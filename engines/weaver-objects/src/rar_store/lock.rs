@@ -292,7 +292,23 @@ impl RarStore {
         let order = self.order();
         let mut asks = false;
         let mut due = Vec::new();
-        for index in 0..self.entries.len() {
+        #[cfg(not(test))]
+        let locked: Vec<usize> = self.locked.iter().copied().collect();
+        #[cfg(test)]
+        let locked: Vec<usize> = match super::counts::old() {
+            true => (0..self.entries.len()).collect(),
+            false => self.locked.iter().copied().collect(),
+        };
+        #[cfg(test)]
+        super::counts::bump(|counts| counts.keyed += locked.len());
+        #[cfg(test)]
+        if !super::counts::old() {
+            let all: Vec<usize> = (0..self.entries.len())
+                .filter(|&index| matches!(self.entries[index].lock, Lock::Locked | Lock::Sealed(_)))
+                .collect();
+            assert_eq!(locked, all, "the locked entries are filed");
+        }
+        for index in locked {
             let entry = &self.entries[index];
             let (Lock::Locked | Lock::Sealed(_), Some(store), Some(length)) =
                 (&entry.lock, &entry.store, entry.length)
@@ -358,6 +374,7 @@ impl RarStore {
                 return self.give_up(Emit::NeedsEngine(Why::Unsupported), out);
             };
             entry.lock = Lock::Open(Arc::new(cbc));
+            self.locked.remove(&index);
             entry.hash_key = key.hash_key;
             entry.trial = trial;
             self.stale = true;
@@ -380,6 +397,7 @@ impl RarStore {
             if entry.trial != Some(candidate) {
                 continue;
             }
+            self.locked.insert(id);
             let Lock::Open(cbc) = std::mem::replace(&mut entry.lock, Lock::Locked) else {
                 continue;
             };
@@ -444,10 +462,7 @@ impl RarStore {
         if headers_shut {
             return Some(Why::EncryptedHeader);
         }
-        self.entries
-            .iter()
-            .any(|entry| matches!(entry.lock, Lock::Locked | Lock::Sealed(_)))
-            .then_some(Why::Encrypted)
+        (!self.locked.is_empty()).then_some(Why::Encrypted)
     }
 }
 

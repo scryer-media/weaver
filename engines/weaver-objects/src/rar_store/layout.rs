@@ -12,7 +12,7 @@
 // was placed by it, so the bytes go back from where the last one put them.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use unrar_rs::{
@@ -199,11 +199,15 @@ fn breaks_at(member: &StoredMember) -> Option<u32> {
 
 // A layout and, for each volume it holds, the facts it took it on: their
 // stamp and how many members they list, and the member it ends on when it
-// carries one on, as the layout took it.
+// carries one on, as the layout took it. It finds a member by the name it
+// lists it under, and keeps the first member any volume it took since it
+// was last asked names: no member before that one changed since.
 pub(super) struct Laid {
     builder: StoredLayoutBuilder,
     added: BTreeMap<u32, (u64, usize)>,
     tails: BTreeMap<u32, RarVolumeMemberFacts>,
+    names: HashMap<String, usize>,
+    low: Option<usize>,
 }
 
 impl std::ops::Deref for Laid {
@@ -220,7 +224,14 @@ impl Laid {
             builder: StoredLayoutBuilder::new(format),
             added: BTreeMap::new(),
             tails: BTreeMap::new(),
+            names: HashMap::new(),
+            low: None,
         }
+    }
+
+    // The first member a volume taken since the last ask names, or none.
+    fn take_low(&mut self) -> Option<usize> {
+        self.low.take()
     }
 
     // A volume's facts as the layout takes them. The builder links a
@@ -278,7 +289,10 @@ impl Laid {
             }
             None => {
                 #[cfg(test)]
-                super::counts::bump(|counts| counts.asked.push((index, walk.stamp)));
+                super::counts::bump(|counts| {
+                    counts.asked.push((index, walk.stamp));
+                    counts.laid_members += facts.members.len();
+                });
                 let joined = self.joined(index, facts);
                 let added = self.builder.add_volume(index, &joined).is_ok();
                 if added {
@@ -286,6 +300,19 @@ impl Laid {
                         Some(tail) => self.tails.insert(index, tail.clone()),
                         None => self.tails.remove(&index),
                     };
+                    // A volume changes only the members it names: those it
+                    // carries a part of, and so every one whose chain runs
+                    // through it, the layout holding the first volumes only.
+                    let members = self.builder.members();
+                    for (at, member) in members.iter().enumerate().skip(self.names.len()) {
+                        self.names.insert(member.name.clone(), at);
+                    }
+                    let low = joined
+                        .members
+                        .iter()
+                        .filter_map(|member| self.names.get(&member.name).copied())
+                        .min();
+                    self.low = self.low.into_iter().chain(low).min();
                 }
                 added
             }
@@ -412,6 +439,8 @@ impl RarStore {
         let Some(format) = self.first_format(out) else {
             return;
         };
+        #[cfg(test)]
+        super::counts::bump(|counts| counts.syncs += 1);
         let kept = self
             .layout
             .take_if(|layout| layout.format() == format && stands(&self.volumes, layout, touched));
@@ -428,8 +457,12 @@ impl RarStore {
         // the next until the set is ordered: a layout already past it is
         // laid again short of it.
         let held_out = self.held_out();
+        // Whether every member the layout lists is to be looked at: those
+        // of one laid afresh are all new to it.
+        let mut relaid = afresh;
         if let Some(at) = held_out.filter(|at| *at < laid(&layout)) {
             layout = self.laid_afresh(format, at);
+            relaid = true;
         }
         let from = laid(&layout);
         let mut end = match reach(&self.volumes, &layout, from, self.refuted, held_out) {
@@ -484,19 +517,61 @@ impl RarStore {
             end = at;
             refusal = None;
             layout = self.laid_afresh(format, end);
+            relaid = true;
         }
+        // A kept layout changed no member before the first one a volume it
+        // took since the last look names. Each member before it was looked
+        // at then and said nothing that gave the set up, and is still the
+        // member its entry holds: it is passed over. So is no announced
+        // entry, which the loop below announces.
+        let low = layout.take_low();
+        let start = match relaid {
+            true => 0,
+            false => low.unwrap_or(usize::MAX).min(self.entries.len()),
+        };
+        #[cfg(test)]
+        let start = if super::counts::old() { 0 } else { start };
         let members = layout.members();
+        #[cfg(test)]
+        for (entry, member) in self.entries.iter().zip(members).take(start) {
+            // What the old look found of each member passed over: the same
+            // member, no verdict, and nothing to extend.
+            assert!(same(entry, member), "{}", member.name);
+            assert!(
+                verdict(member, || in_clear(&self.volumes, member)).is_none(),
+                "{}",
+                member.name
+            );
+            assert!(
+                member
+                    .parts
+                    .get(entry.pieces.len())
+                    .is_none_or(|part| part.logical_offset.is_none()),
+                "{}",
+                member.name
+            );
+            assert!(entry.complete || !member.chain_complete, "{}", member.name);
+            assert_eq!(
+                entry.store,
+                member.eligibility.encrypted_store(),
+                "{}",
+                member.name
+            );
+        }
         // An entry stands until the layout lists something else for it. A
         // layout laid afresh may reach less far than the one before, as when
         // a volume's length is said anew and the headers at its new end are
         // not in yet: what it does not list yet is unread, not refuted, and
         // its bytes stay where they were placed.
-        let keep = self
-            .entries
+        let keep = self.entries[start..]
             .iter()
-            .zip(members)
-            .position(|(entry, member)| !same(entry, member))
-            .unwrap_or(self.entries.len());
+            .zip(members.iter().skip(start))
+            .position(|(entry, member)| {
+                #[cfg(test)]
+                super::counts::bump(|counts| counts.compared += 1);
+                !same(entry, member)
+            })
+            .map_or(self.entries.len(), |at| start + at);
         for id in (keep..self.entries.len()).rev() {
             out.push(Emit::Retract(MemberId(id as u32)));
         }
@@ -504,10 +579,12 @@ impl RarStore {
             self.entries.truncate(keep);
             self.remap();
         }
-        for (id, member) in members.iter().enumerate() {
+        for (id, member) in members.iter().enumerate().skip(start) {
             if refusal.is_some() {
                 break;
             }
+            #[cfg(test)]
+            super::counts::bump(|counts| counts.visited += 1);
             if let Some(emit) = verdict(member, || in_clear(&self.volumes, member)) {
                 refusal = Some(emit);
                 break;
@@ -556,6 +633,9 @@ impl RarStore {
             length,
         });
         let store = member.eligibility.encrypted_store();
+        if store.is_some() {
+            self.locked.insert(id.0 as usize);
+        }
         self.entries.push(Entry {
             name: member.name.clone(),
             length,
@@ -652,6 +732,8 @@ impl RarStore {
         let handed = self
             .header_password()
             .map_or_else(Handed::default, Handed::new);
+        #[cfg(test)]
+        super::counts::bump(|counts| counts.recovery_looked += changed.len());
         for volume in changed {
             let said = self
                 .recovery_said

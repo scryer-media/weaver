@@ -477,6 +477,8 @@ impl Walk {
         closed: bool,
     ) -> Step {
         let facts = walk.facts;
+        #[cfg(test)]
+        super::counts::bump(|counts| counts.read_members += facts.members.len());
         let reach = data_end(&facts);
         let ended = match (walk.short_at, length) {
             (None, _) => true,
