@@ -209,6 +209,30 @@ impl SharedPipelineState {
         })
     }
 
+    // The names every queued job is known by in memory, by job id, for the
+    // stand-in table of the diagnostics package: its name, category,
+    // metadata, output directory and hash, copied under the read lock and
+    // nothing else. A row with an edit the pipeline has not applied yet
+    // reads as the queue shows it.
+    pub fn diagnostic_queue_names(
+        &self,
+    ) -> Vec<(u64, crate::jobs::diagnostic_names::JobNameRecord)> {
+        self.queue.read(|inner| {
+            inner
+                .jobs
+                .iter()
+                .map(|row| {
+                    let view = row.view(&inner.globals);
+                    let job = view.job();
+                    (
+                        job.job_id.0,
+                        crate::jobs::diagnostic_names::JobNameRecord::of_info(job),
+                    )
+                })
+                .collect()
+        })
+    }
+
     // The queued jobs the diagnostics package reports on: those Weaver has
     // started work on, post-processing first, then failed, then downloading,
     // each group in queue order, at most `limit` of them. Every row is
@@ -2070,6 +2094,20 @@ impl SchedulerHandle {
     // [`SharedPipelineState::metrics_jobs`].
     pub fn metrics_jobs(&self, mode: crate::settings::PerJobSeries) -> Vec<JobInfo> {
         self.state.metrics_jobs(mode)
+    }
+
+    // The names every queued job is known by in memory (reads from shared
+    // state, no channel round-trip). See
+    // [`SharedPipelineState::diagnostic_queue_names`].
+    pub fn diagnostic_queue_names(
+        &self,
+    ) -> Vec<(u64, crate::jobs::diagnostic_names::JobNameRecord)> {
+        self.state.diagnostic_queue_names()
+    }
+
+    // The finished jobs the queue publishes, shared rather than copied.
+    pub fn diagnostic_history_rows(&self) -> std::sync::Arc<[JobInfo]> {
+        self.state.history_rows()
     }
 
     // The queued jobs the diagnostics package reports on (reads from shared
