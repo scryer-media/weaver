@@ -627,6 +627,14 @@ pub(in crate::pipeline::tests) struct Scenario {
     // The name an article's header gives its file, by file, and from the
     // ordinal given on, when not the posted name.
     headers: Vec<(u32, u32, String)>,
+    // Articles a server answers with another post's article: its bytes,
+    // and a header naming that post's obfuscated file, its size and a
+    // range far past this file's end, as a news server that reused the
+    // message-id serves it.
+    foreign: Vec<(u32, u32)>,
+    // Articles whose bodies are the post's own and whose header is
+    // another post's, as `foreign` states it.
+    foreign_header: Vec<(u32, u32)>,
 }
 
 impl Scenario {
@@ -664,7 +672,22 @@ impl Scenario {
             setup: None,
             heard: None,
             headers: Vec::new(),
+            foreign: Vec::new(),
+            foreign_header: Vec::new(),
         }
+    }
+
+    // The article at `ordinal` of `file` is served as another post's.
+    pub(in crate::pipeline::tests) fn foreign(mut self, file: u32, ordinal: u32) -> Self {
+        self.foreign.push((file, ordinal));
+        self
+    }
+
+    // The article at `ordinal` of `file` is served with its own body under
+    // another post's header.
+    pub(in crate::pipeline::tests) fn foreign_header(mut self, file: u32, ordinal: u32) -> Self {
+        self.foreign_header.push((file, ordinal));
+        self
     }
 
     // Every article of `file` names it `name` in its header.
@@ -1690,6 +1713,14 @@ pub(in crate::pipeline::tests) async fn serve_job(
 
 // [`serve_job`] for an ask that excludes `exclude`: the first server it
 // leaves answers.
+// The post another post's article comes from: an obfuscated file far larger
+// than any of the scenario's, the article at a place past their ends.
+const FOREIGN_NAME: &str = "6878f815a73f3004";
+const FOREIGN_SIZE: u64 = 172_462_596;
+const FOREIGN_AT: u64 = 100_000_000;
+const FOREIGN_PART: u32 = 300;
+const FOREIGN_TOTAL: u32 = 524;
+
 async fn serve_from(
     pipeline: &mut Pipeline,
     job: JobId,
@@ -1739,6 +1770,20 @@ async fn serve_from(
     let part = scenario.posted(file, ordinal);
     let offset = part as usize * post.article(scenario.article);
     let posted = post.articles(scenario.article).nth(part as usize).unwrap();
+    // Another post's article carries its own bytes, at its own place in its
+    // own file.
+    let genuine = scenario.foreign_header.contains(&(file, ordinal));
+    let foreign = genuine || scenario.foreign.contains(&(file, ordinal));
+    let alien: Vec<u8>;
+    let (offset, posted) = if foreign {
+        alien = match genuine {
+            true => posted.to_vec(),
+            false => posted.iter().map(|byte| byte ^ 0xa5).collect(),
+        };
+        (FOREIGN_AT as usize + offset, alien.as_slice())
+    } else {
+        (offset, posted)
+    };
     // The checksum the article declares is the posted one, so damaged bytes
     // disagree with it.
     let crc_wrong = scenario.crc_wrong.contains(&(file, ordinal));
@@ -1822,13 +1867,19 @@ async fn serve_from(
                 raw_size: len,
                 encoding: SegmentEncoding::Yenc,
                 yenc_layout: YencLayoutAssertions {
-                    file_size: scenario
-                        .declares
-                        .iter()
-                        .find(|(at, _)| *at == file)
-                        .map_or(post.bytes.len() as u64, |(_, size)| *size),
-                    part: Some(part + 1),
-                    total: Some(post.articles(scenario.article).count() as u32),
+                    file_size: match foreign {
+                        true => FOREIGN_SIZE,
+                        false => scenario
+                            .declares
+                            .iter()
+                            .find(|(at, _)| *at == file)
+                            .map_or(post.bytes.len() as u64, |(_, size)| *size),
+                    },
+                    part: Some(part + 1 + u32::from(foreign) * FOREIGN_PART),
+                    total: Some(match foreign {
+                        true => FOREIGN_TOTAL,
+                        false => post.articles(scenario.article).count() as u32,
+                    }),
                     begin: Some(offset as u64 + 1),
                     end: Some(offset as u64 + declared),
                 },
@@ -1838,7 +1889,10 @@ async fn serve_from(
                 truncation_suspected: truncated,
                 expected_file_crc: None,
                 data: DecodedChunk::from(body),
-                yenc_name: scenario.header_of(file, ordinal).to_string(),
+                yenc_name: match foreign {
+                    true => FOREIGN_NAME.to_string(),
+                    false => scenario.header_of(file, ordinal).to_string(),
+                },
                 checkpoint_plan,
                 segments,
             },

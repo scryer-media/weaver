@@ -810,3 +810,197 @@ async fn shared_stem_pack(named: bool) {
         );
     }
 }
+
+// An old-style set posted as the HULK image set was: the follow-on volumes
+// first, under their true underscored names, then the first volume as a
+// dotted `part01.rar` of the release name, then the PAR2 index and its
+// volumes over the true names. The first volume's opening article is lost,
+// so neither its signature nor the 16 KiB the set renames it by arrive;
+// the PAR2 set must still bind, find the volume, rebuild the article and
+// join the set, as the recovery on hand can.
+async fn an_old_style_set_whose_posted_first_volume_lost_its_opening_article(
+    truth: Vec<(String, Vec<u8>)>,
+    format: &str,
+) {
+    let body = body();
+    let truth: Vec<(String, Vec<u8>)> = truth
+        .into_iter()
+        .enumerate()
+        .map(|(index, (_, bytes))| {
+            let name = match index {
+                0 => "Final_Girl_2015_720p_IMAGESET_HULK.rar".to_string(),
+                n => format!("Final_Girl_2015_720p_IMAGESET_HULK.r{:02}", n - 1),
+            };
+            (name, bytes)
+        })
+        .collect();
+    let mut posted: Vec<(String, usize)> =
+        (1..truth.len()).map(|n| (truth[n].0.clone(), n)).collect();
+    posted.push((
+        "Final.Girl.2015.720p.IMAGESET.HULK.part01.rar".to_string(),
+        0,
+    ));
+    let first = posted.len() as u32 - 1;
+    let (posts, _) = arranged(&truth, &posted, 2, Order::Posted);
+    let graph = run(&Scenario::new(posts).framed(FRAME).lost(first, 0)).await;
+    assert_one_store_delivers(&graph, MEMBER, &body, format);
+}
+
+#[tokio::test]
+async fn an_old_style_rar4_set_whose_posted_first_volume_lost_its_opening_article_is_repaired() {
+    an_old_style_set_whose_posted_first_volume_lost_its_opening_article(
+        single_member_rar4_store_set(MEMBER, &body(), 5),
+        "rar4",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_old_style_rar5_set_whose_posted_first_volume_lost_its_opening_article_is_repaired() {
+    an_old_style_set_whose_posted_first_volume_lost_its_opening_article(
+        single_member_store_set(MEMBER, &body(), 5),
+        "rar5",
+    )
+    .await;
+}
+
+// The same post as a news server answered it: the first volume's opening
+// article and every article of the PAR2 index and volume are another
+// post's, each placed by its own header far past this post's files and
+// never contradicted. No PAR2 file opens with a PAR2 packet, so no set
+// binds, nothing can rebuild the first volume, and the job fails as the
+// bench's HULK run did: the follow-on volumes refused for the first bytes
+// of their set, and no recovery line at all.
+#[tokio::test]
+async fn an_old_style_set_whose_recovery_articles_are_another_posts_binds_no_set_and_fails() {
+    use crate::pipeline::graph::lines::Lines;
+    let truth: Vec<(String, Vec<u8>)> = single_member_rar4_store_set(MEMBER, &body(), 5)
+        .into_iter()
+        .enumerate()
+        .map(|(index, (_, bytes))| {
+            let name = match index {
+                0 => "Final_Girl_2015_720p_IMAGESET_HULK.rar".to_string(),
+                n => format!("Final_Girl_2015_720p_IMAGESET_HULK.r{:02}", n - 1),
+            };
+            (name, bytes)
+        })
+        .collect();
+    let mut posted: Vec<(String, usize)> =
+        (1..truth.len()).map(|n| (truth[n].0.clone(), n)).collect();
+    posted.push((
+        "Final.Girl.2015.720p.IMAGESET.HULK.part01.rar".to_string(),
+        0,
+    ));
+    let first = posted.len() as u32 - 1;
+    let (posts, _) = arranged(&truth, &posted, 2, Order::Posted);
+    let recovery: Vec<(u32, u32)> = posts
+        .iter()
+        .enumerate()
+        .skip(posted.len())
+        .flat_map(|(file, post)| {
+            (0..post.articles(FRAME).count() as u32).map(move |ordinal| (file as u32, ordinal))
+        })
+        .collect();
+    let mut scenario = Scenario::new(posts).framed(FRAME).foreign(first, 0);
+    for (file, ordinal) in recovery {
+        scenario = scenario.foreign(file, ordinal);
+    }
+    let (lines, guard) = Lines::capture();
+    let graph = run(&scenario).await;
+    drop(guard);
+    let refused: Vec<String> = lines
+        .of("object refused")
+        .iter()
+        .map(|line| line.split_once("node=").unwrap().1.to_string())
+        .collect();
+    assert_eq!(
+        refused,
+        (0..4)
+            .map(|n| format!(
+                "0 kind=rar_store member=Final_Girl_2015_720p_IMAGESET_HULK.r{n:02} why=first_bytes_lost"
+            ))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        lines
+            .of("object bound")
+            .iter()
+            .all(|line| line.contains("kind=rar_store")),
+        "{:?}",
+        lines.of("object bound")
+    );
+    assert!(lines.of("recovery bound").is_empty());
+    assert!(lines.of("recovery set ruled").is_empty());
+    assert!(
+        matches!(&graph.status, Some(crate::jobs::model::JobStatus::Failed { error })
+            if error.starts_with("no file was delivered whole; 5 short: ")),
+        "{:?}",
+        graph.status
+    );
+}
+
+// The same post, read as SABnzbd's repair says it was: the PAR2 index and
+// volume carry their own bytes, every article of them under another post's
+// header (an obfuscated name, a 172 MB size and a place far past these
+// files), and the first volume's opening article is another post's whole.
+// Laid in the NZB's order, as SABnzbd lays them, the PAR2 files are whole
+// and repair the first volume; the job must complete.
+#[tokio::test]
+async fn an_old_style_set_whose_recovery_articles_carry_another_posts_headers_is_repaired() {
+    use crate::pipeline::graph::lines::Lines;
+    let body = body();
+    let truth: Vec<(String, Vec<u8>)> = single_member_rar4_store_set(MEMBER, &body, 5)
+        .into_iter()
+        .enumerate()
+        .map(|(index, (_, bytes))| {
+            let name = match index {
+                0 => "Final_Girl_2015_720p_IMAGESET_HULK.rar".to_string(),
+                n => format!("Final_Girl_2015_720p_IMAGESET_HULK.r{:02}", n - 1),
+            };
+            (name, bytes)
+        })
+        .collect();
+    let mut posted: Vec<(String, usize)> =
+        (1..truth.len()).map(|n| (truth[n].0.clone(), n)).collect();
+    posted.push((
+        "Final.Girl.2015.720p.IMAGESET.HULK.part01.rar".to_string(),
+        0,
+    ));
+    let first = posted.len() as u32 - 1;
+    let (posts, _) = arranged(&truth, &posted, 2, Order::Posted);
+    let recovery: Vec<(u32, u32)> = posts
+        .iter()
+        .enumerate()
+        .skip(posted.len())
+        .flat_map(|(file, post)| {
+            (0..post.articles(FRAME).count() as u32).map(move |ordinal| (file as u32, ordinal))
+        })
+        .collect();
+    let mut scenario = Scenario::new(posts).framed(FRAME).foreign(first, 0);
+    for (file, ordinal) in recovery {
+        scenario = scenario.foreign_header(file, ordinal);
+    }
+    let (lines, guard) = Lines::capture();
+    let graph = run(&scenario).await;
+    drop(guard);
+    assert!(
+        graph.completed(),
+        "{:?} {:?} bound {:#?} refused {:#?} ruled {:#?}",
+        graph.status,
+        graph.failure,
+        lines.of("object bound"),
+        lines.of("object refused"),
+        lines.of("recovery set ruled"),
+    );
+    assert_one_store_delivers(&graph, MEMBER, &body, "foreign headers on the recovery");
+    // Every PAR2 file lost its front to the header's place, so the set is
+    // founded past the hole, by its packets' hashes.
+    assert!(
+        lines
+            .of("object bound")
+            .iter()
+            .any(|line| line.contains("kind=par2")),
+        "{:?}",
+        lines.of("object bound")
+    );
+}
