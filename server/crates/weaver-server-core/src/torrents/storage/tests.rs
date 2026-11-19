@@ -2711,7 +2711,6 @@ fn an_ignored_files_share_of_a_piece_goes_to_the_side_store_not_the_file() {
     // A file set aside is never made, even at its length.
     shim.storage.ensure_file_length(1, 2048).unwrap();
     assert!(!shim.dir.path().join("sub").exists());
-    assert!(!shim.store.whole_names().contains(&"sub/b.bin".to_owned()));
 
     assert!(shim.store.needs_copy(&[false, false]));
     shim.store.relevel(&[false, false]).unwrap();

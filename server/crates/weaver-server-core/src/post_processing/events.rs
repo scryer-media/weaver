@@ -254,6 +254,9 @@ pub(crate) type Admitted = tokio::sync::oneshot::Receiver<Result<Option<String>,
 
 struct QueueAdmission {
     context: EventContext,
+    // The occurrence of a download end its owner numbers: 0 for a job's
+    // first, which is every NZB job's only one.
+    occurrence: u64,
     completion: Option<tokio::sync::oneshot::Sender<Result<Option<String>, StateError>>>,
 }
 
@@ -1171,6 +1174,27 @@ impl Database {
         context: EventContext,
         barrier: bool,
     ) -> (Admitted, Option<Admitted>) {
+        self.admit_queue_script_events_at(context, barrier, 0)
+    }
+
+    // A job's download end and its generic twin, as the job's owner numbers
+    // that end, `occurrence`: one is admitted only past the occurrence of
+    // the job's latest end of that name, so a second end of the same
+    // occurrence runs nothing and returns the run of the first.
+    pub(crate) fn admit_download_end(
+        &self,
+        context: EventContext,
+        occurrence: u64,
+    ) -> (Admitted, Option<Admitted>) {
+        self.admit_queue_script_events_at(context, false, occurrence)
+    }
+
+    fn admit_queue_script_events_at(
+        &self,
+        context: EventContext,
+        barrier: bool,
+        occurrence: u64,
+    ) -> (Admitted, Option<Admitted>) {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let mut admissions = self
             .script_runtime
@@ -1195,11 +1219,13 @@ impl Database {
         };
         admissions.pending.push_back(QueueAdmission {
             context,
+            occurrence,
             completion: Some(sender),
         });
         let generic = generic.map(|(context, sender, receiver)| {
             admissions.pending.push_back(QueueAdmission {
                 context,
+                occurrence,
                 completion: Some(sender),
             });
             receiver
@@ -1437,7 +1463,7 @@ impl Database {
         context: &EventContext,
         now_ms: i64,
     ) -> Result<Option<String>, StateError> {
-        self.enqueue_script_event_inner(context, now_ms, false)
+        self.enqueue_script_event_inner(context, now_ms, false, 0)
     }
 
     fn enqueue_script_event_inner(
@@ -1445,8 +1471,9 @@ impl Database {
         context: &EventContext,
         now_ms: i64,
         require_job: bool,
+        occurrence: u64,
     ) -> Result<Option<String>, StateError> {
-        let queued = self.enqueue_script_event_row(context, now_ms, require_job);
+        let queued = self.enqueue_script_event_row(context, now_ms, require_job, occurrence);
         if matches!(queued, Ok(Some(_))) {
             self.script_runtime.started();
         }
@@ -1458,7 +1485,10 @@ impl Database {
         context: &EventContext,
         now_ms: i64,
         require_job: bool,
+        occurrence: u64,
     ) -> Result<Option<String>, StateError> {
+        let occurrence = i64::try_from(occurrence)
+            .map_err(|_| StateError::Database("a download end's occurrence is too large".into()))?;
         let ScriptEventLabel::Queue(event) = context.event else {
             return Err(StateError::Database("only queue events are durable".into()));
         };
@@ -1501,7 +1531,7 @@ impl Database {
                         tx.execute("DELETE FROM script_event_queue WHERE job_id IS NOT DISTINCT FROM {} AND state = 'queued' AND (event = {} OR event NOT IN ('NZB_DOWNLOADED', 'TORRENT_DOWNLOADED', 'JOB_DOWNLOADED'))", &[SqlArg::OptI64(job_id), SqlArg::Text(event.as_str().into())]).await?;
                     }
                     let run_id = format!("script-event-{seq}");
-                    tx.execute("INSERT INTO script_event_queue (run_id, job_id, event, priority, seq, state, payload, created_at) VALUES ({}, {}, {}, {}, {}, 'queued', {}, {})", &[SqlArg::Text(run_id.clone()), SqlArg::OptI64(job_id), SqlArg::Text(event.as_str().into()), SqlArg::I32(event as i32), SqlArg::I64(seq), SqlArg::Text(payload), SqlArg::I64(now_ms)]).await?;
+                    tx.execute("INSERT INTO script_event_queue (run_id, job_id, event, priority, seq, state, payload, created_at, occurrence) VALUES ({}, {}, {}, {}, {}, 'queued', {}, {}, {})", &[SqlArg::Text(run_id.clone()), SqlArg::OptI64(job_id), SqlArg::Text(event.as_str().into()), SqlArg::I32(event as i32), SqlArg::I64(seq), SqlArg::Text(payload), SqlArg::I64(now_ms), SqlArg::I64(occurrence)]).await?;
                     Ok(Some(run_id))
                 })
             }).await
@@ -1542,6 +1572,20 @@ impl Database {
             .map(|row| row.text("state"))
             .transpose()?
             .is_none_or(|state| state == "done" || state == "interrupted"))
+        })
+    }
+
+    // The run of the job's latest `event`, one of the names of its
+    // download's end, and that end's occurrence.
+    pub(crate) fn latest_download_end(
+        &self,
+        job_id: u64,
+        event: QueueEvent,
+    ) -> Result<Option<(String, u64)>, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            SqlRuntime::fetch_optional(datastore.read_exec(), "SELECT run_id, occurrence FROM script_event_queue WHERE job_id = {} AND event = {} ORDER BY seq DESC LIMIT 1", &[SqlArg::I64(job_id as i64), SqlArg::Text(event.as_str().into())]).await?
+                .map(|row| Ok((row.text("run_id")?, u64::try_from(row.i64("occurrence")?).unwrap_or_default()))).transpose()
         })
     }
 
@@ -1964,7 +2008,8 @@ async fn drain_admissions(db: Database) {
             if let ScriptEventLabel::Queue(event) = admission.context.event
                 && event.downloaded()
                 && let Some(job_id) = admission.context.job_id
-                && let Some((run_id, _)) = worker_db.downloaded_script_event(job_id, event)?
+                && let Some((run_id, latest)) = worker_db.latest_download_end(job_id, event)?
+                && admission.occurrence <= latest
             {
                 return Ok(Some(run_id));
             }
@@ -1972,6 +2017,7 @@ async fn drain_admissions(db: Database) {
                 &admission.context,
                 chrono::Utc::now().timestamp_millis(),
                 true,
+                admission.occurrence,
             )
         })
         .await

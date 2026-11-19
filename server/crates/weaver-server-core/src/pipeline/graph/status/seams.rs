@@ -251,15 +251,12 @@ fn asker(job_id: JobId) -> AskerId {
 // object announced, which is payload. A member named as recovery that a
 // recovery object refused stays recovery; one another object refused is
 // payload.
-fn is_payload(job: &GraphJob, files: &[crate::jobs::model::FileSpec], member: MemberId) -> bool {
+fn is_payload(job: &GraphJob, posted: &dyn Fn(MemberId) -> bool, member: MemberId) -> bool {
     let tree = job.tree();
     if let Some((owner, _)) = tree.child_of(NodeId::ROOT, member) {
         return !tree.recovers(owner);
     }
-    if files
-        .get(member.0 as usize)
-        .is_none_or(|file| file.role.counts_toward_health())
-    {
+    if posted(member) {
         return true;
     }
     tree.refused_by(NodeId::ROOT, member)
@@ -286,6 +283,178 @@ pub(in crate::pipeline) fn recovery_volume(
         && tree
             .refused_by(NodeId::ROOT, member)
             .is_none_or(|owner| tree.recovers(owner))
+}
+
+// What a job's posted files say, for `delivery_of`: the one place a job
+// class says it of its own files, the rest being read off the graph job.
+pub(crate) struct Posted<'a> {
+    // How many files the job was posted with, root members 0 to this.
+    pub(crate) files: u32,
+    // Whether a root member no object holds or refused is payload, by what
+    // it was posted as.
+    pub(crate) payload: &'a dyn Fn(MemberId) -> bool,
+    // The posted name of a root member none of whose declared bytes came,
+    // given up whole.
+    pub(crate) lost: &'a dyn Fn(MemberId) -> Option<&'a str>,
+    // The extensions whose damage leaves a delivery whole.
+    pub(crate) ignore: &'a [String],
+    // Why the job's post was given up, when the rulings say nothing.
+    pub(crate) given_up: Option<Failure>,
+}
+
+// What a graph job hands over, file by file at every depth, off its
+// settled claims, with the repair failure that left any of it short: the
+// one reading of every job class's delivery.
+pub(crate) fn delivery_of(job: &GraphJob, posted: Posted<'_>) -> (Delivery, Option<Failure>) {
+    {
+        let summary = RootJob::recovery_summary(job);
+        let outcomes = summary.outcomes();
+        // The rulings' own failure, or else the feed's words when it gave
+        // the post up.
+        let failure = failure(&summary, &outcomes, job).or(posted.given_up);
+        let ignore = posted.ignore;
+        // Root members are numbered as the posted files they are; one past
+        // them is a file a recovery object announced, which is payload.
+        // Once an object owns a member, its role wins over the posted
+        // filename. A misleading recovery suffix cannot hide an archive's
+        // outputs, including those kept when the archive refused.
+        let payload = |member: MemberId| is_payload(job, posted.payload, member);
+        // A set whose repair failed covers the member: each failed set with
+        // the namespace it lives in, as the summary read them once.
+        let failed: Vec<(NodeId, NodeId)> = failure
+            .as_ref()
+            .map(|failure| {
+                summary
+                    .sets
+                    .iter()
+                    .filter(|set| failure.objects.contains(&set.node))
+                    .map(|set| (set.namespace, set.node))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Recovery the post carried for a namespace that no set of it ruled
+        // on, because nothing that described what it covers survived: what
+        // is short there is short because that recovery could not be used.
+        // Undecided recovery names still count as possible recovery, but
+        // an object that identified an archive has resolved that hint.
+        let posted_recovery = (0..posted.files).any(|index| !payload(MemberId(index)));
+        let unruled = |node: NodeId| {
+            let carried = summary.sets.iter().any(|set| set.namespace == node)
+                || (node == NodeId::ROOT && posted_recovery);
+            carried
+                && !summary.sets.iter().any(|set| {
+                    set.namespace == node
+                        && set
+                            .outcome
+                            .is_some_and(|outcome| outcome != RepairOutcome::Unread)
+                })
+        };
+        // What the sets of a member's namespace say of it: unrepaired where
+        // a failed set covers it or the recovery carried for it went
+        // unused, vouched where a set that vouched covers it, and unchecked
+        // where a set of it vouched and none of its sets describes the
+        // member (SABnzbd's rule: only what a set describes is checked once
+        // one verified). The one place a member
+        // is asked whether a set describes it.
+        let described = |node: NodeId, member: MemberId| {
+            let covers = |set: NodeId| job.writer().covers(job.tree(), set, member);
+            if unruled(node)
+                || failed
+                    .iter()
+                    .any(|(namespace, set)| *namespace == node && covers(*set))
+            {
+                return Described::Unrepaired;
+            }
+            let mut sets = summary.sets.iter().filter(|set| set.namespace == node);
+            if sets.clone().any(|set| set.vouched() && covers(set.node)) {
+                Described::Vouched
+            } else if sets.clone().any(SetSummary::vouched) && !sets.any(|set| covers(set.node)) {
+                Described::Unchecked
+            } else {
+                Described::Otherwise
+            }
+        };
+        // A posted file that is not whole, read by the name it was posted
+        // under once the feed gave up every byte the post declared for it:
+        // another posting of the place a posted file that brought clean
+        // bytes is named into, or a name that says no kind of file. A file
+        // that brought anything is short of the rest.
+        let arrived: Vec<_> = job
+            .tree()
+            .namespace(NodeId::ROOT)
+            .into_iter()
+            .flat_map(|namespace| namespace.members())
+            .filter(|member| {
+                member.coverage.bytes_covered()
+                    > member
+                        .coverage
+                        .damaged_ranges()
+                        .map(|range| range.len())
+                        .sum()
+            })
+            .filter_map(|member| names_a_place(&member.name))
+            .collect();
+        let unarrived = |member: MemberId| {
+            let Some(name) = (posted.lost)(member) else {
+                return Unarrived::Short;
+            };
+            match names_a_place(name) {
+                Some(place) if arrived.contains(&place) => Unarrived::Again,
+                _ if names_nothing(name) => Unarrived::Unnamed,
+                _ => Unarrived::Short,
+            }
+        };
+        let delivery = Delivery::read(
+            job.tree(),
+            payload,
+            |name| par2_damage_ignorable(name, ignore),
+            described,
+            |node, member| job.writer().refused(node, member),
+            // Read by the name the member is delivered under, so a file a
+            // recovery set renamed to what it is counts as that. A piece is
+            // no usable file at any depth: a joined split or an archive an
+            // archive held is a piece as much as a posted volume is. A
+            // member whose name the file system refused has no file at all,
+            // and is no usable file either, however long it is.
+            |node, member| {
+                job.writer().unnamable(node, member)
+                    || job
+                        .tree()
+                        .namespace(node)
+                        .and_then(|ns| ns.get(member))
+                        .is_some_and(|member| {
+                            crate::pipeline::post_health::names_a_piece(&member.output_name)
+                        })
+            },
+            unarrived,
+        );
+        // A file with an unwanted extension the policy deletes is no file
+        // of the delivery: the final move leaves it out.
+        let mut delivery = delivery;
+        delivery.password_given = job.has_passwords();
+        if let Some(policy) = job.writer().removes() {
+            delivery.remove_unwanted(|name| policy.removes(name));
+        }
+        (delivery, failure)
+    }
+}
+
+// Why a delivery is short of whole, as every job class words it. A partial
+// delivery says what it lacks, from its lists; any other says why, and what
+// the policy left out beside it.
+pub(crate) fn shortfall_message(delivery: &Delivery, failure: Option<&Failure>) -> Option<String> {
+    if delivery.status(failure) == JobStatus::Partial {
+        return Some(delivery.partial_error());
+    }
+    match (
+        failure
+            .map(|failure| failure.message.clone())
+            .or_else(|| delivery.withheld_error()),
+        delivery.removed_error(),
+    ) {
+        (Some(why), Some(removed)) => Some(format!("{why}; {removed}")),
+        (why, removed) => why.or(removed),
+    }
 }
 
 impl Pipeline {
@@ -405,7 +574,19 @@ impl Pipeline {
             .files
             .iter()
             .zip(0u32..)
-            .filter(|(_, index)| is_payload(job, &state.spec.files, MemberId(*index)))
+            .filter(|(_, index)| {
+                is_payload(
+                    job,
+                    &|member: MemberId| {
+                        state
+                            .spec
+                            .files
+                            .get(member.0 as usize)
+                            .is_none_or(|file| file.role.counts_toward_health())
+                    },
+                    MemberId(*index),
+                )
+            })
             .filter_map(|(file, index)| {
                 let member = namespace.get(MemberId(index))?;
                 let file_id = NzbFileId {
@@ -568,160 +749,43 @@ impl Pipeline {
 
     // What a graph job hands over, file by file at every depth, off its
     // settled claims, with the repair failure that left any of it short.
-    // `None` once the job has gone.
+    // `None` once the job has gone. The reading is `delivery_of`'s, with
+    // what the post says of each posted file.
     fn graph_ruling(&self, job_id: JobId) -> Option<(Delivery, Option<Failure>)> {
         let job = self.graph_jobs.get(&job_id)?;
         let state = self.jobs.get(&job_id)?;
-        let summary = RootJob::recovery_summary(job);
-        let outcomes = summary.outcomes();
-        // The rulings' own failure, or else the feed's words when it gave
-        // the post up.
-        let failure = failure(&summary, &outcomes, job).or_else(|| {
-            self.post_probes
-                .dead
-                .get(&job_id)
-                .cloned()
-                .map(Failure::post_given_up)
-        });
-        let ignore = self.par2_ignore_extensions();
-        // Root members are numbered as the posted files they are; one past
-        // them is a file a recovery object announced, which is payload.
-        // Once an object owns a member, its role wins over the posted
-        // filename. A misleading recovery suffix cannot hide an archive's
-        // outputs, including those kept when the archive refused.
-        let payload = |member: MemberId| is_payload(job, &state.spec.files, member);
-        // A set whose repair failed covers the member: each failed set with
-        // the namespace it lives in, as the summary read them once.
-        let failed: Vec<(NodeId, NodeId)> = failure
-            .as_ref()
-            .map(|failure| {
-                summary
-                    .sets
-                    .iter()
-                    .filter(|set| failure.objects.contains(&set.node))
-                    .map(|set| (set.namespace, set.node))
-                    .collect()
-            })
-            .unwrap_or_default();
-        // Recovery the post carried for a namespace that no set of it ruled
-        // on, because nothing that described what it covers survived: what
-        // is short there is short because that recovery could not be used.
-        // Undecided recovery names still count as possible recovery, but
-        // an object that identified an archive has resolved that hint.
-        let posted_recovery = state
-            .spec
-            .files
-            .iter()
-            .enumerate()
-            .any(|(index, _)| !payload(MemberId(index as u32)));
-        let unruled = |node: NodeId| {
-            let carried = summary.sets.iter().any(|set| set.namespace == node)
-                || (node == NodeId::ROOT && posted_recovery);
-            carried
-                && !summary.sets.iter().any(|set| {
-                    set.namespace == node
-                        && set
-                            .outcome
-                            .is_some_and(|outcome| outcome != RepairOutcome::Unread)
-                })
-        };
-        // What the sets of a member's namespace say of it: unrepaired where
-        // a failed set covers it or the recovery carried for it went
-        // unused, vouched where a set that vouched covers it, and unchecked
-        // where a set of it vouched and none of its sets describes the
-        // member (SABnzbd's rule: only what a set describes is checked once
-        // one verified). The one place a member
-        // is asked whether a set describes it.
-        let described = |node: NodeId, member: MemberId| {
-            let covers = |set: NodeId| job.writer().covers(job.tree(), set, member);
-            if unruled(node)
-                || failed
-                    .iter()
-                    .any(|(namespace, set)| *namespace == node && covers(*set))
-            {
-                return Described::Unrepaired;
-            }
-            let mut sets = summary.sets.iter().filter(|set| set.namespace == node);
-            if sets.clone().any(|set| set.vouched() && covers(set.node)) {
-                Described::Vouched
-            } else if sets.clone().any(SetSummary::vouched) && !sets.any(|set| covers(set.node)) {
-                Described::Unchecked
-            } else {
-                Described::Otherwise
-            }
-        };
-        // A posted file that is not whole, read by the name it was posted
-        // under once the feed gave up every byte the post declared for it:
-        // another posting of the place a posted file that brought clean
-        // bytes is named into, or a name that says no kind of file. A file
-        // that brought anything is short of the rest.
-        let arrived: Vec<_> = job
-            .tree()
-            .namespace(NodeId::ROOT)
-            .into_iter()
-            .flat_map(|namespace| namespace.members())
-            .filter(|member| {
-                member.coverage.bytes_covered()
-                    > member
-                        .coverage
-                        .damaged_ranges()
-                        .map(|range| range.len())
-                        .sum()
-            })
-            .filter_map(|member| names_a_place(&member.name))
-            .collect();
         let given_up = self.given_up.get(&job_id);
-        let unarrived = |member: MemberId| {
-            let Some(file) = state.spec.files.get(member.0 as usize) else {
-                return Unarrived::Short;
-            };
-            let declared: u64 = file
-                .segments
-                .iter()
-                .map(|segment| u64::from(segment.bytes))
-                .sum();
-            let lost = given_up.map_or(0, |given_up| given_up.file(member.0).bytes);
-            if declared == 0 || lost < declared {
-                return Unarrived::Short;
-            }
-            match names_a_place(&file.filename) {
-                Some(place) if arrived.contains(&place) => Unarrived::Again,
-                _ if names_nothing(&file.filename) => Unarrived::Unnamed,
-                _ => Unarrived::Short,
-            }
-        };
-        let delivery = Delivery::read(
-            job.tree(),
-            payload,
-            |name| par2_damage_ignorable(name, &ignore),
-            described,
-            |node, member| job.writer().refused(node, member),
-            // Read by the name the member is delivered under, so a file a
-            // recovery set renamed to what it is counts as that. A piece is
-            // no usable file at any depth: a joined split or an archive an
-            // archive held is a piece as much as a posted volume is. A
-            // member whose name the file system refused has no file at all,
-            // and is no usable file either, however long it is.
-            |node, member| {
-                job.writer().unnamable(node, member)
-                    || job
-                        .tree()
-                        .namespace(node)
-                        .and_then(|ns| ns.get(member))
-                        .is_some_and(|member| {
-                            crate::pipeline::post_health::names_a_piece(&member.output_name)
-                        })
+        let files = &state.spec.files;
+        Some(delivery_of(
+            job,
+            Posted {
+                files: files.len() as u32,
+                payload: &|member| {
+                    files
+                        .get(member.0 as usize)
+                        .is_none_or(|file| file.role.counts_toward_health())
+                },
+                // A posted file the feed gave up every byte of that the
+                // post declared for it.
+                lost: &|member| {
+                    let file = files.get(member.0 as usize)?;
+                    let declared: u64 = file
+                        .segments
+                        .iter()
+                        .map(|segment| u64::from(segment.bytes))
+                        .sum();
+                    let lost = given_up.map_or(0, |given_up| given_up.file(member.0).bytes);
+                    (declared > 0 && lost >= declared).then_some(file.filename.as_str())
+                },
+                ignore: &self.par2_ignore_extensions(),
+                given_up: self
+                    .post_probes
+                    .dead
+                    .get(&job_id)
+                    .cloned()
+                    .map(Failure::post_given_up),
             },
-            unarrived,
-        );
-        // A file with an unwanted extension the policy deletes is no file
-        // of the delivery: the final move leaves it out.
-        let mut delivery = delivery;
-        delivery.password_given = job.has_passwords();
-        if let Some(policy) = job.writer().removes() {
-            delivery.remove_unwanted(|name| policy.removes(name));
-        }
-        Some((delivery, failure))
+        ))
     }
 
     // Whether a graph job that delivered nothing whole failed for its post:
@@ -799,21 +863,7 @@ impl Pipeline {
         Some(crate::post_processing::model::DeliveredVerdict {
             partial,
             shortfall_stage: delivery.shortfall_stage(failure.as_ref()),
-            // A partial delivery says what it lacks, from its lists; any
-            // other says why, and what the policy left out beside it.
-            shortfall_message: if partial {
-                Some(delivery.partial_error())
-            } else {
-                match (
-                    failure
-                        .map(|failure| failure.message)
-                        .or_else(|| delivery.withheld_error()),
-                    delivery.removed_error(),
-                ) {
-                    (Some(why), Some(removed)) => Some(format!("{why}; {removed}")),
-                    (why, removed) => why.or(removed),
-                }
-            },
+            shortfall_message: shortfall_message(&delivery, failure.as_ref()),
             recovery_verified: self.graph_recovery_verified(job_id),
             unpacked: self.graph_unpacked(job_id),
         })

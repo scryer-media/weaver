@@ -156,11 +156,13 @@ async fn a_torrents_job_raises_each_queue_event_once_with_its_variables() {
     seeding.stop().await;
 }
 
-// A torrent added with its data in place downloads nothing in this run, so
-// it seeds without TORRENT_DOWNLOADED or JOB_DOWNLOADED (libtorrent sends no `completed`, and
-// qBittorrent no `torrentFinished`, for it).
+// A torrent added with its data in place and checked whole is finished,
+// and says so once with TORRENT_DOWNLOADED and JOB_DOWNLOADED though it
+// downloaded nothing in this run, as qBittorrent runs its program on finish
+// for it (libtorrent `files_checked` calls `finished()`, torrent.cpp:8805-8824
+// at v2.0.15). What it held to download is not given back: it held none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_torrent_added_complete_raises_no_download_event() {
+async fn a_torrent_added_with_its_data_in_place_raises_its_download_event() {
     let (metainfo, data) = placed_torrent();
     let rig = rig(set_clock());
     rig.db.enable_queue_scripts_for_test(rig.dir.path());
@@ -179,15 +181,61 @@ async fn a_torrent_added_complete_raises_no_download_event() {
     )
     .await;
     assert_eq!(view.downloaded_bytes, 0);
-    // Whether it downloaded is settled before it seeds.
-    {
-        let live = rig.service.inner.live.lock().await;
-        let torrent = &live[&job_id];
-        assert_eq!(
-            torrent.counters.downloaded_bytes,
-            torrent.downloaded_at_start
-        );
-    }
+    let downloaded = rig
+        .db
+        .queued_script_events_once(QueueEvent::TorrentDownloaded, 1)
+        .await;
+    assert_torrent_vars(&downloaded[0], &rig.service.torrent(job_id).await.unwrap());
+    rig.db
+        .queued_script_events_once(QueueEvent::JobDownloaded, 1)
+        .await;
+    rig.db.admitted_so_far().await;
+    assert_eq!(
+        rig.db
+            .queued_script_events(QueueEvent::TorrentDownloaded)
+            .len(),
+        1
+    );
+    assert_eq!(
+        rig.service.inner.releases[MemoryRelease::Ended as usize]
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    rig.service.stop().await;
+}
+
+// A torrent added in seed mode is finished from its add: it seeds without
+// TORRENT_DOWNLOADED or JOB_DOWNLOADED (qBittorrent sets its finished status
+// at the add, sessionimpl.cpp:2844, and `handleTorrentFinished` returns,
+// torrentimpl.cpp:2194-2198).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_torrent_added_in_seed_mode_raises_no_download_event() {
+    let (metainfo, data) = placed_torrent();
+    let rig = rig(set_clock());
+    rig.db.enable_queue_scripts_for_test(rig.dir.path());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let save = rig.dir.path().join("seeded-here");
+    std::fs::create_dir_all(save.join("placed")).unwrap();
+    std::fs::write(save.join("placed/a.bin"), &data).unwrap();
+    let (job_id, _) = completed_placed(
+        &rig,
+        metainfo,
+        Placement {
+            save_path: Some(save.to_string_lossy().into_owned()),
+            seed_mode: true,
+            ..Placement::default()
+        },
+    )
+    .await;
+    assert!(
+        rig.service
+            .torrent(job_id)
+            .await
+            .unwrap()
+            .completed_at_ms
+            .is_some()
+    );
     rig.db.admitted_so_far().await;
     assert_eq!(
         rig.db.queued_script_events(QueueEvent::TorrentAdded).len(),
@@ -203,6 +251,33 @@ async fn a_torrent_added_complete_raises_no_download_event() {
             .queued_script_events(QueueEvent::JobDownloaded)
             .is_empty()
     );
+    rig.service.stop().await;
+}
+
+// A torrent that wants no file is finished at once, and says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrent_that_wants_no_file_raises_its_download_event() {
+    let rig = rig(set_clock());
+    rig.db.enable_queue_scripts_for_test(rig.dir.path());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add_opened(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(plain("none", 4)))
+        })
+        .await
+        .unwrap();
+    rig.service
+        .set_file_priorities(job_id, &[(0, FilePriority::Ignored)])
+        .await
+        .unwrap();
+    rig.db
+        .queued_script_events_once(QueueEvent::TorrentDownloaded, 1)
+        .await;
+    rig.db
+        .queued_script_events_once(QueueEvent::JobDownloaded, 1)
+        .await;
     rig.service.stop().await;
 }
 

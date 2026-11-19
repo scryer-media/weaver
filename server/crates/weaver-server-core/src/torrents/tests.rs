@@ -12,6 +12,9 @@ use crate::torrents::{
 pub(crate) fn torrent(job_id: u64, v1: Option<[u8; 20]>, v2: Option<[u8; 32]>) -> TorrentRecord {
     TorrentRecord {
         unpack_in_force: None,
+        unpack_over: false,
+        unpack_end: None,
+        download_ends: 0,
         job_id: JobId(job_id),
         infohash_v1: v1,
         infohash_v2: v2,
@@ -180,7 +183,7 @@ fn intent_and_counters_update_in_place() {
     db.insert_torrent(&torrent(3, Some([3; 20]), None), &[])
         .unwrap();
 
-    assert!(db.set_torrent_completed(JobId(3), 9_000).unwrap());
+    assert!(db.set_torrent_completed(JobId(3), 9_000, 1).unwrap());
     // An intent written after, or racing, the completion keeps it: the two
     // are apart.
     assert!(
@@ -229,7 +232,7 @@ fn intent_and_counters_update_in_place() {
         !db.update_torrent_intent(JobId(4), TorrentIntent::Paused)
             .unwrap()
     );
-    assert!(!db.set_torrent_completed(JobId(4), 1).unwrap());
+    assert!(!db.set_torrent_completed(JobId(4), 1, 1).unwrap());
     assert!(!db.update_torrent_counters(JobId(4), &counters).unwrap());
 }
 
@@ -767,7 +770,7 @@ fn each_stored_word_of_a_torrent_reads_back_and_keeps_its_text() {
     }
     assert_eq!(
         HistoryEnd::ALL.map(HistoryEnd::as_str),
-        ["complete", "partial", "failed", "cancelled"]
+        ["complete", "failed", "cancelled"]
     );
 }
 
@@ -783,10 +786,8 @@ fn a_torrents_history_end_is_the_jobs_stored_status() {
     };
     for (status, end) in [
         (JobStatus::Complete, HistoryEnd::Complete),
-        (JobStatus::Partial, HistoryEnd::Partial),
         (failed.clone(), HistoryEnd::Failed),
     ] {
-        assert_eq!(HistoryEnd::delivered(&status), end);
         assert_eq!(end.as_str(), status.persisted_status());
         assert_eq!(
             job_status_from_persisted_str(end.as_str(), Some("why")),

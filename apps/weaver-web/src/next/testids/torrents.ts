@@ -61,6 +61,9 @@ export const torrentIds = {
   file: "torrent-file",
   filePath: "torrent-file-path",
   fileProgress: "torrent-file-progress",
+  // How its unpacking came out, and a file its unpacking placed beside its own.
+  unpacking: "torrent-unpacking",
+  unpackedFile: "torrent-unpacked-file",
   // The seeding block: the override button, a term's value by the term, and
   // the level it comes from by the product's level.
   seedingOverride: "torrent-seeding-override",

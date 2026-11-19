@@ -31,7 +31,6 @@ use crate::persistence::Database;
 use crate::pipeline::ExtractionLimits;
 use crate::pipeline::graph::engine::{DecodePool, Outside, RunMail, Said};
 use crate::pipeline::graph::status::RepairSlots;
-use crate::pipeline::graph::status::{Delivery, Failure};
 use crate::scratch::ScratchLedger;
 use crate::settings::model::{TrackerCertificate, TrackerRule, tracker_rule_for};
 use crate::settings::{Config, TorrentEncryption, TransportRule};
@@ -620,6 +619,16 @@ impl Signal {
         self.marked(job_id, CHECKPOINT_PIECES);
     }
 
+    // Its checkpoint due at the settle, with nothing for it to look at: a
+    // torrent that completed keeps every piece it has at once, so a crash
+    // while it seeds fetches none again (qBittorrent asks for its resume
+    // data at finish, `TorrentImpl::handleTorrentFinished`,
+    // torrentimpl.cpp:2205).
+    pub(super) fn checkpoint_due(&self, job_id: JobId) {
+        *locked(&self.unsaved).entry(job_id).or_default() += CHECKPOINT_PIECES;
+        self.wake.notify_one();
+    }
+
     fn marked(&self, job_id: JobId, pieces: u32) {
         locked(&self.dirty).insert(job_id);
         *locked(&self.unsaved).entry(job_id).or_default() += pieces;
@@ -712,10 +721,11 @@ impl Signal {
         locked(&self.whole).remove(&job_id).unwrap_or_default()
     }
 
-    fn take_unsaved(&self) -> BTreeSet<JobId> {
-        std::mem::take(&mut *locked(&self.unsaved))
+    fn take_unsaved(&self) -> Owed<'_> {
+        let jobs = std::mem::take(&mut *locked(&self.unsaved))
             .into_keys()
-            .collect()
+            .collect();
+        Owed { signal: self, jobs }
     }
 
     fn take_unsaved_one(&self, job_id: JobId) -> bool {
@@ -723,7 +733,7 @@ impl Signal {
     }
 
     // The jobs whose checkpoint is [`CHECKPOINT_PIECES`] pieces behind.
-    fn take_due(&self) -> BTreeSet<JobId> {
+    fn take_due(&self) -> Owed<'_> {
         let mut unsaved = locked(&self.unsaved);
         let due: BTreeSet<JobId> = unsaved
             .iter()
@@ -731,7 +741,42 @@ impl Signal {
             .map(|(job_id, _)| *job_id)
             .collect();
         unsaved.retain(|job_id, _| !due.contains(job_id));
-        due
+        Owed {
+            signal: self,
+            jobs: due,
+        }
+    }
+}
+
+// Checkpoints taken off the unsaved, owed until [`Owed::queued`]: dropped
+// before, as a task a stop aborts drops them part way, they are due
+// again, so the next settle or the stop's own checkpoint writes them. One queued twice writes
+// nothing the second time.
+pub(super) struct Owed<'a> {
+    signal: &'a Signal,
+    jobs: BTreeSet<JobId>,
+}
+
+impl Owed<'_> {
+    pub(super) fn jobs(&self) -> &BTreeSet<JobId> {
+        &self.jobs
+    }
+
+    // Every checkpoint taken is queued.
+    pub(super) fn queued(mut self) {
+        self.jobs.clear();
+    }
+}
+
+impl Drop for Owed<'_> {
+    fn drop(&mut self) {
+        if self.jobs.is_empty() {
+            return;
+        }
+        let mut unsaved = locked(&self.signal.unsaved);
+        for &job_id in &self.jobs {
+            *unsaved.entry(job_id).or_default() += CHECKPOINT_PIECES;
+        }
     }
 }
 
@@ -889,9 +934,6 @@ struct Inner {
     // latest, and does nothing.
     history_turns: Mutex<HashMap<JobId, u64>>,
     next_history_turn: AtomicU64,
-    // Counts the waiters on a history row kept for room that have ended.
-    #[cfg(test)]
-    history_waits: watch::Sender<u64>,
     queue: Mutex<Option<SchedulerHandle>>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     tick: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -1027,8 +1069,6 @@ impl TorrentService {
                 retiring: Mutex::default(),
                 history_turns: Mutex::default(),
                 next_history_turn: AtomicU64::new(0),
-                #[cfg(test)]
-                history_waits: watch::channel(0).0,
                 queue: Mutex::new(None),
                 tasks: Mutex::new(Vec::new()),
                 tick: Mutex::new(None),
@@ -1192,9 +1232,7 @@ impl TorrentService {
         let tees: Vec<(JobId, Arc<Tee>)> = {
             let live = self.inner.live.lock().await;
             live.iter()
-                .filter_map(|(&job_id, torrent)| {
-                    Some((job_id, Arc::clone(torrent.store.as_ref()?.tee()?)))
-                })
+                .filter_map(|(&job_id, torrent)| Some((job_id, torrent.store.as_ref()?.tee()?)))
                 .collect()
         };
         for (job_id, tee) in tees {
@@ -1203,8 +1241,9 @@ impl TorrentService {
         if let Some(hearing) = locked(&self.inner.hearing).take() {
             hearing.abort();
         }
-        self.save_checkpoints(self.inner.signal.take_unsaved())
-            .await;
+        let unsaved = self.inner.signal.take_unsaved();
+        self.save_checkpoints(unsaved.jobs().clone()).await;
+        unsaved.queued();
         // libtorrent `torrent::abort` waits out the disk jobs outstanding:
         // every save queued before here, a stopped task's among them, has
         // landed when stop returns.
@@ -1647,6 +1686,17 @@ pub(crate) static PLACE_PANICS: std::sync::atomic::AtomicBool =
 pub(crate) static KEEP_FAILS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+// Test seam: the next write of a torrent's completion is refused.
+#[cfg(test)]
+pub(crate) static COMPLETION_FAILS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+// Test seam: the next write of the mark that a torrent's unpacking ended
+// short is refused.
+#[cfg(test)]
+pub(crate) static UNPACK_OVER_FAILS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 // Test seam: run once a move of a torrent's placed files has moved them,
 // right before the write of the move to its row.
 #[cfg(test)]
@@ -1710,29 +1760,6 @@ fn unplaced(work: &Path, error: &impl std::fmt::Display) -> String {
         "the unpacked files could not be placed beside the torrent's files ({error}); they are kept in {}",
         work.display()
     )
-}
-
-// How a torrent's job ends when unpacking left it short of what it would
-// deliver, from its own files it has whole, `own`, and the files unpacking
-// placed beside them, `unpacked` (AGENTS.md, "Job status: Partial"): as a
-// graph job's delivery ends (`Delivery::status`), the one judgement both
-// kinds of job take. Partial when one of them is a usable end file, failed
-// for `why` when none is. An archive volume, a split part and recovery data
-// are never usable files, whole or not, and an own file that is furniture
-// is no file of the delivery, as an NZB job's root furniture is not.
-fn short_status(own: &[String], unpacked: &[String], why: &str) -> JobStatus {
-    let failure = Failure {
-        objects: Vec::new(),
-        message: why.to_owned(),
-        rejection: None,
-        from_feed: false,
-    };
-    Delivery::of_whole_files(own.iter().cloned(), unpacked.iter().cloned()).status(Some(&failure))
-}
-
-// Whether the torrent's job unpacks, as its metainfo fixed it.
-fn unpacks(torrent: &Live) -> bool {
-    torrent.record.unpack_in_force.unwrap_or_default()
 }
 
 // The bytes in hand of the files that go to disk: the progress over the

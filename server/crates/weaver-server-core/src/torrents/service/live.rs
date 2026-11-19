@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use super::checkpoints::{Ledger, Resume};
+use super::checkpoints::{Ledger, OwedRow, Resume};
 use super::disk_room::DiskHeld;
 use super::intake::{About, Resolving};
 use super::moves::Moving;
@@ -144,9 +144,6 @@ pub(super) struct Live {
     pub(super) have_bytes: u64,
     // The pieces it kept, until its store is back.
     pub(super) kept_pieces: u32,
-    // Why unpacking refused it, as its history kept it when it was
-    // restored: a restored job does not say.
-    pub(super) failed: Option<String>,
     // What the boot read of its rows for its first store and its first
     // attach, each taken by the one it is for; a later one reads its row.
     pub(super) kept_at_boot: Option<Option<Kept>>,
@@ -193,6 +190,7 @@ impl Live {
                 peers_at_ms: now,
                 times_at_ms,
                 lost: Arc::default(),
+                row_owed: Arc::default(),
             },
             resume,
             names: Vec::new(),
@@ -235,7 +233,6 @@ impl Live {
             file_have: Vec::new(),
             have_bytes: 0,
             kept_pieces: 0,
-            failed: None,
             kept_at_boot: None,
             stamps_at_boot: None,
             verified_at_boot: None,
@@ -247,16 +244,51 @@ impl Live {
         self.record.completed_at_ms.is_some()
     }
 
-    // Short of complete, wanting a file, with its store holding every file
-    // it wants whole: the next settle completes it. One that wants none
-    // seeds without completing, and fetches again once it wants a file.
+    // Short of complete, with its store holding every file it wants whole:
+    // the next settle completes it. One that wants none has every file it
+    // wants, and completes too (libtorrent `piece_picker::is_finished` with
+    // every piece filtered, `update_peer_interest` -> `finished()`,
+    // torrent.cpp:5880-5915 at v2.0.15; qBittorrent `handleTorrentFinished`
+    // on the `torrent_finished_alert`).
     pub(super) fn completes(&self) -> bool {
         let levels = &self.levels;
         !self.complete()
-            && levels.iter().any(|level| level.wanted())
             && self.store.as_ref().is_some_and(|store| {
                 store.has_files(|file| levels.get(file).copied().unwrap_or_default().wanted())
             })
+    }
+
+    // Whether a complete torrent with `held` as its levels is short of
+    // complete: a file it wants is not whole, as when a file it ignored is
+    // wanted again (qBittorrent `TorrentImpl::prioritizeFiles` clears
+    // `m_hasFinishedStatus`, torrentimpl.cpp:3045-3057; libtorrent
+    // `resume_download`, torrent.cpp:8653-8676 at v2.0.15), or when it was
+    // stored complete with levels a write after it changed. What it has is
+    // its store's, or, before its store is open, the pieces it kept; one
+    // that kept none, or is in seed mode, which has every piece as added,
+    // is taken as whole until its store says otherwise. One whose
+    // unpacking is over reopens with no tee, and does not unpack again.
+    pub(super) fn reopens(&self, held: &[FilePriority]) -> bool {
+        let wanted = |file: usize| held.get(file).copied().unwrap_or_default().wanted();
+        let whole = match (&self.store, &self.layout) {
+            (Some(store), _) => store.has_files(wanted),
+            (None, Some(layout))
+                if !self.record.seed_mode && matches!(self.kept_at_boot, Some(Some(_))) =>
+            {
+                crate::torrents::store::has_files(layout, &self.file_have, wanted)
+            }
+            (None, _) => true,
+        };
+        self.complete() && !whole
+    }
+
+    // Whether its job unpacks, as its metainfo fixed it, and its unpacking
+    // is not over: the one owner of whether it makes a tee and takes the
+    // tee's branch. One whose unpacking ended, whole or short, and that
+    // downloads again, as when a file it ignored is wanted, makes none: its
+    // unpacking does not run again, and its outputs and history stay.
+    pub(super) fn unpacking(&self) -> bool {
+        self.record.unpack_in_force.unwrap_or_default() && !self.record.unpack_over
     }
 
     // Complete, or with every piece it wants had as the session last said.
@@ -278,15 +310,13 @@ impl Live {
     }
 
     // What it shows until its store is back, from what was stored: the
-    // pieces it kept, as the store restored from them will have, and the
-    // failure its history keeps.
-    pub(super) fn kept(&mut self, failed: Option<String>, kept: Option<&Kept>) {
+    // pieces it kept, as the store restored from them will have.
+    pub(super) fn kept(&mut self, kept: Option<&Kept>) {
         if let (Some(kept), Some(layout)) = (kept, &self.layout) {
             let (count, file_have) = kept.had(layout);
             self.hold(file_have);
             self.kept_pieces = count;
         }
-        self.failed = failed;
     }
 
     // Fold what the session moved since the last reading into the ledger,
@@ -371,6 +401,22 @@ impl Live {
         self.record.intent() == TorrentIntent::Resumed
     }
 
+    // A write of how many times its download ended, or that its unpacking
+    // is over, failed: its checkpoints write both again until one lands.
+    pub(super) fn owe_row(&self) {
+        self.ledger.row_owed.fetch_add(1, Ordering::AcqRel);
+    }
+
+    // What its row lacks of memory, while a failed write left it owed.
+    pub(super) fn owed_row(&self) -> Option<OwedRow> {
+        OwedRow::taken(
+            self.record.download_ends,
+            self.record.unpack_over,
+            self.record.unpack_end.as_ref(),
+            &self.ledger.row_owed,
+        )
+    }
+
     // Whether a start of the torrent's run now would wait on a move of its
     // files. The start after an error forgets every piece to check them
     // all (`ManagedTorrent::start`), which opens the files to reads
@@ -396,16 +442,6 @@ impl Live {
             tracing::warn!(job_id = self.record.job_id.0, error = %error, "a torrent's run did not change");
         }
         self.run_error = result.err().map(|error| format!("{error:#}"));
-    }
-
-    // Why unpacking refused the torrent's output, while that stands: the
-    // job's word, or the one its history keeps.
-    pub(super) fn refusal(&self) -> Option<String> {
-        self.store
-            .as_ref()
-            .and_then(|store| store.tee())
-            .and_then(|tee| tee.refusal())
-            .or_else(|| self.failed.clone())
     }
 
     // A write found no room: the session fetches nothing for the torrent
@@ -611,7 +647,6 @@ impl Live {
             intent: self.record.intent(),
             queued: self.queued,
             paused_by: self.paused_by,
-            failed: self.refusal(),
             held: self.held.clone(),
             moving: self.moving.is_some(),
             restore_held: self.restore_held.clone(),

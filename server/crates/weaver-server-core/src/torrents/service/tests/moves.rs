@@ -844,7 +844,14 @@ async fn a_recheck_reads_files_a_move_left_shut_and_finds_the_torrents_own() {
 async fn a_run_ended_after_a_move_kept_a_file_checks_every_piece_at_the_next_start() {
     let (rig, job_id, data, _, _) = seeding_beside_a_taken_name().await;
     let checking = |db: &Database| db.torrent_pieces(job_id).unwrap().unwrap().checking;
+    // Its completion has its checkpoint written by a settle of its own,
+    // which may hold the pieces this save would write: either lands them.
+    let mut written = rig.service.written();
     rig.service.save_checkpoints([job_id].into()).await;
+    written
+        .wait_for(|_| rig.db.torrent_pieces(job_id).unwrap().is_some())
+        .await
+        .unwrap();
     assert!(!checking(&rig.db), "vouched for before any move");
 
     // A move that keeps nothing: marked while it lasts, vouched for after.

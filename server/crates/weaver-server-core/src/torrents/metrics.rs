@@ -160,6 +160,12 @@ impl Counters {
         self.events[event as usize].fetch_add(1, Ordering::Relaxed);
     }
 
+    // How many of `event` were counted.
+    #[cfg(test)]
+    pub(crate) fn count(&self, event: TorrentEvent) -> u64 {
+        self.events[event as usize].load(Ordering::Relaxed)
+    }
+
     pub(crate) fn fetch(&self, outcome: FetchOutcome) {
         self.fetches[outcome as usize].fetch_add(1, Ordering::Relaxed);
     }

@@ -654,6 +654,71 @@ async fn admission_preserves_event_order_and_coalesces_pending_files() {
     assert_eq!(db.claim_script_event().unwrap().unwrap().0, downloaded);
 }
 
+// An NZB job's download ends once: a second NZB_DOWNLOADED raised for it,
+// after the first ran, runs nothing, adds no row and answers with the
+// first's runs. An end its owner numbers past the first is a new one.
+#[tokio::test]
+async fn a_second_download_end_of_an_nzb_job_is_refused() {
+    let (db, _data) = configured();
+    history(&db, 35);
+    db.script_runtime
+        .worker_active
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let rows = || {
+        let datastore = db.datastore();
+        db.run_sql_blocking_read(async move {
+            SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT run_id, event, state, occurrence FROM script_event_queue WHERE job_id = 35 ORDER BY seq",
+                &[],
+            )
+            .await?
+            .into_iter()
+            .map(|row| {
+                Ok((
+                    row.text("run_id")?,
+                    row.text("event")?,
+                    row.text("state")?,
+                    row.i64("occurrence")?,
+                ))
+            })
+            .collect::<Result<Vec<_>, StateError>>()
+        })
+        .unwrap()
+    };
+    let (downloaded, generic) =
+        db.admit_queue_script_events(event(35, QueueEvent::NzbDownloaded), false);
+    let first = [
+        downloaded.await.unwrap().unwrap().unwrap(),
+        generic.unwrap().await.unwrap().unwrap().unwrap(),
+    ];
+    for _ in 0..2 {
+        let (claimed, _, _) = db.claim_script_event().unwrap().unwrap();
+        db.finish_script_event(&claimed).unwrap();
+    }
+    let before = rows();
+    assert_eq!(before.len(), 2);
+    assert!(before.iter().all(|row| row.2 == "done" && row.3 == 0));
+
+    let (downloaded, generic) =
+        db.admit_queue_script_events(event(35, QueueEvent::NzbDownloaded), false);
+    let again = [
+        downloaded.await.unwrap().unwrap().unwrap(),
+        generic.unwrap().await.unwrap().unwrap().unwrap(),
+    ];
+    assert_eq!(again, first);
+    assert_eq!(rows(), before);
+    assert!(db.claim_script_event().unwrap().is_none());
+
+    let (downloaded, generic) = db.admit_download_end(event(35, QueueEvent::NzbDownloaded), 1);
+    let next = [
+        downloaded.await.unwrap().unwrap().unwrap(),
+        generic.unwrap().await.unwrap().unwrap().unwrap(),
+    ];
+    assert!(next.iter().all(|run| !first.contains(run)));
+    assert_eq!(rows().len(), 4);
+}
+
 #[tokio::test]
 async fn deletion_waits_pending_admission_and_removed_history_cannot_enqueue_afterward() {
     let (db, _data) = configured();

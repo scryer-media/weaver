@@ -514,6 +514,7 @@ fn view(state: TorrentState) -> TorrentView {
         upload_cap: None,
         unpack: true,
         unpack_override: None,
+        unpack_end: None,
         route: None,
         files: Vec::new(),
         sequential: false,
@@ -1658,10 +1659,18 @@ async fn a_duplicate_fails_and_a_refusal_conflicts() {
             ..PostProcessingSettings::default()
         })
         .unwrap();
-    // A torrent of only unwanted files is added with every file left out,
-    // as qBittorrent adds it, not refused.
+    // A torrent of only unwanted files is added with nothing wanted, as
+    // qBittorrent's filename filter skips every matching file
+    // (`applyFilenameFilter`); one named after an executable is refused.
     let unwanted = rig.add_file(&metainfo("disc.iso", 2000, false), &[]).await;
     assert_eq!(unwanted.json()["success_count"], 1, "{}", unwanted.body);
+    let refused = rig.add_file(&metainfo("setup.exe", 2000, false), &[]).await;
+    assert_eq!(refused.status, StatusCode::CONFLICT);
+    assert!(
+        refused.body.contains("is an executable"),
+        "{}",
+        refused.body
+    );
 
     // A magnet is added whatever its route's state, as qBittorrent adds one
     // at once (the rig's route is down, so it is held), and the same hash
@@ -3925,6 +3934,80 @@ fn a_files_level_reads_as_the_clients_number_and_back() {
     }
 }
 
+// What a torrent's unpacking placed is listed after the torrent's own files,
+// numbered on after them, its name and length with all of it in hand and no
+// piece range, level or availability; a failed unpacking placed nothing and
+// lists nothing more. However the unpacking came out, the torrent's state
+// reads as a torrent's with nothing to unpack: seeding, stalled or uploading,
+// and stopped when it is paused, never an error.
+#[test]
+fn unpacked_files_list_after_the_torrents_own_and_never_touch_its_state() {
+    use weaver_server_core::torrents::service::TorrentPieces;
+    use weaver_server_core::torrents::{FilePriority, UnpackEnd, UnpackResult, UnpackedFile};
+    let mut seeding = view(TorrentState::Seeding);
+    seeding.files = vec![TorrentFile {
+        index: 0,
+        path: "set/set.rar".into(),
+        length: 100,
+        priority: FilePriority::Normal,
+    }];
+    seeding.file_have = vec![100];
+    seeding.pieces = Some(TorrentPieces {
+        count: 1,
+        size: 16_384,
+        have: 1,
+    });
+    seeding.completed_at_ms = Some(1_700_000_000_000);
+    let unpacked = [UnpackedFile {
+        name: "set/clip.mkv".into(),
+        length: 90,
+    }];
+    let listed = listing(&seeding, &unpacked, 0..2);
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0]["name"], "set/set.rar");
+    assert_eq!(listed[0]["is_seed"], true);
+    assert_eq!(
+        listed[1],
+        json!({"index": 1, "name": "set/clip.mkv", "size": 90, "progress": 1})
+    );
+    // Asked for by index, in the order asked.
+    let asked = listing(&seeding, &unpacked, [1, 0]);
+    assert_eq!(
+        asked
+            .iter()
+            .map(|file| file["index"].clone())
+            .collect::<Vec<_>>(),
+        [json!(1), json!(0)]
+    );
+    assert_eq!(asked[0]["is_seed"], true);
+    // A failed unpacking placed nothing: the torrent's own files only.
+    let own = listing(&seeding, &[], 0..1);
+    assert_eq!(own.len(), 1);
+    assert_eq!(own, file_list(&seeding, 0..1));
+
+    let end = |result, why: Option<&str>| UnpackEnd {
+        result,
+        why: why.map(str::to_owned),
+    };
+    for end in [
+        end(UnpackResult::Whole, None),
+        end(UnpackResult::Part, Some("damaged: notes.txt")),
+        end(UnpackResult::Failed, Some("missing a volume")),
+        end(
+            UnpackResult::Refused,
+            Some("x.exe has an unwanted extension"),
+        ),
+    ] {
+        let mut ended = seeding.clone();
+        ended.unpack_end = Some(end.clone());
+        assert_eq!(state(&ended), "stalledUP", "{end:?}");
+        ended.upload_bps = 1;
+        assert_eq!(state(&ended), "uploading", "{end:?}");
+        ended.state = TorrentState::Paused;
+        assert_eq!(state(&ended), "stoppedUP", "{end:?}");
+    }
+}
+
 // filePrio sets the named files' level, which files reports; the two
 // toggles flip each named torrent, which info and properties report.
 #[tokio::test(start_paused = true)]
@@ -4014,6 +4097,65 @@ async fn file_levels_and_picking_toggles_are_set_and_reported() {
     )
     .await;
     assert_eq!(picking().await, (json!(false), json!(true)));
+}
+
+// A torrent whose every file is set to priority 0 has every piece it wants
+// and reads as finished, with a completion time; a file wanted again that it
+// lacks takes it back to a downloading state, its completion time gone
+// (qBittorrent `handleTorrentFinished` on the `torrent_finished_alert`;
+// `prioritizeFiles`, and libtorrent `resume_download` clearing
+// `m_completed_time`).
+#[tokio::test(start_paused = true)]
+async fn a_torrent_that_wants_nothing_reads_finished_until_it_wants_a_file() {
+    let rig = rig().await;
+    rig.add_file(&metainfo("one.mkv", 3000, false), &[]).await;
+    let hash = rig.torrents().await[0]["hash"].as_str().unwrap().to_owned();
+    let service = rig.context.inner.torrents.as_ref().unwrap();
+    let snapshot = service.snapshot();
+    let mut revision = snapshot.subscribe();
+    let set = |number: u8| {
+        let rig = &rig;
+        let hash = hash.clone();
+        async move {
+            let set = rig
+                .post(
+                    "/api/v2/torrents/filePrio",
+                    &format!("hash={hash}&id=0&priority={number}"),
+                )
+                .await;
+            assert_eq!(set.status, StatusCode::OK);
+        }
+    };
+    let row = async || rig.torrents().await[0].clone();
+    assert_eq!(row().await["completion_on"], -1);
+
+    set(0).await;
+    loop {
+        revision.borrow_and_update();
+        let (_, rows) = snapshot.every();
+        if rows[0].view.completed_at_ms.is_some() {
+            break;
+        }
+        revision.changed().await.unwrap();
+    }
+    let done = row().await;
+    assert!(done["completion_on"].as_i64().unwrap() > 0, "{done}");
+    assert!(done["state"].as_str().unwrap().ends_with("UP"), "{done}");
+    assert_eq!(done["amount_left"], 0, "{done}");
+
+    set(1).await;
+    loop {
+        revision.borrow_and_update();
+        let (_, rows) = snapshot.every();
+        if rows[0].view.completed_at_ms.is_none() && rows[0].view.wanted_bytes == 3000 {
+            break;
+        }
+        revision.changed().await.unwrap();
+    }
+    let again = row().await;
+    assert_eq!(again["completion_on"], -1, "{again}");
+    assert!(again["state"].as_str().unwrap().ends_with("DL"), "{again}");
+    assert_eq!(again["amount_left"], 3000, "{again}");
 }
 
 // Trackers are added by tier, edited, removed and reannounced to by hash,

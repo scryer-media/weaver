@@ -5,7 +5,9 @@ use super::disk_room::disk_warning;
 use super::listing::{CategoryPick, FileTotals, Pick, Shown};
 use super::live::Live;
 use super::settings::{Presence, SeedingLevels, TorrentSettings};
-use super::{NotReady, Reading, TorrentService, files_of, hashes_of, on_disk, report, wanted};
+use super::{
+    ActionError, NotReady, Reading, TorrentService, files_of, hashes_of, on_disk, report, wanted,
+};
 use crate::categories::model::resolve_category_config;
 use crate::jobs::JobId;
 use crate::jobs::handle::{HoldOrigin, JobInfo};
@@ -21,7 +23,7 @@ use crate::torrents::sessions::TorrentRouteReason;
 use crate::torrents::status::Engine;
 use crate::torrents::{
     FilePriority, TorrentCounters, TorrentFile, TorrentSource, TorrentState, TorrentTracker,
-    TrackerEntry, TrackerStatus, status,
+    TrackerEntry, TrackerStatus, UnpackEnd, UnpackedFile, status,
 };
 use bytes::Bytes;
 use std::collections::{BTreeMap, HashMap};
@@ -143,6 +145,9 @@ pub struct TorrentView {
     pub unpack: bool,
     /// Whether it was asked to extract its archives; `None` inherits.
     pub unpack_override: Option<bool>,
+    /// How its unpacking came out, once over: the unpacking's own line,
+    /// which nothing of the torrent's reads.
+    pub unpack_end: Option<UnpackEnd>,
     pub route: Option<String>,
     pub files: Vec<TorrentFile>,
     /// Whether its pieces are fetched in order.
@@ -676,6 +681,7 @@ impl TorrentService {
                 .unpack_in_force
                 .unwrap_or_else(|| settings.unpack(record, rule)),
             unpack_override: record.unpack,
+            unpack_end: record.unpack_end.clone(),
             scope: settings.scope(record.category_id, rule),
             route: torrent.route.as_ref().map(|key| key.as_str().to_owned()),
             files: Vec::new(),
@@ -745,6 +751,42 @@ impl TorrentService {
             self.tag(&mut [&mut view]);
         }
         Some(view)
+    }
+
+    /// The files the torrent's unpacking placed beside its own, which its
+    /// file list shows after them: each by its name under the directory its
+    /// files are in, as its row keeps them, with its length on disk. One no
+    /// longer there is not listed. They are no piece, peer or progress of
+    /// the torrent's. One read of its row and one look at each file, off the
+    /// runtime.
+    pub async fn unpacked_files(&self, job_id: JobId) -> Result<Vec<UnpackedFile>, ActionError> {
+        self.ensure(&[job_id]).await;
+        let dir = {
+            let live = self.inner.live.lock().await;
+            let torrent = live.get(&job_id).ok_or(ActionError::NotFound(job_id))?;
+            if torrent.record.unpack_end.is_none() {
+                return Ok(Vec::new());
+            }
+            super::files_dir(torrent)
+        };
+        let db = self.inner.db.clone();
+        tokio::task::spawn_blocking(move || {
+            let names = db
+                .torrent_outputs(job_id)
+                .map_err(|error| ActionError::State(error.to_string()))?;
+            Ok(names
+                .into_iter()
+                .filter_map(|name| {
+                    let meta = std::fs::metadata(dir.join(&name)).ok()?;
+                    meta.is_file().then_some(UnpackedFile {
+                        name,
+                        length: meta.len(),
+                    })
+                })
+                .collect())
+        })
+        .await
+        .map_err(|error| ActionError::State(error.to_string()))?
     }
 
     /// What a support report reads of one torrent: its view, its metainfo,

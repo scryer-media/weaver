@@ -31,7 +31,7 @@ pub use availability::{
 pub use model::{
     ContentLayout, FilePriority, Infohash, KeptIntent, TorrentCounters, TorrentFile, TorrentInsert,
     TorrentIntent, TorrentRecord, TorrentSource, TorrentState, TorrentTracker, TrackerEntry,
-    TrackerStatus,
+    TrackerStatus, UnpackEnd, UnpackResult, UnpackedFile,
 };
 pub use weaver_torrent::analysis;
 pub use weaver_torrent::tracker::redacted_tracker_url;

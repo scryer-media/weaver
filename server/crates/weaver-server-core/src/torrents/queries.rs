@@ -10,14 +10,14 @@ use crate::settings::SeedingPolicy;
 use crate::torrents::model::{parse_file_priorities, parse_named_by};
 use crate::torrents::{
     ContentLayout, FilePriority, Infohash, KeptIntent, TorrentCounters, TorrentRecord,
-    TorrentSource, TrackerEntry,
+    TorrentSource, TrackerEntry, UnpackEnd, UnpackResult,
 };
 
 pub(crate) const TORRENT_COLUMNS: &str = "job_id, infohash_v1, infohash_v2, name, source, metainfo, \
      category_id, added_at_ms, state, forced, completed_at_ms, storage_dir, \
      policy_override, unpack, unpack_in_force, metadata, upload_limit, download_limit, \
      sequential, first_last_piece_first, save_path, content_layout, files_dir, seed_mode, move_to, \
-     queue_position, pool_member, private";
+     queue_position, pool_member, private, unpack_over, download_ends, unpack_end, unpack_why";
 
 fn corrupt(what: &str, value: impl std::fmt::Display) -> StateError {
     StateError::Database(format!("stored torrent {what} is not valid: {value}"))
@@ -135,8 +135,24 @@ pub(crate) fn torrent_and_seal(
         queue_position: row.i64("queue_position")?,
         pool_member: opt_u32(row, "pool_member")?,
         private: row.bool("private")?,
+        unpack_over: row.bool("unpack_over")?,
+        unpack_end: unpack_end_of(row)?,
+        download_ends: opt_u64(row, "download_ends")?.unwrap_or_default(),
     };
     Ok((record, sealed))
+}
+
+// How its unpacking came out, as its row keeps it; none while it is not
+// over, or when it never unpacked.
+fn unpack_end_of(row: &SqlRow) -> Result<Option<UnpackEnd>, StateError> {
+    let Some(result) = row.opt_text("unpack_end")? else {
+        return Ok(None);
+    };
+    let result = UnpackResult::parse(&result).ok_or_else(|| corrupt("unpack result", &result))?;
+    Ok(Some(UnpackEnd {
+        result,
+        why: row.opt_text("unpack_why")?,
+    }))
 }
 
 // The torrents going by any of `infohashes`; it matches none when empty.
@@ -912,7 +928,6 @@ impl Database {
                             .map_or(Some(Vec::new()), |text| serde_json::from_str(&text).ok()),
                         trackers: Ok(Vec::new()),
                         counters: None,
-                        failure: None,
                     })
                 })
                 .collect::<Result<Vec<_>, StateError>>()?;
@@ -987,21 +1002,6 @@ impl Database {
                         counters.stamps.push((file, time));
                     }
                 }
-                let rows = SqlRuntime::fetch_all(
-                    datastore.read_exec(),
-                    &format!(
-                        "SELECT job_id, error_message FROM job_history \
-                          WHERE job_id IN ({among}) AND status IN ('failed', 'partial') \
-                            AND error_message IS NOT NULL"
-                    ),
-                    &args,
-                )
-                .await?;
-                for row in &rows {
-                    if let Some(&index) = at.get(&count(row, "job_id")?) {
-                        restored[index].failure = Some(row.text("error_message")?);
-                    }
-                }
             }
             for list in restored
                 .iter_mut()
@@ -1064,9 +1064,6 @@ pub(crate) struct RestoredTorrent {
     pub(crate) trackers: Result<Vec<TrackerEntry>, String>,
     // Its ledger, saved peers and kept pieces; None with no row of them.
     pub(crate) counters: Option<crate::torrents::persistence::CountersRow>,
-    // Why unpacking left it short, as its history keeps it failed or
-    // partial: what [`Database::get_job_history`] gives a torrent's restore.
-    pub(crate) failure: Option<String>,
 }
 
 pub(crate) fn counters_from_row(row: &SqlRow) -> Result<TorrentCounters, StateError> {

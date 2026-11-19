@@ -2,177 +2,9 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // A finished torrent goes through the owners a finished NZB job goes
-// through, and each gives the two kinds the same answer on the same input.
-
-use weaver_graph::{MemberId, NodeId, Posted, Provenance, Tree};
+// through: its history and the archives of what it wrote.
 
 use super::*;
-use crate::pipeline::graph::status::Unarrived;
-
-const LENGTH: u64 = 64;
-
-// The status an NZB job's graph rules for a post of `files`, each whole or
-// not, failed for `why`: its root members as the walk reads them, a piece
-// named as the pipeline names one (`names_a_piece`).
-fn usenet_status(files: &[(&str, bool)], why: &str) -> JobStatus {
-    let mut tree = Tree::new();
-    let mut objects = weaver_objects::Objects::default();
-    let mut effects = Vec::new();
-    for (name, whole) in files {
-        let member = tree.announce_root(name, Some(LENGTH), &mut effects);
-        if *whole {
-            let arrival = Posted {
-                offset: 0,
-                bytes: bytes::Bytes::from(vec![b'e'; LENGTH as usize]).into(),
-                provenance: Provenance::Fresh,
-            };
-            tree.deliver(NodeId::ROOT, member, arrival, &mut objects, &mut effects);
-            tree.close(NodeId::ROOT, member, &mut objects, &mut effects);
-        }
-    }
-    let piece = |node: NodeId, member: MemberId| {
-        tree.namespace(node)
-            .and_then(|namespace| namespace.get(member))
-            .is_some_and(|member| crate::pipeline::post_health::names_a_piece(&member.output_name))
-    };
-    let delivery = Delivery::read(
-        &tree,
-        |_| true,
-        crate::pipeline::graph::status::root_furniture(),
-        |_, _| crate::pipeline::graph::status::Described::Otherwise,
-        |_, _| None,
-        piece,
-        |_| Unarrived::Short,
-    );
-    let failure = Failure {
-        objects: Vec::new(),
-        message: why.to_owned(),
-        rejection: None,
-        from_feed: false,
-    };
-    delivery.status(Some(&failure))
-}
-
-// The status a torrent's job ends with for the same files: the names of
-// those it has whole.
-fn torrent_status(files: &[(&str, bool)], why: &str) -> JobStatus {
-    let whole: Vec<String> = files
-        .iter()
-        .filter(|(_, whole)| *whole)
-        .map(|(name, _)| (*name).to_owned())
-        .collect();
-    short_status(&whole, &[], why)
-}
-
-const WHY: &str = "unpacking refused the archive";
-
-// AGENTS.md "Job status: Partial": one .mkv in a five-volume RAR, one
-// volume lost and nothing to rebuild it. Four volumes arrived whole, no
-// usable file came out: Failed, for the torrent as for the NZB job.
-#[test]
-fn a_five_volume_rar_short_a_volume_fails_for_both_kinds() {
-    let files = [
-        ("ember.part1.rar", true),
-        ("ember.part2.rar", true),
-        ("ember.part3.rar", false),
-        ("ember.part4.rar", true),
-        ("ember.part5.rar", true),
-    ];
-    let failed = JobStatus::Failed {
-        error: WHY.to_owned(),
-    };
-    assert_eq!(usenet_status(&files, WHY), failed);
-    assert_eq!(torrent_status(&files, WHY), failed);
-}
-
-// Three plain files and no recovery, one of them short: the two whole ones
-// are usable, so the job is Partial for both kinds.
-#[test]
-fn three_plain_files_one_short_are_partial_for_both_kinds() {
-    let files = [
-        ("ember.mkv", true),
-        ("ember.srt", false),
-        ("ember.nfo", true),
-    ];
-    assert_eq!(usenet_status(&files, WHY), JobStatus::Partial);
-    assert_eq!(torrent_status(&files, WHY), JobStatus::Partial);
-}
-
-// Furniture is no usable file for either kind, by the one rule an NZB
-// job's root furniture follows (`par2_damage_ignorable`, nfo, sfv, srr and
-// nzb by default): a whole .nfo beside a refused archive fails both.
-#[test]
-fn a_whole_nfo_beside_a_refused_archive_fails_for_both_kinds() {
-    let files = [
-        ("ember.nfo", true),
-        ("ember.srr", true),
-        ("ember.part1.rar", true),
-        ("ember.part2.rar", false),
-    ];
-    let failed = JobStatus::Failed {
-        error: WHY.to_owned(),
-    };
-    assert_eq!(usenet_status(&files, WHY), failed);
-    assert_eq!(torrent_status(&files, WHY), failed);
-}
-
-// Root furniture is left out of the delivery only at the torrent's root,
-// as an NZB job's is only at its root: a whole .nfo in a folder of the
-// torrent is delivered, but furniture never stands for a delivery made in
-// part, and beside a refused archive the job fails.
-#[test]
-fn a_whole_nfo_in_a_torrents_folder_is_no_usable_file() {
-    let files = [
-        ("extras/ember.nfo", true),
-        ("ember.part1.rar", true),
-        ("ember.part2.rar", false),
-    ];
-    assert_eq!(
-        torrent_status(&files, WHY),
-        JobStatus::Failed {
-            error: WHY.to_owned(),
-        }
-    );
-    assert_eq!(
-        torrent_status(&[("ember.nfo", true), ("ember.part1.rar", true)], WHY),
-        JobStatus::Failed {
-            error: WHY.to_owned(),
-        }
-    );
-}
-
-// Whole recovery, check and split files, beside an archive volume, are each
-// a member that exists to make something else: none is usable, and both
-// kinds fail.
-#[test]
-fn whole_recovery_check_and_split_files_alone_fail_for_both_kinds() {
-    let files = [
-        ("ember.par2", true),
-        ("ember.vol00+01.par2", true),
-        ("ember.rev", true),
-        ("ember.sfv", true),
-        ("ember.mkv.001", true),
-        ("ember.rar", true),
-        ("ember.mkv", false),
-    ];
-    let failed = JobStatus::Failed {
-        error: WHY.to_owned(),
-    };
-    assert_eq!(usenet_status(&files, WHY), failed);
-    assert_eq!(torrent_status(&files, WHY), failed);
-}
-
-// A whole file of no type people open, beside a short one, is not usable:
-// both kinds fail, and the torrent's job keeps why.
-#[test]
-fn a_whole_file_of_no_known_type_alone_fails_for_both_kinds() {
-    let files = [("ember.bin", true), ("ember.mkv", false)];
-    let failed = JobStatus::Failed {
-        error: WHY.to_owned(),
-    };
-    assert_eq!(usenet_status(&files, WHY), failed);
-    assert_eq!(torrent_status(&files, WHY), failed);
-}
 
 // A torrent removed while the database's disk has no room for its history
 // row is not lost: its row is kept by the owner that keeps an NZB job's
@@ -1107,50 +939,6 @@ async fn a_retiring_torrent_the_start_could_not_archive_is_shown_and_written_lat
         "cancelled"
     );
     restarted.stop().await;
-}
-
-// A torrent whose finish row waits for room, then is removed: the removal's
-// row takes the finish row's place, and the finish row's waiter, let go,
-// does nothing. The job reaches the finished jobs once.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_finish_row_a_removal_takes_the_place_of_finishes_nothing() {
-    use crate::persistence::ArchiveNews;
-    let rig = rig(set_clock());
-    rig.service.open().await.unwrap();
-    let (news, mut heard) = tokio::sync::mpsc::unbounded_channel();
-    rig.db.hear_archive_news(move |said| {
-        let _ = news.send(said);
-    });
-    let mut waits = rig.service.history_waits();
-    let mut retired = rig.service.retired();
-    crate::persistence::connection::ARCHIVE_REFUSED
-        .lock()
-        .unwrap()
-        .push_back(crate::StateError::OutOfSpace(
-            "database or disk is full".into(),
-        ));
-    let files: [(&str, &[u8]); 1] = [("ember.mkv", &[0x5a_u8; 300])];
-    let job_id = rig
-        .service
-        .add_opened(request(AddSource::Metainfo(metainfo(
-            "ember", &files, 128, false,
-        ))))
-        .await
-        .unwrap();
-    // Unpacking refused its output: its job's failed row, the torrent kept.
-    rig.service.refused(job_id, "refused".to_owned()).await;
-    assert_eq!(heard.recv().await, Some(ArchiveNews::Kept(job_id)));
-    assert_eq!(*retired.borrow(), 0);
-
-    rig.service.remove(job_id, false, true).await.unwrap();
-    retired.wait_for(|retired| *retired >= 1).await.unwrap();
-    waits.wait_for(|ended| *ended >= 1).await.unwrap();
-    assert_eq!(*retired.borrow(), 1, "finished once");
-    assert_eq!(
-        rig.db.get_job_history(job_id.0).unwrap().unwrap().status,
-        "cancelled"
-    );
-    rig.service.stop().await;
 }
 
 // A history row of `protocol` for `job_id`, delivered to `dir`.
@@ -2652,6 +2440,7 @@ async fn a_kept_name_with_no_file_goes_from_the_row() {
             &["kept.txt".to_owned(), "gone.txt".to_owned()],
             &[],
             &[],
+            &UnpackEnd::whole(),
         )
         .unwrap();
     fetched_and_completed(&rig, job_id, &whole).await;

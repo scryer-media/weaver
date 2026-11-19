@@ -112,10 +112,9 @@ fn settled(tee: &Tee, piece: u32) -> bool {
 }
 
 // Only a torrent with a container volume among its files has a tee, and
-// only its archive files, the volumes with the recovery files beside them,
-// go to it: a video and its notes never do.
+// then every one of its files goes to it, as a post's files all go.
 #[test]
-fn only_archive_files_go_to_the_graph() {
+fn only_a_torrent_with_an_archive_goes_to_the_graph_and_all_its_files_with_it() {
     let plain = PieceLayout::new(
         1024,
         vec![
@@ -141,21 +140,16 @@ fn only_archive_files_go_to_the_graph() {
     let plan = Plan::of(&archive).unwrap();
     assert_eq!(
         (0..6).map(|file| plan.volume(file)).collect::<Vec<_>>(),
-        [
-            Some(VolumeIndex(0)),
-            Some(VolumeIndex(1)),
-            None,
-            Some(VolumeIndex(2)),
-            Some(VolumeIndex(3)),
-            None,
-        ]
+        (0..6)
+            .map(|file| Some(VolumeIndex(file)))
+            .collect::<Vec<_>>()
     );
 }
 
 // A piece's share of an archive file goes to the job as a view of the
 // buffer the piece was hashed in: the same memory, at the share's place in
 // the piece, vouched for by the piece check and so not checked again. A
-// share of a plain file in the same piece does not go at all.
+// share of a plain file in the same piece goes the same way.
 #[tokio::test]
 async fn an_archive_share_goes_to_the_job_as_a_view_of_the_hashed_buffer() {
     let dir = tempfile::tempdir().unwrap();
@@ -166,7 +160,11 @@ async fn an_archive_share_goes_to_the_job_as_a_view_of_the_hashed_buffer() {
     let torrent: Vec<u8> = (0..150).map(|at| at as u8).collect();
     let held = piece(&layout, &torrent, 1);
     let shares = tee.with(|job| tee.unsettled(job, 1));
-    assert_eq!(shares.len(), 1);
+    assert_eq!(shares.len(), 2);
+    let plain = tee.decoded(&shares[1], held.slice(36..64));
+    assert_eq!((plain.volume, plain.ordinal), (VolumeIndex(1), 0));
+    assert_eq!(plain.bytes.as_ptr(), held[36..].as_ptr());
+    assert_eq!(&plain.bytes[..], &torrent[100..128]);
     let at = shares[0].span.at as usize;
     let len = shares[0].span.range.len() as usize;
     let decoded = tee.decoded(&shares[0], held.slice(at..at + len));
@@ -1194,4 +1192,159 @@ mod numbered_outputs {
             b"Dangling"
         );
     }
+}
+
+// The five volumes of an encrypted RAR set, as one torrent's files.
+fn volumes() -> Vec<(String, Vec<u8>)> {
+    (1..=5)
+        .map(|n| {
+            let name = format!("rar5_enc_mv_video.part{n}.rar");
+            let path = format!("{}/tests/fixtures/rar5/{name}", env!("CARGO_MANIFEST_DIR"));
+            (name, std::fs::read(path).unwrap())
+        })
+        .collect()
+}
+
+// The shares of a volume the torrent does not want are ruled lost, every
+// one, so the job waits on none of its pieces, and the pieces of the
+// volumes it wants are left as they were.
+#[tokio::test]
+async fn lose_unwanted_rules_every_share_of_an_unwanted_volume_lost() {
+    let dir = tempfile::tempdir().unwrap();
+    let mail = RunMail::default();
+    let volumes = volumes();
+    let layout = Arc::new(
+        PieceLayout::new(
+            16384,
+            volumes
+                .iter()
+                .map(|(name, bytes)| file(name, bytes.len() as u64))
+                .collect(),
+        )
+        .unwrap(),
+    );
+    let torrent: Vec<u8> = volumes
+        .iter()
+        .flat_map(|(_, bytes)| bytes.clone())
+        .collect();
+    let mut kept = storage(&dir.path().join("work"), &mail, CapacityReader::unknown());
+    kept.passwords = vec![crate::jobs::ArchivePasswordCandidate::new(
+        crate::jobs::ArchivePasswordSource::Explicit,
+        "testpass123".to_owned(),
+    )];
+    let tee = Tee::fresh(
+        parts(&layout, &dir.path().join("work"), &mail, Arc::default()),
+        kept,
+    );
+    let unwanted = |file: usize| file == 2;
+    let of = |piece: u32, keep: &dyn Fn(usize) -> bool| {
+        layout.spans(piece).iter().any(|span| keep(span.file))
+    };
+    for index in (0..layout.piece_count()).filter(|&index| of(index, &|file| !unwanted(file))) {
+        tee.deliver(index, &piece(&layout, &torrent, index));
+    }
+    let lost: Vec<u32> = (0..layout.piece_count())
+        .filter(|&index| of(index, &unwanted))
+        .collect();
+    assert!(!lost.is_empty());
+    assert!(lost.iter().all(|&index| !settled(&tee, index)));
+
+    tee.lose_unwanted(|file| !unwanted(file)).unwrap();
+    assert!(lost.iter().all(|&index| settled(&tee, index)));
+    tee.stop().await;
+}
+
+// A tee over the five volumes with the third unwanted, every other piece
+// delivered and the unwanted shares ruled lost: its give-up has volumes
+// left to read back. What its runs say is taken here, as the torrent's
+// task takes it, until the give-up is seen with volumes left; its own
+// wakes are taken on its own task.
+async fn mid_give_up(dir: &Path, mail: &mut RunMail) -> Arc<Tee> {
+    let volumes = volumes();
+    let layout = Arc::new(
+        PieceLayout::new(
+            16384,
+            volumes
+                .iter()
+                .map(|(name, bytes)| file(name, bytes.len() as u64))
+                .collect(),
+        )
+        .unwrap(),
+    );
+    let torrent: Vec<u8> = volumes
+        .iter()
+        .flat_map(|(_, bytes)| bytes.clone())
+        .collect();
+    let mut kept = storage(&dir.join("work"), mail, CapacityReader::unknown());
+    kept.passwords = vec![crate::jobs::ArchivePasswordCandidate::new(
+        crate::jobs::ArchivePasswordSource::Explicit,
+        "testpass123".to_owned(),
+    )];
+    let tee = Tee::fresh(
+        parts(&layout, &dir.join("work"), mail, Arc::default()),
+        kept,
+    );
+    let wanted = |file: usize| file != 2;
+    for index in 0..layout.piece_count() {
+        if layout.spans(index).iter().any(|span| wanted(span.file)) {
+            tee.deliver(index, &piece(&layout, &torrent, index));
+        }
+    }
+    tee.lose_unwanted(wanted).unwrap();
+    while !tee.with(|job| job.giving_up()) {
+        let said = mail.recv().await.unwrap();
+        tee.take(super::Word::Said(said, 1), (false, false));
+    }
+    tee
+}
+
+// What the tee's runs say is taken, as the torrent's task takes it, until
+// `until` ends; then its result.
+async fn taking_until<T>(
+    tee: &Tee,
+    mail: &mut RunMail,
+    until: impl std::future::Future<Output = T>,
+) -> T {
+    tokio::pin!(until);
+    loop {
+        tokio::select! {
+            done = &mut until => return done,
+            said = mail.recv() => {
+                tee.take(super::Word::Said(said.unwrap(), 1), (false, false));
+            }
+        }
+    }
+}
+
+// A stop's checkpoint taken while a give-up has volumes left returns: the
+// give-up goes on, a volume a turn, on the job's own task, and the
+// checkpoint is taken once it is over.
+#[tokio::test]
+async fn a_stop_checkpoint_during_a_give_up_returns() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut mail = RunMail::default();
+    let tee = mid_give_up(dir.path(), &mut mail).await;
+    let stop = tokio::task::spawn_blocking({
+        let tee = Arc::clone(&tee);
+        move || tee.checkpoint_stopped()
+    });
+    taking_until(&tee, &mut mail, stop).await.unwrap().unwrap();
+    assert!(
+        !tee.with(|job| job.giving_up()),
+        "the give-up ran to its end"
+    );
+    taking_until(&tee, &mut mail, tee.stop()).await;
+    tee.forget();
+}
+
+// A tee stopped, as a removal stops it, while a give-up has volumes left
+// returns: it waits for runs and repairs out on their threads alone.
+#[tokio::test]
+async fn a_tee_stopped_during_a_give_up_returns() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut mail = RunMail::default();
+    let tee = mid_give_up(dir.path(), &mut mail).await;
+    taking_until(&tee, &mut mail, tee.stop()).await;
+    tee.stop_checkpoints();
+    tee.forget();
 }

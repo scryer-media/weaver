@@ -2017,6 +2017,10 @@ export const TORRENT_UPDATES_SUBSCRIPTION = gql`
         trackerRule
         unpack
         unpackOverride
+        unpacking {
+          result
+          reason
+        }
         route
         files {
           index
@@ -2055,6 +2059,21 @@ export const REMOVE_TORRENT_MUTATION = gql`
 export const SET_TORRENT_FORCED_MUTATION = gql`
   mutation SetTorrentForced($id: Int!, $forced: Boolean!) {
     setTorrentForced(id: $id, forced: $forced)
+  }
+`;
+
+/** The files a torrent's unpacking placed beside its own, read once its unpacking is over. */
+export const TORRENT_UNPACKED_FILES_QUERY = gql`
+  query TorrentUnpackedFiles($id: Int!) {
+    torrent(id: $id) {
+      id
+      unpacking {
+        files {
+          path
+          length
+        }
+      }
+    }
   }
 `;
 

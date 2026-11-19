@@ -28,6 +28,7 @@ use crate::settings::{Client, Leaf, Level, Seeding, SeedingPolicy, TorrentConfig
 use crate::settings::{SeedingAction, SeedingGoalMode};
 use crate::torrents::TrackerStatus;
 use crate::torrents::admission::Refusal;
+use crate::torrents::metrics::TorrentEvent;
 use crate::torrents::metrics::TorrentSeries;
 use crate::torrents::persistence::HistoryFile;
 use crate::torrents::sessions::Routes;
@@ -38,6 +39,7 @@ use crate::torrents::sessions::tests::{
 use crate::torrents::storage::PieceStorage;
 use crate::torrents::storage::Pieces;
 use crate::torrents::{ContentLayout, TorrentSource, TorrentTracker};
+use crate::torrents::{UnpackEnd, UnpackResult};
 use bytes::Bytes;
 use weaver_torrent::api::TorrentIdOrHash;
 use weaver_torrent::{ResumePeers, Session, TorrentVersion, TrackerAnnounce};
@@ -649,7 +651,7 @@ async fn sharing(
 async fn tee_of(service: &TorrentService, job_id: JobId) -> Arc<crate::torrents::tee::Tee> {
     let live = service.inner.live.lock().await;
     let store = live[&job_id].store.as_ref().unwrap();
-    Arc::clone(store.tee().unwrap())
+    store.tee().unwrap()
 }
 
 // The torrent's checkpoint written now, its tee's queued at once first,
@@ -658,7 +660,7 @@ async fn save_with_tee(service: &TorrentService, job_id: JobId) {
     let tee = {
         let live = service.inner.live.lock().await;
         live.get(&job_id)
-            .and_then(|torrent| Some(Arc::clone(torrent.store.as_ref()?.tee()?)))
+            .and_then(|torrent| torrent.store.as_ref()?.tee())
     };
     if let Some(tee) = tee {
         service.checkpoint_tee(job_id, tee, true).await;
@@ -987,6 +989,9 @@ async fn paused_by(service: &TorrentService, job_id: JobId) -> Option<HoldOrigin
 fn chain() -> (TorrentRecord, TrackerRule, TorrentSettings) {
     let record = TorrentRecord {
         unpack_in_force: None,
+        unpack_over: false,
+        unpack_end: None,
+        download_ends: 0,
         job_id: JobId(1),
         infohash_v1: Some([1; 20]),
         infohash_v2: None,

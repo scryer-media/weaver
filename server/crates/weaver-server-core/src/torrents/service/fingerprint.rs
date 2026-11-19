@@ -95,6 +95,7 @@ impl TorrentView {
             upload_cap,
             unpack,
             unpack_override,
+            unpack_end,
             route,
             files,
             sequential,
@@ -181,6 +182,7 @@ impl TorrentView {
             upload_cap,
             unpack,
             unpack_override,
+            unpack_end,
         )
             .hash(hasher);
         (route, sequential, first_last_piece_first).hash(hasher);

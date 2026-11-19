@@ -59,7 +59,7 @@ use weaver_server_core::torrents::service::{
 };
 use weaver_server_core::torrents::{
     ContentLayout, Encryption, FilePriority, NamedBy, PeerInfo, PeerSourceFlag, TorrentState,
-    TorrentTracker, redacted_tracker_url, status,
+    TorrentTracker, UnpackedFile, redacted_tracker_url, status,
 };
 use weaver_server_core::watch_folder::WatchFolderService;
 use weaver_server_core::{Database, RssFeedRow, SchedulerHandle};
@@ -1576,17 +1576,19 @@ fn when(ms: Option<i64>) -> i64 {
     ms.map_or(-1, secs)
 }
 
-// The bytes of the files it fetches, and of those the bytes it lacks
-// (qBittorrent `wantedSize`, `remainingSize`).
 // qBittorrent's `progress`: while the torrent is checked, how far the check
 // has read; otherwise the wanted bytes in hand (qBittorrent
 // `TorrentImpl::progress`, torrentimpl.cpp:927-947, with `isChecking` at
 // :1181-1185; served in torrents/info, serialize_torrent.cpp:130, and in
-// torrents/properties, torrentscontroller.cpp:873).
+// torrents/properties, torrentscontroller.cpp:873). One departure: a
+// torrent that wants no file reads as the view has it, 1, all it wants in
+// hand, where qBittorrent sends 0 (torrentimpl.cpp:932-933).
 fn progress(view: &TorrentView) -> f64 {
     view.check_progress.unwrap_or(view.progress).clamp(0.0, 1.0)
 }
 
+// The bytes of the files it fetches, and of those the bytes it lacks
+// (qBittorrent `wantedSize`, `remainingSize`).
 fn wanted_and_left(view: &TorrentView, totals: FileTotals) -> (u64, u64) {
     if !totals.any {
         return (
@@ -2383,13 +2385,23 @@ async fn files(ctx: &TorrentFacadeContext, params: &Params) -> Response {
     if view.pieces.is_none() {
         return axum::Json(json!([])).into_response();
     }
+    // What its unpacking placed beside its files, listed after them.
+    let unpacked = match &ctx.inner.torrents {
+        Some(torrents) => match torrents.unpacked_files(view.job_id).await {
+            Ok(unpacked) => unpacked,
+            Err(ActionError::NotFound(_)) => return not_found(),
+            Err(error) => return internal(error),
+        },
+        None => Vec::new(),
+    };
+    let listed = view.files.len() + unpacked.len();
     let Some(wanted) = params.get("indexes") else {
-        return axum::Json(file_list(&view, 0..view.files.len())).into_response();
+        return axum::Json(listing(&view, &unpacked, 0..listed)).into_response();
     };
     let mut indexes = Vec::new();
     for index in wanted.split('|') {
         match index.trim().parse::<usize>() {
-            Ok(index) if index < view.files.len() => indexes.push(index),
+            Ok(index) if index < listed => indexes.push(index),
             Ok(_) => {
                 return text(
                     StatusCode::CONFLICT,
@@ -2404,7 +2416,50 @@ async fn files(ctx: &TorrentFacadeContext, params: &Params) -> Response {
             }
         }
     }
-    axum::Json(file_list(&view, indexes)).into_response()
+    axum::Json(listing(&view, &unpacked, indexes)).into_response()
+}
+
+// The files at `indexes` of a listing of the torrent's own files, then
+// what its unpacking placed beside them, `unpacked`, numbered on after the
+// last of its own. An unpacked file is no file of the torrent's: it has its
+// name under the folder the torrent's files are in, its length on disk and
+// all of it in hand, and no piece range, level or availability, which only
+// the torrent's own files have. A level asked for its index is refused as
+// for an index the torrent has no file at (`file_prio`).
+fn listing(
+    view: &TorrentView,
+    unpacked: &[UnpackedFile],
+    indexes: impl IntoIterator<Item = usize>,
+) -> Vec<Value> {
+    let own = view.files.len();
+    let indexes: Vec<usize> = indexes.into_iter().collect();
+    // Its own files in one pass over them, in the order asked.
+    let mut mine = file_list(view, indexes.iter().copied().filter(|index| *index < own))
+        .into_iter()
+        .map(|mut file| {
+            if let Some(file) = file.as_object_mut() {
+                file.remove("is_seed");
+            }
+            file
+        });
+    let mut list: Vec<Value> = indexes
+        .iter()
+        .filter_map(|&index| match index.checked_sub(own) {
+            None => mine.next(),
+            Some(at) => unpacked.get(at).map(|file| {
+                json!({
+                    "index": index,
+                    "name": file.name,
+                    "size": file.length,
+                    "progress": 1,
+                })
+            }),
+        })
+        .collect();
+    if let Some(first) = list.first_mut() {
+        first["is_seed"] = json!(view.completed_at_ms.is_some());
+    }
+    list
 }
 
 // The files at `indexes` (qBittorrent `getFiles`), the first saying

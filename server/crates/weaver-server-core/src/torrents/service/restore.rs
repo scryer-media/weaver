@@ -10,7 +10,7 @@ use super::tick::Leveling;
 use super::{
     Asked, Load, PeerTerms, RESTORES_AT_ONCE, Restores, Signal, TorrentService, certificate_of,
     fetch_levels, files_dir, held_by, identity_of, ignored_of, in_table_order, load_of, locked,
-    placed, queued, ratelimits_of, ssl_identity, state_error, tracker_tiers, unpacks,
+    placed, queued, ratelimits_of, ssl_identity, state_error, tracker_tiers,
 };
 use tokio::sync::watch;
 
@@ -496,7 +496,7 @@ impl TorrentService {
         Some(Making {
             files: files_dir(torrent),
             layout: Arc::clone(torrent.layout.as_ref()?),
-            tee: unpacks(torrent) && !torrent.complete(),
+            tee: torrent.unpacking() && !torrent.complete(),
             passwords: self.archive_passwords(torrent, global),
             seeded: torrent.record.seed_mode,
             side: self.side_store(torrent.record.job_id),
@@ -977,6 +977,7 @@ impl TorrentService {
                 task: None,
                 asked: asked.clone(),
                 next: None,
+                reopened: None,
             });
             return Some((Arc::clone(store), asked));
         }
@@ -2176,7 +2177,7 @@ impl TorrentService {
                     Vec::new()
                 });
                 let unpack = self.describe(&mut torrent, &parsed, levels);
-                torrent.kept(row.failure, kept.as_ref().and_then(Option::as_ref));
+                torrent.kept(kept.as_ref().and_then(Option::as_ref));
                 torrent.kept_at_boot = kept;
                 torrent.stamps_at_boot = Some(stamps);
                 if torrent.record.seed_mode {
@@ -2220,14 +2221,35 @@ impl TorrentService {
         let mut unheld = Vec::new();
         let mut unpacks = Vec::new();
         let mut taken = Vec::new();
+        let mut reopened = Vec::new();
+        let mut late = Vec::new();
         let mut waits = false;
         {
             let mut live = self.inner.live.lock().await;
-            let marks = locked(&self.inner.load_marks);
-            for read in page.read {
+            let mut marks = locked(&self.inner.load_marks);
+            for mut read in page.read {
                 let job_id = read.torrent.record.job_id;
                 if marks.gone.contains(&job_id) || live.contains_key(&job_id) {
                     continue;
+                }
+                // Stored complete with levels that want a file the pieces it
+                // kept lack, as a change of levels stored while its copy was
+                // out leaves it when its reopen was not: short of complete
+                // again, past every stored torrent at the load's end, as a
+                // change of levels would have left it, its unpacking over.
+                // The same rule as a change of levels made now
+                // (`Live::reopens`, `save_levels`).
+                if read.torrent.reopens(&read.torrent.levels) {
+                    read.torrent.record.completed_at_ms = None;
+                    read.torrent.record.unpack_over = true;
+                    // A read that outlasted the load places it now, every
+                    // stored place being known.
+                    if self.loading() {
+                        marks.asked.push(Asked::Added(job_id));
+                    } else {
+                        late.push(job_id);
+                    }
+                    reopened.push(job_id);
                 }
                 self.inner
                     .next_queue_position
@@ -2259,22 +2281,27 @@ impl TorrentService {
                 Then::Resolves => self.resolve(job_id).await,
             }
         }
-        if !unheld.is_empty() || !unpacks.is_empty() {
+        if !unheld.is_empty() || !unpacks.is_empty() || !reopened.is_empty() {
             let db = self.inner.db.clone();
             let written = tokio::task::spawn_blocking(move || {
                 (
                     db.set_torrents_held(&unheld),
                     db.set_torrents_unpack_in_force(&unpacks),
+                    db.clear_torrents_completed(&reopened),
                 )
             })
             .await;
             match written {
-                Ok((held, unpacks)) => {
+                Ok((held, unpacks, reopened)) => {
                     if let Err(error) = held {
                         tracing::warn!(error = %error, "could not write what the torrents hold; each holds its whole folder until its next start");
                     }
                     if let Err(error) = unpacks {
                         tracing::warn!(error = %error, "could not record whether the torrents unpack");
+                    }
+                    if let Err(error) = reopened {
+                        // Read the same way at the next start.
+                        tracing::warn!(error = %error, "could not store the torrents short of complete again");
                     }
                 }
                 Err(error) => {
@@ -2282,6 +2309,7 @@ impl TorrentService {
                 }
             }
         }
+        self.place_last(late).await;
         // A folder made in another spelling before a torrent's first write
         // holds its files from then on: each start spells what the
         // torrents hold as the filesystem does.

@@ -182,6 +182,14 @@ impl TorrentService {
         )
     }
 
+    // TORRENT_DOWNLOADED and its JOB_ twin for the `occurrence`th end of
+    // `torrent`'s download, counted from 0.
+    pub(super) fn raise_download_end(&self, torrent: &Live, occurrence: u64) {
+        if let Some(context) = self.script_event(torrent, QueueEvent::TorrentDownloaded, &[]) {
+            drop(self.inner.db.admit_download_end(context, occurrence));
+        }
+    }
+
     pub(super) fn queue_script_event(&self, context: Option<EventContext>) {
         if let Some(context) = context {
             drop(self.inner.db.admit_queue_script_event(context, false));

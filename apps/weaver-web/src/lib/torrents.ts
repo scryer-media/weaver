@@ -101,6 +101,22 @@ export interface TorrentFileData {
   progress: number;
 }
 
+/** How a torrent's unpacking came out. */
+export type TorrentUnpackResult = "WHOLE" | "PART" | "FAILED" | "REFUSED";
+
+/** A torrent's unpacking, once over: its own line, never the torrent's state. */
+export interface TorrentUnpackingData {
+  result: TorrentUnpackResult;
+  /** Why it is short of whole. */
+  reason: string | null;
+}
+
+/** A file the unpacking placed beside the torrent's own: no piece of the torrent. */
+export interface TorrentUnpackedFileData {
+  path: string;
+  length: number;
+}
+
 /** Who named a tracker: the torrent itself, or the operator who added it. */
 export type TrackerSource = "TORRENT" | "OPERATOR";
 
@@ -228,6 +244,8 @@ export interface TorrentData extends TorrentSummaryData {
   unpack: boolean;
   /** The torrent's own unpack; null inherits. */
   unpackOverride: boolean | null;
+  /** How its unpacking came out, once over; null while it runs or with nothing to unpack. */
+  unpacking: TorrentUnpackingData | null;
   route: string | null;
   files: TorrentFileData[];
   /** Whether its pieces are fetched in order. */

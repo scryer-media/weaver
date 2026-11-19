@@ -16,7 +16,7 @@ const DEFAULT_PAR2_IGNORE_EXTENSIONS: [&str; 4] = ["nfo", "sfv", "srr", "nzb"];
 
 // The extension list [`par2_damage_ignorable`] matches against, as read from
 // the environment once per verdict.
-pub(in crate::pipeline) fn configured_par2_ignore_extensions() -> Vec<String> {
+pub(crate) fn configured_par2_ignore_extensions() -> Vec<String> {
     parse_par2_ignore_extensions(std::env::var(PAR2_IGNORE_EXTENSIONS_ENV).ok().as_deref())
 }
 

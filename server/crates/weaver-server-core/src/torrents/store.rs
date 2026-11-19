@@ -38,6 +38,11 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+// The tee a store holds now, if it holds one.
+fn held_tee(tee: &RwLock<Option<Arc<Tee>>>) -> Option<Arc<Tee>> {
+    tee.read().unwrap_or_else(PoisonError::into_inner).clone()
+}
+
 // A copy out of the side store that its writer did not write: nothing of
 // the side store changes for it.
 fn unwritten() -> io::Error {
@@ -59,6 +64,21 @@ impl Kept {
         let have = Have::kept(layout, Some(self));
         (have.count, have.file_have)
     }
+}
+
+// Whether `file_have`, each file's bytes in the pieces had, holds every file
+// `wanted` names whole. Padding is on no disk and is never wanted; a file
+// past the end of `file_have` has none of its bytes.
+pub(crate) fn has_files(
+    layout: &PieceLayout,
+    file_have: &[u64],
+    wanted: impl Fn(usize) -> bool,
+) -> bool {
+    layout
+        .files()
+        .enumerate()
+        .filter(|(index, file)| !file.padding && wanted(*index))
+        .all(|(index, file)| file_have.get(index).copied().unwrap_or(0) >= file.length)
 }
 
 struct Have {
@@ -228,7 +248,10 @@ pub(crate) struct TorrentStore {
     // The pieces as the database last took them, or as they were read from
     // it: a checkpoint writes them again only once they differ.
     saved: Mutex<Option<Kept>>,
-    tee: Option<Arc<Tee>>,
+    // The job its archive files go to, while its unpacking runs: once that
+    // is over the store lets go of it (`let_go_of_tee`), and a piece had
+    // after, as a reopen fetches, goes to none.
+    tee: Arc<RwLock<Option<Arc<Tee>>>>,
     // Which files are set aside: a piece never writes them, its share of
     // them goes to the side store, and a share kept there is read from
     // there. Taken to read for a piece's write or a read, and to write only
@@ -245,6 +268,11 @@ pub(crate) struct TorrentStore {
     // made and given up once the files have been looked at
     // (`drop_unbacked`): a file whose time is not that one is checked again.
     stamps: Mutex<HashMap<u32, i64>>,
+    // Test seam: the next change of the files set aside fails before it
+    // changes anything, as one that meets a piece on its way to the side
+    // store does.
+    #[cfg(test)]
+    relevel_fails: std::sync::atomic::AtomicBool,
 }
 
 // A piece handed over while its files moved, queued for the files where
@@ -300,12 +328,14 @@ impl TorrentStore {
             files,
             have: Arc::new(Mutex::new(have)),
             saved: Mutex::new(None),
-            tee,
+            tee: Arc::new(RwLock::new(tee)),
             aside: RwLock::new(Arc::new(Vec::new())),
             side: Arc::new(Mutex::new(Side::none())),
             writes,
             moves: Mutex::default(),
             stamps: Mutex::default(),
+            #[cfg(test)]
+            relevel_fails: std::sync::atomic::AtomicBool::new(false),
         };
         *store.saved() = Some(store.kept());
         store
@@ -315,7 +345,7 @@ impl TorrentStore {
     // again when a read-back waited for room.
     pub(crate) fn shared(self) -> Arc<Self> {
         let store = Arc::new(self);
-        if let Some(tee) = &store.tee {
+        if let Some(tee) = store.tee() {
             let reads: Arc<dyn ReadsBack> = Arc::clone(&store) as Arc<dyn ReadsBack>;
             tee.reads_back_through(Arc::downgrade(&reads));
         }
@@ -510,6 +540,13 @@ impl TorrentStore {
         })
     }
 
+    // The next `relevel` of this store fails before it changes anything.
+    #[cfg(test)]
+    pub(crate) fn fail_next_relevel(&self) {
+        self.relevel_fails
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
     // The files `ignored` names set aside from now on, and no other. A file
     // no longer set aside first takes its shares out of the side store,
     // written to it where they lie, and a slot no file set aside still has
@@ -519,6 +556,15 @@ impl TorrentStore {
     // v2.0.15). A copy that fails changes nothing: the bytes stay in the
     // side store, and the files set aside are as they were.
     pub(crate) fn relevel(&self, ignored: &[bool]) -> io::Result<()> {
+        #[cfg(test)]
+        if self
+            .relevel_fails
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(io::Error::other(
+                "a test failed the change of files set aside",
+            ));
+        }
         let mut aside = self.aside_mut();
         let wanted: Vec<bool> = self
             .layout
@@ -644,8 +690,19 @@ impl TorrentStore {
         &self.files
     }
 
-    pub(crate) fn tee(&self) -> Option<&Arc<Tee>> {
-        self.tee.as_ref()
+    pub(crate) fn tee(&self) -> Option<Arc<Tee>> {
+        held_tee(&self.tee)
+    }
+
+    // Its unpacking is over: the store holds its tee no more, so nothing it
+    // has after goes to it, in this run as after a restart, which makes a
+    // store of a torrent whose unpacking is over with no tee. The tee, if
+    // it held one, is returned for its owner to stop.
+    pub(crate) fn let_go_of_tee(&self) -> Option<Arc<Tee>> {
+        self.tee
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
     }
 
     pub(crate) fn has(&self, piece: u32) -> bool {
@@ -785,45 +842,14 @@ impl TorrentStore {
 
     // Whether every file `wanted` names is had whole.
     pub(crate) fn has_files(&self, wanted: impl Fn(usize) -> bool) -> bool {
-        let have = self.have();
-        self.layout
-            .files()
-            .enumerate()
-            .filter(|(index, file)| !file.padding && wanted(*index))
-            .all(|(index, file)| have.file_have[index] >= file.length)
-    }
-
-    // The names of the listed files it has whole.
-    // A file set aside with any of its bytes in the side store is not whole
-    // on disk.
-    pub(crate) fn whole_names(&self) -> Vec<String> {
-        let aside = self.aside();
-        // A set, so a torrent of many files and many kept pieces is not
-        // searched once per file.
-        let kept: std::collections::BTreeSet<usize> = self
-            .side()
-            .pieces()
-            .into_iter()
-            .flat_map(|piece| self.layout.spans(piece))
-            .map(|span| span.file)
-            .filter(|file| aside.get(*file).copied().unwrap_or(false))
-            .collect();
-        let have = self.have();
-        self.layout
-            .files()
-            .enumerate()
-            .filter(|(index, file)| {
-                !file.padding && have.file_have[*index] >= file.length && !kept.contains(index)
-            })
-            .map(|(_, file)| file.name.clone())
-            .collect()
+        has_files(&self.layout, &self.have().file_have, wanted)
     }
 
     // The piece's shares the tee waits on go to it from the files: the
     // read a restart, or a seed added over files already there, makes to
     // bring it level with the pieces the torrent has. True when it took any.
     pub(crate) fn replay(&self, piece: u32) -> io::Result<bool> {
-        let Some(tee) = &self.tee else {
+        let Some(tee) = self.tee() else {
             return Ok(false);
         };
         tee.replay(piece, |file, offset, out| {
@@ -982,7 +1008,7 @@ impl TorrentStore {
 
     // Whether the tee waits on any share of the piece.
     pub(crate) fn tee_wants(&self, piece: u32) -> bool {
-        self.tee.as_ref().is_some_and(|tee| tee.wants(piece))
+        self.tee().is_some_and(|tee| tee.wants(piece))
     }
 
     // The torrent going away: what it has still queued to be written is
@@ -995,7 +1021,7 @@ impl TorrentStore {
         // after.
         drop(self.unpark());
         self.files.release();
-        if let Some(tee) = &self.tee {
+        if let Some(tee) = self.tee() {
             tee.forget();
         }
     }
@@ -1008,7 +1034,7 @@ impl TorrentStore {
             barrier.wait_aside();
         }
         self.files.release();
-        if let Some(tee) = &self.tee {
+        if let Some(tee) = self.tee() {
             tee.forget();
         }
     }
@@ -1234,7 +1260,7 @@ impl TorrentStore {
             let have = Arc::clone(&self.have);
             let side = Arc::clone(&self.side);
             let layout = Arc::clone(&self.layout);
-            let tee = self.tee.clone();
+            let tee = Arc::clone(&self.tee);
             let writes = self.writes.clone();
             batch.then(done, move |done| {
                 if let Some(aside) = kept
@@ -1247,8 +1273,10 @@ impl TorrentStore {
                     have.set(&layout, piece, true);
                     have.count == layout.piece_count()
                 };
-                // What may stand still runs off the writer.
-                match tee {
+                // What may stand still runs off the writer. The tee is the
+                // one the store holds as the piece is had, none once its
+                // unpacking is over.
+                match held_tee(&tee) {
                     Some(tee) => writes.clone().aside(move || {
                         tee.deliver(piece, &held);
                         if whole {
@@ -1309,7 +1337,7 @@ impl TorrentStore {
     // The piece's archive shares read back from disk for the tee, holding
     // `room` until it took them.
     fn read_back(&self, piece: u32, room: HeldRoom) {
-        if let Some(tee) = &self.tee {
+        if let Some(tee) = self.tee() {
             let read = |file: usize, offset: u64, out: &mut [u8]| {
                 self.read_in(&self.aside(), file, offset, out)
             };
@@ -1430,7 +1458,7 @@ impl Pieces for TorrentStore {
             have.set(&self.layout, piece, true);
             have.count == self.layout.piece_count()
         };
-        if self.tee.is_none() && !whole {
+        if self.tee().is_none() && !whole {
             return Ok(());
         }
         let store = Arc::clone(&self);
@@ -1475,13 +1503,12 @@ impl Pieces for TorrentStore {
     // written block by block is checked a slice at a time, never a whole
     // piece held: the tee reads such a piece back once it is found.
     fn wants_hashed(&self, piece: u32) -> bool {
-        self.tee
-            .as_ref()
+        self.tee()
             .is_some_and(|tee| !tee.writes_blocks() && tee.wants(piece))
     }
 
     fn hashed(&self, piece: u32, held: &Bytes) {
-        if let Some(tee) = &self.tee {
+        if let Some(tee) = self.tee() {
             tee.deliver(piece, held);
         }
     }
@@ -1505,7 +1532,7 @@ impl Pieces for TorrentStore {
     // Room returned to the torrent's budget: the tee's read-backs waiting
     // for it go again.
     fn room_returned(&self) {
-        if let Some(tee) = &self.tee {
+        if let Some(tee) = self.tee() {
             tee.room_returned();
         }
     }
@@ -1513,7 +1540,7 @@ impl Pieces for TorrentStore {
     // The tee's plan chose with the torrent's write path, so its choice
     // holds; a torrent with no tee is judged by its piece length alone.
     fn writes_blocks(&self) -> Option<bool> {
-        self.tee.as_ref().map(|tee| tee.writes_blocks())
+        self.tee().map(|tee| tee.writes_blocks())
     }
 
     fn read(&self, file: usize, offset: u64, out: &mut [u8]) -> io::Result<()> {

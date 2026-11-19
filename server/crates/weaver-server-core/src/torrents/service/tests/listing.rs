@@ -607,6 +607,9 @@ fn picks_are_the_walk_of_every_record(db: &Database) {
         let v2_only = job_id % 7 == 0;
         let record = TorrentRecord {
             unpack_in_force: None,
+            unpack_over: false,
+            unpack_end: None,
+            download_ends: 0,
             job_id: JobId(job_id),
             infohash_v1: (!v2_only).then_some(v1),
             infohash_v2: (v2_only || job_id % 5 == 0).then_some(v2),

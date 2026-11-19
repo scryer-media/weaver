@@ -214,26 +214,23 @@ impl KeptIntent {
 }
 
 /// How a torrent's job ends, as its history row stores the status: complete,
-/// partial or failed as a delivery ends, or cancelled by a removal before it
-/// completed. History reads each back as the jobs model's stored status
-/// (`job_status_from_persisted_str`).
+/// failed when its store could not write, or cancelled by a removal before
+/// it completed. Its unpacking never sets it. History reads each back as the
+/// jobs model's stored status (`job_status_from_persisted_str`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HistoryEnd {
     Complete,
-    Partial,
     Failed,
     Cancelled,
 }
 
 impl HistoryEnd {
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 4] =
-        [Self::Complete, Self::Partial, Self::Failed, Self::Cancelled];
+    pub(crate) const ALL: [Self; 3] = [Self::Complete, Self::Failed, Self::Cancelled];
 
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Complete => "complete",
-            Self::Partial => "partial",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
         }
@@ -243,15 +240,96 @@ impl HistoryEnd {
     pub(crate) fn parse(value: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|end| end.as_str() == value)
     }
+}
 
-    /// The end a delivery's status names (`Delivery::status`, which gives
-    /// complete, partial or failed and nothing else).
-    pub(crate) fn delivered(status: &crate::jobs::model::JobStatus) -> Self {
-        use crate::jobs::model::JobStatus;
-        match status {
-            JobStatus::Complete => Self::Complete,
-            JobStatus::Partial => Self::Partial,
-            _ => Self::Failed,
+/// How a torrent's unpacking came out. It is the unpacking's own: the
+/// torrent's state, history, events and counters never read it, and what
+/// it made is only listed beside the torrent's files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnpackResult {
+    /// Everything it would deliver was placed beside the torrent's files.
+    Whole,
+    /// Some of it was placed; the reason says what is short.
+    Part,
+    /// Nothing usable was delivered; the reason says why.
+    Failed,
+    /// The unpacking refused the torrent's files before it ended.
+    Refused,
+}
+
+impl UnpackResult {
+    const ALL: [Self; 4] = [Self::Whole, Self::Part, Self::Failed, Self::Refused];
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Whole => "whole",
+            Self::Part => "part",
+            Self::Failed => "failed",
+            Self::Refused => "refused",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|result| result.as_str() == value)
+    }
+}
+
+/// A file a torrent's unpacking placed beside the torrent's own: its name
+/// under the directory they are in, and its length on disk. It is listed
+/// after the torrent's files and is none of them: no piece, no peer and no
+/// progress of the torrent's covers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnpackedFile {
+    pub name: String,
+    pub length: u64,
+}
+
+/// The most bytes of an unpacking's reason a row keeps: a reason that
+/// names many files is cut at a character boundary.
+pub(crate) const UNPACK_WHY_MAX: usize = 4096;
+
+/// A torrent's unpacking, over: how it came out and why, when it is short.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct UnpackEnd {
+    pub result: UnpackResult,
+    pub why: Option<String>,
+}
+
+impl UnpackEnd {
+    pub(crate) fn whole() -> Self {
+        Self {
+            result: UnpackResult::Whole,
+            why: None,
+        }
+    }
+
+    pub(crate) fn refused(why: String) -> Self {
+        Self::said(UnpackResult::Refused, why)
+    }
+
+    /// Short for `why`: in part when it placed any file, failed otherwise.
+    pub(crate) fn short(placed_any: bool, why: String) -> Self {
+        let result = if placed_any {
+            UnpackResult::Part
+        } else {
+            UnpackResult::Failed
+        };
+        Self::said(result, why)
+    }
+
+    fn said(result: UnpackResult, mut why: String) -> Self {
+        if why.len() > UNPACK_WHY_MAX {
+            let mut cut = UNPACK_WHY_MAX;
+            while !why.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            why.truncate(cut);
+        }
+        Self {
+            result,
+            why: Some(why),
         }
     }
 }
@@ -305,6 +383,17 @@ pub struct TorrentRecord {
     // from the override chain then, so a restart builds the same tree;
     // `None` until then.
     pub unpack_in_force: Option<bool>,
+    // Whether its unpacking is over, whole or short: kept so a torrent
+    // reopened after it, in this run or after a restart, does not unpack
+    // again.
+    pub unpack_over: bool,
+    // How its unpacking came out, once over: kept so its unpack line
+    // reads the same after a restart, which has no tee to ask again.
+    pub unpack_end: Option<UnpackEnd>,
+    // How many times its download has ended: the occurrence of its next
+    // end, kept so a restart numbers that end on and its script runs once
+    // for it.
+    pub download_ends: u64,
     // The attributes its job was added with.
     pub metadata: Vec<(String, String)>,
     // Its own upload and download limits in bytes per second: None is

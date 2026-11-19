@@ -4,15 +4,13 @@
 use super::intake::{Resolving, parse};
 use super::live::Live;
 use super::scripts::{Ending, StoppedSeeding};
-use super::{
-    ActionError, MemoryRelease, TorrentService, hashes_of, report, short_status, unpacking_dir,
-};
+use super::{ActionError, MemoryRelease, TorrentService, hashes_of, report, unpacking_dir};
 #[cfg(test)]
 use super::{MARK_HOLD, MOVE_HOLD, SYNC_HELD_FAILS, locked};
 use crate::StateError;
 use crate::jobs::JobId;
 use crate::jobs::handle::JobInfo;
-use crate::jobs::model::{JobStatus, job_status_from_persisted_str};
+use crate::jobs::model::job_status_from_persisted_str;
 use crate::jobs::report::JobReport;
 use crate::persistence::Database;
 use crate::post_processing::events::EventContext;
@@ -29,9 +27,6 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, PoisonError};
-#[cfg(test)]
-use tokio::sync::watch;
-use weaver_torrent::core::Id20;
 
 impl TorrentService {
     // The torrents' jobs, and among them, by when each was added, the
@@ -90,40 +85,6 @@ impl TorrentService {
             )
             .await;
         self.to_history(vec![retired]).await;
-    }
-
-    // Unpacking refused the torrent's output. Its job goes to history as
-    // failed, once; the torrent stays, stopped with its data, until the
-    // operator resumes it to seed.
-    pub(super) async fn refused(&self, job_id: JobId, error: String) {
-        match self.inner.db.get_job_history(job_id.0) {
-            Ok(None) => {}
-            Ok(Some(_)) => return,
-            Err(error) => {
-                tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's history");
-                return;
-            }
-        }
-        let settings = self.settings();
-        let now = self.inner.clock.unix_ms();
-        let (report, hash, landing) = {
-            let mut live = self.inner.live.lock().await;
-            let Some(torrent) = live.get_mut(&job_id) else {
-                return;
-            };
-            self.queue_script_event(self.seeding_stopped(torrent, StoppedSeeding::Failed));
-            let landing = self.stop_torrent(torrent, now);
-            let report = report(
-                self.view(&settings, torrent, now),
-                JobStatus::Failed { error },
-                now,
-            );
-            (report, hashes_of(&torrent.record).best(), landing)
-        };
-        let _ = self.landed(landing).await;
-        self.inner.counters.event(TorrentEvent::Failed);
-        self.apply_queue().await;
-        self.finish(report, HistoryEnd::Failed, hash, now).await;
     }
 
     // A torrent that left the live ones, readied for history: its row, to
@@ -262,23 +223,6 @@ impl TorrentService {
         (report, row)
     }
 
-    // A torrent's job, finished as `status`: into history and the queue's
-    // finished jobs, listing the files it wrote so far.
-    pub(super) async fn finish(&self, report: JobReport, status: HistoryEnd, hash: Id20, now: i64) {
-        let of = {
-            let live = self.inner.live.lock().await;
-            live.get(&report.job_id)
-                .map(|torrent| self.written_of(torrent))
-        };
-        let files = match of {
-            Some(of) => history_files(read_written(of).await.deletion).await,
-            None => Vec::new(),
-        };
-        let row = report.history_row(status.as_str(), Some(hash.0.to_vec()), now);
-        self.write_history(row, false, report.job_info(), files, Shown::Now)
-            .await;
-    }
-
     // The job's history row goes through the database writer's archives,
     // as an NZB job's does, with the `files` it wrote listed beside it for an
     // archive from history, and the torrent removed when it `retires`; then
@@ -371,8 +315,6 @@ impl TorrentService {
                         }
                         service.finished(job, Shown::Now).await;
                     }
-                    #[cfg(test)]
-                    service.inner.history_waits.send_modify(|ended| *ended += 1);
                 });
             }
         }
@@ -401,12 +343,6 @@ impl TorrentService {
         }
         turns.remove(&job_id);
         true
-    }
-
-    // Counts the waiters on a history row kept for room that have ended.
-    #[cfg(test)]
-    pub(crate) fn history_waits(&self) -> watch::Receiver<u64> {
-        self.inner.history_waits.subscribe()
     }
 
     // A torrent removed whose history row the database's disk has no room
@@ -637,21 +573,12 @@ impl TorrentService {
         let mut of = self.written_of(&torrent);
         of.made = made;
         let written = read_written(of).await;
-        // The job's outcome: complete, short of what unpacking would
-        // deliver, refused by unpacking, or cut short.
-        let (status, error) = match (torrent.complete(), torrent.refusal()) {
-            (true, None) => (HistoryEnd::Complete, None),
-            (true, Some(why)) => {
-                let own = torrent
-                    .store
-                    .as_ref()
-                    .map(|store| store.whole_names())
-                    .unwrap_or_default();
-                let status = short_status(&own, &written.outputs, &why);
-                (HistoryEnd::delivered(&status), Some(why))
-            }
-            (false, Some(refusal)) => (HistoryEnd::Failed, Some(refusal)),
-            (false, None) => (HistoryEnd::Cancelled, None),
+        // The job's outcome: complete, or cut short. Its unpacking's never
+        // changes it.
+        let status = if torrent.complete() {
+            HistoryEnd::Complete
+        } else {
+            HistoryEnd::Cancelled
         };
         // What its scripts hear of a removal asked for: a seed stops
         // seeding; a download is cancelled, as an NZB job's is.
@@ -699,7 +626,7 @@ impl TorrentService {
         };
         self.inner.counters.event(TorrentEvent::Removed);
         Ok(self
-            .ready_history(torrent, status, error, written, shown, ended)
+            .ready_history(torrent, status, None, written, shown, ended)
             .await)
     }
 
@@ -843,12 +770,11 @@ pub(in crate::torrents) struct WrittenOf {
     made: Option<MadeRead>,
 }
 
-// What a torrent wrote: what a deletion of its files takes, and the files
-// unpacking placed beside them, as its row keeps them.
+// What a torrent wrote: what a deletion of its files takes, the files
+// unpacking placed beside them among it.
 #[derive(Debug, Default)]
 pub(in crate::torrents) struct Wrote {
     pub(in crate::torrents) deletion: Deletion,
-    pub(in crate::torrents) outputs: Vec<String>,
 }
 
 // `written_paths`, off the runtime: its two database reads and the marker
@@ -903,7 +829,7 @@ fn written_paths(mut of: WrittenOf) -> Wrote {
     // With or without a tee: one whose unpacked files were not placed
     // keeps its directory past it. It goes only as the torrent's job's.
     deletion.work = Some((of.work.clone(), unpacking_dir(&of.work, job_id), job_id));
-    Wrote { deletion, outputs }
+    Wrote { deletion }
 }
 
 // What a deletion of a torrent's files removes: see `written_paths`.

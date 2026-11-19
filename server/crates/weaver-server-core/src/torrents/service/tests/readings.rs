@@ -244,6 +244,9 @@ fn stored_magnets(db: &Database, count: u64) -> Vec<JobId> {
                 policy_override: None,
                 unpack: None,
                 unpack_in_force: None,
+                unpack_over: false,
+                unpack_end: None,
+                download_ends: 0,
                 metadata: Vec::new(),
                 upload_limit: None,
                 download_limit: None,
@@ -1046,12 +1049,14 @@ async fn a_restart_keeps_the_whole_and_starts_the_seeding_run_again() {
     seeded.stop().await;
 }
 
-// A torrent that wants none of its files has every piece it wants: it seeds
-// at 100 % with nothing in hand and no peers, though its job is not
-// complete, and its seeding time runs. Wanting the file again takes it back
-// to fetching, and its seeding time stops.
+// A torrent set to want none of its files after its add has every piece it
+// wants: its job completes, and it seeds at 100 % with nothing in hand and
+// no peers, its seeding time running (libtorrent `update_peer_interest` ->
+// `finished()`; qBittorrent `handleTorrentFinished`). Wanting the file again
+// takes it back to fetching, short of complete (qBittorrent
+// `prioritizeFiles`), and its seeding time stops where it was at the change.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_torrent_that_wants_nothing_seeds_until_it_wants_a_file() {
+async fn a_torrent_that_wants_nothing_completes_and_downloads_when_it_wants_a_file() {
     use FilePriority::*;
     let clock = set_clock();
     let rig = rig(Arc::clone(&clock) as Arc<dyn Clock>);
@@ -1064,6 +1069,7 @@ async fn a_torrent_that_wants_nothing_seeds_until_it_wants_a_file() {
         })
         .await
         .unwrap();
+    let mut settles = rig.service.inner.settled.subscribe();
     rig.service
         .set_file_priorities(job_id, &[(0, Ignored)])
         .await
@@ -1072,6 +1078,17 @@ async fn a_torrent_that_wants_nothing_seeds_until_it_wants_a_file() {
     handle_of(&rig.service, job_id)
         .await
         .wait_until_completed()
+        .await
+        .unwrap();
+    settles
+        .wait_for(|_| {
+            rig.db
+                .get_torrent(job_id)
+                .unwrap()
+                .unwrap()
+                .completed_at_ms
+                .is_some()
+        })
         .await
         .unwrap();
     let view = rig.service.torrent(job_id).await.unwrap();
@@ -1084,8 +1101,13 @@ async fn a_torrent_that_wants_nothing_seeds_until_it_wants_a_file() {
             view.peers,
             view.completed_at_ms,
         ),
-        (TorrentState::Seeding, 1.0, 0, 3000, 0, None)
+        (TorrentState::Seeding, 1.0, 0, 3000, 0, Some(EPOCH_MS))
     );
+    assert_eq!(
+        crate::torrents::service::views::job_status(&view),
+        JobStatus::Seeding
+    );
+    let place = rig.db.get_torrent(job_id).unwrap().unwrap().queue_position;
 
     rig.service.tick().await;
     rig.service.restored().await;
@@ -1095,20 +1117,66 @@ async fn a_torrent_that_wants_nothing_seeds_until_it_wants_a_file() {
     let kept = rig.service.inner.live.lock().await[&job_id].counters;
     assert_eq!((kept.active_duration_s, kept.finished_duration_s), (5, 5));
 
+    // Wanted again between ticks: the seconds up to the change count as
+    // seeding, none after (libtorrent `update_state_timers` runs the
+    // finished timer only while finished).
+    clock.shift_unix_ms(3_000);
     rig.service
         .set_file_priorities(job_id, &[(0, Normal)])
         .await
         .unwrap();
+    let seeded = |live: &super::super::live::Live| {
+        rig.service
+            .settings()
+            .policy(&live.record, None)
+            .seeded_seconds(&live.counters)
+    };
+    {
+        let live = rig.service.inner.live.lock().await;
+        let torrent = &live[&job_id];
+        assert_eq!(
+            (
+                torrent.counters.active_duration_s,
+                torrent.counters.finished_duration_s,
+                seeded(torrent),
+            ),
+            (8, 8, 8)
+        );
+    }
     let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(view.seeding_seconds, 8);
     assert_eq!(
         (view.state, view.progress, view.completed_at_ms),
         (TorrentState::Stalled, 0.0, None)
     );
-    clock.shift_unix_ms(5_000);
+    assert_eq!(
+        crate::torrents::service::views::job_status(&view),
+        JobStatus::Stalled
+    );
+    // Short of complete as stored, at the end of the download queue
+    // (libtorrent `resume_download` takes `last_pos`).
+    let stored = rig.db.get_torrent(job_id).unwrap().unwrap();
+    assert_eq!(stored.completed_at_ms, None);
+    assert!(stored.queue_position > place, "{stored:?}");
+    clock.shift_unix_ms(4_000);
     rig.service.tick().await;
     rig.service.restored().await;
-    let kept = rig.service.inner.live.lock().await[&job_id].counters;
-    assert_eq!((kept.active_duration_s, kept.finished_duration_s), (10, 5));
+    {
+        let live = rig.service.inner.live.lock().await;
+        let torrent = &live[&job_id];
+        assert_eq!(
+            (
+                torrent.counters.active_duration_s,
+                torrent.counters.finished_duration_s,
+                seeded(torrent),
+            ),
+            (12, 8, 8)
+        );
+    }
+    assert_eq!(
+        rig.service.torrent(job_id).await.unwrap().seeding_seconds,
+        8
+    );
     rig.service.stop().await;
 }
 
@@ -1427,6 +1495,9 @@ fn stored_resumed(db: &Database, dir: &Path, count: u64) -> Vec<JobId> {
             policy_override: None,
             unpack: Some(false),
             unpack_in_force: Some(false),
+            unpack_over: false,
+            unpack_end: None,
+            download_ends: 0,
             metadata: Vec::new(),
             upload_limit: None,
             download_limit: None,
