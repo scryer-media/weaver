@@ -990,8 +990,10 @@ impl TorrentStore {
     // are let go, and its tee hears nothing more and gives back what it
     // holds of the repair slots.
     pub(crate) async fn forget(&self) {
-        drop(self.unpark());
         self.writes.forget().await;
+        // Kept for a move before the writes were given up; none is kept
+        // after.
+        drop(self.unpark());
         self.files.release();
         if let Some(tee) = &self.tee {
             tee.forget();
@@ -1153,7 +1155,10 @@ impl TorrentStore {
     fn hand_over(&self, parked: Parked) -> Option<Parked> {
         let mut moves = lock(&self.moves);
         if moves.moving {
-            moves.parked.push_back(parked);
+            // A torrent gone keeps nothing for its move to queue.
+            if !self.writes.retired() {
+                moves.parked.push_back(parked);
+            }
             return None;
         }
         // Not waited for: a move says it begins before it takes the files.
