@@ -467,6 +467,18 @@ impl Object for Par {
 }
 
 impl Recovery for Par {
+    fn rebuilds(&self) -> bool {
+        true
+    }
+
+    fn carried_inside(&self) -> bool {
+        false
+    }
+
+    fn outgrows_recovery(&self) -> bool {
+        self.seen.lock().unwrap().par3
+    }
+
     fn bind(&mut self, namespace: &mut weaver_graph::Namespace, renamed: &mut Vec<MemberId>) {
         let covered = (self.volume, self.others.clone());
         self.volume = namespace.find_by_name("set.par2").map(|own| own.id);
@@ -4037,6 +4049,8 @@ fn names_placed_while_the_policy_is_unreadable_are_judged_once_it_reads() {
             if readable.load(Ordering::SeqCst) {
                 Ok(Arc::new(PostProcessingSettings {
                     unacceptable_extensions: vec!["exe".into()],
+                    unwanted_extension_action:
+                        crate::post_processing::model::UnwantedExtensionAction::FailJob,
                     ..PostProcessingSettings::default()
                 }))
             } else {
@@ -5486,7 +5500,7 @@ fn a_refused_name_recognised_and_rebuilt_is_a_usable_file() {
         &job.tree,
         |member| member != other,
         |_| false,
-        |_, _| false,
+        |_, _| crate::pipeline::graph::status::Described::Otherwise,
         |node, member| job.writer.refused(node, member),
         |node, member| job.writer.unnamable(node, member),
         |_| crate::pipeline::graph::status::Unarrived::Short,

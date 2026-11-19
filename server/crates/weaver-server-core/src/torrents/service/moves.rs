@@ -1019,16 +1019,28 @@ impl TorrentService {
     // one pass, the sessions joined in the order the moves let them go, and
     // one publish.
     async fn pay(&self, owed: Owed) {
+        // The looks ask one pass between them, as the last ends. Ended
+        // already, they take the pass made here; those still out ask theirs
+        // as the last of them ends.
+        let batch = (!owed.places.is_empty()).then(|| super::disk_room::PlaceBatch::new(self));
         for (job_id, intake, dir) in owed.places {
-            self.spawn_place(job_id, &intake, dir, false);
+            self.spawn_place_in(job_id, &intake, dir, false, batch.as_ref());
         }
+        let placed = batch
+            .and_then(|batch| Arc::try_unwrap(batch).ok())
+            .is_some_and(super::disk_room::PlaceBatch::take_placed);
         if owed.pass {
             self.apply_queue().await;
         }
         for job_id in owed.attach {
             self.spawn_attach(job_id).await;
         }
-        if owed.publish {
+        // The pass the looks asked, made here as the settle makes it: the
+        // queue's turns, then picking for every torrent.
+        if placed {
+            self.apply_queue_and_picking().await;
+        }
+        if owed.publish || placed {
             self.publish().await;
         }
     }

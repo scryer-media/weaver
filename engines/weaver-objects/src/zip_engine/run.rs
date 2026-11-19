@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use ::zip::read::ZipReadOptions;
+use ::zip::result::ZipError;
 use bytes::Bytes;
 use weaver_graph::{Emit, Extraction, MemberId, Provenance, Sink, Volumes};
 
@@ -63,7 +64,7 @@ impl Extraction for Run {
             open: None,
         };
         // `None`: the owner stopped the run, so it already knows why.
-        let Err(Some(verdict)) = walk.all(image, self.password.as_deref()) else {
+        let Err(Some((error, verdict))) = walk.all(image, self.password.as_deref()) else {
             return;
         };
         // An owner that failed a read already knows why too, as it does
@@ -83,9 +84,15 @@ impl Extraction for Run {
         {
             return;
         }
-        (walk.sink)(verdict);
+        if (walk.sink)(Emit::Failed(verdict::failed(&error))) {
+            (walk.sink)(verdict);
+        }
     }
 }
+
+// How a walk ends early: `None` when the owner stopped it, so it already
+// knows why, or the error's text and what it means.
+type Ended = Option<(String, Emit)>;
 
 struct Walk<'s, 'a> {
     sink: &'s mut Sink<'a>,
@@ -97,32 +104,26 @@ struct Walk<'s, 'a> {
 }
 
 impl Walk<'_, '_> {
-    fn all(&mut self, image: Image, password: Option<&str>) -> Result<(), Option<Emit>> {
-        let archive = image
-            .archive()
-            .map_err(|error| Some(verdict::zip(&error)))?;
+    // A walk that fails ends on the error's text and what it means.
+    fn all(&mut self, image: Image, password: Option<&str>) -> Result<(), Ended> {
+        let zip = |error: ZipError| Some((error.to_string(), verdict::zip(&error)));
+        let archive = image.archive().map_err(zip)?;
         let directory = archive.metadata();
         if directory.has_duplicate_names() {
-            return Err(Some(Emit::Refuse(weaver_graph::Why::InvalidArchive)));
+            return Err(Some((
+                "the zip's directory names a member twice".to_owned(),
+                Emit::Refuse(weaver_graph::Why::InvalidArchive),
+            )));
         }
         let mut image = archive.into_inner();
         for index in 0..directory.len() {
-            let entry = directory
-                .entry(index)
-                .map_err(|error| Some(verdict::zip(&error)))?;
-            image
-                .check_header(&entry)
-                .map_err(|error| Some(verdict::zip(&error)))?;
+            let entry = directory.entry(index).map_err(zip)?;
+            image.check_header(&entry).map_err(zip)?;
             // The directory bounds the read and the decoded output. A stale
             // local size does not discard a member whose CRC still checks.
             let options = ZipReadOptions::new().password(password.map(str::as_bytes));
-            let mut file = entry
-                .with_reader(&mut image, options)
-                .map_err(|error| Some(verdict::zip(&error)))?;
-            let name = file
-                .name()
-                .map_err(|error| Some(verdict::zip(&error)))?
-                .into_owned();
+            let mut file = entry.with_reader(&mut image, options).map_err(zip)?;
+            let name = file.name().map_err(zip)?.into_owned();
             // A directory is a member with nothing in it, named as the store
             // names it. Links and devices are not file bodies, so none is a
             // member and the files around them stand.
@@ -161,14 +162,15 @@ impl Walk<'_, '_> {
             if out.stopped {
                 return Err(None);
             }
-            copied.map_err(|error| Some(verdict::zip_read(&error, encrypted)))?;
+            copied
+                .map_err(|error| Some((error.to_string(), verdict::zip_read(&error, encrypted))))?;
             self.open = None;
             self.say(Emit::MemberClosed(member))?;
         }
         Ok(())
     }
 
-    fn say(&mut self, emit: Emit) -> Result<(), Option<Emit>> {
+    fn say(&mut self, emit: Emit) -> Result<(), Ended> {
         (self.sink)(emit).then_some(()).ok_or(None)
     }
 }

@@ -676,7 +676,7 @@ impl Object for Zip {
                     })
                     .map(|_| Why::Encrypted)
             })
-            .or_else(|| crate::quiet::unplaced(standing))
+            .or_else(|| crate::quiet::unplaced(standing, None))
         {
             self.give_up(Emit::Refuse(why), out);
         }

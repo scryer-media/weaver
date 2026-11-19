@@ -572,3 +572,93 @@ async fn a_torrent_that_wants_a_piece_again_finishes_again() {
         h.live.on_piece_completed(h.piece(1)).unwrap()
     }));
 }
+
+impl Harness {
+    /// A peer at `addr` named and dialled, its dial under way, and the
+    /// handler of that dial's task.
+    fn dialling(&self, addr: &str) -> PeerHandler {
+        let addr: SocketAddr = addr.parse().unwrap();
+        self.peers.add_peer(addr, PeerSourceFlag::Tracker);
+        let (dialled, _rx, tx) = self
+            .peers
+            .connect_next(tokio::time::Instant::now())
+            .unwrap();
+        assert_eq!(dialled, addr);
+        let counters = self
+            .peers
+            .with_peer(addr.into(), |p| p.stats.counters.clone())
+            .unwrap();
+        PeerHandler {
+            addr: addr.into(),
+            incoming: false,
+            on_bitfield_notify: Default::default(),
+            speaks_v2: AtomicBool::new(false),
+            sent_dht_port: AtomicBool::new(false),
+            let_go_in_upload_mode: AtomicU64::new(0),
+            pex_started: AtomicBool::new(false),
+            flow_control: Mutex::new(PeerFlowControl::new(self.live.max_request_window())),
+            state: self.live.clone(),
+            tx,
+            answers: Default::default(),
+            counters,
+            first_message_received: AtomicBool::new(false),
+            transport: AtomicU8::new(0),
+            disk: Default::default(),
+            upload: Default::default(),
+            requests: Default::default(),
+            cancel_token: self.live.cancellation_token.child_token(),
+            client_name_and_version: String::new(),
+        }
+    }
+}
+
+// Weaver's departure from libtorrent, ruled: a pause or recheck lets its
+// connections go, so the next run dials their peers at once
+// (`PeerStates::close_all`). The end cancels the run before it lets every
+// connection go, and a dial's task the cancel drops can settle in between:
+// that close is the end's too. A dial that failed, or a peer that closed
+// on us, keeps its wait, whenever it settles.
+#[tokio::test(start_paused = true)]
+async fn a_dial_the_runs_end_cancels_is_dialled_at_once_by_the_next_run() {
+    let h = Harness::new("dial_let_go_by_the_end").await;
+    let cancelled = h.dialling("127.0.0.1:6881");
+    let refused = h.dialling("127.0.0.2:6881");
+    let closed = h.dialling("127.0.0.3:6881");
+    let ended_at = tokio::time::Instant::now();
+
+    // The end's first step, then each dial settles before the rest of it.
+    h.live.cancellation_token.cancel();
+    drop(PeerLifetime(Some(cancelled)));
+    refused
+        .on_peer_died(Some(crate::Error::TcpConnect(
+            std::io::ErrorKind::ConnectionRefused.into(),
+        )))
+        .unwrap();
+    closed
+        .on_peer_died(Some(crate::Error::PeerDisconnected))
+        .unwrap();
+    let paused = h.live.pause().unwrap();
+
+    let next = PeerStates::founded_on(paused.peers, Default::default(), h.lengths.total_pieces());
+    let wait = |addr: &str| {
+        next.with_peer(sock(addr).into(), |p| (p.reconnect_at(), p.failcount()))
+            .unwrap()
+    };
+    assert_eq!(wait("127.0.0.1:6881"), (Some(ended_at), 0));
+    assert_eq!(
+        wait("127.0.0.2:6881"),
+        (Some(ended_at + peer::MIN_RECONNECT_TIME * 2), 1)
+    );
+    assert_eq!(
+        wait("127.0.0.3:6881"),
+        (Some(ended_at + peer::MIN_RECONNECT_TIME), 0)
+    );
+    // The next run's connect loop dials the cancelled one at once, and it
+    // alone.
+    let now = tokio::time::Instant::now();
+    assert_eq!(
+        next.connect_next(now).map(|(addr, ..)| addr),
+        Some(sock("127.0.0.1:6881"))
+    );
+    assert!(next.connect_next(now).is_none());
+}

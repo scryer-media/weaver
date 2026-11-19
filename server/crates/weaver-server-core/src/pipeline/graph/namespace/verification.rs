@@ -5,10 +5,9 @@
 // namespace until an answer for the same backing and bytes is accepted.
 
 use std::fs::File;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::*;
-use crate::operations::disk::reader::Reading;
+use crate::operations::disk::reader::{Reading, TurnStop};
 use crate::operations::disk::volume::Volume;
 use crate::pipeline::graph::hardware::Shutdown;
 use crate::pipeline::graph::leaf::read_exact_at;
@@ -29,7 +28,7 @@ pub(crate) struct Verification {
     settled: Option<crate::operations::disk::writer::Barrier>,
     // The volume the file lies on: the check reads in its turns.
     volume: Option<Arc<Volume>>,
-    pub(crate) stop: Arc<AtomicBool>,
+    pub(crate) stop: Arc<TurnStop>,
     #[cfg(test)]
     barrier: Option<ReadBarrier>,
 }
@@ -84,7 +83,7 @@ impl Verification {
     }
 
     pub(super) fn run_with(self, shutdown: &Shutdown, mut read: impl FnMut(usize)) -> Verified {
-        let stopped = || self.stop.load(Ordering::Relaxed) || shutdown.started();
+        let stopped = || self.stop.raised() || shutdown.started();
         let io = |source| LeafError::Io {
             device: crate::pipeline::graph::limits::Device::Working,
             path: self.path.clone(),
@@ -122,8 +121,16 @@ impl Verification {
                 }
                 let len = (self.length - at).min(READ_BACK) as usize;
                 let into = &mut bytes[..len];
+                // A wait for a turn ends when the job stops the check.
                 match reads {
-                    Some(reads) => reading.read(reads, || read_exact_at(&file, at, into)),
+                    Some(reads) => {
+                        match reading.read_unless(reads, &self.stop, || {
+                            read_exact_at(&file, at, into)
+                        }) {
+                            Some(read) => read,
+                            None => return Ok(None),
+                        }
+                    }
                     None => read_exact_at(&file, at, into),
                 }
                 .map_err(io)?;
@@ -235,7 +242,7 @@ impl NamespaceWriter {
                 .map(|folded| folded as u32),
             settled: leaf.settled(),
             volume: leaf.volume().cloned(),
-            stop: Arc::new(AtomicBool::new(false)),
+            stop: Arc::default(),
             #[cfg(test)]
             barrier: None,
         })
@@ -261,7 +268,7 @@ impl NamespaceWriter {
     ) -> Result<(), WriteError> {
         let Verified { check, actual } = verified;
         let key = (check.node, check.member);
-        if !self.verifications.contains(&key) || check.stop.load(Ordering::Relaxed) {
+        if !self.verifications.contains(&key) || check.stop.raised() {
             return Ok(());
         }
         // A member that can no longer be checked keeps its obligation for
@@ -298,7 +305,6 @@ impl NamespaceWriter {
 #[cfg(test)]
 mod turns {
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
 
     use weaver_graph::{Coverage, MemberId, NodeId};
 
@@ -320,7 +326,7 @@ mod turns {
             folded: None,
             settled: None,
             volume,
-            stop: Arc::new(AtomicBool::new(false)),
+            stop: Arc::default(),
             barrier: None,
         }
     }
@@ -378,6 +384,38 @@ mod turns {
             let (missing, _, _) = run(Some(Arc::clone(&volume)), dir.path().join("gone.bin"));
             assert_eq!(missing, old_missing, "{kind:?}");
             assert_eq!(volume.read_turns().turns().available_permits(), all);
+        }
+    }
+
+    // A check waiting for a turn that the volume's other readers hold ends
+    // when its job stops it, having read nothing, on solid state and on a
+    // spinning volume alike.
+    #[test]
+    fn a_check_waiting_for_a_turn_ends_when_it_is_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("member.bin");
+        std::fs::write(&path, vec![7; 64]).unwrap();
+        for kind in [StorageKind::Solid, StorageKind::Rotational] {
+            let volume = Arc::new(Volume::new(None, "test".to_owned()));
+            let reads = volume.reads(|| kind);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let every = runtime
+                .block_on(Arc::clone(reads.turns()).acquire_many_owned(reads.readers() as u32))
+                .unwrap();
+            let check = check(path.clone(), 64, Some(Arc::clone(&volume)));
+            let stop = Arc::clone(&check.stop);
+            let waiting = std::thread::spawn(move || {
+                let mut read = 0;
+                let verified = check.run_with(&Shutdown::default(), |len| read += len);
+                (verified.actual.ok(), read)
+            });
+            stop.await_waiters(1);
+            stop.raise();
+            assert_eq!(waiting.join().unwrap(), (Some(None), 0), "{kind:?}");
+            drop(every);
+            assert_eq!(reads.turns().available_permits(), reads.readers(), "{kind:?}");
         }
     }
 }

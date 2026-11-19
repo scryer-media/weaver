@@ -56,11 +56,30 @@ fn a_volume_of_the_set_with_no_front_is_claimed_by_a_packet_past_its_hole() {
     assert!(claims(&mut job, past_hole(&volume)));
 }
 
+// An object that holds no set yet, built to judge a member past its hole
+// when no file of the set opened on its own packets: a packet whose MD5
+// passes founds the set, whatever set it is, and bytes that hold no such
+// packet claim nothing.
 #[test]
-fn a_volume_with_no_front_is_not_claimed_before_its_set_is_known() {
+fn a_volume_with_no_front_founds_its_set_by_a_packet_past_its_hole() {
     let (_, volume) = set(61);
-    let mut job = job(&[]);
-    assert!(!claims(&mut job, past_hole(&volume)));
+    assert!(
+        claims(&mut job(&[]), past_hole(&volume)),
+        "a packet that passes"
+    );
+    assert!(
+        !claims(&mut job(&[]), &payload(12, RUN)),
+        "no packet at all"
+    );
+    let run = past_hole(&volume);
+    let (at, length) = first_packet(run);
+    let mut spoiled = run.to_vec();
+    spoiled.truncate(at + length);
+    spoiled[at + length - 1] ^= 0x5a;
+    assert!(
+        !claims(&mut job(&[]), &spoiled),
+        "a packet that fails its MD5"
+    );
 }
 
 #[test]

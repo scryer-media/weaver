@@ -292,7 +292,9 @@ async fn a_damaged_article_without_par2_fails_with_the_file_claimed_damaged() {
 }
 
 // A damaged member no set covers: the graph leaves it a damaged leaf and
-// delivers the rest repaired.
+// delivers the rest repaired. The set vouched for the job, and nothing
+// checks a file no set describes (SABnzbd's rule), so the job completes
+// with the leaf delivered as it stands.
 #[tokio::test]
 async fn a_damaged_member_no_set_covers_is_a_damaged_leaf() {
     let covered_data = payload(3 * ARTICLE, 10);
@@ -304,10 +306,10 @@ async fn a_damaged_member_no_set_covers_is_a_damaged_leaf() {
     let scenario = Scenario::new(posts).damaged(1, 1);
     let graph = run(&scenario).await;
     assert!(graph.refetched().is_empty());
-    // The damaged leaf beside the whole member makes the job Partial.
+    // The damaged leaf no set describes leaves the job no shorter.
     assert_eq!(
         graph.status,
-        Some(JobStatus::Partial),
+        Some(JobStatus::Complete),
         "{:?}",
         graph.failure
     );

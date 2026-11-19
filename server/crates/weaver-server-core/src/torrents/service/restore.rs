@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use super::disk_room::PlaceBatch;
 use super::intake::{Fetched, Parsed, parse};
 use super::live::Live;
 use super::retire::{held_key, held_of, held_tops};
@@ -508,6 +509,16 @@ impl TorrentService {
     // The store joined to what feeds it: the intake the session hands its
     // pieces to.
     fn give_store(&self, torrent: &mut Live, store: TorrentStore) {
+        self.give_store_in(torrent, store, None);
+    }
+
+    // `give_store`, the look for its disk one of `batch`'s when it is one.
+    fn give_store_in(
+        &self,
+        torrent: &mut Live,
+        store: TorrentStore,
+        batch: Option<&Arc<PlaceBatch>>,
+    ) {
         let job_id = torrent.record.job_id;
         let env = &self.inner.env;
         let store = store.shared();
@@ -536,7 +547,7 @@ impl TorrentService {
             Box::new(move |heard| signal.heard(job_id, heard)),
         ));
         if env.capacity.is_some() && !torrent.complete() && intake.room().place().is_none() {
-            self.look_for_place(torrent.record.job_id, &intake, dir);
+            self.look_for_place_in(torrent.record.job_id, &intake, dir, batch);
         }
         torrent.hold(store.file_have());
         if let Some(tee) = store.tee() {
@@ -561,13 +572,18 @@ impl TorrentService {
     // The torrent's metainfo and its store over it, at once. A store that
     // cannot be made fails the torrent. The files `left_out`, by their
     // index among the manifest's paths, are not downloaded: their level is
-    // `Ignored`, kept as the operator's own would be.
+    // `Ignored`, kept as the operator's own would be. True when the store
+    // already holds every file the torrent wants, as one whose every file is
+    // left out does: no piece is coming to ask for it to be judged, so the
+    // caller has the next settle look at it once the torrent is where a
+    // settle finds it (libtorrent `piece_picker::is_finished` with every
+    // piece filtered).
     pub(super) fn give_metainfo(
         &self,
         torrent: &mut Live,
         parsed: &Parsed,
         left_out: &[usize],
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let job_id = torrent.record.job_id;
         let mut stored = self.inner.db.torrent_file_priorities(job_id).unwrap_or_else(|error| {
             tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's file levels");
@@ -598,7 +614,7 @@ impl TorrentService {
             tracing::warn!(job_id = job_id.0, error = %error, "could not record whether a torrent unpacks");
         }
         let Some(made) = self.making(torrent, &self.global_passwords()) else {
-            return Ok(());
+            return Ok(false);
         };
         let (store, notes) = self
             .store::<std::convert::Infallible>(job_id, made, Err)
@@ -610,8 +626,17 @@ impl TorrentService {
             note.say(job_id);
         }
         torrent.files_missing = Note::absent(&notes);
+        let wanted = |file: usize| {
+            torrent
+                .levels
+                .get(file)
+                .copied()
+                .unwrap_or_default()
+                .wanted()
+        };
+        let whole = store.has_files(wanted);
         self.give_store(torrent, store);
-        Ok(())
+        Ok(whole)
     }
 
     // What the metainfo says of the torrent, without its job. Whether it
@@ -748,6 +773,8 @@ impl TorrentService {
             return;
         }
         let global = Some(self.global_passwords());
+        // The looks for their disks ask one pass between them.
+        let looks = PlaceBatch::new(self);
         let mut restoring = tokio::task::JoinSet::new();
         for job_id in waiting {
             if restoring.len() >= RESTORES_AT_ONCE {
@@ -755,13 +782,15 @@ impl TorrentService {
             }
             let service = self.clone();
             let global = global.clone();
+            let looks = Arc::clone(&looks);
             restoring.spawn(async move {
-                if service.restore_job_with(job_id, global).await {
+                if service.restore_job_with(job_id, global, Some(&looks)).await {
                     service.attach(job_id, None).await;
                 }
             });
         }
         while restoring.join_next().await.is_some() {}
+        drop(looks);
         // Those back read as their sessions have them now, not at the next
         // tick, as the tick reads them after a pass it waited on.
         self.read_sessions().await;
@@ -774,7 +803,7 @@ impl TorrentService {
     // restore that panics is a checkpoint that does not restore. Whether it
     // gave the torrent its job, unheld, so it may attach now.
     pub(super) async fn restore_job(&self, job_id: JobId) -> bool {
-        self.restore_job_with(job_id, None).await
+        self.restore_job_with(job_id, None, None).await
     }
 
     // [`Self::restore_job`] with the global archive passwords read for it,
@@ -783,6 +812,7 @@ impl TorrentService {
         &self,
         job_id: JobId,
         global: Option<Arc<[ArchivePasswordCandidate]>>,
+        looks: Option<&Arc<PlaceBatch>>,
     ) -> bool {
         self.ensure(&[job_id]).await;
         // However the restore ends, even cancelled or with the runtime, its
@@ -894,7 +924,16 @@ impl TorrentService {
             Some(torrent) => {
                 torrent.restore_held = None;
                 torrent.files_missing = missing;
-                self.give_store(torrent, store);
+                // One restored short of complete that holds every file it
+                // wants is judged at the next settle, as an add is.
+                let levels = &torrent.levels;
+                let whole = !torrent.complete()
+                    && store
+                        .has_files(|file| levels.get(file).copied().unwrap_or_default().wanted());
+                self.give_store_in(torrent, store, looks);
+                if whole {
+                    self.inner.signal.look(job_id);
+                }
                 let copy = self.catch_up_levels(torrent);
                 (torrent.held.is_none() && !missing, copy)
             }

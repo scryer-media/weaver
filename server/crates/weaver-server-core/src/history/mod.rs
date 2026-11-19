@@ -22,7 +22,6 @@ pub use attributes::{
 pub use failure_kind::HistoryFailureKind;
 pub use model::{
     HistoryEditFields, HistoryFilter, HistoryMetadataEquals, HistoryOrder, HistoryOrderKey,
-    HistoryRows,
 };
 pub use nzbget_state::{NzbgetHistoryState, NzbgetMarkStatus};
 pub use record::{IntegrationEventRow, JobHistoryRow};

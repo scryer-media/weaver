@@ -2316,7 +2316,7 @@ impl StorageCapacity {
     pub(crate) async fn root_of_path(&self, path: &Path) -> Option<Option<StorageRoot>> {
         #[cfg(test)]
         self.root_looks.fetch_add(1, Ordering::Relaxed);
-        let deadline = tokio::time::Instant::now() + ON_DEMAND_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + self.on_demand_timeout();
         let ticket = self
             .root_device(path)
             .map_or_else(|| self.begin(path, Want::Device), Ticket::Device);

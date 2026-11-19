@@ -200,6 +200,12 @@ pub enum Why {
     // never placed every member it named: its map never came, or never
     // closed what it announced.
     Unmapped,
+    // Unmapped for want of one volume the object can name: every volume is
+    // in, and the set runs on into volume `volume`, counted from zero in
+    // the set's own numbering, which never came.
+    Unfound {
+        volume: u32,
+    },
     // The object would sit deeper than a job's namespaces may nest. What
     // the member holds is the container, delivered as it is.
     TooDeep,
@@ -238,6 +244,7 @@ impl Why {
             | Why::EncryptedHeader
             | Why::Compressed
             | Why::Unmapped
+            | Why::Unfound { .. }
             | Why::InvalidArchive
             | Why::Scattered
             | Why::TooLarge { .. }
@@ -285,6 +292,7 @@ impl Why {
             | Why::FirstBytesLost
             | Why::HoldsBreached
             | Why::Unmapped
+            | Why::Unfound { .. }
             | Why::InvalidArchive
             | Why::Scattered
             | Why::TooLarge { .. }
@@ -389,6 +397,10 @@ pub enum Emit {
     // and taken by no object then, is offered to me again. Said once per
     // thing learned, never per delivery.
     Learned,
+    // "My run ended on this error": its text, for the job's log, said just
+    // before what the error means. It changes nothing in the tree. The text
+    // names no path outside the job and no secret.
+    Failed(String),
 }
 
 #[cfg(test)]
@@ -402,6 +414,7 @@ mod tests {
             Why::EncryptedHeader,
             Why::Compressed,
             Why::Unmapped,
+            Why::Unfound { volume: 2 },
             Why::InvalidArchive,
             Why::Scattered,
             Why::TooLarge {

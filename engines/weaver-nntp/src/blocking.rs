@@ -1255,6 +1255,9 @@ impl BlockingNntpConnection {
     ) -> Result<Self> {
         let dialer = &config.dialer;
         let dialed = dialer.runtime.block_on(dialer.dial(config))?;
+        // The route's part is done: a lane waiting behind this one for the
+        // route may dial now.
+        crate::route_line::routed();
         let remote_addr = dialed.stream.tcp().and_then(|s| s.peer_addr().ok());
         let socket = dialer.blocking_stream(dialed.stream, config)?;
         let mut result = Self::from_tcp(

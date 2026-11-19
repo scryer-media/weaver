@@ -108,6 +108,18 @@ impl Object for Reader {
 }
 
 impl Recovery for Reader {
+    fn rebuilds(&self) -> bool {
+        true
+    }
+
+    fn carried_inside(&self) -> bool {
+        false
+    }
+
+    fn outgrows_recovery(&self) -> bool {
+        false
+    }
+
     fn covers(&self, _: MemberId) -> bool {
         false
     }
@@ -387,7 +399,13 @@ fn a_full_front_queued_behind_a_lent_window_waits_through_damage() {
         &mut effects,
     );
     if tree.is_undecided(NodeId::ROOT, member) && !tree.front_to_come(NodeId::ROOT, member) {
-        tree.settle_leaf(NodeId::ROOT, member, None, &mut effects);
+        tree.settle_leaf(
+            NodeId::ROOT,
+            member,
+            None,
+            &mut Reading(Arc::clone(&log)),
+            &mut effects,
+        );
     }
     assert!(
         tree.is_undecided(NodeId::ROOT, member),
@@ -445,7 +463,13 @@ fn a_whole_member_shorter_than_a_verdict_founds_its_store_after_a_loan() {
     );
     assert!(!tree.front_to_come(NodeId::ROOT, member), "whole");
     if tree.is_undecided(NodeId::ROOT, member) {
-        tree.settle_leaf(NodeId::ROOT, member, None, &mut effects);
+        tree.settle_leaf(
+            NodeId::ROOT,
+            member,
+            None,
+            &mut Reading(Arc::clone(&log)),
+            &mut effects,
+        );
     }
     assert!(
         tree.is_undecided(NodeId::ROOT, member),

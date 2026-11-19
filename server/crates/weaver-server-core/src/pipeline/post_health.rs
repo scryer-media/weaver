@@ -21,9 +21,17 @@
 // touched while a round is out.
 //
 // The recovery a post declares is what its NZB names: PAR2 files, PAR3
-// files and RAR recovery volumes, each by its name. A RAR recovery record
-// inside a volume is invisible here; the 85% line is what leaves room for
-// it.
+// files and RAR recovery volumes, each by its name. To that the line adds
+// every file the graph holds as a recovery set's volume whatever its name,
+// as the graph binds it: a set posted under names that say nothing lowers
+// the line once its volumes bind, as a named set does from the start. So
+// that it can, a verdict the health would give waits while a file that
+// nothing counts as recovery yet still has its first article to come, and
+// those files binding as recovery, with what of them is not gone, would
+// lift the post above the line. The first articles lead the payload, so
+// the wait costs at most that one article per such file; a post those
+// files could not save is given up as it was. A RAR recovery record inside a volume is
+// invisible here; the 85% line is what leaves room for it.
 //
 // A round's STAT batches are work on the download lanes like an article.
 // Each batch waits for a free seat on a server it has not asked yet, the
@@ -44,7 +52,7 @@ use weaver_nntp::client::ProbeBatchResult;
 use weaver_nntp::pool::ServerId;
 
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
-use crate::jobs::model::{FileSpec, JobSpec};
+use crate::jobs::model::{FileSpec, JobSpec, SegmentSpec};
 use crate::pipeline::download::queue::QueuedWork;
 use crate::pipeline::{Pipeline, SegmentTerminalState, health_milli};
 
@@ -82,12 +90,23 @@ pub(crate) const DEAD_RELEASE_LANDED_DIVISOR: u64 = 4;
 const BATCH_SIZE: usize = 50;
 // Answers the mail holds before a lane waits for the pipeline to hear one.
 const MAIL_CAPACITY: usize = 64;
+// How long a batch seated on a lane is taken to be answering. A batch is
+// fifty STATs and at most fifty HEADs, each read bounded by its connection's
+// command timeout; at the half to three quarters of a second a reply takes
+// on a slow server, unpipelined, that is about seventy seconds. A round with
+// no batch seated within this window is not making progress, and the
+// dispatch stall it leaves is reported and escalated as any other.
+pub(crate) const SEATED_BATCH_ANSWERS_WITHIN: std::time::Duration =
+    std::time::Duration::from_secs(2 * 60);
 
 // What a round found, once every batch in it is back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProbeUpdate {
     pub(crate) job_id: JobId,
     pub(crate) round: u32,
+    // The bytes every server had said are gone when the round was armed:
+    // none of them was asked.
+    pub(crate) known: u64,
     // Articles a batch answered for.
     pub(crate) total: usize,
     // Of those, the ones no server holds.
@@ -146,10 +165,11 @@ impl ProbeTally {
     }
 
     // The update the round reports once every batch is back.
-    pub(crate) fn update(&self, job_id: JobId, round: u32) -> ProbeUpdate {
+    pub(crate) fn update(&self, job_id: JobId, round: u32, known: u64) -> ProbeUpdate {
         ProbeUpdate {
             job_id,
             round,
+            known,
             total: self.checked,
             missed: self.missed,
             unverified: self.unverified,
@@ -269,8 +289,14 @@ pub(crate) enum ProbeMail {
 #[derive(Debug, Clone, Copy)]
 struct LaneRound {
     round: u32,
+    // The bytes every server had said are gone when the round was armed.
+    known: u64,
     tally: ProbeTally,
     left: usize,
+    // Batches seated on a lane and not yet heard back from.
+    on_lanes: usize,
+    // When the latest of them was seated.
+    seated_at: Option<std::time::Instant>,
 }
 
 // Where a job's probe stands between rounds.
@@ -308,6 +334,9 @@ pub(crate) struct Probes {
     pub(crate) states: HashMap<JobId, ProbeState>,
     // The posts the feed gave up, in its words.
     pub(crate) dead: HashMap<JobId, String>,
+    // The posts whose health would give them up, held until every file
+    // that may yet bind as recovery has its first article in or lost.
+    pub(crate) held: std::collections::HashSet<JobId>,
     pub(crate) verdicts: HashMap<JobId, crate::jobs::feed_verdict::FeedVerdict>,
     // The jobs whose dead files are being abandoned now, and whether one of
     // the refusals booked since asked for the post to be weighed again.
@@ -327,6 +356,7 @@ impl Default for Probes {
             receiver,
             states: HashMap::new(),
             dead: HashMap::new(),
+            held: std::collections::HashSet::new(),
             verdicts: HashMap::new(),
             abandoning: HashMap::new(),
             waiting: VecDeque::new(),
@@ -366,6 +396,7 @@ impl Probes {
     // goes, and the post's verdict, if the feed gave one, stays.
     pub(crate) fn retire(&mut self, job_id: JobId) {
         self.states.remove(&job_id);
+        self.held.remove(&job_id);
         self.lane_rounds.remove(&job_id);
         self.waiting.retain(|batch| batch.job_id != job_id);
     }
@@ -375,6 +406,81 @@ impl Probes {
         self.retire(job_id);
         self.dead.remove(&job_id);
         self.verdicts.remove(&job_id);
+    }
+
+    // Whether a round has a batch out on the lanes that is still answering
+    // at `now`: seated, not heard back from, and the latest such batch
+    // seated within [`SEATED_BATCH_ANSWERS_WITHIN`]. While one is, the
+    // lanes a dispatch pass finds idle were yielded to it on purpose, and
+    // the connections it asks on are busy with it. A batch that never comes
+    // back stops answering once the window has passed since the last seat.
+    pub(crate) fn answering(&self, now: std::time::Instant) -> bool {
+        self.lane_rounds.values().any(|lane_round| {
+            lane_round.on_lanes > 0
+                && lane_round.seated_at.is_some_and(|seated_at| {
+                    now.saturating_duration_since(seated_at) < SEATED_BATCH_ANSWERS_WITHIN
+                })
+        })
+    }
+
+    // A batch of the round its job waits on was seated on a lane at `now`.
+    fn seated(&mut self, batch: &ProbeBatch, now: std::time::Instant) {
+        if let Some(lane_round) = self
+            .lane_rounds
+            .get_mut(&batch.job_id)
+            .filter(|lane_round| lane_round.round == batch.round)
+        {
+            lane_round.on_lanes += 1;
+            lane_round.seated_at = Some(now);
+        }
+    }
+
+    // A lane gave back a batch of the round its job waits on, answered or
+    // unasked.
+    fn heard_from_lane(&mut self, batch: &ProbeBatch) {
+        if let Some(lane_round) = self
+            .lane_rounds
+            .get_mut(&batch.job_id)
+            .filter(|lane_round| lane_round.round == batch.round)
+        {
+            lane_round.on_lanes = lane_round.on_lanes.saturating_sub(1);
+        }
+    }
+
+    // Batches seated on lanes that no worker started: they are off the
+    // lanes and wait for a seat again.
+    pub(crate) fn wait_again(&mut self, batches: Vec<ProbeBatch>) {
+        for batch in batches {
+            self.heard_from_lane(&batch);
+            self.waiting.push_back(batch);
+        }
+    }
+
+    // A round of `batches` batches out for the job, numbered `round`, every
+    // one seated on a lane at `seated_at`, as the dispatch pass seats them.
+    #[cfg(test)]
+    pub(crate) fn seat_round_for_test(
+        &mut self,
+        job_id: JobId,
+        round: u32,
+        batches: usize,
+        seated_at: std::time::Instant,
+    ) {
+        self.lane_rounds.insert(
+            job_id,
+            LaneRound {
+                round,
+                known: 0,
+                tally: ProbeTally::default(),
+                left: batches,
+                on_lanes: 0,
+                seated_at: None,
+            },
+        );
+        let batch = ProbeBatch::new(job_id, round, Vec::new());
+        for _ in 0..batches {
+            self.seated(&batch, seated_at);
+        }
     }
 
     // Whether `batch` belongs to the round its job is waiting on.
@@ -452,15 +558,18 @@ pub(crate) struct Place {
     number: u32,
 }
 
+// Whether the post's names count the file in the critical line: a PAR2 or
+// PAR3 file, its index among them, or a RAR recovery volume.
+pub(crate) fn names_recovery(file: &FileSpec) -> bool {
+    matches!(file.role, FileRole::Par2 { .. } | FileRole::Par3 { .. }) || declares_recovery(file)
+}
+
 // The bytes of every file the post names as recovery data, its indexes
-// among them: what the critical line is drawn from.
+// among them: the critical line until the graph binds more.
 pub(crate) fn declared_recovery_bytes(spec: &JobSpec) -> u64 {
     spec.files
         .iter()
-        .filter(|file| {
-            matches!(file.role, FileRole::Par2 { .. } | FileRole::Par3 { .. })
-                || declares_recovery(file)
-        })
+        .filter(|file| names_recovery(file))
         .flat_map(|file| file.segments.iter())
         .map(|segment| u64::from(segment.bytes))
         .sum()
@@ -534,18 +643,64 @@ pub(crate) fn first_article_verdict_error(missing: usize, total: usize) -> Strin
     format!("aborted: {missing} of {total} first articles are missing, the post cannot complete")
 }
 
-// The message ids a round samples from: every article of every file that
-// counts toward the post's health, in post order.
-pub(crate) fn candidates(spec: &JobSpec) -> Vec<String> {
-    spec.files
-        .iter()
-        .filter(|file| file.role.counts_toward_health())
-        .flat_map(|file| {
-            file.segments
-                .iter()
-                .map(|segment| segment.message_ids.in_use().to_string())
-        })
-        .collect()
+// The articles a round samples from: every article of every file that
+// counts toward the post's health, in post order. Built from the files
+// alone; an article is found by its place, so a round reads only the
+// articles it looks at.
+pub(crate) struct Candidates<'a> {
+    files: Vec<(u32, &'a FileSpec)>,
+    // Where each file's articles end, counted from the post's first.
+    ends: Vec<usize>,
+}
+
+impl<'a> Candidates<'a> {
+    pub(crate) fn new(spec: &'a JobSpec) -> Self {
+        let mut files = Vec::new();
+        let mut ends = Vec::new();
+        let mut end = 0;
+        for (file, index) in spec.files.iter().zip(0u32..) {
+            if file.role.counts_toward_health() && !file.segments.is_empty() {
+                end += file.segments.len();
+                files.push((index, file));
+                ends.push(end);
+            }
+        }
+        Self { files, ends }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.ends.last().copied().unwrap_or(0)
+    }
+
+    // The article at `at`: its file's index, and the article.
+    pub(crate) fn at(&self, at: usize) -> (u32, &'a SegmentSpec) {
+        let slot = self.ends.partition_point(|end| *end <= at);
+        let start = slot.checked_sub(1).map_or(0, |before| self.ends[before]);
+        let (index, file) = self.files[slot];
+        (index, &file.segments[at - start])
+    }
+}
+
+// The candidates a round asks for: at each place `sample_indices` picks,
+// the first article from there to the next pick that `gone` does not say
+// every server already failed. Such an article is in the post's losses
+// exactly; asking for it again would count it twice. Each article is
+// looked at once at most, so a round costs its picks and the known losses
+// it steps over.
+pub(crate) fn sample_unknown(
+    total: usize,
+    round: u32,
+    mut gone: impl FnMut(usize) -> bool,
+) -> Vec<usize> {
+    let picks = sample_indices(total, round);
+    let mut sampled = Vec::with_capacity(picks.len());
+    for (at, start) in picks.iter().enumerate() {
+        let end = picks.get(at + 1).copied().unwrap_or(total);
+        if let Some(unknown) = (*start..end).find(|candidate| !gone(*candidate)) {
+            sampled.push(unknown);
+        }
+    }
+    sampled
 }
 
 // The candidates a round asks for: an even stride of at least ten, or one
@@ -565,13 +720,22 @@ pub(crate) fn sample_indices(total: usize, round: u32) -> Vec<usize> {
     (offset..total).step_by(stride).collect()
 }
 
-// The loss a round projects over the payload: the share of what it asked
-// that is gone, taken over every byte that counts toward health.
-pub(crate) fn projected(tracked_bytes: u64, total: usize, missed: usize) -> Option<u64> {
+// The loss a round projects over the payload: the `known` bytes every
+// server already said are gone, exactly, and the share of what it asked
+// that is gone, taken over the bytes that count toward health past those.
+// The round asked none of the known losses.
+pub(crate) fn projected(
+    tracked_bytes: u64,
+    known: u64,
+    total: usize,
+    missed: usize,
+) -> Option<u64> {
     if total == 0 || missed == 0 || tracked_bytes == 0 {
         return None;
     }
-    Some((u128::from(tracked_bytes) * missed as u128 / total as u128) as u64)
+    let rest = tracked_bytes.saturating_sub(known);
+    let share = (u128::from(rest) * missed as u128 / total as u128) as u64;
+    Some(known.saturating_add(share))
 }
 
 // Whether the damage has the shape a probe exists to catch.
@@ -676,24 +840,55 @@ impl Pipeline {
     // sample lost; short of it with first articles still to come that could
     // take it there, the post has no verdict yet. Only a post the sample let
     // through is weighed by its health, at the failed bytes it lost or a
-    // round projected it will, against its critical line.
+    // round projected it will, against its critical line: the recovery the
+    // names declare and the graph binds. The sample counts the same
+    // recovery: a named file by its name, any other by what the graph has
+    // bound. Either verdict is held while a file nothing counts as recovery
+    // yet still has its first article to come and those files could still
+    // save the post, and given once each has arrived or been lost.
     pub(in crate::pipeline) fn post_health_verdict(&mut self, job_id: JobId) -> Option<String> {
         if self.post_probes.dead.contains_key(&job_id) || !self.jobs.contains_key(&job_id) {
             return None;
         }
         let first_articles = self.read_first_articles(job_id)?;
         let spec = &self.jobs.get(&job_id)?.spec;
-        let verdict = match first_articles.gate() {
-            Gate::Undecided => None,
-            Gate::Dead { missing, total }
-                if first_articles.weighed().0 > first_articles.weighed().1 =>
-            {
-                Some(Some(first_article_verdict_error(missing, total)))
+        let verdict = match (first_articles.gate(), first_articles.dead()) {
+            (Gate::Undecided, _) => None,
+            // The gate is held as the line is: while a file nothing counts
+            // as recovery yet has its first article to come, and those
+            // files, were they all recovery, would keep the post alive.
+            (_, Some(_)) if first_articles.unresolved() > 0 && !first_articles.dead_at_reach() => {
+                self.post_probes.held.insert(job_id);
+                None
             }
-            Gate::Dead { .. } | Gate::Open => {
-                Some(self.health_verdict(job_id, spec, first_articles.declared_recovery()))
+            (_, Some((missing, total))) => Some(Some(first_article_verdict_error(missing, total))),
+            (Gate::Dead { .. } | Gate::Open, None) => {
+                match self.health_verdict(job_id, spec, first_articles.recovery()) {
+                    Some(_)
+                        if first_articles.unresolved() > 0
+                            && self
+                                .health_verdict(
+                                    job_id,
+                                    spec,
+                                    self.reach(
+                                        job_id,
+                                        spec,
+                                        first_articles.recovery(),
+                                        first_articles.unresolved_reach(),
+                                    ),
+                                )
+                                .is_none() =>
+                    {
+                        self.post_probes.held.insert(job_id);
+                        None
+                    }
+                    verdict => Some(verdict),
+                }
             }
         };
+        if verdict.is_some() {
+            self.post_probes.held.remove(&job_id);
+        }
         // Kept only beside the graph it was read from: a sample read with no
         // graph in place holds nothing in hand, and is read again whole.
         if self.graph_jobs.contains_key(&job_id)
@@ -719,7 +914,7 @@ impl Pipeline {
             .get_mut(&job_id)
             .and_then(GivenUp::take_first_articles);
         let spec = &self.jobs.get(&job_id)?.spec;
-        Some(match (kept, changed) {
+        let mut sample = match (kept, changed) {
             (Some(mut kept), Some(Some(volumes))) if kept.files() == spec.files.len() => {
                 for volume in volumes {
                     kept.stale(volume.0);
@@ -730,10 +925,62 @@ impl Pipeline {
                 }
                 kept
             }
-            _ => FirstArticles::new(spec, |index, first| {
-                self.first_article_head(job_id, index, first)
-            }),
-        })
+            _ => FirstArticles::new(
+                spec,
+                |index, first| self.first_article_head(job_id, index, first),
+                |index| self.file_gone_bytes(job_id, index),
+            ),
+        };
+        self.read_bindings(job_id, &mut sample);
+        Some(sample)
+    }
+
+    // Which files the graph holds as recovery, brought up to date in the
+    // sample: the root's members whose rows changed since it last read
+    // them, or every posted file when it never has or the root was built
+    // again. A job with no graph has bound nothing.
+    fn read_bindings(&self, job_id: JobId, sample: &mut FirstArticles) {
+        let Some(graph) = self.graph_jobs.get(&job_id) else {
+            return;
+        };
+        let root = graph.namespace();
+        let generation = root.generation();
+        let files = sample.files() as u32;
+        match sample.bindings_at() {
+            Some(at) if at <= generation => {
+                let changed: Vec<u32> = root
+                    .changed_since(at)
+                    .map(|member| member.0)
+                    .filter(|index| *index < files)
+                    .collect();
+                for index in changed {
+                    sample.bind(index, graph.holds_as_recovery(index));
+                }
+            }
+            _ => {
+                for index in 0..files {
+                    sample.bind(index, graph.holds_as_recovery(index));
+                }
+            }
+        }
+        sample.set_bindings_at(generation);
+    }
+
+    // The most recovery the line could be drawn from once the files that may
+    // yet bind say what they are: `recovery`, and what those files would
+    // bring, `unresolved`, no more than the post's bytes not lost or
+    // projected lost.
+    fn reach(&self, job_id: JobId, spec: &JobSpec, recovery: u64, unresolved: u64) -> u64 {
+        let probe = self
+            .post_probes
+            .states
+            .get(&job_id)
+            .copied()
+            .unwrap_or_default();
+        let left = self
+            .post_bytes(job_id, spec)
+            .saturating_sub(probe.decided(self.missing_bytes(job_id)));
+        recovery.saturating_add(unresolved.min(left))
     }
 
     // The post's health against its critical line, once the sample has let
@@ -783,7 +1030,24 @@ impl Pipeline {
             .zip(0u32..)
             .map(|(file, index)| (index, file, self.first_article(job_id, index, file)))
             .collect();
-        let payload = heads.iter().filter(|(_, file, _)| !declares_recovery(file));
+        let graph = self.graph_jobs.get(&job_id);
+        // A file the names count is weighed by its name, any other by what
+        // the graph holds it as.
+        let gate_recovery = |index: u32, file: &FileSpec| {
+            if names_recovery(file) {
+                declares_recovery(file)
+            } else {
+                graph.is_some_and(|graph| graph.holds_as_recovery(index))
+            }
+        };
+        let unresolved_at = |index: u32, file: &FileSpec, head: Head| {
+            head == Head::Outstanding
+                && !names_recovery(file)
+                && !graph.is_some_and(|graph| graph.holds_as_recovery(index))
+        };
+        let payload = heads
+            .iter()
+            .filter(|(index, file, _)| !gate_recovery(*index, file));
         match first_article_gate(payload.clone().map(|head| head.2)) {
             Gate::Undecided => return None,
             Gate::Open => {}
@@ -795,20 +1059,77 @@ impl Pipeline {
                         .sum()
                 };
                 let lost: u64 = payload
+                    .clone()
                     .filter(|(_, _, head)| *head == Head::Lost)
                     .map(|(_, file, _)| bytes(file))
                     .sum();
                 let reachable: u64 = heads
                     .iter()
-                    .filter(|(_, file, head)| declares_recovery(file) && *head != Head::Lost)
+                    .filter(|(index, file, head)| {
+                        gate_recovery(*index, file) && *head != Head::Lost
+                    })
                     .map(|(_, file, _)| bytes(file))
                     .sum();
                 if lost > reachable {
-                    return Some(first_article_verdict_error(missing, total));
+                    let unresolved: Vec<(u32, u64)> = heads
+                        .iter()
+                        .filter(|(index, file, head)| unresolved_at(*index, file, *head))
+                        .map(|(index, file, _)| {
+                            (
+                                *index,
+                                bytes(file).saturating_sub(self.file_gone_bytes(job_id, *index)),
+                            )
+                        })
+                        .collect();
+                    let rest = payload
+                        .clone()
+                        .filter(|(index, file, head)| !unresolved_at(*index, file, *head))
+                        .map(|head| head.2);
+                    let reach: u64 = unresolved.iter().map(|(_, reach)| reach).sum();
+                    let reaching = matches!(first_article_gate(rest), Gate::Dead { .. })
+                        && lost > reachable + reach;
+                    if unresolved.is_empty() || reaching {
+                        return Some(first_article_verdict_error(missing, total));
+                    }
+                    return None;
                 }
             }
         }
-        self.health_verdict(job_id, spec, declared_recovery_bytes(spec))
+        let recovery = self.recovery_walked(job_id, spec);
+        let unresolved: Vec<u64> = heads
+            .iter()
+            .filter(|(index, file, head)| unresolved_at(*index, file, *head))
+            .map(|(index, file, _)| {
+                file.segments
+                    .iter()
+                    .map(|segment| u64::from(segment.bytes))
+                    .sum::<u64>()
+                    .saturating_sub(self.file_gone_bytes(job_id, *index))
+            })
+            .collect();
+        let reach = self.reach(job_id, spec, recovery, unresolved.iter().sum());
+        let verdict = self.health_verdict(job_id, spec, recovery);
+        if verdict.is_some()
+            && !unresolved.is_empty()
+            && self.health_verdict(job_id, spec, reach).is_none()
+        {
+            return None;
+        }
+        verdict
+    }
+
+    // The recovery the line is drawn from, by a walk of every posted file.
+    #[cfg(test)]
+    fn recovery_walked(&self, job_id: JobId, spec: &JobSpec) -> u64 {
+        let graph = self.graph_jobs.get(&job_id);
+        (0u32..)
+            .zip(&spec.files)
+            .filter(|(index, file)| {
+                names_recovery(file) || graph.is_some_and(|graph| graph.holds_as_recovery(*index))
+            })
+            .flat_map(|(_, file)| file.segments.iter())
+            .map(|segment| u64::from(segment.bytes))
+            .sum()
     }
 
     // The job's sample as the feed keeps it, and as a whole read of the post
@@ -824,9 +1145,18 @@ impl Pipeline {
             .and_then(GivenUp::first_articles)
             .cloned();
         let read = self.jobs.get(&job_id).map(|state| {
-            FirstArticles::new(&state.spec, |index, first| {
-                self.first_article_head(job_id, index, first)
-            })
+            let mut read = FirstArticles::new(
+                &state.spec,
+                |index, first| self.first_article_head(job_id, index, first),
+                |index| self.file_gone_bytes(job_id, index),
+            );
+            // The bindings as a whole read finds them, read at the
+            // generation the kept sample was.
+            self.read_bindings(job_id, &mut read);
+            if let Some(at) = kept.as_ref().and_then(FirstArticles::bindings_at) {
+                read.set_bindings_at(at);
+            }
+            read
         });
         (kept, read)
     }
@@ -866,7 +1196,7 @@ impl Pipeline {
             .and_then(GivenUp::first_articles)
             .map_or_else(
                 || declared_recovery_bytes(&state.spec),
-                FirstArticles::declared_recovery,
+                FirstArticles::recovery,
             );
         let critical = Self::critical_health_milli(total, recovery);
         let critical_failed = critical_failed_bytes(total, critical);
@@ -878,25 +1208,39 @@ impl Pipeline {
         if !needed {
             return;
         }
-        let candidates = candidates(&state.spec);
         let round = probe.rounds;
+        let candidates = Candidates::new(&state.spec);
+        let given_up = self.given_up.get(&job_id);
+        let segment_of = |at: usize| {
+            let (file_index, segment) = candidates.at(at);
+            SegmentId {
+                file_id: NzbFileId { job_id, file_index },
+                segment_number: segment.ordinal,
+            }
+        };
+        let probes: Vec<String> = sample_unknown(candidates.len(), round, |at| {
+            given_up.is_some_and(|given_up| given_up.gone(segment_of(at)))
+        })
+        .into_iter()
+        .map(|at| candidates.at(at).1.message_ids.in_use().to_string())
+        .collect();
+        // What every server already said is gone, which the round does not
+        // ask again: its projection is over the rest.
+        let known = self.missing_bytes(job_id);
         let entry = self.post_probes.states.entry(job_id).or_default();
         entry.rounds = round.wrapping_add(1);
         entry.failing_files = failing_files;
-        if candidates.is_empty() {
+        if probes.is_empty() {
             entry.next_failed_bytes = decided.saturating_add(1);
             return;
         }
         entry.out = Some(round);
-        let probes: Vec<String> = sample_indices(candidates.len(), round)
-            .into_iter()
-            .map(|index| candidates[index].clone())
-            .collect();
         info!(
             job_id = job_id.0,
             round,
             probes = probes.len(),
             candidates = candidates.len(),
+            known_lost_bytes = known,
             failing_files,
             failed_bytes = decided,
             "health probe armed: STAT sampling"
@@ -911,8 +1255,11 @@ impl Pipeline {
             job_id,
             LaneRound {
                 round,
+                known,
                 tally: ProbeTally::default(),
                 left: batches.len(),
+                on_lanes: 0,
+                seated_at: None,
             },
         );
         self.post_probes.waiting.extend(batches);
@@ -934,6 +1281,7 @@ impl Pipeline {
         if !self.post_probes.current(&batch) {
             return;
         }
+        self.post_probes.heard_from_lane(&batch);
         batch.rebase(&self.pool_layouts, self.pool_generation);
         self.post_probes.waiting.push_back(batch);
         self.download_dispatch_wake = true;
@@ -951,6 +1299,7 @@ impl Pipeline {
         if !self.post_probes.current(&batch) {
             return;
         }
+        self.post_probes.heard_from_lane(&batch);
         // An answer from a server of a pool since rebuilt names that server
         // as the old pool numbered it: it is folded in under the server's
         // current number, or not at all once the server is gone or changed.
@@ -976,9 +1325,11 @@ impl Pipeline {
     // has not asked, that is not held back from new connections, and that
     // has a seat left in the pass's ledger. Each seat taken is entered in
     // the ledger, so no article lease takes it too. A batch every server it
-    // may go to has answered for is done; one that finds no seat waits.
+    // may go to has answered for is done; one that finds no seat waits. A
+    // batch handed to a lane is seated at `now`, the pass's instant.
     pub(in crate::pipeline) fn seat_waiting_probes(
         &mut self,
+        now: std::time::Instant,
         sent_this_pass: &mut HashMap<usize, usize>,
         headroom_at_pass_start: &mut HashMap<usize, usize>,
     ) {
@@ -1019,6 +1370,7 @@ impl Pipeline {
             *sent_this_pass.entry(server).or_default() += 1;
             let ids = batch.unfound();
             let unasked = ids.len();
+            self.post_probes.seated(&batch, now);
             // A pool that has stopped seats nothing: the batch is unsettled
             // on that server and goes on to the next.
             if let Err(mut batch) = self.owned_download_lane_pool.probe(
@@ -1028,6 +1380,7 @@ impl Pipeline {
                 batch,
                 self.post_probes.sender(),
             ) {
+                self.post_probes.heard_from_lane(&batch);
                 batch.fold(
                     server,
                     ProbeBatchResult {
@@ -1112,7 +1465,12 @@ impl Pipeline {
         if lane_round.left > 0 {
             return;
         }
-        let LaneRound { round, tally, .. } = *lane_round;
+        let LaneRound {
+            round,
+            known,
+            tally,
+            ..
+        } = *lane_round;
         self.post_probes.lane_rounds.remove(&job_id);
         info!(
             job_id = job_id.0,
@@ -1122,7 +1480,7 @@ impl Pipeline {
             unverified = tally.unverified,
             "health probe complete"
         );
-        self.post_probe_heard(tally.update(job_id, round));
+        self.post_probe_heard(tally.update(job_id, round, known));
     }
 
     // What a round said. Only the round the job waits on is heard: a job
@@ -1149,7 +1507,14 @@ impl Pipeline {
             return;
         };
         let total = self.post_bytes(job_id, &state.spec);
-        let recovery = declared_recovery_bytes(&state.spec);
+        let recovery = self
+            .given_up
+            .get(&job_id)
+            .and_then(GivenUp::first_articles)
+            .map_or_else(
+                || declared_recovery_bytes(&state.spec),
+                FirstArticles::recovery,
+            );
         let tracked = total.saturating_sub(recovery);
         let critical = Self::critical_health_milli(total, recovery);
         let failed = self.missing_bytes(job_id);
@@ -1158,7 +1523,7 @@ impl Pipeline {
         };
         probe.out = None;
         if !update.inconclusive
-            && let Some(projected) = projected(tracked, update.total, update.missed)
+            && let Some(projected) = projected(tracked, update.known, update.total, update.missed)
             && projected > probe.projected
         {
             probe.projected = projected;
@@ -1198,6 +1563,40 @@ impl Pipeline {
         } else if !self.fail_graph_job_ruled_short(job_id) {
             self.arm_post_probe(job_id);
         }
+    }
+
+    // An article of the post arrived. When the post's health verdict is
+    // held and the article is its file's first, the post is weighed again:
+    // that file may have bound as recovery, or was the last the hold waited
+    // for. Any other article costs one lookup.
+    pub(in crate::pipeline) fn post_article_came(&mut self, segment: SegmentId) {
+        let job_id = segment.file_id.job_id;
+        if !self.post_probes.held.contains(&job_id)
+            || !self
+                .jobs
+                .get(&job_id)
+                .is_some_and(|state| state.status.in_progress())
+        {
+            return;
+        }
+        let first = self
+            .given_up
+            .get(&job_id)
+            .and_then(GivenUp::first_articles)
+            .and_then(|sample| sample.first(segment.file_id.file_index));
+        if first != Some(segment.segment_number) {
+            return;
+        }
+        if let Some(error) = self.post_health_verdict(job_id) {
+            self.stop_feeding_post(job_id, error);
+        }
+    }
+
+    // The bytes of the file at `index` every server said are gone.
+    fn file_gone_bytes(&self, job_id: JobId, index: u32) -> u64 {
+        self.given_up
+            .get(&job_id)
+            .map_or(0, |given_up| given_up.file(index).missing_bytes)
     }
 
     // The bytes of the post the servers said are gone, in this run or one

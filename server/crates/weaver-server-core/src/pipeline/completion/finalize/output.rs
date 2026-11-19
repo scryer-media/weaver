@@ -55,10 +55,14 @@ pub(in crate::pipeline) fn member_crc32_by_path(
     by_path
 }
 
+// The unwanted extension policy a final move scans its delivery under.
 enum DeliveryPolicySource {
-    Persisted(crate::Database),
-    #[cfg(test)]
-    Fixed(PostProcessingSettings),
+    // The job's own copy, the one its graph read once and judged it by: a
+    // job ends by the setting it started with.
+    Job(Arc<PostProcessingSettings>),
+    // The setting as the database holds it now, for a move with no such
+    // copy: one restored from its moving row after a restart.
+    Persisted(Box<crate::Database>),
 }
 
 // Inspect exactly the entries the final move can publish, without following
@@ -985,7 +989,8 @@ async fn run_move_to_claimed_destination(
     };
     let again = Arc::new(again);
     let policy = match policy_source {
-        DeliveryPolicySource::Persisted(database) => {
+        DeliveryPolicySource::Job(policy) => policy,
+        DeliveryPolicySource::Persisted(database) => Arc::new(
             crate::runtime::panic_trap::spawn_blocking(move || database.post_processing_settings())
                 .await
                 .map_err(|error| {
@@ -997,12 +1002,9 @@ async fn run_move_to_claimed_destination(
                     MoveToCompleteFailure::Operational(format!(
                         "could not load unacceptable extension policy: {error}"
                     ))
-                })?
-        }
-        #[cfg(test)]
-        DeliveryPolicySource::Fixed(policy) => policy,
+                })?,
+        ),
     };
-    let policy = Arc::new(policy);
     let validation = {
         let working_dir = working_dir.clone();
         let staging_dir = staging_dir.clone();
@@ -1972,7 +1974,7 @@ impl Pipeline {
             hold,
             phase_counters,
             naming,
-            policy_source: DeliveryPolicySource::Persisted(self.db.clone()),
+            policy_source: self.delivery_policy(job_id),
             left_behind,
         });
         Ok(())
@@ -2210,9 +2212,24 @@ impl Pipeline {
             hold: None,
             phase_counters,
             naming,
-            policy_source: DeliveryPolicySource::Persisted(self.db.clone()),
+            policy_source: self.delivery_policy(job_id),
             left_behind,
         });
+    }
+
+    // The policy a job's final move scans under: the copy its graph judged
+    // it by, so a setting saved while it ran never turns a ruling into a
+    // failure at the move. Only a job with no such copy, a moving row
+    // restored after a restart, takes the setting as it stands now.
+    fn delivery_policy(&self, job_id: JobId) -> DeliveryPolicySource {
+        match self
+            .graph_jobs
+            .get(&job_id)
+            .and_then(|graph| graph.writer().policy())
+        {
+            Some(policy) => DeliveryPolicySource::Job(policy),
+            None => DeliveryPolicySource::Persisted(Box::new(self.db.clone())),
+        }
     }
 
     fn spawn_final_move(&self, final_move: FinalMove) {

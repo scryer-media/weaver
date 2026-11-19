@@ -1563,7 +1563,7 @@ struct OutcomeStream {
     // runtime wherever the drop happens, a blocking lane thread included.
     runtime: Option<tokio::runtime::Handle>,
     _session: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
-    _capacity: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    _capacity: Option<Arc<SessionPermit>>,
     _socket: StreamSocket,
 }
 impl OutcomeStream {
@@ -1571,7 +1571,7 @@ impl OutcomeStream {
         stream: DialedStream,
         outcome: Arc<ConnectionOutcome>,
         session: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
-        capacity: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+        capacity: Option<Arc<SessionPermit>>,
     ) -> Self {
         Self {
             stream: std::mem::ManuallyDrop::new(stream),
@@ -1634,26 +1634,57 @@ impl AsyncWrite for OutcomeStream {
     }
 }
 
+// Rings each time a session gives a budget permit back: a dial refused for
+// the budget (`DialError::SessionBudget`) waits on it for the room.
+pub fn session_budget_freed() -> Arc<Notify> {
+    static FREED: std::sync::OnceLock<Arc<Notify>> = std::sync::OnceLock::new();
+    Arc::clone(FREED.get_or_init(Arc::default))
+}
+
+// A session's budget permit. It goes back to the budget first and rings
+// `session_budget_freed` after, so a waiter woken by the ring finds it.
+#[derive(Debug)]
+pub struct SessionPermit(Option<tokio::sync::OwnedSemaphorePermit>);
+impl Drop for SessionPermit {
+    fn drop(&mut self) {
+        drop(self.0.take());
+        session_budget_freed().notify_waiters();
+    }
+}
+
 #[derive(Default)]
 pub struct SessionCapacity {
     pub budget: Option<Arc<tokio::sync::Semaphore>>,
     held: Arc<identity::Held>,
 }
 impl SessionCapacity {
-    fn acquire(&self) -> Result<Option<Arc<tokio::sync::OwnedSemaphorePermit>>, DialError> {
+    fn acquire(&self) -> Result<Option<Arc<SessionPermit>>, DialError> {
         let Some(budget) = &self.budget else {
             return Ok(None);
         };
         let mut permit = self.held.permit.lock().expect("session capacity");
         if permit.is_none() {
-            *permit = Some(Arc::new(
+            *permit = Some(Arc::new(SessionPermit(Some(
                 budget
                     .clone()
                     .try_acquire_owned()
                     .map_err(|_| DialError::SessionBudget)?,
-            ));
+            ))));
         }
         Ok(permit.clone())
+    }
+    // Whether `acquire` would find a permit now, or the slot that rings as
+    // one is given back. Asks only: nothing is taken.
+    fn room(&self) -> Result<(), Vec<Arc<Notify>>> {
+        let Some(budget) = &self.budget else {
+            return Ok(());
+        };
+        if self.held.permit.lock().expect("session capacity").is_some()
+            || budget.available_permits() > 0
+        {
+            return Ok(());
+        }
+        Err(vec![session_budget_freed()])
     }
     fn release(&self) {
         self.held.release();
@@ -2053,6 +2084,11 @@ impl Dialer for SessionHop {
             .or_else(|| self.failure.of(self.id))
     }
     fn room(&self, purpose: &Purpose) -> Result<(), Vec<Arc<Notify>>> {
+        // Only a usenet dial waits on a spent session budget; every other
+        // purpose is answered on the session's sockets alone, as before.
+        if waits_on_a_full_rung(purpose) {
+            self.capacity.room()?;
+        }
         self.sockets
             .room(
                 SocketClass::of(purpose),
@@ -2061,6 +2097,12 @@ impl Dialer for SessionHop {
             .map_err(|freed| vec![freed.notify()])
     }
     fn wait_room(&self, purpose: &Purpose) -> Result<(), Capacity> {
+        if waits_on_a_full_rung(purpose) {
+            self.capacity.room().map_err(|waits| Capacity {
+                waits,
+                demand: Vec::new(),
+            })?;
+        }
         self.sockets
             .wait_room(
                 SocketClass::of(purpose),
@@ -2330,6 +2372,15 @@ pub async fn as_named_by<'a>(
     }))
 }
 
+// Whether a dial for `purpose` waits on a rung that is up but full rather
+// than trying the rungs below it. A usenet connection does: its count on a
+// tunnel is held to the bytes the tunnel has (the leg warns "usenet is held
+// to N"), and the rung below may be the host's own address, which a route
+// falls back to only when the rung above is down, never when it is full.
+fn waits_on_a_full_rung(purpose: &Purpose) -> bool {
+    matches!(purpose, Purpose::Nntp { .. } | Purpose::NntpProbe { .. })
+}
+
 // Whether a dial for `purpose` probes its path, and so tries rungs still
 // cooling.
 fn probes(purpose: &Purpose) -> bool {
@@ -2374,7 +2425,17 @@ impl Dialer for Fallback {
                     return Ok(dialed);
                 }
                 Err(error @ DialError::Fatal(_)) => return Err(error),
-                Err(DialError::AtCapacity(changes)) => capacity_changes.extend(changes),
+                Err(DialError::AtCapacity(changes)) => {
+                    capacity_changes.extend(changes);
+                    if waits_on_a_full_rung(&target.purpose) {
+                        return Err(DialError::AtCapacity(capacity_changes));
+                    }
+                }
+                // A tunnel that cannot come up for the session budget is
+                // full, not down: usenet waits for a session to close.
+                Err(DialError::SessionBudget) if waits_on_a_full_rung(&target.purpose) => {
+                    return Err(DialError::SessionBudget);
+                }
                 Err(error) => {
                     self.report_rung(index, Some(&error));
                     if !last.is_evidence() {

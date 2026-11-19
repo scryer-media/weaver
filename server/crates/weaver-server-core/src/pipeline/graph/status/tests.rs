@@ -731,7 +731,7 @@ fn a_posted_file_that_never_arrived_is_what_its_name_says() {
         &tree,
         |_| true,
         |_| false,
-        |_, _| false,
+        |_, _| super::Described::Otherwise,
         |_, _| None,
         |_, _| false,
         unarrived,
@@ -799,7 +799,8 @@ fn a_posted_file_that_never_arrived_is_what_its_name_says() {
 
 // A member withheld by its object's refusal is neither whole nor short:
 // nothing whole beside it fails the job, worded by the refusal, one wording
-// for a password whether it shut the bytes or the headers, its names sorted
+// for a password whether it shut the bytes or the headers, and another for
+// a password given that opened nothing, its names sorted
 // whatever order the objects refused in.
 #[test]
 fn a_delivery_with_a_withheld_member_fails_worded_by_the_refusal() {
@@ -812,11 +813,24 @@ fn a_delivery_with_a_withheld_member_fails_worded_by_the_refusal() {
         ..Delivery::default()
     };
     let password = "WEAVER_PASSWORD_REQUIRED: lantern.rar needs a password and none was given";
+    // Given a password that opens nothing, the wording says so.
+    let wrong =
+        "WEAVER_PASSWORD_REQUIRED: lantern.rar needs a password and no password given opens it";
     for why in [Why::Encrypted, Why::EncryptedHeader] {
         assert_eq!(
             withheld(&[], &[("lantern.rar", why)]).status(None),
             JobStatus::Failed {
                 error: password.to_string()
+            }
+        );
+        let given = Delivery {
+            password_given: true,
+            ..withheld(&[], &[("lantern.rar", why)])
+        };
+        assert_eq!(
+            given.status(None),
+            JobStatus::Failed {
+                error: wrong.to_string()
             }
         );
     }
@@ -859,6 +873,65 @@ fn a_delivery_with_a_withheld_member_fails_worded_by_the_refusal() {
         withheld(&[], &[("lantern.rar", Why::Encrypted)]).status(Some(&failed(error))),
         JobStatus::Failed {
             error: error.to_string()
+        }
+    );
+}
+
+// A set short of the volume after its last names it, in the numbering, width
+// and case of its own volumes' names, once for the set however many of its
+// volumes were withheld; its number where no name numbers it.
+#[test]
+fn a_set_short_of_a_volume_names_the_volume_it_lacks() {
+    let withheld = |withheld: &[(&str, Why)]| Delivery {
+        withheld: withheld
+            .iter()
+            .map(|(name, why)| (name.to_string(), *why))
+            .collect(),
+        ..Delivery::default()
+    };
+    let unfound = |volume| Why::Unfound { volume };
+    let cases: &[(&[(&str, Why)], &str)] = &[
+        (
+            &[
+                ("silver.horizon.r00", unfound(2)),
+                ("silver.horizon.rar", unfound(2)),
+            ],
+            "silver.horizon.r00, silver.horizon.rar never placed every member it named: \
+             unable to find silver.horizon.r01",
+        ),
+        (
+            &[("Silver.part01.rar", unfound(1))],
+            "Silver.part01.rar never placed every member it named: unable to find Silver.part02.rar",
+        ),
+        (
+            &[("silver.horizon.rar", unfound(1))],
+            "silver.horizon.rar never placed every member it named: unable to find silver.horizon.r00",
+        ),
+        (
+            &[("silver.r99", unfound(101))],
+            "silver.r99 never placed every member it named: unable to find silver.s00",
+        ),
+        (
+            &[("silver.z99", unfound(901))],
+            "silver.z99 never placed every member it named: unable to find volume 902",
+        ),
+        (
+            &[("lantern.bin", unfound(u32::MAX))],
+            "lantern.bin never placed every member it named: unable to find volume 4294967296",
+        ),
+    ];
+    for (given, said) in cases {
+        assert_eq!(
+            withheld(given).withheld_error().as_deref(),
+            Some(*said),
+            "{given:?}"
+        );
+    }
+    assert_eq!(
+        withheld(&[("lantern.rar", unfound(1))]).status(None),
+        JobStatus::Failed {
+            error: "lantern.rar never placed every member it named: unable to find lantern.r00"
+                .to_string()
         }
     );
 }
@@ -942,7 +1015,7 @@ fn a_whole_container_nothing_opened_is_no_usable_file() {
             &tree,
             |_| true,
             |_| false,
-            |_, _| false,
+            |_, _| super::Described::Otherwise,
             |_, _| None,
             |_, _| false,
             |_| Unarrived::Short,
@@ -994,7 +1067,7 @@ fn a_broken_7z_is_refused_and_no_usable_file() {
             &tree,
             |_| true,
             |_| false,
-            |_, _| false,
+            |_, _| super::Described::Otherwise,
             |_, _| None,
             |_, _| false,
             |_| Unarrived::Short,

@@ -3336,3 +3336,367 @@ async fn test_a_public_torrent_a_rule_turns_every_discovery_off_keeps_its_peers(
     session.cancellation_token().cancel();
     Ok(())
 }
+
+/// One announce a tracker of [`recording_tracker`] heard.
+struct Heard {
+    query: String,
+    // The gate was held as it came: the torrent was checking its files.
+    during_check: bool,
+}
+
+impl Heard {
+    fn event(&self) -> Option<&str> {
+        param(&self.query, "event")
+    }
+
+    fn param(&self, key: &str) -> Option<&str> {
+        param(&self.query, key)
+    }
+}
+
+/// A tracker on loopback that answers every announce with no peers, its
+/// URL, and what it heard, in order.
+async fn recording_tracker(
+    gate: &std::sync::Arc<super::e2e_peers::Gate>,
+) -> anyhow::Result<(
+    String,
+    tokio::sync::mpsc::UnboundedReceiver<Heard>,
+    tokio::task::JoinHandle<()>,
+)> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let url = format!("http://{}/announce", listener.local_addr()?);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let gate = gate.clone();
+    let serving = tokio::spawn(async move {
+        while let Ok((conn, query)) = read_announce_query(&listener).await {
+            let during_check = gate.is_held();
+            if tx
+                .send(Heard {
+                    query,
+                    during_check,
+                })
+                .is_err()
+            {
+                return;
+            }
+            let _ = respond(conn, ANSWER).await;
+        }
+    });
+    Ok((url, rx, serving))
+}
+
+async fn heard(at: &mut tokio::sync::mpsc::UnboundedReceiver<Heard>) -> anyhow::Result<Heard> {
+    at.recv().await.context("the tracker stopped")
+}
+
+/// Returns once every tracker of the run answered what it was sent: each
+/// is owed `stopped`.
+async fn all_answered(handle: &crate::torrent_state::ManagedTorrentHandle) -> anyhow::Result<()> {
+    handle
+        .tracker_status()
+        .context("a live run has a table")?
+        .subscribe()
+        .wait_for(|rows| rows.iter().all(|row| !row.in_flight && row.last.is_some()))
+        .await?;
+    Ok(())
+}
+
+/// Holds the gate, rechecks the torrent, and returns once the check waits
+/// at the gate: whatever is done then is done while it checks.
+async fn checking(
+    session: &std::sync::Arc<Session>,
+    handle: &crate::torrent_state::ManagedTorrentHandle,
+    gate: &super::e2e_peers::Gate,
+) -> anyhow::Result<()> {
+    use futures::FutureExt;
+    all_answered(handle).await?;
+    // A read of the add's check left word that it passed: not this one's.
+    let _ = gate.reached.notified().now_or_never();
+    gate.hold();
+    session.force_recheck(handle).await?;
+    gate.reached.notified().await;
+    anyhow::ensure!(
+        handle.with_state(|s| matches!(s, crate::ManagedTorrentState::Initializing(_)))
+    );
+    Ok(())
+}
+
+/// Opens the gate, and returns once the check is over.
+async fn checked(
+    handle: &crate::torrent_state::ManagedTorrentHandle,
+    gate: &super::e2e_peers::Gate,
+) -> anyhow::Result<()> {
+    gate.open();
+    handle.wait_until_initialized().await?;
+    anyhow::ensure!(handle.live().is_some(), "not live after the check");
+    Ok(())
+}
+
+/// The torrent's own peer id and tracker key, the same in every announce.
+fn one_identity<'a>(heard: impl IntoIterator<Item = &'a Heard>) -> (String, String) {
+    let mut seen = std::collections::BTreeSet::new();
+    for h in heard {
+        seen.insert((
+            h.param("peer_id").unwrap_or_default().to_owned(),
+            h.param("key").unwrap_or_default().to_owned(),
+        ));
+    }
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    seen.into_iter().next().unwrap()
+}
+
+// libtorrent `torrent::add_tracker` while the torrent checks its files
+// edits the one list `torrent::start_announcing` announces to as the check
+// ends: each tracker is reset and sent `started` (torrent.cpp:6039-6057,
+// :8884, :10346, :3326, v2.0.15), and nothing while it checks, which
+// `force_recheck` began with `stop_announcing` (:2407). The counters of
+// that `started` are the new start's (:10353): none. A tracker added once
+// the run is live is sent `started` once, as well.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_tracker_added_while_the_torrent_checks_is_started_once_the_check_ends()
+-> anyhow::Result<()> {
+    setup_test_logging();
+    const LEN: usize = 4096;
+    let t = TestTorrent::new("test_added_while_checking", LEN, 1024).await?;
+    let (_seed, seed) = t.seed().await?;
+    let storage = super::e2e_peers::GatedStorageFactory::default();
+    let (a, mut at_a, serving_a) = recording_tracker(&storage.gate).await?;
+    let (b, mut at_b, serving_b) = recording_tracker(&storage.gate).await?;
+    let (d, mut at_d, serving_d) = recording_tracker(&storage.gate).await?;
+    let out = TempDir::with_prefix("test_added_while_checking_out")?;
+    let session = Session::new_with_opts(out.path().into(), tracker_session_opts()?).await?;
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(t.torrent.clone()),
+            Some(AddTorrentOptions {
+                storage_factory: Some(storage.clone_box()),
+                tracker_tiers: Some(named(vec![vec![&a]])),
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+    let mut all = Vec::new();
+
+    // The first run fetches the torrent whole from the seed, named once
+    // the tracker answered `started`: a torrent that completes while its
+    // `started` is out owes `completed` at the next interval (libtorrent
+    // `torrent::completed` skips a tracker that is updating, and the answer
+    // sets `next_announce` to the interval: torrent.cpp:8739-8745,
+    // :3607-3616, v2.0.15).
+    let started = heard(&mut at_a).await?;
+    assert_eq!(started.event(), Some("started"));
+    all_answered(&handle).await?;
+    handle
+        .live()
+        .context("not live")?
+        .add_peer(seed, crate::type_aliases::PeerSourceFlag::Tracker);
+    handle.wait_until_completed().await?;
+    let completed = heard(&mut at_a).await?;
+    assert_eq!(completed.event(), Some("completed"));
+    assert_eq!(
+        completed.param("downloaded"),
+        Some(LEN.to_string().as_str())
+    );
+    all.extend([started, completed]);
+
+    // The recheck ends the run: `stopped`, its counters as it ended.
+    checking(&session, &handle, &storage.gate).await?;
+    let stopped = heard(&mut at_a).await?;
+    assert_eq!(stopped.event(), Some("stopped"));
+    assert_eq!(stopped.param("downloaded"), Some(LEN.to_string().as_str()));
+    all.push(stopped);
+    handle.add_trackers(named(vec![vec![&b]]));
+    checked(&handle, &storage.gate).await?;
+
+    // Once checked, every tracker is sent `started`, the one added during
+    // the check too, which heard nothing while it ran: counting from this
+    // start, and nothing left.
+    for at in [&mut at_a, &mut at_b] {
+        let started = heard(at).await?;
+        assert_eq!(started.event(), Some("started"));
+        assert!(!started.during_check);
+        assert_eq!(started.param("uploaded"), Some("0"));
+        assert_eq!(started.param("downloaded"), Some("0"));
+        assert_eq!(started.param("left"), Some("0"));
+        all.push(started);
+    }
+    assert_eq!(
+        handle
+            .tracker_announces()
+            .iter()
+            .map(|row| row.url.as_str())
+            .collect::<Vec<_>>(),
+        [a.as_str(), b.as_str()]
+    );
+
+    // One added once the run is live is sent `started` once as well.
+    handle.add_trackers(named(vec![vec![&d]]));
+    let started = heard(&mut at_d).await?;
+    assert_eq!(started.event(), Some("started"));
+    all.push(started);
+
+    // Paused, each is sent `stopped` next: no `started` twice, and no
+    // `completed` from a run that began a seed.
+    all_answered(&handle).await?;
+    session.pause(&handle).await?;
+    for at in [&mut at_a, &mut at_b, &mut at_d] {
+        let stopped = heard(at).await?;
+        assert_eq!(stopped.event(), Some("stopped"));
+        all.push(stopped);
+    }
+    assert!(at_a.try_recv().is_err() && at_b.try_recv().is_err() && at_d.try_recv().is_err());
+    one_identity(&all);
+    serving_a.abort();
+    serving_b.abort();
+    serving_d.abort();
+    session.cancellation_token().cancel();
+    Ok(())
+}
+
+// libtorrent `torrent::replace_trackers` while the torrent checks leaves
+// the list `start_announcing` walks without the tracker removed
+// (torrent.cpp:5985-6004, :10346, v2.0.15): it is sent nothing after the
+// check.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_tracker_removed_while_the_torrent_checks_is_sent_nothing_after()
+-> anyhow::Result<()> {
+    setup_test_logging();
+    let t = TestTorrent::new("test_removed_while_checking", 4096, 1024).await?;
+    let storage = super::e2e_peers::GatedStorageFactory::default();
+    let (a, mut at_a, serving_a) = recording_tracker(&storage.gate).await?;
+    let (c, mut at_c, serving_c) = recording_tracker(&storage.gate).await?;
+    let out = TempDir::with_prefix("test_removed_while_checking_out")?;
+    let session = Session::new_with_opts(out.path().into(), tracker_session_opts()?).await?;
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(t.torrent.clone()),
+            Some(AddTorrentOptions {
+                storage_factory: Some(storage.clone_box()),
+                tracker_tiers: Some(named(vec![vec![&a], vec![&c]])),
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+    let mut all = Vec::new();
+    for at in [&mut at_a, &mut at_c] {
+        let started = heard(at).await?;
+        assert_eq!(started.event(), Some("started"));
+        all.push(started);
+    }
+
+    checking(&session, &handle, &storage.gate).await?;
+    for at in [&mut at_a, &mut at_c] {
+        let stopped = heard(at).await?;
+        assert_eq!(stopped.event(), Some("stopped"));
+        all.push(stopped);
+    }
+    handle.remove_trackers(&[url::Url::parse(&a)?]);
+    checked(&handle, &storage.gate).await?;
+
+    // The one kept is sent `started`; the run lists it alone.
+    let started = heard(&mut at_c).await?;
+    assert_eq!(started.event(), Some("started"));
+    assert!(!started.during_check);
+    all.push(started);
+    assert_eq!(
+        handle
+            .tracker_announces()
+            .iter()
+            .map(|row| row.url.as_str())
+            .collect::<Vec<_>>(),
+        [c.as_str()]
+    );
+
+    // To its end, the run sends the removed one nothing.
+    all_answered(&handle).await?;
+    session.pause(&handle).await?;
+    let stopped = heard(&mut at_c).await?;
+    assert_eq!(stopped.event(), Some("stopped"));
+    all.push(stopped);
+    assert!(at_a.try_recv().is_err());
+    one_identity(&all);
+    serving_a.abort();
+    serving_c.abort();
+    session.cancellation_token().cancel();
+    Ok(())
+}
+
+// The edit of a private torrent's trackers while it checks is kept as a
+// public one's is, and its new run looks for peers on its trackers alone:
+// neither the DHT nor local discovery (libtorrent
+// `torrent::should_announce_dht`, `torrent::lsd_announce`).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_private_torrents_tracker_added_while_it_checks_is_its_only_peer_source()
+-> anyhow::Result<()> {
+    use crate::type_aliases::PeerSourceFlag::Tracker;
+    setup_test_logging();
+    let node = crate::test_support::loopback_kernel_udp();
+    let out = TempDir::with_prefix("test_private_added_while_checking_out")?;
+    // Local discovery tells only a port peers can reach: one is set
+    // (`test_a_private_torrent_asks_neither_the_dht_nor_local_discovery`).
+    let (session, _sent) = dht_and_lsd_session_on(
+        &out,
+        &node,
+        Some(ListenerOptions {
+            mode: ListenerMode::TcpOnly,
+            listen_addr: (Ipv4Addr::LOCALHOST, 0).into(),
+            announce_port: Some(6881),
+            ..Default::default()
+        }),
+    )
+    .await?;
+    let lsd = session.lsd.clone().context("no LSD")?;
+
+    let mut t = TestTorrent::new("test_private_added_while_checking", 4096, 1024).await?;
+    t.torrent = made_private(&t.torrent)?;
+    let hash = info_hash_of(&t.torrent)?;
+    let storage = super::e2e_peers::GatedStorageFactory::default();
+    let (a, mut at_a, serving_a) = recording_tracker(&storage.gate).await?;
+    let (b, mut at_b, serving_b) = recording_tracker(&storage.gate).await?;
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(t.torrent.clone()),
+            Some(AddTorrentOptions {
+                storage_factory: Some(storage.clone_box()),
+                tracker_tiers: Some(named(vec![vec![&a]])),
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+    assert!(handle.is_private());
+    let mut all = vec![heard(&mut at_a).await?];
+    assert_eq!(all[0].event(), Some("started"));
+
+    checking(&session, &handle, &storage.gate).await?;
+    let stopped = heard(&mut at_a).await?;
+    assert_eq!(stopped.event(), Some("stopped"));
+    all.push(stopped);
+    handle.add_trackers(named(vec![vec![&b]]));
+    checked(&handle, &storage.gate).await?;
+
+    for at in [&mut at_a, &mut at_b] {
+        let started = heard(at).await?;
+        assert_eq!(started.event(), Some("started"));
+        assert!(!started.during_check);
+        assert_eq!(started.param("uploaded"), Some("0"));
+        assert_eq!(started.param("downloaded"), Some("0"));
+        assert_eq!(started.param("left"), Some("4096"));
+        all.push(started);
+    }
+    // Both runs looked on their trackers alone, and asked the DHT and
+    // local discovery nothing.
+    assert_eq!(looked(&session, hash), [Tracker, Tracker]);
+    assert!(!asked_for_peers(&node, hash));
+    assert!(!lsd.registered(hash));
+    one_identity(&all);
+    serving_a.abort();
+    serving_b.abort();
+    session.cancellation_token().cancel();
+    Ok(())
+}

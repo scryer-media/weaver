@@ -19,10 +19,15 @@ impl Pipeline {
     }
 
     // The exclusions an article carries to the next server once its tries
-    // on `source` are spent on answers to BODY the client has no class for,
-    // or `None` when it stays where it is: the failure is of another kind,
-    // no server is named, the server is already excluded, or no other server
-    // may serve the article (then the spent tries end it).
+    // on `source` are spent, or `None` when it stays where it is: the failure
+    // is of another kind, no server is named, the server is already excluded,
+    // or no other server may serve the article (then the spent tries end it).
+    //
+    // Two kinds spend tries this way: answers to BODY the client has no class
+    // for, and established-transport failures (a dropped connection, a 503 or
+    // 499 to BODY) once they have become the article's own, which happens
+    // only while other segments keep downloading. Transport failures that
+    // still say nothing about the article spend no tries and never get here.
     //
     // The server joins the exclusions as one without the article does, so a
     // fill server spent this way counts toward opening the backfill tier: it
@@ -35,7 +40,10 @@ impl Pipeline {
         source: Option<usize>,
         excludes: weaver_nntp::ServerSet,
     ) -> Option<weaver_nntp::ServerSet> {
-        if kind != DownloadFailureKind::ContentOrProtocol {
+        if !matches!(
+            kind,
+            DownloadFailureKind::ContentOrProtocol | DownloadFailureKind::EstablishedTransport
+        ) {
             return None;
         }
         let source = source?;
@@ -1581,6 +1589,11 @@ impl Pipeline {
                     // Every server is missing the id in use: the article moves
                     // to its next id, or with every id spent is booked missing.
                     if !self.spend_message_id(result.segment_id) {
+                        warn!(
+                            segment = %result.segment_id,
+                            error = %failure.message,
+                            "article missing on every server; segment lost"
+                        );
                         self.semantic_terminal_causes.insert(job_id, terminal_cause);
                         self.metrics
                             .articles_not_found
@@ -1635,18 +1648,21 @@ impl Pipeline {
                     });
                     let preserves_retry_budget =
                         failure.preserves_article_retry_budget() && !article_local_transport;
-                    let infrastructure_retry = failure.kind.infrastructure_wait_reason().is_some();
+                    let mut infrastructure_retry =
+                        failure.kind.infrastructure_wait_reason().is_some();
+                    let mut transport_streak = transport_streak;
                     let mut next_retry = if preserves_retry_budget || source_not_found {
                         result.retry_count
                     } else {
                         result.retry_count + 1
                     };
-                    // A server that answered BODY with something unreadable
-                    // for every try could not produce the article: with its
-                    // tries spent it joins the article's exclusions, as a
-                    // server without the article does, and the next server is
-                    // asked with a fresh count. Only with none left is the
-                    // article booked below.
+                    // A server that answered BODY with something unreadable,
+                    // or whose transport failed on this article alone, for
+                    // every try could not produce the article: with its tries
+                    // spent it joins the article's exclusions, as a server
+                    // without the article does, and the next server is asked
+                    // at once with a fresh count and no transport run. Only
+                    // with none left is the article booked below.
                     let mut retry_exclude_servers = retry_exclude_servers;
                     let next_server_excludes = (next_retry > MAX_SEGMENT_RETRIES)
                         .then(|| {
@@ -1668,6 +1684,9 @@ impl Pipeline {
                         );
                         retry_exclude_servers = excludes;
                         next_retry = 0;
+                        self.transport_failure_streaks.remove(&seg_id);
+                        transport_streak = None;
+                        infrastructure_retry = false;
                     }
 
                     if next_retry > MAX_SEGMENT_RETRIES {

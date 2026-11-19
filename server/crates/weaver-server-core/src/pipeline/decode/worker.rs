@@ -396,6 +396,7 @@ impl Pipeline {
         offset: u64,
         len: u32,
         expected: ExpectedSegmentLayout,
+        actual: YencLayoutAssertions,
         other: u32,
     ) -> bool {
         let file_id = segment_id.file_id;
@@ -424,10 +425,15 @@ impl Pipeline {
             segment_number: other,
         };
         self.graph_article_sent_back(other_id);
-        let error = format!(
-            "yEnc layout conflict: segment {other} claims [{other_offset}, {}) past what the NZB declares for it, which segment {} contradicts",
-            other_offset.saturating_add(u64::from(other_len)),
+        let error = format_withdrawn_placement(
+            other,
+            other_offset,
+            other_len,
+            other_expected,
             segment_id.segment_number,
+            offset,
+            len,
+            actual,
         );
         self.metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
         self.handle_decode_failure(other_id, &error, PoolServers::none());
@@ -813,6 +819,7 @@ impl Pipeline {
                     file_offset,
                     decoded_size,
                     expected_layout,
+                    yenc_layout,
                     other,
                 )
             {
@@ -840,10 +847,20 @@ impl Pipeline {
                     });
             }
             if let Some(other) = conflict {
-                let error = format!(
-                    "yEnc layout conflict: segment {} claims [{file_offset}, {}) which runs into segment {other}",
+                let other_placement = self
+                    .jobs
+                    .get(&job_id)
+                    .and_then(|state| state.articles.assembly()?.file(file_id))
+                    .and_then(|file| file.placement_of(other));
+                let error = format_yenc_layout_conflict(
                     segment_id.segment_number,
-                    file_offset.saturating_add(u64::from(decoded_size)),
+                    file_offset,
+                    decoded_size,
+                    yenc_layout,
+                    &yenc_name,
+                    expected_layout,
+                    other,
+                    other_placement,
                 );
                 self.metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
                 self.handle_decode_failure(segment_id, &error, source.servers);
@@ -882,6 +899,7 @@ impl Pipeline {
                 yenc_layout.file_size,
                 declared_part_end(expected_layout, yenc_layout),
                 segments,
+                &yenc_name,
             );
             // The write of it found the disk full: the job is held, and the
             // article is fetched and counted once the job runs on.

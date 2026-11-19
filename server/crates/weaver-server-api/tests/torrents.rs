@@ -372,8 +372,10 @@ async fn a_magnet_is_added_without_a_network() {
     );
 }
 
+// A torrent whose every file has an unwanted extension is added with
+// nothing wanted, as qBittorrent adds it, not refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_unwanted_extension_is_refused() {
+async fn an_unwanted_extension_is_left_out_not_refused() {
     let rig = rig().await;
     rig.harness
         .db
@@ -385,11 +387,14 @@ async fn an_unwanted_extension_is_refused() {
     let response = rig
         .execute(&submit(&metainfo("disc.iso", 2000, false), ""))
         .await;
-    assert_eq!(code(&response).as_deref(), Some("REFUSED"));
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
+        .as_u64()
+        .unwrap();
     let listed = rig.execute("{ torrents { id } }").await;
     assert_eq!(
         listed.data.into_json().unwrap()["torrents"],
-        Value::Array(Vec::new())
+        serde_json::json!([{ "id": id }])
     );
 }
 

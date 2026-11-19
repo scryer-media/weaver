@@ -447,12 +447,15 @@ function JobDetailContent() {
   }
 
   const token = statusToken(job.status);
-  const failed = token === "failed";
+  // A job that delivered in part reads as failed in its status; its outcome
+  // says it moved the files it had whole.
+  const partial = job.outcome === "PARTIAL";
+  const failed = token === "failed" && !partial;
   const done = token === "completed";
   // Weaver holds a finished job in its queue for a while before history takes
   // it, so whether the job is over comes from its status, not from where the
   // snapshot found it: pausing or cancelling a finished job means nothing.
-  const terminal = done || failed;
+  const terminal = done || failed || partial;
   const color = statusColor(progress.status);
   const percent = job.progress * 100;
   // While queued, the payload is what the download is out to bring, so a
@@ -475,7 +478,9 @@ function JobDetailContent() {
     job.optionalRecoveryBytes - job.optionalRecoveryDownloadedBytes,
   );
 
-  const outcome = failed
+  const outcome = partial
+    ? t("next.job.outcomePartial")
+    : failed
     ? t("next.job.outcomeFailed")
     : done
       ? repaired
@@ -483,7 +488,12 @@ function JobDetailContent() {
         : t("next.job.outcomeVerified")
       : t("next.job.outcomeRunning", { status: statusLabel(progress.status), percent: Math.round(percent) });
 
-  const statusSentence = failed
+  const statusSentence = partial
+    ? t("next.job.deliveredInPart", {
+        time: formatClockSeconds(job.completedAt),
+        reason: job.error || t("next.job.partialReason"),
+      })
+    : failed
     ? t("next.job.stopped", {
         time: formatClockSeconds(job.completedAt),
         reason: job.error || t("next.job.stoppedReason"),
@@ -626,8 +636,8 @@ function JobDetailContent() {
               {job.displayTitle || job.name}
             </h1>
             <StateChip
-              label={stateKey ? t(stateKey) : statusLabel(progress.status)}
-              tone={failed ? "bad" : "ok"}
+              label={stateKey ? t(stateKey) : partial ? t("next.job.partial") : statusLabel(progress.status)}
+              tone={failed || partial ? "bad" : "ok"}
             />
           </div>
           <div className="flex min-w-0 flex-wrap items-center gap-2">
@@ -878,16 +888,16 @@ function JobDetailContent() {
           <MetricCell
             variant="stat"
             eyebrow={t("next.job.integrity")}
-            value={verified || done || failed ? `${(job.health / 10).toFixed(1)}%` : EM_DASH}
+            value={verified || terminal ? `${(job.health / 10).toFixed(1)}%` : EM_DASH}
             valueClassName={
-              !verified && !done && !failed
+              !verified && !terminal
                 ? "text-wv-muted"
                 : HEALTH_TONE_CLASS[
                     healthTone(job.health, criticalHealthMilli(job.totalBytes, job.optionalRecoveryBytes))
                   ]
             }
             note={
-              verified || done || failed
+              verified || terminal
                 ? job.failedBytes > 0
                   ? t("next.job.neverRecovered", { size: formatSize(job.failedBytes) })
                   : t("next.job.noDamage")

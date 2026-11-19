@@ -11,12 +11,13 @@
 // A layout the store gives the set up over never becomes its map: no byte
 // was placed by it, so the bytes go back from where the last one put them.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use unrar_rs::{
     ArchiveFormat, IneligibilityReason, MalformedReason, MemberEligibility, RarVolumeFacts,
-    StoredLayoutBuilder, StoredMember,
+    RarVolumeMemberFacts, StoredLayoutBuilder, StoredMember,
 };
 use weaver_graph::{ByteRange, Coverage, Emit, Handed, MemberId, RecoveryKind, VolumeIndex, Why};
 
@@ -95,11 +96,73 @@ fn lays(index: VolumeIndex, found: &Volume) -> Option<(&RarVolumeFacts, bool)> {
     Some((facts, found.walk.ended && !found.walk.is_last()))
 }
 
+// The member a volume ends on, when it carries on into the next one.
+fn carried_on(facts: &RarVolumeFacts) -> Option<&RarVolumeMemberFacts> {
+    let last = facts.members.iter().max_by_key(|member| member.order)?;
+    last.split_after.then_some(last)
+}
+
+// Where among `facts`' members sits the one the volume opens on, when it
+// carries on `tail`, the member the volume before ends on, and says of it
+// otherwise than `tail` does: another name, or another size for the whole
+// member. Which set a volume is of, and where in it, is the claim's to say,
+// and a name is evidence there. Once the volume is laid after the one
+// before, RAR reads the part it opens on as the part that volume carries
+// on, by place alone: unrar's MergeArchive (volume.cpp) reads the next
+// volume's header in place of the last and compares neither name nor size,
+// and CmdExtract::UnstoreFile (extract.cpp) writes a stored member to the
+// size its first part states. Packers name a member one way in its first
+// part and another in the rest, and misstate its size in the middle parts.
+// The member is what its first part says, and the CRC its last part states
+// proves its bytes, as unrar's ValidCRC check does.
+fn continuation(tail: &RarVolumeMemberFacts, facts: &RarVolumeFacts) -> Option<usize> {
+    let (at, head) = facts
+        .members
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, member)| member.order)?;
+    let differs = head.name != tail.name || head.unpacked_size != tail.unpacked_size;
+    (head.split_before && differs).then_some(at)
+}
+
+// Whether a volume is held where it is on trust: its headers state no
+// position, so only its name or its links put it there.
+pub(super) fn on_trust(found: &Volume) -> bool {
+    found
+        .stated()
+        .is_none_or(|facts| !claim::states_position(facts))
+}
+
+// The volume at which a member's parts stop joining into one member, when
+// what the volumes laid say of it, in the places they are laid, disagrees:
+// the volume the layout names, else the one holding the last part it took,
+// where the chain closed or ran past the member's size.
+fn breaks_at(member: &StoredMember) -> Option<u32> {
+    use MalformedReason as Reason;
+    let MemberEligibility::Ineligible(IneligibilityReason::MalformedChain(reason)) =
+        &member.eligibility
+    else {
+        return None;
+    };
+    match reason {
+        Reason::DuplicatePartInVolume { volume }
+        | Reason::OverlappingParts { volume }
+        | Reason::UnexpectedChainStart { volume }
+        | Reason::UnexpectedChainEnd { volume }
+        | Reason::MissingPartInAddedVolume { volume }
+        | Reason::MixedEncryption { volume } => Some(*volume),
+        Reason::ContinuationInFirstVolume => Some(0),
+        _ => member.parts.last().map(|part| part.volume),
+    }
+}
+
 // A layout and, for each volume it holds, the facts it took it on: their
-// stamp and how many members they list.
+// stamp and how many members they list, and the member it ends on when it
+// carries one on, as the layout took it.
 pub(super) struct Laid {
     builder: StoredLayoutBuilder,
     added: BTreeMap<u32, (u64, usize)>,
+    tails: BTreeMap<u32, RarVolumeMemberFacts>,
 }
 
 impl std::ops::Deref for Laid {
@@ -115,7 +178,30 @@ impl Laid {
         Self {
             builder: StoredLayoutBuilder::new(format),
             added: BTreeMap::new(),
+            tails: BTreeMap::new(),
         }
+    }
+
+    // A volume's facts as the layout takes them. The builder links a
+    // member's parts by name and holds them to one stated size, so a volume
+    // that opens on the member the one before carries on, saying otherwise
+    // of it, has it as the layout took that member: the name and size its
+    // first part gives it, as unrar extracts it. The sum of the parts' bytes
+    // must still come to that size, and the last part's CRC proves them.
+    fn joined<'a>(&self, index: u32, facts: &'a RarVolumeFacts) -> Cow<'a, RarVolumeFacts> {
+        let carried = index
+            .checked_sub(1)
+            .and_then(|before| self.tails.get(&before))
+            .and_then(|tail| Some((tail, continuation(tail, facts)?)));
+        let Some((tail, at)) = carried else {
+            return Cow::Borrowed(facts);
+        };
+        let mut joined = facts.clone();
+        let head = &mut joined.members[at];
+        head.name.clone_from(&tail.name);
+        head.name_raw.clone_from(&tail.name_raw);
+        head.unpacked_size = tail.unpacked_size;
+        Cow::Owned(joined)
     }
 
     // Add a volume on its walk's facts, or say the layout refuses them.
@@ -139,19 +225,28 @@ impl Laid {
                 {
                     // Taking a volume it holds again changes nothing either
                     // way, so asking costs the test only time.
+                    let joined = self.joined(index, facts);
                     assert_eq!(
                         added,
-                        self.builder.add_volume(index, facts).is_ok(),
+                        self.builder.add_volume(index, &joined).is_ok(),
                         "the layout answers as known"
                     );
                     super::counts::bump(|counts| counts.known += 1);
                 }
-                added
+                return added;
             }
             None => {
                 #[cfg(test)]
                 super::counts::bump(|counts| counts.asked.push((index, walk.stamp)));
-                self.builder.add_volume(index, facts).is_ok()
+                let joined = self.joined(index, facts);
+                let added = self.builder.add_volume(index, &joined).is_ok();
+                if added {
+                    match carried_on(&joined) {
+                        Some(tail) => self.tails.insert(index, tail.clone()),
+                        None => self.tails.remove(&index),
+                    };
+                }
+                added
             }
         };
         if added {
@@ -190,11 +285,14 @@ fn stands(
 
 // One past the volumes the layout takes past its tail, from `from`, or the
 // refusal one of them makes: found before any is added, so no layout the
-// set is given up over is ever extended.
+// set is given up over is ever extended. A volume it refuted on the headers
+// it holds now is not taken.
 fn reach(
     volumes: &BTreeMap<VolumeIndex, Volume>,
     layout: &StoredLayoutBuilder,
     from: u32,
+    refuted: Option<(VolumeIndex, u64)>,
+    held_out: Option<u32>,
 ) -> Result<u32, Emit> {
     let tail = from.checked_sub(1).map(VolumeIndex);
     if tail.is_some_and(|tail| {
@@ -207,7 +305,10 @@ fn reach(
     }
     let mut end = from;
     for (index, found) in volumes.range(VolumeIndex(from)..) {
-        if index.0 != end {
+        if index.0 != end
+            || refuted == Some((*index, found.walk.stamp))
+            || held_out.is_some_and(|at| index.0 >= at)
+        {
             break;
         }
         let Some((facts, on)) = lays(*index, found) else {
@@ -248,6 +349,11 @@ impl RarStore {
         Some(format)
     }
 
+    // How many volumes the kept layout holds, from the first.
+    pub(super) fn laid_through(&self) -> Option<u32> {
+        self.layout.as_ref().map(|layout| laid(layout))
+    }
+
     // A layout laid afresh over the first `through` volumes, as one kept
     // over them was before anything was added past them.
     fn laid_afresh(&self, format: ArchiveFormat, through: u32) -> Laid {
@@ -269,13 +375,23 @@ impl RarStore {
             .layout
             .take_if(|layout| layout.format() == format && stands(&self.volumes, layout, touched));
         let afresh = kept.is_none();
+        if afresh {
+            self.refuted = None;
+        }
         let mut layout = kept.unwrap_or_else(|| {
             #[cfg(test)]
             super::counts::bump(|counts| counts.layouts += 1);
             Laid::new(format)
         });
+        // Nothing is mapped from a volume held the wrong way round beside
+        // the next until the set is ordered: a layout already past it is
+        // laid again short of it.
+        let held_out = self.held_out();
+        if let Some(at) = held_out.filter(|at| *at < laid(&layout)) {
+            layout = self.laid_afresh(format, at);
+        }
         let from = laid(&layout);
-        let end = match reach(&self.volumes, &layout, from) {
+        let mut end = match reach(&self.volumes, &layout, from, self.refuted, held_out) {
             Ok(end) => end,
             Err(emit) => {
                 if !afresh {
@@ -288,8 +404,33 @@ impl RarStore {
         for (index, found) in self.volumes.range(VolumeIndex(from)..VolumeIndex(end)) {
             if !layout.add(index.0, &found.walk) {
                 refusal = Some(Emit::Refuse(Why::Unsupported));
+                end = index.0 + 1;
                 break;
             }
+        }
+        // A volume only its name or its links hold where it is, its headers
+        // stating no number, as a RAR4 volume's do short of a numbered end
+        // record, is held there on trust. A layout that cannot take it there
+        // refutes that place, not the set: when every volume from the one it
+        // breaks at to its tail is held on trust, it is laid once more short
+        // of that volume, which waits for its own headers or a new name to
+        // place it, and is not laid there again on the same headers.
+        let broken = match refusal {
+            Some(_) => Some(end - 1),
+            None => layout.members().iter().filter_map(breaks_at).min(),
+        };
+        if let Some(at) = broken.filter(|at| (from..end).contains(at))
+            && self
+                .volumes
+                .range(VolumeIndex(at)..VolumeIndex(end))
+                .all(|(_, found)| on_trust(found))
+        {
+            #[cfg(test)]
+            super::counts::bump(|counts| counts.cut += 1);
+            self.refuted = Some((VolumeIndex(at), self.volumes[&VolumeIndex(at)].walk.stamp));
+            end = at;
+            refusal = None;
+            layout = self.laid_afresh(format, end);
         }
         let members = layout.members();
         // An entry stands until the layout lists something else for it. A
@@ -343,7 +484,9 @@ impl RarStore {
                 }
                 self.give_up(emit, out);
             }
-            None => self.layout = Some(layout),
+            None => {
+                self.layout = Some(layout);
+            }
         }
     }
 
@@ -475,6 +618,51 @@ impl RarStore {
                 range: ByteRange::at(service.data_offset, service.data_size),
                 kind: RecoveryKind::Rar,
                 handed: handed.clone(),
+            });
+        }
+    }
+
+    // The record of each volume in `changed` held by its name alone, its
+    // headers stating nothing and no byte of its front in hand, as a
+    // volume claimed past its hole holds none: no header says
+    // where its record lies, and the record finds itself from the
+    // volume's end, as RAR finds a record whose volume lost its headers.
+    // It is said there, over no bytes, once the volume is closed;
+    // a volume said already is passed over, so the record its headers
+    // name once it is rebuilt is not said again.
+    pub(super) fn say_records_unheaded(
+        &mut self,
+        changed: &BTreeSet<VolumeIndex>,
+        out: &mut Vec<Emit>,
+    ) {
+        for volume in changed {
+            let Some(found) = self.volumes.get(volume) else {
+                continue;
+            };
+            let (Some(_), None, Some(length)) = (&found.name, found.stated(), found.length) else {
+                continue;
+            };
+            // Only a closed volume has lost its front for good: before then
+            // its first bytes may still be on their way.
+            if !found.closed || found.walk.hole(&found.kept, found.closed) > 0 {
+                continue;
+            }
+            let said = self
+                .recovery_said
+                .range((*volume, 0)..=(*volume, u64::MAX))
+                .next()
+                .is_some();
+            if said {
+                continue;
+            }
+            self.recovery_said.insert((*volume, length));
+            out.push(Emit::RecoveryAt {
+                volume: *volume,
+                range: ByteRange::new(length, length),
+                kind: RecoveryKind::Rar,
+                handed: self
+                    .header_password()
+                    .map_or_else(Handed::default, Handed::new),
             });
         }
     }

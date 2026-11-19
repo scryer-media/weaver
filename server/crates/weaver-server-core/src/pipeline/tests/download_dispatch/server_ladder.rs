@@ -465,8 +465,12 @@ async fn a_dead_post_on_the_field_layout_asks_first_articles_first_and_ends() {
 }
 
 // Fewer than ten files: the first-article sample does not rule, and the
-// post's health ends it on the ask that ends the fourth article's walk, 4
-// of 24 equal articles lost taking it to 83.3%, below its 85% line.
+// post's health ends it. Four of 24 equal articles lost take it to 83.3%,
+// below its 85% line, but two files still have their first article out,
+// and were they recovery volumes their eight articles would draw the line
+// at 50%: the verdict waits for them. On the ask that ends the fifth first
+// article's walk, 5 of 24 lost take it to 79.1%, below the 80% line even
+// the one file still out could draw, and the post is given up then.
 #[tokio::test]
 async fn a_small_dead_post_on_the_field_layout_ends_on_its_health() {
     let levels = field_levels();
@@ -480,7 +484,7 @@ async fn a_small_dead_post_on_the_field_layout_ends_on_its_health() {
         run.lost,
         run.reason
     );
-    assert_eq!(run.asks_at_give_up, Some(run.walked_out[3].0));
+    assert_eq!(run.asks_at_give_up, Some(run.walked_out[4].0));
     assert!(
         run.reason
             .as_deref()
@@ -1679,6 +1683,174 @@ async fn an_unknown_body_reply_on_the_only_server_ends_the_article_once_its_trie
         Some(&crate::pipeline::SegmentTerminalState::RetriesExhausted)
     );
     assert!(ask(&mut pipeline, 0, 1).is_empty());
+}
+
+// A job of one plain file whose one article carries `payload`.
+async fn one_payload_job(pipeline: &mut Pipeline, job_id: JobId, payload: &[u8]) {
+    let spec = standalone_job_spec(
+        "Busy Server",
+        &[("payload.bin".to_string(), payload.len() as u32)],
+    );
+    insert_active_job(pipeline, job_id, spec).await;
+    pipeline.active_download_passes.insert(job_id);
+}
+
+// Puts the retry `server`'s 503 scheduled back on the queue, as the retry
+// timer does when it fires.
+fn requeue_infrastructure_retry(pipeline: &mut Pipeline) {
+    let due = pipeline.infrastructure_retries.next_deadline().unwrap();
+    let mut ready = pipeline.infrastructure_retries.take_due(due);
+    assert_eq!(ready.len(), 1);
+    pipeline.receive_retry_work(ready.pop().unwrap());
+}
+
+// Answers 503 to the article on `server` until it spends its tries there,
+// while other articles keep downloading, so the fault is the article's own.
+// Returns how many 503s the server gave.
+async fn answer_503_until_spent(pipeline: &mut Pipeline, server: usize) -> u32 {
+    let mut answers = 0;
+    loop {
+        let Some(work) = ask(pipeline, server, 1).pop() else {
+            return answers;
+        };
+        assert!(answers < 3 + MAX_SEGMENT_RETRIES, "tries never spent");
+        // Other articles download between this article's faults.
+        pipeline
+            .metrics
+            .segments_downloaded
+            .fetch_add(1, Ordering::Relaxed);
+        answer_nntp(pipeline, server, work, body_reply(503, "service unavailable")).await;
+        answers += 1;
+        if pipeline.infrastructure_retries.next_deadline().is_some() {
+            requeue_infrastructure_retry(pipeline);
+        }
+    }
+}
+
+// A fill server answers 503 for one article only while it serves the rest.
+// Once the article has spent its tries there, the backfill server, which has
+// it, is asked, and the article downloads from it: nothing is booked lost.
+#[tokio::test]
+async fn an_article_a_fill_server_keeps_answering_503_for_moves_to_backfill() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut pipeline = ladder_pipeline(&temp_dir, &[(0, false), (0, true)]).await;
+    let job_id = JobId(42111);
+    let payload = b"the article the fill server would not serve";
+    one_payload_job(&mut pipeline, job_id, payload).await;
+
+    assert!(ask(&mut pipeline, 1, 1).is_empty(), "backfill waits at first");
+    let answers = answer_503_until_spent(&mut pipeline, 0).await;
+    assert!(answers > MAX_SEGMENT_RETRIES, "{answers} answers");
+
+    let work = ask(&mut pipeline, 1, 1)
+        .pop()
+        .expect("the backfill server is handed it");
+    assert_eq!(work.exclude_servers, [0]);
+    assert_eq!(work.retry_count, 0);
+    assert!(
+        !pipeline
+            .transport_failure_streaks
+            .contains_key(&work.segment_id),
+        "the backfill server starts without the fill server's run"
+    );
+    let (segment_id, exclude_servers) = (work.segment_id, work.exclude_servers);
+    pipeline.hold_test_lane_works(vec![work], false);
+    let raw = encode_article_part("payload.bin", payload, 1, 1, 1, payload.len() as u64);
+    pipeline
+        .handle_download_done(DownloadResult {
+            lane_id: 0,
+            job_id,
+            runtime_generation: pipeline.pool_generation,
+            segment_id,
+            data: Ok(DownloadPayload::Raw(raw)),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: Some(1),
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count: 0,
+            exclude_servers,
+            release_connection_slot: true,
+        })
+        .await;
+    drain_decode_results(&mut pipeline, 1).await;
+    hear_graph_mail(&mut pipeline, job_id).await;
+
+    assert_eq!(
+        pipeline
+            .metrics
+            .segments_failed_permanent
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(pipeline.jobs[&job_id].failed_bytes, 0);
+    assert!(!pipeline.segment_terminal_states.contains_key(&segment_id));
+    assert!(ask(&mut pipeline, 0, 1).is_empty());
+    assert!(ask(&mut pipeline, 1, 1).is_empty());
+    pipeline.check_job_completion(job_id).await;
+    crate::pipeline::tests::pump_pipeline_runtime_queues(&mut pipeline).await;
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete)
+    );
+}
+
+// With one server there is nowhere else to ask: an article it keeps
+// answering 503 for while others download is booked lost once its tries are
+// spent, as before.
+#[tokio::test]
+async fn an_article_the_only_server_keeps_answering_503_for_is_booked_lost() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut pipeline = ladder_pipeline(&temp_dir, &[(0, false)]).await;
+    let job_id = JobId(42112);
+    one_article_job(&mut pipeline, job_id).await;
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+
+    let answers = answer_503_until_spent(&mut pipeline, 0).await;
+    assert_eq!(answers, 3 + MAX_SEGMENT_RETRIES);
+    assert_eq!(
+        pipeline
+            .metrics
+            .segments_failed_permanent
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        pipeline.segment_terminal_states.get(&segment_id),
+        Some(&crate::pipeline::SegmentTerminalState::RetriesExhausted)
+    );
+}
+
+// Two fill servers: a 503 from one hands the article's retry to the other
+// at once, with no try spent and nothing excluded, as before.
+#[tokio::test]
+async fn a_503_from_one_fill_server_rotates_the_article_to_the_other_fill_server() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut pipeline = ladder_pipeline(&temp_dir, &[(0, false), (0, false)]).await;
+    let job_id = JobId(42113);
+    one_article_job(&mut pipeline, job_id).await;
+
+    let work = ask(&mut pipeline, 0, 1).pop().unwrap();
+    answer_nntp(&mut pipeline, 0, work, body_reply(503, "service unavailable")).await;
+    requeue_infrastructure_retry(&mut pipeline);
+    assert!(ask(&mut pipeline, 0, 1).is_empty(), "server 0 is avoided");
+    let moved = ask(&mut pipeline, 1, 1)
+        .pop()
+        .expect("server 1 is handed it");
+    assert!(moved.exclude_servers.is_empty());
+    assert_eq!(moved.retry_count, 0);
+    assert_eq!(
+        pipeline
+            .metrics
+            .segments_failed_permanent
+            .load(Ordering::Relaxed),
+        0
+    );
 }
 
 // A server that needs a group selected and answers 411 for every newsgroup

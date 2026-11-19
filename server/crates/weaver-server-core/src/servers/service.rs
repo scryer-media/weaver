@@ -89,10 +89,10 @@ impl ServersService {
             {
                 server.active = previous_active;
             }
-            // A rollback restores what was saved; it never budgets it again.
+            // A rollback restores what was saved.
             let db = self.db.clone();
             let rollback = tokio::task::spawn_blocking(move || {
-                db.restore_server_active(server_id, previous_active)
+                db.set_server_active(server_id, previous_active)
             })
             .await;
             if !matches!(rollback, Ok(Ok(()))) {
@@ -269,29 +269,15 @@ impl Database {
         })
     }
 
+    // Turn a server on or off. An activated server's connections are never
+    // refused here: the tunnels its route reaches hold usenet to their bytes
+    // as its sockets open.
     pub fn set_server_active(&self, server_id: u32, active: bool) -> Result<(), StateError> {
-        self.write_server_active(server_id, active, active)
-    }
-
-    // Put back the activation a failed change replaced, without budgeting
-    // the tunnels for it: a rollback restores, it never validates.
-    pub fn restore_server_active(&self, server_id: u32, active: bool) -> Result<(), StateError> {
-        self.write_server_active(server_id, active, false)
-    }
-
-    // An activated server asks its connections of the tunnels its route
-    // reaches, checked when `budget` holds.
-    fn write_server_active(
-        &self,
-        server_id: u32,
-        active: bool,
-        budget: bool,
-    ) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "set_server_active", |tx| {
                 Box::pin(async move {
-                    let before = crate::proxies::lock_network_asks(tx).await?;
+                    crate::proxies::lock_network(tx).await?;
                     let changed = tx
                         .execute(
                             "UPDATE servers SET active = {} WHERE id = {}",
@@ -302,9 +288,6 @@ impl Database {
                         return Err(StateError::Database(format!(
                             "server {server_id} not found"
                         )));
-                    }
-                    if budget {
-                        crate::proxies::validate_stored_sockets(tx, &before).await?;
                     }
                     Ok(())
                 })

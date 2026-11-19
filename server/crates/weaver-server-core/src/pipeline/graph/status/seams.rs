@@ -8,10 +8,10 @@ use weaver_graph::recovery::{RepairOutcome, SetRuling};
 use weaver_graph::slots::AskerId;
 use weaver_graph::{MemberId, NodeId};
 
-use super::claims::{self, Claim, ClaimedMember};
+use super::claims::{self, Claim, ClaimedMember, Described};
 use super::{
-    Delivery, Failure, RecoverySummary, RootJob, Step, Unarrived, drive, failure, metrics,
-    shown_status,
+    Delivery, Failure, RecoverySummary, RootJob, SetSummary, Step, Unarrived, drive, failure,
+    metrics, shown_status,
 };
 use crate::events::model::PipelineEvent;
 use crate::jobs::JobPhase;
@@ -199,6 +199,39 @@ fn log_set_rulings(job_id: JobId, job: &GraphJob) {
     }
 }
 
+// Every recovery set the job ends with that bound no file, said once, when
+// the root is done, as its object gives the reason: a line of the log and
+// an event of the job's each.
+fn unused_sets(job_id: JobId, job: &GraphJob) -> Vec<PipelineEvent> {
+    let tree = job.tree();
+    job.writer()
+        .unbound(tree)
+        .into_iter()
+        .map(|(node, kind, unbound)| {
+            let set = job
+                .writer()
+                .set_name(tree, node)
+                .map_or_else(|| kind.to_string(), str::to_owned);
+            let reason = unbound.reason.label();
+            info!(
+                job_id = job_id.0,
+                node = node.0,
+                kind = %kind,
+                set = %set,
+                recovery_set_id = unbound.id.as_deref().unwrap_or(""),
+                reason = reason,
+                "{}",
+                crate::events::model::recovery_set_unused_message(&set, reason)
+            );
+            PipelineEvent::RecoverySetUnused {
+                job_id,
+                set,
+                reason: reason.to_owned(),
+            }
+        })
+        .collect()
+}
+
 fn asker(job_id: JobId) -> AskerId {
     AskerId(job_id.0)
 }
@@ -224,6 +257,28 @@ fn is_payload(job: &GraphJob, files: &[crate::jobs::model::FileSpec], member: Me
     }
     tree.refused_by(NodeId::ROOT, member)
         .is_some_and(|owner| !tree.recovers(owner))
+}
+
+// Whether a posted file is a recovery volume, the job's optional recovery
+// bytes, by the rule `is_payload` reads: a file a recovery object holds is
+// recovery whatever its posted name, one another object holds or refused
+// is payload, and one no object holds yet is what its posted name says, so
+// the figure rises as a volume posted under another name binds. A set's
+// index is no volume, whoever holds it, when its name says it is one.
+pub(in crate::pipeline) fn recovery_volume(
+    job: &GraphJob,
+    file: &crate::jobs::model::FileSpec,
+    member: MemberId,
+) -> bool {
+    let tree = job.tree();
+    let index = !file.role.counts_toward_health() && !file.role.is_recovery();
+    if let Some((owner, _)) = tree.child_of(NodeId::ROOT, member) {
+        return tree.recovers(owner) && !index;
+    }
+    file.role.is_recovery()
+        && tree
+            .refused_by(NodeId::ROOT, member)
+            .is_none_or(|owner| tree.recovers(owner))
 }
 
 impl Pipeline {
@@ -563,11 +618,27 @@ impl Pipeline {
                             .is_some_and(|outcome| outcome != RepairOutcome::Unread)
                 })
         };
-        let unrepaired = |node: NodeId, member: MemberId| {
-            unruled(node)
-                || failed.iter().any(|(namespace, set)| {
-                    *namespace == node && job.writer().covers(job.tree(), *set, member)
-                })
+        // What the sets of a member's namespace say of it: unrepaired where
+        // a failed set covers it or the recovery carried for it went
+        // unused, and unchecked where a set of it vouched and none of its
+        // sets describes the member (SABnzbd's rule: only what a set
+        // describes is checked once one verified). The one place a member
+        // is asked whether a set describes it.
+        let described = |node: NodeId, member: MemberId| {
+            let covers = |set: NodeId| job.writer().covers(job.tree(), set, member);
+            if unruled(node)
+                || failed
+                    .iter()
+                    .any(|(namespace, set)| *namespace == node && covers(*set))
+            {
+                return Described::Unrepaired;
+            }
+            let mut sets = summary.sets.iter().filter(|set| set.namespace == node);
+            if sets.clone().any(SetSummary::vouched) && !sets.any(|set| covers(set.node)) {
+                Described::Unchecked
+            } else {
+                Described::Otherwise
+            }
         };
         // A posted file that is not whole, read by the name it was posted
         // under once the feed gave up every byte the post declared for it:
@@ -613,7 +684,7 @@ impl Pipeline {
             job.tree(),
             payload,
             |name| par2_damage_ignorable(name, &ignore),
-            unrepaired,
+            described,
             |node, member| job.writer().refused(node, member),
             // Read by the name the member is delivered under, so a file a
             // recovery set renamed to what it is counts as that. A piece is
@@ -636,6 +707,7 @@ impl Pipeline {
         // A file with an unwanted extension the policy deletes is no file
         // of the delivery: the final move leaves it out.
         let mut delivery = delivery;
+        delivery.password_given = job.has_passwords();
         if let Some(policy) = job.writer().removes() {
             delivery.remove_unwanted(|name| policy.removes(name));
         }
@@ -713,18 +785,24 @@ impl Pipeline {
         job_id: JobId,
     ) -> Option<crate::post_processing::model::DeliveredVerdict> {
         let (delivery, failure) = self.graph_ruling(job_id)?;
+        let partial = delivery.status(failure.as_ref()) == JobStatus::Partial;
         Some(crate::post_processing::model::DeliveredVerdict {
-            partial: delivery.status(failure.as_ref()) == JobStatus::Partial,
+            partial,
             shortfall_stage: delivery.shortfall_stage(failure.as_ref()),
-            // What the policy left out is said beside any other reason.
-            shortfall_message: match (
-                failure
-                    .map(|failure| failure.message)
-                    .or_else(|| delivery.withheld_error()),
-                delivery.removed_error(),
-            ) {
-                (Some(why), Some(removed)) => Some(format!("{why}; {removed}")),
-                (why, removed) => why.or(removed),
+            // A partial delivery says what it lacks, from its lists; any
+            // other says why, and what the policy left out beside it.
+            shortfall_message: if partial {
+                Some(delivery.partial_error())
+            } else {
+                match (
+                    failure
+                        .map(|failure| failure.message)
+                        .or_else(|| delivery.withheld_error()),
+                    delivery.removed_error(),
+                ) {
+                    (Some(why), Some(removed)) => Some(format!("{why}; {removed}")),
+                    (why, removed) => why.or(removed),
+                }
             },
             recovery_verified: self.graph_recovery_verified(job_id),
             unpacked: self.graph_unpacked(job_id),
@@ -769,10 +847,11 @@ impl Pipeline {
             return;
         };
         metrics::phase(phase);
-        let stage = stage_events(job_id, before, phase, &RootJob::recovery_summary(&*graph));
+        let mut stage = stage_events(job_id, before, phase, &RootJob::recovery_summary(&*graph));
         if phase == RootPhase::Done {
             self.post_probes.retire(job_id);
             log_set_rulings(job_id, graph);
+            stage.extend(unused_sets(job_id, graph));
             let summary = RootJob::recovery_summary(&*graph);
             metrics::repaired(&summary, &summary.outcomes());
         }

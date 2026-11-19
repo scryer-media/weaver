@@ -523,6 +523,7 @@ fn scenario_client(servers: usize, port: u16) -> weaver_nntp::client::NntpClient
 pub(super) async fn hear_probe(pipeline: &mut Pipeline) {
     loop {
         pipeline.seat_waiting_probes(
+            std::time::Instant::now(),
             &mut std::collections::HashMap::new(),
             &mut std::collections::HashMap::new(),
         );
@@ -602,6 +603,8 @@ pub(in crate::pipeline::tests) struct Scenario {
     pub(in crate::pipeline::tests) limits: Option<ExtractionLimits>,
     // The operator's unacceptable extensions, when not the stored ones.
     pub(in crate::pipeline::tests) unacceptable: Option<Vec<String>>,
+    // What a job holding one of them comes to, when not the stored action.
+    action: Option<crate::post_processing::model::UnwantedExtensionAction>,
     // Every pipeline the scenario prepares finds the stored settings
     // present but not parsing.
     policy_corrupt: bool,
@@ -621,6 +624,9 @@ pub(in crate::pipeline::tests) struct Scenario {
     // What the scenario is told of everything a run says, as the run loop
     // hears it and before the job does.
     heard: Option<HeardHook>,
+    // The name an article's header gives its file, by file, and from the
+    // ordinal given on, when not the posted name.
+    headers: Vec<(u32, u32, String)>,
 }
 
 impl Scenario {
@@ -649,6 +655,7 @@ impl Scenario {
             leased: false,
             limits: None,
             unacceptable: None,
+            action: None,
             policy_corrupt: false,
             holds: None,
             profile: None,
@@ -656,7 +663,34 @@ impl Scenario {
             stat_servers: std::sync::Mutex::new(Vec::new()),
             setup: None,
             heard: None,
+            headers: Vec::new(),
         }
+    }
+
+    // Every article of `file` names it `name` in its header.
+    pub(in crate::pipeline::tests) fn header(self, file: u32, name: &str) -> Self {
+        self.header_from(file, 0, name)
+    }
+
+    // The articles of `file` from `ordinal` on name it `name` in their
+    // header.
+    pub(in crate::pipeline::tests) fn header_from(
+        mut self,
+        file: u32,
+        ordinal: u32,
+        name: &str,
+    ) -> Self {
+        self.headers.push((file, ordinal, name.to_string()));
+        self
+    }
+
+    // The name the header of an article of `file` at `ordinal` gives it.
+    pub(in crate::pipeline::tests) fn header_of(&self, file: u32, ordinal: u32) -> &str {
+        self.headers
+            .iter()
+            .filter(|(at, from, _)| *at == file && *from <= ordinal)
+            .max_by_key(|(_, from, _)| *from)
+            .map_or(self.posts[file as usize].name.as_str(), |(.., name)| name)
     }
 
     // Everything a run says is told to `heard` first.
@@ -711,6 +745,13 @@ impl Scenario {
         self
     }
 
+    // A file with one of those extensions fails the job, the action that is
+    // not the default.
+    pub(in crate::pipeline::tests) fn failing_job(mut self) -> Self {
+        self.action = Some(crate::post_processing::model::UnwantedExtensionAction::FailJob);
+        self
+    }
+
     // What the scenario sets on a pipeline before its job is admitted or
     // restored: its servers, the settings' passwords and policy, and the
     // limits. A scenario whose primary serves some articles damaged has a
@@ -755,6 +796,9 @@ impl Scenario {
             // A save forgets whether any script could run; the runtime works
             // it out at startup, so the job's scripts gate does not wait.
             crate::post_processing::events::refresh_admission_hint(&pipeline.db).unwrap();
+        }
+        if let Some(action) = self.action {
+            pipeline.db.save_unwanted_extension_action(action).unwrap();
         }
         if let Some(limits) = &self.limits {
             pipeline.extraction_limits = std::sync::Arc::new(limits.clone());
@@ -1068,6 +1112,8 @@ pub(in crate::pipeline::tests) struct GraphView {
     // The most the job's holds kept at any look, in memory, on scratch and
     // on file, over every namespace.
     pub(in crate::pipeline::tests) held: u64,
+    // Every name a root member carried at any look.
+    pub(in crate::pipeline::tests) names: BTreeSet<String>,
 }
 
 #[derive(Debug)]
@@ -1102,6 +1148,9 @@ pub(in crate::pipeline::tests) struct Outcome {
     pub(in crate::pipeline::tests) history: Option<crate::JobHistoryRow>,
     // How many times each job stage's duration was observed, by stage name.
     pub(in crate::pipeline::tests) stages_timed: Vec<(&'static str, u64)>,
+    // The job's report as the run left it: its finished record once it
+    // has finished.
+    pub(in crate::pipeline::tests) report: Option<crate::jobs::handle::JobInfo>,
 }
 
 // The kind of every object a graph run's tree held, by its name, sorted.
@@ -1354,6 +1403,15 @@ async fn try_run_then(
         .into_iter()
         .map(|(stage, histogram)| (stage, histogram.count))
         .collect();
+    let report = match pipeline
+        .finished_jobs()
+        .await
+        .into_iter()
+        .find(|job| job.job_id == JOB)
+    {
+        Some(finished) => Some(finished),
+        None => pipeline.job_report(JOB),
+    };
     after(&mut pipeline, &complete_dir).await;
     retire_pipeline_database(pipeline).await;
     Ok(Outcome {
@@ -1376,6 +1434,7 @@ async fn try_run_then(
         download_summary,
         history,
         stages_timed,
+        report,
     })
 }
 
@@ -1716,7 +1775,7 @@ async fn serve_from(
                     expected_file_crc: None,
                     data: DecodedChunk::from(body),
                     yenc_name: if ordinal == 0 {
-                        post.name.clone()
+                        scenario.header_of(file, ordinal).to_string()
                     } else {
                         String::new()
                     },
@@ -1779,7 +1838,7 @@ async fn serve_from(
                 truncation_suspected: truncated,
                 expected_file_crc: None,
                 data: DecodedChunk::from(body),
-                yenc_name: post.name.clone(),
+                yenc_name: scenario.header_of(file, ordinal).to_string(),
                 checkpoint_plan,
                 segments,
             },
@@ -1857,6 +1916,8 @@ pub(in crate::pipeline::tests) fn observe(
             })
             .collect();
         view.sealing.push(look);
+        view.names
+            .extend(namespace.members().map(|member| member.name.clone()));
     }
     view.kinds.extend(
         tree.live()

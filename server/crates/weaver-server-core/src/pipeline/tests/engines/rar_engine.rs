@@ -170,12 +170,16 @@ async fn the_encrypted_five_volume_set_tries_a_wrong_candidate_once_then_the_rig
 // volumes and the password they need, so its history says a password
 // failed it, with nothing whole, nothing short and nothing in the complete
 // directory.
-fn assert_needs_password(graph: &Outcome, volumes: &[(String, Vec<u8>)]) {
+fn assert_needs_password(graph: &Outcome, volumes: &[(String, Vec<u8>)], given: bool) {
+    let said = match given {
+        true => "no password given opens it",
+        false => "none was given",
+    };
     let names: Vec<String> = volumes.iter().map(|(name, _)| name.clone()).collect();
     assert_eq!(
         graph.failure,
         Some(format!(
-            "WEAVER_PASSWORD_REQUIRED: {} needs a password and none was given",
+            "WEAVER_PASSWORD_REQUIRED: {} needs a password and {said}",
             names.join(", ")
         )),
         "{:?}",
@@ -207,7 +211,7 @@ fn assert_needs_password(graph: &Outcome, volumes: &[(String, Vec<u8>)]) {
 async fn the_encrypted_five_volume_set_with_no_password_fails_naming_the_password() {
     let scenario = video(posts(video_set()));
     let graph = run(&scenario).await;
-    assert_needs_password(&graph, &video_set());
+    assert_needs_password(&graph, &video_set(), false);
     assert_eq!(kinds(&graph), ["rar_store"]);
 }
 
@@ -224,19 +228,19 @@ async fn a_header_encrypted_set_with_no_password_fails_naming_the_password() {
         let volumes = header_encrypted_store_set("beacon.bin", &body, 2, VIDEO_SECRET, check);
         let scenario = Scenario::new(posts(volumes.clone()));
         let graph = run(&scenario).await;
-        assert_needs_password(&graph, &volumes);
+        assert_needs_password(&graph, &volumes, false);
         assert!(kinds(&graph).contains(&kind), "{:?}", kinds(&graph));
     }
 }
 
 // A wrong candidate only: offered once, refuted by the member's password
-// check, and with none left the store gives the volumes back withheld, in
-// the same words.
+// check, and with none left the store gives the volumes back withheld,
+// saying the password given opens nothing.
 #[tokio::test]
 async fn the_encrypted_five_volume_set_with_only_a_wrong_candidate_fails_naming_the_password() {
     let scenario = video(posts(video_set())).global_password("cinder-wrong-guess");
     let graph = run(&scenario).await;
-    assert_needs_password(&graph, &video_set());
+    assert_needs_password(&graph, &video_set(), true);
     let offered: Vec<_> = graph.graph().offered.values().copied().collect();
     assert_eq!(offered, [1], "one try for the one candidate");
 }
@@ -741,5 +745,99 @@ async fn a_set_numbered_at_mixed_widths_delivers_its_member() {
             expected["sha256"].as_str().unwrap(),
             "{fixture} {widths:?}"
         );
+    }
+}
+
+// A compressed set posted under dotted names beside a PAR2 set over its
+// true spaced names: `Set.Name-(2003-2022).part01.rar` is renamed
+// `Set Name - (2003 - 2022).part01.rar` by its content, each volume as it
+// is bound, while the engine reads the volumes before it. The set is one
+// engine run across the renames and every member is delivered, in every
+// order the PAR2 set and the volumes arrive in.
+#[tokio::test]
+async fn a_compressed_set_renamed_by_par2_while_it_extracts_delivers_every_member() {
+    let dir = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/extraction_profiles"
+    );
+    let oracle: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/extraction_profiles/expected.json"
+    )))
+    .unwrap();
+    for fixture in ["rar5_lz_four", "rar5_solid_four"] {
+        let truth: Vec<(String, Vec<u8>)> = (1..=4usize)
+            .map(|part| {
+                let bytes = std::fs::read(format!("{dir}/{fixture}.part0{part}.rar")).unwrap();
+                (
+                    format!("Casting Crowns - Collection (2003 - 2022).part0{part}.rar"),
+                    bytes,
+                )
+            })
+            .collect();
+        let files: Vec<(&str, &[u8])> = truth
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+            .collect();
+        let volumes = || -> Vec<Post> {
+            truth
+                .iter()
+                .enumerate()
+                .map(|(index, (_, bytes))| {
+                    Post::plain(
+                        &format!(
+                            "Casting.Crowns-Collection.(2003-2022).part0{}.rar",
+                            index + 1
+                        ),
+                        bytes.clone(),
+                    )
+                })
+                .collect()
+        };
+        let set = || super::harness::par2_set("Casting.Crowns-Collection.(2003-2022)", &files, 2);
+        let orders: [(&str, Vec<Post>); 3] = [
+            ("par2 first", set().into_iter().chain(volumes()).collect()),
+            ("par2 last", volumes().into_iter().chain(set()).collect()),
+            ("par2 midway", {
+                let mut posts = volumes();
+                let rest = posts.split_off(1);
+                posts.extend(set());
+                posts.extend(rest);
+                posts
+            }),
+        ];
+        for (order, posts) in orders {
+            let case = format!("{fixture} {order}");
+            let graph = run(&Scenario::new(posts)).await;
+            assert!(
+                graph.completed(),
+                "{case}: {:?} {:?} kinds {:?} delivery {:?}",
+                graph.status,
+                graph.failure,
+                kinds(&graph),
+                graph.graph().delivery,
+            );
+            assert_engine_ran(&graph);
+            let expected = oracle["archives"][fixture].as_object().unwrap();
+            let mut names: Vec<String> = expected.keys().map(|name| delivered(name)).collect();
+            names.sort();
+            let mut got: Vec<String> = graph.files.keys().cloned().collect();
+            got.sort();
+            assert_eq!(got, names, "{case}");
+            for (name, facts) in expected {
+                assert_eq!(
+                    hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+                        &graph.files[&delivered(name)]
+                    )),
+                    facts["sha256"].as_str().unwrap(),
+                    "{case}: {name}"
+                );
+            }
+            assert!(
+                graph.graph().delivery.withheld.is_empty(),
+                "{case}: {:?}",
+                graph.graph().delivery
+            );
+        }
     }
 }

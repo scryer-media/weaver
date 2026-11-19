@@ -18,6 +18,7 @@ mod gaps;
 mod image;
 mod layout;
 mod lock;
+mod order;
 mod place;
 mod record;
 mod walk;
@@ -37,6 +38,7 @@ use weaver_graph::{
 };
 use zeroize::Zeroizing;
 
+use crate::beside::Beside;
 use crate::crypt::{Cbc, Chain, Padding};
 use crate::engine::SetName;
 use crate::grid::crc32;
@@ -64,6 +66,10 @@ pub(crate) struct Volume {
     // same numbering are this set's all the same.
     posted: Option<String>,
     posted_numbered: Option<naming::VolumeName>,
+    // Where the set's headers put a volume held on trust, against what its
+    // name says, with the stamp of the headers that put it there: it
+    // outranks the name while those headers stand (`order`).
+    ordered: Option<(VolumeIndex, u64)>,
     length: Option<u64>,
     closed: bool,
     kept: Kept,
@@ -83,6 +89,7 @@ impl Volume {
             numbered: None,
             posted: None,
             posted_numbered: None,
+            ordered: None,
             length: None,
             closed: false,
             kept: Kept::default(),
@@ -120,6 +127,14 @@ impl Volume {
             .is_some_and(|facts| claim::misplaced(index, facts))
     }
 
+    // The place the set's headers put this volume, while the headers they
+    // read stand.
+    fn ordered(&self) -> Option<VolumeIndex> {
+        self.ordered
+            .filter(|(_, stamp)| *stamp == self.walk.stamp)
+            .map(|(at, _)| at)
+    }
+
     fn name_as(&mut self, name: &str) {
         self.numbered = numbering(name);
         self.name = Some(name.to_owned());
@@ -138,6 +153,58 @@ impl Volume {
     fn posted_as(&mut self, name: &str) {
         self.posted_numbered = numbering(name);
         self.posted = Some(name.to_owned());
+    }
+}
+
+// The numberings the names of the volumes held carry, each with how many
+// names carry it: filed as a volume's names change, so a claim asks whether
+// any volume is numbered, and whether its name is in a numbering held, by
+// lookup.
+#[derive(Default)]
+struct Numberings {
+    filed: BTreeMap<VolumeIndex, Vec<naming::VolumeName>>,
+    sets: BTreeMap<naming::SetKey, usize>,
+}
+
+impl Numberings {
+    // File the names `found` carries at `index` now, or none for a volume
+    // no longer held.
+    fn file(&mut self, index: VolumeIndex, found: Option<&Volume>) {
+        let now = || found.into_iter().flat_map(Volume::numberings);
+        if self
+            .filed
+            .get(&index)
+            .map_or(&[][..], Vec::as_slice)
+            .iter()
+            .eq(now())
+        {
+            return;
+        }
+        for name in self.filed.remove(&index).unwrap_or_default() {
+            if let btree_map::Entry::Occupied(mut held) = self.sets.entry(name.set_key()) {
+                *held.get_mut() -= 1;
+                if *held.get() == 0 {
+                    held.remove();
+                }
+            }
+        }
+        let now: Vec<naming::VolumeName> = now().cloned().collect();
+        for name in &now {
+            *self.sets.entry(name.set_key()).or_default() += 1;
+        }
+        if !now.is_empty() {
+            self.filed.insert(index, now);
+        }
+    }
+
+    // Whether any volume held carries a numbered name.
+    fn any(&self) -> bool {
+        !self.sets.is_empty()
+    }
+
+    // Whether a volume held carries a name of `wanted`'s numbering.
+    fn holds(&self, wanted: &naming::VolumeName) -> bool {
+        self.sets.contains_key(&wanted.set_key())
     }
 }
 
@@ -176,6 +243,13 @@ mod counts {
         // answer was known.
         pub(crate) asked: Vec<(u32, u64)>,
         pub(crate) known: usize,
+        // Layouts laid again short of a volume they refuted.
+        pub(crate) cut: usize,
+        // Runs of volumes held on trust laid in their headers' order.
+        pub(crate) orders: usize,
+        // Places a placement by links read of those filed beside the
+        // volumes held.
+        pub(crate) beside: usize,
     }
 
     thread_local! {
@@ -339,9 +413,23 @@ pub struct RarStore {
     // nothing was held there: each said once, so siblings are asked once.
     wanted: BTreeSet<VolumeIndex>,
     formats: [BTreeSet<VolumeIndex>; 3],
+    // Where the volumes held stand as they place the next, and the
+    // numberings their names carry: filed as a volume is walked, named,
+    // comes or goes, so a claim reads neither off every volume held.
+    beside: Beside,
+    numberings: Numberings,
     // The layout kept: extended past its tail as volumes are read, laid
     // afresh only where a volume it holds changed what it said.
     layout: Option<layout::Laid>,
+    // The volume just past the kept layout that the layout refuted where it
+    // is held on trust, with the stamp of the headers it was refuted on: not
+    // laid there again until those headers change or the layout is laid
+    // afresh.
+    refuted: Option<(VolumeIndex, u64)>,
+    // Each place whose volume and the one after it are held the wrong way
+    // round by their headers, filed as volumes are touched: nothing is
+    // mapped from the first until the job is quiet and the set is ordered.
+    inversions: BTreeSet<u32>,
     entries: Vec<Entry>,
     candidates: Vec<Candidate>,
     // The candidate that opened the headers.
@@ -401,7 +489,11 @@ impl RarStore {
             lasts: BTreeSet::new(),
             wanted: BTreeSet::new(),
             formats: Default::default(),
+            beside: Beside::default(),
+            numberings: Numberings::default(),
             layout: None,
+            refuted: None,
+            inversions: BTreeSet::new(),
             entries: Vec::new(),
             candidates: Vec::new(),
             headers_open: None,
@@ -460,14 +552,26 @@ impl RarStore {
         if let Some(found) = self.volumes.get_mut(&volume) {
             found.invalidate_facts();
         }
+        self.file_place(volume);
         self.dirty.insert(volume);
         self.moved();
+    }
+
+    // File what places a volume beside the others, as it stands now:
+    // whether it is held there for the next to go beside, and the
+    // numberings its names carry. A volume no longer held places nothing.
+    fn file_place(&mut self, volume: VolumeIndex) {
+        let found = self.volumes.get(&volume);
+        let held = found.is_some_and(|found| claim::holds(volume, found));
+        self.beside.file(volume.0, held);
+        self.numberings.file(volume, found);
     }
 
     // File what a volume's walk says of the set, as it stands now: whether
     // no volume follows it, and the format its headers were read in. A
     // volume no longer held says nothing.
     fn file(&mut self, volume: VolumeIndex) {
+        self.file_place(volume);
         let walk = self.volumes.get(&volume).map(|found| &found.walk);
         match walk.is_some_and(Walk::is_last) {
             true => self.lasts.insert(volume),
@@ -520,17 +624,33 @@ impl RarStore {
     // held one's end record says a volume follows it, or its last file
     // header says the file goes on in the next.
     fn scattered(&self) -> bool {
-        let held: Vec<(&VolumeIndex, &Volume)> = self
+        self.last_held()
+            .is_some_and(|(from_first, _, last)| !from_first || last.walk.followed())
+    }
+
+    // The volume after the last held, when the volumes are held from the
+    // first with none between them missing, and the last one's end record
+    // says a volume follows it, or its last file header says the file goes
+    // on in the next: the volume the set lacks, as unrar names the volume
+    // it cannot open.
+    fn lacks(&self) -> Option<u32> {
+        let (from_first, index, last) = self.last_held()?;
+        index
+            .0
+            .checked_add(1)
+            .filter(|_| from_first && last.walk.followed())
+    }
+
+    // Whether the volumes held run from the first with none between them
+    // missing, and the last held, with its place.
+    fn last_held(&self) -> Option<(bool, VolumeIndex, &Volume)> {
+        let mut held = self
             .volumes
             .iter()
-            .filter(|(_, volume)| volume.name.is_some())
-            .collect();
-        let Some((last, volume)) = held.last() else {
-            return false;
-        };
-        held.len() as u64 != u64::from(last.0) + 1
-            || volume.walk.successor() == Some(true)
-            || volume.walk.continues()
+            .filter(|(_, volume)| volume.name.is_some());
+        let count = held.clone().count() as u64;
+        let (index, volume) = held.next_back()?;
+        Some((count == u64::from(index.0) + 1, *index, volume))
     }
 
     fn give_up(&mut self, emit: Emit, out: &mut Vec<Emit>) {
@@ -574,6 +694,8 @@ impl RarStore {
             // The layout holds to every volume touched so far, those the
             // walks gave back or touched again included.
             let touched: BTreeSet<VolumeIndex> = touched.union(&self.dirty).copied().collect();
+            self.file_inversions(&touched);
+            self.say_records_unheaded(&touched, out);
             if !self.gone {
                 self.sync(&touched, out);
             }
@@ -722,7 +844,9 @@ impl RarStore {
     // A set ends at the volume whose headers say no volume follows it. A
     // volume held past it was claimed on a number every set states alike:
     // it goes back at its close, as a misplaced one does, for the store
-    // whose set it is to claim.
+    // whose set it is to claim. One whose headers put it before that volume,
+    // held there on trust, is the set's, and is placed when the set is
+    // ordered at quiet.
     fn give_back_past_last(&mut self, out: &mut Vec<Emit>) {
         let Some(last) = self.last() else {
             return;
@@ -730,7 +854,9 @@ impl RarStore {
         let going: Vec<VolumeIndex> = self
             .volumes
             .range((Bound::Excluded(last), Bound::Unbounded))
-            .filter(|(_, found)| found.closed)
+            .filter(|(_, found)| {
+                found.closed && !found.stated().is_some_and(|facts| self.before_last(facts))
+            })
             .map(|(index, _)| *index)
             .collect();
         if !going.is_empty() {
@@ -966,6 +1092,11 @@ impl Object for RarStore {
             self.settle(None, out);
             return;
         }
+        // Volumes held the wrong way round take their places now, and the
+        // set is judged once they are claimed there.
+        if self.order_at_quiet(out) {
+            return;
+        }
         if standing.liftable() && self.scattered() {
             self.give_up(Emit::Refuse(Why::Scattered), out);
             return;
@@ -975,7 +1106,7 @@ impl Object for RarStore {
             true => Some(Why::FirstBytesLost),
             false => crate::quiet::damaged(standing)
                 .or_else(|| self.shut())
-                .or_else(|| crate::quiet::unplaced(standing)),
+                .or_else(|| crate::quiet::unplaced(standing, self.lacks())),
         };
         if let Some(why) = why {
             self.give_up(Emit::Refuse(why), out);
@@ -1110,10 +1241,13 @@ impl Object for RarStore {
     }
 
     // The place the volume's headers or name give it, held or not: whether
-    // it takes it is the tree's to judge.
+    // it takes it is the tree's to judge. A member offered by the bytes
+    // past its hole has no headers to give one.
     fn claim(&mut self, name: &str, clean: weaver_graph::Clean<'_>, _length: Option<u64>) -> Claim {
-        let first_bytes = clean.front();
-        self.claim_volume(name, first_bytes)
+        match clean.at {
+            0 => self.claim_volume(name, clean.front()),
+            _ => self.claim_past_hole(name),
+        }
     }
 
     // A volume contributes to no member yet and can travel with all the
@@ -1225,7 +1359,8 @@ impl Object for RarStore {
             .numbered
             .as_ref()
             .is_some_and(|named| named.index() != volume.0)
-            && !stated;
+            && !stated
+            && found.ordered() != Some(volume);
         // The name is what settles a volume its headers do not place, and
         // what it settles is said now, as a length said anew is: a
         // checkpoint before the next delivery records the name, and a

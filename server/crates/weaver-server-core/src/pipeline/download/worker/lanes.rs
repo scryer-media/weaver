@@ -762,7 +762,7 @@ impl Pipeline {
         // A probe batch no worker started was never asked: it waits for a
         // seat again, on the lanes the reset leaves.
         if !stopped.probes.is_empty() {
-            self.post_probes.waiting.extend(stopped.probes);
+            self.post_probes.wait_again(stopped.probes);
             self.download_dispatch_wake = true;
         }
     }

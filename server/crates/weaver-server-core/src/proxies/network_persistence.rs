@@ -239,7 +239,6 @@ pub(super) async fn validate_policy(
 
 pub(super) async fn validate_stored_network(
     tx: &mut SqlTx<'_>,
-    before: &SocketAsks,
     touched: super::dns_persistence::Touched,
 ) -> Result<(), StateError> {
     let profiles = profiles(tx).await?;
@@ -294,68 +293,7 @@ pub(super) async fn validate_stored_network(
     }
     super::validate_wireguard_paths(&routes, &profiles, &pools)?;
     super::validate_instance_budget(&routes, &profiles, &pools, super::max_wireguard_instances())?;
-    super::dns_persistence::validate_route_dns(&mut tx.conn(), &profiles, &pools, touched).await?;
-    validate_stored_sockets(tx, before).await
-}
-
-// What the stored usenet servers ask of each WireGuard tunnel, read under the
-// network lock before a write changes them.
-pub(crate) struct SocketAsks(HashMap<super::SessionPath, usize>);
-
-// Take the network lock, and read what the servers ask of each tunnel
-// before the write that follows.
-pub(crate) async fn lock_network_asks(tx: &mut SqlTx<'_>) -> Result<SocketAsks, StateError> {
-    lock_network(tx).await?;
-    Ok(SocketAsks(super::socket_asks(&stored_sockets(tx).await?)))
-}
-
-// Refuse a write that raises what the usenet servers ask of a WireGuard
-// tunnel it leaves over budget under the hardware profile in force.
-pub(crate) async fn validate_stored_sockets(
-    tx: &mut SqlTx<'_>,
-    before: &SocketAsks,
-) -> Result<(), StateError> {
-    super::validate_socket_raise(&before.0, stored_sockets(tx).await?)?;
-    Ok(())
-}
-
-// How the stored routes and active servers share each WireGuard tunnel.
-async fn stored_sockets(
-    tx: &mut SqlTx<'_>,
-) -> Result<HashMap<super::SessionPath, super::TunnelSockets>, StateError> {
-    let profiles = profiles(tx).await?;
-    let pools = tx
-        .fetch_all("SELECT * FROM proxy_pools", &[])
-        .await?
-        .into_iter()
-        .map(pool_row)
-        .map(|r| r.map(|pool| (pool.id, pool)))
-        .collect::<Result<HashMap<_, _>, _>>()?;
-    let mut routes = Vec::new();
-    for row in tx
-        .fetch_all("SELECT consumer, policy FROM proxy_routes", &[])
-        .await?
-    {
-        if let Some(consumer) = super::Consumer::from_key(&row.text("consumer")?) {
-            routes.push((consumer, stored_route(&row.text("policy")?)?));
-        }
-    }
-    let mut connections = HashMap::new();
-    for row in tx
-        .fetch_all("SELECT id, connections FROM servers WHERE active", &[])
-        .await?
-    {
-        connections.insert(
-            u32::try_from(row.i64("id")?).map_err(error)?,
-            u16::try_from(row.i64("connections")?).map_err(error)?,
-        );
-    }
-    Ok(super::socket_ledger(
-        &routes,
-        &profiles,
-        &pools,
-        &connections,
-    ))
+    super::dns_persistence::validate_route_dns(&mut tx.conn(), &profiles, &pools, touched).await
 }
 
 impl Database {
@@ -529,7 +467,7 @@ impl Database {
             SqlRuntime::run_in_transaction(&store, "save_proxy_pool", |tx| {
                 let mut pool = pool.clone();
                 Box::pin(async move {
-                    let before = lock_network_asks(tx).await?;
+                    lock_network(tx).await?;
                     if create {
                         let row = tx.fetch_optional("SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM proxy_pools", &[]).await?.ok_or_else(|| error("cannot allocate pool id"))?;
                         pool.id = u32::try_from(row.i64("next_id")?).map_err(error)?;
@@ -565,7 +503,6 @@ impl Database {
                     ]).await?;
                     validate_stored_network(
                         tx,
-                        &before,
                         super::dns_persistence::Touched::Pool(pool.id),
                     )
                     .await?;

@@ -11,7 +11,7 @@ use crate::StateError;
 use crate::history::HistoryFailureKind;
 use crate::jobs::{FieldUpdate, JobUpdate};
 use crate::persistence::Database;
-use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx};
+use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx, max_rows_for_tx};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NzbgetHistoryState {
@@ -53,19 +53,73 @@ impl Database {
     // Hide or unhide a history row from the NZBGet-compatible API. Returns
     // false when no history row exists for the job.
     pub fn set_nzbget_history_hidden(&self, job_id: u64, hidden: bool) -> Result<bool, StateError> {
-        let job_id = i64::try_from(job_id)
-            .map_err(|_| StateError::Database("job id is too large".into()))?;
+        Ok(self.set_nzbget_history_rows_hidden(&[job_id], hidden)? > 0)
+    }
+
+    // NZBGet's non-final HistoryDelete: archive the entries of `job_ids` and
+    // hide from the NZBGet-compatible API the ones the archive took or had
+    // already archived. Returns how many were hidden.
+    //
+    // The archive is accepted first, so an entry leaves the client's history
+    // only with its archive queued or done. One another operation holds, or a
+    // job back in the queue, stays listed, and the client's next remove tries
+    // again. A hide that fails after the accept leaves the entry listed; the
+    // next remove finds it archived and hides it.
+    pub fn archive_nzbget_history(&self, job_ids: &[u64]) -> Result<u64, StateError> {
+        use crate::operations::ArchiveHistoryAcceptOutcome as Outcome;
+        let acceptance = self.accept_archive_history(job_ids)?;
+        let taken = acceptance
+            .results
+            .iter()
+            .filter(|(_, outcome)| matches!(outcome, Outcome::Accepted | Outcome::AlreadyArchived))
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        if taken.is_empty() {
+            return Ok(0);
+        }
+        self.set_nzbget_history_rows_hidden(&taken, true)
+    }
+
+    // Hide or unhide the history rows of `job_ids` in one transaction, in
+    // statements of as many ids as the engine binds. Returns how many rows
+    // exist for the ids; an id with no row changes nothing.
+    pub fn set_nzbget_history_rows_hidden(
+        &self,
+        job_ids: &[u64],
+        hidden: bool,
+    ) -> Result<u64, StateError> {
+        let ids = job_ids
+            .iter()
+            .map(|id| {
+                i64::try_from(*id).map_err(|_| StateError::Database("job id is too large".into()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if ids.is_empty() {
+            return Ok(0);
+        }
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "set_nzbget_history_hidden", |tx| {
+                let ids = ids.clone();
                 Box::pin(async move {
-                    let changed = tx
-                        .execute(
-                            "UPDATE job_history SET nzbget_hidden = {} WHERE job_id = {}",
-                            &[SqlArg::I64(i64::from(hidden)), SqlArg::I64(job_id)],
-                        )
-                        .await?;
-                    Ok(changed > 0)
+                    let mut changed = 0;
+                    // One bind for `hidden`, one for each id.
+                    for chunk in ids.chunks(max_rows_for_tx(tx, 1) - 1) {
+                        let placeholders = vec!["{}"; chunk.len()].join(", ");
+                        let args = std::iter::once(SqlArg::I64(i64::from(hidden)))
+                            .chain(chunk.iter().copied().map(SqlArg::I64))
+                            .collect::<Vec<_>>();
+                        changed += tx
+                            .execute(
+                                &format!(
+                                    "UPDATE job_history SET nzbget_hidden = {{}} \
+                                     WHERE job_id IN ({placeholders})"
+                                ),
+                                &args,
+                            )
+                            .await?;
+                    }
+                    Ok(changed)
                 })
             })
             .await
@@ -301,6 +355,81 @@ mod tests {
         })
         .unwrap();
         db
+    }
+
+    // A test's own statement, written through the writer gate.
+    fn execute_sql(db: &Database, sql: &'static str) {
+        let datastore = db.datastore();
+        db.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "nzbget_state_test_sql", |tx| {
+                Box::pin(async move {
+                    tx.execute(sql, &[]).await?;
+                    Ok(())
+                })
+            })
+            .await
+        })
+        .unwrap()
+    }
+
+    fn hidden(db: &Database, job_id: u64) -> bool {
+        db.nzbget_history_states(&[job_id]).unwrap()[&job_id].hidden
+    }
+
+    // An archive that cannot be accepted hides nothing, so the client still
+    // lists the entry and its next remove tries again.
+    #[test]
+    fn a_history_delete_whose_archive_fails_hides_nothing() {
+        let db = database_with_history();
+        execute_sql(
+            &db,
+            "CREATE TRIGGER reject_archive BEFORE INSERT ON async_operations \
+             BEGIN SELECT RAISE(ABORT, 'injected archive failure'); END",
+        );
+        let error = db.archive_nzbget_history(&[41]).unwrap_err();
+        assert!(error.to_string().contains("injected archive failure"));
+        assert!(!hidden(&db, 41));
+
+        execute_sql(&db, "DROP TRIGGER reject_archive");
+        assert_eq!(db.archive_nzbget_history(&[41]).unwrap(), 1);
+        assert!(hidden(&db, 41));
+    }
+
+    // An entry another operation holds is not archived, so it stays listed:
+    // the answer counts only the entries the archive took.
+    #[test]
+    fn a_history_delete_of_a_busy_entry_leaves_it_listed() {
+        let db = database_with_history();
+        let mut other = db.get_job_history(41).unwrap().unwrap();
+        other.job_id = 42;
+        db.insert_job_history(&other).unwrap();
+        // A first archive holds 41 until the worker runs it.
+        assert!(
+            db.accept_archive_history(&[41])
+                .unwrap()
+                .operation_id
+                .is_some()
+        );
+
+        assert_eq!(db.archive_nzbget_history(&[41]).unwrap(), 0);
+        assert!(!hidden(&db, 41));
+        assert_eq!(db.archive_nzbget_history(&[41, 42, 99]).unwrap(), 1);
+        assert!(!hidden(&db, 41));
+        assert!(hidden(&db, 42));
+    }
+
+    // One request's ids past SQLite's 32,766 binds hide every row named, in
+    // one call, and count only the rows that exist.
+    #[test]
+    fn hiding_many_rows_is_bind_safe() {
+        let db = database_with_history();
+        let mut ids: Vec<u64> = (1_000..34_000).collect();
+        ids.push(41);
+        assert_eq!(db.set_nzbget_history_rows_hidden(&ids, true).unwrap(), 1);
+        assert!(db.nzbget_history_states(&[41]).unwrap()[&41].hidden);
+        assert_eq!(db.set_nzbget_history_rows_hidden(&[], true).unwrap(), 0);
+        assert_eq!(db.set_nzbget_history_rows_hidden(&[41], false).unwrap(), 1);
+        assert!(!db.nzbget_history_states(&[41]).unwrap()[&41].hidden);
     }
 
     #[test]

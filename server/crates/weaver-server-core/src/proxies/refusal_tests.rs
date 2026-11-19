@@ -273,18 +273,6 @@ fn table() -> Vec<(R, &'static str, &'static str)> {
             "routes require 3 WireGuard instances × 516 MiB = 1548 MiB; this host permits 2 instances (available memory / 4 / 516 MiB, clamped to 1–8). Pool members count individually.",
         ),
         (
-            R::WireGuardSocketBudget {
-                proxy: 3,
-                egress: 0,
-                nntp: 241,
-                nntp_bytes: 241 * (2 * 1024 * 1024 + 68 * 1024),
-                kept_bytes: 40 * 1024 * 1024 + 1,
-                limit_bytes: 516 * 1024 * 1024,
-            },
-            "WIREGUARD_SOCKET_BUDGET",
-            "usenet servers ask 241 connections of WireGuard proxy 3 on egress 0, 499 MiB, and the tunnel keeps 41 MiB for itself, over the 516 MiB it holds",
-        ),
-        (
             R::ProxyNameLength,
             "PROXY_NAME_LENGTH",
             "proxy name must contain 1–128 characters",
@@ -694,34 +682,33 @@ fn slot(refusal: &R) -> usize {
         R::TorrentRouteExit(super::TorrentRouteFault::Legs) => 86,
         R::TorrentRouteExit(super::TorrentRouteFault::DirectFallback) => 87,
         R::TorrentRouteExit(super::TorrentRouteFault::Rungs) => 88,
-        R::WireGuardSocketBudget { .. } => 89,
-        R::ProxyDnsServersRequired => 90,
-        R::ProxyDnsTlsNameInvalid => 91,
-        R::ProxyDnsUrlInvalid => 92,
-        R::ProxyDnsUrlHostname => 93,
-        R::ProxyDnsPlainAfterEncrypted => 94,
-        R::DnsListNotFound => 95,
-        R::ProxyDnsServerDuplicate => 96,
-        R::ProxyDnsServerCount => 97,
-        R::DnsListLimitReached => 98,
-        R::DnsListInUse { .. } => 99,
-        R::DnsProfileNameLength => 100,
-        R::DnsProfileNotFound => 101,
-        R::DnsProfileLimitReached => 102,
-        R::DnsProfileBuiltIn => 103,
-        R::DnsProfileInUse { .. } => 104,
-        R::DnsProfileListRequired => 105,
-        R::DnsProfileTrustInvalid => 106,
-        R::DnsProfileNeedsProxy { .. } => 107,
-        R::DnsProfileNeedsWireGuard { .. } => 108,
-        R::DnsProfileNeedsTunnelDns { .. } => 109,
-        R::DnsProfileKind { .. } => 110,
-        R::DnsProfileProxyNameInvalid => 111,
-        R::DnsProfileKindImmutable => 112,
-        R::DnsProfileKindRequired => 113,
+        R::ProxyDnsServersRequired => 89,
+        R::ProxyDnsTlsNameInvalid => 90,
+        R::ProxyDnsUrlInvalid => 91,
+        R::ProxyDnsUrlHostname => 92,
+        R::ProxyDnsPlainAfterEncrypted => 93,
+        R::DnsListNotFound => 94,
+        R::ProxyDnsServerDuplicate => 95,
+        R::ProxyDnsServerCount => 96,
+        R::DnsListLimitReached => 97,
+        R::DnsListInUse { .. } => 98,
+        R::DnsProfileNameLength => 99,
+        R::DnsProfileNotFound => 100,
+        R::DnsProfileLimitReached => 101,
+        R::DnsProfileBuiltIn => 102,
+        R::DnsProfileInUse { .. } => 103,
+        R::DnsProfileListRequired => 104,
+        R::DnsProfileTrustInvalid => 105,
+        R::DnsProfileNeedsProxy { .. } => 106,
+        R::DnsProfileNeedsWireGuard { .. } => 107,
+        R::DnsProfileNeedsTunnelDns { .. } => 108,
+        R::DnsProfileKind { .. } => 109,
+        R::DnsProfileProxyNameInvalid => 110,
+        R::DnsProfileKindImmutable => 111,
+        R::DnsProfileKindRequired => 112,
     }
 }
-const SLOTS: usize = 114;
+const SLOTS: usize = 113;
 
 #[test]
 fn every_refusal_keeps_its_code_and_its_sentence() {
@@ -802,17 +789,6 @@ fn only_the_sentences_that_name_values_carry_them() {
             "WIREGUARD_INSTANCE_LIMIT" => assert_eq!(
                 params,
                 serde_json::json!({ "required": 3, "limit": 2, "instanceMib": 516 })
-            ),
-            "WIREGUARD_SOCKET_BUDGET" => assert_eq!(
-                params,
-                serde_json::json!({
-                    "proxyId": 3,
-                    "egressId": 0,
-                    "nntp": 241,
-                    "nntpBytes": 241_u64 * (2 * 1024 * 1024 + 68 * 1024),
-                    "keptBytes": 40_u64 * 1024 * 1024 + 1,
-                    "limitBytes": 516_u64 * 1024 * 1024,
-                })
             ),
             "SPEED_TEST_ALREADY_RUNNING" => {
                 assert_eq!(params, serde_json::json!({ "runId": 4 }))

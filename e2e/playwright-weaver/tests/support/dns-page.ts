@@ -73,7 +73,15 @@ export async function fillProfile(page: Page, editor: Locator, form: ProfileForm
   await pick(editor, "dnsWho", form.who);
   if (form.listId !== undefined) await choose(page, editor, field("dnsList"), String(form.listId));
   if (form.transit) await pick(editor, "dnsTransit", form.transit);
-  if (form.trust) await pick(editor, "dnsTrust", form.trust);
+  if (form.trust === "VALIDATE") await turnOnDnssec(editor);
+}
+
+/** Turn on the profile editor's DNSSEC switch, which shows off, and wait until it shows on. */
+export async function turnOnDnssec(editor: Locator): Promise<void> {
+  const toggle = editor.getByTestId(field("dnsTrust"));
+  await expect(toggle, "dnsTrust shows off before the change").toHaveAttribute("aria-checked", "false");
+  await toggle.click();
+  await expect(toggle, "dnsTrust shows on").toHaveAttribute("aria-checked", "true");
 }
 
 /** Pick `value` on the segmented field `id` and wait until it shows as chosen. */

@@ -31,7 +31,7 @@ use weaver_graph::{
     VolumeIndex,
 };
 
-use crate::operations::disk::reader::Reading;
+use crate::operations::disk::reader::{Reading, TurnStop};
 use crate::operations::disk::volume::Volume;
 
 use super::super::envelope::Shelf;
@@ -133,6 +133,11 @@ impl Returned {
 }
 
 impl Loan {
+    // The loan's stop, which its job raises to end it.
+    pub(crate) fn stop(&self) -> Arc<TurnStop> {
+        self.access.stop()
+    }
+
     // The members the repair is to write nothing into: the disk has no room
     // for them.
     pub(super) fn withhold(&mut self, members: BTreeSet<MemberId>) {
@@ -249,7 +254,7 @@ impl Lent {
     // The pipeline began shutting down, or the job's working directory was
     // released: the repair reads and writes nothing more.
     fn stopped(&self) -> bool {
-        self.shutdown.started() || self.unwritten || !self.internal.is_dir()
+        self.stop.raised() || self.shutdown.started() || self.unwritten || !self.internal.is_dir()
     }
 
     // The loan's thread begins: it waits for what was still queued for the
@@ -339,14 +344,39 @@ struct Lent {
     // read of a file is made in a turn of the file's volume.
     working: Option<Arc<Volume>>,
     reading: RefCell<Reading>,
+    // Raised when the job stops the loan (`Loans::request_stop`): a wait for
+    // a read turn ends, and the loan reads nothing more and comes back
+    // stopped, as it does once the shutdown starts.
+    stop: Arc<TurnStop>,
+}
+
+// What a read the loan was stopped before gives.
+fn stopped_read() -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::BrokenPipe,
+        "the loan was stopped",
+    ))
 }
 
 impl Lent {
+    fn stop(&self) -> Arc<TurnStop> {
+        Arc::clone(&self.stop)
+    }
+
     // `read` in a turn of `volume`, when the file read is written through
-    // one.
-    fn in_turn<R>(&self, volume: Option<&Arc<Volume>>, read: impl FnOnce() -> R) -> R {
+    // one, or `stopped` when the loan is stopped while it waits for the turn.
+    fn in_turn<R>(
+        &self,
+        volume: Option<&Arc<Volume>>,
+        stopped: impl FnOnce() -> R,
+        read: impl FnOnce() -> R,
+    ) -> R {
         match volume {
-            Some(volume) => self.reading.borrow_mut().read(volume.read_turns(), read),
+            Some(volume) => self
+                .reading
+                .borrow_mut()
+                .read_unless(volume.read_turns(), &self.stop, read)
+                .unwrap_or_else(stopped),
             None => read(),
         }
     }
@@ -581,6 +611,7 @@ impl NamespaceWriter {
             withheld: BTreeSet::new(),
             working: self.working_volume(),
             reading: RefCell::default(),
+            stop: Arc::default(),
         };
         let mut seen = BTreeSet::new();
         self.take_namespace(tree, namespace, &mut access, &mut seen);
@@ -853,7 +884,11 @@ impl Lent {
             .members
             .get(&at)
             .and_then(|taken| taken.volume.as_ref());
-        self.in_turn(volume, || self.read_file_here(at, path, range, into))
+        self.in_turn(
+            volume,
+            || false,
+            || self.read_file_here(at, path, range, into),
+        )
     }
 
     fn read_file_here(
@@ -933,9 +968,11 @@ impl Source for Lent {
         match self.shelves.get(&child) {
             // The turn is taken before the shelf's lock, which the read
             // holds: nothing waits for a turn under it.
-            Some((shelf, _)) => {
-                self.in_turn(shelf.volume(), || shelf.read_aside(envelope, range, into))
-            }
+            Some((shelf, _)) => self.in_turn(
+                shelf.volume(),
+                || false,
+                || shelf.read_aside(envelope, range, into),
+            ),
             None => range.is_empty(),
         }
     }
@@ -948,6 +985,8 @@ impl Source for Lent {
         let Some(path) = &taken.path else {
             return range.is_empty();
         };
+        // The file is read where the lent coverage tiles the range with runs
+        // of any provenance, lost included: a lost run does not stop it.
         taken.coverage.covered(range) && self.read_file((node, member), path, range, into)
     }
 
@@ -1004,7 +1043,7 @@ impl Source for Lent {
         super::tests::SCRATCH_READ_MOST.with(|most| most.set(most.get().max(len)));
         let start = into.len();
         into.resize(start + index(len), 0);
-        let read = self.in_turn(self.working.as_ref(), || {
+        let read = self.in_turn(self.working.as_ref(), stopped_read, || {
             read_exact_at(file, offset, &mut into[start..])
         });
         if read.is_err() {
@@ -1030,7 +1069,7 @@ impl Source for Lent {
         };
         let start = into.len();
         into.resize(start + index(range.len()), 0);
-        let read = self.in_turn(self.working.as_ref(), || {
+        let read = self.in_turn(self.working.as_ref(), stopped_read, || {
             read_exact_at(file, range.start, &mut into[start..])
         });
         if read.is_err() {
@@ -1156,6 +1195,79 @@ mod tests {
     use crate::pipeline::graph::job::GraphError;
     use crate::pipeline::graph::limits::Device;
     use crate::pipeline::graph::namespace::WriteError;
+
+    // A loan with nothing taken, working in `dir`.
+    fn bare(dir: &std::path::Path) -> Lent {
+        Lent {
+            namespace: NodeId(1),
+            set: NodeId(2),
+            recovery: Some(NodeId(2)),
+            defer_holds: false,
+            scratch_read: None,
+            held_scratch: BTreeMap::new(),
+            settled: None,
+            scratch_later: BTreeMap::new(),
+            unwritten: false,
+            internal: dir.to_path_buf(),
+            members: BTreeMap::new(),
+            homes: BTreeMap::new(),
+            usage: RefCell::default(),
+            postings: BTreeMap::new(),
+            shelves: BTreeMap::new(),
+            volumes: BTreeMap::new(),
+            window: None,
+            open: RefCell::new(None),
+            reads: 0,
+            repaired: Repaired::again(dir, NodeId(2)).expect("an output"),
+            found: Vec::new(),
+            diagnostics: Vec::new(),
+            scratch: None,
+            shutdown: Shutdown::default(),
+            withheld: BTreeSet::new(),
+            working: None,
+            reading: RefCell::default(),
+            stop: Arc::default(),
+        }
+    }
+
+    // A repair or replay waiting for a read turn that the volume's other
+    // readers hold ends when its job stops the loan: the read is not made,
+    // and the loan reads as stopped, so nothing it came to stands. On solid
+    // state and on a spinning volume alike.
+    #[test]
+    fn a_loan_waiting_for_a_turn_ends_when_its_job_stops_it() {
+        use crate::operations::disk::StorageKind;
+        for kind in [StorageKind::Solid, StorageKind::Rotational] {
+            let dir = tempfile::tempdir().expect("a working directory");
+            let volume = Arc::new(Volume::new(None, "test".to_owned()));
+            let reads = volume.reads(|| kind);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let every = runtime
+                .block_on(Arc::clone(reads.turns()).acquire_many_owned(reads.readers() as u32))
+                .unwrap();
+            let lent = bare(dir.path());
+            assert!(!lent.stopped());
+            let stop = lent.stop();
+            let waiting = {
+                let volume = Arc::clone(&volume);
+                std::thread::spawn(move || {
+                    let read = lent.in_turn(Some(&volume), || "stopped", || "read");
+                    (read, lent.stopped())
+                })
+            };
+            stop.await_waiters(1);
+            stop.raise();
+            assert_eq!(waiting.join().unwrap(), ("stopped", true), "{kind:?}");
+            drop(every);
+            assert_eq!(
+                reads.turns().available_permits(),
+                reads.readers(),
+                "{kind:?}"
+            );
+        }
+    }
 
     // A repair whose output finds the disk full part-way comes back as a
     // write the working disk had no room for, which holds the job, whatever

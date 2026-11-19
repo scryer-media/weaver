@@ -251,7 +251,9 @@ export function IconButton({
         "flex size-8 flex-none items-center justify-center border border-wv-control bg-wv-button",
         disabled
           ? "cursor-default text-wv-disabled"
-          : "cursor-pointer text-wv-fg hover:border-wv-control-hover hover:bg-wv-button-hover",
+          : icon === "remove"
+            ? "cursor-pointer !border-wv-danger-border text-wv-error-text hover:!border-wv-danger-border-hover hover:bg-wv-danger-bg-hover"
+            : "cursor-pointer text-wv-fg hover:border-wv-control-hover hover:bg-wv-button-hover",
       )}
     >
       <Icon name={icon} size={13} />

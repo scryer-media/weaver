@@ -292,7 +292,7 @@ fn what_a_refused_store_closed_whole_is_delivered_whole() {
         refusing.job.tree(),
         |_| true,
         |_| false,
-        |_, _| false,
+        |_, _| crate::pipeline::graph::status::Described::Otherwise,
         |_, _| None,
         |_, _| false,
         |_| Unarrived::Short,

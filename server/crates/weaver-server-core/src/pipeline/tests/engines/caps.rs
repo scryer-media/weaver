@@ -441,7 +441,7 @@ async fn caps_at_their_defaults_touch_nothing() {
 
 #[tokio::test]
 async fn a_member_the_extension_policy_rejects_fails_the_job_at_any_depth() {
-    let rejected = |posts: Vec<Post>| Scenario::new(posts).unacceptable(&["exe"]);
+    let rejected = |posts: Vec<Post>| Scenario::new(posts).unacceptable(&["exe"]).failing_job();
     let member = || vec![("beacon.exe", payload(2 * ARTICLE + 3, 75))];
     let cases = [
         // A posted file, refused at the root before any of it is fetched.
@@ -497,8 +497,9 @@ async fn a_member_the_policy_allows_is_untouched() {
 }
 
 // A stored policy that does not parse is no reason to hold a job: the job is
-// judged by the default unacceptable extensions, not the operator's list,
-// and the stored value is left as it is.
+// judged by the default unacceptable extensions and the default action,
+// which deletes only the unwanted files, not the operator's list, and the
+// stored value is left as it is.
 #[tokio::test]
 async fn a_job_whose_policy_does_not_parse_is_judged_by_the_default() {
     let refused = vec![
@@ -511,13 +512,14 @@ async fn a_job_whose_policy_does_not_parse_is_judged_by_the_default() {
     for posts in refused {
         let scenario = Scenario::new(posts).unacceptable(&["iso"]).policy_corrupt();
         let graph = run(&scenario).await;
-        assert_eq!(
-            graph.failure.as_deref(),
-            Some("unwanted extension '.exe' in 'beacon.exe'"),
+        assert!(
+            graph
+                .failure
+                .as_deref()
+                .is_some_and(|why| why.ends_with("removed for an unwanted extension: beacon.exe")),
             "{:?}",
             graph.status
         );
-        assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Unpack));
         assert!(graph.files.is_empty(), "{:?}", graph.files.keys());
     }
 
@@ -568,7 +570,7 @@ async fn a_restored_job_whose_policy_does_not_parse_is_judged_by_the_default() {
     assert_eq!(
         restarted.status,
         Some(JobStatus::Failed {
-            error: "unwanted extension '.exe' in 'beacon.exe'".into()
+            error: "no file of a known type was delivered whole; removed for an unwanted extension: beacon.exe".into()
         })
     );
     assert!(restarted.files.is_empty(), "{:?}", restarted.files.keys());
@@ -895,7 +897,7 @@ mod unwanted {
     }
 
     fn failing(posts: Vec<Post>) -> Scenario {
-        Scenario::new(posts).unacceptable(&["exe"])
+        Scenario::new(posts).unacceptable(&["exe"]).failing_job()
     }
 
     fn names(graph: &Outcome) -> BTreeSet<String> {
@@ -950,7 +952,55 @@ mod unwanted {
         assert_eq!(graph.files[&delivered("lantern.mkv")], lantern());
         assert_eq!(
             reason(&graph).as_deref(),
-            Some("removed for an unwanted extension: beacon.exe, cinder.exe")
+            Some("delivered in part; removed for an unwanted extension: beacon.exe, cinder.exe")
+        );
+    }
+
+    // A job ends by the action it started with. Saved as "fail job" once
+    // the job was ruled under "delete only unwanted files", just before its
+    // move, the change does not fail the job at the move: the unwanted file
+    // is removed, the rest delivered, and the job ends partial.
+    #[tokio::test]
+    async fn an_action_saved_while_the_job_runs_leaves_it_on_the_one_it_started_with() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let saved = std::sync::Arc::new(AtomicBool::new(false));
+        let hooked = std::sync::Arc::clone(&saved);
+        let scenario = Scenario::new(vec![
+            Post::plain("lantern.mkv", lantern()),
+            Post::plain("beacon.exe", payload(ARTICLE + 7, 83)),
+        ])
+        .unacceptable(&["exe"])
+        .setup(move |pipeline| {
+            pipeline
+                .db
+                .save_unwanted_extension_action(UnwantedExtensionAction::DeleteFiles)
+                .unwrap();
+            crate::post_processing::events::refresh_admission_hint(&pipeline.db).unwrap();
+            let (db, saved) = (pipeline.db.clone(), std::sync::Arc::clone(&hooked));
+            *crate::pipeline::completion::finalize::BEFORE_FIRST_MOVE
+                .lock()
+                .unwrap() = Some(Box::new(move |_| {
+                db.save_unwanted_extension_action(UnwantedExtensionAction::FailJob)
+                    .unwrap();
+                saved.store(true, Ordering::SeqCst);
+            }));
+        });
+        let graph = run(&scenario).await;
+        assert!(
+            saved.load(Ordering::SeqCst),
+            "the action changed before the move"
+        );
+        assert_eq!(
+            graph.status,
+            Some(JobStatus::Partial),
+            "{:?} {:?}",
+            graph.failure,
+            graph.graph().delivery
+        );
+        assert_eq!(names(&graph), BTreeSet::from([delivered("lantern.mkv")]));
+        assert_eq!(
+            reason(&graph).as_deref(),
+            Some("delivered in part; removed for an unwanted extension: beacon.exe")
         );
     }
 
@@ -1019,7 +1069,7 @@ mod unwanted {
             assert_eq!(names(&graph), BTreeSet::from([delivered("lantern.mkv")]));
             assert_eq!(
                 reason(&graph).as_deref(),
-                Some("removed for an unwanted extension: setup.exe")
+                Some("delivered in part; removed for an unwanted extension: setup.exe")
             );
             // No RAR was opened at the root; inside, only the outer one:
             // `candle.mkv`, which `setup.exe` holds, never came out.

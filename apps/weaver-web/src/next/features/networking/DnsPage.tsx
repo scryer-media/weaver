@@ -17,7 +17,6 @@ import {
   DNS_TRANSITS,
   SYSTEM_DNS_PROFILE_ID,
   dnsTransitKey,
-  dnsTrustKey,
   dnsProfileName,
   dnsWhoKey,
   listForm,
@@ -47,7 +46,6 @@ import {
   type DnsServerRow,
   type DnsTestRun,
   type DnsTransit,
-  type DnsTrust,
   type DnsWho,
 } from "@/lib/dns";
 import { routeInput, type NetworkRoute } from "@/lib/networking";
@@ -479,7 +477,6 @@ function DnsCapabilityDialog({
         </>
       }
     >
-      <p className="flex-none px-4 pt-4 text-[12.5px] leading-[1.5] text-wv-muted sm:px-6">{t("next.dns.test.help")}</p>
       <DraftRouteEditor draft={draft} />
     </Dialog>
   );
@@ -544,12 +541,6 @@ function DnsProfileEditor({
   const proxyName = form.kind === "PROXY_NAME";
   const words = KIND_WORDS[form.kind];
   const trusts = trustChoices(form.who);
-  const trustHelp =
-    form.trust === "VALIDATE"
-      ? form.who === "PROXY"
-        ? t("next.dns.proxyValidateNote")
-        : t("next.dns.validateNote")
-      : undefined;
 
   return (
     <>
@@ -647,12 +638,10 @@ function DnsProfileEditor({
                     {
                       id: "dnsTrust",
                       label: t("next.dns.trust"),
-                      help: trustHelp,
                       control: {
-                        kind: "segmented" as const,
-                        value: form.trust,
-                        options: trusts.map((trust) => ({ value: trust, label: t(dnsTrustKey(trust)) })),
-                        onChange: (trust: string) => patch({ trust: trust as DnsTrust }),
+                        kind: "toggle" as const,
+                        value: form.trust === "VALIDATE",
+                        onChange: (validate: boolean) => patch({ trust: validate ? "VALIDATE" : "AS_SENT" }),
                       },
                     },
                   ]

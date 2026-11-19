@@ -915,6 +915,49 @@ fn an_object_with_no_sets_rules_unread_once_a_volume_is_read_through() {
     assert_eq!(job.object.outcome(), None);
 }
 
+// An object with no set says its index never arrived while no volume is read
+// through, and that it found no set once one is read through with none in it.
+#[test]
+fn an_object_with_no_sets_says_why() {
+    use weaver_graph::recovery::{Recovery, Unbound, UnboundReason};
+    let data = payload(18, 5000);
+    let files = par2_set("set", &[("payload.bin", &data)], BLOCK, 4, 2);
+    let mut job = Job::new(Par2::new(OWN), OWN);
+    let reasons = |object: &Par2| {
+        let mut unbound = Vec::new();
+        object.unbound(&mut unbound);
+        unbound
+    };
+    let undescribed = vec![Unbound {
+        id: None,
+        reason: UnboundReason::Undescribed,
+    }];
+    assert_eq!(reasons(&job.object), undescribed);
+    let (name, bytes) = &files[0];
+    let header = &bytes[..par2_rs::packet::HEADER_SIZE];
+    let volume = job.name(name, header);
+    let mut out = Vec::new();
+    job.object.deliver(
+        weaver_graph::Delivery {
+            volume,
+            offset: 0,
+            bytes: &weaver_graph::Evidenced::from(header.to_vec()),
+            provenance: Provenance::Fresh,
+        },
+        &mut |_, _| false,
+        &mut out,
+    );
+    assert_eq!(reasons(&job.object), undescribed);
+    job.object.volume_closed(volume, &mut out);
+    assert_eq!(
+        reasons(&job.object),
+        vec![Unbound {
+            id: None,
+            reason: UnboundReason::NoSet,
+        }]
+    );
+}
+
 // The front of a volume walk steps over a lost article and resyncs on the
 // next packet, so every recovery packet clear of the loss is still found.
 #[test]
@@ -1303,6 +1346,33 @@ fn a_set_past_the_output_limit_is_refused() {
         let mut named = Vec::new();
         job.object.absent(&mut named);
         assert!(named.is_empty());
+    }
+}
+
+// A set refused at the output limit names itself as unreadable; the same set
+// within the limit binds its file and names nothing.
+#[test]
+fn a_set_past_the_output_limit_reports_an_unreadable_index() {
+    use weaver_graph::recovery::{Recovery, UnboundReason};
+    let data = payload(34, 5000);
+    let files = par2_set("set", &[("payload.bin", &data)], BLOCK, 2, 1);
+    for (limit, reason) in [
+        (data.len() as u64 - 1, Some(UnboundReason::Unreadable)),
+        (data.len() as u64, None),
+    ] {
+        let mut object = Par2::new(OWN);
+        object.output_limit = limit;
+        let mut job = Job::new(object, OWN);
+        for (name, bytes) in &files {
+            job.volume(name, bytes, ARTICLE as usize, false);
+        }
+        job.member("payload.bin", &data);
+        bind(&mut job);
+        let mut unbound = Vec::new();
+        job.object.unbound(&mut unbound);
+        let reasons: Vec<_> = unbound.iter().map(|set| set.reason).collect();
+        assert_eq!(reasons, reason.into_iter().collect::<Vec<_>>());
+        assert!(unbound.iter().all(|set| set.id.is_some()));
     }
 }
 
@@ -1965,6 +2035,27 @@ fn nested_packets_that_were_none_refuse_past_the_examined_limit() {
     );
     assert_eq!(object.meter.examined(), most + 1);
     assert_eq!(object.volumes[0].walked_blocks, 0);
+}
+
+// An object refused at the packet limit before it found a set says so, with
+// no set id to name.
+#[test]
+fn an_object_refused_before_any_set_reports_too_many_packets() {
+    use weaver_graph::recovery::{Recovery, Unbound, UnboundReason};
+    let (volume, _) = nested_fakes(64);
+    let mut object = Par2::new(OWN);
+    object.meter = super::walker::Meter::spent(super::walker::MAX_EXAMINED - 10);
+    walk_asked_again(&mut object, &volume);
+    assert!(object.refused);
+    let mut unbound = Vec::new();
+    object.unbound(&mut unbound);
+    assert_eq!(
+        unbound,
+        vec![Unbound {
+            id: None,
+            reason: UnboundReason::TooLarge,
+        }]
+    );
 }
 
 fn found_ranges(object: &Par2) -> Vec<(u32, ByteRange)> {

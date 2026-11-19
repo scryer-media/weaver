@@ -12,7 +12,7 @@
 // write, and the removals.
 
 use super::checkpoints::{CheckpointSave, CheckpointTaken, Landing, Resume, take_checkpoint};
-use super::disk_room::{DiskHeld, StartHold};
+use super::disk_room::{DiskHeld, PlaceBatch, StartHold};
 use super::live::Live;
 use super::queue::QueueEnd;
 use super::scripts::Ending;
@@ -455,6 +455,9 @@ pub(super) struct Gathered {
     // The torrents whose goal removes them, with their data or not, and
     // the event raised once each is in history.
     removals: Vec<(JobId, bool, Option<EventContext>)>,
+    // The looks for disks the walks began, which ask one pass between
+    // them as the last ends.
+    looks: Option<std::sync::Arc<PlaceBatch>>,
     // The walks made, and the writes queued or made, counted in tests.
     walks: u64,
     writes: u64,
@@ -780,7 +783,8 @@ impl TorrentService {
                     .as_ref()
                     .is_none_or(|attached| attached.handle.is_paused());
                 if checks_start(run, starting, torrent.disk_held) {
-                    match self.start_hold(torrent) {
+                    let looks = gathered.looks.get_or_insert_with(|| PlaceBatch::new(self));
+                    match self.start_hold_in(torrent, Some(looks)) {
                         StartHold::Short => {
                             torrent.disk_held = Some(DiskHeld::Starting);
                             run = false;

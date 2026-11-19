@@ -73,16 +73,6 @@ pub enum NetworkRefusal {
         required: usize,
         limit: usize,
     },
-    // Usenet asks `nntp` connections, `nntp_bytes` of a tunnel that keeps
-    // `kept_bytes` for itself and its torrent sessions, past `limit_bytes`.
-    WireGuardSocketBudget {
-        proxy: u32,
-        egress: u32,
-        nntp: usize,
-        nntp_bytes: u64,
-        kept_bytes: u64,
-        limit_bytes: u64,
-    },
 
     // Proxy profiles.
     ProxyNameLength,
@@ -311,7 +301,6 @@ impl NetworkRefusal {
 
             Self::WireGuardPathConflict { .. } => "WIREGUARD_PROXY_PATH_CONFLICT",
             Self::WireGuardInstanceLimit { .. } => "WIREGUARD_INSTANCE_LIMIT",
-            Self::WireGuardSocketBudget { .. } => "WIREGUARD_SOCKET_BUDGET",
 
             Self::ProxyNameLength => "PROXY_NAME_LENGTH",
             Self::ProxyEndpointInvalid => "PROXY_ENDPOINT_INVALID",
@@ -385,21 +374,6 @@ impl NetworkRefusal {
                 egress,
                 paths,
             } => serde_json::json!({ "proxyId": proxy, "egressId": egress, "paths": paths }),
-            Self::WireGuardSocketBudget {
-                proxy,
-                egress,
-                nntp,
-                nntp_bytes,
-                kept_bytes,
-                limit_bytes,
-            } => serde_json::json!({
-                "proxyId": proxy,
-                "egressId": egress,
-                "nntp": nntp,
-                "nntpBytes": nntp_bytes,
-                "keptBytes": kept_bytes,
-                "limitBytes": limit_bytes,
-            }),
             Self::WireGuardInstanceLimit { required, limit } => serde_json::json!({
                 "required": required,
                 "limit": limit,
@@ -547,23 +521,6 @@ impl std::fmt::Display for NetworkRefusal {
                 return write!(
                     f,
                     "WireGuard proxy {proxy} is used on egress {egress} by two different paths ({paths}); a WireGuard server accepts one connection per key, so a WireGuard proxy may reach the egress by only one path"
-                );
-            }
-            Self::WireGuardSocketBudget {
-                proxy,
-                egress,
-                nntp,
-                nntp_bytes,
-                kept_bytes,
-                limit_bytes,
-            } => {
-                const MIB: u64 = 1024 * 1024;
-                return write!(
-                    f,
-                    "usenet servers ask {nntp} connections of WireGuard proxy {proxy} on egress {egress}, {} MiB, and the tunnel keeps {} MiB for itself, over the {} MiB it holds",
-                    nntp_bytes.div_ceil(MIB),
-                    kept_bytes.div_ceil(MIB),
-                    limit_bytes / MIB
                 );
             }
             Self::WireGuardInstanceLimit { required, limit } => {

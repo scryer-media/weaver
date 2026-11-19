@@ -537,6 +537,14 @@ impl Pipeline {
                 _ => JobStatus::Complete,
             }
         });
+        // A partial job keeps the verdict that words what it lacks, for its
+        // report to say while it stays in the queue.
+        if status == JobStatus::Partial {
+            let verdict = self.delivered_verdict(job_id);
+            if let Some(state) = self.jobs.get_mut(&job_id) {
+                state.delivered = verdict;
+            }
+        }
         let persisted = status.persisted_status();
         self.transition_postprocessing_status(job_id, status, Some(persisted));
     }

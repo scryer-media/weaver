@@ -592,6 +592,13 @@ impl NamespaceWriter {
         self.caps.policy_known()
     }
 
+    // The job's content policy once read (`Caps::policy`).
+    pub(crate) fn policy(
+        &self,
+    ) -> Option<std::sync::Arc<crate::post_processing::model::PostProcessingSettings>> {
+        self.caps.policy()
+    }
+
     // The policy was read: the members the tree asked about before it was
     // are asked again, once (`Tree::rule_known`), and what that binds is
     // handed what its members received, as any bind is.
@@ -1025,11 +1032,19 @@ impl NamespaceWriter {
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
         let end = BatchEnd::of(effects);
-        for effect in effects.drain(..) {
+        // What the delivery that bound a member gave its new object is in no
+        // file from the first effect of the batch on, not only once the
+        // batch ends: an object refused in the same batch hands those bytes
+        // on from itself, as the hand-over reads the file around them.
+        let depth = self.reached_now.len();
+        self.reached_now.extend(end.reached.iter().copied());
+        let applied = effects.drain(..).try_for_each(|effect| {
             self.apply(tree, builder, segments, effect, write, out)?;
-            self.apply_unnamed(tree, builder, segments, out)?;
-        }
-        self.finish_batch(tree, builder, segments, end, out)
+            self.apply_unnamed(tree, builder, segments, out)
+        });
+        let finished = applied.and_then(|()| self.finish_batch(tree, builder, segments, end, out));
+        self.reached_now.truncate(depth);
+        finished
     }
 
     // What a batch leaves to do once every effect of it is applied.
@@ -1042,24 +1057,16 @@ impl NamespaceWriter {
             bound,
             folded,
             given_back,
-            reached,
+            ..
         }: BatchEnd,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
         if given_back {
             self.prune(tree)?;
         }
-        let depth = self.reached_now.len();
-        self.reached_now.extend(reached);
-        let mut handed = Ok(());
         for (node, member, child) in bound {
-            handed = self.hand_over(tree, builder, segments, (node, member), child, out);
-            if handed.is_err() {
-                break;
-            }
+            self.hand_over(tree, builder, segments, (node, member), child, out)?;
         }
-        self.reached_now.truncate(depth);
-        handed?;
         for (node, copy, held) in folded {
             self.fold_over(tree, builder, segments, (node, copy), &held, out)?;
         }
@@ -1264,6 +1271,38 @@ impl NamespaceWriter {
             provenance,
         };
         self.deliver(tree, builder, segments, arrival, out)
+    }
+
+    // A root member's article header named it before any of its bytes
+    // came: the tree's ledger moves its name, every file whose name changed
+    // follows, and the claims the name makes again bind through the tree as
+    // any claim does, as a recovery set's renames do (`bind_sets`).
+    pub(crate) fn header_named(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        (member, name): (MemberId, &str),
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        let mut effects = Vec::new();
+        if tree
+            .rename(
+                NodeId::ROOT,
+                member,
+                name,
+                &mut self.placing(builder),
+                &mut effects,
+            )
+            .is_none()
+        {
+            return Ok(());
+        }
+        let (moves, claims): (Vec<Effect>, Vec<Effect>) = effects
+            .into_iter()
+            .partition(|effect| matches!(effect, Effect::Renamed { .. }));
+        self.moved(tree, &moves)?;
+        self.apply_all(tree, builder, segments, claims, out)
     }
 
     // A recovery object recognised the member: the tree's ledger moves its
@@ -2401,7 +2440,7 @@ impl NamespaceWriter {
         out: &mut Vec<Effect>,
     ) -> Result<Option<(NodeId, VolumeIndex)>, WriteError> {
         let mut effects = Vec::new();
-        tree.settle_leaf(node, member, None, &mut effects);
+        tree.settle_leaf(node, member, None, builder, &mut effects);
         self.apply_each(tree, builder, segments, effects, Write::Again, out)?;
         let owner = tree.child_of(node, member);
         if owner.is_none() {
@@ -3138,7 +3177,8 @@ impl NamespaceWriter {
         Ok(())
     }
 
-    // Before a PAR3 set over the posts goes out: the files it describes
+    // Before a set over the posts that can outgrow its recovery goes out,
+    // as a PAR3 set can: the files it describes
     // none of whose bytes arrived, at the lengths they declare, are what its
     // rebuild would add to the disk, as the file under the post's directory
     // and as the repair's staged output under the working directory. Taken
@@ -3148,9 +3188,8 @@ impl NamespaceWriter {
     // into it. The rest are rebuilt however the set describes them,
     // once the disks have room for them all above the reserve: until then
     // the set does not go out, and the job waits for room, as it does for a
-    // write. `None` while it waits. Only a PAR3 set can name one block in
-    // many places of a file; any other set writes no more than the recovery
-    // it received, and is not judged here.
+    // write. `None` while it waits. The set says whether it can: any other
+    // writes no more than the recovery it received, and is not judged here.
     // `noted`, when given, gains each file found absent.
     pub(super) fn withheld(
         &mut self,
@@ -3159,13 +3198,13 @@ impl NamespaceWriter {
         noted: Option<&mut BTreeSet<MemberId>>,
     ) -> Option<BTreeSet<MemberId>> {
         let mut withheld = BTreeSet::new();
-        if tree.kind(set) != Some(Kind::Par3) {
-            return Some(withheld);
-        }
         let (Some(recovery), Some(posts)) = (tree.recovery(set), tree.namespace(NodeId::ROOT))
         else {
             return Some(withheld);
         };
+        if !recovery.outgrows_recovery() {
+            return Some(withheld);
+        }
         let mut absent: Vec<(u64, MemberId)> = posts
             .members()
             .filter(|record| absent_from_posts(record) && recovery.covers(record.id))
@@ -3500,7 +3539,9 @@ pub(crate) trait Source {
     // Where a range of the volume of the object at `child` lies in the
     // member it is bound to; `None` past the window it is bound to.
     fn in_member(&self, child: NodeId, range: ByteRange) -> Option<ByteRange>;
-    // The member's own file, for a range its coverage says was written.
+    // The member's own file, for a range its coverage tiles: runs of any
+    // provenance, lost included, so a lost range reads what the file holds
+    // there.
     fn leaf(&self, node: NodeId, member: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool;
     // The parts of a range still held for the member, in offset order and
     // left held, and where each is kept: a member whose object has not
@@ -3863,6 +3904,8 @@ impl Source for Access<'_> {
         self.writer.envelopes.read(child, envelope, range, into)
     }
 
+    // The file is read where the member's coverage tiles the range with
+    // runs of any provenance, lost included: a lost run does not stop it.
     fn leaf(&self, node: NodeId, member: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool {
         let written = self
             .tree

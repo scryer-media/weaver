@@ -141,6 +141,9 @@ impl Coverage {
         self.runs.values().map(|run| run.range.len()).sum()
     }
 
+    // Whether runs tile every byte of `range`, whatever their provenance:
+    // a lost run counts, so this says the range is accounted for, not that
+    // its bytes arrived (`Provenance::arrived`).
     pub fn covered(&self, range: ByteRange) -> bool {
         if range.is_empty() {
             return true;
@@ -481,8 +484,14 @@ impl Namespace {
 
     // The member's rows changed by what the tree keeps of it beside its
     // record: its owner, whether it waits on one, what it was given up as.
+    // A further posting of it answers by it, so each is marked with it.
     pub fn mark(&mut self, member: MemberId) {
         self.members.mark(member);
+        if let Some(folded) = self.folded.get(&member) {
+            for copy in &folded.copies {
+                self.members.mark(*copy);
+            }
+        }
     }
 
     // The generation of the members' marks: a change to one marks it under
@@ -497,7 +506,7 @@ impl Namespace {
     }
 
     // The members, each once: a further posting of one is not listed.
-    pub fn members(&self) -> impl Iterator<Item = &Member> {
+    pub fn members(&self) -> impl Iterator<Item = &Member> + Clone {
         self.members
             .values()
             .filter(|member| !self.copies.contains_key(&member.id))

@@ -106,8 +106,11 @@ impl MemoryShare {
 
 // One profile's whole definition: what it needs, and what it decides.
 //
-// Every number the profiles differ by lives in [`TABLE`] below, so retuning a
-// profile after a benchmark sweep is a one-line change here and nowhere else.
+// Every number the profiles differ by lives in [`TABLE`] below. The usenet
+// receive buffers inside a WireGuard tunnel (1 MiB Balanced, 2 MiB
+// Performance) were set by the operator on 2026-11-18, with the connection
+// count per tunnel they leave; neither is changed without the operator (see
+// `proxies::socket_ledger`).
 struct ProfileRow {
     profile: HardwareProfile,
     // Memory the machine must have for this profile to be offered.
@@ -177,7 +180,7 @@ const TABLE: [ProfileRow; 3] = [
             cap_bytes: GIB,
         },
         direct_store_resident_default_cap_bytes: None,
-        wireguard_usenet_receive_bytes: 4 * MIB as usize,
+        wireguard_usenet_receive_bytes: 2 * MIB as usize,
         over_limit: OverLimit::ScratchThenRam,
     },
 ];

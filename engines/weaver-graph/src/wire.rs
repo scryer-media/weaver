@@ -65,6 +65,9 @@ enum WhyMirror {
     HoldsBreached,
     Unsupported,
     Unmapped,
+    Unfound {
+        volume: u32,
+    },
     TooDeep,
     InvalidArchive,
     Scattered,

@@ -17,8 +17,6 @@ pub struct Manifest {
 /// The torrent's job may not be made, and why.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Refusal {
-    #[error("{path} has an unwanted extension ({pattern}), as every file of the torrent does")]
-    Unwanted { path: String, pattern: String },
     #[error("{0} is an executable")]
     Executable(String),
     #[error("the torrent has no name")]
@@ -37,29 +35,22 @@ fn extension(name: &str) -> Option<&str> {
 
 /// Admits a torrent, with the files among its `paths`, by their index
 /// there, whose extension the operator does not want: those are left out
-/// of its download. Refuses one that would leave no file wanted, one with
-/// no name, and one that would be named after an executable whatever the
-/// policy says.
+/// of its download. One whose every file is left out is admitted all the
+/// same, with nothing wanted, as qBittorrent's filename filter sets every
+/// matching file to be skipped and counts none (`applyFilenameFilter`).
+/// Refuses one with no name, and one that would be named after an
+/// executable whatever the policy says.
 pub fn admit(policy: &PostProcessingSettings, manifest: &Manifest) -> Result<Vec<usize>, Refusal> {
     if manifest.name.trim().is_empty() {
         return Err(Refusal::Unnamed);
     }
-    let mut first = None;
-    let mut unwanted = Vec::new();
-    for (index, path) in manifest.paths.iter().enumerate() {
-        if let Some(pattern) = policy.unacceptable_extension_match(path) {
-            first.get_or_insert((path, pattern));
-            unwanted.push(index);
-        }
-    }
-    if let Some((path, pattern)) = first
-        && unwanted.len() == manifest.paths.len()
-    {
-        return Err(Refusal::Unwanted {
-            path: path.clone(),
-            pattern: pattern.to_owned(),
-        });
-    }
+    let unwanted = manifest
+        .paths
+        .iter()
+        .enumerate()
+        .filter(|(_, path)| policy.unacceptable_extension_match(path).is_some())
+        .map(|(index, _)| index)
+        .collect();
     if let Some(extension) = extension(&manifest.name)
         && weaver_nzb::delivery_rename::EXECUTABLE_EXTENSIONS
             .iter()
@@ -100,10 +91,10 @@ mod tests {
         }
     }
 
-    // A file with an unwanted extension is left out of the download; the
-    // torrent is refused only when that leaves no file wanted.
+    // A file with an unwanted extension is left out of the download, every
+    // file of the torrent when every one has one.
     #[test]
-    fn files_with_an_unwanted_extension_are_left_out_and_none_left_refuses() {
+    fn files_with_an_unwanted_extension_are_left_out_even_when_none_is_left() {
         let policy = policy(&["nfo", "sc?"]);
         assert_eq!(
             admit(
@@ -113,18 +104,12 @@ mod tests {
             Ok(vec![1, 2])
         );
         assert_eq!(
-            admit(&policy, &manifest("set.scr", true, &["set.scr"])),
-            Err(Refusal::Unwanted {
-                path: "set.scr".into(),
-                pattern: "sc?".into()
-            })
+            admit(&policy, &manifest("set", false, &["set/a.scr"])),
+            Ok(vec![0])
         );
         assert_eq!(
             admit(&policy, &manifest("set", false, &["a.nfo", "b.NFO"])),
-            Err(Refusal::Unwanted {
-                path: "a.nfo".into(),
-                pattern: "nfo".into()
-            })
+            Ok(vec![0, 1])
         );
         assert_eq!(
             admit(&policy, &manifest("set", false, &["a.bin", "b.mkv"])),

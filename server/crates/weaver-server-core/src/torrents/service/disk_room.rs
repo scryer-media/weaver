@@ -129,6 +129,42 @@ struct PlaceLook {
     placed: bool,
     // A reading began this look.
     again: bool,
+    // The batch whose looks ask one pass between them, when it is one.
+    batch: Option<Arc<PlaceBatch>>,
+}
+
+// The looks begun together for many torrents (a batch of moves, a
+// reading's looks again, a restore pass, a pass of the queue): the pass
+// their torrents wait for is asked once, as the last of them ends, not
+// once a look, so many looks are one pass and one publish of every
+// torrent, whenever they end (libtorrent `trigger_auto_manage`, posted
+// once).
+pub(super) struct PlaceBatch {
+    service: TorrentService,
+    placed: std::sync::atomic::AtomicBool,
+}
+
+impl PlaceBatch {
+    pub(super) fn new(service: &TorrentService) -> Arc<Self> {
+        Arc::new(Self {
+            service: service.clone(),
+            placed: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    // Every look ended: whether one placed its torrent, the pass it waits
+    // for then the caller's to make, and asked of no one else.
+    pub(super) fn take_placed(self) -> bool {
+        self.placed.swap(false, Ordering::AcqRel)
+    }
+}
+
+impl Drop for PlaceBatch {
+    fn drop(&mut self) {
+        if self.placed.load(Ordering::Acquire) {
+            self.service.inner.signal.want_pass();
+        }
+    }
 }
 
 impl PlaceLook {
@@ -143,8 +179,12 @@ impl Drop for PlaceLook {
         if self.placed {
             self.service.relooked(self.again);
             // A torrent kept for its disk to be known is judged at the next
-            // pass, and a piece that waited for it at the next wake.
-            self.service.inner.signal.want_pass();
+            // pass, and a piece that waited for it at the next wake. A
+            // batch's looks ask it once, as the last ends.
+            match &self.batch {
+                Some(batch) => batch.placed.store(true, Ordering::Release),
+                None => self.service.inner.signal.want_pass(),
+            }
         } else {
             self.intake.room().end_placing();
             // A look the stop ended is looked again by no one: no reading
@@ -153,6 +193,9 @@ impl Drop for PlaceLook {
                 self.service.place_later(self.job_id, self.again);
             }
         }
+        // The batch's pass, when this was its last look, is asked before
+        // the look is seen ended.
+        drop(self.batch.take());
         self.service
             .inner
             .disk_waits_moved
@@ -227,6 +270,15 @@ impl TorrentService {
     // the bytes its ledger counts as downloaded, over every run. A disk off
     // the roots' is not checked.
     pub(super) fn start_hold(&self, torrent: &Live) -> StartHold {
+        self.start_hold_in(torrent, None)
+    }
+
+    // `start_hold`, a look it begins one of `batch`'s when it is one.
+    pub(super) fn start_hold_in(
+        &self,
+        torrent: &Live,
+        batch: Option<&Arc<PlaceBatch>>,
+    ) -> StartHold {
         if torrent.seeding() {
             return StartHold::Free;
         }
@@ -236,7 +288,7 @@ impl TorrentService {
         let Some(place) = intake.room().place() else {
             // Looked up once at a time; the store's handover began a look
             // already, unless the torrent was complete then.
-            self.look_for_place(torrent.record.job_id, intake, files_dir(torrent));
+            self.look_for_place_in(torrent.record.job_id, intake, files_dir(torrent), batch);
             return StartHold::Unplaced;
         };
         if ever_downloaded(torrent.counters.downloaded_bytes) {
@@ -278,11 +330,22 @@ impl TorrentService {
     // up now, unless a look is out, which takes the latest folder, or the
     // last one failed, which the next reading looks again for.
     pub(super) fn look_for_place(&self, job_id: JobId, intake: &Arc<Intake>, dir: PathBuf) {
+        self.look_for_place_in(job_id, intake, dir, None);
+    }
+
+    // `look_for_place`, the look one of `batch`'s when it is one.
+    pub(super) fn look_for_place_in(
+        &self,
+        job_id: JobId,
+        intake: &Arc<Intake>,
+        dir: PathBuf,
+        batch: Option<&Arc<PlaceBatch>>,
+    ) {
         if locked(&self.inner.relook).jobs.contains(&job_id) {
             return;
         }
         if intake.room().begin_placing() {
-            self.spawn_place(job_id, intake, dir, false);
+            self.spawn_place_in(job_id, intake, dir, false, batch);
         }
     }
 
@@ -303,12 +366,26 @@ impl TorrentService {
         dir: PathBuf,
         again: bool,
     ) {
+        self.spawn_place_in(job_id, intake, dir, again, None);
+    }
+
+    // `spawn_place`, as one of `batch`'s looks when it is one: the pass
+    // its torrent waits for is the batch's.
+    pub(super) fn spawn_place_in(
+        &self,
+        job_id: JobId,
+        intake: &Arc<Intake>,
+        dir: PathBuf,
+        again: bool,
+        batch: Option<&Arc<PlaceBatch>>,
+    ) {
         let mut placing = PlaceLook {
             service: self.clone(),
             job_id,
             intake: Arc::clone(intake),
             placed: false,
             again,
+            batch: batch.cloned(),
         };
         let Some(capacity) = self.inner.env.capacity.clone() else {
             // Nothing to look on: no look is left out.
@@ -384,6 +461,8 @@ impl TorrentService {
             self.relooked(false);
             return;
         }
+        // The looks of one reading ask one pass between them.
+        let batch = PlaceBatch::new(self);
         let live = self.inner.live.lock().await;
         for job_id in jobs {
             let Some(torrent) = live.get(&job_id) else {
@@ -394,10 +473,11 @@ impl TorrentService {
             };
             if intake.room().place().is_none() && intake.room().begin_placing() {
                 locked(&self.inner.relook).out += 1;
-                self.spawn_place(job_id, intake, files_dir(torrent), true);
+                self.spawn_place_in(job_id, intake, files_dir(torrent), true, Some(&batch));
             }
         }
         drop(live);
+        drop(batch);
         self.relooked(false);
     }
 

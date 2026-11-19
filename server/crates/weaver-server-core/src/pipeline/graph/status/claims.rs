@@ -20,6 +20,10 @@ use super::Failure;
 // delivery.
 const EVIDENCE_PERCENT: u64 = 10;
 
+// How many files a partial delivery's reason names before it counts the
+// rest, as the unwanted extension reason does.
+const PARTIAL_NAMED: usize = 20;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Claim {
     // Whole: closed at its length, every byte clean.
@@ -150,6 +154,11 @@ pub(crate) struct Delivery {
     // Posted files that never arrived under names that say nothing of what
     // they were: short unless a set extracted whole beside them.
     pub(crate) unnamed: Vec<String>,
+    // Not whole, in a namespace a recovery set vouched for, and described
+    // by none of its sets: nothing checks them, as SABnzbd checks only
+    // what a set describes. Delivered as they stand, and the job is no
+    // shorter for them.
+    pub(crate) unchecked: Vec<String>,
     // A recovery object that covers them could not rebuild them. Left as
     // they stand, and not a delivery.
     pub(crate) unrepaired: Vec<String>,
@@ -160,6 +169,26 @@ pub(crate) struct Delivery {
     pub(crate) removed: Vec<String>,
     // Every file delivered, whole or as it stands, as the walk met it.
     pub(crate) files: Vec<Delivered>,
+    // The job was given a password to try, as its candidates say
+    // (`GraphJob::has_passwords`): a member withheld for a password then
+    // needs one that none given opens, not one never given.
+    pub(crate) password_given: bool,
+}
+
+// What the recovery sets of a member's namespace say of it, the one answer
+// the walk reads for every member it meets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Described {
+    // A set whose repair failed covers it, or recovery the post carried for
+    // its namespace could not be used: what is short of it is unrepaired.
+    Unrepaired,
+    // A set of its namespace vouched, clean or repaired, and none describes
+    // it: SABnzbd checks only what a set describes, and so nothing checked
+    // it. Short, it ships as it stands and leaves the job no shorter.
+    Unchecked,
+    // Covered by a set that vouched, or in a namespace no set vouched for:
+    // its own bytes say what it is.
+    Otherwise,
 }
 
 // What a posted file that is not whole says of the delivery: short of it,
@@ -192,16 +221,16 @@ pub(crate) struct Delivered {
 impl Delivery {
     // `payload` picks the root members that are the post's files,
     // `furniture` the names of those files whose state never decides a
-    // job, such as a text file posted beside the payload, and
-    // `unrepaired` the members a recovery set whose repair could not
-    // rebuild what it found covers, as their namespace says. `refused` says
-    // why a member is a leaf, and `unarrived` what a posted file that is
-    // not whole was, when none of its bytes arrived.
+    // job, such as a text file posted beside the payload, and `described`
+    // what the recovery sets of a member's namespace say of it
+    // (`Described`). `refused` says why a member is a leaf, and `unarrived`
+    // what a posted file that is not whole was, when none of its bytes
+    // arrived.
     pub(crate) fn read(
         tree: &Tree,
         payload: impl Fn(MemberId) -> bool,
         furniture: impl Fn(&str) -> bool,
-        unrepaired: impl Fn(NodeId, MemberId) -> bool,
+        described: impl Fn(NodeId, MemberId) -> Described,
         refused: impl Fn(NodeId, MemberId) -> Option<Why>,
         piece: impl Fn(NodeId, MemberId) -> bool,
         unarrived: impl Fn(MemberId) -> Unarrived,
@@ -211,7 +240,7 @@ impl Delivery {
             piece: &piece,
             unarrived: &unarrived,
             furniture: &furniture,
-            unrepaired: &unrepaired,
+            described: &described,
             refused: &refused,
             opened: BTreeSet::new(),
             delivery: Self::default(),
@@ -259,16 +288,19 @@ impl Delivery {
                     crc32: None,
                 },
                 None,
+                false,
             );
         }
         delivery
     }
 
-    // One file the delivery hands over: whole, never arrived under a name
-    // that says nothing (`unarrived`), or as it stands.
-    fn deliver(&mut self, file: Delivered, unarrived: Option<Unarrived>) {
+    // One file the delivery hands over: whole, outside every set beside a
+    // set that vouched (`unchecked`), never arrived under a name that says
+    // nothing (`unarrived`), or as it stands.
+    fn deliver(&mut self, file: Delivered, unarrived: Option<Unarrived>, unchecked: bool) {
         match (file.whole, unarrived) {
             (true, _) => self.whole.push(file.name.clone()),
+            (false, _) if unchecked => self.unchecked.push(file.name.clone()),
             (false, Some(Unarrived::Unnamed)) => self.unnamed.push(file.name.clone()),
             (false, _) => self.damaged.push(file.name.clone()),
         }
@@ -291,7 +323,8 @@ impl Delivery {
     // when a whole file is of a type people open (`known_type`), whatever
     // depth it came from; a job whole files of no known type alone stand
     // for fails, and as every failed job publishes nothing, they stay in its
-    // working directory.
+    // working directory. A file no set describes beside a set that vouched
+    // (`unchecked`) is never short: nothing checked it.
     pub(crate) fn status(&self, failure: Option<&Failure>) -> JobStatus {
         let short = !(self.damaged.is_empty()
             && self.unrepaired.is_empty()
@@ -320,6 +353,7 @@ impl Delivery {
                     .iter()
                     .chain(&self.unrepaired)
                     .chain(&self.unnamed)
+                    .chain(&self.unchecked)
                     .map(String::as_str)
                     .collect();
                 match short.len() {
@@ -361,7 +395,12 @@ impl Delivery {
         if out.is_empty() {
             return;
         }
-        for list in [&mut self.whole, &mut self.damaged, &mut self.unnamed] {
+        for list in [
+            &mut self.whole,
+            &mut self.damaged,
+            &mut self.unnamed,
+            &mut self.unchecked,
+        ] {
             list.retain(|name| !out.contains(name));
         }
         self.removed.extend(out);
@@ -398,7 +437,7 @@ impl Delivery {
         };
         let mut reasons: Vec<(String, Vec<&str>)> = Vec::new();
         for (name, why) in &self.withheld {
-            let reason = withheld_because(*why);
+            let reason = withheld_because(name, *why, self.password_given);
             match reasons.iter_mut().find(|(seen, _)| *seen == reason) {
                 Some((_, names)) => names.push(name),
                 None => reasons.push((reason, vec![name])),
@@ -415,6 +454,72 @@ impl Delivery {
                 .join("; ");
             format!("{marker}{reasons}")
         })
+    }
+
+    // What a job that delivered in part lacks, worded as its reason: each
+    // list of what is not whole, its names sorted, at most `PARTIAL_NAMED`
+    // names in all and a count of the rest. Something withheld for a
+    // password opens it with the marker integrations read a password
+    // failure by.
+    pub(crate) fn partial_error(&self) -> String {
+        let marker = if self
+            .withheld
+            .iter()
+            .any(|(_, why)| matches!(why, Why::Encrypted | Why::EncryptedHeader))
+        {
+            crate::pipeline::extraction::error::PASSWORD_REQUIRED_MARKER
+        } else {
+            ""
+        };
+        let withheld: Vec<&str> = self
+            .withheld
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        let lists: [(&str, Vec<&str>); 5] = [
+            (
+                "unrepaired",
+                self.unrepaired.iter().map(String::as_str).collect(),
+            ),
+            ("damaged", self.damaged.iter().map(String::as_str).collect()),
+            // An unnamed file beside a set that extracted whole leaves the
+            // job no shorter (`status`), and is not named.
+            (
+                "missing",
+                if self.extracted() {
+                    Vec::new()
+                } else {
+                    self.unnamed.iter().map(String::as_str).collect()
+                },
+            ),
+            ("withheld", withheld),
+            (
+                "removed for an unwanted extension",
+                self.removed.iter().map(String::as_str).collect(),
+            ),
+        ];
+        let mut text = format!("{marker}delivered in part");
+        let mut left = PARTIAL_NAMED;
+        let mut more = 0usize;
+        for (label, mut names) in lists {
+            names.sort_unstable();
+            names.dedup();
+            if names.is_empty() {
+                continue;
+            }
+            if left == 0 {
+                more += names.len();
+                continue;
+            }
+            let named = names.len().min(left);
+            left -= named;
+            more += names.len() - named;
+            text.push_str(&format!("; {label}: {}", names[..named].join(", ")));
+        }
+        if more > 0 {
+            text.push_str(&format!("; and {more} more"));
+        }
+        text
     }
 
     // The stage a short delivery names as the one that left it short: the
@@ -435,7 +540,7 @@ impl Delivery {
 struct Walk<'t, F, R> {
     tree: &'t Tree,
     furniture: &'t F,
-    unrepaired: &'t R,
+    described: &'t R,
     refused: &'t dyn Fn(NodeId, MemberId) -> Option<Why>,
     // A member the post names as a piece of something else: an archive
     // volume, a split part or recovery data, never a file the user opens.
@@ -455,7 +560,7 @@ pub(crate) fn root_furniture() -> impl Fn(&str) -> bool {
     move |name| crate::pipeline::completion::finalize::check::par2_damage_ignorable(name, &ignore)
 }
 
-impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> bool> Walk<'_, F, R> {
+impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> Described> Walk<'_, F, R> {
     // `short` says a volume the member was unpacked from is short where a
     // failed repair covers it. Furniture is a file of the post: a member an
     // object unpacked is payload, whatever it is named.
@@ -488,7 +593,8 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> bool> Walk<'_, F, R> {
         }
         let claim = Claim::of(member);
         let name = member.output_name.clone();
-        if claim != Claim::Complete && (short || (self.unrepaired)(node, member.id)) {
+        let described = (self.described)(node, member.id);
+        if claim != Claim::Complete && (short || described == Described::Unrepaired) {
             self.delivery.unrepaired.push(name);
             return;
         }
@@ -519,6 +625,9 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> bool> Walk<'_, F, R> {
                 || (!(self.piece)(node, member.id)
                     && !self.unopened(node, member)
                     && self.tree.refused_by(node, member.id).is_none()));
+        // Short bytes no set describes, beside a set that vouched: nothing
+        // checked them, and they ship as they stand.
+        let unchecked = claim != Claim::Complete && described == Described::Unchecked;
         self.delivery.deliver(
             Delivered {
                 name,
@@ -528,6 +637,7 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> bool> Walk<'_, F, R> {
                 crc32: member.crc32,
             },
             unarrived,
+            unchecked,
         );
     }
 
@@ -574,19 +684,31 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> bool> Walk<'_, F, R> {
             .values()
             .filter_map(|volume| namespace.get(*volume))
             .any(|volume| {
-                Claim::of(volume) != Claim::Complete && (self.unrepaired)(parent, volume.id)
+                Claim::of(volume) != Claim::Complete
+                    && (self.described)(parent, volume.id) == Described::Unrepaired
             })
     }
 }
 
 // Why a member was withheld, as a job's error words it after its names. A
 // password the object needed is one reason, whether it shut the member's
-// bytes or the headers naming them.
-fn withheld_because(why: Why) -> String {
+// bytes or the headers naming them: none was given, or `given` says the job
+// had some and none of them opened it. A set short of a volume names the one
+// it lacks in the numbering of `name`, a volume of the set, as SABnzbd's
+// "unable to find" does, or its number where the name does not number it.
+fn withheld_because(name: &str, why: Why, given: bool) -> String {
     let said = match why {
+        Why::Encrypted | Why::EncryptedHeader if given => {
+            "needs a password and no password given opens it"
+        }
         Why::Encrypted | Why::EncryptedHeader => "needs a password and none was given",
         Why::Compressed => "is compressed and no engine reads it",
         Why::Unmapped => "never placed every member it named",
+        Why::Unfound { volume } => {
+            let lacks = weaver_objects::engine::volume_name(name, volume)
+                .unwrap_or_else(|| format!("volume {}", u64::from(volume) + 1));
+            return format!("never placed every member it named: unable to find {lacks}");
+        }
         Why::InvalidArchive => "is an invalid archive rejected by validation",
         Why::TooLarge { needed, allowed } => return too_large(needed, allowed),
         Why::OverMachine { needed, memory } => {

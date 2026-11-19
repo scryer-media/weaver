@@ -155,6 +155,10 @@ impl TorrentService {
     // A tee whose moves wait on a checkpoint has it written, and a torrent
     // whose pieces fell [`CHECKPOINT_PIECES`] behind has them written.
     pub(super) async fn settle(&self) {
+        #[cfg(test)]
+        self.inner
+            .settling
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let dirty = self.inner.signal.take();
         for &job_id in &dirty {
             let made_whole = self.inner.signal.take_whole(job_id);
@@ -250,7 +254,12 @@ impl TorrentService {
             }
         }
         #[cfg(test)]
-        self.inner.settled.send_modify(|settled| *settled += 1);
+        {
+            self.inner
+                .settling
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            self.inner.settled.send_modify(|settled| *settled += 1);
+        }
     }
 
     /// The torrent's own upload and download limits in bytes per second
@@ -624,6 +633,12 @@ impl TorrentService {
                         .map_err(|error| ActionError::State(error.to_string()))?;
                 }
                 torrent.levels = held;
+                // No piece comes for a change that leaves nothing it wants
+                // missing: the settle is told, as an add's is (libtorrent
+                // `update_peer_interest` calls `finished()`).
+                if torrent.completes() {
+                    self.inner.signal.look(job_id);
+                }
                 Ok(None)
             })
             .await?;
@@ -701,6 +716,9 @@ impl TorrentService {
                                 tracing::warn!(job_id = job_id.0, error = %error, "could not keep a torrent's file levels");
                             }
                             torrent.levels = held;
+                            if torrent.completes() {
+                                self.inner.signal.look(job_id);
+                            }
                             if let Some(leveling) = &mut torrent.leveling {
                                 next = leveling.next.take();
                                 if let Some(next) = &next {

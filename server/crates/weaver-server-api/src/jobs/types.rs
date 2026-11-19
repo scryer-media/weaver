@@ -148,6 +148,39 @@ impl From<&weaver_server_core::JobStatus> for QueueItemState {
     }
 }
 
+/// How a finished job ended. `state` and `status` show a job that delivered
+/// in part as failed, for the clients that do not model it; a client that
+/// does selects `outcome`, where it is `PARTIAL`. Null while the job has not
+/// ended.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Enum)]
+pub enum JobOutcome {
+    Complete,
+    Partial,
+    Failed,
+}
+
+impl JobOutcome {
+    pub fn of(status: &weaver_server_core::JobStatus) -> Option<Self> {
+        match status {
+            weaver_server_core::JobStatus::Complete => Some(Self::Complete),
+            weaver_server_core::JobStatus::Partial => Some(Self::Partial),
+            weaver_server_core::JobStatus::Failed { .. } => Some(Self::Failed),
+            _ => None,
+        }
+    }
+
+    // The outcome of a history row with persisted `status`, read as its
+    // `state` is (`history_state_from_status`) but for a partial delivery.
+    pub(crate) fn of_history(status: &str) -> Option<Self> {
+        match status.to_ascii_lowercase().as_str() {
+            "complete" => Some(Self::Complete),
+            "partial" => Some(Self::Partial),
+            "paused" => None,
+            _ => Some(Self::Failed),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Enum)]
 pub enum QueueDownloadState {
     Queued,
@@ -317,6 +350,10 @@ pub struct QueueItem {
     pub original_title: String,
     pub parsed_release: ParsedRelease,
     pub state: QueueItemState,
+    /// How the job ended, a partial delivery as its own value; null while
+    /// it has not ended.
+    #[serde(default)]
+    pub outcome: Option<JobOutcome>,
     #[serde(default = "default_queue_download_state")]
     pub download_state: QueueDownloadState,
     #[serde(default = "default_queue_post_state")]
@@ -1278,6 +1315,9 @@ pub struct Job {
     pub original_title: String,
     pub parsed_release: ParsedRelease,
     pub status: JobStatusGql,
+    /// How the job ended, a partial delivery as its own value; null while
+    /// it has not ended.
+    pub outcome: Option<JobOutcome>,
     pub error: Option<String>,
     pub progress: f64,
     pub total_bytes: u64,
@@ -1336,6 +1376,7 @@ impl From<&weaver_server_core::JobInfo> for Job {
             original_title: display.original_title,
             parsed_release: display.parsed_release,
             status: JobStatusGql::from(&info.status),
+            outcome: JobOutcome::of(&info.status),
             error: info.error.clone(),
             progress: info.progress,
             total_bytes: info.total_bytes,
@@ -1629,6 +1670,7 @@ fn queue_item_from_display(
         original_title,
         parsed_release,
         state,
+        outcome: JobOutcome::of(&info.status),
         download_state: QueueDownloadState::from(info.download_state),
         post_state: QueuePostState::from(info.post_state),
         wait_reason: wait_reason_for(info),
@@ -1690,6 +1732,7 @@ pub fn queue_item_from_submission(
         } else {
             QueueItemState::Queued
         },
+        outcome: None,
         download_state: QueueDownloadState::Queued,
         post_state: QueuePostState::Idle,
         wait_reason: None,
