@@ -702,3 +702,99 @@ async fn a_set_starved_of_its_volumes_is_starved_after_a_restart() {
     assert_eq!(restarted.status, whole.status);
     assert!(restarted.files.is_empty(), "{:?}", restarted.files.keys());
 }
+
+// Articles of a kilobyte: the first of each volume holds its headers.
+const LISTED_FRAME: usize = 1024;
+
+// A stored RAR set of three volumes whose first volume carries an SFV
+// listing ahead of two tracks, every article but each volume's first gone
+// from every server; with `recovery`, an index and two volumes of four
+// blocks over the volumes beside them, every article of it lost, as the
+// post that hung lost its own. The listing is read
+// out of the first volume and binds the first track inside the archive.
+// The second track's header lies in a lost article, so nothing announces
+// it, and the store holds what the second volume brings of the first track
+// until it hears the first volume's tail lost.
+fn listed_in_a_dead_archive(recovery: bool) -> Scenario {
+    let first = payload(20 * LISTED_FRAME, 181);
+    let second = payload(20 * LISTED_FRAME, 182);
+    let sfv = super::sfv::listing(
+        "lantern.sfv",
+        &[
+            ("lantern01.mp3", super::sfv::crc(&first)),
+            ("lantern02.mp3", super::sfv::crc(&second)),
+        ],
+    );
+    let volumes = crate::pipeline::tests::direct_store::multi_member_store_set(
+        &[
+            ("lantern.sfv", sfv.bytes.clone()),
+            ("lantern01.mp3", first),
+            ("lantern02.mp3", second),
+        ],
+        3,
+    );
+    let mut posts = super::rar::posts(volumes.clone());
+    let mut lost: Vec<(u32, u32)> = posts
+        .iter()
+        .zip(0u32..)
+        .flat_map(|(post, file)| {
+            (1..post.bytes.len().div_ceil(LISTED_FRAME) as u32).map(move |ordinal| (file, ordinal))
+        })
+        .collect();
+    if recovery {
+        let files: Vec<(&str, &[u8])> = volumes
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+            .collect();
+        let index = posts.len() as u32;
+        posts.extend(par2_volumes_sliced(
+            "lantern",
+            &files,
+            LISTED_FRAME as u64,
+            4,
+            2,
+        ));
+        for (post, file) in posts[index as usize..].iter().zip(index..) {
+            let articles = post.bytes.len().div_ceil(LISTED_FRAME) as u32;
+            lost.extend((0..articles).map(|ordinal| (file, ordinal)));
+        }
+    }
+    lost.iter().fold(
+        Scenario::new(posts).framed(LISTED_FRAME),
+        |scenario, &(file, ordinal)| scenario.lost(file, ordinal),
+    )
+}
+
+// The post falls below its critical line and the feed gives it up. Nothing
+// can rebuild a track, so the job fails in the feed's words: it never waits
+// on the listing for a member only the job's quiet can close.
+#[tokio::test]
+async fn a_post_given_up_under_a_listing_read_from_its_archive_fails() {
+    let graph = try_run(&listed_in_a_dead_archive(false))
+        .await
+        .unwrap_or_else(|stall| panic!("job stalled at {:?}: {}", stall.status, stall.state));
+    assert!(
+        matches!(graph.status, Some(JobStatus::Failed { .. })),
+        "{:?}",
+        graph.status
+    );
+    let failure = graph.failure.as_deref().unwrap_or_default();
+    assert!(failure.contains("below critical"), "{failure}");
+    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Health));
+}
+
+// The same beside a PAR2 set over the volumes that lost every article: no
+// set binds at the root, and the job still ends Failed, never waiting on
+// the listing.
+#[tokio::test]
+async fn a_post_given_up_under_a_listing_beside_lost_recovery_fails() {
+    let graph = try_run(&listed_in_a_dead_archive(true))
+        .await
+        .unwrap_or_else(|stall| panic!("job stalled at {:?}: {}", stall.status, stall.state));
+    assert!(
+        matches!(graph.status, Some(JobStatus::Failed { .. })),
+        "{:?} {:?}",
+        graph.status,
+        graph.failure
+    );
+}

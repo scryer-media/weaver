@@ -469,9 +469,12 @@ impl GraphJob {
             return false;
         }
         let coming = self.coming();
+        let runs = &self.runs;
         !coming.payload
             && !self.writer.verifications_due(&self.tree, &coming)
-            && self.writer.all_ruled(&self.tree, &coming)
+            && self
+                .writer
+                .ruled_but_for_quiet(&self.tree, &coming, &|namespace| runs.reading(namespace))
     }
 
     // Ranges of lost articles go to the root namespace as soon as they can
