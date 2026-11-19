@@ -3021,4 +3021,42 @@ mod tests {
         assert!(ledger.wanting.is_empty() && ledger.left_by.is_empty());
         assert_eq!(ledger.paths.ids.len(), 0);
     }
+
+    // Many nested archives at one depth, read in an order that is not their
+    // rank, whose members want a handful of names at the root of the
+    // output: `zips` archives of `each` members, `names` names shared.
+    // Forms read, and members moved on, over every seat.
+    fn many_zips(zips: u32, each: u32, names: u32, order: &[u32]) -> (usize, usize) {
+        let mut ledger = NameLedger {
+            unchecked: true,
+            ..NameLedger::default()
+        };
+        let mut moved = Vec::new();
+        for &zip in order.iter().take(zips as usize) {
+            for member in 0..each {
+                let holder = (NodeId(zip + 2), MemberId(member));
+                let name = format!("data{}.bin", (zip * each + member) % names);
+                ledger.allocate(holder, at(&[0, zip, member]), &name, &mut moved);
+            }
+        }
+        (ledger.read, moved.len())
+    }
+
+    #[test]
+    fn many_nested_archives_sharing_names_read_forms_in_proportion() {
+        for (label, reorder, sizes) in [
+            ("rank order", false, [200u32, 800]),
+            ("reverse order", true, [20u32, 80]),
+        ] {
+            let mut row = Vec::new();
+            for zips in sizes {
+                let mut order: Vec<u32> = (0..zips).collect();
+                if reorder {
+                    order.reverse();
+                }
+                row.push((zips, many_zips(zips, 50, 20, &order)));
+            }
+            eprintln!("NAMES | {label} | {row:?}");
+        }
+    }
 }

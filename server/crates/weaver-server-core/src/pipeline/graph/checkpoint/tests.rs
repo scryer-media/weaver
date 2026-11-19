@@ -1866,6 +1866,54 @@ async fn a_crash_costs_only_the_articles_since_the_committed_checkpoint() {
     assert_eq!(restored.job.in_memory(), Vec::<(u32, u32)>::new());
 }
 
+// A change whose write is still out past the age of a write takes no
+// checkpoint for each step after it: taking one would read the job again
+// and write nothing sooner. The steps wait for their own age, as they do
+// while nothing waits.
+#[tokio::test(start_paused = true)]
+async fn steps_take_no_checkpoint_each_while_an_old_change_cannot_be_written() {
+    let _clock = ClockHeld::new();
+    let (db, id) = checkpoint_database();
+    let (mut job, _dir, _files) = four_members();
+    let pending = job.pending().clone();
+    let (mail, _heard) = tokio::sync::mpsc::unbounded_channel();
+
+    // The database's writer is busy, so the change's write waits queued.
+    let (entered, waiting) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    db.try_queue_write("held_database_writer", move |_| {
+        entered.send(()).unwrap();
+        released.recv().unwrap();
+        Ok(())
+    })
+    .unwrap();
+    waiting.await.unwrap();
+    arrive(&mut job, 0, 0);
+    assert!(pending.stepped(id, &mail), "the first checkpoint is due");
+    pending.put(&job, Vec::new());
+    pending.queue(&db, id, &mail, true);
+    assert!(pending.slot().enqueued);
+
+    // The change is now older than the age, and its write is still out.
+    tokio::time::advance(super::CHECKPOINT_AGE).await;
+    let first = tokio::time::Instant::now();
+    for (volume, ordinal) in [(1, 0), (2, 0), (3, 0), (0, 1)] {
+        arrive(&mut job, volume, ordinal);
+        assert!(pending.slot().enqueued);
+        assert!(!pending.stepped(id, &mail), "{volume}/{ordinal}");
+    }
+    assert_eq!(pending.tally().checkpoints, 1);
+
+    // The steps' own age makes the next one due.
+    tokio::time::advance(super::CHECKPOINT_AGE).await;
+    assert_eq!(tokio::time::Instant::now(), first + super::CHECKPOINT_AGE);
+    arrive(&mut job, 1, 1);
+    assert!(pending.stepped(id, &mail), "the steps' own age");
+    release.send(()).unwrap();
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(writes(&db), 1);
+}
+
 // A forced write takes every change: once it is queued a crash costs
 // nothing the job has on disk, before the write has run and after.
 #[tokio::test(start_paused = true)]

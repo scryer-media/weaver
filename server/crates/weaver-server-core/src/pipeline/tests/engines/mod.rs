@@ -107,6 +107,7 @@ mod lines;
 pub(in crate::pipeline) mod loans;
 mod lost_fronts;
 mod lost_index;
+mod many_members;
 mod misstated_sizes;
 mod nameless_recovery;
 mod nameless_reversed;
