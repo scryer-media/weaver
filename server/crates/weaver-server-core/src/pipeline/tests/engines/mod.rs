@@ -92,6 +92,7 @@ mod download_summary;
 mod embedded;
 mod encrypted_hex;
 mod end_files;
+mod extractor_claims;
 mod first_article_sample;
 mod frontless_rar;
 mod frontless_records;
