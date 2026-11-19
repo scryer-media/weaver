@@ -562,11 +562,17 @@ fn a_short_delivery_is_partial_only_by_a_whole_file_of_a_known_type() {
     assert_eq!(
         posted("d1c70000.bin").status(None),
         JobStatus::Failed {
-            error: "no file of a known type was delivered whole; 1 short: ember.mkv".to_string()
+            error: "no usable file was delivered whole; 1 short: ember.mkv".to_string()
         }
     );
     assert_eq!(
         posted("ember.nfo").status(Some(&failed(error))),
+        JobStatus::Failed {
+            error: error.to_string()
+        }
+    );
+    assert_eq!(
+        posted("ember.srt").status(Some(&failed(error))),
         JobStatus::Partial
     );
     // One member of a 7z unpacked whole, the other lost with the volume
@@ -589,7 +595,7 @@ fn a_short_delivery_is_partial_only_by_a_whole_file_of_a_known_type() {
     assert_eq!(
         unpacked("ember.bin").status(None),
         JobStatus::Failed {
-            error: "no file of a known type was delivered whole; 1 short: ember.idx".to_string()
+            error: "no usable file was delivered whole; 1 short: ember.idx".to_string()
         }
     );
     assert_eq!(unpacked("ember.mkv").status(None), JobStatus::Partial);
@@ -598,6 +604,48 @@ fn a_short_delivery_is_partial_only_by_a_whole_file_of_a_known_type() {
     whole.damaged.clear();
     whole.files.truncate(1);
     assert_eq!(whole.status(None), JobStatus::Complete);
+}
+
+// Furniture beside a payload, an `.nfo` or a `file_id.diz`, never stands for
+// a delivery made in part, posted at the root, in a folder or unpacked:
+// beside volumes nothing could unpack the job fails. One usable file beside
+// it is partial, an archive Weaver does not unpack, such as an `.apk`,
+// among them. Nothing short, furniture alone completes as it did.
+#[test]
+fn furniture_alone_never_makes_a_short_delivery_partial() {
+    let short = |whole: &[&str]| Delivery {
+        whole: whole.iter().map(ToString::to_string).collect(),
+        unrepaired: ["ember.part1.rar", "ember.part2.rar", "ember.part3.rar"]
+            .map(String::from)
+            .to_vec(),
+        ..Delivery::default()
+    };
+    let furniture = [
+        "00-ember.nfo",
+        "file_id.diz",
+        "file_id (1).diz",
+        "Sample/ember.nfo",
+        "ember.url",
+    ];
+    assert_eq!(
+        short(&furniture).status(None),
+        JobStatus::Failed {
+            error: "no usable file was delivered whole; 3 short: ember.part1.rar, \
+                    ember.part2.rar, ember.part3.rar"
+                .to_string()
+        }
+    );
+    let mut usable = furniture.to_vec();
+    usable.push("ember.mkv");
+    assert_eq!(short(&usable).status(None), JobStatus::Partial);
+    assert_eq!(
+        short(&["ember.nfo", "ember.apk"]).status(None),
+        JobStatus::Partial
+    );
+    assert_eq!(short(&["ember.apk"]).status(None), JobStatus::Partial);
+    let mut clean = short(&furniture);
+    clean.unrepaired.clear();
+    assert_eq!(clean.status(None), JobStatus::Complete);
 }
 
 // The delete action leaves each file with an unwanted extension out of the

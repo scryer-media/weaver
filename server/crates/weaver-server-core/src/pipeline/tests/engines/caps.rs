@@ -570,7 +570,9 @@ async fn a_restored_job_whose_policy_does_not_parse_is_judged_by_the_default() {
     assert_eq!(
         restarted.status,
         Some(JobStatus::Failed {
-            error: "no file of a known type was delivered whole; removed for an unwanted extension: beacon.exe".into()
+            error:
+                "no usable file was delivered whole; removed for an unwanted extension: beacon.exe"
+                    .into()
         })
     );
     assert!(restarted.files.is_empty(), "{:?}", restarted.files.keys());

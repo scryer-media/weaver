@@ -7,7 +7,7 @@
 
 use std::collections::BTreeSet;
 
-use weaver_graph::{Member, MemberId, NodeId, Sniff, Tree, Why, known_type};
+use weaver_graph::{Member, MemberId, NodeId, Sniff, Tree, VolumeIndex, Why, usable_type};
 
 use crate::jobs::model::JobStatus;
 use crate::pipeline::graph::leaf::Leaf;
@@ -156,8 +156,9 @@ pub(crate) struct Delivery {
     pub(crate) unnamed: Vec<String>,
     // Not whole, in a namespace a recovery set vouched for, and described
     // by none of its sets: nothing checks them, as SABnzbd checks only
-    // what a set describes. Delivered as they stand, and the job is no
-    // shorter for them.
+    // what a set describes. With them, a whole volume a vouching set proved
+    // of a set whose first volume the release never carried, which nothing
+    // can open. Delivered as they stand, and the job is no shorter for them.
     pub(crate) unchecked: Vec<String>,
     // A recovery object that covers them could not rebuild them. Left as
     // they stand, and not a delivery.
@@ -186,8 +187,10 @@ pub(crate) enum Described {
     // it: SABnzbd checks only what a set describes, and so nothing checked
     // it. Short, it ships as it stands and leaves the job no shorter.
     Unchecked,
-    // Covered by a set that vouched, or in a namespace no set vouched for:
-    // its own bytes say what it is.
+    // Covered by a set of its namespace that vouched: its bytes are what
+    // was posted, and say what it is.
+    Vouched,
+    // In a namespace no set vouched for: its own bytes say what it is.
     Otherwise,
 }
 
@@ -247,7 +250,7 @@ impl Delivery {
         };
         if let Some(root) = tree.namespace(NodeId::ROOT) {
             for member in root.members().filter(|member| payload(member.id)) {
-                walk.member(NodeId::ROOT, member, false);
+                walk.member(NodeId::ROOT, member, false, false);
             }
         }
         walk.delivery
@@ -320,10 +323,11 @@ impl Delivery {
     // files alone it is a file the post lacks. The feed giving the post up
     // words a failure and rules nothing: a delivery with a whole usable
     // output and nothing short is complete. A short delivery is partial only
-    // when a whole file is of a type people open (`known_type`), whatever
-    // depth it came from; a job whole files of no known type alone stand
-    // for fails, and as every failed job publishes nothing, they stay in its
-    // working directory. A file no set describes beside a set that vouched
+    // when a whole file is of a type people open and no furniture beside the
+    // payload (`usable_type`), whatever depth it came from; a job whole
+    // files of no usable type alone stand for, an `.nfo` or a `file_id.diz`
+    // among them, fails, and as every failed job publishes nothing, they
+    // stay in its working directory. A file no set describes beside a set that vouched
     // (`unchecked`) is never short: nothing checked it.
     pub(crate) fn status(&self, failure: Option<&Failure>) -> JobStatus {
         let short = !(self.damaged.is_empty()
@@ -334,13 +338,13 @@ impl Delivery {
         if !self.whole.is_empty() && !short && failure.is_none_or(|failure| failure.from_feed) {
             return JobStatus::Complete;
         }
-        if self.whole.iter().any(|name| known_type(name)) {
+        if self.whole.iter().any(|name| usable_type(name)) {
             return JobStatus::Partial;
         }
         let nothing = if self.whole.is_empty() {
             "no file was delivered whole"
         } else {
-            "no file of a known type was delivered whole"
+            "no usable file was delivered whole"
         };
         let error = match failure
             .map(|failure| failure.message.clone())
@@ -564,17 +568,19 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> Described> Walk<'_, F, R> {
     // `short` says a volume the member was unpacked from is short where a
     // failed repair covers it. Furniture is a file of the post: a member an
     // object unpacked is payload, whatever it is named.
-    fn member(&mut self, node: NodeId, member: &Member, short: bool) {
+    // `vouched` says `node`'s bytes were unpacked from volumes a set that
+    // vouched proved whole (`vouched_volumes`).
+    fn member(&mut self, node: NodeId, member: &Member, short: bool, vouched: bool) {
         let tree = self.tree;
         match tree.child_of(node, member.id) {
             Some((child, _)) if tree.recovers(child) => {}
-            Some((child, _)) => self.namespace(child, short),
+            Some((child, _)) => self.namespace(child, short, vouched),
             None => {
                 if !(node == NodeId::ROOT && (self.furniture)(&member.output_name)) {
-                    self.leaf(node, member, short);
+                    self.leaf(node, member, short, vouched);
                 }
                 for kept in tree.kept(node, member.id) {
-                    self.namespace(kept, short);
+                    self.namespace(kept, short, vouched);
                 }
             }
         }
@@ -587,7 +593,7 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> Described> Walk<'_, F, R> {
     // (`Why::disclaims`); and otherwise it is whole when its bytes are.
     // A directory is no file of the delivery: it holds files, and is
     // neither whole nor short of its own.
-    fn leaf(&mut self, node: NodeId, member: &Member, short: bool) {
+    fn leaf(&mut self, node: NodeId, member: &Member, short: bool, vouched: bool) {
         if Leaf::is_directory(&member.output_name) {
             return;
         }
@@ -626,8 +632,14 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> Described> Walk<'_, F, R> {
                     && !self.unopened(node, member)
                     && self.tree.refused_by(node, member.id).is_none()));
         // Short bytes no set describes, beside a set that vouched: nothing
-        // checked them, and they ship as they stand.
-        let unchecked = claim != Claim::Complete && described == Described::Unchecked;
+        // checked them, and they ship as they stand. So does a whole volume
+        // of a set whose first volume the release never carried, which a
+        // set that vouched proved, here or in what it was unpacked from: no
+        // object can open it, and its bytes are what was posted. A set that
+        // holds its first volume and lost another is short as it was.
+        let proved = vouched || described == Described::Vouched;
+        let unchecked = (claim != Claim::Complete && described == Described::Unchecked)
+            || (claim == Claim::Complete && !whole && proved && self.headless(node, member.id));
         self.delivery.deliver(
             Delivered {
                 name,
@@ -641,7 +653,8 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> Described> Walk<'_, F, R> {
         );
     }
 
-    fn namespace(&mut self, node: NodeId, short: bool) {
+    // `vouched` says the namespace `node` was bound in was itself vouched.
+    fn namespace(&mut self, node: NodeId, short: bool, vouched: bool) {
         let tree = self.tree;
         if !self.opened.insert(node) {
             return;
@@ -650,13 +663,43 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> Described> Walk<'_, F, R> {
             return;
         };
         let short = short || self.short_volume(node);
+        let vouched = self.vouched_volumes(node, vouched);
         // A buried member is no file: it says its object left it open.
         for below in namespace
             .members()
             .filter(|below| !tree.holds_no_file(node, below.id))
         {
-            self.member(node, below, short);
+            self.member(node, below, short, vouched);
         }
+    }
+
+    // Every volume of `node` is whole, and a set that vouched covers it or
+    // the namespace it lies in was vouched itself (`above`): what `node`
+    // unpacks is the bytes that were posted, at any depth.
+    fn vouched_volumes(&self, node: NodeId, above: bool) -> bool {
+        let Some((parent, volumes)) = self.tree.volumes(node) else {
+            return false;
+        };
+        let Some(namespace) = self.tree.namespace(parent) else {
+            return false;
+        };
+        !volumes.is_empty()
+            && volumes.values().all(|volume| {
+                namespace.get(*volume).is_some_and(|volume| {
+                    Claim::of(volume) == Claim::Complete
+                        && (above || (self.described)(parent, volume.id) == Described::Vouched)
+                })
+            })
+    }
+
+    // The member is a volume of an object that refused it and was bound
+    // without its set's first volume: a set the release never carried the
+    // head of.
+    fn headless(&self, node: NodeId, member: MemberId) -> bool {
+        self.tree
+            .refused_by(node, member)
+            .and_then(|object| self.tree.volumes(object))
+            .is_some_and(|(_, volumes)| !volumes.contains_key(&VolumeIndex(0)))
     }
 
     // A leaf whose name and front say an object of some kind reads it: a

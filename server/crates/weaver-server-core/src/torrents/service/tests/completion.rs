@@ -116,17 +116,23 @@ fn a_whole_nfo_beside_a_refused_archive_fails_for_both_kinds() {
     assert_eq!(torrent_status(&files, WHY), failed);
 }
 
-// Furniture is so only at the torrent's root, as an NZB job's is only at
-// its root: a whole .nfo in a folder of the torrent is a usable file, and
-// beside a refused archive the job is partial.
+// Root furniture is left out of the delivery only at the torrent's root,
+// as an NZB job's is only at its root: a whole .nfo in a folder of the
+// torrent is delivered, but furniture never stands for a delivery made in
+// part, and beside a refused archive the job fails.
 #[test]
-fn a_whole_nfo_in_a_torrents_folder_is_a_usable_file() {
+fn a_whole_nfo_in_a_torrents_folder_is_no_usable_file() {
     let files = [
         ("extras/ember.nfo", true),
         ("ember.part1.rar", true),
         ("ember.part2.rar", false),
     ];
-    assert_eq!(torrent_status(&files, WHY), JobStatus::Partial);
+    assert_eq!(
+        torrent_status(&files, WHY),
+        JobStatus::Failed {
+            error: WHY.to_owned(),
+        }
+    );
     assert_eq!(
         torrent_status(&[("ember.nfo", true), ("ember.part1.rar", true)], WHY),
         JobStatus::Failed {
