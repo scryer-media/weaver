@@ -142,6 +142,7 @@ mod remaining_stalls;
 mod renamed_engine;
 mod renamed_held_volumes;
 mod renamed_sets;
+mod repaired_records;
 mod repaired_source;
 mod reposted;
 pub(in crate::pipeline::tests) mod restart;
