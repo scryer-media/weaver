@@ -74,8 +74,13 @@ fn equal_content_claimants_remain_ambiguous_and_available_for_verification() {
         .values()
         .filter(|set| set.usable().is_some())
         .collect();
-    let found =
-        super::super::bind::bind_sets(&indexes, &job.namespace, OWN, &mut Default::default());
+    let found = super::super::bind::bind_sets(
+        &indexes,
+        &job.namespace,
+        OWN,
+        &mut Default::default(),
+        |_, _| false,
+    );
     assert!(found.sets.iter().all(|set| set.is_empty()));
     assert_eq!(found.unnamed.len(), 2);
 }
@@ -108,6 +113,7 @@ fn cross_set_content_identity_outranks_an_earlier_filename_guess() {
                 &job.namespace,
                 OWN,
                 &mut Default::default(),
+                |_, _| false,
             );
             assert!(found.unnamed.is_empty());
             for (index, bound) in indexes.iter().zip(found.sets) {

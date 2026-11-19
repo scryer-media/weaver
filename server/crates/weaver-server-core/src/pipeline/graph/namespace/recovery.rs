@@ -16,7 +16,7 @@ use std::collections::binary_heap::{BinaryHeap, PeekMut};
 use std::collections::{BTreeSet, HashSet};
 
 use bytes::Bytes;
-use weaver_graph::recovery::{Recovery, RepairOutcome, SetRuling, Unbound};
+use weaver_graph::recovery::{Recovery, RepairOutcome, SetRuling, ShortSets, Unbound};
 use weaver_graph::{
     Algorithm, Builder, ByteRange, Effect, Handed, Kind, MemberId, Namespace, NodeId, Provenance,
     RecoveryKind, Restore, Segment, Tree, VolumeIndex,
@@ -356,6 +356,13 @@ impl NamespaceWriter {
         if let Some(recovery) = tree.recovery(set) {
             recovery.sets(out);
         }
+    }
+
+    // What the object at `set` says of its sets that cannot rebuild what
+    // they bind, set by set, when it can say it. A set out on loan says
+    // nothing until it returns.
+    pub(crate) fn short_sets(&self, tree: &Tree, set: NodeId) -> Option<ShortSets> {
+        tree.recovery(set)?.short_sets()
     }
 
     // Each standing set of every namespace that bound no member, with its

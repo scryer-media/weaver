@@ -101,6 +101,11 @@ impl RootJob for GraphJob {
                     .set_name(tree, object.node)
                     .map_or_else(|| object.kind.to_string(), str::to_owned),
                 outcome: object.outcome,
+                // Read set by set only for an object that ruled it cannot
+                // rebuild: no other ruling fails or excuses anything.
+                short: matches!(object.outcome, Some(RepairOutcome::Impossible { .. }))
+                    .then(|| self.writer().short_sets(tree, object.node))
+                    .flatten(),
             })
             .collect();
         RecoverySummary { sets }
@@ -187,9 +192,12 @@ pub(crate) fn drive(
 
 // The objects that could not rebuild what they found, and that failure
 // worded as a recovery failure reads today, unless another object of its
-// namespace vouched for that namespace and left no damage in it: an object
-// that only checks never overrules one that repaired, but a repair of one
-// set never excuses another's. Each set is judged in the namespace it lives
+// namespace, or another set of its own object, vouched for that namespace
+// and left no damage in it: an object that only checks never overrules one
+// that repaired, but a repair of one set never excuses another's. An object
+// that says set by set fails for its short sets alone, each named as it was
+// posted, and leaves short only what they bind (`SetSummary::leaves_short`).
+// Each set is judged in the namespace it lives
 // in, at whatever depth. A breach of the job's extraction budget fails the
 // job before any of that: it carries the budget's refusal, worded as the
 // job's failure reason, and names no object. When no set failed and the
@@ -230,10 +238,13 @@ pub(crate) fn failure(
     }
     let ruled: Vec<(&SetSummary, RepairOutcome)> =
         summary.sets.iter().zip(outcomes.iter().copied()).collect();
+    // A set of the same object that vouched for what it binds excuses its
+    // short sibling on the same terms as another object does.
     let excused = |set: &SetSummary| {
-        ruled.iter().any(|(other, outcome)| {
+        (ruled.iter().any(|(other, outcome)| {
             other.namespace == set.namespace && summary::vouches(Some(*outcome))
-        }) && job.namespace(set.namespace).is_none_or(Namespace::is_clean)
+        }) || set.short.as_ref().is_some_and(|short| short.vouched))
+            && job.namespace(set.namespace).is_none_or(Namespace::is_clean)
     };
     let failed: Vec<(&SetSummary, u64, u64)> = ruled
         .iter()
@@ -248,26 +259,52 @@ pub(crate) fn failure(
         return None;
     }
     let kinds: BTreeSet<String> = failed.iter().map(|(set, _, _)| label(set.kind)).collect();
-    let described = failed
-        .iter()
-        .map(|(set, slices, reachable)| {
+    let mut described = Vec::new();
+    for (set, slices, reachable) in &failed {
+        let namespace = job.namespace(set.namespace);
+        let worded = |name: &str, slices: u64, reachable: u64, damaged: String| {
             // The members still damaged where the set lives, when its
             // namespace marks any; a check that failed on bytes that
             // arrived whole leaves none to name.
-            let damaged = Some(damaged_names(job.namespace(set.namespace), set.node))
+            let damaged = Some(damaged)
                 .filter(|names| !names.is_empty())
                 .map(|names| format!(" ({names})"))
                 .unwrap_or_default();
             format!(
-                "{}{damaged}: not repairable: {slices} damaged slices, only {reachable} recovery blocks reachable",
-                set.name
+                "{name}{damaged}: not repairable: {slices} damaged slices, only {reachable} recovery blocks reachable"
             )
-        })
-        .collect::<Vec<_>>();
+        };
+        // An object that says set by set is worded set by set: each short
+        // set by the name it was posted under, over the damaged members it
+        // binds and those no short set of the object binds.
+        match set.short.as_ref().filter(|short| !short.sets.is_empty()) {
+            Some(short) => described.extend(short.sets.iter().map(|one| {
+                let names = damaged_names(namespace, set.node, |member| {
+                    one.members.contains(&member)
+                        || !short
+                            .sets
+                            .iter()
+                            .any(|other| other.members.contains(&member))
+                });
+                worded(
+                    one.name.as_deref().unwrap_or(&set.name),
+                    one.damaged,
+                    one.reachable,
+                    names,
+                )
+            })),
+            None => described.push(worded(
+                &set.name,
+                *slices,
+                *reachable,
+                damaged_names(namespace, set.node, |_| true),
+            )),
+        }
+    }
     let message = format!(
         "{} recovery failed for {} set(s): {}",
         kinds.into_iter().collect::<Vec<_>>().join("/"),
-        failed.len(),
+        described.len(),
         described.join("; ")
     );
     Some(Failure {
@@ -301,15 +338,25 @@ pub(crate) fn ruled_short(job: &GraphJob) -> Option<Failure> {
     let tree = job.tree();
     let writer = job.writer();
     let sets = tree.recovery_nodes(NodeId::ROOT);
+    // A failed object that says set by set leaves short only what its short
+    // sets bind; a member another of its sets binds may still come whole.
+    let failed: Vec<&SetSummary> = summary
+        .sets
+        .iter()
+        .filter(|set| failure.objects.contains(&set.node))
+        .collect();
     let may_come_whole = job
         .namespace()
         .members()
         .filter(|member| !writer.carries_recovery(tree, NodeId::ROOT, member.id))
         .any(|member| {
             member.coverage.damaged_ranges().next().is_none()
-                || writer
-                    .covering(tree, &sets, member.id)
-                    .any(|set| !failure.objects.contains(&set))
+                || writer.covering(tree, &sets, member.id).any(|set| {
+                    failed
+                        .iter()
+                        .find(|failed| failed.node == set)
+                        .is_none_or(|failed| !failed.leaves_short(member.id, || true))
+                })
                 || may_come_whole_below(tree, NodeId::ROOT, member.id)
         });
     (!may_come_whole).then_some(failure)
@@ -348,7 +395,11 @@ fn label(kind: Kind) -> String {
 
 // The members still carrying damage, as they are written: the set's
 // members, never its own volumes.
-fn damaged_names(namespace: Option<&Namespace>, set: NodeId) -> String {
+fn damaged_names(
+    namespace: Option<&Namespace>,
+    set: NodeId,
+    named: impl Fn(MemberId) -> bool,
+) -> String {
     let Some(namespace) = namespace else {
         return String::new();
     };
@@ -358,6 +409,7 @@ fn damaged_names(namespace: Option<&Namespace>, set: NodeId) -> String {
         .collect();
     members
         .into_iter()
+        .filter(|member| named(*member))
         .filter_map(|member| namespace.get(member))
         .filter(|member| member.bound_to != Some(ObjectId(set.0)))
         .map(|member| member.output_name.as_str())
