@@ -354,7 +354,7 @@ impl TorrentService {
     // written beside it keeps it, and the ledger and peers as they stand.
     pub(super) async fn completed(&self, job_id: JobId) {
         let now = self.inner.clock.unix_ms();
-        let (landing, downloaded) = {
+        let (landing, downloaded, finished) = {
             let mut live = self.inner.live.lock().await;
             let Some(torrent) = live.get_mut(&job_id) else {
                 return;
@@ -364,13 +364,24 @@ impl TorrentService {
             }
             torrent.settle(now);
             let was_seeding = torrent.seeding();
-            // Its download finished in this run only if it downloaded in
-            // this run: one added with its data in place, or restored with
-            // nothing left to fetch, did not (qBittorrent marks a torrent
-            // finished after its check, or added in seed mode, without
-            // `torrentFinished`; libtorrent sends `completed` only for a run
-            // that began short of a seed).
+            // What it held to download in this run goes back only if it
+            // downloaded in this run.
             let downloaded = torrent.counters.downloaded_bytes > torrent.downloaded_at_start;
+            // Its finish is told as qBittorrent runs its program on finish:
+            // for every torrent that becomes finished, one added with its
+            // data in place and checked whole or wanting no file among them
+            // (libtorrent `files_checked` calls `finished()`, which posts
+            // `torrent_finished_alert`, before `torrent_checked_alert`,
+            // torrent.cpp:8805-8824, 8839 and 11953-11957 at v2.0.15), but
+            // not one added in seed mode, which is finished from its add
+            // (qBittorrent `SessionImpl::initLoadTorrentParams`,
+            // sessionimpl.cpp:2844, and `TorrentImpl::handleTorrentFinished`,
+            // torrentimpl.cpp:2194-2198). One restored complete never gets
+            // here. One reopened finishes again in qBittorrent
+            // (`prioritizeFiles`, torrentimpl.cpp:3045-3057), but the script
+            // queue admits one end of a job's download and no second
+            // (`drain_admissions`), so its second finish is not run.
+            let finished = !torrent.record.seed_mode;
             torrent.record.completed_at_ms = Some(now);
             // It seeds now: its slot and rank go to the torrents after it.
             // One that seeded already, as a seed-mode add does, held none.
@@ -387,6 +398,7 @@ impl TorrentService {
                     torrent.record.move_to.take(),
                 ),
                 downloaded,
+                finished,
             )
         };
         let (landing, move_to) = landing;
@@ -411,7 +423,7 @@ impl TorrentService {
             }
         }
         // Raised where its files now are, once any move is over.
-        if downloaded {
+        if finished {
             let live = self.inner.live.lock().await;
             if let Some(torrent) = live.get(&job_id) {
                 self.raise_script_event(torrent, QueueEvent::TorrentDownloaded, &[]);
