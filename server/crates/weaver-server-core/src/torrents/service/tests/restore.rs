@@ -779,16 +779,34 @@ async fn a_torrent_stopped_part_way_restarts_with_its_pieces() {
     resumes_with_its_pieces(fetched).await;
 }
 
-// As a clean stop, a crash: the checkpoint the last tick wrote is all the
-// restart has, and it has every piece the torrent had by then.
+// As a clean stop, a crash: the checkpoint written by then is all the
+// restart has, and it has every piece the torrent had. The torrent
+// completed with the files it wants, and the settle that completed it wrote
+// that checkpoint; a tick after writes any it still owes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_torrent_that_crashed_part_way_restarts_with_its_pieces() {
     let fetched = partly_fetched().await;
-    let written = fetched.rig.service.written();
-    let before = written.borrow().checkpoints;
     fetched.rig.service.tick().await;
     fetched.rig.service.restored().await;
-    assert!(written.borrow().checkpoints > before);
+    let (service, db, job_id) = (&fetched.rig.service, &fetched.rig.db, fetched.job_id);
+    service
+        .inner
+        .settled
+        .subscribe()
+        .wait_for(|_| {
+            db.get_torrent(job_id)
+                .unwrap()
+                .unwrap()
+                .completed_at_ms
+                .is_some()
+                && !service
+                    .inner
+                    .settling
+                    .load(std::sync::atomic::Ordering::SeqCst)
+        })
+        .await
+        .unwrap();
+    assert_eq!(kept_pieces(db, job_id), 3);
     // The process ends here: its sessions go with it, and nothing else is
     // written.
     fetched.rig.service.inner.sessions.stop_all().await;
