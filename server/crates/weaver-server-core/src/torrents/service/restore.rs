@@ -2177,7 +2177,7 @@ impl TorrentService {
                     Vec::new()
                 });
                 let unpack = self.describe(&mut torrent, &parsed, levels);
-                torrent.kept(row.failure, kept.as_ref().and_then(Option::as_ref));
+                torrent.kept(kept.as_ref().and_then(Option::as_ref));
                 torrent.kept_at_boot = kept;
                 torrent.stamps_at_boot = Some(stamps);
                 if torrent.record.seed_mode {

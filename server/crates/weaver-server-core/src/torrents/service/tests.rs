@@ -28,6 +28,7 @@ use crate::settings::{Client, Leaf, Level, Seeding, SeedingPolicy, TorrentConfig
 use crate::settings::{SeedingAction, SeedingGoalMode};
 use crate::torrents::TrackerStatus;
 use crate::torrents::admission::Refusal;
+use crate::torrents::metrics::TorrentEvent;
 use crate::torrents::metrics::TorrentSeries;
 use crate::torrents::persistence::HistoryFile;
 use crate::torrents::sessions::Routes;
@@ -38,6 +39,7 @@ use crate::torrents::sessions::tests::{
 use crate::torrents::storage::PieceStorage;
 use crate::torrents::storage::Pieces;
 use crate::torrents::{ContentLayout, TorrentSource, TorrentTracker};
+use crate::torrents::{UnpackEnd, UnpackResult};
 use bytes::Bytes;
 use weaver_torrent::api::TorrentIdOrHash;
 use weaver_torrent::{ResumePeers, Session, TorrentVersion, TrackerAnnounce};
@@ -988,6 +990,7 @@ fn chain() -> (TorrentRecord, TrackerRule, TorrentSettings) {
     let record = TorrentRecord {
         unpack_in_force: None,
         unpack_over: false,
+        unpack_end: None,
         download_ends: 0,
         job_id: JobId(1),
         infohash_v1: Some([1; 20]),

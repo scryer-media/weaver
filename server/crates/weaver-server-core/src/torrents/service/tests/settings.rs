@@ -761,6 +761,7 @@ fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_defaul
     let mut record = TorrentRecord {
         unpack_in_force: None,
         unpack_over: false,
+        unpack_end: None,
         download_ends: 0,
         job_id: JobId(1),
         infohash_v1: Some([1; 20]),

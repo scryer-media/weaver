@@ -269,8 +269,6 @@ pub struct Observed {
     pub queued: bool,
     /// Who holds it stopped, while a hold does.
     pub paused_by: Option<HoldOrigin>,
-    /// Why unpacking refused the torrent's output, while that stands.
-    pub failed: Option<String>,
     pub held: Option<Held>,
     /// Its directory is being moved; it goes on from the new one.
     pub moving: bool,
@@ -323,7 +321,6 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<Why>) {
             let why = seen
                 .restore_held
                 .clone()
-                .or_else(|| seen.failed.clone())
                 .map(Why::Said)
                 .or_else(|| seen.seeding().then_some(Why::Stated(Stated::GoalMet)));
             return (TorrentState::Stopped, why);
@@ -366,9 +363,9 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<Why>) {
         Engine::Absent => (TorrentState::Queued, None),
         Engine::Starting => (TorrentState::CheckingResumeData, None),
         Engine::Checking => (TorrentState::CheckingFiles, None),
-        // A torrent whose unpacking came up short seeds on, and says why.
+        // A torrent seeds whatever its unpacking came to.
         Engine::Live { .. } | Engine::Paused { .. } if seen.seeding() => {
-            (TorrentState::Seeding, seen.failed.clone().map(Why::Said))
+            (TorrentState::Seeding, None)
         }
         // Waiting for room, it says so as a usenet job does.
         Engine::Live {
@@ -769,7 +766,6 @@ mod tests {
             intent: TorrentIntent::Resumed,
             queued: false,
             paused_by: None,
-            failed: None,
             held: None,
             moving: false,
             restore_held: None,
@@ -1199,30 +1195,6 @@ mod tests {
                 ..seen(Engine::Paused { finished: false })
             }),
             (TorrentState::Queued, Some(Stated::DiskSpace.into()))
-        );
-        assert_eq!(
-            project(&Observed {
-                intent: TorrentIntent::Stopped,
-                complete: true,
-                failed: Some("x.exe has an unwanted extension".into()),
-                ..seen(live.clone())
-            }),
-            (
-                TorrentState::Stopped,
-                Some("x.exe has an unwanted extension".into())
-            )
-        );
-        // A refusal the operator resumed past seeds again, and says why.
-        assert_eq!(
-            project(&Observed {
-                complete: true,
-                failed: Some("x.exe has an unwanted extension".into()),
-                ..seen(live.clone())
-            }),
-            (
-                TorrentState::Seeding,
-                Some("x.exe has an unwanted extension".into())
-            )
         );
         assert_eq!(
             project(&Observed {

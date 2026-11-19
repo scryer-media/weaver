@@ -845,32 +845,6 @@ impl TorrentStore {
         has_files(&self.layout, &self.have().file_have, wanted)
     }
 
-    // The names of the listed files it has whole.
-    // A file set aside with any of its bytes in the side store is not whole
-    // on disk.
-    pub(crate) fn whole_names(&self) -> Vec<String> {
-        let aside = self.aside();
-        // A set, so a torrent of many files and many kept pieces is not
-        // searched once per file.
-        let kept: std::collections::BTreeSet<usize> = self
-            .side()
-            .pieces()
-            .into_iter()
-            .flat_map(|piece| self.layout.spans(piece))
-            .map(|span| span.file)
-            .filter(|file| aside.get(*file).copied().unwrap_or(false))
-            .collect();
-        let have = self.have();
-        self.layout
-            .files()
-            .enumerate()
-            .filter(|(index, file)| {
-                !file.padding && have.file_have[*index] >= file.length && !kept.contains(index)
-            })
-            .map(|(_, file)| file.name.clone())
-            .collect()
-    }
-
     // The piece's shares the tee waits on go to it from the files: the
     // read a restart, or a seed added over files already there, makes to
     // bring it level with the pieces the torrent has. True when it took any.

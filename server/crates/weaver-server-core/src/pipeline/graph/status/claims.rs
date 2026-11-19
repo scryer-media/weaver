@@ -253,47 +253,6 @@ impl Delivery {
         walk.delivery
     }
 
-    // Files that came whole to disk with no tree to walk, such as a
-    // torrent's own files, `posted`, and what its unpacking placed beside
-    // them, `unpacked`, each by the name it is delivered under, read as the
-    // walk reads a whole leaf: one whose name makes it a piece of something
-    // else (`names_a_piece`), an archive volume, a split part or recovery
-    // data, is delivered as it stands and is no usable file; any other is
-    // whole. A posted file at the root, its name with no folder, that is
-    // furniture (`root_furniture`) is no file of the delivery, as the walk
-    // leaves a root member that is out; one in a folder, and an unpacked
-    // one, is payload, whatever it is named. A directory is no file.
-    // Its `status` is then every delivery's.
-    pub(crate) fn of_whole_files(
-        posted: impl IntoIterator<Item = String>,
-        unpacked: impl IntoIterator<Item = String>,
-    ) -> Self {
-        let furniture = root_furniture();
-        let names = posted
-            .into_iter()
-            .filter(|name| name.contains(['/', '\\']) || !furniture(name))
-            .chain(unpacked);
-        let mut delivery = Self::default();
-        for name in names {
-            if Leaf::is_directory(&name) {
-                continue;
-            }
-            let whole = !crate::pipeline::post_health::names_a_piece(&name);
-            delivery.deliver(
-                Delivered {
-                    from: name.clone(),
-                    name,
-                    depth: 0,
-                    whole,
-                    crc32: None,
-                },
-                None,
-                false,
-            );
-        }
-        delivery
-    }
-
     // One file the delivery hands over: whole, outside every set beside a
     // set that vouched (`unchecked`), never arrived under a name that says
     // nothing (`unarrived`), or as it stands.
@@ -549,15 +508,6 @@ struct Walk<'t, F, R> {
     // Every volume of a set opens the same namespace; it is read once.
     opened: BTreeSet<NodeId>,
     delivery: Delivery,
-}
-
-// Whether a file posted at the root of a job, by its name, is furniture
-// beside the payload (an `.nfo`, an `.sfv` and their relatives, by the
-// extension list in force, read once here): the rule an NZB job's walk drops
-// root members by, and the one a torrent's own files are read by too.
-pub(crate) fn root_furniture() -> impl Fn(&str) -> bool {
-    let ignore = crate::pipeline::completion::finalize::check::configured_par2_ignore_extensions();
-    move |name| crate::pipeline::completion::finalize::check::par2_damage_ignorable(name, &ignore)
 }
 
 impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> Described> Walk<'_, F, R> {

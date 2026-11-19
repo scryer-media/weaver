@@ -31,7 +31,6 @@ use crate::persistence::Database;
 use crate::pipeline::ExtractionLimits;
 use crate::pipeline::graph::engine::{DecodePool, Outside, RunMail, Said};
 use crate::pipeline::graph::status::RepairSlots;
-use crate::pipeline::graph::status::{Delivery, Failure};
 use crate::scratch::ScratchLedger;
 use crate::settings::model::{TrackerCertificate, TrackerRule, tracker_rule_for};
 use crate::settings::{Config, TorrentEncryption, TransportRule};
@@ -935,9 +934,6 @@ struct Inner {
     // latest, and does nothing.
     history_turns: Mutex<HashMap<JobId, u64>>,
     next_history_turn: AtomicU64,
-    // Counts the waiters on a history row kept for room that have ended.
-    #[cfg(test)]
-    history_waits: watch::Sender<u64>,
     queue: Mutex<Option<SchedulerHandle>>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     tick: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -1073,8 +1069,6 @@ impl TorrentService {
                 retiring: Mutex::default(),
                 history_turns: Mutex::default(),
                 next_history_turn: AtomicU64::new(0),
-                #[cfg(test)]
-                history_waits: watch::channel(0).0,
                 queue: Mutex::new(None),
                 tasks: Mutex::new(Vec::new()),
                 tick: Mutex::new(None),
@@ -1766,24 +1760,6 @@ fn unplaced(work: &Path, error: &impl std::fmt::Display) -> String {
         "the unpacked files could not be placed beside the torrent's files ({error}); they are kept in {}",
         work.display()
     )
-}
-
-// How a torrent's job ends when unpacking left it short of what it would
-// deliver, from its own files it has whole, `own`, and the files unpacking
-// placed beside them, `unpacked` (AGENTS.md, "Job status: Partial"): as a
-// graph job's delivery ends (`Delivery::status`), the one judgement both
-// kinds of job take. Partial when one of them is a usable end file, failed
-// for `why` when none is. An archive volume, a split part and recovery data
-// are never usable files, whole or not, and an own file that is furniture
-// is no file of the delivery, as an NZB job's root furniture is not.
-fn short_status(own: &[String], unpacked: &[String], why: &str) -> JobStatus {
-    let failure = Failure {
-        objects: Vec::new(),
-        message: why.to_owned(),
-        rejection: None,
-        from_feed: false,
-    };
-    Delivery::of_whole_files(own.iter().cloned(), unpacked.iter().cloned()).status(Some(&failure))
 }
 
 // The bytes in hand of the files that go to disk: the progress over the

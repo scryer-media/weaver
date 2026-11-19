@@ -11,7 +11,7 @@ use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx};
 use crate::settings::SeedingPolicy;
 use crate::settings::model::tracker_host;
-use crate::torrents::model::{HistoryEnd, file_priorities_str, named_by_str};
+use crate::torrents::model::{HistoryEnd, UnpackEnd, file_priorities_str, named_by_str};
 use crate::torrents::queries::{TORRENT_COLUMNS, count, counters_from_row, torrent_by_infohash_tx};
 use crate::torrents::store::Kept;
 use crate::torrents::{
@@ -1347,7 +1347,44 @@ fn torrent_args(
         SqlArg::Bool(torrent.private),
         SqlArg::Bool(torrent.unpack_over),
         SqlArg::I64(stored(torrent.download_ends)?),
+        SqlArg::OptText(
+            torrent
+                .unpack_end
+                .as_ref()
+                .map(|end| end.result.as_str().to_owned()),
+        ),
+        SqlArg::OptText(torrent.unpack_end.as_ref().and_then(|end| end.why.clone())),
     ])
+}
+
+// The values that mark a torrent's unpacking over as `end`: whether it is
+// over, how it came out and why, in that order.
+fn unpack_end_args(end: &UnpackEnd) -> Vec<SqlArg> {
+    vec![
+        SqlArg::Bool(true),
+        SqlArg::Text(end.result.as_str().to_owned()),
+        SqlArg::OptText(end.why.clone()),
+    ]
+}
+
+// The write a checkpoint owes a torrent whose unpacking is over: its mark,
+// with how it came out when that is known.
+fn unpack_over_update(end: Option<&UnpackEnd>, id: i64) -> (&'static str, Vec<SqlArg>) {
+    match end {
+        Some(end) => {
+            let mut args = unpack_end_args(end);
+            args.push(SqlArg::I64(id));
+            (
+                "UPDATE torrents SET unpack_over = {}, unpack_end = {}, unpack_why = {} \
+                 WHERE job_id = {}",
+                args,
+            )
+        }
+        None => (
+            "UPDATE torrents SET unpack_over = {} WHERE job_id = {}",
+            vec![SqlArg::Bool(true), SqlArg::I64(id)],
+        ),
+    }
 }
 
 impl Database {
@@ -1609,12 +1646,27 @@ impl Database {
         })
     }
 
-    // The torrent's unpacking is over: the mark an unpacking that ended
-    // short, with no placing written, keeps. Returns whether the torrent
-    // exists.
-    pub fn set_torrent_unpack_over(&self, job_id: JobId) -> Result<bool, StateError> {
-        let args = vec![SqlArg::Bool(true), SqlArg::I64(stored(job_id.0)?)];
-        self.set_torrent_column("unpack_over", args)
+    // The torrent's unpacking is over, as `end` says it came out: the mark
+    // an unpacking that ended with no placing written keeps. Returns
+    // whether the torrent exists.
+    pub fn set_torrent_unpack_end(
+        &self,
+        job_id: JobId,
+        end: &UnpackEnd,
+    ) -> Result<bool, StateError> {
+        let mut args = unpack_end_args(end);
+        args.push(SqlArg::I64(stored(job_id.0)?));
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let changed = SqlRuntime::execute(
+                datastore.write_exec(),
+                "UPDATE torrents SET unpack_over = {}, unpack_end = {}, unpack_why = {} \
+                 WHERE job_id = {}",
+                &args,
+            )
+            .await?;
+            Ok(changed > 0)
+        })
     }
 
     // The torrent's files' levels, when it completed, its place in the
@@ -1707,11 +1759,14 @@ impl Database {
         stamps: &[(u32, Option<i64>)],
         counters: Option<&TorrentCounters>,
         peers: Option<&ResumePeers>,
-        row: Option<(u64, bool)>,
+        row: Option<(u64, bool, Option<UnpackEnd>)>,
     ) -> Result<(), StateError> {
         let id = stored(job_id.0)?;
         let row = row
-            .map(|(ends, over)| Ok::<_, StateError>((stored(ends)?, over)))
+            .map(|(ends, over, end)| {
+                let over = over.then(|| unpack_over_update(end.as_ref(), id));
+                Ok::<_, StateError>((stored(ends)?, over))
+            })
             .transpose()?;
         let resume = resume_update(job_id, counters, peers)?;
         let pieces = pieces.map(|kept| {
@@ -1738,6 +1793,7 @@ impl Database {
             SqlRuntime::run_in_transaction(&datastore, "save_torrent_checkpoint", |tx| {
                 let pieces = pieces.clone();
                 let resume = resume.clone();
+                let row = row.clone();
                 let (timed, untimed) = (timed.clone(), untimed.clone());
                 Box::pin(async move {
                     if let Some(args) = &pieces {
@@ -1752,19 +1808,16 @@ impl Database {
                     if let Some((sql, args)) = &resume {
                         tx.execute(sql, args).await?;
                     }
-                    if let Some((ends, over)) = row {
+                    if let Some((ends, over)) = &row {
+                        let ends = *ends;
                         tx.execute(
                             "UPDATE torrents SET download_ends = CASE WHEN download_ends < {} \
                              THEN {} ELSE download_ends END WHERE job_id = {}",
                             &[SqlArg::I64(ends), SqlArg::I64(ends), SqlArg::I64(id)],
                         )
                         .await?;
-                        if over {
-                            tx.execute(
-                                "UPDATE torrents SET unpack_over = {} WHERE job_id = {}",
-                                &[SqlArg::Bool(true), SqlArg::I64(id)],
-                            )
-                            .await?;
+                        if let Some((sql, args)) = over {
+                            tx.execute(sql, args).await?;
                         }
                     }
                     Ok(())
@@ -1841,22 +1894,23 @@ impl Database {
         outputs: &[String],
         dropped: &[String],
         held: &[String],
+        end: &UnpackEnd,
     ) -> Result<(), StateError> {
         let id = stored(job_id.0)?;
         let outputs = self.outputs_with(job_id, outputs, dropped)?;
         let held = held.to_vec();
+        let mut args = vec![SqlArg::OptText(outputs)];
+        args.extend(unpack_end_args(end));
+        args.push(SqlArg::I64(id));
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "finish_torrent_unpack", |tx| {
-                let (outputs, held) = (outputs.clone(), held.clone());
+                let (args, held) = (args.clone(), held.clone());
                 Box::pin(async move {
                     tx.execute(
-                        "UPDATE torrents SET outputs = {}, unpack_over = {} WHERE job_id = {}",
-                        &[
-                            SqlArg::OptText(outputs),
-                            SqlArg::Bool(true),
-                            SqlArg::I64(id),
-                        ],
+                        "UPDATE torrents SET outputs = {}, unpack_over = {}, unpack_end = {}, \
+                         unpack_why = {} WHERE job_id = {}",
+                        &args,
                     )
                     .await?;
                     insert_held_tx(tx, id, &held).await?;

@@ -799,6 +799,7 @@ fn stored_torrents(db: &Database, count: u64) {
             unpack: None,
             unpack_in_force: None,
             unpack_over: false,
+            unpack_end: None,
             download_ends: 0,
             metadata: Vec::new(),
             upload_limit: job_id.is_multiple_of(7).then_some(4096),

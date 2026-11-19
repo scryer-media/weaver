@@ -1322,7 +1322,6 @@ async fn a_checkpoint_the_database_fails_to_read_holds_the_restore_until_it_read
         let live = again.inner.live.lock().await;
         let torrent = &live[&job_id];
         assert!(torrent.store.is_none());
-        assert!(torrent.failed.is_none());
         assert!(
             matches!(
                 &torrent.observed(Engine::Absent).engine,
@@ -1586,9 +1585,9 @@ async fn a_restart_has_no_piece_its_file_lost() {
 
 // A tee's checkpoint that the database refuses for good does not hold the
 // torrent's writes up for ever: as a job of the pipeline pauses for one,
-// the torrent's unpacking ends for it, said in its history, the checkpoint
-// is let go, and the writes behind it, the torrent's own and a flush of
-// every write, go through.
+// the torrent's unpacking ends refused for it, said on its unpacking line
+// and nowhere of the torrent's, the checkpoint is let go, and the writes
+// behind it, the torrent's own and a flush of every write, go through.
 #[tokio::test]
 async fn a_checkpoint_the_database_refuses_ends_unpacking_and_holds_no_write_up() {
     use crate::persistence::sql_runtime::SqlRuntime;
@@ -1659,23 +1658,42 @@ async fn a_checkpoint_the_database_refuses_ends_unpacking_and_holds_no_write_up(
             )
             .unwrap();
     }
-    let mut published = rig.service.inner.published.subscribe();
+    // Every settle is counted, the one that ends the unpacking among them:
+    // the torrent's queue row does not change for it.
+    let mut settles = rig.service.inner.settled.subscribe();
     storage.on_piece_completed(index).unwrap();
     save_with_tee(&rig.service, job_id).await;
 
-    published
-        .wait_for(|_| rig.db.get_job_history(job_id.0).unwrap().is_some())
+    settles
+        .wait_for(|_| {
+            rig.db
+                .get_torrent(job_id)
+                .unwrap()
+                .unwrap()
+                .unpack_end
+                .is_some()
+        })
         .await
         .unwrap();
-    let history = rig.db.get_job_history(job_id.0).unwrap().unwrap();
+    let end = rig
+        .db
+        .get_torrent(job_id)
+        .unwrap()
+        .unwrap()
+        .unpack_end
+        .unwrap();
+    assert_eq!(end.result, UnpackResult::Refused);
     assert!(
-        history
-            .error_message
+        end.why
             .as_deref()
             .unwrap()
             .contains("Checkpoint could not be persisted"),
-        "{history:?}"
+        "{end:?}"
     );
+    assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_ne!(view.state, TorrentState::Stopped);
+    assert_eq!(view.detail, None);
     save_with_tee(&rig.service, job_id).await;
     rig.db.flush_write_queue().await.unwrap();
     assert!(rig.service.torrent(job_id).await.is_some());
@@ -1700,20 +1718,40 @@ async fn an_unpacking_run_again_keeps_the_files_the_first_one_placed() {
         .await
         .unwrap();
     rig.db
-        .finish_torrent_unpack(job_id, &["small.txt".to_owned()], &[], &[])
+        .finish_torrent_unpack(
+            job_id,
+            &["small.txt".to_owned()],
+            &[],
+            &[],
+            &UnpackEnd::whole(),
+        )
         .unwrap();
-    rig.db.finish_torrent_unpack(job_id, &[], &[], &[]).unwrap();
+    rig.db
+        .finish_torrent_unpack(
+            job_id,
+            &[],
+            &[],
+            &[],
+            &UnpackEnd::short(false, "none".into()),
+        )
+        .unwrap();
     rig.db
         .finish_torrent_unpack(
             job_id,
             &["small.txt".to_owned(), "notes.txt".to_owned()],
             &[],
             &[],
+            &UnpackEnd::short(true, "damaged: x".into()),
         )
         .unwrap();
     assert_eq!(
         rig.db.torrent_outputs(job_id).unwrap(),
         ["small.txt", "notes.txt"]
+    );
+    // How it came out is the last placing's, as the row reads back.
+    assert_eq!(
+        rig.db.get_torrent(job_id).unwrap().unwrap().unpack_end,
+        Some(UnpackEnd::short(true, "damaged: x".into()))
     );
     rig.service.stop().await;
 }

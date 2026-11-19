@@ -4,6 +4,7 @@
 use async_graphql::{ComplexObject, Context, Enum, InputObject, Result, SimpleObject};
 use weaver_server_core::auth::CallerScope;
 use weaver_server_core::jobs::handle::HoldOrigin;
+use weaver_server_core::jobs::ids::JobId;
 use weaver_server_core::proxies::{TorrentRouteFault, TorrentScope};
 use weaver_server_core::settings::Seeding;
 use weaver_server_core::torrents::net::Exposure;
@@ -15,7 +16,8 @@ use weaver_server_core::torrents::sessions::{PortMapped, PortmapProtocol, Portma
 use weaver_server_core::torrents::status::Stated;
 use weaver_server_core::torrents::{
     ConnectionKind, Encryption, FetchPhase, FilePriority, NamedBy, PeerInfo, PeerSourceFlag,
-    TorrentState, TorrentTracker, TorrentVersion, TrackerStatus, redacted_tracker_url,
+    TorrentState, TorrentTracker, TorrentVersion, TrackerStatus, UnpackEnd, UnpackResult,
+    UnpackedFile, redacted_tracker_url,
 };
 
 use crate::networking::ResolvedBy;
@@ -586,7 +588,79 @@ pub struct TorrentTrackerInput {
     pub url: String,
 }
 
+/// How a torrent's unpacking came out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+#[graphql(name = "TorrentUnpackResult")]
+pub enum TorrentUnpackResultGql {
+    /// Everything it would deliver is beside the torrent's files.
+    Whole,
+    /// Some of it is; the reason says what is short.
+    Part,
+    /// Nothing usable was delivered.
+    Failed,
+    /// The unpacking refused the torrent's files.
+    Refused,
+}
+
+impl From<UnpackResult> for TorrentUnpackResultGql {
+    fn from(result: UnpackResult) -> Self {
+        match result {
+            UnpackResult::Whole => Self::Whole,
+            UnpackResult::Part => Self::Part,
+            UnpackResult::Failed => Self::Failed,
+            UnpackResult::Refused => Self::Refused,
+        }
+    }
+}
+
+/// A torrent's unpacking, once over. It is the unpacking's own: the
+/// torrent's state, history and counters never read it.
 #[derive(Clone, Debug, SimpleObject)]
+#[graphql(name = "TorrentUnpacking", complex)]
+pub struct TorrentUnpackingGql {
+    #[graphql(skip)]
+    pub id: u64,
+    pub result: TorrentUnpackResultGql,
+    /// Why it is short of whole.
+    pub reason: Option<String>,
+}
+
+#[ComplexObject]
+impl TorrentUnpackingGql {
+    /// The files it placed beside the torrent's own, which the torrent's
+    /// file list shows after them: read from the torrent's row and disk
+    /// only when asked for.
+    async fn files(&self, ctx: &Context<'_>) -> Result<Vec<TorrentUnpackedFileGql>> {
+        Ok(super::service(ctx)?
+            .unpacked_files(JobId(self.id))
+            .await
+            .map_err(super::mutation::action_error)?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+}
+
+/// A file a torrent's unpacking placed beside the torrent's own: no piece
+/// of the torrent, so it has no index, level or progress of its own.
+#[derive(Clone, Debug, SimpleObject)]
+#[graphql(name = "TorrentUnpackedFile")]
+pub struct TorrentUnpackedFileGql {
+    pub path: String,
+    pub length: u64,
+}
+
+impl From<UnpackedFile> for TorrentUnpackedFileGql {
+    fn from(file: UnpackedFile) -> Self {
+        Self {
+            path: file.name,
+            length: file.length,
+        }
+    }
+}
+
+#[derive(Clone, Debug, SimpleObject)]
+#[graphql(complex)]
 pub struct Torrent {
     pub id: u64,
     pub name: String,
@@ -680,6 +754,21 @@ pub struct Torrent {
     /// Whether each file's first and last pieces are fetched first.
     pub first_last_piece_first: bool,
     pub trackers: Vec<TorrentTrackerGql>,
+    #[graphql(skip)]
+    pub unpack_end: Option<UnpackEnd>,
+}
+
+#[ComplexObject]
+impl Torrent {
+    /// How its unpacking came out, once over; absent while it runs, and for
+    /// a torrent with nothing to unpack.
+    async fn unpacking(&self) -> Option<TorrentUnpackingGql> {
+        self.unpack_end.as_ref().map(|end| TorrentUnpackingGql {
+            id: self.id,
+            result: end.result.into(),
+            reason: end.why.clone(),
+        })
+    }
 }
 
 /// What a `torrentUpdates` push carries.
@@ -783,6 +872,7 @@ impl From<TorrentView> for Torrent {
             sequential: view.sequential,
             first_last_piece_first: view.first_last_piece_first,
             trackers: view.trackers.into_iter().map(Into::into).collect(),
+            unpack_end: view.unpack_end,
         }
     }
 }

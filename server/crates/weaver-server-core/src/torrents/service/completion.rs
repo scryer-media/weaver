@@ -6,9 +6,7 @@ use super::policy::goal_met;
 use super::retire::{held_tops, resolved};
 #[cfg(test)]
 use super::{COMPLETION_FAILS, KEEP_FAILS, OUTPUT_MEETS, PLACE_PANICS, UNPACK_OVER_FAILS, locked};
-use super::{
-    MemoryRelease, TorrentService, hashes_of, report, short_status, unpacking_dir, unplaced,
-};
+use super::{MemoryRelease, TorrentService, unpacking_dir, unplaced};
 use crate::StateError;
 use crate::jobs::JobId;
 use crate::jobs::model::JobStatus;
@@ -17,7 +15,7 @@ use crate::post_processing::model::QueueEvent;
 use crate::runtime::fs::JobMoves;
 use crate::runtime::panic_trap::JobScope;
 use crate::torrents::metrics::TorrentEvent;
-use crate::torrents::model::HistoryEnd;
+use crate::torrents::model::UnpackEnd;
 use crate::torrents::relocate::Existing;
 use crate::torrents::store::TorrentStore;
 use crate::torrents::tee::{Tee, place_outputs, remove_unwanted_outputs};
@@ -94,7 +92,8 @@ impl TorrentService {
     // torrent. It waits while its job still uses its storage, so the next
     // settle asks again. Files it could not place are never removed for
     // it: they stay in its directory, which stays, and it ends short with
-    // the ones it did place.
+    // the ones it did place. How it came out is the unpacking's own, kept
+    // on the row in the same write: the torrent never reads it.
     pub(super) async fn unpacked(
         &self,
         job_id: JobId,
@@ -205,17 +204,44 @@ impl TorrentService {
                     .await;
             }
         };
+        // What the policy left out, worded as the job's reason; a file it
+        // could not remove stays where unpacking made it, and says why.
+        let removed = match removed {
+            Ok(removed) => crate::post_processing::model::unwanted_files_removed_reason(&removed),
+            Err(why) => Some(why),
+        };
+        // How it came out: short when a file did not move beside the
+        // torrent's, or the delivery was in part, or the policy left a file
+        // out; whole otherwise.
+        let placed_any = !placed.names.is_empty();
+        let end = match placed.failed.as_ref().map(ToString::to_string) {
+            Some(error) => {
+                tracing::warn!(job_id = job_id.0, error = %error, "a torrent's unpacked files did not all move beside it");
+                let why = unplaced(&work, &error);
+                UnpackEnd::short(
+                    placed_any,
+                    match removed {
+                        Some(removed) => format!("{why}; {removed}"),
+                        None => why,
+                    },
+                )
+            }
+            None => match part.or(removed) {
+                Some(why) => UnpackEnd::short(placed_any, why),
+                None => UnpackEnd::whole(),
+            },
+        };
         // The one write of this placing, after its moves: the row keeps
-        // exactly the names of the files it moved, what the torrent holds
-        // gains them, and the job's checkpoint goes.
+        // exactly the names of the files it moved and how it came out, what
+        // the torrent holds gains them, and the job's checkpoint goes.
         let (names, gone) = (placed.names.clone(), placed.gone.clone());
-        let failed = placed.failed.as_ref().map(ToString::to_string);
+        let ending = end.clone();
         let recorded = self.queue_save(job_id, "finish_torrent_unpack", move |db| {
             #[cfg(test)]
             if KEEP_FAILS.swap(false, std::sync::atomic::Ordering::AcqRel) {
                 return Err(StateError::Database("refused".to_owned()));
             }
-            db.finish_torrent_unpack(job_id, &names, &gone, &held)
+            db.finish_torrent_unpack(job_id, &names, &gone, &held, &ending)
         });
         let recorded = match recorded.await {
             Ok(Ok(())) => Ok(()),
@@ -238,32 +264,12 @@ impl TorrentService {
             .unwrap_or_default();
             return self.not_placed(job_id, &work, &error, gone, there).await;
         }
-        self.unpack_over(job_id).await;
+        self.unpack_over(job_id, end.clone()).await;
         self.unclaim_outputs(job_id).await;
-        // What the policy left out, worded as the job's reason; a file it
-        // could not remove stays where unpacking made it, and says why.
-        let removed = match removed {
-            Ok(removed) => crate::post_processing::model::unwanted_files_removed_reason(&removed),
-            Err(why) => Some(why),
-        };
-        if let Some(error) = failed {
-            tracing::warn!(job_id = job_id.0, error = %error, "a torrent's unpacked files did not all move beside it");
-            let why = unplaced(&work, &error);
-            return Placing::Short {
-                why: match removed {
-                    Some(removed) => format!("{why}; {removed}"),
-                    None => why,
-                },
-                placed: placed.names,
-            };
-        }
-        // A delivery in part says what it lacks, what the policy left out
-        // among it.
-        if let Some(why) = part.or(removed) {
-            return Placing::Short {
-                why,
-                placed: placed.names,
-            };
+        // Its folder stays while anything in it is short: a file that did
+        // not move is there.
+        if end.why.is_some() {
+            return Placing::Ended(end);
         }
         let root = self.inner.env.work.clone();
         let removed = tokio::task::spawn_blocking(move || {
@@ -275,7 +281,7 @@ impl TorrentService {
         {
             tracing::warn!(job_id = job_id.0, error = %error, "could not remove a torrent's unpacking directory");
         }
-        Placing::Placed
+        Placing::Ended(end)
     }
 
     // No output is on the row for this placing: the row lets go of
@@ -291,17 +297,16 @@ impl TorrentService {
         there: Vec<String>,
     ) -> Placing {
         tracing::warn!(job_id = job_id.0, error = %error, "a torrent's unpacked files were not placed");
+        let end = UnpackEnd::short(!there.is_empty(), unplaced(work, &error));
+        let ending = end.clone();
         let recorded = self.queue_save(job_id, "finish_torrent_unpack", move |db| {
-            db.finish_torrent_unpack(job_id, &[], &dropped, &[])
+            db.finish_torrent_unpack(job_id, &[], &dropped, &[], &ending)
         });
         if self.recorded(job_id, recorded.await) {
-            self.unpack_over(job_id).await;
+            self.unpack_over(job_id, end.clone()).await;
         }
         self.unclaim_outputs(job_id).await;
-        Placing::Short {
-            why: unplaced(work, &error),
-            placed: there,
-        }
+        Placing::Ended(end)
     }
 
     // Unpacking delivered no usable file whole: nothing it made is placed,
@@ -333,17 +338,16 @@ impl TorrentService {
                 tracing::warn!(job_id = job_id.0, error = %error, "a torrent's unwanted unpacked files were not all removed");
             }
         }
+        let end = UnpackEnd::short(false, why);
+        let ending = end.clone();
         let recorded = self.queue_save(job_id, "finish_torrent_unpack", move |db| {
-            db.finish_torrent_unpack(job_id, &[], &[], &[])
+            db.finish_torrent_unpack(job_id, &[], &[], &[], &ending)
         });
         if self.recorded(job_id, recorded.await) {
-            self.unpack_over(job_id).await;
+            self.unpack_over(job_id, end.clone()).await;
         }
         self.unclaim_outputs(job_id).await;
-        Placing::Short {
-            why,
-            placed: Vec::new(),
-        }
+        Placing::Ended(end)
     }
 
     // Whether the placing was written.
@@ -368,12 +372,13 @@ impl TorrentService {
         }
     }
 
-    // Its unpacking is over, as the placing written for it keeps on its
-    // row (`finish_torrent_unpack`).
-    async fn unpack_over(&self, job_id: JobId) {
+    // Its unpacking is over, as `end` says, as the placing written for it
+    // keeps on its row (`finish_torrent_unpack`).
+    async fn unpack_over(&self, job_id: JobId, end: UnpackEnd) {
         let _ = self
             .with_torrent(job_id, |torrent| {
                 torrent.record.unpack_over = true;
+                torrent.record.unpack_end = Some(end);
                 Ok(())
             })
             .await;
@@ -561,14 +566,18 @@ impl TorrentService {
         }
     }
 
-    // Its unpacking is over, short: one whose placing was not written, as
-    // when the tee refused, keeps the mark in a write of its own, so a
-    // reopen of it in this run or after a restart does not unpack again.
-    // A mark whose write failed stays owed to the torrent's checkpoints,
-    // which write it until one lands. Its store lets go of its tee.
-    async fn ended_short(&self, job_id: JobId) {
+    // Its unpacking is over, as `end` says: one whose placing was not
+    // written, as when the tee refused, keeps the mark and how it came out
+    // in a write of its own, so a reopen of it in this run or after a
+    // restart does not unpack again. A mark whose write failed stays owed
+    // to the torrent's checkpoints, which write it until one lands. Its
+    // store lets go of its tee. The torrent never reads how its unpacking
+    // came out: it downloads, completes and seeds as one with nothing to
+    // unpack does.
+    pub(super) async fn unpack_ended(&self, job_id: JobId, end: UnpackEnd) {
         let marks = self
             .with_torrent(job_id, |torrent| {
+                torrent.record.unpack_end = Some(end.clone());
                 Ok(!std::mem::replace(&mut torrent.record.unpack_over, true))
             })
             .await;
@@ -578,7 +587,7 @@ impl TorrentService {
                 if UNPACK_OVER_FAILS.swap(false, std::sync::atomic::Ordering::AcqRel) {
                     return Err(StateError::Database("refused".to_owned()));
                 }
-                db.set_torrent_unpack_over(job_id).map(|_| ())
+                db.set_torrent_unpack_end(job_id, &end).map(|_| ())
             });
             let failed = match marked.await {
                 Ok(Ok(())) => None,
@@ -602,60 +611,15 @@ impl TorrentService {
         }
         self.let_go_of_tee(job_id).await;
     }
-
-    // Unpacking ended short of what it would deliver, on a torrent with
-    // every file it wants: the torrent completes and seeds on to its goal,
-    // saying `why`, and its job goes to history as what it delivered says
-    // (`short_status`): its files it has whole and the unpacked files
-    // `placed` beside them.
-    pub(super) async fn short(
-        &self,
-        job_id: JobId,
-        store: &TorrentStore,
-        why: String,
-        placed: &[String],
-    ) {
-        self.ended_short(job_id).await;
-        self.completed(job_id).await;
-        let status = short_status(&store.whole_names(), placed, &why);
-        let settings = self.settings();
-        let now = self.inner.clock.unix_ms();
-        let (report, hash) = {
-            let mut live = self.inner.live.lock().await;
-            let Some(torrent) = live.get_mut(&job_id) else {
-                return;
-            };
-            torrent.failed = Some(why.clone());
-            let mut report = report(self.view(&settings, torrent, now), status.clone(), now);
-            // A partial delivery says so before why, as an NZB job's does;
-            // a reason its delivery worded (`shortfall_message`) already
-            // says so.
-            report.shortfall = Some(
-                if status == JobStatus::Partial && !why.contains("delivered in part") {
-                    format!("delivered in part; {why}")
-                } else {
-                    why
-                },
-            );
-            (report, hashes_of(&torrent.record).best())
-        };
-        if matches!(status, JobStatus::Failed { .. }) {
-            self.inner.counters.event(TorrentEvent::Failed);
-        }
-        self.finish(report, HistoryEnd::delivered(&status), hash, now)
-            .await;
-    }
 }
 
 // What placing a torrent's unpacked files came to.
 pub(super) enum Placing {
     // Not yet: the next settle asks again.
     Waits,
-    // Every one is beside the torrent's files.
-    Placed,
-    // Some or all stay where unpacking made them, for `why`; `placed` are
-    // the ones beside the torrent's files.
-    Short { why: String, placed: Vec<String> },
+    // Over, as the end says: whole with every one beside the torrent's
+    // files, or short with why.
+    Ended(UnpackEnd),
 }
 
 // The move every output is placed by: never over what is there.

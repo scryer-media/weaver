@@ -39,8 +39,6 @@ pub(crate) use claims::Claim;
 pub(crate) use claims::Delivered;
 #[cfg(test)]
 pub(crate) use claims::Described;
-#[cfg(test)]
-pub(crate) use claims::root_furniture;
 pub(crate) use claims::{Delivery, Unarrived};
 pub(crate) use seams::{Posted, delivery_of, shortfall_message};
 pub(in crate::pipeline) use seams::{advance, recovery_volume};

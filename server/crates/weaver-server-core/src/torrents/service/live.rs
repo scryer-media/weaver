@@ -144,9 +144,6 @@ pub(super) struct Live {
     pub(super) have_bytes: u64,
     // The pieces it kept, until its store is back.
     pub(super) kept_pieces: u32,
-    // Why unpacking refused it, as its history kept it when it was
-    // restored: a restored job does not say.
-    pub(super) failed: Option<String>,
     // What the boot read of its rows for its first store and its first
     // attach, each taken by the one it is for; a later one reads its row.
     pub(super) kept_at_boot: Option<Option<Kept>>,
@@ -236,7 +233,6 @@ impl Live {
             file_have: Vec::new(),
             have_bytes: 0,
             kept_pieces: 0,
-            failed: None,
             kept_at_boot: None,
             stamps_at_boot: None,
             verified_at_boot: None,
@@ -314,15 +310,13 @@ impl Live {
     }
 
     // What it shows until its store is back, from what was stored: the
-    // pieces it kept, as the store restored from them will have, and the
-    // failure its history keeps.
-    pub(super) fn kept(&mut self, failed: Option<String>, kept: Option<&Kept>) {
+    // pieces it kept, as the store restored from them will have.
+    pub(super) fn kept(&mut self, kept: Option<&Kept>) {
         if let (Some(kept), Some(layout)) = (kept, &self.layout) {
             let (count, file_have) = kept.had(layout);
             self.hold(file_have);
             self.kept_pieces = count;
         }
-        self.failed = failed;
     }
 
     // Fold what the session moved since the last reading into the ledger,
@@ -418,6 +412,7 @@ impl Live {
         OwedRow::taken(
             self.record.download_ends,
             self.record.unpack_over,
+            self.record.unpack_end.as_ref(),
             &self.ledger.row_owed,
         )
     }
@@ -447,16 +442,6 @@ impl Live {
             tracing::warn!(job_id = self.record.job_id.0, error = %error, "a torrent's run did not change");
         }
         self.run_error = result.err().map(|error| format!("{error:#}"));
-    }
-
-    // Why unpacking refused the torrent's output, while that stands: the
-    // job's word, or the one its history keeps.
-    pub(super) fn refusal(&self) -> Option<String> {
-        self.store
-            .as_ref()
-            .and_then(|store| store.tee())
-            .and_then(|tee| tee.refusal())
-            .or_else(|| self.failed.clone())
     }
 
     // A write found no room: the session fetches nothing for the torrent
@@ -662,7 +647,6 @@ impl Live {
             intent: self.record.intent(),
             queued: self.queued,
             paused_by: self.paused_by,
-            failed: self.refusal(),
             held: self.held.clone(),
             moving: self.moving.is_some(),
             restore_held: self.restore_held.clone(),

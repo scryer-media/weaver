@@ -1918,3 +1918,20 @@ kind = "sql"
 file = "migrations/0133_download_end_occurrence/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 134
+description = "a torrent keeps how its unpacking came out"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0134_torrent_unpack_end/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0134_torrent_unpack_end/postgres.sql"
+engine = "postgres"
+scope = "all"

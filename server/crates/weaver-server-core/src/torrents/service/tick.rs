@@ -8,13 +8,13 @@ use crate::categories::model::resolve_category_config;
 use crate::jobs::JobId;
 use crate::proxies::{ResolvedBy, TorrentScope};
 use crate::settings::SeedingPolicy;
-use crate::torrents::FilePriority;
 use crate::torrents::metrics::FetchOutcome;
 use crate::torrents::sessions::{
     OPENING, RouteFailure, RouteKey, RoutePlan, SessionError, SessionView,
 };
 use crate::torrents::status::{Engine, Held};
 use crate::torrents::store::TorrentStore;
+use crate::torrents::{FilePriority, UnpackEnd};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, PoisonError};
 use tokio::sync::watch;
@@ -152,8 +152,9 @@ impl TorrentService {
     }
 
     // What the torrents that spoke did: a write the store could not make
-    // fails its torrent, a refusal found while unpacking stops it, and one
-    // with every file it wants whole, unpacked when it has a tee, completes.
+    // fails its torrent, a refusal found while unpacking ends the unpacking
+    // and nothing of the torrent's, and one with every file it wants whole,
+    // unpacked when it has a tee, completes.
     // A tee whose moves wait on a checkpoint has it written, and a torrent
     // whose pieces fell [`CHECKPOINT_PIECES`] behind has them written.
     pub(super) async fn settle(&self) {
@@ -222,12 +223,12 @@ impl TorrentService {
                         Ok(())
                     }),
                 );
-                // With every file it wants, the torrent is done downloading
-                // whatever its unpacking came to.
+                // Its unpacking is over, refused; the torrent goes on as
+                // one with nothing to unpack: done downloading with every
+                // file it wants, downloading on otherwise.
+                self.unpack_ended(job_id, UnpackEnd::refused(error)).await;
                 if whole {
-                    self.short(job_id, &store, error, &[]).await;
-                } else {
-                    self.refused(job_id, error).await;
+                    self.completed(job_id).await;
                 }
                 continue;
             }
@@ -236,12 +237,9 @@ impl TorrentService {
             }
             if whole && tee.done() {
                 let delivered = tee.delivery(wanted);
-                match self.unpacked(job_id, &store, &tee, delivered).await {
-                    Placing::Waits => {}
-                    Placing::Placed => self.completed(job_id).await,
-                    Placing::Short { why, placed } => {
-                        self.short(job_id, &store, why, &placed).await;
-                    }
+                if let Placing::Ended(end) = self.unpacked(job_id, &store, &tee, delivered).await {
+                    self.unpack_ended(job_id, end).await;
+                    self.completed(job_id).await;
                 }
             }
         }

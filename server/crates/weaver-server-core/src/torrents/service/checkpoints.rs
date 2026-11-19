@@ -41,6 +41,8 @@ pub(super) struct Ledger {
 pub(super) struct OwedRow {
     download_ends: u64,
     unpack_over: bool,
+    // How its unpacking came out, written with the mark.
+    unpack_end: Option<crate::torrents::UnpackEnd>,
     // The failures it covers: it settles them only if no other came since.
     seen: u64,
     owed: Arc<AtomicU64>,
@@ -50,12 +52,14 @@ impl OwedRow {
     pub(super) fn taken(
         download_ends: u64,
         unpack_over: bool,
+        unpack_end: Option<&crate::torrents::UnpackEnd>,
         owed: &Arc<AtomicU64>,
     ) -> Option<Self> {
         let seen = owed.load(Ordering::Acquire);
         (seen > 0).then(|| Self {
             download_ends,
             unpack_over,
+            unpack_end: unpack_end.cloned(),
             seen,
             owed: Arc::clone(owed),
         })
@@ -265,7 +269,9 @@ impl TorrentService {
             (resume.counters, resume.peers, Some(resume.lost))
         });
         let wrote = (pieces.is_some() || stamping.is_some()).then(|| Arc::clone(&store));
-        let owed = row.as_ref().map(|row| (row.download_ends, row.unpack_over));
+        let owed = row
+            .as_ref()
+            .map(|row| (row.download_ends, row.unpack_over, row.unpack_end.clone()));
         let landed = self.queue_save(job_id, "torrent_checkpoint", move |db| {
             // The files are looked at here, on the lane's own thread, not
             // the runtime's: one look each, just before the write.

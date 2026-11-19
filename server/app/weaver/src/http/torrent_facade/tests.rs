@@ -514,6 +514,7 @@ fn view(state: TorrentState) -> TorrentView {
         upload_cap: None,
         unpack: true,
         unpack_override: None,
+        unpack_end: None,
         route: None,
         files: Vec::new(),
         sequential: false,
@@ -3930,6 +3931,80 @@ fn a_files_level_reads_as_the_clients_number_and_back() {
     }
     for number in ["2", "4", "8", "-1", "", "high"] {
         assert_eq!(level_of(number), None, "{number:?}");
+    }
+}
+
+// What a torrent's unpacking placed is listed after the torrent's own files,
+// numbered on after them, its name and length with all of it in hand and no
+// piece range, level or availability; a failed unpacking placed nothing and
+// lists nothing more. However the unpacking came out, the torrent's state
+// reads as a torrent's with nothing to unpack: seeding, stalled or uploading,
+// and stopped when it is paused, never an error.
+#[test]
+fn unpacked_files_list_after_the_torrents_own_and_never_touch_its_state() {
+    use weaver_server_core::torrents::service::TorrentPieces;
+    use weaver_server_core::torrents::{FilePriority, UnpackEnd, UnpackResult, UnpackedFile};
+    let mut seeding = view(TorrentState::Seeding);
+    seeding.files = vec![TorrentFile {
+        index: 0,
+        path: "set/set.rar".into(),
+        length: 100,
+        priority: FilePriority::Normal,
+    }];
+    seeding.file_have = vec![100];
+    seeding.pieces = Some(TorrentPieces {
+        count: 1,
+        size: 16_384,
+        have: 1,
+    });
+    seeding.completed_at_ms = Some(1_700_000_000_000);
+    let unpacked = [UnpackedFile {
+        name: "set/clip.mkv".into(),
+        length: 90,
+    }];
+    let listed = listing(&seeding, &unpacked, 0..2);
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0]["name"], "set/set.rar");
+    assert_eq!(listed[0]["is_seed"], true);
+    assert_eq!(
+        listed[1],
+        json!({"index": 1, "name": "set/clip.mkv", "size": 90, "progress": 1})
+    );
+    // Asked for by index, in the order asked.
+    let asked = listing(&seeding, &unpacked, [1, 0]);
+    assert_eq!(
+        asked
+            .iter()
+            .map(|file| file["index"].clone())
+            .collect::<Vec<_>>(),
+        [json!(1), json!(0)]
+    );
+    assert_eq!(asked[0]["is_seed"], true);
+    // A failed unpacking placed nothing: the torrent's own files only.
+    let own = listing(&seeding, &[], 0..1);
+    assert_eq!(own.len(), 1);
+    assert_eq!(own, file_list(&seeding, 0..1));
+
+    let end = |result, why: Option<&str>| UnpackEnd {
+        result,
+        why: why.map(str::to_owned),
+    };
+    for end in [
+        end(UnpackResult::Whole, None),
+        end(UnpackResult::Part, Some("damaged: notes.txt")),
+        end(UnpackResult::Failed, Some("missing a volume")),
+        end(
+            UnpackResult::Refused,
+            Some("x.exe has an unwanted extension"),
+        ),
+    ] {
+        let mut ended = seeding.clone();
+        ended.unpack_end = Some(end.clone());
+        assert_eq!(state(&ended), "stalledUP", "{end:?}");
+        ended.upload_bps = 1;
+        assert_eq!(state(&ended), "uploading", "{end:?}");
+        ended.state = TorrentState::Paused;
+        assert_eq!(state(&ended), "stoppedUP", "{end:?}");
     }
 }
 

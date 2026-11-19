@@ -162,6 +162,7 @@ fn a_downloading_torrent_carries_its_speed_and_eta_to_the_queue() {
         source: TorrentSource::Metainfo,
         state: TorrentState::Downloading,
         detail: None,
+        unpack_end: None,
         stated: None,
         route_reason: None,
         paused_by: None,

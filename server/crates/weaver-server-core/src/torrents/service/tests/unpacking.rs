@@ -4,11 +4,13 @@
 use super::*;
 
 // A member with an extension the operator does not want, found inside an
-// archive the torrent carries while it is short of a piece, fails the job
-// into history. The torrent stays, stopped with its data, and may be
-// resumed.
+// archive the torrent carries while it is short of a piece, ends its
+// unpacking refused and nothing of the torrent's: no history row, no
+// failure, no stop. It downloads on, completes and seeds, as a torrent with
+// nothing to unpack does, its unpacking line saying why.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_unwanted_member_found_while_unpacking_fails_the_job_and_keeps_the_torrent() {
+async fn an_unwanted_member_found_while_unpacking_refuses_the_unpacking_and_the_torrent_completes()
+{
     let archive = include_bytes!(concat!(
         std::env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/rar5/rar5_store.rar"
@@ -29,64 +31,58 @@ async fn an_unwanted_member_found_while_unpacking_fails_the_job_and_keeps_the_to
         .add_opened(request(AddSource::Metainfo(bytes)))
         .await
         .unwrap();
-    let (layout, intake) = {
+    let count = {
         let live = rig.service.inner.live.lock().await;
-        let torrent = &live[&job_id];
-        (
-            torrent.layout.clone().unwrap(),
-            torrent.intake.clone().unwrap(),
-        )
+        live[&job_id].layout.as_ref().unwrap().piece_count()
     };
-    let mut retired = rig.service.retired();
-    let storage = PieceStorage::new(
-        Arc::clone(&layout),
-        intake as Arc<dyn Pieces>,
-        rig.service.resident(job_id),
-    );
-    let lengths = Lengths::new(
-        layout.files().map(|file| file.length).sum(),
-        layout.piece_length() as u32,
-    )
-    .unwrap();
-    // The last piece never comes: the torrent is short when it is refused.
-    for piece in 0..layout.piece_count() - 1 {
-        let range = layout.piece_range(piece);
-        let index = lengths.try_validate_piece_index(piece).unwrap();
-        assert!(storage.reserve_piece(index, &Arc::default()));
-        for span in layout.spans(piece) {
-            let at = (range.start + span.at) as usize;
-            storage
-                .pwrite_all(
-                    span.file,
-                    span.range.start,
-                    &archive[at..at + span.range.len() as usize],
-                )
-                .unwrap();
-        }
-        // A piece past the refusal is refused too.
-        if let Err(error) = storage.on_piece_completed(index) {
-            assert!(format!("{error:#}").contains("txt"), "{error:#}");
-        }
-    }
-    retired.wait_for(|retired| *retired >= 1).await.unwrap();
-    let history = rig.db.get_job_history(job_id.0).unwrap().unwrap();
-    assert_eq!(history.status, "failed");
-    assert!(history.error_message.unwrap().contains("txt"));
-    let record = rig.db.get_torrent(job_id).unwrap().unwrap();
-    assert_eq!(record.intent(), TorrentIntent::Stopped);
-    let view = rig.service.torrent(job_id).await.unwrap();
-    assert_eq!(view.state, TorrentState::Stopped);
-    assert!(view.detail.unwrap().contains("txt"));
-
-    // The job's outcome is kept once: resumed, the torrent seeds on.
-    rig.service.resume(job_id).await.unwrap();
-    rig.service.inner.signal.mark(job_id);
-    rig.service.settle().await;
+    let retired = rig.service.retired();
+    let mut settles = rig.service.inner.settled.subscribe();
+    // The last piece not yet come: the torrent is short when it is refused.
+    feed(&rig.service, job_id, archive, 0..count - 1).await;
+    rig.service.inner.signal.look(job_id);
+    settles
+        .wait_for(|_| {
+            rig.db
+                .get_torrent(job_id)
+                .unwrap()
+                .unwrap()
+                .unpack_end
+                .is_some()
+        })
+        .await
+        .unwrap();
+    let end = rig
+        .db
+        .get_torrent(job_id)
+        .unwrap()
+        .unwrap()
+        .unpack_end
+        .unwrap();
+    assert_eq!(end.result, UnpackResult::Refused);
+    assert!(end.why.as_deref().unwrap().contains("txt"), "{end:?}");
+    assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
     assert_eq!(
         rig.db.get_torrent(job_id).unwrap().unwrap().intent(),
         TorrentIntent::Resumed
     );
-    assert_eq!(*retired.borrow(), 1);
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_ne!(view.state, TorrentState::Stopped);
+    assert_eq!(view.detail, None);
+    assert_eq!(view.unpack_end, Some(end.clone()));
+
+    // The rest comes: it completes and seeds, nothing unpacked.
+    feed(&rig.service, job_id, archive, count - 1..count).await;
+    stored_complete(&rig.service, &rig.db, job_id).await;
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(view.state, TorrentState::Seeding);
+    assert_eq!(view.detail, None);
+    assert_eq!(job_status(&view), JobStatus::Seeding);
+    assert_eq!(view.unpack_end, Some(end));
+    assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
+    assert!(rig.db.torrent_outputs(job_id).unwrap().is_empty());
+    assert_eq!(*retired.borrow(), 0);
+    assert_eq!(rig.service.inner.counters.count(TorrentEvent::Failed), 0);
+    rig.service.stop().await;
 }
 
 // A torrent of an archive keeps its archive as it came, seeds from it, and
@@ -206,63 +202,11 @@ async fn unpacks_beside_and_seeds(name: &str, archive: &[u8]) {
 }
 
 // A torrent with every file it wants whose unpacking refused its output
-// is done downloading: it completes and seeds on, saying why, and its job
-// goes to history as failed when nothing it delivered is a usable file, an
-// archive volume being none. After a restart, before the tick restores its
-// job, a removal goes to history as failed for the same reason.
+// is done downloading: it completes and seeds on with no history row, its
+// unpacking line saying why. After a restart its line is the same, and a
+// removal goes to history complete, as any complete torrent's does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_finished_torrent_unpacking_refused_seeds_on_and_fails_with_no_usable_file() {
-    let archive = include_bytes!(concat!(
-        std::env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/rar5/rar5_store.rar"
-    ));
-    let rig = rig(set_clock());
-    rig.service.open().await.unwrap();
-    rig.db
-        .save_post_processing_settings(&PostProcessingSettings {
-            unacceptable_extensions: vec!["txt".into()],
-            unwanted_extension_action:
-                crate::post_processing::model::UnwantedExtensionAction::FailJob,
-            ..PostProcessingSettings::default()
-        })
-        .unwrap();
-    let bytes = metainfo("set.rar", &[("set.rar", archive)], 128, false);
-    let job_id = rig
-        .service
-        .add_opened(request(AddSource::Metainfo(bytes)))
-        .await
-        .unwrap();
-    let mut retired = rig.service.retired();
-    fetch_every_piece(&rig.service, job_id, archive).await;
-    retired.wait_for(|retired| *retired >= 1).await.unwrap();
-    let history = rig.db.get_job_history(job_id.0).unwrap().unwrap();
-    assert_eq!(history.status, "failed");
-    assert!(history.error_message.unwrap().contains("txt"));
-    let view = rig.service.torrent(job_id).await.unwrap();
-    assert!(view.completed_at_ms.is_some());
-    assert_ne!(view.state, TorrentState::Stopped);
-    rig.service.stop().await;
-    rig.db.prune_orphan_active_state(JobId(u64::MAX)).unwrap();
-
-    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
-    again.open().await.unwrap();
-    let view = again.torrent(job_id).await.unwrap();
-    assert!(view.completed_at_ms.is_some());
-    assert_ne!(view.state, TorrentState::Stopped);
-
-    again.remove(job_id, false, false).await.unwrap();
-    let history = rig.db.get_job_history(job_id.0).unwrap().unwrap();
-    assert_eq!(history.status, "failed");
-    assert!(history.error_message.unwrap().contains("txt"));
-    again.stop().await;
-}
-
-// AGENTS.md "Job status: Partial": a finished torrent whose unpacking
-// refused its archive, beside a file people open that it delivered whole,
-// ends partial, with the refusal kept as why, and seeds on; its removal
-// keeps it partial.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_finished_torrent_unpacking_refused_beside_a_usable_file_is_partial() {
+async fn a_finished_torrent_unpacking_refused_seeds_on_and_its_removal_is_complete() {
     let archive = include_bytes!(concat!(
         std::env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/rar5/rar5_store.rar"
@@ -285,32 +229,42 @@ async fn a_finished_torrent_unpacking_refused_beside_a_usable_file_is_partial() 
         .add_opened(request(AddSource::Metainfo(bytes)))
         .await
         .unwrap();
-    let mut retired = rig.service.retired();
     let whole: Vec<u8> = files.iter().flat_map(|(_, bytes)| bytes.to_vec()).collect();
     fetch_every_piece(&rig.service, job_id, &whole).await;
-    retired.wait_for(|retired| *retired >= 1).await.unwrap();
-    let history = rig.db.get_job_history(job_id.0).unwrap().unwrap();
-    assert_eq!(history.status, "partial");
-    let error = history.error_message.unwrap();
-    assert!(error.starts_with("delivered in part; "), "{error}");
-    assert!(error.contains("txt"));
+    stored_complete(&rig.service, &rig.db, job_id).await;
     let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(view.state, TorrentState::Seeding);
+    assert_eq!(view.detail, None);
+    let end = view.unpack_end.clone().unwrap();
+    assert_eq!(end.result, UnpackResult::Refused);
+    assert!(end.why.as_deref().unwrap().contains("txt"), "{end:?}");
+    assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
+    assert_eq!(*rig.service.retired().borrow(), 0);
+    rig.service.stop().await;
+    rig.db.prune_orphan_active_state(JobId(u64::MAX)).unwrap();
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.open().await.unwrap();
+    let view = again.torrent(job_id).await.unwrap();
     assert!(view.completed_at_ms.is_some());
     assert_ne!(view.state, TorrentState::Stopped);
+    assert_eq!(view.unpack_end, Some(end));
 
-    rig.service.remove(job_id, false, false).await.unwrap();
+    again.remove(job_id, false, false).await.unwrap();
     let history = rig.db.get_job_history(job_id.0).unwrap().unwrap();
-    assert_eq!(history.status, "partial");
-    assert!(history.error_message.unwrap().contains("txt"));
-    rig.service.stop().await;
+    assert_eq!(
+        (history.status.as_str(), history.error_message),
+        ("complete", None)
+    );
+    again.stop().await;
 }
 
 // Under the delete action, a file unpacking made with an unwanted extension
 // is deleted and never placed: the torrent's own files stay as they came,
-// it completes and seeds on, and its job ends partial beside a file people
-// open, naming what was removed.
+// it completes and seeds on with no history row, and its unpacking line
+// names what was removed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_unwanted_unpacked_file_is_deleted_under_the_delete_action_and_the_job_is_partial() {
+async fn an_unwanted_unpacked_file_is_deleted_under_the_delete_action_and_said_on_the_unpacking() {
     use crate::post_processing::model::UnwantedExtensionAction;
     let archive = include_bytes!(concat!(
         std::env!("CARGO_MANIFEST_DIR"),
@@ -334,19 +288,20 @@ async fn an_unwanted_unpacked_file_is_deleted_under_the_delete_action_and_the_jo
         .await
         .unwrap();
     let work = rig.service.unpacking_dir(job_id);
-    let mut retired = rig.service.retired();
     let whole: Vec<u8> = files.iter().flat_map(|(_, bytes)| bytes.to_vec()).collect();
     fetch_every_piece(&rig.service, job_id, &whole).await;
-    retired.wait_for(|retired| *retired >= 1).await.unwrap();
-    let history = rig.db.get_job_history(job_id.0).unwrap().unwrap();
-    assert_eq!(history.status, "partial");
-    assert_eq!(
-        history.error_message.as_deref(),
-        Some("delivered in part; removed for an unwanted extension: small.txt")
-    );
+    stored_complete(&rig.service, &rig.db, job_id).await;
+    assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
     let view = rig.service.torrent(job_id).await.unwrap();
-    assert!(view.completed_at_ms.is_some());
-    assert_ne!(view.state, TorrentState::Stopped);
+    assert_eq!(view.state, TorrentState::Seeding);
+    assert_eq!(view.detail, None);
+    assert_eq!(
+        view.unpack_end,
+        Some(UnpackEnd::short(
+            false,
+            "delivered in part; removed for an unwanted extension: small.txt".into()
+        ))
+    );
     let dir = PathBuf::from(view.storage_dir.unwrap());
     assert_eq!(std::fs::read(dir.join("set.rar")).unwrap(), archive);
     assert_eq!(std::fs::read(dir.join("sample.mkv")).unwrap(), sample);
@@ -357,13 +312,12 @@ async fn an_unwanted_unpacked_file_is_deleted_under_the_delete_action_and_the_jo
 
 // Unpacked files that cannot be placed beside the torrent's are never
 // removed for it: they stay in its unpacking directory, the torrent
-// completes and seeds on, and its job ends as what it delivered says,
-// partial beside a file people open, with why and where they are. The
-// directory stays past a restart, and a removal that deletes the
-// torrent's files takes it.
+// completes and seeds on with no history row, and its unpacking line says
+// why and where they are. The directory stays past a restart, and a removal
+// that deletes the torrent's files takes it.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unpacked_files_that_cannot_be_placed_are_kept_and_the_job_is_partial() {
+async fn unpacked_files_that_cannot_be_placed_are_kept_and_said_on_the_unpacking() {
     use std::os::unix::fs::PermissionsExt;
     let archive = include_bytes!(concat!(
         std::env!("CARGO_MANIFEST_DIR"),
@@ -380,7 +334,6 @@ async fn unpacked_files_that_cannot_be_placed_are_kept_and_the_job_is_partial() 
         .await
         .unwrap();
     let work = rig.service.unpacking_dir(job_id);
-    let mut retired = rig.service.retired();
     let whole: Vec<u8> = files.iter().flat_map(|(_, bytes)| bytes.to_vec()).collect();
     let mut dir = PathBuf::new();
     fetch_pieces(&rig.service, job_id, &whole, None, |torrent| {
@@ -388,11 +341,18 @@ async fn unpacked_files_that_cannot_be_placed_are_kept_and_the_job_is_partial() 
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
     })
     .await;
-    retired.wait_for(|retired| *retired >= 1).await.unwrap();
+    stored_complete(&rig.service, &rig.db, job_id).await;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let history = rig.db.get_job_history(job_id.0).unwrap().unwrap();
-    assert_eq!(history.status, "partial");
-    let error = history.error_message.unwrap();
+    assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
+    let end = rig
+        .db
+        .get_torrent(job_id)
+        .unwrap()
+        .unwrap()
+        .unpack_end
+        .unwrap();
+    assert_eq!(end.result, UnpackResult::Failed);
+    let error = end.why.unwrap();
     assert!(error.contains("could not be placed"), "{error}");
     assert!(error.contains(&work.display().to_string()), "{error}");
     assert!(!dir.join("small.txt").exists());
@@ -414,7 +374,7 @@ async fn unpacked_files_that_cannot_be_placed_are_kept_and_the_job_is_partial() 
     assert!(!work.exists());
     assert!(!dir.join("sample.mkv").exists());
     let history = rig.db.get_job_history(job_id.0).unwrap().unwrap();
-    assert_eq!(history.status, "partial");
+    assert_eq!(history.status, "complete");
     again.stop().await;
 }
 
@@ -1087,10 +1047,10 @@ fn contents(dir: &Path) -> Vec<(String, Vec<u8>)> {
 
 // An archive and a plain file, the plain file ignored: the archive unpacks
 // whole, and the unpacking ends in part for the plain file the graph never
-// had, as a post's does. The plain file wanted again reopens the torrent,
-// which downloads it and completes again with no tee: its unpacking does not
-// run again, and its outputs, the names its row keeps and its one history
-// row stay as they were.
+// had, as a post's does, with no history row. The plain file wanted again
+// reopens the torrent, which downloads it and completes again with no tee:
+// its unpacking does not run again, and its outputs, the names its row keeps
+// and its unpacking line stay as they were.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unpacked_torrent_reopened_for_a_plain_file_completes_without_unpacking_again() {
     reopened_for_a_plain_file(false).await;
@@ -1136,17 +1096,15 @@ async fn reopened_for_a_plain_file(restart: bool) {
     let placed = contents(&dir);
     assert!(placed.contains(&("small.txt".to_owned(), SMALL_TXT.to_vec())));
     // The plain file left out is lost to the graph, as a posted file no
-    // article of which came: the unpacking ends in part, with its row.
-    let ended = rig
-        .db
-        .get_job_history(job_id.0)
-        .unwrap()
-        .map(|row| (row.status, row.error_message));
+    // article of which came: the unpacking ends in part, the torrent with
+    // no row.
+    assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
+    let ended = rig.db.get_torrent(job_id).unwrap().unwrap().unpack_end;
     assert_eq!(
         ended,
-        Some((
-            "partial".to_owned(),
-            Some("delivered in part; damaged: extra.bin".to_owned())
+        Some(UnpackEnd::short(
+            true,
+            "delivered in part; damaged: extra.bin".into()
         ))
     );
     assert!(rig.db.get_torrent(job_id).unwrap().unwrap().unpack_over);
@@ -1205,30 +1163,29 @@ async fn reopened_for_a_plain_file(restart: bool) {
         expected.contains(&("extra.bin".to_owned(), plain.clone())),
         "{expected:?}"
     );
+    assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
     assert_eq!(
-        rig.db
-            .get_job_history(job_id.0)
-            .unwrap()
-            .map(|row| (row.status, row.error_message)),
+        rig.db.get_torrent(job_id).unwrap().unwrap().unpack_end,
         ended
     );
+    assert_eq!(service.torrent(job_id).await.unwrap().unpack_end, ended);
     assert_eq!(*retired.borrow_and_update(), retirements);
     service.stop().await;
 }
 
 // Unpacking that ends short with no placing written, its archive refused,
-// beside a plain file ignored: the torrent completes with one history row,
+// beside a plain file ignored: the torrent completes with no history row,
 // its unpacking over. The plain file wanted again reopens it, and it
 // downloads the file and completes again with no tee: no second unpacking,
-// and its history row, outputs and failure stay as they were, in the same
-// run and across a restart.
+// and its outputs and unpacking line stay as they were, in the same run and
+// across a restart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_short_unpacked_torrent_reopened_for_a_plain_file_keeps_one_history_row() {
+async fn a_short_unpacked_torrent_reopened_for_a_plain_file_keeps_its_unpacking_line() {
     reopened_after_ending_short(false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_short_unpacked_torrent_reopened_across_a_restart_keeps_one_history_row() {
+async fn a_short_unpacked_torrent_reopened_across_a_restart_keeps_its_unpacking_line() {
     reopened_after_ending_short(true, false).await;
 }
 
@@ -1270,13 +1227,11 @@ async fn reopened_after_ending_short(restart: bool, mark_fails: bool) {
         .set_file_priorities(job_id, &[(1, Ignored)])
         .await
         .unwrap();
-    let mut retired = rig.service.retired();
     let first = pieces_of(&rig.service, job_id, |file| file == 0).await;
     if mark_fails {
         UNPACK_OVER_FAILS.store(true, std::sync::atomic::Ordering::Release);
     }
     fetch_pieces(&rig.service, job_id, &whole, Some(&first), |_| {}).await;
-    retired.wait_for(|retired| *retired >= 1).await.unwrap();
     stored_complete(&rig.service, &rig.db, job_id).await;
     if mark_fails {
         assert!(
@@ -1289,22 +1244,20 @@ async fn reopened_after_ending_short(restart: bool, mark_fails: bool) {
             .await
             .unwrap();
     }
-    let history = rig.db.get_job_history(job_id.0).unwrap().unwrap();
-    assert!(history.error_message.as_deref().unwrap().contains("txt"));
-    let ended = (
-        history.status.clone(),
-        history.error_message.clone(),
-        history.completed_at,
-    );
+    assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
     let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(view.state, TorrentState::Seeding);
+    let ended = view.unpack_end.clone().unwrap();
+    assert_eq!(ended.result, UnpackResult::Refused);
+    assert!(ended.why.as_deref().unwrap().contains("txt"), "{ended:?}");
     let dir = PathBuf::from(view.storage_dir.unwrap());
     let outputs = rig.db.torrent_outputs(job_id).unwrap();
     let placed = contents(&dir);
-    let failed = rig.service.inner.live.lock().await[&job_id].failed.clone();
-    assert!(failed.is_some());
     // Kept by a write of its own, or its checkpoint when that failed: no
     // placing was written for it.
-    assert!(rig.db.get_torrent(job_id).unwrap().unwrap().unpack_over);
+    let stored = rig.db.get_torrent(job_id).unwrap().unwrap();
+    assert!(stored.unpack_over);
+    assert_eq!(stored.unpack_end.as_ref(), Some(&ended));
 
     rig.service
         .set_file_priorities(job_id, &[(1, Normal)])
@@ -1349,10 +1302,14 @@ async fn reopened_after_ending_short(restart: bool, mark_fails: bool) {
         "no placing runs again"
     );
 
-    let history = rig.db.get_job_history(job_id.0).unwrap().unwrap();
+    assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
     assert_eq!(
-        (history.status, history.error_message, history.completed_at),
-        ended
+        rig.db.get_torrent(job_id).unwrap().unwrap().unpack_end,
+        Some(ended.clone())
+    );
+    assert_eq!(
+        service.torrent(job_id).await.unwrap().unpack_end,
+        Some(ended)
     );
     assert_eq!(*retired.borrow_and_update(), before);
     assert_eq!(rig.db.torrent_outputs(job_id).unwrap(), outputs);
@@ -1361,9 +1318,6 @@ async fn reopened_after_ending_short(restart: bool, mark_fails: bool) {
     expected.push(("extra.bin".to_owned(), plain.clone()));
     expected.sort();
     assert_eq!(contents(&dir), expected);
-    if !restart {
-        assert_eq!(service.inner.live.lock().await[&job_id].failed, failed);
-    }
     service.stop().await;
 }
 
@@ -1579,35 +1533,38 @@ async fn ignoring(
     (rig, job_id, whole, tee)
 }
 
-// How a torrent's unpacking ended, as its history row keeps it (none when
-// it completed: it seeds on, with no row), and what it placed beside its
-// files: its row's outputs and the names in its directory that are none of
-// its own files nor the directory's hidden marker.
+// How a torrent's unpacking ended, as its unpacking line says it, and what
+// it placed beside its files: its row's outputs and the names in its
+// directory that are none of its own files nor the directory's hidden
+// marker. However it ended, the torrent is one with nothing to unpack: it
+// seeds, saying nothing of it, with no history row, nothing retired and no
+// failure counted.
 async fn ended(
     rig: &Rig,
     job_id: JobId,
     own: &[(String, Vec<u8>)],
 ) -> (String, Option<String>, Vec<String>, Vec<String>) {
-    let history = rig.db.get_job_history(job_id.0).unwrap();
-    let dir = PathBuf::from(
-        rig.service
-            .torrent(job_id)
-            .await
-            .unwrap()
-            .storage_dir
-            .unwrap(),
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(view.state, TorrentState::Seeding);
+    assert_eq!(view.detail, None);
+    assert_eq!(job_status(&view), JobStatus::Seeding);
+    assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
+    assert_eq!(*rig.service.retired().borrow(), 0);
+    assert_eq!(rig.service.inner.counters.count(TorrentEvent::Failed), 0);
+    let end = view.unpack_end.clone().unwrap();
+    assert_eq!(
+        rig.db.get_torrent(job_id).unwrap().unwrap().unpack_end,
+        Some(end.clone())
     );
+    let dir = PathBuf::from(view.storage_dir.unwrap());
     let beside = contents(&dir)
         .into_iter()
         .map(|(name, _)| name)
         .filter(|name| !name.starts_with('.') && !own.iter().any(|(own, _)| own == name))
         .collect();
-    let (status, error) = history.map_or(("none".to_owned(), None), |history| {
-        (history.status, history.error_message)
-    });
     (
-        status,
-        error,
+        end.result.as_str().to_owned(),
+        end.why,
         rig.db.torrent_outputs(job_id).unwrap(),
         beside,
     )
@@ -1615,7 +1572,9 @@ async fn ended(
 
 // A torrent of the five-volume RAR set that leaves out its first, a middle
 // or its last volume delivers nothing whole: its unpacking fails, as a post
-// missing that volume does, it places nothing, and it seeds on.
+// missing that volume does, and it places nothing. The torrent seeds on as
+// one with nothing to unpack, stopped reads as stopped and nothing else,
+// and its unpacking line, failed with why, is the same after a restart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unpacking_torrent_without_its_first_volume_places_nothing_and_fails() {
     ignored_volume_fails(0).await;
@@ -1639,11 +1598,27 @@ async fn ignored_volume_fails(ignored: usize) {
     assert!(error.is_some());
     assert!(outputs.is_empty(), "{outputs:?}");
     assert!(beside.is_empty(), "{beside:?}");
+    assert!(rig.service.unpacked_files(job_id).await.unwrap().is_empty());
+    let end = rig.service.torrent(job_id).await.unwrap().unpack_end;
+
+    rig.service.pause(job_id).await.unwrap();
+    let view = rig.service.torrent(job_id).await.unwrap();
     assert_eq!(
-        rig.service.torrent(job_id).await.unwrap().state,
-        TorrentState::Seeding
+        (view.state, view.detail.clone()),
+        (TorrentState::Paused, None)
     );
+    assert_eq!(job_status(&view), JobStatus::Paused);
+    rig.service.resume(job_id).await.unwrap();
     rig.service.stop().await;
+    rig.db.prune_orphan_active_state(JobId(u64::MAX)).unwrap();
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.open().await.unwrap();
+    let view = again.torrent(job_id).await.unwrap();
+    assert_eq!(view.unpack_end, end);
+    assert_eq!(view.detail, None);
+    assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
+    again.stop().await;
 }
 
 // The set, nothing left out, unpacks whole and places what it holds.
@@ -1651,9 +1626,20 @@ async fn ignored_volume_fails(ignored: usize) {
 async fn an_unpacking_torrent_that_leaves_nothing_out_completes() {
     let (rig, job_id, _, _) = ignoring(rar_set(), &[], 16384).await;
     let (status, error, outputs, beside) = ended(&rig, job_id, &rar_set()).await;
-    assert_eq!((status.as_str(), error), ("none", None));
+    assert_eq!((status.as_str(), error), ("whole", None));
     assert_eq!(outputs, vec!["test_clip.mkv".to_owned()]);
     assert_eq!(beside, outputs);
+    // What Scryer and Arr tools read it downloaded lists it, with its
+    // length on disk.
+    let unpacked = rig.service.unpacked_files(job_id).await.unwrap();
+    assert_eq!(
+        unpacked
+            .iter()
+            .map(|file| file.name.as_str())
+            .collect::<Vec<_>>(),
+        ["test_clip.mkv"]
+    );
+    assert!(unpacked[0].length > 0);
     rig.service.stop().await;
 }
 
@@ -1667,8 +1653,8 @@ async fn a_torrent_of_two_sets_one_short_of_a_volume_ends_in_part() {
     let (rig, job_id, _, _) = ignoring(parts.clone(), &[3], 16384).await;
     let (status, error, outputs, beside) = ended(&rig, job_id, &parts).await;
     eprintln!("two sets: {status} {error:?} {outputs:?}");
-    assert_eq!(status, "partial");
-    assert!(error.unwrap().contains("delivered in part"));
+    assert_eq!(status, "part");
+    assert!(error.is_some());
     assert!(!outputs.is_empty());
     assert!(!outputs.iter().any(|name| name == "test_clip.mkv"));
     assert_eq!(beside, outputs);
@@ -1685,7 +1671,7 @@ async fn a_torrent_that_leaves_out_its_recovery_with_its_data_whole_completes() 
     parts.extend(parity);
     let (rig, job_id, _, _) = ignoring(parts.clone(), &ignored, 256).await;
     let (status, error, outputs, _) = ended(&rig, job_id, &parts).await;
-    assert_eq!((status.as_str(), error), ("none", None));
+    assert_eq!((status.as_str(), error), ("whole", None));
     assert!(!outputs.is_empty());
     rig.service.stop().await;
 }
@@ -1713,7 +1699,7 @@ async fn an_archive_beside_an_ignored_plain_file_under_one_recovery_set_ends_as_
     let parts = archive_notes_and_parity();
     let (rig, job_id, _, _) = ignoring(parts.clone(), &[1], 256).await;
     let (status, error, outputs, beside) = ended(&rig, job_id, &parts).await;
-    assert_eq!(status, "partial");
+    assert_eq!(status, "part");
     assert_eq!(
         error.as_deref(),
         Some("delivered in part; unrepaired: notes.txt")
@@ -1730,7 +1716,7 @@ async fn an_ignored_volume_the_set_rebuilds_from_a_plain_files_bytes_completes()
     let parts = archive_notes_and_parity();
     let (rig, job_id, _, _) = ignoring(parts.clone(), &[0], 256).await;
     let (status, error, outputs, beside) = ended(&rig, job_id, &parts).await;
-    assert_eq!((status.as_str(), error), ("none", None));
+    assert_eq!((status.as_str(), error), ("whole", None));
     assert_eq!(outputs, vec!["small.txt".to_owned()]);
     assert_eq!(beside, outputs);
     rig.service.stop().await;

@@ -13,6 +13,7 @@ pub(crate) fn torrent(job_id: u64, v1: Option<[u8; 20]>, v2: Option<[u8; 32]>) -
     TorrentRecord {
         unpack_in_force: None,
         unpack_over: false,
+        unpack_end: None,
         download_ends: 0,
         job_id: JobId(job_id),
         infohash_v1: v1,
@@ -769,7 +770,7 @@ fn each_stored_word_of_a_torrent_reads_back_and_keeps_its_text() {
     }
     assert_eq!(
         HistoryEnd::ALL.map(HistoryEnd::as_str),
-        ["complete", "partial", "failed", "cancelled"]
+        ["complete", "failed", "cancelled"]
     );
 }
 
@@ -785,10 +786,8 @@ fn a_torrents_history_end_is_the_jobs_stored_status() {
     };
     for (status, end) in [
         (JobStatus::Complete, HistoryEnd::Complete),
-        (JobStatus::Partial, HistoryEnd::Partial),
         (failed.clone(), HistoryEnd::Failed),
     ] {
-        assert_eq!(HistoryEnd::delivered(&status), end);
         assert_eq!(end.as_str(), status.persisted_status());
         assert_eq!(
             job_status_from_persisted_str(end.as_str(), Some("why")),
