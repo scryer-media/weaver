@@ -406,7 +406,11 @@ impl Volumes for RunVolumes {
         let reads = self.volume.as_deref().map(Volume::read_turns);
         let stopped = || -> io::Error { Unreadable::Stopped.into() };
         let _one = match reads.filter(|reads| reads.whole_pieces()) {
-            Some(reads) => Some(reads.one_here_unless(&self.files.stop).ok_or_else(stopped)?),
+            Some(reads) => Some(
+                reads
+                    .one_here_unless(&self.files.stop)
+                    .ok_or_else(stopped)?,
+            ),
             None => None,
         };
         // The run's reads go one at a time; a drain never takes this lock.
@@ -466,7 +470,10 @@ impl Volumes for RunVolumes {
                 files.reading.keep(turn);
             }
             if let Ok(Some(opened)) = &read {
-                files.open.entry(volume.0).or_insert_with(|| Arc::clone(opened));
+                files
+                    .open
+                    .entry(volume.0)
+                    .or_insert_with(|| Arc::clone(opened));
             }
         }
         read.map(|_| len)
