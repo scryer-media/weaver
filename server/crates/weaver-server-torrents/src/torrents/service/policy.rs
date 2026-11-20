@@ -476,7 +476,7 @@ type LiveMap = BTreeMap<JobId, Live>;
 // settings are not cloned for them.
 static NO_SETTINGS: LazyLock<TorrentSettings> = LazyLock::new(|| TorrentSettings {
     complete_dir: PathBuf::new(),
-    categories: Vec::new(),
+    categories: super::settings::Categories::default(),
     seeding: None,
     upload_cap: None,
     torrent: TorrentConfig::default(),

@@ -230,7 +230,7 @@ fn client(db: &Database, dir: &std::path::Path, routes: Offline) -> TorrentServi
         TorrentSettings {
             upload_cap: None,
             complete_dir: dir.join("complete"),
-            categories: Vec::new(),
+            categories: Default::default(),
             seeding: None,
             torrent: TorrentConfig {
                 enabled: true,
@@ -1501,7 +1501,8 @@ async fn the_dht_row_follows_the_torrents_rule_before_its_category() {
                 seeding: None,
                 torrent_route: true,
                 unpack: None,
-            }],
+            }]
+            .into(),
             seeding: None,
             torrent: TorrentConfig {
                 enabled: true,

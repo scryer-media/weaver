@@ -209,7 +209,8 @@ fn service_over(
             seeding: None,
             torrent_route: true,
             unpack: None,
-        }],
+        }]
+        .into(),
         seeding: None,
         torrent: TorrentConfig {
             enabled: true,
@@ -1032,7 +1033,8 @@ fn chain() -> (TorrentRecord, TrackerRule, TorrentSettings) {
             seeding: None,
             torrent_route: false,
             unpack: None,
-        }],
+        }]
+        .into(),
         // As the global terms load: nothing there inherits.
         seeding: Some(SeedingPolicy::default().at_global()),
         torrent: TorrentConfig::default(),

@@ -1056,7 +1056,7 @@ fn making_in(rig: &Rig) -> crate::settings::SharedConfig {
                 .into_owned(),
         ),
         servers: vec![],
-        categories: rig.service.settings().categories,
+        categories: rig.service.settings().categories.to_vec(),
         retry: None,
         bandwidth: Default::default(),
         cleanup_after_extract: None,
@@ -1135,7 +1135,9 @@ async fn an_alias_match_or_a_bad_name_makes_no_category() {
     let rig = rig(set_clock());
     rig.service.open().await.unwrap();
     let mut settings = rig.service.settings();
-    settings.categories[0].aliases = "series*".to_owned();
+    settings
+        .categories
+        .edit(|list| list[0].aliases = "series*".to_owned());
     rig.service.set_settings(settings).await;
     let config = making_in(&rig);
     let by_alias = rig

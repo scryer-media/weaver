@@ -197,7 +197,7 @@ impl Pick<'_> {
                     ..CategoryIds::default()
                 };
                 // The first category of an id is the one a torrent of it is in.
-                for category in &settings.categories {
+                for category in settings.categories.iter() {
                     if seen.insert(category.id) {
                         categories.known.push(category.id);
                         if pick.keeps(Some(&category.name)) {

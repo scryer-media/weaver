@@ -90,7 +90,7 @@ use queue::QueueEnd;
 #[cfg(test)]
 pub(in crate::torrents) use retire::{delete_written, deletion, listed_files};
 pub use settings::{
-    DHT, ENCRYPTION, Field, INACTIVE_GOAL, LSD, PEX, Presence, RATIO_GOAL, SCOPE,
+    Categories, DHT, ENCRYPTION, Field, INACTIVE_GOAL, LSD, PEX, Presence, RATIO_GOAL, SCOPE,
     SEED_TIME_COUNTING, SEED_TIME_GOAL, SEEDING_ACTION, SEEDING_MODE, ScheduleSeeding,
     SeedingLevels, TorrentSettings, UNPACK, UPLOAD_CAP, WindDown,
 };

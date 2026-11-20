@@ -595,7 +595,8 @@ fn picks_are_the_walk_of_every_record(db: &Database) {
             category(3, "movies"),
             category(1, "shadowed"),
             category(4, ""),
-        ],
+        ]
+        .into(),
         seeding: None,
         torrent: TorrentConfig::default(),
     };
