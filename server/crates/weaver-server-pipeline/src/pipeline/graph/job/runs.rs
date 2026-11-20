@@ -17,6 +17,22 @@ use crate::pipeline::graph::engine::{Heard, Reservation, Said};
 use crate::pipeline::graph::namespace::{Coming, Returned, WriteError};
 use crate::pipeline::graph::status::RepairSlots;
 
+// Words for a job no one is left to hear: the staged output a repair, a
+// replay or a return's reader came back with is removed, as a stopped job's
+// is (`GraphJob::drain_failed_run`); what a slice counted goes back as it
+// drops.
+pub(crate) fn discard_unheard(said: Said) {
+    let removed = match said.heard {
+        Heard::Repaired(returned) => returned.repaired.remove(),
+        Heard::Replayed(replayed) => replayed.remove(),
+        Heard::RepairRead(read) => read.output.remove(),
+        _ => Ok(()),
+    };
+    if let Err(error) = removed {
+        tracing::warn!(job_id = said.scope, %error, "failed to remove a gone job's staged output");
+    }
+}
+
 impl GraphJob {
     // A terminal failure keeps worker ownership until the matching end
     // acknowledgments arrive. Late output and checkpoint acknowledgments
@@ -52,7 +68,20 @@ impl GraphJob {
                     self.acknowledge_checkpoint(stamp.unwrap_or(said.generation));
                 }
             }
+            // A return being applied is dropped with the job: its reader is
+            // told to read no more, and what a slice counted goes back as it
+            // drops. What the slices placed is not ruled on, so no later
+            // checkpoint of the job is taken: it restarts from its last one.
+            Heard::RepairSlice(_) => self.loans.end_apply(),
+            Heard::RepairRead(read) => {
+                if !self.loans.returned(said.node, said.generation) {
+                    read.output.remove().map_err(WriteError::from)?;
+                } else if self.writer.drop_apply(read.output).map_err(WriteError::from)? {
+                    self.pending().left_at_stop();
+                }
+            }
             Heard::Emit(_)
+            | Heard::Paid(..)
             | Heard::Ended
             | Heard::CheckpointBlocked { .. }
             | Heard::CheckpointDue { .. }
@@ -65,7 +94,47 @@ impl GraphJob {
 
     // What a run said, or a repair lent off the loop came back with. A
     // stopped run's words carry an old generation and are not heard.
+    //
+    // What a producing thread counted for the bytes it said, on the job's
+    // volumes, pays for every write the step queues, with what the job
+    // carries from the steps before: the loop queues them without waiting
+    // for a disk (`Credit::prepay`). What the step did not write is carried
+    // on only for the bytes of the run's output that the step left held in
+    // memory, on the volume each will be written to, and given back past
+    // that; as those holds are written or dropped later, what was carried
+    // for them pays the write or is given back (`namespace::carried`).
     pub(crate) fn run_said(
+        &mut self,
+        mut said: Said,
+        slots: &mut RepairSlots,
+        limit: usize,
+    ) -> Result<(), GraphError> {
+        let fresh = match said.heard {
+            Heard::Paid(emit, credit) => {
+                said.heard = Heard::Emit(emit);
+                Some((credit, said.node))
+            }
+            Heard::RepairSlice(ref mut slice) => self
+                .writer
+                .applying_into()
+                .map(|into| (std::mem::take(&mut slice.credit), into)),
+            _ => None,
+        };
+        if fresh.is_none() && self.writer.carries_nothing() {
+            return self.hear(said, slots, limit);
+        }
+        let mut credit = self.writer.take_credit();
+        if let Some((fresh, into)) = fresh {
+            credit.join(fresh);
+            self.writer.crediting(Some(into));
+        }
+        let paying = credit.prepay();
+        let heard = self.hear(said, slots, limit);
+        self.writer.settle_credit(&self.tree, paying);
+        heard
+    }
+
+    fn hear(
         &mut self,
         said: Said,
         slots: &mut RepairSlots,
@@ -77,6 +146,33 @@ impl GraphJob {
         let admitted = match said.heard {
             Heard::Repaired(returned) => {
                 return self.repaired(node, said.generation, *returned, slots, limit);
+            }
+            Heard::RepairSlice(slice) => {
+                if self.loans.applying_under(node, said.generation)
+                    && !self.writer.repair_slice(
+                        &mut self.tree,
+                        &mut *self.builder,
+                        &self.root,
+                        *slice,
+                    )
+                {
+                    self.loans.end_apply();
+                }
+                return Ok(());
+            }
+            Heard::RepairRead(read) => {
+                if !self.loans.returned(node, said.generation) {
+                    return Ok(read.output.remove().map_err(WriteError::from)?);
+                }
+                let mut out = Vec::new();
+                let rebuilt = self.writer.repair_read(
+                    &mut self.tree,
+                    &mut *self.builder,
+                    &self.root,
+                    *read,
+                    &mut out,
+                )?;
+                return self.taken_back(rebuilt, out, slots, limit);
             }
             Heard::Replayed(replayed) => {
                 if !self.loans.returned(node, said.generation) {
@@ -301,6 +397,14 @@ impl GraphJob {
                 }
                 Vec::new()
             }
+            // Heard as an emit, its credit taken off by `run_said`.
+            Heard::Paid(emit, _) => {
+                let said = Said {
+                    heard: Heard::Emit(emit),
+                    ..said
+                };
+                return self.hear(said, slots, limit);
+            }
             Heard::Ended => {
                 // A member is closed by its engine alone, once it verified
                 // every byte of it: one a run left open stays open, and
@@ -404,6 +508,28 @@ impl GraphJob {
             returned,
             &mut out,
         )?;
+        // The return is applied a slice at a time, from its staged output
+        // read back off the loop (`Loans::apply`): its tail runs as the
+        // reader is done (`Heard::RepairRead`).
+        if let Some((set, output)) = self.writer.apply_output() {
+            match self.disk().cloned() {
+                Some(disk) => self.loans.apply(set, output, disk),
+                None => {
+                    self.writer.drop_apply(output).map_err(WriteError::from)?;
+                }
+            }
+            return Ok(());
+        }
+        self.taken_back(rebuilt, out, slots, limit)
+    }
+
+    fn taken_back(
+        &mut self,
+        rebuilt: Option<u64>,
+        mut out: Vec<weaver_graph::Effect>,
+        slots: &mut RepairSlots,
+        limit: usize,
+    ) -> Result<(), GraphError> {
         self.writer.refused_after_return(
             &mut self.tree,
             &mut *self.builder,

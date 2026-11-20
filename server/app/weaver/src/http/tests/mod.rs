@@ -1509,6 +1509,8 @@ fn sample_volumes() -> Vec<instr::VolumeSnapshot> {
                 length_sets_skipped: 8,
                 closes: 10,
                 close_nanos: 250_000_000,
+                write_outs: 7,
+                write_out_nanos: 1_750_000_000,
                 failed_operations: 2,
                 abandoned_operations: 5,
                 threads: 1,

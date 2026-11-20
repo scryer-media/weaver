@@ -22,6 +22,10 @@
 // from those of any other thread.
 //
 // Nothing here syncs: an operation has returned when its system call has.
+// On a share over the network, on Linux, the writer only starts the
+// write-out of each file every `WRITE_OUT_STRIDE` bytes written to it, so
+// the OS cannot pile up minutes of unwritten pages for a close to stand
+// behind (`write_out_due`): flow, not durability.
 
 use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fs::File;
@@ -38,6 +42,9 @@ use crate::clock::{Clock, SystemClock};
 
 use super::volume::{LoopWait, OWNERS, Reservation, Volume, WriterCounts};
 use super::volume_rate::RateSignal;
+
+mod credit;
+pub use credit::{Credit, Paying, Stand};
 
 // How a file that is not open is opened, made when it is not there, at the
 // length it is declared to reach when one is given, and under the folder it
@@ -670,10 +677,10 @@ impl VolumeWriters {
             let state = &lane.state;
             {
                 let _held = state
-                    .below_waiting
+                    .volume.below_waiting
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
-                state.below.notify_all();
+                state.volume.below.notify_all();
             }
             let keys = state
                 .aside
@@ -706,10 +713,10 @@ impl VolumeWriters {
             lane.state.woke.notify_all();
             let _held = lane
                 .state
-                .below_waiting
+                .volume.below_waiting
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            lane.state.below.notify_all();
+            lane.state.volume.below.notify_all();
         }
     }
 
@@ -762,6 +769,11 @@ struct Key {
     // A wait of the queuing thread on the key was given up at the end of a
     // stop, with what it waited for still out.
     gave_up: AtomicBool,
+    // Bytes counted on the volume that the queuing thread carries for the
+    // key's output it holds (`Credit`): what a producing thread's grant
+    // under the key is judged beside (`Volume::grant`). Changed by the
+    // queuing thread only.
+    carried: AtomicU64,
     // Refusals the caller has yet to hear and answer; no barrier of the key
     // passes while there are any.
     unheard: AtomicU32,
@@ -855,6 +867,7 @@ impl Key {
             failed: AtomicBool::new(false),
             abandoned: AtomicBool::new(false),
             gave_up: AtomicBool::new(false),
+            carried: AtomicU64::new(0),
             unheard: AtomicU32::new(0),
             submitted: AtomicU64::new(0),
             returned: AtomicU64::new(0),
@@ -1230,21 +1243,121 @@ impl Submitter {
         // made with the lock held: the writer lowers the bytes first and
         // looks for waiters after, so it either finds this one and wakes
         // it under the lock, or this look finds the bytes already lowered.
-        state.below_waiters.fetch_add(1, Ordering::SeqCst);
+        state.volume.below_waiters.fetch_add(1, Ordering::SeqCst);
         let mut held = state
-            .below_waiting
+            .volume.below_waiting
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         #[cfg(any(test, feature = "test-support"))]
-        state.below.notify_all();
+        state.volume.below.notify_all();
         while over() {
             held = state
-                .below
+                .volume.below
                 .wait(held)
                 .unwrap_or_else(PoisonError::into_inner);
         }
-        state.below_waiters.fetch_sub(1, Ordering::SeqCst);
+        state.volume.below_waiters.fetch_sub(1, Ordering::SeqCst);
         drop(held);
+    }
+
+    // A producing thread's wait to count `bytes` it is about to hand the
+    // queuing thread (`Credit::reserve`): it stands still here, on its own
+    // thread, until they are counted below the volume's hard limit
+    // (`Reservation::reserve_ahead`), and the reservation goes with the
+    // bytes. Nothing is reserved once the key stopped, by a failure or by
+    // being given up, or the volume has no writer thread: nothing more of
+    // the key is written then. `stand` says what a stop does to the wait:
+    // it ends it, or the wait keeps the volume's limit until the end of the
+    // stop, as the queuing thread's own waits do (`wait_room`), and the key
+    // says it gave up when that end passed with the bytes still over. The
+    // writer, and whoever gives counted bytes back, wake it; nothing is
+    // polled. Counted with the waits made aside, never the queuing
+    // thread's. The grant is judged beside what the queuing thread carries
+    // for the key (`Key::carried`), never beside another key's.
+    fn reserve_ahead(&self, bytes: u64, stand: Stand) -> Reservation {
+        let state = &self.lane.state;
+        let held = std::cell::RefCell::new(Reservation::none(Arc::clone(&state.volume)));
+        let over = || {
+            !self.ends_reserve(stand)
+                && !held
+                    .borrow_mut()
+                    .reserve_ahead(bytes, self.key.carried.load(Ordering::SeqCst))
+        };
+        if !over() {
+            return held.into_inner();
+        }
+        let began = Instant::now();
+        // Counted in before the look made under the lock, as in
+        // `wait_below`.
+        state.volume.below_waiters.fetch_add(1, Ordering::SeqCst);
+        let mut lock = state
+            .volume.below_waiting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        #[cfg(any(test, feature = "test-support"))]
+        state.volume.below.notify_all();
+        let below = match stand {
+            Stand::UntilStop => {
+                while over() {
+                    lock = state
+                        .volume.below
+                        .wait(lock)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
+                true
+            }
+            Stand::UntilStopsEnd => {
+                let below;
+                (lock, below) = state.wait_end.wait(&state.volume.below, lock, over);
+                below
+            }
+        };
+        state.volume.below_waiters.fetch_sub(1, Ordering::SeqCst);
+        drop(lock);
+        state
+            .volume
+            .writer
+            .aside_waited(began.elapsed().as_nanos() as u64);
+        if !below {
+            self.key.gave_up.store(true, Ordering::SeqCst);
+        }
+        held.into_inner()
+    }
+
+    // `reserve_ahead` without standing: `None` when the volume refuses the
+    // bytes now. Whatever ends a stand ends this too, with nothing counted.
+    fn try_reserve_ahead(&self, bytes: u64, stand: Stand) -> Option<Reservation> {
+        let mut held = Reservation::none(Arc::clone(&self.lane.state.volume));
+        (self.ends_reserve(stand)
+            || held.reserve_ahead(bytes, self.key.carried.load(Ordering::SeqCst)))
+        .then_some(held)
+    }
+
+    // Whether a producing thread's wait for room under the key ends with
+    // nothing counted: the key stopped, by a failure or by being given up,
+    // the volume has no writer thread, or the owner is stopping and `stand`
+    // ends the wait at that.
+    fn ends_reserve(&self, stand: Stand) -> bool {
+        self.key.failed.load(Ordering::SeqCst)
+            || self.key.abandoned.load(Ordering::SeqCst)
+            || self.lane.threadless.is_some()
+            || (stand == Stand::UntilStop && self.lane.state.stopped.load(Ordering::SeqCst))
+    }
+
+    // The bytes the queuing thread carries on the volume under the key
+    // changed by `more` and `less` (`Credit`).
+    fn carried(&self, more: u64, less: u64) {
+        let carried = &self.key.carried;
+        carried.fetch_add(more, Ordering::SeqCst);
+        let before = carried
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |carried| {
+                Some(carried.saturating_sub(less))
+            })
+            .unwrap_or_else(|carried| carried);
+        debug_assert!(before >= less, "a key uncarried more than it carried");
+        let volume = &self.lane.state.volume;
+        volume.carry(more);
+        volume.uncarry(less);
     }
 
     // The queuing thread's wait to queue `bytes` of its own: it stands
@@ -1268,15 +1381,15 @@ impl Submitter {
         let began = Instant::now();
         // Counted in before the look made under the lock, as in
         // `wait_below`.
-        state.below_waiters.fetch_add(1, Ordering::SeqCst);
+        state.volume.below_waiters.fetch_add(1, Ordering::SeqCst);
         let held = state
-            .below_waiting
+            .volume.below_waiting
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         #[cfg(any(test, feature = "test-support"))]
-        state.below.notify_all();
-        let (held, below) = state.wait_end.wait(&state.below, held, over);
-        state.below_waiters.fetch_sub(1, Ordering::SeqCst);
+        state.volume.below.notify_all();
+        let (held, below) = state.wait_end.wait(&state.volume.below, held, over);
+        state.volume.below_waiters.fetch_sub(1, Ordering::SeqCst);
         drop(held);
         state.waited(LoopWait::Budget, began);
         if !below {
@@ -1617,10 +1730,8 @@ struct LaneState {
     waiters: AtomicUsize,
     waiting: Mutex<()>,
     woke: Condvar,
-    // Threads standing in `Submitter::wait_below`, and what wakes them.
-    below_waiters: AtomicUsize,
-    below_waiting: Mutex<()>,
-    below: Condvar,
+    // Threads standing for room on the volume wait on the volume itself
+    // (`Volume::look_below`), so whoever lowers its count wakes them.
     // The owner is stopping: see `VolumeWriters::stop_waits`.
     stopped: Arc<AtomicBool>,
     // Where the queuing thread's own waits end once the owner is stopping.
@@ -1651,16 +1762,13 @@ impl LaneState {
             .loop_read(began.elapsed().as_nanos() as u64);
     }
 
-    // Have every thread in `Submitter::wait_below` look again: the bytes
-    // waiting fell, or a key stopped. One load when no thread waits.
+    // Have every thread standing for room on the volume look again: a key
+    // stopped, or what a requester carries changed (`Volume::look_below`;
+    // a lower count wakes them by itself). One load when no thread waits.
     fn look_below(&self) {
-        if self.below_waiters.load(Ordering::SeqCst) > 0 {
+        if self.volume.below_waited() {
             break_span();
-            let _held = self
-                .below_waiting
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            self.below.notify_all();
+            self.volume.look_below();
         }
     }
 
@@ -1682,8 +1790,11 @@ fn unbuffer(state: &LaneState, bytes: u64) {
     }
     let volume = &state.volume;
     volume.buffered_bytes.fetch_sub(bytes, Ordering::SeqCst);
+    // The release wakes whoever stands for room.
+    if volume.below_waited() {
+        break_span();
+    }
     volume.release(bytes);
-    state.look_below();
     state.owners.room(volume.take_wake());
 }
 
@@ -1714,9 +1825,6 @@ impl Lane {
             waiters: AtomicUsize::new(0),
             waiting: Mutex::new(()),
             woke: Condvar::new(),
-            below_waiters: AtomicUsize::new(0),
-            below_waiting: Mutex::new(()),
-            below: Condvar::new(),
             stopped,
             wait_end,
             aside: Mutex::default(),
@@ -1894,6 +2002,9 @@ struct Open {
     length: Option<u64>,
     // The file is in the key's closed files, its handle kept since a close.
     closed: bool,
+    // Bytes written through this handle since its last write-out, on a
+    // volume that starts them (`Volume::write_out`).
+    since_out: u64,
 }
 
 impl Held {
@@ -2012,6 +2123,7 @@ impl Held {
                     end: None,
                     length: opened.length,
                     closed: false,
+                    since_out: 0,
                 },
             );
         }
@@ -2047,6 +2159,61 @@ fn set_length(open: &mut Open, length: u64, counts: &WriterCounts) -> io::Result
 
 fn nanos_since(began: Instant) -> u64 {
     now().saturating_duration_since(began).as_nanos() as u64
+}
+
+// The bytes written to one file between two write-outs of it, on a volume
+// that starts them. Each write-out starts the write-out of what was written
+// since the last and waits for what that one started, so the OS holds at
+// most about two strides of a file unwritten, and the writer stands still
+// often and briefly instead of for minutes at a close.
+pub(crate) const WRITE_OUT_STRIDE: u64 = 32 * 1024 * 1024;
+
+// `wrote` more bytes went to `open` on `volume`: on a volume that starts
+// write-outs, start one once a stride of them has gone since the last. On
+// the writer's thread, timed for the volume's counts and not as write time.
+// A write-out that fails stops them on the volume; the write stands.
+fn write_out_due(volume: &Volume, open: &mut Open, wrote: u64) {
+    let Some(write_out) = volume.write_out(&open.file) else {
+        return;
+    };
+    open.since_out = open.since_out.saturating_add(wrote);
+    if open.since_out < WRITE_OUT_STRIDE {
+        return;
+    }
+    open.since_out = 0;
+    let began = now();
+    let started = write_out(&open.path, &open.file);
+    volume.writer.wrote_out(nanos_since(began));
+    break_span();
+    if let Err(error) = started {
+        volume.write_out_failed(&open.path, &error);
+    }
+}
+
+// Start the write-out of every page of `file` written and not yet sent,
+// after waiting for the write-out already under way for it: one
+// `sync_file_range` over the whole file with `WAIT_BEFORE | WRITE`. It
+// waits for no write-out it starts, and no metadata is written: it is no
+// sync, and no byte is on disk because it returned.
+#[cfg(target_os = "linux")]
+pub(super) fn start_write_out(_: &Path, file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: the descriptor is open for as long as `file` is borrowed; an
+    // offset and length of zero name the whole file.
+    let started = unsafe {
+        libc::sync_file_range(
+            file.as_raw_fd(),
+            0,
+            0,
+            libc::SYNC_FILE_RANGE_WAIT_BEFORE | libc::SYNC_FILE_RANGE_WRITE,
+        )
+    };
+    if started == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 // What a batch has come to so far.
@@ -2833,6 +3000,9 @@ fn perform(state: &LaneState, key: &Key, op: Op, forced: Option<io::Error>, ran:
                         .length
                         .filter(|_| wrote.is_ok())
                         .map(|length| length.max(end));
+                    if wrote.is_ok() {
+                        write_out_due(volume, open, bytes.len() as u64);
+                    }
                     // Its count fell as the call returned (`in_hand`). The
                     // last share of the buffer is freed here, as soon as it
                     // is written: the memory goes back while it is still
@@ -3088,12 +3258,12 @@ impl Hold {
     pub fn wait_below_waiters(&self, count: usize) {
         let state = &self.0.state;
         let mut held = state
-            .below_waiting
+            .volume.below_waiting
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        while state.below_waiters.load(Ordering::SeqCst) < count {
+        while state.volume.below_waiters.load(Ordering::SeqCst) < count {
             held = state
-                .below
+                .volume.below
                 .wait(held)
                 .unwrap_or_else(PoisonError::into_inner);
         }

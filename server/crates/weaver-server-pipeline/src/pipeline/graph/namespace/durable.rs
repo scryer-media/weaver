@@ -153,6 +153,8 @@ impl NamespaceWriter {
                 files.leaves.mark(member);
             }
             let (page_outs, spills) = files.holds.page_out_all(free_disk);
+            // Nothing of the namespace stays in memory to be carried for.
+            self.uncredit_node(node);
             for page_out in &page_outs {
                 free_disk = free_disk.saturating_sub(page_out.range.len());
                 self.scratch(node)?

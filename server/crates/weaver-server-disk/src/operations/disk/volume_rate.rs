@@ -629,6 +629,8 @@ fn writer_counts(volume: &Volume) -> crate::operations::instrumentation::VolumeW
         length_sets_skipped: counts.length_sets_skipped.load(Ordering::Relaxed),
         closes: counts.closes.load(Ordering::Relaxed),
         close_nanos: counts.close_nanos.load(Ordering::Relaxed),
+        write_outs: counts.write_outs.load(Ordering::Relaxed),
+        write_out_nanos: counts.write_out_nanos.load(Ordering::Relaxed),
         failed_operations: counts.failed_operations.load(Ordering::Relaxed),
         abandoned_operations: counts.abandoned_operations.load(Ordering::Relaxed),
         threads: counts.threads.load(Ordering::Relaxed),

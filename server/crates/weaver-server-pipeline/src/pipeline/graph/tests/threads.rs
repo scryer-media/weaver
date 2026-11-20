@@ -291,9 +291,9 @@ async fn a_run_reads_its_volume_once_the_volumes_thread_put_it_down() {
     retire_pipeline_database(pipeline).await;
 }
 
-// A run whose volume holds its budget of bytes for its writer says nothing
-// more until the volume is below it: the run stands on its own thread, the
-// loop never does, and the output is whole once the volume's thread goes on.
+// A run whose output fills its volume's budget says nothing more until the
+// volume is below it: the run stands on its own thread, the loop never
+// does, and the output is whole once the volume's thread goes on.
 #[tokio::test]
 async fn a_run_waits_on_its_own_thread_while_its_volume_holds_the_write_budget() {
     let _threads = threads::real();
@@ -322,14 +322,22 @@ async fn a_run_waits_on_its_own_thread_while_its_volume_holds_the_write_budget()
             gate: Some(Arc::clone(&gate)),
             ..Echoes::default()
         }));
-    let (volume, hold) = held(&pipeline, job_id);
+    // The archive is down before the volume stands still: the run reads
+    // it, and stands only for room for what it says.
     decode_all(&mut pipeline, job_id, &posts, 0).await;
-    assert!(volume.buffered_bytes.load(Ordering::Relaxed) > ARTICLE as u64);
+    pipeline.graph_jobs[&job_id]
+        .disk()
+        .unwrap()
+        .barrier()
+        .wait_aside();
+    let (volume, hold) = held(&pipeline, job_id);
+    let downloaded = volume.writer.loop_waits.load(Ordering::Relaxed);
     gate.started().await;
     gate.release();
-    // The run stands before the first thing it has to say.
+    // The run counts its output up to the limit, and stands for the rest.
     hold.wait_below_waiters(1);
-    no_loop_waits(&volume);
+    assert_eq!(volume.unwritten_bytes(), ARTICLE as u64);
+    assert_eq!(volume.writer.loop_waits.load(Ordering::Relaxed), downloaded);
     hold.open();
     drain_runs(&mut pipeline, job_id).await;
     pipeline.graph_jobs[&job_id]
@@ -436,10 +444,11 @@ async fn a_job_on_two_volumes_is_written_by_each_volumes_own_thread() {
     retire_pipeline_database(pipeline).await;
 }
 
-// A repair's output is said again by the loop itself, slice after slice in
-// one step. Onto a volume that stands still it queues no more than the
-// budget and a slice: the loop waits there, counted, and the repair is
-// whole once the volume's thread goes on.
+// A repair's output is read back on its own thread, slice after slice, each
+// paid for on the volume it lands on before its mail. Onto a volume that
+// stands still it counts no more than the budget and a slice: the reader
+// stands there, the loop never does, and the repair is whole once the
+// volume's thread goes on.
 #[tokio::test]
 async fn a_repair_larger_than_the_write_budget_is_applied_within_it() {
     let _threads = threads::real();
@@ -479,31 +488,42 @@ async fn a_repair_larger_than_the_write_budget_is_applied_within_it() {
     // only once the repair's return is in hand and everything before it is
     // down, so what the return queues is all that waits behind the hold.
     let mut watcher = None;
+    let mut downloaded = 0;
     while pipeline.graph_jobs[&job_id].repair_out() {
         let said = pipeline.graph_runs.recv().await.unwrap();
         if matches!(&said.heard, Heard::Repaired(returned) if matches!(returned.outcome, Some(RepairOutcome::Repaired { .. })))
         {
             disk.barrier().wait_aside();
+            // What the downloads waited, before the repair.
+            downloaded = budget_waits(&volume);
             let hold = pipeline.volume_writers.hold(&volume);
             let watched = Arc::clone(&volume);
             watcher = Some(std::thread::spawn(move || {
-                // The loop stands on the budget with one run queued.
+                // The reader stands on the budget with one slice counted.
                 hold.wait_below_waiters(1);
-                let queued = watched.buffered_bytes.load(Ordering::Relaxed);
+                let counted = watched.unwritten_bytes();
                 hold.open();
-                queued
+                counted
             }));
         }
         pipeline.graph_run_said(said);
     }
     let watcher = watcher.expect("the repair came back");
-    let queued = watcher.join().unwrap();
-    assert!(queued >= BUDGET, "{queued}");
-    assert!(queued <= BUDGET + ARTICLE as u64, "{queued}");
-    assert!(volume.writer.loop_waits.load(Ordering::Relaxed) >= 1);
+    let counted = watcher.join().unwrap();
+    assert!(counted >= BUDGET, "{counted}");
+    assert!(counted <= BUDGET + ARTICLE as u64, "{counted}");
+    assert_eq!(
+        budget_waits(&volume) - downloaded,
+        0,
+        "the loop stood still for the volume"
+    );
     disk.barrier().wait_aside();
     assert!(!disk.barrier().unwritten());
     assert_eq!(read(&working_dir.join("lantern.bin")), data);
+    // The repair's output is written: nothing is carried for it any more,
+    // though the job lives on.
+    assert_eq!(volume.carried_bytes(), 0);
+    assert!(pipeline.graph_jobs.contains_key(&job_id));
     retire_pipeline_database(pipeline).await;
 }
 
@@ -1099,16 +1119,25 @@ async fn a_stop_does_not_wait_for_a_run_held_by_the_write_budget_of_a_still_volu
             gate: Some(Arc::clone(&gate)),
             ..Echoes::default()
         }));
-    let (volume, hold) = held(&pipeline, job_id);
+    // The archive is down before the volume stands still: the run reads
+    // it, and stands only for room for what it says.
     decode_all(&mut pipeline, job_id, &posts, 0).await;
+    pipeline.graph_jobs[&job_id]
+        .disk()
+        .unwrap()
+        .barrier()
+        .wait_aside();
+    let (volume, hold) = held(&pipeline, job_id);
     gate.started().await;
     gate.release();
     hold.wait_below_waiters(1);
-    let queued = volume.buffered_bytes.load(Ordering::Relaxed);
-    assert!(queued > ARTICLE as u64);
+    let counted = volume.unwritten_bytes();
+    assert_eq!(counted, ARTICLE as u64, "the run counted up to the limit");
     stop_past_a_still_volume(&mut pipeline).await;
-    // The run said nothing more: no byte joined what the volume held.
-    assert_eq!(volume.buffered_bytes.load(Ordering::Relaxed), queued);
+    // The run said nothing more: the stop may hear what it said before it
+    // stood, which it had counted, and no byte past that joins the volume.
+    assert!(volume.buffered_bytes.load(Ordering::Relaxed) <= counted);
+    assert!(volume.unwritten_bytes() <= counted);
     assert!(!working_dir.join("echo-0.mkv").exists());
     assert_ne!(
         job_status_for_assert(&pipeline, job_id)
@@ -1223,10 +1252,11 @@ async fn a_stopped_repair_is_taken_back_once_its_volume_has_settled() {
 
 // A repair that comes back while the owner is stopping is applied within
 // the volume's limit like any other: the stop that sends producing threads
-// on does not send the loop on, so the loop stands still for the volume
-// with one run queued. When the stop's span ends with the volume still at
-// its limit the applying ends there: nothing more is queued, the job does
-// not fail, and it is left at its last written checkpoint.
+// on does not send the apply's reader on, so it stands still for the volume
+// with one slice counted, and the loop never does. When the stop's span
+// ends with the volume still at its limit the applying ends there: nothing
+// more is queued, the job does not fail, and it is left at its last
+// written checkpoint.
 #[tokio::test]
 async fn a_repair_applied_during_a_stop_keeps_the_volumes_limit_until_the_stops_end() {
     use weaver_server_base::clock::ManualClock;
@@ -1266,21 +1296,24 @@ async fn a_repair_applied_during_a_stop_keeps_the_volumes_limit_until_the_stops_
     // The repair's return is in hand and everything before it is down when
     // the stop is rung and the volume stands still.
     let mut watcher = None;
+    let mut downloaded = 0;
     while pipeline.graph_jobs[&job_id].repair_out() {
         let said = pipeline.graph_runs.recv().await.unwrap();
         if matches!(&said.heard, Heard::Repaired(returned) if matches!(returned.outcome, Some(RepairOutcome::Repaired { .. })))
         {
             disk.barrier().wait_aside();
+            // What the downloads waited, before the repair.
+            downloaded = budget_waits(&volume);
             let hold = pipeline.volume_writers.hold(&volume);
             let writers = Arc::clone(&pipeline.volume_writers);
             writers.end_waits_at(Arc::clone(&clock) as _, clock.instant(span));
             writers.stop_waits();
             let (watched, clock) = (Arc::clone(&volume), Arc::clone(&clock));
             watcher = Some(std::thread::spawn(move || {
-                // The loop stands on the limit with one run queued, the
-                // stop notwithstanding.
+                // The reader stands on the limit with one slice counted,
+                // the stop notwithstanding.
                 hold.wait_below_waiters(1);
-                let queued = watched.buffered_bytes.load(Ordering::SeqCst);
+                let queued = watched.unwritten_bytes();
                 // The stop's span ends with the volume still at its limit.
                 clock.move_to(span);
                 writers.look_again();
@@ -1292,9 +1325,13 @@ async fn a_repair_applied_during_a_stop_keeps_the_volumes_limit_until_the_stops_
     let (hold, queued) = watcher.expect("the repair came back").join().unwrap();
     assert!(queued >= BUDGET, "{queued}");
     assert!(queued <= BUDGET + ARTICLE as u64, "{queued}");
-    // Nothing joined what the volume held once the span was over.
-    assert_eq!(volume.buffered_bytes.load(Ordering::SeqCst), queued);
-    assert!(volume.writer.loop_waits.load(Ordering::Relaxed) >= 1);
+    // Nothing joined what the volume counts once the span was over.
+    assert_eq!(volume.unwritten_bytes(), queued);
+    assert_eq!(
+        budget_waits(&volume) - downloaded,
+        0,
+        "the loop stood still for the volume"
+    );
     let graph = &pipeline.graph_jobs[&job_id];
     assert!(graph.disk().unwrap().left_at_stop());
     assert!(
@@ -2118,5 +2155,452 @@ async fn a_name_a_volumes_thread_refuses_is_skipped_once_over_later_writes() {
         !listed.iter().any(|listed| listed.ends_with(".bin")),
         "{listed:?}"
     );
+    retire_pipeline_database(pipeline).await;
+}
+
+// A job whose working directory and delivered files lie on two volumes of
+// their own: scratch under the intermediate root, the delivered files in
+// the movies category's folder. The volumes are sized on `figure` as the
+// job is admitted. Where the delivered files are staged.
+async fn delivered_apart(
+    temp_dir: &tempfile::TempDir,
+    job_id: JobId,
+    posts: &[Post],
+    figure: Option<u64>,
+) -> (Pipeline, PathBuf) {
+    let (intermediate, complete, movies) = (
+        temp_dir.path().join("intermediate"),
+        temp_dir.path().join("complete"),
+        temp_dir.path().join("movies"),
+    );
+    weaver_server_disk::runtime::fs::test_devices::assign(&intermediate, 1);
+    weaver_server_disk::runtime::fs::test_devices::assign(&complete, 2);
+    weaver_server_disk::runtime::fs::test_devices::assign(&movies, 3);
+    let (mut pipeline, _, _) = crate::pipeline::tests::new_direct_pipeline_at_roots(
+        temp_dir.path().join("data"),
+        intermediate,
+        complete,
+        temp_dir.path().join("weaver.db"),
+        16 * 1024 * 1024,
+        0,
+        None,
+    )
+    .await;
+    pipeline.config.write().await.categories = vec![crate::categories::CategoryConfig {
+        id: 0,
+        name: "movies".to_string(),
+        dest_dir: Some(movies.display().to_string()),
+        aliases: String::new(),
+        seeding: None,
+        torrent_route: false,
+        unpack: None,
+        upload_cap: Default::default(),
+    }];
+    if let Some(figure) = figure {
+        pipeline.volume_buffers.set_figure(figure, u64::MAX);
+    }
+    let mut spec = spec("lantern joined", posts, ARTICLE);
+    spec.category = Some("movies".to_string());
+    let nzb_zstd = crate::pipeline::tests::nzb_zstd_for(&spec);
+    pipeline
+        .add_job(
+            job_id,
+            spec,
+            PathBuf::from("lantern.nzb"),
+            nzb_zstd,
+            crate::jobs::AddJobOptions::default(),
+        )
+        .await
+        .unwrap();
+    crate::pipeline::tests::activate_job(&mut pipeline, job_id).await;
+    let staging_dir = crate::pipeline::queue::staging_dir_for(&movies, job_id);
+    (pipeline, staging_dir)
+}
+
+// The job's scratch volume and the volume its delivered files land on,
+// told apart.
+fn working_and_output(
+    pipeline: &Pipeline,
+    job_id: JobId,
+    staging_dir: &std::path::Path,
+) -> (Arc<Volume>, Arc<Volume>) {
+    let disk = pipeline.graph_jobs[&job_id].disk().unwrap();
+    let working = Arc::clone(disk.working().volume());
+    let output = Arc::clone(disk.under(staging_dir).volume());
+    assert!(!Arc::ptr_eq(&working, &output));
+    (working, output)
+}
+
+// How often the loop stood still for the volume's write budget.
+fn budget_waits(volume: &Volume) -> u64 {
+    volume.writer.loop_waits_by_kind
+        [weaver_server_disk::operations::disk::volume::LoopWait::Budget as usize]
+        .load(Ordering::Relaxed)
+}
+
+// The first file of `posts` loses every other one of its eight articles;
+// the others arrive, and so does every file after it up to `last`.
+async fn lose_every_other_article(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    posts: &[Post],
+    last: u32,
+) {
+    for ordinal in [1, 3, 5, 7] {
+        decode(pipeline, job_id, posts, 0, ordinal, true).await;
+    }
+    for ordinal in [0, 2, 4, 6] {
+        pipeline.book_terminal_segment(
+            segment_id(job_id, 0, ordinal),
+            SegmentTerminalState::Missing,
+        );
+    }
+    for index in 1..last {
+        decode_all(pipeline, job_id, posts, index).await;
+    }
+}
+
+// Hear the job's mail until a thread stands for room on the held volume.
+// A producing thread counts its output on each of the job's volumes, and
+// what it counted on those the output does not land on is freed only as
+// the loop hears it: a test that stopped hearing would hold it there.
+async fn hear_until_one_stands(pipeline: &mut Pipeline, hold: Hold) -> Hold {
+    let (stood, mut standing) = tokio::sync::oneshot::channel();
+    let watcher = std::thread::spawn(move || {
+        hold.wait_below_waiters(1);
+        let _ = stood.send(());
+        hold
+    });
+    loop {
+        tokio::select! {
+            _ = &mut standing => break,
+            Some(said) = pipeline.graph_runs.recv() => pipeline.graph_run_said(said),
+        }
+    }
+    watcher.join().unwrap()
+}
+
+// Whether the mail is the return of a repair that rebuilt what it was for.
+fn repaired(said: &crate::pipeline::graph::engine::Said) -> bool {
+    matches!(&said.heard, Heard::Repaired(returned) if matches!(returned.outcome, Some(RepairOutcome::Repaired { .. })))
+}
+
+// The staged output of the job's repair, as the repair left it.
+fn staged_repair(working_dir: &std::path::Path) -> Option<PathBuf> {
+    std::fs::read_dir(working_dir.join(weaver_graph::names::INTERNAL_DIR))
+        .ok()?
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "repaired"))
+}
+
+// An extraction whose output lands on a volume of its own that stands
+// still, sized below what the extraction writes: the run pays for each
+// output on its own thread, against the volume it lands on, and the loop
+// never stands still for it. The volume never counts more than its limit,
+// or than it held when the run first stood.
+#[tokio::test]
+async fn an_extraction_onto_a_still_output_volume_never_stops_the_loop() {
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_490);
+    let body = payload(6 * ARTICLE + 5, 6);
+    let posts = vec![echo_volume(0, &body)];
+    // Above the 160 bytes the loop holds of a member before its first
+    // write: a limit below that can never be met by a thread that pays.
+    let (mut pipeline, staging_dir) =
+        delivered_apart(&temp_dir, job_id, &posts, Some(4 * ARTICLE as u64)).await;
+    pipeline
+        .graph_jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .set_builder(Box::new(Echoes {
+            volumes: 1,
+            ..Echoes::default()
+        }));
+    let disk = pipeline.graph_jobs[&job_id].disk().unwrap().clone();
+    let (_, output) = working_and_output(&pipeline, job_id, &staging_dir);
+    let (_, hard) = output.buffer_limits();
+    let hold = pipeline.volume_writers.hold(&output);
+    let watched = Arc::clone(&output);
+    let watcher = std::thread::spawn(move || {
+        // The run stands on its own thread for the output volume.
+        hold.wait_below_waiters(1);
+        let seen = (
+            watched.buffered_bytes.load(Ordering::Relaxed),
+            watched.unwritten_bytes(),
+        );
+        hold.open();
+        seen
+    });
+    decode_all(&mut pipeline, job_id, &posts, 0).await;
+    drain_runs(&mut pipeline, job_id).await;
+    let (buffered, counted) = watcher.join().unwrap();
+    disk.barrier().wait_aside();
+    assert_eq!(read(&staging_dir.join("echo-0.mkv")), body);
+    assert_eq!(budget_waits(&output), 0, "the loop stood still for the volume");
+    assert!(counted <= hard.max(buffered), "{counted} over {hard}");
+    retire_pipeline_database(pipeline).await;
+}
+
+// A repair whose member lies on a volume of its own that stands still,
+// sized below a slice: the return is read back and paid for on its own
+// thread, a slice a mail, against the volume it lands on. The loop never
+// stands still for the volume, and the volume never counts two slices.
+#[tokio::test]
+async fn a_repair_onto_a_still_output_volume_never_stops_the_loop() {
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_491);
+    let data = payload(8 * ARTICLE, 4);
+    let mut posts = vec![Post::plain("lantern.bin", data.clone())];
+    posts.extend(par2_set("lantern", &[("lantern.bin", &data)], 4));
+    let (mut pipeline, staging_dir) = delivered_apart(&temp_dir, job_id, &posts, Some(1)).await;
+    let last = posts.len() as u32;
+    lose_every_other_article(&mut pipeline, job_id, &posts, last).await;
+    assert!(pipeline.graph_jobs[&job_id].repair_out());
+    let disk = pipeline.graph_jobs[&job_id].disk().unwrap().clone();
+    let (_, output) = working_and_output(&pipeline, job_id, &staging_dir);
+    let (_, hard) = output.buffer_limits();
+    // What the downloads waited, before any repair.
+    let downloaded = budget_waits(&output);
+    let mut watcher = None;
+    let (mut slices, mut over) = (0u32, 0u64);
+    while pipeline.graph_jobs[&job_id].repair_out() {
+        let said = pipeline.graph_runs.recv().await.unwrap();
+        if repaired(&said) {
+            disk.barrier().wait_aside();
+            let hold = pipeline.volume_writers.hold(&output);
+            watcher = Some(std::thread::spawn(move || {
+                // A disk that writes one slice each time the reader stands
+                // on the volume; the third time it opens.
+                for _ in 0..2 {
+                    hold.wait_below_waiters(1);
+                    hold.release(1);
+                }
+                hold.wait_below_waiters(1);
+                hold.open();
+            }));
+        }
+        if matches!(&said.heard, Heard::RepairSlice(_)) {
+            slices += 1;
+        }
+        pipeline.graph_run_said(said);
+        // One slice may stand alone over a limit smaller than it; two never.
+        let counted = output.unwritten_bytes();
+        if counted > hard.max(ARTICLE as u64) {
+            over = over.max(counted);
+        }
+    }
+    watcher.expect("the repair came back").join().unwrap();
+    disk.barrier().wait_aside();
+    assert_eq!(read(&staging_dir.join("lantern.bin")), data);
+    assert_eq!(slices, 4);
+    assert_eq!(
+        budget_waits(&output) - downloaded,
+        0,
+        "the loop stood still for the output volume"
+    );
+    assert_eq!(over, 0, "more than one slice was counted over the limit");
+    retire_pipeline_database(pipeline).await;
+}
+
+// An article of a file outside the set arrives between two slices of a
+// repair being applied: both files end whole.
+#[tokio::test]
+async fn an_article_between_a_repairs_slices_lands_whole() {
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_492);
+    let data = payload(8 * ARTICLE, 4);
+    let other = payload(2 * ARTICLE, 9);
+    let mut posts = vec![Post::plain("lantern.bin", data.clone())];
+    posts.extend(par2_set("lantern", &[("lantern.bin", &data)], 4));
+    posts.push(Post::plain("other.bin", other.clone()));
+    let last = posts.len() as u32 - 1;
+    let (mut pipeline, staging_dir) = delivered_apart(&temp_dir, job_id, &posts, None).await;
+    decode(&mut pipeline, job_id, &posts, last, 1, true).await;
+    lose_every_other_article(&mut pipeline, job_id, &posts, last).await;
+    assert!(pipeline.graph_jobs[&job_id].repair_out());
+    let disk = pipeline.graph_jobs[&job_id].disk().unwrap().clone();
+    let mut between = false;
+    while pipeline.graph_jobs[&job_id].repair_out() {
+        let said = pipeline.graph_runs.recv().await.unwrap();
+        pipeline.graph_run_said(said);
+        if !between && pipeline.graph_jobs[&job_id].slices_applied() == 2 {
+            between = true;
+            decode(&mut pipeline, job_id, &posts, last, 0, true).await;
+        }
+    }
+    assert!(between, "the article arrived between two slices");
+    disk.barrier().wait_aside();
+    assert_eq!(read(&staging_dir.join("lantern.bin")), data);
+    assert_eq!(read(&staging_dir.join("other.bin")), other);
+    retire_pipeline_database(pipeline).await;
+}
+
+// An article of the member being repaired, one it had lost, arrives late
+// between two slices of the repair: it is the bytes the repair writes, and
+// the member ends whole.
+#[tokio::test]
+async fn a_lost_article_arriving_during_its_repair_leaves_the_member_whole() {
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_493);
+    let data = payload(8 * ARTICLE, 4);
+    let mut posts = vec![Post::plain("lantern.bin", data.clone())];
+    posts.extend(par2_set("lantern", &[("lantern.bin", &data)], 4));
+    let last = posts.len() as u32;
+    let (mut pipeline, staging_dir) = delivered_apart(&temp_dir, job_id, &posts, None).await;
+    lose_every_other_article(&mut pipeline, job_id, &posts, last).await;
+    assert!(pipeline.graph_jobs[&job_id].repair_out());
+    let disk = pipeline.graph_jobs[&job_id].disk().unwrap().clone();
+    let mut between = false;
+    while pipeline.graph_jobs[&job_id].repair_out() {
+        let said = pipeline.graph_runs.recv().await.unwrap();
+        pipeline.graph_run_said(said);
+        if !between && pipeline.graph_jobs[&job_id].slices_applied() == 2 {
+            between = true;
+            decode(&mut pipeline, job_id, &posts, 0, 6, true).await;
+        }
+    }
+    assert!(between, "the article arrived between two slices");
+    disk.barrier().wait_aside();
+    assert_eq!(read(&staging_dir.join("lantern.bin")), data);
+    assert_ne!(
+        job_status_for_assert(&pipeline, job_id)
+            .map(|status| matches!(status, JobStatus::Failed { .. })),
+        Some(true)
+    );
+    retire_pipeline_database(pipeline).await;
+}
+
+// The last article of the recovery volume, one block more than the repair
+// needs, arrives between two slices of the repair: the member ends whole.
+#[tokio::test]
+async fn a_recovery_article_arriving_during_a_repair_leaves_the_member_whole() {
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_494);
+    let data = payload(8 * ARTICLE, 4);
+    let mut posts = vec![Post::plain("lantern.bin", data.clone())];
+    posts.extend(par2_set("lantern", &[("lantern.bin", &data)], 5));
+    let recovery = posts.len() as u32 - 1;
+    let (mut pipeline, staging_dir) = delivered_apart(&temp_dir, job_id, &posts, None).await;
+    lose_every_other_article(&mut pipeline, job_id, &posts, recovery).await;
+    let held_back = posts[recovery as usize].articles(ARTICLE).count() as u32 - 1;
+    for ordinal in 0..held_back {
+        decode(&mut pipeline, job_id, &posts, recovery, ordinal, true).await;
+    }
+    assert!(pipeline.graph_jobs[&job_id].repair_out());
+    let disk = pipeline.graph_jobs[&job_id].disk().unwrap().clone();
+    let mut between = false;
+    while pipeline.graph_jobs[&job_id].repair_out() {
+        let said = pipeline.graph_runs.recv().await.unwrap();
+        pipeline.graph_run_said(said);
+        if !between && pipeline.graph_jobs[&job_id].slices_applied() == 2 {
+            between = true;
+            decode(&mut pipeline, job_id, &posts, recovery, held_back, true).await;
+        }
+    }
+    assert!(between, "the article arrived between two slices");
+    disk.barrier().wait_aside();
+    assert_eq!(read(&staging_dir.join("lantern.bin")), data);
+    retire_pipeline_database(pipeline).await;
+}
+
+// A stop while a repair's return is read back onto a volume of its own that
+// does not put it down: the reader stands for the volume until the stop's
+// span is over, the loop never does, and the stop does not wait for the
+// volume past its span. The return is not applied, its staged output goes,
+// and the job is left at its last checkpoint without failing.
+#[tokio::test]
+async fn a_stop_during_an_apply_onto_a_still_output_volume_leaves_the_job_at_its_checkpoint() {
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_495);
+    let data = payload(8 * ARTICLE, 4);
+    let mut posts = vec![Post::plain("lantern.bin", data.clone())];
+    posts.extend(par2_set("lantern", &[("lantern.bin", &data)], 4));
+    let (mut pipeline, staging_dir) = delivered_apart(&temp_dir, job_id, &posts, Some(1)).await;
+    let last = posts.len() as u32;
+    lose_every_other_article(&mut pipeline, job_id, &posts, last).await;
+    assert!(pipeline.graph_jobs[&job_id].repair_out());
+    let disk = pipeline.graph_jobs[&job_id].disk().unwrap().clone();
+    let (_, output) = working_and_output(&pipeline, job_id, &staging_dir);
+    let downloaded = budget_waits(&output);
+    let working_dir = pipeline.jobs[&job_id].working_dir.clone();
+    let mut hold = None;
+    while !pipeline.graph_jobs[&job_id].applying_repair() {
+        let said = pipeline.graph_runs.recv().await.unwrap();
+        if repaired(&said) {
+            disk.barrier().wait_aside();
+            hold = Some(pipeline.volume_writers.hold(&output));
+        }
+        pipeline.graph_run_said(said);
+    }
+    let hold = hold.expect("the repair came back");
+    // The reader's first slice is queued, and it stands for the second.
+    let hold = hear_until_one_stands(&mut pipeline, hold).await;
+    stop_past_a_still_volume(&mut pipeline).await;
+    let graph = &pipeline.graph_jobs[&job_id];
+    assert!(!graph.applying_repair());
+    assert!(graph.disk().unwrap().left_at_stop());
+    assert!(
+        graph.pending().given_up(),
+        "the job is left at its last checkpoint"
+    );
+    assert_eq!(staged_repair(&working_dir), None);
+    assert_eq!(budget_waits(&output) - downloaded, 0);
+    assert_ne!(
+        job_status_for_assert(&pipeline, job_id)
+            .map(|status| matches!(status, JobStatus::Failed { .. })),
+        Some(true)
+    );
+    hold.open();
+    pipeline.volume_writers.settle();
+    retire_pipeline_database(pipeline).await;
+}
+
+// A repair whose staged output cannot be read back: the first slice fails,
+// nothing more is read, the job fails with the read's error, and the staged
+// output goes.
+#[tokio::test]
+async fn a_repair_whose_slice_cannot_be_read_back_fails_the_job() {
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_496);
+    let data = payload(8 * ARTICLE, 4);
+    let mut posts = vec![Post::plain("lantern.bin", data.clone())];
+    posts.extend(par2_set("lantern", &[("lantern.bin", &data)], 4));
+    let (mut pipeline, _) = delivered_apart(&temp_dir, job_id, &posts, None).await;
+    let last = posts.len() as u32;
+    lose_every_other_article(&mut pipeline, job_id, &posts, last).await;
+    assert!(pipeline.graph_jobs[&job_id].repair_out());
+    let working_dir = pipeline.jobs[&job_id].working_dir.clone();
+    let mut slices = 0u32;
+    while !matches!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Failed { .. })
+    ) {
+        let said = pipeline.graph_runs.recv().await.unwrap();
+        if repaired(&said) {
+            // The output is cut short before the reader opens it.
+            let staged = staged_repair(&working_dir).expect("the repair staged its output");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(staged)
+                .unwrap()
+                .set_len(0)
+                .unwrap();
+        }
+        if matches!(&said.heard, Heard::RepairSlice(_)) {
+            slices += 1;
+        }
+        pipeline.graph_run_said(said);
+    }
+    assert_eq!(slices, 1, "nothing was read after the failed slice");
+    assert_eq!(staged_repair(&working_dir), None);
+    settle_failed_releases(&mut pipeline).await;
+    assert!(!pipeline.jobs.contains_key(&job_id));
     retire_pipeline_database(pipeline).await;
 }

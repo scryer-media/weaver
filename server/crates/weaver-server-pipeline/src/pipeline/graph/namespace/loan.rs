@@ -411,6 +411,15 @@ pub(crate) struct Repaired {
     gave_back: u64,
 }
 
+impl std::fmt::Debug for Repaired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Repaired")
+            .field("runs", &self.runs.len())
+            .field("written", &self.written)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Repaired {
     fn new(
         working_dir: &std::path::Path,

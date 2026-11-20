@@ -13,6 +13,7 @@ mod passwords;
 mod repair;
 pub(crate) mod restore;
 mod runs;
+pub(crate) use runs::discard_unheard;
 mod works;
 
 use std::collections::BTreeMap;
@@ -459,12 +460,20 @@ impl GraphJob {
         self.loans.out()
     }
 
-    // Whether an object of the job is out for its work, or a give-up has
-    // volumes left to read back. No checkpoint is taken meanwhile: its facts
-    // as it left hold the work undone, which a restart could not always do
-    // without the tree, and a tree half given up is no state to restore. A
-    // restart gives up again from the checkpoint before.
+    // Whether an object of the job is out for its work, a give-up has
+    // volumes left to read back, or a repair's return is being applied. No
+    // checkpoint is taken meanwhile: its facts as it left hold the work
+    // undone, which a restart could not always do without the tree, and a
+    // tree half given up or half repaired is no state to restore. A restart
+    // gives up or repairs again from the checkpoint before.
     pub(crate) fn working(&self) -> bool {
+        self.held_by_work() || self.loans.applying()
+    }
+
+    // Whether an object of the job is out for its work or a give-up has
+    // volumes left: what the loop takes back before the next article. A
+    // return being applied speaks through the mail as a repair does.
+    pub(crate) fn held_by_work(&self) -> bool {
         self.works.working() || self.quieting.is_some()
     }
 
@@ -692,6 +701,18 @@ impl GraphJob {
     // thread. A repair and a replay write the job's files as they go.
     pub(in crate::pipeline) fn loan_out(&self) -> bool {
         self.loans.out()
+    }
+
+    // Whether a repair's return is being applied a slice at a time.
+    #[cfg(test)]
+    pub(crate) fn applying_repair(&self) -> bool {
+        self.loans.applying()
+    }
+
+    // How many slices of the return being applied were placed so far.
+    #[cfg(test)]
+    pub(crate) fn slices_applied(&self) -> u64 {
+        self.writer.slices_applied()
     }
 
     // Seam for status: whether a repair of the job is out on a thread.

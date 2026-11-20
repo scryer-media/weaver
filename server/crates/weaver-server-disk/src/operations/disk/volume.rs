@@ -1,11 +1,33 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::fs::File;
+use std::io;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 
 use super::StorageKind;
 use super::reader::VolumeReads;
+
+// How a volume's writer starts the write-out of what it wrote to an open
+// file and waits for the write-out it started before
+// (`Volume::write_out`), given the file's path and handle.
+pub(crate) type WriteOut = Arc<dyn Fn(&Path, &File) -> io::Result<()> + Send + Sync>;
+
+// The write-out of a volume whose first opened file is `file`: on Linux,
+// one for a share over the network (`writer::start_write_out`).
+#[cfg(target_os = "linux")]
+fn default_write_out(file: &File) -> Option<WriteOut> {
+    super::storage_kind::file_on_network(file)
+        .then(|| Arc::new(super::writer::start_write_out) as WriteOut)
+}
+
+// Elsewhere none: a share there was not seen to pile up unwritten pages.
+#[cfg(not(target_os = "linux"))]
+fn default_write_out(_: &File) -> Option<WriteOut> {
+    None
+}
 
 // The most of a volume's hard limit one write counts at once
 // (`Volume::write_piece`).
@@ -52,6 +74,19 @@ pub struct Volume {
     // owner prepays and writes from one thread; only that thread reads or
     // changes its slot.
     pub(super) prepaid: [AtomicU64; OWNERS],
+    // Bytes of `counted_bytes` the queuing thread carries from one step to
+    // the next for output it still holds in memory and will write here
+    // (`writer::Credit`), for every owner's job together: a gauge. Never
+    // more than `counted_bytes`.
+    carried_bytes: AtomicU64,
+    // Threads standing still for the volume's counted or buffered bytes to
+    // fall (`Submitter::wait_below`, `Submitter::wait_room`, and a producer
+    // in `writer::Credit::reserve`), and what wakes them. Every path that
+    // lowers the count wakes them (`release`), as does a stop or a failure
+    // of a key they wait under. One load when no thread stands.
+    pub(super) below_waiters: AtomicUsize,
+    pub(super) below_waiting: Mutex<()>,
+    pub(super) below: Condvar,
     // The volume's buffer limits. Nothing is reserved or counted past the
     // hard one (`Reservation::reserve`, `fits`); the soft limit is a
     // reported figure.
@@ -80,6 +115,12 @@ pub struct Volume {
     // Its read turns, made with its kind when first asked for
     // (`Volume::reads`).
     reads: OnceLock<VolumeReads>,
+    // How its writer starts the write-out of what it wrote to a file
+    // (`Volume::write_out`): found with the first file its writer opens
+    // there; `None` on a volume that needs none.
+    write_out: OnceLock<Option<WriteOut>>,
+    // A write-out failed: the writer starts none on the volume again.
+    write_out_off: AtomicBool,
 }
 
 // A volume writer's own counts. Each is one relaxed add per event.
@@ -124,6 +165,11 @@ pub struct WriterCounts {
     // Handles the writer dropped, and the time inside those drops.
     pub(crate) closes: AtomicU64,
     pub(crate) close_nanos: AtomicU64,
+    // Write-outs the writer started on a share, each after a stride of a
+    // file's writes (`writer::WRITE_OUT_STRIDE`), and the time inside those
+    // calls, which wait for the write-out the one before started.
+    pub(crate) write_outs: AtomicU64,
+    pub(crate) write_out_nanos: AtomicU64,
     // Operations that came back with an error.
     pub(crate) failed_operations: AtomicU64,
     // Operations not run: their caller gave its files up, or an earlier
@@ -206,6 +252,12 @@ impl WriterCounts {
         self.closes.fetch_add(handles, Ordering::Relaxed);
         self.close_nanos.fetch_add(nanos, Ordering::Relaxed);
     }
+
+    // The writer started a write-out in `nanos`. Relaxed adds.
+    pub(crate) fn wrote_out(&self, nanos: u64) {
+        self.write_outs.fetch_add(1, Ordering::Relaxed);
+        self.write_out_nanos.fetch_add(nanos, Ordering::Relaxed);
+    }
 }
 
 impl std::fmt::Debug for Volume {
@@ -231,6 +283,10 @@ impl Volume {
             counted_bytes: AtomicU64::new(0),
             peak_bytes: AtomicU64::new(0),
             prepaid: std::array::from_fn(|_| AtomicU64::new(0)),
+            carried_bytes: AtomicU64::new(0),
+            below_waiters: AtomicUsize::new(0),
+            below_waiting: Mutex::new(()),
+            below: Condvar::new(),
             buffer_soft_bytes: AtomicU64::new(u64::MAX),
             buffer_hard_bytes: AtomicU64::new(u64::MAX),
             wake_line: AtomicU64::new(0),
@@ -240,7 +296,51 @@ impl Volume {
             throughput: AtomicU64::new(0),
             writer: WriterCounts::default(),
             reads: OnceLock::new(),
+            write_out: OnceLock::new(),
+            write_out_off: AtomicBool::new(false),
         }
+    }
+
+    // How the volume's writer starts the write-out of a file it wrote to:
+    // found once, with `file`, the first file it opens on the volume, and
+    // kept. On Linux a share over the network gets one: there a buffered
+    // write returns at once and the kernel lets gigabytes of the share's
+    // pages pile up unwritten, which a later close or write then stands
+    // behind for minutes. Nothing elsewhere, nor on a local disk, nor once
+    // a write-out failed (`Volume::write_out_failed`). Called on the
+    // writer's thread only.
+    pub(crate) fn write_out(&self, file: &File) -> Option<&WriteOut> {
+        if self.write_out_off.load(Ordering::Relaxed) {
+            return None;
+        }
+        self.write_out
+            .get_or_init(|| default_write_out(file))
+            .as_ref()
+    }
+
+    // A write-out on the volume failed with `error`, at `path`: none is
+    // started on it again, and the first failure is logged. The write it
+    // followed stands; nothing fails because of it.
+    pub(crate) fn write_out_failed(&self, path: &Path, error: &io::Error) {
+        if !self.write_out_off.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                volume = %self.label,
+                path = %path.display(),
+                %error,
+                "a volume's writer could not start the write-out of a file on a share; it starts none on the volume again"
+            );
+        }
+    }
+
+    // The volume's writer starts each write-out through `write_out`, as on
+    // a share, for a test.
+    #[cfg(test)]
+    pub(crate) fn write_out_for_test(
+        &self,
+        write_out: impl Fn(&Path, &File) -> io::Result<()> + Send + Sync + 'static,
+    ) {
+        let set = self.write_out.set(Some(Arc::new(write_out)));
+        assert!(set.is_ok(), "a volume's write-out is set once");
     }
 
     // The volume's read turns, shared by everything that reads files on it.
@@ -283,8 +383,16 @@ impl Volume {
     // Count `bytes` if they fit below the hard limit less `keep`. A volume
     // that counts nothing grants one request whatever its size, so a
     // request larger than the limit is still granted, alone. A volume not
-    // sized grants everything.
-    fn grant(&self, bytes: u64, keep: u64) -> bool {
+    // sized grants everything. `own_carried` are bytes the requester's own
+    // queuing thread carries here for output it holds (`writer::Credit`):
+    // the request is judged as though they were not counted, since nothing
+    // its writer could write frees them, only more of the output they are
+    // held for, which this request is. Only when they are all the volume
+    // counts is the request granted on that account, alone, as on an empty
+    // volume: then nothing else can make room, and the volume passes its
+    // limit by that one requester's held bytes. Whenever anything else is
+    // counted, carried or not, the request waits for room as any other.
+    fn grant(&self, bytes: u64, keep: u64, own_carried: u64) -> bool {
         let (_, hard) = self.buffer_limits();
         let limit = if hard == u64::MAX {
             u64::MAX
@@ -294,7 +402,7 @@ impl Volume {
         let granted =
             self.counted_bytes
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |counted| {
-                    (counted == 0 || counted.saturating_add(bytes) <= limit)
+                    (counted <= own_carried || counted.saturating_add(bytes) <= limit)
                         .then(|| counted.saturating_add(bytes))
                 });
         match granted {
@@ -340,8 +448,12 @@ impl Volume {
     // `bytes` counted no longer count: given back, or written by the
     // writer. The count never goes below zero: a release of more than it
     // holds is a fault, and wrapping would stop the volume's grants for
-    // good.
+    // good. Every thread standing for room here looks again: whoever lowers
+    // the count, through whatever path, wakes them (`look_below`).
     pub(super) fn release(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
         let before = self
             .counted_bytes
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |counted| {
@@ -349,6 +461,50 @@ impl Volume {
             })
             .unwrap_or_else(|counted| counted);
         debug_assert!(before >= bytes, "a volume released more than it counted");
+        self.look_below();
+    }
+
+    // Whether any thread stands for room on the volume. One load.
+    pub(super) fn below_waited(&self) -> bool {
+        self.below_waiters.load(Ordering::SeqCst) > 0
+    }
+
+    // Have every thread standing for room on the volume look again: the
+    // count fell, a key it waits under stopped, or the bytes a requester
+    // carries changed. A standing thread counts itself in before the look
+    // it makes under the lock, and whoever lowers the count lowers it
+    // first and looks here after, so a wake is never missed. One load when
+    // no thread stands.
+    pub(super) fn look_below(&self) {
+        if self.below_waited() {
+            let _held = self
+                .below_waiting
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            self.below.notify_all();
+        }
+    }
+
+    // `bytes` counted are carried by the queuing thread from here
+    // (`carried_bytes`), or no longer are. The requester's own count of
+    // them (`writer::Key`) is what a grant judges by; this is the sum.
+    pub(super) fn carry(&self, bytes: u64) {
+        self.carried_bytes.fetch_add(bytes, Ordering::SeqCst);
+    }
+
+    pub(super) fn uncarry(&self, bytes: u64) {
+        let before = self
+            .carried_bytes
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |carried| {
+                Some(carried.saturating_sub(bytes))
+            })
+            .unwrap_or_else(|carried| carried);
+        debug_assert!(before >= bytes, "a volume uncarried more than it carried");
+    }
+
+    // The bytes the queuing thread carries on the volume.
+    pub fn carried_bytes(&self) -> u64 {
+        self.carried_bytes.load(Ordering::SeqCst)
     }
 
     // Give the volume its soft and hard buffer limits. A limit lowered
@@ -438,6 +594,12 @@ pub struct Reservation {
 }
 
 impl Reservation {
+    // `bytes` already counted on `volume` and handed on, held again from
+    // here: what a prepayment left untaken (`writer::Credit`).
+    pub(super) fn counted(volume: Arc<Volume>, bytes: u64) -> Self {
+        Self { volume, bytes }
+    }
+
     // Nothing reserved on `volume` yet.
     pub fn none(volume: Arc<Volume>) -> Self {
         Self { volume, bytes: 0 }
@@ -457,7 +619,18 @@ impl Reservation {
     // when the volume has room (`Submitter::wake_below`). A volume that
     // counts nothing grants one request of any size.
     pub fn reserve(&mut self, bytes: u64, keep: u64) -> bool {
-        let granted = self.volume.grant(bytes, keep);
+        let granted = self.volume.grant(bytes, keep, 0);
+        if granted {
+            self.bytes += bytes;
+        }
+        granted
+    }
+
+    // `reserve` for a thread that produces output its queuing thread may
+    // carry, keeping nothing, judged beside `own_carried`, what that queuing
+    // thread already carries here for the requester (`Volume::grant`).
+    pub(super) fn reserve_ahead(&mut self, bytes: u64, own_carried: u64) -> bool {
+        let granted = self.volume.grant(bytes, 0, own_carried);
         if granted {
             self.bytes += bytes;
         }
@@ -694,7 +867,7 @@ mod tests {
         assert_eq!(released.is_err(), cfg!(debug_assertions));
         assert_eq!(volume.unwritten_bytes(), 0);
         assert!(
-            volume.grant(1500, volume.write_piece()),
+            volume.grant(1500, volume.write_piece(), 0),
             "the volume still grants reservations"
         );
     }

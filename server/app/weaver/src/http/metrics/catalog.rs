@@ -1064,6 +1064,10 @@ metric_families! {
         "File handles a volume's writer dropped.");
     VOLUME_WRITER_CLOSE_SECONDS = ("weaver_volume_writer_close_seconds_total", Counter, ["volume"],
         "Time a volume's writer spent dropping file handles (see `weaver_volume_writer_closes_total`).");
+    VOLUME_WRITER_WRITE_OUTS = ("weaver_volume_writer_write_outs_total", Counter, ["volume"],
+        "Write-outs a volume's writer started on a network share (Linux only), one after every 32 MiB written to a file.");
+    VOLUME_WRITER_WRITE_OUT_SECONDS = ("weaver_volume_writer_write_out_seconds_total", Counter, ["volume"],
+        "Time a volume's writer spent in write-outs, each of which waits for the write-out the one before started (see `weaver_volume_writer_write_outs_total`).");
     VOLUME_WRITER_THREADS = ("weaver_volume_writer_threads_total", Counter, ["volume"],
         "Writer threads started for a volume, one after another: a volume's thread ends when nothing writes to it and starts again at the next write.");
     VOLUME_WRITER_WOKEN = ("weaver_volume_writer_woken_total", Counter, ["volume"],

@@ -1501,6 +1501,11 @@ pub struct VolumeWriterSnapshot {
     // Handles the writer dropped, and the time inside those drops.
     pub closes: u64,
     pub close_nanos: u64,
+    // Write-outs the writer started on a share, each after a stride of a
+    // file's writes, and the time inside those calls, which wait for the
+    // write-out the one before started.
+    pub write_outs: u64,
+    pub write_out_nanos: u64,
     // Operations that came back with an error.
     pub failed_operations: u64,
     // Operations not run: their caller gave its files up, or an earlier
