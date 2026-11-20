@@ -19,7 +19,7 @@ use crate::pipeline::tests::single_member_rar4_old_numbering_set;
 
 // What the volumes are.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::pipeline::tests) enum Container {
+pub enum Container {
     Rar4,
     Rar5,
     // Encrypted data under plain headers: the headers still chain the set.
@@ -39,7 +39,7 @@ pub(in crate::pipeline::tests) enum Container {
 
 // The names the volumes are posted under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::pipeline::tests) enum Naming {
+pub enum Naming {
     // `silver.horizon.partNN.rar`, `silver.horizon.7z.NNN`.
     Conventional,
     // [`Naming::Conventional`] over four volumes, so two are middle volumes.
@@ -76,7 +76,7 @@ pub(in crate::pipeline::tests) enum Naming {
 
 // What, besides the volumes, could group or order them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::pipeline::tests) enum Binding {
+pub enum Binding {
     // A PAR2 index carrying the real names arrives before any volume.
     Par2RealFirst,
     // A PAR2 index carrying the real names arrives after every volume.
@@ -91,7 +91,7 @@ pub(in crate::pipeline::tests) enum Binding {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::pipeline::tests) struct Cell {
+pub struct Cell {
     pub container: Container,
     pub naming: Naming,
     pub binding: Binding,
@@ -688,7 +688,7 @@ fn generator_listing() -> String {
 }
 
 // The generator emits a campaign for exactly the possible cells.
-pub(super) fn assert_generated(generated: &[Cell]) {
+pub fn assert_generated(generated: &[Cell]) {
     assert!(
         generated == possible_cells().as_slice(),
         "the generator's list is stale; replace it with:\n{}",

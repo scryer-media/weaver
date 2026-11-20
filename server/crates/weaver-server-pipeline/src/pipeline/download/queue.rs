@@ -1042,7 +1042,7 @@ impl DownloadQueue {
         self.iter().filter(|work| predicate(work)).count()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub fn drain_all(&mut self) -> Vec<QueueItem> {
         std::iter::from_fn(|| self.pop()).collect()
     }
@@ -1385,7 +1385,7 @@ impl Default for DownloadQueue {
 
 // The work dispatch makes of an item, for tests that take items off a queue
 // by hand.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 impl QueueItem {
     pub(crate) fn dispatched(self, spec: &JobSpec) -> DownloadWork {
         self.into_work(spec).expect("a queued article of the job")

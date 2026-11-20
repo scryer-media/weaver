@@ -144,6 +144,7 @@ pub(super) fn cells() -> Vec<DamageCell> {
 const PER_UNIT: usize = 283;
 
 // 5,280 possible cells, 283 schedules each.
+#[cfg(test)]
 pub(super) const TOTAL: usize = 1_494_240;
 
 pub(super) fn family() -> Family<DamageCell> {
@@ -526,6 +527,7 @@ async fn swapped_encrypted_headers_repaired_after_restart() {
 macro_rules! damage_smokes {
     ($($name:ident $kind:ident $location:ident $pattern:ident $recovery:expr, $container:ident;)+) => {
         mod combined_damage_smoke {
+            #[cfg(test)]
             use super::*;
             $(
                 #[tokio::test]
@@ -603,6 +605,7 @@ async fn encrypted_par3_restart_retains_the_first_volume() {
 }
 
 mod combined_damage_loss_smoke {
+    #[cfg(test)]
     use super::*;
 
     #[tokio::test]
@@ -631,12 +634,10 @@ mod combined_damage_loss_smoke {
 }
 
 // The campaign: 4,500 shards of about three hundred cases.
-mod combined_damage {
+pub mod combined_damage {
     use super::*;
 
-    tier2_shards!(family, 4500;
-        h00 0 h01 1 h02 2 h03 3 h04 4 h05 5 h06 6 h07 7 h08 8 h09 9 h10 10 h11 11 h12 12 h13 13 h14 14
-        h15 15 h16 16 h17 17 h18 18 h19 19 h20 20 h21 21 h22 22 h23 23 h24 24 h25 25 h26 26 h27 27 h28 28
-        h29 29 h30 30 h31 31 h32 32 h33 33 h34 34 h35 35 h36 36 h37 37 h38 38 h39 39 h40 40 h41 41 h42 42
-        h43 43 h44 44);
+    pub async fn run_shard(shard: usize, shards: usize) {
+        family().shard(shard, shards).await;
+    }
 }

@@ -530,7 +530,7 @@ impl NamespaceWriter {
     // The posted bytes of a root member's range, read back through the
     // inverse map of whatever owns it, as a repair reads them, from what is
     // on disk only: what a restart now would find.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn read_posted(
         &self,
         tree: &Tree,

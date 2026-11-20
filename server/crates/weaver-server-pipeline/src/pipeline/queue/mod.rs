@@ -712,7 +712,7 @@ impl Queue {
         self.history.read().expect("history lock poisoned").clone()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn job_counters(&self, id: JobId) -> Option<Arc<JobCounters>> {
         self.read(|inner| inner.job(id).map(|row| row.counters.clone()))
     }
@@ -814,7 +814,7 @@ impl Queue {
         self.revision.subscribe()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn report_jobs(&self, live: Vec<JobInfo>) {
         self.write(|inner| {
             let ids: Vec<_> = live.iter().map(|job| job.job_id).collect();

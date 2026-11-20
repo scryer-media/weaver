@@ -86,7 +86,6 @@ mod busy_turn_completions;
 mod checkpoint_progress;
 mod credentials_refusal;
 mod dispatch_ineligible_log;
-mod dispatch_server_order;
 mod emits_download_pipeline_drained;
 mod first_article_gate;
 mod gapless_lanes;

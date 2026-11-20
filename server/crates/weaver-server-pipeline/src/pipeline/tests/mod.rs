@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::SchedulerError;
+#[cfg(test)]
 use crate::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
 use crate::jobs::persistence::JobsPersistenceInternalQueries;
 use crate::jobs::persistence::JobsPersistenceQueries;
@@ -12,16 +13,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use crate::Database;
+#[cfg(test)]
 use crate::ingest::submit_nzb_bytes;
+#[cfg(test)]
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::settings::{Config, SharedConfig};
-use crate::{
-    FileSpec, JobInfo, PipelineMetrics, SchedulerHandle, SegmentSpec, SharedPipelineState,
-};
+use crate::{FileSpec, PipelineMetrics, SegmentSpec, SharedPipelineState};
+#[cfg(test)]
+use crate::{JobInfo, SchedulerHandle};
 use tempfile::TempDir;
-use tokio::sync::{RwLock, oneshot};
+use tokio::sync::RwLock;
+#[cfg(test)]
+use tokio::sync::oneshot;
 use weaver_model::files::FileRole;
 use weaver_nntp::client::{NntpClient, NntpClientConfig};
+#[cfg(test)]
 use weaver_server_base::jobs::ids::MessageId;
 use weaver_server_base::runtime::system_profile::{
     CpuProfile, DiskProfile, FilesystemType, MemoryProfile, SimdSupport, StorageClass,
@@ -47,41 +53,73 @@ macro_rules! segment_spec {
     };
 }
 
+#[cfg(test)]
 mod archive_history;
 mod archive_output_contract;
+#[cfg(test)]
 mod archive_passwords;
+#[cfg(test)]
 mod archive_topology;
+#[cfg(test)]
 mod bandwidth_split;
+#[cfg(test)]
 mod cancel_batch;
+#[cfg(test)]
 mod control_lifecycle;
+#[cfg(test)]
 mod core;
+#[cfg(test)]
 mod decode_stage;
+#[cfg(test)]
 pub(in crate::pipeline) mod delivered_restore;
-pub(in crate::pipeline) mod direct_store;
+pub mod direct_store;
+#[cfg(test)]
 mod dispatch_order;
+#[cfg(test)]
 mod download_dispatch;
-pub(in crate::pipeline) mod engines;
+pub mod engines;
+#[cfg(test)]
 mod full_file_names;
+#[cfg(test)]
 mod hardware_profile;
+#[cfg(test)]
 mod idle;
+#[cfg(test)]
 mod memory_release;
+#[cfg(test)]
 mod next_up_ring;
+#[cfg(test)]
 mod nzb_admission;
+#[cfg(test)]
 mod par2;
+#[cfg(test)]
 mod par2_completion;
 #[cfg(unix)]
+#[cfg(test)]
 mod post_processing_completion;
+#[cfg(test)]
 mod post_processing_pause;
+#[cfg(test)]
 mod provider_scheduling;
+#[cfg(test)]
 mod queue;
+#[cfg(test)]
 mod queue_scale;
+#[cfg(test)]
 mod queue_window;
+#[cfg(test)]
 mod restore_history;
+#[cfg(test)]
 mod script_events;
+#[cfg(test)]
 mod server_attribution;
+#[cfg(test)]
 mod shared_articles;
+#[cfg(test)]
 mod terminal_settlement;
+#[cfg(test)]
 mod uu_assembly;
+#[cfg(test)]
 mod yenc_compatibility;
 
 impl Pipeline {
@@ -127,6 +165,7 @@ impl Pipeline {
     }
 }
 
+#[cfg(test)]
 struct TestHarness {
     _temp_dir: TempDir,
     _data_dir: PathBuf,
@@ -136,6 +175,7 @@ struct TestHarness {
     pipeline_task: tokio::task::JoinHandle<()>,
 }
 
+#[cfg(test)]
 impl TestHarness {
     async fn new() -> Self {
         Self::new_with_nntp(
@@ -320,6 +360,7 @@ pub(in crate::pipeline) fn nzb_zstd_for(spec: &JobSpec) -> Vec<u8> {
 
 // Build a waiting job's articles as its first handout would, and wait for
 // them: the read is sent for and its result delivered on the actor's turn.
+#[cfg(test)]
 pub(in crate::pipeline) async fn activate_job(pipeline: &mut Pipeline, job_id: JobId) {
     let retiring = pipeline.retiring_graph_jobs.contains_key(&job_id);
     while pipeline.retiring_graph_jobs.contains_key(&job_id) {
@@ -344,6 +385,7 @@ pub(in crate::pipeline) async fn activate_job(pipeline: &mut Pipeline, job_id: J
     pipeline.handle_job_activated(done);
 }
 
+#[cfg(test)]
 fn minimal_job_state(job_id: JobId, name: &str, working_dir: PathBuf) -> JobState {
     JobState {
         job_id,
@@ -396,6 +438,7 @@ fn minimal_job_state(job_id: JobId, name: &str, working_dir: PathBuf) -> JobStat
     }
 }
 
+#[cfg(test)]
 fn finished_job_info(job_id: JobId) -> JobInfo {
     JobInfo {
         protocol: crate::jobs::Protocol::Nzb,
@@ -436,6 +479,7 @@ fn finished_job_info(job_id: JobId) -> JobInfo {
     }
 }
 
+#[cfg(test)]
 fn history_row_with_output_dir(
     job_id: JobId,
     name: &str,
@@ -466,6 +510,7 @@ fn history_row_with_output_dir(
     }
 }
 
+#[cfg(test)]
 fn insert_history_row_with_nzb_zstd(db: &Database, row: &crate::JobHistoryRow, nzb_zstd: &[u8]) {
     db.insert_job_history(row).unwrap();
     let datastore = db.datastore();
@@ -527,6 +572,7 @@ fn refusing_harness_server_port() -> u16 {
 // permit back from one that has not taken it yet, so this waits for each
 // lane's own failure report instead, which the worker sends only after its
 // permit is back.
+#[cfg(test)]
 async fn settle_lane_dials(pipeline: &mut Pipeline) {
     for _ in 0..pipeline.download_lane_owners.len() {
         match pipeline
@@ -738,6 +784,7 @@ async fn new_direct_pipeline_on_machine(
     (pipeline, intermediate_dir, complete_dir)
 }
 
+#[cfg(test)]
 async fn new_scheduler_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBuf, PathBuf) {
     let (mut pipeline, intermediate, complete) = new_direct_pipeline(temp_dir).await;
     // Scheduler-only callers name two real policy entries without dialing.
@@ -795,6 +842,7 @@ pub(in crate::pipeline) async fn retire_pipeline_database(pipeline: Pipeline) {
 
 // Hear the run mail until the graph job has nothing out: a repair it lent
 // returns there, and is applied as it is heard.
+#[cfg(test)]
 pub(in crate::pipeline) async fn hear_graph_mail(pipeline: &mut Pipeline, job_id: JobId) {
     while pipeline
         .graph_jobs
@@ -810,6 +858,7 @@ pub(in crate::pipeline) async fn hear_graph_mail(pipeline: &mut Pipeline, job_id
 // Hear the run mail until every restored recovery object of the graph job
 // heard what of its volumes arrived again, as it does before the job
 // fetches anything.
+#[cfg(test)]
 pub(in crate::pipeline) async fn hear_rewalks(pipeline: &mut Pipeline, job_id: JobId) {
     while pipeline
         .graph_jobs
@@ -832,6 +881,7 @@ fn checkpoint_plan(pipeline: &Pipeline, job_id: JobId) -> weaver_yenc::Checkpoin
         })
 }
 
+#[cfg(test)]
 fn encode_article_part(
     filename: &str,
     payload: &[u8],
@@ -979,11 +1029,13 @@ fn build_test_rar_file_header_with_extra(
 // `Compressed`, and the solid bit makes it `Solid`, which the classifier checks
 // first. The data area a header like this describes is not really compressed,
 // so a fixture using it is only good for what the *classification* decides.
+#[cfg(test)]
 fn test_rar_compression_info(method: u64, solid: bool) -> u64 {
     ((method & 0x07) << 7) | u64::from(solid) << 6
 }
 
 // A RAR5 file header whose member is compressed (and optionally solid).
+#[cfg(test)]
 fn build_test_rar_compressed_file_header(
     filename: &str,
     common_flags_extra: u64,
@@ -1015,6 +1067,7 @@ fn build_test_rar_compressed_file_header(
 // `unix_mode` lands in the attributes field and `host_os` is Unix, which is how
 // [`crate::pipeline::extraction::apply_rar_member_filesystem_metadata`] reads
 // the mode back out.
+#[cfg(test)]
 fn build_test_rar_directory_header(name: &str, unix_mode: u32, mtime: u32) -> Vec<u8> {
     let file_flags: u64 = 0x0001 | 0x0002;
     let mut type_body = Vec::new();
@@ -1221,6 +1274,7 @@ pub(in crate::pipeline::tests) fn single_member_rar4_old_numbering_set(
 // has an end record, and each part's header states the unpacked size
 // `stated` gives for that volume. The last part states `member_crc` as the
 // whole member's CRC.
+#[cfg(test)]
 pub(in crate::pipeline::tests) fn rar4_misstated_set(
     base: &str,
     member_name: &str,
@@ -1274,6 +1328,7 @@ pub(in crate::pipeline::tests) fn rar4_misstated_set(
 // as RAR5 writes it, each part's header naming the member and stating its
 // unpacked size as `stated` gives them for that volume. The last part states
 // `member_crc` as the whole member's CRC.
+#[cfg(test)]
 pub(in crate::pipeline::tests) fn rar5_misstated_set(
     base: &str,
     payload: &[u8],
@@ -1329,6 +1384,7 @@ pub(in crate::pipeline::tests) fn rar5_misstated_set(
 // volume. With one, as RAR 3.4 on write it, the number after the CRC
 // (0x0008): flags 0x400f, 0x400e on the last, every volume stating that
 // same number.
+#[cfg(test)]
 pub(in crate::pipeline::tests) fn single_member_rar4_old_numbering_set_ending(
     base: &str,
     member_name: &str,
@@ -1393,6 +1449,7 @@ pub(in crate::pipeline::tests) fn with_rar4_header_crcs(mut bytes: Vec<u8>) -> V
 // every data volume, padded to the longest, followed by the 7-byte footer
 // (`data-1`, `rec-1`, `position-1`, CRC32) a new-style `.rev` carries and the
 // restorer reads its geometry from.
+#[cfg(test)]
 pub(in crate::pipeline::tests) fn single_recovery_volume_for_rar4_set(
     volumes: &[&[u8]],
 ) -> Vec<u8> {
@@ -1439,6 +1496,7 @@ fn build_test_rar4_file_header(
     build_test_rar4_block(0x74, 0x8000 | split_flags, &body)
 }
 
+#[cfg(test)]
 fn build_multifile_multivolume_rar_set() -> Vec<(String, Vec<u8>)> {
     let episode_a = b"episode-a-payload";
     let episode_b = b"episode-b-payload";
@@ -1510,6 +1568,7 @@ fn build_multifile_multivolume_rar_set() -> Vec<(String, Vec<u8>)> {
     ]
 }
 
+#[cfg(test)]
 fn rar_job_spec(name: &str, files: &[(String, Vec<u8>)]) -> JobSpec {
     JobSpec {
         name: name.to_string(),
@@ -1536,6 +1595,7 @@ fn rar_job_spec(name: &str, files: &[(String, Vec<u8>)]) -> JobSpec {
 }
 
 // Article `segment_number` of file `file_index` in job `job_id`.
+#[cfg(test)]
 pub(in crate::pipeline) fn segment_id(
     job_id: JobId,
     file_index: u32,
@@ -1547,6 +1607,7 @@ pub(in crate::pipeline) fn segment_id(
     }
 }
 
+#[cfg(test)]
 pub(in crate::pipeline) fn standalone_job_spec(name: &str, files: &[(String, u32)]) -> JobSpec {
     JobSpec {
         name: name.to_string(),
@@ -1572,12 +1633,14 @@ pub(in crate::pipeline) fn standalone_job_spec(name: &str, files: &[(String, u32
     }
 }
 
+#[cfg(test)]
 fn many_standalone_files(prefix: &str, count: usize) -> Vec<(String, u32)> {
     (0..count)
         .map(|idx| (format!("{prefix}-{idx}.bin"), 512u32))
         .collect()
 }
 
+#[cfg(test)]
 fn standalone_with_par2_job_spec(name: &str, payload_bytes: u32, recovery_bytes: u32) -> JobSpec {
     JobSpec {
         name: name.to_string(),
@@ -1651,6 +1714,7 @@ fn build_test_par2_packet(
     data
 }
 
+#[cfg(test)]
 pub(super) fn build_test_par2_index(filename: &str, file_data: &[u8], slice_size: u64) -> Vec<u8> {
     build_test_par2_index_for_files(&[(filename, file_data)], slice_size)
 }
@@ -1742,6 +1806,7 @@ pub(super) fn build_test_par2_index_for_files(files: &[(&str, &[u8])], slice_siz
     stream
 }
 
+#[cfg(test)]
 pub(in crate::pipeline) fn segmented_job_spec(
     name: &str,
     filename: &str,
@@ -1773,12 +1838,14 @@ pub(in crate::pipeline) fn segmented_job_spec(
     }
 }
 
+#[cfg(test)]
 fn with_priority(mut spec: JobSpec, priority: &str) -> JobSpec {
     spec.metadata = vec![("priority".to_string(), priority.to_string())];
     spec
 }
 
 // Record cancellation, drive its boundary, then observe the durable archive.
+#[cfg(test)]
 async fn cancel_one_job(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -1803,6 +1870,7 @@ async fn cancel_one_job(
 }
 
 // Hand the actor the archive outcome, then hear its cancelled workers out.
+#[cfg(test)]
 async fn finish_cancel_jobs(pipeline: &mut Pipeline) {
     match pipeline
         .terminal_post_processing_done_rx
@@ -1952,6 +2020,7 @@ async fn insert_active_job_with_persisted_nzb_named(
 // `payload`, inserted and then delivered as a lane delivers it: the article
 // comes back from the server, is decoded, and the graph hears it. The file is
 // whole when this returns, so the job has something usable to complete with.
+#[cfg(test)]
 pub(in crate::pipeline) async fn insert_delivered_job(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -1997,6 +2066,7 @@ pub(in crate::pipeline) async fn insert_delivered_job(
     working_dir
 }
 
+#[cfg(test)]
 pub(in crate::pipeline) fn rar5_fixture_bytes(name: &str) -> Vec<u8> {
     std::fs::read(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2054,6 +2124,7 @@ pub(in crate::pipeline) async fn settle_script_admissions(pipeline: &mut Pipelin
     }
 }
 
+#[cfg(test)]
 fn set_job_status_for_test(pipeline: &mut Pipeline, job_id: JobId, status: JobStatus) {
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
     state.status = status;
@@ -2238,6 +2309,7 @@ pub(in crate::pipeline) fn job_status_for_assert(
         .or_else(|| pipeline.shared_state.get_job(job_id).map(|job| job.status))
 }
 
+#[cfg(test)]
 fn drain_job_events(
     events: &mut tokio::sync::broadcast::Receiver<PipelineEvent>,
     job_id: JobId,
@@ -2295,12 +2367,14 @@ pub(in crate::pipeline) async fn settle_failed_releases(pipeline: &mut Pipeline)
 
 // Polls until `predicate` holds. There is no deadline: the test runner
 // bounds a condition that never arrives.
+#[cfg(test)]
 async fn wait_until(mut predicate: impl FnMut() -> bool) {
     while !predicate() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
+#[cfg(test)]
 async fn drain_decode_results(pipeline: &mut Pipeline, expected: usize) {
     for index in 0..expected {
         let done = pipeline.decode_done_rx.recv().await.unwrap_or_else(|| {
@@ -2318,6 +2392,7 @@ async fn drain_decode_results(pipeline: &mut Pipeline, expected: usize) {
 
 // Fill servers with the given retention windows (days, 0 = unlimited). No
 // connections are opened — only the config matters.
+#[cfg(test)]
 fn retention_client(retention_days: &[u32]) -> weaver_nntp::client::NntpClient {
     let servers = retention_days
         .iter()
@@ -2342,6 +2417,7 @@ fn retention_client(retention_days: &[u32]) -> weaver_nntp::client::NntpClient {
 
 // A client of the `retention_client` servers named by `hosts`, in that
 // order: host `n` is the same server in every client built here.
+#[cfg(test)]
 fn hosts_client(hosts: &[usize]) -> weaver_nntp::client::NntpClient {
     weaver_nntp::client::NntpClient::new(weaver_nntp::client::NntpClientConfig {
         servers: hosts
@@ -2364,6 +2440,7 @@ fn hosts_client(hosts: &[usize]) -> weaver_nntp::client::NntpClient {
 // Pool server `server` refuses the login. A fill server's refusal waits: the
 // server may still serve the work only it could serve, as through any
 // outage. A backfill server's refusal is the answer at once.
+#[cfg(test)]
 async fn refuse_login(pipeline: &Pipeline, server: usize) {
     let pool = pipeline.nntp.pool();
     pool.health().lock().await.record_failure(server, true);
@@ -2386,6 +2463,7 @@ async fn refuse_login(pipeline: &Pipeline, server: usize) {
 // Pool server `server` refuses the login, waits as [`refuse_login`] does,
 // and then has refused it for its whole give-up time: the refusal is the
 // verdict on the work only it could serve.
+#[cfg(test)]
 async fn refuse_login_past_give_up(pipeline: &Pipeline, server: usize) {
     refuse_login(pipeline, server).await;
     let pool = pipeline.nntp.pool();
@@ -2397,10 +2475,12 @@ async fn refuse_login_past_give_up(pipeline: &Pipeline, server: usize) {
 }
 
 // Two fill servers: index 0 holds 5 days of retention, index 1 is unlimited.
+#[cfg(test)]
 fn two_server_retention_client() -> weaver_nntp::client::NntpClient {
     retention_client(&[5, 0])
 }
 
+#[cfg(test)]
 fn age_job_days(pipeline: &mut Pipeline, job_id: JobId, days: u64) {
     let posted = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

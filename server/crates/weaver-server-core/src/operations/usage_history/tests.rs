@@ -9,6 +9,7 @@ use chrono::NaiveDate;
 use super::*;
 use crate::persistence::Database;
 use crate::persistence::database_target::DatabaseTarget;
+use crate::persistence::sql_runtime::StoreDatastore;
 
 fn date(y: i32, m: u32, d: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(y, m, d).unwrap()
@@ -682,7 +683,9 @@ fn finished_jobs_count_by_how_they_ended() {
     assert_finished_counts(&Database::open_in_memory().unwrap());
 }
 
-async fn open_postgres_usage_test_db(test_name: &str) -> Option<(Database, sqlx::PgPool, String)> {
+async fn open_postgres_usage_test_db(
+    test_name: &str,
+) -> Option<(Database, StoreDatastore, String)> {
     let Ok(base_url) = std::env::var("WEAVER_TEST_POSTGRES_URL") else {
         eprintln!("skipping {test_name}; WEAVER_TEST_POSTGRES_URL is not set");
         return None;
@@ -701,8 +704,8 @@ async fn open_postgres_usage_test_db(test_name: &str) -> Option<(Database, sqlx:
         .connect(&base_url)
         .await
         .unwrap();
-    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
-        .execute(&admin)
+    let admin = StoreDatastore::Postgres { pool: admin };
+    SqlRuntime::execute(admin.write_exec(), &format!("CREATE SCHEMA {schema}"), &[])
         .await
         .unwrap();
     let separator = if base_url.contains('?') { '&' } else { '?' };
@@ -711,11 +714,12 @@ async fn open_postgres_usage_test_db(test_name: &str) -> Option<(Database, sqlx:
     Some((db, admin, schema))
 }
 
-async fn drop_postgres_usage_test_schema(admin: sqlx::PgPool, schema: String) {
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "DROP SCHEMA IF EXISTS {schema} CASCADE"
-    )))
-    .execute(&admin)
+async fn drop_postgres_usage_test_schema(admin: StoreDatastore, schema: String) {
+    SqlRuntime::execute(
+        admin.write_exec(),
+        &format!("DROP SCHEMA IF EXISTS {schema} CASCADE"),
+        &[],
+    )
     .await
     .unwrap();
 }

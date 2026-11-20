@@ -46,7 +46,7 @@ pub(crate) struct Works {
     #[cfg(test)]
     held: Option<Vec<HeldLoan>>,
     // How many objects went out for their work.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     lent: u64,
 }
 
@@ -90,7 +90,7 @@ impl Works {
             clock: DecodeClock::default(),
             #[cfg(test)]
             held: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             lent: 0,
         }
     }
@@ -117,7 +117,7 @@ impl Works {
         self.held.as_mut().map(std::mem::take).unwrap_or_default()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn lent(&self) -> u64 {
         self.lent
     }
@@ -263,7 +263,7 @@ impl Works {
         let (scope, serial) = (self.scope, self.serial);
         let stop = Arc::new(AtomicBool::new(false));
         self.out.insert(node, (serial, Arc::clone(&stop)));
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         {
             self.lent += 1;
         }

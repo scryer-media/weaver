@@ -242,7 +242,7 @@ struct Slot {
     // Who to tell once a stamp has committed, or a write has failed, while
     // a member's file waits on it to move.
     owed: Option<Owed>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     named: Named,
 }
 
@@ -258,14 +258,14 @@ struct Gated {
     // The decoded bytes the change spares a restore, said once it is
     // released.
     settled: u64,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     named: std::collections::BTreeSet<(u32, u32)>,
 }
 
 // The articles on disk that a checkpoint names, as a restore after a crash
 // would find them: at the last checkpoint that changed anything, at the
 // last one a write took, and at the last one a write committed.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 #[derive(Default)]
 struct Named {
     put: std::collections::BTreeSet<(u32, u32)>,
@@ -646,7 +646,7 @@ impl Pending {
             // What reads back is asked of the disk, which waits for the
             // volume's writer; a test that holds the writer is not made to
             // wait for it.
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             let named = if barrier.as_ref().is_some_and(|barrier| barrier.test_held()) {
                 slot.named.put.clone()
             } else {
@@ -659,7 +659,7 @@ impl Pending {
                     last.barrier = barrier;
                     last.told = false;
                     last.settled = settled;
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
                     {
                         last.named = named;
                     }
@@ -670,14 +670,14 @@ impl Pending {
                     barrier,
                     told: false,
                     settled,
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
                     named,
                 }),
             }
             Self::release(slot);
             return false;
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         {
             slot.named.put = job.on_disk();
         }
@@ -713,7 +713,7 @@ impl Pending {
         if let Some(timer) = slot.timer.take() {
             timer.abort();
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         {
             slot.named.taken = slot.named.put.clone();
         }
@@ -733,7 +733,7 @@ impl Pending {
             if let Some(held) = slot.held.as_mut() {
                 held.in_hand_bytes = gated.settled;
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             {
                 slot.named.put = gated.named;
             }
@@ -762,7 +762,7 @@ impl Pending {
             first.delta.absorb(later.delta);
             first.stamp = later.stamp;
             first.settled = later.settled;
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             {
                 first.named = later.named;
             }
@@ -774,7 +774,7 @@ impl Pending {
     // The articles on disk the database names once the writes queued for
     // it run, as a restore after a crash now finds them: a change queued
     // with no write to take it dies with the process.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn named(&self) -> std::collections::BTreeSet<(u32, u32)> {
         let slot = self.slot();
         if slot.enqueued {
@@ -786,6 +786,7 @@ impl Pending {
 
     // The job came back from the database's rows, on disk as `job` stands
     // now: every checkpoint so far names that.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     #[cfg(test)]
     pub(crate) fn restored(&self, job: &GraphJob) {
         let on_disk = job.on_disk();
@@ -885,7 +886,7 @@ impl Pending {
         if slot.lost {
             return;
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         {
             slot.named.committed = slot.named.taken.clone();
         }
@@ -961,7 +962,7 @@ impl Pending {
         if let Some(timer) = slot.timer.take() {
             timer.abort();
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         {
             slot.named.taken = slot.named.committed.clone();
         }
@@ -1104,7 +1105,7 @@ impl Pending {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn tally(&self) -> Tally {
         self.slot().tally
     }

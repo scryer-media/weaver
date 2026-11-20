@@ -22,6 +22,7 @@ const VOLUMES: usize = 4;
 const ARTICLES_PER_VOLUME: usize = 32;
 
 // Each family's name and scenario count.
+#[cfg(test)]
 pub(super) fn totals() -> Vec<(&'static str, usize)> {
     vec![
         ("index that lies", lies::family().total()),
@@ -35,6 +36,7 @@ pub(super) fn totals() -> Vec<(&'static str, usize)> {
     ]
 }
 
+#[cfg(test)]
 pub(super) const TOTAL: usize = lies::TOTAL
     + nesting::TOTAL
     + scale::TOTAL
@@ -199,6 +201,7 @@ fn standard_payload(seed: u64) -> Vec<u8> {
 macro_rules! breadth_family {
     ($cell:ty, $cells:expr, $pool:expr, $per:expr, $total:expr, $count:expr) => {
         pub(in super::super) const PER_UNIT: usize = $per;
+        #[cfg(test)]
         pub(in super::super) const TOTAL: usize = $total;
 
         pub(in super::super) fn family() -> Family<$cell> {
@@ -216,7 +219,7 @@ macro_rules! breadth_family {
 }
 
 // A PAR2 index whose descriptions are wrong about the files they name.
-pub(super) mod lies {
+pub mod lies {
     use super::*;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -386,6 +389,7 @@ pub(super) mod lies {
     }
 
     mod combined_lies_smoke {
+        #[cfg(test)]
         use super::*;
 
         #[tokio::test]
@@ -423,15 +427,17 @@ pub(super) mod lies {
     }
 
     // The campaign: 300 shards of about three hundred cases.
-    mod combined_lies {
+    pub mod combined_lies {
         use super::*;
 
-        tier2_shards!(family, 300; h0 0 h1 1 h2 2);
+        pub async fn run_shard(shard: usize, shards: usize) {
+            family().shard(shard, shards).await;
+        }
     }
 }
 
 // Archives inside archives.
-pub(super) mod nesting {
+pub mod nesting {
     use super::*;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -603,6 +609,7 @@ pub(super) mod nesting {
     }
 
     mod combined_nesting_smoke {
+        #[cfg(test)]
         use super::*;
 
         #[tokio::test]
@@ -659,15 +666,17 @@ pub(super) mod nesting {
     }
 
     // The campaign: 300 shards of about three hundred cases.
-    mod combined_nesting {
+    pub mod combined_nesting {
         use super::*;
 
-        tier2_shards!(family, 300; h0 0 h1 1 h2 2);
+        pub async fn run_shard(shard: usize, shards: usize) {
+            family().shard(shard, shards).await;
+        }
     }
 }
 
 // The far ends of the size axes.
-pub(super) mod scale {
+pub mod scale {
     use super::*;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -783,6 +792,7 @@ pub(super) mod scale {
     }
 
     mod combined_scale_smoke {
+        #[cfg(test)]
         use super::*;
 
         #[tokio::test]
@@ -827,17 +837,19 @@ pub(super) mod scale {
     }
 
     // The campaign: 300 shards of about three hundred cases.
-    mod combined_scale {
+    pub mod combined_scale {
         use super::*;
 
-        tier2_shards!(family, 300; h0 0 h1 1 h2 2);
+        pub async fn run_shard(shard: usize, shards: usize) {
+            family().shard(shard, shards).await;
+        }
     }
 }
 
 // A volume the post never carried, at the field's volume size: the NZB lists
 // every volume but one, and a PAR2 set authored over all of them, cut into
 // doubling recovery volumes, is what rebuilds it.
-pub(super) mod withheld {
+pub mod withheld {
     use super::*;
 
     // The volume the post leaves out: an interior one.
@@ -939,15 +951,17 @@ pub(super) mod withheld {
     }
 
     // The campaign: 100 shards of six cases.
-    mod combined_withheld {
+    pub mod combined_withheld {
         use super::*;
 
-        tier2_shards!(family, 100; h0 0);
+        pub async fn run_shard(shard: usize, shards: usize) {
+            family().shard(shard, shards).await;
+        }
     }
 }
 
 // Passwords right, wrong and missing over every locked container.
-pub(super) mod password {
+pub mod password {
     use super::*;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1083,6 +1097,7 @@ pub(super) mod password {
     }
 
     mod combined_password_smoke {
+        #[cfg(test)]
         use super::*;
 
         #[tokio::test]
@@ -1131,15 +1146,17 @@ pub(super) mod password {
     }
 
     // The campaign: 200 shards of about three hundred cases.
-    mod combined_password {
+    pub mod combined_password {
         use super::*;
 
-        tier2_shards!(family, 200; h0 0 h1 1);
+        pub async fn run_shard(shard: usize, shards: usize) {
+            family().shard(shard, shards).await;
+        }
     }
 }
 
 // The yEnc wire's own variants.
-pub(super) mod wire {
+pub mod wire {
     use super::*;
 
     const LINES: [usize; 4] = [64, 128, 256, 990];
@@ -1240,6 +1257,7 @@ pub(super) mod wire {
     }
 
     mod combined_wire_smoke {
+        #[cfg(test)]
         use super::*;
 
         #[tokio::test]
@@ -1277,15 +1295,17 @@ pub(super) mod wire {
     }
 
     // The campaign: 200 shards of about three hundred cases.
-    mod combined_wire {
+    pub mod combined_wire {
         use super::*;
 
-        tier2_shards!(family, 200; h0 0 h1 1);
+        pub async fn run_shard(shard: usize, shards: usize) {
+            family().shard(shard, shards).await;
+        }
     }
 }
 
 // Volume naming as the field writes it.
-pub(super) mod naming {
+pub mod naming {
     use super::*;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1436,6 +1456,7 @@ pub(super) mod naming {
     }
 
     mod combined_naming_smoke {
+        #[cfg(test)]
         use super::*;
 
         #[tokio::test]
@@ -1484,15 +1505,17 @@ pub(super) mod naming {
     }
 
     // The campaign: 200 shards of about three hundred cases.
-    mod combined_naming {
+    pub mod combined_naming {
         use super::*;
 
-        tier2_shards!(family, 200; h0 0 h1 1);
+        pub async fn run_shard(shard: usize, shards: usize) {
+            family().shard(shard, shards).await;
+        }
     }
 }
 
 // Jobs of several sets and the furniture posted beside them.
-pub(super) mod sets {
+pub mod sets {
     use super::*;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1754,6 +1777,7 @@ pub(super) mod sets {
     }
 
     mod combined_sets_smoke {
+        #[cfg(test)]
         use super::*;
 
         #[tokio::test]
@@ -1814,9 +1838,11 @@ pub(super) mod sets {
     }
 
     // The campaign: 200 shards of about three hundred cases.
-    mod combined_sets {
+    pub mod combined_sets {
         use super::*;
 
-        tier2_shards!(family, 200; h0 0 h1 1);
+        pub async fn run_shard(shard: usize, shards: usize) {
+            family().shard(shard, shards).await;
+        }
     }
 }

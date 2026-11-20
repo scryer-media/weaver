@@ -83,7 +83,7 @@ impl Pipeline {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn note_decode_started(&mut self, segment_id: SegmentId, raw_bytes: u64) {
         self.active_decode_bytes.insert(segment_id, raw_bytes);
         let job_id = segment_id.file_id.job_id;

@@ -27,13 +27,13 @@ pub(in crate::pipeline) fn lane_acquire_failure_for_work(
 // the histogram and the profile bucket — two reads per decoded article,
 // roughly one per 750 KB of work, not one per byte. Everything else on this
 // path stays `Relaxed`-atomic only.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 struct DecodeTaskTimer {
     started: Instant,
     metrics: Arc<weaver_server_base::operations::metrics::PipelineMetrics>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 impl DecodeTaskTimer {
     fn start(metrics: Arc<weaver_server_base::operations::metrics::PipelineMetrics>) -> Self {
         Self {
@@ -43,7 +43,7 @@ impl DecodeTaskTimer {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 impl Drop for DecodeTaskTimer {
     fn drop(&mut self) {
         let elapsed = self.started.elapsed();
@@ -54,7 +54,7 @@ impl Drop for DecodeTaskTimer {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 fn send_blocking_decode_failure(
     tx: &mpsc::Sender<DecodeDone>,
     segment_id: SegmentId,
@@ -92,7 +92,7 @@ impl Pipeline {
     // routed through here would fail its decode exactly as it did before
     // uuencode support existed. If `Raw` is ever made production-reachable
     // again, this path needs the same sniffer the fused decoder has.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(in crate::pipeline::download::worker) fn spawn_decode_task(&self, work: PendingDecodeWork) {
         let tx = self.decode_done_tx.clone();
         let PendingDecodeWork {
@@ -211,7 +211,7 @@ impl Pipeline {
 
     // Start decodes for queued undecoded bodies while decode slots are free.
     // Test-only, as [`Self::spawn_decode_task`] is.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn pump_decode_queue(&mut self) {
         if self.pending_decode.is_empty() {
             return;

@@ -13,10 +13,7 @@
 // member is when the post carries every volume and leaves none of its
 // bytes lost.
 use super::super::super::sevenz_store::schedules::graph::sevenz_reads;
-use super::super::grouping::{
-    Binding, Cell, Container, Fixture, Naming, Ruling, assert_generated, recovery_layouts, rule,
-};
-use super::super::grouping_listing;
+use super::super::grouping::{Cell, Fixture, Ruling, recovery_layouts, rule};
 use super::*;
 
 // Each volume the archive is written as, as a schedule leaves the post:
@@ -306,6 +303,7 @@ async fn run_cell_under(cell: Cell, cases: Vec<(usize, Schedule)>, only: Option<
 // One replay index of the matrix's schedules over `cell`, under the one
 // recovery layout `recovery`, held to the rule set: a row elsewhere pins a
 // case the matrix found.
+#[cfg(test)]
 pub(in crate::pipeline::tests) async fn cell_case(
     cell: Cell,
     case: usize,
@@ -324,12 +322,12 @@ pub(in crate::pipeline::tests) async fn cell_case(
 }
 
 // A cell's campaign: the matrix's smoke schedules.
-async fn cell_campaign(cell: Cell) {
+pub async fn cell_campaign(cell: Cell) {
     run_cell(cell, schedules().into_iter().enumerate().collect()).await;
 }
 
 // A cell's smoke: in order and reversed.
-async fn cell_smoke(cell: Cell) {
+pub async fn cell_smoke(cell: Cell) {
     let forward = slot_arrivals(4);
     let mut backward = forward.clone();
     backward.reverse();
@@ -341,64 +339,4 @@ async fn cell_smoke(cell: Cell) {
         ],
     )
     .await;
-}
-
-// Emits one smoke under `graph::grouping::grouping_smoke` and one ignored
-// campaign under `graph::grouping::combined_grouping` per listed cell, and
-// the list itself as `GENERATED_CELLS`.
-macro_rules! graph_grouping_cells {
-    ($($tag:ident $c:ident $C:ident {
-        $($n:ident $N:ident [$($b:ident $B:ident)*])*
-    })*) => {
-        const GENERATED_CELLS: &[Cell] = &[$($($(Cell {
-            container: Container::$C,
-            naming: Naming::$N,
-            binding: Binding::$B,
-        },)*)*)*];
-        mod grouping_smoke {
-            $(mod $c {
-                $(mod $n {
-                    use super::super::super::*;
-                    $(
-                        #[tokio::test]
-                        async fn $b() {
-                            cell_smoke(Cell {
-                                container: Container::$C,
-                                naming: Naming::$N,
-                                binding: Binding::$B,
-                            })
-                            .await;
-                        }
-                    )*
-                })*
-            })*
-        }
-        mod combined_grouping {
-            $(mod $c {
-                $(mod $n {
-                    use super::super::super::*;
-                    $(
-                        #[tokio::test]
-                        #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
-                        async fn $b() {
-                            cell_campaign(Cell {
-                                container: Container::$C,
-                                naming: Naming::$N,
-                                binding: Binding::$B,
-                            })
-                            .await;
-                        }
-                    )*
-                })*
-            })*
-        }
-    };
-}
-
-grouping_listing!(graph_grouping_cells);
-
-// The generator emits a smoke and a campaign for exactly the possible cells.
-#[test]
-fn grouping_generator_covers_every_possible_cell() {
-    assert_generated(GENERATED_CELLS);
 }

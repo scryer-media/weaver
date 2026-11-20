@@ -38,7 +38,7 @@ pub(crate) struct Envelopes {
     // marks the node.
     marks: Marks<NodeId>,
     // Rung as a run begins to wait on any of the job's shelves.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     blocked: Arc<tokio::sync::Notify>,
 }
 
@@ -52,7 +52,7 @@ pub(crate) struct Shelf {
     state: Mutex<Shelved>,
     changed: Condvar,
     readers: Mutex<Vec<Weak<ReadFiles>>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     blocked: Arc<tokio::sync::Notify>,
 }
 
@@ -135,9 +135,9 @@ pub(crate) struct Shelved {
     pub(crate) generation: u64,
     // How many times the shelf woke its waiters, and the count a run last
     // began to wait at: a run waits for good while the two agree.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) woken: u64,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) waits_since: Option<u64>,
 }
 
@@ -213,12 +213,13 @@ impl Envelopes {
             given: Given::default(),
             shelves: BTreeMap::new(),
             marks: Marks::default(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             blocked: Arc::default(),
         }
     }
 
     // What rings as a run begins to wait on one of the shelves.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     #[cfg(test)]
     pub(crate) fn blocked(&self) -> Arc<tokio::sync::Notify> {
         Arc::clone(&self.blocked)
@@ -245,7 +246,7 @@ impl Envelopes {
         let dir = &self.working_dir;
         let to = &self.to;
         let given = &self.given;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         let blocked = &self.blocked;
         Arc::clone(self.shelves.entry(node).or_insert_with(|| {
             Arc::new(Shelf {
@@ -256,7 +257,7 @@ impl Envelopes {
                 state: Mutex::default(),
                 changed: Condvar::new(),
                 readers: Mutex::default(),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "pipeline-test-fixtures"))]
                 blocked: Arc::clone(blocked),
             })
         }))
@@ -566,7 +567,7 @@ impl Shelf {
     pub(crate) fn update<R>(&self, change: impl FnOnce(&mut Shelved) -> R) -> R {
         let mut state = self.lock();
         let result = change(&mut state);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         {
             state.woken += 1;
         }
@@ -585,7 +586,7 @@ impl Shelf {
         let mut state = self.lock();
         let result = change(&mut state);
         let wakes = !matches!(result, Ok(false));
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         if wakes {
             state.woken += 1;
         }
@@ -599,19 +600,20 @@ impl Shelf {
     // Wait for the shelf to change; the guard is given back once it did.
     pub(crate) fn wait<'a>(
         &self,
-        #[cfg_attr(not(test), expect(unused_mut))] mut state: MutexGuard<'a, Shelved>,
+        #[cfg_attr(not(any(test, feature = "pipeline-test-fixtures")), expect(unused_mut))]
+        mut state: MutexGuard<'a, Shelved>,
     ) -> MutexGuard<'a, Shelved> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         {
             state.waits_since = Some(state.woken);
             self.blocked.notify_one();
         }
-        #[cfg_attr(not(test), expect(unused_mut))]
+        #[cfg_attr(not(any(test, feature = "pipeline-test-fixtures")), expect(unused_mut))]
         let mut state = self
             .changed
             .wait(state)
             .unwrap_or_else(PoisonError::into_inner);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         {
             state.waits_since = None;
         }
@@ -619,6 +621,7 @@ impl Shelf {
     }
 
     // Whether a run waits on the shelf for a change that has not come.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     #[cfg(test)]
     pub(crate) fn blocked(&self) -> bool {
         let state = self.lock();

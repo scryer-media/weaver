@@ -295,7 +295,7 @@ impl Pipeline {
         })
     }
 
-    pub(in crate::pipeline) fn order_dispatch_candidates(
+    pub fn order_dispatch_candidates(
         servers: &mut [usize],
         groups: &[u32],
         backfill_flags: &[bool],

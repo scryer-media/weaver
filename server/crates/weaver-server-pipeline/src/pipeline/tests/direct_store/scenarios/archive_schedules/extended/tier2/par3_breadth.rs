@@ -85,6 +85,7 @@ pub(super) fn cells() -> Vec<Par3Cell> {
 pub(super) const PER_UNIT: usize = 231;
 
 // 432 cells, 231 schedules each.
+#[cfg(test)]
 pub(super) const TOTAL: usize = 99_792;
 
 pub(super) fn family() -> Family<Par3Cell> {
@@ -391,6 +392,7 @@ impl Cell for Par3Cell {
 macro_rules! par3_smokes {
     ($($name:ident $code:ident $margin:ident $block:literal $entries:ident $sets:ident $index:ident $container:ident;)+) => {
         mod combined_par3_breadth_smoke {
+            #[cfg(test)]
             use super::*;
             $(
                 #[tokio::test]
@@ -420,6 +422,7 @@ par3_smokes! {
 }
 
 mod combined_par3_breadth_loss_smoke {
+    #[cfg(test)]
     use super::*;
 
     #[tokio::test]
@@ -438,8 +441,10 @@ mod combined_par3_breadth_loss_smoke {
 }
 
 // The campaign: 500 shards of about two hundred cases.
-mod combined_par3_breadth {
+pub mod combined_par3_breadth {
     use super::*;
 
-    tier2_shards!(family, 500; h0 0 h1 1 h2 2 h3 3 h4 4);
+    pub async fn run_shard(shard: usize, shards: usize) {
+        family().shard(shard, shards).await;
+    }
 }

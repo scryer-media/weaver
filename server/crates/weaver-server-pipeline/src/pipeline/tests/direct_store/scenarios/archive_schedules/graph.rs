@@ -15,8 +15,8 @@ use crate::history::HistoryFailureKind;
 use crate::pipeline::graph::engine::{Heard, Said};
 use crate::pipeline::tests::engines::harness::{JOB, finished};
 
-pub(in crate::pipeline::tests) mod grouping;
-mod two_sets;
+pub mod grouping;
+pub mod two_sets;
 
 // What a schedule came to under the graph.
 pub(in super::super) struct GraphOutcome {
@@ -1231,14 +1231,11 @@ pub(in super::super) async fn graph_fixture_campaign(fixture: GraphFixture, sele
     assert_cells(&reports);
 }
 
-pub(in super::super) async fn graph_campaign(format: Format, selection: Selection) {
+pub async fn graph_campaign(format: Format, selection: Selection) {
     graph_fixture_campaign(graph_fixture(format, 4), selection).await;
 }
 
-pub(in super::super) async fn graph_compressed_campaign(
-    format: CompressedFormat,
-    selection: Selection,
-) {
+pub async fn graph_compressed_campaign(format: CompressedFormat, selection: Selection) {
     graph_fixture_campaign(graph_compressed_fixture(format), selection).await;
 }
 
@@ -1312,220 +1309,3 @@ graph_smokes!(graph_compressed_campaign;
 
 // The combined matrix under the graph: every case in shards, and the wrong
 // password's schedules as a test of their own.
-combined_campaign!(combined_rar4, Format::Rar4, graph_campaign);
-combined_campaign!(combined_rar5, Format::Rar5, graph_campaign);
-combined_campaign!(
-    combined_rar4_encrypted,
-    Format::Rar4Encrypted,
-    graph_campaign
-);
-combined_campaign!(combined_rar4_unsalted, Format::Rar4Unsalted, graph_campaign);
-combined_campaign!(
-    combined_rar5_encrypted,
-    Format::Rar5Encrypted,
-    graph_campaign
-);
-combined_campaign!(
-    combined_rar5_keyed_checksum,
-    Format::Rar5KeyedChecksum,
-    graph_campaign
-);
-combined_campaign!(
-    combined_rar5_header_encrypted,
-    Format::Rar5EncryptedHeaders,
-    graph_campaign
-);
-combined_campaign!(
-    combined_rar5_unchecked_header,
-    Format::Rar5UncheckedHeaders,
-    graph_campaign
-);
-combined_campaign!(combined_quick_open, Format::QuickOpen, graph_campaign);
-combined_campaign!(combined_blake2, Format::Blake2, graph_campaign);
-combined_campaign!(
-    combined_rar4_four_volume,
-    Format::Rar4FourVolumes,
-    graph_campaign
-);
-combined_campaign!(
-    combined_rar5_four_volume,
-    Format::Rar5FourVolumes,
-    graph_campaign
-);
-combined_campaign!(
-    combined_rar4_encrypted_four_volume,
-    Format::Rar4EncryptedFourVolumes,
-    graph_campaign
-);
-combined_campaign!(
-    combined_rar5_obfuscated,
-    Format::Rar5Obfuscated,
-    graph_campaign
-);
-combined_campaign!(combined_rar5_hex_bare, Format::Rar5HexBare, graph_campaign);
-combined_campaign!(combined_rar4_hex_bare, Format::Rar4HexBare, graph_campaign);
-combined_campaign!(
-    combined_rar5_hex_self_described,
-    Format::Rar5HexSelfDescribed,
-    graph_campaign
-);
-combined_campaign!(
-    combined_rar4_hex_self_described,
-    Format::Rar4HexSelfDescribed,
-    graph_campaign
-);
-combined_campaign!(
-    combined_rar5_hex_late_index,
-    Format::Rar5HexLateIndex,
-    graph_campaign
-);
-combined_campaign!(
-    combined_rar4_hex_late_index,
-    Format::Rar4HexLateIndex,
-    graph_campaign
-);
-combined_campaign!(
-    combined_rar5_hex_misnumbered,
-    Format::Rar5HexMisnumbered,
-    graph_campaign
-);
-combined_campaign!(
-    combined_rar4_hex_misnumbered,
-    Format::Rar4HexMisnumbered,
-    graph_campaign
-);
-combined_campaign!(
-    combined_rar5_hex_swapped_rar,
-    Format::Rar5HexSwappedRar,
-    graph_campaign
-);
-combined_campaign!(
-    combined_rar4_hex_swapped_rar,
-    Format::Rar4HexSwappedRar,
-    graph_campaign
-);
-combined_campaign!(
-    combined_rar5_hex_scattered,
-    Format::Rar5HexScattered,
-    graph_campaign
-);
-combined_campaign!(
-    combined_rar4_hex_scattered,
-    Format::Rar4HexScattered,
-    graph_campaign
-);
-combined_campaign!(
-    combined_rar5_hex_single,
-    Format::Rar5HexSingle,
-    graph_campaign
-);
-combined_campaign!(
-    combined_rar4_hex_single,
-    Format::Rar4HexSingle,
-    graph_campaign
-);
-combined_campaign!(
-    combined_compressed_rar4_mixed,
-    CompressedFormat::Rar4Mixed,
-    graph_compressed_campaign
-);
-combined_campaign!(
-    combined_compressed_rar4_lz,
-    CompressedFormat::Rar4Lz,
-    graph_compressed_campaign
-);
-combined_campaign!(
-    combined_compressed_rar4_encrypted,
-    CompressedFormat::Rar4Encrypted,
-    graph_compressed_campaign
-);
-combined_campaign!(
-    combined_compressed_rar4_headers,
-    CompressedFormat::Rar4Headers,
-    graph_compressed_campaign
-);
-combined_campaign!(
-    combined_compressed_rar5_mixed,
-    CompressedFormat::Rar5Mixed,
-    graph_compressed_campaign
-);
-combined_campaign!(
-    combined_compressed_rar5_lz,
-    CompressedFormat::Rar5Lz,
-    graph_compressed_campaign
-);
-combined_campaign!(
-    combined_compressed_rar5_encrypted,
-    CompressedFormat::Rar5Encrypted,
-    graph_compressed_campaign
-);
-combined_campaign!(
-    combined_compressed_rar5_headers,
-    CompressedFormat::Rar5Headers,
-    graph_compressed_campaign
-);
-combined_campaign!(
-    combined_compressed_rar5_solid,
-    CompressedFormat::Rar5Solid,
-    graph_compressed_campaign
-);
-combined_campaign!(
-    combined_compressed_rar5_solid_encrypted,
-    CompressedFormat::Rar5SolidEncrypted,
-    graph_compressed_campaign
-);
-combined_campaign!(
-    combined_compressed_rar5_solid_headers,
-    CompressedFormat::Rar5SolidHeaders,
-    graph_compressed_campaign
-);
-combined_campaign!(
-    combined_compressed_rar4_solid,
-    CompressedFormat::Rar4Solid,
-    graph_compressed_campaign
-);
-combined_campaign!(
-    combined_compressed_rar4_solid_encrypted,
-    CompressedFormat::Rar4SolidEncrypted,
-    graph_compressed_campaign
-);
-combined_campaign!(
-    combined_compressed_rar4_solid_headers,
-    CompressedFormat::Rar4SolidHeaders,
-    graph_compressed_campaign
-);
-combined_campaign!(
-    combined_compressed_rar4_ppmd,
-    CompressedFormat::Rar4Ppmd,
-    graph_compressed_campaign
-);
-combined_campaign!(
-    combined_compressed_rar4_ppmd_encrypted,
-    CompressedFormat::Rar4PpmdEncrypted,
-    graph_compressed_campaign
-);
-combined_campaign!(
-    combined_compressed_rar4_ppmd_headers,
-    CompressedFormat::Rar4PpmdHeaders,
-    graph_compressed_campaign
-);
-combined_campaign!(
-    combined_compressed_rar4_lz_two_volume,
-    CompressedFormat::Rar4LzTwoVolumes,
-    graph_compressed_campaign
-);
-combined_campaign!(
-    combined_compressed_rar5_lz_two_volume,
-    CompressedFormat::Rar5LzTwoVolumes,
-    graph_compressed_campaign
-);
-combined_campaign!(
-    combined_compressed_rar4_lz_four_volume,
-    CompressedFormat::Rar4LzFourVolumes,
-    graph_compressed_campaign
-);
-combined_campaign!(
-    combined_compressed_rar5_lz_four_volume,
-    CompressedFormat::Rar5LzFourVolumes,
-    graph_compressed_campaign
-);

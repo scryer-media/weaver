@@ -11,12 +11,7 @@ use super::*;
 
 use std::path::{Path, PathBuf};
 
-pub(in crate::pipeline) mod scenarios;
-
-mod tests {
-    mod lent_store_loss;
-    mod par2_schedules;
-}
+pub mod scenarios;
 
 // A real NZB's `<segment bytes=…>` is the yEnc-**encoded** article size, about
 // 3% larger than the decoded payload. Every fixture here declares inflated
@@ -408,6 +403,7 @@ pub(in crate::pipeline::tests) fn single_member_rar4_store_set_numbered(
 // [`single_member_rar4_store_set_numbered`] with a RAR3 recovery record of
 // `slots` parity sectors in each volume over every byte before its header,
 // as `rar a -rr` writes one.
+#[cfg(test)]
 pub(in crate::pipeline::tests) fn protected_rar4_store_set(
     member_name: &str,
     payload: &[u8],
@@ -426,6 +422,7 @@ pub(in crate::pipeline::tests) fn protected_rar4_store_set(
 // enciphered under `password`, as `rar a -hp -rr` writes it, the member's
 // data stored in the clear. Each volume's record is over its bytes before
 // its own header's salt.
+#[cfg(test)]
 pub(in crate::pipeline::tests) fn protected_sealed_rar4_store_set(
     member_name: &str,
     payload: &[u8],
@@ -443,6 +440,7 @@ pub(in crate::pipeline::tests) fn protected_sealed_rar4_store_set(
 // header's CRC made whole, every one past the main as its salt and its
 // cipher; data areas are
 // copied, and the record is made again over what precedes it.
+#[cfg(test)]
 fn seal_rar4_volume(plain: &[u8], slots: u32, password: &str) -> Vec<u8> {
     use weaver_objects::rar_record::encode;
     let size_at = |at: usize| usize::from(u16::from_le_bytes([plain[at + 5], plain[at + 6]]));
@@ -724,6 +722,7 @@ pub(in crate::pipeline::tests) fn multi_member_store_set(
 
 // A store set whose volumes each carry a RAR5 recovery record of `parity`
 // units over every byte before its header, as `rar a -rr` writes one.
+#[cfg(test)]
 pub(in crate::pipeline::tests) fn protected_store_set(
     member_name: &str,
     payload: &[u8],
@@ -737,6 +736,7 @@ pub(in crate::pipeline::tests) fn protected_store_set(
 
 // [`protected_store_set`] with a second member, `lead`, stored whole in the
 // first volume ahead of the split one.
+#[cfg(test)]
 pub(in crate::pipeline::tests) fn protected_store_set_led_by(
     lead: (&str, &[u8]),
     member_name: &str,
@@ -756,6 +756,7 @@ pub(in crate::pipeline::tests) fn protected_store_set_led_by(
 // A store set whose volumes each end in an `RR` service header, the record
 // `record` makes of the bytes before it and the volume's index, and the end
 // header.
+#[cfg(test)]
 fn store_set_with_records(
     member_name: &str,
     payload: &[u8],
@@ -767,6 +768,7 @@ fn store_set_with_records(
 
 // [`store_set_with_records`], `lead` stored whole in the first volume ahead
 // of the split member when there is one.
+#[cfg(test)]
 fn led_store_set_with_records(
     lead: Option<(&str, &[u8])>,
     member_name: &str,
@@ -1065,4 +1067,10 @@ fn build_test_rar4_end_header_numbered(more_volumes: bool, volume: u16) -> Vec<u
         flags |= 0x0001; // NEXT_VOLUME
     }
     build_test_rar4_block(0x7b, flags, &volume.to_le_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    mod lent_store_loss;
+    mod par2_schedules;
 }

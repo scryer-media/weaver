@@ -16,16 +16,16 @@ use super::super::graph::Answers;
 use super::*;
 use std::ops::Range;
 
-mod breadth;
-mod damage;
+pub mod breadth;
+pub mod damage;
 mod fixtures;
-mod headers;
-mod par2_realism;
-mod par3_breadth;
+pub mod headers;
+pub mod par2_realism;
+pub mod par3_breadth;
 mod post;
 mod recovery;
 mod run;
-mod uu;
+pub mod uu;
 
 use post::Post;
 use recovery::Geometry;
@@ -141,6 +141,7 @@ pub(super) async fn run_cell<C: Cell>(cell: C, cases: Vec<(usize, Schedule)>) {
 
 // A cell's smoke: every data group in order and then reversed, with
 // nothing lost.
+#[cfg(test)]
 pub(super) async fn smoke<C: Cell>(cell: C) {
     let forward = slot_arrivals(4);
     let mut backward = forward.clone();
@@ -157,6 +158,7 @@ pub(super) async fn smoke<C: Cell>(cell: C) {
 
 // A cell's smoke under a loss: the first and last groups each lose their
 // middle article, in order and reversed.
+#[cfg(test)]
 pub(super) async fn loss_smoke<C: Cell>(cell: C) {
     let forward = slot_arrivals(4);
     let mut backward = forward.clone();
@@ -197,6 +199,7 @@ pub(super) struct Family<C> {
 }
 
 impl<C: Cell> Family<C> {
+    #[cfg(test)]
     pub(super) fn total(&self) -> usize {
         self.units
             .iter()
@@ -260,37 +263,6 @@ impl<C: Cell> Family<C> {
     }
 }
 
-// Emits `shards` ignored campaign tests for a family, as nested modules of
-// hundreds, tens and units, so shard `h d s` runs shard `100h + 10d + s`.
-macro_rules! tier2_shards {
-    ($family:path, $shards:expr; $($h:ident $hv:literal)+) => {
-        const _: () = assert!(100 * [$($hv),+].len() == $shards);
-        $(mod $h {
-            use super::*;
-            tier2_shards!(@tens $family, $shards, $hv);
-        })+
-    };
-    (@tens $family:path, $shards:expr, $hv:literal) => {
-        tier2_shards!(@ten $family, $shards, $hv; d0 0 d1 1 d2 2 d3 3 d4 4 d5 5 d6 6 d7 7 d8 8 d9 9);
-    };
-    (@ten $family:path, $shards:expr, $hv:literal; $($d:ident $dv:literal)+) => {
-        $(mod $d {
-            use super::*;
-            tier2_shards!(@units $family, $shards, $hv, $dv; s0 0 s1 1 s2 2 s3 3 s4 4 s5 5 s6 6 s7 7 s8 8 s9 9);
-        })+
-    };
-    (@units $family:path, $shards:expr, $hv:literal, $dv:literal; $($s:ident $sv:literal)+) => {
-        $(
-            #[tokio::test]
-            #[ignore = "opt-in extended archive matrix; run with the archive-matrix-extended Nextest profile and --run-ignored all"]
-            async fn $s() {
-                $family().shard($hv * 100 + $dv * 10 + $sv, $shards).await;
-            }
-        )+
-    };
-}
-pub(super) use tier2_shards;
-
 // Every family's scenario count, as its enumerator yields it.
 #[test]
 fn tier2_sizing() {
@@ -314,6 +286,7 @@ fn tier2_sizing() {
 }
 
 // Tier two's scenarios across every family.
+#[cfg(test)]
 const TOTAL: usize = damage::TOTAL
     + par2_realism::TOTAL
     + par3_breadth::TOTAL

@@ -10,7 +10,8 @@
 // `cargo nextest run --profile archive-matrix-extended --run-ignored all --no-fail-fast`
 use super::*;
 
-mod depth;
-mod graph;
+pub mod depth;
+pub mod graph;
+#[cfg(test)]
 mod repair;
-mod tier2;
+pub mod tier2;

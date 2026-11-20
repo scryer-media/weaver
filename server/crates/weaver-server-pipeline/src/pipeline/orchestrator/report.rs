@@ -207,7 +207,7 @@ impl Pipeline {
 
     // A failed job is archived once its working directory is released, so
     // every release still out is heard first.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) async fn finished_jobs(&mut self) -> Vec<JobInfo> {
         crate::pipeline::tests::settle_failed_releases(self).await;
         let mut changes = self.shared_state.queue.subscribe();
@@ -224,7 +224,7 @@ impl Pipeline {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn report_all_for_test(&self) {
         let jobs = self
             .job_order

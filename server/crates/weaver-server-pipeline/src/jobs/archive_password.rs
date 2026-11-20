@@ -15,7 +15,7 @@ pub(crate) const VALIDATED_ARCHIVE_PASSWORD_METADATA_SQL: &str = "SELECT metadat
 pub(crate) trait JobsArchivePasswordInternalQueries {
     fn validated_archive_password_ciphertexts(&self) -> Result<Vec<String>, StateError>;
     fn seal_validated_archive_password(&self, password: &str) -> Result<String, StateError>;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     fn validated_archive_password(&self, job_id: u64) -> Result<Option<String>, StateError>;
 }
 
@@ -54,7 +54,7 @@ impl JobsArchivePasswordInternalQueries for Database {
 
     // The opened password, unsealed. Only tests read it back, to prove it
     // was sealed; no API serves a job's password.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     fn validated_archive_password(&self, job_id: u64) -> Result<Option<String>, StateError> {
         use crate::persistence::encryption::decrypt_value;
         use crate::persistence::sql_runtime::SqlArg;

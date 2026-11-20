@@ -89,7 +89,7 @@ pub(in super::super::super) fn sevenz_reads(
 // A shape's campaign, as the single-set campaign runs it: the wrong
 // password, then the selection, every case by its replay index in the pool
 // it was drawn from.
-async fn campaign(shape: Shape, selection: Selection) {
+pub async fn campaign(shape: Shape, selection: Selection) {
     let ShapeFixture {
         expected,
         packing,
@@ -180,23 +180,3 @@ async fn copy_obfuscated_arrival_schedules() {
 async fn copy_single_obfuscated_arrival_schedules() {
     campaign(Shape::CopySingleObfuscated, Selection::Smoke).await;
 }
-
-combined_campaign!(combined_copy, Shape::Copy, campaign);
-combined_campaign!(combined_copy_four_volume, Shape::CopyFourVolumes, campaign);
-combined_campaign!(combined_copy_single, Shape::CopySingle, campaign);
-combined_campaign!(combined_multiple, Shape::Multiple, campaign);
-combined_campaign!(combined_empty_entry, Shape::EmptyEntry, campaign);
-combined_campaign!(combined_nested, Shape::Nested, campaign);
-combined_campaign!(combined_lzma2, Shape::Lzma2Fallback, campaign);
-combined_campaign!(combined_encrypted_copy, Shape::EncryptedCopy, campaign);
-combined_campaign!(combined_encrypted_header, Shape::EncryptedHeaders, campaign);
-combined_campaign!(combined_encrypted_lzma2, Shape::EncryptedLzma2, campaign);
-combined_campaign!(combined_solid, Shape::Solid, campaign);
-combined_campaign!(combined_solid_encrypted, Shape::SolidEncrypted, campaign);
-combined_campaign!(combined_solid_headers, Shape::SolidHeaders, campaign);
-combined_campaign!(combined_copy_obfuscated, Shape::CopyObfuscated, campaign);
-combined_campaign!(
-    combined_copy_single_obfuscated,
-    Shape::CopySingleObfuscated,
-    campaign
-);

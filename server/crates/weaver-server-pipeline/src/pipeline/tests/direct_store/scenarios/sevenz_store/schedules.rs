@@ -2,12 +2,10 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // Tail-metadata discovery under every bounded arrival/duplicate schedule.
-use super::super::archive_schedules::{
-    Interruption, ScheduleOptions, Selection, combined_campaign,
-};
+use super::super::archive_schedules::{Interruption, ScheduleOptions, Selection};
 use super::*;
 
-pub(in super::super) mod graph;
+pub mod graph;
 
 // Bytes in which no slice recurs. A recovery set mends a lost slice from any
 // copy of it elsewhere in the set, so a payload that repeats survives a loss
@@ -25,7 +23,7 @@ pub(in super::super) fn unrepeated_payload(seed: u64, len: usize) -> Vec<u8> {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum Shape {
+pub enum Shape {
     Copy,
     // Four single-article volumes, so two of the volumes are middle volumes.
     CopyFourVolumes,

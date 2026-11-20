@@ -133,6 +133,7 @@ pub(super) fn cells() -> Vec<UuCell> {
 pub(super) const PER_UNIT: usize = 139;
 
 // 1,100 cells, 139 schedules each.
+#[cfg(test)]
 pub(super) const TOTAL: usize = 152_900;
 
 pub(super) fn family() -> Family<UuCell> {
@@ -262,6 +263,7 @@ impl Cell for UuCell {
 macro_rules! uu_smokes {
     ($($name:ident $style:literal $shape:ident $damage:expr, $container:ident;)+) => {
         mod combined_uu_smoke {
+            #[cfg(test)]
             use super::*;
             $(
                 #[tokio::test]
@@ -314,6 +316,7 @@ async fn truncated_sevenz_part_reaches_par2_repair() {
 }
 
 mod combined_uu_loss_smoke {
+    #[cfg(test)]
     use super::*;
 
     #[tokio::test]
@@ -340,8 +343,10 @@ mod combined_uu_loss_smoke {
 }
 
 // The campaign: 500 shards of about three hundred cases.
-mod combined_uu {
+pub mod combined_uu {
     use super::*;
 
-    tier2_shards!(family, 500; h0 0 h1 1 h2 2 h3 3 h4 4);
+    pub async fn run_shard(shard: usize, shards: usize) {
+        family().shard(shard, shards).await;
+    }
 }

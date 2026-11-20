@@ -10,14 +10,9 @@
 // no article is asked twice but those a restart or a crash dropped.
 // Neither interruption of a two-interruption case changes that, and a second
 // duplicate is an article already held, never one asked for again.
-use super::super::depth::{Family, depth_shards};
-use super::*;
-
-async fn graph_family_campaign(family: Family, format: Format, selection: Selection) {
-    eprintln!("graph {family:?} {format:?} selection={selection:?}");
-    let cases = family.selected(format, selection);
-    assert_cells(&graph_fixture_cases(&graph_fixture(format, family.slots()), cases).await);
-}
+use weaver_server_pipeline::pipeline::tests::direct_store::scenarios::archive_schedules::{
+    Format, Selection, extended::depth::Family, extended::graph::graph_family_campaign,
+};
 
 macro_rules! graph_depth_smoke {
     ($($name:ident $family:ident $format:ident),+ $(,)?) => {

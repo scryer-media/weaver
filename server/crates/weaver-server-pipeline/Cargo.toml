@@ -7,6 +7,7 @@ license-file.workspace = true
 repository.workspace = true
 
 [features]
+pipeline-test-fixtures = ["test-support", "weaver-graph/test-support", "weaver-objects/test-support", "sevenz-turbo/compress", "lzma-turbo/enc"]
 slow-tests = []
 # Hooks that let other crates' tests move stored state directly instead of
 # waiting on the wall clock. Never enabled outside dev-dependencies. The
@@ -143,6 +144,7 @@ keyring-core = { workspace = true }
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_JobObjects", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 
 [dev-dependencies]
+weaver-server-pipeline = { path = ".", features = ["pipeline-test-fixtures"] }
 weaver-server-torrents = { path = "../weaver-server-torrents", features = ["test-support"] }
 weaver-server-rss = { path = "../weaver-server-rss", features = ["test-support"] }
 weaver-server-net = { path = "../weaver-server-net", features = ["test-support"] }

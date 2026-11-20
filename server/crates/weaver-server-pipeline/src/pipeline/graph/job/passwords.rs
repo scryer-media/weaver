@@ -161,7 +161,7 @@ impl GraphJob {
     }
 
     // How many candidates each node has been offered, by node.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn passwords_offered(&self) -> std::collections::BTreeMap<NodeId, usize> {
         (*self.passwords.offered).clone()
     }

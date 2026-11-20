@@ -10,7 +10,7 @@
 
 use super::*;
 
-pub(super) mod schedules;
+pub mod schedules;
 
 use sevenz_turbo::encoder_options::AesEncoderOptions;
 use sevenz_turbo::{ArchiveEntry, ArchiveWriter, EncoderConfiguration, EncoderMethod, Password};
@@ -48,6 +48,7 @@ impl Entry {
     }
 
     // An entry the header marks for deletion rather than for writing.
+    #[cfg(test)]
     fn anti_item(name: &'static str) -> Self {
         Self {
             name,
@@ -58,6 +59,7 @@ impl Entry {
     }
 
     // An entry whose attributes say the name is a redirection, not a file.
+    #[cfg(test)]
     fn symlink(name: &'static str, target: &str) -> Self {
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
         Self {
@@ -84,6 +86,7 @@ pub(super) fn payload(seed: u8, len: usize) -> Vec<u8> {
 }
 
 // Encodes a fixture archive in memory.
+#[cfg(test)]
 fn build_7z(entries: &[Entry], method: EncoderMethod, password: Option<&str>) -> Vec<u8> {
     build_7z_shaped(entries, method, password, false)
 }
@@ -208,7 +211,9 @@ fn sevenz_job_spec_stating(
     }
 }
 
+#[cfg(test)]
 const MEMBER: &str = "Silver.Horizon.S01E01.dat";
+#[cfg(test)]
 const SECOND_MEMBER: &str = "Silver.Horizon.S01E02.dat";
 
 // The same container with every stored CRC32 taken out of its end header.
@@ -221,6 +226,7 @@ const SECOND_MEMBER: &str = "Silver.Horizon.S01E02.dat";
 // header's own two checksums are recomputed. Every checksum written here is
 // **computed**, never a literal: a typed CRC is a fixture that agrees with
 // itself and with nothing else.
+#[cfg(test)]
 fn strip_member_crcs(archive: &[u8], member: &[u8]) -> Vec<u8> {
     const K_END: u8 = 0x00;
     const K_HEADER: u8 = 0x01;

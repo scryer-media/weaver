@@ -60,16 +60,16 @@ impl JobsDownloadSummaryPersistenceQueries for Database {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) trait JobsDownloadSummaryPersistenceInternalQueries {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     fn history_download_summary_text(&self, job_id: JobId) -> Result<Option<String>, StateError>;
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 impl JobsDownloadSummaryPersistenceInternalQueries for Database {
     // The stored text of a history row's summary, as written.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     fn history_download_summary_text(&self, job_id: JobId) -> Result<Option<String>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {

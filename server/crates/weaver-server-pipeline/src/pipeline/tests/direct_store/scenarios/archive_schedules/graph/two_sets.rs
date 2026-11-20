@@ -16,7 +16,7 @@ use super::*;
 
 // A two-set layout of the archive matrix.
 #[derive(Clone, Copy, Debug)]
-enum TwoSets {
+pub enum TwoSets {
     // Two single-volume stored sets: the first in slots 0 and 1, the second
     // in slots 2 and 3.
     Stored,
@@ -77,11 +77,12 @@ impl TwoSets {
     }
 }
 
-async fn two_set_campaign(layout: TwoSets, selection: Selection) {
+pub async fn two_set_campaign(layout: TwoSets, selection: Selection) {
     graph_fixture_campaign(layout.fixture(), selection).await;
 }
 
 // One named arrival order, uninterrupted, under its smoke replay index.
+#[cfg(test)]
 async fn two_set_order(layout: TwoSets, order: &[(u32, u32)]) {
     let schedule = (order.to_vec(), Interruption::None);
     let case = schedules()
@@ -129,15 +130,3 @@ async fn rar5_hex_two_sets_with_each_later_volume_first_never_merge() {
     )
     .await;
 }
-
-combined_campaign!(combined_two_sets, TwoSets::Stored, two_set_campaign);
-combined_campaign!(
-    combined_rar5_hex_two_set,
-    TwoSets::Hex(HexTwoSets::Rar5),
-    two_set_campaign
-);
-combined_campaign!(
-    combined_rar4_hex_two_set,
-    TwoSets::Hex(HexTwoSets::Rar4),
-    two_set_campaign
-);

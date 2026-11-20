@@ -276,6 +276,7 @@ const PER_UNIT: usize = 4;
 
 // 1,576 cells, four schedules each.
 pub(super) const CELLS: usize = 1_576;
+#[cfg(test)]
 pub(super) const TOTAL: usize = CELLS * PER_UNIT + field::TOTAL;
 
 pub(super) fn family() -> Family<HeaderCell> {
@@ -510,7 +511,7 @@ impl Cell for HeaderCell {
 // The field post at its own size: one 21,504,000-byte file in 28 parts of
 // 768,000 bytes, every header declaring `size=1536000`, so part 28 begins at
 // 20,736,000 (`begin=20736001`) far past the size every header states.
-pub(super) mod field {
+pub mod field {
     use super::*;
 
     const PART: usize = 768_000;
@@ -551,6 +552,7 @@ pub(super) mod field {
     }
 
     const PER_UNIT: usize = 2;
+    #[cfg(test)]
     pub(in super::super) const TOTAL: usize = 10 * PER_UNIT;
 
     pub(in super::super) fn family() -> Family<FieldCell> {
@@ -638,6 +640,7 @@ pub(super) mod field {
     }
 
     mod field_smoke {
+        #[cfg(test)]
         use super::*;
 
         // Every part arrives: complete and byte-equal, whatever the size
@@ -675,14 +678,17 @@ pub(super) mod field {
     }
 
     // The campaign: ten shards of two cases.
-    mod field_campaign {
+    pub mod field_campaign {
         use super::*;
 
-        tier2_shards!(family, 100; h0 0);
+        pub async fn run_shard(shard: usize, shards: usize) {
+            family().shard(shard, shards).await;
+        }
     }
 }
 
 mod header_smoke {
+    #[cfg(test)]
     use super::*;
 
     #[tokio::test]
@@ -739,8 +745,10 @@ mod header_smoke {
 }
 
 // The campaign: a hundred shards of about seventy cases.
-mod header_campaign {
+pub mod header_campaign {
     use super::*;
 
-    tier2_shards!(family, 100; h0 0);
+    pub async fn run_shard(shard: usize, shards: usize) {
+        family().shard(shard, shards).await;
+    }
 }

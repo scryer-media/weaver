@@ -6996,6 +6996,7 @@ dependencies = [
  "weaver-server-jobs",
  "weaver-server-migrations",
  "weaver-server-net",
+ "weaver-server-pipeline",
  "weaver-server-postproc",
  "weaver-server-rss",
  "weaver-server-settings",

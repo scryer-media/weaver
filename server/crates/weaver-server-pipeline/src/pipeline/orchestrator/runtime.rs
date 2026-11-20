@@ -426,7 +426,7 @@ impl Pipeline {
             server_attribution_checkpoint_at: Instant::now(),
             #[cfg(test)]
             par2_ignore_extensions_override: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             pending_decode: VecDeque::new(),
             pending_completion_checks: VecDeque::new(),
             blocked_restores: HashMap::new(),

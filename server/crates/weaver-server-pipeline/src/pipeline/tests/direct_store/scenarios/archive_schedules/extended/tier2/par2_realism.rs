@@ -179,6 +179,7 @@ pub(super) const PER_UNIT: usize = 46;
 // Preserve every cell, but sample fewer schedules for the cubic
 // thousands-block algebra. Weight those cases separately when sharding.
 const THOUSANDS_PER_UNIT: usize = 2;
+#[cfg(test)]
 pub(super) const TOTAL: usize = 4_000 * (PER_UNIT + THOUSANDS_PER_UNIT);
 
 pub(super) fn family() -> Family<Par2Cell> {
@@ -527,6 +528,7 @@ async fn index_absent_restart_fetches_remaining_recovery() {
 macro_rules! par2_smokes {
     ($($name:ident $slice:literal $redundancy:ident $margin:ident $band:ident $alignment:ident $pattern:ident $structure:ident $container:ident;)+) => {
         mod combined_par2_realism_smoke {
+            #[cfg(test)]
             use super::*;
             $(
                 #[tokio::test]
@@ -565,8 +567,10 @@ par2_smokes! {
 
 // The campaign: 2,200 cost-balanced shards. Thousands-block cells retain
 // fewer schedules and a higher partition weight.
-mod combined_par2_realism {
+pub mod combined_par2_realism {
     use super::*;
 
-    tier2_shards!(family, 2200; h00 0 h01 1 h02 2 h03 3 h04 4 h05 5 h06 6 h07 7 h08 8 h09 9 h10 10 h11 11 h12 12 h13 13 h14 14 h15 15 h16 16 h17 17 h18 18 h19 19 h20 20 h21 21);
+    pub async fn run_shard(shard: usize, shards: usize) {
+        family().shard(shard, shards).await;
+    }
 }

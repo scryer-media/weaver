@@ -69,109 +69,194 @@
 //
 // Files are indexed as the posts are listed; ordinals count from zero.
 
+#[cfg(test)]
 mod abandon_cost;
+#[cfg(test)]
 mod accounting;
+#[cfg(test)]
 mod binding_order;
+#[cfg(test)]
 mod bound_recovery_health;
+#[cfg(test)]
 mod caps;
+#[cfg(test)]
 mod checkpoint_cost;
-mod classic_par2_index;
+#[cfg(test)]
 mod classic_rar_crypt;
+#[cfg(test)]
 mod classic_sfv;
+#[cfg(test)]
 mod classic_sfv_nameless;
+#[cfg(test)]
 mod classic_streams;
+#[cfg(test)]
 mod classic_uu;
-mod classic_zip64;
-mod dashed_volumes;
+#[cfg(test)]
 mod dead_posts;
+#[cfg(test)]
 mod deep;
+#[cfg(test)]
 mod delivery;
+#[cfg(test)]
 mod depth;
+#[cfg(test)]
 mod disk_wait;
+#[cfg(test)]
 mod download_summary;
+#[cfg(test)]
 mod embedded;
+#[cfg(test)]
 mod encrypted_hex;
+#[cfg(test)]
 mod end_files;
+#[cfg(test)]
 mod extractor_claims;
+#[cfg(test)]
 mod first_article_sample;
+#[cfg(test)]
 mod frontless_rar;
+#[cfg(test)]
 mod frontless_records;
-mod frontless_sets;
-pub(in crate::pipeline) mod harness;
+pub mod harness;
+mod state;
+
+#[cfg(test)]
 mod header_names;
+#[cfg(test)]
 mod hold_breach;
+#[cfg(test)]
 mod lent_handed;
+#[cfg(test)]
 mod lent_windows;
+#[cfg(test)]
 mod lifecycle;
+#[cfg(test)]
 mod lines;
+#[cfg(test)]
 pub(in crate::pipeline) mod loans;
+#[cfg(test)]
 mod lost_fronts;
-mod lost_index;
+#[cfg(test)]
 mod many_members;
+#[cfg(test)]
 mod misstated_sizes;
-mod nameless_recovery;
+#[cfg(test)]
 mod nameless_reversed;
+#[cfg(test)]
 mod nested_engine_fault;
+#[cfg(test)]
 mod nested_rar4;
+#[cfg(test)]
 mod nesting;
+#[cfg(test)]
 mod obfuscated_revs;
+#[cfg(test)]
 mod pairings;
+#[cfg(test)]
 mod par3;
+#[cfg(test)]
 mod partial;
+#[cfg(test)]
 mod password;
+#[cfg(test)]
 mod perf;
+#[cfg(test)]
 mod plain_par2;
+#[cfg(test)]
 mod post_health_seats;
+#[cfg(test)]
 mod prefix_sets;
+#[cfg(test)]
 mod rar;
+#[cfg(test)]
 mod rar4_end_records;
+#[cfg(test)]
 mod rar_engine;
+#[cfg(test)]
 mod rar_rev;
+#[cfg(test)]
 mod recovery_audit;
+#[cfg(test)]
 mod recovery_contracts;
+#[cfg(test)]
 mod recovery_damage_wire;
+#[cfg(test)]
 mod recovery_duplicate_wire;
+#[cfg(test)]
 mod recovery_encrypted_wire;
+#[cfg(test)]
 mod recovery_geometry;
+#[cfg(test)]
 mod recovery_geometry_wire;
+#[cfg(test)]
 mod recovery_restart_wire;
+#[cfg(test)]
 mod refused_then_repaired;
+#[cfg(test)]
 mod release_layers;
+#[cfg(test)]
 mod remaining_par2;
+#[cfg(test)]
 mod remaining_stalls;
+#[cfg(test)]
 mod renamed_engine;
+#[cfg(test)]
 mod renamed_held_volumes;
+#[cfg(test)]
 mod renamed_sets;
+#[cfg(test)]
 mod repaired_records;
+#[cfg(test)]
 mod repaired_source;
+#[cfg(test)]
 mod reposted;
+#[cfg(test)]
 pub(in crate::pipeline::tests) mod restart;
+#[cfg(test)]
 mod scene_zips;
-mod sealed;
+#[cfg(test)]
 mod seek;
+#[cfg(test)]
 mod sets;
+#[cfg(test)]
 mod settled_rulings;
+#[cfg(test)]
 mod sevenz;
+#[cfg(test)]
 mod sevenz_hex;
+#[cfg(test)]
 mod sfv;
+#[cfg(test)]
 mod size_bounds;
+#[cfg(test)]
 mod solid_hex;
+#[cfg(test)]
 mod spent;
+#[cfg(test)]
 mod split;
+#[cfg(test)]
 mod split_sets;
+#[cfg(test)]
 mod srr;
+#[cfg(test)]
 mod stage_events;
-mod status_rulings;
+#[cfg(test)]
 mod streams;
+#[cfg(test)]
 mod too_large;
+#[cfg(test)]
 mod unasked_recovery;
-mod unlisted_data;
+#[cfg(test)]
 mod unlisted_par2;
-mod unnamed_index;
+#[cfg(test)]
 mod unnamed_recovery;
-mod unused_sets;
+#[cfg(test)]
 mod volume_order;
+#[cfg(test)]
 mod waiting_sets;
+#[cfg(test)]
 mod withheld_par2;
+#[cfg(test)]
 mod zip;
+#[cfg(test)]
 mod zip_par3;

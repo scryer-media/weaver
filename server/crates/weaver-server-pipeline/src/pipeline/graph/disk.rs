@@ -300,14 +300,16 @@ fn probed_dir(job_dir: &Path) -> Option<&Path> {
 
 // A test's say over how the pipelines it builds write: one thread per
 // volume, as outside tests, instead of each operation as it is submitted.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) mod threads {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     static ASKED: AtomicBool = AtomicBool::new(false);
 
+    #[cfg(test)]
     pub(crate) struct Threads(());
 
+    #[cfg(test)]
     pub(crate) fn real() -> Threads {
         ASKED.store(true, Ordering::SeqCst);
         Threads(())
@@ -328,6 +330,7 @@ pub(crate) mod threads {
         })
     }
 
+    #[cfg(test)]
     impl Drop for Threads {
         fn drop(&mut self) {
             ASKED.store(false, Ordering::SeqCst);
@@ -866,7 +869,7 @@ impl JobBarrier {
     }
 
     // Whether a test holds a volume behind it.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn test_held(&self) -> bool {
         self.0.iter().any(Barrier::test_held)
     }

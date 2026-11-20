@@ -51,7 +51,7 @@ use bytes::Bytes;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 use crate::RestoreJobRequest;
 #[cfg(test)]
 use crate::jobs::assembly::JobAssembly;
@@ -62,7 +62,7 @@ use crate::{
     JobState, JobStatus, NntpRuntimeActivation, PipelineMetrics, RuntimeTuner, SharedPipelineState,
     TokenBucket,
 };
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 use par2_rs::checksum;
 use weaver_nntp::NntpClient;
 use weaver_server_base::events::model::PipelineEvent;
@@ -880,7 +880,7 @@ pub(super) fn download_outcome_keeps_connection(
 
 // An undecoded article body waiting for a decode slot. Test-only: see
 // [`DownloadPayload::Raw`].
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(super) struct PendingDecodeWork {
     pub(super) segment_id: SegmentId,
     pub(super) raw: Bytes,
@@ -1915,7 +1915,7 @@ pub struct Pipeline {
     pub(super) par2_ignore_extensions_override: Option<Vec<String>>,
     // Undecoded article bodies waiting for a decode slot. Only tests hand
     // the pipeline an undecoded body; the download lanes decode inline.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(super) pending_decode: VecDeque<PendingDecodeWork>,
     // Jobs that should re-enter completion/post-processing on the next loop pass.
     pub(super) pending_completion_checks: VecDeque<JobId>,
@@ -2358,5 +2358,6 @@ pub struct Pipeline {
     pub(super) process_memory_budget: Arc<ProcessMemoryBudget>,
 }
 
-#[cfg(test)]
-pub(crate) mod tests;
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+#[doc(hidden)]
+pub mod tests;

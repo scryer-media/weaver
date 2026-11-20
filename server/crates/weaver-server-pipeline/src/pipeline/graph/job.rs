@@ -416,6 +416,7 @@ impl GraphJob {
     // Whether mail is still owed by anything but runs that each wait on
     // their shelf for a change that has not come, and what rings as a run
     // begins to wait.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     #[cfg(test)]
     pub(crate) fn awaits_mail_unless_blocked(&self) -> bool {
         self.loans.out()
@@ -428,6 +429,7 @@ impl GraphJob {
             })
     }
 
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     #[cfg(test)]
     pub(crate) fn blocked(&self) -> std::sync::Arc<tokio::sync::Notify> {
         self.writer.blocked()
@@ -454,7 +456,7 @@ impl GraphJob {
     }
 
     // Whether a repair, replay or check of the job is out on a thread.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn lent(&self) -> bool {
         self.loans.out()
     }
@@ -481,7 +483,7 @@ impl GraphJob {
     }
 
     // How many objects went out for their work.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn loans_lent(&self) -> u64 {
         self.works.lent()
     }
@@ -841,7 +843,7 @@ impl GraphJob {
     }
 
     // Whether the root keeps decoder checksums for the member's volume.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn checksums_held(&self, member: MemberId) -> bool {
         self.root.checksums_held(VolumeIndex(member.0))
     }

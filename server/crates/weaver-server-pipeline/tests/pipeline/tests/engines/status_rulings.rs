@@ -58,11 +58,11 @@ async fn damage_to_a_file_no_set_describes_does_not_shorten_a_job_a_set_vouched_
         graph.files.keys().collect::<Vec<_>>()
     );
     assert!(
-        graph.graph().delivery.damaged.is_empty(),
+        graph.graph().damaged_files().is_empty(),
         "{:?}",
-        graph.graph().delivery
+        graph.graph()
     );
-    assert_eq!(graph.graph().delivery.unchecked, vec!["foo_dr.txt"]);
+    assert_eq!(graph.graph().unchecked_files(), vec!["foo_dr.txt"]);
 
     // A repair that rebuilt a track vouches for the job too.
     let repaired = run(&Scenario::new(tracks_beside(1)).lost(0, 1).lost(TEXT, 1)).await;
@@ -93,7 +93,7 @@ async fn damage_beside_no_recovery_set_still_shortens_the_job() {
         "{:?}",
         graph.failure
     );
-    assert_eq!(graph.graph().delivery.damaged, vec!["foo_dr.txt"]);
+    assert_eq!(graph.graph().damaged_files(), vec!["foo_dr.txt"]);
 }
 
 // A set that cannot rebuild a file it describes vouches for nothing: the
@@ -119,7 +119,7 @@ async fn damage_a_set_describes_and_cannot_repair_still_shortens_the_job() {
         "{:?}",
         graph.failure
     );
-    assert!(graph.graph().delivery.unchecked.is_empty());
+    assert!(graph.graph().unchecked_files().is_empty());
 }
 
 // The share of a job that is recovery data follows the graph's binding: a

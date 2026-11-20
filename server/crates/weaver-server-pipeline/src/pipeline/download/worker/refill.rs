@@ -64,7 +64,7 @@ impl Pipeline {
 
     // The depth the lanes on `server_idx` run at, whichever lane asks: on a
     // pin's trial, the depth of the lanes that are not running it.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(in crate::pipeline) fn download_lane_mode_for_server(
         &self,
         server_idx: usize,
@@ -656,7 +656,7 @@ impl Pipeline {
     // Cut one lease for `server_idx` the way a dispatch pass would: one
     // scheduler handout, reserved and pinned to that server. `None` when the
     // scheduler had nothing for the server or nothing survived reservation.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(in crate::pipeline) fn lease_for_server_for_test(
         &mut self,
         server_idx: usize,

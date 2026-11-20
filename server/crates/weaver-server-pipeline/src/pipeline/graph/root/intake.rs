@@ -164,7 +164,7 @@ impl Checksums {
     }
 
     // Whether any checksum of the volume is kept.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn holds(&self, volume: VolumeIndex) -> bool {
         self.volumes
             .get(&volume)

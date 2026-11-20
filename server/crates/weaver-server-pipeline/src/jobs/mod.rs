@@ -9,7 +9,7 @@ pub mod diagnostic_names;
 pub mod diagnostic_tables;
 pub use weaver_server_jobs::jobs::download_summary;
 mod download_summary_persistence;
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) use download_summary_persistence::JobsDownloadSummaryPersistenceInternalQueries;
 pub use download_summary_persistence::JobsDownloadSummaryPersistenceQueries;
 pub use weaver_server_jobs::jobs::duplicate;

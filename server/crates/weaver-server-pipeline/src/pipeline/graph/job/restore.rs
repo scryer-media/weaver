@@ -320,7 +320,7 @@ impl GraphJob {
     // in hand but not on disk, on disk but not in the checkpoint the
     // database will hold once the writes already queued for it run, or
     // heard of before the root saw them.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn in_memory(&self) -> Vec<(u32, u32)> {
         let named = self.pending.named();
         let mut out = Vec::new();
@@ -341,7 +341,7 @@ impl GraphJob {
 
     // The articles the root has in hand whose bytes are on disk: what a
     // checkpoint taken now names.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn on_disk(&self) -> std::collections::BTreeSet<(u32, u32)> {
         let mut out = std::collections::BTreeSet::new();
         self.arrived(|article, on_disk| {
@@ -357,7 +357,7 @@ impl GraphJob {
     // article, so articles that lie end to end are read back
     // as one run, and only a run that does not read back is halved until
     // each article in it is answered alone.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     fn arrived(&self, mut each: impl FnMut((u32, u32), bool)) {
         let mut bytes = Vec::new();
         for index in 0..self.root.map.volume_count() {
@@ -370,7 +370,7 @@ impl GraphJob {
     }
 
     // Whether each article of `run`, which lie end to end, reads back.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     fn reads_back(
         &self,
         volume: VolumeIndex,

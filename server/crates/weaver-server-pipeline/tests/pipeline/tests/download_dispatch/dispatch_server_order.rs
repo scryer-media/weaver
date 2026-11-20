@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use super::*;
 use std::collections::HashMap;
+use std::time::Duration;
+use weaver_server_pipeline::Pipeline;
 
 // Two fill servers, the second in a lower priority group, plus an optional
 // backfill server in the highest group there is.
