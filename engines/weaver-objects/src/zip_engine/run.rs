@@ -9,6 +9,10 @@
 // as the download brings each entry, never ahead of it. A verdict waits for
 // the volumes to close, as the lengths it rests on are final only then;
 // an ask for a password does not.
+//
+// Each member is ruled on alone: one that fails is retracted, and the walk
+// goes on to the next. A member that bytes nothing will bring cross fails,
+// and its owner says why the archive is short.
 
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -47,9 +51,9 @@ impl Extraction for Run {
         sink: &mut Sink<'_>,
         _: weaver_graph::Budget,
     ) {
-        let joined = Joined::new(volumes);
+        let joined = Joined::member_by_member(volumes);
         let failed = joined.failure();
-        let image = match Image::open(joined) {
+        let image = match Image::open(joined.clone()) {
             Ok(image) => image,
             Err(Unopened::Refused(why)) if !failed.load(Ordering::Acquire) => {
                 sink(Emit::Refuse(why));
@@ -60,6 +64,7 @@ impl Extraction for Run {
         let disks = image.disks();
         let mut walk = Walk {
             sink,
+            joined,
             next: 0,
             open: None,
         };
@@ -96,6 +101,7 @@ type Ended = Option<(String, Emit)>;
 
 struct Walk<'s, 'a> {
     sink: &'s mut Sink<'a>,
+    joined: Joined,
     // The id the next member announced gets: members are numbered in the
     // order the walk meets them, so every run of the same set numbers them
     // alike.
@@ -116,57 +122,93 @@ impl Walk<'_, '_> {
             )));
         }
         let mut image = archive.into_inner();
+        // The first member that failed on bytes the run read, which the run
+        // ends on once every member is ruled on.
+        let mut damaged = None;
         for index in 0..directory.len() {
-            let entry = directory.entry(index).map_err(zip)?;
-            image.check_header(&entry).map_err(zip)?;
-            // The directory bounds the read and the decoded output. A stale
-            // local size does not discard a member whose CRC still checks.
-            let options = ZipReadOptions::new().password(password.map(str::as_bytes));
-            let mut file = entry.with_reader(&mut image, options).map_err(zip)?;
-            let name = file.name().map_err(zip)?.into_owned();
-            // A directory is a member with nothing in it, named as the store
-            // names it. Links and devices are not file bodies, so none is a
-            // member and the files around them stand.
-            let shape = records::shape(&name, file.unix_mode());
-            let length = match shape {
-                Shape::File => file.size(),
-                Shape::Directory => 0,
-                Shape::Other => continue,
+            let losses = self.joined.losses();
+            let Err(Some((error, verdict))) = self.member(&directory, index, &mut image, password)
+            else {
+                continue;
             };
-            let name = records::member_name(name, shape);
-            let member = MemberId(self.next);
-            self.next += 1;
-            self.say(Emit::Member {
-                member,
-                name,
-                length: Some(length),
-            })?;
-            self.open = Some(member);
-            let encrypted = file.encrypted();
-            if shape == Shape::File && !encrypted {
-                self.say(Emit::Checksum {
-                    member,
-                    crc32: file.crc32(),
-                })?;
+            // Bytes nothing will bring failed it: its owner, who knows they
+            // were lost, says why the archive is short.
+            let lost = self.joined.losses() != losses;
+            // The owner failed a read, or the member's failure is no damage:
+            // the walk ends on it.
+            let damage = verdict == Emit::Refuse(weaver_graph::Why::Unrepairable);
+            if self.joined.failed() || !(lost || damage) {
+                return Err(Some((error, verdict)));
             }
-            let out = Out {
-                sink: &mut *self.sink,
-                member,
-                offset: 0,
-                stopped: false,
-            };
-            let mut out = io::BufWriter::with_capacity(EMIT_BYTES, out);
-            let copied = io::copy(&mut file, &mut out).and_then(|_| out.flush());
-            // What is still gathered when the copy failed is not said.
-            let (out, _) = out.into_parts();
-            if out.stopped {
-                return Err(None);
+            if let Some(open) = self.open.take() {
+                self.say(Emit::Retract(open))?;
             }
-            copied
-                .map_err(|error| Some((error.to_string(), verdict::zip_read(&error, encrypted))))?;
-            self.open = None;
-            self.say(Emit::MemberClosed(member))?;
+            match lost || damaged.is_some() {
+                true => self.say(Emit::Failed(verdict::failed(&error)))?,
+                false => damaged = Some((error, verdict)),
+            }
         }
+        damaged.map_or(Ok(()), |damaged| Err(Some(damaged)))
+    }
+
+    // One member, read whole into the sink and closed, or the error it
+    // failed on.
+    fn member(
+        &mut self,
+        directory: &::zip::read::ZipArchiveMetadata,
+        index: usize,
+        image: &mut Image,
+        password: Option<&str>,
+    ) -> Result<(), Ended> {
+        let zip = |error: ZipError| Some((error.to_string(), verdict::zip(&error)));
+        let entry = directory.entry(index).map_err(zip)?;
+        image.check_header(&entry).map_err(zip)?;
+        // The directory bounds the read and the decoded output. A stale
+        // local size does not discard a member whose CRC still checks.
+        let options = ZipReadOptions::new().password(password.map(str::as_bytes));
+        let mut file = entry.with_reader(image, options).map_err(zip)?;
+        let name = file.name().map_err(zip)?.into_owned();
+        // A directory is a member with nothing in it, named as the store
+        // names it. Links and devices are not file bodies, so none is a
+        // member and the files around them stand.
+        let shape = records::shape(&name, file.unix_mode());
+        let length = match shape {
+            Shape::File => file.size(),
+            Shape::Directory => 0,
+            Shape::Other => return Ok(()),
+        };
+        let name = records::member_name(name, shape);
+        let member = MemberId(self.next);
+        self.next += 1;
+        self.say(Emit::Member {
+            member,
+            name,
+            length: Some(length),
+        })?;
+        self.open = Some(member);
+        let encrypted = file.encrypted();
+        if shape == Shape::File && !encrypted {
+            self.say(Emit::Checksum {
+                member,
+                crc32: file.crc32(),
+            })?;
+        }
+        let out = Out {
+            sink: &mut *self.sink,
+            member,
+            offset: 0,
+            stopped: false,
+        };
+        let mut out = io::BufWriter::with_capacity(EMIT_BYTES, out);
+        let copied = io::copy(&mut file, &mut out).and_then(|_| out.flush());
+        // What is still gathered when the copy failed is not said.
+        let (out, _) = out.into_parts();
+        if out.stopped {
+            return Err(None);
+        }
+        copied.map_err(|error| Some((error.to_string(), verdict::zip_read(&error, encrypted))))?;
+        self.open = None;
+        self.say(Emit::MemberClosed(member))?;
         Ok(())
     }
 

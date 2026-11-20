@@ -780,6 +780,18 @@ impl Object for SevenZipStore {
         Kind::SevenZipStore
     }
 
+    // An entry of a folder that copies, not enciphered: the map takes no
+    // other method.
+    fn verbatim(&self, member: MemberId) -> bool {
+        self.map.as_ref().is_some_and(|map| {
+            map.entries
+                .get(member.0 as usize)
+                .and_then(|entry| entry.folder)
+                .and_then(|folder| map.folders.get(folder))
+                .is_some_and(|folder| folder.aes.is_none())
+        })
+    }
+
     fn deliver(
         &mut self,
         delivery: Delivery<'_>,

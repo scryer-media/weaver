@@ -1297,6 +1297,14 @@ impl Object for RarStore {
         );
     }
 
+    // A stored file not enciphered, whose CRC is plain: its bytes are its
+    // volumes' bytes as they lie.
+    fn verbatim(&self, member: MemberId) -> bool {
+        self.entries
+            .get(member.0 as usize)
+            .is_some_and(|entry| entry.store.is_none() && !entry.uses_mac)
+    }
+
     fn sized(&mut self, volume: VolumeIndex, length: u64, out: &mut Vec<Emit>) {
         // A length said anew is the producer's word now: the volume is
         // walked again against it.

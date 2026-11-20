@@ -900,6 +900,14 @@ impl Tree {
         out
     }
 
+    // Whether the object at `node` holds its member's bytes as they lie,
+    // as `Object::verbatim` says. False for the root, and for an object
+    // lent out.
+    pub fn verbatim(&self, node: NodeId, member: MemberId) -> bool {
+        self.object(node)
+            .is_some_and(|object| object.verbatim(member))
+    }
+
     // What the object at `node` is, lent out or not. `None` for the root.
     pub fn kind(&self, node: NodeId) -> Option<Kind> {
         self.object(node)

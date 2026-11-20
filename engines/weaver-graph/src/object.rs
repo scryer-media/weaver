@@ -511,6 +511,14 @@ pub trait Object: Send + Sync {
     // close reads nothing of its file. An object that keeps none says none.
     fn vouched(&self, _member: MemberId, _out: &mut Vec<(ByteRange, u32)>) {}
 
+    // Whether my member's bytes are my volumes' bytes as they lie: stored,
+    // not enciphered, so what my volumes lost it lost byte for byte, and
+    // the checksum my headers state of it says whether zeros were what was
+    // lost. An object that transforms its bytes says no.
+    fn verbatim(&self, _member: MemberId) -> bool {
+        false
+    }
+
     // My volume's length is known: its member declared one, or it closed at
     // the length it reached. Said ahead of every delivery while it is known
     // and once more at the close, so an object acts on it once and ignores

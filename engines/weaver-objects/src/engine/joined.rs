@@ -7,18 +7,22 @@
 // bytes, or for the volume to close short of them, and then the read carries
 // on into the next. A read the owner fails is remembered, so the error the
 // library makes of it ends the run silently instead of being taken for
-// damage.
+// damage. A run that rules on each member itself counts a read of bytes
+// nothing will bring apart from the owner's failures instead: it fails the
+// member it was in, and the owner says why the archive is short.
 
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use weaver_graph::{VolumeIndex, Volumes};
+use weaver_graph::{Lost, VolumeIndex, Volumes};
 
 #[derive(Clone)]
 pub(crate) struct Joined {
     volumes: Arc<dyn Volumes>,
     failed: Arc<AtomicBool>,
+    // Reads of bytes nothing will bring, when the run counts them apart.
+    losses: Option<Arc<AtomicU64>>,
 }
 
 impl Joined {
@@ -26,6 +30,32 @@ impl Joined {
         Self {
             volumes,
             failed: Arc::new(AtomicBool::new(false)),
+            losses: None,
+        }
+    }
+
+    // A source whose run rules on each member: a lost read is counted,
+    // not taken for the owner's failure.
+    pub(crate) fn member_by_member(volumes: Arc<dyn Volumes>) -> Self {
+        Self {
+            losses: Some(Arc::default()),
+            ..Self::new(volumes)
+        }
+    }
+
+    // How many reads of bytes nothing will bring the run made so far.
+    pub(crate) fn losses(&self) -> u64 {
+        self.losses
+            .as_ref()
+            .map_or(0, |losses| losses.load(Ordering::Acquire))
+    }
+
+    fn failed_read(&self, error: &io::Error) {
+        match &self.losses {
+            Some(losses) if Lost::of(error).is_some() => {
+                losses.fetch_add(1, Ordering::AcqRel);
+            }
+            _ => self.fail(),
         }
     }
 
@@ -33,6 +63,11 @@ impl Joined {
     // has given up, after the source has moved into it.
     pub(crate) fn failure(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.failed)
+    }
+
+    // Whether the owner failed a read.
+    pub(crate) fn failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
     }
 
     // The owner's own failure: the run read past where a volume really
@@ -51,7 +86,7 @@ impl Joined {
     ) -> io::Result<usize> {
         self.volumes
             .read_at(volume, offset, into)
-            .inspect_err(|_| self.fail())
+            .inspect_err(|error| self.failed_read(error))
     }
 
     // The volumes bound now, past any gap between them.
