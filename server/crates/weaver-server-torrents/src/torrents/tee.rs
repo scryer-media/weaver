@@ -875,6 +875,12 @@ impl Tee {
             return;
         }
         self.note_disk(job);
+        // Its unpacking is over and nothing more comes for it: the job is
+        // ready to deliver, and its files move to their names now, each
+        // once, as a job of the pipeline's does (`status::drive`).
+        if job.phase() == RootPhase::Done && job.moves_waiting() {
+            job.deliver_names();
+        }
         if job.awaits_commit()
             || job.owes_checkpoint()
             || job.pending().stepped(self.job_id, &self.mail)
