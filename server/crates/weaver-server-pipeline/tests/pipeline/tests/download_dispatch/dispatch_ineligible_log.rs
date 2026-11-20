@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use super::*;
+use weaver_server_pipeline::pipeline::tests::dispatch_fixture::DispatchFixture;
+use weaver_server_pipeline::{JobId, JobStatus};
 
 // A job dispatch will not serve is re-visited by every dispatch pass, and
 // passes come in bursts. Reporting it once per pass wrote hundreds of
@@ -10,25 +11,20 @@ use super::*;
 #[tokio::test]
 async fn an_ineligible_job_reports_at_most_once_a_window() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut pipeline = DispatchFixture::new(&temp_dir).await;
     let job_id = JobId(41601);
-    insert_active_job(
-        &mut pipeline,
-        job_id,
-        standalone_job_spec("Withheld Job", &many_standalone_files("withheld", 4)),
-    )
-    .await;
+    pipeline
+        .add_files(job_id, "Withheld Job", "withheld", 4)
+        .await;
 
     // Articles queued, a status that dispatches, a slot held, and still
     // nothing handed out: this is the shape the stall reports. Here the
     // job's row carries a pause the pipeline has not applied yet.
-    pipeline.nzb_admitted.insert(job_id);
-    pipeline.shared_state.queue.write(|inner| {
-        inner.job_mut(job_id).unwrap().intents.paused = Some(true);
-        crate::pipeline::queue::Change::changed(())
-    });
+    pipeline.admit(job_id);
+    pipeline.request_pause(job_id);
     assert!(
-        !pipeline.jobs[&job_id]
+        !pipeline
+            .job(job_id)
             .articles
             .active()
             .unwrap()
@@ -39,34 +35,28 @@ async fn an_ineligible_job_reports_at_most_once_a_window() {
     // Every pass runs at an instant the test names, so the window is the
     // passes', not the machine's.
     let now = std::time::Instant::now();
-    pipeline.dispatch_downloads_at(now);
+    pipeline.dispatch_at(now);
     assert_eq!(
-        pipeline
-            .dispatch_ineligible_log_throttle
-            .last_emitted_at(job_id),
+        pipeline.last_ineligible_log(job_id),
         Some(now),
         "the first pass of a window reports the stalled job"
     );
 
-    let window = crate::pipeline::download::DISPATCH_INELIGIBLE_LOG_INTERVAL;
+    let window = DispatchFixture::LOG_INTERVAL;
     let last_inside = now + window - std::time::Duration::from_millis(1);
     for _ in 0..64 {
-        pipeline.dispatch_downloads_at(now);
+        pipeline.dispatch_at(now);
     }
-    pipeline.dispatch_downloads_at(last_inside);
+    pipeline.dispatch_at(last_inside);
     assert_eq!(
-        pipeline
-            .dispatch_ineligible_log_throttle
-            .last_emitted_at(job_id),
+        pipeline.last_ineligible_log(job_id),
         Some(now),
         "every later pass inside the window is counted, not logged again"
     );
 
-    pipeline.dispatch_downloads_at(now + window);
+    pipeline.dispatch_at(now + window);
     assert_eq!(
-        pipeline
-            .dispatch_ineligible_log_throttle
-            .last_emitted_at(job_id),
+        pipeline.last_ineligible_log(job_id),
         Some(now + window),
         "the first pass of the next window reports it again"
     );
@@ -79,43 +69,26 @@ async fn an_ineligible_job_reports_at_most_once_a_window() {
 #[tokio::test]
 async fn jobs_waiting_for_a_slot_report_once_a_window_together() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut pipeline = DispatchFixture::new(&temp_dir).await;
     let waiting: Vec<JobId> = (0..300).map(|offset| JobId(41700 + offset)).collect();
     for job_id in &waiting {
-        insert_active_job(
-            &mut pipeline,
-            *job_id,
-            standalone_job_spec("Waiting Job", &many_standalone_files("waiting", 1)),
-        )
-        .await;
-        pipeline.nzb_admitted.remove(job_id);
+        pipeline
+            .add_files(*job_id, "Waiting Job", "waiting", 1)
+            .await;
+        pipeline.release_slot(*job_id);
     }
 
     let now = std::time::Instant::now();
-    pipeline.dispatch_downloads_at(now);
-    assert_eq!(
-        pipeline.dispatch_slot_wait_log_throttle.last_emitted_at(()),
-        Some(now)
-    );
+    pipeline.dispatch_at(now);
+    assert_eq!(pipeline.last_slot_wait_log(), Some(now));
     for job_id in &waiting {
-        assert_eq!(
-            pipeline
-                .dispatch_ineligible_log_throttle
-                .last_emitted_at(*job_id),
-            None
-        );
+        assert_eq!(pipeline.last_ineligible_log(*job_id), None);
     }
-    let window = crate::pipeline::download::DISPATCH_INELIGIBLE_LOG_INTERVAL;
-    pipeline.dispatch_downloads_at(now + window - std::time::Duration::from_millis(1));
-    assert_eq!(
-        pipeline.dispatch_slot_wait_log_throttle.last_emitted_at(()),
-        Some(now)
-    );
-    pipeline.dispatch_downloads_at(now + window);
-    assert_eq!(
-        pipeline.dispatch_slot_wait_log_throttle.last_emitted_at(()),
-        Some(now + window)
-    );
+    let window = DispatchFixture::LOG_INTERVAL;
+    pipeline.dispatch_at(now + window - std::time::Duration::from_millis(1));
+    assert_eq!(pipeline.last_slot_wait_log(), Some(now));
+    pipeline.dispatch_at(now + window);
+    assert_eq!(pipeline.last_slot_wait_log(), Some(now + window));
 }
 
 // A job whose download is over has nothing for dispatch to hand out, whether
@@ -138,16 +111,13 @@ async fn a_job_past_its_download_is_not_a_stall() {
     .enumerate()
     {
         let temp_dir = tempfile::tempdir().unwrap();
-        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let mut pipeline = DispatchFixture::new(&temp_dir).await;
         let job_id = JobId(41610 + offset as u64);
-        insert_active_job(
-            &mut pipeline,
-            job_id,
-            standalone_job_spec("Finished Download", &many_standalone_files("finished", 2)),
-        )
-        .await;
+        pipeline
+            .add_files(job_id, "Finished Download", "finished", 2)
+            .await;
         {
-            let state = pipeline.jobs.get_mut(&job_id).unwrap();
+            let state = pipeline.job_mut(job_id);
             state
                 .articles
                 .active_mut()
@@ -157,12 +127,10 @@ async fn a_job_past_its_download_is_not_a_stall() {
             state.status = status.clone();
         }
 
-        pipeline.dispatch_downloads();
+        pipeline.dispatch();
 
         assert_eq!(
-            pipeline
-                .dispatch_ineligible_log_throttle
-                .last_emitted_at(job_id),
+            pipeline.last_ineligible_log(job_id),
             None,
             "{status:?} with nothing queued is not waiting on dispatch"
         );
@@ -175,16 +143,11 @@ async fn a_job_past_its_download_is_not_a_stall() {
 #[tokio::test]
 async fn parked_recovery_behind_a_moving_job_is_not_a_stall() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut pipeline = DispatchFixture::new(&temp_dir).await;
     let job_id = JobId(41604);
-    insert_active_job(
-        &mut pipeline,
-        job_id,
-        standalone_job_spec("Moving Job", &many_standalone_files("moving", 2)),
-    )
-    .await;
+    pipeline.add_files(job_id, "Moving Job", "moving", 2).await;
     {
-        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        let state = pipeline.job_mut(job_id);
         let parked = state
             .articles
             .active_mut()
@@ -202,12 +165,10 @@ async fn parked_recovery_behind_a_moving_job_is_not_a_stall() {
         state.status = JobStatus::Moving;
     }
 
-    pipeline.dispatch_downloads();
+    pipeline.dispatch();
 
     assert_eq!(
-        pipeline
-            .dispatch_ineligible_log_throttle
-            .last_emitted_at(job_id),
+        pipeline.last_ineligible_log(job_id),
         None,
         "a moving job with parked recovery is idle by design"
     );
@@ -220,48 +181,37 @@ async fn parked_recovery_behind_a_moving_job_is_not_a_stall() {
 #[tokio::test]
 async fn a_verifying_job_holding_its_slot_with_recovery_parked_is_not_a_stall() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut pipeline = DispatchFixture::new(&temp_dir).await;
     let verifying = JobId(41620);
     let waiting = JobId(41621);
-    insert_active_job(
-        &mut pipeline,
-        verifying,
-        standalone_job_spec("Verifying Job", &many_standalone_files("verifying", 3)),
-    )
-    .await;
+    pipeline
+        .add_files(verifying, "Verifying Job", "verifying", 3)
+        .await;
     {
-        let state = pipeline.jobs.get_mut(&verifying).unwrap();
+        let state = pipeline.job_mut(verifying);
         let active = state.articles.active_mut().unwrap();
         for work in active.download_queue.drain_all() {
             active.recovery_queue.push(work);
         }
         state.status = JobStatus::Verifying;
     }
-    insert_active_job(
-        &mut pipeline,
-        waiting,
-        standalone_job_spec("Waiting Job", &many_standalone_files("waiting", 1)),
-    )
-    .await;
-    pipeline.nzb_admitted.remove(&waiting);
-    assert!(pipeline.nzb_admitted.contains(&verifying));
-    assert_eq!(pipeline.jobs[&verifying].articles.queued_download_len(), 0);
-    assert!(pipeline.jobs[&verifying].articles.queued_recovery_len() > 0);
+    pipeline
+        .add_files(waiting, "Waiting Job", "waiting", 1)
+        .await;
+    pipeline.release_slot(waiting);
+    assert!(pipeline.admits(verifying));
+    assert_eq!(pipeline.job(verifying).articles.queued_download_len(), 0);
+    assert!(pipeline.job(verifying).articles.queued_recovery_len() > 0);
 
     let now = std::time::Instant::now();
-    pipeline.dispatch_downloads_at(now);
+    pipeline.dispatch_at(now);
 
-    assert_eq!(pipeline.articles_in_flight, 0);
+    assert_eq!(pipeline.articles_in_flight(), 0);
     assert_eq!(
-        pipeline.dispatch_slot_wait_log_throttle.last_emitted_at(()),
+        pipeline.last_slot_wait_log(),
         None,
         "a slot held by a verifying job is held by design"
     );
-    assert_eq!(
-        pipeline
-            .dispatch_ineligible_log_throttle
-            .last_emitted_at(verifying),
-        None
-    );
-    assert_eq!(pipeline.last_download_dispatch_stall_log_at, None);
+    assert_eq!(pipeline.last_ineligible_log(verifying), None);
+    assert_eq!(pipeline.last_stall_log(), None);
 }

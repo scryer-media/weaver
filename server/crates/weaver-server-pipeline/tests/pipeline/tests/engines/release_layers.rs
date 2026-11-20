@@ -341,7 +341,7 @@ async fn a_layer_and_a_packed_container_restarted_after_every_article_end_as_the
     ] {
         let whole = run(&scenario).await;
         assert!(whole.completed(), "{:?} {:?}", whole.status, whole.failure);
-        let restarted = run_restarting(&scenario, &mut |_| {}).await;
+        let restarted = run_restarting(&scenario).await;
         assert_restarted(&restarted, &whole);
     }
 }

@@ -37,11 +37,19 @@ pub fn file_stats() -> FileStatsSnapshot {
 use weaver_torrent::session_stats::snapshot::SessionStatsSnapshot;
 use weaver_torrent::{FetchPhase, Session};
 
-use crate::jobs::JobId;
-use crate::settings::Seeding;
-use crate::settings::model::tracker_host;
-use crate::torrents::service::TorrentPieces;
-use crate::torrents::{TorrentCounters, TorrentState, TorrentTracker, TrackerStatus, status};
+use weaver_server_base::jobs::ids::JobId;
+use weaver_server_settings::settings::model::Seeding;
+use weaver_server_settings::settings::model::tracker_host;
+/// A torrent's pieces: how many, how long each is, and how many verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TorrentPieces {
+    pub count: u32,
+    pub size: u64,
+    pub have: u32,
+}
+
+use super::model::{TorrentCounters, TorrentState, TorrentTracker, TrackerStatus};
+use super::status;
 
 /// Every state a torrent can be in, in the order they are exported.
 pub const TORRENT_STATES: [TorrentState; 12] = [
@@ -150,23 +158,23 @@ impl FetchOutcome {
 
 /// The service's event counters.
 #[derive(Debug, Default)]
-pub(crate) struct Counters {
+pub struct Counters {
     events: [AtomicU64; 4],
     fetches: [AtomicU64; 4],
 }
 
 impl Counters {
-    pub(crate) fn event(&self, event: TorrentEvent) {
+    pub fn event(&self, event: TorrentEvent) {
         self.events[event as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     // How many of `event` were counted.
-    #[cfg(test)]
-    pub(crate) fn count(&self, event: TorrentEvent) -> u64 {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn count(&self, event: TorrentEvent) -> u64 {
         self.events[event as usize].load(Ordering::Relaxed)
     }
 
-    pub(crate) fn fetch(&self, outcome: FetchOutcome) {
+    pub fn fetch(&self, outcome: FetchOutcome) {
         self.fetches[outcome as usize].fetch_add(1, Ordering::Relaxed);
     }
 
@@ -233,7 +241,7 @@ impl CheckSeries {
 }
 
 impl TorrentMetrics {
-    pub(crate) fn of(published: Arc<Published>, counters: &Counters) -> Self {
+    pub fn of(published: Arc<Published>, counters: &Counters) -> Self {
         Self {
             published,
             events: counters.events().to_vec(),
@@ -515,7 +523,7 @@ pub const SESSION_PEER_STATES: [&str; 5] =
     ["established", "connecting", "queued", "dead", "not_needed"];
 
 impl SessionSeries {
-    pub(crate) fn held(route: &str) -> Self {
+    pub fn held(route: &str) -> Self {
         Self {
             route: route.to_owned(),
             ..Self::default()
@@ -524,7 +532,7 @@ impl SessionSeries {
 
     /// `session`'s figures, all read from its counters but the DHT's table
     /// sizes, which take the table's read lock for a length.
-    pub(crate) fn open(route: &str, session: &Session, port: u16) -> Self {
+    pub fn open(route: &str, session: &Session, port: u16) -> Self {
         let stats = session.stats_snapshot();
         let peers = &stats.peers;
         let connections = &stats.connections;
@@ -632,9 +640,10 @@ mod tests {
     use weaver_torrent::{AnnounceOk, LastAnnounce, TrackerAnnounce};
 
     use super::{TrackerSeries, trackers};
-    use crate::settings::model::tracker_host;
-    use crate::torrents::{NamedBy, TorrentTracker, TrackerStatus};
+    use crate::torrents::model::{TorrentTracker, TrackerStatus};
+    use weaver_server_settings::settings::model::tracker_host;
     use weaver_torrent::ConnectionKind;
+    use weaver_torrent::NamedBy;
 
     /// The series as they were built before: a walk of the kept series and
     /// of the announces for every tracker.

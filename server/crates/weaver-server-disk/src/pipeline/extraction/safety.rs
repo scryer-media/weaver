@@ -21,22 +21,22 @@ const MAX_MEMORY_ENV: &str = "WEAVER_EXTRACTION_MAX_MEMORY_BYTES";
 const DEFAULT_MAX_ENTRIES: u64 = 1_000_000;
 
 #[derive(Debug, Clone)]
-pub(crate) struct ExtractionLimits {
-    pub(crate) max_job_bytes: u64,
-    pub(crate) max_member_bytes: u64,
-    pub(crate) max_entries: u64,
-    pub(crate) max_ratio: u64,
+pub struct ExtractionLimits {
+    pub max_job_bytes: u64,
+    pub max_member_bytes: u64,
+    pub max_entries: u64,
+    pub max_ratio: u64,
     // The output a job may always write, however little its archives
     // declared: the ratio limit never falls under it.
-    pub(crate) ratio_floor_bytes: u64,
-    pub(crate) max_seconds: u64,
-    pub(crate) min_free_bytes: u64,
-    pub(crate) max_memory_bytes: u64,
+    pub ratio_floor_bytes: u64,
+    pub max_seconds: u64,
+    pub min_free_bytes: u64,
+    pub max_memory_bytes: u64,
 }
 
 impl ExtractionLimits {
     // No limit at all: a writer standing alone, outside a job.
-    pub(crate) fn unbounded() -> Self {
+    pub fn unbounded() -> Self {
         Self {
             max_job_bytes: u64::MAX,
             max_member_bytes: u64::MAX,
@@ -53,7 +53,7 @@ impl ExtractionLimits {
     // decides. An explicit `WEAVER_EXTRACTION_MAX_MEMORY_BYTES` still wins,
     // and says so once, so an operator who pinned the ceiling is not left
     // wondering why the profile did nothing.
-    pub(crate) fn from_env_with_profile_ceiling(
+    pub fn from_env_with_profile_ceiling(
         complete_dir: &Path,
         ceiling_bytes: u64,
     ) -> Result<Self, String> {
@@ -69,7 +69,7 @@ impl ExtractionLimits {
     // These limits under another hardware profile's memory ceiling. Nothing
     // else here depends on the profile, and a ceiling pinned by the
     // environment stays pinned.
-    pub(crate) fn with_profile_ceiling(&self, ceiling_bytes: u64) -> Self {
+    pub fn with_profile_ceiling(&self, ceiling_bytes: u64) -> Self {
         self.with_memory_ceiling(ceiling_bytes, std::env::var_os(MAX_MEMORY_ENV).is_some())
     }
 
@@ -95,7 +95,7 @@ impl ExtractionLimits {
         // without the runtime's — half the machine's memory stands in.
         let default_memory = profile_ceiling_bytes
             .unwrap_or_else(|| {
-                weaver_server_disk::runtime::system_probe::detect_total_memory_bytes()
+                crate::runtime::system_probe::detect_total_memory_bytes()
                     .unwrap_or(2 * MAX_MEMORY_LIMIT)
                     / 2
             })
@@ -120,7 +120,7 @@ impl ExtractionLimits {
     // `declared_archive_bytes`, and the limit that sets it: the ratio over
     // what was declared, never under the ratio floor, unless the job byte cap is
     // tighter. A breach names whichever of the two it is.
-    pub(crate) fn job_output_limit(
+    pub fn job_output_limit(
         &self,
         declared_archive_bytes: u64,
     ) -> (u64, ExtractionRejectionReason) {
@@ -139,7 +139,7 @@ impl ExtractionLimits {
 // twentieth of it, between 512 MiB and 5 GiB, and 512 MiB when the size is
 // unknown. The extractor's default output reserve, and the same rule the
 // direct-store holds scratch keeps for the working directory.
-pub(crate) fn default_disk_reserve_bytes(total_filesystem_bytes: Option<u64>) -> u64 {
+pub fn default_disk_reserve_bytes(total_filesystem_bytes: Option<u64>) -> u64 {
     total_filesystem_bytes
         .map(|total| (total / 20).clamp(512 * MIB, 5 * GIB))
         .unwrap_or(512 * MIB)
@@ -164,7 +164,7 @@ fn parse_positive_u64(name: &str, default: u64) -> Result<u64, String> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ExtractionRejectionReason {
+pub enum ExtractionRejectionReason {
     MemberBytes,
     JobBytes,
     Ratio,
@@ -175,7 +175,7 @@ pub(crate) enum ExtractionRejectionReason {
 }
 
 impl ExtractionRejectionReason {
-    pub(crate) const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::MemberBytes => "member_bytes",
             Self::JobBytes => "job_bytes",
@@ -192,20 +192,20 @@ impl ExtractionRejectionReason {
 // it refused. Carried typed by `ExtractionError` so a consumer never has to
 // recognise it from its rendering.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ExtractionFailure {
+pub struct ExtractionFailure {
     reason: ExtractionRejectionReason,
     detail: String,
 }
 
 impl ExtractionFailure {
-    pub(crate) fn new(reason: ExtractionRejectionReason, detail: impl Into<String>) -> Self {
+    pub fn new(reason: ExtractionRejectionReason, detail: impl Into<String>) -> Self {
         Self {
             reason,
             detail: detail.into(),
         }
     }
 
-    pub(crate) fn reason(&self) -> ExtractionRejectionReason {
+    pub fn reason(&self) -> ExtractionRejectionReason {
         self.reason
     }
 
@@ -213,7 +213,7 @@ impl ExtractionFailure {
     // refusal is kept as its own sentence, without the marker, because the
     // consumer app and the Jobs screen show it as it stands. Every other
     // refusal keeps the whole rendering.
-    pub(crate) fn job_failure_reason(&self) -> String {
+    pub fn job_failure_reason(&self) -> String {
         match self.reason {
             ExtractionRejectionReason::ContentPolicy => self.detail.clone(),
             _ => self.to_string(),
@@ -247,7 +247,7 @@ impl std::fmt::Display for ExtractionFailure {
 // the only thing that refuses: a cache reservation that would pass the limit
 // fails outright and the cache does without it.
 #[derive(Debug)]
-pub(crate) struct ProcessMemoryBudget {
+pub struct ProcessMemoryBudget {
     limit: u64,
     reserved: Arc<AtomicU64>,
     // The limit a lowered one replaced, while the charges recorded under it
@@ -259,7 +259,7 @@ pub(crate) struct ProcessMemoryBudget {
 }
 
 impl ProcessMemoryBudget {
-    pub(crate) fn new(limit: u64) -> Self {
+    pub fn new(limit: u64) -> Self {
         Self {
             limit,
             reserved: Arc::new(AtomicU64::new(0)),
@@ -274,7 +274,7 @@ impl ProcessMemoryBudget {
     // Charges and reservations are shared with the budget this one
     // replaces. A view already handed to running work keeps the limit it was
     // given.
-    pub(crate) fn with_limit(&self, limit: u64) -> Self {
+    pub fn with_limit(&self, limit: u64) -> Self {
         let _guard = self
             .admission
             .lock()
@@ -307,7 +307,7 @@ impl ProcessMemoryBudget {
 
     // Reserve `bytes` until the returned permit drops, or fail at once when
     // they do not fit.
-    pub(crate) fn try_reserve_retained(
+    pub fn try_reserve_retained(
         self: &Arc<Self>,
         bytes: u64,
     ) -> Result<ProcessMemoryPermit, String> {
@@ -337,7 +337,7 @@ impl ProcessMemoryBudget {
     // the returned permit drops. Never refuses: the charge is recorded as it
     // is, even past the limit, and only counts against the reservations the
     // repeated-article cache asks for afterwards.
-    pub(crate) fn charge_retained(self: &Arc<Self>, bytes: u64) -> ProcessMemoryPermit {
+    pub fn charge_retained(self: &Arc<Self>, bytes: u64) -> ProcessMemoryPermit {
         let _guard = self
             .admission
             .lock()
@@ -349,19 +349,19 @@ impl ProcessMemoryBudget {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn reserved_bytes(&self) -> u64 {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn reserved_bytes(&self) -> u64 {
         self.reserved.load(Ordering::Acquire)
     }
 
-    #[cfg(test)]
-    pub(crate) fn limit(&self) -> u64 {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn limit(&self) -> u64 {
         self.limit
     }
 }
 
 #[derive(Debug)]
-pub(crate) struct ProcessMemoryPermit {
+pub struct ProcessMemoryPermit {
     budget: Arc<ProcessMemoryBudget>,
     bytes: u64,
 }

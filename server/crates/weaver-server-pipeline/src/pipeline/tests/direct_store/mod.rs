@@ -1063,8 +1063,3 @@ fn build_test_rar4_end_header_numbered(more_volumes: bool, volume: u16) -> Vec<u
     }
     build_test_rar4_block(0x7b, flags, &volume.to_le_bytes())
 }
-
-#[cfg(test)]
-mod tests {
-    mod lent_store_loss;
-}

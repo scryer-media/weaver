@@ -74,8 +74,6 @@ mod abandon_cost;
 #[cfg(test)]
 mod accounting;
 #[cfg(test)]
-mod binding_order;
-#[cfg(test)]
 mod bound_recovery_health;
 #[cfg(test)]
 mod caps;
@@ -116,27 +114,13 @@ mod lines;
 #[cfg(test)]
 pub(in crate::pipeline) mod loans;
 #[cfg(test)]
-mod lost_fronts;
-#[cfg(test)]
-mod many_members;
-#[cfg(test)]
-mod misstated_sizes;
-#[cfg(test)]
 mod nameless_reversed;
-#[cfg(test)]
-mod nested_engine_fault;
-#[cfg(test)]
-mod nested_rar4;
-#[cfg(test)]
-mod nesting;
 #[cfg(test)]
 mod pairings;
 #[cfg(test)]
 mod par3;
 #[cfg(test)]
 mod password;
-#[cfg(test)]
-mod perf;
 #[cfg(test)]
 mod plain_par2;
 #[cfg(test)]
@@ -148,15 +132,11 @@ mod rar_rev;
 #[cfg(test)]
 mod recovery_audit;
 #[cfg(test)]
-mod recovery_contracts;
-#[cfg(test)]
 mod recovery_damage_wire;
 #[cfg(test)]
 mod recovery_duplicate_wire;
 #[cfg(test)]
 mod recovery_encrypted_wire;
-#[cfg(test)]
-mod recovery_geometry;
 #[cfg(test)]
 mod recovery_geometry_wire;
 #[cfg(test)]
@@ -164,13 +144,9 @@ mod recovery_restart_wire;
 #[cfg(test)]
 mod refused_then_repaired;
 #[cfg(test)]
-mod release_layers;
-#[cfg(test)]
 mod remaining_par2;
 #[cfg(test)]
 mod remaining_stalls;
-#[cfg(test)]
-mod renamed_engine;
 #[cfg(test)]
 mod repaired_source;
 #[cfg(test)]
@@ -185,24 +161,17 @@ mod sets;
 mod settled_rulings;
 #[cfg(test)]
 mod sevenz;
+pub mod sevenz_fixtures;
 #[cfg(test)]
 mod sevenz_hex;
 pub mod sfv;
 #[cfg(test)]
-mod size_bounds;
-#[cfg(test)]
 mod solid_hex;
 #[cfg(test)]
 mod spent;
-#[cfg(test)]
-mod split_sets;
-#[cfg(test)]
-mod stage_events;
 pub mod stream_fixtures;
 #[cfg(test)]
 use stream_fixtures as streams;
 #[cfg(test)]
 mod too_large;
-#[cfg(test)]
-mod waiting_sets;
 pub mod zip;

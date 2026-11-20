@@ -59,8 +59,6 @@ mod archive_history;
 mod archive_output_contract;
 #[cfg(test)]
 mod archive_passwords;
-#[cfg(test)]
-mod archive_topology;
 #[path = "download_dispatch/bandwidth_fixture.rs"]
 pub mod bandwidth_fixture;
 #[cfg(test)]
@@ -80,6 +78,7 @@ pub mod direct_store;
 mod dispatch_order;
 #[cfg(test)]
 mod download_dispatch;
+pub mod dispatch_fixture;
 pub mod engines;
 #[cfg(test)]
 mod full_file_names;
@@ -786,7 +785,6 @@ async fn new_direct_pipeline_on_machine(
     (pipeline, intermediate_dir, complete_dir)
 }
 
-#[cfg(test)]
 async fn new_scheduler_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBuf, PathBuf) {
     let (mut pipeline, intermediate, complete) = new_direct_pipeline(temp_dir).await;
     // Scheduler-only callers name two real policy entries without dialing.
@@ -1177,13 +1175,13 @@ fn build_test_rar_data_header_with_compression(
     result
 }
 
-const TEST_RAR4_SIG: [u8; 7] = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00];
+pub const TEST_RAR4_SIG: [u8; 7] = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00];
 
 // RAR4's fixed-layout common header: `crc16, type, flags, header size`.
 //
 // The CRC16 is left zero — the parser warns on a mismatch and carries on, which
 // is deliberate recovery behaviour, so a fixture does not need to compute it.
-fn build_test_rar4_block(header_type: u8, flags: u16, body: &[u8]) -> Vec<u8> {
+pub fn build_test_rar4_block(header_type: u8, flags: u16, body: &[u8]) -> Vec<u8> {
     let header_size = (7 + body.len()) as u16;
     let mut out = Vec::with_capacity(header_size as usize);
     out.extend_from_slice(&0u16.to_le_bytes());
@@ -1206,7 +1204,7 @@ fn build_test_rar4_main_header(is_first_volume: bool) -> Vec<u8> {
     build_test_rar4_block(0x73, flags, &body)
 }
 
-fn build_test_rar4_end_header(more_volumes: bool) -> Vec<u8> {
+pub fn build_test_rar4_end_header(more_volumes: bool) -> Vec<u8> {
     let flags: u16 = if more_volumes { 0x0001 } else { 0 };
     build_test_rar4_block(0x7b, flags, &[])
 }
@@ -1272,8 +1270,7 @@ pub fn single_member_rar4_old_numbering_set(
 // has an end record, and each part's header states the unpacked size
 // `stated` gives for that volume. The last part states `member_crc` as the
 // whole member's CRC.
-#[cfg(test)]
-pub(in crate::pipeline::tests) fn rar4_misstated_set(
+pub fn rar4_misstated_set(
     base: &str,
     member_name: &str,
     payload: &[u8],
@@ -1326,8 +1323,7 @@ pub(in crate::pipeline::tests) fn rar4_misstated_set(
 // as RAR5 writes it, each part's header naming the member and stating its
 // unpacked size as `stated` gives them for that volume. The last part states
 // `member_crc` as the whole member's CRC.
-#[cfg(test)]
-pub(in crate::pipeline::tests) fn rar5_misstated_set(
+pub fn rar5_misstated_set(
     base: &str,
     payload: &[u8],
     volume_count: usize,
@@ -1472,7 +1468,7 @@ pub(in crate::pipeline::tests) fn single_recovery_volume_for_rar4_set(
 
 // A stored RAR4 file header. `unpack_version` 29 is what makes a split part's
 // CRC32 describe that part's packed bytes rather than nothing at all.
-fn build_test_rar4_file_header(
+pub fn build_test_rar4_file_header(
     filename: &str,
     split_flags: u16,
     packed_size: u32,
@@ -1629,7 +1625,6 @@ pub fn standalone_job_spec(name: &str, files: &[(String, u32)]) -> JobSpec {
     }
 }
 
-#[cfg(test)]
 fn many_standalone_files(prefix: &str, count: usize) -> Vec<(String, u32)> {
     (0..count)
         .map(|idx| (format!("{prefix}-{idx}.bin"), 512u32))
@@ -1802,8 +1797,7 @@ pub fn build_test_par2_index_for_files(files: &[(&str, &[u8])], slice_size: u64)
     stream
 }
 
-#[cfg(test)]
-pub(in crate::pipeline) fn segmented_job_spec(
+pub fn segmented_job_spec(
     name: &str,
     filename: &str,
     segment_sizes: &[u32],
@@ -2362,8 +2356,7 @@ pub(in crate::pipeline) async fn settle_failed_releases(pipeline: &mut Pipeline)
 
 // Polls until `predicate` holds. There is no deadline: the test runner
 // bounds a condition that never arrives.
-#[cfg(test)]
-async fn wait_until(mut predicate: impl FnMut() -> bool) {
+pub async fn wait_until(mut predicate: impl FnMut() -> bool) {
     while !predicate() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -2387,7 +2380,6 @@ async fn drain_decode_results(pipeline: &mut Pipeline, expected: usize) {
 
 // Fill servers with the given retention windows (days, 0 = unlimited). No
 // connections are opened — only the config matters.
-#[cfg(test)]
 fn retention_client(retention_days: &[u32]) -> weaver_nntp::client::NntpClient {
     let servers = retention_days
         .iter()
@@ -2435,7 +2427,6 @@ fn hosts_client(hosts: &[usize]) -> weaver_nntp::client::NntpClient {
 // Pool server `server` refuses the login. A fill server's refusal waits: the
 // server may still serve the work only it could serve, as through any
 // outage. A backfill server's refusal is the answer at once.
-#[cfg(test)]
 async fn refuse_login(pipeline: &Pipeline, server: usize) {
     let pool = pipeline.nntp.pool();
     pool.health().lock().await.record_failure(server, true);
@@ -2458,7 +2449,6 @@ async fn refuse_login(pipeline: &Pipeline, server: usize) {
 // Pool server `server` refuses the login, waits as [`refuse_login`] does,
 // and then has refused it for its whole give-up time: the refusal is the
 // verdict on the work only it could serve.
-#[cfg(test)]
 async fn refuse_login_past_give_up(pipeline: &Pipeline, server: usize) {
     refuse_login(pipeline, server).await;
     let pool = pipeline.nntp.pool();
@@ -2475,7 +2465,6 @@ fn two_server_retention_client() -> weaver_nntp::client::NntpClient {
     retention_client(&[5, 0])
 }
 
-#[cfg(test)]
 fn age_job_days(pipeline: &mut Pipeline, job_id: JobId, days: u64) {
     let posted = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

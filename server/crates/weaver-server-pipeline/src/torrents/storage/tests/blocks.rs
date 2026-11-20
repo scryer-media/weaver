@@ -511,14 +511,10 @@ fn a_piece_given_back_as_it_is_hashed_holds_up_no_other_piece() {
     let shim = shim_over(tempfile::tempdir().unwrap(), holds(&budget), None);
     let torrent = noise(160_000, 3);
     shim.write_blocks(0, &torrent, u64::MAX, None);
-    let writing = match shim.storage.inner.flight_read().get(&0) {
-        Some(crate::torrents::storage::Flight::Writing(writing, _)) => Arc::clone(writing),
-        _ => panic!("piece 0 is held in memory"),
-    };
-    let hashing = writing.read();
-    shim.storage.on_piece_requeued(shim.index(0));
-    assert!(shim.storage.inner.flight.try_write().is_ok());
-    drop(hashing);
+    shim.storage.while_hashing(0, || {
+        shim.storage.on_piece_requeued(shim.index(0));
+        assert!(shim.storage.flight_map_is_writable());
+    });
     assert!(shim.storage.writes_piece_to_memory(shim.index(0)));
     assert_eq!(budget.namespace_usage(NAMESPACE).resident, PIECE);
     shim.storage.on_piece_completed(shim.index(0)).unwrap();

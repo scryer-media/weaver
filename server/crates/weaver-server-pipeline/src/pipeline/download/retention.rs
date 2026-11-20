@@ -473,7 +473,7 @@ impl Pipeline {
         exclude_servers: weaver_nntp::ServerSet,
         warn_per_article: bool,
     ) -> weaver_nntp::ServerSet {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         {
             let (depth, deepest) = &mut self.unservable_booking_depth;
             *depth += 1;
@@ -481,7 +481,7 @@ impl Pipeline {
         }
         let refused_by =
             self.book_unservable_segment_inner(segment_id, exclude_servers, warn_per_article);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         {
             self.unservable_booking_depth.0 -= 1;
         }

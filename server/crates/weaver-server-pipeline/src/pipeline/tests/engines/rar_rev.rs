@@ -24,12 +24,7 @@ use crate::pipeline::tests::{
 const MEMBER: &str = "beacon.bin";
 const SECRET: &str = "quill-ember-secret";
 
-// Enough articles that each of four volumes holds several.
-pub(super) fn body() -> Vec<u8> {
-    payload(11 * ARTICLE + 29, 61)
-}
-
-pub(super) use super::rar_fixtures::rar5_revs;
+pub(super) use super::rar_fixtures::{body, lz_four, rar5_revs};
 
 fn crc(bytes: &[u8]) -> u32 {
     par2_rs::checksum::crc32(bytes)
@@ -367,22 +362,6 @@ async fn rar_rev_rebuilds_an_absent_volume_of_a_compressed_part_numbered_rar4_se
     // volume's front reaches the engine before the third is rebuilt.
     scenario.article = 4096;
     assert_lz_four_rebuilt(&run(&scenario).await);
-}
-
-// A compressed four-volume RAR4 set as RAR writes it, under part numbering:
-// each volume's end header states the CRC32 of the bytes before it and
-// reserves seven bytes for a recovery volume.
-pub(super) fn lz_four() -> Vec<(String, Vec<u8>)> {
-    let dir = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../weaver-server-core/tests/fixtures/extraction_profiles"
-    );
-    (1..=4)
-        .map(|part| {
-            let bytes = std::fs::read(format!("{dir}/rar4_lz_four.part0{part}.rar")).unwrap();
-            (format!("silver.horizon.part{part}.rar"), bytes)
-        })
-        .collect()
 }
 
 // One volume of the set rebuilt in one ruling, and the set's one member

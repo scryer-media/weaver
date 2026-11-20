@@ -5,14 +5,17 @@
 // part, in NZB order, before it is booked missing. However many ids the part
 // carries, the booking does not nest in itself once per id.
 
-use super::*;
+use weaver_server_pipeline::pipeline::tests::{
+    dispatch_fixture::DispatchFixture, segmented_job_spec,
+};
+use weaver_server_pipeline::{DownloadQueue, JobId, JobStatus, MessageIds, NzbFileId, SegmentId};
 
 // What one booking left behind, for comparing runs.
 #[derive(Debug, PartialEq, Eq)]
 struct BookingOutcome {
     spent_ids: Vec<String>,
     id_in_use: Option<String>,
-    terminal_state: Option<SegmentTerminalState>,
+    booked_missing: bool,
     articles_not_found: u64,
     failed_bytes: Option<u64>,
     status: Option<JobStatus>,
@@ -31,28 +34,22 @@ fn alternate_ids(count: usize) -> Vec<String> {
 // server's retention, so no server may fetch any of its ids. The download
 // pass is open and the queues are empty.
 async fn job_beyond_retention(
-    pipeline: &mut Pipeline,
+    pipeline: &mut DispatchFixture,
     job_id: JobId,
     ids: Vec<String>,
 ) -> SegmentId {
-    pipeline.nntp = std::sync::Arc::new(retention_client(&[5]));
+    pipeline.set_retention(&[5]);
+    pipeline.start_recording_spent_ids();
     let mut spec = segmented_job_spec("Alternate Ids Beyond Retention", "aged.bin", &[128, 128]);
-    spec.files[0].segments[0].message_ids = crate::jobs::MessageIds::new(ids);
-    insert_active_job(pipeline, job_id, spec).await;
-    age_job_days(pipeline, job_id, 10);
-    pipeline.clear_job_retention_excludes(job_id);
+    spec.files[0].segments[0].message_ids = MessageIds::new(ids);
+    pipeline.add_job(job_id, spec).await;
+    pipeline.set_job_age(job_id, 10);
     {
-        let active = pipeline
-            .jobs
-            .get_mut(&job_id)
-            .unwrap()
-            .articles
-            .active_mut()
-            .unwrap();
+        let active = pipeline.job_mut(job_id).articles.active_mut().unwrap();
         active.download_queue = DownloadQueue::new();
         active.recovery_queue = DownloadQueue::new();
     }
-    pipeline.active_download_passes.insert(job_id);
+    pipeline.open_pass(job_id);
     SegmentId {
         file_id: NzbFileId {
             job_id,
@@ -62,67 +59,58 @@ async fn job_beyond_retention(
     }
 }
 
-fn outcome(pipeline: &Pipeline, segment_id: SegmentId) -> BookingOutcome {
+fn outcome(pipeline: &DispatchFixture, segment_id: SegmentId) -> BookingOutcome {
     let job_id = segment_id.file_id.job_id;
-    let state = pipeline.jobs.get(&job_id);
+    let state = pipeline.job_if_present(job_id);
     BookingOutcome {
-        spent_ids: pipeline.spent_message_ids.clone(),
+        spent_ids: pipeline.spent_ids().to_vec(),
         id_in_use: state.map(|state| {
             state.spec.files[0].segments[0]
                 .message_ids
                 .in_use()
                 .to_string()
         }),
-        terminal_state: pipeline.segment_terminal_states.get(&segment_id).copied(),
-        articles_not_found: pipeline.metrics.articles_not_found.load(Ordering::Relaxed),
+        booked_missing: pipeline.booked_missing(segment_id),
+        articles_not_found: pipeline.lost_articles(),
         failed_bytes: state.map(|state| state.failed_bytes),
         status: state.map(|state| state.status.clone()),
         queued: state.and_then(|state| {
             let active = state.articles.active()?;
             Some(active.download_queue.len() + active.recovery_queue.len())
         }),
-        download_pass_open: pipeline.active_download_passes.contains(&job_id),
-        completion_check_pending: pipeline.pending_completion_checks.contains(&job_id),
+        download_pass_open: pipeline.pass_open(job_id),
+        completion_check_pending: pipeline.completion_check_pending(job_id),
     }
 }
 
 // The article's own retry, requeued with no server left to fetch it.
 async fn requeue_unservable(ids: Vec<String>) -> (BookingOutcome, usize) {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut pipeline = DispatchFixture::new(&temp_dir).await;
     let segment_id = job_beyond_retention(&mut pipeline, JobId(41980), ids).await;
-    let work = pipeline
-        .download_retry_work(segment_id, 0, weaver_nntp::ServerSet::EMPTY)
-        .unwrap();
-    pipeline.enqueue_download_work(work);
-    (
-        outcome(&pipeline, segment_id),
-        pipeline.unservable_booking_depth.1,
-    )
+    let work = pipeline.retry_work(segment_id);
+    pipeline.enqueue(work);
+    (outcome(&pipeline, segment_id), pipeline.booking_depth())
 }
 
 // The article queued, retired by the sweep that books every queued article
 // no server may fetch.
 async fn sweep_unservable(ids: Vec<String>) -> (BookingOutcome, usize, usize) {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut pipeline = DispatchFixture::new(&temp_dir).await;
     let segment_id = job_beyond_retention(&mut pipeline, JobId(41981), ids).await;
-    let work = pipeline
-        .download_retry_work(segment_id, 0, weaver_nntp::ServerSet::EMPTY)
-        .unwrap();
+    let work = pipeline.retry_work(segment_id);
     pipeline
-        .jobs
-        .get_mut(&segment_id.file_id.job_id)
-        .unwrap()
+        .job_mut(segment_id.file_id.job_id)
         .articles
         .active_mut()
         .unwrap()
         .download_queue
         .push(work);
-    let retired = pipeline.retire_unservable_queued_work(segment_id.file_id.job_id);
+    let retired = pipeline.retire_unservable(segment_id.file_id.job_id);
     (
         outcome(&pipeline, segment_id),
-        pipeline.unservable_booking_depth.1,
+        pipeline.booking_depth(),
         retired,
     )
 }
@@ -134,7 +122,7 @@ fn expected_outcome(ids: &[String], status: Option<JobStatus>) -> BookingOutcome
     BookingOutcome {
         spent_ids: ids.to_vec(),
         id_in_use: ids.last().cloned(),
-        terminal_state: Some(SegmentTerminalState::Missing),
+        booked_missing: true,
         articles_not_found: 1,
         failed_bytes: Some(128),
         status,

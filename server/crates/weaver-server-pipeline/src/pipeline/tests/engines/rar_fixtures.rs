@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use super::harness::{ARTICLE, Post, par2_set};
+use super::harness::{ARTICLE, Post, par2_set, payload};
 use super::sfv::crc;
 
 pub fn delivered(name: &str) -> String {
@@ -76,4 +76,102 @@ pub fn rar5_revs(base: &str, volumes: &[&[u8]], count: usize) -> Vec<Post> {
             }
         })
         .collect()
+}
+
+// Enough articles that each of four volumes holds several.
+pub fn body() -> Vec<u8> {
+    payload(11 * ARTICLE + 29, 61)
+}
+
+// A compressed four-volume RAR4 set as RAR writes it, under part numbering:
+// each volume's end header states the CRC32 of the bytes before it and
+// reserves seven bytes for a recovery volume.
+pub fn lz_four() -> Vec<(String, Vec<u8>)> {
+    let dir = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../weaver-server-core/tests/fixtures/extraction_profiles"
+    );
+    (1..=4)
+        .map(|part| {
+            let bytes = std::fs::read(format!("{dir}/rar4_lz_four.part0{part}.rar")).unwrap();
+            (format!("silver.horizon.part{part}.rar"), bytes)
+        })
+        .collect()
+}
+
+pub mod store {
+    use super::super::harness::{ARTICLE, Claim, Outcome, Scenario, payload};
+    use super::{delivered, with_par2};
+    use crate::pipeline::tests::direct_store::single_member_store_set;
+    use weaver_model::files::FileRole;
+
+    pub const MEMBER: &str = "beacon.bin";
+
+    pub const SECRET: &str = "quill-ember-secret";
+
+    // A member that ends mid-article, over enough articles that every volume
+    // of a four-volume set holds some of it.
+    pub fn body() -> Vec<u8> {
+        payload(7 * ARTICLE + 13, 51)
+    }
+
+    pub fn assert_delivers(outcome: &Outcome, name: &str, body: &[u8]) {
+        assert!(
+            outcome.completed(),
+            "{:?} {:?}",
+            outcome.status,
+            outcome.failure
+        );
+        assert_eq!(
+            outcome.files.keys().cloned().collect::<Vec<_>>(),
+            vec![delivered(name)],
+            "delivered names",
+        );
+        assert!(outcome.files[&delivered(name)] == body, "member bytes",);
+    }
+
+    // Every volume's mark is what its bytes are now.
+    pub fn assert_volumes_complete(graph: &Outcome) {
+        let claims = &graph.graph().claims;
+        assert!(
+            claims.values().all(|claim| *claim == Claim::Complete),
+            "{claims:?}"
+        );
+    }
+
+    // Every article of the scenario's recovery volumes.
+    pub fn recovery_articles(scenario: &Scenario) -> Vec<(u32, u32)> {
+        scenario
+            .posts
+            .iter()
+            .zip(0u32..)
+            .filter(|(post, _)| {
+                matches!(
+                    post.role,
+                    FileRole::Par2 {
+                        is_index: false,
+                        ..
+                    }
+                )
+            })
+            .flat_map(|(post, file)| {
+                (0..post.articles(scenario.article).count() as u32)
+                    .map(move |ordinal| (file, ordinal))
+            })
+            .collect()
+    }
+
+    // A RAR beside PAR2 whose opening article is gone, every article of its
+    // recovery volumes refused at the first ask, as a primary that holds none
+    // of them answers.
+    pub fn opening_lost_recovery_refused() -> Scenario {
+        let mut scenario =
+            Scenario::new(with_par2(single_member_store_set(MEMBER, &body(), 1))).lost(0, 0);
+        let refused = recovery_articles(&scenario);
+        assert!(!refused.is_empty(), "the set has recovery volumes");
+        for (file, ordinal) in refused {
+            scenario = scenario.refused_once(file, ordinal);
+        }
+        scenario
+    }
 }

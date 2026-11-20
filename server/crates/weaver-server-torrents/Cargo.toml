@@ -12,7 +12,9 @@ test-support = []
 [dependencies]
 anyhow = { version = "1", default-features = false, features = ["std"] }
 base64 = { workspace = true }
+bitvec = { workspace = true }
 bytes = { workspace = true }
+memmap2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -30,7 +32,7 @@ weaver-server-settings = { path = "../weaver-server-settings" }
 weaver-torrent = { workspace = true }
 weaver-tunnel = { path = "../../../engines/weaver-tunnel" }
 
-[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
 [dev-dependencies]

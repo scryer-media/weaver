@@ -7,9 +7,9 @@
 // loss waits for the store and is placed through its map when it is back,
 // so the member keeps its length and the PAR2 set mends it whole.
 
-use super::super::scenarios::encrypted_store_set;
-use crate::jobs::model::JobStatus;
-use crate::pipeline::tests::engines::harness::{
+use weaver_server_pipeline::jobs::model::JobStatus;
+use weaver_server_pipeline::pipeline::tests::direct_store::scenarios::encrypted_store_set;
+use weaver_server_pipeline::pipeline::tests::engines::harness::{
     ARTICLE, Post, Scenario, par2_volumes, payload, run,
 };
 

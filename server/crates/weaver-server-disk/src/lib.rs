@@ -16,6 +16,9 @@ pub mod operations {
     };
 }
 pub mod pipeline {
+    pub mod extraction {
+        pub mod safety;
+    }
     pub mod archive {
         pub mod split_reader;
     }

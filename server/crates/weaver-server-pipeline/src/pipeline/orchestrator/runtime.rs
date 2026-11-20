@@ -500,7 +500,7 @@ impl Pipeline {
             checkpoint_progress_articles: HashMap::new(),
             released_remaining: HashMap::new(),
             download_lane_owners: HashMap::new(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             audit_lane_holdings: false,
             #[cfg(test)]
             move_gates: Default::default(),
@@ -508,10 +508,10 @@ impl Pipeline {
             propagation_delay,
             #[cfg(test)]
             propagation_delay_forced: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             unservable_booking_depth: (0, 0),
-            #[cfg(test)]
-            spent_message_ids: Vec::new(),
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+            spent_message_ids: None,
             #[cfg(test)]
             dispatch_hold_items_examined: Default::default(),
             #[cfg(test)]

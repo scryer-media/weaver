@@ -6845,8 +6845,10 @@ version = "0.16.17"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
+ "bitvec",
  "bytes",
  "libc",
+ "memmap2",
  "serde",
  "serde_json",
  "tempfile",
@@ -6925,6 +6927,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "sevenz-turbo",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

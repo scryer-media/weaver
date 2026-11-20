@@ -17,7 +17,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 use bytes::Bytes;
 use weaver_graph::holds::{HoldsAccountant, HoldsNamespace};
 
-use crate::pipeline::ExtractionLimits;
 use crate::torrents::storage::Pieces;
 use crate::torrents::writes::{Done, Paid, VolumeRoom};
 use tokio::sync::Notify;
@@ -25,6 +24,7 @@ use weaver_server_disk::operations::disk::{
     CapacityReader, DiskLedger, StorageRoot, is_out_of_space, is_quota_exceeded,
 };
 use weaver_server_disk::operations::room_wait::{Disk, Wants};
+use weaver_server_disk::pipeline::extraction::safety::ExtractionLimits;
 use weaver_torrent::storage::HeldRoom;
 
 // Where a torrent's pieces land: the disk the folder they are written to
@@ -33,20 +33,20 @@ use weaver_torrent::storage::HeldRoom;
 // has none: its writes are not booked, and wait only when the disk itself
 // refuses one.
 #[derive(Clone)]
-pub(crate) struct Place {
-    pub(crate) disk: Disk,
+pub struct Place {
+    pub disk: Disk,
     // The folder the disk was chosen for.
-    pub(crate) dir: PathBuf,
+    pub dir: PathBuf,
     reader: Option<CapacityReader>,
 }
 
 impl Place {
-    pub(crate) fn new(disk: Disk, dir: PathBuf, reader: Option<CapacityReader>) -> Self {
+    pub fn new(disk: Disk, dir: PathBuf, reader: Option<CapacityReader>) -> Self {
         Self { disk, dir, reader }
     }
 
     // The reading writes here book on, when they book.
-    pub(crate) fn reader(&self) -> Option<&CapacityReader> {
+    pub fn reader(&self) -> Option<&CapacityReader> {
         self.reader.as_ref()
     }
 }
@@ -58,7 +58,7 @@ impl Place {
 // the pieces go to is known, no piece is let through: each is refused as a
 // booking the ledger refused, and the torrent waits for its disk to be
 // known, then on its ledger.
-pub(crate) struct Room {
+pub struct Room {
     limits: Arc<ExtractionLimits>,
     spot: Mutex<Spot>,
     // Room a wake promised on the place's ledger for the write it let go:
@@ -83,7 +83,7 @@ struct Spot {
 impl Room {
     // A budget booked on `free_disk`, which reads the complete root: with
     // no disks to look a folder up on.
-    pub(crate) fn new(limits: Arc<ExtractionLimits>, free_disk: CapacityReader) -> Self {
+    pub fn new(limits: Arc<ExtractionLimits>, free_disk: CapacityReader) -> Self {
         Self::with(
             limits,
             None,
@@ -96,12 +96,12 @@ impl Room {
     }
 
     // A budget for pieces that go to `dir`, whose disk is not known yet.
-    pub(crate) fn aimed(limits: Arc<ExtractionLimits>, dir: PathBuf) -> Self {
+    pub fn aimed(limits: Arc<ExtractionLimits>, dir: PathBuf) -> Self {
         Self::with(limits, Some(dir), None)
     }
 
     // A budget for pieces that land at `place`, known already.
-    pub(crate) fn placed(limits: Arc<ExtractionLimits>, place: Place) -> Self {
+    pub fn placed(limits: Arc<ExtractionLimits>, place: Place) -> Self {
         Self::with(limits, Some(place.dir.clone()), Some(place))
     }
 
@@ -116,12 +116,12 @@ impl Room {
     }
 
     // A look for its disk begins: whether none was out.
-    pub(crate) fn begin_placing(&self) -> bool {
+    pub fn begin_placing(&self) -> bool {
         !self.placing.swap(true, Ordering::AcqRel)
     }
 
     // The look for its disk ended without a place.
-    pub(crate) fn end_placing(&self) {
+    pub fn end_placing(&self) {
         self.placing.store(false, Ordering::Release);
     }
 
@@ -129,7 +129,7 @@ impl Room {
     // folder the pieces go to. While it is not, the look goes on, for the
     // folder named: one look at a time, and the latest folder wins. A move
     // that names a folder after this ends begins a look of its own.
-    pub(crate) fn finish_placing(&self) -> Result<(), PathBuf> {
+    pub fn finish_placing(&self) -> Result<(), PathBuf> {
         let spot = self.locked();
         match &spot.aim {
             Some(aim) if spot.place.as_ref().is_none_or(|place| place.dir != *aim) => {
@@ -143,8 +143,8 @@ impl Room {
     }
 
     // Whether a look for its disk is out.
-    #[cfg(test)]
-    pub(crate) fn placing(&self) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn placing(&self) -> bool {
         self.placing.load(Ordering::Acquire)
     }
 
@@ -153,14 +153,14 @@ impl Room {
     }
 
     // Where the pieces land, once known.
-    pub(crate) fn place(&self) -> Option<Place> {
+    pub fn place(&self) -> Option<Place> {
         self.locked().place.clone()
     }
 
     // The pieces go to `dir` from now: a place known for another folder is
     // dropped, with the room in hand on it. Whether the disk of `dir` is to
     // be looked up.
-    pub(crate) fn aim(&self, dir: &Path) -> bool {
+    pub fn aim(&self, dir: &Path) -> bool {
         let mut spot = self.locked();
         if spot.place.as_ref().is_some_and(|place| place.dir != dir) {
             let left = spot.place.take();
@@ -174,7 +174,7 @@ impl Room {
     // go to, from now. A place found for a folder they no longer go to is
     // not taken. Room in hand on the disk they landed on goes back. Whether
     // it was taken.
-    pub(crate) fn set_place(&self, place: Place) -> bool {
+    pub fn set_place(&self, place: Place) -> bool {
         let mut spot = self.locked();
         if spot.aim.as_ref().is_some_and(|aim| *aim != place.dir) {
             return false;
@@ -193,27 +193,27 @@ impl Room {
     }
 
     // A wake promised `bytes` on the place's ledger to this torrent.
-    pub(crate) fn hand(&self, bytes: u64) {
+    pub fn hand(&self, bytes: u64) {
         self.in_hand.fetch_add(bytes, Ordering::AcqRel);
     }
 
     // A wake promised this torrent room beside the other waiters': the next
     // piece that lands ends it.
-    pub(crate) fn promise_room(&self) {
+    pub fn promise_room(&self) {
         self.promised.store(true, Ordering::Release);
     }
 
     // What a wake handed this torrent and it did not spend goes back, and
     // a promise beside the other waiters' is no longer pending: its run
     // ended.
-    pub(crate) fn give_back(&self) {
+    pub fn give_back(&self) {
         self.promised.store(false, Ordering::Release);
         let spot = self.locked();
         self.give_in_hand(spot.place.as_ref());
     }
 
-    #[cfg(test)]
-    pub(crate) fn in_hand(&self) -> u64 {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn in_hand(&self) -> u64 {
         self.in_hand.load(Ordering::Acquire)
     }
 
@@ -294,14 +294,14 @@ impl Drop for Booked {
 // Where a torrent's bytes in memory are counted: the accountant every job
 // shares, under the namespace of the job's root.
 #[derive(Clone)]
-pub(crate) struct Holds {
-    pub(crate) accountant: Arc<HoldsAccountant>,
-    pub(crate) namespace: HoldsNamespace,
+pub struct Holds {
+    pub accountant: Arc<HoldsAccountant>,
+    pub namespace: HoldsNamespace,
 }
 
 // What the intake tells its owner.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Heard {
+pub enum Heard {
     // The pieces had changed: one verified, one failed its hash, a check of
     // every piece began, or the check found one.
     Changed,
@@ -322,21 +322,21 @@ pub(crate) enum Heard {
     FileWhole,
 }
 
-pub(crate) type Hear = Box<dyn Fn(Heard) + Send + Sync>;
+pub type Hear = Box<dyn Fn(Heard) + Send + Sync>;
 
-pub(crate) struct Intake {
+pub struct Intake {
     inner: Arc<dyn Pieces>,
     room: Room,
     hear: Hear,
 }
 
 impl Intake {
-    pub(crate) fn new(inner: Arc<dyn Pieces>, room: Room, hear: Hear) -> Self {
+    pub fn new(inner: Arc<dyn Pieces>, room: Room, hear: Hear) -> Self {
         Self { inner, room, hear }
     }
 
     // The disk budget its pieces are written under.
-    pub(crate) fn room(&self) -> &Room {
+    pub fn room(&self) -> &Room {
         &self.room
     }
 

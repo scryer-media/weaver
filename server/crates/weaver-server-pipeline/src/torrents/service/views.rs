@@ -269,13 +269,7 @@ impl PeerKinds {
     }
 }
 
-/// A torrent's pieces: how many, how long each is, and how many verified.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TorrentPieces {
-    pub count: u32,
-    pub size: u64,
-    pub have: u32,
-}
+pub use weaver_server_torrents::torrents::metrics::TorrentPieces;
 
 impl TorrentView {
     /// Where the torrent's output is: the folder that holds it, and the

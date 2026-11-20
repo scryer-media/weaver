@@ -72,7 +72,7 @@ async fn row(name: &str, members: usize, scenario: Scenario) {
     eprintln!(
         "MANY | {name:<6} | {members:>6} | {:>9.1} ms | {:?}",
         took.as_secs_f64() * 1000.0,
-        outcome.graph.checkpoints,
+        outcome.graph.checkpoint_debug(),
     );
 }
 

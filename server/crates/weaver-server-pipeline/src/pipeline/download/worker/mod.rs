@@ -156,7 +156,7 @@ impl<K: std::hash::Hash + Eq + Copy> KeyedLogThrottle<K> {
         self.windows.retain(|key, _| keep(key));
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn last_emitted_at(&self, job_id: K) -> Option<Instant> {
         self.windows.get(&job_id).map(|window| window.emitted_at)
     }
@@ -720,7 +720,7 @@ impl Pipeline {
         self.download_pass_provider_policy = None;
         self.report_changed_dispatch_holds();
         self.publish_download_drained();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         self.audit_lane_holdings();
     }
 

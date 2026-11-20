@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use super::*;
+use par2_rs::checksum;
+use weaver_server_pipeline::pipeline::tests::{
+    TEST_RAR5_SIG, build_test_rar_end_header, build_test_rar_file_header,
+    build_test_rar_main_header,
+};
 
 #[test]
 fn started_member_names_excludes_orphan_split_continuations() {

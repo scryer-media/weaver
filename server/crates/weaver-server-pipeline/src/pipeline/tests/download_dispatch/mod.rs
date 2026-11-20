@@ -3,26 +3,10 @@
 
 use super::*;
 
-// Every pipeline these tests build checks, after each dispatch pass and each
-// lane result batch, that its in-flight gauges are what its live lanes hold.
-// These shadow the shared fixtures of the same names for this module tree.
-async fn new_direct_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBuf, PathBuf) {
-    let (mut pipeline, intermediate_dir, complete_dir) = super::new_direct_pipeline(temp_dir).await;
-    pipeline.audit_lane_holdings = true;
-    (pipeline, intermediate_dir, complete_dir)
-}
-
-async fn new_direct_pipeline_with_backlog(
-    temp_dir: &TempDir,
-    backlog_base_bytes: usize,
-    total_connections: usize,
-) -> (Pipeline, PathBuf, PathBuf) {
-    let (mut pipeline, intermediate_dir, complete_dir) =
-        super::new_direct_pipeline_with_backlog(temp_dir, backlog_base_bytes, total_connections)
-            .await;
-    pipeline.audit_lane_holdings = true;
-    (pipeline, intermediate_dir, complete_dir)
-}
+use super::dispatch_fixture::{
+    audited_pipeline as new_direct_pipeline,
+    audited_pipeline_with_backlog as new_direct_pipeline_with_backlog,
+};
 
 // Hand `segments` to lane 0 as a dispatched lease would, so the result a
 // test then injects from lane 0 releases an article a lane holds.
@@ -72,18 +56,14 @@ fn posted_job_spec(name: &str, posted_at: Option<u64>) -> JobSpec {
     spec
 }
 
-mod alternate_message_ids;
 mod article_scheduler;
 mod article_slots;
 mod blocking_lane_guards;
 mod busy_turn_completions;
 mod checkpoint_progress;
 mod credentials_refusal;
-mod dispatch_ineligible_log;
 mod emits_download_pipeline_drained;
-mod first_article_gate;
 mod gapless_lanes;
-mod lane_depth_seeding;
 mod lane_failure_visibility;
 mod lane_holdings;
 mod owned_download_lane_pool;

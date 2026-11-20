@@ -3,8 +3,11 @@
 
 // Every configured server has a depth explorer before the first lane runs.
 
-use super::*;
-use crate::pipeline::download::transport::{DownloadLaneMode, UNCLEAN_BURST_WINDOW};
+use std::time::Duration;
+use weaver_nntp::client::{NntpClient, NntpClientConfig};
+use weaver_server_pipeline::pipeline::tests::dispatch_fixture::{
+    DispatchFixture, lanes::UNCLEAN_BURST_WINDOW,
+};
 
 fn pool_with(servers: Vec<weaver_nntp::pool::ServerPoolConfig>) -> NntpClient {
     NntpClient::new(NntpClientConfig {
@@ -43,38 +46,30 @@ fn server(
 #[tokio::test]
 async fn the_first_lease_on_a_pipelining_server_is_already_pipelined() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    pipeline.nntp = std::sync::Arc::new(pool_with(vec![server(
+    let mut pipeline = DispatchFixture::new(&temp_dir).await;
+    pipeline.seed_explorers(pool_with(vec![server(
         "pipelines.example.invalid",
         weaver_nntp::PipeliningCapability::Known(true),
         None,
     )]));
-    pipeline.seed_download_lane_explorers();
-    let pressure = pipeline.refresh_download_pressure();
+    let pressure = pipeline.pressure();
 
-    assert_eq!(
-        pipeline.download_lane_mode_for_server(0, pressure, true),
-        DownloadLaneMode::Pipelined { depth: 2 }
-    );
+    assert_eq!(pipeline.pipelined_depth(0, pressure, true), Some(2));
 }
 
 // The rung the last run proved is where this one starts.
 #[tokio::test]
 async fn a_proven_depth_seeds_the_first_lease() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    pipeline.nntp = std::sync::Arc::new(pool_with(vec![server(
+    let mut pipeline = DispatchFixture::new(&temp_dir).await;
+    pipeline.seed_explorers(pool_with(vec![server(
         "proven.example.invalid",
         weaver_nntp::PipeliningCapability::Known(true),
         Some(8),
     )]));
-    pipeline.seed_download_lane_explorers();
-    let pressure = pipeline.refresh_download_pressure();
+    let pressure = pipeline.pressure();
 
-    assert_eq!(
-        pipeline.download_lane_mode_for_server(0, pressure, true),
-        DownloadLaneMode::Pipelined { depth: 8 }
-    );
+    assert_eq!(pipeline.pipelined_depth(0, pressure, true), Some(8));
 }
 
 // A server that does not pipeline, or whose capability has never been
@@ -83,8 +78,8 @@ async fn a_proven_depth_seeds_the_first_lease() {
 #[tokio::test]
 async fn a_server_without_a_known_capability_is_seeded_sequential() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    pipeline.nntp = std::sync::Arc::new(pool_with(vec![
+    let mut pipeline = DispatchFixture::new(&temp_dir).await;
+    pipeline.seed_explorers(pool_with(vec![
         server(
             "unknown.example.invalid",
             weaver_nntp::PipeliningCapability::Probe,
@@ -101,31 +96,20 @@ async fn a_server_without_a_known_capability_is_seeded_sequential() {
             Some(4),
         ),
     ]));
-    pipeline.seed_download_lane_explorers();
-    let pressure = pipeline.refresh_download_pressure();
+    let pressure = pipeline.pressure();
 
-    let modes: Vec<(usize, DownloadLaneMode)> = (0..3)
+    let modes: Vec<(usize, Option<u8>)> = (0..3)
         .map(|server_idx| {
             (
                 server_idx,
-                pipeline.download_lane_mode_for_server(server_idx, pressure, true),
+                pipeline.pipelined_depth(server_idx, pressure, true),
             )
         })
         .collect();
-    assert_eq!(
-        modes,
-        vec![
-            (0, DownloadLaneMode::Sequential),
-            (1, DownloadLaneMode::Sequential),
-            (2, DownloadLaneMode::Pipelined { depth: 4 }),
-        ]
-    );
+    assert_eq!(modes, vec![(0, None), (1, None), (2, Some(4)),]);
     // A lane whose own connection never negotiated pipelining runs sequential
     // whatever its server's explorer says.
-    assert_eq!(
-        pipeline.download_lane_mode_for_server(2, pressure, false),
-        DownloadLaneMode::Sequential
-    );
+    assert_eq!(pipeline.pipelined_depth(2, pressure, false), None);
 }
 
 // Re-seeding against a new pool layout keeps what a surviving server had
@@ -133,7 +117,7 @@ async fn a_server_without_a_known_capability_is_seeded_sequential() {
 #[tokio::test]
 async fn reseeding_carries_a_surviving_servers_measurements_across() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut pipeline = DispatchFixture::new(&temp_dir).await;
     let survivor = || {
         let mut config = server(
             "survivor.example.invalid",
@@ -153,28 +137,20 @@ async fn reseeding_carries_a_surviving_servers_measurements_across() {
         config
     };
 
-    pipeline.nntp = std::sync::Arc::new(pool_with(vec![survivor()]));
-    pipeline.seed_download_lane_explorers();
+    pipeline.seed_explorers(pool_with(vec![survivor()]));
     // A round trip four times the article's wire time: the link wants eight.
-    let explorer = pipeline
-        .download_lane_runtime
-        .servers
-        .get_mut(&0)
-        .expect("the only server is seeded");
-    explorer.note_latency(Duration::from_millis(100));
-    explorer.note_transfer(Duration::from_millis(25));
+    pipeline.note_timing(0, Duration::from_millis(100), Duration::from_millis(25));
 
     // Rebuild the pool with a second server, which reshuffles the positions
     // the explorers are keyed by.
-    pipeline.nntp = std::sync::Arc::new(pool_with(vec![newcomer(), survivor()]));
-    pipeline.seed_download_lane_explorers();
-    let pressure = pipeline.refresh_download_pressure();
+    pipeline.seed_explorers(pool_with(vec![newcomer(), survivor()]));
+    let pressure = pipeline.pressure();
 
-    let by_stable_id: std::collections::HashMap<u32, DownloadLaneMode> = (0..2)
+    let by_stable_id: std::collections::HashMap<u32, Option<u8>> = (0..2)
         .map(|server_idx| {
-            let mode = pipeline.download_lane_mode_for_server(server_idx, pressure, true);
+            let mode = pipeline.pipelined_depth(server_idx, pressure, true);
             let stable_id = pipeline
-                .nntp
+                .client()
                 .pool()
                 .stable_server_id(weaver_nntp::pool::ServerId(server_idx))
                 .expect("every pool position has a stable id");
@@ -183,12 +159,12 @@ async fn reseeding_carries_a_surviving_servers_measurements_across() {
         .collect();
     assert_eq!(
         by_stable_id.get(&7),
-        Some(&DownloadLaneMode::Pipelined { depth: 8 }),
+        Some(&Some(8)),
         "the survivor keeps the depth its own measurements ask for"
     );
     assert_eq!(
         by_stable_id.get(&9),
-        Some(&DownloadLaneMode::Pipelined { depth: 2 }),
+        Some(&Some(2)),
         "the newcomer has measured nothing and starts at the shallowest rung"
     );
 }
@@ -202,7 +178,7 @@ async fn reseeding_carries_a_surviving_servers_measurements_across() {
 #[tokio::test]
 async fn a_pinned_server_stays_sequential_across_a_pool_rebuild() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut pipeline = DispatchFixture::new(&temp_dir).await;
     let with_id = |host: &str, id: u32| {
         let mut config = server(
             host,
@@ -213,39 +189,25 @@ async fn a_pinned_server_stays_sequential_across_a_pool_rebuild() {
         config
     };
 
-    pipeline.nntp = std::sync::Arc::new(pool_with(vec![
+    pipeline.seed_explorers(pool_with(vec![
         with_id("pinned.example.invalid", 7),
         with_id("clean.example.invalid", 8),
     ]));
-    pipeline.seed_download_lane_explorers();
     let now = std::time::Instant::now();
-    let explorer = pipeline
-        .download_lane_runtime
-        .servers
-        .get_mut(&0)
-        .expect("the first server is seeded");
-    explorer.note_unclean_batch(now);
-    explorer.note_unclean_batch(now + UNCLEAN_BURST_WINDOW);
-    assert!(explorer.pinned_sequential());
+    pipeline.note_unclean(0, now);
+    pipeline.note_unclean(0, now + UNCLEAN_BURST_WINDOW);
+    assert!(pipeline.pinned(0));
 
     // The rebuild swaps the two positions.
-    pipeline.nntp = std::sync::Arc::new(pool_with(vec![
+    pipeline.seed_explorers(pool_with(vec![
         with_id("clean.example.invalid", 8),
         with_id("pinned.example.invalid", 7),
     ]));
-    pipeline.seed_download_lane_explorers();
-    let pressure = pipeline.refresh_download_pressure();
+    let pressure = pipeline.pressure();
 
-    assert_eq!(
-        pipeline.download_lane_mode_for_server(1, pressure, true),
-        DownloadLaneMode::Sequential
-    );
-    assert_eq!(
-        pipeline.download_lane_mode_for_server(0, pressure, true),
-        DownloadLaneMode::Pipelined { depth: 4 }
-    );
-    pipeline.publish_download_transport_health();
-    let shown = pipeline.shared_state.download_transport_health();
+    assert_eq!(pipeline.pipelined_depth(1, pressure, true), None);
+    assert_eq!(pipeline.pipelined_depth(0, pressure, true), Some(4));
+    let shown = pipeline.transport_health();
     assert_eq!(
         shown
             .iter()
@@ -320,24 +282,17 @@ async fn a_pin_follows_its_server_and_not_an_edited_host_or_port() {
     ];
     for (case, rebuilt, position, pinned) in cases {
         let temp_dir = tempfile::tempdir().unwrap();
-        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-        pipeline.nntp = std::sync::Arc::new(pool_with(vec![
+        let mut pipeline = DispatchFixture::new(&temp_dir).await;
+        pipeline.seed_explorers(pool_with(vec![
             entry("nova.example.invalid", 119, 0, 7),
             other(0),
         ]));
-        pipeline.seed_download_lane_explorers();
         let now = std::time::Instant::now();
-        let explorer = pipeline.download_lane_runtime.servers.get_mut(&0).unwrap();
-        explorer.note_unclean_batch(now);
-        explorer.note_unclean_batch(now + UNCLEAN_BURST_WINDOW);
-        assert!(explorer.pinned_sequential());
+        pipeline.note_unclean(0, now);
+        pipeline.note_unclean(0, now + UNCLEAN_BURST_WINDOW);
+        assert!(pipeline.pinned(0));
 
-        pipeline.nntp = std::sync::Arc::new(pool_with(rebuilt));
-        pipeline.seed_download_lane_explorers();
-        assert_eq!(
-            pipeline.download_lane_runtime.servers[&position].pinned_sequential(),
-            pinned,
-            "{case}"
-        );
+        pipeline.seed_explorers(pool_with(rebuilt));
+        assert_eq!(pipeline.pinned(position), pinned, "{case}");
     }
 }

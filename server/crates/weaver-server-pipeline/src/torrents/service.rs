@@ -1694,11 +1694,8 @@ pub(crate) static UNPACK_OVER_FAILS: std::sync::atomic::AtomicBool =
 #[cfg(test)]
 pub(crate) static MOVE_RECORD_MEETS: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
 
-// Test seam: the next time a torrent's session asks its store to forget
-// every piece for a check, the store refuses.
 #[cfg(test)]
-pub(crate) static CHECK_EVERYTHING_FAILS: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub(crate) use super::storage::CHECK_EVERYTHING_FAILS;
 
 // Test seam: run once a move of a torrent's placed files has written the
 // move to its row, the files still held by the move.

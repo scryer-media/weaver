@@ -800,7 +800,7 @@ impl Pipeline {
         pending: &mut VecDeque<DownloadResult>,
     ) {
         self.ingest_owned_download_lane_event(event, pending);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         self.audit_lane_holdings();
     }
 
@@ -1218,7 +1218,7 @@ impl Pipeline {
             }
         }
         self.publish_active_stage_metrics();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         self.audit_lane_holdings();
     }
 }

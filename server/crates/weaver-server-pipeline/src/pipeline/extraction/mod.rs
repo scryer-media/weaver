@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 pub(crate) mod error;
-pub(crate) mod safety;
+pub(crate) use weaver_server_disk::pipeline::extraction::safety;
 
 pub(crate) use error::ExtractionError;
 pub(crate) use safety::{

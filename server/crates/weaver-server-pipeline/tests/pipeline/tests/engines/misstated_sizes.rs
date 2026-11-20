@@ -395,7 +395,7 @@ async fn a_set_whose_first_part_overstates_its_size_and_whose_bytes_fail_its_crc
 
 // A restart after every article ends the job as a run without one does.
 async fn delivers_restarted(scenario: Scenario, body: &[u8]) {
-    let restarted = super::restart::run_restarting(&scenario, &mut |_| {}).await;
+    let restarted = super::restart::run_restarting(&scenario).await;
     assert!(restarted.restarts > 0);
     assert_eq!(restarted.status, Some(JobStatus::Complete));
     assert_eq!(
@@ -580,7 +580,7 @@ async fn a_set_whose_first_part_overstates_its_size_and_that_loses_an_article_re
         ("RAR4", rar4_bare(&body, "every part", false).lost(2, 1)),
         ("RAR5", rar5_bare(&body, "the first part", false).lost(2, 1)),
     ] {
-        let restarted = super::restart::run_restarting(&scenario, &mut |_| {}).await;
+        let restarted = super::restart::run_restarting(&scenario).await;
         assert!(restarted.restarts > 0, "{case}");
         assert!(
             matches!(restarted.status, Some(JobStatus::Failed { .. })),

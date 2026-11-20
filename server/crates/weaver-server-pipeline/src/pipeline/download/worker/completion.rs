@@ -223,9 +223,10 @@ impl Pipeline {
                     active.download_queue.pin_message_id(segment_id, pin);
                     active.recovery_queue.pin_message_id(segment_id, pin);
                 }
-                #[cfg(test)]
-                self.spent_message_ids
-                    .push(segment.message_ids.in_use().to_string());
+                #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+                if let Some(spent) = &mut self.spent_message_ids {
+                    spent.push(segment.message_ids.in_use().to_string());
+                }
                 Some(segment.message_ids.spend())
             })
             .unwrap_or(false);
@@ -606,7 +607,7 @@ impl Pipeline {
 
     pub(crate) async fn handle_download_done(&mut self, result: DownloadResult) {
         let released = self.release_download_result(&result);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         self.audit_lane_holdings();
         if released {
             // What arrived is handed on in this step, as a released result

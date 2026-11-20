@@ -9,6 +9,7 @@ pub mod e2e_failpoint;
 pub mod error;
 pub mod events;
 pub mod jobs {
+    pub mod graph_checkpoint;
     pub mod ids;
     pub mod model;
 }

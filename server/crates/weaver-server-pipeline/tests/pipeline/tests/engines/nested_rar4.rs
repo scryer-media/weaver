@@ -331,7 +331,8 @@ async fn a_broken_rar4_in_a_zip_in_an_outer_rar_with_whole_bytes_fails_as_an_arc
                         .whole
                         .iter()
                         .any(|name| name.ends_with("tn60025.rar"))
-                    && delivery
+                    && outcome
+                        .graph()
                         .withheld_error()
                         .is_some_and(|reason| reason.contains("tn60025.rar")),
                 "{case}: {:?} ruled {:?} withheld {:?} whole {:?} damaged {:?} unrepaired {:?} reason {:?}",
@@ -341,7 +342,7 @@ async fn a_broken_rar4_in_a_zip_in_an_outer_rar_with_whole_bytes_fails_as_an_arc
                 delivery.whole,
                 delivery.damaged,
                 delivery.unrepaired,
-                delivery.withheld_error(),
+                outcome.graph().withheld_error(),
             );
             // A failed job publishes nothing: the furniture is delivered
             // whole and stays in its working directory.

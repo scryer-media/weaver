@@ -215,12 +215,7 @@ pub fn par3_set(base: &str, files: &[(&str, &[u8])], blocks: u64) -> Vec<Post> {
 }
 
 // The same, in blocks of `size` bytes.
-pub(in crate::pipeline::tests) fn par3_set_sized(
-    base: &str,
-    files: &[(&str, &[u8])],
-    size: u64,
-    blocks: u64,
-) -> Vec<Post> {
+pub fn par3_set_sized(base: &str, files: &[(&str, &[u8])], size: u64, blocks: u64) -> Vec<Post> {
     let source = tempfile::tempdir().unwrap();
     let names: Vec<std::path::PathBuf> = files
         .iter()
@@ -966,8 +961,7 @@ impl Scenario {
     }
 
     // The article's bytes are whole and its checksum is wrong.
-    #[cfg(test)]
-    pub(in crate::pipeline::tests) fn crc_wrong(mut self, file: u32, ordinal: u32) -> Self {
+    pub fn crc_wrong(mut self, file: u32, ordinal: u32) -> Self {
         self.crc_wrong.push((file, ordinal));
         self
     }
@@ -976,6 +970,10 @@ impl Scenario {
     pub fn declares(mut self, file: u32, size: u64) -> Self {
         self.declares.push((file, size));
         self
+    }
+
+    pub fn was_refused(&self, article: &(u32, u32)) -> bool {
+        self.refused.contains(article)
     }
 
     pub fn refused_once(mut self, file: u32, ordinal: u32) -> Self {
@@ -1113,7 +1111,7 @@ pub struct GraphView {
     // look, summed from the tree.
     pub(in crate::pipeline::tests) resident: u64,
     // The time the looks themselves took, which a run's time is not.
-    pub(in crate::pipeline::tests) observed: std::time::Duration,
+    pub observed: std::time::Duration,
     // What the job's report showed at each look, its status and whether it
     // was fetching repair data, each change once.
     pub(in crate::pipeline::tests) shown: Vec<(JobStatus, bool)>,
@@ -1142,6 +1140,22 @@ pub struct GraphView {
     pub names: BTreeSet<String>,
 }
 impl GraphView {
+    pub fn checkpoint_counts(&self) -> (usize, usize, usize) {
+        (
+            self.checkpoints.checkpoints,
+            self.checkpoints.facts,
+            self.checkpoints.rows,
+        )
+    }
+
+    pub fn checkpoint_debug(&self) -> &impl std::fmt::Debug {
+        &self.checkpoints
+    }
+
+    pub fn withheld_error(&self) -> Option<String> {
+        self.delivery.withheld_error()
+    }
+
     pub fn has_withheld_files(&self) -> bool {
         !self.delivery.withheld.is_empty()
     }

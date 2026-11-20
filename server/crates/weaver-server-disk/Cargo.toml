@@ -29,6 +29,7 @@ getrandom = { workspace = true, default-features = false }
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_JobObjects", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 
 [dev-dependencies]
+sevenz-turbo = { workspace = true }
 weaver-server-base = { path = "../weaver-server-base", features = ["test-support"] }
 # `test-util` for the paused clock.
 tokio = { workspace = true, features = ["test-util"] }

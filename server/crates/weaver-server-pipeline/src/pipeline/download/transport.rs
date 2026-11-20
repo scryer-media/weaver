@@ -553,7 +553,7 @@ impl ServerPipelineExplorer {
         self.latency.map(LatencyBand::from_latency)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn pinned_sequential(&self) -> bool {
         self.pinned_sequential
     }
@@ -564,7 +564,7 @@ impl ServerPipelineExplorer {
         self.pinned_sequential || self.pin_trial
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(in crate::pipeline) fn note_latency(&mut self, sample: Duration) {
         self.latency = Some(blend(self.latency, sample));
     }
@@ -1041,7 +1041,7 @@ impl ServerPipelineExplorer {
 
     // The same, from lane 0 at the explorer's current rung, or at the
     // trial's on a trial.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(in crate::pipeline) fn note_unclean_batch(&mut self, now: Instant) -> Option<RungChange> {
         let depth = if self.pin_trial {
             PIN_TRIAL_DEPTH

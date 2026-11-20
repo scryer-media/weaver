@@ -129,19 +129,19 @@ fn ms(took: Duration) -> f64 {
 
 async fn row(name: &str, scenario: Scenario) {
     let graph = timed(&scenario).await;
-    let tally = graph
+    let (checkpoints, facts, rows) = graph
         .outcome
         .as_ref()
-        .map(|outcome| outcome.graph.checkpoints)
+        .map(|outcome| outcome.graph.checkpoint_counts())
         .unwrap_or_default();
     eprintln!(
         "PERF | {name:<14} | {:>10.1} | {:<28} | {:>6} | {:>6} | {:>9} | {:>7}",
         ms(graph.took),
         graph.said,
         graph.requests,
-        tally.checkpoints,
-        tally.facts,
-        tally.rows,
+        checkpoints,
+        facts,
+        rows,
     );
 }
 

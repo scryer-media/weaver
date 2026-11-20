@@ -822,7 +822,7 @@ impl DownloadError {
         Self::Local { raw_size: 0, error }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(super) fn fetch(kind: DownloadFailureKind, message: impl Into<String>) -> Self {
         Self::Fetch(DownloadFailure::new(kind, message))
     }
@@ -2096,7 +2096,7 @@ pub struct Pipeline {
     // Set by the download-dispatch test fixtures: every dispatch pass and
     // every lane result batch then checks that the in-flight gauges are what
     // the lane records hold (see `Pipeline::audit_lane_holdings`).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(super) audit_lane_holdings: bool,
     // Where a test stops this pipeline's moves of working folders.
     #[cfg(test)]
@@ -2115,11 +2115,11 @@ pub struct Pipeline {
     pub(super) propagation_delay_forced: Option<Duration>,
     // How deep the unservable-article booking is nested in itself now, and
     // the deepest it has been.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(super) unservable_booking_depth: (usize, usize),
     // Every message-id an article spent, in the order spent.
-    #[cfg(test)]
-    pub(super) spent_message_ids: Vec<String>,
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub(super) spent_message_ids: Option<Vec<String>>,
     // Queued articles the dispatch-hold reason has read.
     #[cfg(test)]
     pub(super) dispatch_hold_items_examined: std::sync::atomic::AtomicUsize,

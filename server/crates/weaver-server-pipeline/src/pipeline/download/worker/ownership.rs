@@ -16,7 +16,7 @@ impl Pipeline {
 
     pub(in crate::pipeline) fn download_lane_is_live(&self, lane_id: u64) -> bool {
         // Standalone fixtures can inject outcomes without starting a transport.
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         if lane_id == 0 {
             return true;
         }
@@ -111,7 +111,7 @@ impl Pipeline {
     // Standalone fixtures inject results from lane 0 without starting a
     // transport; this books what such a result releases, through the same
     // record a dispatched lease writes.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(in crate::pipeline) fn hold_test_lane_works(
         &mut self,
         works: Vec<DownloadWork>,
@@ -220,7 +220,7 @@ impl Pipeline {
     // Standalone fixtures book articles no lease reserved: they are
     // reserved here, whatever room the volume has, so what they release
     // was counted.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(in crate::pipeline) fn reserve_test_lane_work(&mut self, work: &DownloadWork) {
         let job_id = work.segment_id.file_id.job_id;
         let Some(volume) = self.article_volume(job_id) else {
@@ -433,7 +433,7 @@ impl Pipeline {
         let Some(owner) = self.download_lane_owners.get_mut(&lane_id) else {
             // Standalone fixtures inject outcomes from lane 0 without
             // booking it; such an outcome was never counted.
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             if lane_id == 0 {
                 if arrived != 0 {
                     self.note_volume_arrived(segment.file_id.job_id, arrived);
@@ -544,7 +544,7 @@ impl Pipeline {
 
     // What the in-flight gauges should read, counted from the lane records,
     // set against what they do read. Empty when they agree.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(in crate::pipeline) fn lane_holdings_discrepancies(&self) -> Vec<String> {
         let mut total = 0usize;
         let mut recovery = 0usize;
@@ -630,7 +630,7 @@ impl Pipeline {
     // Fail the test when the in-flight gauges disagree with the lane records.
     // Called after every dispatch pass and every lane result batch; a no-op
     // unless the fixture asked for it.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(in crate::pipeline) fn audit_lane_holdings(&self) {
         if !self.audit_lane_holdings {
             return;

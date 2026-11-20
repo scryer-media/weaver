@@ -16,18 +16,7 @@ use super::persistence::lock_active_job_for_write_tx;
 use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime, SqlTx};
 use crate::{Database, LoadError, StateError};
 
-// Every table a checkpoint writes. A job's rows go with the job.
-pub(crate) const TABLES: [&str; 9] = [
-    "graph_nodes",
-    "graph_members",
-    "graph_coverage",
-    "graph_envelopes",
-    "graph_crypt",
-    "graph_recovery",
-    "graph_holds",
-    "graph_facts_parts",
-    "graph_held_parts",
-];
+pub(crate) use weaver_server_base::jobs::graph_checkpoint::TABLES;
 
 // Rows per statement: enough to keep a large change to a few statements,
 // few enough to stay under every engine's bind limit.

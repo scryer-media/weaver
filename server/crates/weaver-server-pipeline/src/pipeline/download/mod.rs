@@ -20,9 +20,11 @@ pub(in crate::pipeline) use retention::LoginRefusalView;
 #[cfg(test)]
 pub(in crate::pipeline) use retention::LoginRefusalWait;
 pub(super) use worker::HeldDownloadRefill;
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+pub(in crate::pipeline) use worker::{DISPATCH_INELIGIBLE_LOG_INTERVAL, DownloadPressure};
 #[cfg(test)]
 pub(in crate::pipeline) use worker::{
-    DISPATCH_INELIGIBLE_LOG_INTERVAL, DOWNLOAD_DISPATCH_STALL_KICK_AFTER,
+    DOWNLOAD_DISPATCH_STALL_KICK_AFTER,
     DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL, DOWNLOAD_DISPATCH_STALL_RELEASE_AFTER,
     DOWNLOAD_RETRY_STORM_THRESHOLD,
 };

@@ -20,7 +20,8 @@ use weaver_graph::Why;
 use weaver_graph::recovery::RepairOutcome;
 
 use super::caps::{FLOOR, assert_refused, limits, zeros_zstd};
-use super::depth::stored as sevenz_stored;
+pub(super) use super::depth::{articles_inside, delivered, two_deep};
+use super::depth::{rar, sevenz};
 use super::harness::{
     ARTICLE, Claim, Outcome, Post, Scenario, kinds, par2_set, par3_set, payload, run,
 };
@@ -37,41 +38,8 @@ use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::tests::direct_store::scenarios::encrypted_store_set;
 use crate::pipeline::tests::direct_store::{
-    multi_member_store_set, obfuscate_volumes, protected_store_set, single_member_store_set,
+    obfuscate_volumes, protected_store_set, single_member_store_set,
 };
-
-pub(super) fn delivered(name: &str) -> String {
-    format!("lantern beacon/{name}")
-}
-
-// A stored RAR5 volume of `entries`, in order.
-fn rar(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
-    multi_member_store_set(entries, 1).remove(0).1
-}
-
-fn sevenz(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
-    let borrowed: Vec<(&str, &[u8])> = entries.iter().map(|(n, b)| (*n, b.as_slice())).collect();
-    sevenz_stored(&borrowed)
-}
-
-// `entries` in a stored RAR, `level.rar`, in a stored 7z posted as
-// `lantern.7z`: what they hold sits two deep.
-pub(super) fn two_deep(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
-    sevenz(&[("level.rar", rar(entries))])
-}
-
-// Every article of `outer` lying wholly inside the bytes of `inner`, past
-// its front, so what the member is can still be told from its first bytes.
-pub(super) fn articles_inside(outer: &[u8], inner: &[u8]) -> Vec<u32> {
-    let at = outer
-        .windows(inner.len())
-        .position(|window| window == inner)
-        .expect("a stored container holds its member's bytes as they are");
-    (at / ARTICLE + 1..)
-        .take_while(|ordinal| (ordinal + 1) * ARTICLE <= at + inner.len())
-        .map(|ordinal| ordinal as u32)
-        .collect()
-}
 
 fn beacon() -> Vec<u8> {
     payload(4 * ARTICLE + 7, 91)

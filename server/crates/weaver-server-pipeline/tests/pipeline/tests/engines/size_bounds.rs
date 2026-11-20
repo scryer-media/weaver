@@ -238,7 +238,7 @@ async fn a_rar_repair_off_article_bounds_reads_back_a_plain_member() {
 
 #[tokio::test]
 async fn a_rar_repair_off_article_bounds_reads_back_an_xz_member() {
-    let data = super::nesting::noise(3 * MIB + 17, 194);
+    let data = super::harness::noise(3 * MIB + 17, 194);
     let packed = super::streams::xz(&data);
     rar_repair_reads_back("ember.bin.xz", packed, "ember.bin", &data).await;
 }

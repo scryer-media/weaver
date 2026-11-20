@@ -152,7 +152,7 @@ impl Pipeline {
         request: DownloadLaneRefillRequest,
     ) {
         self.answer_download_lane_refill(request, Instant::now(), None);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         self.audit_lane_holdings();
     }
 
