@@ -1,0 +1,912 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+use std::fmt::Display;
+use std::io::Cursor;
+
+#[cfg(test)]
+use crate::JobStatus;
+use crate::persistence::{
+    Database,
+    sql_runtime::{SqlArg, SqlRow, SqlRuntime, SqlTx, StoreDatastore},
+};
+use crate::{JobInfo, MetricsSnapshot, StateError};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+pub use weaver_server_pipeline::operations::metrics_store::*;
+
+const METRICS_HISTORY_COMPRESSION_LEVEL: i32 = 3;
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct RawMetricsHistoryChunk {
+    points: Vec<RawMetricsHistoryPoint>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct RollupMetricsHistoryChunk {
+    points: Vec<RollupMetricsHistoryPoint>,
+}
+
+fn db_err(error: impl Display) -> StateError {
+    StateError::Database(error.to_string())
+}
+
+pub trait OperationsMetricsStoreQueries {
+    fn record_metrics_history_sample(
+        &self,
+        recorded_at_epoch_sec: i64,
+        snapshot: &MetricsSnapshot,
+        jobs: &[JobInfo],
+    ) -> Result<(), StateError>;
+    fn record_metrics_history_point(
+        &self,
+        recorded_at_epoch_sec: i64,
+        snapshot: &MetricsSnapshot,
+        jobs: &JobStatusCounts,
+        plan: MetricsHistoryWritePlan,
+    ) -> Result<(), StateError>;
+    fn read_metrics_history(
+        &self,
+        tier: MetricsHistoryTier,
+        since_epoch_sec: i64,
+        until_epoch_sec: i64,
+    ) -> Result<MetricsHistoryQueryResult, StateError>;
+    fn list_metrics_history_chunks(
+        &self,
+        tier: MetricsHistoryTier,
+    ) -> Result<Vec<MetricsHistoryChunkRow>, StateError>;
+    fn delete_all_metrics_history(&self) -> Result<(), StateError>;
+}
+
+impl OperationsMetricsStoreQueries for Database {
+    // Write one sample and bring every rollup and retention window up to
+    // date with it. The periodic sampler uses
+    // [`Database::record_metrics_history_point`] instead, which writes only
+    // what its cadence says is due.
+    fn record_metrics_history_sample(
+        &self,
+        recorded_at_epoch_sec: i64,
+        snapshot: &MetricsSnapshot,
+        jobs: &[JobInfo],
+    ) -> Result<(), StateError> {
+        self.record_metrics_history_point(
+            recorded_at_epoch_sec,
+            snapshot,
+            &JobStatusCounts::from_jobs(jobs),
+            MetricsHistoryWritePlan::eager(recorded_at_epoch_sec),
+        )
+    }
+
+    // Write one raw sample plus whatever `plan` names.
+    fn record_metrics_history_point(
+        &self,
+        recorded_at_epoch_sec: i64,
+        snapshot: &MetricsSnapshot,
+        jobs: &JobStatusCounts,
+        plan: MetricsHistoryWritePlan,
+    ) -> Result<(), StateError> {
+        let recorded_at_epoch_sec = quantize_raw_timestamp(recorded_at_epoch_sec);
+        let raw_point =
+            RawMetricsHistoryPoint::from_snapshot(recorded_at_epoch_sec, snapshot, jobs);
+
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "record_metrics_history_sample", |tx| {
+                let raw_point = raw_point.clone();
+                Box::pin(async move {
+                    upsert_raw_point_tx(tx, raw_point).await?;
+                    if let Some(bucket) = plan.rollup_5m_bucket {
+                        refresh_rollup_5m_bucket_tx(tx, bucket).await?;
+                    }
+                    if let Some(bucket) = plan.rollup_1h_bucket {
+                        refresh_rollup_1h_bucket_tx(tx, bucket).await?;
+                    }
+                    for (due, tier) in [
+                        (plan.prune_raw, MetricsHistoryTier::Raw10s),
+                        (plan.prune_5m, MetricsHistoryTier::Rollup5m),
+                        (plan.prune_1h, MetricsHistoryTier::Rollup1h),
+                    ] {
+                        if due {
+                            prune_metrics_history_tx(tx, tier, recorded_at_epoch_sec).await?;
+                        }
+                    }
+                    Ok(())
+                })
+            })
+            .await
+        })
+    }
+
+    fn read_metrics_history(
+        &self,
+        tier: MetricsHistoryTier,
+        since_epoch_sec: i64,
+        until_epoch_sec: i64,
+    ) -> Result<MetricsHistoryQueryResult, StateError> {
+        let datastore = self.datastore();
+        match tier {
+            MetricsHistoryTier::Raw10s => self.run_sql_blocking_read(async move {
+                Ok(MetricsHistoryQueryResult {
+                    resolution_sec: tier.resolution_sec(),
+                    data: MetricsHistoryQueryData::Raw(
+                        load_raw_points_between(&datastore, tier, since_epoch_sec, until_epoch_sec)
+                            .await?,
+                    ),
+                })
+            }),
+            MetricsHistoryTier::Rollup5m | MetricsHistoryTier::Rollup1h => self
+                .run_sql_blocking_read(async move {
+                    Ok(MetricsHistoryQueryResult {
+                        resolution_sec: tier.resolution_sec(),
+                        data: MetricsHistoryQueryData::Rollup(
+                            load_rollup_points_between(
+                                &datastore,
+                                tier,
+                                since_epoch_sec,
+                                until_epoch_sec,
+                            )
+                            .await?,
+                        ),
+                    })
+                }),
+        }
+    }
+
+    fn list_metrics_history_chunks(
+        &self,
+        tier: MetricsHistoryTier,
+    ) -> Result<Vec<MetricsHistoryChunkRow>, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT resolution_sec, chunk_start_epoch_sec, body_zstd
+                 FROM metrics_history_chunks
+                 WHERE resolution_sec = {}
+                 ORDER BY chunk_start_epoch_sec ASC",
+                &[SqlArg::I64(tier.resolution_sec())],
+            )
+            .await?;
+            rows.into_iter().map(metrics_chunk_row_from_row).collect()
+        })
+    }
+
+    fn delete_all_metrics_history(&self) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.write_exec(),
+                "DELETE FROM metrics_history_chunks",
+                &[],
+            )
+            .await?;
+            Ok(())
+        })
+    }
+}
+
+fn quantize_raw_timestamp(timestamp_epoch_sec: i64) -> i64 {
+    align_down_epoch(timestamp_epoch_sec, RAW_METRICS_RESOLUTION_SECS)
+}
+
+fn align_down_epoch(value: i64, interval_sec: i64) -> i64 {
+    value - value.rem_euclid(interval_sec)
+}
+
+fn align_up_epoch(value: i64, interval_sec: i64) -> i64 {
+    let remainder = value.rem_euclid(interval_sec);
+    if remainder == 0 {
+        value
+    } else {
+        value + (interval_sec - remainder)
+    }
+}
+
+fn chunk_start_for_timestamp(timestamp_epoch_sec: i64, tier: MetricsHistoryTier) -> i64 {
+    align_down_epoch(timestamp_epoch_sec, tier.chunk_span_sec())
+}
+
+fn serialize_chunk<T: Serialize>(payload: &T) -> Result<Vec<u8>, StateError> {
+    let encoded = rmp_serde::to_vec(payload).map_err(db_err)?;
+    zstd::bulk::compress(&encoded, METRICS_HISTORY_COMPRESSION_LEVEL).map_err(db_err)
+}
+
+fn deserialize_chunk<T: DeserializeOwned>(blob: &[u8]) -> Result<T, StateError> {
+    let decoded = zstd::stream::decode_all(Cursor::new(blob)).map_err(db_err)?;
+    rmp_serde::from_slice(&decoded).map_err(db_err)
+}
+
+async fn load_chunk_blob_tx(
+    tx: &mut SqlTx<'_>,
+    tier: MetricsHistoryTier,
+    chunk_start_epoch_sec: i64,
+) -> Result<Option<Vec<u8>>, StateError> {
+    tx.fetch_optional(
+        "SELECT body_zstd
+         FROM metrics_history_chunks
+         WHERE resolution_sec = {} AND chunk_start_epoch_sec = {}",
+        &[
+            SqlArg::I64(tier.resolution_sec()),
+            SqlArg::I64(chunk_start_epoch_sec),
+        ],
+    )
+    .await?
+    .map(|row| row.bytes("body_zstd"))
+    .transpose()
+}
+
+async fn load_raw_chunk_tx(
+    tx: &mut SqlTx<'_>,
+    tier: MetricsHistoryTier,
+    chunk_start_epoch_sec: i64,
+) -> Result<RawMetricsHistoryChunk, StateError> {
+    debug_assert!(matches!(tier, MetricsHistoryTier::Raw10s));
+    match load_chunk_blob_tx(tx, tier, chunk_start_epoch_sec).await? {
+        Some(blob) => deserialize_chunk(&blob),
+        None => Ok(RawMetricsHistoryChunk::default()),
+    }
+}
+
+async fn load_rollup_chunk_tx(
+    tx: &mut SqlTx<'_>,
+    tier: MetricsHistoryTier,
+    chunk_start_epoch_sec: i64,
+) -> Result<RollupMetricsHistoryChunk, StateError> {
+    debug_assert!(!matches!(tier, MetricsHistoryTier::Raw10s));
+    match load_chunk_blob_tx(tx, tier, chunk_start_epoch_sec).await? {
+        Some(blob) => deserialize_chunk(&blob),
+        None => Ok(RollupMetricsHistoryChunk::default()),
+    }
+}
+
+async fn store_chunk_tx<T: Serialize>(
+    tx: &mut SqlTx<'_>,
+    tier: MetricsHistoryTier,
+    chunk_start_epoch_sec: i64,
+    payload: &T,
+) -> Result<(), StateError> {
+    let body_zstd = serialize_chunk(payload)?;
+    tx.execute(
+        "INSERT INTO metrics_history_chunks (
+             resolution_sec,
+             chunk_start_epoch_sec,
+             body_zstd
+         ) VALUES ({}, {}, {})
+         ON CONFLICT(resolution_sec, chunk_start_epoch_sec) DO UPDATE SET
+            body_zstd = excluded.body_zstd",
+        &[
+            SqlArg::I64(tier.resolution_sec()),
+            SqlArg::I64(chunk_start_epoch_sec),
+            SqlArg::Bytes(body_zstd),
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+async fn delete_chunk_tx(
+    tx: &mut SqlTx<'_>,
+    tier: MetricsHistoryTier,
+    chunk_start_epoch_sec: i64,
+) -> Result<(), StateError> {
+    tx.execute(
+        "DELETE FROM metrics_history_chunks
+         WHERE resolution_sec = {} AND chunk_start_epoch_sec = {}",
+        &[
+            SqlArg::I64(tier.resolution_sec()),
+            SqlArg::I64(chunk_start_epoch_sec),
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+async fn select_chunk_rows_between(
+    datastore: &StoreDatastore,
+    tier: MetricsHistoryTier,
+    since_epoch_sec: i64,
+    until_epoch_sec: i64,
+) -> Result<Vec<MetricsHistoryChunkRow>, StateError> {
+    if until_epoch_sec < since_epoch_sec {
+        return Ok(Vec::new());
+    }
+
+    let first_chunk_start = chunk_start_for_timestamp(since_epoch_sec, tier);
+    let last_chunk_start = chunk_start_for_timestamp(until_epoch_sec, tier);
+    let rows = SqlRuntime::fetch_all(
+        datastore.read_exec(),
+        "SELECT resolution_sec, chunk_start_epoch_sec, body_zstd
+         FROM metrics_history_chunks
+         WHERE resolution_sec = {}
+           AND chunk_start_epoch_sec >= {}
+           AND chunk_start_epoch_sec <= {}
+         ORDER BY chunk_start_epoch_sec ASC",
+        &[
+            SqlArg::I64(tier.resolution_sec()),
+            SqlArg::I64(first_chunk_start),
+            SqlArg::I64(last_chunk_start),
+        ],
+    )
+    .await?;
+    rows.into_iter().map(metrics_chunk_row_from_row).collect()
+}
+
+async fn select_chunk_rows_between_tx(
+    tx: &mut SqlTx<'_>,
+    tier: MetricsHistoryTier,
+    since_epoch_sec: i64,
+    until_epoch_sec: i64,
+) -> Result<Vec<MetricsHistoryChunkRow>, StateError> {
+    if until_epoch_sec < since_epoch_sec {
+        return Ok(Vec::new());
+    }
+
+    let first_chunk_start = chunk_start_for_timestamp(since_epoch_sec, tier);
+    let last_chunk_start = chunk_start_for_timestamp(until_epoch_sec, tier);
+    let rows = tx
+        .fetch_all(
+            "SELECT resolution_sec, chunk_start_epoch_sec, body_zstd
+             FROM metrics_history_chunks
+             WHERE resolution_sec = {}
+               AND chunk_start_epoch_sec >= {}
+               AND chunk_start_epoch_sec <= {}
+             ORDER BY chunk_start_epoch_sec ASC",
+            &[
+                SqlArg::I64(tier.resolution_sec()),
+                SqlArg::I64(first_chunk_start),
+                SqlArg::I64(last_chunk_start),
+            ],
+        )
+        .await?;
+    rows.into_iter().map(metrics_chunk_row_from_row).collect()
+}
+
+async fn upsert_raw_point_tx(
+    tx: &mut SqlTx<'_>,
+    point: RawMetricsHistoryPoint,
+) -> Result<(), StateError> {
+    let tier = MetricsHistoryTier::Raw10s;
+    let chunk_start_epoch_sec = chunk_start_for_timestamp(point.timestamp_epoch_sec, tier);
+    let mut chunk = load_raw_chunk_tx(tx, tier, chunk_start_epoch_sec).await?;
+    upsert_sorted_point(
+        &mut chunk.points,
+        point,
+        |value| value.timestamp_epoch_sec,
+        replace_raw_point,
+    );
+    store_chunk_tx(tx, tier, chunk_start_epoch_sec, &chunk).await
+}
+
+async fn upsert_rollup_point_tx(
+    tx: &mut SqlTx<'_>,
+    tier: MetricsHistoryTier,
+    point: RollupMetricsHistoryPoint,
+) -> Result<(), StateError> {
+    let chunk_start_epoch_sec = chunk_start_for_timestamp(point.timestamp_epoch_sec, tier);
+    let mut chunk = load_rollup_chunk_tx(tx, tier, chunk_start_epoch_sec).await?;
+    upsert_sorted_point(
+        &mut chunk.points,
+        point,
+        |value| value.timestamp_epoch_sec,
+        replace_rollup_point,
+    );
+    store_chunk_tx(tx, tier, chunk_start_epoch_sec, &chunk).await
+}
+
+fn upsert_sorted_point<T, F, R>(points: &mut Vec<T>, point: T, timestamp: F, replace: R)
+where
+    F: Fn(&T) -> i64,
+    R: Fn(&mut T, T),
+{
+    match points.binary_search_by_key(&timestamp(&point), timestamp) {
+        Ok(index) => replace(&mut points[index], point),
+        Err(index) => points.insert(index, point),
+    }
+}
+
+fn replace_raw_point(current: &mut RawMetricsHistoryPoint, next: RawMetricsHistoryPoint) {
+    *current = next;
+}
+
+fn replace_rollup_point(current: &mut RollupMetricsHistoryPoint, next: RollupMetricsHistoryPoint) {
+    *current = next;
+}
+
+async fn refresh_rollup_5m_bucket_tx(
+    tx: &mut SqlTx<'_>,
+    recorded_at_epoch_sec: i64,
+) -> Result<(), StateError> {
+    let bucket_end_epoch_sec = align_up_epoch(recorded_at_epoch_sec, ROLLUP_5M_RESOLUTION_SECS);
+    let bucket_start_epoch_sec = bucket_end_epoch_sec - ROLLUP_5M_RESOLUTION_SECS;
+    let raw_points = load_raw_points_between_tx(
+        tx,
+        MetricsHistoryTier::Raw10s,
+        bucket_start_epoch_sec + 1,
+        bucket_end_epoch_sec,
+    )
+    .await?;
+    if raw_points.is_empty() {
+        return Ok(());
+    }
+
+    let point = RollupMetricsHistoryPoint {
+        timestamp_epoch_sec: bucket_end_epoch_sec,
+        counter_values: aggregate_counter_rollups(&raw_points),
+        gauge_values: aggregate_gauge_rollups(&raw_points),
+        job_status_values: aggregate_job_status_rollups(&raw_points),
+    };
+    upsert_rollup_point_tx(tx, MetricsHistoryTier::Rollup5m, point).await
+}
+
+async fn refresh_rollup_1h_bucket_tx(
+    tx: &mut SqlTx<'_>,
+    recorded_at_epoch_sec: i64,
+) -> Result<(), StateError> {
+    let bucket_end_epoch_sec = align_up_epoch(recorded_at_epoch_sec, ROLLUP_1H_RESOLUTION_SECS);
+    let bucket_start_epoch_sec = bucket_end_epoch_sec - ROLLUP_1H_RESOLUTION_SECS;
+    let rollup_points = load_rollup_points_between_tx(
+        tx,
+        MetricsHistoryTier::Rollup5m,
+        bucket_start_epoch_sec + 1,
+        bucket_end_epoch_sec,
+    )
+    .await?;
+    if rollup_points.is_empty() {
+        return Ok(());
+    }
+
+    let point = RollupMetricsHistoryPoint {
+        timestamp_epoch_sec: bucket_end_epoch_sec,
+        counter_values: aggregate_counter_rollups_from_rollups(&rollup_points),
+        gauge_values: aggregate_gauge_rollups_from_rollups(&rollup_points),
+        job_status_values: aggregate_job_rollups_from_rollups(&rollup_points),
+    };
+    upsert_rollup_point_tx(tx, MetricsHistoryTier::Rollup1h, point).await
+}
+
+async fn prune_metrics_history_tx(
+    tx: &mut SqlTx<'_>,
+    tier: MetricsHistoryTier,
+    now_epoch_sec: i64,
+) -> Result<(), StateError> {
+    let cutoff_epoch_sec = now_epoch_sec - tier.retention_sec();
+    let boundary_chunk_start = chunk_start_for_timestamp(cutoff_epoch_sec, tier);
+
+    tx.execute(
+        "DELETE FROM metrics_history_chunks
+         WHERE resolution_sec = {}
+           AND chunk_start_epoch_sec < {}",
+        &[
+            SqlArg::I64(tier.resolution_sec()),
+            SqlArg::I64(boundary_chunk_start),
+        ],
+    )
+    .await?;
+
+    match tier {
+        MetricsHistoryTier::Raw10s => {
+            let mut chunk = load_raw_chunk_tx(tx, tier, boundary_chunk_start).await?;
+            chunk
+                .points
+                .retain(|point| point.timestamp_epoch_sec >= cutoff_epoch_sec);
+            if chunk.points.is_empty() {
+                delete_chunk_tx(tx, tier, boundary_chunk_start).await?;
+            } else {
+                store_chunk_tx(tx, tier, boundary_chunk_start, &chunk).await?;
+            }
+        }
+        MetricsHistoryTier::Rollup5m | MetricsHistoryTier::Rollup1h => {
+            let mut chunk = load_rollup_chunk_tx(tx, tier, boundary_chunk_start).await?;
+            chunk
+                .points
+                .retain(|point| point.timestamp_epoch_sec >= cutoff_epoch_sec);
+            if chunk.points.is_empty() {
+                delete_chunk_tx(tx, tier, boundary_chunk_start).await?;
+            } else {
+                store_chunk_tx(tx, tier, boundary_chunk_start, &chunk).await?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn load_raw_points_between(
+    datastore: &StoreDatastore,
+    tier: MetricsHistoryTier,
+    since_epoch_sec: i64,
+    until_epoch_sec: i64,
+) -> Result<Vec<RawMetricsHistoryPoint>, StateError> {
+    let rows = select_chunk_rows_between(datastore, tier, since_epoch_sec, until_epoch_sec).await?;
+    let mut points = Vec::new();
+    for row in rows {
+        let chunk: RawMetricsHistoryChunk = deserialize_chunk(&row.body_zstd)?;
+        points.extend(chunk.points.into_iter().filter(|point| {
+            point.timestamp_epoch_sec >= since_epoch_sec
+                && point.timestamp_epoch_sec <= until_epoch_sec
+        }));
+    }
+    points.sort_by_key(|point| point.timestamp_epoch_sec);
+    Ok(points)
+}
+
+async fn load_raw_points_between_tx(
+    tx: &mut SqlTx<'_>,
+    tier: MetricsHistoryTier,
+    since_epoch_sec: i64,
+    until_epoch_sec: i64,
+) -> Result<Vec<RawMetricsHistoryPoint>, StateError> {
+    let rows = select_chunk_rows_between_tx(tx, tier, since_epoch_sec, until_epoch_sec).await?;
+    let mut points = Vec::new();
+    for row in rows {
+        let chunk: RawMetricsHistoryChunk = deserialize_chunk(&row.body_zstd)?;
+        points.extend(chunk.points.into_iter().filter(|point| {
+            point.timestamp_epoch_sec >= since_epoch_sec
+                && point.timestamp_epoch_sec <= until_epoch_sec
+        }));
+    }
+    points.sort_by_key(|point| point.timestamp_epoch_sec);
+    Ok(points)
+}
+
+async fn load_rollup_points_between(
+    datastore: &StoreDatastore,
+    tier: MetricsHistoryTier,
+    since_epoch_sec: i64,
+    until_epoch_sec: i64,
+) -> Result<Vec<RollupMetricsHistoryPoint>, StateError> {
+    let rows = select_chunk_rows_between(datastore, tier, since_epoch_sec, until_epoch_sec).await?;
+    let mut points = Vec::new();
+    for row in rows {
+        let chunk: RollupMetricsHistoryChunk = deserialize_chunk(&row.body_zstd)?;
+        points.extend(chunk.points.into_iter().filter(|point| {
+            point.timestamp_epoch_sec >= since_epoch_sec
+                && point.timestamp_epoch_sec <= until_epoch_sec
+        }));
+    }
+    points.sort_by_key(|point| point.timestamp_epoch_sec);
+    Ok(points)
+}
+
+async fn load_rollup_points_between_tx(
+    tx: &mut SqlTx<'_>,
+    tier: MetricsHistoryTier,
+    since_epoch_sec: i64,
+    until_epoch_sec: i64,
+) -> Result<Vec<RollupMetricsHistoryPoint>, StateError> {
+    let rows = select_chunk_rows_between_tx(tx, tier, since_epoch_sec, until_epoch_sec).await?;
+    let mut points = Vec::new();
+    for row in rows {
+        let chunk: RollupMetricsHistoryChunk = deserialize_chunk(&row.body_zstd)?;
+        points.extend(chunk.points.into_iter().filter(|point| {
+            point.timestamp_epoch_sec >= since_epoch_sec
+                && point.timestamp_epoch_sec <= until_epoch_sec
+        }));
+    }
+    points.sort_by_key(|point| point.timestamp_epoch_sec);
+    Ok(points)
+}
+
+fn metrics_chunk_row_from_row(row: SqlRow) -> Result<MetricsHistoryChunkRow, StateError> {
+    Ok(MetricsHistoryChunkRow {
+        resolution_sec: row.i64("resolution_sec")?,
+        chunk_start_epoch_sec: row.i64("chunk_start_epoch_sec")?,
+        body_zstd: row.bytes("body_zstd")?,
+    })
+}
+
+fn aggregate_counter_rollups(
+    points: &[RawMetricsHistoryPoint],
+) -> [CounterRollupValue; NUM_COUNTER_METRICS] {
+    std::array::from_fn(|index| aggregate_single_counter_rollup(points, index))
+}
+
+fn aggregate_single_counter_rollup(
+    points: &[RawMetricsHistoryPoint],
+    index: usize,
+) -> CounterRollupValue {
+    let end = points
+        .last()
+        .map(|point| point.counter_values[index])
+        .unwrap_or_default();
+    let avg_rate = if points.len() >= 2 {
+        let first = &points[0];
+        let last = &points[points.len() - 1];
+        let elapsed = (last.timestamp_epoch_sec - first.timestamp_epoch_sec) as f64;
+        if elapsed > 0.0 {
+            ((last.counter_values[index] - first.counter_values[index]).max(0.0)) / elapsed
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+
+    let mut peak_rate = 0.0_f64;
+    for window in points.windows(2) {
+        let previous = &window[0];
+        let current = &window[1];
+        let elapsed = (current.timestamp_epoch_sec - previous.timestamp_epoch_sec) as f64;
+        if elapsed <= 0.0 {
+            continue;
+        }
+        let delta = (current.counter_values[index] - previous.counter_values[index]).max(0.0);
+        peak_rate = peak_rate.max(delta / elapsed);
+    }
+
+    CounterRollupValue {
+        end,
+        avg_rate,
+        peak_rate,
+        avg_rate_weight_sec: if points.len() >= 2 {
+            let first = &points[0];
+            let last = &points[points.len() - 1];
+            (last.timestamp_epoch_sec - first.timestamp_epoch_sec).max(0) as f64
+        } else {
+            0.0
+        },
+    }
+}
+
+fn aggregate_gauge_rollups(
+    points: &[RawMetricsHistoryPoint],
+) -> [GaugeRollupValue; NUM_GAUGE_METRICS] {
+    std::array::from_fn(|index| {
+        let values = points.iter().map(|point| point.gauge_values[index]);
+        aggregate_gauge_rollup_values(values)
+    })
+}
+
+fn aggregate_job_status_rollups(
+    points: &[RawMetricsHistoryPoint],
+) -> [GaugeRollupValue; NUM_JOB_STATUS_METRICS] {
+    std::array::from_fn(|index| {
+        let values = points.iter().map(|point| point.job_status_values[index]);
+        aggregate_gauge_rollup_values(values)
+    })
+}
+
+fn aggregate_counter_rollups_from_rollups(
+    points: &[RollupMetricsHistoryPoint],
+) -> [CounterRollupValue; NUM_COUNTER_METRICS] {
+    std::array::from_fn(|index| {
+        let avg_rate_weight_sec: f64 = points
+            .iter()
+            .map(|point| point.counter_values[index].avg_rate_weight_sec)
+            .sum();
+        CounterRollupValue {
+            end: points
+                .last()
+                .map(|point| point.counter_values[index].end)
+                .unwrap_or_default(),
+            avg_rate: weighted_mean(points.iter().map(|point| {
+                (
+                    point.counter_values[index].avg_rate,
+                    point.counter_values[index].avg_rate_weight_sec,
+                )
+            })),
+            peak_rate: points
+                .iter()
+                .map(|point| point.counter_values[index].peak_rate)
+                .fold(0.0, f64::max),
+            avg_rate_weight_sec,
+        }
+    })
+}
+
+fn aggregate_gauge_rollups_from_rollups(
+    points: &[RollupMetricsHistoryPoint],
+) -> [GaugeRollupValue; NUM_GAUGE_METRICS] {
+    std::array::from_fn(|index| {
+        let sample_count: u32 = points
+            .iter()
+            .map(|point| point.gauge_values[index].sample_count)
+            .sum();
+        GaugeRollupValue {
+            avg: weighted_mean(points.iter().map(|point| {
+                (
+                    point.gauge_values[index].avg,
+                    point.gauge_values[index].sample_count as f64,
+                )
+            })),
+            peak: points
+                .iter()
+                .map(|point| point.gauge_values[index].peak)
+                .fold(0.0, f64::max),
+            sample_count,
+        }
+    })
+}
+
+fn aggregate_job_rollups_from_rollups(
+    points: &[RollupMetricsHistoryPoint],
+) -> [GaugeRollupValue; NUM_JOB_STATUS_METRICS] {
+    std::array::from_fn(|index| {
+        let sample_count: u32 = points
+            .iter()
+            .map(|point| point.job_status_values[index].sample_count)
+            .sum();
+        GaugeRollupValue {
+            avg: weighted_mean(points.iter().map(|point| {
+                (
+                    point.job_status_values[index].avg,
+                    point.job_status_values[index].sample_count as f64,
+                )
+            })),
+            peak: points
+                .iter()
+                .map(|point| point.job_status_values[index].peak)
+                .fold(0.0, f64::max),
+            sample_count,
+        }
+    })
+}
+
+fn aggregate_gauge_rollup_values(values: impl Iterator<Item = f64>) -> GaugeRollupValue {
+    let mut total = 0.0;
+    let mut count = 0_u64;
+    let mut peak = 0.0_f64;
+    for value in values {
+        total += value;
+        count += 1;
+        peak = peak.max(value);
+    }
+
+    GaugeRollupValue {
+        avg: if count == 0 {
+            0.0
+        } else {
+            total / count as f64
+        },
+        peak,
+        sample_count: count as u32,
+    }
+}
+
+fn weighted_mean(values: impl Iterator<Item = (f64, f64)>) -> f64 {
+    let mut weighted_total = 0.0;
+    let mut total_weight = 0.0;
+    for (value, weight) in values {
+        if weight <= 0.0 {
+            continue;
+        }
+        weighted_total += value * weight;
+        total_weight += weight;
+    }
+    if total_weight == 0.0 {
+        0.0
+    } else {
+        weighted_total / total_weight
+    }
+}
+
+// Which parts of the metrics history a sample writes besides its raw point.
+//
+// A rollup bucket is aggregated once, when the samples have moved past it,
+// and each tier is pruned at most once per its own resolution, so a steady
+// stream of raw samples costs one small write each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MetricsHistoryWritePlan {
+    // A timestamp inside the 5-minute bucket to aggregate, if one closed.
+    pub rollup_5m_bucket: Option<i64>,
+    // A timestamp inside the 1-hour bucket to aggregate, if one closed.
+    pub rollup_1h_bucket: Option<i64>,
+    pub prune_raw: bool,
+    pub prune_5m: bool,
+    pub prune_1h: bool,
+}
+
+impl MetricsHistoryWritePlan {
+    // Refresh the buckets holding `recorded_at_epoch_sec` and prune every
+    // tier: what a one-off sample with no history of its own needs.
+    pub fn eager(recorded_at_epoch_sec: i64) -> Self {
+        let recorded_at_epoch_sec = quantize_raw_timestamp(recorded_at_epoch_sec);
+        Self {
+            rollup_5m_bucket: Some(recorded_at_epoch_sec),
+            rollup_1h_bucket: Some(recorded_at_epoch_sec),
+            prune_raw: true,
+            prune_5m: true,
+            prune_1h: true,
+        }
+    }
+}
+
+const RAW_PRUNE_EVERY_SECS: i64 = ROLLUP_5M_RESOLUTION_SECS;
+const ROLLUP_5M_PRUNE_EVERY_SECS: i64 = ROLLUP_1H_RESOLUTION_SECS;
+const ROLLUP_1H_PRUNE_EVERY_SECS: i64 = 24 * 60 * 60;
+
+// The sampler's memory of what it has already written, so each sample only
+// writes what is due.
+#[derive(Debug, Clone, Default)]
+pub struct MetricsHistoryCadence {
+    last_sample_epoch_sec: Option<i64>,
+    last_prune_raw: Option<i64>,
+    last_prune_5m: Option<i64>,
+    last_prune_1h: Option<i64>,
+    // The values of the last written sample, timestamp zeroed.
+    last_written: Option<RawMetricsHistoryPoint>,
+}
+
+impl MetricsHistoryCadence {
+    // A sample's values with the timestamp zeroed, for comparing samples.
+    pub fn sample_values(
+        snapshot: &MetricsSnapshot,
+        jobs: &JobStatusCounts,
+    ) -> RawMetricsHistoryPoint {
+        RawMetricsHistoryPoint::from_snapshot(0, snapshot, jobs)
+    }
+
+    // Whether writing `values` under `plan` would only repeat the last
+    // written sample: the values are unchanged and no roll-up closes and no
+    // prune falls due with it. Every roll-up bucket still gets the sample
+    // that opens it, so an idle daemon writes once per bucket, not per tick.
+    pub fn repeats_last_write(
+        &self,
+        plan: &MetricsHistoryWritePlan,
+        values: &RawMetricsHistoryPoint,
+    ) -> bool {
+        plan.rollup_5m_bucket.is_none()
+            && plan.rollup_1h_bucket.is_none()
+            && !plan.prune_raw
+            && !plan.prune_5m
+            && !plan.prune_1h
+            && self.last_written.as_ref() == Some(values)
+    }
+
+    // [`Self::commit`], remembering the written values for
+    // [`Self::repeats_last_write`].
+    pub fn commit_written(
+        &mut self,
+        recorded_at_epoch_sec: i64,
+        plan: &MetricsHistoryWritePlan,
+        values: RawMetricsHistoryPoint,
+    ) {
+        self.commit(recorded_at_epoch_sec, plan);
+        self.last_written = Some(values);
+    }
+
+    // What the sample taken at `recorded_at_epoch_sec` should write.
+    //
+    // The first sample closes the buckets just before its own, so a bucket
+    // left open when the process last stopped is still aggregated.
+    pub fn plan(&self, recorded_at_epoch_sec: i64) -> MetricsHistoryWritePlan {
+        let now = quantize_raw_timestamp(recorded_at_epoch_sec);
+        let closed = |resolution: i64| {
+            let current = align_up_epoch(now, resolution);
+            match self.last_sample_epoch_sec {
+                None => Some(current - resolution),
+                Some(previous) => {
+                    let previous_bucket = align_up_epoch(previous, resolution);
+                    (previous_bucket < current).then_some(previous_bucket)
+                }
+            }
+        };
+        let due = |last: Option<i64>, every: i64| last.is_none_or(|last| now - last >= every);
+        MetricsHistoryWritePlan {
+            rollup_5m_bucket: closed(ROLLUP_5M_RESOLUTION_SECS),
+            rollup_1h_bucket: closed(ROLLUP_1H_RESOLUTION_SECS),
+            prune_raw: due(self.last_prune_raw, RAW_PRUNE_EVERY_SECS),
+            prune_5m: due(self.last_prune_5m, ROLLUP_5M_PRUNE_EVERY_SECS),
+            prune_1h: due(self.last_prune_1h, ROLLUP_1H_PRUNE_EVERY_SECS),
+        }
+    }
+
+    // Record that the sample planned at `recorded_at_epoch_sec` was written.
+    // A failed write is not committed, so its work is planned again.
+    pub fn commit(&mut self, recorded_at_epoch_sec: i64, plan: &MetricsHistoryWritePlan) {
+        let now = quantize_raw_timestamp(recorded_at_epoch_sec);
+        self.last_sample_epoch_sec = Some(now);
+        if plan.prune_raw {
+            self.last_prune_raw = Some(now);
+        }
+        if plan.prune_5m {
+            self.last_prune_5m = Some(now);
+        }
+        if plan.prune_1h {
+            self.last_prune_1h = Some(now);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

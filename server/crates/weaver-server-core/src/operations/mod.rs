@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 pub use weaver_server_pipeline::operations::*;
+pub mod async_ops;
 pub mod backup;
 pub use backup::{
     BackupArtifact, BackupInspectResult, BackupManifest, BackupService, BackupServiceError,
@@ -9,6 +10,8 @@ pub use backup::{
     RestoreOptions, RestoreReport, StableStateExport, apply_pending_restore,
 };
 pub mod health;
+pub mod metrics_store;
+pub use metrics_store::{MetricsHistoryCadence, MetricsHistoryWritePlan};
 pub mod maintenance;
 pub use maintenance::spawn_maintenance_worker;
 pub mod logs;

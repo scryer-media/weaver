@@ -6950,6 +6950,7 @@ dependencies = [
  "hex",
  "http",
  "pbkdf2",
+ "rmp-serde",
  "semver",
  "serde",
  "serde_json",
