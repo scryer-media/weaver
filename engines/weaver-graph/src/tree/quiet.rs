@@ -5,8 +5,9 @@
 // will come. Each data object hears the lost ranges of its volumes that
 // nothing vouched for, then that the job is quiet, and rules for itself on
 // what the tree records of it. The tree tells and reads; it chooses no
-// reason. A recovery object heard its losses when they were marked, and
-// the root came out of no object, so neither is told.
+// reason. A recovery object heard its losses when they were marked, so it
+// hears only that the job is quiet, once its ruling is in; the root came
+// out of no object, and is told neither.
 
 use super::{Builder, Effect, NodeId, Tree};
 use crate::member::MemberId;
@@ -45,7 +46,7 @@ impl Tree {
     // records of it, and rules: what it says is applied as if it said it in
     // `deliver`.
     pub fn quiet(&mut self, node: NodeId, builder: &mut dyn Builder, effects: &mut Vec<Effect>) {
-        if !self.told_when_quiet(node) {
+        if !self.live_bound(node) {
             return;
         }
         let Some(mut object) = self.take_object(node) else {
@@ -93,10 +94,14 @@ impl Tree {
     // A live data object: bound in a namespace, standing, and no recovery
     // object.
     fn told_when_quiet(&self, node: NodeId) -> bool {
+        self.live_bound(node) && !self.recovers(node)
+    }
+
+    // A live object: bound in a namespace and standing.
+    fn live_bound(&self, node: NodeId) -> bool {
         self.nodes
             .get(&node)
             .is_some_and(|found| !found.retired && found.binding.is_some())
-            && !self.recovers(node)
     }
 
     // The ranges of the node's volumes held as damage, an article that never

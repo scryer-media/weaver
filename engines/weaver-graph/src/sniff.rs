@@ -802,6 +802,15 @@ pub fn names_claimable(name: &str) -> bool {
     names_recovery(name) || split_piece(name).is_some()
 }
 
+// Whether a posted name says nothing of what its member is: no kind an
+// object is founded for by name, no recovery volume or piece, no type
+// people open. An obfuscated name, a hash, says nothing.
+pub(crate) fn names_nothing(name: &str) -> bool {
+    named(name, numbered_piece(name)).is_none()
+        && !names_claimable(name)
+        && !crate::known::known_type(name)
+}
+
 // What a file of a listing is, by the names beside it: a container volume
 // founds or joins a set, recovery data and SFVs go with one, and anything
 // else is a plain file.

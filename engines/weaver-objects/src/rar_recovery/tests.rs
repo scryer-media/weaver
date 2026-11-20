@@ -1409,23 +1409,29 @@ fn a_rar3_footer_counts_the_volumes_of_a_set_that_covers_one() {
 }
 
 // A set kept before the sets passed over were kept restores as passing over
-// none: its encoding is the same array without the last field.
+// none, and one kept before an unnamed RAR3 volume was told apart restores
+// as named and proving nothing: its encoding is the same array without the
+// last fields.
 #[test]
 fn a_set_kept_without_the_sets_passed_over_restores_passing_over_none() {
     let fresh = rmp_serde::to_vec(&RarRecovery::new(OWN)).unwrap();
     let fields = fresh[0] & 0x0f;
     assert_eq!(fresh[0] & 0xf0, 0x90, "a fixed array of fields");
     assert_eq!(
-        fresh.last(),
-        Some(&0x80),
-        "the empty map of sets passed over"
+        &fresh[fresh.len() - 3..],
+        &[0x80, 0xc2, 0xc0],
+        "the empty map of sets passed over, named, proving no set"
     );
-    let mut kept = vec![0x90 | (fields - 1)];
-    kept.extend_from_slice(&fresh[1..fresh.len() - 1]);
+    for dropped in [2u8, 3] {
+        let mut kept = vec![0x90 | (fields - dropped)];
+        kept.extend_from_slice(&fresh[1..fresh.len() - dropped as usize]);
 
-    let restored: RarRecovery = rmp_serde::from_slice(&kept).unwrap();
-    assert!(restored.passed.is_empty());
-    assert_eq!(restored.id, OWN);
+        let restored: RarRecovery = rmp_serde::from_slice(&kept).unwrap();
+        assert!(restored.passed.is_empty());
+        assert!(!restored.unnamed);
+        assert_eq!(restored.proven, None);
+        assert_eq!(restored.id, OWN);
+    }
 
     let mut passing = RarRecovery::new(OWN);
     passing

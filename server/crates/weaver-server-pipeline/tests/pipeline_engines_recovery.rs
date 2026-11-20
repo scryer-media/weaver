@@ -5,7 +5,9 @@ pub use weaver_server_pipeline::{history, jobs};
 
 mod pipeline {
     mod tests {
-        use weaver_server_pipeline::pipeline::tests::{direct_store, rar5_fixture_bytes};
+        use weaver_server_pipeline::pipeline::tests::{
+            direct_store, rar5_fixture_bytes, single_member_rar4_old_numbering_set_ending,
+        };
         mod engines {
             use weaver_server_pipeline::pipeline::tests::engines::{
                 depth, harness, rar_fixtures as rar, rar_fixtures as rar_rev, recovery_fixtures,
@@ -24,6 +26,7 @@ mod pipeline {
             mod recovery_by_bytes;
             mod reposted;
             mod seek;
+            mod unnamed_rar3_revs;
         }
     }
 }

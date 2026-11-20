@@ -1131,10 +1131,27 @@ impl Namespace {
     }
 
     // What the member's front alone says of its being recovery data, `None`
-    // while it says nothing (`sniff::recovery_by_front`).
+    // while it says nothing (`sniff::recovery_by_front`). A RAR3 recovery
+    // volume's front signs nothing, so under RAR's `.rev` it says nothing,
+    // unless the RAR recovery object that held the member refuted it by the
+    // footer it ends on (`RarRecovery::deliver`): then a front that signs
+    // nothing is no recovery data, as under any other name.
     pub fn recovery_by_front(&self, member: MemberId) -> Option<bool> {
         let record = self.get(member)?;
-        crate::sniff::recovery_by_front(&record.name, self.first_bytes(member), record.length)
+        let front = self.first_bytes(member);
+        let said = crate::sniff::recovery_by_front(&record.name, front, record.length);
+        match said {
+            None if record.refuted == Some(crate::object::Kind::RarRecovery)
+                && !front.is_empty()
+                && matches!(
+                    crate::sniff::signed(front, record.length),
+                    crate::sniff::Sniff::Leaf
+                ) =>
+            {
+                Some(false)
+            }
+            said => said,
+        }
     }
 
     // Keep the part of a delivered range that lies in the member's first

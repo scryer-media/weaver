@@ -26,6 +26,12 @@ use crate::object::{
 use crate::recovery::Recovery;
 use crate::seek::{Pull, Seek, SeekUp, When};
 use crate::sniff::{Sniff, VERDICT_BYTES, signed};
+
+// A RAR 1.5 to 4.x volume's signature, and the footer every RAR3 recovery
+// volume ends on: what the tree tells such a volume posted under no name by
+// (`Tree::unnamed_rar3_rev`).
+const RAR4_SIGN: &[u8] = b"Rar!\x1a\x07\x00";
+const RAR3_FOOTER: u64 = 7;
 use crate::volume::{ByteRange, VolumeIndex};
 
 mod bound_kinds;
@@ -3256,6 +3262,9 @@ impl Tree {
         if self.offer(node, member, Clean::start(prefix), &siblings, None, effects) {
             return;
         }
+        let rev = self
+            .unnamed_rar3_rev(node, member)
+            .is_some_and(|width| siblings.iter().any(|set| self.rar4_wide(node, *set, width)));
         let Some(mut members) = self.nodes.members_mut(node) else {
             return;
         };
@@ -3270,6 +3279,21 @@ impl Tree {
         };
         match said {
             Sniff::Pending => {}
+            // A leaf as wide as a RAR 1.5 to 4.x set's volumes, its name and
+            // front saying nothing, may be the set's RAR3 recovery volume
+            // posted under no name: a recovery object holds it until the
+            // set's rebuild proves it or the job goes quiet without.
+            Sniff::Leaf if rev => {
+                let kind = Kind::RarRecovery;
+                self.found(
+                    node,
+                    member,
+                    kind,
+                    (&name, prefix, length),
+                    builder,
+                    effects,
+                );
+            }
             Sniff::Leaf => {
                 members.decide(member);
             }
@@ -3345,12 +3369,98 @@ impl Tree {
                 if matches!(signed(prefix, length), Sniff::Object(_)) {
                     self.take_claimed(node, child, effects);
                 }
+                if matches!(kind, Kind::RarStore | Kind::RarEngine)
+                    && prefix.starts_with(RAR4_SIGN)
+                    && let Some(width) = length
+                {
+                    self.found_unnamed_rar3_revs(node, width, builder, effects);
+                }
                 true
             }
             Ok(None) => false,
             Err(why) => {
                 effects.push(Effect::Refused { node, member, why });
                 false
+            }
+        }
+    }
+
+    // How wide `member` is when it may be a RAR3 recovery volume posted
+    // under no name: a member of known length past a footer's, its name
+    // saying nothing (`sniff::names_nothing`), its front signing nothing,
+    // never refuted as one, and not a member the rule never opens. RAR
+    // writes each data volume but a set's last as wide as its recovery
+    // volumes, so only a member as wide as some such set's volume is one
+    // (`rar4_wide`); the recovery object it founds binds and proves the set.
+    fn unnamed_rar3_rev(&self, node: NodeId, member: MemberId) -> Option<u64> {
+        let namespace = self.namespace(node)?;
+        let record = namespace.get(member)?;
+        let length = record.length.filter(|length| *length > RAR3_FOOTER)?;
+        let says_nothing = record.refuted != Some(Kind::RarRecovery)
+            && crate::sniff::names_nothing(&record.name)
+            && (*self.never_open)(&record.name) == Some(false);
+        let front = namespace.first_bytes(member);
+        (says_nothing && !front.is_empty() && matches!(signed(front, record.length), Sniff::Leaf))
+            .then_some(length)
+    }
+
+    // Whether the object at `set` is a RAR store of 1.5 to 4.x volumes one
+    // of which is `width` wide, by the first two volumes it holds: one of
+    // any two is not the set's last, and so is as wide as its recovery
+    // volumes. Two lookups, whatever the set's size.
+    fn rar4_wide(&self, node: NodeId, set: NodeId, width: u64) -> bool {
+        let (Some(Kind::RarStore | Kind::RarEngine), Some((_, volumes)), Some(namespace)) =
+            (self.kind(set), self.volumes(set), self.namespace(node))
+        else {
+            return false;
+        };
+        volumes.values().take(2).any(|volume| {
+            namespace.first_bytes(*volume).starts_with(RAR4_SIGN)
+                && namespace
+                    .get(*volume)
+                    .is_some_and(|record| record.length == Some(width))
+        })
+    }
+
+    // A RAR 1.5 to 4.x set founded by a volume `width` wide: each member no
+    // object owns that may be its RAR3 recovery volume posted under no name,
+    // decided a leaf before the set's first volume said what it is, founds
+    // the recovery object as it would have had it come after. One walk of
+    // the namespace per set founded, as `offer_unowned`'s.
+    fn found_unnamed_rar3_revs(
+        &mut self,
+        node: NodeId,
+        width: u64,
+        builder: &mut dyn Builder,
+        effects: &mut Vec<Effect>,
+    ) {
+        let revs: Vec<(MemberId, String, Vec<u8>, Option<u64>)> = self
+            .namespace(node)
+            .map(|namespace| {
+                namespace
+                    .members()
+                    .filter(|record| {
+                        self.unowned(node, record.id)
+                            && self.unnamed_rar3_rev(node, record.id) == Some(width)
+                    })
+                    .map(|record| {
+                        let front = namespace.first_bytes(record.id).to_vec();
+                        (record.id, record.name.clone(), front, record.length)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (member, name, front, length) in revs {
+            if self.unowned(node, member) {
+                let kind = Kind::RarRecovery;
+                self.found_one(
+                    node,
+                    member,
+                    kind,
+                    (&name, &front, length),
+                    builder,
+                    effects,
+                );
             }
         }
     }
