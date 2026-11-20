@@ -23,7 +23,7 @@ import { categoryColor, UNCATEGORISED_COLOR, WV } from "../data/palette";
 import { UNTAGGED } from "../data/tags";
 import { jobIds } from "../testids";
 import { useNow } from "../data/clock";
-import { formatClock, formatDayClock, formatLatency, splitUptime } from "../data/format";
+import { formatClock, formatDayClock, formatLatency, formatRate, splitUptime } from "../data/format";
 import { providerActivityLabel, type ProviderActivity } from "../data/provider-activity";
 import { countLabel, providerStateLabel } from "../i18n/labels";
 
@@ -195,7 +195,7 @@ export function useAttentionItems(): AttentionItem[] {
 }
 
 function attentionItems(
-  { providers, holdoffs, downloadBlock, isPaused }: NextData,
+  { providers, holdoffs, downloadBlock, diskVolumes, isPaused }: NextData,
   t: Translate,
   now: number,
 ): AttentionItem[] {
@@ -260,6 +260,20 @@ function attentionItems(
                 : formatClock(downloadBlock.windowEndsAtEpochMs),
           })
         : t("next.monitoring.egressLink"),
+      color: WV.warn,
+    });
+  }
+
+  // One row per volume the daemon finds slow; each goes when its vote clears.
+  for (const volume of diskVolumes) {
+    if (!volume.slow) continue;
+    items.push({
+      id: `slow-disk:${volume.label}`,
+      text:
+        volume.writeRateBytesPerSec > 0
+          ? t("next.attention.slowDisk", { rate: formatRate(volume.writeRateBytesPerSec) })
+          : t("next.attention.slowDiskUnmeasured"),
+      meta: volume.label,
       color: WV.warn,
     });
   }

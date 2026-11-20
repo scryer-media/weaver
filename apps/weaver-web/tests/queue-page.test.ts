@@ -9,6 +9,7 @@ import {
   batchTarget,
   conflictCount,
   departedId,
+  diskPace,
   etaById,
   groupCounts,
   queuePageInput,
@@ -79,6 +80,52 @@ test("time left follows each row's bytes through it, and nothing without speed",
     [3, "3s"],
   ]);
   assert.equal(etaById(through, 0, format).size, 0);
+});
+
+test("a row a slow disk holds back runs at the disk's rate, with what waits for it", () => {
+  const through = [
+    { id: 7, bytesThrough: 100 },
+    { id: 3, bytesThrough: 300 },
+    { id: 9, bytesThrough: 500 },
+  ];
+  const format = (bytes: number, speed: number) => `${bytes / speed}s`;
+  const nas = { volume: "/mnt/nas", slow: true };
+  const volumes = [
+    { label: "/mnt/nas", writeRateBytesPerSec: 50, waitingBytes: 400 },
+    { label: "/mnt/usb", writeRateBytesPerSec: 25, waitingBytes: 0 },
+    { label: "/", writeRateBytesPerSec: 5, waitingBytes: 900 },
+  ];
+  const rows = [
+    { id: 7, diskWrite: nas, status: "DOWNLOADING" },
+    { id: 3, diskWrite: null, status: "QUEUED" },
+    { id: 9, diskWrite: nas, status: "PAUSED" },
+    // A slow disk the page's paused row alone writes to still sets the slowest rate.
+    { id: 4, diskWrite: { volume: "/mnt/usb", slow: true }, status: "PAUSED" },
+    // Done fetching on a disk that is not slow: no pace of its own.
+    { id: 5, diskWrite: { volume: "/", slow: false }, status: "DOWNLOADING" },
+    // A disk the live list does not carry yet: no pace.
+    { id: 6, diskWrite: { volume: "/mnt/new", slow: true }, status: "DOWNLOADING" },
+  ];
+  const pace = diskPace(rows, volumes);
+  assert.deepEqual([...pace.byId], [[7, { rate: 50, waiting: 400 }]]);
+  assert.equal(pace.slowest, 25);
+  // While something downloads, the other rows keep the download speed.
+  assert.deepEqual([...etaById(through, 100, format, pace)], [
+    [7, "10s"],
+    [3, "3s"],
+    [9, "5s"],
+  ]);
+  // With the speed at nothing, the estimate is never blank: the slowest disk sets it.
+  assert.deepEqual([...etaById(through, 0, format, pace)], [
+    [7, "10s"],
+    [3, "12s"],
+    [9, "20s"],
+  ]);
+  // No slow volume: the plain estimates, the very same as without a pace.
+  const none = diskPace(rows.map((row) => ({ ...row, diskWrite: null })), volumes);
+  assert.deepEqual([...etaById(through, 100, format, none)], [...etaById(through, 100, format)]);
+  assert.equal(diskPace(rows, []), none);
+  assert.equal(etaById(through, 0, format, none).size, 0);
 });
 
 test("section headers count the whole queue by section", () => {

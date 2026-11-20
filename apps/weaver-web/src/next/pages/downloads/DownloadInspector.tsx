@@ -106,7 +106,7 @@ export function DownloadInspector({
   const [stopState, cancelPostProcessing] = useMutation(CANCEL_JOB_POST_PROCESSING_MUTATION);
   const [forceState, setTorrentForced] = useMutation(SET_TORRENT_FORCED_MUTATION);
   const [removingTorrent, setRemovingTorrent] = useState(false);
-  const { categories, queue } = useNextData("categories", "queue");
+  const { categories, queue, diskVolumes } = useNextData("categories", "queue", "diskVolumes");
   // What was just picked, shown until the queue carries it back; the daemon's
   // answer can take a refresh to arrive, and a select that snaps back to the
   // old value in the meantime reads as a refusal.
@@ -176,6 +176,7 @@ export function DownloadInspector({
     job,
     progress.bars.find((bar) => bar.phase === progress.status) ?? progress.bars.at(-1) ?? null,
     progress.status,
+    diskVolumes,
   );
   const isPaused = token === "paused";
   const stateKey = torrentStateLabelKey(torrent?.state);

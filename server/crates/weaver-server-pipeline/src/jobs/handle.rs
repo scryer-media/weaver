@@ -33,6 +33,9 @@ pub struct SharedPipelineState {
     // for, held or not, for every owner of queue items to look again at what
     // it keeps from running.
     starts: tokio::sync::watch::Sender<u64>,
+    // Moves when which job waits on which disk changes, and only then: the
+    // disk figures move without it (`set_disk_limits`).
+    disk_rows: tokio::sync::watch::Sender<u64>,
     // How the global download limit is shared out, as last put in force.
     bandwidth_split: Arc<RwLock<crate::bandwidth::SplitState>>,
     metrics: Arc<PipelineMetrics>,
@@ -100,6 +103,7 @@ impl SharedPipelineState {
             classes,
             holds: tokio::sync::watch::channel(HoldSet::default()).0,
             starts: tokio::sync::watch::channel(0).0,
+            disk_rows: tokio::sync::watch::channel(0).0,
             bandwidth_split: Arc::new(RwLock::new(crate::bandwidth::SplitState::default())),
             metrics,
             download_block: Arc::new(RwLock::new(DownloadBlockState::default())),
@@ -386,13 +390,95 @@ impl SharedPipelineState {
 
     pub fn download_block(&self) -> DownloadBlockState {
         let mut state = self.download_block.read().unwrap().clone();
-        state.schedule_hold_reason = self
-            .queue
-            .read(|inner| inner.globals.schedule_hold_reason.clone());
+        let disk_limits;
+        (state.schedule_hold_reason, disk_limits) = self.queue.read(|inner| {
+            (
+                inner.globals.schedule_hold_reason.clone(),
+                Arc::clone(&inner.globals.disk_limits),
+            )
+        });
         if state.schedule_hold_reason.is_some() && state.kind == DownloadBlockKind::None {
             state.kind = DownloadBlockKind::Scheduled;
         }
+        state.disk_volumes = disk_limits.volume_states();
         state
+    }
+
+    // What the disk vote and the job disks last said: the slow volumes,
+    // and the jobs held on one or still writing with nothing left to
+    // fetch, with the volumes' figures as published. One read of the
+    // queue's shared state; a request reads it once and shares it.
+    pub fn disk_limits(&self) -> Arc<crate::pipeline::disk_vote::DiskLimits> {
+        self.queue
+            .read(|inner| Arc::clone(&inner.globals.disk_limits))
+    }
+
+    // Publish what the disk vote and the job disks say. The pipeline calls
+    // this only when it changed. It does not move the queue's revision, so
+    // no queue reader is woken for a figure: the figures reach clients
+    // through the metrics snapshot. When `rows` (which job waits on which
+    // disk) changed too, the disk rows signal moves.
+    pub(crate) fn set_disk_limits(
+        &self,
+        limits: Arc<crate::pipeline::disk_vote::DiskLimits>,
+        rows: bool,
+    ) {
+        self.queue.write(|inner| {
+            inner.globals.disk_limits = limits;
+            Change::unchanged(())
+        });
+        if rows {
+            self.disk_rows
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
+        }
+    }
+
+    // The revision of which job waits on which disk.
+    pub fn disk_rows_revision(&self) -> u64 {
+        *self.disk_rows.borrow()
+    }
+
+    // Wakes when which job waits on which disk changes.
+    pub fn subscribe_disk_rows(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.disk_rows.subscribe()
+    }
+
+    // Publish one volume as the pipeline would, with `held` jobs waiting
+    // on it while it is slow and `draining` jobs that have nothing left to
+    // fetch and writes still out: for the API's tests, which have no
+    // pipeline.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn mark_disk_for_test(
+        &self,
+        label: &str,
+        write_rate_bytes_per_sec: u64,
+        waiting_bytes: u64,
+        slow: bool,
+        held: &[JobId],
+        draining: &[JobId],
+    ) {
+        use crate::pipeline::disk_vote::{JobDiskView, disk_limits};
+        use weaver_server_disk::operations::disk::volume::Volume;
+        let volume = Arc::new(Volume::new(Some(1), label.into()));
+        volume
+            .write_rate
+            .store(write_rate_bytes_per_sec, Ordering::Relaxed);
+        volume.count_for_test(waiting_bytes);
+        volume.buffered_bytes.store(waiting_bytes, Ordering::SeqCst);
+        let slow_volumes = if slow { vec![Arc::clone(&volume)] } else { Vec::new() };
+        let views = held
+            .iter()
+            .map(|job_id| (*job_id, false))
+            .chain(draining.iter().map(|job_id| (*job_id, true)))
+            .map(|(job_id, fetched)| JobDiskView {
+                job_id,
+                volumes: vec![&volume],
+                fetched,
+                quiet: false,
+            });
+        let next = disk_limits(&slow_volumes, views);
+        let rows = !next.same_rows(&self.disk_limits());
+        self.set_disk_limits(Arc::new(next), rows);
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1336,6 +1422,17 @@ impl SchedulerHandle {
     // Wakes when the published job list changes.
     pub fn subscribe_job_changes(&self) -> tokio::sync::watch::Receiver<u64> {
         self.state.subscribe_job_changes()
+    }
+
+    // The revision of which job waits on which disk; the disk figures move
+    // without it.
+    pub fn disk_rows_revision(&self) -> u64 {
+        self.state.disk_rows_revision()
+    }
+
+    // Wakes when which job waits on which disk changes.
+    pub fn subscribe_disk_rows(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.state.subscribe_disk_rows()
     }
 
     // Download rate of every transferring job (reads from shared state, no

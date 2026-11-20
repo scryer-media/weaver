@@ -422,6 +422,55 @@ pub struct QueueItem {
     /// NZB material and credentials, which remain unavailable to GraphQL.
     #[serde(default)]
     pub duplicate_summary: Option<DuplicateSummaryInfo>,
+    /// The job's write to disk as a list read it, from the one read of the
+    /// disk state the list made for all its rows; None when no list did,
+    /// and `disk_write` then reads it for this row alone.
+    #[graphql(skip)]
+    #[serde(skip)]
+    pub disk_write: Option<Option<QueueDiskWrite>>,
+}
+
+/// A job's write to its destination disk, while the disk is slow or the
+/// job has nothing left to fetch and bytes still waiting in memory to be
+/// written. The disk's figures are on `downloadBlock.diskVolumes`, under the
+/// same label, so a figure change moves no queue row.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
+pub struct QueueDiskWrite {
+    /// The disk, by the label `downloadBlock.diskVolumes` gives it.
+    pub volume: String,
+    /// Whether the disk cannot keep up: downloads keep waiting on it.
+    pub slow: bool,
+    /// Whether the job has nothing left to fetch and bytes still waiting in
+    /// memory for the disk.
+    pub draining: bool,
+}
+
+impl QueueDiskWrite {
+    fn of(
+        limits: &weaver_server_core::pipeline::disk_vote::DiskLimits,
+        job_id: u64,
+    ) -> Option<Self> {
+        limits.job(JobId(job_id)).map(|write| Self {
+            volume: write.volume,
+            slow: write.slow,
+            draining: write.draining,
+        })
+    }
+}
+
+/// Give each row of a list its disk write from one read of the disk state,
+/// shared by every row. Nothing is read for an empty list.
+pub(crate) fn attach_disk_writes(
+    state: &weaver_server_core::SharedPipelineState,
+    items: &mut [QueueItem],
+) {
+    if items.is_empty() {
+        return;
+    }
+    let limits = state.disk_limits();
+    for item in items {
+        item.disk_write = Some(QueueDiskWrite::of(&limits, item.id));
+    }
 }
 
 #[async_graphql::ComplexObject]
@@ -435,6 +484,21 @@ impl QueueItem {
     /// The job's tags, in tag order.
     async fn tags(&self, ctx: &async_graphql::Context<'_>) -> async_graphql::Result<Vec<String>> {
         crate::tags::tags_of(ctx, self.id).await
+    }
+
+    /// The job's write to its destination disk while the disk is slow,
+    /// or while the job has nothing left to fetch and bytes still waiting
+    /// to be written; null otherwise. A list reads the disk state once for
+    /// all its rows.
+    async fn disk_write(
+        &self,
+        ctx: &async_graphql::Context<'_>,
+    ) -> async_graphql::Result<Option<QueueDiskWrite>> {
+        if let Some(attached) = &self.disk_write {
+            return Ok(attached.clone());
+        }
+        let state = ctx.data::<weaver_server_core::SharedPipelineState>()?;
+        Ok(QueueDiskWrite::of(&state.disk_limits(), self.id))
     }
 }
 
@@ -1721,6 +1785,7 @@ fn queue_item_from_display(
         created_at: ms_to_datetime(info.created_at_epoch_ms as i64),
         attention: attention_for_live_job(info, state),
         duplicate_summary: None,
+        disk_write: None,
     }
 }
 
@@ -1780,6 +1845,7 @@ pub fn queue_item_from_submission(
         created_at: ms_to_datetime(submitted.created_at_epoch_ms as i64),
         attention: None,
         duplicate_summary: None,
+        disk_write: None,
     }
 }
 

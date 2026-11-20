@@ -67,7 +67,7 @@ test("every proxy failure code but OTHER has a sentence here", () => {
 });
 
 test("every way a proxy test passes has a sentence here", () => {
-  const codes = [...body(source("server/crates/weaver-server-core/src/proxies/fault.rs"), "pub fn code(self)").matchAll(/=> "([A-Z][A-Z0-9_]*)"/g)]
+  const codes = [...body(source("server/crates/weaver-server-net/src/proxies/fault.rs"), "pub fn code(self)").matchAll(/=> "([A-Z][A-Z0-9_]*)"/g)]
     .map((match) => match[1]!)
     .sort();
   assert.ok(codes.includes("CONNECTED"), "the pass codes were not found where they are defined");

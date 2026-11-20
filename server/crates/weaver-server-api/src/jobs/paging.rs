@@ -629,6 +629,8 @@ pub(crate) struct PageWants {
     /// screen-wide counts every screen reads) asks for neither, and is then
     /// planned without listing, ordering or copying any row.
     pub(crate) rows: bool,
+    /// The rows' writes to disk, read once for the page.
+    pub(crate) disk_write: bool,
 }
 
 impl PagePlan {
@@ -1277,8 +1279,14 @@ mod tests {
         }
     }
 
-    const ROWS: PageWants = PageWants { rows: true };
-    const TOTALS: PageWants = PageWants { rows: false };
+    const ROWS: PageWants = PageWants {
+        rows: true,
+        disk_write: false,
+    };
+    const TOTALS: PageWants = PageWants {
+        rows: false,
+        disk_write: false,
+    };
 
     fn ids(plan: &PagePlan) -> Vec<u64> {
         plan.ids.iter().map(|id| id.0).collect()
@@ -1841,6 +1849,46 @@ mod tests {
         assert_eq!(cache.reads(), 1);
         cache.attach(db.clone(), 8, &mut page).await.unwrap();
         assert_eq!(cache.reads(), 2, "a new revision reads again");
+    }
+
+    // A disk figure moving is no queue change: the queue's revision stays,
+    // so the duplicate summaries are not read again and no queue reader
+    // is woken, the rows signal stays, and the figure is read where it is
+    // shown, on the download block.
+    #[tokio::test]
+    async fn a_disk_figure_moves_neither_the_queue_revision_nor_the_duplicate_memo() {
+        let db = weaver_server_core::Database::open_in_memory().unwrap();
+        let rows: Vec<JobInfo> = (1..=60)
+            .map(|id| job(id, JobStatus::Downloading, None, 1))
+            .collect();
+        let state = SharedPipelineState::new(PipelineMetrics::new(), rows.clone());
+        let mut page: Vec<_> = rows[..50]
+            .iter()
+            .map(crate::jobs::types::queue_table_item_from_job)
+            .collect();
+        let held = [JobId(1)];
+        state.mark_disk_for_test("/mnt/nas", 28 << 20, 240 << 20, true, &held, &[]);
+        let revision = state.job_revision();
+        let disk_rows = state.disk_rows_revision();
+        let mut cache = crate::jobs::query::DuplicateSummaryCache::default();
+        cache.attach(db.clone(), revision, &mut page).await.unwrap();
+        state.mark_disk_for_test("/mnt/nas", 9 << 20, 300 << 20, true, &held, &[]);
+        assert_eq!(state.job_revision(), revision);
+        assert_eq!(state.disk_rows_revision(), disk_rows);
+        cache
+            .attach(db.clone(), state.job_revision(), &mut page)
+            .await
+            .unwrap();
+        assert_eq!(cache.reads(), 1);
+        let shown = state.download_block().disk_volumes;
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].write_rate_bytes_per_sec, 9 << 20);
+        assert_eq!(shown[0].waiting_bytes, 300 << 20);
+        // Which job waits on which disk is a row change: the rows signal
+        // moves, the queue revision still does not.
+        state.mark_disk_for_test("/mnt/nas", 9 << 20, 300 << 20, true, &[JobId(2)], &[]);
+        assert_ne!(state.disk_rows_revision(), disk_rows);
+        assert_eq!(state.job_revision(), revision);
     }
 
     #[test]

@@ -127,7 +127,7 @@ const PARAM_VALUES = ["PROXY_NAME"];
 
 test("every code the daemon refuses with has a sentence here", () => {
   const source = readFileSync(
-    new URL("../../../server/crates/weaver-server-core/src/proxies/refusal.rs", import.meta.url),
+    new URL("../../../server/crates/weaver-server-net/src/proxies/refusal.rs", import.meta.url),
     "utf8",
   );
   const codes = [...new Set([...source.matchAll(/"([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)"/g)].map((match) => match[1]!))]

@@ -41,6 +41,7 @@ import {
   batchTarget,
   conflictCount,
   departedId,
+  diskPace,
   etaById as etaByIdFrom,
   groupCounts as groupCountsFrom,
   queuePageInput,
@@ -66,6 +67,7 @@ import {
   DOWNLOAD_GROUP_LABEL,
   DOWNLOAD_GROUP_NOTE,
   DOWNLOAD_GROUP_ORDER,
+  diskDetail,
   downloadGroup,
   useStatusLabel,
   type DownloadGroup,
@@ -247,7 +249,8 @@ function TimedResumeButton({ resumeAt, onResume }: { resumeAt: number; onResume:
 }
 
 export function DownloadsPage() {
-  const { queue, categories: configured, speed, isPaused, pausedClasses, resumeAt, downloadBlock } = useNextData();
+  const { queue, categories: configured, speed, isPaused, pausedClasses, resumeAt, downloadBlock, diskVolumes } =
+    useNextData();
   // The ETA's cap; 0 is none.
   const speedLimit = useSpeedLimitInForce().inForce ?? 0;
   const statusLabel = useStatusLabel();
@@ -372,9 +375,11 @@ export function DownloadsPage() {
   );
   const etaConditions = useMemo(() => ({ paused: isPaused, speedLimit }), [isPaused, speedLimit]);
   const etaSpeed = useStableEtaSpeed(etaSample, speed, etaConditions);
+  // A row a slow disk holds back runs at that disk's rate, not the download speed.
+  const pace = useMemo(() => diskPace(jobs, diskVolumes), [jobs, diskVolumes]);
   const estimates = useMemo(
-    () => etaByIdFrom(page.etaThrough, etaSpeed, formatEtaFromRemainingBytes),
-    [etaSpeed, page.etaThrough],
+    () => etaByIdFrom(page.etaThrough, etaSpeed, formatEtaFromRemainingBytes, pace),
+    [etaSpeed, page.etaThrough, pace],
   );
   // Kept while every estimate reads the same, so the rows' time-left text is
   // drawn again only when some of it changes.
@@ -701,6 +706,11 @@ export function DownloadsPage() {
     (job: JobData): string | null => (blocked && HELD_BACK_STATUSES.has(job.status) ? blockLabel : null),
     [blockLabel, blocked],
   );
+  /** What the download is doing with its disk, in full; null when the row shows nothing of it. */
+  const diskValue = useCallback(
+    (job: JobData): string | null => diskDetail(t, job, diskVolumes),
+    [t, diskVolumes],
+  );
 
   return (
     <NextShell
@@ -937,6 +947,7 @@ export function DownloadsPage() {
                   seedingColumn={seedingColumn}
                   heldOf={heldValue}
                   holdOf={holdValue}
+                  diskOf={diskValue}
                 />
               ))}
             </QueueEtaContext>
@@ -1056,6 +1067,8 @@ interface QueueGroupProps {
   onCancel: (id: number) => void;
   heldOf: (job: JobData) => string | null;
   holdOf: (job: JobData) => string | null;
+  /** What the download is doing with its disk, in full, while the row shows it. */
+  diskOf: (job: JobData) => string | null;
   torrents: ReadonlyMap<number, TorrentSummaryData>;
   seedingColumn: boolean;
 }
@@ -1081,6 +1094,7 @@ const QueueGroup = memo(function QueueGroup({
   onCancel,
   heldOf,
   holdOf,
+  diskOf,
   torrents,
   seedingColumn,
 }: QueueGroupProps) {
@@ -1104,30 +1118,33 @@ const QueueGroup = memo(function QueueGroup({
         count={count}
         note={DOWNLOAD_GROUP_NOTE[group] === null ? undefined : t(DOWNLOAD_GROUP_NOTE[group])}
       />
-      {sorted.map((job) => (
-        <DownloadRow
-          key={job.id}
-          job={job}
-          selected={job.id === selectedId}
-          onSelect={onSelect}
-          picked={picked.has(job.id)}
-          onPick={onPick}
-          statusLabel={statusLabel}
-          onPause={onPause}
-          onCancel={onCancel}
-          held={heldOf(job)}
-          hold={stateLabel(torrents.get(job.id)) ?? holdOf(job)}
-          seeding={seedingOf(torrents.get(job.id))}
-          seedingColumn={seedingColumn}
-          statusTitle={
-            job.status === "PROPAGATING" && job.downloadRetryAtEpochMs != null
-              ? t("next.status.propagationUntil", {
-                  time: new Date(job.downloadRetryAtEpochMs).toLocaleString(),
-                })
-              : undefined
-          }
-        />
-      ))}
+      {sorted.map((job) => {
+        const disk = diskOf(job);
+        return (
+          <DownloadRow
+            key={job.id}
+            job={job}
+            selected={job.id === selectedId}
+            onSelect={onSelect}
+            picked={picked.has(job.id)}
+            onPick={onPick}
+            statusLabel={statusLabel}
+            onPause={onPause}
+            onCancel={onCancel}
+            held={heldOf(job)}
+            hold={stateLabel(torrents.get(job.id)) ?? holdOf(job) ?? (disk ? t("next.status.diskShort") : null)}
+            seeding={seedingOf(torrents.get(job.id))}
+            seedingColumn={seedingColumn}
+            statusTitle={
+              job.status === "PROPAGATING" && job.downloadRetryAtEpochMs != null
+                ? t("next.status.propagationUntil", {
+                    time: new Date(job.downloadRetryAtEpochMs).toLocaleString(),
+                  })
+                : (disk ?? undefined)
+            }
+          />
+        );
+      })}
     </section>
   );
 }, sameGroupProps);
