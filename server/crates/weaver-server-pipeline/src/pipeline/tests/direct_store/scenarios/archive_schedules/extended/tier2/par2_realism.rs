@@ -179,7 +179,6 @@ pub(super) const PER_UNIT: usize = 46;
 // Preserve every cell, but sample fewer schedules for the cubic
 // thousands-block algebra. Weight those cases separately when sharding.
 const THOUSANDS_PER_UNIT: usize = 2;
-#[cfg(test)]
 pub(super) const TOTAL: usize = 4_000 * (PER_UNIT + THOUSANDS_PER_UNIT);
 
 pub(super) fn family() -> Family<Par2Cell> {
@@ -465,8 +464,7 @@ impl Cell for Par2Cell {
     }
 }
 
-#[tokio::test]
-async fn repaired_encrypted_restart_finishes_member_edges() {
+pub async fn repaired_encrypted_restart_finishes_member_edges() {
     run_cell(
         Par2Cell {
             slice: 5240,
@@ -495,8 +493,7 @@ async fn repaired_encrypted_restart_finishes_member_edges() {
     .await;
 }
 
-#[tokio::test]
-async fn index_absent_restart_fetches_remaining_recovery() {
+pub async fn index_absent_restart_fetches_remaining_recovery() {
     run_cell(
         Par2Cell {
             slice: 5240,
@@ -527,12 +524,10 @@ async fn index_absent_restart_fetches_remaining_recovery() {
 
 macro_rules! par2_smokes {
     ($($name:ident $slice:literal $redundancy:ident $margin:ident $band:ident $alignment:ident $pattern:ident $structure:ident $container:ident;)+) => {
-        mod combined_par2_realism_smoke {
-            #[cfg(test)]
+        pub mod combined_par2_realism_smoke {
             use super::*;
             $(
-                #[tokio::test]
-                async fn $name() {
+                pub async fn $name() {
                     smoke(Par2Cell {
                         slice: $slice,
                         redundancy: Redundancy::$redundancy,

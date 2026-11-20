@@ -276,7 +276,6 @@ const PER_UNIT: usize = 4;
 
 // 1,576 cells, four schedules each.
 pub(super) const CELLS: usize = 1_576;
-#[cfg(test)]
 pub(super) const TOTAL: usize = CELLS * PER_UNIT + field::TOTAL;
 
 pub(super) fn family() -> Family<HeaderCell> {
@@ -552,7 +551,6 @@ pub mod field {
     }
 
     const PER_UNIT: usize = 2;
-    #[cfg(test)]
     pub(in super::super) const TOTAL: usize = 10 * PER_UNIT;
 
     pub(in super::super) fn family() -> Family<FieldCell> {
@@ -639,14 +637,12 @@ pub mod field {
         }
     }
 
-    mod field_smoke {
-        #[cfg(test)]
+    pub mod field_smoke {
         use super::*;
 
         // Every part arrives: complete and byte-equal, whatever the size
         // every header states.
-        #[tokio::test]
-        async fn every_part_arrives() {
+        pub async fn every_part_arrives() {
             smoke(FieldCell {
                 lost: Lost::None,
                 par2: false,
@@ -656,8 +652,7 @@ pub mod field {
 
         // Parts 2 to 27 lost with nothing to mend them: failed, never a
         // complete or partial 1.5 MB file.
-        #[tokio::test]
-        async fn inner_parts_lost_fails() {
+        pub async fn inner_parts_lost_fails() {
             smoke(FieldCell {
                 lost: Lost::Inner,
                 par2: false,
@@ -667,8 +662,7 @@ pub mod field {
 
         // The same loss under a PAR2 set that covers it: repaired,
         // byte-equal.
-        #[tokio::test]
-        async fn inner_parts_lost_repaired() {
+        pub async fn inner_parts_lost_repaired() {
             smoke(FieldCell {
                 lost: Lost::Inner,
                 par2: true,
@@ -687,12 +681,10 @@ pub mod field {
     }
 }
 
-mod header_smoke {
-    #[cfg(test)]
+pub mod header_smoke {
     use super::*;
 
-    #[tokio::test]
-    async fn every_header_small_size_rar5() {
+    pub async fn every_header_small_size_rar5() {
         smoke(HeaderCell {
             lie: Lie::SizeSmall,
             scope: Scope::Every,
@@ -704,8 +696,7 @@ mod header_smoke {
         .await;
     }
 
-    #[tokio::test]
-    async fn end_below_begin_plain() {
+    pub async fn end_below_begin_plain() {
         smoke(HeaderCell {
             lie: Lie::EndBelowBegin,
             scope: Scope::One(Spot::Middle),
@@ -717,8 +708,7 @@ mod header_smoke {
         .await;
     }
 
-    #[tokio::test]
-    async fn overlap_repaired_sevenzip() {
+    pub async fn overlap_repaired_sevenzip() {
         smoke(HeaderCell {
             lie: Lie::Overlap,
             scope: Scope::One(Spot::Middle),
@@ -730,8 +720,7 @@ mod header_smoke {
         .await;
     }
 
-    #[tokio::test]
-    async fn single_part_large_size_loss_par2() {
+    pub async fn single_part_large_size_loss_par2() {
         loss_smoke(HeaderCell {
             lie: Lie::SingleSizeLarge,
             scope: Scope::Every,

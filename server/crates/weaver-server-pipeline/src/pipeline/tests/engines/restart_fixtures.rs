@@ -7,6 +7,7 @@
 // must finish as a run that never restarted finishes, and the only articles
 // it asks for again are the ones it held in memory when it went down.
 
+use super::harness::serve;
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::harness::{
@@ -506,4 +507,115 @@ pub fn with_par3(files: &[(&str, Vec<u8>)], names: &[&str], set: &str) -> Vec<Po
         .collect();
     posts.extend(par3_set(set, &described, 2));
     posts
+}
+
+// Every event `pipeline` sent since `sent` subscribed, kept in order.
+pub(super) fn drain(
+    sent: &mut tokio::sync::broadcast::Receiver<PipelineEvent>,
+    into: &mut Vec<PipelineEvent>,
+) {
+    loop {
+        match sent.try_recv() {
+            Ok(event) => into.push(event),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+            Err(error) => panic!("the run's events were not all kept: {error}"),
+        }
+    }
+}
+
+// What a run restarted once after its repair came to.
+pub struct RestartedDone {
+    pub status: Option<JobStatus>,
+    pub files: BTreeMap<String, Vec<u8>>,
+    // Every event either pipeline sent from admission on, in order.
+    pub events: Vec<PipelineEvent>,
+}
+
+// The job served as `run` serves it, and the pipeline drained and taken down
+// once, the first time a repair of the job is out on a thread. Whether the
+// restored job lent a repair again.
+pub async fn run_restarted_while_repairing(scenario: &Scenario) -> (RestartedDone, bool) {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) =
+        new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
+    scenario.prepare(&mut pipeline);
+    insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
+    let mut sent = pipeline.event_tx.subscribe();
+    let mut events = Vec::new();
+    let mut in_memory = BTreeSet::new();
+    let (mut restarted, mut lent_again) = (false, false);
+    let mut quiet = 0;
+    let mut asked = 0usize;
+    loop {
+        while let Some(work) = next_work(&mut pipeline, scenario) {
+            let article = (
+                work.segment_id.file_id.file_index,
+                work.segment_id.segment_number,
+            );
+            asked += 1;
+            serve(&mut pipeline, scenario, article).await;
+        }
+        if finished(&pipeline) {
+            break;
+        }
+        let before = asked;
+        if pipeline.jobs.contains_key(&JOB) {
+            pipeline.check_job_completion(JOB).await;
+        }
+        pump_pipeline_runtime_queues(&mut pipeline).await;
+        if finished(&pipeline) {
+            break;
+        }
+        let (awaits_mail, repair_out) = pipeline
+            .graph_jobs
+            .get(&JOB)
+            .map_or((false, false), |job| (job.awaits_mail(), job.repair_out()));
+        if repair_out && restarted {
+            lent_again = true;
+        }
+        if repair_out && !restarted {
+            // A repair out writes the job's files: the drain waits for it to
+            // its end rather than for a bound.
+            assert!(pipeline.graph_drain_waits_for_loans());
+            pipeline.drain().await;
+            assert!(
+                !pipeline.graph_jobs[&JOB].awaits_mail(),
+                "the drain left the job's repair out on its thread"
+            );
+            assert!(!pipeline.graph_drain_waits_for_loans());
+            drain(&mut sent, &mut events);
+            (pipeline, sent) =
+                restart_heard(&temp_dir, pipeline, scenario, &mut in_memory, &mut |_| {}).await;
+            restarted = true;
+            continue;
+        }
+        if awaits_mail {
+            let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
+            pipeline.graph_run_said(said);
+            continue;
+        }
+        if asked == before {
+            quiet += 1;
+            assert!(
+                quiet < 3,
+                "restarted job stalled at {:?}",
+                job_status_for_assert(&pipeline, JOB)
+            );
+        } else {
+            quiet = 0;
+        }
+    }
+    assert!(restarted, "a repair went out before the job finished");
+    let status = job_status_for_assert(&pipeline, JOB);
+    pipeline.db.flush_write_queue().await.unwrap();
+    drain(&mut sent, &mut events);
+    let mut files = BTreeMap::new();
+    collect(&complete_dir, &complete_dir, &mut files);
+    retire_pipeline_database(pipeline).await;
+    let done = RestartedDone {
+        status,
+        files,
+        events,
+    };
+    (done, lent_again)
 }

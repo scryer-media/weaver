@@ -144,7 +144,6 @@ pub(super) fn cells() -> Vec<DamageCell> {
 const PER_UNIT: usize = 283;
 
 // 5,280 possible cells, 283 schedules each.
-#[cfg(test)]
 pub(super) const TOTAL: usize = 1_494_240;
 
 pub(super) fn family() -> Family<DamageCell> {
@@ -446,8 +445,7 @@ impl Cell for DamageCell {
 // The graph has no schedule-driven demotion: a crash, which loses what the
 // job held only in memory and refetches it, is the boundary that makes the
 // job reassess a source it already saw.
-#[tokio::test]
-async fn par3_crash_refetch_reassesses_changed_source() {
+pub async fn par3_crash_refetch_reassesses_changed_source() {
     run_cell(
         DamageCell {
             kind: Damage::CrcWrong,
@@ -464,8 +462,7 @@ async fn par3_crash_refetch_reassesses_changed_source() {
     .await;
 }
 
-#[tokio::test]
-async fn encrypted_par3_readback_crosses_missing_member_boundary() {
+pub async fn encrypted_par3_readback_crosses_missing_member_boundary() {
     run_cell(
         DamageCell {
             kind: Damage::Recomputed,
@@ -482,8 +479,7 @@ async fn encrypted_par3_readback_crosses_missing_member_boundary() {
     .await;
 }
 
-#[tokio::test]
-async fn encrypted_par3_duplicate_restart_settles() {
+pub async fn encrypted_par3_duplicate_restart_settles() {
     run_cell(
         DamageCell {
             kind: Damage::DifferingDuplicate,
@@ -503,8 +499,7 @@ async fn encrypted_par3_duplicate_restart_settles() {
     .await;
 }
 
-#[tokio::test]
-async fn swapped_encrypted_headers_repaired_after_restart() {
+pub async fn swapped_encrypted_headers_repaired_after_restart() {
     run_cell(
         DamageCell {
             kind: Damage::Swapped,
@@ -526,12 +521,10 @@ async fn swapped_encrypted_headers_repaired_after_restart() {
 
 macro_rules! damage_smokes {
     ($($name:ident $kind:ident $location:ident $pattern:ident $recovery:expr, $container:ident;)+) => {
-        mod combined_damage_smoke {
-            #[cfg(test)]
+        pub mod combined_damage_smoke {
             use super::*;
             $(
-                #[tokio::test]
-                async fn $name() {
+                pub async fn $name() {
                     smoke(DamageCell {
                         kind: Damage::$kind,
                         location: Location::$location,
@@ -560,8 +553,7 @@ damage_smokes! {
     trailing_junk_middle_hundred TrailingJunk MiddleVolumeHead Hundred Recovery::Par2(Margin::With), Rar4;
 }
 
-#[tokio::test]
-async fn par3_restart_retains_the_decoded_prefix_as_repair_input() {
+pub async fn par3_restart_retains_the_decoded_prefix_as_repair_input() {
     run_cell(
         DamageCell {
             kind: Damage::CrcWrong,
@@ -581,8 +573,7 @@ async fn par3_restart_retains_the_decoded_prefix_as_repair_input() {
     .await;
 }
 
-#[tokio::test]
-async fn encrypted_par3_restart_retains_the_first_volume() {
+pub async fn encrypted_par3_restart_retains_the_first_volume() {
     for at in [2, 3] {
         run_cell(
             DamageCell {
@@ -604,12 +595,10 @@ async fn encrypted_par3_restart_retains_the_first_volume() {
     }
 }
 
-mod combined_damage_loss_smoke {
-    #[cfg(test)]
+pub mod combined_damage_loss_smoke {
     use super::*;
 
-    #[tokio::test]
-    async fn crc_wrong_mid_volume_par2() {
+    pub async fn crc_wrong_mid_volume_par2() {
         loss_smoke(DamageCell {
             kind: Damage::CrcWrong,
             location: Location::MidVolume,
@@ -620,8 +609,7 @@ mod combined_damage_loss_smoke {
         .await;
     }
 
-    #[tokio::test]
-    async fn truncated_straddle_par3() {
+    pub async fn truncated_straddle_par3() {
         loss_smoke(DamageCell {
             kind: Damage::Truncated,
             location: Location::SliceStraddle,

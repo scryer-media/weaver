@@ -12,6 +12,5 @@ use super::*;
 
 pub mod depth;
 pub mod graph;
-#[cfg(test)]
-mod repair;
+pub mod repair;
 pub mod tier2;

@@ -133,7 +133,6 @@ pub(super) fn cells() -> Vec<UuCell> {
 pub(super) const PER_UNIT: usize = 139;
 
 // 1,100 cells, 139 schedules each.
-#[cfg(test)]
 pub(super) const TOTAL: usize = 152_900;
 
 pub(super) fn family() -> Family<UuCell> {
@@ -262,12 +261,10 @@ impl Cell for UuCell {
 
 macro_rules! uu_smokes {
     ($($name:ident $style:literal $shape:ident $damage:expr, $container:ident;)+) => {
-        mod combined_uu_smoke {
-            #[cfg(test)]
+        pub mod combined_uu_smoke {
             use super::*;
             $(
-                #[tokio::test]
-                async fn $name() {
+                pub async fn $name() {
                     smoke(UuCell {
                         style: $style,
                         shape: Shape::$shape,
@@ -295,8 +292,7 @@ uu_smokes! {
     lenient_combo_par2 10 SetWithPar2 None, Rar5Encrypted;
 }
 
-#[tokio::test]
-async fn truncated_sevenz_part_reaches_par2_repair() {
+pub async fn truncated_sevenz_part_reaches_par2_repair() {
     run_cell(
         UuCell {
             style: 4,
@@ -315,12 +311,10 @@ async fn truncated_sevenz_part_reaches_par2_repair() {
     .await;
 }
 
-mod combined_uu_loss_smoke {
-    #[cfg(test)]
+pub mod combined_uu_loss_smoke {
     use super::*;
 
-    #[tokio::test]
-    async fn standard_set_par2() {
+    pub async fn standard_set_par2() {
         loss_smoke(UuCell {
             style: 0,
             shape: Shape::SetWithPar2,
@@ -330,8 +324,7 @@ mod combined_uu_loss_smoke {
         .await;
     }
 
-    #[tokio::test]
-    async fn bare_lf_set_unprotected() {
+    pub async fn bare_lf_set_unprotected() {
         loss_smoke(UuCell {
             style: 8,
             shape: Shape::Set,

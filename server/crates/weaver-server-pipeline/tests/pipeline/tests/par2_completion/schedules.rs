@@ -114,7 +114,7 @@ pub(super) fn agree(restarted: &Restarted, whole: &Outcome, context: &str) {
 pub(super) async fn row(scenario: &Scenario, expect: Expect<'_>, context: &str) -> Outcome {
     let whole = run(scenario).await;
     check(&whole, &expect, context);
-    let restarted = run_restarting(scenario, &mut |_| {}).await;
+    let restarted = run_restarting(scenario).await;
     agree(&restarted, &whole, context);
     whole
 }

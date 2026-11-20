@@ -63,7 +63,7 @@ pub(super) fn fixture(format: Format) -> Fixture {
 
 // Which slice of a campaign one test runs.
 #[derive(Clone, Copy, Debug)]
-pub(super) enum Slice {
+pub enum Slice {
     // The default suite's sample, drawn from the smoke schedules.
     Smoke,
     // One of `of` shards of the combined cases the campaign keeps.
@@ -104,8 +104,7 @@ pub(super) fn carries_loss(interruption: Interruption) -> bool {
     interruption.loss().is_some()
 }
 
-#[test]
-fn par3_campaign_case_count() {
+pub fn par3_campaign_case_count() {
     if std::env::var_os("WEAVER_ARCHIVE_COMBINED_CASE").is_some() {
         return;
     }
@@ -117,30 +116,3 @@ fn par3_campaign_case_count() {
         .count();
     assert_eq!(losses, LOSS_CASES);
 }
-
-// Shards cut each campaign to well under a thousand cases, so no test
-// approaches the runner's per-test limit. Each shard calls `$run` with the
-// bracketed arguments and its slice.
-macro_rules! par3_shards {
-    ($module:ident, $run:path, $args:tt) => {
-        mod $module {
-            use super::*;
-            par3_shards!(@each $run, $args, 8;
-                shard_0 0, shard_1 1, shard_2 2, shard_3 3,
-                shard_4 4, shard_5 5, shard_6 6, shard_7 7);
-        }
-    };
-    (@each $run:path, $args:tt, $of:literal; $($name:ident $shard:literal),+) => {
-        $(
-            #[tokio::test]
-            #[ignore = "opt-in extended archive matrix; run with the archive-matrix-extended Nextest profile and --run-ignored all"]
-            async fn $name() {
-                par3_shards!(@call $run, $args, Slice::Shard { shard: $shard, of: $of });
-            }
-        )+
-    };
-    (@call $run:path, [$($arg:expr),*], $selection:expr) => {
-        $run($($arg,)* $selection).await
-    };
-}
-pub(super) use par3_shards;

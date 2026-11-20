@@ -22,7 +22,6 @@ const VOLUMES: usize = 4;
 const ARTICLES_PER_VOLUME: usize = 32;
 
 // Each family's name and scenario count.
-#[cfg(test)]
 pub(super) fn totals() -> Vec<(&'static str, usize)> {
     vec![
         ("index that lies", lies::family().total()),
@@ -36,7 +35,6 @@ pub(super) fn totals() -> Vec<(&'static str, usize)> {
     ]
 }
 
-#[cfg(test)]
 pub(super) const TOTAL: usize = lies::TOTAL
     + nesting::TOTAL
     + scale::TOTAL
@@ -201,7 +199,6 @@ fn standard_payload(seed: u64) -> Vec<u8> {
 macro_rules! breadth_family {
     ($cell:ty, $cells:expr, $pool:expr, $per:expr, $total:expr, $count:expr) => {
         pub(in super::super) const PER_UNIT: usize = $per;
-        #[cfg(test)]
         pub(in super::super) const TOTAL: usize = $total;
 
         pub(in super::super) fn family() -> Family<$cell> {
@@ -388,12 +385,10 @@ pub mod lies {
         }
     }
 
-    mod combined_lies_smoke {
-        #[cfg(test)]
+    pub mod combined_lies_smoke {
         use super::*;
 
-        #[tokio::test]
-        async fn truthful_uniform() {
+        pub async fn truthful_uniform() {
             smoke(LieCell {
                 lie: Lie::None,
                 margin: Margin::With,
@@ -403,8 +398,7 @@ pub mod lies {
             .await;
         }
 
-        #[tokio::test]
-        async fn file_hash_exponent() {
+        pub async fn file_hash_exponent() {
             smoke(LieCell {
                 lie: Lie::FileHash,
                 margin: Margin::Exact,
@@ -414,8 +408,7 @@ pub mod lies {
             .await;
         }
 
-        #[tokio::test]
-        async fn slice_size_one_volume() {
+        pub async fn slice_size_one_volume() {
             loss_smoke(LieCell {
                 lie: Lie::SliceSize,
                 margin: Margin::With,
@@ -608,12 +601,10 @@ pub mod nesting {
         }
     }
 
-    mod combined_nesting_smoke {
-        #[cfg(test)]
+    pub mod combined_nesting_smoke {
         use super::*;
 
-        #[tokio::test]
-        async fn two_deep_four_volumes_par2() {
+        pub async fn two_deep_four_volumes_par2() {
             smoke(NestCell {
                 depth: Depth::Two,
                 volumes: VOLUMES,
@@ -625,8 +616,7 @@ pub mod nesting {
             .await;
         }
 
-        #[tokio::test]
-        async fn three_deep_locked() {
+        pub async fn three_deep_locked() {
             smoke(NestCell {
                 depth: Depth::Three,
                 volumes: 1,
@@ -638,8 +628,7 @@ pub mod nesting {
             .await;
         }
 
-        #[tokio::test]
-        async fn sevenzip_inside_loss() {
+        pub async fn sevenzip_inside_loss() {
             loss_smoke(NestCell {
                 depth: Depth::SevenZipInside,
                 volumes: VOLUMES,
@@ -651,8 +640,7 @@ pub mod nesting {
             .await;
         }
 
-        #[tokio::test]
-        async fn rar_inside_sevenzip() {
+        pub async fn rar_inside_sevenzip() {
             smoke(NestCell {
                 depth: Depth::RarInside7z,
                 volumes: VOLUMES,
@@ -791,12 +779,10 @@ pub mod scale {
         }
     }
 
-    mod combined_scale_smoke {
-        #[cfg(test)]
+    pub mod combined_scale_smoke {
         use super::*;
 
-        #[tokio::test]
-        async fn many_volumes_par2() {
+        pub async fn many_volumes_par2() {
             smoke(ScaleCell {
                 shape: Shape::ManyVolumes,
                 recovery: Recovery::Par2(Margin::With),
@@ -805,8 +791,7 @@ pub mod scale {
             .await;
         }
 
-        #[tokio::test]
-        async fn many_articles_par3() {
+        pub async fn many_articles_par3() {
             smoke(ScaleCell {
                 shape: Shape::ManyArticles,
                 recovery: Recovery::Par3,
@@ -815,8 +800,7 @@ pub mod scale {
             .await;
         }
 
-        #[tokio::test]
-        async fn big_articles_loss() {
+        pub async fn big_articles_loss() {
             loss_smoke(ScaleCell {
                 shape: Shape::BigArticles,
                 recovery: Recovery::Par2(Margin::Exact),
@@ -825,8 +809,7 @@ pub mod scale {
             .await;
         }
 
-        #[tokio::test]
-        async fn tiny_unprotected() {
+        pub async fn tiny_unprotected() {
             smoke(ScaleCell {
                 shape: Shape::Tiny,
                 recovery: Recovery::None,
@@ -941,8 +924,7 @@ pub mod withheld {
 
     // A rebuilt volume no posted file owns must reach the member that
     // spans it, under a loss as well.
-    #[tokio::test]
-    async fn a_rebuilt_withheld_volume_reaches_its_member() {
+    pub async fn a_rebuilt_withheld_volume_reaches_its_member() {
         loss_smoke(WithheldCell {
             container: Container::Rar5Encrypted,
             field_size: false,
@@ -1096,12 +1078,10 @@ pub mod password {
         }
     }
 
-    mod combined_password_smoke {
-        #[cfg(test)]
+    pub mod combined_password_smoke {
         use super::*;
 
-        #[tokio::test]
-        async fn right_rar5_headers() {
+        pub async fn right_rar5_headers() {
             smoke(PasswordCell {
                 given: Given::Right,
                 locked: Locked::Rar5Headers,
@@ -1111,8 +1091,7 @@ pub mod password {
             .await;
         }
 
-        #[tokio::test]
-        async fn wrong_sevenzip_data() {
+        pub async fn wrong_sevenzip_data() {
             smoke(PasswordCell {
                 given: Given::Wrong,
                 locked: Locked::SevenZipData,
@@ -1122,8 +1101,7 @@ pub mod password {
             .await;
         }
 
-        #[tokio::test]
-        async fn missing_rar4_data() {
+        pub async fn missing_rar4_data() {
             smoke(PasswordCell {
                 given: Given::Missing,
                 locked: Locked::Rar4Data,
@@ -1133,8 +1111,7 @@ pub mod password {
             .await;
         }
 
-        #[tokio::test]
-        async fn wrong_on_plain_loss() {
+        pub async fn wrong_on_plain_loss() {
             loss_smoke(PasswordCell {
                 given: Given::Wrong,
                 locked: Locked::Rar5Plain,
@@ -1256,12 +1233,10 @@ pub mod wire {
         }
     }
 
-    mod combined_wire_smoke {
-        #[cfg(test)]
+    pub mod combined_wire_smoke {
         use super::*;
 
-        #[tokio::test]
-        async fn long_lines_many() {
+        pub async fn long_lines_many() {
             smoke(WireCell {
                 line: 990,
                 articles: Articles::Many,
@@ -1271,8 +1246,7 @@ pub mod wire {
             .await;
         }
 
-        #[tokio::test]
-        async fn short_lines_single_part() {
+        pub async fn short_lines_single_part() {
             smoke(WireCell {
                 line: 64,
                 articles: Articles::One,
@@ -1282,8 +1256,7 @@ pub mod wire {
             .await;
         }
 
-        #[tokio::test]
-        async fn single_part_loss_par2() {
+        pub async fn single_part_loss_par2() {
             loss_smoke(WireCell {
                 line: 128,
                 articles: Articles::One,
@@ -1455,12 +1428,10 @@ pub mod naming {
         }
     }
 
-    mod combined_naming_smoke {
-        #[cfg(test)]
+    pub mod combined_naming_smoke {
         use super::*;
 
-        #[tokio::test]
-        async fn upper_extension_par2() {
+        pub async fn upper_extension_par2() {
             smoke(NameCell {
                 naming: Naming::UpperExtension,
                 container: Container::Rar5,
@@ -1470,8 +1441,7 @@ pub mod naming {
             .await;
         }
 
-        #[tokio::test]
-        async fn mixed_case_sevenzip() {
+        pub async fn mixed_case_sevenzip() {
             smoke(NameCell {
                 naming: Naming::MixedCase,
                 container: Container::SevenZip,
@@ -1481,8 +1451,7 @@ pub mod naming {
             .await;
         }
 
-        #[tokio::test]
-        async fn narrow_padding_rar4() {
+        pub async fn narrow_padding_rar4() {
             smoke(NameCell {
                 naming: Naming::NarrowPadding,
                 container: Container::Rar4,
@@ -1492,8 +1461,7 @@ pub mod naming {
             .await;
         }
 
-        #[tokio::test]
-        async fn gap_repaired() {
+        pub async fn gap_repaired() {
             loss_smoke(NameCell {
                 naming: Naming::Gap,
                 container: Container::Rar5,
@@ -1687,8 +1655,7 @@ pub mod sets {
     // The graph has no schedule-driven demotion: a crash, which loses what
     // the job held only in memory, is the boundary that sends the 7z set
     // back for what it had not made durable.
-    #[tokio::test]
-    async fn crashed_sevenz_extracts_beside_healthy_neighbour() {
+    pub async fn crashed_sevenz_extracts_beside_healthy_neighbour() {
         run_cell(
             SetsCell {
                 layout: Layout::TwoSetsFurniture,
@@ -1710,8 +1677,7 @@ pub mod sets {
 
     // A set damaged past mending beside a healthy one: the healthy set's
     // member is delivered whole and the job ends partial.
-    #[tokio::test]
-    async fn damaged_neighbour_leaves_healthy_set_delivered() {
+    pub async fn damaged_neighbour_leaves_healthy_set_delivered() {
         let cell = SetsCell {
             layout: Layout::TwoSets,
             container: Container::Rar5,
@@ -1751,8 +1717,7 @@ pub mod sets {
 
     // The second set loses an article it has no recovery for: the first
     // set's member is still delivered whole.
-    #[tokio::test]
-    async fn lost_neighbour_leaves_healthy_set_delivered() {
+    pub async fn lost_neighbour_leaves_healthy_set_delivered() {
         let cell = SetsCell {
             layout: Layout::TwoSets,
             container: Container::Rar5,
@@ -1776,12 +1741,10 @@ pub mod sets {
         .await;
     }
 
-    mod combined_sets_smoke {
-        #[cfg(test)]
+    pub mod combined_sets_smoke {
         use super::*;
 
-        #[tokio::test]
-        async fn furniture_par2() {
+        pub async fn furniture_par2() {
             smoke(SetsCell {
                 layout: Layout::Furniture,
                 container: Container::Rar5,
@@ -1792,8 +1755,7 @@ pub mod sets {
             .await;
         }
 
-        #[tokio::test]
-        async fn two_sets_sevenzip() {
+        pub async fn two_sets_sevenzip() {
             smoke(SetsCell {
                 layout: Layout::TwoSets,
                 container: Container::SevenZip,
@@ -1804,8 +1766,7 @@ pub mod sets {
             .await;
         }
 
-        #[tokio::test]
-        async fn two_sets_stale_sfv_loss() {
+        pub async fn two_sets_stale_sfv_loss() {
             loss_smoke(SetsCell {
                 layout: Layout::TwoSetsFurniture,
                 container: Container::Rar4,
@@ -1816,8 +1777,7 @@ pub mod sets {
             .await;
         }
 
-        #[tokio::test]
-        async fn loose_media_and_sample() {
+        pub async fn loose_media_and_sample() {
             smoke(SetsCell {
                 layout: Layout::LooseMedia,
                 container: Container::Rar5,

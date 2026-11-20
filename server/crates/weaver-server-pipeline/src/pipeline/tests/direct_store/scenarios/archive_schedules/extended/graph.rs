@@ -4,18 +4,14 @@
 // The extended campaigns: each schedule of a campaign's pool admitted as a
 // job and judged by the archive matrix's one rule set.
 use super::*;
-#[cfg(test)]
 use crate::pipeline::tests::direct_store::scenarios::archive_schedules::graph::{
-    GraphFixture, graph_campaign, graph_compressed_campaign, rar_post,
+    GraphFixture, rar_post,
 };
 use crate::pipeline::tests::direct_store::scenarios::archive_schedules::graph::{
     assert_cells, graph_fixture, graph_fixture_cases,
 };
 
-#[cfg(test)]
-mod formats;
-#[cfg(test)]
-mod repair;
+pub mod repair;
 
 use super::depth::Family;
 

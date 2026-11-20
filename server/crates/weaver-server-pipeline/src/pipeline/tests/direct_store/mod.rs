@@ -1067,5 +1067,4 @@ fn build_test_rar4_end_header_numbered(more_volumes: bool, volume: u16) -> Vec<u
 #[cfg(test)]
 mod tests {
     mod lent_store_loss;
-    mod par2_schedules;
 }

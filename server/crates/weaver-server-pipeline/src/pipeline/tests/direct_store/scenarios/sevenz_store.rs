@@ -16,7 +16,7 @@ use sevenz_turbo::encoder_options::AesEncoderOptions;
 use sevenz_turbo::{ArchiveEntry, ArchiveWriter, EncoderConfiguration, EncoderMethod, Password};
 
 // One entry of a fixture archive.
-pub(in crate::pipeline::tests) struct Entry {
+pub struct Entry {
     name: &'static str,
     // `None` for an entry the archive names but stores no bytes for. Such an
     // entry has no stream at all — a zero-length stream is a different thing,
@@ -29,7 +29,7 @@ pub(in crate::pipeline::tests) struct Entry {
 }
 
 impl Entry {
-    pub(in crate::pipeline::tests) fn file(name: &'static str, bytes: Vec<u8>) -> Self {
+    pub fn file(name: &'static str, bytes: Vec<u8>) -> Self {
         Self {
             name,
             bytes: Some(bytes),
@@ -91,7 +91,7 @@ fn build_7z(entries: &[Entry], method: EncoderMethod, password: Option<&str>) ->
     build_7z_shaped(entries, method, password, false)
 }
 
-pub(in crate::pipeline::tests) fn build_7z_shaped(
+pub fn build_7z_shaped(
     entries: &[Entry],
     method: EncoderMethod,
     password: Option<&str>,

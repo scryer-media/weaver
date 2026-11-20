@@ -319,8 +319,7 @@ pub fn recovery_blocks(post: &Post) -> Vec<Vec<u32>> {
 
 // The packets of a PAR2 file with every slice-checksum packet left out: a
 // set that hashes its files whole and no finer.
-#[cfg(test)]
-pub(in crate::pipeline::tests) fn without_slice_checksums(bytes: &[u8]) -> Vec<u8> {
+pub fn without_slice_checksums(bytes: &[u8]) -> Vec<u8> {
     const HEADER: usize = 64;
     const SLICE_CHECKSUMS: &[u8; 16] = b"PAR 2.0\0IFSC\0\0\0\0";
     let mut kept = Vec::new();
@@ -337,8 +336,7 @@ pub(in crate::pipeline::tests) fn without_slice_checksums(bytes: &[u8]) -> Vec<u
 }
 
 // The bytes of a volume's one recovery packet, cut from it.
-#[cfg(test)]
-pub(in crate::pipeline::tests) fn recovery_packet(volume: &Post) -> Vec<u8> {
+pub fn recovery_packet(volume: &Post) -> Vec<u8> {
     const HEADER: usize = 64;
     const RECOVERY: &[u8; 16] = b"PAR 2.0\0RecvSlic";
     let bytes = &volume.bytes;
@@ -354,8 +352,7 @@ pub(in crate::pipeline::tests) fn recovery_packet(volume: &Post) -> Vec<u8> {
 }
 
 // An article of a PAR2 volume whose loss costs exactly one recovery block.
-#[cfg(test)]
-pub(in crate::pipeline::tests) fn one_block_article(post: &Post) -> u32 {
+pub fn one_block_article(post: &Post) -> u32 {
     let blocks = recovery_blocks(post);
     blocks
         .iter()
@@ -1717,7 +1714,6 @@ pub(in crate::pipeline::tests) async fn serve_work(
 }
 
 // One article as the scenario's server answers it.
-#[cfg(test)]
 pub(in crate::pipeline::tests) async fn serve(
     pipeline: &mut Pipeline,
     scenario: &Scenario,
@@ -1727,7 +1723,6 @@ pub(in crate::pipeline::tests) async fn serve(
 }
 
 // [`serve`] for a job other than the run's own.
-#[cfg(test)]
 pub(in crate::pipeline::tests) async fn serve_job(
     pipeline: &mut Pipeline,
     job: JobId,

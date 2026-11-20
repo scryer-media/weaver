@@ -391,8 +391,7 @@ fn two_interruption_cases(orders: &BTreeSet<Order>) -> Vec<Schedule> {
 
 // The family's generator, given the archive matrix's own slots and orders,
 // builds the archive matrix case for case.
-#[test]
-fn single_interruption_cases_reproduce_the_archive_matrix() {
+pub fn single_interruption_cases_reproduce_the_archive_matrix() {
     let four = permutations(4);
     let mut orders = with_duplicate(&four);
     orders.extend(four);

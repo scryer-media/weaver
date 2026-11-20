@@ -85,7 +85,6 @@ pub(super) fn cells() -> Vec<Par3Cell> {
 pub(super) const PER_UNIT: usize = 231;
 
 // 432 cells, 231 schedules each.
-#[cfg(test)]
 pub(super) const TOTAL: usize = 99_792;
 
 pub(super) fn family() -> Family<Par3Cell> {
@@ -391,12 +390,10 @@ impl Cell for Par3Cell {
 
 macro_rules! par3_smokes {
     ($($name:ident $code:ident $margin:ident $block:literal $entries:ident $sets:ident $index:ident $container:ident;)+) => {
-        mod combined_par3_breadth_smoke {
-            #[cfg(test)]
+        pub mod combined_par3_breadth_smoke {
             use super::*;
             $(
-                #[tokio::test]
-                async fn $name() {
+                pub async fn $name() {
                     smoke(Par3Cell {
                         code: Code::$code,
                         margin: Margin::$margin,
@@ -421,12 +418,10 @@ par3_smokes! {
     sidecar_index_damaged_short Fft OneShort 1024 One One Damaged SevenZip;
 }
 
-mod combined_par3_breadth_loss_smoke {
-    #[cfg(test)]
+pub mod combined_par3_breadth_loss_smoke {
     use super::*;
 
-    #[tokio::test]
-    async fn sidecar_fft_rar5() {
+    pub async fn sidecar_fft_rar5() {
         loss_smoke(Par3Cell {
             code: Code::Fft,
             margin: Margin::With,

@@ -23,7 +23,7 @@ pub mod headers;
 pub mod par2_realism;
 pub mod par3_breadth;
 mod post;
-mod recovery;
+pub mod recovery;
 mod run;
 pub mod uu;
 
@@ -141,7 +141,6 @@ pub(super) async fn run_cell<C: Cell>(cell: C, cases: Vec<(usize, Schedule)>) {
 
 // A cell's smoke: every data group in order and then reversed, with
 // nothing lost.
-#[cfg(test)]
 pub(super) async fn smoke<C: Cell>(cell: C) {
     let forward = slot_arrivals(4);
     let mut backward = forward.clone();
@@ -158,7 +157,6 @@ pub(super) async fn smoke<C: Cell>(cell: C) {
 
 // A cell's smoke under a loss: the first and last groups each lose their
 // middle article, in order and reversed.
-#[cfg(test)]
 pub(super) async fn loss_smoke<C: Cell>(cell: C) {
     let forward = slot_arrivals(4);
     let mut backward = forward.clone();
@@ -199,7 +197,6 @@ pub(super) struct Family<C> {
 }
 
 impl<C: Cell> Family<C> {
-    #[cfg(test)]
     pub(super) fn total(&self) -> usize {
         self.units
             .iter()
@@ -264,8 +261,7 @@ impl<C: Cell> Family<C> {
 }
 
 // Every family's scenario count, as its enumerator yields it.
-#[test]
-fn tier2_sizing() {
+pub fn tier2_sizing() {
     let damage = damage::family().total();
     let par2 = par2_realism::family().total();
     let par3 = par3_breadth::family().total();
@@ -286,7 +282,6 @@ fn tier2_sizing() {
 }
 
 // Tier two's scenarios across every family.
-#[cfg(test)]
 const TOTAL: usize = damage::TOTAL
     + par2_realism::TOTAL
     + par3_breadth::TOTAL

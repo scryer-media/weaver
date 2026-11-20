@@ -93,10 +93,6 @@ mod memory_release;
 mod next_up_ring;
 #[cfg(test)]
 mod nzb_admission;
-#[cfg(test)]
-mod par2;
-#[cfg(test)]
-mod par2_completion;
 #[cfg(unix)]
 #[cfg(test)]
 mod post_processing_completion;

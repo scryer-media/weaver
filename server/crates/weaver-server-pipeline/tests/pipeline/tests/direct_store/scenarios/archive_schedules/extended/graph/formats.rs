@@ -8,7 +8,13 @@
 // unless it starves the recovery set; then it delivers what the post still
 // holds whole as the schedule left it. A wrong password delivers nothing
 // from an encrypted layout and changes nothing for a plain one.
-use super::*;
+
+use weaver_server_pipeline::pipeline::tests::direct_store::scenarios::archive_schedules::graph::{
+    graph_campaign, graph_compressed_campaign,
+};
+use weaver_server_pipeline::pipeline::tests::direct_store::scenarios::archive_schedules::{
+    CompressedFormat, Format, Selection,
+};
 
 #[tokio::test]
 async fn rar4_obfuscated_arrival_schedules() {

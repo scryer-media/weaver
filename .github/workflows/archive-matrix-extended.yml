@@ -85,7 +85,7 @@ jobs:
       - name: Archive compiled extended archive campaign tests
         run: >-
           cargo nextest archive --locked --cargo-profile matrix -p weaver-server-pipeline
-          --lib --test archive_matrix_damage --test archive_matrix_formats
+          --test archive_matrix_remaining --test archive_matrix_damage --test archive_matrix_formats
           --test archive_matrix_par2_realism --test archive_matrix_grouping_depth --test pipeline_direct_store
           --archive-file target/archive-matrix-extended.tar.zst
       - name: Upload compiled extended archive campaign tests

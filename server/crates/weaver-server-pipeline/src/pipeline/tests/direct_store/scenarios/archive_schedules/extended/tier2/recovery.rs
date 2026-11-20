@@ -100,8 +100,7 @@ pub(in super::super) fn recovery_packets(bytes: &[u8]) -> Vec<Range<usize>> {
     packets
 }
 
-#[test]
-fn recovery_packet_counts_do_not_require_an_aligned_archive_tail() {
+pub fn recovery_packet_counts_do_not_require_an_aligned_archive_tail() {
     let sources = [("payload.bin".to_string(), vec![7; 2048])];
     for files in [
         par2_set(&sources, 512, 2, Par2Volumes::Uniform),
@@ -194,8 +193,7 @@ pub(in super::super) fn needed(
     (upper, lower)
 }
 
-#[test]
-fn missing_short_tail_can_be_supplied_by_an_intact_source() {
+pub fn missing_short_tail_can_be_supplied_by_an_intact_source() {
     let mut missing = Posted::new("first.bin", vec![1, 2, 3, 4, 9, 8], 4, Role::Data);
     missing.absent();
     let donor = Posted::new("second.bin", vec![5, 6, 7, 0, 9, 8], 4, Role::Data);
@@ -309,8 +307,7 @@ pub(in super::super) fn all_missing_exact_par2_is_singular(
         && exact_par2_matrix_is_singular(blocks, exponents.into_iter().collect())
 }
 
-#[test]
-fn distinct_par2_exponents_need_not_be_independent() {
+pub fn distinct_par2_exponents_need_not_be_independent() {
     assert!(!exact_par2_matrix_is_singular(2, vec![0, 1]));
     assert!(exact_par2_matrix_is_singular(2, vec![0, 65535]));
 }
@@ -430,8 +427,7 @@ pub(in super::super) fn par2_set(
     files
 }
 
-#[test]
-fn zero_row_par2_keeps_metadata_redundancy_without_repair_power() {
+pub fn zero_row_par2_keeps_metadata_redundancy_without_repair_power() {
     let files = par2_set(
         &[("payload.bin".to_string(), vec![7; 2048])],
         512,
