@@ -39,6 +39,11 @@ pub(crate) struct RootFacts {
     pub(crate) reported: Option<RootPhase>,
     // Namespace members whose whole-file verification has not been acknowledged.
     pub(crate) pending_verifications: Vec<(u32, u32)>,
+    // Whether the job ever reported Repairing, so a job restored past its
+    // repair still ends saying the repair failed. A checkpoint written before
+    // this was kept says it did not.
+    #[serde(default)]
+    pub(crate) repair_entered: bool,
 }
 
 impl RootFacts {
@@ -131,6 +136,9 @@ pub(crate) struct Encoded {
     read_backs: u64,
     reported: Option<RootPhase>,
     pending_verifications: Vec<(u32, u32)>,
+    // Written only when set, so a job that never repaired encodes as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    repair_entered: bool,
     // The generation of each of its sealed values when its parts were last
     // taken, by number in the walk.
     #[serde(skip)]
@@ -239,7 +247,13 @@ impl Encoded {
             read_backs: self.read_backs,
             reported: self.reported,
             pending_verifications: self.pending_verifications.clone(),
+            repair_entered: self.repair_entered,
         }
+    }
+
+    // Whether the job ever reported Repairing, for the next encoding.
+    pub(crate) fn note_repair_entered(&mut self, entered: bool) {
+        self.repair_entered = entered;
     }
 }
 

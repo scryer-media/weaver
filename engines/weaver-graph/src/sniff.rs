@@ -790,11 +790,13 @@ pub fn listed(names: &[&str]) -> Vec<Listed> {
     names.iter().map(|name| listing.told(name)).collect()
 }
 
-// The names of a listing, each once, trimmed and lower case: what telling
-// one of them asks of the names beside it is a lookup, so telling every
-// name of a listing is linear in its length.
+// The names of a listing, trimmed and lower case, each with how many times
+// it is listed: what telling one of them asks of the names beside it is a
+// lookup, so telling every name of a listing is linear in its length. A
+// namespace keeps one of its members' names as they come, change and go.
+#[derive(Debug, Default)]
 pub(crate) struct Listing {
-    names: std::collections::HashSet<String>,
+    names: std::collections::BTreeMap<String, usize>,
 }
 
 // A name's last extension, split into its first letter and the rest, and
@@ -823,15 +825,50 @@ fn archive_extension(extension: &str) -> bool {
 
 impl Listing {
     pub(crate) fn new<'a>(names: impl Iterator<Item = &'a str>) -> Self {
-        Self {
-            names: names
-                .map(|name| trimmed(name).to_ascii_lowercase())
-                .collect(),
+        let mut listing = Self::default();
+        for name in names {
+            listing.add(name);
+        }
+        listing
+    }
+
+    pub(crate) fn add(&mut self, name: &str) {
+        *self
+            .names
+            .entry(trimmed(name).to_ascii_lowercase())
+            .or_default() += 1;
+    }
+
+    pub(crate) fn forget(&mut self, name: &str) {
+        let name = trimmed(name).to_ascii_lowercase();
+        if let Some(count) = self.names.get_mut(&name) {
+            *count -= 1;
+            if *count == 0 {
+                self.names.remove(&name);
+            }
         }
     }
 
     fn has(&self, stem: &str, extension: &str) -> bool {
-        self.names.contains(&format!("{stem}.{extension}"))
+        self.names.contains_key(&format!("{stem}.{extension}"))
+    }
+
+    // Whether a name of the listing is a recovery volume's by the names
+    // beside it: a `.par2` or `.par3`, index or volume, and RAR's `.rev`, by
+    // their names alone; the older numbered `.p<N>` and `.par<N>` only beside
+    // a `.par` or `.par2` of their stem. A short name with a letter and
+    // digits for an extension, a `.p12`, is a plain file when no set of its
+    // stem is listed. The one rule a listing, a member no object holds and
+    // the job's health tell recovery data by.
+    pub(crate) fn recovery(&self, name: &str) -> bool {
+        let name = trimmed(name).to_ascii_lowercase();
+        let Some((stem, extension)) = name.rsplit_once('.') else {
+            return false;
+        };
+        names_recovery(&name)
+            && (matches!(extension, "rev" | "par2" | "par3")
+                || self.has(stem, "par")
+                || self.has(stem, "par2"))
     }
 
     // `split_piece_among`, of a trimmed lower-case name, asked of the
@@ -863,11 +900,7 @@ impl Listing {
         if container {
             return Listed::Container;
         }
-        let recovery = match extension {
-            "rev" | "par2" | "par3" | "sfv" => true,
-            _ => names_recovery(&name) && (self.has(stem, "par") || self.has(stem, "par2")),
-        };
-        if recovery {
+        if extension == "sfv" || self.recovery(&name) {
             Listed::Recovery
         } else {
             Listed::Plain
@@ -1599,6 +1632,43 @@ mod tests {
                 .iter()
                 .all(|name| !name.is_empty() && name.bytes().all(|byte| !byte.is_ascii_uppercase()))
         );
+    }
+
+    // A `.par2`, `.par3` or `.rev` is recovery data by its name; an older
+    // numbered `.p<N>` or `.par<N>` only beside a `.par` or `.par2` of its
+    // stem, and a plain file otherwise.
+    #[test]
+    fn a_listing_tells_old_numbered_volumes_by_the_set_beside_them() {
+        let names = [
+            "notes.p12",
+            "notes.par01",
+            "x.p01",
+            "x.par2",
+            "y.par01",
+            "y.par",
+            "a.part2.rev",
+            "b.vol00+01.par2",
+            "c.par3",
+            "x.mkv",
+        ];
+        let listing = Listing::new(names.iter().copied());
+        for (name, recovery) in [
+            ("notes.p12", false),
+            ("notes.par01", false),
+            ("x.p01", true),
+            ("X.P01", true),
+            ("x.par2", true),
+            ("y.par01", true),
+            ("y.par", false),
+            ("a.part2.rev", true),
+            ("b.vol00+01.par2", true),
+            ("c.par3", true),
+            ("x.mkv", false),
+        ] {
+            assert_eq!(listing.recovery(name), recovery, "{name}");
+            let told = listing.told(name) == Listed::Recovery;
+            assert_eq!(told, recovery, "{name}");
+        }
     }
 
     // Each member of a namespace below the root is told a piece, furniture

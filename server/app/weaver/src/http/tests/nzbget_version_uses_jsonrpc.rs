@@ -3049,6 +3049,76 @@ async fn nzbget_history_reports_compound_status_history_time_and_stage_timings()
     assert_eq!(by_id(402)["Deleted"], true);
 }
 
+// A failed job whose repair ran from 310 s to 340 s, then extracted until
+// 400 s and ended at 405 s. Its repair failure is said as the job ends and
+// recorded at the moment its repair stopped, so the facade's repair time is
+// the 30 s the repair ran, and extraction keeps its own 60 s.
+#[tokio::test]
+async fn nzbget_history_repair_time_of_a_failed_job_is_the_repair_alone() {
+    let db = Database::open_in_memory().unwrap();
+    db.insert_job_history(&nzbget_history_row(403, "failed", 1_700_000_405, None))
+        .unwrap();
+    let job_id = JobId(403);
+    let repair_ended = 1_700_000_340_000;
+    let recorded = [
+        (PipelineEvent::DownloadStarted { job_id }, 1_700_000_000_000),
+        (
+            PipelineEvent::DownloadFinished {
+                job_id,
+                finalization_pending: false,
+            },
+            1_700_000_300_000,
+        ),
+        (PipelineEvent::RepairStarted { job_id }, 1_700_000_310_000),
+        (PipelineEvent::ExtractionReady { job_id }, repair_ended),
+        (
+            PipelineEvent::ExtractionComplete { job_id },
+            1_700_000_400_000,
+        ),
+        (
+            PipelineEvent::RepairFailed {
+                job_id,
+                error: "not repairable".into(),
+                ended_at_ms: Some(repair_ended),
+            },
+            1_700_000_405_000,
+        ),
+    ];
+    let rows: Vec<_> = recorded
+        .iter()
+        .filter_map(|(event, now)| crate::wiring::job_event_row(event, *now))
+        .collect();
+    assert_eq!(rows.len(), recorded.len());
+    assert_eq!(
+        rows.last().map(|row| (row.kind.as_str(), row.timestamp)),
+        Some(("RepairFailed", repair_ended)),
+        "the failure is recorded when its repair stopped"
+    );
+    db.insert_job_events(&rows).unwrap();
+    let app = nzbget_test_router(
+        db,
+        test_scheduler_handle(),
+        test_config(),
+        ApiKeyCache::default(),
+    );
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({"method": "history", "params": [false], "id": "history"}),
+        "Bearer session-token",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let item = payload["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["ID"] == 403)
+        .unwrap();
+    assert_eq!(item["RepairTimeSec"], 30);
+    assert_eq!(item["UnpackTimeSec"], 60);
+    assert_eq!(item["PostTotalTimeSec"], 90);
+}
+
 #[tokio::test]
 async fn nzbget_listfiles_reports_nzb_files_with_progress() {
     let db = Database::open_in_memory().unwrap();

@@ -151,18 +151,21 @@ async fn a_graph_job_fetches_repair_data_before_it_repairs() {
 }
 
 // A whole movie beside a file posted under an older recovery volume's name,
-// `.p01` or `.par01`, that no object holds: its bytes say nothing an object
-// reads. It is recovery data by its name, as a `.par2` beside the movie is:
-// no file of the delivery, whole or short. The job hands over the movie and
-// ends Complete, also when the recovery file lost an article.
+// `.p01` or `.par01`, beside a `.par2` of its stem, that no object holds:
+// its bytes say nothing an object reads. It is recovery data by its name
+// among the names beside it, as the `.par2` is by its own: no file of the
+// delivery, whole or short. The job hands over the movie and ends
+// Complete, also when the recovery file lost an article, and that loss
+// costs the job's health nothing.
 #[tokio::test]
 async fn a_recovery_file_no_object_holds_is_no_file_of_the_delivery() {
     let movie = payload(4 * ARTICLE + 17, 91);
-    for name in ["lantern.p01", "lantern.par01", "lantern.par2"] {
+    for name in ["lantern.p01", "lantern.par01", "lantern.vol00+01.par2"] {
         for lost in [false, true] {
             let posts = vec![
                 Post::plain("lantern.mkv", movie.clone()),
                 Post::plain(name, payload(3 * ARTICLE + 5, 203)),
+                Post::plain("lantern.par2", payload(ARTICLE, 7)),
             ];
             let mut scenario = Scenario::new(posts);
             if lost {
@@ -182,6 +185,112 @@ async fn a_recovery_file_no_object_holds_is_no_file_of_the_delivery() {
                 vec!["lantern beacon/lantern.mkv".to_string()],
                 "{said}"
             );
+            assert_eq!(
+                graph.report.as_ref().map(|report| report.health),
+                Some(1000),
+                "{said}"
+            );
         }
     }
+}
+
+// A file whose name has a letter and digits for an extension, `.p12` or
+// `.par01`, with no `.par` or `.par2` of its stem posted, is a plain file:
+// a name alone never makes a posted file recovery data. Posted alone or
+// beside a movie, it is handed over.
+#[tokio::test]
+async fn a_file_named_like_an_old_recovery_volume_with_no_set_is_delivered() {
+    let movie = payload(4 * ARTICLE + 17, 91);
+    let notes = payload(3 * ARTICLE + 5, 203);
+    let alone = run(&Scenario::new(vec![Post::plain(
+        "notes.p12",
+        notes.clone(),
+    )]))
+    .await;
+    assert_eq!(
+        alone.status,
+        Some(JobStatus::Complete),
+        "{:?}",
+        alone.failure
+    );
+    assert_eq!(alone.graph().delivery.whole, ["notes.p12"]);
+    assert!(alone.files["lantern beacon/notes.p12"] == notes);
+    let beside = run(&Scenario::new(vec![
+        Post::plain("lantern.mkv", movie.clone()),
+        Post::plain("notes.p12", notes.clone()),
+        Post::plain("notes.par01", payload(2 * ARTICLE + 9, 17)),
+    ]))
+    .await;
+    let delivery = &beside.graph().delivery;
+    assert_eq!(
+        beside.status,
+        Some(JobStatus::Complete),
+        "{:?}",
+        beside.failure
+    );
+    assert_eq!(delivery.whole, ["lantern.mkv", "notes.p12", "notes.par01"]);
+    assert_eq!(
+        beside.files.keys().cloned().collect::<Vec<_>>(),
+        [
+            "lantern beacon/lantern.mkv",
+            "lantern beacon/notes.p12",
+            "lantern beacon/notes.par01",
+        ],
+    );
+}
+
+// A plain `.p12` that lost an article is a damaged file of the delivery,
+// and its loss counts toward the job's health as any payload file's does.
+#[tokio::test]
+async fn a_plain_file_named_like_an_old_recovery_volume_counts_its_loss() {
+    let movie = payload(4 * ARTICLE + 17, 91);
+    let graph = run(&Scenario::new(vec![
+        Post::plain("lantern.mkv", movie.clone()),
+        Post::plain("notes.p12", payload(3 * ARTICLE + 5, 203)),
+    ])
+    .lost(1, 1))
+    .await;
+    let delivery = &graph.graph().delivery;
+    let report = graph
+        .report
+        .as_ref()
+        .map(|report| (report.health, report.failed_bytes));
+    let said = format!("{:?} {:?} {report:?}", graph.status, graph.failure);
+    assert_eq!(graph.status, Some(JobStatus::Partial), "{said}");
+    assert_eq!(delivery.whole, ["lantern.mkv"], "{said}");
+    assert_eq!(delivery.damaged, ["notes.p12"], "{said}");
+    assert!(
+        report.is_some_and(|(health, failed)| health < 1000 && failed > 0),
+        "{said}"
+    );
+}
+
+// A `.p01` beside a PAR2 set of its stem that covers the movie, its bytes
+// no volume of the set, is recovery data: an article it lost leaves the
+// movie whole, the job Complete, the `.p01` out of the delivery and the
+// job's health untouched.
+#[tokio::test]
+async fn an_unused_old_volume_beside_its_set_costs_nothing_when_it_loses_an_article() {
+    let movie = payload(4 * ARTICLE + 17, 91);
+    let mut posts = vec![
+        Post::plain("lantern.mkv", movie.clone()),
+        Post::plain("lantern.p01", payload(3 * ARTICLE + 5, 203)),
+    ];
+    posts.extend(par2_set("lantern", &[("lantern.mkv", &movie)], 2));
+    let graph = run(&Scenario::new(posts).lost(1, 1)).await;
+    let delivery = &graph.graph().delivery;
+    let report = graph
+        .report
+        .as_ref()
+        .map(|report| (report.health, report.failed_bytes));
+    let said = format!("{:?} {:?} {report:?}", graph.status, graph.failure);
+    assert_eq!(graph.status, Some(JobStatus::Complete), "{said}");
+    assert_eq!(delivery.whole, ["lantern.mkv"], "{said}");
+    assert!(delivery.damaged.is_empty(), "{said}");
+    assert_eq!(
+        graph.files.keys().cloned().collect::<Vec<_>>(),
+        vec!["lantern beacon/lantern.mkv".to_string()],
+        "{said}"
+    );
+    assert_eq!(report.map(|(health, _)| health), Some(1000), "{said}");
 }

@@ -203,9 +203,11 @@ impl GraphJob {
         self.passwords.last_offered(node)
     }
 
-    // The root's facts, with the job's count of repair reads and the phase
-    // it last reported, encoded into `encoded`.
+    // The root's facts, with the job's count of repair reads, the phase it
+    // last reported and whether it ever reported Repairing, encoded into
+    // `encoded`.
     pub(crate) fn encode_root(&self, encoded: &mut Encoded, next_node: u32) -> Encoding {
+        encoded.note_repair_entered(self.repair_reported);
         self.root.encode(
             encoded,
             next_node,

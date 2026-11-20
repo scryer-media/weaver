@@ -323,6 +323,9 @@ pub struct Namespace {
     // The members posted more than once whose own posting ended. Such a
     // member closes once its own posting and every further one have.
     ended: BTreeSet<MemberId>,
+    // The names of every record, kept as they come, change and go, so
+    // what a member is by the names beside it is a lookup.
+    listing: crate::sniff::Listing,
     // How many further postings' records `copies_of` has read.
     #[cfg(test)]
     copies_read: AtomicUsize,
@@ -444,6 +447,7 @@ impl Namespace {
     pub fn announce(&mut self, name: &str, length: Option<u64>) -> MemberId {
         let id = MemberId(self.next);
         self.next += 1;
+        self.listing.add(name);
         self.members.insert(
             id,
             Member {
@@ -469,7 +473,9 @@ impl Namespace {
     pub fn restore(&mut self, member: Member) {
         self.next = self.next.max(member.id.0 + 1);
         let (id, now) = (member.id, member.closed);
+        self.listing.add(&member.name);
         if let Some(was) = self.members.insert(id, member) {
+            self.listing.forget(&was.name);
             self.closing(id, was.closed, now);
         }
     }
@@ -1001,6 +1007,8 @@ impl Namespace {
     // whose ledger moves its output name, in `Tree::rename`.
     pub fn rename(&mut self, member: MemberId, name: &str) -> Option<&Member> {
         let found = self.members.get_mut(&member)?;
+        self.listing.forget(&found.name);
+        self.listing.add(name);
         found.name = name.to_owned();
         Some(found)
     }
@@ -1011,6 +1019,8 @@ impl Namespace {
     // past the length is not it.
     pub fn recognise(&mut self, member: MemberId, name: &str, length: u64) -> Option<&Member> {
         let found = self.members.get_mut(&member)?;
+        self.listing.forget(&found.name);
+        self.listing.add(name);
         found.name = name.to_owned();
         let reached = found.coverage.runs().last().map_or(0, |run| run.range.end);
         if reached > length {
@@ -1088,12 +1098,22 @@ impl Namespace {
         for copy in copies {
             self.unlink(copy);
             self.first_bytes.remove(&copy);
-            self.members.remove(&copy);
+            if let Some(gone) = self.members.remove(&copy) {
+                self.listing.forget(&gone.name);
+            }
         }
         self.unlink(member);
         self.ended.remove(&member);
         self.first_bytes.remove(&member);
-        self.members.remove(&member)
+        let gone = self.members.remove(&member)?;
+        self.listing.forget(&gone.name);
+        Some(gone)
+    }
+
+    // Whether a member's name is a recovery volume's by the names of the
+    // namespace beside it (`Listing::recovery`).
+    pub fn names_recovery_beside(&self, name: &str) -> bool {
+        self.listing.recovery(name)
     }
 
     // Keep the part of a delivered range that lies in the member's first
@@ -1282,6 +1302,31 @@ fn gaps(range: ByteRange, covered: &Coverage) -> Vec<ByteRange> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A namespace's listing follows its members' names as they come,
+    // change and go: an old `.p01` is recovery data only while a `.par2`
+    // of its stem is a member's name.
+    #[test]
+    fn a_namespace_tells_old_numbered_volumes_by_its_members_now() {
+        let mut namespace = Namespace::new();
+        namespace.announce("x.p01", Some(10));
+        assert!(!namespace.names_recovery_beside("x.p01"));
+        let index = namespace.announce("a9f3c1e0", Some(10));
+        assert!(!namespace.names_recovery_beside("x.p01"));
+        namespace.rename(index, "x.par2");
+        assert!(namespace.names_recovery_beside("x.p01"));
+        let again = namespace.announce("x.par2", Some(10));
+        namespace.remove(index);
+        assert!(namespace.names_recovery_beside("x.p01"));
+        namespace.recognise(again, "x.bin", 10);
+        assert!(!namespace.names_recovery_beside("x.p01"));
+        let restored = namespace.get(again).cloned().map(|mut member| {
+            member.name = "x.par2".to_owned();
+            member
+        });
+        namespace.restore(restored.expect("member"));
+        assert!(namespace.names_recovery_beside("x.p01"));
+    }
 
     fn runs(coverage: &Coverage) -> Vec<(u64, u64, Provenance)> {
         coverage

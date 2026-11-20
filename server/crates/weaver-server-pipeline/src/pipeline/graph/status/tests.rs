@@ -511,6 +511,7 @@ fn repair_failures(job: &Prepared) -> Vec<String> {
         RootPhase::Done,
         job,
         true,
+        None,
     )
     .into_iter()
     .filter_map(|event| match event {

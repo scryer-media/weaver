@@ -1328,17 +1328,19 @@ impl Drop for Caps {
 }
 
 // Whether a post is recovery data: a recovery object holds it or gave it
-// up, or, held by none, its posted name says so.
+// up, or, held by none, its posted name says so among the posted names
+// (`Namespace::names_recovery_beside`).
 fn recovery_post(tree: &Tree, member: MemberId) -> bool {
     match tree
         .child_of(NodeId::ROOT, member)
         .or_else(|| tree.retired(NodeId::ROOT, member))
     {
         Some((object, _)) => tree.recovers(object),
-        None => tree
-            .namespace(NodeId::ROOT)
-            .and_then(|namespace| namespace.get(member))
-            .is_some_and(|record| weaver_graph::names_recovery(&record.name)),
+        None => tree.namespace(NodeId::ROOT).is_some_and(|namespace| {
+            namespace
+                .get(member)
+                .is_some_and(|record| namespace.names_recovery_beside(&record.name))
+        }),
     }
 }
 

@@ -146,6 +146,31 @@ pub(crate) fn spawn_event_persistence_task(
     })
 }
 
+// The timeline row a job's event is recorded as, at `now` unless the event
+// says when what it reports happened: a repair failure is said as the job
+// ends, and is recorded when its repair stopped running.
+pub(crate) fn job_event_row(
+    event: &PipelineEvent,
+    now: i64,
+) -> Option<weaver_server_core::JobEvent> {
+    let gql = weaver_server_api::PipelineEventGql::from(event);
+    let job_id = gql.job_id?;
+    let timestamp = match event {
+        PipelineEvent::RepairFailed {
+            ended_at_ms: Some(ended_at),
+            ..
+        } => *ended_at,
+        _ => now,
+    };
+    Some(weaver_server_core::JobEvent {
+        job_id,
+        timestamp,
+        kind: format!("{:?}", gql.kind),
+        message: gql.message,
+        file_id: gql.file_id,
+    })
+}
+
 async fn persist_events(
     mut rx: broadcast::Receiver<PipelineEvent>,
     db: Database,
@@ -187,7 +212,7 @@ async fn persist_events(
                     }
                 }
                 for waiting in &waiting {
-                    if let Some(row) = job_event_row(&waiting.terminal) {
+                    if let Some(row) = kept_job_event_row(&waiting.terminal) {
                         settled.insert(row.job_id);
                         batch.push(row);
                     }
@@ -254,32 +279,22 @@ fn record_job_event(
             | PipelineEvent::JobFailed { .. }
             | PipelineEvent::JobCancelled { .. }
     );
-    if let Some(row) = job_event_row(event) {
+    if let Some(row) = kept_job_event_row(event) {
         batch.push(row);
     }
     barrier
 }
 
 // The job event row an event is kept as, if it is kept.
-fn job_event_row(event: &PipelineEvent) -> Option<weaver_server_core::JobEvent> {
-    use weaver_server_api::PipelineEventGql;
-
+fn kept_job_event_row(event: &PipelineEvent) -> Option<weaver_server_core::JobEvent> {
     if !should_record_job_event(event) {
         return None;
     }
-    let gql = PipelineEventGql::from(event);
-    let job_id = gql.job_id?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64;
-    Some(weaver_server_core::JobEvent {
-        job_id,
-        timestamp: now,
-        kind: format!("{:?}", gql.kind),
-        message: gql.message,
-        file_id: gql.file_id,
-    })
+    job_event_row(event, now)
 }
 
 async fn flush_job_event_batch(db: &Database, batch: &mut Vec<weaver_server_core::JobEvent>) {

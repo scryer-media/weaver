@@ -928,22 +928,25 @@ impl Tree {
     // consumed, whose output is what the object hands over in its stead,
     // unless it is a recovery object's whose volumes are released, as a
     // listing is kept beside what it lists. A member no object holds is
-    // spent when its posted name says it is recovery data: one whose first
-    // bytes were lost never said by them which set it is. One an object
-    // that is not a recovery object refused is that object's file, never
-    // spent, as the status reads it.
+    // spent when its posted name, among the names beside it, says it is
+    // recovery data (`Listing::recovery`): one whose first bytes were lost
+    // never said by them which set it is. A `.p12` with no set of its stem
+    // beside it is a plain file, and is handed over. One an object that is
+    // not a recovery object refused is that object's file, never spent, as
+    // the status reads it.
     pub fn spends(&self, node: NodeId, member: MemberId) -> bool {
         match self.child_of(node, member) {
             Some((child, _)) => self
                 .recovery(child)
                 .is_none_or(|recovery| !recovery.released()),
             None => {
-                self.namespace(node)
-                    .and_then(|namespace| namespace.get(member))
-                    .is_some_and(|record| crate::sniff::names_recovery(&record.name))
-                    && self
-                        .refused_by(node, member)
-                        .is_none_or(|owner| self.recovers(owner))
+                self.namespace(node).is_some_and(|namespace| {
+                    namespace
+                        .get(member)
+                        .is_some_and(|record| namespace.names_recovery_beside(&record.name))
+                }) && self
+                    .refused_by(node, member)
+                    .is_none_or(|owner| self.recovers(owner))
             }
         }
     }

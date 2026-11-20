@@ -133,6 +133,7 @@ fn full() -> Snapshot {
         },
         root: RootFacts {
             pending_verifications: Vec::new(),
+            repair_entered: false,
             next_node: 3,
             posted: vec!["alpha.part1.rar".to_owned(), "alpha.par2".to_owned()],
             volumes: vec![
@@ -870,6 +871,7 @@ fn what_a_restore_fetches_again_is_not_in_hand() {
     };
     let root = RootFacts {
         pending_verifications: Vec::new(),
+        repair_entered: false,
         next_node: 1,
         posted: vec!["alpha.bin".to_owned(), "beta.bin".to_owned()],
         volumes: vec![

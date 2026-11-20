@@ -127,8 +127,10 @@ impl GraphJob {
             runs,
             passwords: Passwords::from_candidates(storage.passwords),
             reported: snapshot.root.reported,
-            repair_reported: snapshot.root.reported
-                == Some(crate::pipeline::graph::root::phase::RootPhase::Repairing),
+            repair_reported: snapshot.root.repair_entered
+                || snapshot.root.reported
+                    == Some(crate::pipeline::graph::root::phase::RootPhase::Repairing),
+            repair_ended_at: None,
             pending: Pending::default(),
             mail_owed: None,
             stopped_repair: None,

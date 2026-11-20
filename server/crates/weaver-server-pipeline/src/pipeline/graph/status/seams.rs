@@ -951,7 +951,14 @@ impl Pipeline {
             return;
         };
         metrics::phase(phase);
-        let mut stage = stage_events(job_id, before, phase, &*graph, graph.repair_reported());
+        let mut stage = stage_events(
+            job_id,
+            before,
+            phase,
+            &*graph,
+            graph.repair_reported(),
+            graph.repair_ended_at(),
+        );
         if phase == RootPhase::Done {
             self.post_probes.retire(job_id);
             log_set_rulings(job_id, graph);
@@ -1110,13 +1117,16 @@ impl Pipeline {
 // could not rebuild what it found: a set that ruled so while another object
 // had still to repair is said nothing of when that repair made it good. A
 // set that ruled so where another set of its namespace vouched and left it
-// clean is not a failure of the job, and says none.
+// clean is not a failure of the job, and says none. The failure carries when
+// the repair stopped running, so the job's timeline puts it there and not at
+// the job's end.
 pub(super) fn stage_events(
     job_id: JobId,
     before: Option<RootPhase>,
     phase: RootPhase,
     job: &dyn RootJob,
     repair_reported: bool,
+    repair_ended_at: Option<i64>,
 ) -> Vec<PipelineEvent> {
     let summary = job.recovery_summary();
     let mut events = Vec::new();
@@ -1152,6 +1162,7 @@ pub(super) fn stage_events(
                 error: format!(
                     "not repairable: {damaged} damaged slices, only {reachable} recovery blocks reachable"
                 ),
+                ended_at_ms: repair_ended_at,
             });
         }
     }

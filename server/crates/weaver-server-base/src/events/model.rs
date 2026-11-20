@@ -219,10 +219,14 @@ pub enum PipelineEvent {
         blocks_repaired: u64,
     },
 
-    // Recovery repair failed.
+    // Recovery repair failed. It is said as the job ends, so it carries the
+    // moment its repair stopped running, epoch milliseconds, for the job's
+    // timeline to record it at; none when the job's repair ended in an
+    // earlier run of the process.
     RepairFailed {
         job_id: JobId,
         error: String,
+        ended_at_ms: Option<i64>,
     },
 
     // ---- Extraction stage ----

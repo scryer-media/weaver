@@ -186,9 +186,13 @@ pub struct GraphJob {
     passwords: Passwords,
     // The phase last reported, so only a change is reported.
     reported: Option<RootPhase>,
-    // Whether the job reported Repairing in this run, or was restored
-    // reporting it: its end says a repair failed only then.
+    // Whether the job reported Repairing since it was added, in this run or
+    // one its checkpoint was taken in: its end says a repair failed only then.
     repair_reported: bool,
+    // When, epoch milliseconds, the job last left Repairing in this run: the
+    // end of the repair a failure at the job's end says. Not kept across a
+    // restart; a job restored past its repair has none.
+    repair_ended_at: Option<i64>,
     // The checkpoint waiting for the database, if one is.
     pending: Pending,
     // A member's file waits to move on a checkpoint the database has not
@@ -324,6 +328,7 @@ impl GraphJob {
             passwords: Passwords::default(),
             reported: None,
             repair_reported: false,
+            repair_ended_at: None,
             pending: Pending::default(),
             mail_owed: None,
             stopped_repair: None,
@@ -395,9 +400,14 @@ impl GraphJob {
         self.reported
     }
 
-    // Whether the job reported Repairing since it was added or restored.
+    // Whether the job reported Repairing since it was added.
     pub(crate) fn repair_reported(&self) -> bool {
         self.repair_reported
+    }
+
+    // When the job last left Repairing in this run, epoch milliseconds.
+    pub(crate) fn repair_ended_at(&self) -> Option<i64> {
+        self.repair_ended_at
     }
 
     // The candidates offered to an object that asks for a password.
@@ -1604,6 +1614,9 @@ impl GraphJob {
         #[cfg(not(test))]
         let phase = self.phase();
         (self.reported != Some(phase)).then(|| {
+            if self.reported == Some(RootPhase::Repairing) {
+                self.repair_ended_at = Some(crate::jobs::epoch_ms_now() as i64);
+            }
             self.reported = Some(phase);
             self.repair_reported |= phase == RootPhase::Repairing;
             phase

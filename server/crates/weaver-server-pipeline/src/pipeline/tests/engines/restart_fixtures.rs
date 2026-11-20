@@ -818,6 +818,100 @@ pub async fn run_restarted_once_done(scenario: &Scenario) -> RestartedDone {
     }
 }
 
+// The job served as `run` serves it, and the pipeline taken down once, the
+// first time the job has reported Repairing and then a phase past it that is
+// not its end: a restart between its repair and its end.
+pub async fn run_restarted_after_repairing(scenario: &Scenario) -> RestartedDone {
+    use crate::pipeline::graph::root::phase::RootPhase;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) =
+        new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
+    scenario.prepare(&mut pipeline);
+    insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
+    let mut sent = pipeline.event_tx.subscribe();
+    let mut events = Vec::new();
+    let mut in_memory = BTreeSet::new();
+    let mut restarted = false;
+    let mut quiet = 0;
+    let mut asked = 0usize;
+    let past_repair = |pipeline: &Pipeline| {
+        pipeline.graph_jobs.get(&JOB).is_some_and(|job| {
+            job.repair_reported()
+                && !matches!(
+                    job.reported_phase(),
+                    None | Some(RootPhase::Repairing | RootPhase::Done)
+                )
+        })
+    };
+    loop {
+        while let Some(work) = next_work(&mut pipeline, scenario) {
+            let article = (
+                work.segment_id.file_id.file_index,
+                work.segment_id.segment_number,
+            );
+            asked += 1;
+            super::harness::serve(&mut pipeline, scenario, article).await;
+            if !restarted && past_repair(&pipeline) {
+                break;
+            }
+        }
+        if finished(&pipeline) {
+            break;
+        }
+        if !restarted && past_repair(&pipeline) {
+            // A run still out is heard where it stands, as a shutdown does.
+            pipeline.drain().await;
+            drain(&mut sent, &mut events);
+            (pipeline, sent) =
+                restart_heard(&temp_dir, pipeline, scenario, &mut in_memory, &mut |_| {}).await;
+            restarted = true;
+            continue;
+        }
+        let before = asked;
+        if pipeline.jobs.contains_key(&JOB) {
+            pipeline.check_job_completion(JOB).await;
+        }
+        pump_pipeline_runtime_queues(&mut pipeline).await;
+        if finished(&pipeline) {
+            break;
+        }
+        if pipeline
+            .graph_jobs
+            .get(&JOB)
+            .is_some_and(|job| job.awaits_mail())
+        {
+            let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
+            pipeline.graph_run_said(said);
+            continue;
+        }
+        if asked == before {
+            quiet += 1;
+            assert!(
+                quiet < 3,
+                "restarted job stalled at {:?}",
+                job_status_for_assert(&pipeline, JOB)
+            );
+        } else {
+            quiet = 0;
+        }
+    }
+    assert!(
+        restarted,
+        "the job left repair for no other phase before its end"
+    );
+    let status = job_status_for_assert(&pipeline, JOB);
+    pipeline.db.flush_write_queue().await.unwrap();
+    drain(&mut sent, &mut events);
+    let mut files = BTreeMap::new();
+    collect(&complete_dir, &complete_dir, &mut files);
+    retire_pipeline_database(pipeline).await;
+    RestartedDone {
+        status,
+        files,
+        events,
+    }
+}
+
 pub fn member_check_bytes() -> u64 {
     crate::pipeline::graph::namespace::checked::so_far()
 }
