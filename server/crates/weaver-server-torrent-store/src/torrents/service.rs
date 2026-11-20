@@ -8,7 +8,6 @@
 use crate::torrents::files;
 use crate::torrents::files::Files;
 use crate::torrents::history_persistence::HistoryFile;
-use crate::torrents::history_persistence::TorrentHistoryDatabase;
 use crate::torrents::history_persistence::TorrentsPersistenceMarkTorrentRetiringInternalQueries;
 use crate::torrents::metainfo;
 use crate::torrents::model::Adopted;
@@ -115,7 +114,7 @@ pub fn listed_files(deletion: &Deletion) -> Vec<HistoryFile> {
 // is read once for all of them; when that read fails, those that would
 // delete stay retiring for the next try. Reads and deletes on the calling
 // thread: run off the runtime.
-pub fn finish_retiring<D: TorrentHistoryDatabase>(
+pub fn finish_retiring<D: TorrentDatabase + 'static>(
     db: &D,
     work: &Path,
 ) -> Result<

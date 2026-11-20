@@ -17,18 +17,3 @@ impl weaver_server_torrent_store::torrents::queries::TorrentDatabase for crate::
         Some(&self.torrent_reads)
     }
 }
-
-impl weaver_server_torrent_store::torrents::history_persistence::TorrentHistoryDatabase
-    for crate::Database
-{
-    fn insert_job_history_tx<'a>(
-        tx: &'a mut crate::persistence::sql_runtime::SqlTx<'_>,
-        entry: &'a crate::history::record::JobHistoryRow,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(), crate::StateError>> + Send + 'a>,
-    > {
-        Box::pin(crate::history::persistence::insert_job_history_tx(
-            tx, entry,
-        ))
-    }
-}

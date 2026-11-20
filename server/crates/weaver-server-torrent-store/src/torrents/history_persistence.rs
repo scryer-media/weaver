@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::Pin;
 
 use super::model::HistoryEnd;
 use super::persistence::{RetiringMark, delete_torrent_tx, stored, update_column_tx};
@@ -12,18 +10,8 @@ use weaver_server_base::jobs::ids::JobId;
 use weaver_server_db::persistence::StateError;
 use weaver_server_db::persistence::connection::Database as SqlDatabase;
 use weaver_server_db::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx};
+use weaver_server_history::history::persistence::insert_job_history_tx;
 use weaver_server_history::history::record::JobHistoryRow;
-
-// A database that writes a torrent's job's history row in a transaction:
-// the history row, its attributes and its duplicate identity's move, as the
-// history persistence writes them (`insert_job_history_tx`). The composed
-// database forwards to that function.
-pub trait TorrentHistoryDatabase: TorrentDatabase + 'static {
-    fn insert_job_history_tx<'a>(
-        tx: &'a mut SqlTx<'_>,
-        entry: &'a JobHistoryRow,
-    ) -> Pin<Box<dyn Future<Output = Result<(), StateError>> + Send + 'a>>;
-}
 
 pub trait TorrentsPersistenceMarkTorrentRetiringInternalQueries {
     fn mark_torrent_retiring(&self, job_id: JobId, delete_files: bool) -> Result<(), StateError>;
@@ -36,7 +24,7 @@ pub trait TorrentsPersistenceMarkTorrentRetiringInternalQueries {
     ) -> RetiringArchived;
 }
 
-impl<D: TorrentHistoryDatabase> TorrentsPersistenceMarkTorrentRetiringInternalQueries for D {
+impl<D: TorrentDatabase + 'static> TorrentsPersistenceMarkTorrentRetiringInternalQueries for D {
     // A removal's mark, before anything of the torrent goes: the flag that
     // it is leaving, and whether its files go with it (`delete_files`). A
     // stop from then on brings it back retiring, never live, and the next
@@ -190,7 +178,7 @@ trait TorrentsPersistenceWriteRetiringLocalQueries {
     ) -> Result<Vec<JobId>, StateError>;
 }
 
-impl<D: TorrentHistoryDatabase> TorrentsPersistenceWriteRetiringLocalQueries for D {
+impl<D: TorrentDatabase + 'static> TorrentsPersistenceWriteRetiringLocalQueries for D {
     // `rows` to history, out of the torrents, in one transaction.
     fn write_retiring(
         &self,
@@ -215,7 +203,7 @@ impl<D: TorrentHistoryDatabase> TorrentsPersistenceWriteRetiringLocalQueries for
                     let mut written = Vec::with_capacity(rows.len());
                     for (job_id, entry, files) in &rows {
                         let id = stored(job_id.0)?;
-                        D::insert_job_history_tx(tx, entry).await?;
+                        insert_job_history_tx(tx, entry).await?;
                         write_history_files_tx(tx, id, files).await?;
                         delete_torrent_tx(tx, id).await?;
                         written.push(*job_id);
