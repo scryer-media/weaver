@@ -240,7 +240,7 @@ impl AllocationState {
     }
 }
 
-pub(super) struct PreparedUpdate {
+pub struct PreparedUpdate {
     route: Route,
     legs: Vec<Arc<dyn Dialer>>,
     cap: u16,
@@ -608,7 +608,7 @@ impl Weighted {
         self.apply_update(Self::prepare_update(route, legs, cap)?);
         Ok(())
     }
-    pub(super) fn prepare_update(
+    pub fn prepare_update(
         route: Route,
         legs: Vec<Arc<dyn Dialer>>,
         cap: u16,
@@ -619,7 +619,7 @@ impl Weighted {
         }
         Ok(PreparedUpdate { route, legs, cap })
     }
-    pub(super) fn apply_update(&self, update: PreparedUpdate) {
+    pub fn apply_update(&self, update: PreparedUpdate) {
         let PreparedUpdate { route, legs, cap } = update;
         let mut state = self.shared.state.lock().expect("leg allocation");
         let mut old = self.legs.write().expect("route stages");

@@ -15,6 +15,7 @@ use super::quota_events::QuotaEventDirs;
 use super::runner::CompatibilityFacts;
 use crate::Database;
 use crate::proxies::{RouteChange, RouteEvent, RouteHealth};
+use weaver_server_net::proxies::route_health::follow_routes;
 
 /// Queue a ROUTE_DOWN or ROUTE_UP event for each route `health` tells of,
 /// and tell the downs that waited out the quiet period when it ends. Ends
@@ -27,45 +28,6 @@ pub fn spawn_route_events(
     follow_routes(health, move |event| {
         if db.queue_scripts_possible() {
             drop(db.admit_queue_script_event(route_event(event, &dirs), false));
-        }
-    })
-}
-
-// Hand `raise` each route `health` tells of, and tell the downs that waited
-// out the quiet period when it ends. Ends once `health` is dropped.
-pub(crate) fn follow_routes(
-    health: &Arc<RouteHealth>,
-    mut raise: impl FnMut(&RouteEvent) + Send + 'static,
-) -> tokio::task::JoinHandle<()> {
-    let mut events = health.subscribe();
-    let rearmed = health.rearmed();
-    let health = Arc::downgrade(health);
-    tokio::spawn(async move {
-        loop {
-            let due = match health.upgrade() {
-                Some(health) => health.due(),
-                None => return,
-            };
-            let wait = async {
-                match due {
-                    Some(due) => tokio::time::sleep_until(due.into()).await,
-                    None => std::future::pending().await,
-                }
-            };
-            tokio::select! {
-                event = events.recv() => {
-                    let Some(event) = event else {
-                        return;
-                    };
-                    raise(&event);
-                }
-                () = rearmed.notified() => {}
-                () = wait => {
-                    if let Some(health) = health.upgrade() {
-                        health.settle();
-                    }
-                }
-            }
         }
     })
 }

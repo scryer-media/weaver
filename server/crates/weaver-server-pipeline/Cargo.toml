@@ -78,13 +78,10 @@ unrar-rs = { workspace = true, features = [
 ] }
 serde = { workspace = true }
 blake3 = { workspace = true }
-unicode-normalization = { workspace = true }
-unicase = { version = "2.10.0", default-features = false }
 crc-turbo = { workspace = true }
 thiserror = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
-crossbeam-queue = { workspace = true }
 bitvec = { workspace = true }
 weaver-torrent = { workspace = true }
 # The storage trait weaver-torrent calls returns `anyhow::Result`.
@@ -94,24 +91,17 @@ tokio = { workspace = true }
 # Named for `rustls` itself: the upgrade downloader and the Sigstore trust-root
 # refresh both need the process default crypto provider installed.
 tokio-rustls = { workspace = true }
-# The subject and the end of validity of a tracker rule's SSL certificate.
-x509-parser = { version = "0.18", default-features = false }
 toml = { workspace = true }
 rayon = { workspace = true, default-features = false }
 libc = { workspace = true }
-# A torrent piece in flight is an anonymous mapping: the OS backs its pages
-# only as its blocks arrive (`torrents/storage.rs`).
-memmap2 = { workspace = true }
 chrono = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 sha2 = { workspace = true }
-hmac = { workspace = true, default-features = false }
 reqwest = { workspace = true }
 semver = { workspace = true }
 httpdate = { workspace = true }
 regex = { workspace = true }
-ipnet = { workspace = true }
 quick-xml = { workspace = true }
 notify = { workspace = true }
 zstd = { workspace = true }
@@ -126,15 +116,12 @@ sqlx = { workspace = true }
 rmp-serde = { workspace = true, default-features = false }
 tempfile = { workspace = true }
 filetime = { workspace = true }
-aes-gcm = { workspace = true }
 base64 = { workspace = true }
 sevenz-turbo = { workspace = true }
 lzma-turbo = { workspace = true }
-argon2 = { workspace = true }
 getrandom = { workspace = true, default-features = false }
 hex = { workspace = true }
 pbkdf2 = { workspace = true }
-if-addrs = "0.15.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = { workspace = true }

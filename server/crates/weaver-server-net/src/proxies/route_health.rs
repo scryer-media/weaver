@@ -402,7 +402,7 @@ impl RouteHealth {
     // Take the configured egresses, proxies, pools and the saved routes
     // that use them, forgetting what was seen of each route the change
     // disabled, deleted or edited.
-    pub(super) fn configure(
+    pub fn configure(
         &self,
         egresses: &HashMap<u32, EgressInterface>,
         profiles: &HashMap<u32, ProxyProfile>,
@@ -472,7 +472,7 @@ impl RouteHealth {
     // keeps what was last seen. An egress going down takes every proxy and
     // pool on it back to never seen; back up, each proxy on it is seen as
     // its hops last said.
-    pub(super) fn egress(&self, id: u32, health: &EgressHealth) {
+    pub fn egress(&self, id: u32, health: &EgressHealth) {
         let now = self.clock.now();
         let mut state = self.state.lock().expect("route health");
         let Some(egress) = state.egress(id) else {
@@ -560,7 +560,7 @@ impl RouteHealth {
     }
     // What a hop for proxy `proxy` at `revision` on egress `egress` tells,
     // above the proxies `beneath` it, nearest the egress first.
-    pub(super) fn watcher(
+    pub fn watcher(
         self: &Arc<Self>,
         egress: u32,
         beneath: &[u32],
@@ -593,6 +593,45 @@ impl HopWatcher for ProxyWatcher {
             health.proxy(&self.hop, self.revision, Some(fault));
         }
     }
+}
+
+// Hand `raise` each route `health` tells of, and tell the downs that waited
+// out the quiet period when it ends. Ends once `health` is dropped.
+pub fn follow_routes(
+    health: &Arc<RouteHealth>,
+    mut raise: impl FnMut(&RouteEvent) + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
+    let mut events = health.subscribe();
+    let rearmed = health.rearmed();
+    let health = Arc::downgrade(health);
+    tokio::spawn(async move {
+        loop {
+            let due = match health.upgrade() {
+                Some(health) => health.due(),
+                None => return,
+            };
+            let wait = async {
+                match due {
+                    Some(due) => tokio::time::sleep_until(due.into()).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                event = events.recv() => {
+                    let Some(event) = event else {
+                        return;
+                    };
+                    raise(&event);
+                }
+                () = rearmed.notified() => {}
+                () = wait => {
+                    if let Some(health) = health.upgrade() {
+                        health.settle();
+                    }
+                }
+            }
+        }
+    })
 }
 
 #[cfg(test)]

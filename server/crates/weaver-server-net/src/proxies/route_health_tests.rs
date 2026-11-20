@@ -671,7 +671,7 @@ async fn the_follower_raises_a_held_down_when_the_quiet_period_ends() {
     let health = RouteHealth::with_clock(Arc::new(RuntimeClock::at_unix_ms(0)));
     configure(&health, &[interface(3)], &[]);
     let (sender, mut raised) = mpsc::unbounded_channel();
-    let follower = crate::post_processing::route_events::follow_routes(&health, move |event| {
+    let follower = follow_routes(&health, move |event| {
         drop(sender.send(event.clone()));
     });
     let mut next = async || {
