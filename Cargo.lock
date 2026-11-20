@@ -6807,6 +6807,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "weaver-server-torrents"
+version = "0.16.17"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "weaver-graph",
+ "weaver-model",
+ "weaver-nzb",
+ "weaver-server-base",
+ "weaver-server-disk",
+ "weaver-server-net",
+ "weaver-server-postproc",
+ "weaver-server-settings",
+ "weaver-torrent",
+ "weaver-tunnel",
+]
+
+[[package]]
+name = "weaver-server-speedtest"
+version = "0.16.17"
+dependencies = [
+ "http",
+ "serde_json",
+ "url",
+]
+
+[[package]]
+name = "weaver-server-rss"
+version = "0.16.17"
+dependencies = [
+ "blake3",
+ "hex",
+ "serde_json",
+ "sha2 0.11.1",
+ "tokio",
+ "weaver-server-db",
+]
+
+[[package]]
 name = "weaver-server-db"
 version = "0.16.17"
 dependencies = [
@@ -6853,6 +6896,27 @@ dependencies = [
 name = "weaver-server-core"
 version = "0.16.17"
 dependencies = [
+ "blake3",
+ "criterion",
+ "hex",
+ "http",
+ "sevenz-turbo",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "toml",
+ "weaver-model",
+ "weaver-nntp",
+ "weaver-nzb",
+ "weaver-server-base",
+ "weaver-server-pipeline",
+ "zstd",
+]
+
+[[package]]
+name = "weaver-server-pipeline"
+version = "0.16.17"
+dependencies = [
  "aes-gcm",
  "anyhow",
  "application-updater",
@@ -6871,7 +6935,6 @@ dependencies = [
  "cap-std",
  "chrono",
  "crc-turbo",
- "criterion",
  "crossbeam-queue",
  "filetime",
  "flate2",
@@ -6933,7 +6996,10 @@ dependencies = [
  "weaver-server-migrations",
  "weaver-server-net",
  "weaver-server-postproc",
+ "weaver-server-rss",
  "weaver-server-settings",
+ "weaver-server-speedtest",
+ "weaver-server-torrents",
  "weaver-torrent",
  "weaver-tunnel",
  "weaver-yenc",

@@ -1,0 +1,31 @@
+[package]
+name = "weaver-server-torrents"
+description = "Torrent state, admission, piece layouts, disk writes and rate allocation"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[features]
+test-support = []
+
+[dependencies]
+anyhow = { version = "1", default-features = false, features = ["std"] }
+bytes = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+weaver-graph = { path = "../../../engines/weaver-graph" }
+weaver-model = { path = "../../../shared/crates/weaver-model", default-features = false }
+weaver-nzb = { path = "../../../engines/weaver-nzb", default-features = false }
+weaver-server-base = { path = "../weaver-server-base" }
+weaver-server-disk = { path = "../weaver-server-disk" }
+weaver-server-net = { path = "../weaver-server-net" }
+weaver-server-postproc = { path = "../weaver-server-postproc" }
+weaver-server-settings = { path = "../weaver-server-settings" }
+weaver-torrent = { workspace = true }
+weaver-tunnel = { path = "../../../engines/weaver-tunnel" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = { workspace = true }

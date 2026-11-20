@@ -1,0 +1,179 @@
+[package]
+name = "weaver-server-pipeline"
+description = "Download pipeline, queue and runtime services for Weaver"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[features]
+slow-tests = []
+# Hooks that let other crates' tests move stored state directly instead of
+# waiting on the wall clock. Never enabled outside dev-dependencies. The
+# tunnel's loopback certificate backs the speed test's HTTPS fixture, and
+# NNTP's direct test route serves servers built with no route of their own.
+test-support = [
+    "weaver-tunnel/test-support",
+    "weaver-nntp/test-support",
+    "weaver-server-base/test-support",
+    "weaver-server-disk/test-support",
+    "weaver-server-rss/test-support",
+    "weaver-server-torrents/test-support",
+    "weaver-server-db/test-support",
+    "weaver-server-net/test-support",
+    "weaver-server-ingest/test-support",
+    "weaver-server-auth/test-support",
+]
+# e2e builds only; see weaver-torrent's feature of the same name.
+e2e-local-trackers = ["weaver-torrent/e2e-local-trackers"]
+
+[dependencies]
+weaver-server-base = { path = "../weaver-server-base" }
+weaver-server-disk = { path = "../weaver-server-disk" }
+weaver-server-db = { path = "../weaver-server-db" }
+weaver-server-rss = { path = "../weaver-server-rss" }
+weaver-server-speedtest = { path = "../weaver-server-speedtest" }
+weaver-server-torrents = { path = "../weaver-server-torrents" }
+weaver-server-postproc = { path = "../weaver-server-postproc" }
+weaver-server-net = { path = "../weaver-server-net" }
+weaver-server-history = { path = "../weaver-server-history" }
+weaver-server-jobs = { path = "../weaver-server-jobs" }
+weaver-server-ingest = { path = "../weaver-server-ingest" }
+weaver-server-auth = { path = "../weaver-server-auth" }
+weaver-server-settings = { path = "../weaver-server-settings" }
+weaver-server-migrations = { path = "../weaver-server-migrations" }
+weaver-tunnel = { path = "../../../engines/weaver-tunnel" }
+async-trait = "0.1"
+# The in-application upgrade core: manifest validation, installation
+# classification, download, verification, extraction, promotion, rollback, the
+# durable journal and the Windows helper handoff. Pinned to a signed tag rather
+# than a branch, because everything in it is release-critical.
+application-updater = { git = "https://github.com/scryer-media/application-updater", tag = "v0.1.1" }
+# The signer-policy types, plus the Sigstore trust-root refresh Weaver primes at
+# startup. `verification` is named explicitly rather than left to feature
+# unification through `application-updater`.
+artifact-trust = { git = "https://github.com/scryer-media/artifact-trust", tag = "v0.1.3", default-features = false, features = [
+    "verification",
+] }
+weaver-graph = { path = "../../../engines/weaver-graph" }
+weaver-objects = { path = "../../../engines/weaver-objects" }
+weaver-model = { path = "../../../shared/crates/weaver-model", default-features = false }
+weaver-nntp = { path = "../../../engines/weaver-nntp", default-features = false }
+weaver-nzb = { path = "../../../engines/weaver-nzb", default-features = false }
+weaver-yenc = { path = "../../../engines/weaver-yenc", default-features = false }
+par2-rs = { workspace = true, features = [
+    "crypto-aws-lc",
+] }
+par3-rs = { workspace = true }
+# Already in the graph through par2-rs; named directly so System info can read
+# the XOR-JIT gate, which par2-rs does not re-export. The RAR3 recovery-volume
+# tests also author their `.rev` fixture with its RS coder.
+reedsolomon-rs = { version = "0.4.11", default-features = false }
+unrar-rs = { workspace = true, features = [
+    "crypto-aws-lc",
+] }
+serde = { workspace = true }
+blake3 = { workspace = true }
+unicode-normalization = { workspace = true }
+unicase = { version = "2.10.0", default-features = false }
+crc-turbo = { workspace = true }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+crossbeam-queue = { workspace = true }
+bitvec = { workspace = true }
+weaver-torrent = { workspace = true }
+# The storage trait weaver-torrent calls returns `anyhow::Result`.
+anyhow = { version = "1", default-features = false, features = ["std"] }
+sha1 = { workspace = true }
+tokio = { workspace = true }
+# Named for `rustls` itself: the upgrade downloader and the Sigstore trust-root
+# refresh both need the process default crypto provider installed.
+tokio-rustls = { workspace = true }
+# The subject and the end of validity of a tracker rule's SSL certificate.
+x509-parser = { version = "0.18", default-features = false }
+toml = { workspace = true }
+rayon = { workspace = true, default-features = false }
+libc = { workspace = true }
+# A torrent piece in flight is an anonymous mapping: the OS backs its pages
+# only as its blocks arrive (`torrents/storage.rs`).
+memmap2 = { workspace = true }
+chrono = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true, default-features = false }
+reqwest = { workspace = true }
+semver = { workspace = true }
+httpdate = { workspace = true }
+regex = { workspace = true }
+ipnet = { workspace = true }
+quick-xml = { workspace = true }
+notify = { workspace = true }
+zstd = { workspace = true }
+zip = { workspace = true }
+tar = { workspace = true }
+cap-std = { workspace = true }
+cap-fs-ext = { workspace = true }
+flate2 = { workspace = true }
+brotli = { workspace = true }
+bzip2 = { workspace = true }
+sqlx = { workspace = true }
+rmp-serde = { workspace = true, default-features = false }
+tempfile = { workspace = true }
+filetime = { workspace = true }
+aes-gcm = { workspace = true }
+base64 = { workspace = true }
+sevenz-turbo = { workspace = true }
+lzma-turbo = { workspace = true }
+argon2 = { workspace = true }
+getrandom = { workspace = true, default-features = false }
+hex = { workspace = true }
+pbkdf2 = { workspace = true }
+if-addrs = "0.15.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { workspace = true }
+security-framework-sys = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+cap-primitives = { workspace = true }
+keyring = { workspace = true }
+keyring-core = { workspace = true }
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_JobObjects", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+
+[dev-dependencies]
+weaver-server-torrents = { path = "../weaver-server-torrents", features = ["test-support"] }
+weaver-server-rss = { path = "../weaver-server-rss", features = ["test-support"] }
+weaver-server-net = { path = "../weaver-server-net", features = ["test-support"] }
+weaver-server-auth = { path = "../weaver-server-auth", features = ["test-support"] }
+weaver-server-ingest = { path = "../weaver-server-ingest", features = ["test-support"] }
+weaver-server-base = { path = "../weaver-server-base", features = ["test-support"] }
+weaver-server-disk = { path = "../weaver-server-disk", features = ["test-support"] }
+weaver-server-db = { path = "../weaver-server-db", features = ["test-support"] }
+weaver-nntp = { path = "../../../engines/weaver-nntp", default-features = false, features = ["test-support"] }
+weaver-graph = { path = "../../../engines/weaver-graph", features = ["test-support"] }
+weaver-objects = { path = "../../../engines/weaver-objects", features = ["test-support"] }
+weaver-tunnel = { path = "../../../engines/weaver-tunnel", features = ["test-support"] }
+serde_json = { workspace = true }
+# `test-util` for the paused clock: the health-probe reclaim tests assert on
+# multi-second timeout budgets, which only a mocked clock can settle without
+# either sleeping for real or trading determinism for speed.
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = { workspace = true }
+# `compress` pulls in the 7z writer, which only the direct-unpack read-pattern
+# tests need: they build their codec-matrix archives in-process rather than
+# checking in a fixture per chain. Test-only on purpose — the shipped binary
+# never encodes 7z.
+sevenz-turbo = { workspace = true, features = ["compress"] }
+axum = { workspace = true }
+# The manifest-fetch-order tests drive the shared fetch against a local server
+# with signature verification stubbed. `test-seams` is a dev-dependency feature
+# on purpose: the shipped binary must never be able to skip verification.
+application-updater = { git = "https://github.com/scryer-media/application-updater", tag = "v0.1.1", features = ["test-seams"] }
+# `UpgradeManifestFetchOverrides::asset_base` is a `url::Url`; already in the
+# graph through reqwest, named here only so the test can build one.
+url = "2"
+lzma-turbo = { workspace = true, features = ["enc"] }
+# A tracker rule's certificate and keys, made in-test.
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
