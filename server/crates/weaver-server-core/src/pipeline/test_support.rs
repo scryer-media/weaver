@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::history::persistence::HistoryPersistenceRecordArchivedHistoryFilesInternalQueries;
 
 /// An isolated pipeline with no network providers and a fixed machine profile.
 /// The caller owns its task and temporary directories.

@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::jobs::persistence::JobsPersistenceQueries;
 
 // Runtime row writes queued, for tests that pin how many a path makes. Each
 // test runs in its own process, so a count is the test's own.

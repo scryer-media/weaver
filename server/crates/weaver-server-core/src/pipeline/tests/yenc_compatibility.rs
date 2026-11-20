@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::jobs::graph_checkpoint::JobsGraphCheckpointInternalQueries;
 
 async fn setup(temp: &TempDir, id: u64, sizes: &[u32]) -> (Pipeline, NzbFileId, PathBuf) {
     let (mut pipeline, _, _) = new_direct_pipeline(temp).await;

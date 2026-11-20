@@ -7,6 +7,8 @@
 // from the script each time it is wanted and is never saved: once an instance
 // exists, editing the header changes nothing about it.
 
+use crate::post_processing::instances::PostProcessingInstancesQueries;
+use crate::post_processing::settings::PostProcessingSettingsQueries;
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::instances::{
@@ -230,19 +232,33 @@ pub enum HeaderSetupError {
     Storage(#[from] StateError),
 }
 
-impl Database {
+trait PostProcessingPresetLocalQueries {
+    fn discovered_script(&self, script: &ScriptName) -> Result<DiscoveredScript, HeaderSetupError>;
+}
+
+impl PostProcessingPresetLocalQueries for Database {
     fn discovered_script(&self, script: &ScriptName) -> Result<DiscoveredScript, HeaderSetupError> {
         resolve_script(&self.post_processing_script_directory()?, script)
             .map_err(|error| HeaderSetupError::Script(error.to_string()))
     }
+}
 
+pub trait PostProcessingPresetQueries {
+    fn set_up_script_from_header(
+        &self,
+        script: &ScriptName,
+    ) -> Result<HeaderSetup, HeaderSetupError>;
+    fn reapply_script_header(&self, id: &str) -> Result<ScriptInstance, HeaderSetupError>;
+}
+
+impl PostProcessingPresetQueries for Database {
     // Create every instance a script's header asks for and does not have
     // yet: one per declared trigger, each filled from the header. A new
     // schedule job runs at the times the header declares.
     //
     // Running it again adds only what is still missing, so a trigger the
     // header gained later can be picked up without touching what is saved.
-    pub fn set_up_script_from_header(
+    fn set_up_script_from_header(
         &self,
         script: &ScriptName,
     ) -> Result<HeaderSetup, HeaderSetupError> {
@@ -273,7 +289,7 @@ impl Database {
     }
 
     // Bring one instance's inputs back in line with its script's header.
-    pub fn reapply_script_header(&self, id: &str) -> Result<ScriptInstance, HeaderSetupError> {
+    fn reapply_script_header(&self, id: &str) -> Result<ScriptInstance, HeaderSetupError> {
         let instance = self
             .script_instance(id)?
             .ok_or(ScriptInstanceError::NotFound)?;
@@ -289,6 +305,10 @@ mod tests {
     use super::super::model::OptionName;
     use super::super::secrets::SecretRef;
     use super::*;
+    use crate::post_processing::instances::PostProcessingInstancesInternalQueries;
+    use crate::post_processing::instances::PostProcessingInstancesQueries;
+    use crate::post_processing::secrets::PostProcessingSecretsQueries;
+    use crate::post_processing::settings::PostProcessingSettingsQueries;
 
     fn declared(name: &str, value: Option<&str>, secret: bool) -> PresetInput {
         PresetInput {

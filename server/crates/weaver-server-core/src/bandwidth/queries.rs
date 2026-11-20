@@ -5,8 +5,17 @@ use crate::StateError;
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlEngine, SqlRuntime};
 
-impl Database {
-    pub fn sum_bandwidth_usage_minutes(
+pub trait BandwidthQueries {
+    fn sum_bandwidth_usage_minutes(
+        &self,
+        start_bucket_epoch_minute: i64,
+        end_bucket_epoch_minute: i64,
+    ) -> Result<u64, StateError>;
+    fn sum_metered_bandwidth_usage_minutes(&self, start: i64, end: i64) -> Result<u64, StateError>;
+}
+
+impl BandwidthQueries for Database {
+    fn sum_bandwidth_usage_minutes(
         &self,
         start_bucket_epoch_minute: i64,
         end_bucket_epoch_minute: i64,
@@ -14,14 +23,21 @@ impl Database {
         self.sum_bandwidth_usage(start_bucket_epoch_minute, end_bucket_epoch_minute, false)
     }
 
-    pub fn sum_metered_bandwidth_usage_minutes(
-        &self,
-        start: i64,
-        end: i64,
-    ) -> Result<u64, StateError> {
+    fn sum_metered_bandwidth_usage_minutes(&self, start: i64, end: i64) -> Result<u64, StateError> {
         self.sum_bandwidth_usage(start, end, true)
     }
+}
 
+trait BandwidthLocalQueries {
+    fn sum_bandwidth_usage(
+        &self,
+        start_bucket_epoch_minute: i64,
+        end_bucket_epoch_minute: i64,
+        metered_only: bool,
+    ) -> Result<u64, StateError>;
+}
+
+impl BandwidthLocalQueries for Database {
     fn sum_bandwidth_usage(
         &self,
         start_bucket_epoch_minute: i64,

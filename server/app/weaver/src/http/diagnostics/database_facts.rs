@@ -13,6 +13,7 @@
 
 use std::future::Future;
 use std::time::Duration;
+use weaver_server_core::jobs::diagnostic_tables::JobsDiagnosticTablesQueries;
 
 use serde::Serialize;
 

@@ -6,6 +6,7 @@
 // post. Nothing here runs per article, block or tick, and nothing in the
 // engines carries a field for it.
 
+use crate::jobs::JobsDownloadSummaryPersistenceQueries;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use weaver_graph::recovery::{RepairOutcome, SetRuling};

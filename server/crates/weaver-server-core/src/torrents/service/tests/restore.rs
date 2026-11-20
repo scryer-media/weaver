@@ -2,7 +2,15 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::history::queries::HistoryQueries;
+use crate::jobs::graph_checkpoint::JobsGraphCheckpointInternalQueries;
+use crate::jobs::repository::JobsRepositoryQueries;
 use crate::persistence::sql_runtime::SqlRuntime;
+use crate::settings::SettingsArchivePasswordsQueries;
+use crate::settings::archive_passwords::SettingsArchivePasswordsInternalQueries;
+use crate::settings::repository::SettingsRepositoryQueries;
+use crate::torrents::persistence::TorrentsPersistenceInsertPlacedTorrentInternalQueries;
+use crate::torrents::queries::TorrentsQueries;
 
 // A restart brings back what the operator asked, not the state last shown.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

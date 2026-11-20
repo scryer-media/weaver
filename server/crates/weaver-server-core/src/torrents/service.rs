@@ -4,6 +4,7 @@
 //! The torrent client: torrents become graph jobs fed by a session on their
 //! route, are read back as one state with its reason, and leave as history.
 
+use crate::torrents::persistence::TorrentsPersistenceInsertTorrentQueries;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};

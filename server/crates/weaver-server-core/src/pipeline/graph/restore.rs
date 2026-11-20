@@ -7,6 +7,8 @@
 // placed. A job with no checkpoint is admitted afresh, and so is a job whose
 // checkpoint this build does not restore: to this build it has none.
 
+use crate::jobs::graph_checkpoint::JobsGraphCheckpointInternalQueries;
+use crate::settings::archive_passwords::SettingsArchivePasswordsInternalQueries;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

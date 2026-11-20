@@ -6,6 +6,8 @@
 // category Weaver does not have (qBittorrent `SessionImpl::addTorrent_impl`
 // makes it, sessionimpl.cpp:2853-2857) all make one here.
 
+use crate::categories::persistence::CategoriesPersistenceQueries;
+use crate::categories::queries::CategoriesQueries;
 use std::sync::LazyLock;
 
 use crate::StateError;

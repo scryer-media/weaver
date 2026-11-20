@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::bandwidth::persistence::BandwidthPersistenceInternalQueries;
+use crate::bandwidth::persistence::BandwidthPersistenceQueries;
+use crate::settings::persistence::SettingsPersistenceQueries;
 use std::collections::BTreeMap;
 use std::range::Range;
 use std::time::{Duration as StdDuration, Instant};

@@ -8,6 +8,8 @@
 
 use super::*;
 use crate::jobs::handle::RestoreJobRequest;
+use crate::jobs::outline_persistence::JobsOutlinePersistenceInternalQueries;
+use crate::jobs::queries::JobsQueries;
 use crate::pipeline::queue::{Change, JobRow, QueueInner};
 
 // How many jobs the window holds in dispatch order.

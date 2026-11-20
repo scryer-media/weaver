@@ -5,6 +5,11 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
+use weaver_server_core::history::queries::HistoryQueries;
+use weaver_server_core::history::timeline::HistoryTimelineQueries;
+use weaver_server_core::operations::async_ops::OperationsAsyncOpsQueries;
+#[cfg(test)]
+use weaver_server_core::tags::TagsQueries;
 
 use super::*;
 use crate::history::types::{history_delete_row_state_from_core, history_table_item_from_row};
@@ -1199,6 +1204,9 @@ pub(crate) fn job_info_from_history_row(row: &JobHistoryRow) -> JobInfo {
 mod tests {
     use super::*;
     use weaver_server_core::JobHistoryRow;
+    use weaver_server_core::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
+    use weaver_server_core::history::queries::HistoryQueries;
+    use weaver_server_core::tags::TagsQueries;
 
     fn history_row(job_id: u64, status: &str, completed_at: i64) -> JobHistoryRow {
         JobHistoryRow {

@@ -4,6 +4,7 @@
 use crate::StateError;
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+use crate::proxies::ProxiesNetworkPersistenceQueries;
 use crate::servers::ServerConfig;
 
 // Shared serialization for server mutations and whole-generation reloads.
@@ -244,8 +245,17 @@ impl ServersService {
     }
 }
 
-impl Database {
-    pub fn set_server_max_download_speed(
+pub trait ServersServiceQueries {
+    fn set_server_max_download_speed(
+        &self,
+        server_id: u32,
+        bytes_per_sec: u64,
+    ) -> Result<(), StateError>;
+    fn set_server_active(&self, server_id: u32, active: bool) -> Result<(), StateError>;
+}
+
+impl ServersServiceQueries for Database {
+    fn set_server_max_download_speed(
         &self,
         server_id: u32,
         bytes_per_sec: u64,
@@ -272,7 +282,7 @@ impl Database {
     // Turn a server on or off. An activated server's connections are never
     // refused here: the tunnels its route reaches hold usenet to their bytes
     // as its sockets open.
-    pub fn set_server_active(&self, server_id: u32, active: bool) -> Result<(), StateError> {
+    fn set_server_active(&self, server_id: u32, active: bool) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "set_server_active", |tx| {
@@ -295,8 +305,14 @@ impl Database {
             .await
         })
     }
+}
 
-    pub(crate) fn replace_servers(&self, servers: &[ServerConfig]) -> Result<(), StateError> {
+pub(crate) trait ServersServiceInternalQueries {
+    fn replace_servers(&self, servers: &[ServerConfig]) -> Result<(), StateError>;
+}
+
+impl ServersServiceInternalQueries for Database {
+    fn replace_servers(&self, servers: &[ServerConfig]) -> Result<(), StateError> {
         use crate::persistence::encryption::encrypt_secret_for_write;
 
         let datastore = self.datastore();

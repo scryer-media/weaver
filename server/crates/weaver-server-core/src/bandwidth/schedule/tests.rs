@@ -2,6 +2,10 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::servers::persistence::ServersPersistenceQueries;
+use crate::settings::persistence::SettingsPersistenceQueries;
+use crate::settings::queries::SettingsQueries;
+use crate::settings::service::SettingsServiceQueries;
 
 #[tokio::test]
 async fn daylight_saving_fallback_does_not_reassert_or_rewind_hold_tracks() {

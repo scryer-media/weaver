@@ -9,6 +9,8 @@
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use weaver_server_core::auth::repository::AuthRepositoryQueries;
+use weaver_server_core::settings::queries::SettingsQueries;
 
 use weaver_server_core::Database;
 use weaver_server_core::auth::repository::{

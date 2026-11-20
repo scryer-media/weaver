@@ -2,6 +2,11 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::post_processing::events::PostProcessingEventsInvalidateQueueScriptAdmissionInternalQueries;
+use crate::post_processing::settings::PostProcessingSettingsQueries;
+use crate::settings::repository::SettingsRepositoryQueries;
+use crate::torrents::persistence::TorrentsPersistenceInsertTorrentQueries;
+use crate::torrents::queries::TorrentsQueries;
 
 // The list of torrents carries each torrent's trackers, the same rows its
 // own view does, and no other torrent's.

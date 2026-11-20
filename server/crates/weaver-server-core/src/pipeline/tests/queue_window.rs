@@ -5,7 +5,11 @@
 // every other job is its row and its stored rows.
 
 use super::*;
+use crate::history::queries::HistoryQueries;
+use crate::jobs::graph_checkpoint::JobsGraphCheckpointInternalQueries;
 use crate::jobs::handle::QueueMoveTarget;
+use crate::jobs::persistence::JobsPersistenceQueries;
+use crate::jobs::queries::JobsQueries;
 use crate::pipeline::queue_window::QUEUE_WINDOW;
 
 const QUEUED: u64 = 1_000;

@@ -6,6 +6,7 @@ use crate::StateError;
 use crate::persistence::Database;
 use crate::persistence::encryption::{decrypt_value, encrypt_secret_for_write, is_encrypted};
 use crate::persistence::sql_runtime::{SqlArg, SqlExec, SqlRuntime, SqlTx};
+use crate::settings::queries::SettingsQueries;
 
 const JWT_SIGNING_SECRET_SETTING_KEY: &str = "auth.jwt_signing_secret";
 pub const SETUP_COMPLETED_SETTING_KEY: &str = "auth.setup_completed_v1";
@@ -51,11 +52,54 @@ pub struct BrowserSession {
     pub revoked_at: Option<i64>,
 }
 
-impl Database {
+pub trait AuthRepositoryQueries {
+    fn mark_initial_setup_pending(&self) -> Result<(), StateError>;
+    fn complete_initial_authenticated_setup(
+        &self,
+        setup: &InitialAuthenticatedSetup,
+    ) -> Result<InitialSetupOutcome, StateError>;
+    fn get_or_create_jwt_signing_secret(&self) -> Result<[u8; 32], StateError>;
+    fn rotate_jwt_signing_secret(&self) -> Result<[u8; 32], StateError>;
+    fn get_auth_credentials(&self) -> Result<Option<AuthCredentials>, StateError>;
+    fn set_auth_credentials(&self, username: &str, password_hash: &str) -> Result<(), StateError>;
+    fn change_auth_credentials_and_revoke_sessions(
+        &self,
+        username: &str,
+        password_hash: &str,
+        now: i64,
+    ) -> Result<(), StateError>;
+    fn clear_auth_credentials(&self) -> Result<(), StateError>;
+    fn create_browser_session(&self, session: &BrowserSession) -> Result<(), StateError>;
+    fn get_active_browser_session(
+        &self,
+        token_hash: &str,
+        now: i64,
+    ) -> Result<Option<BrowserSession>, StateError>;
+    fn revoke_browser_session(&self, token_hash: &str, now: i64) -> Result<(), StateError>;
+    #[cfg(any(test, feature = "test-support"))]
+    fn set_browser_session_expiry(
+        &self,
+        token_hash: &str,
+        expires_at: i64,
+    ) -> Result<(), StateError>;
+    fn revoke_all_browser_sessions(&self, now: i64) -> Result<(), StateError>;
+    fn verify_browser_session_password(
+        &self,
+        token_hash: &str,
+        verified_at: i64,
+    ) -> Result<(), StateError>;
+    fn browser_session_password_verified_at(
+        &self,
+        token_hash: &str,
+        now: i64,
+    ) -> Result<Option<i64>, StateError>;
+}
+
+impl AuthRepositoryQueries for Database {
     // Persist the explicit pending state before exposing first-run setup.
     // Callers must independently establish a new datastore, an explicitly
     // requested credentialless legacy migration, or operator-authorized recovery.
-    pub fn mark_initial_setup_pending(&self) -> Result<(), StateError> {
+    fn mark_initial_setup_pending(&self) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "mark_initial_setup_pending", |tx| {
@@ -79,7 +123,7 @@ impl Database {
     // completion marker is the transaction claim: a concurrent setup loses
     // without changing credentials or browser sessions, and any later error
     // rolls that claim back with the rest of the transaction.
-    pub fn complete_initial_authenticated_setup(
+    fn complete_initial_authenticated_setup(
         &self,
         setup: &InitialAuthenticatedSetup,
     ) -> Result<InitialSetupOutcome, StateError> {
@@ -159,7 +203,7 @@ impl Database {
         })
     }
     // Load the persistent JWT signing secret, creating one on first use.
-    pub fn get_or_create_jwt_signing_secret(&self) -> Result<[u8; 32], StateError> {
+    fn get_or_create_jwt_signing_secret(&self) -> Result<[u8; 32], StateError> {
         let datastore = self.datastore();
         let encryption_key = self.encryption_key().cloned();
         self.run_sql_blocking(async move {
@@ -174,7 +218,7 @@ impl Database {
     }
 
     // Replace the persistent JWT signing secret and return the new value.
-    pub fn rotate_jwt_signing_secret(&self) -> Result<[u8; 32], StateError> {
+    fn rotate_jwt_signing_secret(&self) -> Result<[u8; 32], StateError> {
         let datastore = self.datastore();
         let encryption_key = self.encryption_key().cloned();
         self.run_sql_blocking(async move {
@@ -200,7 +244,7 @@ impl Database {
     }
 
     // Get the stored login credentials, if any.
-    pub fn get_auth_credentials(&self) -> Result<Option<AuthCredentials>, StateError> {
+    fn get_auth_credentials(&self) -> Result<Option<AuthCredentials>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
@@ -222,11 +266,7 @@ impl Database {
     }
 
     // Set (insert or replace) login credentials.
-    pub fn set_auth_credentials(
-        &self,
-        username: &str,
-        password_hash: &str,
-    ) -> Result<(), StateError> {
+    fn set_auth_credentials(&self, username: &str, password_hash: &str) -> Result<(), StateError> {
         let datastore = self.datastore();
         let username = username.to_string();
         let password_hash = password_hash.to_string();
@@ -254,7 +294,7 @@ impl Database {
 
     // Atomically changes the only administrator password and invalidates all
     // durable browser sessions that could have been established with it.
-    pub fn change_auth_credentials_and_revoke_sessions(
+    fn change_auth_credentials_and_revoke_sessions(
         &self,
         username: &str,
         password_hash: &str,
@@ -283,7 +323,7 @@ impl Database {
     }
 
     // Clear login credentials (disable login).
-    pub fn clear_auth_credentials(&self) -> Result<(), StateError> {
+    fn clear_auth_credentials(&self) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             let now = std::time::SystemTime::now()
@@ -311,7 +351,7 @@ impl Database {
         })
     }
 
-    pub fn create_browser_session(&self, session: &BrowserSession) -> Result<(), StateError> {
+    fn create_browser_session(&self, session: &BrowserSession) -> Result<(), StateError> {
         let datastore = self.datastore();
         let session = session.clone();
         self.run_sql_blocking(async move {
@@ -347,7 +387,7 @@ impl Database {
         })
     }
 
-    pub fn get_active_browser_session(
+    fn get_active_browser_session(
         &self,
         token_hash: &str,
         now: i64,
@@ -378,7 +418,7 @@ impl Database {
         })
     }
 
-    pub fn revoke_browser_session(&self, token_hash: &str, now: i64) -> Result<(), StateError> {
+    fn revoke_browser_session(&self, token_hash: &str, now: i64) -> Result<(), StateError> {
         let datastore = self.datastore();
         let token_hash = token_hash.to_string();
         self.run_sql_blocking(async move {
@@ -395,7 +435,7 @@ impl Database {
     // Moves a session's expiry, so a test can expire a live session outright
     // instead of waiting for the wall clock to pass it.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn set_browser_session_expiry(
+    fn set_browser_session_expiry(
         &self,
         token_hash: &str,
         expires_at: i64,
@@ -413,7 +453,7 @@ impl Database {
         })
     }
 
-    pub fn revoke_all_browser_sessions(&self, now: i64) -> Result<(), StateError> {
+    fn revoke_all_browser_sessions(&self, now: i64) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
@@ -429,7 +469,7 @@ impl Database {
     // Record a successful password check for one active browser session.
     // The session token hash is already a durable verifier, so this table
     // stores no additional credential material.
-    pub fn verify_browser_session_password(
+    fn verify_browser_session_password(
         &self,
         token_hash: &str,
         verified_at: i64,
@@ -459,7 +499,7 @@ impl Database {
         })
     }
 
-    pub fn browser_session_password_verified_at(
+    fn browser_session_password_verified_at(
         &self,
         token_hash: &str,
         now: i64,
@@ -480,14 +520,24 @@ impl Database {
             .transpose()
         })
     }
+}
 
-    pub(crate) fn has_encrypted_persisted_jwt_signing_secret(&self) -> Result<bool, StateError> {
+pub(crate) trait AuthRepositoryInternalQueries {
+    fn has_encrypted_persisted_jwt_signing_secret(&self) -> Result<bool, StateError>;
+    fn validate_persisted_jwt_signing_secret(
+        &self,
+        encryption_key: &crate::persistence::encryption::EncryptionKey,
+    ) -> Result<(), StateError>;
+}
+
+impl AuthRepositoryInternalQueries for Database {
+    fn has_encrypted_persisted_jwt_signing_secret(&self) -> Result<bool, StateError> {
         Ok(self
             .get_setting(JWT_SIGNING_SECRET_SETTING_KEY)?
             .is_some_and(|stored| is_encrypted(&stored)))
     }
 
-    pub(crate) fn validate_persisted_jwt_signing_secret(
+    fn validate_persisted_jwt_signing_secret(
         &self,
         encryption_key: &crate::persistence::encryption::EncryptionKey,
     ) -> Result<(), StateError> {
@@ -634,6 +684,8 @@ fn decode_stored_jwt_signing_secret(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::persistence::SettingsPersistenceQueries;
+    use crate::settings::queries::SettingsQueries;
 
     fn browser_session(token_hash: &str, created_at: i64) -> BrowserSession {
         BrowserSession {

@@ -7,6 +7,9 @@
 
 use super::*;
 use crate::categories::CategoryConfig;
+use crate::categories::persistence::CategoriesPersistenceQueries;
+use crate::proxies::ProxiesNetworkPersistenceQueries;
+use crate::proxies::ProxiesPersistenceQueries;
 use crate::proxies::{EgressInterface, ProxyKind, ProxyPool, ProxyProfile};
 
 // The category whose torrents route on their own.

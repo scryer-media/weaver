@@ -2,6 +2,16 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::history::nzbget_state::HistoryNzbgetStateQueries;
+use crate::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
+use crate::history::persistence::HistoryPersistenceRecordArchivedHistoryFilesInternalQueries;
+use crate::history::queries::HistoryInternalQueries;
+use crate::history::queries::HistoryQueries;
+use crate::history::timeline::HistoryTimelineQueries;
+use crate::jobs::queries::JobsQueries;
+use crate::jobs::repository::JobsRepositoryQueries;
+use crate::torrents::persistence::TorrentsPersistenceInsertTorrentQueries;
+use crate::torrents::persistence::TorrentsPersistenceMarkTorrentRetiringInternalQueries;
 
 // History deletion finishes without a pipeline turn.
 async fn delete_history_batch(

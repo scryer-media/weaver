@@ -2,6 +2,11 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::jobs::persistence::JobsPersistenceInternalQueries;
+use crate::jobs::queries::JobsInternalQueries;
+use crate::post_processing::events::PostProcessingEventsCancelEventScriptsQueries;
+use crate::post_processing::output::PostProcessingOutputQueries;
+use crate::post_processing::settings::PostProcessingSettingsQueries;
 
 // A job's run state as its queue row states it, installed or not: a job
 // paused before it started waits as its row.

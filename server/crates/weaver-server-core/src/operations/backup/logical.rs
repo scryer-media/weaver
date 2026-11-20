@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::operations::backup::OperationsBackupQueries;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -89,48 +90,29 @@ pub(crate) struct LogicalBackupExport {
     pub tables: BTreeMap<String, TablePartMetadata>,
 }
 
-impl Database {
+pub(crate) trait OperationsBackupLogicalInternalQueries {
     #[cfg(test)]
-    pub(crate) fn export_logical_backup(&self) -> Result<LogicalBackupExport, StateError> {
+    fn export_logical_backup(&self) -> Result<LogicalBackupExport, StateError>;
+    fn import_logical_backup(
+        &self,
+        tables_dir: &Path,
+        expected: &BTreeMap<String, TablePartMetadata>,
+        source_schema_version: i64,
+    ) -> Result<(), StateError>;
+    fn validate_backup_catalog(&self) -> Result<(), StateError>;
+    fn validate_logical_backup_import(
+        &self,
+        expected: &BTreeMap<String, TablePartMetadata>,
+    ) -> Result<(), StateError>;
+}
+
+impl OperationsBackupLogicalInternalQueries for Database {
+    #[cfg(test)]
+    fn export_logical_backup(&self) -> Result<LogicalBackupExport, StateError> {
         self.export_logical_backup_cancellable(super::archive::BackupCancellation::new())
     }
 
-    pub(super) fn export_logical_backup_cancellable(
-        &self,
-        cancellation: super::archive::BackupCancellation,
-    ) -> Result<LogicalBackupExport, StateError> {
-        let staging = super::create_backup_temp_dir().map_err(db_err)?;
-        let tables_dir = staging.path().join("tables");
-        std::fs::create_dir_all(&tables_dir).map_err(db_err)?;
-        let schema_version = self.schema_version()?;
-        let datastore = self.datastore();
-        let tables = match datastore {
-            StoreDatastore::Sqlite { .. } => {
-                let tables_dir = tables_dir.clone();
-                let path = self
-                    .database_target()
-                    .sqlite_path()?
-                    .ok_or_else(|| StateError::Database("SQLite backup has no path".into()))?;
-                self.run_sql_blocking_local(move || async move {
-                    export_sqlite(&path, &tables_dir, false, &cancellation).await
-                })?
-            }
-            StoreDatastore::Postgres { pool } => {
-                let tables_dir = tables_dir.clone();
-                self.run_sql_blocking_read(async move {
-                    export_postgres(pool, &tables_dir, false, &cancellation).await
-                })?
-            }
-        };
-        Ok(LogicalBackupExport {
-            staging,
-            source_engine: self.datastore().engine().as_str().to_string(),
-            schema_version,
-            tables,
-        })
-    }
-
-    pub(crate) fn import_logical_backup(
+    fn import_logical_backup(
         &self,
         tables_dir: &Path,
         expected: &BTreeMap<String, TablePartMetadata>,
@@ -179,7 +161,7 @@ impl Database {
         clippy::disallowed_methods,
         reason = "writer gate: a read-only check on the read lane, it writes nothing; Postgres has no writer gate"
     )]
-    pub(crate) fn validate_backup_catalog(&self) -> Result<(), StateError> {
+    fn validate_backup_catalog(&self) -> Result<(), StateError> {
         let datastore = self.datastore();
         match datastore {
             StoreDatastore::Sqlite { pool, .. } => {
@@ -199,7 +181,7 @@ impl Database {
         clippy::disallowed_methods,
         reason = "writer gate: a read-only check on the read lane, it writes nothing; Postgres has no writer gate"
     )]
-    pub(crate) fn validate_logical_backup_import(
+    fn validate_logical_backup_import(
         &self,
         expected: &BTreeMap<String, TablePartMetadata>,
     ) -> Result<(), StateError> {
@@ -234,6 +216,50 @@ impl Database {
                 })
             }
         }
+    }
+}
+
+pub(super) trait LogicalBackupExportQueries {
+    fn export_logical_backup_cancellable(
+        &self,
+        cancellation: super::archive::BackupCancellation,
+    ) -> Result<LogicalBackupExport, StateError>;
+}
+
+impl LogicalBackupExportQueries for Database {
+    fn export_logical_backup_cancellable(
+        &self,
+        cancellation: super::archive::BackupCancellation,
+    ) -> Result<LogicalBackupExport, StateError> {
+        let staging = super::create_backup_temp_dir().map_err(db_err)?;
+        let tables_dir = staging.path().join("tables");
+        std::fs::create_dir_all(&tables_dir).map_err(db_err)?;
+        let schema_version = self.schema_version()?;
+        let datastore = self.datastore();
+        let tables = match datastore {
+            StoreDatastore::Sqlite { .. } => {
+                let tables_dir = tables_dir.clone();
+                let path = self
+                    .database_target()
+                    .sqlite_path()?
+                    .ok_or_else(|| StateError::Database("SQLite backup has no path".into()))?;
+                self.run_sql_blocking_local(move || async move {
+                    export_sqlite(&path, &tables_dir, false, &cancellation).await
+                })?
+            }
+            StoreDatastore::Postgres { pool } => {
+                let tables_dir = tables_dir.clone();
+                self.run_sql_blocking_read(async move {
+                    export_postgres(pool, &tables_dir, false, &cancellation).await
+                })?
+            }
+        };
+        Ok(LogicalBackupExport {
+            staging,
+            source_engine: self.datastore().engine().as_str().to_string(),
+            schema_version,
+            tables,
+        })
     }
 }
 
@@ -2118,6 +2144,20 @@ pub(super) async fn export_before_migrations_cancellable(
 #[cfg(test)]
 mod logical_reader_tests {
     use super::*;
+    use crate::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
+    use crate::history::persistence::HistoryPersistenceRecordArchivedHistoryFilesInternalQueries;
+    use crate::history::queries::HistoryQueries;
+    use crate::jobs::JobsDownloadSummaryPersistenceQueries;
+    use crate::operations::recovery::credentials::StoredCredentialQueries;
+    use crate::post_processing::instances::PostProcessingInstancesInternalQueries;
+    use crate::post_processing::instances::PostProcessingInstancesQueries;
+    use crate::post_processing::secrets::PostProcessingSecretsQueries;
+    use crate::post_processing::settings::PostProcessingSettingsQueries;
+    use crate::proxies::ProxiesDnsPersistenceQueries;
+    use crate::proxies::ProxiesNetworkPersistenceQueries;
+    use crate::proxies::ProxiesPersistenceQueries;
+    use crate::settings::persistence::SettingsPersistenceQueries;
+    use crate::settings::queries::SettingsQueries;
 
     #[tokio::test]
     async fn pre_migration_export_preserves_unclassified_tables_and_checks_cancellation() {

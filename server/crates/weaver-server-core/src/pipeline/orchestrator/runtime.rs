@@ -2,6 +2,13 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::jobs::persistence::JobsPersistenceQueries;
+use crate::jobs::queries::JobsInternalQueries;
+use crate::post_processing::effects::PostProcessingEffectsInternalQueries;
+use crate::post_processing::events::PostProcessingEventsCancelEventScriptsQueries;
+use crate::post_processing::events::PostProcessingEventsInvalidateQueueScriptAdmissionInternalQueries;
+use crate::post_processing::instances::PostProcessingInstancesInternalQueries;
+use crate::post_processing::settings::PostProcessingSettingsQueries;
 use weaver_server_base::operations::instrumentation::PipelinePhase;
 use weaver_server_base::runtime::shutdown_steps::{
     bounded_shutdown_step, waited_shutdown_step, waited_shutdown_write,

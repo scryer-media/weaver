@@ -703,8 +703,76 @@ async fn bulk_insert_history_delete_targets_tx(
     Ok(())
 }
 
-impl Database {
-    pub fn list_history_delete_locked_target_ids(
+pub trait OperationsAsyncOpsQueries {
+    fn list_history_delete_locked_target_ids(
+        &self,
+        ids: &[u64],
+    ) -> Result<HashSet<u64>, StateError>;
+    fn has_any_locked_history_delete_targets(&self) -> Result<bool, StateError>;
+    fn list_history_job_ids(&self, ids: &[u64]) -> Result<BTreeSet<u64>, StateError>;
+    fn list_all_history_job_ids(&self) -> Result<Vec<u64>, StateError>;
+    fn insert_history_delete_operation(
+        &self,
+        ids: &[u64],
+        delete_files: bool,
+        file_delete_authorized: bool,
+    ) -> Result<u64, HistoryDeleteOperationInsertError>;
+    fn accept_archive_history(&self, ids: &[u64]) -> Result<ArchiveHistoryAcceptance, StateError>;
+    fn settle_archive_history_targets(
+        &self,
+        operation_id: u64,
+        settled: &[ArchiveHistorySettlement],
+    ) -> Result<(), StateError>;
+    fn insert_all_history_delete_operation(
+        &self,
+        delete_files: bool,
+        file_delete_authorized: bool,
+    ) -> Result<(u64, Vec<u64>), HistoryDeleteOperationInsertError>;
+    fn recover_running_history_delete_operations(&self) -> Result<(), StateError>;
+    fn requeue_history_delete_operation(&self, operation_id: u64) -> Result<(), StateError>;
+    fn next_history_delete_operation(
+        &self,
+    ) -> Result<Option<HistoryDeleteOperationRow>, StateError>;
+    fn list_history_delete_operation_targets(
+        &self,
+        operation_id: u64,
+        delete_files: bool,
+    ) -> Result<Vec<HistoryDeleteTargetWork>, StateError>;
+    fn mark_history_delete_target_state(
+        &self,
+        operation_id: u64,
+        target_id: u64,
+        state: AsyncOperationTargetState,
+        error_message: Option<&str>,
+    ) -> Result<(), StateError>;
+    fn mark_history_delete_targets_state(
+        &self,
+        operation_id: u64,
+        target_ids: &[u64],
+        state: AsyncOperationTargetState,
+        error_message: Option<&str>,
+    ) -> Result<(), StateError>;
+    fn fail_pending_history_delete_operation_targets(
+        &self,
+        operation_id: u64,
+        error_message: &str,
+    ) -> Result<(), StateError>;
+    fn finalize_history_delete_operation(
+        &self,
+        operation_id: u64,
+    ) -> Result<AsyncOperationState, StateError>;
+    fn list_history_delete_row_states(
+        &self,
+        ids: &[u64],
+    ) -> Result<HashMap<u64, HistoryDeleteRowState>, StateError>;
+    fn list_history_delete_operations(
+        &self,
+        active_only: bool,
+    ) -> Result<Vec<HistoryDeleteOperationSummary>, StateError>;
+}
+
+impl OperationsAsyncOpsQueries for Database {
+    fn list_history_delete_locked_target_ids(
         &self,
         ids: &[u64],
     ) -> Result<HashSet<u64>, StateError> {
@@ -737,7 +805,7 @@ impl Database {
         })
     }
 
-    pub fn has_any_locked_history_delete_targets(&self) -> Result<bool, StateError> {
+    fn has_any_locked_history_delete_targets(&self) -> Result<bool, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             Ok(SqlRuntime::fetch_optional(
@@ -754,7 +822,7 @@ impl Database {
         })
     }
 
-    pub fn list_history_job_ids(&self, ids: &[u64]) -> Result<BTreeSet<u64>, StateError> {
+    fn list_history_job_ids(&self, ids: &[u64]) -> Result<BTreeSet<u64>, StateError> {
         let ids = dedupe_ids(ids);
         if ids.is_empty() {
             return Ok(BTreeSet::new());
@@ -779,7 +847,7 @@ impl Database {
         })
     }
 
-    pub fn list_all_history_job_ids(&self) -> Result<Vec<u64>, StateError> {
+    fn list_all_history_job_ids(&self) -> Result<Vec<u64>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
@@ -796,7 +864,7 @@ impl Database {
         })
     }
 
-    pub fn insert_history_delete_operation(
+    fn insert_history_delete_operation(
         &self,
         ids: &[u64],
         delete_files: bool,
@@ -836,111 +904,12 @@ impl Database {
         })?
     }
 
-    #[cfg(test)]
-    pub(crate) fn insert_available_history_delete_operation(
-        &self,
-        ids: &[u64],
-        delete_files: bool,
-    ) -> Result<Option<u64>, StateError> {
-        let ids = dedupe_ids(ids);
-        let datastore = self.datastore();
-        self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(
-                &datastore,
-                "insert_available_history_delete_operation",
-                |tx| {
-                    let ids = ids.clone();
-                    Box::pin(async move {
-                        insert_unclaimed_history_delete_operation_tx(tx, &ids, delete_files).await
-                    })
-                },
-            )
-            .await
-        })
-    }
-
-    // Retention's deletes for the due entries `ids`, with or without their
-    // files. An entry another operation holds is left for a later pass. An
-    // entry whose latest delete of the same file policy refused it is
-    // retried: that target and its operation are queued again, so no new
-    // operation is added for it pass after pass. Every other entry joins
-    // one new operation. The entries are read first outside any
-    // transaction: a pass with nothing to queue or retry writes nothing.
-    // Returns whether anything was queued; the caller rings the worker.
-    pub(crate) fn queue_retention_history_deletes(
-        &self,
-        ids: &[u64],
-        delete_files: bool,
-    ) -> Result<bool, StateError> {
-        let ids = dedupe_ids(ids);
-        if ids.is_empty() {
-            return Ok(false);
-        }
-        let datastore = self.datastore();
-        let probe = ids.clone();
-        let (rearm, queue) = self.run_sql_blocking_read(async move {
-            let chunk_size = id_chunk_size(bind_budget_for_engine(datastore.engine()), 3);
-            let mut rearm = Vec::new();
-            let mut queue = Vec::new();
-            for chunk in probe.chunks(chunk_size) {
-                let mut args = vec![
-                    SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_owned()),
-                    SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_owned()),
-                    SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_owned()),
-                ];
-                args.extend(id_args(chunk));
-                let rows = SqlRuntime::fetch_all(
-                    datastore.read_exec(),
-                    &retention_probe_sql(chunk.len()),
-                    &args,
-                )
-                .await?;
-                let mut steps = HashMap::with_capacity(rows.len());
-                for row in rows {
-                    steps.insert(
-                        row.i64("job_id")? as u64,
-                        retention_step(&row, delete_files)?,
-                    );
-                }
-                for id in chunk {
-                    match steps.get(id) {
-                        Some(RetentionStep::Rearm) => rearm.push(*id),
-                        Some(RetentionStep::Queue) => queue.push(*id),
-                        Some(RetentionStep::Held) | None => {}
-                    }
-                }
-            }
-            Ok::<_, StateError>((rearm, queue))
-        })?;
-        if rearm.is_empty() && queue.is_empty() {
-            return Ok(false);
-        }
-        let datastore = self.datastore();
-        self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "queue_retention_history_deletes", |tx| {
-                let rearm = rearm.clone();
-                let queue = queue.clone();
-                Box::pin(async move {
-                    let rearmed = rearm_refused_history_deletes_tx(tx, &rearm).await?;
-                    let inserted =
-                        insert_unclaimed_history_delete_operation_tx(tx, &queue, delete_files)
-                            .await?;
-                    Ok(rearmed > 0 || inserted.is_some())
-                })
-            })
-            .await
-        })
-    }
-
     // Accepts the removal of the files of `ids`, keeping the entries: one
     // transaction reads, per id, whether it is an entry, a job still in the
     // queue, held by another history operation, or already without its
     // files, then queues one operation for the accepted ids. Nothing is
     // written when none is accepted. The worker is rung; no disk is touched.
-    pub fn accept_archive_history(
-        &self,
-        ids: &[u64],
-    ) -> Result<ArchiveHistoryAcceptance, StateError> {
+    fn accept_archive_history(&self, ids: &[u64]) -> Result<ArchiveHistoryAcceptance, StateError> {
         let ids = dedupe_ids(ids);
         if ids.is_empty() {
             return Ok(ArchiveHistoryAcceptance {
@@ -1038,7 +1007,7 @@ impl Database {
     // Settles the targets of one archive operation, each with its
     // state, outcome and message, in one transaction of one statement per
     // bind-sized chunk.
-    pub fn settle_archive_history_targets(
+    fn settle_archive_history_targets(
         &self,
         operation_id: u64,
         settled: &[ArchiveHistorySettlement],
@@ -1097,7 +1066,7 @@ impl Database {
         })
     }
 
-    pub fn insert_all_history_delete_operation(
+    fn insert_all_history_delete_operation(
         &self,
         delete_files: bool,
         file_delete_authorized: bool,
@@ -1134,7 +1103,7 @@ impl Database {
         })?
     }
 
-    pub fn recover_running_history_delete_operations(&self) -> Result<(), StateError> {
+    fn recover_running_history_delete_operations(&self) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(
@@ -1181,7 +1150,7 @@ impl Database {
         })
     }
 
-    pub fn requeue_history_delete_operation(&self, operation_id: u64) -> Result<(), StateError> {
+    fn requeue_history_delete_operation(&self, operation_id: u64) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "requeue_history_delete_operation", |tx| {
@@ -1220,7 +1189,7 @@ impl Database {
         })
     }
 
-    pub fn next_history_delete_operation(
+    fn next_history_delete_operation(
         &self,
     ) -> Result<Option<HistoryDeleteOperationRow>, StateError> {
         let datastore = self.datastore();
@@ -1280,7 +1249,7 @@ impl Database {
         })
     }
 
-    pub fn list_history_delete_operation_targets(
+    fn list_history_delete_operation_targets(
         &self,
         operation_id: u64,
         delete_files: bool,
@@ -1314,7 +1283,7 @@ impl Database {
         })
     }
 
-    pub fn mark_history_delete_target_state(
+    fn mark_history_delete_target_state(
         &self,
         operation_id: u64,
         target_id: u64,
@@ -1326,7 +1295,7 @@ impl Database {
 
     // Moves every listed target of one operation to `state` with one
     // `UPDATE ... IN (...)` per bind-sized chunk.
-    pub fn mark_history_delete_targets_state(
+    fn mark_history_delete_targets_state(
         &self,
         operation_id: u64,
         target_ids: &[u64],
@@ -1365,7 +1334,7 @@ impl Database {
         })
     }
 
-    pub fn fail_pending_history_delete_operation_targets(
+    fn fail_pending_history_delete_operation_targets(
         &self,
         operation_id: u64,
         error_message: &str,
@@ -1392,7 +1361,7 @@ impl Database {
         })
     }
 
-    pub fn finalize_history_delete_operation(
+    fn finalize_history_delete_operation(
         &self,
         operation_id: u64,
     ) -> Result<AsyncOperationState, StateError> {
@@ -1436,7 +1405,7 @@ impl Database {
         })
     }
 
-    pub fn list_history_delete_row_states(
+    fn list_history_delete_row_states(
         &self,
         ids: &[u64],
     ) -> Result<HashMap<u64, HistoryDeleteRowState>, StateError> {
@@ -1491,7 +1460,7 @@ impl Database {
         })
     }
 
-    pub fn list_history_delete_operations(
+    fn list_history_delete_operations(
         &self,
         active_only: bool,
     ) -> Result<Vec<HistoryDeleteOperationSummary>, StateError> {
@@ -1536,6 +1505,118 @@ impl Database {
     }
 }
 
+pub(crate) trait OperationsAsyncOpsInternalQueries {
+    #[cfg(test)]
+    fn insert_available_history_delete_operation(
+        &self,
+        ids: &[u64],
+        delete_files: bool,
+    ) -> Result<Option<u64>, StateError>;
+    fn queue_retention_history_deletes(
+        &self,
+        ids: &[u64],
+        delete_files: bool,
+    ) -> Result<bool, StateError>;
+}
+
+impl OperationsAsyncOpsInternalQueries for Database {
+    #[cfg(test)]
+    fn insert_available_history_delete_operation(
+        &self,
+        ids: &[u64],
+        delete_files: bool,
+    ) -> Result<Option<u64>, StateError> {
+        let ids = dedupe_ids(ids);
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(
+                &datastore,
+                "insert_available_history_delete_operation",
+                |tx| {
+                    let ids = ids.clone();
+                    Box::pin(async move {
+                        insert_unclaimed_history_delete_operation_tx(tx, &ids, delete_files).await
+                    })
+                },
+            )
+            .await
+        })
+    }
+
+    // Retention's deletes for the due entries `ids`, with or without their
+    // files. An entry another operation holds is left for a later pass. An
+    // entry whose latest delete of the same file policy refused it is
+    // retried: that target and its operation are queued again, so no new
+    // operation is added for it pass after pass. Every other entry joins
+    // one new operation. The entries are read first outside any
+    // transaction: a pass with nothing to queue or retry writes nothing.
+    // Returns whether anything was queued; the caller rings the worker.
+    fn queue_retention_history_deletes(
+        &self,
+        ids: &[u64],
+        delete_files: bool,
+    ) -> Result<bool, StateError> {
+        let ids = dedupe_ids(ids);
+        if ids.is_empty() {
+            return Ok(false);
+        }
+        let datastore = self.datastore();
+        let probe = ids.clone();
+        let (rearm, queue) = self.run_sql_blocking_read(async move {
+            let chunk_size = id_chunk_size(bind_budget_for_engine(datastore.engine()), 3);
+            let mut rearm = Vec::new();
+            let mut queue = Vec::new();
+            for chunk in probe.chunks(chunk_size) {
+                let mut args = vec![
+                    SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_owned()),
+                    SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_owned()),
+                    SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_owned()),
+                ];
+                args.extend(id_args(chunk));
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    &retention_probe_sql(chunk.len()),
+                    &args,
+                )
+                .await?;
+                let mut steps = HashMap::with_capacity(rows.len());
+                for row in rows {
+                    steps.insert(
+                        row.i64("job_id")? as u64,
+                        retention_step(&row, delete_files)?,
+                    );
+                }
+                for id in chunk {
+                    match steps.get(id) {
+                        Some(RetentionStep::Rearm) => rearm.push(*id),
+                        Some(RetentionStep::Queue) => queue.push(*id),
+                        Some(RetentionStep::Held) | None => {}
+                    }
+                }
+            }
+            Ok::<_, StateError>((rearm, queue))
+        })?;
+        if rearm.is_empty() && queue.is_empty() {
+            return Ok(false);
+        }
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "queue_retention_history_deletes", |tx| {
+                let rearm = rearm.clone();
+                let queue = queue.clone();
+                Box::pin(async move {
+                    let rearmed = rearm_refused_history_deletes_tx(tx, &rearm).await?;
+                    let inserted =
+                        insert_unclaimed_history_delete_operation_tx(tx, &queue, delete_files)
+                            .await?;
+                    Ok(rearmed > 0 || inserted.is_some())
+                })
+            })
+            .await
+        })
+    }
+}
+
 fn history_delete_row_state_from_row(row: SqlRow) -> Result<HistoryDeleteRowState, StateError> {
     let state = AsyncOperationTargetState::parse(&row.text("state")?)?;
     Ok(HistoryDeleteRowState {
@@ -1572,6 +1653,10 @@ fn history_delete_operation_summary_from_row(
 mod tests {
     use super::*;
     use crate::JobHistoryRow;
+    use crate::history::delete_queue::HistoryDeleteQueueQueries;
+    use crate::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
+    use crate::history::queries::HistoryQueries;
+    use crate::jobs::persistence::JobsPersistenceQueries;
 
     fn history(job_id: u64, completed_at: i64) -> JobHistoryRow {
         JobHistoryRow {

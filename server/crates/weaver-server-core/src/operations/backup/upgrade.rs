@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::settings::persistence::SettingsPersistenceQueries;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -326,7 +327,12 @@ mod tests {
     use super::super::automatic::StoredAutoSettings;
     use super::super::stored::{BackupArtifactStatus, list_backups};
     use super::*;
+    use crate::operations::recovery::credentials::StoredCredentialQueries;
     use crate::persistence::encryption::{EncryptionKey, encrypt_value};
+    use crate::servers::persistence::ServersPersistenceQueries;
+    use crate::settings::persistence::SettingsPersistenceQueries;
+    use crate::settings::queries::SettingsQueries;
+    use crate::settings::service::SettingsServiceQueries;
 
     #[tokio::test]
     async fn successful_open_keeps_retry_pending_and_labels_retry_with_running_version() {

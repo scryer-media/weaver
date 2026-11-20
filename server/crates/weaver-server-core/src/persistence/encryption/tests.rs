@@ -2,6 +2,9 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::auth::repository::AuthRepositoryQueries;
+use crate::operations::recovery::credentials::StoredCredentialQueries;
+use crate::servers::persistence::ServersPersistenceQueries;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

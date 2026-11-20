@@ -2,6 +2,17 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::auth::api_keys::AuthApiKeysQueries;
+use crate::bandwidth::persistence::BandwidthPersistenceInternalQueries;
+use crate::bandwidth::queries::BandwidthQueries;
+use crate::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
+use crate::history::queries::HistoryQueries;
+use crate::history::timeline::HistoryTimelineQueries;
+use crate::operations::metrics_store::OperationsMetricsStoreQueries;
+use crate::rss::RssPersistenceQueries;
+use crate::rss::RssQueries;
+use crate::servers::repository::ServersRepositoryQueries;
+use crate::settings::service::SettingsServiceQueries;
 use std::path::Path;
 
 use crate::categories::CategoryConfig;

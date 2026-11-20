@@ -2,6 +2,8 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::history::queries::HistoryQueries;
+use crate::jobs::queries::JobsQueries;
 use std::future::Future;
 
 fn handle(pipeline: &Pipeline) -> SchedulerHandle {

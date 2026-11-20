@@ -7,6 +7,8 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::RwLock as StdRwLock;
+use weaver_server_core::auth::repository::AuthRepositoryQueries;
+use weaver_server_core::categories::queries::CategoriesQueries;
 
 use base64::Engine;
 use weaver_server_api::{SchemaContext, SystemRuntimeContext, build_schema};

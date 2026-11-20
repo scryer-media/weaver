@@ -594,14 +594,18 @@ fn changes<R: Row>(out: &mut Changes<R>, before: &[R], after: &[R]) {
     out.extend(was.map(|gone| (gone.key(), None)));
 }
 
-impl Database {
+pub(crate) trait JobsGraphCheckpointInternalQueries {
+    fn save_graph_checkpoint(&self, job_id: JobId, delta: Arc<Delta>) -> Result<(), StateError>;
+    #[cfg(test)]
+    fn has_graph_checkpoint(&self, job_id: JobId) -> Result<bool, LoadError>;
+    fn jobs_with_graph_checkpoint(&self) -> Result<std::collections::HashSet<JobId>, LoadError>;
+    fn load_graph_checkpoint(&self, job_id: JobId) -> Result<Option<GraphCheckpoint>, LoadError>;
+}
+
+impl JobsGraphCheckpointInternalQueries for Database {
     // Write what the checkpoint changed. A job whose active row is gone
     // keeps none: its rows are deleted and nothing is written.
-    pub(crate) fn save_graph_checkpoint(
-        &self,
-        job_id: JobId,
-        delta: Arc<Delta>,
-    ) -> Result<(), StateError> {
+    fn save_graph_checkpoint(&self, job_id: JobId, delta: Arc<Delta>) -> Result<(), StateError> {
         #[cfg(test)]
         self.graph_checkpoint_writes
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -619,7 +623,7 @@ impl Database {
     // never waits on the writer gate or the serial writer. An install reads
     // this with its batch, through `load_install_row_facts`.
     #[cfg(test)]
-    pub(crate) fn has_graph_checkpoint(&self, job_id: JobId) -> Result<bool, LoadError> {
+    fn has_graph_checkpoint(&self, job_id: JobId) -> Result<bool, LoadError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             SqlRuntime::run_read_transaction(&datastore, "has_graph_checkpoint", |tx| {
@@ -640,9 +644,7 @@ impl Database {
 
     // Every job with a checkpoint, in one read: the jobs with bytes on disk,
     // since a checkpoint describes only those. A pure read, as above.
-    pub(crate) fn jobs_with_graph_checkpoint(
-        &self,
-    ) -> Result<std::collections::HashSet<JobId>, LoadError> {
+    fn jobs_with_graph_checkpoint(&self) -> Result<std::collections::HashSet<JobId>, LoadError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             SqlRuntime::run_read_transaction(&datastore, "jobs_with_graph_checkpoint", |tx| {
@@ -669,10 +671,7 @@ impl Database {
     // The job's checkpoint, or `None` when it has no rows. Read in one
     // snapshot transaction, so it is one checkpoint even beside a writer, and
     // never behind the writer gate or the serial writer.
-    pub(crate) fn load_graph_checkpoint(
-        &self,
-        job_id: JobId,
-    ) -> Result<Option<GraphCheckpoint>, LoadError> {
+    fn load_graph_checkpoint(&self, job_id: JobId) -> Result<Option<GraphCheckpoint>, LoadError> {
         let datastore = self.datastore();
         let fetched = self
             .run_sql_blocking_read(async move {

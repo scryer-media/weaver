@@ -177,9 +177,68 @@ async fn insert_job_events_sql(
     }
 }
 
-impl Database {
+pub trait HistoryTimelineQueries {
+    fn insert_job_event(
+        &self,
+        job_id: u64,
+        timestamp: i64,
+        kind: &str,
+        message: &str,
+        file_id: Option<&str>,
+    ) -> Result<(), StateError>;
+    fn insert_job_events(&self, events: &[JobEvent]) -> Result<(), StateError>;
+    fn get_job_events(&self, job_id: u64) -> Result<Vec<JobEvent>, StateError>;
+    fn get_job_events_latest(&self, job_id: u64, cap: u32) -> Result<Vec<JobEvent>, StateError>;
+    fn get_job_events_window(
+        &self,
+        job_id: u64,
+        limit: u32,
+        skip_newest: u32,
+    ) -> Result<Vec<JobEvent>, StateError>;
+    fn get_job_event_records_window(
+        &self,
+        job_id: u64,
+        limit: u32,
+        skip_newest: u32,
+        before: Option<u64>,
+    ) -> Result<Vec<JobEventRecord>, StateError>;
+    fn count_job_events(&self, job_id: u64) -> Result<u64, StateError>;
+    fn get_job_events_of_kinds(
+        &self,
+        job_id: u64,
+        kinds: &[&str],
+    ) -> Result<Vec<JobEvent>, StateError>;
+    fn get_last_job_event_of_kinds(
+        &self,
+        job_id: u64,
+        kinds: &[&str],
+        download_finished_file_id: &str,
+    ) -> Result<Option<JobEvent>, StateError>;
+    fn get_job_event_kind_counts(&self, job_id: u64)
+    -> Result<Vec<(String, u64, u64)>, StateError>;
+    fn get_job_event_records_latest(
+        &self,
+        job_id: u64,
+        cap: u32,
+    ) -> Result<Vec<JobEventRecord>, StateError>;
+    fn get_job_event_stage_bounds(
+        &self,
+        job_ids: &[u64],
+        kinds: &[&str],
+    ) -> Result<JobEventStageBounds, StateError>;
+    fn get_recent_job_events_multi(
+        &self,
+        job_ids: &[u64],
+        min_id: u64,
+        limit: usize,
+    ) -> Result<Vec<JobEventRecord>, StateError>;
+    fn delete_job_events(&self, job_id: u64) -> Result<(), StateError>;
+    fn delete_all_job_events(&self) -> Result<(), StateError>;
+}
+
+impl HistoryTimelineQueries for Database {
     // Insert a single job event.
-    pub fn insert_job_event(
+    fn insert_job_event(
         &self,
         job_id: u64,
         timestamp: i64,
@@ -210,7 +269,7 @@ impl Database {
     }
 
     // Batch-insert job events in a single transaction.
-    pub fn insert_job_events(&self, events: &[JobEvent]) -> Result<(), StateError> {
+    fn insert_job_events(&self, events: &[JobEvent]) -> Result<(), StateError> {
         if events.is_empty() {
             return Ok(());
         }
@@ -221,7 +280,7 @@ impl Database {
     }
 
     // Load all events for a specific job, ordered by insertion order.
-    pub fn get_job_events(&self, job_id: u64) -> Result<Vec<JobEvent>, StateError> {
+    fn get_job_events(&self, job_id: u64) -> Result<Vec<JobEvent>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
@@ -256,17 +315,13 @@ impl Database {
     // intended for read-only views that re-poll frequently and only render the
     // tail of a potentially huge log (large RAR jobs write several rows per
     // extracted member).
-    pub fn get_job_events_latest(
-        &self,
-        job_id: u64,
-        cap: u32,
-    ) -> Result<Vec<JobEvent>, StateError> {
+    fn get_job_events_latest(&self, job_id: u64, cap: u32) -> Result<Vec<JobEvent>, StateError> {
         self.get_job_events_window(job_id, cap, 0)
     }
 
     // Up to `limit` of a job's events, oldest-first, ending `skip_newest`
     // events before its newest one.
-    pub fn get_job_events_window(
+    fn get_job_events_window(
         &self,
         job_id: u64,
         limit: u32,
@@ -283,7 +338,7 @@ impl Database {
     // ending `skip_newest` events before the newest one older than `before`
     // (a row id), or than none. Each row id is fixed, so paging by `before`
     // stays put while events are added.
-    pub fn get_job_event_records_window(
+    fn get_job_event_records_window(
         &self,
         job_id: u64,
         limit: u32,
@@ -314,7 +369,7 @@ impl Database {
     }
 
     // How many events a job has.
-    pub fn count_job_events(&self, job_id: u64) -> Result<u64, StateError> {
+    fn count_job_events(&self, job_id: u64) -> Result<u64, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let row = SqlRuntime::fetch_optional(
@@ -331,7 +386,7 @@ impl Database {
     }
 
     // Every one of a job's events of `kinds`, ordered by insertion order.
-    pub fn get_job_events_of_kinds(
+    fn get_job_events_of_kinds(
         &self,
         job_id: u64,
         kinds: &[&str],
@@ -368,7 +423,7 @@ impl Database {
 
     // The newest of a job's events of `kinds`, leaving out a `DownloadFinished`
     // that does not carry `download_finished_file_id`.
-    pub fn get_last_job_event_of_kinds(
+    fn get_last_job_event_of_kinds(
         &self,
         job_id: u64,
         kinds: &[&str],
@@ -406,70 +461,9 @@ impl Database {
         })
     }
 
-    // As `get_last_job_event_of_kinds`, for every job of `job_ids`: one
-    // statement per bind-sized chunk, served by the (job_id, kind) index. A
-    // job with no such event is absent from the map.
-    pub(crate) fn get_last_job_events_of_kinds(
-        &self,
-        job_ids: &[u64],
-        kinds: &[&str],
-        download_finished_file_id: &str,
-    ) -> Result<std::collections::HashMap<u64, JobEvent>, StateError> {
-        if kinds.is_empty() || job_ids.is_empty() {
-            return Ok(Default::default());
-        }
-        let fixed = kinds
-            .iter()
-            .map(|kind| SqlArg::Text((*kind).to_string()))
-            .chain(std::iter::once(SqlArg::Text(
-                download_finished_file_id.to_string(),
-            )))
-            .collect::<Vec<_>>();
-        let kind_placeholders = vec!["{}"; kinds.len()].join(", ");
-        let ids = job_ids.iter().map(|id| *id as i64).collect::<Vec<_>>();
-        let datastore = self.datastore();
-        self.run_sql_blocking_read(async move {
-            let mut events = std::collections::HashMap::new();
-            let chunk_len =
-                crate::persistence::sql_runtime::max_rows_for_engine(datastore.engine(), 1)
-                    .saturating_sub(fixed.len())
-                    .max(1);
-            for chunk in ids.chunks(chunk_len) {
-                let sql = format!(
-                    "SELECT e.job_id, e.timestamp, e.kind, e.message, e.file_id
-                       FROM job_events AS e
-                      WHERE e.id IN (
-                        SELECT MAX(x.id) FROM job_events AS x
-                         WHERE x.job_id IN ({})
-                           AND x.kind IN ({kind_placeholders})
-                           AND (x.kind <> 'DownloadFinished' OR x.file_id = {{}})
-                         GROUP BY x.job_id)",
-                    vec!["{}"; chunk.len()].join(", ")
-                );
-                let args = chunk
-                    .iter()
-                    .copied()
-                    .map(SqlArg::I64)
-                    .chain(fixed.iter().cloned())
-                    .collect::<Vec<_>>();
-                for row in SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await? {
-                    let event = JobEvent {
-                        job_id: row.i64("job_id")? as u64,
-                        timestamp: row.i64("timestamp")?,
-                        kind: row.text("kind")?,
-                        message: row.text("message")?,
-                        file_id: row.opt_text("file_id")?,
-                    };
-                    events.insert(event.job_id, event);
-                }
-            }
-            Ok(events)
-        })
-    }
-
     // How many events of each kind a job has, with the id of the newest of
     // each, ordered by that id.
-    pub fn get_job_event_kind_counts(
+    fn get_job_event_kind_counts(
         &self,
         job_id: u64,
     ) -> Result<Vec<(String, u64, u64)>, StateError> {
@@ -499,7 +493,7 @@ impl Database {
 
     // Load the most recent events for a job with their stable database ids.
     // Results are returned oldest-first after the capped newest-row query.
-    pub fn get_job_event_records_latest(
+    fn get_job_event_records_latest(
         &self,
         job_id: u64,
         cap: u32,
@@ -537,7 +531,7 @@ impl Database {
     // Batched min/max event timestamps per (job, kind) for stage-duration
     // reporting. One query regardless of how many jobs are listed; only the
     // stage-boundary kinds in `kinds` are scanned.
-    pub fn get_job_event_stage_bounds(
+    fn get_job_event_stage_bounds(
         &self,
         job_ids: &[u64],
         kinds: &[&str],
@@ -589,7 +583,7 @@ impl Database {
     //
     // Unlike [`Database::get_job_events_latest`], the result is returned in
     // the raw `ORDER BY id DESC` order (newest first) and is not reversed.
-    pub fn get_recent_job_events_multi(
+    fn get_recent_job_events_multi(
         &self,
         job_ids: &[u64],
         min_id: u64,
@@ -647,7 +641,7 @@ impl Database {
     }
 
     // Delete all events for a job.
-    pub fn delete_job_events(&self, job_id: u64) -> Result<(), StateError> {
+    fn delete_job_events(&self, job_id: u64) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
@@ -661,11 +655,83 @@ impl Database {
     }
 
     // Delete all job events across all jobs.
-    pub fn delete_all_job_events(&self) -> Result<(), StateError> {
+    fn delete_all_job_events(&self) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::execute(datastore.write_exec(), "DELETE FROM job_events", &[]).await?;
             Ok(())
+        })
+    }
+}
+
+pub(crate) trait HistoryTimelineInternalQueries {
+    fn get_last_job_events_of_kinds(
+        &self,
+        job_ids: &[u64],
+        kinds: &[&str],
+        download_finished_file_id: &str,
+    ) -> Result<std::collections::HashMap<u64, JobEvent>, StateError>;
+}
+
+impl HistoryTimelineInternalQueries for Database {
+    // As `get_last_job_event_of_kinds`, for every job of `job_ids`: one
+    // statement per bind-sized chunk, served by the (job_id, kind) index. A
+    // job with no such event is absent from the map.
+    fn get_last_job_events_of_kinds(
+        &self,
+        job_ids: &[u64],
+        kinds: &[&str],
+        download_finished_file_id: &str,
+    ) -> Result<std::collections::HashMap<u64, JobEvent>, StateError> {
+        if kinds.is_empty() || job_ids.is_empty() {
+            return Ok(Default::default());
+        }
+        let fixed = kinds
+            .iter()
+            .map(|kind| SqlArg::Text((*kind).to_string()))
+            .chain(std::iter::once(SqlArg::Text(
+                download_finished_file_id.to_string(),
+            )))
+            .collect::<Vec<_>>();
+        let kind_placeholders = vec!["{}"; kinds.len()].join(", ");
+        let ids = job_ids.iter().map(|id| *id as i64).collect::<Vec<_>>();
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let mut events = std::collections::HashMap::new();
+            let chunk_len =
+                crate::persistence::sql_runtime::max_rows_for_engine(datastore.engine(), 1)
+                    .saturating_sub(fixed.len())
+                    .max(1);
+            for chunk in ids.chunks(chunk_len) {
+                let sql = format!(
+                    "SELECT e.job_id, e.timestamp, e.kind, e.message, e.file_id
+                       FROM job_events AS e
+                      WHERE e.id IN (
+                        SELECT MAX(x.id) FROM job_events AS x
+                         WHERE x.job_id IN ({})
+                           AND x.kind IN ({kind_placeholders})
+                           AND (x.kind <> 'DownloadFinished' OR x.file_id = {{}})
+                         GROUP BY x.job_id)",
+                    vec!["{}"; chunk.len()].join(", ")
+                );
+                let args = chunk
+                    .iter()
+                    .copied()
+                    .map(SqlArg::I64)
+                    .chain(fixed.iter().cloned())
+                    .collect::<Vec<_>>();
+                for row in SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await? {
+                    let event = JobEvent {
+                        job_id: row.i64("job_id")? as u64,
+                        timestamp: row.i64("timestamp")?,
+                        kind: row.text("kind")?,
+                        message: row.text("message")?,
+                        file_id: row.opt_text("file_id")?,
+                    };
+                    events.insert(event.job_id, event);
+                }
+            }
+            Ok(events)
         })
     }
 }

@@ -6,6 +6,8 @@
 // The evaluator ticks once a minute from memory. It reads the jobs from the
 // database only after one of them changed, never to decide what is due.
 
+use crate::post_processing::instances::PostProcessingInstancesQueries;
+use crate::post_processing::output::PostProcessingOutputQueries;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -99,7 +101,11 @@ impl Occurrences {
     }
 }
 
-impl Database {
+trait PostProcessingSchedulerLocalQueries {
+    fn schedule_jobs(&self) -> Result<Arc<Vec<ScriptInstance>>, StateError>;
+}
+
+impl PostProcessingSchedulerLocalQueries for Database {
     // Every script job, as the evaluator last read it. A write to any job
     // clears this, and the next tick reads them again.
     fn schedule_jobs(&self) -> Result<Arc<Vec<ScriptInstance>>, StateError> {
@@ -254,6 +260,7 @@ mod tests {
     use super::super::instances::{InstanceSchedule, ScriptInstanceDraft};
     use super::super::model::ScriptName;
     use super::*;
+    use crate::post_processing::instances::PostProcessingInstancesQueries;
 
     fn at(time: &str) -> NaiveDateTime {
         NaiveDateTime::parse_from_str(time, "%Y-%m-%d %H:%M").unwrap()

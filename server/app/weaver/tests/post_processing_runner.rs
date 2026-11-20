@@ -13,6 +13,12 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use weaver_server_core::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
+use weaver_server_core::post_processing::events::PostProcessingEventsCancelEventScriptsQueries;
+use weaver_server_core::post_processing::instances::PostProcessingInstancesQueries;
+use weaver_server_core::post_processing::output::PostProcessingOutputQueries;
+use weaver_server_core::post_processing::secrets::PostProcessingSecretsQueries;
+use weaver_server_core::post_processing::settings::PostProcessingSettingsQueries;
 
 use weaver_server_core::persistence::Database;
 use weaver_server_core::post_processing::executor::PostProcessingExecutor;

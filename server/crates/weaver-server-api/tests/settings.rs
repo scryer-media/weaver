@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use weaver_server_core::post_processing::settings::PostProcessingSettingsQueries;
+use weaver_server_core::settings::SettingsSchedulesQueries;
+use weaver_server_core::settings::queries::SettingsQueries;
+use weaver_server_core::settings::service::SettingsServiceQueries;
 mod common;
 
 use common::{

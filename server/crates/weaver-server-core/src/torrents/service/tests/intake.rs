@@ -2,6 +2,14 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::categories::persistence::CategoriesPersistenceQueries;
+use crate::categories::queries::CategoriesQueries;
+use crate::history::queries::HistoryQueries;
+use crate::post_processing::settings::PostProcessingSettingsQueries;
+use crate::proxies::ProxiesDnsPersistenceQueries;
+use crate::proxies::ProxiesPersistenceQueries;
+use crate::tags::TagsQueries;
+use crate::torrents::queries::TorrentsQueries;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_torrent_takes_the_tags_it_was_added_with_and_its_view_shows_them() {

@@ -230,11 +230,74 @@ pub struct DuplicateBackfillEntry {
     pub evidence: FingerprintEvidence,
 }
 
-impl Database {
+pub trait JobsDuplicatePersistenceAdmitDuplicateSubmissionQueries {
+    fn admit_duplicate_submission(
+        &self,
+        request: &DuplicateAdmissionRequest,
+    ) -> Result<DuplicateAdmission, StateError>;
+    fn activate_duplicate_admission(&self, job_id: JobId) -> Result<(), StateError>;
+    fn release_duplicate_admission(&self, job_id: JobId) -> Result<(), StateError>;
+    fn forget_duplicate_identity(&self, job_id: JobId) -> Result<bool, StateError>;
+    fn cleanup_stale_duplicate_admissions(&self) -> Result<usize, StateError>;
+    fn duplicate_snapshot(&self, job_id: JobId)
+    -> Result<Option<DuplicateJobSnapshot>, StateError>;
+    fn semantic_candidate_snapshot(
+        &self,
+        job_id: JobId,
+    ) -> Result<Option<SemanticCandidateSnapshot>, StateError>;
+    fn duplicate_summaries(
+        &self,
+        job_ids: &[JobId],
+    ) -> Result<BTreeMap<JobId, DuplicateJobSummary>, StateError>;
+    fn mark_semantic_candidate_good(&self, job_id: JobId) -> Result<bool, StateError>;
+    fn mark_semantic_candidate_bad(&self, job_id: JobId) -> Result<bool, StateError>;
+    fn clear_semantic_bad_transition(&self, job_id: JobId) -> Result<(), StateError>;
+    fn claim_semantic_promotion(
+        &self,
+        trigger_job_id: JobId,
+    ) -> Result<Option<SemanticPromotionClaim>, StateError>;
+    fn reconcile_semantic_promotion_claims(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<SemanticPromotionClaim>, StateError>;
+    fn complete_semantic_promotion_claim(
+        &self,
+        job_id: JobId,
+        generation: i64,
+    ) -> Result<bool, StateError>;
+    fn rollback_semantic_supersession(
+        &self,
+        replacement_job_id: JobId,
+        incumbent_job_id: JobId,
+    ) -> Result<(), StateError>;
+    fn release_semantic_promotion_claim(
+        &self,
+        job_id: JobId,
+        generation: i64,
+    ) -> Result<bool, StateError>;
+    fn duplicate_backfill_state(&self) -> Result<Option<DuplicateBackfillState>, StateError>;
+    fn save_duplicate_backfill_state(
+        &self,
+        state: DuplicateBackfillState,
+    ) -> Result<(), StateError>;
+    fn load_duplicate_backfill_sources(
+        &self,
+        cursor_job_id: Option<JobId>,
+        limit: usize,
+    ) -> Result<Vec<DuplicateBackfillSource>, StateError>;
+    fn commit_duplicate_backfill_batch(
+        &self,
+        entries: &[DuplicateBackfillEntry],
+        cursor_job_id: Option<JobId>,
+        completed: bool,
+    ) -> Result<(), StateError>;
+}
+
+impl JobsDuplicatePersistenceAdmitDuplicateSubmissionQueries for Database {
     // Atomically allocates a job id, records the evidence and claims its
     // identities. The short-lived reservation is recovered if the scheduler
     // never materializes the active job after a process crash.
-    pub fn admit_duplicate_submission(
+    fn admit_duplicate_submission(
         &self,
         request: &DuplicateAdmissionRequest,
     ) -> Result<DuplicateAdmission, StateError> {
@@ -273,7 +336,7 @@ impl Database {
         outcome
     }
 
-    pub fn activate_duplicate_admission(&self, job_id: JobId) -> Result<(), StateError> {
+    fn activate_duplicate_admission(&self, job_id: JobId) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
@@ -294,7 +357,7 @@ impl Database {
 
     // Removes a reservation that did not become a scheduler-owned job. This
     // is intentionally separate from visible-history deletion.
-    pub fn release_duplicate_admission(&self, job_id: JobId) -> Result<(), StateError> {
+    fn release_duplicate_admission(&self, job_id: JobId) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "release_duplicate_admission", |tx| {
@@ -306,7 +369,7 @@ impl Database {
 
     // Explicitly forgets durable duplicate identity. Normal history deletion
     // must not call this: duplicate identity deliberately outlives retention.
-    pub fn forget_duplicate_identity(&self, job_id: JobId) -> Result<bool, StateError> {
+    fn forget_duplicate_identity(&self, job_id: JobId) -> Result<bool, StateError> {
         let datastore = self.datastore();
         let now = epoch_seconds();
         self.run_sql_blocking(async move {
@@ -349,7 +412,7 @@ impl Database {
         })
     }
 
-    pub fn cleanup_stale_duplicate_admissions(&self) -> Result<usize, StateError> {
+    fn cleanup_stale_duplicate_admissions(&self) -> Result<usize, StateError> {
         let datastore = self.datastore();
         let now = epoch_seconds();
         self.run_sql_blocking(async move {
@@ -360,7 +423,7 @@ impl Database {
         })
     }
 
-    pub fn duplicate_snapshot(
+    fn duplicate_snapshot(
         &self,
         job_id: JobId,
     ) -> Result<Option<DuplicateJobSnapshot>, StateError> {
@@ -378,7 +441,7 @@ impl Database {
         })
     }
 
-    pub fn semantic_candidate_snapshot(
+    fn semantic_candidate_snapshot(
         &self,
         job_id: JobId,
     ) -> Result<Option<SemanticCandidateSnapshot>, StateError> {
@@ -434,7 +497,7 @@ impl Database {
     // stored source is read only by length, so the compressed NZB that sits in
     // the same row is never read, and the candidate row is read once per job
     // rather than once per fingerprint. Missing identities are omitted.
-    pub fn duplicate_summaries(
+    fn duplicate_summaries(
         &self,
         job_ids: &[JobId],
     ) -> Result<BTreeMap<JobId, DuplicateJobSummary>, StateError> {
@@ -545,7 +608,7 @@ impl Database {
 
     // Marks a successful candidate as good and permanently suppresses its
     // lower-or-equal parked alternatives. Higher-score upgrades remain valid.
-    pub fn mark_semantic_candidate_good(&self, job_id: JobId) -> Result<bool, StateError> {
+    fn mark_semantic_candidate_good(&self, job_id: JobId) -> Result<bool, StateError> {
         let datastore = self.datastore();
         let now = epoch_seconds();
         self.run_sql_blocking(async move {
@@ -607,7 +670,7 @@ impl Database {
 
     // Explicitly marks a candidate bad. This is the only operator override
     // that schedules semantic promotion regardless of the raw failure text.
-    pub fn mark_semantic_candidate_bad(&self, job_id: JobId) -> Result<bool, StateError> {
+    fn mark_semantic_candidate_bad(&self, job_id: JobId) -> Result<bool, StateError> {
         let datastore = self.datastore();
         let now = epoch_seconds();
         self.run_sql_blocking(async move {
@@ -634,7 +697,7 @@ impl Database {
     // Reverts an operator mark-bad only when no scheduler cancellation was
     // issued. This prevents a post-processing race from leaving a phantom
     // pending promotion behind.
-    pub fn clear_semantic_bad_transition(&self, job_id: JobId) -> Result<(), StateError> {
+    fn clear_semantic_bad_transition(&self, job_id: JobId) -> Result<(), StateError> {
         let datastore = self.datastore();
         let now = epoch_seconds();
         self.run_sql_blocking(async move {
@@ -663,7 +726,7 @@ impl Database {
     // Atomically chooses the best parked candidate for a promotable group and
     // marks it claimed before any scheduler work is created. The winner rule
     // is score descending, then oldest creation time, then lowest job ID.
-    pub fn claim_semantic_promotion(
+    fn claim_semantic_promotion(
         &self,
         trigger_job_id: JobId,
     ) -> Result<Option<SemanticPromotionClaim>, StateError> {
@@ -681,6 +744,431 @@ impl Database {
         })
     }
 
+    // Reconciles crash windows after startup: completed scheduler-owned claims
+    // are finalized, while claimed-without-active-job and pending groups are
+    // returned for idempotent materialization by the scheduler owner.
+    fn reconcile_semantic_promotion_claims(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<SemanticPromotionClaim>, StateError> {
+        let datastore = self.datastore();
+        let limit = limit.clamp(1, 256) as i64;
+        let now = epoch_seconds();
+        let (active_claims, stale_claims, pending_triggers) =
+            self.run_sql_blocking_read(async move {
+                let active_claims = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    "SELECT c.job_id, c.promotion_generation FROM semantic_duplicate_candidates AS c
+                 WHERE c.promotion_state = {}
+                   AND EXISTS (SELECT 1 FROM active_jobs AS a WHERE a.job_id = c.job_id)
+                 ORDER BY c.job_id ASC LIMIT {}",
+                    &[
+                        SqlArg::Text(SemanticPromotionState::Claimed.as_str().to_string()),
+                        SqlArg::I64(limit),
+                    ],
+                )
+                .await?
+                .into_iter()
+                .map(|row| Ok((JobId(row.i64("job_id")? as u64), row.i64("promotion_generation")?)))
+                .collect::<Result<Vec<_>, StateError>>()?;
+                let stale_claims = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    "SELECT c.job_id, c.promotion_generation
+                 FROM semantic_duplicate_candidates AS c
+                 WHERE c.promotion_state = {}
+                   AND NOT EXISTS (SELECT 1 FROM active_jobs AS a WHERE a.job_id = c.job_id)
+                   AND c.promotion_lease_expires_at <= {}
+                 ORDER BY c.promotion_claimed_at ASC, c.job_id ASC LIMIT {}",
+                    &[
+                        SqlArg::Text(SemanticPromotionState::Claimed.as_str().to_string()),
+                        SqlArg::I64(now),
+                        SqlArg::I64(limit),
+                    ],
+                )
+                .await?;
+                let stale_claims = stale_claims
+                    .into_iter()
+                    .map(|row| {
+                        Ok((
+                            JobId(row.i64("job_id")? as u64),
+                            row.i64("promotion_generation")?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, StateError>>()?;
+                let pending_triggers = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    "SELECT job_id FROM semantic_duplicate_candidates
+                 WHERE promotion_state = {} ORDER BY updated_at ASC, job_id ASC LIMIT {}",
+                    &[
+                        SqlArg::Text(SemanticPromotionState::Pending.as_str().to_string()),
+                        SqlArg::I64(limit),
+                    ],
+                )
+                .await?
+                .into_iter()
+                .map(|row| Ok(JobId(row.i64("job_id")? as u64)))
+                .collect::<Result<Vec<_>, StateError>>()?;
+                Ok((active_claims, stale_claims, pending_triggers))
+            })?;
+
+        for (job_id, generation) in active_claims {
+            let _ = self.complete_semantic_promotion_claim(job_id, generation)?;
+        }
+        let mut claims = Vec::new();
+        for (job_id, generation) in stale_claims {
+            if let Some(claim) = self.reclaim_semantic_promotion_claim(job_id, generation)? {
+                record_semantic_duplicate_lifecycle_metric(
+                    SemanticDuplicateLifecycleEvent::PromotionRecovery,
+                );
+                claims.push(claim);
+            }
+        }
+        for trigger_job_id in pending_triggers {
+            if claims.len() >= limit as usize {
+                break;
+            }
+            if let Some(claim) = self.claim_semantic_promotion(trigger_job_id)? {
+                claims.push(claim);
+            }
+        }
+        Ok(claims)
+    }
+
+    // Marks a successfully materialized claim active. A scheduler enqueue
+    // failure must call [`Self::release_semantic_promotion_claim`] instead.
+    fn complete_semantic_promotion_claim(
+        &self,
+        job_id: JobId,
+        generation: i64,
+    ) -> Result<bool, StateError> {
+        let datastore = self.datastore();
+        let now = epoch_seconds();
+        let completed = self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "complete_semantic_promotion_claim", |tx| {
+                Box::pin(async move {
+                    let group_id = tx
+                        .fetch_optional(
+                            "SELECT group_id FROM semantic_duplicate_candidates
+                             WHERE job_id = {} AND promotion_state = {} AND promotion_generation = {}",
+                            &[
+                                SqlArg::I64(job_id.0 as i64),
+                                SqlArg::Text(SemanticPromotionState::Claimed.as_str().to_string()),
+                                SqlArg::I64(generation),
+                            ],
+                        )
+                        .await?
+                        .map(|row| row.i64("group_id"))
+                        .transpose()?;
+                    let Some(group_id) = group_id else {
+                        return Ok(false);
+                    };
+                    let changed = tx.execute(
+                        "UPDATE semantic_duplicate_candidates
+                         SET promotion_state = {}, promotion_claimed_at = NULL,
+                             promotion_lease_expires_at = NULL, updated_at = {}
+                         WHERE job_id = {} AND promotion_state = {} AND promotion_generation = {}",
+                        &[
+                            SqlArg::Text(SemanticPromotionState::None.as_str().to_string()),
+                            SqlArg::I64(now),
+                            SqlArg::I64(job_id.0 as i64),
+                            SqlArg::Text(SemanticPromotionState::Claimed.as_str().to_string()),
+                            SqlArg::I64(generation),
+                        ],
+                    )
+                    .await?;
+                    if changed != 1 {
+                        return Ok(false);
+                    }
+                    tx.execute(
+                        "UPDATE semantic_duplicate_candidates
+                         SET promotion_state = {}, updated_at = {}
+                         WHERE group_id = {} AND promotion_state = {}",
+                        &[
+                            SqlArg::Text(SemanticPromotionState::None.as_str().to_string()),
+                            SqlArg::I64(now),
+                            SqlArg::I64(group_id),
+                            SqlArg::Text(SemanticPromotionState::Pending.as_str().to_string()),
+                        ],
+                    )
+                    .await?;
+                    Ok(true)
+                })
+            })
+            .await
+        });
+        if matches!(completed, Ok(true)) {
+            record_semantic_duplicate_lifecycle_metric(SemanticDuplicateLifecycleEvent::Promote);
+        }
+        completed
+    }
+
+    // Restores the incumbent and parks a higher-score replacement when the
+    // scheduler's last-moment post-processing guard rejects supersession.
+    fn rollback_semantic_supersession(
+        &self,
+        replacement_job_id: JobId,
+        incumbent_job_id: JobId,
+    ) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        let now = epoch_seconds();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "rollback_semantic_supersession", |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        "UPDATE semantic_duplicate_candidates
+                         SET candidate_state = {}, updated_at = {}
+                         WHERE job_id = {} AND candidate_state = {}",
+                        &[
+                            SqlArg::Text(SemanticCandidateState::Parked.as_str().to_string()),
+                            SqlArg::I64(now),
+                            SqlArg::I64(replacement_job_id.0 as i64),
+                            SqlArg::Text(SemanticCandidateState::Active.as_str().to_string()),
+                        ],
+                    )
+                    .await?;
+                    tx.execute(
+                        "UPDATE duplicate_job_snapshots
+                         SET lifecycle = {}, reservation_expires_at = NULL, updated_at = {}
+                         WHERE job_id = {}",
+                        &[
+                            SqlArg::Text(DuplicateJobLifecycle::Parked.as_str().to_string()),
+                            SqlArg::I64(now),
+                            SqlArg::I64(replacement_job_id.0 as i64),
+                        ],
+                    )
+                    .await?;
+                    tx.execute(
+                        "UPDATE semantic_duplicate_candidates
+                         SET candidate_state = {}, updated_at = {}
+                         WHERE job_id = {} AND candidate_state IN ({}, {})",
+                        &[
+                            SqlArg::Text(SemanticCandidateState::Active.as_str().to_string()),
+                            SqlArg::I64(now),
+                            SqlArg::I64(incumbent_job_id.0 as i64),
+                            SqlArg::Text(SemanticCandidateState::Parked.as_str().to_string()),
+                            SqlArg::Text(SemanticCandidateState::Suppressed.as_str().to_string()),
+                        ],
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+        })
+    }
+
+    fn release_semantic_promotion_claim(
+        &self,
+        job_id: JobId,
+        generation: i64,
+    ) -> Result<bool, StateError> {
+        let datastore = self.datastore();
+        let now = epoch_seconds();
+        let released = self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "release_semantic_promotion_claim", |tx| {
+                Box::pin(async move {
+                    let changed = tx.execute(
+                        "UPDATE semantic_duplicate_candidates
+                         SET candidate_state = {}, promotion_state = {}, promotion_claimed_at = NULL,
+                             promotion_lease_expires_at = NULL, updated_at = {}
+                         WHERE job_id = {} AND promotion_state = {} AND promotion_generation = {}",
+                        &[
+                            SqlArg::Text(SemanticCandidateState::Parked.as_str().to_string()),
+                            SqlArg::Text(SemanticPromotionState::None.as_str().to_string()),
+                            SqlArg::I64(now),
+                            SqlArg::I64(job_id.0 as i64),
+                            SqlArg::Text(SemanticPromotionState::Claimed.as_str().to_string()),
+                            SqlArg::I64(generation),
+                        ],
+                    )
+                    .await?;
+                    if changed != 1 {
+                        return Ok(false);
+                    }
+                    tx.execute(
+                        "UPDATE duplicate_job_snapshots
+                         SET lifecycle = {}, reservation_expires_at = NULL, updated_at = {}
+                         WHERE job_id = {}",
+                        &[
+                            SqlArg::Text(DuplicateJobLifecycle::Parked.as_str().to_string()),
+                            SqlArg::I64(now),
+                            SqlArg::I64(job_id.0 as i64),
+                        ],
+                    )
+                    .await?;
+                    Ok(true)
+                })
+            })
+            .await
+        });
+        if matches!(released, Ok(true)) {
+            record_semantic_duplicate_lifecycle_metric(
+                SemanticDuplicateLifecycleEvent::PromotionRetry,
+            );
+        }
+        released
+    }
+
+    fn duplicate_backfill_state(&self) -> Result<Option<DuplicateBackfillState>, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT cursor_job_id, completed_at FROM duplicate_backfill_state WHERE backfill_key = {}",
+                &[SqlArg::Text(BACKFILL_KEY.to_string())],
+            )
+            .await?
+            .map(|row| {
+                Ok(DuplicateBackfillState {
+                    cursor_job_id: row.opt_i64("cursor_job_id")?.map(|id| JobId(id as u64)),
+                    completed_at: row.opt_i64("completed_at")?,
+                })
+            })
+            .transpose()
+        })
+    }
+
+    fn save_duplicate_backfill_state(
+        &self,
+        state: DuplicateBackfillState,
+    ) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.write_exec(),
+                "INSERT INTO duplicate_backfill_state
+                    (backfill_key, cursor_job_id, completed_at, updated_at)
+                 VALUES ({}, {}, {}, {})
+                 ON CONFLICT(backfill_key) DO UPDATE SET
+                    cursor_job_id = excluded.cursor_job_id,
+                    completed_at = excluded.completed_at,
+                    updated_at = excluded.updated_at",
+                &[
+                    SqlArg::Text(BACKFILL_KEY.to_string()),
+                    SqlArg::OptI64(state.cursor_job_id.map(|job_id| job_id.0 as i64)),
+                    SqlArg::OptI64(state.completed_at),
+                    SqlArg::I64(epoch_seconds()),
+                ],
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
+    // Reads a small ordered page of persisted NZBs. Parsing is deliberately
+    // left to the async caller's blocking worker, never the scheduler or SQL
+    // runtime thread. Active rows win only while not yet archived.
+    fn load_duplicate_backfill_sources(
+        &self,
+        cursor_job_id: Option<JobId>,
+        limit: usize,
+    ) -> Result<Vec<DuplicateBackfillSource>, StateError> {
+        let datastore = self.datastore();
+        let after = cursor_job_id.map_or(0, |job_id| job_id.0.min(i64::MAX as u64) as i64);
+        let limit = limit.clamp(1, 256) as i64;
+        self.run_sql_blocking_read(async move {
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT job_id, raw_job_hash, nzb_zstd, lifecycle, created_at, metadata FROM (
+                     SELECT a.job_id, a.nzb_hash AS raw_job_hash, n.nzb_zstd,
+                            'active' AS lifecycle, a.created_at, a.metadata
+                       FROM active_jobs AS a
+                       LEFT JOIN job_nzbs AS n ON n.job_id = a.job_id
+                      WHERE NOT EXISTS (
+                            SELECT 1 FROM job_history AS h WHERE h.job_id = a.job_id
+                        )
+                     UNION ALL
+                     SELECT h.job_id, h.job_hash AS raw_job_hash, hn.nzb_zstd,
+                            CASE
+                                WHEN h.status IN ('complete', 'succeeded') THEN 'succeeded'
+                                WHEN h.status = 'cancelled' THEN 'cancelled'
+                                ELSE 'failed'
+                            END AS lifecycle,
+                            h.created_at, h.metadata
+                       FROM job_history AS h
+                       LEFT JOIN job_nzbs AS hn ON hn.job_id = h.job_id
+                 ) AS source
+                 WHERE job_id > {}
+                   AND NOT EXISTS (
+                       SELECT 1 FROM forgotten_duplicate_identities AS forgotten
+                        WHERE forgotten.job_id = source.job_id
+                   )
+                 ORDER BY job_id ASC
+                 LIMIT {}",
+                &[SqlArg::I64(after), SqlArg::I64(limit)],
+            )
+            .await?;
+            rows.into_iter()
+                .map(|row| {
+                    let lifecycle = row
+                        .text("lifecycle")
+                        .ok()
+                        .and_then(|value| DuplicateJobLifecycle::from_persisted(&value))
+                        .ok_or_else(|| {
+                            StateError::Database("invalid duplicate backfill lifecycle".to_string())
+                        })?;
+                    let raw_job_hash = row
+                        .opt_bytes("raw_job_hash")?
+                        .and_then(|bytes| bytes.try_into().ok());
+                    Ok(DuplicateBackfillSource {
+                        job_id: JobId(row.i64("job_id")? as u64),
+                        raw_job_hash,
+                        nzb_zstd: row.opt_bytes("nzb_zstd")?,
+                        lifecycle,
+                        created_at: row.i64("created_at")?,
+                        metadata: crate::parse_history_metadata(
+                            row.opt_text("metadata")?.as_deref(),
+                        ),
+                    })
+                })
+                .collect()
+        })
+    }
+
+    // Commits all parser-validated evidence and the cursor together. A crash
+    // before commit repeats an idempotent page; a crash after commit never
+    // loses its checkpoint.
+    fn commit_duplicate_backfill_batch(
+        &self,
+        entries: &[DuplicateBackfillEntry],
+        cursor_job_id: Option<JobId>,
+        completed: bool,
+    ) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        let entries = entries.to_vec();
+        let now = epoch_seconds();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "commit_duplicate_backfill_batch", |tx| {
+                let entries = entries.clone();
+                Box::pin(async move {
+                    for entry in &entries {
+                        backfill_duplicate_evidence_tx(tx, entry, now).await?;
+                    }
+                    save_duplicate_backfill_state_tx(
+                        tx,
+                        DuplicateBackfillState {
+                            cursor_job_id,
+                            completed_at: completed.then_some(now),
+                        },
+                        now,
+                    )
+                    .await
+                })
+            })
+            .await
+        })
+    }
+}
+
+trait JobsDuplicatePersistenceReclaimSemanticPromotionClaimLocalQueries {
+    fn reclaim_semantic_promotion_claim(
+        &self,
+        job_id: JobId,
+        expected_generation: i64,
+    ) -> Result<Option<SemanticPromotionClaim>, StateError>;
+}
+
+impl JobsDuplicatePersistenceReclaimSemanticPromotionClaimLocalQueries for Database {
     // Reclaims only an expired promotion lease. The expected generation makes
     // concurrent runtime/API recovery attempts single-winner operations.
     fn reclaim_semantic_promotion_claim(
@@ -776,421 +1264,6 @@ impl Database {
                         generation,
                         source,
                     }))
-                })
-            })
-            .await
-        })
-    }
-
-    // Reconciles crash windows after startup: completed scheduler-owned claims
-    // are finalized, while claimed-without-active-job and pending groups are
-    // returned for idempotent materialization by the scheduler owner.
-    pub fn reconcile_semantic_promotion_claims(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<SemanticPromotionClaim>, StateError> {
-        let datastore = self.datastore();
-        let limit = limit.clamp(1, 256) as i64;
-        let now = epoch_seconds();
-        let (active_claims, stale_claims, pending_triggers) =
-            self.run_sql_blocking_read(async move {
-                let active_claims = SqlRuntime::fetch_all(
-                    datastore.read_exec(),
-                    "SELECT c.job_id, c.promotion_generation FROM semantic_duplicate_candidates AS c
-                 WHERE c.promotion_state = {}
-                   AND EXISTS (SELECT 1 FROM active_jobs AS a WHERE a.job_id = c.job_id)
-                 ORDER BY c.job_id ASC LIMIT {}",
-                    &[
-                        SqlArg::Text(SemanticPromotionState::Claimed.as_str().to_string()),
-                        SqlArg::I64(limit),
-                    ],
-                )
-                .await?
-                .into_iter()
-                .map(|row| Ok((JobId(row.i64("job_id")? as u64), row.i64("promotion_generation")?)))
-                .collect::<Result<Vec<_>, StateError>>()?;
-                let stale_claims = SqlRuntime::fetch_all(
-                    datastore.read_exec(),
-                    "SELECT c.job_id, c.promotion_generation
-                 FROM semantic_duplicate_candidates AS c
-                 WHERE c.promotion_state = {}
-                   AND NOT EXISTS (SELECT 1 FROM active_jobs AS a WHERE a.job_id = c.job_id)
-                   AND c.promotion_lease_expires_at <= {}
-                 ORDER BY c.promotion_claimed_at ASC, c.job_id ASC LIMIT {}",
-                    &[
-                        SqlArg::Text(SemanticPromotionState::Claimed.as_str().to_string()),
-                        SqlArg::I64(now),
-                        SqlArg::I64(limit),
-                    ],
-                )
-                .await?;
-                let stale_claims = stale_claims
-                    .into_iter()
-                    .map(|row| {
-                        Ok((
-                            JobId(row.i64("job_id")? as u64),
-                            row.i64("promotion_generation")?,
-                        ))
-                    })
-                    .collect::<Result<Vec<_>, StateError>>()?;
-                let pending_triggers = SqlRuntime::fetch_all(
-                    datastore.read_exec(),
-                    "SELECT job_id FROM semantic_duplicate_candidates
-                 WHERE promotion_state = {} ORDER BY updated_at ASC, job_id ASC LIMIT {}",
-                    &[
-                        SqlArg::Text(SemanticPromotionState::Pending.as_str().to_string()),
-                        SqlArg::I64(limit),
-                    ],
-                )
-                .await?
-                .into_iter()
-                .map(|row| Ok(JobId(row.i64("job_id")? as u64)))
-                .collect::<Result<Vec<_>, StateError>>()?;
-                Ok((active_claims, stale_claims, pending_triggers))
-            })?;
-
-        for (job_id, generation) in active_claims {
-            let _ = self.complete_semantic_promotion_claim(job_id, generation)?;
-        }
-        let mut claims = Vec::new();
-        for (job_id, generation) in stale_claims {
-            if let Some(claim) = self.reclaim_semantic_promotion_claim(job_id, generation)? {
-                record_semantic_duplicate_lifecycle_metric(
-                    SemanticDuplicateLifecycleEvent::PromotionRecovery,
-                );
-                claims.push(claim);
-            }
-        }
-        for trigger_job_id in pending_triggers {
-            if claims.len() >= limit as usize {
-                break;
-            }
-            if let Some(claim) = self.claim_semantic_promotion(trigger_job_id)? {
-                claims.push(claim);
-            }
-        }
-        Ok(claims)
-    }
-
-    // Marks a successfully materialized claim active. A scheduler enqueue
-    // failure must call [`Self::release_semantic_promotion_claim`] instead.
-    pub fn complete_semantic_promotion_claim(
-        &self,
-        job_id: JobId,
-        generation: i64,
-    ) -> Result<bool, StateError> {
-        let datastore = self.datastore();
-        let now = epoch_seconds();
-        let completed = self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "complete_semantic_promotion_claim", |tx| {
-                Box::pin(async move {
-                    let group_id = tx
-                        .fetch_optional(
-                            "SELECT group_id FROM semantic_duplicate_candidates
-                             WHERE job_id = {} AND promotion_state = {} AND promotion_generation = {}",
-                            &[
-                                SqlArg::I64(job_id.0 as i64),
-                                SqlArg::Text(SemanticPromotionState::Claimed.as_str().to_string()),
-                                SqlArg::I64(generation),
-                            ],
-                        )
-                        .await?
-                        .map(|row| row.i64("group_id"))
-                        .transpose()?;
-                    let Some(group_id) = group_id else {
-                        return Ok(false);
-                    };
-                    let changed = tx.execute(
-                        "UPDATE semantic_duplicate_candidates
-                         SET promotion_state = {}, promotion_claimed_at = NULL,
-                             promotion_lease_expires_at = NULL, updated_at = {}
-                         WHERE job_id = {} AND promotion_state = {} AND promotion_generation = {}",
-                        &[
-                            SqlArg::Text(SemanticPromotionState::None.as_str().to_string()),
-                            SqlArg::I64(now),
-                            SqlArg::I64(job_id.0 as i64),
-                            SqlArg::Text(SemanticPromotionState::Claimed.as_str().to_string()),
-                            SqlArg::I64(generation),
-                        ],
-                    )
-                    .await?;
-                    if changed != 1 {
-                        return Ok(false);
-                    }
-                    tx.execute(
-                        "UPDATE semantic_duplicate_candidates
-                         SET promotion_state = {}, updated_at = {}
-                         WHERE group_id = {} AND promotion_state = {}",
-                        &[
-                            SqlArg::Text(SemanticPromotionState::None.as_str().to_string()),
-                            SqlArg::I64(now),
-                            SqlArg::I64(group_id),
-                            SqlArg::Text(SemanticPromotionState::Pending.as_str().to_string()),
-                        ],
-                    )
-                    .await?;
-                    Ok(true)
-                })
-            })
-            .await
-        });
-        if matches!(completed, Ok(true)) {
-            record_semantic_duplicate_lifecycle_metric(SemanticDuplicateLifecycleEvent::Promote);
-        }
-        completed
-    }
-
-    // Restores the incumbent and parks a higher-score replacement when the
-    // scheduler's last-moment post-processing guard rejects supersession.
-    pub fn rollback_semantic_supersession(
-        &self,
-        replacement_job_id: JobId,
-        incumbent_job_id: JobId,
-    ) -> Result<(), StateError> {
-        let datastore = self.datastore();
-        let now = epoch_seconds();
-        self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "rollback_semantic_supersession", |tx| {
-                Box::pin(async move {
-                    tx.execute(
-                        "UPDATE semantic_duplicate_candidates
-                         SET candidate_state = {}, updated_at = {}
-                         WHERE job_id = {} AND candidate_state = {}",
-                        &[
-                            SqlArg::Text(SemanticCandidateState::Parked.as_str().to_string()),
-                            SqlArg::I64(now),
-                            SqlArg::I64(replacement_job_id.0 as i64),
-                            SqlArg::Text(SemanticCandidateState::Active.as_str().to_string()),
-                        ],
-                    )
-                    .await?;
-                    tx.execute(
-                        "UPDATE duplicate_job_snapshots
-                         SET lifecycle = {}, reservation_expires_at = NULL, updated_at = {}
-                         WHERE job_id = {}",
-                        &[
-                            SqlArg::Text(DuplicateJobLifecycle::Parked.as_str().to_string()),
-                            SqlArg::I64(now),
-                            SqlArg::I64(replacement_job_id.0 as i64),
-                        ],
-                    )
-                    .await?;
-                    tx.execute(
-                        "UPDATE semantic_duplicate_candidates
-                         SET candidate_state = {}, updated_at = {}
-                         WHERE job_id = {} AND candidate_state IN ({}, {})",
-                        &[
-                            SqlArg::Text(SemanticCandidateState::Active.as_str().to_string()),
-                            SqlArg::I64(now),
-                            SqlArg::I64(incumbent_job_id.0 as i64),
-                            SqlArg::Text(SemanticCandidateState::Parked.as_str().to_string()),
-                            SqlArg::Text(SemanticCandidateState::Suppressed.as_str().to_string()),
-                        ],
-                    )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await
-        })
-    }
-
-    pub fn release_semantic_promotion_claim(
-        &self,
-        job_id: JobId,
-        generation: i64,
-    ) -> Result<bool, StateError> {
-        let datastore = self.datastore();
-        let now = epoch_seconds();
-        let released = self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "release_semantic_promotion_claim", |tx| {
-                Box::pin(async move {
-                    let changed = tx.execute(
-                        "UPDATE semantic_duplicate_candidates
-                         SET candidate_state = {}, promotion_state = {}, promotion_claimed_at = NULL,
-                             promotion_lease_expires_at = NULL, updated_at = {}
-                         WHERE job_id = {} AND promotion_state = {} AND promotion_generation = {}",
-                        &[
-                            SqlArg::Text(SemanticCandidateState::Parked.as_str().to_string()),
-                            SqlArg::Text(SemanticPromotionState::None.as_str().to_string()),
-                            SqlArg::I64(now),
-                            SqlArg::I64(job_id.0 as i64),
-                            SqlArg::Text(SemanticPromotionState::Claimed.as_str().to_string()),
-                            SqlArg::I64(generation),
-                        ],
-                    )
-                    .await?;
-                    if changed != 1 {
-                        return Ok(false);
-                    }
-                    tx.execute(
-                        "UPDATE duplicate_job_snapshots
-                         SET lifecycle = {}, reservation_expires_at = NULL, updated_at = {}
-                         WHERE job_id = {}",
-                        &[
-                            SqlArg::Text(DuplicateJobLifecycle::Parked.as_str().to_string()),
-                            SqlArg::I64(now),
-                            SqlArg::I64(job_id.0 as i64),
-                        ],
-                    )
-                    .await?;
-                    Ok(true)
-                })
-            })
-            .await
-        });
-        if matches!(released, Ok(true)) {
-            record_semantic_duplicate_lifecycle_metric(
-                SemanticDuplicateLifecycleEvent::PromotionRetry,
-            );
-        }
-        released
-    }
-
-    pub fn duplicate_backfill_state(&self) -> Result<Option<DuplicateBackfillState>, StateError> {
-        let datastore = self.datastore();
-        self.run_sql_blocking_read(async move {
-            SqlRuntime::fetch_optional(
-                datastore.read_exec(),
-                "SELECT cursor_job_id, completed_at FROM duplicate_backfill_state WHERE backfill_key = {}",
-                &[SqlArg::Text(BACKFILL_KEY.to_string())],
-            )
-            .await?
-            .map(|row| {
-                Ok(DuplicateBackfillState {
-                    cursor_job_id: row.opt_i64("cursor_job_id")?.map(|id| JobId(id as u64)),
-                    completed_at: row.opt_i64("completed_at")?,
-                })
-            })
-            .transpose()
-        })
-    }
-
-    pub fn save_duplicate_backfill_state(
-        &self,
-        state: DuplicateBackfillState,
-    ) -> Result<(), StateError> {
-        let datastore = self.datastore();
-        self.run_sql_blocking(async move {
-            SqlRuntime::execute(
-                datastore.write_exec(),
-                "INSERT INTO duplicate_backfill_state
-                    (backfill_key, cursor_job_id, completed_at, updated_at)
-                 VALUES ({}, {}, {}, {})
-                 ON CONFLICT(backfill_key) DO UPDATE SET
-                    cursor_job_id = excluded.cursor_job_id,
-                    completed_at = excluded.completed_at,
-                    updated_at = excluded.updated_at",
-                &[
-                    SqlArg::Text(BACKFILL_KEY.to_string()),
-                    SqlArg::OptI64(state.cursor_job_id.map(|job_id| job_id.0 as i64)),
-                    SqlArg::OptI64(state.completed_at),
-                    SqlArg::I64(epoch_seconds()),
-                ],
-            )
-            .await?;
-            Ok(())
-        })
-    }
-
-    // Reads a small ordered page of persisted NZBs. Parsing is deliberately
-    // left to the async caller's blocking worker, never the scheduler or SQL
-    // runtime thread. Active rows win only while not yet archived.
-    pub fn load_duplicate_backfill_sources(
-        &self,
-        cursor_job_id: Option<JobId>,
-        limit: usize,
-    ) -> Result<Vec<DuplicateBackfillSource>, StateError> {
-        let datastore = self.datastore();
-        let after = cursor_job_id.map_or(0, |job_id| job_id.0.min(i64::MAX as u64) as i64);
-        let limit = limit.clamp(1, 256) as i64;
-        self.run_sql_blocking_read(async move {
-            let rows = SqlRuntime::fetch_all(
-                datastore.read_exec(),
-                "SELECT job_id, raw_job_hash, nzb_zstd, lifecycle, created_at, metadata FROM (
-                     SELECT a.job_id, a.nzb_hash AS raw_job_hash, n.nzb_zstd,
-                            'active' AS lifecycle, a.created_at, a.metadata
-                       FROM active_jobs AS a
-                       LEFT JOIN job_nzbs AS n ON n.job_id = a.job_id
-                      WHERE NOT EXISTS (
-                            SELECT 1 FROM job_history AS h WHERE h.job_id = a.job_id
-                        )
-                     UNION ALL
-                     SELECT h.job_id, h.job_hash AS raw_job_hash, hn.nzb_zstd,
-                            CASE
-                                WHEN h.status IN ('complete', 'succeeded') THEN 'succeeded'
-                                WHEN h.status = 'cancelled' THEN 'cancelled'
-                                ELSE 'failed'
-                            END AS lifecycle,
-                            h.created_at, h.metadata
-                       FROM job_history AS h
-                       LEFT JOIN job_nzbs AS hn ON hn.job_id = h.job_id
-                 ) AS source
-                 WHERE job_id > {}
-                   AND NOT EXISTS (
-                       SELECT 1 FROM forgotten_duplicate_identities AS forgotten
-                        WHERE forgotten.job_id = source.job_id
-                   )
-                 ORDER BY job_id ASC
-                 LIMIT {}",
-                &[SqlArg::I64(after), SqlArg::I64(limit)],
-            )
-            .await?;
-            rows.into_iter()
-                .map(|row| {
-                    let lifecycle = row
-                        .text("lifecycle")
-                        .ok()
-                        .and_then(|value| DuplicateJobLifecycle::from_persisted(&value))
-                        .ok_or_else(|| {
-                            StateError::Database("invalid duplicate backfill lifecycle".to_string())
-                        })?;
-                    let raw_job_hash = row
-                        .opt_bytes("raw_job_hash")?
-                        .and_then(|bytes| bytes.try_into().ok());
-                    Ok(DuplicateBackfillSource {
-                        job_id: JobId(row.i64("job_id")? as u64),
-                        raw_job_hash,
-                        nzb_zstd: row.opt_bytes("nzb_zstd")?,
-                        lifecycle,
-                        created_at: row.i64("created_at")?,
-                        metadata: crate::parse_history_metadata(
-                            row.opt_text("metadata")?.as_deref(),
-                        ),
-                    })
-                })
-                .collect()
-        })
-    }
-
-    // Commits all parser-validated evidence and the cursor together. A crash
-    // before commit repeats an idempotent page; a crash after commit never
-    // loses its checkpoint.
-    pub fn commit_duplicate_backfill_batch(
-        &self,
-        entries: &[DuplicateBackfillEntry],
-        cursor_job_id: Option<JobId>,
-        completed: bool,
-    ) -> Result<(), StateError> {
-        let datastore = self.datastore();
-        let entries = entries.to_vec();
-        let now = epoch_seconds();
-        self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "commit_duplicate_backfill_batch", |tx| {
-                let entries = entries.clone();
-                Box::pin(async move {
-                    for entry in &entries {
-                        backfill_duplicate_evidence_tx(tx, entry, now).await?;
-                    }
-                    save_duplicate_backfill_state_tx(
-                        tx,
-                        DuplicateBackfillState {
-                            cursor_job_id,
-                            completed_at: completed.then_some(now),
-                        },
-                        now,
-                    )
-                    .await
                 })
             })
             .await
@@ -1320,11 +1393,19 @@ async fn save_duplicate_backfill_state_tx(
     Ok(())
 }
 
-impl Database {
+pub trait JobsDuplicatePersistenceApplySemanticTerminalCauseQueries {
+    fn apply_semantic_terminal_cause(
+        &self,
+        job_id: JobId,
+        cause: SemanticTerminalCause,
+    ) -> Result<(), StateError>;
+}
+
+impl JobsDuplicatePersistenceApplySemanticTerminalCauseQueries for Database {
     // Applies terminal policy from pipeline-provided typed provenance. This is
     // queued immediately after archival, so it supersedes the legacy
     // raw-error classifier without parsing an operator-visible error string.
-    pub fn apply_semantic_terminal_cause(
+    fn apply_semantic_terminal_cause(
         &self,
         job_id: JobId,
         cause: SemanticTerminalCause,

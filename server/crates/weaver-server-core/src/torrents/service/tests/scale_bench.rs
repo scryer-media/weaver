@@ -14,6 +14,8 @@
 //   --run-ignored only --no-capture
 //   -E 'test(=torrents::service::tests::scale_bench::torrent_service_scale)'
 
+use crate::jobs::repository::JobsRepositoryQueries;
+use crate::torrents::queries::TorrentsQueries;
 use std::time::Instant;
 
 use super::*;

@@ -1305,6 +1305,7 @@ mod tests {
     mod torrents {
         use super::*;
         use crate::settings::Config;
+        use crate::torrents::queries::TorrentsQueries;
         use crate::torrents::service::{JobEnv, TorrentService, TorrentSettings};
         use crate::torrents::sessions::tests::{FakeRoutes, env};
         use crate::torrents::sessions::{Routes, Sessions};

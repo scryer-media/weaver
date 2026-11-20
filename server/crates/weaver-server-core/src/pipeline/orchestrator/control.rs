@@ -3,6 +3,8 @@
 
 use super::*;
 use crate::jobs::handle::RestoreJobRequest;
+use crate::jobs::persistence::JobsPersistenceInternalQueries;
+use crate::jobs::persistence::JobsPersistenceQueries;
 use crate::pipeline::queue::Change;
 
 // How many restores one turn installs.

@@ -2,7 +2,13 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::operations::backup::OperationsBackupQueries;
+use crate::operations::recovery::credentials::StoredCredentialQueries;
+use crate::proxies::ProxiesNetworkPersistenceQueries;
+use crate::proxies::ProxiesPersistenceQueries;
 use crate::proxies::{LegPath, RouteLeg, Rung};
+use crate::servers::persistence::ServersPersistenceQueries;
+use crate::servers::queries::ServersQueries;
 mod credentials;
 mod http3;
 mod review_regressions;

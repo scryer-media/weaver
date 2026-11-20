@@ -12,8 +12,15 @@ use crate::{Database, StateError};
 // queue and history.
 pub(crate) const VALIDATED_ARCHIVE_PASSWORD_METADATA_SQL: &str = "SELECT metadata FROM active_jobs WHERE metadata LIKE '%validated_archive_password%' UNION ALL SELECT metadata FROM job_history WHERE metadata LIKE '%validated_archive_password%'";
 
-impl Database {
-    pub(crate) fn validated_archive_password_ciphertexts(&self) -> Result<Vec<String>, StateError> {
+pub(crate) trait JobsArchivePasswordInternalQueries {
+    fn validated_archive_password_ciphertexts(&self) -> Result<Vec<String>, StateError>;
+    fn seal_validated_archive_password(&self, password: &str) -> Result<String, StateError>;
+    #[cfg(test)]
+    fn validated_archive_password(&self, job_id: u64) -> Result<Option<String>, StateError>;
+}
+
+impl JobsArchivePasswordInternalQueries for Database {
+    fn validated_archive_password_ciphertexts(&self) -> Result<Vec<String>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
@@ -37,10 +44,7 @@ impl Database {
 
     // The password an archive opened with, sealed under the database key
     // for the job's metadata.
-    pub(crate) fn seal_validated_archive_password(
-        &self,
-        password: &str,
-    ) -> Result<String, StateError> {
+    fn seal_validated_archive_password(&self, password: &str) -> Result<String, StateError> {
         let key = self
             .encryption_key()
             .ok_or_else(|| StateError::Conflict("encryption key required".into()))?;
@@ -51,10 +55,7 @@ impl Database {
     // The opened password, unsealed. Only tests read it back, to prove it
     // was sealed; no API serves a job's password.
     #[cfg(test)]
-    pub(crate) fn validated_archive_password(
-        &self,
-        job_id: u64,
-    ) -> Result<Option<String>, StateError> {
+    fn validated_archive_password(&self, job_id: u64) -> Result<Option<String>, StateError> {
         use crate::persistence::encryption::decrypt_value;
         use crate::persistence::sql_runtime::SqlArg;
         let datastore = self.datastore();

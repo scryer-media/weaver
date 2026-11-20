@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::post_processing::instances::PostProcessingInstancesQueries;
+use crate::post_processing::settings::PostProcessingSettingsInternalQueries;
+use crate::post_processing::settings::PostProcessingSettingsQueries;
 use std::fs;
 
 use super::instances::{InstanceTrigger, ScriptInstanceDraft};

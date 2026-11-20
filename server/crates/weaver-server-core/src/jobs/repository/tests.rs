@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
+use crate::history::queries::HistoryQueries;
 use crate::jobs::persistence::CompletedHashProvenance;
+use crate::jobs::persistence::JobsPersistenceInternalQueries;
+use crate::jobs::persistence::JobsPersistenceQueries;
+use crate::jobs::queries::JobsQueries;
+use crate::jobs::repository::JobsRepositoryQueries;
+use crate::post_processing::effects::PostProcessingEffectsQueries;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -1289,11 +1296,11 @@ fn credential_reads() -> [(&'static str, &'static [(&'static str, &'static str)]
             ],
         ),
         (
-            crate::persistence::connection::ACTIVE_JOB_PASSWORDS_SQL,
+            crate::operations::recovery::credentials::ACTIVE_JOB_PASSWORDS_SQL,
             &[("active_jobs", "idx_active_jobs_password")],
         ),
         (
-            crate::persistence::connection::ACTIVE_JOB_PASSWORD_CANDIDATES_SQL,
+            crate::operations::recovery::credentials::ACTIVE_JOB_PASSWORD_CANDIDATES_SQL,
             &[("active_jobs", "idx_active_jobs_password_candidates")],
         ),
     ]

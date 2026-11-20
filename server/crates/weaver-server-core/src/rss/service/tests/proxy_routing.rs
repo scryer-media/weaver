@@ -2,10 +2,13 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::proxies::ProxiesDnsPersistenceQueries;
+use crate::proxies::ProxiesPersistenceQueries;
 use crate::proxies::{
     Consumer, DnsProfile, DnsServerList, DnsTransit, DnsTrust, DnsWho, ListedServer, ListedWire,
     ProxyKind, ProxyProfile, ProxyRuntime, ProxySecrets, RouteState, RoutingPolicy,
 };
+use crate::rss::RssPersistenceQueries;
 use std::{
     collections::HashMap,
     net::{Ipv4Addr, SocketAddr},

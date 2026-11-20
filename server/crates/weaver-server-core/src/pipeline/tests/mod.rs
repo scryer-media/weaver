@@ -3,6 +3,10 @@
 
 use super::*;
 use crate::SchedulerError;
+use crate::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
+use crate::jobs::persistence::JobsPersistenceInternalQueries;
+use crate::jobs::persistence::JobsPersistenceQueries;
+use crate::jobs::queries::JobsQueries;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;

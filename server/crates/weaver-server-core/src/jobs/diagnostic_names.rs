@@ -13,6 +13,7 @@
 // finished jobs by their ids; stored NZBs are sized first and then read in
 // small batches, so a caller can keep the bytes it holds under a budget.
 
+use crate::settings::queries::SettingsQueries;
 use std::collections::BTreeMap;
 
 use crate::StateError;
@@ -206,11 +207,23 @@ fn file_statements(
         .collect()
 }
 
-impl Database {
+pub trait JobsDiagnosticNamesDiagnosticRecentHistoryIdsQueries {
+    fn diagnostic_recent_history_ids(&self) -> Result<Vec<u64>, StateError>;
+    fn diagnostic_job_names_page(
+        &self,
+        jobs: DiagnosticJobs<'_>,
+    ) -> Result<DiagnosticNamePage, StateError>;
+    fn diagnostic_nzb_sizes(&self, ids: &[u64]) -> Result<Vec<DiagnosticNzbSize>, StateError>;
+    fn diagnostic_nzbs(&self, ids: &[u64]) -> Result<Vec<(u64, Vec<u8>)>, StateError>;
+    fn diagnostic_history_total(&self) -> Result<u64, StateError>;
+    fn diagnostic_script_directory(&self) -> Result<Option<String>, StateError>;
+}
+
+impl JobsDiagnosticNamesDiagnosticRecentHistoryIdsQueries for Database {
     // The ids of the [`DIAGNOSTIC_RECENT_HISTORY`] most recently finished
     // jobs, by completion, newest first. Served by the history's completion
     // index.
-    pub fn diagnostic_recent_history_ids(&self) -> Result<Vec<u64>, StateError> {
+    fn diagnostic_recent_history_ids(&self) -> Result<Vec<u64>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_all(
@@ -232,7 +245,7 @@ impl Database {
     // read with one statement over the page's ids, by primary key. Each
     // statement is its own snapshot; a job archived between two pages can be
     // read in both, and the table built from them gives it one stand-in.
-    pub fn diagnostic_job_names_page(
+    fn diagnostic_job_names_page(
         &self,
         jobs: DiagnosticJobs<'_>,
     ) -> Result<DiagnosticNamePage, StateError> {
@@ -374,7 +387,7 @@ impl Database {
 
     // The stored size of each listed job's NZB, by primary key, without
     // reading the NZB. A job with no stored NZB is not listed.
-    pub fn diagnostic_nzb_sizes(&self, ids: &[u64]) -> Result<Vec<DiagnosticNzbSize>, StateError> {
+    fn diagnostic_nzb_sizes(&self, ids: &[u64]) -> Result<Vec<DiagnosticNzbSize>, StateError> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -399,7 +412,7 @@ impl Database {
     }
 
     // The stored NZB of each listed job, by primary key, in job id order.
-    pub fn diagnostic_nzbs(&self, ids: &[u64]) -> Result<Vec<(u64, Vec<u8>)>, StateError> {
+    fn diagnostic_nzbs(&self, ids: &[u64]) -> Result<Vec<(u64, Vec<u8>)>, StateError> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -419,7 +432,7 @@ impl Database {
     }
 
     // How many finished jobs the history holds, read or not.
-    pub fn diagnostic_history_total(&self) -> Result<u64, StateError> {
+    fn diagnostic_history_total(&self) -> Result<u64, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let row = SqlRuntime::fetch_optional(
@@ -433,7 +446,7 @@ impl Database {
     }
 
     // The post-processing scripts directory, or `None` when none was set.
-    pub fn diagnostic_script_directory(&self) -> Result<Option<String>, StateError> {
+    fn diagnostic_script_directory(&self) -> Result<Option<String>, StateError> {
         self.get_setting(crate::post_processing::settings::SCRIPT_DIRECTORY_KEY)
     }
 }
@@ -523,14 +536,28 @@ pub mod reference {
         )
     }
 
-    impl Database {
+    pub trait JobsDiagnosticNamesDiagnosticJobNamesWholeQueries {
+        fn diagnostic_job_names_whole(&self) -> Result<BTreeMap<u64, JobNameRecord>, StateError>;
+        fn diagnostic_persisted_nzbs(
+            &self,
+            source: DiagnosticNzbSource,
+            after_job_id: u64,
+        ) -> Result<Vec<DiagnosticPersistedNzb>, StateError>;
+        fn diagnostic_seed_sql(&self, sql: String) -> Result<(), StateError>;
+        fn diagnostic_seed_nzbs(&self, rows: Vec<(u64, Vec<u8>)>) -> Result<(), StateError>;
+        fn diagnostic_query_plan(
+            &self,
+            sql: &str,
+            args: Vec<i64>,
+        ) -> Result<Vec<String>, StateError>;
+    }
+
+    impl JobsDiagnosticNamesDiagnosticJobNamesWholeQueries for Database {
         #[expect(
             clippy::disallowed_methods,
             reason = "writer gate: a read-only snapshot transaction on the read lane, it writes nothing; Postgres has no writer gate"
         )]
-        pub fn diagnostic_job_names_whole(
-            &self,
-        ) -> Result<BTreeMap<u64, JobNameRecord>, StateError> {
+        fn diagnostic_job_names_whole(&self) -> Result<BTreeMap<u64, JobNameRecord>, StateError> {
             let datastore = self.datastore();
             let recent = recent_history();
             self.run_sql_blocking_read(async move {
@@ -677,7 +704,7 @@ pub mod reference {
             })
         }
 
-        pub fn diagnostic_persisted_nzbs(
+        fn diagnostic_persisted_nzbs(
             &self,
             source: DiagnosticNzbSource,
             after_job_id: u64,
@@ -713,7 +740,7 @@ pub mod reference {
         }
 
         // Runs a seeding script for a test, in one transaction.
-        pub fn diagnostic_seed_sql(&self, sql: String) -> Result<(), StateError> {
+        fn diagnostic_seed_sql(&self, sql: String) -> Result<(), StateError> {
             let datastore = self.datastore();
             self.run_sql_blocking(async move {
                 SqlRuntime::run_in_transaction(&datastore, "diagnostic_seed_sql", |tx| {
@@ -728,7 +755,7 @@ pub mod reference {
         }
 
         // Stores NZBs for a test, in one transaction.
-        pub fn diagnostic_seed_nzbs(&self, rows: Vec<(u64, Vec<u8>)>) -> Result<(), StateError> {
+        fn diagnostic_seed_nzbs(&self, rows: Vec<(u64, Vec<u8>)>) -> Result<(), StateError> {
             let datastore = self.datastore();
             let rows = std::sync::Arc::new(rows);
             self.run_sql_blocking(async move {
@@ -751,7 +778,7 @@ pub mod reference {
         }
 
         // The query plan SQLite gives a statement, one line per step.
-        pub fn diagnostic_query_plan(
+        fn diagnostic_query_plan(
             &self,
             sql: &str,
             args: Vec<i64>,
@@ -772,6 +799,8 @@ pub mod reference {
 
 #[cfg(test)]
 mod tests {
+    use crate::jobs::persistence::JobsPersistenceQueries;
+    use crate::jobs::repository::JobsRepositoryQueries;
     use std::path::PathBuf;
 
     use super::reference::*;

@@ -6,6 +6,7 @@
 //! one that is empty or holds a comma is left out (qBittorrent's rules).
 
 use std::sync::Arc;
+use weaver_server_core::tags::TagsQueries;
 
 use async_graphql::{Context, Object, Result, SimpleObject};
 use weaver_server_core::Database;

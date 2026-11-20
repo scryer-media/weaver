@@ -18,14 +18,23 @@ use crate::jobs::JobId;
 use crate::persistence::Database;
 use crate::pipeline::claim_complete_destination_path;
 use crate::post_processing::model::QueueEvent;
+use crate::post_processing::settings::PostProcessingSettingsQueries;
 use crate::proxies::TorrentScope;
 use crate::settings::model::{TrackerRule, tracker_rule_for};
+use crate::settings::persistence::SettingsPersistenceQueries;
 use crate::settings::{Client, SeedingPolicy, TorrentConfig};
+use crate::tags::TagsQueries;
 use crate::torrents::admission::{Manifest, Refusal};
 use crate::torrents::identity::ClientIdentity;
 use crate::torrents::layout::{PieceLayout, layout_of};
 use crate::torrents::metrics::{FetchOutcome, TorrentEvent};
 use crate::torrents::model::Adopted;
+use crate::torrents::persistence::TorrentsPersistenceInsertPlacedTorrentInternalQueries;
+use crate::torrents::persistence::TorrentsPersistenceInsertTorrentQueries;
+use crate::torrents::persistence::TorrentsPersistenceMarkTorrentRetiringInternalQueries;
+use crate::torrents::persistence::TorrentsPersistenceTorrentHistoryListsInternalQueries;
+use crate::torrents::queries::TorrentsInternalQueries;
+use crate::torrents::queries::TorrentsQueries;
 use crate::torrents::sessions::{RoutePlan, SessionError};
 use crate::torrents::{
     ContentLayout, Infohash, KeptIntent, TorrentCounters, TorrentInsert, TorrentIntent,

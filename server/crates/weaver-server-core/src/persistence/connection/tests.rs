@@ -2,6 +2,35 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::auth::api_keys::AuthApiKeysQueries;
+use crate::auth::repository::AuthRepositoryQueries;
+use crate::bandwidth::persistence::BandwidthPersistenceQueries;
+use crate::bandwidth::queries::BandwidthQueries;
+use crate::categories::queries::CategoriesQueries;
+use crate::history::cache::HistoryCacheQueries;
+use crate::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
+use crate::history::queries::HistoryQueries;
+use crate::history::timeline::HistoryTimelineQueries;
+use crate::jobs::persistence::JobsPersistenceInternalQueries;
+use crate::jobs::persistence::JobsPersistenceQueries;
+use crate::jobs::queries::JobsQueries;
+use crate::jobs::repository::JobsRepositoryQueries;
+use crate::operations::async_ops::OperationsAsyncOpsQueries;
+use crate::operations::backup::OperationsBackupQueries;
+use crate::operations::recovery::credentials::StoredCredentialQueries;
+use crate::post_processing::instances::PostProcessingInstancesInternalQueries;
+use crate::post_processing::instances::PostProcessingInstancesQueries;
+use crate::post_processing::secrets::PostProcessingSecretsQueries;
+use crate::post_processing::settings::PostProcessingSettingsQueries;
+use crate::rss::RssPersistenceQueries;
+use crate::rss::RssQueries;
+use crate::servers::persistence::ServersPersistenceQueries;
+use crate::servers::queries::ServersQueries;
+use crate::servers::repository::ServersRepositoryQueries;
+use crate::servers::tls_diagnostics::ServersTlsDiagnosticsQueries;
+use crate::settings::persistence::SettingsPersistenceQueries;
+use crate::settings::queries::SettingsQueries;
+use crate::settings::service::SettingsServiceQueries;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;

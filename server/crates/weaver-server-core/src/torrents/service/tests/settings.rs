@@ -2,6 +2,10 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::settings::persistence::SettingsPersistenceQueries;
+use crate::settings::queries::SettingsQueries;
+use crate::settings::repository::SettingsRepositoryQueries;
+use crate::torrents::queries::TorrentsQueries;
 
 // Turning torrents off closes their sessions and stops each torrent, and
 // refuses new ones; turning them on starts the tick, which takes them up.

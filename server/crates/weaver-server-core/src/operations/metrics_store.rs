@@ -312,12 +312,39 @@ impl RawMetricsHistoryPoint {
     }
 }
 
-impl Database {
+pub trait OperationsMetricsStoreQueries {
+    fn record_metrics_history_sample(
+        &self,
+        recorded_at_epoch_sec: i64,
+        snapshot: &MetricsSnapshot,
+        jobs: &[JobInfo],
+    ) -> Result<(), StateError>;
+    fn record_metrics_history_point(
+        &self,
+        recorded_at_epoch_sec: i64,
+        snapshot: &MetricsSnapshot,
+        jobs: &JobStatusCounts,
+        plan: MetricsHistoryWritePlan,
+    ) -> Result<(), StateError>;
+    fn read_metrics_history(
+        &self,
+        tier: MetricsHistoryTier,
+        since_epoch_sec: i64,
+        until_epoch_sec: i64,
+    ) -> Result<MetricsHistoryQueryResult, StateError>;
+    fn list_metrics_history_chunks(
+        &self,
+        tier: MetricsHistoryTier,
+    ) -> Result<Vec<MetricsHistoryChunkRow>, StateError>;
+    fn delete_all_metrics_history(&self) -> Result<(), StateError>;
+}
+
+impl OperationsMetricsStoreQueries for Database {
     // Write one sample and bring every rollup and retention window up to
     // date with it. The periodic sampler uses
     // [`Database::record_metrics_history_point`] instead, which writes only
     // what its cadence says is due.
-    pub fn record_metrics_history_sample(
+    fn record_metrics_history_sample(
         &self,
         recorded_at_epoch_sec: i64,
         snapshot: &MetricsSnapshot,
@@ -332,7 +359,7 @@ impl Database {
     }
 
     // Write one raw sample plus whatever `plan` names.
-    pub fn record_metrics_history_point(
+    fn record_metrics_history_point(
         &self,
         recorded_at_epoch_sec: i64,
         snapshot: &MetricsSnapshot,
@@ -371,7 +398,7 @@ impl Database {
         })
     }
 
-    pub fn read_metrics_history(
+    fn read_metrics_history(
         &self,
         tier: MetricsHistoryTier,
         since_epoch_sec: i64,
@@ -406,7 +433,7 @@ impl Database {
         }
     }
 
-    pub fn list_metrics_history_chunks(
+    fn list_metrics_history_chunks(
         &self,
         tier: MetricsHistoryTier,
     ) -> Result<Vec<MetricsHistoryChunkRow>, StateError> {
@@ -425,7 +452,7 @@ impl Database {
         })
     }
 
-    pub fn delete_all_metrics_history(&self) -> Result<(), StateError> {
+    fn delete_all_metrics_history(&self) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::execute(

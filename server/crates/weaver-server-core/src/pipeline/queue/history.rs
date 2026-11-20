@@ -2,6 +2,13 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::{Change, Queue};
+use crate::history::nzbget_state::HistoryNzbgetStateQueries;
+use crate::history::persistence::HistoryPersistenceRecordArchivedHistoryFilesInternalQueries;
+use crate::history::queries::HistoryInternalQueries;
+use crate::history::queries::HistoryQueries;
+use crate::operations::async_ops::OperationsAsyncOpsQueries;
+use crate::post_processing::events::PostProcessingEventsInvalidateQueueScriptAdmissionInternalQueries;
+use crate::post_processing::events::PostProcessingEventsScriptStartsInternalQueries;
 use crate::{HistoryDeleteBatchOutcome, JobId, SchedulerError};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;

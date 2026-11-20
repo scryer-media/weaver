@@ -2,8 +2,12 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::history::queries::HistoryQueries;
 use crate::jobs::feed_verdict::FeedVerdict;
+use crate::jobs::graph_checkpoint::JobsGraphCheckpointInternalQueries;
 use crate::jobs::graph_checkpoint::{Delta, NodeRow};
+use crate::jobs::persistence::JobsPersistenceQueries;
+use crate::jobs::queries::JobsQueries;
 use crate::persistence::checkpoint_write::{CheckpointControl, CheckpointWrite};
 use weaver_server_base::jobs::ids::JobId;
 

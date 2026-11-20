@@ -5,6 +5,8 @@ use super::{
     ActionError, TorrentService, in_table_order, state_error, tidy_trackers, tracker_tiers,
 };
 use crate::jobs::JobId;
+use crate::torrents::persistence::TorrentsPersistenceInsertPlacedTorrentInternalQueries;
+use crate::torrents::persistence::TorrentsPersistenceInsertTorrentQueries;
 use crate::torrents::{NamedBy, PeerInfo, TorrentTracker, TrackerEntry};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;

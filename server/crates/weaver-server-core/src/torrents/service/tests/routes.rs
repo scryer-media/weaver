@@ -2,6 +2,11 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::categories::persistence::CategoriesPersistenceQueries;
+use crate::proxies::ProxiesNetworkPersistenceQueries;
+use crate::proxies::ProxiesPersistenceQueries;
+use crate::settings::repository::SettingsRepositoryQueries;
+use crate::torrents::queries::TorrentsQueries;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_route_that_goes_down_holds_its_torrents_and_a_category_move_changes_session() {

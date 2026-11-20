@@ -11,6 +11,8 @@ use std::collections::BTreeSet;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::{Error as SocketError, Message};
+use weaver_server_core::auth::api_keys::AuthApiKeysQueries;
+use weaver_server_core::auth::repository::AuthRepositoryQueries;
 use weaver_server_core::security::RuntimeSecurityConfig;
 
 struct Query;

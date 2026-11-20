@@ -14,6 +14,13 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use weaver_server_core::jobs::persistence::JobsPersistenceQueries;
+use weaver_server_core::post_processing::callbacks::PostProcessingCallbacksQueries;
+use weaver_server_core::post_processing::effects::PostProcessingEffectsQueries;
+use weaver_server_core::post_processing::instances::PostProcessingInstancesQueries;
+use weaver_server_core::post_processing::secrets::PostProcessingSecretsQueries;
+use weaver_server_core::post_processing::settings::PostProcessingSettingsQueries;
+use weaver_server_core::post_processing::test_run::PostProcessingTestRunQueries;
 
 use tokio::sync::RwLock;
 use weaver_server_core::jobs::record::ActiveJob;

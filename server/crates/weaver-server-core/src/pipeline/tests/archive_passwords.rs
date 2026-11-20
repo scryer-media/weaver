@@ -5,6 +5,7 @@
 // admission keeps, what the first harvest reads from the row and remembers,
 // and what a reprocess or a redownload rebuilds from the row.
 
+use crate::jobs::queries::JobsQueries;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
 use super::*;

@@ -2,6 +2,8 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use crate::Database;
+use crate::auth::api_keys::AuthApiKeysQueries;
+use crate::jobs::queries::JobsQueries;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, StoreDatastore, sql_writes};
 use weaver_server_base::jobs::ids::JobId;
 

@@ -15,6 +15,9 @@
 // on a track does not undo its last applied state, except one egress's quota
 // metering, which goes back to the setting for every egress.
 
+use crate::history::delete_queue::HistoryDeleteQueueQueries;
+use crate::settings::persistence::SettingsPersistenceQueries;
+use crate::settings::queries::SettingsQueries;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 

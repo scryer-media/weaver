@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::history::cache::HistoryCacheQueries;
 // History state that only the NZBGet-compatible API reads or writes. It lives
 // on the history row, so erasing the row erases it too, and the web UI never
 // sees it.
 
+use crate::operations::async_ops::OperationsAsyncOpsQueries;
 use std::collections::HashMap;
 
 use crate::StateError;
@@ -49,10 +51,39 @@ impl NzbgetMarkStatus {
     }
 }
 
-impl Database {
+pub trait HistoryNzbgetStateQueries {
+    fn set_nzbget_history_hidden(&self, job_id: u64, hidden: bool) -> Result<bool, StateError>;
+    fn archive_nzbget_history(&self, job_ids: &[u64]) -> Result<u64, StateError>;
+    fn set_nzbget_history_rows_hidden(
+        &self,
+        job_ids: &[u64],
+        hidden: bool,
+    ) -> Result<u64, StateError>;
+    fn update_job_history_fields(
+        &self,
+        job_id: u64,
+        update: &JobUpdate,
+    ) -> Result<bool, StateError>;
+    fn set_nzbget_history_mark(
+        &self,
+        job_id: u64,
+        mark: NzbgetMarkStatus,
+    ) -> Result<bool, StateError>;
+    fn set_history_failure_kind(
+        &self,
+        job_id: u64,
+        kind: Option<HistoryFailureKind>,
+    ) -> Result<bool, StateError>;
+    fn nzbget_history_states(
+        &self,
+        job_ids: &[u64],
+    ) -> Result<HashMap<u64, NzbgetHistoryState>, StateError>;
+}
+
+impl HistoryNzbgetStateQueries for Database {
     // Hide or unhide a history row from the NZBGet-compatible API. Returns
     // false when no history row exists for the job.
-    pub fn set_nzbget_history_hidden(&self, job_id: u64, hidden: bool) -> Result<bool, StateError> {
+    fn set_nzbget_history_hidden(&self, job_id: u64, hidden: bool) -> Result<bool, StateError> {
         Ok(self.set_nzbget_history_rows_hidden(&[job_id], hidden)? > 0)
     }
 
@@ -65,7 +96,7 @@ impl Database {
     // job back in the queue, stays listed, and the client's next remove tries
     // again. A hide that fails after the accept leaves the entry listed; the
     // next remove finds it archived and hides it.
-    pub fn archive_nzbget_history(&self, job_ids: &[u64]) -> Result<u64, StateError> {
+    fn archive_nzbget_history(&self, job_ids: &[u64]) -> Result<u64, StateError> {
         use crate::operations::ArchiveHistoryAcceptOutcome as Outcome;
         let acceptance = self.accept_archive_history(job_ids)?;
         let taken = acceptance
@@ -83,7 +114,7 @@ impl Database {
     // Hide or unhide the history rows of `job_ids` in one transaction, in
     // statements of as many ids as the engine binds. Returns how many rows
     // exist for the ids; an id with no row changes nothing.
-    pub fn set_nzbget_history_rows_hidden(
+    fn set_nzbget_history_rows_hidden(
         &self,
         job_ids: &[u64],
         hidden: bool,
@@ -129,7 +160,7 @@ impl Database {
     // Rename, recategorise or re-parameterise a history row. A rename is kept
     // in the metadata too, so a later redownload or reprocess keeps it.
     // Returns false when no history row exists for the job.
-    pub fn update_job_history_fields(
+    fn update_job_history_fields(
         &self,
         job_id: u64,
         update: &JobUpdate,
@@ -222,7 +253,7 @@ impl Database {
 
     // Record how the client marked a history row. Returns false when no
     // history row exists for the job.
-    pub fn set_nzbget_history_mark(
+    fn set_nzbget_history_mark(
         &self,
         job_id: u64,
         mark: NzbgetMarkStatus,
@@ -248,7 +279,7 @@ impl Database {
 
     // Record why a history row's job failed, or clear it. Returns false when
     // no history row exists for the job.
-    pub fn set_history_failure_kind(
+    fn set_history_failure_kind(
         &self,
         job_id: u64,
         kind: Option<HistoryFailureKind>,
@@ -277,7 +308,7 @@ impl Database {
 
     // The facade-only state for each listed history row. Rows absent from the
     // map have no history row.
-    pub fn nzbget_history_states(
+    fn nzbget_history_states(
         &self,
         job_ids: &[u64],
     ) -> Result<HashMap<u64, NzbgetHistoryState>, StateError> {
@@ -321,6 +352,9 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
+    use crate::history::queries::HistoryQueries;
+    use crate::operations::async_ops::OperationsAsyncOpsQueries;
 
     fn database_with_history() -> Database {
         let db = Database::open_in_memory().unwrap();

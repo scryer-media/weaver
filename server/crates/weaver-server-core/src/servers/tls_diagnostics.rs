@@ -23,8 +23,21 @@ pub struct ServerTlsDiagnostics {
     pub probed_at: DateTime<Utc>,
 }
 
-impl Database {
-    pub fn server_tls_diagnostics(
+pub trait ServersTlsDiagnosticsQueries {
+    fn server_tls_diagnostics(
+        &self,
+        server_id: u32,
+    ) -> Result<Option<ServerTlsDiagnostics>, StateError>;
+    fn list_server_tls_diagnostics(&self) -> Result<Vec<ServerTlsDiagnostics>, StateError>;
+    fn upsert_server_tls_diagnostics(
+        &self,
+        diagnostics: &ServerTlsDiagnostics,
+    ) -> Result<(), StateError>;
+    fn delete_server_tls_diagnostics(&self, server_id: u32) -> Result<bool, StateError>;
+}
+
+impl ServersTlsDiagnosticsQueries for Database {
+    fn server_tls_diagnostics(
         &self,
         server_id: u32,
     ) -> Result<Option<ServerTlsDiagnostics>, StateError> {
@@ -44,7 +57,7 @@ impl Database {
         })
     }
 
-    pub fn list_server_tls_diagnostics(&self) -> Result<Vec<ServerTlsDiagnostics>, StateError> {
+    fn list_server_tls_diagnostics(&self) -> Result<Vec<ServerTlsDiagnostics>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_all(
@@ -62,7 +75,7 @@ impl Database {
         })
     }
 
-    pub fn upsert_server_tls_diagnostics(
+    fn upsert_server_tls_diagnostics(
         &self,
         diagnostics: &ServerTlsDiagnostics,
     ) -> Result<(), StateError> {
@@ -91,7 +104,7 @@ impl Database {
         })
     }
 
-    pub fn delete_server_tls_diagnostics(&self, server_id: u32) -> Result<bool, StateError> {
+    fn delete_server_tls_diagnostics(&self, server_id: u32) -> Result<bool, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             let changed = SqlRuntime::execute(

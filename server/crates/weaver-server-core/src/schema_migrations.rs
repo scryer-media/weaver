@@ -1147,6 +1147,10 @@ mod tests {
         ChecksumAlgorithm, CompiledMigration, CompiledMigrationStep, EngineScope, PayloadSlice,
         StepScope,
     };
+    use crate::operations::backup::OperationsBackupLogicalInternalQueries;
+    use crate::proxies::ProxiesNetworkPersistenceQueries;
+    use crate::servers::queries::ServersQueries;
+    use crate::torrents::persistence::TorrentsPersistenceJobHistoryFilesInternalQueries;
     use sqlx::sqlite::SqlitePoolOptions;
     use std::time::{SystemTime, UNIX_EPOCH};
 

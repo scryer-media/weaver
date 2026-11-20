@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use crate::StateError;
+use crate::history::cache::HistoryCacheQueries;
 use crate::jobs::model::{FieldUpdate, JobUpdate};
 use crate::jobs::record::{ActiveFileIdentity, ActiveJob};
 use crate::persistence::Database;
@@ -9,6 +10,9 @@ use crate::persistence::sql_runtime::{
     POSTGRES_BATCH_BIND_LIMIT, SQLITE_BATCH_BIND_LIMIT, SqlArg, SqlEngine, SqlRuntime, SqlTx,
     max_rows_for_tx,
 };
+use crate::post_processing::effects::PostProcessingEffectsInternalQueries;
+use crate::post_processing::events::PostProcessingEventsInvalidateQueueScriptAdmissionInternalQueries;
+use crate::tags::TagsQueries;
 use sqlx::{Postgres, QueryBuilder, Sqlite};
 use weaver_server_base::jobs::ids::JobId;
 
@@ -366,8 +370,113 @@ fn build_complete_files_pg_sql(row_count: usize) -> String {
     )
 }
 
-impl Database {
-    pub fn create_active_job(&self, job: &ActiveJob) -> Result<(), StateError> {
+pub trait JobsPersistenceQueries {
+    fn create_active_job(&self, job: &ActiveJob) -> Result<(), StateError>;
+    fn update_active_job(&self, job_id: JobId, update: &JobUpdate) -> Result<(), StateError>;
+    fn update_active_job_output_dir(
+        &self,
+        job_id: JobId,
+        output_dir: &std::path::Path,
+    ) -> Result<(), StateError>;
+    fn move_active_job_output_dir(
+        &self,
+        job_id: JobId,
+        from: &std::path::Path,
+        to: &std::path::Path,
+    ) -> Result<bool, StateError>;
+    fn update_active_job_queue_positions(
+        &self,
+        positions: &[(JobId, i64)],
+    ) -> Result<(), StateError>;
+    fn load_active_job_queue_positions(
+        &self,
+    ) -> Result<std::collections::HashMap<JobId, i64>, StateError>;
+    fn set_active_job_status(
+        &self,
+        job_id: JobId,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<(), StateError>;
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "active job runtime is persisted as one atomic SQL update"
+    )]
+    fn set_active_job_runtime(
+        &self,
+        job_id: JobId,
+        status: &str,
+        download_state: Option<&str>,
+        post_state: Option<&str>,
+        run_state: Option<&str>,
+        error: Option<&str>,
+        queued_repair_at_epoch_ms: Option<f64>,
+        queued_extract_at_epoch_ms: Option<f64>,
+        paused_resume_status: Option<&str>,
+        paused_resume_download_state: Option<&str>,
+        paused_resume_post_state: Option<&str>,
+    ) -> Result<(), StateError>;
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "active job runtime is persisted as one atomic SQL update"
+    )]
+    fn set_active_job_runtime_at(
+        &self,
+        job_id: JobId,
+        output_dir: Option<&str>,
+        post_processing_outcome: Option<&str>,
+        status: &str,
+        download_state: Option<&str>,
+        post_state: Option<&str>,
+        run_state: Option<&str>,
+        error: Option<&str>,
+        queued_repair_at_epoch_ms: Option<f64>,
+        queued_extract_at_epoch_ms: Option<f64>,
+        paused_resume_status: Option<&str>,
+        paused_resume_download_state: Option<&str>,
+        paused_resume_post_state: Option<&str>,
+    ) -> Result<(), StateError>;
+    fn complete_file(
+        &self,
+        job_id: JobId,
+        file_index: u32,
+        filename: &str,
+        md5: &[u8; 16],
+    ) -> Result<(), StateError>;
+    fn complete_file_with_optional_hash(
+        &self,
+        job_id: JobId,
+        file_index: u32,
+        filename: &str,
+        md5: Option<&[u8; 16]>,
+    ) -> Result<(), StateError>;
+    fn complete_file_with_provenance(
+        &self,
+        job_id: JobId,
+        file_index: u32,
+        filename: &str,
+        md5: Option<&[u8; 16]>,
+        provenance: CompletedHashProvenance,
+    ) -> Result<(), StateError>;
+    fn complete_files(
+        &self,
+        job_id: JobId,
+        entries: &[(u32, String, Option<[u8; 16]>)],
+        provenance: CompletedHashProvenance,
+    ) -> Result<(), StateError>;
+    fn save_file_identity(
+        &self,
+        job_id: JobId,
+        identity: &ActiveFileIdentity,
+    ) -> Result<(), StateError>;
+    fn save_file_identities(
+        &self,
+        job_id: JobId,
+        identities: &[ActiveFileIdentity],
+    ) -> Result<(), StateError>;
+}
+
+impl JobsPersistenceQueries for Database {
+    fn create_active_job(&self, job: &ActiveJob) -> Result<(), StateError> {
         let datastore = self.datastore();
         let job_id = job.job_id;
         let nzb_zstd: std::sync::Arc<[u8]> = job.nzb_zstd.as_slice().into();
@@ -415,8 +524,835 @@ impl Database {
         })
     }
 
+    fn update_active_job(&self, job_id: JobId, update: &JobUpdate) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        let mut update = update.clone();
+        if let FieldUpdate::Set(password) = &mut update.password {
+            *password = encrypt_archive_password(self.encryption_key(), Some(password))?
+                .expect("supplied password");
+        }
+        let _effects_writer = self.lock_script_effects_writer();
+        let rewritten_effects = self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "update_active_job", |tx| {
+                let update = update.clone();
+                Box::pin(async move {
+                    tx.execute(
+                        "UPDATE script_output_state SET next_seq = next_seq WHERE singleton = 1",
+                        &[],
+                    )
+                    .await?;
+                    let mut rewritten_effects = None;
+                    match &update.category {
+                        FieldUpdate::Unchanged => {}
+                        FieldUpdate::Clear => {
+                            tx.execute(
+                                "UPDATE active_jobs SET category = NULL WHERE job_id = {}",
+                                &[SqlArg::I64(job_id.0 as i64)],
+                            )
+                            .await?;
+                        }
+                        FieldUpdate::Set(category) => {
+                            tx.execute(
+                                "UPDATE active_jobs SET category = {} WHERE job_id = {}",
+                                &[SqlArg::Text(category.clone()), SqlArg::I64(job_id.0 as i64)],
+                            )
+                            .await?;
+                        }
+                    }
+
+                    if (!matches!(update.metadata, FieldUpdate::Unchanged)
+                        || !update.metadata_edits.is_empty()
+                        || update.name.is_some())
+                        && let Some(active) = tx
+                            .fetch_optional(
+                                "SELECT metadata FROM active_jobs WHERE job_id = {}",
+                                &[SqlArg::I64(job_id.0 as i64)],
+                            )
+                            .await?
+                    {
+                        let mut metadata: Vec<(String, String)> = active
+                            .opt_text("metadata")?
+                            .map(|text| serde_json::from_str(&text).map_err(db_err))
+                            .transpose()?
+                            .unwrap_or_default();
+                        update.apply_to_metadata(&mut metadata);
+                        if let Some(name) = &update.name {
+                            crate::ingest::set_renamed_title(&mut metadata, name);
+                        }
+                        if let Some(row) = tx
+                            .fetch_optional(
+                                "SELECT state FROM script_job_state WHERE job_id = {}",
+                                &[SqlArg::I64(job_id.0 as i64)],
+                            )
+                            .await?
+                        {
+                            let mut effects: crate::post_processing::effects::JobScriptEffects =
+                                serde_json::from_str(&row.text("state")?)
+                                    .map_err(|error| StateError::Database(error.to_string()))?;
+                            if !matches!(update.metadata, FieldUpdate::Unchanged) {
+                                for value in effects.parameters.values_mut() {
+                                    value.clear();
+                                }
+                                effects.parameters.extend(metadata.clone());
+                            } else {
+                                let renamed = update.name.as_ref().map(|name| {
+                                    (
+                                        crate::ingest::RENAMED_TITLE_METADATA_KEY.to_string(),
+                                        Some(name.clone()),
+                                    )
+                                });
+                                for (key, value) in
+                                    update.metadata_edits.iter().chain(renamed.iter())
+                                {
+                                    for (existing, previous) in &mut effects.parameters {
+                                        if existing.eq_ignore_ascii_case(key) {
+                                            previous.clear();
+                                        }
+                                    }
+                                    effects
+                                        .parameters
+                                        .insert(key.clone(), value.clone().unwrap_or_default());
+                                }
+                            }
+                            tx.execute(
+                                "UPDATE script_job_state SET state = {} WHERE job_id = {}",
+                                &[
+                                    SqlArg::Text(serde_json::to_string(&effects).map_err(
+                                        |error| StateError::Database(error.to_string()),
+                                    )?),
+                                    SqlArg::I64(job_id.0 as i64),
+                                ],
+                            )
+                            .await?;
+                            rewritten_effects = Some(effects);
+                        }
+                        tx.execute(
+                            "UPDATE active_jobs SET metadata = {} WHERE job_id = {}",
+                            &[
+                                SqlArg::OptText(metadata_json(&metadata)?),
+                                SqlArg::I64(job_id.0 as i64),
+                            ],
+                        )
+                        .await?;
+                    }
+
+                    // Password override column: NULL = no override (restore
+                    // keeps the NZB-derived password), '' = explicitly no
+                    // password, anything else = the encrypted override.
+                    match update.password {
+                        FieldUpdate::Unchanged => {}
+                        FieldUpdate::Clear => {
+                            tx.execute(
+                                "UPDATE active_jobs SET password = {} WHERE job_id = {}",
+                                &[SqlArg::Text(String::new()), SqlArg::I64(job_id.0 as i64)],
+                            )
+                            .await?;
+                        }
+                        FieldUpdate::Set(password) => {
+                            tx.execute(
+                                "UPDATE active_jobs SET password = {} WHERE job_id = {}",
+                                &[SqlArg::Text(password), SqlArg::I64(job_id.0 as i64)],
+                            )
+                            .await?;
+                        }
+                    }
+                    Ok(rewritten_effects)
+                })
+            })
+            .await
+        })?;
+        if let Some(effects) = rewritten_effects {
+            self.cache_script_effects(job_id.0, effects);
+        }
+        Ok(())
+    }
+
+    fn update_active_job_output_dir(
+        &self,
+        job_id: JobId,
+        output_dir: &std::path::Path,
+    ) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        let output_dir = output_dir.to_string_lossy().into_owned();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "update_active_job_output_dir", |tx| {
+                let output_dir = output_dir.clone();
+                Box::pin(async move {
+                    tx.execute(
+                        "UPDATE active_jobs SET output_dir = {} WHERE job_id = {}",
+                        &[SqlArg::Text(output_dir), SqlArg::I64(job_id.0 as i64)],
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+        })
+    }
+
+    // The job's row names `to` if it still names `from`: whether it did. A
+    // row that has gone, or names another directory, is left as it is.
+    fn move_active_job_output_dir(
+        &self,
+        job_id: JobId,
+        from: &std::path::Path,
+        to: &std::path::Path,
+    ) -> Result<bool, StateError> {
+        let datastore = self.datastore();
+        let from = from.to_string_lossy().into_owned();
+        let to = to.to_string_lossy().into_owned();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "move_active_job_output_dir", |tx| {
+                let (from, to) = (from.clone(), to.clone());
+                Box::pin(async move {
+                    let changed = tx
+                        .execute(
+                            "UPDATE active_jobs SET output_dir = {} WHERE job_id = {} AND output_dir = {}",
+                            &[
+                                SqlArg::Text(to),
+                                SqlArg::I64(job_id.0 as i64),
+                                SqlArg::Text(from),
+                            ],
+                        )
+                        .await?;
+                    Ok(changed > 0)
+                })
+            })
+            .await
+        })
+    }
+
+    // Persist queue positions as one write transaction through the writer
+    // gate. The caller passes only the rows whose position changed; each
+    // statement binds a bounded number of them, so a long queue never builds
+    // one unbounded statement.
+    fn update_active_job_queue_positions(
+        &self,
+        positions: &[(JobId, i64)],
+    ) -> Result<(), StateError> {
+        if positions.is_empty() {
+            return Ok(());
+        }
+        let datastore = self.datastore();
+        let positions = std::sync::Arc::new(positions.to_vec());
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "update_active_job_queue_positions", |tx| {
+                let positions = positions.clone();
+                Box::pin(async move {
+                    // Three binds a row: the CASE arm's id and position, and
+                    // the id in the IN list.
+                    let chunk_size = max_rows_for_tx(tx, 3);
+                    for chunk in positions.chunks(chunk_size) {
+                        let arms = "WHEN {} THEN {} ".repeat(chunk.len());
+                        let ids = vec!["{}"; chunk.len()].join(",");
+                        let sql = format!(
+                            "UPDATE active_jobs
+                                SET queue_position = CASE job_id {arms}END
+                              WHERE job_id IN ({ids})"
+                        );
+                        let mut args = Vec::with_capacity(chunk.len() * 3);
+                        for (job_id, position) in chunk {
+                            args.push(SqlArg::I64(job_id.0 as i64));
+                            args.push(SqlArg::I64(*position));
+                        }
+                        args.extend(chunk.iter().map(|(job_id, _)| SqlArg::I64(job_id.0 as i64)));
+                        tx.execute(&sql, &args).await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+        })
+    }
+
+    // Every active job's stored queue position, for the actor to compare a
+    // new order against.
+    fn load_active_job_queue_positions(
+        &self,
+    ) -> Result<std::collections::HashMap<JobId, i64>, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT job_id, queue_position FROM active_jobs WHERE queue_position IS NOT NULL",
+                &[],
+            )
+            .await?;
+            rows.into_iter()
+                .map(|row| Ok((JobId(row.i64("job_id")? as u64), row.i64("queue_position")?)))
+                .collect()
+        })
+    }
+
+    fn set_active_job_status(
+        &self,
+        job_id: JobId,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<(), StateError> {
+        self.set_active_job_runtime(
+            job_id, status, None, None, None, error, None, None, None, None, None,
+        )
+    }
+
+    fn set_active_job_runtime(
+        &self,
+        job_id: JobId,
+        status: &str,
+        download_state: Option<&str>,
+        post_state: Option<&str>,
+        run_state: Option<&str>,
+        error: Option<&str>,
+        queued_repair_at_epoch_ms: Option<f64>,
+        queued_extract_at_epoch_ms: Option<f64>,
+        paused_resume_status: Option<&str>,
+        paused_resume_download_state: Option<&str>,
+        paused_resume_post_state: Option<&str>,
+    ) -> Result<(), StateError> {
+        self.set_active_job_runtime_at(
+            job_id,
+            None,
+            None,
+            status,
+            download_state,
+            post_state,
+            run_state,
+            error,
+            queued_repair_at_epoch_ms,
+            queued_extract_at_epoch_ms,
+            paused_resume_status,
+            paused_resume_download_state,
+            paused_resume_post_state,
+        )
+    }
+
+    // [`Self::set_active_job_runtime`] that also moves the job's recorded
+    // output directory in the same statement, so a restart can never read the
+    // new runtime against the old location or the other way round. `None`
+    // keeps the directory already recorded. `post_processing_outcome`, when
+    // given, is kept in the same statement too: the moving row carries what
+    // the delivery ruled.
+    fn set_active_job_runtime_at(
+        &self,
+        job_id: JobId,
+        output_dir: Option<&str>,
+        post_processing_outcome: Option<&str>,
+        status: &str,
+        download_state: Option<&str>,
+        post_state: Option<&str>,
+        run_state: Option<&str>,
+        error: Option<&str>,
+        queued_repair_at_epoch_ms: Option<f64>,
+        queued_extract_at_epoch_ms: Option<f64>,
+        paused_resume_status: Option<&str>,
+        paused_resume_download_state: Option<&str>,
+        paused_resume_post_state: Option<&str>,
+    ) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        let args = vec![
+            SqlArg::OptText(output_dir.map(str::to_string)),
+            SqlArg::OptText(post_processing_outcome.map(str::to_string)),
+            SqlArg::Text(status.to_string()),
+            SqlArg::OptText(download_state.map(str::to_string)),
+            SqlArg::OptText(post_state.map(str::to_string)),
+            SqlArg::OptText(run_state.map(str::to_string)),
+            SqlArg::OptText(error.map(str::to_string)),
+            SqlArg::OptF64(queued_repair_at_epoch_ms),
+            SqlArg::OptF64(queued_extract_at_epoch_ms),
+            SqlArg::OptText(paused_resume_status.map(str::to_string)),
+            SqlArg::OptText(paused_resume_download_state.map(str::to_string)),
+            SqlArg::OptText(paused_resume_post_state.map(str::to_string)),
+            SqlArg::I64(job_id.0 as i64),
+        ];
+        self.run_sql_blocking(async move {
+            match datastore.engine() {
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(&datastore, "set_active_job_runtime", |tx| {
+                        let args = args.clone();
+                        Box::pin(async move {
+                            tx.execute(
+                                "UPDATE active_jobs
+                                 SET output_dir = COALESCE({}, output_dir),
+                                     post_processing_outcome = COALESCE({}, post_processing_outcome),
+                                     status = {},
+                                     download_state = {},
+                                     post_state = {},
+                                     run_state = {},
+                                     error = {},
+                                     queued_repair_at_epoch_ms = {},
+                                     queued_extract_at_epoch_ms = {},
+                                     paused_resume_status = {},
+                                     paused_resume_download_state = {},
+                                     paused_resume_post_state = {}
+                                 WHERE job_id = {}",
+                                &args,
+                            )
+                            .await?;
+                            Ok(())
+                        })
+                    })
+                    .await
+                }
+                SqlEngine::Postgres => {
+                    SqlRuntime::execute(
+                        datastore.write_exec(),
+                        "UPDATE active_jobs
+                         SET output_dir = COALESCE({}, output_dir),
+                             post_processing_outcome = COALESCE({}, post_processing_outcome),
+                             status = {},
+                             download_state = {},
+                             post_state = {},
+                             run_state = {},
+                             error = {},
+                             queued_repair_at_epoch_ms = {},
+                             queued_extract_at_epoch_ms = {},
+                             paused_resume_status = {},
+                             paused_resume_download_state = {},
+                             paused_resume_post_state = {}
+                         WHERE job_id = {}",
+                        &args,
+                    )
+                    .await?;
+                    Ok(())
+                }
+            }
+        })
+    }
+
+    fn complete_file(
+        &self,
+        job_id: JobId,
+        file_index: u32,
+        filename: &str,
+        md5: &[u8; 16],
+    ) -> Result<(), StateError> {
+        self.complete_file_with_optional_hash(job_id, file_index, filename, Some(md5))
+    }
+
+    fn complete_file_with_optional_hash(
+        &self,
+        job_id: JobId,
+        file_index: u32,
+        filename: &str,
+        md5: Option<&[u8; 16]>,
+    ) -> Result<(), StateError> {
+        self.complete_file_with_provenance(
+            job_id,
+            file_index,
+            filename,
+            md5,
+            CompletedHashProvenance::Streamed,
+        )
+    }
+
+    fn complete_file_with_provenance(
+        &self,
+        job_id: JobId,
+        file_index: u32,
+        filename: &str,
+        md5: Option<&[u8; 16]>,
+        provenance: CompletedHashProvenance,
+    ) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        let filename = filename.to_string();
+        let md5 = md5.map(|md5| md5.to_vec());
+        let provenance = md5.is_some().then(|| provenance.as_sql().to_string());
+        self.run_sql_blocking(async move {
+            match datastore.engine() {
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(&datastore, "complete_file", |tx| {
+                        let filename = filename.clone();
+                        let md5 = md5.clone();
+                        let provenance = provenance.clone();
+                        Box::pin(async move {
+                            if active_job_exists_tx(tx, job_id).await? {
+                                tx.execute(
+                                    "INSERT INTO active_files (job_id, file_index, filename, md5, md5_provenance)
+                                     VALUES ({}, {}, {}, {}, {})
+                                     ON CONFLICT(job_id, file_index) DO UPDATE SET
+                                        filename = excluded.filename,
+                                        md5 = excluded.md5,
+                                        md5_provenance = excluded.md5_provenance",
+                                    &[
+                                        SqlArg::I64(job_id.0 as i64),
+                                        SqlArg::I64(file_index as i64),
+                                        SqlArg::Text(filename),
+                                        SqlArg::OptBytes(md5),
+                                        SqlArg::OptText(provenance),
+                                    ],
+                                )
+                                .await?;
+                            }
+                            Ok(())
+                        })
+                    })
+                    .await
+                }
+                SqlEngine::Postgres => {
+                    let started = std::time::Instant::now();
+                    let result = SqlRuntime::execute(
+                        datastore.write_exec(),
+                        "WITH active_file_complete_active AS (
+                             SELECT 1
+                             FROM active_jobs
+                             WHERE job_id = {}
+                             FOR KEY SHARE
+                         )
+                             INSERT INTO active_files (job_id, file_index, filename, md5, md5_provenance)
+                             SELECT {}, {}, {}, {}, {}
+                             FROM active_file_complete_active
+                             ON CONFLICT(job_id, file_index) DO UPDATE SET
+                                filename = excluded.filename,
+                                md5 = excluded.md5,
+                                md5_provenance = excluded.md5_provenance",
+                        &[
+                            SqlArg::I64(job_id.0 as i64),
+                            SqlArg::I64(job_id.0 as i64),
+                            SqlArg::I64(file_index as i64),
+                            SqlArg::Text(filename),
+                            SqlArg::OptBytes(md5),
+                            SqlArg::OptText(provenance),
+                        ],
+                    )
+                    .await
+                    .map(|_| ());
+                    weaver_server_base::runtime::perf_probe::record_sql_op(
+                        "postgres",
+                        "complete_file",
+                        started.elapsed(),
+                    );
+                    result
+                }
+            }
+        })
+    }
+
+    // Complete a batch of files for a single job, the bulk counterpart to
+    // [`Self::complete_file_with_optional_hash`]. Each entry is
+    // `(file_index, filename, optional md5)`; the guard semantics match the
+    // single-file path (an absent `active_jobs` row inserts nothing). Postgres
+    // runs one autocommit `FOR KEY SHARE`-guarded multi-row upsert per chunk;
+    // SQLite guards once inside a transaction then bulk-upserts in chunks.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "writer gate: a batch on the transaction run_in_transaction opened under the gate; Postgres has no writer gate"
+    )]
+    fn complete_files(
+        &self,
+        job_id: JobId,
+        entries: &[(u32, String, Option<[u8; 16]>)],
+        provenance: CompletedHashProvenance,
+    ) -> Result<(), StateError> {
+        // 5 value binds per row (job_id, file_index, filename, md5,
+        // md5_provenance) plus the single guard bind reused across the chunk.
+        // Batched completions carry decode-streamed digests, so a present md5
+        // records 'streamed' provenance.
+        const BINDS_PER_ROW: usize = 5;
+
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let datastore = self.datastore();
+        let entries = entries.to_vec();
+        self.run_sql_blocking(async move {
+            match datastore.engine() {
+                SqlEngine::Sqlite => {
+                    let chunk_size = (SQLITE_BATCH_BIND_LIMIT / BINDS_PER_ROW).max(1);
+                    SqlRuntime::run_in_transaction(&datastore, "complete_files", |tx| {
+                        let entries = entries.clone();
+                        Box::pin(async move {
+                            if !active_job_exists_tx(tx, job_id).await? {
+                                return Ok(());
+                            }
+                            let SqlTx::Sqlite(tx) = tx else {
+                                return Ok(());
+                            };
+                            for chunk in entries.chunks(chunk_size) {
+                                let mut builder = QueryBuilder::<Sqlite>::new(
+                                    "INSERT INTO active_files (job_id, file_index, filename, md5, md5_provenance) ",
+                                );
+                                builder.push_values(
+                                    chunk,
+                                    |mut row, (file_index, filename, md5)| {
+                                        row.push_bind(job_id.0 as i64)
+                                            .push_bind(*file_index as i64)
+                                            .push_bind(filename.clone())
+                                            .push_bind(md5.map(|md5| md5.to_vec()))
+                                            .push_bind(md5.map(|_| provenance.as_sql()));
+                                    },
+                                );
+                                builder.push(
+                                    " ON CONFLICT(job_id, file_index) DO UPDATE SET
+                                        filename = excluded.filename,
+                                        md5 = excluded.md5,
+                                        md5_provenance = excluded.md5_provenance",
+                                );
+                                builder.build().execute(&mut **tx).await.map_err(db_err)?;
+                            }
+                            Ok(())
+                        })
+                    })
+                    .await
+                }
+                SqlEngine::Postgres => {
+                    let chunk_size = (POSTGRES_BATCH_BIND_LIMIT / BINDS_PER_ROW).max(1);
+                    let started = std::time::Instant::now();
+                    for chunk in entries.chunks(chunk_size) {
+                        let sql = build_complete_files_pg_sql(chunk.len());
+                        let mut args = Vec::with_capacity(1 + chunk.len() * BINDS_PER_ROW);
+                        args.push(SqlArg::I64(job_id.0 as i64));
+                        for (file_index, filename, md5) in chunk {
+                            args.push(SqlArg::I64(job_id.0 as i64));
+                            args.push(SqlArg::I64(*file_index as i64));
+                            args.push(SqlArg::Text(filename.clone()));
+                            args.push(SqlArg::OptBytes(md5.map(|md5| md5.to_vec())));
+                            args.push(SqlArg::OptText(
+                                md5.map(|_| provenance.as_sql().to_string()),
+                            ));
+                        }
+                        SqlRuntime::execute(datastore.write_exec(), &sql, &args).await?;
+                    }
+                    weaver_server_base::runtime::perf_probe::record_sql_op(
+                        "postgres",
+                        "complete_files",
+                        started.elapsed(),
+                    );
+                    Ok(())
+                }
+            }
+        })
+    }
+
+    fn save_file_identity(
+        &self,
+        job_id: JobId,
+        identity: &ActiveFileIdentity,
+    ) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        let identity = identity.clone();
+        self.run_sql_blocking(async move {
+            let classification_kind = identity
+                .classification
+                .as_ref()
+                .map(|classification| classification.kind.as_str().to_string());
+            let classification_set_name = identity
+                .classification
+                .as_ref()
+                .map(|classification| classification.set_name.clone());
+            let classification_volume_index = identity
+                .classification
+                .as_ref()
+                .and_then(|classification| classification.volume_index)
+                .map(|value| value as i64);
+            let classification_source = identity.classification_source.as_str().to_string();
+            let active_file_index = identity.file_index;
+            let active_filename = identity.current_filename.clone();
+            match datastore.engine() {
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(&datastore, "save_file_identity", |tx| {
+                        let identity = identity.clone();
+                        let classification_kind = classification_kind.clone();
+                        let classification_set_name = classification_set_name.clone();
+                        let classification_source = classification_source.clone();
+                        let active_filename = active_filename.clone();
+                        Box::pin(async move {
+                            tx.execute(
+                                "INSERT INTO active_file_identities
+                                 (job_id, file_index, source_filename, current_filename, canonical_filename,
+                                  classification_kind, classification_set_name, classification_volume_index,
+                                  classification_source)
+                                 SELECT {}, {}, {}, {}, {}, {}, {}, {}, {}
+                                 WHERE EXISTS (SELECT 1 FROM active_jobs WHERE job_id = {})
+                                 ON CONFLICT(job_id, file_index) DO UPDATE SET
+                                    source_filename = excluded.source_filename,
+                                    current_filename = excluded.current_filename,
+                                    canonical_filename = excluded.canonical_filename,
+                                    classification_kind = excluded.classification_kind,
+                                    classification_set_name = excluded.classification_set_name,
+                                    classification_volume_index = excluded.classification_volume_index,
+                                    classification_source = excluded.classification_source",
+                                &[
+                                    SqlArg::I64(job_id.0 as i64),
+                                    SqlArg::I64(active_file_index as i64),
+                                    SqlArg::Text(identity.source_filename),
+                                    SqlArg::Text(identity.current_filename),
+                                    SqlArg::OptText(identity.canonical_filename),
+                                    SqlArg::OptText(classification_kind),
+                                    SqlArg::OptText(classification_set_name),
+                                    SqlArg::OptI64(classification_volume_index),
+                                    SqlArg::Text(classification_source),
+                                    SqlArg::I64(job_id.0 as i64),
+                                ],
+                            )
+                            .await?;
+                            tx.execute(
+                                "UPDATE active_files
+                                 SET filename = {}
+                                 WHERE job_id = {} AND file_index = {}",
+                                &[
+                                    SqlArg::Text(active_filename),
+                                    SqlArg::I64(job_id.0 as i64),
+                                    SqlArg::I64(active_file_index as i64),
+                                ],
+                            )
+                            .await?;
+                            Ok(())
+                        })
+                    })
+                    .await
+                }
+                // Both writes ride one autocommit statement: the identity upsert
+                // and the sibling filename update are data-modifying CTEs behind
+                // a shared FOR KEY SHARE guard, so the statement no-ops when the
+                // parent job row is gone and blocks a concurrent archive/delete
+                // for its duration. Callers sit on the pipeline task, so the
+                // round trips a BEGIN/COMMIT pair would add are latency the
+                // actor itself pays.
+                SqlEngine::Postgres => {
+                    let started = std::time::Instant::now();
+                    let result = SqlRuntime::execute(
+                        datastore.write_exec(),
+                        "WITH active_file_identity_parent AS (
+                            SELECT 1 FROM active_jobs WHERE job_id = {} FOR KEY SHARE
+                         ),
+                         identity_upsert AS (
+                            INSERT INTO active_file_identities
+                            (job_id, file_index, source_filename, current_filename, canonical_filename,
+                             classification_kind, classification_set_name, classification_volume_index,
+                             classification_source)
+                            SELECT {}, {}, {}, {}, {}, {}, {}, {}, {}
+                            FROM active_file_identity_parent
+                            ON CONFLICT(job_id, file_index) DO UPDATE SET
+                               source_filename = excluded.source_filename,
+                               current_filename = excluded.current_filename,
+                               canonical_filename = excluded.canonical_filename,
+                               classification_kind = excluded.classification_kind,
+                               classification_set_name = excluded.classification_set_name,
+                               classification_volume_index = excluded.classification_volume_index,
+                               classification_source = excluded.classification_source
+                         )
+                         UPDATE active_files
+                            SET filename = {}
+                           FROM active_file_identity_parent
+                          WHERE active_files.job_id = {} AND active_files.file_index = {}",
+                        &[
+                            SqlArg::I64(job_id.0 as i64),
+                            SqlArg::I64(job_id.0 as i64),
+                            SqlArg::I64(active_file_index as i64),
+                            SqlArg::Text(identity.source_filename),
+                            SqlArg::Text(identity.current_filename),
+                            SqlArg::OptText(identity.canonical_filename),
+                            SqlArg::OptText(classification_kind),
+                            SqlArg::OptText(classification_set_name),
+                            SqlArg::OptI64(classification_volume_index),
+                            SqlArg::Text(classification_source),
+                            SqlArg::Text(active_filename),
+                            SqlArg::I64(job_id.0 as i64),
+                            SqlArg::I64(active_file_index as i64),
+                        ],
+                    )
+                    .await
+                    .map(|_| ());
+                    weaver_server_base::runtime::perf_probe::record_sql_op(
+                        "postgres",
+                        "save_file_identity",
+                        started.elapsed(),
+                    );
+                    result
+                }
+            }
+        })
+    }
+
+    // Persist a batch of file identities for a single job in ONE transaction.
+    //
+    // This is the bulk counterpart to [`Self::save_file_identity`]: it upserts
+    // every `active_file_identities` row via [`bulk_upsert_file_identities_tx`]
+    // AND performs the sibling `active_files.filename` update that the bulk tx
+    // helper omits, so callers converting a per-identity loop keep identical
+    // semantics. Postgres runs one `UPDATE ... FROM (VALUES ...)` per chunk;
+    // SQLite issues per-row `UPDATE`s inside the same transaction (cheap and
+    // local to the serialized writer).
+    fn save_file_identities(
+        &self,
+        job_id: JobId,
+        identities: &[ActiveFileIdentity],
+    ) -> Result<(), StateError> {
+        if identities.is_empty() {
+            return Ok(());
+        }
+
+        let datastore = self.datastore();
+        let identities = identities.to_vec();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "save_file_identities", |tx| {
+                let identities = identities.clone();
+                Box::pin(async move {
+                    if !active_job_exists_tx(tx, job_id).await? {
+                        return Ok(());
+                    }
+                    bulk_upsert_file_identities_tx(tx, job_id, &identities).await?;
+                    bulk_update_active_files_filenames_tx(tx, job_id, &identities).await?;
+                    Ok(())
+                })
+            })
+            .await
+        })
+    }
+}
+
+pub(crate) trait JobsPersistenceInternalQueries {
     #[allow(dead_code)] // retained for restoration paths that bypass admission.
-    pub(crate) fn create_active_job_with_file_identities(
+    fn create_active_job_with_file_identities(
+        &self,
+        job: &ActiveJob,
+        identities: &[ActiveFileIdentity],
+    ) -> Result<(), StateError>;
+    fn semantic_materialization_is_current(
+        &self,
+        job_id: JobId,
+        generation: i64,
+    ) -> Result<bool, StateError>;
+    fn semantic_promotion_materialization_is_current(
+        &self,
+        job_id: JobId,
+        generation: i64,
+    ) -> Result<bool, StateError>;
+    #[cfg(test)]
+    fn materialize_admission(
+        &self,
+        job: &ActiveJob,
+        identities: &[ActiveFileIdentity],
+        semantic_materialization_generation: Option<i64>,
+        semantic_promotion_generation: Option<i64>,
+        restart: bool,
+    ) -> Result<bool, StateError>;
+    fn materialize_admission_with_outline(
+        &self,
+        job: &ActiveJob,
+        identities: &[ActiveFileIdentity],
+        outline: Option<&crate::ingest::outline::NzbOutline>,
+        semantic_materialization_generation: Option<i64>,
+        semantic_promotion_generation: Option<i64>,
+        restart: bool,
+    ) -> Result<bool, StateError>;
+    fn refresh_script_job_inputs(
+        &self,
+        job_id: u64,
+        facts: &mut crate::post_processing::runner::CompatibilityFacts,
+    ) -> Result<(), StateError>;
+    fn set_active_job_staging_dir(
+        &self,
+        job_id: JobId,
+        staging_dir: Option<&std::path::Path>,
+    ) -> Result<(), StateError>;
+    fn set_nzb_pause_release(&self, job_id: JobId, pending: bool) -> Result<(), StateError>;
+    fn set_nzb_admitted(&self, job_id: JobId, admitted: bool) -> Result<(), StateError>;
+}
+
+impl JobsPersistenceInternalQueries for Database {
+    fn create_active_job_with_file_identities(
         &self,
         job: &ActiveJob,
         identities: &[ActiveFileIdentity],
@@ -479,7 +1415,7 @@ impl Database {
     // Performs the inexpensive first half of SCORE materialization before a
     // pipeline creates a work directory. The transactional check below remains
     // authoritative; this keeps a known-stale submit from allocating anything.
-    pub(crate) fn semantic_materialization_is_current(
+    fn semantic_materialization_is_current(
         &self,
         job_id: JobId,
         generation: i64,
@@ -503,7 +1439,7 @@ impl Database {
 
     // Checks an owned promotion lease before the scheduler allocates a
     // working directory. The materialization transaction repeats this CAS.
-    pub(crate) fn semantic_promotion_materialization_is_current(
+    fn semantic_promotion_materialization_is_current(
         &self,
         job_id: JobId,
         generation: i64,
@@ -535,7 +1471,7 @@ impl Database {
     // or superseding that candidate invalidates the generation before any
     // stale request can create scheduler work.
     #[cfg(test)]
-    pub(crate) fn materialize_admission(
+    fn materialize_admission(
         &self,
         job: &ActiveJob,
         identities: &[ActiveFileIdentity],
@@ -555,7 +1491,7 @@ impl Database {
 
     // As `materialize_admission`, writing the job's NZB outline in the same
     // transaction when it was read.
-    pub(crate) fn materialize_admission_with_outline(
+    fn materialize_admission_with_outline(
         &self,
         job: &ActiveJob,
         identities: &[ActiveFileIdentity],
@@ -746,7 +1682,7 @@ impl Database {
         result
     }
 
-    pub(crate) fn refresh_script_job_inputs(
+    fn refresh_script_job_inputs(
         &self,
         job_id: u64,
         facts: &mut crate::post_processing::runner::CompatibilityFacts,
@@ -773,280 +1709,9 @@ impl Database {
         Ok(())
     }
 
-    pub fn update_active_job(&self, job_id: JobId, update: &JobUpdate) -> Result<(), StateError> {
-        let datastore = self.datastore();
-        let mut update = update.clone();
-        if let FieldUpdate::Set(password) = &mut update.password {
-            *password = encrypt_archive_password(self.encryption_key(), Some(password))?
-                .expect("supplied password");
-        }
-        let _effects_writer = self.lock_script_effects_writer();
-        let rewritten_effects = self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "update_active_job", |tx| {
-                let update = update.clone();
-                Box::pin(async move {
-                    tx.execute(
-                        "UPDATE script_output_state SET next_seq = next_seq WHERE singleton = 1",
-                        &[],
-                    )
-                    .await?;
-                    let mut rewritten_effects = None;
-                    match &update.category {
-                        FieldUpdate::Unchanged => {}
-                        FieldUpdate::Clear => {
-                            tx.execute(
-                                "UPDATE active_jobs SET category = NULL WHERE job_id = {}",
-                                &[SqlArg::I64(job_id.0 as i64)],
-                            )
-                            .await?;
-                        }
-                        FieldUpdate::Set(category) => {
-                            tx.execute(
-                                "UPDATE active_jobs SET category = {} WHERE job_id = {}",
-                                &[SqlArg::Text(category.clone()), SqlArg::I64(job_id.0 as i64)],
-                            )
-                            .await?;
-                        }
-                    }
-
-                    if (!matches!(update.metadata, FieldUpdate::Unchanged)
-                        || !update.metadata_edits.is_empty()
-                        || update.name.is_some())
-                        && let Some(active) = tx
-                            .fetch_optional(
-                                "SELECT metadata FROM active_jobs WHERE job_id = {}",
-                                &[SqlArg::I64(job_id.0 as i64)],
-                            )
-                            .await?
-                    {
-                        let mut metadata: Vec<(String, String)> = active
-                            .opt_text("metadata")?
-                            .map(|text| serde_json::from_str(&text).map_err(db_err))
-                            .transpose()?
-                            .unwrap_or_default();
-                        update.apply_to_metadata(&mut metadata);
-                        if let Some(name) = &update.name {
-                            crate::ingest::set_renamed_title(&mut metadata, name);
-                        }
-                        if let Some(row) = tx
-                            .fetch_optional(
-                                "SELECT state FROM script_job_state WHERE job_id = {}",
-                                &[SqlArg::I64(job_id.0 as i64)],
-                            )
-                            .await?
-                        {
-                            let mut effects: crate::post_processing::effects::JobScriptEffects =
-                                serde_json::from_str(&row.text("state")?)
-                                    .map_err(|error| StateError::Database(error.to_string()))?;
-                            if !matches!(update.metadata, FieldUpdate::Unchanged) {
-                                for value in effects.parameters.values_mut() {
-                                    value.clear();
-                                }
-                                effects.parameters.extend(metadata.clone());
-                            } else {
-                                let renamed = update.name.as_ref().map(|name| {
-                                    (
-                                        crate::ingest::RENAMED_TITLE_METADATA_KEY.to_string(),
-                                        Some(name.clone()),
-                                    )
-                                });
-                                for (key, value) in
-                                    update.metadata_edits.iter().chain(renamed.iter())
-                                {
-                                    for (existing, previous) in &mut effects.parameters {
-                                        if existing.eq_ignore_ascii_case(key) {
-                                            previous.clear();
-                                        }
-                                    }
-                                    effects
-                                        .parameters
-                                        .insert(key.clone(), value.clone().unwrap_or_default());
-                                }
-                            }
-                            tx.execute(
-                                "UPDATE script_job_state SET state = {} WHERE job_id = {}",
-                                &[
-                                    SqlArg::Text(serde_json::to_string(&effects).map_err(
-                                        |error| StateError::Database(error.to_string()),
-                                    )?),
-                                    SqlArg::I64(job_id.0 as i64),
-                                ],
-                            )
-                            .await?;
-                            rewritten_effects = Some(effects);
-                        }
-                        tx.execute(
-                            "UPDATE active_jobs SET metadata = {} WHERE job_id = {}",
-                            &[
-                                SqlArg::OptText(metadata_json(&metadata)?),
-                                SqlArg::I64(job_id.0 as i64),
-                            ],
-                        )
-                        .await?;
-                    }
-
-                    // Password override column: NULL = no override (restore
-                    // keeps the NZB-derived password), '' = explicitly no
-                    // password, anything else = the encrypted override.
-                    match update.password {
-                        FieldUpdate::Unchanged => {}
-                        FieldUpdate::Clear => {
-                            tx.execute(
-                                "UPDATE active_jobs SET password = {} WHERE job_id = {}",
-                                &[SqlArg::Text(String::new()), SqlArg::I64(job_id.0 as i64)],
-                            )
-                            .await?;
-                        }
-                        FieldUpdate::Set(password) => {
-                            tx.execute(
-                                "UPDATE active_jobs SET password = {} WHERE job_id = {}",
-                                &[SqlArg::Text(password), SqlArg::I64(job_id.0 as i64)],
-                            )
-                            .await?;
-                        }
-                    }
-                    Ok(rewritten_effects)
-                })
-            })
-            .await
-        })?;
-        if let Some(effects) = rewritten_effects {
-            self.cache_script_effects(job_id.0, effects);
-        }
-        Ok(())
-    }
-
-    pub fn update_active_job_output_dir(
-        &self,
-        job_id: JobId,
-        output_dir: &std::path::Path,
-    ) -> Result<(), StateError> {
-        let datastore = self.datastore();
-        let output_dir = output_dir.to_string_lossy().into_owned();
-        self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "update_active_job_output_dir", |tx| {
-                let output_dir = output_dir.clone();
-                Box::pin(async move {
-                    tx.execute(
-                        "UPDATE active_jobs SET output_dir = {} WHERE job_id = {}",
-                        &[SqlArg::Text(output_dir), SqlArg::I64(job_id.0 as i64)],
-                    )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await
-        })
-    }
-
-    // The job's row names `to` if it still names `from`: whether it did. A
-    // row that has gone, or names another directory, is left as it is.
-    pub fn move_active_job_output_dir(
-        &self,
-        job_id: JobId,
-        from: &std::path::Path,
-        to: &std::path::Path,
-    ) -> Result<bool, StateError> {
-        let datastore = self.datastore();
-        let from = from.to_string_lossy().into_owned();
-        let to = to.to_string_lossy().into_owned();
-        self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "move_active_job_output_dir", |tx| {
-                let (from, to) = (from.clone(), to.clone());
-                Box::pin(async move {
-                    let changed = tx
-                        .execute(
-                            "UPDATE active_jobs SET output_dir = {} WHERE job_id = {} AND output_dir = {}",
-                            &[
-                                SqlArg::Text(to),
-                                SqlArg::I64(job_id.0 as i64),
-                                SqlArg::Text(from),
-                            ],
-                        )
-                        .await?;
-                    Ok(changed > 0)
-                })
-            })
-            .await
-        })
-    }
-
-    // Persist queue positions as one write transaction through the writer
-    // gate. The caller passes only the rows whose position changed; each
-    // statement binds a bounded number of them, so a long queue never builds
-    // one unbounded statement.
-    pub fn update_active_job_queue_positions(
-        &self,
-        positions: &[(JobId, i64)],
-    ) -> Result<(), StateError> {
-        if positions.is_empty() {
-            return Ok(());
-        }
-        let datastore = self.datastore();
-        let positions = std::sync::Arc::new(positions.to_vec());
-        self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "update_active_job_queue_positions", |tx| {
-                let positions = positions.clone();
-                Box::pin(async move {
-                    // Three binds a row: the CASE arm's id and position, and
-                    // the id in the IN list.
-                    let chunk_size = max_rows_for_tx(tx, 3);
-                    for chunk in positions.chunks(chunk_size) {
-                        let arms = "WHEN {} THEN {} ".repeat(chunk.len());
-                        let ids = vec!["{}"; chunk.len()].join(",");
-                        let sql = format!(
-                            "UPDATE active_jobs
-                                SET queue_position = CASE job_id {arms}END
-                              WHERE job_id IN ({ids})"
-                        );
-                        let mut args = Vec::with_capacity(chunk.len() * 3);
-                        for (job_id, position) in chunk {
-                            args.push(SqlArg::I64(job_id.0 as i64));
-                            args.push(SqlArg::I64(*position));
-                        }
-                        args.extend(chunk.iter().map(|(job_id, _)| SqlArg::I64(job_id.0 as i64)));
-                        tx.execute(&sql, &args).await?;
-                    }
-                    Ok(())
-                })
-            })
-            .await
-        })
-    }
-
-    // Every active job's stored queue position, for the actor to compare a
-    // new order against.
-    pub fn load_active_job_queue_positions(
-        &self,
-    ) -> Result<std::collections::HashMap<JobId, i64>, StateError> {
-        let datastore = self.datastore();
-        self.run_sql_blocking_read(async move {
-            let rows = SqlRuntime::fetch_all(
-                datastore.read_exec(),
-                "SELECT job_id, queue_position FROM active_jobs WHERE queue_position IS NOT NULL",
-                &[],
-            )
-            .await?;
-            rows.into_iter()
-                .map(|row| Ok((JobId(row.i64("job_id")? as u64), row.i64("queue_position")?)))
-                .collect()
-        })
-    }
-
-    pub fn set_active_job_status(
-        &self,
-        job_id: JobId,
-        status: &str,
-        error: Option<&str>,
-    ) -> Result<(), StateError> {
-        self.set_active_job_runtime(
-            job_id, status, None, None, None, error, None, None, None, None, None,
-        )
-    }
-
     // Where the job stages the files it delivers; None when it stages
     // nothing apart from its working directory.
-    pub(crate) fn set_active_job_staging_dir(
+    fn set_active_job_staging_dir(
         &self,
         job_id: JobId,
         staging_dir: Option<&std::path::Path>,
@@ -1067,525 +1732,7 @@ impl Database {
         })
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "active job runtime is persisted as one atomic SQL update"
-    )]
-    pub fn set_active_job_runtime(
-        &self,
-        job_id: JobId,
-        status: &str,
-        download_state: Option<&str>,
-        post_state: Option<&str>,
-        run_state: Option<&str>,
-        error: Option<&str>,
-        queued_repair_at_epoch_ms: Option<f64>,
-        queued_extract_at_epoch_ms: Option<f64>,
-        paused_resume_status: Option<&str>,
-        paused_resume_download_state: Option<&str>,
-        paused_resume_post_state: Option<&str>,
-    ) -> Result<(), StateError> {
-        self.set_active_job_runtime_at(
-            job_id,
-            None,
-            None,
-            status,
-            download_state,
-            post_state,
-            run_state,
-            error,
-            queued_repair_at_epoch_ms,
-            queued_extract_at_epoch_ms,
-            paused_resume_status,
-            paused_resume_download_state,
-            paused_resume_post_state,
-        )
-    }
-
-    // [`Self::set_active_job_runtime`] that also moves the job's recorded
-    // output directory in the same statement, so a restart can never read the
-    // new runtime against the old location or the other way round. `None`
-    // keeps the directory already recorded. `post_processing_outcome`, when
-    // given, is kept in the same statement too: the moving row carries what
-    // the delivery ruled.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "active job runtime is persisted as one atomic SQL update"
-    )]
-    pub fn set_active_job_runtime_at(
-        &self,
-        job_id: JobId,
-        output_dir: Option<&str>,
-        post_processing_outcome: Option<&str>,
-        status: &str,
-        download_state: Option<&str>,
-        post_state: Option<&str>,
-        run_state: Option<&str>,
-        error: Option<&str>,
-        queued_repair_at_epoch_ms: Option<f64>,
-        queued_extract_at_epoch_ms: Option<f64>,
-        paused_resume_status: Option<&str>,
-        paused_resume_download_state: Option<&str>,
-        paused_resume_post_state: Option<&str>,
-    ) -> Result<(), StateError> {
-        let datastore = self.datastore();
-        let args = vec![
-            SqlArg::OptText(output_dir.map(str::to_string)),
-            SqlArg::OptText(post_processing_outcome.map(str::to_string)),
-            SqlArg::Text(status.to_string()),
-            SqlArg::OptText(download_state.map(str::to_string)),
-            SqlArg::OptText(post_state.map(str::to_string)),
-            SqlArg::OptText(run_state.map(str::to_string)),
-            SqlArg::OptText(error.map(str::to_string)),
-            SqlArg::OptF64(queued_repair_at_epoch_ms),
-            SqlArg::OptF64(queued_extract_at_epoch_ms),
-            SqlArg::OptText(paused_resume_status.map(str::to_string)),
-            SqlArg::OptText(paused_resume_download_state.map(str::to_string)),
-            SqlArg::OptText(paused_resume_post_state.map(str::to_string)),
-            SqlArg::I64(job_id.0 as i64),
-        ];
-        self.run_sql_blocking(async move {
-            match datastore.engine() {
-                SqlEngine::Sqlite => {
-                    SqlRuntime::run_in_transaction(&datastore, "set_active_job_runtime", |tx| {
-                        let args = args.clone();
-                        Box::pin(async move {
-                            tx.execute(
-                                "UPDATE active_jobs
-                                 SET output_dir = COALESCE({}, output_dir),
-                                     post_processing_outcome = COALESCE({}, post_processing_outcome),
-                                     status = {},
-                                     download_state = {},
-                                     post_state = {},
-                                     run_state = {},
-                                     error = {},
-                                     queued_repair_at_epoch_ms = {},
-                                     queued_extract_at_epoch_ms = {},
-                                     paused_resume_status = {},
-                                     paused_resume_download_state = {},
-                                     paused_resume_post_state = {}
-                                 WHERE job_id = {}",
-                                &args,
-                            )
-                            .await?;
-                            Ok(())
-                        })
-                    })
-                    .await
-                }
-                SqlEngine::Postgres => {
-                    SqlRuntime::execute(
-                        datastore.write_exec(),
-                        "UPDATE active_jobs
-                         SET output_dir = COALESCE({}, output_dir),
-                             post_processing_outcome = COALESCE({}, post_processing_outcome),
-                             status = {},
-                             download_state = {},
-                             post_state = {},
-                             run_state = {},
-                             error = {},
-                             queued_repair_at_epoch_ms = {},
-                             queued_extract_at_epoch_ms = {},
-                             paused_resume_status = {},
-                             paused_resume_download_state = {},
-                             paused_resume_post_state = {}
-                         WHERE job_id = {}",
-                        &args,
-                    )
-                    .await?;
-                    Ok(())
-                }
-            }
-        })
-    }
-
-    pub fn complete_file(
-        &self,
-        job_id: JobId,
-        file_index: u32,
-        filename: &str,
-        md5: &[u8; 16],
-    ) -> Result<(), StateError> {
-        self.complete_file_with_optional_hash(job_id, file_index, filename, Some(md5))
-    }
-
-    pub fn complete_file_with_optional_hash(
-        &self,
-        job_id: JobId,
-        file_index: u32,
-        filename: &str,
-        md5: Option<&[u8; 16]>,
-    ) -> Result<(), StateError> {
-        self.complete_file_with_provenance(
-            job_id,
-            file_index,
-            filename,
-            md5,
-            CompletedHashProvenance::Streamed,
-        )
-    }
-
-    pub fn complete_file_with_provenance(
-        &self,
-        job_id: JobId,
-        file_index: u32,
-        filename: &str,
-        md5: Option<&[u8; 16]>,
-        provenance: CompletedHashProvenance,
-    ) -> Result<(), StateError> {
-        let datastore = self.datastore();
-        let filename = filename.to_string();
-        let md5 = md5.map(|md5| md5.to_vec());
-        let provenance = md5.is_some().then(|| provenance.as_sql().to_string());
-        self.run_sql_blocking(async move {
-            match datastore.engine() {
-                SqlEngine::Sqlite => {
-                    SqlRuntime::run_in_transaction(&datastore, "complete_file", |tx| {
-                        let filename = filename.clone();
-                        let md5 = md5.clone();
-                        let provenance = provenance.clone();
-                        Box::pin(async move {
-                            if active_job_exists_tx(tx, job_id).await? {
-                                tx.execute(
-                                    "INSERT INTO active_files (job_id, file_index, filename, md5, md5_provenance)
-                                     VALUES ({}, {}, {}, {}, {})
-                                     ON CONFLICT(job_id, file_index) DO UPDATE SET
-                                        filename = excluded.filename,
-                                        md5 = excluded.md5,
-                                        md5_provenance = excluded.md5_provenance",
-                                    &[
-                                        SqlArg::I64(job_id.0 as i64),
-                                        SqlArg::I64(file_index as i64),
-                                        SqlArg::Text(filename),
-                                        SqlArg::OptBytes(md5),
-                                        SqlArg::OptText(provenance),
-                                    ],
-                                )
-                                .await?;
-                            }
-                            Ok(())
-                        })
-                    })
-                    .await
-                }
-                SqlEngine::Postgres => {
-                    let started = std::time::Instant::now();
-                    let result = SqlRuntime::execute(
-                        datastore.write_exec(),
-                        "WITH active_file_complete_active AS (
-                             SELECT 1
-                             FROM active_jobs
-                             WHERE job_id = {}
-                             FOR KEY SHARE
-                         )
-                             INSERT INTO active_files (job_id, file_index, filename, md5, md5_provenance)
-                             SELECT {}, {}, {}, {}, {}
-                             FROM active_file_complete_active
-                             ON CONFLICT(job_id, file_index) DO UPDATE SET
-                                filename = excluded.filename,
-                                md5 = excluded.md5,
-                                md5_provenance = excluded.md5_provenance",
-                        &[
-                            SqlArg::I64(job_id.0 as i64),
-                            SqlArg::I64(job_id.0 as i64),
-                            SqlArg::I64(file_index as i64),
-                            SqlArg::Text(filename),
-                            SqlArg::OptBytes(md5),
-                            SqlArg::OptText(provenance),
-                        ],
-                    )
-                    .await
-                    .map(|_| ());
-                    weaver_server_base::runtime::perf_probe::record_sql_op(
-                        "postgres",
-                        "complete_file",
-                        started.elapsed(),
-                    );
-                    result
-                }
-            }
-        })
-    }
-
-    // Complete a batch of files for a single job, the bulk counterpart to
-    // [`Self::complete_file_with_optional_hash`]. Each entry is
-    // `(file_index, filename, optional md5)`; the guard semantics match the
-    // single-file path (an absent `active_jobs` row inserts nothing). Postgres
-    // runs one autocommit `FOR KEY SHARE`-guarded multi-row upsert per chunk;
-    // SQLite guards once inside a transaction then bulk-upserts in chunks.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "writer gate: a batch on the transaction run_in_transaction opened under the gate; Postgres has no writer gate"
-    )]
-    pub fn complete_files(
-        &self,
-        job_id: JobId,
-        entries: &[(u32, String, Option<[u8; 16]>)],
-        provenance: CompletedHashProvenance,
-    ) -> Result<(), StateError> {
-        // 5 value binds per row (job_id, file_index, filename, md5,
-        // md5_provenance) plus the single guard bind reused across the chunk.
-        // Batched completions carry decode-streamed digests, so a present md5
-        // records 'streamed' provenance.
-        const BINDS_PER_ROW: usize = 5;
-
-        if entries.is_empty() {
-            return Ok(());
-        }
-
-        let datastore = self.datastore();
-        let entries = entries.to_vec();
-        self.run_sql_blocking(async move {
-            match datastore.engine() {
-                SqlEngine::Sqlite => {
-                    let chunk_size = (SQLITE_BATCH_BIND_LIMIT / BINDS_PER_ROW).max(1);
-                    SqlRuntime::run_in_transaction(&datastore, "complete_files", |tx| {
-                        let entries = entries.clone();
-                        Box::pin(async move {
-                            if !active_job_exists_tx(tx, job_id).await? {
-                                return Ok(());
-                            }
-                            let SqlTx::Sqlite(tx) = tx else {
-                                return Ok(());
-                            };
-                            for chunk in entries.chunks(chunk_size) {
-                                let mut builder = QueryBuilder::<Sqlite>::new(
-                                    "INSERT INTO active_files (job_id, file_index, filename, md5, md5_provenance) ",
-                                );
-                                builder.push_values(
-                                    chunk,
-                                    |mut row, (file_index, filename, md5)| {
-                                        row.push_bind(job_id.0 as i64)
-                                            .push_bind(*file_index as i64)
-                                            .push_bind(filename.clone())
-                                            .push_bind(md5.map(|md5| md5.to_vec()))
-                                            .push_bind(md5.map(|_| provenance.as_sql()));
-                                    },
-                                );
-                                builder.push(
-                                    " ON CONFLICT(job_id, file_index) DO UPDATE SET
-                                        filename = excluded.filename,
-                                        md5 = excluded.md5,
-                                        md5_provenance = excluded.md5_provenance",
-                                );
-                                builder.build().execute(&mut **tx).await.map_err(db_err)?;
-                            }
-                            Ok(())
-                        })
-                    })
-                    .await
-                }
-                SqlEngine::Postgres => {
-                    let chunk_size = (POSTGRES_BATCH_BIND_LIMIT / BINDS_PER_ROW).max(1);
-                    let started = std::time::Instant::now();
-                    for chunk in entries.chunks(chunk_size) {
-                        let sql = build_complete_files_pg_sql(chunk.len());
-                        let mut args = Vec::with_capacity(1 + chunk.len() * BINDS_PER_ROW);
-                        args.push(SqlArg::I64(job_id.0 as i64));
-                        for (file_index, filename, md5) in chunk {
-                            args.push(SqlArg::I64(job_id.0 as i64));
-                            args.push(SqlArg::I64(*file_index as i64));
-                            args.push(SqlArg::Text(filename.clone()));
-                            args.push(SqlArg::OptBytes(md5.map(|md5| md5.to_vec())));
-                            args.push(SqlArg::OptText(
-                                md5.map(|_| provenance.as_sql().to_string()),
-                            ));
-                        }
-                        SqlRuntime::execute(datastore.write_exec(), &sql, &args).await?;
-                    }
-                    weaver_server_base::runtime::perf_probe::record_sql_op(
-                        "postgres",
-                        "complete_files",
-                        started.elapsed(),
-                    );
-                    Ok(())
-                }
-            }
-        })
-    }
-
-    pub fn save_file_identity(
-        &self,
-        job_id: JobId,
-        identity: &ActiveFileIdentity,
-    ) -> Result<(), StateError> {
-        let datastore = self.datastore();
-        let identity = identity.clone();
-        self.run_sql_blocking(async move {
-            let classification_kind = identity
-                .classification
-                .as_ref()
-                .map(|classification| classification.kind.as_str().to_string());
-            let classification_set_name = identity
-                .classification
-                .as_ref()
-                .map(|classification| classification.set_name.clone());
-            let classification_volume_index = identity
-                .classification
-                .as_ref()
-                .and_then(|classification| classification.volume_index)
-                .map(|value| value as i64);
-            let classification_source = identity.classification_source.as_str().to_string();
-            let active_file_index = identity.file_index;
-            let active_filename = identity.current_filename.clone();
-            match datastore.engine() {
-                SqlEngine::Sqlite => {
-                    SqlRuntime::run_in_transaction(&datastore, "save_file_identity", |tx| {
-                        let identity = identity.clone();
-                        let classification_kind = classification_kind.clone();
-                        let classification_set_name = classification_set_name.clone();
-                        let classification_source = classification_source.clone();
-                        let active_filename = active_filename.clone();
-                        Box::pin(async move {
-                            tx.execute(
-                                "INSERT INTO active_file_identities
-                                 (job_id, file_index, source_filename, current_filename, canonical_filename,
-                                  classification_kind, classification_set_name, classification_volume_index,
-                                  classification_source)
-                                 SELECT {}, {}, {}, {}, {}, {}, {}, {}, {}
-                                 WHERE EXISTS (SELECT 1 FROM active_jobs WHERE job_id = {})
-                                 ON CONFLICT(job_id, file_index) DO UPDATE SET
-                                    source_filename = excluded.source_filename,
-                                    current_filename = excluded.current_filename,
-                                    canonical_filename = excluded.canonical_filename,
-                                    classification_kind = excluded.classification_kind,
-                                    classification_set_name = excluded.classification_set_name,
-                                    classification_volume_index = excluded.classification_volume_index,
-                                    classification_source = excluded.classification_source",
-                                &[
-                                    SqlArg::I64(job_id.0 as i64),
-                                    SqlArg::I64(active_file_index as i64),
-                                    SqlArg::Text(identity.source_filename),
-                                    SqlArg::Text(identity.current_filename),
-                                    SqlArg::OptText(identity.canonical_filename),
-                                    SqlArg::OptText(classification_kind),
-                                    SqlArg::OptText(classification_set_name),
-                                    SqlArg::OptI64(classification_volume_index),
-                                    SqlArg::Text(classification_source),
-                                    SqlArg::I64(job_id.0 as i64),
-                                ],
-                            )
-                            .await?;
-                            tx.execute(
-                                "UPDATE active_files
-                                 SET filename = {}
-                                 WHERE job_id = {} AND file_index = {}",
-                                &[
-                                    SqlArg::Text(active_filename),
-                                    SqlArg::I64(job_id.0 as i64),
-                                    SqlArg::I64(active_file_index as i64),
-                                ],
-                            )
-                            .await?;
-                            Ok(())
-                        })
-                    })
-                    .await
-                }
-                // Both writes ride one autocommit statement: the identity upsert
-                // and the sibling filename update are data-modifying CTEs behind
-                // a shared FOR KEY SHARE guard, so the statement no-ops when the
-                // parent job row is gone and blocks a concurrent archive/delete
-                // for its duration. Callers sit on the pipeline task, so the
-                // round trips a BEGIN/COMMIT pair would add are latency the
-                // actor itself pays.
-                SqlEngine::Postgres => {
-                    let started = std::time::Instant::now();
-                    let result = SqlRuntime::execute(
-                        datastore.write_exec(),
-                        "WITH active_file_identity_parent AS (
-                            SELECT 1 FROM active_jobs WHERE job_id = {} FOR KEY SHARE
-                         ),
-                         identity_upsert AS (
-                            INSERT INTO active_file_identities
-                            (job_id, file_index, source_filename, current_filename, canonical_filename,
-                             classification_kind, classification_set_name, classification_volume_index,
-                             classification_source)
-                            SELECT {}, {}, {}, {}, {}, {}, {}, {}, {}
-                            FROM active_file_identity_parent
-                            ON CONFLICT(job_id, file_index) DO UPDATE SET
-                               source_filename = excluded.source_filename,
-                               current_filename = excluded.current_filename,
-                               canonical_filename = excluded.canonical_filename,
-                               classification_kind = excluded.classification_kind,
-                               classification_set_name = excluded.classification_set_name,
-                               classification_volume_index = excluded.classification_volume_index,
-                               classification_source = excluded.classification_source
-                         )
-                         UPDATE active_files
-                            SET filename = {}
-                           FROM active_file_identity_parent
-                          WHERE active_files.job_id = {} AND active_files.file_index = {}",
-                        &[
-                            SqlArg::I64(job_id.0 as i64),
-                            SqlArg::I64(job_id.0 as i64),
-                            SqlArg::I64(active_file_index as i64),
-                            SqlArg::Text(identity.source_filename),
-                            SqlArg::Text(identity.current_filename),
-                            SqlArg::OptText(identity.canonical_filename),
-                            SqlArg::OptText(classification_kind),
-                            SqlArg::OptText(classification_set_name),
-                            SqlArg::OptI64(classification_volume_index),
-                            SqlArg::Text(classification_source),
-                            SqlArg::Text(active_filename),
-                            SqlArg::I64(job_id.0 as i64),
-                            SqlArg::I64(active_file_index as i64),
-                        ],
-                    )
-                    .await
-                    .map(|_| ());
-                    weaver_server_base::runtime::perf_probe::record_sql_op(
-                        "postgres",
-                        "save_file_identity",
-                        started.elapsed(),
-                    );
-                    result
-                }
-            }
-        })
-    }
-
-    // Persist a batch of file identities for a single job in ONE transaction.
-    //
-    // This is the bulk counterpart to [`Self::save_file_identity`]: it upserts
-    // every `active_file_identities` row via [`bulk_upsert_file_identities_tx`]
-    // AND performs the sibling `active_files.filename` update that the bulk tx
-    // helper omits, so callers converting a per-identity loop keep identical
-    // semantics. Postgres runs one `UPDATE ... FROM (VALUES ...)` per chunk;
-    // SQLite issues per-row `UPDATE`s inside the same transaction (cheap and
-    // local to the serialized writer).
-    pub fn save_file_identities(
-        &self,
-        job_id: JobId,
-        identities: &[ActiveFileIdentity],
-    ) -> Result<(), StateError> {
-        if identities.is_empty() {
-            return Ok(());
-        }
-
-        let datastore = self.datastore();
-        let identities = identities.to_vec();
-        self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "save_file_identities", |tx| {
-                let identities = identities.clone();
-                Box::pin(async move {
-                    if !active_job_exists_tx(tx, job_id).await? {
-                        return Ok(());
-                    }
-                    bulk_upsert_file_identities_tx(tx, job_id, &identities).await?;
-                    bulk_update_active_files_filenames_tx(tx, job_id, &identities).await?;
-                    Ok(())
-                })
-            })
-            .await
-        })
-    }
-
-    pub(crate) fn set_nzb_pause_release(
-        &self,
-        job_id: JobId,
-        pending: bool,
-    ) -> Result<(), StateError> {
+    fn set_nzb_pause_release(&self, job_id: JobId, pending: bool) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "set_nzb_pause_release", |tx| {
@@ -1606,7 +1753,7 @@ impl Database {
         })
     }
 
-    pub(crate) fn set_nzb_admitted(&self, job_id: JobId, admitted: bool) -> Result<(), StateError> {
+    fn set_nzb_admitted(&self, job_id: JobId, admitted: bool) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "set_nzb_admitted", |tx| {
@@ -1637,6 +1784,9 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jobs::queries::JobsQueries;
+    use crate::operations::recovery::credentials::StoredCredentialQueries;
+    use crate::post_processing::effects::PostProcessingEffectsQueries;
     use std::path::PathBuf;
 
     fn sample_active_job(id: u64) -> ActiveJob {

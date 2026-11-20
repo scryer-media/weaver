@@ -9,8 +9,11 @@
 
 use super::*;
 use crate::post_processing::events::EventContext;
+use crate::post_processing::events::PostProcessingEventsInvalidateQueueScriptAdmissionInternalQueries;
 use crate::post_processing::model::QueueEvent;
 use crate::torrents::FilePriority;
+use crate::torrents::persistence::TorrentsPersistenceInsertTorrentQueries;
+use crate::torrents::queries::TorrentsQueries;
 use crate::torrents::service::disk_room::DiskHeld;
 use crate::torrents::service::settings::WindDown;
 

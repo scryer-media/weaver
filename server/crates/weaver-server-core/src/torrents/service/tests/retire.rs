@@ -2,6 +2,8 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::history::queries::HistoryQueries;
+use crate::torrents::queries::TorrentsQueries;
 
 // A torrent that cannot go on reaches the finished jobs as failed, once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

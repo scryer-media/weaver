@@ -2,6 +2,10 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::post_processing::events::PostProcessingEventsInvalidateQueueScriptAdmissionInternalQueries;
+use crate::proxies::ProxiesDnsPersistenceQueries;
+use crate::proxies::ProxiesNetworkPersistenceQueries;
+use crate::proxies::ProxiesPersistenceQueries;
 use weaver_tunnel::{TunnelProvider, pipe::Purpose};
 
 fn proxy() -> ProxyProfile {

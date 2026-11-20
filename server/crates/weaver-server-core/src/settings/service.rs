@@ -2,8 +2,15 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use crate::StateError;
+use crate::categories::queries::CategoriesQueries;
+use crate::categories::service::CategoriesServiceInternalQueries;
 use crate::jobs::{DuplicateAction, DuplicatePolicy};
 use crate::persistence::Database;
+use crate::proxies::ProxiesNetworkPersistenceQueries;
+use crate::servers::queries::ServersQueries;
+use crate::servers::service::ServersServiceInternalQueries;
+use crate::settings::persistence::SettingsPersistenceQueries;
+use crate::settings::queries::SettingsInternalQueries;
 use crate::settings::record::SettingRecord;
 use crate::settings::{
     Config, DeliveryNamingOverrides, DirectStoreOverrides, Leaf, MetricsConfig, PeerTransport,
@@ -32,10 +39,14 @@ pub(crate) const RETIRED_SETTING_KEYS: &[&str] = &[
 // The torrent listen port. Absent until the first load draws one.
 const BASE_PORT_KEY: &str = "torrent.base_port";
 
-impl Database {
+pub(crate) trait SettingsServiceInternalQueries {
+    fn chosen_base_port(&self) -> Result<u16, StateError>;
+}
+
+impl SettingsServiceInternalQueries for Database {
     // The listen port of a database that names none: drawn at random the
     // first time, then kept, so peers and forwarded ports find it again.
-    pub(crate) fn chosen_base_port(&self) -> Result<u16, StateError> {
+    fn chosen_base_port(&self) -> Result<u16, StateError> {
         use crate::torrents::sessions::{LISTEN_PORTS, random_port};
         let drawn = random_port(LISTEN_PORTS)?;
         let stored = self.setting_or_insert(BASE_PORT_KEY, &drawn.to_string())?;
@@ -43,10 +54,21 @@ impl Database {
             .parse()
             .map_err(|_| StateError::Database(format!("{BASE_PORT_KEY} is not a port: {stored}")))
     }
+}
 
+pub trait SettingsServiceQueries {
+    fn torrent_peer_limit(&self) -> Result<usize, StateError>;
+    fn load_config(&self) -> Result<Config, StateError>;
+    fn save_seeding_policy(&self, policy: Option<&SeedingPolicy>) -> Result<(), StateError>;
+    fn save_upload_cap(&self, cap: Option<u64>) -> Result<(), StateError>;
+    fn save_torrent_config(&self, torrent: &TorrentConfig) -> Result<(), StateError>;
+    fn save_config(&self, config: &Config) -> Result<(), StateError>;
+}
+
+impl SettingsServiceQueries for Database {
     // The most peers a torrent session connects to, as the saved torrent
     // settings set it.
-    pub fn torrent_peer_limit(&self) -> Result<usize, StateError> {
+    fn torrent_peer_limit(&self) -> Result<usize, StateError> {
         let settings: std::collections::HashMap<String, String> = self
             .list_setting_records()?
             .into_iter()
@@ -59,7 +81,7 @@ impl Database {
     }
 
     // Load a full `Config` from the settings and servers tables.
-    pub fn load_config(&self) -> Result<Config, StateError> {
+    fn load_config(&self) -> Result<Config, StateError> {
         let settings: std::collections::HashMap<String, String> = self
             .list_setting_records()?
             .into_iter()
@@ -262,7 +284,7 @@ impl Database {
 
     // Write the global seeding policy; `None` removes it. A goal is kept
     // while it is set; an inherited one is none, as nothing is above.
-    pub fn save_seeding_policy(&self, policy: Option<&SeedingPolicy>) -> Result<(), StateError> {
+    fn save_seeding_policy(&self, policy: Option<&SeedingPolicy>) -> Result<(), StateError> {
         let Some(policy) = policy.map(|policy| policy.at_global()) else {
             for key in SEEDING_KEYS {
                 self.delete_setting(key)?;
@@ -299,14 +321,14 @@ impl Database {
     }
 
     // Write the global upload cap; `None` is none.
-    pub fn save_upload_cap(&self, cap: Option<u64>) -> Result<(), StateError> {
+    fn save_upload_cap(&self, cap: Option<u64>) -> Result<(), StateError> {
         match cap {
             Some(cap) => self.set_setting(SEEDING_UPLOAD_CAP, &cap.to_string()),
             None => self.delete_setting(SEEDING_UPLOAD_CAP),
         }
     }
 
-    pub fn save_torrent_config(&self, torrent: &TorrentConfig) -> Result<(), StateError> {
+    fn save_torrent_config(&self, torrent: &TorrentConfig) -> Result<(), StateError> {
         self.set_setting("torrent.enabled", &torrent.enabled.to_string())?;
         self.set_setting(BASE_PORT_KEY, &torrent.base_port.to_string())?;
         match torrent.announce_port {
@@ -392,7 +414,7 @@ impl Database {
     }
 
     // Save a full `Config` to the settings and servers tables.
-    pub fn save_config(&self, config: &Config) -> Result<(), StateError> {
+    fn save_config(&self, config: &Config) -> Result<(), StateError> {
         self.set_setting("data_dir", &config.data_dir)?;
         if let Some(ref intermediate_dir) = config.intermediate_dir {
             self.set_setting("intermediate_dir", intermediate_dir)?;

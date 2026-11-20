@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::jobs::repository::JobsRepositoryQueries;
+use crate::torrents::persistence::TorrentsPersistenceInsertPlacedTorrentInternalQueries;
+use crate::torrents::queries::TorrentsQueries;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use sha1::{Digest, Sha1};

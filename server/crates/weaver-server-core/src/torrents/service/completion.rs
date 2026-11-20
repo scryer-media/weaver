@@ -14,6 +14,8 @@ use crate::pipeline::graph::status::{Delivery, Failure, shortfall_message};
 use crate::post_processing::model::QueueEvent;
 use crate::torrents::metrics::TorrentEvent;
 use crate::torrents::model::UnpackEnd;
+use crate::torrents::persistence::TorrentsPersistenceInsertPlacedTorrentInternalQueries;
+use crate::torrents::persistence::TorrentsPersistenceInsertTorrentQueries;
 use crate::torrents::relocate::Existing;
 use crate::torrents::store::TorrentStore;
 use crate::torrents::tee::{Tee, place_outputs, remove_unwanted_outputs};

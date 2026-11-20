@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::settings::SettingsSchedulesInternalQueries;
 use chrono::{DateTime, Local, Utc};
 
 use crate::StateError;
@@ -11,12 +12,30 @@ use crate::servers::{
     ServerConfig, ServerDownloadQuotaConfig, ServerDownloadQuotaPeriod, record::ServerRecord,
 };
 
-impl Database {
-    pub fn insert_server(&self, server: &ServerConfig) -> Result<(), StateError> {
+pub trait ServersPersistenceQueries {
+    fn insert_server(&self, server: &ServerConfig) -> Result<(), StateError>;
+    fn insert_server_with_routing(
+        &self,
+        server: &ServerConfig,
+        routing: Option<&crate::proxies::RoutingPolicy>,
+    ) -> Result<(), StateError>;
+    fn update_server(&self, server: &ServerConfig) -> Result<(), StateError>;
+    fn update_server_with_routing(
+        &self,
+        server: &ServerConfig,
+        routing: Option<&crate::proxies::RoutingPolicy>,
+    ) -> Result<(), StateError>;
+    fn update_server_pipelining_depth(&self, id: u32, depth: Option<u8>) -> Result<(), StateError>;
+    fn delete_server(&self, id: u32) -> Result<bool, StateError>;
+    fn delete_server_at(&self, id: u32, now: DateTime<Local>) -> Result<ServerRemoval, StateError>;
+}
+
+impl ServersPersistenceQueries for Database {
+    fn insert_server(&self, server: &ServerConfig) -> Result<(), StateError> {
         self.insert_server_with_routing(server, None)
     }
 
-    pub fn insert_server_with_routing(
+    fn insert_server_with_routing(
         &self,
         server: &ServerConfig,
         routing: Option<&crate::proxies::RoutingPolicy>,
@@ -24,56 +43,11 @@ impl Database {
         self.insert_server_row(server, routing, true)
     }
 
-    // A stored list past the limit, as an older version could leave one, so
-    // the upgrade step that trims it can be tested.
-    #[cfg(test)]
-    pub(crate) fn insert_server_past_limit(&self, server: &ServerConfig) -> Result<(), StateError> {
-        self.insert_server_row(server, None, false)
-    }
-
-    fn insert_server_row(
-        &self,
-        server: &ServerConfig,
-        routing: Option<&crate::proxies::RoutingPolicy>,
-        within_limit: bool,
-    ) -> Result<(), StateError> {
-        use crate::persistence::encryption::encrypt_secret_for_write;
-
-        let datastore = self.datastore();
-        let record = ServerRecord::from_config(server);
-        let encrypted_password = encrypt_secret_for_write(self.encryption_key(), &record.password)
-            .map_err(StateError::Database)?;
-        let args = server_args(record, encrypted_password)?;
-        let routing = routing.cloned();
-        let consumer = crate::proxies::Consumer::Server(server.id);
-        self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "save_consumer_routing", |tx| {
-                let args = args.clone(); let routing = routing.clone();
-                Box::pin(async move {
-            crate::proxies::lock_network(tx).await?;
-            if within_limit {
-                refuse_past_server_limit(tx).await?;
-            }
-            tx.execute(
-                "INSERT INTO servers
-                    (id, host, port, tls, username, password, connections, active, supports_pipelining, pipelining_depth, priority, backfill, retention_days, max_download_speed, download_quota_enabled, download_quota_limit_bytes, download_quota_period, download_quota_reset_time_minutes_local, download_quota_weekly_reset_weekday, download_quota_monthly_reset_day, tls_ca_cert, tls_name_mismatch_certificate_der)
-                 VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
-                &args,
-            )
-            .await?;
-            crate::proxies::persistence::write_routing(tx, consumer, routing.as_ref())
-                .await?;
-            Ok(())
-                })
-            }).await
-        })
-    }
-
-    pub fn update_server(&self, server: &ServerConfig) -> Result<(), StateError> {
+    fn update_server(&self, server: &ServerConfig) -> Result<(), StateError> {
         self.update_server_with_routing(server, None)
     }
 
-    pub fn update_server_with_routing(
+    fn update_server_with_routing(
         &self,
         server: &ServerConfig,
         routing: Option<&crate::proxies::RoutingPolicy>,
@@ -122,11 +96,7 @@ impl Database {
     // Write through one proven BODY pipelining depth. Narrow on purpose: the
     // download runtime learns this while a user may be editing the same row,
     // so it must not carry the rest of the record with it.
-    pub fn update_server_pipelining_depth(
-        &self,
-        id: u32,
-        depth: Option<u8>,
-    ) -> Result<(), StateError> {
+    fn update_server_pipelining_depth(&self, id: u32, depth: Option<u8>) -> Result<(), StateError> {
         let datastore = self.datastore();
         let args = vec![
             SqlArg::OptI64(depth.map(i64::from)),
@@ -143,7 +113,7 @@ impl Database {
         })
     }
 
-    pub fn delete_server(&self, id: u32) -> Result<bool, StateError> {
+    fn delete_server(&self, id: u32) -> Result<bool, StateError> {
         self.delete_server_at(id, Local::now())
             .map(|removal| removal.removed)
     }
@@ -155,11 +125,7 @@ impl Database {
     /// its rows, moved to a consumer id no live server can have, until that
     /// quota's next reset after `now`; housekeeping then drops them. Any
     /// other server's rows go at once.
-    pub fn delete_server_at(
-        &self,
-        id: u32,
-        now: DateTime<Local>,
-    ) -> Result<ServerRemoval, StateError> {
+    fn delete_server_at(&self, id: u32, now: DateTime<Local>) -> Result<ServerRemoval, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "delete_routed_consumer", |tx| {
@@ -193,6 +159,71 @@ impl Database {
                 })
             })
             .await
+        })
+    }
+}
+
+#[cfg(test)]
+pub(crate) trait ServersPersistenceInternalQueries {
+    #[cfg(test)]
+    fn insert_server_past_limit(&self, server: &ServerConfig) -> Result<(), StateError>;
+}
+
+#[cfg(test)]
+impl ServersPersistenceInternalQueries for Database {
+    // A stored list past the limit, as an older version could leave one, so
+    // the upgrade step that trims it can be tested.
+    #[cfg(test)]
+    fn insert_server_past_limit(&self, server: &ServerConfig) -> Result<(), StateError> {
+        self.insert_server_row(server, None, false)
+    }
+}
+
+trait ServersPersistenceLocalQueries {
+    fn insert_server_row(
+        &self,
+        server: &ServerConfig,
+        routing: Option<&crate::proxies::RoutingPolicy>,
+        within_limit: bool,
+    ) -> Result<(), StateError>;
+}
+
+impl ServersPersistenceLocalQueries for Database {
+    fn insert_server_row(
+        &self,
+        server: &ServerConfig,
+        routing: Option<&crate::proxies::RoutingPolicy>,
+        within_limit: bool,
+    ) -> Result<(), StateError> {
+        use crate::persistence::encryption::encrypt_secret_for_write;
+
+        let datastore = self.datastore();
+        let record = ServerRecord::from_config(server);
+        let encrypted_password = encrypt_secret_for_write(self.encryption_key(), &record.password)
+            .map_err(StateError::Database)?;
+        let args = server_args(record, encrypted_password)?;
+        let routing = routing.cloned();
+        let consumer = crate::proxies::Consumer::Server(server.id);
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "save_consumer_routing", |tx| {
+                let args = args.clone(); let routing = routing.clone();
+                Box::pin(async move {
+            crate::proxies::lock_network(tx).await?;
+            if within_limit {
+                refuse_past_server_limit(tx).await?;
+            }
+            tx.execute(
+                "INSERT INTO servers
+                    (id, host, port, tls, username, password, connections, active, supports_pipelining, pipelining_depth, priority, backfill, retention_days, max_download_speed, download_quota_enabled, download_quota_limit_bytes, download_quota_period, download_quota_reset_time_minutes_local, download_quota_weekly_reset_weekday, download_quota_monthly_reset_day, tls_ca_cert, tls_name_mismatch_certificate_der)
+                 VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                &args,
+            )
+            .await?;
+            crate::proxies::persistence::write_routing(tx, consumer, routing.as_ref())
+                .await?;
+            Ok(())
+                })
+            }).await
         })
     }
 }
@@ -395,6 +426,8 @@ pub(crate) fn server_args(
 
 #[cfg(test)]
 mod tests {
+    use crate::servers::persistence::ServersPersistenceQueries;
+    use crate::settings::service::SettingsServiceQueries;
     fn server(id: u32) -> crate::servers::ServerConfig {
         serde_json::from_value(serde_json::json!({
             "id": id, "host": format!("news-{id}.example.test"), "port": 119, "tls": false,

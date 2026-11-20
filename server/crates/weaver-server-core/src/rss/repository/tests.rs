@@ -2,6 +2,9 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::operations::recovery::credentials::StoredCredentialQueries;
+use crate::rss::RssPersistenceQueries;
+use crate::rss::RssQueries;
 
 fn sample_feed(id: u32) -> RssFeedRow {
     RssFeedRow {

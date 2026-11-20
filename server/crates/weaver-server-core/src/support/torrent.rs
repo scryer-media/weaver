@@ -9,6 +9,9 @@
 // host, as in the analysis; words the session or a tracker said are reduced
 // to a constant.
 
+use crate::history::queries::HistoryQueries;
+use crate::history::timeline::HistoryTimelineQueries;
+use crate::torrents::persistence::TorrentsPersistenceInsertPlacedTorrentInternalQueries;
 use std::fmt::Write as _;
 
 use serde::Serialize;

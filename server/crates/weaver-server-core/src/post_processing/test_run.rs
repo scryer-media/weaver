@@ -10,6 +10,10 @@
 // reported and never applied, and nothing about the run is stored: it is kept
 // in memory for as long as it takes to read.
 
+use crate::post_processing::callbacks::PostProcessingCallbacksQueries;
+use crate::post_processing::instances::PostProcessingInstancesInternalQueries;
+use crate::post_processing::instances::PostProcessingInstancesQueries;
+use crate::post_processing::settings::PostProcessingSettingsQueries;
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -711,16 +715,26 @@ fn command_text(directive: &Directive) -> String {
     }
 }
 
-impl Database {
+pub trait PostProcessingTestRunQueries {
+    fn script_test(&self, id: &str) -> Option<ScriptTestSnapshot>;
+    fn cancel_script_test(&self, id: &str) -> bool;
+    fn script_test_when(
+        &self,
+        id: &str,
+        reached: impl Fn(&ScriptTestSnapshot) -> bool + Send,
+    ) -> impl std::future::Future<Output = Option<ScriptTestSnapshot>> + Send;
+}
+
+impl PostProcessingTestRunQueries for Database {
     // The test run `id` as it stands, or `None` when there is no such run or
     // it is no longer kept.
-    pub fn script_test(&self, id: &str) -> Option<ScriptTestSnapshot> {
+    fn script_test(&self, id: &str) -> Option<ScriptTestSnapshot> {
         Some(self.script_runtime.tests.find(id)?.snapshot())
     }
 
     // Ask the test run `id` to stop. False when there is no such run or it
     // has already ended.
-    pub fn cancel_script_test(&self, id: &str) -> bool {
+    fn cancel_script_test(&self, id: &str) -> bool {
         let Some(run) = self.script_runtime.tests.find(id) else {
             return false;
         };
@@ -735,10 +749,10 @@ impl Database {
 
     // The test run `id` once `reached` holds for it, however long that
     // takes, or `None` when there is no such run.
-    pub async fn script_test_when(
+    async fn script_test_when(
         &self,
         id: &str,
-        reached: impl Fn(&ScriptTestSnapshot) -> bool,
+        reached: impl Fn(&ScriptTestSnapshot) -> bool + Send,
     ) -> Option<ScriptTestSnapshot> {
         let run = self.script_runtime.tests.find(id)?;
         loop {

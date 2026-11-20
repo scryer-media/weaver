@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::history::timeline::HistoryTimelineInternalQueries;
+use crate::jobs::persistence::JobsPersistenceInternalQueries;
+use crate::jobs::persistence::JobsPersistenceQueries;
+use crate::jobs::queries::JobsInternalQueries;
+use crate::jobs::queries::JobsQueries;
+use crate::post_processing::settings::PostProcessingSettingsQueries;
+use crate::settings::queries::SettingsInternalQueries;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -2111,6 +2118,16 @@ async fn read_restored(
 
 #[cfg(test)]
 mod tests {
+    use crate::history::timeline::HistoryTimelineQueries;
+    use crate::jobs::JobsServerAttributionPersistenceInternalQueries;
+    use crate::jobs::JobsSupportFactsPersistenceQueries;
+    use crate::jobs::graph_checkpoint::JobsGraphCheckpointInternalQueries;
+    use crate::jobs::persistence::JobsPersistenceInternalQueries;
+    use crate::jobs::persistence::JobsPersistenceQueries;
+    use crate::jobs::queries::JobsInternalQueries;
+    use crate::jobs::queries::JobsQueries;
+    use crate::settings::persistence::SettingsPersistenceQueries;
+    use crate::settings::queries::SettingsQueries;
     use std::collections::HashSet;
 
     use super::*;

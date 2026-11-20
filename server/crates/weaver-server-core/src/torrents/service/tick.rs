@@ -9,6 +9,7 @@ use crate::jobs::JobId;
 use crate::proxies::{ResolvedBy, TorrentScope};
 use crate::settings::SeedingPolicy;
 use crate::torrents::metrics::FetchOutcome;
+use crate::torrents::persistence::TorrentsPersistenceInsertTorrentQueries;
 use crate::torrents::sessions::{
     OPENING, RouteFailure, RouteKey, RoutePlan, SessionError, SessionView,
 };

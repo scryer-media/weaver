@@ -3,6 +3,9 @@
 
 use super::*;
 use crate::JobHistoryRow;
+use crate::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
+use crate::jobs::persistence::JobsPersistenceInternalQueries;
+use crate::settings::persistence::SettingsPersistenceQueries;
 
 #[test]
 fn a_tag_is_trimmed_and_has_no_comma() {

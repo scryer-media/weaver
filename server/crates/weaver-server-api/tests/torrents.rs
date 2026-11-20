@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use weaver_server_core::history::queries::HistoryQueries;
+use weaver_server_core::post_processing::settings::PostProcessingSettingsQueries;
+use weaver_server_core::proxies::ProxiesDnsPersistenceQueries;
+use weaver_server_core::proxies::ProxiesPersistenceQueries;
+use weaver_server_core::tags::TagsQueries;
+use weaver_server_core::torrents::persistence::TorrentsPersistenceInsertTorrentQueries;
+use weaver_server_core::torrents::queries::TorrentsQueries;
 mod common;
 
 use std::future::Future;

@@ -8,8 +8,14 @@ use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::proxies::{Consumer, TorrentScope};
 
-impl Database {
-    pub fn insert_category(&self, category: &CategoryConfig) -> Result<(), StateError> {
+pub trait CategoriesPersistenceQueries {
+    fn insert_category(&self, category: &CategoryConfig) -> Result<(), StateError>;
+    fn update_category(&self, category: &CategoryConfig) -> Result<(), StateError>;
+    fn delete_category(&self, id: u32) -> Result<bool, StateError>;
+}
+
+impl CategoriesPersistenceQueries for Database {
+    fn insert_category(&self, category: &CategoryConfig) -> Result<(), StateError> {
         let datastore = self.datastore();
         let args = CategoryRecord::from_config(category).into_args()?;
         self.run_sql_blocking(async move {
@@ -25,7 +31,7 @@ impl Database {
         })
     }
 
-    pub fn update_category(&self, category: &CategoryConfig) -> Result<(), StateError> {
+    fn update_category(&self, category: &CategoryConfig) -> Result<(), StateError> {
         let datastore = self.datastore();
         // The id binds first in `into_args`, last here.
         let mut args = CategoryRecord::from_config(category).into_args()?;
@@ -45,7 +51,7 @@ impl Database {
 
     // Returns whether the category existed. Its torrent route goes with it,
     // so a category given its id later starts on the default route.
-    pub fn delete_category(&self, id: u32) -> Result<bool, StateError> {
+    fn delete_category(&self, id: u32) -> Result<bool, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "delete_category", |tx| {

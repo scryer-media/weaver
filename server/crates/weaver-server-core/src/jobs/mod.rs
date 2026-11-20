@@ -2,12 +2,16 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 mod archive_password;
+pub(crate) use archive_password::JobsArchivePasswordInternalQueries;
 pub mod assembly;
 pub mod class;
 pub mod diagnostic_names;
 pub mod diagnostic_tables;
 pub mod download_summary;
 mod download_summary_persistence;
+#[cfg(test)]
+pub(crate) use download_summary_persistence::JobsDownloadSummaryPersistenceInternalQueries;
+pub use download_summary_persistence::JobsDownloadSummaryPersistenceQueries;
 pub mod duplicate;
 pub mod duplicate_persistence;
 pub mod error;
@@ -25,9 +29,11 @@ pub mod report;
 pub mod repository;
 pub mod server_attribution;
 mod server_attribution_persistence;
+pub(crate) use server_attribution_persistence::JobsServerAttributionPersistenceInternalQueries;
 pub mod service;
 pub mod support_facts;
 mod support_facts_persistence;
+pub use support_facts_persistence::JobsSupportFactsPersistenceQueries;
 pub mod working_dir;
 
 pub use weaver_server_base::jobs::ids;

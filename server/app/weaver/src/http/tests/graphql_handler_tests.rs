@@ -6,6 +6,8 @@
 
 use super::super::graphql::refusal;
 use super::*;
+use weaver_server_core::auth::api_keys::AuthApiKeysQueries;
+use weaver_server_core::auth::repository::AuthRepositoryQueries;
 use weaver_server_core::security::RuntimeSecurityConfig;
 
 const VALID_KEY: &str = "fixture-graphql-key";

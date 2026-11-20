@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::servers::persistence::ServersPersistenceQueries;
 
 impl Pipeline {
     pub(in crate::pipeline) fn bandwidth_reservation_estimate(decoded_bytes: u32) -> u64 {

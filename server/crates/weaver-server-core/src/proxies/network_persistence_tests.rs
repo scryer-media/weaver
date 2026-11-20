@@ -2,7 +2,12 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::operations::backup::OperationsBackupLogicalInternalQueries;
+use crate::operations::backup::OperationsBackupQueries;
+use crate::proxies::ProxiesPersistenceQueries;
 use crate::proxies::{Consumer, Failover, ProxyKind, ProxySecrets, RouteLeg, TorrentScope};
+use crate::servers::persistence::ServersPersistenceQueries;
+use crate::settings::repository::SettingsRepositoryQueries;
 
 // The code of the refusal a write was turned away with. A storage fault has
 // none, so a refusal that degrades into one fails here.

@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::proxies::ProxiesPersistenceQueries;
 
 #[tokio::test]
 async fn http3_profile_test_never_falls_back_to_tcp_when_dns_is_missing() {

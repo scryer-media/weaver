@@ -402,10 +402,43 @@ pub(crate) async fn delete_job_tags_tx(
     take_tags_tx(tx, job_ids, None).await
 }
 
-impl Database {
+pub trait TagsQueries {
+    fn tag_snapshot(&self) -> Result<Arc<TagSnapshot>, StateError>;
+    fn cached_tag_snapshot(&self) -> Option<Arc<TagSnapshot>>;
+    fn tag_revision(&self) -> u64;
+    fn subscribe_tag_changes(&self) -> watch::Receiver<u64>;
+    fn job_tags(&self, job_id: JobId) -> Result<Vec<String>, StateError>;
+    fn made_tags(&self) -> Result<Vec<String>, StateError>;
+    fn create_tags<'a>(&self, tags: impl IntoIterator<Item = &'a str>) -> Result<(), StateError>;
+    fn delete_tags<'a>(&self, tags: impl IntoIterator<Item = &'a str>) -> Result<(), StateError>;
+    fn add_job_tags<'a>(
+        &self,
+        job_ids: &[JobId],
+        tags: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), StateError>;
+    fn remove_job_tags<'a>(
+        &self,
+        job_ids: &[JobId],
+        tags: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), StateError>;
+    fn set_job_tags<'a>(
+        &self,
+        job_ids: &[JobId],
+        tags: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), StateError>;
+    fn tag_new_job<'a>(
+        &self,
+        job_id: JobId,
+        tags: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), StateError>;
+    fn untag_job(&self, job_id: JobId) -> Result<(), StateError>;
+    fn tag_counts(&self) -> Result<Vec<TagCount>, StateError>;
+}
+
+impl TagsQueries for Database {
     /// Every tag and each job's tags. Read from the database once, then from
     /// memory until the tags next change.
-    pub fn tag_snapshot(&self) -> Result<Arc<TagSnapshot>, StateError> {
+    fn tag_snapshot(&self) -> Result<Arc<TagSnapshot>, StateError> {
         let generation = {
             let state = self.tags.lock();
             if let Some(snapshot) = &state.snapshot {
@@ -452,24 +485,24 @@ impl Database {
 
     /// The tags as last read, when nothing changed them since: read from
     /// memory alone, never from the database.
-    pub fn cached_tag_snapshot(&self) -> Option<Arc<TagSnapshot>> {
+    fn cached_tag_snapshot(&self) -> Option<Arc<TagSnapshot>> {
         self.tags.lock().snapshot.clone()
     }
 
     /// The revision of the tags: it moves on every change to them.
-    pub fn tag_revision(&self) -> u64 {
+    fn tag_revision(&self) -> u64 {
         *self.tags.changes.borrow()
     }
 
     /// Wakes on every change to the tags.
-    pub fn subscribe_tag_changes(&self) -> watch::Receiver<u64> {
+    fn subscribe_tag_changes(&self) -> watch::Receiver<u64> {
         self.tags.changes.subscribe()
     }
 
     /// One job's tags, in [`tag_order`]: what a script for the job is told.
     /// From the tags in memory when nothing changed them since, else read
     /// by the job's id on the table's key, never every job's.
-    pub fn job_tags(&self, job_id: JobId) -> Result<Vec<String>, StateError> {
+    fn job_tags(&self, job_id: JobId) -> Result<Vec<String>, StateError> {
         if let Some(snapshot) = self.cached_tag_snapshot() {
             return Ok(snapshot.of(job_id).to_vec());
         }
@@ -493,7 +526,7 @@ impl Database {
 
     /// Every tag made, in [`tag_order`]. From the tags in memory when
     /// nothing changed them since, else read from the made tags alone.
-    pub fn made_tags(&self) -> Result<Vec<String>, StateError> {
+    fn made_tags(&self) -> Result<Vec<String>, StateError> {
         if let Some(snapshot) = self.cached_tag_snapshot() {
             return Ok(snapshot.made().to_vec());
         }
@@ -508,33 +541,8 @@ impl Database {
         Ok(sorted_tags(made))
     }
 
-    // Makes one change to the tags in one transaction, then tells every
-    // watcher the tags changed.
-    fn change_tags(
-        &self,
-        op_name: &'static str,
-        job_ids: &[JobId],
-        change: Change,
-    ) -> Result<(), StateError> {
-        let ids = stored_ids(job_ids)?;
-        let datastore = self.datastore();
-        let result = self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, op_name, |tx| {
-                let ids = ids.clone();
-                let change = change.clone();
-                Box::pin(async move { change.apply(tx, ids).await })
-            })
-            .await
-        });
-        self.tags.changed();
-        result
-    }
-
     /// Makes each tag in `tags` that is a tag (qBittorrent `createTags`).
-    pub fn create_tags<'a>(
-        &self,
-        tags: impl IntoIterator<Item = &'a str>,
-    ) -> Result<(), StateError> {
+    fn create_tags<'a>(&self, tags: impl IntoIterator<Item = &'a str>) -> Result<(), StateError> {
         let tags = clean_tags(tags);
         if tags.is_empty() {
             return Ok(());
@@ -544,10 +552,7 @@ impl Database {
 
     /// Deletes each tag in `tags`, taking it off every job that carries it
     /// (qBittorrent `deleteTags`).
-    pub fn delete_tags<'a>(
-        &self,
-        tags: impl IntoIterator<Item = &'a str>,
-    ) -> Result<(), StateError> {
+    fn delete_tags<'a>(&self, tags: impl IntoIterator<Item = &'a str>) -> Result<(), StateError> {
         let tags = clean_tags(tags);
         if tags.is_empty() {
             return Ok(());
@@ -557,7 +562,7 @@ impl Database {
 
     /// Puts `tags` on each job Weaver has among `job_ids`, making any tag
     /// not made yet (qBittorrent `addTags`). An id of no job is passed over.
-    pub fn add_job_tags<'a>(
+    fn add_job_tags<'a>(
         &self,
         job_ids: &[JobId],
         tags: impl IntoIterator<Item = &'a str>,
@@ -571,7 +576,7 @@ impl Database {
 
     /// Takes `tags` off each job among `job_ids`; with no tag given, takes
     /// every tag off them (qBittorrent `removeTags`). The tags stay made.
-    pub fn remove_job_tags<'a>(
+    fn remove_job_tags<'a>(
         &self,
         job_ids: &[JobId],
         tags: impl IntoIterator<Item = &'a str>,
@@ -591,7 +596,7 @@ impl Database {
     /// Gives each job Weaver has among `job_ids` exactly `tags`: the tags it
     /// carries and `tags` does not name come off, the rest go on, making any
     /// not made yet (qBittorrent `setTags`).
-    pub fn set_job_tags<'a>(
+    fn set_job_tags<'a>(
         &self,
         job_ids: &[JobId],
         tags: impl IntoIterator<Item = &'a str>,
@@ -605,7 +610,7 @@ impl Database {
 
     /// Puts the tags a job is submitted with on it as it is added, before
     /// it is in the queue's tables.
-    pub fn tag_new_job<'a>(
+    fn tag_new_job<'a>(
         &self,
         job_id: JobId,
         tags: impl IntoIterator<Item = &'a str>,
@@ -618,14 +623,14 @@ impl Database {
     }
 
     /// Takes every tag off a job that was never added after all.
-    pub fn untag_job(&self, job_id: JobId) -> Result<(), StateError> {
+    fn untag_job(&self, job_id: JobId) -> Result<(), StateError> {
         self.change_tags("untag_job", &[job_id], Change::Clear)
     }
 
     /// Every tag made, with how many jobs carry it, in [`tag_order`]. From
     /// the tags in memory when nothing changed them since, else counted in
     /// the database, a row per tag, never a row per job.
-    pub fn tag_counts(&self) -> Result<Vec<TagCount>, StateError> {
+    fn tag_counts(&self) -> Result<Vec<TagCount>, StateError> {
         if let Some(snapshot) = self.cached_tag_snapshot() {
             return Ok(snapshot.counts());
         }
@@ -656,6 +661,39 @@ impl Database {
                 name,
             })
             .collect())
+    }
+}
+
+trait TagsLocalQueries {
+    fn change_tags(
+        &self,
+        op_name: &'static str,
+        job_ids: &[JobId],
+        change: Change,
+    ) -> Result<(), StateError>;
+}
+
+impl TagsLocalQueries for Database {
+    // Makes one change to the tags in one transaction, then tells every
+    // watcher the tags changed.
+    fn change_tags(
+        &self,
+        op_name: &'static str,
+        job_ids: &[JobId],
+        change: Change,
+    ) -> Result<(), StateError> {
+        let ids = stored_ids(job_ids)?;
+        let datastore = self.datastore();
+        let result = self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, op_name, |tx| {
+                let ids = ids.clone();
+                let change = change.clone();
+                Box::pin(async move { change.apply(tx, ids).await })
+            })
+            .await
+        });
+        self.tags.changed();
+        result
     }
 }
 

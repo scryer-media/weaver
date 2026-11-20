@@ -4,6 +4,12 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use weaver_server_core::auth::api_keys::AuthApiKeysQueries;
+use weaver_server_core::auth::repository::AuthRepositoryQueries;
+use weaver_server_core::post_processing::callbacks::PostProcessingCallbacksQueries;
+use weaver_server_core::settings::SettingsSchedulesQueries;
+use weaver_server_core::settings::persistence::SettingsPersistenceQueries;
+use weaver_server_core::settings::queries::SettingsQueries;
 
 use tokio::sync::{RwLock, broadcast};
 use tracing::{debug, error, info, warn};
@@ -1029,12 +1035,15 @@ fn prepare_credentialless_legacy_migration(
 mod migration_tests {
     use super::prepare_credentialless_legacy_migration;
     use weaver_server_core::Database;
+    use weaver_server_core::auth::repository::AuthRepositoryQueries;
     use weaver_server_core::auth::repository::{
         SETUP_COMPLETED_SETTING_KEY, SETUP_PENDING_SETTING_KEY,
     };
     use weaver_server_core::security::{
         AUTHENTICATED_POLICY_REVISION, SETTING_SECURITY_POLICY_REVISION,
     };
+    use weaver_server_core::settings::persistence::SettingsPersistenceQueries;
+    use weaver_server_core::settings::queries::SettingsQueries;
 
     #[test]
     fn credentialless_legacy_migration_resumes_after_restart_without_override() {

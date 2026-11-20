@@ -4,6 +4,8 @@
 use super::manifest::io_err;
 use super::{BackupInfo, BackupService, BackupServiceError, BackupTrigger};
 use crate::persistence::encryption::{decrypt_value, encrypt_value};
+use crate::settings::persistence::SettingsPersistenceQueries;
+use crate::settings::queries::SettingsQueries;
 use chrono::{DateTime, Duration, Local, LocalResult, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -334,6 +336,9 @@ impl BackupService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operations::recovery::credentials::StoredCredentialQueries;
+    use crate::settings::persistence::SettingsPersistenceQueries;
+    use crate::settings::queries::SettingsQueries;
     use chrono::{FixedOffset, NaiveDate, Timelike};
 
     #[test]

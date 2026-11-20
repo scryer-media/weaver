@@ -5,6 +5,7 @@
 // tests, with that thread held by the test: what the loop does while a
 // job's bytes wait for the disk, and what it does once they are down.
 
+use crate::history::queries::HistoryQueries;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;

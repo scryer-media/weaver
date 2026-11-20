@@ -2,6 +2,9 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
+use crate::history::queries::HistoryQueries;
+use crate::jobs::repository::JobsRepositoryQueries;
 use crate::{ArchiveHistoryOutcome as Outcome, ArchiveHistoryResult};
 
 const NOW: i64 = 1_800_000_000;

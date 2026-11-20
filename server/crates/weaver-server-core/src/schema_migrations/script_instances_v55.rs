@@ -669,8 +669,12 @@ mod tests {
     use super::super::{embedded_catalog, embedded_payload_bytes, replay_catalog_into_fresh_db};
     use super::*;
     use crate::Database;
+    use crate::post_processing::instances::PostProcessingInstancesQueries;
     use crate::post_processing::instances::{InstanceTrigger, ScriptInstance, resolve_instances};
     use crate::post_processing::model::{GlobalScriptsRun, ScriptEventLabel};
+    use crate::post_processing::secrets::PostProcessingSecretsQueries;
+    use crate::post_processing::settings::PostProcessingSettingsQueries;
+    use crate::settings::queries::SettingsQueries;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::fs;
     fn bare(root: &Path, name: &str, header: &str) {

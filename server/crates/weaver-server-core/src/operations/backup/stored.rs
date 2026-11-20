@@ -3,6 +3,8 @@
 
 use super::manifest::{BACKUP_FORMAT_VERSION, io_err};
 use super::{BackupArtifact, BackupService, BackupServiceError};
+use crate::settings::persistence::SettingsPersistenceQueries;
+use crate::settings::queries::SettingsQueries;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};

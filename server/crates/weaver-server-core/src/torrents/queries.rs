@@ -500,61 +500,43 @@ pub(crate) async fn torrent_by_infohash_tx(
     .transpose()
 }
 
-impl Database {
+pub(crate) trait TorrentsInternalQueries {
+    fn torrent_read(&self);
+    fn torrent_rows(&self) -> Result<(Vec<JobId>, Vec<JobId>), StateError>;
+    fn torrent_job_ids_among(
+        &self,
+        job_ids: &[JobId],
+    ) -> Result<std::collections::BTreeSet<JobId>, StateError>;
+    fn torrent_list_ids(
+        &self,
+        filter: &TorrentListFilter,
+        offset: usize,
+        limit: Option<usize>,
+    ) -> Result<Vec<JobId>, StateError>;
+    fn count_torrent_list(&self, filter: &TorrentListFilter) -> Result<usize, StateError>;
+    fn torrent_page_sizes(
+        &self,
+        after: Option<JobId>,
+        through: JobId,
+        limit: usize,
+    ) -> Result<Vec<(JobId, u64)>, StateError>;
+    fn torrent_sizes_of(&self, jobs: &[JobId]) -> Result<Vec<(JobId, u64)>, StateError>;
+    fn restored_torrents(&self, jobs: &[JobId]) -> Result<Vec<RestoredTorrent>, StateError>;
+    fn last_torrent_job(&self) -> Result<Option<JobId>, StateError>;
+}
+
+impl TorrentsInternalQueries for Database {
     // One read of the rows a torrent's restore or attach reads, counted
     // under test so a test pins how many a boot makes.
-    pub(crate) fn torrent_read(&self) {
+    fn torrent_read(&self) {
         #[cfg(test)]
         self.torrent_reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    pub fn get_torrent(&self, job_id: JobId) -> Result<Option<TorrentRecord>, StateError> {
-        let key = self.encryption_key().cloned();
-        let datastore = self.datastore();
-        self.run_sql_blocking_read(async move {
-            SqlRuntime::fetch_optional(
-                datastore.read_exec(),
-                &format!("SELECT {TORRENT_COLUMNS} FROM torrents WHERE job_id = {{}}"),
-                &[SqlArg::I64(job_id.0 as i64)],
-            )
-            .await?
-            .as_ref()
-            .map(|row| torrent_from_row(row, key.as_ref()))
-            .transpose()
-        })
-    }
-
-    // The torrent going by any of `infohashes`.
-    pub fn get_torrent_by_infohash(
-        &self,
-        infohashes: &[Infohash],
-    ) -> Result<Option<TorrentRecord>, StateError> {
-        let key = self.encryption_key().cloned();
-        let datastore = self.datastore();
-        let (filter, args) = infohash_filter(infohashes);
-        self.run_sql_blocking_read(async move {
-            SqlRuntime::fetch_optional(
-                datastore.read_exec(),
-                &format!("SELECT {TORRENT_COLUMNS} FROM torrents WHERE {filter}"),
-                &args,
-            )
-            .await?
-            .as_ref()
-            .map(|row| torrent_from_row(row, key.as_ref()))
-            .transpose()
-        })
-    }
-
-    // The job of every torrent a start brings back, read alone: never one a
-    // removal left retiring, which goes to history instead.
-    pub fn torrent_job_ids(&self) -> Result<Vec<JobId>, StateError> {
-        Ok(self.torrent_rows()?.0)
-    }
-
     // Every torrent row's job, those that come back live and those a
     // removal left retiring, in one read.
-    pub(crate) fn torrent_rows(&self) -> Result<(Vec<JobId>, Vec<JobId>), StateError> {
+    fn torrent_rows(&self) -> Result<(Vec<JobId>, Vec<JobId>), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
@@ -579,7 +561,7 @@ impl Database {
 
     // Which of `job_ids` have a torrent row: one statement per bind-sized
     // chunk, each served by the torrents' key.
-    pub(crate) fn torrent_job_ids_among(
+    fn torrent_job_ids_among(
         &self,
         job_ids: &[JobId],
     ) -> Result<std::collections::BTreeSet<JobId>, StateError> {
@@ -615,7 +597,7 @@ impl Database {
     /// arms walks an index in that order; named hashes are read in chunks
     /// that fit the engine's binds, a page of them at most as many torrents
     /// as named.
-    pub(crate) fn torrent_list_ids(
+    fn torrent_list_ids(
         &self,
         filter: &TorrentListFilter,
         offset: usize,
@@ -651,10 +633,7 @@ impl Database {
     }
 
     /// How many torrents `filter` keeps, counted in the statement.
-    pub(crate) fn count_torrent_list(
-        &self,
-        filter: &TorrentListFilter,
-    ) -> Result<usize, StateError> {
+    fn count_torrent_list(&self, filter: &TorrentListFilter) -> Result<usize, StateError> {
         let datastore = self.datastore();
         let filter = filter.clone();
         self.run_sql_blocking_read(async move {
@@ -671,154 +650,12 @@ impl Database {
         })
     }
 
-    // Every torrent, in the order they were added.
-    pub fn list_torrents(&self) -> Result<Vec<TorrentRecord>, StateError> {
-        self.torrent_read();
-        let key = self.encryption_key().cloned();
-        let datastore = self.datastore();
-        self.run_sql_blocking_read(async move {
-            let rows = SqlRuntime::fetch_all(
-                datastore.read_exec(),
-                &format!(
-                    "SELECT {TORRENT_COLUMNS} FROM torrents WHERE retiring IS NULL \
-                     ORDER BY added_at_ms, job_id"
-                ),
-                &[],
-            )
-            .await?;
-            rows.iter()
-                .map(|row| torrent_from_row(row, key.as_ref()))
-                .collect()
-        })
-    }
-
-    // The torrents of one category, or with `None` those with no category, in
-    // the order they were added.
-    pub fn list_torrents_by_category(
-        &self,
-        category_id: Option<u32>,
-    ) -> Result<Vec<TorrentRecord>, StateError> {
-        let key = self.encryption_key().cloned();
-        let datastore = self.datastore();
-        self.run_sql_blocking_read(async move {
-            let rows = match category_id {
-                Some(id) => {
-                    SqlRuntime::fetch_all(
-                        datastore.read_exec(),
-                        &format!(
-                            "SELECT {TORRENT_COLUMNS} FROM torrents WHERE category_id = {{}}
-                              AND retiring IS NULL ORDER BY added_at_ms, job_id"
-                        ),
-                        &[SqlArg::I64(i64::from(id))],
-                    )
-                    .await?
-                }
-                None => {
-                    SqlRuntime::fetch_all(
-                        datastore.read_exec(),
-                        &format!(
-                            "SELECT {TORRENT_COLUMNS} FROM torrents WHERE category_id IS NULL
-                              AND retiring IS NULL ORDER BY added_at_ms, job_id"
-                        ),
-                        &[],
-                    )
-                    .await?
-                }
-            };
-            rows.iter()
-                .map(|row| torrent_from_row(row, key.as_ref()))
-                .collect()
-        })
-    }
-
-    // The operator's level for each file of a torrent, in the metainfo's
-    // order, as far as one was stored; a file past them is normal.
-    pub fn torrent_file_priorities(&self, job_id: JobId) -> Result<Vec<FilePriority>, StateError> {
-        self.torrent_read();
-        let datastore = self.datastore();
-        self.run_sql_blocking_read(async move {
-            let row = SqlRuntime::fetch_optional(
-                datastore.read_exec(),
-                "SELECT file_priorities FROM torrents WHERE job_id = {}",
-                &[SqlArg::I64(job_id.0 as i64)],
-            )
-            .await?;
-            row.as_ref()
-                .map_or_else(|| Ok(Vec::new()), file_priorities_from_row)
-        })
-    }
-
-    // Its URLs are sealed, so they are put in order once opened: by tier,
-    // then URL. One that does not open fails the read.
-    pub fn list_torrent_trackers(&self, job_id: JobId) -> Result<Vec<TrackerEntry>, StateError> {
-        self.torrent_read();
-        let key = self.encryption_key().cloned();
-        let datastore = self.datastore();
-        self.run_sql_blocking_read(async move {
-            let rows = SqlRuntime::fetch_all(
-                datastore.read_exec(),
-                "SELECT tier, url, named_by FROM torrent_trackers WHERE job_id = {}",
-                &[SqlArg::I64(job_id.0 as i64)],
-            )
-            .await?;
-            let mut trackers = rows
-                .iter()
-                .map(|row| {
-                    tracker_entry(row, key.as_ref())?.map_err(|error| {
-                        StateError::Database(format!(
-                            "a tracker URL of torrent {} does not decrypt: {error}",
-                            job_id.0
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            trackers.sort_by(|a, b| (a.tier, &a.url).cmp(&(b.tier, &b.url)));
-            Ok(trackers)
-        })
-    }
-
-    // Every host a torrent has announced to, in order.
-    pub fn list_tracker_hosts(&self) -> Result<Vec<String>, StateError> {
-        let datastore = self.datastore();
-        self.run_sql_blocking_read(async move {
-            let rows = SqlRuntime::fetch_all(
-                datastore.read_exec(),
-                "SELECT host FROM tracker_hosts ORDER BY host",
-                &[],
-            )
-            .await?;
-            rows.iter().map(|row| row.text("host")).collect()
-        })
-    }
-
-    pub fn get_torrent_counters(
-        &self,
-        job_id: JobId,
-    ) -> Result<Option<TorrentCounters>, StateError> {
-        self.torrent_read();
-        let datastore = self.datastore();
-        self.run_sql_blocking_read(async move {
-            SqlRuntime::fetch_optional(
-                datastore.read_exec(),
-                "SELECT uploaded_bytes, downloaded_bytes, active_duration_s,
-                        last_seen_complete_ms, finished_duration_s, last_activity_ms,
-                        consecutive_seeding_s, failed_bytes, redundant_bytes
-                   FROM torrent_counters WHERE job_id = {}",
-                &[SqlArg::I64(job_id.0 as i64)],
-            )
-            .await?
-            .as_ref()
-            .map(counters_from_row)
-            .transpose()
-        })
-    }
-
     // The jobs of the next stored torrents after `after`, none past
     // `through` nor left retiring by a removal, `limit` at most, each with
     // the bytes its stored metainfo takes: what a start reads before a
     // page, by the table's key, to bound the page by its bytes and not its
     // rows alone. No metainfo is read for it.
-    pub(crate) fn torrent_page_sizes(
+    fn torrent_page_sizes(
         &self,
         after: Option<JobId>,
         through: JobId,
@@ -846,7 +683,7 @@ impl Database {
     }
 
     // `torrent_page_sizes` for the jobs named, by job id.
-    pub(crate) fn torrent_sizes_of(&self, jobs: &[JobId]) -> Result<Vec<(JobId, u64)>, StateError> {
+    fn torrent_sizes_of(&self, jobs: &[JobId]) -> Result<Vec<(JobId, u64)>, StateError> {
         self.torrent_read();
         let named: Vec<i64> = jobs.iter().map(|job_id| job_id.0 as i64).collect();
         let datastore = self.datastore();
@@ -879,10 +716,7 @@ impl Database {
     // A row that does not read fails the read, as [`Self::list_torrents`]
     // does; a level, a seed-mode column, a tracker URL or a part of the
     // ledger that does not read is that torrent's alone.
-    pub(crate) fn restored_torrents(
-        &self,
-        jobs: &[JobId],
-    ) -> Result<Vec<RestoredTorrent>, StateError> {
+    fn restored_torrents(&self, jobs: &[JobId]) -> Result<Vec<RestoredTorrent>, StateError> {
         self.torrent_read();
         let key = self.encryption_key().cloned();
         let datastore = self.datastore();
@@ -1015,7 +849,7 @@ impl Database {
 
     // The last job a torrent row has: a start reads the torrents as far as
     // it, by the table's key. None with no torrent.
-    pub(crate) fn last_torrent_job(&self) -> Result<Option<JobId>, StateError> {
+    fn last_torrent_job(&self) -> Result<Option<JobId>, StateError> {
         self.torrent_read();
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
@@ -1034,6 +868,208 @@ impl Database {
                         .map_err(|_| corrupt("job", last))
                 })
                 .transpose()
+        })
+    }
+}
+
+pub trait TorrentsQueries {
+    fn get_torrent(&self, job_id: JobId) -> Result<Option<TorrentRecord>, StateError>;
+    fn get_torrent_by_infohash(
+        &self,
+        infohashes: &[Infohash],
+    ) -> Result<Option<TorrentRecord>, StateError>;
+    fn torrent_job_ids(&self) -> Result<Vec<JobId>, StateError>;
+    fn list_torrents(&self) -> Result<Vec<TorrentRecord>, StateError>;
+    fn list_torrents_by_category(
+        &self,
+        category_id: Option<u32>,
+    ) -> Result<Vec<TorrentRecord>, StateError>;
+    fn torrent_file_priorities(&self, job_id: JobId) -> Result<Vec<FilePriority>, StateError>;
+    fn list_torrent_trackers(&self, job_id: JobId) -> Result<Vec<TrackerEntry>, StateError>;
+    fn list_tracker_hosts(&self) -> Result<Vec<String>, StateError>;
+    fn get_torrent_counters(&self, job_id: JobId) -> Result<Option<TorrentCounters>, StateError>;
+}
+
+impl TorrentsQueries for Database {
+    fn get_torrent(&self, job_id: JobId) -> Result<Option<TorrentRecord>, StateError> {
+        let key = self.encryption_key().cloned();
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                &format!("SELECT {TORRENT_COLUMNS} FROM torrents WHERE job_id = {{}}"),
+                &[SqlArg::I64(job_id.0 as i64)],
+            )
+            .await?
+            .as_ref()
+            .map(|row| torrent_from_row(row, key.as_ref()))
+            .transpose()
+        })
+    }
+
+    // The torrent going by any of `infohashes`.
+    fn get_torrent_by_infohash(
+        &self,
+        infohashes: &[Infohash],
+    ) -> Result<Option<TorrentRecord>, StateError> {
+        let key = self.encryption_key().cloned();
+        let datastore = self.datastore();
+        let (filter, args) = infohash_filter(infohashes);
+        self.run_sql_blocking_read(async move {
+            SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                &format!("SELECT {TORRENT_COLUMNS} FROM torrents WHERE {filter}"),
+                &args,
+            )
+            .await?
+            .as_ref()
+            .map(|row| torrent_from_row(row, key.as_ref()))
+            .transpose()
+        })
+    }
+
+    // The job of every torrent a start brings back, read alone: never one a
+    // removal left retiring, which goes to history instead.
+    fn torrent_job_ids(&self) -> Result<Vec<JobId>, StateError> {
+        Ok(self.torrent_rows()?.0)
+    }
+
+    // Every torrent, in the order they were added.
+    fn list_torrents(&self) -> Result<Vec<TorrentRecord>, StateError> {
+        self.torrent_read();
+        let key = self.encryption_key().cloned();
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                &format!(
+                    "SELECT {TORRENT_COLUMNS} FROM torrents WHERE retiring IS NULL \
+                     ORDER BY added_at_ms, job_id"
+                ),
+                &[],
+            )
+            .await?;
+            rows.iter()
+                .map(|row| torrent_from_row(row, key.as_ref()))
+                .collect()
+        })
+    }
+
+    // The torrents of one category, or with `None` those with no category, in
+    // the order they were added.
+    fn list_torrents_by_category(
+        &self,
+        category_id: Option<u32>,
+    ) -> Result<Vec<TorrentRecord>, StateError> {
+        let key = self.encryption_key().cloned();
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let rows = match category_id {
+                Some(id) => {
+                    SqlRuntime::fetch_all(
+                        datastore.read_exec(),
+                        &format!(
+                            "SELECT {TORRENT_COLUMNS} FROM torrents WHERE category_id = {{}}
+                              AND retiring IS NULL ORDER BY added_at_ms, job_id"
+                        ),
+                        &[SqlArg::I64(i64::from(id))],
+                    )
+                    .await?
+                }
+                None => {
+                    SqlRuntime::fetch_all(
+                        datastore.read_exec(),
+                        &format!(
+                            "SELECT {TORRENT_COLUMNS} FROM torrents WHERE category_id IS NULL
+                              AND retiring IS NULL ORDER BY added_at_ms, job_id"
+                        ),
+                        &[],
+                    )
+                    .await?
+                }
+            };
+            rows.iter()
+                .map(|row| torrent_from_row(row, key.as_ref()))
+                .collect()
+        })
+    }
+
+    // The operator's level for each file of a torrent, in the metainfo's
+    // order, as far as one was stored; a file past them is normal.
+    fn torrent_file_priorities(&self, job_id: JobId) -> Result<Vec<FilePriority>, StateError> {
+        self.torrent_read();
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let row = SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT file_priorities FROM torrents WHERE job_id = {}",
+                &[SqlArg::I64(job_id.0 as i64)],
+            )
+            .await?;
+            row.as_ref()
+                .map_or_else(|| Ok(Vec::new()), file_priorities_from_row)
+        })
+    }
+
+    // Its URLs are sealed, so they are put in order once opened: by tier,
+    // then URL. One that does not open fails the read.
+    fn list_torrent_trackers(&self, job_id: JobId) -> Result<Vec<TrackerEntry>, StateError> {
+        self.torrent_read();
+        let key = self.encryption_key().cloned();
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT tier, url, named_by FROM torrent_trackers WHERE job_id = {}",
+                &[SqlArg::I64(job_id.0 as i64)],
+            )
+            .await?;
+            let mut trackers = rows
+                .iter()
+                .map(|row| {
+                    tracker_entry(row, key.as_ref())?.map_err(|error| {
+                        StateError::Database(format!(
+                            "a tracker URL of torrent {} does not decrypt: {error}",
+                            job_id.0
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            trackers.sort_by(|a, b| (a.tier, &a.url).cmp(&(b.tier, &b.url)));
+            Ok(trackers)
+        })
+    }
+
+    // Every host a torrent has announced to, in order.
+    fn list_tracker_hosts(&self) -> Result<Vec<String>, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT host FROM tracker_hosts ORDER BY host",
+                &[],
+            )
+            .await?;
+            rows.iter().map(|row| row.text("host")).collect()
+        })
+    }
+
+    fn get_torrent_counters(&self, job_id: JobId) -> Result<Option<TorrentCounters>, StateError> {
+        self.torrent_read();
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT uploaded_bytes, downloaded_bytes, active_duration_s,
+                        last_seen_complete_ms, finished_duration_s, last_activity_ms,
+                        consecutive_seeding_s, failed_bytes, redundant_bytes
+                   FROM torrent_counters WHERE job_id = {}",
+                &[SqlArg::I64(job_id.0 as i64)],
+            )
+            .await?
+            .as_ref()
+            .map(counters_from_row)
+            .transpose()
         })
     }
 }

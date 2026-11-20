@@ -6,6 +6,14 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use weaver_server_core::categories::queries::CategoriesQueries;
+use weaver_server_core::post_processing::settings::PostProcessingSettingsQueries;
+use weaver_server_core::rss::RssPersistenceQueries;
+use weaver_server_core::rss::RssQueries;
+use weaver_server_core::settings::repository::SettingsRepositoryQueries;
+use weaver_server_core::settings::service::SettingsServiceQueries;
+use weaver_server_core::torrents::persistence::TorrentsPersistenceInsertTorrentQueries;
+use weaver_server_core::torrents::queries::TorrentsQueries;
 
 use axum::Router;
 use axum::body::{Body, to_bytes};

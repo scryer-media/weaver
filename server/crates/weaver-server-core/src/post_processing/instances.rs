@@ -7,6 +7,8 @@
 // What is stored here is what runs. A script's own header can fill a form, but
 // nothing is ever read back out of it into a saved instance.
 
+use crate::post_processing::events::PostProcessingEventsInvalidateQueueScriptAdmissionInternalQueries;
+use crate::post_processing::settings::PostProcessingSettingsQueries;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -656,7 +658,20 @@ impl ValidatedInstance {
     }
 }
 
-impl Database {
+trait PostProcessingInstancesLocalQueries {
+    fn seal_input(&self, value: &str) -> Result<String, ScriptInstanceError>;
+    fn validate_script_instance(
+        &self,
+        draft: ScriptInstanceDraft,
+    ) -> Result<ValidatedInstance, ScriptInstanceError>;
+    fn load_script_instances(
+        &self,
+        only: Option<String>,
+    ) -> Result<Vec<ScriptInstance>, StateError>;
+    fn script_dispatch_jobs(&self) -> Result<DispatchJobs, StateError>;
+}
+
+impl PostProcessingInstancesLocalQueries for Database {
     // Seal the value of a secret of an instance's own. Refused without an
     // encryption key, as storing a named secret is.
     fn seal_input(&self, value: &str) -> Result<String, ScriptInstanceError> {
@@ -765,11 +780,6 @@ impl Database {
             blocking: draft.blocking,
             timeout_seconds,
         })
-    }
-
-    // Every instance, in run order.
-    pub fn script_instances(&self) -> Result<Vec<ScriptInstance>, StateError> {
-        self.load_script_instances(None)
     }
 
     // Every instance, or only the one with id `only`. A secret input carries
@@ -901,49 +911,6 @@ impl Database {
         })
     }
 
-    pub fn script_instance(&self, id: &str) -> Result<Option<ScriptInstance>, StateError> {
-        Ok(self
-            .load_script_instances(Some(id.to_owned()))?
-            .into_iter()
-            .next())
-    }
-
-    // The instances `event` starts for a download in `category`, in run order.
-    pub fn script_instances_for(
-        &self,
-        event: &ScriptEventLabel,
-        category: Option<&str>,
-    ) -> Result<Vec<ScriptInstance>, StateError> {
-        let snapshot = self.script_dispatch_jobs()?;
-        Ok(resolve_instances(
-            &snapshot.jobs,
-            event,
-            category,
-            snapshot.mode,
-        ))
-    }
-
-    // An actor-safe lookup: a cold cache is reported without touching SQL.
-    pub(crate) fn cached_script_instances_for(
-        &self,
-        event: &ScriptEventLabel,
-        category: Option<&str>,
-    ) -> Option<Vec<ScriptInstance>> {
-        let cache = self
-            .script_runtime
-            .dispatch_jobs
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        cache
-            .1
-            .as_ref()
-            .map(|snapshot| resolve_instances(&snapshot.jobs, event, category, snapshot.mode))
-    }
-
-    pub(crate) fn warm_script_dispatch_jobs(&self) -> Result<(), StateError> {
-        self.script_dispatch_jobs().map(|_| ())
-    }
-
     fn script_dispatch_jobs(&self) -> Result<DispatchJobs, StateError> {
         loop {
             let revision = {
@@ -971,8 +938,67 @@ impl Database {
             }
         }
     }
+}
 
-    pub fn create_script_instance(
+pub trait PostProcessingInstancesQueries {
+    fn script_instances(&self) -> Result<Vec<ScriptInstance>, StateError>;
+    fn script_instance(&self, id: &str) -> Result<Option<ScriptInstance>, StateError>;
+    fn script_instances_for(
+        &self,
+        event: &ScriptEventLabel,
+        category: Option<&str>,
+    ) -> Result<Vec<ScriptInstance>, StateError>;
+    fn create_script_instance(
+        &self,
+        draft: ScriptInstanceDraft,
+    ) -> Result<ScriptInstance, ScriptInstanceError>;
+    fn update_script_instance(
+        &self,
+        id: &str,
+        draft: ScriptInstanceDraft,
+    ) -> Result<ScriptInstance, ScriptInstanceError>;
+    fn delete_script_instance(&self, id: &str) -> Result<bool, StateError>;
+    fn reorder_script_instances(&self, ids: &[String]) -> Result<(), StateError>;
+    fn disable_script_instances(&self) -> Result<(), StateError>;
+    fn feed_script_instance_ids(&self, feed_id: u32) -> Result<Vec<String>, StateError>;
+    fn feed_script_instance_ids_by_feed(&self) -> Result<BTreeMap<u32, Vec<String>>, StateError>;
+    fn set_feed_script_instances(
+        &self,
+        feed_id: u32,
+        ids: &[String],
+    ) -> Result<(), ScriptInstanceError>;
+    fn delete_feed_script_instances(&self, feed_id: u32) -> Result<(), StateError>;
+}
+
+impl PostProcessingInstancesQueries for Database {
+    // Every instance, in run order.
+    fn script_instances(&self) -> Result<Vec<ScriptInstance>, StateError> {
+        self.load_script_instances(None)
+    }
+
+    fn script_instance(&self, id: &str) -> Result<Option<ScriptInstance>, StateError> {
+        Ok(self
+            .load_script_instances(Some(id.to_owned()))?
+            .into_iter()
+            .next())
+    }
+
+    // The instances `event` starts for a download in `category`, in run order.
+    fn script_instances_for(
+        &self,
+        event: &ScriptEventLabel,
+        category: Option<&str>,
+    ) -> Result<Vec<ScriptInstance>, StateError> {
+        let snapshot = self.script_dispatch_jobs()?;
+        Ok(resolve_instances(
+            &snapshot.jobs,
+            event,
+            category,
+            snapshot.mode,
+        ))
+    }
+
+    fn create_script_instance(
         &self,
         draft: ScriptInstanceDraft,
     ) -> Result<ScriptInstance, ScriptInstanceError> {
@@ -1010,7 +1036,7 @@ impl Database {
             .ok_or(ScriptInstanceError::NotFound)
     }
 
-    pub fn update_script_instance(
+    fn update_script_instance(
         &self,
         id: &str,
         draft: ScriptInstanceDraft,
@@ -1105,7 +1131,7 @@ impl Database {
 
     // Remove an instance and everything that hangs off it. Returns whether
     // there was one.
-    pub fn delete_script_instance(&self, id: &str) -> Result<bool, StateError> {
+    fn delete_script_instance(&self, id: &str) -> Result<bool, StateError> {
         let datastore = self.datastore();
         let target = id.to_string();
         let result = self.run_sql_blocking(async move {
@@ -1145,7 +1171,7 @@ impl Database {
 
     // Put `ids` in this order. Instances that are not named keep their place
     // after the ones that are.
-    pub fn reorder_script_instances(&self, ids: &[String]) -> Result<(), StateError> {
+    fn reorder_script_instances(&self, ids: &[String]) -> Result<(), StateError> {
         let datastore = self.datastore();
         let ids = ids.to_vec();
         let result = self.run_sql_blocking(async move {
@@ -1183,7 +1209,7 @@ impl Database {
     }
 
     // Stop every instance from running without losing what was saved in it.
-    pub fn disable_script_instances(&self) -> Result<(), StateError> {
+    fn disable_script_instances(&self) -> Result<(), StateError> {
         let datastore = self.datastore();
         let result = self.run_sql_blocking(async move {
             SqlRuntime::execute(
@@ -1198,10 +1224,137 @@ impl Database {
         result
     }
 
+    // The instances attached to a feed, in the order they run.
+    fn feed_script_instance_ids(&self, feed_id: u32) -> Result<Vec<String>, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT instance_id FROM feed_scripts WHERE feed_id = {}
+                  ORDER BY run_order, instance_id",
+                &[SqlArg::I64(i64::from(feed_id))],
+            )
+            .await?
+            .into_iter()
+            .map(|row| row.text("instance_id"))
+            .collect()
+        })
+    }
+
+    // Every feed's attached instances, in the order they run.
+    fn feed_script_instance_ids_by_feed(&self) -> Result<BTreeMap<u32, Vec<String>>, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let mut by_feed = BTreeMap::<u32, Vec<String>>::new();
+            for row in SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT feed_id, instance_id FROM feed_scripts
+                  ORDER BY feed_id, run_order, instance_id",
+                &[],
+            )
+            .await?
+            {
+                if let Ok(feed_id) = u32::try_from(row.i64("feed_id")?) {
+                    by_feed
+                        .entry(feed_id)
+                        .or_default()
+                        .push(row.text("instance_id")?);
+                }
+            }
+            Ok(by_feed)
+        })
+    }
+
+    // Replace the instances attached to a feed. Each must be a feed instance.
+    fn set_feed_script_instances(
+        &self,
+        feed_id: u32,
+        ids: &[String],
+    ) -> Result<(), ScriptInstanceError> {
+        let instances = self.script_instances()?;
+        let mut seen = BTreeSet::new();
+        for id in ids {
+            let instance = instances
+                .iter()
+                .find(|instance| &instance.id == id)
+                .ok_or(ScriptInstanceError::NotFound)?;
+            if instance.trigger != InstanceTrigger::Feed {
+                return Err(ScriptInstanceError::Invalid(
+                    "only a feed script job can be attached to a feed",
+                ));
+            }
+            if !seen.insert(id) {
+                return Err(ScriptInstanceError::Invalid(
+                    "a script job can be attached to a feed once",
+                ));
+            }
+        }
+        let datastore = self.datastore();
+        let ids = ids.to_vec();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "set_feed_script_instances", |tx| {
+                let ids = ids.clone();
+                Box::pin(async move { set_feed_scripts_tx(tx, feed_id, &ids).await })
+            })
+            .await
+        })?;
+        Ok(())
+    }
+
+    // Forget a deleted feed's attachments.
+    fn delete_feed_script_instances(&self, feed_id: u32) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.write_exec(),
+                "DELETE FROM feed_scripts WHERE feed_id = {}",
+                &[SqlArg::I64(i64::from(feed_id))],
+            )
+            .await?;
+            Ok(())
+        })
+    }
+}
+
+pub(crate) trait PostProcessingInstancesInternalQueries {
+    fn cached_script_instances_for(
+        &self,
+        event: &ScriptEventLabel,
+        category: Option<&str>,
+    ) -> Option<Vec<ScriptInstance>>;
+    fn warm_script_dispatch_jobs(&self) -> Result<(), StateError>;
+    fn script_instance_run_inputs(
+        &self,
+        id: &str,
+    ) -> Result<Option<Vec<ResolvedOption>>, StateError>;
+}
+
+impl PostProcessingInstancesInternalQueries for Database {
+    // An actor-safe lookup: a cold cache is reported without touching SQL.
+    fn cached_script_instances_for(
+        &self,
+        event: &ScriptEventLabel,
+        category: Option<&str>,
+    ) -> Option<Vec<ScriptInstance>> {
+        let cache = self
+            .script_runtime
+            .dispatch_jobs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        cache
+            .1
+            .as_ref()
+            .map(|snapshot| resolve_instances(&snapshot.jobs, event, category, snapshot.mode))
+    }
+
+    fn warm_script_dispatch_jobs(&self) -> Result<(), StateError> {
+        self.script_dispatch_jobs().map(|_| ())
+    }
+
     // An instance's inputs as a run receives them, secrets included: a
     // secret of its own is handed over exactly as a linked one is. `None`
     // when the instance is gone.
-    pub(crate) fn script_instance_run_inputs(
+    fn script_instance_run_inputs(
         &self,
         id: &str,
     ) -> Result<Option<Vec<ResolvedOption>>, StateError> {
@@ -1268,99 +1421,6 @@ impl Database {
             inputs.push(ResolvedOption::new(name, value));
         }
         Ok(Some(inputs))
-    }
-
-    // The instances attached to a feed, in the order they run.
-    pub fn feed_script_instance_ids(&self, feed_id: u32) -> Result<Vec<String>, StateError> {
-        let datastore = self.datastore();
-        self.run_sql_blocking_read(async move {
-            SqlRuntime::fetch_all(
-                datastore.read_exec(),
-                "SELECT instance_id FROM feed_scripts WHERE feed_id = {}
-                  ORDER BY run_order, instance_id",
-                &[SqlArg::I64(i64::from(feed_id))],
-            )
-            .await?
-            .into_iter()
-            .map(|row| row.text("instance_id"))
-            .collect()
-        })
-    }
-
-    // Every feed's attached instances, in the order they run.
-    pub fn feed_script_instance_ids_by_feed(
-        &self,
-    ) -> Result<BTreeMap<u32, Vec<String>>, StateError> {
-        let datastore = self.datastore();
-        self.run_sql_blocking_read(async move {
-            let mut by_feed = BTreeMap::<u32, Vec<String>>::new();
-            for row in SqlRuntime::fetch_all(
-                datastore.read_exec(),
-                "SELECT feed_id, instance_id FROM feed_scripts
-                  ORDER BY feed_id, run_order, instance_id",
-                &[],
-            )
-            .await?
-            {
-                if let Ok(feed_id) = u32::try_from(row.i64("feed_id")?) {
-                    by_feed
-                        .entry(feed_id)
-                        .or_default()
-                        .push(row.text("instance_id")?);
-                }
-            }
-            Ok(by_feed)
-        })
-    }
-
-    // Replace the instances attached to a feed. Each must be a feed instance.
-    pub fn set_feed_script_instances(
-        &self,
-        feed_id: u32,
-        ids: &[String],
-    ) -> Result<(), ScriptInstanceError> {
-        let instances = self.script_instances()?;
-        let mut seen = BTreeSet::new();
-        for id in ids {
-            let instance = instances
-                .iter()
-                .find(|instance| &instance.id == id)
-                .ok_or(ScriptInstanceError::NotFound)?;
-            if instance.trigger != InstanceTrigger::Feed {
-                return Err(ScriptInstanceError::Invalid(
-                    "only a feed script job can be attached to a feed",
-                ));
-            }
-            if !seen.insert(id) {
-                return Err(ScriptInstanceError::Invalid(
-                    "a script job can be attached to a feed once",
-                ));
-            }
-        }
-        let datastore = self.datastore();
-        let ids = ids.to_vec();
-        self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "set_feed_script_instances", |tx| {
-                let ids = ids.clone();
-                Box::pin(async move { set_feed_scripts_tx(tx, feed_id, &ids).await })
-            })
-            .await
-        })?;
-        Ok(())
-    }
-
-    // Forget a deleted feed's attachments.
-    pub fn delete_feed_script_instances(&self, feed_id: u32) -> Result<(), StateError> {
-        let datastore = self.datastore();
-        self.run_sql_blocking(async move {
-            SqlRuntime::execute(
-                datastore.write_exec(),
-                "DELETE FROM feed_scripts WHERE feed_id = {}",
-                &[SqlArg::I64(i64::from(feed_id))],
-            )
-            .await?;
-            Ok(())
-        })
     }
 }
 

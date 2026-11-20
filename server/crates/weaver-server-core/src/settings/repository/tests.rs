@@ -2,6 +2,17 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::categories::persistence::CategoriesPersistenceQueries;
+use crate::categories::queries::CategoriesQueries;
+use crate::categories::service::CategoriesServiceInternalQueries;
+use crate::proxies::ProxiesPersistenceQueries;
+use crate::servers::persistence::ServersPersistenceQueries;
+use crate::servers::queries::ServersQueries;
+use crate::settings::SettingsArchivePasswordsQueries;
+use crate::settings::archive_passwords::SettingsArchivePasswordsInternalQueries;
+use crate::settings::persistence::SettingsPersistenceQueries;
+use crate::settings::queries::SettingsQueries;
+use crate::settings::service::SettingsServiceQueries;
 
 #[test]
 fn settings_roundtrip() {

@@ -9,6 +9,8 @@
 // `lib.rs`, and the block that calls [`apply_pre_0_9_bind_compat_shim`] in the
 // serve command — with nothing else to unpick.
 
+use crate::settings::persistence::SettingsPersistenceQueries;
+use crate::settings::queries::SettingsQueries;
 use tracing::warn;
 
 use crate::{Database, StateError};
@@ -99,6 +101,10 @@ pub fn apply_pre_0_9_bind_compat_shim(
 
 #[cfg(test)]
 mod tests {
+    use crate::operations::recovery::credentials::StoredCredentialQueries;
+    use crate::settings::persistence::SettingsPersistenceQueries;
+    use crate::settings::queries::SettingsQueries;
+    use crate::settings::service::SettingsServiceQueries;
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::*;

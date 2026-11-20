@@ -4,6 +4,7 @@
 use crate::StateError;
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx, StoreDatastore};
+use crate::settings::queries::SettingsQueries;
 use weaver_server_base::jobs::ids::JobId;
 
 const NEXT_JOB_ID_SETTING_KEY: &str = "next_job_id";
@@ -28,11 +29,24 @@ pub struct AuthenticatedNetworkAccessUpdate {
     pub bind_address: NetworkBindAddressUpdate,
 }
 
-impl Database {
+pub trait SettingsPersistenceQueries {
+    fn update_authenticated_network_access(
+        &self,
+        update: &AuthenticatedNetworkAccessUpdate,
+    ) -> Result<(), StateError>;
+    fn set_setting(&self, key: &str, value: &str) -> Result<(), StateError>;
+    fn setting_or_insert(&self, key: &str, value: &str) -> Result<String, StateError>;
+    fn delete_setting(&self, key: &str) -> Result<(), StateError>;
+    fn delete_setting_if_value(&self, key: &str, expected: &str) -> Result<(), StateError>;
+    fn initialize_next_job_id_counter(&self) -> Result<u64, StateError>;
+    fn reserve_next_job_id(&self) -> Result<JobId, StateError>;
+}
+
+impl SettingsPersistenceQueries for Database {
     // Persist the authenticated browser policy in one transaction. The live
     // runtime snapshot is intentionally updated by the caller only after this
     // returns successfully.
-    pub fn update_authenticated_network_access(
+    fn update_authenticated_network_access(
         &self,
         update: &AuthenticatedNetworkAccessUpdate,
     ) -> Result<(), StateError> {
@@ -91,7 +105,7 @@ impl Database {
         })
     }
 
-    pub fn set_setting(&self, key: &str, value: &str) -> Result<(), StateError> {
+    fn set_setting(&self, key: &str, value: &str) -> Result<(), StateError> {
         let datastore = self.datastore();
         let key = key.to_string();
         let value = value.to_string();
@@ -109,7 +123,7 @@ impl Database {
 
     // The value stored under `key`, storing `value` first when it holds
     // none, in one statement, so two first loads keep the same one.
-    pub fn setting_or_insert(&self, key: &str, value: &str) -> Result<String, StateError> {
+    fn setting_or_insert(&self, key: &str, value: &str) -> Result<String, StateError> {
         let datastore = self.datastore();
         let (stored, value) = (key.to_string(), value.to_string());
         self.run_sql_blocking(async move {
@@ -126,7 +140,7 @@ impl Database {
             .ok_or_else(|| StateError::Database(format!("setting {key} was not stored")))
     }
 
-    pub fn delete_setting(&self, key: &str) -> Result<(), StateError> {
+    fn delete_setting(&self, key: &str) -> Result<(), StateError> {
         let datastore = self.datastore();
         let key = key.to_string();
         self.run_sql_blocking(async move {
@@ -144,7 +158,7 @@ impl Database {
     // in one statement. Closes the read-then-delete TOCTOU a two-round-trip
     // value-compare would leave open (a concurrent writer replacing the value
     // between the read and the delete).
-    pub fn delete_setting_if_value(&self, key: &str, expected: &str) -> Result<(), StateError> {
+    fn delete_setting_if_value(&self, key: &str, expected: &str) -> Result<(), StateError> {
         let datastore = self.datastore();
         let key = key.to_string();
         let expected = expected.to_string();
@@ -159,7 +173,7 @@ impl Database {
         })
     }
 
-    pub fn initialize_next_job_id_counter(&self) -> Result<u64, StateError> {
+    fn initialize_next_job_id_counter(&self) -> Result<u64, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             let next_job_id = next_job_id_floor_target(&datastore).await?;
@@ -177,7 +191,7 @@ impl Database {
         })
     }
 
-    pub fn reserve_next_job_id(&self) -> Result<JobId, StateError> {
+    fn reserve_next_job_id(&self) -> Result<JobId, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "reserve_next_job_id", |tx| {

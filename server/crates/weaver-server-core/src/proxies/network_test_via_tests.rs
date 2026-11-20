@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::proxies::ProxiesPersistenceQueries;
 use crate::proxies::SYSTEM_DNS_PROFILE_ID;
 use std::net::IpAddr;
 use weaver_tunnel::test_support::{

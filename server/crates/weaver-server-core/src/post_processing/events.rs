@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::history::timeline::HistoryTimelineQueries;
+use crate::jobs::persistence::JobsPersistenceInternalQueries;
+use crate::post_processing::callbacks::PostProcessingCallbacksQueries;
+use crate::post_processing::effects::PostProcessingEffectsQueries;
+use crate::post_processing::instances::PostProcessingInstancesInternalQueries;
+use crate::post_processing::instances::PostProcessingInstancesQueries;
+use crate::post_processing::settings::PostProcessingSettingsQueries;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -287,11 +294,15 @@ impl ScriptRuntime {
     }
 }
 
-impl Database {
+pub(crate) trait PostProcessingEventsScriptStartsInternalQueries {
+    fn script_starts(&self) -> u64;
+}
+
+impl PostProcessingEventsScriptStartsInternalQueries for Database {
     // How many times a job has gained a script. Taken before
     // `jobs_with_live_script_events`, an unchanged count says no job has
     // gained one since that look.
-    pub(crate) fn script_starts(&self) -> u64 {
+    fn script_starts(&self) -> u64 {
         self.script_runtime
             .starts
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -1100,8 +1111,61 @@ fn apply_directive(
     Ok(())
 }
 
-impl Database {
-    pub(crate) fn invalidate_queue_script_admission(&self) {
+pub(crate) trait PostProcessingEventsInvalidateQueueScriptAdmissionInternalQueries {
+    fn invalidate_queue_script_admission(&self);
+    fn queue_scripts_possible(&self) -> bool;
+    fn queue_barrier_possible(&self, job_id: u64) -> bool;
+    fn admit_queue_script_event(&self, context: EventContext, barrier: bool) -> Admitted;
+    fn admit_queue_script_events(
+        &self,
+        context: EventContext,
+        barrier: bool,
+    ) -> (Admitted, Option<Admitted>);
+    fn admit_download_end(
+        &self,
+        context: EventContext,
+        occurrence: u64,
+    ) -> (Admitted, Option<Admitted>);
+    fn jobs_with_live_script_events(
+        &self,
+        job_ids: &[u64],
+    ) -> Result<std::collections::HashSet<u64>, StateError>;
+    fn subscribe_script_effects(&self) -> watch::Receiver<()>;
+    fn notify_script_effects(&self, job_id: u64);
+    fn take_script_effects(&self) -> BTreeSet<u64>;
+    fn cancel_event_scripts_of(&self, job_ids: &std::collections::HashSet<u64>);
+    fn latest_download_end(
+        &self,
+        job_id: u64,
+        event: QueueEvent,
+    ) -> Result<Option<(String, u64)>, StateError>;
+    fn notify_script_events_changed(&self);
+    #[cfg(test)]
+    fn finish_script_event_for_test(&self, run_id: &str) -> Result<(), StateError>;
+    #[cfg(test)]
+    fn queued_script_events(&self, event: QueueEvent) -> Vec<EventContext>;
+    #[cfg(test)]
+    fn queued_script_events_once(
+        &self,
+        event: QueueEvent,
+        count: usize,
+    ) -> impl std::future::Future<Output = Vec<EventContext>> + Send;
+    #[cfg(test)]
+    fn admitted_so_far(&self) -> impl std::future::Future<Output = ()> + Send;
+    #[cfg(test)]
+    fn enable_queue_scripts_for_test(&self, root: &std::path::Path);
+    #[cfg(test)]
+    fn tag_reporting_queue_script_for_test(&self, out: &std::path::Path) -> PathBuf;
+    #[cfg(test)]
+    fn run_next_queue_event_for_test(
+        &self,
+        supervisor: &std::path::Path,
+    ) -> impl std::future::Future<Output = Option<EventContext>> + Send;
+    fn script_event_error(&self, run_id: &str) -> Result<Option<String>, StateError>;
+}
+
+impl PostProcessingEventsInvalidateQueueScriptAdmissionInternalQueries for Database {
+    fn invalidate_queue_script_admission(&self) {
         let mut cache = self
             .script_runtime
             .admission_hint
@@ -1135,7 +1199,7 @@ impl Database {
         }
     }
 
-    pub(crate) fn queue_scripts_possible(&self) -> bool {
+    fn queue_scripts_possible(&self) -> bool {
         !matches!(
             self.script_runtime
                 .admission_hint
@@ -1146,7 +1210,7 @@ impl Database {
         )
     }
 
-    pub(crate) fn queue_barrier_possible(&self, job_id: u64) -> bool {
+    fn queue_barrier_possible(&self, job_id: u64) -> bool {
         self.queue_scripts_possible()
             || self
                 .script_runtime
@@ -1159,17 +1223,13 @@ impl Database {
     // the actor. Only one pending file notification per job is necessary.
     // A job's ADDED, DOWNLOADED or DELETED event brings its JOB_ twin, as
     // `admit_queue_script_events` says.
-    pub(crate) fn admit_queue_script_event(
-        &self,
-        context: EventContext,
-        barrier: bool,
-    ) -> Admitted {
+    fn admit_queue_script_event(&self, context: EventContext, barrier: bool) -> Admitted {
         self.admit_queue_script_events(context, barrier).0
     }
 
     // Admit `context`, and right after it the generic event the job raises
     // beside it, if any: the admission of each, the generic one second.
-    pub(crate) fn admit_queue_script_events(
+    fn admit_queue_script_events(
         &self,
         context: EventContext,
         barrier: bool,
@@ -1181,7 +1241,7 @@ impl Database {
     // that end, `occurrence`: one is admitted only past the occurrence of
     // the job's latest end of that name, so a second end of the same
     // occurrence runs nothing and returns the run of the first.
-    pub(crate) fn admit_download_end(
+    fn admit_download_end(
         &self,
         context: EventContext,
         occurrence: u64,
@@ -1189,6 +1249,332 @@ impl Database {
         self.admit_queue_script_events_at(context, false, occurrence)
     }
 
+    // Which of `job_ids` have a script event being admitted, queued, started
+    // or running: what `wait_for_job_events_stopped` would wait on, asked of
+    // a whole list in one statement per bind-sized chunk.
+    fn jobs_with_live_script_events(
+        &self,
+        job_ids: &[u64],
+    ) -> Result<std::collections::HashSet<u64>, StateError> {
+        // Each registry is walked once, not once per asked job.
+        let held = self.jobs_with_scripts_held();
+        let mut live = job_ids
+            .iter()
+            .copied()
+            .filter(|id| held.contains(id))
+            .collect::<std::collections::HashSet<_>>();
+        if job_ids.is_empty() {
+            return Ok(live);
+        }
+        let datastore = self.datastore();
+        let ids = job_ids.iter().map(|id| *id as i64).collect::<Vec<_>>();
+        let queued = self.run_sql_blocking_read(async move {
+            let mut queued = Vec::new();
+            for chunk in ids.chunks(crate::persistence::sql_runtime::max_rows_for_engine(
+                datastore.engine(),
+                1,
+            )) {
+                let placeholders = vec!["{}"; chunk.len()].join(", ");
+                let args = chunk.iter().copied().map(SqlArg::I64).collect::<Vec<_>>();
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    &format!(
+                        "SELECT DISTINCT job_id FROM script_event_queue \
+                         WHERE job_id IN ({placeholders}) AND state IN ('queued', 'started')"
+                    ),
+                    &args,
+                )
+                .await?;
+                for row in rows {
+                    queued.push(row.i64("job_id")? as u64);
+                }
+            }
+            Ok(queued)
+        })?;
+        live.extend(queued);
+        Ok(live)
+    }
+
+    fn subscribe_script_effects(&self) -> watch::Receiver<()> {
+        let (sender, receiver) = watch::channel(());
+        self.script_runtime
+            .effects
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .1 = Some(sender);
+        receiver
+    }
+
+    fn notify_script_effects(&self, job_id: u64) {
+        let mut effects = self
+            .script_runtime
+            .effects
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if effects.1.is_some() && effects.0.insert(job_id) {
+            effects
+                .1
+                .as_ref()
+                .expect("subscriber checked")
+                .send_replace(());
+        }
+    }
+
+    fn take_script_effects(&self) -> BTreeSet<u64> {
+        std::mem::take(
+            &mut self
+                .script_runtime
+                .effects
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .0,
+        )
+    }
+
+    // `cancel_event_scripts` for every job of `job_ids`, walking each
+    // registry once for the whole list.
+    fn cancel_event_scripts_of(&self, job_ids: &std::collections::HashSet<u64>) {
+        if !job_ids.is_empty() {
+            self.cancel_event_scripts_where(|job| job_ids.contains(&job));
+        }
+    }
+
+    // The run of the job's latest `event`, one of the names of its
+    // download's end, and that end's occurrence.
+    fn latest_download_end(
+        &self,
+        job_id: u64,
+        event: QueueEvent,
+    ) -> Result<Option<(String, u64)>, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            SqlRuntime::fetch_optional(datastore.read_exec(), "SELECT run_id, occurrence FROM script_event_queue WHERE job_id = {} AND event = {} ORDER BY seq DESC LIMIT 1", &[SqlArg::I64(job_id as i64), SqlArg::Text(event.as_str().into())]).await?
+                .map(|row| Ok((row.text("run_id")?, u64::try_from(row.i64("occurrence")?).unwrap_or_default()))).transpose()
+        })
+    }
+
+    fn notify_script_events_changed(&self) {
+        self.script_runtime.changed.notify_waiters();
+    }
+
+    #[cfg(test)]
+    fn finish_script_event_for_test(&self, run_id: &str) -> Result<(), StateError> {
+        self.finish_script_event(run_id)?;
+        self.script_runtime.changed.notify_waiters();
+        Ok(())
+    }
+
+    // Every `event` the queue holds, in the order queued.
+    #[cfg(test)]
+    fn queued_script_events(&self, event: QueueEvent) -> Vec<EventContext> {
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT payload FROM script_event_queue WHERE event = {} ORDER BY seq",
+                &[SqlArg::Text(event.as_str().into())],
+            )
+            .await?
+            .iter()
+            .map(|row| row.text("payload"))
+            .collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap()
+        .iter()
+        .map(|payload| serde_json::from_str(payload).unwrap())
+        .collect()
+    }
+
+    // Every `event` the queue holds, once it holds at least `count`.
+    #[cfg(test)]
+    async fn queued_script_events_once(
+        &self,
+        event: QueueEvent,
+        count: usize,
+    ) -> Vec<EventContext> {
+        let mut queued = Vec::new();
+        wait_for_test_script_change(self, || {
+            queued = self.queued_script_events(event);
+            queued.len() >= count
+        })
+        .await;
+        queued
+    }
+
+    // Returns once every event raised before it is admitted: admissions
+    // are taken in the order raised, so once one raised after them is in,
+    // they are.
+    #[cfg(test)]
+    async fn admitted_so_far(&self) {
+        let marker = EventContext {
+            job_id: None,
+            event: ScriptEventLabel::Queue(QueueEvent::UrlCompleted),
+            category: None,
+            cwd: PathBuf::new(),
+            env: BTreeMap::new(),
+            facts: CompatibilityFacts::default(),
+            instances: None,
+            scratch: None,
+        };
+        let _ = self.admit_queue_script_event(marker, false).await;
+    }
+
+    // Queue scripts on, with one instance of `queue.sh` for every queue
+    // event, under `root`. None runs: the queue keeps every event raised
+    // as it was queued.
+    #[cfg(test)]
+    fn enable_queue_scripts_for_test(&self, root: &std::path::Path) {
+        self.script_runtime
+            .worker_active
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let scripts = self
+            .initialize_post_processing_script_directory(root, None)
+            .unwrap();
+        std::fs::write(
+            scripts.join("queue.sh"),
+            "#!/bin/sh\n### NZBGET QUEUE SCRIPT ###\nexit 0\n",
+        )
+        .unwrap();
+        self.save_post_processing_settings(&super::model::PostProcessingSettings {
+            execution_enabled: true,
+            ..Default::default()
+        })
+        .unwrap();
+        for event in QueueEvent::ALL {
+            self.create_script_instance(super::instances::ScriptInstanceDraft::new(
+                super::model::ScriptName::new("queue.sh").unwrap(),
+                InstanceTrigger::Queue(event),
+            ))
+            .unwrap();
+        }
+    }
+
+    // Make every queue instance's `queue.sh` write what `NZBNA_TAGS` tells
+    // it, or `unset`, to a file under `out` named for the job id, or `none`
+    // for a jobless event. Returns the supervisor a run must be given: this
+    // test binary, run as the real one.
+    #[cfg(test)]
+    fn tag_reporting_queue_script_for_test(&self, out: &std::path::Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(out).unwrap();
+        let scripts = self.post_processing_script_directory().unwrap();
+        let script = scripts.join("queue.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n### NZBGET QUEUE SCRIPT ###\nprintf '%s' \"${{NZBNA_TAGS-unset}}\" > '{}'/\"${{NZBNA_NZBID-none}}\"\n",
+                out.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let supervisor = out.join("supervisor.sh");
+        let binary = std::env::current_exe().unwrap();
+        let binary = binary.to_str().unwrap().replace('\'', "'\"'\"'");
+        std::fs::write(
+            &supervisor,
+            format!(
+                "#!/bin/sh\nexport WEAVER_TEST_POST_PROCESSING_SUPERVISOR=1\nexec '{binary}' --exact pipeline::tests::post_processing_completion::post_processing_supervisor_child --nocapture 3>&1 1>/dev/null\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&supervisor, std::fs::Permissions::from_mode(0o755)).unwrap();
+        supervisor
+    }
+
+    // Claim the next queued event and run it to its end as the queue worker
+    // does, with `supervisor` running its scripts. Returns the event, or
+    // none when nothing is queued.
+    #[cfg(test)]
+    async fn run_next_queue_event_for_test(
+        &self,
+        supervisor: &std::path::Path,
+    ) -> Option<EventContext> {
+        let (run_id, context, claim) = self.claim_script_event().unwrap()?;
+        run_queue_event(
+            self.clone(),
+            run_id,
+            context.clone(),
+            claim,
+            Some(supervisor.to_path_buf()),
+        )
+        .await
+        .unwrap();
+        Some(context)
+    }
+
+    fn script_event_error(&self, run_id: &str) -> Result<Option<String>, StateError> {
+        if let Some(error) = self
+            .script_runtime
+            .failed_runs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(run_id)
+            .cloned()
+        {
+            return Ok(Some(error));
+        }
+        let datastore = self.datastore();
+        let run_id = run_id.to_string();
+        self.run_sql_blocking_read(async move {
+            let row = SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT payload FROM script_event_queue WHERE run_id = {} AND state = 'done'",
+                &[SqlArg::Text(run_id)],
+            )
+            .await?;
+            Ok(row
+                .map(|row| row.text("payload"))
+                .transpose()?
+                .and_then(|payload| serde_json::from_str::<serde_json::Value>(&payload).ok())
+                .and_then(|value| {
+                    value
+                        .get("script_event_error")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                }))
+        })
+    }
+}
+
+trait PostProcessingEventsAdmitQueueScriptEventsAtLocalQueries {
+    fn admit_queue_script_events_at(
+        &self,
+        context: EventContext,
+        barrier: bool,
+        occurrence: u64,
+    ) -> (Admitted, Option<Admitted>);
+    fn jobs_with_scripts_held(&self) -> std::collections::HashSet<u64>;
+    fn has_pending_script_admission(&self, job_id: u64) -> bool;
+    fn cancel_event_scripts_where(&self, of: impl Fn(u64) -> bool);
+    fn enqueue_script_event_inner(
+        &self,
+        context: &EventContext,
+        now_ms: i64,
+        require_job: bool,
+        occurrence: u64,
+    ) -> Result<Option<String>, StateError>;
+    fn enqueue_script_event_row(
+        &self,
+        context: &EventContext,
+        now_ms: i64,
+        require_job: bool,
+        occurrence: u64,
+    ) -> Result<Option<String>, StateError>;
+    fn claim_script_event(
+        &self,
+    ) -> Result<Option<(String, EventContext, QueueClaimRegistration)>, StateError>;
+    fn script_run_active(&self, run_id: &str) -> bool;
+    fn active_script_run_for_job(&self, job_id: u64) -> Option<String>;
+    fn finish_script_event(&self, run_id: &str) -> Result<(), StateError>;
+    fn finish_script_event_with_error(
+        &self,
+        run_id: &str,
+        error: Option<String>,
+    ) -> Result<(), StateError>;
+}
+
+impl PostProcessingEventsAdmitQueueScriptEventsAtLocalQueries for Database {
     fn admit_queue_script_events_at(
         &self,
         context: EventContext,
@@ -1239,52 +1625,6 @@ impl Database {
             });
         }
         (receiver, generic)
-    }
-
-    // Which of `job_ids` have a script event being admitted, queued, started
-    // or running: what `wait_for_job_events_stopped` would wait on, asked of
-    // a whole list in one statement per bind-sized chunk.
-    pub(crate) fn jobs_with_live_script_events(
-        &self,
-        job_ids: &[u64],
-    ) -> Result<std::collections::HashSet<u64>, StateError> {
-        // Each registry is walked once, not once per asked job.
-        let held = self.jobs_with_scripts_held();
-        let mut live = job_ids
-            .iter()
-            .copied()
-            .filter(|id| held.contains(id))
-            .collect::<std::collections::HashSet<_>>();
-        if job_ids.is_empty() {
-            return Ok(live);
-        }
-        let datastore = self.datastore();
-        let ids = job_ids.iter().map(|id| *id as i64).collect::<Vec<_>>();
-        let queued = self.run_sql_blocking_read(async move {
-            let mut queued = Vec::new();
-            for chunk in ids.chunks(crate::persistence::sql_runtime::max_rows_for_engine(
-                datastore.engine(),
-                1,
-            )) {
-                let placeholders = vec!["{}"; chunk.len()].join(", ");
-                let args = chunk.iter().copied().map(SqlArg::I64).collect::<Vec<_>>();
-                let rows = SqlRuntime::fetch_all(
-                    datastore.read_exec(),
-                    &format!(
-                        "SELECT DISTINCT job_id FROM script_event_queue \
-                         WHERE job_id IN ({placeholders}) AND state IN ('queued', 'started')"
-                    ),
-                    &args,
-                )
-                .await?;
-                for row in rows {
-                    queued.push(row.i64("job_id")? as u64);
-                }
-            }
-            Ok(queued)
-        })?;
-        live.extend(queued);
-        Ok(live)
     }
 
     // The jobs with a script waiting to be admitted, admitted, claimed or
@@ -1339,53 +1679,6 @@ impl Database {
                 .any(|entry| entry.context.job_id == Some(job_id))
     }
 
-    pub(crate) fn subscribe_script_effects(&self) -> watch::Receiver<()> {
-        let (sender, receiver) = watch::channel(());
-        self.script_runtime
-            .effects
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .1 = Some(sender);
-        receiver
-    }
-
-    pub(crate) fn notify_script_effects(&self, job_id: u64) {
-        let mut effects = self
-            .script_runtime
-            .effects
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if effects.1.is_some() && effects.0.insert(job_id) {
-            effects
-                .1
-                .as_ref()
-                .expect("subscriber checked")
-                .send_replace(());
-        }
-    }
-
-    pub(crate) fn take_script_effects(&self) -> BTreeSet<u64> {
-        std::mem::take(
-            &mut self
-                .script_runtime
-                .effects
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .0,
-        )
-    }
-    pub fn cancel_event_scripts(&self, job_id: u64) {
-        self.cancel_event_scripts_where(|job| job == job_id);
-    }
-
-    // `cancel_event_scripts` for every job of `job_ids`, walking each
-    // registry once for the whole list.
-    pub(crate) fn cancel_event_scripts_of(&self, job_ids: &std::collections::HashSet<u64>) {
-        if !job_ids.is_empty() {
-            self.cancel_event_scripts_where(|job| job_ids.contains(&job));
-        }
-    }
-
     // Signal every run, queued, running or fire-and-forget, of a job `of`
     // picks to stop.
     fn cancel_event_scripts_where(&self, of: impl Fn(u64) -> bool) {
@@ -1415,55 +1708,6 @@ impl Database {
                 sender.send_replace(true);
             }
         }
-    }
-
-    // Signal every fire-and-forget run of `job_id` to stop. Returns whether
-    // there was one.
-    pub fn cancel_background_scripts(&self, job_id: u64) -> bool {
-        let mut cancelled = false;
-        for (job, sender) in self
-            .script_runtime
-            .background
-            .runs
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .values()
-        {
-            if *job == Some(job_id) {
-                sender.send_replace(true);
-                cancelled = true;
-            }
-        }
-        cancelled
-    }
-
-    // Resolves once no fire-and-forget run is registered. Nothing in weaver
-    // waits on this; it exists so a test can.
-    #[doc(hidden)]
-    pub async fn background_scripts_settled(&self) {
-        loop {
-            let settled = self.script_runtime.background.settled.notified();
-            tokio::pin!(settled);
-            settled.as_mut().enable();
-            if self
-                .script_runtime
-                .background
-                .runs
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .is_empty()
-            {
-                return;
-            }
-            settled.await;
-        }
-    }
-    pub fn enqueue_script_event(
-        &self,
-        context: &EventContext,
-        now_ms: i64,
-    ) -> Result<Option<String>, StateError> {
-        self.enqueue_script_event_inner(context, now_ms, false, 0)
     }
 
     fn enqueue_script_event_inner(
@@ -1538,71 +1782,6 @@ impl Database {
         })
     }
 
-    pub fn queue_script_count(&self) -> Result<u64, StateError> {
-        let datastore = self.datastore();
-        self.run_sql_blocking_read(async move {
-            Ok(SqlRuntime::fetch_optional(datastore.read_exec(), "SELECT COUNT(*) AS count FROM script_event_queue WHERE state IN ('queued', 'started')", &[]).await?.map(|row| row.i64("count")).transpose()?.unwrap_or(0) as u64)
-        })
-    }
-
-    pub fn recover_script_events(&self) -> Result<(), StateError> {
-        let datastore = self.datastore();
-        let seen = self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "recover_script_events", |tx| Box::pin(async move {
-                tx.execute("UPDATE script_event_queue SET state = 'interrupted' WHERE state = 'started'", &[]).await?;
-                Ok(tx.fetch_optional("SELECT run_id FROM script_event_queue LIMIT 1", &[]).await?.is_some())
-            })).await
-        })?;
-        self.script_runtime
-            .durable_events_seen
-            .store(seen, std::sync::atomic::Ordering::Release);
-        Ok(())
-    }
-
-    pub fn script_event_finished(&self, run_id: &str) -> Result<bool, StateError> {
-        let datastore = self.datastore();
-        let run_id = run_id.to_string();
-        self.run_sql_blocking_read(async move {
-            Ok(SqlRuntime::fetch_optional(
-                datastore.read_exec(),
-                "SELECT state FROM script_event_queue WHERE run_id = {}",
-                &[SqlArg::Text(run_id)],
-            )
-            .await?
-            .map(|row| row.text("state"))
-            .transpose()?
-            .is_none_or(|state| state == "done" || state == "interrupted"))
-        })
-    }
-
-    // The run of the job's latest `event`, one of the names of its
-    // download's end, and that end's occurrence.
-    pub(crate) fn latest_download_end(
-        &self,
-        job_id: u64,
-        event: QueueEvent,
-    ) -> Result<Option<(String, u64)>, StateError> {
-        let datastore = self.datastore();
-        self.run_sql_blocking_read(async move {
-            SqlRuntime::fetch_optional(datastore.read_exec(), "SELECT run_id, occurrence FROM script_event_queue WHERE job_id = {} AND event = {} ORDER BY seq DESC LIMIT 1", &[SqlArg::I64(job_id as i64), SqlArg::Text(event.as_str().into())]).await?
-                .map(|row| Ok((row.text("run_id")?, u64::try_from(row.i64("occurrence")?).unwrap_or_default()))).transpose()
-        })
-    }
-
-    // The latest `event` queued for the job, one of the names of its
-    // download's end, and whether it is over.
-    pub fn downloaded_script_event(
-        &self,
-        job_id: u64,
-        event: QueueEvent,
-    ) -> Result<Option<(String, bool)>, StateError> {
-        let datastore = self.datastore();
-        self.run_sql_blocking_read(async move {
-            SqlRuntime::fetch_optional(datastore.read_exec(), "SELECT run_id, state FROM script_event_queue WHERE job_id = {} AND event = {} ORDER BY seq DESC LIMIT 1", &[SqlArg::I64(job_id as i64), SqlArg::Text(event.as_str().into())]).await?
-                .map(|row| Ok((row.text("run_id")?, matches!(row.text("state")?.as_str(), "done" | "interrupted")))).transpose()
-        })
-    }
-
     fn claim_script_event(
         &self,
     ) -> Result<Option<(String, EventContext, QueueClaimRegistration)>, StateError> {
@@ -1640,10 +1819,6 @@ impl Database {
         result
     }
 
-    pub(crate) fn notify_script_events_changed(&self) {
-        self.script_runtime.changed.notify_waiters();
-    }
-
     fn script_run_active(&self, run_id: &str) -> bool {
         self.script_runtime
             .claimed
@@ -1675,152 +1850,6 @@ impl Database {
                     .find(|(_, (job, _))| *job == Some(job_id))
                     .map(|(run, _)| run.clone())
             })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn finish_script_event_for_test(&self, run_id: &str) -> Result<(), StateError> {
-        self.finish_script_event(run_id)?;
-        self.script_runtime.changed.notify_waiters();
-        Ok(())
-    }
-
-    // Every `event` the queue holds, in the order queued.
-    #[cfg(test)]
-    pub(crate) fn queued_script_events(&self, event: QueueEvent) -> Vec<EventContext> {
-        let datastore = self.datastore();
-        self.run_sql_blocking_read(async move {
-            SqlRuntime::fetch_all(
-                datastore.read_exec(),
-                "SELECT payload FROM script_event_queue WHERE event = {} ORDER BY seq",
-                &[SqlArg::Text(event.as_str().into())],
-            )
-            .await?
-            .iter()
-            .map(|row| row.text("payload"))
-            .collect::<Result<Vec<_>, _>>()
-        })
-        .unwrap()
-        .iter()
-        .map(|payload| serde_json::from_str(payload).unwrap())
-        .collect()
-    }
-
-    // Every `event` the queue holds, once it holds at least `count`.
-    #[cfg(test)]
-    pub(crate) async fn queued_script_events_once(
-        &self,
-        event: QueueEvent,
-        count: usize,
-    ) -> Vec<EventContext> {
-        let mut queued = Vec::new();
-        wait_for_test_script_change(self, || {
-            queued = self.queued_script_events(event);
-            queued.len() >= count
-        })
-        .await;
-        queued
-    }
-
-    // Returns once every event raised before it is admitted: admissions
-    // are taken in the order raised, so once one raised after them is in,
-    // they are.
-    #[cfg(test)]
-    pub(crate) async fn admitted_so_far(&self) {
-        let marker = EventContext {
-            job_id: None,
-            event: ScriptEventLabel::Queue(QueueEvent::UrlCompleted),
-            category: None,
-            cwd: PathBuf::new(),
-            env: BTreeMap::new(),
-            facts: CompatibilityFacts::default(),
-            instances: None,
-            scratch: None,
-        };
-        let _ = self.admit_queue_script_event(marker, false).await;
-    }
-
-    // Queue scripts on, with one instance of `queue.sh` for every queue
-    // event, under `root`. None runs: the queue keeps every event raised
-    // as it was queued.
-    #[cfg(test)]
-    pub(crate) fn enable_queue_scripts_for_test(&self, root: &std::path::Path) {
-        self.script_runtime
-            .worker_active
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        let scripts = self
-            .initialize_post_processing_script_directory(root, None)
-            .unwrap();
-        std::fs::write(
-            scripts.join("queue.sh"),
-            "#!/bin/sh\n### NZBGET QUEUE SCRIPT ###\nexit 0\n",
-        )
-        .unwrap();
-        self.save_post_processing_settings(&super::model::PostProcessingSettings {
-            execution_enabled: true,
-            ..Default::default()
-        })
-        .unwrap();
-        for event in QueueEvent::ALL {
-            self.create_script_instance(super::instances::ScriptInstanceDraft::new(
-                super::model::ScriptName::new("queue.sh").unwrap(),
-                InstanceTrigger::Queue(event),
-            ))
-            .unwrap();
-        }
-    }
-
-    // Make every queue instance's `queue.sh` write what `NZBNA_TAGS` tells
-    // it, or `unset`, to a file under `out` named for the job id, or `none`
-    // for a jobless event. Returns the supervisor a run must be given: this
-    // test binary, run as the real one.
-    #[cfg(test)]
-    pub(crate) fn tag_reporting_queue_script_for_test(&self, out: &std::path::Path) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::create_dir_all(out).unwrap();
-        let scripts = self.post_processing_script_directory().unwrap();
-        let script = scripts.join("queue.sh");
-        std::fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\n### NZBGET QUEUE SCRIPT ###\nprintf '%s' \"${{NZBNA_TAGS-unset}}\" > '{}'/\"${{NZBNA_NZBID-none}}\"\n",
-                out.display()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let supervisor = out.join("supervisor.sh");
-        let binary = std::env::current_exe().unwrap();
-        let binary = binary.to_str().unwrap().replace('\'', "'\"'\"'");
-        std::fs::write(
-            &supervisor,
-            format!(
-                "#!/bin/sh\nexport WEAVER_TEST_POST_PROCESSING_SUPERVISOR=1\nexec '{binary}' --exact pipeline::tests::post_processing_completion::post_processing_supervisor_child --nocapture 3>&1 1>/dev/null\n"
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&supervisor, std::fs::Permissions::from_mode(0o755)).unwrap();
-        supervisor
-    }
-
-    // Claim the next queued event and run it to its end as the queue worker
-    // does, with `supervisor` running its scripts. Returns the event, or
-    // none when nothing is queued.
-    #[cfg(test)]
-    pub(crate) async fn run_next_queue_event_for_test(
-        &self,
-        supervisor: &std::path::Path,
-    ) -> Option<EventContext> {
-        let (run_id, context, claim) = self.claim_script_event().unwrap()?;
-        run_queue_event(
-            self.clone(),
-            run_id,
-            context.clone(),
-            claim,
-            Some(supervisor.to_path_buf()),
-        )
-        .await
-        .unwrap();
-        Some(context)
     }
 
     fn finish_script_event(&self, run_id: &str) -> Result<(), StateError> {
@@ -1869,37 +1898,129 @@ impl Database {
         self.notify_script_events_changed();
         result
     }
+}
 
-    pub(crate) fn script_event_error(&self, run_id: &str) -> Result<Option<String>, StateError> {
-        if let Some(error) = self
+pub trait PostProcessingEventsCancelEventScriptsQueries {
+    fn cancel_event_scripts(&self, job_id: u64);
+    fn cancel_background_scripts(&self, job_id: u64) -> bool;
+    fn background_scripts_settled(&self) -> impl std::future::Future<Output = ()> + Send;
+    fn enqueue_script_event(
+        &self,
+        context: &EventContext,
+        now_ms: i64,
+    ) -> Result<Option<String>, StateError>;
+    fn queue_script_count(&self) -> Result<u64, StateError>;
+    fn recover_script_events(&self) -> Result<(), StateError>;
+    fn script_event_finished(&self, run_id: &str) -> Result<bool, StateError>;
+    fn downloaded_script_event(
+        &self,
+        job_id: u64,
+        event: QueueEvent,
+    ) -> Result<Option<(String, bool)>, StateError>;
+}
+
+impl PostProcessingEventsCancelEventScriptsQueries for Database {
+    fn cancel_event_scripts(&self, job_id: u64) {
+        self.cancel_event_scripts_where(|job| job == job_id);
+    }
+
+    // Signal every fire-and-forget run of `job_id` to stop. Returns whether
+    // there was one.
+    fn cancel_background_scripts(&self, job_id: u64) -> bool {
+        let mut cancelled = false;
+        for (job, sender) in self
             .script_runtime
-            .failed_runs
+            .background
+            .runs
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .get(run_id)
-            .cloned()
+            .values()
         {
-            return Ok(Some(error));
+            if *job == Some(job_id) {
+                sender.send_replace(true);
+                cancelled = true;
+            }
         }
+        cancelled
+    }
+
+    // Resolves once no fire-and-forget run is registered. Nothing in weaver
+    // waits on this; it exists so a test can.
+    #[doc(hidden)]
+    async fn background_scripts_settled(&self) {
+        loop {
+            let settled = self.script_runtime.background.settled.notified();
+            tokio::pin!(settled);
+            settled.as_mut().enable();
+            if self
+                .script_runtime
+                .background
+                .runs
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+            {
+                return;
+            }
+            settled.await;
+        }
+    }
+    fn enqueue_script_event(
+        &self,
+        context: &EventContext,
+        now_ms: i64,
+    ) -> Result<Option<String>, StateError> {
+        self.enqueue_script_event_inner(context, now_ms, false, 0)
+    }
+
+    fn queue_script_count(&self) -> Result<u64, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            Ok(SqlRuntime::fetch_optional(datastore.read_exec(), "SELECT COUNT(*) AS count FROM script_event_queue WHERE state IN ('queued', 'started')", &[]).await?.map(|row| row.i64("count")).transpose()?.unwrap_or(0) as u64)
+        })
+    }
+
+    fn recover_script_events(&self) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        let seen = self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "recover_script_events", |tx| Box::pin(async move {
+                tx.execute("UPDATE script_event_queue SET state = 'interrupted' WHERE state = 'started'", &[]).await?;
+                Ok(tx.fetch_optional("SELECT run_id FROM script_event_queue LIMIT 1", &[]).await?.is_some())
+            })).await
+        })?;
+        self.script_runtime
+            .durable_events_seen
+            .store(seen, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    fn script_event_finished(&self, run_id: &str) -> Result<bool, StateError> {
         let datastore = self.datastore();
         let run_id = run_id.to_string();
         self.run_sql_blocking_read(async move {
-            let row = SqlRuntime::fetch_optional(
+            Ok(SqlRuntime::fetch_optional(
                 datastore.read_exec(),
-                "SELECT payload FROM script_event_queue WHERE run_id = {} AND state = 'done'",
+                "SELECT state FROM script_event_queue WHERE run_id = {}",
                 &[SqlArg::Text(run_id)],
             )
-            .await?;
-            Ok(row
-                .map(|row| row.text("payload"))
-                .transpose()?
-                .and_then(|payload| serde_json::from_str::<serde_json::Value>(&payload).ok())
-                .and_then(|value| {
-                    value
-                        .get("script_event_error")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_string)
-                }))
+            .await?
+            .map(|row| row.text("state"))
+            .transpose()?
+            .is_none_or(|state| state == "done" || state == "interrupted"))
+        })
+    }
+
+    // The latest `event` queued for the job, one of the names of its
+    // download's end, and whether it is over.
+    fn downloaded_script_event(
+        &self,
+        job_id: u64,
+        event: QueueEvent,
+    ) -> Result<Option<(String, bool)>, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            SqlRuntime::fetch_optional(datastore.read_exec(), "SELECT run_id, state FROM script_event_queue WHERE job_id = {} AND event = {} ORDER BY seq DESC LIMIT 1", &[SqlArg::I64(job_id as i64), SqlArg::Text(event.as_str().into())]).await?
+                .map(|row| Ok((row.text("run_id")?, matches!(row.text("state")?.as_str(), "done" | "interrupted")))).transpose()
         })
     }
 }

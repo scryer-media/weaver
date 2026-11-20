@@ -223,8 +223,33 @@ fn tracker_rule_args(
     ])
 }
 
-impl Database {
-    pub fn list_tracker_rules(&self) -> Result<Vec<TrackerRule>, StateError> {
+pub trait SettingsRepositoryQueries {
+    fn list_tracker_rules(&self) -> Result<Vec<TrackerRule>, StateError>;
+    fn insert_tracker_rule(
+        &self,
+        rule: &TrackerRule,
+        now_ms: i64,
+    ) -> Result<TrackerRule, StateError>;
+    fn update_tracker_rule(&self, rule: &TrackerRule, now_ms: i64) -> Result<bool, StateError>;
+    fn delete_tracker_rule(&self, id: u32) -> Result<bool, StateError>;
+    fn save_tracker_rule(
+        &self,
+        id: Option<u32>,
+        rule: TrackerRule,
+        keeps_ssl: bool,
+        keeps_passwords: bool,
+        now_ms: i64,
+    ) -> Result<Result<Vec<TrackerRule>, String>, StateError>;
+    fn apply_tracker_file(
+        &self,
+        file: &super::tracker_file::TrackerFile,
+        now_ms: i64,
+    ) -> Result<TrackerRule, StateError>;
+    fn unbind_tracker_rule(&self, id: u32, now_ms: i64) -> Result<bool, StateError>;
+}
+
+impl SettingsRepositoryQueries for Database {
+    fn list_tracker_rules(&self) -> Result<Vec<TrackerRule>, StateError> {
         let datastore = self.datastore();
         let key = self.encryption_key().cloned();
         self.run_sql_blocking_read(async move {
@@ -241,7 +266,7 @@ impl Database {
     }
 
     // Add `rule` under the next free id, which it returns with.
-    pub fn insert_tracker_rule(
+    fn insert_tracker_rule(
         &self,
         rule: &TrackerRule,
         now_ms: i64,
@@ -283,7 +308,7 @@ impl Database {
     }
 
     // Returns whether the rule exists.
-    pub fn update_tracker_rule(&self, rule: &TrackerRule, now_ms: i64) -> Result<bool, StateError> {
+    fn update_tracker_rule(&self, rule: &TrackerRule, now_ms: i64) -> Result<bool, StateError> {
         let datastore = self.datastore();
         let mut args = tracker_rule_args(rule, self.encryption_key())?;
         args.extend([SqlArg::I64(now_ms), SqlArg::I64(i64::from(rule.id))]);
@@ -307,7 +332,7 @@ impl Database {
     // Returns whether the rule existed. A torrent it matched keeps no rule
     // until its trackers are matched again. Its torrent route goes with it,
     // so a rule given its id later starts on the default route.
-    pub fn delete_tracker_rule(&self, id: u32) -> Result<bool, StateError> {
+    fn delete_tracker_rule(&self, id: u32) -> Result<bool, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "delete_tracker_rule", |tx| {
@@ -340,7 +365,7 @@ impl Database {
     // archive passwords. A rule a tracker file binds stays
     // bound, and a change to a field the file locked is refused, as is a
     // second rule for one pattern; the refusal is the inner error.
-    pub fn save_tracker_rule(
+    fn save_tracker_rule(
         &self,
         id: Option<u32>,
         mut rule: TrackerRule,
@@ -384,7 +409,7 @@ impl Database {
 
     // Fill the rule whose pattern is the file's, or a new one, from `file`,
     // and return the rule.
-    pub fn apply_tracker_file(
+    fn apply_tracker_file(
         &self,
         file: &super::tracker_file::TrackerFile,
         now_ms: i64,
@@ -405,7 +430,7 @@ impl Database {
 
     // Release the rule `id` names from the tracker file that filled it,
     // keeping every value it holds. Returns whether the rule exists.
-    pub fn unbind_tracker_rule(&self, id: u32, now_ms: i64) -> Result<bool, StateError> {
+    fn unbind_tracker_rule(&self, id: u32, now_ms: i64) -> Result<bool, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             let changed = SqlRuntime::execute(

@@ -12,6 +12,14 @@ use super::{
     fetch_levels, files_dir, held_by, identity_of, ignored_of, in_table_order, load_of, locked,
     placed, queued, ratelimits_of, ssl_identity, state_error, tracker_tiers,
 };
+use crate::jobs::graph_checkpoint::JobsGraphCheckpointInternalQueries;
+use crate::post_processing::settings::PostProcessingSettingsQueries;
+use crate::settings::archive_passwords::SettingsArchivePasswordsInternalQueries;
+use crate::torrents::persistence::TorrentsPersistenceInsertPlacedTorrentInternalQueries;
+use crate::torrents::persistence::TorrentsPersistenceInsertTorrentQueries;
+use crate::torrents::persistence::TorrentsPersistenceLiveHeldPathsInternalQueries;
+use crate::torrents::queries::TorrentsInternalQueries;
+use crate::torrents::queries::TorrentsQueries;
 use tokio::sync::watch;
 
 use crate::LoadError;

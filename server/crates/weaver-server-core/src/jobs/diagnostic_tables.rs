@@ -51,11 +51,15 @@ fn largest_rowids(tables: &[String]) -> String {
         .join(" UNION ALL ")
 }
 
-impl Database {
+pub trait JobsDiagnosticTablesQueries {
+    fn diagnostic_table_sizes(&self) -> Option<Result<Vec<DiagnosticTableSize>, StateError>>;
+}
+
+impl JobsDiagnosticTablesQueries for Database {
     // The tables of the database, by name, each with its figures; `None` for
     // an engine that is not SQLite. Tables without a rowid and SQLite's own
     // are left out.
-    pub fn diagnostic_table_sizes(&self) -> Option<Result<Vec<DiagnosticTableSize>, StateError>> {
+    fn diagnostic_table_sizes(&self) -> Option<Result<Vec<DiagnosticTableSize>, StateError>> {
         let datastore = self.datastore();
         if !matches!(datastore, StoreDatastore::Sqlite { .. }) {
             return None;
@@ -124,6 +128,7 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::persistence::SettingsPersistenceQueries;
 
     fn execute_sql(db: &Database, sql: &'static str) {
         let datastore = db.datastore();

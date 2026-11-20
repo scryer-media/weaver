@@ -12,10 +12,15 @@ use crate::persistence::sql_runtime::{SqlArg, SqlConn, SqlRuntime, SqlTx};
 // tidying a load does never interleave. The value is only a lock sentinel.
 const LOCK_KEY: &str = "schedule_write_lock";
 
-impl Database {
+pub trait SettingsSchedulesQueries {
+    fn list_schedules(&self) -> Result<Vec<ScheduleEntry>, StateError>;
+    fn save_schedules(&self, entries: &[ScheduleEntry]) -> Result<(), StateError>;
+}
+
+impl SettingsSchedulesQueries for Database {
     // The saved schedule rules. A rule that names an egress or provider that
     // is gone loses that part, and is saved that way, with a log line.
-    pub fn list_schedules(&self) -> Result<Vec<ScheduleEntry>, StateError> {
+    fn list_schedules(&self) -> Result<Vec<ScheduleEntry>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "list_schedules", |tx| {
@@ -33,7 +38,7 @@ impl Database {
         })
     }
 
-    pub fn save_schedules(&self, entries: &[ScheduleEntry]) -> Result<(), StateError> {
+    fn save_schedules(&self, entries: &[ScheduleEntry]) -> Result<(), StateError> {
         let datastore = self.datastore();
         let entries = entries.to_vec();
         self.run_sql_blocking(async move {
@@ -51,9 +56,22 @@ impl Database {
             .await
         })
     }
+}
 
+pub(crate) trait SettingsSchedulesInternalQueries {
+    fn remove_server_schedules(
+        conn: &mut SqlConn<'_>,
+        server_id: u32,
+    ) -> impl std::future::Future<Output = Result<(), StateError>> + Send;
+    fn remove_egress_schedules(
+        tx: &mut SqlTx<'_>,
+        egress_id: u32,
+    ) -> impl std::future::Future<Output = Result<(), StateError>> + Send;
+}
+
+impl SettingsSchedulesInternalQueries for Database {
     // Drop every rule and every speed limit for a server being deleted.
-    pub(crate) async fn remove_server_schedules(
+    async fn remove_server_schedules(
         conn: &mut SqlConn<'_>,
         server_id: u32,
     ) -> Result<(), StateError> {
@@ -70,10 +88,7 @@ impl Database {
 
     // Drop every quota rule and every speed limit for an egress being
     // deleted, so an egress later given the same id inherits none of them.
-    pub(crate) async fn remove_egress_schedules(
-        tx: &mut SqlTx<'_>,
-        egress_id: u32,
-    ) -> Result<(), StateError> {
+    async fn remove_egress_schedules(tx: &mut SqlTx<'_>, egress_id: u32) -> Result<(), StateError> {
         let conn = &mut tx.conn();
         lock(conn).await?;
         let mut entries = read_schedules(conn).await?;

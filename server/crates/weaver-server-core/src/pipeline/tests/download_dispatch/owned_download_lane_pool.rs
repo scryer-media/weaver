@@ -4,6 +4,7 @@
 // `download_dispatch` tests, part of a mechanical split of the original file.
 
 use super::*;
+use crate::proxies::ProxiesNetworkPersistenceQueries;
 
 #[tokio::test]
 async fn owned_download_lane_pool_respects_configured_connection_count_at_startup() {

@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 pub(crate) mod archive_passwords;
+pub use archive_passwords::SettingsArchivePasswordsQueries;
 pub mod env_seed;
 pub mod levels;
 pub mod model;
@@ -10,6 +11,8 @@ pub mod queries;
 pub mod record;
 pub mod repository;
 mod schedules;
+pub(crate) use schedules::SettingsSchedulesInternalQueries;
+pub use schedules::SettingsSchedulesQueries;
 pub mod service;
 pub mod tracker_file;
 

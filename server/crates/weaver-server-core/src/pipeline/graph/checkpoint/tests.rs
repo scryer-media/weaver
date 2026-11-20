@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::jobs::graph_checkpoint::JobsGraphCheckpointInternalQueries;
+use crate::jobs::persistence::JobsPersistenceQueries;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 

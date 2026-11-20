@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::jobs::queries::JobsQueries;
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
@@ -28,6 +29,7 @@ mod archive;
 mod automatic;
 mod catalog;
 mod logical;
+pub(crate) use logical::OperationsBackupLogicalInternalQueries;
 mod manifest;
 mod pending;
 mod permissions;
@@ -716,8 +718,15 @@ async fn rebuild_job_history_attributes_tx(
     Ok(())
 }
 
-impl Database {
-    pub fn schema_version(&self) -> Result<i64, StateError> {
+pub trait OperationsBackupQueries {
+    fn schema_version(&self) -> Result<i64, StateError>;
+    fn restore_target_is_pristine(&self) -> Result<bool, StateError>;
+    fn export_stable_state(&self, dest: &Path) -> Result<StableStateExport, StateError>;
+    fn import_stable_state(&self, src: &Path) -> Result<(), StateError>;
+}
+
+impl OperationsBackupQueries for Database {
+    fn schema_version(&self) -> Result<i64, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
@@ -731,7 +740,7 @@ impl Database {
         })
     }
 
-    pub fn restore_target_is_pristine(&self) -> Result<bool, StateError> {
+    fn restore_target_is_pristine(&self) -> Result<bool, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             for entry in catalog::BACKUP_TABLE_CATALOG {
@@ -765,7 +774,7 @@ impl Database {
         clippy::disallowed_methods,
         reason = "writer gate: runs under run_serialized_sqlite_connection, which holds the gate"
     )]
-    pub fn export_stable_state(&self, dest: &Path) -> Result<StableStateExport, StateError> {
+    fn export_stable_state(&self, dest: &Path) -> Result<StableStateExport, StateError> {
         let datastore = self.datastore();
         let schema_version = self.schema_version()?;
         let max_job_id = self.max_job_id_all()?;
@@ -823,7 +832,7 @@ impl Database {
         clippy::disallowed_methods,
         reason = "writer gate: runs under run_serialized_sqlite_connection, which holds the gate"
     )]
-    pub fn import_stable_state(&self, src: &Path) -> Result<(), StateError> {
+    fn import_stable_state(&self, src: &Path) -> Result<(), StateError> {
         let src_path = src.to_string_lossy().to_string();
         let datastore = self.datastore();
         if let StoreDatastore::Postgres { pool } = datastore {

@@ -8,6 +8,8 @@ use crate::jobs::JobId;
 use crate::persistence::Database;
 use crate::torrents::TorrentCounters;
 use crate::torrents::files::Stamping;
+use crate::torrents::persistence::TorrentsPersistenceInsertPlacedTorrentInternalQueries;
+use crate::torrents::persistence::TorrentsPersistenceInsertTorrentQueries;
 use crate::torrents::store::{Kept, TorrentStore};
 use crate::torrents::tee::Tee;
 use std::collections::BTreeSet;

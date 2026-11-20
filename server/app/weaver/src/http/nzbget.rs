@@ -5,6 +5,14 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use weaver_server_core::history::nzbget_state::HistoryNzbgetStateQueries;
+use weaver_server_core::history::queries::HistoryQueries;
+use weaver_server_core::history::timeline::HistoryTimelineQueries;
+use weaver_server_core::jobs::queries::JobsQueries;
+use weaver_server_core::post_processing::events::PostProcessingEventsCancelEventScriptsQueries;
+use weaver_server_core::post_processing::settings::PostProcessingSettingsQueries;
+use weaver_server_core::rss::RssQueries;
+use weaver_server_core::servers::repository::ServersRepositoryQueries;
 
 use axum::body::Bytes;
 use axum::extract::Extension;

@@ -2,6 +2,9 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::post_processing::effects::PostProcessingEffectsInternalQueries;
+use crate::post_processing::effects::PostProcessingEffectsQueries;
+use crate::post_processing::events::PostProcessingEventsCancelEventScriptsQueries;
 
 impl Pipeline {
     pub(crate) fn activate_nntp(

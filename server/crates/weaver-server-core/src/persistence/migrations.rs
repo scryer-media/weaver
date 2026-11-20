@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::jobs::persistence::JobsPersistenceQueries;
+use crate::settings::service::SettingsServiceInternalQueries;
+use crate::settings::service::SettingsServiceQueries;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 

@@ -2,7 +2,9 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::harness::{self, JOB, Post};
+use crate::jobs::graph_checkpoint::JobsGraphCheckpointInternalQueries;
 use crate::jobs::model::{DownloadState, JobStatus, PostState, RunState};
+use crate::jobs::queries::JobsQueries;
 use crate::pipeline::Pipeline;
 use crate::pipeline::tests::direct_store::{
     build_test_par2_with_recovery, direct_store_job_spec, obfuscate_volumes,

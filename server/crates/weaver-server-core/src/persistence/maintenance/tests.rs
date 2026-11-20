@@ -2,7 +2,11 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
+use crate::jobs::persistence::JobsPersistenceQueries;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+use crate::torrents::persistence::TorrentsPersistenceInsertTorrentQueries;
+use crate::torrents::persistence::TorrentsPersistenceMarkTorrentRetiringInternalQueries;
 use crate::{ActiveJob, JobId};
 
 fn maintenance_snapshot(db: &Database) -> DbMaintenanceSnapshot {

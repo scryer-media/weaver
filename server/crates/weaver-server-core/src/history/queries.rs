@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::history::cache::HistoryCacheQueries;
+use crate::torrents::queries::TorrentsInternalQueries;
 use std::path::PathBuf;
 
 use crate::StateError;
@@ -46,12 +48,61 @@ pub(crate) const FAILED_SWEEP_NEXT_PAGE_SQL: &str = "SELECT job_id, completed_at
      AND NOT EXISTS (SELECT 1 FROM torrents WHERE torrents.job_id = job_history.job_id) \
      ORDER BY completed_at DESC, job_id DESC LIMIT {}";
 
-impl Database {
-    pub fn get_job_history(&self, job_id: u64) -> Result<Option<JobHistoryRow>, StateError> {
+pub trait HistoryQueries {
+    fn get_job_history(&self, job_id: u64) -> Result<Option<JobHistoryRow>, StateError>;
+    fn get_job_history_profiled(
+        &self,
+        job_id: u64,
+        label: &'static str,
+    ) -> Result<Option<JobHistoryRow>, StateError>;
+    fn list_job_history_output_dirs(
+        &self,
+        job_ids: &[crate::JobId],
+    ) -> Result<std::collections::BTreeMap<crate::JobId, Option<String>>, StateError>;
+    fn shared_output_dirs(
+        &self,
+        dirs: &[String],
+    ) -> Result<std::collections::BTreeSet<String>, StateError>;
+    fn list_job_history_file_states(
+        &self,
+        job_ids: &[crate::JobId],
+    ) -> Result<std::collections::BTreeMap<crate::JobId, HistoryFileState>, StateError>;
+    fn list_archived_history_files(
+        &self,
+        job_id: u64,
+        from: u64,
+        limit: usize,
+    ) -> Result<Vec<(String, u64)>, StateError>;
+    fn has_archived_history_file(&self, job_id: u64, ordinal: u64) -> Result<bool, StateError>;
+    fn list_job_history(&self, filter: &HistoryFilter) -> Result<Vec<JobHistoryRow>, StateError>;
+    fn count_job_history(&self, filter: &HistoryFilter) -> Result<u32, StateError>;
+    fn count_job_history_by_category(
+        &self,
+        filter: &HistoryFilter,
+    ) -> Result<Vec<(String, u32)>, StateError>;
+    fn job_history_ids_among(&self, job_ids: &[u64]) -> Result<Vec<u64>, StateError>;
+    fn job_history_edit_fields(&self, job_id: u64)
+    -> Result<Option<HistoryEditFields>, StateError>;
+    fn list_integration_events_after(
+        &self,
+        after_id: Option<i64>,
+        item_id: Option<u64>,
+        limit: Option<u32>,
+    ) -> Result<Vec<IntegrationEventRow>, StateError>;
+    fn latest_integration_event_id(&self) -> Result<Option<i64>, StateError>;
+    fn max_job_id(&self) -> Result<u64, StateError>;
+    fn load_history_job_persisted_nzb(
+        &self,
+        job_id: u64,
+    ) -> Result<Option<PersistedNzbRecord>, StateError>;
+}
+
+impl HistoryQueries for Database {
+    fn get_job_history(&self, job_id: u64) -> Result<Option<JobHistoryRow>, StateError> {
         self.get_job_history_inner(job_id)
     }
 
-    pub fn get_job_history_profiled(
+    fn get_job_history_profiled(
         &self,
         job_id: u64,
         label: &'static str,
@@ -60,43 +111,9 @@ impl Database {
         self.get_job_history_inner(job_id)
     }
 
-    fn get_job_history_inner(&self, job_id: u64) -> Result<Option<JobHistoryRow>, StateError> {
-        if let Some(row) = self.get_cached_job_history(job_id) {
-            weaver_server_base::runtime::perf_probe::record(
-                "db.get_job_history.cache_hit",
-                std::time::Duration::ZERO,
-            );
-            return Ok(Some(row));
-        }
-        weaver_server_base::runtime::perf_probe::record(
-            "db.get_job_history.cache_miss",
-            std::time::Duration::ZERO,
-        );
-        // Snapshot the cache generation before the read so a delete that races
-        // this read (invalidating after its own commit) makes the re-cache a
-        // no-op instead of resurrecting the deleted row from a stale read.
-        let observed_generation = self.job_history_cache_generation();
-        self.torrent_read();
-        let datastore = self.datastore();
-        let row = self.run_sql_blocking_read(async move {
-            SqlRuntime::fetch_optional(
-                datastore.read_exec(),
-                &format!("{JOB_HISTORY_SELECT} WHERE job_id = {{}} LIMIT 1"),
-                &[SqlArg::I64(job_id as i64)],
-            )
-            .await?
-            .map(job_history_row_from_sql)
-            .transpose()
-        })?;
-        if let Some(row) = &row {
-            self.cache_job_history_at(row.clone(), observed_generation);
-        }
-        Ok(row)
-    }
-
     // The recorded output directory of every id that has a history row, read
     // in bind-sized chunks. An id without a row is absent from the map.
-    pub fn list_job_history_output_dirs(
+    fn list_job_history_output_dirs(
         &self,
         job_ids: &[crate::JobId],
     ) -> Result<std::collections::BTreeMap<crate::JobId, Option<String>>, StateError> {
@@ -132,7 +149,7 @@ impl Database {
     // Which of `dirs` more than one job records as its output folder, across
     // history and the queue: one statement per bind-sized chunk, served by
     // the output-folder indexes.
-    pub fn shared_output_dirs(
+    fn shared_output_dirs(
         &self,
         dirs: &[String],
     ) -> Result<std::collections::BTreeSet<String>, StateError> {
@@ -184,7 +201,7 @@ impl Database {
     // recorded output directory, when it was archived and the totals of the
     // folder its archive removed, read in bind-sized chunks. An id without a row
     // is absent from the map.
-    pub fn list_job_history_file_states(
+    fn list_job_history_file_states(
         &self,
         job_ids: &[crate::JobId],
     ) -> Result<std::collections::BTreeMap<crate::JobId, HistoryFileState>, StateError> {
@@ -232,7 +249,7 @@ impl Database {
     // One page of the files a history entry recorded when its files were
     // removed, from position `from` on, in listing order, as
     // `(relative path, bytes)`. A range of the primary key.
-    pub fn list_archived_history_files(
+    fn list_archived_history_files(
         &self,
         job_id: u64,
         from: u64,
@@ -254,7 +271,7 @@ impl Database {
     // Whether the record of an archive holds a file at position
     // `ordinal`: the record keeps fewer files than the totals count once the
     // folder was larger than the cap. One primary-key lookup.
-    pub fn has_archived_history_file(&self, job_id: u64, ordinal: u64) -> Result<bool, StateError> {
+    fn has_archived_history_file(&self, job_id: u64, ordinal: u64) -> Result<bool, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let row = SqlRuntime::fetch_optional(
@@ -268,164 +285,8 @@ impl Database {
         })
     }
 
-    // One page of the history rows, hidden ones too, whose status is
-    // `status`, newest first, as `(completed_at, job_id)`, at most `limit`
-    // of them. `after` is the last pair of the page before, so a page never
-    // repeats a row. A range of the status index, read in its order.
-    pub(crate) fn job_history_ids_by_status_page(
-        &self,
-        status: &str,
-        after: Option<(i64, u64)>,
-        limit: usize,
-    ) -> Result<Vec<(i64, u64)>, StateError> {
-        let datastore = self.datastore();
-        let (sql, args) = history_status_ids_sql(status, after, limit);
-        self.run_sql_blocking_read(async move {
-            let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await?;
-            rows.into_iter()
-                .map(|row| Ok((row.i64("completed_at")?, row.i64("job_id")? as u64)))
-                .collect()
-        })
-    }
-
-    // The ids of every history row, hidden ones too, whose status is one of
-    // `statuses`, in the order `list_job_history` returns them by default:
-    // newest first. The unpaged read the pages replace.
-    #[cfg(test)]
-    pub(crate) fn list_job_history_ids_by_status(
-        &self,
-        statuses: &[&str],
-    ) -> Result<Vec<u64>, StateError> {
-        if statuses.is_empty() {
-            return Ok(Vec::new());
-        }
-        let datastore = self.datastore();
-        let placeholders = vec!["{}"; statuses.len()].join(", ");
-        let args = statuses
-            .iter()
-            .map(|status| SqlArg::Text((*status).to_owned()))
-            .collect::<Vec<_>>();
-        self.run_sql_blocking_read(async move {
-            let rows = SqlRuntime::fetch_all(
-                datastore.read_exec(),
-                &format!(
-                    "SELECT job_id FROM job_history WHERE status IN ({placeholders})
-                      ORDER BY completed_at DESC, job_id DESC"
-                ),
-                &args,
-            )
-            .await?;
-            rows.into_iter()
-                .map(|row| Ok(row.i64("job_id")? as u64))
-                .collect()
-        })
-    }
-
-    // One page of the history rows that finished at or before `cutoff`, in
-    // epoch seconds, oldest first, as `(completed_at, job_id)`. `after` is
-    // the last pair of the page before, so a page never repeats a row.
-    pub(crate) fn list_history_completed_by(
-        &self,
-        cutoff: i64,
-        after: Option<(i64, u64)>,
-        limit: usize,
-    ) -> Result<Vec<(i64, u64)>, StateError> {
-        let datastore = self.datastore();
-        self.run_sql_blocking_read(async move {
-            let (sql, args) = history_completed_by_sql(cutoff, after, limit);
-            let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await?;
-            rows.into_iter()
-                .map(|row| Ok((row.i64("completed_at")?, row.i64("job_id")? as u64)))
-                .collect()
-        })
-    }
-
-    // One page of the failed jobs whose record says they finished at or
-    // before `finished_by`, in epoch seconds, and that no sweep has yet left
-    // nothing of, newest first, at most `limit` of them, each with its
-    // finish time and the output directory it records. `after` is the last
-    // `(completed_at, job_id)` of the page before. The predicate is spelled
-    // out literally so the partial unswept-failed index serves the filter
-    // and the sort.
-    pub(crate) fn failed_job_history_page(
-        &self,
-        finished_by: i64,
-        after: Option<(i64, crate::JobId)>,
-        limit: usize,
-    ) -> Result<Vec<(i64, crate::JobId, Option<String>)>, StateError> {
-        let datastore = self.datastore();
-        self.run_sql_blocking_read(async move {
-            let limit = SqlArg::I64(limit as i64);
-            let (sql, args) = match after {
-                None => (
-                    FAILED_SWEEP_FIRST_PAGE_SQL,
-                    vec![SqlArg::I64(finished_by), limit],
-                ),
-                Some((completed_at, job_id)) => (
-                    FAILED_SWEEP_NEXT_PAGE_SQL,
-                    vec![
-                        SqlArg::I64(finished_by),
-                        SqlArg::I64(completed_at),
-                        SqlArg::I64(completed_at),
-                        SqlArg::I64(job_id.0 as i64),
-                        limit,
-                    ],
-                ),
-            };
-            let rows = SqlRuntime::fetch_all(datastore.read_exec(), sql, &args).await?;
-            rows.into_iter()
-                .map(|row| {
-                    Ok((
-                        row.i64("completed_at")?,
-                        crate::JobId(row.i64("job_id")? as u64),
-                        row.opt_text("output_dir")?,
-                    ))
-                })
-                .collect()
-        })
-    }
-
-    // Which of `job_ids` are still failed jobs that finished at or before
-    // `finished_by`, not yet swept: one statement per bind-sized chunk.
-    pub(crate) fn failed_jobs_finished_by(
-        &self,
-        finished_by: i64,
-        job_ids: &[crate::JobId],
-    ) -> Result<std::collections::HashSet<crate::JobId>, StateError> {
-        if job_ids.is_empty() {
-            return Ok(Default::default());
-        }
-        let datastore = self.datastore();
-        let ids = job_ids.iter().map(|id| id.0 as i64).collect::<Vec<_>>();
-        self.run_sql_blocking_read(async move {
-            let mut failed = std::collections::HashSet::new();
-            for chunk in ids.chunks(max_rows_for_engine(datastore.engine(), 1) - 1) {
-                let placeholders = vec!["{}"; chunk.len()].join(", ");
-                let args = std::iter::once(SqlArg::I64(finished_by))
-                    .chain(chunk.iter().copied().map(SqlArg::I64))
-                    .collect::<Vec<_>>();
-                let rows = SqlRuntime::fetch_all(
-                    datastore.read_exec(),
-                    &format!(
-                        "SELECT job_id FROM job_history WHERE status = 'failed' AND files_swept_at IS NULL \
-                         AND completed_at <= {{}} AND job_id IN ({placeholders})"
-                    ),
-                    &args,
-                )
-                .await?;
-                for row in rows {
-                    failed.insert(crate::JobId(row.i64("job_id")? as u64));
-                }
-            }
-            Ok(failed)
-        })
-    }
-
     // The visibility predicate is applied in SQL, before pagination.
-    pub fn list_job_history(
-        &self,
-        filter: &HistoryFilter,
-    ) -> Result<Vec<JobHistoryRow>, StateError> {
+    fn list_job_history(&self, filter: &HistoryFilter) -> Result<Vec<JobHistoryRow>, StateError> {
         let datastore = self.datastore();
         let (base, ids) = split_history_ids(datastore.engine(), filter);
         self.run_sql_blocking_read(async move {
@@ -470,7 +331,7 @@ impl Database {
         })
     }
 
-    pub fn count_job_history(&self, filter: &HistoryFilter) -> Result<u32, StateError> {
+    fn count_job_history(&self, filter: &HistoryFilter) -> Result<u32, StateError> {
         let datastore = self.datastore();
         let (base, ids) = split_history_ids(datastore.engine(), filter);
         self.run_sql_blocking_read(async move {
@@ -489,7 +350,7 @@ impl Database {
     // a number beside a facet without reading the table it is counting: the
     // whole point of the facet list is that it describes rows no page is
     // showing.
-    pub fn count_job_history_by_category(
+    fn count_job_history_by_category(
         &self,
         filter: &HistoryFilter,
     ) -> Result<Vec<(String, u32)>, StateError> {
@@ -513,7 +374,7 @@ impl Database {
 
     // The ids among `job_ids` that have a history row, hidden or not, in no
     // particular order. Reads only the id column, through the primary key.
-    pub fn job_history_ids_among(&self, job_ids: &[u64]) -> Result<Vec<u64>, StateError> {
+    fn job_history_ids_among(&self, job_ids: &[u64]) -> Result<Vec<u64>, StateError> {
         if job_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -537,7 +398,7 @@ impl Database {
     // The name, category and metadata of `job_id`'s history row, the columns
     // a history edit changes, and its archive time, or `None` when it
     // has no row.
-    pub fn job_history_edit_fields(
+    fn job_history_edit_fields(
         &self,
         job_id: u64,
     ) -> Result<Option<HistoryEditFields>, StateError> {
@@ -562,7 +423,7 @@ impl Database {
         })
     }
 
-    pub fn list_integration_events_after(
+    fn list_integration_events_after(
         &self,
         after_id: Option<i64>,
         item_id: Option<u64>,
@@ -609,7 +470,7 @@ impl Database {
         })
     }
 
-    pub fn latest_integration_event_id(&self) -> Result<Option<i64>, StateError> {
+    fn latest_integration_event_id(&self) -> Result<Option<i64>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
@@ -624,7 +485,7 @@ impl Database {
         })
     }
 
-    pub fn max_job_id(&self) -> Result<u64, StateError> {
+    fn max_job_id(&self) -> Result<u64, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let max = SqlRuntime::fetch_optional(
@@ -641,7 +502,7 @@ impl Database {
         })
     }
 
-    pub fn load_history_job_persisted_nzb(
+    fn load_history_job_persisted_nzb(
         &self,
         job_id: u64,
     ) -> Result<Option<PersistedNzbRecord>, StateError> {
@@ -665,6 +526,226 @@ impl Database {
                 Ok((path, row.opt_bytes("nzb_zstd")?))
             })
             .transpose()
+        })
+    }
+}
+
+trait HistoryLocalQueries {
+    fn get_job_history_inner(&self, job_id: u64) -> Result<Option<JobHistoryRow>, StateError>;
+}
+
+impl HistoryLocalQueries for Database {
+    fn get_job_history_inner(&self, job_id: u64) -> Result<Option<JobHistoryRow>, StateError> {
+        if let Some(row) = self.get_cached_job_history(job_id) {
+            weaver_server_base::runtime::perf_probe::record(
+                "db.get_job_history.cache_hit",
+                std::time::Duration::ZERO,
+            );
+            return Ok(Some(row));
+        }
+        weaver_server_base::runtime::perf_probe::record(
+            "db.get_job_history.cache_miss",
+            std::time::Duration::ZERO,
+        );
+        // Snapshot the cache generation before the read so a delete that races
+        // this read (invalidating after its own commit) makes the re-cache a
+        // no-op instead of resurrecting the deleted row from a stale read.
+        let observed_generation = self.job_history_cache_generation();
+        self.torrent_read();
+        let datastore = self.datastore();
+        let row = self.run_sql_blocking_read(async move {
+            SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                &format!("{JOB_HISTORY_SELECT} WHERE job_id = {{}} LIMIT 1"),
+                &[SqlArg::I64(job_id as i64)],
+            )
+            .await?
+            .map(job_history_row_from_sql)
+            .transpose()
+        })?;
+        if let Some(row) = &row {
+            self.cache_job_history_at(row.clone(), observed_generation);
+        }
+        Ok(row)
+    }
+}
+
+pub(crate) trait HistoryInternalQueries {
+    fn job_history_ids_by_status_page(
+        &self,
+        status: &str,
+        after: Option<(i64, u64)>,
+        limit: usize,
+    ) -> Result<Vec<(i64, u64)>, StateError>;
+    #[cfg(test)]
+    fn list_job_history_ids_by_status(&self, statuses: &[&str]) -> Result<Vec<u64>, StateError>;
+    fn list_history_completed_by(
+        &self,
+        cutoff: i64,
+        after: Option<(i64, u64)>,
+        limit: usize,
+    ) -> Result<Vec<(i64, u64)>, StateError>;
+    fn failed_job_history_page(
+        &self,
+        finished_by: i64,
+        after: Option<(i64, crate::JobId)>,
+        limit: usize,
+    ) -> Result<Vec<(i64, crate::JobId, Option<String>)>, StateError>;
+    fn failed_jobs_finished_by(
+        &self,
+        finished_by: i64,
+        job_ids: &[crate::JobId],
+    ) -> Result<std::collections::HashSet<crate::JobId>, StateError>;
+}
+
+impl HistoryInternalQueries for Database {
+    // One page of the history rows, hidden ones too, whose status is
+    // `status`, newest first, as `(completed_at, job_id)`, at most `limit`
+    // of them. `after` is the last pair of the page before, so a page never
+    // repeats a row. A range of the status index, read in its order.
+    fn job_history_ids_by_status_page(
+        &self,
+        status: &str,
+        after: Option<(i64, u64)>,
+        limit: usize,
+    ) -> Result<Vec<(i64, u64)>, StateError> {
+        let datastore = self.datastore();
+        let (sql, args) = history_status_ids_sql(status, after, limit);
+        self.run_sql_blocking_read(async move {
+            let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await?;
+            rows.into_iter()
+                .map(|row| Ok((row.i64("completed_at")?, row.i64("job_id")? as u64)))
+                .collect()
+        })
+    }
+
+    // The ids of every history row, hidden ones too, whose status is one of
+    // `statuses`, in the order `list_job_history` returns them by default:
+    // newest first. The unpaged read the pages replace.
+    #[cfg(test)]
+    fn list_job_history_ids_by_status(&self, statuses: &[&str]) -> Result<Vec<u64>, StateError> {
+        if statuses.is_empty() {
+            return Ok(Vec::new());
+        }
+        let datastore = self.datastore();
+        let placeholders = vec!["{}"; statuses.len()].join(", ");
+        let args = statuses
+            .iter()
+            .map(|status| SqlArg::Text((*status).to_owned()))
+            .collect::<Vec<_>>();
+        self.run_sql_blocking_read(async move {
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                &format!(
+                    "SELECT job_id FROM job_history WHERE status IN ({placeholders})
+                      ORDER BY completed_at DESC, job_id DESC"
+                ),
+                &args,
+            )
+            .await?;
+            rows.into_iter()
+                .map(|row| Ok(row.i64("job_id")? as u64))
+                .collect()
+        })
+    }
+
+    // One page of the history rows that finished at or before `cutoff`, in
+    // epoch seconds, oldest first, as `(completed_at, job_id)`. `after` is
+    // the last pair of the page before, so a page never repeats a row.
+    fn list_history_completed_by(
+        &self,
+        cutoff: i64,
+        after: Option<(i64, u64)>,
+        limit: usize,
+    ) -> Result<Vec<(i64, u64)>, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let (sql, args) = history_completed_by_sql(cutoff, after, limit);
+            let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await?;
+            rows.into_iter()
+                .map(|row| Ok((row.i64("completed_at")?, row.i64("job_id")? as u64)))
+                .collect()
+        })
+    }
+
+    // One page of the failed jobs whose record says they finished at or
+    // before `finished_by`, in epoch seconds, and that no sweep has yet left
+    // nothing of, newest first, at most `limit` of them, each with its
+    // finish time and the output directory it records. `after` is the last
+    // `(completed_at, job_id)` of the page before. The predicate is spelled
+    // out literally so the partial unswept-failed index serves the filter
+    // and the sort.
+    fn failed_job_history_page(
+        &self,
+        finished_by: i64,
+        after: Option<(i64, crate::JobId)>,
+        limit: usize,
+    ) -> Result<Vec<(i64, crate::JobId, Option<String>)>, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let limit = SqlArg::I64(limit as i64);
+            let (sql, args) = match after {
+                None => (
+                    FAILED_SWEEP_FIRST_PAGE_SQL,
+                    vec![SqlArg::I64(finished_by), limit],
+                ),
+                Some((completed_at, job_id)) => (
+                    FAILED_SWEEP_NEXT_PAGE_SQL,
+                    vec![
+                        SqlArg::I64(finished_by),
+                        SqlArg::I64(completed_at),
+                        SqlArg::I64(completed_at),
+                        SqlArg::I64(job_id.0 as i64),
+                        limit,
+                    ],
+                ),
+            };
+            let rows = SqlRuntime::fetch_all(datastore.read_exec(), sql, &args).await?;
+            rows.into_iter()
+                .map(|row| {
+                    Ok((
+                        row.i64("completed_at")?,
+                        crate::JobId(row.i64("job_id")? as u64),
+                        row.opt_text("output_dir")?,
+                    ))
+                })
+                .collect()
+        })
+    }
+
+    // Which of `job_ids` are still failed jobs that finished at or before
+    // `finished_by`, not yet swept: one statement per bind-sized chunk.
+    fn failed_jobs_finished_by(
+        &self,
+        finished_by: i64,
+        job_ids: &[crate::JobId],
+    ) -> Result<std::collections::HashSet<crate::JobId>, StateError> {
+        if job_ids.is_empty() {
+            return Ok(Default::default());
+        }
+        let datastore = self.datastore();
+        let ids = job_ids.iter().map(|id| id.0 as i64).collect::<Vec<_>>();
+        self.run_sql_blocking_read(async move {
+            let mut failed = std::collections::HashSet::new();
+            for chunk in ids.chunks(max_rows_for_engine(datastore.engine(), 1) - 1) {
+                let placeholders = vec!["{}"; chunk.len()].join(", ");
+                let args = std::iter::once(SqlArg::I64(finished_by))
+                    .chain(chunk.iter().copied().map(SqlArg::I64))
+                    .collect::<Vec<_>>();
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    &format!(
+                        "SELECT job_id FROM job_history WHERE status = 'failed' AND files_swept_at IS NULL \
+                         AND completed_at <= {{}} AND job_id IN ({placeholders})"
+                    ),
+                    &args,
+                )
+                .await?;
+                for row in rows {
+                    failed.insert(crate::JobId(row.i64("job_id")? as u64));
+                }
+            }
+            Ok(failed)
         })
     }
 }
@@ -1208,6 +1289,8 @@ pub(crate) fn job_history_row_from_sql(
 #[cfg(test)]
 mod order_index_tests {
     use super::*;
+    use crate::history::nzbget_state::HistoryNzbgetStateQueries;
+    use crate::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
 
     // The retention read is a range of a completed-at index, with and
     // without its cursor, and sorts nothing.

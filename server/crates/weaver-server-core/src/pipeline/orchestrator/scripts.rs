@@ -2,7 +2,11 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::post_processing::effects::PostProcessingEffectsQueries;
+use crate::post_processing::events::PostProcessingEventsInvalidateQueueScriptAdmissionInternalQueries;
 use crate::post_processing::events::{EventContext, wait_for_event, wait_for_job_events};
+use crate::post_processing::instances::PostProcessingInstancesInternalQueries;
+use crate::post_processing::instances::PostProcessingInstancesQueries;
 use crate::post_processing::model::{PipelineOutcome, QueueEvent, ScriptEventLabel};
 use crate::post_processing::runner::{CompatibilityFacts, JobExecutionContext};
 

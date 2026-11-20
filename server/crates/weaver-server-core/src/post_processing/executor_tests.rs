@@ -11,8 +11,18 @@ use super::model::{
 };
 use super::secrets::SecretError;
 use super::settings::normalize_script_directory;
+use crate::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
+use crate::jobs::persistence::JobsPersistenceQueries;
+use crate::operations::recovery::credentials::StoredCredentialQueries;
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+use crate::post_processing::instances::PostProcessingInstancesInternalQueries;
+use crate::post_processing::instances::PostProcessingInstancesQueries;
+use crate::post_processing::output::PostProcessingOutputQueries;
+use crate::post_processing::secrets::PostProcessingSecretsQueries;
+use crate::post_processing::settings::PostProcessingSettingsInternalQueries;
+use crate::post_processing::settings::PostProcessingSettingsQueries;
+use crate::rss::RssPersistenceQueries;
 
 fn script(name: &str) -> ScriptName {
     ScriptName::new(name).unwrap()

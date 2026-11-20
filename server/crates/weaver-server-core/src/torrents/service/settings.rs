@@ -7,6 +7,9 @@ use crate::categories::CategoryConfig;
 use crate::jobs::JobId;
 use crate::proxies::TorrentScope;
 use crate::settings::model::TrackerRule;
+use crate::settings::persistence::SettingsPersistenceQueries;
+use crate::settings::queries::SettingsQueries;
+use crate::settings::repository::SettingsRepositoryQueries;
 use crate::settings::{
     Config, Leaf, Level, Levels, SeedTimeCounting, Seeding, SeedingAction, SeedingGoalMode,
     SeedingPolicy, TorrentConfig, TorrentEncryption,

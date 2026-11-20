@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::history::timeline::HistoryTimelineQueries;
+use crate::jobs::JobsSupportFactsPersistenceQueries;
+use crate::jobs::persistence::JobsPersistenceQueries;
+use crate::jobs::repository::JobsRepositoryQueries;
 use std::path::PathBuf;
 
 use super::*;

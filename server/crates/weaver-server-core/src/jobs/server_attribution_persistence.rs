@@ -7,8 +7,20 @@ use super::server_attribution::JobServerAttribution;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::{Database, StateError};
 
-impl Database {
-    pub(crate) fn save_active_server_attribution(
+pub(crate) trait JobsServerAttributionPersistenceInternalQueries {
+    fn save_active_server_attribution(
+        &self,
+        snapshots: Vec<(JobId, String)>,
+    ) -> Result<(), StateError>;
+    #[cfg(test)]
+    fn load_active_server_attribution(
+        &self,
+        job_id: JobId,
+    ) -> Result<JobServerAttribution, StateError>;
+}
+
+impl JobsServerAttributionPersistenceInternalQueries for Database {
+    fn save_active_server_attribution(
         &self,
         snapshots: Vec<(JobId, String)>,
     ) -> Result<(), StateError> {
@@ -33,7 +45,7 @@ impl Database {
     }
 
     #[cfg(test)]
-    pub(crate) fn load_active_server_attribution(
+    fn load_active_server_attribution(
         &self,
         job_id: JobId,
     ) -> Result<JobServerAttribution, StateError> {

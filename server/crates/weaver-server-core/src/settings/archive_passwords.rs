@@ -30,13 +30,22 @@ pub(crate) const MAX_HEADER_ARCHIVE_PASSWORDS: usize = 10;
 pub(crate) const MAX_NZB_ARCHIVE_PASSWORDS: usize = 10;
 pub(crate) const MAX_ARCHIVE_PASSWORDS: usize = 50;
 
-impl Database {
-    pub fn archive_password_settings(&self) -> Result<(bool, Option<String>), StateError> {
+pub trait SettingsArchivePasswordsQueries {
+    fn archive_password_settings(&self) -> Result<(bool, Option<String>), StateError>;
+    fn save_archive_password_settings(
+        &self,
+        passwords: Option<Vec<String>>,
+        password_file: Option<Option<String>>,
+    ) -> Result<(), StateError>;
+}
+
+impl SettingsArchivePasswordsQueries for Database {
+    fn archive_password_settings(&self) -> Result<(bool, Option<String>), StateError> {
         let (passwords, file) = self.load_archive_password_settings()?;
         Ok((!passwords.is_empty(), file))
     }
 
-    pub fn save_archive_password_settings(
+    fn save_archive_password_settings(
         &self,
         passwords: Option<Vec<String>>,
         password_file: Option<Option<String>>,
@@ -82,7 +91,13 @@ impl Database {
             }).await
         })
     }
+}
 
+trait SettingsArchivePasswordsLocalQueries {
+    fn load_archive_password_settings(&self) -> Result<(Vec<String>, Option<String>), LoadError>;
+}
+
+impl SettingsArchivePasswordsLocalQueries for Database {
     // The global list and the password file's path. A failed read, or a list
     // that does not decrypt, is `Read`. A value this build cannot take, a
     // decrypted list included, is `Rows`.
@@ -124,8 +139,16 @@ impl Database {
         };
         Ok((passwords, file.filter(|file| !file.is_empty())))
     }
+}
 
-    pub(crate) fn global_archive_password_candidates(
+pub(crate) trait SettingsArchivePasswordsInternalQueries {
+    fn global_archive_password_candidates(
+        &self,
+    ) -> Result<Vec<ArchivePasswordCandidate>, LoadError>;
+}
+
+impl SettingsArchivePasswordsInternalQueries for Database {
+    fn global_archive_password_candidates(
         &self,
     ) -> Result<Vec<ArchivePasswordCandidate>, LoadError> {
         // Read past the global cap by the three job buckets' caps, so the
@@ -207,6 +230,7 @@ fn read_password_file(path: &str) -> std::io::Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::queries::SettingsQueries;
 
     #[test]
     fn archive_passwords_are_encrypted_and_files_refresh() {

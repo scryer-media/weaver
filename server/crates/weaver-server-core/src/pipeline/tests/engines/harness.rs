@@ -10,6 +10,13 @@
 // or failed; a round that changes nothing ends it too, with the job's state
 // in the panic.
 
+use crate::history::nzbget_state::HistoryNzbgetStateQueries;
+use crate::history::queries::HistoryQueries;
+use crate::jobs::JobsArchivePasswordInternalQueries;
+use crate::jobs::JobsDownloadSummaryPersistenceInternalQueries;
+use crate::post_processing::settings::PostProcessingSettingsQueries;
+use crate::settings::SettingsArchivePasswordsQueries;
+use crate::settings::persistence::SettingsPersistenceQueries;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 

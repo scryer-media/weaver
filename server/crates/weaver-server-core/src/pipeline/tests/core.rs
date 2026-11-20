@@ -2,6 +2,11 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::history::queries::HistoryQueries;
+use crate::jobs::queries::JobsQueries;
+use crate::post_processing::instances::PostProcessingInstancesQueries;
+use crate::post_processing::settings::PostProcessingSettingsQueries;
+use crate::tags::TagsQueries;
 use std::sync::atomic::AtomicUsize;
 
 fn capacity_test_client(port: u16, connections: usize) -> NntpClient {

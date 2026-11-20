@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::categories::queries::CategoriesQueries;
+use crate::proxies::ProxiesPersistenceQueries;
+use crate::rss::RssInternalQueries;
+use crate::rss::RssQueries;
+use crate::servers::queries::ServersQueries;
+use crate::settings::repository::SettingsRepositoryQueries;
 use std::{
     collections::HashMap,
     sync::{

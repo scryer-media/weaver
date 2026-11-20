@@ -3,7 +3,10 @@
 
 use super::*;
 use crate::bandwidth::{SpeedLimitChange, Weekday};
+use crate::proxies::ProxiesNetworkPersistenceQueries;
 use crate::proxies::{EgressBinding, EgressInterface};
+use crate::settings::persistence::SettingsPersistenceQueries;
+use crate::settings::queries::SettingsQueries;
 
 fn rule(id: &str, time: &str, days: Vec<Weekday>, action: ScheduleAction) -> ScheduleEntry {
     ScheduleEntry {

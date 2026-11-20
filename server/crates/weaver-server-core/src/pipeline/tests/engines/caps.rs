@@ -17,6 +17,9 @@ use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::extraction::ExtractionLimits;
 use crate::pipeline::tests::direct_store::{multi_member_store_set, single_member_store_set};
+use crate::post_processing::settings::PostProcessingSettingsQueries;
+use crate::settings::persistence::SettingsPersistenceQueries;
+use crate::settings::queries::SettingsQueries;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 pub(super) const FLOOR: u64 = 256 * 1024;
@@ -872,6 +875,7 @@ mod unwanted {
     use super::super::harness::{Outcome, kinds};
     use super::*;
     use crate::post_processing::model::UnwantedExtensionAction;
+    use crate::post_processing::settings::PostProcessingSettingsQueries;
     use std::collections::BTreeSet;
 
     const FOLDER: &str = "lantern beacon";

@@ -3,10 +3,13 @@
 
 use crate::StateError;
 use crate::history;
+use crate::history::cache::HistoryCacheQueries;
 use crate::history::persistence::replace_job_history_attributes_tx;
 use crate::jobs::persistence::lock_active_job_for_delete_tx;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx, StoreDatastore};
 use crate::persistence::{Database, DatabaseWriterExecutor};
+use crate::post_processing::effects::PostProcessingEffectsInternalQueries;
+use crate::post_processing::events::PostProcessingEventsInvalidateQueueScriptAdmissionInternalQueries;
 use weaver_server_base::jobs::ids::JobId;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -327,8 +330,21 @@ async fn archive_job_sql(
     Ok(archived)
 }
 
-impl Database {
-    pub fn archive_job(
+pub trait JobsRepositoryQueries {
+    fn archive_job(
+        &self,
+        job_id: JobId,
+        history: &history::JobHistoryRow,
+    ) -> Result<(), StateError>;
+    fn delete_active_job(&self, job_id: JobId) -> Result<(), StateError>;
+    fn prune_orphan_active_state(
+        &self,
+        below: JobId,
+    ) -> Result<OrphanActiveStateCounts, StateError>;
+}
+
+impl JobsRepositoryQueries for Database {
+    fn archive_job(
         &self,
         job_id: JobId,
         history: &history::JobHistoryRow,
@@ -346,7 +362,7 @@ impl Database {
         result.map(|_| ())
     }
 
-    pub fn delete_active_job(&self, job_id: JobId) -> Result<(), StateError> {
+    fn delete_active_job(&self, job_id: JobId) -> Result<(), StateError> {
         let datastore = self.datastore();
         let db = self.clone();
         let result = self.run_sql_blocking(async move {
@@ -376,7 +392,7 @@ impl Database {
     // orphans are found by reads, and then go a chunk of jobs at a time, one
     // statement per table and one transaction per chunk, so the writer is
     // never held for long.
-    pub fn prune_orphan_active_state(
+    fn prune_orphan_active_state(
         &self,
         below: JobId,
     ) -> Result<OrphanActiveStateCounts, StateError> {

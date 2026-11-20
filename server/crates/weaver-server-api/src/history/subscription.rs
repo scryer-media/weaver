@@ -2,6 +2,9 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use weaver_server_core::history::queries::HistoryQueries;
+use weaver_server_core::operations::async_ops::OperationsAsyncOpsQueries;
+use weaver_server_core::tags::TagsQueries;
 
 #[derive(Default)]
 pub(crate) struct HistorySubscription;
@@ -263,6 +266,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use weaver_server_core::history::nzbget_state::HistoryNzbgetStateQueries;
+    use weaver_server_core::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
 
     fn handle_with(jobs: Vec<weaver_server_core::JobInfo>) -> SchedulerHandle {
         let (event_tx, _event_rx) = tokio::sync::broadcast::channel(1);

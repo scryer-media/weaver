@@ -2,6 +2,13 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::history::queries::HistoryQueries;
+use crate::jobs::graph_checkpoint::JobsGraphCheckpointInternalQueries;
+use crate::jobs::repository::JobsRepositoryQueries;
+use crate::post_processing::settings::PostProcessingSettingsQueries;
+use crate::settings::SettingsArchivePasswordsQueries;
+use crate::torrents::persistence::TorrentsPersistenceInsertPlacedTorrentInternalQueries;
+use crate::torrents::queries::TorrentsQueries;
 
 // A member with an extension the operator does not want, found inside an
 // archive the torrent carries while it is short of a piece, ends its

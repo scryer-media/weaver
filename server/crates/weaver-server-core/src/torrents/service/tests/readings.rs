@@ -5,6 +5,15 @@
 // what `changes` tells a follower that reads the views for itself, and an
 // idle one costs no view and no statement.
 
+use crate::history::queries::HistoryQueries;
+use crate::jobs::repository::JobsRepositoryQueries;
+use crate::operations::async_ops::OperationsAsyncOpsQueries;
+use crate::post_processing::events::PostProcessingEventsInvalidateQueueScriptAdmissionInternalQueries;
+use crate::tags::TagsQueries;
+use crate::torrents::persistence::TorrentsPersistenceInsertPlacedTorrentInternalQueries;
+use crate::torrents::persistence::TorrentsPersistenceInsertTorrentQueries;
+use crate::torrents::persistence::TorrentsPersistenceJobHistoryFilesInternalQueries;
+use crate::torrents::queries::TorrentsQueries;
 use std::collections::BTreeSet;
 
 use crate::post_processing::model::QueueEvent;

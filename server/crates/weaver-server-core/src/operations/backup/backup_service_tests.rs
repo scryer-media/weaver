@@ -2,6 +2,19 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
+use crate::history::queries::HistoryQueries;
+use crate::history::timeline::HistoryTimelineQueries;
+use crate::jobs::queries::JobsQueries;
+use crate::operations::backup::OperationsBackupLogicalInternalQueries;
+use crate::operations::recovery::credentials::StoredCredentialQueries;
+use crate::servers::persistence::ServersPersistenceInternalQueries;
+use crate::servers::queries::ServersQueries;
+use crate::servers::repository::ServersRepositoryQueries;
+use crate::settings::persistence::SettingsPersistenceQueries;
+use crate::settings::queries::SettingsQueries;
+use crate::settings::service::SettingsServiceQueries;
+use crate::tags::TagsQueries;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc as StdArc;

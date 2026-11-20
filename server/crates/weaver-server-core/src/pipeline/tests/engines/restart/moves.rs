@@ -6,6 +6,7 @@
 // committed, so wherever the job goes down, the restore finds every file
 // at a name its checkpoint gives it, and fetches nothing it had on disk.
 
+use crate::jobs::graph_checkpoint::JobsGraphCheckpointInternalQueries;
 use std::sync::Arc;
 
 use super::*;

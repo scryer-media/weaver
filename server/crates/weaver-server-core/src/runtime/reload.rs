@@ -3,6 +3,8 @@
 
 use crate::Database;
 use crate::jobs::{Hold, HoldOrigin, HoldOwner, HoldSet};
+use crate::settings::queries::SettingsQueries;
+use crate::settings::service::SettingsServiceQueries;
 use crate::settings::{Config, SharedConfig};
 use crate::{NntpRuntimeActivation, SchedulerError, SchedulerHandle};
 
@@ -232,6 +234,10 @@ pub async fn reload_runtime_from_db(
 
 #[cfg(test)]
 mod tests {
+    use crate::proxies::ProxiesNetworkPersistenceQueries;
+    use crate::servers::persistence::ServersPersistenceQueries;
+    use crate::settings::SettingsSchedulesQueries;
+    use crate::settings::service::SettingsServiceQueries;
     use std::sync::Arc;
 
     use tokio::sync::{RwLock, broadcast};

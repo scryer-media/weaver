@@ -11,6 +11,7 @@
 // the disk full: the job waits for room, not failed, and completes once
 // there is room.
 
+use crate::history::queries::HistoryQueries;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

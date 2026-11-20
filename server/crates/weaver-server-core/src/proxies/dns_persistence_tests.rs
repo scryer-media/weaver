@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::proxies::ProxiesPersistenceQueries;
 use crate::proxies::{ListedServer, ListedWire, ProxySecrets, RouteLeg, RoutingPolicy};
 
 fn refused<T: std::fmt::Debug>(result: Result<T, StateError>) -> &'static str {

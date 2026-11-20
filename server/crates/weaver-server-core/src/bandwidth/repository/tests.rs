@@ -2,6 +2,8 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::bandwidth::persistence::BandwidthPersistenceQueries;
+use crate::bandwidth::queries::BandwidthQueries;
 
 #[tokio::test]
 async fn quota_metering_migration_preserves_existing_sqlite_usage() {

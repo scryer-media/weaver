@@ -12,6 +12,11 @@ use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use weaver_server_core::categories::persistence::CategoriesPersistenceQueries;
+use weaver_server_core::rss::RssPersistenceQueries;
+use weaver_server_core::rss::RssQueries;
+use weaver_server_core::settings::service::SettingsServiceQueries;
+use weaver_server_core::tags::TagsQueries;
 
 use axum::Router;
 use axum::extract::{ConnectInfo, Extension, FromRequest, Multipart, Query, Request};

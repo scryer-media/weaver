@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::servers::repository::ServersRepositoryQueries;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -1130,6 +1131,9 @@ fn snapshot_for_policy(
 
 #[cfg(test)]
 mod tests {
+    use crate::proxies::ProxiesNetworkPersistenceQueries;
+    use crate::servers::persistence::ServersPersistenceQueries;
+    use crate::servers::repository::ServersRepositoryQueries;
     use chrono::{Local, TimeZone};
 
     use crate::bandwidth::QuotaWeekday;

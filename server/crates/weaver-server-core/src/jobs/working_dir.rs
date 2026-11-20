@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::jobs::persistence::JobsPersistenceQueries;
+use crate::settings::persistence::SettingsPersistenceQueries;
+use crate::settings::queries::SettingsQueries;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -1411,6 +1414,8 @@ fn output_marker_value(dir: &Path, job_id: JobId) -> std::io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::persistence::SettingsPersistenceQueries;
+    use crate::settings::queries::SettingsQueries;
 
     #[test]
     fn working_directory_ownership_is_bound_to_job_and_directory() {

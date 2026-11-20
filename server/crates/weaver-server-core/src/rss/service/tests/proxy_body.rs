@@ -3,6 +3,7 @@
 
 use super::proxy_routing::{Fixture, service};
 use super::*;
+use crate::proxies::ProxiesPersistenceQueries;
 use crate::proxies::{Consumer, ProxyKind, RoutingPolicy};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

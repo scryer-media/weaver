@@ -6,14 +6,18 @@ use super::ids::JobId;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::{Database, StateError};
 
-impl Database {
-    // Put a finishing job's summary on its active row. The history archive,
-    // queued after this write, copies it from there.
-    pub fn save_active_download_summary(
+pub trait JobsDownloadSummaryPersistenceQueries {
+    fn save_active_download_summary(&self, job_id: JobId, json: String) -> Result<(), StateError>;
+    fn history_download_summary(
         &self,
         job_id: JobId,
-        json: String,
-    ) -> Result<(), StateError> {
+    ) -> Result<Option<DownloadSummary>, StateError>;
+}
+
+impl JobsDownloadSummaryPersistenceQueries for Database {
+    // Put a finishing job's summary on its active row. The history archive,
+    // queued after this write, copies it from there.
+    fn save_active_download_summary(&self, job_id: JobId, json: String) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "active_download_summary", |tx| {
@@ -35,7 +39,7 @@ impl Database {
     // A finished job's summary: one column of its history row, by its key.
     // `None` for a job still in the queue, one that finished before
     // summaries were kept, or one whose summary this build cannot read.
-    pub fn history_download_summary(
+    fn history_download_summary(
         &self,
         job_id: JobId,
     ) -> Result<Option<DownloadSummary>, StateError> {
@@ -54,13 +58,19 @@ impl Database {
                 .and_then(|json| DownloadSummary::from_storage_json(&json)))
         })
     }
+}
 
+#[cfg(test)]
+pub(crate) trait JobsDownloadSummaryPersistenceInternalQueries {
+    #[cfg(test)]
+    fn history_download_summary_text(&self, job_id: JobId) -> Result<Option<String>, StateError>;
+}
+
+#[cfg(test)]
+impl JobsDownloadSummaryPersistenceInternalQueries for Database {
     // The stored text of a history row's summary, as written.
     #[cfg(test)]
-    pub(crate) fn history_download_summary_text(
-        &self,
-        job_id: JobId,
-    ) -> Result<Option<String>, StateError> {
+    fn history_download_summary_text(&self, job_id: JobId) -> Result<Option<String>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let row = SqlRuntime::fetch_optional(
@@ -81,6 +91,8 @@ impl Database {
 mod tests {
     use super::*;
     use crate::JobHistoryRow;
+    use crate::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
+    use crate::history::queries::HistoryQueries;
     use crate::jobs::download_summary::{DOWNLOAD_SUMMARY_VERSION, Layout};
 
     fn history_row(id: u64) -> JobHistoryRow {

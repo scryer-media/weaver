@@ -15,6 +15,8 @@
 // subscription read one source and a restart does not lose the run that caused
 // it.
 
+use crate::settings::persistence::SettingsPersistenceQueries;
+use crate::settings::queries::SettingsQueries;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

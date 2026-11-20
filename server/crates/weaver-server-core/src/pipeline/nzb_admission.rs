@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::jobs::persistence::JobsPersistenceInternalQueries;
 use crate::pipeline::download::LoginRefusalView;
 use crate::pipeline::queue::Change;
 use weaver_server_disk::operations::room_wait::ever_downloaded;

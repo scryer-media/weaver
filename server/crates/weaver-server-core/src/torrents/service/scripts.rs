@@ -8,6 +8,7 @@
 // (`Application::runExternalProgram`), so the torrent never waits on it:
 // here each event is queued and the torrent goes on.
 
+use crate::post_processing::events::PostProcessingEventsInvalidateQueueScriptAdmissionInternalQueries;
 use std::path::PathBuf;
 
 use super::{Live, TorrentService, TorrentView};

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use weaver_server_core::post_processing::instances::PostProcessingInstancesQueries;
+use weaver_server_core::rss::RssQueries;
 mod common;
 
 use common::{TestHarness, assert_has_errors, assert_no_errors, response_data};

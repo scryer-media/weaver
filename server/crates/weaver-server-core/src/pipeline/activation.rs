@@ -20,6 +20,9 @@
 
 use super::*;
 use crate::jobs::model::{ActiveArticles, FileSummaries, FileSummary, JobArticles, SegmentSpec};
+use crate::jobs::persistence::JobsPersistenceInternalQueries;
+use crate::jobs::persistence::JobsPersistenceQueries;
+use crate::jobs::queries::JobsQueries;
 use crate::pipeline::download::queue::DownloadQueue;
 use crate::pipeline::download::repeated::RepeatedArticles;
 use crate::pipeline::graph::restore::{GraphRestore, GraphRestoreError, RestoreSeat, root_files};

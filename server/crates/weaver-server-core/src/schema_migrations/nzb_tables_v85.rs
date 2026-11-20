@@ -261,6 +261,9 @@ async fn compress_outlines(conn: &mut SqlConn<'_>) -> Result<(), StateError> {
 
 #[cfg(test)]
 mod tests {
+    use crate::history::queries::HistoryQueries;
+    use crate::jobs::outline_persistence::JobsOutlinePersistenceInternalQueries;
+    use crate::jobs::queries::JobsQueries;
     use std::collections::HashMap;
     use std::path::Path;
 

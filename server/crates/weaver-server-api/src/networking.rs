@@ -10,6 +10,13 @@ use async_graphql::{
     Context, Enum, InputObject, Object, OneofObject, Result, SimpleObject, Subscription,
 };
 use std::{sync::Arc, time::Duration};
+use weaver_server_core::categories::queries::CategoriesQueries;
+use weaver_server_core::proxies::ProxiesNetworkPersistenceQueries;
+use weaver_server_core::proxies::ProxiesPersistenceQueries;
+use weaver_server_core::rss::RssQueries;
+use weaver_server_core::servers::queries::ServersQueries;
+use weaver_server_core::settings::SettingsSchedulesQueries;
+use weaver_server_core::settings::repository::SettingsRepositoryQueries;
 use weaver_server_core::{
     Database,
     proxies::{self as core, NetworkRefusal, ProxyRuntime},

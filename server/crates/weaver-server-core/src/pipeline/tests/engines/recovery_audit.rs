@@ -3,6 +3,7 @@
 
 use super::harness::{Post, Scenario, par2_set, par3_set, payload, run};
 use crate::jobs::model::JobStatus;
+use crate::jobs::queries::JobsQueries;
 use crate::pipeline::tests::direct_store::scenarios::sevenz_store::{
     Entry, build_7z_shaped, split_volumes,
 };

@@ -3,6 +3,9 @@
 
 // The pipeline's hooks into a graph job's status.
 
+use crate::jobs::JobsArchivePasswordInternalQueries;
+use crate::jobs::persistence::JobsPersistenceQueries;
+use crate::jobs::queries::JobsQueries;
 use tracing::{debug, info, warn};
 use weaver_graph::recovery::{RepairOutcome, SetRuling};
 use weaver_graph::slots::AskerId;

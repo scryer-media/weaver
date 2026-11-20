@@ -42,8 +42,30 @@ const RSS_SEEN_SELECT: &str =
         seen_at, job_id, item_url, error
    FROM rss_seen_items";
 
-impl Database {
-    pub fn next_rss_feed_id(&self) -> Result<u32, StateError> {
+pub trait RssQueries {
+    fn next_rss_feed_id(&self) -> Result<u32, StateError>;
+    fn next_rss_rule_id(&self) -> Result<u32, StateError>;
+    fn list_rss_feeds(&self) -> Result<Vec<RssFeedRow>, StateError>;
+    fn get_rss_feed(&self, id: u32) -> Result<Option<RssFeedRow>, StateError>;
+    fn list_rss_rules(&self, feed_id: u32) -> Result<Vec<RssRuleRow>, StateError>;
+    fn get_rss_rule(&self, id: u32) -> Result<Option<RssRuleRow>, StateError>;
+    fn rss_seen_item_key(&self, item_id: &str) -> String;
+    fn rss_seen_item_exists(&self, feed_id: u32, item_id: &str) -> Result<bool, StateError>;
+    fn seen_rss_item_ids(
+        &self,
+        feed_id: u32,
+        item_ids: &[String],
+    ) -> Result<std::collections::HashSet<String>, StateError>;
+    fn list_rss_seen_items(
+        &self,
+        feed_id: Option<u32>,
+        limit: Option<u32>,
+    ) -> Result<Vec<RssSeenItemRow>, StateError>;
+    fn list_rss_seen_items_per_feed(&self, limit: u32) -> Result<Vec<RssSeenItemRow>, StateError>;
+}
+
+impl RssQueries for Database {
+    fn next_rss_feed_id(&self) -> Result<u32, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let row = SqlRuntime::fetch_optional(
@@ -61,7 +83,7 @@ impl Database {
         })
     }
 
-    pub fn next_rss_rule_id(&self) -> Result<u32, StateError> {
+    fn next_rss_rule_id(&self) -> Result<u32, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let row = SqlRuntime::fetch_optional(
@@ -79,7 +101,7 @@ impl Database {
         })
     }
 
-    pub fn list_rss_feeds(&self) -> Result<Vec<RssFeedRow>, StateError> {
+    fn list_rss_feeds(&self) -> Result<Vec<RssFeedRow>, StateError> {
         use crate::persistence::encryption::maybe_decrypt;
 
         let datastore = self.datastore();
@@ -119,7 +141,7 @@ impl Database {
         })
     }
 
-    pub fn get_rss_feed(&self, id: u32) -> Result<Option<RssFeedRow>, StateError> {
+    fn get_rss_feed(&self, id: u32) -> Result<Option<RssFeedRow>, StateError> {
         use crate::persistence::encryption::maybe_decrypt;
 
         let datastore = self.datastore();
@@ -151,65 +173,7 @@ impl Database {
         })
     }
 
-    // When each feed is next due, without loading or decrypting the feeds.
-    pub(crate) fn list_rss_feed_schedules(
-        &self,
-    ) -> Result<Vec<crate::rss::model::RssFeedSchedule>, StateError> {
-        let mut cached = self
-            .rss_schedule_cache
-            .rows
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if let Some(rows) = cached.as_ref() {
-            return Ok(rows.clone());
-        }
-        let datastore = self.datastore();
-        let rows: Vec<_> = self.run_sql_blocking_read(async move {
-            SqlRuntime::fetch_all(
-                datastore.read_exec(),
-                "SELECT id, enabled, poll_interval_secs, last_polled_at
-                   FROM rss_feeds ORDER BY id",
-                &[],
-            )
-            .await?
-            .into_iter()
-            .map(|row| {
-                Ok(crate::rss::model::RssFeedSchedule {
-                    id: row.i32("id")? as u32,
-                    enabled: row.bool("enabled")?,
-                    poll_interval_secs: row.i32("poll_interval_secs")? as u32,
-                    last_polled_at: row.opt_i64("last_polled_at")?,
-                })
-            })
-            .collect()
-        })?;
-        #[cfg(test)]
-        self.rss_schedule_cache
-            .loads
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        *cached = Some(rows.clone());
-        Ok(rows)
-    }
-
-    pub(crate) fn invalidate_rss_schedules(&self) {
-        *self
-            .rss_schedule_cache
-            .rows
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = None;
-        self.rss_schedule_cache
-            .changed
-            .send_modify(|revision| *revision = revision.wrapping_add(1));
-    }
-
-    // Re-run the due check without discarding the cached schedules.
-    pub(crate) fn wake_rss_scheduler(&self) {
-        self.rss_schedule_cache
-            .changed
-            .send_modify(|revision| *revision = revision.wrapping_add(1));
-    }
-
-    pub fn list_rss_rules(&self, feed_id: u32) -> Result<Vec<RssRuleRow>, StateError> {
+    fn list_rss_rules(&self, feed_id: u32) -> Result<Vec<RssRuleRow>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
@@ -222,7 +186,7 @@ impl Database {
         })
     }
 
-    pub fn get_rss_rule(&self, id: u32) -> Result<Option<RssRuleRow>, StateError> {
+    fn get_rss_rule(&self, id: u32) -> Result<Option<RssRuleRow>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
@@ -238,11 +202,11 @@ impl Database {
 
     /// The id a seen item is stored and listed under: the BLAKE3 digest of
     /// the id its feed gives it.
-    pub fn rss_seen_item_key(&self, item_id: &str) -> String {
+    fn rss_seen_item_key(&self, item_id: &str) -> String {
         super::persistence::seen_item_key(super::persistence::SeenId::Id(item_id))
     }
 
-    pub fn rss_seen_item_exists(&self, feed_id: u32, item_id: &str) -> Result<bool, StateError> {
+    fn rss_seen_item_exists(&self, feed_id: u32, item_id: &str) -> Result<bool, StateError> {
         let datastore = self.datastore();
         let [keyed, item_id] = super::persistence::seen_item_keys(item_id);
         self.run_sql_blocking_read(async move {
@@ -264,7 +228,7 @@ impl Database {
     /// chunk, served by the table's key. The ids are the feed's own; each
     /// is looked up by the digest it is stored as, and by itself, as a row
     /// stored before the digest holds it until the sealing pass.
-    pub fn seen_rss_item_ids(
+    fn seen_rss_item_ids(
         &self,
         feed_id: u32,
         item_ids: &[String],
@@ -306,7 +270,7 @@ impl Database {
         })
     }
 
-    pub fn list_rss_seen_items(
+    fn list_rss_seen_items(
         &self,
         feed_id: Option<u32>,
         limit: Option<u32>,
@@ -339,10 +303,7 @@ impl Database {
     /// The `limit` items each feed saw last, in one statement: feed by
     /// feed, each feed's items in the order `list_rss_seen_items` gives
     /// for that feed alone.
-    pub fn list_rss_seen_items_per_feed(
-        &self,
-        limit: u32,
-    ) -> Result<Vec<RssSeenItemRow>, StateError> {
+    fn list_rss_seen_items_per_feed(&self, limit: u32) -> Result<Vec<RssSeenItemRow>, StateError> {
         let key = self.encryption_key().cloned();
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
@@ -369,6 +330,74 @@ impl Database {
                 })
                 .collect()
         })
+    }
+}
+
+pub(crate) trait RssInternalQueries {
+    fn list_rss_feed_schedules(
+        &self,
+    ) -> Result<Vec<crate::rss::model::RssFeedSchedule>, StateError>;
+    fn invalidate_rss_schedules(&self);
+    fn wake_rss_scheduler(&self);
+}
+
+impl RssInternalQueries for Database {
+    // When each feed is next due, without loading or decrypting the feeds.
+    fn list_rss_feed_schedules(
+        &self,
+    ) -> Result<Vec<crate::rss::model::RssFeedSchedule>, StateError> {
+        let mut cached = self
+            .rss_schedule_cache
+            .rows
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(rows) = cached.as_ref() {
+            return Ok(rows.clone());
+        }
+        let datastore = self.datastore();
+        let rows: Vec<_> = self.run_sql_blocking_read(async move {
+            SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT id, enabled, poll_interval_secs, last_polled_at
+                   FROM rss_feeds ORDER BY id",
+                &[],
+            )
+            .await?
+            .into_iter()
+            .map(|row| {
+                Ok(crate::rss::model::RssFeedSchedule {
+                    id: row.i32("id")? as u32,
+                    enabled: row.bool("enabled")?,
+                    poll_interval_secs: row.i32("poll_interval_secs")? as u32,
+                    last_polled_at: row.opt_i64("last_polled_at")?,
+                })
+            })
+            .collect()
+        })?;
+        #[cfg(test)]
+        self.rss_schedule_cache
+            .loads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *cached = Some(rows.clone());
+        Ok(rows)
+    }
+
+    fn invalidate_rss_schedules(&self) {
+        *self
+            .rss_schedule_cache
+            .rows
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+        self.rss_schedule_cache
+            .changed
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+    }
+
+    // Re-run the due check without discarding the cached schedules.
+    fn wake_rss_scheduler(&self) {
+        self.rss_schedule_cache
+            .changed
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
 }
 

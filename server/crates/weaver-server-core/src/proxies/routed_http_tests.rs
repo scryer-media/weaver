@@ -3,6 +3,10 @@
 
 use super::*;
 use crate::Database;
+use crate::categories::persistence::CategoriesPersistenceQueries;
+use crate::proxies::ProxiesDnsPersistenceQueries;
+use crate::proxies::ProxiesNetworkPersistenceQueries;
+use crate::proxies::ProxiesPersistenceQueries;
 use crate::proxies::{LegHealthState, ProxyKind, outbound_only_through};
 use axum::Router;
 use axum::http::{HeaderMap, StatusCode, header};

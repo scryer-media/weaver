@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::bandwidth::queries::BandwidthQueries;
 
 fn quota(period: ServerDownloadQuotaPeriod) -> ServerDownloadQuotaConfig {
     ServerDownloadQuotaConfig {

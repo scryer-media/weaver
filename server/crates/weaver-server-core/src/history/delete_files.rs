@@ -3,7 +3,13 @@
 
 use crate::JobId;
 use crate::history::output_files::OutputFileListing;
+use crate::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
+use crate::history::persistence::HistoryPersistenceRecordArchivedHistoryFilesInternalQueries;
+use crate::history::queries::HistoryQueries;
+use crate::post_processing::events::PostProcessingEventsInvalidateQueueScriptAdmissionInternalQueries;
+use crate::post_processing::events::PostProcessingEventsScriptStartsInternalQueries;
 use crate::torrents::persistence::HistoryFile;
+use crate::torrents::persistence::TorrentsPersistenceTorrentHistoryListsInternalQueries;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::Duration;

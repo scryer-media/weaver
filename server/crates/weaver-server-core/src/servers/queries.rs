@@ -6,8 +6,14 @@ use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::servers::{ServerConfig, ServerDownloadQuotaPeriod, record::ServerRecord};
 
-impl Database {
-    pub fn list_servers(&self) -> Result<Vec<ServerConfig>, StateError> {
+pub trait ServersQueries {
+    fn list_servers(&self) -> Result<Vec<ServerConfig>, StateError>;
+    fn next_server_id(&self) -> Result<u32, StateError>;
+    fn server_pipelining_depth(&self, id: u32) -> Result<Option<u8>, StateError>;
+}
+
+impl ServersQueries for Database {
+    fn list_servers(&self) -> Result<Vec<ServerConfig>, StateError> {
         use crate::persistence::encryption::maybe_decrypt;
 
         let datastore = self.datastore();
@@ -88,7 +94,7 @@ impl Database {
         })
     }
 
-    pub fn next_server_id(&self) -> Result<u32, StateError> {
+    fn next_server_id(&self) -> Result<u32, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let row = SqlRuntime::fetch_optional(
@@ -112,7 +118,7 @@ impl Database {
     // Read just the proven BODY pipelining depth. The download runtime writes
     // this column behind the in-memory config, so an editor that wants to keep
     // it has to ask the database rather than the config it already holds.
-    pub fn server_pipelining_depth(&self, id: u32) -> Result<Option<u8>, StateError> {
+    fn server_pipelining_depth(&self, id: u32) -> Result<Option<u8>, StateError> {
         let datastore = self.datastore();
         let args = vec![SqlArg::I64(i64::from(id))];
         self.run_sql_blocking_read(async move {

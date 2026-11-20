@@ -6,6 +6,7 @@
 // from the interface check and from the hops' own dials, so an idle daemon
 // does no work here beyond waking for a down held by the quiet period.
 
+use crate::post_processing::events::PostProcessingEventsInvalidateQueueScriptAdmissionInternalQueries;
 use std::sync::Arc;
 
 use super::events::EventContext;

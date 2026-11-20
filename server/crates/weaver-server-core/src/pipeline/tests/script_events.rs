@@ -3,11 +3,17 @@
 
 use super::*;
 use crate::post_processing::effects::JobScriptEffects;
+use crate::post_processing::effects::PostProcessingEffectsQueries;
 use crate::post_processing::events::EventContext;
+use crate::post_processing::events::PostProcessingEventsCancelEventScriptsQueries;
+use crate::post_processing::events::PostProcessingEventsInvalidateQueueScriptAdmissionInternalQueries;
+use crate::post_processing::instances::PostProcessingInstancesQueries;
 use crate::post_processing::instances::{InstanceTrigger, ScriptInstanceDraft};
 use crate::post_processing::model::{
     PostProcessingSettings, QueueEvent, ScriptEventLabel, ScriptName, ScriptStatus,
 };
+use crate::post_processing::output::PostProcessingOutputQueries;
+use crate::post_processing::settings::PostProcessingSettingsQueries;
 
 fn queue_instance(event: QueueEvent) -> ScriptInstanceDraft {
     ScriptInstanceDraft::new(

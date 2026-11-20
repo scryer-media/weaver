@@ -2,6 +2,9 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::jobs::queries::JobsQueries;
+use crate::settings::persistence::SettingsPersistenceQueries;
+use crate::settings::service::SettingsServiceQueries;
 use std::io::Write;
 
 fn sample_nzb_bytes() -> &'static [u8] {

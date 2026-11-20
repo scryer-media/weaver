@@ -1,6 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+pub mod credentials;
+
+use crate::history::queries::HistoryQueries;
+use crate::jobs::graph_checkpoint::JobsGraphCheckpointInternalQueries;
+use crate::jobs::outline_persistence::JobsOutlinePersistenceInternalQueries;
+use crate::jobs::queries::JobsQueries;
+use crate::jobs::repository::JobsRepositoryQueries;
+use crate::settings::persistence::SettingsPersistenceQueries;
+use crate::torrents::persistence::TorrentsPersistenceMarkTorrentRetiringInternalQueries;
+use crate::torrents::persistence::TorrentsPersistenceTorrentHistoryListsInternalQueries;
+use crate::torrents::queries::TorrentsInternalQueries;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -730,6 +741,13 @@ fn cleanup_unlisted_intermediate_dirs(
 #[cfg(test)]
 mod tests {
     use super::recover_server_state;
+    use crate::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
+    use crate::history::queries::HistoryQueries;
+    use crate::jobs::outline_persistence::JobsOutlinePersistenceInternalQueries;
+    use crate::jobs::persistence::JobsPersistenceInternalQueries;
+    use crate::jobs::persistence::JobsPersistenceQueries;
+    use crate::jobs::queries::JobsInternalQueries;
+    use crate::jobs::queries::JobsQueries;
     use std::path::PathBuf;
 
     use tempfile::TempDir;

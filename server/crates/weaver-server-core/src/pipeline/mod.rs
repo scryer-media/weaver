@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::jobs::persistence::JobsPersistenceQueries;
+use crate::jobs::queries::JobsQueries;
+use crate::settings::archive_passwords::SettingsArchivePasswordsInternalQueries;
 mod activation;
 pub(crate) use activation::read_stored_spec_and_passwords;
 pub(crate) use completion::finalize::{

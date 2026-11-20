@@ -11,6 +11,8 @@ use super::*;
 use crate::post_processing::model::{QueueEvent, vars};
 use crate::settings::model::TrackerRule;
 use crate::settings::{Seeding, SeedingAction};
+use crate::torrents::persistence::TorrentsPersistenceInsertPlacedTorrentInternalQueries;
+use crate::torrents::persistence::TorrentsPersistenceInsertTorrentQueries;
 use crate::torrents::service::disk_room::{DiskHeld, StartHold};
 use crate::torrents::service::live::Live;
 use crate::torrents::service::queue::QueueEnd;

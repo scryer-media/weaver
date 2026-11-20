@@ -316,6 +316,9 @@ fn scan_run_incomplete(result: &super::model::ScriptResult) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::post_processing::instances::PostProcessingInstancesQueries;
+    use crate::post_processing::settings::PostProcessingSettingsQueries;
+    use crate::settings::service::SettingsServiceQueries;
 
     #[test]
     fn scan_only_applies_changed_environment_fields() {

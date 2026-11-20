@@ -10,6 +10,7 @@
 // and every later run takes a read lock to find them. The name itself is
 // only read again at scrape time.
 
+use crate::post_processing::settings::PostProcessingSettingsQueries;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU32, AtomicU64, Ordering};
@@ -616,9 +617,13 @@ pub fn snapshot(db: &Database) -> ScriptRunMetricsSnapshot {
     snapshot
 }
 
-impl Database {
+pub trait PostProcessingRunMetricsQueries {
+    fn script_event_backlog(&self) -> Result<u64, StateError>;
+}
+
+impl PostProcessingRunMetricsQueries for Database {
     // Queue events recorded but not yet started.
-    pub fn script_event_backlog(&self) -> Result<u64, StateError> {
+    fn script_event_backlog(&self) -> Result<u64, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             Ok(SqlRuntime::fetch_optional(

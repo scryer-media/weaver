@@ -6,6 +6,7 @@
 // store's holds, the extraction concurrency or the extraction limits gets
 // the same limits here.
 
+use crate::post_processing::settings::PostProcessingSettingsQueries;
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;

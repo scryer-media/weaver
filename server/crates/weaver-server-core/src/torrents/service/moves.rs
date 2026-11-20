@@ -11,6 +11,8 @@ use crate::jobs::JobId;
 use crate::pipeline::claim_complete_destination_path;
 use crate::torrents::files;
 use crate::torrents::model::Adopted;
+use crate::torrents::persistence::TorrentsPersistenceInsertPlacedTorrentInternalQueries;
+use crate::torrents::persistence::TorrentsPersistenceInsertTorrentQueries;
 use crate::torrents::relocate;
 use crate::torrents::relocate::{Existing, MoveError};
 use crate::torrents::storage::Pieces;

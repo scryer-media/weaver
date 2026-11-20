@@ -530,10 +530,33 @@ async fn profiles_using_list(tx: &mut SqlTx<'_>, id: u32) -> Result<Vec<String>,
     .collect()
 }
 
-impl Database {
+pub trait ProxiesDnsPersistenceQueries {
+    fn list_dns_server_lists(&self) -> Result<Vec<DnsServerList>, StateError>;
+    fn list_dns_profiles(&self) -> Result<Vec<DnsProfile>, StateError>;
+    fn list_dns_profiles_of(
+        &self,
+        kind: Option<DnsProfileKind>,
+    ) -> Result<Vec<DnsProfile>, StateError>;
+    fn dns_profile(&self, id: u32) -> Result<Option<DnsProfile>, StateError>;
+    fn load_dns(&self) -> Result<StoredDns, StateError>;
+    fn dns_list_users(&self, ids: &[u32]) -> Result<HashMap<u32, Vec<String>>, StateError>;
+    fn dns_profile_proxy_counts(&self) -> Result<HashMap<u32, u32>, StateError>;
+    fn dns_profile_route_counts(&self) -> Result<HashMap<u32, u32>, StateError>;
+    fn save_dns_server_list(
+        &self,
+        list: DnsServerList,
+        create: bool,
+    ) -> Result<DnsServerList, StateError>;
+    fn delete_dns_server_list(&self, id: u32) -> Result<(), StateError>;
+    fn save_dns_profile(&self, profile: DnsProfile, create: bool)
+    -> Result<DnsProfile, StateError>;
+    fn delete_dns_profile(&self, id: u32) -> Result<(), StateError>;
+}
+
+impl ProxiesDnsPersistenceQueries for Database {
     /// Every saved server list, in id order. A list whose stored servers
     /// cannot be read is given with none; saving it again repairs it.
-    pub fn list_dns_server_lists(&self) -> Result<Vec<DnsServerList>, StateError> {
+    fn list_dns_server_lists(&self) -> Result<Vec<DnsServerList>, StateError> {
         let store = self.datastore();
         self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_all(
@@ -549,14 +572,14 @@ impl Database {
     }
 
     /// Every profile, the built-in System profile first, then by id.
-    pub fn list_dns_profiles(&self) -> Result<Vec<DnsProfile>, StateError> {
+    fn list_dns_profiles(&self) -> Result<Vec<DnsProfile>, StateError> {
         self.list_dns_profiles_of(None)
     }
 
     /// The profiles something taking `kind` may select, in the order of
     /// `list_dns_profiles`: the built-in System profile, then the saved
     /// profiles of that kind. `None` is every profile.
-    pub fn list_dns_profiles_of(
+    fn list_dns_profiles_of(
         &self,
         kind: Option<DnsProfileKind>,
     ) -> Result<Vec<DnsProfile>, StateError> {
@@ -583,7 +606,7 @@ impl Database {
 
     /// Profile `id`, the built-in System profile for its id, or `None`
     /// when no profile has it.
-    pub fn dns_profile(&self, id: u32) -> Result<Option<DnsProfile>, StateError> {
+    fn dns_profile(&self, id: u32) -> Result<Option<DnsProfile>, StateError> {
         if id == SYSTEM_DNS_PROFILE_ID {
             return Ok(Some(DnsProfile::system()));
         }
@@ -602,7 +625,7 @@ impl Database {
     }
 
     /// The lists and profiles as the routing configuration loads them.
-    pub fn load_dns(&self) -> Result<StoredDns, StateError> {
+    fn load_dns(&self) -> Result<StoredDns, StateError> {
         let store = self.datastore();
         self.run_sql_blocking_read(async move {
             let mut stored = StoredDns::default();
@@ -634,7 +657,7 @@ impl Database {
     }
 
     /// The names of the profiles using each list in `ids`.
-    pub fn dns_list_users(&self, ids: &[u32]) -> Result<HashMap<u32, Vec<String>>, StateError> {
+    fn dns_list_users(&self, ids: &[u32]) -> Result<HashMap<u32, Vec<String>>, StateError> {
         let mut ids = ids.to_vec();
         ids.sort_unstable();
         ids.dedup();
@@ -665,7 +688,7 @@ impl Database {
 
     /// How many proxies have their address found by each profile, counted
     /// in SQL.
-    pub fn dns_profile_proxy_counts(&self) -> Result<HashMap<u32, u32>, StateError> {
+    fn dns_profile_proxy_counts(&self) -> Result<HashMap<u32, u32>, StateError> {
         let store = self.datastore();
         self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_all(
@@ -686,7 +709,7 @@ impl Database {
     }
 
     /// How many routes use each profile, counted in SQL.
-    pub fn dns_profile_route_counts(&self) -> Result<HashMap<u32, u32>, StateError> {
+    fn dns_profile_route_counts(&self) -> Result<HashMap<u32, u32>, StateError> {
         let store = self.datastore();
         self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_all(
@@ -707,7 +730,7 @@ impl Database {
     }
 
     /// Save `list`: a new one when it has no id, else the saved one.
-    pub fn save_dns_server_list(
+    fn save_dns_server_list(
         &self,
         list: DnsServerList,
         create: bool,
@@ -757,7 +780,7 @@ impl Database {
     }
 
     /// Delete list `id`, refused while a profile uses it.
-    pub fn delete_dns_server_list(&self, id: u32) -> Result<(), StateError> {
+    fn delete_dns_server_list(&self, id: u32) -> Result<(), StateError> {
         let store = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&store, "delete_dns_server_list", |tx| {
@@ -784,7 +807,7 @@ impl Database {
 
     /// Save `profile`: a new one when `create`, else the saved one. The
     /// routes using it are checked against the saved profile.
-    pub fn save_dns_profile(
+    fn save_dns_profile(
         &self,
         profile: DnsProfile,
         create: bool,
@@ -852,7 +875,7 @@ impl Database {
 
     /// Delete profile `id`, refused for the built-in profile and while a
     /// route or a proxy uses it.
-    pub fn delete_dns_profile(&self, id: u32) -> Result<(), StateError> {
+    fn delete_dns_profile(&self, id: u32) -> Result<(), StateError> {
         if id == SYSTEM_DNS_PROFILE_ID {
             return Err(NetworkRefusal::DnsProfileBuiltIn.into());
         }

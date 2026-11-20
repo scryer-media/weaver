@@ -8,7 +8,12 @@
 
 use super::*;
 use crate::post_processing::events::EventContext;
+use crate::post_processing::events::PostProcessingEventsCancelEventScriptsQueries;
+use crate::post_processing::events::PostProcessingEventsInvalidateQueueScriptAdmissionInternalQueries;
 use crate::post_processing::model::{QueueEvent, ScriptEventLabel, vars};
+use crate::post_processing::settings::PostProcessingSettingsQueries;
+use crate::tags::TagsQueries;
+use crate::torrents::queries::TorrentsQueries;
 
 // No NZB_ event was queued for any job.
 fn assert_no_nzb_events(db: &Database) {

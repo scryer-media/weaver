@@ -6,11 +6,12 @@ use crate::categories::CategoryConfig;
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::SqlRuntime;
 
-impl Database {
-    pub(crate) fn replace_categories(
-        &self,
-        categories: &[CategoryConfig],
-    ) -> Result<(), StateError> {
+pub(crate) trait CategoriesServiceInternalQueries {
+    fn replace_categories(&self, categories: &[CategoryConfig]) -> Result<(), StateError>;
+}
+
+impl CategoriesServiceInternalQueries for Database {
+    fn replace_categories(&self, categories: &[CategoryConfig]) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking({
             let categories = categories.to_vec();

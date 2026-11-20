@@ -2,6 +2,9 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::post_processing::effects::PostProcessingEffectsQueries;
+use crate::post_processing::events::PostProcessingEventsInvalidateQueueScriptAdmissionInternalQueries;
+use crate::post_processing::settings::PostProcessingSettingsQueries;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 

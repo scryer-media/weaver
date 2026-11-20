@@ -5,6 +5,8 @@
 // and paging every torrent's view gives.
 
 use super::*;
+use crate::torrents::persistence::TorrentsPersistenceInsertTorrentQueries;
+use crate::torrents::queries::TorrentsInternalQueries;
 use crate::torrents::service::listing::{CategoryPick, FileTotals, Pick, Shown, Window, page};
 use crate::torrents::service::updates::Follow;
 

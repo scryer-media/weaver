@@ -17,6 +17,7 @@ use crate::jobs::model::Protocol;
 use crate::jobs::model::{FieldUpdate, JobUpdate, PRIORITY_ATTRIBUTE_KEY};
 use crate::torrents::admission::Refusal;
 use crate::torrents::metrics::FetchOutcome;
+use crate::torrents::persistence::TorrentsPersistenceInsertTorrentQueries;
 use crate::torrents::{TorrentIntent, status};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::atomic::Ordering;

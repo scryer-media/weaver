@@ -94,6 +94,13 @@ fn past_limit(stored: &[Stored], max: usize) -> Vec<&Stored> {
 
 #[cfg(test)]
 mod tests {
+    use crate::proxies::ProxiesPersistenceQueries;
+    use crate::servers::persistence::ServersPersistenceInternalQueries;
+    use crate::servers::queries::ServersQueries;
+    use crate::servers::repository::ServersRepositoryQueries;
+    use crate::servers::tls_diagnostics::ServersTlsDiagnosticsQueries;
+    use crate::settings::SettingsSchedulesQueries;
+    use crate::settings::queries::SettingsInternalQueries;
     use std::collections::BTreeSet;
 
     use super::*;

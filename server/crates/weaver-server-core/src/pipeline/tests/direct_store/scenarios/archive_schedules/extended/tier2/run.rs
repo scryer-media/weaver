@@ -21,6 +21,7 @@ use super::super::super::graph::{Answers, Turns, fingerprint, restore};
 use super::post::{Post, Role};
 use super::*;
 use crate::history::HistoryFailureKind;
+use crate::history::nzbget_state::HistoryNzbgetStateQueries;
 use crate::pipeline::tests::engines::harness::{JOB, finished};
 
 // The most disk one run may hold, counted as allocated blocks under its

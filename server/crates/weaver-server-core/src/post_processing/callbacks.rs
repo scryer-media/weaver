@@ -9,6 +9,7 @@
 // the same code: whatever is reading the script's output also takes these
 // requests, one at a time, in the order they arrive.
 
+use crate::auth::repository::AuthRepositoryQueries;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -218,10 +219,29 @@ impl Drop for RunRequests {
     }
 }
 
-impl Database {
+pub trait PostProcessingCallbacksQueries {
+    fn set_script_api_url(&self, url: impl Into<String>);
+    fn open_script_run(
+        &self,
+        identity: &mut RunIdentity,
+        job_id: Option<u64>,
+        event: &ScriptEventLabel,
+        time_limit: Option<Duration>,
+        test: bool,
+    ) -> RunRequests;
+    fn live_script_run(&self, run_id: &str) -> Option<LiveScriptRun>;
+    fn script_run_for_token(&self, token: &str) -> Option<LiveScriptRun>;
+    fn script_run_action(
+        &self,
+        run_id: &str,
+        action: RunAction,
+    ) -> impl std::future::Future<Output = Result<(), RunActionError>> + Send;
+}
+
+impl PostProcessingCallbacksQueries for Database {
     // Where scripts reach this server's API. Set by the server once it is
     // listening; until then runs are handed no address and no token.
-    pub fn set_script_api_url(&self, url: impl Into<String>) {
+    fn set_script_api_url(&self, url: impl Into<String>) {
         *self
             .script_runtime
             .live
@@ -236,7 +256,7 @@ impl Database {
     // Whoever holds what this returns is the run: it must take what the
     // script asks for, and the run is over when it lets go.
     #[doc(hidden)]
-    pub fn open_script_run(
+    fn open_script_run(
         &self,
         identity: &mut RunIdentity,
         job_id: Option<u64>,
@@ -311,7 +331,7 @@ impl Database {
     }
 
     // The live run `run_id`, or `None` once it has ended.
-    pub fn live_script_run(&self, run_id: &str) -> Option<LiveScriptRun> {
+    fn live_script_run(&self, run_id: &str) -> Option<LiveScriptRun> {
         self.script_runtime
             .live
             .runs()
@@ -321,7 +341,7 @@ impl Database {
 
     // The run `token` was issued to, when that run is still going on. A token
     // is worth nothing once its run has ended, whatever date it carries.
-    pub fn script_run_for_token(&self, token: &str) -> Option<LiveScriptRun> {
+    fn script_run_for_token(&self, token: &str) -> Option<LiveScriptRun> {
         if !is_script_run_token_shape(token) {
             return None;
         }
@@ -332,7 +352,7 @@ impl Database {
     }
 
     // Hand `action` to the live run `run_id` and wait for what came of it.
-    pub async fn script_run_action(
+    async fn script_run_action(
         &self,
         run_id: &str,
         action: RunAction,

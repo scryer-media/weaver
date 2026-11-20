@@ -1,8 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
+use crate::jobs::persistence::JobsPersistenceQueries;
+use crate::operations::recovery::credentials::StoredCredentialQueries;
 use crate::persistence::Database;
+use crate::settings::queries::SettingsQueries;
 use crate::settings::{Leaf, SeedingAction, SeedingGoalMode, SeedingPolicy};
+use crate::torrents::persistence::TorrentsPersistenceInsertPlacedTorrentInternalQueries;
+use crate::torrents::persistence::TorrentsPersistenceInsertTorrentQueries;
+use crate::torrents::persistence::TorrentsPersistenceLiveHeldPathsInternalQueries;
+use crate::torrents::persistence::TorrentsPersistenceMarkTorrentRetiringInternalQueries;
+use crate::torrents::queries::TorrentsInternalQueries;
+use crate::torrents::queries::TorrentsQueries;
 use crate::torrents::{
     FilePriority, Infohash, KeptIntent, NamedBy, TorrentCounters, TorrentInsert, TorrentIntent,
     TorrentRecord, TorrentSource, TrackerEntry,

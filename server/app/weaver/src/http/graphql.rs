@@ -812,6 +812,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use weaver_server_core::Database;
+    use weaver_server_core::auth::repository::AuthRepositoryQueries;
     use weaver_server_core::auth::{ApiKeyCache, BrowserSession, LoginAuthCache, hash_api_key};
     use weaver_server_core::security::RuntimeSecurityConfig;
 

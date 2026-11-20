@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::proxies::ProxiesNetworkPersistenceQueries;
+use crate::servers::service::ServersServiceInternalQueries;
+use crate::settings::persistence::SettingsPersistenceQueries;
+use crate::settings::queries::SettingsQueries;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::future::Future;
@@ -655,6 +659,11 @@ fn parse_monthly_reset_day_value(name: &str, value: &str) -> Result<u8, EnvSeedE
 mod tests {
     use super::*;
     use crate::categories::CategoryConfig;
+    use crate::proxies::ProxiesNetworkPersistenceQueries;
+    use crate::servers::queries::ServersQueries;
+    use crate::settings::persistence::SettingsPersistenceQueries;
+    use crate::settings::queries::SettingsQueries;
+    use crate::settings::service::SettingsServiceQueries;
 
     fn parse(vars: &[(&str, &str)]) -> Result<EnvSeedConfig, EnvSeedError> {
         parse_env_seed(vars.iter().copied())

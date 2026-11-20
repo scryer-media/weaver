@@ -5,8 +5,20 @@ use crate::StateError;
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlEngine, SqlRuntime};
 
-impl Database {
-    pub fn add_bandwidth_usage_minute(
+pub trait BandwidthPersistenceQueries {
+    fn add_bandwidth_usage_minute(
+        &self,
+        bucket_epoch_minute: i64,
+        payload_bytes: u64,
+    ) -> Result<(), StateError>;
+    fn prune_bandwidth_usage_before(
+        &self,
+        cutoff_bucket_epoch_minute: i64,
+    ) -> Result<usize, StateError>;
+}
+
+impl BandwidthPersistenceQueries for Database {
+    fn add_bandwidth_usage_minute(
         &self,
         bucket_epoch_minute: i64,
         payload_bytes: u64,
@@ -14,10 +26,33 @@ impl Database {
         self.add_bandwidth_usage_minutes(&[(bucket_epoch_minute, payload_bytes)])
     }
 
-    pub(crate) fn add_bandwidth_usage_minutes(
+    fn prune_bandwidth_usage_before(
         &self,
-        entries: &[(i64, u64)],
-    ) -> Result<(), StateError> {
+        cutoff_bucket_epoch_minute: i64,
+    ) -> Result<usize, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let changed = SqlRuntime::execute(
+                datastore.write_exec(),
+                "DELETE FROM bandwidth_usage_minute_buckets WHERE bucket_epoch_minute < {}",
+                &[SqlArg::I64(cutoff_bucket_epoch_minute)],
+            )
+            .await?;
+            Ok(changed as usize)
+        })
+    }
+}
+
+pub(crate) trait BandwidthPersistenceInternalQueries {
+    fn add_bandwidth_usage_minutes(&self, entries: &[(i64, u64)]) -> Result<(), StateError>;
+    fn add_metered_bandwidth_usage_minutes(
+        &self,
+        entries: &[(i64, bool, u64)],
+    ) -> Result<(), StateError>;
+}
+
+impl BandwidthPersistenceInternalQueries for Database {
+    fn add_bandwidth_usage_minutes(&self, entries: &[(i64, u64)]) -> Result<(), StateError> {
         self.add_metered_bandwidth_usage_minutes(
             &entries
                 .iter()
@@ -26,7 +61,7 @@ impl Database {
         )
     }
 
-    pub(crate) fn add_metered_bandwidth_usage_minutes(
+    fn add_metered_bandwidth_usage_minutes(
         &self,
         entries: &[(i64, bool, u64)],
     ) -> Result<(), StateError> {
@@ -93,22 +128,6 @@ impl Database {
                     result
                 }
             }
-        })
-    }
-
-    pub fn prune_bandwidth_usage_before(
-        &self,
-        cutoff_bucket_epoch_minute: i64,
-    ) -> Result<usize, StateError> {
-        let datastore = self.datastore();
-        self.run_sql_blocking(async move {
-            let changed = SqlRuntime::execute(
-                datastore.write_exec(),
-                "DELETE FROM bandwidth_usage_minute_buckets WHERE bucket_epoch_minute < {}",
-                &[SqlArg::I64(cutoff_bucket_epoch_minute)],
-            )
-            .await?;
-            Ok(changed as usize)
         })
     }
 }

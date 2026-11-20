@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::jobs::JobsSupportFactsPersistenceQueries;
 use crate::jobs::support_facts::{GapKind, GapPosition};
 
 fn gap_kind(state: SegmentTerminalState) -> GapKind {

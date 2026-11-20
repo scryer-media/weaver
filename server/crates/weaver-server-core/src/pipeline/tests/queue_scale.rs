@@ -5,8 +5,13 @@
 // visits or writes, never how long it takes.
 
 use super::*;
+use crate::history::queries::HistoryQueries;
 use crate::jobs::handle::QueueMoveTarget;
+use crate::jobs::outline_persistence::JobsOutlinePersistenceInternalQueries;
+use crate::jobs::persistence::JobsPersistenceQueries;
 use crate::jobs::phase_progress::JobPhase;
+use crate::jobs::queries::JobsInternalQueries;
+use crate::jobs::queries::JobsQueries;
 use crate::pipeline::nzb_admission::NZB_SLOT_WAIT_REASON;
 use crate::pipeline::queue_window::QUEUE_WINDOW;
 

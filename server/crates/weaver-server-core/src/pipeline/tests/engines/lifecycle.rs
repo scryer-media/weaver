@@ -5,6 +5,9 @@
 // barriers, and the order in which its history row, its terminal event and
 // its delivery land.
 
+use crate::history::nzbget_state::HistoryNzbgetStateQueries;
+use crate::history::queries::HistoryQueries;
+use crate::jobs::duplicate_persistence::JobsDuplicatePersistenceAdmitDuplicateSubmissionQueries;
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 

@@ -22,9 +22,23 @@ pub struct ApiKeyAuthRow {
     pub scope: String,
 }
 
-impl Database {
+pub trait AuthApiKeysQueries {
+    fn insert_api_key(
+        &self,
+        name: &str,
+        key_hash: &[u8; 32],
+        scope: &str,
+    ) -> Result<i64, StateError>;
+    fn lookup_api_key(&self, key_hash: &[u8; 32]) -> Result<Option<ApiKeyRow>, StateError>;
+    fn list_api_keys(&self) -> Result<Vec<ApiKeyRow>, StateError>;
+    fn list_api_key_auth_rows(&self) -> Result<Vec<ApiKeyAuthRow>, StateError>;
+    fn delete_api_key(&self, id: i64) -> Result<bool, StateError>;
+    fn touch_api_key_last_used(&self, id: i64, now: i64) -> Result<(), StateError>;
+}
+
+impl AuthApiKeysQueries for Database {
     // Insert a new API key. Returns the new row ID.
-    pub fn insert_api_key(
+    fn insert_api_key(
         &self,
         name: &str,
         key_hash: &[u8; 32],
@@ -61,7 +75,7 @@ impl Database {
     }
 
     // Look up an API key by its SHA-256 hash.
-    pub fn lookup_api_key(&self, key_hash: &[u8; 32]) -> Result<Option<ApiKeyRow>, StateError> {
+    fn lookup_api_key(&self, key_hash: &[u8; 32]) -> Result<Option<ApiKeyRow>, StateError> {
         let datastore = self.datastore();
         let key_hash = key_hash.to_vec();
         self.run_sql_blocking_read(async move {
@@ -78,7 +92,7 @@ impl Database {
     }
 
     // List all API keys (without hashes).
-    pub fn list_api_keys(&self) -> Result<Vec<ApiKeyRow>, StateError> {
+    fn list_api_keys(&self) -> Result<Vec<ApiKeyRow>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
@@ -92,7 +106,7 @@ impl Database {
         })
     }
 
-    pub fn list_api_key_auth_rows(&self) -> Result<Vec<ApiKeyAuthRow>, StateError> {
+    fn list_api_key_auth_rows(&self) -> Result<Vec<ApiKeyAuthRow>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
@@ -121,7 +135,7 @@ impl Database {
     }
 
     // Delete an API key by ID. Returns true if a row was deleted.
-    pub fn delete_api_key(&self, id: i64) -> Result<bool, StateError> {
+    fn delete_api_key(&self, id: i64) -> Result<bool, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             let changed = SqlRuntime::execute(
@@ -135,7 +149,7 @@ impl Database {
     }
 
     // Update last_used_at timestamp for an API key.
-    pub fn touch_api_key_last_used(&self, id: i64, now: i64) -> Result<(), StateError> {
+    fn touch_api_key_last_used(&self, id: i64, now: i64) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::execute(

@@ -2,6 +2,8 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::rss::RssPersistenceQueries;
+use crate::rss::RssQueries;
 use std::time::Duration;
 mod proxy_body;
 mod proxy_routing;

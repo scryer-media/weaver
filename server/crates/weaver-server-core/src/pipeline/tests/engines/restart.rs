@@ -7,6 +7,8 @@
 // must finish as a run that never restarted finishes, and the only articles
 // it asks for again are the ones it held in memory when it went down.
 
+use crate::jobs::graph_checkpoint::JobsGraphCheckpointInternalQueries;
+use crate::jobs::queries::JobsQueries;
 use std::collections::{BTreeMap, BTreeSet};
 
 use sevenz_turbo::EncoderMethod;

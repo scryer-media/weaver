@@ -154,13 +154,17 @@ struct StoredOutline {
     blob: Option<Vec<u8>>,
 }
 
-impl Database {
-    // Write a job's outline in one transaction of its own.
-    pub(crate) fn write_job_outline(
+pub(crate) trait JobsOutlinePersistenceInternalQueries {
+    fn write_job_outline(&self, job_id: JobId, outline: &NzbOutline) -> Result<(), StateError>;
+    fn load_job_outlines(
         &self,
-        job_id: JobId,
-        outline: &NzbOutline,
-    ) -> Result<(), StateError> {
+        only: Option<&[JobId]>,
+    ) -> Result<HashMap<JobId, NzbOutline>, StateError>;
+}
+
+impl JobsOutlinePersistenceInternalQueries for Database {
+    // Write a job's outline in one transaction of its own.
+    fn write_job_outline(&self, job_id: JobId, outline: &NzbOutline) -> Result<(), StateError> {
         let datastore = self.datastore();
         let head = OutlineHead::of(self.encryption_key(), outline)?;
         self.run_sql_blocking(async move {
@@ -176,7 +180,7 @@ impl Database {
     // jobs named, those read in bind-safe chunks. An outline whose files do
     // not match its count, or whose blob does not open, is not one. The blobs
     // are opened after the read, off the SQL runtime.
-    pub(crate) fn load_job_outlines(
+    fn load_job_outlines(
         &self,
         only: Option<&[JobId]>,
     ) -> Result<HashMap<JobId, NzbOutline>, StateError> {
@@ -266,6 +270,9 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
+    use crate::jobs::persistence::JobsPersistenceInternalQueries;
+    use crate::jobs::persistence::JobsPersistenceQueries;
+    use crate::jobs::repository::JobsRepositoryQueries;
     use std::path::PathBuf;
 
     use super::*;

@@ -103,7 +103,12 @@ enum Outcome {
     InUse(Vec<SecretUsage>),
 }
 
-impl Database {
+trait PostProcessingSecretsLocalQueries {
+    fn seal_secret(&self, value: &str) -> Result<String, SecretError>;
+    fn finish(&self, outcome: Outcome, id: &str) -> Result<Secret, SecretError>;
+}
+
+impl PostProcessingSecretsLocalQueries for Database {
     fn seal_secret(&self, value: &str) -> Result<String, SecretError> {
         valid_value(value)?;
         let key = self.encryption_key().ok_or(SecretError::Invalid(
@@ -112,9 +117,34 @@ impl Database {
         encrypt_value(key, value).map_err(|error| SecretError::Storage(StateError::Database(error)))
     }
 
+    fn finish(&self, outcome: Outcome, id: &str) -> Result<Secret, SecretError> {
+        match outcome {
+            Outcome::Done => self.secret(id)?.ok_or(SecretError::NotFound),
+            Outcome::NotFound => Err(SecretError::NotFound),
+            Outcome::NameTaken => Err(SecretError::NameTaken),
+            Outcome::InUse(usages) => Err(SecretError::InUse(usages)),
+        }
+    }
+}
+
+pub trait PostProcessingSecretsQueries {
+    fn secrets(&self) -> Result<Vec<Secret>, StateError>;
+    fn secret(&self, id: &str) -> Result<Option<Secret>, StateError>;
+    fn secret_usages(&self) -> Result<BTreeMap<String, Vec<SecretUsage>>, StateError>;
+    fn create_secret(&self, name: &str, value: &str) -> Result<Secret, SecretError>;
+    fn update_secret(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        value: Option<&str>,
+    ) -> Result<Secret, SecretError>;
+    fn delete_secret(&self, id: &str) -> Result<(), SecretError>;
+}
+
+impl PostProcessingSecretsQueries for Database {
     // Every secret, by name, with the instances that link it. Values are
     // never read.
-    pub fn secrets(&self) -> Result<Vec<Secret>, StateError> {
+    fn secrets(&self) -> Result<Vec<Secret>, StateError> {
         let mut usages = self.secret_usages()?;
         let datastore = self.datastore();
         let rows = self.run_sql_blocking_read(async move {
@@ -140,12 +170,12 @@ impl Database {
             .collect()
     }
 
-    pub fn secret(&self, id: &str) -> Result<Option<Secret>, StateError> {
+    fn secret(&self, id: &str) -> Result<Option<Secret>, StateError> {
         Ok(self.secrets()?.into_iter().find(|secret| secret.id == id))
     }
 
     // For each linked secret, the instances that link it, by instance name.
-    pub fn secret_usages(&self) -> Result<BTreeMap<String, Vec<SecretUsage>>, StateError> {
+    fn secret_usages(&self) -> Result<BTreeMap<String, Vec<SecretUsage>>, StateError> {
         let datastore = self.datastore();
         let rows = self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_all(
@@ -177,7 +207,7 @@ impl Database {
         Ok(usages)
     }
 
-    pub fn create_secret(&self, name: &str, value: &str) -> Result<Secret, SecretError> {
+    fn create_secret(&self, name: &str, value: &str) -> Result<Secret, SecretError> {
         let name = valid_name(name)?;
         let sealed = self.seal_secret(value)?;
         let mut entropy = [0_u8; 12];
@@ -218,7 +248,7 @@ impl Database {
 
     // Rename a secret, give it a new value, or both. A run started after
     // this resolves the new value.
-    pub fn update_secret(
+    fn update_secret(
         &self,
         id: &str,
         name: Option<&str>,
@@ -275,7 +305,7 @@ impl Database {
     }
 
     // Remove a secret. Refused while any instance links it.
-    pub fn delete_secret(&self, id: &str) -> Result<(), SecretError> {
+    fn delete_secret(&self, id: &str) -> Result<(), SecretError> {
         let datastore = self.datastore();
         let target = id.to_string();
         let outcome = self.run_sql_blocking(async move {
@@ -332,15 +362,6 @@ impl Database {
         };
         match outcome {
             Outcome::Done => Ok(()),
-            Outcome::NotFound => Err(SecretError::NotFound),
-            Outcome::NameTaken => Err(SecretError::NameTaken),
-            Outcome::InUse(usages) => Err(SecretError::InUse(usages)),
-        }
-    }
-
-    fn finish(&self, outcome: Outcome, id: &str) -> Result<Secret, SecretError> {
-        match outcome {
-            Outcome::Done => self.secret(id)?.ok_or(SecretError::NotFound),
             Outcome::NotFound => Err(SecretError::NotFound),
             Outcome::NameTaken => Err(SecretError::NameTaken),
             Outcome::InUse(usages) => Err(SecretError::InUse(usages)),

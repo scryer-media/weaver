@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::settings::persistence::SettingsPersistenceQueries;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;

@@ -8,6 +8,7 @@
 // Each ring reads the egresses' states from memory and compares them with
 // the last ones seen, so an idle daemon does no work here.
 
+use crate::post_processing::events::PostProcessingEventsInvalidateQueueScriptAdmissionInternalQueries;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;

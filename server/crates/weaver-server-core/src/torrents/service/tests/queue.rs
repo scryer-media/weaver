@@ -2,6 +2,8 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::settings::repository::SettingsRepositoryQueries;
+use crate::torrents::queries::TorrentsQueries;
 
 // The queue lists torrents among the pipeline's jobs by when each was added,
 // and a torrent that leaves goes to the finished jobs.

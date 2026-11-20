@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::post_processing::settings::PostProcessingSettingsQueries;
 use std::collections::BTreeSet;
 use std::io::Read;
 
@@ -221,7 +222,18 @@ pub(crate) async fn retain_result(
     .map_err(error)?
 }
 
-impl Database {
+trait PostProcessingOutputLocalQueries {
+    fn insert_script_output(
+        &self,
+        job_id: Option<u64>,
+        result: ScriptResult,
+        raw_bytes: u64,
+        output: Vec<u8>,
+        limits: EventScriptSettings,
+    ) -> Result<ScriptResult, StateError>;
+}
+
+impl PostProcessingOutputLocalQueries for Database {
     fn insert_script_output(
         &self,
         job_id: Option<u64>,
@@ -288,11 +300,34 @@ impl Database {
         })
         .inspect(|_| committed.commit())
     }
+}
 
+pub trait PostProcessingOutputQueries {
+    fn request_script_output_trim(&self);
+    fn script_output_trims_settled(&self) -> impl std::future::Future<Output = ()> + Send;
+    fn trim_script_outputs(&self) -> Result<u64, StateError>;
+    fn script_output(&self, id: &str) -> Result<Option<String>, StateError>;
+    fn script_output_retained(&self, id: &str) -> Result<bool, StateError>;
+    fn retained_script_output_ids(&self, job_id: u64) -> Result<BTreeSet<String>, StateError>;
+    fn event_script_results(&self, job_id: u64) -> Result<Vec<ScriptResult>, StateError>;
+    fn script_runs(
+        &self,
+        filter: ScriptRunFilter,
+        before: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<ScriptRun>, StateError>;
+    fn script_run_count(&self, filter: &ScriptRunFilter) -> Result<u64, StateError>;
+    fn script_run_status_counts(
+        &self,
+        filter: &ScriptRunFilter,
+    ) -> Result<Vec<(ScriptStatus, u64)>, StateError>;
+}
+
+impl PostProcessingOutputQueries for Database {
     // Trim every job and event kind to the stored retention limits, in the
     // background, after a limit was lowered. Returns at once; see
     // [`Database::script_output_trims_settled`].
-    pub fn request_script_output_trim(&self) {
+    fn request_script_output_trim(&self) {
         let trim = &self.script_runtime.trim;
         {
             let mut state = trim.state();
@@ -347,7 +382,7 @@ impl Database {
     }
 
     // Wait until every trim requested before this call has finished.
-    pub async fn script_output_trims_settled(&self) {
+    async fn script_output_trims_settled(&self) {
         let trim = &self.script_runtime.trim;
         let target = trim.state().requested;
         loop {
@@ -362,7 +397,7 @@ impl Database {
     }
 
     // Apply the stored retention limits to every recorded run now.
-    pub fn trim_script_outputs(&self) -> Result<u64, StateError> {
+    fn trim_script_outputs(&self) -> Result<u64, StateError> {
         let limits = self.post_processing_settings()?.event_scripts;
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
@@ -375,7 +410,7 @@ impl Database {
         .inspect(|pruned| super::run_metrics::record_retention(RetentionAction::Pruned, *pruned))
     }
 
-    pub fn script_output(&self, id: &str) -> Result<Option<String>, StateError> {
+    fn script_output(&self, id: &str) -> Result<Option<String>, StateError> {
         let datastore = self.datastore();
         let id = id.to_string();
         self.run_sql_blocking_read(async move {
@@ -390,7 +425,7 @@ impl Database {
         })
     }
 
-    pub fn script_output_retained(&self, id: &str) -> Result<bool, StateError> {
+    fn script_output_retained(&self, id: &str) -> Result<bool, StateError> {
         let datastore = self.datastore();
         let id = id.to_string();
         self.run_sql_blocking_read(async move {
@@ -404,7 +439,7 @@ impl Database {
         })
     }
 
-    pub fn retained_script_output_ids(&self, job_id: u64) -> Result<BTreeSet<String>, StateError> {
+    fn retained_script_output_ids(&self, job_id: u64) -> Result<BTreeSet<String>, StateError> {
         let datastore = self.datastore();
         let job_id = i64::try_from(job_id).map_err(error)?;
         self.run_sql_blocking_read(async move {
@@ -422,7 +457,7 @@ impl Database {
 
     // The job's runs that are not part of a post-processing pass: its event
     // scripts, and the post-processing scripts nothing waited for.
-    pub fn event_script_results(&self, job_id: u64) -> Result<Vec<ScriptResult>, StateError> {
+    fn event_script_results(&self, job_id: u64) -> Result<Vec<ScriptResult>, StateError> {
         let datastore = self.datastore();
         let job_id = i64::try_from(job_id).map_err(error)?;
         let results: Vec<ScriptResult> = self.run_sql_blocking_read(async move {
@@ -436,7 +471,7 @@ impl Database {
 
     // Recorded runs, latest first. `before` continues a listing below the
     // `seq` of the last run already returned.
-    pub fn script_runs(
+    fn script_runs(
         &self,
         filter: ScriptRunFilter,
         before: Option<i64>,
@@ -480,7 +515,7 @@ impl Database {
     }
 
     // How many recorded runs the filter matches, across every page.
-    pub fn script_run_count(&self, filter: &ScriptRunFilter) -> Result<u64, StateError> {
+    fn script_run_count(&self, filter: &ScriptRunFilter) -> Result<u64, StateError> {
         let datastore = self.datastore();
         let (conditions, args) = script_run_conditions(filter)?;
         let mut sql = String::from("SELECT COUNT(*) AS total FROM script_outputs o");
@@ -499,7 +534,7 @@ impl Database {
 
     // How many of the runs the filter matches ended each way. The filter's
     // own status is left out, so the answer covers every status at once.
-    pub fn script_run_status_counts(
+    fn script_run_status_counts(
         &self,
         filter: &ScriptRunFilter,
     ) -> Result<Vec<(ScriptStatus, u64)>, StateError> {
@@ -595,6 +630,13 @@ pub(crate) async fn delete_script_state_rows_tx(
 mod tests {
     use super::super::model::{ScriptAdapter, ScriptName};
     use super::*;
+    use crate::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
+    use crate::jobs::persistence::JobsPersistenceQueries;
+    use crate::jobs::repository::JobsRepositoryQueries;
+    use crate::post_processing::effects::PostProcessingEffectsQueries;
+    use crate::post_processing::instances::PostProcessingInstancesQueries;
+    use crate::post_processing::settings::PostProcessingSettingsQueries;
+    use crate::rss::RssPersistenceQueries;
 
     fn feed(db: &Database, id: u32) {
         db.insert_rss_feed(&crate::RssFeedRow {

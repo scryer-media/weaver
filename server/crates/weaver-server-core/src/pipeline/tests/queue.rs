@@ -2,6 +2,11 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::history::queries::HistoryQueries;
+use crate::jobs::duplicate_persistence::JobsDuplicatePersistenceAdmitDuplicateSubmissionQueries;
+use crate::jobs::graph_checkpoint::JobsGraphCheckpointInternalQueries;
+use crate::jobs::queries::JobsQueries;
+use crate::post_processing::effects::PostProcessingEffectsQueries;
 
 fn handle(pipeline: &Pipeline) -> SchedulerHandle {
     SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())

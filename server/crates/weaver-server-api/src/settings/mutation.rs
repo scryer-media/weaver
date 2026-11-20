@@ -3,6 +3,11 @@
 
 use std::path::PathBuf;
 use std::sync::LazyLock;
+use weaver_server_core::settings::SettingsArchivePasswordsQueries;
+use weaver_server_core::settings::SettingsSchedulesQueries;
+use weaver_server_core::settings::persistence::SettingsPersistenceQueries;
+use weaver_server_core::settings::repository::SettingsRepositoryQueries;
+use weaver_server_core::settings::service::SettingsServiceQueries;
 
 use async_graphql::{Context, MaybeUndefined, Object, Result};
 

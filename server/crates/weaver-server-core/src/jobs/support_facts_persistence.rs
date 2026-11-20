@@ -5,11 +5,19 @@ use super::{ids::JobId, support_facts::JobSupportFacts};
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::{Database, StateError};
 
-impl Database {
+pub trait JobsSupportFactsPersistenceQueries {
+    fn save_active_support_facts(
+        &self,
+        snapshots: Vec<(JobId, Option<String>)>,
+    ) -> Result<(), StateError>;
+    fn load_job_support_facts(&self, job_id: JobId) -> Result<JobSupportFacts, StateError>;
+}
+
+impl JobsSupportFactsPersistenceQueries for Database {
     // Checkpoint live jobs' support facts onto their active rows. The history
     // archive copies the column from there, so the last checkpoint before it
     // is what a finished job keeps.
-    pub fn save_active_support_facts(
+    fn save_active_support_facts(
         &self,
         snapshots: Vec<(JobId, Option<String>)>,
     ) -> Result<(), StateError> {
@@ -35,7 +43,7 @@ impl Database {
 
     // A job's support facts from its active row, or from its history row once
     // it has finished. A job with neither reads as having none.
-    pub fn load_job_support_facts(&self, job_id: JobId) -> Result<JobSupportFacts, StateError> {
+    fn load_job_support_facts(&self, job_id: JobId) -> Result<JobSupportFacts, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let row = SqlRuntime::fetch_optional(

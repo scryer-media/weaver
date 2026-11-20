@@ -9,6 +9,7 @@ use async_graphql::{
     ComplexObject, Context, Enum, InputObject, MaybeUndefined, Object, Result, SimpleObject,
 };
 use std::{sync::Arc, time::Duration};
+use weaver_server_core::proxies::ProxiesPersistenceQueries;
 use weaver_server_core::{
     Database, SchedulerHandle,
     proxies::{self, Consumer, NetworkRefusal, ProxyProfile, ProxyRuntime, RoutingPolicy},

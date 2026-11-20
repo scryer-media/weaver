@@ -2,15 +2,40 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use crate::bandwidth::PruneFiles;
+use crate::history::queries::HistoryInternalQueries;
+use crate::operations::async_ops::OperationsAsyncOpsInternalQueries;
+use crate::operations::async_ops::OperationsAsyncOpsQueries;
 use crate::{Database, HistoryDeleteOperationInsertError};
 
-impl Database {
+pub trait HistoryDeleteQueueQueries {
+    fn history_delete_notification(&self) -> std::sync::Arc<tokio::sync::Notify>;
+    fn accept_history_delete_ids(
+        &self,
+        ids: &[u64],
+        delete_files: bool,
+        file_delete_authorized: bool,
+    ) -> Result<u64, HistoryDeleteOperationInsertError>;
+    fn accept_all_history_delete(
+        &self,
+        delete_files: bool,
+        file_delete_authorized: bool,
+    ) -> Result<(u64, Vec<u64>), HistoryDeleteOperationInsertError>;
+    fn prune_history(
+        &self,
+        failed: Option<PruneFiles>,
+        completed: Option<PruneFiles>,
+        cancelled: Option<PruneFiles>,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send;
+    fn prune_history_by_age(&self, days: u32, now: i64) -> Result<usize, crate::StateError>;
+}
+
+impl HistoryDeleteQueueQueries for Database {
     // Manual and scheduled deletion use the same durable worker queue.
-    pub fn history_delete_notification(&self) -> std::sync::Arc<tokio::sync::Notify> {
+    fn history_delete_notification(&self) -> std::sync::Arc<tokio::sync::Notify> {
         self.history_delete_wake.clone()
     }
 
-    pub fn accept_history_delete_ids(
+    fn accept_history_delete_ids(
         &self,
         ids: &[u64],
         delete_files: bool,
@@ -21,7 +46,7 @@ impl Database {
         Ok(id)
     }
 
-    pub fn accept_all_history_delete(
+    fn accept_all_history_delete(
         &self,
         delete_files: bool,
         file_delete_authorized: bool,
@@ -32,7 +57,7 @@ impl Database {
         Ok(acceptance)
     }
 
-    pub async fn prune_history(
+    async fn prune_history(
         &self,
         failed: Option<PruneFiles>,
         completed: Option<PruneFiles>,
@@ -75,13 +100,46 @@ impl Database {
         .map_err(|error| error.to_string())?
     }
 
+    // Age retention: every history entry, of any status and hidden ones too,
+    // whose job finished `days` or more days before `now` (epoch seconds) is
+    // handed to the durable delete queue without its files. Delivered output
+    // stays on disk. `days` 0 keeps history forever and reads nothing.
+    //
+    // The entries are read as ids only, a page at a time, oldest first. The
+    // cursor always moves past a page, so an entry another operation holds
+    // is passed over this pass and not read again. An entry an earlier
+    // delete refused is retried on every pass by queueing that delete
+    // again, never by adding an operation per pass. Returns how many pages
+    // queued or retried anything; nothing due, or nothing but held entries,
+    // writes nothing and wakes nothing.
+    fn prune_history_by_age(&self, days: u32, now: i64) -> Result<usize, crate::StateError> {
+        self.prune_history_by_age_paged(days, now, HISTORY_RETENTION_PAGE)
+    }
+}
+
+pub(crate) trait HistoryDeleteQueueInternalQueries {
+    fn prune_history_statuses_paged(
+        &self,
+        statuses: &[&str],
+        delete_files: bool,
+        page: usize,
+    ) -> Result<usize, crate::StateError>;
+    fn prune_history_by_age_paged(
+        &self,
+        days: u32,
+        now: i64,
+        page: usize,
+    ) -> Result<usize, crate::StateError>;
+}
+
+impl HistoryDeleteQueueInternalQueries for Database {
     // Status retention: every history entry, hidden ones too, whose status
     // is one of `statuses`, is handed to the durable delete queue with or
     // without its files, read as ids a page at a time, newest first, one
     // status after another. Each page is queued as it is read, as age
     // retention queues its pages. Returns how many pages queued or retried
     // anything.
-    pub(crate) fn prune_history_statuses_paged(
+    fn prune_history_statuses_paged(
         &self,
         statuses: &[&str],
         delete_files: bool,
@@ -109,23 +167,7 @@ impl Database {
         Ok(queued)
     }
 
-    // Age retention: every history entry, of any status and hidden ones too,
-    // whose job finished `days` or more days before `now` (epoch seconds) is
-    // handed to the durable delete queue without its files. Delivered output
-    // stays on disk. `days` 0 keeps history forever and reads nothing.
-    //
-    // The entries are read as ids only, a page at a time, oldest first. The
-    // cursor always moves past a page, so an entry another operation holds
-    // is passed over this pass and not read again. An entry an earlier
-    // delete refused is retried on every pass by queueing that delete
-    // again, never by adding an operation per pass. Returns how many pages
-    // queued or retried anything; nothing due, or nothing but held entries,
-    // writes nothing and wakes nothing.
-    pub fn prune_history_by_age(&self, days: u32, now: i64) -> Result<usize, crate::StateError> {
-        self.prune_history_by_age_paged(days, now, HISTORY_RETENTION_PAGE)
-    }
-
-    pub(crate) fn prune_history_by_age_paged(
+    fn prune_history_by_age_paged(
         &self,
         days: u32,
         now: i64,
@@ -162,6 +204,11 @@ const HISTORY_RETENTION_PAGE: usize = 1_000;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::nzbget_state::HistoryNzbgetStateQueries;
+    use crate::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
+    use crate::history::queries::HistoryInternalQueries;
+    use crate::operations::async_ops::OperationsAsyncOpsInternalQueries;
+    use crate::operations::async_ops::OperationsAsyncOpsQueries;
 
     const DAY: i64 = 86_400;
     const NOW: i64 = 1_800_000_000;

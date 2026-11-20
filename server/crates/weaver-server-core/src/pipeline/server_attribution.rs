@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::jobs::JobsServerAttributionPersistenceInternalQueries;
 
 impl Pipeline {
     pub(crate) fn checkpoint_server_attribution_if_due(&mut self) {

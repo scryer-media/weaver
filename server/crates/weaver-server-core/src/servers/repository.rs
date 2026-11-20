@@ -10,8 +10,46 @@ use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime};
 use crate::servers::ServerDownloadUsage;
 
-impl Database {
-    pub fn server_download_usage(
+pub trait ServersRepositoryQueries {
+    fn server_download_usage(
+        &self,
+        server_id: u32,
+    ) -> Result<Option<ServerDownloadUsage>, StateError>;
+    fn list_server_download_usage(&self) -> Result<Vec<ServerDownloadUsage>, StateError>;
+    fn upsert_server_download_usage(&self, usage: &ServerDownloadUsage) -> Result<(), StateError>;
+    fn store_download_usage(
+        &self,
+        server: &[ServerDownloadUsage],
+        egress: &[ServerDownloadUsage],
+    ) -> Result<(), StateError>;
+    fn reset_server_download_usage(
+        &self,
+        server_id: u32,
+    ) -> Result<ServerDownloadUsage, StateError>;
+    fn egress_download_usage(
+        &self,
+        egress_id: u32,
+    ) -> Result<Option<ServerDownloadUsage>, StateError>;
+    fn server_download_usages(
+        &self,
+        ids: &HashSet<u32>,
+    ) -> Result<HashMap<u32, ServerDownloadUsage>, StateError>;
+    fn egress_download_usages(
+        &self,
+        ids: &HashSet<u32>,
+    ) -> Result<HashMap<u32, ServerDownloadUsage>, StateError>;
+    fn upsert_egress_download_usage(&self, usage: &ServerDownloadUsage) -> Result<(), StateError>;
+    fn egress_upload_usage(&self, egress_id: u32) -> Result<Option<(u64, u64)>, StateError>;
+    fn set_egress_upload_usage(
+        &self,
+        egress_id: u32,
+        lifetime_bytes: u64,
+        baseline_bytes: u64,
+    ) -> Result<(), StateError>;
+}
+
+impl ServersRepositoryQueries for Database {
+    fn server_download_usage(
         &self,
         server_id: u32,
     ) -> Result<Option<ServerDownloadUsage>, StateError> {
@@ -32,7 +70,7 @@ impl Database {
         })
     }
 
-    pub fn list_server_download_usage(&self) -> Result<Vec<ServerDownloadUsage>, StateError> {
+    fn list_server_download_usage(&self) -> Result<Vec<ServerDownloadUsage>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_all(
@@ -51,10 +89,7 @@ impl Database {
         })
     }
 
-    pub fn upsert_server_download_usage(
-        &self,
-        usage: &ServerDownloadUsage,
-    ) -> Result<(), StateError> {
+    fn upsert_server_download_usage(&self, usage: &ServerDownloadUsage) -> Result<(), StateError> {
         self.store_download_usage(std::slice::from_ref(usage), &[])
     }
 
@@ -62,7 +97,7 @@ impl Database {
     // flush commits once whatever the number of servers and egresses, and
     // waits for the database writer like every other write instead of
     // retrying against its lock one row at a time.
-    pub fn store_download_usage(
+    fn store_download_usage(
         &self,
         server: &[ServerDownloadUsage],
         egress: &[ServerDownloadUsage],
@@ -93,7 +128,7 @@ impl Database {
         })
     }
 
-    pub fn reset_server_download_usage(
+    fn reset_server_download_usage(
         &self,
         server_id: u32,
     ) -> Result<ServerDownloadUsage, StateError> {
@@ -126,7 +161,7 @@ impl Database {
 
     // Download usage counted against an egress. The egress id is carried in
     // `server_id`.
-    pub fn egress_download_usage(
+    fn egress_download_usage(
         &self,
         egress_id: u32,
     ) -> Result<Option<ServerDownloadUsage>, StateError> {
@@ -149,7 +184,7 @@ impl Database {
 
     // The stored usage of the servers in `ids`, in one read of a table that
     // holds a row per server. See `usages_of`.
-    pub fn server_download_usages(
+    fn server_download_usages(
         &self,
         ids: &HashSet<u32>,
     ) -> Result<HashMap<u32, ServerDownloadUsage>, StateError> {
@@ -164,7 +199,7 @@ impl Database {
 
     // The stored usage of the egresses in `ids`, in one read of a table that
     // holds a row per egress. See `usages_of`.
-    pub fn egress_download_usages(
+    fn egress_download_usages(
         &self,
         ids: &HashSet<u32>,
     ) -> Result<HashMap<u32, ServerDownloadUsage>, StateError> {
@@ -177,30 +212,15 @@ impl Database {
         )
     }
 
-    fn download_usages(
-        &self,
-        statement: &'static str,
-        ids: &HashSet<u32>,
-    ) -> Result<HashMap<u32, ServerDownloadUsage>, StateError> {
-        let datastore = self.datastore();
-        let rows = self.run_sql_blocking_read(async move {
-            SqlRuntime::fetch_all(datastore.read_exec(), statement, &[]).await
-        })?;
-        usages_of(rows, ids)
-    }
-
     // Store download usage counted against an egress, whose id is carried
     // in `server_id`. Usage for an egress that no longer exists is dropped.
-    pub fn upsert_egress_download_usage(
-        &self,
-        usage: &ServerDownloadUsage,
-    ) -> Result<(), StateError> {
+    fn upsert_egress_download_usage(&self, usage: &ServerDownloadUsage) -> Result<(), StateError> {
         self.store_download_usage(&[], std::slice::from_ref(usage))
     }
 
     // Bytes uploaded over an egress: ever, and when its current quota
     // period began.
-    pub fn egress_upload_usage(&self, egress_id: u32) -> Result<Option<(u64, u64)>, StateError> {
+    fn egress_upload_usage(&self, egress_id: u32) -> Result<Option<(u64, u64)>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
@@ -226,7 +246,7 @@ impl Database {
 
     // Store an egress's upload counts on its usage row, which
     // `upsert_egress_download_usage` writes first.
-    pub fn set_egress_upload_usage(
+    fn set_egress_upload_usage(
         &self,
         egress_id: u32,
         lifetime_bytes: u64,
@@ -249,6 +269,28 @@ impl Database {
             .await?;
             Ok(())
         })
+    }
+}
+
+trait ServersRepositoryLocalQueries {
+    fn download_usages(
+        &self,
+        statement: &'static str,
+        ids: &HashSet<u32>,
+    ) -> Result<HashMap<u32, ServerDownloadUsage>, StateError>;
+}
+
+impl ServersRepositoryLocalQueries for Database {
+    fn download_usages(
+        &self,
+        statement: &'static str,
+        ids: &HashSet<u32>,
+    ) -> Result<HashMap<u32, ServerDownloadUsage>, StateError> {
+        let datastore = self.datastore();
+        let rows = self.run_sql_blocking_read(async move {
+            SqlRuntime::fetch_all(datastore.read_exec(), statement, &[]).await
+        })?;
+        usages_of(rows, ids)
     }
 }
 
@@ -369,6 +411,8 @@ fn timestamp(value: i64, field: &str) -> Result<DateTime<Utc>, StateError> {
 
 #[cfg(test)]
 mod tests {
+    use crate::servers::persistence::ServersPersistenceQueries;
+    use crate::servers::service::ServersServiceInternalQueries;
     use std::path::PathBuf;
 
     use super::*;

@@ -1079,10 +1079,42 @@ const DELETE_EXPIRED_REMOVED_ROWS: &str = "DELETE FROM usage_daily
 const DELETE_EXPIRED_REMOVED_SERVERS: &str =
     "DELETE FROM usage_removed_servers WHERE remove_at <= {}";
 
-impl Database {
+pub trait OperationsUsageHistoryQueries {
+    fn write_usage_flush(&self, flush: &UsageFlush) -> Result<(), StateError>;
+    fn read_usage_days(
+        &self,
+        from: Option<NaiveDate>,
+        to: NaiveDate,
+        kind: Option<UsageConsumerKind>,
+    ) -> Result<Vec<UsageDayRow>, StateError>;
+    fn read_usage_totals(
+        &self,
+        kind: Option<UsageConsumerKind>,
+    ) -> Result<Vec<UsageConsumerTotal>, StateError>;
+    fn read_usage_start(&self, kind: UsageConsumerKind) -> Result<UsageStart, StateError>;
+    fn read_removed_servers(&self) -> Result<Vec<RemovedServerUsage>, StateError>;
+    fn read_next_usage_expiry(&self) -> Result<Option<i64>, StateError>;
+    fn count_finished_jobs(
+        &self,
+        since_epoch_sec: Option<i64>,
+        until_epoch_sec: i64,
+    ) -> Result<FinishedJobCounts, StateError>;
+    fn sum_recovery_bytes(
+        &self,
+        since_epoch_sec: Option<i64>,
+        until_epoch_sec: i64,
+    ) -> Result<RecoveryBytes, StateError>;
+    fn count_failures_by_cause(
+        &self,
+        since_epoch_sec: Option<i64>,
+        until_epoch_sec: i64,
+    ) -> Result<Vec<(String, u64)>, StateError>;
+}
+
+impl OperationsUsageHistoryQueries for Database {
     /// Write a batch: add each row onto its day, and fold days older than
     /// the batch's cutoff. One transaction whatever the row count.
-    pub fn write_usage_flush(&self, flush: &UsageFlush) -> Result<(), StateError> {
+    fn write_usage_flush(&self, flush: &UsageFlush) -> Result<(), StateError> {
         if flush.is_empty() {
             return Ok(());
         }
@@ -1154,7 +1186,7 @@ impl Database {
 
     /// Daily rows from `from` (every kept row when `None`) through `to`,
     /// for one kind or all.
-    pub fn read_usage_days(
+    fn read_usage_days(
         &self,
         from: Option<NaiveDate>,
         to: NaiveDate,
@@ -1195,7 +1227,7 @@ impl Database {
     }
 
     /// Every kept row summed per consumer, for one kind or all.
-    pub fn read_usage_totals(
+    fn read_usage_totals(
         &self,
         kind: Option<UsageConsumerKind>,
     ) -> Result<Vec<UsageConsumerTotal>, StateError> {
@@ -1233,7 +1265,7 @@ impl Database {
     }
 
     /// Where the kept rows of `kind` start.
-    pub fn read_usage_start(&self, kind: UsageConsumerKind) -> Result<UsageStart, StateError> {
+    fn read_usage_start(&self, kind: UsageConsumerKind) -> Result<UsageStart, StateError> {
         let datastore = self.datastore();
         let args = vec![SqlArg::Text(kind.as_str().to_string())];
         self.run_sql_blocking_read(async move {
@@ -1255,7 +1287,7 @@ impl Database {
     }
 
     /// The removed servers whose rows are still kept.
-    pub fn read_removed_servers(&self) -> Result<Vec<RemovedServerUsage>, StateError> {
+    fn read_removed_servers(&self) -> Result<Vec<RemovedServerUsage>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_all(
@@ -1280,7 +1312,7 @@ impl Database {
 
     /// The earliest time a removed server's kept rows are due to go, in
     /// epoch seconds, or `None` when none are kept.
-    pub fn read_next_usage_expiry(&self) -> Result<Option<i64>, StateError> {
+    fn read_next_usage_expiry(&self) -> Result<Option<i64>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
@@ -1299,7 +1331,7 @@ impl Database {
     /// Jobs that finished in `[since, until)`, in epoch seconds, by how they
     /// ended. History shows a cancelled job as failed, so it counts as one; a
     /// paused row has not finished and is not counted.
-    pub fn count_finished_jobs(
+    fn count_finished_jobs(
         &self,
         since_epoch_sec: Option<i64>,
         until_epoch_sec: i64,
@@ -1333,7 +1365,7 @@ impl Database {
 
     /// The recovery the NZB jobs that finished in `[since, until)` posted,
     /// and how much of it they fetched, from their history rows.
-    pub fn sum_recovery_bytes(
+    fn sum_recovery_bytes(
         &self,
         since_epoch_sec: Option<i64>,
         until_epoch_sec: i64,
@@ -1360,7 +1392,7 @@ impl Database {
 
     /// The NZB jobs that failed in `[since, until)`, by the cause their
     /// history row keeps; the empty cause is a row that keeps none.
-    pub fn count_failures_by_cause(
+    fn count_failures_by_cause(
         &self,
         since_epoch_sec: Option<i64>,
         until_epoch_sec: i64,

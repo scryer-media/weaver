@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::history::nzbget_state::HistoryNzbgetStateQueries;
+use crate::history::queries::HistoryQueries;
+use crate::jobs::duplicate_persistence::JobsDuplicatePersistenceAdmitDuplicateSubmissionQueries;
+use crate::post_processing::events::PostProcessingEventsCancelEventScriptsQueries;
+use crate::settings::service::SettingsServiceQueries;
 use std::path::PathBuf;
 
 use super::events::{EventContext, wake_queue};

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::categories::queries::CategoriesQueries;
+use crate::post_processing::events::PostProcessingEventsInvalidateQueueScriptAdmissionInternalQueries;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -41,8 +43,17 @@ impl JobScriptEffects {
     }
 }
 
-impl Database {
-    pub fn job_script_effects(&self, job_id: u64) -> Result<JobScriptEffects, StateError> {
+pub trait PostProcessingEffectsQueries {
+    fn job_script_effects(&self, job_id: u64) -> Result<JobScriptEffects, StateError>;
+    fn save_job_script_effects(
+        &self,
+        job_id: u64,
+        effects: &JobScriptEffects,
+    ) -> Result<JobScriptEffects, StateError>;
+}
+
+impl PostProcessingEffectsQueries for Database {
+    fn job_script_effects(&self, job_id: u64) -> Result<JobScriptEffects, StateError> {
         self.warm_script_effects()?;
         Ok(self
             .script_runtime
@@ -55,112 +66,7 @@ impl Database {
             .unwrap_or_default())
     }
 
-    // The same, from memory alone: none while the effects were never read,
-    // so a caller that must not read the database asks this.
-    pub(crate) fn job_script_effects_in_hand(&self, job_id: u64) -> Option<JobScriptEffects> {
-        self.script_runtime
-            .effects_cache
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .as_ref()
-            .map(|cache| cache.get(&job_id).cloned().unwrap_or_default())
-    }
-
-    pub(crate) fn warm_script_effects(&self) -> Result<(), StateError> {
-        if self
-            .script_runtime
-            .effects_cache
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .is_some()
-        {
-            return Ok(());
-        }
-        let _writer = self
-            .script_runtime
-            .effects_writer
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if self
-            .script_runtime
-            .effects_cache
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .is_some()
-        {
-            return Ok(());
-        }
-        let datastore = self.datastore();
-        let cache = self.run_sql_blocking_read(async move {
-            SqlRuntime::fetch_all(
-                datastore.read_exec(),
-                "SELECT job_id, state FROM script_job_state",
-                &[],
-            )
-            .await?
-            .into_iter()
-            .map(|row| {
-                Ok((
-                    row.i64("job_id")? as u64,
-                    serde_json::from_str(&row.text("state")?)
-                        .map_err(|error| StateError::Database(error.to_string()))?,
-                ))
-            })
-            .collect::<Result<BTreeMap<_, _>, StateError>>()
-        })?;
-        *self
-            .script_runtime
-            .effects_cache
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(cache);
-        Ok(())
-    }
-
-    // Serialises writes to `script_job_state` with the effects cache.
-    pub(crate) fn lock_script_effects_writer(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.script_runtime
-            .effects_writer
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-    }
-
-    // Callers hold `lock_script_effects_writer` across the committed write.
-    pub(crate) fn cache_script_effects(&self, job_id: u64, effects: JobScriptEffects) {
-        if let Some(cache) = self
-            .script_runtime
-            .effects_cache
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .as_mut()
-        {
-            cache.insert(job_id, effects);
-        }
-    }
-
-    pub(crate) fn forget_script_effects(&self, job_id: u64) {
-        self.forget_script_effects_for(&[job_id]);
-    }
-
-    pub(crate) fn forget_script_effects_for(&self, job_ids: &[u64]) {
-        let _writer = self
-            .script_runtime
-            .effects_writer
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if let Some(cache) = self
-            .script_runtime
-            .effects_cache
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .as_mut()
-        {
-            for job_id in job_ids {
-                cache.remove(job_id);
-            }
-        }
-    }
-
-    pub fn save_job_script_effects(
+    fn save_job_script_effects(
         &self,
         job_id: u64,
         effects: &JobScriptEffects,
@@ -214,6 +120,122 @@ impl Database {
             cache.insert(job_id, saved.clone());
         }
         Ok(saved)
+    }
+}
+
+pub(crate) trait PostProcessingEffectsInternalQueries {
+    fn job_script_effects_in_hand(&self, job_id: u64) -> Option<JobScriptEffects>;
+    fn warm_script_effects(&self) -> Result<(), StateError>;
+    fn lock_script_effects_writer(&self) -> std::sync::MutexGuard<'_, ()>;
+    fn cache_script_effects(&self, job_id: u64, effects: JobScriptEffects);
+    fn forget_script_effects(&self, job_id: u64);
+    fn forget_script_effects_for(&self, job_ids: &[u64]);
+}
+
+impl PostProcessingEffectsInternalQueries for Database {
+    // The same, from memory alone: none while the effects were never read,
+    // so a caller that must not read the database asks this.
+    fn job_script_effects_in_hand(&self, job_id: u64) -> Option<JobScriptEffects> {
+        self.script_runtime
+            .effects_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map(|cache| cache.get(&job_id).cloned().unwrap_or_default())
+    }
+
+    fn warm_script_effects(&self) -> Result<(), StateError> {
+        if self
+            .script_runtime
+            .effects_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_some()
+        {
+            return Ok(());
+        }
+        let _writer = self
+            .script_runtime
+            .effects_writer
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self
+            .script_runtime
+            .effects_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_some()
+        {
+            return Ok(());
+        }
+        let datastore = self.datastore();
+        let cache = self.run_sql_blocking_read(async move {
+            SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT job_id, state FROM script_job_state",
+                &[],
+            )
+            .await?
+            .into_iter()
+            .map(|row| {
+                Ok((
+                    row.i64("job_id")? as u64,
+                    serde_json::from_str(&row.text("state")?)
+                        .map_err(|error| StateError::Database(error.to_string()))?,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, StateError>>()
+        })?;
+        *self
+            .script_runtime
+            .effects_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(cache);
+        Ok(())
+    }
+
+    // Serialises writes to `script_job_state` with the effects cache.
+    fn lock_script_effects_writer(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.script_runtime
+            .effects_writer
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    // Callers hold `lock_script_effects_writer` across the committed write.
+    fn cache_script_effects(&self, job_id: u64, effects: JobScriptEffects) {
+        if let Some(cache) = self
+            .script_runtime
+            .effects_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_mut()
+        {
+            cache.insert(job_id, effects);
+        }
+    }
+
+    fn forget_script_effects(&self, job_id: u64) {
+        self.forget_script_effects_for(&[job_id]);
+    }
+
+    fn forget_script_effects_for(&self, job_ids: &[u64]) {
+        let _writer = self
+            .script_runtime
+            .effects_writer
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(cache) = self
+            .script_runtime
+            .effects_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_mut()
+        {
+            for job_id in job_ids {
+                cache.remove(job_id);
+            }
+        }
     }
 }
 
@@ -416,6 +438,7 @@ fn validate_directory_owner(
 mod tests {
     use super::*;
     use crate::categories::CategoryConfig;
+    use crate::categories::persistence::CategoriesPersistenceQueries;
     use crate::post_processing::model::PipelineOutcome;
     use crate::post_processing::runner::CompatibilityFacts;
 

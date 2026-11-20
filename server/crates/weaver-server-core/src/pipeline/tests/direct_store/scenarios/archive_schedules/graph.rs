@@ -6,6 +6,8 @@
 // schedule orders, moved as the orchestrator moves it, and judged by one
 // rule set read off the schedule and the post.
 
+use crate::history::nzbget_state::HistoryNzbgetStateQueries;
+use crate::jobs::queries::JobsQueries;
 use weaver_graph::recovery::RepairOutcome;
 
 use super::*;

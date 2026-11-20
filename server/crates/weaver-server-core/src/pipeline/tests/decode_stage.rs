@@ -8,6 +8,7 @@ use super::*;
 use crate::pipeline::orchestrator::{
     compute_decode_backlog_budget_bytes, compute_write_backlog_budget_bytes,
 };
+use crate::settings::queries::SettingsQueries;
 
 #[tokio::test]
 async fn pump_decode_queue_releases_bytes_for_inactive_job() {

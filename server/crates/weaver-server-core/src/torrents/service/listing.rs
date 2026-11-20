@@ -7,6 +7,7 @@
 //! the order they were added in, of a privacy through the index of that
 //! privacy.
 
+use crate::torrents::queries::TorrentsInternalQueries;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ops::Range;
 

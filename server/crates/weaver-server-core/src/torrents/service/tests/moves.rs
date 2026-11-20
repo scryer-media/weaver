@@ -2,6 +2,10 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::jobs::repository::JobsRepositoryQueries;
+use crate::torrents::persistence::TorrentsPersistenceInsertPlacedTorrentInternalQueries;
+use crate::torrents::persistence::TorrentsPersistenceInsertTorrentQueries;
+use crate::torrents::queries::TorrentsQueries;
 
 // The one file of `dir`'s tree.
 fn only_file(dir: &Path) -> PathBuf {

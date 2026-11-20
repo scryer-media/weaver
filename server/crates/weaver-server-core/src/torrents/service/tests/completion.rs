@@ -5,6 +5,19 @@
 // through: its history and the archives of what it wrote.
 
 use super::*;
+use crate::history::delete_queue::HistoryDeleteQueueQueries;
+use crate::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
+use crate::history::queries::HistoryInternalQueries;
+use crate::history::queries::HistoryQueries;
+use crate::jobs::repository::JobsRepositoryQueries;
+use crate::operations::async_ops::OperationsAsyncOpsQueries;
+use crate::torrents::persistence::TorrentsPersistenceInsertPlacedTorrentInternalQueries;
+use crate::torrents::persistence::TorrentsPersistenceInsertTorrentQueries;
+use crate::torrents::persistence::TorrentsPersistenceJobHistoryFilesInternalQueries;
+use crate::torrents::persistence::TorrentsPersistenceLiveHeldPathsInternalQueries;
+use crate::torrents::persistence::TorrentsPersistenceMarkTorrentRetiringInternalQueries;
+use crate::torrents::queries::TorrentsInternalQueries;
+use crate::torrents::queries::TorrentsQueries;
 
 // A torrent removed while the database's disk has no room for its history
 // row is not lost: its row is kept by the owner that keeps an NZB job's

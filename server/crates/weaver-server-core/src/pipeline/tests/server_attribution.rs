@@ -2,6 +2,10 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::history::queries::HistoryQueries;
+use crate::jobs::JobsServerAttributionPersistenceInternalQueries;
+use crate::jobs::queries::JobsQueries;
+use crate::jobs::repository::JobsRepositoryQueries;
 
 #[tokio::test]
 async fn attribution_checkpoint_survives_repeated_active_job_restores() {

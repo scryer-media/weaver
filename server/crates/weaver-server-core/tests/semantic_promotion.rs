@@ -10,6 +10,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use weaver_server_core::jobs::duplicate_persistence::JobsDuplicatePersistenceAdmitDuplicateSubmissionQueries;
+use weaver_server_core::jobs::queries::JobsQueries;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use tempfile::TempDir;

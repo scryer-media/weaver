@@ -6,6 +6,7 @@
 // windows are crossed without waiting for them.
 
 use super::*;
+use crate::jobs::persistence::JobsPersistenceInternalQueries;
 use crate::pipeline::download::{
     DOWNLOAD_DISPATCH_STALL_KICK_AFTER, DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL,
     DOWNLOAD_DISPATCH_STALL_RELEASE_AFTER,

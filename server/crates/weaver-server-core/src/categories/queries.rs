@@ -7,8 +7,13 @@ use crate::categories::record::{CATEGORY_COLUMNS, CategoryRecord};
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::SqlRuntime;
 
-impl Database {
-    pub fn list_categories(&self) -> Result<Vec<CategoryConfig>, StateError> {
+pub trait CategoriesQueries {
+    fn list_categories(&self) -> Result<Vec<CategoryConfig>, StateError>;
+    fn next_category_id(&self) -> Result<u32, StateError>;
+}
+
+impl CategoriesQueries for Database {
+    fn list_categories(&self) -> Result<Vec<CategoryConfig>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
@@ -24,7 +29,7 @@ impl Database {
         })
     }
 
-    pub fn next_category_id(&self) -> Result<u32, StateError> {
+    fn next_category_id(&self) -> Result<u32, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let row = SqlRuntime::fetch_optional(

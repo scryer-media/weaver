@@ -5,6 +5,9 @@
 // the tree and the namespace writer to its files, and the assembly writes
 // nothing.
 
+use crate::history::nzbget_state::HistoryNzbgetStateQueries;
+use crate::history::queries::HistoryQueries;
+use crate::jobs::graph_checkpoint::JobsGraphCheckpointInternalQueries;
 use std::path::{Path, PathBuf};
 
 use weaver_graph::recovery::RepairOutcome;

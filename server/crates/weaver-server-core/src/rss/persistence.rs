@@ -4,6 +4,7 @@
 use crate::StateError;
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, max_rows_for_tx};
+use crate::rss::RssInternalQueries;
 use crate::rss::record::{RssFeedRow, RssRuleRow, RssSeenItemRow};
 
 use super::repository::{encode_categories, encode_metadata};
@@ -141,13 +142,18 @@ fn sealed_link(key: Option<&EncryptionKey>, link: &str) -> Result<String, StateE
     }
 }
 
-impl Database {
+pub(crate) trait RssPersistenceInternalQueries {
+    fn seal_rss_links(&self, key: &EncryptionKey) -> Result<(), StateError>;
+    fn key_rss_idempotency(&self) -> Result<(), StateError>;
+}
+
+impl RssPersistenceInternalQueries for Database {
     // The RSS part of [`Database::seal_stored_secrets`]: every feed URL and
     // seen item link stored in the clear encrypted, and every seen item id
     // stored as the feed gave it replaced by its digest. Each step selects in SQL only the rows
     // it has yet to do, a page at a time, each page in one write
     // transaction, so a pass cut short goes on at the next start.
-    pub(crate) fn seal_rss_links(&self, key: &EncryptionKey) -> Result<(), StateError> {
+    fn seal_rss_links(&self, key: &EncryptionKey) -> Result<(), StateError> {
         use crate::persistence::encryption::{decrypt_value, encrypt_value, is_encrypted};
 
         let key = key.clone();
@@ -267,7 +273,7 @@ impl Database {
     // the one kept. The rows are walked once by the table's job index, a
     // page at a time, each page in one write transaction: a row put back
     // no longer matches, so a page never reads one twice.
-    pub(crate) fn key_rss_idempotency(&self) -> Result<(), StateError> {
+    fn key_rss_idempotency(&self) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             let mut from = i64::MIN;
@@ -325,12 +331,60 @@ impl Database {
             Ok(())
         })
     }
+}
 
-    pub fn insert_rss_feed(&self, feed: &RssFeedRow) -> Result<(), StateError> {
+pub trait RssPersistenceQueries {
+    fn insert_rss_feed(&self, feed: &RssFeedRow) -> Result<(), StateError>;
+    fn insert_rss_feed_with_routing(
+        &self,
+        feed: &RssFeedRow,
+        routing: Option<&crate::proxies::RoutingPolicy>,
+    ) -> Result<(), StateError>;
+    fn update_rss_feed(&self, feed: &RssFeedRow) -> Result<(), StateError>;
+    fn update_rss_feed_with_routing(
+        &self,
+        feed: &RssFeedRow,
+        routing: Option<&crate::proxies::RoutingPolicy>,
+    ) -> Result<(), StateError>;
+    fn delete_rss_feed(&self, id: u32) -> Result<bool, StateError>;
+    fn insert_rss_rule(&self, rule: &RssRuleRow) -> Result<(), StateError>;
+    fn update_rss_rule(&self, rule: &RssRuleRow) -> Result<(), StateError>;
+    fn delete_rss_rule(&self, id: u32) -> Result<bool, StateError>;
+    fn insert_rss_seen_item(&self, item: &RssSeenItemRow) -> Result<(), StateError>;
+    fn delete_rss_seen_item(&self, feed_id: u32, item_id: &str) -> Result<bool, StateError>;
+    fn clear_rss_seen_items(&self, feed_id: Option<u32>) -> Result<u64, StateError>;
+    fn release_rss_waiting_items(&self) -> Result<bool, StateError>;
+    fn record_rss_feed_sync(
+        &self,
+        feed_id: u32,
+        items: &[RssSeenItemRow],
+        polled_at: i64,
+        etag: Option<&str>,
+        last_modified: Option<&str>,
+    ) -> Result<(), StateError>;
+    fn insert_rss_seen_items(&self, items: &[RssSeenItemRow]) -> Result<(), StateError>;
+    fn purge_old_rss_seen_items(&self, cutoff_ts: i64) -> Result<u64, StateError>;
+    fn record_rss_poll_success(
+        &self,
+        feed_id: u32,
+        polled_at: i64,
+        etag: Option<&str>,
+        last_modified: Option<&str>,
+    ) -> Result<(), StateError>;
+    fn record_rss_poll_failure(
+        &self,
+        feed_id: u32,
+        polled_at: i64,
+        error: &str,
+    ) -> Result<(), StateError>;
+}
+
+impl RssPersistenceQueries for Database {
+    fn insert_rss_feed(&self, feed: &RssFeedRow) -> Result<(), StateError> {
         self.insert_rss_feed_with_routing(feed, None)
     }
 
-    pub fn insert_rss_feed_with_routing(
+    fn insert_rss_feed_with_routing(
         &self,
         feed: &RssFeedRow,
         routing: Option<&crate::proxies::RoutingPolicy>,
@@ -374,11 +428,11 @@ impl Database {
         result
     }
 
-    pub fn update_rss_feed(&self, feed: &RssFeedRow) -> Result<(), StateError> {
+    fn update_rss_feed(&self, feed: &RssFeedRow) -> Result<(), StateError> {
         self.update_rss_feed_with_routing(feed, None)
     }
 
-    pub fn update_rss_feed_with_routing(
+    fn update_rss_feed_with_routing(
         &self,
         feed: &RssFeedRow,
         routing: Option<&crate::proxies::RoutingPolicy>,
@@ -428,7 +482,7 @@ impl Database {
         result
     }
 
-    pub fn delete_rss_feed(&self, id: u32) -> Result<bool, StateError> {
+    fn delete_rss_feed(&self, id: u32) -> Result<bool, StateError> {
         let datastore = self.datastore();
         let result = self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "delete_routed_consumer", |tx| {
@@ -470,7 +524,7 @@ impl Database {
         result
     }
 
-    pub fn insert_rss_rule(&self, rule: &RssRuleRow) -> Result<(), StateError> {
+    fn insert_rss_rule(&self, rule: &RssRuleRow) -> Result<(), StateError> {
         let datastore = self.datastore();
         let args = rss_rule_args(rule)?;
         self.run_sql_blocking(async move {
@@ -487,7 +541,7 @@ impl Database {
         })
     }
 
-    pub fn update_rss_rule(&self, rule: &RssRuleRow) -> Result<(), StateError> {
+    fn update_rss_rule(&self, rule: &RssRuleRow) -> Result<(), StateError> {
         let datastore = self.datastore();
         let mut args = rss_rule_args(rule)?;
         let id = args.remove(0);
@@ -507,7 +561,7 @@ impl Database {
         })
     }
 
-    pub fn delete_rss_rule(&self, id: u32) -> Result<bool, StateError> {
+    fn delete_rss_rule(&self, id: u32) -> Result<bool, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             let changed = SqlRuntime::execute(
@@ -520,7 +574,7 @@ impl Database {
         })
     }
 
-    pub fn insert_rss_seen_item(&self, item: &RssSeenItemRow) -> Result<(), StateError> {
+    fn insert_rss_seen_item(&self, item: &RssSeenItemRow) -> Result<(), StateError> {
         let datastore = self.datastore();
         let args = rss_seen_item_args(item, self.encryption_key())?;
         self.run_sql_blocking(async move {
@@ -548,7 +602,7 @@ impl Database {
 
     // Forget one seen item, named by its id as the seen list gives it, or
     // as the feed does: an equality on the table's key either way.
-    pub fn delete_rss_seen_item(&self, feed_id: u32, item_id: &str) -> Result<bool, StateError> {
+    fn delete_rss_seen_item(&self, feed_id: u32, item_id: &str) -> Result<bool, StateError> {
         let datastore = self.datastore();
         let [keyed, item_id] = seen_item_keys(item_id);
         self.run_sql_blocking(async move {
@@ -566,7 +620,7 @@ impl Database {
         })
     }
 
-    pub fn clear_rss_seen_items(&self, feed_id: Option<u32>) -> Result<u64, StateError> {
+    fn clear_rss_seen_items(&self, feed_id: Option<u32>) -> Result<u64, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             let changed = match feed_id {
@@ -593,7 +647,7 @@ impl Database {
     /// were held. Nothing is written when none were. Both statements, and the
     /// read before them, are served by the partial index on held items: the
     /// state is a literal, never a bound parameter.
-    pub fn release_rss_waiting_items(&self) -> Result<bool, StateError> {
+    fn release_rss_waiting_items(&self) -> Result<bool, StateError> {
         let datastore = self.datastore();
         let held = self.run_sql_blocking_read(async move {
             let held = SqlRuntime::fetch_optional(
@@ -630,7 +684,7 @@ impl Database {
 
     /// One feed poll's seen items and its success, in one transaction: the
     /// items in multi-row statements of bind-sized chunks.
-    pub fn record_rss_feed_sync(
+    fn record_rss_feed_sync(
         &self,
         feed_id: u32,
         items: &[RssSeenItemRow],
@@ -670,7 +724,7 @@ impl Database {
 
     /// Seen items recorded without a poll's success: those of a poll cut
     /// short, written together.
-    pub fn insert_rss_seen_items(&self, items: &[RssSeenItemRow]) -> Result<(), StateError> {
+    fn insert_rss_seen_items(&self, items: &[RssSeenItemRow]) -> Result<(), StateError> {
         if items.is_empty() {
             return Ok(());
         }
@@ -690,7 +744,7 @@ impl Database {
 
     /// Rows seen before `cutoff_ts` go. An indexed read first, so a pass
     /// with none past retention writes nothing.
-    pub fn purge_old_rss_seen_items(&self, cutoff_ts: i64) -> Result<u64, StateError> {
+    fn purge_old_rss_seen_items(&self, cutoff_ts: i64) -> Result<u64, StateError> {
         let datastore = self.datastore();
         let due = self.run_sql_blocking_read(async move {
             let due = SqlRuntime::fetch_optional(
@@ -715,7 +769,7 @@ impl Database {
         })
     }
 
-    pub fn record_rss_poll_success(
+    fn record_rss_poll_success(
         &self,
         feed_id: u32,
         polled_at: i64,
@@ -740,7 +794,7 @@ impl Database {
         result
     }
 
-    pub fn record_rss_poll_failure(
+    fn record_rss_poll_failure(
         &self,
         feed_id: u32,
         polled_at: i64,

@@ -2,6 +2,13 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use std::path::PathBuf;
+use weaver_server_core::history::queries::HistoryQueries;
+use weaver_server_core::post_processing::events::PostProcessingEventsCancelEventScriptsQueries;
+use weaver_server_core::post_processing::instances::PostProcessingInstancesQueries;
+use weaver_server_core::post_processing::preset::PostProcessingPresetQueries;
+use weaver_server_core::post_processing::secrets::PostProcessingSecretsQueries;
+use weaver_server_core::post_processing::settings::PostProcessingSettingsQueries;
+use weaver_server_core::post_processing::test_run::PostProcessingTestRunQueries;
 
 use super::*;
 use crate::auth::{AdminGuard, FreshAdminGuard, graphql_error};

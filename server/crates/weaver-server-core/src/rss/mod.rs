@@ -3,8 +3,12 @@
 
 mod model;
 mod persistence;
+pub(crate) use persistence::RssPersistenceInternalQueries;
+pub use persistence::RssPersistenceQueries;
 mod poller;
 mod queries;
+pub(crate) use queries::RssInternalQueries;
+pub use queries::RssQueries;
 pub(crate) use queries::ScheduleCache;
 mod record;
 pub mod repository;

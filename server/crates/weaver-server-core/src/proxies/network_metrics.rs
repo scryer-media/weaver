@@ -490,6 +490,7 @@ pub fn snapshot(runtime: &NetworkRuntime) -> NetworkMetricsSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proxies::ProxiesNetworkPersistenceQueries;
 
     // A torrent that holds `0` on its leg.
     struct Holds(super::super::SessionTraffic);

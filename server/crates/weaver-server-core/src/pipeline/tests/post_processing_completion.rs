@@ -3,8 +3,10 @@
 
 use super::*;
 use crate::post_processing::executor::PostProcessingExecutor;
+use crate::post_processing::instances::PostProcessingInstancesQueries;
 use crate::post_processing::instances::{InstanceTrigger, ScriptInstanceDraft};
 use crate::post_processing::model::{PostProcessingSettings, PostProcessingSummary, ScriptName};
+use crate::post_processing::settings::PostProcessingSettingsQueries;
 use std::os::unix::fs::PermissionsExt;
 use tokio::io::AsyncWriteExt;
 

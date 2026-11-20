@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use weaver_server_core::auth::repository::AuthRepositoryQueries;
+use weaver_server_core::jobs::queries::JobsQueries;
+use weaver_server_core::post_processing::output::PostProcessingOutputQueries;
+use weaver_server_core::post_processing::secrets::PostProcessingSecretsQueries;
+use weaver_server_core::post_processing::settings::PostProcessingSettingsQueries;
 mod common;
 
 use common::{TestHarness, assert_has_errors, assert_no_errors, response_data};

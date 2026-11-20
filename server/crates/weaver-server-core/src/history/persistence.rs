@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use crate::StateError;
+use crate::history::cache::HistoryCacheQueries;
 use crate::history::output_files::OutputFileListing;
 use crate::history::record::{IntegrationEventRow, JobHistoryRow};
 use crate::history::{parse_history_metadata, public_history_attributes};
@@ -9,6 +10,8 @@ use crate::persistence::Database;
 use crate::persistence::sql_runtime::{
     POSTGRES_BATCH_BIND_LIMIT, SqlArg, SqlEngine, SqlRuntime, SqlTx, max_rows_for_tx,
 };
+use crate::post_processing::effects::PostProcessingEffectsInternalQueries;
+use crate::post_processing::events::PostProcessingEventsInvalidateQueueScriptAdmissionInternalQueries;
 use sqlx::{Postgres, QueryBuilder, Sqlite};
 use weaver_server_base::jobs::ids::JobId;
 
@@ -219,8 +222,23 @@ pub(crate) async fn insert_job_history_tx(
     Ok(())
 }
 
-impl Database {
-    pub fn insert_job_history(&self, entry: &JobHistoryRow) -> Result<(), StateError> {
+pub trait HistoryPersistenceInsertJobHistoryQueries {
+    fn insert_job_history(&self, entry: &JobHistoryRow) -> Result<(), StateError>;
+    fn delete_job_history(&self, job_id: u64) -> Result<bool, StateError>;
+    fn delete_job_history_and_forget_duplicate_identity(
+        &self,
+        job_id: u64,
+    ) -> Result<bool, StateError>;
+    fn delete_job_histories_and_forget_duplicate_identities(
+        &self,
+        job_ids: &[JobId],
+    ) -> Result<Vec<JobId>, StateError>;
+    fn insert_integration_events(&self, events: &[IntegrationEventRow]) -> Result<(), StateError>;
+    fn delete_all_integration_events(&self) -> Result<(), StateError>;
+}
+
+impl HistoryPersistenceInsertJobHistoryQueries for Database {
+    fn insert_job_history(&self, entry: &JobHistoryRow) -> Result<(), StateError> {
         let datastore = self.datastore();
         let cache_entry = entry.clone();
         // Capture the cache generation before the write so a delete racing this
@@ -240,7 +258,7 @@ impl Database {
         result
     }
 
-    pub fn delete_job_history(&self, job_id: u64) -> Result<bool, StateError> {
+    fn delete_job_history(&self, job_id: u64) -> Result<bool, StateError> {
         self.delete_job_history_bundles(&[JobId(job_id)], false)
             .map(|deleted| !deleted.is_empty())
     }
@@ -248,7 +266,7 @@ impl Database {
     // Permanently removes visible history and the duplicate identity it owns.
     // Unlike scheduler-internal history cleanup, this records a tombstone so a
     // stale backfill cannot restore the identity after the delete commits.
-    pub fn delete_job_history_and_forget_duplicate_identity(
+    fn delete_job_history_and_forget_duplicate_identity(
         &self,
         job_id: u64,
     ) -> Result<bool, StateError> {
@@ -259,13 +277,84 @@ impl Database {
     // The batched form of `delete_job_history_and_forget_duplicate_identity`:
     // every id's history bundle and duplicate identity go in one transaction.
     // Returns the ids that had a history row; an id without one is skipped.
-    pub fn delete_job_histories_and_forget_duplicate_identities(
+    fn delete_job_histories_and_forget_duplicate_identities(
         &self,
         job_ids: &[JobId],
     ) -> Result<Vec<JobId>, StateError> {
         self.delete_job_history_bundles(job_ids, true)
     }
 
+    fn insert_integration_events(&self, events: &[IntegrationEventRow]) -> Result<(), StateError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        let datastore = self.datastore();
+        let events = events.to_vec();
+        self.run_sql_blocking(async move {
+            match datastore.engine() {
+                SqlEngine::Sqlite => {
+                    SqlRuntime::run_in_transaction(&datastore, "insert_integration_events", |tx| {
+                        let events = events.clone();
+                        Box::pin(async move {
+                            bulk_insert_integration_events_tx(tx, &events).await?;
+                            Ok(())
+                        })
+                    })
+                    .await
+                }
+                // Integration events are append-only rows with no parent guard,
+                // so each chunk rides one autocommit statement instead of
+                // paying a BEGIN/COMMIT pair around it.
+                SqlEngine::Postgres => {
+                    const BINDS_PER_ROW: usize = 4;
+                    let chunk_size = (POSTGRES_BATCH_BIND_LIMIT / BINDS_PER_ROW).max(1);
+                    let started = std::time::Instant::now();
+                    for chunk in events.chunks(chunk_size) {
+                        let sql = build_integration_events_pg_sql(chunk.len());
+                        let mut args = Vec::with_capacity(chunk.len() * BINDS_PER_ROW);
+                        for event in chunk {
+                            args.push(SqlArg::I64(event.timestamp));
+                            args.push(SqlArg::Text(event.kind.clone()));
+                            args.push(SqlArg::OptI64(event.item_id.map(|value| value as i64)));
+                            args.push(SqlArg::Text(event.payload_json.clone()));
+                        }
+                        SqlRuntime::execute(datastore.write_exec(), &sql, &args).await?;
+                    }
+                    weaver_server_base::runtime::perf_probe::record_sql_op(
+                        "postgres",
+                        "insert_integration_events",
+                        started.elapsed(),
+                    );
+                    Ok(())
+                }
+            }
+        })
+    }
+
+    fn delete_all_integration_events(&self) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.write_exec(),
+                "DELETE FROM integration_events",
+                &[],
+            )
+            .await?;
+            Ok(())
+        })
+    }
+}
+
+trait HistoryPersistenceDeleteJobHistoryBundlesLocalQueries {
+    fn delete_job_history_bundles(
+        &self,
+        job_ids: &[JobId],
+        forget_duplicate_identities: bool,
+    ) -> Result<Vec<JobId>, StateError>;
+}
+
+impl HistoryPersistenceDeleteJobHistoryBundlesLocalQueries for Database {
     fn delete_job_history_bundles(
         &self,
         job_ids: &[JobId],
@@ -314,84 +403,35 @@ impl Database {
         }
         result
     }
-
-    pub fn insert_integration_events(
-        &self,
-        events: &[IntegrationEventRow],
-    ) -> Result<(), StateError> {
-        if events.is_empty() {
-            return Ok(());
-        }
-
-        let datastore = self.datastore();
-        let events = events.to_vec();
-        self.run_sql_blocking(async move {
-            match datastore.engine() {
-                SqlEngine::Sqlite => {
-                    SqlRuntime::run_in_transaction(&datastore, "insert_integration_events", |tx| {
-                        let events = events.clone();
-                        Box::pin(async move {
-                            bulk_insert_integration_events_tx(tx, &events).await?;
-                            Ok(())
-                        })
-                    })
-                    .await
-                }
-                // Integration events are append-only rows with no parent guard,
-                // so each chunk rides one autocommit statement instead of
-                // paying a BEGIN/COMMIT pair around it.
-                SqlEngine::Postgres => {
-                    const BINDS_PER_ROW: usize = 4;
-                    let chunk_size = (POSTGRES_BATCH_BIND_LIMIT / BINDS_PER_ROW).max(1);
-                    let started = std::time::Instant::now();
-                    for chunk in events.chunks(chunk_size) {
-                        let sql = build_integration_events_pg_sql(chunk.len());
-                        let mut args = Vec::with_capacity(chunk.len() * BINDS_PER_ROW);
-                        for event in chunk {
-                            args.push(SqlArg::I64(event.timestamp));
-                            args.push(SqlArg::Text(event.kind.clone()));
-                            args.push(SqlArg::OptI64(event.item_id.map(|value| value as i64)));
-                            args.push(SqlArg::Text(event.payload_json.clone()));
-                        }
-                        SqlRuntime::execute(datastore.write_exec(), &sql, &args).await?;
-                    }
-                    weaver_server_base::runtime::perf_probe::record_sql_op(
-                        "postgres",
-                        "insert_integration_events",
-                        started.elapsed(),
-                    );
-                    Ok(())
-                }
-            }
-        })
-    }
-
-    pub fn delete_all_integration_events(&self) -> Result<(), StateError> {
-        let datastore = self.datastore();
-        self.run_sql_blocking(async move {
-            SqlRuntime::execute(
-                datastore.write_exec(),
-                "DELETE FROM integration_events",
-                &[],
-            )
-            .await?;
-            Ok(())
-        })
-    }
 }
 
 // Deletes the history bundle of every id that has a history row, and
 // returns those ids. Each chunk runs one `IN (...)` statement per table; the
 // `script_output_state` lock is taken once, first, in the same order as
 // insertion takes it.
-impl Database {
+pub(crate) trait HistoryPersistenceRecordArchivedHistoryFilesInternalQueries {
+    fn record_archived_history_files(
+        &self,
+        records: &[(JobId, OutputFileListing)],
+    ) -> Result<(), StateError>;
+    fn stamp_history_archived(&self, job_ids: &[JobId], archived_at: i64)
+    -> Result<(), StateError>;
+    fn stamp_history_swept(
+        &self,
+        job_ids: &[JobId],
+        swept_at: i64,
+        finished_by: i64,
+    ) -> Result<(), StateError>;
+}
+
+impl HistoryPersistenceRecordArchivedHistoryFilesInternalQueries for Database {
     // Keeps the record of what each entry's output folder held, read before
     // its archive removes it: the totals and the first files, in one
     // transaction. Only an entry with neither a stamp nor a record takes
     // one, so a retry after an archive that failed part way keeps the record
     // of the whole folder.
     // The record is shown only once the entry is stamped.
-    pub(crate) fn record_archived_history_files(
+    fn record_archived_history_files(
         &self,
         records: &[(JobId, OutputFileListing)],
     ) -> Result<(), StateError> {
@@ -422,7 +462,7 @@ impl Database {
     // Says that each entry was archived at `archived_at`, epoch seconds, in
     // one transaction. An entry that already says so keeps its first time;
     // the record kept before the archive is left as it is.
-    pub(crate) fn stamp_history_archived(
+    fn stamp_history_archived(
         &self,
         job_ids: &[JobId],
         archived_at: i64,
@@ -472,7 +512,7 @@ impl Database {
     // Internal: no view of the entry reads it, so no cached entry changes. An
     // entry already stamped keeps its first time, and one that is no longer
     // the failure the sweep listed, as after a retry, is not stamped.
-    pub(crate) fn stamp_history_swept(
+    fn stamp_history_swept(
         &self,
         job_ids: &[JobId],
         swept_at: i64,

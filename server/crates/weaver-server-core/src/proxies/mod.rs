@@ -3,6 +3,7 @@
 
 mod dns;
 mod dns_persistence;
+pub use dns_persistence::ProxiesDnsPersistenceQueries;
 pub(crate) use dns_persistence::validate_restored_dns;
 pub use dns_persistence::{StoredDns, UnreadableDnsList};
 mod fault;
@@ -11,9 +12,11 @@ mod model;
 mod network;
 pub mod network_metrics;
 mod network_persistence;
+pub use network_persistence::ProxiesNetworkPersistenceQueries;
 pub(crate) use network_persistence::lock_network;
 mod network_runtime;
 pub(crate) mod persistence;
+pub use persistence::ProxiesPersistenceQueries;
 mod pool_stage;
 mod refusal;
 #[cfg(test)]

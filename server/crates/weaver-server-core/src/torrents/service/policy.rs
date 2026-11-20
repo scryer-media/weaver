@@ -26,6 +26,7 @@ use crate::post_processing::model::{QueueEvent, vars};
 use crate::settings::model::{TorrentConfig, TrackerRule};
 use crate::settings::{Seeding, SeedingAction};
 use crate::torrents::persistence::TorrentSeedWrites;
+use crate::torrents::persistence::TorrentsPersistenceInsertPlacedTorrentInternalQueries;
 use crate::torrents::status::{self, Queued, Turn};
 use crate::torrents::{FilePriority, KeptIntent, TorrentIntent};
 use std::collections::{BTreeMap, BTreeSet};

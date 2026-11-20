@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use weaver_server_core::history::nzbget_state::HistoryNzbgetStateQueries;
+use weaver_server_core::operations::usage_history::OperationsUsageHistoryQueries;
+use weaver_server_core::servers::persistence::ServersPersistenceQueries;
 mod common;
 
 use chrono::{NaiveDate, TimeZone};

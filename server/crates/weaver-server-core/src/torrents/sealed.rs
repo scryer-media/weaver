@@ -6,6 +6,9 @@
 // value written before sealing reads as it was until the one pass that
 // seals it.
 
+use crate::rss::RssPersistenceInternalQueries;
+use crate::settings::persistence::SettingsPersistenceQueries;
+use crate::settings::queries::SettingsQueries;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 

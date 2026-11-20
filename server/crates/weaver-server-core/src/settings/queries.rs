@@ -6,8 +6,16 @@ use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::settings::record::SettingRecord;
 
-impl Database {
-    pub(crate) fn list_setting_records(&self) -> Result<Vec<SettingRecord>, StateError> {
+pub(crate) trait SettingsInternalQueries {
+    fn list_setting_records(&self) -> Result<Vec<SettingRecord>, StateError>;
+    fn get_settings(
+        &self,
+        keys: Vec<String>,
+    ) -> Result<std::collections::HashMap<String, String>, StateError>;
+}
+
+impl SettingsInternalQueries for Database {
+    fn list_setting_records(&self) -> Result<Vec<SettingRecord>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
@@ -30,7 +38,7 @@ impl Database {
 
     // As `get_setting`, for every key of `keys`: one statement per bind-sized
     // chunk. A key with no setting is absent from the map.
-    pub(crate) fn get_settings(
+    fn get_settings(
         &self,
         keys: Vec<String>,
     ) -> Result<std::collections::HashMap<String, String>, StateError> {
@@ -58,8 +66,14 @@ impl Database {
             Ok(values)
         })
     }
+}
 
-    pub fn get_setting(&self, key: &str) -> Result<Option<String>, StateError> {
+pub trait SettingsQueries {
+    fn get_setting(&self, key: &str) -> Result<Option<String>, StateError>;
+}
+
+impl SettingsQueries for Database {
+    fn get_setting(&self, key: &str) -> Result<Option<String>, StateError> {
         let datastore = self.datastore();
         let key = key.to_string();
         self.run_sql_blocking_read(async move {

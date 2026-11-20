@@ -4,6 +4,8 @@
 // propagation delay
 
 use super::*;
+use crate::history::queries::HistoryQueries;
+use crate::settings::queries::SettingsQueries;
 
 #[tokio::test]
 async fn owned_download_lane_capacity_failure_requeues_without_failing_the_articles() {

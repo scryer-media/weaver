@@ -2,8 +2,13 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
+use crate::post_processing::instances::PostProcessingInstancesQueries;
 use crate::post_processing::instances::ScriptInstanceDraft;
 use crate::post_processing::model::ScriptName;
+use crate::post_processing::output::PostProcessingOutputQueries;
+use crate::post_processing::settings::PostProcessingSettingsQueries;
+use crate::tags::TagsQueries;
 
 fn configured() -> (Database, tempfile::TempDir) {
     let db = Database::open_in_memory().unwrap();

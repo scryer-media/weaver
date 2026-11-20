@@ -11,6 +11,10 @@
 // is a constant from a fixed list or a generated token; a torrent's
 // trackers appear by scheme and host only.
 
+use crate::history::queries::HistoryQueries;
+use crate::history::timeline::HistoryTimelineQueries;
+use crate::jobs::JobsSupportFactsPersistenceQueries;
+use crate::jobs::queries::JobsQueries;
 #[cfg(test)]
 mod tests;
 mod torrent;

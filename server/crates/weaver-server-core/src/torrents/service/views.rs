@@ -15,10 +15,12 @@ use crate::jobs::model::JobStatus;
 use crate::proxies::{ResolvedBy, TorrentScope};
 use crate::settings::model::TrackerRule;
 use crate::settings::{Seeding, SeedingPolicy};
+use crate::tags::TagsQueries;
 use crate::torrents::layout::PieceLayout;
 use crate::torrents::metrics::{
     Published, SeedingSeries, SessionSeries, TorrentMetrics, TorrentSeries,
 };
+use crate::torrents::persistence::TorrentsPersistenceInsertPlacedTorrentInternalQueries;
 use crate::torrents::sessions::TorrentRouteReason;
 use crate::torrents::status::Engine;
 use crate::torrents::{

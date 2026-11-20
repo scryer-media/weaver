@@ -2,6 +2,11 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::post_processing::events::PostProcessingEventsInvalidateQueueScriptAdmissionInternalQueries;
+use crate::settings::repository::SettingsRepositoryQueries;
+use crate::torrents::persistence::TorrentsPersistenceInsertPlacedTorrentInternalQueries;
+use crate::torrents::persistence::TorrentsPersistenceInsertTorrentQueries;
+use crate::torrents::queries::TorrentsQueries;
 
 // libtorrent `torrent::set_upload_limit` / `set_download_limit` throttle the
 // torrent's own channels in place, and qBittorrent's `TorrentImpl` keeps

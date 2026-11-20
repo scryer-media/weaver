@@ -8,6 +8,15 @@
 // first come, first served, and a job between two of its scripts holds no
 // slot another run could use.
 
+use crate::history::timeline::HistoryTimelineQueries;
+use crate::jobs::persistence::JobsPersistenceInternalQueries;
+use crate::post_processing::callbacks::PostProcessingCallbacksQueries;
+use crate::post_processing::effects::PostProcessingEffectsQueries;
+use crate::post_processing::events::PostProcessingEventsCancelEventScriptsQueries;
+use crate::post_processing::instances::PostProcessingInstancesInternalQueries;
+use crate::post_processing::instances::PostProcessingInstancesQueries;
+use crate::post_processing::settings::PostProcessingSettingsInternalQueries;
+use crate::post_processing::settings::PostProcessingSettingsQueries;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};

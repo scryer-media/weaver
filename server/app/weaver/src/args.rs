@@ -335,6 +335,7 @@ pub(crate) fn upgrade_backup_required(flag: bool, env: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use weaver_server_core::settings::service::SettingsServiceQueries;
 
     use clap::{Parser, error::ErrorKind};
 

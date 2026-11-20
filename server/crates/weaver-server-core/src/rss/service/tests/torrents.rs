@@ -3,7 +3,11 @@
 
 use super::*;
 use crate::categories::CategoryConfig;
+use crate::rss::RssPersistenceInternalQueries;
+use crate::rss::RssPersistenceQueries;
+use crate::rss::RssQueries;
 use crate::settings::TorrentConfig;
+use crate::torrents::queries::TorrentsQueries;
 use crate::torrents::service::{JobEnv, TorrentService, TorrentSettings};
 use crate::torrents::sessions::tests::{FakeRoutes, env};
 use crate::torrents::sessions::{Routes, Sessions};

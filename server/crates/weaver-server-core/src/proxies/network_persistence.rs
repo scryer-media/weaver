@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::settings::SettingsSchedulesInternalQueries;
 use std::collections::HashMap;
 
 use super::{
@@ -296,10 +297,29 @@ pub(super) async fn validate_stored_network(
     super::dns_persistence::validate_route_dns(&mut tx.conn(), &profiles, &pools, touched).await
 }
 
-impl Database {
+pub trait ProxiesNetworkPersistenceQueries {
+    fn network_bandwidth(&self) -> Result<Bandwidth, StateError>;
+    fn set_network_bandwidth(&self, bandwidth: &Bandwidth) -> Result<(), StateError>;
+    fn list_egress_interfaces(&self) -> Result<Vec<EgressInterface>, StateError>;
+    fn create_egress_interface(
+        &self,
+        egress: &EgressInterface,
+    ) -> Result<EgressInterface, StateError>;
+    fn update_egress_interface(
+        &self,
+        egress: &EgressInterface,
+    ) -> Result<EgressInterface, StateError>;
+    fn delete_egress_interface(&self, id: u32) -> Result<(), StateError>;
+    fn list_proxy_pools(&self) -> Result<Vec<ProxyPool>, StateError>;
+    fn create_proxy_pool(&self, pool: &ProxyPool) -> Result<ProxyPool, StateError>;
+    fn update_proxy_pool(&self, pool: &ProxyPool) -> Result<ProxyPool, StateError>;
+    fn delete_proxy_pool(&self, id: u32) -> Result<(), StateError>;
+}
+
+impl ProxiesNetworkPersistenceQueries for Database {
     // The global limits in each direction. A database without the row has
     // none.
-    pub fn network_bandwidth(&self) -> Result<Bandwidth, StateError> {
+    fn network_bandwidth(&self) -> Result<Bandwidth, StateError> {
         let store = self.datastore();
         self.run_sql_blocking_read(async move {
             let Some(row) = SqlRuntime::fetch_optional(
@@ -321,7 +341,7 @@ impl Database {
         })
     }
 
-    pub fn set_network_bandwidth(&self, bandwidth: &Bandwidth) -> Result<(), StateError> {
+    fn set_network_bandwidth(&self, bandwidth: &Bandwidth) -> Result<(), StateError> {
         bandwidth.validate()?;
         let bandwidth = *bandwidth;
         let store = self.datastore();
@@ -344,7 +364,7 @@ impl Database {
         })
     }
 
-    pub fn list_egress_interfaces(&self) -> Result<Vec<EgressInterface>, StateError> {
+    fn list_egress_interfaces(&self) -> Result<Vec<EgressInterface>, StateError> {
         let store = self.datastore();
         self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_all(store.read_exec(), select_egresses!("ORDER BY id"), &[])
@@ -355,20 +375,101 @@ impl Database {
         })
     }
 
-    pub fn create_egress_interface(
+    fn create_egress_interface(
         &self,
         egress: &EgressInterface,
     ) -> Result<EgressInterface, StateError> {
         self.write_egress_interface(egress, true)
     }
 
-    pub fn update_egress_interface(
+    fn update_egress_interface(
         &self,
         egress: &EgressInterface,
     ) -> Result<EgressInterface, StateError> {
         self.write_egress_interface(egress, false)
     }
 
+    fn delete_egress_interface(&self, id: u32) -> Result<(), StateError> {
+        if id == 0 {
+            return Err(NetworkRefusal::EgressSystemUndeletable.into());
+        }
+        let store = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&store, "delete_egress", |tx| {
+                Box::pin(async move {
+                    lock_network(tx).await?;
+                    if let Some((holder, _)) = routes_by_holder(tx)
+                        .await?
+                        .into_iter()
+                        .find(|(_, route)| route.legs.iter().any(|leg| leg.egress_id == id))
+                    {
+                        return Err(NetworkRefusal::EgressInUse(holder).into());
+                    }
+                    tx.execute(
+                        "DELETE FROM egress_interfaces WHERE id = {}",
+                        &[SqlArg::I64(i64::from(id))],
+                    )
+                    .await?;
+                    Database::remove_egress_schedules(tx, id).await
+                })
+            })
+            .await
+        })
+    }
+
+    fn list_proxy_pools(&self) -> Result<Vec<ProxyPool>, StateError> {
+        let store = self.datastore();
+        self.run_sql_blocking_read(async move {
+            SqlRuntime::fetch_all(
+                store.read_exec(),
+                "SELECT * FROM proxy_pools ORDER BY id",
+                &[],
+            )
+            .await?
+            .into_iter()
+            .map(pool_row)
+            .collect()
+        })
+    }
+
+    fn create_proxy_pool(&self, pool: &ProxyPool) -> Result<ProxyPool, StateError> {
+        self.write_proxy_pool(pool, true)
+    }
+
+    fn update_proxy_pool(&self, pool: &ProxyPool) -> Result<ProxyPool, StateError> {
+        self.write_proxy_pool(pool, false)
+    }
+
+    fn delete_proxy_pool(&self, id: u32) -> Result<(), StateError> {
+        let store = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&store, "delete_proxy_pool", |tx| Box::pin(async move {
+                lock_network(tx).await?;
+                for (holder, route) in routes_by_holder(tx).await? {
+                    for leg in route.legs {
+                        if let LegPath::Ladder { rungs, .. } = leg.path
+                            && rungs.iter().any(|rung| matches!(rung, Rung::Pool { id: referenced } if *referenced == id)) {
+                            return Err(NetworkRefusal::PoolInUse(holder).into());
+                        }
+                    }
+                }
+                tx.execute("DELETE FROM proxy_pools WHERE id = {}", &[SqlArg::I64(i64::from(id))]).await?;
+                Ok(())
+            })).await
+        })
+    }
+}
+
+trait ProxiesNetworkPersistenceLocalQueries {
+    fn write_egress_interface(
+        &self,
+        egress: &EgressInterface,
+        create: bool,
+    ) -> Result<EgressInterface, StateError>;
+    fn write_proxy_pool(&self, pool: &ProxyPool, create: bool) -> Result<ProxyPool, StateError>;
+}
+
+impl ProxiesNetworkPersistenceLocalQueries for Database {
     fn write_egress_interface(
         &self,
         egress: &EgressInterface,
@@ -407,57 +508,6 @@ impl Database {
                 })
             }).await
         })
-    }
-
-    pub fn delete_egress_interface(&self, id: u32) -> Result<(), StateError> {
-        if id == 0 {
-            return Err(NetworkRefusal::EgressSystemUndeletable.into());
-        }
-        let store = self.datastore();
-        self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&store, "delete_egress", |tx| {
-                Box::pin(async move {
-                    lock_network(tx).await?;
-                    if let Some((holder, _)) = routes_by_holder(tx)
-                        .await?
-                        .into_iter()
-                        .find(|(_, route)| route.legs.iter().any(|leg| leg.egress_id == id))
-                    {
-                        return Err(NetworkRefusal::EgressInUse(holder).into());
-                    }
-                    tx.execute(
-                        "DELETE FROM egress_interfaces WHERE id = {}",
-                        &[SqlArg::I64(i64::from(id))],
-                    )
-                    .await?;
-                    Database::remove_egress_schedules(tx, id).await
-                })
-            })
-            .await
-        })
-    }
-
-    pub fn list_proxy_pools(&self) -> Result<Vec<ProxyPool>, StateError> {
-        let store = self.datastore();
-        self.run_sql_blocking_read(async move {
-            SqlRuntime::fetch_all(
-                store.read_exec(),
-                "SELECT * FROM proxy_pools ORDER BY id",
-                &[],
-            )
-            .await?
-            .into_iter()
-            .map(pool_row)
-            .collect()
-        })
-    }
-
-    pub fn create_proxy_pool(&self, pool: &ProxyPool) -> Result<ProxyPool, StateError> {
-        self.write_proxy_pool(pool, true)
-    }
-
-    pub fn update_proxy_pool(&self, pool: &ProxyPool) -> Result<ProxyPool, StateError> {
-        self.write_proxy_pool(pool, false)
     }
 
     fn write_proxy_pool(&self, pool: &ProxyPool, create: bool) -> Result<ProxyPool, StateError> {
@@ -509,25 +559,6 @@ impl Database {
                     Ok(pool)
                 })
             }).await
-        })
-    }
-
-    pub fn delete_proxy_pool(&self, id: u32) -> Result<(), StateError> {
-        let store = self.datastore();
-        self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&store, "delete_proxy_pool", |tx| Box::pin(async move {
-                lock_network(tx).await?;
-                for (holder, route) in routes_by_holder(tx).await? {
-                    for leg in route.legs {
-                        if let LegPath::Ladder { rungs, .. } = leg.path
-                            && rungs.iter().any(|rung| matches!(rung, Rung::Pool { id: referenced } if *referenced == id)) {
-                            return Err(NetworkRefusal::PoolInUse(holder).into());
-                        }
-                    }
-                }
-                tx.execute("DELETE FROM proxy_pools WHERE id = {}", &[SqlArg::I64(i64::from(id))]).await?;
-                Ok(())
-            })).await
         })
     }
 }

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::proxies::ProxiesNetworkPersistenceQueries;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;

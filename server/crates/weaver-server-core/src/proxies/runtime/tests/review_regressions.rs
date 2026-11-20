@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::proxies::ProxiesPersistenceQueries;
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicUsize;
 use tokio::io::{AsyncBufReadExt, BufReader};

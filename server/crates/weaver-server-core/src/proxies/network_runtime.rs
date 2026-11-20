@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::proxies::ProxiesDnsPersistenceQueries;
+use crate::proxies::ProxiesNetworkPersistenceQueries;
+use crate::proxies::ProxiesPersistenceQueries;
+use crate::servers::queries::ServersQueries;
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex, RwLock},
