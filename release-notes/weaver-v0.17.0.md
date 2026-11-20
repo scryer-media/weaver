@@ -22,8 +22,7 @@ Everything below is new since 0.16.17.
   and upload limit shared between Usenet and torrents, upload caps and
   quotas per egress, and a per-day usage history with new dashboards.
 - **More releases complete.** Many fixes to nested archives, RAR sets,
-  PAR2 and RAR recovery, splits and naming, found by running real NZBs
-  against SABnzbd.
+  PAR2 and RAR recovery, splits and naming, found by running real NZBs.
 
 ## Torrents: engine
 
@@ -207,7 +206,7 @@ Weaver ships a new engine crate, `weaver-torrent`, and a new uTP crate,
   it started with. A torrent of only unwanted files is added with every
   file left out.
 - **Naming.** A posted file takes its yEnc or uuencode header name once,
-  by SABnzbd's rules. A leftover `&quot;` is dropped from names.
+  when it is a clear name. A leftover `&quot;` is dropped from names.
 - **Splits.** Two-digit split sets join, with guards for version-like
   names.
 - **Nested archives.** Below the root, only release layers are opened.

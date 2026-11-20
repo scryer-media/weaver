@@ -697,8 +697,7 @@ async fn a_split_compressed_members_checksum_reaches_the_naming_plan() {
 
 // A poster who numbered a set's volumes at more than one width: the first
 // ones at two digits, the later ones at three (`part01.rar` … `part09.rar`,
-// `part010.rar` …). The number is the number whatever its width, as SABnzbd
-// reads it, so the set is one set, in order, and its member is delivered.
+// `part010.rar` …). The number is the number whatever its width, so the set is one set, in order, and its member is delivered.
 #[tokio::test]
 async fn a_set_numbered_at_mixed_widths_delivers_its_member() {
     let dir = concat!(

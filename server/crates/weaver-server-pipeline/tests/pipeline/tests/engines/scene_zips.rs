@@ -919,7 +919,7 @@ async fn a_core_release_with_an_archive_inside_its_set_ends_complete() {
 // volume of another set whose first volume the release never carried
 // (`avecd0q.r00`, its `avecd0qa.zip` absent from the outer RAR). Nothing is
 // lost: the book is delivered whole and the lone volume as posted, and
-// SABnzbd ends the same files Completed, and so does Weaver: the set that
+// the job ends Completed: the set that
 // vouched for the outer volumes proved the bytes unpacked from them, the
 // lone volume among them, and nothing can open a set without its first
 // volume.

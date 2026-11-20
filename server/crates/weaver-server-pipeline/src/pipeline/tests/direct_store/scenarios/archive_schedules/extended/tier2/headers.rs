@@ -9,12 +9,9 @@
 // the fields around them lie, each the way a post in the field or a
 // reference decoder's own tolerance shows it.
 //
-// What the reference decoders do with a part decides each verdict: each
+// What the common decoders do with a part decides each verdict: each
 // writes the body where its own `=ypart begin=` puts it and ends the file at
-// the furthest byte written (sabctools `src/yenc.cc:361-377` and `:802-804`,
-// SABnzbd `sabnzbd/assembler.py:567`, NZBGet
-// `daemon/nntp/ArticleWriter.cpp:557-558`, nzbfast
-// `crates/nzbfast-engine/src/get/workers.rs:823-863`). A lie that leaves
+// the furthest byte written. A lie that leaves
 // every `begin=` where it belongs therefore leaves a whole post byte-equal,
 // whatever else it says, and must complete; one that moves a `begin=` lands
 // the body where it says, and only a recovery set can put it back.
@@ -43,60 +40,56 @@ pub(super) enum Lie {
     // file: the field post that declared `size=1536000` on a file of
     // 21,504,000 bytes (two of its 768,000-byte parts).
     SizeSmall,
-    // Every header states a different size, all far below the file: the
-    // poster nzbfast records at `workers.rs:792-801` (4.8 to 15.6 MB against
-    // a 200 MB volume, a fresh figure per article).
+    // Every header states a different size, all far below the file: a
+    // poster seen in the field (4.8 to 15.6 MB against a 200 MB volume, a
+    // fresh figure per article).
     SizeRandom,
     // The middle third of each file's articles state the field post's size,
     // the rest the truth: a run of articles, as the same poster's figure
     // changes from article to article.
     SizeRun,
-    // Every header states a mebibyte more than the file. nzbfast bounds a
-    // part by `size=` only while its range fits inside it
-    // (`workers.rs:845-851`), so a larger size bounds nothing; SABnzbd and
-    // NZBGet never read it for placement.
+    // Every header states a mebibyte more than the file. A decoder that
+    // bounds a part by `size=` does so only while its range fits inside it,
+    // so a larger size bounds nothing; most never read it for placement.
     SizeLarge,
-    // Every header states `size=0`: nzbfast reads it as no bound
-    // (`workers.rs:829-844`), and so does a missing size.
+    // Every header states `size=0`: read as no bound, as a missing size
+    // is.
     SizeZero,
-    // Every part's trailer states the whole file's size: the poster quirk
-    // nzbfast waives the trailer length for (`nzbkit-base/src/yenc.rs:609-626`).
+    // Every part's trailer states the whole file's size: a poster quirk
+    // seen in the field, where the trailer length is waived.
     YendSizeFile,
-    // Every article numbered from zero, header and trailer alike: the
-    // zero-based poster nzbfast records (`nzbkit-base/src/yenc.rs:732-770`).
+    // Every article numbered from zero, header and trailer alike: a
+    // zero-based poster seen in the field.
     PartZeroBased,
     // Every header states a `total=` below the real count, and above it:
-    // the poster at nzbfast `workers.rs:797` writes a random `total=`.
+    // a poster seen in the field writes a random `total=`.
     TotalSmall,
     TotalLarge,
-    // Every header states `line=64` over 128-character lines: sabctools
-    // never reads `line=` (`yenc.cc:337-360`), so SABnzbd writes the bytes.
+    // Every header states `line=64` over 128-character lines: decoders
+    // do not read `line=`, so the bytes are written.
     LineWrong,
     // A single-part article whose `=ybegin size=` is half its body, and a
-    // mebibyte more than it, its trailer right: sabctools places it at the start with the
-    // stated size (`yenc.cc:343-349`) and writes what decoded; NZBGet
-    // refuses the disagreement (`Decoder.cpp:333`).
+    // mebibyte more than it, its trailer right: a lenient decoder places it
+    // at the start with the stated size and writes what decoded; a strict
+    // one refuses the disagreement.
     SingleSizeSmall,
     SingleSizeLarge,
-    // One part's `end=` below its `begin=`: sabctools drops the range
-    // (`yenc.cc:366-377`) and SABnzbd appends the body after the part
-    // before it (`nzb/file.py:276-291`, `nzb/article.py:197-202`); NZBGet
-    // refuses it (`ArticleDownloader.cpp:484-494`).
+    // One part's `end=` below its `begin=`: a lenient decoder drops the
+    // range and appends the body after the part before it; a strict one
+    // refuses it.
     EndBelowBegin,
-    // One part's `begin=` and `end=` exchanged: nzbfast places it at the
-    // smaller (`nzbkit-base/src/yenc.rs:927`), sabctools drops the range and
-    // SABnzbd appends it, as above.
+    // One part's `begin=` and `end=` exchanged: one decoder places it at
+    // the smaller, another drops the range and appends it, as above.
     Swapped,
-    // One part's `begin=0`: sabctools drops a range that does not begin
-    // above zero (`yenc.cc:366`) and SABnzbd appends it, as above.
+    // One part's `begin=0`: a range that does not begin above zero is
+    // dropped and the body appended, as above.
     BeginZero,
     // One part's range moved down by half an article, over the part before
     // it, and up by half an article, leaving a gap behind it and running
     // into the part after: every decoder writes it where it says, so the
     // file is wrong where it lands. Weaver keeps the placement that runs
     // into an arrived neighbour from overwriting it
-    // (`FileAssembly::placement_conflict`), and nzbfast cuts a part that
-    // runs past the posted bytes (`workers.rs:845-863`).
+    // (`FileAssembly::placement_conflict`).
     Overlap,
     Gap,
     // Two neighbouring parts each state the other's range, so the later
@@ -104,13 +97,11 @@ pub(super) enum Lie {
     // built from its declared size, without the size lie. Weaver's
     // neighbour check is the path for it, as above.
     NonMonotonic,
-    // One part's trailer states half its body: SABnzbd never reads the
-    // trailer size, NZBGet refuses it (`Decoder.cpp:333`).
+    // One part's trailer states half its body: a lenient decoder never
+    // reads the trailer size, a strict one refuses it.
     YendSizeHalf,
     // One part numbers itself as its neighbour, header and trailer: the
-    // body for the wrong article nzbfast steers away from
-    // (`nzbkit/src/pool/queue.rs:1103`); SABnzbd never reads `part=` for
-    // placement.
+    // body for the wrong article; `part=` is not read for placement.
     PartDuplicate,
 }
 

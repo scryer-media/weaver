@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// Integration tests for deobfuscation heuristics and subject line parsing.
-//
-// Test cases sourced from NZBGet (tests/queue/Deobfuscation.cpp) and
-// SABnzbd (tests/test_deobfuscate_filenames.py) to ensure parity with
-// both established Usenet downloaders.
+// Integration tests for deobfuscation heuristics and subject line parsing,
+// over names seen in the field.
 
 use std::path::Path;
 use weaver_nzb::{extract_filename, is_obfuscated, is_protected_media_structure};

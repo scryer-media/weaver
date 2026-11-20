@@ -523,9 +523,9 @@ fn kind_named(name: &str) -> Option<(Kind, Claims)> {
 // whose bytes open one of its signatures is that end file, and a leaf:
 // unpacking it destroys the file the post is. Bytes that open any other
 // signature make the name a lie (usenet is full of them), and they decide.
-// SABnzbd unpacks by name only (`.rar`, `.rNN`, `.sNN`… and numbered
-// volumes, `.zip`, `.7z`, `.7z.NNN`, `.tar`, `.NNN` pieces, `.NN.ts`) and
-// delivers every name here as it is. The one table: a format joins it here
+// Archives are unpacked by name only (`.rar`, `.rNN`, `.sNN`… and numbered
+// volumes, `.zip`, `.7z`, `.7z.NNN`, `.tar`, `.NNN` pieces, `.NN.ts`), and
+// every other name is delivered as it is. The one table: a format joins it here
 // and nowhere else.
 //
 //   .dmg   an Apple disk image; a bzip2 one (UDBZ) opens on a bzip2 stream.
@@ -953,7 +953,7 @@ impl Listing {
 }
 
 // Whether a member that founds an object of `kind` is an archive by its own
-// name, as SABnzbd unpacks by name: a RAR volume (`.rar`, `.partN.rar`, and
+// name: a RAR volume (`.rar`, `.partN.rar`, and
 // the old `.r00` … `.y99` numbering, on a volume whose bytes are a RAR's), a
 // 7z, a zip and its `.z01` parts (on bytes that are a zip's), a tar, or a
 // numbered piece of a split file (`.001` onward, `.7z.001` among them, and a
@@ -1036,7 +1036,7 @@ impl Listing {
 const SET_DIGITS: usize = 2;
 
 // The digits a piece's number has to be a piece by its name alone: `.001`,
-// as 7-Zip, HJSplit and SABnzbd's joiner number pieces. A name ending in `.4`
+// as 7-Zip and HJSplit number pieces. A name ending in `.4`
 // or `.0` is a version, never a piece, and one ending in `.10` or `.99` is a
 // version or a repost unless its set stands beside it (`split_piece_among`).
 const PIECE_DIGITS: usize = 3;
@@ -2082,8 +2082,8 @@ mod tests {
         assert_eq!(sniff("9f3a7c1e", &srr, length), Sniff::Leaf);
     }
 
-    // A piece's number has three digits or more, as 7-Zip, HJSplit and
-    // SABnzbd number pieces: a version's or a repost's short digit tail is
+    // A piece's number has three digits or more, as 7-Zip and HJSplit
+    // number pieces: a version's or a repost's short digit tail is
     // no piece, whatever its bytes open. A posted name's trailed quote or
     // underscore is no part of the number.
     #[test]

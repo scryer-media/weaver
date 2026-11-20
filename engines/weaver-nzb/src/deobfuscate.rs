@@ -62,7 +62,7 @@ pub fn is_obfuscated(filename: &str) -> bool {
     }
 
     // Clear-naming signals: if the name looks like a real release or title,
-    // it's not obfuscated. Adapted from SABnzbd's explicit false returns.
+    // it's not obfuscated.
     if is_clearly_named(bare) {
         return false;
     }
@@ -78,14 +78,14 @@ pub fn is_obfuscated(filename: &str) -> bool {
         }
     }
 
-    // Known obfuscator prefixes (NZBGet patterns)
+    // Known obfuscator prefixes
     let lower_bare = bare.to_ascii_lowercase();
     if lower_bare.starts_with("abc.xyz.") || lower_bare.starts_with("b00bs.") {
         return true;
     }
 
-    // Pure hex (with optional dots), 16+ hex chars: almost certainly a hash.
-    // Matches NZBGet's `[0-9a-f.]{16}` pattern.
+    // Pure hex (with optional dots), 16+ hex chars: almost certainly a hash
+    // (`[0-9a-f.]{16}`).
     {
         let hex_chars: usize = bare.chars().filter(|c| c.is_ascii_hexdigit()).count();
         let all_hex_or_dot = bare.chars().all(|c| c.is_ascii_hexdigit() || c == '.');
@@ -125,7 +125,7 @@ pub fn is_obfuscated(filename: &str) -> bool {
         }
     }
 
-    // Backup_NNNNN_SNN-NN pattern (NZBGet: `Backup_[0-9]{5,}S[0-9]{2}-[0-9]{2}`)
+    // Backup_NNNNN_SNN-NN pattern (`Backup_[0-9]{5,}S[0-9]{2}-[0-9]{2}`)
     if let Some(rest) = bare.strip_prefix("Backup_") {
         let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
         if digits.len() >= 5 {
@@ -141,7 +141,7 @@ pub fn is_obfuscated(filename: &str) -> bool {
         }
     }
 
-    // Timestamp-like: NNNNNN_NN (NZBGet: `[0-9]{6}_[0-9]{2}`)
+    // Timestamp-like: NNNNNN_NN (`[0-9]{6}_[0-9]{2}`)
     if bare.len() >= 9 {
         let parts: Vec<&str> = bare.splitn(2, '_').collect();
         if parts.len() == 2
@@ -154,7 +154,7 @@ pub fn is_obfuscated(filename: &str) -> bool {
         }
     }
 
-    // Bracketed tags wrapping a hex hash (SABnzbd pattern):
+    // Bracketed tags wrapping a hex hash:
     // e.g. "[BlaBla] something [More] b2.bef89a622e4a23f07b0d3757ad5e8a.a0 [Brrr]"
     // If there are 30+ contiguous hex+dot characters anywhere in the string, it's obfuscated.
     {
@@ -211,8 +211,7 @@ fn extract_quoted(subject: &str) -> Option<String> {
 }
 
 // The first closed quote pair of a subject that holds more than spaces,
-// with the spaces trimmed, as SABnzbd's `subject_name_extractor` reads it
-// (`"([^"]*)"`, then `strip(' "')`). A quote mark is never part of a name:
+// with the spaces trimmed (`"([^"]*)"`, then `strip(' "')`). A quote mark is never part of a name:
 // an unpaired one is left to the later strategies, which split on it.
 pub(crate) fn quoted_name(subject: &str) -> Option<&str> {
     let mut runs = subject.split('"');
@@ -231,9 +230,8 @@ pub(crate) fn quoted_name(subject: &str) -> Option<&str> {
 // The last word of `text`, words split by whitespace and by quote marks, so
 // an unpaired quote (`name.mkv.001" yEnc`) is never part of the word. A
 // quote escaped twice in the NZB (`&amp;quot;`) reaches here as the text
-// `&quot;` once the XML is read, and is a quote mark too: SABnzbd's basic
-// filename pattern (`RE_SUBJECT_BASIC_FILENAME`, misc.py) has neither `&`
-// nor `;` in its class, so `&quot;Show.Name.mkv&quot;` names `Show.Name.mkv`.
+// `&quot;` once the XML is read, and is a quote mark too: a filename word
+// has neither `&` nor `;` in it, so `&quot;Show.Name.mkv&quot;` names `Show.Name.mkv`.
 pub(crate) fn last_word(text: &str) -> Option<&str> {
     text.rsplit(|ch: char| ch.is_whitespace() || ch == '"')
         .find_map(|word| word.rsplit(ESCAPED_QUOTE).find(|piece| !piece.is_empty()))
@@ -244,10 +242,9 @@ const ESCAPED_QUOTE: &str = "&quot;";
 
 // Whether a file posted as `posted` takes the name its article header gives
 // (`=ybegin ... name=`, or a uuencode `begin` line), and the name it takes,
-// cleaned as a posted name is. SABnzbd's `verify_nzf_filename`
-// (nzb/object.py) takes the header name when it differs, is not
-// `is_probably_obfuscated`, and the posted name has no `.par2` in it
-// (`has_par2_in_filename`, par2file.py), which is usually right. A header
+// cleaned as a posted name is. The header name is taken when it differs,
+// is not `is_probably_obfuscated`, and the posted name has no `.par2` in
+// it, which is usually right. A header
 // that names nothing is no name.
 pub fn header_name(posted: &str, header: &str) -> Option<String> {
     if header.trim().is_empty()
@@ -260,13 +257,10 @@ pub fn header_name(posted: &str, header: &str) -> Option<String> {
     (name != posted).then_some(name)
 }
 
-// Whether a name is likely obfuscated: SABnzbd's `is_probably_obfuscated`
-// (deobfuscate_filenames.py), rule for rule. The name's last path component
-// without its extension (`get_basename(get_filename(...))`, as Python's
-// `os.path.splitext` cuts it) is judged: certainly obfuscated patterns
-// first, then the shapes of a clear name, and obfuscated by default. One
-// departure: a name with nothing left to judge is obfuscated, where SABnzbd
-// would fail reading its first character.
+// Whether a name is likely obfuscated. The name's last path component
+// without its extension (as Python's `os.path.splitext` cuts it) is judged: certainly obfuscated patterns
+// first, then the shapes of a clear name, and obfuscated by default. A
+// name with nothing left to judge is obfuscated.
 pub fn is_probably_obfuscated(name: &str) -> bool {
     let file = name.rsplit(['/', '\\']).next().unwrap_or(name);
     let base = python_splitext_stem(file);
@@ -482,7 +476,7 @@ fn strip_trailing_part_info(s: &str) -> &str {
 }
 
 // Returns `true` if the filename clearly looks like a real title or release name
-// rather than an obfuscated hash. Adapted from SABnzbd's explicit false-return rules.
+// rather than an obfuscated hash.
 //
 // Only triggers on names with word-like tokens (3+ alpha chars). Pure hex/digits
 // with dots still fall through to the obfuscation checks.
@@ -700,9 +694,8 @@ mod tests {
     }
 
     // A quote mark is never part of a posted name. Each row: the subject,
-    // the name, and the confidence. SABnzbd's `subject_name_extractor`
-    // gives the same name for every row; the quoted rows are its
-    // `RE_SUBJECT_FILENAME_QUOTES`, the rest its basic filename pattern.
+    // the name, and the confidence. The quoted rows read the first closed
+    // pair, the rest the last word.
     const QUOTE_SHAPES: &[(&str, &str, f32)] = &[
         (r#""name.ext" yEnc (1/5)"#, "name.ext", 1.0),
         (r#"[1/5] - "name.ext" yEnc (1/5)"#, "name.ext", 1.0),
@@ -724,7 +717,7 @@ mod tests {
         // An empty or blank pair is passed over for the next one.
         (r#""" - "name.mkv" yEnc (1/5)"#, "name.mkv", 1.0),
         (r#"" " - "name.mkv" yEnc (1/5)"#, "name.mkv", 1.0),
-        // Quotes inside the name end it at the first pair, as SABnzbd does.
+        // Quotes inside the name end it at the first pair.
         (r#"[1/5] - "He said "hi".mkv" yEnc (1/5)"#, "He said", 1.0),
         // A quote the NZB escaped twice (`&amp;quot;`) is left as the text
         // `&quot;` and is a quote mark too.
@@ -744,8 +737,7 @@ mod tests {
             "Show.Name.mkv",
             0.5,
         ),
-        // A closed pair of real quotes keeps what it holds, as SABnzbd's
-        // `RE_SUBJECT_FILENAME_QUOTES` does.
+        // A closed pair of real quotes keeps what it holds.
         (r#""a&quot;b.mkv" yEnc (1/5)"#, "a&quot;b.mkv", 1.0),
     ];
 
@@ -770,12 +762,11 @@ mod tests {
         assert_eq!(file.filename(), Some("Show.Name.mkv"));
     }
 
-    // ── is_probably_obfuscated: every row of SABnzbd's
-    // tests/test_deobfuscate_filenames.py `test_is_probably_obfuscated`,
-    // and the header name of the ruling's counter-example.
+    // ── is_probably_obfuscated: names in the field, and the header name
+    // of the ruling's counter-example.
 
     #[test]
-    fn probably_obfuscated_follows_sabnzbd() {
+    fn probably_obfuscated_judges_field_names() {
         for name in [
             "599c1c9e2bdfb5114044bf25152b7eaa.mkv",
             "/my/blabla/directory/stuff/599c1c9e2bdfb5114044bf25152b7eaa.mkv",
@@ -839,7 +830,7 @@ mod tests {
     // ── header_name
 
     #[test]
-    fn a_file_takes_its_header_name_by_sabnzbds_rules() {
+    fn a_file_takes_its_header_name_by_the_rules() {
         // A clear name that differs is taken.
         assert_eq!(
             header_name(
@@ -914,7 +905,7 @@ mod tests {
         assert_eq!(strip_archive_extension("movie.mkv"), "movie.mkv");
     }
 
-    // ── NZBGet parity tests (patterns from nzbget/tests/queue/Deobfuscation.cpp)
+    // ── Obfuscation patterns
 
     #[test]
     fn hex_with_dots_is_obfuscated() {

@@ -141,10 +141,9 @@ impl YencMetadata {
     // the body has decoded to `decoded` bytes. Only an exact exchange is
     // turned: `begin - end + 1` must be the decoded length, and the smaller
     // field must be a real 1-based offset. Any other end below begin stays
-    // unusable and the part is placed by its begin, as before. nzbfast places
-    // the same shape at the smaller field (`crates/nzbkit-base/src/yenc.rs:917`);
-    // SABnzbd appends it after the part before it, which for an exchanged
-    // pair is the same place (`sabnzbd/nzb/file.py:268-291`).
+    // unusable and the part is placed by its begin, as before. Placing the
+    // exchanged pair at the smaller field is the same place as appending it
+    // after the part before it.
     //
     // Returns whether the range was turned, so the caller can move the
     // article's checksums to where its bytes now go.

@@ -463,7 +463,7 @@ pub(crate) fn normalize_uploaded_nzb_reader(
         limits.nzb_upload_limit_bytes,
         "NZB upload",
     );
-    // A compressed NZB under a plain name, SABnzbd's "gzip in disguise", is
+    // A compressed NZB under a plain name (gzip in disguise) is
     // known by its first bytes. A name or content type that names an encoding
     // is taken at its word.
     let (sniffed, source) = sniff_upload_encoding(source).map_err(SubmitNzbError::Upload)?;
@@ -744,7 +744,7 @@ mod tests {
         );
     }
 
-    // SABnzbd's "gzip in disguise": compressed bytes under a plain `.nzb` name.
+    // Gzip in disguise: compressed bytes under a plain `.nzb` name.
     #[test]
     fn compressed_uploads_under_a_plain_name_decode_by_magic() {
         let nzb = minimal_nzb("disguised");

@@ -1376,8 +1376,8 @@ impl GraphJob {
 
     // An article of a posted file named the file in its header (`=ybegin
     // ... name=`, or a uuencode `begin` line), and is about to be taken in.
-    // The file takes that name, as SABnzbd's `verify_nzf_filename`
-    // (nzb/object.py) decides it, only while none of its bytes are in: the
+    // The file takes that name, as `weaver_nzb::header_name` decides it,
+    // only while none of its bytes are in: the
     // first article taken in decides, and its write is under the name it
     // decided. A recovery set that already describes the file named it,
     // and its name stands; one that recognises the file by its content

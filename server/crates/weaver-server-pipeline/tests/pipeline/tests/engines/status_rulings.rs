@@ -35,7 +35,7 @@ fn tracks_beside(blocks: u32) -> Vec<Post> {
 
 const TEXT: u32 = 4;
 
-// SABnzbd's rule: a set that verified its files clean or repaired them
+// A set that verified its files clean or repaired them
 // vouches for the job, and a posted file no set describes is never checked.
 // Its damage leaves the job no shorter; the file is delivered as it stands.
 #[tokio::test]

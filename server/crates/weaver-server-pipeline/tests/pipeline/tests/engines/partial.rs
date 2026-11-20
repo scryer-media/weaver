@@ -1233,7 +1233,7 @@ async fn a_rar_whose_last_volume_never_arrives_withholds_its_volumes_unmapped() 
 }
 
 // The same set alone: nothing whole, the job fails, and its error names the
-// volume the set lacks, as SABnzbd's "unable to find" does.
+// volume the set lacks.
 #[tokio::test]
 async fn a_rar_whose_last_volume_never_arrives_fails_naming_it() {
     let mut volumes = store(3);

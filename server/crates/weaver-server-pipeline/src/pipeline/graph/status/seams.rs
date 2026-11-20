@@ -406,8 +406,7 @@ pub fn delivery_of(job: &GraphJob, posted: Posted<'_>) -> (Delivery, Option<Fail
         // a failed set covers it or the recovery carried for it went
         // unused, vouched where a set that vouched covers it, and unchecked
         // where a set of it vouched and none of its sets describes the
-        // member (SABnzbd's rule: only what a set describes is checked once
-        // one verified). The one place a member
+        // member (only what a set describes is checked once one verified). The one place a member
         // is asked whether a set describes it.
         let described = |node: NodeId, member: MemberId| {
             let covers = |set: NodeId| job.writer().covers(job.tree(), set, member);

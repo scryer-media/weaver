@@ -3,8 +3,8 @@
 
 // End files whose bytes are a container format: a disk image that opens on a
 // bzip2 stream, an app package that is a zip of deflated entries. Each is
-// delivered whole under its own name, posted plain or inside a RAR, as
-// SABnzbd delivers it: it unpacks by name, and neither name is an archive's.
+// delivered whole under its own name, posted plain or inside a RAR:
+// archives unpack by name, and neither name is an archive's.
 // A member under a name that says nothing, whose bytes open a bzip2 stream
 // that then goes bad, fails the job, plain or inside a RAR. And a deflated zip
 // posted under a name the zip engine cannot number, which is still opened,

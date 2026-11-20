@@ -39,7 +39,7 @@ func namespaceRestartCases() []restartCase {
 			},
 		},
 		{
-			Name: "par2_destination_collision", Description: "A committed move replaces unrelated bytes at its destination, as SABnzbd does, and the job completes",
+			Name: "par2_destination_collision", Description: "A committed move replaces unrelated bytes at its destination, and the job completes",
 			Slugs: []string{namespaceRestartSlug},
 			Run: func(ctx *restartCaseContext) (restartCaseResult, error) {
 				return runNamespaceRestart(ctx, namespaceRestartSlug, "a.bin", false, false, true)

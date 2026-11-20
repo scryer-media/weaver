@@ -163,8 +163,8 @@ pub struct Delivery {
     // they were: short unless a set extracted whole beside them.
     pub unnamed: Vec<String>,
     // Not whole, in a namespace a recovery set vouched for, and described
-    // by none of its sets: nothing checks them, as SABnzbd checks only
-    // what a set describes. With them, a whole volume a vouching set proved
+    // by none of its sets: nothing checks them, as only what a set
+    // describes is checked. With them, a whole volume a vouching set proved
     // of a set whose first volume the release never carried, which nothing
     // can open. Delivered as they stand, and the job is no shorter for them.
     pub unchecked: Vec<String>,
@@ -192,7 +192,7 @@ pub enum Described {
     // its namespace could not be used: what is short of it is unrepaired.
     Unrepaired,
     // A set of its namespace vouched, clean or repaired, and none describes
-    // it: SABnzbd checks only what a set describes, and so nothing checked
+    // it: only what a set describes is checked, and so nothing checked
     // it. Short, it ships as it stands and leaves the job no shorter.
     Unchecked,
     // Covered by a set of its namespace that vouched: its bytes are what
@@ -785,8 +785,7 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> Described> Walk<'_, F, R> {
 // password the object needed is one reason, whether it shut the member's
 // bytes or the headers naming them: none was given, or `given` says the job
 // had some and none of them opened it. A set short of a volume names the one
-// it lacks in the numbering of `name`, a volume of the set, as SABnzbd's
-// "unable to find" does, or its number where the name does not number it.
+// it lacks in the numbering of `name`, a volume of the set, or its number where the name does not number it.
 fn withheld_because(name: &str, why: Why, given: bool) -> String {
     let said = match why {
         Why::Encrypted | Why::EncryptedHeader if given => {

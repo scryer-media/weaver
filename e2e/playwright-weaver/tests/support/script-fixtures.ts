@@ -36,7 +36,7 @@ export type ScriptRecord = {
 };
 
 export type FixtureOptions = {
-  /** Header kinds, joined with "/" as NZBGet does. */
+  /** Header kinds, joined with "/". */
   kinds: ScriptKind[];
   queueEvents?: string[];
   taskTimes?: string[];

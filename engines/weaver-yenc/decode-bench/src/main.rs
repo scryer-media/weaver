@@ -391,7 +391,7 @@ fn real_synth_bodies() -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
-// Captured article bodies: SABnzbd's 1000 MB reference test post (48 RAR
+// Captured article bodies: a public 1000 MB reference test post (48 RAR
 // volumes of 37 segments, line=128, 716,800-byte segments). Each file is
 // one NNTP BODY payload byte for byte as it arrived on the wire: dot-stuffed
 // (none of these lines needed it), CRLF lines, the =ybegin/=ypart/=yend lines

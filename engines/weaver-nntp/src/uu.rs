@@ -28,11 +28,9 @@
 // # Attribution
 //
 // The per-line decode follows the classic UUDECODE formulation (Clem Dye's
-// `UUDECODE.c`, 1998, released under the GPL) by way of the two reference
-// decoders this crate is checked against: NZBGet's `Decoder::DecodeUx` and
-// sabctools' uuencode branch. The detection heuristics — the `M`-line shape,
-// the octal-validated `begin` line, and the short-final-part admission — follow
-// sabctools. Damage handling is stricter here than in either reference: see
+// `UUDECODE.c`, 1998, released under the GPL). The detection heuristics are
+// the `M`-line shape, the octal-validated `begin` line, and the
+// short-final-part admission. Damage handling is strict: see
 // [`UuDecoder::push_body_line`].
 
 // Lowest byte value a uuencode payload character may take (`' '`).

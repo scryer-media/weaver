@@ -3,7 +3,7 @@
 
 // A posted file takes the name its articles' yEnc header gives it
 // (`=ybegin ... name=`), once, from the first article taken in, before any
-// of its bytes are written, as SABnzbd's `verify_nzf_filename` decides:
+// of its bytes are written, as `weaver_nzb::header_name` decides:
 // not an obfuscated-looking name, not over a posted PAR2 name, and never
 // over the name a PAR2 set gives the file by its content. The name is the
 // tree's, as a PAR2 set's rename is, so a split set the posted names

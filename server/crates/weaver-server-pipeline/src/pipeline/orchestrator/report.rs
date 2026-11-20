@@ -264,7 +264,8 @@ impl Pipeline {
         };
         let (download_state, post_state, run_state) =
             crate::jobs::model::runtime_lanes_from_status_snapshot(&status);
-        // The recovery files, index included, as NZBGet counts its par files.
+        // The recovery files, index included, as the NZBGet facade counts
+        // par files.
         let is_par_file = |role: &weaver_model::files::FileRole| {
             matches!(
                 role,

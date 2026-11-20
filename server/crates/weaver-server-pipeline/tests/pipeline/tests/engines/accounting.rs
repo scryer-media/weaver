@@ -270,8 +270,8 @@ async fn a_lost_nfo_beside_a_repair_stays_failed_on_a_complete_job() {
     assert!(row.health < 1000);
 }
 
-// A clean post under PAR3 leaves both its PAR3 volumes to fetch, as NZBGet
-// counts every par file still queued.
+// A clean post under PAR3 leaves both its PAR3 volumes to fetch: every
+// par file still queued counts.
 #[tokio::test]
 async fn a_clean_par3_post_leaves_its_volumes_remaining() {
     let data = payload(4 * ARTICLE, 81);
