@@ -5168,6 +5168,15 @@ async fn torrents_info_filters_and_pages_as_the_whole_list() {
             "tag=hd&private=false".into(),
             only(&|row| row["tags"] == "hd" && row["private"] == false),
         ),
+        (
+            "sort=added_on&limit=6&offset=3".into(),
+            page(all.clone(), 3, 6),
+        ),
+        (
+            format!("hashes={named}&limit=2&offset=1"),
+            page(only(&is_named), 1, 2),
+        ),
+        ("offset=-50&limit=2".into(), page(all.clone(), 0, 2)),
         ("sort=name&reverse=true&limit=4".into(), {
             let mut sorted = all.clone();
             sorted.reverse();

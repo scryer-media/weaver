@@ -122,7 +122,7 @@ pub enum Window {
 
 impl Window {
     // Its places among `kept` torrents.
-    fn places(self, kept: usize) -> Range<usize> {
+    pub(super) fn places(self, kept: usize) -> Range<usize> {
         let Range { start, end } = match self {
             Self::Every => 0..kept,
             Self::Page { offset, first } => offset..offset.saturating_add(first),

@@ -24,7 +24,7 @@ use tokio::sync::watch;
 
 use super::TorrentView;
 use super::fingerprint::ViewParts;
-use super::listing::FileTotals;
+use super::listing::{FileTotals, RowPick, Window};
 use crate::jobs::JobId;
 use crate::torrents::{TorrentTracker, TrackerStatus};
 
@@ -294,6 +294,31 @@ impl Snapshot {
             .filter_map(|(_, job_id)| rows.rows.get(job_id).cloned())
             .collect();
         (rows.revision, every)
+    }
+
+    /// The rows `pick` keeps at `window`'s places, in the order the
+    /// torrents were added, under one look at the rows: those the pick
+    /// keeps are walked in place, and only the page's rows are taken. A
+    /// window counted back from the end walks them twice, once to count.
+    pub fn kept(&self, pick: &RowPick<'_>, window: Window) -> Vec<Arc<TorrentRow>> {
+        let rows = self.read();
+        let kept = || {
+            rows.order
+                .iter()
+                .filter_map(|(_, job_id)| rows.rows.get(job_id))
+                .filter(|row| pick.keeps(&row.view))
+        };
+        let size = match &window {
+            Window::Every => return kept().cloned().collect(),
+            Window::Page { .. } => usize::MAX,
+            Window::Counted(_) => kept().count(),
+        };
+        let places = window.places(size);
+        kept()
+            .skip(places.start)
+            .take(places.len())
+            .cloned()
+            .collect()
     }
 
     /// The rows moved past `revision`, and the torrents gone since.
