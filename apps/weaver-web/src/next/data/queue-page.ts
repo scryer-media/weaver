@@ -149,22 +149,77 @@ export function tabCounts(stateCounts: readonly QueueStateCount[]): Record<Queue
 }
 
 /**
+ * How fast the slow destination disks take bytes. A row held back by one
+ * finishes when that disk has written what waits for it and what is still to
+ * come, so its time left runs at the disk's rate, not the download speed.
+ */
+export interface DiskPace {
+  /** Per disk-limited row: its volume's measured write rate and bytes waiting for it. */
+  byId: ReadonlyMap<number, { rate: number; waiting: number }>;
+  /** The slowest measured rate among the page's slow disks, 0 when none is measured. */
+  slowest: number;
+}
+
+const NO_DISK_PACE: DiskPace = { byId: new Map(), slowest: 0 };
+
+/**
  * Time left per page row, in queue order: each row's own bytes and every
  * waiting or downloading job's ahead of it, at `speed`.
+ *
+ * With `disk`, a row a slow disk holds back counts its volume's waiting bytes
+ * too, at that volume's write rate; any other row falls back to the slowest
+ * disk's rate when nothing is downloading, since the queue drains no faster.
+ * Without a slow disk the estimates are the plain ones.
  */
 export function etaById(
   etaThrough: readonly { id: number; bytesThrough: number }[],
   speed: number,
   format: (bytes: number, speed: number) => string,
+  disk: DiskPace = NO_DISK_PACE,
 ): Map<number, string> {
   const estimates = new Map<number, string>();
-  if (speed <= 0) {
+  const fallback = speed > 0 ? speed : disk.slowest;
+  if (fallback <= 0 && disk.byId.size === 0) {
     return estimates;
   }
   for (const { id, bytesThrough } of etaThrough) {
-    estimates.set(id, format(bytesThrough, speed));
+    const held = disk.byId.get(id);
+    if (held && held.rate > 0) {
+      estimates.set(id, format(bytesThrough + held.waiting, held.rate));
+    } else if (fallback > 0) {
+      estimates.set(id, format(bytesThrough, fallback));
+    }
   }
   return estimates;
+}
+
+/**
+ * The disk pace for the rows on a page: each row held by a slow disk, with
+ * that disk's figures from the live disk list.
+ */
+export function diskPace(
+  rows: readonly {
+    id: number;
+    status: string;
+    diskWrite?: { volume: string; slow: boolean } | null;
+  }[],
+  volumes: readonly { label: string; writeRateBytesPerSec: number; waitingBytes: number }[],
+): DiskPace {
+  if (volumes.length === 0) return NO_DISK_PACE;
+  const byId = new Map<number, { rate: number; waiting: number }>();
+  let slowest = 0;
+  for (const row of rows) {
+    const write = row.diskWrite;
+    if (!write?.slow) continue;
+    const figures = volumes.find((volume) => volume.label === write.volume);
+    if (!figures) continue;
+    const rate = figures.writeRateBytesPerSec;
+    if (rate > 0 && (slowest === 0 || rate < slowest)) slowest = rate;
+    if (row.status !== "PAUSED") {
+      byId.set(row.id, { rate, waiting: figures.waitingBytes });
+    }
+  }
+  return byId.size === 0 && slowest === 0 ? NO_DISK_PACE : { byId, slowest };
 }
 
 /** A queue event, as far as the ticks care. */

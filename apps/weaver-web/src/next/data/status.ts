@@ -5,6 +5,8 @@ import { useCallback } from "react";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { statusI18nKey } from "@/lib/status-tokens";
 import type { JobData } from "@/lib/job-types";
+import type { DiskVolume } from "@/lib/context/live-data-context";
+import { diskDetail } from "./disk-detail";
 import { latestPhase } from "./phase-bars";
 import { waitReasonDetail } from "./wait-reason";
 
@@ -58,12 +60,18 @@ export function statusDetail(
   phase = latestPhase(job.phaseProgress),
   /** The status the screen labels the job with, which the detail does not repeat. */
   shownStatus = job.status,
+  /** The live disk list, whose figures a disk write is shown with. */
+  diskVolumes: readonly DiskVolume[] = [],
 ): string | null {
   if (job.error) {
     return job.error;
   }
   if (job.downloadWaitReason) {
     return waitReasonDetail(t, job.downloadWaitReason);
+  }
+  const disk = diskDetail(t, job, diskVolumes);
+  if (disk) {
+    return disk;
   }
   if (phase && phase.totalBytes > 0) {
     const percent = `${Math.round(phase.progressPercent)}%`;
@@ -72,4 +80,5 @@ export function statusDetail(
   return null;
 }
 
+export { diskDetail, diskShort } from "./disk-detail";
 export { eventTone } from "./event-tone";

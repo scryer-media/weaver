@@ -41,6 +41,13 @@ export interface JobData {
   status: string;
   downloadWaitReason?: string | null;
   downloadRetryAtEpochMs?: number | null;
+  /** The slow volume holding the download back, while one does; queue rows only. */
+  /**
+   * The job's write to its disk while the disk is slow, or while it has
+   * nothing left to fetch and bytes still waiting; null otherwise. The
+   * figures are the disk's, from every job that writes there.
+   */
+  diskWrite?: DiskWrite | null;
   progress: number;
   progressPercent?: number | null;
   totalBytes: number;
@@ -141,4 +148,17 @@ export function formatJobReleaseName(job: Pick<JobData, "name" | "originalTitle"
   }
 
   return releaseName.replaceAll(".", " ").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * A job's write to its destination disk, as the queue rows carry it. The
+ * disk's figures come with the live metrics, under the same label.
+ */
+export interface DiskWrite {
+  /** The disk, by the label the live disk list gives it. */
+  volume: string;
+  /** Downloads keep waiting on the disk. */
+  slow: boolean;
+  /** Nothing is left to fetch and bytes still wait in memory for the disk. */
+  draining: boolean;
 }

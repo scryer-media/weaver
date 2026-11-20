@@ -35,6 +35,7 @@ import { useTranslate } from "@/lib/context/translate-context";
 import {
   LiveJobDownloadRatesProvider,
   type DownloadBlockState,
+  type DiskVolume,
 } from "@/lib/context/live-data-context";
 import type { JobDownloadRate } from "@/lib/live-job-download-rates";
 import { formatRate } from "./format";
@@ -111,7 +112,7 @@ interface LiveMetricsSnapshot {
     pausedClasses?: string[];
     speedLimitBytesPerSec: number | null;
     resumeAtEpochMs?: number | null;
-    downloadBlock: DownloadBlockState;
+    downloadBlock: DownloadBlockState & { diskVolumes?: DiskVolume[] };
   };
   providerHoldoffs?: ProviderHoldoff[];
   providerConnections?: ProviderConnections[];
@@ -154,6 +155,12 @@ export interface NextData {
   /** The configured download limit in bytes per second; null is no limit, and 0 lets nothing through. */
   speedLimit: number | null;
   downloadBlock: DownloadBlockState;
+  /**
+   * The destination volumes a download waits on or still writes to, each
+   * with whether it is slow, its write rate and the bytes waiting for it;
+   * empty while none is. Queue rows name theirs by label.
+   */
+  diskVolumes: readonly DiskVolume[];
   queue: LiveQueue;
   /**
    * The categories a person configured, in the order the daemon returns them.
@@ -204,6 +211,7 @@ const DEFAULT_DOWNLOAD_BLOCK: DownloadBlockState = {
 };
 
 const EMPTY_CATEGORIES: ConfiguredCategory[] = [];
+const NO_DISK_VOLUMES: readonly DiskVolume[] = [];
 const NO_CLASSES: readonly string[] = [];
 const sameClasses = (left: readonly string[], right: readonly string[]) =>
   left.length === right.length && left.every((held, index) => held === right[index]);
@@ -476,7 +484,17 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
   }
 
   const globalState = snapshot?.globalState;
-  const downloadBlock = useSettled(globalState?.downloadBlock ?? DEFAULT_DOWNLOAD_BLOCK, shallowEqual);
+  // The disk volumes' figures move on pushes while a download waits on one;
+  // they are settled apart, so the block itself stays the same object
+  // meanwhile.
+  const pushedBlock = globalState?.downloadBlock;
+  const blockOnly = useMemo(() => {
+    if (!pushedBlock) return DEFAULT_DOWNLOAD_BLOCK;
+    const { diskVolumes: _disks, ...block } = pushedBlock;
+    return block;
+  }, [pushedBlock]);
+  const downloadBlock = useSettled(blockOnly, shallowEqual);
+  const diskVolumes = useSettled(pushedBlock?.diskVolumes ?? NO_DISK_VOLUMES, sameItems);
   const isPaused = globalState?.isPaused ?? false;
   const pausedClasses = useSettled(globalState?.pausedClasses ?? NO_CLASSES, sameClasses);
   const resumeAt = globalState?.resumeAtEpochMs ?? null;
@@ -532,6 +550,7 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
       resumeAt,
       speedLimit,
       downloadBlock,
+      diskVolumes,
       queue,
       categories,
       refreshCategories,
@@ -552,6 +571,7 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
       dnsProfileNames,
       dnsRouteProfiles,
       downloadBlock,
+      diskVolumes,
       historyCount,
       holdoffs,
       isPaused,

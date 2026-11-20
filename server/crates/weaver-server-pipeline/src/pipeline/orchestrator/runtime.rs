@@ -218,7 +218,7 @@ impl Pipeline {
         let volume_writers = Arc::new(crate::pipeline::graph::disk::PipelineWriters::new(
             volume_writers,
             graph_runs.written(),
-            volume_room_tx,
+            volume_room_tx.clone(),
         ));
         // Each volume's first write rate comes from a probe queued on its
         // writer; the figures an earlier run kept are read here, off the
@@ -544,6 +544,10 @@ impl Pipeline {
             volume_writers,
             volume_rooms,
             volume_budget_held: std::sync::atomic::AtomicBool::new(false),
+            disk_vote: crate::pipeline::disk_vote::DiskVote::new(Instant::now()),
+            disk_limits: Arc::default(),
+            disk_tells: HashMap::new(),
+            disk_tell: volume_room_tx,
             shutdown_settle: weaver_server_disk::operations::disk::writer::SettleBound::wall(
                 Self::SHUTDOWN_DRAIN_IDLE_TIMEOUT,
             ),
@@ -1101,6 +1105,8 @@ impl Pipeline {
     // pipeline holds now, since no tick will refresh them.
     fn settle_parked_gauges(&mut self) {
         self.refresh_periodic_snapshot();
+        // No tick counts the vote again, and nothing dispatches to be held.
+        self.clear_disk_vote();
         self.refresh_download_pressure();
         self.publish_download_transport_health();
     }
@@ -1244,7 +1250,11 @@ impl Pipeline {
             self.drain_ready_download_results(&mut pending_download_results);
             self.drain_ready_lane_control_messages();
             turn_active |= self.hear_graph_runs();
-            turn_active |= self.hear_volume_rooms();
+            let rooms = self.hear_volume_rooms();
+            if rooms {
+                self.refresh_parked_disk_limits();
+            }
+            turn_active |= rooms;
             #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             self.pump_decode_queue();
 
@@ -1454,6 +1464,9 @@ impl Pipeline {
                                 hear!(5);
                                 turn_timer.resume(PipelinePhase::GraphRun);
                                 self.graph_run_said(said);
+                                if !drive {
+                                    self.refresh_parked_disk_limits();
+                                }
                                 #[cfg(any(test, feature = "pipeline-test-fixtures"))]
                                 if let Some(stamps) = &self.graph_mail_stamps {
                                     let _ = stamps.send(
@@ -1464,7 +1477,7 @@ impl Pipeline {
                             Some(()) = self.volume_rooms.recv(), if open!(6) => {
                                 hear!(6);
                                 turn_timer.resume(PipelinePhase::GraphRun);
-                                self.volume_room_heard();
+                                self.hear_disk_room();
                             }
                             Some(mail) = self.post_probes.recv(), if open!(7) => {
                                 hear!(7);
@@ -1554,6 +1567,9 @@ impl Pipeline {
                                 idle_tick = true;
                                 count_periodic_tick();
                                 self.refresh_periodic_snapshot();
+                                // Which volumes held dispatch for their write
+                                // buffer; a flag read while none has.
+                                self.tally_disk_vote(Instant::now());
                                 // Lanes whose refill found nothing wait here for the
                                 // next wake; the tick is what ends the wait when no
                                 // wake comes.

@@ -935,6 +935,43 @@ async fn a_job_held_by_a_full_write_buffer_is_dispatched_again_once_woken() {
     retire_pipeline_database(pipeline).await;
 }
 
+// A job with nothing left to fetch whose bytes wait for its volume is
+// listed as still writing out. With no tick and no other mail, the word its
+// own returned writes send on the room channel drops it from the list at
+// once, and what is published no longer names it.
+#[tokio::test]
+async fn a_draining_job_is_dropped_when_its_writes_return_with_the_loop_parked() {
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_431);
+    let posts = [Post::plain("lantern.bin", payload(3 * ARTICLE, 1))];
+    let (mut pipeline, _) = graph_job(&temp_dir, job_id, &posts).await;
+    let (volume, hold) = held(&pipeline, job_id);
+    decode_all(&mut pipeline, job_id, &posts, 0).await;
+    // Nothing left to fetch: the decoder took every article without a lane.
+    crate::pipeline::tests::queue_fixture::clear_download_queue(&mut pipeline, job_id);
+    assert_eq!(
+        volume.buffered_bytes.load(Ordering::SeqCst),
+        posts[0].bytes.len() as u64
+    );
+    pipeline.tally_disk_vote(std::time::Instant::now());
+    let listed = pipeline.shared_state.disk_limits();
+    let write = listed.job(job_id).expect("the job is listed as writing out");
+    assert!(write.draining && !write.slow);
+    assert_eq!(write.volume, volume.label);
+    let rows = pipeline.shared_state.disk_rows_revision();
+    hold.open();
+    // Only the room channel is heard, as the parked loop hears it.
+    while pipeline.shared_state.disk_limits().job(job_id).is_some() {
+        pipeline.volume_rooms.recv().await.unwrap();
+        pipeline.hear_disk_room();
+    }
+    assert!(pipeline.shared_state.disk_limits().is_empty());
+    assert_ne!(pipeline.shared_state.disk_rows_revision(), rows);
+    assert_eq!(volume.buffered_bytes.load(Ordering::SeqCst), 0);
+    retire_pipeline_database(pipeline).await;
+}
+
 // A graceful stop puts down what the volumes hold before the last
 // checkpoint, and that checkpoint says the bytes are down.
 #[tokio::test]

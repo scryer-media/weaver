@@ -131,6 +131,37 @@ pub struct DownloadBlock {
     pub speed_limit_by_schedule: bool,
     /// Why a schedule rule is holding new downloads, while one is.
     pub schedule_hold_reason: Option<String>,
+    /// Every destination disk a download is writing to or held by: whether it
+    /// is slow, what it takes and what waits for it. A disk is slow when its
+    /// write buffer held new articles back in most of the last 20 seconds.
+    /// Empty while no download waits on a disk.
+    #[serde(default)]
+    pub disk_volumes: Vec<DiskVolume>,
+}
+
+/// A destination disk a download is writing to or held by. Its figures move
+/// at most once a second, rounded as a screen shows them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SimpleObject)]
+pub struct DiskVolume {
+    /// The mount path or drive root, as the storage page shows it.
+    pub label: String,
+    /// Whether the disk cannot keep up with the downloads.
+    pub slow: bool,
+    /// What the disk takes, in bytes per second; 0 until measured.
+    pub write_rate_bytes_per_sec: u64,
+    /// Bytes in memory waiting for this disk's writer, from every download.
+    pub waiting_bytes: u64,
+}
+
+impl From<&weaver_server_core::jobs::handle::DiskVolumeState> for DiskVolume {
+    fn from(value: &weaver_server_core::jobs::handle::DiskVolumeState) -> Self {
+        Self {
+            label: value.label.clone(),
+            slow: value.slow,
+            write_rate_bytes_per_sec: value.write_rate_bytes_per_sec,
+            waiting_bytes: value.waiting_bytes,
+        }
+    }
 }
 
 #[ComplexObject]
@@ -160,6 +191,7 @@ impl From<&DownloadBlockState> for DownloadBlock {
             speed_limit_in_force: value.speed_limit_in_force,
             speed_limit_by_schedule: value.speed_limit_by_schedule,
             schedule_hold_reason: value.schedule_hold_reason.clone(),
+            disk_volumes: value.disk_volumes.iter().map(DiskVolume::from).collect(),
         }
     }
 }

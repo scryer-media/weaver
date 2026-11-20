@@ -301,6 +301,27 @@ pub struct DownloadBlockState {
     // Why a schedule rule is holding new downloads, while one is.
     #[serde(default)]
     pub schedule_hold_reason: Option<String>,
+    // Every volume whose writer holds the downloads back, as the vote of
+    // the last seconds has it, and every volume a job with nothing left to
+    // fetch is still writing to, each with its figures as last published.
+    // Empty while no disk is the limit and nothing is being written out.
+    #[serde(default)]
+    pub disk_volumes: Vec<DiskVolumeState>,
+}
+
+// A volume the downloads wait on: its writer is the limit on downloads
+// (dispatch for a job on it was held for its write buffer in most of the
+// last seconds), or a job with nothing left to fetch still writes to it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskVolumeState {
+    // The mount path or drive root shown to the user.
+    pub label: String,
+    // Whether its writer is the limit on downloads.
+    pub slow: bool,
+    // What the volume takes, in bytes per second; zero until measured.
+    pub write_rate_bytes_per_sec: u64,
+    // Bytes waiting in memory for the volume's writer, from every job.
+    pub waiting_bytes: u64,
 }
 
 // An egress download quota that holds work back: no leg of the route the
@@ -333,6 +354,7 @@ impl Default for DownloadBlockState {
             speed_limit_in_force: None,
             speed_limit_by_schedule: false,
             schedule_hold_reason: None,
+            disk_volumes: Vec::new(),
         }
     }
 }

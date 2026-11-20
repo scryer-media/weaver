@@ -1265,6 +1265,7 @@ fn manual_pause_block() -> DownloadBlockState {
         speed_limit_in_force: Some(4_096),
         speed_limit_by_schedule: true,
         schedule_hold_reason: None,
+        disk_volumes: Vec::new(),
     }
 }
 

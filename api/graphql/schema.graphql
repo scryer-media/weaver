@@ -650,6 +650,29 @@ type DiskUsage {
 }
 
 """
+A destination disk a download is writing to or held by. Its figures move
+at most once a second, rounded as a screen shows them.
+"""
+type DiskVolume {
+	"""
+	The mount path or drive root, as the storage page shows it.
+	"""
+	label: String!
+	"""
+	Whether the disk cannot keep up with the downloads.
+	"""
+	slow: Boolean!
+	"""
+	What the disk takes, in bytes per second; 0 until measured.
+	"""
+	writeRateBytesPerSec: Int!
+	"""
+	Bytes in memory waiting for this disk's writer, from every download.
+	"""
+	waitingBytes: Int!
+}
+
+"""
 What one probe of a server came to.
 """
 type DnsProbe {
@@ -930,6 +953,13 @@ type DownloadBlock {
 	Why a schedule rule is holding new downloads, while one is.
 	"""
 	scheduleHoldReason: String
+	"""
+	Every destination disk a download is writing to or held by: whether it
+	is slow, what it takes and what waits for it. A disk is slow when its
+	write buffer held new articles back in most of the last 20 seconds.
+	Empty while no download waits on a disk.
+	"""
+	diskVolumes: [DiskVolume!]!
 	"""
 	When a timed pause lifts by itself, in epoch milliseconds. Absent for
 	a pause that waits to be resumed by hand.
@@ -4044,6 +4074,28 @@ type QueueCommandResult {
 	globalState: GlobalQueueState
 }
 
+"""
+A job's write to its destination disk, while the disk is slow or the
+job has nothing left to fetch and bytes still waiting in memory to be
+written. The disk's figures are on `downloadBlock.diskVolumes`, under the
+same label, so a figure change moves no queue row.
+"""
+type QueueDiskWrite {
+	"""
+	The disk, by the label `downloadBlock.diskVolumes` gives it.
+	"""
+	volume: String!
+	"""
+	Whether the disk cannot keep up: downloads keep waiting on it.
+	"""
+	slow: Boolean!
+	"""
+	Whether the job has nothing left to fetch and bytes still waiting in
+	memory for the disk.
+	"""
+	draining: Boolean!
+}
+
 enum QueueDownloadState {
 	QUEUED
 	DOWNLOADING
@@ -4163,6 +4215,13 @@ type QueueItem {
 	The job's tags, in tag order.
 	"""
 	tags: [String!]!
+	"""
+	The job's write to its destination disk while the disk is slow,
+	or while the job has nothing left to fetch and bytes still waiting
+	to be written; null otherwise. A list reads the disk state once for
+	all its rows.
+	"""
+	diskWrite: QueueDiskWrite
 }
 
 """

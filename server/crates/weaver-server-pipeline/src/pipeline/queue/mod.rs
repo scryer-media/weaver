@@ -240,6 +240,9 @@ pub struct Globals {
     pub runtime_paths: Option<RuntimePaths>,
     pub nntp_generation: u64,
     pub nntp_active: Option<crate::jobs::handle::NntpRuntimeActivation>,
+    // The volumes the disk vote finds slow and the jobs writing to them,
+    // as the pipeline last published them.
+    pub disk_limits: Arc<crate::pipeline::disk_vote::DiskLimits>,
 }
 
 impl Globals {
