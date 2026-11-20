@@ -22,9 +22,7 @@ use weaver_graph::slots::{AskerId, Ticket};
 use super::super::disk::JobDisk;
 use super::super::engine::{Heard, Said};
 use super::super::hardware::Hardware;
-use super::super::namespace::{
-    Lender, Loan, Repaired, RepairRead, RepairSlice, Replay, SetState,
-};
+use super::super::namespace::{Lender, Loan, RepairRead, RepairSlice, Repaired, Replay, SetState};
 use super::super::status::RepairSlots;
 
 pub struct Loans {
@@ -97,9 +95,9 @@ impl Loans {
     // Whether `serial` is the apply out for `set`: a slice of any other is
     // not heard.
     pub(crate) fn applying_under(&self, set: NodeId, serial: u64) -> bool {
-        self.out.as_ref().is_some_and(|out| {
-            out.kind == Work::Apply && out.set == set && out.serial == serial
-        })
+        self.out
+            .as_ref()
+            .is_some_and(|out| out.kind == Work::Apply && out.set == set && out.serial == serial)
     }
 
     // Tell the reader of the return being applied to read no more: a slice

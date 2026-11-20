@@ -4386,8 +4386,8 @@ pub fn index(offset: u64) -> usize {
     usize::try_from(offset).expect("an offset fits the address space")
 }
 
-pub(crate) mod claimed;
 mod carried;
+pub(crate) mod claimed;
 mod durable;
 mod loan;
 mod moves;

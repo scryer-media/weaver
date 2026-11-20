@@ -2343,7 +2343,10 @@ fn a_share_starts_a_files_write_out_at_each_stride_of_its_writes() {
     // Two more take the second to its own.
     b = write_pieces(&job, 2, &second, b, 2, &piece);
     job.barrier().wait();
-    assert_eq!(seen.lock().unwrap().last(), Some(&(second.clone(), 32 * MIB)));
+    assert_eq!(
+        seen.lock().unwrap().last(),
+        Some(&(second.clone(), 32 * MIB))
+    );
     // The first file counts again from its last write-out.
     a = write_pieces(&job, 1, &first, a, 3, &piece);
     job.barrier().wait();
@@ -2361,7 +2364,10 @@ fn a_share_starts_a_files_write_out_at_each_stride_of_its_writes() {
     assert_eq!(count(&volume.writer.write_outs), 3);
     assert!(job.barrier().passed());
     assert_eq!(std::fs::metadata(&second).unwrap().len(), b);
-    assert!(reports.try_recv().is_err(), "a clean write-out says nothing");
+    assert!(
+        reports.try_recv().is_err(),
+        "a clean write-out says nothing"
+    );
 }
 
 // A write-out the OS refuses is not asked for again on the volume, for any
@@ -2386,7 +2392,10 @@ fn a_refused_write_out_stops_them_on_the_volume_and_fails_nothing() {
     let barrier = job.barrier();
     assert!(barrier.passed(), "the writes stand");
     assert!(!job.failed());
-    assert!(reports.try_recv().is_err(), "a refused write-out is no failure");
+    assert!(
+        reports.try_recv().is_err(),
+        "a refused write-out is no failure"
+    );
     assert_eq!(std::fs::metadata(&first).unwrap().len(), a);
     assert_eq!(std::fs::metadata(&second).unwrap().len(), b);
 }
@@ -2450,7 +2459,11 @@ fn a_write_paid_where_it_lands_never_stops_the_queuing_thread() {
     assert!(!kept.is_unique(), "the queue holds the same allocation");
     hold.open();
     writers.settle();
-    assert_eq!(budget_waits(&share), waits_before, "the queuing thread never stood still");
+    assert_eq!(
+        budget_waits(&share),
+        waits_before,
+        "the queuing thread never stood still"
+    );
     assert_eq!(share.peak_bytes(), 1600);
     assert_eq!(share.unwritten_bytes(), 0);
     assert!(kept.is_unique());
@@ -2481,7 +2494,11 @@ fn a_credit_is_freed_where_its_bytes_did_not_land_and_carried_while_held() {
     let credit = paying.settle(|_| 100);
     assert!(credit.is_empty());
     assert_eq!(one.unwritten_bytes(), 100, "the write's own count");
-    assert_eq!(two.unwritten_bytes(), 0, "freed where the bytes did not land");
+    assert_eq!(
+        two.unwritten_bytes(),
+        0,
+        "freed where the bytes did not land"
+    );
     // Nothing is written in the next step, and 60 of the bytes are held.
     let credit = Credit::reserve([&first, &second], 100, Stand::UntilStop);
     let credit = credit.prepay().settle(|_| 60);
@@ -2544,7 +2561,10 @@ fn carried_bytes_grant_room_to_their_own_job_only() {
         .settle(|_| 64);
     assert_eq!(volume.carried_bytes(), 64);
     let next = Credit::reserve([&job], 10, Stand::UntilStop);
-    assert!(next.covers(10), "granted beside its own job's carried bytes");
+    assert!(
+        next.covers(10),
+        "granted beside its own job's carried bytes"
+    );
     assert_eq!(volume.unwritten_bytes(), 74);
     drop(next);
     // Beside the carried bytes and one byte the writer can write, neither
@@ -2564,6 +2584,36 @@ fn carried_bytes_grant_room_to_their_own_job_only() {
         assert!(mine.join().unwrap().covers(10));
         assert!(theirs.join().unwrap().covers(10));
     });
+    hold.open();
+    writers.settle();
+    assert_eq!(volume.unwritten_bytes(), 0);
+}
+
+// An owner's prepayment made inside a credit's step on the same volume and
+// slot, as the loop arms an article's step while it carries credit, keeps
+// the two apart: each settles only what of its own the writes did not take,
+// and the volume counts nothing that was not written.
+#[test]
+fn a_prepayment_inside_a_credits_step_settles_apart_from_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a");
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    volume.set_buffer_limits(64, 64);
+    let hold = writers.hold(&volume);
+    let job = writers.test_submitter(&volume, 1);
+    let paying = Credit::reserve([&job], 6, Stand::UntilStop).prepay();
+    let mut held = Reservation::none(Arc::clone(&volume));
+    held.count(10);
+    let prepaid = writers.test_owner().prepay(&mut held, 10);
+    assert_eq!(volume.unwritten_bytes(), 16);
+    // The writes take the latest prepayment first.
+    job.write(1, 0, Bytes::from(vec![1u8; 4]), create(&path));
+    assert_eq!(prepaid.settle(), 6, "the owner gives back only its own");
+    assert_eq!(volume.unwritten_bytes(), 10);
+    let left = paying.settle(|_| 0);
+    assert!(left.is_empty());
+    assert_eq!(volume.unwritten_bytes(), 4, "only the written bytes count");
     hold.open();
     writers.settle();
     assert_eq!(volume.unwritten_bytes(), 0);
@@ -2651,9 +2701,15 @@ fn a_carried_credit_is_taken_and_given_back_by_volume() {
     assert_eq!((one.carried_bytes(), two.carried_bytes()), (80, 0));
     assert_eq!((one.unwritten_bytes(), two.unwritten_bytes()), (80, 0));
     credit.give_back_on(&one, 30);
-    assert_eq!((credit.on(&one), one.carried_bytes(), one.unwritten_bytes()), (50, 50, 50));
+    assert_eq!(
+        (credit.on(&one), one.carried_bytes(), one.unwritten_bytes()),
+        (50, 50, 50)
+    );
     let taken = credit.take_on(&one, 20);
-    assert_eq!((taken.on(&one), credit.on(&one), one.carried_bytes()), (20, 30, 30));
+    assert_eq!(
+        (taken.on(&one), credit.on(&one), one.carried_bytes()),
+        (20, 30, 30)
+    );
     let moved = taken.moved_to(&second);
     assert_eq!((moved.on(&one), moved.on(&two)), (0, 20));
     assert_eq!((one.unwritten_bytes(), two.unwritten_bytes()), (30, 20));

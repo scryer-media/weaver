@@ -278,7 +278,11 @@ impl DiskLimits {
     // The volume `volume` is, by its place, added with its figures read
     // now when it is not listed yet.
     fn place(&mut self, volume: &Arc<Volume>, slow: bool) -> usize {
-        if let Some(at) = self.volumes.iter().position(|kept| Arc::ptr_eq(kept, volume)) {
+        if let Some(at) = self
+            .volumes
+            .iter()
+            .position(|kept| Arc::ptr_eq(kept, volume))
+        {
             self.states[at].slow |= slow;
             return at;
         }
@@ -323,12 +327,16 @@ impl DiskLimits {
     // reasons: what a queue row shows. Figures are not compared.
     pub fn same_rows(&self, other: &Self) -> bool {
         self.jobs.len() == other.jobs.len()
-            && self.jobs.iter().zip(&other.jobs).all(|((a_id, a), (b_id, b))| {
-                a_id == b_id
-                    && a.draining == b.draining
-                    && self.states[a.at].label == other.states[b.at].label
-                    && self.states[a.at].slow == other.states[b.at].slow
-            })
+            && self
+                .jobs
+                .iter()
+                .zip(&other.jobs)
+                .all(|((a_id, a), (b_id, b))| {
+                    a_id == b_id
+                        && a.draining == b.draining
+                        && self.states[a.at].label == other.states[b.at].label
+                        && self.states[a.at].slow == other.states[b.at].slow
+                })
     }
 
     // Whether the two say the same: the same rows, volumes and figures.
@@ -449,7 +457,9 @@ impl Pipeline {
                 .is_none_or(|disk| {
                     draining
                         && (disk.quiet()
-                            || disk.each().all(|submitter| waiting(submitter.volume()) == 0))
+                            || disk
+                                .each()
+                                .all(|submitter| waiting(submitter.volume()) == 0))
                 })
         });
         if self.disk_vote.publish_due(Instant::now()) || done {
@@ -482,7 +492,11 @@ impl Pipeline {
             .graph_jobs
             .iter()
             .map(|(job_id, graph)| (job_id, graph, fetched(job_id)))
-            .chain(self.retiring_graph_jobs.iter().map(|(job_id, graph)| (job_id, graph, true)))
+            .chain(
+                self.retiring_graph_jobs
+                    .iter()
+                    .map(|(job_id, graph)| (job_id, graph, true)),
+            )
             .filter_map(|(job_id, graph, fetched)| {
                 let disk = graph.disk()?;
                 Some(JobDiskView {
@@ -561,7 +575,12 @@ mod tests {
     }
 
     // Mark `volume` held in each of the windows `seconds`.
-    fn hold(vote: &DiskVote, epoch: Instant, volume: &Arc<Volume>, seconds: impl Iterator<Item = u64>) {
+    fn hold(
+        vote: &DiskVote,
+        epoch: Instant,
+        volume: &Arc<Volume>,
+        seconds: impl Iterator<Item = u64>,
+    ) {
         for second in seconds {
             vote.note_held(volume, 1, at(epoch, second, 500));
         }
@@ -793,7 +812,12 @@ mod tests {
         assert!(!vote.publish_due(at(epoch, 1, 500)));
     }
 
-    fn view<'a>(job: u64, volumes: Vec<&'a Arc<Volume>>, fetched: bool, quiet: bool) -> JobDiskView<'a> {
+    fn view<'a>(
+        job: u64,
+        volumes: Vec<&'a Arc<Volume>>,
+        fetched: bool,
+        quiet: bool,
+    ) -> JobDiskView<'a> {
         JobDiskView {
             job_id: JobId(job),
             volumes,

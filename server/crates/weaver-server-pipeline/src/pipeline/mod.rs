@@ -2287,10 +2287,8 @@ pub struct Pipeline {
     // The barriers each job listed as still writing out asked to be told
     // of, one set per listed job, and what rings when they return: the
     // room channel the volumes' writers already ring.
-    pub(super) disk_tells: HashMap<
-        JobId,
-        Vec<weaver_server_disk::operations::disk::writer::Barrier>,
-    >,
+    pub(super) disk_tells:
+        HashMap<JobId, Vec<weaver_server_disk::operations::disk::writer::Barrier>>,
     pub(super) disk_tell: tokio::sync::mpsc::UnboundedSender<()>,
     // The clock the shutdown settle of the volume writers goes by, and how
     // long a volume may stand still before it is left behind. The machine's

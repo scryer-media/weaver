@@ -684,3 +684,69 @@ async fn bytes_held_on_a_volume_the_job_left_move_only_where_they_fit() {
     nothing_waits_counted(&pipeline, job_id);
     retire_pipeline_database(pipeline).await;
 }
+
+// An extraction's thread stands for room on output beside a lease for an
+// article that lands there. The lease is settled to what arrived, as a
+// lane's article is: that gives most of it back, and the thread is woken
+// and granted its room, with nothing written and no owner asked.
+#[tokio::test]
+async fn a_producer_standing_on_output_wakes_when_a_leased_article_gives_back() {
+    use weaver_server_disk::operations::disk::writer::{Credit, Stand};
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_509);
+    let posts = [Post::plain("lantern.bin", payload(24 * ARTICLE, 18))];
+    let (mut pipeline, staging_dir, working, output) =
+        two_volume_job(&temp_dir, job_id, &posts, 16 * ARTICLE as u64).await;
+    let next = decide_onto_output(&mut pipeline, job_id, &posts, &output).await;
+    let disk = pipeline.graph_jobs[&job_id].disk().unwrap().clone();
+    disk.barrier().wait_aside();
+    assert_eq!(output.unwritten_bytes(), 0);
+    // The job's own way to write to output, as its extraction counts there.
+    let producer = Arc::clone(disk.under(&staging_dir));
+    assert!(Arc::ptr_eq(producer.volume(), &output));
+    let hold = pipeline.volume_writers.hold(&output);
+
+    // A lease that leaves no room for the producer's output beside it.
+    let (_, hard) = output.buffer_limits();
+    let leased = 14 * ARTICLE as u64;
+    let wanted = 4 * ARTICLE as u64;
+    assert!(leased + wanted > hard);
+    assert!(pipeline.lease_for_test(segment_id(job_id, 0, next), leased as u32));
+    let standing =
+        std::thread::spawn(move || Credit::reserve([&producer], wanted, Stand::UntilStop));
+    hold.wait_below_waiters(1);
+    assert_eq!(
+        output.unwritten_bytes(),
+        leased,
+        "the producer counted nothing"
+    );
+
+    // The article arrives smaller than its lease: what it does not need is
+    // given back, and the standing thread is woken by that alone.
+    let body = body(&posts, 0, next);
+    pipeline.arrive_for_test(
+        segment_id(job_id, 0, next),
+        leased as u32,
+        body.len() as u64,
+    );
+    let credit = standing.join().unwrap();
+    assert!(credit.covers(wanted));
+    assert_eq!(output.unwritten_bytes(), body.len() as u64 + wanted);
+    assert_eq!(
+        output.buffered_bytes.load(Ordering::SeqCst),
+        0,
+        "nothing was written"
+    );
+    drop(credit);
+    hold.open();
+    assert!(
+        pipeline
+            .hand_on_for_test(decoded_article(job_id, &posts, 0, next, body, true))
+            .await
+    );
+    within_limit(&working);
+    within_limit(&output);
+    nothing_waits_counted(&pipeline, job_id);
+    retire_pipeline_database(pipeline).await;
+}

@@ -709,7 +709,8 @@ impl VolumeWriters {
             let state = &lane.state;
             {
                 let _held = state
-                    .volume.below_waiting
+                    .volume
+                    .below_waiting
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
                 state.volume.below.notify_all();
@@ -745,7 +746,8 @@ impl VolumeWriters {
             lane.state.woke.notify_all();
             let _held = lane
                 .state
-                .volume.below_waiting
+                .volume
+                .below_waiting
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             lane.state.volume.below.notify_all();
@@ -1277,14 +1279,16 @@ impl Submitter {
         // it under the lock, or this look finds the bytes already lowered.
         state.volume.below_waiters.fetch_add(1, Ordering::SeqCst);
         let mut held = state
-            .volume.below_waiting
+            .volume
+            .below_waiting
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         #[cfg(any(test, feature = "test-support"))]
         state.volume.below.notify_all();
         while over() {
             held = state
-                .volume.below
+                .volume
+                .below
                 .wait(held)
                 .unwrap_or_else(PoisonError::into_inner);
         }
@@ -1323,7 +1327,8 @@ impl Submitter {
         // `wait_below`.
         state.volume.below_waiters.fetch_add(1, Ordering::SeqCst);
         let mut lock = state
-            .volume.below_waiting
+            .volume
+            .below_waiting
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         #[cfg(any(test, feature = "test-support"))]
@@ -1332,7 +1337,8 @@ impl Submitter {
             Stand::UntilStop => {
                 while over() {
                     lock = state
-                        .volume.below
+                        .volume
+                        .below
                         .wait(lock)
                         .unwrap_or_else(PoisonError::into_inner);
                 }
@@ -1415,7 +1421,8 @@ impl Submitter {
         // `wait_below`.
         state.volume.below_waiters.fetch_add(1, Ordering::SeqCst);
         let held = state
-            .volume.below_waiting
+            .volume
+            .below_waiting
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         #[cfg(any(test, feature = "test-support"))]
@@ -3290,12 +3297,14 @@ impl Hold {
     pub fn wait_below_waiters(&self, count: usize) {
         let state = &self.0.state;
         let mut held = state
-            .volume.below_waiting
+            .volume
+            .below_waiting
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         while state.volume.below_waiters.load(Ordering::SeqCst) < count {
             held = state
-                .volume.below
+                .volume
+                .below
                 .wait(held)
                 .unwrap_or_else(PoisonError::into_inner);
         }

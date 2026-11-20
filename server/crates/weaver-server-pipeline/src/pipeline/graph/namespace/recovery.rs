@@ -1002,7 +1002,14 @@ impl NamespaceWriter {
         let placed = bound.and_then(|()| {
             for (member, offset, bytes) in repaired.slices() {
                 self.below_budget()?;
-                self.place_slice(tree, builder, segments, &mut apply, (member, offset, bytes?), out)?;
+                self.place_slice(
+                    tree,
+                    builder,
+                    segments,
+                    &mut apply,
+                    (member, offset, bytes?),
+                    out,
+                )?;
             }
             Ok(())
         });
@@ -1030,7 +1037,15 @@ impl NamespaceWriter {
             provenance: Provenance::Repaired,
         };
         let write = Write::new(&arrival);
-        if self.place_as(tree, builder, segments, (arrival, apply.contested), write, out)? > 0 {
+        if self.place_as(
+            tree,
+            builder,
+            segments,
+            (arrival, apply.contested),
+            write,
+            out,
+        )? > 0
+        {
             apply.landed = true;
             apply.rewritten.insert(member);
         }

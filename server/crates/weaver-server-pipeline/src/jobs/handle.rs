@@ -465,7 +465,11 @@ impl SharedPipelineState {
             .store(write_rate_bytes_per_sec, Ordering::Relaxed);
         volume.count_for_test(waiting_bytes);
         volume.buffered_bytes.store(waiting_bytes, Ordering::SeqCst);
-        let slow_volumes = if slow { vec![Arc::clone(&volume)] } else { Vec::new() };
+        let slow_volumes = if slow {
+            vec![Arc::clone(&volume)]
+        } else {
+            Vec::new()
+        };
         let views = held
             .iter()
             .map(|job_id| (*job_id, false))

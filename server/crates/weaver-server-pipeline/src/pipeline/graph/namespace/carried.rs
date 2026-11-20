@@ -199,7 +199,13 @@ impl NamespaceWriter {
             self.carried.members.remove(&(node, member));
         }
         if let Some(PaidHeld { paying, volume }) = paid {
-            let mut left = paying.settle(|on| if std::ptr::eq(on, volume.as_ref()) { kept } else { 0 });
+            let mut left = paying.settle(|on| {
+                if std::ptr::eq(on, volume.as_ref()) {
+                    kept
+                } else {
+                    0
+                }
+            });
             left.join(std::mem::take(&mut self.carried.credit));
             left.carry();
             self.carried.credit = left;

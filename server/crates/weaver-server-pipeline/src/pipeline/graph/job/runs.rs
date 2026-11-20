@@ -76,7 +76,11 @@ impl GraphJob {
             Heard::RepairRead(read) => {
                 if !self.loans.returned(said.node, said.generation) {
                     read.output.remove().map_err(WriteError::from)?;
-                } else if self.writer.drop_apply(read.output).map_err(WriteError::from)? {
+                } else if self
+                    .writer
+                    .drop_apply(read.output)
+                    .map_err(WriteError::from)?
+                {
                     self.pending().left_at_stop();
                 }
             }

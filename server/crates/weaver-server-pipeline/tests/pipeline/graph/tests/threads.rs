@@ -978,7 +978,9 @@ async fn a_draining_job_is_dropped_when_its_writes_return_with_the_loop_parked()
     );
     pipeline.tally_disk_vote(std::time::Instant::now());
     let listed = pipeline.shared_state.disk_limits();
-    let write = listed.job(job_id).expect("the job is listed as writing out");
+    let write = listed
+        .job(job_id)
+        .expect("the job is listed as writing out");
     assert!(write.draining && !write.slow);
     assert_eq!(write.volume, volume.label);
     let rows = pipeline.shared_state.disk_rows_revision();
@@ -2376,7 +2378,11 @@ async fn an_extraction_onto_a_still_output_volume_never_stops_the_loop() {
     let (buffered, counted) = watcher.join().unwrap();
     disk.barrier().wait_aside();
     assert_eq!(read(&staging_dir.join("echo-0.mkv")), body);
-    assert_eq!(budget_waits(&output), 0, "the loop stood still for the volume");
+    assert_eq!(
+        budget_waits(&output),
+        0,
+        "the loop stood still for the volume"
+    );
     assert!(counted <= hard.max(buffered), "{counted} over {hard}");
     retire_pipeline_database(pipeline).await;
 }
