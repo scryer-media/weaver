@@ -471,6 +471,22 @@ pub async fn drive_until_graph_waiting(pipeline: &mut Pipeline, scenario: &Scena
     drive(pipeline, scenario, JOB, graph_waiting).await;
 }
 
+pub fn graph_in_place(pipeline: &Pipeline) -> bool {
+    pipeline.graph_jobs.contains_key(&JOB)
+}
+
+// A lane asks for the job's work: its articles are read back and its graph
+// is put in place.
+pub async fn activates(pipeline: &mut Pipeline) {
+    pipeline.request_job_activation(JOB);
+    let done = pipeline
+        .job_activated_rx
+        .recv()
+        .await
+        .expect("the activation channel stays open");
+    pipeline.handle_job_activated(done);
+}
+
 // What the job counts downloaded, while it runs and once it has ended.
 pub fn counted(pipeline: &Pipeline) -> u64 {
     pipeline

@@ -305,6 +305,7 @@ impl Pipeline {
             ((wanted_bytes - remaining_bytes) as f64 / wanted_bytes as f64).clamp(0.0, 1.0)
         };
         let download_wait = self.download_wait_by_job.get(&state.job_id);
+        let (disk_need_bytes, disk_free_bytes) = self.disk_figures(state.job_id);
         Some(JobInfo {
             job_id: state.job_id,
             protocol: crate::jobs::model::Protocol::Nzb,
@@ -360,8 +361,8 @@ impl Pipeline {
             metadata: state.spec.metadata.clone(),
             output_dir: Some(state.working_dir.display().to_string()),
             server_attribution: state.server_attribution.contributions().to_vec(),
-            disk_need_bytes: None,
-            disk_free_bytes: None,
+            disk_need_bytes,
+            disk_free_bytes,
             created_at_epoch_ms: state.created_at_epoch_ms,
         })
     }

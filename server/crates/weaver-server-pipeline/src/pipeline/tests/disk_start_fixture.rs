@@ -244,6 +244,11 @@ pub fn remaining(pipeline: &Pipeline, id: u64) -> Option<u64> {
     })
 }
 
+// Whether the job has a graph in place.
+pub fn has_graph(pipeline: &Pipeline, id: u64) -> bool {
+    pipeline.graph_jobs.contains_key(&JobId(id))
+}
+
 // Whether jobs are kept from starting for the disk, and that hold waits on
 // it for a reading.
 pub fn kept_for_disk(pipeline: &Pipeline) -> bool {
@@ -272,4 +277,46 @@ pub fn booking_locks() -> u64 {
 // How many walks over the queue's rows ran on this thread.
 pub fn walks() -> u64 {
     crate::pipeline::queue::ROW_WALKS.load(Ordering::Relaxed)
+}
+
+// The job's row says it has `left` still to fetch, as a job partly fetched
+// before a pause does.
+pub fn says_left(pipeline: &Pipeline, id: u64, left: u64) {
+    pipeline.shared_state.queue.write(|inner| {
+        if let Some(mut row) = inner.job_mut(JobId(id)) {
+            row.report.job.remaining_bytes = left;
+        }
+        crate::pipeline::queue::Change::changed(())
+    });
+}
+
+// The id of the torrent the tests let go.
+const TORRENT: u64 = 77_001;
+
+// A torrent held for a full disk on the working root is let go on its
+// figure, `bytes` promised to its step, as the torrent service's wake does.
+pub fn torrent_let_go_on_working(pipeline: &Pipeline, bytes: u64) {
+    use weaver_server_disk::operations::room_wait::{Disk, Promised, Waiter};
+    let disk = Disk::Root(StorageRoot::Intermediate);
+    let device = disk.device(&pipeline.storage_capacity);
+    pipeline.storage_capacity.promises().insert(
+        Waiter::Torrent,
+        JobId(TORRENT),
+        Promised {
+            disk,
+            bytes,
+            device,
+        },
+    );
+}
+
+// The step of the torrent let go by [`torrent_let_go_on_working`] ends: its
+// promise goes, as the torrent service ends it.
+pub fn torrent_step_ends(pipeline: &Pipeline) {
+    use weaver_server_disk::operations::room_wait::Waiter;
+    pipeline.storage_capacity.promises().end(
+        &pipeline.storage_capacity,
+        Waiter::Torrent,
+        JobId(TORRENT),
+    );
 }
