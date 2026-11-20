@@ -11,6 +11,7 @@ use crate::torrents::{NamedBy, PeerInfo, TorrentTracker, TrackerEntry};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::time::Duration;
+use weaver_torrent::tracker::redacted_tracker_url;
 
 // Refuse an edit naming a tracker that is no URL.
 fn tracker_urls(trackers: &[TrackerEntry]) -> Result<(), ActionError> {
@@ -19,9 +20,9 @@ fn tracker_urls(trackers: &[TrackerEntry]) -> Result<(), ActionError> {
         .map(|tracker| tracker.url.trim())
         .filter(|url| !url.is_empty())
         .try_for_each(|url| {
-            weaver_torrent::Url::parse(url)
-                .map(drop)
-                .map_err(|error| ActionError::Invalid(format!("tracker {url}: {error}")))
+            weaver_torrent::Url::parse(url).map(drop).map_err(|error| {
+                ActionError::Invalid(format!("tracker {}: {error}", redacted_tracker_url(url)))
+            })
         })
 }
 
@@ -359,10 +360,14 @@ impl TorrentService {
             .get(&job_id)
             .is_some_and(|torrent| torrent.trackers.iter().any(|tracker| tracker.url == url));
         if !listed {
-            return Err(ActionError::Invalid(format!("no tracker {url}")));
+            return Err(ActionError::Invalid(format!(
+                "no tracker {}",
+                redacted_tracker_url(url)
+            )));
         }
-        let url = weaver_torrent::Url::parse(url)
-            .map_err(|error| ActionError::Invalid(format!("tracker {url}: {error}")))?;
+        let url = weaver_torrent::Url::parse(url).map_err(|error| {
+            ActionError::Invalid(format!("tracker {}: {error}", redacted_tracker_url(url)))
+        })?;
         if let Some(handle) = handle {
             handle.force_reannounce(Duration::ZERO, Some(&url), true);
         }

@@ -352,6 +352,33 @@ pub fn redacted_tracker_url(url: &str) -> String {
     }
 }
 
+/// `text` a tracker sent (a failure reason, a warning, a UDP error) with
+/// every URL in it shown as [`redacted_tracker_url`] shows one: a tracker
+/// that echoes its announce URL echoes the passkey in it. A URL runs from
+/// its scheme to the next space, quote or angle bracket.
+pub fn redacted_tracker_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("://") {
+        let start = rest[..at]
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+            .map_or(0, |before| before + 1);
+        let end = rest[at..]
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>'))
+            .map_or(rest.len(), |after| at + after);
+        out.push_str(&rest[..start]);
+        if start == at {
+            // No scheme before it: not a URL, kept as it came.
+            out.push_str(&rest[at..end]);
+        } else {
+            out.push_str(&redacted_tracker_url(&rest[start..end]));
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// `e` without the URL an HTTP client error names, which carries the
 /// tracker's passkey. Every tracker request's error passes through it
 /// before it is logged or kept as the tracker's message.
@@ -1039,7 +1066,7 @@ fn read_answer(bytes: &[u8]) -> anyhow::Result<tracker_comms_http::TrackerRespon
         return Err(Refused::error(
             format!(
                 "tracker returned failure. Failure reason: {}",
-                error.failure_reason
+                redacted_tracker_text(&error.failure_reason.to_string())
             ),
             error.interval,
             true,
@@ -2703,7 +2730,7 @@ fn read_http_announce(
         warning: response
             .warning_message
             .as_ref()
-            .map(|m| String::from_utf8_lossy(m.as_ref()).into_owned()),
+            .map(|m| redacted_tracker_text(&String::from_utf8_lossy(m.as_ref()))),
         seen_as: response.external_ip().zip(answer.from),
         body_len: Some(answer.body.len()),
         accepted: Accepted::default(),
