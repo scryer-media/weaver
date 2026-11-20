@@ -888,9 +888,6 @@ impl RarStore {
         let going: Vec<VolumeIndex> = claim::misfits(volume, &self.volumes)
             .into_iter()
             .filter(|index| self.volumes.get(index).is_some_and(|found| found.closed))
-            // One the layout already placed pieces in stays: its bytes went
-            // to the store's members, and nothing carries them back with it.
-            .filter(|index| self.unmapped.contains(index))
             .collect();
         if !going.is_empty() {
             self.give_back_held(going, out);
@@ -938,8 +935,18 @@ impl RarStore {
         }
     }
 
+    // Every volume the store gives back goes through here. One the layout
+    // already placed pieces in stays, whichever path asked: its bytes went
+    // to the store's members, its kept bytes no longer hold them, and the
+    // tree, handed it, would refuse its member with those bytes lost, the
+    // store founded again on the same bytes would give it back again, and
+    // nothing would change between the rounds. It is the store's, as any
+    // volume its members read is.
     fn give_back_held(&mut self, going: Vec<VolumeIndex>, out: &mut Vec<Emit>) {
         for index in going {
+            if !self.unmapped.contains(&index) {
+                continue;
+            }
             if let Some(found) = self.volumes.remove(&index) {
                 self.giving.insert(index, found);
                 out.push(Emit::GiveBack(index));

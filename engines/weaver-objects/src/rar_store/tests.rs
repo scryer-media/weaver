@@ -2848,6 +2848,33 @@ fn the_open_volumes_filed_agree_with_a_walk_of_every_volume() {
     assert!(store.finished());
 }
 
+// Every give-back goes through one gate: a volume the layout placed pieces
+// in stays, whichever path asks, since its bytes went to the store's members
+// and the tree could only refuse it. A volume no piece lies in still goes,
+// and the tree is handed it.
+#[test]
+fn a_volume_the_layout_placed_is_never_given_back() {
+    let volumes = write(&items(), &split(Version::Rar5));
+    assert!(volumes.len() >= 3, "{}", volumes.len());
+    let mut owner = Owner::named(store(), volumes);
+    owner.whole(usize::MAX >> 1);
+    streamed(&owner);
+    let mapped = VolumeIndex(1);
+    assert!(!owner.object.unmapped.contains(&mapped));
+    let mut out = Vec::new();
+    owner.object.give_back_held(vec![mapped], &mut out);
+    assert!(!out.contains(&Emit::GiveBack(mapped)), "{out:?}");
+    assert!(owner.object.volumes.contains_key(&mapped));
+    assert!(owner.object.give_back(mapped).is_none());
+
+    let mut unplaced = store();
+    unplaced.bound(VolumeIndex(0), "alpha.part1.rar", &[], None);
+    let mut out = Vec::new();
+    unplaced.give_back_held(vec![VolumeIndex(0)], &mut out);
+    assert_eq!(out, vec![Emit::GiveBack(VolumeIndex(0))]);
+    assert!(unplaced.give_back(VolumeIndex(0)).is_some());
+}
+
 // A repair inside a run of several MiB cuts it, and what it cut and
 // did not cover is read back from the member past READ_BACK, a MiB at a
 // time. Once with runs as fed, once with runs a restore joined.
