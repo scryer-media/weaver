@@ -48,10 +48,13 @@ jobs:
       contents: read
       packages: write
     steps:
+      # No ref: a workflow_run job checks out the default branch, so the
+      # Dockerfile is never taken from a commit the triggering run names.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event.workflow_run.pull_requests[0].base.sha }}
           persist-credentials: false
+          sparse-checkout: docker/weaver.Dockerfile
+          sparse-checkout-cone-mode: false
       - name: Download prepared PR build context
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
