@@ -5,6 +5,7 @@ mod pipeline {
     mod tests {
         mod cancel_batch;
         mod control_lifecycle;
+        mod nzb_admission;
         mod queue;
         mod queue_window;
     }

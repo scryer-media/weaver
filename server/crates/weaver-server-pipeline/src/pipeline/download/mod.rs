@@ -13,7 +13,7 @@ pub(crate) mod transport;
 mod worker;
 pub(in crate::pipeline) use worker::volume_pace;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(in crate::pipeline) use worker::lane_acquire_failure_for_work;
 
 pub(in crate::pipeline) use retention::LoginRefusalView;
@@ -22,7 +22,7 @@ pub(in crate::pipeline) use retention::LoginRefusalWait;
 pub(super) use worker::HeldDownloadRefill;
 #[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(in crate::pipeline) use worker::{DISPATCH_INELIGIBLE_LOG_INTERVAL, DownloadPressure};
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(in crate::pipeline) use worker::{
     DOWNLOAD_DISPATCH_STALL_KICK_AFTER, DOWNLOAD_DISPATCH_STALL_RELEASE_AFTER,
 };

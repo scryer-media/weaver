@@ -106,7 +106,7 @@ impl Pipeline {
     // The category lookup uses the dispatch cache. Only a blocking script
     // holds the job; a cold cache is resolved off the actor before releasing
     // a provisional hold. A script that could not run decides nothing.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn raise_added_script_event(&mut self, job_id: JobId) {
         if !self.jobs.contains_key(&job_id) || !self.db.queue_scripts_possible() {
             return;

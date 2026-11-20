@@ -224,18 +224,18 @@ pub(crate) fn post_summary(state: &JobState) -> SummaryPost {
 
 // How many tree nodes a summary keeps; a test lowers it on its own thread,
 // where the pipeline it drives runs.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 thread_local! {
     pub(crate) static NODES_KEPT_HERE: std::cell::Cell<usize> =
         const { std::cell::Cell::new(NODES_KEPT) };
 }
 
 fn nodes_kept() -> usize {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     {
         NODES_KEPT_HERE.with(std::cell::Cell::get)
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "pipeline-test-fixtures")))]
     {
         NODES_KEPT
     }

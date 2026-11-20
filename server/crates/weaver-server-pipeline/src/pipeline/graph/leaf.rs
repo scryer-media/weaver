@@ -568,7 +568,7 @@ impl Leaf {
         if let Some(open) = self.queued.as_ref().map(|queued| queued.open) {
             // A test's full disk refuses the write as it is handed over, as
             // the disk would refuse it in place.
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             if counting::full(bytes.len()) {
                 return Err(LeafError::on(&self.path, self.device)(io::Error::from(
                     counting::refusal(),
@@ -1268,11 +1268,11 @@ fn create_parent(path: &Path, device: Device) -> Result<(), LeafError> {
 }
 
 fn write_all_at(file: &File, offset: u64, bytes: &[u8]) -> io::Result<()> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     if counting::full(bytes.len()) {
         return Err(io::Error::from(counting::refusal()));
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     counting::wrote(bytes.len());
     #[cfg(unix)]
     {
@@ -1297,7 +1297,7 @@ fn write_all_at(file: &File, offset: u64, bytes: &[u8]) -> io::Result<()> {
 }
 
 pub(crate) fn read_exact_at(file: &File, offset: u64, out: &mut [u8]) -> io::Result<()> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     counting::read(out.len());
     #[cfg(unix)]
     {
@@ -1336,7 +1336,7 @@ fn joined_digest(first: Option<Digest>, second: Option<Digest>, len_second: u64)
 
 // The bytes this thread read from and wrote to the job's files, so a test
 // can hold a step to what it touches on disk.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) mod counting {
     use std::cell::Cell;
 
@@ -1392,6 +1392,7 @@ pub(crate) mod counting {
     }
 
     // Bytes read and bytes written so far.
+    #[cfg(test)]
     pub(crate) fn so_far() -> (u64, u64) {
         (READ.with(Cell::get), WRITTEN.with(Cell::get))
     }

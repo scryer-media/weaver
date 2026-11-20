@@ -3,7 +3,7 @@
 
 use super::*;
 
-pub struct ParkedRetry(RetryWork);
+pub struct ParkedRetry(pub(super) RetryWork);
 
 impl ParkedRetry {
     pub fn work(&self) -> &DownloadWork {

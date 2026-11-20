@@ -332,3 +332,46 @@ async fn explicit_article_body(
         .await;
     heard(pipeline, look).await;
 }
+
+pub(super) async fn decode_wire_article(
+    pipeline: &mut crate::pipeline::Pipeline,
+    id: weaver_server_base::jobs::ids::SegmentId,
+    raw: &[u8],
+) {
+    use crate::pipeline::tests::checkpoint_plan;
+    use crate::pipeline::{DecodeDone, DownloadPayload, Pipeline, SegmentSource};
+    use weaver_nntp::client::{DecodedBody, DecodedBodyTrace};
+    let mut decoder = weaver_nntp::fused_yenc::FusedYencArticleDecoder::new();
+    decoder.set_checkpoint_plan(checkpoint_plan(pipeline, id.file_id.job_id));
+    let decoded = decoder
+        .decode_available(&mut bytes::BytesMut::from(raw))
+        .unwrap()
+        .unwrap();
+    let trace = DecodedBodyTrace {
+        attempts: Vec::new(),
+        result: Ok(DecodedBody {
+            raw_size: raw.len() as u32,
+            decoded: decoded.chunks,
+            body: decoded.body,
+            cpu: Default::default(),
+            io: Default::default(),
+        }),
+    };
+    let (payload, _, _) = Pipeline::download_data_from_decoded_trace(id, trace);
+    let Ok(DownloadPayload::Decoded(result)) = payload else {
+        panic!("valid yEnc");
+    };
+    pipeline.note_decode_started(id, raw.len() as u64);
+    pipeline
+        .handle_decode_done(DecodeDone::Success {
+            result,
+            source: SegmentSource {
+                servers: crate::pipeline::PoolServers::stamped(
+                    pipeline.pool_generation,
+                    Some(0),
+                    weaver_nntp::ServerSet::EMPTY,
+                ),
+            },
+        })
+        .await;
+}

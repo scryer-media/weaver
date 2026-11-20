@@ -238,7 +238,7 @@ fn article_extent(volume_len: usize, segment_number: u32, articles: usize) -> (u
 
 // Two articles per volume, so a volume's payload arrives after its header and
 // routing has to split at least one article across destinations.
-pub(super) fn direct_store_job_spec(name: &str, volumes: &[(String, Vec<u8>)]) -> JobSpec {
+pub fn direct_store_job_spec(name: &str, volumes: &[(String, Vec<u8>)]) -> JobSpec {
     direct_store_job_spec_with_articles(name, volumes, 2)
 }
 
@@ -730,8 +730,7 @@ pub fn protected_store_set(
 
 // [`protected_store_set`] with a second member, `lead`, stored whole in the
 // first volume ahead of the split one.
-#[cfg(test)]
-pub(in crate::pipeline::tests) fn protected_store_set_led_by(
+pub fn protected_store_set_led_by(
     lead: (&str, &[u8]),
     member_name: &str,
     payload: &[u8],

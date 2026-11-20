@@ -306,6 +306,14 @@ pub(crate) mod threads {
 
     static ASKED: AtomicBool = AtomicBool::new(false);
 
+    tokio::task_local! {
+        static THREADED_WRITERS: ();
+    }
+
+    pub(crate) async fn with_real_writers<F: std::future::Future>(fixture: F) -> F::Output {
+        THREADED_WRITERS.scope((), fixture).await
+    }
+
     #[cfg(test)]
     pub(crate) struct Threads(());
 
@@ -316,7 +324,7 @@ pub(crate) mod threads {
     }
 
     pub(crate) fn asked() -> bool {
-        ASKED.load(Ordering::SeqCst)
+        THREADED_WRITERS.try_with(|()| ()).is_ok() || ASKED.load(Ordering::SeqCst)
     }
 
     // The writers a pipeline under test writes through: each operation
@@ -628,7 +636,7 @@ fn output_limit(submitter: &Submitter) -> u64 {
 }
 
 impl JobDisk {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn new(working: Arc<Submitter>, output: Option<(PathBuf, Arc<Submitter>)>) -> Self {
         Self {
             working,
@@ -890,7 +898,7 @@ impl JobBarrier {
 
     // Wait until every operation behind it returned, counted against the
     // loop.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn wait(&self) {
         for barrier in &self.0 {
             barrier.wait();

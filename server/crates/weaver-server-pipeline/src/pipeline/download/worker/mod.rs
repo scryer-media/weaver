@@ -26,7 +26,7 @@ pub(in crate::pipeline::download) use leases::{
     BlockedBy, ScanMemo, ServableWork, ServableWorkFilter,
 };
 pub(in crate::pipeline) use refill::HeldDownloadRefill;
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(in crate::pipeline) use spawn::lane_acquire_failure_for_work;
 
 enum DispatchAttempt {

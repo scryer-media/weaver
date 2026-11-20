@@ -4,7 +4,7 @@
 use super::*;
 
 use std::collections::VecDeque;
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc as std_mpsc};
 use std::time::{Duration, Instant};
@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, oneshot};
 
 pub(crate) struct OwnedDownloadLanePool {
     shared: Arc<std::sync::Mutex<OwnedLanePoolShared>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     reset_calls: AtomicUsize,
 }
 
@@ -556,7 +556,7 @@ impl OwnedDownloadLanePool {
                 #[cfg(test)]
                 observer: None,
             })),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             reset_calls: AtomicUsize::new(0),
         };
         pool.resize(worker_count);
@@ -644,7 +644,7 @@ impl OwnedDownloadLanePool {
         lock_pool(&self.shared).live_workers()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn reset_calls(&self) -> usize {
         self.reset_calls.load(Ordering::Relaxed)
     }
@@ -652,7 +652,7 @@ impl OwnedDownloadLanePool {
     // Fence queued runs before workers can take another retired-client lease.
     // The actor returns these unstarted leases without charging article retries.
     pub(crate) fn reset(&self) -> StoppedOwnedLaneWork {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         self.reset_calls.fetch_add(1, Ordering::Relaxed);
         let mut shared = lock_pool(&self.shared);
         for worker in shared.workers.iter().flatten() {

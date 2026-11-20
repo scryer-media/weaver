@@ -69,75 +69,42 @@
 //
 // Files are indexed as the posts are listed; ordinals count from zero.
 
-#[cfg(test)]
-mod abandon_cost;
 pub mod accounting_fixture;
 mod actor_drive;
+pub mod archive_scenario_fixtures;
 pub mod caps;
-#[cfg(test)]
-mod dead_posts;
 pub mod depth;
 pub mod disk_archive;
+pub mod disk_move_fixture;
 pub mod disk_reserve;
-#[cfg(test)]
-mod disk_wait;
-#[cfg(test)]
-use archive_scenario_fixtures::download_summary;
-pub mod archive_scenario_fixtures;
-#[cfg(test)]
-mod extractor_claims;
-#[cfg(test)]
-mod first_article_sample;
+pub mod feed_fixtures;
 pub mod harness;
 pub mod rar_fixtures;
+pub mod recovery_actor;
 pub mod recovery_fixtures;
 pub mod restart_fixtures;
+pub mod restart_move_fixture;
+pub mod restart_regressions;
 mod state;
 
-#[cfg(test)]
-mod lent_handed;
-#[cfg(test)]
-mod lent_windows;
-#[cfg(test)]
-mod lifecycle;
+pub mod large_window_fixtures;
+pub mod lent_windows;
+pub mod lifecycle_fixture;
 pub mod loans;
-#[cfg(test)]
-mod pairings;
-#[cfg(test)]
-mod post_health_seats;
-#[cfg(test)]
-mod rar;
-#[cfg(test)]
-mod rar_rev;
-#[cfg(test)]
-mod recovery_duplicate_wire;
-#[cfg(test)]
-mod recovery_geometry_wire;
-#[cfg(test)]
-mod recovery_restart_wire;
-#[cfg(test)]
-mod refused_then_repaired;
-#[cfg(test)]
-mod remaining_par2;
-#[cfg(test)]
-mod remaining_stalls;
-#[cfg(test)]
-mod repaired_source;
-#[cfg(test)]
-pub(in crate::pipeline::tests) mod restart;
-#[cfg(test)]
-mod seek;
-#[cfg(test)]
-mod sets;
-#[cfg(test)]
-mod sevenz;
+pub mod post_health_seats;
+pub mod rar_actor;
+pub mod recovery_duplicate_wire;
+pub mod recovery_geometry_wire;
+pub mod recovery_restart_wire;
+pub mod refused_then_repaired;
+pub mod remaining_par2;
+pub mod remaining_stalls;
+pub mod repaired_source;
+pub mod seek;
+pub mod send_back_fixtures;
 pub mod sevenz_fixtures;
 pub mod sfv;
 pub mod spent_fixtures;
 pub mod stream_fixtures;
-#[cfg(test)]
-use stream_fixtures as streams;
-#[cfg(test)]
-mod too_large;
 pub mod wire_recovery;
 pub mod zip;

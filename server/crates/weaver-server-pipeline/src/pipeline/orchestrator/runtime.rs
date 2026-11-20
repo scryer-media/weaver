@@ -36,7 +36,7 @@ fn compute_uu_spool_max_segments(write_buf_max_pending: usize) -> usize {
 
 // Counts the decode results the actor heard while a restart's restores
 // still waited, so a test can pin that a restore does not hold them back.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) static DECODES_HEARD_RESTORING: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -333,7 +333,7 @@ impl Pipeline {
             graph_decode,
             graph_runs,
             graph_outside: Default::default(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             graph_mail_stamps: None,
             post_probes: Default::default(),
             nzb_admitted,
@@ -379,7 +379,7 @@ impl Pipeline {
             full_disk: std::collections::BTreeMap::new(),
             full_disk_moves: Vec::new(),
             archive_wait: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             full_disk_sweeps: Vec::new(),
             nntp_handoff_draining: false,
             active_download_passes: HashSet::new(),
@@ -418,7 +418,7 @@ impl Pipeline {
             uu_spool_min_free_bytes: UU_SPOOL_MIN_FREE_BYTES,
             #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             uu_spool_available_bytes_for_test: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             probe_waits_on_for_test: None,
             dirty_server_attribution: HashSet::new(),
             dirty_support_facts: HashSet::new(),
@@ -506,7 +506,7 @@ impl Pipeline {
             move_gates: Default::default(),
             propagation_ready_at: HashMap::new(),
             propagation_delay,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             propagation_delay_forced: None,
             #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             unservable_booking_depth: (0, 0),
@@ -613,7 +613,7 @@ impl Pipeline {
         F: FnOnce(&crate::Database) -> R + Send + 'static,
         R: Send + 'static,
     {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         actor_db::count(std::panic::Location::caller());
         let db = self.db.clone();
         async move {
@@ -1454,7 +1454,7 @@ impl Pipeline {
                                 hear!(5);
                                 turn_timer.resume(PipelinePhase::GraphRun);
                                 self.graph_run_said(said);
-                                #[cfg(test)]
+                                #[cfg(any(test, feature = "pipeline-test-fixtures"))]
                                 if let Some(stamps) = &self.graph_mail_stamps {
                                     let _ = stamps.send(
                                         turn_metrics.pipeline_turn.read(std::time::Instant::now()),
@@ -1483,7 +1483,7 @@ impl Pipeline {
                             Some(result) = self.decode_done_rx.recv(), if open!(10) => {
                                 hear!(10);
                                 turn_timer.resume(PipelinePhase::DecodeDone);
-                                #[cfg(test)]
+                                #[cfg(any(test, feature = "pipeline-test-fixtures"))]
                                 if restoring {
                                     DECODES_HEARD_RESTORING.fetch_add(1, Ordering::Relaxed);
                                 }
@@ -2526,7 +2526,7 @@ pub(crate) fn is_terminal_status(status: &JobStatus) -> bool {
 
 // Counts the database calls the actor awaits, by call site, so a test can
 // pin which turns make none.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) mod actor_db {
     use std::collections::BTreeMap;
     use std::sync::Mutex;

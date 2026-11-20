@@ -176,7 +176,7 @@ impl DispatchFixture {
         &mut self,
         lane_id: u64,
         segment_id: SegmentId,
-    ) -> ReleasedResults {
+    ) -> LaneResults {
         let mut pending = VecDeque::new();
         self.0.handle_owned_download_lane_event(
             OwnedDownloadLaneEvent::BatchComplete {
@@ -204,9 +204,9 @@ impl DispatchFixture {
             },
             &mut pending,
         );
-        ReleasedResults(pending)
+        LaneResults(pending)
     }
-    pub async fn process_released_result(&mut self, results: &mut ReleasedResults) {
+    pub async fn process_released_result(&mut self, results: &mut LaneResults) {
         self.0
             .process_released_download_done(results.0.pop_front().unwrap())
             .await;
@@ -225,27 +225,10 @@ impl DispatchFixture {
     pub fn set_active_decodes(&mut self, id: JobId, count: usize) {
         self.0.active_decodes_by_job.insert(id, count);
     }
-    pub fn lease_for_server(&mut self, server: usize) -> Option<Vec<DownloadWork>> {
-        self.0
-            .lease_for_server_for_test(server)
-            .map(|lease| lease.works)
-    }
     pub fn diagnostics(&self) -> diagnostics::PipelineDiagnostics {
         self.0.diagnostics_snapshot()
     }
     pub fn durable_lead_limit() -> u64 {
         Pipeline::restart_durable_lead_limit_bytes()
-    }
-}
-
-pub struct ReleasedResults(VecDeque<DownloadResult>);
-
-impl ReleasedResults {
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
     }
 }

@@ -5,7 +5,7 @@ use super::*;
 
 mod layout;
 mod worker;
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(in crate::pipeline) use worker::SegmentWriteError;
 
 // In-flight decode task count per job, with their sum kept beside them so the
@@ -15,7 +15,7 @@ pub(in crate::pipeline) use worker::SegmentWriteError;
 pub(crate) struct ActiveDecodes {
     by_job: HashMap<JobId, usize>,
     total: usize,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     walks: std::sync::atomic::AtomicU64,
 }
 
@@ -76,14 +76,14 @@ impl ActiveDecodes {
     }
 
     // Every job's count, one walk of the map.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(in crate::pipeline) fn values(&self) -> impl Iterator<Item = &usize> {
         self.walks
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.by_job.values()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(in crate::pipeline) fn walks(&self) -> u64 {
         self.walks.load(std::sync::atomic::Ordering::Relaxed)
     }

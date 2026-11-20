@@ -19,7 +19,7 @@ const PASSWORD: &str = "moonlit-harbour";
 
 // These are four explicit saved arrival sequences, not a schedule generator.
 #[derive(Clone, Copy, Debug)]
-enum Saved {
+pub enum Saved {
     Bare,
     Misnumbered,
     Swapped,
@@ -210,7 +210,7 @@ fn full_state(pipeline: &Pipeline) -> String {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Acknowledgments {
+pub enum Acknowledgments {
     Ready,
     Early,
     Deferred,
@@ -292,15 +292,11 @@ async fn arrive(
     pump_pipeline_runtime_queues(pipeline).await;
 }
 
-async fn saved_sequence(saved: Saved, metadata_true_size: bool) {
-    saved_with_acknowledgments(saved, metadata_true_size, Acknowledgments::Ready).await;
-}
-
-async fn saved_with_acknowledgments(
+pub async fn drive_saved_sequence(
     saved: Saved,
     metadata_true_size: bool,
     acknowledgments: Acknowledgments,
-) {
+) -> SavedRun {
     let fixture = fixture(saved);
     let root = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete) = new_direct_pipeline(&root).await;
@@ -397,62 +393,17 @@ async fn saved_with_acknowledgments(
     let mut output = BTreeMap::new();
     collect(&complete, &complete, &mut output);
     retire_pipeline_database(pipeline).await;
-    assert!(
-        stopped.is_none(),
-        "{saved:?} true_metadata={metadata_true_size}: {}",
-        stopped.unwrap_or_default()
-    );
-    if matches!(saved, Saved::Gap) {
-        assert!(
-            matches!(status, Some(JobStatus::Failed { .. })),
-            "{status:?}"
-        );
-    } else {
-        assert_eq!(status, Some(JobStatus::Complete));
-        assert!(output.values().any(|bytes| bytes == &fixture.expected));
+    SavedRun {
+        stopped,
+        status,
+        output,
+        expected: fixture.expected,
     }
 }
 
-#[tokio::test]
-async fn saved_bare_encrypted_sequence_has_a_terminal_owner() {
-    saved_sequence(Saved::Bare, false).await;
-}
-#[tokio::test]
-async fn saved_misnumbered_encrypted_sequence_has_a_terminal_owner() {
-    saved_sequence(Saved::Misnumbered, false).await;
-}
-#[tokio::test]
-async fn saved_swapped_encrypted_sequence_has_a_terminal_owner() {
-    saved_sequence(Saved::Swapped, false).await;
-}
-#[tokio::test]
-async fn saved_gap_encrypted_sequence_has_a_terminal_owner() {
-    saved_sequence(Saved::Gap, false).await;
-}
-#[tokio::test]
-async fn bare_encrypted_metadata_true_length_control() {
-    saved_sequence(Saved::Bare, true).await;
-}
-
-#[tokio::test]
-async fn bare_encrypted_sequence_acknowledges_each_early_loan() {
-    saved_with_acknowledgments(Saved::Bare, false, Acknowledgments::Early).await;
-}
-
-#[tokio::test]
-async fn bare_encrypted_sequence_defers_worker_acknowledgments_until_all_arrivals() {
-    saved_with_acknowledgments(Saved::Bare, false, Acknowledgments::Deferred).await;
-}
-
-#[tokio::test]
-async fn misnumbered_encrypted_sequence_defers_worker_acknowledgments_until_all_arrivals() {
-    saved_with_acknowledgments(Saved::Misnumbered, false, Acknowledgments::Deferred).await;
-}
-#[tokio::test]
-async fn swapped_encrypted_sequence_defers_worker_acknowledgments_until_all_arrivals() {
-    saved_with_acknowledgments(Saved::Swapped, false, Acknowledgments::Deferred).await;
-}
-#[tokio::test]
-async fn gap_encrypted_sequence_defers_worker_acknowledgments_until_all_arrivals() {
-    saved_with_acknowledgments(Saved::Gap, false, Acknowledgments::Deferred).await;
+pub struct SavedRun {
+    pub stopped: Option<String>,
+    pub status: Option<JobStatus>,
+    pub output: BTreeMap<String, Vec<u8>>,
+    pub expected: Vec<u8>,
 }

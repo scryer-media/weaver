@@ -167,7 +167,7 @@ pub(crate) struct ReadArticles {
     made_staging: Option<PathBuf>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 impl ReadArticles {
     // Whether the job was built again from its checkpoint.
     pub(crate) fn restored(&self) -> bool {

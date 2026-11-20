@@ -42,7 +42,7 @@ impl fmt::Debug for Passwords {
 }
 
 impl Passwords {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(super) fn new(candidates: Vec<String>) -> Self {
         Self {
             candidates,

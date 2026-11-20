@@ -51,7 +51,7 @@ impl Pipeline {
             return None;
         }
         let delay = self.propagation_delay;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         let delay = self.propagation_delay_forced.unwrap_or(delay);
         if delay.is_zero() {
             return None;

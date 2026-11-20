@@ -12,7 +12,7 @@ pub(crate) const NZB_SLOT_WAIT_REASON: &str = "nzb_slot";
 // How many candidates a walk looked at for a slot, or showed waiting for the
 // disk, on this thread, so a test can pin that a walk visits no more of a
 // long queue than its slots call for.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 thread_local! {
     pub(crate) static ADMISSION_VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
@@ -339,7 +339,7 @@ impl Pipeline {
                 && started.binary_search(key).is_err()
                 && *short.get_or_insert_with(|| self.admission_disk_short())
             {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "pipeline-test-fixtures"))]
                 ADMISSION_VISITS.with(|visits| visits.set(visits.get() + 1));
                 let slots = *slots.get_or_insert_with(|| self.admission_slots());
                 if !propagating.contains(&id)
@@ -405,7 +405,7 @@ impl Pipeline {
     // The candidate takes a slot if one is free. False once none is, which
     // ends the walk's admissions.
     fn admit_candidate(&mut self, id: JobId, propagating: &HashSet<JobId>) -> bool {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         ADMISSION_VISITS.with(|visits| visits.set(visits.get() + 1));
         // A settings edit or global hold can arrive while the previous
         // acquisition awaits its durable commit. Re-read before admitting

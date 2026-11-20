@@ -3,6 +3,8 @@
 
 mod pipeline {
     mod tests {
+        mod dispatch_order;
+        mod next_up_ring;
         mod queue_scale;
     }
 }

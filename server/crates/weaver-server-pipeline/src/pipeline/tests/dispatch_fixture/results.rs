@@ -3,6 +3,18 @@
 
 use super::*;
 
+pub struct LaneResults(pub(super) VecDeque<DownloadResult>);
+
+impl LaneResults {
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 // Hand `segments` to lane 0 as a dispatched lease would, so the result a
 // test then injects from lane 0 releases an article a lane holds.
 pub(in crate::pipeline::tests) fn hold_on_test_lane(

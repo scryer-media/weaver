@@ -173,10 +173,6 @@ impl DispatchFixture {
             .record_failure(server, auth);
     }
 
-    pub fn set_retention_client(&mut self, days: &[u32]) {
-        self.set_client(retention_client(days));
-    }
-
     pub fn server_may_serve(
         &self,
         server: usize,

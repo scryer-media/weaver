@@ -458,7 +458,7 @@ impl Probes {
 
     // A round of `batches` batches out for the job, numbered `round`, every
     // one seated on a lane at `seated_at`, as the dispatch pass seats them.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn seat_round_for_test(
         &mut self,
         job_id: JobId,
@@ -605,7 +605,7 @@ pub(crate) enum Gate {
 // sample that reaches the share with articles outstanding has the verdict
 // the complete sample would have, and one that cannot reach it even were
 // every outstanding article lost has let the post through.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) fn first_article_gate(heads: impl IntoIterator<Item = Head>) -> Gate {
     let mut total = 0;
     let mut lost = 0;
@@ -783,7 +783,7 @@ impl Pipeline {
     // The first article of each file the post names, its first segment:
     // lost when every server failed it, settled when the root holds it or
     // it ended some other way, and otherwise still to come.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     fn first_article(&self, job_id: JobId, index: u32, file: &FileSpec) -> Head {
         let first = file.segments.iter().map(|segment| segment.ordinal).min();
         self.first_article_head(job_id, index, first)
@@ -792,7 +792,7 @@ impl Pipeline {
     // Where the first article of the file at `index` stands, `first` its
     // ordinal, `None` for a file with no articles.
     fn first_article_head(&self, job_id: JobId, index: u32, first: Option<u32>) -> Head {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         HEADS_READ.with(|read| read.set(read.get() + 1));
         let Some(first) = first else {
             return Head::Settled;
@@ -1017,7 +1017,7 @@ impl Pipeline {
 
     // The verdict as it is reached by walking every file of the post: what
     // the kept sample must always agree with.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(in crate::pipeline) fn post_health_verdict_walked(&self, job_id: JobId) -> Option<String> {
         if self.post_probes.dead.contains_key(&job_id) {
             return None;
@@ -1119,7 +1119,7 @@ impl Pipeline {
     }
 
     // The recovery the line is drawn from, by a walk of every posted file.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     fn recovery_walked(&self, job_id: JobId, spec: &JobSpec) -> u64 {
         let graph = self.graph_jobs.get(&job_id);
         (0u32..)
@@ -1134,7 +1134,7 @@ impl Pipeline {
 
     // The job's sample as the feed keeps it, and as a whole read of the post
     // finds it now.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(in crate::pipeline) fn first_articles_kept_and_read(
         &self,
         job_id: JobId,
@@ -1402,7 +1402,7 @@ impl Pipeline {
     // and a lane on a server held back from new connections is never
     // yielded, since no batch may take its seat.
     pub(in crate::pipeline) fn probe_waits_for_seat_on(&self, server: usize) -> bool {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         if self.probe_waits_on_for_test == Some(server) {
             return true;
         }
@@ -1685,7 +1685,7 @@ impl Pipeline {
         // earlier decisions, never this decision without its refusals.
         verdict.abandoned_files = lost;
         self.post_probes.verdicts.insert(job_id, verdict);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         count_abandon_work(|work| work.checkpoints += 1);
         self.checkpoint_graph_job(job_id);
         self.update_queue_metrics();
@@ -1718,7 +1718,7 @@ impl Pipeline {
             .jobs
             .get_mut(&job_id)
             .and_then(|state| state.articles.active_mut())?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         count_abandon_work(|work| {
             work.passes += 1;
             work.lost_files += lost.len();
@@ -1734,46 +1734,46 @@ impl Pipeline {
 // What abandoning a dead post's files cost on this thread, counted as it is
 // done: the passes that weighed the post, the queued items their walks read,
 // the files their lost sets held, and the checkpoints they took.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(in crate::pipeline) struct AbandonWork {
-    pub(in crate::pipeline) passes: usize,
-    pub(in crate::pipeline) scanned: usize,
-    pub(in crate::pipeline) lost_files: usize,
-    pub(in crate::pipeline) checkpoints: usize,
+pub struct AbandonWork {
+    pub passes: usize,
+    pub scanned: usize,
+    pub lost_files: usize,
+    pub checkpoints: usize,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 thread_local! {
     static ABANDON_WORK: std::cell::Cell<AbandonWork> =
         const { std::cell::Cell::new(AbandonWork { passes: 0, scanned: 0, lost_files: 0, checkpoints: 0 }) };
 }
 
 // The first-article heads read on this thread.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 thread_local! {
     static HEADS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(in crate::pipeline) fn heads_read() -> usize {
     HEADS_READ.with(std::cell::Cell::get)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(in crate::pipeline) fn abandon_work() -> AbandonWork {
     ABANDON_WORK.with(std::cell::Cell::get)
 }
 
 // The terminal states booked on this thread, in the order they were booked,
 // once a test asks for them to be kept.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 thread_local! {
     static BOOKED: std::cell::RefCell<Option<Vec<(SegmentId, SegmentTerminalState)>>> =
         const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(in crate::pipeline) fn note_booked(segment: SegmentId, state: SegmentTerminalState) {
     BOOKED.with(|booked| {
         if let Some(booked) = booked.borrow_mut().as_mut() {
@@ -1784,12 +1784,12 @@ pub(in crate::pipeline) fn note_booked(segment: SegmentId, state: SegmentTermina
 
 // Keep the terminal states booked on this thread from now on, and give back
 // the ones kept until now.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(in crate::pipeline) fn keep_booked() -> Vec<(SegmentId, SegmentTerminalState)> {
     BOOKED.with(|booked| booked.replace(Some(Vec::new())).unwrap_or_default())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 fn count_abandon_work(count: impl FnOnce(&mut AbandonWork)) {
     ABANDON_WORK.with(|cell| {
         let mut work = cell.get();

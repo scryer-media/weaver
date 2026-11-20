@@ -2,6 +2,33 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 pub mod dead_posts {
+    use super::super::harness::{JOB, Scenario, serve};
+    use crate::pipeline::tests::hear_graph_mail;
+    use crate::pipeline::{Pipeline, graph::root::phase::RootPhase, post_health::ProbeState};
+
+    pub fn prepare_probe(pipeline: &mut Pipeline) {
+        pipeline.post_probes.states.insert(
+            JOB,
+            ProbeState {
+                rounds: 1,
+                ..Default::default()
+            },
+        );
+    }
+
+    pub async fn serve_and_hear(pipeline: &mut Pipeline, scenario: &Scenario, article: (u32, u32)) {
+        serve(pipeline, scenario, article).await;
+        hear_graph_mail(pipeline, JOB).await;
+    }
+
+    pub fn probe_state(pipeline: &Pipeline) -> (bool, bool, bool) {
+        (
+            pipeline.graph_jobs[&JOB].phase() == RootPhase::Done,
+            pipeline.jobs.contains_key(&JOB),
+            pipeline.post_probes.states.contains_key(&JOB),
+        )
+    }
+
     use super::super::harness::*;
 
     // Twelve files of four articles each.

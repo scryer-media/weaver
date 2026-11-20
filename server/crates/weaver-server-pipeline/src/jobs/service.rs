@@ -790,14 +790,6 @@ impl Pipeline {
             .await
     }
 
-    #[cfg(test)]
-    pub(crate) async fn redownload_job(
-        &mut self,
-        job_id: JobId,
-    ) -> Result<(), crate::SchedulerError> {
-        self.redownload_job_with_password(job_id, None).await
-    }
-
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) async fn redownload_job_with_password(
         &mut self,
@@ -1647,7 +1639,7 @@ pub(crate) enum InstallEntry {
 }
 
 // The outlines read for restores that were not installed to read them.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) static OUTLINE_ONLY_READS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -1661,7 +1653,7 @@ pub(crate) fn read_outline(
     request: &mut RestoreJobRequest,
 ) -> Result<(), UnreadOutline> {
     let (spec, summaries) = read_unread_outline(db, request.job_id)?;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     OUTLINE_ONLY_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     request.spec = spec;
     if let Some(read) = request.restart.as_mut() {

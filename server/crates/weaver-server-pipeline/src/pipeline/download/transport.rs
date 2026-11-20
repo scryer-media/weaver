@@ -520,19 +520,19 @@ impl ServerPipelineExplorer {
     }
 
     // The server is on the one trial a lapsed pin gets.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn on_pin_trial(&self) -> bool {
         self.pin_trial
     }
 
     // The lane running the trial, if one has taken it.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn pin_trial_lane(&self) -> Option<u64> {
         self.pin_trial_lane
     }
 
     // A pipelining server whose pin has lapsed into its trial.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn on_a_lapsed_pin_trial(now: Instant) -> Self {
         let mut explorer = Self::seeded(Some(2), None, None);
         explorer.note_supports_pipelining(true);

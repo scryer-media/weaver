@@ -654,7 +654,7 @@ impl Pipeline {
     // the loop and counted on its volume, as an accepted lane result is
     // (`Self::accept_lane_result`), for fixtures that book results no lane
     // returned.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn note_arrived_result_for_test(&mut self, job_id: JobId, bytes: u64) {
         self.note_released_download_result_pending(job_id, bytes);
         self.note_volume_arrived(job_id, bytes);
@@ -662,7 +662,7 @@ impl Pipeline {
 
     // The loop hands on one waiting result of the job of `bytes` whose
     // writes took nothing, as `process_released_download_done` does.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn hand_on_result_for_test(&mut self, job_id: JobId, bytes: u64) {
         let credit = self.arm_volume_credit(job_id, bytes);
         self.settle_volume_credit(credit);

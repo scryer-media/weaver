@@ -23,7 +23,7 @@ use crate::pipeline::tests::{
 };
 use crate::pipeline::{Pipeline, PipelineEvent};
 
-pub(super) fn backlog_base_bytes() -> usize {
+pub fn backlog_base_bytes() -> usize {
     16 * 1024 * 1024
 }
 
@@ -269,7 +269,7 @@ pub(in crate::pipeline::tests) async fn run_restarting_at_inspecting(
 // scenario's `first` it holds, else its next, or with `together` the one
 // whose turn comes first, a turn of each named post at a time; the rest stay
 // queued.
-pub(super) fn next_work(pipeline: &mut Pipeline, scenario: &Scenario) -> Option<DownloadWork> {
+pub fn next_work(pipeline: &mut Pipeline, scenario: &Scenario) -> Option<DownloadWork> {
     let crate::jobs::model::JobState { articles, spec, .. } = pipeline.jobs.get_mut(&JOB)?;
     let queue = &mut articles.active_mut().unwrap().download_queue;
     if scenario.together.is_empty() && scenario.first.is_empty() {
@@ -469,6 +469,54 @@ pub fn with_par2(mut posts: Vec<Post>, blocks: u32) -> Vec<Post> {
 pub struct CheckpointView<'a>(&'a crate::jobs::graph_checkpoint::GraphCheckpoint);
 
 impl CheckpointView<'_> {
+    pub fn member_crc32<'a>(&'a self, name: &'a str) -> impl Iterator<Item = Option<i64>> + 'a {
+        self.0
+            .members
+            .iter()
+            .filter(move |member| member.name == name)
+            .map(|member| member.crc32)
+    }
+
+    pub fn checkpoint_blobs(&self) -> Vec<Vec<u8>> {
+        let mut blobs: Vec<Vec<u8>> = Vec::new();
+        for node in &self.0.nodes {
+            blobs.push(node.facts.clone());
+            blobs.extend(node.volumes.iter().cloned());
+            blobs.push(node.kind.as_bytes().to_vec());
+            blobs.extend(node.reason.iter().map(|reason| reason.as_bytes().to_vec()));
+            blobs.extend(
+                node.winning_password
+                    .iter()
+                    .map(|index| index.to_le_bytes().to_vec()),
+            );
+        }
+        for member in &self.0.members {
+            blobs.push(member.name.as_bytes().to_vec());
+            blobs.push(member.output_name.as_bytes().to_vec());
+        }
+        for crypt in &self.0.crypt {
+            blobs.push(crypt.seed.clone());
+        }
+        for part in &self.0.parts {
+            blobs.push(part.bytes.to_vec());
+        }
+        blobs
+    }
+
+    pub fn member_in_root(&self, name: &str) -> Option<(bool, bool, String)> {
+        let row = self
+            .0
+            .members
+            .iter()
+            .find(|row| row.node == 0 && row.name == name)?;
+        Some((row.buried, row.owner.is_none(), format!("{row:?}")))
+    }
+
+    pub fn feed_verdict(&self) -> Option<(&str, &BTreeSet<u32>)> {
+        let verdict = self.0.feed_verdict.as_ref()?;
+        Some((verdict.reason.as_str(), &verdict.abandoned_files))
+    }
+
     pub fn member_provenance(&self, name: &str) -> Option<Vec<&str>> {
         let member = self.0.members.iter().find(|row| row.name == name)?;
         Some(
@@ -683,4 +731,93 @@ pub fn repairs_and_end(events: &[PipelineEvent]) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+// The job served as `run` serves it, and the pipeline taken down once, the
+// first time the tree is done with its repair announced and the job's next
+// completion check, which starts the move, has not run.
+pub async fn run_restarted_once_done(scenario: &Scenario) -> RestartedDone {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) =
+        new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
+    scenario.prepare(&mut pipeline);
+    insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
+    let mut sent = pipeline.event_tx.subscribe();
+    let mut events = Vec::new();
+    let mut in_memory = BTreeSet::new();
+    let mut restarted = false;
+    let mut quiet = 0;
+    let mut asked = 0usize;
+    loop {
+        while let Some(work) = next_work(&mut pipeline, scenario) {
+            let article = (
+                work.segment_id.file_id.file_index,
+                work.segment_id.segment_number,
+            );
+            asked += 1;
+            super::harness::serve(&mut pipeline, scenario, article).await;
+        }
+        if finished(&pipeline) {
+            break;
+        }
+        // Down once the repair is announced and before the job's next
+        // completion check starts its move.
+        drain(&mut sent, &mut events);
+        let announced = events.iter().any(
+            |event| matches!(event, PipelineEvent::RepairComplete { job_id, .. } if *job_id == JOB),
+        );
+        let done = pipeline
+            .graph_jobs
+            .get(&JOB)
+            .is_some_and(|job| job.phase() == crate::pipeline::graph::root::phase::RootPhase::Done);
+        if !restarted && announced && done {
+            (pipeline, sent) =
+                restart_heard(&temp_dir, pipeline, scenario, &mut in_memory, &mut |_| {}).await;
+            restarted = true;
+            continue;
+        }
+        let before = asked;
+        if pipeline.jobs.contains_key(&JOB) {
+            pipeline.check_job_completion(JOB).await;
+        }
+        pump_pipeline_runtime_queues(&mut pipeline).await;
+        if finished(&pipeline) {
+            break;
+        }
+        if pipeline
+            .graph_jobs
+            .get(&JOB)
+            .is_some_and(|job| job.awaits_mail())
+        {
+            let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
+            pipeline.graph_run_said(said);
+            continue;
+        }
+        if asked == before {
+            quiet += 1;
+            assert!(
+                quiet < 3,
+                "restarted job stalled at {:?}",
+                job_status_for_assert(&pipeline, JOB)
+            );
+        } else {
+            quiet = 0;
+        }
+    }
+    assert!(restarted, "the tree was done before the job finished");
+    let status = job_status_for_assert(&pipeline, JOB);
+    pipeline.db.flush_write_queue().await.unwrap();
+    drain(&mut sent, &mut events);
+    let mut files = BTreeMap::new();
+    collect(&complete_dir, &complete_dir, &mut files);
+    retire_pipeline_database(pipeline).await;
+    RestartedDone {
+        status,
+        files,
+        events,
+    }
+}
+
+pub fn member_check_bytes() -> u64 {
+    crate::pipeline::graph::namespace::checked::so_far()
 }

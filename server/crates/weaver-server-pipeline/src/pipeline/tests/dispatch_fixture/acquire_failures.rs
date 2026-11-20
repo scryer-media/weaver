@@ -10,23 +10,11 @@ pub const DISPATCH_STALL_LOG_INTERVAL: Duration =
     crate::pipeline::download::DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL;
 pub const RETRY_STORM_THRESHOLD: u64 = crate::pipeline::download::DOWNLOAD_RETRY_STORM_THRESHOLD;
 
-pub struct AcquireLease(DownloadBatchLease);
+pub struct AcquireLease(pub(super) DownloadBatchLease);
 
 impl AcquireLease {
     pub fn works(&self) -> &[DownloadWork] {
         &self.0.works
-    }
-}
-
-pub struct RefusalResults(VecDeque<DownloadResult>);
-
-impl RefusalResults {
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
     }
 }
 
@@ -103,7 +91,7 @@ impl DispatchFixture {
         &mut self,
         lease: AcquireLease,
         error: BlockingBodyLaneAcquireError,
-    ) -> RefusalResults {
+    ) -> LaneResults {
         let mut pending = VecDeque::new();
         self.0.handle_owned_download_lane_event(
             OwnedDownloadLaneEvent::AcquireFailed {
@@ -112,10 +100,10 @@ impl DispatchFixture {
             },
             &mut pending,
         );
-        RefusalResults(pending)
+        LaneResults(pending)
     }
 
-    pub async fn hear_refused_acquires(&mut self, mut pending: RefusalResults) {
+    pub async fn hear_refused_acquires(&mut self, mut pending: LaneResults) {
         while let Some(result) = pending.0.pop_front() {
             self.0.handle_download_done(result).await;
         }

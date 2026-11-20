@@ -392,7 +392,7 @@ impl GraphJob {
     }
 
     // The candidates offered to an object that asks for a password.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn offering(mut self, candidates: Vec<String>) -> Self {
         self.passwords = Passwords::new(candidates);
         self
@@ -448,7 +448,7 @@ impl GraphJob {
             })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn current_repair(&self, said: &Said) -> bool {
         said.scope == self.runs.scope() && self.loans.current_repair(said.node, said.generation)
     }
@@ -780,7 +780,7 @@ impl GraphJob {
         self.writer.disk()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn move_disk_for_test(&mut self, disk: super::disk::JobDisk) {
         self.writer.move_disk_for_test(disk);
     }

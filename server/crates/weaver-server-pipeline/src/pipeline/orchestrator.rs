@@ -15,13 +15,13 @@ mod scripts;
 mod state;
 
 pub(super) use commands::{CancelJobsDone, CancelledJobCleanup};
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(super) use control::RESTORE_BATCH;
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+pub(super) use runtime::PERIODIC_TICKS;
 pub(crate) use runtime::is_terminal_status;
 pub(super) use runtime::timestamp_secs;
 #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-pub(super) use runtime::PERIODIC_TICKS;
-#[cfg(test)]
 pub(super) use runtime::{DECODES_HEARD_RESTORING, actor_db};
 #[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(super) use runtime::{compute_decode_backlog_budget_bytes, compute_write_backlog_budget_bytes};

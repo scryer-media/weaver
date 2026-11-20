@@ -9,7 +9,7 @@ pub const UNCLEAN_BURST_WINDOW: Duration =
     crate::pipeline::download::transport::UNCLEAN_BURST_WINDOW;
 
 #[derive(Clone, Copy)]
-pub struct Pressure(DownloadPressure);
+pub struct Pressure(pub(super) DownloadPressure);
 
 impl DispatchFixture {
     pub fn seed_explorers(&mut self, client: NntpClient) {

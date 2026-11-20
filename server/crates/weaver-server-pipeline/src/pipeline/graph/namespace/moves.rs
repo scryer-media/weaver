@@ -73,7 +73,7 @@ pub(crate) fn restored_at<'a>(
 // changed files the kept count read again (`Kept`), on this thread: a job's
 // writer runs on its pipeline's thread, so a test reads its own job's,
 // across every writer a restart makes.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Tally {
     pub(crate) waiting_opens: u64,
@@ -82,12 +82,12 @@ pub(crate) struct Tally {
     pub(crate) kept: u64,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 thread_local! {
     pub(crate) static TALLY: std::cell::Cell<Tally> = std::cell::Cell::default();
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 fn count(change: impl FnOnce(&mut Tally)) {
     TALLY.with(|tally| {
         let mut now = tally.get();
@@ -257,7 +257,7 @@ impl NamespaceWriter {
         if !held_off && self.free_for_new(name, (node, member)) {
             return Leaf::at(root, name).through(to.as_ref());
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         count(|tally| tally.waiting_opens += 1);
         let waiting = waiting_name(
             self.envelopes.given(),
@@ -523,7 +523,7 @@ impl NamespaceWriter {
                 .files
                 .get_mut(&waiting.node)
                 .and_then(|files| files.leaves.get_mut(&waiting.member));
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             if leaf.as_ref().is_some_and(|leaf| leaf.on_disk()) {
                 count(|tally| tally.moves += 1);
             }
@@ -749,7 +749,7 @@ impl Held {
         let mut held = Self::default();
         for files in writer.files.values() {
             for leaf in files.leaves.values() {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "pipeline-test-fixtures"))]
                 count(|tally| tally.weighed += 1);
                 for name in std::iter::once(leaf.name()).chain(leaf.wants()) {
                     held.add(name, 1);
@@ -885,7 +885,7 @@ impl Kept {
                 if leaf == before {
                     continue;
                 }
-                #[cfg(test)]
+                #[cfg(any(test, feature = "pipeline-test-fixtures"))]
                 count(|tally| tally.kept += 1);
                 if let Some((name, wants)) = kept.names.remove(&member) {
                     self.held.add(&name, -1);

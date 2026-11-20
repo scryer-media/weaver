@@ -175,6 +175,10 @@ impl ActivationReply {
         self.0.moved_to.as_deref()
     }
 
+    pub fn is_restored(&self) -> bool {
+        self.0.result.as_ref().is_ok_and(|read| read.restored())
+    }
+
     pub fn take_moved_dir(&self, pipeline: &mut Pipeline) -> bool {
         pipeline.take_moved_dir(
             self.0.job_id,

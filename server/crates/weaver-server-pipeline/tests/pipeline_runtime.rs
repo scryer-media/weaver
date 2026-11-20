@@ -3,11 +3,19 @@
 
 mod pipeline {
     mod tests {
+        mod archive_output_contract;
         mod archive_passwords;
         mod archive_topology;
         mod bandwidth_split;
         mod core;
         mod full_file_names;
+        mod hardware_profile;
+        mod idle;
+        mod memory_release;
+        mod post_processing_pause;
+        mod provider_scheduling;
+        mod server_attribution;
+        mod terminal_settlement;
         mod direct_store {
             mod scenarios {
                 mod sevenz_store;

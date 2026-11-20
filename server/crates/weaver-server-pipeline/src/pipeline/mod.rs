@@ -53,8 +53,6 @@ use tracing::{debug, error, info, warn};
 
 #[cfg(any(test, feature = "pipeline-test-fixtures"))]
 use crate::RestoreJobRequest;
-#[cfg(test)]
-use crate::jobs::assembly::JobAssembly;
 use crate::jobs::{ArchivePasswordCandidate, ArchivePasswordSource};
 use crate::jobs::{JobPhase, PhaseCounters};
 use crate::{
@@ -1696,7 +1694,7 @@ pub struct Pipeline {
     pub(super) graph_outside: Arc<graph::engine::Outside>,
     // Where a test hears the turn stamp as the select arm handling graph mail
     // left it, so the stamp of a turn woken by that mail can be pinned.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(super) graph_mail_stamps: Option<
         tokio::sync::mpsc::UnboundedSender<
             weaver_server_base::operations::instrumentation::PipelineTurnReading,
@@ -1832,7 +1830,7 @@ pub struct Pipeline {
     pub(super) archive_wait: Option<full_disk::ArchiveWait>,
     // The removals of spool files a held job no longer reads, for a test to
     // wait on.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(super) full_disk_sweeps: Vec<tokio::task::JoinHandle<()>>,
     // A `RebuildNntp` has activated a new pool whose predecessor still holds
     // sockets at the provider. Fresh dials wait until the old generation has
@@ -2111,7 +2109,7 @@ pub struct Pipeline {
     pub(super) propagation_ready_at: HashMap<JobId, (Instant, i64)>,
     // Configured minimum post age, updated through the scheduler command channel.
     pub(super) propagation_delay: Duration,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(super) propagation_delay_forced: Option<Duration>,
     // How deep the unservable-article booking is nested in itself now, and
     // the deepest it has been.
@@ -2247,7 +2245,7 @@ pub struct Pipeline {
     // Test-only free-space reading; `Some(None)` exercises a filesystem that
     // has never produced a reading.
     pub(super) uu_spool_available_bytes_for_test: Option<Option<u64>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     // Test-only: a health probe batch waits for a seat on this server.
     pub(super) probe_waits_on_for_test: Option<usize>,
     // Sequential-assembly state for uuencode files, created on the first

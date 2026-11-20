@@ -23,7 +23,6 @@ use weaver_server_net::proxies::route_health;
 mod routed_http;
 mod runtime;
 mod socket_ledger;
-use weaver_server_net::proxies::weighted;
 pub use dns::*;
 pub use fault::{ProxyFault, ProxyTestPass, fault_params};
 pub use interfaces::*;
@@ -43,4 +42,5 @@ pub use routed_http::{
 pub(crate) use routed_http::{direct_runtime, outbound_only_through};
 pub use runtime::*;
 pub use socket_ledger::*;
+use weaver_server_net::proxies::weighted;
 pub use weighted::*;

@@ -6,7 +6,7 @@ use super::super::{JobId, JobStatus, Pipeline, job_status_for_assert};
 // Every run is its own pipeline, so one id serves every scenario.
 pub const JOB: JobId = JobId(93_001);
 
-pub(in crate::pipeline::tests) fn finished(pipeline: &Pipeline) -> bool {
+pub fn finished(pipeline: &Pipeline) -> bool {
     matches!(
         job_status_for_assert(pipeline, JOB),
         Some(JobStatus::Complete | JobStatus::Partial | JobStatus::Failed { .. }) | None

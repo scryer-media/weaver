@@ -29,7 +29,5 @@ pub mod test_run;
 
 #[cfg(test)]
 mod executor_tests;
-#[cfg(all(test, unix))]
-pub(crate) use weaver_server_postproc::post_processing::runner_fixtures as runner_tests;
 #[cfg(test)]
 mod settings_tests;

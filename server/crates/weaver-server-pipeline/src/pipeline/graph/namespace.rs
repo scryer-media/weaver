@@ -471,7 +471,7 @@ impl NamespaceWriter {
 
     // The job's files are written through `disk` from here, as a job whose
     // working volume changed.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn move_disk_for_test(&mut self, disk: crate::pipeline::graph::disk::JobDisk) {
         self.envelopes
             .write_through(Some(Arc::clone(disk.working())));
@@ -4097,16 +4097,16 @@ mod recovery;
 mod refusal;
 mod verification;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) use verification::checked;
 pub(crate) use verification::{Verification, Verified};
 
 pub(crate) use loan::replay::{Replay, Replayed};
 pub(crate) use loan::rewalk::{RewalkLoan, Rewalked};
 pub(crate) use loan::{Loan, Returned};
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+pub(crate) use moves::TALLY;
 pub(crate) use moves::restored_at;
-#[cfg(test)]
-pub(crate) use moves::{TALLY, Tally};
 pub(crate) use recovery::{Coming, Lender, SetState};
 pub(crate) use refusal::GivingUp;
 #[cfg(test)]

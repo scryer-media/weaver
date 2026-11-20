@@ -718,3 +718,72 @@ async fn a_post_given_up_under_a_listing_beside_lost_recovery_fails() {
         graph.failure
     );
 }
+
+#[tokio::test]
+async fn committed_feed_verdict_survives_restart_without_fetching_abandoned_files() {
+    let first: Vec<_> = (0..10).map(|file| (file, 0)).collect();
+    let scenario = (0..10).fold(Scenario::new(files()).first(&first), |scenario, file| {
+        scenario.lost(file, 0)
+    });
+    let mut committed = false;
+    let restarted = super::restart::run_restarting_at(
+        &scenario,
+        &mut |rows| {
+            let (reason, abandoned) = rows
+                .feed_verdict()
+                .expect("the crash follows a committed feed verdict");
+            assert!(reason.contains("first articles are missing"));
+            assert_eq!(*abandoned, (0..10).collect());
+            committed = true;
+        },
+        super::restart::Down::Crash,
+        &|asked| asked == 10,
+    )
+    .await;
+    assert!(committed);
+    assert_eq!(restarted.restarts, 1);
+    assert_eq!(restarted.status, Some(JobStatus::Partial));
+    for file in 0..10 {
+        let fetched: Vec<_> = restarted
+            .order
+            .iter()
+            .copied()
+            .filter(|(index, _)| *index == file)
+            .collect();
+        assert_eq!(fetched, vec![(file, 0)], "abandoned file {file} restarted");
+    }
+    for file in 10..12u8 {
+        let suffix = format!("lantern{file:02}.mkv");
+        let (_, delivered) = restarted
+            .files
+            .iter()
+            .find(|(name, _)| name.ends_with(&suffix))
+            .expect("healthy files still finish");
+        assert_eq!(*delivered, payload(4 * ARTICLE, file));
+    }
+}
+
+// A job whose root is done has nothing downloading for the feed's health
+// probe to rule on, so the feed forgets its probe as the job leaves the root,
+// while the job itself is still in the pipeline.
+#[tokio::test]
+async fn the_feed_forgets_its_probe_when_the_job_leaves_the_root() {
+    use weaver_server_pipeline::pipeline::tests::engines::recovery_fixtures::dead_posts::{
+        prepare_probe, probe_state, serve_and_hear,
+    };
+    use weaver_server_pipeline::pipeline::tests::retire_pipeline_database;
+
+    let post = Post::plain("lantern.mkv", payload(4 * ARTICLE, 7));
+    let articles = post.bytes.len().div_ceil(ARTICLE) as u32;
+    let scenario = Scenario::new(vec![post]);
+    let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
+    prepare_probe(&mut pipeline);
+    for ordinal in 0..articles {
+        serve_and_hear(&mut pipeline, &scenario, (0, ordinal)).await;
+    }
+    let (root_done, job_kept, probe_kept) = probe_state(&pipeline);
+    assert!(root_done);
+    assert!(job_kept);
+    assert!(!probe_kept);
+    retire_pipeline_database(pipeline).await;
+}

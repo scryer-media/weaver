@@ -57,7 +57,7 @@ pub struct SharedPipelineState {
     // write lock: clearing a block that is not there, which the pipeline
     // asks on every article, takes no lock.
     egress_quota_blocked: Arc<AtomicBool>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     egress_quota_block_locks: Arc<AtomicU64>,
     proxy_runtime: Arc<RwLock<Option<Arc<crate::proxies::ProxyRuntime>>>>,
     server_transfer_policy:
@@ -117,7 +117,7 @@ impl SharedPipelineState {
             shutdown_started: Arc::new(AtomicBool::new(false)),
             egress_quota_block: Arc::new(RwLock::new(None)),
             egress_quota_blocked: Arc::new(AtomicBool::new(false)),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             egress_quota_block_locks: Arc::new(AtomicU64::new(0)),
             proxy_runtime: Arc::new(RwLock::new(None)),
             server_transfer_policy: Arc::new(RwLock::new(None)),
@@ -600,7 +600,7 @@ impl SharedPipelineState {
         if block.is_none() && !self.egress_quota_blocked.load(Ordering::Acquire) {
             return;
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         self.egress_quota_block_locks
             .fetch_add(1, Ordering::Relaxed);
         if *self.egress_quota_block.read().unwrap() == block {
@@ -620,7 +620,7 @@ impl SharedPipelineState {
     }
 
     // How many times setting the egress block took its lock.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn egress_quota_block_lock_count(&self) -> u64 {
         self.egress_quota_block_locks.load(Ordering::Relaxed)
     }

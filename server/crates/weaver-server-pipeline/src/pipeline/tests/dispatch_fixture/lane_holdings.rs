@@ -3,9 +3,13 @@
 
 use super::*;
 
-pub struct LaneLease(DownloadBatchLease);
+pub struct LaneLease(pub(super) DownloadBatchLease);
 
 impl LaneLease {
+    pub fn job_id(&self) -> JobId {
+        self.0.job_id
+    }
+
     pub fn id(&self) -> u64 {
         self.0.lane_id
     }

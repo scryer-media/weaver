@@ -87,6 +87,17 @@ pub mod embedded {
 }
 
 pub mod pairings {
+    pub async fn capped_summary(
+        scenario: &super::super::harness::Scenario,
+        cap: usize,
+    ) -> crate::jobs::download_summary::DownloadSummary {
+        use crate::pipeline::graph::summary::NODES_KEPT_HERE;
+        let previous = NODES_KEPT_HERE.with(|kept| kept.replace(cap));
+        let outcome = super::super::harness::run(scenario).await;
+        NODES_KEPT_HERE.with(|kept| kept.set(previous));
+        super::download_summary::summary(&outcome)
+    }
+
     use super::super::harness::{ARTICLE, Post, Scenario, payload};
     use super::super::sevenz_fixtures::store::SECRET;
     use crate::pipeline::tests::direct_store::scenarios::{
@@ -329,6 +340,11 @@ pub mod rar_rev {
 }
 
 pub mod sets {
+    pub fn namespace_move_counts() -> (u64, u64) {
+        let tally = crate::pipeline::graph::namespace::TALLY.with(std::cell::Cell::get);
+        (tally.moves, tally.waiting_opens)
+    }
+
     use super::super::harness::Outcome;
     use std::collections::BTreeMap;
 

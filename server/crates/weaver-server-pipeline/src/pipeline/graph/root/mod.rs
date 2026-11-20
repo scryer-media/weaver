@@ -19,7 +19,7 @@ pub(crate) mod intake;
 pub(crate) mod phase;
 pub(crate) mod sample;
 mod seams;
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) use seams::{DISK_WAIT_LOOKS, DISK_WAITS_SAID};
 pub(crate) mod source;
 pub(crate) mod window;

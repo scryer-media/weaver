@@ -19,7 +19,7 @@ const ARTICLE: usize = 768;
 const SLICE: usize = 1048;
 
 #[derive(Clone, Copy)]
-enum Shape {
+pub enum Shape {
     TruncatedMiddle,
     WrongFinalLength { mixed: bool },
     // The truncated article of `TruncatedMiddle`, posted right behind the
@@ -288,7 +288,7 @@ async fn article(pipeline: &mut Pipeline, fixture: &Fixture, file: u32, ordinal:
     pump_pipeline_runtime_queues(pipeline).await;
 }
 
-async fn witness(shape: Shape) {
+pub async fn drive_wire(shape: Shape) -> Witness {
     let fixture = Fixture::new(shape);
     let root = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete) = new_direct_pipeline(&root).await;
@@ -388,40 +388,17 @@ async fn witness(shape: Shape) {
     let mut files = BTreeMap::new();
     harness::collect(&complete, &complete, &mut files);
     retire_pipeline_database(pipeline).await;
-    assert_eq!(
+    Witness {
+        expected: fixture.payload,
+        files,
+        graph,
         status,
-        Some(JobStatus::Complete),
-        "delivery={:?}, rulings={:?}",
-        graph.delivery,
-        graph.rulings
-    );
-    assert_eq!(files.len(), 1);
-    assert_eq!(
-        files.values().next(),
-        Some(&fixture.payload),
-        "byte-exact extracted payload"
-    );
+    }
 }
 
-#[tokio::test]
-async fn a_truncated_middle_uu_article_reaches_repair_with_its_tail_present() {
-    witness(Shape::TruncatedMiddle).await;
-}
-
-#[tokio::test]
-async fn wrong_final_uu_lengths_and_a_missing_middle_article_repair() {
-    witness(Shape::WrongFinalLength { mixed: false }).await;
-}
-
-#[tokio::test]
-async fn wrong_final_uu_lengths_in_a_mixed_set_repair() {
-    witness(Shape::WrongFinalLength { mixed: true }).await;
-}
-
-// A damaged article that waited ahead of its file's cursor is sent on only
-// to a server that has not served it. With one server its bytes stand, the
-// file closes, and the recovery set repairs it.
-#[tokio::test]
-async fn a_truncated_uu_article_behind_a_missing_one_reaches_repair() {
-    witness(Shape::TruncatedBehindAMissingArticle).await;
+pub struct Witness {
+    pub expected: Vec<u8>,
+    pub files: BTreeMap<String, Vec<u8>>,
+    pub graph: harness::GraphView,
+    pub status: Option<JobStatus>,
 }

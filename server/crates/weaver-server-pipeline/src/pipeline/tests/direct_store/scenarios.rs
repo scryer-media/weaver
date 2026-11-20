@@ -418,8 +418,7 @@ pub fn header_encrypted_store_set(
 // units in each volume over every byte before its `RR` header, as
 // `rar a -m0 -hp -rr` writes one: the header is enciphered with the rest,
 // the record's chunks are not.
-#[cfg(test)]
-pub(in crate::pipeline::tests) fn protected_header_encrypted_store_set(
+pub fn protected_header_encrypted_store_set(
     member_name: &str,
     payload: &[u8],
     volume_count: usize,

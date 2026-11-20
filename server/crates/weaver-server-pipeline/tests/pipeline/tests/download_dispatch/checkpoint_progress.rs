@@ -90,7 +90,7 @@ async fn checkpoint_abandoned_lane_requeues_once_and_fences_late_events() {
     assert_eq!(pipeline.articles_in_flight(), 0);
     assert_eq!(pipeline.active_connections(), 0);
     assert!(pipeline.rate_reservations().is_empty());
-    assert!(!pipeline.checkpoint_booking(HOT).is_some());
+    assert!(pipeline.checkpoint_booking(HOT).is_none());
     assert!(!pipeline.lane_owned(old_id));
     // Force reuse of the same segment to exercise the hardest stale-event
     // case; ordinary FIFO scheduling may select another queued article first.
@@ -190,7 +190,7 @@ async fn checkpoint_teardown_refunds_before_clearing_and_leaves_no_activity() {
             "late events must only charge actual transport: {remaining}"
         );
         assert!(!pipeline.has_download_activity(HOT));
-        assert!(!pipeline.pending_retries(HOT).is_some());
+        assert!(pipeline.pending_retries(HOT).is_none());
         assert_eq!(pipeline.articles_in_flight(), 0);
         assert_eq!(pipeline.active_connections(), 0);
         pipeline.set_rate(None);
@@ -227,7 +227,7 @@ async fn checkpoint_accepted_result_survives_pause_and_lane_retirement() {
         (lane_id, segment_id)
     );
     pipeline.process_released_result(&mut pending).await;
-    assert!(!pipeline.checkpoint_booking(HOT).is_some());
+    assert!(pipeline.checkpoint_booking(HOT).is_none());
     assert_eq!(pipeline.pending_retries(HOT).unwrap(), 131);
     assert!(!pipeline.has_released_results(HOT));
 }
@@ -300,10 +300,10 @@ async fn checkpoint_progress_keeps_recovery_and_global_pressure_rules() {
         "blocked payload remains ahead of recovery in the queue"
     );
     assert!(pipeline.has_dispatchable_work(HOT));
-    let lease = pipeline.lease_for_server(0).unwrap();
-    assert_eq!(lease.len(), 1);
-    assert!(lease[0].is_recovery);
-    assert!(lease[0].completion_critical);
+    let lease = pipeline.cut_server_lease(0).unwrap();
+    assert_eq!(lease.works().len(), 1);
+    assert!(lease.works()[0].is_recovery);
+    assert!(lease.works()[0].completion_critical);
 }
 
 #[tokio::test]
@@ -379,7 +379,7 @@ async fn checkpoint_progress_diagnostics_track_staggered_retries_and_cancel() {
     let result = pipeline.cancel_job(HOT).await;
     assert!(result.is_ok());
     assert_eq!(pipeline.parked_retry_count(), 0);
-    assert!(!pipeline.pending_retries(HOT).is_some());
-    assert!(!pipeline.checkpoint_booking(HOT).is_some());
+    assert!(pipeline.pending_retries(HOT).is_none());
+    assert!(pipeline.checkpoint_booking(HOT).is_none());
     assert!(!pipeline.checkpoint_retry_pending(HOT));
 }

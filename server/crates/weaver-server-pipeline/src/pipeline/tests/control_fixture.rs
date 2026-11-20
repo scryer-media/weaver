@@ -130,8 +130,12 @@ impl CompletedMove {
     }
 
     pub async fn deliver(self, pipeline: &mut Pipeline) {
-        pipeline.handle_move_to_complete_done(self.0).await;
+        self.deliver_without_settling(pipeline).await;
         super::settle_script_admissions(pipeline).await;
+    }
+
+    pub async fn deliver_without_settling(self, pipeline: &mut Pipeline) {
+        pipeline.handle_move_to_complete_done(self.0).await;
     }
 }
 

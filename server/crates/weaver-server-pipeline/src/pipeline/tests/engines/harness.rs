@@ -50,7 +50,7 @@ pub const ARTICLE: usize = 64;
 pub const NESTING: u32 = crate::pipeline::graph::limits::NESTING;
 
 pub use super::state::JOB;
-pub(in crate::pipeline::tests) use super::state::finished;
+pub use super::state::finished;
 const JOB_NAME: &str = "lantern beacon";
 // A stored settings value that does not parse.
 pub const CORRUPT_POLICY: &str = "{unreadable";
@@ -796,7 +796,7 @@ impl Scenario {
     // limits. A scenario whose primary serves some articles damaged has a
     // backup that serves them whole, on every pipeline that runs the job,
     // a restarted one too.
-    pub(in crate::pipeline::tests) fn prepare(&self, pipeline: &mut Pipeline) {
+    pub fn prepare(&self, pipeline: &mut Pipeline) {
         // A health probe asks the scenario's servers on the download lanes,
         // and each holds every article but the ones the scenario lost.
         let missing = self
@@ -1555,10 +1555,7 @@ fn hear(
 // check a step scheduled is run, and a live run is heard. Returns where the
 // job stands once nothing is queued, scheduled or running: the recovery
 // outcomes as last seen, and whether its delivery move is out.
-#[cfg(test)]
-pub(in crate::pipeline::tests) async fn run_unprompted(
-    scenario: &Scenario,
-) -> (Vec<Option<RepairOutcome>>, bool) {
+pub async fn run_unprompted(scenario: &Scenario) -> (Vec<Option<RepairOutcome>>, bool) {
     fn look(pipeline: &Pipeline, outcomes: &mut Vec<Option<RepairOutcome>>) {
         if let Some(job) = pipeline.graph_jobs.get(&JOB) {
             *outcomes = job
@@ -1706,7 +1703,7 @@ fn handed_out(
 // A body a server spoiled is asked of the next server once the worker's
 // backoff ends: the retry it scheduled is the job's next move. True when one
 // was taken.
-pub(in crate::pipeline::tests) async fn take_retry(pipeline: &mut Pipeline) -> bool {
+pub async fn take_retry(pipeline: &mut Pipeline) -> bool {
     if !pipeline
         .pending_retries_by_job
         .get(&JOB)
@@ -1725,11 +1722,7 @@ pub(in crate::pipeline::tests) async fn take_retry(pipeline: &mut Pipeline) -> b
 
 // An ask as the worker serves it: the first server it does not exclude
 // answers.
-pub(in crate::pipeline::tests) async fn serve_work(
-    pipeline: &mut Pipeline,
-    scenario: &Scenario,
-    work: &DownloadWork,
-) {
+pub async fn serve_work(pipeline: &mut Pipeline, scenario: &Scenario, work: &DownloadWork) {
     let article = (
         work.segment_id.file_id.file_index,
         work.segment_id.segment_number,
@@ -1738,11 +1731,7 @@ pub(in crate::pipeline::tests) async fn serve_work(
 }
 
 // One article as the scenario's server answers it.
-pub(in crate::pipeline::tests) async fn serve(
-    pipeline: &mut Pipeline,
-    scenario: &Scenario,
-    article: (u32, u32),
-) {
+pub async fn serve(pipeline: &mut Pipeline, scenario: &Scenario, article: (u32, u32)) {
     serve_job(pipeline, JOB, scenario, article).await;
 }
 

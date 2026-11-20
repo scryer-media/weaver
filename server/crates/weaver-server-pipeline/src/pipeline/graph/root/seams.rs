@@ -32,7 +32,7 @@ const WINDOW_PRIORITY: u32 = 3;
 
 // How many jobs the loop looked at for a wait for room, on this thread, so
 // a test can pin that a turn with nothing changed looks at none.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 thread_local! {
     pub(crate) static DISK_WAIT_LOOKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     // How many waits for room were said as they began, on this thread.
@@ -685,7 +685,7 @@ impl Pipeline {
                 .map(|(job_id, _)| *job_id)
                 .collect();
             for job_id in began {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "pipeline-test-fixtures"))]
                 DISK_WAIT_LOOKS.with(|looks| looks.set(looks.get() + 1));
                 // Said once, as the wait begins.
                 if let Some((wait, dir)) =
@@ -708,7 +708,7 @@ impl Pipeline {
         // as one of the pipeline's does: it is heard here once, as its wait
         // begins, and woken with the pipeline's own by ticket.
         for scope in self.graph_outside.disk_waits_began() {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             DISK_WAIT_LOOKS.with(|looks| looks.set(looks.get() + 1));
             // Said once, as the wait begins, as the pipeline's own is.
             if let Some((wait, dir)) = self.graph_outside.disk_wait_of(scope) {
@@ -721,7 +721,7 @@ impl Pipeline {
         let idle: Vec<JobId> = std::mem::take(&mut self.disk_idle)
             .into_iter()
             .filter(|job_id| {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "pipeline-test-fixtures"))]
                 DISK_WAIT_LOOKS.with(|looks| looks.set(looks.get() + 1));
                 self.disk_waiting.contains(job_id)
                     && self
@@ -747,7 +747,7 @@ impl Pipeline {
     // the reserve.
     fn say_disk_wait(&self, job_id: JobId, wait: &limits::DiskWait, dir: &std::path::Path) {
         use crate::support::human_bytes;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         DISK_WAITS_SAID.with(|said| said.set(said.get() + 1));
         // A job outside the pipeline has no name here: its line leaves the
         // field out (`Option` records nothing when `None`).

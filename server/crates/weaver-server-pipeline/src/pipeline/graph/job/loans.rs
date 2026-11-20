@@ -88,7 +88,7 @@ impl Loans {
             .and_then(|out| out.state)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(super) fn current_repair(&self, set: NodeId, serial: u64) -> bool {
         self.out
             .as_ref()

@@ -633,7 +633,7 @@ impl Pipeline {
 
     // Move every held refill's clock back by the idle window, as if each
     // had waited that much longer.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(in crate::pipeline) fn age_held_download_refills_past_idle_window_for_test(&mut self) {
         let by = DOWNLOAD_REFILL_IDLE_HOLD;
         for held in &mut self.held_download_refills {
@@ -645,7 +645,7 @@ impl Pipeline {
     }
 
     // Whether a held refill waits for its volume's room.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(in crate::pipeline) fn room_held_download_refills_for_test(&self) -> usize {
         self.held_download_refills
             .iter()

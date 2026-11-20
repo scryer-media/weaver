@@ -6,17 +6,17 @@ use crate::jobs::persistence::JobsPersistenceQueries;
 
 // Runtime row writes queued, for tests that pin how many a path makes. Each
 // test runs in its own process, so a count is the test's own.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) static RUNTIME_WRITES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 // What the writer answers the next moving-row writes with in place of
 // running them, first in first out, and how many moving rows it wrote.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) static MOVING_ROW_REFUSED: std::sync::Mutex<
     std::collections::VecDeque<crate::StateError>,
 > = std::sync::Mutex::new(std::collections::VecDeque::new());
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) static MOVING_ROWS_WRITTEN: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -82,7 +82,7 @@ impl StoredRuntimeValues {
 }
 
 impl Pipeline {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn status_enter_failpoint_for_transition(
         old_post_state: crate::jobs::model::PostState,
         old_run_state: crate::jobs::model::RunState,
@@ -192,7 +192,7 @@ impl Pipeline {
         output_dir: Option<std::path::PathBuf>,
     ) -> Option<tokio::sync::oneshot::Receiver<Result<(), crate::persistence::error::WriteFailed>>>
     {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         RUNTIME_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let output_dir = output_dir
             .or_else(|| match values.status {
@@ -230,13 +230,13 @@ impl Pipeline {
         match self
             .db
             .try_queue_job_write_committed(job_id, "set_active_job_runtime", move |db| {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "pipeline-test-fixtures"))]
                 if status == "moving"
                     && let Some(refused) = MOVING_ROW_REFUSED.lock().unwrap().pop_front()
                 {
                     return Err(refused);
                 }
-                #[cfg(test)]
+                #[cfg(any(test, feature = "pipeline-test-fixtures"))]
                 if status == "moving" {
                     MOVING_ROWS_WRITTEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }

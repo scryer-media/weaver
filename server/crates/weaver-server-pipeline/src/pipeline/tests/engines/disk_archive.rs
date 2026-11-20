@@ -11,12 +11,12 @@ use crate::pipeline::{Pipeline, PipelineEvent};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-pub(super) const RESERVE: u64 = 1 << 30;
+pub const RESERVE: u64 = 1 << 30;
 
 pub const PLENTY: u64 = 1 << 30;
 
 // The room value at which a look at the disk fails.
-pub(super) const UNREADABLE: u64 = u64::MAX;
+pub const UNREADABLE: u64 = u64::MAX;
 
 pub(super) const NEVER: std::time::Duration = std::time::Duration::from_secs(365 * 24 * 60 * 60);
 
@@ -26,7 +26,7 @@ pub fn on_disk_posting(room: &Arc<AtomicU64>, posts: Vec<Post>) -> Scenario {
 
 // The same, the job held to keep `reserve` free and the disks reading
 // `room` bytes over it.
-pub(super) fn on_disk_keeping(room: &Arc<AtomicU64>, posts: Vec<Post>, reserve: u64) -> Scenario {
+pub fn on_disk_keeping(room: &Arc<AtomicU64>, posts: Vec<Post>, reserve: u64) -> Scenario {
     let room = Arc::clone(room);
     Scenario::new(posts)
         .limits(limits(move |limits| limits.min_free_bytes = reserve))

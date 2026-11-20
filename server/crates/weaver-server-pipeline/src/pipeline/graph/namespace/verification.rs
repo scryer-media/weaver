@@ -72,7 +72,7 @@ impl Verification {
         #[cfg(not(test))]
         let this = self;
         this.run_with(shutdown, |_len| {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             checked::read(_len);
             #[cfg(test)]
             if let Some(barrier) = barrier.take() {
@@ -426,7 +426,7 @@ mod turns {
 
 // The bytes every member check in this process read from its file, so a
 // test can hold a check to what it reads.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) mod checked {
     use std::sync::atomic::{AtomicU64, Ordering};
 

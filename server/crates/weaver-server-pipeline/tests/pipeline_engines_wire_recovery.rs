@@ -15,8 +15,15 @@ mod pipeline {
             mod recovery_audit;
             use weaver_server_pipeline::pipeline::tests::engines::{disk_archive, disk_reserve};
             mod disk_wait;
+            mod lent_handed;
             mod recovery_damage_wire;
+            mod recovery_duplicate_wire;
             mod recovery_encrypted_wire;
+            mod recovery_geometry_wire;
+            mod recovery_restart_wire;
+            mod remaining_par2;
+            mod remaining_stalls;
+            mod repaired_source;
         }
     }
 }

@@ -9,6 +9,7 @@
 // a 7z of a directory, an empty file and an empty directory; two streams of
 // one name in two directories; and an xz cut short inside a store.
 
+use super::archive_scenario_fixtures::pairings::capped_summary;
 use super::archive_scenario_fixtures::pairings::{Entry, copy, nested_encrypted, posts, sevenz};
 use super::harness::{ARTICLE, Outcome, Post, Scenario, kinds, par2_set, payload, run};
 use super::sevenz::SECRET;
@@ -18,8 +19,8 @@ use crate::pipeline::tests::direct_store::multi_member_store_set;
 use crate::pipeline::tests::direct_store::scenarios::{
     HeaderCheck, encrypted_store_set, header_encrypted_store_set,
 };
-use sevenz_turbo::encoder_options::Lzma2Options;
 use sevenz_turbo::EncoderConfiguration;
+use sevenz_turbo::encoder_options::Lzma2Options;
 use weaver_graph::recovery::RepairOutcome;
 
 const WRONG: &str = "cinder-wrong-guess";
@@ -448,4 +449,14 @@ async fn an_xz_member_of_a_compressed_7z_decodes_and_lands() {
     let graph = run(&Scenario::new(vec![Post::plain("lantern.7z", outer)])).await;
     assert_whole(&graph, &[("first.nfo", &first), ("inner", &held)]);
     assert!(kinds(&graph).contains(&"stream_xz"), "{:?}", kinds(&graph));
+}
+
+// The node cap, lowered to one: the first node breadth first is kept, and
+// the true count and depth stay.
+#[tokio::test]
+async fn a_capped_summary_keeps_the_first_nodes_and_the_true_count() {
+    let summary = capped_summary(&nested_encrypted(), 1).await;
+    assert_eq!(summary.nodes.len(), 1, "{summary:?}");
+    assert_eq!(summary.nodes[0].kind, "rar_store");
+    assert_eq!((summary.node_count, summary.max_depth), (2, 2));
 }

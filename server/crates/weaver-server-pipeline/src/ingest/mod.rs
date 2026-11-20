@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 mod classify;
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) use persisted_nzb::NZB_PARSES;
 use weaver_server_ingest::ingest::import;
 pub use weaver_server_ingest::ingest::metadata;

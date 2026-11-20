@@ -16,8 +16,12 @@ use super::recovery_fixtures::seek::{FOLDER, assert_members, members, named, pos
 use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::tests::direct_store::obfuscate_volumes;
+use std::collections::BTreeSet;
 use std::io::Write;
 use weaver_graph::recovery::RepairOutcome;
+use weaver_server_pipeline::pipeline::tests::engines::seek::{
+    Stop, restart_after_announcement, restart_recovery_seek,
+};
 
 // The posts of an `out_of_order` row: its volumes and the plain file.
 fn posted(order: &[usize]) -> u32 {
@@ -460,4 +464,83 @@ async fn an_open_ended_recovery_seek_fetches_the_volume_after_the_damage() {
         damaged < past_head(&graph, 2),
         "the volume follows the damage"
     );
+}
+
+// Row 10. A graph run restarted once, the moment the recovery seek was
+// answered: the pipeline drains, so the volume heads it held go to scratch
+// and are read back; the restored objects restate their wants, and the run
+// finishes in the order the whole run took, asking for nothing twice.
+#[tokio::test]
+async fn a_recovery_seek_stands_across_a_restart() {
+    let (scenario, whole) = recovery_seek().await;
+    let (status, order, requests) = restart_recovery_seek(&scenario, Stop::Drained).await;
+    assert_eq!(status, Some(JobStatus::Complete));
+    assert_eq!(order, whole.order, "the restarted run's order");
+    assert!(
+        requests.values().all(|count| *count == 1),
+        "the restarted run asks for nothing twice: {requests:?}"
+    );
+}
+
+// Row 10 with the pipeline dropped instead of drained: the volume heads held
+// in RAM are lost with it and fetched again, and nothing that had a place on
+// disk is.
+#[tokio::test]
+async fn a_recovery_seek_across_a_crash_fetches_only_the_held_heads_again() {
+    let (scenario, whole) = recovery_seek().await;
+    let (status, _, requests) = restart_recovery_seek(&scenario, Stop::Crashed).await;
+    assert_eq!(status, Some(JobStatus::Complete));
+    let twice: Vec<(u32, u32)> = requests
+        .iter()
+        .filter(|(_, count)| **count > 1)
+        .map(|(article, _)| *article)
+        .collect();
+    assert!(!twice.is_empty(), "a crash loses the held heads");
+    assert!(
+        twice.iter().all(|(_, ordinal)| *ordinal == 0),
+        "only volume heads are fetched again: {twice:?}"
+    );
+    assert!(
+        requests.values().all(|count| *count <= 2),
+        "nothing is fetched more than once again: {requests:?}"
+    );
+    assert_eq!(
+        requests.keys().copied().collect::<BTreeSet<_>>(),
+        whole.order.iter().copied().collect::<BTreeSet<_>>(),
+        "the crashed run fetches what the whole run fetched"
+    );
+}
+
+// The store and set of row 10, and the run of it with no restart.
+async fn recovery_seek() -> (Scenario, Outcome) {
+    let members = members(3, 151);
+    let volumes = store_set(&members, 4);
+    let mut posts = posts(&volumes);
+    posts.extend(par2_set("silver.horizon", &named(&volumes), 2));
+    let scenario = Scenario::new(posts).damaged(1, 2);
+    let whole = run(&scenario).await;
+    assert_members(&whole, &members);
+    (scenario, whole)
+}
+
+// A file the set describes and no post carries is a root member the root
+// announced itself, past the post's files. A run restarted once that member
+// is in the checkpoint restores it beside the posted ones and rebuilds it.
+#[tokio::test]
+async fn a_root_member_the_set_announced_restores_across_a_restart() {
+    let lantern = payload(4 * ARTICLE, 75);
+    let quill = payload(3 * ARTICLE - 3, 76);
+    let mut posts = vec![Post::plain("lantern.bin", lantern.clone())];
+    posts.extend(par2_set(
+        "lantern",
+        &[
+            ("lantern.bin", lantern.as_slice()),
+            ("quill.bin", quill.as_slice()),
+        ],
+        4,
+    ));
+    let posted = posts.len() as u32;
+    let scenario = Scenario::new(posts);
+    let (status, _, _) = restart_after_announcement(&scenario, posted).await;
+    assert_eq!(status, Some(JobStatus::Complete));
 }

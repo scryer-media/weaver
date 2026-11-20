@@ -714,7 +714,7 @@ fn move_delivered_entry(
     phase_counters: Arc<PhaseCounters>,
     resumed: bool,
 ) -> Result<(), (std::io::Error, std::io::Error)> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     {
         let mut room = DESTINATION_ROOM.lock().unwrap();
         match room.as_mut() {
@@ -842,10 +842,6 @@ async fn moving_row_committed(
 pub(crate) type MoveHook = Box<dyn FnOnce(JobId) + Send>;
 
 // Runs once the moving row has committed and before any file moves.
-#[cfg(test)]
-pub(crate) static BEFORE_FIRST_MOVE: std::sync::Mutex<Option<MoveHook>> =
-    std::sync::Mutex::new(None);
-
 #[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(in crate::pipeline) static FIXTURE_MOVE_HOOKS: std::sync::LazyLock<
     std::sync::Mutex<HashMap<PathBuf, MoveHook>>,
@@ -854,18 +850,18 @@ pub(in crate::pipeline) static FIXTURE_MOVE_HOOKS: std::sync::LazyLock<
 // A destination that fills: how many more entries it has room for. Each
 // entry past that finds no room and leaves nothing of itself there, as the
 // copy does, which removes what it wrote.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) static DESTINATION_ROOM: std::sync::Mutex<Option<u32>> = std::sync::Mutex::new(None);
 
 // The copy that finds no room leaves what it wrote in the destination, as a
 // copy stopped before it could remove it does.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) static PARTIAL_STAYS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 // A disk with no room for the category folder or the job's own: claiming a
 // destination finds it full while this is set.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) static CLAIM_FULL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -888,10 +884,6 @@ pub(crate) type SpentHook = Box<dyn FnOnce(&[PathBuf]) + Send>;
 
 // Runs with the consumed inputs once their handles are released and before
 // they are removed.
-#[cfg(test)]
-pub(crate) static BEFORE_SPENT_REMOVAL: std::sync::Mutex<Option<SpentHook>> =
-    std::sync::Mutex::new(None);
-
 #[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(in crate::pipeline) static FIXTURE_SPENT_HOOKS: std::sync::LazyLock<
     std::sync::Mutex<HashMap<PathBuf, SpentHook>>,
@@ -1478,7 +1470,7 @@ pub(crate) async fn claim_complete_destination_path(
     job_id: JobId,
     reserved: &HashSet<PathBuf>,
 ) -> std::io::Result<PathBuf> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     if CLAIM_FULL.load(Ordering::Acquire) {
         return Err(std::io::Error::from(std::io::ErrorKind::StorageFull));
     }
@@ -1824,13 +1816,6 @@ impl Pipeline {
             return Ok(());
         }
         self.moves_awaiting_disk.remove(&job_id);
-        #[cfg(test)]
-        {
-            let hook = BEFORE_SPENT_REMOVAL.lock().unwrap().take();
-            if let Some(hook) = hook {
-                hook(&spent);
-            }
-        }
         #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         {
             let hook = FIXTURE_SPENT_HOOKS
@@ -2311,13 +2296,6 @@ impl Pipeline {
                             None => MoveInto::Resumed(dest.clone()),
                         },
                     };
-                    #[cfg(test)]
-                    {
-                        let hook = BEFORE_FIRST_MOVE.lock().unwrap().take();
-                        if let Some(hook) = hook {
-                            let _ = tokio::task::spawn_blocking(move || hook(job_id)).await;
-                        }
-                    }
                     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
                     {
                         let hook = FIXTURE_MOVE_HOOKS.lock().unwrap().remove(&fixture_root);

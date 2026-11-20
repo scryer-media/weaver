@@ -15,19 +15,13 @@ use std::time::Duration;
 use crate::Database;
 use crate::JobInfo;
 use crate::SchedulerHandle;
-#[cfg(test)]
-use crate::ingest::submit_nzb_bytes;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::settings::{Config, SharedConfig};
 use crate::{FileSpec, PipelineMetrics, SegmentSpec, SharedPipelineState};
 use tempfile::TempDir;
 use tokio::sync::RwLock;
-#[cfg(test)]
-use tokio::sync::oneshot;
 use weaver_model::files::FileRole;
 use weaver_nntp::client::{NntpClient, NntpClientConfig};
-#[cfg(test)]
-use weaver_server_base::jobs::ids::MessageId;
 use weaver_server_base::runtime::system_profile::{
     CpuProfile, DiskProfile, FilesystemType, MemoryProfile, SimdSupport, StorageClass,
     SystemProfile,
@@ -52,64 +46,43 @@ macro_rules! segment_spec {
     };
 }
 
-mod archive_output_contract;
-pub mod password_fixture;
+pub mod archive_output_contract;
 #[path = "download_dispatch/bandwidth_fixture.rs"]
 pub mod bandwidth_fixture;
+pub mod completion_fixture;
 pub mod control_fixture;
-#[cfg(test)]
-mod core;
 pub mod decode_fixture;
+pub mod password_fixture;
+pub mod progress_fixture;
 #[cfg(test)]
-mod decode_stage;
-#[cfg(test)]
-pub(in crate::pipeline) mod delivered_restore;
+pub(in crate::pipeline) mod delivered_restore {
+    pub(in crate::pipeline) use super::delivery_fixture::restart_and_restore;
+}
+pub mod attribution_fixture;
+pub mod delivery_fixture;
 pub mod direct_store;
 pub mod dispatch_fixture;
-#[cfg(test)]
-mod dispatch_order;
-#[cfg(test)]
-mod download_dispatch;
+pub mod dispatch_order_fixture;
 pub mod engines;
-pub mod delivery_fixture;
-#[cfg(test)]
-mod hardware_profile;
+pub mod hardware_fixture;
 pub mod history_fixture;
-#[cfg(test)]
-mod idle;
-#[cfg(test)]
-mod memory_release;
-#[cfg(test)]
-mod next_up_ring;
-#[cfg(test)]
-mod nzb_admission;
-#[cfg(unix)]
-#[cfg(test)]
-mod post_processing_completion;
-#[cfg(test)]
-mod post_processing_pause;
+pub mod idle_fixture;
+pub mod memory_fixture;
+pub mod next_up_fixture;
+pub mod nzb_admission_fixture;
 #[path = "download_dispatch/propagation_fixture.rs"]
 pub mod propagation_fixture;
-#[cfg(test)]
-mod provider_scheduling;
+pub mod provider_fixture;
 pub mod queue_fixture;
-#[cfg(test)]
-mod queue_scale;
 pub mod queue_scale_fixture;
-#[cfg(test)]
-mod restore_history {
-    pub(super) use super::history_fixture::{hold_database_writer, wait_for_job_event};
-}
-#[cfg(test)]
-mod script_events;
+pub mod rename_fixture;
 pub mod script_fixture;
-#[cfg(test)]
-mod server_attribution;
-#[cfg(test)]
-mod terminal_settlement;
+pub mod stall_fixture;
+pub mod stall_liveness_fixture;
+pub mod terminal_fixture;
 pub mod uu_fixture;
-pub mod yenc_fixture;
 pub mod window_fixture;
+pub mod yenc_fixture;
 
 impl Pipeline {
     pub async fn restore_job(&mut self, request: RestoreJobRequest) -> Result<(), SchedulerError> {
@@ -161,8 +134,7 @@ pub struct TestHarness {
 }
 
 impl TestHarness {
-    #[cfg(test)]
-    async fn new() -> Self {
+    pub async fn new() -> Self {
         Self::new_with_nntp(
             NntpClient::new(NntpClientConfig {
                 servers: vec![],
@@ -526,7 +498,7 @@ pub fn insert_history_row_with_nzb_zstd(
 // stays eligible for the next pass. A name that
 // does not resolve did the first half of that and not the second, and left
 // each test racing the worker's health bookkeeping.
-fn refusing_harness_server_port() -> u16 {
+pub fn refusing_harness_server_port() -> u16 {
     static PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
     *PORT.get_or_init(|| {
         let listener =
@@ -560,7 +532,7 @@ fn refusing_harness_server_port() -> u16 {
 // permit back from one that has not taken it yet, so this waits for each
 // lane's own failure report instead, which the worker sends only after its
 // permit is back.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 async fn settle_lane_dials(pipeline: &mut Pipeline) {
     for _ in 0..pipeline.download_lane_owners.len() {
         match pipeline
@@ -665,7 +637,7 @@ pub async fn new_direct_pipeline_at_roots(
 // [`new_direct_pipeline_at_roots`] on a machine the test describes, for the
 // tests whose subject is what the machine can honour.
 #[allow(clippy::too_many_arguments)]
-async fn new_direct_pipeline_on_machine(
+pub async fn new_direct_pipeline_on_machine(
     data_dir: PathBuf,
     intermediate_dir: PathBuf,
     complete_dir: PathBuf,
@@ -829,7 +801,7 @@ pub async fn retire_pipeline_database(pipeline: Pipeline) {
 
 // Hear the run mail until the graph job has nothing out: a repair it lent
 // returns there, and is applied as it is heard.
-pub(in crate::pipeline) async fn hear_graph_mail(pipeline: &mut Pipeline, job_id: JobId) {
+pub async fn hear_graph_mail(pipeline: &mut Pipeline, job_id: JobId) {
     while pipeline
         .graph_jobs
         .get(&job_id)
@@ -866,7 +838,7 @@ fn checkpoint_plan(pipeline: &Pipeline, job_id: JobId) -> weaver_yenc::Checkpoin
         })
 }
 
-fn encode_article_part(
+pub fn encode_article_part(
     filename: &str,
     payload: &[u8],
     part: u32,
@@ -1688,11 +1660,6 @@ fn build_test_par2_packet(
     data
 }
 
-#[cfg(test)]
-pub(super) fn build_test_par2_index(filename: &str, file_data: &[u8], slice_size: u64) -> Vec<u8> {
-    build_test_par2_index_for_files(&[(filename, file_data)], slice_size)
-}
-
 pub fn build_test_par2_index_for_files(files: &[(&str, &[u8])], slice_size: u64) -> Vec<u8> {
     struct IndexedFile {
         id: [u8; 16],
@@ -1805,12 +1772,6 @@ pub fn segmented_job_spec(name: &str, filename: &str, segment_sizes: &[u32]) -> 
                 .collect(),
         }],
     }
-}
-
-#[cfg(test)]
-fn with_priority(mut spec: JobSpec, priority: &str) -> JobSpec {
-    spec.metadata = vec![("priority".to_string(), priority.to_string())];
-    spec
 }
 
 // Record cancellation, drive its boundary, then observe the durable archive.
@@ -2085,8 +2046,7 @@ pub(in crate::pipeline) async fn settle_script_admissions(pipeline: &mut Pipelin
     }
 }
 
-#[cfg(test)]
-fn set_job_status_for_test(pipeline: &mut Pipeline, job_id: JobId, status: JobStatus) {
+pub fn set_job_status_for_test(pipeline: &mut Pipeline, job_id: JobId, status: JobStatus) {
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
     state.status = status;
     state.refresh_runtime_lanes_from_status();
@@ -2333,7 +2293,7 @@ pub async fn wait_until(mut predicate: impl FnMut() -> bool) {
     }
 }
 
-async fn drain_decode_results(pipeline: &mut Pipeline, expected: usize) {
+pub async fn drain_decode_results(pipeline: &mut Pipeline, expected: usize) {
     for index in 0..expected {
         let done = pipeline.decode_done_rx.recv().await.unwrap_or_else(|| {
             panic!(
@@ -2374,7 +2334,6 @@ fn retention_client(retention_days: &[u32]) -> weaver_nntp::client::NntpClient {
 
 // A client of the `retention_client` servers named by `hosts`, in that
 // order: host `n` is the same server in every client built here.
-#[cfg(test)]
 fn hosts_client(hosts: &[usize]) -> weaver_nntp::client::NntpClient {
     weaver_nntp::client::NntpClient::new(weaver_nntp::client::NntpClientConfig {
         servers: hosts
@@ -2397,7 +2356,7 @@ fn hosts_client(hosts: &[usize]) -> weaver_nntp::client::NntpClient {
 // Pool server `server` refuses the login. A fill server's refusal waits: the
 // server may still serve the work only it could serve, as through any
 // outage. A backfill server's refusal is the answer at once.
-async fn refuse_login(pipeline: &Pipeline, server: usize) {
+pub async fn refuse_login(pipeline: &Pipeline, server: usize) {
     let pool = pipeline.nntp.pool();
     pool.health().lock().await.record_failure(server, true);
     if pool.is_backfill(server) {

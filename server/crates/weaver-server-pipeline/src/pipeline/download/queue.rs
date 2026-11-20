@@ -1402,16 +1402,6 @@ impl crate::pipeline::Pipeline {
             .spec;
         item.dispatched(spec)
     }
-
-    pub(crate) fn dispatched_all(
-        &self,
-        items: impl IntoIterator<Item = QueueItem>,
-    ) -> Vec<DownloadWork> {
-        items
-            .into_iter()
-            .map(|item| self.dispatched(item))
-            .collect()
-    }
 }
 
 #[cfg(test)]

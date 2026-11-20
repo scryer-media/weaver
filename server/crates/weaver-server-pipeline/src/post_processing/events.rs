@@ -1140,9 +1140,9 @@ pub(crate) trait PostProcessingEventsInvalidateQueueScriptAdmissionInternalQueri
         event: QueueEvent,
     ) -> Result<Option<(String, u64)>, StateError>;
     fn notify_script_events_changed(&self);
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     fn finish_script_event_for_test(&self, run_id: &str) -> Result<(), StateError>;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     fn queued_script_events(&self, event: QueueEvent) -> Vec<EventContext>;
     #[cfg(test)]
     fn queued_script_events_once(
@@ -1150,7 +1150,7 @@ pub(crate) trait PostProcessingEventsInvalidateQueueScriptAdmissionInternalQueri
         event: QueueEvent,
         count: usize,
     ) -> impl std::future::Future<Output = Vec<EventContext>> + Send;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     fn admitted_so_far(&self) -> impl std::future::Future<Output = ()> + Send;
     #[cfg(test)]
     fn enable_queue_scripts_for_test(&self, root: &std::path::Path);
@@ -1357,7 +1357,7 @@ impl PostProcessingEventsInvalidateQueueScriptAdmissionInternalQueries for Datab
         self.script_runtime.changed.notify_waiters();
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     fn finish_script_event_for_test(&self, run_id: &str) -> Result<(), StateError> {
         self.finish_script_event(run_id)?;
         self.script_runtime.changed.notify_waiters();
@@ -1365,7 +1365,7 @@ impl PostProcessingEventsInvalidateQueueScriptAdmissionInternalQueries for Datab
     }
 
     // Every `event` the queue holds, in the order queued.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     fn queued_script_events(&self, event: QueueEvent) -> Vec<EventContext> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
@@ -1404,7 +1404,7 @@ impl PostProcessingEventsInvalidateQueueScriptAdmissionInternalQueries for Datab
     // Returns once every event raised before it is admitted: admissions
     // are taken in the order raised, so once one raised after them is in,
     // they are.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     async fn admitted_so_far(&self) {
         let marker = EventContext {
             job_id: None,

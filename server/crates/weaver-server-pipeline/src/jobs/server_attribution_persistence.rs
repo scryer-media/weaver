@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::ids::JobId;
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 use super::server_attribution::JobServerAttribution;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::{Database, StateError};
@@ -12,7 +12,7 @@ pub(crate) trait JobsServerAttributionPersistenceInternalQueries {
         &self,
         snapshots: Vec<(JobId, String)>,
     ) -> Result<(), StateError>;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     fn load_active_server_attribution(
         &self,
         job_id: JobId,
@@ -44,7 +44,7 @@ impl JobsServerAttributionPersistenceInternalQueries for Database {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     fn load_active_server_attribution(
         &self,
         job_id: JobId,

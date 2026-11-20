@@ -364,7 +364,7 @@ impl Pipeline {
     }
 
     // List all jobs: the live ones, then history.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn list_jobs(&self) -> Vec<JobInfo> {
         self.report_all_for_test();
         self.shared_state.list_jobs()

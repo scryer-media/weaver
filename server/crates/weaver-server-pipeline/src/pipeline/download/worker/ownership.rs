@@ -143,7 +143,7 @@ impl Pipeline {
 
     // Every live lane answers what it holds and parks with nothing left to
     // do, as the lane tasks would report once their batches were done.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(in crate::pipeline) fn finish_test_lanes(&mut self) {
         let lanes: Vec<(u64, Vec<SegmentId>)> = self
             .download_lane_owners
@@ -379,7 +379,7 @@ impl Pipeline {
     // nothing is lowered, because whatever took the article off the lane's
     // record lowered them already. A result comes back through
     // `accept_lane_result`; this is for fixtures that end lanes whole.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(super) fn accept_lane_work(&mut self, lane_id: u64, segment: SegmentId) -> bool {
         self.accept_lane_work_with(lane_id, segment, 0, |_| {})
     }

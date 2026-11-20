@@ -50,26 +50,30 @@ async fn database(temp_dir: &tempfile::TempDir) -> sqlx::SqlitePool {
 
 // Overwrites the job's persisted NZB with bytes that cannot be parsed, so a
 // harvest that still returns the NZB's candidates provably did not read it.
-async fn corrupt_persisted_nzb(temp_dir: &tempfile::TempDir, job_id: JobId) {
-    set_persisted_nzb(temp_dir, job_id, Some(vec![0xFFu8; 64])).await;
+async fn corrupt_persisted_nzb(pipeline: &weaver_server_pipeline::Pipeline, job_id: JobId) {
+    set_persisted_nzb(pipeline, job_id, Some(vec![0xFFu8; 64])).await;
 }
 
-async fn set_persisted_nzb(temp_dir: &tempfile::TempDir, job_id: JobId, nzb_zstd: Option<Vec<u8>>) {
-    let pool = database(temp_dir).await;
-    let updated = match nzb_zstd {
-        Some(nzb_zstd) => sqlx::query(
-            "INSERT INTO job_nzbs (job_id, nzb_zstd) VALUES (?, ?)
+async fn set_persisted_nzb(
+    pipeline: &weaver_server_pipeline::Pipeline,
+    job_id: JobId,
+    nzb_zstd: Option<Vec<u8>>,
+) {
+    use weaver_server_db::persistence::sql_runtime::{SqlArg, SqlRuntime};
+    let id = SqlArg::I64(job_id.0 as i64);
+    let (statement, args) = match nzb_zstd {
+        Some(bytes) => (
+            "INSERT INTO job_nzbs (job_id, nzb_zstd) VALUES ({}, {})
              ON CONFLICT(job_id) DO UPDATE SET nzb_zstd = excluded.nzb_zstd",
-        )
-        .bind(job_id.0 as i64)
-        .bind(nzb_zstd),
-        None => sqlx::query("DELETE FROM job_nzbs WHERE job_id = ?").bind(job_id.0 as i64),
-    }
-    .execute(&pool)
-    .await
-    .unwrap();
-    assert_eq!(updated.rows_affected(), 1);
-    pool.close().await;
+            vec![id, SqlArg::Bytes(bytes)],
+        ),
+        None => ("DELETE FROM job_nzbs WHERE job_id = {}", vec![id]),
+    };
+    let db = pipeline_database(pipeline).datastore();
+    let updated = SqlRuntime::execute(db.write_exec(), statement, &args)
+        .await
+        .unwrap();
+    assert_eq!(updated, 1);
 }
 
 fn nzb_half_candidates() -> Vec<ArchivePasswordCandidate> {
@@ -133,7 +137,7 @@ async fn add_job_keeps_nzb_password_candidates_so_the_harvest_never_rereads_the_
 
     // Before any archive file completes: the persisted NZB is now unreadable,
     // so every candidate below came from what admission derived.
-    corrupt_persisted_nzb(&temp_dir, job_id).await;
+    corrupt_persisted_nzb(&pipeline, job_id).await;
 
     let mut expected = nzb_half_candidates();
     expected.insert(
@@ -169,7 +173,7 @@ async fn the_first_harvest_parses_the_persisted_nzb_and_later_ones_read_memory()
     assert!(remembered);
     assert!(first == nzb_half_candidates());
 
-    corrupt_persisted_nzb(&temp_dir, job_id).await;
+    corrupt_persisted_nzb(&pipeline, job_id).await;
 
     let (second, remembered) = harvest(&pipeline, job_id);
     assert!(remembered);
@@ -194,7 +198,7 @@ async fn a_harvest_that_finds_no_persisted_nzb_remembers_the_empty_list() {
     )
     .await;
     forget_harvest(&mut pipeline, job_id);
-    set_persisted_nzb(&temp_dir, job_id, None).await;
+    set_persisted_nzb(&pipeline, job_id, None).await;
 
     let (first, remembered) = harvest(&pipeline, job_id);
     assert!(remembered);
@@ -203,7 +207,7 @@ async fn a_harvest_that_finds_no_persisted_nzb_remembers_the_empty_list() {
     // Bytes that appear afterwards are not read: the first harvest's answer
     // stands for the rest of the job.
     set_persisted_nzb(
-        &temp_dir,
+        &pipeline,
         job_id,
         Some(sample_nzb_zstd_with_password("meta-key")),
     )
@@ -232,7 +236,7 @@ async fn a_harvest_whose_nzb_failed_to_parse_reads_the_row_again() {
 
     // The row read again finds the NZB once it parses.
     set_persisted_nzb(
-        &temp_dir,
+        &pipeline,
         job_id,
         Some(sample_nzb_zstd_with_password("meta-key")),
     )

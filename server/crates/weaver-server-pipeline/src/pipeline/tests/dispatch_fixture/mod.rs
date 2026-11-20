@@ -8,19 +8,27 @@ pub mod blocking_lane;
 mod booking;
 pub mod busy_turns;
 pub mod checkpoint;
+pub mod dispatch_timing;
+mod drain_and_pressure;
+pub(in crate::pipeline::tests) mod ladder;
 pub mod ladder_failures;
 pub mod ladder_quota;
-pub mod scheduler_lanes;
-pub mod scheduler_activation;
-pub(in crate::pipeline::tests) mod ladder;
 pub mod lane_holdings;
 pub mod lanes;
 mod logs;
+pub mod owned_completion;
 pub mod owned_failures;
+pub mod owned_pool;
+pub mod propagation;
 pub(in crate::pipeline::tests) mod results;
+pub use results::LaneResults;
 pub mod retries;
-mod seeded_walk;
 pub(in crate::pipeline::tests) mod scheduler;
+pub mod scheduler_activation;
+pub mod scheduler_lanes;
+mod seeded_walk;
+pub mod sequential_refill;
+pub mod volume_budget;
 
 // Every pipeline these tests build checks, after each dispatch pass and each
 // lane result batch, that its in-flight gauges are what its live lanes hold.
@@ -58,7 +66,8 @@ impl DispatchFixture {
     }
 
     pub fn book_missing(&mut self, segment: SegmentId) {
-        self.0.book_terminal_segment(segment, SegmentTerminalState::Missing);
+        self.0
+            .book_terminal_segment(segment, SegmentTerminalState::Missing);
     }
 
     pub async fn add_files(&mut self, id: JobId, name: &str, prefix: &str, count: usize) {

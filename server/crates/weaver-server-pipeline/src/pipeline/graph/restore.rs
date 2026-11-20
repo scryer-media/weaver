@@ -104,7 +104,7 @@ pub(crate) struct GraphRestore {
 // pipeline thread so the restore itself, every read back included, runs off
 // it.
 // How many restores were entered, for the tests that show one was not.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) static RESTORES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub(crate) struct RestoreSeat {
@@ -252,7 +252,7 @@ impl RestoreSeat {
         job_id: JobId,
         files: Vec<RootFile>,
     ) -> Result<GraphRestore, GraphRestoreError> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         RESTORES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // A restore replays the job's own facts: a panic in it is the job's.
         let _job = weaver_server_base::runtime::panic_trap::JobScope::enter(job_id);

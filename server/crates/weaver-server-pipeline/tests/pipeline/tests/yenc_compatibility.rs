@@ -186,7 +186,7 @@ async fn an_article_past_the_parks_total_is_requeued_without_retry_budget() {
         file_id,
         segment_number: 3,
     };
-    let queued = |pipeline: &Pipeline| download_queue_len(&pipeline, file_id.job_id);
+    let queued = |pipeline: &Pipeline| download_queue_len(pipeline, file_id.job_id);
     let buffered = backlog(&pipeline).write_buffered_bytes;
     let buffered_segments = backlog(&pipeline).write_buffered_segments;
 

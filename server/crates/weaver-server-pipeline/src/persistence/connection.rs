@@ -3,9 +3,9 @@
 
 use super::executor::DatabaseRuntimeWorker;
 #[cfg(test)]
-use super::executor::postgres_db_concurrency_from_env;
+pub(crate) use super::executor::blocking_call_probe;
 #[cfg(test)]
-pub(crate) use super::executor::{actor_thread, blocking_call_probe};
+use super::executor::postgres_db_concurrency_from_env;
 use crate::history::cache::{HistoryWriterCacheQueries, JobHistoryCache};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;

@@ -27,7 +27,7 @@ fn held_segment(job_id: JobId, file_index: u32, segment_number: u32) -> SegmentI
 async fn a_credentials_refusal_retries_on_a_server_that_may_still_serve() {
     let temp_dir = tempfile::tempdir().unwrap();
     let mut pipeline = DispatchFixture::new(&temp_dir).await;
-    pipeline.set_retention_client(&[0, 0]);
+    pipeline.set_retention(&[0, 0]);
     let job_id = JobId(41961);
     pipeline
         .add_job(
@@ -86,7 +86,7 @@ async fn a_credentials_refusal_retries_on_a_server_that_may_still_serve() {
 async fn refused_articles_of_a_file_retry_holding_its_one_group_list() {
     let temp_dir = tempfile::tempdir().unwrap();
     let mut pipeline = DispatchFixture::new(&temp_dir).await;
-    pipeline.set_retention_client(&[0, 0]);
+    pipeline.set_retention(&[0, 0]);
     let job_id = JobId(41962);
     let segments = 64u32;
     pipeline

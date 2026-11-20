@@ -5,7 +5,6 @@
 // Every one serves arbitrary bytes over plain HTTPS; fast.com hands out a
 // token its own page carries.
 
-
 pub const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
 
