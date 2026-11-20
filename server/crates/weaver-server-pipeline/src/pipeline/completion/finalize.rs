@@ -12,7 +12,7 @@ pub(crate) mod check;
 pub(crate) mod claims;
 pub(crate) mod deobfuscate;
 mod output;
-pub(crate) use output::claim_complete_destination_path;
+pub use output::claim_complete_destination_path;
 #[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(in crate::pipeline) use output::{
     CLAIM_FULL, DESTINATION_ROOM, FIXTURE_MOVE_HOOKS, FIXTURE_SPENT_HOOKS, PARTIAL_STAYS,
@@ -20,8 +20,8 @@ pub(in crate::pipeline) use output::{
 };
 pub(crate) use output::{RestoredPostProcessing, release_failed_delivery};
 mod status;
+pub(crate) use status::ActiveRuntimeValues;
 #[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) use status::RUNTIME_WRITES;
-pub(crate) use status::{ActiveRuntimeValues, StoredRuntimeValues};
 #[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) use status::{MOVING_ROW_REFUSED, MOVING_ROWS_WRITTEN};

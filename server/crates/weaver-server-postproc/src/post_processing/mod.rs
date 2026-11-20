@@ -12,11 +12,28 @@ pub mod model;
 #[cfg(test)]
 mod model_tests;
 
+pub mod admission_persistence;
+pub mod callbacks;
+pub mod database;
+pub mod effects;
+pub mod events;
+pub mod executor;
+pub mod feed;
+pub mod history_bundles;
+pub mod instance_model;
 pub mod instances;
+pub mod output;
+pub mod preset;
+pub mod run_metrics;
 pub mod runner;
 #[cfg(any(test, all(unix, feature = "test-support")))]
 #[doc(hidden)]
 pub mod runner_fixtures;
 #[cfg(test)]
 mod runner_tests;
+pub mod scan;
+pub mod scheduler;
 pub mod secrets;
+pub mod secrets_persistence;
+pub mod settings;
+pub mod test_run;

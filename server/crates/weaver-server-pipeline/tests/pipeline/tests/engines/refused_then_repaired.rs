@@ -13,7 +13,7 @@ use sha2::Digest;
 use std::collections::BTreeMap;
 use weaver_graph::recovery::RepairOutcome;
 use weaver_graph::{MemberId, Why};
-use weaver_server_pipeline::JobStatus;
+use weaver_server_composition::JobStatus;
 
 use super::harness::{
     ARTICLE, Post, Scenario, admit, par2_volumes, par2_volumes_sliced, par3_set, run,

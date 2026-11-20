@@ -6,13 +6,11 @@ use crate::jobs::queries::JobsQueries;
 use crate::settings::archive_passwords::SettingsArchivePasswordsInternalQueries;
 mod activation;
 pub(crate) use activation::read_stored_spec_and_passwords;
-pub(crate) use completion::finalize::{
-    ActiveRuntimeValues, RestoredPostProcessing, StoredRuntimeValues,
-};
+pub(crate) use completion::finalize::{ActiveRuntimeValues, RestoredPostProcessing};
 pub mod archive;
 mod capacity;
 mod completion;
-pub(crate) use completion::finalize::claim_complete_destination_path;
+pub use completion::finalize::claim_complete_destination_path;
 mod db_reply;
 mod decode;
 pub mod diagnostics;
@@ -69,9 +67,9 @@ use weaver_server_base::runtime::system_profile::SystemProfile;
 
 use self::download::{DownloadLaneMode, DownloadLaneRuntimeState, LaneParkReason};
 pub(crate) use self::extraction::ExtractionError;
-pub(crate) use self::extraction::ExtractionLimits;
 use self::extraction::ProcessMemoryBudget;
 pub(crate) use self::extraction::safety::ProcessMemoryPermit;
+pub use weaver_server_disk::pipeline::extraction::safety::ExtractionLimits;
 
 // Maximum number of retries for a single segment before giving up.
 const MAX_SEGMENT_RETRIES: u32 = 3;
@@ -146,7 +144,7 @@ pub(crate) fn job_carried_password_candidates(
 // `FilenameConvention`), and global (`Settings`, then `PasswordFile`). A value
 // already in the list is skipped without taking a slot, so the earliest
 // source keeps its label.
-pub(crate) fn assemble_archive_password_candidates(
+pub fn assemble_archive_password_candidates(
     spec_password: Option<&str>,
     carried: &[ArchivePasswordCandidate],
     global: &[ArchivePasswordCandidate],
@@ -1893,9 +1891,9 @@ pub struct Pipeline {
     // an egress download quota rather than a server quota parked it.
     pub(super) egress_quota_parked: HashMap<SegmentId, u32>,
     // Directory for active downloads (per-job subdirectories).
-    pub(super) intermediate_dir: PathBuf,
+    pub intermediate_dir: PathBuf,
     // Directory for completed downloads (category subdirectories).
-    pub(super) complete_dir: PathBuf,
+    pub complete_dir: PathBuf,
     // Legacy logical NZB path base retained for compatibility with existing rows and tests.
     pub(super) nzb_dir: PathBuf,
     // Jobs whose provider shares have moved since the last checkpoint.
@@ -2008,7 +2006,7 @@ pub struct Pipeline {
     // Jobs kept from downloading while a blocking instance runs on their
     // arrival.
     pub(super) added_script_holds: HashSet<JobId>,
-    pub(super) script_data_dir: PathBuf,
+    pub script_data_dir: PathBuf,
     pub(super) terminal_post_processing_cancellations:
         HashMap<JobId, tokio::sync::watch::Sender<bool>>,
     // The holds the pipeline last put in force from the queue: whether

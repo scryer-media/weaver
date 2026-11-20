@@ -12,6 +12,8 @@ test-support = []
 [dependencies]
 if-addrs = "0.15.0"
 serde_json = { workspace = true }
+hex = { workspace = true }
+sha1 = { workspace = true }
 weaver-server-disk = { path = "../weaver-server-disk" }
 async-trait = "0.1"
 chrono = { workspace = true }
@@ -20,6 +22,8 @@ tokio = { workspace = true }
 weaver-nntp = { path = "../../../engines/weaver-nntp", default-features = false }
 weaver-server-base = { path = "../weaver-server-base" }
 weaver-server-db = { path = "../weaver-server-db" }
+weaver-server-jobs = { path = "../weaver-server-jobs" }
+weaver-torrent = { workspace = true }
 weaver-tunnel = { path = "../../../engines/weaver-tunnel" }
 
 [dev-dependencies]

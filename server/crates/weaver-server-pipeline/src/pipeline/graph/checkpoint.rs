@@ -60,12 +60,12 @@ use weaver_server_base::jobs::ids::JobId;
 // makes.
 const ROOT_KIND: &str = "root";
 
-pub(crate) const CHECKPOINT_BYTES: u64 = 256 * 1024 * 1024;
-pub(crate) const CHECKPOINT_AGE: Duration = Duration::from_secs(5);
+pub const CHECKPOINT_BYTES: u64 = 256 * 1024 * 1024;
+pub const CHECKPOINT_AGE: Duration = Duration::from_secs(5);
 
 // A job's checkpoint, as a restore reads it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Snapshot {
+pub struct Snapshot {
     pub(crate) tree: TreeRecord,
     pub(crate) root: RootFacts,
     // What the writer holds of each member it holds anything of.
@@ -74,7 +74,7 @@ pub(crate) struct Snapshot {
     // The holds each namespace had paged to scratch.
     pub(crate) holds: Vec<HoldRecord>,
     // The candidate each node was offered last, by index.
-    pub(crate) passwords: BTreeMap<NodeId, usize>,
+    pub passwords: BTreeMap<NodeId, usize>,
 }
 
 // A hold of the namespace at `node` paged to its scratch file, or,
@@ -144,7 +144,7 @@ pub(crate) struct FileState {
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum CheckpointError {
+pub enum CheckpointError {
     #[error("the checkpoint has no root row")]
     NoRoot,
     #[error("node {node}: {reason}")]
@@ -156,7 +156,7 @@ pub(crate) enum CheckpointError {
 // A job's checkpoints on their way to the database: the rows the database
 // holds once what is queued is written, and the change queued for it.
 #[derive(Clone, Default)]
-pub(crate) struct Pending(Arc<Writer>);
+pub struct Pending(Arc<Writer>);
 
 #[derive(Default)]
 struct Writer {
@@ -495,14 +495,14 @@ pub(super) fn member_rows_built() -> usize {
 // taken: how many were taken, how many rows they changed, and how many bytes
 // of facts they wrote.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Tally {
-    pub(crate) checkpoints: usize,
-    pub(crate) rows: usize,
+pub struct Tally {
+    pub checkpoints: usize,
+    pub rows: usize,
     pub(crate) facts: usize,
 }
 
 impl Pending {
-    pub(crate) fn control(&self) -> CheckpointControl {
+    pub fn control(&self) -> CheckpointControl {
         self.slot().control.clone()
     }
 
@@ -804,7 +804,7 @@ impl Pending {
     }
 
     // A step wrote `bytes` of the job's coverage.
-    pub(crate) fn delivered(&self, bytes: u64) {
+    pub fn delivered(&self, bytes: u64) {
         let mut slot = self.slot();
         slot.dirty_bytes = slot.dirty_bytes.saturating_add(bytes);
     }
@@ -813,7 +813,7 @@ impl Pending {
     // write it joins would be. The first checkpoint is, and so is one after
     // the database's rows were lost. Otherwise the run mail hears once the
     // first step not yet taken is CHECKPOINT_AGE old.
-    pub(crate) fn stepped(&self, job_id: JobId, mail: &UnboundedSender<Said>) -> bool {
+    pub fn stepped(&self, job_id: JobId, mail: &UnboundedSender<Said>) -> bool {
         let mut slot = self.slot();
         let first = *slot.stepped.get_or_insert_with(tokio::time::Instant::now);
         // A change that waits too long joins the steps since, so its write
@@ -847,7 +847,7 @@ impl Pending {
     }
 
     // The stamp of the last checkpoint that changed anything.
-    pub(crate) fn stamp(&self) -> u64 {
+    pub fn stamp(&self) -> u64 {
         self.slot().asked
     }
 
@@ -976,7 +976,7 @@ impl Pending {
     // checkpoints are one `Pending`, told this before it takes any, so its
     // encoder has read nothing and the next encoding reads the root whole
     // and is compared with them.
-    pub(crate) fn written(&self, rows: GraphCheckpoint) {
+    pub fn written(&self, rows: GraphCheckpoint) {
         let mut slot = self.slot();
         slot.feed_verdict = rows.feed_verdict;
         let root = i64::from(NodeId::ROOT.0);
@@ -1106,7 +1106,7 @@ impl Pending {
     }
 
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-    pub(crate) fn tally(&self) -> Tally {
+    pub fn tally(&self) -> Tally {
         self.slot().tally
     }
 }
@@ -1338,7 +1338,7 @@ impl Pipeline {
 // The steps stay unread and the checkpoint is owed, so nothing more goes
 // out until one is recorded, and the step that takes the object back takes
 // it. A forced one still queues at once what earlier checkpoints recorded.
-pub(crate) fn checkpoint_job(
+pub fn checkpoint_job(
     graph: &mut GraphJob,
     job_id: JobId,
     db: &crate::Database,
@@ -1829,7 +1829,7 @@ fn envelope_rows(kept: &[KeptRecord]) -> Vec<EnvelopeRow> {
     out
 }
 
-pub(crate) fn snapshot(rows: &GraphCheckpoint) -> Result<Snapshot, CheckpointError> {
+pub fn snapshot(rows: &GraphCheckpoint) -> Result<Snapshot, CheckpointError> {
     let root = rows
         .nodes
         .iter()

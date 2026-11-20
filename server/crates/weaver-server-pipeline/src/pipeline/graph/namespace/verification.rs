@@ -34,7 +34,7 @@ pub(crate) struct Verification {
 }
 
 #[derive(Debug)]
-pub(crate) struct Verified {
+pub struct Verified {
     check: Verification,
     actual: Result<Option<u32>, LeafError>,
 }

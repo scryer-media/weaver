@@ -6,6 +6,9 @@
 // its delivery land.
 
 use weaver_server_base::events::model::PipelineEvent;
+use weaver_server_composition::{
+    FieldUpdate, HistoryFilter, JobHistoryRow, JobId, JobStatus, JobUpdate, SchedulerError,
+};
 use weaver_server_pipeline::history::{
     nzbget_state::HistoryNzbgetStateQueries, queries::HistoryQueries,
 };
@@ -23,11 +26,14 @@ use weaver_server_pipeline::pipeline::tests::{
     terminal_fixture::{any_move_in_flight, settle_moves},
     window_fixture::retiring,
 };
-use weaver_server_pipeline::{
-    FieldUpdate, HistoryFilter, JobHistoryRow, JobId, JobStatus, JobUpdate, Pipeline,
-    SchedulerError, SchedulerHandle,
-};
+use weaver_server_pipeline::{Pipeline, SchedulerHandle};
 
+use weaver_server_composition::post_processing::model::PipelineFailureStage;
+use weaver_server_composition::{
+    DuplicateAdmission, DuplicateAdmissionRequest, DuplicateMode, DuplicatePolicy,
+    FingerprintEvidence, JobSpec, MessageIds, SemanticCandidateSource, SemanticDuplicate,
+    SemanticPromotionState, SemanticTerminalCause, SubmissionOrigin,
+};
 use weaver_server_pipeline::history::HistoryFailureKind;
 use weaver_server_pipeline::jobs::duplicate_persistence::JobsDuplicatePersistenceAdmitDuplicateSubmissionQueries;
 use weaver_server_pipeline::jobs::handle::DISK_SPACE_WAIT_REASON;
@@ -39,12 +45,6 @@ use weaver_server_pipeline::pipeline::tests::{
         fail_job, fail_on_health, has_login_refusals, has_terminal_cause, login_refusal_words,
     },
     refuse_login, sample_nzb_zstd,
-};
-use weaver_server_pipeline::post_processing::model::PipelineFailureStage;
-use weaver_server_pipeline::{
-    DuplicateAdmission, DuplicateAdmissionRequest, DuplicateMode, DuplicatePolicy,
-    FingerprintEvidence, JobSpec, MessageIds, SemanticCandidateSource, SemanticDuplicate,
-    SemanticPromotionState, SemanticTerminalCause, SubmissionOrigin,
 };
 
 async fn history(pipeline: &mut Pipeline, job: JobId) -> JobHistoryRow {

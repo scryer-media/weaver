@@ -11,7 +11,7 @@ mod durable;
 mod loans;
 mod passwords;
 mod repair;
-pub(crate) mod restore;
+pub mod restore;
 mod runs;
 mod works;
 
@@ -45,7 +45,7 @@ use crate::pipeline::ExtractionError;
 use weaver_server_disk::operations::disk::CapacityReader;
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum GraphError {
+pub enum GraphError {
     #[error("the namespace write path failed")]
     Write(#[from] WriteError),
     // The job's own record contradicts itself: it fails, and every other
@@ -111,48 +111,48 @@ impl GraphError {
 // space of the volume its scratch lives on, how many engines it may run at
 // once, and where their runs speak, and the extraction budget its writes are
 // held to.
-pub(crate) struct Storage {
-    pub(crate) working_dir: PathBuf,
+pub struct Storage {
+    pub working_dir: PathBuf,
     // Where the files of the members it delivers lie, and the free space of
     // that device: the working directory unless the complete directory is
     // on another device.
-    pub(crate) output: Option<(PathBuf, CapacityReader)>,
-    pub(crate) accountant: Arc<HoldsAccountant>,
-    pub(crate) decode: Arc<super::engine::DecodePool>,
-    pub(crate) free_disk: CapacityReader,
-    pub(crate) slots: usize,
-    pub(crate) mail: mpsc::Sender<Said>,
+    pub output: Option<(PathBuf, CapacityReader)>,
+    pub accountant: Arc<HoldsAccountant>,
+    pub decode: Arc<super::engine::DecodePool>,
+    pub free_disk: CapacityReader,
+    pub slots: usize,
+    pub mail: mpsc::Sender<Said>,
     // The job's password candidates, in the order they are tried, each with
     // where it came from.
-    pub(crate) passwords: Vec<crate::jobs::ArchivePasswordCandidate>,
+    pub passwords: Vec<crate::jobs::ArchivePasswordCandidate>,
     // The job's extraction budget.
-    pub(crate) caps: Caps,
+    pub caps: Caps,
     // How deep the job's namespaces may nest, the root's being 0.
-    pub(crate) nesting: u32,
+    pub nesting: u32,
     // What the job's runs and repairs are granted as each starts.
-    pub(crate) hardware: super::hardware::Hardware,
+    pub hardware: super::hardware::Hardware,
     // Where the job's writes publish what they take, in a pipeline.
-    pub(crate) metrics: Option<Arc<weaver_server_base::operations::metrics::PipelineMetrics>>,
+    pub metrics: Option<Arc<weaver_server_base::operations::metrics::PipelineMetrics>>,
     // The volume writers the job's files are written through; `None` for a
     // job that writes its files itself as each byte is placed.
-    pub(crate) disk: Option<super::disk::JobDisk>,
+    pub disk: Option<super::disk::JobDisk>,
     // Weaver's data folder and the free space of its disk: where a decode
     // window goes when the working directory cannot hold it.
-    pub(crate) data_dir: Option<(
+    pub data_dir: Option<(
         PathBuf,
         CapacityReader,
         weaver_server_disk::scratch::ScratchLedger,
     )>,
     // What decode windows took from the working directory's disk, for
     // every job that lends on it.
-    pub(crate) window_ledger: weaver_server_disk::scratch::ScratchLedger,
+    pub window_ledger: weaver_server_disk::scratch::ScratchLedger,
 }
 
 impl Storage {
     // The scratch memory job `scope` may borrow: scratch files in its
     // working directory, else in the data folder, out of the free space the
     // holds keep.
-    pub(crate) fn scratch(&self, scope: u64) -> weaver_server_disk::scratch::Scratch {
+    pub fn scratch(&self, scope: u64) -> weaver_server_disk::scratch::Scratch {
         let scratch = weaver_server_disk::scratch::Scratch::new(
             self.working_dir.clone(),
             self.free_disk.clone(),
@@ -175,7 +175,7 @@ impl Storage {
     }
 }
 
-pub(crate) struct GraphJob {
+pub struct GraphJob {
     tree: Tree,
     root: ArticleRoot,
     builder: Box<dyn Builder + Send + Sync>,
@@ -237,16 +237,16 @@ pub(crate) enum Note {
 
 // A root member as the post lists it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RootFile {
-    pub(crate) name: String,
+pub struct RootFile {
+    pub name: String,
     // Each article's ordinal and declared encoded size.
-    pub(crate) articles: Vec<(u32, u32)>,
+    pub articles: Vec<(u32, u32)>,
 }
 
 impl GraphJob {
     // The runtime a job admitted fresh gets. `scope` is the job's
     // process-wide id.
-    pub(crate) fn admit(scope: u64, files: &[RootFile], storage: Storage) -> Self {
+    pub fn admit(scope: u64, files: &[RootFile], storage: Storage) -> Self {
         let windows = storage.windows(scope);
         let runs = Runs::new(scope, storage.slots, storage.mail, storage.decode)
             .on(storage.hardware)
@@ -464,7 +464,7 @@ impl GraphJob {
     // as it left hold the work undone, which a restart could not always do
     // without the tree, and a tree half given up is no state to restore. A
     // restart gives up again from the checkpoint before.
-    pub(crate) fn working(&self) -> bool {
+    pub fn working(&self) -> bool {
         self.works.working() || self.quieting.is_some()
     }
 
@@ -475,8 +475,8 @@ impl GraphJob {
     }
 
     // Every work loan from here on stays in the test's hand.
-    #[cfg(test)]
-    pub(crate) fn hold_loans(&mut self) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hold_loans(&mut self) {
         self.works.hold_loans();
     }
 
@@ -486,8 +486,8 @@ impl GraphJob {
         self.works.lent()
     }
 
-    #[cfg(test)]
-    pub(crate) fn held_loans(&mut self) -> Vec<works::HeldLoan> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn held_loans(&mut self) -> Vec<works::HeldLoan> {
         self.works.take_held()
     }
 
@@ -506,8 +506,8 @@ impl GraphJob {
 
     // A held loan's work done, and the word it comes back with through the
     // run mail, as one from the pool does.
-    #[cfg(test)]
-    pub(crate) fn worked_loan(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn worked_loan(
         &self,
         (node, serial, mut object, stop): works::HeldLoan,
     ) -> super::engine::Said {
@@ -526,12 +526,12 @@ impl GraphJob {
 
     // A checkpoint found an object out for its work and took nothing: the
     // work stays on the loop until one is recorded.
-    pub(crate) fn owe_checkpoint(&mut self) {
+    pub fn owe_checkpoint(&mut self) {
         self.works.owe_checkpoint();
     }
 
     // Whether a checkpoint that found an object out is owed still.
-    pub(crate) fn owes_checkpoint(&self) -> bool {
+    pub fn owes_checkpoint(&self) -> bool {
         self.works.owed()
     }
 
@@ -565,7 +565,7 @@ impl GraphJob {
     // Whether a member's file still waits to move, or a name a file left
     // waits to be free: the job is not done until every file sits at its
     // name.
-    pub(crate) fn moves_waiting(&self) -> bool {
+    pub fn moves_waiting(&self) -> bool {
         self.writer.moves_waiting()
     }
 
@@ -579,7 +579,7 @@ impl GraphJob {
     // Whether anything of the job waits for a checkpoint to commit. Not
     // while a rewalk reads: no file moves under it, so nothing hurries a
     // checkpoint on, and the first one after its last piece commits.
-    pub(crate) fn awaits_commit(&self) -> bool {
+    pub fn awaits_commit(&self) -> bool {
         self.writer.awaits_commit() && !self.works.rewalks_out()
     }
 
@@ -678,13 +678,13 @@ impl GraphJob {
     // its generation, so no run starts under it again: what it read is on
     // its shelf, and the restored job reads it again. A repair out on its
     // thread still comes back through the mail.
-    pub(crate) fn stop_runs(&mut self, limit: usize) {
+    pub fn stop_runs(&mut self, limit: usize) {
         self.loans.request_stop();
         self.runs.stop(limit);
     }
 
     // Whether a run or a repair of the job is still out on its thread.
-    pub(crate) fn workers_out(&self) -> bool {
+    pub fn workers_out(&self) -> bool {
         self.runs.in_flight() || self.loan_out()
     }
 
@@ -731,18 +731,18 @@ impl GraphJob {
         self.tree.namespace_mut(node)
     }
 
-    pub(crate) fn writer(&self) -> &NamespaceWriter {
+    pub fn writer(&self) -> &NamespaceWriter {
         &self.writer
     }
 
     // The job paused or resumed: its extraction deadline does not run
     // while it is paused.
-    pub(crate) fn hold_clock(&mut self, paused: bool) {
+    pub fn hold_clock(&mut self, paused: bool) {
         self.writer.hold_clock(paused);
     }
 
-    #[cfg(test)]
-    pub(crate) fn clock_held(&self) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn clock_held(&self) -> bool {
         self.writer.clock_held()
     }
 
@@ -785,7 +785,7 @@ impl GraphJob {
         self.writer.move_disk_for_test(disk);
     }
 
-    pub(crate) fn pending(&self) -> &Pending {
+    pub fn pending(&self) -> &Pending {
         &self.pending
     }
 
@@ -793,7 +793,7 @@ impl GraphJob {
     // off the tree. Stable. Payload still to fetch wins over everything
     // else, so while it is there, which is every article but the last, the
     // walks of the sets and members are not taken.
-    pub(crate) fn phase(&self) -> RootPhase {
+    pub fn phase(&self) -> RootPhase {
         if self.payload_waiting() {
             return RootPhase::Downloading;
         }
@@ -1059,7 +1059,7 @@ impl GraphJob {
     // Hand storage to completion. The graph only classifies what was
     // consumed; its adapter releases every handle before returning paths
     // completion may remove. A logical volume close is not an OS close.
-    pub(crate) fn release_delivery_files(&mut self) -> Result<Vec<PathBuf>, &'static str> {
+    pub fn release_delivery_files(&mut self) -> Result<Vec<PathBuf>, &'static str> {
         if self.work_pending() || self.runs.live() || self.moves_waiting() {
             return Err("graph storage is still in use before delivery");
         }
@@ -1220,7 +1220,7 @@ impl GraphJob {
     }
 
     // Whether the root holds the article or has ruled it lost.
-    pub(crate) fn article_settled(&self, volume: VolumeIndex, ordinal: u32) -> bool {
+    pub fn article_settled(&self, volume: VolumeIndex, ordinal: u32) -> bool {
         self.root.map.article_settled(volume, ordinal)
     }
 
@@ -1249,11 +1249,7 @@ impl GraphJob {
         self.root.map.take_moves()
     }
 
-    pub(crate) fn resume_runs(
-        &mut self,
-        slots: &mut RepairSlots,
-        limit: usize,
-    ) -> Result<(), GraphError> {
+    pub fn resume_runs(&mut self, slots: &mut RepairSlots, limit: usize) -> Result<(), GraphError> {
         self.step_runs(Vec::new(), limit)?;
         self.lend(slots, limit)
     }
@@ -1280,7 +1276,7 @@ impl GraphJob {
 
     // Whether the job waits for room on a disk, and its place among the
     // jobs that wait.
-    pub(crate) fn disk_held(&self) -> bool {
+    pub fn disk_held(&self) -> bool {
         self.writer.disk_held()
     }
 
@@ -1294,7 +1290,7 @@ impl GraphJob {
         self.writer.take_left_to_write()
     }
 
-    pub(crate) fn disk_ticket(&self) -> Option<u64> {
+    pub fn disk_ticket(&self) -> Option<u64> {
         self.writer.disk_ticket()
     }
 
@@ -1302,7 +1298,7 @@ impl GraphJob {
     // owes is promised again, and the runs parked for room, queued again,
     // start on the next step. A job that waits idle wakes whatever the
     // disk reads.
-    pub(crate) fn wake_disk(&mut self) -> bool {
+    pub fn wake_disk(&mut self) -> bool {
         if self.disk_idle() {
             return self.writer.wake_idle();
         }
@@ -1314,12 +1310,12 @@ impl GraphJob {
     // running or waits to. Its last write crossed the reserve and closed,
     // and it wakes on the next turn. A run still live could write again,
     // and keeps the job waiting for a reading with room.
-    pub(crate) fn disk_idle(&self) -> bool {
+    pub fn disk_idle(&self) -> bool {
         self.writer.disk_held() && self.writer.owes_nothing() && !self.runs.live()
     }
 
     // What the job waits for room for, and the folder it waits on.
-    pub(crate) fn disk_wait(&self) -> Option<(super::limits::DiskWait, std::path::PathBuf)> {
+    pub fn disk_wait(&self) -> Option<(super::limits::DiskWait, std::path::PathBuf)> {
         self.writer.disk_wait()
     }
 
@@ -1403,7 +1399,7 @@ impl GraphJob {
     // The article taken in and the runs stepped, with no lend: a caller
     // whose repair slots are shared lends after, holding them only for
     // that. True when the root took the article.
-    pub(crate) fn take_in(&mut self, decoded: Decoded, limit: usize) -> Result<bool, GraphError> {
+    pub fn take_in(&mut self, decoded: Decoded, limit: usize) -> Result<bool, GraphError> {
         let volume = decoded.volume;
         let member = MemberId(volume.0);
         let length = self.root.accepted_length(&decoded);
@@ -1435,7 +1431,7 @@ impl GraphJob {
     }
 
     // Every server failed the article; nothing will fetch it again.
-    pub(crate) fn lost(
+    pub fn lost(
         &mut self,
         volume: VolumeIndex,
         ordinal: u32,

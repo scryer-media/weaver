@@ -3,6 +3,8 @@
 
 use std::sync::{Arc, atomic::Ordering};
 use std::time::{Duration, Instant};
+use weaver_server_composition::{JobId, JobStatus};
+use weaver_server_pipeline::Pipeline;
 use weaver_server_pipeline::pipeline::tests::{
     control_fixture::completion_pending,
     decode_fixture::generation,
@@ -13,7 +15,6 @@ use weaver_server_pipeline::pipeline::tests::{
     refuse_login, refusing_harness_server_port, segmented_job_spec,
     stall_fixture::{client as client_of, job as stall_job, *},
 };
-use weaver_server_pipeline::{JobId, JobStatus, Pipeline};
 
 #[tokio::test]
 async fn a_stall_explained_by_a_future_deadline_is_never_kicked() {

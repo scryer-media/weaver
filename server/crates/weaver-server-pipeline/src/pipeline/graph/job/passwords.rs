@@ -103,8 +103,8 @@ impl Passwords {
 
 impl GraphJob {
     // The candidates the job tries, in order.
-    #[cfg(test)]
-    pub(crate) fn password_candidates(&self) -> &[String] {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn password_candidates(&self) -> &[String] {
         &self.passwords.candidates
     }
 

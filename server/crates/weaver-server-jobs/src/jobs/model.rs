@@ -467,3 +467,536 @@ impl FileSummaries {
             .sum()
     }
 }
+
+// The protocols, from one list: the enum, `ALL` in the same order, and the
+// exhaustive `index` every per-protocol entry is read through. A variant is
+// added to the list and nowhere else; `names` then fails to compile until
+// its row is written.
+macro_rules! protocols {
+    ($(#[$meta:meta])* pub enum Protocol { $($(#[$attr:meta])* $variant:ident => $index:literal),+ $(,)? }) => {
+        $(#[$meta])*
+        pub enum Protocol {
+            $($(#[$attr])* $variant),+
+        }
+
+        impl Protocol {
+            /// Every one, in the order their entries are indexed.
+            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
+            pub const COUNT: usize = Self::ALL.len();
+
+            /// Where the protocol's entry sits in every per-protocol table.
+            pub const fn index(self) -> usize {
+                match self {
+                    $(Self::$variant => $index),+
+                }
+            }
+        }
+    };
+}
+
+protocols! {
+    // What a job downloads over: its class of job.
+    #[derive(
+        Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+    )]
+    pub enum Protocol {
+        #[default]
+        Nzb => 0,
+        Torrent => 1,
+    }
+}
+
+// Every protocol's index is its place in `ALL`, and `ALL` holds each index
+// once: an index written out of order, twice or past the end fails the build.
+const _: () = {
+    let mut at = 0;
+    while at < Protocol::COUNT {
+        assert!(Protocol::ALL[at].index() == at);
+        at += 1;
+    }
+};
+
+/// Every name a class of job goes by, and what an operator's hold over it
+/// does: one row per protocol, read in place of a match at each caller.
+#[derive(Debug)]
+pub struct ClassNames {
+    /// Lower case, stable: stored values, schedule actions, GraphQL.
+    pub key: &'static str,
+    /// What runs the class's jobs, as a refusal names it while it is not
+    /// running.
+    pub runner: &'static str,
+    /// The GraphQL error code of an add the class cannot take because it is
+    /// not running or is turned off.
+    pub disabled_code: &'static str,
+    /// The operator's hold over the class alone, when it has one.
+    pub hold: Option<ClassHold>,
+}
+
+/// An operator's hold over one class, and where it is kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClassHold {
+    /// What the hold stops of the class's jobs.
+    pub scope: HoldScope,
+    /// The setting it is kept in across a restart.
+    pub setting: &'static str,
+}
+
+const NZB_CLASS: ClassNames = ClassNames {
+    key: "nzb",
+    runner: "download pipeline",
+    disabled_code: "NZB_DISABLED",
+    hold: None,
+};
+
+const TORRENT_CLASS: ClassNames = ClassNames {
+    key: "torrent",
+    runner: "torrent client",
+    disabled_code: "TORRENTS_DISABLED",
+    // The operator's pause of the torrents stops them whole, seeding too.
+    hold: Some(ClassHold {
+        scope: HoldScope::Everything,
+        setting: "torrent_paused",
+    }),
+};
+
+impl Protocol {
+    pub const fn names(self) -> &'static ClassNames {
+        match self {
+            Self::Nzb => &NZB_CLASS,
+            Self::Torrent => &TORRENT_CLASS,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        self.names().key
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|protocol| protocol.as_str() == value)
+    }
+
+    /// The class a classified payload belongs to; `None` for a URL whose
+    /// bytes are not fetched yet.
+    pub const fn of_kind(kind: &Kind) -> Option<Self> {
+        match kind {
+            Kind::Nzb => Some(Self::Nzb),
+            Kind::Metainfo | Kind::Magnet(_) => Some(Self::Torrent),
+            Kind::Url(_) => None,
+        }
+    }
+}
+
+/// A class an operator can hold apart from the rest: only a protocol whose
+/// row has a hold makes one, so no hold can name a class it would not stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct HeldClass(Protocol);
+
+impl HeldClass {
+    /// The held class of `protocol`, when its row has a hold.
+    pub const fn of(protocol: Protocol) -> Option<Self> {
+        match protocol.names().hold {
+            Some(_) => Some(Self(protocol)),
+            None => None,
+        }
+    }
+
+    /// The held class of `protocol`, for a constant: fails the build when
+    /// its row has no hold.
+    pub const fn must(protocol: Protocol) -> Self {
+        match Self::of(protocol) {
+            Some(class) => class,
+            None => panic!("the protocol has no hold of its own"),
+        }
+    }
+
+    pub const fn protocol(self) -> Protocol {
+        self.0
+    }
+
+    pub const fn hold(self) -> &'static ClassHold {
+        match &self.0.names().hold {
+            Some(hold) => hold,
+            None => unreachable!(),
+        }
+    }
+
+    /// Every class an operator can hold apart, in the table's order.
+    pub fn all() -> impl Iterator<Item = Self> {
+        Protocol::ALL.iter().copied().filter_map(Self::of)
+    }
+}
+
+// A held class is stored and sent by its protocol's key; a key that names no
+// class, or a class with no hold, is refused.
+impl Serialize for HeldClass {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.0.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for HeldClass {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let key = String::deserialize(deserializer)?;
+        let protocol = Protocol::parse(&key)
+            .ok_or_else(|| serde::de::Error::custom(format!("no class of job is named {key}")))?;
+        Self::of(protocol)
+            .ok_or_else(|| serde::de::Error::custom(format!("the {key} class has no hold")))
+    }
+}
+
+// What a hold stops of the items it covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum HoldScope {
+    // Downloading stops; what is complete keeps seeding.
+    Downloads,
+    // Everything stops, seeding too.
+    Everything,
+}
+
+/// What a submission is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Kind {
+    /// An NZB, or anything else: the NZB path refuses what it cannot read,
+    /// in its own words.
+    Nzb,
+    /// A bencoded torrent metainfo.
+    Metainfo,
+    /// A magnet URI. A bare infohash is given as its magnet.
+    Magnet(String),
+    /// An http(s) URL, whose bytes say what it is once fetched.
+    Url(url::Url),
+}
+
+impl Kind {
+    /// The class of job these bytes belong to; `None` for a URL whose bytes
+    /// are not fetched yet.
+    pub const fn protocol(&self) -> Option<Protocol> {
+        Protocol::of_kind(self)
+    }
+}
+
+// Status of a job in the scheduler.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JobStatus {
+    AwaitingQueueScripts,
+    Queued,
+    Downloading,
+    // Health probe in progress — checking article availability.
+    Checking,
+    Verifying,
+    QueuedRepair,
+    Repairing,
+    QueuedExtract,
+    Extracting,
+    // Moving extracted files to the final destination directory.
+    Moving,
+    QueuedPostProcessing,
+    PostProcessing,
+    Complete,
+    // Delivered with what extracted; at least one member is damaged or
+    // missing. Terminal like Complete; clients see it as failed.
+    Partial,
+    Failed { error: String },
+    Paused,
+    // A magnet link is asking its peers for the torrent's metainfo.
+    FetchingMetadata,
+    // A torrent's pieces already on disk are being hashed.
+    CheckingFiles,
+    // A finished torrent is uploading to its peers.
+    Seeding,
+    // A torrent that is downloading has no peer sending it data.
+    Stalled,
+}
+
+impl JobStatus {
+    // Whether the job is still being worked through: queued, downloading,
+    // or verifying, repairing or extracting what came. A pause, a failure or
+    // anything after that work is done belongs to whoever set it.
+    pub fn in_progress(&self) -> bool {
+        matches!(
+            self,
+            Self::Queued | Self::Downloading | Self::Verifying | Self::Repairing | Self::Extracting
+        )
+    }
+
+    // Whether the download is over and the job is in verify, repair,
+    // extraction, the move or post-processing, or waits for one of them.
+    pub fn past_download(&self) -> bool {
+        matches!(
+            self,
+            Self::Verifying
+                | Self::QueuedRepair
+                | Self::Repairing
+                | Self::QueuedExtract
+                | Self::Extracting
+                | Self::Moving
+                | Self::QueuedPostProcessing
+                | Self::PostProcessing
+        )
+    }
+
+    // Whether the job has its outcome: complete, partial or failed.
+    pub fn finished(&self) -> bool {
+        matches!(self, Self::Complete | Self::Partial | Self::Failed { .. })
+    }
+
+    pub fn persisted_status(&self) -> &'static str {
+        match self {
+            Self::AwaitingQueueScripts => "awaiting_queue_scripts",
+            Self::Queued => "queued",
+            Self::Downloading => "downloading",
+            Self::Checking => "checking",
+            Self::Verifying => "verifying",
+            Self::QueuedRepair => "queued_repair",
+            Self::Repairing => "repairing",
+            Self::QueuedExtract => "queued_extract",
+            Self::Extracting => "extracting",
+            Self::Moving => "moving",
+            Self::QueuedPostProcessing => "queued_post_processing",
+            Self::PostProcessing => "post_processing",
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+            Self::Failed { .. } => "failed",
+            Self::Paused => "paused",
+            Self::FetchingMetadata => "fetching_metadata",
+            Self::CheckingFiles => "checking_files",
+            Self::Seeding => "seeding",
+            Self::Stalled => "stalled",
+        }
+    }
+
+    // The stage a terminal status names as failed by itself, when no step
+    // recorded one: a partial delivery left members short, which every
+    // reader outside the engine takes for a failed unpack.
+    pub fn shortfall_stage(&self) -> Option<crate::jobs::failure_stage::PipelineFailureStage> {
+        matches!(self, Self::Partial)
+            .then_some(crate::jobs::failure_stage::PipelineFailureStage::Extract)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DownloadState {
+    Queued,
+    Downloading,
+    // Health probe in progress — checking article availability.
+    Checking,
+    Complete,
+    Failed,
+}
+
+impl DownloadState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Downloading => "downloading",
+            Self::Checking => "checking",
+            Self::Complete => "complete",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "queued" => Some(Self::Queued),
+            "downloading" => Some(Self::Downloading),
+            "checking" => Some(Self::Checking),
+            "complete" => Some(Self::Complete),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+pub use weaver_server_base::jobs::model::PostState;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RunState {
+    Active,
+    Paused,
+}
+
+impl RunState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Paused => "paused",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "active" => Some(Self::Active),
+            "paused" => Some(Self::Paused),
+            _ => None,
+        }
+    }
+}
+
+pub fn derive_legacy_job_status(
+    download_state: DownloadState,
+    post_state: PostState,
+    run_state: RunState,
+    failure_error: Option<&str>,
+) -> JobStatus {
+    if matches!(run_state, RunState::Paused) {
+        return JobStatus::Paused;
+    }
+
+    if matches!(download_state, DownloadState::Failed) || matches!(post_state, PostState::Failed) {
+        return JobStatus::Failed {
+            error: failure_error.unwrap_or("unknown error").to_string(),
+        };
+    }
+
+    if matches!(post_state, PostState::Completed)
+        && matches!(download_state, DownloadState::Complete)
+    {
+        return JobStatus::Complete;
+    }
+
+    match post_state {
+        PostState::AwaitingQueueScripts => JobStatus::AwaitingQueueScripts,
+        PostState::Finalizing => JobStatus::Moving,
+        PostState::QueuedPostProcessing => JobStatus::QueuedPostProcessing,
+        PostState::PostProcessing => JobStatus::PostProcessing,
+        PostState::Repairing => JobStatus::Repairing,
+        PostState::QueuedRepair => JobStatus::QueuedRepair,
+        PostState::Verifying | PostState::AwaitingRepair => JobStatus::Verifying,
+        PostState::Extracting => JobStatus::Extracting,
+        PostState::QueuedExtract => JobStatus::QueuedExtract,
+        PostState::Idle
+        | PostState::WaitingForVolumes
+        | PostState::Completed
+        | PostState::Failed => match download_state {
+            DownloadState::Checking => JobStatus::Checking,
+            DownloadState::Queued => JobStatus::Queued,
+            DownloadState::Downloading | DownloadState::Complete | DownloadState::Failed => {
+                JobStatus::Downloading
+            }
+        },
+    }
+}
+
+// The error a job the operator cancelled carries in history.
+pub const OPERATOR_CANCELLED_ERROR: &str = "cancelled by operator";
+
+pub fn job_status_from_persisted_str(status: &str, error: Option<&str>) -> JobStatus {
+    match status {
+        "awaiting_queue_scripts" => JobStatus::AwaitingQueueScripts,
+        "queued" => JobStatus::Queued,
+        "downloading" => JobStatus::Downloading,
+        "checking" => JobStatus::Checking,
+        "verifying" => JobStatus::Verifying,
+        "queued_repair" => JobStatus::QueuedRepair,
+        "repairing" => JobStatus::Repairing,
+        "queued_extract" => JobStatus::QueuedExtract,
+        "extracting" => JobStatus::Extracting,
+        "moving" => JobStatus::Moving,
+        "queued_post_processing" => JobStatus::QueuedPostProcessing,
+        "post_processing" => JobStatus::PostProcessing,
+        "complete" => JobStatus::Complete,
+        "partial" => JobStatus::Partial,
+        "failed" => JobStatus::Failed {
+            error: error.unwrap_or("unknown error").to_string(),
+        },
+        "paused" => JobStatus::Paused,
+        "fetching_metadata" => JobStatus::FetchingMetadata,
+        "checking_files" => JobStatus::CheckingFiles,
+        "seeding" => JobStatus::Seeding,
+        "stalled" => JobStatus::Stalled,
+        "cancelled" => JobStatus::Failed {
+            error: error.unwrap_or("cancelled").to_string(),
+        },
+        other => JobStatus::Failed {
+            error: format!("unknown status: {other}"),
+        },
+    }
+}
+
+pub fn runtime_lanes_from_status_snapshot(
+    status: &JobStatus,
+) -> (DownloadState, PostState, RunState) {
+    match status {
+        JobStatus::AwaitingQueueScripts => (
+            DownloadState::Complete,
+            PostState::AwaitingQueueScripts,
+            RunState::Active,
+        ),
+        JobStatus::Queued => (DownloadState::Queued, PostState::Idle, RunState::Active),
+        JobStatus::Downloading => (
+            DownloadState::Downloading,
+            PostState::Idle,
+            RunState::Active,
+        ),
+        JobStatus::Checking => (DownloadState::Checking, PostState::Idle, RunState::Active),
+        JobStatus::Verifying => (
+            DownloadState::Complete,
+            PostState::Verifying,
+            RunState::Active,
+        ),
+        JobStatus::QueuedRepair => (
+            DownloadState::Complete,
+            PostState::QueuedRepair,
+            RunState::Active,
+        ),
+        JobStatus::Repairing => (
+            DownloadState::Complete,
+            PostState::Repairing,
+            RunState::Active,
+        ),
+        JobStatus::QueuedExtract => (
+            DownloadState::Complete,
+            PostState::QueuedExtract,
+            RunState::Active,
+        ),
+        JobStatus::Extracting => (
+            DownloadState::Complete,
+            PostState::Extracting,
+            RunState::Active,
+        ),
+        JobStatus::Moving => (
+            DownloadState::Complete,
+            PostState::Finalizing,
+            RunState::Active,
+        ),
+        JobStatus::QueuedPostProcessing => (
+            DownloadState::Complete,
+            PostState::QueuedPostProcessing,
+            RunState::Active,
+        ),
+        JobStatus::PostProcessing => (
+            DownloadState::Complete,
+            PostState::PostProcessing,
+            RunState::Active,
+        ),
+        JobStatus::Complete | JobStatus::Partial => (
+            DownloadState::Complete,
+            PostState::Completed,
+            RunState::Active,
+        ),
+        JobStatus::Failed { .. } => (DownloadState::Failed, PostState::Failed, RunState::Active),
+        JobStatus::Paused => (DownloadState::Queued, PostState::Idle, RunState::Paused),
+        JobStatus::FetchingMetadata | JobStatus::Stalled => (
+            DownloadState::Downloading,
+            PostState::Idle,
+            RunState::Active,
+        ),
+        JobStatus::CheckingFiles => (DownloadState::Checking, PostState::Idle, RunState::Active),
+        JobStatus::Seeding => (
+            DownloadState::Complete,
+            PostState::Completed,
+            RunState::Active,
+        ),
+    }
+}
+
+// Current wall-clock time as Unix epoch milliseconds.
+pub fn epoch_ms_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as f64
+}

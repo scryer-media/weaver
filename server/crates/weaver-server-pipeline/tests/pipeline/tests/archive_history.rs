@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use weaver_server_base::jobs::ids::JobId;
+use weaver_server_composition::{ArchiveHistoryOutcome as Outcome, ArchiveHistoryResult};
 use weaver_server_pipeline::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
 use weaver_server_pipeline::history::queries::HistoryQueries;
 use weaver_server_pipeline::jobs::repository::JobsRepositoryQueries;
@@ -13,7 +14,6 @@ use weaver_server_pipeline::pipeline::tests::{
     insert_active_job, insert_history_row_with_nzb_zstd, new_direct_pipeline_at_roots,
     retire_pipeline_database, sample_nzb_zstd, standalone_job_spec,
 };
-use weaver_server_pipeline::{ArchiveHistoryOutcome as Outcome, ArchiveHistoryResult};
 
 // Nothing on disk is already gone, and is stamped. A second archive changes
 // nothing and returns the first stamp.
@@ -233,7 +233,7 @@ async fn finishing_again_clears_the_stamp() {
     database(&pipeline)
         .archive_job(
             job_id,
-            &weaver_server_pipeline::JobHistoryRow {
+            &weaver_server_composition::JobHistoryRow {
                 archived_at: Some(NOW),
                 ..row
             },
@@ -259,7 +259,7 @@ async fn rewriting_the_entry_without_a_stamp_clears_the_record() {
 
     // Written again with the stamp, the record stays.
     database(&pipeline)
-        .insert_job_history(&weaver_server_pipeline::JobHistoryRow {
+        .insert_job_history(&weaver_server_composition::JobHistoryRow {
             archived_at: Some(NOW),
             ..row.clone()
         })
@@ -813,7 +813,7 @@ async fn a_script_a_later_job_gains_during_the_removals_stops_before_its_files_g
                 // The second job's script starts as the first job's files go.
                 Step::Turn(id) if id == first => {
                     held = Some(Box::new(
-                        weaver_server_pipeline::post_processing::events::hold_test_event_run(
+                        weaver_server_composition::post_processing::events::hold_test_event_run(
                             &db, second.0, "marked",
                         ),
                     ));

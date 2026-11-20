@@ -51,7 +51,7 @@ impl Class {
 // job's record, which fails the job and never the daemon.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("the article map of {volume} placed articles {start}..{end} at an inverted range")]
-pub(crate) struct Inconsistent {
+pub struct Inconsistent {
     pub(crate) volume: VolumeIndex,
     pub(crate) start: usize,
     pub(crate) end: usize,

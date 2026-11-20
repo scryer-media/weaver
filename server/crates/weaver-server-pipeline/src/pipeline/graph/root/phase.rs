@@ -12,7 +12,7 @@ use weaver_graph::{NodeId, Tree};
 use crate::jobs::model::JobStatus;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum RootPhase {
+pub enum RootPhase {
     Downloading,
     Verifying,
     Repairing,

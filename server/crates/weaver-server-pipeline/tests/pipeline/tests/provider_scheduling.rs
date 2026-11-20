@@ -5,12 +5,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use weaver_model::files::FileRole;
+use weaver_server_composition::{FileSpec, JobId, MessageIds, SegmentSpec};
 use weaver_server_pipeline::pipeline::tests::{
     activate_job, memory_fixture::admitted_count, new_direct_pipeline, nzb_zstd_for,
     password_fixture::add_job, provider_fixture::*, queue_scale_fixture::admitted_ids,
     segmented_job_spec,
 };
-use weaver_server_pipeline::{FileSpec, JobId, MessageIds, SegmentSpec};
 
 // Hold each socket at its first BODY. Accepted sockets and observed commands
 // provide the barrier; elapsed time and scheduler speed play no part.

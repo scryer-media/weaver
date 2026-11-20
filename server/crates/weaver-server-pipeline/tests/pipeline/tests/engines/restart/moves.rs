@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use weaver_server_pipeline::JobStatus;
+use weaver_server_composition::JobStatus;
 use weaver_server_pipeline::pipeline::tests::engines::{
     harness::{ARTICLE, Scenario, payload},
     restart_fixtures::{Restarted, with_par3},

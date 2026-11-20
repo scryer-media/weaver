@@ -382,7 +382,7 @@ async fn a_stall_under_soft_byte_pressure_is_still_reported() {
         metrics(&pipeline)
             .download_pressure_state
             .load(Ordering::Relaxed),
-        weaver_server_pipeline::DownloadPressureState::Soft.as_code()
+        weaver_server_composition::DownloadPressureState::Soft.as_code()
     );
     assert_eq!(
         liveness::soft_dispatch_after(&pipeline),
@@ -399,7 +399,7 @@ async fn a_stall_under_soft_byte_pressure_is_still_reported() {
         metrics(&pipeline)
             .download_pressure_state
             .load(Ordering::Relaxed),
-        weaver_server_pipeline::DownloadPressureState::Soft.as_code()
+        weaver_server_composition::DownloadPressureState::Soft.as_code()
     );
     let heard = lines.take();
     assert_eq!(heard.len(), 1, "{heard:?}");

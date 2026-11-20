@@ -617,7 +617,7 @@ fn disk_error(failure: Failure, device: crate::pipeline::graph::limits::Device) 
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct JobDisk {
+pub struct JobDisk {
     // The volume the working directory lies on.
     working: Arc<Submitter>,
     // Where the delivered files lie and their volume, when it is another.

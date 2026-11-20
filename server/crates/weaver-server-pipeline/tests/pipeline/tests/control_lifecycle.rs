@@ -4,8 +4,12 @@
 use std::{future::Future, path::PathBuf};
 
 use weaver_server_base::{events::model::PipelineEvent, jobs::ids::JobId};
+use weaver_server_composition::{
+    DownloadState, FieldUpdate, JobStatus, JobUpdate, RunState, SchedulerError,
+};
 use weaver_server_pipeline::history::queries::HistoryQueries;
 use weaver_server_pipeline::jobs::queries::JobsQueries;
+use weaver_server_pipeline::pipeline::Pipeline;
 use weaver_server_pipeline::pipeline::tests::{
     activate_job,
     control_fixture::*,
@@ -21,9 +25,6 @@ use weaver_server_pipeline::pipeline::tests::{
     },
     segmented_job_spec, settle_failed_releases, standalone_job_spec,
     window_fixture::{articles_active, has_installed, intermediate_dir, retiring},
-};
-use weaver_server_pipeline::{
-    DownloadState, FieldUpdate, JobStatus, JobUpdate, RunState, SchedulerError, pipeline::Pipeline,
 };
 
 // A repeated-article cache that cannot be prepared fails the job when its

@@ -68,6 +68,7 @@ impl<T> std::ops::IndexMut<Protocol> for ByProtocol<T> {
 pub const PIPELINE: Protocol = Protocol::Nzb;
 
 pub use weaver_server_net::bandwidth::limits::ClassRates;
+pub use weaver_server_net::proxies::give_back::{Owed, TunnelGiveBack};
 
 /// A class's side of the global limits.
 pub trait ClassRate: Send + Sync {
@@ -230,92 +231,6 @@ pub trait JobClass: Send + Sync {
         let _ = ask;
     }
 }
-
-/// A WireGuard tunnel's wake for a class to give back its sockets there.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TunnelGiveBack {
-    /// The tunnel: its egress and the hops up to and including it, as a
-    /// socket's `DialPath` names them.
-    pub egress: u32,
-    pub hops: Vec<u32>,
-    /// The torrent sessions whose legs run over the tunnel.
-    pub torrent_routes: Vec<crate::torrents::sessions::RouteKey>,
-    /// What the class owes the tunnel, read when it acts.
-    pub owed: Owed,
-}
-
-impl TunnelGiveBack {
-    /// Whether a socket dialled over `path` sits in the tunnel itself: on
-    /// its egress, with the tunnel its last hop.
-    pub fn holds(&self, path: &weaver_tunnel::pipe::DialPath) -> bool {
-        self.rides(path.egress, &path.proxies)
-    }
-
-    /// Whether a socket on `egress` through `proxies` sits in the tunnel.
-    pub fn rides(&self, egress: u32, proxies: &[u32]) -> bool {
-        egress == self.egress && proxies == self.hops
-    }
-}
-
-/// What a class owes a tunnel: the bytes it holds there past what it is
-/// given while another class presses, read at the moment it is acted on.
-/// A level, never an amount handed over once: an answer, or a connection
-/// marked to close for one, reads it again when it acts.
-#[derive(Clone)]
-pub struct Owed {
-    owed: Arc<dyn Fn() -> u64 + Send + Sync>,
-    dry: Arc<dyn Fn() + Send + Sync>,
-}
-
-impl Owed {
-    /// `owed` reads the level; `dry` tells the tunnel an answer found
-    /// nothing it could give.
-    pub fn new(
-        owed: impl Fn() -> u64 + Send + Sync + 'static,
-        dry: impl Fn() + Send + Sync + 'static,
-    ) -> Self {
-        Self {
-            owed: Arc::new(owed),
-            dry: Arc::new(dry),
-        }
-    }
-
-    /// The bytes owed now.
-    pub fn bytes(&self) -> u64 {
-        (self.owed)()
-    }
-
-    /// Whether anything is owed now.
-    pub fn stands(&self) -> bool {
-        self.bytes() > 0
-    }
-
-    /// The answer found nothing it could give: the class is not woken again
-    /// until its own holdings on the tunnel change.
-    pub fn dry(&self) {
-        (self.dry)()
-    }
-
-    /// Whether anything is owed, as a connection marked to close reads it.
-    pub fn standing(&self) -> Arc<dyn Fn() -> bool + Send + Sync> {
-        let owed = Arc::clone(&self.owed);
-        Arc::new(move || owed() > 0)
-    }
-}
-
-impl std::fmt::Debug for Owed {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Owed")
-    }
-}
-
-impl PartialEq for Owed {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.owed, &other.owed)
-    }
-}
-
-impl Eq for Owed {}
 
 /// Where an intake hands a payload.
 pub enum Route<'a> {
@@ -523,6 +438,20 @@ impl OwnedRows {
     }
 }
 
+// The tunnels' give-backs reach the classes through this: the network
+// runtime sits below the job classes and names none of them.
+impl weaver_server_net::proxies::give_back::GiveBackClasses for JobClasses {
+    fn seated(&self, side: usize) -> bool {
+        self.get(Protocol::ALL[side]).is_some()
+    }
+
+    fn give_back(&self, side: usize, ask: TunnelGiveBack) {
+        if let Some(class) = self.get(Protocol::ALL[side]) {
+            class.give_back(ask);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,7 +529,7 @@ mod tests {
             ("nzb", "download pipeline", "NZB_DISABLED")
         );
         assert!(nzb.hold.is_none());
-        assert!(nzb.live.is_none());
+        assert!(crate::jobs::model::live_of(Protocol::Nzb).is_none());
         assert_eq!(HeldClass::of(Protocol::Nzb), None);
 
         let torrent = Protocol::Torrent.names();
@@ -611,7 +540,7 @@ mod tests {
         let hold = torrent.hold.expect("torrents hold apart");
         assert_eq!(hold.scope, HoldScope::Everything);
         assert_eq!(hold.setting, "torrent_paused");
-        assert!(torrent.live.is_some());
+        assert!(crate::jobs::model::live_of(Protocol::Torrent).is_some());
         assert_eq!(
             HeldClass::of(Protocol::Torrent),
             Some(crate::torrents::CLASS)

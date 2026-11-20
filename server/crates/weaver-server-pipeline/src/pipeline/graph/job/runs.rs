@@ -65,7 +65,7 @@ impl GraphJob {
 
     // What a run said, or a repair lent off the loop came back with. A
     // stopped run's words carry an old generation and are not heard.
-    pub(crate) fn run_said(
+    pub fn run_said(
         &mut self,
         said: Said,
         slots: &mut RepairSlots,

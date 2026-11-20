@@ -11,7 +11,7 @@
 // nothing is held, and never rules the member short while work is due.
 
 use super::harness::{Outcome, Post, Scenario, par2_set, run};
-use weaver_server_pipeline::JobStatus;
+use weaver_server_composition::JobStatus;
 use weaver_server_pipeline::pipeline::tests::engines::loans::{
     BODY, FRAME, Kind, MEMBER, SECRET, body, stored_zip, volumes,
 };

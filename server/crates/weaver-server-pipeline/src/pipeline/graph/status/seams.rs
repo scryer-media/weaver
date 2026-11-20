@@ -323,25 +323,25 @@ pub(in crate::pipeline) fn recovery_volume(
 
 // What a job's posted files say, for `delivery_of`: the one place a job
 // class says it of its own files, the rest being read off the graph job.
-pub(crate) struct Posted<'a> {
+pub struct Posted<'a> {
     // How many files the job was posted with, root members 0 to this.
-    pub(crate) files: u32,
+    pub files: u32,
     // Whether a root member no object holds or refused is payload, by what
     // it was posted as.
-    pub(crate) payload: &'a dyn Fn(MemberId) -> bool,
+    pub payload: &'a dyn Fn(MemberId) -> bool,
     // The posted name of a root member none of whose declared bytes came,
     // given up whole.
-    pub(crate) lost: &'a dyn Fn(MemberId) -> Option<&'a str>,
+    pub lost: &'a dyn Fn(MemberId) -> Option<&'a str>,
     // The extensions whose damage leaves a delivery whole.
-    pub(crate) ignore: &'a [String],
+    pub ignore: &'a [String],
     // Why the job's post was given up, when the rulings say nothing.
-    pub(crate) given_up: Option<Failure>,
+    pub given_up: Option<Failure>,
 }
 
 // What a graph job hands over, file by file at every depth, off its
 // settled claims, with the repair failure that left any of it short: the
 // one reading of every job class's delivery.
-pub(crate) fn delivery_of(job: &GraphJob, posted: Posted<'_>) -> (Delivery, Option<Failure>) {
+pub fn delivery_of(job: &GraphJob, posted: Posted<'_>) -> (Delivery, Option<Failure>) {
     {
         let summary = RootJob::recovery_summary(job);
         let outcomes = summary.outcomes();
@@ -478,7 +478,7 @@ pub(crate) fn delivery_of(job: &GraphJob, posted: Posted<'_>) -> (Delivery, Opti
 // Why a delivery is short of whole, as every job class words it. A partial
 // delivery says what it lacks, from its lists; any other says why, and what
 // the policy left out beside it.
-pub(crate) fn shortfall_message(delivery: &Delivery, failure: Option<&Failure>) -> Option<String> {
+pub fn shortfall_message(delivery: &Delivery, failure: Option<&Failure>) -> Option<String> {
     if delivery.status(failure) == JobStatus::Partial {
         return Some(delivery.partial_error());
     }

@@ -5,9 +5,19 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
 
+use weaver_server_composition::operations::recover_server_state;
+use weaver_server_composition::post_processing::{
+    events::wait_for_job_events,
+    instances::{InstanceTrigger, PostProcessingInstancesQueries, ScriptInstanceDraft},
+    model::{PostProcessingSettings, PostProcessingSummary, QueueEvent, ScriptName},
+    runner::run_supervisor_stdio,
+    scan::SOURCE_URL_KEY,
+    settings::PostProcessingSettingsQueries,
+};
+use weaver_server_composition::{FieldUpdate, JobId, JobStatus, JobUpdate};
 use weaver_server_ingest::ingest::persisted_nzb::compress_nzb_bytes;
+use weaver_server_pipeline::Pipeline;
 use weaver_server_pipeline::jobs::working_dir::sanitize_dirname;
-use weaver_server_pipeline::operations::recover_server_state;
 use weaver_server_pipeline::pipeline::tests::{
     control_fixture::{CompletedMove, move_deferred, start_move_to_complete},
     history_fixture::{check_completion, database, finished_jobs, set_installed_status},
@@ -23,15 +33,6 @@ use weaver_server_pipeline::pipeline::tests::{
     terminal_fixture::*,
     window_fixture::has_installed,
 };
-use weaver_server_pipeline::post_processing::{
-    events::wait_for_job_events,
-    instances::{InstanceTrigger, PostProcessingInstancesQueries, ScriptInstanceDraft},
-    model::{PostProcessingSettings, PostProcessingSummary, QueueEvent, ScriptName},
-    runner::run_supervisor_stdio,
-    scan::SOURCE_URL_KEY,
-    settings::PostProcessingSettingsQueries,
-};
-use weaver_server_pipeline::{FieldUpdate, JobId, JobStatus, JobUpdate, Pipeline};
 
 // Re-execute this test binary as the real supervisor, without requiring an
 // independently built application binary for the suite.
@@ -428,7 +429,7 @@ async fn queue_scripts_hold_a_job_without_post_processing_instances() {
 // context carries what the submission recorded.
 #[tokio::test]
 async fn terminal_post_processing_context_carries_the_submission_url() {
-    use weaver_server_pipeline::post_processing::model::{PipelineOutcome, PostProcessingFacts};
+    use weaver_server_composition::post_processing::model::{PipelineOutcome, PostProcessingFacts};
 
     let temp = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
@@ -692,7 +693,7 @@ exit 93
 // running is not run again.
 #[tokio::test]
 async fn restart_part_way_through_a_failed_jobs_scripts_resumes_them_with_its_failure() {
-    use weaver_server_pipeline::post_processing::model::{
+    use weaver_server_composition::post_processing::model::{
         PipelineFailureStage, PipelineOutcome, PostProcessingFacts, PostProcessingResume,
         ScriptStatus, StartedScript,
     };

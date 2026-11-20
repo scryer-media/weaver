@@ -892,8 +892,11 @@ fn a_failed_return_still_releases_the_working_directory_and_keeps_the_rest_stage
     ));
 }
 
-fn staging_category(name: &str, dest_dir: Option<&Path>) -> crate::categories::CategoryConfig {
-    crate::categories::CategoryConfig {
+fn staging_category(
+    name: &str,
+    dest_dir: Option<&Path>,
+) -> weaver_server_settings::categories::CategoryConfig {
+    weaver_server_settings::categories::CategoryConfig {
         id: 0,
         name: name.to_string(),
         dest_dir: dest_dir.map(|dir| dir.display().to_string()),

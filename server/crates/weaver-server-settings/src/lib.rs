@@ -5,3 +5,4 @@ pub mod categories;
 pub mod settings;
 pub mod tags;
 pub mod torrents;
+pub mod watch_folder;

@@ -3,11 +3,12 @@
 
 use std::time::Duration;
 use tokio::time::Instant;
+use weaver_server_composition::{JobId, NzbFileId, SegmentId};
+use weaver_server_pipeline::DownloadQueue;
 use weaver_server_pipeline::pipeline::tests::{
     dispatch_fixture::{DispatchFixture, owned_failures::FailedFetch},
     segmented_job_spec,
 };
-use weaver_server_pipeline::{DownloadQueue, JobId, NzbFileId, SegmentId};
 
 #[tokio::test]
 async fn unavailable_provider_recovery_does_not_leave_602_retries_parked_forever() {

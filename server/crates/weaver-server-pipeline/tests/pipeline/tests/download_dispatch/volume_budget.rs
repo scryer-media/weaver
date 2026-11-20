@@ -13,7 +13,9 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 use weaver_nntp::client::{NntpClient, NntpClientConfig};
+use weaver_server_composition::{JobId, JobStatus};
 use weaver_server_disk::operations::disk::volume::Volume;
+use weaver_server_pipeline::DownloadWork;
 use weaver_server_pipeline::pipeline::tests::{
     dispatch_fixture::{
         DispatchFixture,
@@ -22,7 +24,6 @@ use weaver_server_pipeline::pipeline::tests::{
     },
     segmented_job_spec,
 };
-use weaver_server_pipeline::{DownloadWork, JobId, JobStatus};
 
 const ARTICLE: u32 = 512;
 

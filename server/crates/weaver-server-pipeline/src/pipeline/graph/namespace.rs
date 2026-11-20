@@ -99,7 +99,7 @@ impl Write {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum WriteError {
+pub enum WriteError {
     #[error(transparent)]
     Leaf(#[from] LeafError),
     #[error("member {member:?} of node {node:?} is not in its namespace")]
@@ -213,7 +213,7 @@ pub(crate) struct GivenBack {
     pub(crate) why: Why,
 }
 
-pub(crate) struct NamespaceWriter {
+pub struct NamespaceWriter {
     // The job's process-wide id, which with a node id names a namespace to
     // the holds accountant that every job shares.
     scope: u64,
@@ -579,7 +579,7 @@ impl NamespaceWriter {
     }
 
     // The breach of the job's extraction budget, once one stands.
-    pub(crate) fn refusal(&self) -> Option<&ExtractionFailure> {
+    pub fn refusal(&self) -> Option<&ExtractionFailure> {
         self.caps.refusal()
     }
 
@@ -634,7 +634,7 @@ impl NamespaceWriter {
 
     // The job's content policy when it leaves files with an unwanted
     // extension out of the delivery (`Caps::removes`).
-    pub(crate) fn removes(&self) -> Option<&crate::post_processing::model::PostProcessingSettings> {
+    pub fn removes(&self) -> Option<&crate::post_processing::model::PostProcessingSettings> {
         self.caps.removes()
     }
 
@@ -766,7 +766,7 @@ impl NamespaceWriter {
         self.caps.wanted()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn clock_held(&self) -> bool {
         self.caps.clock_held()
     }

@@ -3,9 +3,11 @@
 
 pub mod caps;
 pub mod limits;
+pub mod model;
 pub mod persistence;
 pub mod queries;
 pub mod rate_limiter;
+pub mod record;
 pub mod service;
 mod weekday;
 pub use caps::QuotaWeekday;

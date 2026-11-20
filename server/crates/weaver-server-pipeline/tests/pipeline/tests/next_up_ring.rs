@@ -8,7 +8,11 @@
 // activated; a read that comes back for a job no longer wanted is dropped.
 
 use weaver_model::files::FileRole;
+use weaver_server_composition::{
+    FileSpec, JobId, JobSpec, JobUpdate, MessageIds, QueueMoveTarget, SegmentSpec,
+};
 use weaver_server_ingest::ingest::outline::read_stored_lists;
+use weaver_server_pipeline::Pipeline;
 use weaver_server_pipeline::pipeline::tests::{
     activate_job,
     dispatch_order_fixture::ring as dispatch_ring,
@@ -21,9 +25,6 @@ use weaver_server_pipeline::pipeline::tests::{
     },
     segmented_job_spec,
     window_fixture::{QUEUE_WINDOW, admitted, articles_active, articles_queued, has_installed},
-};
-use weaver_server_pipeline::{
-    FileSpec, JobId, JobSpec, JobUpdate, MessageIds, Pipeline, QueueMoveTarget, SegmentSpec,
 };
 
 fn ids(ids: impl IntoIterator<Item = u64>) -> Vec<JobId> {

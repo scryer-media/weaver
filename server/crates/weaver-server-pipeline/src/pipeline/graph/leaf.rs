@@ -32,7 +32,7 @@ use weaver_server_disk::pipeline::graph::sparse::{
 };
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum LeafError {
+pub enum LeafError {
     #[error("{}: {source}", path.display())]
     Io {
         path: PathBuf,

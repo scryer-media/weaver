@@ -3,7 +3,7 @@
 
 use weaver_server_base::e2e_failpoint::DIRECT_STORE_POST_REPAIR_VERIFY;
 use weaver_server_base::jobs::ids::JobId;
-use weaver_server_pipeline::JobStatus;
+use weaver_server_composition::JobStatus;
 use weaver_server_pipeline::pipeline::tests::{
     engines::{
         harness::{ARTICLE, JOB, Post, Scenario, admit, payload},

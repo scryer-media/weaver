@@ -1,0 +1,56 @@
+[package]
+name = "weaver-server-net-runtime"
+description = "The network runtime of the Weaver server: proxies, routes, servers and the routed HTTP client"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[features]
+# Hooks and fixtures that other crates' tests use: the speed test's HTTPS
+# fixture, fixture tunnel providers and the stored-list upgrade helpers.
+test-support = [
+    "weaver-server-base/test-support",
+    "weaver-server-db/test-support",
+    "weaver-server-net/test-support",
+    "weaver-server-postproc/test-support",
+    "weaver-server-rss/test-support",
+    "weaver-server-speedtest/test-support",
+    "weaver-server-torrent-store/test-support",
+    "weaver-tunnel/test-support",
+    "weaver-nntp/test-support",
+]
+
+[dependencies]
+weaver-server-base = { path = "../weaver-server-base" }
+weaver-server-db = { path = "../weaver-server-db" }
+weaver-server-ingest = { path = "../weaver-server-ingest" }
+weaver-server-jobs = { path = "../weaver-server-jobs" }
+weaver-server-net = { path = "../weaver-server-net" }
+weaver-server-postproc = { path = "../weaver-server-postproc" }
+weaver-server-rss = { path = "../weaver-server-rss" }
+weaver-server-settings = { path = "../weaver-server-settings" }
+weaver-server-speedtest = { path = "../weaver-server-speedtest" }
+weaver-server-torrent-store = { path = "../weaver-server-torrent-store" }
+weaver-tunnel = { path = "../../../engines/weaver-tunnel" }
+weaver-nntp = { path = "../../../engines/weaver-nntp", default-features = false }
+weaver-nzb = { path = "../../../engines/weaver-nzb", default-features = false }
+weaver-yenc = { path = "../../../engines/weaver-yenc", default-features = false }
+weaver-torrent = { workspace = true }
+async-trait = "0.1"
+bytes = { workspace = true }
+chrono = { workspace = true }
+getrandom = { workspace = true, default-features = false }
+hex = { workspace = true }
+http = { workspace = true }
+quick-xml = { workspace = true }
+regex = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+weaver-tunnel = { path = "../../../engines/weaver-tunnel", features = ["test-support"] }

@@ -82,7 +82,7 @@ pub(crate) enum ArticleFacts {
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum RootFactsError {
+pub enum RootFactsError {
     #[error("the root's facts are version {0}, which this build does not read")]
     Version(u16),
     #[error("the root's facts do not decode: {0}")]

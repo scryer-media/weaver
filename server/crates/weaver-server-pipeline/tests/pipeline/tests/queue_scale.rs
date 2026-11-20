@@ -8,6 +8,8 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use weaver_server_composition::operations::recover_server_state;
+use weaver_server_composition::{JobId, JobSpec, JobStatus, MessageIds, QueueMoveTarget, RunState};
 use weaver_server_pipeline::history::queries::HistoryQueries;
 use weaver_server_pipeline::jobs::model::FileSummary;
 use weaver_server_pipeline::jobs::persistence::JobsPersistenceQueries;
@@ -15,7 +17,6 @@ use weaver_server_pipeline::jobs::queries::JobsQueries;
 use weaver_server_pipeline::jobs::{
     ActiveFileIdentity, FileIdentitySource, Hold, HoldOrigin, HoldOwner, HoldScope,
 };
-use weaver_server_pipeline::operations::recover_server_state;
 use weaver_server_pipeline::pipeline::tests::{
     activate_job,
     history_fixture::database,
@@ -28,10 +29,7 @@ use weaver_server_pipeline::pipeline::tests::{
         installed_count, parked as is_parked, request_activation, rows, settle as settle_window,
     },
 };
-use weaver_server_pipeline::{
-    JobId, JobSpec, JobStatus, MessageIds, Pipeline, QueueMoveTarget, RunState, SchedulerHandle,
-    settings::PerJobSeries,
-};
+use weaver_server_pipeline::{Pipeline, SchedulerHandle, settings::PerJobSeries};
 
 #[tokio::test]
 async fn a_job_waiting_for_a_slot_stores_the_reason_the_dispatch_pass_computes() {

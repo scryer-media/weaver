@@ -20,7 +20,7 @@ pub(crate) struct Replay {
     access: Lent,
 }
 
-pub(crate) struct Replayed {
+pub struct Replayed {
     pub(crate) node: NodeId,
     generation: u64,
     ranges: Vec<(VolumeIndex, ByteRange)>,

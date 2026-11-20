@@ -8,18 +8,19 @@ use super::harness::{ARTICLE, Post, Scenario, admit, payload};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, atomic::AtomicU64};
 use weaver_server_base::events::model::PipelineEvent;
+use weaver_server_composition::JobId;
+use weaver_server_composition::{
+    JobHistoryRow,
+    operations::{DiskSpace, StorageRoot},
+};
+use weaver_server_pipeline::jobs::model::JobStatus;
 use weaver_server_pipeline::pipeline::tests::engines::restart_regressions::restart_as_it_stands;
 use weaver_server_pipeline::pipeline::tests::engines::stream_fixtures::xz;
 use weaver_server_pipeline::pipeline::tests::{
     finish_cancel_jobs,
     queue_fixture::{apply_intents, handle},
 };
-use weaver_server_pipeline::{
-    JobHistoryRow,
-    jobs::model::JobStatus,
-    operations::{DiskSpace, StorageRoot},
-};
-use weaver_server_pipeline::{JobId, jobs::model::RunState, pipeline::Pipeline};
+use weaver_server_pipeline::{jobs::model::RunState, pipeline::Pipeline};
 // The job is said to be complete.
 async fn said_complete(events: &mut tokio::sync::broadcast::Receiver<PipelineEvent>) {
     loop {

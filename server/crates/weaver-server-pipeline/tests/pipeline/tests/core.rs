@@ -7,7 +7,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use weaver_nntp::client::{NntpClient, NntpClientConfig};
 use weaver_server_base::events::model::PipelineEvent;
+use weaver_server_composition::tags::TagsQueries;
+use weaver_server_composition::{
+    DownloadPressureReason, DownloadPressureState, JobId, JobPhase, JobStatus,
+};
+use weaver_server_orchestration::ingest::submit_nzb_bytes;
 use weaver_server_pipeline::history::queries::HistoryQueries;
+use weaver_server_pipeline::jobs::queries::JobsQueries;
 use weaver_server_pipeline::pipeline::tests::{
     TestHarness, nzb_zstd_for, segmented_job_spec, standalone_job_spec, wait_until,
 };
@@ -22,14 +28,15 @@ use weaver_server_pipeline::pipeline::tests::{
     sample_nzb_bytes,
     uu_fixture::{refresh_download_pressure, set_write_budget},
 };
-use weaver_server_pipeline::{
-    DownloadPressureReason, DownloadPressureState, JobId, JobPhase, JobStatus,
-};
-use weaver_server_pipeline::{
-    ingest::submit_nzb_bytes, jobs::queries::JobsQueries, tags::TagsQueries,
-};
 
 use weaver_model::files::FileRole;
+use weaver_server_composition::post_processing::{
+    instances::PostProcessingInstancesQueries, settings::PostProcessingSettingsQueries,
+};
+use weaver_server_composition::{
+    FileSpec, JobSpec, MessageId, MessageIds, NzbFileId, SegmentId, SegmentSpec,
+};
+use weaver_server_pipeline::DownloadWork;
 use weaver_server_pipeline::pipeline::tests::{
     completion_fixture::*,
     control_fixture::{completion_pending, rename_when_quiet, start_move_to_complete},
@@ -43,12 +50,6 @@ use weaver_server_pipeline::pipeline::tests::{
     uu_fixture::{has_job, job_status},
 };
 use weaver_server_pipeline::pipeline::tests::{queue_fixture::working_dir, rename_fixture::*};
-use weaver_server_pipeline::post_processing::{
-    instances::PostProcessingInstancesQueries, settings::PostProcessingSettingsQueries,
-};
-use weaver_server_pipeline::{
-    DownloadWork, FileSpec, JobSpec, MessageId, MessageIds, NzbFileId, SegmentId, SegmentSpec,
-};
 
 fn capacity_test_client(port: u16, connections: usize) -> NntpClient {
     NntpClient::new(NntpClientConfig::single(
@@ -569,7 +570,7 @@ async fn cancel_mid_download_archives_then_cleans_up() {
     });
     let harness = TestHarness::new_with_nntp(capacity_test_client(port, 1), 1).await;
     let id = JobId(80032);
-    let script = weaver_server_pipeline::post_processing::events::hold_test_event_run(
+    let script = weaver_server_composition::post_processing::events::hold_test_event_run(
         &harness.db,
         id.0,
         "cancel-cleanup",
@@ -882,7 +883,7 @@ async fn phase_end_removes_only_the_ended_phase_snapshot() {
 #[tokio::test]
 async fn a_submitted_nzb_takes_its_tags() {
     let harness = TestHarness::new().await;
-    let submitted = weaver_server_pipeline::ingest::submit_nzb_bytes_with_options(
+    let submitted = weaver_server_orchestration::ingest::submit_nzb_bytes_with_options(
         &harness.db,
         &harness.handle,
         &harness.config,
@@ -891,7 +892,7 @@ async fn a_submitted_nzb_takes_its_tags() {
         None,
         None,
         Vec::new(),
-        weaver_server_pipeline::ingest::SubmissionOptions {
+        weaver_server_composition::ingest::SubmissionOptions {
             tags: vec![" tv ".to_string(), "".to_string(), "HD".to_string()],
             ..Default::default()
         },
@@ -949,7 +950,8 @@ async fn submit_nzb_persists_zstd_and_creates_active_job() {
     assert_eq!(stored_path, PathBuf::from("Silver Horizon.Sample.nzb"));
     assert!(stored_nzb.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]));
 
-    let decoded = weaver_server_pipeline::ingest::decode_persisted_nzb_bytes(&stored_nzb).unwrap();
+    let decoded =
+        weaver_server_composition::ingest::decode_persisted_nzb_bytes(&stored_nzb).unwrap();
     assert_eq!(decoded, nzb_bytes);
 
     harness.shutdown().await;
@@ -1166,20 +1168,20 @@ async fn unacceptable_extension_rejection_never_starts_a_final_move_or_scripts()
     let job_id = JobId(10069);
     let job_name = "Rejected Before Publication";
     database(&pipeline)
-        .save_post_processing_settings(&weaver_server_pipeline::post_processing::model::PostProcessingSettings {
+        .save_post_processing_settings(&weaver_server_composition::post_processing::model::PostProcessingSettings {
             execution_enabled: true,
             unacceptable_extensions: vec!["exe".into()],
             unwanted_extension_action:
-                weaver_server_pipeline::post_processing::model::UnwantedExtensionAction::FailJob,
+                weaver_server_composition::post_processing::model::UnwantedExtensionAction::FailJob,
             ..Default::default()
         })
         .unwrap();
     database(&pipeline)
         .create_script_instance(
-            weaver_server_pipeline::post_processing::instances::ScriptInstanceDraft::new(
-                weaver_server_pipeline::post_processing::model::ScriptName::new("sentinel.sh")
+            weaver_server_composition::post_processing::instances::ScriptInstanceDraft::new(
+                weaver_server_composition::post_processing::model::ScriptName::new("sentinel.sh")
                     .unwrap(),
-                weaver_server_pipeline::post_processing::instances::InstanceTrigger::PostProcessing,
+                weaver_server_composition::post_processing::instances::InstanceTrigger::PostProcessing,
             ),
         )
         .unwrap();
@@ -1361,7 +1363,7 @@ async fn restored_post_processing_that_already_finished_archives_as_complete() {
     database(&pipeline)
         .save_job_post_processing_results(
             job_id.0,
-            weaver_server_pipeline::post_processing::model::PostProcessingSummary::Succeeded,
+            weaver_server_composition::post_processing::model::PostProcessingSummary::Succeeded,
             &[],
         )
         .unwrap();

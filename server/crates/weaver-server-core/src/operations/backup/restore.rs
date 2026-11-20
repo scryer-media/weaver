@@ -761,7 +761,7 @@ fn rewrite_first_matching_prefix(path: &str, roots: &[PathRemap]) -> Option<Path
 }
 
 #[cfg(test)]
-use weaver_server_pipeline::operations::backup::job_info_from_history;
+use weaver_server_composition::operations::backup::job_info_from_history;
 
 #[cfg(test)]
 mod tests {

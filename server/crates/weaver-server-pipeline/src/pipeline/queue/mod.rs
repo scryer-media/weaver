@@ -30,10 +30,7 @@ pub(crate) use history::FAILED_SWEEP_PAGE;
 pub(crate) use history::SweepPlaces;
 #[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) use history::between_sweeps;
-pub(crate) use history::{
-    MoveOut, clear_left_working_dirs, clear_restart_artifacts, remove_job_staging,
-    remove_job_staging_checked,
-};
+pub(crate) use history::{MoveOut, clear_left_working_dirs, clear_restart_artifacts};
 
 /// The control plane's shared facts. A guard never leaves a synchronous
 /// closure, so callers copy inputs out before doing asynchronous work.
@@ -794,7 +791,7 @@ impl Queue {
 
     // Set by the actor at the end of each turn; a repeat of the same answer
     // wakes no one.
-    pub(crate) fn set_driving(&self, driving: bool) {
+    pub fn set_driving(&self, driving: bool) {
         self.drive.send_if_modified(|current| {
             let changed = *current != driving;
             *current = driving;

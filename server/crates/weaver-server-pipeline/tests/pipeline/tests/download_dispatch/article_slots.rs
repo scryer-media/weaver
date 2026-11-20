@@ -5,7 +5,7 @@
 // moves to the next only once the id in use is spent.
 
 use std::sync::atomic::Ordering;
-use weaver_server_pipeline::JobId;
+use weaver_server_composition::JobId;
 use weaver_server_pipeline::pipeline::tests::dispatch_fixture::{
     DispatchFixture,
     article_slots::{finish_slot_body, finish_slot_missing, lease_slot, slot_body, slot_pipeline},

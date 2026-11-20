@@ -691,7 +691,7 @@ async fn a_restart_during_a_held_move_delivers_every_file_from_the_recorded_sour
         );
         let facts = successful_move_facts(&pipeline);
         assert_eq!(facts.source.as_deref(), Some(working_dir.as_path()));
-        let stored: weaver_server_pipeline::post_processing::model::PostProcessingFacts =
+        let stored: weaver_server_composition::post_processing::model::PostProcessingFacts =
             serde_json::from_str(&serde_json::to_string(&facts).unwrap()).unwrap();
         assert_eq!(
             stored.source.as_deref(),
@@ -747,7 +747,7 @@ async fn a_moving_row_the_database_disk_has_no_room_for_holds_the_job_and_is_wri
         .await
         .unwrap();
 
-    refuse_moving_row(weaver_server_pipeline::StateError::OutOfSpace(
+    refuse_moving_row(weaver_server_composition::StateError::OutOfSpace(
         "database or disk is full".into(),
     ));
     drive(&mut pipeline, &scenario, JOB, |pipeline| {
@@ -794,7 +794,7 @@ async fn a_moving_row_refused_waits_on_the_database_folder_not_the_data_folder()
         .await
         .unwrap();
 
-    refuse_moving_row(weaver_server_pipeline::StateError::OutOfSpace(
+    refuse_moving_row(weaver_server_composition::StateError::OutOfSpace(
         "database or disk is full".into(),
     ));
     drive(&mut pipeline, &scenario, JOB, |pipeline| {
@@ -830,7 +830,7 @@ async fn a_moving_row_refused_for_another_reason_fails_the_job() {
     let scenario = on_disk_posting(&room, posts);
     let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
 
-    refuse_moving_row(weaver_server_pipeline::StateError::Database(
+    refuse_moving_row(weaver_server_composition::StateError::Database(
         "the row is malformed".into(),
     ));
     drive(&mut pipeline, &scenario, JOB, |_| false).await;

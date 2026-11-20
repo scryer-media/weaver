@@ -30,7 +30,7 @@ pub(crate) struct RewalkLoan {
 // taken, not when a shutdown or the working directory going cut the
 // reading short. `scratch` is what the piece read of holds on scratch,
 // which the loop checks before it hears the piece.
-pub(crate) struct Rewalked {
+pub struct Rewalked {
     pub(crate) piece: Option<(VolumeIndex, Result<Posted, ByteRange>)>,
     pub(crate) whole: bool,
     pub(crate) scratch: ScratchRead,

@@ -26,7 +26,7 @@ use crate::RuntimeTuner;
 use crate::runtime::{HardwareProfile, OverLimit};
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct Hardware {
+pub struct Hardware {
     grant: Arc<RwLock<Grant>>,
     shutdown: Shutdown,
     // The job was asked to run with no memory limit: a run whose window is

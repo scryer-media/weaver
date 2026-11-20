@@ -21,24 +21,24 @@ use crate::pipeline::graph::namespace::{Arrival, Segments};
 
 // A decoded article, as the decoder placed it.
 #[derive(Clone, Debug)]
-pub(crate) struct Decoded {
-    pub(crate) volume: VolumeIndex,
-    pub(crate) ordinal: u32,
-    pub(crate) offset: u64,
-    pub(crate) bytes: Bytes,
+pub struct Decoded {
+    pub volume: VolumeIndex,
+    pub ordinal: u32,
+    pub offset: u64,
+    pub bytes: Bytes,
     // The article's own checksum passed and nothing suggests it was cut short.
-    pub(crate) intact: bool,
+    pub intact: bool,
     // The encoding carries the article's position; uuencode does not, so its
     // offset is only where the articles before it ended.
-    pub(crate) positioned: bool,
+    pub positioned: bool,
     // The file's decoded length, when the article declares it.
-    pub(crate) length: Option<u64>,
+    pub length: Option<u64>,
     // Where the article's part ends, as its header declares it: where the
     // next article begins, whatever its own bytes decoded to.
-    pub(crate) declared_end: Option<u64>,
+    pub declared_end: Option<u64>,
     // The checksums of the article's bytes, cut at the recovery set's block
     // boundaries when the decoder knew them.
-    pub(crate) segments: Vec<Segment>,
+    pub segments: Vec<Segment>,
 }
 
 impl Decoded {

@@ -12,6 +12,7 @@
 use std::sync::{Arc, atomic::Ordering};
 use std::time::Duration;
 use weaver_nntp::client::{NntpClient, NntpClientConfig};
+use weaver_server_composition::{JobId, SchedulerBlockClause};
 use weaver_server_disk::operations::disk::volume::Volume;
 use weaver_server_pipeline::pipeline::tests::{
     dispatch_fixture::{
@@ -21,7 +22,6 @@ use weaver_server_pipeline::pipeline::tests::{
     },
     segmented_job_spec,
 };
-use weaver_server_pipeline::{JobId, SchedulerBlockClause};
 
 fn queued(pipeline: &DispatchFixture, id: JobId) -> usize {
     pipeline

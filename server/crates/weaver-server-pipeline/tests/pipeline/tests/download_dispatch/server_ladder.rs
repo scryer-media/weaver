@@ -12,7 +12,11 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use weaver_model::files::FileRole;
 use weaver_nntp::client::{NntpClient, NntpClientConfig};
-use weaver_server_pipeline::JobStatus;
+use weaver_server_composition::JobStatus;
+use weaver_server_composition::{FileSpec, JobSpec, MessageIds, SegmentSpec};
+use weaver_server_composition::{JobId, NzbFileId};
+use weaver_server_pipeline::DownloadQueue;
+use weaver_server_pipeline::DownloadWork;
 use weaver_server_pipeline::jobs::SegmentId;
 use weaver_server_pipeline::pipeline::tests::build_test_par2_index_for_files;
 use weaver_server_pipeline::pipeline::tests::dispatch_fixture::ladder_failures::{
@@ -24,8 +28,6 @@ use weaver_server_pipeline::pipeline::tests::dispatch_fixture::ladder_quota::{
 use weaver_server_pipeline::pipeline::tests::{
     dispatch_fixture::DispatchFixture, segmented_job_spec,
 };
-use weaver_server_pipeline::{DownloadQueue, FileSpec, JobSpec, MessageIds, SegmentSpec};
-use weaver_server_pipeline::{DownloadWork, JobId, NzbFileId};
 
 // `count` servers spread over ten levels so that pool order and level order
 // differ; the two worst levels are backfill.
@@ -462,7 +464,8 @@ async fn a_not_found_walk_past_a_refusing_server_is_booked_unservable_and_names_
             (0, 1, SegmentOutcome::ABANDONED)
         ]
     );
-    let missing = Some(weaver_server_pipeline::SemanticTerminalCause::MissingArticlesOrLowHealth);
+    let missing =
+        Some(weaver_server_composition::SemanticTerminalCause::MissingArticlesOrLowHealth);
     assert_eq!(pipeline.terminal_cause(ALPHA), missing);
     let words = pipeline.login_refusal_words(ALPHA).unwrap();
     assert!(words.contains("s2.example"), "{words}");
@@ -488,7 +491,7 @@ async fn a_failure_of_another_kind_past_a_refusing_server_says_nothing_of_it() {
     );
     assert_eq!(
         pipeline.terminal_cause(ALPHA),
-        Some(weaver_server_pipeline::SemanticTerminalCause::MissingArticlesOrLowHealth)
+        Some(weaver_server_composition::SemanticTerminalCause::MissingArticlesOrLowHealth)
     );
 }
 
@@ -573,7 +576,7 @@ async fn a_not_found_walk_over_every_server_is_still_booked_missing() {
     );
     assert_eq!(
         pipeline.terminal_cause(ALPHA),
-        Some(weaver_server_pipeline::SemanticTerminalCause::MissingArticlesOrLowHealth)
+        Some(weaver_server_composition::SemanticTerminalCause::MissingArticlesOrLowHealth)
     );
     assert_eq!(pipeline.login_refusal_words(ALPHA), None);
     pipeline.fail_job(ALPHA, "the post cannot complete".into());
@@ -583,7 +586,7 @@ async fn a_not_found_walk_over_every_server_is_still_booked_missing() {
     );
     assert_eq!(
         pipeline.terminal_cause(ALPHA),
-        Some(weaver_server_pipeline::SemanticTerminalCause::MissingArticlesOrLowHealth)
+        Some(weaver_server_composition::SemanticTerminalCause::MissingArticlesOrLowHealth)
     );
 }
 
@@ -604,7 +607,7 @@ async fn a_job_with_missing_and_unservable_articles_books_each_as_it_is() {
             let mut spec = template.clone();
             spec.filename = format!("f{file:02}.mkv");
             for segment in &mut spec.segments {
-                segment.message_ids = weaver_server_pipeline::MessageIds::new(vec![format!(
+                segment.message_ids = weaver_server_composition::MessageIds::new(vec![format!(
                     "f{file}-s{}@example.com",
                     segment.ordinal
                 )]);
@@ -654,7 +657,7 @@ async fn a_job_with_missing_and_unservable_articles_books_each_as_it_is() {
     assert!(pipeline.dead_post_reason(job_id).is_some());
     assert_eq!(
         pipeline.terminal_cause(job_id),
-        Some(weaver_server_pipeline::SemanticTerminalCause::MissingArticlesOrLowHealth)
+        Some(weaver_server_composition::SemanticTerminalCause::MissingArticlesOrLowHealth)
     );
     let words = pipeline.login_refusal_words(job_id).unwrap();
     assert!(words.contains("s2.example"), "{words}");

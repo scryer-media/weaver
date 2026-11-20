@@ -11,7 +11,7 @@ use crate::{JobId, JobInfo, JobSpec, JobStatus, SchedulerError};
 use weaver_server_base::events::model::PipelineEvent;
 
 #[derive(Clone)]
-pub(crate) struct AdmissionResources {
+pub struct AdmissionResources {
     pub db: crate::Database,
     pub intermediate_dir: PathBuf,
     pub complete_dir: PathBuf,
@@ -327,26 +327,14 @@ pub(super) fn initial_info(
 // cannot deliver.
 pub(crate) fn destination_root(
     complete_dir: &Path,
-    categories: &[crate::categories::CategoryConfig],
+    categories: &[weaver_server_settings::categories::CategoryConfig],
     category: Option<&str>,
 ) -> PathBuf {
-    crate::categories::completion_parent(complete_dir, categories, category)
+    weaver_server_settings::categories::completion_parent(complete_dir, categories, category)
         .unwrap_or_else(|_| complete_dir.to_path_buf())
 }
 
-// Where a job writes the files it delivers when its intermediate directory
-// and its destination lie on different devices: its staging directory on the
-// destination's device, so finalize renames them into place there instead of
-// copying every byte across. On one device nothing is staged. Whether they
-// share a device is the disk owner's answer,
-// [`crate::operations::StorageCapacity::same_filesystem`].
-pub(crate) fn staging_dir_on(
-    one_device: bool,
-    destination_root: &Path,
-    job_id: JobId,
-) -> Option<PathBuf> {
-    (!one_device).then(|| staging_dir_for(destination_root, job_id))
-}
+pub(crate) use crate::jobs::working_dir::{staging_dir_for, staging_dir_on};
 
 // [`staging_dir_on`] with the devices read on the spot, as the choice was
 // made before the disk owner answered it: what a test compares the owner's
@@ -364,12 +352,6 @@ pub(crate) fn delivery_staging_dir(
     )
 }
 
-pub(crate) fn staging_dir_for(destination_root: &Path, job_id: JobId) -> PathBuf {
-    destination_root
-        .join(crate::jobs::working_dir::STAGING_DIR_NAME)
-        .join(job_id.0.to_string())
-}
-
 // Make the job's staging directory and mark it the job's, as its working
 // directory is. Nothing under the destination is reached through a symbolic
 // link.
@@ -381,7 +363,7 @@ pub(crate) fn make_staging_dir(staging_dir: &Path, job_id: JobId) -> std::io::Re
 // directory and each category's folder.
 pub fn destination_roots(
     complete_dir: &Path,
-    categories: &[crate::categories::CategoryConfig],
+    categories: &[weaver_server_settings::categories::CategoryConfig],
 ) -> Vec<PathBuf> {
     let mut seen = std::collections::HashSet::new();
     std::iter::once(complete_dir.to_path_buf())
@@ -424,8 +406,11 @@ mod staging_tests {
         );
     }
 
-    fn category(name: &str, dest_dir: Option<&Path>) -> crate::categories::CategoryConfig {
-        crate::categories::CategoryConfig {
+    fn category(
+        name: &str,
+        dest_dir: Option<&Path>,
+    ) -> weaver_server_settings::categories::CategoryConfig {
+        weaver_server_settings::categories::CategoryConfig {
             id: 1,
             name: name.to_string(),
             dest_dir: dest_dir.map(|dir| dir.display().to_string()),

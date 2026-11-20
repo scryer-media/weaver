@@ -5,10 +5,10 @@
 // raised when an article enters a lane's record and lowered when it leaves,
 // so no path can leave a job waiting on articles nobody is fetching.
 
+use weaver_server_composition::{JobId, JobStatus};
 use weaver_server_pipeline::pipeline::tests::{
     dispatch_fixture::DispatchFixture, segmented_job_spec,
 };
-use weaver_server_pipeline::{JobId, JobStatus};
 
 fn assert_gauges_match_lanes(pipeline: &DispatchFixture) {
     let discrepancies = pipeline.lane_holdings_discrepancies();

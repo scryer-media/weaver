@@ -29,6 +29,8 @@ pub(super) use weaver_server_pipeline::pipeline::tests::engines::restart_fixture
     Down, assert_restarted, restart_row, run_restarting, run_restarting_at,
 };
 
+use weaver_server_composition::{JobId, RestoreJobRequest};
+use weaver_server_pipeline::Pipeline;
 use weaver_server_pipeline::jobs::{
     handle::CancellationOrigin, model::JobArticles, queries::JobsQueries,
     working_dir::WORKING_DIR_MARKER,
@@ -51,7 +53,6 @@ use weaver_server_pipeline::pipeline::tests::{
     retire_pipeline_database,
     window_fixture::{ActivationReply, admitted, has_installed, request_activation},
 };
-use weaver_server_pipeline::{JobId, Pipeline, RestoreJobRequest};
 
 #[tokio::test]
 async fn a_plain_file_under_par2_restarted_after_every_article_is_repaired_with_no_refetch() {
@@ -2394,7 +2395,7 @@ async fn cancelling_a_job_blocked_on_its_checkpoint_clears_the_block() {
 // restore cannot say what of it is done.
 #[tokio::test]
 async fn a_job_blocked_on_its_checkpoint_resumes_into_the_status_its_lanes_name() {
-    use weaver_server_pipeline::{DownloadState, PostState};
+    use weaver_server_composition::{DownloadState, PostState};
     for (status, download_state, post_state, resume, persisted) in [
         (
             JobStatus::Extracting,

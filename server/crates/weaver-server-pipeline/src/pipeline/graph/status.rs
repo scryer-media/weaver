@@ -33,16 +33,16 @@ use super::root::phase::RootPhase;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::extraction::ExtractionFailure;
 
-pub(crate) use crate::pipeline::completion::finalize::check::configured_par2_ignore_extensions;
+pub use crate::pipeline::completion::finalize::check::configured_par2_ignore_extensions;
 #[cfg(test)]
 pub(crate) use claims::Claim;
 pub(crate) use claims::Delivered;
 #[cfg(test)]
 pub(crate) use claims::Described;
-pub(crate) use claims::{Delivery, Unarrived};
-pub(crate) use seams::{Posted, delivery_of, shortfall_message};
+pub use claims::{Delivery, Unarrived};
+pub use seams::{Posted, delivery_of, shortfall_message};
 pub(in crate::pipeline) use seams::{advance, recovery_volume};
-pub(crate) use slots::RepairSlots;
+pub use slots::RepairSlots;
 pub(crate) use summary::{RecoverySummary, SetSummary};
 
 // The pipeline's part of graph status: the repair slots every graph job
@@ -213,7 +213,7 @@ pub(crate) fn drive(
 // job's failure reason, and names no object. When no set failed and the
 // feed gave the post up, the failure is the feed's, in its words.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Failure {
+pub struct Failure {
     pub(crate) objects: Vec<NodeId>,
     pub(crate) message: String,
     pub(crate) rejection: Option<ExtractionFailure>,

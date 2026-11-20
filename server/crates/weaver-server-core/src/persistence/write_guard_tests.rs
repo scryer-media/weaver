@@ -42,7 +42,7 @@ const BANNED: &[&str] = &[
 // file, runs alone at startup or on Postgres, or is outside the gate by ruling.
 const LIFTED: &[(&str, usize)] = &[
     (
-        "server/crates/weaver-server-pipeline/src/history/persistence.rs",
+        "server/crates/weaver-server-composition/src/history/persistence.rs",
         2,
     ),
     (
@@ -50,23 +50,23 @@ const LIFTED: &[(&str, usize)] = &[
         1,
     ),
     (
-        "server/crates/weaver-server-pipeline/src/jobs/diagnostic_names.rs",
+        "server/crates/weaver-server-history/src/history/async_ops.rs",
         1,
     ),
     (
-        "server/crates/weaver-server-pipeline/src/jobs/persistence.rs",
+        "server/crates/weaver-server-composition/src/jobs/diagnostic_names.rs",
+        1,
+    ),
+    (
+        "server/crates/weaver-server-jobs/src/jobs/persistence.rs",
         3,
     ),
     (
-        "server/crates/weaver-server-pipeline/src/operations/async_ops.rs",
-        1,
-    ),
-    (
-        "server/crates/weaver-server-pipeline/src/operations/backup.rs",
+        "server/crates/weaver-server-composition/src/operations/backup.rs",
         10,
     ),
     (
-        "server/crates/weaver-server-pipeline/src/operations/backup/logical.rs",
+        "server/crates/weaver-server-composition/src/operations/backup/logical.rs",
         10,
     ),
     (
@@ -86,7 +86,7 @@ const LIFTED: &[(&str, usize)] = &[
         7,
     ),
     (
-        "server/crates/weaver-server-pipeline/src/persistence/postgres_migrations.rs",
+        "server/crates/weaver-server-composition/src/persistence/postgres_migrations.rs",
         1,
     ),
     (

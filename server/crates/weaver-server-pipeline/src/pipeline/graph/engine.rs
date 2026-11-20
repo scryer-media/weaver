@@ -33,7 +33,7 @@ use tokio::sync::mpsc;
 use weaver_graph::slots::{Admissions, Asked, AskerId, Slots, Ticket};
 use weaver_graph::{Emit, Extraction, Marks, NodeId, Why};
 
-pub(crate) use self::pool::DecodePool;
+pub use self::pool::DecodePool;
 use self::volumes::RunVolumes;
 use super::decoding::DecodeClock;
 use super::envelope::Shelf;
@@ -56,15 +56,15 @@ pub(crate) const RUN_OVERHEAD: u64 = 4 << 20;
 // What a run said, addressed to its job, its node, and the generation it
 // runs under.
 #[derive(Debug)]
-pub(crate) struct Said {
-    pub(crate) scope: u64,
-    pub(crate) node: NodeId,
-    pub(crate) generation: u64,
-    pub(crate) heard: Heard,
+pub struct Said {
+    pub scope: u64,
+    pub node: NodeId,
+    pub generation: u64,
+    pub heard: Heard,
 }
 
 #[derive(Debug)]
-pub(crate) enum Heard {
+pub enum Heard {
     Emit(Emit),
     // The run returned: nothing more will be said under its generation.
     Ended,
@@ -115,7 +115,7 @@ pub(crate) enum Heard {
 // database's writer, which must never wait on the pipeline, so it has a
 // channel of its own without a bound: at most one word per checkpoint write.
 #[derive(Debug)]
-pub(crate) struct RunMail {
+pub struct RunMail {
     sender: mpsc::Sender<Said>,
     receiver: mpsc::Receiver<Said>,
     written: mpsc::UnboundedSender<Said>,
@@ -136,15 +136,15 @@ impl Default for RunMail {
 }
 
 impl RunMail {
-    pub(crate) fn sender(&self) -> mpsc::Sender<Said> {
+    pub fn sender(&self) -> mpsc::Sender<Said> {
         self.sender.clone()
     }
 
-    pub(crate) fn written(&self) -> mpsc::UnboundedSender<Said> {
+    pub fn written(&self) -> mpsc::UnboundedSender<Said> {
         self.written.clone()
     }
 
-    pub(crate) async fn recv(&mut self) -> Option<Said> {
+    pub async fn recv(&mut self) -> Option<Said> {
         tokio::select! {
             biased;
             Some(said) = self.heard_written.recv() => Some(said),
@@ -173,7 +173,7 @@ impl RunMail {
 
 // A job the pipeline does not hold, hearing its runs through the pipeline's
 // mail: the step a run's word drives, with the slots the job may use now.
-pub(crate) trait Hears: Send + Sync {
+pub trait Hears: Send + Sync {
     fn said(&self, said: Said, slots: usize);
     // Every download paused or resumed: the job's extraction deadline
     // does not run while they are.
@@ -204,7 +204,7 @@ pub(crate) trait Hears: Send + Sync {
 // and whether every download is paused, which each job's clock follows
 // from the moment it joins.
 #[derive(Default)]
-pub(crate) struct Outside(
+pub struct Outside(
     std::sync::Mutex<std::collections::HashMap<u64, Arc<dyn Hears>>>,
     std::sync::atomic::AtomicBool,
     DiskWaits,
@@ -226,14 +226,14 @@ impl Outside {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    pub(crate) fn join(&self, scope: u64, hears: Arc<dyn Hears>) {
+    pub fn join(&self, scope: u64, hears: Arc<dyn Hears>) {
         let mut jobs = self.jobs();
         hears.hold_clock(self.1.load(std::sync::atomic::Ordering::Relaxed));
         jobs.insert(scope, hears);
     }
 
     // Every download paused or resumed: each job's clock follows.
-    pub(crate) fn hold_clocks(&self, paused: bool) {
+    pub fn hold_clocks(&self, paused: bool) {
         let jobs = self.jobs();
         self.1.store(paused, std::sync::atomic::Ordering::Relaxed);
         for hears in jobs.values() {
@@ -241,7 +241,7 @@ impl Outside {
         }
     }
 
-    pub(crate) fn leave(&self, scope: u64) {
+    pub fn leave(&self, scope: u64) {
         self.jobs().remove(&scope);
         self.disk_unheld(scope);
     }
@@ -257,7 +257,7 @@ impl Outside {
 
     // The job `scope` began to wait for room on a disk: the pipeline wakes
     // it with its own, in ticket order.
-    pub(crate) fn disk_held(&self, scope: u64) {
+    pub fn disk_held(&self, scope: u64) {
         let mut scopes = self.disk_scopes();
         if scopes.0.insert(scope) {
             scopes.1.push(scope);
@@ -267,25 +267,25 @@ impl Outside {
     }
 
     // The job `scope` no longer waits for room.
-    pub(crate) fn disk_unheld(&self, scope: u64) {
+    pub fn disk_unheld(&self, scope: u64) {
         let mut scopes = self.disk_scopes();
         if scopes.0.remove(&scope) {
             scopes.1.retain(|began| *began != scope);
         }
     }
 
-    pub(crate) fn waits_for_disk(&self) -> bool {
+    pub fn waits_for_disk(&self) -> bool {
         !self.disk_scopes().0.is_empty()
     }
 
     // The jobs that began to wait since the last look, still waiting.
-    pub(crate) fn disk_waits_began(&self) -> Vec<u64> {
+    pub fn disk_waits_began(&self) -> Vec<u64> {
         std::mem::take(&mut self.disk_scopes().1)
     }
 
     // What the job `scope` waits for room for, and the folder it waits on,
     // if it is here and waits.
-    pub(crate) fn disk_wait_of(
+    pub fn disk_wait_of(
         &self,
         scope: u64,
     ) -> Option<(super::limits::DiskWait, std::path::PathBuf)> {
@@ -300,7 +300,7 @@ impl Outside {
     }
 
     // Every job that waits for room, with its ticket.
-    pub(crate) fn disk_waiters(&self) -> Vec<(u64, u64, Arc<dyn Hears>)> {
+    pub fn disk_waiters(&self) -> Vec<(u64, u64, Arc<dyn Hears>)> {
         let scopes: Vec<u64> = self.disk_scopes().0.iter().copied().collect();
         if scopes.is_empty() {
             return Vec::new();
@@ -316,7 +316,7 @@ impl Outside {
     }
 
     // Hand `said` to the job it is addressed to, if that job is here.
-    pub(crate) fn deliver(&self, said: Said, slots: usize) {
+    pub fn deliver(&self, said: Said, slots: usize) {
         let hears = self.jobs().get(&said.scope).cloned();
         if let Some(hears) = hears {
             hears.said(said, slots);

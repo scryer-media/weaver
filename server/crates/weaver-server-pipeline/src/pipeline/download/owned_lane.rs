@@ -1516,7 +1516,7 @@ const OWNED_LANE_SELECTION_CONTENTION_RETRIES: usize = 3;
 // both had through here, so neither takes contention for an answer. Work
 // that is no longer `current` is never dialled for, and is not asked again:
 // it ends as contended at once.
-pub(crate) fn acquire_owned_lane_through_contention(
+pub fn acquire_owned_lane_through_contention(
     mut current: impl FnMut() -> bool,
     mut dial: impl FnMut() -> std::result::Result<
         weaver_nntp::blocking::BlockingBodyLane,

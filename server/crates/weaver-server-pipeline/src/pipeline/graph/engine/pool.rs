@@ -27,7 +27,7 @@ use weaver_graph::Budget;
 use super::RUN_OVERHEAD;
 
 #[derive(Debug)]
-pub(crate) struct DecodePool(Mutex<Room>);
+pub struct DecodePool(Mutex<Room>);
 
 // What the pool holds reserved, against its limit.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -45,7 +45,7 @@ pub(crate) struct Room {
 }
 
 impl DecodePool {
-    pub(crate) fn new(limit: u64) -> Self {
+    pub fn new(limit: u64) -> Self {
         Self(Mutex::new(Room {
             reserved: 0,
             limit,
@@ -56,8 +56,8 @@ impl DecodePool {
     }
 
     // A pool with no limit, for runs outside a pipeline.
-    #[cfg(test)]
-    pub(crate) fn unbounded() -> std::sync::Arc<Self> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn unbounded() -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self::new(u64::MAX))
     }
 

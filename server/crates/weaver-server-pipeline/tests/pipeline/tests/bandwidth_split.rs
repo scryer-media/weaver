@@ -5,8 +5,9 @@
 // it in force, and the global pause it publishes to the torrents.
 
 use std::sync::Arc;
+use weaver_server_composition::Database;
+use weaver_server_pipeline::SchedulerHandle;
 use weaver_server_pipeline::pipeline::tests::bandwidth_fixture::BandwidthFixture;
-use weaver_server_pipeline::{Database, SchedulerHandle};
 
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicU64 as StdAtomicU64;
@@ -38,19 +39,19 @@ impl JobClass for Torrents {
     async fn act(
         &self,
         actions: Vec<(
-            weaver_server_pipeline::JobId,
+            weaver_server_composition::JobId,
             weaver_server_pipeline::jobs::handle::QueueAction,
         )>,
     ) -> std::collections::BTreeMap<
-        weaver_server_pipeline::JobId,
-        Result<(), weaver_server_pipeline::SchedulerError>,
+        weaver_server_composition::JobId,
+        Result<(), weaver_server_composition::SchedulerError>,
     > {
         actions
             .into_iter()
             .map(|(id, _)| {
                 (
                     id,
-                    Err(weaver_server_pipeline::SchedulerError::JobNotFound(id)),
+                    Err(weaver_server_composition::SchedulerError::JobNotFound(id)),
                 )
             })
             .collect()
@@ -92,8 +93,8 @@ fn split(usenet_pct: u8) -> Option<BandwidthSplit> {
 fn bandwidth(
     download_bps: Option<u64>,
     usenet_pct: Option<u8>,
-) -> weaver_server_pipeline::proxies::Bandwidth {
-    weaver_server_pipeline::proxies::Bandwidth {
+) -> weaver_server_composition::proxies::Bandwidth {
+    weaver_server_composition::proxies::Bandwidth {
         download_bps,
         upload_bps: None,
         split: usenet_pct.and_then(split),
@@ -126,7 +127,7 @@ fn handle(pipeline: &BandwidthFixture) -> SchedulerHandle {
 
 async fn set_bandwidth(
     pipeline: &mut BandwidthFixture,
-    bandwidth: weaver_server_pipeline::proxies::Bandwidth,
+    bandwidth: weaver_server_composition::proxies::Bandwidth,
 ) {
     handle(pipeline).set_bandwidth(bandwidth).await.unwrap();
     pipeline.apply_queue_intents().await;
@@ -273,7 +274,7 @@ async fn the_whole_upload_limit_is_the_torrents() {
     // side of the download split.
     set_bandwidth(
         &mut pipeline,
-        weaver_server_pipeline::proxies::Bandwidth {
+        weaver_server_composition::proxies::Bandwidth {
             upload_bps: Some(3 * MB),
             ..bandwidth(Some(100 * MB), Some(80))
         },
@@ -369,7 +370,7 @@ async fn usenet_is_measured_off_the_wire_at_each_tick() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, torrents) = seated(&temp_dir).await;
     let policy = Arc::new(
-        weaver_server_pipeline::servers::transfer_policy::ServerTransferPolicyRegistry::new(
+        weaver_server_composition::servers::transfer_policy::ServerTransferPolicyRegistry::new(
             Database::open_in_memory().unwrap(),
             &[],
         )

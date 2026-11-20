@@ -9,8 +9,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use weaver_nntp::client::{NntpClient, NntpClientConfig};
+use weaver_server_composition::{JobId, JobStatus};
 use weaver_server_pipeline::pipeline::tests::{TestHarness, nzb_zstd_for, standalone_job_spec};
-use weaver_server_pipeline::{JobId, JobStatus};
 
 const SHARED: &str = "shared@example.com";
 const PAYLOAD: &[u8] = b"one article, several independent file placements";

@@ -34,7 +34,7 @@ use crate::pipeline::graph::root::ArticleRoot;
 use crate::pipeline::graph::root::facts::RootFactsError;
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum RestoreFailure {
+pub enum RestoreFailure {
     #[error(transparent)]
     Tree(#[from] RestoreError),
     #[error(transparent)]
@@ -47,8 +47,8 @@ pub(crate) enum RestoreFailure {
     Step(#[from] GraphError),
 }
 
-pub(crate) struct Restored {
-    pub(crate) job: GraphJob,
+pub struct Restored {
+    pub job: GraphJob,
     // Articles this run does not fetch: read back, or lost for good.
     pub(crate) settled: Vec<(VolumeIndex, u32)>,
     // Articles the checkpoint had that were not on disk.
@@ -59,7 +59,7 @@ pub(crate) struct Restored {
 }
 
 impl GraphJob {
-    pub(crate) fn restore(
+    pub fn restore(
         snapshot: &Snapshot,
         files: &[RootFile],
         scope: u64,

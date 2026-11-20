@@ -195,7 +195,7 @@ pub(crate) fn slots(tuner: &RuntimeTuner) -> usize {
 // How deep a graph job's namespaces may nest, handed to its tree beside the
 // hold budgets. An object that would open one deeper is never built: its
 // member is refused as the container it is, and the job goes on.
-pub(crate) const NESTING: u32 = MAX_GRAPH_NESTING_DEPTH;
+pub const NESTING: u32 = MAX_GRAPH_NESTING_DEPTH;
 
 // The job's extraction budget: the operator's extraction limits, one budget
 // per job, read where the namespace writes. Every byte an object
@@ -238,7 +238,7 @@ pub(crate) const NESTING: u32 = MAX_GRAPH_NESTING_DEPTH;
 //                      setting that does not parse is the default. A name
 //                      the action deletes is no breach: the delivery
 //                      leaves its file out (`removes`)
-pub(crate) struct Caps {
+pub struct Caps {
     limits: Arc<ExtractionLimits>,
     read_policy: PolicyRead,
     policy: Policy,
@@ -286,14 +286,13 @@ pub(crate) struct Caps {
 // database could not be read. A failed read is the host's, never the
 // post's: it is tried again when the policy is next needed. A stored value
 // that does not parse is no failed read: it answers with the default.
-pub(crate) type PolicyRead =
-    Arc<dyn Fn() -> Result<Arc<PostProcessingSettings>, String> + Send + Sync>;
+pub type PolicyRead = Arc<dyn Fn() -> Result<Arc<PostProcessingSettings>, String> + Send + Sync>;
 
 // What a failed read of the policy is said as: the setting, never the post.
 const POLICY_UNREAD: &str = "The Unacceptable extensions setting could not be read";
 
 // A read that always answers with these settings.
-pub(crate) fn known_policy(settings: PostProcessingSettings) -> PolicyRead {
+pub fn known_policy(settings: PostProcessingSettings) -> PolicyRead {
     let settings = Arc::new(settings);
     Arc::new(move || Ok(Arc::clone(&settings)))
 }
@@ -310,7 +309,7 @@ enum Policy {
 // directory's, where what an object produced waits for the object that
 // reads it. One device when the two directories are one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Device {
+pub enum Device {
     Output = 0,
     Working = 1,
 }
@@ -373,11 +372,11 @@ struct Extent {
 // the reserve before it wakes, what the cached reading shows free, and the
 // reserve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DiskWait {
+pub struct DiskWait {
     pub(crate) device: Device,
     pub(crate) owes: u64,
     pub(crate) free: Option<u64>,
-    pub(crate) reserve: u64,
+    pub reserve: u64,
 }
 
 // How much is promised from a device beyond what a write needs when the
@@ -627,11 +626,7 @@ impl Spend {
 
 impl Caps {
     // The policy is read once here; a read that fails is tried again.
-    pub(crate) fn new(
-        limits: Arc<ExtractionLimits>,
-        read_policy: PolicyRead,
-        declared: Vec<u64>,
-    ) -> Self {
+    pub fn new(limits: Arc<ExtractionLimits>, read_policy: PolicyRead, declared: Vec<u64>) -> Self {
         let known = Arc::new(OnceLock::new());
         let policy = match read_policy() {
             Ok(settings) => {
@@ -666,7 +661,7 @@ impl Caps {
     }
 
     // No limit and no policy: a writer standing alone, outside a job.
-    pub(crate) fn unbounded() -> Self {
+    pub fn unbounded() -> Self {
         let limits = ExtractionLimits::unbounded();
         let policy = PostProcessingSettings {
             unacceptable_extensions: Vec::new(),
@@ -772,7 +767,7 @@ impl Caps {
         self.decoding.clone()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn clock_held(&self) -> bool {
         self.paused.is_some()
     }
@@ -1363,7 +1358,7 @@ impl crate::pipeline::Pipeline {
     // What a job outside the pipeline builds its graph with: the pipeline's
     // holds accountant, slots, extraction limits and the complete root's
     // free-space reader, and the mail its runs speak on.
-    pub(crate) fn graph_budget(&self) -> GraphBudget {
+    pub fn graph_budget(&self) -> GraphBudget {
         GraphBudget {
             accountant: Arc::clone(&self.graph_holds),
             slots: self.graph_slot_limit(),
@@ -1384,25 +1379,25 @@ impl crate::pipeline::Pipeline {
 
 // The pipeline's budget, for a job it does not run.
 #[derive(Clone)]
-pub(crate) struct GraphBudget {
-    pub(crate) accountant: Arc<weaver_graph::holds::HoldsAccountant>,
-    pub(crate) slots: usize,
-    pub(crate) limits: Arc<ExtractionLimits>,
-    pub(crate) free_disk: weaver_server_disk::operations::disk::CapacityReader,
+pub struct GraphBudget {
+    pub accountant: Arc<weaver_graph::holds::HoldsAccountant>,
+    pub slots: usize,
+    pub limits: Arc<ExtractionLimits>,
+    pub free_disk: weaver_server_disk::operations::disk::CapacityReader,
     // Where the job's runs speak, and where it joins to hear them.
-    pub(crate) mail: tokio::sync::mpsc::Sender<super::engine::Said>,
+    pub mail: tokio::sync::mpsc::Sender<super::engine::Said>,
     // Where the database's word on the job's checkpoints is said.
-    pub(crate) written: tokio::sync::mpsc::UnboundedSender<super::engine::Said>,
-    pub(crate) outside: Arc<super::engine::Outside>,
+    pub written: tokio::sync::mpsc::UnboundedSender<super::engine::Said>,
+    pub outside: Arc<super::engine::Outside>,
     // The directory the job's own scratch goes under.
-    pub(crate) work: std::path::PathBuf,
+    pub work: std::path::PathBuf,
     // The decode pool every job shares.
-    pub(crate) decode: Arc<super::engine::DecodePool>,
+    pub decode: Arc<super::engine::DecodePool>,
     // What decode windows took from the disk `work` is on.
-    pub(crate) window_ledger: weaver_server_disk::scratch::ScratchLedger,
+    pub window_ledger: weaver_server_disk::scratch::ScratchLedger,
     // Weaver's data folder, the free space of its disk, and what decode
     // windows took from it.
-    pub(crate) data_dir: (
+    pub data_dir: (
         std::path::PathBuf,
         weaver_server_disk::operations::disk::CapacityReader,
         weaver_server_disk::scratch::ScratchLedger,

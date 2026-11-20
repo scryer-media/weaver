@@ -8,11 +8,11 @@
 
 use tokio::sync::broadcast::error::TryRecvError;
 
-use weaver_server_pipeline::events::model::PipelineEvent;
+use weaver_server_composition::events::model::PipelineEvent;
+use weaver_server_composition::{JobId, NzbFileId, SegmentId};
 use weaver_server_pipeline::pipeline::tests::dispatch_fixture::busy_turns::{
     BusyTurns, ResultStream,
 };
-use weaver_server_pipeline::{JobId, NzbFileId, SegmentId};
 
 fn held_segment(job_id: JobId, file_index: u32, segment_number: u32) -> SegmentId {
     SegmentId {

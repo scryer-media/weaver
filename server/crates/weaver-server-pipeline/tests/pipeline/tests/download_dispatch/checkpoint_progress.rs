@@ -3,6 +3,8 @@
 
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
+use weaver_server_composition::{JobId, JobStatus};
+use weaver_server_pipeline::DownloadQueue;
 use weaver_server_pipeline::pipeline::{
     diagnostics::PipelineDiagnostics,
     tests::{
@@ -10,7 +12,6 @@ use weaver_server_pipeline::pipeline::{
         segmented_job_spec,
     },
 };
-use weaver_server_pipeline::{DownloadQueue, JobId, JobStatus};
 
 fn queue(fixture: &DispatchFixture, id: JobId) -> &DownloadQueue {
     &fixture.job(id).articles.active().unwrap().download_queue

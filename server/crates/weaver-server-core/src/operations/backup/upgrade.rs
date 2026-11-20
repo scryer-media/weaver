@@ -17,7 +17,7 @@ use crate::persistence::database_target::DatabaseTarget;
 // Settings key holding the version that last started against this database.
 // It is written as soon as the database opens, before first-run configuration
 // is imported, so it does not make the database hold settings of its own.
-use weaver_server_pipeline::operations::backup::LAST_VERSION;
+use weaver_server_composition::operations::backup::LAST_VERSION;
 const PENDING_VERSION: &str = "pending_auto_backup_version";
 
 // Record the version after the database has opened and restore recovery has completed.
@@ -31,7 +31,7 @@ fn record_started_version_for(
     db: &crate::Database,
     version: &str,
 ) -> Result<(), BackupServiceError> {
-    weaver_server_pipeline::operations::backup::record_started_version_for(db, version)
+    weaver_server_composition::operations::backup::record_started_version_for(db, version)
         .map_err(io_err)
 }
 

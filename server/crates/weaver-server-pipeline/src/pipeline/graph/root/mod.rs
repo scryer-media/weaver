@@ -15,8 +15,8 @@
 //   seams    the pipeline's hooks into all of the above
 
 pub(crate) mod facts;
-pub(crate) mod intake;
-pub(crate) mod phase;
+pub mod intake;
+pub mod phase;
 pub(crate) mod sample;
 mod seams;
 #[cfg(any(test, feature = "pipeline-test-fixtures"))]

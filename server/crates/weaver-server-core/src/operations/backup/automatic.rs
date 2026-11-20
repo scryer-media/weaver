@@ -9,7 +9,7 @@ use crate::settings::queries::SettingsQueries;
 use chrono::{DateTime, Duration, Local, LocalResult, TimeZone, Utc};
 use serde::Serialize;
 
-pub(super) use weaver_server_pipeline::operations::backup::automatic::{
+pub(super) use weaver_server_composition::operations::backup::automatic::{
     AUTO_SETTINGS_KEY, StoredAutoSettings, decode_auto_settings,
 };
 

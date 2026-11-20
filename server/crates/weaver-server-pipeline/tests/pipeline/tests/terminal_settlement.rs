@@ -3,12 +3,12 @@
 
 // Delivery claims, including terminal classifications written by older versions.
 
+use weaver_server_composition::{JobId, NzbFileId, SegmentId};
 use weaver_server_pipeline::jobs::model::TerminalDiscardKind;
 use weaver_server_pipeline::pipeline::tests::{
     control_fixture::start_move_to_complete, delivery_fixture::*, insert_active_job,
     new_direct_pipeline, segmented_job_spec, yenc_fixture::mark_missing,
 };
-use weaver_server_pipeline::{JobId, NzbFileId, SegmentId};
 
 fn file_id(job_id: JobId, file_index: u32) -> NzbFileId {
     NzbFileId { job_id, file_index }

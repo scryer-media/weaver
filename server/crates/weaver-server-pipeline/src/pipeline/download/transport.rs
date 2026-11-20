@@ -4,11 +4,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-// Latency bands. A band picks the starting rung, labels a server in the UI,
-// and labels a connection test. It never gates a depth on its own: the depth
-// comes from the measured latency/transfer ratio.
-pub(crate) const LATENCY_BAND_GOOD_MAX: Duration = Duration::from_millis(400);
-pub(crate) const LATENCY_BAND_MODERATE_MAX: Duration = Duration::from_millis(800);
+pub(crate) use weaver_server_composition::servers::latency_band::LatencyBand;
 
 // Probe latency from which a server with nothing proven opens four deep
 // inside the good band, which otherwise opens two deep.
@@ -176,45 +172,6 @@ impl DownloadLaneMode {
             Self::Sequential
         } else {
             Self::Pipelined { depth }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum LatencyBand {
-    Good,
-    Moderate,
-    Slow,
-}
-
-impl LatencyBand {
-    pub(crate) fn from_latency(latency: Duration) -> Self {
-        if latency < LATENCY_BAND_GOOD_MAX {
-            Self::Good
-        } else if latency < LATENCY_BAND_MODERATE_MAX {
-            Self::Moderate
-        } else {
-            Self::Slow
-        }
-    }
-
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Good => "good",
-            Self::Moderate => "moderate",
-            Self::Slow => "slow",
-        }
-    }
-
-    // Where a server with no measurement of its own starts. A further-away
-    // server has more round trip to hide, so it starts deeper. The good band
-    // opens deeper from [`OPEN_FOUR_DEEP_MIN_LATENCY`]; see
-    // [`guessed_opening_depth`].
-    pub(crate) fn starting_depth(self) -> u8 {
-        match self {
-            Self::Good => 2,
-            Self::Moderate => 4,
-            Self::Slow => 8,
         }
     }
 }

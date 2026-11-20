@@ -538,7 +538,7 @@ pub async fn drain_pipeline(pipeline: &mut Pipeline) {
 }
 pub async fn set_categories(
     pipeline: &Pipeline,
-    categories: Vec<crate::categories::CategoryConfig>,
+    categories: Vec<weaver_server_settings::categories::CategoryConfig>,
 ) {
     pipeline.config.write().await.categories = categories;
 }

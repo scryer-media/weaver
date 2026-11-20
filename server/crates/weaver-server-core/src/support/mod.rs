@@ -20,8 +20,8 @@ mod tests;
 mod torrent;
 
 pub use torrent::TorrentJobSection;
-use weaver_server_pipeline::support::human_bytes;
-pub use weaver_server_pipeline::support::{ActiveReportGroup, ActiveReportJobs};
+use weaver_server_composition::support::human_bytes;
+pub use weaver_server_composition::support::{ActiveReportGroup, ActiveReportJobs};
 
 use std::fmt::Write as _;
 

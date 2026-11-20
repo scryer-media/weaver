@@ -4,12 +4,13 @@
 use std::collections::BTreeMap;
 use weaver_server_base::events::model::PipelineEvent;
 use weaver_server_base::jobs::ids::JobId;
+use weaver_server_composition::JobStatus;
 use weaver_server_pipeline::Pipeline;
+use weaver_server_pipeline::history::queries::HistoryQueries;
 use weaver_server_pipeline::jobs::queries::JobsQueries;
 use weaver_server_pipeline::pipeline::tests::{
     history_fixture::database, new_direct_pipeline, queue_fixture::*,
 };
-use weaver_server_pipeline::{JobStatus, history::queries::HistoryQueries};
 
 #[tokio::test]
 async fn cancel_batch_of_queued_jobs_archives_every_row() {
@@ -81,11 +82,11 @@ async fn cancel_batch_refusal_of_one_id_leaves_the_rest_cancelled() {
 
     assert!(matches!(
         outcome[&moving],
-        Err(weaver_server_pipeline::SchedulerError::Conflict(_))
+        Err(weaver_server_composition::SchedulerError::Conflict(_))
     ));
     assert!(matches!(
         outcome[&missing],
-        Err(weaver_server_pipeline::SchedulerError::JobNotFound(id)) if id == missing
+        Err(weaver_server_composition::SchedulerError::JobNotFound(id)) if id == missing
     ));
     assert!(installed_spec(&pipeline, moving).is_some());
     assert!(
@@ -197,7 +198,7 @@ async fn fail_history_insert_for(pipeline: &Pipeline, job_id: JobId) {
         "CREATE TRIGGER reject_cancel_archive BEFORE INSERT ON job_history WHEN NEW.job_id = {} BEGIN SELECT RAISE(ABORT, 'synthetic archive failure'); END",
         job_id.0
     );
-    weaver_server_pipeline::persistence::sql_runtime::SqlRuntime::run_in_transaction(
+    weaver_server_composition::persistence::sql_runtime::SqlRuntime::run_in_transaction(
         &datastore,
         "test_archive_fault",
         |tx| {
@@ -322,7 +323,7 @@ async fn cancel_batch_archive_failure_leaves_that_job_live_and_recoverable() {
 
     // Recoverable: once the fault clears, the same job cancels cleanly.
     let datastore = database(&pipeline).datastore();
-    weaver_server_pipeline::persistence::sql_runtime::SqlRuntime::run_in_transaction(
+    weaver_server_composition::persistence::sql_runtime::SqlRuntime::run_in_transaction(
         &datastore,
         "test_archive_fault",
         |tx| {

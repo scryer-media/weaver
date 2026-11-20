@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use weaver_graph::slots::{Admissions, Asked, AskerId, Slots, Ticket, Waiting};
 
 #[derive(Debug)]
-pub(crate) struct RepairSlots {
+pub struct RepairSlots {
     slots: Slots,
     tickets: HashMap<AskerId, Ticket>,
     woken: Vec<AskerId>,
@@ -45,11 +45,11 @@ impl RepairSlots {
 
     // Whether a slot was handed to the asker while it waited, and is kept
     // here until it asks again.
-    pub(crate) fn handed(&self, asker: AskerId) -> bool {
+    pub fn handed(&self, asker: AskerId) -> bool {
         self.tickets.contains_key(&asker)
     }
 
-    pub(crate) fn release(&mut self, ticket: Ticket) {
+    pub fn release(&mut self, ticket: Ticket) {
         let admissions = self.slots.release(ticket);
         self.note(admissions);
     }
@@ -64,7 +64,7 @@ impl RepairSlots {
     }
 
     // A job that went away: its slot or its place in the queue.
-    pub(crate) fn forget(&mut self, asker: AskerId) {
+    pub fn forget(&mut self, asker: AskerId) {
         match self.tickets.remove(&asker) {
             Some(ticket) => self.release(ticket),
             None => {
@@ -73,7 +73,7 @@ impl RepairSlots {
         }
     }
 
-    pub(crate) fn take_woken(&mut self) -> Vec<AskerId> {
+    pub fn take_woken(&mut self) -> Vec<AskerId> {
         std::mem::take(&mut self.woken)
     }
 

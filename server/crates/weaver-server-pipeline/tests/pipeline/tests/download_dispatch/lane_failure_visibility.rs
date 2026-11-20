@@ -13,11 +13,12 @@ use std::sync::{Arc, atomic::Ordering};
 use std::time::{Duration, Instant};
 
 use weaver_nntp::client::BlockingBodyLaneAcquireError;
+use weaver_server_composition::{JobId, JobStatus};
+use weaver_server_pipeline::DownloadQueue;
 use weaver_server_pipeline::pipeline::tests::dispatch_fixture::{
     DispatchFixture,
     acquire_failures::{DISPATCH_STALL_LOG_INTERVAL, RETRY_STORM_THRESHOLD, RoutePress},
 };
-use weaver_server_pipeline::{DownloadQueue, JobId, JobStatus};
 
 fn queued_works(pipeline: &DispatchFixture, job_id: JobId) -> usize {
     pipeline

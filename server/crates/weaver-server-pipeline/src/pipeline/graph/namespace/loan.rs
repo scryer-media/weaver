@@ -51,7 +51,7 @@ pub(crate) struct Loan {
 }
 
 // What a repair came back with.
-pub(crate) struct Returned {
+pub struct Returned {
     pub(crate) set: NodeId,
     pub(crate) namespace: NodeId,
     pub(crate) object: Box<dyn Object>,

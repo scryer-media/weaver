@@ -4,22 +4,22 @@
 // The graph engine: every job's articles go from the decoder through the
 // root, the tree and the namespace writer to its files.
 
-pub(crate) mod checkpoint;
+pub mod checkpoint;
 pub(crate) mod decoding;
 pub(crate) mod disk;
-pub(crate) mod engine;
+pub mod engine;
 pub(crate) mod envelope;
 pub(crate) mod hardware;
-pub(crate) mod job;
-pub(crate) mod leaf;
-pub(crate) mod limits;
+pub mod job;
+pub mod leaf;
+pub mod limits;
 #[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub mod lines;
 pub(crate) mod metadata;
-pub(crate) mod namespace;
-pub(crate) mod restore;
-pub(crate) mod root;
-pub(crate) mod status;
+pub mod namespace;
+pub mod restore;
+pub mod root;
+pub mod status;
 pub(crate) mod summary;
 pub(crate) mod window;
 

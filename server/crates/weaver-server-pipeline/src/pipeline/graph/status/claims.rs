@@ -197,7 +197,7 @@ pub(crate) enum Described {
 // What a posted file that is not whole says of the delivery: short of it,
 // unless none of its bytes arrived and its name says otherwise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Unarrived {
+pub enum Unarrived {
     // A file of the delivery, which is short of it.
     Short,
     // A volume or part posted again: another posted file named into the
@@ -288,7 +288,7 @@ impl Delivery {
     // among them, fails, and as every failed job publishes nothing, they
     // stay in its working directory. A file no set describes beside a set that vouched
     // (`unchecked`) is never short: nothing checked it.
-    pub(crate) fn status(&self, failure: Option<&Failure>) -> JobStatus {
+    pub fn status(&self, failure: Option<&Failure>) -> JobStatus {
         let short = !(self.damaged.is_empty()
             && self.unrepaired.is_empty()
             && self.withheld.is_empty()

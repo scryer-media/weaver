@@ -38,7 +38,7 @@ impl GraphJob {
     // While the job waits for room on a disk, only what writes nothing goes
     // out: the reads of recovery a restore asked again, and a check of what
     // was written. Repairs, replays and the objects' work wait with the job.
-    pub(crate) fn lend(&mut self, slots: &mut RepairSlots, limit: usize) -> Result<(), GraphError> {
+    pub fn lend(&mut self, slots: &mut RepairSlots, limit: usize) -> Result<(), GraphError> {
         if limit > 0 {
             self.lend_rewalks()?;
         }
@@ -128,7 +128,7 @@ impl GraphJob {
 
     // A retiring job releases an idle slot. An outstanding repair keeps
     // its loan and ticket until its matching completion acknowledgment.
-    pub(crate) fn forget_slot(&mut self) -> Option<Ticket> {
+    pub fn forget_slot(&mut self) -> Option<Ticket> {
         self.loans.give_back()
     }
 
@@ -324,7 +324,7 @@ impl GraphJob {
 
     // Whether a give-up the job went quiet into still has volumes to read
     // back. Nothing else of the job is stepped meanwhile.
-    pub(crate) fn giving_up(&self) -> bool {
+    pub fn giving_up(&self) -> bool {
         self.quieting.is_some()
     }
 
@@ -332,7 +332,7 @@ impl GraphJob {
     // give-up: once per volume, and not once the pipeline is stopping,
     // when the give-up waits where it stands and the job keeps the
     // checkpoint from before it.
-    pub(crate) fn ring_give_up(&mut self) -> bool {
+    pub fn ring_give_up(&mut self) -> bool {
         let stopping = self.works.stopping();
         self.quieting
             .as_mut()

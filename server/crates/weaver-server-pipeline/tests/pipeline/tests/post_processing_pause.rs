@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use weaver_server_composition::{JobId, JobStatus};
 use weaver_server_pipeline::pipeline::tests::{
     control_fixture::{completion_pending, move_deferred, move_in_flight, start_move_to_complete},
     insert_active_job, new_direct_pipeline,
     queue_fixture::{apply_intents, handle as scheduler, installed_status, report_all},
     standalone_job_spec,
 };
-use weaver_server_pipeline::{JobId, JobStatus};
 
 #[tokio::test]
 async fn post_processing_resume_preserves_manual_pause_on_deferred_move() {

@@ -11,7 +11,6 @@ use crate::jobs::handle::{DownloadBlockKind, DownloadBlockState};
 use crate::pipeline::Pipeline;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 pub use weaver_server_net::bandwidth::service::QuotaCalendar;
-pub(crate) use weaver_server_net::bandwidth::service::compute_window;
 
 use crate::jobs::{HoldOrigin, HoldOwner, HoldSet};
 

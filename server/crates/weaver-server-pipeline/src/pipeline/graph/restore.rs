@@ -381,7 +381,7 @@ impl RestoreSeat {
 // directory's own marker and the run's cache are the directory's, never the
 // job's, and stay. A file that cannot be removed stays; the job does not
 // read it.
-pub(crate) fn sweep_unnamed(
+pub fn sweep_unnamed(
     working_dir: &Path,
     snapshot: &checkpoint::Snapshot,
     held_parts: &[crate::jobs::graph_checkpoint::HeldPartRow],
@@ -481,7 +481,7 @@ fn sweep_within(dir: &Path, at: &Path, named: &HashSet<String>, within: &HashSet
 
 // What a job's working directory holds that no archive made: the job's own
 // files, and the directory's.
-pub(crate) fn the_jobs(name: &Path) -> bool {
+pub fn the_jobs(name: &Path) -> bool {
     name == Path::new(weaver_graph::names::INTERNAL_DIR) || the_directorys(name)
 }
 

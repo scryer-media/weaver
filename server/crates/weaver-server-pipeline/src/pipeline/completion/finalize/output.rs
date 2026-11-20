@@ -1439,10 +1439,10 @@ async fn holds_more_than_marker(dir: &Path) -> bool {
 
 fn complete_parent_for_category(
     complete_dir: &std::path::Path,
-    categories: &[crate::categories::CategoryConfig],
+    categories: &[weaver_server_settings::categories::CategoryConfig],
     category: Option<&str>,
 ) -> Result<PathBuf, String> {
-    crate::categories::completion_parent(complete_dir, categories, category)
+    weaver_server_settings::categories::completion_parent(complete_dir, categories, category)
 }
 
 fn complete_destination_candidate(
@@ -1464,7 +1464,7 @@ fn complete_destination_candidate(
     }
 }
 
-pub(crate) async fn claim_complete_destination_path(
+pub async fn claim_complete_destination_path(
     parent: &Path,
     dir_name: &str,
     job_id: JobId,
@@ -1496,8 +1496,11 @@ pub(crate) async fn claim_complete_destination_path(
 mod category_destination_tests {
     use super::*;
 
-    fn category(name: &str, dest_dir: Option<&str>) -> crate::categories::CategoryConfig {
-        crate::categories::CategoryConfig {
+    fn category(
+        name: &str,
+        dest_dir: Option<&str>,
+    ) -> weaver_server_settings::categories::CategoryConfig {
+        weaver_server_settings::categories::CategoryConfig {
             upload_cap: Default::default(),
             seeding: None,
             torrent_route: false,

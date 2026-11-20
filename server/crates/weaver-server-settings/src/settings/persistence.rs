@@ -5,9 +5,10 @@ use crate::settings::queries::SettingsQueries;
 use weaver_server_base::jobs::ids::JobId;
 use weaver_server_db::persistence::StateError;
 use weaver_server_db::persistence::connection::Database;
-use weaver_server_db::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx, StoreDatastore};
+use weaver_server_db::persistence::sql_runtime::{SqlArg, SqlRuntime, StoreDatastore};
 
-const NEXT_JOB_ID_SETTING_KEY: &str = "next_job_id";
+use weaver_server_jobs::jobs::job_id_reservation::NEXT_JOB_ID_SETTING_KEY;
+pub use weaver_server_jobs::jobs::job_id_reservation::reserve_next_job_id_tx;
 
 // The bind-address portion of an authenticated network-policy update.
 // Keeping `Unchanged` distinct from `Clear` lets the combined settings form
@@ -239,68 +240,4 @@ async fn next_job_id_floor_target(datastore: &StoreDatastore) -> Result<u64, Sta
         .unwrap_or(0);
 
     Ok(persisted.max(max_seen as u64 + 1).max(10_000))
-}
-
-async fn max_seen_job_id_floor_tx(tx: &mut SqlTx<'_>) -> Result<u64, StateError> {
-    let row = tx
-        .fetch_optional(
-            "SELECT MAX(id) AS id FROM (
-                 SELECT MAX(job_id) AS id FROM active_jobs
-                 UNION ALL
-                 SELECT MAX(job_id) AS id FROM job_history
-                 UNION ALL
-                 SELECT MAX(job_id) AS id FROM duplicate_job_snapshots
-                 UNION ALL
-                 SELECT MAX(job_id) AS id FROM forgotten_duplicate_identities
-                 UNION ALL
-                 SELECT MAX(job_id) AS id FROM job_tags
-             ) ids",
-            &[],
-        )
-        .await?;
-    let max_seen = row
-        .map(|row| row.opt_i64("id"))
-        .transpose()?
-        .flatten()
-        .unwrap_or(0);
-
-    Ok((max_seen as u64 + 1).max(10_000))
-}
-
-pub async fn reserve_next_job_id_tx(tx: &mut SqlTx<'_>) -> Result<u64, StateError> {
-    let floor = max_seen_job_id_floor_tx(tx).await?;
-    tx.execute(
-        "INSERT INTO settings (key, value) VALUES ({}, {})
-         ON CONFLICT(key) DO NOTHING",
-        &[
-            SqlArg::Text(NEXT_JOB_ID_SETTING_KEY.to_string()),
-            SqlArg::Text(floor.to_string()),
-        ],
-    )
-    .await?;
-
-    let select_sql = match tx {
-        SqlTx::Postgres(_) => "SELECT value FROM settings WHERE key = {} FOR UPDATE",
-        SqlTx::Sqlite(_) => "SELECT value FROM settings WHERE key = {}",
-    };
-    let persisted = tx
-        .fetch_optional(
-            select_sql,
-            &[SqlArg::Text(NEXT_JOB_ID_SETTING_KEY.to_string())],
-        )
-        .await?
-        .and_then(|row| row.text("value").ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(floor);
-    let next_job_id = persisted.max(floor).max(10_000);
-    tx.execute(
-        "UPDATE settings SET value = {} WHERE key = {}",
-        &[
-            SqlArg::Text((next_job_id + 1).to_string()),
-            SqlArg::Text(NEXT_JOB_ID_SETTING_KEY.to_string()),
-        ],
-    )
-    .await?;
-
-    Ok(next_job_id)
 }
