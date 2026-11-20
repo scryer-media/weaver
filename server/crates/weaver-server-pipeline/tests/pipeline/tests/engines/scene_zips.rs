@@ -552,7 +552,7 @@ async fn a_restart_mid_lift_ends_as_the_run_that_never_restarted() {
             let restarted = super::restart::run_restarting_at(
                 &scenario,
                 &mut |rows| {
-                    if rows.members.iter().any(|member| member.lifted.is_some()) {
+                    if rows.has_lifted_members() {
                         lifted += 1;
                     }
                 },
@@ -661,7 +661,7 @@ async fn a_lifted_volume_keeps_its_rank_across_a_restart() {
     let restarted = super::restart::run_restarting_at(
         &scenario,
         &mut |rows| {
-            if rows.members.iter().any(|member| member.lifted.is_some()) {
+            if rows.has_lifted_members() {
                 lifted += 1;
             }
         },
@@ -771,7 +771,7 @@ fn deep_sets(levels: usize) -> (Scenario, Scenario) {
 
 #[tokio::test]
 async fn the_nesting_limit_counts_where_a_lifted_volume_came_from() {
-    let depth = crate::pipeline::graph::limits::NESTING as usize;
+    let depth = super::harness::NESTING as usize;
     let mut unpacked = Vec::new();
     for levels in [depth - 3, depth - 2] {
         let (scattered, together) = deep_sets(levels);

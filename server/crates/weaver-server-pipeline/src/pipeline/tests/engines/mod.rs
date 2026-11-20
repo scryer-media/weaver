@@ -82,19 +82,9 @@ mod caps;
 #[cfg(test)]
 mod checkpoint_cost;
 #[cfg(test)]
-mod classic_rar_crypt;
-#[cfg(test)]
-mod classic_sfv;
-#[cfg(test)]
-mod classic_sfv_nameless;
-#[cfg(test)]
-mod classic_streams;
-#[cfg(test)]
 mod dead_posts;
 #[cfg(test)]
 mod deep;
-#[cfg(test)]
-mod delivery;
 pub mod depth;
 #[cfg(test)]
 mod disk_wait;
@@ -105,17 +95,14 @@ mod embedded;
 #[cfg(test)]
 mod encrypted_hex;
 #[cfg(test)]
-mod end_files;
-#[cfg(test)]
 mod extractor_claims;
 #[cfg(test)]
 mod first_article_sample;
 pub mod harness;
 pub mod rar_fixtures;
+pub mod restart_fixtures;
 mod state;
 
-#[cfg(test)]
-mod header_names;
 #[cfg(test)]
 mod hold_breach;
 #[cfg(test)]
@@ -143,13 +130,9 @@ mod nested_rar4;
 #[cfg(test)]
 mod nesting;
 #[cfg(test)]
-mod obfuscated_revs;
-#[cfg(test)]
 mod pairings;
 #[cfg(test)]
 mod par3;
-#[cfg(test)]
-mod partial;
 #[cfg(test)]
 mod password;
 #[cfg(test)]
@@ -160,8 +143,6 @@ mod plain_par2;
 mod post_health_seats;
 #[cfg(test)]
 mod rar;
-#[cfg(test)]
-mod rar_engine;
 #[cfg(test)]
 mod rar_rev;
 #[cfg(test)]
@@ -191,17 +172,11 @@ mod remaining_stalls;
 #[cfg(test)]
 mod renamed_engine;
 #[cfg(test)]
-mod renamed_sets;
-#[cfg(test)]
-mod repaired_records;
-#[cfg(test)]
 mod repaired_source;
 #[cfg(test)]
 mod reposted;
 #[cfg(test)]
 pub(in crate::pipeline::tests) mod restart;
-#[cfg(test)]
-mod scene_zips;
 #[cfg(test)]
 mod seek;
 #[cfg(test)]
@@ -220,23 +195,14 @@ mod solid_hex;
 #[cfg(test)]
 mod spent;
 #[cfg(test)]
-mod split;
-#[cfg(test)]
 mod split_sets;
 #[cfg(test)]
-mod srr;
-#[cfg(test)]
 mod stage_events;
+pub mod stream_fixtures;
 #[cfg(test)]
-mod streams;
+use stream_fixtures as streams;
 #[cfg(test)]
 mod too_large;
-#[cfg(test)]
-mod unasked_recovery;
-#[cfg(test)]
-mod unlisted_par2;
-#[cfg(test)]
-mod unnamed_recovery;
 #[cfg(test)]
 mod waiting_sets;
 pub mod zip;

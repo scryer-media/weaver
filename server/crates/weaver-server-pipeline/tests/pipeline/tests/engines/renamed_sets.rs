@@ -13,10 +13,9 @@ use super::super::{
     TEST_RAR5_SIG, build_test_rar_end_header, build_test_rar_file_header,
     build_test_rar_main_header,
 };
-use super::classic_sfv::listing_text;
 use super::harness::{Outcome, Post, Scenario, kinds, par2_volumes_sliced, payload, run};
 use super::rar::delivered;
-use super::sfv::crc;
+use super::sfv::{crc, listing_text};
 use crate::pipeline::tests::direct_store::{
     multi_member_store_set, single_member_rar4_store_set, single_member_rar4_store_set_numbered,
     single_member_store_set,

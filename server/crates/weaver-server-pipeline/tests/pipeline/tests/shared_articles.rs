@@ -5,7 +5,12 @@
 // lane like every other article, and its other references are answered from
 // the job's repeated-article cache.
 
-use super::*;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+use weaver_nntp::client::{NntpClient, NntpClientConfig};
+use weaver_server_pipeline::pipeline::tests::{TestHarness, nzb_zstd_for, standalone_job_spec};
+use weaver_server_pipeline::{JobId, JobStatus};
 
 const SHARED: &str = "shared@example.com";
 const PAYLOAD: &[u8] = b"one article, several independent file placements";
@@ -232,7 +237,7 @@ async fn run_shared_job(servers: &[(&FakeServer, Answer)], id: JobId) -> Run {
         }
         revisions.changed().await.unwrap();
     };
-    let output = harness._temp_dir.path().join("complete/Shared Article");
+    let output = harness.root().join("complete/Shared Article");
     let delivered = std::fs::read_dir(&output)
         .into_iter()
         .flatten()

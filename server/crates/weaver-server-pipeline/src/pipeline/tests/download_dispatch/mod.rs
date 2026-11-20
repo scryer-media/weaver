@@ -61,13 +61,7 @@ fn held_segment(job_id: JobId, file_index: u32, segment_number: u32) -> SegmentI
     }
 }
 
-// Seconds since the epoch, as the NZB's `date` attribute carries it.
-fn now_epoch_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or(0)
-}
+use super::propagation_fixture::now_epoch_secs;
 
 // A one-file job whose files carry `posted_at` (or no date at all).
 fn posted_job_spec(name: &str, posted_at: Option<u64>) -> JobSpec {

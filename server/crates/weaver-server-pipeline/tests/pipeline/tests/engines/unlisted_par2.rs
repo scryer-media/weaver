@@ -171,7 +171,7 @@ async fn holes_in_a_recovery_volume_are_told_again_after_a_restart() {
             scenario = scenario.unlisted(2, *posted);
         }
         let scenario = damaged(scenario, 2);
-        let restarted = super::restart::run_restarting(&scenario, &mut |_| {}).await;
+        let restarted = super::restart::run_restarting(&scenario).await;
         assert_eq!(
             restarted.status,
             Some(JobStatus::Complete),

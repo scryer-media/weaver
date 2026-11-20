@@ -207,7 +207,7 @@ impl GraphJob {
     // What an older build left when a member's holds ran past their
     // budgets: the object bound over the first root member that has one
     // refuses it for its holds, as that build's object said.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn refuse_for_holds(&mut self) -> Result<NodeId, GraphError> {
         let node = self
             .tree

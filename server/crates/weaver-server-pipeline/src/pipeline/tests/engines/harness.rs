@@ -39,6 +39,7 @@ use crate::pipeline::{
 use weaver_server_base::jobs::ids::{JobId, NzbFileId, SegmentId};
 
 pub const ARTICLE: usize = 64;
+pub const NESTING: u32 = crate::pipeline::graph::limits::NESTING;
 
 pub use super::state::JOB;
 pub(in crate::pipeline::tests) use super::state::finished;
@@ -297,8 +298,7 @@ pub(in crate::pipeline::tests) fn par3_set_with(
 
 // For each recovery block of a PAR2 volume, the ordinals of the articles
 // holding its bytes.
-#[cfg(test)]
-pub(in crate::pipeline::tests) fn recovery_blocks(post: &Post) -> Vec<Vec<u32>> {
+pub fn recovery_blocks(post: &Post) -> Vec<Vec<u32>> {
     const HEADER: usize = 64;
     const RECOVERY: &[u8; 16] = b"PAR 2.0\0RecvSlic";
     let bytes = &post.bytes;
@@ -692,16 +692,14 @@ impl Scenario {
     }
 
     // The article at `ordinal` of `file` is served as another post's.
-    #[cfg(test)]
-    pub(in crate::pipeline::tests) fn foreign(mut self, file: u32, ordinal: u32) -> Self {
+    pub fn foreign(mut self, file: u32, ordinal: u32) -> Self {
         self.foreign.push((file, ordinal));
         self
     }
 
     // The article at `ordinal` of `file` is served with its own body under
     // another post's header.
-    #[cfg(test)]
-    pub(in crate::pipeline::tests) fn foreign_header(mut self, file: u32, ordinal: u32) -> Self {
+    pub fn foreign_header(mut self, file: u32, ordinal: u32) -> Self {
         self.foreign_header.push((file, ordinal));
         self
     }
@@ -713,12 +711,7 @@ impl Scenario {
 
     // The articles of `file` from `ordinal` on name it `name` in their
     // header.
-    pub(in crate::pipeline::tests) fn header_from(
-        mut self,
-        file: u32,
-        ordinal: u32,
-        name: &str,
-    ) -> Self {
+    pub fn header_from(mut self, file: u32, ordinal: u32, name: &str) -> Self {
         self.headers.push((file, ordinal, name.to_string()));
         self
     }
@@ -893,8 +886,7 @@ impl Scenario {
     // Whatever the download queue hands out at once arrives as workers
     // fetching `posts` side by side: the first article of each, in this
     // order, then the second of each, and so on.
-    #[cfg(test)]
-    pub(in crate::pipeline::tests) fn together(mut self, posts: &[u32]) -> Self {
+    pub fn together(mut self, posts: &[u32]) -> Self {
         self.together = posts.to_vec();
         self
     }
@@ -989,8 +981,7 @@ impl Scenario {
         self
     }
 
-    #[cfg(test)]
-    pub(in crate::pipeline::tests) fn refused_once(mut self, file: u32, ordinal: u32) -> Self {
+    pub fn refused_once(mut self, file: u32, ordinal: u32) -> Self {
         self.refused.push((file, ordinal));
         self
     }
@@ -1000,29 +991,17 @@ impl Scenario {
         self.damage.contains(&article) || (server == 0 && self.corrupt_primary.contains(&article))
     }
 
-    #[cfg(test)]
-    pub(in crate::pipeline::tests) fn corrupt_on_primary(
-        mut self,
-        file: u32,
-        ordinal: u32,
-    ) -> Self {
+    pub fn corrupt_on_primary(mut self, file: u32, ordinal: u32) -> Self {
         self.corrupt_primary.push((file, ordinal));
         self
     }
 
-    #[cfg(test)]
-    pub(in crate::pipeline::tests) fn headerless_on(
-        mut self,
-        file: u32,
-        ordinal: u32,
-        server: usize,
-    ) -> Self {
+    pub fn headerless_on(mut self, file: u32, ordinal: u32, server: usize) -> Self {
         self.headerless.push((file, ordinal, server));
         self
     }
 
-    #[cfg(test)]
-    pub(in crate::pipeline::tests) fn servers(mut self, servers: usize) -> Self {
+    pub fn servers(mut self, servers: usize) -> Self {
         self.servers = servers;
         self
     }
@@ -1125,7 +1104,7 @@ pub struct GraphView {
     // How many password candidates each node was offered, at the last look.
     pub offered: BTreeMap<weaver_graph::NodeId, usize>,
     // The files the job hands over at every depth, by output name.
-    pub(in crate::pipeline::tests) delivery: Delivery,
+    pub delivery: Delivery,
     // Whether a failure of the job, at the last look, is its post's: what
     // queue scripts hear as a deletion for health.
     pub health: bool,
@@ -1168,6 +1147,14 @@ pub struct GraphView {
 impl GraphView {
     pub fn has_withheld_files(&self) -> bool {
         !self.delivery.withheld.is_empty()
+    }
+
+    pub fn member_crc32_by_path(&self) -> std::collections::HashMap<String, u32> {
+        crate::pipeline::completion::finalize::member_crc32_by_path(&self.delivery.files)
+    }
+
+    pub fn delivery_debug(&self) -> &impl std::fmt::Debug {
+        &self.delivery
     }
 
     pub fn whole_files(&self) -> &[String] {
@@ -1244,8 +1231,7 @@ impl Outcome {
 
 // The repair and terminal events the run sent, in order, as words a row
 // can compare: `RepairComplete <slices>`, `JobCompleted`, `JobFailed`.
-#[cfg(test)]
-pub(in crate::pipeline::tests) fn repair_and_terminal_events(outcome: &Outcome) -> Vec<String> {
+pub fn repair_and_terminal_events(outcome: &Outcome) -> Vec<String> {
     outcome
         .events
         .iter()
@@ -1718,7 +1704,6 @@ pub(in crate::pipeline::tests) async fn take_retry(pipeline: &mut Pipeline) -> b
 
 // An ask as the worker serves it: the first server it does not exclude
 // answers.
-#[cfg(test)]
 pub(in crate::pipeline::tests) async fn serve_work(
     pipeline: &mut Pipeline,
     scenario: &Scenario,
@@ -2339,3 +2324,16 @@ pub(in crate::pipeline::tests) async fn run_holding_where(
 
 #[cfg(test)]
 mod remaining_walk;
+
+// Bytes no period runs through, so a compressing level cannot fold them.
+pub fn noise(len: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect()
+}

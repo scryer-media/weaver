@@ -686,8 +686,7 @@ async fn a_split_compressed_members_checksum_reaches_the_naming_plan() {
     let member = delivered("compressible.txt");
     let expected =
         crc_turbo::checksum(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, &graph.files[&member]) as u32;
-    let by_path =
-        crate::pipeline::completion::finalize::member_crc32_by_path(&graph.graph().delivery.files);
+    let by_path = graph.graph().member_crc32_by_path();
     assert_eq!(
         by_path.get("compressible.txt"),
         Some(&expected),

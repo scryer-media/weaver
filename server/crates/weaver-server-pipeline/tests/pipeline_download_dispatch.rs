@@ -5,6 +5,7 @@ mod pipeline {
     mod tests {
         mod download_dispatch {
             mod dispatch_server_order;
+            mod propagation_delay;
         }
     }
 }

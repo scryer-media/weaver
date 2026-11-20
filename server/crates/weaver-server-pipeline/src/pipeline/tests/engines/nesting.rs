@@ -28,18 +28,7 @@ fn delivered(name: &str) -> String {
     format!("{FOLDER}/{name}")
 }
 
-// Bytes no period runs through, so a compressing level cannot fold them.
-pub(super) fn noise(len: usize, seed: u64) -> Vec<u8> {
-    let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
-    (0..len)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            (state >> 24) as u8
-        })
-        .collect()
-}
+pub(super) use super::harness::noise;
 
 // The file's name at the bottom of `levels`: a stream names no member, so
 // what an xz holds is named after the stream.

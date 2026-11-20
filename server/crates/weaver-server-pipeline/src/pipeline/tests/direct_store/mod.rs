@@ -647,7 +647,7 @@ pub fn single_member_rar4_store_set(
 // volumes, and one volume carries the tail of one member and the head of the
 // next. That is the shape a season pack posts as, and the shape the first
 // shape demoted on sight.
-pub(in crate::pipeline::tests) fn multi_member_store_set(
+pub fn multi_member_store_set(
     members: &[(&str, Vec<u8>)],
     volume_count: usize,
 ) -> Vec<(String, Vec<u8>)> {

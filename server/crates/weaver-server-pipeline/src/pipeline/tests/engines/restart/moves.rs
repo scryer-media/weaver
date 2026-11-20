@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use super::*;
 use crate::jobs::graph_checkpoint::{Delta, GraphCheckpoint};
+use crate::pipeline::tests::engines::restart_fixtures::with_par3;
 
 // Where the job goes down, the first time the ledger renames a member.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

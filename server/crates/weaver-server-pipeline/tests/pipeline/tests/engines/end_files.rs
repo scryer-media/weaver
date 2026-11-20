@@ -16,8 +16,7 @@ use ::zip::CompressionMethod;
 use ::zip::ZipWriter;
 use ::zip::write::SimpleFileOptions;
 
-use super::harness::{ARTICLE, Outcome, Post, Scenario, run, try_run};
-use super::nesting::noise;
+use super::harness::{ARTICLE, Outcome, Post, Scenario, noise, run, try_run};
 use super::streams::bzip2;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::tests::direct_store::multi_member_store_set;

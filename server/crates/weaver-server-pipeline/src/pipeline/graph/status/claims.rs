@@ -146,11 +146,11 @@ pub(crate) fn refused<'c>(
 // A posted file none of whose bytes arrived is short only where its name
 // says it is a file the delivery lacks (`Unarrived`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Delivery {
-    pub(crate) whole: Vec<String>,
+pub struct Delivery {
+    pub whole: Vec<String>,
     // Damaged or missing with nothing that could rebuild them: delivered as
     // they stand.
-    pub(crate) damaged: Vec<String>,
+    pub damaged: Vec<String>,
     // Posted files that never arrived under names that say nothing of what
     // they were: short unless a set extracted whole beside them.
     pub(crate) unnamed: Vec<String>,
@@ -159,17 +159,17 @@ pub(crate) struct Delivery {
     // what a set describes. With them, a whole volume a vouching set proved
     // of a set whose first volume the release never carried, which nothing
     // can open. Delivered as they stand, and the job is no shorter for them.
-    pub(crate) unchecked: Vec<String>,
+    pub unchecked: Vec<String>,
     // A recovery object that covers them could not rebuild them. Left as
     // they stand, and not a delivery.
-    pub(crate) unrepaired: Vec<String>,
+    pub unrepaired: Vec<String>,
     // Given back withheld, with the reason its object refused it.
-    pub(crate) withheld: Vec<(String, Why)>,
+    pub withheld: Vec<(String, Why)>,
     // Left out of the delivery for an unwanted extension
     // (`remove_unwanted`): no file of it, whole or short.
     pub(crate) removed: Vec<String>,
     // Every file delivered, whole or as it stands, as the walk met it.
-    pub(crate) files: Vec<Delivered>,
+    pub files: Vec<Delivered>,
     // The job was given a password to try, as its candidates say
     // (`GraphJob::has_passwords`): a member withheld for a password then
     // needs one that none given opens, not one never given.
@@ -211,14 +211,14 @@ pub(crate) enum Unarrived {
 
 // One file the job hands over, under the name the tree placed it at.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Delivered {
-    pub(crate) name: String,
+pub struct Delivered {
+    pub name: String,
     // The name the member wanted before the tree placed it.
     pub(crate) from: String,
-    pub(crate) depth: u32,
-    pub(crate) whole: bool,
+    pub depth: u32,
+    pub whole: bool,
     // The CRC32 its object's headers state for its bytes, when they do.
-    pub(crate) crc32: Option<u32>,
+    pub crc32: Option<u32>,
 }
 
 impl Delivery {

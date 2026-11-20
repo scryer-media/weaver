@@ -1754,7 +1754,7 @@ async fn a_partial_job_restarted_after_every_article_ends_partial_with_the_same_
         Err(stall) => panic!("graph stalled at {:?}: {}", stall.status, stall.state),
     };
     assert_eq!(whole.status, Some(JobStatus::Partial));
-    let restarted = run_restarting(&scenario, &mut |_| {}).await;
+    let restarted = run_restarting(&scenario).await;
     assert!(restarted.restarts > 0, "the run restarted");
     assert_eq!(restarted.status, whole.status, "the status");
     assert_eq!(
@@ -2100,7 +2100,7 @@ async fn a_rar4_stray_named_as_a_volume_never_keeps_that_volume_out_whatever_com
                 "{case}: {:?}",
                 outcome.files.keys()
             );
-            let restarted = run_restarting(&scenario, &mut |_| {}).await;
+            let restarted = run_restarting(&scenario).await;
             assert!(restarted.restarts > 0, "{case}: the run restarted");
             assert_eq!(restarted.status, outcome.status, "{case}: the status");
             assert_eq!(

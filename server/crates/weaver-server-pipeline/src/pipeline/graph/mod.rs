@@ -13,8 +13,8 @@ pub(crate) mod hardware;
 pub(crate) mod job;
 pub(crate) mod leaf;
 pub(crate) mod limits;
-#[cfg(test)]
-pub(crate) mod lines;
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+pub mod lines;
 pub(crate) mod metadata;
 pub(crate) mod namespace;
 pub(crate) mod restore;

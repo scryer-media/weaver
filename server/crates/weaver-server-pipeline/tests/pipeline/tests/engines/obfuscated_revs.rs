@@ -11,8 +11,7 @@
 use weaver_graph::recovery::RepairOutcome;
 
 use super::harness::{ARTICLE, Outcome, Post, Scenario, par2_set, payload, run};
-use super::rar::{delivered, posts};
-use super::rar_rev::rar5_revs;
+use super::rar::{delivered, posts, rar5_revs};
 use crate::jobs::model::JobStatus;
 use crate::pipeline::tests::direct_store::single_member_store_set;
 

@@ -9,7 +9,7 @@
 // every byte of each.
 
 use super::harness::{Outcome, Post, Scenario, run};
-use super::streams::{brotli, bzip2, deflate, gzip, prose, tar, xz, zstd};
+use super::stream_fixtures::{brotli, bzip2, deflate, gzip, prose, tar, xz, zstd};
 use crate::jobs::model::JobStatus;
 
 fn delivered(name: &str) -> String {

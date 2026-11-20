@@ -14,7 +14,7 @@ use tracing::subscriber::DefaultGuard;
 const TARGET: &str = "weaver_server_pipeline::pipeline::graph";
 
 #[derive(Clone)]
-pub(crate) struct Lines {
+pub struct Lines {
     heard: Arc<Mutex<Vec<String>>>,
     target: &'static str,
     level: tracing::Level,
@@ -22,12 +22,12 @@ pub(crate) struct Lines {
 
 impl Lines {
     // Hear the graph's lines until the guard drops.
-    pub(crate) fn capture() -> (Self, DefaultGuard) {
+    pub fn capture() -> (Self, DefaultGuard) {
         Self::capture_at(TARGET, tracing::Level::INFO)
     }
 
     // Hear the lines at `level` under `target` until the guard drops.
-    pub(crate) fn capture_at(target: &'static str, level: tracing::Level) -> (Self, DefaultGuard) {
+    pub fn capture_at(target: &'static str, level: tracing::Level) -> (Self, DefaultGuard) {
         BESIDE.get_or_init(|| tracing::Dispatch::new(Beside));
         let lines = Self {
             heard: Arc::default(),
@@ -39,7 +39,7 @@ impl Lines {
     }
 
     // Every line heard with this message, as written.
-    pub(crate) fn of(&self, message: &str) -> Vec<String> {
+    pub fn of(&self, message: &str) -> Vec<String> {
         let prefix = format!("{message} ");
         self.heard
             .lock()

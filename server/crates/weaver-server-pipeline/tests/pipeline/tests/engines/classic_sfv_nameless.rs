@@ -8,9 +8,8 @@
 // hex digits. A listing found that way checks the files it names as a named
 // one does.
 
-use super::classic_sfv::listing_text;
 use super::harness::{ARTICLE, Claim, Post, Scenario, payload, run};
-use super::sfv::crc;
+use super::sfv::{crc, listing_text};
 use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
 

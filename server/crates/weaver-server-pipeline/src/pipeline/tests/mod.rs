@@ -14,13 +14,14 @@ use std::time::Duration;
 
 use crate::Database;
 #[cfg(test)]
+use crate::JobInfo;
+use crate::SchedulerHandle;
+#[cfg(test)]
 use crate::ingest::submit_nzb_bytes;
 #[cfg(test)]
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::settings::{Config, SharedConfig};
 use crate::{FileSpec, PipelineMetrics, SegmentSpec, SharedPipelineState};
-#[cfg(test)]
-use crate::{JobInfo, SchedulerHandle};
 use tempfile::TempDir;
 use tokio::sync::RwLock;
 #[cfg(test)]
@@ -60,6 +61,8 @@ mod archive_output_contract;
 mod archive_passwords;
 #[cfg(test)]
 mod archive_topology;
+#[path = "download_dispatch/bandwidth_fixture.rs"]
+pub mod bandwidth_fixture;
 #[cfg(test)]
 mod bandwidth_split;
 #[cfg(test)]
@@ -99,6 +102,8 @@ mod par2_completion;
 mod post_processing_completion;
 #[cfg(test)]
 mod post_processing_pause;
+#[path = "download_dispatch/propagation_fixture.rs"]
+pub mod propagation_fixture;
 #[cfg(test)]
 mod provider_scheduling;
 #[cfg(test)]
@@ -113,8 +118,6 @@ mod restore_history;
 mod script_events;
 #[cfg(test)]
 mod server_attribution;
-#[cfg(test)]
-mod shared_articles;
 #[cfg(test)]
 mod terminal_settlement;
 #[cfg(test)]
@@ -165,18 +168,17 @@ impl Pipeline {
     }
 }
 
-#[cfg(test)]
-struct TestHarness {
+pub struct TestHarness {
     _temp_dir: TempDir,
     _data_dir: PathBuf,
-    handle: SchedulerHandle,
-    config: SharedConfig,
-    db: Database,
+    pub handle: SchedulerHandle,
+    pub config: SharedConfig,
+    pub db: Database,
     pipeline_task: tokio::task::JoinHandle<()>,
 }
 
-#[cfg(test)]
 impl TestHarness {
+    #[cfg(test)]
     async fn new() -> Self {
         Self::new_with_nntp(
             NntpClient::new(NntpClientConfig {
@@ -190,7 +192,7 @@ impl TestHarness {
         .await
     }
 
-    async fn new_with_nntp(nntp: NntpClient, total_connections: usize) -> Self {
+    pub async fn new_with_nntp(nntp: NntpClient, total_connections: usize) -> Self {
         let temp_dir = tempfile::tempdir().unwrap();
         let data_dir = temp_dir.path().join("data");
         let intermediate_dir = temp_dir.path().join("intermediate");
@@ -294,7 +296,11 @@ impl TestHarness {
         }
     }
 
-    async fn shutdown(self) {
+    pub fn root(&self) -> &std::path::Path {
+        self._temp_dir.path()
+    }
+
+    pub async fn shutdown(self) {
         self.handle.shutdown().await.unwrap();
         self.pipeline_task.await.unwrap();
     }
@@ -318,7 +324,7 @@ pub(in crate::pipeline) fn sample_nzb_zstd() -> Vec<u8> {
 // The stored NZB a fixture spec would have been read from: the same files,
 // in the same order, with the same articles, so a job added with it reads
 // its articles back when it is first handed work.
-pub(in crate::pipeline) fn nzb_zstd_for(spec: &JobSpec) -> Vec<u8> {
+pub fn nzb_zstd_for(spec: &JobSpec) -> Vec<u8> {
     fn escape(text: &str) -> String {
         text.replace('&', "&amp;")
             .replace('<', "&lt;")
@@ -858,7 +864,6 @@ pub(in crate::pipeline) async fn hear_graph_mail(pipeline: &mut Pipeline, job_id
 // Hear the run mail until every restored recovery object of the graph job
 // heard what of its volumes arrived again, as it does before the job
 // fetches anything.
-#[cfg(test)]
 pub(in crate::pipeline) async fn hear_rewalks(pipeline: &mut Pipeline, job_id: JobId) {
     while pipeline
         .graph_jobs
@@ -906,9 +911,9 @@ fn encode_article_part(
     Bytes::from(encoded)
 }
 
-const TEST_RAR5_SIG: [u8; 8] = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00];
+pub const TEST_RAR5_SIG: [u8; 8] = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00];
 
-fn encode_test_rar_vint(mut value: u64) -> Vec<u8> {
+pub fn encode_test_rar_vint(mut value: u64) -> Vec<u8> {
     let mut result = Vec::new();
     loop {
         let mut byte = (value & 0x7F) as u8;
@@ -955,7 +960,7 @@ fn build_test_rar_header(
     result
 }
 
-fn build_test_rar_main_header(archive_flags: u64, volume_number: Option<u64>) -> Vec<u8> {
+pub fn build_test_rar_main_header(archive_flags: u64, volume_number: Option<u64>) -> Vec<u8> {
     let mut type_body = Vec::new();
     type_body.extend_from_slice(&encode_test_rar_vint(archive_flags));
     if let Some(volume_number) = volume_number {
@@ -964,12 +969,12 @@ fn build_test_rar_main_header(archive_flags: u64, volume_number: Option<u64>) ->
     build_test_rar_header(1, 0, &type_body, &[])
 }
 
-fn build_test_rar_end_header(more_volumes: bool) -> Vec<u8> {
+pub fn build_test_rar_end_header(more_volumes: bool) -> Vec<u8> {
     let end_flags: u64 = if more_volumes { 0x0001 } else { 0 };
     build_test_rar_header(5, 0, &encode_test_rar_vint(end_flags), &[])
 }
 
-fn build_test_rar_file_header(
+pub fn build_test_rar_file_header(
     filename: &str,
     common_flags_extra: u64,
     data_size: u64,
@@ -1002,7 +1007,7 @@ fn build_test_rar_blake2_extra(digest: [u8; 32]) -> Vec<u8> {
     out
 }
 
-fn build_test_rar_file_header_with_extra(
+pub fn build_test_rar_file_header_with_extra(
     filename: &str,
     common_flags_extra: u64,
     data_size: u64,
@@ -1029,14 +1034,12 @@ fn build_test_rar_file_header_with_extra(
 // `Compressed`, and the solid bit makes it `Solid`, which the classifier checks
 // first. The data area a header like this describes is not really compressed,
 // so a fixture using it is only good for what the *classification* decides.
-#[cfg(test)]
-fn test_rar_compression_info(method: u64, solid: bool) -> u64 {
+pub fn test_rar_compression_info(method: u64, solid: bool) -> u64 {
     ((method & 0x07) << 7) | u64::from(solid) << 6
 }
 
 // A RAR5 file header whose member is compressed (and optionally solid).
-#[cfg(test)]
-fn build_test_rar_compressed_file_header(
+pub fn build_test_rar_compressed_file_header(
     filename: &str,
     common_flags_extra: u64,
     data_size: u64,
@@ -1067,8 +1070,7 @@ fn build_test_rar_compressed_file_header(
 // `unix_mode` lands in the attributes field and `host_os` is Unix, which is how
 // [`crate::pipeline::extraction::apply_rar_member_filesystem_metadata`] reads
 // the mode back out.
-#[cfg(test)]
-fn build_test_rar_directory_header(name: &str, unix_mode: u32, mtime: u32) -> Vec<u8> {
+pub fn build_test_rar_directory_header(name: &str, unix_mode: u32, mtime: u32) -> Vec<u8> {
     let file_flags: u64 = 0x0001 | 0x0002;
     let mut type_body = Vec::new();
     type_body.extend_from_slice(&encode_test_rar_vint(file_flags));
@@ -1220,7 +1222,7 @@ fn build_test_rar4_end_header(more_volumes: bool) -> Vec<u8> {
 // `VOLUME_NUMBER` flag (a numbered `ENDARC` is what modern `.partNN` writers
 // emit). No volume of such a set states its number; only the filename says
 // which volume a file is.
-pub(in crate::pipeline::tests) fn single_member_rar4_old_numbering_set(
+pub fn single_member_rar4_old_numbering_set(
     base: &str,
     member_name: &str,
     payload: &[u8],
@@ -1606,8 +1608,7 @@ pub(in crate::pipeline) fn segment_id(
     }
 }
 
-#[cfg(test)]
-pub(in crate::pipeline) fn standalone_job_spec(name: &str, files: &[(String, u32)]) -> JobSpec {
+pub fn standalone_job_spec(name: &str, files: &[(String, u32)]) -> JobSpec {
     JobSpec {
         name: name.to_string(),
         password: None,
@@ -1718,7 +1719,7 @@ pub(super) fn build_test_par2_index(filename: &str, file_data: &[u8], slice_size
     build_test_par2_index_for_files(&[(filename, file_data)], slice_size)
 }
 
-pub(super) fn build_test_par2_index_for_files(files: &[(&str, &[u8])], slice_size: u64) -> Vec<u8> {
+pub fn build_test_par2_index_for_files(files: &[(&str, &[u8])], slice_size: u64) -> Vec<u8> {
     struct IndexedFile {
         id: [u8; 16],
         desc_body: Vec<u8>,
@@ -2065,8 +2066,7 @@ pub(in crate::pipeline) async fn insert_delivered_job(
     working_dir
 }
 
-#[cfg(test)]
-pub(in crate::pipeline) fn rar5_fixture_bytes(name: &str) -> Vec<u8> {
+pub fn rar5_fixture_bytes(name: &str) -> Vec<u8> {
     std::fs::read(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../weaver-server-core/tests/fixtures/rar5")

@@ -13,7 +13,7 @@ pub(crate) mod claims;
 pub(crate) mod deobfuscate;
 mod output;
 pub(crate) use output::claim_complete_destination_path;
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(in crate::pipeline) use output::member_crc32_by_path;
 #[cfg(test)]
 pub(in crate::pipeline) use output::{

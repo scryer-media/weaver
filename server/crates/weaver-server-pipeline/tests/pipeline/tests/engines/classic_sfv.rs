@@ -12,17 +12,8 @@
 
 use super::harness::{ARTICLE, Claim, Post, Scenario, assert_fetched_once, par2_set, payload, run};
 use super::rar::{delivered, posts};
-use super::sfv::crc;
+use super::sfv::{crc, listing_text};
 use crate::pipeline::tests::direct_store::single_member_store_set;
-
-// A listing as a checksum tool writes it, under any name.
-pub(super) fn listing_text(header: &str, entries: &[(&str, u32)]) -> Vec<u8> {
-    let mut text = String::from(header);
-    for (listed, crc) in entries {
-        text.push_str(&format!("{listed} {crc:08x}\n"));
-    }
-    text.into_bytes()
-}
 
 // A PAR2 set that verifies every file outranks a listing that disagrees
 // with one of them: the job completes with both files whole.

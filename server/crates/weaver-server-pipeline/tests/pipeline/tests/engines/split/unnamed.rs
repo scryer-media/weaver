@@ -90,7 +90,7 @@ fn assert_sevenz_members(outcome: &Outcome, backwards: bool) {
                 == Some(&expected),
             "backwards {backwards}: part{index}.mkv is byte-exact: {:?} {:?}",
             outcome.files.keys().collect::<Vec<_>>(),
-            outcome.graph().delivery
+            outcome.graph().delivery_debug()
         );
     }
 }
@@ -101,7 +101,7 @@ fn assert_joined(outcome: &Outcome, backwards: bool, pieces: &[Vec<u8>]) {
         Some(JobStatus::Complete),
         "backwards {backwards}: {:?} {:?}",
         outcome.failure,
-        outcome.graph().delivery
+        outcome.graph().delivery_debug()
     );
     assert!(
         kinds(outcome).contains(&"split"),
