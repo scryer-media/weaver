@@ -600,6 +600,86 @@ fn end_file_built_on(name: &str, kind: Kind) -> bool {
         .any(|(extension, kinds)| kinds.contains(&kind) && has_extension(name, extension))
 }
 
+// Sidecars: small files a person or a player reads beside a payload, by
+// the last extension of their name. Below the root, a single-stream
+// compressor whose name, the compression taken off, is a sidecar's opens
+// as a layer by that name alone (`names_a_sidecar`). The list grows as real
+// posts show new names.
+//
+//   nfo diz   release text
+//   txt   plain text a person reads
+//   srt ass ssa sub idx vtt smi sami sup usf ttml dfxp sbv mks   subtitles
+//          and captions
+//   cue m3u m3u8 pls lrc ffp   audio: cue sheets, playlists, lyrics and
+//          FLAC fingerprints
+//   gdi ccd mds sbi toc   disc images' descriptors
+//   opf xmp   a book's metadata, a photo's
+//   nzb   a usenet post
+//
+// Not here, and so kept compressed: names a program loads in compressed
+// form by that exact name (`json`, `xml`, `csv`, `sql`, `html`, `js`,
+// `css`, `svg`, `dat`, `log`, man pages), a `tar`, whose opening leads to
+// an archive that multiplies the file count, and checksum or recovery
+// listings (`sfv`, `md5`, `sha*`, `par2`), whose opening would change what
+// is verified.
+const SIDECARS: &[&str] = &[
+    "ass", "ccd", "cue", "dfxp", "diz", "ffp", "gdi", "idx", "lrc", "m3u", "m3u8", "mds", "mks",
+    "nfo", "nzb", "opf", "pls", "sami", "sbi", "sbv", "smi", "srt", "ssa", "sub", "sup", "toc",
+    "ttml", "txt", "usf", "vtt", "xmp",
+];
+
+// A single-stream compressor's extension and what it leaves behind: `.tgz`
+// held a `.tar`.
+const STREAM_EXTENSIONS: [(&str, &str); 11] = [
+    (".gz", ""),
+    (".tgz", ".tar"),
+    (".xz", ""),
+    (".txz", ".tar"),
+    (".bz2", ""),
+    (".tbz2", ".tar"),
+    (".tbz", ".tar"),
+    (".zst", ""),
+    (".tzst", ".tar"),
+    (".br", ""),
+    (".deflate", ""),
+];
+
+// A stream's volume name with its compression extension taken off, or
+// `None` when it carries none.
+fn uncompressed(volume: &str) -> Option<String> {
+    let lower = volume.to_ascii_lowercase();
+    STREAM_EXTENSIONS
+        .iter()
+        .find(|(extension, _)| lower.len() > extension.len() && lower.ends_with(extension))
+        .map(|(extension, left)| format!("{}{left}", &volume[..volume.len() - extension.len()]))
+}
+
+// The name a stream's one member is announced under: the volume's name with
+// its compression extension taken off, or the name as it is when it carries
+// no extension, which the namespace numbers if it collides.
+pub fn stream_member_name(volume: &str) -> String {
+    uncompressed(volume).unwrap_or_else(|| volume.to_owned())
+}
+
+// Whether a member that founds a single-stream compressor is a sidecar by
+// its own name: its compression extension taken off, what is left ends in
+// a sidecar's extension (`SIDECARS`), with a stem before it in the file's
+// own name. A bare `.xz`, a name with no compression extension, or one
+// left with no extension of its own, names no sidecar.
+pub fn names_a_sidecar(name: &str) -> bool {
+    let Some(inner) = uncompressed(trimmed(name)) else {
+        return false;
+    };
+    let file = inner.rsplit(['/', '\\']).next().unwrap_or_default();
+    file.rsplit_once('.')
+        .filter(|(stem, _)| !stem.is_empty())
+        .is_some_and(|(_, extension)| {
+            SIDECARS
+                .iter()
+                .any(|sidecar| sidecar.eq_ignore_ascii_case(extension))
+        })
+}
+
 // Whether a name is a container's an object opens: an archive, a tar, or a
 // compressed stream, by the extensions the sniffer knows them by. Recovery
 // data and SFVs are not containers.
@@ -804,6 +884,7 @@ impl Listing {
 // single-stream compressor's name (`.gz`, `.bz2`, `.xz`, `.zst`, `.br`,
 // `.deflate`) names a compressed file, not an archive, and so does no name
 // of an end file (`END_FILES`), whose member is a leaf before this is asked.
+// A compressed sidecar is a layer by its name too (`names_a_sidecar`).
 pub fn names_an_archive(name: &str, kind: Kind) -> bool {
     let name = trimmed(name);
     let lower = name.to_ascii_lowercase();
@@ -1458,6 +1539,66 @@ mod tests {
         ] {
             assert!(!names_an_archive(name, kind), "{name}");
         }
+    }
+
+    // A compressed file is a sidecar by its name with the compression off:
+    // text a person reads beside a payload, subtitles, cue sheets and
+    // playlists, disc descriptors, a book's or a photo's metadata, an NZB.
+    // A name a program loads compressed, a tar, a checksum listing, or a
+    // name with no stem before its extension is none.
+    #[test]
+    fn a_compressed_name_says_a_sidecar_only_for_a_sidecar_extension() {
+        for name in [
+            "a.srt.xz",
+            "Subs/movie.en.ass.gz",
+            "release.nfo.zst",
+            "disc.cue.bz2",
+            "x.nzb.gz",
+            "MOVIE.SRT.XZ",
+            "README.txt.gz",
+            "file_id.diz.br",
+            "Subs\\movie.vtt.deflate",
+            "album.m3u8.gz",
+            "game.gdi.xz",
+            "book.opf.gz",
+            "photo.xmp.zst",
+            "a.srt.xz\"",
+        ] {
+            assert!(names_a_sidecar(name), "{name}");
+        }
+        for name in [
+            "foo.1.gz",
+            "man/foo.1.gz",
+            "index.json.gz",
+            "data/index.json.gz",
+            "app.js.gz",
+            "logo.svg.gz",
+            "lib.tar.xz",
+            "lib.tgz",
+            "debug.log.gz",
+            "set.sfv.gz",
+            "set.md5.gz",
+            "set.par2.gz",
+            "x.xz",
+            ".xz",
+            "srt.xz",
+            "Subs/.srt.gz",
+            "a.srt",
+            "a.srt.rar",
+        ] {
+            assert!(!names_a_sidecar(name), "{name}");
+        }
+    }
+
+    // The sidecar list is lower case and sorted, each name once.
+    #[test]
+    fn the_sidecar_list_is_sorted_lower_case_and_once() {
+        assert!(SIDECARS.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(
+            SIDECARS
+                .iter()
+                .all(|name| !name.is_empty() && name.bytes().all(|byte| !byte.is_ascii_uppercase()))
+        );
     }
 
     // Each member of a namespace below the root is told a piece, furniture
