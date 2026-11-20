@@ -1384,8 +1384,7 @@ pub(in crate::pipeline::tests) fn rar5_misstated_set(
 // volume. With one, as RAR 3.4 on write it, the number after the CRC
 // (0x0008): flags 0x400f, 0x400e on the last, every volume stating that
 // same number.
-#[cfg(test)]
-pub(in crate::pipeline::tests) fn single_member_rar4_old_numbering_set_ending(
+pub fn single_member_rar4_old_numbering_set_ending(
     base: &str,
     member_name: &str,
     payload: &[u8],

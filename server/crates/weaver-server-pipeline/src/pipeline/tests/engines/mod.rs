@@ -90,8 +90,6 @@ mod classic_sfv_nameless;
 #[cfg(test)]
 mod classic_streams;
 #[cfg(test)]
-mod classic_uu;
-#[cfg(test)]
 mod dead_posts;
 #[cfg(test)]
 mod deep;
@@ -112,11 +110,8 @@ mod end_files;
 mod extractor_claims;
 #[cfg(test)]
 mod first_article_sample;
-#[cfg(test)]
-mod frontless_rar;
-#[cfg(test)]
-mod frontless_records;
 pub mod harness;
+pub mod rar_fixtures;
 mod state;
 
 #[cfg(test)]
@@ -164,11 +159,7 @@ mod plain_par2;
 #[cfg(test)]
 mod post_health_seats;
 #[cfg(test)]
-mod prefix_sets;
-#[cfg(test)]
 mod rar;
-#[cfg(test)]
-mod rar4_end_records;
 #[cfg(test)]
 mod rar_engine;
 #[cfg(test)]
@@ -199,8 +190,6 @@ mod remaining_par2;
 mod remaining_stalls;
 #[cfg(test)]
 mod renamed_engine;
-#[cfg(test)]
-mod renamed_held_volumes;
 #[cfg(test)]
 mod renamed_sets;
 #[cfg(test)]
@@ -249,9 +238,5 @@ mod unlisted_par2;
 #[cfg(test)]
 mod unnamed_recovery;
 #[cfg(test)]
-mod volume_order;
-#[cfg(test)]
 mod waiting_sets;
-#[cfg(test)]
-mod withheld_par2;
 pub mod zip;

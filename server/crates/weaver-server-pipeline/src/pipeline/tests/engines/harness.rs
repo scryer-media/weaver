@@ -110,13 +110,7 @@ pub fn par2_volumes(base: &str, files: &[(&str, &[u8])], blocks: u32, volumes: u
 // rest, so 53 blocks are `vol00+01`, `vol01+02`, `vol03+04`, `vol07+08`,
 // `vol15+16` and `vol31+22`. The index first, the volumes in block order,
 // sliced at `slice` bytes.
-#[cfg(test)]
-pub(in crate::pipeline::tests) fn par2_doubling(
-    base: &str,
-    files: &[(&str, &[u8])],
-    slice: u64,
-    blocks: u32,
-) -> Vec<Post> {
+pub fn par2_doubling(base: &str, files: &[(&str, &[u8])], slice: u64, blocks: u32) -> Vec<Post> {
     par2_created(base, files, slice, blocks, None)
 }
 
@@ -891,8 +885,7 @@ impl Scenario {
 
     // The queue hands out `articles` at a time, served in the order handed
     // out.
-    #[cfg(test)]
-    pub(in crate::pipeline::tests) fn batched(mut self, articles: usize) -> Self {
+    pub fn batched(mut self, articles: usize) -> Self {
         self.batch = articles;
         self
     }
@@ -908,8 +901,7 @@ impl Scenario {
 
     // Whatever the queue holds of `posts` arrives at once, last first, from
     // the first time it hands one of them out.
-    #[cfg(test)]
-    pub(in crate::pipeline::tests) fn reversed(mut self, posts: &[u32]) -> Self {
+    pub fn reversed(mut self, posts: &[u32]) -> Self {
         self.reversed = posts.to_vec();
         self
     }
@@ -922,8 +914,7 @@ impl Scenario {
     }
 
     // Every article posted uuencoded rather than yEnc.
-    #[cfg(test)]
-    pub(in crate::pipeline::tests) fn uuencoded(mut self) -> Self {
+    pub fn uuencoded(mut self) -> Self {
         self.uuencoded = true;
         self
     }
@@ -1175,6 +1166,10 @@ pub struct GraphView {
     pub names: BTreeSet<String>,
 }
 impl GraphView {
+    pub fn has_withheld_files(&self) -> bool {
+        !self.delivery.withheld.is_empty()
+    }
+
     pub fn whole_files(&self) -> &[String] {
         &self.delivery.whole
     }
@@ -1284,7 +1279,7 @@ pub fn assert_fetched_once(outcome: &Outcome) {
 #[derive(Debug)]
 pub struct Stall {
     pub status: Option<JobStatus>,
-    pub(in crate::pipeline::tests) state: String,
+    pub state: String,
 }
 
 pub async fn run(scenario: &Scenario) -> Outcome {

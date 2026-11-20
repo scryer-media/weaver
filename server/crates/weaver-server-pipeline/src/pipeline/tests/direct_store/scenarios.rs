@@ -325,7 +325,7 @@ const TEST_HP_KDF_LG2: u8 = 4;
 
 // What a fixture's type-4 record claims about its password check.
 #[derive(Clone, Copy)]
-pub(in crate::pipeline::tests) enum HeaderCheck {
+pub enum HeaderCheck {
     // A check the parser will validate and hand out: the flag set, eight check
     // bytes from this password's KDF, and their real SHA-256 tag. What WinRAR
     // writes by default, and the only shape `-hp` admission accepts.
@@ -398,7 +398,7 @@ fn seal_test_rar_header(key: &[u8; 32], iv: &[u8; 16], header: &[u8]) -> Vec<u8>
 //   admission is decided on. The member-level check is always this password's,
 //   because a member that refuted it would be testing the admission gate
 //   rather than this one.
-pub(in crate::pipeline::tests) fn header_encrypted_store_set(
+pub fn header_encrypted_store_set(
     member_name: &str,
     payload: &[u8],
     volume_count: usize,

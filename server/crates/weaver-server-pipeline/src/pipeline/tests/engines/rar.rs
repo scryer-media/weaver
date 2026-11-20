@@ -38,33 +38,12 @@ const SECRET: &str = "quill-ember-secret";
 // A second job beside the harness's own.
 const OTHER: JobId = JobId(93_002);
 
-pub(super) fn delivered(name: &str) -> String {
-    format!("lantern beacon/{name}")
-}
+pub(super) use super::rar_fixtures::{delivered, posts, with_par2};
 
 // A member that ends mid-article, over enough articles that every volume
 // of a four-volume set holds some of it.
 fn body() -> Vec<u8> {
     payload(7 * ARTICLE + 13, 51)
-}
-
-pub(super) fn posts(volumes: Vec<(String, Vec<u8>)>) -> Vec<Post> {
-    volumes
-        .into_iter()
-        .map(|(name, bytes)| Post::plain(&name, bytes))
-        .collect()
-}
-
-// The volumes, then an index and a volume of two recovery blocks over them.
-pub(super) fn with_par2(volumes: Vec<(String, Vec<u8>)>) -> Vec<Post> {
-    let files: Vec<(&str, &[u8])> = volumes
-        .iter()
-        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
-        .collect();
-    let set = par2_set("silver.horizon", &files, 2);
-    let mut out = posts(volumes.clone());
-    out.extend(set);
-    out
 }
 
 fn xz(bytes: &[u8]) -> Vec<u8> {

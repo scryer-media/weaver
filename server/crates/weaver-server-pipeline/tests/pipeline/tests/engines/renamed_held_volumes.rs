@@ -84,7 +84,7 @@ fn assert_delivers(graph: &Outcome, body: &[u8], case: &str) {
         graph.status,
         graph.failure,
         kinds(graph),
-        graph.graph().delivery,
+        graph.graph(),
     );
     assert_eq!(
         graph.files.get(&delivered(FIRST)).map(Vec::as_slice),
@@ -93,9 +93,9 @@ fn assert_delivers(graph: &Outcome, body: &[u8], case: &str) {
         graph.files.keys().collect::<Vec<_>>()
     );
     assert!(
-        graph.graph().delivery.withheld.is_empty(),
+        !graph.graph().has_withheld_files(),
         "{case}: {:?}",
-        graph.graph().delivery
+        graph.graph()
     );
 }
 

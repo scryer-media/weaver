@@ -26,7 +26,7 @@ fn yenc_declared_bytes(decoded_len: u32) -> u32 {
 // Non-final parts carry the packed CRC32 of *their* bytes (the RAR5 spec's
 // rule for split files); the final part carries the whole-member CRC32. That
 // is exactly what the two integrity layers read.
-pub(in crate::pipeline) fn single_member_store_set(
+pub fn single_member_store_set(
     member_name: &str,
     payload: &[u8],
     volume_count: usize,
@@ -372,9 +372,7 @@ fn append_par2_index(spec: &mut JobSpec, par2_bytes: &[u8]) -> u32 {
 // The same volume bytes under hex names that classify to nothing — the shape
 // of a fully obfuscated posting. The real names survive only inside the PAR2
 // descriptions the caller builds from the un-obfuscated list.
-pub(in crate::pipeline::tests) fn obfuscate_volumes(
-    volumes: &[(String, Vec<u8>)],
-) -> Vec<(String, Vec<u8>)> {
+pub fn obfuscate_volumes(volumes: &[(String, Vec<u8>)]) -> Vec<(String, Vec<u8>)> {
     volumes
         .iter()
         .enumerate()
@@ -392,7 +390,7 @@ pub(in crate::pipeline::tests) fn obfuscate_volumes(
 // variant is kept for the paths that must tolerate it; a renamed
 // conventional set needs the numbers, because every unnumbered volume's
 // parsed facts claim position zero and the fact-driven topology collides.
-pub(in crate::pipeline::tests) fn single_member_rar4_store_set_numbered(
+pub fn single_member_rar4_store_set_numbered(
     member_name: &str,
     payload: &[u8],
     volume_count: usize,
@@ -595,7 +593,7 @@ fn blake2_store_set(
 // RAR4 states the whole-member CRC32 in the *last* part's header and each
 // earlier part's own packed CRC32 in its own — the same two integrity layers,
 // in a completely different container.
-pub(in crate::pipeline::tests) fn single_member_rar4_store_set(
+pub fn single_member_rar4_store_set(
     member_name: &str,
     payload: &[u8],
     volume_count: usize,
@@ -722,8 +720,7 @@ pub(in crate::pipeline::tests) fn multi_member_store_set(
 
 // A store set whose volumes each carry a RAR5 recovery record of `parity`
 // units over every byte before its header, as `rar a -rr` writes one.
-#[cfg(test)]
-pub(in crate::pipeline::tests) fn protected_store_set(
+pub fn protected_store_set(
     member_name: &str,
     payload: &[u8],
     volume_count: usize,
@@ -756,7 +753,6 @@ pub(in crate::pipeline::tests) fn protected_store_set_led_by(
 // A store set whose volumes each end in an `RR` service header, the record
 // `record` makes of the bytes before it and the volume's index, and the end
 // header.
-#[cfg(test)]
 fn store_set_with_records(
     member_name: &str,
     payload: &[u8],
@@ -768,7 +764,6 @@ fn store_set_with_records(
 
 // [`store_set_with_records`], `lead` stored whole in the first volume ahead
 // of the split member when there is one.
-#[cfg(test)]
 fn led_store_set_with_records(
     lead: Option<(&str, &[u8])>,
     member_name: &str,
