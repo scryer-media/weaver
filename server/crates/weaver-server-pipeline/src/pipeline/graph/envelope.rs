@@ -23,7 +23,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 
 use weaver_graph::{ByteRange, Coverage, Marks, NodeId, Placement, Provenance, VolumeIndex};
 
-use super::leaf::{Leaf, LeafError};
+use super::leaf::{FileId, Leaf, LeafError};
 
 #[derive(Debug)]
 pub struct Envelopes {
@@ -230,6 +230,15 @@ pub struct Kept {
     pub length_read: Option<u64>,
 }
 
+// Bytes read out of the file `file`, the first of them at `offset` of the
+// volume, going down again: where they land at that same offset of an
+// envelope whose file is that very file, they are already there.
+#[derive(Clone, Copy, Debug)]
+pub struct InPlace {
+    pub file: FileId,
+    pub offset: u64,
+}
+
 // The file an envelope is kept in: its name, how many bytes it holds, and
 // whether it is on disk.
 #[derive(Debug)]
@@ -337,13 +346,16 @@ impl Envelopes {
 
     // Keep the envelope pieces among `placements`, which the object at
     // `node` gave for the volume range that `bytes` is: pieces in volume
-    // order, so each one's bytes are the next run of `bytes`.
-    pub(crate) fn capture(
+    // order, so each one's bytes are the next run of `bytes`. Bytes
+    // `in_place` says were read from a file, kept at their own volume
+    // offset in an envelope whose file is that file, are already there.
+    pub fn capture(
         &mut self,
         node: NodeId,
         placements: &[Placement],
         bytes: &[u8],
         provenance: Provenance,
+        in_place: Option<InPlace>,
     ) -> Result<(), LeafError> {
         let mut cursor = 0usize;
         for placement in placements {
@@ -352,12 +364,16 @@ impl Envelopes {
                 return Ok(());
             };
             if let Placement::Envelope { envelope, range } = placement {
-                self.keep(
+                let file = in_place
+                    .filter(|read| read.offset.checked_add(cursor as u64) == Some(range.start))
+                    .map(|read| read.file);
+                self.keep_from(
                     node,
                     *envelope,
                     range.start,
                     &bytes[cursor..end],
                     provenance,
+                    file,
                 )?;
             }
             cursor = end;
@@ -378,6 +394,23 @@ impl Envelopes {
         bytes: &[u8],
         provenance: Provenance,
     ) -> Result<(), LeafError> {
+        self.keep_from(node, envelope, offset, bytes, provenance, None)
+    }
+
+    // As `keep`, for bytes read at `offset` of the file `from`, when they
+    // were: in an envelope whose file is that very file now, asked at this
+    // write, they are already there, so they are kept as if written and
+    // nothing is written. A second name never made, an empty file made in
+    // its place, or a file replaced since is another file, and is written.
+    fn keep_from(
+        &mut self,
+        node: NodeId,
+        envelope: u32,
+        offset: u64,
+        bytes: &[u8],
+        provenance: Provenance,
+        from: Option<FileId>,
+    ) -> Result<(), LeafError> {
         if bytes.is_empty() {
             return Ok(());
         }
@@ -387,7 +420,11 @@ impl Envelopes {
         shelf.update(|state| {
             let kept = shelf.kept(state, envelope)?;
             let mends = provenance.is_verified() && kept.coverage.damaged(range);
-            kept.leaf.write(offset, bytes, None)?;
+            if from.is_some() && !writes_over() && kept.leaf.file_id() == from {
+                kept.leaf.wrote_in_place(offset, range.len());
+            } else {
+                kept.leaf.write(offset, bytes, None)?;
+            }
             kept.coverage.write(range, provenance);
             if (provenance == Provenance::Repaired || mends) && range.start < kept.reached {
                 state.generation += 1;
@@ -407,7 +444,7 @@ impl Envelopes {
 
     // Whether every byte of `range` of an envelope was kept, from the
     // record alone.
-    pub(crate) fn keeps(&self, node: NodeId, envelope: u32, range: ByteRange) -> bool {
+    pub fn keeps(&self, node: NodeId, envelope: u32, range: ByteRange) -> bool {
         match self.shelves.get(&node) {
             Some(shelf) => shelf.keeps(envelope, range),
             None => range.is_empty(),
@@ -420,7 +457,7 @@ impl Envelopes {
     }
 
     // The node's shelf, if anything was ever kept on it.
-    pub(crate) fn shelf_of(&self, node: NodeId) -> Option<Arc<Shelf>> {
+    pub fn shelf_of(&self, node: NodeId) -> Option<Arc<Shelf>> {
         self.shelves.get(&node).map(Arc::clone)
     }
 
@@ -440,13 +477,7 @@ impl Envelopes {
     // their own offsets, or none when `on_disk` says it was never made:
     // nothing is cleared, and what is kept in it is written over the same
     // bytes. False when the envelope started already.
-    pub(crate) fn start_in(
-        &mut self,
-        node: NodeId,
-        envelope: u32,
-        name: &str,
-        on_disk: bool,
-    ) -> bool {
+    pub fn start_in(&mut self, node: NodeId, envelope: u32, name: &str, on_disk: bool) -> bool {
         self.start_after(node, envelope, name, on_disk, 0)
     }
 
@@ -576,6 +607,25 @@ impl Drop for Envelopes {
     fn drop(&mut self) {
         self.release_handles();
     }
+}
+
+// Whether this thread writes bytes over themselves, as it did before an
+// envelope knew they were there, for a test to compare the two.
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+pub mod in_place {
+    thread_local! {
+        pub static WRITES_OVER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+}
+
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+fn writes_over() -> bool {
+    in_place::WRITES_OVER.get()
+}
+
+#[cfg(not(any(test, feature = "pipeline-test-fixtures")))]
+fn writes_over() -> bool {
+    false
 }
 
 // The shelves this thread locked, by node, for a test to read back.

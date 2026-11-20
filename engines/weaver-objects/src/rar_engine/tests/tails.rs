@@ -390,6 +390,45 @@ fn a_place_is_open_only_while_its_tail_may_move_the_volume() {
     assert!(open(&engine, 4).is_empty(), "no number stated");
 }
 
+// A volume waiting for its tail that a recovery set names, as PAR2 names a
+// volume posted under a name that numbers nothing: the name states its
+// place, so the place is settled at once and its tail is bid for no more,
+// while the volumes still waiting keep their bids.
+#[test]
+fn a_volume_a_recovery_names_waits_for_its_tail_no_more() {
+    let set = set(Version::Rar4, 4, true);
+    let mut engine = handed(&set, &[0, 1, 2, 3]);
+    assert_eq!(open(&engine, 4), vec![1, 2, 3]);
+    let mut out = Vec::new();
+    engine.renamed(VolumeIndex(1), "long.part2.rar", &mut out);
+    assert!(out.is_empty(), "the name holds it where it is: {out:?}");
+    assert_eq!(open(&engine, 4), vec![2, 3], "the name states its place");
+    let bid: Vec<u32> = wanted(&engine).iter().map(|seek| seek.volume.0).collect();
+    assert_eq!(bid, vec![2, 3], "no tail is bid for the named volume");
+}
+
+// A named volume's tail that then comes damaged states nothing and changes
+// nothing: the place stays settled, nothing goes back, and nothing more is
+// bid for it.
+#[test]
+fn a_named_volume_stays_placed_when_its_tail_comes_damaged() {
+    let set = set(Version::Rar4, 4, true);
+    let mut engine = handed(&set, &[0, 1, 2, 3]);
+    engine.renamed(VolumeIndex(1), "long.part2.rar", &mut Vec::new());
+    let out = deliver(
+        &mut engine,
+        1,
+        &set[1],
+        last(&set[1], 64),
+        Provenance::Damaged,
+        &BTreeMap::new(),
+    );
+    assert!(out.is_empty(), "{out:?}");
+    assert_eq!(open(&engine, 4), vec![2, 3]);
+    let bid: Vec<u32> = wanted(&engine).iter().map(|seek| seek.volume.0).collect();
+    assert_eq!(bid, vec![2, 3]);
+}
+
 // A RAR5 volume states its number in its main header, and a posted name
 // that numbers a volume states its place: neither place is ever open.
 #[test]

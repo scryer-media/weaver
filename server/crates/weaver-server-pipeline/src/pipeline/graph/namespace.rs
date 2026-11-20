@@ -38,7 +38,7 @@ use weaver_graph::{
 };
 
 use super::checkpoint::why_name;
-use super::envelope::{Envelopes, Shelf, Shelved};
+use super::envelope::{Envelopes, InPlace, Shelf, Shelved};
 use super::leaf::{Leaf, LeafError};
 use super::limits::{Caps, Device, Output};
 use crate::pipeline::extraction::ExtractionFailure;
@@ -325,6 +325,9 @@ pub struct NamespaceWriter {
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub diagnostics: Vec<weaver_graph::recovery::RepairDiagnostic>,
     placements: Vec<Placement>,
+    // The run of a member's file going down to its object again, while it
+    // does: the member, where the run lies, and the file it was read from.
+    from_file: Option<FromFile>,
     // Each held volume's object, volume and placement number when a pass
     // last asked where its holds go: while the object says the same number,
     // it places them as it did then, and nothing of them goes down.
@@ -376,6 +379,16 @@ pub(super) struct HeldWant {
     pub(super) sizes: (Option<u64>, Option<u64>),
     pub(super) at: u64,
     pub(super) absent: BTreeSet<MemberId>,
+}
+
+// Bytes of `member` of `node` at `range`, read just now from the file
+// `file`.
+#[derive(Clone, Copy, Debug)]
+struct FromFile {
+    node: NodeId,
+    member: MemberId,
+    range: ByteRange,
+    file: super::leaf::FileId,
 }
 
 // A cipher's tail read back before the ranges that fed its keys are
@@ -443,6 +456,7 @@ impl NamespaceWriter {
             #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             diagnostics: Vec::new(),
             placements: Vec::new(),
+            from_file: None,
             asked: BTreeMap::new(),
             metrics: None,
             disk: None,
@@ -1526,9 +1540,26 @@ impl NamespaceWriter {
                 range: ByteRange::new(arrival.offset + placed, arrival.range().end),
             });
         }
-        let kept = self
-            .envelopes
-            .capture(child, &placements, &arrival.bytes, arrival.provenance);
+        // Bytes just read from the member's file are what that file holds
+        // where they were read.
+        let in_place = self
+            .from_file
+            .filter(|read| {
+                read.node == arrival.node
+                    && read.member == arrival.member
+                    && read.range.covers(arrival.range())
+            })
+            .map(|read| InPlace {
+                file: read.file,
+                offset: arrival.offset,
+            });
+        let kept = self.envelopes.capture(
+            child,
+            &placements,
+            &arrival.bytes,
+            arrival.provenance,
+            in_place,
+        );
         // What arrives is the member's bytes now, whatever was held of them
         // before: a repair rewrites what was held, and the held copy never
         // goes down after it.

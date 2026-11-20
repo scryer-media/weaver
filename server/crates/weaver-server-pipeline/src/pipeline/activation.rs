@@ -824,7 +824,10 @@ impl Pipeline {
         }
         self.charge_job_article_memory(job_id);
         match graph {
-            Some(graph) => self.install_graph_job(job_id, graph, held_parts),
+            Some(graph) => {
+                self.install_graph_job(job_id, graph, held_parts);
+                self.post_restored(job_id);
+            }
             None => self.admit_graph_job(job_id, volumes),
         }
         self.abandon_dead_files(job_id);

@@ -2361,3 +2361,324 @@ async fn measure_the_read_of_20000_jobs() {
     .expect("the old read runs")
     .await;
 }
+
+// A job that moves while the table is read, or that no read reaches, and
+// what the collected log says of it: its id, with its name and a member name
+// on the same line of running text.
+struct MovedJob {
+    id: u64,
+    name: &'static str,
+    member: &'static str,
+}
+
+impl MovedJob {
+    fn info(&self, status: weaver_server_core::JobStatus) -> weaver_server_core::JobInfo {
+        let mut job = queued_info(self.id, status);
+        job.name = self.name.to_string();
+        job
+    }
+
+    fn log(&self) -> Vec<Component> {
+        vec![Component::bytes(
+            "weaver.log",
+            format!(
+                "INFO job_id={} imported {} and extracted {}\n\
+                 INFO pipeline turn took 12 ms\n",
+                self.id, self.name, self.member
+            )
+            .into_bytes(),
+        )]
+    }
+
+    // Asserts that the built package names the job by neither its name nor
+    // its member's, that the log says lines were left out, and that the
+    // line naming nothing ships. Returns the manifest.
+    async fn assert_named_nowhere(&self, names: stored_read::TableNames) -> archive::Manifest {
+        let (members, manifest) = package_of(self.log(), names).await;
+        let text = package_text(&members);
+        for real in [self.name, self.member] {
+            assert!(!text.contains(real), "{real} left the host:\n{text}");
+        }
+        let log = member_text(&members, "weaver.log");
+        assert!(log.contains(sanitize::GUARDED_LINE), "{log}");
+        assert!(log.contains("INFO pipeline turn took 12 ms\n"), "{log}");
+        let entry = manifest
+            .files
+            .iter()
+            .find(|file| file.name == "weaver.log")
+            .expect("the log ships");
+        assert!(entry.partial.is_some(), "{entry:?}");
+        manifest
+    }
+}
+
+// The table read over `db` with `between` run once on the read's own thread,
+// after the recent history ids are taken and before the first page of active
+// names: `queue_at_start` is the queue memory holds when the read begins,
+// `queue_at_end` and `history_at_end` what it holds once the logs are in.
+async fn read_with_a_move(
+    db: &Database,
+    between: impl FnOnce() + Send + 'static,
+    queue_at_start: Vec<weaver_server_core::JobInfo>,
+    queue_at_end: Vec<weaver_server_core::JobInfo>,
+    history_at_end: Vec<weaver_server_core::JobInfo>,
+) -> stored_read::TableNames {
+    use weaver_server_core::jobs::diagnostic_names::JobNameRecord;
+
+    let records = |jobs: Vec<weaver_server_core::JobInfo>| -> Vec<(u64, JobNameRecord)> {
+        jobs.iter()
+            .map(|job| (job.job_id.0, JobNameRecord::of_info(job)))
+            .collect()
+    };
+    let at_start = records(queue_at_start);
+    let between = std::sync::Mutex::new(Some(between));
+    let read = stored_read::NameRead::with_cut(move |step, ran| {
+        if step == stored_read::STEP_ACTIVE_NAMES
+            && ran == 0
+            && let Some(between) = between.lock().expect("lock").take()
+        {
+            between();
+        }
+        None
+    })
+    .with_queue(move || at_start.clone());
+    let state = run_read(db, read).await;
+    assert!(
+        state
+            .steps
+            .iter()
+            .all(|step| step.state == stored_read::STATE_COMPLETE),
+        "{:#?}",
+        state.steps
+    );
+    let memory = stored_read::MemoryNames {
+        queue: records(queue_at_end),
+        history: records(history_at_end),
+        ..stored_read::MemoryNames::default()
+    };
+    stored_read::TableNames::from_read(state, memory)
+}
+
+// An active job seeded with a stored NZB, as `job` names it.
+fn seed_moved_job(db: &Database, job: &MovedJob) {
+    db.create_active_job(&seeded_job(
+        job.id,
+        &format!("/srv/olaf-nzbs/{}.nzb", job.name),
+        seeded_nzb(job.name, job.member),
+        &format!("/srv/olaf-complete/{}", job.name),
+        None,
+        Vec::new(),
+    ))
+    .expect("active job");
+}
+
+// An empty instance whose job ids are handed out from the start.
+fn empty_instance() -> Database {
+    use weaver_server_core::settings::persistence::SettingsPersistenceQueries;
+
+    let db = Database::open_in_memory().expect("database");
+    db.initialize_next_job_id_counter().expect("job ids");
+    db
+}
+
+// A job id handed out by `db`, as the add path reserves one.
+fn reserved_job_id(db: &Database) -> u64 {
+    use weaver_server_core::settings::persistence::SettingsPersistenceQueries;
+
+    db.reserve_next_job_id().expect("job id").0
+}
+
+// A job active when the read begins finishes after the recent history ids
+// are taken and before its page of active names: the read names it in
+// neither, and memory holds it among the finished jobs.
+#[tokio::test]
+async fn a_job_that_finishes_during_the_read_is_named_nowhere() {
+    use weaver_server_core::JobStatus;
+
+    let db = empty_instance();
+    let job = MovedJob {
+        id: 31,
+        name: "Olaf.Finished.Show.S01E01",
+        member: "Olaf.Finished.Member.mkv",
+    };
+    seed_moved_job(&db, &job);
+    let names = {
+        let mover = db.clone();
+        let (id, name) = (job.id, job.name);
+        read_with_a_move(
+            &db,
+            move || archive_seeded(&mover, id, name, None),
+            vec![job.info(JobStatus::Downloading)],
+            Vec::new(),
+            vec![job.info(JobStatus::Complete)],
+        )
+        .await
+    };
+    let manifest = job.assert_named_nowhere(names).await;
+    assert!(!manifest.sanitized.table.complete);
+}
+
+// A job active when the read begins is cancelled after the recent history
+// ids are taken and before its page of active names, so it left the queue
+// during the read: no read and no list in memory holds it any more.
+#[tokio::test]
+async fn a_job_that_left_the_queue_during_the_read_is_named_nowhere() {
+    use weaver_server_core::JobStatus;
+
+    let db = empty_instance();
+    let job = MovedJob {
+        id: 32,
+        name: "Olaf.Cancelled.Show.S01E02",
+        member: "Olaf.Cancelled.Member.mkv",
+    };
+    seed_moved_job(&db, &job);
+    let names = {
+        let mover = db.clone();
+        let id = job.id;
+        read_with_a_move(
+            &db,
+            move || {
+                mover
+                    .delete_active_job(weaver_server_core::jobs::JobId(id))
+                    .expect("cancel");
+            },
+            vec![job.info(JobStatus::Downloading)],
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+    };
+    let manifest = job.assert_named_nowhere(names).await;
+    assert!(!manifest.sanitized.table.complete);
+}
+
+// A job added and removed again while the package is collected: memory never
+// held it when the read began or once the logs were in, and the read never
+// saw it. The read itself is whole.
+#[tokio::test]
+async fn a_job_added_and_removed_inside_the_window_is_named_nowhere() {
+    let db = empty_instance();
+    let added = Arc::new(std::sync::Mutex::new(None));
+    let names = {
+        let mover = db.clone();
+        let added = added.clone();
+        read_with_a_move(
+            &db,
+            move || {
+                *added.lock().expect("lock") = Some(reserved_job_id(&mover));
+            },
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+    };
+    assert!(names.manifest.complete, "{:#?}", names.manifest);
+    let id = added.lock().expect("lock").expect("the job was added");
+    let job = MovedJob {
+        id,
+        name: "Olaf.Brief.Show.S02E02",
+        member: "Olaf.Brief.Member.mkv",
+    };
+    job.assert_named_nowhere(names).await;
+}
+
+// A job cancelled before the package was asked for: it holds no row and no
+// place in memory, but the logs still hold its lines. The read is whole.
+#[tokio::test]
+async fn a_job_cancelled_before_the_package_is_named_nowhere() {
+    let db = empty_instance();
+    let id = reserved_job_id(&db);
+    let job = MovedJob {
+        id,
+        name: "Olaf.Gone.Show.S03E03",
+        member: "Olaf.Gone.Member.mkv",
+    };
+    seed_moved_job(&db, &job);
+    db.delete_active_job(weaver_server_core::jobs::JobId(id))
+        .expect("delete");
+    let names = stored_names(&db).await;
+    assert!(names.manifest.complete, "{:#?}", names.manifest);
+    assert!(names.guard.is_none());
+    job.assert_named_nowhere(names).await;
+}
+
+// A finished job older than the recent history the read takes: its row is
+// there, but the read only counts it. The read is whole.
+#[tokio::test]
+async fn a_finished_job_older_than_the_recent_history_is_named_nowhere() {
+    let db = seeded_instance(
+        0,
+        u64::try_from(weaver_server_core::jobs::diagnostic_names::DIAGNOSTIC_RECENT_HISTORY)
+            .expect("count")
+            + 1,
+        1,
+    );
+    let names = stored_names(&db).await;
+    assert!(names.manifest.complete, "{:#?}", names.manifest);
+    assert!(names.guard.is_none());
+    // The oldest seeded job is job 1, one past the recent ones.
+    assert!(!names.stored.jobs.contains_key(&1));
+    let job = MovedJob {
+        id: 1,
+        name: "Seed.History.1",
+        member: "Seed.Posted.1.mkv",
+    };
+    job.assert_named_nowhere(names).await;
+}
+
+// A job whose id was handed out before the read began, that joined the
+// queue only after the read took the queue's names, and was cancelled
+// before the logs were in: it is in no list memory or the database holds.
+// The read is whole.
+#[tokio::test]
+async fn a_job_queued_after_the_snapshot_is_named_nowhere() {
+    let db = empty_instance();
+    let id = reserved_job_id(&db);
+    let names = read_with_a_move(&db, || {}, Vec::new(), Vec::new(), Vec::new()).await;
+    assert!(names.manifest.complete, "{:#?}", names.manifest);
+    let job = MovedJob {
+        id,
+        name: "Olaf.Raced.Show.S04E04",
+        member: "Olaf.Raced.Member.mkv",
+    };
+    job.assert_named_nowhere(names).await;
+}
+
+// On a whole read, a line that names no job ships, dotted words and all: a
+// panic message, a configuration file's name and a bare host name are
+// Weaver's own text, and only the job id rule leaves a line out.
+#[tokio::test]
+async fn a_whole_read_keeps_panic_config_and_host_lines() {
+    let db = empty_instance();
+    let names = stored_names(&db).await;
+    assert!(names.manifest.complete, "{:#?}", names.manifest);
+    assert!(names.guard.is_none());
+    let lines = [
+        "ERROR panic.message=\"called `Option::unwrap()` on a `None` value\" \
+         panic.location=engines/weaver-graph/src/tree.rs:4852:17\n",
+        "WARN could not read config.toml: missing field `servers`\n",
+        "INFO update check reached tuf-repo-cdn.sigstore.dev\n",
+    ];
+    let (members, manifest) = package_of(
+        vec![Component::bytes("weaver.log", lines.concat().into_bytes())],
+        names,
+    )
+    .await;
+    let log = member_text(&members, "weaver.log");
+    assert!(!log.contains(sanitize::GUARDED_LINE), "{log}");
+    for kept in [
+        "panic.message=",
+        "engines/weaver-graph/src/tree.rs:4852:17",
+        "config.toml",
+        "tuf-repo-cdn.sigstore.dev",
+    ] {
+        assert!(log.contains(kept), "{kept} was left out:\n{log}");
+    }
+    let entry = manifest
+        .files
+        .iter()
+        .find(|file| file.name == "weaver.log")
+        .expect("the log ships");
+    assert!(entry.partial.is_none(), "{entry:?}");
+}
