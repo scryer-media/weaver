@@ -211,11 +211,15 @@ impl TorrentService {
             let mut live = self.inner.live.lock().await;
             let torrent = live.get_mut(&job_id).ok_or(ActionError::NotFound(job_id))?;
             let trackers = edited(torrent, edit)?;
-            let stored = self
-                .inner
-                .db
-                .set_torrent_trackers(job_id, &trackers)
-                .map_err(|error| ActionError::State(state_error(error)))?;
+            // The write runs off the runtime; the list stays held, so no
+            // other change of this torrent lands between it and its own.
+            let db = self.inner.db.clone();
+            let written = trackers.clone();
+            let stored =
+                tokio::task::spawn_blocking(move || db.set_torrent_trackers(job_id, &written))
+                    .await
+                    .map_err(|error| ActionError::State(error.to_string()))?
+                    .map_err(|error| ActionError::State(state_error(error)))?;
             if !stored {
                 return Err(ActionError::NotFound(job_id));
             }
@@ -297,16 +301,23 @@ impl TorrentService {
             if edits.is_empty() {
                 return outcome;
             }
-            let stored = match self.inner.db.set_torrents_trackers(&edits) {
-                Ok(stored) => stored,
-                Err(error) => {
-                    let error = state_error(error);
-                    for (job_id, _) in edits {
-                        outcome.insert(job_id, Err(ActionError::State(error.clone())));
+            // Off the runtime, as one torrent's edit writes.
+            let db = self.inner.db.clone();
+            let written = edits.clone();
+            let stored =
+                match tokio::task::spawn_blocking(move || db.set_torrents_trackers(&written))
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result.map_err(state_error))
+                {
+                    Ok(stored) => stored,
+                    Err(error) => {
+                        for (job_id, _) in edits {
+                            outcome.insert(job_id, Err(ActionError::State(error.clone())));
+                        }
+                        return outcome;
                     }
-                    return outcome;
-                }
-            };
+                };
             for (job_id, trackers) in edits {
                 match live.get_mut(&job_id) {
                     Some(torrent) if stored.contains(&job_id) => {
