@@ -225,6 +225,7 @@ impl NamespaceWriter {
                 working: self.working_volume(),
                 reading: RefCell::default(),
                 stop: Arc::default(),
+                timing: RefCell::default(),
             };
             let mut seen = BTreeSet::new();
             for member in volumes.values() {

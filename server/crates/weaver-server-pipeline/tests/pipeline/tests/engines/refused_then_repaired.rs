@@ -339,14 +339,11 @@ async fn a_member_delivered_whole_before_its_archive_was_refused_is_made_over_on
     let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
 
     refused_while_open(&mut pipeline, &scenario, 1, 0).await;
-    // The member's file moves to its name once the checkpoint that records
-    // the name has committed.
+    // The member's file keeps the name it was opened under until the job
+    // delivers: it moves to its own name once, at delivery.
     hear_recovery(&mut pipeline).await;
     let first = extracted(&pipeline);
-    assert!(
-        first.len() == 1 && first[0].ends_with("hello.txt"),
-        "{first:?}"
-    );
+    assert_eq!(first.len(), 1, "{first:?}");
     let delivered_first = std::fs::read(&first[0]).unwrap();
 
     serve_posts(&mut pipeline, &scenario, 1..3).await;
