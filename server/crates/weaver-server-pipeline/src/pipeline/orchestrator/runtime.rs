@@ -551,6 +551,8 @@ impl Pipeline {
             volume_buffers,
             volume_arrived_by_job: HashMap::new(),
             volume_reserved_by_job: HashMap::new(),
+            parked_download_results: Default::default(),
+            parked_results_room: false,
             window_ledgers: Default::default(),
             extraction_limits,
             process_memory_budget,
@@ -1244,7 +1246,10 @@ impl Pipeline {
             self.drain_ready_download_results(&mut pending_download_results);
             self.drain_ready_lane_control_messages();
             turn_active |= self.hear_graph_runs();
-            turn_active |= self.hear_volume_rooms();
+            if self.hear_volume_rooms() {
+                turn_active = true;
+                self.parked_results_room = true;
+            }
             #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             self.pump_decode_queue();
 
@@ -1465,6 +1470,7 @@ impl Pipeline {
                                 hear!(6);
                                 turn_timer.resume(PipelinePhase::GraphRun);
                                 self.volume_room_heard();
+                                self.parked_results_room = true;
                             }
                             Some(mail) = self.post_probes.recv(), if open!(7) => {
                                 hear!(7);
@@ -1612,7 +1618,7 @@ impl Pipeline {
                                 // lost its last are heard here. With neither
                                 // nothing is written.
                                 if self.volume_buffers.follow_rates() {
-                                    self.volume_room_changed();
+                                    self.volume_room_taken();
                                 }
 
                                 if tracing::enabled!(tracing::Level::DEBUG) {
@@ -1738,11 +1744,25 @@ impl Pipeline {
         // once if its stage moved, else on the snapshot tick.
         let mut reported = BTreeSet::new();
         while processed < Self::DOWNLOAD_RESULTS_PER_TURN {
-            let Some(result) = pending.pop_front() else {
+            // Parked fronts their volume has room for go first once a volume
+            // may have some, the previous result's step among what may have
+            // given it.
+            self.unpark_download_results();
+            let handed = if let Some(result) = self.take_retried_download_result() {
+                let job_id = result.job_id;
+                (job_id, self.process_retried_download_done(result).await)
+            } else if let Some(result) = pending.pop_front() {
+                let job_id = result.job_id;
+                (job_id, self.process_released_download_done(result).await)
+            } else {
                 break;
             };
-            reported.insert(result.job_id);
-            self.process_released_download_done(result).await;
+            let (job_id, handed) = handed;
+            // One parked again waits for its wake and is not counted.
+            if !handed {
+                continue;
+            }
+            reported.insert(job_id);
             processed += 1;
             // Return freed connections during ingestion rather than waiting
             // until the entire result batch has been processed.
@@ -2111,6 +2131,8 @@ impl Pipeline {
             Arc::clone(&self.shutdown_settle.clock),
             self.shutdown_settle.end(),
         );
+        // Results parked for a volume's room are handed on within that span.
+        self.hand_on_parked_results_at_stop().await;
         // Unblock lanes waiting on deferred refills so they can finish their
         // batches and exit; dropping the senders answers them with an error.
         self.drain_inflight_download_and_decode_work().await;
@@ -2290,7 +2312,10 @@ impl Pipeline {
                     self.handle_owned_download_lane_event(event, &mut pending);
                     while let Some(result) = pending.pop_front() {
                         let reported_job = result.job_id;
-                        self.process_released_download_done(result).await;
+                        // At the stop nothing parks: the writes are bounded
+                        // by its span.
+                        self.process_released_download_done_with(result, false, false)
+                            .await;
                         self.report_job(reported_job);
                     }
                     #[cfg(any(test, feature = "pipeline-test-fixtures"))]

@@ -310,7 +310,7 @@ impl Volume {
     // Whether `bytes` more may be queued: they fit below the hard limit, or
     // the volume counts nothing, or its writer holds nothing it could write
     // to make room.
-    pub(crate) fn fits(&self, bytes: u64) -> bool {
+    pub fn fits(&self, bytes: u64) -> bool {
         let (_, hard) = self.buffer_limits();
         let counted = self.unwritten_bytes();
         counted == 0

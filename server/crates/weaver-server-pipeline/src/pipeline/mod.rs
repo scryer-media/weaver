@@ -2269,15 +2269,18 @@ pub struct Pipeline {
     // The keeper of every volume's buffer limits.
     pub volume_buffers: Arc<crate::operations::VolumeBuffers>,
     // For each job with released results waiting for the loop: their bytes,
-    // counted as arrived on the one volume they are held on.
-    pub volume_arrived_by_job:
-        HashMap<JobId, weaver_server_disk::operations::disk::volume::Reservation>,
+    // counted as arrived on each volume they are held on.
+    pub volume_arrived_by_job: HashMap<JobId, crate::pipeline::download::VolumeHolds>,
     // For each job with articles leased to lanes: their bytes, reserved on
-    // the volume the job writes to (`Reservation::reserve`). Each article
-    // is reserved once, as it is leased, and given back once, as it leaves
-    // its lane's record however it ends (`note_lane_work_left`).
-    pub(super) volume_reserved_by_job:
-        HashMap<JobId, weaver_server_disk::operations::disk::volume::Reservation>,
+    // the volume each lands on (`Reservation::reserve`). Each article is
+    // reserved once, as it is leased, and given back once, as it leaves its
+    // lane's record however it ends (`note_lane_work_left`).
+    pub(super) volume_reserved_by_job: HashMap<JobId, crate::pipeline::download::VolumeHolds>,
+    // Released results whose bytes land on a volume that had no room for
+    // them, kept per job in the order they came until that volume has room
+    // (`ParkedResults`); and whether a volume may have room since.
+    pub(super) parked_download_results: crate::pipeline::download::ParkedResults,
+    pub(super) parked_results_room: bool,
     // What decode windows took from each disk they go on, for every graph
     // job together.
     pub(super) window_ledgers: weaver_server_disk::scratch::ScratchLedgers,

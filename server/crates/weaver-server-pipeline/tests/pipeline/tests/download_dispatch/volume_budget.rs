@@ -376,12 +376,13 @@ async fn a_job_whose_volume_changes_gives_each_volume_back_what_it_counted() {
     let later = book_lease(&mut pipeline).expect("room on the second volume");
     let leased = later.works().len() as u64 * u64::from(ARTICLE);
     assert_eq!(second.unwritten_bytes(), leased);
-    // One of them arrives too, and waits with the first: both count on the
-    // second volume now, and the first counts nothing.
+    // One of them arrives too, and waits with the first. Each counts where
+    // it was counted: the first article stays on the first volume, which
+    // the second takes from only where it fits, as the loop hands it on.
     let next = arrived(&pipeline, later.id(), &later.works()[0]);
     assert!(pipeline.release_waiting_volume_result(&next));
-    assert_eq!(first.unwritten_bytes(), 0);
-    assert_eq!(second.unwritten_bytes(), leased + u64::from(ARTICLE));
+    assert_eq!(first.unwritten_bytes(), u64::from(ARTICLE));
+    assert_eq!(second.unwritten_bytes(), leased);
 
     pipeline.process_released_volume_result(early).await;
     pipeline.process_released_volume_result(next).await;
