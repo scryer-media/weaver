@@ -942,16 +942,14 @@ impl Scenario {
     }
 
     // The password the job is submitted with.
-    #[cfg(test)]
-    pub(in crate::pipeline::tests) fn password(mut self, password: &str) -> Self {
+    pub fn password(mut self, password: &str) -> Self {
         self.password = Some(password.to_string());
         self
     }
 
     // A password the settings carry, not the job: the graph engine offers it
     // when an object asks.
-    #[cfg(test)]
-    pub(in crate::pipeline::tests) fn global_password(mut self, password: &str) -> Self {
+    pub fn global_password(mut self, password: &str) -> Self {
         self.global_passwords.push(password.to_string());
         self
     }
@@ -1120,8 +1118,8 @@ pub enum Claim {
 #[derive(Clone, Debug, Default)]
 pub struct GraphView {
     // Payload members by output name, read off the namespace's marks.
-    pub(in crate::pipeline::tests) claims: BTreeMap<String, Claim>,
-    pub(in crate::pipeline::tests) blocks_reachable: u64,
+    pub claims: BTreeMap<String, Claim>,
+    pub blocks_reachable: u64,
     // The damaged slices every set last reported, as the history keeps them.
     pub damaged_slices: u64,
     pub outcomes: Vec<Option<RepairOutcome>>,
@@ -1134,7 +1132,7 @@ pub struct GraphView {
     // look.
     pub(in crate::pipeline::tests) loans: u64,
     // How many password candidates each node was offered, at the last look.
-    pub(in crate::pipeline::tests) offered: BTreeMap<weaver_graph::NodeId, usize>,
+    pub offered: BTreeMap<weaver_graph::NodeId, usize>,
     // The files the job hands over at every depth, by output name.
     pub(in crate::pipeline::tests) delivery: Delivery,
     // Whether a failure of the job, at the last look, is its post's: what
@@ -1169,7 +1167,7 @@ pub struct GraphView {
     pub sealing: Vec<Vec<(String, bool, bool)>>,
     // The most the job's working directory held at any look, every file
     // under it by its length.
-    pub(in crate::pipeline::tests) scratch: u64,
+    pub scratch: u64,
     // The most the job's holds kept at any look, in memory, on scratch and
     // on file, over every namespace.
     pub held: u64,
@@ -1177,6 +1175,10 @@ pub struct GraphView {
     pub names: BTreeSet<String>,
 }
 impl GraphView {
+    pub fn whole_files(&self) -> &[String] {
+        &self.delivery.whole
+    }
+
     pub fn damaged_files(&self) -> &[String] {
         &self.delivery.damaged
     }
@@ -1228,8 +1230,7 @@ pub fn kinds(graph: &Outcome) -> Vec<&str> {
 }
 
 impl Outcome {
-    #[cfg(test)]
-    pub(in crate::pipeline::tests) fn refetched(&self) -> Vec<(u32, u32)> {
+    pub fn refetched(&self) -> Vec<(u32, u32)> {
         self.requests
             .iter()
             .filter(|(_, count)| **count > 1)
@@ -1270,8 +1271,7 @@ pub(in crate::pipeline::tests) fn repair_and_terminal_events(outcome: &Outcome) 
 }
 
 // Every article was asked for once.
-#[cfg(test)]
-pub(in crate::pipeline::tests) fn assert_fetched_once(outcome: &Outcome) {
+pub fn assert_fetched_once(outcome: &Outcome) {
     assert!(
         outcome.refetched().is_empty(),
         "asked for an article twice: {:?}",

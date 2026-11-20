@@ -97,8 +97,7 @@ mod dead_posts;
 mod deep;
 #[cfg(test)]
 mod delivery;
-#[cfg(test)]
-mod depth;
+pub mod depth;
 #[cfg(test)]
 mod disk_wait;
 #[cfg(test)]
@@ -224,8 +223,7 @@ mod settled_rulings;
 mod sevenz;
 #[cfg(test)]
 mod sevenz_hex;
-#[cfg(test)]
-mod sfv;
+pub mod sfv;
 #[cfg(test)]
 mod size_bounds;
 #[cfg(test)]
@@ -256,7 +254,4 @@ mod volume_order;
 mod waiting_sets;
 #[cfg(test)]
 mod withheld_par2;
-#[cfg(test)]
-mod zip;
-#[cfg(test)]
-mod zip_par3;
+pub mod zip;

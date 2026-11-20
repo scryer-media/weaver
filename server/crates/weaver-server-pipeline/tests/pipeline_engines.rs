@@ -10,14 +10,18 @@ mod pipeline {
             mod classic_par2_index;
             mod classic_zip64;
             mod dashed_volumes;
+            mod depth;
             mod frontless_sets;
             mod lost_index;
             mod nameless_recovery;
             mod sealed;
+            mod sfv;
             mod status_rulings;
             mod unlisted_data;
             mod unnamed_index;
             mod unused_sets;
+            mod zip;
+            mod zip_par3;
         }
     }
 }
