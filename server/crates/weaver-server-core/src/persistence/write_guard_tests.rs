@@ -94,8 +94,12 @@ const LIFTED: &[(&str, usize)] = &[
         1,
     ),
     (
+        "server/crates/weaver-server-migrations/src/schema_migrations.rs",
+        7,
+    ),
+    (
         "server/crates/weaver-server-pipeline/src/schema_migrations.rs",
-        12,
+        5,
     ),
     (
         "server/crates/weaver-server-pipeline/src/schema_migrations/nzb_tables_v85.rs",
