@@ -3,7 +3,7 @@
 # revision. The source tarball's SHA-256 is verified before a single line of it
 # is compiled, so the image can only ever contain the revision
 # test-corpus/toolchains.json pins.
-FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3 AS build
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS build
 
 ARG PAR3_URL
 ARG PAR3_SHA256
@@ -20,7 +20,7 @@ RUN set -eux; \
     cmake --build build --parallel "$(nproc)"; \
     install -D -m 0755 build/par3cmd/par3 /opt/par3/bin/par3
 
-FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 
 RUN set -eux; \
     apt-get update; \
