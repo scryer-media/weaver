@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use crate::torrents::queries::TorrentsInternalQueries;
 pub use weaver_server_net::torrents::net;
 pub use weaver_server_settings::torrents::identity;
 pub use weaver_server_torrent_store::torrents::admission;
@@ -35,15 +34,6 @@ pub use weaver_torrent::{
 /// The torrents as a class an operator holds apart: their own pause.
 pub const CLASS: crate::jobs::HeldClass =
     crate::jobs::HeldClass::must(crate::jobs::Protocol::Torrent);
-
-// The torrents the database still keeps, among `job_ids`: theirs whether or
-// not the client runs, so a history row never takes their folders.
-pub(crate) fn live_among(
-    db: &crate::Database,
-    job_ids: &[weaver_server_base::jobs::ids::JobId],
-) -> Result<std::collections::BTreeSet<weaver_server_base::jobs::ids::JobId>, crate::StateError> {
-    db.torrent_job_ids_among(job_ids)
-}
 
 #[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub mod test_fixture;

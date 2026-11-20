@@ -7,6 +7,7 @@ pub mod files;
 pub mod history_persistence;
 pub mod intake;
 pub mod layout;
+pub mod live;
 pub mod metainfo;
 pub mod metrics;
 pub mod model;

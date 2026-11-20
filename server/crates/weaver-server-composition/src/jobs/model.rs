@@ -3,49 +3,19 @@
 
 #[cfg(test)]
 use weaver_model::files::FileRole;
-use weaver_server_base::jobs::ids::JobId;
 
 pub use weaver_server_jobs::jobs::model::*;
 
-/// Which of some job ids a class still keeps live, read from the database
-/// whether or not the class runs. Blocking: called off the async runtime.
-pub type LiveAmong =
-    fn(&crate::Database, &[JobId]) -> Result<std::collections::BTreeSet<JobId>, crate::StateError>;
+pub use weaver_server_torrent_store::torrents::live::ProtocolLiveAmong;
 
-/// Which jobs a class keeps live past their history row, whose folders are
-/// the class's; `None` when a history row is the whole job. Kept here, out
-/// of the class's names, because the torrents' lookup is the pipeline's.
+/// Which of some job ids a class still keeps live, for the composed
+/// database. Blocking: called off the async runtime.
+pub type LiveAmong = weaver_server_torrent_store::torrents::live::LiveAmong<crate::Database>;
+
+/// Which jobs a class keeps live past their history row, for the composed
+/// database; `None` when a history row is the whole job.
 pub const fn live_of(protocol: Protocol) -> Option<LiveAmong> {
-    match protocol {
-        Protocol::Nzb => None,
-        Protocol::Torrent => Some(crate::torrents::live_among),
-    }
-}
-
-/// Which jobs the classes keep live, for `Protocol`, whose own impls are in
-/// weaver-server-jobs.
-pub trait ProtocolLiveAmong {
-    fn live_among(
-        db: &crate::Database,
-        job_ids: &[JobId],
-    ) -> Result<std::collections::BTreeSet<JobId>, crate::StateError>;
-}
-
-impl ProtocolLiveAmong for Protocol {
-    /// Which of `job_ids` any class keeps live, as one batched lookup per
-    /// class that keeps them. Blocking: called off the async runtime.
-    fn live_among(
-        db: &crate::Database,
-        job_ids: &[JobId],
-    ) -> Result<std::collections::BTreeSet<JobId>, crate::StateError> {
-        let mut live = std::collections::BTreeSet::new();
-        for protocol in Self::ALL {
-            if let Some(among) = live_of(*protocol) {
-                live.extend(among(db, job_ids)?);
-            }
-        }
-        Ok(live)
-    }
+    weaver_server_torrent_store::torrents::live::live_of::<crate::Database>(protocol)
 }
 
 #[cfg(test)]
