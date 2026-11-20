@@ -996,6 +996,84 @@ async fn a_draining_job_is_dropped_when_its_writes_return_with_the_loop_parked()
     retire_pipeline_database(pipeline).await;
 }
 
+// A job listed as still writing out whose last operation does not return,
+// as an unpack stuck on the volume's thread: once the bytes that waited in
+// memory are down, the volume's room wake drops it from the list, with no
+// tick, no other mail and its writes still out.
+#[tokio::test]
+async fn a_draining_job_with_a_stuck_operation_is_dropped_once_its_bytes_are_down() {
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_432);
+    let posts = [Post::plain("lantern.bin", payload(3 * ARTICLE, 1))];
+    let (mut pipeline, _) = graph_job(&temp_dir, job_id, &posts).await;
+    let (volume, hold) = held(&pipeline, job_id);
+    decode_all(&mut pipeline, job_id, &posts, 0).await;
+    crate::pipeline::tests::queue_fixture::clear_download_queue(&mut pipeline, job_id);
+    // An operation behind the writes that returns only when the test lets
+    // it.
+    let (unstick, stuck) = std::sync::mpsc::channel::<()>();
+    pipeline.graph_jobs[&job_id].disk().unwrap().working().run(
+        None,
+        temp_dir.path().join("stuck"),
+        move || {
+            let _ = stuck.recv();
+            Ok(())
+        },
+    );
+    pipeline.tally_disk_vote(std::time::Instant::now());
+    let write = pipeline
+        .shared_state
+        .disk_limits()
+        .job(job_id)
+        .expect("the job is listed as writing out");
+    assert!(write.draining && !write.slow);
+    hold.open();
+    // Only the room channel is heard, as the parked loop hears it.
+    while pipeline.shared_state.disk_limits().job(job_id).is_some() {
+        pipeline.volume_rooms.recv().await.unwrap();
+        pipeline.hear_disk_room();
+    }
+    assert!(pipeline.shared_state.disk_limits().is_empty());
+    assert_eq!(volume.buffered_bytes.load(Ordering::SeqCst), 0);
+    assert!(
+        !pipeline.graph_jobs[&job_id].disk().unwrap().quiet(),
+        "the stuck operation is still out"
+    );
+    unstick.send(()).unwrap();
+    retire_pipeline_database(pipeline).await;
+}
+
+// A job listed as still writing out that begins to unpack shows its own
+// status: the next word the loop hears drops it at once, within the second
+// figures wait for.
+#[tokio::test]
+async fn a_draining_job_that_begins_to_unpack_is_dropped_at_once() {
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_433);
+    let posts = [Post::plain("lantern.bin", payload(3 * ARTICLE, 1))];
+    let (mut pipeline, _) = graph_job(&temp_dir, job_id, &posts).await;
+    let (_volume, hold) = held(&pipeline, job_id);
+    decode_all(&mut pipeline, job_id, &posts, 0).await;
+    crate::pipeline::tests::queue_fixture::clear_download_queue(&mut pipeline, job_id);
+    pipeline.tally_disk_vote(std::time::Instant::now());
+    assert!(
+        pipeline
+            .shared_state
+            .disk_limits()
+            .job(job_id)
+            .is_some_and(|write| write.draining)
+    );
+    let rows = pipeline.shared_state.disk_rows_revision();
+    pipeline.jobs.get_mut(&job_id).unwrap().post_state = crate::jobs::model::PostState::Extracting;
+    pipeline.hear_disk_room();
+    assert_eq!(pipeline.shared_state.disk_limits().job(job_id), None);
+    assert_ne!(pipeline.shared_state.disk_rows_revision(), rows);
+    hold.open();
+    retire_pipeline_database(pipeline).await;
+}
+
 // A graceful stop puts down what the volumes hold before the last
 // checkpoint, and that checkpoint says the bytes are down.
 #[tokio::test]
@@ -2446,6 +2524,97 @@ async fn a_repair_onto_a_still_output_volume_never_stops_the_loop() {
         "the loop stood still for the output volume"
     );
     assert_eq!(over, 0, "more than one slice was counted over the limit");
+    retire_pipeline_database(pipeline).await;
+}
+
+// A repair whose set proves good two articles that arrived marked damaged:
+// the tail of its return delivers them again, read back, onto a volume of
+// their own that is full as the tail begins: its limit counted by another
+// producer and bytes waiting for its writer, as a slow disk leaves it. The
+// loop never stands still for the volume: the tail stands for room on a
+// thread of its own (`Heard::TailPaid`) and goes on as that thread counts
+// the piece. Once the room is given back the repair ends, the member whole
+// and nothing of it still marked damaged. The writer itself is never held:
+// the loop reads back what it wrote, and that read waits for the writer.
+#[tokio::test]
+async fn a_repairs_tail_onto_a_full_output_volume_never_stops_the_loop() {
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_493);
+    let data = payload(8 * ARTICLE, 4);
+    let mut posts = vec![Post::plain("lantern.bin", data.clone())];
+    posts.extend(par2_set("lantern", &[("lantern.bin", &data)], 4));
+    let (mut pipeline, staging_dir) = delivered_apart(&temp_dir, job_id, &posts, Some(1)).await;
+    let last = posts.len() as u32;
+    // Two articles lost, two apart from each other that arrive with their
+    // own bytes but a failed checksum, the rest whole.
+    for ordinal in [1, 3, 5, 7] {
+        decode(&mut pipeline, job_id, &posts, 0, ordinal, true).await;
+    }
+    for ordinal in [4, 6] {
+        decode(&mut pipeline, job_id, &posts, 0, ordinal, false).await;
+    }
+    for ordinal in [0, 2] {
+        pipeline.book_terminal_segment(
+            segment_id(job_id, 0, ordinal),
+            SegmentTerminalState::Missing,
+        );
+    }
+    for index in 1..last {
+        decode_all(&mut pipeline, job_id, &posts, index).await;
+    }
+    assert!(pipeline.graph_jobs[&job_id].repair_out());
+    let disk = pipeline.graph_jobs[&job_id].disk().unwrap().clone();
+    let (_, output) = working_and_output(&pipeline, job_id, &staging_dir);
+    // What the downloads waited, before any repair.
+    let downloaded = budget_waits(&output);
+    let (mut watcher, mut stood) = (None, 0u32);
+    while pipeline.graph_jobs[&job_id].repair_out() {
+        let said = pipeline.graph_runs.recv().await.unwrap();
+        if matches!(&said.heard, Heard::RepairRead(_)) {
+            // Every slice is down. Another producer counts the volume's
+            // whole limit and the writer is said to hold bytes, until a
+            // thread stands for room; then both go.
+            disk.barrier().wait_aside();
+            let submitter = Arc::clone(disk.under(&staging_dir));
+            let (_, hard) = output.buffer_limits();
+            assert!(hard < u64::MAX, "the volume is sized");
+            let full = weaver_server_disk::operations::disk::writer::Credit::reserve(
+                std::iter::once(&submitter),
+                hard,
+                weaver_server_disk::operations::disk::writer::Stand::UntilStop,
+            );
+            assert!(full.covers(hard));
+            output.buffered_bytes.fetch_add(hard, Ordering::SeqCst);
+            let (hold, filled) = (pipeline.volume_writers.hold(&output), Arc::clone(&output));
+            hold.open();
+            watcher = Some(std::thread::spawn(move || {
+                hold.wait_below_waiters(1);
+                filled.buffered_bytes.fetch_sub(hard, Ordering::SeqCst);
+                drop(full);
+            }));
+        }
+        if matches!(&said.heard, Heard::TailPaid(_)) {
+            stood += 1;
+        }
+        pipeline.graph_run_said(said);
+    }
+    assert_eq!(
+        budget_waits(&output) - downloaded,
+        0,
+        "the loop stood still for the output volume"
+    );
+    assert!(stood > 0, "the tail never stood for room");
+    watcher.expect("the repair was read back").join().unwrap();
+    disk.barrier().wait_aside();
+    assert_eq!(read(&staging_dir.join("lantern.bin")), data);
+    assert_eq!(
+        pipeline.graph_jobs[&job_id]
+            .namespace()
+            .damaged_ranges()
+            .count(),
+        0
+    );
     retire_pipeline_database(pipeline).await;
 }
 

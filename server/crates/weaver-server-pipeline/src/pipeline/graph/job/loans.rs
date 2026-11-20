@@ -191,6 +191,40 @@ impl Loans {
         });
     }
 
+    // The tail of the set's return found no room on the job's volumes for
+    // the next piece it delivers again: a thread counts `bytes` for it on
+    // each, standing still on its own thread while one is at its limit, and
+    // mails what it counted (`Heard::TailPaid`), on which the tail goes on.
+    // Numbered by a loan of its own, as an apply, under the slot the repair
+    // held: the set's repair is not done until the tail is. A stop keeps the
+    // volumes' limits until its end, which ends the wait short.
+    pub(crate) fn pay(&mut self, set: NodeId, bytes: u64, disk: JobDisk) {
+        self.serial += 1;
+        let (scope, serial) = (self.scope, self.serial);
+        self.out = Some(Out {
+            set,
+            serial,
+            state: None,
+            stop: None,
+            kind: Work::Apply,
+            ends: Arc::new(AtomicBool::new(false)),
+        });
+        let mail = self.mail.clone();
+        tokio::task::spawn_blocking(move || {
+            let _job =
+                weaver_server_base::runtime::panic_trap::JobScope::enter(crate::JobId(scope));
+            let credit = disk.reserve_ahead(bytes, Stand::UntilStopsEnd);
+            // A closed channel means the pipeline is gone; the credit goes
+            // back as it drops.
+            let _ = mail.blocking_send(Said {
+                scope,
+                node: set,
+                generation: serial,
+                heard: Heard::TailPaid(Box::new(credit)),
+            });
+        });
+    }
+
     fn is_out(&self, kind: Work) -> bool {
         self.out.as_ref().is_some_and(|out| out.kind == kind)
     }

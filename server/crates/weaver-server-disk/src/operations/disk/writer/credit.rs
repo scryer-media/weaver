@@ -162,6 +162,39 @@ impl Credit {
         Self { shares }
     }
 
+    // `reserve` without standing, for the queuing thread itself: `None`
+    // when any volume refuses the bytes now, with whatever the others
+    // granted given back. A share that ended short as `reserve`'s would,
+    // with nothing counted, is no refusal.
+    pub fn try_reserve<'a>(
+        submitters: impl IntoIterator<Item = &'a Arc<Submitter>>,
+        bytes: u64,
+        stand: Stand,
+    ) -> Option<Self> {
+        let mut shares = Vec::new();
+        for submitter in submitters {
+            let Some(held) = submitter.try_reserve_ahead(bytes, stand) else {
+                for share in shares.drain(..) {
+                    let Share {
+                        submitter, held, ..
+                    } = share;
+                    let granted = held.bytes() > 0;
+                    drop(held);
+                    if granted {
+                        gave_back(&submitter);
+                    }
+                }
+                return None;
+            };
+            shares.push(Share {
+                held,
+                submitter: Arc::clone(submitter),
+                carried: false,
+            });
+        }
+        Some(Self { shares })
+    }
+
     // Whether every share holds `bytes`: no wait ended short of them.
     pub fn covers(&self, bytes: u64) -> bool {
         self.shares.iter().all(|share| share.held.bytes() >= bytes)

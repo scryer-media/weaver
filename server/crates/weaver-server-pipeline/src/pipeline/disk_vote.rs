@@ -242,6 +242,11 @@ struct JobWrite {
     // Nothing is left to fetch, the job's disk still has writes out, and
     // bytes wait for the volume's writer.
     draining: bool,
+    // The listing ends when the job's writes return or the volume has
+    // nothing waiting: a job draining, or one verifying, repairing or
+    // unpacking that is named only for its own writes to a slow volume.
+    // The pipeline asks to hear of either ([`Pipeline::ask_disk_tells`]).
+    watched: bool,
 }
 
 // What the job disks and the vote say about one job, for a request: which
@@ -315,12 +320,19 @@ impl DiskLimits {
         self.jobs.keys().copied()
     }
 
-    // The jobs listed as still writing out.
-    fn draining_ids(&self) -> impl Iterator<Item = JobId> + '_ {
+    // The jobs whose listing ends with their writes or their volumes'
+    // buffers.
+    fn watched_ids(&self) -> impl Iterator<Item = JobId> + '_ {
         self.jobs
             .iter()
-            .filter(|(_, write)| write.draining)
+            .filter(|(_, write)| write.watched)
             .map(|(job_id, _)| *job_id)
+    }
+
+    // Whether `job_id` is listed until its writes return or its volume has
+    // nothing waiting.
+    fn is_watched(&self, job_id: JobId) -> bool {
+        self.jobs.get(&job_id).is_some_and(|write| write.watched)
     }
 
     // Whether the two name the same jobs on the same disks for the same
@@ -362,21 +374,28 @@ pub fn volume_state(volume: &Volume, slow: bool) -> DiskVolumeState {
     }
 }
 
-// What one job's disk says, for the lists: its volumes, whether it has
-// nothing left to fetch, and whether its writes are all back.
+// What one job's disk says, for the lists: its volumes, the ones where
+// writes of its own are still out (not all returned), whether it has
+// nothing left to fetch, and whether it is verifying, repairing or
+// unpacking.
 pub struct JobDiskView<'a> {
     pub job_id: JobId,
     pub volumes: Vec<&'a Arc<Volume>>,
+    pub out: Vec<&'a Arc<Volume>>,
     pub fetched: bool,
-    pub quiet: bool,
+    pub working: bool,
 }
 
 // Build what is published from the slow volumes and each installed job's
 // disk. A job is listed when one of its volumes is slow (on that volume),
-// or when it has nothing left to fetch, writes still out and bytes waiting
-// for one of its volumes' writers (on the first such volume). A job whose
-// volumes have nothing waiting is not listed, whatever else it does: an
-// unpack or a repair that waits on no disk shows its own status.
+// or when it has nothing left to fetch and, on one of its volumes, writes
+// of its own still out with bytes waiting for that volume's writer (on the
+// first such volume). Bytes waiting on a volume the job has nothing out to
+// never name it: another job's bytes are not its own. A job verifying,
+// repairing or unpacking shows its own status: it is listed only on a slow
+// volume where writes of its own are out and bytes wait, and never as
+// draining. A job whose volumes have nothing waiting is not listed,
+// whatever else it does.
 pub fn disk_limits<'a>(
     slow: &[Arc<Volume>],
     jobs: impl IntoIterator<Item = JobDiskView<'a>>,
@@ -390,16 +409,35 @@ pub fn disk_limits<'a>(
             .volumes
             .iter()
             .find(|volume| slow.iter().any(|kept| Arc::ptr_eq(kept, volume)));
-        let writing = (job.fetched && !job.quiet)
-            .then(|| job.volumes.iter().find(|volume| waiting(volume) > 0))
-            .flatten();
-        let (volume, draining) = match (on_slow, writing) {
-            (Some(volume), writing) => (*volume, writing.is_some()),
-            (None, Some(volume)) => (*volume, true),
-            (None, None) => continue,
+        // Its own writes out, with bytes waiting for the volume's writer.
+        let own = |volume: &Arc<Volume>| {
+            waiting(volume) > 0 && job.out.iter().any(|out| Arc::ptr_eq(out, volume))
+        };
+        let (volume, draining, watched) = if job.working {
+            match on_slow {
+                Some(volume) if own(volume) => (*volume, false, true),
+                _ => continue,
+            }
+        } else {
+            let writing = job
+                .fetched
+                .then(|| job.out.iter().find(|volume| own(volume)))
+                .flatten();
+            match (on_slow, writing) {
+                (Some(volume), writing) => (*volume, writing.is_some(), writing.is_some()),
+                (None, Some(volume)) => (*volume, true, true),
+                (None, None) => continue,
+            }
         };
         let at = limits.place(volume, false);
-        limits.jobs.insert(job.job_id, JobWrite { at, draining });
+        limits.jobs.insert(
+            job.job_id,
+            JobWrite {
+                at,
+                draining,
+                watched,
+            },
+        );
     }
     limits
 }
@@ -435,35 +473,45 @@ impl Pipeline {
         }
     }
 
-    // A volume made room, or a listed job's writes returned (each listed
-    // job asks for that, [`Self::ask_disk_tells`]): what is published moves
-    // with it, with the ticks parked as well. A listed job whose writes are
-    // all back, or whose volumes have nothing waiting any more, or that has
-    // gone, is dropped at once; figures move at most once a second.
-    // Nothing is done while nothing is listed.
+    // A volume made room, a listed job's writes returned, or a volume a
+    // listed job writes to emptied its buffer (each watched job asks for
+    // both, [`Self::ask_disk_tells`]): what is published moves with it,
+    // with the ticks parked as well. A watched job whose writes are all
+    // back, whose volumes have nothing waiting any more, that began to
+    // verify, repair or unpack while listed as draining, or that has gone,
+    // is dropped at once; figures move at most once a second. A refresh
+    // that publishes nothing asks again for what the watched jobs wait on,
+    // so each always has a ring coming. Nothing is done while nothing is
+    // listed.
     pub(in crate::pipeline) fn refresh_parked_disk_limits(&mut self) {
         if self.disk_limits.is_empty() {
             return;
         }
         let graphs = (&self.graph_jobs, &self.retiring_graph_jobs);
+        let jobs = &self.jobs;
         let limits = &self.disk_limits;
         let done = limits.job_ids().any(|job_id| {
-            let draining = limits.job(job_id).is_some_and(|write| write.draining);
+            let write = limits.job(job_id);
+            let watched = limits.is_watched(job_id);
+            let draining = write.is_some_and(|write| write.draining);
             graphs
                 .0
                 .get(&job_id)
                 .or_else(|| graphs.1.get(&job_id))
                 .and_then(|graph| graph.disk())
                 .is_none_or(|disk| {
-                    draining
-                        && (disk.quiet()
-                            || disk
-                                .each()
-                                .all(|submitter| waiting(submitter.volume()) == 0))
+                    (draining && working(jobs, &job_id))
+                        || (watched
+                            && disk.each().all(|submitter| {
+                                waiting(submitter.volume()) == 0 || submitter.barrier().returned()
+                            }))
                 })
         });
         if self.disk_vote.publish_due(Instant::now()) || done {
             self.publish_disk_limits();
+        } else {
+            let limits = Arc::clone(&self.disk_limits);
+            self.ask_disk_tells(&limits);
         }
     }
 
@@ -502,8 +550,13 @@ impl Pipeline {
                 Some(JobDiskView {
                     job_id: *job_id,
                     volumes: disk.each().map(|submitter| submitter.volume()).collect(),
+                    out: disk
+                        .each()
+                        .filter(|submitter| !submitter.barrier().returned())
+                        .map(|submitter| submitter.volume())
+                        .collect(),
                     fetched,
-                    quiet: disk.quiet(),
+                    working: working(jobs, job_id),
                 })
             });
         let next = disk_limits(&slow, views);
@@ -517,18 +570,47 @@ impl Pipeline {
         self.shared_state.set_disk_limits(next, rows);
     }
 
-    // Each job listed as still writing out asks to be told when what it
-    // has submitted so far returns: its volumes' writers ring the room
-    // channel then, and [`Self::refresh_parked_disk_limits`] drops it or
-    // asks again for what it submitted since. One ask per listed job at a
-    // time; a job no longer listed is forgotten.
+    // Each watched job asks to be told when what it has submitted so far
+    // returns, and when each of its volumes has written what waits there
+    // now: its volumes' writers ring the room channel then, and
+    // [`Self::refresh_parked_disk_limits`] drops it or asks again. The
+    // buffer's wake is the volume's own room wake, at the line of what is
+    // counted there and not waiting in memory (what callers reserved
+    // ahead), so it rings once the bytes waiting now are written, however
+    // the job's own writes stand. One barrier ask per watched job at a
+    // time; a job no longer watched is forgotten. A job with nothing left
+    // to wait on rings the channel itself, so it is dropped on the next
+    // turn.
     fn ask_disk_tells(&mut self, limits: &DiskLimits) {
-        if self.disk_tells.is_empty() && limits.draining_ids().next().is_none() {
+        if self.disk_tells.is_empty() && limits.watched_ids().next().is_none() {
             return;
         }
         self.disk_tells
-            .retain(|job_id, _| limits.job(*job_id).is_some_and(|write| write.draining));
-        for job_id in limits.draining_ids() {
+            .retain(|job_id, _| limits.is_watched(*job_id));
+        let mut settled = false;
+        for job_id in limits.watched_ids() {
+            let Some(disk) = self
+                .graph_jobs
+                .get(&job_id)
+                .or_else(|| self.retiring_graph_jobs.get(&job_id))
+                .and_then(|graph| graph.disk())
+            else {
+                settled = true;
+                continue;
+            };
+            let mut waits = false;
+            for submitter in disk.each() {
+                let volume = submitter.volume();
+                let buffered = waiting(volume);
+                if buffered == 0 {
+                    continue;
+                }
+                let line = volume.unwritten_bytes().saturating_sub(buffered);
+                waits |= submitter.wake_below(line);
+            }
+            // Nothing waits in memory any more: the job is dropped however
+            // its writes stand, so a stuck write does not keep it listed.
+            settled |= !waits;
             let asked = self
                 .disk_tells
                 .get(&job_id)
@@ -536,14 +618,6 @@ impl Pipeline {
             if asked {
                 continue;
             }
-            let Some(disk) = self
-                .graph_jobs
-                .get(&job_id)
-                .or_else(|| self.retiring_graph_jobs.get(&job_id))
-                .and_then(|graph| graph.disk())
-            else {
-                continue;
-            };
             let barriers: Vec<_> = disk
                 .each()
                 .map(|submitter| submitter.barrier())
@@ -555,9 +629,31 @@ impl Pipeline {
                     let _ = ring.send(());
                 });
             }
+            settled |= barriers.is_empty();
             self.disk_tells.insert(job_id, barriers);
         }
+        if settled {
+            let _ = self.disk_tell.send(());
+        }
     }
+}
+
+// Whether `job_id` is verifying, repairing or unpacking: its row shows
+// that, not the disk, unless its own writes wait on a slow volume.
+fn working(
+    jobs: &std::collections::HashMap<JobId, crate::jobs::model::JobState>,
+    job_id: &JobId,
+) -> bool {
+    use crate::jobs::model::{JobStatus, PostState};
+    jobs.get(job_id).is_some_and(|state| {
+        matches!(
+            state.status,
+            JobStatus::Verifying | JobStatus::Repairing | JobStatus::Extracting
+        ) || matches!(
+            state.post_state,
+            PostState::Verifying | PostState::Repairing | PostState::Extracting
+        )
+    })
 }
 
 #[cfg(test)]
@@ -820,10 +916,90 @@ mod tests {
     ) -> JobDiskView<'a> {
         JobDiskView {
             job_id: JobId(job),
+            out: if quiet { Vec::new() } else { volumes.clone() },
             volumes,
             fetched,
-            quiet,
+            working: false,
         }
+    }
+
+    // A job verifying, repairing or unpacking shows its own status: bytes
+    // waiting on a volume that is not slow never name it, nor does a slow
+    // one once its own writes are back. Only its own writes still out to a
+    // slow volume with bytes waiting do, and then as slow, not draining.
+    #[test]
+    fn a_job_that_unpacks_is_named_only_for_its_own_writes_to_a_slow_volume() {
+        let nas = volume("/mnt/nas");
+        let usb = volume("/mnt/usb");
+        wait(&nas, 8 << 20);
+        wait(&usb, 8 << 20);
+        let working = |job, volumes, quiet| JobDiskView {
+            working: true,
+            ..view(job, volumes, true, quiet)
+        };
+        let limits = disk_limits(
+            &[Arc::clone(&nas)],
+            [
+                working(1, vec![&usb], false),
+                working(2, vec![&nas], true),
+                working(3, vec![&nas], false),
+                view(4, vec![&usb], true, false),
+            ],
+        );
+        assert_eq!(limits.job(JobId(1)), None, "a disk that is not slow");
+        assert_eq!(limits.job(JobId(2)), None, "its writes are back");
+        assert_eq!(
+            limits.job(JobId(3)),
+            Some(JobDiskWrite {
+                volume: "/mnt/nas".into(),
+                slow: true,
+                draining: false,
+            })
+        );
+        assert!(limits.is_watched(JobId(3)));
+        assert!(limits.job(JobId(4)).is_some_and(|write| write.draining));
+        assert!(limits.is_watched(JobId(4)));
+        // Once nothing waits on the slow volume, its writes no longer hold
+        // the row.
+        wait(&nas, 0);
+        let limits = disk_limits(&[Arc::clone(&nas)], [working(3, vec![&nas], false)]);
+        assert_eq!(limits.job(JobId(3)), None);
+        // Bytes counted and not waiting in memory, an emit's credit held
+        // ahead, do not name it either.
+        nas.count_for_test(99_825);
+        let limits = disk_limits(&[Arc::clone(&nas)], [working(3, vec![&nas], false)]);
+        assert_eq!(limits.job(JobId(3)), None);
+    }
+
+    // A job done fetching is named for bytes waiting only on a volume where
+    // writes of its own are out: another job's bytes waiting on a second
+    // volume it writes to do not name it, nor that volume.
+    #[test]
+    fn a_draining_job_is_named_only_for_a_volume_it_has_writes_out_to() {
+        let incomplete = volume("/downloads/incomplete");
+        let complete = volume("/downloads/complete");
+        wait(&complete, 18 << 20);
+        let job = JobDiskView {
+            out: vec![&incomplete],
+            ..view(1, vec![&incomplete, &complete], true, false)
+        };
+        let limits = disk_limits(&[], [job]);
+        assert_eq!(limits.job(JobId(1)), None);
+        assert!(limits.volume_states().is_empty());
+        wait(&incomplete, 1 << 20);
+        let job = JobDiskView {
+            out: vec![&incomplete],
+            ..view(1, vec![&incomplete, &complete], true, false)
+        };
+        let limits = disk_limits(&[], [job]);
+        assert_eq!(
+            limits.job(JobId(1)),
+            Some(JobDiskWrite {
+                volume: "/downloads/incomplete".into(),
+                slow: false,
+                draining: true,
+            })
+        );
     }
 
     // Bytes counted on the volume that are not waiting in memory, credit

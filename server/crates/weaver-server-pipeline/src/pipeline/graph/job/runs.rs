@@ -14,7 +14,7 @@ use weaver_graph::{Emit, Engine, MemberId, NodeId, VolumeIndex, Why};
 
 use super::{GraphError, GraphJob};
 use crate::pipeline::graph::engine::{Heard, Reservation, Said};
-use crate::pipeline::graph::namespace::{Coming, Returned, WriteError};
+use crate::pipeline::graph::namespace::{Coming, Returned, Tailed, WriteError};
 use crate::pipeline::graph::status::RepairSlots;
 
 // Words for a job no one is left to hear: the staged output a repair, a
@@ -84,6 +84,14 @@ impl GraphJob {
                     self.pending().left_at_stop();
                 }
             }
+            // A tail standing for room is dropped with the job, as a return
+            // being applied is; what its piece was counted goes back as it
+            // drops.
+            Heard::TailPaid(_) => {
+                if self.loans.returned(said.node, said.generation) && self.writer.drop_tail() {
+                    self.pending().left_at_stop();
+                }
+            }
             Heard::Emit(_)
             | Heard::Paid(..)
             | Heard::Ended
@@ -123,6 +131,10 @@ impl GraphJob {
                 .writer
                 .applying_into()
                 .map(|into| (std::mem::take(&mut slice.credit), into)),
+            Heard::TailPaid(ref mut credit) => self
+                .writer
+                .tail_into()
+                .map(|into| (std::mem::take(&mut **credit), into)),
             _ => None,
         };
         if fresh.is_none() && self.writer.carries_nothing() {
@@ -170,14 +182,29 @@ impl GraphJob {
                     return Ok(read.output.remove().map_err(WriteError::from)?);
                 }
                 let mut out = Vec::new();
-                let rebuilt = self.writer.repair_read(
+                let tailed = self.writer.repair_read(
                     &mut self.tree,
                     &mut *self.builder,
                     &self.root,
                     *read,
                     &mut out,
                 )?;
-                return self.taken_back(rebuilt, out, slots, limit);
+                return self.tailed(node, tailed, out, slots, limit);
+            }
+            // What the tail stood for was counted, and this step prepaid
+            // with it: the tail goes on.
+            Heard::TailPaid(_) => {
+                if !self.loans.returned(node, said.generation) {
+                    return Ok(());
+                }
+                let mut out = Vec::new();
+                let tailed = self.writer.tail_paid(
+                    &mut self.tree,
+                    &mut *self.builder,
+                    &self.root,
+                    &mut out,
+                )?;
+                return self.tailed(node, tailed, out, slots, limit);
             }
             Heard::Replayed(replayed) => {
                 if !self.loans.returned(node, said.generation) {
@@ -508,7 +535,8 @@ impl GraphJob {
     ) -> Result<(), GraphError> {
         let mut out = Vec::new();
         let objects = self.runs.hardware();
-        let rebuilt = self.writer.returned(
+        let set = returned.set;
+        let tailed = self.writer.returned(
             &mut self.tree,
             &mut *self.builder,
             &self.root,
@@ -528,7 +556,32 @@ impl GraphJob {
             }
             return Ok(());
         }
-        self.taken_back(rebuilt, out, slots, limit)
+        self.tailed(set, tailed, out, slots, limit)
+    }
+
+    // Where the tail of the set's return stands. Done, the return is taken
+    // back. Standing for room for its next piece, a thread is sent to count
+    // it (`Loans::pay`) and the loop goes on; the tail goes on when that is
+    // heard (`Heard::TailPaid`).
+    fn tailed(
+        &mut self,
+        set: weaver_graph::NodeId,
+        tailed: Tailed,
+        out: Vec<weaver_graph::Effect>,
+        slots: &mut RepairSlots,
+        limit: usize,
+    ) -> Result<(), GraphError> {
+        match tailed {
+            Tailed::Done(rebuilt) => self.taken_back(rebuilt, out, slots, limit),
+            Tailed::Standing(bytes) => {
+                let disk = self
+                    .disk()
+                    .cloned()
+                    .expect("only a job with volumes stands for room");
+                self.loans.pay(set, bytes, disk);
+                Ok(())
+            }
+        }
     }
 
     fn taken_back(

@@ -892,11 +892,15 @@ impl GraphJob {
     }
 
     // What the recovery sets are doing: repairing while a repair run is out
-    // over damage a set covers, which a run that only checks is not. With
+    // over damage a set covers, which a run that only checks is not, and
+    // while a repair's return is applied off the loop (its slices read back,
+    // or its tail standing for room): the slices it placed are off the
+    // damage by then, and the repair is not done until it is applied. With
     // nothing else at work, a replay or checksum still to settle, or a
     // worker's answer not yet acknowledged, is verifying what the job holds.
     fn activity(&self) -> Activity {
-        let repairing = self.repair_out() && self.writer.damage_covered(&self.tree);
+        let repairing = self.loans.applying()
+            || (self.loans.repairing() && self.writer.damage_covered(&self.tree));
         match phase::activity(self.writer.outcomes(&self.tree), repairing) {
             Activity::Idle if self.work_pending() => Activity::Verifying,
             activity => activity,

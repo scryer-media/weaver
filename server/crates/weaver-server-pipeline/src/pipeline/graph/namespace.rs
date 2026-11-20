@@ -247,6 +247,47 @@ struct Applying {
     slices: u64,
 }
 
+// The tail of a repair's return (`NamespaceWriter::applied`) while it
+// delivers again what its set ruled on, a read-back piece at a time. Each
+// piece is counted on the job's volumes before it goes: by the loop when
+// they have room now, or else by a thread standing for it while the loop
+// goes on with the job's other mail under the open batch, as between two
+// slices (`Loans::pay`, `Heard::TailPaid`). The loop never stands still for
+// a volume here.
+struct ReturnTail {
+    set: NodeId,
+    node: NodeId,
+    outcome: Option<weaver_graph::recovery::RepairOutcome>,
+    rejected: Vec<(NodeId, Vec<(weaver_graph::VolumeIndex, ByteRange)>)>,
+    rewritten: BTreeSet<MemberId>,
+    // A return none of whose slices landed rewrote nothing.
+    turned_away: bool,
+    // Whether the ranges the set vouches for were taken: the ranges it
+    // found come first, then those.
+    vouched: bool,
+    // The ranges left to deliver again, the next first.
+    ranges: std::collections::VecDeque<(MemberId, ByteRange, Provenance)>,
+    // The range being delivered again: its member, what it is delivered
+    // as, and the parts of it left, each with whether it arrived.
+    member: MemberId,
+    provenance: Provenance,
+    parts: std::collections::VecDeque<(ByteRange, bool)>,
+    // The next piece is paid by what the step that goes on with the tail
+    // was prepaid with.
+    paid: bool,
+    // What the tail said before it stood, heard once it is done.
+    said: Vec<Effect>,
+}
+
+// Where a return's tail stands.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Tailed {
+    // Done, with the slices the repair rebuilt when it rebuilt any.
+    Done(Option<u64>),
+    // Standing for room for its next piece of `bytes` (`Loans::pay`).
+    Standing(u64),
+}
+
 // One slice of a repair's staged output, read back off the loop, with what
 // its reader counted for it on the job's volumes.
 #[derive(Debug)]
@@ -363,6 +404,8 @@ pub struct NamespaceWriter {
     // A repair's return being applied a slice at a time, until its reader
     // is done.
     applying: Option<Applying>,
+    // A return's tail standing for room for its next piece.
+    tail: Option<ReturnTail>,
     // The credit the loop carries for a run's output it holds (`carried`).
     carried: carried::Carried,
     // Members refused while a repair's return was applied, each read as the
@@ -519,6 +562,7 @@ impl NamespaceWriter {
             effects: Vec::new(),
             acknowledging: None,
             applying: None,
+            tail: None,
             carried: carried::Carried::default(),
             refused_in_batch: BTreeSet::new(),
             given_back: Vec::new(),
@@ -575,8 +619,8 @@ impl NamespaceWriter {
         self.disk = Some(disk);
     }
 
-    // Before the next slice of a repair's or a replay's output is said
-    // again: the loop stands still while a volume the job writes to holds
+    // Before the next piece an object asked for is said again, or the next
+    // slice of a replay's output: the loop stands still while a volume the job writes to holds
     // its budget of bytes (`JobDisk::loop_wait_below`). An error once the
     // end of a stop passed with the budget still held: no further slice is
     // queued.
@@ -590,6 +634,11 @@ impl NamespaceWriter {
     // The namespace the slices of the return being applied land in.
     pub(crate) fn applying_into(&self) -> Option<NodeId> {
         self.applying.as_ref().map(|applying| applying.apply.node)
+    }
+
+    // The namespace a standing tail delivers its pieces again in.
+    pub(crate) fn tail_into(&self) -> Option<NodeId> {
+        self.tail.as_ref().map(|tail| tail.node)
     }
 
     // The writer of the volume a file under `root` lies on, when the job

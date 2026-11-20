@@ -432,6 +432,7 @@ impl Pipeline {
                     Heard::Repaired(_)
                         | Heard::RepairSlice(_)
                         | Heard::RepairRead(_)
+                        | Heard::TailPaid(_)
                         | Heard::Replayed(_)
                         | Heard::Verified(_)
                         | Heard::Worked(_)
@@ -461,6 +462,7 @@ impl Pipeline {
             Heard::Ended
                 | Heard::Repaired(_)
                 | Heard::RepairRead(_)
+                | Heard::TailPaid(_)
                 | Heard::Replayed(_)
                 | Heard::Verified(_)
                 | Heard::Worked(_)

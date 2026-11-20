@@ -4683,7 +4683,10 @@ fn a_repair_into_the_posts_is_promised_its_room_before_it_goes_out() {
             returned,
             &mut job.out,
         );
-        assert_eq!(result.unwrap(), Some(1));
+        assert_eq!(
+            result.unwrap(),
+            crate::pipeline::graph::namespace::Tailed::Done(Some(1))
+        );
         assert!(job.writer.refusal().is_none());
         assert!(
             !job.writer.disk_held(),

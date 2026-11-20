@@ -24,7 +24,8 @@ use weaver_graph::{
 
 use super::{
     Acknowledging, Apply, Applying, Arrival, HeldWant, LeafError, Loan, NamespaceWriter, READ_BACK,
-    Returned, Segments, Write, WriteError, absent_from_posts, in_own_file, index,
+    ReturnTail, Returned, Segments, Tailed, Write, WriteError, absent_from_posts, in_own_file,
+    index,
 };
 
 // How many times a job waiting for room asked again what its due sets
@@ -856,7 +857,7 @@ impl NamespaceWriter {
         restore: &dyn Restore,
         mut returned: Returned,
         out: &mut Vec<Effect>,
-    ) -> Result<Option<u64>, WriteError> {
+    ) -> Result<Tailed, WriteError> {
         // A repair whose output refused a write failed with it, and nothing
         // it came to is applied. The refusal is the error, whatever removing
         // the output then says.
@@ -868,7 +869,7 @@ impl NamespaceWriter {
         // A set retracted while it was out has nowhere to rule.
         if !tree.lent(returned.set) {
             returned.repaired.remove()?;
-            return Ok(None);
+            return Ok(Tailed::Done(None));
         }
         // A repair the shutdown stopped is not repaired: what it read was
         // cut short. It is rebuilt as it left, as one the loop moved under
@@ -914,7 +915,7 @@ impl NamespaceWriter {
             tree.heard_again(set, &mut effects);
             self.apply_all(tree, builder, segments, effects, out)?;
             repaired.remove()?;
-            return Ok(None);
+            return Ok(Tailed::Done(None));
         }
         tree.take_back(set, object, &mut self.placing(builder), &mut effects);
         self.apply_all(tree, builder, segments, effects, out)?;
@@ -922,7 +923,7 @@ impl NamespaceWriter {
         // came, and nothing it came to is applied.
         if stopped {
             repaired.remove()?;
-            return Ok(None);
+            return Ok(Tailed::Done(None));
         }
         for diagnostic in diagnostics {
             tracing::warn!(
@@ -997,11 +998,12 @@ impl NamespaceWriter {
                 said: std::mem::take(out),
                 slices: 0,
             });
-            return Ok(None);
+            return Ok(Tailed::Done(None));
         }
+        // Here the job has no volumes to wait on, or the return staged no
+        // slices.
         let placed = bound.and_then(|()| {
             for (member, offset, bytes) in repaired.slices() {
-                self.below_budget()?;
                 self.place_slice(
                     tree,
                     builder,
@@ -1054,8 +1056,11 @@ impl NamespaceWriter {
 
     // The tail of a repair's return, whether its slices were placed in one
     // step or a mail at a time: called with the return's batch open, once
-    // every slice is down or `placed` failed. The slices a repair applied
-    // rebuilt, when it rebuilt any.
+    // every slice is down or `placed` failed. What it delivers again is
+    // paid piece by piece without the loop standing still for a volume
+    // (`ReturnTail`): it may stand for room and go on when a thread counted it
+    // (`tail_paid`). Done, with the slices a repair applied rebuilt when it
+    // rebuilt any, or standing.
     fn applied(
         &mut self,
         tree: &mut Tree,
@@ -1064,19 +1069,19 @@ impl NamespaceWriter {
         apply: Apply,
         (repaired, placed): (super::Repaired, Result<(), WriteError>),
         out: &mut Vec<Effect>,
-    ) -> Result<Option<u64>, WriteError> {
+    ) -> Result<Tailed, WriteError> {
         let Apply {
             set,
             node,
             found,
             outcome,
-            mut rejected,
-            mut rewritten,
+            rejected,
+            rewritten,
             offered,
             landed,
             ..
         } = apply;
-        let applied = (|| {
+        let begun = (|| {
             // The staged output goes whether or not its slices landed: one
             // a member had no room for is not left on the disk while the
             // job waits. The repair runs again, so the job waits for all it
@@ -1094,58 +1099,178 @@ impl NamespaceWriter {
                 return Err(error);
             }
             removed?;
-            // An SFV below the root whose namespace came out of volumes a
-            // recovery set above proved makes no claim of damage: every
-            // byte of what it lists is what was posted.
-            let found = if tree.kind(set) == Some(Kind::Sfv) && tree.vouched_above(node) {
-                Vec::new()
-            } else {
-                found
-            };
-            for (member, range) in found {
-                let marked = (node, member, range, Provenance::Refuted);
-                self.redeliver(tree, builder, segments, marked, out)?;
+            Ok::<_, WriteError>(())
+        })();
+        if let Err(error) = begun {
+            self.acknowledging = None;
+            return Err(error);
+        }
+        // An SFV below the root whose namespace came out of volumes a
+        // recovery set above proved makes no claim of damage: every byte of
+        // what it lists is what was posted.
+        let found = if tree.kind(set) == Some(Kind::Sfv) && tree.vouched_above(node) {
+            Vec::new()
+        } else {
+            found
+        };
+        self.tail = Some(ReturnTail {
+            set,
+            node,
+            outcome,
+            rejected,
+            rewritten,
+            turned_away: offered && !landed,
+            vouched: false,
+            ranges: found
+                .into_iter()
+                .map(|(member, range)| (member, range, Provenance::Refuted))
+                .collect(),
+            member: MemberId(0),
+            provenance: Provenance::Refuted,
+            parts: Default::default(),
+            paid: false,
+            said: Vec::new(),
+        });
+        self.tail_on(tree, builder, segments, out)
+    }
+
+    // A thread counted on the job's volumes the piece the standing tail
+    // waits for, and the step hearing it was prepaid with that: the tail
+    // goes on from that piece. A wait the end of a stop cut short leaves the
+    // return unapplied, as the loop's own wait at that end did
+    // (`WriteError::LeftAtStop`).
+    pub(crate) fn tail_paid(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        out: &mut Vec<Effect>,
+    ) -> Result<Tailed, WriteError> {
+        let Some(tail) = self.tail.as_mut() else {
+            return Ok(Tailed::Done(None));
+        };
+        if self.disk.as_ref().is_some_and(|disk| disk.left_at_stop()) {
+            self.drop_tail();
+            return Err(WriteError::LeftAtStop);
+        }
+        tail.paid = true;
+        self.placing_return(true);
+        self.tail_on(tree, builder, segments, out)
+    }
+
+    // The job drops a standing tail, as it fails or retires: what it
+    // delivered is not ruled on. Whether one stood.
+    pub(crate) fn drop_tail(&mut self) -> bool {
+        let stood = self.tail.take().is_some();
+        if stood {
+            self.acknowledging = None;
+        }
+        stood
+    }
+
+    // The tail goes on until it is done, fails, or stands for room for its
+    // next piece. Its batch closes as it ends either way.
+    fn tail_on(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        out: &mut Vec<Effect>,
+    ) -> Result<Tailed, WriteError> {
+        let Some(mut tail) = self.tail.take() else {
+            return Ok(Tailed::Done(None));
+        };
+        let stood = self.tail_steps(tree, builder, segments, &mut tail, out);
+        match stood {
+            Ok(Some(bytes)) => {
+                // Bytes that arrive while it stands are fed as any others.
+                self.placing_return(false);
+                tail.said.append(out);
+                self.tail = Some(tail);
+                Ok(Tailed::Standing(bytes))
             }
-            // A rebuilt volume can let its object place bytes held behind it;
-            // they go down before the set's proof is read back through the map.
+            Ok(None) => {
+                let batch = self
+                    .acknowledging
+                    .take()
+                    .expect("the batch is open while a return is applied");
+                let mut said = std::mem::take(&mut tail.said);
+                said.append(out);
+                *out = said;
+                self.acknowledged(tree, builder, segments, batch, out)?;
+                // A repair none of whose slices landed rewrote nothing, and
+                // is not said to have.
+                Ok(Tailed::Done(match tail.outcome {
+                    Some(RepairOutcome::Repaired { slices }) if !tail.turned_away => Some(slices),
+                    _ => None,
+                }))
+            }
+            Err(error) => {
+                self.acknowledging = None;
+                Err(error)
+            }
+        }
+    }
+
+    // The tail's steps from where it stands: what the set found delivered
+    // again, what was held behind it released, what the set vouches for
+    // delivered again, and the rest of the ruling. `Some` with the bytes of
+    // the next piece when the job's volumes have no room for it now.
+    fn tail_steps(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        tail: &mut ReturnTail,
+        out: &mut Vec<Effect>,
+    ) -> Result<Option<u64>, WriteError> {
+        loop {
+            if let Some(bytes) = self.redeliver_paid(tree, builder, segments, tail, out)? {
+                return Ok(Some(bytes));
+            }
+            if tail.vouched {
+                break;
+            }
+            tail.vouched = true;
+            // A rebuilt volume can let its object place bytes held behind
+            // it; they go down before the set's proof is read back through
+            // the map.
             self.release_held(tree, builder, segments, out)?;
             // The ruling as the set stands now: one given before the bind
-            // above changed what it covers is void, and vouches for nothing.
-            if self.stands_proved(tree, set) {
-                rewritten.extend(self.vouched(tree, builder, segments, (node, set), out)?);
+            // changed what it covers is void, and vouches for nothing.
+            if self.stands_proved(tree, tail.set) {
+                let marked = self.vouched(tree, (tail.node, tail.set));
+                tail.rewritten
+                    .extend(marked.iter().map(|(member, _)| *member));
+                tail.ranges.extend(
+                    marked
+                        .into_iter()
+                        .map(|(member, range)| (member, range, Provenance::Repaired)),
+                );
             }
-            // Repair or proof delivery can complete a member's checksum
-            // metadata or inverse map. Capture any newly auditable damage
-            // through those changed inputs, alongside the earlier captures.
-            rejected.extend(tree.rejected_inputs(node, rewritten.iter().copied()));
-            for &member in &rewritten {
-                self.reopen(tree, builder, segments, (node, member), out)?;
+        }
+        let node = tail.node;
+        let rewritten = std::mem::take(&mut tail.rewritten);
+        let mut rejected = std::mem::take(&mut tail.rejected);
+        // Repair or proof delivery can complete a member's checksum
+        // metadata or inverse map. Capture any newly auditable damage
+        // through those changed inputs, alongside the earlier captures.
+        rejected.extend(tree.rejected_inputs(node, rewritten.iter().copied()));
+        for &member in &rewritten {
+            self.reopen(tree, builder, segments, (node, member), out)?;
+        }
+        // A member the set rebuilt or proved whole has its length and every
+        // byte proven: that proof closes it, through the close its
+        // producer's would take, and the batch judges it with every member
+        // it closed.
+        for member in rewritten {
+            if proven_open(tree, node, member) {
+                self.shut(tree, builder, segments, node, member, out)?;
             }
-            // A member the set rebuilt or proved whole has its length and
-            // every byte proven: that proof closes it, through the close
-            // its producer's would take, and the batch judges it with every
-            // member it closed.
-            for member in rewritten {
-                if proven_open(tree, node, member) {
-                    self.shut(tree, builder, segments, node, member, out)?;
-                }
-            }
-            self.queue_rechecks(rejected);
-            self.release_held(tree, builder, segments, out)?;
-            Ok::<_, WriteError>(offered && !landed)
-        })();
-        let batch = self
-            .acknowledging
-            .take()
-            .expect("the batch is open while a return is applied");
-        let turned_away = applied?;
-        self.acknowledged(tree, builder, segments, batch, out)?;
-        // A repair none of whose slices landed rewrote nothing, and is not
-        // said to have.
-        Ok(match outcome {
-            Some(RepairOutcome::Repaired { slices }) if !turned_away => Some(slices),
-            _ => None,
-        })
+        }
+        self.queue_rechecks(rejected);
+        self.release_held(tree, builder, segments, out)?;
+        Ok(None)
     }
 
     // How many slices of the return being applied were placed so far.
@@ -1208,10 +1333,10 @@ impl NamespaceWriter {
         segments: &dyn Segments,
         read: super::RepairRead,
         out: &mut Vec<Effect>,
-    ) -> Result<Option<u64>, WriteError> {
+    ) -> Result<Tailed, WriteError> {
         let Some(applying) = self.applying.take() else {
             read.output.remove()?;
-            return Ok(None);
+            return Ok(Tailed::Done(None));
         };
         let Applying {
             apply, error, said, ..
@@ -1277,15 +1402,8 @@ impl NamespaceWriter {
     // went, so those marks say what the set proved; damage past what it
     // proves stays marked, and so does a producer's verdict on a member
     // nothing reads further, which its producer judges again. Returns the
-    // members it delivered again.
-    fn vouched(
-        &mut self,
-        tree: &mut Tree,
-        builder: &mut dyn Builder,
-        segments: &dyn Segments,
-        (node, set): (NodeId, NodeId),
-        out: &mut Vec<Effect>,
-    ) -> Result<Vec<MemberId>, WriteError> {
+    // ranges to deliver again, each member's in order, none overlapping.
+    fn vouched(&self, tree: &Tree, (node, set): (NodeId, NodeId)) -> Vec<(MemberId, ByteRange)> {
         let sets = tree.recovery_nodes(node);
         let mut marked: Vec<(MemberId, ByteRange)> = tree
             .namespace(node)
@@ -1315,12 +1433,7 @@ impl NamespaceWriter {
             }
             overlaps
         });
-        let members: Vec<_> = marked.iter().map(|(member, _)| *member).collect();
-        for (member, range) in marked {
-            let proven = (node, member, range, Provenance::Repaired);
-            self.redeliver(tree, builder, segments, proven, out)?;
-        }
-        Ok(members)
+        marked
     }
 
     // The member's bytes were rewritten or proved: any refusal of it was
@@ -1362,54 +1475,111 @@ impl NamespaceWriter {
     // says were lost may never have come: where none read back the range
     // stays the loss it is, which a repair mends or the set's verdict
     // answers.
+    //
+    // The tail's ranges go a read-back piece at a time, each counted on the
+    // job's volumes before it is read: by the loop when every volume has
+    // room for it now, or else by the thread the job sends to stand for it
+    // (`Some` with its bytes), the piece left where it was until that
+    // credit comes. `None` once every range is down.
+    fn redeliver_paid(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        tail: &mut ReturnTail,
+        out: &mut Vec<Effect>,
+    ) -> Result<Option<u64>, WriteError> {
+        let node = tail.node;
+        loop {
+            let Some(&(piece, arrived)) = tail.parts.front() else {
+                let Some((member, range, provenance)) = tail.ranges.pop_front() else {
+                    return Ok(None);
+                };
+                tail.member = member;
+                tail.provenance = provenance;
+                tail.parts = tree
+                    .namespace(node)
+                    .and_then(|namespace| namespace.get(member))
+                    .map_or_else(
+                        || vec![(range, true)],
+                        |record| record.coverage.by_arrival(range),
+                    )
+                    .into_iter()
+                    .filter(|(piece, _)| piece.start < piece.end)
+                    .collect();
+                continue;
+            };
+            let chunk = ByteRange::new(
+                piece.start,
+                piece.end.min(piece.start.saturating_add(READ_BACK)),
+            );
+            let credit = if std::mem::take(&mut tail.paid) {
+                None
+            } else {
+                match self.disk.as_ref() {
+                    Some(disk) => match disk.try_reserve(chunk.len()) {
+                        Some(credit) => Some(credit),
+                        None => return Ok(Some(chunk.len())),
+                    },
+                    None => None,
+                }
+            };
+            if chunk.end < piece.end {
+                tail.parts[0].0 = ByteRange::new(chunk.end, piece.end);
+            } else {
+                tail.parts.pop_front();
+            }
+            let at = (node, tail.member, chunk, tail.provenance);
+            self.redeliver(tree, builder, segments, at, arrived, credit, out)?;
+        }
+    }
+
+    // One piece delivered again, paid by `credit` when the loop counted it
+    // itself, as a step that hears a producer's bytes is paid
+    // (`GraphJob::run_said`), or by what the step was prepaid with.
+    #[allow(clippy::too_many_arguments)]
     fn redeliver(
         &mut self,
         tree: &mut Tree,
         builder: &mut dyn Builder,
         segments: &dyn Segments,
-        (node, member, range, provenance): (NodeId, MemberId, ByteRange, Provenance),
+        (node, member, chunk, provenance): (NodeId, MemberId, ByteRange, Provenance),
+        arrived: bool,
+        credit: Option<weaver_server_disk::operations::disk::writer::Credit>,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
-        let parts = tree
-            .namespace(node)
-            .and_then(|namespace| namespace.get(member))
-            .map_or_else(
-                || vec![(range, true)],
-                |record| record.coverage.by_arrival(range),
-            );
-        for (piece, arrived) in parts {
-            let mut at = piece.start;
-            while at < piece.end {
-                let chunk = ByteRange::new(at, piece.end.min(at.saturating_add(READ_BACK)));
-                at = chunk.end;
-                self.below_budget()?;
-                let mut bytes = Vec::new();
-                if !self.access(tree).read_at(node, member, chunk, &mut bytes) {
-                    if !arrived {
-                        continue;
-                    }
-                    return Err(WriteError::ProofUnreadable {
-                        node,
-                        member,
-                        range: chunk,
-                    });
-                }
-                let arrival = Arrival {
-                    node,
-                    member,
-                    offset: chunk.start,
-                    // Read back: no evidence comes with it.
-                    bytes: Bytes::from(bytes).into(),
-                    provenance,
-                };
-                let rereading = self.rereading(true);
-                let delivered =
-                    self.arrive(tree, builder, segments, Write::new(&arrival), arrival, out);
-                self.rereading(rereading);
-                delivered?;
+        let mut bytes = Vec::new();
+        if !self.access(tree).read_at(node, member, chunk, &mut bytes) {
+            if !arrived {
+                return Ok(());
             }
+            return Err(WriteError::ProofUnreadable {
+                node,
+                member,
+                range: chunk,
+            });
         }
-        Ok(())
+        let paying = credit.map(|fresh| {
+            let mut credit = self.take_credit();
+            credit.join(fresh);
+            self.crediting(Some(node));
+            credit.prepay()
+        });
+        let arrival = Arrival {
+            node,
+            member,
+            offset: chunk.start,
+            // Read back: no evidence comes with it.
+            bytes: Bytes::from(bytes).into(),
+            provenance,
+        };
+        let rereading = self.rereading(true);
+        let delivered = self.arrive(tree, builder, segments, Write::new(&arrival), arrival, out);
+        self.rereading(rereading);
+        if let Some(paying) = paying {
+            self.settle_credit(tree, paying);
+        }
+        delivered
     }
 
     // Mark the bytes being delivered as ones the namespace held already, or

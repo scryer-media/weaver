@@ -75,6 +75,11 @@ pub enum Heard {
     RepairSlice(Box<super::namespace::RepairSlice>),
     // The apply's reader is done: every slice it read was said before.
     RepairRead(Box<super::namespace::RepairRead>),
+    // What a thread counted on the job's volumes for the next piece a
+    // return's tail delivers again, the loop having found no room for it:
+    // addressed to the set's node, under the tail's loan number
+    // (`Loans::pay`).
+    TailPaid(Box<Credit>),
     // The run returned: nothing more will be said under its generation.
     Ended,
     // A recovery set's repair, lent off the loop, came back: addressed to

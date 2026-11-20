@@ -650,6 +650,13 @@ impl JobDisk {
         Credit::reserve(self.each(), bytes, stand)
     }
 
+    // The same for the loop, which never stands: `None` when a volume
+    // refuses the bytes now (`Credit::try_reserve`). A stop keeps the
+    // volumes' limits until its end, as the loop's own writes do.
+    pub(crate) fn try_reserve(&self, bytes: u64) -> Option<Credit> {
+        Credit::try_reserve(self.each(), bytes, Stand::UntilStopsEnd)
+    }
+
     // The writer of the volume a file under `root` lies on.
     pub fn under(&self, root: &Path) -> &Arc<Submitter> {
         match &self.output {

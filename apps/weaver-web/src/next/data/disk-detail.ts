@@ -8,14 +8,20 @@ import { formatRate, formatSize } from "./format.ts";
 
 type DiskJob = Pick<JobData, "diskWrite" | "status" | "remainingBytes" | "totalBytes" | "downloadedBytes">;
 
+/** Statuses that show their own work: the disk is named only while it is slow. */
+const WORKING = new Set(["VERIFYING", "REPAIRING", "EXTRACTING"]);
+
 /**
  * The disk write a row is showing: a download a slow disk holds back while it
  * still fetches (not paused), or one done fetching whose bytes still wait for
- * its disk, slow or not. Null otherwise.
+ * its disk, slow or not. A job verifying, repairing or unpacking shows its own
+ * status, and the disk only while its own writes wait on a slow one, as the
+ * server lists it. Null otherwise.
  */
 export function shownDiskWrite(job: DiskJob): { write: DiskWrite; fetched: boolean } | null {
   const write = job.diskWrite;
   if (!write) return null;
+  if (WORKING.has(job.status)) return write.slow ? { write, fetched: false } : null;
   const fetched = (job.remainingBytes ?? job.totalBytes - job.downloadedBytes) <= 0;
   if (fetched) return write.draining ? { write, fetched } : null;
   return write.slow && job.status !== "PAUSED" ? { write, fetched } : null;

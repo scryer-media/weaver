@@ -477,8 +477,9 @@ impl SharedPipelineState {
             .map(|(job_id, fetched)| JobDiskView {
                 job_id,
                 volumes: vec![&volume],
+                out: vec![&volume],
                 fetched,
-                quiet: false,
+                working: false,
             });
         let next = disk_limits(&slow_volumes, views);
         let rows = !next.same_rows(&self.disk_limits());

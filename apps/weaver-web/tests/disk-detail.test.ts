@@ -57,3 +57,17 @@ test("only a row the daemon names, and not a paused one still fetching, shows it
   // A disk that is not slow says nothing while the row still fetches.
   assert.equal(diskDetail(t, { ...fetching, diskWrite: { ...slow, slow: false } }, disks), null);
 });
+
+test("a job verifying, repairing or unpacking shows its own status unless its writes wait on a slow disk", () => {
+  const draining = { ...slow, slow: false, draining: true };
+  for (const status of ["EXTRACTING", "VERIFYING", "REPAIRING"]) {
+    assert.equal(diskShort(t, { ...done, status, diskWrite: draining }), null, status);
+    assert.equal(diskDetail(t, { ...done, status, diskWrite: draining }, disks), null, status);
+    assert.equal(diskShort(t, { ...done, status, diskWrite: slow }), "Writing to disk", status);
+    assert.equal(
+      diskDetail(t, { ...done, status, diskWrite: slow }, disks),
+      diskDetail(t, { ...fetching, diskWrite: slow }, disks),
+      status,
+    );
+  }
+});
