@@ -28,6 +28,7 @@ test-support = [
     "weaver-server-speedtest/test-support",
     "weaver-server-ingest/test-support",
     "weaver-server-jobs/test-support",
+    "weaver-server-settings/test-support",
     "weaver-server-auth/test-support",
 ]
 

@@ -6,6 +6,10 @@ edition.workspace = true
 license-file.workspace = true
 repository.workspace = true
 
+[features]
+# Test-only reads for other crates' tests.
+test-support = []
+
 [dependencies]
 libc = { workspace = true }
 tracing = { workspace = true }

@@ -54,7 +54,7 @@ const LIFTED: &[(&str, usize)] = &[
         1,
     ),
     (
-        "server/crates/weaver-server-composition/src/jobs/diagnostic_names.rs",
+        "server/crates/weaver-server-settings/src/diagnostic_names.rs",
         1,
     ),
     (

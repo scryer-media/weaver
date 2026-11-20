@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 pub mod holds;
+pub mod keys;
 pub mod levels;
 pub mod model;
 pub mod persistence;

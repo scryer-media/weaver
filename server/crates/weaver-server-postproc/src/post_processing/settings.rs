@@ -26,7 +26,7 @@ use weaver_server_db::persistence::StateError;
 use weaver_server_db::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx, max_rows_for_engine};
 
 pub const SETTINGS_KEY: &str = "post_processing.settings.v2";
-pub const SCRIPT_DIRECTORY_KEY: &str = "post_processing.script_directory.v1";
+pub use weaver_server_settings::settings::keys::SCRIPT_DIRECTORY_KEY;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ScriptDirectoryError {
