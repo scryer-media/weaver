@@ -63,14 +63,14 @@ impl StateError {
 // Why an ordered write did not commit, as its waiter is told: the message,
 // and whether the database's disk had no room for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct WriteFailed {
-    pub(crate) message: String,
-    pub(crate) out_of_space: bool,
+pub struct WriteFailed {
+    pub message: String,
+    pub out_of_space: bool,
 }
 
 impl WriteFailed {
     // A write that failed for a reason other than room.
-    pub(crate) fn other(message: impl Into<String>) -> Self {
+    pub fn other(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             out_of_space: false,
@@ -84,7 +84,7 @@ impl From<&StateError> for WriteFailed {
             message: error.to_string(),
             out_of_space: match error {
                 StateError::OutOfSpace(_) => true,
-                StateError::Io(error) => crate::operations::is_out_of_space(error),
+                StateError::Io(error) => weaver_server_disk::operations::is_out_of_space(error),
                 _ => false,
             },
         }

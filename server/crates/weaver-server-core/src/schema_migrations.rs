@@ -34,14 +34,10 @@ pub(crate) mod torrent_private_v126;
 pub(crate) mod tracker_hosts_v105;
 pub(crate) mod unwanted_extensions_v56;
 
-const EMBEDDED_MIGRATION_CATALOG: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/migration_catalog.json.zst"));
-const EMBEDDED_MIGRATION_PAYLOAD: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/migration_payload.bin.zst"));
-const MIGRATION_21_BASE_SCHEMA_SQL: &str =
-    include_str!("db/migrations/0021_legacy_schema_parity/fresh.sql");
-const MIGRATION_22_SCHEMA_SQL: &str =
-    include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
+use weaver_server_migrations::{
+    EMBEDDED_MIGRATION_CATALOG, EMBEDDED_MIGRATION_PAYLOAD, MIGRATION_21_BASE_SCHEMA_SQL,
+    MIGRATION_22_SCHEMA_SQL,
+};
 const LEGACY_SCHEMA_VERSION: i64 = 20;
 const CURRENT_SCHEMA_VERSION: i64 = 134;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"

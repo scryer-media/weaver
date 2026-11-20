@@ -11,28 +11,8 @@ use crate::Database;
 use crate::persistence::database_target::DatabaseTarget;
 use crate::settings::Config;
 
-fn is_explicit_config_file(config_path: &Path) -> bool {
-    config_path
-        .extension()
-        .is_some_and(|extension| extension == "toml")
-        || config_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.ends_with(".toml.migrated"))
-        || config_path.is_file()
-}
-
-pub fn resolve_database_paths(config_path: &Path) -> (PathBuf, Option<PathBuf>) {
-    if is_explicit_config_file(config_path) {
-        let dir = config_path.parent().unwrap_or(Path::new("."));
-        (dir.join("weaver.db"), Some(config_path.to_path_buf()))
-    } else {
-        let dir = config_path;
-        let toml_candidate = dir.join("weaver.toml");
-        let toml_path = toml_candidate.exists().then_some(toml_candidate);
-        (dir.join("weaver.db"), toml_path)
-    }
-}
+use super::database_target::is_explicit_config_file;
+pub use super::database_target::resolve_database_paths;
 
 pub fn open_db_and_config(
     config_path: &Path,

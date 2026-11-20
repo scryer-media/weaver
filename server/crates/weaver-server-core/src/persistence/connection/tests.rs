@@ -1029,7 +1029,7 @@ fn open_applies_sqlite_file_pragmas() {
 fn close_ends_the_wal_checkpoint_task_while_another_owner_holds_the_services() {
     let temp = tempfile::tempdir().unwrap();
     let db = Database::open(&temp.path().join("weaver.db")).unwrap();
-    let held = db.sql_services.clone();
+    let held = db.services().clone();
     assert_eq!(held.checkpointer_ended(), Some(false));
 
     db.close().unwrap();
@@ -3126,7 +3126,7 @@ fn a_sync_write_returns_its_connection_without_another_job() {
     let db = Database::open(&temp.path().join("weaver.db")).unwrap();
     db.set_setting("returns", "1").unwrap();
 
-    let DatabaseServices::Sqlite(services) = &db.sql_services else {
+    let DatabaseServices::Sqlite(services) = db.services() else {
         unreachable!("a path opens SQLite");
     };
     let pool = services.pool();

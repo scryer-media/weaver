@@ -78,7 +78,7 @@ const LIFTED: &[(&str, usize)] = &[
         1,
     ),
     (
-        "server/crates/weaver-server-core/src/persistence/connection.rs",
+        "server/crates/weaver-server-db/src/persistence/connection.rs",
         1,
     ),
     (
@@ -86,11 +86,11 @@ const LIFTED: &[(&str, usize)] = &[
         8,
     ),
     (
-        "server/crates/weaver-server-core/src/persistence/sql_runtime.rs",
+        "server/crates/weaver-server-db/src/persistence/sql_runtime.rs",
         7,
     ),
     (
-        "server/crates/weaver-server-core/src/persistence/sql_services.rs",
+        "server/crates/weaver-server-db/src/persistence/sql_services.rs",
         1,
     ),
     (

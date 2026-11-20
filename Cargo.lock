@@ -6666,6 +6666,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "weaver-server-migrations"
+version = "0.16.17"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+ "zstd",
+]
+
+[[package]]
+name = "weaver-server-db"
+version = "0.16.17"
+dependencies = [
+ "aes-gcm",
+ "base64 0.23.1",
+ "chrono",
+ "getrandom 0.4.3",
+ "hmac 0.13.0",
+ "keyring",
+ "security-framework",
+ "security-framework-sys",
+ "serde_json",
+ "sha2 0.11.1",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "weaver-server-base",
+ "weaver-server-disk",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "weaver-server-disk"
 version = "0.16.17"
 dependencies = [
@@ -6759,7 +6796,9 @@ dependencies = [
  "weaver-nzb",
  "weaver-objects",
  "weaver-server-base",
+ "weaver-server-db",
  "weaver-server-disk",
+ "weaver-server-migrations",
  "weaver-torrent",
  "weaver-tunnel",
  "weaver-yenc",

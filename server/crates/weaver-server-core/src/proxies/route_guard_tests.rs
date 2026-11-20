@@ -176,7 +176,7 @@ const KNOWN_HOST_DNS: &[(&str, usize)] = &[
         1,
     ),
     (
-        "server/crates/weaver-server-core/src/persistence/sql_services.rs",
+        "server/crates/weaver-server-db/src/persistence/sql_services.rs",
         1,
     ),
     (

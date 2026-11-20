@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-pub(crate) fn is_known_migration_hook_id(hook_id: &str) -> bool {
+pub fn is_known_migration_hook_id(hook_id: &str) -> bool {
     matches!(
         hook_id,
         "adopt_legacy_schema_to_21"
@@ -26,7 +26,7 @@ pub(crate) fn is_known_migration_hook_id(hook_id: &str) -> bool {
     )
 }
 
-pub(crate) fn validate_migration_hook_id(hook_id: &str) -> Result<(), String> {
+pub fn validate_migration_hook_id(hook_id: &str) -> Result<(), String> {
     if is_known_migration_hook_id(hook_id) {
         Ok(())
     } else {

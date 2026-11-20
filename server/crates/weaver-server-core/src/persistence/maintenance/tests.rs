@@ -8,6 +8,8 @@ use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::torrents::persistence::TorrentsPersistenceInsertTorrentQueries;
 use crate::torrents::persistence::TorrentsPersistenceMarkTorrentRetiringInternalQueries;
 use crate::{ActiveJob, JobId};
+use std::path::PathBuf;
+use std::time::Duration;
 
 fn maintenance_snapshot(db: &Database) -> DbMaintenanceSnapshot {
     let datastore = db.datastore();

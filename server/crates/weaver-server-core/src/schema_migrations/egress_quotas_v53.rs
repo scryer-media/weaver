@@ -344,9 +344,11 @@ mod tests {
 
         // The schema 53 tables, then the step, with a fixed clock.
         let mut tx = pool.begin().await.unwrap();
-        for statement in include_str!("../db/migrations/0053_egress_interfaces/schema.sql")
-            .split(';')
-            .filter(|statement| !statement.trim().is_empty())
+        for statement in include_str!(
+            "../../../weaver-server-migrations/src/db/migrations/0053_egress_interfaces/schema.sql"
+        )
+        .split(';')
+        .filter(|statement| !statement.trim().is_empty())
         {
             sqlx::query(sqlx::AssertSqlSafe(statement))
                 .execute(&mut *tx)

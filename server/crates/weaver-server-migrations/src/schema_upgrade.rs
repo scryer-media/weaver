@@ -34,14 +34,14 @@ pub fn subscribe() -> watch::Receiver<SchemaUpgrade> {
 
 // One upgrade being published. Dropping it returns the state to idle, so an
 // upgrade that fails part way still ends.
-pub(crate) struct UpgradeProgress {
+pub struct UpgradeProgress {
     sender: &'static watch::Sender<SchemaUpgrade>,
     applied: usize,
     total: usize,
 }
 
 impl UpgradeProgress {
-    pub(crate) fn start(total: usize) -> Self {
+    pub fn start(total: usize) -> Self {
         Self::start_on(&PROGRESS, total)
     }
 
@@ -54,7 +54,7 @@ impl UpgradeProgress {
         }
     }
 
-    pub(crate) fn advance(&mut self) {
+    pub fn advance(&mut self) {
         self.applied = (self.applied + 1).min(self.total);
         self.sender.send_replace(SchemaUpgrade::Running {
             applied: self.applied,
@@ -71,12 +71,12 @@ impl Drop for UpgradeProgress {
 
 // The backup before an upgrade being published. Dropping it returns the state
 // to idle, whether the backup was written or failed.
-pub(crate) struct UpgradeBackup {
+pub struct UpgradeBackup {
     sender: &'static watch::Sender<SchemaUpgrade>,
 }
 
 impl UpgradeBackup {
-    pub(crate) fn start() -> Self {
+    pub fn start() -> Self {
         Self::start_on(&PROGRESS)
     }
 

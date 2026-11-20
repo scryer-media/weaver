@@ -28,7 +28,7 @@ async fn quota_metering_migration_preserves_existing_sqlite_usage() {
     .await
     .unwrap();
     sqlx::raw_sql(include_str!(
-        "../../db/migrations/0051_quota_metering/sqlite.sql"
+        "../../../../weaver-server-migrations/src/db/migrations/0051_quota_metering/sqlite.sql"
     ))
     .execute(&mut connection)
     .await

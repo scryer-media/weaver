@@ -32,13 +32,13 @@ const POSTGRES_TRANSIENT_RETRY_DELAYS: [Duration; 4] = [
     Duration::from_millis(150),
     Duration::from_millis(400),
 ];
-pub(crate) const SQLITE_BATCH_BIND_LIMIT: usize = 900;
-pub(crate) const POSTGRES_BATCH_BIND_LIMIT: usize = 16_000;
+pub const SQLITE_BATCH_BIND_LIMIT: usize = 900;
+pub const POSTGRES_BATCH_BIND_LIMIT: usize = 16_000;
 
-pub(crate) type SqlResult<T> = Result<T, StateError>;
+pub type SqlResult<T> = Result<T, StateError>;
 
 #[derive(Clone)]
-pub(crate) enum StoreDatastore {
+pub enum StoreDatastore {
     Sqlite {
         pool: SqlitePool,
         writer_gate: SqliteWriterGate,
@@ -52,7 +52,7 @@ impl StoreDatastore {
     // Statements that only read. On SQLite a write handed to it trips a debug
     // assertion: a write outside the writer gate meets the gated writer's
     // transaction in SQLite's busy handler and fails after `busy_timeout`.
-    pub(crate) fn read_exec(&self) -> SqlExec<'_, '_> {
+    pub fn read_exec(&self) -> SqlExec<'_, '_> {
         match self {
             Self::Sqlite { pool, .. } => SqlExec::Target(SqlTarget::Sqlite(pool)),
             Self::Postgres { pool } => SqlExec::Target(SqlTarget::Postgres(pool)),
@@ -63,7 +63,7 @@ impl StoreDatastore {
     // its turn on the writer gate, so it never races another write, and it
     // retries a transient busy as the gated transactions do. Postgres has no
     // gate and is unchanged.
-    pub(crate) fn write_exec(&self) -> SqlExec<'_, '_> {
+    pub fn write_exec(&self) -> SqlExec<'_, '_> {
         match self {
             Self::Sqlite { pool, writer_gate } => SqlExec::Target(SqlTarget::SqliteWrite {
                 pool,
@@ -73,7 +73,7 @@ impl StoreDatastore {
         }
     }
 
-    pub(crate) fn engine(&self) -> SqlEngine {
+    pub fn engine(&self) -> SqlEngine {
         match self {
             Self::Sqlite { .. } => SqlEngine::Sqlite,
             Self::Postgres { .. } => SqlEngine::Postgres,
@@ -82,13 +82,13 @@ impl StoreDatastore {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SqlEngine {
+pub enum SqlEngine {
     Sqlite,
     Postgres,
 }
 
 impl SqlEngine {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Sqlite => "sqlite",
             Self::Postgres => "postgres",
@@ -96,7 +96,7 @@ impl SqlEngine {
     }
 }
 
-pub(crate) enum SqlTarget<'a> {
+pub enum SqlTarget<'a> {
     Sqlite(&'a SqlitePool),
     SqliteWrite {
         pool: &'a SqlitePool,
@@ -105,16 +105,16 @@ pub(crate) enum SqlTarget<'a> {
     Postgres(&'a PgPool),
 }
 
-pub(crate) enum SqlExec<'tx, 'db> {
+pub enum SqlExec<'tx, 'db> {
     Target(SqlTarget<'db>),
     Tx(&'tx mut SqlTx<'db>),
 }
 
-pub(crate) type TxFuture<'a, T> = Pin<Box<dyn Future<Output = SqlResult<T>> + Send + 'a>>;
+pub type TxFuture<'a, T> = Pin<Box<dyn Future<Output = SqlResult<T>> + Send + 'a>>;
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
-pub(crate) enum SqlArg {
+pub enum SqlArg {
     Text(String),
     OptText(Option<String>),
     I32(i32),
@@ -139,12 +139,12 @@ enum PlaceholderDialect {
     Postgres,
 }
 
-pub(crate) enum SqlRow {
+pub enum SqlRow {
     Sqlite(SqliteRow),
     Postgres(PgRow),
 }
 
-pub(crate) enum SqlTx<'db> {
+pub enum SqlTx<'db> {
     Sqlite(Transaction<'db, Sqlite>),
     Postgres(Transaction<'db, Postgres>),
 }
@@ -152,12 +152,12 @@ pub(crate) enum SqlTx<'db> {
 // One borrowed connection of either engine, for code that runs inside a
 // transaction it does not own: a migration step, or the reconciliation at
 // the end of a restore.
-pub(crate) enum SqlConn<'c> {
+pub enum SqlConn<'c> {
     Sqlite(&'c mut sqlx::SqliteConnection),
     Postgres(&'c mut sqlx::PgConnection),
 }
 
-pub(crate) fn max_rows_for_engine(engine: SqlEngine, binds_per_row: usize) -> usize {
+pub fn max_rows_for_engine(engine: SqlEngine, binds_per_row: usize) -> usize {
     let bind_limit = match engine {
         SqlEngine::Sqlite => SQLITE_BATCH_BIND_LIMIT,
         SqlEngine::Postgres => POSTGRES_BATCH_BIND_LIMIT,
@@ -165,7 +165,7 @@ pub(crate) fn max_rows_for_engine(engine: SqlEngine, binds_per_row: usize) -> us
     (bind_limit / binds_per_row.max(1)).max(1)
 }
 
-pub(crate) fn max_rows_for_tx(tx: &SqlTx<'_>, binds_per_row: usize) -> usize {
+pub fn max_rows_for_tx(tx: &SqlTx<'_>, binds_per_row: usize) -> usize {
     let engine = match tx {
         SqlTx::Sqlite(_) => SqlEngine::Sqlite,
         SqlTx::Postgres(_) => SqlEngine::Postgres,
@@ -173,10 +173,10 @@ pub(crate) fn max_rows_for_tx(tx: &SqlTx<'_>, binds_per_row: usize) -> usize {
     max_rows_for_engine(engine, binds_per_row)
 }
 
-pub(crate) struct SqlRuntime;
+pub struct SqlRuntime;
 
 impl SqlRuntime {
-    pub(crate) async fn run_serialized_sqlite<T, Op, Fut>(
+    pub async fn run_serialized_sqlite<T, Op, Fut>(
         datastore: &StoreDatastore,
         op_name: &'static str,
         mut op: Op,
@@ -207,7 +207,7 @@ impl SqlRuntime {
         clippy::disallowed_methods,
         reason = "writer gate: this is the gate; it hands the connection out under the gate"
     )]
-    pub(crate) async fn run_serialized_sqlite_connection<T, Op, Fut>(
+    pub async fn run_serialized_sqlite_connection<T, Op, Fut>(
         datastore: &StoreDatastore,
         op_name: &'static str,
         op: Op,
@@ -238,11 +238,7 @@ impl SqlRuntime {
         clippy::disallowed_methods,
         reason = "writer gate: this is the gate, its read lane and the Postgres arm, which has no writer gate"
     )]
-    pub(crate) async fn execute(
-        exec: SqlExec<'_, '_>,
-        template: &str,
-        args: &[SqlArg],
-    ) -> SqlResult<u64> {
+    pub async fn execute(exec: SqlExec<'_, '_>, template: &str, args: &[SqlArg]) -> SqlResult<u64> {
         match exec {
             SqlExec::Target(SqlTarget::Sqlite(pool)) => {
                 debug_assert_reads(template);
@@ -306,7 +302,7 @@ impl SqlRuntime {
     // `false`): a bare write's commit outcome is unknown on a dropped
     // connection, so only guaranteed-rolled-back failures are retried, never
     // connection errors — retrying those would duplicate the inserted row.
-    pub(crate) async fn execute_returning(
+    pub async fn execute_returning(
         exec: SqlExec<'_, '_>,
         template: &str,
         args: &[SqlArg],
@@ -378,7 +374,7 @@ impl SqlRuntime {
         }
     }
 
-    pub(crate) async fn fetch_optional(
+    pub async fn fetch_optional(
         exec: SqlExec<'_, '_>,
         template: &str,
         args: &[SqlArg],
@@ -447,7 +443,7 @@ impl SqlRuntime {
         }
     }
 
-    pub(crate) async fn fetch_all(
+    pub async fn fetch_all(
         exec: SqlExec<'_, '_>,
         template: &str,
         args: &[SqlArg],
@@ -520,7 +516,7 @@ impl SqlRuntime {
         clippy::disallowed_methods,
         reason = "writer gate: this is the gate; the transaction begins and commits under it, Postgres has no writer gate"
     )]
-    pub(crate) async fn run_in_transaction<T, F>(
+    pub async fn run_in_transaction<T, F>(
         datastore: &StoreDatastore,
         op_name: &'static str,
         op: F,
@@ -603,7 +599,7 @@ impl SqlRuntime {
         clippy::disallowed_methods,
         reason = "writer gate: a read-only snapshot transaction, outside the gate by design"
     )]
-    pub(crate) async fn run_read_transaction<T, F>(
+    pub async fn run_read_transaction<T, F>(
         datastore: &StoreDatastore,
         op_name: &'static str,
         op: F,
@@ -651,7 +647,7 @@ impl SqlRuntime {
 impl<'db> SqlTx<'db> {
     // This transaction's connection, for code that also runs inside a
     // transaction it does not own.
-    pub(crate) fn conn(&mut self) -> SqlConn<'_> {
+    pub fn conn(&mut self) -> SqlConn<'_> {
         match self {
             SqlTx::Sqlite(tx) => SqlConn::Sqlite(tx),
             SqlTx::Postgres(tx) => SqlConn::Postgres(tx),
@@ -662,7 +658,7 @@ impl<'db> SqlTx<'db> {
         clippy::disallowed_methods,
         reason = "writer gate: runs on a transaction run_in_transaction opened under the gate; Postgres has no writer gate"
     )]
-    pub(crate) async fn execute(&mut self, template: &str, args: &[SqlArg]) -> SqlResult<u64> {
+    pub async fn execute(&mut self, template: &str, args: &[SqlArg]) -> SqlResult<u64> {
         match self {
             SqlTx::Sqlite(tx) => {
                 let started = Instant::now();
@@ -695,7 +691,7 @@ impl<'db> SqlTx<'db> {
         }
     }
 
-    pub(crate) async fn fetch_optional(
+    pub async fn fetch_optional(
         &mut self,
         template: &str,
         args: &[SqlArg],
@@ -738,11 +734,7 @@ impl<'db> SqlTx<'db> {
         }
     }
 
-    pub(crate) async fn fetch_all(
-        &mut self,
-        template: &str,
-        args: &[SqlArg],
-    ) -> SqlResult<Vec<SqlRow>> {
+    pub async fn fetch_all(&mut self, template: &str, args: &[SqlArg]) -> SqlResult<Vec<SqlRow>> {
         match self {
             SqlTx::Sqlite(tx) => {
                 let started = Instant::now();
@@ -785,14 +777,14 @@ impl<'db> SqlTx<'db> {
         clippy::disallowed_methods,
         reason = "writer gate: runs on a transaction run_in_transaction opened under the gate; Postgres has no writer gate"
     )]
-    pub(crate) async fn commit(self) -> SqlResult<()> {
+    pub async fn commit(self) -> SqlResult<()> {
         match self {
             SqlTx::Sqlite(tx) => tx.commit().await.map_err(sqlite_write_err),
             SqlTx::Postgres(tx) => tx.commit().await.map_err(pg_db_err),
         }
     }
 
-    pub(crate) async fn rollback(self) -> SqlResult<()> {
+    pub async fn rollback(self) -> SqlResult<()> {
         match self {
             SqlTx::Sqlite(tx) => tx.rollback().await.map_err(db_err),
             SqlTx::Postgres(tx) => tx.rollback().await.map_err(pg_db_err),
@@ -805,7 +797,7 @@ impl SqlConn<'_> {
         clippy::disallowed_methods,
         reason = "writer gate: runs on a connection whose owner holds the gate, or a migration's; Postgres has no writer gate"
     )]
-    pub(crate) async fn execute(&mut self, template: &str, args: &[SqlArg]) -> SqlResult<u64> {
+    pub async fn execute(&mut self, template: &str, args: &[SqlArg]) -> SqlResult<u64> {
         match self {
             SqlConn::Sqlite(conn) => {
                 let sql = render_sql(template, PlaceholderDialect::Sqlite, args.len())?;
@@ -826,11 +818,7 @@ impl SqlConn<'_> {
         }
     }
 
-    pub(crate) async fn fetch_all(
-        &mut self,
-        template: &str,
-        args: &[SqlArg],
-    ) -> SqlResult<Vec<SqlRow>> {
+    pub async fn fetch_all(&mut self, template: &str, args: &[SqlArg]) -> SqlResult<Vec<SqlRow>> {
         match self {
             SqlConn::Sqlite(conn) => {
                 let sql = render_sql(template, PlaceholderDialect::Sqlite, args.len())?;
@@ -854,77 +842,77 @@ impl SqlConn<'_> {
 
 #[allow(dead_code)]
 impl SqlRow {
-    pub(crate) fn text(&self, column: &str) -> SqlResult<String> {
+    pub fn text(&self, column: &str) -> SqlResult<String> {
         match self {
             SqlRow::Sqlite(row) => row.try_get(column).map_err(db_err),
             SqlRow::Postgres(row) => row.try_get(column).map_err(db_err),
         }
     }
 
-    pub(crate) fn opt_text(&self, column: &str) -> SqlResult<Option<String>> {
+    pub fn opt_text(&self, column: &str) -> SqlResult<Option<String>> {
         match self {
             SqlRow::Sqlite(row) => opt_text_from_sqlite_row(row, column),
             SqlRow::Postgres(row) => opt_text_from_pg_row(row, column),
         }
     }
 
-    pub(crate) fn i64(&self, column: &str) -> SqlResult<i64> {
+    pub fn i64(&self, column: &str) -> SqlResult<i64> {
         match self {
             SqlRow::Sqlite(row) => row.try_get(column).map_err(db_err),
             SqlRow::Postgres(row) => i64_from_pg_row(row, column),
         }
     }
 
-    pub(crate) fn i64_at(&self, column: usize) -> SqlResult<i64> {
+    pub fn i64_at(&self, column: usize) -> SqlResult<i64> {
         match self {
             SqlRow::Sqlite(row) => row.try_get(column).map_err(db_err),
             SqlRow::Postgres(row) => row.try_get(column).map_err(db_err),
         }
     }
 
-    pub(crate) fn i32(&self, column: &str) -> SqlResult<i32> {
+    pub fn i32(&self, column: &str) -> SqlResult<i32> {
         match self {
             SqlRow::Sqlite(row) => i32_from_sqlite_row(row, column),
             SqlRow::Postgres(row) => i32_from_pg_row(row, column),
         }
     }
 
-    pub(crate) fn opt_i64(&self, column: &str) -> SqlResult<Option<i64>> {
+    pub fn opt_i64(&self, column: &str) -> SqlResult<Option<i64>> {
         match self {
             SqlRow::Sqlite(row) => opt_i64_from_sqlite_row(row, column),
             SqlRow::Postgres(row) => opt_i64_from_pg_row(row, column),
         }
     }
 
-    pub(crate) fn opt_i32(&self, column: &str) -> SqlResult<Option<i32>> {
+    pub fn opt_i32(&self, column: &str) -> SqlResult<Option<i32>> {
         match self {
             SqlRow::Sqlite(row) => opt_i32_from_sqlite_row(row, column),
             SqlRow::Postgres(row) => opt_i32_from_pg_row(row, column),
         }
     }
 
-    pub(crate) fn opt_f64(&self, column: &str) -> SqlResult<Option<f64>> {
+    pub fn opt_f64(&self, column: &str) -> SqlResult<Option<f64>> {
         match self {
             SqlRow::Sqlite(row) => row.try_get(column).map_err(db_err),
             SqlRow::Postgres(row) => row.try_get(column).map_err(db_err),
         }
     }
 
-    pub(crate) fn bool(&self, column: &str) -> SqlResult<bool> {
+    pub fn bool(&self, column: &str) -> SqlResult<bool> {
         match self {
             SqlRow::Sqlite(row) => bool_from_sqlite_row(row, column),
             SqlRow::Postgres(row) => bool_from_pg_row(row, column),
         }
     }
 
-    pub(crate) fn opt_bool(&self, column: &str) -> SqlResult<Option<bool>> {
+    pub fn opt_bool(&self, column: &str) -> SqlResult<Option<bool>> {
         match self {
             SqlRow::Sqlite(row) => opt_bool_from_sqlite_row(row, column),
             SqlRow::Postgres(row) => opt_bool_from_pg_row(row, column),
         }
     }
 
-    pub(crate) fn timestamp(&self, column: &str) -> SqlResult<DateTime<Utc>> {
+    pub fn timestamp(&self, column: &str) -> SqlResult<DateTime<Utc>> {
         match self {
             SqlRow::Sqlite(row) => {
                 let raw: String = row.try_get(column).map_err(db_err)?;
@@ -934,7 +922,7 @@ impl SqlRow {
         }
     }
 
-    pub(crate) fn opt_timestamp(&self, column: &str) -> SqlResult<Option<DateTime<Utc>>> {
+    pub fn opt_timestamp(&self, column: &str) -> SqlResult<Option<DateTime<Utc>>> {
         match self {
             SqlRow::Sqlite(row) => {
                 let raw: Option<String> = row.try_get(column).map_err(db_err)?;
@@ -947,7 +935,7 @@ impl SqlRow {
         }
     }
 
-    pub(crate) fn opt_json(&self, column: &str) -> SqlResult<Option<JsonValue>> {
+    pub fn opt_json(&self, column: &str) -> SqlResult<Option<JsonValue>> {
         match self {
             SqlRow::Sqlite(row) => {
                 let raw: Option<String> = row.try_get(column).map_err(db_err)?;
@@ -970,14 +958,14 @@ impl SqlRow {
         }
     }
 
-    pub(crate) fn opt_bytes(&self, column: &str) -> SqlResult<Option<Vec<u8>>> {
+    pub fn opt_bytes(&self, column: &str) -> SqlResult<Option<Vec<u8>>> {
         match self {
             SqlRow::Sqlite(row) => row.try_get(column).map_err(db_err),
             SqlRow::Postgres(row) => row.try_get(column).map_err(db_err),
         }
     }
 
-    pub(crate) fn bytes(&self, column: &str) -> SqlResult<Vec<u8>> {
+    pub fn bytes(&self, column: &str) -> SqlResult<Vec<u8>> {
         match self {
             SqlRow::Sqlite(row) => row.try_get(column).map_err(db_err),
             SqlRow::Postgres(row) => row.try_get(column).map_err(db_err),
@@ -1175,7 +1163,7 @@ fn opt_bool_from_pg_row(row: &PgRow, column: &str) -> SqlResult<Option<bool>> {
 // SQLITE_IOERR_SHORT_READ) must surface immediately, not retry for 120s.
 const SQLITE_BUSY_TRANSIENT_CODES: [u32; 6] = [5, 261, 517, 773, 6, 262];
 
-pub(crate) fn is_transient_sqlite_busy(error: &StateError) -> bool {
+pub fn is_transient_sqlite_busy(error: &StateError) -> bool {
     let StateError::Database(message) = error else {
         return false;
     };
@@ -1216,7 +1204,7 @@ fn contains_sqlite_code(haystack: &str, marker: &str, codes: &[u32]) -> bool {
 // Postgres errors that are always safe to retry because the failed transaction
 // is guaranteed to have rolled back: serialization failures (SQLSTATE 40001)
 // and deadlocks (40P01). The code is preserved by [`pg_db_err`].
-pub(crate) fn is_postgres_rolled_back_transient(error: &StateError) -> bool {
+pub fn is_postgres_rolled_back_transient(error: &StateError) -> bool {
     let StateError::Database(message) = error else {
         return false;
     };
@@ -1231,7 +1219,7 @@ pub(crate) fn is_postgres_rolled_back_transient(error: &StateError) -> bool {
 // Retrying is safe for reads and for whole transactions (a lost connection
 // aborts an open transaction) but NOT for a bare autocommit write, whose
 // commit outcome is unknown.
-pub(crate) fn is_postgres_connection_error(error: &StateError) -> bool {
+pub fn is_postgres_connection_error(error: &StateError) -> bool {
     let StateError::Database(message) = error else {
         return false;
     };
@@ -1251,7 +1239,7 @@ pub(crate) fn is_postgres_connection_error(error: &StateError) -> bool {
 
 // A write refused by a unique constraint or index: SQLSTATE 23505 on
 // Postgres, `UNIQUE constraint failed` on SQLite.
-pub(crate) fn is_unique_violation(error: &StateError) -> bool {
+pub fn is_unique_violation(error: &StateError) -> bool {
     let StateError::Database(message) = error else {
         return false;
     };
@@ -1263,7 +1251,7 @@ pub(crate) fn is_unique_violation(error: &StateError) -> bool {
 
 // A write refused by a foreign key: SQLSTATE 23503 on Postgres,
 // `FOREIGN KEY constraint failed` on SQLite.
-pub(crate) fn is_foreign_key_violation(error: &StateError) -> bool {
+pub fn is_foreign_key_violation(error: &StateError) -> bool {
     let StateError::Database(message) = error else {
         return false;
     };
@@ -1422,7 +1410,7 @@ where
 // Whether a statement writes: it changes rows, the schema or the file, so it
 // takes SQLite's write lock. A `WITH` writes when its body does, a `PRAGMA`
 // when it sets a value or vacuums.
-pub(crate) fn sql_writes(template: &str) -> bool {
+pub fn sql_writes(template: &str) -> bool {
     let mut rest = template.trim_start();
     while let Some(comment) = rest.strip_prefix("--") {
         rest = comment
@@ -1454,7 +1442,7 @@ fn debug_assert_reads(template: &str) {
     );
 }
 
-pub(crate) async fn run_with_sqlite_busy_retries<T, Op, Fut>(
+pub async fn run_with_sqlite_busy_retries<T, Op, Fut>(
     operation_name: &str,
     mut operation: Op,
 ) -> SqlResult<T>
@@ -1470,7 +1458,7 @@ where
     .await
 }
 
-pub(crate) async fn run_with_sqlite_busy_retries_with_deadline<T, Op, Fut>(
+pub async fn run_with_sqlite_busy_retries_with_deadline<T, Op, Fut>(
     operation_name: &str,
     hard_cap: Duration,
     operation: &mut Op,
@@ -1527,7 +1515,7 @@ fn parse_utc_datetime(raw: &str) -> SqlResult<DateTime<Utc>> {
         .map_err(db_err)
 }
 
-pub(crate) fn db_err(error: impl std::fmt::Display) -> StateError {
+pub fn db_err(error: impl std::fmt::Display) -> StateError {
     StateError::Database(error.to_string())
 }
 
@@ -1564,13 +1552,13 @@ const PG_DISK_FULL: &str = "53100";
 
 // A SQLite write's error, kept apart when the database's disk had no room
 // for it: by SQLite's own code, or by the kind of the I/O error under it.
-pub(crate) fn sqlite_write_err(error: sqlx::Error) -> StateError {
+pub fn sqlite_write_err(error: sqlx::Error) -> StateError {
     let full = match &error {
         sqlx::Error::Database(database) => database
             .code()
             .and_then(|code| code.parse::<u32>().ok())
             .is_some_and(sqlite_code_out_of_space),
-        sqlx::Error::Io(io) => crate::operations::is_out_of_space(io),
+        sqlx::Error::Io(io) => weaver_server_disk::operations::is_out_of_space(io),
         _ => false,
     };
     if full {
@@ -1583,7 +1571,7 @@ pub(crate) fn sqlite_write_err(error: sqlx::Error) -> StateError {
 // Map a Postgres `sqlx::Error` to `StateError`, prefixing the SQLSTATE code as
 // `sqlstate=<code>;` so the transient-retry classifiers can recognize
 // serialization/deadlock/connection failures after the error is stringified.
-pub(crate) fn pg_db_err(error: sqlx::Error) -> StateError {
+pub fn pg_db_err(error: sqlx::Error) -> StateError {
     if let Some(code) = error
         .as_database_error()
         .and_then(|db| db.code())

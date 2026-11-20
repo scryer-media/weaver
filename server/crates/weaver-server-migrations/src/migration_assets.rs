@@ -162,10 +162,7 @@ impl CompiledMigrationCatalog {
             .unwrap_or(self.starting_version - 1)
     }
 
-    pub(crate) fn pending_keys(
-        &self,
-        applied_versions: impl IntoIterator<Item = i64>,
-    ) -> Vec<String> {
+    pub fn pending_keys(&self, applied_versions: impl IntoIterator<Item = i64>) -> Vec<String> {
         let applied_versions: HashSet<_> = applied_versions.into_iter().collect();
         self.migrations
             .iter()
@@ -224,11 +221,7 @@ impl CompiledMigration {
     // this migration used to produce before the checksum was made independent
     // of line endings. Callers that accept one must rewrite the ledger to
     // `self.checksum`.
-    pub(crate) fn is_legacy_line_ending_checksum(
-        &self,
-        checksum_algo: &str,
-        checksum: &[u8],
-    ) -> bool {
+    pub fn is_legacy_line_ending_checksum(&self, checksum_algo: &str, checksum: &[u8]) -> bool {
         checksum_algo == self.checksum_algo.as_str()
             && self
                 .legacy_line_ending_checksums
@@ -667,7 +660,7 @@ const SUPERSEDED_MIGRATION_LEDGER_CHECKSUMS: &[(i64, ChecksumAlgorithm, &str)] =
 // whitelisted historical ledger checksum for migration `version` whose payload
 // was superseded in place. Used by the runners to avoid bricking installs that
 // already applied the pre-edit payload.
-pub(crate) fn is_superseded_migration_checksum(
+pub fn is_superseded_migration_checksum(
     version: i64,
     checksum_algo: &str,
     checksum: &[u8],

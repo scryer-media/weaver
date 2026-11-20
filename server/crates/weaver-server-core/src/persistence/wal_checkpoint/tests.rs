@@ -9,8 +9,8 @@ use crate::persistence::sql_runtime::{SqlRuntime, StoreDatastore};
 use crate::persistence::sql_services::{
     SqliteServices, sqlite_connect_options, sqlite_url_with_create,
 };
-use crate::persistence::wal_checkpoint::{WRITE_WAIT_THRESHOLDS, WalSignal};
 use crate::schema_migrations::MigrationMode;
+use weaver_server_db::persistence::wal_checkpoint::{WRITE_WAIT_THRESHOLDS, WalSignal};
 
 // Small enough that a few commits cross it; each insert below is about 17
 // frames at 4 KiB pages.

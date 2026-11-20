@@ -22,7 +22,7 @@ reedsolomon-rs = { version = "0.4.11", default-features = false }
 serde = { workspace = true }
 crc-turbo = { workspace = true }
 thiserror = { workspace = true }
-http = { workspace = true }
+http = { workspace = true, features = ["std"] }
 tokio = { workspace = true }
 rayon = { workspace = true, default-features = false }
 libc = { workspace = true }

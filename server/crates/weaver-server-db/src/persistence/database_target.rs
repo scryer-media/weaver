@@ -8,17 +8,17 @@ use std::path::{Path, PathBuf};
 
 use crate::persistence::StateError;
 
-pub(crate) const DATABASE_URL_ENV: &str = "WEAVER_DATABASE_URL";
+pub const DATABASE_URL_ENV: &str = "WEAVER_DATABASE_URL";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum DatabaseTarget {
+pub enum DatabaseTarget {
     SqlitePath(PathBuf),
     SqliteUrl(String),
     PostgresUrl(String),
 }
 
 impl DatabaseTarget {
-    pub(crate) fn sqlite_path(&self) -> Result<Option<PathBuf>, StateError> {
+    pub fn sqlite_path(&self) -> Result<Option<PathBuf>, StateError> {
         match self {
             Self::SqlitePath(path) => Ok(Some(path.clone())),
             Self::SqliteUrl(url) => {
@@ -31,12 +31,12 @@ impl DatabaseTarget {
         }
     }
 
-    pub(crate) fn from_config_path(config_path: &Path) -> Self {
-        let (db_path, _) = super::setup::resolve_database_paths(config_path);
+    pub fn from_config_path(config_path: &Path) -> Self {
+        let (db_path, _) = resolve_database_paths(config_path);
         Self::SqlitePath(db_path)
     }
 
-    pub(crate) fn resolve(config_path: &Path) -> Result<Self, StateError> {
+    pub fn resolve(config_path: &Path) -> Result<Self, StateError> {
         match env::var(DATABASE_URL_ENV) {
             Ok(raw) => Self::from_database_url(raw, config_path),
             Err(env::VarError::NotPresent) => Ok(Self::from_config_path(config_path)),
@@ -46,7 +46,7 @@ impl DatabaseTarget {
         }
     }
 
-    pub(crate) fn from_database_url(
+    pub fn from_database_url(
         raw: impl Into<String>,
         config_path: &Path,
     ) -> Result<Self, StateError> {
@@ -66,6 +66,29 @@ impl DatabaseTarget {
         Err(StateError::Database(format!(
             "unsupported {DATABASE_URL_ENV} scheme; expected postgres://, postgresql://, or sqlite:"
         )))
+    }
+}
+
+pub fn is_explicit_config_file(config_path: &Path) -> bool {
+    config_path
+        .extension()
+        .is_some_and(|extension| extension == "toml")
+        || config_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".toml.migrated"))
+        || config_path.is_file()
+}
+
+pub fn resolve_database_paths(config_path: &Path) -> (PathBuf, Option<PathBuf>) {
+    if is_explicit_config_file(config_path) {
+        let dir = config_path.parent().unwrap_or(Path::new("."));
+        (dir.join("weaver.db"), Some(config_path.to_path_buf()))
+    } else {
+        let dir = config_path;
+        let toml_candidate = dir.join("weaver.toml");
+        let toml_path = toml_candidate.exists().then_some(toml_candidate);
+        (dir.join("weaver.db"), toml_path)
     }
 }
 

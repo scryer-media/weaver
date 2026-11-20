@@ -17,6 +17,7 @@ test-support = [
     "weaver-nntp/test-support",
     "weaver-server-base/test-support",
     "weaver-server-disk/test-support",
+    "weaver-server-db/test-support",
 ]
 # e2e builds only; see weaver-torrent's feature of the same name.
 e2e-local-trackers = ["weaver-torrent/e2e-local-trackers"]
@@ -24,6 +25,8 @@ e2e-local-trackers = ["weaver-torrent/e2e-local-trackers"]
 [dependencies]
 weaver-server-base = { path = "../weaver-server-base" }
 weaver-server-disk = { path = "../weaver-server-disk" }
+weaver-server-db = { path = "../weaver-server-db" }
+weaver-server-migrations = { path = "../weaver-server-migrations" }
 weaver-tunnel = { path = "../../../engines/weaver-tunnel" }
 async-trait = "0.1"
 # The in-application upgrade core: manifest validation, installation
@@ -127,6 +130,7 @@ windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Securit
 [dev-dependencies]
 weaver-server-base = { path = "../weaver-server-base", features = ["test-support"] }
 weaver-server-disk = { path = "../weaver-server-disk", features = ["test-support"] }
+weaver-server-db = { path = "../weaver-server-db", features = ["test-support"] }
 weaver-nntp = { path = "../../../engines/weaver-nntp", default-features = false, features = ["test-support"] }
 weaver-graph = { path = "../../../engines/weaver-graph", features = ["test-support"] }
 weaver-objects = { path = "../../../engines/weaver-objects", features = ["test-support"] }
@@ -158,10 +162,3 @@ rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "
 [[bench]]
 name = "infrastructure_retry"
 harness = false
-
-[build-dependencies]
-blake3 = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-toml = { workspace = true }
-zstd = { workspace = true }
