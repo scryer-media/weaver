@@ -45,6 +45,7 @@ fn enable_schedule_trace() {
     let _ = tracing::subscriber::set_global_default(Trace(std::sync::atomic::AtomicU64::new(0)));
 }
 
+#[cfg(feature = "archive-matrix")]
 pub mod extended;
 pub mod graph;
 pub mod grouping;
@@ -169,6 +170,10 @@ pub(super) enum Interruption {
     // Two boundary actions in one run, the first never after the second.
     // At a shared boundary both happen before that boundary's arrival, in
     // order. An empty mask loses nothing and posts no recovery set.
+    #[cfg_attr(
+        not(feature = "archive-matrix"),
+        expect(dead_code, reason = "only the extended depth campaigns build one")
+    )]
     Twice {
         mask: u8,
         index_first: bool,
@@ -1134,6 +1139,7 @@ fn slot_fixture(format: Format, slots: usize) -> SlotFixture {
 }
 
 // The members of every two-set fixture, one a set, and their payloads.
+#[cfg(feature = "archive-matrix")]
 pub(super) fn two_set_members() -> ([&'static str; 2], Vec<Vec<u8>>) {
     let payloads = [(6001, 7), (4093, 11)]
         .into_iter()
@@ -1148,6 +1154,7 @@ pub(super) fn two_set_members() -> ([&'static str; 2], Vec<Vec<u8>>) {
 
 // Two single-volume stored sets in one job, two articles each: the first
 // set in slots 0 and 1, the second in slots 2 and 3.
+#[cfg(feature = "archive-matrix")]
 pub(super) fn two_set_fixture() -> TwoSetFixture {
     let (members, payloads) = two_set_members();
     let volumes: Vec<_> = ["alpha", "beta"]
@@ -1175,6 +1182,7 @@ pub enum HexTwoSets {
 impl HexTwoSets {
     // Posted order: the first set's volumes in slots 0 and 2, the second's
     // in slots 1 and 3.
+    #[cfg(feature = "archive-matrix")]
     const NAMES: [&'static str; 4] = [
         "d3b07384d113edec49eaa6238ad5ff00",
         "0f2c6e9a4b8d1e3f5a7c9b0d2e4f6a81",
@@ -1185,6 +1193,7 @@ impl HexTwoSets {
 
 // The members, their payloads, the posted volumes and the job of a two-set
 // fixture.
+#[cfg(feature = "archive-matrix")]
 pub(super) type TwoSetFixture = (
     [&'static str; 2],
     Vec<Vec<u8>>,
@@ -1192,6 +1201,7 @@ pub(super) type TwoSetFixture = (
     JobSpec,
 );
 
+#[cfg(feature = "archive-matrix")]
 pub(super) fn hex_two_set_fixture(format: HexTwoSets) -> TwoSetFixture {
     let (members, payloads) = two_set_members();
     let sets: Vec<Vec<Vec<u8>>> = members

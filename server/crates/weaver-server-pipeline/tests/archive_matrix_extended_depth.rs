@@ -5,10 +5,6 @@
 #[path = "archive_matrix/depth_shards.rs"]
 mod depth_shards;
 
-#[macro_use]
-#[path = "archive_matrix/grouping_listing.rs"]
-mod grouping_listing;
-
 mod pipeline {
     mod tests {
         mod direct_store {
@@ -18,9 +14,6 @@ mod pipeline {
                         mod graph {
                             mod depth;
                         }
-                    }
-                    mod graph {
-                        mod grouping;
                     }
                 }
             }

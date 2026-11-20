@@ -16,6 +16,7 @@ use crate::pipeline::graph::engine::{Heard, Said};
 use crate::pipeline::tests::engines::harness::{JOB, finished};
 
 pub mod grouping;
+#[cfg(feature = "archive-matrix")]
 pub mod two_sets;
 
 // What a schedule came to under the graph.

@@ -85,8 +85,12 @@ jobs:
       - name: Archive compiled extended archive campaign tests
         run: >-
           cargo nextest archive --locked --cargo-profile matrix -p weaver-server-pipeline
-          --test archive_matrix_remaining --test archive_matrix_damage --test archive_matrix_formats
-          --test archive_matrix_par2_realism --test archive_matrix_grouping_depth --test pipeline_direct_store
+          --features archive-matrix
+          --test archive_matrix_graph --test archive_matrix_combined --test archive_matrix_grouping
+          --test archive_matrix_sevenz --test archive_matrix_par2 --test archive_matrix_par2_completion
+          --test archive_matrix_par2_store --test archive_matrix_extended --test archive_matrix_extended_depth
+          --test archive_matrix_extended_damage --test archive_matrix_extended_formats
+          --test archive_matrix_extended_par2_realism
           --archive-file target/archive-matrix-extended.tar.zst
       - name: Upload compiled extended archive campaign tests
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -101,6 +105,29 @@ jobs:
           if command -v sccache >/dev/null 2>&1; then
             sccache --show-stats
           fi
+
+  # The matrix targets and their harness compile only with the
+  # `archive-matrix` feature, which no other build turns on; lint them here.
+  archive-matrix-clippy:
+    name: archive-matrix-clippy-linux-x86_64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          cache-bin: false
+          save-if: false
+      - name: Clippy the archive matrix targets
+        run: cargo clippy --locked -p weaver-server-pipeline --features archive-matrix --tests -- -D warnings
 
   archive-matrix-extended:
     name: archive-matrix-extended-linux-x86_64-${{ matrix.partition }}

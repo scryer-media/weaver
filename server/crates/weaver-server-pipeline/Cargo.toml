@@ -9,6 +9,10 @@ repository.workspace = true
 [features]
 pipeline-test-fixtures = ["test-support", "weaver-server-composition/pipeline-test-fixtures", "weaver-graph/test-support", "weaver-objects/test-support", "sevenz-turbo/compress", "lzma-turbo/enc"]
 slow-tests = []
+# The archive matrix and the extended campaigns: their test targets below and
+# the schedule harness only they use. Off unless a matrix run asks for it, so
+# no ordinary build or test run compiles a line of either.
+archive-matrix = ["pipeline-test-fixtures"]
 # Hooks that let other crates' tests move stored state directly instead of
 # waiting on the wall clock. Never enabled outside dev-dependencies. The
 # tunnel's loopback certificate backs the speed test's HTTPS fixture, and
@@ -112,6 +116,81 @@ lzma-turbo = { workspace = true }
 getrandom = { workspace = true, default-features = false }
 hex = { workspace = true }
 pbkdf2 = { workspace = true }
+
+# Archive matrix and extended campaign targets: built only with the
+# `archive-matrix` feature, one per family so a re-run builds only its own tests.
+
+# The archive matrix: graph arrival schedules and two-set smokes.
+[[test]]
+name = "archive_matrix_graph"
+path = "tests/archive_matrix_graph.rs"
+required-features = ["archive-matrix"]
+
+# The archive matrix: combined graph, two-set and 7z campaigns.
+[[test]]
+name = "archive_matrix_combined"
+path = "tests/archive_matrix_combined.rs"
+required-features = ["archive-matrix"]
+
+# The archive matrix: grouping cross.
+[[test]]
+name = "archive_matrix_grouping"
+path = "tests/archive_matrix_grouping.rs"
+required-features = ["archive-matrix"]
+
+# The archive matrix: 7z store schedules.
+[[test]]
+name = "archive_matrix_sevenz"
+path = "tests/archive_matrix_sevenz.rs"
+required-features = ["archive-matrix"]
+
+# The archive matrix: PAR2 repair schedules.
+[[test]]
+name = "archive_matrix_par2"
+path = "tests/archive_matrix_par2.rs"
+required-features = ["archive-matrix"]
+
+# The archive matrix: PAR2 completion schedules.
+[[test]]
+name = "archive_matrix_par2_completion"
+path = "tests/archive_matrix_par2_completion.rs"
+required-features = ["archive-matrix"]
+
+# The archive matrix: direct-store PAR2 schedules.
+[[test]]
+name = "archive_matrix_par2_store"
+path = "tests/archive_matrix_par2_store.rs"
+required-features = ["archive-matrix"]
+
+# The extended campaigns: depth, graph formats and repair, tier-2 smokes.
+[[test]]
+name = "archive_matrix_extended"
+path = "tests/archive_matrix_extended.rs"
+required-features = ["archive-matrix"]
+
+# The extended campaigns: graph depth shards.
+[[test]]
+name = "archive_matrix_extended_depth"
+path = "tests/archive_matrix_extended_depth.rs"
+required-features = ["archive-matrix"]
+
+# The extended campaigns: tier-2 combined damage shards.
+[[test]]
+name = "archive_matrix_extended_damage"
+path = "tests/archive_matrix_extended_damage.rs"
+required-features = ["archive-matrix"]
+
+# The extended campaigns: tier-2 breadth, headers, par3 and uu shards.
+[[test]]
+name = "archive_matrix_extended_formats"
+path = "tests/archive_matrix_extended_formats.rs"
+required-features = ["archive-matrix"]
+
+# The extended campaigns: tier-2 PAR2 realism shards.
+[[test]]
+name = "archive_matrix_extended_par2_realism"
+path = "tests/archive_matrix_extended_par2_realism.rs"
+required-features = ["archive-matrix"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = { workspace = true }
