@@ -255,7 +255,7 @@ async fn started(
         TorrentSettings {
             upload_cap: None,
             complete_dir: dir.join("complete"),
-            categories: Vec::new(),
+            categories: Default::default(),
             seeding,
             torrent: TorrentConfig {
                 enabled: true,

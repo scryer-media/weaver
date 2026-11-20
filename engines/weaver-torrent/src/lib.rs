@@ -107,7 +107,7 @@ pub use piece_priority::{FilePriority, PiecePriority};
 pub use session::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, Discovery, FetchPhase,
     IpFilter, Ipv6RouteChange, ListOnlyResponse, MetadataFetch, SUPPORTED_SCHEMES, Session,
-    SessionLimits, SessionOptions, SessionPersistenceConfig, SharedLimits,
+    SessionLimits, SessionOptions, SessionPersistenceConfig, SharedLimits, TrackersChanged,
 };
 pub use ssl::SslIdentity;
 pub use stream_connect::{

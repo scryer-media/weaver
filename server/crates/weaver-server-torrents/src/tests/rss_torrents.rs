@@ -201,7 +201,8 @@ fn torrent_settings(complete_dir: &std::path::Path, on: bool) -> TorrentSettings
             name: "tv".to_string(),
             dest_dir: None,
             aliases: String::new(),
-        }],
+        }]
+        .into(),
         seeding: None,
         torrent: TorrentConfig {
             enabled: on,

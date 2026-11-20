@@ -963,9 +963,9 @@ pub struct Sessions {
     // Wakes the follower of the routes when the leg under an open session
     // is revoked.
     revoked: Arc<tokio::sync::Notify>,
-    // Rung by every session as an announce table or a metadata fetch's
-    // phase changes.
-    trackers_changed: Arc<tokio::sync::Notify>,
+    // Told by every session, by the torrent's hash, as an announce table
+    // or a metadata fetch's phase changes.
+    trackers_changed: weaver_torrent::TrackersChanged,
     // Counts the times the egresses' limits were put in force.
     egress_limits_applied: tokio::sync::watch::Sender<u64>,
     // The connection budget and check turns every session shares, made
@@ -989,7 +989,7 @@ impl Sessions {
             rates: SessionRates::default(),
             closing: Closing::default(),
             revoked: Arc::default(),
-            trackers_changed: Arc::default(),
+            trackers_changed: weaver_torrent::TrackersChanged::default(),
             egress_limits_applied: tokio::sync::watch::Sender::new(0),
             shared_limits: std::sync::OnceLock::new(),
         }
@@ -1001,10 +1001,11 @@ impl Sessions {
         self.revoked.notified().await;
     }
 
-    /// Resolves once an announce table of an open session, or the phase of
-    /// a metadata fetch on one, has changed since last asked.
-    pub async fn trackers_changed(&self) {
-        self.trackers_changed.notified().await;
+    /// The hashes of the torrents whose announce table on an open session,
+    /// or whose metadata fetch's phase on one, changed since last asked,
+    /// once there is one.
+    pub async fn trackers_changed(&self) -> std::collections::HashSet<weaver_torrent::core::Id20> {
+        self.trackers_changed.changed().await
     }
 
     // Once `leg` is revoked under `session`, or the pool member it holds
@@ -1539,7 +1540,7 @@ impl Sessions {
         self.closing.table_released(plan).await;
         let mut options = session_options(&leg, port, &dir, peers, &torrent, ip_filter, opener);
         options.port_map_events = Some(mappings.follow());
-        options.trackers_changed = Some(Arc::clone(&self.trackers_changed));
+        options.trackers_changed = Some(self.trackers_changed.clone());
         options.shared_limits = Some(
             self.shared_limits
                 .get_or_init(|| {

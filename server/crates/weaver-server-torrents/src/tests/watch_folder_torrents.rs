@@ -64,7 +64,7 @@ async fn rig() -> Rig {
     let settings = TorrentSettings {
         upload_cap: None,
         complete_dir: dir.path().join("complete"),
-        categories: vec![tv()],
+        categories: vec![tv()].into(),
         seeding: None,
         torrent: crate::settings::TorrentConfig {
             enabled: true,

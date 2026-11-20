@@ -511,7 +511,7 @@ impl TorrentService {
                     torrent.record.category_id = category_id;
                     if before != settings.scope(category_id, rule) {
                         self.move_out(torrent).await;
-                        torrent.route = None;
+                        torrent.route.clear();
                         torrent.held = None;
                         moved.push(job_id);
                     }
@@ -783,7 +783,7 @@ impl TorrentService {
                 return (outcome, false);
             };
             let moved: Vec<(JobId, i64)> = order
-                .order
+                .order()
                 .iter()
                 .zip(places.iter().copied())
                 .filter(|(job_id, place)| live[*job_id].record.queue_position != *place)
@@ -851,12 +851,12 @@ fn failed(mut outcome: Outcome, job_ids: &[JobId], error: &StateError) -> Outcom
 }
 
 // The torrents still downloading, in queue order, as one move after
-// another changes it, each move as `splice_job_order` makes it. Each
-// torrent's index is kept, so a move costs the places it moves over, not
-// the length of the queue.
+// another changes it, each move as `splice_job_order` makes it. The order
+// is a tree that knows each torrent's place, so a move costs the depth of
+// the tree, not the places it moves over: moving every torrent of a long
+// queue to its top is not the square of the queue.
 pub struct Spliced {
-    pub order: Vec<JobId>,
-    at: HashMap<JobId, usize>,
+    order: Sequence,
     // The runs of slots that share a place, in order. Torrents in one run
     // keep the order a fresh read gives them: by job.
     ties: Vec<Range<usize>>,
@@ -866,11 +866,6 @@ impl Spliced {
     // `order` sorted by place then job, with `places` the place of each
     // slot.
     pub fn new(order: Vec<JobId>, places: &[i64]) -> Self {
-        let at = order
-            .iter()
-            .enumerate()
-            .map(|(index, job_id)| (*job_id, index))
-            .collect();
         let mut ties = Vec::new();
         let mut start = 0;
         while start < places.len() {
@@ -883,13 +878,21 @@ impl Spliced {
             }
             start = end;
         }
-        Self { order, at, ties }
+        Self {
+            order: Sequence::new(order),
+            ties,
+        }
+    }
+
+    // The torrents in their order now.
+    pub fn order(&self) -> Vec<JobId> {
+        self.order.to_vec()
     }
 
     // Moves `job_id` to `target`; false when it did not move, or is not in
     // the order.
     pub fn splice(&mut self, job_id: JobId, target: QueueMoveTarget) -> bool {
-        let Some(&current) = self.at.get(&job_id) else {
+        let Some(current) = self.order.index_of(job_id) else {
             return false;
         };
         let last = self.order.len() - 1;
@@ -903,31 +906,272 @@ impl Spliced {
         if to == current {
             return false;
         }
+        self.order.relocate(current, to);
         let (low, high) = (current.min(to), current.max(to));
-        if current < to {
-            self.order[low..=high].rotate_left(1);
-        } else {
-            self.order[low..=high].rotate_right(1);
-        }
-        self.index(low..high + 1);
-        // Only the runs of shared places the move shifted can be out of
-        // job order.
+        // Only the runs of shared places the move shifted can be out of job
+        // order, and each by one torrent alone: the moved one in the run it
+        // lands in, else the one shifted in across the run's edge, first
+        // for a move up and last for a move down. Every other torrent of
+        // the run kept its order.
         let first = self.ties.partition_point(|run| run.end <= low);
-        for run in self.ties[first..]
-            .iter()
-            .take_while(|run| run.start <= high)
-            .cloned()
-            .collect::<Vec<_>>()
-        {
-            self.order[run.clone()].sort_unstable();
-            self.index(run);
+        for index in first..self.ties.len() {
+            let run = self.ties[index].clone();
+            if run.start > high {
+                break;
+            }
+            let slot = if run.contains(&to) {
+                to
+            } else if to < current {
+                run.start
+            } else {
+                run.end - 1
+            };
+            self.order.resort_one(run, slot);
         }
         true
     }
+}
 
-    fn index(&mut self, slots: Range<usize>) {
-        for slot in slots {
-            self.at.insert(self.order[slot], slot);
+// An order of torrents that moves one by its index, and finds one's index,
+// in the depth of a tree: a treap keyed by place, each node knowing its
+// parent and the size under it.
+struct Sequence {
+    nodes: Vec<Node>,
+    root: u32,
+    at: HashMap<JobId, u32>,
+}
+
+#[derive(Clone, Copy)]
+struct Node {
+    job_id: JobId,
+    rank: u64,
+    size: u32,
+    left: u32,
+    right: u32,
+    parent: u32,
+}
+
+const NONE: u32 = u32::MAX;
+
+impl Sequence {
+    fn new(order: Vec<JobId>) -> Self {
+        // Ranks from a fixed generator: the tree's shape is the same on
+        // every run, and as balanced as a random one.
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut nodes: Vec<Node> = order
+            .iter()
+            .map(|&job_id| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                Node {
+                    job_id,
+                    rank: state,
+                    size: 1,
+                    left: NONE,
+                    right: NONE,
+                    parent: NONE,
+                }
+            })
+            .collect();
+        let at = order
+            .iter()
+            .enumerate()
+            .map(|(index, job_id)| (*job_id, index as u32))
+            .collect();
+        // Built in one pass, as a Cartesian tree of the ranks: the right
+        // spine is the stack.
+        let mut spine: Vec<u32> = Vec::new();
+        for node in 0..nodes.len() as u32 {
+            let mut last = NONE;
+            while let Some(&top) = spine.last() {
+                if nodes[top as usize].rank >= nodes[node as usize].rank {
+                    break;
+                }
+                last = top;
+                spine.pop();
+            }
+            nodes[node as usize].left = last;
+            if last != NONE {
+                nodes[last as usize].parent = node;
+            }
+            if let Some(&top) = spine.last() {
+                nodes[top as usize].right = node;
+                nodes[node as usize].parent = top;
+            }
+            spine.push(node);
         }
+        let root = spine.first().copied().unwrap_or(NONE);
+        let mut sequence = Self { nodes, root, at };
+        sequence.sizes(root);
+        sequence
+    }
+
+    // The size under each node from `root` down, children first, without
+    // recursion.
+    fn sizes(&mut self, root: u32) {
+        let mut stack = vec![(root, false)];
+        while let Some((node, seen)) = stack.pop() {
+            if node == NONE {
+                continue;
+            }
+            if seen {
+                self.update(node);
+            } else {
+                stack.push((node, true));
+                stack.push((self.nodes[node as usize].left, false));
+                stack.push((self.nodes[node as usize].right, false));
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.size(self.root) as usize
+    }
+
+    fn size(&self, node: u32) -> u32 {
+        if node == NONE {
+            0
+        } else {
+            self.nodes[node as usize].size
+        }
+    }
+
+    fn update(&mut self, node: u32) {
+        let Node { left, right, .. } = self.nodes[node as usize];
+        self.nodes[node as usize].size = self.size(left) + self.size(right) + 1;
+        for child in [left, right] {
+            if child != NONE {
+                self.nodes[child as usize].parent = node;
+            }
+        }
+    }
+
+    fn index_of(&self, job_id: JobId) -> Option<usize> {
+        let mut node = *self.at.get(&job_id)?;
+        let mut index = self.size(self.nodes[node as usize].left);
+        loop {
+            let parent = self.nodes[node as usize].parent;
+            if parent == NONE {
+                return Some(index as usize);
+            }
+            if self.nodes[parent as usize].right == node {
+                index += self.size(self.nodes[parent as usize].left) + 1;
+            }
+            node = parent;
+        }
+    }
+
+    fn get(&self, mut index: u32) -> JobId {
+        let mut node = self.root;
+        loop {
+            let Node { left, right, .. } = self.nodes[node as usize];
+            let before = self.size(left);
+            if index < before {
+                node = left;
+            } else if index == before {
+                return self.nodes[node as usize].job_id;
+            } else {
+                index -= before + 1;
+                node = right;
+            }
+        }
+    }
+
+    // `node`'s first `count` torrents, and the rest.
+    fn split(&mut self, node: u32, count: u32) -> (u32, u32) {
+        if node == NONE {
+            return (NONE, NONE);
+        }
+        let Node { left, right, .. } = self.nodes[node as usize];
+        let before = self.size(left);
+        let pair = if count <= before {
+            let (low, high) = self.split(left, count);
+            self.nodes[node as usize].left = high;
+            (low, node)
+        } else {
+            let (low, high) = self.split(right, count - before - 1);
+            self.nodes[node as usize].right = low;
+            (node, high)
+        };
+        self.update(node);
+        for side in [pair.0, pair.1] {
+            if side != NONE {
+                self.nodes[side as usize].parent = NONE;
+            }
+        }
+        pair
+    }
+
+    fn merge(&mut self, low: u32, high: u32) -> u32 {
+        if low == NONE {
+            return high;
+        }
+        if high == NONE {
+            return low;
+        }
+        if self.nodes[low as usize].rank > self.nodes[high as usize].rank {
+            let right = self.nodes[low as usize].right;
+            let merged = self.merge(right, high);
+            self.nodes[low as usize].right = merged;
+            self.update(low);
+            low
+        } else {
+            let left = self.nodes[high as usize].left;
+            let merged = self.merge(low, left);
+            self.nodes[high as usize].left = merged;
+            self.update(high);
+            high
+        }
+    }
+
+    // The torrent at `from` taken out and put back at `to`, as a remove and
+    // an insert by index make it.
+    fn relocate(&mut self, from: usize, to: usize) {
+        let (before, rest) = self.split(self.root, from as u32);
+        let (node, after) = self.split(rest, 1);
+        let without = self.merge(before, after);
+        let (before, after) = self.split(without, to as u32);
+        let with = self.merge(before, node);
+        self.root = self.merge(with, after);
+        self.nodes[self.root as usize].parent = NONE;
+    }
+
+    // `run` in job order again, where only the torrent at `slot` is out of
+    // it: that torrent goes where it falls among the rest.
+    fn resort_one(&mut self, run: Range<usize>, slot: usize) {
+        let job_id = self.get(slot as u32);
+        let (mut low, mut high) = (run.start, run.end - 1);
+        // The rest of the run, as it reads with `slot` taken out.
+        let rest = |index: usize| if index < slot { index } else { index + 1 };
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if self.get(rest(middle) as u32) < job_id {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        if low != slot {
+            self.relocate(slot, low);
+        }
+    }
+
+    fn to_vec(&self) -> Vec<JobId> {
+        let mut order = Vec::with_capacity(self.len());
+        let mut stack = Vec::new();
+        let mut node = self.root;
+        while node != NONE || !stack.is_empty() {
+            while node != NONE {
+                stack.push(node);
+                node = self.nodes[node as usize].left;
+            }
+            let Some(top) = stack.pop() else {
+                break;
+            };
+            order.push(self.nodes[top as usize].job_id);
+            node = self.nodes[top as usize].right;
+        }
+        order
     }
 }

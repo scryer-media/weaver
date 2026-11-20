@@ -653,3 +653,76 @@ async fn a_files_level_reaches_its_torrents_follower_and_no_list() {
     assert_eq!((after.moved, after.listed), (row.moved, row.listed));
     rig.service.stop().await;
 }
+
+// A change the sessions tell of one torrent's trackers publishes that
+// torrent alone: its row, its figures and its job, read as a publish of
+// every torrent reads them, while every other torrent stands as last
+// published.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tracker_change_publishes_the_torrent_it_names_alone() {
+    // Restored and never attached, as no session is open: nothing but the
+    // calls below builds a view.
+    let rig = rig(set_clock());
+    let jobs = super::readings::stored_magnets(&rig.db, 2);
+    rig.service.restore().await.unwrap();
+    let (named, other) = (jobs[0], jobs[1]);
+    rig.service.publish().await;
+    let before = rig.service.inner.published.borrow().clone();
+    let hash = {
+        let mut live = rig.service.inner.live.lock().await;
+        for job_id in [named, other] {
+            live.get_mut(&job_id).unwrap().counters.uploaded_bytes = 777;
+        }
+        hashes_of(&live[&named].record).best()
+    };
+
+    // A hash no torrent carries publishes nothing.
+    let built = rig.service.views_built();
+    rig.service
+        .publish_hashes(&std::collections::HashSet::from([
+            weaver_torrent::core::Id20::new([9; 20]),
+        ]))
+        .await;
+    assert_eq!(rig.service.views_built(), built);
+    rig.service
+        .publish_hashes(&std::collections::HashSet::from([hash]))
+        .await;
+    assert_eq!(rig.service.views_built() - built, 1);
+    let told = rig.service.inner.published.borrow().clone();
+    assert_eq!(told.job(named).unwrap().torrent.uploaded_bytes, 777);
+    assert_eq!(told.job(other), before.job(other));
+    assert_eq!(told.sessions, before.sessions);
+    assert_eq!(
+        rig.service
+            .inner
+            .snapshot
+            .row(named)
+            .unwrap()
+            .view
+            .uploaded_bytes,
+        777
+    );
+    assert_eq!(
+        rig.service
+            .inner
+            .snapshot
+            .row(other)
+            .unwrap()
+            .view
+            .uploaded_bytes,
+        before.job(other).unwrap().torrent.uploaded_bytes
+    );
+
+    // What a publish of every torrent reads of the one told is what the
+    // publish of it alone read.
+    let row = rig.service.inner.snapshot.row(named).unwrap();
+    rig.service.publish().await;
+    let every = rig.service.inner.published.borrow().clone();
+    assert_eq!(every.job(named), told.job(named));
+    assert_eq!(
+        rig.service.inner.snapshot.row(named).unwrap().view,
+        row.view
+    );
+    assert_eq!(every.job(other).unwrap().torrent.uploaded_bytes, 777);
+    rig.service.stop().await;
+}

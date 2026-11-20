@@ -117,12 +117,16 @@ pub struct TagCount {
     pub jobs: u64,
 }
 
-/// The tags as stored, read whole: every tag made, and each job's tags.
-#[derive(Debug, Default)]
+/// The tags as stored: every tag made, and each job's tags. Read whole
+/// once, then kept in step by each change, which patches only the jobs and
+/// tags it touched.
+#[derive(Debug, Default, Clone)]
 pub struct TagSnapshot {
     revision: u64,
     made: Vec<String>,
     by_job: HashMap<u64, Vec<String>>,
+    // How many jobs carry each tag.
+    carried: HashMap<String, u64>,
 }
 
 impl TagSnapshot {
@@ -144,19 +148,63 @@ impl TagSnapshot {
 
     /// Every tag made, with how many jobs carry it.
     pub fn counts(&self) -> Vec<TagCount> {
-        let mut counts: HashMap<&str, u64> = HashMap::new();
-        for tags in self.by_job.values() {
-            for tag in tags {
-                *counts.entry(tag.as_str()).or_default() += 1;
-            }
-        }
         self.made
             .iter()
             .map(|name| TagCount {
                 name: name.clone(),
-                jobs: counts.get(name.as_str()).copied().unwrap_or(0),
+                jobs: self.carried.get(name).copied().unwrap_or(0),
             })
             .collect()
+    }
+
+    fn whole(revision: u64, made: Vec<String>, rows: Vec<(i64, String)>) -> Self {
+        let mut by_job: HashMap<u64, Vec<String>> = HashMap::new();
+        for (job_id, tag) in rows {
+            by_job.entry(job_id as u64).or_default().push(tag);
+        }
+        let mut carried: HashMap<String, u64> = HashMap::new();
+        for tags in by_job.values_mut() {
+            *tags = sorted_tags(std::mem::take(tags));
+            for tag in tags.iter() {
+                *carried.entry(tag.clone()).or_default() += 1;
+            }
+        }
+        Self {
+            revision,
+            made: sorted_tags(made),
+            by_job,
+            carried,
+        }
+    }
+
+    // The tags as `patch` leaves them, touching only what it names.
+    fn patch(&mut self, patch: Patch) {
+        for tag in patch.made {
+            if let Err(at) = self.made.binary_search_by(|made| tag_order(made, &tag)) {
+                self.made.insert(at, tag);
+            }
+        }
+        for tag in &patch.unmade {
+            if let Ok(at) = self.made.binary_search_by(|made| tag_order(made, tag)) {
+                self.made.remove(at);
+            }
+        }
+        for (job_id, tags) in patch.jobs {
+            for tag in self.by_job.remove(&job_id).unwrap_or_default() {
+                if let Some(count) = self.carried.get_mut(&tag) {
+                    *count -= 1;
+                    if *count == 0 {
+                        self.carried.remove(&tag);
+                    }
+                }
+            }
+            if !tags.is_empty() {
+                for tag in &tags {
+                    *self.carried.entry(tag.clone()).or_default() += 1;
+                }
+                self.by_job.insert(job_id, tags);
+            }
+        }
     }
 
     /// Whether a job passes a tag filter: it carries `tag`, or, for the
@@ -171,10 +219,23 @@ impl TagSnapshot {
     }
 }
 
+// What one change did to the tags, for the snapshot in memory: the tags it
+// made and deleted, and the tags each job it touched carries now, none
+// when empty.
+#[derive(Default)]
+struct Patch {
+    made: Vec<String>,
+    unmade: Vec<String>,
+    jobs: Vec<(u64, Vec<String>)>,
+}
+
 // What the database keeps of the tags in memory: the last snapshot read,
-// dropped on every change, and the revision of the changes.
+// patched by every change, and the revision of the changes. Changes to the
+// tags are made one at a time under the writer lock, so each patch lands in
+// the order its change was written.
 pub struct TagCache {
     state: Mutex<CacheState>,
+    writer: Mutex<()>,
     changes: watch::Sender<u64>,
 }
 
@@ -189,6 +250,7 @@ impl Default for TagCache {
     fn default() -> Self {
         Self {
             state: Mutex::new(CacheState::default()),
+            writer: Mutex::new(()),
             changes: watch::channel(0).0,
         }
     }
@@ -201,13 +263,50 @@ impl TagCache {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Held across a write to the tag tables and the patch that follows
+    /// it, so patches land in the order the writes did.
+    pub fn lock_writer(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn cached(&self) -> bool {
+        self.lock().snapshot.is_some()
+    }
+
     // Drops the snapshot and tells every watcher the tags changed.
     pub fn changed(&self) {
+        self.patched(None);
+    }
+
+    /// The jobs `job_ids` names are gone with every tag they carried: the
+    /// snapshot forgets them, and every watcher is told the tags changed.
+    /// Called under [`TagCache::lock_writer`], after the delete committed.
+    pub fn jobs_deleted(&self, job_ids: &[u64]) {
+        self.patched(Some(Patch {
+            jobs: job_ids.iter().map(|&job_id| (job_id, Vec::new())).collect(),
+            ..Patch::default()
+        }));
+    }
+
+    // The snapshot patched, or dropped when there is no patch for it, and
+    // every watcher told the tags changed. A snapshot a reader still holds
+    // is copied first; the reader keeps the one it read.
+    fn patched(&self, patch: Option<Patch>) {
         let generation = {
             let mut state = self.lock();
-            state.snapshot = None;
             state.generation += 1;
-            state.generation
+            let generation = state.generation;
+            match (state.snapshot.as_mut(), patch) {
+                (Some(snapshot), Some(patch)) => {
+                    let snapshot = Arc::make_mut(snapshot);
+                    snapshot.patch(patch);
+                    snapshot.revision = generation;
+                }
+                _ => state.snapshot = None,
+            }
+            generation
         };
         self.changes.send_replace(generation);
     }
@@ -359,10 +458,45 @@ enum Change {
 }
 
 impl Change {
-    async fn apply(&self, tx: &mut SqlTx<'_>, ids: Vec<i64>) -> Result<(), StateError> {
+    // Makes the change, and, when `patching`, what it did for the snapshot
+    // in memory: the jobs it touched are read back by id, never every job.
+    async fn apply(
+        &self,
+        tx: &mut SqlTx<'_>,
+        ids: Vec<i64>,
+        patching: bool,
+    ) -> Result<Option<Patch>, StateError> {
+        let (touched, made, unmade) = self.write(tx, ids, patching).await?;
+        if !patching {
+            return Ok(None);
+        }
+        Ok(Some(Patch {
+            made,
+            unmade,
+            jobs: tags_of_jobs_tx(tx, &touched).await?,
+        }))
+    }
+
+    // Makes the change: the ids of the jobs it touched, the tags it made
+    // and the tags it deleted. The jobs a delete touched are read only
+    // when `patching`.
+    async fn write(
+        &self,
+        tx: &mut SqlTx<'_>,
+        ids: Vec<i64>,
+        patching: bool,
+    ) -> Result<(Vec<i64>, Vec<String>, Vec<String>), StateError> {
         match self {
-            Self::Make(tags) => make_tags_tx(tx, tags).await,
+            Self::Make(tags) => {
+                make_tags_tx(tx, tags).await?;
+                Ok((Vec::new(), tags.clone(), Vec::new()))
+            }
             Self::Delete(tags) => {
+                let touched = if patching {
+                    jobs_carrying_tx(tx, tags).await?
+                } else {
+                    Vec::new()
+                };
                 for chunk in tags.chunks(max_rows_for_tx(tx, 1)) {
                     let (placeholders, args) = tag_args(chunk);
                     tx.execute(
@@ -376,22 +510,90 @@ impl Change {
                     )
                     .await?;
                 }
-                Ok(())
+                Ok((touched, Vec::new(), tags.clone()))
             }
-            Self::Add(tags) => {
-                let ids = known_jobs_tx(tx, &ids).await?;
-                put_tags_tx(tx, &ids, tags).await
+            Self::Add(tags) | Self::Put(tags) => {
+                let ids = if matches!(self, Self::Add(_)) {
+                    known_jobs_tx(tx, &ids).await?
+                } else {
+                    ids
+                };
+                put_tags_tx(tx, &ids, tags).await?;
+                // A tag is made only as a job takes it.
+                let made = if ids.is_empty() {
+                    Vec::new()
+                } else {
+                    tags.clone()
+                };
+                Ok((ids, made, Vec::new()))
             }
-            Self::Put(tags) => put_tags_tx(tx, &ids, tags).await,
-            Self::Remove(tags) => take_tags_tx(tx, &ids, Some(tags)).await,
-            Self::Clear => take_tags_tx(tx, &ids, None).await,
+            Self::Remove(tags) => {
+                take_tags_tx(tx, &ids, Some(tags)).await?;
+                Ok((ids, Vec::new(), Vec::new()))
+            }
+            Self::Clear => {
+                take_tags_tx(tx, &ids, None).await?;
+                Ok((ids, Vec::new(), Vec::new()))
+            }
             Self::Set(tags) => {
                 let ids = known_jobs_tx(tx, &ids).await?;
                 take_tags_tx(tx, &ids, None).await?;
-                put_tags_tx(tx, &ids, tags).await
+                put_tags_tx(tx, &ids, tags).await?;
+                let made = if ids.is_empty() {
+                    Vec::new()
+                } else {
+                    tags.clone()
+                };
+                Ok((ids, made, Vec::new()))
             }
         }
     }
+}
+
+// The ids of the jobs that carry any of `tags`, through the tag index.
+async fn jobs_carrying_tx(tx: &mut SqlTx<'_>, tags: &[String]) -> Result<Vec<i64>, StateError> {
+    let mut jobs = BTreeSet::new();
+    for chunk in tags.chunks(max_rows_for_tx(tx, 1)) {
+        let (placeholders, args) = tag_args(chunk);
+        for row in tx
+            .fetch_all(
+                &format!("SELECT DISTINCT job_id FROM job_tags WHERE tag IN ({placeholders})"),
+                &args,
+            )
+            .await?
+        {
+            jobs.insert(row.i64("job_id")?);
+        }
+    }
+    Ok(jobs.into_iter().collect())
+}
+
+// The tags each job of `ids` carries, in [`tag_order`], read by the
+// table's key; a job with none carries an empty list.
+async fn tags_of_jobs_tx(
+    tx: &mut SqlTx<'_>,
+    ids: &[i64],
+) -> Result<Vec<(u64, Vec<String>)>, StateError> {
+    let mut by_job: HashMap<i64, Vec<String>> = ids.iter().map(|&id| (id, Vec::new())).collect();
+    for chunk in ids.chunks(max_rows_for_tx(tx, 1)) {
+        let (placeholders, args) = id_args(chunk);
+        for row in tx
+            .fetch_all(
+                &format!("SELECT job_id, tag FROM job_tags WHERE job_id IN ({placeholders})"),
+                &args,
+            )
+            .await?
+        {
+            by_job
+                .entry(row.i64("job_id")?)
+                .or_default()
+                .push(row.text("tag")?);
+        }
+    }
+    Ok(by_job
+        .into_iter()
+        .map(|(id, tags)| (id as u64, sorted_tags(tags)))
+        .collect())
 }
 
 // Every tag row of the jobs `job_ids` names goes, with their history.
@@ -439,7 +641,7 @@ pub trait TagsQueries {
 
 impl<T: TagStore> TagsQueries for T {
     /// Every tag and each job's tags. Read from the database once, then from
-    /// memory until the tags next change.
+    /// memory, kept in step by each change.
     fn tag_snapshot(&self) -> Result<Arc<TagSnapshot>, StateError> {
         let generation = {
             let state = self.tag_cache().lock();
@@ -466,18 +668,7 @@ impl<T: TagStore> TagsQueries for T {
             .collect::<Result<Vec<_>, StateError>>()?;
             Ok((made, rows))
         })?;
-        let mut by_job: HashMap<u64, Vec<String>> = HashMap::new();
-        for (job_id, tag) in rows {
-            by_job.entry(job_id as u64).or_default().push(tag);
-        }
-        for tags in by_job.values_mut() {
-            *tags = sorted_tags(std::mem::take(tags));
-        }
-        let snapshot = Arc::new(TagSnapshot {
-            revision: generation,
-            made: sorted_tags(made),
-            by_job,
-        });
+        let snapshot = Arc::new(TagSnapshot::whole(generation, made, rows));
         let mut state = self.tag_cache().lock();
         if state.generation == generation {
             state.snapshot = Some(snapshot.clone());
@@ -485,8 +676,8 @@ impl<T: TagStore> TagsQueries for T {
         Ok(snapshot)
     }
 
-    /// The tags as last read, when nothing changed them since: read from
-    /// memory alone, never from the database.
+    /// The tags as last read and kept in step since: read from memory
+    /// alone, never from the database.
     fn cached_tag_snapshot(&self) -> Option<Arc<TagSnapshot>> {
         self.tag_cache().lock().snapshot.clone()
     }
@@ -676,8 +867,9 @@ trait TagsLocalQueries {
 }
 
 impl<T: TagStore> TagsLocalQueries for T {
-    // Makes one change to the tags in one transaction, then tells every
-    // watcher the tags changed.
+    // Makes one change to the tags in one transaction, patches the tags in
+    // memory with what it touched, then tells every watcher the tags
+    // changed. A change that failed drops them.
     fn change_tags(
         &self,
         op_name: &'static str,
@@ -685,16 +877,26 @@ impl<T: TagStore> TagsLocalQueries for T {
         change: Change,
     ) -> Result<(), StateError> {
         let ids = stored_ids(job_ids)?;
+        let _writer = self.tag_cache().lock_writer();
+        let patching = self.tag_cache().cached();
         let datastore = self.datastore();
         let result = self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, op_name, |tx| {
                 let ids = ids.clone();
                 let change = change.clone();
-                Box::pin(async move { change.apply(tx, ids).await })
+                Box::pin(async move { change.apply(tx, ids, patching).await })
             })
             .await
         });
-        self.tag_cache().changed();
-        result
+        match result {
+            Ok(patch) => {
+                self.tag_cache().patched(patch);
+                Ok(())
+            }
+            Err(error) => {
+                self.tag_cache().changed();
+                Err(error)
+            }
+        }
     }
 }

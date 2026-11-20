@@ -9,8 +9,8 @@ use super::settings::TorrentSettings;
 use super::tick::Leveling;
 use super::{
     Asked, Load, PeerTerms, RESTORES_AT_ONCE, Restores, Signal, TorrentService, certificate_of,
-    fetch_levels, files_dir, held_by, identity_of, ignored_of, in_table_order, load_of, locked,
-    placed, queued, ratelimits_of, ssl_identity, state_error, tracker_tiers,
+    fetch_levels, files_dir, held_by, identity_of, ignored_of, in_table_order, locked, placed,
+    queued, ratelimits_of, ssl_identity, state_error, tracker_tiers,
 };
 use crate::jobs::graph_checkpoint::JobsGraphCheckpointInternalQueries;
 use crate::post_processing::settings::PostProcessingSettingsQueries;
@@ -1174,7 +1174,9 @@ impl TorrentService {
             && torrent.attached.is_none()
             && torrent.held.is_none()
         {
-            torrent.route = Some(plan.key.clone());
+            torrent
+                .route
+                .set(Some(plan.key.clone()), &self.inner.route_loads);
             torrent.held = Some(Held::Session(OPENING));
         }
         plan
@@ -1522,7 +1524,7 @@ impl TorrentService {
                     names,
                     scope,
                 });
-                torrent.route = Some(plan.key);
+                torrent.route.set(Some(plan.key), &self.inner.route_loads);
                 torrent.held = None;
                 torrent.run_error = None;
                 // A pause, resume or turn made while the session took it,
@@ -1565,8 +1567,8 @@ impl TorrentService {
         plan: &RoutePlan,
         pinned: Option<u32>,
     ) -> (RoutePlan, Option<u32>) {
-        let load = load_of(self.inner.live.lock().await.values());
-        plan.place(pinned, |key| load.get(key).copied().unwrap_or(0))
+        let _live = self.inner.live.lock().await;
+        plan.place(pinned, |key| self.inner.route_loads.of(key))
     }
 
     // The plan `job_id` runs on: on a pool route its member's, kept or
@@ -1575,19 +1577,22 @@ impl TorrentService {
     // torrent placed sees it there.
     pub(super) async fn pinned(&self, job_id: JobId, plan: RoutePlan) -> RoutePlan {
         let mut live = self.inner.live.lock().await;
-        let load = load_of(
-            live.values()
-                .filter(|torrent| torrent.record.job_id != job_id),
-        );
         let Some(torrent) = live.get_mut(&job_id) else {
             return plan;
         };
+        // Counted among the others: not on the route it reads as now.
+        let own = torrent.route.key();
         let (plan, pin) = plan.place(torrent.record.pool_member, |key| {
-            load.get(key).copied().unwrap_or(0)
+            self.inner
+                .route_loads
+                .of(key)
+                .saturating_sub(usize::from(own == Some(key)))
         });
         self.pin(torrent, pin);
         if pin.is_some() {
-            torrent.route = Some(plan.key.clone());
+            torrent
+                .route
+                .set(Some(plan.key.clone()), &self.inner.route_loads);
         }
         plan
     }
@@ -1610,7 +1615,9 @@ impl TorrentService {
     pub(super) async fn held(&self, job_id: JobId, key: Option<RouteKey>, held: Held) {
         if let Some(torrent) = self.inner.live.lock().await.get_mut(&job_id) {
             torrent.settle(self.inner.clock.unix_ms());
-            torrent.route = key.or(torrent.route.take());
+            if key.is_some() {
+                torrent.route.set(key, &self.inner.route_loads);
+            }
             torrent.held = Some(held);
         }
     }

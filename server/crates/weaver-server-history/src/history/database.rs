@@ -32,7 +32,13 @@ pub trait HistoryDatabase: Borrow<SqlDatabase> {
     // of `job_ids`. Called before the history cache is invalidated.
     fn forget_job_script_effects(&self, job_ids: &[u64]);
 
-    // After a history bundle delete commits and the history cache is
-    // invalidated: tells script event and tag subscribers, in that order.
-    fn job_history_bundles_deleted(&self);
+    // Held across a history bundle delete and the hook after it, so the
+    // tags in memory forget the deleted jobs in the order the tag writes
+    // landed.
+    fn lock_tag_writer(&self) -> std::sync::MutexGuard<'_, ()>;
+
+    // After a history bundle delete of `job_ids` commits and the history
+    // cache is invalidated: tells script event and tag subscribers, in that
+    // order.
+    fn job_history_bundles_deleted(&self, job_ids: &[u64]);
 }

@@ -1862,9 +1862,10 @@ impl PeerStates {
     }
 
     // Recompute the cached "this peer has the full torrent" flag after its bitfield
-    // changed, keeping the aggregate seeder counters in sync. Must be called on every
-    // bitfield change of a live peer.
+    // changed, keeping the aggregate seeder counters in sync, and stamp the new
+    // pieces. Must be called on every bitfield change of a live peer.
     fn update_seeder_flag(&self, live: &mut LivePeerState) {
+        live.pieces_stamp = super::peer::next_pieces_stamp();
         let seeder = live.has_full_torrent(self.total_pieces as usize);
         if seeder == live.seeder {
             return;
