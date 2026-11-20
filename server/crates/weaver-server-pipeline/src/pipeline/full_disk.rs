@@ -19,8 +19,10 @@
 // free to spend. A step that gave nothing back (a download write) has one
 // mark, what its disk showed as the write failed, and is let go by a reading
 // that shows more than the mark and more than the reserve free to spend. A
-// resume of the job by its user lets it go once, whatever the readings say.
-// A disk with no good reading keeps it waiting.
+// job held in its download starts again as any job starts: by a fresh
+// reading that leaves room for what it still has to fetch, which is
+// promised to it. A resume by its user is judged the same way. A disk with
+// no good reading keeps it waiting.
 //
 // A job let go in its download has its articles read back and its graph
 // restored from its last checkpoint, as after a restart, and what that
@@ -88,6 +90,10 @@ pub(crate) struct FullDisk {
     stage: Stage,
     // Room was made, or the user asked: the job goes on once it has parked.
     go: bool,
+    // Its user resumed it while it was held in its download: the next wake
+    // judges its start by room alone, as any start is judged, and not by
+    // whether its disk showed more than at the failure.
+    resumed: bool,
     // What the job's graph said was left to fetch, taken before it went:
     // what the job's summaries say once it parks, with no graph to ask.
     left: Option<FileSummaries>,
@@ -201,6 +207,10 @@ impl Pipeline {
                 .collect();
         }
         self.retire_graph_job(job_id);
+        // Its graph gave back what its start promised and did not land; a
+        // start promise its graph never took goes back too. Held, the job
+        // holds no room: its start again is promised anew.
+        self.release_start_promise(job_id);
         // What the disk showed free as the write failed is what a later
         // reading has to beat.
         let wait = RoomWait::begin(
@@ -216,6 +226,7 @@ impl Pipeline {
                 wait,
                 stage: Stage::Graph,
                 go: false,
+                resumed: false,
                 left,
                 named,
             },
@@ -315,16 +326,99 @@ impl Pipeline {
                     .promise_ended(&self.storage_capacity, &ended, begun);
             }
         }
+        // A job held in its download starts again as any job starts: once a
+        // fresh reading whose probe began after its write failed leaves room
+        // for what it still has to fetch, or what its step needs free when
+        // that is more, less everything promised on the disk. Those bytes
+        // are promised to it as it is let go; its step books its own room
+        // when it runs, so that is judged and not promised. That reading
+        // also has to show more than the disk did as the write failed, as
+        // every wait's does: a disk whose free figure never moves, as one
+        // whose free space is not what stops the write, does not send it
+        // round. A resume by its user is judged by room alone, once. One
+        // not paused is judged; one held on a path, its root pointed
+        // elsewhere, waits as a move does. One a quota refused keeps waiting
+        // for its figure to rise: the free figure shows room the quota does
+        // not give it.
+        //
+        // First each such wait takes the mark a reading sets, so what it
+        // has to beat is known before it is judged.
+        for hold in self.full_disk.values_mut() {
+            if matches!(hold.stage, Stage::Graph)
+                && !hold.go
+                && !hold.wait.quota
+                && hold.wait.root_read_since(&self.storage_capacity).is_some()
+            {
+                hold.wait
+                    .judge(&self.storage_capacity, reserve, true, |_, _| 0);
+            }
+        }
+        let starts: Vec<(JobId, StorageRoot, u64, u64)> = self
+            .full_disk
+            .iter()
+            .filter(|(job_id, hold)| {
+                matches!(hold.stage, Stage::Graph)
+                    && !hold.go
+                    && !hold.wait.quota
+                    && self
+                        .jobs
+                        .get(job_id)
+                        .is_none_or(|state| state.run_state != RunState::Paused)
+            })
+            .filter_map(|(job_id, hold)| {
+                let (root, read) = hold.wait.root_read_since(&self.storage_capacity)?;
+                let read = read && (hold.resumed || hold.wait.shows_rise(&self.storage_capacity));
+                let (remaining, need) = self.held_start_need(*job_id, &hold.wait);
+                let size = self.held_start_size(*job_id).max(need);
+                (read && self.held_start_room(root, need, size))
+                    .then_some((*job_id, root, remaining, size))
+            })
+            .collect();
+        // A resume counts for the wake that follows it, once the job is not
+        // paused: one still paused keeps it until then.
+        for (job_id, hold) in &mut self.full_disk {
+            if self
+                .jobs
+                .get(job_id)
+                .is_none_or(|state| state.run_state != RunState::Paused)
+            {
+                hold.resumed = false;
+            }
+        }
+        for (job_id, root, remaining, size) in starts {
+            if let Ok(promise) = self.book_start_promise_on(root, remaining, size) {
+                self.release_start_promise(job_id);
+                self.start_promises.insert(job_id, promise);
+                if let Some(hold) = self.full_disk.get_mut(&job_id) {
+                    hold.go = true;
+                }
+            }
+        }
+        let mut given_back = Vec::new();
+        // Jobs held in their download let go here, by a quota's figure or a
+        // path's: their start is promised what they have left, as one let
+        // go above is, so their graph's bytes land on it.
+        let mut judged_starts = Vec::new();
         for (job_id, hold) in &mut self.full_disk {
             let capacity = &self.storage_capacity;
+            let graph_on_root = matches!(hold.stage, Stage::Graph)
+                && !hold.wait.quota
+                && hold.wait.root_read_since(capacity).is_some();
             // A job let go here is promised its figure at once, so the next
             // held job of this pass is judged against it. So is a torrent
-            // let go on the same disk.
-            let room = hold.wait.judge(capacity, reserve, hold.go, |disk, device| {
-                capacity.promises().on(disk, device)
-            });
+            // let go on the same disk. A job held in its download on its
+            // root was judged above; here only its mark moves.
+            let room = hold.wait.judge(
+                capacity,
+                reserve,
+                hold.go || graph_on_root,
+                |disk, device| capacity.promises().on(disk, device),
+            );
             if let Some((bytes, device)) = room {
                 hold.go = true;
+                if matches!(hold.stage, Stage::Graph) {
+                    judged_starts.push(*job_id);
+                }
                 capacity.promises().insert(
                     Waiter::Usenet,
                     *job_id,
@@ -358,6 +452,15 @@ impl Pipeline {
                     .is_some()
             {
                 hold.go = false;
+                if matches!(hold.stage, Stage::Graph) {
+                    given_back.push(*job_id);
+                }
+            }
+            // So does a job let go to start again in its download: its
+            // start's promise goes back, and its resume is judged anew.
+            if paused && hold.go && graph_on_root {
+                hold.go = false;
+                given_back.push(*job_id);
             }
             let parked = !paused
                 && match hold.stage {
@@ -372,6 +475,19 @@ impl Pipeline {
                 };
             if hold.go && parked {
                 woken.push(*job_id);
+            }
+        }
+        for job_id in given_back {
+            self.release_start_promise(job_id);
+        }
+        for job_id in judged_starts {
+            if self.full_disk.get(&job_id).is_some_and(|hold| hold.go) {
+                let remaining = self
+                    .full_disk
+                    .get(&job_id)
+                    .map_or(0, |hold| self.held_start_need(job_id, &hold.wait).0);
+                let size = self.held_start_size(job_id).max(remaining);
+                self.promise_start_unjudged(job_id, remaining, size);
             }
         }
         for job_id in woken {
@@ -446,6 +562,7 @@ impl Pipeline {
                 wait,
                 stage,
                 go: false,
+                resumed: false,
                 left: None,
                 named: HashSet::new(),
             },
@@ -676,33 +793,6 @@ impl Pipeline {
         }
     }
 
-    // The user resumed the job: it tries its disk again now, once, whatever
-    // the readings say. A write that fails again holds it again, with a mark
-    // of its own.
-    pub(in crate::pipeline) fn try_full_disk_now(&mut self, job_id: JobId) {
-        if self.full_disk.is_empty() {
-            return;
-        }
-        if let Some(hold) = self.full_disk.get_mut(&job_id) {
-            // Its step takes the room it needs all the same, so that much
-            // is promised to it like any job let go on its figure.
-            if let (false, Some(bytes)) = (hold.go, hold.wait.needs.or(hold.wait.rise)) {
-                let disk = hold.wait.disk.clone();
-                let device = disk.device(&self.storage_capacity);
-                self.storage_capacity.promises().insert(
-                    Waiter::Usenet,
-                    job_id,
-                    Promised {
-                        disk,
-                        bytes,
-                        device,
-                    },
-                );
-            }
-            hold.go = true;
-        }
-    }
-
     // The step of a job let go on the figure it needs ended: the job is held
     // again, reached its final move from its download, finished its move, or
     // is gone. The room promised to it is counted no longer, and the jobs
@@ -736,6 +826,96 @@ impl Pipeline {
             Some(Stage::Moving(_, again)) => again.iter().cloned().collect(),
             _ => Vec::new(),
         }
+    }
+
+    // What a job held in its download still has to fetch, which its start
+    // promises, and what it needs free past the reserve to start again:
+    // that, or what its step needs when that is more. A step's `needs` is
+    // the free figure it runs on, the reserve in it; what was left of a
+    // refused file is bytes to write.
+    fn held_start_need(&self, job_id: JobId, wait: &RoomWait) -> (u64, u64) {
+        let remaining = self
+            .released_remaining
+            .get(&job_id)
+            .map_or(0, |(remaining, _)| *remaining);
+        let step = match wait.needs {
+            Some(needs) => needs.saturating_sub(self.extraction_limits.min_free_bytes),
+            None => wait.rise.unwrap_or(0),
+        };
+        (remaining, remaining.max(step))
+    }
+
+    // Its user resumed the held job: its next start is judged by room.
+    pub(in crate::pipeline) fn full_disk_resumed(&mut self, job_id: JobId) {
+        if let Some(hold) = self.full_disk.get_mut(&job_id) {
+            hold.resumed = true;
+        }
+    }
+
+    // What a job held in its download delivers, which its start promises
+    // on the complete folder's disk when that is another disk.
+    fn held_start_size(&self, job_id: JobId) -> u64 {
+        self.released_remaining
+            .get(&job_id)
+            .map_or(0, |(remaining, wanted)| (*wanted).max(*remaining))
+    }
+
+    // What a job held in its download needs past the reserve to start
+    // again, and the room a fresh reading of its disk leaves now: the
+    // figures its row shows. A hold a quota began, or one on a path, shows
+    // none.
+    pub(in crate::pipeline) fn full_disk_figures(
+        &self,
+        job_id: JobId,
+    ) -> (Option<u64>, Option<u64>) {
+        let Some(hold) = self.full_disk.get(&job_id) else {
+            return (None, None);
+        };
+        if !matches!(hold.stage, Stage::Graph) || hold.wait.quota {
+            return (None, None);
+        }
+        let Some((root, _)) = hold.wait.root_read_since(&self.storage_capacity) else {
+            return (None, None);
+        };
+        let room = weaver_server_disk::operations::room_wait::StartCheck {
+            root,
+            ..self.working_disk_check()
+        }
+        .room_now(&self.storage_capacity);
+        (Some(self.held_start_need(job_id, &hold.wait).1), room)
+    }
+
+    // Whether a fresh, good reading of `root` leaves `need` past the
+    // reserve and every promise, and, when the complete folder is on
+    // another disk, a reading of that disk leaves `size`. It books nothing.
+    fn held_start_room(&self, root: StorageRoot, need: u64, size: u64) -> bool {
+        let check = self.working_disk_check();
+        let room = |root, need| {
+            weaver_server_disk::operations::room_wait::StartCheck { root, ..check }
+                .room_now(&self.storage_capacity)
+                .is_some_and(|room| room >= need)
+        };
+        match self.complete_on_other_disk() {
+            true => room(check.root, need) && room(StorageRoot::Complete, size),
+            false => room(root, need),
+        }
+    }
+
+    // What a reading of the held job's disk has to leave free, past the
+    // reserve and every promise, to let it start again in its download.
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
+    pub(in crate::pipeline) fn full_disk_start_need(&self, job_id: JobId) -> Option<u64> {
+        self.full_disk
+            .get(&job_id)
+            .map(|hold| self.held_start_need(job_id, &hold.wait).1)
+    }
+
+    // What the held job's start again promises: what it has left to fetch.
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
+    pub(in crate::pipeline) fn full_disk_start_promise(&self, job_id: JobId) -> Option<u64> {
+        self.full_disk
+            .get(&job_id)
+            .map(|hold| self.held_start_need(job_id, &hold.wait).0)
     }
 
     // What a reading of the held job's disk has to show more than.

@@ -16,6 +16,7 @@ use super::*;
 use crate::pipeline::graph::lines::Lines;
 
 mod again;
+mod disk_start;
 mod held_release;
 mod recovery;
 mod recovery_contracts;
@@ -4337,9 +4338,21 @@ const RESERVE: u64 = 1 << 30;
 
 fn reserved(free: &Arc<std::sync::atomic::AtomicU64>, size: u64, par3: bool, fix: Fix) -> Job {
     let reader = disk(free, size, &Arc::default());
-    let job = on_disk(&reader, RESERVE, 5);
+    let mut job = on_disk(&reader, RESERVE, 5);
     job.par.lock().unwrap().par3 = par3;
+    // The job started with its set's bytes promised, as a started job is:
+    // they land on that promise, and only the repair's own writes are
+    // judged.
+    posting(&mut job, PAR2_SIGNATURE.len() as u64);
     job.with_set(Some(fix))
+}
+
+// The job's start promised `bytes` more of posts on the disk it delivers
+// to, the only one these jobs read, as a start does: on the ledger, and in
+// the writer, which its posts draw on.
+fn posting(job: &mut Job, bytes: u64) {
+    job.writer.output_free_disk.ledger().promise(bytes);
+    job.writer.start_with_posted(0, bytes);
 }
 
 // How many of the repair's staged outputs are left in the job's folder.
@@ -4467,6 +4480,7 @@ fn a_post_that_arrives_while_its_rebuild_waits_is_no_longer_waited_for() {
         },
     );
     let video = job.member("video.mkv", Some(DECLARED));
+    posting(&mut job, DECLARED);
     let due = job.tree.recovery_nodes(NodeId::ROOT);
     let mut lent = Inline::default();
     let rechecks = || super::recovery::HELD_RECHECKS.with(std::cell::Cell::get);
@@ -4584,6 +4598,7 @@ fn a_repair_into_the_posts_is_promised_its_room_before_it_goes_out() {
             },
         );
         let member = job.member("video.mkv", Some(8));
+        posting(&mut job, 8);
         if arrived {
             job.send(member, 0, b"go", Provenance::Fresh);
             job.send(member, 2, b"XX", Provenance::Damaged);
@@ -4615,7 +4630,10 @@ fn a_repair_into_the_posts_is_promised_its_room_before_it_goes_out() {
         );
         assert_eq!(result.unwrap(), Some(1));
         assert!(job.writer.refusal().is_none());
-        assert!(!job.writer.disk_held(), "its room was promised before");
+        assert!(
+            !job.writer.disk_held(),
+            "its room was promised before: par3 {par3}, arrived {arrived}, free {before} then {after}"
+        );
         assert_eq!(job.file("video.mkv"), b"goOKgood");
     }
 }

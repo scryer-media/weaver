@@ -314,6 +314,8 @@ pub fn initial_info(
         error: None,
         download_wait_reason: None,
         download_retry_at_epoch_ms: None,
+        disk_need_bytes: None,
+        disk_free_bytes: None,
         created_at_epoch_ms: crate::jobs::model::epoch_ms_now(),
     }
 }

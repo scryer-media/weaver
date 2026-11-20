@@ -11,8 +11,8 @@ pub mod operations {
 
     pub use disk::{
         Capacity, CapacityDebits, CapacityReader, CapacityReading, DiskProbeError, DiskSpace,
-        LateClassification, OnDemandSpace, Reach, StorageCapacity, StorageRoot, VolumeBuffers,
-        VolumeWriters, is_out_of_space, is_quota_exceeded,
+        LateClassification, OnDemandSpace, Reach, StartBooking, StorageCapacity, StorageRoot,
+        VolumeBuffers, VolumeWriters, is_out_of_space, is_quota_exceeded,
     };
 }
 pub mod pipeline {

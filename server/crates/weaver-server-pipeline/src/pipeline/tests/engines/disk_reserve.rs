@@ -196,6 +196,9 @@ pub fn nested() -> (Vec<u8>, u64, Vec<u8>, Vec<u8>) {
 pub fn status(pipeline: &Pipeline) -> Option<JobStatus> {
     crate::pipeline::tests::job_status_for_assert(pipeline, JOB)
 }
+pub fn status_of(pipeline: &Pipeline, job: JobId) -> Option<JobStatus> {
+    crate::pipeline::tests::job_status_for_assert(pipeline, job)
+}
 pub fn eligible(pipeline: &Pipeline) -> Vec<JobId> {
     pipeline.download_scheduler_eligible_jobs()
 }
@@ -513,6 +516,51 @@ pub fn full_disk_mark(pipeline: &Pipeline) -> Option<u64> {
 
 pub fn full_disk_rise(pipeline: &Pipeline) -> (Option<u64>, bool) {
     pipeline.full_disk_rise(JOB)
+}
+
+// What a reading has to leave free, past the reserve and every promise, for
+// the job held in its download to start again.
+pub fn full_disk_start_need(pipeline: &Pipeline) -> u64 {
+    pipeline
+        .full_disk_start_need(JOB)
+        .expect("the job is held for a full disk")
+}
+
+// What the job held in its download is promised when it starts again.
+pub fn full_disk_start_promise(pipeline: &Pipeline) -> u64 {
+    full_disk_start_promise_of(pipeline, JOB)
+}
+
+pub fn full_disk_start_promise_of(pipeline: &Pipeline, job: JobId) -> u64 {
+    pipeline
+        .full_disk_start_promise(job)
+        .expect("the job is held for a full disk")
+}
+
+// `job` is held in its download as a step that needs `needs` free, with the
+// disk refusing it, is held.
+pub fn hold_step_of(pipeline: &mut Pipeline, job: JobId, needs: u64) {
+    pipeline.hold_job_for_full_disk(
+        job,
+        StorageRoot::Intermediate,
+        crate::pipeline::full_disk::Wants {
+            needs: Some(needs),
+            left: None,
+            quota: false,
+        },
+    );
+}
+
+// Every retiring graph has said its runs are over.
+pub async fn old_graphs_heard(pipeline: &mut Pipeline) {
+    while !pipeline.retiring_graph_jobs.is_empty() {
+        let said = pipeline
+            .graph_runs
+            .recv()
+            .await
+            .expect("the retiring graph's runs answer");
+        pipeline.graph_run_said(said);
+    }
 }
 
 pub fn park_disk_held_jobs(pipeline: &mut Pipeline) {

@@ -1059,6 +1059,9 @@ impl Pipeline {
         self.disk_waiting.remove(&job_id);
         self.disk_idle.remove(&job_id);
         let mut graph = self.graph_jobs.remove(&job_id)?;
+        // A job that stops fetches no more: what its start promised and did
+        // not land goes back before the graph may be kept.
+        graph.release_posted();
         let pending = graph.pending().clone();
         if !pending.control().cancelled()
             && pending

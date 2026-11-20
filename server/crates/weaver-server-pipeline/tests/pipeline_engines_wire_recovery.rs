@@ -14,6 +14,7 @@ mod pipeline {
             #[path = "recovery_audit_stream.rs"]
             mod recovery_audit;
             use weaver_server_pipeline::pipeline::tests::engines::{disk_archive, disk_reserve};
+            mod disk_start_wait;
             mod disk_wait;
             mod lent_handed;
             mod recovery_damage_wire;

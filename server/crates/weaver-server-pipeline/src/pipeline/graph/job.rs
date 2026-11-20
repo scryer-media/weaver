@@ -383,6 +383,24 @@ impl GraphJob {
         kept
     }
 
+    // The bytes promised on the disks when the job started, `working` on
+    // the working disk and `output` on the complete one: its downloaded
+    // bytes land against them.
+    pub(crate) fn take_posted(&mut self, working: u64, output: u64) {
+        self.writer.take_posted(working, output);
+    }
+
+    // What the start promised and did not land goes back.
+    pub(crate) fn release_posted(&mut self) {
+        self.writer.release_posted();
+    }
+
+    // What the start promised and has not landed, working and output.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn posted(&self) -> [u64; 2] {
+        self.writer.posted()
+    }
+
     // What the job did since this was last asked.
     pub fn take_notes(&mut self) -> Vec<Note> {
         let mut notes = std::mem::take(&mut self.notes);

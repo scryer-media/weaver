@@ -1852,12 +1852,31 @@ pub struct Pipeline {
     // live: they wake on the next turn whatever the disk reads. A turn
     // with none of them looks at no job.
     pub(super) disk_idle: std::collections::BTreeSet<JobId>,
-    // The working disk had no room over its reserve when a job that never
-    // downloaded was to start: no such job starts until a good reading shows
-    // room. A job that started fetches on.
+    // A job the last walk would have started did not fit on the disk, or
+    // the disk had no fresh reading: the disk's ledger is waited on, so its
+    // readings and the promises given back ring, and one that may let a job
+    // start brings the next walk.
     pub(super) admission_disk_held: bool,
-    // The jobs the last walk would have started but for that.
-    pub(super) disk_unadmitted: std::collections::BTreeSet<JobId>,
+    // The least any job kept waiting needs: a reading whose room reaches it
+    // brings a walk, a smaller one does not.
+    pub(super) admission_disk_need_min: u64,
+    // A job was kept waiting for want of a fresh reading: the first one
+    // brings a walk.
+    pub(super) admission_disk_unread: bool,
+    // How many promises the disk had given back when the hold last looked:
+    // one given back since brings a walk.
+    pub(super) admission_disk_releases: u64,
+    // The most the disks could hold for a start when the last walk looked:
+    // disks that grew since bring a walk.
+    pub(super) admission_disk_most: Option<nzb_admission::StartMost>,
+    // The hold waits on the complete disk's ledger too, it being another
+    // disk the jobs write to.
+    pub(super) admission_disk_waits_complete: bool,
+    // The jobs the last walk would have started but for the disk, and why.
+    pub(super) disk_unadmitted: std::collections::BTreeMap<JobId, nzb_admission::DiskUnadmitted>,
+    // What each job holding a slot was promised on the disk when it
+    // started: still with the walk, or handed to its graph.
+    pub(super) start_promises: HashMap<JobId, nzb_admission::StartPromise>,
     // The jobs a write found the disk full for: each fetches nothing until
     // a reading taken since shows room, and then runs on from its last
     // checkpoint.

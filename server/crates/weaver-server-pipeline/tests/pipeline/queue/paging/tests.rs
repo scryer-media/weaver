@@ -43,6 +43,8 @@ fn job(id: u64, status: JobStatus, download: DownloadState, post: PostState) -> 
         error: None,
         download_wait_reason: None,
         download_retry_at_epoch_ms: None,
+        disk_need_bytes: None,
+        disk_free_bytes: None,
         created_at_epoch_ms: 1.0,
     });
     job.name = format!("Release.{id}.1080p");

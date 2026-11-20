@@ -1142,9 +1142,5 @@ pub fn queue_position_writes(
 
 // Whether the row's restore waits for its stored NZB outline to be read.
 fn outline_pending(row: &crate::pipeline::queue::JobRow) -> bool {
-    row.intents
-        .restore
-        .as_ref()
-        .and_then(|request| request.restart.as_ref())
-        .is_some_and(|read| read.outline_pending)
+    row.outline_pending()
 }
