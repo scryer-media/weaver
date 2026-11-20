@@ -22,7 +22,7 @@ use crate::pipeline::graph::leaf::LeafError;
 use crate::pipeline::graph::namespace::WriteError;
 use weaver_server_disk::operations::disk::volume::{Reservation, Volume};
 use weaver_server_disk::operations::disk::writer::{
-    Barrier, DiskOwner, Failure, Owner, Prepaid, Submitter, VolumeWriters,
+    Barrier, Credit, DiskOwner, Failure, Owner, Prepaid, Stand, Submitter, VolumeWriters,
 };
 
 // The volumes' writers as the pipeline writes through them: the writers
@@ -632,14 +632,6 @@ pub struct JobDisk {
     _writing: Option<Arc<Writing>>,
 }
 
-// The bytes a volume may hold in memory for its writer before a thread
-// that produces a job's output waits for it: the volume's own hard limit.
-// It paces the thread only; what it hands the loop counts against the limit
-// as the loop queues it (`Submitter::write`).
-fn output_limit(submitter: &Submitter) -> u64 {
-    submitter.volume().buffer_limits().1
-}
-
 impl JobDisk {
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub fn new(working: Arc<Submitter>, output: Option<(PathBuf, Arc<Submitter>)>) -> Self {
@@ -650,15 +642,12 @@ impl JobDisk {
         }
     }
 
-    // Stand still until no volume the job writes to holds more than its
-    // hard limit for its writer: the wait of a thread that produces what
-    // the job writes, an extraction's run, before it hands the loop more.
-    // Never for the loop. Returns at once for a job whose writes failed
-    // or were given up.
-    pub(crate) fn wait_below(&self) {
-        for submitter in self.each() {
-            submitter.wait_below(output_limit(submitter));
-        }
+    // Count `bytes` on every volume the job writes to, standing still on the
+    // calling thread until each has them below its hard limit: what a
+    // thread that produces the job's output hands the loop with the bytes
+    // (`Credit::reserve`). Never the loop's own wait.
+    pub(crate) fn reserve_ahead(&self, bytes: u64, stand: Stand) -> Credit {
+        Credit::reserve(self.each(), bytes, stand)
     }
 
     // The writer of the volume a file under `root` lies on.

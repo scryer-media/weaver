@@ -1001,6 +1001,8 @@ fn renders_collected_instrumentation_snapshots() {
         ("weaver_volume_writer_length_sets_skipped_total", "8"),
         ("weaver_volume_writer_closes_total", "10"),
         ("weaver_volume_writer_close_seconds_total", "0.25"),
+        ("weaver_volume_writer_write_outs_total", "7"),
+        ("weaver_volume_writer_write_out_seconds_total", "1.75"),
     ] {
         let line = format!("{row}{{volume=\"/mnt/nas\"}} {value}");
         assert!(rendered.contains(&line), "{line}");

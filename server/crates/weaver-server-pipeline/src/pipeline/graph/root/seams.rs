@@ -430,6 +430,8 @@ impl Pipeline {
                 || matches!(
                     &said.heard,
                     Heard::Repaired(_)
+                        | Heard::RepairSlice(_)
+                        | Heard::RepairRead(_)
                         | Heard::Replayed(_)
                         | Heard::Verified(_)
                         | Heard::Worked(_)
@@ -449,13 +451,16 @@ impl Pipeline {
         }
         let limit = self.graph_job_slot_limit(job_id);
         let Some(graph) = self.graph_jobs.get_mut(&job_id) else {
-            self.graph_outside.deliver(said, limit);
+            if let Some(unheard) = self.graph_outside.deliver(said, limit) {
+                crate::pipeline::graph::job::discard_unheard(unheard);
+            }
             return;
         };
         let ended = matches!(
             said.heard,
             Heard::Ended
                 | Heard::Repaired(_)
+                | Heard::RepairRead(_)
                 | Heard::Replayed(_)
                 | Heard::Verified(_)
                 | Heard::Worked(_)

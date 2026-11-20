@@ -39,6 +39,12 @@ impl GraphJob {
     // out: the reads of recovery a restore asked again, and a check of what
     // was written. Repairs, replays and the objects' work wait with the job.
     pub fn lend(&mut self, slots: &mut RepairSlots, limit: usize) -> Result<(), GraphError> {
+        // Nothing is lent or done while a repair's return is being applied:
+        // its slices are read back through the members its set covers, and
+        // its tail lends what is due then.
+        if self.loans.applying() {
+            return Ok(());
+        }
         if limit > 0 {
             self.lend_rewalks()?;
         }

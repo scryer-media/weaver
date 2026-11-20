@@ -201,6 +201,69 @@ pub struct Acknowledging {
     // set's verdict: read back, they are the bytes every set over them
     // ruled on, so they take no ruling back.
     pub rereading: bool,
+    // The return's own bytes are being placed: a slice, or its tail. They
+    // are the set's ruling, so they take none back. Bytes that arrive
+    // between two slices of a return applied a slice at a time are fed as
+    // any others are.
+    pub placing: bool,
+}
+
+// What a repair's return being applied has come to so far, slice by slice,
+// until its tail rules on it (`NamespaceWriter::applied`).
+struct Apply {
+    set: NodeId,
+    node: NodeId,
+    found: Vec<(MemberId, ByteRange)>,
+    outcome: Option<weaver_graph::recovery::RepairOutcome>,
+    rejected: Vec<(NodeId, Vec<(weaver_graph::VolumeIndex, ByteRange)>)>,
+    // The members a slice landed in.
+    rewritten: BTreeSet<MemberId>,
+    // Whether a slice was read back, and whether one landed: a return none
+    // of whose slices landed rewrote nothing.
+    offered: bool,
+    landed: bool,
+    // Whether a slice lands only where no repair wrote before it.
+    contested: bool,
+}
+
+// A repair's return applied a slice at a time, as its reader reads the
+// staged output back off the loop and counts each slice on the job's
+// volumes (`RepairSlice`). Between two slices the loop goes on with the
+// job's other mail under the open batch (`acknowledging`): a member that
+// mail closes is judged with the batch at the tail, and a member it refuses
+// is placed again there, as within an apply in one step. Only the return's
+// own bytes are placed under the set's ruling (`Acknowledging::placing`).
+struct Applying {
+    apply: Apply,
+    // The first failure placing a slice: nothing lands after it, and the
+    // reader is told to read no more.
+    error: Option<WriteError>,
+    // The staged output, until the job hands it to its reader.
+    output: Option<loan::Repaired>,
+    // What the slices said, heard once the whole return is down, as an
+    // apply in one step hears it.
+    said: Vec<Effect>,
+    // The slices placed so far.
+    slices: u64,
+}
+
+// One slice of a repair's staged output, read back off the loop, with what
+// its reader counted for it on the job's volumes.
+#[derive(Debug)]
+pub struct RepairSlice {
+    pub member: MemberId,
+    pub offset: u64,
+    pub bytes: Result<bytes::Bytes, LeafError>,
+    pub credit: weaver_server_disk::operations::disk::writer::Credit,
+}
+
+// The reader of a repair's staged output is done: every slice it read was
+// said before. `whole` is false when it read no further than a slice it
+// could not count before the end of a stop, or when it was told to stop.
+#[derive(Debug)]
+pub struct RepairRead {
+    pub output: loan::Repaired,
+    pub whole: bool,
 }
 
 // An archive given up on as an archive: its members are delivered or
@@ -297,6 +360,11 @@ pub struct NamespaceWriter {
     // The set whose repair is being acknowledged: only its certified writes
     // retain its settled ruling.
     pub acknowledging: Option<Acknowledging>,
+    // A repair's return being applied a slice at a time, until its reader
+    // is done.
+    applying: Option<Applying>,
+    // The credit the loop carries for a run's output it holds (`carried`).
+    carried: carried::Carried,
     // Members refused while a repair's return was applied, each read as the
     // first piece of a file once the whole return is down: a later slice of
     // the same return may still rewrite the front of a piece beside it.
@@ -450,6 +518,8 @@ impl NamespaceWriter {
             segments: Vec::new(),
             effects: Vec::new(),
             acknowledging: None,
+            applying: None,
+            carried: carried::Carried::default(),
             refused_in_batch: BTreeSet::new(),
             given_back: Vec::new(),
             unkept: Vec::new(),
@@ -515,6 +585,11 @@ impl NamespaceWriter {
             Some(disk) if !disk.loop_wait_below() => Err(WriteError::LeftAtStop),
             _ => Ok(()),
         }
+    }
+
+    // The namespace the slices of the return being applied land in.
+    pub(crate) fn applying_into(&self) -> Option<NodeId> {
+        self.applying.as_ref().map(|applying| applying.apply.node)
     }
 
     // The writer of the volume a file under `root` lies on, when the job
@@ -2436,6 +2511,7 @@ impl NamespaceWriter {
     ) -> Result<(), WriteError> {
         let free_disk = self.free_disk_bytes();
         let spilled = bytes.clone();
+        let len = bytes.len() as u64;
         let files = self.files_mut(node);
         // Bytes held over ones the member's file already has leave the
         // tree's coverage as it was, so the hold itself marks the member.
@@ -2443,6 +2519,15 @@ impl NamespaceWriter {
         let outcome = files
             .holds
             .hold(held_volume(member), offset, bytes, free_disk);
+        // What a run's output holds in memory is carried for; what the hold
+        // cut over or paged out of memory no longer is.
+        if outcome.placed == Placed::Ram {
+            self.credit_held(node, member, len);
+        }
+        self.uncredit_past_resident(node, member);
+        for page_out in &outcome.page_outs {
+            self.uncredit_past_resident(node, held_member(page_out.volume));
+        }
         for page_out in &outcome.page_outs {
             self.scratch(node)?
                 .write(page_out.scratch_offset, &page_out.bytes, None)?;
@@ -2599,11 +2684,13 @@ impl NamespaceWriter {
         node: NodeId,
         member: MemberId,
     ) -> Result<(), WriteError> {
+        let paid = self.pay_held(tree, node, member);
         for span in self.held_spans(node, member, ALL) {
             for (offset, bytes) in self.take_held(node, member, span)? {
                 self.write_file(tree, node, member, offset, &bytes)?;
             }
         }
+        self.paid_held(node, member, paid);
         Ok(())
     }
 
@@ -2628,11 +2715,13 @@ impl NamespaceWriter {
         said: Option<&Coverage>,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
+        let paid = self.pay_held(tree, node, member);
         for span in self.held_spans(node, member, range) {
             for piece in self.take_held(node, member, span)? {
                 self.replay_piece(tree, builder, segments, (node, member), piece, said, out)?;
             }
         }
+        self.paid_held(node, member, paid);
         Ok(())
     }
 
@@ -2884,6 +2973,7 @@ impl NamespaceWriter {
             // What a checkpoint says of the member's bytes changed.
             files.leaves.mark(member);
         }
+        self.uncredit_past_resident(node, member);
         self.release_spill(node, member)
     }
 
@@ -3548,8 +3638,10 @@ impl NamespaceWriter {
         let nodes: Vec<NodeId> = self.files.keys().copied().collect();
         for node in nodes {
             let Some(namespace) = tree.namespace(node) else {
-                // Dropping the namespace's holds gives their count back.
+                // Dropping the namespace's holds gives their count back,
+                // and what the loop carried for them.
                 if let Some(files) = self.files.remove(&node) {
+                    self.uncredit_node(node);
                     for member in files.leaves.keys() {
                         self.caps.forget(tree, node, *member);
                     }
@@ -4295,6 +4387,7 @@ pub fn index(offset: u64) -> usize {
 }
 
 pub(crate) mod claimed;
+mod carried;
 mod durable;
 mod loan;
 mod moves;
@@ -4309,7 +4402,7 @@ pub(crate) use verification::{Verification, Verified};
 
 pub(crate) use loan::replay::{Replay, Replayed};
 pub(crate) use loan::rewalk::{RewalkLoan, Rewalked};
-pub use loan::{Loan, Returned};
+pub use loan::{Loan, Repaired, Returned};
 #[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub use moves::TALLY;
 pub use moves::restored_at;

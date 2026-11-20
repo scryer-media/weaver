@@ -8,7 +8,9 @@
 // solid state, on Windows whether it incurs a seek penalty. What cannot be
 // read is unknown. An unknown volume's reads take turns as a solid-state
 // one's do (`reader::VolumeReads::of`); only a volume known to spin reads
-// one at a time. No write looks at the kind.
+// one at a time. A write looks only at whether a file lies on a share, on
+// Linux, where the writer bounds what the OS holds unwritten for it
+// (`file_on_network`).
 //
 // This file is the one place that reads it. The disk owner,
 // [`super::StorageCapacity`], reads a root's kind on its own thread and a
@@ -162,6 +164,27 @@ fn cached_rotates(disk: Option<String>, ask: impl FnOnce() -> Option<bool>) -> O
 // through.
 #[cfg(target_os = "linux")]
 const NETWORK_MAGIC: [u64; 5] = [0x6969, 0x517B, 0xFF53_4D42, 0xFE53_4D42, 0x6573_5546];
+
+// Whether the open `file` lies on a share, by the filesystem its handle is
+// on: one `fstatfs`, and no path walked. False when the call fails. Asked
+// by a volume's writer once for the volume, with the first file it opens
+// there (`Volume::write_out`), on the writer's own thread.
+#[cfg(target_os = "linux")]
+pub(crate) fn file_on_network(file: &std::fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: `fstatfs` fills a zeroed `libc::statfs` for an open
+    // descriptor `file` holds; the return code is checked before any field
+    // is read.
+    let magic = unsafe {
+        let mut stat: libc::statfs = std::mem::zeroed();
+        if libc::fstatfs(file.as_raw_fd(), &mut stat) != 0 {
+            return false;
+        }
+        (stat.f_type as u64) & 0xFFFF_FFFF
+    };
+    NETWORK_MAGIC.contains(&magic)
+}
 
 #[cfg(target_os = "linux")]
 fn look(path: &Path) -> Look<impl FnOnce() -> Option<bool>> {
@@ -456,6 +479,13 @@ mod tests {
         // Whatever the disk, a local directory is never called a share.
         let root = tempfile::tempdir().expect("temp dir");
         assert_ne!(storage_kind(root.path()), StorageKind::Network);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_local_file_is_not_on_a_share() {
+        let file = tempfile::tempfile().expect("temp file");
+        assert!(!file_on_network(&file));
     }
 
     #[test]

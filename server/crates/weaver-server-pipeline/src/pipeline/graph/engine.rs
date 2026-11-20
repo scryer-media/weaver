@@ -28,6 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
+use weaver_server_disk::operations::disk::writer::{Credit, Stand};
 use weaver_graph::slots::{Admissions, Asked, AskerId, Slots, Ticket};
 use weaver_graph::{Emit, Extraction, Marks, NodeId, Why};
 
@@ -64,6 +65,16 @@ pub struct Said {
 #[derive(Debug)]
 pub enum Heard {
     Emit(Emit),
+    // An emit of bytes with what the run's thread counted for them on the
+    // job's volumes: the writes they make are paid for out of it, so the
+    // loop queues them without waiting for a disk (`Credit`).
+    Paid(Emit, Credit),
+    // A slice of a repair's staged output, read back off the loop and
+    // counted on the job's volumes as an extraction's bytes are: addressed
+    // to the set's node, under the apply's loan number.
+    RepairSlice(Box<super::namespace::RepairSlice>),
+    // The apply's reader is done: every slice it read was said before.
+    RepairRead(Box<super::namespace::RepairRead>),
     // The run returned: nothing more will be said under its generation.
     Ended,
     // A recovery set's repair, lent off the loop, came back: addressed to
@@ -317,11 +328,16 @@ impl Outside {
             .collect()
     }
 
-    // Hand `said` to the job it is addressed to, if that job is here.
-    pub fn deliver(&self, said: Said, slots: usize) {
+    // Hand `said` to the job it is addressed to, if that job is here; back
+    // when no one is left to hear it.
+    pub fn deliver(&self, said: Said, slots: usize) -> Option<Said> {
         let hears = self.jobs().get(&said.scope).cloned();
-        if let Some(hears) = hears {
-            hears.said(said, slots);
+        match hears {
+            Some(hears) => {
+                hears.said(said, slots);
+                None
+            }
+            None => Some(said),
         }
     }
 }
@@ -889,13 +905,20 @@ impl Runs {
                 }
                 let _waiting = decoding.wait();
                 extracting_hook(&volumes);
-                // What the run said before is with the volumes' writers
-                // or on its way: no more is said while a volume holds
-                // its budget of it.
-                if let Some(disk) = &disk {
-                    disk.wait_below();
-                }
-                volumes.current() && mail.blocking_send(said(Heard::Emit(emit))).is_ok()
+                // Bytes are counted here, on the run's thread, on every
+                // volume they may land on, standing still while one is at
+                // its hard limit, and the count goes with them: the loop
+                // pays their writes out of it and never waits for a disk.
+                // A stop ends the wait; what the run says after it is not
+                // heard, and the count goes back as it drops.
+                let heard = match (&disk, &emit) {
+                    (Some(disk), Emit::Bytes { bytes, .. }) => {
+                        let credit = disk.reserve_ahead(bytes.len() as u64, Stand::UntilStop);
+                        Heard::Paid(emit, credit)
+                    }
+                    _ => Heard::Emit(emit),
+                };
+                volumes.current() && mail.blocking_send(said(heard)).is_ok()
             };
             extraction.run(reader, &mut sink, budget);
             // A run that read bytes nothing will bring, and did not read on

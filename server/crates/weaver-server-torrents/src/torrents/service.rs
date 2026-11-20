@@ -348,7 +348,12 @@ impl JobEnv {
         let (outside, slots) = (Arc::clone(&self.outside), self.slots);
         Some(tokio::spawn(async move {
             while let Some(said) = mail.recv().await {
-                outside.deliver(said, slots);
+                if let Some(unheard) = outside.deliver(said, slots) {
+                    // Off the runtime: the removal is a filesystem call.
+                    tokio::task::spawn_blocking(move || {
+                        crate::pipeline::graph::job::discard_unheard(unheard);
+                    });
+                }
             }
         }))
     }

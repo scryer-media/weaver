@@ -149,6 +149,7 @@ fn a_member_closed_during_acknowledgement_gets_its_verdict_once() {
             set: NodeId(91),
             closed: Default::default(),
             rereading: false,
+            placing: true,
         });
         job.send(member, 0, b"abcd", Provenance::Repaired);
         job.close(member);

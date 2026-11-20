@@ -2279,3 +2279,448 @@ fn a_closed_file_written_again_leaves_the_closed_files() {
     drop(held);
     assert_eq!(std::fs::read(path(1)).unwrap(), b"headtail");
 }
+
+// What a test's write-out saw: each call's file, and the file's length then.
+type WriteOuts = Arc<Mutex<Vec<(PathBuf, u64)>>>;
+
+// A volume whose writer starts each write-out through the test, as on a
+// share, answering `answer` to each.
+fn share(label: &str, answer: fn() -> io::Result<()>) -> (Arc<Volume>, WriteOuts) {
+    let volume = volume(label);
+    let seen = WriteOuts::default();
+    let record = Arc::clone(&seen);
+    volume.write_out_for_test(move |path, file| {
+        let length = file.metadata()?.len();
+        record.lock().unwrap().push((path.to_path_buf(), length));
+        answer()
+    });
+    (volume, seen)
+}
+
+const MIB: u64 = 1024 * 1024;
+
+// Writes `pieces` more of `piece` to `file` from `at`; a write at the start
+// brings the way to open the file. Where the next piece goes.
+fn write_pieces(
+    job: &Submitter,
+    file: u64,
+    path: &Path,
+    at: u64,
+    pieces: u64,
+    piece: &Bytes,
+) -> u64 {
+    let mut at = at;
+    for _ in 0..pieces {
+        let opens = (at == 0).then(|| create(path)).flatten();
+        job.write(file, at, piece.clone(), opens);
+        at += piece.len() as u64;
+    }
+    at
+}
+
+// On a share each file starts a write-out once a stride of its own writes
+// has gone since its last: never before, never for another file's bytes,
+// and with each counted and timed on the volume.
+#[test]
+fn a_share_starts_a_files_write_out_at_each_stride_of_its_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (first, second) = (dir.path().join("first"), dir.path().join("second"));
+    let (writers, reports) = writers();
+    let (volume, seen) = share("share", || Ok(()));
+    let job = writers.test_submitter(&volume, 1);
+    let piece = Bytes::from(vec![7u8; (8 * MIB) as usize]);
+    assert_eq!(WRITE_OUT_STRIDE, 32 * MIB);
+    // Three pieces of the first file and two of the second: 40 MiB in all,
+    // neither file at a stride.
+    let mut a = write_pieces(&job, 1, &first, 0, 3, &piece);
+    let mut b = write_pieces(&job, 2, &second, 0, 2, &piece);
+    job.barrier().wait();
+    assert!(seen.lock().unwrap().is_empty(), "no file reached a stride");
+    // The fourth piece takes the first file to its stride.
+    a = write_pieces(&job, 1, &first, a, 1, &piece);
+    job.barrier().wait();
+    assert_eq!(*seen.lock().unwrap(), vec![(first.clone(), 32 * MIB)]);
+    // Two more take the second to its own.
+    b = write_pieces(&job, 2, &second, b, 2, &piece);
+    job.barrier().wait();
+    assert_eq!(seen.lock().unwrap().last(), Some(&(second.clone(), 32 * MIB)));
+    // The first file counts again from its last write-out.
+    a = write_pieces(&job, 1, &first, a, 3, &piece);
+    job.barrier().wait();
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    write_pieces(&job, 1, &first, a, 1, &piece);
+    job.barrier().wait();
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![
+            (first.clone(), 32 * MIB),
+            (second.clone(), 32 * MIB),
+            (first.clone(), 64 * MIB),
+        ]
+    );
+    assert_eq!(count(&volume.writer.write_outs), 3);
+    assert!(job.barrier().passed());
+    assert_eq!(std::fs::metadata(&second).unwrap().len(), b);
+    assert!(reports.try_recv().is_err(), "a clean write-out says nothing");
+}
+
+// A write-out the OS refuses is not asked for again on the volume, for any
+// file, and fails nothing: every write stands.
+#[test]
+fn a_refused_write_out_stops_them_on_the_volume_and_fails_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (first, second) = (dir.path().join("first"), dir.path().join("second"));
+    let (writers, reports) = writers();
+    let (volume, seen) = share("share", || Err(io::ErrorKind::Unsupported.into()));
+    let job = writers.test_submitter(&volume, 1);
+    let piece = Bytes::from(vec![7u8; (8 * MIB) as usize]);
+    let a = write_pieces(&job, 1, &first, 0, 4, &piece);
+    job.barrier().wait();
+    assert_eq!(*seen.lock().unwrap(), vec![(first.clone(), 32 * MIB)]);
+    // Past another stride of the first file and a whole one of the second.
+    let a = write_pieces(&job, 1, &first, a, 4, &piece);
+    let b = write_pieces(&job, 2, &second, 0, 4, &piece);
+    job.barrier().wait();
+    assert_eq!(seen.lock().unwrap().len(), 1, "asked once, then never");
+    assert_eq!(count(&volume.writer.write_outs), 1);
+    let barrier = job.barrier();
+    assert!(barrier.passed(), "the writes stand");
+    assert!(!job.failed());
+    assert!(reports.try_recv().is_err(), "a refused write-out is no failure");
+    assert_eq!(std::fs::metadata(&first).unwrap().len(), a);
+    assert_eq!(std::fs::metadata(&second).unwrap().len(), b);
+}
+
+// A volume on a local disk starts no write-out, however much is written:
+// the volume finds its own, from the first file its writer opens.
+#[test]
+fn a_local_volume_starts_no_write_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("local");
+    let (writers, _reports) = writers();
+    let volume = volume("local");
+    let job = writers.test_submitter(&volume, 1);
+    let piece = Bytes::from(vec![7u8; (8 * MIB) as usize]);
+    write_pieces(&job, 1, &path, 0, 8, &piece);
+    job.barrier().wait();
+    assert!(job.barrier().passed());
+    assert_eq!(count(&volume.writer.write_outs), 0);
+    assert_eq!(count(&volume.writer.write_out_nanos), 0);
+}
+
+fn budget_waits(volume: &Volume) -> u64 {
+    count(&volume.writer.loop_waits_by_kind[LoopWait::Budget as usize])
+}
+
+// Output counted ahead on the volume it lands on: the producing thread
+// stands still for a full volume, never the queuing thread. Once counted,
+// the write is queued at once, counted no further, so the volume never
+// counts past its limit, and the queue holds the producer's own allocation.
+#[test]
+fn a_write_paid_where_it_lands_never_stops_the_queuing_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a");
+    let (writers, _reports) = writers();
+    let share = volume("share");
+    share.set_buffer_limits(1600, 1600);
+    let hold = writers.hold(&share);
+    let job = writers.test_submitter(&share, 1);
+    job.write(1, 0, Bytes::from(vec![1u8; 1000]), create(&path));
+    hold.wait_held();
+    job.write(1, 1000, Bytes::from(vec![2u8; 600]), None);
+    assert_eq!(share.unwritten_bytes(), 1600);
+    let waits_before = budget_waits(&share);
+    let credit = std::thread::scope(|scope| {
+        let producer = scope.spawn(|| Credit::reserve([&job], 400, Stand::UntilStop));
+        hold.wait_below_waiters(1);
+        assert_eq!(share.unwritten_bytes(), 1600, "nothing more was counted");
+        // The writer writes five pieces of 100: 1100 counted, and 400 fit.
+        hold.release(5);
+        producer.join().unwrap()
+    });
+    assert!(credit.covers(400));
+    assert_eq!(share.unwritten_bytes(), 1500);
+    let paying = credit.prepay();
+    let article = Bytes::from(vec![3u8; 400]);
+    let kept = article.clone();
+    job.write(1, 1600, article, None);
+    let credit = paying.settle(|_| 0);
+    assert!(credit.is_empty(), "the write took all of the credit");
+    assert_eq!(share.unwritten_bytes(), 1500, "counted once, ahead");
+    assert!(!kept.is_unique(), "the queue holds the same allocation");
+    hold.open();
+    writers.settle();
+    assert_eq!(budget_waits(&share), waits_before, "the queuing thread never stood still");
+    assert_eq!(share.peak_bytes(), 1600);
+    assert_eq!(share.unwritten_bytes(), 0);
+    assert!(kept.is_unique());
+    let written = std::fs::read(&path).unwrap();
+    assert!(written[1600..].iter().all(|byte| *byte == 3));
+}
+
+// Output counted on two volumes it may land on: a write of it on one frees
+// what was counted for it on the other. What no write took is carried for
+// as long as the queuing thread holds the bytes, and given back past that.
+#[test]
+fn a_credit_is_freed_where_its_bytes_did_not_land_and_carried_while_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a");
+    let (writers, _reports) = writers();
+    let (one, two) = (volume("one"), volume("two"));
+    one.set_buffer_limits(1600, 1600);
+    two.set_buffer_limits(1600, 1600);
+    let hold = writers.hold(&one);
+    let (first, second) = (
+        writers.test_submitter(&one, 1),
+        writers.test_submitter(&two, 2),
+    );
+    let credit = Credit::reserve([&first, &second], 100, Stand::UntilStop);
+    assert_eq!((one.unwritten_bytes(), two.unwritten_bytes()), (100, 100));
+    let paying = credit.prepay();
+    first.write(1, 0, Bytes::from(vec![1u8; 100]), create(&path));
+    let credit = paying.settle(|_| 100);
+    assert!(credit.is_empty());
+    assert_eq!(one.unwritten_bytes(), 100, "the write's own count");
+    assert_eq!(two.unwritten_bytes(), 0, "freed where the bytes did not land");
+    // Nothing is written in the next step, and 60 of the bytes are held.
+    let credit = Credit::reserve([&first, &second], 100, Stand::UntilStop);
+    let credit = credit.prepay().settle(|_| 60);
+    assert_eq!(credit.on(&one), 60);
+    assert_eq!(credit.on(&two), 60);
+    assert_eq!((one.carried_bytes(), two.carried_bytes()), (60, 60));
+    assert_eq!((one.unwritten_bytes(), two.unwritten_bytes()), (160, 60));
+    drop(credit);
+    assert_eq!((one.carried_bytes(), two.carried_bytes()), (0, 0));
+    assert_eq!((one.unwritten_bytes(), two.unwritten_bytes()), (100, 0));
+    hold.open();
+    writers.settle();
+    assert_eq!(one.unwritten_bytes(), 0);
+}
+
+// Credit given back wakes a producing thread that stands for room on its
+// volume, with nothing written meanwhile.
+#[test]
+fn a_credit_given_back_wakes_a_thread_that_stands_for_room() {
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    volume.set_buffer_limits(64, 64);
+    let hold = writers.hold(&volume);
+    let job = writers.test_submitter(&volume, 1);
+    let held = Credit::reserve([&job], 64, Stand::UntilStop);
+    assert!(held.covers(64));
+    let credit = std::thread::scope(|scope| {
+        let producer = scope.spawn(|| Credit::reserve([&job], 10, Stand::UntilStop));
+        hold.wait_below_waiters(1);
+        assert_eq!(volume.unwritten_bytes(), 64);
+        drop(held);
+        producer.join().unwrap()
+    });
+    assert!(credit.covers(10));
+    assert_eq!(volume.unwritten_bytes(), 10);
+    assert_eq!(count(&volume.written_bytes), 0, "nothing was written");
+    drop(credit);
+    hold.open();
+}
+
+// What the queuing thread carries for a job's output is judged as not
+// counted for that job's own producers only: the queuing thread may need
+// their next output to let go of what it holds, so the volume passes its
+// limit by at most what the job holds. Another job's producer counts the
+// carried bytes in full and stands until they go.
+#[test]
+fn carried_bytes_grant_room_to_their_own_job_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a");
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    volume.set_buffer_limits(64, 64);
+    let hold = writers.hold(&volume);
+    let (job, other) = (
+        writers.test_submitter(&volume, 1),
+        writers.test_submitter(&volume, 2),
+    );
+    let carried = Credit::reserve([&job], 64, Stand::UntilStop)
+        .prepay()
+        .settle(|_| 64);
+    assert_eq!(volume.carried_bytes(), 64);
+    let next = Credit::reserve([&job], 10, Stand::UntilStop);
+    assert!(next.covers(10), "granted beside its own job's carried bytes");
+    assert_eq!(volume.unwritten_bytes(), 74);
+    drop(next);
+    // Beside the carried bytes and one byte the writer can write, neither
+    // the job's producer nor another job's is granted room past the limit:
+    // both stand until room is made.
+    job.write(1, 0, Bytes::from(vec![1u8; 1]), create(&path));
+    std::thread::scope(|scope| {
+        let mine = scope.spawn(|| Credit::reserve([&job], 10, Stand::UntilStop));
+        let theirs = scope.spawn(|| Credit::reserve([&other], 10, Stand::UntilStop));
+        hold.wait_below_waiters(2);
+        assert_eq!(
+            volume.unwritten_bytes(),
+            65,
+            "no producer is granted room beside a byte the writer can write"
+        );
+        drop(carried);
+        assert!(mine.join().unwrap().covers(10));
+        assert!(theirs.join().unwrap().covers(10));
+    });
+    hold.open();
+    writers.settle();
+    assert_eq!(volume.unwritten_bytes(), 0);
+}
+
+// Counted bytes given back by any path wake a producer that stands for room,
+// with nothing written and no owner asked: here another job's reservation,
+// as the loop's download leases are, dropped where it was held.
+#[test]
+fn any_release_of_counted_bytes_wakes_a_thread_that_stands_for_room() {
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    volume.set_buffer_limits(64, 64);
+    let hold = writers.hold(&volume);
+    let job = writers.test_submitter(&volume, 1);
+    let mut lease = Reservation::none(Arc::clone(&volume));
+    assert!(lease.reserve(60, 0));
+    let credit = std::thread::scope(|scope| {
+        let producer = scope.spawn(|| Credit::reserve([&job], 10, Stand::UntilStop));
+        hold.wait_below_waiters(1);
+        assert_eq!(volume.unwritten_bytes(), 60, "nothing more was counted");
+        lease.give_back(30);
+        drop(lease);
+        producer.join().unwrap()
+    });
+    assert!(credit.covers(10));
+    assert_eq!(volume.unwritten_bytes(), 10);
+    assert_eq!(count(&volume.written_bytes), 0, "nothing was written");
+    drop(credit);
+    hold.open();
+}
+
+// A producer that wants room on two volumes never stands for one while it
+// holds bytes on the other: what the free one granted goes back while it
+// waits, so two producers that want the two in either order cannot each
+// hold one and stand for the other.
+#[test]
+fn a_producer_holds_nothing_while_it_stands_for_another_volume() {
+    let (writers, _reports) = writers();
+    let (one, two) = (volume("one"), volume("two"));
+    one.set_buffer_limits(64, 64);
+    two.set_buffer_limits(64, 64);
+    let hold = writers.hold(&two);
+    let (first, second) = (
+        writers.test_submitter(&one, 1),
+        writers.test_submitter(&two, 1),
+    );
+    let mut lease = Reservation::none(Arc::clone(&two));
+    assert!(lease.reserve(30, 0));
+    let credit = std::thread::scope(|scope| {
+        let producer = scope.spawn(|| Credit::reserve([&first, &second], 40, Stand::UntilStop));
+        hold.wait_below_waiters(1);
+        assert_eq!(
+            (one.unwritten_bytes(), two.unwritten_bytes()),
+            (0, 30),
+            "it stands holding nothing"
+        );
+        drop(lease);
+        producer.join().unwrap()
+    });
+    assert!(credit.covers(40));
+    assert_eq!((one.unwritten_bytes(), two.unwritten_bytes()), (40, 40));
+    drop(credit);
+    assert_eq!((one.unwritten_bytes(), two.unwritten_bytes()), (0, 0));
+    hold.open();
+}
+
+// What the queuing thread carries is given back, or taken to pay a write,
+// on the volume named, and only there; a credit moved to another volume
+// counts there instead.
+#[test]
+fn a_carried_credit_is_taken_and_given_back_by_volume() {
+    let (writers, _reports) = writers();
+    let (one, two) = (volume("one"), volume("two"));
+    one.set_buffer_limits(1600, 1600);
+    two.set_buffer_limits(1600, 1600);
+    let (first, second) = (
+        writers.test_submitter(&one, 1),
+        writers.test_submitter(&two, 1),
+    );
+    let mut credit = Credit::reserve([&first, &second], 100, Stand::UntilStop)
+        .prepay()
+        .settle(|volume| if std::ptr::eq(volume, &*one) { 80 } else { 0 });
+    assert_eq!((credit.on(&one), credit.on(&two)), (80, 0));
+    assert_eq!((one.carried_bytes(), two.carried_bytes()), (80, 0));
+    assert_eq!((one.unwritten_bytes(), two.unwritten_bytes()), (80, 0));
+    credit.give_back_on(&one, 30);
+    assert_eq!((credit.on(&one), one.carried_bytes(), one.unwritten_bytes()), (50, 50, 50));
+    let taken = credit.take_on(&one, 20);
+    assert_eq!((taken.on(&one), credit.on(&one), one.carried_bytes()), (20, 30, 30));
+    let moved = taken.moved_to(&second);
+    assert_eq!((moved.on(&one), moved.on(&two)), (0, 20));
+    assert_eq!((one.unwritten_bytes(), two.unwritten_bytes()), (30, 20));
+    drop((credit, moved));
+    assert_eq!((one.unwritten_bytes(), two.unwritten_bytes()), (0, 0));
+    assert_eq!((one.carried_bytes(), two.carried_bytes()), (0, 0));
+}
+
+// A stop ends a producing thread's wait for room at once when it stands
+// until the stop, with nothing counted. One that stands until the stop's
+// end keeps the volume's limit through it, and at that end comes back short
+// with its key given up.
+#[test]
+fn a_producers_wait_for_room_ends_at_the_stop_or_at_its_end_as_it_stands() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a");
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    volume.set_buffer_limits(64, 64);
+    let hold = writers.hold(&volume);
+    let job = writers.test_submitter(&volume, 1);
+    job.write(1, 0, Bytes::from(vec![1u8; 60]), create(&path));
+    hold.wait_held();
+    let clock = Arc::new(ManualClock::default());
+    let end = Duration::from_secs(30);
+    writers.end_waits_at(Arc::clone(&clock) as Arc<dyn Clock>, clock.instant(end));
+    writers.stop_waits();
+    let ended = Credit::reserve([&job], 10, Stand::UntilStop);
+    assert!(!ended.covers(10));
+    assert!(ended.is_empty());
+    assert!(!job.gave_up());
+    let short = std::thread::scope(|scope| {
+        let producer = scope.spawn(|| Credit::reserve([&job], 10, Stand::UntilStopsEnd));
+        hold.wait_below_waiters(1);
+        assert_eq!(volume.unwritten_bytes(), 60, "the limit is kept");
+        clock.move_to(end);
+        writers.look_again();
+        producer.join().unwrap()
+    });
+    assert!(!short.covers(10));
+    assert!(job.gave_up());
+    assert_eq!(volume.unwritten_bytes(), 60);
+    hold.open();
+    writers.settle();
+    assert_eq!(volume.unwritten_bytes(), 0);
+}
+
+// A step that carries all its credit, giving none back, wakes a producer
+// that stands for room: it may now count beside the carried bytes.
+#[test]
+fn a_credit_carried_whole_wakes_a_thread_that_stands_for_room() {
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    volume.set_buffer_limits(64, 64);
+    let hold = writers.hold(&volume);
+    let job = writers.test_submitter(&volume, 1);
+    let held = Credit::reserve([&job], 64, Stand::UntilStop);
+    let (carried, next) = std::thread::scope(|scope| {
+        let producer = scope.spawn(|| Credit::reserve([&job], 10, Stand::UntilStop));
+        hold.wait_below_waiters(1);
+        let carried = held.prepay().settle(|_| 64);
+        assert_eq!(volume.carried_bytes(), 64);
+        (carried, producer.join().unwrap())
+    });
+    assert!(next.covers(10));
+    assert_eq!(volume.unwritten_bytes(), 74);
+    drop((carried, next));
+    assert_eq!(volume.unwritten_bytes(), 0);
+    hold.open();
+}

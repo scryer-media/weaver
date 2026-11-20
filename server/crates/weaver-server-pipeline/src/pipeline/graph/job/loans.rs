@@ -10,16 +10,21 @@
 // applied by the namespace as the set's ruling.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use weaver_server_disk::operations::disk::reader::TurnStop;
+use weaver_server_disk::operations::disk::writer::{Credit, Stand};
 
 use tokio::sync::mpsc;
 use weaver_graph::NodeId;
 use weaver_graph::slots::{AskerId, Ticket};
 
+use super::super::disk::JobDisk;
 use super::super::engine::{Heard, Said};
 use super::super::hardware::Hardware;
-use super::super::namespace::{Lender, Loan, Replay, SetState};
+use super::super::namespace::{
+    Lender, Loan, Repaired, RepairRead, RepairSlice, Replay, SetState,
+};
 use super::super::status::RepairSlots;
 
 pub struct Loans {
@@ -41,6 +46,15 @@ struct Out {
     state: Option<SetState>,
     stop: Option<Arc<TurnStop>>,
     kind: Work,
+    // Raised to tell an apply's reader to read no more; raised too as the
+    // loan is dropped, its job's with it.
+    ends: Arc<AtomicBool>,
+}
+
+impl Drop for Out {
+    fn drop(&mut self) {
+        self.ends.store(true, Ordering::SeqCst);
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -48,6 +62,8 @@ enum Work {
     Repair,
     Replay,
     Verification,
+    // A repair's return being applied from its staged output.
+    Apply,
 }
 
 impl Loans {
@@ -66,8 +82,115 @@ impl Loans {
         self.out.is_some()
     }
 
+    // Whether a repair is out, or its return is being applied: the set's
+    // repair is not done until its last slice is down.
     pub(crate) fn repairing(&self) -> bool {
-        self.is_out(Work::Repair)
+        self.is_out(Work::Repair) || self.is_out(Work::Apply)
+    }
+
+    // Whether a repair's return is being applied, its staged output read
+    // back off the loop.
+    pub(crate) fn applying(&self) -> bool {
+        self.is_out(Work::Apply)
+    }
+
+    // Whether `serial` is the apply out for `set`: a slice of any other is
+    // not heard.
+    pub(crate) fn applying_under(&self, set: NodeId, serial: u64) -> bool {
+        self.out.as_ref().is_some_and(|out| {
+            out.kind == Work::Apply && out.set == set && out.serial == serial
+        })
+    }
+
+    // Tell the reader of the return being applied to read no more: a slice
+    // failed, or the job is going. It says what it read and ends.
+    pub(crate) fn end_apply(&self) {
+        if let Some(out) = self.out.as_ref().filter(|out| out.kind == Work::Apply) {
+            out.ends.store(true, Ordering::SeqCst);
+        }
+    }
+
+    // The set's repair came back, and its return is applied from its
+    // staged output: a reader reads it back off the loop a slice at a time,
+    // counts each slice on the job's volumes, standing still on its own
+    // thread while one is at its limit, and mails it with what it counted
+    // (`Heard::RepairSlice`), then says it is done (`Heard::RepairRead`).
+    // Its mail is numbered by a loan of its own, under the slot the repair
+    // held. A stop does not end the reading: a volume's limit is kept until
+    // the stop's end, and a slice not counted by then ends it short.
+    pub(crate) fn apply(&mut self, set: NodeId, output: Repaired, disk: JobDisk) {
+        self.serial += 1;
+        let (scope, serial) = (self.scope, self.serial);
+        let ends = Arc::new(AtomicBool::new(false));
+        self.out = Some(Out {
+            set,
+            serial,
+            state: None,
+            stop: None,
+            kind: Work::Apply,
+            ends: Arc::clone(&ends),
+        });
+        let mail = self.mail.clone();
+        tokio::task::spawn_blocking(move || {
+            let _job =
+                weaver_server_base::runtime::panic_trap::JobScope::enter(crate::JobId(scope));
+            let said = |heard| Said {
+                scope,
+                node: set,
+                generation: serial,
+                heard,
+            };
+            let (mut whole, mut gone) = (true, false);
+            for (member, offset, bytes) in output.slices() {
+                if ends.load(Ordering::SeqCst) {
+                    whole = false;
+                    break;
+                }
+                let credit = match &bytes {
+                    Ok(bytes) => {
+                        let len = bytes.len() as u64;
+                        let credit = disk.reserve_ahead(len, Stand::UntilStopsEnd);
+                        if !credit.covers(len) {
+                            whole = false;
+                            break;
+                        }
+                        credit
+                    }
+                    Err(_) => Credit::none(),
+                };
+                let failed = bytes.is_err();
+                let slice = RepairSlice {
+                    member,
+                    offset,
+                    bytes,
+                    credit,
+                };
+                // A closed channel means the pipeline is gone, and no one
+                // is left to tell.
+                if mail
+                    .blocking_send(said(Heard::RepairSlice(Box::new(slice))))
+                    .is_err()
+                {
+                    gone = true;
+                    break;
+                }
+                // The loop fails the return on a slice that could not be
+                // read: nothing after it is applied.
+                if failed {
+                    break;
+                }
+            }
+            if gone {
+                let _ = output.remove();
+                return;
+            }
+            let read = RepairRead { output, whole };
+            if let Err(error) = mail.blocking_send(said(Heard::RepairRead(Box::new(read))))
+                && let Heard::RepairRead(read) = error.0.heard
+            {
+                let _ = read.output.remove();
+            }
+        });
     }
 
     fn is_out(&self, kind: Work) -> bool {
@@ -161,6 +284,7 @@ impl Lender for Lending<'_> {
             state: loan.state,
             stop: Some(loan.stop()),
             kind: Work::Repair,
+            ends: Arc::default(),
         });
         let mail = loans.mail.clone();
         // The repair runs inside the repair pool, on the budget in force as
@@ -213,6 +337,7 @@ impl Lending<'_> {
             state: None,
             stop: Some(Arc::clone(&check.stop)),
             kind: Work::Verification,
+            ends: Arc::default(),
         });
         let mail = loans.mail.clone();
         let shutdown = loans.hardware.shutdown().clone();
@@ -241,6 +366,7 @@ impl Lending<'_> {
             state: None,
             stop: Some(Arc::clone(&replay.stop)),
             kind: Work::Replay,
+            ends: Arc::default(),
         });
         let mail = loans.mail.clone();
         let shutdown = loans.hardware.shutdown().clone();

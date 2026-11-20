@@ -1676,6 +1676,12 @@ fn render_volumes(out: &mut Encoder, volumes: &[VolumeSnapshot]) {
             labels,
             writer.close_nanos as f64 / 1e9,
         );
+        out.sample(&f::VOLUME_WRITER_WRITE_OUTS, labels, writer.write_outs);
+        out.sample_f64(
+            &f::VOLUME_WRITER_WRITE_OUT_SECONDS,
+            labels,
+            writer.write_out_nanos as f64 / 1e9,
+        );
         out.sample(&f::VOLUME_WRITER_THREADS, labels, writer.threads);
         out.sample(&f::VOLUME_WRITER_WOKEN, labels, writer.woken);
     }

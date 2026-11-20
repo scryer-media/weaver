@@ -23,8 +23,8 @@ use weaver_graph::{
 };
 
 use super::{
-    Acknowledging, Arrival, HeldWant, Loan, NamespaceWriter, READ_BACK, Returned, Segments, Write,
-    WriteError, absent_from_posts, in_own_file, index,
+    Acknowledging, Apply, Applying, Arrival, HeldWant, LeafError, Loan, NamespaceWriter, READ_BACK,
+    Returned, Segments, Write, WriteError, absent_from_posts, in_own_file, index,
 };
 
 // How many times a job waiting for room asked again what its due sets
@@ -961,40 +961,107 @@ impl NamespaceWriter {
             set,
             closed: BTreeSet::new(),
             rereading: false,
+            placing: true,
         });
+        let mut apply = Apply {
+            set,
+            node,
+            found,
+            outcome,
+            rejected: tree.rejected_inputs(node, repaired.members()),
+            rewritten: BTreeSet::new(),
+            offered: false,
+            landed: false,
+            contested: false,
+        };
+        let bound = self.bind_recoveries(tree, builder, segments, node, out);
+        // Whether every slice was turned away. A slice lands only where no
+        // repair wrote before it, unless the set outranks every other set
+        // beside it: a set that disagrees with another's repair loses there
+        // to an equal or a higher one, so no two rewrite each other in turn.
+        apply.contested = !tree.outranks(node, set);
+        // With volumes to write to, the slices are read back off the loop
+        // and counted there on the volumes they may land on, a mail each
+        // (`RepairSlice`): the loop places each as it comes and never waits
+        // for a disk. The job hands the output to its reader
+        // (`apply_output`). A return that staged nothing writes nothing, so
+        // it is applied in this step, as a ruling with no slices always is:
+        // the set takes back what it ruled with its ruling, and what arrives
+        // after is heard by the set as it then stands.
+        if self.disk().is_some() && repaired.sizes().next().is_some() {
+            self.placing_return(false);
+            self.applying = Some(Applying {
+                apply,
+                error: bound.err(),
+                output: Some(repaired),
+                said: std::mem::take(out),
+                slices: 0,
+            });
+            return Ok(None);
+        }
+        let placed = bound.and_then(|()| {
+            for (member, offset, bytes) in repaired.slices() {
+                self.below_budget()?;
+                self.place_slice(tree, builder, segments, &mut apply, (member, offset, bytes?), out)?;
+            }
+            Ok(())
+        });
+        self.applied(tree, builder, segments, apply, (repaired, placed), out)
+    }
+
+    // Place one slice of a repair's return through the one write path, as
+    // repaired bytes. Called with the return's batch open.
+    fn place_slice(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        apply: &mut Apply,
+        (member, offset, bytes): (MemberId, u64, Bytes),
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        apply.offered = true;
+        let arrival = Arrival {
+            node: apply.node,
+            member,
+            offset,
+            // A repair's output: nothing proved it on the way.
+            bytes: bytes.into(),
+            provenance: Provenance::Repaired,
+        };
+        let write = Write::new(&arrival);
+        if self.place_as(tree, builder, segments, (arrival, apply.contested), write, out)? > 0 {
+            apply.landed = true;
+            apply.rewritten.insert(member);
+        }
+        Ok(())
+    }
+
+    // The tail of a repair's return, whether its slices were placed in one
+    // step or a mail at a time: called with the return's batch open, once
+    // every slice is down or `placed` failed. The slices a repair applied
+    // rebuilt, when it rebuilt any.
+    fn applied(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        apply: Apply,
+        (repaired, placed): (super::Repaired, Result<(), WriteError>),
+        out: &mut Vec<Effect>,
+    ) -> Result<Option<u64>, WriteError> {
+        let Apply {
+            set,
+            node,
+            found,
+            outcome,
+            mut rejected,
+            mut rewritten,
+            offered,
+            landed,
+            ..
+        } = apply;
         let applied = (|| {
-            let mut rejected = tree.rejected_inputs(node, repaired.members());
-            let mut rewritten = std::collections::BTreeSet::new();
-            let (mut offered, mut landed) = (false, false);
-            let placed = (|| {
-                self.bind_recoveries(tree, builder, segments, node, out)?;
-                // Whether every slice was turned away. A slice lands only
-                // where no repair wrote before it, unless the set outranks
-                // every other set beside it: a set that disagrees with
-                // another's repair loses there to an equal or a higher one,
-                // so no two rewrite each other in turn.
-                let contested = !tree.outranks(node, set);
-                for (member, offset, bytes) in repaired.slices() {
-                    self.below_budget()?;
-                    let bytes = bytes?;
-                    offered = true;
-                    let arrival = Arrival {
-                        node,
-                        member,
-                        offset,
-                        // A repair's output: nothing proved it on the way.
-                        bytes: bytes.into(),
-                        provenance: Provenance::Repaired,
-                    };
-                    let write = Write::new(&arrival);
-                    if self.place_as(tree, builder, segments, (arrival, contested), write, out)? > 0
-                    {
-                        landed = true;
-                        rewritten.insert(member);
-                    }
-                }
-                Ok::<_, WriteError>(())
-            })();
             // The staged output goes whether or not its slices landed: one
             // a member had no room for is not left on the disk while the
             // job waits. The repair runs again, so the job waits for all it
@@ -1052,7 +1119,10 @@ impl NamespaceWriter {
             self.release_held(tree, builder, segments, out)?;
             Ok::<_, WriteError>(offered && !landed)
         })();
-        let batch = self.acknowledging.take().expect("the batch opened above");
+        let batch = self
+            .acknowledging
+            .take()
+            .expect("the batch is open while a return is applied");
         let turned_away = applied?;
         self.acknowledged(tree, builder, segments, batch, out)?;
         // A repair none of whose slices landed rewrote nothing, and is not
@@ -1061,6 +1131,103 @@ impl NamespaceWriter {
             Some(RepairOutcome::Repaired { slices }) if !turned_away => Some(slices),
             _ => None,
         })
+    }
+
+    // How many slices of the return being applied were placed so far.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn slices_applied(&self) -> u64 {
+        self.applying.as_ref().map_or(0, |applying| applying.slices)
+    }
+
+    // The staged output of the return whose apply just opened, for the job
+    // to hand its reader, with the set it is of.
+    pub(crate) fn apply_output(&mut self) -> Option<(NodeId, super::Repaired)> {
+        let applying = self.applying.as_mut()?;
+        Some((applying.apply.set, applying.output.take()?))
+    }
+
+    // One slice of the return being applied came back from its reader: it
+    // is placed under the set's ruling, as the slices of a return applied
+    // in one step are, and nothing after a failure is. Whether the reader
+    // may read on.
+    pub(crate) fn repair_slice(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        slice: super::RepairSlice,
+    ) -> bool {
+        let Some(mut applying) = self.applying.take() else {
+            return false;
+        };
+        if applying.error.is_none() {
+            self.placing_return(true);
+            let placed = slice.bytes.map_err(WriteError::from).and_then(|bytes| {
+                self.place_slice(
+                    tree,
+                    builder,
+                    segments,
+                    &mut applying.apply,
+                    (slice.member, slice.offset, bytes),
+                    &mut applying.said,
+                )
+            });
+            self.placing_return(false);
+            applying.slices += 1;
+            applying.error = placed.err();
+        }
+        let reads_on = applying.error.is_none();
+        self.applying = Some(applying);
+        reads_on
+    }
+
+    // The reader of the return being applied is done: the return's tail
+    // runs, as an apply in one step ends. A reader cut short before the
+    // last slice, at the end of a stop, leaves the return unapplied: the
+    // job stands on bytes that are not written and is left at its last
+    // checkpoint (`WriteError::LeftAtStop`).
+    pub(crate) fn repair_read(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        read: super::RepairRead,
+        out: &mut Vec<Effect>,
+    ) -> Result<Option<u64>, WriteError> {
+        let Some(applying) = self.applying.take() else {
+            read.output.remove()?;
+            return Ok(None);
+        };
+        let Applying {
+            apply, error, said, ..
+        } = applying;
+        out.extend(said);
+        self.placing_return(true);
+        let placed = match error {
+            Some(error) => Err(error),
+            None if !read.whole => Err(WriteError::LeftAtStop),
+            None => Ok(()),
+        };
+        self.applied(tree, builder, segments, apply, (read.output, placed), out)
+    }
+
+    // Whether the bytes being delivered are the return's own (`placing`).
+    fn placing_return(&mut self, placing: bool) {
+        if let Some(batch) = self.acknowledging.as_mut() {
+            batch.placing = placing;
+        }
+    }
+
+    // The job drops the return being applied, as it fails or retires: what
+    // its slices placed is not ruled on, and its staged output goes. Whether
+    // one was being applied.
+    pub(crate) fn drop_apply(&mut self, output: super::Repaired) -> Result<bool, LeafError> {
+        let applying = self.applying.take().is_some();
+        if applying {
+            self.acknowledging = None;
+        }
+        output.remove()?;
+        Ok(applying)
     }
 
     // The batch is down: each member it closed that is still closed in its
@@ -1329,7 +1496,7 @@ impl NamespaceWriter {
             if self
                 .acknowledging
                 .as_ref()
-                .is_some_and(|batch| batch.set == set || batch.rereading)
+                .is_some_and(|batch| (batch.set == set && batch.placing) || batch.rereading)
             {
                 tree.feed_proven(set, member, &self.segments);
             } else {
