@@ -63,6 +63,86 @@ impl std::ops::Deref for Rules {
     }
 }
 
+/// How many torrents read as each route, shared by every torrent's
+/// `RouteSlot` and kept by it as its route changes and as it goes: placing
+/// a torrent on a pool member reads a count, not every torrent. A route
+/// with no torrent left has no entry.
+#[derive(Clone, Debug, Default)]
+pub struct RouteLoads(Arc<std::sync::Mutex<std::collections::HashMap<RouteKey, usize>>>);
+
+impl RouteLoads {
+    /// The torrents that read as route `key` now.
+    pub fn of(&self, key: &RouteKey) -> usize {
+        super::locked(&self.0).get(key).copied().unwrap_or(0)
+    }
+
+    fn add(&self, key: &RouteKey) {
+        *super::locked(&self.0).entry(key.clone()).or_default() += 1;
+    }
+
+    fn sub(&self, key: &RouteKey) {
+        let mut loads = super::locked(&self.0);
+        if let Some(count) = loads.get_mut(key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                loads.remove(key);
+            }
+        }
+    }
+}
+
+/// The route a torrent reads as, counted in the `RouteLoads` it was set
+/// with until it changes, is cleared or the torrent goes.
+#[derive(Debug, Default)]
+pub struct RouteSlot {
+    key: Option<RouteKey>,
+    loads: Option<RouteLoads>,
+}
+
+impl RouteSlot {
+    pub fn key(&self) -> Option<&RouteKey> {
+        self.key.as_ref()
+    }
+
+    pub fn is_some(&self) -> bool {
+        self.key.is_some()
+    }
+
+    /// It reads as `key` from here, counted in `loads`.
+    pub fn set(&mut self, key: Option<RouteKey>, loads: &RouteLoads) {
+        if self.key == key {
+            return;
+        }
+        self.clear();
+        if let Some(key) = &key {
+            loads.add(key);
+            self.loads = Some(loads.clone());
+        }
+        self.key = key;
+    }
+
+    /// It reads as no route from here.
+    pub fn clear(&mut self) {
+        if let Some(key) = self.key.take()
+            && let Some(loads) = self.loads.take()
+        {
+            loads.sub(&key);
+        }
+    }
+}
+
+impl Drop for RouteSlot {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+impl PartialEq<Option<RouteKey>> for RouteSlot {
+    fn eq(&self, other: &Option<RouteKey>) -> bool {
+        self.key == *other
+    }
+}
+
 // What the service keeps of each torrent while it lives.
 pub struct Live {
     pub record: TorrentRecord,
@@ -98,7 +178,7 @@ pub struct Live {
     // Its wait for its route's session to open, off the add or action that
     // asked for it, until the wait ends.
     pub(super) attaching: Option<tokio::task::AbortHandle>,
-    pub route: Option<RouteKey>,
+    pub route: RouteSlot,
     pub held: Option<Held>,
     pub(super) about: About,
     pub counters: TorrentCounters,
@@ -234,7 +314,7 @@ impl Live {
             fetching: None,
             resolving: None,
             attaching: None,
-            route: None,
+            route: RouteSlot::default(),
             held: None,
             about: About::default(),
             downloaded_at_start: counters.downloaded_bytes,

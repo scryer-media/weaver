@@ -130,14 +130,14 @@ impl TorrentService {
     }
 
     // A tracker's answer, and a fetch moving on, are published as the
-    // sessions ring them: the exporter reads them when the views do, not
-    // at the next tick.
+    // sessions tell them, for the torrents they name alone: the exporter
+    // reads them when the views do, not at the next tick.
     pub(super) fn spawn_follow_trackers(&self) {
         let service = self.clone();
         self.keep(tokio::spawn(async move {
             loop {
-                service.inner.sessions.trackers_changed().await;
-                service.publish().await;
+                let hashes = service.inner.sessions.trackers_changed().await;
+                service.publish_hashes(&hashes).await;
             }
         }));
     }
@@ -367,7 +367,7 @@ impl TorrentService {
             let moved = before != settings.scope(category_id, rule);
             if moved {
                 self.move_out(torrent).await;
-                torrent.route = None;
+                torrent.route.clear();
                 torrent.held = None;
             }
             moved
@@ -447,8 +447,8 @@ impl TorrentService {
                         load.get(key).copied().unwrap_or(0)
                     });
                 self.pin(torrent, pin);
-                if torrent.route.as_ref() != Some(&plan.key) {
-                    if let Some(count) = torrent.route.as_ref().and_then(|key| load.get_mut(key)) {
+                if torrent.route.key() != Some(&plan.key) {
+                    if let Some(count) = torrent.route.key().and_then(|key| load.get_mut(key)) {
                         *count = count.saturating_sub(1);
                     }
                     *load.entry(plan.key.clone()).or_default() += 1;
@@ -456,7 +456,7 @@ impl TorrentService {
                 if torrent.layout.is_none() {
                     let moved = matches!(torrent.resolving, Some(Resolving::Fetching(_)))
                         && (plan.down.is_some()
-                            || torrent.route.as_ref() != Some(&plan.key)
+                            || torrent.route.key() != Some(&plan.key)
                             || outdated.contains(&plan.key));
                     if moved && let Some(Resolving::Fetching(fetch)) = torrent.resolving.take() {
                         fetch.abort();
@@ -482,12 +482,12 @@ impl TorrentService {
                     torrent.engine = Engine::Absent;
                     // Its run ended with its leg: so does a wait for room.
                     self.end_disk_room(torrent);
-                    torrent.route = Some(plan.key);
+                    torrent.route.set(Some(plan.key), &self.inner.route_loads);
                     torrent.held = Some(Held::RouteDown(reason.clone()));
                 } else if torrent.attaching.is_some() {
                     // Its route's session is being opened for it already:
                     // the pass after that wait ends looks at it again.
-                } else if torrent.route.as_ref() != Some(&plan.key)
+                } else if torrent.route.key() != Some(&plan.key)
                     || outdated.contains(&plan.key)
                     || torrent.attached.as_ref().is_none_or(|attached| {
                         attached.terms != terms
@@ -502,8 +502,10 @@ impl TorrentService {
                     // their turn. One whose route's session could not be
                     // built reads as that cause while the route opens
                     // again; any other hold is over.
-                    if torrent.route.as_ref() != Some(&plan.key) {
-                        torrent.route = Some(plan.key.clone());
+                    if torrent.route.key() != Some(&plan.key) {
+                        torrent
+                            .route
+                            .set(Some(plan.key.clone()), &self.inner.route_loads);
                         torrent.held = Some(Held::Session(OPENING));
                     } else if !matches!(torrent.held, Some(Held::Session(_))) {
                         torrent.held = None;
@@ -544,7 +546,7 @@ impl TorrentService {
             if !failed.is_empty() {
                 let mut live = self.inner.live.lock().await;
                 if let Some(torrent) = live.get_mut(&job_id)
-                    && let Some(held) = torrent.route.as_ref().and_then(|key| failed.get(key))
+                    && let Some(held) = torrent.route.key().and_then(|key| failed.get(key))
                 {
                     torrent.settle(self.inner.clock.unix_ms());
                     torrent.held = Some(held.clone());
@@ -1065,7 +1067,7 @@ impl TorrentService {
             let live = self.inner.live.lock().await;
             let used: BTreeSet<&RouteKey> = live
                 .values()
-                .filter_map(|torrent| torrent.route.as_ref())
+                .filter_map(|torrent| torrent.route.key())
                 .collect();
             #[cfg(any(test, feature = "test-support"))]
             self.sweep_seam().await;

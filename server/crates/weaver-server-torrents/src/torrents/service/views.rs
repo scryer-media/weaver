@@ -468,15 +468,80 @@ impl TorrentService {
             changed
         });
         let sessions = with_routes_of(sessions, &torrents);
-        self.inner
-            .published
-            .send_replace(Arc::new(Published { torrents, sessions }));
+        {
+            let mut at = super::locked(&self.inner.published_at);
+            *at = torrents
+                .iter()
+                .enumerate()
+                .map(|(place, torrent)| (torrent.job_id, place))
+                .collect();
+            self.inner
+                .published
+                .send_replace(Arc::new(Published { torrents, sessions }));
+        }
         if let Some(queue) = self.queue() {
             let views = rows.into_iter().map(|(view, _)| view).collect();
             queue.publish_owned_jobs(
                 crate::jobs::Protocol::Torrent,
                 self.with_retiring(job_infos(views, now)),
             );
+        }
+    }
+
+    // The torrents of `hashes`, whose trackers or metadata fetch changed,
+    // published as `publish` publishes each: their rows, their figures for
+    // the exporter and their jobs in the queue, beside the others as they
+    // stand. Only they are read (libtorrent posts a state update for the
+    // torrents that changed); one not yet in the published figures waits
+    // for the next publish of every torrent there.
+    pub async fn publish_hashes(
+        &self,
+        hashes: &std::collections::HashSet<weaver_torrent::core::Id20>,
+    ) {
+        let now = self.inner.clock.unix_ms();
+        let stamp = self.inner.snapshot.stamp();
+        let listed = self
+            .listed_by(Shown::LISTED, true, true, now, |_, live| {
+                live.values()
+                    .filter(|torrent| hashes.contains(&hashes_of(&torrent.record).best()))
+                    .map(|torrent| torrent.record.job_id)
+                    .collect()
+            })
+            .await;
+        if listed.is_empty() {
+            return;
+        }
+        let mut series = Vec::with_capacity(listed.len());
+        let mut rows = Vec::with_capacity(listed.len());
+        for (view, figures, totals) in listed {
+            series.extend(figures);
+            rows.push((view, totals.unwrap_or_default()));
+        }
+        self.inner.snapshot.put_some(&rows, stamp);
+        {
+            let at = super::locked(&self.inner.published_at);
+            self.inner.published.send_if_modified(|published| {
+                let mut moved = false;
+                for figures in series {
+                    let Some(&place) = at.get(&figures.job_id) else {
+                        continue;
+                    };
+                    if published.torrents.get(place) != Some(&figures) {
+                        Arc::make_mut(published).torrents[place] = figures;
+                        moved = true;
+                    }
+                }
+                moved
+            });
+        }
+        if let Some(queue) = self.queue() {
+            for (view, _) in rows {
+                let status = job_status(&view);
+                queue.publish_owned_job(
+                    crate::jobs::Protocol::Torrent,
+                    report(view, status, now).job_info(),
+                );
+            }
         }
     }
 
@@ -679,7 +744,7 @@ impl TorrentService {
             unpack_override: record.unpack,
             unpack_end: record.unpack_end.clone(),
             scope: settings.scope(record.category_id, rule),
-            route: torrent.route.as_ref().map(|key| key.as_str().to_owned()),
+            route: torrent.route.key().map(|key| key.as_str().to_owned()),
             files: Vec::new(),
             sequential: record.sequential,
             first_last_piece_first: record.first_last_piece_first,

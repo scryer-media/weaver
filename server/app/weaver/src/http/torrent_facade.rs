@@ -287,7 +287,7 @@ impl TorrentFacadeContext {
             hashes: (!all).then_some(hashes.as_slice()),
             ..Pick::default()
         };
-        if let Ok(rows) = self.every_row() {
+        if let Some(rows) = self.published(pick, Window::Every) {
             return Ok(kept_views(&rows, &pick.of_rows()));
         }
         if all {
@@ -296,15 +296,16 @@ impl TorrentFacadeContext {
         self.picked(pick).await
     }
 
-    // Every torrent's row, in the order they were added, as the service
-    // last published them; not ready until the rows are every stored
-    // torrent's.
-    fn every_row(&self) -> Result<Vec<Arc<TorrentRow>>, NotReady> {
+    // The rows `pick` keeps at `window`'s places, in the order the
+    // torrents were added, as the service last published them: the page
+    // walked in place, and only its rows taken. None until the rows are
+    // every stored torrent's.
+    fn published(&self, pick: Pick<'_>, window: Window) -> Option<Vec<Arc<TorrentRow>>> {
         let Some(torrents) = &self.inner.torrents else {
-            return Ok(Vec::new());
+            return Some(Vec::new());
         };
-        torrents.listing_ready()?;
-        Ok(torrents.snapshot().every().1)
+        torrents.listing_ready().ok()?;
+        Some(torrents.snapshot().kept(&pick.of_rows(), window))
     }
 
     // Every torrent `pick` keeps, with its files, which its paths follow.
@@ -354,7 +355,7 @@ impl TorrentFacadeContext {
         let Some(torrents) = &self.inner.torrents else {
             return Ok(Vec::new());
         };
-        if let Ok(rows) = self.every_row() {
+        if let Some(rows) = self.published(pick, Window::Every) {
             return Ok(kept_views(&rows, &pick.of_rows()));
         }
         torrents
@@ -1902,7 +1903,15 @@ async fn torrents_info(
     let hashes = info_hashes(params);
     let ask = InfoAsk::of(params);
     let pick = info_pick(params, &hashes);
-    let (Some(torrents), Ok(rows)) = (&ctx.inner.torrents, ctx.every_row()) else {
+    // The page is taken first when nothing but the table's fields picks
+    // the rows and they keep the order they were added in; otherwise every
+    // row the pick keeps is read, to filter or sort it in full.
+    let (window, page_ask) = if ask.windowed() {
+        (info_window(ask.limit, ask.offset), ask.whole())
+    } else {
+        (Window::Every, ask)
+    };
+    let (Some(torrents), Some(rows)) = (&ctx.inner.torrents, ctx.published(pick, window)) else {
         // A row's files are read only when the answer lists them.
         let window = if ask.paged_first() {
             info_window(ask.limit, ask.offset)
@@ -1912,7 +1921,7 @@ async fn torrents_info(
         let rows = found!(ctx.rows(pick, window, ask.with_files).await);
         return info_list(rows, &ask, scope, ctx.api(), now_secs());
     };
-    let mut page = match info_rows(&rows, &pick.of_rows(), &ask, scope, torrents.now_ms()) {
+    let mut page = match info_rows(&rows, &pick.of_rows(), &page_ask, scope, torrents.now_ms()) {
         Ok(page) => page,
         Err(response) => return *response,
     };
@@ -2084,6 +2093,7 @@ fn info_order(left: &Value, right: &Value, reverse: bool) -> std::cmp::Ordering 
 }
 
 // What a `torrents/info` request asks for beyond the torrents' records.
+#[derive(Clone, Copy)]
 struct InfoAsk<'a> {
     filter: &'a str,
     // A tag the torrent carries; the empty tag passes the untagged ones
@@ -2114,6 +2124,30 @@ impl<'a> InfoAsk<'a> {
             offset: number("offset"),
             sort: params.get("sort").filter(|column| !column.is_empty()),
             reverse: params.flag("reverse").unwrap_or(false),
+        }
+    }
+
+    // Whether the published rows' page can be taken before any row is
+    // read: nothing but the table's fields picks them, and they are listed
+    // in the order the torrents were added, unsorted or sorted by when
+    // they were added, which a stable sort leaves as it is. A reversed sort
+    // by it keeps the order of torrents added in one second, so it reads
+    // every row, as does every other sort, a status filter and a tag.
+    fn windowed(&self) -> bool {
+        self.tag.is_none()
+            && filters_none(self.filter)
+            && match self.sort {
+                None => true,
+                Some(column) => column == "added_on" && !self.reverse,
+            }
+    }
+
+    // The ask with its page already taken.
+    fn whole(self) -> Self {
+        Self {
+            limit: 0,
+            offset: 0,
+            ..self
         }
     }
 

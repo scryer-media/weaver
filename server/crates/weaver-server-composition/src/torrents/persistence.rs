@@ -4,6 +4,7 @@
 use crate::StateError;
 use crate::history::record::JobHistoryRow;
 use crate::persistence::sql_runtime::{SqlRuntime, SqlTx};
+use weaver_server_history::history::persistence::unique_runs;
 pub use weaver_server_torrent_store::torrents::history_persistence::*;
 pub use weaver_server_torrent_store::torrents::persistence::TorrentsPersistenceInsertTorrentQueries;
 pub use weaver_server_torrent_store::torrents::persistence::{
@@ -11,7 +12,9 @@ pub use weaver_server_torrent_store::torrents::persistence::{
     TorrentsPersistenceInsertPlacedTorrentInternalQueries,
     TorrentsPersistenceLiveHeldPathsInternalQueries, update_column_tx,
 };
-use weaver_server_torrent_store::torrents::persistence::{delete_torrent_tx, stored};
+use weaver_server_torrent_store::torrents::persistence::{
+    delete_torrent_tx, delete_torrents_tx, stored,
+};
 
 impl crate::persistence::DatabaseWriterExecutor {
     // A torrent's job's history row, written in one transaction on the
@@ -57,9 +60,24 @@ impl crate::persistence::DatabaseWriterExecutor {
             SqlRuntime::run_in_transaction(&datastore, "write_torrent_histories", |tx| {
                 let entries = std::sync::Arc::clone(&entries);
                 Box::pin(async move {
-                    for (entry, retires, files) in entries.iter() {
-                        let id = stored(entry.job_id)?;
-                        torrent_history_tx(tx, id, entry, *retires, files).await?;
+                    // Each run of distinct jobs at once, as each of its
+                    // entries one by one would write it.
+                    for run in unique_runs(&entries, |(entry, ..)| entry.job_id) {
+                        let rows: Vec<&JobHistoryRow> =
+                            run.iter().map(|(entry, ..)| entry).collect();
+                        crate::history::persistence::insert_job_histories_tx(tx, &rows).await?;
+                        let lists = run
+                            .iter()
+                            .map(|(entry, _, files)| Ok((stored(entry.job_id)?, &files[..])))
+                            .collect::<Result<Vec<_>, StateError>>()?;
+                        write_histories_files_tx(tx, &lists).await?;
+                        let retiring: Vec<i64> = run
+                            .iter()
+                            .zip(&lists)
+                            .filter(|((_, retires, _), _)| *retires)
+                            .map(|(_, (id, _))| *id)
+                            .collect();
+                        delete_torrents_tx(tx, &retiring).await?;
                     }
                     // The seam refuses the whole transaction once its rows
                     // are in it, so none of them may be left.

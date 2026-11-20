@@ -358,6 +358,13 @@ pub(crate) fn listen_address(addr: SocketAddr, kind: ConnectionKind) -> Option<S
         .then_some(addr)
 }
 
+/// A pieces stamp no peer took before, in this run of the process; see
+/// `LivePeerState::pieces_stamp`. None is 0.
+pub(crate) fn next_pieces_stamp() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A peer bitfield holding no piece, shaped as BITFIELD carries one: a bit
 /// per piece, padded to whole bytes.
 pub(crate) fn empty_bitfield(total_pieces: u32) -> BF {
@@ -1288,6 +1295,11 @@ pub(crate) struct LivePeerState {
     // with the bitfield by PeerStates::update_seeder_flag.
     pub seeder: bool,
 
+    // A number no peer's pieces stood at before, taken anew with each change
+    // to the bitfield above by PeerStates::update_seeder_flag: what a reader
+    // learned of the pieces holds while it reads the same.
+    pub pieces_stamp: u64,
+
     // When the peer sends us data this is used to track if we asked for it.
     inflight_requests: HashSet<InflightRequest>,
 
@@ -1473,6 +1485,7 @@ impl LivePeerState {
             outgoing,
             bitfield: BF::default(),
             seeder: false,
+            pieces_stamp: next_pieces_stamp(),
             inflight_requests: Default::default(),
             requests_outstanding: Arc::default(),
             late_cancelled_request_tolerance: 0,

@@ -826,7 +826,8 @@ fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_defaul
             seeding: None,
             torrent_route: false,
             unpack: None,
-        }],
+        }]
+        .into(),
         seeding: None,
         torrent: TorrentConfig::default(),
     };
@@ -834,7 +835,7 @@ fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_defaul
     assert!(settings.unpack(&record, rules.first()));
     settings.torrent.unpack = false;
     assert!(!settings.unpack(&record, rules.first()));
-    settings.categories[0].unpack = Some(true);
+    settings.categories.edit(|list| list[0].unpack = Some(true));
     assert!(settings.unpack(&record, rules.first()));
     rules[0].unpack = Some(false);
     assert!(!settings.unpack(&record, rules.first()));
@@ -850,11 +851,13 @@ fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_defaul
 #[test]
 fn each_seeding_term_resolves_over_the_levels_on_its_own() {
     let (mut record, rule, mut settings) = chain();
-    settings.categories[0].seeding = Some(SeedingPolicy {
-        ratio_goal: Leaf::Set(1.0),
-        seed_time_goal_minutes: Leaf::Set(72 * 60),
-        mode: Leaf::Set(SeedingGoalMode::All),
-        ..SeedingPolicy::default()
+    settings.categories.edit(|list| {
+        list[0].seeding = Some(SeedingPolicy {
+            ratio_goal: Leaf::Set(1.0),
+            seed_time_goal_minutes: Leaf::Set(72 * 60),
+            mode: Leaf::Set(SeedingGoalMode::All),
+            ..SeedingPolicy::default()
+        })
     });
 
     // Kept before: every policy then carried its mode and action.
@@ -912,9 +915,11 @@ fn each_seeding_term_resolves_over_the_levels_on_its_own() {
 #[test]
 fn off_drops_an_inherited_goal_and_inherit_takes_the_one_above() {
     let (mut record, mut rule, mut settings) = chain();
-    settings.categories[0].seeding = Some(SeedingPolicy {
-        inactive_goal_minutes: Leaf::Set(60),
-        ..SeedingPolicy::default()
+    settings.categories.edit(|list| {
+        list[0].seeding = Some(SeedingPolicy {
+            inactive_goal_minutes: Leaf::Set(60),
+            ..SeedingPolicy::default()
+        })
     });
     let inactive = |record: &TorrentRecord, rule: &TrackerRule| {
         let (seeding, levels) = settings.seeding(record, Some(rule));
@@ -963,7 +968,9 @@ fn the_upload_cap_comes_from_the_first_level_that_sets_it() {
     assert_eq!(cap(&settings, &record, &rule), (None, Level::Global));
     settings.upload_cap = Some(5_000);
     assert_eq!(cap(&settings, &record, &rule), (Some(5_000), Level::Global));
-    settings.categories[0].upload_cap = Leaf::Set(3_000);
+    settings
+        .categories
+        .edit(|list| list[0].upload_cap = Leaf::Set(3_000));
     assert_eq!(
         cap(&settings, &record, &rule),
         (Some(3_000), Level::Category)
@@ -975,7 +982,9 @@ fn the_upload_cap_comes_from_the_first_level_that_sets_it() {
         cap(&settings, &record, &rule),
         (Some(1_000), Level::TrackerRule)
     );
-    settings.categories[0].upload_cap = Leaf::Off;
+    settings
+        .categories
+        .edit(|list| list[0].upload_cap = Leaf::Off);
     rule.upload_cap = Leaf::Inherit;
     assert_eq!(cap(&settings, &record, &rule), (None, Level::Category));
 
@@ -986,6 +995,49 @@ fn the_upload_cap_comes_from_the_first_level_that_sets_it() {
     assert_eq!(upload(&record, None), bps(2_000));
     record.upload_limit = Some(500);
     assert_eq!(upload(&record, Some(1_000)), bps(500));
+}
+
+// A category is found by its id as the scan of the list found it: the first
+// of an id, after a push or an edit too.
+#[test]
+fn a_category_by_its_id_is_the_first_of_that_id_in_the_list() {
+    let category = |id: u32, name: &str| CategoryConfig {
+        upload_cap: Default::default(),
+        id,
+        name: name.to_owned(),
+        dest_dir: None,
+        aliases: String::new(),
+        seeding: None,
+        torrent_route: false,
+        unpack: None,
+    };
+    let scan = |list: &[CategoryConfig], id: u32| {
+        list.iter()
+            .find(|category| category.id == id)
+            .map(|category| category.name.clone())
+    };
+    let list: Vec<CategoryConfig> = (0..200u32)
+        .map(|n| category(n % 70, &format!("c{n}")))
+        .collect();
+    let mut categories = Categories::from(list);
+    let same = |categories: &Categories| {
+        for id in 0..80 {
+            assert_eq!(
+                categories.of(id).map(|category| category.name.clone()),
+                scan(categories, id),
+                "id {id}"
+            );
+        }
+    };
+    same(&categories);
+    categories.push(category(75, "late"));
+    categories.push(category(3, "shadowed"));
+    same(&categories);
+    categories.edit(|list| {
+        list.remove(0);
+        list[5].id = 79;
+    });
+    same(&categories);
 }
 
 // A torrent takes its tracker rule's route when the rule routes its torrents
@@ -1005,7 +1057,7 @@ fn a_torrents_route_is_its_rules_then_its_categorys_then_the_default() {
     let settings = TorrentSettings {
         upload_cap: None,
         complete_dir: PathBuf::from("/complete"),
-        categories: vec![category(1, true), category(2, false)],
+        categories: vec![category(1, true), category(2, false)].into(),
         seeding: None,
         torrent: TorrentConfig::default(),
     };

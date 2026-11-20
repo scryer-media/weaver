@@ -915,7 +915,7 @@ async fn a_tracker_edit_racing_an_attach_reaches_the_session() {
         let mut live = rig.service.inner.live.lock().await;
         let torrent = live.get_mut(&job_id).unwrap();
         rig.service.detach(torrent).await;
-        torrent.route = None;
+        torrent.route.clear();
     }
     // Its route's session goes with it, so the attach waits for a new one,
     // whose leg has not answered yet.

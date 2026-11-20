@@ -231,6 +231,12 @@ struct Wants {
     rejected_of: HashMap<PeerHandle, HashSet<Key>>,
     /// The wants for the block hashes of each piece.
     blocks_of: BTreeSet<(u32, Key)>,
+    /// Where each peer's pick of the layers starts, and the pieces stamp it
+    /// was found at: every run of a layer before it is one the peer
+    /// rejected or has no piece of, which no pick gives it until it leaves
+    /// or its pieces change. Runs of a layer are only ever taken out, so
+    /// the place holds while the stamp does.
+    cursor_of: HashMap<PeerHandle, (u64, Key)>,
     /// The key the next want put first takes, less one.
     front: Key,
     /// The key the next want put last takes.
@@ -361,43 +367,64 @@ impl LayerFetch {
     /// given `timeout` to answer: the wants it has a piece of that are out
     /// to no one, or only to peers past their timeout, block hashes first,
     /// up to [`REQUESTS_PER_PEER`] held at once (libtorrent
-    /// `hash_picker::pick_hashes`).
+    /// `hash_picker::pick_hashes`). It waits for the soonest want it has a
+    /// piece of to go free. `stamp` is the peer's pieces stamp
+    /// (`LivePeerState::pieces_stamp`): the runs of a layer it was found to
+    /// reject or lack under the same stamp are not looked at again, so a
+    /// peer with pieces of the later files alone walks the earlier ones
+    /// once, not on every pick.
     pub fn pick(
         &self,
         peer: PeerHandle,
+        stamp: u64,
         has_any: impl Fn(Range<u32>) -> bool,
         timeout: Duration,
         now: Instant,
     ) -> Pick {
         let mut guard = self.wanted.lock();
         let wants = &mut *guard;
-        let mut held = wants.held(peer);
-        let mut send = Vec::new();
-        let mut wake: Option<Instant> = None;
-        for (&key, w) in wants.by_order.iter_mut() {
-            if held >= REQUESTS_PER_PEER {
+        let mut pick = Picking {
+            peer,
+            has_any,
+            deadline: now + timeout,
+            now,
+            held: wants.held(peer),
+            send: Vec::new(),
+            wake: None,
+        };
+        // The block hashes first, all of them: there is one want for each
+        // piece failing at once.
+        for (&key, w) in wants.by_order.range_mut(..0) {
+            if pick.held >= REQUESTS_PER_PEER {
                 break;
             }
-            if w.out.iter().any(|o| o.peer == peer) || w.rejected_by.contains(&peer) {
-                continue;
+            if pick.consider(w) == Considered::Taken {
+                wants.out_of.entry(peer).or_default().insert(key);
             }
-            if let Some(due) = w.due()
-                && due > now
-            {
-                wake = Some(wake.map_or(due, |at| at.min(due)));
-                continue;
-            }
-            if !w.pieces.iter().any(|pieces| has_any(pieces.clone())) {
-                continue;
-            }
-            w.out.push(Out {
-                peer,
-                deadline: now + timeout,
-            });
-            wants.out_of.entry(peer).or_default().insert(key);
-            send.push(w.request);
-            held += 1;
         }
+        let start = match wants.cursor_of.get(&peer) {
+            Some(&(at, key)) if at == stamp => key,
+            _ => 0,
+        };
+        // The cursor moves past the runs at its head that the peer will not
+        // be given, and stops at the first it may be.
+        let (mut cursor, mut advancing) = (start, true);
+        for (&key, w) in wants.by_order.range_mut(start..) {
+            if pick.held >= REQUESTS_PER_PEER {
+                break;
+            }
+            match pick.consider(w) {
+                Considered::Never if advancing => cursor = key + 1,
+                Considered::Never => {}
+                Considered::Taken => {
+                    advancing = false;
+                    wants.out_of.entry(peer).or_default().insert(key);
+                }
+                Considered::NotNow => advancing = false,
+            }
+        }
+        wants.cursor_of.insert(peer, (stamp, cursor));
+        let Picking { send, wake, .. } = pick;
         if send.is_empty() {
             Pick::Wait(wake)
         } else {
@@ -536,6 +563,7 @@ impl LayerFetch {
                 w.out.retain(|o| o.peer != peer);
                 wake = wake.and(Wake::taken_off(peer, was, w.due()));
             }
+            wants.cursor_of.remove(&peer);
             for key in wants.rejected_of.remove(&peer).unwrap_or_default() {
                 if let Some(w) = wants.by_order.get_mut(&key) {
                     w.rejected_by.retain(|p| *p != peer);
@@ -544,6 +572,57 @@ impl LayerFetch {
         }
         self.waiters.lock().remove(&peer);
         self.wake(wake);
+    }
+}
+
+/// One pick's walk of the wants: the peer, what it holds and is to be sent,
+/// and when to ask again.
+struct Picking<F> {
+    peer: PeerHandle,
+    has_any: F,
+    deadline: Instant,
+    now: Instant,
+    held: usize,
+    send: Vec<HashRequest>,
+    wake: Option<Instant>,
+}
+
+/// What a pick made of a want.
+#[derive(PartialEq, Eq)]
+enum Considered {
+    /// Asked of the peer.
+    Taken,
+    /// Out to it already, or to others not yet past their time.
+    NotNow,
+    /// Rejected by it, or of no piece it has: not until it leaves or its
+    /// pieces change.
+    Never,
+}
+
+impl<F: Fn(Range<u32>) -> bool> Picking<F> {
+    fn consider(&mut self, w: &mut Wanted) -> Considered {
+        let peer = self.peer;
+        if w.out.iter().any(|o| o.peer == peer) {
+            return Considered::NotNow;
+        }
+        if w.rejected_by.contains(&peer)
+            || !w.pieces.iter().any(|pieces| (self.has_any)(pieces.clone()))
+        {
+            return Considered::Never;
+        }
+        if let Some(due) = w.due()
+            && due > self.now
+        {
+            self.wake = Some(self.wake.map_or(due, |at| at.min(due)));
+            return Considered::NotNow;
+        }
+        w.out.push(Out {
+            peer,
+            deadline: self.deadline,
+        });
+        self.send.push(w.request);
+        self.held += 1;
+        Considered::Taken
     }
 }
 
@@ -588,6 +667,7 @@ impl PeerHandler {
             let Some(pick) = self.state.peers.with_live(self.addr, |live| {
                 fetch.pick(
                     self.addr,
+                    live.pieces_stamp,
                     |pieces| has_any(&live.bitfield, pieces),
                     live.request_timeout(),
                     Instant::now(),
@@ -742,6 +822,7 @@ mod tests {
             loop {
                 let pick = self.fetch.pick(
                     peer.into(),
+                    u64::from(peer.port()),
                     |pieces| pieces.into_iter().any(|p| has[p as usize]),
                     timeout,
                     now,
@@ -784,6 +865,7 @@ mod tests {
         // The peer has b's pieces, 3..6, and none of a's.
         let pick = fetch.pick(
             peer,
+            0,
             |pieces| pieces.start.max(3) < pieces.end.min(6),
             Duration::from_secs(5),
             Instant::now(),
@@ -795,7 +877,7 @@ mod tests {
         // A peer with no piece of the root is not.
         let other = PeerHandle::from(SocketAddr::from(([10, 0, 0, 2], 6881)));
         assert!(matches!(
-            fetch.pick(other, |_| false, Duration::from_secs(5), Instant::now()),
+            fetch.pick(other, 0, |_| false, Duration::from_secs(5), Instant::now()),
             Pick::Wait(_)
         ));
     }
@@ -826,7 +908,7 @@ mod tests {
             assert!(b.notified().now_or_never().is_some());
         }
         let now = Instant::now();
-        let Pick::Send(sent) = fetch.pick(peer, |_| true, Duration::from_secs(5), now) else {
+        let Pick::Send(sent) = fetch.pick(peer, 0, |_| true, Duration::from_secs(5), now) else {
             panic!("the block hashes were not asked for");
         };
         assert_eq!(sent, vec![request(1)]);
@@ -838,8 +920,78 @@ mod tests {
         assert!(fetch.wanted.lock().by_order.is_empty());
     }
 
+    // A peer with pieces of the last runs alone is given them all, two at a
+    // time, looking once at the runs before them, not again on each pick;
+    // when its pieces change it looks at them all again, and is given the
+    // run of a piece it gained.
+    #[test]
+    fn a_peer_lacking_the_first_runs_looks_at_them_once_while_its_pieces_hold() {
+        const RUNS: u32 = 1000;
+        let request = |index: u32| HashRequest {
+            root: Id32::default(),
+            base: 0,
+            index,
+            count: 1,
+            proof_layers: 0,
+        };
+        let fetch = LayerFetch {
+            wanted: Mutex::new(Wants::new((0..RUNS).map(|i| Wanted {
+                request: request(i),
+                pieces: vec![i..i + 1],
+                kind: Kind::Layer,
+                out: Vec::new(),
+                rejected_by: Vec::new(),
+            }))),
+            waiters: Mutex::default(),
+        };
+        let peer = PeerHandle::from(SocketAddr::from(([10, 0, 0, 1], 6881)));
+        let looked = std::cell::Cell::new(0u32);
+        let mut gained = None;
+        let has = |pieces: Range<u32>, gained: Option<u32>| {
+            looked.set(looked.get() + 1);
+            pieces.start >= RUNS - 10 || gained.is_some_and(|p| pieces.contains(&p))
+        };
+        let timeout = Duration::from_secs(5);
+        let now = Instant::now();
+        let mut given = Vec::new();
+        let mut stamp = 1;
+        loop {
+            match fetch.pick(peer, stamp, |p| has(p, gained), timeout, now) {
+                Pick::Send(sent) => {
+                    for r in &sent {
+                        fetch.answered(peer, r);
+                        fetch.landed(r);
+                    }
+                    given.extend(sent);
+                }
+                Pick::Wait(at) => {
+                    assert_eq!(at, None);
+                    break;
+                }
+            }
+        }
+        assert_eq!(given, ((RUNS - 10)..RUNS).map(request).collect::<Vec<_>>());
+        // Every run once, and the ten given looked at once more each at
+        // most, where every pick looking at them all was five times as many.
+        assert!(looked.get() <= RUNS + 10, "{}", looked.get());
+        // The peer gains piece 3. Under the old stamp nothing changed for
+        // the pick; the new one has it look again.
+        gained = Some(3);
+        assert!(matches!(
+            fetch.pick(peer, stamp, |p| has(p, gained), timeout, now),
+            Pick::Wait(None)
+        ));
+        stamp += 1;
+        let Pick::Send(sent) = fetch.pick(peer, stamp, |p| has(p, gained), timeout, now) else {
+            panic!("the run of the piece gained was not asked for");
+        };
+        assert_eq!(sent, vec![request(3)]);
+    }
+
     /// The fetch as it was before it was indexed: a list searched for each
-    /// change. The reference the indexed fetch is compared with.
+    /// change, every want looked at on every pick. The reference the
+    /// indexed fetch is compared with. A pick waits for the soonest want
+    /// the peer has a piece of to go free.
     struct Listed(Vec<Wanted>);
 
     impl Listed {
@@ -864,13 +1016,13 @@ mod tests {
                 if w.out.iter().any(|o| o.peer == peer) || w.rejected_by.contains(&peer) {
                     continue;
                 }
+                if !w.pieces.iter().any(|pieces| has_any(pieces.clone())) {
+                    continue;
+                }
                 if let Some(due) = w.due()
                     && due > now
                 {
                     wake = Some(wake.map_or(due, |at| at.min(due)));
-                    continue;
-                }
-                if !w.pieces.iter().any(|pieces| has_any(pieces.clone())) {
                     continue;
                 }
                 w.out.push(Out {
@@ -1029,9 +1181,10 @@ mod tests {
                 wanted: Mutex::new(Wants::new(wants.iter().map(copy))),
                 waiters: Mutex::default(),
             };
-            let peers: Vec<(PeerHandle, Vec<bool>, Duration)> = (0..6u16)
+            let mut peers: Vec<(PeerHandle, Vec<bool>, Duration)> = (0..6u16)
                 .map(|i| {
-                    let has = (0..PIECES).map(|_| next() % 3 == 0).collect();
+                    // Few pieces, so a peer lacks many runs in a row.
+                    let has = (0..PIECES).map(|_| next() % 5 == 0).collect();
                     let timeout = Duration::from_millis(1000 + next() % 4000);
                     (
                         SocketAddr::from(([10, 0, 0, 1], 6881 + i)).into(),
@@ -1040,10 +1193,14 @@ mod tests {
                     )
                 })
                 .collect();
+            // Each peer's pieces stamp, taken anew when its pieces change.
+            let mut stamps: Vec<u64> = (1..=6).collect();
+            let mut next_stamp = 7;
             let mut now = Instant::now();
             for step in 0..500 {
                 let r = next();
-                let (peer, ..) = peers[(r >> 8) as usize % peers.len()];
+                let at = (r >> 8) as usize % peers.len();
+                let (peer, ..) = peers[at];
                 let held: Vec<HashRequest> = listed
                     .0
                     .iter()
@@ -1111,12 +1268,20 @@ mod tests {
                         indexed.piece_passed(piece);
                         listed.piece_passed(piece);
                     }
+                    // The peer gains a piece or loses one, and its pieces
+                    // take a new stamp.
+                    6 if r & 0x800 != 0 => {
+                        let piece = (r >> 16) as usize % PIECES as usize;
+                        peers[at].1[piece] ^= true;
+                        stamps[at] = next_stamp;
+                        next_stamp += 1;
+                    }
                     _ => now += Duration::from_millis(next() % 3000),
                 }
-                for (peer, has, timeout) in &peers {
+                for ((peer, has, timeout), &stamp) in peers.iter().zip(&stamps) {
                     let has = |pieces: Range<u32>| pieces.into_iter().any(|p| has[p as usize]);
                     assert_eq!(
-                        picked(indexed.pick(*peer, has, *timeout, now)),
+                        picked(indexed.pick(*peer, stamp, has, *timeout, now)),
                         picked(listed.pick(*peer, has, *timeout, now)),
                         "run {run} step {step} peer {peer:?}"
                     );

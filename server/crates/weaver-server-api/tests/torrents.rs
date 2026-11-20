@@ -115,7 +115,7 @@ async fn rig_on(routes: impl FnOnce(&weaver_server_core::Database) -> Arc<dyn Ro
         TorrentSettings {
             upload_cap: None,
             complete_dir: complete.clone(),
-            categories: Vec::new(),
+            categories: Default::default(),
             seeding: None,
             // Torrents on, as the open sessions say: a torrent is added only then.
             torrent: TorrentConfig {
@@ -460,7 +460,7 @@ async fn the_torrent_surface_says_when_torrents_are_off() {
     let settings = |enabled| TorrentSettings {
         upload_cap: None,
         complete_dir: rig._dir.path().join("complete"),
-        categories: Vec::new(),
+        categories: Default::default(),
         seeding: None,
         torrent: TorrentConfig {
             enabled,
@@ -529,7 +529,8 @@ async fn a_torrent_reads_its_leechers_file_progress_and_seeding_policy() {
             seeding: Some(policy(3.0)),
             torrent_route: false,
             unpack: None,
-        }],
+        }]
+        .into(),
         seeding: Some(policy(1.5)),
         torrent: TorrentConfig {
             enabled: true,
@@ -1513,7 +1514,7 @@ async fn the_torrent_routes_are_listed_with_their_scopes_and_reasons() {
         .set_settings(TorrentSettings {
             upload_cap: None,
             complete_dir: rig._dir.path().join("complete"),
-            categories: Vec::new(),
+            categories: Default::default(),
             seeding: None,
             torrent: TorrentConfig {
                 enabled: true,
@@ -2353,7 +2354,7 @@ async fn the_updates_of_a_page_wait_for_the_load() {
         TorrentSettings {
             upload_cap: None,
             complete_dir: _dir.path().join("complete"),
-            categories: Vec::new(),
+            categories: Default::default(),
             seeding: None,
             torrent: TorrentConfig {
                 enabled: true,
@@ -2437,7 +2438,8 @@ async fn a_control_key_moves_a_torrent_only_under_the_save_folders() {
                 seeding: None,
                 torrent_route: false,
                 unpack: None,
-            }],
+            }]
+            .into(),
             seeding: None,
             torrent: TorrentConfig {
                 enabled: true,

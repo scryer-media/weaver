@@ -509,7 +509,10 @@ impl Session {
                             unable,
                             discovery,
                             phase_tx,
-                            session.trackers_changed.clone(),
+                            session
+                                .trackers_changed
+                                .clone()
+                                .map(|changed| (changed, info_hashes.best())),
                         )
                         .await;
                         peer_finder::after_trackers(

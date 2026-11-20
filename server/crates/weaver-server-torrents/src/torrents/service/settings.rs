@@ -25,10 +25,66 @@ use weaver_server_settings::categories::CategoryConfig;
 #[derive(Debug, Clone)]
 pub struct TorrentSettings {
     pub complete_dir: PathBuf,
-    pub categories: Vec<CategoryConfig>,
+    pub categories: Categories,
     pub seeding: Option<SeedingPolicy>,
     pub upload_cap: Option<u64>,
     pub torrent: TorrentConfig,
+}
+
+/// The categories torrents are kept under, with each one's place by its id:
+/// the first of an id is the one a torrent's id names. The list is read as a
+/// slice and replaced whole, so its index is never out of step with it.
+#[derive(Debug, Clone, Default)]
+pub struct Categories {
+    list: Vec<CategoryConfig>,
+    at: std::collections::HashMap<u32, usize>,
+}
+
+impl Categories {
+    /// The category `id` names, if any.
+    pub fn of(&self, id: u32) -> Option<&CategoryConfig> {
+        self.at.get(&id).map(|&place| &self.list[place])
+    }
+
+    /// The list changed by `change`, and indexed again.
+    pub fn edit(&mut self, change: impl FnOnce(&mut Vec<CategoryConfig>)) {
+        let mut list = std::mem::take(&mut self.list);
+        change(&mut list);
+        *self = list.into();
+    }
+
+    /// `category` added last; the first of an id stays the one it names.
+    pub fn push(&mut self, category: CategoryConfig) {
+        self.at.entry(category.id).or_insert(self.list.len());
+        self.list.push(category);
+    }
+}
+
+impl IntoIterator for Categories {
+    type Item = CategoryConfig;
+    type IntoIter = std::vec::IntoIter<CategoryConfig>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.list.into_iter()
+    }
+}
+
+impl From<Vec<CategoryConfig>> for Categories {
+    fn from(list: Vec<CategoryConfig>) -> Self {
+        let mut at = std::collections::HashMap::with_capacity(list.len());
+        for (place, category) in list.iter().enumerate() {
+            at.entry(category.id).or_insert(place);
+        }
+        Self { list, at }
+    }
+}
+
+impl std::ops::Deref for Categories {
+    type Target = [CategoryConfig];
+
+    fn deref(&self) -> &[CategoryConfig] {
+        &self.list
+    }
 }
 
 /// Where each level keeps one setting a torrent takes over its levels; a
@@ -145,7 +201,7 @@ impl TorrentSettings {
     pub fn of(config: &Config) -> Self {
         Self {
             complete_dir: PathBuf::from(config.complete_dir()),
-            categories: config.categories.clone(),
+            categories: config.categories.clone().into(),
             seeding: config.seeding,
             upload_cap: config.upload_cap,
             torrent: config.torrent.clone(),
@@ -153,7 +209,7 @@ impl TorrentSettings {
     }
 
     pub(super) fn category(&self, id: Option<u32>) -> Option<&CategoryConfig> {
-        id.and_then(|id| self.categories.iter().find(|category| category.id == id))
+        id.and_then(|id| self.categories.of(id))
     }
 
     /// `field` at each level for a torrent: `torrent`, when there is one

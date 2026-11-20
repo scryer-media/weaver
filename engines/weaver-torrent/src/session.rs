@@ -81,6 +81,7 @@ mod turnover;
 pub use options::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, IpFilter,
     ListOnlyResponse, SessionLimits, SessionOptions, SessionPersistenceConfig, SharedLimits,
+    TrackersChanged,
 };
 pub use peer_sources::{Discovery, FetchPhase, MetadataFetch};
 pub(crate) use peer_sources::{a_tracker_answered, speaks_pex};
@@ -317,7 +318,7 @@ pub struct Session {
     // limits.
     http_announces: HttpAnnounces,
     // Rung as an announce table or a metadata fetch's phase changes.
-    trackers_changed: Option<Arc<Notify>>,
+    trackers_changed: Option<TrackersChanged>,
 
     // Lifecycle management
     cancellation_token: CancellationToken,
