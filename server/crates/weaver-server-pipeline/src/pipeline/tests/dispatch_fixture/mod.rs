@@ -2,10 +2,25 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+pub mod acquire_failures;
+pub mod article_slots;
+pub mod blocking_lane;
 mod booking;
+pub mod busy_turns;
+pub mod checkpoint;
+pub mod ladder_failures;
+pub mod ladder_quota;
+pub mod scheduler_lanes;
+pub mod scheduler_activation;
 pub(in crate::pipeline::tests) mod ladder;
+pub mod lane_holdings;
 pub mod lanes;
 mod logs;
+pub mod owned_failures;
+pub(in crate::pipeline::tests) mod results;
+pub mod retries;
+mod seeded_walk;
+pub(in crate::pipeline::tests) mod scheduler;
 
 // Every pipeline these tests build checks, after each dispatch pass and each
 // lane result batch, that its in-flight gauges are what its live lanes hold.
@@ -15,7 +30,6 @@ pub(super) async fn audited_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBuf, 
     (pipeline, intermediate_dir, complete_dir)
 }
 
-#[cfg(test)]
 pub(super) async fn audited_pipeline_with_backlog(
     temp_dir: &TempDir,
     backlog_base_bytes: usize,

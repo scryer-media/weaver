@@ -220,7 +220,6 @@ impl Envelopes {
 
     // What rings as a run begins to wait on one of the shelves.
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-    #[cfg(test)]
     pub(crate) fn blocked(&self) -> Arc<tokio::sync::Notify> {
         Arc::clone(&self.blocked)
     }
@@ -622,7 +621,6 @@ impl Shelf {
 
     // Whether a run waits on the shelf for a change that has not come.
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-    #[cfg(test)]
     pub(crate) fn blocked(&self) -> bool {
         let state = self.lock();
         state.waits_since == Some(state.woken)

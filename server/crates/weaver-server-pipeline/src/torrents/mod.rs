@@ -54,5 +54,7 @@ pub(crate) fn live_among(
     db.torrent_job_ids_among(job_ids)
 }
 
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+pub(crate) mod test_fixture;
 #[cfg(test)]
 pub(crate) mod tests;

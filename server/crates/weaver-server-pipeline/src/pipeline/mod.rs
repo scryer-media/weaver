@@ -575,7 +575,7 @@ pub(super) struct DownloadLaneObservation {
 }
 
 pub(super) enum DownloadPayload {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     Raw(Bytes),
     Decoded(DecodeResult),
 }
@@ -2099,7 +2099,7 @@ pub struct Pipeline {
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(super) audit_lane_holdings: bool,
     // Where a test stops this pipeline's moves of working folders.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(super) move_gates: activation::MoveGates,
     // When each deferred job's articles become old enough to fetch.
     //
@@ -2243,7 +2243,7 @@ pub struct Pipeline {
     // Largest refused UU spill. Dispatch preserves cursor progress until
     // this many bytes can be parked in memory or admitted to the spool.
     pub(super) uu_spool_blocked_spill_bytes: Option<usize>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     // Test-only free-space reading; `Some(None)` exercises a filesystem that
     // has never produced a reading.
     pub(super) uu_spool_available_bytes_for_test: Option<Option<u64>>,

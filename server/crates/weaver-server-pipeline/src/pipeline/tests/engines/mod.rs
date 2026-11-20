@@ -71,58 +71,38 @@
 
 #[cfg(test)]
 mod abandon_cost;
-#[cfg(test)]
-mod accounting;
-#[cfg(test)]
-mod bound_recovery_health;
-#[cfg(test)]
-mod caps;
-#[cfg(test)]
-mod checkpoint_cost;
+pub mod accounting_fixture;
+mod actor_drive;
+pub mod caps;
 #[cfg(test)]
 mod dead_posts;
-#[cfg(test)]
-mod deep;
 pub mod depth;
+pub mod disk_archive;
+pub mod disk_reserve;
 #[cfg(test)]
 mod disk_wait;
 #[cfg(test)]
-mod download_summary;
-#[cfg(test)]
-mod embedded;
-#[cfg(test)]
-mod encrypted_hex;
+use archive_scenario_fixtures::download_summary;
+pub mod archive_scenario_fixtures;
 #[cfg(test)]
 mod extractor_claims;
 #[cfg(test)]
 mod first_article_sample;
 pub mod harness;
 pub mod rar_fixtures;
+pub mod recovery_fixtures;
 pub mod restart_fixtures;
 mod state;
 
-#[cfg(test)]
-mod hold_breach;
 #[cfg(test)]
 mod lent_handed;
 #[cfg(test)]
 mod lent_windows;
 #[cfg(test)]
 mod lifecycle;
-#[cfg(test)]
-mod lines;
-#[cfg(test)]
-pub(in crate::pipeline) mod loans;
-#[cfg(test)]
-mod nameless_reversed;
+pub mod loans;
 #[cfg(test)]
 mod pairings;
-#[cfg(test)]
-mod par3;
-#[cfg(test)]
-mod password;
-#[cfg(test)]
-mod plain_par2;
 #[cfg(test)]
 mod post_health_seats;
 #[cfg(test)]
@@ -130,13 +110,7 @@ mod rar;
 #[cfg(test)]
 mod rar_rev;
 #[cfg(test)]
-mod recovery_audit;
-#[cfg(test)]
-mod recovery_damage_wire;
-#[cfg(test)]
 mod recovery_duplicate_wire;
-#[cfg(test)]
-mod recovery_encrypted_wire;
 #[cfg(test)]
 mod recovery_geometry_wire;
 #[cfg(test)]
@@ -150,28 +124,20 @@ mod remaining_stalls;
 #[cfg(test)]
 mod repaired_source;
 #[cfg(test)]
-mod reposted;
-#[cfg(test)]
 pub(in crate::pipeline::tests) mod restart;
 #[cfg(test)]
 mod seek;
 #[cfg(test)]
 mod sets;
 #[cfg(test)]
-mod settled_rulings;
-#[cfg(test)]
 mod sevenz;
 pub mod sevenz_fixtures;
-#[cfg(test)]
-mod sevenz_hex;
 pub mod sfv;
-#[cfg(test)]
-mod solid_hex;
-#[cfg(test)]
-mod spent;
+pub mod spent_fixtures;
 pub mod stream_fixtures;
 #[cfg(test)]
 use stream_fixtures as streams;
 #[cfg(test)]
 mod too_large;
+pub mod wire_recovery;
 pub mod zip;

@@ -26,11 +26,11 @@ pub fn delivered(name: &str) -> String {
 }
 
 // A stored RAR5 volume of `entries`, in order.
-pub(super) fn rar(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+pub fn rar(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
     multi_member_store_set(entries, 1).remove(0).1
 }
 
-pub(super) fn sevenz(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+pub fn sevenz(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
     let borrowed: Vec<(&str, &[u8])> = entries.iter().map(|(n, b)| (*n, b.as_slice())).collect();
     stored(&borrowed)
 }

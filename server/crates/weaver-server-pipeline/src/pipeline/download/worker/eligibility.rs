@@ -44,7 +44,7 @@ impl Pipeline {
             .sum()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(in crate::pipeline::download::worker) fn job_has_dispatchable_work(
         &mut self,
         job_id: JobId,
@@ -99,7 +99,7 @@ impl Pipeline {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(in crate::pipeline) fn job_has_dispatchable_work_for_test(
         &mut self,
         job_id: JobId,

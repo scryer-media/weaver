@@ -155,7 +155,7 @@ impl Pipeline {
 
     // The cleanup as it was, with a pass over each list per file, kept to
     // compare the single pass against.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn clear_job_write_backlog_per_file(&mut self, job_id: JobId) {
         let file_ids: std::collections::HashSet<NzbFileId> = self
             .uu_files

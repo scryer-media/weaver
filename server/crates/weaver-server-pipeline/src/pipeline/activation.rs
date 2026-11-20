@@ -29,7 +29,7 @@ use crate::pipeline::graph::restore::{GraphRestore, GraphRestoreError, RestoreSe
 use crate::pipeline::held::HeldPart;
 
 // A point a move stops at, for a test, until the test opens it.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 #[derive(Default)]
 pub(crate) struct MoveGate {
     // Reached, and opened.
@@ -37,7 +37,7 @@ pub(crate) struct MoveGate {
     moved: std::sync::Condvar,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 impl MoveGate {
     // On a blocking thread: say it is reached, and wait until it is open.
     pub(crate) fn pass(&self) {
@@ -72,7 +72,7 @@ impl MoveGate {
 // on disk (leaving the old folder, or giving up the new one), and
 // `leaving`, just before the removal of a folder a move claimed for a job
 // that left.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 #[derive(Default)]
 pub(crate) struct MoveGates {
     pub(crate) moving: Option<Arc<MoveGate>>,
@@ -291,10 +291,10 @@ async fn follow_working_dir(
     root: PathBuf,
     current: PathBuf,
     name: String,
-    #[cfg(test)] gate: Option<Arc<MoveGate>>,
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))] gate: Option<Arc<MoveGate>>,
 ) -> Option<PathBuf> {
     let from = current.clone();
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     let seam_root = root.clone();
     let followed = tokio::task::spawn_blocking(move || {
         crate::jobs::working_dir::follow_intermediate_dir(&root, &current, job_id, &name)
@@ -313,7 +313,7 @@ async fn follow_working_dir(
     let stored = dir.clone();
     let moved = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let moved_in_row = Arc::clone(&moved);
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     move_seams::before_row_write(&seam_root).await;
     let recorded =
         match db.try_queue_job_write_committed(job_id, "move_active_job_output_dir", move |db| {
@@ -333,12 +333,12 @@ async fn follow_working_dir(
     // The row is the arbiter: a row that no longer names the directory the
     // job started in, or has gone, did not move, and the claim is given up.
     let recorded = recorded.is_ok() && moved.load(std::sync::atomic::Ordering::Acquire);
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     if !recorded {
         move_seams::before_abandon(&seam_root).await;
     }
     let _ = tokio::task::spawn_blocking(move || {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         if let Some(gate) = gate {
             gate.pass();
         }
@@ -349,7 +349,7 @@ async fn follow_working_dir(
         }
     })
     .await;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     if !recorded {
         move_seams::after_abandon(&seam_root);
     }
@@ -441,7 +441,7 @@ impl Pipeline {
                 (move_out, hold)
             })
             .unzip();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         let gate = self.move_gates.moving.clone();
         let seat = self
             .graph_restore_seat(None, &working_dir)
@@ -473,7 +473,7 @@ impl Pipeline {
                         root,
                         working_dir,
                         name,
-                        #[cfg(test)]
+                        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
                         gate,
                     )
                     .await
@@ -543,7 +543,7 @@ impl Pipeline {
     // with the id. An id being admitted, or held by a history operation,
     // may have taken the directory as its own, so it stays, and that job's
     // own cleanup takes any directory that carries its marker.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn take_moved_dir(&mut self, job_id: JobId, started_in: &Path, dir: &Path) -> bool {
         self.take_or_hold_moved_dir(job_id, started_in, dir, false)
     }
@@ -670,14 +670,14 @@ impl Pipeline {
         });
         // Both go off the actor, their counts and holds with them.
         if left_dir.is_some() || left_staging.is_some() {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             let gate = self
                 .move_gates
                 .leaving
                 .clone()
                 .filter(|_| left_dir.is_some());
             tokio::task::spawn_blocking(move || {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "pipeline-test-fixtures"))]
                 if let Some(gate) = gate {
                     gate.pass();
                 }
@@ -690,7 +690,7 @@ impl Pipeline {
                     warn!(job_id = job_id.0, dir = %dir.display(), %error, "could not remove the working directory claimed for a job that left");
                 }
                 if let Some((staging, _staging_hold)) = left_staging {
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
                     move_seams::before_staging_removal(&staging);
                     // The read named it, not necessarily made it: one that
                     // holds files, or cannot be read, is kept.
@@ -706,7 +706,7 @@ impl Pipeline {
                             tracing::debug!(job_id = job_id.0, dir = %staging.display(), ?held, "kept the staging directory of a job that left: it holds files or cannot be read");
                         }
                     }
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
                     move_seams::after_staging_removal(&staging);
                 }
             });
@@ -1010,7 +1010,7 @@ impl Pipeline {
     // its volumes, without which its root would say less than it did, or an
     // object out for its work, without which no checkpoint can be taken.
     fn job_has_results_out(&self, job_id: JobId) -> bool {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         if self.job_has_queued_decode(job_id) {
             return true;
         }
@@ -1221,7 +1221,7 @@ fn read_job_articles(
 // the folders left with the job's marker, at chosen points, so a test sets
 // the order of each step against a cancel and a restart. Armed for one
 // intermediate root at a time; unarmed, each is a no-op.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) mod move_seams {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};

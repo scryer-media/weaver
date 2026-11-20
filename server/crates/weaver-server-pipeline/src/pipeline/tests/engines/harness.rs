@@ -38,6 +38,14 @@ use crate::pipeline::{
 };
 use weaver_server_base::jobs::ids::{JobId, NzbFileId, SegmentId};
 
+pub fn health_milli(total: u64, failed_bytes: u64) -> u32 {
+    crate::pipeline::health_milli(total, failed_bytes)
+}
+
+pub fn critical_health_milli(total: u64, par2_bytes: u64) -> u32 {
+    Pipeline::critical_health_milli(total, par2_bytes)
+}
+
 pub const ARTICLE: usize = 64;
 pub const NESTING: u32 = crate::pipeline::graph::limits::NESTING;
 
@@ -45,7 +53,7 @@ pub use super::state::JOB;
 pub(in crate::pipeline::tests) use super::state::finished;
 const JOB_NAME: &str = "lantern beacon";
 // A stored settings value that does not parse.
-pub(in crate::pipeline::tests) const CORRUPT_POLICY: &str = "{unreadable";
+pub const CORRUPT_POLICY: &str = "{unreadable";
 
 pub struct Post {
     pub name: String,
@@ -188,12 +196,7 @@ fn par2_created(
 // A single-volume stored RAR5 holding `files` and, beside them, a PAR2
 // set of `blocks` recovery blocks over them named under `base`: the set
 // is nested, reachable only once the archive opens.
-#[cfg(test)]
-pub(in crate::pipeline::tests) fn par2_in_store(
-    base: &str,
-    files: &[(&str, &[u8])],
-    blocks: u32,
-) -> Post {
+pub fn par2_in_store(base: &str, files: &[(&str, &[u8])], blocks: u32) -> Post {
     let mut members: Vec<(&str, Vec<u8>)> = files
         .iter()
         .map(|(name, bytes)| (*name, bytes.to_vec()))
@@ -250,8 +253,7 @@ pub fn par3_set_sized(base: &str, files: &[(&str, &[u8])], size: u64, blocks: u6
 // A PAR3 set over `files` built as `options` say (its codec, its recovery
 // count, whether it carries its input as Data packets), blocks of one
 // article, named as the creator names them under `base`, the index first.
-#[cfg(test)]
-pub(in crate::pipeline::tests) fn par3_set_with(
+pub fn par3_set_with(
     base: &str,
     files: &[(&str, &[u8])],
     options: par3_rs::creation::CreationOptions,
@@ -591,7 +593,7 @@ pub struct Scenario {
     pub batch: usize,
     // Every batch the download queue hands out is served as workers fetching
     // these posts at once: one article of each in turn, in this order.
-    pub(in crate::pipeline::tests) together: Vec<u32>,
+    pub together: Vec<u32>,
     // Once the queue hands out an article of one of these posts, every
     // article it holds of them arrives at once, last first, as the fetches
     // of many workers land out of order.
@@ -718,7 +720,6 @@ impl Scenario {
     }
 
     // Everything a run says is told to `heard` first.
-    #[cfg(test)]
     pub(in crate::pipeline::tests) fn heard(
         mut self,
         heard: impl Fn(&crate::pipeline::graph::engine::Said) + Send + Sync + 'static,
@@ -727,59 +728,65 @@ impl Scenario {
         self
     }
 
-    // Every pipeline the scenario prepares is set this way, last.
-    #[cfg(test)]
-    pub(in crate::pipeline::tests) fn setup(
-        mut self,
-        setup: impl Fn(&mut Pipeline) + Send + Sync + 'static,
+    pub fn on_run_message(
+        self,
+        heard: impl Fn(weaver_graph::NodeId, u64, String) + Send + Sync + 'static,
     ) -> Self {
+        self.heard(move |said| heard(said.node, said.generation, format!("{:?}", said.heard)))
+    }
+
+    pub fn on_repair(
+        self,
+        repaired: impl Fn(weaver_graph::NodeId) + Send + Sync + 'static,
+    ) -> Self {
+        use crate::pipeline::graph::engine::Heard;
+        self.heard(move |said| {
+            if matches!(said.heard, Heard::Repaired(_)) {
+                repaired(said.node);
+            }
+        })
+    }
+
+    // Every pipeline the scenario prepares is set this way, last.
+    pub fn setup(mut self, setup: impl Fn(&mut Pipeline) + Send + Sync + 'static) -> Self {
         self.setup = Some(std::sync::Arc::new(setup));
         self
     }
 
     // The operator chose this hardware profile.
-    #[cfg(test)]
-    pub(in crate::pipeline::tests) fn profile(
-        mut self,
-        profile: crate::runtime::HardwareProfile,
-    ) -> Self {
+    pub fn profile(mut self, profile: crate::runtime::HardwareProfile) -> Self {
         self.profile = Some(profile);
         self
     }
 
     // The job carries this metadata entry, as a reprocess or a client sets it.
-    #[cfg(test)]
-    pub(in crate::pipeline::tests) fn metadata(mut self, key: &str, value: &str) -> Self {
+    pub fn metadata(mut self, key: &str, value: &str) -> Self {
         self.metadata.push((key.to_string(), value.to_string()));
         self
     }
 
     // The stored settings are present but do not parse, on every pipeline
     // that runs the job.
-    #[cfg(test)]
-    pub(in crate::pipeline::tests) fn policy_corrupt(mut self) -> Self {
+    pub fn policy_corrupt(mut self) -> Self {
         self.policy_corrupt = true;
         self
     }
 
     // The job runs under these extraction limits.
-    #[cfg(test)]
-    pub(in crate::pipeline::tests) fn limits(mut self, limits: ExtractionLimits) -> Self {
+    pub fn limits(mut self, limits: ExtractionLimits) -> Self {
         self.limits = Some(limits);
         self
     }
 
     // The settings refuse these extensions.
-    #[cfg(test)]
-    pub(in crate::pipeline::tests) fn unacceptable(mut self, extensions: &[&str]) -> Self {
+    pub fn unacceptable(mut self, extensions: &[&str]) -> Self {
         self.unacceptable = Some(extensions.iter().map(|ext| ext.to_string()).collect());
         self
     }
 
     // A file with one of those extensions fails the job, the action that is
     // not the default.
-    #[cfg(test)]
-    pub(in crate::pipeline::tests) fn failing_job(mut self) -> Self {
+    pub fn failing_job(mut self) -> Self {
         self.action = Some(crate::post_processing::model::UnwantedExtensionAction::FailJob);
         self
     }
@@ -1095,7 +1102,7 @@ pub struct GraphView {
     pub kinds: BTreeSet<String>,
     // How many objects the job had sent out for their work, at the last
     // look.
-    pub(in crate::pipeline::tests) loans: u64,
+    pub loans: u64,
     // How many password candidates each node was offered, at the last look.
     pub offered: BTreeMap<weaver_graph::NodeId, usize>,
     // The files the job hands over at every depth, by output name.
@@ -1109,17 +1116,17 @@ pub struct GraphView {
     // The most the live namespaces objects produced kept resident for their
     // members, with the name ledger for the parts of its paths, at any
     // look, summed from the tree.
-    pub(in crate::pipeline::tests) resident: u64,
+    pub resident: u64,
     // The time the looks themselves took, which a run's time is not.
     pub observed: std::time::Duration,
     // What the job's report showed at each look, its status and whether it
     // was fetching repair data, each change once.
-    pub(in crate::pipeline::tests) shown: Vec<(JobStatus, bool)>,
+    pub shown: Vec<(JobStatus, bool)>,
     // The job's report at the last look.
     pub report: Option<crate::jobs::handle::JobInfo>,
     // The bytes still to come and the bytes wanted the job's report showed
     // at each look, each change once.
-    pub(in crate::pipeline::tests) remaining: Vec<(u64, u64)>,
+    pub remaining: Vec<(u64, u64)>,
     // Across each restart: the bytes still to come and wanted the report
     // showed as the pipeline went down, and as the new one restored the job.
     pub restored_remaining: Vec<((u64, u64), (u64, u64))>,
@@ -1286,9 +1293,7 @@ pub async fn run(scenario: &Scenario) -> Outcome {
 }
 
 // A fresh pipeline with the scenario's job admitted, nothing asked yet.
-pub(in crate::pipeline::tests) async fn admit(
-    scenario: &Scenario,
-) -> (tempfile::TempDir, Pipeline, std::path::PathBuf) {
+pub async fn admit(scenario: &Scenario) -> (tempfile::TempDir, Pipeline, std::path::PathBuf) {
     admit_with(scenario, |_, _| {}).await
 }
 
@@ -1317,12 +1322,17 @@ pub async fn try_run(scenario: &Scenario) -> Result<Outcome, Stall> {
 
 // [`run`], with `after` given the pipeline and the complete directory once
 // the job has finished and its outcome is read, before the pipeline goes.
-#[cfg(test)]
-pub(in crate::pipeline::tests) async fn run_then(
+pub async fn run_then(
     scenario: &Scenario,
     after: impl AsyncFnOnce(&mut Pipeline, &Path),
 ) -> Outcome {
     try_run_then(scenario, after)
+        .await
+        .unwrap_or_else(|stall| panic!("job stalled at {:?}: {}", stall.status, stall.state))
+}
+
+pub async fn run_after(scenario: &Scenario, after: impl FnOnce(&Path)) -> Outcome {
+    try_run_then(scenario, async |_, complete_dir| after(complete_dir))
         .await
         .unwrap_or_else(|stall| panic!("job stalled at {:?}: {}", stall.status, stall.state))
 }
@@ -2171,15 +2181,14 @@ fn delivered_name(relative: &Path) -> String {
 
 // Where a job stood while the server held every article of one post, and
 // how it ended once the server let them go.
-#[cfg(test)]
-pub(in crate::pipeline::tests) struct Held {
+pub struct Held {
     // The job's report once nothing moved while the post was held.
     pub report: crate::JobInfo,
     // What its recovery sets had ruled then.
     pub outcomes: Vec<Option<RepairOutcome>>,
     // Its status, and whether it read as fetching repair data, at each
     // round after the release.
-    pub(in crate::pipeline::tests) after: Vec<(JobStatus, bool)>,
+    pub after: Vec<(JobStatus, bool)>,
     pub status: Option<JobStatus>,
     pub files: BTreeMap<String, Vec<u8>>,
 }
@@ -2188,14 +2197,12 @@ pub(in crate::pipeline::tests) struct Held {
 // an article a worker asked for: the worker has it out, and no answer comes.
 // Once nothing moves the job is looked at; then the held articles are
 // answered and the job runs to its end.
-#[cfg(test)]
-pub(in crate::pipeline::tests) async fn run_holding(scenario: &Scenario, held: u32) -> Held {
+pub async fn run_holding(scenario: &Scenario, held: u32) -> Held {
     run_holding_where(scenario, |article| article.0 == held, |_| {}).await
 }
 
 // [`run_holding`], holding every article `held` names, and showing
 // `at_hold` the pipeline once nothing moves while they are held.
-#[cfg(test)]
 pub(in crate::pipeline::tests) async fn run_holding_where(
     scenario: &Scenario,
     held: impl Fn((u32, u32)) -> bool,
@@ -2331,8 +2338,41 @@ pub(in crate::pipeline::tests) async fn run_holding_where(
     }
 }
 
-#[cfg(test)]
-mod remaining_walk;
+pub async fn serve_and_observe_recovery(
+    pipeline: &mut Pipeline,
+    scenario: &Scenario,
+    article: (u32, u32),
+) -> Vec<Option<RepairOutcome>> {
+    serve(pipeline, scenario, article).await;
+    crate::pipeline::tests::hear_graph_mail(pipeline, JOB).await;
+    pipeline.graph_jobs[&JOB]
+        .recovery_summary()
+        .iter()
+        .map(|set| set.outcome)
+        .collect()
+}
+
+type RunPositions = Vec<(weaver_graph::NodeId, BTreeMap<u32, u64>)>;
+
+pub async fn run_holding_inspecting_reads(
+    scenario: &Scenario,
+    held: impl Fn((u32, u32)) -> bool,
+    inspect: impl FnOnce(RunPositions),
+) -> Held {
+    run_holding_where(scenario, held, |pipeline| {
+        let graph = &pipeline.graph_jobs[&JOB];
+        inspect(
+            graph
+                .runs()
+                .running()
+                .map(|node| (node, graph.run_reached(node)))
+                .collect(),
+        );
+    })
+    .await
+}
+
+pub mod remaining_walk;
 
 // Bytes no period runs through, so a compressing level cannot fold them.
 pub fn noise(len: usize, seed: u64) -> Vec<u8> {

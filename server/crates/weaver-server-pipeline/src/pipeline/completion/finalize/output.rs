@@ -838,13 +838,18 @@ async fn moving_row_committed(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) type MoveHook = Box<dyn FnOnce(JobId) + Send>;
 
 // Runs once the moving row has committed and before any file moves.
 #[cfg(test)]
 pub(crate) static BEFORE_FIRST_MOVE: std::sync::Mutex<Option<MoveHook>> =
     std::sync::Mutex::new(None);
+
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+pub(in crate::pipeline) static FIXTURE_MOVE_HOOKS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<PathBuf, MoveHook>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 // A destination that fills: how many more entries it has room for. Each
 // entry past that finds no room and leaves nothing of itself there, as the
@@ -878,7 +883,7 @@ pub(in crate::pipeline) enum ClaimFailure {
     Other(String),
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) type SpentHook = Box<dyn FnOnce(&[PathBuf]) + Send>;
 
 // Runs with the consumed inputs once their handles are released and before
@@ -886,6 +891,11 @@ pub(crate) type SpentHook = Box<dyn FnOnce(&[PathBuf]) + Send>;
 #[cfg(test)]
 pub(crate) static BEFORE_SPENT_REMOVAL: std::sync::Mutex<Option<SpentHook>> =
     std::sync::Mutex::new(None);
+
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+pub(in crate::pipeline) static FIXTURE_SPENT_HOOKS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<PathBuf, SpentHook>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 // Where a final move delivers: a directory it claimed empty, the one the
 // moving row of a job interrupted by a restart names, which already holds
@@ -1821,6 +1831,16 @@ impl Pipeline {
                 hook(&spent);
             }
         }
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+        {
+            let hook = FIXTURE_SPENT_HOOKS
+                .lock()
+                .unwrap()
+                .remove(&self.complete_dir);
+            if let Some(hook) = hook {
+                hook(&spent);
+            }
+        }
         // A consumed input another process still holds open, or a share that
         // refuses the unlink, is not part of the delivery and costs it
         // nothing: it stays where it is, and the move leaves it there. No
@@ -2240,6 +2260,8 @@ impl Pipeline {
     }
 
     fn spawn_final_move(&self, final_move: FinalMove) {
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+        let fixture_root = self.complete_dir.clone();
         let FinalMove {
             job_id,
             working_dir,
@@ -2292,6 +2314,13 @@ impl Pipeline {
                     #[cfg(test)]
                     {
                         let hook = BEFORE_FIRST_MOVE.lock().unwrap().take();
+                        if let Some(hook) = hook {
+                            let _ = tokio::task::spawn_blocking(move || hook(job_id)).await;
+                        }
+                    }
+                    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+                    {
+                        let hook = FIXTURE_MOVE_HOOKS.lock().unwrap().remove(&fixture_root);
                         if let Some(hook) = hook {
                             let _ = tokio::task::spawn_blocking(move || hook(job_id)).await;
                         }

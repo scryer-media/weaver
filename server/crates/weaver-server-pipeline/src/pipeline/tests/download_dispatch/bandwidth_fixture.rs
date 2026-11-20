@@ -17,6 +17,32 @@ impl BandwidthFixture {
         Self(pipeline)
     }
 
+    pub async fn direct(temp: &TempDir) -> Self {
+        let (pipeline, _, _) = super::new_direct_pipeline(temp).await;
+        Self(pipeline)
+    }
+
+    pub fn clear_scheduled_bandwidth(&mut self) {
+        self.0.scheduled_bandwidth = None;
+    }
+
+    pub fn reset_split_measurement(&mut self) {
+        self.0.split_sampled = None;
+        self.0.measure_split();
+    }
+
+    pub fn measure_split(&mut self) {
+        self.0.measure_split();
+    }
+
+    pub fn refresh_periodic_snapshot(&mut self) {
+        self.0.refresh_periodic_snapshot();
+    }
+
+    pub fn recorded_bytes(&self) -> u64 {
+        self.0.shared_state.queue.counters.bandwidth.total()
+    }
+
     pub fn handle(&self) -> SchedulerHandle {
         SchedulerHandle::new(self.0.event_tx.clone(), self.0.shared_state.clone())
     }

@@ -42,13 +42,13 @@ pub(crate) static DECODES_HEARD_RESTORING: std::sync::atomic::AtomicU64 =
 
 // Counts the actor's periodic ticks, so a test can pin that parked drivers
 // take none.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) static PERIODIC_TICKS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 #[inline]
 fn count_periodic_tick() {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     PERIODIC_TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -416,7 +416,7 @@ impl Pipeline {
             uu_park_max_segments: compute_uu_spool_max_segments(write_buf_max_pending),
             unanchored_park_max_parts: compute_uu_spool_max_segments(write_buf_max_pending),
             uu_spool_min_free_bytes: UU_SPOOL_MIN_FREE_BYTES,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             uu_spool_available_bytes_for_test: None,
             #[cfg(test)]
             probe_waits_on_for_test: None,
@@ -502,7 +502,7 @@ impl Pipeline {
             download_lane_owners: HashMap::new(),
             #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             audit_lane_holdings: false,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             move_gates: Default::default(),
             propagation_ready_at: HashMap::new(),
             propagation_delay,
@@ -1022,7 +1022,7 @@ impl Pipeline {
     // so asking costs the same however many jobs and history rows exist.
     pub(crate) fn pipeline_is_live(&self) -> bool {
         // Only tests queue undecoded bodies.
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         if !self.pending_decode.is_empty() {
             return true;
         }
@@ -1245,7 +1245,7 @@ impl Pipeline {
             self.drain_ready_lane_control_messages();
             turn_active |= self.hear_graph_runs();
             turn_active |= self.hear_volume_rooms();
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             self.pump_decode_queue();
 
             // An ordinal can be retired from outside the result handlers — a
@@ -1256,7 +1256,7 @@ impl Pipeline {
             if !self.pending_unanchored_release.is_empty() {
                 turn_active = true;
                 self.release_settled_unanchored_runs().await;
-                #[cfg(test)]
+                #[cfg(any(test, feature = "pipeline-test-fixtures"))]
                 self.pump_decode_queue();
             }
 
@@ -1268,7 +1268,7 @@ impl Pipeline {
                     break;
                 };
                 self.check_job_completion(job_id).await;
-                #[cfg(test)]
+                #[cfg(any(test, feature = "pipeline-test-fixtures"))]
                 self.pump_decode_queue();
             }
 
@@ -1692,7 +1692,7 @@ impl Pipeline {
                 turn_active |= !idle_tick;
             }
 
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             self.pump_decode_queue();
             turn_timer.end_of_turn(self.jobs.len());
             let live = self.pipeline_is_live();
@@ -2243,7 +2243,7 @@ impl Pipeline {
     // A decode running, or an undecoded body queued for one. Only tests
     // queue undecoded bodies.
     fn has_queued_or_active_decode(&self) -> bool {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         if !self.pending_decode.is_empty() {
             return true;
         }
@@ -2260,7 +2260,7 @@ impl Pipeline {
     }
 
     async fn drain_inflight_download_and_decode_work(&mut self) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         self.pump_decode_queue();
 
         while self.has_download_or_decode_drain_work() {
@@ -2282,7 +2282,7 @@ impl Pipeline {
             match event {
                 Ok(Some(ShutdownDrainEvent::Download(result))) => {
                     self.handle_download_done(result).await;
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
                     self.pump_decode_queue();
                 }
                 Ok(Some(ShutdownDrainEvent::OwnedDownload(event))) => {
@@ -2293,12 +2293,12 @@ impl Pipeline {
                         self.process_released_download_done(result).await;
                         self.report_job(reported_job);
                     }
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
                     self.pump_decode_queue();
                 }
                 Ok(Some(ShutdownDrainEvent::Decode(result))) => {
                     self.handle_decode_done(result).await;
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
                     self.pump_decode_queue();
                 }
                 Ok(None) => {

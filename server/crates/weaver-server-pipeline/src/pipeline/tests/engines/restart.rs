@@ -12,25 +12,18 @@ use crate::jobs::model::SchedulingMemoryEstimate;
 use crate::jobs::queries::JobsQueries;
 use std::collections::{BTreeMap, BTreeSet};
 
-use sevenz_turbo::EncoderMethod;
-
 use super::harness::{
     ARTICLE, GraphView, JOB, Post, Scenario, collect, finished, observe, par2_set, payload, run,
     serve, serve_work, take_retry,
 };
+use super::rar_fixtures::posts as volumes;
 use super::streams::{tar, xz};
 use super::zip;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::graph::root::phase::RootPhase;
-use crate::pipeline::tests::direct_store::scenarios::sevenz_store::{
-    Entry, build_7z_shaped, split_volumes,
-};
-use crate::pipeline::tests::direct_store::scenarios::{
-    HeaderCheck, encrypted_store_set, header_encrypted_store_set,
-};
+use crate::pipeline::tests::direct_store::scenarios::encrypted_store_set;
 use crate::pipeline::tests::direct_store::{
-    obfuscate_volumes, protected_rar4_store_set, protected_sealed_rar4_store_set,
-    protected_store_set, single_member_store_set,
+    protected_rar4_store_set, protected_sealed_rar4_store_set, single_member_store_set,
 };
 use crate::pipeline::tests::{
     insert_active_job, job_status_for_assert, new_direct_pipeline_with_backlog,
@@ -41,20 +34,13 @@ use crate::pipeline::{Pipeline, PipelineEvent};
 pub(in crate::pipeline::tests) use super::restart_fixtures::{
     RestartedDone, run_restarted_while_repairing,
 };
-use super::restart_fixtures::{SECRET, drain, with_par2};
+use super::restart_fixtures::{SECRET, drain, repairs_and_end, with_par2};
 
 pub(in crate::pipeline::tests) use super::restart_fixtures::{
     Down, Restarted, assert_restarted, restart, restart_as_it_stands, restart_row,
     run_restarting_at_inspecting as run_restarting_at, run_restarting_inspecting as run_restarting,
 };
 use super::restart_fixtures::{backlog_base_bytes, next_work, restart_heard};
-
-fn volumes(volumes: Vec<(String, Vec<u8>)>) -> Vec<Post> {
-    volumes
-        .into_iter()
-        .map(|(name, bytes)| Post::plain(&name, bytes))
-        .collect()
-}
 
 // The job served as `run` serves it, and the pipeline taken down once, the
 // first time the tree is done with its repair announced and the job's next
@@ -162,23 +148,6 @@ async fn a_repaired_job_restarted_after_its_repair_announces_the_repair_once() {
     );
 }
 
-// What the job announced of its repair and its end, in order.
-pub(in crate::pipeline::tests) fn repairs_and_end(events: &[PipelineEvent]) -> Vec<String> {
-    events
-        .iter()
-        .filter_map(|event| match event {
-            PipelineEvent::RepairComplete {
-                job_id,
-                slices_repaired,
-            } if *job_id == JOB => Some(format!("RepairComplete {slices_repaired}")),
-            PipelineEvent::JobCompleted { job_id } if *job_id == JOB => {
-                Some("JobCompleted".to_string())
-            }
-            _ => None,
-        })
-        .collect()
-}
-
 // The pipeline goes down while the repair is out on its thread. The drain
 // hears it back, so the checkpoint holds the repair: the restored job applies
 // it once, lends no second one, and finishes.
@@ -195,29 +164,6 @@ async fn a_job_restarted_while_its_repair_is_out_applies_the_repair_once_with_no
         repairs_and_end(&restarted.events),
         ["RepairComplete 1", "JobCompleted"]
     );
-}
-
-#[tokio::test]
-async fn an_xz_stream_under_par2_restarted_after_every_article_replays_from_its_start() {
-    let posts = with_par2(
-        vec![Post::plain(
-            "ember.bin.xz",
-            xz(&payload(40 * ARTICLE + 5, 72)),
-        )],
-        2,
-    );
-    restart_row(Scenario::new(posts)).await;
-}
-
-#[tokio::test]
-async fn a_three_volume_stored_rar_restarted_after_every_article_delivers_its_member() {
-    let body = payload(11 * ARTICLE + 9, 73);
-    restart_row(Scenario::new(volumes(single_member_store_set(
-        "beacon.bin",
-        &body,
-        3,
-    ))))
-    .await;
 }
 
 // The checksum a store said for its member is in every checkpoint taken
@@ -295,21 +241,6 @@ async fn a_member_byte_posted_wrong_still_fails_its_check_across_a_restart() {
 }
 
 #[tokio::test]
-async fn a_stored_rar_under_par2_restarted_after_every_article_is_repaired_with_no_refetch() {
-    let body = payload(8 * ARTICLE + 17, 74);
-    let posts = with_par2(volumes(single_member_store_set("beacon.bin", &body, 2)), 2);
-    restart_row(Scenario::new(posts).damaged(0, 2)).await;
-}
-
-#[tokio::test]
-async fn a_rar5_volume_repaired_from_its_recovery_record_restarted_after_every_article_is_repaired_with_no_refetch()
- {
-    let body = payload(8 * ARTICLE + 17, 76);
-    let posts = volumes(protected_store_set("beacon.bin", &body, 2, 1));
-    restart_row(Scenario::new(posts).damaged(0, 2)).await;
-}
-
-#[tokio::test]
 async fn a_rar4_volume_repaired_from_its_recovery_record_restarted_after_every_article_is_repaired_with_no_refetch()
  {
     let body = payload(8 * ARTICLE + 17, 77);
@@ -348,17 +279,6 @@ async fn a_rar4_hp_volume_proven_on_its_first_candidate_restarted_after_every_ar
             .global_password(SECRET)
             .global_password("lantern-restart-wrong")
     })
-    .await;
-}
-
-#[tokio::test]
-async fn an_xz_stream_inside_a_rar_volume_restarted_after_every_article_delivers_the_file() {
-    let compressed = xz(&payload(30 * ARTICLE + 3, 75));
-    restart_row(Scenario::new(volumes(single_member_store_set(
-        "beacon.bin.xz",
-        &compressed,
-        2,
-    ))))
     .await;
 }
 
@@ -724,364 +644,6 @@ async fn no_checkpoint_of_an_encrypted_rar_holds_its_password_or_keys() {
     assert_restarted(&restarted, &whole);
 }
 
-// The RARLAB archive with a compressed member, cut fine enough to restart
-// between its articles: the engine's run replays from the volume's start
-// over the partials on disk, so a restart re-reads and never fetches.
-#[tokio::test]
-async fn a_compressed_rar5_volume_restarted_after_every_article_replays_the_engine_from_disk() {
-    let bytes = crate::pipeline::tests::rar5_fixture_bytes("rar5_multifile_lz.rar");
-    restart_row(Scenario::new(vec![Post::plain("mixed.rar", bytes)]).framed(64)).await;
-}
-
-// The same archive under PAR2 with its first article lost: whenever the
-// restart lands, the restored job repairs the front it never had and the
-// engine delivers every member.
-#[tokio::test]
-async fn a_compressed_rar5_volume_under_par2_with_its_front_lost_restarted_after_every_article_is_repaired()
- {
-    let bytes = crate::pipeline::tests::rar5_fixture_bytes("rar5_multifile_lz.rar");
-    let posts = with_par2(vec![Post::plain("mixed.rar", bytes)], 8);
-    restart_row(Scenario::new(posts).framed(64).lost(0, 0)).await;
-}
-
-// A file posted under a name its PAR2 set does not give, damaged: the set
-// knows it by its contents. No checkpoint keeps that, so a restored set
-// binds over the restored members before it rules, and never takes the file
-// it describes for absent while the member that is it sits there complete.
-// Whenever the restart lands, the file is repaired and delivered once,
-// under the name the set describes.
-#[tokio::test]
-async fn a_damaged_file_under_another_name_restarted_after_every_article_is_repaired_under_its_own()
-{
-    let body = payload(5 * ARTICLE, 121);
-    let mut posts = with_par2(vec![Post::plain("lantern.bin", body.clone())], 2);
-    posts[0] = Post::plain("a1b2c3d4e5", body.clone());
-    let whole = restart_row(Scenario::new(posts).damaged(0, 1)).await;
-    assert_eq!(
-        whole.files.values().collect::<Vec<_>>(),
-        vec![&body],
-        "{:?}",
-        whole.files.keys().collect::<Vec<_>>()
-    );
-    assert!(
-        whole
-            .files
-            .keys()
-            .all(|path| path.ends_with("/lantern.bin")),
-        "{:?}",
-        whole.files.keys().collect::<Vec<_>>()
-    );
-}
-
-// The five encrypted RARLAB volumes, offered their password again at every
-// restore, in 64 KiB articles so a restart lands inside every volume.
-#[tokio::test]
-async fn the_encrypted_five_volume_rar5_set_restarted_after_every_article_delivers_its_member() {
-    let set = (1..=5)
-        .map(|part| {
-            (
-                format!("clip.part{part}.rar"),
-                crate::pipeline::tests::rar5_fixture_bytes(&format!(
-                    "rar5_enc_mv_video.part{part}.rar"
-                )),
-            )
-        })
-        .collect();
-    restart_row(
-        Scenario::new(volumes(set))
-            .framed(64 * 1024)
-            .password("testpass123"),
-    )
-    .await;
-}
-
-// Two members in one 7z coded by `method`, cut into `count` volumes.
-fn sevenz(method: EncoderMethod, count: usize) -> Vec<Post> {
-    let entries = [
-        Entry::file("ember.bin", payload(7 * ARTICLE + 11, 78)),
-        Entry::file("quill.bin", payload(4 * ARTICLE - 3, 79)),
-    ];
-    volumes(split_volumes(
-        &build_7z_shaped(&entries, method, None, false),
-        count,
-    ))
-}
-
-#[tokio::test]
-async fn a_stored_7z_restarted_after_every_article_delivers_its_members() {
-    restart_row(Scenario::new(sevenz(EncoderMethod::COPY, 1))).await;
-}
-
-// The two members of `sevenz` stored in two volumes, enciphered under
-// `password` when one is given.
-fn quill_parts(password: Option<&str>) -> Vec<(String, Vec<u8>)> {
-    let entries = [
-        Entry::file("ember.bin", payload(7 * ARTICLE + 11, 78)),
-        Entry::file("quill.bin", payload(4 * ARTICLE - 3, 79)),
-    ];
-    split_volumes(
-        &build_7z_shaped(&entries, EncoderMethod::COPY, password, false),
-        2,
-    )
-}
-
-// The article holding the first byte of `quill.bin` starts inside it and
-// holds the end of `ember.bin` too; enciphered, it starts inside a cipher
-// block whose first bytes are the article before's. The second volume
-// backwards from its end header, then the first volume, and the cut last:
-// both members are whole and on disk when the pipeline goes down with
-// `quill.bin` gone. The article before reads back and comes no more, and
-// the one holding the cut is fetched again. The job finishes as the run
-// that never restarted does, fetching again only the articles holding
-// `quill.bin`.
-async fn lost_quill(password: Option<&str>) {
-    let parts = quill_parts(password);
-    let first = parts[0].1.len();
-    let counts: Vec<u32> = parts
-        .iter()
-        .map(|(_, bytes)| bytes.len().div_ceil(ARTICLE) as u32)
-        .collect();
-    let article_at = |offset: usize| match offset.checked_sub(first) {
-        None => (0, (offset / ARTICLE) as u32),
-        Some(into) => (1, (into / ARTICLE) as u32),
-    };
-    let start_of =
-        |(volume, ordinal): (u32, u32)| volume as usize * first + ordinal as usize * ARTICLE;
-    // `quill.bin` follows `ember.bin` in the folder's plaintext.
-    let quill = 32 + 7 * ARTICLE + 11..32 + 7 * ARTICLE + 11 + 4 * ARTICLE - 3;
-    let cut = article_at(quill.start);
-    let cut_start = start_of(cut);
-    assert!(
-        cut_start < quill.start,
-        "the cut article holds ember.bin too"
-    );
-    if password.is_some() {
-        assert_ne!((cut_start - 32) % 16, 0, "the cut is inside a cipher block");
-    }
-    assert_eq!(cut.0, 1, "the cut is the second volume's");
-    let before = (0, counts[0] - 1);
-    let order: Vec<(u32, u32)> = std::iter::once((0, 0))
-        .chain((1..counts[1]).rev().map(|ordinal| (1, ordinal)))
-        .chain((1..counts[0]).map(|ordinal| (0, ordinal)))
-        .chain(std::iter::once(cut))
-        .collect();
-    let mut scenario = Scenario::new(volumes(parts)).first(&order);
-    if let Some(password) = password {
-        scenario = scenario.password(password);
-    }
-    let whole = run(&scenario).await;
-    assert!(whole.completed(), "{:?} {:?}", whole.status, whole.failure);
-    let down = order.len();
-    let restarted = run_restarting_at(&scenario, &mut |_| {}, Down::Losing("quill.bin"), &|nth| {
-        nth == down
-    })
-    .await;
-    assert_eq!(restarted.restarts, 1);
-    assert_eq!(restarted.status, whole.status, "status");
-    assert_eq!(
-        restarted.files.keys().collect::<Vec<_>>(),
-        whole.files.keys().collect::<Vec<_>>()
-    );
-    for (name, bytes) in &whole.files {
-        assert!(restarted.files[name] == *bytes, "{name}: delivered bytes");
-    }
-    let holding: BTreeSet<(u32, u32)> = (cut.1..=article_at(quill.end - 1).1)
-        .map(|ordinal| (1, ordinal))
-        .filter(|article| !restarted.in_memory.contains(article))
-        .collect();
-    assert!(holding.contains(&cut), "the cut article was on disk");
-    assert!(
-        !restarted.in_memory.contains(&before),
-        "the article before was on disk"
-    );
-    assert_eq!(
-        restarted.from_disk, holding,
-        "the articles holding quill.bin on disk, and no other, come again"
-    );
-}
-
-#[tokio::test]
-async fn an_enciphered_7z_member_lost_from_inside_a_cipher_block_comes_out_again_whole() {
-    lost_quill(Some(SECRET)).await;
-}
-
-#[tokio::test]
-async fn a_stored_7z_member_lost_at_a_restart_comes_out_again_whole() {
-    lost_quill(None).await;
-}
-
-#[tokio::test]
-async fn a_three_volume_stored_7z_restarted_after_every_article_delivers_its_members() {
-    restart_row(Scenario::new(sevenz(EncoderMethod::COPY, 3))).await;
-}
-
-// The engine's run replays its folder from the start over the partials on
-// disk, so a restart re-reads and never fetches.
-#[tokio::test]
-async fn an_lzma2_7z_restarted_after_every_article_replays_the_engine_from_disk() {
-    restart_row(Scenario::new(sevenz(EncoderMethod::LZMA2, 1))).await;
-}
-
-// The two members of `sevenz` in one AES folder, cut into two volumes: the
-// second starts inside a cipher block, so an article of it starts inside one
-// whose first bytes are the article before's.
-fn enciphered_7z_parts() -> Vec<(String, Vec<u8>)> {
-    let entries = [
-        Entry::file("ember.bin", payload(7 * ARTICLE + 11, 78)),
-        Entry::file("quill.bin", payload(4 * ARTICLE - 3, 79)),
-    ];
-    let parts = split_volumes(
-        &build_7z_shaped(&entries, EncoderMethod::COPY, Some(SECRET), false),
-        2,
-    );
-    // The folder's cipher starts past the 32-byte signature header.
-    assert_ne!(
-        (parts[0].1.len() - 32) % 16,
-        0,
-        "the second volume starts inside a cipher block"
-    );
-    parts
-}
-
-// The signature, the second volume backwards from its end header, the
-// first volume's last article, then the rest of the first in order: the
-// article that starts the second volume comes before the one that brings
-// the first bytes of its cipher block.
-fn header_first(parts: &[(String, Vec<u8>)]) -> Vec<(u32, u32)> {
-    let counts: Vec<u32> = parts
-        .iter()
-        .map(|(_, bytes)| bytes.len().div_ceil(ARTICLE) as u32)
-        .collect();
-    std::iter::once((0, 0))
-        .chain((0..counts[1]).rev().map(|ordinal| (1, ordinal)))
-        .chain(std::iter::once((0, counts[0] - 1)))
-        .chain((1..counts[0] - 1).map(|ordinal| (0, ordinal)))
-        .collect()
-}
-
-// In order, backwards, and with the second volume ahead of the first.
-#[tokio::test]
-async fn an_enciphered_split_7z_restarted_after_every_article_delivers_its_members() {
-    let scenario = || Scenario::new(volumes(enciphered_7z_parts())).password(SECRET);
-    restart_row(scenario()).await;
-    restart_row(scenario().backwards()).await;
-    let order = header_first(&enciphered_7z_parts());
-    restart_row(scenario().first(&order)).await;
-}
-
-// A stored 7z in hex-named parts that say nothing of which part they are,
-// under a PAR2 set that names them, its index posted first. Its verify run
-// is out from the index on, so no part is bound by its bytes before a
-// restart; the restore binds each one as it reads the part back, and the
-// articles of that part it has not read yet are on disk all the same.
-#[tokio::test]
-async fn obfuscated_7z_parts_under_par2_restarted_after_every_article_are_bound_with_no_refetch() {
-    let entries = [Entry::file("ember.bin", payload(70_001, 88))];
-    let parts = split_volumes(
-        &build_7z_shaped(&entries, EncoderMethod::COPY, None, false),
-        2,
-    );
-    let named: Vec<(&str, &[u8])> = parts
-        .iter()
-        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
-        .collect();
-    let mut set = par2_set("lantern", &named, 2);
-    let mut posts = vec![set.remove(0)];
-    posts.extend(volumes(obfuscate_volumes(&parts)));
-    posts.extend(set);
-    let scenario = Scenario::new(posts)
-        .framed(20 * 1024)
-        .first(&[(0, 0), (0, 1), (1, 1), (1, 0)]);
-    restart_row(scenario).await;
-}
-
-// Nameless header-encrypted RAR5 volumes under a PAR2 set that names them,
-// its index posted first, then the second volume ahead of the first. The
-// second is bound to a store of its own, which gives it back once the set
-// renames it, and the store it founds opens the headers before the first
-// volume arrives.
-fn nameless_header_encrypted_second_first() -> Scenario {
-    let body = payload(70_001, 51);
-    let parts = header_encrypted_store_set(
-        "nested/feature.mkv",
-        &body,
-        4,
-        SECRET,
-        HeaderCheck::For(SECRET),
-    );
-    let named: Vec<(&str, &[u8])> = parts
-        .iter()
-        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
-        .collect();
-    let mut set = par2_set("silver.horizon", &named, 2);
-    let mut posts = vec![set.remove(0)];
-    posts.extend(volumes(obfuscate_volumes(&parts)));
-    posts.extend(set);
-    Scenario::new(posts)
-        .framed(64 * 1024)
-        .password(SECRET)
-        .first(&[(0, 0), (2, 0), (1, 0), (3, 0), (4, 0)])
-}
-
-// The run shut down and restored after each article `at` picks finishes as
-// the run that never restarted does, and fetches nothing it had on disk.
-async fn shut_down_after(scenario: Scenario, at: &dyn Fn(usize) -> bool) {
-    let whole = run(&scenario).await;
-    assert!(whole.completed(), "{:?} {:?}", whole.status, whole.failure);
-    let restarted = run_restarting_at(&scenario, &mut |_| {}, Down::Shutdown, at).await;
-    assert_restarted(&restarted, &whole);
-}
-
-// A solid RAR5 set in hex-named volumes under a PAR2 set that names them,
-// its index posted first. The engine's run is out over the first volume
-// whenever the pipeline goes down, waiting for bytes of a volume still to
-// come or for the owner of a member still undecided, which nothing brings
-// once the pipeline is down: the drain stops it where it stands, and the
-// restored job reads the volumes back and fetches none again.
-#[tokio::test]
-async fn a_solid_rar5_set_in_hex_names_shut_down_while_its_run_waits_is_read_back() {
-    let parts: Vec<(String, Vec<u8>)> = (1..=4)
-        .map(|part| {
-            let name = format!("rar5_solid_four.part0{part}.rar");
-            let path = format!(
-                "{}/../weaver-server-core/tests/fixtures/extraction_profiles/{name}",
-                env!("CARGO_MANIFEST_DIR")
-            );
-            (name, std::fs::read(path).unwrap())
-        })
-        .collect();
-    let named: Vec<(&str, &[u8])> = parts
-        .iter()
-        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
-        .collect();
-    let mut set = par2_set("harbour", &named, 2);
-    let mut posts = vec![set.remove(0)];
-    posts.extend(volumes(obfuscate_volumes(&parts)));
-    posts.extend(set);
-    shut_down_after(Scenario::new(posts).framed(4096), &|_| true).await;
-}
-
-// Restarted before the first volume arrives, the store the given-back
-// volume founded still opens the first volume's headers.
-#[tokio::test]
-async fn nameless_header_encrypted_volumes_restarted_before_the_first_arrives_are_bound_whole() {
-    shut_down_after(nameless_header_encrypted_second_first(), &|nth| nth == 2).await;
-}
-
-// Restarted once the first volume is in, the store reads both volumes back
-// from disk and fetches neither again.
-#[tokio::test]
-async fn nameless_header_encrypted_volumes_restarted_after_the_first_arrives_are_read_back() {
-    shut_down_after(nameless_header_encrypted_second_first(), &|nth| nth == 3).await;
-}
-
-// Restarted after every article, each store the restore rebuilds opens
-// what it opened before.
-#[tokio::test]
-async fn nameless_header_encrypted_volumes_restarted_after_every_article_deliver() {
-    shut_down_after(nameless_header_encrypted_second_first(), &|_| true).await;
-}
-
 // The password is offered again at every restore, and the run that derives
 // its key is the engine's; no checkpoint holds the password. The WinZip key
 // itself is not grepped for: deriving it here needs PBKDF2 over SHA-1, a
@@ -1144,34 +706,6 @@ async fn a_buried_refusal_restarted_after_every_article_is_offered_to_no_later_s
     })
     .await;
     assert!(buried, "a checkpoint says the tar is buried");
-    assert_restarted(&restarted, &whole);
-}
-
-// A three-volume set the RAR engine reads, posted without `.r00`. The engine
-// announces the member and never closes it, so its refusal leaves it buried
-// under the engine's node, and that buried member leaves nothing whole, so
-// the job fails. A refusal of that kind waits for the payload to be in, so it
-// lands in the last settle, after the last checkpoint: restored after every
-// article before it, the job still fails as the run that never restarted
-// does. That a checkpoint carries a buried member back is the tree record's
-// round trip.
-#[tokio::test]
-async fn a_set_missing_a_volume_restarted_after_every_article_still_fails() {
-    let body = payload(7 * ARTICLE + 13, 51);
-    let posts: Vec<Post> =
-        header_encrypted_store_set("beacon.bin", &body, 3, SECRET, HeaderCheck::Absent)
-            .into_iter()
-            .zip(["ember.rar", "ember.r00", "ember.r01"])
-            .filter(|(_, name)| *name != "ember.r00")
-            .map(|((_, bytes), name)| Post::plain(name, bytes))
-            .collect();
-    let scenario = Scenario::new(posts).password(SECRET);
-    let whole = run(&scenario).await;
-    assert_eq!(
-        whole.failure.as_deref(),
-        Some("no file was delivered whole; 2 short: ember.rar, ember.r01")
-    );
-    let restarted = run_restarting(&scenario, &mut |_| {}).await;
     assert_restarted(&restarted, &whole);
 }
 
@@ -2509,85 +2043,6 @@ async fn a_job_restored_under_paused_post_processing_starts_no_run_until_resume(
         files.keys()
     );
     retire_pipeline_database(pipeline).await;
-}
-
-// One enciphered RAR5 member whose checksum the password keys, with 16 bytes
-// in the middle of the volume posted wrong when `spoiled`, though every
-// article passes its own check.
-fn keyed_member(body: &[u8], spoiled: bool) -> Scenario {
-    let mut set = encrypted_store_set("beacon.bin", body, 1, SECRET, Some(SECRET), true);
-    if spoiled {
-        let middle = set[0].1.len() / 2;
-        set[0].1[middle..middle + 16]
-            .iter_mut()
-            .for_each(|byte| *byte ^= 0x5a);
-    }
-    Scenario::new(volumes(set)).password(SECRET)
-}
-
-// The article after which a keyed member restarts while it is still open:
-// past the wrong span in its middle, short of its end.
-const KEYED_OPEN_AT: usize = 6;
-
-// Run straight through, a keyed member posted wrong fails its checksum.
-#[tokio::test]
-async fn a_keyed_rar_member_posted_wrong_fails_its_checksum() {
-    let body = payload(6 * ARTICLE + 11, 77);
-    let whole = run(&keyed_member(&body, true)).await;
-    assert!(!whole.completed(), "{:?} {:?}", whole.status, whole.failure);
-}
-
-// Restarted after every article, it fails it too: a restore does not leave
-// the member unchecked.
-#[tokio::test]
-async fn a_keyed_rar_member_posted_wrong_fails_its_checksum_across_restarts() {
-    let body = payload(6 * ARTICLE + 11, 77);
-    let restarted = run_restarting(&keyed_member(&body, true), &mut |_| {}).await;
-    assert!(restarted.restarts > 0);
-    assert!(
-        !matches!(restarted.status, Some(JobStatus::Complete)),
-        "{:?} {:?}",
-        restarted.status,
-        restarted.files.keys()
-    );
-}
-
-// A keyed member restarted while it is open takes its last articles after the
-// restore and comes out whole, as it does run straight through.
-#[tokio::test]
-async fn a_keyed_rar_member_restarted_open_comes_out_whole() {
-    let body = payload(6 * ARTICLE + 11, 77);
-    let scenario = keyed_member(&body, false);
-    let whole = run(&scenario).await;
-    assert!(whole.completed(), "{:?} {:?}", whole.status, whole.failure);
-    assert!(
-        whole.files.values().any(|bytes| *bytes == body),
-        "member bytes"
-    );
-    let restarted =
-        run_restarting_at(&scenario, &mut |_| {}, Down::Crash, &|n| n == KEYED_OPEN_AT).await;
-    assert_restarted(&restarted, &whole);
-}
-
-// A keyed member restarted while it is open, its wrong span read before the
-// restart, fails its checksum once its last articles come.
-#[tokio::test]
-async fn a_keyed_rar_member_restarted_open_over_a_wrong_span_fails_its_checksum() {
-    let body = payload(6 * ARTICLE + 11, 77);
-    let scenario = keyed_member(&body, true);
-    let restarted =
-        run_restarting_at(&scenario, &mut |_| {}, Down::Crash, &|n| n == KEYED_OPEN_AT).await;
-    assert_eq!(restarted.restarts, 1);
-    assert!(
-        !matches!(restarted.status, Some(JobStatus::Complete)),
-        "{:?} {:?}",
-        restarted.status,
-        restarted.files.keys()
-    );
-    assert!(
-        !restarted.files.values().any(|bytes| *bytes == body),
-        "member whole"
-    );
 }
 
 mod moves;

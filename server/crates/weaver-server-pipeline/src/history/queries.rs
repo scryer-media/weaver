@@ -23,10 +23,6 @@ use weaver_server_history::history::queries::{
 #[cfg(test)]
 use weaver_server_history::history::queries::{history_completed_by_sql, history_status_ids_sql};
 pub(crate) use weaver_server_history::history::retention::HistoryInternalQueries;
-#[cfg(test)]
-pub(crate) use weaver_server_history::history::retention::{
-    FAILED_SWEEP_FIRST_PAGE_SQL, FAILED_SWEEP_NEXT_PAGE_SQL,
-};
 
 type PersistedNzbRecord = (PathBuf, Option<Vec<u8>>);
 

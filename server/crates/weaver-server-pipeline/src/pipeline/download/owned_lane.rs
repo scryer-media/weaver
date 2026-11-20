@@ -295,10 +295,10 @@ fn next_refusal_report(
 
 // The press a lane's refused dial for `lease` leaves, for the pipeline's
 // tests: it reports the refusal the way the lane does, and holds no demand.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(in crate::pipeline) struct TestRoutePress(RoutePress);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 impl TestRoutePress {
     pub(in crate::pipeline) fn refused(
         state: &crate::jobs::handle::SharedPipelineState,
@@ -2605,7 +2605,7 @@ pub(in crate::pipeline) fn credit_transfer(
     data: &Result<DownloadPayload, DownloadError>,
 ) {
     let (wire, decoded) = match data {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         Ok(DownloadPayload::Raw(raw)) => (raw.len() as u64, 0),
         Ok(DownloadPayload::Decoded(decoded)) => {
             (decoded.raw_size, decoded.data.len_bytes() as u64)

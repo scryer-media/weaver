@@ -3,8 +3,8 @@
 
 use super::*;
 use crate::SchedulerError;
-#[cfg(test)]
 use crate::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
+use crate::jobs::assembly::JobAssembly;
 use crate::jobs::persistence::JobsPersistenceInternalQueries;
 use crate::jobs::persistence::JobsPersistenceQueries;
 use crate::jobs::queries::JobsQueries;
@@ -13,12 +13,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use crate::Database;
-#[cfg(test)]
 use crate::JobInfo;
 use crate::SchedulerHandle;
 #[cfg(test)]
 use crate::ingest::submit_nzb_bytes;
-#[cfg(test)]
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::settings::{Config, SharedConfig};
 use crate::{FileSpec, PipelineMetrics, SegmentSpec, SharedPipelineState};
@@ -54,36 +52,29 @@ macro_rules! segment_spec {
     };
 }
 
-#[cfg(test)]
-mod archive_history;
 mod archive_output_contract;
-#[cfg(test)]
-mod archive_passwords;
+pub mod password_fixture;
 #[path = "download_dispatch/bandwidth_fixture.rs"]
 pub mod bandwidth_fixture;
-#[cfg(test)]
-mod bandwidth_split;
-#[cfg(test)]
-mod cancel_batch;
-#[cfg(test)]
-mod control_lifecycle;
+pub mod control_fixture;
 #[cfg(test)]
 mod core;
+pub mod decode_fixture;
 #[cfg(test)]
 mod decode_stage;
 #[cfg(test)]
 pub(in crate::pipeline) mod delivered_restore;
 pub mod direct_store;
+pub mod dispatch_fixture;
 #[cfg(test)]
 mod dispatch_order;
 #[cfg(test)]
 mod download_dispatch;
-pub mod dispatch_fixture;
 pub mod engines;
-#[cfg(test)]
-mod full_file_names;
+pub mod delivery_fixture;
 #[cfg(test)]
 mod hardware_profile;
+pub mod history_fixture;
 #[cfg(test)]
 mod idle;
 #[cfg(test)]
@@ -101,30 +92,27 @@ mod post_processing_pause;
 pub mod propagation_fixture;
 #[cfg(test)]
 mod provider_scheduling;
-#[cfg(test)]
-mod queue;
+pub mod queue_fixture;
 #[cfg(test)]
 mod queue_scale;
+pub mod queue_scale_fixture;
 #[cfg(test)]
-mod queue_window;
-#[cfg(test)]
-mod restore_history;
+mod restore_history {
+    pub(super) use super::history_fixture::{hold_database_writer, wait_for_job_event};
+}
 #[cfg(test)]
 mod script_events;
+pub mod script_fixture;
 #[cfg(test)]
 mod server_attribution;
 #[cfg(test)]
 mod terminal_settlement;
-#[cfg(test)]
-mod uu_assembly;
-#[cfg(test)]
-mod yenc_compatibility;
+pub mod uu_fixture;
+pub mod yenc_fixture;
+pub mod window_fixture;
 
 impl Pipeline {
-    pub(in crate::pipeline) async fn restore_job(
-        &mut self,
-        request: RestoreJobRequest,
-    ) -> Result<(), SchedulerError> {
+    pub async fn restore_job(&mut self, request: RestoreJobRequest) -> Result<(), SchedulerError> {
         let id = request.job_id;
         if self.jobs.contains_key(&id) {
             return Err(SchedulerError::JobExists(id));
@@ -301,7 +289,7 @@ impl TestHarness {
     }
 }
 
-fn sample_nzb_bytes() -> Vec<u8> {
+pub fn sample_nzb_bytes() -> Vec<u8> {
     br#"<?xml version="1.0" encoding="UTF-8"?>
         <nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
           <file poster="poster" date="1700000000" subject="Silver Horizon.Sample.rar">
@@ -312,7 +300,7 @@ fn sample_nzb_bytes() -> Vec<u8> {
         .to_vec()
 }
 
-pub(in crate::pipeline) fn sample_nzb_zstd() -> Vec<u8> {
+pub fn sample_nzb_zstd() -> Vec<u8> {
     crate::ingest::compress_nzb_bytes(&sample_nzb_bytes()).unwrap()
 }
 
@@ -361,8 +349,7 @@ pub fn nzb_zstd_for(spec: &JobSpec) -> Vec<u8> {
 
 // Build a waiting job's articles as its first handout would, and wait for
 // them: the read is sent for and its result delivered on the actor's turn.
-#[cfg(test)]
-pub(in crate::pipeline) async fn activate_job(pipeline: &mut Pipeline, job_id: JobId) {
+pub async fn activate_job(pipeline: &mut Pipeline, job_id: JobId) {
     let retiring = pipeline.retiring_graph_jobs.contains_key(&job_id);
     while pipeline.retiring_graph_jobs.contains_key(&job_id) {
         let said = pipeline
@@ -386,7 +373,6 @@ pub(in crate::pipeline) async fn activate_job(pipeline: &mut Pipeline, job_id: J
     pipeline.handle_job_activated(done);
 }
 
-#[cfg(test)]
 fn minimal_job_state(job_id: JobId, name: &str, working_dir: PathBuf) -> JobState {
     JobState {
         job_id,
@@ -439,8 +425,7 @@ fn minimal_job_state(job_id: JobId, name: &str, working_dir: PathBuf) -> JobStat
     }
 }
 
-#[cfg(test)]
-fn finished_job_info(job_id: JobId) -> JobInfo {
+pub fn finished_job_info(job_id: JobId) -> JobInfo {
     JobInfo {
         protocol: crate::jobs::Protocol::Nzb,
         job_id,
@@ -480,8 +465,7 @@ fn finished_job_info(job_id: JobId) -> JobInfo {
     }
 }
 
-#[cfg(test)]
-fn history_row_with_output_dir(
+pub fn history_row_with_output_dir(
     job_id: JobId,
     name: &str,
     status: &str,
@@ -511,8 +495,11 @@ fn history_row_with_output_dir(
     }
 }
 
-#[cfg(test)]
-fn insert_history_row_with_nzb_zstd(db: &Database, row: &crate::JobHistoryRow, nzb_zstd: &[u8]) {
+pub fn insert_history_row_with_nzb_zstd(
+    db: &Database,
+    row: &crate::JobHistoryRow,
+    nzb_zstd: &[u8],
+) {
     db.insert_job_history(row).unwrap();
     let datastore = db.datastore();
     let job_id = row.job_id as i64;
@@ -593,7 +580,7 @@ async fn settle_lane_dials(pipeline: &mut Pipeline) {
     }
 }
 
-pub(crate) async fn new_direct_pipeline_with_backlog(
+pub async fn new_direct_pipeline_with_backlog(
     temp_dir: &TempDir,
     backlog_base_bytes: usize,
     total_connections: usize,
@@ -633,7 +620,7 @@ async fn new_direct_pipeline_with(
 // The cross-device probe in `direct_store/scenarios/cross_device.rs` hands in two roots on
 // genuinely different mounts.
 #[allow(clippy::too_many_arguments)]
-pub(in crate::pipeline) async fn new_direct_pipeline_at_roots(
+pub async fn new_direct_pipeline_at_roots(
     data_dir: PathBuf,
     intermediate_dir: PathBuf,
     complete_dir: PathBuf,
@@ -802,7 +789,7 @@ async fn new_scheduler_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBuf, PathB
     (pipeline, intermediate, complete)
 }
 
-pub(crate) async fn new_direct_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBuf, PathBuf) {
+pub async fn new_direct_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBuf, PathBuf) {
     new_direct_pipeline_with_backlog(temp_dir, 16 * 1024 * 1024, 0).await
 }
 
@@ -827,7 +814,7 @@ pub(crate) async fn new_direct_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBu
 // after the drop — so the flush moves those writes ahead of the reopen
 // instead of racing it, and loses nothing a plain drop would have kept. What
 // a crash does lose is the state that was never queued, and that stays lost.
-pub(in crate::pipeline) async fn retire_pipeline_database(pipeline: Pipeline) {
+pub async fn retire_pipeline_database(pipeline: Pipeline) {
     let db = pipeline.db.clone();
     drop(pipeline);
     db.flush_write_queue().await.unwrap();
@@ -842,7 +829,6 @@ pub(in crate::pipeline) async fn retire_pipeline_database(pipeline: Pipeline) {
 
 // Hear the run mail until the graph job has nothing out: a repair it lent
 // returns there, and is applied as it is heard.
-#[cfg(test)]
 pub(in crate::pipeline) async fn hear_graph_mail(pipeline: &mut Pipeline, job_id: JobId) {
     while pipeline
         .graph_jobs
@@ -880,7 +866,6 @@ fn checkpoint_plan(pipeline: &Pipeline, job_id: JobId) -> weaver_yenc::Checkpoin
         })
 }
 
-#[cfg(test)]
 fn encode_article_part(
     filename: &str,
     payload: &[u8],
@@ -1416,7 +1401,7 @@ pub fn single_member_rar4_old_numbering_set_ending(
 // builders leave it zero because weaver's own parser only warns on a
 // mismatch; the recovery restorer's validity probe does not, and a set
 // written to exercise it has to be one it would accept.
-pub(in crate::pipeline::tests) fn with_rar4_header_crcs(mut bytes: Vec<u8>) -> Vec<u8> {
+pub fn with_rar4_header_crcs(mut bytes: Vec<u8>) -> Vec<u8> {
     let mut offset = TEST_RAR4_SIG.len();
     while offset + 7 <= bytes.len() {
         let flags = u16::from_le_bytes([bytes[offset + 3], bytes[offset + 4]]);
@@ -1442,10 +1427,7 @@ pub(in crate::pipeline::tests) fn with_rar4_header_crcs(mut bytes: Vec<u8>) -> V
 // every data volume, padded to the longest, followed by the 7-byte footer
 // (`data-1`, `rec-1`, `position-1`, CRC32) a new-style `.rev` carries and the
 // restorer reads its geometry from.
-#[cfg(test)]
-pub(in crate::pipeline::tests) fn single_recovery_volume_for_rar4_set(
-    volumes: &[&[u8]],
-) -> Vec<u8> {
+pub fn single_recovery_volume_for_rar4_set(volumes: &[&[u8]]) -> Vec<u8> {
     let width = volumes.iter().map(|volume| volume.len()).max().unwrap_or(0);
     let coder = reedsolomon_rs::rar3::Rar3RsCoder::new(1).expect("one recovery volume");
     let mut rev = Vec::with_capacity(width + 7);
@@ -1489,8 +1471,7 @@ pub fn build_test_rar4_file_header(
     build_test_rar4_block(0x74, 0x8000 | split_flags, &body)
 }
 
-#[cfg(test)]
-fn build_multifile_multivolume_rar_set() -> Vec<(String, Vec<u8>)> {
+pub fn build_multifile_multivolume_rar_set() -> Vec<(String, Vec<u8>)> {
     let episode_a = b"episode-a-payload";
     let episode_b = b"episode-b-payload";
     let episode_a_crc = checksum::crc32(episode_a);
@@ -1561,8 +1542,7 @@ fn build_multifile_multivolume_rar_set() -> Vec<(String, Vec<u8>)> {
     ]
 }
 
-#[cfg(test)]
-fn rar_job_spec(name: &str, files: &[(String, Vec<u8>)]) -> JobSpec {
+pub fn rar_job_spec(name: &str, files: &[(String, Vec<u8>)]) -> JobSpec {
     JobSpec {
         name: name.to_string(),
         password: None,
@@ -1631,8 +1611,11 @@ fn many_standalone_files(prefix: &str, count: usize) -> Vec<(String, u32)> {
         .collect()
 }
 
-#[cfg(test)]
-fn standalone_with_par2_job_spec(name: &str, payload_bytes: u32, recovery_bytes: u32) -> JobSpec {
+pub fn standalone_with_par2_job_spec(
+    name: &str,
+    payload_bytes: u32,
+    recovery_bytes: u32,
+) -> JobSpec {
     JobSpec {
         name: name.to_string(),
         password: None,
@@ -1797,11 +1780,7 @@ pub fn build_test_par2_index_for_files(files: &[(&str, &[u8])], slice_size: u64)
     stream
 }
 
-pub fn segmented_job_spec(
-    name: &str,
-    filename: &str,
-    segment_sizes: &[u32],
-) -> JobSpec {
+pub fn segmented_job_spec(name: &str, filename: &str, segment_sizes: &[u32]) -> JobSpec {
     JobSpec {
         name: name.to_string(),
         password: None,
@@ -1835,8 +1814,7 @@ fn with_priority(mut spec: JobSpec, priority: &str) -> JobSpec {
 }
 
 // Record cancellation, drive its boundary, then observe the durable archive.
-#[cfg(test)]
-async fn cancel_one_job(
+pub async fn cancel_one_job(
     pipeline: &mut Pipeline,
     job_id: JobId,
     origin: crate::jobs::handle::CancellationOrigin,
@@ -1860,8 +1838,7 @@ async fn cancel_one_job(
 }
 
 // Hand the actor the archive outcome, then hear its cancelled workers out.
-#[cfg(test)]
-async fn finish_cancel_jobs(pipeline: &mut Pipeline) {
+pub async fn finish_cancel_jobs(pipeline: &mut Pipeline) {
     match pipeline
         .terminal_post_processing_done_rx
         .recv()
@@ -1882,16 +1859,12 @@ async fn finish_cancel_jobs(pipeline: &mut Pipeline) {
     }
 }
 
-pub(in crate::pipeline) async fn insert_active_job(
-    pipeline: &mut Pipeline,
-    job_id: JobId,
-    spec: JobSpec,
-) -> PathBuf {
+pub async fn insert_active_job(pipeline: &mut Pipeline, job_id: JobId, spec: JobSpec) -> PathBuf {
     let nzb_zstd = nzb_zstd_for(&spec);
     insert_active_job_with_persisted_nzb(pipeline, job_id, spec, nzb_zstd).await
 }
 
-async fn insert_active_job_with_persisted_nzb(
+pub async fn insert_active_job_with_persisted_nzb(
     pipeline: &mut Pipeline,
     job_id: JobId,
     spec: JobSpec,
@@ -1907,7 +1880,7 @@ async fn insert_active_job_with_persisted_nzb(
 // `{{password}}` convention out of the NZB path's stem, so it is the only way
 // to exercise that candidate source. `None` keeps the job-id name every other
 // caller gets.
-async fn insert_active_job_with_persisted_nzb_named(
+pub async fn insert_active_job_with_persisted_nzb_named(
     pipeline: &mut Pipeline,
     job_id: JobId,
     spec: JobSpec,
@@ -2010,8 +1983,7 @@ async fn insert_active_job_with_persisted_nzb_named(
 // `payload`, inserted and then delivered as a lane delivers it: the article
 // comes back from the server, is decoded, and the graph hears it. The file is
 // whole when this returns, so the job has something usable to complete with.
-#[cfg(test)]
-pub(in crate::pipeline) async fn insert_delivered_job(
+pub async fn insert_delivered_job(
     pipeline: &mut Pipeline,
     job_id: JobId,
     name: &str,
@@ -2030,7 +2002,7 @@ pub(in crate::pipeline) async fn insert_delivered_job(
         .download_queue
         .pop()
         .unwrap();
-    let work = pipeline.dispatched(work);
+    let work = work.dispatched(&pipeline.jobs[&job_id].spec);
     let segment_id = work.segment_id;
     let raw = encode_article_part(filename, payload, 1, 1, 1, payload.len() as u64);
     // Lane 0 holds the article, as a dispatched lease would book it.
@@ -2298,8 +2270,7 @@ pub(in crate::pipeline) fn job_status_for_assert(
         .or_else(|| pipeline.shared_state.get_job(job_id).map(|job| job.status))
 }
 
-#[cfg(test)]
-fn drain_job_events(
+pub fn drain_job_events(
     events: &mut tokio::sync::broadcast::Receiver<PipelineEvent>,
     job_id: JobId,
 ) -> Vec<PipelineEvent> {
@@ -2312,7 +2283,7 @@ fn drain_job_events(
     drained
 }
 
-async fn pump_pipeline_runtime_queues(pipeline: &mut Pipeline) {
+pub async fn pump_pipeline_runtime_queues(pipeline: &mut Pipeline) {
     pipeline.pump_decode_queue();
     while let Some(queued_job) = pipeline.pending_completion_checks.pop_front() {
         pipeline.check_job_completion(queued_job).await;
@@ -2335,7 +2306,7 @@ async fn pump_pipeline_runtime_queues(pipeline: &mut Pipeline) {
 
 // Hands the actor every failed job's working-directory release in flight,
 // so each records its history as the orchestrator records it.
-pub(in crate::pipeline) async fn settle_failed_releases(pipeline: &mut Pipeline) {
+pub async fn settle_failed_releases(pipeline: &mut Pipeline) {
     while !pipeline.pending_graph_terminals.is_empty() {
         let said = pipeline
             .graph_runs
@@ -2362,7 +2333,6 @@ pub async fn wait_until(mut predicate: impl FnMut() -> bool) {
     }
 }
 
-#[cfg(test)]
 async fn drain_decode_results(pipeline: &mut Pipeline, expected: usize) {
     for index in 0..expected {
         let done = pipeline.decode_done_rx.recv().await.unwrap_or_else(|| {
@@ -2460,7 +2430,6 @@ async fn refuse_login_past_give_up(pipeline: &Pipeline, server: usize) {
 }
 
 // Two fill servers: index 0 holds 5 days of retention, index 1 is unlimited.
-#[cfg(test)]
 fn two_server_retention_client() -> weaver_nntp::client::NntpClient {
     retention_client(&[5, 0])
 }

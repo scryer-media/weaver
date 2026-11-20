@@ -110,7 +110,7 @@ impl Pipeline {
 
     // Whether an undecoded body of `job_id` waits for a decode slot. Only
     // tests hand the pipeline undecoded bodies.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(in crate::pipeline) fn job_has_queued_decode(&self, job_id: JobId) -> bool {
         self.pending_decode
             .iter()
@@ -125,7 +125,7 @@ impl Pipeline {
     // only about the decode stage, and is the cheap gate that decides whether
     // a settling decode is worth re-running the download-drain sequence for.
     pub(in crate::pipeline) fn job_decode_stage_drained(&self, job_id: JobId) -> bool {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         if self.job_has_queued_decode(job_id) {
             return false;
         }
@@ -184,7 +184,7 @@ impl Pipeline {
         // damaged bytes a parked part was waiting to start after.
         self.release_settled_unanchored_runs().await;
 
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         self.pump_decode_queue();
 
         // The download-result path already ran the drain sequence for this

@@ -548,7 +548,7 @@ impl SharedClaim {
                 }));
                 *data = Err(error);
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             Ok(raw @ DownloadPayload::Raw(_)) => *data = Ok(raw),
         }
     }

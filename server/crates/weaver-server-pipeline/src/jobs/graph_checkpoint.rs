@@ -585,7 +585,7 @@ fn changes<R: Row>(out: &mut Changes<R>, before: &[R], after: &[R]) {
 
 pub(crate) trait JobsGraphCheckpointInternalQueries {
     fn save_graph_checkpoint(&self, job_id: JobId, delta: Arc<Delta>) -> Result<(), StateError>;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     fn has_graph_checkpoint(&self, job_id: JobId) -> Result<bool, LoadError>;
     fn jobs_with_graph_checkpoint(&self) -> Result<std::collections::HashSet<JobId>, LoadError>;
     fn load_graph_checkpoint(&self, job_id: JobId) -> Result<Option<GraphCheckpoint>, LoadError>;
@@ -611,7 +611,7 @@ impl JobsGraphCheckpointInternalQueries for Database {
     // Whether the job has a checkpoint, without reading it. A pure read: it
     // never waits on the writer gate or the serial writer. An install reads
     // this with its batch, through `load_install_row_facts`.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     fn has_graph_checkpoint(&self, job_id: JobId) -> Result<bool, LoadError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {

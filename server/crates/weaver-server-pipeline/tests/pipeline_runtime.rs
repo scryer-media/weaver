@@ -3,8 +3,11 @@
 
 mod pipeline {
     mod tests {
+        mod archive_passwords;
         mod archive_topology;
+        mod bandwidth_split;
         mod core;
+        mod full_file_names;
         mod direct_store {
             mod scenarios {
                 mod sevenz_store;

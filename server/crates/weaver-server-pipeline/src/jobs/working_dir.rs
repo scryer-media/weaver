@@ -1270,8 +1270,8 @@ fn parse_output_marker(stored: &[u8], path: &Path) -> Option<OutputDirOwner> {
 
 // A marker as a build before job-named markers wrote it, for tests of how
 // one is still read.
-#[cfg(test)]
-pub(crate) fn mark_legacy_output_dir(dir: &Path) -> std::io::Result<()> {
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+pub fn mark_legacy_output_dir(dir: &Path) -> std::io::Result<()> {
     let canonical = std::fs::canonicalize(dir)?;
     std::fs::write(
         dir.join(OUTPUT_DIR_MARKER),
@@ -1326,7 +1326,7 @@ pub fn remove_owned_output_dir(dir: &Path) -> std::io::Result<()> {
                 result => result?,
             }
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         injected_removal_failure(dir)?;
     }
     match std::fs::remove_file(dir.join(OUTPUT_DIR_MARKER)) {
@@ -1339,12 +1339,12 @@ pub fn remove_owned_output_dir(dir: &Path) -> std::io::Result<()> {
 // Output directories whose removal fails once one entry is gone, for tests
 // of a removal that fails part way. Keyed by directory, so tests in
 // separate temporary directories do not meet.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 static INJECTED_REMOVAL_FAILURES: std::sync::Mutex<Vec<PathBuf>> =
     std::sync::Mutex::new(Vec::new());
 
-#[cfg(test)]
-pub(crate) fn inject_removal_failure(dir: &Path, fail: bool) {
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+pub fn inject_removal_failure(dir: &Path, fail: bool) {
     let mut failing = INJECTED_REMOVAL_FAILURES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1354,7 +1354,7 @@ pub(crate) fn inject_removal_failure(dir: &Path, fail: bool) {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 fn injected_removal_failure(dir: &Path) -> std::io::Result<()> {
     let failing = INJECTED_REMOVAL_FAILURES
         .lock()

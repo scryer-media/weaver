@@ -229,7 +229,7 @@ impl GraphJob {
     }
 
     // Count `bytes` more in hand, as articles a test does not model would.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn add_in_hand_for_test(&mut self, bytes: u64) {
         self.root.map.add_in_hand_for_test(bytes);
     }

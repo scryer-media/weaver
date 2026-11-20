@@ -62,7 +62,7 @@ impl ActiveDecodes {
         self.by_job.contains_key(job_id)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(in crate::pipeline) fn insert(&mut self, job_id: JobId, count: usize) -> Option<usize> {
         let previous = self.remove(&job_id);
         self.by_job.insert(job_id, count);

@@ -72,7 +72,6 @@ pub(in crate::pipeline::tests) async fn answer_not_found(
 // Fail the connection under `work`, handed to `server`, through the result
 // path a lane's lost connection takes: an ordinary retry, which refuses the
 // article to no server.
-#[cfg(test)]
 pub(in crate::pipeline::tests) async fn answer_connection_failed(
     pipeline: &mut Pipeline,
     server: usize,
@@ -158,6 +157,37 @@ impl DispatchFixture {
 
     pub async fn refuse_login(&self, server: usize) {
         refuse_login_past_give_up(&self.0, server).await;
+    }
+
+    pub async fn refuse_login_fresh(&self, server: usize) {
+        refuse_login(&self.0, server).await;
+    }
+
+    pub async fn record_server_failure(&self, server: usize, auth: bool) {
+        self.0
+            .nntp
+            .pool()
+            .health()
+            .lock()
+            .await
+            .record_failure(server, auth);
+    }
+
+    pub fn set_retention_client(&mut self, days: &[u32]) {
+        self.set_client(retention_client(days));
+    }
+
+    pub fn server_may_serve(
+        &self,
+        server: usize,
+        excluded: weaver_nntp::ServerSet,
+        retention: weaver_nntp::ServerSet,
+    ) -> bool {
+        Pipeline::server_may_serve(self.0.nntp.pool(), server, excluded, retention)
+    }
+
+    pub fn no_server_can_serve(&mut self, id: JobId, excluded: weaver_nntp::ServerSet) -> bool {
+        self.0.no_server_can_serve(id, excluded)
     }
 
     pub async fn start_pass(&mut self, id: JobId, spec: JobSpec) {

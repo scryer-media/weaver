@@ -607,7 +607,7 @@ impl Pipeline {
     }
 
     pub(crate) fn nzb_work_in_flight(&self, id: JobId) -> bool {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         if self.job_has_queued_decode(id) {
             return true;
         }

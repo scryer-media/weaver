@@ -80,7 +80,7 @@ impl CheckpointLease {
 
 impl CheckpointAdmission {
     // Whether the checkpoint refuses no article at all.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(in crate::pipeline) fn admits_every_article(self) -> bool {
         !self.enforced || self.limit == 0
     }
@@ -229,7 +229,7 @@ impl Pipeline {
     // The spool filesystem's reading less the spills admitted against it.
     // Reads the sampler's cache; never touches the filesystem.
     pub(in crate::pipeline) fn uu_spool_capacity(&mut self) -> crate::operations::Capacity {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         if let Some(available) = self.uu_spool_available_bytes_for_test {
             use crate::operations::{Capacity, CapacityReading};
             return match available {
@@ -346,13 +346,13 @@ impl Pipeline {
         job_id: JobId,
     ) -> DownloadPipelineBacklog {
         // Only tests queue undecoded bodies.
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         let pending_decodes = self
             .pending_decode
             .iter()
             .filter(|work| work.segment_id.file_id.job_id == job_id)
             .count();
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "pipeline-test-fixtures")))]
         let pending_decodes = 0;
         DownloadPipelineBacklog {
             articles_in_flight: self

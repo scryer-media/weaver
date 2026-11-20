@@ -303,12 +303,7 @@ async fn run_cell_under(cell: Cell, cases: Vec<(usize, Schedule)>, only: Option<
 // One replay index of the matrix's schedules over `cell`, under the one
 // recovery layout `recovery`, held to the rule set: a row elsewhere pins a
 // case the matrix found.
-#[cfg(test)]
-pub(in crate::pipeline::tests) async fn cell_case(
-    cell: Cell,
-    case: usize,
-    recovery: RecoveryFormat,
-) {
+pub async fn cell_case(cell: Cell, case: usize, recovery: RecoveryFormat) {
     let schedule = schedules().swap_remove(case);
     let fixture = Fixture::build(cell);
     let (options, _) = cell.binding.drive(&fixture);

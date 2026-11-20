@@ -401,8 +401,7 @@ pub fn single_member_rar4_store_set_numbered(
 // [`single_member_rar4_store_set_numbered`] with a RAR3 recovery record of
 // `slots` parity sectors in each volume over every byte before its header,
 // as `rar a -rr` writes one.
-#[cfg(test)]
-pub(in crate::pipeline::tests) fn protected_rar4_store_set(
+pub fn protected_rar4_store_set(
     member_name: &str,
     payload: &[u8],
     volume_count: usize,
@@ -420,8 +419,7 @@ pub(in crate::pipeline::tests) fn protected_rar4_store_set(
 // enciphered under `password`, as `rar a -hp -rr` writes it, the member's
 // data stored in the clear. Each volume's record is over its bytes before
 // its own header's salt.
-#[cfg(test)]
-pub(in crate::pipeline::tests) fn protected_sealed_rar4_store_set(
+pub fn protected_sealed_rar4_store_set(
     member_name: &str,
     payload: &[u8],
     volume_count: usize,
@@ -438,7 +436,6 @@ pub(in crate::pipeline::tests) fn protected_sealed_rar4_store_set(
 // header's CRC made whole, every one past the main as its salt and its
 // cipher; data areas are
 // copied, and the record is made again over what precedes it.
-#[cfg(test)]
 fn seal_rar4_volume(plain: &[u8], slots: u32, password: &str) -> Vec<u8> {
     use weaver_objects::rar_record::encode;
     let size_at = |at: usize| usize::from(u16::from_le_bytes([plain[at + 5], plain[at + 6]]));
@@ -870,7 +867,7 @@ fn peek_queued_segments(pipeline: &mut Pipeline, job_id: JobId) -> Vec<(u32, u32
 // global input-slice ordering PAR2 defines — files in main-packet order,
 // slices in order within each file, each padded to `slice_size` — which is the
 // same ordering `plan_repair` reconstructs from the parsed set.
-pub(in crate::pipeline::tests) fn build_test_par2_with_recovery(
+pub fn build_test_par2_with_recovery(
     files: &[(&str, &[u8])],
     slice_size: u64,
     recovery_block_count: usize,

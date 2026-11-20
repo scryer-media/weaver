@@ -11,6 +11,11 @@ use weaver_server_pipeline::history::queries::HistoryQueries;
 use weaver_server_pipeline::pipeline::tests::{
     TestHarness, nzb_zstd_for, segmented_job_spec, standalone_job_spec, wait_until,
 };
+use weaver_server_pipeline::pipeline::tests::{
+    delivery_fixture::{finish_delivery, install_delivery_job},
+    history_fixture::finished_jobs,
+    new_direct_pipeline,
+};
 use weaver_server_pipeline::{JobId, JobStatus};
 
 fn capacity_test_client(port: u16, connections: usize) -> NntpClient {
@@ -687,5 +692,73 @@ async fn repeated_article_case(uuencode: bool) {
     assert_eq!(
         wire_bytes, expected_wire,
         "cached placements must not count as new network transfers"
+    );
+}
+
+#[tokio::test]
+async fn move_to_complete_uses_unique_destination_for_duplicate_job_names() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(10067);
+    let job_name = "Silver Horizon Beyond the Vale";
+    let payload_dir =
+        "Silver Horizon.Beyond.Journeys.End.S01.1080p.BluRay.Opus2.0.x265.DUAL-Anitsu";
+    let episode_name = "Silver Horizon.Beyond.Journeys.End.S01E01.mkv";
+
+    let existing_dest = complete_dir.join(
+        weaver_server_pipeline::jobs::working_dir::sanitize_dirname(job_name),
+    );
+    tokio::fs::create_dir_all(existing_dest.join(payload_dir))
+        .await
+        .unwrap();
+    tokio::fs::write(
+        existing_dest.join(payload_dir).join(episode_name),
+        b"existing",
+    )
+    .await
+    .unwrap();
+
+    let working_dir = intermediate_dir.join(format!(
+        "{}.#{}",
+        weaver_server_pipeline::jobs::working_dir::sanitize_dirname(job_name),
+        job_id.0
+    ));
+    tokio::fs::create_dir_all(working_dir.join(payload_dir))
+        .await
+        .unwrap();
+    tokio::fs::write(working_dir.join(payload_dir).join(episode_name), b"new")
+        .await
+        .unwrap();
+
+    install_delivery_job(&mut pipeline, job_id, job_name, working_dir.clone());
+    let (dest, succeeded) = finish_delivery(&mut pipeline, job_id).await;
+    assert!(succeeded);
+    let expected_dest = complete_dir.join(format!(
+        "{}.#{}",
+        weaver_server_pipeline::jobs::working_dir::sanitize_dirname(job_name),
+        job_id.0
+    ));
+
+    assert_eq!(dest, expected_dest);
+    assert!(!weaver_server_pipeline::pipeline::tests::uu_fixture::has_job(&pipeline, job_id));
+    assert!(
+        finished_jobs(&mut pipeline)
+            .await
+            .into_iter()
+            .any(|job| job.job_id == job_id
+                && job.output_dir.as_deref() == Some(expected_dest.to_str().unwrap()))
+    );
+    assert!(!working_dir.exists());
+    assert_eq!(
+        tokio::fs::read(dest.join(payload_dir).join(episode_name))
+            .await
+            .unwrap(),
+        b"new"
+    );
+    assert_eq!(
+        tokio::fs::read(existing_dest.join(payload_dir).join(episode_name))
+            .await
+            .unwrap(),
+        b"existing"
     );
 }

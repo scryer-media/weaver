@@ -3,6 +3,9 @@
 
 mod pipeline {
     mod tests {
+        mod decode_stage;
         mod shared_articles;
+        mod uu_assembly;
+        mod yenc_compatibility;
     }
 }

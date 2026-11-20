@@ -104,29 +104,29 @@ use weaver_server_base::operations::metrics::SchedulerBlockClause;
 
 // Whether a walk may start at a server's floor. Always, except in a test
 // that walks every queue whole to hold the floors' answers to it.
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "pipeline-test-fixtures")))]
 fn scan_floors_enabled() -> bool {
     true
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 thread_local! {
     static SCAN_FLOORS_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 fn scan_floors_enabled() -> bool {
     !SCAN_FLOORS_OFF.with(std::cell::Cell::get)
 }
 
 // Walks every queue whole on this thread while `off` holds.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(in crate::pipeline) fn set_scan_floors_off(off: bool) {
     SCAN_FLOORS_OFF.with(|cell| cell.set(off));
 }
 
 // What a server gets when it asks for work.
-pub(in crate::pipeline) enum Handout {
+pub enum Handout {
     // Articles to fetch, all from one job, in the order they should go out.
     Works(Vec<DownloadWork>),
     // No job can serve this server right now.
@@ -142,31 +142,31 @@ pub(in crate::pipeline) enum Handout {
 // What a saturated lane is waiting to fetch down to before it is asked
 // about again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::pipeline) struct SaturationWake {
+pub struct SaturationWake {
     // The job whose articles are counted; every job's when `None`.
-    pub(in crate::pipeline) of: Option<JobId>,
+    pub of: Option<JobId>,
     // Answer the lane again once it holds fewer than this many of them.
-    pub(in crate::pipeline) below: usize,
+    pub below: usize,
     // Held for the room of the job's volumes instead: the lane is answered
     // again once each volume the job writes to has fallen to its resume
     // line, however much it holds; `below` is not read. Each volume was
     // asked for one wake at that line, so a lane is not asked again while
     // its volume is still above it.
-    pub(in crate::pipeline) room: bool,
+    pub room: bool,
 }
 
 // The asking lane, so what it already holds of a job can be set against
 // its share of that job.
 #[derive(Debug, Clone, Copy)]
-pub(in crate::pipeline) struct LaneShare {
+pub struct LaneShare {
     pub(in crate::pipeline) lane_id: u64,
     // The pipeline depth the lane runs at.
-    pub(in crate::pipeline) depth: usize,
+    pub depth: usize,
 }
 
 // The only reasons a slot may be left empty while work is queued.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::pipeline) enum YieldReason {
+pub enum YieldReason {
     Paused,
     HardPressure,
     RateLimited,
@@ -629,7 +629,7 @@ impl Pipeline {
     // for this call, and names the clauses that refused it. The job's
     // completion-critical heap leads its ordinary one, which is what the
     // queue's own "first matching" scan already does.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(in crate::pipeline) fn take_servable_works_or_none(
         &mut self,
         job_id: JobId,

@@ -659,7 +659,7 @@ impl Pipeline {
 
     // Whether the job's graph waits for room on a disk, read from the job
     // itself.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(in crate::pipeline) fn graph_disk_held(&self, job_id: JobId) -> bool {
         self.graph_jobs
             .get(&job_id)

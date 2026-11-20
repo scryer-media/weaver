@@ -177,7 +177,7 @@ async fn a_stall_behind_a_job_whose_articles_are_being_read_is_never_kicked() {
     let temp_dir = tempfile::tempdir().unwrap();
     let mut pipeline = stalled_pipeline(&temp_dir).await;
     let job_id = JobId(40010);
-    super::article_scheduler::add_queued_job(&mut pipeline, job_id, 3).await;
+    super::dispatch_fixture::scheduler_activation::add_queued_job(&mut pipeline, job_id, 3).await;
     pipeline.db.set_nzb_admitted(job_id, true).unwrap();
     pipeline.nzb_admitted.insert(job_id);
     // The scheduler's first reach sends for the articles; the read is never

@@ -408,7 +408,7 @@ impl GraphJob {
         self
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn runs(&self) -> &Runs {
         &self.runs
     }
@@ -417,7 +417,6 @@ impl GraphJob {
     // their shelf for a change that has not come, and what rings as a run
     // begins to wait.
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-    #[cfg(test)]
     pub(crate) fn awaits_mail_unless_blocked(&self) -> bool {
         self.loans.out()
             || self.works.out()
@@ -430,13 +429,12 @@ impl GraphJob {
     }
 
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-    #[cfg(test)]
     pub(crate) fn blocked(&self) -> std::sync::Arc<tokio::sync::Notify> {
         self.writer.blocked()
     }
 
     // How far the node's run read into each of its volumes, by index.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn run_reached(&self, node: NodeId) -> BTreeMap<u32, u64> {
         self.writer
             .shelf_of(node)

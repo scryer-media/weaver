@@ -469,9 +469,57 @@ pub fn with_par2(mut posts: Vec<Post>, blocks: u32) -> Vec<Post> {
 pub struct CheckpointView<'a>(&'a crate::jobs::graph_checkpoint::GraphCheckpoint);
 
 impl CheckpointView<'_> {
+    pub fn member_provenance(&self, name: &str) -> Option<Vec<&str>> {
+        let member = self.0.members.iter().find(|row| row.name == name)?;
+        Some(
+            self.0
+                .coverage
+                .iter()
+                .filter(|row| row.node == member.node && row.member == member.member)
+                .map(|row| row.provenance.as_str())
+                .collect(),
+        )
+    }
+
+    pub fn closed_copy_members(&self) -> impl Iterator<Item = (&str, &str, bool)> {
+        self.0
+            .members
+            .iter()
+            .filter(|row| row.closed)
+            .filter_map(|copy| {
+                let into = copy.copy_of?;
+                let member = self
+                    .0
+                    .members
+                    .iter()
+                    .find(|row| row.node == copy.node && row.member == into)
+                    .expect("a copy's member is checkpointed");
+                Some((copy.name.as_str(), member.name.as_str(), member.closed))
+            })
+    }
+
+    pub fn hold_counts(&self) -> (usize, usize) {
+        let on_file = self.0.holds.iter().filter(|row| row.on_file).count();
+        (self.0.holds.len() - on_file, on_file)
+    }
+
+    pub fn member_refusals(&self) -> impl Iterator<Item = &str> {
+        self.0
+            .members
+            .iter()
+            .filter_map(|row| row.refused.as_deref())
+    }
+
     pub fn has_lifted_members(&self) -> bool {
         self.0.members.iter().any(|member| member.lifted.is_some())
     }
+}
+
+pub async fn run_restarting_with_checkpoints(
+    scenario: &Scenario,
+    inspect: &mut dyn FnMut(CheckpointView<'_>),
+) -> Restarted {
+    run_restarting_inspecting(scenario, &mut |rows| inspect(CheckpointView(rows))).await
 }
 
 pub async fn run_restarting(scenario: &Scenario) -> Restarted {
@@ -618,4 +666,21 @@ pub async fn run_restarted_while_repairing(scenario: &Scenario) -> (RestartedDon
         events,
     };
     (done, lent_again)
+}
+
+// What the job announced of its repair and its end, in order.
+pub fn repairs_and_end(events: &[PipelineEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            PipelineEvent::RepairComplete {
+                job_id,
+                slices_repaired,
+            } if *job_id == JOB => Some(format!("RepairComplete {slices_repaired}")),
+            PipelineEvent::JobCompleted { job_id } if *job_id == JOB => {
+                Some("JobCompleted".to_string())
+            }
+            _ => None,
+        })
+        .collect()
 }

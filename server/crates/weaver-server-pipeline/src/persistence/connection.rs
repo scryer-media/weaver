@@ -277,14 +277,14 @@ fn keeps_archive(target: &DatabaseTarget, error: &StateError) -> bool {
 
 // Test seam: the errors the next archives answer with instead of writing,
 // and how many archives were written.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) static ARCHIVE_REFUSED: Mutex<VecDeque<StateError>> = Mutex::new(VecDeque::new());
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) static ARCHIVES_WRITTEN: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 // Test seam: the next pass over the kept archives panics on its thread.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) static ARCHIVE_PASS_PANICS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -306,7 +306,7 @@ fn archive_one(
         ..
     } = archive;
     let job_id = *job_id;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     if let Some(refused) = ARCHIVE_REFUSED.lock().unwrap().pop_front() {
         return Err(refused);
     }
@@ -343,7 +343,7 @@ fn archive_one(
     if let Some(row) = archived {
         writer.cache_job_history_at(row, observed_generation);
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     ARCHIVES_WRITTEN.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
@@ -789,7 +789,7 @@ async fn retry_kept_archives(from: usize, writer: &DatabaseWriterExecutor, write
     let failures = Arc::clone(&writer_db.checkpoint_failures);
     let in_pass: Vec<_> = pass.iter().map(|archive| archive.job_id).collect();
     let ran = tokio::task::spawn_blocking(move || {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         if ARCHIVE_PASS_PANICS.swap(false, Ordering::Relaxed) {
             panic!("the pass over the kept archives panics, as the test asked");
         }
@@ -1430,7 +1430,7 @@ impl Database {
             let _ = reached.send(());
             Ok(())
         })?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         JOB_WRITE_WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(rx)
     }
@@ -1697,7 +1697,7 @@ fn close_line(overflow: &Mutex<Option<VecDeque<QueuedWrite>>>, context: &'static
 }
 
 // Each wait for a job's queued writes, counted for the tests.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) static JOB_WRITE_WAITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 

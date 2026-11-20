@@ -15,32 +15,7 @@ use crate::post_processing::model::{
 use crate::post_processing::output::PostProcessingOutputQueries;
 use crate::post_processing::settings::PostProcessingSettingsQueries;
 
-fn queue_instance(event: QueueEvent) -> ScriptInstanceDraft {
-    ScriptInstanceDraft::new(
-        ScriptName::new("queue.sh").unwrap(),
-        InstanceTrigger::Queue(event),
-    )
-}
-
-pub(in crate::pipeline::tests) fn enable_queue_script(db: &Database, root: &Path) {
-    let scripts = db
-        .initialize_post_processing_script_directory(root, None)
-        .unwrap();
-    std::fs::write(
-        scripts.join("queue.sh"),
-        "#!/bin/sh\n### NZBGET QUEUE SCRIPT ###\nexit 0\n",
-    )
-    .unwrap();
-    db.save_post_processing_settings(&PostProcessingSettings {
-        execution_enabled: true,
-        ..Default::default()
-    })
-    .unwrap();
-    // One instance for each thing that can happen to a download.
-    for event in QueueEvent::ALL {
-        db.create_script_instance(queue_instance(event)).unwrap();
-    }
-}
+pub(super) use super::script_fixture::{enable_queue_script, queue_instance};
 
 #[tokio::test]
 async fn non_queue_script_does_not_publish_queue_wait_status() {

@@ -1079,11 +1079,11 @@ pub(crate) async fn archive_history(
     let removal_order: Vec<u64> = proven.iter().map(|(id, ..)| id.0).collect();
     let mut stamp = Vec::new();
     for (turn, (job_id, recorded, dirs, output)) in proven.into_iter().enumerate() {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         archive_removals::run(archive_removals::Step::Turn(job_id));
         if scripted.waits(db, &removal_order[turn..]).await
             && let Err(error) = retry_script_stop_wait(job_id, || {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "pipeline-test-fixtures"))]
                 archive_removals::run(archive_removals::Step::Wait(job_id));
                 crate::post_processing::events::wait_for_job_events_stopped(db, job_id.0)
             })
@@ -1185,14 +1185,14 @@ pub(crate) async fn archive_history(
 
 // What a test runs at each job's turn of an archive's removals, and when
 // that turn waits for the job's scripts, on the thread that archives.
-#[cfg(test)]
-pub(crate) mod archive_removals {
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+pub mod archive_removals {
     use std::cell::RefCell;
 
     use weaver_server_base::jobs::ids::JobId;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(crate) enum Step {
+    pub enum Step {
         Turn(JobId),
         Wait(JobId),
     }
@@ -1203,7 +1203,7 @@ pub(crate) mod archive_removals {
         static RUN: RefCell<Option<Hook>> = const { RefCell::new(None) };
     }
 
-    pub(crate) fn set(run: impl FnMut(Step) + 'static) {
+    pub fn set(run: impl FnMut(Step) + 'static) {
         RUN.with(|slot| *slot.borrow_mut() = Some(Box::new(run)));
     }
 

@@ -11,7 +11,7 @@ use crate::post_processing::model::{PipelineOutcome, QueueEvent, ScriptEventLabe
 use crate::post_processing::runner::{CompatibilityFacts, JobExecutionContext};
 
 // Each arrival script event raised, counted for the tests.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) static ADDED_SCRIPT_RAISES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -135,7 +135,7 @@ impl Pipeline {
     // NZB_ADDED and JOB_ADDED each hold the job while a script of theirs
     // that blocks runs.
     fn raise_added_script_context(&mut self, job_id: JobId, context: EventContext) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         ADDED_SCRIPT_RAISES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let events = [
             context.event.clone(),

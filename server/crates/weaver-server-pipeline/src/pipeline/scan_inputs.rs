@@ -140,7 +140,7 @@ impl UuFiles {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn insert(&mut self, file_id: NzbFileId, file: UuFileAssembly) {
         self.moved.fetch_add(1, Ordering::Relaxed);
         self.files.insert(file_id, Self::adopted(&self.moved, file));

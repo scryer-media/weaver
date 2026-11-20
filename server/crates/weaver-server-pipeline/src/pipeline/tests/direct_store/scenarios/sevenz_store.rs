@@ -127,10 +127,7 @@ pub fn build_7z_shaped(
 // a pure byte split at a fixed size, with no per-volume header. The last
 // volume is whatever is left, so an `archive` that does not divide evenly
 // produces the short tail real sets have.
-pub(in crate::pipeline::tests) fn split_volumes(
-    archive: &[u8],
-    count: usize,
-) -> Vec<(String, Vec<u8>)> {
+pub fn split_volumes(archive: &[u8], count: usize) -> Vec<(String, Vec<u8>)> {
     assert!(count >= 1);
     if count == 1 {
         return vec![("silver.horizon.7z".to_string(), archive.to_vec())];

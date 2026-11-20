@@ -1603,14 +1603,12 @@ impl NamespaceWriter {
     }
 
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-    #[cfg(test)]
     pub(crate) fn shelf_of(&self, node: NodeId) -> Option<Arc<Shelf>> {
         self.envelopes.shelf_of(node)
     }
 
     // What rings as a run begins to wait on one of the shelves.
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-    #[cfg(test)]
     pub(crate) fn blocked(&self) -> Arc<tokio::sync::Notify> {
         self.envelopes.blocked()
     }

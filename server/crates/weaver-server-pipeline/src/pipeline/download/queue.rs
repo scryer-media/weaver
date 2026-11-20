@@ -1037,7 +1037,7 @@ impl DownloadQueue {
             })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub fn count_matching(&self, mut predicate: impl FnMut(&QueuedWork<'_>) -> bool) -> usize {
         self.iter().filter(|work| predicate(work)).count()
     }

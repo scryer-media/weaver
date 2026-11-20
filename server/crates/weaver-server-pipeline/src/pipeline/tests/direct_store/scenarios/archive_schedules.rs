@@ -628,7 +628,7 @@ async fn submit_schedule_recovery(
 
 // What a schedule's recovery set is authored as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::pipeline::tests) enum RecoveryFormat {
+pub enum RecoveryFormat {
     // One PAR2 file carrying the descriptions and every recovery block.
     Par2,
     // The same blocks as a poster lays them out: an index of descriptions

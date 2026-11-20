@@ -22,13 +22,13 @@ pub(crate) use admission::{
     AdmissionResources, PreparedAdd, RestartAdmission, destination_root, make_staging_dir,
     outline_read, staging_dir_for, staging_dir_on,
 };
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) use counters::COUNTER_SAMPLES;
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) use history::FAILED_SWEEP_PAGE;
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) use history::SweepPlaces;
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) use history::between_sweeps;
 pub(crate) use history::{
     MoveOut, clear_left_working_dirs, clear_restart_artifacts, remove_job_staging,
@@ -122,10 +122,10 @@ pub struct QueueInner {
     // job's folders until its count is gone: see `MoveOut`.
     pub(crate) moves_out: HashMap<JobId, usize>,
     // How often a cleanup wait found a move out for the job it waits for.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) waits_on_moves: usize,
     // How many restarts went on to clear the job's folders.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) restarts_clearing: usize,
     pub(crate) nntp: Option<(u64, weaver_nntp::client::NntpClient, usize)>,
     // What WireGuard tunnels asked usenet to give back, for the pipeline to
@@ -163,7 +163,7 @@ impl PendingCleanup {
         self.0.contains_key(id)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn folders_held(&self, id: &JobId) -> bool {
         self.0
             .get(id)
@@ -199,12 +199,12 @@ impl PendingCleanup {
 
 // Counts the actor's walks over every queue row, so a test can pin how many
 // a pass makes.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) static ROW_WALKS: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 pub(crate) fn count_walk() {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     ROW_WALKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 

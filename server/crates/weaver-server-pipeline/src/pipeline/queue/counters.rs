@@ -13,7 +13,7 @@ use weaver_server_base::operations::metrics::{PipelineMetrics, RateSeries};
 
 // Counts the ticker's samples, so a test can pin that a parked ticker takes
 // none.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) static COUNTER_SAMPLES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -168,7 +168,7 @@ impl Queue {
         events: &tokio::sync::broadcast::Sender<PipelineEvent>,
         now: Instant,
     ) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         COUNTER_SAMPLES.fetch_add(1, Ordering::Relaxed);
         if let Err(error) = self.sample_bandwidth(false) {
             tracing::warn!(%error, "failed to sample bandwidth usage");

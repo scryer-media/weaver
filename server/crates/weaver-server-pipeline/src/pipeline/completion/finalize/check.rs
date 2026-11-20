@@ -97,7 +97,7 @@ impl Pipeline {
     // the scheduler's backlog, not current transfer activity, and a started
     // job with only backlog still lists as Downloading on its own state.
     pub(crate) fn job_has_current_download_activity(&self, job_id: JobId) -> bool {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         if self.job_has_queued_decode(job_id) {
             return true;
         }
@@ -174,7 +174,7 @@ impl Pipeline {
             .unwrap_or(0)
             > 0;
         // Only tests queue undecoded bodies.
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         let has_inflight_decodes = has_inflight_decodes || self.job_has_queued_decode(job_id);
 
         has_queued_work

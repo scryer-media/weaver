@@ -90,7 +90,7 @@ pub(crate) async fn clear_left_working_dirs(
     tokio::task::spawn_blocking(move || {
         let jobs = BTreeSet::from([id]);
         let marked = crate::jobs::working_dir::job_working_dirs(&root, &jobs)?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         crate::pipeline::activation::move_seams::after_listing(&root);
         for dir in marked.into_values().flatten().filter(|dir| *dir != keep) {
             crate::jobs::working_dir::remove_job_working_dir_if_there(&root, &dir, id)?;
@@ -299,18 +299,18 @@ impl Queue {
     // Until no cleanup of a cancel, and no move, is out for any of `ids`.
     pub(super) async fn wait_for_cleanup(&self, ids: &BTreeSet<JobId>) {
         let mut revision = self.subscribe();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         let mut counted = false;
         while self.read(|inner| {
             ids.iter()
                 .any(|id| inner.pending_cleanup.contains(id) || inner.moves_out.contains_key(id))
         }) {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             crate::pipeline::activation::move_seams::cleanup_waited();
             // Counted once, and rung for the test that waits on the count;
             // that ring is marked seen and the wait looks again, so no
             // other ring is missed.
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             if !counted {
                 counted = true;
                 self.write(|inner| {
@@ -382,7 +382,7 @@ impl Queue {
         tokio::spawn(async move {
             let _guard = guard;
             self.wait_for_cleanup(&BTreeSet::from([id])).await;
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             self.write(|inner| {
                 inner.restarts_clearing += 1;
                 Change::changed(())
@@ -849,7 +849,7 @@ impl Queue {
         // it could not read may be any job's.
         let mut swept = Vec::new();
         for (turn, (id, recorded)) in page.into_iter().enumerate() {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             between_sweeps::run(id);
             // A job gained a script since the last read: the jobs still to
             // go are read again, in one statement, and those with one are
@@ -1101,7 +1101,7 @@ impl Queue {
     // same hold a history delete takes. An id in the queue, being admitted,
     // or held by another history operation is busy and nothing of it is
     // touched.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) async fn archive_history(
         self: Arc<Self>,
         ids: BTreeSet<JobId>,
@@ -1117,7 +1117,7 @@ impl Queue {
 
     // `archive_history`, keeping the record of at most `keep` files of
     // each archived entry's output directory.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) async fn archive_history_keeping(
         self: Arc<Self>,
         ids: BTreeSet<JobId>,
@@ -1240,7 +1240,7 @@ async fn settle_archive_history(
 
 // What a test runs at the start of each job's turn of a failed-sweep page,
 // on the thread that sweeps it.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) mod between_sweeps {
     use std::cell::RefCell;
 
