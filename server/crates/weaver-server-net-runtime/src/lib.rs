@@ -9,6 +9,7 @@
 
 pub mod database;
 pub mod ingest;
+pub mod post_processing;
 pub mod proxies;
 pub mod rss;
 pub mod servers;

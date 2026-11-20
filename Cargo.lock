@@ -6973,6 +6973,7 @@ dependencies = [
  "weaver-nzb",
  "weaver-server-base",
  "weaver-server-db",
+ "weaver-server-history",
  "weaver-server-ingest",
  "weaver-server-jobs",
  "weaver-server-net",

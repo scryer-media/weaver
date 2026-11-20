@@ -24,6 +24,7 @@ test-support = [
 [dependencies]
 weaver-server-base = { path = "../weaver-server-base" }
 weaver-server-db = { path = "../weaver-server-db" }
+weaver-server-history = { path = "../weaver-server-history" }
 weaver-server-ingest = { path = "../weaver-server-ingest" }
 weaver-server-jobs = { path = "../weaver-server-jobs" }
 weaver-server-net = { path = "../weaver-server-net" }
