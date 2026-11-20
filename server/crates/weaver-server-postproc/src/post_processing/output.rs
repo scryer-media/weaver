@@ -593,35 +593,7 @@ fn script_run_conditions(
     Ok((conditions, args))
 }
 
-// Archive moves active rows to history, so deletion is explicit rather than an FK cascade.
-pub async fn delete_script_state_tx(tx: &mut SqlTx<'_>, job_id: i64) -> Result<(), StateError> {
-    // Taken in the same order as insertion takes it.
-    tx.execute(
-        "UPDATE script_output_state SET next_seq = next_seq WHERE singleton = 1",
-        &[],
-    )
-    .await?;
-    delete_script_state_rows_tx(tx, &[job_id]).await
-}
-
-// The rows half of `delete_script_state_tx`, for a caller that already holds
-// the `script_output_state` lock and deletes many jobs under it.
-pub async fn delete_script_state_rows_tx(
-    tx: &mut SqlTx<'_>,
-    job_ids: &[i64],
-) -> Result<(), StateError> {
-    for chunk in job_ids.chunks(weaver_server_db::persistence::sql_runtime::max_rows_for_tx(
-        tx, 1,
-    )) {
-        let placeholders = vec!["{}"; chunk.len()].join(", ");
-        let args = chunk.iter().copied().map(SqlArg::I64).collect::<Vec<_>>();
-        for table in ["script_outputs", "script_event_queue", "script_job_state"] {
-            tx.execute(
-                &format!("DELETE FROM {table} WHERE job_id IN ({placeholders})"),
-                &args,
-            )
-            .await?;
-        }
-    }
-    Ok(())
-}
+// The script rows of a job are deleted with its other rows, in weaver-server-jobs.
+pub use weaver_server_jobs::jobs::child_rows::{
+    delete_script_state_rows_tx, delete_script_state_tx,
+};

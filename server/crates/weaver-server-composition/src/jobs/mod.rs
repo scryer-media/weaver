@@ -18,7 +18,6 @@ pub use weaver_server_jobs::jobs::feed_verdict;
 pub mod control;
 pub mod graph_checkpoint;
 pub mod model;
-pub(crate) use weaver_server_jobs::jobs::nzb_persistence;
 pub mod outline_persistence;
 pub mod persistence;
 pub use weaver_server_jobs::jobs::phase_progress;

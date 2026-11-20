@@ -32,6 +32,15 @@ impl weaver_server_history::history::database::HistoryDatabase for Database {
     fn wake_history_delete(&self) {
         self.history_delete_wake.notify_one();
     }
+
+    fn forget_job_script_effects(&self, job_ids: &[u64]) {
+        crate::post_processing::effects::PostProcessingEffectsInternalQueries::forget_script_effects_for(self, job_ids);
+    }
+
+    fn job_history_bundles_deleted(&self) {
+        crate::post_processing::events::PostProcessingEventsInvalidateQueueScriptAdmissionInternalQueries::notify_script_events_changed(self);
+        self.tags.changed();
+    }
 }
 
 impl weaver_server_jobs::jobs::database::JobsDatabase for Database {

@@ -261,7 +261,7 @@ impl<D: PostprocDatabase> JobsPersistenceInternalQueries for D {
                     let outline = outline.clone();
                     Box::pin(async move {
                         if restart {
-                            let deleted = crate::post_processing::history_bundles::delete_job_history_bundles_tx(tx, &[job_id]).await?;
+                            let deleted = weaver_server_history::history::bundles::delete_job_history_bundles_tx(tx, &[job_id]).await?;
                             if deleted.is_empty() {
                                 return Err(StateError::Database("restart history row disappeared".into()));
                             }

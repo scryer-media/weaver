@@ -42,7 +42,7 @@ const BANNED: &[&str] = &[
 // file, runs alone at startup or on Postgres, or is outside the gate by ruling.
 const LIFTED: &[(&str, usize)] = &[
     (
-        "server/crates/weaver-server-composition/src/history/persistence.rs",
+        "server/crates/weaver-server-history/src/history/persistence.rs",
         2,
     ),
     (

@@ -63,7 +63,7 @@ pub async fn delete_job_history_bundles_tx(
             )
             .await?;
         }
-        crate::post_processing::output::delete_script_state_rows_tx(tx, &present).await?;
+        weaver_server_jobs::jobs::child_rows::delete_script_state_rows_tx(tx, &present).await?;
         tx.execute(
             &format!("DELETE FROM job_history WHERE job_id IN ({placeholders})"),
             &args,

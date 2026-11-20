@@ -6925,6 +6925,7 @@ dependencies = [
  "weaver-server-db",
  "weaver-server-ingest",
  "weaver-server-jobs",
+ "weaver-server-settings",
 ]
 
 [[package]]

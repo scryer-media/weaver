@@ -27,4 +27,12 @@ pub trait HistoryDatabase: Borrow<SqlDatabase> {
 
     // Wakes the history delete worker once an accepted operation is queued.
     fn wake_history_delete(&self);
+
+    // After a history bundle delete commits: drops the cached script effects
+    // of `job_ids`. Called before the history cache is invalidated.
+    fn forget_job_script_effects(&self, job_ids: &[u64]);
+
+    // After a history bundle delete commits and the history cache is
+    // invalidated: tells script event and tag subscribers, in that order.
+    fn job_history_bundles_deleted(&self);
 }

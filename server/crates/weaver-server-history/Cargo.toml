@@ -19,6 +19,7 @@ weaver-server-base = { path = "../weaver-server-base" }
 weaver-server-db = { path = "../weaver-server-db" }
 weaver-server-ingest = { path = "../weaver-server-ingest" }
 weaver-server-jobs = { path = "../weaver-server-jobs" }
+weaver-server-settings = { path = "../weaver-server-settings" }
 
 [dev-dependencies]
 tempfile = { workspace = true }
