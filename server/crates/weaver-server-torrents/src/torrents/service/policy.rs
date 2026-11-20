@@ -38,25 +38,25 @@ use weaver_torrent::limits::LimitsConfig;
 /// What a pass looks at besides the torrent: the settings, rules and holds
 /// as it took them, and its instant.
 #[derive(Clone, Copy)]
-pub(super) struct Context<'a> {
-    pub(super) settings: &'a TorrentSettings,
-    pub(super) rules: &'a [TrackerRule],
-    pub(super) holds: &'a HoldSet,
-    pub(super) now: i64,
+pub struct Context<'a> {
+    pub settings: &'a TorrentSettings,
+    pub rules: &'a [TrackerRule],
+    pub holds: &'a HoldSet,
+    pub now: i64,
     // Reading: the peers are taken now, not once a minute.
-    pub(super) at_once: bool,
+    pub at_once: bool,
     // Goals: torrents are off, winding down to the downloads alone.
-    pub(super) downloads_only: bool,
+    pub downloads_only: bool,
     // Checkpoint: the torrents whose checkpoints are behind.
-    pub(super) unsaved: &'a BTreeSet<JobId>,
+    pub unsaved: &'a BTreeSet<JobId>,
     // Turn: each torrent's seat in the queue, as the pass worked it out.
-    pub(super) seats: &'a Seats,
+    pub seats: &'a Seats,
 }
 
 /// What a policy says should change for one torrent: plain data, applied by
 /// the pass in the order given.
 #[derive(Debug, Clone, PartialEq)]
-pub(super) enum Intent {
+pub enum Intent {
     // Reading. Seed mode ended in the session: what the job has is what
     // the torrent has, after a restart too.
     LeaveSeedMode,
@@ -85,7 +85,7 @@ pub(super) enum Intent {
 }
 
 /// One rule of a pass: what one torrent should be doing, as intents.
-pub(super) trait Policy: Sync {
+pub trait Policy: Sync {
     fn decide(&self, torrent: &Live, cx: &Context<'_>, out: &mut Vec<Intent>);
 }
 
@@ -99,7 +99,7 @@ pub(super) const UP_TO_GOALS: &[&dyn Policy] = &[&Reading, &Checkpoint, &Goals, 
 pub(super) const ON_TURNS: &[&dyn Policy] = &[&Turns, &Picking, &Limits];
 
 /// The session's figures for the torrent, and seed mode as it stands.
-pub(super) struct Reading;
+pub struct Reading;
 
 impl Policy for Reading {
     fn decide(&self, torrent: &Live, _: &Context<'_>, out: &mut Vec<Intent>) {
@@ -124,7 +124,7 @@ impl Policy for Reading {
 // session's checked pieces are read from `verified` only while it is in
 // seed mode, counted by `count`, and copied by `pieces` only when more
 // passed than were kept.
-pub(super) fn seed_mode_step<V>(
+pub fn seed_mode_step<V>(
     stored: bool,
     running: bool,
     verified: impl FnOnce() -> Option<V>,
@@ -147,7 +147,7 @@ pub(super) fn seed_mode_step<V>(
 }
 
 /// A torrent whose checkpoint is behind has it written, after its reading.
-pub(super) struct Checkpoint;
+pub struct Checkpoint;
 
 impl Policy for Checkpoint {
     fn decide(&self, torrent: &Live, cx: &Context<'_>, out: &mut Vec<Intent>) {
@@ -159,7 +159,7 @@ impl Policy for Checkpoint {
 
 /// A seeding torrent whose goal is met does what its policy says; winding
 /// down to the downloads alone, one done downloading stops.
-pub(super) struct Goals;
+pub struct Goals;
 
 impl Policy for Goals {
     fn decide(&self, torrent: &Live, cx: &Context<'_>, out: &mut Vec<Intent>) {
@@ -202,7 +202,7 @@ pub(super) fn goal_met(
 }
 
 /// How the download queue and its holds stand the torrent, for its turn.
-pub(super) struct Standing;
+pub struct Standing;
 
 impl Policy for Standing {
     fn decide(&self, torrent: &Live, cx: &Context<'_>, out: &mut Vec<Intent>) {
@@ -217,7 +217,7 @@ impl Policy for Standing {
 
 /// The torrent's seat in the queue, as the pass worked it out from every
 /// torrent's standing.
-pub(super) struct Turns;
+pub struct Turns;
 
 impl Policy for Turns {
     fn decide(&self, torrent: &Live, cx: &Context<'_>, out: &mut Vec<Intent>) {
@@ -229,27 +229,27 @@ impl Policy for Turns {
 
 // Whether a torrent whose turn is `turn` runs, before its disk is looked
 // at: its turn lets it and the operator has it resumed.
-pub(super) fn runs(turn: Turn, resumed: bool) -> bool {
+pub fn runs(turn: Turn, resumed: bool) -> bool {
     turn.active && resumed
 }
 
 // Whether a torrent that would `run` has its disk looked at: one not
 // running yet whose turn lets it run is kept from starting while the disk is
 // short, and one held for that is let go once it has room.
-pub(super) fn checks_start(run: bool, starting: bool, disk_held: Option<DiskHeld>) -> bool {
+pub fn checks_start(run: bool, starting: bool, disk_held: Option<DiskHeld>) -> bool {
     run && (starting || disk_held == Some(DiskHeld::Starting))
 }
 
 /// What a session is told of a torrent's run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum RunCommand {
+pub enum RunCommand {
     Pause,
     Unpause,
 }
 
 // What a session running a torrent `paused` or not is told so that it
 // `run`s or not: nothing when it already does.
-pub(super) fn run_command(run: bool, paused: bool) -> Option<RunCommand> {
+pub fn run_command(run: bool, paused: bool) -> Option<RunCommand> {
     match (run, paused) {
         (true, true) => Some(RunCommand::Unpause),
         (false, false) => Some(RunCommand::Pause),
@@ -261,7 +261,7 @@ pub(super) fn run_command(run: bool, paused: bool) -> Option<RunCommand> {
 /// for the files, sequential and first-and-last, each pushed only where it
 /// differs. A full disk leaves the levels as they are: the session stops
 /// fetching in upload mode, not by lower levels.
-pub(super) struct Picking;
+pub struct Picking;
 
 impl Policy for Picking {
     fn decide(&self, torrent: &Live, _: &Context<'_>, out: &mut Vec<Intent>) {
@@ -285,16 +285,16 @@ impl Policy for Picking {
 
 /// How a torrent's pieces are picked: in order, its files' first and last
 /// pieces first, and each file's level.
-pub(super) struct Picks<'a> {
-    pub(super) sequential: bool,
-    pub(super) first_last: bool,
-    pub(super) levels: &'a [FilePriority],
+pub struct Picks<'a> {
+    pub sequential: bool,
+    pub first_last: bool,
+    pub levels: &'a [FilePriority],
 }
 
 // What reaches a session `running` the picks to run the `stored` ones. The
 // levels go as the files that differ, and only when one does: nothing is
 // built for a torrent whose levels the session runs already.
-pub(super) fn picks(stored: &Picks<'_>, running: &Picks<'_>, out: &mut Vec<Intent>) {
+pub fn picks(stored: &Picks<'_>, running: &Picks<'_>, out: &mut Vec<Intent>) {
     if running.sequential != stored.sequential {
         out.push(Intent::Sequential(stored.sequential));
     }
@@ -315,7 +315,7 @@ pub(super) fn picks(stored: &Picks<'_>, running: &Picks<'_>, out: &mut Vec<Inten
 /// The limits each torrent's session holds it to, from its own and its
 /// seeding policy's as they are now: a change of either at any level
 /// reaches the torrent's peers without reconnecting them.
-pub(super) struct Limits;
+pub struct Limits;
 
 impl Policy for Limits {
     fn decide(&self, torrent: &Live, cx: &Context<'_>, out: &mut Vec<Intent>) {
@@ -333,16 +333,16 @@ impl Policy for Limits {
 
 // The limits that reach a session holding a torrent to `running`, so that
 // it holds it to `wanted`: none when it does.
-pub(super) fn limits_change(wanted: LimitsConfig, running: LimitsConfig) -> Option<Intent> {
+pub fn limits_change(wanted: LimitsConfig, running: LimitsConfig) -> Option<Intent> {
     (running != wanted).then_some(Intent::Limits(wanted))
 }
 
 /// Each torrent's seat in the queue, by job.
 #[derive(Debug, Default)]
-pub(super) struct Seats(Vec<(JobId, Queued, Turn)>);
+pub struct Seats(Vec<(JobId, Queued, Turn)>);
 
 impl Seats {
-    pub(super) fn of(&self, job_id: JobId) -> Option<(Queued, Turn)> {
+    pub fn of(&self, job_id: JobId) -> Option<(Queued, Turn)> {
         let at = self
             .0
             .binary_search_by_key(&job_id, |(id, _, _)| *id)
@@ -356,7 +356,7 @@ impl Seats {
 /// each torrent, by job, and the torrents in place order, as indexes into
 /// those. A pass whose places are the same takes the same order.
 #[derive(Debug, Default)]
-pub(super) struct QueueOrder {
+pub struct QueueOrder {
     places: Vec<(i64, JobId)>,
     order: Vec<u32>,
 }
@@ -364,7 +364,7 @@ pub(super) struct QueueOrder {
 impl QueueOrder {
     // The torrents of `places`, which are by job, in place order: the last
     // order again when no place moved, else sorted anew.
-    pub(super) fn of(&mut self, places: Vec<(i64, JobId)>) -> &[u32] {
+    pub fn of(&mut self, places: Vec<(i64, JobId)>) -> &[u32] {
         if places != self.places {
             let mut order: Vec<u32> = (0..places.len() as u32).collect();
             order.sort_unstable_by_key(|&at| places[at as usize]);
@@ -377,7 +377,7 @@ impl QueueOrder {
 
 // Each standing's seat, the standings taken by job: the turns are worked
 // out in queue order, by place then job, and the walk's end with them.
-pub(super) fn seat(
+pub fn seat(
     standings: Vec<(i64, Queued)>,
     order: &mut QueueOrder,
     max_active: u32,
@@ -531,7 +531,7 @@ impl TorrentService {
             ..Self::context(&settings, &rules, &holds, now)
         };
         let mut gathered = Gathered::default();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let mut locks = 1;
         {
             let mut live = self.inner.live.lock().await;
@@ -554,24 +554,24 @@ impl TorrentService {
         // Their checkpoints were queued with the walk's.
         unsaved.queued();
         let removals = std::mem::take(&mut gathered.removals);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let (mut walks, writes) = (gathered.walks, gathered.writes);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         {
             locks += u64::from(self.land(gathered).await);
         }
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-support")))]
         self.land(gathered).await;
         if !removals.is_empty() {
             self.remove_met(removals).await;
             let _turn_walks = self.apply_turns(ON_TURNS).await;
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             {
                 locks += 1;
                 walks += _turn_walks;
             }
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         self.inner.pass_counts.send_modify(|counts| {
             counts.passes += 1;
             counts.locks += locks;
@@ -994,8 +994,8 @@ impl TorrentService {
     /// says, and one done downloading stops while torrents wind down to the
     /// downloads alone: the goals policy over every torrent. The tick
     /// applies them in its pass; tests ask for them alone.
-    #[cfg(test)]
-    pub(super) async fn apply_goals(&self, now: i64) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn apply_goals(&self, now: i64) {
         let settings = self.settings();
         let rules = self.rules();
         let holds = HoldSet::default();
@@ -1020,7 +1020,7 @@ impl TorrentService {
     // them: written whenever it changed, with its peers once a minute while
     // they change, or now when `at_once`. The reading policy over every
     // torrent, which reads no settings.
-    pub(super) async fn read(&self, now: i64, at_once: bool) {
+    pub async fn read(&self, now: i64, at_once: bool) {
         let holds = HoldSet::default();
         let cx = Context {
             at_once,
@@ -1037,21 +1037,21 @@ impl TorrentService {
     }
 
     // Which torrents the queue lets download, applied to their sessions.
-    pub(super) async fn apply_queue(&self) {
+    pub async fn apply_queue(&self) {
         self.apply_turns(&[&Turns]).await;
     }
 
     // The queue applied, then each torrent's picking, under one take: for
     // each torrent its turn, then its picking, as the two passes one after
     // the other gave them.
-    pub(super) async fn apply_queue_and_picking(&self) {
+    pub async fn apply_queue_and_picking(&self) {
         self.apply_turns(&[&Turns, &Picking]).await;
     }
 
     // What each session runs is what is stored, read from the torrent's
     // handle and pushed only where it differs. A change the session refuses
     // (while it checks its files) is pushed again on the next pass.
-    pub(super) async fn apply_picking(&self) {
+    pub async fn apply_picking(&self) {
         self.pick(None).await;
     }
 
@@ -1123,11 +1123,11 @@ fn undo_seed(live: &mut LiveMap, undo: &[SeedUndo], error: &str) {
 /// What the tick's passes did, counted in tests: each pass, each take of
 /// `live` and each walk over the torrents it made, and each write it queued
 /// or made of its rows.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(super) struct PassCounts {
-    pub(super) passes: u64,
-    pub(super) locks: u64,
-    pub(super) walks: u64,
-    pub(super) writes: u64,
+pub struct PassCounts {
+    pub passes: u64,
+    pub locks: u64,
+    pub walks: u64,
+    pub writes: u64,
 }

@@ -5,7 +5,7 @@ use super::intake::Resolving;
 use super::live::Live;
 use super::scripts::{Ending, StoppedSeeding};
 use super::{ActionError, MemoryRelease, TorrentService, hashes_of, report, unpacking_dir};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use super::{MARK_HOLD, MOVE_HOLD, SYNC_HELD_FAILS, locked};
 use crate::StateError;
 use crate::jobs::JobId;
@@ -29,13 +29,11 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, PoisonError};
-pub(super) use weaver_server_pipeline::torrents::service::resolved;
+pub use weaver_server_pipeline::torrents::service::resolved;
 pub(in crate::torrents) use weaver_server_pipeline::torrents::service::{
     Deletion, delete_written, deletion, listed_files,
 };
-#[cfg(test)]
-pub(crate) use weaver_server_pipeline::torrents::service::{LiveHeld, remove_history_files};
-pub(crate) use weaver_server_pipeline::torrents::service::{
+pub use weaver_server_pipeline::torrents::service::{
     finish_retiring, held_key, held_of, held_tops,
 };
 
@@ -61,7 +59,7 @@ impl TorrentService {
     }
 
     // The torrent cannot go on: it leaves as a failed job and its data stays.
-    pub(super) async fn fail(&self, job_id: JobId, error: String) {
+    pub async fn fail(&self, job_id: JobId, error: String) {
         let torrent = {
             let mut live = self.inner.live.lock().await;
             // One whose removal has begun is the removal's to retire: a
@@ -691,9 +689,9 @@ impl TorrentService {
         job_id: JobId,
         to: (Option<String>, Option<String>),
     ) -> Result<(), StateError> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let held = locked(&MOVE_HOLD).take();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some((reached, release)) = held {
             let _ = reached.send(());
             let _ = release.await;
@@ -732,7 +730,7 @@ impl TorrentService {
                 )
             });
             let held = held_of(storage.as_deref(), files.as_deref(), tops.as_ref());
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             if SYNC_HELD_FAILS.load(Ordering::Relaxed) == if adding { 2 } else { 1 } {
                 return Err(StateError::Database("the held paths were refused".into()));
             }
@@ -877,9 +875,9 @@ pub(super) async fn held_at(record: &TorrentRecord, tops: Option<BTreeSet<String
 
 // A test's hold on a removal just before its mark is written.
 pub(super) async fn mark_hold() {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let held = locked(&MARK_HOLD).take();
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some((reached, release)) = held {
         let _ = reached.send(());
         let _ = release.await;

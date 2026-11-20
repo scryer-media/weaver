@@ -249,12 +249,12 @@ impl Snapshot {
 
     // A load of the stored torrents begins: the rows are not every
     // torrent's until a publish after it ends.
-    pub(super) fn unready(&self) {
+    pub fn unready(&self) {
         self.unready.store(true, Ordering::Release);
     }
 
     // A stamp for a reading about to begin, newer than every one before.
-    pub(super) fn stamp(&self) -> u64 {
+    pub fn stamp(&self) -> u64 {
         self.stamps.fetch_add(1, Ordering::AcqRel) + 1
     }
 
@@ -334,7 +334,7 @@ impl Snapshot {
     }
 
     // `stamp` is the one taken before the views were read.
-    pub(super) fn replace(&self, views: &[(TorrentView, FileTotals)], every: bool, stamp: u64) {
+    pub fn replace(&self, views: &[(TorrentView, FileTotals)], every: bool, stamp: u64) {
         let mut rows = self.write();
         let next = rows.revision + 1;
         let mut moved = false;
@@ -361,7 +361,7 @@ impl Snapshot {
 
     // One torrent's view, read whole, or none when it is gone; `stamp` is
     // the one taken before it was read.
-    pub(super) fn put_one(&self, job_id: JobId, view: Option<&TorrentView>, stamp: u64) {
+    pub fn put_one(&self, job_id: JobId, view: Option<&TorrentView>, stamp: u64) {
         let mut rows = self.write();
         let next = rows.revision + 1;
         let moved = match view {
@@ -373,7 +373,7 @@ impl Snapshot {
 
     // Each row's tags as `tags_of` gives them; `stamp` is the one taken
     // before the tags were read.
-    pub(super) fn retag(&self, tags_of: impl Fn(JobId) -> Vec<String>, stamp: u64) {
+    pub fn retag(&self, tags_of: impl Fn(JobId) -> Vec<String>, stamp: u64) {
         let mut rows = self.write();
         let next = rows.revision + 1;
         let changed: Vec<(JobId, Vec<String>)> = rows

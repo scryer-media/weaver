@@ -32,19 +32,19 @@ fn rule_of(id: Option<u32>, rules: &[TrackerRule]) -> Option<&TrackerRule> {
 }
 
 // What the service keeps of each torrent while it lives.
-pub(super) struct Live {
-    pub(super) record: TorrentRecord,
+pub struct Live {
+    pub record: TorrentRecord,
     // Who it is to its peers and trackers from its add to its remove, in
     // every session it runs in.
     pub(super) identity: TorrentIdentity,
     // The tracker rule its trackers match, picked again whenever they or
     // the rules change: the trackers are what is kept, not the rule.
-    pub(super) rule_id: Option<u32>,
+    pub rule_id: Option<u32>,
     // The trackers it lists, as its rows in the database hold them, in
     // `in_table_order`: each change is written to the table first, then
     // here as a new list, under the lock that holds this torrent, so a
     // reader takes the list without copying it.
-    pub(super) trackers: Arc<[TrackerEntry]>,
+    pub trackers: Arc<[TrackerEntry]>,
     // The peers and bans its next start begins with: the one place a ban
     // made here lives until it is written.
     pub(super) resume: ResumePeers,
@@ -52,30 +52,30 @@ pub(super) struct Live {
     ledger: Ledger,
     pub(super) names: Vec<String>,
     pub(super) total: u64,
-    pub(super) layout: Option<Arc<PieceLayout>>,
+    pub layout: Option<Arc<PieceLayout>>,
     // What it has in its files, once it has metainfo.
-    pub(super) store: Option<Arc<TorrentStore>>,
-    pub(super) intake: Option<Arc<Intake>>,
-    pub(super) attached: Option<Attached>,
+    pub store: Option<Arc<TorrentStore>>,
+    pub intake: Option<Arc<Intake>>,
+    pub attached: Option<Attached>,
     // A magnet's metadata fetch, while it runs: its announce table, whose
     // trackers are announced to before the torrent is in a session, and
     // where it asks for peers.
-    pub(super) fetching: Option<weaver_torrent::MetadataFetch>,
+    pub fetching: Option<weaver_torrent::MetadataFetch>,
     // A magnet's metadata fetch, until it ends.
-    pub(super) resolving: Option<Resolving>,
+    pub resolving: Option<Resolving>,
     // Its wait for its route's session to open, off the add or action that
     // asked for it, until the wait ends.
     pub(super) attaching: Option<tokio::task::AbortHandle>,
-    pub(super) route: Option<RouteKey>,
-    pub(super) held: Option<Held>,
+    pub route: Option<RouteKey>,
+    pub held: Option<Held>,
     pub(super) about: About,
-    pub(super) counters: TorrentCounters,
+    pub counters: TorrentCounters,
     // The payload its ledger held as downloaded when this run of weaver took
     // it: more since means it downloaded in this run.
     pub(super) downloaded_at_start: u64,
     // What the session reported at the last kept reading, for the ledger's
     // deltas; the next session it runs in counts on from here.
-    pub(super) seen: TorrentTotals,
+    pub seen: TorrentTotals,
     // The instant its durations were last advanced to, with what each ran
     // past its whole seconds.
     timed: Timed,
@@ -85,7 +85,7 @@ pub(super) struct Live {
     pub(super) run_error: Option<String>,
     // Why its restore is held, while it is: a checkpoint the database did
     // not give, tried again at each restore until it does.
-    pub(super) restore_held: Option<String>,
+    pub restore_held: Option<String>,
     // Why its stored metainfo or tracker URLs did not decrypt at start: it
     // is held, neither restored nor fetched, while that stands.
     pub(super) sealed: Option<String>,
@@ -95,22 +95,22 @@ pub(super) struct Live {
     pub(super) files_missing: bool,
     // Waits for room on its disk, and how: the service's wait for it is in
     // `Inner::disk_waits`.
-    pub(super) disk_held: Option<DiskHeld>,
-    pub(super) queued: bool,
+    pub disk_held: Option<DiskHeld>,
+    pub queued: bool,
     // Its place among the torrents still downloading, from 1, as the queue
     // was last applied; None while it seeds (qBittorrent
     // `TorrentImpl::queuePosition`).
-    pub(super) queue_rank: Option<u32>,
+    pub queue_rank: Option<u32>,
     // Who holds it stopped, while a hold does.
-    pub(super) paused_by: Option<HoldOrigin>,
+    pub paused_by: Option<HoldOrigin>,
     // The operator's level for each file, as stored.
-    pub(super) levels: Vec<FilePriority>,
+    pub levels: Vec<FilePriority>,
     pub(super) speeds: (u64, u64),
     // Its established peers, the seeders among them, and the peers still
     // in their handshake.
     pub(super) peers: (u32, u32, u32),
     // Where a move goes, while it is under way.
-    pub(super) moving: Option<Moving>,
+    pub moving: Option<Moving>,
     // A start of its run was left for the end of that move
     // (`start_waits_on_move`): the move's end makes one pass over the
     // queue for it, and none otherwise.
@@ -123,19 +123,19 @@ pub(super) struct Live {
     pub(super) failed_removing: Option<String>,
     // A change of its files' levels that copies bytes out of its side
     // store, while it is under way.
-    pub(super) leveling: Option<Leveling>,
+    pub leveling: Option<Leveling>,
     // Why its files' bytes did not copy out of its side store, until it is
     // started again: it is in error, stopped.
     pub(super) copy_error: Option<String>,
     // How many pieces had passed their check in seed mode when they were
     // last kept.
-    pub(super) seed_verified: usize,
+    pub seed_verified: usize,
     // Whether the database refused the row that says it left seed mode,
     // and has not kept one since: warned of once, not at every pass that
     // writes it again.
-    pub(super) seed_left_refused: bool,
+    pub seed_left_refused: bool,
     // The same for the row that keeps the pieces it checked in seed mode.
-    pub(super) seed_verified_refused: bool,
+    pub seed_verified_refused: bool,
     // Each file's bytes in hand: the checkpoint's until the session has
     // checked the files, then the session's.
     file_have: Vec<u64>,
@@ -152,7 +152,7 @@ pub(super) struct Live {
     // Held while a session takes it and while it is removed, so the two
     // never cross: a torrent removed is never put in a session after, and
     // one put in a session is removed from it.
-    pub(super) gate: Arc<tokio::sync::Mutex<()>>,
+    pub gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Live {
@@ -169,7 +169,7 @@ impl Live {
     // A torrent whose ledger and peers the database holds as given, as of
     // `now`. Its seeding run starts again from zero: the time Weaver was
     // down is no seeding.
-    pub(super) fn new(
+    pub fn new(
         record: TorrentRecord,
         mut counters: TorrentCounters,
         resume: ResumePeers,
@@ -240,7 +240,7 @@ impl Live {
         }
     }
 
-    pub(super) fn complete(&self) -> bool {
+    pub fn complete(&self) -> bool {
         self.record.completed_at_ms.is_some()
     }
 
@@ -287,7 +287,7 @@ impl Live {
     // tee's branch. One whose unpacking ended, whole or short, and that
     // downloads again, as when a file it ignored is wanted, makes none: its
     // unpacking does not run again, and its outputs and history stay.
-    pub(super) fn unpacking(&self) -> bool {
+    pub fn unpacking(&self) -> bool {
         self.record.unpack_in_force.unwrap_or_default() && !self.record.unpack_over
     }
 
@@ -302,7 +302,7 @@ impl Live {
 
     // Whether it has download work in hand: running, not queued, short of a
     // seed, and fetching its metadata or in its session.
-    pub(super) fn downloading(&self) -> bool {
+    pub fn downloading(&self) -> bool {
         self.resumed()
             && !self.queued
             && !self.seeding()
@@ -355,7 +355,7 @@ impl Live {
     // they were last taken, or at once when `at_once`; they are the
     // session's while it runs the torrent, and one stopped by an error
     // keeps those last taken.
-    pub(super) fn take_resume(&mut self, now: i64, at_once: bool) -> Option<Resume> {
+    pub fn take_resume(&mut self, now: i64, at_once: bool) -> Option<Resume> {
         if self.ledger.lost.swap(false, Ordering::AcqRel) {
             self.ledger.written = None;
         }
@@ -437,7 +437,7 @@ impl Live {
     }
 
     // The session took a change to the torrent's run, or refused it.
-    pub(super) fn ran(&mut self, result: anyhow::Result<()>) {
+    pub fn ran(&mut self, result: anyhow::Result<()>) {
         if let Err(error) = &result {
             tracing::warn!(job_id = self.record.job_id.0, error = %error, "a torrent's run did not change");
         }
@@ -490,7 +490,7 @@ impl Live {
     // run to `now` as its bytes do: the time since the last kept reading
     // is active while the session runs the torrent, and finished while it
     // seeds.
-    pub(super) fn reading(&self, now: i64) -> Reading {
+    pub fn reading(&self, now: i64) -> Reading {
         let mut reading = self.sampled(now);
         let (state, _) = status::project(&self.observed(reading.engine.clone()));
         reading.timed = self.timed.advanced(
@@ -612,7 +612,7 @@ impl Live {
 
     // Everything the state is read from, with the session reporting
     // `engine`.
-    pub(super) fn observed(&self, engine: Engine) -> Observed {
+    pub fn observed(&self, engine: Engine) -> Observed {
         // Shown once its session is in upload mode for it.
         let disk_space = match self.disk_held {
             Some(DiskHeld::Writing) => matches!(
@@ -658,11 +658,7 @@ impl Live {
 
 // Fold into the ledger the bytes the session threw away between its totals
 // `then` and `now`, so its wasted bytes are the torrent's across restarts.
-pub(super) fn count_waste(
-    counters: &mut TorrentCounters,
-    then: &TorrentTotals,
-    now: &TorrentTotals,
-) {
+pub fn count_waste(counters: &mut TorrentCounters, then: &TorrentTotals, now: &TorrentTotals) {
     counters.failed_bytes = counters
         .failed_bytes
         .saturating_add(now.failed_bytes.saturating_sub(then.failed_bytes));
@@ -675,7 +671,7 @@ pub(super) fn count_waste(
 // past the whole seconds its counter holds: a reading carries them over,
 // so no part of a second is lost between readings.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct Timed {
+pub struct Timed {
     at_ms: i64,
     pub(super) active_ms: u64,
     finished_ms: u64,
@@ -683,7 +679,7 @@ pub(super) struct Timed {
 }
 
 impl Timed {
-    pub(super) fn at(now: i64) -> Self {
+    pub fn at(now: i64) -> Self {
         Self {
             at_ms: now,
             active_ms: 0,
@@ -703,7 +699,7 @@ impl Timed {
     // `seeding`; a reading that is not `seeding` ends the run, and it starts
     // again from zero. A clock stepped back credits nothing for that
     // reading, and the next runs from `now`.
-    pub(super) fn advanced(
+    pub fn advanced(
         self,
         now: i64,
         active: bool,
@@ -767,7 +763,7 @@ fn same_peers(a: &ResumePeers, b: &ResumePeers) -> bool {
 // session reports none, as while it checks the files, the store's figure
 // stands: the pieces the check has found so far, or those the checkpoint
 // it starts from vouches for, which are the pieces the torrent counts.
-pub(super) fn take_file_have(kept: &mut Vec<u64>, reported: &[u64], store: Option<&TorrentStore>) {
+pub fn take_file_have(kept: &mut Vec<u64>, reported: &[u64], store: Option<&TorrentStore>) {
     if !reported.is_empty() {
         kept.clear();
         kept.extend_from_slice(reported);

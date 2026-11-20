@@ -16,7 +16,7 @@ use weaver_server_disk::operations::room_wait::{
 
 // How a torrent waits for room on the disk its folder lies on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum DiskHeld {
+pub enum DiskHeld {
     // A piece found no room: its session is in upload mode, fetching
     // nothing and seeding, until a reading shows room made or its user
     // resumes it.
@@ -31,7 +31,7 @@ pub(super) enum DiskHeld {
 // What a torrent's write that found no room was refused by: the disk
 // itself, or the ledger every writer on the disk books on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum NoRoom {
+pub enum NoRoom {
     Disk(Wants),
     Ledger(u64),
 }
@@ -39,7 +39,7 @@ pub(super) enum NoRoom {
 // The run a wait began in. The weak pointer keeps the run's allocation,
 // so no later run can share its address: a wait is the current run's only
 // while that run is the one it began in.
-pub(super) struct RunMark(std::sync::Weak<dyn std::any::Any + Send + Sync>);
+pub struct RunMark(std::sync::Weak<dyn std::any::Any + Send + Sync>);
 
 impl RunMark {
     fn of<T: Send + Sync + 'static>(run: &Arc<T>) -> Self {
@@ -60,7 +60,7 @@ impl RunMark {
 // refusal: a write the disk refused waits for a reading that shows room
 // made, as a usenet job held for a full disk does; a booking the ledger
 // refused waits on the ledger, as a usenet job's refused booking does.
-pub(super) enum Waiting {
+pub enum Waiting {
     Room(RoomWait),
     Ledger(LedgerWait, CapacityReader),
     // A piece was refused while the disk of its folder was not known, or
@@ -70,8 +70,8 @@ pub(super) enum Waiting {
     Place(u64),
 }
 
-pub(super) struct DiskWait {
-    pub(super) how: Waiting,
+pub struct DiskWait {
+    pub how: Waiting,
     run: RunMark,
 }
 
@@ -112,10 +112,10 @@ fn root_index(root: StorageRoot) -> usize {
 // torrent is listed or a look a reading began is out, so a look that
 // fails again waits for the next reading and does not ask for one.
 #[derive(Default)]
-pub(super) struct Relook {
-    pub(super) jobs: BTreeSet<JobId>,
+pub struct Relook {
+    pub jobs: BTreeSet<JobId>,
     out: usize,
-    pub(super) waiting: bool,
+    pub waiting: bool,
 }
 
 // A look for a torrent's disk on its way. However it ends, panicking
@@ -359,13 +359,7 @@ impl TorrentService {
     // leaves the torrent unplaced, never placed off the roots', and it is
     // looked up again at the next reading. The caller began the look on
     // the torrent's room, and counted it as out when a reading began it.
-    pub(super) fn spawn_place(
-        &self,
-        job_id: JobId,
-        intake: &Arc<Intake>,
-        dir: PathBuf,
-        again: bool,
-    ) {
+    pub fn spawn_place(&self, job_id: JobId, intake: &Arc<Intake>, dir: PathBuf, again: bool) {
         self.spawn_place_in(job_id, intake, dir, again, None);
     }
 
@@ -487,7 +481,7 @@ impl TorrentService {
     // its own folder lies on, as it stands now. A wait left from another
     // run is replaced. With no disks to read, its session tries again by
     // itself.
-    pub(super) async fn hold_for_room(&self, job_id: JobId, no_room: NoRoom) {
+    pub async fn hold_for_room(&self, job_id: JobId, no_room: NoRoom) {
         let Some(capacity) = &self.inner.env.capacity else {
             return;
         };
@@ -630,7 +624,7 @@ impl TorrentService {
 
     // The torrent waits for room no longer: room was made, its user
     // resumed it, its run ended, or it is gone.
-    pub(super) fn end_disk_wait(&self, job_id: JobId, torrent: Option<&mut Live>) {
+    pub fn end_disk_wait(&self, job_id: JobId, torrent: Option<&mut Live>) {
         if let Some(torrent) = torrent {
             torrent.disk_held = None;
         }

@@ -63,7 +63,7 @@ use weaver_torrent::{
 // alone: an NZB job's harvest reads no rule, a torrent under another rule or
 // none gets only the global list, and nothing writes a rule's passwords to
 // the global list.
-pub(super) fn torrent_archive_passwords(
+pub fn torrent_archive_passwords(
     rule: Option<&TrackerRule>,
     global: &[ArchivePasswordCandidate],
 ) -> Vec<ArchivePasswordCandidate> {
@@ -84,9 +84,9 @@ pub(super) fn torrent_archive_passwords(
 }
 
 // A torrent's place in its session.
-pub(super) struct Attached {
-    pub(super) session: Arc<Session>,
-    pub(super) handle: Arc<ManagedTorrent>,
+pub struct Attached {
+    pub session: Arc<Session>,
+    pub handle: Arc<ManagedTorrent>,
     // The terms the session took it under.
     pub(super) terms: PeerTerms,
     // The certificate an SSL torrent was given from its rule.
@@ -162,7 +162,7 @@ struct Joining {
 
 impl TorrentService {
     // Everything but the tick, every stored torrent read before it ends.
-    pub(crate) async fn open(&self) -> Result<(), String> {
+    pub async fn open(&self) -> Result<(), String> {
         let through = self.begin()?;
         self.load(through).await?;
         self.after_load().await;
@@ -191,8 +191,8 @@ impl TorrentService {
     }
 
     // The stored torrents read, with no task of a start begun.
-    #[cfg(test)]
-    pub(super) async fn restore(&self) -> Result<(), String> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn restore(&self) -> Result<(), String> {
         self.load_rules()?;
         let through = self.inner.db.last_torrent_job().map_err(state_error)?;
         self.inner.snapshot.unready();
@@ -212,7 +212,7 @@ impl TorrentService {
 
     // The archive passwords a graph built for `torrent` now takes. One
     // already extracting keeps the list it started with.
-    pub(super) fn archive_passwords(
+    pub fn archive_passwords(
         &self,
         torrent: &Live,
         global: &[ArchivePasswordCandidate],
@@ -222,7 +222,7 @@ impl TorrentService {
 
     // The archive passwords every torrent may try, as the settings give
     // them now.
-    pub(super) fn global_passwords(&self) -> Arc<[ArchivePasswordCandidate]> {
+    pub fn global_passwords(&self) -> Arc<[ArchivePasswordCandidate]> {
         self.inner
             .db
             .global_archive_password_candidates()
@@ -428,7 +428,7 @@ impl TorrentService {
     // whose directory cannot be made ready refuses at once, for why. Rows
     // this build cannot read are no checkpoint; a read the database failed
     // holds a restore, and starts a new torrent's tee fresh.
-    pub(super) fn tee<W>(
+    pub fn tee<W>(
         &self,
         job_id: JobId,
         layout: &Arc<PieceLayout>,
@@ -567,7 +567,7 @@ impl TorrentService {
 
     // Where a torrent's bytes in memory are counted: the accountant every
     // job shares, under the torrent's namespace.
-    pub(super) fn resident(&self, job_id: JobId) -> Holds {
+    pub fn resident(&self, job_id: JobId) -> Holds {
         Holds {
             accountant: Arc::clone(&self.inner.env.accountant),
             namespace: weaver_graph::holds::HoldsNamespace {
@@ -746,8 +746,8 @@ impl TorrentService {
 
     // Once no restore pass runs: what a test waits on after a tick to read
     // the jobs that tick restored.
-    #[cfg(test)]
-    pub(crate) async fn restored(&self) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn restored(&self) {
         self.inner
             .restores
             .subscribe()
@@ -760,7 +760,7 @@ impl TorrentService {
     // only, each restored from its checkpoint, RESTORES_AT_ONCE at a time,
     // in the order of their job ids. A torrent reads as it was kept, its
     // restore shown, until its job is back.
-    pub(super) async fn restore_jobs(&self) {
+    pub async fn restore_jobs(&self) {
         let waiting: Vec<JobId> = self
             .inner
             .live
@@ -810,7 +810,7 @@ impl TorrentService {
     // to the torrent if it still waits: one removed meanwhile drops it. A
     // restore that panics is a checkpoint that does not restore. Whether it
     // gave the torrent its job, unheld, so it may attach now.
-    pub(super) async fn restore_job(&self, job_id: JobId) -> bool {
+    pub async fn restore_job(&self, job_id: JobId) -> bool {
         self.restore_job_with(job_id, None, None).await
     }
 
@@ -1001,7 +1001,7 @@ impl TorrentService {
     // why, until a resume takes its marker. Its marker is read under the
     // torrent's lock, which a resume takes after the marker, so a resume
     // is never undone. Whether the torrent waits for a resume.
-    pub(super) async fn park(&self, job_id: JobId) -> bool {
+    pub async fn park(&self, job_id: JobId) -> bool {
         let mut live = self.inner.live.lock().await;
         let Some(why) = self.crashed(job_id) else {
             return false;
@@ -1032,7 +1032,7 @@ impl TorrentService {
     // they hear one torrent; otherwise the fetch's trackers are let go,
     // which sends them `stopped`, and the run starts its own.
     // Returns the route whose session did not open for it, and why.
-    pub(super) async fn attach(
+    pub async fn attach(
         &self,
         job_id: JobId,
         fetched: Option<Fetched>,
@@ -1619,7 +1619,7 @@ impl TorrentService {
     // it is behind the job, and what changed in its ledger and peers taken
     // before the session lets it go. Its tee stays with it, and writes its
     // own checkpoint when that is due, as it does in a session.
-    pub(super) async fn detach(&self, torrent: &mut Live) {
+    pub async fn detach(&self, torrent: &mut Live) {
         self.leave(torrent, false).await;
     }
 
@@ -1797,7 +1797,7 @@ impl TorrentService {
     }
 
     // The read `resume_load` begins, when there is one to begin.
-    pub(super) fn resumed_load(&self) -> Option<impl Future<Output = ()> + Send + 'static> {
+    pub fn resumed_load(&self) -> Option<impl Future<Output = ()> + Send + 'static> {
         let through = {
             let mut marks = locked(&self.inner.load_marks);
             if marks.fault.is_none() || marks.resuming {
@@ -1991,7 +1991,7 @@ impl TorrentService {
     // A read of torrents the load has not reached, begun: counted under
     // the lock the load ends under, with how far the load reads. None once
     // the load has ended.
-    pub(super) fn reader(&self) -> Option<(Reader, JobId)> {
+    pub fn reader(&self) -> Option<(Reader, JobId)> {
         let mut marks = locked(&self.inner.load_marks);
         let Load::Running(Some(through)) = *self.inner.load.borrow() else {
             return None;
@@ -2040,7 +2040,7 @@ impl TorrentService {
     // Of `wanted`, the torrents no asker is reading are left in it and
     // claimed, this asker's to read until the claim is dropped; the others
     // are given with what tells that their read has ended.
-    pub(super) fn claim(
+    pub fn claim(
         &self,
         wanted: &mut Vec<(JobId, u64)>,
     ) -> (Claim, Vec<(JobId, u64, watch::Receiver<bool>)>) {
@@ -2075,7 +2075,7 @@ impl TorrentService {
     // the page when they fail. One torrent's part that does not read is
     // said, and that torrent goes on without it: its pieces and seed-mode
     // pieces are then read again, each by the one it is for.
-    pub(super) async fn read_page(&self, jobs: Vec<JobId>) -> Result<Page, String> {
+    pub async fn read_page(&self, jobs: Vec<JobId>) -> Result<Page, String> {
         let service = self.clone();
         tokio::task::spawn_blocking(move || {
             let rows = service
@@ -2224,7 +2224,7 @@ impl TorrentService {
     // unpacks, where neither was kept before, are written for the page in
     // one go, and what they hold is spelled as the filesystem spells it,
     // off the runtime.
-    pub(super) async fn take_page(&self, page: Page) {
+    pub async fn take_page(&self, page: Page) {
         let mut then = Vec::new();
         let mut unheld = Vec::new();
         let mut unpacks = Vec::new();
@@ -2526,7 +2526,7 @@ fn adopt_placed(
 // Why a torrent has no store: one that cannot be made fails the torrent,
 // and one whose checkpoint the database did not give waits to be tried
 // again.
-pub(super) enum Unmade<W> {
+pub enum Unmade<W> {
     Fails(String),
     Waits(W),
 }
@@ -2541,7 +2541,7 @@ type Hold<W> = fn(String) -> Result<W, String>;
 // though it had a checkpoint, and the pieces its files no longer gave.
 // Said where the restore is awaited, so the line goes where the caller's
 // lines go.
-pub(super) enum Note {
+pub enum Note {
     Unread(String),
     Unrestored(String),
     Dropped { pieces: u32, error: String },
@@ -2592,11 +2592,11 @@ impl Note {
 // would take it past 32 MiB, so it holds 32 MiB of stored metainfo or one
 // torrent's, whichever is more, with what parsing makes of it.
 const LOAD_PAGE: usize = 64;
-pub(super) const LOAD_PAGE_BYTES: u64 = 32 * 1024 * 1024;
+pub const LOAD_PAGE_BYTES: u64 = 32 * 1024 * 1024;
 
 // `sized` in pages of `rows` torrents and `LOAD_PAGE_BYTES` at most, a
 // torrent larger than that a page alone.
-pub(super) fn pages(sized: &[(JobId, u64)], rows: usize) -> Vec<Vec<JobId>> {
+pub fn pages(sized: &[(JobId, u64)], rows: usize) -> Vec<Vec<JobId>> {
     let mut pages: Vec<Vec<JobId>> = Vec::new();
     let mut bytes = 0u64;
     for &(job_id, size) in sized {
@@ -2616,7 +2616,7 @@ pub(super) fn pages(sized: &[(JobId, u64)], rows: usize) -> Vec<Vec<JobId>> {
 
 // A read of torrents the load had not reached, in flight: while one is,
 // the torrents taken out are kept as gone, though the load ends.
-pub(super) struct Reader {
+pub struct Reader {
     service: TorrentService,
 }
 
@@ -2632,10 +2632,10 @@ impl Drop for Reader {
 
 // The torrents one asker reads now: theirs until this is dropped, which
 // tells those waiting for one that its read has ended.
-pub(super) struct Claim {
+pub struct Claim {
     service: TorrentService,
     jobs: Vec<JobId>,
-    pub(super) ended: watch::Sender<bool>,
+    pub ended: watch::Sender<bool>,
 }
 
 impl Drop for Claim {
@@ -2651,7 +2651,7 @@ impl Drop for Claim {
 }
 
 // A page of stored torrents read.
-pub(super) struct Page {
+pub struct Page {
     read: Vec<Read>,
 }
 

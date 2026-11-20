@@ -60,7 +60,7 @@ fn edited(
 }
 
 // `trackers` without those whose URL is one of `urls`, trimmed.
-pub(super) fn without_urls(mut trackers: Vec<TrackerEntry>, urls: &[String]) -> Vec<TrackerEntry> {
+pub fn without_urls(mut trackers: Vec<TrackerEntry>, urls: &[String]) -> Vec<TrackerEntry> {
     let gone: HashSet<&str> = urls.iter().map(|url| url.trim()).collect();
     trackers.retain(|tracker| !gone.contains(tracker.url.as_str()));
     trackers
@@ -68,10 +68,7 @@ pub(super) fn without_urls(mut trackers: Vec<TrackerEntry>, urls: &[String]) -> 
 
 // Each of `trackers` as whoever first named its URL in `listed`, and as the
 // operator when `listed` does not name it.
-pub(super) fn named_as_listed(
-    listed: &[TrackerEntry],
-    trackers: Vec<TrackerEntry>,
-) -> Vec<TrackerEntry> {
+pub fn named_as_listed(listed: &[TrackerEntry], trackers: Vec<TrackerEntry>) -> Vec<TrackerEntry> {
     let mut named: HashMap<&str, NamedBy> = HashMap::with_capacity(listed.len());
     for known in listed {
         named.entry(known.url.as_str()).or_insert(known.named_by);

@@ -75,8 +75,8 @@ impl OwedRow {
 }
 
 // A write of what changed in a torrent's ledger and peers.
-pub(super) struct Resume {
-    pub(super) counters: Option<TorrentCounters>,
+pub struct Resume {
+    pub counters: Option<TorrentCounters>,
     pub(super) peers: Option<ResumePeers>,
     pub(super) lost: Arc<AtomicBool>,
 }
@@ -125,7 +125,7 @@ pub(super) fn take_checkpoint(torrent: &mut Live, now: i64) -> Option<Checkpoint
 }
 
 // A write of a torrent's ledger and peers, queued.
-pub(super) struct Landing {
+pub struct Landing {
     job_id: JobId,
     landed: oneshot::Receiver<Result<bool, StateError>>,
     lost: Arc<AtomicBool>,
@@ -135,7 +135,7 @@ impl TorrentService {
     // Write the checkpoints of `jobs`: each torrent's pieces with its
     // ledger. A tee checkpoints its job on its own, as a job of the
     // pipeline's does, once the bytes it took or their age make a write due.
-    pub(super) async fn save_checkpoints(&self, jobs: BTreeSet<JobId>) {
+    pub async fn save_checkpoints(&self, jobs: BTreeSet<JobId>) {
         let now = self.inner.clock.unix_ms();
         let saves: Vec<CheckpointSave> = {
             let mut live = self.inner.live.lock().await;
@@ -184,7 +184,7 @@ impl TorrentService {
     // Wait for a write of a torrent's ledger and peers to land. One that
     // failed leaves what the database holds unknown, so the next writes
     // all of it.
-    pub(super) async fn landed(&self, landing: Option<Landing>) -> Result<(), String> {
+    pub async fn landed(&self, landing: Option<Landing>) -> Result<(), String> {
         let Some(Landing {
             job_id,
             landed,
@@ -300,7 +300,7 @@ impl TorrentService {
     // it waits on the job, which an intake writing to disk may hold. Its
     // write goes at once when `force`, a stop's, once every object out for
     // its work is back; otherwise once it is due.
-    pub(super) async fn checkpoint_tee(&self, job_id: JobId, tee: Arc<Tee>, force: bool) {
+    pub async fn checkpoint_tee(&self, job_id: JobId, tee: Arc<Tee>, force: bool) {
         let queued = tokio::task::spawn_blocking(move || {
             if force {
                 tee.checkpoint_stopped()

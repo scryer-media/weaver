@@ -2342,5 +2342,8 @@ fn release_slots(db: &Database, gone: impl Fn(&str) -> bool) -> Result<(), State
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod fakes;
 #[cfg(test)]
 pub(crate) mod tests;

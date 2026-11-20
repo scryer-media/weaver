@@ -48,6 +48,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
+weaver-server-torrents = { path = ".", features = ["test-support"] }
 weaver-server-pipeline = { path = "../weaver-server-pipeline", features = ["pipeline-test-fixtures"] }
 weaver-server-orchestration = { path = "../weaver-server-orchestration", features = ["test-support"] }
 weaver-server-torrent-store = { path = "../weaver-server-torrent-store", features = ["test-support"] }

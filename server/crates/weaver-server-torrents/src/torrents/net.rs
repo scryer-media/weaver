@@ -1086,8 +1086,12 @@ pub(crate) const LOOPBACK_DEVICE: &str = if cfg!(target_os = "linux") {
 };
 
 // A leg on the host's own sockets.
-#[cfg(test)]
-pub(crate) fn system_dialer() -> Arc<dyn Dialer> {
+#[cfg(any(test, feature = "test-support"))]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a test's own leg: the host's egress, for the session fakes' loopback fixtures"
+)]
+pub fn system_dialer() -> Arc<dyn Dialer> {
     Arc::new(weaver_tunnel::pipe::Revocable::new(Arc::new(
         weaver_tunnel::pipe::Egress::new(
             4,

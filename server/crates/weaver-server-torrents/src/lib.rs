@@ -25,10 +25,7 @@ use weaver_server_orchestration::{bandwidth, history, ingest, servers};
 use weaver_server_pipeline::{SchedulerHandle, jobs, pipeline, settings};
 
 #[cfg(test)]
-use weaver_server_composition::{
-    ArchiveHistoryOutcome, ArchiveHistoryResult, JobHistoryRow, PipelineMetrics, RssSeenDecision,
-    schema_migrations,
-};
+use weaver_server_composition::{PipelineMetrics, RssSeenDecision};
 #[cfg(test)]
 use weaver_server_orchestration::{rss, watch_folder};
 #[cfg(test)]

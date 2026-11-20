@@ -54,7 +54,7 @@ mod tests;
 // post's files all go, once a name says a file is a container volume; none
 // otherwise, as for most torrents.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Plan {
+pub struct Plan {
     volumes: Vec<Option<VolumeIndex>>,
     // The longest article a share is cut into: no cut, one article per
     // share, unless the torrent writes its pieces block by block, when a
@@ -141,7 +141,7 @@ impl Plan {
         cut
     }
 
-    pub(crate) fn of(layout: &PieceLayout) -> Option<Self> {
+    pub fn of(layout: &PieceLayout) -> Option<Self> {
         let names: Vec<&str> = layout.files().map(|file| file.name.as_str()).collect();
         let listed: Vec<Option<Listed>> = layout
             .files()
@@ -168,7 +168,7 @@ impl Plan {
     }
 
     // The volume the file is, if it goes to the graph.
-    pub(crate) fn volume(&self, file: usize) -> Option<VolumeIndex> {
+    pub fn volume(&self, file: usize) -> Option<VolumeIndex> {
         self.volumes.get(file).copied().flatten()
     }
 
@@ -219,7 +219,7 @@ impl Plan {
     }
 }
 
-pub(crate) struct Tee {
+pub struct Tee {
     job: Mutex<GraphJob>,
     layout: Arc<PieceLayout>,
     plan: Plan,
@@ -266,10 +266,10 @@ pub(crate) struct Tee {
     disk_wait: Mutex<Option<DiskWaitOf>>,
     // Counts the checkpoints asked of the job, each before it waits on the
     // job's lock.
-    #[cfg(test)]
-    pub(crate) asked: tokio::sync::watch::Sender<u64>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub asked: tokio::sync::watch::Sender<u64>,
     // Counts the words on the job's clock, taken.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     clocked: tokio::sync::watch::Sender<u64>,
 }
 
@@ -316,7 +316,7 @@ pub(crate) struct Reading {
     pub(crate) holds: super::intake::Holds,
     bell: Arc<RoomBell>,
     // The most resident and scratch memory read-backs held at once.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) peaks: Arc<Peaks>,
 }
 
@@ -329,7 +329,7 @@ impl Reading {
             scratch,
             holds,
             bell: Arc::default(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             peaks: Arc::default(),
         }
     }
@@ -404,7 +404,7 @@ impl RoomBell {
 // has this id.
 const READ_BACK_OWNER: u32 = u32::MAX;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Default, Debug)]
 pub(crate) struct Peaks {
     pub(crate) resident: std::sync::atomic::AtomicU64,
@@ -415,7 +415,7 @@ pub(crate) struct Peaks {
     pub(crate) fallbacks: std::sync::atomic::AtomicU64,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Peaks {
     fn add(now: &std::sync::atomic::AtomicU64, peak: &std::sync::atomic::AtomicU64, bytes: u64) {
         use std::sync::atomic::Ordering;
@@ -429,13 +429,13 @@ impl Peaks {
 struct Resident {
     holds: super::intake::Holds,
     bell: Arc<RoomBell>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     peaks: Arc<Peaks>,
 }
 
 impl weaver_torrent::storage::GivesRoomBack for Resident {
     fn give_back(&self, bytes: u64) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         self.peaks
             .resident
             .fetch_sub(bytes, std::sync::atomic::Ordering::AcqRel);
@@ -465,7 +465,7 @@ struct Leased {
     // Always there until dropped.
     lease: Option<weaver_server_disk::scratch::Lease>,
     bell: Arc<RoomBell>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     peaks: Arc<Peaks>,
 }
 
@@ -478,7 +478,7 @@ impl AsRef<[u8]> for Leased {
 impl Drop for Leased {
     fn drop(&mut self) {
         let lease = self.lease.take();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         self.peaks.scratch.fetch_sub(
             lease.as_ref().map_or(0, |lease| lease.len() as u64),
             std::sync::atomic::Ordering::AcqRel,
@@ -589,9 +589,9 @@ impl Tee {
             stopped: std::sync::atomic::AtomicBool::new(false),
             disk_ticket: std::sync::atomic::AtomicU64::new(NO_TICKET),
             disk_wait: Mutex::new(None),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             asked: tokio::sync::watch::Sender::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             clocked: tokio::sync::watch::Sender::new(0),
         });
         tokio::spawn(hear(Arc::downgrade(&tee), heard_words));
@@ -758,14 +758,14 @@ impl Tee {
 
     // The count of the words for the job taken so far, which moves with
     // each one.
-    #[cfg(test)]
-    pub(crate) fn taken(&self) -> tokio::sync::watch::Receiver<u64> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn taken(&self) -> tokio::sync::watch::Receiver<u64> {
         self.heard.subscribe()
     }
 
     // The count of the words on the job's clock taken so far.
-    #[cfg(test)]
-    pub(crate) fn clocked(&self) -> tokio::sync::watch::Receiver<u64> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn clocked(&self) -> tokio::sync::watch::Receiver<u64> {
         self.clocked.subscribe()
     }
 
@@ -794,7 +794,7 @@ impl Tee {
     // paused, and running again once neither is.
     fn held_clock(&self, (all, own): (bool, bool)) {
         self.locked().hold_clock(all || own);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         self.clocked.send_modify(|clocked| *clocked += 1);
         self.heard.send_modify(|heard| *heard += 1);
     }
@@ -832,7 +832,7 @@ impl Tee {
         }
     }
 
-    pub(crate) fn with<T>(&self, look: impl FnOnce(&mut GraphJob) -> T) -> T {
+    pub fn with<T>(&self, look: impl FnOnce(&mut GraphJob) -> T) -> T {
         look(&mut self.locked())
     }
 
@@ -842,7 +842,7 @@ impl Tee {
     // other torrent's step waits on. A slot the step gave back may go to a
     // job that waited for it: that job is marked, and the service lends for
     // it. A step that fails is kept as the job's failure.
-    pub(crate) fn step<T>(
+    pub fn step<T>(
         &self,
         limit: usize,
         step: impl FnOnce(&mut GraphJob, &mut RepairSlots, usize) -> Result<T, GraphError>,
@@ -988,7 +988,7 @@ impl Tee {
     // shares only when they are free: held by another torrent's step, the
     // lend is left to the service's next settle, which this marks. One
     // torrent's commit never waits on another's.
-    pub(crate) fn deliver(&self, piece: u32, held: &Bytes) -> bool {
+    pub fn deliver(&self, piece: u32, held: &Bytes) -> bool {
         self.take_shares(|job| {
             self.unsettled(job, piece)
                 .into_iter()
@@ -1071,7 +1071,7 @@ impl Tee {
         if let Ok(mut lease) = reading.scratch.allocate(READ_BACK_OWNER, total as usize) {
             // The lease holds the bytes: the piece's room is not needed.
             drop(room);
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             Peaks::add(
                 &reading.peaks.scratch,
                 &reading.peaks.scratch_peak,
@@ -1093,7 +1093,7 @@ impl Tee {
             let bytes = Bytes::from_owner(Leased {
                 lease: Some(lease),
                 bell: Arc::clone(&reading.bell),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 peaks: Arc::clone(&reading.peaks),
             });
             return Ok(self.take_shares(|_| {
@@ -1104,7 +1104,7 @@ impl Tee {
                     .collect()
             }));
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         reading
             .peaks
             .fallbacks
@@ -1180,14 +1180,14 @@ impl Tee {
             Reserve::Granted => {}
             Reserve::Breached(_) => return None,
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         Peaks::add(&reading.peaks.resident, &reading.peaks.resident_peak, bytes);
         Some(HeldRoom::new(
             bytes,
             Arc::new(Resident {
                 holds: holds.clone(),
                 bell: Arc::clone(&reading.bell),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 peaks: Arc::clone(&reading.peaks),
             }),
         ))
@@ -1391,7 +1391,7 @@ impl Tee {
 
     // Done: every share in or ruled lost, everything unpacked, and every
     // file at its name.
-    pub(crate) fn done(&self) -> bool {
+    pub fn done(&self) -> bool {
         let job = self.locked();
         job.phase() == RootPhase::Done && !job.moves_waiting()
     }
@@ -1433,9 +1433,9 @@ impl Tee {
 
     // Checkpoint the job as it stands, its change queued for the database
     // at once when `force`, and otherwise once its write is due.
-    pub(crate) fn checkpoint(&self, force: bool) -> Result<(), WriteError> {
+    pub fn checkpoint(&self, force: bool) -> Result<(), WriteError> {
         let _job = JobScope::enter(self.job_id);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         self.asked.send_modify(|asked| *asked += 1);
         self.checkpoint_locked(&mut self.locked(), force)
     }
@@ -1447,7 +1447,7 @@ impl Tee {
     // checkpoint is owed meanwhile, so nothing more goes out.
     pub(crate) fn checkpoint_stopped(&self) -> Result<(), WriteError> {
         let _job = JobScope::enter(self.job_id);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         self.asked.send_modify(|asked| *asked += 1);
         let mut heard = self.heard.subscribe();
         loop {

@@ -7292,6 +7292,7 @@ dependencies = [
  "weaver-server-settings",
  "weaver-server-speedtest",
  "weaver-server-torrent-store",
+ "weaver-server-torrents",
  "weaver-torrent",
  "weaver-tunnel",
  "zip",

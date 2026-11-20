@@ -189,7 +189,7 @@ impl TorrentSettings {
     // The scope whose route a torrent takes: its tracker rule's when the
     // rule routes its torrents itself, else its category's when that does,
     // else the default.
-    pub(super) fn scope(&self, id: Option<u32>, rule: Option<&TrackerRule>) -> TorrentScope {
+    pub fn scope(&self, id: Option<u32>, rule: Option<&TrackerRule>) -> TorrentScope {
         self.levels(&SCOPE, None, id, rule)
             .resolve()
             .unwrap_or(TorrentScope::Default)
@@ -243,7 +243,7 @@ impl TorrentSettings {
     // Whether the torrent's archives would be extracted were its job built
     // now: its own value, else its tracker rule's, else its category's,
     // else the global one.
-    pub(super) fn unpack(&self, record: &TorrentRecord, rule: Option<&TrackerRule>) -> bool {
+    pub fn unpack(&self, record: &TorrentRecord, rule: Option<&TrackerRule>) -> bool {
         self.of_torrent(&UNPACK, record, rule)
             .resolve()
             .unwrap_or(false)
@@ -314,7 +314,7 @@ impl WindDown {
 
 // Where a wind-down is kept, so a restart while torrents end keeps ending
 // them instead of stopping them or running them on.
-pub(super) const WIND_DOWN_KEY: &str = "torrent.wind_down";
+pub const WIND_DOWN_KEY: &str = "torrent.wind_down";
 
 /// Whether there are torrents, as last published: any torrent job, and any
 /// torrent not paused or stopped.
@@ -377,7 +377,7 @@ impl TorrentService {
         Ok(())
     }
 
-    pub(super) fn load_rules(&self) -> Result<(), String> {
+    pub fn load_rules(&self) -> Result<(), String> {
         let rules = self.inner.db.list_tracker_rules().map_err(state_error)?;
         *self
             .inner
@@ -527,7 +527,7 @@ impl TorrentService {
     /// Open sessions at start as the settings and a kept wind-down say: a
     /// wind-down a restart cut short goes on; one kept while torrents are
     /// on is dropped.
-    pub(crate) async fn turn_at_start(&self, enabled: bool) {
+    pub async fn turn_at_start(&self, enabled: bool) {
         let db = self.inner.db.clone();
         let stored = match tokio::task::spawn_blocking(move || db.get_setting(WIND_DOWN_KEY)).await
         {
@@ -582,7 +582,7 @@ impl TorrentService {
     // While torrents are on the tick runs, putting each torrent in its
     // route's session; while they are off every torrent is out of its
     // session, held off.
-    pub(super) async fn run(&self, on: bool) {
+    pub async fn run(&self, on: bool) {
         if on {
             // While the stored torrents are still being read no tick runs:
             // the load starts it once the last is in, as the sessions

@@ -89,7 +89,7 @@ impl TorrentService {
     // a session's leg was revoked, so it opens again at once, or the routes
     // took a saved configuration, so a route held down or failing opens
     // again on it at once.
-    pub(crate) async fn woken(&self, reloads: &mut Option<watch::Receiver<u64>>) {
+    pub async fn woken(&self, reloads: &mut Option<watch::Receiver<u64>>) {
         tokio::select! {
             () = self.inner.settings_changed.notified() => {}
             () = self.inner.sessions.revoked() => {}
@@ -158,8 +158,8 @@ impl TorrentService {
     // unpacked when it has a tee, completes.
     // A tee whose moves wait on a checkpoint has it written, and a torrent
     // whose pieces fell [`CHECKPOINT_PIECES`] behind has them written.
-    pub(super) async fn settle(&self) {
-        #[cfg(test)]
+    pub async fn settle(&self) {
+        #[cfg(any(test, feature = "test-support"))]
         self.inner
             .settling
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -260,7 +260,7 @@ impl TorrentService {
                 self.publish_job(job_id).await;
             }
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         {
             self.inner
                 .settling
@@ -418,7 +418,7 @@ impl TorrentService {
     // session its route no longer runs moves to the one it does. A magnet
     // fetching on a session its route no longer runs, or on a route gone
     // down, ends that fetch and fetches again on its route as it stands.
-    pub(super) async fn follow_routes(&self) {
+    pub async fn follow_routes(&self) {
         let now = self.inner.clock.unix_ms();
         let settings = self.settings();
         let rules = self.rules();
@@ -1049,14 +1049,14 @@ impl TorrentService {
     // asks the route's session to open (`planned`), so a session opening
     // or opened for a torrent is never taken for idle. The sessions' lock
     // is only ever taken inside the torrents', never around it.
-    pub(super) async fn drop_idle_sessions(&self) {
+    pub async fn drop_idle_sessions(&self) {
         {
             let live = self.inner.live.lock().await;
             let used: BTreeSet<&RouteKey> = live
                 .values()
                 .filter_map(|torrent| torrent.route.as_ref())
                 .collect();
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             self.sweep_seam().await;
             for view in self.inner.sessions.views().await {
                 if !used.contains(&view.key) {
@@ -1077,7 +1077,7 @@ impl TorrentService {
 
     // While a test holds the sweep of idle sessions, it waits here, and
     // says it reached the hold.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     async fn sweep_seam(&self) {
         let mut held = self.inner.sweep_held.subscribe();
         if !*held.borrow_and_update() {
@@ -1089,14 +1089,14 @@ impl TorrentService {
 
     /// Hold the sweep of idle sessions once it has read the routes the
     /// torrents use, before it reads the sessions, or let it go.
-    #[cfg(test)]
-    pub(crate) fn hold_sweep(&self, held: bool) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hold_sweep(&self, held: bool) {
         self.inner.sweep_held.send_replace(held);
     }
 
     /// Counts the sweeps of idle sessions that reached a test's hold.
-    #[cfg(test)]
-    pub(crate) fn sweeps_held(&self) -> watch::Receiver<u64> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn sweeps_held(&self) -> watch::Receiver<u64> {
         self.inner.sweeps_held.subscribe()
     }
 }
@@ -1117,11 +1117,11 @@ async fn reloaded(reloads: &mut Option<watch::Receiver<u64>>) {
 // their bytes out of the side store and then takes the levels, and the
 // levels asked for while it runs, which it takes after (libtorrent
 // `torrent::m_deferred_file_priorities`, torrent.cpp:5803-5807 at v2.0.15).
-pub(super) struct Leveling {
-    pub(super) task: Option<tokio::task::JoinHandle<()>>,
+pub struct Leveling {
+    pub task: Option<tokio::task::JoinHandle<()>>,
     // The levels the job takes, as stored.
     pub(super) asked: Vec<FilePriority>,
-    pub(super) next: Option<Vec<FilePriority>>,
+    pub next: Option<Vec<FilePriority>>,
     // The place `asked`, stored before its copy, took at the end of the
     // download queue when it stored the torrent short of complete again.
     pub(super) reopened: Option<i64>,

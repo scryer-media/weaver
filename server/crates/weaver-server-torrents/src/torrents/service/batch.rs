@@ -708,7 +708,7 @@ impl TorrentService {
     //
     // Asked for while the stored torrents are still being read, the moves
     // are kept and made once the last is in, among all of them.
-    pub(super) async fn move_many(&self, moves: &[(JobId, QueueMoveTarget)]) -> Outcome {
+    pub async fn move_many(&self, moves: &[(JobId, QueueMoveTarget)]) -> Outcome {
         self.ensure(&moves.iter().map(|(job_id, _)| *job_id).collect::<Vec<_>>())
             .await;
         {
@@ -847,8 +847,8 @@ fn failed(mut outcome: Outcome, job_ids: &[JobId], error: &StateError) -> Outcom
 // another changes it, each move as `splice_job_order` makes it. Each
 // torrent's index is kept, so a move costs the places it moves over, not
 // the length of the queue.
-pub(super) struct Spliced {
-    pub(super) order: Vec<JobId>,
+pub struct Spliced {
+    pub order: Vec<JobId>,
     at: HashMap<JobId, usize>,
     // The runs of slots that share a place, in order. Torrents in one run
     // keep the order a fresh read gives them: by job.
@@ -858,7 +858,7 @@ pub(super) struct Spliced {
 impl Spliced {
     // `order` sorted by place then job, with `places` the place of each
     // slot.
-    pub(super) fn new(order: Vec<JobId>, places: &[i64]) -> Self {
+    pub fn new(order: Vec<JobId>, places: &[i64]) -> Self {
         let at = order
             .iter()
             .enumerate()
@@ -881,7 +881,7 @@ impl Spliced {
 
     // Moves `job_id` to `target`; false when it did not move, or is not in
     // the order.
-    pub(super) fn splice(&mut self, job_id: JobId, target: QueueMoveTarget) -> bool {
+    pub fn splice(&mut self, job_id: JobId, target: QueueMoveTarget) -> bool {
         let Some(&current) = self.at.get(&job_id) else {
             return false;
         };

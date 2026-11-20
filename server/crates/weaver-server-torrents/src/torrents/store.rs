@@ -49,7 +49,7 @@ fn unwritten() -> io::Error {
 }
 
 use weaver_server_torrent_store::torrents::pieces::Have;
-pub(crate) use weaver_server_torrent_store::torrents::pieces::{Kept, has_files};
+pub use weaver_server_torrent_store::torrents::pieces::{Kept, has_files};
 
 // A move of a torrent's placed files is under way until this is dropped
 // (`TorrentStore::mid_move`).
@@ -70,7 +70,7 @@ pub(crate) struct Replayed {
     pub(crate) unread: Option<io::Error>,
 }
 
-pub(crate) struct TorrentStore {
+pub struct TorrentStore {
     layout: Arc<PieceLayout>,
     files: Files,
     // Shared with what follows a piece's writes on its writer.
@@ -101,7 +101,7 @@ pub(crate) struct TorrentStore {
     // Test seam: the next change of the files set aside fails before it
     // changes anything, as one that meets a piece on its way to the side
     // store does.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     relevel_fails: std::sync::atomic::AtomicBool,
 }
 
@@ -145,7 +145,7 @@ impl TorrentStore {
     // The store of a torrent whose files are under `files`, with the pieces
     // `kept` says it had, and the tee its archive files go to, if any. Its
     // pieces are written by `writes`.
-    pub(crate) fn new(
+    pub fn new(
         layout: Arc<PieceLayout>,
         files: Files,
         kept: Option<&Kept>,
@@ -164,7 +164,7 @@ impl TorrentStore {
             writes,
             moves: Mutex::default(),
             stamps: Mutex::default(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             relevel_fails: std::sync::atomic::AtomicBool::new(false),
         };
         *store.saved() = Some(store.kept());
@@ -200,7 +200,7 @@ impl TorrentStore {
 
     // A write of the pieces failed: what the database holds is unknown, so
     // the next checkpoint writes them.
-    pub(crate) fn lost_saved(&self) {
+    pub fn lost_saved(&self) {
         *self.saved() = None;
         // And the times went with them: they are taken again.
         self.have().all_written();
@@ -323,8 +323,8 @@ impl TorrentStore {
 
     // Holds off a change of which files are set aside while held, as a
     // piece's write or a read under way does.
-    #[cfg(test)]
-    pub(crate) fn hold_reads(&self) -> RwLockReadGuard<'_, Arc<Vec<bool>>> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hold_reads(&self) -> RwLockReadGuard<'_, Arc<Vec<bool>>> {
         self.aside()
     }
 
@@ -337,13 +337,13 @@ impl TorrentStore {
     }
 
     // Where its side store is, when it has one.
-    pub(crate) fn side_path(&self) -> Option<PathBuf> {
+    pub fn side_path(&self) -> Option<PathBuf> {
         self.side().path().map(Path::to_path_buf)
     }
 
     // The pieces its side store keeps.
-    #[cfg(test)]
-    pub(crate) fn side_pieces(&self) -> Vec<u32> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn side_pieces(&self) -> Vec<u32> {
         self.side().pieces()
     }
 
@@ -371,8 +371,8 @@ impl TorrentStore {
     }
 
     // The next `relevel` of this store fails before it changes anything.
-    #[cfg(test)]
-    pub(crate) fn fail_next_relevel(&self) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fail_next_relevel(&self) {
         self.relevel_fails
             .store(true, std::sync::atomic::Ordering::Release);
     }
@@ -386,7 +386,7 @@ impl TorrentStore {
     // v2.0.15). A copy that fails changes nothing: the bytes stay in the
     // side store, and the files set aside are as they were.
     pub(crate) fn relevel(&self, ignored: &[bool]) -> io::Result<()> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if self
             .relevel_fails
             .swap(false, std::sync::atomic::Ordering::AcqRel)
@@ -516,11 +516,11 @@ impl TorrentStore {
         &self.layout
     }
 
-    pub(crate) fn files(&self) -> &Files {
+    pub fn files(&self) -> &Files {
         &self.files
     }
 
-    pub(crate) fn tee(&self) -> Option<Arc<Tee>> {
+    pub fn tee(&self) -> Option<Arc<Tee>> {
         held_tee(&self.tee)
     }
 
@@ -535,14 +535,14 @@ impl TorrentStore {
             .take()
     }
 
-    pub(crate) fn has(&self, piece: u32) -> bool {
+    pub fn has(&self, piece: u32) -> bool {
         self.have()
             .pieces
             .get(piece as usize)
             .is_some_and(|bit| *bit)
     }
 
-    pub(crate) fn count(&self) -> u32 {
+    pub fn count(&self) -> u32 {
         self.have().count
     }
 
@@ -586,7 +586,7 @@ impl TorrentStore {
     }
 
     // The pieces to keep for the next run.
-    pub(crate) fn kept(&self) -> Kept {
+    pub fn kept(&self) -> Kept {
         let have = self.have();
         let mut bits = have.pieces.as_raw_slice().to_vec();
         // A piece waiting on its check is kept as it was: had, unless the
@@ -671,7 +671,7 @@ impl TorrentStore {
     }
 
     // Whether every file `wanted` names is had whole.
-    pub(crate) fn has_files(&self, wanted: impl Fn(usize) -> bool) -> bool {
+    pub fn has_files(&self, wanted: impl Fn(usize) -> bool) -> bool {
         has_files(&self.layout, &self.have().file_have, wanted)
     }
 

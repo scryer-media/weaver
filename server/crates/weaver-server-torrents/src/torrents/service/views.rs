@@ -433,7 +433,7 @@ impl TorrentService {
     // The torrents, as queue items, into the published queue, as rows into
     // the snapshot, and with their sessions as the tick last read them, as
     // the exporter reads them: one reading of each torrent.
-    pub(super) async fn publish(&self) {
+    pub async fn publish(&self) {
         let now = self.inner.clock.unix_ms();
         // Whether every stored torrent is here, taken before they are read.
         let every = self.whole().is_ok();
@@ -485,7 +485,7 @@ impl TorrentService {
     // reads the torrents that spoke, not every one (libtorrent posts a
     // state update for the torrents that changed). The exporter's reading
     // takes it at the next publish of every torrent.
-    pub(super) async fn publish_job(&self, job_id: JobId) {
+    pub async fn publish_job(&self, job_id: JobId) {
         let now = self.inner.clock.unix_ms();
         let stamp = self.inner.snapshot.stamp();
         let view = self.torrent(job_id).await;
@@ -556,7 +556,7 @@ impl TorrentService {
         self.view_of(settings, torrent, torrent.reading(now), now)
     }
 
-    pub(super) fn view_of(
+    pub fn view_of(
         &self,
         settings: &TorrentSettings,
         torrent: &Live,
@@ -1185,7 +1185,7 @@ fn job_infos(views: Vec<TorrentView>, now_ms: i64) -> Vec<JobInfo> {
         .collect()
 }
 
-pub(super) fn job_status(view: &TorrentView) -> JobStatus {
+pub fn job_status(view: &TorrentView) -> JobStatus {
     match view.state {
         TorrentState::Queued => JobStatus::Queued,
         TorrentState::FetchingMetadata => JobStatus::FetchingMetadata,

@@ -96,9 +96,16 @@ const LIFTED: &[(&str, usize)] = &[
     ),
     ("server/crates/weaver-server-torrents/src/lib.rs", 1),
     // A leg's clients, one built for each target and shape and kept for
-    // the leg.
+    // the leg; and the session fakes' leg on the host's own sockets, which
+    // only tests build.
     (
         "server/crates/weaver-server-torrents/src/torrents/net.rs",
+        2,
+    ),
+    // The torrent service's tests, moved out of the crate's own test build
+    // with the crate's test lift.
+    (
+        "server/crates/weaver-server-torrents/tests/torrents_service.rs",
         1,
     ),
     ("xtask/src/main.rs", 1),
@@ -117,6 +124,10 @@ const BLANKET_LIFTED: &[(&str, usize)] = &[
     ("server/crates/weaver-server-core/src/lib.rs", 1),
     ("server/crates/weaver-server-net-runtime/src/lib.rs", 1),
     ("server/crates/weaver-server-torrents/src/lib.rs", 1),
+    (
+        "server/crates/weaver-server-torrents/tests/torrents_service.rs",
+        1,
+    ),
 ];
 
 // Built here so this file never counts as a lift of the host name lookup

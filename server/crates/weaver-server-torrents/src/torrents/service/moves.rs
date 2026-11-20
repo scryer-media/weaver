@@ -413,7 +413,7 @@ impl TorrentService {
                 "the torrent was not moved: its pieces could not be set to check again ({error:#})"
             )));
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if forgot {
             let held = super::locked(&super::MOVE_FORGOT_HOLD).take();
             if let Some((reached, release)) = held {
@@ -473,7 +473,7 @@ impl TorrentService {
             let _mid_move = store.mid_move();
             db.set_torrent_made(job_id, &[], Some(&aside), true)
                 .map_err(not_begun)?;
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             if let Some(meets) = super::locked(&super::MOVE_BEGIN_MEETS).take() {
                 meets();
             }
@@ -495,15 +495,15 @@ impl TorrentService {
                 if !moved.kept.is_empty() {
                     store.unvouch();
                 }
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 if let Some(meets) = super::locked(&super::MOVE_RECORD_MEETS).take() {
                     meets();
                 }
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 if super::MOVE_RECORD_DIES.swap(false, std::sync::atomic::Ordering::AcqRel) {
                     panic!("the run ends here, as a crash would end it");
                 }
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 if super::MOVE_RECORD_FAILS.swap(false, std::sync::atomic::Ordering::AcqRel) {
                     return Err(StateError::Database("refused".to_owned()));
                 }
@@ -534,7 +534,7 @@ impl TorrentService {
                     &moved.held,
                     store.unvouched(),
                 );
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 if let Some(meets) = super::locked(&super::MOVE_RECORDED_MEETS).take() {
                     meets();
                 }
@@ -553,9 +553,9 @@ impl TorrentService {
                     },
                     dirs: adopted.dirs.clone(),
                 });
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 let refused = super::MOVE_UNDO_FAILS.swap(false, std::sync::atomic::Ordering::AcqRel);
-                #[cfg(not(test))]
+                #[cfg(not(any(test, feature = "test-support")))]
                 let refused = false;
                 let written = match refused {
                     true => Err(StateError::Database("refused".to_owned())),
@@ -908,7 +908,7 @@ impl TorrentService {
     // joins checks them, as it checks any torrent whose store vouches for
     // nothing.
     async fn check_kept(&self, job_id: JobId, store: &Arc<TorrentStore>) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         {
             let held = super::locked(&super::MOVE_CHECK_HOLD).take();
             if let Some((reached, release)) = held {
@@ -926,7 +926,7 @@ impl TorrentService {
                 let attached = torrent.attached.as_ref()?;
                 Some((Arc::clone(&attached.session), Arc::clone(&attached.handle)))
             });
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let attached =
             match super::MOVE_CHECK_FAILS.swap(false, std::sync::atomic::Ordering::AcqRel) {
                 true => {
@@ -1080,7 +1080,7 @@ impl Owed {
 
 // What a torrent's move takes.
 #[derive(Debug, Clone)]
-pub(super) enum Moving {
+pub enum Moving {
     // Its directory, to the directory claimed for it.
     Dir(PathBuf),
     // Its files placed outside its directory.

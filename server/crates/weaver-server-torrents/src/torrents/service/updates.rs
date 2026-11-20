@@ -136,7 +136,7 @@ impl TorrentUpdates {
 
 // What `rows` moved from `last`, by their prints, kept as the new `last`;
 // `None` when nothing did.
-pub(super) fn changes_of_rows(
+pub fn changes_of_rows(
     last: &mut Option<HashMap<JobId, u64>>,
     rows: &[Arc<TorrentRow>],
 ) -> Option<TorrentChanges> {
@@ -151,7 +151,7 @@ pub(super) fn changes_of_rows(
 
 // What `views` moved from `last` in the fields `parts` covers, kept as the
 // new `last`; `None` when nothing did.
-pub(super) fn changes(
+pub fn changes(
     last: &mut Option<HashMap<JobId, u64>>,
     views: Vec<TorrentView>,
     parts: ViewParts,

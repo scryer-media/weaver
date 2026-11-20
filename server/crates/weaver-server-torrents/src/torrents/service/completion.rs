@@ -4,7 +4,7 @@
 use super::moves::Moving;
 use super::policy::goal_met;
 use super::retire::{held_tops, resolved};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use super::{COMPLETION_FAILS, KEEP_FAILS, OUTPUT_MEETS, PLACE_PANICS, UNPACK_OVER_FAILS, locked};
 use super::{MemoryRelease, TorrentService, unpacking_dir, unplaced};
 use crate::StateError;
@@ -183,7 +183,7 @@ impl TorrentService {
             let placed = place_outputs(tee.work(), &dir, &listed, &spent, &kept, |from, to| {
                 move_output(&moves, from, to)
             });
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             assert!(
                 !PLACE_PANICS.swap(false, std::sync::atomic::Ordering::AcqRel),
                 "placing a torrent's unpacked files"
@@ -239,7 +239,7 @@ impl TorrentService {
         let (names, gone) = (placed.names.clone(), placed.gone.clone());
         let ending = end.clone();
         let recorded = self.queue_save(job_id, "finish_torrent_unpack", move |db| {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             if KEEP_FAILS.swap(false, std::sync::atomic::Ordering::AcqRel) {
                 return Err(StateError::Database("refused".to_owned()));
             }
@@ -410,7 +410,7 @@ impl TorrentService {
     // The directory a torrent's unpacking works in, marked the torrent's
     // job's as an NZB job's working directory is: `torrent-<id>`, or the
     // job's own suffixed name when an NZB job's marker holds that one.
-    pub(super) fn unpacking_dir(&self, job_id: JobId) -> PathBuf {
+    pub fn unpacking_dir(&self, job_id: JobId) -> PathBuf {
         unpacking_dir(&self.inner.env.work, job_id)
     }
 
@@ -463,7 +463,7 @@ impl TorrentService {
 
     // The job is done: its completion is written on its own, so an intent
     // written beside it keeps it, and the ledger and peers as they stand.
-    pub(super) async fn completed(&self, job_id: JobId) {
+    pub async fn completed(&self, job_id: JobId) {
         let now = self.inner.clock.unix_ms();
         let (landing, downloaded, finished) = {
             let mut live = self.inner.live.lock().await;
@@ -505,11 +505,11 @@ impl TorrentService {
                 self.inner.signal.want_pass();
             }
             self.inner.counters.event(TorrentEvent::Completed);
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             let refused = COMPLETION_FAILS
                 .swap(false, std::sync::atomic::Ordering::AcqRel)
                 .then(|| StateError::Database("refused".to_owned()));
-            #[cfg(not(test))]
+            #[cfg(not(any(test, feature = "test-support")))]
             let refused = None;
             let written = match refused {
                 Some(error) => Err(error),
@@ -585,7 +585,7 @@ impl TorrentService {
             .await;
         if matches!(marks, Ok(true)) {
             let marked = self.queue_save(job_id, "torrent_unpack_over", move |db| {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 if UNPACK_OVER_FAILS.swap(false, std::sync::atomic::Ordering::AcqRel) {
                     return Err(StateError::Database("refused".to_owned()));
                 }
@@ -626,7 +626,7 @@ pub(super) enum Placing {
 
 // The move every output is placed by: never over what is there.
 pub(super) fn move_output(moves: &JobMoves, from: &Path, to: &Path) -> std::io::Result<()> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(meets) = locked(&OUTPUT_MEETS).as_mut() {
         meets(to);
     }

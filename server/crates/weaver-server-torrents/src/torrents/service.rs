@@ -55,24 +55,28 @@ pub mod listing;
 mod scripts;
 pub mod snapshot;
 pub use scripts::ScriptDirs;
-mod batch;
+pub mod batch;
 mod checkpoints;
 mod completion;
-mod disk_room;
-mod intake;
-mod live;
-mod moves;
-mod policy;
-mod queue;
-mod restore;
-mod retire;
-mod settings;
-#[cfg(test)]
-mod tests;
+pub mod disk_room;
+pub mod intake;
+pub mod live;
+pub mod moves;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod old_tick;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod opened;
+pub mod policy;
+pub mod queue;
+pub mod restore;
+pub mod retire;
+pub mod settings;
 mod tick;
-mod trackers;
+pub mod trackers;
 pub mod updates;
-mod views;
+pub mod views;
 pub use batch::TorrentSetting;
 use checkpoints::Landing;
 pub use disk_room::disk_warning;
@@ -83,8 +87,6 @@ use live::{Live, Timed};
 #[cfg(test)]
 pub(in crate::torrents) use moves::{Listed, Moved, NotMoved, move_listed};
 use queue::QueueEnd;
-#[cfg(test)]
-pub(crate) use retire::{LiveHeld, finish_retiring, remove_history_files};
 #[cfg(test)]
 pub(in crate::torrents) use retire::{delete_written, deletion, listed_files};
 pub use settings::{
@@ -97,11 +99,9 @@ pub use views::{
     ClockFields, PeerKinds, RowParts, TorrentLeg, TorrentPieces, TorrentSupport, TorrentView,
     ViewClock,
 };
-#[cfg(test)]
-pub(crate) use weaver_server_torrent_store::torrents::metainfo::metainfo_is_private;
 
 // Why a magnet with no trackers is turned away on a route with no DHT.
-const NEEDS_DHT: &str = "a magnet with no trackers needs DHT, which this route does not carry";
+pub const NEEDS_DHT: &str = "a magnet with no trackers needs DHT, which this route does not carry";
 
 pub use batch::HISTORY_CHUNK;
 
@@ -123,7 +123,7 @@ pub const TIMES_EVERY_MS: i64 = 30 * 60_000;
 // How far into its TIMES_EVERY_MS period a torrent's times start. Job ids
 // are sequential, so the id is mixed first: torrents added one after
 // another land anywhere in the period, not in its first few seconds.
-pub(crate) fn times_offset_ms(job_id: JobId) -> i64 {
+pub fn times_offset_ms(job_id: JobId) -> i64 {
     let mut z = job_id.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
@@ -132,7 +132,7 @@ pub(crate) fn times_offset_ms(job_id: JobId) -> i64 {
 }
 
 // How many torrents' jobs are restored from their checkpoints at once.
-const RESTORES_AT_ONCE: usize = 8;
+pub const RESTORES_AT_ONCE: usize = 8;
 
 /// The most pieces a torrent's ledger goes without between ticks: once
 /// this many pieces reached its job, or left it, since the checkpoint was
@@ -223,7 +223,7 @@ fn identity_of(rule: Option<&TrackerRule>, own: &TorrentIdentity) -> Identity {
 // its levels resolve to where that is tighter. Each is a channel the
 // torrent's peers draw from beside the session's, as each peer class over a
 // libtorrent peer is (`bandwidth_manager::request_bandwidth`).
-fn ratelimits_of(record: &TorrentRecord, cap: Option<u64>) -> LimitsConfig {
+pub fn ratelimits_of(record: &TorrentRecord, cap: Option<u64>) -> LimitsConfig {
     LimitsConfig {
         upload_bps: limit_kind(record.upload_limit).tighter(limit_kind(cap)),
         download_bps: limit_kind(record.download_limit),
@@ -233,39 +233,39 @@ fn ratelimits_of(record: &TorrentRecord, cap: Option<u64>) -> LimitsConfig {
 /// What torrent jobs are built with.
 #[derive(Clone)]
 pub struct JobEnv {
-    pub(crate) accountant: Arc<HoldsAccountant>,
-    pub(crate) free_disk: CapacityReader,
+    pub accountant: Arc<HoldsAccountant>,
+    pub free_disk: CapacityReader,
     // The disks every job's writes are judged on, the pipeline's own: a
     // torrent whose write found no room waits on them for room as a usenet
     // job does. None with no pipeline, where a torrent in upload mode
     // tries again by itself.
-    pub(crate) capacity: Option<Arc<StorageCapacity>>,
+    pub capacity: Option<Arc<StorageCapacity>>,
     // Where every torrent's pieces are written: the volumes' writers the
     // pipeline writes through too.
-    pub(crate) disk: Arc<crate::torrents::writes::TorrentDisk>,
-    pub(crate) slots: usize,
-    pub(crate) limits: Arc<ExtractionLimits>,
+    pub disk: Arc<crate::torrents::writes::TorrentDisk>,
+    pub slots: usize,
+    pub limits: Arc<ExtractionLimits>,
     // The decode pool the pipeline's jobs share, and where a decode window
     // goes: under `work`, else in weaver's data folder.
-    pub(crate) decode: Arc<DecodePool>,
-    pub(crate) window_ledger: ScratchLedger,
-    pub(crate) data_dir: Option<(PathBuf, CapacityReader, ScratchLedger)>,
+    pub decode: Arc<DecodePool>,
+    pub window_ledger: ScratchLedger,
+    pub data_dir: Option<(PathBuf, CapacityReader, ScratchLedger)>,
     // Where the jobs' runs speak, where the database's word on their
     // checkpoints comes, and where a job joins to hear both.
-    pub(crate) mail: mpsc::Sender<Said>,
-    pub(crate) written: mpsc::UnboundedSender<Said>,
-    pub(crate) outside: Arc<Outside>,
+    pub mail: mpsc::Sender<Said>,
+    pub written: mpsc::UnboundedSender<Said>,
+    pub outside: Arc<Outside>,
     // Where a torrent's tee unpacks, each in a directory of its own.
-    pub(crate) work: PathBuf,
+    pub work: PathBuf,
     // The repair slots every torrent job shares, as the pipeline's jobs
     // share theirs.
-    pub(crate) repairs: Arc<Mutex<RepairSlots>>,
+    pub repairs: Arc<Mutex<RepairSlots>>,
     // With no pipeline to hear the mail, the mail itself, until the service
     // hears it in the pipeline's stead.
-    alone: Arc<Mutex<Option<RunMail>>>,
+    pub alone: Arc<Mutex<Option<RunMail>>>,
     // Where the scripts a torrent's job runs are told weaver keeps things,
     // as the pipeline tells its jobs' scripts.
-    pub(crate) script_dirs: ScriptDirs,
+    pub script_dirs: ScriptDirs,
 }
 
 impl JobEnv {
@@ -413,7 +413,7 @@ fn state_error(error: StateError) -> String {
 // `trackers` as a torrent lists them: by tier, in the order given within a
 // tier, each URL once where, and as whoever, first named it. A tracker that
 // is no URL is left out, as a session leaves it out.
-fn tidy_trackers(trackers: Vec<TrackerEntry>) -> Vec<TrackerEntry> {
+pub fn tidy_trackers(trackers: Vec<TrackerEntry>) -> Vec<TrackerEntry> {
     let mut tidy: Vec<TrackerEntry> = Vec::with_capacity(trackers.len());
     let mut seen: std::collections::HashSet<String> =
         std::collections::HashSet::with_capacity(trackers.len());
@@ -436,7 +436,7 @@ fn tidy_trackers(trackers: Vec<TrackerEntry>) -> Vec<TrackerEntry> {
 
 // `trackers` with each URL once in a tier, the first that names it kept, in
 // the order given: what the table's key over a tier and a URL keeps.
-fn once_a_tier(trackers: &[TrackerEntry]) -> Vec<TrackerEntry> {
+pub fn once_a_tier(trackers: &[TrackerEntry]) -> Vec<TrackerEntry> {
     let mut seen: std::collections::HashSet<(u32, &str)> =
         std::collections::HashSet::with_capacity(trackers.len());
     trackers
@@ -474,7 +474,7 @@ fn tracker_tiers(trackers: &[TrackerEntry]) -> Vec<Vec<Tracker>> {
 }
 
 // The hashes `record` goes by.
-fn hashes_of(record: &TorrentRecord) -> InfoHashes {
+pub fn hashes_of(record: &TorrentRecord) -> InfoHashes {
     InfoHashes {
         v1: record.infohash_v1.map(Id20::new),
         v2: record.infohash_v2.map(Id32::new),
@@ -494,7 +494,12 @@ fn load_of<'a>(torrents: impl Iterator<Item = &'a Live>) -> HashMap<RouteKey, us
 // `torrent` as the download queue and its holds see it. A seeding torrent
 // under a tracker rule that never pauses seeds through the schedule's holds
 // until its goal is met.
-fn queued(settings: &TorrentSettings, rules: &[TrackerRule], torrent: &Live, now: i64) -> Queued {
+pub fn queued(
+    settings: &TorrentSettings,
+    rules: &[TrackerRule],
+    torrent: &Live,
+    now: i64,
+) -> Queued {
     let seeding = torrent.seeding();
     // A torrent under a never-pause rule still owes its tracker while it
     // downloads, and while it seeds with a goal left.
@@ -547,10 +552,10 @@ fn files_of(layout: Option<&PieceLayout>, levels: &[FilePriority]) -> Vec<Torren
 }
 
 // A torrent as the session reports it now.
-struct Reading {
+pub struct Reading {
     engine: Engine,
     // Each file's bytes in hand.
-    file_have: Vec<u64>,
+    pub file_have: Vec<u64>,
     // The share of the torrent a check under way has read, while one is.
     checked: Option<f64>,
     // The ledger with what the session moved since it was last kept.
@@ -565,7 +570,7 @@ struct Reading {
     // nothing at its start (libtorrent `torrent_status::total_payload_download`
     // and `total_payload_upload`, which a pause resets).
     run: (u64, u64),
-    speeds: (u64, u64),
+    pub speeds: (u64, u64),
     peers: (u32, u32, u32),
 }
 
@@ -573,9 +578,9 @@ struct Reading {
 // the ones whose checkpoint is behind them with how many pieces came or
 // went since it was written, and the writes a job's intake could not make.
 #[derive(Default)]
-pub(super) struct Signal {
-    dirty: Mutex<BTreeSet<JobId>>,
-    unsaved: Mutex<BTreeMap<JobId, u32>>,
+pub struct Signal {
+    pub dirty: Mutex<BTreeSet<JobId>>,
+    pub unsaved: Mutex<BTreeMap<JobId, u32>>,
     refused: Mutex<BTreeMap<JobId, String>>,
     // What the first write that found no room wanted, of the torrents
     // whose writes found none since the last settle.
@@ -586,22 +591,22 @@ pub(super) struct Signal {
     // How many files pieces made whole since the last settle.
     whole: Mutex<BTreeMap<JobId, usize>>,
     // A slot or a rank moved where no pass runs: the next settle runs one.
-    pass_wanted: AtomicBool,
+    pub pass_wanted: AtomicBool,
     wake: Notify,
 }
 
-fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl Signal {
-    pub(super) fn mark(&self, job_id: JobId) {
+    pub fn mark(&self, job_id: JobId) {
         self.marked(job_id, 0);
     }
 
     // Looked at by the next settle, with nothing for its checkpoint: no
     // piece came or went.
-    pub(super) fn look(&self, job_id: JobId) {
+    pub fn look(&self, job_id: JobId) {
         locked(&self.dirty).insert(job_id);
         self.wake.notify_one();
     }
@@ -628,7 +633,7 @@ impl Signal {
         self.wake.notify_one();
     }
 
-    fn heard(&self, job_id: JobId, heard: IntakeHeard) {
+    pub fn heard(&self, job_id: JobId, heard: IntakeHeard) {
         match heard {
             IntakeHeard::Changed => self.marked(job_id, 1),
             IntakeHeard::Refused(error) => {
@@ -684,8 +689,8 @@ impl Signal {
         self.take_landed(job_id);
     }
 
-    #[cfg(test)]
-    fn holds_writes_of(&self, job_id: JobId) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn holds_writes_of(&self, job_id: JobId) -> bool {
         locked(&self.no_room).contains_key(&job_id) || locked(&self.landed).contains(&job_id)
     }
 
@@ -775,14 +780,14 @@ impl Drop for Owed<'_> {
 
 // A test's hold on the load of the stored torrents.
 #[cfg(any(test, feature = "test-support"))]
-struct LoadSeam {
+pub struct LoadSeam {
     // Held, the load reads no page.
     held: watch::Sender<bool>,
     // The rows of a page, in place of `LOAD_PAGE`; 0 for that.
-    page_rows: std::sync::atomic::AtomicUsize,
+    pub page_rows: std::sync::atomic::AtomicUsize,
     // The page read that fails, once, counted from the next as 1; 0 for
     // none.
-    fail_in: std::sync::atomic::AtomicUsize,
+    pub fail_in: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -807,7 +812,7 @@ pub struct Written {
 // Where the restore pass stands: none runs, one runs, or one runs and
 // another is to follow it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Restores {
+pub enum Restores {
     Idle,
     Running,
     Again,
@@ -827,11 +832,11 @@ enum Load {
 // The load ends under this lock, so what is asked here of whether it runs
 // is true of everything else kept here.
 #[derive(Default)]
-struct LoadMarks {
+pub struct LoadMarks {
     // The torrents taken out of the live ones: a page read before one went
     // does not bring it back. Kept while the load runs and while a read of
     // a torrent the load had not reached is in flight, which may outlast it.
-    gone: BTreeSet<JobId>,
+    pub gone: BTreeSet<JobId>,
     // The reads of torrents the load had not reached that are in flight.
     readers: usize,
     // The torrents being read now, each by one reader, and what tells the
@@ -879,39 +884,39 @@ pub enum ListError {
     State(#[from] StateError),
 }
 
-struct Inner {
-    db: Database,
-    sessions: Sessions,
-    settings: RwLock<TorrentSettings>,
+pub struct Inner {
+    pub db: Database,
+    pub sessions: Sessions,
+    pub settings: RwLock<TorrentSettings>,
     // The tracker rules, as the database last held them.
     rules: RwLock<Arc<[TrackerRule]>>,
-    env: JobEnv,
-    clock: Arc<dyn Clock>,
-    live: tokio::sync::Mutex<BTreeMap<JobId, Live>>,
+    pub env: JobEnv,
+    pub clock: Arc<dyn Clock>,
+    pub live: tokio::sync::Mutex<BTreeMap<JobId, Live>>,
     // Held while a torrent's job is restored, from the check that it waits
     // for one to the job given: one restore of a torrent at a time, and at
     // most RESTORES_AT_ONCE torrents restoring. The blocking restore owns
     // both, so a restore whose awaiting task ends still holds them.
-    restoring: std::sync::Mutex<HashMap<JobId, Arc<tokio::sync::Mutex<()>>>>,
-    restore_permits: Arc<tokio::sync::Semaphore>,
+    pub restoring: std::sync::Mutex<HashMap<JobId, Arc<tokio::sync::Mutex<()>>>>,
+    pub restore_permits: Arc<tokio::sync::Semaphore>,
     // The pass that restores the jobs of the torrents brought back with
     // their records alone, run off the tick: none, one running, or one
     // running with another asked to follow it.
-    restores: watch::Sender<Restores>,
+    pub restores: watch::Sender<Restores>,
     // Set where a torrent comes to wait for its job: a page of the load, a
     // restore held, a resume of one that crashed the daemon. The tick
     // begins a restore pass only when it is set, and takes it.
     restore_wanted: AtomicBool,
     // The load of the stored torrents at start, and what moved under it.
     load: watch::Sender<Load>,
-    load_marks: Mutex<LoadMarks>,
+    pub load_marks: Mutex<LoadMarks>,
     // A test's hold on the load.
     #[cfg(any(test, feature = "test-support"))]
-    load_seam: LoadSeam,
+    pub load_seam: LoadSeam,
     // The torrents whose work crashed the daemon on its last run: each is
     // kept paused, its job not restored, until a resume takes its marker.
     crash_marks: Mutex<weaver_server_base::runtime::panic_trap::CrashMarks>,
-    signal: Arc<Signal>,
+    pub signal: Arc<Signal>,
     ticks: watch::Sender<u64>,
     // Counts the waits for a route's session to open, begun off an add or
     // an action, that have ended.
@@ -927,7 +932,7 @@ struct Inner {
     // latest, and does nothing.
     history_turns: Mutex<HashMap<JobId, u64>>,
     next_history_turn: AtomicU64,
-    queue: Mutex<Option<SchedulerHandle>>,
+    pub queue: Mutex<Option<SchedulerHandle>>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     tick: Mutex<Option<tokio::task::JoinHandle<()>>>,
     // The service hearing the mail no pipeline hears, which a stop ends
@@ -940,25 +945,25 @@ struct Inner {
     wind_down: watch::Sender<Option<WindDown>>,
     // Held while sessions are turned on or off for the settings or for a
     // wind-down's end, so the two never cross.
-    turning: tokio::sync::Mutex<()>,
+    pub turning: tokio::sync::Mutex<()>,
     // Whether there are torrents, as last published.
     presence: watch::Sender<Presence>,
     // Whether any torrent was downloading, as last published: memory goes
     // back as that turns false.
     downloading: AtomicBool,
     // How many memory releases each ending asked for, as a test reads them.
-    #[cfg(test)]
-    releases: [std::sync::atomic::AtomicUsize; 2],
+    #[cfg(any(test, feature = "test-support"))]
+    pub releases: [std::sync::atomic::AtomicUsize; 2],
     // The torrents and their sessions as last published, for the exporter.
-    published: watch::Sender<Arc<Published>>,
+    pub published: watch::Sender<Arc<Published>>,
     // Each route's session as last read. The tick reads them, and turning
     // torrents on or off, under the sessions' lock each takes anyway: a
     // publish from an action never waits on a session that is opening.
     sessions_read: Mutex<Vec<SessionSeries>>,
-    counters: Counters,
+    pub counters: Counters,
     // The place in the download queue the next torrent added takes: past
     // every one kept (libtorrent puts a new torrent last in the queue).
-    next_queue_position: AtomicI64,
+    pub next_queue_position: AtomicI64,
     // What the last pass over the queue left at its end, written under
     // `live`'s lock: a torrent added goes there.
     queue_end: Mutex<QueueEnd>,
@@ -966,10 +971,10 @@ struct Inner {
     // no torrent's place moved. Kept under `live`'s lock.
     queue_order: Mutex<policy::QueueOrder>,
     // What the passes did: each take of `live`, walk and write.
-    #[cfg(test)]
-    pass_counts: watch::Sender<policy::PassCounts>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub pass_counts: watch::Sender<policy::PassCounts>,
     // Every torrent's row as a list shows it, as last published.
-    snapshot: snapshot::Snapshot,
+    pub snapshot: snapshot::Snapshot,
     // How many views were built.
     #[cfg(any(test, feature = "test-support"))]
     views_built: std::sync::atomic::AtomicUsize,
@@ -980,20 +985,20 @@ struct Inner {
     // The torrents waiting for room on their disks, each by the wait every
     // kind of job shares for its refusal, and how many times a wait began
     // or ended, or a torrent's disk became known.
-    disk_waits: Mutex<BTreeMap<JobId, DiskWait>>,
-    disk_waits_moved: watch::Sender<u64>,
+    pub disk_waits: Mutex<BTreeMap<JobId, DiskWait>>,
+    pub disk_waits_moved: watch::Sender<u64>,
     // Torrents that never downloaded are kept from starting for their
     // root's disk, by the start check every kind of job shares: one latch
     // per root, in `StorageRoot::ALL`'s order.
-    start_held: Mutex<[bool; 3]>,
+    pub start_held: Mutex<[bool; 3]>,
     // Torrents whose disk could not be looked up: each is looked up again
     // at the next reading of a root's disk, which the complete root's
     // ledger is waited on for while any is listed. A torrent leaves at that
     // reading, or when it is gone; at most one entry per live torrent.
-    relook: Mutex<Relook>,
+    pub relook: Mutex<Relook>,
     // The refusals heard while their run was not in upload mode, heard
     // again once it is: one task per torrent's run waits for that.
-    entering: Mutex<BTreeMap<JobId, (RunMark, NoRoom)>>,
+    pub entering: Mutex<BTreeMap<JobId, (RunMark, NoRoom)>>,
     // The service stops: a look its stop ended waits for no reading.
     stopping: AtomicBool,
     // The settings an add makes a category it names in, when it names one
@@ -1002,12 +1007,12 @@ struct Inner {
     categories: std::sync::OnceLock<crate::settings::SharedConfig>,
     // How many settles ran: what a test waits on to know one consumed
     // what the intakes said before it.
-    #[cfg(test)]
-    settled: watch::Sender<u64>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub settled: watch::Sender<u64>,
     // A settle under way: set before it takes what it settles, cleared
     // before `settled` counts it.
-    #[cfg(test)]
-    settling: AtomicBool,
+    #[cfg(any(test, feature = "test-support"))]
+    pub settling: AtomicBool,
     // How many magnets' fetches were shown ended: what a test waits on to
     // know every fetch a start began has said its end.
     #[cfg(any(test, feature = "test-support"))]
@@ -1015,15 +1020,15 @@ struct Inner {
     // A test's hold on the sweep of idle sessions, once it has read the
     // routes the torrents use and before it reads the sessions, and how
     // many sweeps reached that hold.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     sweep_held: watch::Sender<bool>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     sweeps_held: watch::Sender<u64>,
 }
 
 #[derive(Clone)]
 pub struct TorrentService {
-    inner: Arc<Inner>,
+    pub inner: Arc<Inner>,
 }
 
 impl TorrentService {
@@ -1071,7 +1076,7 @@ impl TorrentService {
                 turning: tokio::sync::Mutex::new(()),
                 presence: watch::channel(Presence::default()).0,
                 downloading: AtomicBool::new(false),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 releases: Default::default(),
                 published: watch::channel(Arc::default()).0,
                 sessions_read: Mutex::default(),
@@ -1083,7 +1088,7 @@ impl TorrentService {
                     last: None,
                 }),
                 queue_order: Mutex::default(),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 pass_counts: watch::channel(policy::PassCounts::default()).0,
                 snapshot: snapshot::Snapshot::default(),
                 #[cfg(any(test, feature = "test-support"))]
@@ -1092,15 +1097,15 @@ impl TorrentService {
                 tick_hold: Arc::default(),
                 disk_waits: Mutex::default(),
                 disk_waits_moved: watch::channel(0).0,
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 settled: watch::channel(0).0,
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 settling: AtomicBool::new(false),
                 #[cfg(any(test, feature = "test-support"))]
                 fetches_ended: watch::channel(0).0,
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 sweep_held: watch::channel(false).0,
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 sweeps_held: watch::channel(0).0,
                 start_held: Mutex::new([false; 3]),
                 relook: Mutex::default(),
@@ -1120,7 +1125,7 @@ impl TorrentService {
 
     // The torrents that crashed the daemon on its last run, read at start
     // before any torrent's job is restored.
-    pub(crate) fn park_crashed(&self, marks: weaver_server_base::runtime::panic_trap::CrashMarks) {
+    pub fn park_crashed(&self, marks: weaver_server_base::runtime::panic_trap::CrashMarks) {
         *self
             .inner
             .crash_marks
@@ -1138,7 +1143,7 @@ impl TorrentService {
             .map(|mark| mark.reason())
     }
 
-    fn settings(&self) -> TorrentSettings {
+    pub fn settings(&self) -> TorrentSettings {
         self.inner
             .settings
             .read()
@@ -1356,7 +1361,7 @@ impl TorrentService {
     }
 
     // Whether the stored torrents are still being read at start.
-    fn loading(&self) -> bool {
+    pub fn loading(&self) -> bool {
         matches!(*self.inner.load.borrow(), Load::Running(_))
     }
 
@@ -1437,7 +1442,7 @@ impl TorrentService {
         }
     }
 
-    async fn with_torrent<T>(
+    pub async fn with_torrent<T>(
         &self,
         job_id: JobId,
         change: impl FnOnce(&mut Live) -> Result<T, ActionError>,
@@ -1450,7 +1455,11 @@ impl TorrentService {
 
     // What the operator asks of the torrent, written under its lock with
     // no other column, and the ledger and peers as they stand beside it.
-    async fn set_intent(&self, job_id: JobId, intent: TorrentIntent) -> Result<(), ActionError> {
+    pub async fn set_intent(
+        &self,
+        job_id: JobId,
+        intent: TorrentIntent,
+    ) -> Result<(), ActionError> {
         let now = self.inner.clock.unix_ms();
         let landing = self
             .with_torrent(job_id, |torrent| {
@@ -1479,7 +1488,7 @@ impl TorrentService {
 
     // Stop the torrent for good, as its goal or a refusal does: its intent
     // is written, and the ledger and peers as they stand, queued.
-    fn stop_torrent(&self, torrent: &mut Live, now: i64) -> Option<Landing> {
+    pub fn stop_torrent(&self, torrent: &mut Live, now: i64) -> Option<Landing> {
         let job_id = torrent.record.job_id;
         torrent.settle(now);
         torrent.record.kept = KeptIntent::Intent(TorrentIntent::Stopped);
@@ -1505,7 +1514,7 @@ impl TorrentService {
     // finished NZB job asks for, off the runtime: once per `why`, never per
     // piece or peer.
     pub(super) fn release_memory(&self, why: MemoryRelease) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         self.inner.releases[why as usize].fetch_add(1, Ordering::Relaxed);
         let _ = why;
         weaver_server_base::runtime::thread_release::release_job_completion_memory_off_runtime();
@@ -1526,7 +1535,7 @@ impl TorrentService {
 
 // Why a torrent's memory goes back.
 #[derive(Debug, Clone, Copy)]
-pub(super) enum MemoryRelease {
+pub enum MemoryRelease {
     // A torrent's download ended: it completed, or left short of complete.
     Ended = 0,
     // The last torrent downloading stopped downloading.
@@ -1602,7 +1611,7 @@ fn ignored_of(levels: &[FilePriority]) -> Vec<bool> {
 
 // The directory the torrent's files are in: where they were placed, or else
 // the directory claimed for it.
-fn files_dir(torrent: &Live) -> PathBuf {
+pub fn files_dir(torrent: &Live) -> PathBuf {
     PathBuf::from(
         torrent
             .record
@@ -1613,12 +1622,12 @@ fn files_dir(torrent: &Live) -> PathBuf {
     )
 }
 
-pub(super) use weaver_server_pipeline::torrents::service::unpacking_dir;
+pub use weaver_server_pipeline::torrents::service::unpacking_dir;
 
 // Test seam: a removal's mark waits, once, until the test lets it go,
 // saying first that it has reached that point.
-#[cfg(test)]
-pub(crate) static MARK_HOLD: Mutex<
+#[cfg(any(test, feature = "test-support"))]
+pub static MARK_HOLD: Mutex<
     Option<(
         tokio::sync::oneshot::Sender<()>,
         tokio::sync::oneshot::Receiver<()>,
@@ -1628,8 +1637,8 @@ pub(crate) static MARK_HOLD: Mutex<
 // Test seam: a move, shown moving, waits once before it holds its
 // destination, until the test lets it go, saying first that it has reached
 // that point.
-#[cfg(test)]
-pub(crate) static MOVE_HOLD: Mutex<
+#[cfg(any(test, feature = "test-support"))]
+pub static MOVE_HOLD: Mutex<
     Option<(
         tokio::sync::oneshot::Sender<()>,
         tokio::sync::oneshot::Receiver<()>,
@@ -1638,15 +1647,15 @@ pub(crate) static MOVE_HOLD: Mutex<
 
 // Test seam: the write that ends a failed move of placed files, of what the
 // torrent made as the move left it, is refused once.
-#[cfg(test)]
-pub(crate) static MOVE_UNDO_FAILS: std::sync::atomic::AtomicBool =
+#[cfg(any(test, feature = "test-support"))]
+pub static MOVE_UNDO_FAILS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 // Test seam: holds a move of placed files that forgot the torrent's pieces,
 // before any file moves, until the test lets it go, saying first that it has
 // reached that point.
-#[cfg(test)]
-pub(crate) static MOVE_FORGOT_HOLD: Mutex<
+#[cfg(any(test, feature = "test-support"))]
+pub static MOVE_FORGOT_HOLD: Mutex<
     Option<(
         tokio::sync::oneshot::Sender<()>,
         tokio::sync::oneshot::Receiver<()>,
@@ -1655,63 +1664,58 @@ pub(crate) static MOVE_FORGOT_HOLD: Mutex<
 
 // Test seam: run with the name each of a torrent's unpacked files is about
 // to move to, the look having found it free, right before the move.
-#[cfg(test)]
-pub(crate) static OUTPUT_MEETS: Mutex<Option<OutputMeets>> = Mutex::new(None);
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+pub static OUTPUT_MEETS: Mutex<Option<OutputMeets>> = Mutex::new(None);
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) type OutputMeets = Box<dyn FnMut(&Path) + Send>;
 
 // Test seam: the next placing of a torrent's unpacked files panics once
 // its files have moved, before its row is written.
-#[cfg(test)]
-pub(crate) static PLACE_PANICS: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+#[cfg(any(test, feature = "test-support"))]
+pub static PLACE_PANICS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 // Test seam: the next write of a torrent's unpacked names to its row is
 // refused.
-#[cfg(test)]
-pub(crate) static KEEP_FAILS: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+#[cfg(any(test, feature = "test-support"))]
+pub static KEEP_FAILS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 // Test seam: the next write of a torrent's completion is refused.
-#[cfg(test)]
-pub(crate) static COMPLETION_FAILS: std::sync::atomic::AtomicBool =
+#[cfg(any(test, feature = "test-support"))]
+pub static COMPLETION_FAILS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 // Test seam: the next write of the mark that a torrent's unpacking ended
 // short is refused.
-#[cfg(test)]
-pub(crate) static UNPACK_OVER_FAILS: std::sync::atomic::AtomicBool =
+#[cfg(any(test, feature = "test-support"))]
+pub static UNPACK_OVER_FAILS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 // Test seam: run once a move of a torrent's placed files has moved them,
 // right before the write of the move to its row.
-#[cfg(test)]
-pub(crate) static MOVE_RECORD_MEETS: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
-
-#[cfg(test)]
-pub(crate) use super::storage::CHECK_EVERYTHING_FAILS;
+#[cfg(any(test, feature = "test-support"))]
+pub static MOVE_RECORD_MEETS: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
 
 // Test seam: run once a move of a torrent's placed files has written the
 // move to its row, the files still held by the move.
-#[cfg(test)]
-pub(crate) static MOVE_RECORDED_MEETS: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+#[cfg(any(test, feature = "test-support"))]
+pub static MOVE_RECORDED_MEETS: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
 
 // Test seam: run as a move of a torrent's placed files begins, after its
 // look at the new place and before any file moves.
-#[cfg(test)]
-pub(crate) static MOVE_BEGIN_MEETS: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+#[cfg(any(test, feature = "test-support"))]
+pub static MOVE_BEGIN_MEETS: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
 
 // Test seam: the next move of a torrent's placed files ends as a crash
 // would end it, its files moved and its row not written.
-#[cfg(test)]
-pub(crate) static MOVE_RECORD_DIES: std::sync::atomic::AtomicBool =
+#[cfg(any(test, feature = "test-support"))]
+pub static MOVE_RECORD_DIES: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 // Test seam: holds a move of placed files that will check the torrent
 // again, once the move is over and before any piece is forgotten, until the
 // test lets it go, saying first that it has reached that point.
-#[cfg(test)]
-pub(crate) static MOVE_CHECK_HOLD: Mutex<
+#[cfg(any(test, feature = "test-support"))]
+pub static MOVE_CHECK_HOLD: Mutex<
     Option<(
         tokio::sync::oneshot::Sender<()>,
         tokio::sync::oneshot::Receiver<()>,
@@ -1720,21 +1724,20 @@ pub(crate) static MOVE_CHECK_HOLD: Mutex<
 
 // Test seam: the next check a move owes the torrent once it is over is not
 // begun, as when its pieces could not be forgotten.
-#[cfg(test)]
-pub(crate) static MOVE_CHECK_FAILS: std::sync::atomic::AtomicBool =
+#[cfg(any(test, feature = "test-support"))]
+pub static MOVE_CHECK_FAILS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 // Test seam: the next write of a move of a torrent's placed files to its
 // row is refused.
-#[cfg(test)]
-pub(crate) static MOVE_RECORD_FAILS: std::sync::atomic::AtomicBool =
+#[cfg(any(test, feature = "test-support"))]
+pub static MOVE_RECORD_FAILS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 // Test seam: a write of what a torrent holds is refused, 1 once its files
 // moved (`sync_held`), 2 before they move (`hold_destination`).
-#[cfg(test)]
-pub(crate) static SYNC_HELD_FAILS: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(0);
+#[cfg(any(test, feature = "test-support"))]
+pub static SYNC_HELD_FAILS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 // Why a torrent's unpacked files are not all beside its own, and where
 // they are.
@@ -1748,7 +1751,7 @@ fn unplaced(work: &Path, error: &impl std::fmt::Display) -> String {
 // The bytes in hand of the files that go to disk: the progress over the
 // torrent's total, which leaves padding out as the session's own does
 // (libtorrent `file_progress::total_on_disk`).
-fn on_disk(layout: Option<&PieceLayout>, file_have: &[u64]) -> u64 {
+pub fn on_disk(layout: Option<&PieceLayout>, file_have: &[u64]) -> u64 {
     layout.map_or(0, |layout| {
         layout
             .files()
@@ -1777,7 +1780,7 @@ fn wanted(layout: Option<&PieceLayout>, levels: &[FilePriority], file_have: &[u6
 }
 
 // A torrent as a job in `status`.
-fn report(view: TorrentView, status: JobStatus, now_ms: i64) -> JobReport {
+pub fn report(view: TorrentView, status: JobStatus, now_ms: i64) -> JobReport {
     JobReport {
         job_id: view.job_id,
         protocol: Protocol::Torrent,

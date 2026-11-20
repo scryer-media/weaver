@@ -188,7 +188,7 @@ impl Pick<'_> {
     // What the table is asked for it: the ids of the categories it keeps,
     // as `CategoryPick::keeps` reads a torrent's category through
     // `TorrentSettings::category`, the hashes it names and its privacy.
-    pub(super) fn filter(&self, settings: &TorrentSettings) -> TorrentListFilter {
+    pub fn filter(&self, settings: &TorrentSettings) -> TorrentListFilter {
         TorrentListFilter {
             categories: self.category.map(|pick| {
                 let mut seen = HashSet::new();
@@ -260,8 +260,8 @@ impl Pick<'_> {
     // Of the torrents it keeps, those at `window`'s places, read from the
     // records of `live`: the reading the table's replaces, kept to prove it
     // the same.
-    #[cfg(test)]
-    pub(super) fn paged(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn paged(
         &self,
         settings: &TorrentSettings,
         live: &BTreeMap<JobId, Live>,
@@ -286,7 +286,7 @@ impl Pick<'_> {
     // page itself, its privacy kept in the table too. A pick of every
     // torrent reads no table: `Picked::under` takes them from the live
     // torrents it walks anyway.
-    pub(super) fn picked(
+    pub fn picked(
         &self,
         settings: &TorrentSettings,
         db: &crate::persistence::Database,
@@ -357,7 +357,7 @@ impl RowPick<'_> {
 }
 
 /// The torrents a pick read from the table.
-pub(super) enum Picked {
+pub enum Picked {
     /// The page.
     Page(Vec<JobId>),
     /// Every live torrent: the table was not read.
@@ -367,7 +367,7 @@ pub(super) enum Picked {
 impl Picked {
     // The page, among the torrents of `live`: a torrent the table holds
     // that is not live, being added or removed, is not shown.
-    pub(super) fn under(self, live: &BTreeMap<JobId, Live>) -> Vec<JobId> {
+    pub fn under(self, live: &BTreeMap<JobId, Live>) -> Vec<JobId> {
         match self {
             Self::Page(page) => page,
             Self::Live => {

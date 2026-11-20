@@ -46,7 +46,7 @@ use weaver_server_settings::categories::model::{
     completion_parent, may_place, resolve_category_config, validate_category_path_component,
 };
 use weaver_server_torrent_store::torrents::metainfo::{self, tracker};
-pub(super) use weaver_server_torrent_store::torrents::metainfo::{About, Parsed, with_web_seeds};
+pub use weaver_server_torrent_store::torrents::metainfo::{About, Parsed, with_web_seeds};
 use weaver_torrent::core::InfoHashes;
 use weaver_torrent::tracker::Tracker;
 use weaver_torrent::{
@@ -151,7 +151,7 @@ pub struct Placement {
 // moves to the default save path once complete. A relative download path is
 // under the default download path, which weaver has none of, so under the
 // save path.
-pub(super) fn absolute_placement(placement: &Placement, default_save: &Path) -> Placement {
+pub fn absolute_placement(placement: &Placement, default_save: &Path) -> Placement {
     let under = |base: &Path, path: &str| {
         if Path::new(path).is_absolute() {
             path.to_owned()
@@ -274,14 +274,14 @@ fn infohashes(hashes: InfoHashes) -> Vec<Infohash> {
         .collect()
 }
 
-pub(super) fn parse(bytes: &[u8]) -> Result<Parsed, AddError> {
+pub fn parse(bytes: &[u8]) -> Result<Parsed, AddError> {
     metainfo::parse(bytes).map_err(AddError::Invalid)
 }
 
 // A magnet's metadata fetch on its route's session, for the run that
 // follows it: the session, the identity its trackers heard `started` under,
 // and its tracker task.
-pub(super) struct Fetched {
+pub struct Fetched {
     pub(super) session: Arc<Session>,
     pub(super) identity: Identity,
     pub(super) trackers: weaver_torrent::tracker::TrackerHandover,
@@ -290,7 +290,7 @@ pub(super) struct Fetched {
 // A magnet's metadata fetch: running, or ended by a pause, which a resume
 // starts again. Removing or pausing the torrent aborts a running fetch,
 // which lets its trackers go with one `stopped`.
-pub(super) enum Resolving {
+pub enum Resolving {
     Fetching(tokio::task::AbortHandle),
     Paused,
 }
@@ -1055,11 +1055,7 @@ impl TorrentService {
     // changed, so only its row is published, as a settle publishes the
     // torrents that spoke: every magnet a start resumes ends a fetch, and a
     // publish of every torrent for each would cost the square of them.
-    pub(super) async fn fetching(
-        &self,
-        job_id: JobId,
-        fetch: Option<weaver_torrent::MetadataFetch>,
-    ) {
+    pub async fn fetching(&self, job_id: JobId, fetch: Option<weaver_torrent::MetadataFetch>) {
         #[cfg(any(test, feature = "test-support"))]
         let ended = fetch.is_none();
         if let Some(torrent) = self.inner.live.lock().await.get_mut(&job_id)
@@ -1077,7 +1073,7 @@ impl TorrentService {
     // A magnet's metainfo is in hand: `selected` is each file's level as
     // the link's `so=` gave it, by the metainfo's file index (libtorrent
     // `parse_magnet_uri` keeps it as the add's file priorities).
-    pub(super) async fn resolved(
+    pub async fn resolved(
         &self,
         job_id: JobId,
         bytes: Bytes,

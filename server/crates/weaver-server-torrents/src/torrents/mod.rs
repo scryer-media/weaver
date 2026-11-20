@@ -11,5 +11,5 @@ pub mod service;
 pub mod sessions;
 pub mod status;
 pub(crate) mod storage;
-pub(crate) mod store;
-pub(crate) mod tee;
+pub mod store;
+pub mod tee;

@@ -30,9 +30,9 @@ use std::sync::{Arc, PoisonError, Weak};
 // since the pass (a torrent gone or finished, one placed before the end) is
 // corrected by the next, which those ask for.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct QueueEnd {
-    pub(super) slots: status::Slots,
-    pub(super) last: Option<(i64, JobId)>,
+pub struct QueueEnd {
+    pub slots: status::Slots,
+    pub last: Option<(i64, JobId)>,
 }
 
 impl TorrentService {
@@ -61,7 +61,7 @@ impl TorrentService {
     /// fails to give is said, and shown with the service's warnings: the
     /// tick starts then, the torrents read so far run, and each tick reads
     /// that page again until the load ends.
-    pub(super) async fn start_seated(&self) -> Result<(), String> {
+    pub async fn start_seated(&self) -> Result<(), String> {
         let through = self.begin()?;
         if let Some(queue) = self.queue() {
             queue.state().classes().seat(self.class());
@@ -78,7 +78,7 @@ impl TorrentService {
 
     // The queue wiring without the seat: holds, starts and the queue the
     // torrents are published to.
-    pub(super) fn wire_to(&self, queue: SchedulerHandle) {
+    pub fn wire_to(&self, queue: SchedulerHandle) {
         let mut hold = queue.state().subscribe_holds();
         let mut starts = queue.state().subscribe_starts();
         *self
@@ -106,7 +106,7 @@ impl TorrentService {
 
     // The torrents as a job class: the job layer's way to them, which does
     // not keep the service alive.
-    pub(crate) fn class(&self) -> Arc<dyn JobClass> {
+    pub fn class(&self) -> Arc<dyn JobClass> {
         Arc::new(TorrentClass {
             inner: Arc::downgrade(&self.inner),
         })
@@ -481,7 +481,7 @@ fn give_back_peers(
 // its order, and say how many it closed. Once nothing is owed, before
 // torrents act or while they do, nothing more closes: it is read just before
 // each session's peers close.
-pub(super) fn give_back_through<S>(
+pub fn give_back_through<S>(
     running: &std::collections::BTreeMap<crate::torrents::sessions::RouteKey, S>,
     ask: &crate::jobs::TunnelGiveBack,
     peers: usize,
@@ -543,7 +543,7 @@ fn refusal(error: AddError) -> AddRefusal {
     }
 }
 
-pub(super) fn scheduler_error(error: ActionError) -> SchedulerError {
+pub fn scheduler_error(error: ActionError) -> SchedulerError {
     match error {
         ActionError::NotFound(job_id) => SchedulerError::JobNotFound(job_id),
         ActionError::UnmetGoal(_) => SchedulerError::Conflict(error.to_string()),
@@ -567,7 +567,7 @@ pub(super) fn top_priority(value: &str) -> bool {
 // to the top, the named torrents in queue order, then the rest; to the
 // bottom, the rest, then the named torrents in queue order. One pass over
 // the order whatever the offset.
-pub(super) fn moved_order(
+pub fn moved_order(
     order: Vec<JobId>,
     named: &HashSet<JobId>,
     target: QueueMoveTarget,

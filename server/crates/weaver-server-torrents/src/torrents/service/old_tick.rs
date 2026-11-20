@@ -41,7 +41,7 @@ fn old_goal_met(
 
 impl TorrentService {
     // `tick` at e53173421.
-    pub(super) async fn old_tick(&self) {
+    pub async fn old_tick(&self) {
         self.restore_jobs().await;
         self.follow_routes().await;
         let now = self.inner.clock.unix_ms();
@@ -67,7 +67,7 @@ impl TorrentService {
     }
 
     // `read` at e53173421.
-    pub(super) async fn old_read(&self, now: i64, at_once: bool) {
+    pub async fn old_read(&self, now: i64, at_once: bool) {
         let mut landings = Vec::new();
         {
             let mut live = self.inner.live.lock().await;
@@ -115,7 +115,7 @@ impl TorrentService {
     }
 
     // `apply_goals` at e53173421.
-    pub(super) async fn old_apply_goals(&self, now: i64) {
+    pub async fn old_apply_goals(&self, now: i64) {
         let settings = self.settings();
         let rules = self.rules();
         let mut actions = Vec::new();
@@ -202,7 +202,7 @@ impl TorrentService {
     }
 
     // `apply_queue` at e53173421.
-    pub(super) async fn old_apply_queue(&self) {
+    pub async fn old_apply_queue(&self) {
         let settings = self.settings();
         let rules = self.rules();
         let now = self.inner.clock.unix_ms();
@@ -267,7 +267,7 @@ impl TorrentService {
     }
 
     // `pick` at e53173421 (`fetch_levels` is the torrent's levels, cloned).
-    pub(super) async fn old_pick(&self, only: Option<&BTreeSet<JobId>>) {
+    pub async fn old_pick(&self, only: Option<&BTreeSet<JobId>>) {
         let live = self.inner.live.lock().await;
         let torrents: Box<dyn Iterator<Item = &Live> + Send> = match only {
             Some(only) => Box::new(only.iter().filter_map(|job_id| live.get(job_id))),
@@ -309,7 +309,7 @@ impl TorrentService {
     }
 
     // `apply_limits` at e53173421.
-    pub(super) async fn old_apply_limits(&self) {
+    pub async fn old_apply_limits(&self) {
         let settings = self.settings();
         let rules = self.rules();
         let live = self.inner.live.lock().await;
