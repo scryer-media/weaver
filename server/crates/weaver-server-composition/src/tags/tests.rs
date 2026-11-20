@@ -314,3 +314,76 @@ fn tag_changes_to_many_jobs_end_as_one_statement_per_pair_ended() {
     }
     assert_eq!(snapshot.made(), sorted_tags(made.into_iter().collect()));
 }
+
+// Each change patches the tags in memory instead of dropping them, and the
+// patched tags read as the tags read whole after it: every job's tags, the
+// made tags and the counts, over many history jobs and every kind of
+// change, a history delete among them.
+#[test]
+fn each_change_patches_the_tags_in_memory_as_a_whole_read_finds_them() {
+    let db = Database::open_in_memory().unwrap();
+    let ids: Vec<JobId> = (1..=600u64).map(|n| JobId(50_000 + n)).collect();
+    for id in &ids {
+        db.insert_job_history(&history_row(id.0)).unwrap();
+    }
+    let fresh = JobId(90_001);
+    let every_third: Vec<JobId> = ids.iter().copied().step_by(3).collect();
+    let every_seventh: Vec<JobId> = ids.iter().copied().step_by(7).collect();
+    db.add_job_tags(&ids[..400], ["tag10", "TV"]).unwrap();
+    db.tag_snapshot().unwrap();
+    let changes: Vec<(&str, Box<dyn Fn(&Database)>)> = vec![
+        (
+            "add",
+            Box::new(|db| db.add_job_tags(&every_third, ["tag2", "tv"]).unwrap()),
+        ),
+        (
+            "remove",
+            Box::new(|db| db.remove_job_tags(&every_seventh, ["TV"]).unwrap()),
+        ),
+        (
+            "set",
+            Box::new(|db| db.set_job_tags(&ids[100..150], ["set", "tag10"]).unwrap()),
+        ),
+        (
+            "set none",
+            Box::new(|db| db.set_job_tags(&ids[140..160], []).unwrap()),
+        ),
+        (
+            "clear",
+            Box::new(|db| db.remove_job_tags(&ids[..20], []).unwrap()),
+        ),
+        (
+            "put",
+            Box::new(|db| db.tag_new_job(fresh, ["new", "tv"]).unwrap()),
+        ),
+        (
+            "create",
+            Box::new(|db| db.create_tags(["unused", "a1"]).unwrap()),
+        ),
+        (
+            "add to no job",
+            Box::new(|db| db.add_job_tags(&[JobId(9)], ["nowhere"]).unwrap()),
+        ),
+        (
+            "delete",
+            Box::new(|db| db.delete_tags(["tv", "unused"]).unwrap()),
+        ),
+        ("untag", Box::new(|db| db.untag_job(fresh).unwrap())),
+        (
+            "history",
+            Box::new(|db| assert!(db.delete_job_history(ids[21].0).unwrap())),
+        ),
+    ];
+    for (name, change) in changes {
+        change(&db);
+        let patched = db.cached_tag_snapshot().expect(name);
+        assert_eq!(patched.revision(), db.tag_revision(), "{name}");
+        db.tag_cache().changed();
+        let whole = db.tag_snapshot().unwrap();
+        assert_eq!(patched.made(), whole.made(), "{name}");
+        assert_eq!(patched.counts(), whole.counts(), "{name}");
+        for id in ids.iter().chain([&fresh, &JobId(9)]) {
+            assert_eq!(patched.of(*id), whole.of(*id), "{name} {id:?}");
+        }
+    }
+}

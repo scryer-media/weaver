@@ -499,6 +499,7 @@ impl<D: HistoryDatabase> HistoryPersistenceDeleteJobHistoryBundlesLocalQueries f
         if job_ids.is_empty() {
             return Ok(Vec::new());
         }
+        let _tags = self.lock_tag_writer();
         let datastore = self.borrow().datastore();
         // Deduped so no chunk or tombstone insert names an id twice.
         let job_ids = job_ids
@@ -534,7 +535,7 @@ impl<D: HistoryDatabase> HistoryPersistenceDeleteJobHistoryBundlesLocalQueries f
             let ids = deleted.iter().map(|id| id.0).collect::<Vec<_>>();
             self.forget_job_script_effects(&ids);
             self.invalidate_job_history_cache_for(&ids);
-            self.job_history_bundles_deleted();
+            self.job_history_bundles_deleted(&ids);
         }
         result
     }

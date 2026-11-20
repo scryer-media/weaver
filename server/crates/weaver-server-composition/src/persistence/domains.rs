@@ -37,9 +37,13 @@ impl weaver_server_history::history::database::HistoryDatabase for Database {
         crate::post_processing::effects::PostProcessingEffectsInternalQueries::forget_script_effects_for(self, job_ids);
     }
 
-    fn job_history_bundles_deleted(&self) {
+    fn lock_tag_writer(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.tags.lock_writer()
+    }
+
+    fn job_history_bundles_deleted(&self, job_ids: &[u64]) {
         crate::post_processing::events::PostProcessingEventsInvalidateQueueScriptAdmissionInternalQueries::notify_script_events_changed(self);
-        self.tags.changed();
+        self.tags.jobs_deleted(job_ids);
     }
 }
 
