@@ -52,6 +52,8 @@ const QUEUE_TABLE_ITEM_FIELDS = `
     status: state
     downloadWaitReason
     downloadRetryAtEpochMs
+    diskNeedBytes
+    diskFreeBytes
     progressPercent
     totalBytes
     downloadedBytes

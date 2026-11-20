@@ -153,6 +153,8 @@ pub fn state_only(job: &JobInfo) -> JobInfo {
         error: None,
         download_wait_reason: None,
         download_retry_at_epoch_ms: None,
+        disk_need_bytes: None,
+        disk_free_bytes: None,
         created_at_epoch_ms: job.created_at_epoch_ms,
     }
 }
@@ -239,6 +241,9 @@ impl JobView<'_> {
             error: job.error.clone(),
             download_wait_reason: self.download_wait_reason().map(str::to_owned),
             download_retry_at_epoch_ms: self.download_retry_at_epoch_ms(),
+            // Kept on the row as the pipeline restates it: no read of its own.
+            disk_need_bytes: job.disk_need_bytes,
+            disk_free_bytes: job.disk_free_bytes,
             created_at_epoch_ms: job.created_at_epoch_ms,
         }
     }

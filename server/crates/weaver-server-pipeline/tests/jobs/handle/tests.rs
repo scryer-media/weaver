@@ -592,6 +592,8 @@ fn job_download_rates_report_only_transferring_download_phases() {
             download_wait_reason: None,
             download_retry_at_epoch_ms: None,
             server_attribution: Vec::new(),
+            disk_need_bytes: None,
+            disk_free_bytes: None,
             created_at_epoch_ms: 0.0,
         }
     }
@@ -699,6 +701,8 @@ fn owned_job(job_id: JobId, created_at_epoch_ms: f64) -> JobInfo {
         metadata: Vec::new(),
         output_dir: None,
         server_attribution: Vec::new(),
+        disk_need_bytes: None,
+        disk_free_bytes: None,
         created_at_epoch_ms,
     }
 }
@@ -1150,6 +1154,8 @@ fn a_job_s_debug_text_never_shows_its_password() {
         download_wait_reason: None,
         download_retry_at_epoch_ms: None,
         server_attribution: Vec::new(),
+        disk_need_bytes: None,
+        disk_free_bytes: None,
         created_at_epoch_ms: 0.0,
     };
 

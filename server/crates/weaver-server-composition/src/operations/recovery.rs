@@ -344,6 +344,8 @@ pub async fn recover_server_state_with(
             // attribution: the ledger lives with the finished job's
             // history row.
             server_attribution: Vec::new(),
+            disk_need_bytes: None,
+            disk_free_bytes: None,
             created_at_epoch_ms: recovered.created_at as f64 * 1000.0,
         });
     }
@@ -541,6 +543,8 @@ pub async fn recover_server_state_with(
                     server_attribution: crate::jobs::server_attribution::contributions_from_storage(
                         row.server_attribution.as_deref(),
                     ),
+                    disk_need_bytes: None,
+                    disk_free_bytes: None,
                     created_at_epoch_ms: row.created_at as f64 * 1000.0,
                 });
             }

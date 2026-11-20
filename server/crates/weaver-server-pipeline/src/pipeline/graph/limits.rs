@@ -413,6 +413,10 @@ pub struct Spend {
     landed_unbooked: u64,
     // The job's place among those waiting for room on the device.
     waiting: Option<u64>,
+    // What its start promised here for the posts it still had to fetch, and
+    // has not landed yet: drawn as posts land, and on a disk of its own by
+    // what the job delivers there. A wait for room leaves it promised.
+    posted: u64,
 }
 
 impl Spend {
@@ -474,6 +478,13 @@ impl Spend {
             self.unbooked += bytes;
             return;
         }
+        // What is in hand is spent first, as a repair's promise is, then
+        // what the start promised here for the job's bytes.
+        let bytes = {
+            let drawn = bytes.saturating_sub(self.slab).min(self.posted);
+            self.posted -= drawn;
+            bytes - drawn
+        };
         if bytes <= self.slab {
             self.slab -= bytes;
             self.in_hand = self.in_hand.min(self.slab);
@@ -606,9 +617,37 @@ impl Spend {
         }
     }
 
+    // `bytes` of the posts landed here: drawn from what the start promised,
+    // which moves to landed on the ledger once a slab of it has, and what
+    // lands past that promise is booked as it lands, as a repair's write
+    // is. Constant work per write; the booking lock is taken once per slab
+    // of the overflow at most.
+    fn land_posted(&mut self, bytes: u64, reader: &CapacityReader, reserve: u64) {
+        let drawn = bytes.min(self.posted);
+        self.posted -= drawn;
+        self.landed += drawn;
+        if self.landed >= SLAB_BYTES {
+            self.settle();
+        }
+        let over = bytes - drawn;
+        if over > 0 {
+            self.book(over, reader, reserve);
+            self.land(over);
+        }
+    }
+
+    // What the start promised for the posts and did not land is given back.
+    fn release_posted(&mut self) {
+        let posted = std::mem::take(&mut self.posted);
+        self.settle();
+        if let Some(ledger) = &self.ledger {
+            ledger.release(posted);
+        }
+    }
+
     // All that was promised is given back, and the job no longer waits.
     fn release_all(&mut self) {
-        self.settle();
+        self.release_posted();
         if let Some(ledger) = &self.ledger {
             ledger.release(self.slab + (self.owed - self.unbooked));
             if self.waiting.take().is_some() {
@@ -923,6 +962,10 @@ impl Caps {
         self.check()?;
         self.extracting(tree, node)?;
         if !produced(tree, node) {
+            // A post: under none of the job's limits, but its bytes take
+            // room on the disk it lies on, drawn from what its start
+            // promised.
+            self.land_posted(landing, (reader, device));
             return Ok(());
         }
         let key = (node, member);
@@ -1022,6 +1065,52 @@ impl Caps {
         self.book(device, bytes, reader);
         self.spend[device as usize].land(bytes);
         Ok(())
+    }
+
+    // The job started with `bytes` of its posts still to fetch promised on
+    // the ledger `reader` reads, for `device`: its posts' landings there
+    // draw on that promise. The ledger is not touched; the promise exists.
+    pub fn take_posted(&mut self, device: Device, bytes: u64, reader: &CapacityReader) {
+        let spend = &mut self.spend[device as usize];
+        spend.bind(reader);
+        spend.posted = spend.posted.saturating_add(bytes);
+    }
+
+    // What the start promised for the posts and did not land is given
+    // back: the job stopped, paused, or its download ended.
+    pub fn release_posted(&mut self) {
+        for spend in &mut self.spend {
+            spend.release_posted();
+        }
+    }
+
+    // What the start promised and has not landed, on each device.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn posted(&self) -> [u64; 2] {
+        [self.spend[0].posted, self.spend[1].posted]
+    }
+
+    // `landing` bytes of a post landed on `device`, which `reader` reads. A
+    // post on the output device of a job whose two devices are one
+    // filesystem draws on the working device's promise, the one its start
+    // made there.
+    fn land_posted(&mut self, landing: u64, (reader, device): (&CapacityReader, Device)) {
+        if landing == 0 {
+            return;
+        }
+        let device = match device {
+            Device::Output
+                if self.spend[Device::Working as usize]
+                    .ledger
+                    .as_ref()
+                    .is_some_and(|working| working.same_disk(reader.ledger())) =>
+            {
+                Device::Working
+            }
+            device => device,
+        };
+        let reserve = self.limits.min_free_bytes;
+        self.spend[device as usize].land_posted(landing, reader, reserve);
     }
 
     // A member that owed `owed` bytes to `from` moves to the device `reader`

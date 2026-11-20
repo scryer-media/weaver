@@ -858,6 +858,8 @@ fn queued_info(id: u64, status: weaver_server_core::JobStatus) -> weaver_server_
         category: None,
         metadata: Vec::new(),
         output_dir: None,
+        disk_need_bytes: None,
+        disk_free_bytes: None,
         created_at_epoch_ms: 0.0,
         server_attribution: Vec::new(),
     }

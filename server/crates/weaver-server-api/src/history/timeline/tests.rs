@@ -176,6 +176,8 @@ fn job(status: JobStatus) -> JobInfo {
         error,
         download_wait_reason: None,
         download_retry_at_epoch_ms: None,
+        disk_need_bytes: None,
+        disk_free_bytes: None,
         created_at_epoch_ms: 1_000.0,
         server_attribution: Vec::new(),
     }

@@ -41,6 +41,10 @@ export interface JobData {
   status: string;
   downloadWaitReason?: string | null;
   downloadRetryAtEpochMs?: number | null;
+  /** While the job waits to start for its disk: the bytes it still has to fetch; queue rows only. */
+  diskNeedBytes?: number | null;
+  /** The room its disk leaves for them, or for `disk_too_small` the most the disk holds; queue rows only. */
+  diskFreeBytes?: number | null;
   progress: number;
   progressPercent?: number | null;
   totalBytes: number;

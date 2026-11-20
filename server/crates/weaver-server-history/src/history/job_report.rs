@@ -87,6 +87,8 @@ impl JobReport {
             wanted_bytes: self.wanted_bytes,
             download_wait_reason: self.wait_reason,
             download_retry_at_epoch_ms: None,
+            disk_need_bytes: None,
+            disk_free_bytes: None,
             created_at_epoch_ms: self.created_at_ms as f64,
         }
     }

@@ -1162,6 +1162,8 @@ mod tests {
             error: None,
             download_wait_reason: None,
             download_retry_at_epoch_ms: None,
+            disk_need_bytes: None,
+            disk_free_bytes: None,
             created_at_epoch_ms: 0.0,
         }
     }
@@ -1625,6 +1627,39 @@ mod tests {
             (21..=40).collect::<Vec<_>>()
         );
         assert_eq!(read.revision, state.queue_revision());
+    }
+
+    // 6 (review). A job kept for the disk shows what it needs and what the
+    // disk leaves on a page and in a listing alike, copied from its row.
+    #[test]
+    fn a_page_and_a_listing_show_a_kept_job_s_disk_figures() {
+        use super::super::types::queue_item_from_job;
+        let jobs = (1..=3u64)
+            .map(|id| {
+                let mut info = job(id, JobStatus::Queued, None, 10);
+                if id == 2 {
+                    info.disk_need_bytes = Some(4 << 30);
+                    info.disk_free_bytes = Some(1 << 30);
+                }
+                info
+            })
+            .collect();
+        let state = SharedPipelineState::new(PipelineMetrics::new(), jobs);
+        let figures = |rows: &[JobInfo]| -> Vec<(u64, Option<u64>, Option<u64>)> {
+            rows.iter()
+                .map(queue_item_from_job)
+                .map(|item| (item.id, item.disk_need_bytes, item.disk_free_bytes))
+                .collect()
+        };
+        let expected = vec![
+            (1, None, None),
+            (2, Some(4 << 30), Some(1 << 30)),
+            (3, None, None),
+        ];
+        let page = PageRead::read(&state, &page_input(0, 20), ROWS, None);
+        assert_eq!(figures(&page.rows), expected, "the page");
+        let listing = read_listing(&state, None, 0, usize::MAX);
+        assert_eq!(figures(&listing), expected, "the listing");
     }
 
     #[test]

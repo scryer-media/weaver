@@ -652,6 +652,8 @@ mod tests {
             category: None,
             metadata: Vec::new(),
             output_dir: None,
+            disk_need_bytes: None,
+            disk_free_bytes: None,
             created_at_epoch_ms: 0.0,
             server_attribution: Vec::new(),
         }
