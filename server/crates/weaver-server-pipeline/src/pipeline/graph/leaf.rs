@@ -68,6 +68,33 @@ impl LeafError {
     }
 }
 
+// A file as the file system tells files apart: its device and its number
+// there. Every name of one file gives the same; a file made anew in its
+// place gives another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileId {
+    device: u64,
+    number: u64,
+}
+
+impl FileId {
+    #[cfg(unix)]
+    fn of(metadata: &std::fs::Metadata) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        Some(Self {
+            device: metadata.dev(),
+            number: metadata.ino(),
+        })
+    }
+
+    // Without a stable way to read a file's number, no two files are said
+    // to be one, and every byte is written.
+    #[cfg(not(unix))]
+    fn of(_: &std::fs::Metadata) -> Option<Self> {
+        None
+    }
+}
+
 #[derive(Debug)]
 pub struct Leaf {
     // Runtime identity and content revision for in-flight readers. Neither
@@ -519,6 +546,37 @@ impl Leaf {
         self.written.iter().fold(0u64, |sum, (start, run)| {
             sum.saturating_add(run.end - start)
         })
+    }
+
+    // The file already holds `len` bytes at `offset` that a write of them
+    // would put there again: it is recorded as that write, folding nothing,
+    // and nothing goes to disk.
+    pub(crate) fn wrote_in_place(&mut self, offset: u64, len: u64) {
+        self.revision += 1;
+        let span = (offset, offset + len);
+        let overlapped = self.overlapped(span);
+        for (from, to) in &overlapped {
+            self.change(*from, *to);
+        }
+        let replaced = vec![None; overlapped.len()];
+        self.wrote(span, None, &overlapped, &replaced);
+    }
+
+    // The file the leaf reads from now, as the file system tells files
+    // apart, once every operation that shaped it is down: a second name of
+    // a file is that file, and an empty file made where no second name
+    // could be is another. `None` where there is no file or the file system
+    // cannot say.
+    pub fn file_id(&self) -> Option<FileId> {
+        if let Some(queued) = self.queued.as_ref().filter(|queued| queued.last > 0) {
+            queued.to.wait_for(queued.read_after(0, 0)).ok()?;
+            if let Some(file) = queued.reader.get().filter(|_| queued.open) {
+                return FileId::of(&file.metadata().ok()?);
+            }
+        } else if let Some(file) = &self.file {
+            return FileId::of(&file.metadata().ok()?);
+        }
+        FileId::of(&std::fs::metadata(&self.path).ok()?)
     }
 
     // Write `bytes` at `offset`, folding nothing: a file whose bytes no

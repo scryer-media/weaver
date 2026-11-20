@@ -807,6 +807,11 @@ impl<F: Format + 'static> Object for EngineObject<F> {
         if corrected.is_some_and(|at| at != volume) || (elsewhere && corrected.is_none()) {
             out.push(Emit::GiveBack(volume));
         }
+        // A name that numbers the volume states its place: its tail has
+        // nothing left to state, and the volume waits for it no more.
+        if self.tail(volume.0).is_none() {
+            self.tails.remove(&volume.0);
+        }
     }
 
     fn give_back(&mut self, volume: VolumeIndex) -> Option<weaver_graph::Carried> {

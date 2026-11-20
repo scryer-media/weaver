@@ -107,6 +107,15 @@ impl NamespaceWriter {
             at = chunk.end;
             let mut bytes = Vec::new();
             leaf.read(chunk.start, super::index(chunk.len()), &mut bytes)?;
+            // The file the chunk came from, asked at each read: an envelope
+            // whose file is that very file takes the chunk where it was
+            // read without writing it over itself.
+            let read_from = leaf.file_id().map(|file| super::FromFile {
+                node,
+                member,
+                range: chunk,
+                file,
+            });
             let arrival = Arrival {
                 node,
                 member,
@@ -114,16 +123,22 @@ impl NamespaceWriter {
                 bytes: Bytes::from(bytes).into(),
                 provenance: run.provenance,
             };
-            self.route_as_brought(tree, builder, segments, arrival, out)?;
+            let outer = std::mem::replace(&mut self.from_file, read_from);
+            let routed = self.route_as_brought(tree, builder, segments, arrival, out);
+            self.from_file = outer;
+            routed?;
         }
         self.release_owned_elsewhere(tree, node, member)
     }
 
     // An object that keeps the member's volume whole, as one envelope at the
     // volume's own offsets, keeps exactly what the member's file holds, so
-    // the envelope starts in the file itself, under a second name, and what
-    // goes down to it after is each byte written over itself, so the
-    // volume's bytes are on disk once. The member's own name goes once the
+    // the envelope starts in the file itself, under a second name, so the
+    // volume's bytes are on disk once. What goes down to it from the file
+    // after lands where it was read, and is kept there without a write
+    // while the envelope's file is that very file; the object hears every
+    // run of it all the same. Bytes from anywhere else, the holds or a
+    // repair, are written as always. The member's own name goes once the
     // checkpoint that stops naming it commits: a restore before then finds
     // the file under that name, and the second name, which no checkpoint
     // names yet, is swept. An object that places the bytes any other way, a
