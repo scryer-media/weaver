@@ -679,7 +679,7 @@ impl TorrentService {
             unpack_override: record.unpack,
             unpack_end: record.unpack_end.clone(),
             scope: settings.scope(record.category_id, rule),
-            route: torrent.route.as_ref().map(|key| key.as_str().to_owned()),
+            route: torrent.route.key().map(|key| key.as_str().to_owned()),
             files: Vec::new(),
             sequential: record.sequential,
             first_last_piece_first: record.first_last_piece_first,

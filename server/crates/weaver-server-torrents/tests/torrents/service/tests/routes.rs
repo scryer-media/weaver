@@ -787,7 +787,7 @@ async fn a_stored_route_with_two_exits_holds_until_it_is_edited_to_one() {
     let live = service.inner.live.lock().await;
     assert_eq!(live[&job_id].held, None);
     assert!(live[&job_id].attached.is_some());
-    let key = live[&job_id].route.clone().unwrap();
+    let key = live[&job_id].route.key().cloned().unwrap();
     drop(live);
     let listed = service.routes().await;
     let route = listed.iter().find(|route| route.key == key).unwrap();

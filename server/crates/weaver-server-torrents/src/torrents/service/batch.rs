@@ -511,7 +511,7 @@ impl TorrentService {
                     torrent.record.category_id = category_id;
                     if before != settings.scope(category_id, rule) {
                         self.move_out(torrent).await;
-                        torrent.route = None;
+                        torrent.route.clear();
                         torrent.held = None;
                         moved.push(job_id);
                     }

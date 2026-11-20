@@ -566,7 +566,8 @@ async fn a_magnet_fetching_when_its_route_changes_fetches_again_on_the_new_route
     started_and_answered(&listener, &mut updates).await;
     let old = rig.service.inner.live.lock().await[&job_id]
         .route
-        .clone()
+        .key()
+        .cloned()
         .unwrap();
 
     rig.routes.route(TorrentScope::Default, 2);
@@ -584,7 +585,7 @@ async fn a_magnet_fetching_when_its_route_changes_fetches_again_on_the_new_route
     events.sort();
     assert_eq!(events, ["started", "stopped"]);
     let live = rig.service.inner.live.lock().await;
-    assert_eq!(live[&job_id].route.as_ref(), Some(&new));
+    assert_eq!(live[&job_id].route.key(), Some(&new));
     assert!(matches!(
         live[&job_id].resolving,
         Some(Resolving::Fetching(_))
