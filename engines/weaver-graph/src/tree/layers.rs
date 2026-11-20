@@ -4,13 +4,15 @@
 // Release layers. The root's namespace is what was posted, and every
 // container there is opened. Below it, inside what an archive held, a
 // container is opened only when it is a layer of the release: its own name
-// says it is an archive (`sniff::names_an_archive`), or the folder it sits
-// in holds nothing but pieces of archive sets and furniture (recovery data,
-// listings, text posted beside a payload, samples), as a scene release's
-// zips, or a `CD1/` and `CD2/` of RAR volumes, are packed. Any other
-// container below the root is a file the release holds, an application's
-// data built on a zip or a compressed file of its own, and is delivered as
-// posted: refused as `Why::Packed`, which disclaims it.
+// says it is an archive (`sniff::names_an_archive`), or a single-stream
+// compressor's name, the compression taken off, says a sidecar a person or
+// a player reads beside the payload (`sniff::names_a_sidecar`), or the
+// folder it sits in holds nothing but pieces of archive sets and furniture
+// (recovery data, listings, text posted beside a payload, samples), as a
+// scene release's zips, or a `CD1/` and `CD2/` of RAR volumes, are packed.
+// Any other container below the root is a file the release holds, an
+// application's data built on a zip or a compressed file of its own, and is
+// delivered as posted: refused as `Why::Packed`, which disclaims it.
 //
 // A name decides at once, so a layer named as one streams. A folder decides
 // only once nothing more can come into its namespace, at the job's quiet:
@@ -35,7 +37,7 @@ use super::{Builder, Effect, NodeId, Tree};
 use crate::deliver::Why;
 use crate::member::MemberId;
 use crate::object::Kind;
-use crate::sniff::{Layered, Listing, names_an_archive};
+use crate::sniff::{Layered, Listing, names_a_sidecar, names_an_archive};
 
 // The folders of one namespace that hold a file of their own, each by its
 // key (`folder`).
@@ -83,10 +85,11 @@ impl Tree {
     // may open as one. At the root, and for a kind the rule does not
     // govern, always; so too as the one member a stream opened, which is
     // every member its namespace will hold (a layer by its namespace, at
-    // once). Below it, when its name says an archive, or when its
-    // namespace's folders are known and its folder holds no file of its
-    // own; refused as packed when they are known and its folder does. While
-    // they are not known, it waits, a leaf, for the quiet.
+    // once). Below it, when its name says an archive, or a single-stream
+    // compressor's says a sidecar, or when its namespace's folders are
+    // known and its folder holds no file of its own; refused as packed when
+    // they are known and its folder does. While they are not known, it
+    // waits, a leaf, for the quiet.
     pub(super) fn opens_as_layer(
         &mut self,
         node: NodeId,
@@ -98,6 +101,7 @@ impl Tree {
             || self.depth(node) == 0
             || self.kind(node).is_some_and(stream)
             || names_an_archive(name, kind)
+            || (stream(kind) && names_a_sidecar(name))
         {
             return true;
         }

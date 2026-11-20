@@ -333,31 +333,6 @@ impl<D: Decoder> Engine for Stream<D> {
     }
 }
 
-// A compression extension and what it leaves behind: `.tgz` held a `.tar`.
-const EXTENSIONS: [(&str, &str); 11] = [
-    (".gz", ""),
-    (".tgz", ".tar"),
-    (".xz", ""),
-    (".txz", ".tar"),
-    (".bz2", ""),
-    (".tbz2", ".tar"),
-    (".tbz", ".tar"),
-    (".zst", ""),
-    (".tzst", ".tar"),
-    (".br", ""),
-    (".deflate", ""),
-];
-
-// The name the one member is announced under: the volume's name with its
-// compression extension taken off, or the name as it is when it carries no
-// extension, which the namespace numbers if it collides.
-pub fn member_name(volume: &str) -> String {
-    let lower = volume.to_ascii_lowercase();
-    EXTENSIONS
-        .iter()
-        .find(|(extension, _)| lower.len() > extension.len() && lower.ends_with(extension))
-        .map_or_else(
-            || volume.to_owned(),
-            |(extension, left)| format!("{}{left}", &volume[..volume.len() - extension.len()]),
-        )
-}
+// The name the one member is announced under: the sniffer owns the
+// compression extensions, which the layer rule reads too.
+pub use weaver_graph::sniff::stream_member_name as member_name;

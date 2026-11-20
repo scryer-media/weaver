@@ -6366,6 +6366,7 @@ mod tests {
     mod reopen;
     mod reposted;
     mod sets;
+    mod sidecars;
     mod takes;
     mod windows;
 
