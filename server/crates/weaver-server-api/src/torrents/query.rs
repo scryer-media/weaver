@@ -118,6 +118,17 @@ impl TorrentsQuery {
             category: category.as_deref().map(CategoryPick::Named),
             ..Pick::default()
         };
+        // The save path is read from the files: without them, from their
+        // totals, which say whether it is one file named as the torrent is.
+        if !shown.files && field.field("savePath").exists() {
+            return Ok(service(ctx)?
+                .picked_rows(pick, page(offset, limit), shown)
+                .await
+                .map_err(super::list_error)?
+                .into_iter()
+                .map(|(view, totals)| Torrent::of(view, totals.one_file))
+                .collect());
+        }
         Ok(service(ctx)?
             .picked(pick, page(offset, limit), shown)
             .await

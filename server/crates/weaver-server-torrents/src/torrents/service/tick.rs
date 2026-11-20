@@ -893,6 +893,9 @@ impl TorrentService {
             self.inner.signal.want_pass();
         }
         torrent.levels = held;
+        // Its files' levels moved, which its row may not show: one torrent's
+        // followers read them.
+        self.inner.snapshot.files_moved(torrent.record.job_id);
         // No piece comes for a change that leaves nothing it wants
         // missing: the settle is told, as an add's is (libtorrent
         // `update_peer_interest` calls `finished()`).
