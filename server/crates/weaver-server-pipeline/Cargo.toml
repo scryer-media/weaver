@@ -14,6 +14,8 @@ slow-tests = []
 # tunnel's loopback certificate backs the speed test's HTTPS fixture, and
 # NNTP's direct test route serves servers built with no route of their own.
 test-support = [
+    "weaver-server-migrations/test-support",
+    "weaver-server-postproc/test-support",
     "weaver-tunnel/test-support",
     "weaver-nntp/test-support",
     "weaver-server-base/test-support",
@@ -22,6 +24,7 @@ test-support = [
     "weaver-server-torrents/test-support",
     "weaver-server-db/test-support",
     "weaver-server-net/test-support",
+    "weaver-server-speedtest/test-support",
     "weaver-server-ingest/test-support",
     "weaver-server-auth/test-support",
 ]

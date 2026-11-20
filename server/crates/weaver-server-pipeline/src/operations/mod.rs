@@ -9,7 +9,6 @@ pub mod disk {
     #[cfg(test)]
     mod tests;
 }
-pub mod maintenance;
 pub mod metrics_store;
 pub mod recovery;
 
@@ -21,11 +20,7 @@ pub use async_ops::{
     HistoryDeleteOperationPayload, HistoryDeleteOperationRow, HistoryDeleteOperationSummary,
     HistoryDeleteRowState, HistoryDeleteTargetWork, HistoryOperationAction,
 };
-pub use backup::{
-    BackupArtifact, BackupInspectResult, BackupManifest, BackupService, BackupServiceError,
-    BackupStatus, CategoryRemapInput, CategoryRemapRequirement, PendingRestoreOutcome,
-    RestoreOptions, RestoreReport, StableStateExport, apply_pending_restore,
-};
+pub use backup::StableStateExport;
 pub use disk::{
     Capacity, CapacityDebits, CapacityReader, CapacityReading, DiskProbeError, DiskSpace,
     LateClassification, OnDemandSpace, Reach, StorageCapacity, StorageRoot, VolumeBuffers,
@@ -41,7 +36,6 @@ pub use instrumentation::{
     ServerArticleOutcomes, ServerAttemptCount, ServerAttemptOutcomeKind, ServerCounters,
     ServerMetricsRegistry, ServerMetricsSnapshot, StageOutcomeKind, VerificationOutcomeKind,
 };
-pub use maintenance::spawn_maintenance_worker;
 pub use metrics_store::{
     COUNTER_METRIC_KEYS, CounterRollupValue, GAUGE_METRIC_KEYS, GaugeRollupValue, JOB_STATUS_KEYS,
     JobStatusCounts, MetricsHistoryCadence, MetricsHistoryChunkRow, MetricsHistoryQueryData,

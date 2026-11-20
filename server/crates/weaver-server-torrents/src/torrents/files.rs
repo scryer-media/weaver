@@ -33,7 +33,7 @@ use weaver_server_disk::operations::disk::beneath::{self, Access};
 // started: one relaxed add per call, read by a scrape without a lock. The
 // handles are shared by every route, so these are not counted by route.
 #[derive(Debug, Default)]
-pub(crate) struct FileStats {
+pub struct FileStats {
     // Files opened because no handle was open under their key, and handles
     // closed to make room for one or for going unused.
     opens: AtomicU64,
@@ -67,7 +67,7 @@ pub struct FileStatsSnapshot {
     pub reads: FileCallsSnapshot,
 }
 
-pub(crate) static STATS: FileStats = FileStats::new();
+pub static STATS: FileStats = FileStats::new();
 
 impl FileStats {
     const fn new() -> Self {
@@ -82,7 +82,7 @@ impl FileStats {
         }
     }
 
-    pub(crate) fn snapshot(&self) -> FileStatsSnapshot {
+    pub fn snapshot(&self) -> FileStatsSnapshot {
         FileStatsSnapshot {
             opens: self.opens.load(Ordering::Relaxed),
             closed_for_room: self.closed_for_room.load(Ordering::Relaxed),
@@ -333,7 +333,7 @@ impl At {
     }
 }
 
-pub(crate) struct Files {
+pub struct Files {
     // Each file's path under the directory; none for padding, which is
     // never on disk.
     names: Vec<Option<PathBuf>>,
@@ -363,7 +363,7 @@ fn relative(name: &str) -> io::Result<PathBuf> {
 }
 
 impl Files {
-    pub(crate) fn new(layout: &PieceLayout, dir: PathBuf) -> io::Result<Self> {
+    pub fn new(layout: &PieceLayout, dir: PathBuf) -> io::Result<Self> {
         Self::in_pool(layout, dir, &SHARED)
     }
 
@@ -396,18 +396,18 @@ impl Files {
     }
 
     // The directory the files are under now.
-    pub(crate) fn dir(&self) -> PathBuf {
+    pub fn dir(&self) -> PathBuf {
         self.at().dir.clone()
     }
 
     // Each file's path under the directory; padding has none.
-    pub(crate) fn names(&self) -> impl Iterator<Item = Option<&Path>> + '_ {
+    pub fn names(&self) -> impl Iterator<Item = Option<&Path>> + '_ {
         self.names.iter().map(Option::as_deref)
     }
 
     // Where the file is now; none for padding.
-    #[cfg(test)]
-    pub(crate) fn path(&self, file: usize) -> Option<PathBuf> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn path(&self, file: usize) -> Option<PathBuf> {
         let name = self.names.get(file)?.as_ref()?;
         Some(self.at().dir.join(name))
     }
@@ -427,7 +427,7 @@ impl Files {
     // Where the files are, held there while the guard is: a move waits for
     // it, so writes queued under it are queued for the files where they
     // are.
-    pub(crate) fn placed(&self) -> Placed<'_> {
+    pub fn placed(&self) -> Placed<'_> {
         Placed {
             files: self,
             at: self.at(),
@@ -436,7 +436,7 @@ impl Files {
 
     // The file's bytes from `offset` into `out`, which is filled whole or
     // not at all: a file not there, or too short, says so.
-    pub(crate) fn read(&self, file: usize, offset: u64, out: &mut [u8]) -> io::Result<()> {
+    pub fn read(&self, file: usize, offset: u64, out: &mut [u8]) -> io::Result<()> {
         let name = self.name(file)?;
         let at = self.at();
         at.read()?;
@@ -456,7 +456,7 @@ impl Files {
     // The file's `len` bytes from `offset` are about to be read in order:
     // the system is told, and reads them ahead. A file not there is left
     // to the read that follows.
-    pub(crate) fn will_read(&self, file: usize, offset: u64, len: u64) {
+    pub fn will_read(&self, file: usize, offset: u64, len: u64) {
         let Ok(name) = self.name(file) else {
             return;
         };
@@ -473,7 +473,7 @@ impl Files {
 
     // `outs` filled one after the other from the file's bytes at `offset`,
     // in one positional read where the platform has one.
-    pub(crate) fn readv(&self, file: usize, offset: u64, outs: &mut [&mut [u8]]) -> io::Result<()> {
+    pub fn readv(&self, file: usize, offset: u64, outs: &mut [&mut [u8]]) -> io::Result<()> {
         let name = self.name(file)?;
         let at = self.at();
         at.read()?;
@@ -494,17 +494,17 @@ impl Files {
     // How many bytes the file holds on disk, by its size alone: none when
     // what is there is not a file, and nothing known when nothing can be
     // found there at all.
-    #[cfg(test)]
-    pub(crate) fn held(&self, file: usize) -> Option<u64> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn held(&self, file: usize) -> Option<u64> {
         self.held_since(file).map(|(held, _)| held)
     }
 
     // `held`, with the file's time as [`stamp`] takes it, from the same one
     // look: none when it has no usable one.
-    pub(crate) fn held_since(&self, file: usize) -> Option<(u64, Option<i64>)> {
+    pub fn held_since(&self, file: usize) -> Option<(u64, Option<i64>)> {
         let name = self.name(file).ok()?;
         let dir = self.at().dir.clone();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         LOOKS.with(|looks| looks.set(looks.get() + 1));
         match beneath::look(&dir, name) {
             Ok(found) if found.is_file => Some((found.len, stamp(found.modified))),
@@ -518,7 +518,7 @@ impl Files {
 
     // Where the files are now, or none while a move holds them: a caller
     // that must not wait out a move asks this.
-    pub(crate) fn dir_unless_moving(&self) -> Option<PathBuf> {
+    pub fn dir_unless_moving(&self) -> Option<PathBuf> {
         match self.at.try_read() {
             Ok(at) => Some(at.dir.clone()),
             Err(std::sync::TryLockError::Poisoned(at)) => Some(at.into_inner().dir.clone()),
@@ -528,7 +528,7 @@ impl Files {
 
     // The files `files` names under `dir`, to have their times taken off
     // this thread.
-    pub(crate) fn stamping(&self, dir: PathBuf, files: Vec<u32>) -> Stamping {
+    pub fn stamping(&self, dir: PathBuf, files: Vec<u32>) -> Stamping {
         let names = files
             .into_iter()
             .filter_map(|file| Some((file, self.names.get(file as usize)?.clone()?)))
@@ -538,7 +538,7 @@ impl Files {
 
     // Every handle to read let go, so the files can be moved, removed or
     // replaced; the next read opens them again under fresh keys.
-    pub(crate) fn release(&self) {
+    pub fn release(&self) {
         let mut at = self.at.write().unwrap_or_else(PoisonError::into_inner);
         self.pool.forget(&at.reads);
         let dir = std::mem::take(&mut at.dir);
@@ -557,7 +557,7 @@ impl Files {
     // among them that is not the torrent's own while the torrent has not
     // forgotten its pieces: no read is made of that file, so none of its
     // bytes is served, from the moment the lock is let go.
-    pub(crate) fn relocate<T, E>(
+    pub fn relocate<T, E>(
         &self,
         relocate: impl FnOnce(&Path) -> Result<(PathBuf, T), E>,
         shut: impl FnOnce(Result<&T, &E>) -> bool,
@@ -582,29 +582,29 @@ impl Files {
     // by the store alone, where it forgets them
     // (`TorrentStore::check_every_piece`), so every way a torrent comes to
     // check all its pieces opens them.
-    pub(super) fn let_read(&self) {
+    pub fn let_read(&self) {
         self.at.write().unwrap_or_else(PoisonError::into_inner).shut = false;
     }
 
-    pub(crate) fn is_shut(&self) -> bool {
+    pub fn is_shut(&self) -> bool {
         self.at().shut
     }
 }
 
 // The files where they are, while no move can take them elsewhere.
-pub(crate) struct Placed<'a> {
+pub struct Placed<'a> {
     files: &'a Files,
     at: RwLockReadGuard<'a, At>,
 }
 
 impl Placed<'_> {
     // Where the file is; an error for padding, which is never on disk.
-    pub(crate) fn path(&self, file: usize) -> io::Result<PathBuf> {
+    pub fn path(&self, file: usize) -> io::Result<PathBuf> {
         Ok(self.at.dir.join(self.files.name(file)?))
     }
 
     // Where the file is, with the folder it must resolve inside.
-    pub(crate) fn place(&self, file: usize) -> io::Result<super::writes::Place> {
+    pub fn place(&self, file: usize) -> io::Result<super::writes::Place> {
         Ok(super::writes::Place {
             path: self.path(file)?,
             within: self.at.dir.clone(),
@@ -613,7 +613,7 @@ impl Placed<'_> {
 
     // A write of `len` bytes at `offset` of the file, counted as it is
     // handed to its writer.
-    pub(crate) fn count_write(&self, file: usize, offset: u64, len: usize) {
+    pub fn count_write(&self, file: usize, offset: u64, len: usize) {
         counted(
             &self.files.ends[file].write,
             offset,
@@ -628,7 +628,7 @@ impl Placed<'_> {
 // folders they go in is already under `dir`, before Weaver writes any: those
 // are never Weaver's to delete. A name that cannot be a path under `dir` is
 // never written, so it is not looked for.
-pub(crate) fn adopted(dir: &Path, names: &[String]) -> super::model::Adopted {
+pub fn adopted(dir: &Path, names: &[String]) -> super::model::Adopted {
     let mut adopted = super::model::Adopted::default();
     if !dir.is_dir() {
         return adopted;
@@ -660,7 +660,7 @@ pub(crate) fn adopted(dir: &Path, names: &[String]) -> super::model::Adopted {
 }
 
 // The files [`adopted`] found, as paths under the directory.
-pub(crate) fn adopted_paths(adopted: &super::model::Adopted) -> HashSet<PathBuf> {
+pub fn adopted_paths(adopted: &super::model::Adopted) -> HashSet<PathBuf> {
     adopted
         .files
         .iter()
@@ -671,7 +671,7 @@ pub(crate) fn adopted_paths(adopted: &super::model::Adopted) -> HashSet<PathBuf>
 // A file's modified time as the database keeps it, nanoseconds since the
 // epoch: none when the filesystem gives none, or one at or before the epoch
 // or past what the column holds, which says nothing of a change.
-pub(crate) fn stamp(modified: Option<std::time::SystemTime>) -> Option<i64> {
+pub fn stamp(modified: Option<std::time::SystemTime>) -> Option<i64> {
     let since = modified?.duration_since(std::time::UNIX_EPOCH).ok()?;
     if since.is_zero() {
         return None;
@@ -680,7 +680,7 @@ pub(crate) fn stamp(modified: Option<std::time::SystemTime>) -> Option<i64> {
 }
 
 // Files whose times a checkpoint takes, where they are as it is taken.
-pub(crate) struct Stamping {
+pub struct Stamping {
     dir: PathBuf,
     names: Vec<(u32, PathBuf)>,
 }
@@ -688,11 +688,11 @@ pub(crate) struct Stamping {
 impl Stamping {
     // Each file's time, one look each: none for one with no usable time,
     // or not there as a file under the folder.
-    pub(crate) fn look(&self) -> Vec<(u32, Option<i64>)> {
+    pub fn look(&self) -> Vec<(u32, Option<i64>)> {
         self.names
             .iter()
             .map(|(file, name)| {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 LOOKS.with(|looks| looks.set(looks.get() + 1));
                 let time = beneath::look(&self.dir, name)
                     .ok()
@@ -703,15 +703,15 @@ impl Stamping {
             .collect()
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.names.is_empty()
     }
 }
 
 // How many times this thread looked at a file's size.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
-    pub(crate) static LOOKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub static LOOKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 // The system is told the file's `len` bytes from `offset` are about to be

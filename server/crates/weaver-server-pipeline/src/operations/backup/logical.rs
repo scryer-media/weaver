@@ -29,7 +29,7 @@ use crate::schema_migrations::{
 use crate::{Database, StateError};
 use weaver_server_base::security::RuntimeSecurityConfig;
 
-pub(crate) const EXPORT_BATCH_SIZE: i64 = 1_000;
+pub const EXPORT_BATCH_SIZE: i64 = 1_000;
 const BLOB_MARKER_TYPE: &str = "__weaver_type";
 const BLOB_MARKER_BASE64: &str = "base64";
 type NdjsonRow = Result<(usize, JsonMap<String, JsonValue>), StateError>;
@@ -83,15 +83,15 @@ pub struct TablePartMetadata {
     pub checksum: String,
 }
 
-pub(crate) struct LogicalBackupExport {
+pub struct LogicalBackupExport {
     pub staging: tempfile::TempDir,
     pub source_engine: String,
     pub schema_version: i64,
     pub tables: BTreeMap<String, TablePartMetadata>,
 }
 
-pub(crate) trait OperationsBackupLogicalInternalQueries {
-    #[cfg(test)]
+pub trait OperationsBackupLogicalInternalQueries {
+    #[cfg(any(test, feature = "test-support"))]
     fn export_logical_backup(&self) -> Result<LogicalBackupExport, StateError>;
     fn import_logical_backup(
         &self,
@@ -107,7 +107,7 @@ pub(crate) trait OperationsBackupLogicalInternalQueries {
 }
 
 impl OperationsBackupLogicalInternalQueries for Database {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn export_logical_backup(&self) -> Result<LogicalBackupExport, StateError> {
         self.export_logical_backup_cancellable(super::archive::BackupCancellation::new())
     }
@@ -219,7 +219,7 @@ impl OperationsBackupLogicalInternalQueries for Database {
     }
 }
 
-pub(super) trait LogicalBackupExportQueries {
+pub trait LogicalBackupExportQueries {
     fn export_logical_backup_cancellable(
         &self,
         cancellation: super::archive::BackupCancellation,
@@ -1823,7 +1823,7 @@ async fn repair_postgres_sequences(
     Ok(())
 }
 
-pub(crate) fn verify_table_parts(
+pub fn verify_table_parts(
     root: &Path,
     expected: &BTreeMap<String, TablePartMetadata>,
 ) -> Result<(), StateError> {
@@ -1877,7 +1877,7 @@ pub(crate) fn verify_table_parts(
     Ok(())
 }
 
-pub(crate) fn read_table_objects(
+pub fn read_table_objects(
     root: &Path,
     table: &str,
 ) -> Result<Vec<JsonMap<String, JsonValue>>, StateError> {
@@ -1889,11 +1889,7 @@ pub(crate) fn read_table_objects(
     Ok(rows)
 }
 
-pub(crate) fn visit_table_objects<F>(
-    root: &Path,
-    table: &str,
-    mut visit: F,
-) -> Result<(), StateError>
+pub fn visit_table_objects<F>(root: &Path, table: &str, mut visit: F) -> Result<(), StateError>
 where
     F: FnMut(JsonMap<String, JsonValue>) -> Result<(), StateError>,
 {
@@ -1908,7 +1904,7 @@ where
     Ok(())
 }
 
-pub(crate) fn rewrite_table_objects<F>(
+pub fn rewrite_table_objects<F>(
     root: &Path,
     table: &str,
     mut rewrite: F,
@@ -1948,7 +1944,7 @@ where
     })
 }
 
-pub(crate) fn append_table_objects(
+pub fn append_table_objects(
     root: &Path,
     table: &str,
     rows: &[JsonMap<String, JsonValue>],
@@ -1994,7 +1990,7 @@ fn db_err(error: impl std::fmt::Display) -> StateError {
     StateError::Database(error.to_string())
 }
 
-pub(crate) async fn validate_legacy_encryption_key(
+pub async fn validate_legacy_encryption_key(
     path: &Path,
     key: Option<&crate::persistence::encryption::EncryptionKey>,
 ) -> Result<(), StateError> {
@@ -2075,14 +2071,14 @@ fn sealed_bytes_prefix_hex() -> String {
 }
 
 // Export an existing schema before opening the application database or running migrations.
-#[cfg(test)]
-pub(super) async fn export_before_migrations(
+#[cfg(any(test, feature = "test-support"))]
+pub async fn export_before_migrations(
     target: &crate::persistence::database_target::DatabaseTarget,
 ) -> Result<LogicalBackupExport, StateError> {
     export_before_migrations_cancellable(target, super::archive::BackupCancellation::new()).await
 }
 
-pub(super) async fn export_before_migrations_cancellable(
+pub async fn export_before_migrations_cancellable(
     target: &crate::persistence::database_target::DatabaseTarget,
     cancellation: super::archive::BackupCancellation,
 ) -> Result<LogicalBackupExport, StateError> {

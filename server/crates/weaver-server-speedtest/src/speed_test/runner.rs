@@ -15,7 +15,7 @@ pub struct RunClock {
 
 impl RunClock {
     // The moment `after` from now.
-    pub(crate) fn deadline(&self, after: Duration) -> Deadline {
+    pub fn deadline(&self, after: Duration) -> Deadline {
         match &self.moved {
             Some(moved) => Deadline::Moved {
                 at: *moved.borrow() + after,
@@ -60,7 +60,7 @@ impl Default for HandClock {
 }
 
 #[derive(Clone)]
-pub(crate) enum Deadline {
+pub enum Deadline {
     Monotonic(tokio::time::Instant),
     E2e(chrono::DateTime<chrono::Utc>),
     Moved {
@@ -70,7 +70,7 @@ pub(crate) enum Deadline {
 }
 
 impl Deadline {
-    pub(crate) fn expired(&self) -> bool {
+    pub fn expired(&self) -> bool {
         match self {
             Self::Monotonic(at) => *at <= tokio::time::Instant::now(),
             Self::E2e(at) => *at <= weaver_server_base::e2e_clock::utc_now(),
@@ -78,7 +78,7 @@ impl Deadline {
         }
     }
 
-    pub(crate) async fn wait(&self) {
+    pub async fn wait(&self) {
         match self {
             Self::Monotonic(at) => tokio::time::sleep_until(*at).await,
             Self::E2e(_) => {
@@ -101,14 +101,14 @@ impl Deadline {
 // When a run's work must end: the operator cancelled, the run decided it has
 // measured enough, or the measurement reached its maximum duration.
 #[derive(Clone)]
-pub(crate) struct Stop {
+pub struct Stop {
     cancel: watch::Receiver<bool>,
     halt: Option<watch::Receiver<bool>>,
     deadline: Option<Deadline>,
 }
 
 impl Stop {
-    pub(crate) fn new(cancel: watch::Receiver<bool>) -> Self {
+    pub fn new(cancel: watch::Receiver<bool>) -> Self {
         Self {
             cancel,
             halt: None,
@@ -117,7 +117,7 @@ impl Stop {
     }
 
     // Also stop at `deadline`.
-    pub(crate) fn with_deadline(&self, deadline: Deadline) -> Self {
+    pub fn with_deadline(&self, deadline: Deadline) -> Self {
         Self {
             deadline: Some(deadline),
             ..self.clone()
@@ -125,24 +125,24 @@ impl Stop {
     }
 
     // Also stop once `halt` is set.
-    pub(crate) fn with_halt(&self, halt: watch::Receiver<bool>) -> Self {
+    pub fn with_halt(&self, halt: watch::Receiver<bool>) -> Self {
         Self {
             halt: Some(halt),
             ..self.clone()
         }
     }
 
-    pub(crate) fn cancelled(&self) -> bool {
+    pub fn cancelled(&self) -> bool {
         *self.cancel.borrow()
     }
 
-    pub(crate) fn is_stopped(&self) -> bool {
+    pub fn is_stopped(&self) -> bool {
         self.cancelled()
             || self.halt.as_ref().is_some_and(|halt| *halt.borrow())
             || self.deadline.as_ref().is_some_and(Deadline::expired)
     }
 
-    pub(crate) async fn stopped(&mut self) {
+    pub async fn stopped(&mut self) {
         let Self {
             cancel,
             halt,

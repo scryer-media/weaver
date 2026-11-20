@@ -206,7 +206,7 @@ mod tests {
     use super::*;
     use crate::history::nzbget_state::HistoryNzbgetStateQueries;
     use crate::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
-    use crate::history::queries::HistoryInternalQueries;
+    use crate::history::queries::HistoryUnpagedQueries;
     use crate::operations::async_ops::OperationsAsyncOpsInternalQueries;
     use crate::operations::async_ops::OperationsAsyncOpsQueries;
 

@@ -13,10 +13,14 @@ use std::path::{Path, PathBuf};
 
 use weaver_server_disk::operations::disk::beneath;
 
+pub fn key_of(path: &Path) -> String {
+    weaver_graph::names::key(&path.to_string_lossy())
+}
+
 // What a move of placed files does with a file already at its destination
 // (libtorrent `move_flags_t`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Existing {
+pub enum Existing {
     // The file there stays, and so does the source of the one that would
     // have taken its place; the torrent's pieces are checked again from the
     // new place, which now holds a file it did not write
@@ -29,22 +33,22 @@ pub(crate) enum Existing {
 // A move that failed: the path it failed at, and why.
 #[derive(Debug, thiserror::Error)]
 #[error("{}: {source}", path.display())]
-pub(crate) struct MoveError {
-    pub(crate) path: PathBuf,
+pub struct MoveError {
+    pub path: PathBuf,
     #[source]
-    pub(crate) source: io::Error,
+    pub source: io::Error,
 }
 
 // A move of files that failed, with what it had moved put back.
 #[derive(Debug, thiserror::Error)]
 #[error("{error}")]
-pub(crate) struct Failed {
+pub struct Failed {
     #[source]
-    pub(crate) error: MoveError,
+    pub error: MoveError,
     // The files, by their place in the list moved, that would not go back:
     // something took each one's old name since it left. Each stays where
     // the move put it, and the file at its old name is not the mover's.
-    pub(crate) stranded: Vec<usize>,
+    pub stranded: Vec<usize>,
 }
 
 impl From<MoveError> for Failed {
@@ -88,7 +92,7 @@ impl MoveError {
 // cannot be ordered so moves nothing.
 //
 // What it moved and what it kept, by their place in `moves`.
-pub(crate) fn move_files(
+pub fn move_files(
     from: &Path,
     moves: &[(PathBuf, PathBuf)],
     existing: Existing,
@@ -162,11 +166,11 @@ fn confined(from: &Path, moves: &[(PathBuf, PathBuf)]) -> Result<(), MoveError> 
 
 // What a move of files did, each file by its place in the list moved.
 #[derive(Debug, Default)]
-pub(crate) struct Moved {
+pub struct Moved {
     // The files whose destination held a file already, which was kept.
-    pub(crate) kept: Vec<usize>,
+    pub kept: Vec<usize>,
     // The files that moved, in the order they did.
-    pub(crate) moved: Vec<usize>,
+    pub moved: Vec<usize>,
 }
 
 impl Moved {
@@ -175,7 +179,7 @@ impl Moved {
     // The folders under `to` that leaves empty go, but for `there`, the
     // ones that were there before the move. The files that would not go
     // back, by their place in `moves`: see `Failed::stranded`.
-    pub(crate) fn put_back(
+    pub fn put_back(
         &self,
         to: &Path,
         moves: &[(PathBuf, PathBuf)],
@@ -238,12 +242,12 @@ fn ordered(moves: &[(PathBuf, PathBuf)]) -> Result<(Vec<usize>, Vec<bool>), Move
     let by_key: HashMap<String, usize> = moves
         .iter()
         .enumerate()
-        .map(|(at, (source, _))| (super::tee::key_of(source), at))
+        .map(|(at, (source, _))| (key_of(source), at))
         .collect();
     let at_destination = |target: &Path| {
         by_source
             .get(target)
-            .or_else(|| by_key.get(&super::tee::key_of(target)))
+            .or_else(|| by_key.get(&key_of(target)))
             .copied()
     };
     // 0 not looked at, 1 waiting on the file at its destination, 2 in.
@@ -388,13 +392,13 @@ fn move_files_using(
 }
 
 // The folders above each of `paths`, under `from`, that hold nothing now.
-pub(crate) fn remove_emptied<'a>(from: &Path, paths: impl Iterator<Item = &'a Path>) {
+pub fn remove_emptied<'a>(from: &Path, paths: impl Iterator<Item = &'a Path>) {
     remove_emptied_but(from, paths, &HashSet::new());
 }
 
 // `remove_emptied`, but for the folders of `there` and those above them:
 // the ones that were there before what emptied them came.
-pub(crate) fn remove_emptied_but<'a>(
+pub fn remove_emptied_but<'a>(
     from: &Path,
     paths: impl Iterator<Item = &'a Path>,
     there: &HashSet<PathBuf>,
@@ -413,7 +417,7 @@ pub(crate) fn remove_emptied_but<'a>(
 // Move the directory at `from` to `to`, an empty directory that exists:
 // renamed where one device holds both, else copied whole and then removed,
 // with nothing left at `to` when the copy fails partway.
-pub(crate) fn move_directory(from: &Path, to: &Path) -> Result<(), MoveError> {
+pub fn move_directory(from: &Path, to: &Path) -> Result<(), MoveError> {
     move_directory_using(from, to, |from, to| std::fs::rename(from, to))
 }
 

@@ -11,14 +11,18 @@ test-support = []
 
 [dependencies]
 anyhow = { version = "1", default-features = false, features = ["std"] }
+base64 = { workspace = true }
 bytes = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 weaver-graph = { path = "../../../engines/weaver-graph" }
 weaver-model = { path = "../../../shared/crates/weaver-model", default-features = false }
 weaver-nzb = { path = "../../../engines/weaver-nzb", default-features = false }
 weaver-server-base = { path = "../weaver-server-base" }
+weaver-server-db = { path = "../weaver-server-db" }
 weaver-server-disk = { path = "../weaver-server-disk" }
 weaver-server-net = { path = "../weaver-server-net" }
 weaver-server-postproc = { path = "../weaver-server-postproc" }
@@ -26,6 +30,10 @@ weaver-server-settings = { path = "../weaver-server-settings" }
 weaver-torrent = { workspace = true }
 weaver-tunnel = { path = "../../../engines/weaver-tunnel" }
 
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
+weaver-server-disk = { path = "../weaver-server-disk", features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }

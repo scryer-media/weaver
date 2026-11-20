@@ -5,7 +5,7 @@ use std::io;
 use std::path::Path;
 
 #[cfg(unix)]
-pub(crate) fn set_file_owner_only(path: &Path) -> io::Result<()> {
+pub fn set_file_owner_only(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
 
     let current = std::fs::metadata(path)?.permissions().mode();
@@ -14,19 +14,19 @@ pub(crate) fn set_file_owner_only(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-pub(crate) fn set_directory_owner_only(path: &Path) -> io::Result<()> {
+pub fn set_directory_owner_only(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
 
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
 }
 
 #[cfg(windows)]
-pub(crate) fn set_file_owner_only(path: &Path) -> io::Result<()> {
+pub fn set_file_owner_only(path: &Path) -> io::Result<()> {
     set_windows_owner_only(path, false)
 }
 
 #[cfg(windows)]
-pub(crate) fn set_directory_owner_only(path: &Path) -> io::Result<()> {
+pub fn set_directory_owner_only(path: &Path) -> io::Result<()> {
     set_windows_owner_only(path, true)
 }
 
@@ -93,11 +93,11 @@ fn set_windows_owner_only(path: &Path, directory: bool) -> io::Result<()> {
 }
 
 #[cfg(all(not(unix), not(windows)))]
-pub(crate) fn set_file_owner_only(_path: &Path) -> io::Result<()> {
+pub fn set_file_owner_only(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
 #[cfg(all(not(unix), not(windows)))]
-pub(crate) fn set_directory_owner_only(_path: &Path) -> io::Result<()> {
+pub fn set_directory_owner_only(_path: &Path) -> io::Result<()> {
     Ok(())
 }

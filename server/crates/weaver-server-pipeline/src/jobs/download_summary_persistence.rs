@@ -1,64 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+pub use weaver_server_jobs::jobs::download_summary_persistence::JobsDownloadSummaryPersistenceQueries;
+
+#[cfg(test)]
 use super::download_summary::DownloadSummary;
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 use super::ids::JobId;
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 use crate::{Database, StateError};
-
-pub trait JobsDownloadSummaryPersistenceQueries {
-    fn save_active_download_summary(&self, job_id: JobId, json: String) -> Result<(), StateError>;
-    fn history_download_summary(
-        &self,
-        job_id: JobId,
-    ) -> Result<Option<DownloadSummary>, StateError>;
-}
-
-impl JobsDownloadSummaryPersistenceQueries for Database {
-    // Put a finishing job's summary on its active row. The history archive,
-    // queued after this write, copies it from there.
-    fn save_active_download_summary(&self, job_id: JobId, json: String) -> Result<(), StateError> {
-        let datastore = self.datastore();
-        self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "active_download_summary", |tx| {
-                let json = json.clone();
-                Box::pin(async move {
-                    // UPDATE cannot recreate a cancelled or archived job.
-                    tx.execute(
-                        "UPDATE active_jobs SET download_summary = {} WHERE job_id = {}",
-                        &[SqlArg::Text(json), SqlArg::I64(job_id.0 as i64)],
-                    )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await
-        })
-    }
-
-    // A finished job's summary: one column of its history row, by its key.
-    // `None` for a job still in the queue, one that finished before
-    // summaries were kept, or one whose summary this build cannot read.
-    fn history_download_summary(
-        &self,
-        job_id: JobId,
-    ) -> Result<Option<DownloadSummary>, StateError> {
-        let datastore = self.datastore();
-        self.run_sql_blocking_read(async move {
-            let row = SqlRuntime::fetch_optional(
-                datastore.read_exec(),
-                "SELECT download_summary FROM job_history WHERE job_id = {}",
-                &[SqlArg::I64(job_id.0 as i64)],
-            )
-            .await?;
-            Ok(row
-                .map(|row| row.opt_text("download_summary"))
-                .transpose()?
-                .flatten()
-                .and_then(|json| DownloadSummary::from_storage_json(&json)))
-        })
-    }
-}
 
 #[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) trait JobsDownloadSummaryPersistenceInternalQueries {
@@ -152,7 +104,11 @@ mod tests {
     fn a_history_summary_reads_back_and_goes_with_its_entry() {
         let db = Database::open_in_memory().unwrap();
         db.insert_job_history(&history_row(41)).unwrap();
-        assert_eq!(db.history_download_summary(JobId(41)).unwrap(), None);
+        assert_eq!(
+            JobsDownloadSummaryPersistenceQueries::history_download_summary(&db, JobId(41))
+                .unwrap(),
+            None
+        );
 
         let summary = DownloadSummary {
             version: DOWNLOAD_SUMMARY_VERSION,

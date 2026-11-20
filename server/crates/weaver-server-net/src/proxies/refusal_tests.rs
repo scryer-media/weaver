@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::EgressQuotaFault as Quota;
 use super::NetworkRefusal as R;
 use super::{Consumer, TorrentScope};
-use crate::{Refusal, StateError};
+use weaver_server_db::persistence::error::{Refusal, StateError};
 
 // Every refusal with the code and the sentence a client is promised. A code
 // is part of the API: renaming one, or rewording a sentence, fails here.

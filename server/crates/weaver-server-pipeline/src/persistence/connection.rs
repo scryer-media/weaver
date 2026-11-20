@@ -1032,8 +1032,14 @@ impl std::ops::Deref for Database {
     }
 }
 
+impl std::borrow::Borrow<SqlDatabase> for Database {
+    fn borrow(&self) -> &SqlDatabase {
+        &self.connection
+    }
+}
+
 impl Database {
-    pub(crate) fn close(self) -> Result<(), StateError> {
+    pub fn close(self) -> Result<(), StateError> {
         let connection = self.connection.clone();
         drop(self);
         connection.close()

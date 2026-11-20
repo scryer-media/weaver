@@ -4,9 +4,6 @@
 use crate::jobs::queries::JobsQueries;
 use std::path::{Path, PathBuf};
 
-#[cfg(test)]
-use std::fs::File;
-
 use sqlx::postgres::{PgPool, PgRow};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqliteRow};
 use sqlx::{
@@ -16,47 +13,20 @@ use sqlx::{
 
 use crate::StateError;
 use crate::persistence::Database;
-#[cfg(test)]
-use crate::persistence::database_target::DatabaseTarget;
 use crate::persistence::sql_runtime::{SqlConn, SqlRuntime, StoreDatastore};
-#[cfg(test)]
-use crate::rss::RssService;
 use crate::schema_migrations::history_search_key_v88::fill_history_search_columns;
-#[cfg(test)]
-use crate::{HistoryFilter, SchedulerHandle};
 
-mod archive;
-mod automatic;
-mod catalog;
-mod logical;
-pub(crate) use logical::OperationsBackupLogicalInternalQueries;
-mod manifest;
-mod pending;
-mod permissions;
+pub mod archive;
+pub mod automatic;
+pub mod catalog;
+pub mod logical;
+pub use logical::OperationsBackupLogicalInternalQueries;
+pub mod permissions;
 mod restore;
-pub(crate) use restore::job_info_from_history;
-mod service;
-mod stored;
+pub use restore::job_info_from_history;
 mod upgrade;
-pub(crate) use upgrade::LAST_VERSION;
-pub use upgrade::{
-    prepare_upgrade_backup, record_started_version, reset_automatic_backup_settings,
-    skip_upgrade_backup,
-};
-
 pub use self::logical::TablePartMetadata;
-#[cfg(test)]
-pub(crate) use self::manifest::{BACKUP_SCOPE, required_category_remaps};
-pub use self::manifest::{
-    BackupArtifact, BackupInspectResult, BackupManifest, BackupServiceError, BackupSourcePaths,
-    BackupStatus, CategoryRemapInput, CategoryRemapRequirement, RestoreOptions, RestoreReport,
-};
-pub use self::service::BackupService;
-pub use automatic::{AutoBackupSettings, AutoBackupSettingsInput, compute_next_auto_backup_run_at};
-pub use pending::{PendingRestoreOutcome, apply_pending_restore};
-pub use stored::{
-    BACKUP_EXECUTION_TIMEOUT, BackupArtifactStatus, BackupInfo, BackupSettings, BackupTrigger,
-};
+pub use upgrade::{LAST_VERSION, record_started_version_for};
 
 #[doc(hidden)]
 pub fn create_backup_temp_dir() -> Result<tempfile::TempDir, std::io::Error> {
@@ -65,7 +35,7 @@ pub fn create_backup_temp_dir() -> Result<tempfile::TempDir, std::io::Error> {
     Ok(directory)
 }
 
-const LEGACY_V1_STABLE_TABLES: &[&str] = &[
+pub const LEGACY_V1_STABLE_TABLES: &[&str] = &[
     "schema_version",
     "settings",
     "servers",
@@ -145,52 +115,6 @@ pub struct StableStateExport {
 
 fn db_err(e: impl std::fmt::Display) -> StateError {
     StateError::Database(e.to_string())
-}
-
-#[cfg(test)]
-async fn open_postgres_backup_test_db(test_name: &str) -> Option<(Database, sqlx::PgPool, String)> {
-    let Ok(base_url) = std::env::var("WEAVER_TEST_POSTGRES_URL") else {
-        eprintln!("skipping {test_name}; WEAVER_TEST_POSTGRES_URL is not set");
-        return None;
-    };
-    if base_url.trim().is_empty() {
-        eprintln!("skipping {test_name}; WEAVER_TEST_POSTGRES_URL is empty");
-        return None;
-    }
-
-    let suffix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let schema = format!(
-        "weaver_backup_{test_name}_{}_{}",
-        std::process::id(),
-        suffix
-    );
-    let admin = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
-        .connect(&base_url)
-        .await
-        .unwrap();
-    let create = format!("CREATE SCHEMA {schema}");
-    sqlx::query(sqlx::AssertSqlSafe(create))
-        .execute(&admin)
-        .await
-        .unwrap();
-    let separator = if base_url.contains('?') { '&' } else { '?' };
-    let url = format!("{base_url}{separator}options=-csearch_path%3D{schema}");
-    let mut db = Database::open_target(DatabaseTarget::PostgresUrl(url)).unwrap();
-    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
-    Some((db, admin, schema))
-}
-
-#[cfg(test)]
-async fn drop_postgres_backup_test_schema(admin: sqlx::PgPool, schema: String) {
-    let drop_schema = format!("DROP SCHEMA IF EXISTS {schema} CASCADE");
-    sqlx::query(sqlx::AssertSqlSafe(drop_schema))
-        .execute(&admin)
-        .await
-        .unwrap();
 }
 
 async fn table_has_column(
@@ -1185,9 +1109,3 @@ impl OperationsBackupQueries for Database {
         })
     }
 }
-
-#[cfg(test)]
-mod tests;
-
-#[cfg(test)]
-mod backup_service_tests;

@@ -12,25 +12,42 @@ test-support = ["weaver-server-pipeline/test-support"]
 e2e-local-trackers = ["weaver-server-pipeline/e2e-local-trackers"]
 
 [dependencies]
+aes-gcm = { workspace = true }
+argon2 = { workspace = true }
+blake3 = { workspace = true }
 chrono = { workspace = true }
+getrandom = { workspace = true, default-features = false }
+pbkdf2 = { workspace = true }
+semver = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+sqlx = { workspace = true }
+tar = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
+weaver-nzb = { path = "../../../engines/weaver-nzb", default-features = false }
 weaver-server-base = { path = "../weaver-server-base" }
+weaver-server-db = { path = "../weaver-server-db" }
 weaver-server-pipeline = { path = "../weaver-server-pipeline" }
+weaver-torrent = { workspace = true }
+zstd = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
-blake3 = { workspace = true }
+sha1 = { workspace = true }
 criterion = "0.8"
 hex = { workspace = true }
 http = { workspace = true }
 sevenz-turbo = { workspace = true, features = ["compress"] }
-sqlx = { workspace = true }
-tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 toml = { workspace = true }
 weaver-model = { path = "../../../shared/crates/weaver-model", default-features = false }
 weaver-nntp = { path = "../../../engines/weaver-nntp", default-features = false, features = ["test-support"] }
-weaver-nzb = { path = "../../../engines/weaver-nzb", default-features = false }
-zstd = { workspace = true }
 weaver-server-pipeline = { path = "../weaver-server-pipeline", features = ["test-support"] }
 
 [[bench]]

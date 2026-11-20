@@ -11,3 +11,12 @@ mod manifest_tests;
 pub mod model;
 #[cfg(test)]
 mod model_tests;
+
+pub mod instances;
+pub mod runner;
+#[cfg(any(test, all(unix, feature = "test-support")))]
+#[doc(hidden)]
+pub mod runner_fixtures;
+#[cfg(test)]
+mod runner_tests;
+pub mod secrets;

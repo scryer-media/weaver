@@ -20,6 +20,7 @@ use weaver_nzb::{Nzb, NzbFile, NzbMeta, NzbSegment};
 
 use super::PersistedNzbError;
 use weaver_server_jobs::jobs::model::{FileSummaries, FileSummary};
+pub use weaver_server_jobs::jobs::outline_persistence::OutlineFile;
 use weaver_server_jobs::jobs::{
     ArchivePasswordCandidate, FileSpec, JobSpec, MessageIds, SegmentSpec,
 };
@@ -43,33 +44,18 @@ impl std::fmt::Debug for NzbOutline {
     }
 }
 
-// One posted file of the outline, in the NZB's file order.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OutlineFile {
-    // The name the file was posted under, before Weaver keeps two names
-    // apart.
-    pub full_name: String,
-    pub groups: Vec<String>,
-    // The NZB's date for the file; 0 when it gives none.
-    pub date: u64,
-    pub articles: u32,
-    pub bytes: u64,
-}
-
-impl OutlineFile {
-    // The outline of a posted file: one with at least one article.
-    fn of(file: &NzbFile) -> Option<Self> {
-        if file.segments.is_empty() {
-            return None;
-        }
-        Some(Self {
-            full_name: posted_name(file),
-            groups: file.groups.clone(),
-            date: file.date,
-            articles: file.segments.len() as u32,
-            bytes: file.total_bytes(),
-        })
+// The outline of a posted file: one with at least one article.
+fn outline_file(file: &NzbFile) -> Option<OutlineFile> {
+    if file.segments.is_empty() {
+        return None;
     }
+    Some(OutlineFile {
+        full_name: posted_name(file),
+        groups: file.groups.clone(),
+        date: file.date,
+        articles: file.segments.len() as u32,
+        bytes: file.total_bytes(),
+    })
 }
 
 // The name a file is written under before names are kept apart, as
@@ -85,7 +71,7 @@ impl NzbOutline {
     #[cfg(test)]
     pub fn of(nzb: &Nzb) -> Self {
         let mut outline = Self::with_meta(&nzb.meta);
-        outline.files = nzb.files.iter().filter_map(OutlineFile::of).collect();
+        outline.files = nzb.files.iter().filter_map(outline_file).collect();
         outline
     }
 
@@ -255,7 +241,7 @@ fn stream_stored_nzb(
 // file closes.
 pub fn read_stored_outline(bytes: &[u8], nzb_path: &Path) -> Result<StoredRead, PersistedNzbError> {
     let mut files = Vec::new();
-    let meta = stream_stored_nzb(bytes, |file| files.extend(OutlineFile::of(&file)))?;
+    let meta = stream_stored_nzb(bytes, |file| files.extend(outline_file(&file)))?;
     Ok(finish(meta, files, Vec::new(), nzb_path))
 }
 
@@ -265,7 +251,7 @@ pub fn read_stored_lists(bytes: &[u8], nzb_path: &Path) -> Result<StoredRead, Pe
     let mut files = Vec::new();
     let mut lists = Vec::new();
     let meta = stream_stored_nzb(bytes, |file| {
-        if let Some(outline) = OutlineFile::of(&file) {
+        if let Some(outline) = outline_file(&file) {
             files.push(outline);
             lists.push(segment_specs(file.segments));
         }

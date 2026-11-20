@@ -22,7 +22,7 @@ use std::sync::Arc as StdArc;
 use crate::JobHistoryRow;
 use crate::categories::CategoryConfig;
 use crate::operations::backup::manifest::BackupInstanceSecrets;
-use crate::persistence::sql_runtime::StoreDatastore;
+use crate::persistence::sql_runtime::{SqlConn, SqlRuntime};
 use crate::settings::Config;
 use crate::{PipelineMetrics, SharedPipelineState};
 use tokio::sync::{RwLock, broadcast};
@@ -45,39 +45,32 @@ fn open_temp_db() -> Database {
 }
 
 fn execute_sql(db: &Database, statements: Vec<&'static str>) {
-    let StoreDatastore::Sqlite { pool, .. } = db.datastore() else {
-        panic!("test database is SQLite");
-    };
+    let store = db.datastore();
     db.run_sql_blocking_local(move || async move {
-        let mut connection = pool
-            .acquire()
-            .await
-            .map_err(|error| crate::StateError::Database(error.to_string()))?;
-        for statement in statements {
-            sqlx::query(statement)
-                .execute(&mut *connection)
-                .await
-                .map_err(|error| crate::StateError::Database(error.to_string()))?;
-        }
-        Ok(())
+        SqlRuntime::run_serialized_sqlite_connection(
+            &store,
+            "backup test setup",
+            |mut connection| async move {
+                let mut conn = SqlConn::Sqlite(&mut connection);
+                for statement in statements {
+                    conn.execute(statement, &[]).await?;
+                }
+                Ok(())
+            },
+        )
+        .await
     })
     .unwrap();
 }
 
 fn query_count(db: &Database, table: &'static str) -> i64 {
-    let StoreDatastore::Sqlite { pool, .. } = db.datastore() else {
-        panic!("test database is SQLite");
-    };
+    let store = db.datastore();
     db.run_sql_blocking_local(move || async move {
-        let mut connection = pool
-            .acquire()
-            .await
-            .map_err(|error| crate::StateError::Database(error.to_string()))?;
         let query = format!("SELECT COUNT(*) FROM {table}");
-        sqlx::query_scalar(sqlx::AssertSqlSafe(query.as_str()))
-            .fetch_one(&mut *connection)
-            .await
-            .map_err(|error| crate::StateError::Database(error.to_string()))
+        SqlRuntime::fetch_optional(store.read_exec(), &query, &[])
+            .await?
+            .expect("count row")
+            .i64_at(0)
     })
     .unwrap()
 }
@@ -1489,13 +1482,8 @@ async fn staged_restore_rewrites_paths_without_mutating_the_live_runtime() {
         target_db.load_config().unwrap().data_dir,
         target_root.path().to_string_lossy()
     );
-    assert!(
-        capture
-            .state
-            .queue
-            .read(|inner| inner.globals.runtime_paths.is_none())
-    );
-    assert_eq!(capture.state.queue.revision(), 0);
+    assert!(!capture.state.has_runtime_paths());
+    assert_eq!(capture.state.job_revision(), 0);
     assert_eq!(target_policy.snapshot(7).unwrap().lifetime_bytes, 50_000);
 
     let (restored_target_db, outcome) =
@@ -1556,25 +1544,15 @@ async fn staged_restore_rewrites_paths_without_mutating_the_live_runtime() {
 
 #[tokio::test]
 async fn backup_catalog_rejects_an_unclassified_application_table() {
-    use sqlx::Connection as _;
-
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("catalog.db");
     let db = Database::open(&path).unwrap();
     db.validate_backup_catalog().unwrap();
 
-    let mut connection = sqlx::sqlite::SqliteConnection::connect_with(
-        &sqlx::sqlite::SqliteConnectOptions::new()
-            .filename(&path)
-            .create_if_missing(false),
-    )
-    .await
-    .unwrap();
-    sqlx::query("CREATE TABLE unclassified_test_table (id INTEGER PRIMARY KEY)")
-        .execute(&mut connection)
-        .await
-        .unwrap();
-    connection.close().await.unwrap();
+    execute_sql(
+        &db,
+        vec!["CREATE TABLE unclassified_test_table (id INTEGER PRIMARY KEY)"],
+    );
 
     let error = db.validate_backup_catalog().unwrap_err();
     assert!(error.to_string().contains("unclassified_test_table"));

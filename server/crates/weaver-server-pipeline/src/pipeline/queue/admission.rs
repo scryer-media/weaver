@@ -379,7 +379,7 @@ pub(crate) fn make_staging_dir(staging_dir: &Path, job_id: JobId) -> std::io::Re
 
 // Every directory a job's staging directory can lie under: the complete
 // directory and each category's folder.
-pub(crate) fn destination_roots(
+pub fn destination_roots(
     complete_dir: &Path,
     categories: &[crate::categories::CategoryConfig],
 ) -> Vec<PathBuf> {

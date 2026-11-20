@@ -11,8 +11,8 @@
 
 use crate::history::queries::HistoryQueries;
 use crate::history::timeline::HistoryTimelineQueries;
-use crate::torrents::persistence::TorrentsPersistenceInsertPlacedTorrentInternalQueries;
 use std::fmt::Write as _;
+use weaver_server_pipeline::support::torrent_checkpoint_in_hand;
 
 use serde::Serialize;
 use weaver_torrent::analysis::{Endpoint, TorrentReport, analyze_magnet, analyze_metainfo};
@@ -116,7 +116,7 @@ pub(super) fn build_job_report(
         }
     };
     job.apply_events(&db.get_job_events(job_id)?);
-    job.checkpoint_in_hand = db.torrent_pieces(JobId(job_id))?.is_some();
+    job.checkpoint_in_hand = torrent_checkpoint_in_hand(db, JobId(job_id))?;
     let analysis = analysis.with_weaver_version(environment.weaver_version);
     Ok(render(&analysis, Some(&job), environment))
 }

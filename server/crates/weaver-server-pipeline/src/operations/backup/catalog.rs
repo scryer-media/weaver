@@ -4,7 +4,7 @@
 use std::collections::BTreeSet;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BackupTableClassification {
+pub enum BackupTableClassification {
     Export,
     ResetOnRestore,
     Rebuild,
@@ -155,7 +155,7 @@ pub(crate) fn is_optional_catalog_table(table: &str) -> bool {
     table == "weaver_internal_metadata"
 }
 
-pub(crate) fn catalog_tables(classifications: &[BackupTableClassification]) -> BTreeSet<String> {
+pub fn catalog_tables(classifications: &[BackupTableClassification]) -> BTreeSet<String> {
     BACKUP_TABLE_CATALOG
         .iter()
         .filter(|entry| classifications.contains(&entry.classification))

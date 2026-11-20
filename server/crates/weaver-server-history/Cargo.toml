@@ -8,5 +8,8 @@ repository.workspace = true
 
 [dependencies]
 serde_json = { workspace = true }
+sqlx = { workspace = true }
 unicode-normalization = { workspace = true }
+weaver-server-base = { path = "../weaver-server-base" }
+weaver-server-db = { path = "../weaver-server-db" }
 weaver-server-ingest = { path = "../weaver-server-ingest" }

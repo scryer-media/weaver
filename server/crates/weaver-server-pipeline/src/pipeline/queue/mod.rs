@@ -17,9 +17,10 @@ mod history;
 mod intents;
 pub(crate) mod order;
 pub mod paging;
+pub use admission::destination_roots;
 pub(crate) use admission::{
-    AdmissionResources, PreparedAdd, RestartAdmission, destination_root, destination_roots,
-    make_staging_dir, outline_read, staging_dir_for, staging_dir_on,
+    AdmissionResources, PreparedAdd, RestartAdmission, destination_root, make_staging_dir,
+    outline_read, staging_dir_for, staging_dir_on,
 };
 #[cfg(test)]
 pub(crate) use counters::COUNTER_SAMPLES;

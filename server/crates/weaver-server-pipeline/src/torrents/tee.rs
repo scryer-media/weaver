@@ -1901,9 +1901,7 @@ struct Names {
     there: Vec<PathBuf>,
 }
 
-pub(in crate::torrents) fn key_of(path: &Path) -> String {
-    weaver_graph::names::key(&path.to_string_lossy())
-}
+pub(in crate::torrents) use super::relocate::key_of;
 
 // What holds a folder's name.
 enum Holder {

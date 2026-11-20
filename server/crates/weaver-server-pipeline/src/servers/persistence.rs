@@ -163,17 +163,17 @@ impl ServersPersistenceQueries for Database {
     }
 }
 
-#[cfg(test)]
-pub(crate) trait ServersPersistenceInternalQueries {
-    #[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+pub trait ServersPersistenceInternalQueries {
+    #[cfg(any(test, feature = "test-support"))]
     fn insert_server_past_limit(&self, server: &ServerConfig) -> Result<(), StateError>;
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl ServersPersistenceInternalQueries for Database {
     // A stored list past the limit, as an older version could leave one, so
     // the upgrade step that trims it can be tested.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn insert_server_past_limit(&self, server: &ServerConfig) -> Result<(), StateError> {
         self.insert_server_row(server, None, false)
     }

@@ -580,7 +580,7 @@ impl OutputInjector {
 
     // `text` with the run's secrets taken out, or `None` when the script is
     // not running and nothing is known about what must be kept out.
-    pub(crate) fn redact(&self, text: &str) -> Option<String> {
+    pub fn redact(&self, text: &str) -> Option<String> {
         let target = self.target();
         let target = target.as_ref()?;
         Some(redact_string(text, &target.secrets))
@@ -588,7 +588,7 @@ impl OutputInjector {
 
     // Add `text` to the output as lines of its own. False when the script is
     // not running.
-    pub(crate) fn push(&self, text: &str) -> bool {
+    pub fn push(&self, text: &str) -> bool {
         let target = self.target();
         let Some(target) = target.as_ref() else {
             return false;
@@ -1158,7 +1158,7 @@ fn insert_nzbget_global_options(
 // The host and port of the address scripts reach this server at. An IPv6
 // host keeps its brackets so that `http://{ip}:{port}/` stays a valid URL.
 fn control_endpoint(api_url: &str) -> Option<(String, String)> {
-    let url = reqwest::Url::parse(api_url).ok()?;
+    let url = url::Url::parse(api_url).ok()?;
     // The serialized host, which keeps an IPv6 address in brackets.
     let host = url.host_str()?.to_string();
     let port = url.port_or_known_default()?;
@@ -1276,7 +1276,7 @@ fn insert_compat_options(
     Ok(())
 }
 
-pub(super) fn option_value_text(value: &OptionValue) -> String {
+pub fn option_value_text(value: &OptionValue) -> String {
     match value {
         OptionValue::String(value) => value.clone(),
         OptionValue::Integer(value) => value.to_string(),
@@ -1290,7 +1290,7 @@ pub(super) fn option_value_text(value: &OptionValue) -> String {
 // Keep ordinary source URLs visible, but protect credential-bearing ones before
 // their script output is parsed into logs, directives or retained output.
 fn append_source_url_secrets(secrets: &mut Vec<Vec<u8>>, source_url: &str) {
-    let Ok(url) = reqwest::Url::parse(source_url) else {
+    let Ok(url) = url::Url::parse(source_url) else {
         return;
     };
     if !matches!(url.scheme(), "http" | "https") {
@@ -2129,16 +2129,9 @@ fn terminate_on_parent_pipe_loss(_child: &mut std::process::Child) {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn adapter_contract_for_test(
-    request: &ScriptExecutionRequest,
-) -> Result<(Vec<String>, BTreeMap<String, String>), RunnerError> {
-    adapter_contract(request)
-}
-
 // The arguments and environment the adapter hands a post-processing script,
 // without the platform environment it inherits.
-pub(crate) fn adapter_contract(
+pub fn adapter_contract(
     request: &ScriptExecutionRequest,
 ) -> Result<(Vec<String>, BTreeMap<String, String>), RunnerError> {
     let mut env = BTreeMap::new();

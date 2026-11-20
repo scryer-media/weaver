@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use super::*;
+use super::SettingsRepositoryQueries;
+use crate::Database;
+use crate::categories::CategoryConfig;
 use crate::categories::persistence::CategoriesPersistenceQueries;
 use crate::categories::queries::CategoriesQueries;
 use crate::categories::service::CategoriesServiceInternalQueries;
+use crate::persistence::encryption::is_encrypted;
+use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::proxies::ProxiesPersistenceQueries;
+use crate::servers::ServerConfig;
 use crate::servers::persistence::ServersPersistenceQueries;
 use crate::servers::queries::ServersQueries;
+use crate::settings::Config;
 use crate::settings::SettingsArchivePasswordsQueries;
 use crate::settings::archive_passwords::SettingsArchivePasswordsInternalQueries;
+use crate::settings::model::{Client, Leaf, TrackerRule};
 use crate::settings::persistence::SettingsPersistenceQueries;
 use crate::settings::queries::SettingsQueries;
 use crate::settings::service::SettingsServiceQueries;
@@ -456,7 +463,11 @@ fn tracker_rules_crud() {
     };
 
     let db = Database::open_in_memory().unwrap();
-    assert!(db.list_tracker_rules().unwrap().is_empty());
+    assert!(
+        SettingsRepositoryQueries::list_tracker_rules(&db)
+            .unwrap()
+            .is_empty()
+    );
     let seeding = SeedingPolicy {
         ratio_goal: Leaf::Set(1.5),
         seed_time_goal_minutes: Leaf::Set(4_320),

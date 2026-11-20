@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use serde_json::{Value, json};
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqlitePoolOptions;
 
@@ -263,7 +264,7 @@ async fn each_distinct_proxy_setting_becomes_one_profile() {
     );
     for id in 1..=5 {
         let proxy = saved_proxy(&pool, id).await;
-        assert!(proxy.get(RESOLVER).is_none() && proxy.get(DNS_SERVERS).is_none());
+        assert!(proxy.get("resolver").is_none() && proxy.get("dns_servers").is_none());
     }
     let kinds: Vec<String> = sqlx::query_scalar("SELECT kind FROM dns_profiles ORDER BY id")
         .fetch_all(&pool)
@@ -282,8 +283,8 @@ async fn each_distinct_proxy_setting_becomes_one_profile() {
     }
     // A WireGuard tunnel keeps the servers it asks, as tunnel configuration.
     let tunnel = saved_proxy(&pool, 6).await;
-    assert!(tunnel.get(RESOLVER).is_none());
-    assert_eq!(tunnel[DNS_SERVERS], json!(["10.64.0.1"]));
+    assert!(tunnel.get("resolver").is_none());
+    assert_eq!(tunnel["dns_servers"], json!(["10.64.0.1"]));
     assert_eq!(tunnel["revision"], json!(3));
 }
 

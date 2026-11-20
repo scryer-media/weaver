@@ -31,7 +31,7 @@ const MAGIC: u32 = 0x5744_5353;
 const HEAD_MAGIC: u32 = 0x5744_5348;
 const TAG: u64 = 8;
 
-pub(crate) struct Side {
+pub struct Side {
     // None: no side store, and no file is set aside.
     path: Option<PathBuf>,
     slot_len: u64,
@@ -119,7 +119,7 @@ fn open_for_write(path: &Path) -> io::Result<File> {
 
 impl Side {
     // No side store: every file is written as it is.
-    pub(crate) fn none() -> Self {
+    pub fn none() -> Self {
         Self {
             path: None,
             slot_len: 0,
@@ -155,7 +155,7 @@ impl Side {
     // (libtorrent takes such a part file as empty and writes over it,
     // `part_file::part_file`, part_file.cpp:87-118 at v2.0.15). A file
     // that cannot be opened or read is an error.
-    pub(crate) fn open(path: PathBuf, piece_length: u64, files: usize) -> io::Result<Self> {
+    pub fn open(path: PathBuf, piece_length: u64, files: usize) -> io::Result<Self> {
         let mut side = Self::empty(piece_length, files);
         match File::open(&path) {
             Ok(file) => {
@@ -218,26 +218,26 @@ impl Side {
 
     // Why the file found at open was not this torrent's side store, and was
     // removed, when it was not.
-    pub(crate) fn reset(&self) -> Option<&'static str> {
+    pub fn reset(&self) -> Option<&'static str> {
         self.reset
     }
 
-    pub(crate) fn path(&self) -> Option<&Path> {
+    pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
 
     // Whether the piece's bytes of the files set aside are here: kept, or
     // still arriving.
-    pub(crate) fn holds(&self, piece: u32) -> bool {
+    pub fn holds(&self, piece: u32) -> bool {
         self.slots.contains_key(&piece) || self.pending.contains_key(&piece)
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.slots.is_empty() && self.pending.is_empty()
     }
 
     // The pieces kept here.
-    pub(crate) fn pieces(&self) -> Vec<u32> {
+    pub fn pieces(&self) -> Vec<u32> {
         let mut pieces: Vec<u32> = self.slots.keys().copied().collect();
         pieces.sort_unstable();
         pieces
@@ -251,13 +251,13 @@ impl Side {
 
     // Whether the head names the file: its shares of the pieces kept may be
     // here alone.
-    pub(crate) fn recorded(&self, file: usize) -> bool {
+    pub fn recorded(&self, file: usize) -> bool {
         self.recorded.get(file).copied().unwrap_or(false)
     }
 
     // The head names the files `aside` names from now on, and no other:
     // only once every share of a file it stops naming is copied out.
-    pub(crate) fn record(&mut self, aside: &[bool]) -> io::Result<()> {
+    pub fn record(&mut self, aside: &[bool]) -> io::Result<()> {
         if self.recorded == aside {
             return Ok(());
         }
@@ -274,12 +274,7 @@ impl Side {
     // head naming them, its bytes in a slot, then the slot's tag. The
     // files are scanned once per selection: a piece kept under the
     // selection the head already names in full goes straight to its slot.
-    pub(crate) fn keep(
-        &mut self,
-        piece: u32,
-        held: &[u8],
-        aside: &Arc<Vec<bool>>,
-    ) -> io::Result<()> {
+    pub fn keep(&mut self, piece: u32, held: &[u8], aside: &Arc<Vec<bool>>) -> io::Result<()> {
         let (file, slot) = self.open_slot(piece, aside)?;
         let at = self.at(slot);
         write_all_at(&file, at + TAG, held)?;
@@ -295,7 +290,7 @@ impl Side {
     // in the piece's slot: the slot is the piece's from its first block,
     // its tag cleared, and is tagged only once the piece verified
     // (`seal`), so a slot whose tag is there still holds what it says.
-    pub(crate) fn keep_block(
+    pub fn keep_block(
         &mut self,
         piece: u32,
         at: u64,
@@ -317,7 +312,7 @@ impl Side {
 
     // The piece still arriving verified: its slot is tagged, and it is
     // kept here. A piece with no block here has nothing to tag.
-    pub(crate) fn seal(&mut self, piece: u32) -> io::Result<()> {
+    pub fn seal(&mut self, piece: u32) -> io::Result<()> {
         let Some(slot) = self.pending.get(&piece).copied() else {
             return Ok(());
         };
@@ -389,7 +384,7 @@ impl Side {
     }
 
     // `out` from `at` inside the piece kept here, or still arriving here.
-    pub(crate) fn read(&self, piece: u32, at: u64, out: &mut [u8]) -> io::Result<()> {
+    pub fn read(&self, piece: u32, at: u64, out: &mut [u8]) -> io::Result<()> {
         let slot = self
             .pending
             .get(&piece)
@@ -410,7 +405,7 @@ impl Side {
 
     // The piece kept here no longer: its slot's tag is cleared, and the slot
     // is free for the next. A piece still arriving had no tag written.
-    pub(crate) fn drop_piece(&mut self, piece: u32) -> io::Result<()> {
+    pub fn drop_piece(&mut self, piece: u32) -> io::Result<()> {
         if let Some(slot) = self.pending.remove(&piece)
             && self.slots.get(&piece) != Some(&slot)
         {
@@ -431,7 +426,7 @@ impl Side {
     }
 
     // The side store gone with its torrent; none there is nothing to do.
-    pub(crate) fn remove(path: &Path) -> io::Result<()> {
+    pub fn remove(path: &Path) -> io::Result<()> {
         match std::fs::remove_file(path) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
             _ => Ok(()),

@@ -154,7 +154,7 @@ const DATABASE_CONNECTS: [&str; 3] = [
 // host's own DNS; a new connect anywhere is one more such name.
 const KNOWN_HOST_DNS: &[(&str, usize)] = &[
     (
-        "server/crates/weaver-server-pipeline/src/operations/backup.rs",
+        "server/crates/weaver-server-core/src/operations/backup.rs",
         1,
     ),
     (
@@ -162,7 +162,7 @@ const KNOWN_HOST_DNS: &[(&str, usize)] = &[
         1,
     ),
     (
-        "server/crates/weaver-server-pipeline/src/operations/backup/upgrade.rs",
+        "server/crates/weaver-server-core/src/operations/backup/upgrade.rs",
         2,
     ),
     (

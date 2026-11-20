@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::{Consumer, EgressQuotaFault, TorrentScope};
-use crate::persistence::Refusal;
+use weaver_server_db::persistence::error::Refusal;
 
 // Why a networking edit was refused. Each variant is one sentence; `code`
 // names the condition and is part of the API, so a client words the refusal
@@ -809,7 +809,7 @@ impl From<NetworkRefusal> for Refusal {
     }
 }
 
-impl From<NetworkRefusal> for crate::StateError {
+impl From<NetworkRefusal> for weaver_server_db::persistence::StateError {
     fn from(refusal: NetworkRefusal) -> Self {
         Self::Refused(refusal.into())
     }

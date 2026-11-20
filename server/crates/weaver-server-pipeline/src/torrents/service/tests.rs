@@ -28,6 +28,7 @@ use crate::proxies::{Consumer, LegPath, RouteLeg, RoutingPolicy, SYSTEM_EGRESS_I
 use crate::proxies::{NetworkRuntime, TorrentScope};
 use crate::settings::{Client, Leaf, Level, Seeding, SeedingPolicy, TorrentConfig};
 use crate::settings::{SeedingAction, SeedingGoalMode};
+use crate::torrents::NamedBy;
 use crate::torrents::TrackerStatus;
 use crate::torrents::admission::Refusal;
 use crate::torrents::metrics::TorrentEvent;

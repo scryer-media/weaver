@@ -10,8 +10,6 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
-
 use crate::persistence::encryption::encrypt_value;
 use crate::persistence::sql_runtime::{
     SqlArg, SqlRuntime, SqlTx, is_foreign_key_violation, is_unique_violation,
@@ -21,13 +19,7 @@ use crate::persistence::{Database, StateError};
 const MAX_SECRET_NAME_BYTES: usize = 128;
 const MAX_SECRET_VALUE_BYTES: usize = 64 * 1024;
 
-// A link from an input to a secret, as an input shows it.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SecretRef {
-    pub id: String,
-    pub name: String,
-}
+pub use weaver_server_postproc::post_processing::secrets::SecretRef;
 
 // An instance that links a secret.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]

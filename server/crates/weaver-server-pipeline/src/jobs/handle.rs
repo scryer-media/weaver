@@ -269,6 +269,12 @@ impl SharedPipelineState {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn has_runtime_paths(&self) -> bool {
+        self.queue
+            .read(|inner| inner.globals.runtime_paths.is_some())
+    }
+
     // The revision of the published job list; it moves on every publish.
     pub fn job_revision(&self) -> u64 {
         self.queue.revision()
@@ -2051,7 +2057,7 @@ impl SchedulerHandle {
     // epoch seconds, the files of every failed job that finished by then go
     // and their records stay; a marked working directory of a job with no
     // row goes once its marker is older than `marked_before`.
-    pub(crate) async fn sweep_job_files(
+    pub async fn sweep_job_files(
         &self,
         failed_finished_by: Option<i64>,
         marked_before: std::time::SystemTime,

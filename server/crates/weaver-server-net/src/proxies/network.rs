@@ -32,7 +32,7 @@ pub fn max_wireguard_instances() -> usize {
     })
 }
 
-pub(super) fn wireguard_session_budget() -> std::sync::Arc<tokio::sync::Semaphore> {
+pub fn wireguard_session_budget() -> std::sync::Arc<tokio::sync::Semaphore> {
     static BUDGET: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
         std::sync::OnceLock::new();
     BUDGET
@@ -147,7 +147,7 @@ pub struct Bandwidth {
     // How the download limit is shared between usenet and torrents. It is
     // kept without a download limit, and does nothing until one is set.
     #[serde(default)]
-    pub split: Option<crate::bandwidth::BandwidthSplit>,
+    pub split: Option<crate::bandwidth::limits::BandwidthSplit>,
 }
 
 impl Bandwidth {
@@ -167,10 +167,10 @@ impl Bandwidth {
         Ok(())
     }
 
-    pub const fn limit(&self, direction: crate::bandwidth::Direction) -> Option<u64> {
+    pub const fn limit(&self, direction: crate::bandwidth::limits::Direction) -> Option<u64> {
         match direction {
-            crate::bandwidth::Direction::Download => self.download_bps,
-            crate::bandwidth::Direction::Upload => self.upload_bps,
+            crate::bandwidth::limits::Direction::Download => self.download_bps,
+            crate::bandwidth::limits::Direction::Upload => self.upload_bps,
         }
     }
 }
@@ -249,14 +249,14 @@ impl EgressQuota {
     // Where `used` bytes put `direction`.
     pub fn state(
         &self,
-        direction: crate::bandwidth::Direction,
+        direction: crate::bandwidth::limits::Direction,
         used: u64,
     ) -> crate::bandwidth::QuotaState {
         match direction {
-            crate::bandwidth::Direction::Download => {
+            crate::bandwidth::limits::Direction::Download => {
                 crate::bandwidth::QuotaState::of(used, None, self.download_bytes)
             }
-            crate::bandwidth::Direction::Upload => crate::bandwidth::QuotaState::of(
+            crate::bandwidth::limits::Direction::Upload => crate::bandwidth::QuotaState::of(
                 used,
                 self.upload_soft_bytes,
                 self.upload_hard_bytes,
@@ -265,10 +265,10 @@ impl EgressQuota {
     }
 
     // The trickle rate `direction` falls to past its soft cap.
-    pub const fn trickle_bps(&self, direction: crate::bandwidth::Direction) -> u64 {
+    pub const fn trickle_bps(&self, direction: crate::bandwidth::limits::Direction) -> u64 {
         match direction {
-            crate::bandwidth::Direction::Download => 0,
-            crate::bandwidth::Direction::Upload => self.upload_trickle_bps,
+            crate::bandwidth::limits::Direction::Download => 0,
+            crate::bandwidth::limits::Direction::Upload => self.upload_trickle_bps,
         }
     }
 
@@ -328,10 +328,10 @@ impl EgressInterface {
     }
 
     // The egress's own cap on `direction`.
-    pub const fn cap(&self, direction: crate::bandwidth::Direction) -> Option<u64> {
+    pub const fn cap(&self, direction: crate::bandwidth::limits::Direction) -> Option<u64> {
         match direction {
-            crate::bandwidth::Direction::Download => self.download_bps,
-            crate::bandwidth::Direction::Upload => self.upload_bps,
+            crate::bandwidth::limits::Direction::Download => self.download_bps,
+            crate::bandwidth::limits::Direction::Upload => self.upload_bps,
         }
     }
 
@@ -588,7 +588,7 @@ impl Route {
         Ok(())
     }
 
-    pub(crate) fn validate_allocation(&self) -> Result<(), NetworkRefusal> {
+    pub fn validate_allocation(&self) -> Result<(), NetworkRefusal> {
         if self
             .legacy_policy()
             .is_some_and(|p| p.proxy_ids.is_empty() && !p.allow_direct)

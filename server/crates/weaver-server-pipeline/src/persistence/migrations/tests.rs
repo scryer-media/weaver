@@ -153,7 +153,7 @@ active = true
         weaver_server_base::security::AUTHENTICATED_INSTALL_GENERATION,
     )
     .unwrap();
-    crate::operations::backup::record_started_version(&db).unwrap();
+    crate::operations::backup::record_started_version_for(&db, env!("CARGO_PKG_VERSION")).unwrap();
     assert!(db.is_empty().unwrap());
     assert!(db.migrate_from_toml(&toml_path).unwrap());
     let config = db.load_config().unwrap();

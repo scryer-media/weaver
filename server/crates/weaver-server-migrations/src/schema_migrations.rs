@@ -1,6 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+pub mod egress_quotas_v53;
+pub mod history_release_name_v87;
+pub mod history_retention_v89;
+pub mod history_search_key_v88;
+pub mod networking_bandwidth_v94;
+pub mod nzb_tables_v85;
+pub mod proxy_dns_v125;
+pub mod proxy_resolver_v64;
+pub mod schedule_tracks_v55;
+pub mod script_concurrency_v58;
+pub mod script_instances_v55;
+pub mod torrent_private_v126;
+pub mod tracker_hosts_v105;
+pub mod unwanted_extensions_v56;
+
 use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
@@ -612,5 +627,414 @@ pub async fn mirror_schema_version(
         .execute(&mut **tx)
         .await
         .map_err(db_err)?;
+    Ok(())
+}
+
+use crate::{MIGRATION_21_BASE_SCHEMA_SQL, MIGRATION_22_SCHEMA_SQL};
+const LEGACY_SCHEMA_VERSION: i64 = 20;
+pub const CURRENT_SCHEMA_VERSION: i64 = 134;
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: the migration run, alone at startup before the gate exists"
+)]
+async fn cleanup_legacy_queue_event_storage(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<(), StateError> {
+    sqlx::query("DELETE FROM integration_events")
+        .execute(&mut **tx)
+        .await
+        .map_err(db_err)?;
+    sqlx::query("DELETE FROM sqlite_sequence WHERE name = 'integration_events'")
+        .execute(&mut **tx)
+        .await
+        .map_err(db_err)?;
+    sqlx::query("DROP TABLE IF EXISTS metrics_scrapes")
+        .execute(&mut **tx)
+        .await
+        .map_err(db_err)?;
+    Ok(())
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: the migration run, alone at startup before the gate exists"
+)]
+async fn backfill_persisted_nzb_blobs(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table: &str,
+) -> Result<(), StateError> {
+    let select_sql = format!(
+        "SELECT job_id, nzb_path
+           FROM {table}
+          WHERE nzb_zstd IS NULL
+            AND nzb_path IS NOT NULL
+            AND nzb_path != ''"
+    );
+    let rows = sqlx::query(AssertSqlSafe(select_sql.as_str()))
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(db_err)?;
+
+    let mut updates = Vec::new();
+    for row in rows {
+        let job_id: i64 = row.try_get("job_id").map_err(db_err)?;
+        let path: String = row.try_get("nzb_path").map_err(db_err)?;
+        match weaver_server_ingest::ingest::load_persisted_nzb_storage_bytes(Path::new(&path)) {
+            Ok(bytes) => updates.push((job_id, bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(
+                    table,
+                    job_id,
+                    nzb_path = %path,
+                    error = %error,
+                    "failed to backfill persisted nzb blob from filesystem"
+                );
+            }
+        }
+    }
+
+    let update_sql = format!(
+        "UPDATE {table}
+            SET nzb_zstd = ?1
+          WHERE job_id = ?2"
+    );
+    for (job_id, bytes) in updates {
+        sqlx::query(AssertSqlSafe(update_sql.as_str()))
+            .bind(bytes)
+            .bind(job_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(db_err)?;
+    }
+
+    Ok(())
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: the migration run, alone at startup before the gate exists"
+)]
+async fn refresh_active_job_hashes(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<(), StateError> {
+    let rows = sqlx::query(
+        "SELECT job_id, nzb_zstd, nzb_path
+           FROM active_jobs",
+    )
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(db_err)?;
+
+    for row in rows {
+        let job_id: i64 = row.try_get("job_id").map_err(db_err)?;
+        let nzb_zstd: Option<Vec<u8>> = row.try_get("nzb_zstd").map_err(db_err)?;
+        let nzb_path: String = row.try_get("nzb_path").map_err(db_err)?;
+        let hash = match nzb_zstd {
+            Some(bytes) => weaver_server_ingest::ingest::hash_persisted_nzb_bytes(&bytes).to_vec(),
+            None => match weaver_server_ingest::ingest::load_persisted_nzb_storage_bytes(Path::new(
+                &nzb_path,
+            )) {
+                Ok(bytes) => {
+                    weaver_server_ingest::ingest::hash_persisted_nzb_bytes(&bytes).to_vec()
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    tracing::warn!(
+                        job_id,
+                        nzb_path = %nzb_path,
+                        error = %error,
+                        "failed to refresh active job hash from filesystem"
+                    );
+                    continue;
+                }
+            },
+        };
+        sqlx::query(
+            "UPDATE active_jobs
+                SET nzb_hash = ?1
+              WHERE job_id = ?2",
+        )
+        .bind(hash)
+        .bind(job_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(db_err)?;
+    }
+
+    Ok(())
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: the migration run, alone at startup before the gate exists"
+)]
+async fn backfill_job_history_hashes(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<(), StateError> {
+    let rows = sqlx::query(
+        "SELECT job_id, nzb_zstd, nzb_path
+           FROM job_history
+          WHERE job_hash IS NULL
+            AND ((nzb_zstd IS NOT NULL) OR (nzb_path IS NOT NULL AND nzb_path != ''))",
+    )
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(db_err)?;
+
+    for row in rows {
+        let job_id: i64 = row.try_get("job_id").map_err(db_err)?;
+        let nzb_zstd: Option<Vec<u8>> = row.try_get("nzb_zstd").map_err(db_err)?;
+        let nzb_path: Option<String> = row.try_get("nzb_path").map_err(db_err)?;
+        let hash = match nzb_zstd {
+            Some(bytes) => weaver_server_ingest::ingest::hash_persisted_nzb_bytes(&bytes).to_vec(),
+            None => {
+                let Some(path) = nzb_path else {
+                    continue;
+                };
+                match weaver_server_ingest::ingest::load_persisted_nzb_storage_bytes(Path::new(
+                    &path,
+                )) {
+                    Ok(bytes) => {
+                        weaver_server_ingest::ingest::hash_persisted_nzb_bytes(&bytes).to_vec()
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        tracing::warn!(
+                            job_id,
+                            nzb_path = %path,
+                            error = %error,
+                            "failed to backfill history job hash from filesystem"
+                        );
+                        continue;
+                    }
+                }
+            }
+        };
+        sqlx::query(
+            "UPDATE job_history
+                SET job_hash = ?1
+              WHERE job_id = ?2",
+        )
+        .bind(hash)
+        .bind(job_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(db_err)?;
+    }
+
+    Ok(())
+}
+
+pub async fn adopt_legacy_schema_to_21(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    _version: i64,
+    install_kind: MigrationInstallKind,
+) -> Result<(), StateError> {
+    if install_kind != MigrationInstallKind::Upgrade {
+        return Err(StateError::Database(
+            "adopt_legacy_schema_to_21 can only run during upgrade".to_string(),
+        ));
+    }
+    execute_sql(tx, MIGRATION_21_BASE_SCHEMA_SQL).await?;
+
+    let legacy_version = query_schema_version(tx).await?;
+    let Some(legacy_version) = legacy_version else {
+        return Err(StateError::Database(format!(
+            "legacy schema adoption requires an existing schema_version row, found {legacy_version:?}"
+        )));
+    };
+
+    match legacy_version {
+        1 => {
+            // The legacy synchronous SQLite path used VACUUM here to retroactively apply
+            // incremental auto_vacuum. Transactional sqlx adoption cannot issue
+            // VACUUM, so we preserve the schema/data transition and let runtime
+            // maintenance handle compaction separately.
+            mirror_schema_version(tx, LEGACY_SCHEMA_VERSION).await?;
+        }
+        2..=4 => {
+            ensure_column(
+                tx,
+                "active_extraction_chunks",
+                "appended",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            .await?;
+            ensure_column(tx, "servers", "priority", "INTEGER NOT NULL DEFAULT 0").await?;
+            mirror_schema_version(tx, LEGACY_SCHEMA_VERSION).await?;
+        }
+        5 => {
+            ensure_column(tx, "servers", "priority", "INTEGER NOT NULL DEFAULT 0").await?;
+            mirror_schema_version(tx, LEGACY_SCHEMA_VERSION).await?;
+        }
+        6..=18 => {
+            mirror_schema_version(tx, LEGACY_SCHEMA_VERSION).await?;
+        }
+        19..=CURRENT_SCHEMA_VERSION => {}
+        other => {
+            return Err(StateError::Database(format!(
+                "unsupported legacy schema version {other} (expected <= {CURRENT_SCHEMA_VERSION})"
+            )));
+        }
+    }
+
+    ensure_column(
+        tx,
+        "job_history",
+        "optional_recovery_bytes",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    ensure_column(
+        tx,
+        "job_history",
+        "optional_recovery_downloaded_bytes",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    ensure_column(
+        tx,
+        "active_extraction_chunks",
+        "start_offset",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    ensure_column(
+        tx,
+        "active_extraction_chunks",
+        "end_offset",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    ensure_column(
+        tx,
+        "active_jobs",
+        "normalization_retried",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    ensure_column(tx, "active_jobs", "queued_repair_at_epoch_ms", "REAL").await?;
+    ensure_column(tx, "active_jobs", "queued_extract_at_epoch_ms", "REAL").await?;
+    ensure_column(tx, "active_jobs", "paused_resume_status", "TEXT").await?;
+    ensure_column(tx, "active_jobs", "download_state", "TEXT").await?;
+    ensure_column(tx, "active_jobs", "post_state", "TEXT").await?;
+    ensure_column(tx, "active_jobs", "run_state", "TEXT").await?;
+    ensure_column(tx, "active_jobs", "paused_resume_download_state", "TEXT").await?;
+    ensure_column(tx, "active_jobs", "paused_resume_post_state", "TEXT").await?;
+    ensure_column(tx, "servers", "tls_ca_cert", "TEXT").await?;
+
+    if legacy_version <= LEGACY_SCHEMA_VERSION {
+        cleanup_legacy_queue_event_storage(tx).await?;
+    }
+
+    Ok(())
+}
+
+pub async fn upgrade_to_schema_22(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<(), StateError> {
+    execute_sql(tx, MIGRATION_22_SCHEMA_SQL).await?;
+    ensure_column(tx, "job_history", "last_diagnostic_id", "TEXT").await?;
+    ensure_column(
+        tx,
+        "job_history",
+        "last_diagnostic_uploaded_at_epoch_ms",
+        "INTEGER",
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn upgrade_to_schema_23(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<(), StateError> {
+    ensure_column(tx, "active_jobs", "nzb_zstd", "BLOB").await?;
+    ensure_column(tx, "job_history", "nzb_zstd", "BLOB").await?;
+    backfill_persisted_nzb_blobs(tx, "active_jobs").await?;
+    backfill_persisted_nzb_blobs(tx, "job_history").await?;
+    Ok(())
+}
+
+pub async fn upgrade_to_schema_25(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<(), StateError> {
+    ensure_column(tx, "job_history", "job_hash", "BLOB").await?;
+    ensure_column(tx, "active_jobs", "nzb_zstd", "BLOB").await?;
+    ensure_column(tx, "job_history", "nzb_zstd", "BLOB").await?;
+    backfill_persisted_nzb_blobs(tx, "active_jobs").await?;
+    backfill_persisted_nzb_blobs(tx, "job_history").await?;
+    refresh_active_job_hashes(tx).await?;
+    backfill_job_history_hashes(tx).await?;
+    Ok(())
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: the migration run, alone at startup before the gate exists"
+)]
+pub async fn restart_active_jobs_drop_active_segments_v28(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<(), StateError> {
+    for table in [
+        "active_file_progress",
+        "active_files",
+        "active_file_identities",
+        "active_par2",
+        "active_par2_files",
+        "active_extracted",
+        "active_failed_extractions",
+        "active_extraction_chunks",
+        "active_archive_headers",
+        "active_rar_volume_facts",
+        "active_detected_archives",
+        "active_volume_status",
+        "active_rar_verified_suspect",
+    ] {
+        let sql = format!("DELETE FROM {table}");
+        sqlx::query(AssertSqlSafe(sql.as_str()))
+            .execute(&mut **tx)
+            .await
+            .map_err(db_err)?;
+    }
+
+    sqlx::query(
+        "UPDATE active_jobs
+         SET download_state = 'queued',
+             post_state = 'idle',
+             error = NULL,
+             queued_repair_at_epoch_ms = NULL,
+             queued_extract_at_epoch_ms = NULL,
+             paused_resume_status = CASE
+                 WHEN status = 'paused' OR run_state = 'paused' THEN 'queued'
+                 ELSE NULL
+             END,
+             paused_resume_download_state = CASE
+                 WHEN status = 'paused' OR run_state = 'paused' THEN 'queued'
+                 ELSE NULL
+             END,
+             paused_resume_post_state = CASE
+                 WHEN status = 'paused' OR run_state = 'paused' THEN 'idle'
+                 ELSE NULL
+             END,
+             status = CASE
+                 WHEN status = 'paused' OR run_state = 'paused' THEN 'paused'
+                 ELSE 'queued'
+             END,
+             run_state = CASE
+                 WHEN status = 'paused' OR run_state = 'paused' THEN 'paused'
+                 ELSE 'active'
+             END",
+    )
+    .execute(&mut **tx)
+    .await
+    .map_err(db_err)?;
+
+    sqlx::query("DROP TABLE IF EXISTS active_segments")
+        .execute(&mut **tx)
+        .await
+        .map_err(db_err)?;
+
     Ok(())
 }

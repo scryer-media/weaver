@@ -16,7 +16,7 @@ mod nearest;
 mod overrides;
 mod progress;
 pub mod providers;
-mod runner;
+use weaver_server_speedtest::speed_test::runner;
 mod service;
 pub(crate) mod torrent;
 #[cfg(any(test, feature = "test-support"))]

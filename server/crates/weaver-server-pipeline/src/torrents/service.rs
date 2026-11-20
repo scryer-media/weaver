@@ -43,7 +43,7 @@ use crate::torrents::sessions::{
 use crate::torrents::status::{self, Engine, Held, Queued};
 use crate::torrents::tee::Tee;
 use crate::torrents::{
-    FilePriority, KeptIntent, NamedBy, TorrentCounters, TorrentFile, TorrentIntent, TorrentRecord,
+    FilePriority, KeptIntent, TorrentCounters, TorrentFile, TorrentIntent, TorrentRecord,
     TorrentState, TrackerEntry,
 };
 use weaver_server_base::clock::{Clock, SystemClock};
@@ -78,7 +78,6 @@ use checkpoints::Landing;
 pub use disk_room::disk_warning;
 use disk_room::{DiskWait, NoRoom, Relook, RunMark};
 use intake::client_of;
-pub(crate) use intake::metainfo_is_private;
 pub use intake::{AddError, AddRequest, AddSource, Placement};
 use live::{Live, Timed};
 #[cfg(test)]
@@ -97,6 +96,8 @@ pub use views::{
     ClockFields, PeerKinds, RowParts, TorrentLeg, TorrentPieces, TorrentSupport, TorrentView,
     ViewClock,
 };
+#[cfg(test)]
+pub(crate) use weaver_server_torrents::torrents::metainfo::metainfo_is_private;
 
 // Why a magnet with no trackers is turned away on a route with no DHT.
 const NEEDS_DHT: &str = "a magnet with no trackers needs DHT, which this route does not carry";
@@ -406,16 +407,6 @@ pub enum ActionError {
 
 fn state_error(error: StateError) -> String {
     error.to_string()
-}
-
-// A tracker the torrent's metainfo names.
-fn tracker(tier: u32, url: &[u8]) -> Option<TrackerEntry> {
-    let url = std::str::from_utf8(url).ok()?.trim();
-    (!url.is_empty()).then(|| TrackerEntry {
-        tier,
-        url: url.to_owned(),
-        named_by: NamedBy::Torrent,
-    })
 }
 
 // `trackers` as a torrent lists them: by tier, in the order given within a

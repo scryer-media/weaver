@@ -6,15 +6,15 @@
 // makes its own. The host is read by the one function that reads it for
 // storage and for matching, so a host stored here is the host matched later.
 
-use crate::StateError;
-use crate::persistence::sql_runtime::{SqlArg, SqlConn};
-use crate::settings::model::tracker_host;
+use weaver_server_db::persistence::StateError;
+use weaver_server_db::persistence::sql_runtime::{SqlArg, SqlConn};
+use weaver_server_settings::settings::model::tracker_host;
 
-pub(crate) const HOOK_ID: &str = "fill_tracker_hosts_v105";
+pub const HOOK_ID: &str = "fill_tracker_hosts_v105";
 
 // Run the step on a connection that is already inside the transaction it
 // belongs to.
-pub(crate) async fn fill_tracker_hosts(conn: &mut SqlConn<'_>) -> Result<(), StateError> {
+pub async fn fill_tracker_hosts(conn: &mut SqlConn<'_>) -> Result<(), StateError> {
     let rows = conn
         .fetch_all("SELECT DISTINCT url FROM torrent_trackers", &[])
         .await?;

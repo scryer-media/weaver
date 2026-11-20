@@ -409,30 +409,6 @@ pub fn tunnel_mtu(profiles: &HashMap<u32, ProxyProfile>, proxy: u32) -> u16 {
         .map_or(DEFAULT_MTU, |profile| profile.mtu)
 }
 
-impl Consumer {
-    // The consumer a stored route key names.
-    pub fn from_key(key: &str) -> Option<Self> {
-        use super::TorrentScope;
-        let id = |rest: &str| rest.parse().ok();
-        if key == "outbound" {
-            return Some(Self::Outbound);
-        }
-        if key == "torrent:default" {
-            return Some(Self::Torrent(TorrentScope::Default));
-        }
-        if let Some(rest) = key.strip_prefix("torrent:category:") {
-            return id(rest).map(|id| Self::Torrent(TorrentScope::Category(id)));
-        }
-        if let Some(rest) = key.strip_prefix("torrent:tracker:") {
-            return id(rest).map(|id| Self::Torrent(TorrentScope::TrackerRule(id)));
-        }
-        if let Some(rest) = key.strip_prefix("server:") {
-            return id(rest).map(Self::Server);
-        }
-        key.strip_prefix("rss:").and_then(id).map(Self::Rss)
-    }
-}
-
 #[cfg(test)]
 #[path = "socket_ledger_tests.rs"]
 mod tests;

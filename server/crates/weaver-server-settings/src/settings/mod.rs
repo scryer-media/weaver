@@ -6,6 +6,7 @@ pub mod model;
 pub mod persistence;
 pub mod queries;
 pub mod record;
+pub mod repository;
 pub mod tracker_file;
 pub use model::{Leaf, SeedingPolicy};
 pub mod archive_passwords;

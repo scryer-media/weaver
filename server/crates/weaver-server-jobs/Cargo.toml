@@ -7,6 +7,8 @@ license-file.workspace = true
 repository.workspace = true
 
 [dependencies]
+rmp-serde = { workspace = true, default-features = false }
+zstd = { workspace = true }
 unicase = { version = "2.10.0", default-features = false }
 unicode-normalization = { workspace = true }
 blake3 = { workspace = true }

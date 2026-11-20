@@ -46,7 +46,7 @@ const LIFTED: &[(&str, usize)] = &[
         2,
     ),
     (
-        "server/crates/weaver-server-pipeline/src/history/timeline.rs",
+        "server/crates/weaver-server-history/src/history/timeline.rs",
         1,
     ),
     (
@@ -70,11 +70,11 @@ const LIFTED: &[(&str, usize)] = &[
         10,
     ),
     (
-        "server/crates/weaver-server-pipeline/src/operations/backup/restore.rs",
+        "server/crates/weaver-server-core/src/operations/backup/restore.rs",
         2,
     ),
     (
-        "server/crates/weaver-server-pipeline/src/operations/backup/upgrade.rs",
+        "server/crates/weaver-server-core/src/operations/backup/upgrade.rs",
         1,
     ),
     (
@@ -99,14 +99,10 @@ const LIFTED: &[(&str, usize)] = &[
     ),
     (
         "server/crates/weaver-server-migrations/src/schema_migrations.rs",
-        7,
+        12,
     ),
     (
-        "server/crates/weaver-server-pipeline/src/schema_migrations.rs",
-        5,
-    ),
-    (
-        "server/crates/weaver-server-pipeline/src/schema_migrations/nzb_tables_v85.rs",
+        "server/crates/weaver-server-migrations/src/schema_migrations/nzb_tables_v85.rs",
         1,
     ),
     (

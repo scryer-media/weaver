@@ -6,84 +6,16 @@
 // compressed blob, one `active_job_outlines` row per job. The row goes with
 // the job's other active rows when it leaves.
 //
-// The blob is a format byte, then one zstd frame (level 3) of a MessagePack
-// body: the job's distinct group lists once, then one entry per file, in the
-// NZB's file order, naming its group list by index:
-//
-//   ([groups, ...], [(full_name, groups_index, date, articles, bytes), ...])
-
 use std::collections::HashMap;
 
 use rayon::prelude::*;
 
 use crate::StateError;
-use crate::ingest::outline::{NzbOutline, OutlineFile};
+use crate::ingest::outline::NzbOutline;
 use crate::persistence::Database;
-use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx, db_err, max_rows_for_engine};
+use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx, max_rows_for_engine};
 use weaver_server_base::jobs::ids::JobId;
-
-// The one format this build writes and reads.
-const OUTLINE_FORMAT: u8 = 1;
-const OUTLINE_ZSTD_LEVEL: i32 = 3;
-
-type StoredFile<'a> = (&'a str, u32, u64, u32, u64);
-type ReadFile = (String, u32, u64, u32, u64);
-
-// The stored blob of an outline's files.
-pub(crate) fn encode_outline_files(files: &[OutlineFile]) -> Result<Vec<u8>, StateError> {
-    let mut lists: Vec<&[String]> = Vec::new();
-    let mut index: HashMap<&[String], u32> = HashMap::new();
-    let rows: Vec<StoredFile<'_>> = files
-        .iter()
-        .map(|file| {
-            let next = lists.len() as u32;
-            let at = *index.entry(file.groups.as_slice()).or_insert_with(|| {
-                lists.push(file.groups.as_slice());
-                next
-            });
-            (
-                file.full_name.as_str(),
-                at,
-                file.date,
-                file.articles,
-                file.bytes,
-            )
-        })
-        .collect();
-    let body = rmp_serde::to_vec(&(lists, rows)).map_err(db_err)?;
-    let packed = zstd::bulk::compress(&body, OUTLINE_ZSTD_LEVEL).map_err(db_err)?;
-    let mut blob = Vec::with_capacity(1 + packed.len());
-    blob.push(OUTLINE_FORMAT);
-    blob.extend_from_slice(&packed);
-    Ok(blob)
-}
-
-// The files of a stored blob. Every failure is total: a blob that is not
-// exactly one outline of this format holds no file.
-pub(crate) fn decode_outline_files(blob: &[u8]) -> Result<Vec<OutlineFile>, String> {
-    let (&format, packed) = blob.split_first().ok_or("empty outline")?;
-    if format != OUTLINE_FORMAT {
-        return Err(format!("outline format {format} is not {OUTLINE_FORMAT}"));
-    }
-    let body = zstd::stream::decode_all(packed).map_err(|error| error.to_string())?;
-    let (lists, rows): (Vec<Vec<String>>, Vec<ReadFile>) =
-        rmp_serde::from_slice(&body).map_err(|error| error.to_string())?;
-    rows.into_iter()
-        .map(|(full_name, at, date, articles, bytes)| {
-            let groups = lists
-                .get(at as usize)
-                .cloned()
-                .ok_or_else(|| format!("outline file names group list {at}, which it lacks"))?;
-            Ok(OutlineFile {
-                full_name,
-                groups,
-                date,
-                articles,
-                bytes,
-            })
-        })
-        .collect()
-}
+use weaver_server_jobs::jobs::outline_persistence::{decode_outline_files, encode_outline_files};
 
 // The outline's columns on the active row, the password sealed, and its
 // files' stored blob.
@@ -277,6 +209,7 @@ mod tests {
 
     use super::*;
     use crate::ActiveJob;
+    use weaver_server_jobs::jobs::outline_persistence::{OUTLINE_FORMAT, OutlineFile};
 
     fn active_job(id: u64) -> ActiveJob {
         ActiveJob {
@@ -470,6 +403,7 @@ mod tests {
             .collect();
         let body =
             zstd::stream::decode_all(&encode_outline_files(&same_groups).unwrap()[1..]).unwrap();
+        type ReadFile = (String, u32, u64, u32, u64);
         let (lists, rows): (Vec<Vec<String>>, Vec<ReadFile>) =
             rmp_serde::from_slice(&body).unwrap();
         assert_eq!(lists.len(), 1);

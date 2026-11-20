@@ -5,3 +5,4 @@ pub use weaver_server_pipeline::*;
 pub mod operations;
 pub mod persistence;
 pub mod proxies;
+pub mod support;

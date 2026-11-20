@@ -4,12 +4,13 @@
 use super::sql_runtime::{SqlArg, SqlRuntime};
 use super::{Database, StateError};
 use std::collections::HashSet;
-pub(crate) use weaver_server_db::persistence::maintenance::*;
+#[cfg(test)]
+use weaver_server_db::persistence::maintenance::*;
 
 impl Database {
     // Every job with a record, live, a torrent, or in the history: the jobs
     // whose per-job directories are still theirs.
-    pub(crate) fn recorded_job_ids(&self) -> Result<HashSet<u64>, StateError> {
+    pub fn recorded_job_ids(&self) -> Result<HashSet<u64>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             let rows = SqlRuntime::fetch_all(
