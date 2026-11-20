@@ -4,3 +4,4 @@
 pub mod bandwidth;
 pub mod proxies;
 pub mod servers;
+pub mod torrents;

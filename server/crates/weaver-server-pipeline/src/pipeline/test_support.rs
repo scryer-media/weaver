@@ -28,9 +28,9 @@ pub async fn idle_pipeline(
     let (events, _) = broadcast::channel(1024);
     let state = crate::SharedPipelineState::new(PipelineMetrics::new(), vec![]);
     let handle = crate::SchedulerHandle::new(events.clone(), state.clone());
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     let writers = crate::pipeline::graph::disk::threads::writers();
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "pipeline-test-fixtures")))]
     let writers = std::sync::Arc::new(crate::operations::VolumeWriters::new());
     let pipeline = Pipeline::new(
         events,
@@ -172,9 +172,35 @@ pub fn put_history_download_summary(
     .unwrap();
 }
 
+/// The pipeline's shared state, for the tests of the services above it.
+pub fn shared_state(pipeline: &Pipeline) -> crate::SharedPipelineState {
+    pipeline.shared_state.clone()
+}
+
+/// The pipeline's event sender, for the tests of the services above it.
+pub fn event_tx(pipeline: &Pipeline) -> broadcast::Sender<PipelineEvent> {
+    pipeline.event_tx.clone()
+}
+
+/// Apply the intents posted to the queue now, as the pipeline's own turn
+/// does.
+pub async fn apply_queue_intents(pipeline: &mut Pipeline) {
+    pipeline.apply_queue_intents().await;
+}
+
+/// Install real admission resources on `state`'s queue without running the
+/// data plane.
+pub fn install_admission_resources(
+    state: &crate::SharedPipelineState,
+    db: crate::Database,
+    root: &std::path::Path,
+) {
+    let _ = state.queue.resources.set(admission_resources(db, root));
+}
+
 /// Initialize real admission resources without running the data plane.
-#[cfg(test)]
-pub(crate) fn admission_resources(
+#[cfg(any(test, feature = "test-support"))]
+pub fn admission_resources(
     db: crate::Database,
     root: &std::path::Path,
 ) -> queue::AdmissionResources {

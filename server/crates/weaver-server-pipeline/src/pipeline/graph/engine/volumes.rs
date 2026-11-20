@@ -52,7 +52,7 @@ impl From<Unreadable> for io::Error {
     }
 }
 
-pub(crate) struct RunVolumes {
+pub struct RunVolumes {
     shelf: Arc<Shelf>,
     generation: u64,
     // The run's handles are registered with the storage owner for draining.
@@ -85,7 +85,7 @@ impl std::fmt::Debug for RunVolumes {
 }
 
 impl RunVolumes {
-    pub(crate) fn new(shelf: Arc<Shelf>, generation: u64) -> Self {
+    pub fn new(shelf: Arc<Shelf>, generation: u64) -> Self {
         Self {
             files: shelf.reader_files(),
             volume: shelf.volume().cloned(),
@@ -106,7 +106,7 @@ impl RunVolumes {
 
     // The run gives back the read turn it holds: it waits on something
     // other than the disk, or it ended.
-    pub(crate) fn let_go(&self) {
+    pub fn let_go(&self) {
         self.files
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -138,7 +138,7 @@ impl RunVolumes {
     // nothing it says from here on is heard. Set under the shelf's lock, so
     // a run between a look at the shelf and its wait on it is woken too, and
     // raised on its files, so a read waiting for a turn is woken as well.
-    pub(crate) fn stop(&self) {
+    pub fn stop(&self) {
         self.shelf.update(|_| {
             self.stopped.store(true, Ordering::Release);
             self.files.stop.raise();
@@ -178,8 +178,8 @@ impl RunVolumes {
         std::time::Duration::from_nanos(self.decoded.load(Ordering::Acquire))
     }
 
-    #[cfg(test)]
-    pub(super) fn open_files(&self) -> usize {
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn open_files(&self) -> usize {
         self.files
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -188,22 +188,20 @@ impl RunVolumes {
     }
 
     // The run's next read stops inside its disk call until the test lets it.
-    #[cfg(test)]
-    pub(super) fn hang_next_read(
-        &self,
-    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn hang_next_read(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
         self.files.hang_next_read()
     }
 
     // Returns once `waiters` of the run's reads wait for a turn.
-    #[cfg(test)]
-    pub(super) fn await_turn_waiters(&self, waiters: usize) {
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn await_turn_waiters(&self, waiters: usize) {
         self.files.stop.await_waiters(waiters);
     }
 
     // Whether the run holds a read turn.
-    #[cfg(test)]
-    pub(super) fn holds_turn(&self) -> bool {
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn holds_turn(&self) -> bool {
         self.files
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -213,7 +211,7 @@ impl RunVolumes {
 
     // Whether a read failed because nothing will bring its bytes, and the
     // run did not read on past them.
-    pub(crate) fn lost(&self) -> bool {
+    pub fn lost(&self) -> bool {
         !self.spans().is_empty()
     }
 
@@ -223,7 +221,7 @@ impl RunVolumes {
 
     // Whether every volume the run reads is in: no volume can join, and
     // each bound one has closed.
-    pub(crate) fn all_in(&self) -> bool {
+    pub fn all_in(&self) -> bool {
         let state = self.shelf.lock();
         state.complete
             && !state.deciding
@@ -236,7 +234,7 @@ impl RunVolumes {
     }
 
     // Whether the run may still speak: nothing has stopped it.
-    pub(crate) fn current(&self) -> bool {
+    pub fn current(&self) -> bool {
         !self.stopped() && self.shelf.generation() == self.generation
     }
 
@@ -469,7 +467,7 @@ impl Volumes for RunVolumes {
                     (Arc::clone(&file), Some(file))
                 }
             };
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             self.files.in_read();
             read_exact_at(&file, offset, &mut into[..len])?;
             Ok(opened)

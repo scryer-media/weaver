@@ -8,7 +8,7 @@ use weaver_server_base::operations::metrics::SchedulerBlockClause;
 // The clauses that refused a job's articles during one scan, so the
 // scheduler can say what kept a blocked job from the asking server.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(in crate::pipeline::download) struct BlockedBy(u16);
+pub struct BlockedBy(u16);
 
 impl BlockedBy {
     pub(in crate::pipeline::download) fn only(clause: SchedulerBlockClause) -> Self {
@@ -32,7 +32,7 @@ impl BlockedBy {
 // listed file's queued count: one step per file the job lists. `Ok` when a
 // bootstrap file has an article queued, or when the queue holds an article
 // of a file the job does not list, which is left to the scan to judge.
-pub(in crate::pipeline::download) fn queued_files_may_pass(
+pub fn queued_files_may_pass(
     files: usize,
     bootstrap_files: &[u32],
     queued_in_all: usize,
@@ -682,7 +682,7 @@ impl Pipeline {
         }
     }
 
-    pub(in crate::pipeline) fn activate_download_batch_lease(
+    pub fn activate_download_batch_lease(
         &mut self,
         lease: &DownloadBatchLease,
         activation_items: &[(SegmentId, NzbFileId, u64)],

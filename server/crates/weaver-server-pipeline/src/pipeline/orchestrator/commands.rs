@@ -97,11 +97,7 @@ impl Pipeline {
         activation
     }
 
-    pub(crate) async fn rename_working_dir_when_quiet(
-        &mut self,
-        job_id: JobId,
-        name: &str,
-    ) -> bool {
+    pub async fn rename_working_dir_when_quiet(&mut self, job_id: JobId, name: &str) -> bool {
         let Some(state) = self.jobs.get(&job_id) else {
             return false;
         };
@@ -223,7 +219,7 @@ impl Pipeline {
 
 // What a cancelled job's directory cleanup waits for and removes, carried
 // from the turn that takes the cancel to the turn that handles its archive.
-pub(in crate::pipeline) struct CancelledJobCleanup {
+pub struct CancelledJobCleanup {
     job_id: JobId,
     post_processing_done: Option<tokio::sync::watch::Receiver<bool>>,
     working_dir: PathBuf,
@@ -238,7 +234,7 @@ pub(in crate::pipeline) struct CancelledJobCleanup {
 
 // A cancel batch's archive outcome, carried back to the actor once the
 // archive write has answered.
-pub(crate) struct CancelJobsDone {
+pub struct CancelJobsDone {
     cleanups: Vec<CancelledJobCleanup>,
     // The ids whose archive failed and why; an error means the writer closed
     // before answering.
@@ -317,7 +313,7 @@ impl Pipeline {
     // The archive has answered. Each id it committed leaves memory and the
     // Queue with one `JobCancelled`; an id whose archive failed, or every id
     // when the writer closed first, is live again.
-    pub(in crate::pipeline) fn handle_cancel_jobs_done(&mut self, done: CancelJobsDone) {
+    pub fn handle_cancel_jobs_done(&mut self, done: CancelJobsDone) {
         let CancelJobsDone {
             cleanups,
             archived,

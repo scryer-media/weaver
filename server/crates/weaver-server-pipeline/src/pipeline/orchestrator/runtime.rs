@@ -424,7 +424,7 @@ impl Pipeline {
             dirty_support_facts: HashSet::new(),
             reports_due: HashSet::new(),
             server_attribution_checkpoint_at: Instant::now(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             par2_ignore_extensions_override: None,
             #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             pending_decode: VecDeque::new(),
@@ -512,9 +512,9 @@ impl Pipeline {
             unservable_booking_depth: (0, 0),
             #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             spent_message_ids: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             dispatch_hold_items_examined: Default::default(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             login_refusal_sets_examined: Default::default(),
             last_download_dispatch_stall_log_at: None,
             download_dispatch_liveness_since: None,
@@ -2004,7 +2004,7 @@ impl Pipeline {
     // flight, and the pass-end gates read the job-wide one. Draining it here
     // for fresh work would cancel some other segment's real pending retry and
     // let the download pass end before that retry fires.
-    pub(crate) fn enqueue_download_work(&mut self, work: DownloadWork) {
+    pub fn enqueue_download_work(&mut self, work: DownloadWork) {
         // Work every server is excluded from can never be seated by a lane:
         // the queue would hold it, and the job with it, indefinitely. Every
         // producer of a re-queue passes through here, so this is where the
@@ -2393,6 +2393,14 @@ impl Pipeline {
         // What the volume holds has the stop's span to be put down, after
         // this. The runs are stopped first, so one that goes on says no
         // more.
+        //
+        // The wait ends only because nothing new goes out: a repair the
+        // stop ended lends the set's next as it is taken back, and that one
+        // is stopped in turn, round and round. So the drain raises the
+        // shutdown that refuses every loan itself, whoever began it.
+        self.shared_state
+            .shutdown_started()
+            .store(true, std::sync::atomic::Ordering::Release);
         let limit = self.graph_slot_limit();
         for job in self.graph_jobs.values_mut() {
             job.stop_runs(limit);
@@ -2488,7 +2496,7 @@ pub(crate) fn compute_decode_backlog_budget_bytes(
 // The figure every volume's buffer limits are sized on, and the memory that
 // caps it: from the hardware profile in force, the machine's memory and what
 // the configured connections hold in flight.
-pub(in crate::pipeline) fn volume_buffer_figure(
+pub fn volume_buffer_figure(
     hardware_profile: crate::runtime::HardwareProfile,
     profile: &SystemProfile,
     connections: usize,
@@ -2541,6 +2549,7 @@ pub(crate) mod actor_db {
             .or_default() += 1;
     }
 
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) fn total() -> u64 {
         CALLS
             .lock()

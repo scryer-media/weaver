@@ -1267,6 +1267,135 @@ fn a_file_key_is_derived_on_the_loan_not_in_the_offer() {
     }
 }
 
+// The cache answers a file key's lookup, then other jobs push every entry
+// out: the store takes the answer it was given, and a key the cache no
+// longer holds is derived on the loan, never in the offer.
+#[test]
+fn a_file_key_the_cache_drops_after_answering_is_not_derived_in_the_offer() {
+    for version in [Version::Rar5, Version::Rar4] {
+        let keys = Arc::new(Keys::new(CAPACITY));
+        let volumes = write(&items(), &encrypted(version, false));
+        let mut first = Owner::named(RarStore::with_keys(Arc::clone(&keys)), volumes.clone());
+        first.offer(PASSWORD);
+        first.whole(4096);
+        let derived = keys.derivations();
+        assert!(derived > 0, "{version:?}");
+
+        let mut owner = Owner::named(RarStore::with_keys(Arc::clone(&keys)), volumes);
+        owner.frames(0, 4096);
+        keys.evict_after_next_get();
+        owner.offer_unworked(PASSWORD);
+        assert_eq!(
+            keys.derivations(),
+            derived,
+            "{version:?} derived in the offer"
+        );
+        assert!(owner.object.work_due(), "{version:?}");
+        owner.settle();
+        owner.close(0);
+        owner.said.retain(|emit| *emit != Emit::NeedsPassword);
+        no_trouble(&owner);
+        streamed(&owner);
+        posted_whole(&owner);
+        assert!(
+            keys.derivations() > derived,
+            "{version:?} derived on the loan"
+        );
+        assert!(!owner.object.work_due(), "{version:?}");
+    }
+}
+
+// Enciphered headers are checked away from the loop: neither the delivery
+// that finds them nor the offer that names a candidate runs a key
+// derivation; the check is the store's work, and a wrong candidate then the
+// right one end as they did inline.
+fn header_check_on_the_loan(version: Version) {
+    let keys = Arc::new(Keys::new(CAPACITY));
+    let derivations = |keys: &Keys| {
+        let kdf = keys.kdf();
+        kdf.rar5_derivation_count() + kdf.rar4_derivation_count() + keys.derivations()
+    };
+    let volumes = write(&items(), &encrypted(version, true));
+    let length = volumes[0].len() as u64;
+    let mut owner = Owner::named(RarStore::with_keys(Arc::clone(&keys)), volumes);
+    owner.offer_unworked("not-the-passphrase");
+    assert!(!owner.object.work_due(), "{version:?}");
+
+    owner.deliver_unworked(0, ByteRange::new(0, length));
+    assert_eq!(derivations(&keys), 0, "{version:?} derived in the delivery");
+    assert!(owner.object.work_due(), "{version:?}");
+    assert!(owner.object.headers_open.is_none(), "{version:?}");
+    assert!(!owner.said.contains(&Emit::NeedsPassword), "{version:?}");
+    owner.settle();
+    assert!(derivations(&keys) > 0, "{version:?}");
+    assert!(owner.said.contains(&Emit::NeedsPassword), "{version:?}");
+    assert!(owner.object.headers_open.is_none(), "{version:?}");
+    assert!(owner.members.is_empty(), "{version:?}");
+    assert!(!owner.object.work_due(), "{version:?}");
+
+    let before = derivations(&keys);
+    owner.offer_unworked(PASSWORD);
+    assert_eq!(
+        derivations(&keys),
+        before,
+        "{version:?} derived in the offer"
+    );
+    assert!(owner.object.work_due(), "{version:?}");
+    assert!(owner.object.headers_open.is_none(), "{version:?}");
+    owner.settle();
+    assert_eq!(owner.object.headers_open, Some(1), "{version:?}");
+    owner.close(0);
+    owner.said.retain(|emit| *emit != Emit::NeedsPassword);
+    no_trouble(&owner);
+    streamed(&owner);
+    posted_whole(&owner);
+    assert!(!owner.object.work_due(), "{version:?}");
+}
+
+#[test]
+fn a_rar5_header_check_runs_on_the_loan_not_in_the_delivery_or_the_offer() {
+    header_check_on_the_loan(Version::Rar5);
+}
+
+#[test]
+fn a_rar4_header_check_runs_on_the_loan_not_in_the_delivery_or_the_offer() {
+    header_check_on_the_loan(Version::Rar4);
+}
+
+// Only wrong candidates: the check on the loan refutes each, the store asks,
+// and at quiet the headers are refused, as inline.
+#[test]
+fn wrong_header_candidates_are_refuted_on_the_loan_and_refused_at_quiet() {
+    for version in [Version::Rar5, Version::Rar4] {
+        let volumes = write(&items(), &encrypted(version, true));
+        let length = volumes[0].len() as u64;
+        let mut owner = Owner::named(RarStore::with_keys(Arc::new(Keys::new(CAPACITY))), volumes);
+        owner.offer_unworked("not-the-passphrase");
+        owner.offer_unworked("not-that-either");
+        owner.deliver_unworked(0, ByteRange::new(0, length));
+        assert!(owner.object.work_due(), "{version:?}");
+        assert!(!owner.said.contains(&Emit::NeedsPassword), "{version:?}");
+        owner.settle();
+        assert!(owner.said.contains(&Emit::NeedsPassword), "{version:?}");
+        assert!(
+            owner
+                .object
+                .candidates
+                .iter()
+                .all(|candidate| candidate.headers_wrong),
+            "{version:?}"
+        );
+        owner.close(0);
+        assert!(owner.members.is_empty(), "{version:?}");
+        owner.quiet();
+        assert!(
+            owner.said.contains(&Emit::Refuse(Why::EncryptedHeader)),
+            "{version:?} {:?}",
+            owner.said
+        );
+    }
+}
+
 // One key cache per process: a second store offered the same password over
 // the same salts derives nothing, neither a file key nor a header check.
 #[test]
@@ -2717,6 +2846,33 @@ fn the_open_volumes_filed_agree_with_a_walk_of_every_volume() {
         assert_eq!(store.finished(), walked(&store));
     }
     assert!(store.finished());
+}
+
+// Every give-back goes through one gate: a volume the layout placed pieces
+// in stays, whichever path asks, since its bytes went to the store's members
+// and the tree could only refuse it. A volume no piece lies in still goes,
+// and the tree is handed it.
+#[test]
+fn a_volume_the_layout_placed_is_never_given_back() {
+    let volumes = write(&items(), &split(Version::Rar5));
+    assert!(volumes.len() >= 3, "{}", volumes.len());
+    let mut owner = Owner::named(store(), volumes);
+    owner.whole(usize::MAX >> 1);
+    streamed(&owner);
+    let mapped = VolumeIndex(1);
+    assert!(!owner.object.unmapped.contains(&mapped));
+    let mut out = Vec::new();
+    owner.object.give_back_held(vec![mapped], &mut out);
+    assert!(!out.contains(&Emit::GiveBack(mapped)), "{out:?}");
+    assert!(owner.object.volumes.contains_key(&mapped));
+    assert!(owner.object.give_back(mapped).is_none());
+
+    let mut unplaced = store();
+    unplaced.bound(VolumeIndex(0), "alpha.part1.rar", &[], None);
+    let mut out = Vec::new();
+    unplaced.give_back_held(vec![VolumeIndex(0)], &mut out);
+    assert_eq!(out, vec![Emit::GiveBack(VolumeIndex(0))]);
+    assert!(unplaced.give_back(VolumeIndex(0)).is_some());
 }
 
 // A repair inside a run of several MiB cuts it, and what it cut and

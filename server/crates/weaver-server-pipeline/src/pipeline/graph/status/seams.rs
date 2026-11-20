@@ -32,7 +32,7 @@ use weaver_server_base::operations::instrumentation::{JobStageKind, StageOutcome
 // The completion gate hands the job here: there is no whole-file
 // verification, no listing check and no re-scan of the output, since the
 // tree already ruled on every member as it arrived.
-pub(in crate::pipeline) async fn advance(pipeline: &mut Pipeline, job_id: JobId) {
+pub async fn advance(pipeline: &mut Pipeline, job_id: JobId) {
     let Some(state) = pipeline.jobs.get(&job_id) else {
         return;
     };
@@ -110,6 +110,7 @@ pub(in crate::pipeline) async fn advance(pipeline: &mut Pipeline, job_id: JobId)
     // Nothing is delivered while a name waits to be judged: the job holds
     // its files and waits for the operator, as an unwritable checkpoint
     // does, and its resume reads the policy again.
+    let policy_read = unread.is_ok();
     if let (Step::Deliver, Err(error)) = (&step, unread) {
         pipeline.hold_graph_job_on_host_error(
             job_id,
@@ -117,7 +118,13 @@ pub(in crate::pipeline) async fn advance(pipeline: &mut Pipeline, job_id: JobId)
         );
         return;
     }
+    let waits = step == Step::Wait;
     settle(pipeline, job_id, step).await;
+    // A wait this turn left with nothing pending can never be lifted. A
+    // policy still unread is read again at the next check.
+    if waits && policy_read {
+        pipeline.end_if_stalled(job_id).await;
+    }
 }
 
 // What an advance came to, applied to the job. A job with nothing left to
@@ -275,37 +282,45 @@ fn unused_sets(job_id: JobId, job: &GraphJob) -> Vec<PipelineEvent> {
         .collect()
 }
 
-fn asker(job_id: JobId) -> AskerId {
+pub(super) fn asker(job_id: JobId) -> AskerId {
     AskerId(job_id.0)
 }
 
 // Whether a root member is a file of the payload, as the census and the
 // delivery read it. The object that holds it says what it is: a member a
 // recovery object holds is recovery whatever its posted name, and one any
-// other object holds is payload. A member no object holds is what its
-// posted name says, and one past the posted files is a file a recovery
-// object announced, which is payload. A member named as recovery that a
+// other object holds is payload. A member named as recovery that a
 // recovery object refused stays recovery; one another object refused is
-// payload.
+// payload. A member no object holds or refused is what its front says,
+// once the front has said, whatever its posted name: a `readme.par2` of
+// text is payload, a PAR1 volume under a hash is recovery
+// (`Namespace::recovery_by_front`). Short of a front, it is recovery data
+// when the tree spends it (`Tree::spends`: its posted name says it is
+// recovery among the names beside it, `.rev`, `.pNN` and `.parNN` among
+// them), and otherwise what it was posted as; one past the posted files is
+// a file a recovery object announced, which is payload.
 fn is_payload(job: &GraphJob, posted: &dyn Fn(MemberId) -> bool, member: MemberId) -> bool {
     let tree = job.tree();
     if let Some((owner, _)) = tree.child_of(NodeId::ROOT, member) {
         return !tree.recovers(owner);
     }
-    if posted(member) {
-        return true;
+    if let Some(owner) = tree.refused_by(NodeId::ROOT, member) {
+        return posted(member) || !tree.recovers(owner);
     }
-    tree.refused_by(NodeId::ROOT, member)
-        .is_some_and(|owner| !tree.recovers(owner))
+    match job.namespace().recovery_by_front(member) {
+        Some(recovery) => !recovery,
+        None => posted(member) && !tree.spends(NodeId::ROOT, member),
+    }
 }
 
 // Whether a posted file is a recovery volume, the job's optional recovery
 // bytes, by the rule `is_payload` reads: a file a recovery object holds is
 // recovery whatever its posted name, one another object holds or refused
-// is payload, and one no object holds yet is what its posted name says, so
-// the figure rises as a volume posted under another name binds. A set's
-// index is no volume, whoever holds it, when its name says it is one.
-pub(in crate::pipeline) fn recovery_volume(
+// is payload, and one no object holds yet is what its posted name says
+// until its front says it is no recovery data, so the figure rises as a
+// volume posted under another name binds. A set's index is no volume,
+// whoever holds it, when its name says it is one.
+pub fn recovery_volume(
     job: &GraphJob,
     file: &crate::jobs::model::FileSpec,
     member: MemberId,
@@ -316,6 +331,7 @@ pub(in crate::pipeline) fn recovery_volume(
         return tree.recovers(owner) && !index;
     }
     file.role.is_recovery()
+        && job.namespace().recovery_by_front(member) != Some(false)
         && tree
             .refused_by(NodeId::ROOT, member)
             .is_none_or(|owner| tree.recovers(owner))
@@ -323,25 +339,25 @@ pub(in crate::pipeline) fn recovery_volume(
 
 // What a job's posted files say, for `delivery_of`: the one place a job
 // class says it of its own files, the rest being read off the graph job.
-pub(crate) struct Posted<'a> {
+pub struct Posted<'a> {
     // How many files the job was posted with, root members 0 to this.
-    pub(crate) files: u32,
+    pub files: u32,
     // Whether a root member no object holds or refused is payload, by what
     // it was posted as.
-    pub(crate) payload: &'a dyn Fn(MemberId) -> bool,
+    pub payload: &'a dyn Fn(MemberId) -> bool,
     // The posted name of a root member none of whose declared bytes came,
     // given up whole.
-    pub(crate) lost: &'a dyn Fn(MemberId) -> Option<&'a str>,
+    pub lost: &'a dyn Fn(MemberId) -> Option<&'a str>,
     // The extensions whose damage leaves a delivery whole.
-    pub(crate) ignore: &'a [String],
+    pub ignore: &'a [String],
     // Why the job's post was given up, when the rulings say nothing.
-    pub(crate) given_up: Option<Failure>,
+    pub given_up: Option<Failure>,
 }
 
 // What a graph job hands over, file by file at every depth, off its
 // settled claims, with the repair failure that left any of it short: the
 // one reading of every job class's delivery.
-pub(crate) fn delivery_of(job: &GraphJob, posted: Posted<'_>) -> (Delivery, Option<Failure>) {
+pub fn delivery_of(job: &GraphJob, posted: Posted<'_>) -> (Delivery, Option<Failure>) {
     {
         let summary = RootJob::recovery_summary(job);
         let outcomes = summary.outcomes();
@@ -451,16 +467,19 @@ pub(crate) fn delivery_of(job: &GraphJob, posted: Posted<'_>) -> (Delivery, Opti
             // no usable file at any depth: a joined split or an archive an
             // archive held is a piece as much as a posted volume is. A
             // member whose name the file system refused has no file at all,
-            // and is no usable file either, however long it is.
+            // and is no usable file either, however long it is. A name that
+            // says recovery data says nothing once the member's front rules
+            // recovery out (`Namespace::recovery_by_front`): it is the plain
+            // file its bytes are.
             |node, member| {
                 job.writer().unnamable(node, member)
-                    || job
-                        .tree()
-                        .namespace(node)
-                        .and_then(|ns| ns.get(member))
-                        .is_some_and(|member| {
-                            crate::pipeline::post_health::names_a_piece(&member.output_name)
+                    || job.tree().namespace(node).is_some_and(|ns| {
+                        ns.get(member).is_some_and(|record| {
+                            crate::pipeline::post_health::names_a_piece(&record.output_name)
+                                && !(weaver_graph::sniff::names_recovery(&record.output_name)
+                                    && ns.recovery_by_front(member) == Some(false))
                         })
+                    })
             },
             unarrived,
         );
@@ -478,7 +497,7 @@ pub(crate) fn delivery_of(job: &GraphJob, posted: Posted<'_>) -> (Delivery, Opti
 // Why a delivery is short of whole, as every job class words it. A partial
 // delivery says what it lacks, from its lists; any other says why, and what
 // the policy left out beside it.
-pub(crate) fn shortfall_message(delivery: &Delivery, failure: Option<&Failure>) -> Option<String> {
+pub fn shortfall_message(delivery: &Delivery, failure: Option<&Failure>) -> Option<String> {
     if delivery.status(failure) == JobStatus::Partial {
         return Some(delivery.partial_error());
     }
@@ -595,10 +614,7 @@ impl Pipeline {
     // The terminal record of the job's delivery, from the census of its
     // root namespace at the last gate before the payload leaves. Returns the
     // operator-facing failure message when the census refuses the delivery.
-    pub(in crate::pipeline) fn reconcile_terminal_delivery(
-        &mut self,
-        job_id: JobId,
-    ) -> Result<(), String> {
+    pub fn reconcile_terminal_delivery(&mut self, job_id: JobId) -> Result<(), String> {
         let (Some(job), Some(state)) = (self.graph_jobs.get(&job_id), self.jobs.get(&job_id))
         else {
             return Ok(());
@@ -872,7 +888,7 @@ impl Pipeline {
             .is_some_and(|failure| failure.from_feed)
     }
 
-    pub(in crate::pipeline) fn graph_delivery(&self, job_id: JobId) -> Option<Delivery> {
+    pub fn graph_delivery(&self, job_id: JobId) -> Option<Delivery> {
         self.graph_ruling(job_id).map(|(delivery, _)| delivery)
     }
 
@@ -880,10 +896,7 @@ impl Pipeline {
     // stage that left it short, and the error a recovery object that could
     // not rebuild what it found words, or else what was withheld. `None`
     // once the job has gone.
-    pub(in crate::pipeline) fn graph_shortfall(
-        &self,
-        job_id: JobId,
-    ) -> Option<(PipelineFailureStage, Option<String>)> {
+    pub fn graph_shortfall(&self, job_id: JobId) -> Option<(PipelineFailureStage, Option<String>)> {
         self.graph_delivered_verdict(job_id)
             .map(|verdict| (verdict.shortfall_stage, verdict.shortfall_message))
     }
@@ -907,7 +920,7 @@ impl Pipeline {
 
     // The status a graph job with nothing left to wait for ends in. `None`
     // once the job has gone.
-    pub(in crate::pipeline) fn graph_terminal_status(&self, job_id: JobId) -> Option<JobStatus> {
+    pub fn graph_terminal_status(&self, job_id: JobId) -> Option<JobStatus> {
         let (delivery, failure) = self.graph_ruling(job_id)?;
         let status = delivery.status(failure.as_ref());
         if status == JobStatus::Partial {
@@ -943,7 +956,14 @@ impl Pipeline {
             return;
         };
         metrics::phase(phase);
-        let mut stage = stage_events(job_id, before, phase, &*graph);
+        let mut stage = stage_events(
+            job_id,
+            before,
+            phase,
+            &*graph,
+            graph.repair_reported(),
+            graph.repair_ended_at(),
+        );
         if phase == RootPhase::Done {
             self.post_probes.retire(job_id);
             log_set_rulings(job_id, graph);
@@ -1097,15 +1117,21 @@ impl Pipeline {
 
 // The stage events a change of the job's phase says: the stage it left
 // ends, and the one it entered starts. Verification passed when it led to
-// no repair and every set vouched; a repair failed when the job's own
-// failure names a set that could not rebuild what it found. A set that
-// ruled so where another set of its namespace vouched and left it clean is
-// not a failure of the job, and says none.
-pub(super) fn stage_events(
+// no repair and every set vouched. A repair failed is said once, as a job
+// that entered repair ends, when the job's own failure names a set that
+// could not rebuild what it found: a set that ruled so while another object
+// had still to repair is said nothing of when that repair made it good. A
+// set that ruled so where another set of its namespace vouched and left it
+// clean is not a failure of the job, and says none. The failure carries when
+// the repair stopped running, so the job's timeline puts it there and not at
+// the job's end.
+pub fn stage_events(
     job_id: JobId,
     before: Option<RootPhase>,
     phase: RootPhase,
     job: &dyn RootJob,
+    repair_reported: bool,
+    repair_ended_at: Option<i64>,
 ) -> Vec<PipelineEvent> {
     let summary = job.recovery_summary();
     let mut events = Vec::new();
@@ -1114,35 +1140,36 @@ pub(super) fn stage_events(
             job_id,
             passed: phase != RootPhase::Repairing && summary.settled(),
         }),
-        Some(RootPhase::Repairing) => {
-            let outcomes = summary.outcomes();
-            let failed = failure(&summary, &outcomes, job)
-                .map(|failure| failure.objects)
-                .unwrap_or_default();
-            if let Some((damaged, reachable)) =
-                summary
-                    .sets
-                    .iter()
-                    .zip(outcomes)
-                    .find_map(|(set, outcome)| match outcome {
-                        RepairOutcome::Impossible { damaged, reachable }
-                            if failed.contains(&set.node) =>
-                        {
-                            Some((damaged, reachable))
-                        }
-                        _ => None,
-                    })
-            {
-                events.push(PipelineEvent::RepairFailed {
-                    job_id,
-                    error: format!(
-                        "not repairable: {damaged} damaged slices, only {reachable} recovery blocks reachable"
-                    ),
-                });
-            }
-        }
         Some(RootPhase::Extracting) => events.push(PipelineEvent::ExtractionComplete { job_id }),
-        Some(RootPhase::Downloading | RootPhase::Done) | None => {}
+        Some(RootPhase::Repairing | RootPhase::Downloading | RootPhase::Done) | None => {}
+    }
+    if phase == RootPhase::Done && repair_reported {
+        let outcomes = summary.outcomes();
+        let failed = failure(&summary, &outcomes, job)
+            .map(|failure| failure.objects)
+            .unwrap_or_default();
+        if let Some((damaged, reachable)) =
+            summary
+                .sets
+                .iter()
+                .zip(outcomes)
+                .find_map(|(set, outcome)| match outcome {
+                    RepairOutcome::Impossible { damaged, reachable }
+                        if failed.contains(&set.node) =>
+                    {
+                        Some((damaged, reachable))
+                    }
+                    _ => None,
+                })
+        {
+            events.push(PipelineEvent::RepairFailed {
+                job_id,
+                error: format!(
+                    "not repairable: {damaged} damaged slices, only {reachable} recovery blocks reachable"
+                ),
+                ended_at_ms: repair_ended_at,
+            });
+        }
     }
     match phase {
         RootPhase::Verifying => events.push(PipelineEvent::JobVerificationStarted { job_id }),

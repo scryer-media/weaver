@@ -9,6 +9,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use weaver_server_pipeline::jobs::queries::JobsQueries;
 
 use std::path::PathBuf;
+use weaver_server_composition::{JobId, JobStatus};
 use weaver_server_pipeline::jobs::{ArchivePasswordCandidate, ArchivePasswordSource};
 use weaver_server_pipeline::pipeline::tests::history_fixture::database as pipeline_database;
 use weaver_server_pipeline::pipeline::tests::password_fixture::*;
@@ -20,7 +21,6 @@ use weaver_server_pipeline::pipeline::tests::{
     insert_active_job_with_persisted_nzb_named, insert_history_row_with_nzb_zstd,
     new_direct_pipeline, sample_nzb_zstd, standalone_job_spec,
 };
-use weaver_server_pipeline::{JobId, JobStatus};
 
 fn sample_nzb_zstd_with_password(password: &str) -> Vec<u8> {
     let nzb = format!(
@@ -33,7 +33,7 @@ fn sample_nzb_zstd_with_password(password: &str) -> Vec<u8> {
           </file>
         </nzb>"#
     );
-    weaver_server_pipeline::ingest::compress_nzb_bytes(nzb.as_bytes()).unwrap()
+    weaver_server_composition::ingest::compress_nzb_bytes(nzb.as_bytes()).unwrap()
 }
 
 async fn database(temp_dir: &tempfile::TempDir) -> sqlx::SqlitePool {
@@ -94,7 +94,7 @@ async fn add_job_records_streamed_nzb_hash_in_active_jobs() {
     let spec = standalone_job_spec("Streamed Hash", &[("episode.mkv".to_string(), 123)]);
     let nzb_path = PathBuf::from(format!("job-{}.nzb", job_id.0));
     let nzb_zstd = sample_nzb_zstd();
-    let expected_hash = weaver_server_pipeline::ingest::hash_persisted_nzb_bytes(&nzb_zstd);
+    let expected_hash = weaver_server_composition::ingest::hash_persisted_nzb_bytes(&nzb_zstd);
 
     add_job(
         &mut pipeline,

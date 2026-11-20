@@ -928,17 +928,25 @@ impl Tree {
     // consumed, whose output is what the object hands over in its stead,
     // unless it is a recovery object's whose volumes are released, as a
     // listing is kept beside what it lists. A member no object holds is
-    // spent when its posted name says it is recovery data: one whose first
-    // bytes were lost never said by them which set it is.
+    // spent when it is recovery data (`Namespace::recovery_data`): by its
+    // front, whatever its name, and by its posted name among the names
+    // beside it only when its first bytes were lost and never said. A
+    // `readme.par2` whose front is text, or a `.p12` with no set of its stem
+    // beside it, is a plain file, and is handed over. One an object that is
+    // not a recovery object refused is that object's file, never spent, as
+    // the status reads it.
     pub fn spends(&self, node: NodeId, member: MemberId) -> bool {
         match self.child_of(node, member) {
             Some((child, _)) => self
                 .recovery(child)
                 .is_none_or(|recovery| !recovery.released()),
-            None => self
-                .namespace(node)
-                .and_then(|namespace| namespace.get(member))
-                .is_some_and(|record| crate::sniff::names_recovery(&record.name)),
+            None => {
+                self.namespace(node)
+                    .is_some_and(|namespace| namespace.recovery_data(member))
+                    && self
+                        .refused_by(node, member)
+                        .is_none_or(|owner| self.recovers(owner))
+            }
         }
     }
 
@@ -2313,9 +2321,11 @@ impl Tree {
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) -> Option<String> {
+        let landed = self.landing(node, member);
         self.namespace_mut(node)?.rename(member, name)?;
         self.place(node, member, effects);
         self.renamed(node, member, builder, effects);
+        self.land_again_below(node, member, landed.as_deref(), effects);
         self.namespace(node)?
             .get(member)
             .map(|record| record.output_name.clone())

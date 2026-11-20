@@ -36,7 +36,7 @@ use crate::pipeline::graph::leaf::Leaf;
 // file on a turn of its own, a stored set's volume by volume, so the loop
 // turns between them. What it leaves to do once all are applied, and what
 // it passed on, are kept with it, so the batch ends as it would in one turn.
-pub(crate) struct GivingUp {
+pub struct GivingUp {
     effects: std::collections::VecDeque<Effect>,
     end: BatchEnd,
     out: Vec<Effect>,
@@ -637,7 +637,7 @@ impl NamespaceWriter {
 // The envelope in which the object at `node` places every byte of `ranges`
 // of its volume, at the volume's own offsets, if one does: that envelope's
 // file holds those bytes as the volume does.
-pub(super) fn kept_as_volume(
+pub fn kept_as_volume(
     tree: &Tree,
     (node, volume): (NodeId, weaver_graph::VolumeIndex),
     ranges: &[ByteRange],
@@ -669,10 +669,7 @@ pub(super) fn kept_as_volume(
 }
 
 // The parts of `range` no held range covers, in order.
-pub(super) fn outside(
-    range: ByteRange,
-    held: &[ByteRange],
-) -> impl Iterator<Item = ByteRange> + '_ {
+pub fn outside(range: ByteRange, held: &[ByteRange]) -> impl Iterator<Item = ByteRange> + '_ {
     let mut cuts: Vec<ByteRange> = held
         .iter()
         .filter_map(|hold| hold.intersect(range))

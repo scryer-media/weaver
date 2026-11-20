@@ -713,14 +713,37 @@ fn named(name: &str, piece: bool) -> Option<Kind> {
         .or_else(|| piece.then_some(Kind::Split))
 }
 
-// Whether a member's first bytes may still open a PAR2 or PAR3 volume:
-// none yet may, and any that differ from both magics cannot, however many
-// more come.
-pub fn may_open_par(first_bytes: &[u8]) -> bool {
-    [PAR2_MAGIC, PAR3_MAGIC].iter().any(|magic| {
-        let seen = first_bytes.len().min(magic.len());
-        first_bytes[..seen] == magic[..seen]
-    })
+// A PAR1 file's head, an index's or a volume's alike: its magic and the
+// one file version PAR1 has, 0x00010000, as par2cmdline reads them. No
+// object reads PAR1; its files are recovery data all the same.
+const PAR1_HEAD: &[u8; 12] = b"PAR\0\0\0\0\0\0\0\x01\0";
+
+// What a member's front says of whether it is recovery data, whatever its
+// name: `Some(true)` when it opens a recovery format (a PAR2 or PAR3
+// packet, a RAR5 recovery volume, or a PAR1 file), `Some(false)` when it
+// rules every one out, and `None` while it says nothing yet: no front, or
+// one too short to decide. A RAR3 recovery volume opens on parity, which
+// signs nothing, so under RAR's own `.rev` a front that signs nothing
+// rules nothing out, and the name says. The bytes are the ones the sniffer
+// already holds: nothing is read to answer.
+pub fn recovery_by_front(name: &str, front: &[u8], length: Option<u64>) -> Option<bool> {
+    if front.is_empty() {
+        return None;
+    }
+    let seen = front.len().min(PAR1_HEAD.len());
+    if front[..seen] == PAR1_HEAD[..seen] {
+        if seen == PAR1_HEAD.len() {
+            return Some(true);
+        }
+        if length.is_none_or(|length| length >= PAR1_HEAD.len() as u64) {
+            return None;
+        }
+    }
+    match signed(front, length) {
+        Sniff::Object(kind) => Some(matches!(kind, Kind::Par2 | Kind::Par3 | Kind::RarRecovery)),
+        Sniff::Pending => None,
+        Sniff::Leaf => (!has_extension(trimmed(name), ".rev")).then_some(false),
+    }
 }
 
 // The kinds whose objects judge a member by the clean bytes past the hole
@@ -790,11 +813,13 @@ pub fn listed(names: &[&str]) -> Vec<Listed> {
     names.iter().map(|name| listing.told(name)).collect()
 }
 
-// The names of a listing, each once, trimmed and lower case: what telling
-// one of them asks of the names beside it is a lookup, so telling every
-// name of a listing is linear in its length.
+// The names of a listing, trimmed and lower case, each with how many times
+// it is listed: what telling one of them asks of the names beside it is a
+// lookup, so telling every name of a listing is linear in its length. A
+// namespace keeps one of its members' names as they come, change and go.
+#[derive(Debug, Default)]
 pub(crate) struct Listing {
-    names: std::collections::HashSet<String>,
+    names: std::collections::BTreeMap<String, usize>,
 }
 
 // A name's last extension, split into its first letter and the rest, and
@@ -823,15 +848,51 @@ fn archive_extension(extension: &str) -> bool {
 
 impl Listing {
     pub(crate) fn new<'a>(names: impl Iterator<Item = &'a str>) -> Self {
-        Self {
-            names: names
-                .map(|name| trimmed(name).to_ascii_lowercase())
-                .collect(),
+        let mut listing = Self::default();
+        for name in names {
+            listing.add(name);
+        }
+        listing
+    }
+
+    pub(crate) fn add(&mut self, name: &str) {
+        *self
+            .names
+            .entry(trimmed(name).to_ascii_lowercase())
+            .or_default() += 1;
+    }
+
+    pub(crate) fn forget(&mut self, name: &str) {
+        let name = trimmed(name).to_ascii_lowercase();
+        if let Some(count) = self.names.get_mut(&name) {
+            *count -= 1;
+            if *count == 0 {
+                self.names.remove(&name);
+            }
         }
     }
 
     fn has(&self, stem: &str, extension: &str) -> bool {
-        self.names.contains(&format!("{stem}.{extension}"))
+        self.names.contains_key(&format!("{stem}.{extension}"))
+    }
+
+    // Whether a name of the listing is a recovery volume's by the names
+    // beside it: a `.par2` or `.par3`, index or volume, and RAR's `.rev`, by
+    // their names alone; the older numbered `.p<N>` and `.par<N>` only beside
+    // a `.par` or `.par2` of their stem. A short name with a letter and
+    // digits for an extension, a `.p12`, is a plain file when no set of its
+    // stem is listed. The rule a listing tells recovery data by, and a
+    // member no object holds while its front has not said
+    // (`Namespace::recovery_data`).
+    pub(crate) fn recovery(&self, name: &str) -> bool {
+        let name = trimmed(name).to_ascii_lowercase();
+        let Some((stem, extension)) = name.rsplit_once('.') else {
+            return false;
+        };
+        names_recovery(&name)
+            && (matches!(extension, "rev" | "par2" | "par3")
+                || self.has(stem, "par")
+                || self.has(stem, "par2"))
     }
 
     // `split_piece_among`, of a trimmed lower-case name, asked of the
@@ -863,11 +924,7 @@ impl Listing {
         if container {
             return Listed::Container;
         }
-        let recovery = match extension {
-            "rev" | "par2" | "par3" | "sfv" => true,
-            _ => names_recovery(&name) && (self.has(stem, "par") || self.has(stem, "par2")),
-        };
-        if recovery {
+        if extension == "sfv" || self.recovery(&name) {
             Listed::Recovery
         } else {
             Listed::Plain
@@ -931,10 +988,17 @@ impl Listing {
         {
             return Layered::Own;
         }
+        // A name that says recovery data is a file of its own once its front
+        // says it is none (`recovery_by_front`).
         match self.told(name) {
             Listed::Container => return Layered::Piece,
-            Listed::Recovery => return Layered::Furniture,
-            Listed::Plain => {}
+            Listed::Recovery
+                if !self.recovery(name)
+                    || recovery_by_front(name, front, length) != Some(false) =>
+            {
+                return Layered::Furniture;
+            }
+            Listed::Recovery | Listed::Plain => {}
         }
         if opens.is_some() {
             return Layered::Piece;
@@ -1599,6 +1663,43 @@ mod tests {
                 .iter()
                 .all(|name| !name.is_empty() && name.bytes().all(|byte| !byte.is_ascii_uppercase()))
         );
+    }
+
+    // A `.par2`, `.par3` or `.rev` is recovery data by its name; an older
+    // numbered `.p<N>` or `.par<N>` only beside a `.par` or `.par2` of its
+    // stem, and a plain file otherwise.
+    #[test]
+    fn a_listing_tells_old_numbered_volumes_by_the_set_beside_them() {
+        let names = [
+            "notes.p12",
+            "notes.par01",
+            "x.p01",
+            "x.par2",
+            "y.par01",
+            "y.par",
+            "a.part2.rev",
+            "b.vol00+01.par2",
+            "c.par3",
+            "x.mkv",
+        ];
+        let listing = Listing::new(names.iter().copied());
+        for (name, recovery) in [
+            ("notes.p12", false),
+            ("notes.par01", false),
+            ("x.p01", true),
+            ("X.P01", true),
+            ("x.par2", true),
+            ("y.par01", true),
+            ("y.par", false),
+            ("a.part2.rev", true),
+            ("b.vol00+01.par2", true),
+            ("c.par3", true),
+            ("x.mkv", false),
+        ] {
+            assert_eq!(listing.recovery(name), recovery, "{name}");
+            let told = listing.told(name) == Listed::Recovery;
+            assert_eq!(told, recovery, "{name}");
+        }
     }
 
     // Each member of a namespace below the root is told a piece, furniture

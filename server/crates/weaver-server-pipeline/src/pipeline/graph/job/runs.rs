@@ -58,14 +58,15 @@ impl GraphJob {
             | Heard::CheckpointDue { .. }
             | Heard::DiskReturned
             | Heard::DiskFailed(_)
-            | Heard::GivingUp => {}
+            | Heard::GivingUp
+            | Heard::Blocked => {}
         }
         Ok(())
     }
 
     // What a run said, or a repair lent off the loop came back with. A
     // stopped run's words carry an old generation and are not heard.
-    pub(crate) fn run_said(
+    pub fn run_said(
         &mut self,
         said: Said,
         slots: &mut RepairSlots,
@@ -198,6 +199,9 @@ impl GraphJob {
                 };
             }
             Heard::GivingUp => return self.give_up_next(slots, limit),
+            // The pipeline's gate hears it; a job outside the pipeline has
+            // none to ask.
+            Heard::Blocked => return Ok(()),
             Heard::CheckpointBlocked { .. }
             | Heard::CheckpointDue { .. }
             | Heard::DiskReturned
@@ -343,7 +347,7 @@ impl GraphJob {
     }
 
     // Whether a repair the stop ended is kept for the writers to settle.
-    pub(in crate::pipeline) fn keeps_stopped_repair(&self) -> bool {
+    pub fn keeps_stopped_repair(&self) -> bool {
         self.stopped_repair.is_some()
     }
 
@@ -367,15 +371,15 @@ impl GraphJob {
             return Ok(false);
         }
         self.take_back(*returned, slots, limit)?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         {
             self.stopped_repairs_taken_back += 1;
         }
         Ok(true)
     }
 
-    #[cfg(test)]
-    pub(in crate::pipeline) fn stopped_repairs_taken_back(&self) -> u32 {
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn stopped_repairs_taken_back(&self) -> u32 {
         self.stopped_repairs_taken_back
     }
 
@@ -658,7 +662,10 @@ impl GraphJob {
 
     // What the parent tells every engine bound in it. `coming` is what the
     // root still fetches unasked, asked once a step.
-    fn facts(&self, parent: NodeId, coming: &mut Option<Coming>) -> Facts {
+    pub fn facts(&self, parent: NodeId, coming: &mut Option<Coming>) -> Facts {
+        if self.fed.ended.contains(&parent) {
+            return Facts::INPUT_ENDED;
+        }
         let coming = coming.get_or_insert_with(|| self.coming());
         let ended = self.writer.ended(&self.tree, parent, coming);
         // A volume can still join while a member's front has yet to decide
@@ -669,8 +676,49 @@ impl GraphJob {
             deciding: !ended || self.tree.deciding(parent),
             held: ended
                 && self.still_above(parent)
+                && !self.fed.withheld()
                 && self.writer.lost_for_good(&self.tree, parent, coming),
         }
+    }
+
+    // The job waits on nothing but runs blocked on their shelves, for input
+    // no event will bring. The shallowest of them, with no blocked run above
+    // them, hear that their input ended, as when what their volumes lost is
+    // lost for good: each volume reads as closed at what it holds and
+    // settled, no volume can join, and the run ends on what it lacks, as one
+    // ends when its payload ends short. Their parents are told so on every
+    // step after. Returns the nodes told.
+    pub(crate) fn end_blocked_input(&mut self) -> Result<Vec<NodeId>, GraphError> {
+        let running: BTreeSet<NodeId> = self.runs.running().collect();
+        let shallowest: Vec<NodeId> = running
+            .iter()
+            .copied()
+            .filter(|node| {
+                let mut at = *node;
+                while let Some((parent, _)) = self.tree.volumes(at) {
+                    if running.contains(&parent) {
+                        return false;
+                    }
+                    at = parent;
+                }
+                true
+            })
+            .collect();
+        for node in &shallowest {
+            let Some((parent, _)) = self.tree.volumes(*node) else {
+                continue;
+            };
+            self.fed.ended.insert(parent);
+            self.feed(*node, Facts::INPUT_ENDED)?;
+        }
+        Ok(shallowest)
+    }
+
+    // A test's seam: what the job's volumes lost is never taken as lost for
+    // good above them, so a run waiting on one waits for good.
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
+    pub(crate) fn withhold_lost_for_good(&mut self) {
+        self.fed.withheld = true;
     }
 
     // Nothing above the node's volumes can place another byte in them: no
@@ -697,7 +745,7 @@ impl GraphJob {
     // (`Engine::placed`), and whether any more can join, as its parent's `facts`
     // say. A shelf already there is left as it is, and its run is not woken
     // to find nothing new.
-    fn feed(&mut self, node: NodeId, facts: Facts) -> Result<(), GraphError> {
+    pub fn feed(&mut self, node: NodeId, facts: Facts) -> Result<(), GraphError> {
         let Some((parent, volumes)) = self.tree.volumes(node) else {
             return Ok(());
         };
@@ -819,10 +867,19 @@ impl GraphJob {
 // still join, and whether what they lost is lost for good, so a volume
 // holding every byte it will reads as closed before its object closes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Facts {
+pub struct Facts {
     ended: bool,
     deciding: bool,
     held: bool,
+}
+
+impl Facts {
+    // Nothing more comes, no volume joins, and what was lost is lost.
+    const INPUT_ENDED: Self = Self {
+        ended: true,
+        deciding: false,
+        held: true,
+    };
 }
 
 // What the steps brought the engines up to: the generations of the tree,
@@ -835,6 +892,20 @@ pub(super) struct Fed {
     at: Option<FedAt>,
     members: BTreeMap<NodeId, u64>,
     told: BTreeMap<NodeId, Facts>,
+    // The parents whose engines' input a stall ended: nothing more comes
+    // to them. Empty but for a job that stalled.
+    ended: BTreeSet<NodeId>,
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    withheld: bool,
+}
+
+impl Fed {
+    fn withheld(&self) -> bool {
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+        return self.withheld;
+        #[cfg(not(any(test, feature = "pipeline-test-fixtures")))]
+        false
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -844,10 +915,6 @@ struct FedAt {
     offered: u64,
     runs: u64,
 }
-
-#[cfg(test)]
-#[path = "runs_tests.rs"]
-mod tests;
 
 // Whether what a run said takes room on a disk where it lands: the members
 // it announces and the bytes it writes, and the bytes it hands to be placed

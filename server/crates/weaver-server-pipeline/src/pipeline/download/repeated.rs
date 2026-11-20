@@ -9,7 +9,7 @@ use crate::MessageId;
 use std::io::{Read, Write};
 use std::sync::Weak;
 
-pub(crate) struct SharedArticle {
+pub struct SharedArticle {
     pub(in crate::pipeline) data: DecodedChunk,
     _memory: ProcessMemoryPermit,
 }
@@ -207,7 +207,7 @@ enum Entry {
     Fatal(String),
 }
 
-pub(crate) struct RepeatedArticles {
+pub struct RepeatedArticles {
     entries: HashMap<MessageId, Arc<tokio::sync::Mutex<Option<Entry>>>>,
     root: Arc<CacheRoot>,
     memory: Arc<ProcessMemoryBudget>,

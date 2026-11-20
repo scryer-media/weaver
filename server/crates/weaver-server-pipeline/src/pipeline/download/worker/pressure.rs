@@ -15,8 +15,8 @@ impl DownloadPipelineBacklog {
 // A single actor-state view shared by work selection and queue availability.
 // Parked retries and cached sockets cannot advance the durable byte floor.
 #[derive(Clone, Copy)]
-pub(in crate::pipeline) struct CheckpointAdmission {
-    pub(in crate::pipeline) enforced: bool,
+pub struct CheckpointAdmission {
+    pub enforced: bool,
     pub(in crate::pipeline) undurable_bytes: u64,
     limit: u64,
     can_advance: bool,
@@ -24,7 +24,7 @@ pub(in crate::pipeline) struct CheckpointAdmission {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(in crate::pipeline) enum CheckpointDecision {
+pub enum CheckpointDecision {
     NotEnforced,
     RecoveryExempt,
     WithinLimit,
@@ -43,7 +43,7 @@ impl CheckpointDecision {
         }
     }
 
-    pub(super) fn allows(self) -> bool {
+    pub fn allows(self) -> bool {
         self != Self::WaitingForPipeline
     }
 }
@@ -80,7 +80,7 @@ impl CheckpointLease {
 
 impl CheckpointAdmission {
     // Whether the checkpoint refuses no article at all.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(in crate::pipeline) fn admits_every_article(self) -> bool {
         !self.enforced || self.limit == 0
     }
@@ -97,11 +97,7 @@ impl CheckpointAdmission {
                 || (self.can_advance && self.undurable_bytes > self.limit))
     }
 
-    pub(in crate::pipeline) fn decision(
-        self,
-        work: &QueuedWork<'_>,
-        leased: &[DownloadWork],
-    ) -> CheckpointDecision {
+    pub fn decision(self, work: &QueuedWork<'_>, leased: &[DownloadWork]) -> CheckpointDecision {
         self.decision_with_lease(work, CheckpointLease::of(leased))
     }
 
@@ -398,7 +394,7 @@ impl Pipeline {
             .is_some_and(|state| state.restored_download_floor_bytes != 0)
     }
 
-    pub(in crate::pipeline) fn checkpoint_admission(&self, job_id: JobId) -> CheckpointAdmission {
+    pub fn checkpoint_admission(&self, job_id: JobId) -> CheckpointAdmission {
         let enforced = self.should_enforce_restart_durable_lead(job_id);
         CheckpointAdmission {
             enforced,
@@ -541,7 +537,7 @@ impl Pipeline {
             .store(0, Ordering::Relaxed);
     }
 
-    pub(crate) fn restart_durable_lead_limit_bytes() -> u64 {
+    pub fn restart_durable_lead_limit_bytes() -> u64 {
         download_restart_checkpoint_bytes()
             .saturating_mul(DOWNLOAD_RESTART_MAX_DURABLE_LEAD_MULTIPLIER)
     }
@@ -556,7 +552,7 @@ impl Pipeline {
             .allows()
     }
 
-    pub(crate) fn refresh_download_pressure(&mut self) -> DownloadPressure {
+    pub fn refresh_download_pressure(&mut self) -> DownloadPressure {
         let (decode_soft, decode_hard, write_soft, write_hard) = self.download_pressure_limits();
         let released_result_bytes = self
             .pending_released_download_result_bytes_by_job

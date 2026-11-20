@@ -57,7 +57,7 @@ const MAX_BACKUP_ZSTD_WINDOW_LOG: u32 = 26;
 // longer writes it; the name survives only to recognize and skip those entries.
 const LEGACY_MANAGED_PACKAGE_DIR: &str = "managed-extensions";
 
-pub(super) use weaver_server_pipeline::operations::backup::archive::BackupCancellation;
+pub(super) use weaver_server_composition::operations::backup::archive::BackupCancellation;
 
 struct AtomicOutputWriter {
     temp: tempfile::NamedTempFile,

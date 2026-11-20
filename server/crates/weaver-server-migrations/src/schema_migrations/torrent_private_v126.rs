@@ -13,7 +13,7 @@
 
 use weaver_server_db::persistence::StateError;
 use weaver_server_db::persistence::sql_runtime::{SqlArg, SqlConn};
-use weaver_server_torrents::torrents::metainfo::metainfo_is_private;
+use weaver_server_torrent_store::torrents::metainfo::metainfo_is_private;
 
 pub const HOOK_ID: &str = "fill_torrent_private_v126";
 

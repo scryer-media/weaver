@@ -2,7 +2,6 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use crate::proxies::ProxiesNetworkPersistenceQueries;
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -10,9 +9,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::broadcast;
 
-use crate::jobs::assembly::DetectedArchiveIdentity;
 use crate::jobs::class::{ByProtocol, JobClasses, PipelineClass};
-use crate::jobs::record::ActiveFileIdentity;
 use weaver_server_base::events::model::PipelineEvent;
 use weaver_server_base::jobs::ids::JobId;
 
@@ -21,18 +18,11 @@ use crate::jobs::model::{HeldClass, JobSpec, JobStatus, JobUpdate, Protocol};
 use crate::pipeline::queue::{Change, Queue};
 use weaver_server_base::operations::metrics::{MetricsSnapshot, PipelineMetrics};
 
-pub const FINISHED_JOBS_RUNTIME_CAP: usize = 1_000;
-pub const PROPAGATION_WAIT_REASON: &str = "propagation_delay";
-// The job waits for room on a disk, in whatever phase it is in.
-pub const DISK_SPACE_WAIT_REASON: &str = "disk_space";
-// The job waits on a fill server refusing the login until the refusal is
-// the verdict. The stored reason is this code, a colon, and the servers as
-// `host:port`, joined by ", ".
-pub const LOGIN_REFUSED_WAIT_REASON: &str = "login_refused";
+pub use weaver_server_composition::jobs::control::*;
 
 #[derive(Clone)]
 pub struct SharedPipelineState {
-    pub(crate) queue: Arc<Queue>,
+    pub queue: Arc<Queue>,
     // The class of each protocol, each seated once: the pipeline at start,
     // every other class when it starts.
     classes: JobClasses,
@@ -83,7 +73,7 @@ pub struct SharedPipelineState {
     // discard it. Nothing is even built here unless someone is listening.
     segment_events: broadcast::Sender<PipelineEvent>,
     // The speed test service, held weakly: the service holds this handle.
-    speed_test: Arc<std::sync::Mutex<std::sync::Weak<crate::speed_test::ServiceInner>>>,
+    speed_test: Arc<std::sync::Mutex<Option<std::sync::Weak<dyn HeldSpeedTest>>>>,
     // The pipeline's free-space samplers, set once it starts: requests read
     // their cached readings and never look at the disk themselves. Held
     // weakly, so the samplers stop with the pipeline that owns them.
@@ -126,7 +116,7 @@ impl SharedPipelineState {
             server_probe_latency: Arc::new(RwLock::new(HashMap::new())),
             sevenz_decode_memory_bytes: Arc::new(AtomicU64::new(u64::MAX)),
             segment_events,
-            speed_test: Arc::new(std::sync::Mutex::new(std::sync::Weak::new())),
+            speed_test: Arc::new(std::sync::Mutex::new(None)),
             storage_capacity: Arc::default(),
         }
     }
@@ -363,7 +353,7 @@ impl SharedPipelineState {
             .send_modify(|starts| *starts = starts.wrapping_add(1));
     }
 
-    pub(crate) fn schedule_replay_paused(&self) -> bool {
+    pub fn schedule_replay_paused(&self) -> bool {
         self.queue
             .read(|inner| inner.globals.schedule_replay_paused)
     }
@@ -429,7 +419,7 @@ impl SharedPipelineState {
     // pipeline publishes, and say what the publish changed as the pipeline
     // says it of its own jobs. The class publishes through its handle, which
     // carries the events.
-    fn publish_class_jobs(&self, protocol: Protocol, jobs: Vec<JobInfo>) -> Vec<PipelineEvent> {
+    pub fn publish_class_jobs(&self, protocol: Protocol, jobs: Vec<JobInfo>) -> Vec<PipelineEvent> {
         self.queue.write(|inner| {
             // The same jobs as they stand: nothing changed, and nothing is
             // said, so an idle publish wakes no reader.
@@ -620,7 +610,7 @@ impl SharedPipelineState {
     }
 
     // How many times setting the egress block took its lock.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) fn egress_quota_block_lock_count(&self) -> u64 {
         self.egress_quota_block_locks.load(Ordering::Relaxed)
     }
@@ -757,261 +747,6 @@ impl SharedPipelineState {
     }
 }
 
-// What the download lanes have learned about one server's BODY transport.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ServerTransportHealth {
-    // Pool server index this describes.
-    pub server_idx: usize,
-    // Command-to-status-line wait.
-    pub latency_ms: Option<f64>,
-    // Status-line-to-terminator wait for one article.
-    pub transfer_ms: Option<f64>,
-    // "good", "moderate" or "slow"; absent until a latency is measured.
-    pub latency_band: Option<String>,
-    // BODY pipelining depth in use, where 1 means sequential.
-    pub pipeline_depth: u32,
-    // Set while a server is held sequential after twice failing a pipelined
-    // batch; cleared by a clean trial once the hold lapses.
-    pub pinned_sequential: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DownloadBlockKind {
-    None,
-    ManualPause,
-    SpeedTest,
-    Scheduled,
-    EgressQuota,
-    ServerQuota,
-}
-
-impl DownloadBlockKind {
-    // Every variant, in gate-reason label order. The Prometheus exporter
-    // renders one series per variant; deriving the label set from `ALL` keeps
-    // a new gate reason from silently vanishing off `/metrics`.
-    pub const ALL: [Self; 6] = [
-        Self::None,
-        Self::ManualPause,
-        Self::SpeedTest,
-        Self::Scheduled,
-        Self::EgressQuota,
-        Self::ServerQuota,
-    ];
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::ManualPause => "manual_pause",
-            Self::SpeedTest => "speed_test",
-            Self::Scheduled => "scheduled",
-            Self::EgressQuota => "egress_quota",
-            Self::ServerQuota => "server_quota",
-        }
-    }
-}
-
-// Where a manual queue reorder should land a job. The order only breaks ties
-// within a dispatch priority band: a LOW job moved to the top still yields to
-// HIGH/NORMAL work.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum QueueMoveTarget {
-    Top,
-    Bottom,
-    Offset(i64),
-}
-
-// What the queue asks of one job, whoever owns it.
-#[derive(Debug, Clone)]
-pub enum QueueAction {
-    Pause,
-    Resume,
-    Cancel(CancellationOrigin),
-    Update(JobUpdate),
-    Move(QueueMoveTarget),
-}
-
-// Who put a hold in force, in the order their reasons take precedence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum HoldOrigin {
-    Manual,
-    Scheduled,
-    SpeedTest,
-}
-
-impl HoldOrigin {
-    // Whether a pause or resume from this origin replaces or lifts a hold
-    // from `other`. The operator and the schedule share one pause, each
-    // overriding the other's; a speed test's hold is its own.
-    const fn shares(self, other: Self) -> bool {
-        matches!(
-            (self, other),
-            (Self::SpeedTest, Self::SpeedTest)
-                | (
-                    Self::Manual | Self::Scheduled,
-                    Self::Manual | Self::Scheduled
-                )
-        )
-    }
-
-    // The reason an item a hold from this origin stops gives.
-    pub const fn reason(self) -> &'static str {
-        match self {
-            Self::Manual => "paused",
-            Self::Scheduled => "scheduled",
-            Self::SpeedTest => "speed test",
-        }
-    }
-}
-
-// What a hold stops of the items it covers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum HoldScope {
-    // Downloading stops; what is complete keeps seeding.
-    Downloads,
-    // Everything stops, seeding too.
-    Everything,
-}
-
-// Which items a hold covers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum HoldOwner {
-    // Every item in the queue.
-    All,
-    // One class's jobs alone: only a class whose row has a hold of its own.
-    Class(HeldClass),
-}
-
-impl HoldOwner {
-    // Every owner an operator's hold is kept for across a restart, with the
-    // setting it is kept in: the whole queue, then each class the protocol
-    // table gives a hold of its own.
-    pub fn kept() -> impl Iterator<Item = (Self, &'static str)> {
-        std::iter::once((Self::All, "global_paused"))
-            .chain(HeldClass::all().map(|class| (Self::Class(class), class.hold().setting)))
-    }
-}
-
-// One hold on the queue.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Hold {
-    pub origin: HoldOrigin,
-    pub scope: HoldScope,
-    pub owner: HoldOwner,
-}
-
-impl Hold {
-    // The operator's hold over `owner`: the queue's pause leaves what is
-    // complete seeding; a class's pause stops what its row in the protocol
-    // table says.
-    pub const fn manual(owner: HoldOwner) -> Self {
-        Self {
-            origin: HoldOrigin::Manual,
-            scope: match owner {
-                HoldOwner::All => HoldScope::Downloads,
-                HoldOwner::Class(class) => class.hold().scope,
-            },
-            owner,
-        }
-    }
-
-    // Whether the hold covers `target` and what it stops of it, before
-    // what the target says of the schedule.
-    const fn reaches(self, target: HoldTarget) -> bool {
-        let covers = match (self.owner, target.owner) {
-            (HoldOwner::All, _) => true,
-            (HoldOwner::Class(held), HoldOwner::Class(of)) => {
-                held.protocol().index() == of.protocol().index()
-            }
-            (HoldOwner::Class(_), HoldOwner::All) => false,
-        };
-        covers
-            && match self.scope {
-                HoldScope::Downloads => !target.complete,
-                HoldScope::Everything => true,
-            }
-    }
-
-    // Whether the hold stops `target`. The schedule's holds leave a target
-    // that runs through them.
-    const fn stops(self, target: HoldTarget) -> bool {
-        self.reaches(target)
-            && !(target.runs_through_schedule && matches!(self.origin, HoldOrigin::Scheduled))
-    }
-}
-
-// An item a hold is asked about: whose it is, whether it has finished
-// downloading, and whether it runs through the schedule's holds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HoldTarget {
-    pub owner: HoldOwner,
-    pub complete: bool,
-    pub runs_through_schedule: bool,
-}
-
-impl HoldTarget {
-    // An item of `owner` that every hold over it may stop.
-    pub const fn of(owner: HoldOwner, complete: bool) -> Self {
-        Self {
-            owner,
-            complete,
-            runs_through_schedule: false,
-        }
-    }
-}
-
-// The holds in force. Every owner of queue items follows them.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct HoldSet(Vec<Hold>);
-
-impl HoldSet {
-    // Put `hold` in force in place of any its origin shares over the same
-    // items.
-    pub fn hold(&mut self, hold: Hold) {
-        self.release(hold.origin, hold.owner);
-        self.0.push(hold);
-        self.0.sort_unstable();
-    }
-
-    // Lift what `origin` shares of the holds over `owner`.
-    pub fn release(&mut self, origin: HoldOrigin, owner: HoldOwner) {
-        self.0
-            .retain(|hold| hold.owner != owner || !origin.shares(hold.origin));
-    }
-
-    // Whether any hold stops an item of `owner`, given whether it has
-    // finished downloading.
-    pub fn stops(&self, owner: HoldOwner, complete: bool) -> bool {
-        self.reason(owner, complete).is_some()
-    }
-
-    // Who stops that item, by precedence, while anyone does.
-    pub fn reason(&self, owner: HoldOwner, complete: bool) -> Option<HoldOrigin> {
-        self.reason_for(HoldTarget::of(owner, complete))
-    }
-
-    // Who stops `target`, by precedence, while anyone does.
-    pub fn reason_for(&self, target: HoldTarget) -> Option<HoldOrigin> {
-        self.0
-            .iter()
-            .filter(|hold| hold.stops(target))
-            .map(|hold| hold.origin)
-            .min()
-    }
-
-    // Whether `target` runs only because it runs through the schedule's
-    // holds: one of them reaches it and no hold stops it.
-    pub fn spares(&self, target: HoldTarget) -> bool {
-        self.reason_for(target).is_none() && self.0.iter().any(|hold| hold.reaches(target))
-    }
-
-    // Whether `origin` holds the items of `owner`.
-    pub fn held_by(&self, origin: HoldOrigin, owner: HoldOwner) -> bool {
-        self.0
-            .iter()
-            .any(|hold| hold.origin == origin && hold.owner == owner)
-    }
-}
-
 // Splice `job_id` to its new position in the manual queue order. Pure so the
 // clamp/splice arithmetic is unit-testable apart from pipeline state.
 pub fn splice_job_order(
@@ -1036,331 +771,6 @@ pub fn splice_job_order(
     let id = order.remove(current);
     order.insert(new_index, id);
     Ok(true)
-}
-
-#[cfg(test)]
-mod splice_job_order_tests {
-    use super::*;
-
-    fn order(ids: &[u64]) -> Vec<JobId> {
-        ids.iter().copied().map(JobId).collect()
-    }
-
-    #[test]
-    fn splices_top_bottom_and_clamped_offsets() {
-        let mut jobs = order(&[1, 2, 3, 4]);
-        assert!(splice_job_order(&mut jobs, JobId(3), QueueMoveTarget::Top).unwrap());
-        assert_eq!(jobs, order(&[3, 1, 2, 4]));
-
-        assert!(splice_job_order(&mut jobs, JobId(1), QueueMoveTarget::Bottom).unwrap());
-        assert_eq!(jobs, order(&[3, 2, 4, 1]));
-
-        assert!(splice_job_order(&mut jobs, JobId(4), QueueMoveTarget::Offset(-1)).unwrap());
-        assert_eq!(jobs, order(&[3, 4, 2, 1]));
-
-        // Offsets clamp at the edges instead of erroring.
-        assert!(splice_job_order(&mut jobs, JobId(3), QueueMoveTarget::Offset(-5)).is_ok());
-        assert_eq!(jobs, order(&[3, 4, 2, 1]));
-        assert!(splice_job_order(&mut jobs, JobId(3), QueueMoveTarget::Offset(99)).unwrap());
-        assert_eq!(jobs, order(&[4, 2, 1, 3]));
-
-        // No-op moves report false; unknown ids error.
-        assert!(!splice_job_order(&mut jobs, JobId(4), QueueMoveTarget::Top).unwrap());
-        assert!(matches!(
-            splice_job_order(&mut jobs, JobId(9), QueueMoveTarget::Top),
-            Err(SchedulerError::JobNotFound(JobId(9)))
-        ));
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct DownloadBlockState {
-    pub kind: DownloadBlockKind,
-    // The egress whose download quota is reached, while one is. The byte
-    // and window fields below describe that egress's quota.
-    #[serde(default)]
-    pub egress_id: Option<u32>,
-    #[serde(default)]
-    pub egress_name: Option<String>,
-    pub used_bytes: u64,
-    pub limit_bytes: u64,
-    pub remaining_bytes: u64,
-    pub window_starts_at_epoch_ms: Option<f64>,
-    pub window_ends_at_epoch_ms: Option<f64>,
-    pub timezone_name: String,
-    // Download limit imposed by the active schedule.
-    #[serde(default)]
-    pub scheduled_speed_limit: Option<u64>,
-    // Download limit the downloads run under now: the tighter of the
-    // configured one and the schedule's; none is unlimited.
-    #[serde(default)]
-    pub speed_limit_in_force: Option<u64>,
-    // Whether a schedule window sets the limit in force, even to unlimited.
-    #[serde(default)]
-    pub speed_limit_by_schedule: bool,
-    // Why a schedule rule is holding new downloads, while one is.
-    #[serde(default)]
-    pub schedule_hold_reason: Option<String>,
-}
-
-// An egress download quota that holds work back: no leg of the route the
-// work needs has quota left.
-#[derive(Debug, Clone, PartialEq)]
-pub struct EgressQuotaBlock {
-    pub egress_id: u32,
-    pub egress_name: String,
-    pub used_bytes: u64,
-    pub limit_bytes: u64,
-    pub remaining_bytes: u64,
-    pub window_starts_at_epoch_ms: Option<f64>,
-    pub window_ends_at_epoch_ms: Option<f64>,
-    pub timezone_name: String,
-}
-
-impl Default for DownloadBlockState {
-    fn default() -> Self {
-        Self {
-            kind: DownloadBlockKind::None,
-            egress_id: None,
-            egress_name: None,
-            used_bytes: 0,
-            limit_bytes: 0,
-            remaining_bytes: 0,
-            window_starts_at_epoch_ms: None,
-            window_ends_at_epoch_ms: None,
-            timezone_name: chrono::Local::now().offset().to_string(),
-            scheduled_speed_limit: None,
-            speed_limit_in_force: None,
-            speed_limit_by_schedule: false,
-            schedule_hold_reason: None,
-        }
-    }
-}
-
-// Commands sent to the scheduler's main loop.
-#[derive(Clone)]
-pub struct RestoreJobRequest {
-    pub job_id: JobId,
-    pub job_hash: [u8; 32],
-    pub spec: JobSpec,
-    pub detected_archives: HashMap<u32, DetectedArchiveIdentity>,
-    pub file_identities: HashMap<u32, ActiveFileIdentity>,
-    pub status: JobStatus,
-    pub download_state: Option<crate::jobs::model::DownloadState>,
-    pub post_state: Option<crate::jobs::model::PostState>,
-    pub run_state: Option<crate::jobs::model::RunState>,
-    pub queued_repair_at_epoch_ms: Option<f64>,
-    pub queued_extract_at_epoch_ms: Option<f64>,
-    pub paused_resume_status: Option<JobStatus>,
-    pub paused_resume_download_state: Option<crate::jobs::model::DownloadState>,
-    pub paused_resume_post_state: Option<crate::jobs::model::PostState>,
-    pub working_dir: PathBuf,
-    // What a restart read of the job's row, when the request comes from one.
-    pub restart: Option<RestartRead>,
-}
-
-// What a restart read of a job's active row besides its request: the runtime
-// columns as stored, so the install writes back only what it changes, and
-// the summaries of the article lists it let go, so a job waiting its turn
-// installs without reading them back.
-#[derive(Clone, Debug)]
-pub struct RestartRead {
-    pub(crate) runtime: crate::pipeline::StoredRuntimeValues,
-    pub(crate) summaries: crate::jobs::model::FileSummaries,
-    // When the job was added, as its row stores it.
-    pub(crate) created_at_epoch_ms: f64,
-    // The job is entering the queue window again, not arriving: it raises
-    // no creation event.
-    pub(crate) reentry: bool,
-    // The job has no stored NZB outline yet: it holds no file, and its
-    // install reads its stored NZB once and stores the outline it reads. It
-    // installs wherever it stands, so its row says what it holds; one out
-    // of the window leaves it again once read.
-    pub(crate) outline_pending: bool,
-    // The job has a checkpoint: some of its bytes are on disk.
-    pub(crate) on_disk: bool,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct AddJobOptions {
-    pub initially_paused: bool,
-    // SCORE admission generation that must still be authoritative when the
-    // scheduler durably materializes this job.
-    pub semantic_materialization_generation: Option<i64>,
-    // Promotion-lease generation that owns this candidate materialization.
-    // Unlike admission generations, this must also still hold an unexpired
-    // durable promotion lease when the active job row is inserted.
-    pub semantic_promotion_generation: Option<i64>,
-    // Archive passwords supplied beside the job's own (`Integration`, then
-    // `DnzbHeader`), persisted with it so a restart still offers them: they are
-    // not in the NZB bytes.
-    pub supplied_password_candidates: Vec<crate::jobs::ArchivePasswordCandidate>,
-}
-
-// Internal provenance for cancellation. Semantic cancellation is intentionally
-// narrower than a user cancel: it may interrupt only download-lane work.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CancellationOrigin {
-    User,
-    UserDuplicate,
-    // A user cancel that leaves the job's files on disk.
-    UserKeepingFiles,
-    SemanticBad,
-    SemanticSuperseded,
-}
-
-impl CancellationOrigin {
-    pub fn is_user(self) -> bool {
-        matches!(
-            self,
-            Self::User | Self::UserDuplicate | Self::UserKeepingFiles
-        )
-    }
-}
-
-// Per-id acceptance: `Ok` means the cancellation intent was recorded and
-// hidden from the live queue; teardown and durable archival follow later.
-pub type CancelJobsOutcome = BTreeMap<JobId, Result<(), SchedulerError>>;
-
-// Which hardware profile's limits the pipeline is running under, and why.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HardwareProfileInForce {
-    // The profile whose limits the next download, decode and extraction use.
-    pub active: crate::runtime::HardwareProfile,
-    // The profile a schedule rule put in force over the operator's choice.
-    // `None` when no rule does, or when the rule's profile is one this
-    // machine cannot honour and the choice stands instead.
-    pub scheduled: Option<crate::runtime::HardwareProfile>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NntpRuntimeActivation {
-    pub generation: u64,
-    pub configured_connections: usize,
-}
-
-// What deleting one history record left behind.
-//
-// The record itself is always gone when this is returned. A working
-// directory whose ownership marker names the job but no longer matches the
-// directory is not removed — nothing proves it is still the job's — and is
-// listed here so the caller can say so.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct HistoryDeleteOutcome {
-    pub left_in_place: Vec<std::path::PathBuf>,
-}
-
-// How many history ids one delete command carries. A batch is one
-// transaction, one statement per table, and one reply the caller waits for,
-// while the queue scripts of each job in it are stopped one after another
-// before its directory goes. So a batch is also what one database error or
-// one slow script fails whole: small enough to keep that to a few dozen
-// rows, large enough that the transaction, lock and sweep a batch pays once
-// are still shared across many.
-pub const HISTORY_DELETE_BATCH_SIZE: usize = 50;
-
-// What one batched history delete did, id by id. A refused id never holds
-// back the rest of the batch.
-#[derive(Debug, Default)]
-pub struct HistoryDeleteBatchOutcome {
-    // Every id whose record is gone, with what its cleanup did: what it left
-    // on disk, or why it did not finish. A cleanup that failed still leaves
-    // the record deleted, so the id is here either way and is announced as
-    // removed; the error is reported beside that, never instead of it.
-    pub deleted: BTreeMap<JobId, Result<HistoryDeleteOutcome, SchedulerError>>,
-    // Ids whose record was not deleted, and why.
-    pub refused: BTreeMap<JobId, SchedulerError>,
-}
-
-// What archiving one history entry did. The entry stays either way.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ArchiveHistoryOutcome {
-    // Archived: folders Weaver manages were on disk and are gone.
-    Archived,
-    // Archived with nothing on disk, or the entry was already archived.
-    AlreadyGone,
-    // A folder of the job is on disk without proof that Weaver manages it,
-    // so it is left as it is. Folders that are proven the job's still go.
-    NotManaged,
-    // The job is in the queue, or another history operation holds it.
-    Busy,
-    // There is no history entry with this id.
-    NotFound,
-    // Removing stopped on an error. A retry removes what is left.
-    Failed,
-}
-
-impl ArchiveHistoryOutcome {
-    // The code an operation target keeps for the outcome.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Archived => "archived",
-            Self::AlreadyGone => "already_gone",
-            Self::NotManaged => "not_managed",
-            Self::Busy => "busy",
-            Self::NotFound => "not_found",
-            Self::Failed => "failed",
-        }
-    }
-
-    // The outcome a kept code names; `None` for any other code, such as a
-    // archive a delete superseded.
-    pub fn parse(code: &str) -> Option<Self> {
-        Some(match code {
-            "archived" => Self::Archived,
-            "already_gone" => Self::AlreadyGone,
-            "not_managed" => Self::NotManaged,
-            "busy" => Self::Busy,
-            "not_found" => Self::NotFound,
-            "failed" => Self::Failed,
-            _ => return None,
-        })
-    }
-
-    // Whether the entry ends with nothing left to remove: its target
-    // completes. Every other outcome fails the target, which the entry then
-    // shows.
-    pub fn settles(self) -> bool {
-        matches!(self, Self::Archived | Self::AlreadyGone | Self::NotFound)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ArchiveHistoryResult {
-    pub outcome: ArchiveHistoryOutcome,
-    // When the entry was archived, in epoch seconds, once it says so.
-    pub archived_at: Option<i64>,
-    pub message: Option<String>,
-}
-
-impl ArchiveHistoryResult {
-    pub(crate) fn new(
-        outcome: ArchiveHistoryOutcome,
-        archived_at: Option<i64>,
-        message: Option<String>,
-    ) -> Self {
-        Self {
-            outcome,
-            archived_at,
-            message,
-        }
-    }
-}
-
-// One `(job, bytes per second)` pair per job whose download phase currently
-// reports a rate. The rate is the value the independent ticker published for
-// that job on the metrics tick, so it is the same estimator and the same
-// instant as the global speed gauge.
-pub fn job_download_rates(jobs: &[JobInfo]) -> Vec<(JobId, u64)> {
-    jobs.iter()
-        .filter_map(|job| {
-            job.phase_progress
-                .iter()
-                .find(|phase| phase.phase == crate::jobs::phase_progress::JobPhase::Downloading)
-                .and_then(|phase| phase.rate_bps)
-                .map(|rate_bps| (job.job_id, rate_bps))
-        })
-        .collect()
 }
 
 // The job events that take an owner's published jobs from `before` to
@@ -1391,218 +801,12 @@ fn owned_job_events(before: &[JobInfo], after: &[JobInfo]) -> Vec<PipelineEvent>
         .collect()
 }
 
-impl JobInfo {
-    /// The event that says how a finished job ended, as the queue hears it.
-    /// None while the job has not ended.
-    pub fn ended_event(&self) -> Option<PipelineEvent> {
-        let job_id = self.job_id;
-        match &self.status {
-            JobStatus::Complete => Some(PipelineEvent::JobCompleted { job_id }),
-            JobStatus::Failed { error } => Some(PipelineEvent::JobFailed {
-                job_id,
-                error: error.clone(),
-            }),
-            _ => None,
-        }
-    }
-}
-
-// Summary info about a job (returned by queries). Its `Debug` never shows
-// the archive password.
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
-pub struct JobInfo {
-    pub job_id: JobId,
-    #[serde(default)]
-    pub protocol: crate::jobs::model::Protocol,
-    pub job_hash: Option<[u8; 32]>,
-    pub name: String,
-    pub status: JobStatus,
-    pub download_state: crate::jobs::model::DownloadState,
-    // Network download is complete, but decode/write or PAR2 discovery work remains.
-    #[serde(default)]
-    pub finalizing_download: bool,
-    // Weaver is fetching the minimum PAR2 metadata or recovery data needed to finish.
-    #[serde(default)]
-    pub fetching_repair_data: bool,
-    pub post_state: crate::jobs::model::PostState,
-    pub run_state: crate::jobs::model::RunState,
-    pub progress: f64,
-    pub total_bytes: u64,
-    pub downloaded_bytes: u64,
-    pub optional_recovery_bytes: u64,
-    pub optional_recovery_downloaded_bytes: u64,
-    #[serde(default)]
-    pub phase_progress: Vec<crate::jobs::phase_progress::JobPhaseProgress>,
-    // Bytes from segments that are permanently lost (430 / max retries).
-    pub failed_bytes: u64,
-    // Job health 0-1000 (1000 = perfect). Drops as articles fail.
-    //
-    // For a job that reached a terminal status this is the settled figure —
-    // what the claim census concluded was delivered — not the live wire
-    // counter, which knows nothing of the repairs and discards that answered
-    // its misses.
-    pub health: u32,
-    // Files the settlement dropped from the delivery, with the bytes each one
-    // took out of the accounting. Empty for every job that discarded nothing.
-    #[serde(default)]
-    pub terminal_discards: Vec<crate::jobs::model::TerminalDiscard>,
-    // Total files in the NZB (all roles).
-    #[serde(default)]
-    pub total_files: u32,
-    // Files fully downloaded and committed.
-    #[serde(default)]
-    pub completed_files: u32,
-    // Each NZB file's bytes not yet downloaded, in the NZB's file order, as
-    // the post declares their sizes. Empty when no download runs for the job.
-    #[serde(default)]
-    pub file_remaining_bytes: Vec<u64>,
-    // Of each NZB file's bytes not yet downloaded, those of recovery held
-    // back until a loss asks for it, in the same order. Empty when no
-    // download runs for the job.
-    #[serde(default)]
-    pub file_parked_bytes: Vec<u64>,
-    // The post's encoded bytes still to come: every article neither in hand
-    // nor lost for good, less the recovery parked until something asks for
-    // it. A clean post ends its download at zero; recovery fetched after a
-    // loss counts from the moment it is asked for.
-    #[serde(default)]
-    pub remaining_bytes: u64,
-    // The post's encoded bytes the download is out to bring: every article
-    // but the recovery still parked. What is done of it is this less
-    // `remaining_bytes`, so the two measure the same declared bytes and the
-    // download ends at exactly 100%.
-    #[serde(default)]
-    pub wanted_bytes: u64,
-    // PAR2 recovery volumes not yet fetched (fetched on demand).
-    #[serde(default)]
-    pub remaining_par_files: u32,
-    pub password: Option<String>,
-    // Optional category (e.g. "tv", "movies").
-    pub category: Option<String>,
-    // Arbitrary key-value metadata from the submitting client.
-    pub metadata: Vec<(String, String)>,
-    // Output directory where extracted files land.
-    pub output_dir: Option<String>,
-    // Which servers served this job's articles, and how much each carried.
-    //
-    // Reporting only, and only as far as attribution reached: articles
-    // Weaver could not name a server for are absent, so these counts are a
-    // floor. Empty for a job downloaded before this was recorded.
-    #[serde(default)]
-    pub server_attribution: Vec<crate::jobs::server_attribution::JobServerContribution>,
-    // Error message (only set when status is Failed).
-    pub error: Option<String>,
-    #[serde(default)]
-    pub download_wait_reason: Option<String>,
-    #[serde(default)]
-    pub download_retry_at_epoch_ms: Option<f64>,
-    // Wall-clock creation time (Unix epoch milliseconds).
-    pub created_at_epoch_ms: f64,
-}
-
-impl std::fmt::Debug for JobInfo {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Destructured whole, so a new field is a compile error here rather
-        // than a field missing from the output.
-        let Self {
-            job_id,
-            protocol,
-            job_hash,
-            name,
-            status,
-            download_state,
-            finalizing_download,
-            fetching_repair_data,
-            post_state,
-            run_state,
-            progress,
-            total_bytes,
-            downloaded_bytes,
-            optional_recovery_bytes,
-            optional_recovery_downloaded_bytes,
-            phase_progress,
-            failed_bytes,
-            health,
-            terminal_discards,
-            total_files,
-            completed_files,
-            file_remaining_bytes,
-            file_parked_bytes,
-            remaining_bytes,
-            wanted_bytes,
-            remaining_par_files,
-            password,
-            category,
-            metadata,
-            output_dir,
-            server_attribution,
-            error,
-            download_wait_reason,
-            download_retry_at_epoch_ms,
-            created_at_epoch_ms,
-        } = self;
-        f.debug_struct("JobInfo")
-            .field("job_id", job_id)
-            .field("protocol", protocol)
-            .field("job_hash", job_hash)
-            .field("name", name)
-            .field("status", status)
-            .field("download_state", download_state)
-            .field("finalizing_download", finalizing_download)
-            .field("fetching_repair_data", fetching_repair_data)
-            .field("post_state", post_state)
-            .field("run_state", run_state)
-            .field("progress", progress)
-            .field("total_bytes", total_bytes)
-            .field("downloaded_bytes", downloaded_bytes)
-            .field("optional_recovery_bytes", optional_recovery_bytes)
-            .field(
-                "optional_recovery_downloaded_bytes",
-                optional_recovery_downloaded_bytes,
-            )
-            .field("phase_progress", phase_progress)
-            .field("failed_bytes", failed_bytes)
-            .field("health", health)
-            .field("terminal_discards", terminal_discards)
-            .field("total_files", total_files)
-            .field("completed_files", completed_files)
-            .field("file_remaining_bytes", file_remaining_bytes)
-            .field("file_parked_bytes", file_parked_bytes)
-            .field("remaining_bytes", remaining_bytes)
-            .field("wanted_bytes", wanted_bytes)
-            .field("remaining_par_files", remaining_par_files)
-            .field("password", &password.as_ref().map(|_| "[REDACTED]"))
-            .field("category", category)
-            .field(
-                "metadata",
-                &metadata
-                    .iter()
-                    .map(|(key, value)| {
-                        let value = if crate::history::attributes::is_password_attribute_key(key) {
-                            "[REDACTED]"
-                        } else {
-                            value.as_str()
-                        };
-                        (key.as_str(), value)
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .field("output_dir", output_dir)
-            .field("server_attribution", server_attribution)
-            .field("error", error)
-            .field("download_wait_reason", download_wait_reason)
-            .field("download_retry_at_epoch_ms", download_retry_at_epoch_ms)
-            .field("created_at_epoch_ms", created_at_epoch_ms)
-            .finish()
-    }
-}
-
 // Handle for sending commands to the scheduler.
 // Cloneable, can be shared across tasks.
 #[derive(Clone)]
 pub struct SchedulerHandle {
     event_tx: broadcast::Sender<PipelineEvent>,
-    state: SharedPipelineState,
+    pub state: SharedPipelineState,
 }
 
 impl SchedulerHandle {
@@ -1886,7 +1090,7 @@ impl SchedulerHandle {
 
     // Whether the pipeline has work to drive, as it last said: while it
     // does, it gives memory back itself as it settles.
-    pub(crate) fn pipeline_driving(&self) -> bool {
+    pub fn pipeline_driving(&self) -> bool {
         self.state.queue.driving()
     }
 
@@ -2361,7 +1565,7 @@ impl SchedulerHandle {
 
     // Hold or release download admission for the schedule evaluator. The
     // reason is published with the download block so the hold is visible.
-    pub(crate) fn set_schedule_admission_hold(&self, reason: Option<String>) {
+    pub fn set_schedule_admission_hold(&self, reason: Option<String>) {
         let held = reason.is_some();
         self.state.queue.write_intent(|inner| {
             inner.globals.schedule_hold_reason = reason;
@@ -2619,32 +1823,35 @@ impl SchedulerHandle {
     }
 
     // The speed test service while something holds it.
-    pub fn speed_test_service(&self) -> Option<crate::speed_test::SpeedTestService> {
+    pub fn speed_test_service(&self) -> Option<Arc<dyn HeldSpeedTest>> {
         self.state
             .speed_test
             .lock()
             .expect("speed test slot")
-            .upgrade()
-            .map(crate::speed_test::SpeedTestService::from_inner)
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
     }
 
     // The speed test service, created by `init` when none is held.
-    pub fn speed_test_service_or_init(
+    pub fn speed_test_service_or_init<S: HeldSpeedTest>(
         &self,
-        init: impl FnOnce() -> crate::speed_test::SpeedTestService,
-    ) -> crate::speed_test::SpeedTestService {
+        init: impl FnOnce() -> Arc<S>,
+    ) -> Arc<S> {
         let mut slot = self.state.speed_test.lock().expect("speed test slot");
-        if let Some(inner) = slot.upgrade() {
-            return crate::speed_test::SpeedTestService::from_inner(inner);
+        if let Some(inner) = slot.as_ref().and_then(std::sync::Weak::upgrade) {
+            let inner: Arc<dyn std::any::Any + Send + Sync> = inner;
+            return inner.downcast::<S>().expect("the held speed test service");
         }
         let service = init();
-        *slot = service.downgrade();
+        *slot = Some(Arc::downgrade(&service) as std::sync::Weak<dyn HeldSpeedTest>);
         service
     }
 
     pub fn set_proxy_runtime(&self, runtime: Arc<crate::proxies::ProxyRuntime>) {
         // The classes answer the WireGuard tunnels' asks to give bytes back.
-        runtime.network.attach_classes(self.state.classes().clone());
+        runtime
+            .network
+            .attach_classes(std::sync::Arc::new(self.state.classes().clone()));
         *self.state.proxy_runtime.write().expect("proxy runtime") = Some(runtime);
     }
 
@@ -2791,6 +1998,3 @@ impl SchedulerHandle {
         self.state.metrics().pipeline_turn.read(now)
     }
 }
-
-#[cfg(test)]
-mod tests;

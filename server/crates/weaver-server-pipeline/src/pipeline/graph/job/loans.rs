@@ -22,7 +22,7 @@ use super::super::hardware::Hardware;
 use super::super::namespace::{Lender, Loan, Replay, SetState};
 use super::super::status::RepairSlots;
 
-pub(crate) struct Loans {
+pub struct Loans {
     scope: u64,
     mail: mpsc::Sender<Said>,
     // The number the last loan went out under.
@@ -51,7 +51,7 @@ enum Work {
 }
 
 impl Loans {
-    pub(crate) fn new(scope: u64, mail: mpsc::Sender<Said>, hardware: Hardware) -> Self {
+    pub fn new(scope: u64, mail: mpsc::Sender<Said>, hardware: Hardware) -> Self {
         Self {
             scope,
             mail,
@@ -88,7 +88,7 @@ impl Loans {
             .and_then(|out| out.state)
     }
 
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(super) fn current_repair(&self, set: NodeId, serial: u64) -> bool {
         self.out
             .as_ref()
@@ -118,15 +118,12 @@ impl Loans {
 
     // A lender over these loans that asks `slots` for a slot when it holds
     // none, or, without slots, lends only under the one it holds.
-    pub(crate) fn lending<'a>(
-        &'a mut self,
-        slots: Option<(&'a mut RepairSlots, usize)>,
-    ) -> Lending<'a> {
+    pub fn lending<'a>(&'a mut self, slots: Option<(&'a mut RepairSlots, usize)>) -> Lending<'a> {
         Lending { loans: self, slots }
     }
 }
 
-pub(crate) struct Lending<'a> {
+pub struct Lending<'a> {
     loans: &'a mut Loans,
     slots: Option<(&'a mut RepairSlots, usize)>,
 }
@@ -206,7 +203,7 @@ impl Lender for Lending<'_> {
 }
 
 impl Lending<'_> {
-    pub(crate) fn verify(&mut self, check: super::super::namespace::Verification) {
+    pub fn verify(&mut self, check: super::super::namespace::Verification) {
         let loans = &mut *self.loans;
         loans.serial += 1;
         let (scope, node, serial) = (loans.scope, check.node, loans.serial);

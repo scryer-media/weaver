@@ -13,7 +13,7 @@ use crate::persistence::{
 use crate::{JobInfo, MetricsSnapshot, StateError};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-pub use weaver_server_pipeline::operations::metrics_store::*;
+pub use weaver_server_composition::operations::metrics_store::*;
 
 const METRICS_HISTORY_COMPRESSION_LEVEL: i32 = 3;
 

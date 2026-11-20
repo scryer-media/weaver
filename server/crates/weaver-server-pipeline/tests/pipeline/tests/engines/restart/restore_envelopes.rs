@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use std::collections::{BTreeMap, BTreeSet};
-use weaver_server_pipeline::JobStatus;
+use weaver_server_composition::JobStatus;
 use weaver_server_pipeline::pipeline::tests::{
     engines::{
         harness::{JOB, Post, Scenario, collect, finished, run, serve_work, take_retry},

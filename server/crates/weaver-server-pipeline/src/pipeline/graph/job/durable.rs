@@ -8,7 +8,7 @@
 // are read on their own, so a checkpoint reads only what the tree, the
 // writer, its envelopes or an offer marked since the generations it read at.
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
@@ -23,7 +23,7 @@ use crate::pipeline::graph::namespace::WriteError;
 use crate::pipeline::graph::root::facts::{Encoded, Encoding};
 
 impl GraphJob {
-    pub(crate) fn generations(&self) -> Generations {
+    pub fn generations(&self) -> Generations {
         Generations {
             tree: self.tree.generation(),
             files: self.writer.files_generation(),
@@ -35,11 +35,7 @@ impl GraphJob {
     // What the tree, the writer, its envelopes or an offer changed of each
     // node since `at`: with `at` the generations nothing was read at, every
     // node the job ever had.
-    pub(in crate::pipeline::graph) fn visit_touched_since(
-        &self,
-        at: Generations,
-        mut visit: impl FnMut(NodeId, Touched),
-    ) {
+    pub fn visit_touched_since(&self, at: Generations, mut visit: impl FnMut(NodeId, Touched)) {
         for mark in self.tree.marked_since(at.tree) {
             let (node, touched) = match mark {
                 Mark::Node(node) => (
@@ -150,7 +146,7 @@ impl GraphJob {
 
     // One node's record, and what the writer holds of each of its members
     // it holds anything of; `None` for a node the tree no longer has.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn node(&self, node: NodeId) -> Option<(NodeRecord, BTreeMap<MemberId, FileState>)> {
         let mut record = self.tree.record(node)?;
         // As `member` takes each member's coverage.
@@ -203,9 +199,11 @@ impl GraphJob {
         self.passwords.last_offered(node)
     }
 
-    // The root's facts, with the job's count of repair reads and the phase
-    // it last reported, encoded into `encoded`.
+    // The root's facts, with the job's count of repair reads, the phase it
+    // last reported and whether it ever reported Repairing, encoded into
+    // `encoded`.
     pub(crate) fn encode_root(&self, encoded: &mut Encoded, next_node: u32) -> Encoding {
+        encoded.note_repair_entered(self.repair_reported);
         self.root.encode(
             encoded,
             next_node,
@@ -217,19 +215,19 @@ impl GraphJob {
 
     // The post's encoded bytes of the articles the root's facts say this
     // run does not fetch again: what the facts encoded now spare a restore.
-    #[cfg(test)]
-    pub(crate) fn settled_bytes(&self) -> u64 {
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn settled_bytes(&self) -> u64 {
         self.root.map.settled_bytes()
     }
 
     // The decoded bytes of the articles in hand: what a checkpoint taken now
     // spares a restore, in the units the job's downloaded bytes count.
-    pub(crate) fn in_hand_bytes(&self) -> u64 {
+    pub fn in_hand_bytes(&self) -> u64 {
         self.root.map.in_hand_bytes()
     }
 
     // Count `bytes` more in hand, as articles a test does not model would.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) fn add_in_hand_for_test(&mut self, bytes: u64) {
         self.root.map.add_in_hand_for_test(bytes);
     }
@@ -266,85 +264,4 @@ fn leave_out(coverage: Vec<CoverageRecord>, held: &[ByteRange]) -> Vec<CoverageR
         }
     }
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::pipeline::graph::job::passwords::Passwords;
-    use crate::pipeline::graph::root::tests::{file, job_with};
-
-    #[test]
-    fn kept_and_offered_sources_visit_their_own_flags_at_their_own_generations() {
-        let (mut job, _dir, _) = job_with(&[file("member.bin", &[64])], Vec::new());
-        let before = job.generations();
-        job.writer
-            .restore_kept(&KeptRecord {
-                node: NodeId::ROOT,
-                envelope: 7,
-                runs: Vec::new(),
-                closed: None,
-                settled: false,
-                file: None,
-            })
-            .unwrap();
-        job.passwords = Passwords::new(vec!["candidate".to_string()]);
-        assert_eq!(job.passwords.resume_at(NodeId::ROOT, 0), Some("candidate"));
-        let now = job.generations();
-        let collect = |at| {
-            let mut visited = Vec::new();
-            job.visit_touched_since(at, |node, flags| visited.push((node, flags)));
-            visited
-        };
-        assert!(collect(now).is_empty());
-        assert_eq!(
-            collect(Generations {
-                kept: before.kept,
-                ..now
-            }),
-            vec![(
-                NodeId::ROOT,
-                Touched {
-                    kept: true,
-                    ..Touched::default()
-                },
-            )]
-        );
-        assert_eq!(
-            collect(Generations {
-                offered: before.offered,
-                ..now
-            }),
-            vec![(
-                NodeId::ROOT,
-                Touched {
-                    own: true,
-                    ..Touched::default()
-                },
-            )]
-        );
-        assert_eq!(
-            collect(Generations {
-                kept: before.kept,
-                offered: before.offered,
-                ..now
-            }),
-            vec![
-                (
-                    NodeId::ROOT,
-                    Touched {
-                        kept: true,
-                        ..Touched::default()
-                    }
-                ),
-                (
-                    NodeId::ROOT,
-                    Touched {
-                        own: true,
-                        ..Touched::default()
-                    }
-                ),
-            ]
-        );
-    }
 }

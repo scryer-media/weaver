@@ -12,15 +12,14 @@
 //   slots     the repair slots the graph jobs share
 //   metrics   the `graph.*` family
 //   seams     the pipeline's hooks: completion, the census, scripts
+//   stall     a job that waits on nothing ends
 
-mod claims;
+pub mod claims;
 mod metrics;
-mod seams;
-mod slots;
-mod summary;
-
-#[cfg(test)]
-mod tests;
+pub mod seams;
+pub mod slots;
+mod stall;
+pub mod summary;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -33,27 +32,27 @@ use super::root::phase::RootPhase;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::extraction::ExtractionFailure;
 
-pub(crate) use crate::pipeline::completion::finalize::check::configured_par2_ignore_extensions;
-#[cfg(test)]
-pub(crate) use claims::Claim;
-pub(crate) use claims::Delivered;
-#[cfg(test)]
-pub(crate) use claims::Described;
-pub(crate) use claims::{Delivery, Unarrived};
-pub(crate) use seams::{Posted, delivery_of, shortfall_message};
+pub use crate::pipeline::completion::finalize::check::configured_par2_ignore_extensions;
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+pub use claims::Claim;
+pub use claims::Delivered;
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+pub use claims::Described;
+pub use claims::{Delivery, Unarrived};
+pub use seams::{Posted, delivery_of, shortfall_message};
 pub(in crate::pipeline) use seams::{advance, recovery_volume};
-pub(crate) use slots::RepairSlots;
+pub use slots::RepairSlots;
 pub(crate) use summary::{RecoverySummary, SetSummary};
 
 // The pipeline's part of graph status: the repair slots every graph job
 // shares.
 #[derive(Debug, Default)]
-pub(crate) struct GraphStatus {
-    pub(crate) repairs: RepairSlots,
+pub struct GraphStatus {
+    pub repairs: RepairSlots,
 }
 
 // What status reads of a graph job and the one thing it asks of it.
-pub(crate) trait RootJob {
+pub trait RootJob {
     fn phase(&self) -> RootPhase;
     // A namespace of the tree, at any depth: where a recovery object lives.
     fn namespace(&self, node: NodeId) -> Option<&Namespace>;
@@ -61,6 +60,9 @@ pub(crate) trait RootJob {
     fn recovery_summary(&self) -> RecoverySummary;
     // Whether the recovery object at `set` covers `member` of its namespace.
     fn covers(&self, set: NodeId, member: MemberId) -> bool;
+    // What the namespace `node` came out of, at some depth, a recovery set
+    // proved (`Tree::vouched_above`). Never the root.
+    fn vouched_above(&self, node: NodeId) -> bool;
     // Run every recovery object of the root namespace.
     fn repair(&mut self) -> Vec<RepairOutcome>;
     // An object below the root produced members.
@@ -119,6 +121,10 @@ impl RootJob for GraphJob {
             .is_some_and(|recovery| recovery.covers(member))
     }
 
+    fn vouched_above(&self, node: NodeId) -> bool {
+        self.tree().vouched_above(node)
+    }
+
     fn repair(&mut self) -> Vec<RepairOutcome> {
         RootJob::recovery_summary(self).outcomes()
     }
@@ -147,7 +153,7 @@ impl RootJob for GraphJob {
 
 // What an advance came to.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Step {
+pub enum Step {
     // For a slot, for recovery bytes, or for an object still producing
     // members. Whatever ends the wait advances the job again.
     Wait,
@@ -160,12 +166,7 @@ pub(crate) enum Step {
 // left for the queues to fetch. A repair that cannot rebuild what it found
 // does not end the job here: the members it left short are part of what
 // the job delivers, beside the whole ones.
-pub(crate) fn drive(
-    job: &mut dyn RootJob,
-    slots: &mut RepairSlots,
-    asker: AskerId,
-    limit: usize,
-) -> Step {
+pub fn drive(job: &mut dyn RootJob, slots: &mut RepairSlots, asker: AskerId, limit: usize) -> Step {
     // No delivery while a worker or queued checksum still has a say about
     // the file's bytes, even when no recovery set needs to run.
     if job.work_pending() {
@@ -208,22 +209,24 @@ pub(crate) fn drive(
 // fails for its short sets alone, each named as it was posted, and leaves
 // short only what they bind (`SetSummary::leaves_short`).
 // Each set is judged in the namespace it lives
-// in, at whatever depth. A breach of the job's extraction budget fails the
+// in, at whatever depth. An SFV in a namespace that came out of volumes a
+// set above proved makes no claim: what it lists is what was posted, and
+// its ruling fails nothing. A breach of the job's extraction budget fails the
 // job before any of that: it carries the budget's refusal, worded as the
 // job's failure reason, and names no object. When no set failed and the
 // feed gave the post up, the failure is the feed's, in its words.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Failure {
-    pub(crate) objects: Vec<NodeId>,
-    pub(crate) message: String,
-    pub(crate) rejection: Option<ExtractionFailure>,
+pub struct Failure {
+    pub objects: Vec<NodeId>,
+    pub message: String,
+    pub rejection: Option<ExtractionFailure>,
     // The words are the feed's: it gave the post up.
-    pub(crate) from_feed: bool,
+    pub from_feed: bool,
 }
 
 impl Failure {
     // The feed gave the post up, in these words.
-    pub(crate) fn post_given_up(words: String) -> Self {
+    pub fn post_given_up(words: String) -> Self {
         Self {
             objects: Vec::new(),
             message: words,
@@ -233,7 +236,7 @@ impl Failure {
     }
 }
 
-pub(crate) fn failure(
+pub fn failure(
     summary: &RecoverySummary,
     outcomes: &[RepairOutcome],
     job: &dyn RootJob,
@@ -277,7 +280,10 @@ pub(crate) fn failure(
     let failed: Vec<(&SetSummary, u64, u64)> = ruled
         .iter()
         .filter_map(|(set, outcome)| match outcome {
-            RepairOutcome::Impossible { damaged, reachable } if !excused(set) => {
+            RepairOutcome::Impossible { damaged, reachable }
+                if !excused(set)
+                    && !(set.kind == Kind::Sfv && job.vouched_above(set.namespace)) =>
+            {
                 Some((*set, *damaged, *reachable))
             }
             _ => None,
@@ -450,7 +456,7 @@ fn damaged_names(
 // downloading show over queued: the tree says only that bytes are wanted,
 // and a queued job starts downloading when the dispatcher sends its first
 // article, whichever engine runs it.
-pub(crate) fn shown_status(phase: RootPhase, current: &JobStatus) -> Option<JobStatus> {
+pub fn shown_status(phase: RootPhase, current: &JobStatus) -> Option<JobStatus> {
     phase
         .job_status()
         .filter(|status| RootPhase::may_replace(current) && status != current)

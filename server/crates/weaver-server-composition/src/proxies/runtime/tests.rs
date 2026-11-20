@@ -1,0 +1,611 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+use super::*;
+use crate::operations::backup::OperationsBackupQueries;
+use crate::operations::recovery::credentials::StoredCredentialQueries;
+use crate::proxies::ProxiesPersistenceQueries;
+use crate::proxies::{LegPath, RouteLeg, Rung};
+use crate::servers::persistence::ServersPersistenceQueries;
+use crate::servers::queries::ServersQueries;
+mod credentials;
+mod http3;
+mod review_regressions;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+fn profile(id: u32) -> ProxyProfile {
+    ProxyProfile {
+        dns_profile_id: 0,
+        id,
+        name: format!("proxy {id}"),
+        kind: ProxyKind::Socks5,
+        enabled: true,
+        host: "127.0.0.1".into(),
+        port: 9,
+        dns_servers: vec![],
+        tunnel_addresses: vec![],
+        peer_public_key: None,
+        mtu: 1280,
+        keepalive_seconds: None,
+        timeout_seconds: 1,
+        host_key_fingerprint: None,
+        natpmp: false,
+        forwarded_port: None,
+        revision: 1,
+        secrets: ProxySecrets::default(),
+    }
+}
+fn server(id: u32) -> crate::servers::ServerConfig {
+    crate::servers::ServerConfig {
+        id,
+        host: "provider.invalid".into(),
+        port: 119,
+        tls: false,
+        username: None,
+        password: None,
+        connections: 1,
+        active: true,
+        supports_pipelining: true,
+        pipelining_depth: None,
+        tls_name_mismatch_certificate_der: None,
+        priority: 0,
+        backfill: false,
+        retention_days: 0,
+        max_download_speed: 0,
+        download_quota: Default::default(),
+        tls_ca_cert: None,
+    }
+}
+fn controlled_route() -> Arc<ConsumerRoute> {
+    let runtime = ProxyRuntime::new(
+        Database::open_in_memory().unwrap(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    runtime
+        .draft_route(
+            RoutingPolicy {
+                proxy_ids: vec![1, 2, 3],
+                allow_direct: false,
+                ..Default::default()
+            },
+            Duration::from_secs(1),
+        )
+        .unwrap()
+}
+
+#[tokio::test(start_paused = true)]
+async fn one_recovery_probe_and_cancellation_releases_it() {
+    let route = controlled_route();
+    route.fail(1, ProxyFault::ConnectionRefused);
+    assert!(route.begin(1).is_none());
+    tokio::time::advance(Duration::from_secs(30)).await;
+    let attempt = route.begin(1).unwrap();
+    assert!(route.begin(1).is_none());
+    drop(attempt);
+    assert!(route.begin(1).is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn policy_save_closes_active_direct_sockets_before_reload_returns() {
+    let db = Database::open_in_memory().unwrap();
+    db.insert_server(&server(1)).unwrap();
+    let runtime = ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let registry = runtime.nntp_sockets(1).unwrap();
+    let fixture = tokio::spawn(async move {
+        let (mut tcp, _) = listener.accept().await.unwrap();
+        tcp.write_all(b"200 fixture\r\n").await.unwrap();
+        let mut data = [0; 1];
+        tcp.read(&mut data).await
+    });
+    let config = weaver_nntp::ServerConfig {
+        host: addr.ip().to_string(),
+        port: addr.port(),
+        tls: false,
+        dialer: runtime
+            .network
+            .nntp_dialer(1, 1, Duration::from_secs(30))
+            .unwrap(),
+        pipelining: weaver_nntp::PipeliningCapability::Known(false),
+        ..Default::default()
+    };
+    let connect = config.clone();
+    let _connection =
+        tokio::task::spawn_blocking(move || weaver_nntp::BlockingNntpConnection::connect(&connect))
+            .await
+            .unwrap()
+            .unwrap();
+    db.save_proxy_routing_policy(
+        Consumer::Server(1),
+        &RoutingPolicy {
+            proxy_ids: vec![],
+            allow_direct: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    runtime.reload().await.unwrap();
+    assert!(registry.check().is_err());
+    assert_eq!(fixture.await.unwrap().unwrap(), 0);
+    assert!(
+        tokio::task::spawn_blocking(
+            move || weaver_nntp::BlockingNntpConnection::connect(&config).is_err()
+        )
+        .await
+        .unwrap()
+    );
+    runtime.stop_all().await;
+}
+
+#[tokio::test]
+async fn reload_keeps_legacy_routes_across_profile_edits() {
+    let db = Database::open_in_memory().unwrap();
+    db.insert_server(&server(1)).unwrap();
+    db.insert_server(&server(2)).unwrap();
+    let mut p = profile(1);
+    db.save_proxy_profile(&p).unwrap();
+    db.save_proxy_routing_policy(
+        Consumer::Server(1),
+        &RoutingPolicy {
+            proxy_ids: vec![1],
+            allow_direct: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let runtime = ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
+    let routed = runtime
+        .route(Consumer::Server(1), Duration::from_secs(1))
+        .unwrap();
+    let direct = runtime
+        .route(Consumer::Server(2), Duration::from_secs(1))
+        .unwrap();
+    runtime.reload().await.unwrap();
+    assert!(Arc::ptr_eq(
+        &routed,
+        &runtime
+            .route(Consumer::Server(1), Duration::from_secs(1))
+            .unwrap()
+    ));
+    p.enabled = false;
+    p.revision += 1;
+    db.save_proxy_profile(&p).unwrap();
+    // A profile edit is the network runtime's to apply to the legs that
+    // use it; the legacy route holds no hop to rebuild.
+    runtime.reload().await.unwrap();
+    assert!(!routed.is_revoked());
+    assert!(!direct.is_revoked());
+    assert!(Arc::ptr_eq(
+        &routed,
+        &runtime
+            .route(Consumer::Server(1), Duration::from_secs(1))
+            .unwrap()
+    ));
+    runtime.stop_all().await;
+    assert!(routed.is_revoked());
+    assert!(direct.is_revoked());
+    assert!(
+        runtime
+            .route(Consumer::Server(2), Duration::from_secs(1))
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn reweighting_legs_keeps_the_legacy_route_and_its_sockets() {
+    let db = Database::open_in_memory().unwrap();
+    db.insert_server(&server(1)).unwrap();
+    let legs = |weight| RoutingPolicy {
+        legs: vec![
+            RouteLeg {
+                egress_id: 0,
+                weight,
+                path: LegPath::Direct,
+            },
+            RouteLeg {
+                egress_id: 0,
+                weight: 100 - weight,
+                path: LegPath::Direct,
+            },
+        ],
+        ..Default::default()
+    };
+    db.save_proxy_routing_policy(Consumer::Server(1), &legs(50))
+        .unwrap();
+    let runtime = ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
+    let route = runtime
+        .route(Consumer::Server(1), Duration::from_secs(1))
+        .unwrap();
+    // A reweight is the network runtime's to apply in place; it must not
+    // rebuild the legacy route, which would close every socket it tracks.
+    db.save_proxy_routing_policy(Consumer::Server(1), &legs(80))
+        .unwrap();
+    runtime.reload().await.unwrap();
+    assert!(!route.is_revoked());
+    assert!(Arc::ptr_eq(
+        &route,
+        &runtime
+            .route(Consumer::Server(1), Duration::from_secs(1))
+            .unwrap()
+    ));
+    // Putting a proxy in front of the first leg changes the legacy
+    // projection, and that does rebuild the route.
+    db.save_proxy_profile(&profile(1)).unwrap();
+    let mut proxied = legs(80);
+    proxied.legs[0].path = LegPath::Ladder {
+        rungs: vec![Rung::Proxy { id: 1 }],
+        direct_fallback: false,
+    };
+    db.save_proxy_routing_policy(Consumer::Server(1), &proxied)
+        .unwrap();
+    runtime.reload().await.unwrap();
+    assert!(route.is_revoked());
+    runtime.stop_all().await;
+}
+
+#[tokio::test]
+async fn deleting_consumer_revokes_routes_and_releases_profile_reference() {
+    let db = Database::open_in_memory().unwrap();
+    db.insert_server(&server(1)).unwrap();
+    db.save_proxy_profile(&profile(1)).unwrap();
+    db.save_proxy_routing_policy(
+        Consumer::Server(1),
+        &RoutingPolicy {
+            proxy_ids: vec![1],
+            allow_direct: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(db.delete_proxy_profile(1).is_err());
+    let runtime = ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
+    let route = runtime
+        .route(Consumer::Server(1), Duration::from_secs(1))
+        .unwrap();
+    db.delete_server(1).unwrap();
+    runtime.reload().await.unwrap();
+    assert!(route.is_revoked());
+    assert!(
+        runtime
+            .route(Consumer::Server(1), Duration::from_secs(1))
+            .is_err()
+    );
+    db.delete_proxy_profile(1).unwrap();
+}
+
+#[test]
+fn routing_validation_and_atomic_consumer_save_preserve_existing_policy() {
+    let db = Database::open_in_memory().unwrap();
+    let mut server = server(1);
+    assert_eq!(
+        db.proxy_routing_policy(Consumer::Server(1)).unwrap(),
+        RoutingPolicy::default()
+    );
+    db.save_proxy_profile(&profile(1)).unwrap();
+    let policy = RoutingPolicy {
+        proxy_ids: vec![1],
+        allow_direct: false,
+        ..Default::default()
+    };
+    db.insert_server_with_routing(&server, Some(&policy))
+        .unwrap();
+    // A loaded route always names its DNS profile; a new one saved without
+    // one takes the System profile.
+    let policy = RoutingPolicy {
+        dns_profile_id: Some(crate::proxies::SYSTEM_DNS_PROFILE_ID),
+        ..policy
+    };
+    server.host = "new.invalid".into();
+    db.update_server(&server).unwrap();
+    assert_eq!(
+        db.proxy_routing_policy(Consumer::Server(1)).unwrap(),
+        policy
+    );
+    for ids in [vec![1, 1], vec![999], (1..=9).collect()] {
+        server.host = "must-not-save.invalid".into();
+        assert!(
+            db.update_server_with_routing(
+                &server,
+                Some(&RoutingPolicy {
+                    proxy_ids: ids,
+                    allow_direct: true,
+                    ..Default::default()
+                })
+            )
+            .is_err()
+        );
+        assert_eq!(db.list_servers().unwrap()[0].host, "new.invalid");
+        assert_eq!(
+            db.proxy_routing_policy(Consumer::Server(1)).unwrap(),
+            policy
+        );
+    }
+}
+
+#[test]
+fn profile_secrets_are_encrypted_and_wrong_key_fails_closed() {
+    use crate::persistence::{encryption::EncryptionKey, sql_runtime::SqlRuntime};
+    let mut db = Database::open_in_memory().unwrap();
+    let mut p = profile(1);
+    p.secrets.username = Some("private-username".into());
+    p.secrets.password = Some("private-password".into());
+    db.save_proxy_profile(&p).unwrap();
+    let store = db.datastore();
+    let rows = db
+        .run_sql_blocking_read(async move {
+            SqlRuntime::fetch_all(
+                store.read_exec(),
+                "SELECT config, password FROM proxy_profiles",
+                &[],
+            )
+            .await
+        })
+        .unwrap();
+    let raw = format!(
+        "{} {}",
+        rows[0].text("config").unwrap(),
+        rows[0].text("password").unwrap()
+    );
+    assert!(!raw.contains("private-username"));
+    assert!(!raw.contains("private-password"));
+    assert_eq!(
+        db.list_proxy_profiles().unwrap()[0]
+            .secrets
+            .password
+            .as_deref(),
+        Some("private-password")
+    );
+    db.set_encryption_key(EncryptionKey::generate());
+    assert!(db.list_proxy_profiles().is_err());
+}
+
+#[test]
+fn backup_restores_encrypted_profiles_ordered_routes_and_host_trust() {
+    use crate::persistence::encryption::EncryptionKey;
+    let source = Database::open_in_memory().unwrap();
+    let key = source.encryption_key().unwrap().clone();
+    source.insert_server(&server(1)).unwrap();
+    let mut p = profile(1);
+    p.secrets.username = Some("backup-user".into());
+    p.secrets.password = Some("backup-only-secret".into());
+    source.save_proxy_profile(&p).unwrap();
+    source.save_proxy_profile(&profile(2)).unwrap();
+    source.pin_proxy_host_key(1, 1, "SHA256:fixture").unwrap();
+    let policy = RoutingPolicy {
+        proxy_ids: vec![2, 1],
+        allow_direct: false,
+        ..Default::default()
+    };
+    source
+        .save_proxy_routing_policy(Consumer::Server(1), &policy)
+        .unwrap();
+    // A loaded route always names its DNS profile; a new one saved without
+    // one takes the System profile.
+    let policy = RoutingPolicy {
+        dns_profile_id: Some(crate::proxies::SYSTEM_DNS_PROFILE_ID),
+        ..policy
+    };
+    assert!(source.has_encrypted_credentials().unwrap());
+    source.validate_encrypted_credentials(&key).unwrap();
+    assert!(
+        source
+            .validate_encrypted_credentials(&EncryptionKey::generate())
+            .is_err()
+    );
+    let backup = tempfile::NamedTempFile::new().unwrap();
+    source.export_stable_state(backup.path()).unwrap();
+    let artifact = Database::open(backup.path()).unwrap();
+    assert_eq!(
+        artifact.proxy_routing_policy(Consumer::Server(1)).unwrap(),
+        policy,
+        "exported routing policy"
+    );
+    drop(artifact);
+    assert!(
+        !std::fs::read(backup.path())
+            .unwrap()
+            .windows(18)
+            .any(|w| w == b"backup-only-secret")
+    );
+    let mut target = Database::open_in_memory().unwrap();
+    target.set_encryption_key(key);
+    target.import_stable_state(backup.path()).unwrap();
+    assert_eq!(
+        target.list_proxy_profiles().unwrap().len(),
+        2,
+        "imported profiles"
+    );
+    assert_eq!(
+        target.proxy_routing_policy(Consumer::Server(1)).unwrap(),
+        policy
+    );
+    let profiles = target.list_proxy_profiles().unwrap();
+    assert_eq!(profiles[0].secrets.username.as_deref(), Some("backup-user"));
+    assert_eq!(
+        profiles[0].secrets.password.as_deref(),
+        Some("backup-only-secret")
+    );
+    assert_eq!(
+        profiles[0].host_key_fingerprint.as_deref(),
+        Some("SHA256:fixture")
+    );
+    // Rewriting profiles with a replacement key preserves all secret fields and trust.
+    let replacement = EncryptionKey::generate();
+    target.set_encryption_key(replacement.clone());
+    for profile in &profiles {
+        target.save_proxy_profile(profile).unwrap();
+    }
+    target.validate_encrypted_credentials(&replacement).unwrap();
+    assert_eq!(
+        target.list_proxy_profiles().unwrap()[0].secrets.password,
+        profiles[0].secrets.password
+    );
+    assert!(!target.restore_target_is_pristine().unwrap());
+}
+
+#[test]
+fn ssh_trust_cannot_be_overwritten_by_conflicting_or_stale_handshakes() {
+    let db = Database::open_in_memory().unwrap();
+    let mut p = profile(1);
+    p.kind = ProxyKind::Ssh;
+    p.secrets.username = Some("fixture".into());
+    p.secrets.private_key = Some(weaver_tunnel::test_support::CLIENT_ED25519_PEM.into());
+    db.save_proxy_profile(&p).unwrap();
+    db.pin_proxy_host_key(1, 1, "SHA256:first").unwrap();
+    assert_eq!(
+        db.proxy_host_key(1, 1).unwrap().as_deref(),
+        Some("SHA256:first")
+    );
+    assert!(db.pin_proxy_host_key(1, 1, "SHA256:other").is_err());
+    p.revision = 2;
+    let saved = db.save_proxy_profile(&p).unwrap();
+    assert_eq!(saved.host_key_fingerprint.as_deref(), Some("SHA256:first"));
+    assert_eq!(
+        db.proxy_host_key(1, 2).unwrap().as_deref(),
+        Some("SHA256:first")
+    );
+    assert!(db.pin_proxy_host_key(1, 1, "SHA256:stale").is_err());
+    assert!(db.proxy_host_key(1, 1).is_err());
+    assert!(db.pin_proxy_host_key(1, 2, "SHA256:reset").is_err());
+    p.revision = 3;
+    db.reset_proxy_host_key(&p).unwrap();
+    assert!(db.proxy_host_key(1, 3).unwrap().is_none());
+    assert!(db.pin_proxy_host_key(1, 2, "SHA256:stale").is_err());
+    db.pin_proxy_host_key(1, 3, "SHA256:reset").unwrap();
+    assert_eq!(
+        db.proxy_host_key(1, 3).unwrap().as_deref(),
+        Some("SHA256:reset")
+    );
+}
+
+#[tokio::test]
+async fn cancelled_route_wakes_waiters_and_refuses_new_attempts() {
+    let route = controlled_route();
+    let waiting = route.clone();
+    let waiter = tokio::spawn(async move {
+        waiting.cancelled().await;
+    });
+    route.revoke().await;
+    waiter.await.unwrap();
+    assert!(route.begin(1).is_none());
+}
+
+#[test]
+fn ssh_profiles_require_a_valid_key_even_if_a_password_is_present() {
+    let mut p = profile(1);
+    p.kind = ProxyKind::Ssh;
+    p.secrets.username = Some("operator".into());
+    p.secrets.password = Some("password-is-not-authentication".into());
+    assert!(p.validate().unwrap_err().to_string().contains("Ed25519"));
+    p.secrets.private_key = Some(weaver_tunnel::test_support::CLIENT_ED25519_PEM.into());
+    p.validate().unwrap();
+    assert!(!format!("{:?}", p.ssh_spec()).contains("password-is-not-authentication"));
+}
+
+#[test]
+fn an_ssh_profile_is_stored_without_a_password() {
+    let db = Database::open_in_memory().unwrap();
+    let mut p = profile(1);
+    p.kind = ProxyKind::Ssh;
+    p.secrets.username = Some("operator".into());
+    p.secrets.password = Some("password-is-not-authentication".into());
+    p.secrets.private_key = Some(weaver_tunnel::test_support::CLIENT_ED25519_PEM.into());
+    let saved = db.save_proxy_profile(&p).unwrap();
+    assert_eq!(saved.secrets.password, None);
+    let stored = &db.list_proxy_profiles().unwrap()[0].secrets;
+    assert_eq!(stored.password, None);
+    assert_eq!(stored.username.as_deref(), Some("operator"));
+    assert!(stored.private_key.is_some());
+}
+
+// A hardware profile with larger usenet buffers, put in force where the
+// profile is applied, budgets the tunnels again at once: a leg whose tunnel
+// fit at the smaller buffers says it is over budget, and says nothing again
+// once the buffers are smaller once more. Nothing polls for it.
+#[tokio::test]
+async fn a_new_usenet_buffer_size_budgets_the_tunnels_again() {
+    use base64::Engine;
+    let key = |seed: u8| {
+        base64::engine::general_purpose::STANDARD
+            .encode(weaver_tunnel::test_support::test_key(seed))
+    };
+    let small = 256 * 1024;
+    let large = 4 * 1024 * 1024;
+    // Before the runtime loads, as the profile is applied at start-up.
+    crate::proxies::set_usenet_receive_bytes(small, None);
+    let db = Database::open_in_memory().unwrap();
+    db.insert_server(&crate::servers::ServerConfig {
+        connections: 400,
+        ..server(1)
+    })
+    .unwrap();
+    db.save_proxy_profile(&ProxyProfile {
+        kind: ProxyKind::WireGuard,
+        host: "192.0.2.1".into(),
+        port: 51820,
+        dns_servers: vec!["10.64.0.1".parse().unwrap()],
+        tunnel_addresses: vec!["10.64.0.2/32".into()],
+        peer_public_key: Some(key(2)),
+        secrets: ProxySecrets {
+            private_key: Some(key(1)),
+            ..Default::default()
+        },
+        ..profile(1)
+    })
+    .unwrap();
+    db.save_proxy_routing_policy(
+        Consumer::Server(1),
+        &RoutingPolicy {
+            legs: vec![RouteLeg {
+                egress_id: 0,
+                weight: 100,
+                path: LegPath::Ladder {
+                    rungs: vec![Rung::Proxy { id: 1 }],
+                    direct_fallback: false,
+                },
+            }],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let runtime = ProxyRuntime::new(db, tokio::runtime::Handle::current()).unwrap();
+    let warning = |runtime: &ProxyRuntime| {
+        runtime
+            .network
+            .route(Consumer::Server(1), 5, Duration::from_secs(1))
+            .unwrap()
+            .legs
+            .read()
+            .unwrap()[0]
+            .warning
+            .clone()
+    };
+    assert_eq!(warning(&runtime), None);
+
+    let mut reloads = runtime.network.reloads();
+    assert!(crate::proxies::set_usenet_receive_bytes(
+        large,
+        Some(Arc::clone(&runtime))
+    ));
+    reloads.changed().await.unwrap();
+    let over = warning(&runtime).expect("the tunnel is over budget");
+    assert!(
+        over.starts_with("Usenet servers ask 401 connections of WireGuard proxy 1"),
+        "{over}"
+    );
+
+    // The same size again budgets nothing.
+    assert!(!crate::proxies::set_usenet_receive_bytes(
+        large,
+        Some(Arc::clone(&runtime))
+    ));
+    assert!(crate::proxies::set_usenet_receive_bytes(
+        small,
+        Some(Arc::clone(&runtime))
+    ));
+    reloads.changed().await.unwrap();
+    assert_eq!(warning(&runtime), None);
+    runtime.network.shutdown().await;
+}

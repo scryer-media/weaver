@@ -12,11 +12,11 @@ const PAR2_IGNORE_EXTENSIONS_ENV: &str = "WEAVER_PAR2_IGNORE_EXTENSIONS";
 // when it is missing entirely. This default is the union of the two lists,
 // overridable through the env var above (comma- or semicolon-separated; an
 // empty value disables the behaviour).
-const DEFAULT_PAR2_IGNORE_EXTENSIONS: [&str; 4] = ["nfo", "sfv", "srr", "nzb"];
+pub const DEFAULT_PAR2_IGNORE_EXTENSIONS: [&str; 4] = ["nfo", "sfv", "srr", "nzb"];
 
 // The extension list [`par2_damage_ignorable`] matches against, as read from
 // the environment once per verdict.
-pub(crate) fn configured_par2_ignore_extensions() -> Vec<String> {
+pub fn configured_par2_ignore_extensions() -> Vec<String> {
     parse_par2_ignore_extensions(std::env::var(PAR2_IGNORE_EXTENSIONS_ENV).ok().as_deref())
 }
 
@@ -26,7 +26,7 @@ pub(crate) fn configured_par2_ignore_extensions() -> Vec<String> {
 //
 // Entries are separated by `,` or `;`, may carry a leading dot, and are
 // compared case-insensitively.
-fn parse_par2_ignore_extensions(raw: Option<&str>) -> Vec<String> {
+pub fn parse_par2_ignore_extensions(raw: Option<&str>) -> Vec<String> {
     let Some(value) = raw else {
         return DEFAULT_PAR2_IGNORE_EXTENSIONS
             .iter()
@@ -57,10 +57,7 @@ fn parse_par2_ignore_extensions(raw: Option<&str>) -> Vec<String> {
 // with a hole in it is strictly better for the user than refusing the payload
 // it describes. Matching is on the file's own extension so a payload that
 // merely *mentions* one of these names is unaffected.
-pub(in crate::pipeline) fn par2_damage_ignorable(
-    filename: &str,
-    ignore_extensions: &[String],
-) -> bool {
+pub fn par2_damage_ignorable(filename: &str, ignore_extensions: &[String]) -> bool {
     if ignore_extensions.is_empty() {
         return false;
     }
@@ -82,7 +79,7 @@ impl Pipeline {
     // "override disables it" case can be exercised without mutating a
     // process-global environment other tests are reading concurrently.
     pub(in crate::pipeline) fn par2_ignore_extensions(&self) -> Vec<String> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         if let Some(extensions) = self.par2_ignore_extensions_override.as_ref() {
             return extensions.clone();
         }
@@ -96,7 +93,7 @@ impl Pipeline {
     // Queued articles and delayed retries deliberately do not count: they are
     // the scheduler's backlog, not current transfer activity, and a started
     // job with only backlog still lists as Downloading on its own state.
-    pub(crate) fn job_has_current_download_activity(&self, job_id: JobId) -> bool {
+    pub fn job_has_current_download_activity(&self, job_id: JobId) -> bool {
         #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         if self.job_has_queued_decode(job_id) {
             return true;
@@ -189,7 +186,7 @@ impl Pipeline {
     // the job's own delivery goes on, and the pause holds what comes after
     // it (the repair and extraction slots the graph asks for, and the final
     // move).
-    pub(crate) async fn check_job_completion(&mut self, job_id: JobId) {
+    pub async fn check_job_completion(&mut self, job_id: JobId) {
         weaver_server_base::runtime::panic_trap::in_job(job_id, self.weigh_job_completion(job_id))
             .await;
     }
@@ -221,6 +218,3 @@ impl Pipeline {
         crate::pipeline::graph::status::advance(self, job_id).await;
     }
 }
-
-#[cfg(test)]
-mod tests;

@@ -29,7 +29,7 @@ use weaver_server_disk::operations::disk::writer::{
 // the process shares, and the pipeline's place among their owners. Every
 // submitter the pipeline takes is its own, so its jobs' failures and the
 // wakes it asks for come back to it.
-pub(crate) struct PipelineWriters {
+pub struct PipelineWriters {
     writers: Arc<VolumeWriters>,
     owner: Owner,
 }
@@ -69,7 +69,7 @@ impl PipelineWriters {
 // both leases and writes, so its leases keep one write piece of the hard
 // limit for its writes (`Volume::write_piece`): those always find room
 // once the writer has written what it holds.
-pub(crate) trait VolumeLeases {
+pub trait VolumeLeases {
     // The loop's share of the hard limit: what leases leave free for it.
     fn loop_share(&self) -> u64;
     // The bytes below which leases are granted: the hard limit less the
@@ -141,7 +141,7 @@ pub(crate) type ReadVolumes = Vec<(PathBuf, Arc<Volume>)>;
 // device, whose limits are its own, so the job's writes would not count
 // against the limit of the volume they land on.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn job_disk(
+pub fn job_disk(
     writers: &PipelineWriters,
     capacity: &StorageCapacity,
     probes: &VolumeProbes,
@@ -228,7 +228,7 @@ type MakeProbe = dyn Fn(Arc<Volume>, PathBuf) -> Probe + Send + Sync;
 // first writes and its first read do not stand behind the probe. It runs
 // the first time the writer runs out of work, on the volume's thread;
 // nothing here looks at a disk.
-pub(crate) struct VolumeProbes {
+pub struct VolumeProbes {
     // The probe of a volume, given a directory on it that is there.
     probe: Option<Arc<MakeProbe>>,
     // The volumes whose probe was queued: one entry for each device.
@@ -247,9 +247,7 @@ impl VolumeProbes {
         })
     }
 
-    pub(crate) fn with(
-        probe: impl Fn(Arc<Volume>, PathBuf) -> Probe + Send + Sync + 'static,
-    ) -> Self {
+    pub fn with(probe: impl Fn(Arc<Volume>, PathBuf) -> Probe + Send + Sync + 'static) -> Self {
         Self {
             probe: Some(Arc::new(probe)),
             seen: Default::default(),
@@ -264,7 +262,13 @@ impl VolumeProbes {
         }
     }
 
-    fn first_seen(&self, writers: &VolumeWriters, owner: &Owner, volume: &Arc<Volume>, dir: &Path) {
+    pub fn first_seen(
+        &self,
+        writers: &VolumeWriters,
+        owner: &Owner,
+        volume: &Arc<Volume>,
+        dir: &Path,
+    ) {
         let Some(probe) = &self.probe else {
             return;
         };
@@ -294,14 +298,14 @@ impl VolumeProbes {
 // one of the intermediate root, or of a destination's `.weaver-staging`,
 // so this is that root or that staging root, on the volume the job writes
 // to, and as writable as the job's folder had to be to be made there.
-fn probed_dir(job_dir: &Path) -> Option<&Path> {
+pub fn probed_dir(job_dir: &Path) -> Option<&Path> {
     job_dir.parent()?.ancestors().find(|dir| dir.is_dir())
 }
 
 // A test's say over how the pipelines it builds write: one thread per
 // volume, as outside tests, instead of each operation as it is submitted.
 #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-pub(crate) mod threads {
+pub mod threads {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     static ASKED: AtomicBool = AtomicBool::new(false);
@@ -310,15 +314,16 @@ pub(crate) mod threads {
         static THREADED_WRITERS: ();
     }
 
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) async fn with_real_writers<F: std::future::Future>(fixture: F) -> F::Output {
         THREADED_WRITERS.scope((), fixture).await
     }
 
-    #[cfg(test)]
-    pub(crate) struct Threads(());
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub struct Threads(());
 
-    #[cfg(test)]
-    pub(crate) fn real() -> Threads {
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn real() -> Threads {
         ASKED.store(true, Ordering::SeqCst);
         Threads(())
     }
@@ -338,7 +343,7 @@ pub(crate) mod threads {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     impl Drop for Threads {
         fn drop(&mut self) {
             ASKED.store(false, Ordering::SeqCst);
@@ -350,7 +355,7 @@ impl Pipeline {
     // What the volumes the job writes to ask of the lanes fetching for it:
     // the most held back of them. Each volume is read against its own
     // limits.
-    pub(in crate::pipeline) fn volume_intake(&self, job_id: JobId) -> VolumeIntake {
+    pub fn volume_intake(&self, job_id: JobId) -> VolumeIntake {
         self.graph_jobs
             .get(&job_id)
             .and_then(|graph| graph.disk())
@@ -386,7 +391,7 @@ impl Pipeline {
     // Whether a volume the job writes to counts its lease limit or more.
     // Dispatch for the job stops while one does, and whatever brings it
     // below wakes dispatch.
-    pub(in crate::pipeline) fn volume_holds_budget(&self, job_id: JobId) -> bool {
+    pub fn volume_holds_budget(&self, job_id: JobId) -> bool {
         let held = self.volume_intake(job_id) == VolumeIntake::Stopped;
         if held {
             self.volume_budget_held
@@ -461,7 +466,7 @@ impl Pipeline {
     // The volumes' writers returned what the job had submitted when a
     // checkpoint or its end began to wait: the checkpoint may go, and a
     // stopped job that waited only for its last file operation ends.
-    pub(in crate::pipeline) fn graph_disk_returned(&mut self, job_id: JobId) {
+    pub fn graph_disk_returned(&mut self, job_id: JobId) {
         let mail = self.graph_runs.written();
         if let Some(graph) = self
             .graph_jobs
@@ -603,7 +608,7 @@ impl Pipeline {
     // stopped for fell below its line, or an operation failed and may have
     // freed one. Its failures came first, as mail. Dispatch that stopped
     // for a volume looks again.
-    pub(in crate::pipeline) fn volume_room_heard(&mut self) {
+    pub fn volume_room_heard(&mut self) {
         self.volume_room_changed();
     }
 }
@@ -617,7 +622,7 @@ fn disk_error(failure: Failure, device: crate::pipeline::graph::limits::Device) 
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct JobDisk {
+pub struct JobDisk {
     // The volume the working directory lies on.
     working: Arc<Submitter>,
     // Where the delivered files lie and their volume, when it is another.
@@ -637,7 +642,7 @@ fn output_limit(submitter: &Submitter) -> u64 {
 
 impl JobDisk {
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-    pub(crate) fn new(working: Arc<Submitter>, output: Option<(PathBuf, Arc<Submitter>)>) -> Self {
+    pub fn new(working: Arc<Submitter>, output: Option<(PathBuf, Arc<Submitter>)>) -> Self {
         Self {
             working,
             output,
@@ -657,14 +662,14 @@ impl JobDisk {
     }
 
     // The writer of the volume a file under `root` lies on.
-    pub(crate) fn under(&self, root: &Path) -> &Arc<Submitter> {
+    pub fn under(&self, root: &Path) -> &Arc<Submitter> {
         match &self.output {
             Some((output, submitter)) if root.starts_with(output) => submitter,
             _ => &self.working,
         }
     }
 
-    pub(crate) fn working(&self) -> &Arc<Submitter> {
+    pub fn working(&self) -> &Arc<Submitter> {
         &self.working
     }
 
@@ -673,7 +678,7 @@ impl JobDisk {
     }
 
     // Everything the job submitted so far, on every volume it writes to.
-    pub(crate) fn barrier(&self) -> JobBarrier {
+    pub fn barrier(&self) -> JobBarrier {
         JobBarrier(self.each().map(|submitter| submitter.barrier()).collect())
     }
 
@@ -698,13 +703,13 @@ impl JobDisk {
     // Whether a wait of the loop on one of the job's volumes was given up
     // at the end of a stop (`Submitter::gave_up`): the step that made it,
     // and every later one, stands on bytes that are not written.
-    pub(crate) fn left_at_stop(&self) -> bool {
+    pub fn left_at_stop(&self) -> bool {
         self.each().any(|submitter| submitter.gave_up())
     }
 
     // What the volumes the job writes to ask of its lanes: the most held
     // back of them, each read against its own limits.
-    pub(in crate::pipeline) fn intake(&self) -> VolumeIntake {
+    pub fn intake(&self) -> VolumeIntake {
         self.each()
             .map(|submitter| intake_of(submitter.volume()))
             .fold(VolumeIntake::Open, |most, intake| match (most, intake) {
@@ -714,12 +719,12 @@ impl JobDisk {
     }
 
     // Whether everything the job submitted has returned, failed or not.
-    pub(crate) fn quiet(&self) -> bool {
+    pub fn quiet(&self) -> bool {
         self.each().all(|submitter| submitter.barrier().returned())
     }
 
-    #[cfg(test)]
-    pub(crate) fn failed(&self) -> bool {
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn failed(&self) -> bool {
         self.each().any(|submitter| submitter.failed())
     }
 
@@ -736,15 +741,15 @@ impl JobDisk {
 
 // What a test runs between the two looks `JobBarrier::passed_or_tell` takes
 // at a barrier, on the thread that takes them: once, then it is gone.
-#[cfg(test)]
-pub(crate) mod between_looks {
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+pub mod between_looks {
     use std::cell::RefCell;
 
     thread_local! {
         static RUN: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
     }
 
-    pub(crate) fn set(run: impl FnOnce() + 'static) {
+    pub fn set(run: impl FnOnce() + 'static) {
         RUN.with(|slot| *slot.borrow_mut() = Some(Box::new(run)));
     }
 
@@ -757,11 +762,11 @@ pub(crate) mod between_looks {
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct JobBarrier(Vec<Barrier>);
+pub struct JobBarrier(Vec<Barrier>);
 
 impl JobBarrier {
     // Every operation behind it returned and none failed.
-    pub(crate) fn passed(&self) -> bool {
+    pub fn passed(&self) -> bool {
         self.0.iter().all(Barrier::passed)
     }
 
@@ -824,13 +829,13 @@ impl JobBarrier {
     // then either pass the barrier here or are told of. Looked at the other
     // way round, they left a barrier that had not passed and asked for no
     // mail, and the job waited for a mail that never came.
-    pub(crate) fn passed_or_tell(
+    pub fn passed_or_tell(
         &self,
         job_id: JobId,
         mail: &tokio::sync::mpsc::UnboundedSender<crate::pipeline::graph::engine::Said>,
     ) -> bool {
         let returned = self.returned();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         between_looks::run();
         if self.passed() {
             return true;
@@ -872,7 +877,7 @@ impl JobBarrier {
     }
 
     // Every operation behind it returned, failed or not.
-    pub(crate) fn returned(&self) -> bool {
+    pub fn returned(&self) -> bool {
         self.0.iter().all(Barrier::returned)
     }
 
@@ -884,7 +889,7 @@ impl JobBarrier {
 
     // Wait until every operation behind it returned, on a thread the loop
     // does not wait for: a repair, a check or a replay on its own thread.
-    pub(crate) fn wait_aside(&self) {
+    pub fn wait_aside(&self) {
         for barrier in &self.0 {
             barrier.wait_aside();
         }
@@ -892,14 +897,14 @@ impl JobBarrier {
 
     // What a thread asks after `wait_aside`: whether it must read nothing
     // back. See `Barrier::unwritten`.
-    pub(crate) fn unwritten(&self) -> bool {
+    pub fn unwritten(&self) -> bool {
         self.0.iter().any(Barrier::unwritten)
     }
 
     // Wait until every operation behind it returned, counted against the
     // loop.
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-    pub(crate) fn wait(&self) {
+    pub fn wait(&self) {
         for barrier in &self.0 {
             barrier.wait();
         }
@@ -907,8 +912,8 @@ impl JobBarrier {
 
     // Wait until every operation behind it returned, on a thread that is
     // not the loop: not counted as a wait of any kind.
-    #[cfg(test)]
-    pub(crate) fn wait_returned(&self) {
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn wait_returned(&self) {
         for barrier in &self.0 {
             let (returned, heard) = std::sync::mpsc::channel();
             barrier.then(move || {
@@ -920,6 +925,3 @@ impl JobBarrier {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

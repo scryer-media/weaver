@@ -8,16 +8,29 @@ repository.workspace = true
 
 [features]
 slow-tests = ["weaver-server-pipeline/slow-tests"]
-test-support = ["weaver-server-pipeline/test-support"]
+test-support = ["weaver-server-pipeline/test-support", "weaver-server-orchestration/test-support", "weaver-server-torrents/test-support"]
 e2e-local-trackers = ["weaver-server-pipeline/e2e-local-trackers"]
 
 [dependencies]
 aes-gcm = { workspace = true }
+# The in-application upgrade core: manifest validation, installation
+# classification, download, verification, extraction, promotion, rollback, the
+# durable journal and the Windows helper handoff. Pinned to a signed tag rather
+# than a branch, because everything in it is release-critical.
+application-updater = { git = "https://github.com/scryer-media/application-updater", tag = "v0.1.1" }
+# The signer-policy types, plus the Sigstore trust-root refresh Weaver primes at
+# startup. `verification` is named explicitly rather than left to feature
+# unification through `application-updater`.
+artifact-trust = { git = "https://github.com/scryer-media/artifact-trust", tag = "v0.1.3", default-features = false, features = [
+    "verification",
+] }
 argon2 = { workspace = true }
 blake3 = { workspace = true }
 chrono = { workspace = true }
 getrandom = { workspace = true, default-features = false }
+httpdate = { workspace = true }
 pbkdf2 = { workspace = true }
+reqwest = { workspace = true }
 rmp-serde = { workspace = true, default-features = false }
 semver = { workspace = true }
 serde = { workspace = true }
@@ -28,11 +41,20 @@ tar = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+# Named for `rustls` itself: the upgrade downloader and the Sigstore trust-root
+# refresh both need the process default crypto provider installed.
+tokio-rustls = { workspace = true }
 tracing = { workspace = true }
 weaver-nzb = { path = "../../../engines/weaver-nzb", default-features = false }
+weaver-server-auth = { path = "../weaver-server-auth" }
 weaver-server-base = { path = "../weaver-server-base" }
 weaver-server-db = { path = "../weaver-server-db" }
+weaver-server-migrations = { path = "../weaver-server-migrations" }
+weaver-server-composition = { path = "../weaver-server-composition" }
 weaver-server-pipeline = { path = "../weaver-server-pipeline" }
+weaver-server-orchestration = { path = "../weaver-server-orchestration" }
+weaver-server-settings = { path = "../weaver-server-settings" }
+weaver-server-torrents = { path = "../weaver-server-torrents" }
 weaver-torrent = { workspace = true }
 zstd = { workspace = true }
 
@@ -40,8 +62,10 @@ zstd = { workspace = true }
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
+axum = { workspace = true }
 sha1 = { workspace = true }
 criterion = "0.8"
+flate2 = { workspace = true }
 hex = { workspace = true }
 http = { workspace = true }
 sevenz-turbo = { workspace = true, features = ["compress"] }
@@ -50,6 +74,16 @@ toml = { workspace = true }
 weaver-model = { path = "../../../shared/crates/weaver-model", default-features = false }
 weaver-nntp = { path = "../../../engines/weaver-nntp", default-features = false, features = ["test-support"] }
 weaver-server-pipeline = { path = "../weaver-server-pipeline", features = ["test-support"] }
+weaver-server-orchestration = { path = "../weaver-server-orchestration", features = ["test-support"] }
+weaver-tunnel = { path = "../../../engines/weaver-tunnel", features = ["test-support"] }
+
+# The manifest-fetch-order tests drive the shared fetch against a local server
+# with signature verification stubbed. `test-seams` is a dev-dependency feature
+# on purpose: the shipped binary must never be able to skip verification.
+application-updater = { git = "https://github.com/scryer-media/application-updater", tag = "v0.1.1", features = ["test-seams"] }
+# `UpgradeManifestFetchOverrides::asset_base` is a `url::Url`; already in the
+# graph through reqwest, named here only so the test can build one.
+url = "2"
 
 [[bench]]
 name = "infrastructure_retry"

@@ -21,6 +21,7 @@ mod pipeline {
             mod deep;
             mod par3;
             mod plain_par2;
+            mod recovery_by_bytes;
             mod reposted;
             mod seek;
         }

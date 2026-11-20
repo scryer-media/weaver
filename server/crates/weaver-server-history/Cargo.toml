@@ -6,10 +6,20 @@ edition.workspace = true
 license-file.workspace = true
 repository.workspace = true
 
+[features]
+# Test-only reads for other crates' tests.
+test-support = []
+
 [dependencies]
+serde = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }
 unicode-normalization = { workspace = true }
 weaver-server-base = { path = "../weaver-server-base" }
 weaver-server-db = { path = "../weaver-server-db" }
 weaver-server-ingest = { path = "../weaver-server-ingest" }
+weaver-server-jobs = { path = "../weaver-server-jobs" }
+weaver-server-settings = { path = "../weaver-server-settings" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

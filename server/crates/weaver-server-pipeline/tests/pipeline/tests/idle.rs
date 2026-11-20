@@ -5,16 +5,14 @@
 
 use std::sync::atomic::Ordering;
 use weaver_server_base::events::model::PipelineEvent;
-use weaver_server_pipeline::{
-    JobId, JobStatus,
-    pipeline::tests::{
-        decode_fixture::refresh_snapshot,
-        idle_fixture::*,
-        insert_active_job, new_direct_pipeline,
-        queue_fixture::{apply_intents, handle as scheduler, metrics, report_all},
-        queue_scale_fixture::pipeline_live,
-        standalone_job_spec,
-    },
+use weaver_server_composition::{JobId, JobStatus};
+use weaver_server_pipeline::pipeline::tests::{
+    decode_fixture::refresh_snapshot,
+    idle_fixture::*,
+    insert_active_job, new_direct_pipeline,
+    queue_fixture::{apply_intents, handle as scheduler, metrics, report_all},
+    queue_scale_fixture::pipeline_live,
+    standalone_job_spec,
 };
 
 #[tokio::test(start_paused = true)]

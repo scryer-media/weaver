@@ -3,7 +3,9 @@
 
 use std::path::PathBuf;
 
+use weaver_server_composition::{JobId, JobStatus};
 use weaver_server_db::persistence::executor::blocking_call_probe;
+use weaver_server_pipeline::Pipeline;
 use weaver_server_pipeline::jobs::persistence::JobsPersistenceQueries;
 use weaver_server_pipeline::jobs::queries::JobsQueries;
 use weaver_server_pipeline::jobs::working_dir::{sanitize_dirname, stamp_working_dir};
@@ -19,7 +21,6 @@ use weaver_server_pipeline::pipeline::tests::{
     terminal_fixture::{any_move_in_flight, minimal_spec, settle_moves},
     window_fixture::{intermediate_dir as intermediate_dir_of, rows},
 };
-use weaver_server_pipeline::{JobId, JobStatus, Pipeline};
 
 // The moving row, naming the destination, commits before the first file
 // leaves the working directory: a restart at any point of the move finds the

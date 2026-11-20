@@ -120,7 +120,7 @@ fn scan_floors_enabled() -> bool {
 }
 
 // Walks every queue whole on this thread while `off` holds.
-#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+#[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
 pub(in crate::pipeline) fn set_scan_floors_off(off: bool) {
     SCAN_FLOORS_OFF.with(|cell| cell.set(off));
 }
@@ -159,7 +159,7 @@ pub struct SaturationWake {
 // its share of that job.
 #[derive(Debug, Clone, Copy)]
 pub struct LaneShare {
-    pub(in crate::pipeline) lane_id: u64,
+    pub lane_id: u64,
     // The pipeline depth the lane runs at.
     pub depth: usize,
 }
@@ -231,7 +231,7 @@ impl Pipeline {
     // [`Self::next_works`] for a lane whose holdings are known, so the
     // handout can be held to the lane's share of the job it comes from.
     // `None` hands out `want` regardless, as a caller with no lane does.
-    pub(in crate::pipeline) fn next_works_for_lane(
+    pub fn next_works_for_lane(
         &mut self,
         server_idx: usize,
         want: usize,
@@ -340,7 +340,7 @@ impl Pipeline {
     // then each spill candidate are drawn from: dispatch priority first,
     // queue order within a priority. Only a job holding a slot can download,
     // so the walk is over the slots, each found in the queue by its index.
-    pub(in crate::pipeline) fn download_scheduler_eligible_jobs(&self) -> Vec<JobId> {
+    pub fn download_scheduler_eligible_jobs(&self) -> Vec<JobId> {
         let candidates: Vec<(JobId, usize)> = self.shared_state.queue.read(|inner| {
             self.nzb_admitted
                 .iter()
@@ -388,7 +388,7 @@ impl Pipeline {
     // the same for the last lane to ask as for the first. Never less than
     // `depth + 1`: a full pipe, and the article that keeps it full while the
     // next ask is answered.
-    pub(in crate::pipeline) fn lane_share_of_job(&self, job_id: JobId, depth: usize) -> usize {
+    pub fn lane_share_of_job(&self, job_id: JobId, depth: usize) -> usize {
         let queued = self
             .jobs
             .get(&job_id)
@@ -629,7 +629,7 @@ impl Pipeline {
     // for this call, and names the clauses that refused it. The job's
     // completion-critical heap leads its ordinary one, which is what the
     // queue's own "first matching" scan already does.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(in crate::pipeline) fn take_servable_works_or_none(
         &mut self,
         job_id: JobId,

@@ -34,7 +34,7 @@ use crate::pipeline::graph::root::ArticleRoot;
 use crate::pipeline::graph::root::facts::RootFactsError;
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum RestoreFailure {
+pub enum RestoreFailure {
     #[error(transparent)]
     Tree(#[from] RestoreError),
     #[error(transparent)]
@@ -47,19 +47,19 @@ pub(crate) enum RestoreFailure {
     Step(#[from] GraphError),
 }
 
-pub(crate) struct Restored {
-    pub(crate) job: GraphJob,
+pub struct Restored {
+    pub job: GraphJob,
     // Articles this run does not fetch: read back, or lost for good.
     pub(crate) settled: Vec<(VolumeIndex, u32)>,
     // Articles the checkpoint had that were not on disk.
-    pub(crate) refetched: Vec<(VolumeIndex, u32)>,
+    pub refetched: Vec<(VolumeIndex, u32)>,
     // The decoded bytes of the articles in hand once those are taken out:
     // what the job had downloaded, counted as a run counts it.
     pub(crate) in_hand_bytes: u64,
 }
 
 impl GraphJob {
-    pub(crate) fn restore(
+    pub fn restore(
         snapshot: &Snapshot,
         files: &[RootFile],
         scope: u64,
@@ -127,17 +127,21 @@ impl GraphJob {
             runs,
             passwords: Passwords::from_candidates(storage.passwords),
             reported: snapshot.root.reported,
+            repair_reported: snapshot.root.repair_entered
+                || snapshot.root.reported
+                    == Some(crate::pipeline::graph::root::phase::RootPhase::Repairing),
+            repair_ended_at: None,
             pending: Pending::default(),
             mail_owed: None,
             stopped_repair: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             stopped_repairs_taken_back: 0,
             commit_held: None,
             notes: Vec::new(),
             fed: super::runs::Fed::default(),
             sealed_at: None,
             quieting: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             one_turn: false,
             moved: 0,
             indexes_kept: None,
@@ -154,7 +158,7 @@ impl GraphJob {
         let mut effects = Vec::new();
         job.tree
             .restored(&mut job.writer.placing(&mut *job.builder), &mut effects);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         job.tree.bound_kinds_recounted().unwrap();
         job.settle(effects)?;
         job.lift_hold_refusals()?;
@@ -173,7 +177,7 @@ impl GraphJob {
         // What the restore closed again landed before the restart, and was
         // said then.
         job.notes.clear();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         job.pending.restored(&job);
         Ok(Restored {
             settled: job.root.map.settled(),
@@ -207,7 +211,7 @@ impl GraphJob {
     // What an older build left when a member's holds ran past their
     // budgets: the object bound over the first root member that has one
     // refuses it for its holds, as that build's object said.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) fn refuse_for_holds(&mut self) -> Result<NodeId, GraphError> {
         let node = self
             .tree
@@ -321,7 +325,7 @@ impl GraphJob {
     // database will hold once the writes already queued for it run, or
     // heard of before the root saw them.
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-    pub(crate) fn in_memory(&self) -> Vec<(u32, u32)> {
+    pub fn in_memory(&self) -> Vec<(u32, u32)> {
         let named = self.pending.named();
         let mut out = Vec::new();
         self.arrived(|article, on_disk| {
@@ -342,7 +346,7 @@ impl GraphJob {
     // The articles the root has in hand whose bytes are on disk: what a
     // checkpoint taken now names.
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-    pub(crate) fn on_disk(&self) -> std::collections::BTreeSet<(u32, u32)> {
+    pub fn on_disk(&self) -> std::collections::BTreeSet<(u32, u32)> {
         let mut out = std::collections::BTreeSet::new();
         self.arrived(|article, on_disk| {
             if on_disk {

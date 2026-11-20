@@ -3,6 +3,8 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
+use weaver_server_composition::{JobId, JobStatus, NzbFileId, RestoreJobRequest, SegmentId};
+use weaver_server_pipeline::Pipeline;
 use weaver_server_pipeline::pipeline::tests::{
     activate_job,
     engines::harness::collect,
@@ -17,7 +19,6 @@ use weaver_server_pipeline::pipeline::tests::{
     uu_fixture::{backlog, set_park_limit},
     yenc_fixture::*,
 };
-use weaver_server_pipeline::{JobId, JobStatus, NzbFileId, Pipeline, RestoreJobRequest, SegmentId};
 
 // Build a yEnc article out of bytes that need no escaping.
 fn plain_article(headers: &[&str], body: &[u8], trailer: Option<&str>) -> Vec<u8> {

@@ -11,10 +11,7 @@ impl Pipeline {
     // honour is never offered, so one arriving here means the machine shrank
     // since it was offered; the recommendation stands in, as it does at
     // startup.
-    pub(in crate::pipeline) fn set_configured_hardware_profile(
-        &mut self,
-        profile: HardwareProfile,
-    ) {
+    pub fn set_configured_hardware_profile(&mut self, profile: HardwareProfile) {
         let probe = self.tuner.system_profile();
         self.configured_hardware_profile = match profile.unmet_requirement(probe) {
             None => profile,

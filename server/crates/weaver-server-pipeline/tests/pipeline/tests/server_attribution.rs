@@ -3,6 +3,7 @@
 
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
+use weaver_server_composition::{JobId, JobStatus, RestoreJobRequest};
 use weaver_server_pipeline::history::queries::HistoryQueries;
 use weaver_server_pipeline::jobs::queries::JobsQueries;
 use weaver_server_pipeline::jobs::repository::JobsRepositoryQueries;
@@ -12,7 +13,6 @@ use weaver_server_pipeline::pipeline::tests::{
     history_row_with_output_dir, insert_active_job_with_persisted_nzb, new_direct_pipeline,
     rar_job_spec, retire_pipeline_database, sample_nzb_zstd,
 };
-use weaver_server_pipeline::{JobId, JobStatus, RestoreJobRequest};
 
 #[tokio::test]
 async fn attribution_checkpoint_survives_repeated_active_job_restores() {

@@ -18,15 +18,15 @@ mod ownership;
 mod pressure;
 mod refill;
 mod spawn;
-pub(in crate::pipeline) mod volume_pace;
+pub mod volume_pace;
 
-#[cfg(test)]
-pub(in crate::pipeline::download) use leases::queued_files_may_pass;
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+pub use leases::queued_files_may_pass;
 pub(in crate::pipeline::download) use leases::{
     BlockedBy, ScanMemo, ServableWork, ServableWorkFilter,
 };
 pub(in crate::pipeline) use refill::HeldDownloadRefill;
-#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+#[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
 pub(in crate::pipeline) use spawn::lane_acquire_failure_for_work;
 
 enum DispatchAttempt {
@@ -75,7 +75,7 @@ const PASS_RANKING_CONTENTION_PAUSE: Duration = Duration::from_micros(50);
 // Nothing is asked to tidy up after a job that leaves, so the map bounds
 // itself: expired windows go first, and if every window is still live the
 // whole map goes. Losing a window costs one extra log line, nothing more.
-const JOB_LOG_THROTTLE_MAX_JOBS: usize = 256;
+pub const JOB_LOG_THROTTLE_MAX_JOBS: usize = 256;
 
 // One log-rate window per job.
 //
@@ -86,8 +86,8 @@ const JOB_LOG_THROTTLE_MAX_JOBS: usize = 256;
 // closed window swallowed is counted and reported by the next line that gets
 // through it.
 #[derive(Debug)]
-pub(crate) struct KeyedLogThrottle<K> {
-    windows: HashMap<K, JobLogWindow>,
+pub struct KeyedLogThrottle<K> {
+    pub windows: HashMap<K, JobLogWindow>,
 }
 
 impl<K> Default for KeyedLogThrottle<K> {
@@ -99,10 +99,10 @@ impl<K> Default for KeyedLogThrottle<K> {
 }
 
 // The per-job window every job-scoped throttle uses.
-pub(crate) type JobLogThrottle = KeyedLogThrottle<JobId>;
+pub type JobLogThrottle = KeyedLogThrottle<JobId>;
 
 #[derive(Debug, Clone, Copy)]
-struct JobLogWindow {
+pub struct JobLogWindow {
     emitted_at: Instant,
     suppressed: u64,
 }
@@ -114,7 +114,7 @@ impl<K: std::hash::Hash + Eq + Copy> KeyedLogThrottle<K> {
         self.admit_at(job_id, interval, Instant::now())
     }
 
-    pub(crate) fn admit_at(&mut self, job_id: K, interval: Duration, now: Instant) -> Option<u64> {
+    pub fn admit_at(&mut self, job_id: K, interval: Duration, now: Instant) -> Option<u64> {
         match self.windows.get_mut(&job_id) {
             Some(window) if now.duration_since(window.emitted_at) < interval => {
                 window.suppressed = window.suppressed.saturating_add(1);
@@ -156,7 +156,7 @@ impl<K: std::hash::Hash + Eq + Copy> KeyedLogThrottle<K> {
         self.windows.retain(|key, _| keep(key));
     }
 
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) fn last_emitted_at(&self, job_id: K) -> Option<Instant> {
         self.windows.get(&job_id).map(|window| window.emitted_at)
     }
@@ -219,7 +219,7 @@ pub(crate) struct DispatchStallWatch {
 pub(in crate::pipeline) const DOWNLOAD_RETRY_STORM_THRESHOLD: u64 = 1_000;
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct DownloadPressure {
+pub struct DownloadPressure {
     pub(in crate::pipeline) state: DownloadPressureState,
     reason: DownloadPressureReason,
     decode_backlog_bytes: u64,
@@ -586,7 +586,7 @@ impl Pipeline {
     // How many warms each server in `order` may take, at most `limit` in
     // all: its seats at pass start, less what the pass has handed out there,
     // less the idle connections holding seats now.
-    fn unclaimed_warm_seats(
+    pub fn unclaimed_warm_seats(
         order: &[usize],
         headroom_at_pass_start: &HashMap<usize, usize>,
         sent_this_pass: &HashMap<usize, usize>,
@@ -1034,102 +1034,5 @@ impl Pipeline {
         self.log_download_retry_storm(now);
         self.log_download_lanes_under_cap(now, max);
         self.update_queue_metrics();
-    }
-}
-
-#[cfg(test)]
-mod warm_seat_tests {
-    use super::*;
-
-    // A pass that hands a lease to a server's last seat leaves that server
-    // nothing to warm; the warm goes to the next server with a free seat.
-    #[test]
-    fn a_lease_on_the_last_seat_leaves_no_warm_for_that_server() {
-        let order = [0, 1];
-        let headroom = HashMap::from([(0, 1), (1, 2)]);
-        let sent = HashMap::from([(0, 1)]);
-        let idle = HashMap::new();
-
-        let seats = Pipeline::unclaimed_warm_seats(&order, &headroom, &sent, &idle, 8);
-
-        assert_eq!(seats, vec![(1, 2)], "no warm is sent to server 0");
-    }
-
-    // A lease served by an idle connection used the seat that connection
-    // held, so the server's permits are still free to warm.
-    #[test]
-    fn idle_connections_hold_their_seats_until_a_lease_takes_them() {
-        let order = [0];
-        let headroom = HashMap::from([(0, 3)]);
-        let idle = HashMap::from([(0, 1)]);
-
-        assert_eq!(
-            Pipeline::unclaimed_warm_seats(&order, &headroom, &HashMap::new(), &idle, 8),
-            vec![(0, 2)]
-        );
-        assert_eq!(
-            Pipeline::unclaimed_warm_seats(&order, &headroom, &HashMap::new(), &idle, 1),
-            vec![(0, 1)],
-            "never more than the job's share"
-        );
-    }
-}
-
-#[cfg(test)]
-mod job_log_throttle_tests {
-    use super::*;
-
-    const WINDOW: Duration = Duration::from_secs(60);
-
-    // A job failing in a loop must not spend another job's first line, and
-    // what its own window swallowed must be readable from the next line.
-    #[test]
-    fn a_noisy_job_does_not_throttle_a_quiet_one() {
-        let mut throttle = JobLogThrottle::default();
-        let noisy = JobId(9001);
-        let quiet = JobId(9002);
-        let start = Instant::now();
-
-        assert_eq!(
-            throttle.admit_at(noisy, WINDOW, start),
-            Some(0),
-            "the first emission of a window always gets through"
-        );
-        for _ in 0..500 {
-            assert_eq!(
-                throttle.admit_at(noisy, WINDOW, start),
-                None,
-                "repeats inside the window are counted, not emitted"
-            );
-        }
-
-        assert_eq!(
-            throttle.admit_at(quiet, WINDOW, start),
-            Some(0),
-            "another job's first emission is its own window, not the noisy job's"
-        );
-
-        assert_eq!(
-            throttle.admit_at(noisy, WINDOW, start + WINDOW),
-            Some(500),
-            "the next line that gets through reports what the window swallowed"
-        );
-        assert_eq!(
-            throttle.admit_at(noisy, WINDOW, start + WINDOW * 2),
-            Some(0),
-            "and the count starts again from the line that reported it"
-        );
-    }
-
-    // The map is bounded, so a long-lived worker cannot accumulate a window
-    // for every job it has ever seen.
-    #[test]
-    fn the_throttle_bounds_the_jobs_it_remembers() {
-        let mut throttle = JobLogThrottle::default();
-        let start = Instant::now();
-        for job in 0..(JOB_LOG_THROTTLE_MAX_JOBS as u64 * 2) {
-            throttle.admit_at(JobId(job), WINDOW, start);
-        }
-        assert!(throttle.windows.len() <= JOB_LOG_THROTTLE_MAX_JOBS);
     }
 }

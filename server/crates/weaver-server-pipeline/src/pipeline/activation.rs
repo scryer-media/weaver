@@ -49,12 +49,14 @@ impl MoveGate {
         }
     }
 
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) fn open(&self) {
         self.state.lock().unwrap().1 = true;
         self.moved.notify_all();
     }
 
     // Until a move has reached it.
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) async fn reached(self: &Arc<Self>) {
         let gate = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
@@ -167,7 +169,7 @@ pub(crate) struct ReadArticles {
     made_staging: Option<PathBuf>,
 }
 
-#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+#[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
 impl ReadArticles {
     // Whether the job was built again from its checkpoint.
     pub(crate) fn restored(&self) -> bool {
@@ -543,7 +545,7 @@ impl Pipeline {
     // with the id. An id being admitted, or held by a history operation,
     // may have taken the directory as its own, so it stays, and that job's
     // own cleanup takes any directory that carries its marker.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) fn take_moved_dir(&mut self, job_id: JobId, started_in: &Path, dir: &Path) -> bool {
         self.take_or_hold_moved_dir(job_id, started_in, dir, false)
     }
@@ -1035,7 +1037,7 @@ impl Pipeline {
     // file's last bytes, a move to its name, a removal of what no longer
     // belongs and the release of its handles, before its working directory
     // is released.
-    pub(in crate::pipeline) fn retire_graph_job(&mut self, job_id: JobId) {
+    pub fn retire_graph_job(&mut self, job_id: JobId) {
         if let Some(graph) = self.stop_graph_job(job_id) {
             // Gone with what its runs reserved: the memory goes to whoever
             // waits for it.
@@ -1078,7 +1080,7 @@ impl Pipeline {
         if let Some(disk) = graph.disk().filter(|disk| !disk.quiet()) {
             disk.barrier().then_tell(job_id, &self.graph_runs.written());
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         before_kept::run();
         if graph.holds_retirement() {
             self.retiring_graph_jobs.insert(job_id, graph);
@@ -1091,15 +1093,15 @@ impl Pipeline {
 
 // What a test runs as a graph stops, just before whether it holds anything
 // is looked at, on the thread that stops it: once, then it is gone.
-#[cfg(test)]
-pub(crate) mod before_kept {
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+pub mod before_kept {
     use std::cell::RefCell;
 
     thread_local! {
         static RUN: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
     }
 
-    pub(crate) fn set(run: impl FnOnce() + 'static) {
+    pub fn set(run: impl FnOnce() + 'static) {
         RUN.with(|slot| *slot.borrow_mut() = Some(Box::new(run)));
     }
 
@@ -1235,6 +1237,7 @@ pub(crate) mod move_seams {
     }
 
     impl Gate {
+        #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
         pub(crate) fn open(&self) {
             *self.open.lock().unwrap() = true;
             self.opened.notify_all();
@@ -1285,12 +1288,14 @@ pub(crate) mod move_seams {
 
     static ARMED: Mutex<Option<(PathBuf, Arc<Seams>)>> = Mutex::new(None);
 
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) fn arm(root: &Path, seams: Seams) -> Arc<Seams> {
         let seams = Arc::new(seams);
         *ARMED.lock().unwrap() = Some((root.to_path_buf(), Arc::clone(&seams)));
         seams
     }
 
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) fn disarm() {
         *ARMED.lock().unwrap() = None;
     }

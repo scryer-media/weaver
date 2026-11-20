@@ -29,6 +29,8 @@ pub(super) use weaver_server_pipeline::pipeline::tests::engines::restart_fixture
     Down, assert_restarted, restart_row, run_restarting, run_restarting_at,
 };
 
+use weaver_server_composition::{JobId, RestoreJobRequest};
+use weaver_server_pipeline::Pipeline;
 use weaver_server_pipeline::jobs::{
     handle::CancellationOrigin, model::JobArticles, queries::JobsQueries,
     working_dir::WORKING_DIR_MARKER,
@@ -51,7 +53,6 @@ use weaver_server_pipeline::pipeline::tests::{
     retire_pipeline_database,
     window_fixture::{ActivationReply, admitted, has_installed, request_activation},
 };
-use weaver_server_pipeline::{JobId, Pipeline, RestoreJobRequest};
 
 #[tokio::test]
 async fn a_plain_file_under_par2_restarted_after_every_article_is_repaired_with_no_refetch() {
@@ -899,15 +900,20 @@ async fn a_repaired_job_restarted_after_its_repair_announces_the_repair_once() {
 }
 
 // The pipeline goes down while the repair is out on its thread. The drain
-// hears it back, so the checkpoint holds the repair: the restored job applies
-// it once, lends no second one, and finishes.
+// stops the repair and hears it back stopped, so nothing it came to is
+// applied and its set is due again: the restored job lends the repair again,
+// applies it once, announces one `RepairComplete`, and finishes whole.
 #[tokio::test]
-async fn a_job_restarted_while_its_repair_is_out_applies_the_repair_once_with_no_second_loan() {
+async fn a_job_restarted_while_its_repair_is_out_lends_the_stopped_repair_again_and_applies_it_once()
+ {
     let body = payload(9 * ARTICLE + 21, 71);
     let posts = with_par2(vec![Post::plain("ember.bin", body.clone())], 2);
     let (restarted, lent_again) =
         run_restarted_while_repairing(&Scenario::new(posts).damaged(0, 3)).await;
-    assert!(!lent_again, "the restored job lent the repair again");
+    assert!(
+        lent_again,
+        "the restored job did not lend the stopped repair again"
+    );
     assert_eq!(restarted.status, Some(JobStatus::Complete));
     assert!(restarted.files["lantern beacon/ember.bin"] == body);
     assert_eq!(
@@ -2394,7 +2400,7 @@ async fn cancelling_a_job_blocked_on_its_checkpoint_clears_the_block() {
 // restore cannot say what of it is done.
 #[tokio::test]
 async fn a_job_blocked_on_its_checkpoint_resumes_into_the_status_its_lanes_name() {
-    use weaver_server_pipeline::{DownloadState, PostState};
+    use weaver_server_composition::{DownloadState, PostState};
     for (status, download_state, post_state, resume, persisted) in [
         (
             JobStatus::Extracting,

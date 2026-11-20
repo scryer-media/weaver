@@ -52,7 +52,7 @@ impl Pipeline {
     // (see `refill_deadline` beside the ring), so one more than that keeps
     // the cadence at one refill per ring turn without pre-leasing articles
     // that other lanes of the same job could be fetching now.
-    pub(in crate::pipeline) fn download_refill_want(&self, lane_mode: DownloadLaneMode) -> usize {
+    pub fn download_refill_want(&self, lane_mode: DownloadLaneMode) -> usize {
         // A limited link activates its reservations after the lease is
         // finalized; single-article leases let every refill see the updated
         // token balance instead of pre-leasing past it.
@@ -65,7 +65,7 @@ impl Pipeline {
     // The depth the lanes on `server_idx` run at, whichever lane asks: on a
     // pin's trial, the depth of the lanes that are not running it.
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-    pub(in crate::pipeline) fn download_lane_mode_for_server(
+    pub fn download_lane_mode_for_server(
         &self,
         server_idx: usize,
         pressure: DownloadPressure,
@@ -114,7 +114,7 @@ impl Pipeline {
     // `server_idx` — the one a spill must go back to rather than fan out
     // from. When more than one such job is in flight (the hot job changed
     // underneath them), the earliest in dispatch order is the one named.
-    pub(in crate::pipeline) fn spill_job_in_flight_on(&self, server_idx: usize) -> Option<JobId> {
+    pub fn spill_job_in_flight_on(&self, server_idx: usize) -> Option<JobId> {
         let hot = self.current_hot_job();
         let mut owners: Vec<JobId> = self
             .download_lane_owners
@@ -322,11 +322,7 @@ impl Pipeline {
             })
     }
 
-    pub(in crate::pipeline) fn download_lane_holdings_of_job(
-        &self,
-        lane_id: u64,
-        job_id: JobId,
-    ) -> usize {
+    pub fn download_lane_holdings_of_job(&self, lane_id: u64, job_id: JobId) -> usize {
         self.download_lane_owners.get(&lane_id).map_or(0, |owner| {
             owner
                 .outstanding
@@ -515,7 +511,7 @@ impl Pipeline {
     // Turn a scheduler handout into a lease for `lane_id`: reserve each
     // article's bandwidth and durable lead, and return whatever could not be
     // reserved to its queue. `None` when nothing survived.
-    pub(in crate::pipeline) fn lease_for_handout(
+    pub fn lease_for_handout(
         &mut self,
         lane_id: u64,
         server_idx: usize,
@@ -633,7 +629,7 @@ impl Pipeline {
 
     // Move every held refill's clock back by the idle window, as if each
     // had waited that much longer.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(in crate::pipeline) fn age_held_download_refills_past_idle_window_for_test(&mut self) {
         let by = DOWNLOAD_REFILL_IDLE_HOLD;
         for held in &mut self.held_download_refills {
@@ -645,7 +641,7 @@ impl Pipeline {
     }
 
     // Whether a held refill waits for its volume's room.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(in crate::pipeline) fn room_held_download_refills_for_test(&self) -> usize {
         self.held_download_refills
             .iter()
@@ -657,10 +653,7 @@ impl Pipeline {
     // scheduler handout, reserved and pinned to that server. `None` when the
     // scheduler had nothing for the server or nothing survived reservation.
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-    pub(in crate::pipeline) fn lease_for_server_for_test(
-        &mut self,
-        server_idx: usize,
-    ) -> Option<DownloadBatchLease> {
+    pub fn lease_for_server_for_test(&mut self, server_idx: usize) -> Option<DownloadBatchLease> {
         let pressure = self.refresh_download_pressure();
         let lane_mode = self.download_lane_mode_for_server(server_idx, pressure, true);
         let want = self.download_refill_want(lane_mode);

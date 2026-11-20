@@ -25,20 +25,25 @@ use super::phase::RootPhase;
 use crate::pipeline::graph::job::RootFile;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct RootFacts {
-    pub(crate) next_node: u32,
+pub struct RootFacts {
+    pub next_node: u32,
     // Each file's name as the post lists it, in post order.
-    pub(crate) posted: Vec<String>,
-    pub(crate) volumes: Vec<VolumeFacts>,
+    pub posted: Vec<String>,
+    pub volumes: Vec<VolumeFacts>,
     // How many member reads the job's repairs made. The writer's count,
     // kept here because the root row is the job's one row.
-    pub(crate) read_backs: u64,
+    pub read_backs: u64,
     // The phase the job last reported, so a restored job reports only a
     // change from it. A checkpoint written before this was kept has none.
     #[serde(default)]
-    pub(crate) reported: Option<RootPhase>,
+    pub reported: Option<RootPhase>,
     // Namespace members whose whole-file verification has not been acknowledged.
-    pub(crate) pending_verifications: Vec<(u32, u32)>,
+    pub pending_verifications: Vec<(u32, u32)>,
+    // Whether the job ever reported Repairing, so a job restored past its
+    // repair still ends saying the repair failed. A checkpoint written before
+    // this was kept says it did not.
+    #[serde(default)]
+    pub repair_entered: bool,
 }
 
 impl RootFacts {
@@ -51,22 +56,22 @@ impl RootFacts {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct VolumeFacts {
+pub struct VolumeFacts {
     // In ordinal order, one per article of the post's file.
-    pub(crate) articles: Vec<(u32, ArticleFacts)>,
+    pub articles: Vec<(u32, ArticleFacts)>,
     // Boundary index and the decoded offset it is known to be at.
-    pub(crate) known: Vec<(u64, u64)>,
-    pub(crate) ordered_only: bool,
+    pub known: Vec<(u64, u64)>,
+    pub ordered_only: bool,
     // start, end, crc32, verified.
-    pub(crate) segments: Vec<(u64, u64, u32, bool)>,
+    pub segments: Vec<(u64, u64, u32, bool)>,
     // Waiting articles raised above the ordinary class, by ordinal: a
     // repair's ask for recovery blocks is made once, so the restored queue
     // must hold it again.
-    pub(crate) raised: Vec<(u32, ClassFacts)>,
+    pub raised: Vec<(u32, ClassFacts)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum ClassFacts {
+pub enum ClassFacts {
     Critical,
     Recovery,
     FirstArticle,
@@ -74,7 +79,7 @@ pub(crate) enum ClassFacts {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum ArticleFacts {
+pub enum ArticleFacts {
     Waiting,
     // Its decoded range, `None` when an earlier run fetched it unseen.
     Arrived(Option<(u64, u64)>),
@@ -82,7 +87,7 @@ pub(crate) enum ArticleFacts {
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum RootFactsError {
+pub enum RootFactsError {
     #[error("the root's facts are version {0}, which this build does not read")]
     Version(u16),
     #[error("the root's facts do not decode: {0}")]
@@ -95,7 +100,7 @@ impl ArticleRoot {
     // The root at the state its facts describe, over the post's articles.
     // The post must be the one they were taken from: its files by name, as
     // the map checks them by their articles.
-    pub(crate) fn restore(files: &[RootFile], facts: &RootFacts) -> Result<Self, RootFactsError> {
+    pub fn restore(files: &[RootFile], facts: &RootFacts) -> Result<Self, RootFactsError> {
         let mut root = Self::new(files);
         if root.posted != facts.posted {
             return Err(RootFactsError::Mismatch("another file name"));
@@ -124,13 +129,16 @@ pub(crate) enum Chunk {
 // The facts as they are encoded: kept from one checkpoint to the next, so a
 // part whose entries did not change keeps its bytes and is not encoded again.
 #[derive(Default, Serialize, Deserialize)]
-pub(crate) struct Encoded {
+pub struct Encoded {
     next_node: u32,
     posted: Sealed<Vec<String>>,
     volumes: Vec<EncodedVolume>,
     read_backs: u64,
     reported: Option<RootPhase>,
     pending_verifications: Vec<(u32, u32)>,
+    // Written only when set, so a job that never repaired encodes as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    repair_entered: bool,
     // The generation of each of its sealed values when its parts were last
     // taken, by number in the walk.
     #[serde(skip)]
@@ -155,7 +163,7 @@ struct EncodedVolume {
     read: Option<(u64, u64)>,
 }
 
-pub(crate) fn of_ordinal(ordinal: u32) -> u32 {
+pub fn of_ordinal(ordinal: u32) -> u32 {
     ordinal / CHUNK
 }
 
@@ -239,19 +247,25 @@ impl Encoded {
             read_backs: self.read_backs,
             reported: self.reported,
             pending_verifications: self.pending_verifications.clone(),
+            repair_entered: self.repair_entered,
         }
+    }
+
+    // Whether the job ever reported Repairing, for the next encoding.
+    pub(crate) fn note_repair_entered(&mut self, entered: bool) {
+        self.repair_entered = entered;
     }
 }
 
 // One encoding of the root's facts: the root row's version and bytes, and
 // its parts.
-pub(crate) struct Encoding {
-    pub(crate) version: u16,
-    pub(crate) bytes: Vec<u8>,
-    pub(crate) parts: Parts,
+pub struct Encoding {
+    pub version: u16,
+    pub bytes: Vec<u8>,
+    pub parts: Parts,
 }
 
-pub(crate) enum Parts {
+pub enum Parts {
     // Every part the facts have.
     All(Vec<Part>),
     // The parts changed since the encoding before.
@@ -275,7 +289,7 @@ impl ArticleRoot {
     // chunks marked since `encoded` last read it, and all of it the first
     // time. Facts that do not encode say so as unsupported, as `encode`
     // does, and the next encoding reads the root whole again.
-    pub(crate) fn encode(
+    pub fn encode(
         &self,
         encoded: &mut Encoded,
         next_node: u32,
@@ -405,11 +419,7 @@ impl ArticleRoot {
     }
 }
 
-pub(crate) fn decode(
-    version: u16,
-    bytes: &[u8],
-    parts: &[Part],
-) -> Result<RootFacts, RootFactsError> {
+pub fn decode(version: u16, bytes: &[u8], parts: &[Part]) -> Result<RootFacts, RootFactsError> {
     if version != RootFacts::VERSION {
         return Err(RootFactsError::Version(version));
     }

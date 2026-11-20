@@ -105,6 +105,7 @@ pub mod send_back_fixtures;
 pub mod sevenz_fixtures;
 pub mod sfv;
 pub mod spent_fixtures;
+pub mod stall_fixtures;
 pub mod stream_fixtures;
 pub mod wire_recovery;
 pub mod zip;

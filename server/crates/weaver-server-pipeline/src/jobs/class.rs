@@ -68,6 +68,7 @@ impl<T> std::ops::IndexMut<Protocol> for ByProtocol<T> {
 pub const PIPELINE: Protocol = Protocol::Nzb;
 
 pub use weaver_server_net::bandwidth::limits::ClassRates;
+pub use weaver_server_net::proxies::give_back::{Owed, TunnelGiveBack};
 
 /// A class's side of the global limits.
 pub trait ClassRate: Send + Sync {
@@ -230,92 +231,6 @@ pub trait JobClass: Send + Sync {
         let _ = ask;
     }
 }
-
-/// A WireGuard tunnel's wake for a class to give back its sockets there.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TunnelGiveBack {
-    /// The tunnel: its egress and the hops up to and including it, as a
-    /// socket's `DialPath` names them.
-    pub egress: u32,
-    pub hops: Vec<u32>,
-    /// The torrent sessions whose legs run over the tunnel.
-    pub torrent_routes: Vec<crate::torrents::sessions::RouteKey>,
-    /// What the class owes the tunnel, read when it acts.
-    pub owed: Owed,
-}
-
-impl TunnelGiveBack {
-    /// Whether a socket dialled over `path` sits in the tunnel itself: on
-    /// its egress, with the tunnel its last hop.
-    pub fn holds(&self, path: &weaver_tunnel::pipe::DialPath) -> bool {
-        self.rides(path.egress, &path.proxies)
-    }
-
-    /// Whether a socket on `egress` through `proxies` sits in the tunnel.
-    pub fn rides(&self, egress: u32, proxies: &[u32]) -> bool {
-        egress == self.egress && proxies == self.hops
-    }
-}
-
-/// What a class owes a tunnel: the bytes it holds there past what it is
-/// given while another class presses, read at the moment it is acted on.
-/// A level, never an amount handed over once: an answer, or a connection
-/// marked to close for one, reads it again when it acts.
-#[derive(Clone)]
-pub struct Owed {
-    owed: Arc<dyn Fn() -> u64 + Send + Sync>,
-    dry: Arc<dyn Fn() + Send + Sync>,
-}
-
-impl Owed {
-    /// `owed` reads the level; `dry` tells the tunnel an answer found
-    /// nothing it could give.
-    pub fn new(
-        owed: impl Fn() -> u64 + Send + Sync + 'static,
-        dry: impl Fn() + Send + Sync + 'static,
-    ) -> Self {
-        Self {
-            owed: Arc::new(owed),
-            dry: Arc::new(dry),
-        }
-    }
-
-    /// The bytes owed now.
-    pub fn bytes(&self) -> u64 {
-        (self.owed)()
-    }
-
-    /// Whether anything is owed now.
-    pub fn stands(&self) -> bool {
-        self.bytes() > 0
-    }
-
-    /// The answer found nothing it could give: the class is not woken again
-    /// until its own holdings on the tunnel change.
-    pub fn dry(&self) {
-        (self.dry)()
-    }
-
-    /// Whether anything is owed, as a connection marked to close reads it.
-    pub fn standing(&self) -> Arc<dyn Fn() -> bool + Send + Sync> {
-        let owed = Arc::clone(&self.owed);
-        Arc::new(move || owed() > 0)
-    }
-}
-
-impl std::fmt::Debug for Owed {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Owed")
-    }
-}
-
-impl PartialEq for Owed {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.owed, &other.owed)
-    }
-}
-
-impl Eq for Owed {}
 
 /// Where an intake hands a payload.
 pub enum Route<'a> {
@@ -523,160 +438,16 @@ impl OwnedRows {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::bandwidth::ScheduleAction;
-    use crate::jobs::handle::{HoldOwner, HoldScope};
-    use crate::jobs::model::HeldClass;
-
-    // With no class seated, every payload a class owns is refused as not
-    // running, in the class's words, and may be taken later; what no class
-    // owns goes on the pipeline's path. Every intake (RSS, the watch
-    // folder, GraphQL's submit and staging) asks this one question.
-    #[test]
-    fn every_class_payload_is_refused_as_not_running_while_no_class_is_seated() {
-        let classes = JobClasses::default();
-        let magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567".to_owned();
-        for kind in [Kind::Metainfo, Kind::Magnet(magnet)] {
-            let refusal = match classes.route(&kind) {
-                Err(refusal) => refusal,
-                Ok(_) => panic!("{kind:?} was not refused"),
-            };
-            assert_eq!(refusal.reason, RefusalReason::NotRunning);
-            assert_eq!(refusal.text, "the torrent client is not running");
-            assert!(refusal.transient());
-        }
-        let url = Kind::Url(reqwest::Url::parse("https://example.invalid/a.nzb").unwrap());
-        for kind in [Kind::Nzb, url] {
-            assert!(
-                matches!(classes.route(&kind), Ok(Route::Pipeline)),
-                "{kind:?}"
-            );
-        }
+// The tunnels' give-backs reach the classes through this: the network
+// runtime sits below the job classes and names none of them.
+impl weaver_server_net::proxies::give_back::GiveBackClasses for JobClasses {
+    fn seated(&self, side: usize) -> bool {
+        self.get(Protocol::ALL[side]).is_some()
     }
 
-    // A class seated with no intake refuses an add in its own words, for
-    // good: it is running, so "not running" would not be true.
-    #[test]
-    fn a_seated_class_with_no_intake_refuses_as_taking_no_jobs() {
-        struct Quiet;
-        #[async_trait::async_trait]
-        impl JobClass for Quiet {
-            fn protocol(&self) -> Protocol {
-                Protocol::Torrent
-            }
-            async fn act(
-                &self,
-                actions: Vec<(JobId, QueueAction)>,
-            ) -> BTreeMap<JobId, Result<(), SchedulerError>> {
-                actions
-                    .into_iter()
-                    .map(|(job_id, _)| (job_id, Ok(())))
-                    .collect()
-            }
-        }
-        let classes = JobClasses::default();
-        classes.seat(Arc::new(Quiet));
-        let refusal = match classes.route(&Kind::Metainfo) {
-            Err(refusal) => refusal,
-            Ok(_) => panic!("a class with no intake took an add"),
-        };
-        assert_eq!(refusal, AddRefusal::no_intake(Protocol::Torrent));
-        assert_eq!(
-            refusal.text,
-            "the torrent client takes no new jobs from here"
-        );
-        assert!(!refusal.transient());
-        assert!(matches!(classes.route(&Kind::Nzb), Ok(Route::Pipeline)));
-    }
-
-    // The words and keys each class owns, as they are shown and stored.
-    #[test]
-    fn each_class_owns_its_words_and_keys() {
-        let nzb = Protocol::Nzb.names();
-        assert_eq!(
-            (nzb.key, nzb.runner, nzb.disabled_code),
-            ("nzb", "download pipeline", "NZB_DISABLED")
-        );
-        assert!(nzb.hold.is_none());
-        assert!(nzb.live.is_none());
-        assert_eq!(HeldClass::of(Protocol::Nzb), None);
-
-        let torrent = Protocol::Torrent.names();
-        assert_eq!(
-            (torrent.key, torrent.runner, torrent.disabled_code),
-            ("torrent", "torrent client", "TORRENTS_DISABLED")
-        );
-        let hold = torrent.hold.expect("torrents hold apart");
-        assert_eq!(hold.scope, HoldScope::Everything);
-        assert_eq!(hold.setting, "torrent_paused");
-        assert!(torrent.live.is_some());
-        assert_eq!(
-            HeldClass::of(Protocol::Torrent),
-            Some(crate::torrents::CLASS)
-        );
-        assert_eq!(
-            HeldClass::all().collect::<Vec<_>>(),
-            vec![crate::torrents::CLASS]
-        );
-        assert_eq!(
-            AddRefusal::not_running(Protocol::Torrent).text,
-            "the torrent client is not running"
-        );
-        assert_eq!(
-            HoldOwner::kept()
-                .map(|(_, setting)| setting)
-                .collect::<Vec<_>>(),
-            vec!["global_paused", "torrent_paused"]
-        );
-
-        for (action, stored) in [
-            (
-                ScheduleAction::PauseClass {
-                    class: crate::torrents::CLASS,
-                },
-                r#"{"type":"pause_class","class":"torrent"}"#,
-            ),
-            (
-                ScheduleAction::ResumeClass {
-                    class: crate::torrents::CLASS,
-                },
-                r#"{"type":"resume_class","class":"torrent"}"#,
-            ),
-        ] {
-            assert_eq!(serde_json::to_string(&action).unwrap(), stored);
-            assert_eq!(
-                serde_json::from_str::<ScheduleAction>(stored).unwrap(),
-                action
-            );
-        }
-        // A pause of a class with no hold, or of no class, is never read in.
-        for stored in [
-            r#"{"type":"pause_class","class":"nzb"}"#,
-            r#"{"type":"resume_class","class":"nzb"}"#,
-            r#"{"type":"pause_class","class":"http"}"#,
-        ] {
-            assert!(
-                serde_json::from_str::<ScheduleAction>(stored).is_err(),
-                "{stored}"
-            );
-        }
-    }
-
-    // Every protocol's entry is at its index, and the index is its place in
-    // `ALL`, so a per-protocol table reads the right row.
-    #[test]
-    fn every_protocol_is_indexed_at_its_place_in_the_table() {
-        for (at, protocol) in Protocol::ALL.iter().enumerate() {
-            assert_eq!(protocol.index(), at);
-        }
-        let mut keys = ByProtocol::<&str>::default();
-        for protocol in Protocol::ALL {
-            keys[*protocol] = protocol.as_str();
-        }
-        for (protocol, key) in keys.iter() {
-            assert_eq!(*key, protocol.as_str());
+    fn give_back(&self, side: usize, ask: TunnelGiveBack) {
+        if let Some(class) = self.get(Protocol::ALL[side]) {
+            class.give_back(ask);
         }
     }
 }

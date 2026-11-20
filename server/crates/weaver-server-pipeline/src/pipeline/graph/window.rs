@@ -40,7 +40,7 @@ impl crate::pipeline::Pipeline {
 
 // One job's decode windows: its scratch, and what each node's run asked of
 // it under the start it was last handed a lender for.
-pub(crate) struct Windows {
+pub struct Windows {
     scratch: Arc<Scratch>,
     // The starts its lenders were handed for, counted.
     starts: AtomicU64,
@@ -50,7 +50,7 @@ pub(crate) struct Windows {
 // One start of a run that was handed a lender: the lender knows it by this,
 // so a run stopped before it, still asking, is not heard as the new one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Start(u64);
+pub struct Start(u64);
 
 // What a run asked of its lender under one start.
 struct Asked {
@@ -69,7 +69,7 @@ impl std::fmt::Debug for Windows {
 
 impl Windows {
     // The windows of the job whose scratch is `scratch`.
-    pub(crate) fn new(scratch: Arc<Scratch>) -> Self {
+    pub fn new(scratch: Arc<Scratch>) -> Self {
         Self {
             scratch,
             starts: AtomicU64::new(0),
@@ -78,14 +78,14 @@ impl Windows {
     }
 
     // The job's scratch, which its windows are lent from.
-    #[cfg(test)]
-    pub(crate) fn scratch(&self) -> &Arc<Scratch> {
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn scratch(&self) -> &Arc<Scratch> {
         &self.scratch
     }
 
     // The windows lent now, and their bytes.
-    #[cfg(test)]
-    pub(crate) fn live(&self) -> (u64, u64) {
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn live(&self) -> (u64, u64) {
         self.scratch.live()
     }
 
@@ -107,7 +107,7 @@ impl Windows {
     // for them, and the start it is handed it for. A run handed it starts
     // with nothing asked on record; what a run handed one before asks from
     // here is not recorded.
-    pub(crate) fn for_node(self: &Arc<Self>, node: NodeId) -> (Arc<dyn WindowLender>, Start) {
+    pub fn for_node(self: &Arc<Self>, node: NodeId) -> (Arc<dyn WindowLender>, Start) {
         let start = Start(self.starts.fetch_add(1, Ordering::Relaxed));
         self.lock().insert(
             node,
@@ -128,7 +128,7 @@ impl Windows {
     // The widest window the node's run asked for under `start`, lent or
     // refused, once one was refused because no folder had room for it
     // (`io::ErrorKind::StorageFull`): `None` while none was.
-    pub(crate) fn refused(&self, node: NodeId, start: Start) -> Option<u64> {
+    pub fn refused(&self, node: NodeId, start: Start) -> Option<u64> {
         self.lock()
             .get(&node)
             .filter(|asked| asked.start == start && asked.refused)
@@ -181,7 +181,3 @@ impl WindowLender for NodeWindows {
         self.windows.scratch.room()
     }
 }
-
-// The lenders a run is handed, where windows can be mapped.
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-mod tests;

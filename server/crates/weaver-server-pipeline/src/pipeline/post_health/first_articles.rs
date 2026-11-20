@@ -12,7 +12,9 @@
 // whose rows changed since it was last read, so a binding costs its member
 // and the critical line follows it without a walk of the post. The gate
 // weighs a file the names do not count by the same answer: one the graph
-// holds as recovery is recovery to it, as a named volume is.
+// holds as recovery is recovery to it, as a named volume is. A named file
+// whose front the graph read and found no recovery data in counts by its
+// bytes, not its name, from then on: payload, unless the graph holds it.
 
 use crate::jobs::model::JobSpec;
 
@@ -37,6 +39,9 @@ struct FirstFile {
     named: bool,
     // The graph holds it as a recovery set's volume.
     bound: bool,
+    // The graph read its front, which opens no recovery format: its name
+    // counts for nothing (`GraphJob::front_refutes_recovery`).
+    refuted: bool,
     bytes: u64,
     // The bytes of it every server said are gone.
     lost: u64,
@@ -50,11 +55,16 @@ impl FirstFile {
     // the names count, by what its name declares; any other, by what the
     // graph holds it as.
     fn gate_recovery(&self) -> bool {
-        if self.named {
+        if self.named() {
             self.recovery
         } else {
             self.bound
         }
+    }
+
+    // Whether the names count it, its front not saying otherwise.
+    fn named(&self) -> bool {
+        self.named && !self.refuted
     }
 }
 
@@ -78,6 +88,8 @@ pub(in crate::pipeline) struct FirstArticles {
     // The bytes of the files the graph holds as recovery that the names do
     // not count.
     bound_bytes: u64,
+    // The bytes of the files the names count whose fronts said otherwise.
+    refuted_bytes: u64,
     // The files whose first article is still to come and which nothing
     // counts as recovery yet: each may still bind as a recovery volume,
     // and bring what of it is not gone.
@@ -106,6 +118,7 @@ impl FirstArticles {
             reachable_bytes: 0,
             declared_recovery: declared_recovery_bytes(spec),
             bound_bytes: 0,
+            refuted_bytes: 0,
             unresolved: 0,
             unresolved_reach: 0,
             bindings_at: None,
@@ -117,6 +130,7 @@ impl FirstArticles {
                 recovery: declares_recovery(file),
                 named: names_recovery(file),
                 bound: false,
+                refuted: false,
                 bytes: file
                     .segments
                     .iter()
@@ -140,7 +154,9 @@ impl FirstArticles {
     // The recovery bytes the critical line is drawn from: what the post's
     // names declare, and every file the graph holds as recovery besides.
     pub(in crate::pipeline) fn recovery(&self) -> u64 {
-        self.declared_recovery.saturating_add(self.bound_bytes)
+        self.declared_recovery
+            .saturating_sub(self.refuted_bytes)
+            .saturating_add(self.bound_bytes)
     }
 
     // How many files have a first article still to come that may yet bind
@@ -178,16 +194,21 @@ impl FirstArticles {
         self.bindings_at = Some(at);
     }
 
-    // Whether the graph holds the file at `index` as recovery now.
-    pub(in crate::pipeline) fn bind(&mut self, index: u32, bound: bool) {
+    // Whether the graph holds the file at `index` as recovery now, and
+    // whether its front said it is none.
+    pub(in crate::pipeline) fn bind(&mut self, index: u32, bound: bool, refuted: bool) {
         let Some(file) = self.files.get(index as usize).copied() else {
             return;
         };
-        if file.bound == bound {
+        if file.bound == bound && file.refuted == refuted {
             return;
         }
         self.count(file, false);
-        let file = FirstFile { bound, ..file };
+        let file = FirstFile {
+            bound,
+            refuted,
+            ..file
+        };
         self.count(file, true);
         self.files[index as usize] = file;
     }
@@ -249,10 +270,13 @@ impl FirstArticles {
                 *sum - file.bytes
             };
         };
-        if file.bound && !file.named {
+        if file.bound && !file.named() {
             bytes(&mut self.bound_bytes);
         }
-        if file.head == Head::Outstanding && !file.bound && !file.named {
+        if file.named && file.refuted {
+            bytes(&mut self.refuted_bytes);
+        }
+        if file.head == Head::Outstanding && !file.bound && !file.named() {
             step(&mut self.unresolved);
             let reach = file.bytes.saturating_sub(file.lost);
             self.unresolved_reach = if add {

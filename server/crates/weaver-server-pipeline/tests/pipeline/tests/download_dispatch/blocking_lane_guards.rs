@@ -6,7 +6,7 @@
 // own report or on a lane event: nothing waits on a clock.
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use weaver_server_pipeline::JobId;
+use weaver_server_composition::JobId;
 use weaver_server_pipeline::pipeline::tests::dispatch_fixture::blocking_lane::{
     LaneEvent, LaneGuard, LaneProgress, lane_guard,
 };

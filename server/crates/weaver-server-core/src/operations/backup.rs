@@ -10,11 +10,11 @@ use crate::{
 use std::{fs::File, path::PathBuf};
 
 #[cfg(test)]
-use weaver_server_pipeline::operations::backup::LEGACY_V1_STABLE_TABLES;
-pub use weaver_server_pipeline::operations::backup::{
+use weaver_server_composition::operations::backup::LEGACY_V1_STABLE_TABLES;
+pub use weaver_server_composition::operations::backup::{
     OperationsBackupQueries, StableStateExport, create_backup_temp_dir,
 };
-use weaver_server_pipeline::operations::backup::{catalog, logical, permissions};
+use weaver_server_composition::operations::backup::{catalog, logical, permissions};
 mod archive;
 mod automatic;
 pub(crate) use logical::OperationsBackupLogicalInternalQueries;

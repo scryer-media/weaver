@@ -1,23 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-pub mod admission;
-pub mod files;
-pub mod intake;
-pub mod layout;
-pub mod metainfo;
-pub mod metrics;
-pub mod model;
-pub mod persistence;
-pub mod pieces;
-pub mod queries;
-pub mod rate;
-pub mod relocate;
-pub mod sealed;
-pub mod side;
+pub use weaver_server_pipeline::torrents::*;
+pub(crate) use weaver_server_torrent_store::torrents::{
+    files, intake, layout, relocate, side, writes,
+};
+pub mod naming;
+pub mod net;
+pub mod service;
+pub mod sessions;
 pub mod status;
-pub mod storage;
-pub mod writes;
-
-#[cfg(test)]
-mod tests;
+pub(crate) mod storage;
+pub mod store;
+pub mod tee;

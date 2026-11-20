@@ -259,7 +259,7 @@ impl Pipeline {
     // and outside any queue lock: the fill servers whose refusal is still a
     // wait and, only while there is one, the servers whose refusal is the
     // verdict. Empty in the common case, at one atomic read per server.
-    pub(in crate::pipeline) fn login_refusal_view(&self) -> LoginRefusalView {
+    pub fn login_refusal_view(&self) -> LoginRefusalView {
         let pool = self.nntp.pool();
         let waiting = pool.login_refusal_waits();
         if waiting.is_empty() {
@@ -348,7 +348,7 @@ impl Pipeline {
     // server may serve it ([`Self::server_may_serve`]) and every server that
     // may is one whose refusal is still a wait. None when any other server
     // may serve it, or none may.
-    pub(in crate::pipeline) fn login_refusal_waited_by(
+    pub fn login_refusal_waited_by(
         &self,
         view: LoginRefusalView,
         failure_excludes: weaver_nntp::ServerSet,
@@ -400,7 +400,7 @@ impl Pipeline {
     // tried, never by the articles queued. The servers named are those of
     // every waiting set together, so the answer does not depend on which
     // set is read first.
-    pub(in crate::pipeline) fn job_login_refusal_wait(
+    pub fn job_login_refusal_wait(
         &self,
         job_id: JobId,
         view: LoginRefusalView,
@@ -420,7 +420,7 @@ impl Pipeline {
             .chain(queue.steered_exclusion_sets())
             .chain(parked)
         {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             self.login_refusal_sets_examined
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             match self.login_refusal_waited_by(view, excludes, retention) {
@@ -738,9 +738,9 @@ impl Pipeline {
 // The pool's login refusals as one pass reads them; see
 // [`Pipeline::login_refusal_view`].
 #[derive(Clone, Copy, Debug, Default)]
-pub(in crate::pipeline) struct LoginRefusalView {
+pub struct LoginRefusalView {
     // Fill servers whose refusal is still a wait.
-    pub(in crate::pipeline) waiting: weaver_nntp::ServerSet,
+    pub waiting: weaver_nntp::ServerSet,
     // Servers whose refusal is the verdict.
     pub(in crate::pipeline) refusing: weaver_nntp::ServerSet,
 }
@@ -748,10 +748,10 @@ pub(in crate::pipeline) struct LoginRefusalView {
 // A job's wait on servers refusing the login; see
 // [`Pipeline::job_login_refusal_wait`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::pipeline) struct LoginRefusalWait {
+pub struct LoginRefusalWait {
     // The servers the waiting work waits on.
-    pub(in crate::pipeline) servers: weaver_nntp::ServerSet,
+    pub servers: weaver_nntp::ServerSet,
     // Whether all the job's queued download work waits on them, so nothing
     // of it could be dispatched now whatever else is wrong.
-    pub(in crate::pipeline) every: bool,
+    pub every: bool,
 }

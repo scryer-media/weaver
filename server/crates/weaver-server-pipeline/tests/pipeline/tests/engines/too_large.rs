@@ -21,11 +21,11 @@ use weaver_server_pipeline::pipeline::tests::engines::large_window_fixtures::{
 use super::harness::{Outcome, Post, Scenario, run};
 use crate::history::attributes::NO_MEMORY_LIMIT_ATTRIBUTE_KEY;
 use crate::jobs::model::JobStatus;
+use weaver_server_composition::runtime::HardwareProfile;
 use weaver_server_pipeline::pipeline::tests::{
     TEST_RAR5_SIG, build_test_rar_compressed_file_header, build_test_rar_end_header,
     build_test_rar_main_header, test_rar_compression_info,
 };
-use weaver_server_pipeline::runtime::HardwareProfile;
 
 const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
@@ -463,9 +463,9 @@ async fn a_later_zstd_frame_above_the_efficient_window_fails_and_is_lifted_by_a_
 // Whether the job's history row says it failed for memory, offering a
 // retry with no limit.
 fn offers_retry(outcome: &Outcome) -> bool {
-    crate::history::attributes::failed_for_memory(&weaver_server_pipeline::parse_history_metadata(
-        outcome.history_metadata.as_deref(),
-    ))
+    crate::history::attributes::failed_for_memory(
+        &weaver_server_composition::parse_history_metadata(outcome.history_metadata.as_deref()),
+    )
 }
 
 fn outcome_error(outcome: &Outcome) -> String {

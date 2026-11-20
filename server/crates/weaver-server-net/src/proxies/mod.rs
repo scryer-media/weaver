@@ -3,6 +3,7 @@
 
 pub mod dns;
 pub mod fault;
+pub mod give_back;
 pub mod interfaces;
 pub mod model;
 pub mod network;
@@ -10,6 +11,7 @@ pub mod network_metrics;
 pub mod pool_stage;
 pub mod refusal;
 pub mod route_health;
+pub mod session_key;
 pub mod weighted;
 pub use dns::*;
 pub use fault::*;

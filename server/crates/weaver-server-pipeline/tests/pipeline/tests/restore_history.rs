@@ -7,6 +7,8 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use weaver_server_base::events::model::PipelineEvent;
 use weaver_server_base::jobs::ids::JobId;
+use weaver_server_composition::{JobSpec, RestoreJobRequest};
+use weaver_server_composition::{JobStatus, SchedulerError};
 use weaver_server_history::history::retention::HistoryInternalQueries;
 use weaver_server_pipeline::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
 use weaver_server_pipeline::history::queries::HistoryQueries;
@@ -43,8 +45,6 @@ use weaver_server_pipeline::pipeline::tests::{
     sample_nzb_bytes, sample_nzb_zstd, standalone_job_spec,
 };
 use weaver_server_pipeline::torrents::persistence::TorrentsPersistenceInsertTorrentQueries;
-use weaver_server_pipeline::{JobSpec, RestoreJobRequest};
-use weaver_server_pipeline::{JobStatus, SchedulerError};
 
 #[tokio::test]
 async fn delete_history_removes_intermediate_output_dir() {
@@ -208,7 +208,7 @@ async fn delete_history_batch_keeps_complete_output_dir() {
     assert!(complete_output_dir.exists());
     assert!(
         database(&pipeline)
-            .list_job_history(&weaver_server_pipeline::HistoryFilter::default())
+            .list_job_history(&weaver_server_composition::HistoryFilter::default())
             .unwrap()
             .is_empty()
     );
@@ -401,7 +401,7 @@ async fn housekeeping_stamps_nothing_while_the_intermediate_root_is_away() {
 // times tied across page edges included, and no other.
 #[tokio::test]
 async fn housekeeping_pages_remove_what_the_unpaged_listing_named() {
-    use weaver_server_pipeline::persistence::sql_runtime::SqlRuntime;
+    use weaver_server_composition::persistence::sql_runtime::SqlRuntime;
     let temp_dir = tempfile::tempdir().unwrap();
     let (pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;
     let count = FAILED_SWEEP_PAGE as u64 * 3 + 37;
@@ -526,7 +526,7 @@ async fn housekeeping_stamps_a_failed_job_once_it_has_no_more_to_do_for_it() {
 // so a sweep with nothing to do reads an empty index range.
 #[tokio::test]
 async fn the_failed_sweep_page_reads_the_unswept_index() {
-    use weaver_server_pipeline::persistence::sql_runtime::{SqlArg, SqlRuntime};
+    use weaver_server_composition::persistence::sql_runtime::{SqlArg, SqlRuntime};
     let temp_dir = tempfile::tempdir().unwrap();
     let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     use weaver_server_history::history::retention::{
@@ -622,7 +622,7 @@ fn views_of(pipeline: &Pipeline, ids: &[JobId]) -> String {
     let db = database(pipeline);
     let mut out = format!(
         "{:?}",
-        db.list_job_history(&weaver_server_pipeline::HistoryFilter::default())
+        db.list_job_history(&weaver_server_composition::HistoryFilter::default())
             .unwrap()
     );
     out.push_str(&format!(
@@ -791,7 +791,7 @@ async fn a_script_a_later_job_gains_mid_page_keeps_its_folder() {
         between_sweeps(move |id| {
             if id == first {
                 held.borrow_mut().push(Box::new(
-                    weaver_server_pipeline::post_processing::events::hold_test_event_run(
+                    weaver_server_composition::post_processing::events::hold_test_event_run(
                         &db, marked.0, "marked",
                     ),
                 ));
@@ -1235,7 +1235,7 @@ async fn delete_history_reports_a_failed_cleanup_as_deleted_with_its_error() {
     // A script still running for the failing job holds its cleanup at the
     // script-stop barrier, after its record is gone and before its directory
     // goes.
-    let running = weaver_server_pipeline::post_processing::events::hold_test_event_run(
+    let running = weaver_server_composition::post_processing::events::hold_test_event_run(
         database(&pipeline),
         failing.0,
         "history-cleanup-barrier",
@@ -1244,7 +1244,7 @@ async fn delete_history_reports_a_failed_cleanup_as_deleted_with_its_error() {
     report_all(&pipeline);
     let delete = start_history_delete(&pipeline, [failing, clean].into_iter().collect(), false);
     let db = database(&pipeline).clone();
-    weaver_server_pipeline::post_processing::events::wait_for_test_script_change(&db, || {
+    weaver_server_composition::post_processing::events::wait_for_test_script_change(&db, || {
         db.get_job_history(failing.0).unwrap().is_none()
     })
     .await;
@@ -1282,9 +1282,9 @@ async fn delete_history_reports_a_failed_cleanup_as_deleted_with_its_error() {
 #[tokio::test]
 async fn a_rename_survives_restore_through_the_metadata() {
     let mut metadata = vec![("drone".to_string(), "abc".to_string())];
-    weaver_server_pipeline::ingest::set_renamed_title(&mut metadata, "Renamed Release");
+    weaver_server_composition::ingest::set_renamed_title(&mut metadata, "Renamed Release");
     let nzb = weaver_nzb::parse_nzb(&sample_nzb_bytes()).unwrap();
-    let spec = weaver_server_pipeline::ingest::nzb_to_spec(
+    let spec = weaver_server_composition::ingest::nzb_to_spec(
         &nzb,
         std::path::Path::new("Original.nzb"),
         None,
@@ -1292,7 +1292,7 @@ async fn a_rename_survives_restore_through_the_metadata() {
     );
     assert_eq!(spec.name, "Renamed Release");
     assert_eq!(
-        weaver_server_pipeline::ingest::original_release_title(&spec.name, &spec.metadata),
+        weaver_server_composition::ingest::original_release_title(&spec.name, &spec.metadata),
         "Renamed Release"
     );
 }
@@ -1319,7 +1319,7 @@ async fn history_deletion_waits_for_scripts_without_blocking_commands() {
                 output_dir.clone(),
             ))
             .unwrap();
-        let running = weaver_server_pipeline::post_processing::events::hold_test_event_run(
+        let running = weaver_server_composition::post_processing::events::hold_test_event_run(
             database(&pipeline),
             job_id.0,
             "deletion-barrier",
@@ -1544,7 +1544,7 @@ async fn job_failed_event_publishes_after_history_archive_commits() {
         "history row must be readable as soon as the failure event is observed"
     );
     let listed = database(&pipeline)
-        .list_job_history(&weaver_server_pipeline::HistoryFilter::default())
+        .list_job_history(&weaver_server_composition::HistoryFilter::default())
         .unwrap();
     assert!(listed.iter().any(|row| row.job_id == job_id.0));
 }
@@ -1895,14 +1895,14 @@ async fn restore_job_reemits_open_download_finalization_and_drains_it() {
 
     database(&pipeline)
         .insert_job_events(&[
-            weaver_server_pipeline::JobEvent {
+            weaver_server_composition::JobEvent {
                 job_id: job_id.0,
                 timestamp: 1,
                 kind: "JobCreated".to_string(),
                 message: "created".to_string(),
                 file_id: None,
             },
-            weaver_server_pipeline::JobEvent {
+            weaver_server_composition::JobEvent {
                 job_id: job_id.0,
                 timestamp: 2,
                 kind: "DownloadFinished".to_string(),
@@ -2086,7 +2086,7 @@ async fn renaming_a_quiet_job_preserves_existing_payload() {
         let dir = working_dir(&pipeline, job_id);
         assert_eq!(spec.name, new_name);
         assert_eq!(
-            weaver_server_pipeline::ingest::completed_folder_name(&spec.name, &spec.metadata),
+            weaver_server_composition::ingest::completed_folder_name(&spec.name, &spec.metadata),
             new_name
         );
         assert_eq!(*dir, intermediate_dir.join(&new_name));
@@ -2161,7 +2161,7 @@ async fn updating_history_edits_the_row_and_the_finished_job() {
     assert_eq!(row.category.as_deref(), Some("tv"));
     let metadata = weaver_server_pipeline::history::parse_history_metadata(row.metadata.as_deref());
     assert_eq!(
-        weaver_server_pipeline::ingest::renamed_title(&metadata),
+        weaver_server_composition::ingest::renamed_title(&metadata),
         Some("Renamed Finished")
     );
     let finished = published_job(&pipeline, job_id).unwrap();
@@ -2180,14 +2180,17 @@ async fn updating_history_edits_the_row_and_the_finished_job() {
             .unwrap_err();
         if conflict {
             assert!(
-                matches!(error, weaver_server_pipeline::SchedulerError::Conflict(_)),
+                matches!(
+                    error,
+                    weaver_server_composition::SchedulerError::Conflict(_)
+                ),
                 "{error}"
             );
         } else {
             assert!(
                 matches!(
                     error,
-                    weaver_server_pipeline::SchedulerError::JobNotFound(_)
+                    weaver_server_composition::SchedulerError::JobNotFound(_)
                 ),
                 "{error}"
             );
@@ -2280,7 +2283,7 @@ async fn job_completed_event_publishes_after_history_archive_commits() {
         "history row must be readable as soon as the completion event is observed"
     );
     let listed = database(&pipeline)
-        .list_job_history(&weaver_server_pipeline::HistoryFilter::default())
+        .list_job_history(&weaver_server_composition::HistoryFilter::default())
         .unwrap();
     assert!(listed.iter().any(|row| row.job_id == job_id.0));
 }
@@ -2345,7 +2348,7 @@ async fn a_restart_finds_the_staging_directory_the_job_chose() {
     .await;
     set_categories(
         &pipeline,
-        vec![weaver_server_pipeline::categories::CategoryConfig {
+        vec![weaver_server_settings::categories::CategoryConfig {
             id: 0,
             name: "movies".to_string(),
             dest_dir: Some(movies.display().to_string()),

@@ -2,14 +2,14 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use std::sync::atomic::Ordering;
+use weaver_server_composition::{
+    DownloadPressureReason, DownloadPressureState, JobId, JobStatus, MessageIds, NzbFileId,
+    SegmentId, SegmentSpec,
+};
 use weaver_server_pipeline::pipeline::tests::{
     insert_active_job, new_direct_pipeline, uu_fixture::*,
 };
 use weaver_server_pipeline::pipeline::tests::{queue_fixture::metrics, standalone_job_spec};
-use weaver_server_pipeline::{
-    DownloadPressureReason, DownloadPressureState, JobId, JobStatus, MessageIds, NzbFileId,
-    SegmentId, SegmentSpec,
-};
 
 #[tokio::test]
 async fn uu_segments_assemble_sequentially_at_decoded_offsets() {
@@ -977,7 +977,7 @@ async fn uu_park_refuses_to_spill_when_free_space_is_unknown() {
 async fn uu_spill_admission_debits_the_cached_free_space_reading() {
     // Two spills inside one probe interval must not both see the headroom
     // the single reading reported.
-    use weaver_server_pipeline::operations::{Capacity, CapacityReader, CapacityReading};
+    use weaver_server_composition::operations::{Capacity, CapacityReader, CapacityReading};
 
     let parts: Vec<Vec<u8>> = vec![vec![b'a'; 80], vec![b'b'; 90], vec![b'c'; 85]];
     let temp_dir = tempfile::tempdir().unwrap();

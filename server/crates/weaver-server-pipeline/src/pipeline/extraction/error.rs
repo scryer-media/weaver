@@ -15,9 +15,15 @@ use std::io;
 use super::safety::ExtractionFailure;
 
 mod adapters;
+#[cfg(feature = "pipeline-test-fixtures")]
+pub(crate) mod units {
+    pub mod adapters {
+        pub use super::super::adapters::*;
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ExtractionErrorClass {
+pub enum ExtractionErrorClass {
     // The job's extraction budget refused the work, or was stopped. The job
     // fails on it, and every other worker of the job stops.
     Rejected,
@@ -42,7 +48,7 @@ pub(crate) enum ExtractionErrorClass {
 pub(crate) const PASSWORD_REQUIRED_MARKER: &str = "WEAVER_PASSWORD_REQUIRED: ";
 
 #[derive(Debug, Clone)]
-pub(crate) struct ExtractionError {
+pub struct ExtractionError {
     class: ExtractionErrorClass,
     message: String,
     rejection: Option<ExtractionFailure>,
@@ -124,7 +130,7 @@ impl From<ExtractionError> for String {
 // An I/O error's class: from the typed error it carries when it carries one,
 // from its OS error code, and from the rendering of a crate that hands its
 // cause over only as text.
-pub(crate) fn io_error_class(error: &io::Error) -> ExtractionErrorClass {
+pub fn io_error_class(error: &io::Error) -> ExtractionErrorClass {
     typed_io_error_class(error)
         .or_else(|| adapters::untyped_io_class(error))
         .unwrap_or(ExtractionErrorClass::Terminal)
@@ -173,7 +179,7 @@ fn typed_io_error_class(error: &io::Error) -> Option<ExtractionErrorClass> {
     None
 }
 
-pub(crate) fn rar_error_class(error: &unrar_rs::RarError) -> ExtractionErrorClass {
+pub fn rar_error_class(error: &unrar_rs::RarError) -> ExtractionErrorClass {
     use unrar_rs::RarError;
     match error {
         RarError::Io(error) => io_error_class(error),
@@ -202,7 +208,7 @@ pub(crate) fn rar_error_class(error: &unrar_rs::RarError) -> ExtractionErrorClas
 // A 7z error's class, read from the error a block error locates rather than
 // from the block's kind: a block fails as `Corrupted` on a cancellation, a
 // limit or a fault in its coder too, and none of those is damage.
-pub(crate) fn sevenz_error_class(error: &sevenz_turbo::Error) -> ExtractionErrorClass {
+pub fn sevenz_error_class(error: &sevenz_turbo::Error) -> ExtractionErrorClass {
     use sevenz_turbo::Error;
     if error.is_password_required() {
         return ExtractionErrorClass::PasswordRequired;
@@ -232,7 +238,7 @@ pub(crate) fn sevenz_error_class(error: &sevenz_turbo::Error) -> ExtractionError
     }
 }
 
-pub(crate) fn zip_error_class(error: &zip::result::ZipError) -> ExtractionErrorClass {
+pub fn zip_error_class(error: &zip::result::ZipError) -> ExtractionErrorClass {
     use zip::result::ZipError;
     match error {
         ZipError::Io(error) => io_error_class(error),
@@ -240,6 +246,3 @@ pub(crate) fn zip_error_class(error: &zip::result::ZipError) -> ExtractionErrorC
         _ => ExtractionErrorClass::Terminal,
     }
 }
-
-#[cfg(test)]
-mod tests;

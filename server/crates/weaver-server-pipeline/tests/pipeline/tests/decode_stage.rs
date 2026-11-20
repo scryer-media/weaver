@@ -8,6 +8,9 @@ use weaver_server_base::runtime::system_profile::{
     CpuProfile, DiskProfile, FilesystemType, MemoryProfile, SimdSupport, StorageClass,
     SystemProfile,
 };
+use weaver_server_composition::{
+    DownloadPressureReason, DownloadPressureState, JobId, JobStatus, NzbFileId, SegmentId,
+};
 use weaver_server_pipeline::pipeline::tests::{
     decode_fixture::*, new_direct_pipeline_with_backlog, uu_fixture::set_write_budget,
 };
@@ -27,9 +30,6 @@ use weaver_server_pipeline::pipeline::tests::{
     uu_fixture::refresh_download_pressure,
     wait_until,
     yenc_fixture::{next_retry, set_retention},
-};
-use weaver_server_pipeline::{
-    DownloadPressureReason, DownloadPressureState, JobId, JobStatus, NzbFileId, SegmentId,
 };
 use weaver_server_pipeline::{Pipeline, settings::queries::SettingsQueries};
 

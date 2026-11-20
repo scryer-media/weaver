@@ -852,7 +852,7 @@ async fn par3_held_recovery_volume_reads_as_fetching_repair_data() {
     assert_eq!(held.report.status, JobStatus::Downloading);
     assert_eq!(
         held.report.post_state,
-        weaver_server_pipeline::PostState::Idle
+        weaver_server_composition::PostState::Idle
     );
     assert!(held.report.fetching_repair_data, "not fetching while held");
     assert!(

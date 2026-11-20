@@ -12,7 +12,7 @@ use weaver_graph::{NodeId, Tree};
 use crate::jobs::model::JobStatus;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum RootPhase {
+pub enum RootPhase {
     Downloading,
     Verifying,
     Repairing,
@@ -23,7 +23,7 @@ pub(crate) enum RootPhase {
 // What the job's recovery objects are doing, read off what each has ruled
 // and whether a repair run is out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub(crate) enum Activity {
+pub enum Activity {
     #[default]
     Idle,
     Verifying,
@@ -35,7 +35,7 @@ pub(crate) enum Activity {
 // A repair run out over damage is repairing; otherwise one waiting on
 // recovery bytes is fetching them; one that has not ruled is verifying; with
 // every one ruled, or none to rule, nothing is at work.
-pub(crate) fn activity(
+pub fn activity(
     outcomes: impl IntoIterator<Item = Option<RepairOutcome>>,
     repairing: bool,
 ) -> Activity {
@@ -55,7 +55,7 @@ impl RootPhase {
     // The first that holds wins: bytes still to fetch, the payload's or the
     // recovery volumes a set waits on, then a recovery object at work, then
     // an object still producing members, then done.
-    pub(crate) fn derive(waiting: bool, activity: Activity, extracting: bool) -> Self {
+    pub fn derive(waiting: bool, activity: Activity, extracting: bool) -> Self {
         match (waiting, activity, extracting) {
             (true, _, _) | (false, Activity::Fetching, _) => Self::Downloading,
             (false, Activity::Repairing, _) => Self::Repairing,
@@ -77,7 +77,7 @@ impl RootPhase {
 
     // The job status the phase shows as. Done has none: from there the job
     // is finalised, and finalisation owns the status.
-    pub(crate) fn job_status(self) -> Option<JobStatus> {
+    pub fn job_status(self) -> Option<JobStatus> {
         match self {
             Self::Downloading => Some(JobStatus::Downloading),
             Self::Verifying => Some(JobStatus::Verifying),
@@ -89,7 +89,7 @@ impl RootPhase {
 
     // Whether the phase may replace this status. The root speaks for the
     // job only while the job is in progress.
-    pub(crate) fn may_replace(status: &JobStatus) -> bool {
+    pub fn may_replace(status: &JobStatus) -> bool {
         status.in_progress()
     }
 }

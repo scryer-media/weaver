@@ -211,16 +211,7 @@ impl ScriptAdapter {
     }
 }
 
-// Typed built-in pipeline failure stage.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PipelineFailureStage {
-    Download,
-    Verify,
-    Repair,
-    Extract,
-    Move,
-}
+pub use weaver_server_jobs::jobs::failure_stage::PipelineFailureStage;
 
 // Pipeline result, which stays independent of the post-processing result.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]

@@ -4,7 +4,9 @@
 use std::path::PathBuf;
 use weaver_server_base::events::model::PipelineEvent;
 use weaver_server_base::jobs::ids::JobId;
-use weaver_server_pipeline::JobSpec;
+use weaver_server_composition::JobSpec;
+use weaver_server_composition::post_processing::effects::PostProcessingEffectsQueries;
+use weaver_server_composition::{JobStatus, SchedulerError};
 use weaver_server_pipeline::history::queries::HistoryQueries;
 use weaver_server_pipeline::jobs::duplicate_persistence::JobsDuplicatePersistenceAdmitDuplicateSubmissionQueries;
 use weaver_server_pipeline::jobs::queries::JobsQueries;
@@ -15,8 +17,6 @@ use weaver_server_pipeline::pipeline::tests::{
     finish_cancel_jobs, history_fixture::database, new_direct_pipeline, nzb_zstd_for,
     queue_fixture::*, segmented_job_spec,
 };
-use weaver_server_pipeline::post_processing::effects::PostProcessingEffectsQueries;
-use weaver_server_pipeline::{JobStatus, SchedulerError};
 
 #[tokio::test]
 async fn admission_and_intents_answer_without_a_running_pipeline() {
@@ -67,7 +67,7 @@ async fn reports_preserve_unapplied_updates_and_queue_order() {
     handle
         .update_job(
             a,
-            weaver_server_pipeline::JobUpdate {
+            weaver_server_composition::JobUpdate {
                 category: weaver_server_pipeline::jobs::FieldUpdate::Set("series".into()),
                 ..Default::default()
             },
@@ -77,7 +77,7 @@ async fn reports_preserve_unapplied_updates_and_queue_order() {
     handle
         .update_job(
             a,
-            weaver_server_pipeline::JobUpdate {
+            weaver_server_composition::JobUpdate {
                 password: weaver_server_pipeline::jobs::FieldUpdate::Set("fixture-secret".into()),
                 ..Default::default()
             },
@@ -247,7 +247,7 @@ async fn rename_waits_for_job_quiescence_and_preserves_written_payload() {
     handle
         .update_job(
             id,
-            weaver_server_pipeline::JobUpdate {
+            weaver_server_composition::JobUpdate {
                 name: Some("first rename".into()),
                 ..Default::default()
             },
@@ -261,7 +261,7 @@ async fn rename_waits_for_job_quiescence_and_preserves_written_payload() {
     handle
         .update_job(
             id,
-            weaver_server_pipeline::JobUpdate {
+            weaver_server_composition::JobUpdate {
                 name: Some("latest rename".into()),
                 ..Default::default()
             },
@@ -378,7 +378,7 @@ async fn metadata_intents_preserve_later_script_parameters_and_merge_per_key() {
         handle
             .update_job(
                 id,
-                weaver_server_pipeline::JobUpdate {
+                weaver_server_composition::JobUpdate {
                     metadata_edits: edits
                         .into_iter()
                         .map(|(key, value)| (key.into(), value.map(String::from)))
@@ -389,7 +389,7 @@ async fn metadata_intents_preserve_later_script_parameters_and_merge_per_key() {
             .await
             .unwrap();
     }
-    let effects = weaver_server_pipeline::post_processing::effects::JobScriptEffects {
+    let effects = weaver_server_composition::post_processing::effects::JobScriptEffects {
         parameters: [("script-value".into(), "preserved".into())].into(),
         ..Default::default()
     };
@@ -429,27 +429,28 @@ async fn superseded_admission_never_installs_a_queue_row() {
     let (pipeline, _, _) = new_direct_pipeline(&temp).await;
     let handle = handle(&pipeline);
     let spec = segmented_job_spec("stale", "payload.bin", &[100]);
-    let request = |spec: &JobSpec, hash, score| weaver_server_pipeline::DuplicateAdmissionRequest {
-        evidence: weaver_server_pipeline::FingerprintEvidence::from_validated_spec(
-            spec, [hash; 32],
-        ),
-        mode: weaver_server_pipeline::DuplicateMode::Score,
-        semantic: weaver_server_pipeline::SemanticDuplicate::from_source(
-            "control-plane-generation",
-            score,
-        ),
-        semantic_source: Some(weaver_server_pipeline::SemanticCandidateSource {
-            nzb_zstd: sample_nzb_zstd(),
-            filename: Some("stale.nzb".into()),
-            password: None,
-            category: None,
-            metadata: vec![],
-        }),
-        origin: weaver_server_pipeline::SubmissionOrigin::Api,
-        idempotency: None,
-        policy: weaver_server_pipeline::DuplicatePolicy::default(),
-    };
-    let weaver_server_pipeline::DuplicateAdmission::Accepted {
+    let request =
+        |spec: &JobSpec, hash, score| weaver_server_composition::DuplicateAdmissionRequest {
+            evidence: weaver_server_composition::FingerprintEvidence::from_validated_spec(
+                spec, [hash; 32],
+            ),
+            mode: weaver_server_composition::DuplicateMode::Score,
+            semantic: weaver_server_composition::SemanticDuplicate::from_source(
+                "control-plane-generation",
+                score,
+            ),
+            semantic_source: Some(weaver_server_composition::SemanticCandidateSource {
+                nzb_zstd: sample_nzb_zstd(),
+                filename: Some("stale.nzb".into()),
+                password: None,
+                category: None,
+                metadata: vec![],
+            }),
+            origin: weaver_server_composition::SubmissionOrigin::Api,
+            idempotency: None,
+            policy: weaver_server_composition::DuplicatePolicy::default(),
+        };
+    let weaver_server_composition::DuplicateAdmission::Accepted {
         job_id: id,
         semantic: Some(semantic),
         ..
@@ -466,7 +467,7 @@ async fn superseded_admission_never_installs_a_queue_row() {
         database(&pipeline)
             .admit_duplicate_submission(&request(&replacement, 2, 20))
             .unwrap(),
-        weaver_server_pipeline::DuplicateAdmission::Accepted { .. }
+        weaver_server_composition::DuplicateAdmission::Accepted { .. }
     ));
     let result = handle
         .add_job_with_options(
@@ -489,7 +490,7 @@ async fn superseded_admission_never_installs_a_queue_row() {
             .unwrap()
             .unwrap()
             .state,
-        weaver_server_pipeline::SemanticCandidateState::Parked
+        weaver_server_composition::SemanticCandidateState::Parked
     );
 }
 
@@ -502,7 +503,7 @@ async fn final_delete_archives_before_the_event_and_erases_history_after_cleanup
     add(&handle, id).await;
     apply_intents(&mut pipeline).await;
     let path = working_dir(&pipeline, id).clone();
-    let script = weaver_server_pipeline::post_processing::events::hold_test_event_run(
+    let script = weaver_server_composition::post_processing::events::hold_test_event_run(
         database(&pipeline),
         id.0,
         "cancel-cleanup",

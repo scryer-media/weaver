@@ -102,85 +102,7 @@ pub(crate) async fn clear_left_working_dirs(
     Ok(())
 }
 
-// The job's staging directories under each of `roots`, whatever they still
-// hold. Only a directory carrying the job's marker goes, and no symbolic link
-// on the way down from a root is followed.
-//
-// `roots` is `destination_roots`: the complete folder first, then each
-// category's folder. A job's staging directory is under the complete folder
-// unless its category delivers elsewhere, and a history row does not say
-// which, so every root is swept. The complete folder must be reachable. A
-// category folder in which the job's staging directory cannot be looked up
-// is passed over with a warning, so one unreachable category does not stop
-// the cleanup of jobs that never used it; whatever is found under a folder
-// that can be searched is removed or fails as before.
-pub(crate) async fn remove_job_staging(
-    roots: &[std::path::PathBuf],
-    id: JobId,
-) -> Result<(), SchedulerError> {
-    remove_job_staging_checked(roots, id).await.map(|_| ())
-}
-
-// `remove_job_staging`, saying whether every root was searched: false when a
-// category folder was passed over, so the job's staging there is not known
-// to be gone.
-pub(crate) async fn remove_job_staging_checked(
-    roots: &[std::path::PathBuf],
-    id: JobId,
-) -> Result<bool, SchedulerError> {
-    let mut checked = true;
-    for (index, root) in roots.iter().enumerate() {
-        let staging = super::staging_dir_for(root, id);
-        if index > 0 && !staging_dir_reachable(root.clone(), staging.clone(), id).await? {
-            checked = false;
-            continue;
-        }
-        remove_staging_dir(staging, id).await?;
-    }
-    Ok(checked)
-}
-
-// Whether the job's staging directory under a category's folder can be looked
-// up, which is what removing it needs. Opening the folder is not the test: on
-// Linux a directory opens with `O_PATH` even when its mode lets nothing be
-// looked up in it. A staging directory that does not exist is reachable, as
-// there is nothing to remove.
-async fn staging_dir_reachable(
-    root: std::path::PathBuf,
-    staging: std::path::PathBuf,
-    id: JobId,
-) -> Result<bool, SchedulerError> {
-    tokio::task::spawn_blocking(move || match std::fs::symlink_metadata(&staging) {
-        Ok(_) => true,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-        Err(error) => {
-            tracing::warn!(
-                job_id = id.0,
-                dir = %root.display(),
-                %error,
-                "a category folder could not be searched; its staging directory for the job is not checked"
-            );
-            false
-        }
-    })
-    .await
-    .map_err(|error| SchedulerError::Internal(error.to_string()))
-}
-
-async fn remove_staging_dir(staging: std::path::PathBuf, id: JobId) -> Result<(), SchedulerError> {
-    let removed = tokio::task::spawn_blocking(move || {
-        crate::jobs::working_dir::remove_job_staging_dir(&staging, id)
-    })
-    .await
-    .map_err(|error| SchedulerError::Internal(error.to_string()))?;
-    match removed {
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
-            Err(SchedulerError::Conflict(error.to_string()))
-        }
-        Err(error) => Err(error.into()),
-    }
-}
+pub(crate) use crate::jobs::working_dir::remove_job_staging;
 
 struct HistoryOperation {
     queue: Arc<Queue>,
@@ -1101,7 +1023,7 @@ impl Queue {
     // same hold a history delete takes. An id in the queue, being admitted,
     // or held by another history operation is busy and nothing of it is
     // touched.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) async fn archive_history(
         self: Arc<Self>,
         ids: BTreeSet<JobId>,
@@ -1117,7 +1039,7 @@ impl Queue {
 
     // `archive_history`, keeping the record of at most `keep` files of
     // each archived entry's output directory.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) async fn archive_history_keeping(
         self: Arc<Self>,
         ids: BTreeSet<JobId>,
@@ -1252,6 +1174,7 @@ pub(crate) mod between_sweeps {
         static RUN: RefCell<Option<Hook>> = const { RefCell::new(None) };
     }
 
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) fn set(run: impl FnMut(JobId) + 'static) {
         RUN.with(|slot| *slot.borrow_mut() = Some(Box::new(run)));
     }

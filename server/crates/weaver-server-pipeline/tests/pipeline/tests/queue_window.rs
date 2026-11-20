@@ -7,10 +7,12 @@
 use std::path::PathBuf;
 
 use weaver_server_base::{events::model::PipelineEvent, jobs::ids::JobId};
+use weaver_server_composition::{JobStatus, SchedulerError};
 use weaver_server_pipeline::history::queries::HistoryQueries;
 use weaver_server_pipeline::jobs::{
     handle::QueueMoveTarget, persistence::JobsPersistenceQueries, queries::JobsQueries,
 };
+use weaver_server_pipeline::pipeline::Pipeline;
 use weaver_server_pipeline::pipeline::tests::{
     activate_job, finish_cancel_jobs,
     history_fixture::{
@@ -24,7 +26,6 @@ use weaver_server_pipeline::pipeline::tests::{
     script_fixture::enable_queue_script,
     window_fixture::*,
 };
-use weaver_server_pipeline::{JobStatus, SchedulerError, pipeline::Pipeline};
 
 #[tokio::test]
 async fn a_long_queue_installs_its_first_window_and_a_priority_raise_moves_it() {
@@ -112,7 +113,7 @@ async fn a_restart_installs_only_the_window_and_lists_every_row_in_place() {
         .set_max_concurrent_nzbs(std::num::NonZeroU32::new(2).unwrap())
         .await
         .unwrap();
-    let recovered = weaver_server_pipeline::operations::recover_server_state(
+    let recovered = weaver_server_composition::operations::recover_server_state(
         database(&pipeline),
         &temp.path().join("data"),
         &intermediate,
@@ -201,7 +202,7 @@ async fn jobs_paused_before_they_start_take_no_window_place() {
         .set_max_concurrent_nzbs(std::num::NonZeroU32::new(2).unwrap())
         .await
         .unwrap();
-    let recovered = weaver_server_pipeline::operations::recover_server_state(
+    let recovered = weaver_server_composition::operations::recover_server_state(
         database(&pipeline),
         &temp.path().join("data"),
         &intermediate,
@@ -256,7 +257,7 @@ async fn a_started_paused_job_moved_out_and_back_keeps_its_place() {
         .set_max_concurrent_nzbs(std::num::NonZeroU32::new(2).unwrap())
         .await
         .unwrap();
-    let recovered = weaver_server_pipeline::operations::recover_server_state(
+    let recovered = weaver_server_composition::operations::recover_server_state(
         database(&pipeline),
         &temp.path().join("data"),
         &intermediate,
@@ -426,7 +427,7 @@ async fn an_intermediate_folder_change_moves_only_the_jobs_that_never_started() 
             )
             .await;
             let handle = queue_handle(&pipeline);
-            let recovered = weaver_server_pipeline::operations::recover_server_state(
+            let recovered = weaver_server_composition::operations::recover_server_state(
                 database(&pipeline),
                 &data,
                 &new_root,

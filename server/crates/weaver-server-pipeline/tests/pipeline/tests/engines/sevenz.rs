@@ -834,7 +834,7 @@ async fn archive_password_sources_are_ordered_and_validated_password_is_private(
     assert!(metadata.iter().any(|(key, _)| key
         == weaver_server_pipeline::history::attributes::VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY));
     assert!(
-        !weaver_server_pipeline::public_history_attributes(&metadata)
+        !weaver_server_composition::public_history_attributes(&metadata)
             .iter()
             .any(|(key, _)| key.contains("validated_archive_password"))
     );

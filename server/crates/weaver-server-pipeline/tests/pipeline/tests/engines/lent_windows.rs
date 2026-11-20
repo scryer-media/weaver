@@ -27,10 +27,10 @@ use weaver_graph::Why;
 use super::harness::{Outcome, Post, Scenario, admit, payload};
 use crate::history::attributes::NO_MEMORY_LIMIT_ATTRIBUTE_KEY;
 use crate::jobs::model::JobStatus;
+use weaver_server_composition::runtime::{HardwareProfile, OverLimit};
 use weaver_server_pipeline::Pipeline;
-use weaver_server_pipeline::runtime::{HardwareProfile, OverLimit};
 
-use weaver_server_pipeline::operations::StorageRoot;
+use weaver_server_composition::operations::StorageRoot;
 use weaver_server_pipeline::pipeline::tests::engines::disk_archive::{finish_disk_job, hears};
 use weaver_server_pipeline::pipeline::tests::engines::disk_reserve::{dispatch_reason, status};
 use weaver_server_pipeline::pipeline::tests::engines::large_window_fixtures::{

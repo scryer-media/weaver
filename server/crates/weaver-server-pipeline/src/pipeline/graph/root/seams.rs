@@ -34,9 +34,9 @@ const WINDOW_PRIORITY: u32 = 3;
 // a test can pin that a turn with nothing changed looks at none.
 #[cfg(any(test, feature = "pipeline-test-fixtures"))]
 thread_local! {
-    pub(crate) static DISK_WAIT_LOOKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub static DISK_WAIT_LOOKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     // How many waits for room were said as they began, on this thread.
-    pub(crate) static DISK_WAITS_SAID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub static DISK_WAITS_SAID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 impl Pipeline {
@@ -132,7 +132,7 @@ impl Pipeline {
     // held parts are in place before that checkpoint, so it names them
     // again. Runs start only here and in later steps, on the pipeline thread
     // with the job in place, so everything a run says is heard.
-    pub(crate) fn install_graph_job(
+    pub fn install_graph_job(
         &mut self,
         job_id: JobId,
         mut graph: GraphJob,
@@ -252,7 +252,7 @@ impl Pipeline {
     // Whether the root of a graph job already has the article in hand or
     // has ruled it lost. An article the root does not hold, or a job that
     // has gone, has settled nothing.
-    pub(in crate::pipeline) fn graph_article_settled(&self, segment_id: SegmentId) -> bool {
+    pub fn graph_article_settled(&self, segment_id: SegmentId) -> bool {
         self.graph_jobs
             .get(&segment_id.file_id.job_id)
             .is_some_and(|graph| {
@@ -379,7 +379,7 @@ impl Pipeline {
     // A stopped graph of a job that dropped its articles only hears its
     // mail out, starting nothing, and goes once the last of it is heard: the
     // job's next graph may be built from then on.
-    pub(in crate::pipeline) fn graph_run_said(&mut self, said: Said) {
+    pub fn graph_run_said(&mut self, said: Said) {
         let job_id = JobId(said.scope);
         let said = match said.heard {
             Heard::DiskFailed(failure) => {
@@ -414,6 +414,12 @@ impl Pipeline {
         }
         if matches!(said.heard, Heard::GivingUp) {
             self.graph_give_up_next(job_id);
+            return;
+        }
+        if matches!(said.heard, Heard::Blocked) {
+            if self.graph_jobs.contains_key(&job_id) {
+                self.schedule_job_completion_check(job_id);
+            }
             return;
         }
         if let Some(graph) = self.retiring_graph_jobs.get_mut(&job_id) {
@@ -508,7 +514,7 @@ impl Pipeline {
     // Everything the runs said since the last turn. A turn hears the mail
     // whole, not one piece of a run's output in a turn's spare moment: a run
     // paced by the pipeline's turns runs as slowly as they are busy.
-    pub(in crate::pipeline) fn hear_graph_runs(&mut self) -> bool {
+    pub fn hear_graph_runs(&mut self) -> bool {
         let waiting = self.graph_runs.waiting();
         let heard = !waiting.is_empty();
         for said in waiting {
@@ -548,7 +554,7 @@ impl Pipeline {
         }
     }
 
-    pub(in crate::pipeline) fn resume_graph_work(&mut self, job_id: JobId) {
+    pub fn resume_graph_work(&mut self, job_id: JobId) {
         if self.graph_job_slot_limit(job_id) == 0 || !self.graph_jobs.contains_key(&job_id) {
             return;
         }
@@ -557,11 +563,7 @@ impl Pipeline {
         self.schedule_job_completion_check(job_id);
     }
 
-    pub(in crate::pipeline::graph) fn after_graph_result(
-        &mut self,
-        job_id: JobId,
-        result: Result<(), GraphError>,
-    ) {
+    pub fn after_graph_result(&mut self, job_id: JobId, result: Result<(), GraphError>) {
         // Every step of a job ends here: one that left a job waiting for
         // room owing nothing, with no run live, has it woken on the next
         // turn. With no job waiting this is one test of an empty set.
@@ -659,7 +661,7 @@ impl Pipeline {
 
     // Whether the job's graph waits for room on a disk, read from the job
     // itself.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(in crate::pipeline) fn graph_disk_held(&self, job_id: JobId) -> bool {
         self.graph_jobs
             .get(&job_id)
@@ -917,7 +919,7 @@ impl Pipeline {
 
     // After anything reached the tree: answer the objects' seeks, move the
     // articles they moved, and report the phase if it changed.
-    fn after_graph_step(&mut self, job_id: JobId) {
+    pub(in crate::pipeline::graph) fn after_graph_step(&mut self, job_id: JobId) {
         let limit = self.graph_job_slot_limit(job_id);
         let (Some(graph), Some(state)) =
             (self.graph_jobs.get_mut(&job_id), self.jobs.get_mut(&job_id))
@@ -964,7 +966,7 @@ impl Pipeline {
 // it: the download queue once for a park, once for a raise and once for a
 // window rank, the recovery queue for any move. Each walk reads the whole
 // queue, so a round costs a pass per kind of move it holds, not one per move.
-pub(super) fn apply_moves(state: &mut JobState, moves: &[Move]) {
+pub fn apply_moves(state: &mut JobState, moves: &[Move]) {
     if moves.is_empty() {
         return;
     }
@@ -1058,8 +1060,8 @@ pub(super) fn rank_volumes(state: &mut JobState, ranks: &[(VolumeIndex, u32)]) {
 
 // The moves applied by walks of the whole queue, which `apply_moves` must
 // match on every state.
-#[cfg(test)]
-pub(super) fn apply_moves_by_walk(state: &mut JobState, moves: &[Move]) {
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+pub fn apply_moves_by_walk(state: &mut JobState, moves: &[Move]) {
     if moves.is_empty() {
         return;
     }
@@ -1174,7 +1176,7 @@ fn segment(job_id: JobId, volume: VolumeIndex, ordinal: u32) -> SegmentId {
 // becomes the delivery's bytes, and its checksums are refiled in the list
 // they came in, so neither is copied.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn decoded(
+pub fn decoded(
     segment_id: SegmentId,
     offset: u64,
     data: DecodedChunk,

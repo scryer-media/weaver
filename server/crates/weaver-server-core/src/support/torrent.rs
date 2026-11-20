@@ -12,7 +12,6 @@
 use crate::history::queries::HistoryQueries;
 use crate::history::timeline::HistoryTimelineQueries;
 use std::fmt::Write as _;
-use weaver_server_pipeline::support::torrent_checkpoint_in_hand;
 
 use serde::Serialize;
 use weaver_torrent::analysis::{Endpoint, TorrentReport, analyze_magnet, analyze_metainfo};
@@ -1201,4 +1200,10 @@ impl SessionFigures {
             let _ = writeln!(text, "    dht nodes v4 {v4} v6 {v6}  waiting {waiting}");
         }
     }
+}
+
+// Whether the torrent's piece checkpoint is in the database.
+pub fn torrent_checkpoint_in_hand(db: &Database, job_id: JobId) -> Result<bool, crate::StateError> {
+    use crate::torrents::persistence::TorrentsPersistenceInsertPlacedTorrentInternalQueries;
+    Ok(db.torrent_pieces(job_id)?.is_some())
 }

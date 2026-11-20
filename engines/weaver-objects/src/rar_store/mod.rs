@@ -520,6 +520,11 @@ pub struct RarStore {
     // What the pool derived for them, until the files take it: the
     // process's cache is shared and may drop an entry before then.
     derived: BTreeMap<(usize, usize), lock::Derived>,
+    // The volumes whose enciphered headers wait on a candidate's check, with
+    // what their headers say of the encryption: checked away from the loop
+    // while the store is lent out, as file keys are, and walked again once
+    // it is back.
+    headers_due: BTreeMap<VolumeIndex, unrar_rs::RarVolumeHeaderEncryption>,
 }
 
 impl Default for RarStore {
@@ -568,6 +573,7 @@ impl RarStore {
             placed: Placed::default(),
             derive_due: BTreeSet::new(),
             derived: BTreeMap::new(),
+            headers_due: BTreeMap::new(),
         }
     }
 
@@ -929,8 +935,18 @@ impl RarStore {
         }
     }
 
+    // Every volume the store gives back goes through here. One the layout
+    // already placed pieces in stays, whichever path asked: its bytes went
+    // to the store's members, its kept bytes no longer hold them, and the
+    // tree, handed it, would refuse its member with those bytes lost, the
+    // store founded again on the same bytes would give it back again, and
+    // nothing would change between the rounds. It is the store's, as any
+    // volume its members read is.
     fn give_back_held(&mut self, going: Vec<VolumeIndex>, out: &mut Vec<Emit>) {
         for index in going {
+            if !self.unmapped.contains(&index) {
+                continue;
+            }
             if let Some(found) = self.volumes.remove(&index) {
                 self.giving.insert(index, found);
                 out.push(Emit::GiveBack(index));
@@ -1012,19 +1028,23 @@ impl Object for RarStore {
         facts::of(self)
     }
 
-    // A file key the cache has no answer for: the derivation is the
-    // slowest thing the store does, done away from the loop.
+    // A header check, or a file key the cache has no answer for: a key
+    // derivation is the slowest thing the store does, done away from the
+    // loop.
     fn work_due(&self) -> bool {
-        !self.gone && !self.derive_due.is_empty()
+        !self.gone && (!self.headers_due.is_empty() || !self.derive_due.is_empty())
     }
 
     fn work(&mut self, out: &mut Vec<Emit>) {
         self.work_until(&AtomicBool::new(false), out);
     }
 
-    // Stopped between two file keys, the store says nothing: the keys it
-    // did not derive stay due.
+    // Stopped between two checks or file keys, the store says nothing more:
+    // the checks and keys it did not begin stay due.
     fn work_until(&mut self, stop: &AtomicBool, out: &mut Vec<Emit>) {
+        if !self.check_headers_due(stop, out) || self.gone {
+            return;
+        }
         if self.derive_due(stop) {
             self.settle(None, out);
         }

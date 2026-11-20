@@ -7,14 +7,15 @@ use bytes::Bytes;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use weaver_model::files::FileRole;
-use weaver_server_pipeline::events::model::PipelineEvent;
+use weaver_server_composition::events::model::PipelineEvent;
+use weaver_server_composition::{
+    DownloadPressureReason, DownloadPressureState, DownloadState, FileSpec, JobId, JobSpec,
+    JobStatus, MessageId, MessageIds, NzbFileId, SegmentId, SegmentSpec,
+};
 use weaver_server_pipeline::pipeline::tests::{
     dispatch_fixture::DispatchFixture, drain_job_events, segmented_job_spec, standalone_job_spec,
 };
-use weaver_server_pipeline::{
-    DownloadPressureReason, DownloadPressureState, DownloadQueue, DownloadState, DownloadWork,
-    FileSpec, JobId, JobSpec, JobStatus, MessageId, MessageIds, NzbFileId, SegmentId, SegmentSpec,
-};
+use weaver_server_pipeline::{DownloadQueue, DownloadWork};
 
 macro_rules! segment_spec {
     (number: $number:expr, bytes: $bytes:expr, message_id: $message_id:expr $(,)?) => {

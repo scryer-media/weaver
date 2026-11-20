@@ -14,7 +14,7 @@
 // one condition: the pipeline writes, closes and cancels, and the engine's
 // run, on a thread of its own, waits on the same shelf for what it reads.
 
-pub(crate) mod durable;
+pub mod durable;
 
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -26,7 +26,7 @@ use weaver_graph::{ByteRange, Coverage, Marks, NodeId, Placement, Provenance, Vo
 use super::leaf::{Leaf, LeafError};
 
 #[derive(Debug)]
-pub(crate) struct Envelopes {
+pub struct Envelopes {
     working_dir: PathBuf,
     // The writer of the working directory's volume, when the job's files
     // are written through one.
@@ -37,6 +37,9 @@ pub(crate) struct Envelopes {
     // latest change: every way to change what a checkpoint says of them
     // marks the node.
     marks: Marks<NodeId>,
+    // Shared with every shelf: whether the job asks to hear of the next
+    // run to begin waiting on one.
+    watch: Arc<Watch>,
     // Rung as a run begins to wait on any of the job's shelves.
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     blocked: Arc<tokio::sync::Notify>,
@@ -44,7 +47,7 @@ pub(crate) struct Envelopes {
 
 // One node's envelopes, shared with the run that reads them.
 #[derive(Debug)]
-pub(crate) struct Shelf {
+pub struct Shelf {
     dir: PathBuf,
     to: Option<Arc<weaver_server_disk::operations::disk::writer::Submitter>>,
     given: Given,
@@ -52,8 +55,74 @@ pub(crate) struct Shelf {
     state: Mutex<Shelved>,
     changed: Condvar,
     readers: Mutex<Vec<Weak<ReadFiles>>>,
+    watch: Arc<Watch>,
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     blocked: Arc<tokio::sync::Notify>,
+}
+
+// A job that waits on nothing but runs still reading asks to hear of the
+// next one to begin waiting on its shelf: that run says so once, on the
+// mail the job's root notices go by, and the flag is down again. A run
+// records its wait under the shelf's lock before it reads the flag, and the
+// job raises the flag before it reads the shelves under the same lock, so
+// one of the two always sees the other.
+#[derive(Debug, Default)]
+pub struct Watch {
+    raised: std::sync::atomic::AtomicBool,
+    tell: std::sync::OnceLock<(tokio::sync::mpsc::UnboundedSender<super::engine::Said>, u64)>,
+    // The gate turns that asked and the notices sent, for a test to count.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    asks: std::sync::atomic::AtomicU64,
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    told: std::sync::atomic::AtomicU64,
+}
+
+impl Watch {
+    // Ask to hear of the next run to begin waiting, through `tell`, for
+    // the job `scope`, or ask no longer.
+    pub fn ask(
+        &self,
+        asked: bool,
+        tell: impl FnOnce() -> (tokio::sync::mpsc::UnboundedSender<super::engine::Said>, u64),
+    ) {
+        if asked {
+            self.tell.get_or_init(tell);
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+            self.asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.raised
+            .store(asked, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn asks(&self) -> u64 {
+        self.asks.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn told(&self) -> u64 {
+        self.told.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    // A run began to wait on the shelf of `node`: one load while nobody
+    // asks, and the one notice when the job did.
+    fn began_to_wait(&self, node: NodeId, generation: u64) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if !self.raised.load(SeqCst) || !self.raised.swap(false, SeqCst) {
+            return;
+        }
+        let Some((tell, scope)) = self.tell.get() else {
+            return;
+        };
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+        self.told.fetch_add(1, SeqCst);
+        let _ = tell.send(super::engine::Said {
+            scope: *scope,
+            node,
+            generation,
+            heard: super::engine::Heard::Blocked,
+        });
+    }
 }
 
 // What a run reads its envelopes with, which a drain reaches.
@@ -72,22 +141,20 @@ pub(crate) struct ReadFiles {
     pub(crate) stop: weaver_server_disk::operations::disk::reader::TurnStop,
     // A test's hold on the next read inside its disk call: the read says it
     // entered, and returns once the test lets it.
-    #[cfg(test)]
-    hang: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub hang: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 impl ReadFiles {
-    #[cfg(test)]
-    pub(crate) fn hang_next_read(
-        &self,
-    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn hang_next_read(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
         let (entered_tx, entered) = std::sync::mpsc::channel();
         let (go, go_rx) = std::sync::mpsc::channel();
         *self.hang.lock().unwrap_or_else(PoisonError::into_inner) = Some((entered_tx, go_rx));
         (entered, go)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn in_read(&self) {
         let hang = self
             .hang
@@ -121,48 +188,46 @@ pub(crate) struct RunFiles {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct Shelved {
-    pub(crate) kept: BTreeMap<u32, Kept>,
+pub struct Shelved {
+    pub kept: BTreeMap<u32, Kept>,
     // The volumes bound to the object, by index, and whether any more can
     // join. An index orders them; a gap is not a volume.
-    pub(crate) volumes: BTreeSet<u32>,
-    pub(crate) complete: bool,
+    pub volumes: BTreeSet<u32>,
+    pub complete: bool,
     // A member beside the volumes has yet to decide its owner, so a volume
     // may still join past the last one bound.
-    pub(crate) deciding: bool,
+    pub deciding: bool,
     // Which run may read. Moving it on stops the one reading: a repair
     // behind what it read, or the node going away.
     pub(crate) generation: u64,
     // How many times the shelf woke its waiters, and the count a run last
     // began to wait at: a run waits for good while the two agree.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) woken: u64,
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) waits_since: Option<u64>,
 }
 
 #[derive(Debug)]
-pub(crate) struct Kept {
+pub struct Kept {
     leaf: Leaf,
-    pub(crate) coverage: Coverage,
+    pub coverage: Coverage,
     // The length, once its member closed, and whether nothing more will
     // come at all, not even a repair: what is missing then is lost.
-    pub(crate) closed: Option<u64>,
+    pub closed: Option<u64>,
     // The length its member declared, known before it closes: where a run
     // that reads a set from its tail finds the tail while the volume grows.
-    pub(crate) sized: Option<u64>,
+    pub sized: Option<u64>,
     // The length the volume last closed at, kept across a reopen: a run
     // that read past the volume built on it until it closes at another.
     pub(crate) closed_at: Option<u64>,
-    pub(crate) settled: bool,
+    pub settled: bool,
     // Its object holds it at a place a byte still owed may move it from
     // (`Engine::placed`): the run reads none of it until the place settles.
     pub(crate) open: bool,
     // How far the run has read, which a repair behind it invalidates.
-    pub(crate) reached: u64,
+    pub reached: u64,
     // The closed length the run read, a dependency even before any payload
     // byte of this volume was read. Only another closed length breaks it.
-    pub(crate) length_read: Option<u64>,
+    pub length_read: Option<u64>,
 }
 
 // The file an envelope is kept in: its name, how many bytes it holds, and
@@ -206,27 +271,33 @@ impl Kept {
 }
 
 impl Envelopes {
-    pub(crate) fn new(working_dir: PathBuf) -> Self {
+    pub fn new(working_dir: PathBuf) -> Self {
         Self {
             working_dir,
             to: None,
             given: Given::default(),
             shelves: BTreeMap::new(),
             marks: Marks::default(),
+            watch: Arc::default(),
             #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             blocked: Arc::default(),
         }
     }
 
+    // What the job asks through to hear of a run beginning to wait.
+    pub fn watch(&self) -> &Watch {
+        &self.watch
+    }
+
     // What rings as a run begins to wait on one of the shelves.
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-    pub(crate) fn blocked(&self) -> Arc<tokio::sync::Notify> {
+    pub fn blocked(&self) -> Arc<tokio::sync::Notify> {
         Arc::clone(&self.blocked)
     }
 
     // Envelopes made from here on are written through `to`. Set before
     // anything is kept.
-    pub(crate) fn write_through(
+    pub fn write_through(
         &mut self,
         to: Option<Arc<weaver_server_disk::operations::disk::writer::Submitter>>,
     ) {
@@ -241,10 +312,11 @@ impl Envelopes {
     }
 
     // The node's shelf, made empty the first time it is asked for.
-    pub(crate) fn shelf(&mut self, node: NodeId) -> Arc<Shelf> {
+    pub fn shelf(&mut self, node: NodeId) -> Arc<Shelf> {
         let dir = &self.working_dir;
         let to = &self.to;
         let given = &self.given;
+        let watch = &self.watch;
         #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         let blocked = &self.blocked;
         Arc::clone(self.shelves.entry(node).or_insert_with(|| {
@@ -256,6 +328,7 @@ impl Envelopes {
                 state: Mutex::default(),
                 changed: Condvar::new(),
                 readers: Mutex::default(),
+                watch: Arc::clone(watch),
                 #[cfg(any(test, feature = "pipeline-test-fixtures"))]
                 blocked: Arc::clone(blocked),
             })
@@ -297,7 +370,7 @@ impl Envelopes {
     // mending damage, behind what a run already read stops that run, since
     // its output used superseded input. A further clean copy of clean bytes
     // never reaches here: the first copy stands.
-    pub(crate) fn keep(
+    pub fn keep(
         &mut self,
         node: NodeId,
         envelope: u32,
@@ -325,13 +398,7 @@ impl Envelopes {
 
     // Append the bytes of `range` of an envelope to `into`, or nothing and
     // `false` when any of them were never kept.
-    pub(crate) fn read(
-        &self,
-        node: NodeId,
-        envelope: u32,
-        range: ByteRange,
-        into: &mut Vec<u8>,
-    ) -> bool {
+    pub fn read(&self, node: NodeId, envelope: u32, range: ByteRange, into: &mut Vec<u8>) -> bool {
         match self.shelves.get(&node) {
             Some(shelf) => shelf.read(envelope, range, into),
             None => range.is_empty(),
@@ -417,7 +484,7 @@ impl Envelopes {
     // An envelope the object at `node` gave back with its volume leaves the
     // shelf, file and all: the file, at the volume's own offsets, is what
     // the object kept of the volume. Nothing is read or copied.
-    pub(crate) fn take(&mut self, node: NodeId, envelope: u32) -> Option<Kept> {
+    pub fn take(&mut self, node: NodeId, envelope: u32) -> Option<Kept> {
         let shelf = self.shelves.get(&node)?;
         let kept = shelf.update(|state| {
             // Removing a volume changes the order already-read input used.
@@ -458,7 +525,7 @@ impl Envelopes {
     // End storage access before completion unlinks consumed volumes or
     // moves outputs. Keep the facts for reporting, but invalidate readers
     // and drain their handles before returning storage to completion.
-    pub(crate) fn release_handles(&mut self) {
+    pub fn release_handles(&mut self) {
         for shelf in self.shelves.values() {
             shelf.update(|state| {
                 state.generation += 1;
@@ -470,8 +537,8 @@ impl Envelopes {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn open_files(&self) -> Vec<PathBuf> {
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn open_files(&self) -> Vec<PathBuf> {
         self.shelves
             .values()
             .flat_map(|shelf| {
@@ -489,7 +556,7 @@ impl Envelopes {
     // The node is gone, and its envelopes with it. A run still reading them
     // is stopped first. Their files are returned, not removed: the last
     // checkpoint the database holds may still name them.
-    pub(crate) fn forget(&mut self, node: NodeId) -> Vec<Leaf> {
+    pub fn forget(&mut self, node: NodeId) -> Vec<Leaf> {
         let Some(shelf) = self.shelves.remove(&node) else {
             return Vec::new();
         };
@@ -512,12 +579,12 @@ impl Drop for Envelopes {
 }
 
 // The shelves this thread locked, by node, for a test to read back.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 thread_local! {
-    pub(crate) static LOCKED: std::cell::RefCell<Vec<NodeId>> =
+    pub static LOCKED: std::cell::RefCell<Vec<NodeId>> =
         const { std::cell::RefCell::new(Vec::new()) };
     // The most bytes one read of a kept envelope asked for on this thread.
-    pub(crate) static READ_MOST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub static READ_MOST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 impl Shelf {
@@ -556,20 +623,17 @@ impl Shelf {
         });
     }
 
-    pub(crate) fn lock(&self) -> MutexGuard<'_, Shelved> {
-        #[cfg(test)]
+    pub fn lock(&self) -> MutexGuard<'_, Shelved> {
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         LOCKED.with_borrow_mut(|locked| locked.push(self.node));
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     // Change the shelf and wake whoever waits on it.
-    pub(crate) fn update<R>(&self, change: impl FnOnce(&mut Shelved) -> R) -> R {
+    pub fn update<R>(&self, change: impl FnOnce(&mut Shelved) -> R) -> R {
         let mut state = self.lock();
         let result = change(&mut state);
-        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-        {
-            state.woken += 1;
-        }
+        state.woken += 1;
         drop(state);
         self.changed.notify_all();
         result
@@ -585,7 +649,6 @@ impl Shelf {
         let mut state = self.lock();
         let result = change(&mut state);
         let wakes = !matches!(result, Ok(false));
-        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         if wakes {
             state.woken += 1;
         }
@@ -597,37 +660,29 @@ impl Shelf {
     }
 
     // Wait for the shelf to change; the guard is given back once it did.
-    pub(crate) fn wait<'a>(
-        &self,
-        #[cfg_attr(not(any(test, feature = "pipeline-test-fixtures")), expect(unused_mut))]
-        mut state: MutexGuard<'a, Shelved>,
-    ) -> MutexGuard<'a, Shelved> {
+    // The wait is recorded before the job's watch is read, both under the
+    // lock: a job that asked to hear of it is told once.
+    pub(crate) fn wait<'a>(&self, mut state: MutexGuard<'a, Shelved>) -> MutexGuard<'a, Shelved> {
+        state.waits_since = Some(state.woken);
+        self.watch.began_to_wait(self.node, state.generation);
         #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-        {
-            state.waits_since = Some(state.woken);
-            self.blocked.notify_one();
-        }
-        #[cfg_attr(not(any(test, feature = "pipeline-test-fixtures")), expect(unused_mut))]
+        self.blocked.notify_one();
         let mut state = self
             .changed
             .wait(state)
             .unwrap_or_else(PoisonError::into_inner);
-        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-        {
-            state.waits_since = None;
-        }
+        state.waits_since = None;
         state
     }
 
     // Whether a run waits on the shelf for a change that has not come.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-    pub(crate) fn blocked(&self) -> bool {
+    pub fn blocked(&self) -> bool {
         let state = self.lock();
         state.waits_since == Some(state.woken)
     }
 
     // A volume's entry, made the first time anything is said of it.
-    pub(crate) fn kept<'a>(
+    pub fn kept<'a>(
         &self,
         state: &'a mut Shelved,
         envelope: u32,
@@ -664,7 +719,7 @@ impl Shelf {
             return range.is_empty();
         };
         let len = usize::try_from(range.len()).expect("an envelope range fits the address space");
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         READ_MOST.set(READ_MOST.get().max(range.len()));
         kept.coverage.covered(range)
             && match aside {
@@ -684,7 +739,7 @@ impl Shelf {
     }
 
     // Whether any byte of any volume is in.
-    pub(crate) fn has_bytes(&self) -> bool {
+    pub fn has_bytes(&self) -> bool {
         self.lock()
             .kept
             .values()
@@ -692,7 +747,7 @@ impl Shelf {
     }
 
     // The furthest volume a run reached, and how far into it.
-    pub(crate) fn reached(&self) -> Option<(VolumeIndex, u64)> {
+    pub fn reached(&self) -> Option<(VolumeIndex, u64)> {
         self.lock()
             .kept
             .iter()
@@ -701,20 +756,20 @@ impl Shelf {
             .map(|(volume, kept)| (VolumeIndex(*volume), kept.reached))
     }
 
-    pub(crate) fn generation(&self) -> u64 {
+    pub fn generation(&self) -> u64 {
         self.lock().generation
     }
 
     // The bytes the run read are good, but the object now knows something
     // the run was started without, a password: the run stops, and its owner
     // starts one over the same bytes.
-    pub(crate) fn restart(&self) {
+    pub fn restart(&self) {
         self.update(|state| state.generation += 1);
     }
 
     // A fresh run reads from the start: what an earlier one read is
     // forgotten, and the generation it reads under is the shelf's.
-    pub(crate) fn begin(&self) -> u64 {
+    pub fn begin(&self) -> u64 {
         self.update(|state| {
             for kept in state.kept.values_mut() {
                 kept.reached = 0;
@@ -727,7 +782,7 @@ impl Shelf {
 
 // The file an envelope of `node` numbered `envelope` sits in, unless a
 // checkpoint says another.
-pub(crate) fn envelope_name(node: NodeId, envelope: u32) -> String {
+pub fn envelope_name(node: NodeId, envelope: u32) -> String {
     format!(
         "{}/graph-envelope-{}-{envelope}",
         weaver_graph::names::INTERNAL_DIR,
@@ -745,13 +800,13 @@ pub(crate) fn envelope_name(node: NodeId, envelope: u32) -> String {
 // Nothing waits here, and a name is asked for once for each new file kept
 // aside, never for each article.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct Given(Arc<Mutex<HashMap<PathBuf, HashSet<String>>>>);
+pub struct Given(Arc<Mutex<HashMap<PathBuf, HashSet<String>>>>);
 
 impl Given {
     // `name` under `dir`, or the first free one after it: one no file sits
     // at and none was given since the directory's writer was last idle.
     // With no writer the disk says it all, and nothing is kept.
-    pub(crate) fn free(
+    pub fn free(
         &self,
         to: Option<&Arc<weaver_server_disk::operations::disk::writer::Submitter>>,
         dir: &Path,
@@ -782,7 +837,7 @@ impl Given {
 // `name`, or, while a file still sits there, the first free one after it:
 // one a member given back sits at waiting to move, or one that goes once a
 // checkpoint commits. Nothing is written over a file that sits anywhere.
-pub(crate) fn free_name(dir: &Path, name: &str) -> String {
+pub fn free_name(dir: &Path, name: &str) -> String {
     if !dir.join(name).exists() {
         return name.to_owned();
     }

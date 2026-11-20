@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 
-use weaver_server_pipeline::JobStatus;
+use weaver_server_composition::JobStatus;
 use weaver_server_pipeline::pipeline::tests::engines::recovery_duplicate_wire::{
     Protection, Witness, drive_wire,
 };

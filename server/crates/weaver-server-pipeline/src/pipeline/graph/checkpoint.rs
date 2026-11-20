@@ -60,46 +60,46 @@ use weaver_server_base::jobs::ids::JobId;
 // makes.
 const ROOT_KIND: &str = "root";
 
-pub(crate) const CHECKPOINT_BYTES: u64 = 256 * 1024 * 1024;
-pub(crate) const CHECKPOINT_AGE: Duration = Duration::from_secs(5);
+pub const CHECKPOINT_BYTES: u64 = 256 * 1024 * 1024;
+pub const CHECKPOINT_AGE: Duration = Duration::from_secs(5);
 
 // A job's checkpoint, as a restore reads it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Snapshot {
-    pub(crate) tree: TreeRecord,
-    pub(crate) root: RootFacts,
+pub struct Snapshot {
+    pub tree: TreeRecord,
+    pub root: RootFacts,
     // What the writer holds of each member it holds anything of.
-    pub(crate) files: BTreeMap<(NodeId, MemberId), FileState>,
-    pub(crate) kept: Vec<KeptRecord>,
+    pub files: BTreeMap<(NodeId, MemberId), FileState>,
+    pub kept: Vec<KeptRecord>,
     // The holds each namespace had paged to scratch.
-    pub(crate) holds: Vec<HoldRecord>,
+    pub holds: Vec<HoldRecord>,
     // The candidate each node was offered last, by index.
-    pub(crate) passwords: BTreeMap<NodeId, usize>,
+    pub passwords: BTreeMap<NodeId, usize>,
 }
 
 // A hold of the namespace at `node` paged to its scratch file, or,
 // `on_file`, in its member's spill file at its own offset.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct HoldRecord {
-    pub(crate) node: NodeId,
-    pub(crate) held: ScratchHold,
-    pub(crate) on_file: bool,
+pub struct HoldRecord {
+    pub node: NodeId,
+    pub held: ScratchHold,
+    pub on_file: bool,
 }
 
 // The generations a checkpoint read the job at: of the tree, of the
 // writer's files, of its kept envelopes, and of the offers of candidates.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Generations {
-    pub(crate) tree: u64,
-    pub(crate) files: u64,
-    pub(crate) kept: u64,
-    pub(crate) offered: u64,
+pub struct Generations {
+    pub tree: u64,
+    pub files: u64,
+    pub kept: u64,
+    pub offered: u64,
 }
 
 // The generations a checkpoint read a node's members at: of its namespace,
 // and of the writer's files of them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct MemberGenerations {
+pub struct MemberGenerations {
     pub(crate) namespace: u64,
     pub(crate) files: u64,
 }
@@ -109,11 +109,11 @@ pub(crate) struct MemberGenerations {
 // its namespace marked, which members' files the writer marked or its holds,
 // and its kept envelopes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Touched {
-    pub(crate) own: bool,
-    pub(crate) members: bool,
-    pub(crate) files: bool,
-    pub(crate) kept: bool,
+pub struct Touched {
+    pub own: bool,
+    pub members: bool,
+    pub files: bool,
+    pub kept: bool,
 }
 
 impl Touched {
@@ -124,7 +124,7 @@ impl Touched {
         kept: true,
     };
 
-    fn merge(&mut self, other: Self) {
+    pub fn merge(&mut self, other: Self) {
         self.own |= other.own;
         self.members |= other.members;
         self.files |= other.files;
@@ -134,17 +134,17 @@ impl Touched {
 
 // What the writer holds of one member.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct FileState {
-    pub(crate) has_file: bool,
+pub struct FileState {
+    pub has_file: bool,
     // The name the file sits at while it waits to move to the member's
     // output name.
-    pub(crate) on_disk: Option<String>,
+    pub on_disk: Option<String>,
     // Why it is a leaf, when something refused to own it.
-    pub(crate) refused: Option<Why>,
+    pub refused: Option<Why>,
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum CheckpointError {
+pub enum CheckpointError {
     #[error("the checkpoint has no root row")]
     NoRoot,
     #[error("node {node}: {reason}")]
@@ -156,7 +156,7 @@ pub(crate) enum CheckpointError {
 // A job's checkpoints on their way to the database: the rows the database
 // holds once what is queued is written, and the change queued for it.
 #[derive(Clone, Default)]
-pub(crate) struct Pending(Arc<Writer>);
+pub struct Pending(Arc<Writer>);
 
 #[derive(Default)]
 struct Writer {
@@ -190,7 +190,7 @@ impl Drop for Writer {
 }
 
 #[derive(Default)]
-struct Slot {
+pub struct Slot {
     control: CheckpointControl,
     root: facts::Encoded,
     // The root's facts parts as `root` last encoded them, by part: what the
@@ -215,15 +215,15 @@ struct Slot {
     // not bear out. Two at most: the first waits on a barrier that does
     // not move, the second takes every later change and the latest
     // barrier, so a job that keeps writing still gets its checkpoints out.
-    gated: std::collections::VecDeque<Gated>,
+    pub gated: std::collections::VecDeque<Gated>,
     // The stamp of the last checkpoint that reached `queued`.
     released: u64,
     // A write was asked for at once while every change was still gated.
     forced: bool,
     oldest: Option<tokio::time::Instant>,
-    dirty_bytes: u64,
-    enqueued: bool,
-    timer: Option<tokio::task::JoinHandle<()>>,
+    pub dirty_bytes: u64,
+    pub enqueued: bool,
+    pub timer: Option<tokio::task::JoinHandle<()>>,
     // When the first step since the last checkpoint ran, while none has
     // been taken of it, and the wake that mails the job's actor to take
     // one once it is due.
@@ -235,7 +235,7 @@ struct Slot {
     // checkpoint through that stamp is in the database.
     asked: u64,
     // The last stamp a write committed.
-    committed: u64,
+    pub committed: u64,
     // A write failed, so the database holds less than the stamps say until
     // a write of the whole job commits.
     lost: bool,
@@ -247,14 +247,14 @@ struct Slot {
 }
 
 // A change held until the disk bears it out.
-struct Gated {
+pub struct Gated {
     delta: Delta,
     stamp: u64,
     // `None` for a change that a later checkpoint must correct before it
     // may be written: it takes that checkpoint's barrier.
     barrier: Option<super::disk::JobBarrier>,
     // The job is told when `barrier` returns.
-    told: bool,
+    pub told: bool,
     // The decoded bytes the change spares a restore, said once it is
     // released.
     settled: u64,
@@ -440,7 +440,7 @@ impl HeldNode {
     }
 
     // Every row, each table in key order.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     fn rows(&self) -> GraphCheckpoint {
         let mut out = self.own.clone();
         for member in self.members.values() {
@@ -458,7 +458,7 @@ impl HeldNode {
 // changing its provenance does not count the same bytes again. Count every
 // member, so an extractor making progress without another article arriving
 // still reaches the byte barrier.
-fn added_coverage(before: &[CoverageRow], after: &[CoverageRow]) -> u64 {
+pub fn added_coverage(before: &[CoverageRow], after: &[CoverageRow]) -> u64 {
     let mut before = before.iter().peekable();
     let mut bytes = 0_u64;
     for row in after {
@@ -481,13 +481,13 @@ fn added_coverage(before: &[CoverageRow], after: &[CoverageRow]) -> u64 {
 }
 
 // How many members' rows the checkpoints taken on this thread built.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 thread_local! {
     static MEMBER_ROWS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(test)]
-pub(super) fn member_rows_built() -> usize {
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+pub fn member_rows_built() -> usize {
     MEMBER_ROWS_BUILT.with(std::cell::Cell::get)
 }
 
@@ -495,26 +495,26 @@ pub(super) fn member_rows_built() -> usize {
 // taken: how many were taken, how many rows they changed, and how many bytes
 // of facts they wrote.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Tally {
-    pub(crate) checkpoints: usize,
-    pub(crate) rows: usize,
+pub struct Tally {
+    pub checkpoints: usize,
+    pub rows: usize,
     pub(crate) facts: usize,
 }
 
 impl Pending {
-    pub(crate) fn control(&self) -> CheckpointControl {
+    pub fn control(&self) -> CheckpointControl {
         self.slot().control.clone()
     }
 
-    fn slot(&self) -> std::sync::MutexGuard<'_, Slot> {
+    pub fn slot(&self) -> std::sync::MutexGuard<'_, Slot> {
         self.0.slot.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     // Queue what this checkpoint changes, the job's spooled held parts
     // `held_parts` with it, in key order; true when a write must be queued
     // to take it.
-    #[cfg(test)]
-    pub(super) fn put(&self, job: &GraphJob, held_parts: Vec<HeldPartRow>) -> bool {
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn put(&self, job: &GraphJob, held_parts: Vec<HeldPartRow>) -> bool {
         self.put_with_feed(job, held_parts, None)
     }
 
@@ -592,7 +592,7 @@ impl Pending {
                 }
             }
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         audit(job, held);
         let was = GraphCheckpoint {
             held_parts: std::mem::take(&mut held.held_parts),
@@ -700,7 +700,7 @@ impl Pending {
     // The change a write takes, and the stamp of the last checkpoint it
     // carries: every checkpoint through it is in the database once the
     // write commits.
-    pub(super) fn take(&self) -> (Option<Delta>, u64) {
+    pub fn take(&self) -> (Option<Delta>, u64) {
         let mut slot = self.slot();
         Self::release(&mut slot);
         // A write that takes everything carries whatever forced it.
@@ -745,7 +745,7 @@ impl Pending {
     }
 
     // Whether a change waits for a volume's writer.
-    pub(in crate::pipeline) fn gated(&self) -> bool {
+    pub fn gated(&self) -> bool {
         !self.slot().gated.is_empty()
     }
 
@@ -787,7 +787,7 @@ impl Pending {
     // The job came back from the database's rows, on disk as `job` stands
     // now: every checkpoint so far names that.
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn restored(&self, job: &GraphJob) {
         let on_disk = job.on_disk();
         let mut slot = self.slot();
@@ -799,12 +799,12 @@ impl Pending {
     }
 
     // Whether a step ran that no checkpoint has read.
-    fn unread_steps(&self) -> bool {
+    pub fn unread_steps(&self) -> bool {
         self.slot().stepped.is_some()
     }
 
     // A step wrote `bytes` of the job's coverage.
-    pub(crate) fn delivered(&self, bytes: u64) {
+    pub fn delivered(&self, bytes: u64) {
         let mut slot = self.slot();
         slot.dirty_bytes = slot.dirty_bytes.saturating_add(bytes);
     }
@@ -813,7 +813,7 @@ impl Pending {
     // write it joins would be. The first checkpoint is, and so is one after
     // the database's rows were lost. Otherwise the run mail hears once the
     // first step not yet taken is CHECKPOINT_AGE old.
-    pub(crate) fn stepped(&self, job_id: JobId, mail: &UnboundedSender<Said>) -> bool {
+    pub fn stepped(&self, job_id: JobId, mail: &UnboundedSender<Said>) -> bool {
         let mut slot = self.slot();
         let first = *slot.stepped.get_or_insert_with(tokio::time::Instant::now);
         // A change that waits too long joins the steps since, so its write
@@ -847,14 +847,14 @@ impl Pending {
     }
 
     // The stamp of the last checkpoint that changed anything.
-    pub(crate) fn stamp(&self) -> u64 {
+    pub fn stamp(&self) -> u64 {
         self.slot().asked
     }
 
     // A move waits on the checkpoint `stamp`: the last stamp committed when
     // it already has, and otherwise the mail says so once it does, or once
     // a write fails.
-    pub(in crate::pipeline) fn await_commit(
+    pub fn await_commit(
         &self,
         stamp: u64,
         scope: u64,
@@ -878,7 +878,7 @@ impl Pending {
 
     // A write committed every checkpoint through `stamp`; `whole` when it
     // wrote the whole job.
-    fn committed(&self, stamp: u64, whole: bool) {
+    pub fn committed(&self, stamp: u64, whole: bool) {
         let mut slot = self.slot();
         if whole {
             slot.lost = false;
@@ -945,11 +945,11 @@ impl Pending {
     }
 
     // Whether no checkpoint is taken of the job any more.
-    pub(in crate::pipeline) fn given_up(&self) -> bool {
+    pub fn given_up(&self) -> bool {
         self.slot().control.cancelled()
     }
 
-    fn forget(&self) {
+    pub fn forget(&self) {
         let mut slot = self.slot();
         slot.control.cancel();
         slot.held = None;
@@ -976,7 +976,7 @@ impl Pending {
     // checkpoints are one `Pending`, told this before it takes any, so its
     // encoder has read nothing and the next encoding reads the root whole
     // and is compared with them.
-    pub(crate) fn written(&self, rows: GraphCheckpoint) {
+    pub fn written(&self, rows: GraphCheckpoint) {
         let mut slot = self.slot();
         slot.feed_verdict = rows.feed_verdict;
         let root = i64::from(NodeId::ROOT.0);
@@ -1034,7 +1034,7 @@ impl Pending {
     // The decoded bytes the rows the database holds, once what is queued is
     // written, spare a restore fetching again; 0 while what it holds is not
     // known.
-    pub(crate) fn in_hand_bytes(&self) -> u64 {
+    pub fn in_hand_bytes(&self) -> u64 {
         self.slot()
             .held
             .as_ref()
@@ -1046,7 +1046,7 @@ impl Pending {
     // root facts it had already decoded, and kept until this run's first
     // checkpoint says it instead. The articles in `refetched` are ones the
     // restore found not on disk and fetches again: they are not in hand.
-    pub(crate) fn stored_settled(&self, root: &RootFacts, refetched: &[(VolumeIndex, u32)]) {
+    pub fn stored_settled(&self, root: &RootFacts, refetched: &[(VolumeIndex, u32)]) {
         let again: std::collections::HashSet<(u32, u32)> = refetched
             .iter()
             .map(|(volume, ordinal)| (volume.0, *ordinal))
@@ -1075,10 +1075,7 @@ impl Pending {
     // job restored and not yet checkpointed in this run, what its restore
     // took from the stored checkpoint. None while no checkpoint was taken
     // from the job.
-    pub(in crate::pipeline) fn checkpoint_settled(
-        &self,
-        volume: usize,
-    ) -> std::collections::HashSet<u32> {
+    pub fn checkpoint_settled(&self, volume: usize) -> std::collections::HashSet<u32> {
         let slot = self.slot();
         if slot.held.is_none() {
             return std::collections::HashSet::new();
@@ -1106,13 +1103,13 @@ impl Pending {
     }
 
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-    pub(crate) fn tally(&self) -> Tally {
+    pub fn tally(&self) -> Tally {
         self.slot().tally
     }
 }
 
 impl Pipeline {
-    pub(in crate::pipeline) fn cancel_graph_checkpoint_retries(&self, job_id: JobId) {
+    pub fn cancel_graph_checkpoint_retries(&self, job_id: JobId) {
         if let Some(graph) = self
             .graph_jobs
             .get(&job_id)
@@ -1139,7 +1136,7 @@ impl Pipeline {
 
     // Called only after the ordered archive command answered: every old
     // checkpoint and its completion callback has relinquished this job.
-    pub(in crate::pipeline) fn recover_cancelled_graph_checkpoint(&mut self, job_id: JobId) {
+    pub fn recover_cancelled_graph_checkpoint(&mut self, job_id: JobId) {
         // A job held for a full disk has only a graph that says more than
         // its files hold, still to hear its mail: no checkpoint is taken of
         // it. The job goes on from the checkpoint it was held at.
@@ -1314,7 +1311,7 @@ impl Pipeline {
 
     // Queue the job's change for the database now, the steps not yet
     // taken in it first.
-    pub(in crate::pipeline) fn flush_graph_checkpoint(&mut self, job_id: JobId) {
+    pub fn flush_graph_checkpoint(&mut self, job_id: JobId) {
         self.take_stepped_graph_checkpoint(job_id);
         if let Some(graph) = self.graph_jobs.get(&job_id) {
             graph
@@ -1338,7 +1335,7 @@ impl Pipeline {
 // The steps stay unread and the checkpoint is owed, so nothing more goes
 // out until one is recorded, and the step that takes the object back takes
 // it. A forced one still queues at once what earlier checkpoints recorded.
-pub(crate) fn checkpoint_job(
+pub fn checkpoint_job(
     graph: &mut GraphJob,
     job_id: JobId,
     db: &crate::Database,
@@ -1372,7 +1369,7 @@ pub(crate) fn checkpoint_job(
 
 impl Pending {
     // The disk bears out a change that waited for it: queue its write.
-    pub(in crate::pipeline) fn queue_released(
+    pub fn queue_released(
         &self,
         db: &crate::Database,
         job_id: JobId,
@@ -1385,7 +1382,7 @@ impl Pending {
 
     // Queue the write that takes the job's waiting change, if any, and says
     // what it committed. A write dropped before it runs has failed.
-    fn queue(
+    pub fn queue(
         &self,
         db: &crate::Database,
         job_id: JobId,
@@ -1590,7 +1587,7 @@ fn root_parts(held: &mut BTreeMap<i64, Arc<[u8]>>, parts: Parts) -> Changes<Part
     out
 }
 
-fn part_rows(node: i64, parts: Vec<Part>) -> impl Iterator<Item = PartRow> {
+pub fn part_rows(node: i64, parts: Vec<Part>) -> impl Iterator<Item = PartRow> {
     parts.into_iter().map(move |part| PartRow {
         node,
         // The key's bits, as the column's integer.
@@ -1599,7 +1596,7 @@ fn part_rows(node: i64, parts: Vec<Part>) -> impl Iterator<Item = PartRow> {
     })
 }
 
-fn root_row(version: u16, facts: Vec<u8>) -> NodeRow {
+pub fn root_row(version: u16, facts: Vec<u8>) -> NodeRow {
     NodeRow {
         node: i64::from(NodeId::ROOT.0),
         parent: None,
@@ -1617,7 +1614,7 @@ fn root_row(version: u16, facts: Vec<u8>) -> NodeRow {
 
 // The rows the job has now of one node: its own, as `node_rows` takes
 // them, its kept envelopes' and its holds on scratch.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 fn job_rows(job: &GraphJob, node: NodeId) -> GraphCheckpoint {
     let mut out = job
         .node(node)
@@ -1635,7 +1632,7 @@ fn job_rows(job: &GraphJob, node: NodeId) -> GraphCheckpoint {
 
 // The rows a step keeps match the job's, read whole: a change that marked
 // nothing a step reads again shows here.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 fn audit(job: &GraphJob, held: &Held) {
     let mut nodes: std::collections::BTreeSet<i64> = held.nodes.keys().copied().collect();
     job.visit_touched_since(Generations::default(), |node, _| {
@@ -1657,7 +1654,7 @@ fn audit(job: &GraphJob, held: &Held) {
 }
 
 // A namespace's holds on disk, in key order, as the ledger lists them.
-fn hold_rows(node: NodeId, holds: &[(ScratchHold, bool)]) -> Vec<HoldRow> {
+pub fn hold_rows(node: NodeId, holds: &[(ScratchHold, bool)]) -> Vec<HoldRow> {
     let node = i64::from(node.0);
     let mut out: Vec<HoldRow> = holds
         .iter()
@@ -1677,7 +1674,7 @@ fn hold_rows(node: NodeId, holds: &[(ScratchHold, bool)]) -> Vec<HoldRow> {
 // A node's own rows, each table in key order: its own row and facts parts
 // when it holds an object, and its seeds. `password` is the candidate the
 // node was offered last.
-fn own_rows(node: NodeRecord, password: Option<i64>) -> GraphCheckpoint {
+pub fn own_rows(node: NodeRecord, password: Option<i64>) -> GraphCheckpoint {
     let mut out = GraphCheckpoint::default();
     let id = i64::from(node.node.0);
     if let (Some(kind), Some(facts)) = (node.kind, node.facts) {
@@ -1718,13 +1715,13 @@ fn own_rows(node: NodeRecord, password: Option<i64>) -> GraphCheckpoint {
 
 // One member's rows: its row and its coverage, in key order. `state` says
 // what the writer holds of it.
-fn member_rows(
+pub fn member_rows(
     node: i64,
     member: MemberRecord,
     coverage: Vec<CoverageRecord>,
     state: FileState,
 ) -> GraphCheckpoint {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     MEMBER_ROWS_BUILT.with(|built| built.set(built.get() + 1));
     let mut out = GraphCheckpoint {
         members: vec![member_row(node, member, state)],
@@ -1767,7 +1764,7 @@ fn member_row(node: i64, member: MemberRecord, state: FileState) -> MemberRow {
 
 // A lifted member's position, its member ids from the root down, as the
 // row keeps it: `0.3.1`.
-fn position_text(position: &[MemberId]) -> String {
+pub fn position_text(position: &[MemberId]) -> String {
     position
         .iter()
         .map(|member| member.0.to_string())
@@ -1796,17 +1793,114 @@ fn coverage_row(node: i64, run: &CoverageRecord) -> CoverageRow {
 // One node's rows, each table in key order: its own, as `own_rows` takes
 // them, and its members and their coverage. `files` says what the writer
 // holds of each member, `password` the candidate the node was offered last.
-#[cfg(test)]
-fn node_rows(
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+pub fn node_rows(
     node: &NodeRecord,
     files: impl Fn(MemberId) -> FileState,
     password: Option<i64>,
 ) -> GraphCheckpoint {
-    tests::borrowed_node_rows(node, files, password)
+    hooks::borrowed_node_rows(node, files, password)
+}
+
+// Test code kept beside the rows it checks: the audit after each step reads it.
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+#[doc(hidden)]
+pub mod hooks {
+    use std::sync::Arc;
+
+    use weaver_graph::{MemberId, NodeRecord};
+
+    use super::FileState;
+    use crate::jobs::graph_checkpoint::{GraphCheckpoint, PartRow, Row};
+
+    // The borrowed full-snapshot encoder, independent of incremental owned conversions.
+    pub fn borrowed_node_rows(
+        node: &NodeRecord,
+        files: impl Fn(MemberId) -> FileState,
+        password: Option<i64>,
+    ) -> GraphCheckpoint {
+        let id = i64::from(node.node.0);
+        let mut out = GraphCheckpoint::default();
+        if let (Some(kind), Some(facts)) = (node.kind, &node.facts) {
+            let volumes: Vec<(u32, u32)> = node
+                .volumes
+                .iter()
+                .map(|(volume, member)| (volume.0, member.0))
+                .collect();
+            out.nodes.push(super::NodeRow {
+                node: id,
+                parent: node.parent.map(|parent| i64::from(parent.0)),
+                parent_member: node.volumes.first().map(|(_, member)| i64::from(member.0)),
+                volumes: rmp_serde::to_vec(&volumes).ok(),
+                window: node
+                    .window
+                    .map(|window| (window.start as i64, window.end as i64)),
+                kind: kind.to_string(),
+                state: super::state_name(node.state).to_owned(),
+                reason: node.reason.map(super::why_text),
+                facts_version: i64::from(facts.version),
+                facts: facts.bytes.clone(),
+                winning_password: password,
+            });
+            out.parts.extend(facts.parts.iter().map(|part| PartRow {
+                node: id,
+                part: part.key as i64,
+                bytes: Arc::clone(&part.bytes),
+            }));
+        }
+        out.crypt
+            .extend(node.crypt.iter().map(|crypt| super::CryptRow {
+                node: id,
+                member: i64::from(crypt.member.0),
+                run_start: crypt.run_start,
+                seed: crypt.seed.to_vec(),
+            }));
+        out.members.extend(node.members.iter().map(|member| {
+            let state = files(member.member);
+            super::MemberRow {
+                node: id,
+                member: i64::from(member.member.0),
+                name: member.name.clone(),
+                output_name: member.output_name.clone(),
+                crc32: member.crc32.map(i64::from),
+                length: member.length.map(|length| length as i64),
+                closed: member.closed,
+                bound: member.bound_to.map(|object| i64::from(object.0)),
+                owner: member.owner.map(super::pair),
+                given_up: member.given_up.map(super::pair),
+                buried: member.buried,
+                undecided: member.undecided,
+                has_file: state.has_file,
+                on_disk: state.on_disk,
+                refused: state.refused.map(super::why_text),
+                copy_of: member.copy_of.map(|into| i64::from(into.0)),
+                refuted_kind: member.refuted.map(|kind| kind.to_string()),
+                lifted: member.lifted.as_ref().map(|lift| super::Lifted {
+                    node: i64::from(lift.node.0),
+                    member: i64::from(lift.member.0),
+                    position: super::position_text(&lift.position),
+                }),
+            }
+        }));
+        out.coverage
+            .extend(node.coverage.iter().map(|run| super::CoverageRow {
+                node: id,
+                member: i64::from(run.member.0),
+                start: run.start as i64,
+                end: run.end as i64,
+                provenance: super::provenance_name(run.provenance).to_owned(),
+                verified: false,
+            }));
+        out.members.sort_by_key(Row::key);
+        out.coverage.sort_by_key(Row::key);
+        out.crypt.sort_by_key(Row::key);
+        out.parts.sort_by_key(Row::key);
+        out
+    }
 }
 
 // The kept envelopes' rows, in key order.
-fn envelope_rows(kept: &[KeptRecord]) -> Vec<EnvelopeRow> {
+pub fn envelope_rows(kept: &[KeptRecord]) -> Vec<EnvelopeRow> {
     let mut out = Vec::new();
     for kept in kept {
         let row = |range: ByteRange, provenance| EnvelopeRow {
@@ -1829,7 +1923,7 @@ fn envelope_rows(kept: &[KeptRecord]) -> Vec<EnvelopeRow> {
     out
 }
 
-pub(crate) fn snapshot(rows: &GraphCheckpoint) -> Result<Snapshot, CheckpointError> {
+pub fn snapshot(rows: &GraphCheckpoint) -> Result<Snapshot, CheckpointError> {
     let root = rows
         .nodes
         .iter()
@@ -2111,7 +2205,7 @@ pub(crate) fn snapshot(rows: &GraphCheckpoint) -> Result<Snapshot, CheckpointErr
     })
 }
 
-fn pair((node, volume): (NodeId, VolumeIndex)) -> (i64, i64) {
+pub fn pair((node, volume): (NodeId, VolumeIndex)) -> (i64, i64) {
     (i64::from(node.0), i64::from(volume.0))
 }
 
@@ -2169,7 +2263,7 @@ fn kind_named(name: &str) -> Option<Kind> {
 }
 
 // The plan's node states: a live node is open, a retired one refused.
-fn state_name(state: NodeState) -> &'static str {
+pub fn state_name(state: NodeState) -> &'static str {
     match state {
         NodeState::Live => "open",
         NodeState::Retired => "refused",
@@ -2182,7 +2276,7 @@ fn state_named(name: &str) -> Option<NodeState> {
         .find(|state| state_name(*state) == name)
 }
 
-fn provenance_name(provenance: Provenance) -> &'static str {
+pub fn provenance_name(provenance: Provenance) -> &'static str {
     match provenance {
         Provenance::Fresh => "fresh",
         Provenance::Damaged => "damaged",
@@ -2204,7 +2298,7 @@ fn provenance_named(name: &str) -> Option<Provenance> {
     .find(|provenance| provenance_name(*provenance) == name)
 }
 
-pub(crate) const REASONS: [Why; 18] = [
+pub const REASONS: [Why; 18] = [
     Why::Compressed,
     Why::TailUnreachable,
     Why::EncryptedHeader,
@@ -2231,7 +2325,7 @@ pub(crate) const REASONS: [Why; 18] = [
     Why::Packed,
 ];
 
-pub(crate) fn why_name(why: Why) -> &'static str {
+pub fn why_name(why: Why) -> &'static str {
     match why {
         Why::Compressed => "compressed",
         Why::TailUnreachable => "tail_unreachable",
@@ -2259,7 +2353,7 @@ pub(crate) fn why_name(why: Why) -> &'static str {
 // `too_large:2147483648:-`; for a decode the machine cannot hold, what it
 // needed and the machine's memory, as `over_machine:68719476736:34359738368`;
 // for a set short of a volume, the volume, as `unfound:2`.
-pub(crate) fn why_text(why: Why) -> String {
+pub fn why_text(why: Why) -> String {
     let size = |size: Option<u64>| size.map_or_else(|| "-".to_owned(), |size| size.to_string());
     match why {
         Why::Unfound { volume } => format!("{}:{volume}", why_name(why)),
@@ -2273,7 +2367,7 @@ pub(crate) fn why_text(why: Why) -> String {
     }
 }
 
-fn why_named(text: &str) -> Option<Why> {
+pub fn why_named(text: &str) -> Option<Why> {
     let Some((name, sizes)) = text.split_once(':') else {
         return REASONS
             .into_iter()
@@ -2307,6 +2401,3 @@ fn why_named(text: &str) -> Option<Why> {
         _ => None,
     }
 }
-
-#[cfg(test)]
-mod tests;

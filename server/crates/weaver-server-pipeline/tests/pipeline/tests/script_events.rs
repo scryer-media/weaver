@@ -1,6 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use weaver_server_composition::post_processing::{
+    effects::{JobScriptEffects, PostProcessingEffectsQueries},
+    events::PostProcessingEventsCancelEventScriptsQueries,
+    instances::{InstanceTrigger, PostProcessingInstancesQueries, ScriptInstanceDraft},
+    model::{PostProcessingSettings, QueueEvent, ScriptEventLabel, ScriptName, ScriptStatus},
+    output::PostProcessingOutputQueries,
+    settings::PostProcessingSettingsQueries,
+};
+use weaver_server_composition::{JobId, JobStatus, StateError};
 use weaver_server_pipeline::pipeline::tests::{
     history_fixture::{check_completion, database, finished_jobs},
     insert_active_job, new_direct_pipeline,
@@ -9,15 +18,6 @@ use weaver_server_pipeline::pipeline::tests::{
     script_fixture::*,
     set_job_status_for_test, settle_failed_releases, standalone_job_spec,
 };
-use weaver_server_pipeline::post_processing::{
-    effects::{JobScriptEffects, PostProcessingEffectsQueries},
-    events::PostProcessingEventsCancelEventScriptsQueries,
-    instances::{InstanceTrigger, PostProcessingInstancesQueries, ScriptInstanceDraft},
-    model::{PostProcessingSettings, QueueEvent, ScriptEventLabel, ScriptName, ScriptStatus},
-    output::PostProcessingOutputQueries,
-    settings::PostProcessingSettingsQueries,
-};
-use weaver_server_pipeline::{JobId, JobStatus, StateError};
 
 #[tokio::test]
 async fn non_queue_script_does_not_publish_queue_wait_status() {

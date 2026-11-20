@@ -29,14 +29,14 @@ use super::{
 
 // How many times a job waiting for room asked again what its due sets
 // would rebuild.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 thread_local! {
-    pub(super) static HELD_RECHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub static HELD_RECHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 // Who a due set's repair is lent to, to run off the loop. One goes out at a
 // time, under a repair slot; its return comes back to `returned`.
-pub(crate) trait Lender {
+pub trait Lender {
     // Whether a repair may go out now.
     fn admit(&mut self) -> bool;
     fn lend(&mut self, loan: Loan);
@@ -44,22 +44,22 @@ pub(crate) trait Lender {
 
 // How many member names a bind kept to log what it newly covered, for the
 // tests that count them.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 thread_local! {
-    pub(super) static NAMES_KEPT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub static NAMES_KEPT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 // What one set says of the members it covers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct SetState {
+pub struct SetState {
     // The tree node the set's object is. One PAR2 object holds every PAR2
     // set of its namespace, so this is per object, not per set id.
     pub(crate) node: NodeId,
     // The namespace it lives in, where the members it covers are.
     pub(crate) namespace: NodeId,
-    pub(crate) kind: Kind,
+    pub kind: Kind,
     // What its last repair came to; `None` before it ran one.
-    pub(crate) outcome: Option<RepairOutcome>,
+    pub outcome: Option<RepairOutcome>,
 }
 
 // What the root still fetches unasked: whether a payload volume has an
@@ -67,9 +67,9 @@ pub(crate) struct SetState {
 // on what it has read, so one whose own volume is still arriving has its
 // ruling still to come, whatever it said of the part that came first.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Coming {
-    pub(crate) payload: bool,
-    pub(crate) sets: BTreeSet<NodeId>,
+pub struct Coming {
+    pub payload: bool,
+    pub sets: BTreeSet<NodeId>,
 }
 
 // The set a root member is an own volume of, if it is one.
@@ -83,7 +83,7 @@ impl NamespaceWriter {
     // What is still to come, from the root members with an article the
     // queue fetches unasked: a member that is a set's own volume names its
     // set, and any other is payload.
-    pub(crate) fn coming(&self, tree: &Tree, members: impl Iterator<Item = MemberId>) -> Coming {
+    pub fn coming(&self, tree: &Tree, members: impl Iterator<Item = MemberId>) -> Coming {
         let mut coming = Coming::default();
         let Some(root) = tree.namespace(NodeId::ROOT) else {
             return coming;
@@ -113,7 +113,7 @@ impl NamespaceWriter {
     }
 
     // Every set in the tree with the namespace it lives in, parents first.
-    pub(crate) fn sets(&self, tree: &Tree) -> Vec<(NodeId, NodeId)> {
+    pub fn sets(&self, tree: &Tree) -> Vec<(NodeId, NodeId)> {
         tree.live()
             .into_iter()
             .flat_map(|namespace| {
@@ -132,7 +132,7 @@ impl NamespaceWriter {
     // Of `sets`, a namespace's sets as the tree listed them, the ones that
     // cover the member. The namespace's sets are asked once and handed to
     // the work over each of its members.
-    pub(crate) fn covering<'t>(
+    pub fn covering<'t>(
         &'t self,
         tree: &'t Tree,
         sets: &'t [NodeId],
@@ -154,7 +154,7 @@ impl NamespaceWriter {
     }
 
     // The member is a set's own volume: recovery data, in its own file.
-    pub(crate) fn carries_recovery(&self, tree: &Tree, node: NodeId, member: MemberId) -> bool {
+    pub fn carries_recovery(&self, tree: &Tree, node: NodeId, member: MemberId) -> bool {
         tree.child_of(node, member)
             .is_some_and(|(child, _)| tree.recovers(child))
     }
@@ -171,7 +171,7 @@ impl NamespaceWriter {
     // nothing a set of it will rebuild is still to come. A set whose repair
     // is out has its ruling still to come, and so has one whose own volume
     // still has an article coming.
-    pub(crate) fn ruled(&self, tree: &Tree, node: NodeId, coming: &Coming) -> bool {
+    pub fn ruled(&self, tree: &Tree, node: NodeId, coming: &Coming) -> bool {
         let sets = tree.recovery_nodes(node);
         let aside = Aside::of(tree, &sets);
         sets.iter().copied().all(|set| {
@@ -191,7 +191,7 @@ impl NamespaceWriter {
     // that has not may cover a member yet, since it binds what it covers as
     // its own volumes arrive, and those can come after the member closed,
     // or rebuild a member that never came at all.
-    pub(crate) fn ended(&self, tree: &Tree, node: NodeId, coming: &Coming) -> bool {
+    pub fn ended(&self, tree: &Tree, node: NodeId, coming: &Coming) -> bool {
         !coming.payload && self.ruled(tree, node, coming)
     }
 
@@ -251,8 +251,8 @@ impl NamespaceWriter {
 
     // Every set of every namespace has ruled on something other than
     // waiting.
-    #[cfg(test)]
-    pub(crate) fn all_ruled(&self, tree: &Tree, coming: &Coming) -> bool {
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn all_ruled(&self, tree: &Tree, coming: &Coming) -> bool {
         tree.live()
             .into_iter()
             .all(|node| self.ruled(tree, node, coming))
@@ -314,7 +314,7 @@ impl NamespaceWriter {
     }
 
     // What each set last ruled, parents first; `None` for one that has not.
-    pub(crate) fn outcomes(&self, tree: &Tree) -> Vec<Option<RepairOutcome>> {
+    pub fn outcomes(&self, tree: &Tree) -> Vec<Option<RepairOutcome>> {
         self.sets(tree)
             .into_iter()
             .map(|(_, set)| tree.recovery(set).and_then(|recovery| recovery.outcome()))
@@ -352,7 +352,7 @@ impl NamespaceWriter {
     }
 
     // Each set the object at `set` holds, as its last repair left it.
-    pub(crate) fn rulings(&self, tree: &Tree, set: NodeId, out: &mut Vec<SetRuling>) {
+    pub fn rulings(&self, tree: &Tree, set: NodeId, out: &mut Vec<SetRuling>) {
         if let Some(recovery) = tree.recovery(set) {
             recovery.sets(out);
         }
@@ -383,7 +383,7 @@ impl NamespaceWriter {
     }
 
     // What a set is called: what the file that carries it is.
-    pub(crate) fn set_name<'t>(&self, tree: &'t Tree, set: NodeId) -> Option<&'t str> {
+    pub fn set_name<'t>(&self, tree: &'t Tree, set: NodeId) -> Option<&'t str> {
         tree.volumes(set)
             .and_then(|(parent, volumes)| tree.namespace(parent)?.get(*volumes.values().next()?))
             .map(|record| record.output_name.as_str())
@@ -407,7 +407,7 @@ impl NamespaceWriter {
     // member it will get, so the repair has a member to write it into.
     // `reading` says which namespaces' sources may still announce members.
     // A due set's repair goes to `lender`, as far as it admits one.
-    pub(crate) fn rule(
+    pub fn rule(
         &mut self,
         tree: &mut Tree,
         builder: &mut dyn Builder,
@@ -430,7 +430,7 @@ impl NamespaceWriter {
     // quiet, as a repair may still bring its bytes back. Every set where a
     // range lands is told it is refused, as far as its parent will never
     // bring it.
-    pub(crate) fn lost(
+    pub fn lost(
         &mut self,
         tree: &mut Tree,
         builder: &mut dyn Builder,
@@ -743,7 +743,7 @@ impl NamespaceWriter {
     // would write now: a file that arrived since is no longer theirs to
     // rebuild, and a set no longer due wants nothing. That is asked again
     // only once something it rests on changed, not on every walk.
-    pub(super) fn repair(
+    pub fn repair(
         &mut self,
         tree: &mut Tree,
         node: NodeId,
@@ -755,7 +755,7 @@ impl NamespaceWriter {
                 self.held_want = None;
             } else {
                 if !self.held_want_stands(tree, due) {
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
                     HELD_RECHECKS.with(|rechecks| rechecks.set(rechecks.get() + 1));
                     self.caps.rewant();
                     let mut absent = BTreeSet::new();
@@ -847,7 +847,7 @@ impl NamespaceWriter {
     // reconstructed fails explicitly and publishes none of its staged bytes.
     // The slices a repair applied rebuilt, when it rebuilt any: that return
     // is the one moment the repair is complete, said once.
-    pub(crate) fn returned(
+    pub fn returned(
         &mut self,
         tree: &mut Tree,
         builder: &mut dyn Builder,
@@ -934,7 +934,7 @@ impl NamespaceWriter {
                 causes = ?diagnostic.causes,
                 "recovery worker operation failed"
             );
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             self.diagnostics.push(diagnostic);
         }
         self.read_backs += reads;
@@ -1011,6 +1011,14 @@ impl NamespaceWriter {
                 return Err(error);
             }
             removed?;
+            // An SFV below the root whose namespace came out of volumes a
+            // recovery set above proved makes no claim of damage: every
+            // byte of what it lists is what was posted.
+            let found = if tree.kind(set) == Some(Kind::Sfv) && tree.vouched_above(node) {
+                Vec::new()
+            } else {
+                found
+            };
             for (member, range) in found {
                 let marked = (node, member, range, Provenance::Refuted);
                 self.redeliver(tree, builder, segments, marked, out)?;
@@ -1057,7 +1065,7 @@ impl NamespaceWriter {
     // The batch is down: each member it closed that is still closed in its
     // own file gets its verdict once, on the bytes it ends with. One the
     // batch reopened or handed to an object is judged when it closes again.
-    pub(super) fn acknowledged(
+    pub fn acknowledged(
         &mut self,
         tree: &mut Tree,
         builder: &mut dyn Builder,
@@ -1378,7 +1386,7 @@ impl NamespaceWriter {
     // covers for the first time is fed everything that arrived for it
     // before, so early segments are not lost. One recognised by content was
     // renamed in the namespace, and its file follows the new name.
-    pub(super) fn bind_recoveries(
+    pub fn bind_recoveries(
         &mut self,
         tree: &mut Tree,
         builder: &mut dyn Builder,
@@ -1428,7 +1436,7 @@ impl NamespaceWriter {
                         .iter()
                         .filter(|member| !recovery.covers(**member))
                         .map(|member| {
-                            #[cfg(test)]
+                            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
                             NAMES_KEPT.with(|kept| kept.set(kept.get() + 1));
                             let name = namespace
                                 .get(*member)
@@ -1757,7 +1765,7 @@ fn follow_founded(tree: &mut Tree, node: NodeId, sets: Vec<NodeId>) -> Vec<NodeI
 }
 
 // Leave out of `absent` every name some posting has.
-fn unposted<'a>(absent: &mut Vec<(String, u64)>, posted: impl Iterator<Item = &'a str>) {
+pub fn unposted<'a>(absent: &mut Vec<(String, u64)>, posted: impl Iterator<Item = &'a str>) {
     if absent.is_empty() {
         return;
     }
@@ -1767,7 +1775,7 @@ fn unposted<'a>(absent: &mut Vec<(String, u64)>, posted: impl Iterator<Item = &'
 
 // The names, each in ASCII lower case, so a name is looked up regardless
 // of ASCII case.
-fn folded(named: &[(String, u64)]) -> HashSet<String> {
+pub fn folded(named: &[(String, u64)]) -> HashSet<String> {
     named
         .iter()
         .map(|(name, _)| name.to_ascii_lowercase())
@@ -1776,7 +1784,7 @@ fn folded(named: &[(String, u64)]) -> HashSet<String> {
 
 // Whether `name` is one of the folded names regardless of ASCII case,
 // folded into `buffer`.
-fn names(folded: &HashSet<String>, name: &str, buffer: &mut String) -> bool {
+pub fn names(folded: &HashSet<String>, name: &str, buffer: &mut String) -> bool {
     buffer.clear();
     buffer.push_str(name);
     buffer.make_ascii_lowercase();
@@ -1788,7 +1796,7 @@ fn names(folded: &HashSet<String>, name: &str, buffer: &mut String) -> bool {
 // size to take it whole. Each cut once, in order. The smallest size that
 // cuts the range leads; a size it divides cuts nowhere new, and every other
 // size merges in by its next cut, so nothing is kept but the cuts made.
-pub(super) fn block_cuts(range: ByteRange, sizes: &mut [u64]) -> Vec<u64> {
+pub fn block_cuts(range: ByteRange, sizes: &mut [u64]) -> Vec<u64> {
     let first = |size: u64| {
         (range.start / size + 1)
             .checked_mul(size)
@@ -1834,56 +1842,4 @@ pub(super) fn block_cuts(range: ByteRange, sizes: &mut [u64]) -> Vec<u64> {
         }
     }
     cuts
-}
-
-#[cfg(test)]
-mod name_sets {
-    use super::{folded, names, unposted};
-
-    // Names drawn from a small alphabet that mixes ASCII case and a letter
-    // outside ASCII, so many collide only by case and some not at all.
-    fn names_of(seed: &mut u64, count: usize) -> Vec<String> {
-        const LETTERS: [&str; 7] = ["a", "A", "b", "B", ".", "é", "É"];
-        (0..count)
-            .map(|_| {
-                let mut name = String::new();
-                for _ in 0..3 {
-                    *seed = seed
-                        .wrapping_mul(6_364_136_223_846_793_005)
-                        .wrapping_add(1_442_695_040_888_963_407);
-                    name.push_str(LETTERS[(*seed >> 33) as usize % LETTERS.len()]);
-                }
-                name
-            })
-            .collect()
-    }
-
-    // The set lookups answer what comparing every pair of the two lists
-    // answered.
-    #[test]
-    fn a_name_set_answers_as_every_pair_compared() {
-        let mut seed = 7;
-        for round in 0..64 {
-            let absent: Vec<(String, u64)> = names_of(&mut seed, round % 9)
-                .into_iter()
-                .zip(0..)
-                .collect();
-            let posted = names_of(&mut seed, round % 13);
-
-            let mut kept = absent.clone();
-            kept.retain(|(name, _)| posted.iter().all(|member| member != name));
-            let mut found = absent.clone();
-            unposted(&mut found, posted.iter().map(String::as_str));
-            assert_eq!(found, kept);
-
-            let set = folded(&absent);
-            let mut buffer = String::new();
-            for member in &posted {
-                let before = absent
-                    .iter()
-                    .any(|(name, _)| name.eq_ignore_ascii_case(member));
-                assert_eq!(names(&set, member, &mut buffer), before, "{member}");
-            }
-        }
-    }
 }

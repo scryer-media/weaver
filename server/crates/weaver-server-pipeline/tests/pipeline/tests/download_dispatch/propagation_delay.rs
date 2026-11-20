@@ -8,8 +8,18 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::broadcast;
 use weaver_nntp::client::{BlockingBodyLaneAcquireError, NntpClient, NntpClientConfig};
-use weaver_server_pipeline::JobId;
-use weaver_server_pipeline::events::model::PipelineEvent;
+use weaver_server_composition::JobId;
+use weaver_server_composition::events::model::PipelineEvent;
+use weaver_server_composition::proxies::Bandwidth;
+use weaver_server_composition::{
+    DownloadBlockKind, DownloadBlockState, DownloadPressureReason, DownloadPressureState,
+    EgressQuotaBlock, JobPhase,
+};
+use weaver_server_composition::{
+    DownloadState, JobSpec, JobStatus, NzbFileId, PostState, RestoreJobRequest, RunState, SegmentId,
+};
+use weaver_server_pipeline::DownloadQueue;
+use weaver_server_pipeline::bandwidth;
 use weaver_server_pipeline::jobs::{
     AddJobOptions,
     working_dir::{mark_weaver_owned_output_dir, stamp_working_dir},
@@ -26,14 +36,6 @@ use weaver_server_pipeline::pipeline::tests::{
     dispatch_fixture::{DispatchFixture, propagation::PROPAGATION_WAIT_REASON},
     history_row_with_output_dir, sample_nzb_zstd, standalone_job_spec,
 };
-use weaver_server_pipeline::{
-    DownloadBlockKind, DownloadBlockState, DownloadPressureReason, DownloadPressureState,
-    DownloadQueue, EgressQuotaBlock, JobPhase,
-};
-use weaver_server_pipeline::{
-    DownloadState, JobSpec, JobStatus, NzbFileId, PostState, RestoreJobRequest, RunState, SegmentId,
-};
-use weaver_server_pipeline::{bandwidth, proxies::Bandwidth};
 
 #[tokio::test]
 async fn download_block_refresh_preserves_scheduled_speed_limit() {

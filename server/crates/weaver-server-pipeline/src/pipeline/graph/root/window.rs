@@ -17,17 +17,17 @@
 
 use weaver_graph::{ByteRange, NodeId, VolumeIndex, Weight};
 
-pub(crate) const WINDOW_VOLUMES: usize = 8;
-pub(crate) const WINDOW_IN_ORDER_VOLUMES: usize = 4;
+pub const WINDOW_VOLUMES: usize = 8;
+pub const WINDOW_IN_ORDER_VOLUMES: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Bid {
-    pub(crate) volume: VolumeIndex,
-    pub(crate) range: ByteRange,
-    pub(crate) weight: Weight,
-    pub(crate) bidder: NodeId,
+pub struct Bid {
+    pub volume: VolumeIndex,
+    pub range: ByteRange,
+    pub weight: Weight,
+    pub bidder: NodeId,
     // The bidder reads only in order.
-    pub(crate) in_order: bool,
+    pub in_order: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -38,14 +38,14 @@ struct Held {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct Window {
+pub struct Window {
     bids: Vec<Bid>,
     held: Vec<Held>,
     next_rank: u32,
 }
 
 impl Window {
-    pub(crate) fn bid(&mut self, bid: Bid) {
+    pub fn bid(&mut self, bid: Bid) {
         self.bids.push(bid);
     }
 

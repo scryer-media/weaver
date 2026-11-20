@@ -4,7 +4,7 @@
 pub(crate) mod error;
 pub(crate) use weaver_server_disk::pipeline::extraction::safety;
 
-pub(crate) use error::ExtractionError;
-pub(crate) use safety::{
+pub use error::ExtractionError;
+pub use safety::{
     ExtractionFailure, ExtractionLimits, ExtractionRejectionReason, ProcessMemoryBudget,
 };

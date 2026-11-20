@@ -11,13 +11,12 @@ use crate::jobs::handle::{DownloadBlockKind, DownloadBlockState};
 use crate::pipeline::Pipeline;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 pub use weaver_server_net::bandwidth::service::QuotaCalendar;
-pub(crate) use weaver_server_net::bandwidth::service::compute_window;
 
 use crate::jobs::{HoldOrigin, HoldOwner, HoldSet};
 
 /// Written by transport lanes, sampled independently of pipeline completions.
 #[derive(Debug)]
-pub(crate) struct BandwidthCounters {
+pub struct BandwidthCounters {
     metered: AtomicU64,
     unmetered: AtomicU64,
     enabled: AtomicBool,
@@ -34,7 +33,7 @@ impl Default for BandwidthCounters {
 }
 
 impl BandwidthCounters {
-    pub(crate) fn record(&self, bytes: u64) {
+    pub fn record(&self, bytes: u64) {
         let target = if self.enabled.load(Ordering::Relaxed) {
             &self.metered
         } else {
@@ -43,19 +42,19 @@ impl BandwidthCounters {
         target.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub(crate) fn total(&self) -> u64 {
+    pub fn total(&self) -> u64 {
         self.metered
             .load(Ordering::Relaxed)
             .saturating_add(self.unmetered.load(Ordering::Relaxed))
     }
 
-    pub(crate) fn set_metering_enabled(&self, enabled: bool) {
+    pub fn set_metering_enabled(&self, enabled: bool) {
         self.enabled.store(enabled, Ordering::Relaxed);
     }
 }
 
 const BANDWIDTH_LEDGER_RETENTION_DAYS: i64 = 90;
-const BANDWIDTH_USAGE_FLUSH_BYTES: u64 = 1024 * 1024 * 1024;
+pub const BANDWIDTH_USAGE_FLUSH_BYTES: u64 = 1024 * 1024 * 1024;
 const BANDWIDTH_USAGE_FLUSH_INTERVAL: StdDuration = StdDuration::from_secs(60);
 
 // The per-minute download ledger behind the bandwidth graph.
@@ -64,26 +63,26 @@ const BANDWIDTH_USAGE_FLUSH_INTERVAL: StdDuration = StdDuration::from_secs(60);
 // when it arrived, and flushes in batches. Download quotas themselves live on
 // each egress and server; nothing here refuses work.
 #[derive(Debug, Default)]
-pub(crate) struct BandwidthLedgerRuntime {
+pub struct BandwidthLedgerRuntime {
     sampled: [u64; 2],
     last_pruned_bucket_epoch_minute: Option<i64>,
-    pending_usage_by_minute: BTreeMap<(i64, bool), u64>,
-    pending_usage_bytes: u64,
+    pub pending_usage_by_minute: BTreeMap<(i64, bool), u64>,
+    pub pending_usage_bytes: u64,
     pending_usage_started_at: Option<Instant>,
     // Batches handed to the writer whose write has not answered yet. A batch
     // stays here until its write commits; a failed or dropped write puts its
     // bytes back in the pending ledger.
-    unacknowledged_usage: Vec<UnacknowledgedUsage>,
+    pub unacknowledged_usage: Vec<UnacknowledgedUsage>,
 }
 
 #[derive(Debug)]
-struct UnacknowledgedUsage {
+pub struct UnacknowledgedUsage {
     entries: Vec<(i64, bool, u64)>,
     committed: tokio::sync::oneshot::Receiver<bool>,
 }
 
 impl BandwidthLedgerRuntime {
-    pub(crate) fn sample(
+    pub fn sample(
         &mut self,
         db: &crate::Database,
         counters: &BandwidthCounters,
@@ -134,10 +133,7 @@ impl BandwidthLedgerRuntime {
     // order keeps the shutdown flush behind every batch handed over before it.
     // A handed-over batch leaves the ledger only once its write commits: a
     // write that fails returns its bytes to the next flush.
-    pub(crate) fn flush_pending_usage(
-        &mut self,
-        db: &crate::Database,
-    ) -> Result<(), crate::StateError> {
+    pub fn flush_pending_usage(&mut self, db: &crate::Database) -> Result<(), crate::StateError> {
         self.settle_unacknowledged_usage();
         if self.pending_usage_by_minute.is_empty() {
             return Ok(());
@@ -186,7 +182,7 @@ impl BandwidthLedgerRuntime {
         }
     }
 
-    fn record_pending_usage(
+    pub fn record_pending_usage(
         &mut self,
         bucket_epoch_minute: i64,
         payload_bytes: u64,
@@ -212,7 +208,7 @@ impl BandwidthLedgerRuntime {
 
 // The block a hold puts on the queue, by who holds it. Quota blocks are laid
 // over this by the shared state.
-pub(crate) fn to_download_block_state(held: Option<HoldOrigin>) -> DownloadBlockState {
+pub fn to_download_block_state(held: Option<HoldOrigin>) -> DownloadBlockState {
     let kind = match held {
         Some(HoldOrigin::Manual) => DownloadBlockKind::ManualPause,
         Some(HoldOrigin::SpeedTest) => DownloadBlockKind::SpeedTest,
@@ -405,6 +401,3 @@ impl Pipeline {
         self.shared_state.set_download_block(block);
     }
 }
-
-#[cfg(test)]
-mod tests;

@@ -14,41 +14,41 @@ use weaver_server_disk::operations::disk::reader::{Reading, TurnStop};
 use weaver_server_disk::operations::disk::volume::Volume;
 
 #[derive(Debug)]
-pub(crate) struct Verification {
-    pub(crate) node: NodeId,
-    member: MemberId,
-    path: PathBuf,
-    revision: (u64, u64),
-    length: u64,
-    stated: u32,
-    coverage: Coverage,
-    folded: Option<u32>,
+pub struct Verification {
+    pub node: NodeId,
+    pub member: MemberId,
+    pub path: PathBuf,
+    pub revision: (u64, u64),
+    pub length: u64,
+    pub stated: u32,
+    pub coverage: Coverage,
+    pub folded: Option<u32>,
     // Everything submitted for the file when the check was lent: the
     // worker reads once it has returned.
-    settled: Option<weaver_server_disk::operations::disk::writer::Barrier>,
+    pub settled: Option<weaver_server_disk::operations::disk::writer::Barrier>,
     // The volume the file lies on: the check reads in its turns.
-    volume: Option<Arc<Volume>>,
-    pub(crate) stop: Arc<TurnStop>,
-    #[cfg(test)]
-    barrier: Option<ReadBarrier>,
+    pub volume: Option<Arc<Volume>>,
+    pub stop: Arc<TurnStop>,
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub barrier: Option<ReadBarrier>,
 }
 
 #[derive(Debug)]
-pub(crate) struct Verified {
+pub struct Verified {
     check: Verification,
-    actual: Result<Option<u32>, LeafError>,
+    pub actual: Result<Option<u32>, LeafError>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 #[derive(Debug)]
-struct ReadBarrier {
+pub struct ReadBarrier {
     started: tokio::sync::oneshot::Sender<()>,
     resume: std::sync::mpsc::Receiver<()>,
 }
 
 impl Verification {
-    #[cfg(test)]
-    pub(crate) fn pause_after_read(
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn pause_after_read(
         &mut self,
     ) -> (
         tokio::sync::oneshot::Receiver<()>,
@@ -63,18 +63,18 @@ impl Verification {
         (ready, resume)
     }
 
-    pub(crate) fn run(self, shutdown: &Shutdown) -> Verified {
-        #[cfg(test)]
+    pub fn run(self, shutdown: &Shutdown) -> Verified {
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         let (mut barrier, this) = {
             let mut this = self;
             (this.barrier.take(), this)
         };
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "pipeline-test-fixtures")))]
         let this = self;
         this.run_with(shutdown, |_len| {
             #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             checked::read(_len);
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             if let Some(barrier) = barrier.take() {
                 let _ = barrier.started.send(());
                 let _ = barrier.resume.recv();
@@ -82,7 +82,7 @@ impl Verification {
         })
     }
 
-    pub(super) fn run_with(self, shutdown: &Shutdown, mut read: impl FnMut(usize)) -> Verified {
+    pub fn run_with(self, shutdown: &Shutdown, mut read: impl FnMut(usize)) -> Verified {
         let stopped = || self.stop.raised() || shutdown.started();
         let io = |source| LeafError::Io {
             device: crate::pipeline::graph::limits::Device::Working,
@@ -163,18 +163,18 @@ impl Verification {
 }
 
 impl NamespaceWriter {
-    pub(crate) fn verifications_waiting(&self) -> bool {
+    pub fn verifications_waiting(&self) -> bool {
         !self.verifications.is_empty()
     }
 
-    pub(crate) fn pending_verifications(&self) -> Vec<(u32, u32)> {
+    pub fn pending_verifications(&self) -> Vec<(u32, u32)> {
         self.verifications
             .iter()
             .map(|(node, member)| (node.0, member.0))
             .collect()
     }
 
-    pub(crate) fn restore_verifications(&mut self, pending: &[(u32, u32)]) {
+    pub fn restore_verifications(&mut self, pending: &[(u32, u32)]) {
         self.verifications.extend(
             pending
                 .iter()
@@ -188,7 +188,7 @@ impl NamespaceWriter {
     // an ended namespace no check can be lent for is met by nothing: the
     // census reads its member damaged or short, and a member whose file an
     // object took over is that object's to read.
-    pub(crate) fn verifications_due(&self, tree: &Tree, coming: &Coming) -> bool {
+    pub fn verifications_due(&self, tree: &Tree, coming: &Coming) -> bool {
         self.verifications
             .iter()
             .any(|&(node, member)| self.owed(tree, coming, node, member))
@@ -243,7 +243,7 @@ impl NamespaceWriter {
             settled: leaf.settled(),
             volume: leaf.volume().cloned(),
             stop: Arc::default(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             barrier: None,
         })
     }
@@ -252,13 +252,13 @@ impl NamespaceWriter {
     // obligation here: a checkpoint taken during the read must retain it.
     // One that cannot be checked yet stays too: a later arrival may clean
     // its member, and only a verdict or the namespace's end settles it.
-    pub(crate) fn take_verification(&self, tree: &Tree) -> Option<Verification> {
+    pub fn take_verification(&self, tree: &Tree) -> Option<Verification> {
         self.verifications
             .iter()
             .find_map(|&(node, member)| self.verification(tree, node, member))
     }
 
-    pub(crate) fn verified(
+    pub fn verified(
         &mut self,
         tree: &mut Tree,
         builder: &mut dyn Builder,
@@ -302,132 +302,10 @@ impl NamespaceWriter {
     }
 }
 
-#[cfg(test)]
-mod turns {
-    use std::sync::Arc;
-
-    use weaver_graph::{Coverage, MemberId, NodeId};
-
-    use super::{READ_BACK, Verification};
-    use crate::pipeline::graph::hardware::Shutdown;
-    use weaver_server_disk::operations::disk::StorageKind;
-    use weaver_server_disk::operations::disk::reader::{SOLID_READERS, SPINNING_READERS};
-    use weaver_server_disk::operations::disk::volume::Volume;
-
-    fn check(path: std::path::PathBuf, length: u64, volume: Option<Arc<Volume>>) -> Verification {
-        Verification {
-            node: NodeId(1),
-            member: MemberId(0),
-            path,
-            revision: (0, 0),
-            length,
-            stated: 0,
-            coverage: Coverage::default(),
-            folded: None,
-            settled: None,
-            volume,
-            stop: Arc::default(),
-            barrier: None,
-        }
-    }
-
-    // A member's check made in turns of its file's volume reads what the
-    // check made without them reads, read for read, and comes to the same
-    // CRC, or the same error. On solid state it holds one turn across its
-    // reads; on a spinning volume each read takes the one turn and gives it
-    // back. Every turn is back once it returns.
-    #[test]
-    fn a_check_in_its_volumes_turns_reads_what_a_check_without_them_reads() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("member.bin");
-        let length = 2 * READ_BACK + READ_BACK / 2 + 7;
-        let body: Vec<u8> = (0..length).map(|at| (at * 31 % 251) as u8).collect();
-        std::fs::write(&path, &body).unwrap();
-        let shutdown = Shutdown::default();
-        let run = |volume: Option<Arc<Volume>>, path: std::path::PathBuf| {
-            let mut reads = Vec::new();
-            let mut free = Vec::new();
-            let watched = volume.clone();
-            let verified = check(path, length, volume).run_with(&shutdown, |len| {
-                reads.push(len);
-                if let Some(volume) = &watched {
-                    free.push(volume.read_turns().turns().available_permits());
-                }
-            });
-            let actual = verified.actual.map_err(|error| {
-                matches!(
-                    error,
-                    crate::pipeline::graph::leaf::LeafError::Io { ref source, .. }
-                        if source.kind() == std::io::ErrorKind::NotFound
-                )
-            });
-            (actual, reads, free)
-        };
-        let (old, old_reads, _) = run(None, path.clone());
-        let crc = crc_turbo::checksum(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, &body) as u32;
-        assert_eq!(old, Ok(Some(crc)));
-        assert_eq!(old_reads.len(), 3);
-        let (old_missing, _, _) = run(None, dir.path().join("gone.bin"));
-        assert_eq!(old_missing, Err(true));
-        for (kind, during, all) in [
-            (StorageKind::Solid, SOLID_READERS - 1, SOLID_READERS),
-            (StorageKind::Unknown, SOLID_READERS - 1, SOLID_READERS),
-            (StorageKind::Rotational, SPINNING_READERS, SPINNING_READERS),
-        ] {
-            let volume = Arc::new(Volume::new(None, "test".to_owned()));
-            volume.reads(|| kind);
-            let (new, new_reads, free) = run(Some(Arc::clone(&volume)), path.clone());
-            assert_eq!(new, old, "{kind:?}");
-            assert_eq!(new_reads, old_reads, "{kind:?}");
-            assert_eq!(free, vec![during; old_reads.len()], "{kind:?}");
-            assert_eq!(volume.read_turns().turns().available_permits(), all);
-            let (missing, _, _) = run(Some(Arc::clone(&volume)), dir.path().join("gone.bin"));
-            assert_eq!(missing, old_missing, "{kind:?}");
-            assert_eq!(volume.read_turns().turns().available_permits(), all);
-        }
-    }
-
-    // A check waiting for a turn that the volume's other readers hold ends
-    // when its job stops it, having read nothing, on solid state and on a
-    // spinning volume alike.
-    #[test]
-    fn a_check_waiting_for_a_turn_ends_when_it_is_stopped() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("member.bin");
-        std::fs::write(&path, vec![7; 64]).unwrap();
-        for kind in [StorageKind::Solid, StorageKind::Rotational] {
-            let volume = Arc::new(Volume::new(None, "test".to_owned()));
-            let reads = volume.reads(|| kind);
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .build()
-                .unwrap();
-            let every = runtime
-                .block_on(Arc::clone(reads.turns()).acquire_many_owned(reads.readers() as u32))
-                .unwrap();
-            let check = check(path.clone(), 64, Some(Arc::clone(&volume)));
-            let stop = Arc::clone(&check.stop);
-            let waiting = std::thread::spawn(move || {
-                let mut read = 0;
-                let verified = check.run_with(&Shutdown::default(), |len| read += len);
-                (verified.actual.ok(), read)
-            });
-            stop.await_waiters(1);
-            stop.raise();
-            assert_eq!(waiting.join().unwrap(), (Some(None), 0), "{kind:?}");
-            drop(every);
-            assert_eq!(
-                reads.turns().available_permits(),
-                reads.readers(),
-                "{kind:?}"
-            );
-        }
-    }
-}
-
 // The bytes every member check in this process read from its file, so a
 // test can hold a check to what it reads.
 #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-pub(crate) mod checked {
+pub mod checked {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static READ: AtomicU64 = AtomicU64::new(0);
@@ -436,6 +314,7 @@ pub(crate) mod checked {
         READ.fetch_add(len as u64, Ordering::Relaxed);
     }
 
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) fn so_far() -> u64 {
         READ.load(Ordering::Relaxed)
     }

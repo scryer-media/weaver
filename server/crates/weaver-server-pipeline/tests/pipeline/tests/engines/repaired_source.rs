@@ -5,7 +5,7 @@ use super::harness::{self, Post, Scenario, par2_volumes_sliced};
 use sevenz_turbo::{ArchiveEntry, ArchiveWriter, EncoderConfiguration, EncoderMethod};
 use std::io::Cursor;
 use weaver_graph::MemberId;
-use weaver_server_pipeline::JobStatus;
+use weaver_server_composition::JobStatus;
 use weaver_server_pipeline::pipeline::tests::engines::repaired_source::drive_periodic_repair;
 
 #[tokio::test]

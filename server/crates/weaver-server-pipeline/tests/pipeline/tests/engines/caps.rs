@@ -16,8 +16,8 @@ use super::streams::{gzip, tar, xz};
 use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::tests::direct_store::{multi_member_store_set, single_member_store_set};
+use weaver_server_composition::post_processing::settings::PostProcessingSettingsQueries;
 use weaver_server_disk::pipeline::extraction::safety::ExtractionLimits;
-use weaver_server_pipeline::post_processing::settings::PostProcessingSettingsQueries;
 use weaver_server_pipeline::settings::persistence::SettingsPersistenceQueries;
 use weaver_server_pipeline::settings::queries::SettingsQueries;
 
@@ -832,7 +832,7 @@ mod unwanted {
     use super::super::harness::{Outcome, kinds};
     use super::*;
     use std::collections::BTreeSet;
-    use weaver_server_pipeline::post_processing::model::UnwantedExtensionAction;
+    use weaver_server_composition::post_processing::model::UnwantedExtensionAction;
 
     const FOLDER: &str = "lantern beacon";
 

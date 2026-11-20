@@ -1254,8 +1254,8 @@ async fn a_rar_whose_last_volume_never_arrives_fails_naming_it() {
 }
 
 // The same set posted with no recovery beside a release's furniture, an
-// `.nfo` and a `file_id.diz`, that arrived whole: furniture never stands
-// for a delivery, and the job fails as the set alone does.
+// `.nfo` and a `file_id.diz`, that arrived whole: both are delivered whole,
+// but neither is a usable file, and the job fails as the set alone does.
 #[tokio::test]
 async fn a_rar_short_of_a_volume_beside_whole_furniture_alone_fails() {
     let mut volumes = store(3);
@@ -1274,8 +1274,8 @@ async fn a_rar_short_of_a_volume_beside_whole_furniture_alone_fails() {
         .unwrap_or_else(|stall| panic!("stalled at {:?}: {}", stall.status, stall.state));
     assert_eq!(
         outcome.graph().delivery.whole,
-        vec!["file_id.diz".to_string()],
-        "the root .nfo is dropped and the diz is delivered whole"
+        vec!["silver.horizon.nfo".to_string(), "file_id.diz".to_string()],
+        "the root .nfo and the diz are delivered whole"
     );
     let error = "silver.horizon.part01.rar, silver.horizon.part02.rar never placed every member \
                  it named: unable to find silver.horizon.part03.rar";

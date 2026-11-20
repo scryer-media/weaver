@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use unrar_rs::{
     MemberKeying, PasswordCheck, RarVolumeHeaderEncryption, check_member_password,
-    decrypt_cipher_range_rar4, rar4_derive_key,
+    decrypt_cipher_range_rar4,
 };
 use weaver_graph::{ByteRange, Emit, VolumeIndex, Why};
 use zeroize::Zeroizing;
@@ -54,11 +54,15 @@ fn with_tuple<R>(password: &str, keying: &MemberKeying, then: impl FnOnce(&Tuple
     })
 }
 
-// Whether the cache holds the answer for a candidate's key to a file: the
-// key, or that the check refutes the password. Without one the derivation
-// is too slow for the loop.
-fn known(keys: &Keys, password: &str, keying: &MemberKeying) -> bool {
-    with_tuple(password, keying, |tuple| keys.get(tuple).is_some())
+// The answer the cache holds for a candidate's key to a file: the key, or
+// that the check refutes the password. Without one the derivation is too
+// slow for the loop. One lookup, acted on as it answered: the cache is
+// shared, and may drop the entry before a second.
+fn cached(keys: &Keys, password: &str, keying: &MemberKeying) -> Option<Derived> {
+    with_tuple(password, keying, |tuple| match keys.get(tuple)? {
+        keys::Derived::Key(material) => Some(Derived::Key(file_key(&material, keying))),
+        keys::Derived::Wrong => Some(Derived::Wrong),
+    })
 }
 
 // The derivation for one candidate, once per tuple in the process: the key
@@ -162,6 +166,8 @@ impl RarStore {
     }
 
     // The header-encryption decision, made before any header is deciphered.
+    // A check derives a key, so it is the store's work, done away from the
+    // loop: here only what needs no key is decided, and the volume is due.
     pub(super) fn open_headers(
         &mut self,
         volume: VolumeIndex,
@@ -173,6 +179,79 @@ impl RarStore {
         if self.headers_open.is_some() {
             return self.give_up(Emit::NeedsEngine(Why::EncryptedHeader), out);
         }
+        match encryption {
+            RarVolumeHeaderEncryption::Rar5(facts) if facts.psw_check.is_some() => {
+                let left = (0..self.candidates.len()).any(|index| !self.rar5_refuted(index, facts));
+                if !left {
+                    return self.ask(out);
+                }
+            }
+            RarVolumeHeaderEncryption::Rar4 => {
+                if self
+                    .candidates
+                    .iter()
+                    .all(|candidate| candidate.headers_wrong)
+                {
+                    return self.ask(out);
+                }
+                // Nothing is checked until the header's front is here whole:
+                // a later walk asks again once it is.
+                if !self.rar4_front_whole(volume) {
+                    return;
+                }
+            }
+            _ => return self.give_up(Emit::NeedsEngine(Why::EncryptedHeader), out),
+        }
+        self.headers_due.insert(volume, *encryption);
+    }
+
+    // Whether the cache, or a check before, already refutes the candidate at
+    // `index` for these headers: no key is derived to know it.
+    fn rar5_refuted(
+        &mut self,
+        index: usize,
+        facts: &unrar_rs::RarVolumeHeaderEncryptionFacts,
+    ) -> bool {
+        let tuple = Tuple {
+            format: "rar5",
+            password: &self.candidates[index].secret,
+            salt: &facts.salt,
+            params: &[facts.kdf_count_lg2],
+        };
+        let refuted = self.candidates[index].headers_wrong || self.keys.is_wrong(&tuple);
+        self.candidates[index].headers_wrong = refuted;
+        refuted
+    }
+
+    // Check the headers of every volume due, away from the loop. Once
+    // `stop` is set no further check is begun, and the rest stay due;
+    // `false` then.
+    pub(super) fn check_headers_due(&mut self, stop: &AtomicBool, out: &mut Vec<Emit>) -> bool {
+        let mut due = std::mem::take(&mut self.headers_due).into_iter();
+        while let Some((volume, encryption)) = due.next() {
+            if stop.load(Ordering::Relaxed) {
+                self.headers_due.insert(volume, encryption);
+                self.headers_due.extend(due);
+                return false;
+            }
+            // A check before this one proved a candidate, and every walk
+            // reads under it now; or the volume went back.
+            if self.gone || self.headers_open.is_some() || !self.volumes.contains_key(&volume) {
+                continue;
+            }
+            self.check_headers(volume, &encryption, out);
+        }
+        true
+    }
+
+    // Each candidate in turn against the archive's own check, first one
+    // proved opening the headers.
+    fn check_headers(
+        &mut self,
+        volume: VolumeIndex,
+        encryption: &RarVolumeHeaderEncryption,
+        out: &mut Vec<Emit>,
+    ) {
         let facts = match encryption {
             RarVolumeHeaderEncryption::Rar5(facts) => facts,
             RarVolumeHeaderEncryption::Rar4 => return self.open_rar4_headers(volume, out),
@@ -249,8 +328,20 @@ impl RarStore {
         rar4_unseals(
             &mut |range| whole(kept, range).map(<[u8]>::to_vec),
             length,
+            self.keys.kdf(),
             password,
         )
+    }
+
+    // Whether the front of the first enciphered header of `volume` is here
+    // whole: what a check reads before it derives a key. Not yet, it is
+    // wanted.
+    fn rar4_front_whole(&mut self, volume: VolumeIndex) -> bool {
+        let Some(found) = self.volumes.get_mut(&volume) else {
+            return false;
+        };
+        let kept = &mut found.kept;
+        rar4_front(&mut |range| whole(kept, range).map(<[u8]>::to_vec)).is_some()
     }
 
     // The candidates in the order to try them: the one that opened the
@@ -328,11 +419,12 @@ impl RarStore {
                 let secret = &self.candidates[*candidate].secret;
                 // A key the cache has no answer for is derived on the pool:
                 // the file waits for it, and no later candidate is tried.
-                let derived = match self.derived.remove(&(*candidate, index)) {
+                let derived = match self
+                    .derived
+                    .remove(&(*candidate, index))
+                    .or_else(|| cached(&self.keys, secret, &keying))
+                {
                     Some(derived) => derived,
-                    None if known(&self.keys, secret, &keying) => {
-                        derive(&self.keys, secret, &keying)
-                    }
                     None => {
                         due.push((*candidate, index));
                         waits = true;
@@ -483,14 +575,11 @@ const AES_BLOCK: usize = 16;
 fn rar4_unseals(
     read: &mut dyn FnMut(ByteRange) -> Option<Vec<u8>>,
     length: Option<u64>,
+    kdf: &unrar_rs::KdfCache,
     password: &str,
 ) -> Option<bool> {
-    let main = read(ByteRange::at(RAR4_SIGNATURE, RAR4_BASE))?;
-    let at = RAR4_SIGNATURE + u64::from(u16::from_le_bytes([main[5], main[6]]));
-    let front = read(ByteRange::at(at, RAR4_SALT + AES_BLOCK as u64))?;
-    let salt: [u8; 8] = front[..8].try_into().ok()?;
-    let mut block: [u8; AES_BLOCK] = front[8..].try_into().ok()?;
-    let (key, iv) = rar4_derive_key(password, Some(&salt));
+    let (at, salt, mut block) = rar4_front(read)?;
+    let (key, iv) = kdf.derive_key_rar4(password, Some(&salt));
     decrypt_cipher_range_rar4(&key, &iv, &mut block).ok()?;
     let size = usize::from(u16::from_le_bytes([block[5], block[6]]));
     let sealed = ByteRange::at(at + RAR4_SALT, size.next_multiple_of(AES_BLOCK) as u64);
@@ -501,6 +590,20 @@ fn rar4_unseals(
     decrypt_cipher_range_rar4(&key, &iv, &mut header).ok()?;
     let crc = crc32(&header[2..size]) & 0xffff;
     Some(crc == u32::from(u16::from_le_bytes([header[0], header[1]])))
+}
+
+// Where the first enciphered header of a RAR4 volume begins, its salt and
+// its first block: all a check reads before it derives a key. `None` while
+// the bytes are not here whole.
+fn rar4_front(
+    read: &mut dyn FnMut(ByteRange) -> Option<Vec<u8>>,
+) -> Option<(u64, [u8; 8], [u8; AES_BLOCK])> {
+    let main = read(ByteRange::at(RAR4_SIGNATURE, RAR4_BASE))?;
+    let at = RAR4_SIGNATURE + u64::from(u16::from_le_bytes([main[5], main[6]]));
+    let front = read(ByteRange::at(at, RAR4_SALT + AES_BLOCK as u64))?;
+    let salt: [u8; 8] = front[..8].try_into().ok()?;
+    let block: [u8; AES_BLOCK] = front[8..].try_into().ok()?;
+    Some((at, salt, block))
 }
 
 // The bytes of `range` when they are here whole; otherwise they are wanted.

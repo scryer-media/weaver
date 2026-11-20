@@ -248,3 +248,50 @@ fn a_compressed_sidecar_beside_its_own_name_is_numbered_by_the_ledger() {
     assert_eq!(output_name(&tree, child, MemberId(0)), "movie.srt");
     assert_eq!(output_name(&tree, stream, MemberId(0)), "movie (1).srt");
 }
+
+// An archive below the root that a recovery set names again, into another
+// folder: what it holds, already placed beside it, is placed again beside
+// it under the folder its new name says.
+#[test]
+fn a_renamed_archive_below_the_root_moves_what_it_holds_to_its_new_folder() {
+    let mut rar = SIGNATURE.to_vec();
+    rar.extend_from_slice(b"inner");
+    let (mut tree, child, mut effects) = below(&[("sub/ember.rar", rar)]);
+    let (inner, _) = tree
+        .child_of(child, MemberId(0))
+        .expect("the archive opens by its name");
+    tree.emitted(
+        inner,
+        vec![Emit::Member {
+            member: MemberId(0),
+            name: "inner.mkv".into(),
+            length: None,
+        }],
+        &mut Builds,
+        &mut effects,
+    );
+    assert_eq!(output_name(&tree, inner, MemberId(0)), "sub/inner.mkv");
+    effects.clear();
+    let given = tree.rename(
+        child,
+        MemberId(0),
+        "CD1/ember.rar",
+        &mut Builds,
+        &mut effects,
+    );
+    assert_eq!(given.as_deref(), Some("CD1/ember.rar"));
+    assert_eq!(
+        tree.child_of(child, MemberId(0)).map(|(at, _)| at),
+        Some(inner)
+    );
+    assert_eq!(output_name(&tree, inner, MemberId(0)), "CD1/inner.mkv");
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Renamed { node, member, old, new }
+                if *node == inner && *member == MemberId(0)
+                    && old == "sub/inner.mkv" && new == "CD1/inner.mkv"
+        )),
+        "{effects:?}"
+    );
+}

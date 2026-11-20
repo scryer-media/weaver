@@ -23,7 +23,7 @@ use super::super::engine::{Heard, Said};
 use super::super::hardware::Hardware;
 use super::super::namespace::{RewalkLoan, Rewalked};
 
-pub(crate) struct Works {
+pub struct Works {
     scope: u64,
     mail: mpsc::Sender<Said>,
     // The number the last loan went out under.
@@ -43,7 +43,7 @@ pub(crate) struct Works {
     clock: DecodeClock,
     // A test keeps every loan in hand, to send the job what it would hear
     // while the object is out, and hands each back when it chooses.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     held: Option<Vec<HeldLoan>>,
     // How many objects went out for their work.
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
@@ -52,8 +52,8 @@ pub(crate) struct Works {
 
 // A loan a test keeps in hand: its node, its number, the object, and the
 // word that stops its work.
-#[cfg(test)]
-pub(crate) type HeldLoan = (NodeId, u64, Box<dyn Object>, Arc<AtomicBool>);
+#[cfg(any(test, feature = "test-support"))]
+pub type HeldLoan = (NodeId, u64, Box<dyn Object>, Arc<AtomicBool>);
 
 struct Rewalking {
     serial: u64,
@@ -63,7 +63,7 @@ struct Rewalking {
 }
 
 // An object back from its work, with what it said.
-pub(crate) struct Worked {
+pub struct Worked {
     pub(crate) object: Box<dyn Object>,
     pub(crate) said: Vec<Emit>,
 }
@@ -88,7 +88,7 @@ impl Works {
             owed: false,
             hardware,
             clock: DecodeClock::default(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             held: None,
             #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             lent: 0,
@@ -106,23 +106,23 @@ impl Works {
         self.clock.decoding()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn hold_loans(&mut self) {
         self.held.get_or_insert_with(Vec::new);
     }
 
     // The loans kept in hand, by node, under their numbers.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn take_held(&mut self) -> Vec<HeldLoan> {
         self.held.as_mut().map(std::mem::take).unwrap_or_default()
     }
 
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) fn lent(&self) -> u64 {
         self.lent
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn scope(&self) -> u64 {
         self.scope
     }
@@ -267,7 +267,7 @@ impl Works {
         {
             self.lent += 1;
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(held) = &mut self.held {
             held.push((node, serial, object, stop));
             return;

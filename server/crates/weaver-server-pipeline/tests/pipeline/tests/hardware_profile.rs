@@ -3,12 +3,12 @@
 
 use std::sync::Arc;
 use weaver_graph::Budget;
+use weaver_server_composition::{HardwareProfile, HardwareProfileInForce};
 use weaver_server_pipeline::pipeline::tests::{
     hardware_fixture::*,
     new_direct_pipeline_on_machine,
     queue_fixture::{apply_intents, handle, report_all},
 };
-use weaver_server_pipeline::{HardwareProfile, HardwareProfileInForce};
 
 #[tokio::test]
 async fn a_chosen_profile_is_in_force_for_the_next_activity() {

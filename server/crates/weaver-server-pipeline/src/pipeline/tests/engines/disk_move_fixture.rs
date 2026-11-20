@@ -131,16 +131,17 @@ pub async fn admit_library_move(
         weaver_server_disk::runtime::fs::test_devices::assign(&pipeline.intermediate_dir, 1);
         weaver_server_disk::runtime::fs::test_devices::assign(&pipeline.complete_dir, 2);
         weaver_server_disk::runtime::fs::test_devices::assign(&library, 3);
-        pipeline.config.try_write().unwrap().categories = vec![crate::categories::CategoryConfig {
-            id: 0,
-            name: "library".to_string(),
-            dest_dir: Some(library.display().to_string()),
-            aliases: String::new(),
-            upload_cap: Default::default(),
-            seeding: None,
-            torrent_route: false,
-            unpack: None,
-        }];
+        pipeline.config.try_write().unwrap().categories =
+            vec![weaver_server_settings::categories::CategoryConfig {
+                id: 0,
+                name: "library".to_string(),
+                dest_dir: Some(library.display().to_string()),
+                aliases: String::new(),
+                upload_cap: Default::default(),
+                seeding: None,
+                torrent_route: false,
+                unpack: None,
+            }];
         let roots = [
             pipeline.script_data_dir.clone(),
             pipeline.intermediate_dir.clone(),

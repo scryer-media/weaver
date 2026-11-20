@@ -301,7 +301,7 @@ impl Pipeline {
         })
     }
 
-    pub(in crate::pipeline) fn download_retry_work(
+    pub fn download_retry_work(
         &self,
         segment_id: SegmentId,
         retry_count: u32,
@@ -655,7 +655,7 @@ impl Pipeline {
     // (`Self::accept_lane_result`), for fixtures that book results no lane
     // returned.
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-    pub(crate) fn note_arrived_result_for_test(&mut self, job_id: JobId, bytes: u64) {
+    pub fn note_arrived_result_for_test(&mut self, job_id: JobId, bytes: u64) {
         self.note_released_download_result_pending(job_id, bytes);
         self.note_volume_arrived(job_id, bytes);
     }
@@ -663,7 +663,7 @@ impl Pipeline {
     // The loop hands on one waiting result of the job of `bytes` whose
     // writes took nothing, as `process_released_download_done` does.
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-    pub(crate) fn hand_on_result_for_test(&mut self, job_id: JobId, bytes: u64) {
+    pub fn hand_on_result_for_test(&mut self, job_id: JobId, bytes: u64) {
         let credit = self.arm_volume_credit(job_id, bytes);
         self.settle_volume_credit(credit);
         self.finish_released_download_result_processing(job_id, bytes);
@@ -673,14 +673,14 @@ impl Pipeline {
     // it on in one step, as `handle_download_done` does: its bytes count on
     // the volume and become the step's loop credit. The fixture writes it
     // and ends the step with `Self::end_hand_on_for_test`.
-    #[cfg(test)]
-    pub(crate) fn begin_hand_on_for_test(&mut self, job_id: JobId, bytes: u64) -> Option<Prepaid> {
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn begin_hand_on_for_test(&mut self, job_id: JobId, bytes: u64) -> Option<Prepaid> {
         self.note_volume_arrived(job_id, bytes);
         self.arm_volume_credit(job_id, bytes)
     }
 
-    #[cfg(test)]
-    pub(crate) fn end_hand_on_for_test(&mut self, job_id: JobId, credit: Option<Prepaid>) {
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn end_hand_on_for_test(&mut self, job_id: JobId, credit: Option<Prepaid>) {
         self.settle_volume_credit(credit);
         if !self
             .pending_released_download_results_by_job

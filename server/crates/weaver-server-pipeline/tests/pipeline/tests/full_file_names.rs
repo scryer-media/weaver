@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use weaver_server_pipeline::{
-    JobId,
-    pipeline::tests::{delivery_fixture::*, history_fixture::finished_jobs, new_direct_pipeline},
+use weaver_server_composition::JobId;
+use weaver_server_pipeline::pipeline::tests::{
+    delivery_fixture::*, history_fixture::finished_jobs, new_direct_pipeline,
 };
 
-use weaver_server_pipeline::ingest::{FullFileName, full_file_names};
+use weaver_server_composition::ingest::{FullFileName, full_file_names};
 
 #[tokio::test]
 async fn a_delivery_rename_reaches_the_finished_job_with_its_full_name() {

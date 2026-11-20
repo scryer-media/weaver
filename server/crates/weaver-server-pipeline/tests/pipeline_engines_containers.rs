@@ -19,6 +19,7 @@ mod pipeline {
             mod binding_order;
             mod misstated_sizes;
             mod nested_rar4;
+            mod nested_rar4_damage;
             mod recovery_contracts;
             mod recovery_geometry;
             mod release_layers;

@@ -1,0 +1,1129 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+use crate::servers::repository::ServersRepositoryQueries;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use chrono::{DateTime, Local, Utc};
+use tracing::{info, warn};
+use weaver_nntp::transfer::{
+    QuotaRuntimeConfig, ServerTransferConfig, ServerTransferInitialState, ServerTransferRegistry,
+    StableServerId, TransferScope,
+};
+
+use crate::database::NetDb;
+use weaver_server_db::persistence::StateError;
+use weaver_server_net::bandwidth::limits::{Direction, QuotaState, RateLimits, effective_rate};
+use weaver_server_net::bandwidth::service::QuotaCalendar;
+
+use super::ServerDownloadUsage;
+use super::model::{ServerConfig, ServerDownloadQuotaConfig, ServerDownloadQuotaPeriod};
+
+// Authoritative live download-policy state for one configured server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerDownloadQuotaSnapshot {
+    pub server_id: u32,
+    pub lifetime_bytes: u64,
+    pub used_bytes: u64,
+    pub reserved_bytes: u64,
+    pub remaining_bytes: Option<u64>,
+    pub blocked: bool,
+    pub window_start: Option<DateTime<Utc>>,
+    pub window_end: Option<DateTime<Utc>>,
+    pub timezone: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerQuotaWindow {
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+}
+
+pub fn quota_window(now: DateTime<Local>, calendar: QuotaCalendar) -> Option<ServerQuotaWindow> {
+    let window = weaver_server_net::bandwidth::service::compute_window(now, calendar)?;
+    Some(ServerQuotaWindow {
+        start: window.starts_at().with_timezone(&Utc),
+        end: window.ends_at().with_timezone(&Utc),
+    })
+}
+
+pub(crate) fn local_timezone_label(now: DateTime<Local>) -> String {
+    std::env::var("TZ").unwrap_or_else(|_| now.offset().to_string())
+}
+
+// A holder's quota as the registry runs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PolicyQuota {
+    // Whether usage counts in periods at all.
+    counted: bool,
+    // The download budget of a period. `None` admits every request.
+    download_bytes: Option<u64>,
+    calendar: QuotaCalendar,
+}
+
+impl From<&ServerDownloadQuotaConfig> for PolicyQuota {
+    fn from(quota: &ServerDownloadQuotaConfig) -> Self {
+        Self {
+            counted: quota.enabled,
+            download_bytes: quota.enabled.then_some(quota.limit_bytes),
+            calendar: quota.into(),
+        }
+    }
+}
+
+impl From<&crate::proxies::EgressQuota> for PolicyQuota {
+    fn from(quota: &crate::proxies::EgressQuota) -> Self {
+        Self {
+            counted: quota.is_set(),
+            download_bytes: quota.download_bytes,
+            calendar: quota.calendar(),
+        }
+    }
+}
+
+// How fast a holder may upload, and the caps its uploads count against.
+// Servers upload nothing, so theirs is empty.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UploadCaps {
+    rate: Option<u64>,
+    soft_bytes: Option<u64>,
+    hard_bytes: Option<u64>,
+    trickle_bps: u64,
+}
+
+// Bytes uploaded over a holder: ever, and when its current period began.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct UploadCount {
+    lifetime_bytes: u64,
+    baseline_bytes: u64,
+}
+
+impl UploadCount {
+    const fn used_bytes(self) -> u64 {
+        self.lifetime_bytes.saturating_sub(self.baseline_bytes)
+    }
+
+    // A new period: what was uploaded so far no longer counts.
+    const fn restart(self) -> Self {
+        Self {
+            lifetime_bytes: self.lifetime_bytes,
+            baseline_bytes: self.lifetime_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ServerPolicyState {
+    quota: PolicyQuota,
+    // The download rate. `Some(0)` admits nothing.
+    rate: Option<u64>,
+    pub window: Option<ServerQuotaWindow>,
+    generation: u64,
+    upload_caps: UploadCaps,
+    upload: UploadCount,
+}
+
+impl ServerPolicyState {
+    fn upload_state(&self) -> QuotaState {
+        QuotaState::of(
+            self.upload.used_bytes(),
+            self.upload_caps.soft_bytes,
+            self.upload_caps.hard_bytes,
+        )
+    }
+}
+
+// One holder of a transfer policy: a server or an egress.
+pub struct QuotaHolder {
+    pub id: u32,
+    pub rate: Option<u64>,
+    pub quota: PolicyQuota,
+    pub upload_caps: UploadCaps,
+}
+
+// Where an egress stands against its quota in each direction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EgressQuotaStates {
+    pub download: QuotaState,
+    pub upload: QuotaState,
+}
+
+// One direction of an egress's usage in its current period.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectionUsage {
+    pub used_bytes: u64,
+    // `None` when the direction has no cap.
+    pub remaining_bytes: Option<u64>,
+    pub state: QuotaState,
+}
+
+// An egress's usage in both directions over its current period.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressQuotaUsage {
+    pub egress_id: u32,
+    pub download: DirectionUsage,
+    pub upload: DirectionUsage,
+    pub window_start: Option<DateTime<Utc>>,
+    pub window_end: Option<DateTime<Utc>>,
+    pub timezone: String,
+}
+
+// The policies and live controls for one kind of holder.
+pub struct PolicyBook {
+    scope: TransferScope,
+    transfers: Arc<ServerTransferRegistry>,
+    policies: Mutex<HashMap<u32, ServerPolicyState>>,
+}
+
+impl PolicyBook {
+    fn new(scope: TransferScope, transfers: ServerTransferRegistry) -> Self {
+        Self {
+            scope,
+            transfers: Arc::new(transfers),
+            policies: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn policies(&self) -> std::sync::MutexGuard<'_, HashMap<u32, ServerPolicyState>> {
+        self.policies
+            .lock()
+            .expect("server policy registry poisoned")
+    }
+}
+
+// Long-lived application policy registry shared by every NNTP client and
+// network runtime rebuild. It holds the download policy of every server and
+// of every egress.
+pub struct ServerTransferPolicyRegistry {
+    db: NetDb,
+    pub servers: PolicyBook,
+    egresses: PolicyBook,
+    maintenance_gate: Mutex<()>,
+    last_flush: Mutex<Instant>,
+    // The usage each control had when it was last written, so an idle
+    // daemon's flush writes nothing.
+    flushed_usage: Mutex<HashMap<(TransferScope, u32), FlushedUsage>>,
+    policy_revision: tokio::sync::watch::Sender<u64>,
+}
+
+// The parts of a stored usage row that change between flushes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FlushedUsage {
+    lifetime_bytes: u64,
+    quota_baseline_bytes: u64,
+    window_end: Option<DateTime<Utc>>,
+    upload: UploadCount,
+}
+
+impl FlushedUsage {
+    fn of(usage: &ServerDownloadUsage, upload: UploadCount) -> Self {
+        Self {
+            lifetime_bytes: usage.lifetime_bytes,
+            quota_baseline_bytes: usage.quota_baseline_bytes,
+            window_end: usage.window_end,
+            upload,
+        }
+    }
+}
+
+// A quota window that rolled over in memory and still has to be written.
+struct WindowReset {
+    scope: TransferScope,
+    id: u32,
+    lifetime_bytes: u64,
+    policy: ServerPolicyState,
+}
+
+impl ServerTransferPolicyRegistry {
+    const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+
+    pub fn new(db: impl Into<NetDb>, servers: &[ServerConfig]) -> Result<Self, StateError> {
+        let db = db.into();
+        let (policy_revision, _) = tokio::sync::watch::channel(0);
+        let server_transfers = ServerTransferRegistry::with_scope(TransferScope::Server);
+        let egress_transfers = server_transfers.sibling(TransferScope::Egress);
+        let registry = Self {
+            db,
+            servers: PolicyBook::new(TransferScope::Server, server_transfers),
+            egresses: PolicyBook::new(TransferScope::Egress, egress_transfers),
+            maintenance_gate: Mutex::new(()),
+            last_flush: Mutex::new(Instant::now()),
+            flushed_usage: Mutex::new(HashMap::new()),
+            policy_revision,
+        };
+        registry.reconfigure(servers)?;
+        Ok(registry)
+    }
+
+    pub fn transfer_registry(&self) -> Arc<ServerTransferRegistry> {
+        Arc::clone(&self.servers.transfers)
+    }
+
+    // The controls every connection's egress is metered by. Network runtime
+    // rebuilds share it, so an egress keeps its counters across them.
+    pub fn egress_transfer_registry(&self) -> Arc<ServerTransferRegistry> {
+        Arc::clone(&self.egresses.transfers)
+    }
+
+    fn book(&self, scope: TransferScope) -> &PolicyBook {
+        match scope {
+            TransferScope::Server => &self.servers,
+            TransferScope::Egress => &self.egresses,
+        }
+    }
+
+    fn books(&self) -> [&PolicyBook; 2] {
+        [&self.servers, &self.egresses]
+    }
+
+    // Every holder's stored usage in one read, in `holders` order; a holder
+    // with no row starts empty. The table holds a row per server or egress,
+    // so reading all of it is bounded by them, not by a reconfigure's size
+    // times a read each. Only the holders' rows are decoded, so a bad row
+    // fails the reconfigure only when it is a holder's.
+    pub fn load_usages(
+        &self,
+        scope: TransferScope,
+        holders: &[QuotaHolder],
+    ) -> Result<Vec<ServerDownloadUsage>, StateError> {
+        let ids = holders.iter().map(|holder| holder.id).collect();
+        let stored = match scope {
+            TransferScope::Server => self.db.server_download_usages(&ids)?,
+            TransferScope::Egress => self.db.egress_download_usages(&ids)?,
+        };
+        Ok(holders
+            .iter()
+            .map(|holder| {
+                stored
+                    .get(&holder.id)
+                    .cloned()
+                    .unwrap_or_else(|| ServerDownloadUsage::empty(holder.id))
+            })
+            .collect())
+    }
+
+    fn load_upload(&self, scope: TransferScope, id: u32) -> Result<UploadCount, StateError> {
+        Ok(match scope {
+            TransferScope::Server => UploadCount::default(),
+            TransferScope::Egress => self.db.egress_upload_usage(id)?.map_or_else(
+                UploadCount::default,
+                |(lifetime_bytes, baseline_bytes)| UploadCount {
+                    lifetime_bytes,
+                    baseline_bytes,
+                },
+            ),
+        })
+    }
+
+    fn store_usage(
+        &self,
+        scope: TransferScope,
+        usage: &ServerDownloadUsage,
+        upload: UploadCount,
+    ) -> Result<(), StateError> {
+        match scope {
+            TransferScope::Server => self.db.upsert_server_download_usage(usage),
+            TransferScope::Egress => {
+                self.db.upsert_egress_download_usage(usage)?;
+                self.db.set_egress_upload_usage(
+                    usage.server_id,
+                    upload.lifetime_bytes,
+                    upload.baseline_bytes,
+                )
+            }
+        }
+    }
+
+    // Drop live controls so the next reconfigure restores counters from the
+    // database. Used after a stable-state import where persisted usage must
+    // replace any pre-restore runtime state for overlapping IDs.
+    pub fn clear_runtime_state(&self) {
+        for book in self.books() {
+            book.policies().clear();
+            book.transfers.clear();
+        }
+        *self
+            .last_flush
+            .lock()
+            .expect("server policy registry poisoned") = Instant::now();
+        self.flushed_usage
+            .lock()
+            .expect("server policy registry poisoned")
+            .clear();
+        self.notify_changed();
+    }
+
+    pub fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.policy_revision.subscribe()
+    }
+
+    // Whether the control that turned a request away, server or egress,
+    // would still turn it away.
+    pub fn quota_rejection_is_current(
+        &self,
+        rejection: &weaver_nntp::transfer::QuotaRejection,
+    ) -> bool {
+        let transfers = &self.book(rejection.scope).transfers;
+        transfers.capacity_revision() == rejection.registry_capacity_revision
+            && transfers
+                .get(rejection.stable_server_id)
+                .and_then(|control| control.quota_rejection_for(rejection.requested_body_bytes))
+                .is_some_and(|current| current.capacity_revision == rejection.capacity_revision)
+    }
+
+    // Capacity changes for servers and egresses alike: the two registries
+    // share one signal.
+    pub fn subscribe_capacity_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.servers.transfers.subscribe_capacity_changes()
+    }
+
+    // Rings each time a server or an egress starts or stops turning work
+    // away for its download quota: the two registries share one signal.
+    pub fn subscribe_quota_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.egresses.transfers.subscribe_quota_changes()
+    }
+
+    // Every egress with a policy, by id.
+    pub fn egress_ids(&self) -> Vec<u32> {
+        self.egresses.policies().keys().copied().collect()
+    }
+
+    fn notify_changed(&self) {
+        self.policy_revision
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+    }
+
+    pub fn reconfigure(&self, servers: &[ServerConfig]) -> Result<(), StateError> {
+        let holders = servers
+            .iter()
+            .map(|server| QuotaHolder {
+                id: server.id,
+                // A server's limit of 0 is no limit.
+                rate: (server.max_download_speed != 0).then_some(server.max_download_speed),
+                quota: (&server.download_quota).into(),
+                upload_caps: UploadCaps::default(),
+            })
+            .collect::<Vec<_>>();
+        self.reconfigure_book(TransferScope::Server, &holders)
+    }
+
+    // Apply every egress's rates and quota. Counters carry
+    // over for an egress that stays; one that is new is restored from its
+    // stored usage.
+    pub fn reconfigure_egresses(
+        &self,
+        egresses: &[crate::proxies::EgressInterface],
+    ) -> Result<(), StateError> {
+        let holders = egresses
+            .iter()
+            .map(|egress| QuotaHolder {
+                id: egress.id,
+                rate: egress.download_bps,
+                quota: (&egress.quota).into(),
+                upload_caps: UploadCaps {
+                    rate: egress.upload_bps,
+                    soft_bytes: egress.quota.upload_soft_bytes,
+                    hard_bytes: egress.quota.upload_hard_bytes,
+                    trickle_bps: egress.quota.upload_trickle_bps,
+                },
+            })
+            .collect::<Vec<_>>();
+        self.reconfigure_book(TransferScope::Egress, &holders)
+    }
+
+    // Start or stop every egress quota counting bytes. Usage already counted
+    // in a window is kept; while stopped no egress quota turns work away.
+    pub fn set_egress_quota_metering(&self, enabled: bool) {
+        self.egresses.transfers.set_quota_metering(enabled);
+        self.notify_changed();
+    }
+
+    // Start or stop one egress's quota counting bytes. It keeps that setting
+    // whatever later happens to every egress's.
+    pub fn set_one_egress_quota_metering(&self, egress_id: u32, enabled: bool) {
+        self.egresses
+            .transfers
+            .set_quota_metering_for(StableServerId(egress_id), enabled);
+        self.notify_changed();
+    }
+
+    // Hand one egress's quota counting back to every egress's setting.
+    pub fn clear_one_egress_quota_metering(&self, egress_id: u32) {
+        self.egresses
+            .transfers
+            .clear_quota_metering_for(StableServerId(egress_id));
+        self.notify_changed();
+    }
+
+    fn reconfigure_book(
+        &self,
+        scope: TransferScope,
+        holders: &[QuotaHolder],
+    ) -> Result<(), StateError> {
+        let _maintenance = self
+            .maintenance_gate
+            .lock()
+            .expect("server policy maintenance gate poisoned");
+        let book = self.book(scope);
+        let now = weaver_server_base::e2e_clock::local_now();
+        let configured_ids = holders
+            .iter()
+            .map(|holder| holder.id)
+            .collect::<HashSet<_>>();
+        let usages = self
+            .load_usages(scope, holders)?
+            .into_iter()
+            .zip(holders)
+            .map(|(usage, holder)| Ok((usage, self.load_upload(scope, holder.id)?)))
+            .collect::<Result<Vec<_>, StateError>>()?;
+        let mut usage_updates = Vec::new();
+        let mut policies = book.policies();
+
+        let removed = policies
+            .keys()
+            .copied()
+            .filter(|id| !configured_ids.contains(id))
+            .collect::<Vec<_>>();
+        for id in removed {
+            policies.remove(&id);
+            book.transfers.remove(StableServerId(id));
+        }
+
+        for (holder, (usage, stored_upload)) in holders.iter().zip(usages) {
+            let previous = policies.get(&holder.id).cloned();
+            let mut window = quota_window(now, holder.quota.calendar);
+            let mut baseline = usage.quota_baseline_bytes.min(usage.lifetime_bytes);
+            let anchors_changed = previous
+                .as_ref()
+                .is_some_and(|previous| previous.quota.calendar != holder.quota.calendar);
+            let newly_enabled = previous
+                .as_ref()
+                .is_some_and(|previous| !previous.quota.counted && holder.quota.counted);
+            let mut upload = previous
+                .as_ref()
+                .map_or(stored_upload, |previous| previous.upload);
+            let persisted_window_matches = match (window, usage.window_start, usage.window_end) {
+                (Some(current), Some(start), Some(end)) => {
+                    current.start == start && current.end == end
+                }
+                (None, None, None) => true,
+                _ => false,
+            };
+
+            if anchors_changed || newly_enabled || !persisted_window_matches {
+                baseline = book
+                    .transfers
+                    .snapshot(StableServerId(holder.id))
+                    .lifetime_body_bytes
+                    .max(usage.lifetime_bytes);
+                upload = upload.restart();
+            }
+            if matches!(
+                holder.quota.calendar.period,
+                ServerDownloadQuotaPeriod::OneTime
+            ) {
+                window = None;
+            }
+
+            let generation = previous.as_ref().map_or_else(
+                || initial_generation(holder.id, window, usage.updated_at),
+                |value| {
+                    if anchors_changed || newly_enabled || !persisted_window_matches {
+                        value.generation.wrapping_add(1).max(1)
+                    } else {
+                        value.generation
+                    }
+                },
+            );
+            let policy = ServerPolicyState {
+                quota: holder.quota,
+                rate: holder.rate,
+                window,
+                generation,
+                upload_caps: holder.upload_caps,
+                upload,
+            };
+            let config = pacer_config(&policy);
+            let quota_used_bytes = usage.lifetime_bytes.saturating_sub(baseline);
+
+            if previous.is_none() {
+                book.transfers.restore(
+                    StableServerId(holder.id),
+                    config,
+                    ServerTransferInitialState {
+                        lifetime_body_bytes: usage.lifetime_bytes,
+                        quota_used_bytes,
+                    },
+                );
+            } else {
+                book.transfers.configure(StableServerId(holder.id), config);
+            }
+            policies.insert(holder.id, policy);
+
+            if baseline != usage.quota_baseline_bytes
+                || window.map(|value| value.start) != usage.window_start
+                || window.map(|value| value.end) != usage.window_end
+                || upload != stored_upload
+            {
+                usage_updates.push((
+                    ServerDownloadUsage {
+                        server_id: holder.id,
+                        lifetime_bytes: usage.lifetime_bytes.max(baseline),
+                        quota_baseline_bytes: baseline,
+                        window_start: window.map(|value| value.start),
+                        window_end: window.map(|value| value.end),
+                        updated_at: weaver_server_base::e2e_clock::utc_now(),
+                    },
+                    upload,
+                ));
+            }
+        }
+        drop(policies);
+        self.notify_changed();
+        for (usage, upload) in usage_updates {
+            self.store_usage(scope, &usage, upload)?;
+        }
+        Ok(())
+    }
+
+    fn snapshot_in(&self, scope: TransferScope, id: u32) -> Option<ServerDownloadQuotaSnapshot> {
+        let book = self.book(scope);
+        let policies = book.policies();
+        let policy = policies.get(&id)?;
+        let snapshot = book.transfers.snapshot(StableServerId(id));
+        Some(snapshot_for_policy(
+            id,
+            &snapshot,
+            policy,
+            weaver_server_base::e2e_clock::local_now(),
+        ))
+    }
+
+    fn snapshots_in(&self, scope: TransferScope) -> Vec<ServerDownloadQuotaSnapshot> {
+        let now = weaver_server_base::e2e_clock::local_now();
+        let book = self.book(scope);
+        let policies = book.policies();
+        let mut snapshots = policies
+            .iter()
+            .map(|(&id, policy)| {
+                let snapshot = book.transfers.snapshot(StableServerId(id));
+                snapshot_for_policy(id, &snapshot, policy, now)
+            })
+            .collect::<Vec<_>>();
+        snapshots.sort_unstable_by_key(|snapshot| snapshot.server_id);
+        snapshots
+    }
+
+    pub fn snapshot(&self, server_id: u32) -> Option<ServerDownloadQuotaSnapshot> {
+        self.snapshot_in(TransferScope::Server, server_id)
+    }
+
+    pub fn snapshots(&self) -> Vec<ServerDownloadQuotaSnapshot> {
+        self.snapshots_in(TransferScope::Server)
+    }
+
+    // The live usage of one egress; its id is carried in `server_id`.
+    pub fn egress_snapshot(&self, egress_id: u32) -> Option<ServerDownloadQuotaSnapshot> {
+        self.snapshot_in(TransferScope::Egress, egress_id)
+    }
+
+    // The live usage of every egress, by id; each id is carried in
+    // `server_id`.
+    pub fn egress_snapshots(&self) -> Vec<ServerDownloadQuotaSnapshot> {
+        self.snapshots_in(TransferScope::Egress)
+    }
+
+    // Count bytes uploaded over an egress. Crossing a cap changes where the
+    // egress stands, and every subscriber hears of it.
+    pub fn record_egress_upload(&self, egress_id: u32, bytes: u64) -> Option<QuotaState> {
+        let (before, after) = {
+            let mut policies = self.egresses.policies();
+            let policy = policies.get_mut(&egress_id)?;
+            let before = policy.upload_state();
+            policy.upload.lifetime_bytes = policy.upload.lifetime_bytes.saturating_add(bytes);
+            (before, policy.upload_state())
+        };
+        if before != after {
+            info!(
+                egress_id,
+                state = after.as_str(),
+                "egress upload quota state changed"
+            );
+            self.notify_changed();
+        }
+        Some(after)
+    }
+
+    // Bytes ever uploaded over an egress.
+    pub fn egress_upload_bytes(&self, egress_id: u32) -> Option<u64> {
+        let policies = self.egresses.policies();
+        Some(policies.get(&egress_id)?.upload.lifetime_bytes)
+    }
+
+    // Where an egress stands against its quota in each direction.
+    pub fn egress_quota_states(&self, egress_id: u32) -> Option<EgressQuotaStates> {
+        let policies = self.egresses.policies();
+        let policy = policies.get(&egress_id)?;
+        let snapshot = self.egresses.transfers.snapshot(StableServerId(egress_id));
+        Some(quota_states(&snapshot, policy))
+    }
+
+    // The rate one direction of an egress may move at under the global and
+    // scheduled limits given. An egress without a policy adds no limit.
+    pub fn egress_rate(
+        &self,
+        egress_id: u32,
+        direction: Direction,
+        global: Option<u64>,
+        schedule: Option<u64>,
+    ) -> Option<u64> {
+        let policies = self.egresses.policies();
+        let limits = policies.get(&egress_id).map_or(
+            RateLimits {
+                global,
+                schedule,
+                ..RateLimits::default()
+            },
+            |policy| {
+                let snapshot = self.egresses.transfers.snapshot(StableServerId(egress_id));
+                let states = quota_states(&snapshot, policy);
+                match direction {
+                    Direction::Download => RateLimits {
+                        global,
+                        schedule,
+                        egress: policy.rate,
+                        quota: states.download,
+                        trickle_bps: 0,
+                    },
+                    Direction::Upload => RateLimits {
+                        global,
+                        schedule,
+                        egress: policy.upload_caps.rate,
+                        quota: states.upload,
+                        trickle_bps: policy.upload_caps.trickle_bps,
+                    },
+                }
+            },
+        );
+        effective_rate(limits)
+    }
+
+    // An egress's usage in both directions over its current period.
+    pub fn egress_usage(&self, egress_id: u32) -> Option<EgressQuotaUsage> {
+        let policies = self.egresses.policies();
+        let policy = policies.get(&egress_id)?;
+        let snapshot = self.egresses.transfers.snapshot(StableServerId(egress_id));
+        let states = quota_states(&snapshot, policy);
+        let projected = snapshot
+            .quota_used_bytes
+            .saturating_add(snapshot.quota_reserved_bytes);
+        let upload_used = policy.upload.used_bytes();
+        Some(EgressQuotaUsage {
+            egress_id,
+            download: DirectionUsage {
+                used_bytes: snapshot.quota_used_bytes,
+                remaining_bytes: policy
+                    .quota
+                    .download_bytes
+                    .map(|limit| limit.saturating_sub(projected)),
+                state: states.download,
+            },
+            upload: DirectionUsage {
+                used_bytes: upload_used,
+                remaining_bytes: policy
+                    .upload_caps
+                    .hard_bytes
+                    .map(|limit| limit.saturating_sub(upload_used)),
+                state: states.upload,
+            },
+            window_start: policy.window.map(|value| value.start),
+            window_end: policy.window.map(|value| value.end),
+            timezone: local_timezone_label(weaver_server_base::e2e_clock::local_now()),
+        })
+    }
+
+    pub fn reset_usage(&self, server_id: u32) -> Result<ServerDownloadQuotaSnapshot, StateError> {
+        self.reset_usage_in(TransferScope::Server, server_id)
+    }
+
+    pub fn reset_egress_usage(
+        &self,
+        egress_id: u32,
+    ) -> Result<ServerDownloadQuotaSnapshot, StateError> {
+        self.reset_usage_in(TransferScope::Egress, egress_id)
+    }
+
+    fn reset_usage_in(
+        &self,
+        scope: TransferScope,
+        server_id: u32,
+    ) -> Result<ServerDownloadQuotaSnapshot, StateError> {
+        let _maintenance = self
+            .maintenance_gate
+            .lock()
+            .expect("server policy maintenance gate poisoned");
+        let now = weaver_server_base::e2e_clock::local_now();
+        let book = self.book(scope);
+        let (usage, upload, result) = {
+            let mut policies = book.policies();
+            let policy = policies.get_mut(&server_id).ok_or_else(|| {
+                let scope = match scope {
+                    TransferScope::Server => "server",
+                    TransferScope::Egress => "egress",
+                };
+                StateError::Database(format!("{scope} {server_id} has no transfer policy"))
+            })?;
+            policy.generation = policy.generation.wrapping_add(1).max(1);
+            policy.window = quota_window(now, policy.quota.calendar);
+            policy.upload = policy.upload.restart();
+
+            book.transfers
+                .configure(StableServerId(server_id), pacer_config(policy));
+            let after = book.transfers.snapshot(StableServerId(server_id));
+            let usage = ServerDownloadUsage {
+                server_id,
+                lifetime_bytes: after.lifetime_body_bytes,
+                quota_baseline_bytes: after.lifetime_body_bytes,
+                window_start: policy.window.map(|value| value.start),
+                window_end: policy.window.map(|value| value.end),
+                updated_at: weaver_server_base::e2e_clock::utc_now(),
+            };
+            let result = snapshot_for_policy(server_id, &after, policy, now);
+            (usage, policy.upload, result)
+        };
+        self.notify_changed();
+        self.store_usage(scope, &usage, upload)?;
+        info!(?scope, id = server_id, "download quota usage reset");
+        Ok(result)
+    }
+
+    pub fn refresh_windows(&self) -> Result<(), StateError> {
+        let _maintenance = self
+            .maintenance_gate
+            .lock()
+            .expect("server policy maintenance gate poisoned");
+        let resets = self.advance_windows();
+        self.persist_window_resets(resets)
+    }
+
+    // Roll every elapsed quota window over in memory. Cheap when nothing
+    // elapsed, which is nearly every call; the returned resets still have to
+    // be written with [`persist_window_resets`](Self::persist_window_resets).
+    fn advance_windows(&self) -> Vec<WindowReset> {
+        let now = weaver_server_base::e2e_clock::local_now();
+        let now_utc = now.with_timezone(&Utc);
+        let mut resets = Vec::new();
+        for book in self.books() {
+            let mut policies = book.policies();
+            for (&id, policy) in policies.iter_mut() {
+                let Some(window) = policy.window else {
+                    continue;
+                };
+                if now_utc < window.end {
+                    continue;
+                }
+                let Some(next_window) = quota_window(now, policy.quota.calendar) else {
+                    continue;
+                };
+                let before = book.transfers.snapshot(StableServerId(id));
+                policy.window = Some(next_window);
+                policy.generation = policy.generation.wrapping_add(1).max(1);
+                policy.upload = policy.upload.restart();
+                book.transfers
+                    .configure(StableServerId(id), pacer_config(policy));
+                resets.push(WindowReset {
+                    scope: book.scope,
+                    id,
+                    lifetime_bytes: before.lifetime_body_bytes,
+                    policy: policy.clone(),
+                });
+            }
+        }
+        if !resets.is_empty() {
+            self.notify_changed();
+        }
+        resets
+    }
+
+    fn persist_window_resets(&self, resets: Vec<WindowReset>) -> Result<(), StateError> {
+        for reset in resets {
+            let usage = ServerDownloadUsage {
+                server_id: reset.id,
+                lifetime_bytes: reset.lifetime_bytes,
+                quota_baseline_bytes: reset.lifetime_bytes,
+                window_start: reset.policy.window.map(|value| value.start),
+                window_end: reset.policy.window.map(|value| value.end),
+                updated_at: weaver_server_base::e2e_clock::utc_now(),
+            };
+            self.store_usage(reset.scope, &usage, reset.policy.upload)?;
+            self.record_flushed(reset.scope, &usage, reset.policy.upload);
+            match reset.scope {
+                TransferScope::Server => {
+                    info!(server_id = reset.id, "server download quota window reset")
+                }
+                TransferScope::Egress => {
+                    info!(egress_id = reset.id, "egress download quota window reset")
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn record_flushed(
+        &self,
+        scope: TransferScope,
+        usage: &ServerDownloadUsage,
+        upload: UploadCount,
+    ) {
+        self.flushed_usage
+            .lock()
+            .expect("server policy registry poisoned")
+            .insert((scope, usage.server_id), FlushedUsage::of(usage, upload));
+    }
+
+    // The current usage of every control, with whether it differs from what
+    // was last written.
+    fn usage_rows(&self) -> Vec<(TransferScope, ServerDownloadUsage, UploadCount, bool)> {
+        let flushed = self
+            .flushed_usage
+            .lock()
+            .expect("server policy registry poisoned");
+        let mut rows = Vec::new();
+        for book in self.books() {
+            let policies = book.policies();
+            rows.extend(policies.iter().map(|(&id, policy)| {
+                let snapshot = book.transfers.snapshot(StableServerId(id));
+                let usage = ServerDownloadUsage {
+                    server_id: id,
+                    lifetime_bytes: snapshot.lifetime_body_bytes,
+                    quota_baseline_bytes: snapshot
+                        .lifetime_body_bytes
+                        .saturating_sub(snapshot.quota_used_bytes),
+                    window_start: policy.window.map(|value| value.start),
+                    window_end: policy.window.map(|value| value.end),
+                    updated_at: weaver_server_base::e2e_clock::utc_now(),
+                };
+                let changed = flushed.get(&(book.scope, id))
+                    != Some(&FlushedUsage::of(&usage, policy.upload));
+                (book.scope, usage, policy.upload, changed)
+            }));
+        }
+        rows
+    }
+
+    // Whether a flush now would write anything.
+    pub fn usage_changed_since_flush(&self) -> bool {
+        self.usage_rows().iter().any(|(_, _, _, changed)| *changed)
+    }
+
+    pub fn flush_usage(&self) -> Result<(), StateError> {
+        let _maintenance = self
+            .maintenance_gate
+            .lock()
+            .expect("server policy maintenance gate poisoned");
+        let resets = self.advance_windows();
+        self.persist_window_resets(resets)?;
+        let changed = self
+            .usage_rows()
+            .into_iter()
+            .filter_map(|(scope, usage, upload, changed)| changed.then_some((scope, usage, upload)))
+            .collect::<Vec<_>>();
+        let mut server = Vec::new();
+        let mut egress = Vec::new();
+        for (scope, usage, _) in &changed {
+            match scope {
+                TransferScope::Server => server.push(usage.clone()),
+                TransferScope::Egress => egress.push(usage.clone()),
+            }
+        }
+        self.db.store_download_usage(&server, &egress)?;
+        // An egress's upload counts sit on the usage row the batch wrote.
+        for (scope, usage, upload) in &changed {
+            if *scope == TransferScope::Egress {
+                self.db.set_egress_upload_usage(
+                    usage.server_id,
+                    upload.lifetime_bytes,
+                    upload.baseline_bytes,
+                )?;
+            }
+        }
+        for (scope, usage, upload) in &changed {
+            self.record_flushed(*scope, usage, *upload);
+        }
+        Ok(())
+    }
+
+    pub fn spawn_maintenance(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let registry = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let Some(registry) = registry.upgrade() else {
+                    break;
+                };
+                // The in-memory part runs here: with no elapsed window and
+                // no new bytes, an idle daemon touches neither a worker
+                // thread nor the database.
+                let resets = {
+                    let _maintenance = registry
+                        .maintenance_gate
+                        .lock()
+                        .expect("server policy maintenance gate poisoned");
+                    registry.advance_windows()
+                };
+                let should_flush = {
+                    let mut last_flush = registry
+                        .last_flush
+                        .lock()
+                        .expect("server policy registry poisoned");
+                    if last_flush.elapsed() >= Self::FLUSH_INTERVAL
+                        && registry.usage_changed_since_flush()
+                    {
+                        *last_flush = Instant::now();
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if resets.is_empty() && !should_flush {
+                    continue;
+                }
+                let result = tokio::task::spawn_blocking(move || {
+                    {
+                        let _maintenance = registry
+                            .maintenance_gate
+                            .lock()
+                            .expect("server policy maintenance gate poisoned");
+                        registry.persist_window_resets(resets)?;
+                    }
+                    if should_flush {
+                        registry.flush_usage()
+                    } else {
+                        Ok(())
+                    }
+                })
+                .await;
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        warn!(error = %error, "failed to maintain download usage");
+                    }
+                    Err(error) => {
+                        warn!(error = %error, "download usage maintenance task failed");
+                    }
+                }
+            }
+        })
+    }
+}
+
+// What the pacer enforces for a policy. A rate of `Some(0)` moves nothing,
+// which the pacer holds as a budget of no bytes.
+fn pacer_config(policy: &ServerPolicyState) -> ServerTransferConfig {
+    let quota = policy
+        .quota
+        .download_bytes
+        .map(|limit_bytes| QuotaRuntimeConfig {
+            limit_bytes,
+            generation: policy.generation,
+            retry_at: policy.window.and_then(monotonic_deadline),
+        });
+    rate_config(policy.rate, quota)
+}
+
+// A download rate and quota as the pacer takes them: its rate of 0 is no
+// limit, so a rate of `Some(0)` closes the holder instead.
+pub(crate) fn rate_config(
+    rate: Option<u64>,
+    quota: Option<QuotaRuntimeConfig>,
+) -> ServerTransferConfig {
+    ServerTransferConfig {
+        rate_bytes_per_sec: rate.unwrap_or(0),
+        quota,
+        closed: rate == Some(0),
+    }
+}
+
+// Where a holder stands in each direction. Downloads stop at the budget,
+// or once the quota turns work away: a reservation is taken at its estimate,
+// so the bytes used can stay short of the budget while nothing more fits. A
+// download quota has no soft cap.
+fn quota_states(
+    snapshot: &weaver_nntp::transfer::ServerTransferSnapshot,
+    policy: &ServerPolicyState,
+) -> EgressQuotaStates {
+    let download = match policy.quota.download_bytes {
+        Some(_) if quota_blocked(snapshot, policy) => QuotaState::Stopped,
+        budget => QuotaState::of(snapshot.quota_used_bytes, None, budget),
+    };
+    EgressQuotaStates {
+        download,
+        upload: policy.upload_state(),
+    }
+}
+
+// Whether the holder's download quota turns work away. A holder at a rate
+// of 0 turns every request away, quota or not: its quota does so only once
+// its bytes reach the budget.
+fn quota_blocked(
+    snapshot: &weaver_nntp::transfer::ServerTransferSnapshot,
+    policy: &ServerPolicyState,
+) -> bool {
+    if policy.rate == Some(0) {
+        return policy.quota.download_bytes.is_some_and(|limit| {
+            snapshot
+                .quota_used_bytes
+                .saturating_add(snapshot.quota_reserved_bytes)
+                >= limit
+        });
+    }
+    snapshot.quota_blocked
+}
+
+fn monotonic_deadline(window: ServerQuotaWindow) -> Option<Instant> {
+    let delay = (window.end - weaver_server_base::e2e_clock::utc_now())
+        .to_std()
+        .ok()?;
+    Some(Instant::now() + delay)
+}
+
+fn initial_generation(
+    server_id: u32,
+    window: Option<ServerQuotaWindow>,
+    updated_at: DateTime<Utc>,
+) -> u64 {
+    let epoch = window
+        .map(|value| value.start.timestamp())
+        .unwrap_or_else(|| updated_at.timestamp())
+        .unsigned_abs();
+    (epoch << 16) ^ u64::from(server_id).max(1)
+}
+
+fn snapshot_for_policy(
+    server_id: u32,
+    snapshot: &weaver_nntp::transfer::ServerTransferSnapshot,
+    policy: &ServerPolicyState,
+    now: DateTime<Local>,
+) -> ServerDownloadQuotaSnapshot {
+    ServerDownloadQuotaSnapshot {
+        server_id,
+        lifetime_bytes: snapshot.lifetime_body_bytes,
+        used_bytes: snapshot.quota_used_bytes,
+        reserved_bytes: snapshot.quota_reserved_bytes,
+        remaining_bytes: policy.quota.download_bytes.map(|limit| {
+            limit.saturating_sub(
+                snapshot
+                    .quota_used_bytes
+                    .saturating_add(snapshot.quota_reserved_bytes),
+            )
+        }),
+        blocked: quota_blocked(snapshot, policy),
+        window_start: policy.window.map(|value| value.start),
+        window_end: policy.window.map(|value| value.end),
+        timezone: local_timezone_label(now),
+    }
+}

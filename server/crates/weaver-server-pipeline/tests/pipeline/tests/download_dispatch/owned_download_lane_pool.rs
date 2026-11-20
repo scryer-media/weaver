@@ -5,7 +5,14 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 use weaver_nntp::client::{NntpClient, NntpClientConfig};
-use weaver_server_pipeline::MessageId;
+use weaver_server_composition::MessageId;
+use weaver_server_composition::proxies::{self, ProxiesNetworkPersistenceQueries};
+use weaver_server_composition::servers::ServerDownloadQuotaPeriod;
+use weaver_server_composition::servers::transfer_policy::ServerTransferPolicyRegistry;
+use weaver_server_composition::{Database, DownloadBlockKind};
+use weaver_server_composition::{DownloadPressureState, DownloadState};
+use weaver_server_composition::{JobId, JobStatus, NzbFileId, SegmentId};
+use weaver_server_pipeline::SchedulerHandle;
 use weaver_server_pipeline::pipeline::tests::dispatch_fixture::owned_completion::{
     PIN_TRIAL_CLEAN_BATCHES, index_and_payload_spec,
 };
@@ -21,12 +28,7 @@ use weaver_server_pipeline::pipeline::tests::dispatch_fixture::{
 use weaver_server_pipeline::pipeline::tests::{
     encode_article_part, segmented_job_spec, standalone_job_spec, standalone_with_par2_job_spec,
 };
-use weaver_server_pipeline::proxies::{self, ProxiesNetworkPersistenceQueries};
-use weaver_server_pipeline::servers::ServerDownloadQuotaPeriod;
-use weaver_server_pipeline::servers::transfer_policy::ServerTransferPolicyRegistry;
-use weaver_server_pipeline::{Database, DownloadBlockKind};
-use weaver_server_pipeline::{DownloadPressureState, DownloadState, SchedulerHandle};
-use weaver_server_pipeline::{DownloadQueue, DownloadWork, JobId, JobStatus, NzbFileId, SegmentId};
+use weaver_server_pipeline::{DownloadQueue, DownloadWork};
 
 fn held_segment(job_id: JobId, file_index: u32, segment_number: u32) -> SegmentId {
     SegmentId {

@@ -6,8 +6,6 @@
 
 use super::archive_scenario_fixtures::sets::{delivered, delivered_as_described};
 use super::harness::{ARTICLE, Claim, Post, Scenario, assert_fetched_once, par2_set, payload, run};
-use crate::history::HistoryFailureKind;
-use crate::jobs::model::JobStatus;
 use std::collections::BTreeMap;
 use weaver_graph::recovery::RepairOutcome;
 use weaver_server_pipeline::pipeline::tests::engines::archive_scenario_fixtures::sets::namespace_move_counts;
@@ -81,30 +79,24 @@ async fn a_member_two_sets_describe_is_repaired_once() {
     );
 }
 
-// The member's binding answers to the first set that describes it: its
-// shortfall is the repair's, though the second set alone holds blocks
-// enough. The members it never reached are delivered whole beside it, so
-// the job ends Partial, its failure the repair's.
+// The first set that describes the member cannot rebuild it: two of its
+// slices are damaged and the lantern set carries one block. It gives the
+// member up, the beacon set, which also describes it and holds two blocks,
+// rebuilds it, and the job completes with every file whole.
 #[tokio::test]
-async fn a_member_two_sets_describe_fails_on_the_first_sets_shortfall() {
+async fn a_member_its_first_set_cannot_rebuild_is_repaired_by_the_second() {
     let scenario = Scenario::new(shared_member()).damaged(1, 0).damaged(1, 2);
     let graph = run(&scenario).await;
     assert!(graph.refetched().is_empty());
-    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Repair));
-    assert_eq!(
-        graph.status,
-        Some(JobStatus::Partial),
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert_eq!(graph.failure_kind, None);
+    assert!(claims_all(&graph.claims, Claim::Complete));
+    assert!(claims_all(&graph.graph().claims, Claim::Complete));
+    let ember = payload(3 * ARTICLE, 24);
+    assert!(
+        graph.files.values().any(|bytes| *bytes == ember),
         "{:?}",
-        graph.failure
-    );
-    assert_eq!(graph.claims["lantern.mkv"], Claim::Complete);
-    assert_eq!(graph.claims["beacon.mkv"], Claim::Complete);
-    assert_eq!(
-        graph.graph().outcomes,
-        vec![Some(RepairOutcome::Impossible {
-            damaged: 2,
-            reachable: 1
-        })]
+        graph.files.keys()
     );
 }
 

@@ -741,10 +741,24 @@ mod cache_tests {
                 &offered.parts[0].bytes
             ));
             assert!(restore(&offered).is_ok());
+            // The header check is the store's work, done on its loan after
+            // the offer and after the delivery.
+            while store.work_due() {
+                store.work(&mut Vec::new());
+            }
             deliver(&mut store, 0, &bytes, Provenance::Fresh);
+            while store.work_due() {
+                store.work(&mut Vec::new());
+            }
+            // The bytes the tree held while the check was due come back once
+            // the headers open and their placement moves.
+            deliver(&mut store, 0, &bytes, Provenance::Fresh);
+            while store.work_due() {
+                store.work(&mut Vec::new());
+            }
             let opened = store.facts();
             let decoded: StoreFacts = opened.read(Kind::RarStore).unwrap();
-            assert!(decoded.volumes[0].get().locked.is_none());
+            assert!(decoded.volumes[0].get().locked.is_none(), "{version:?}");
             assert_eq!(decoded.entries[0].name, "payload.bin");
             assert_eq!(decoded.entries[0].length, Some(128));
             assert!(restore(&opened).is_ok());

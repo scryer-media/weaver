@@ -37,7 +37,7 @@ use weaver_server_base::operations::metrics::PipelineMetrics;
 use weaver_server_disk::operations::disk::CapacityReader;
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum GraphRestoreError {
+pub enum GraphRestoreError {
     #[error("graph job {0} has no checkpoint to restore from")]
     NoCheckpoint(u64),
     #[error("graph job checkpoint could not be read: {0}")]
@@ -72,7 +72,7 @@ impl GraphRestoreError {
     // told again, it would fault again on every start, so the job starts
     // afresh instead. A read that failed, or a rebuild that failed writing,
     // is not this.
-    fn not_this_builds(&self) -> bool {
+    pub fn not_this_builds(&self) -> bool {
         matches!(
             self,
             Self::Rows(_)
@@ -381,7 +381,7 @@ impl RestoreSeat {
 // directory's own marker and the run's cache are the directory's, never the
 // job's, and stay. A file that cannot be removed stays; the job does not
 // read it.
-pub(crate) fn sweep_unnamed(
+pub fn sweep_unnamed(
     working_dir: &Path,
     snapshot: &checkpoint::Snapshot,
     held_parts: &[crate::jobs::graph_checkpoint::HeldPartRow],
@@ -481,7 +481,7 @@ fn sweep_within(dir: &Path, at: &Path, named: &HashSet<String>, within: &HashSet
 
 // What a job's working directory holds that no archive made: the job's own
 // files, and the directory's.
-pub(crate) fn the_jobs(name: &Path) -> bool {
+pub fn the_jobs(name: &Path) -> bool {
     name == Path::new(weaver_graph::names::INTERNAL_DIR) || the_directorys(name)
 }
 
@@ -517,32 +517,4 @@ fn restore_passwords(
         &carried,
         &global,
     ))
-}
-
-#[cfg(test)]
-mod tests {
-    use weaver_graph::VolumeIndex;
-
-    use super::{GraphError, GraphRestoreError, RestoreFailure};
-    use crate::pipeline::graph::root::source::Inconsistent;
-
-    // A record the rebuild finds contradicting itself would fault again on
-    // every start: the job starts afresh, as from a checkpoint this build
-    // does not restore. A rebuild that failed writing is still held.
-    #[test]
-    fn a_rebuild_that_finds_its_record_inconsistent_starts_afresh() {
-        let inconsistent = GraphError::Inconsistent(Inconsistent {
-            volume: VolumeIndex(0),
-            start: 27,
-            end: 28,
-        });
-        assert!(GraphRestoreError::Rebuild(RestoreFailure::Step(inconsistent)).not_this_builds());
-        let write = GraphError::Write(
-            crate::pipeline::graph::namespace::WriteError::UnknownMember {
-                node: weaver_graph::NodeId::ROOT,
-                member: weaver_graph::MemberId(9),
-            },
-        );
-        assert!(!GraphRestoreError::Rebuild(RestoreFailure::Step(write)).not_this_builds());
-    }
 }

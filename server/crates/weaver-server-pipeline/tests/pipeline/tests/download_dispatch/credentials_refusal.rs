@@ -10,11 +10,12 @@
 use std::sync::{Arc, atomic::Ordering};
 use std::time::Duration;
 
+use weaver_server_composition::{JobId, NzbFileId, SegmentId};
+use weaver_server_pipeline::DownloadQueue;
 use weaver_server_pipeline::pipeline::tests::{
     dispatch_fixture::{DispatchFixture, owned_failures::FailedFetch},
     segmented_job_spec,
 };
-use weaver_server_pipeline::{DownloadQueue, JobId, NzbFileId, SegmentId};
 
 fn held_segment(job_id: JobId, file_index: u32, segment_number: u32) -> SegmentId {
     SegmentId {

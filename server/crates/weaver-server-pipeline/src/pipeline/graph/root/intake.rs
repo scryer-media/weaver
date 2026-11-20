@@ -21,24 +21,24 @@ use crate::pipeline::graph::namespace::{Arrival, Segments};
 
 // A decoded article, as the decoder placed it.
 #[derive(Clone, Debug)]
-pub(crate) struct Decoded {
-    pub(crate) volume: VolumeIndex,
-    pub(crate) ordinal: u32,
-    pub(crate) offset: u64,
-    pub(crate) bytes: Bytes,
+pub struct Decoded {
+    pub volume: VolumeIndex,
+    pub ordinal: u32,
+    pub offset: u64,
+    pub bytes: Bytes,
     // The article's own checksum passed and nothing suggests it was cut short.
-    pub(crate) intact: bool,
+    pub intact: bool,
     // The encoding carries the article's position; uuencode does not, so its
     // offset is only where the articles before it ended.
-    pub(crate) positioned: bool,
+    pub positioned: bool,
     // The file's decoded length, when the article declares it.
-    pub(crate) length: Option<u64>,
+    pub length: Option<u64>,
     // Where the article's part ends, as its header declares it: where the
     // next article begins, whatever its own bytes decoded to.
-    pub(crate) declared_end: Option<u64>,
+    pub declared_end: Option<u64>,
     // The checksums of the article's bytes, cut at the recovery set's block
     // boundaries when the decoder knew them.
-    pub(crate) segments: Vec<Segment>,
+    pub segments: Vec<Segment>,
 }
 
 impl Decoded {
@@ -104,13 +104,13 @@ impl Decoded {
 // later than the delivery that brought them. A member a set proved has no
 // bytes left for a set to check, and its volume is sealed.
 #[derive(Debug, Default)]
-pub(crate) struct Checksums {
+pub struct Checksums {
     volumes: BTreeMap<VolumeIndex, BTreeMap<u64, Segment>>,
     // The starts of the segments each change put in or took out.
-    marks: BTreeMap<VolumeIndex, Marks<u64>>,
+    pub marks: BTreeMap<VolumeIndex, Marks<u64>>,
     // How many segments are kept across every volume, and whether the
     // guard below has said they passed it.
-    kept: usize,
+    pub kept: usize,
     warned: bool,
 }
 
@@ -123,7 +123,7 @@ impl Checksums {
     // The checksums kept for a range are those of the bytes last delivered
     // there: an article delivered again, cut at other boundaries, replaces
     // every checksum its range overlaps.
-    pub(crate) fn record(&mut self, volume: VolumeIndex, segments: &[Segment]) {
+    pub fn record(&mut self, volume: VolumeIndex, segments: &[Segment]) {
         let kept = self.volumes.entry(volume).or_default();
         let marks = self.marks.entry(volume).or_default();
         for segment in segments {
@@ -201,58 +201,6 @@ impl Segments for Checksums {
             kept.range(first..range.end)
                 .map(|(_, segment)| *segment)
                 .filter(|segment| segment.range.intersect(range).is_some()),
-        );
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn segment(start: u64, end: u64, crc32: u32) -> Segment {
-        Segment {
-            range: ByteRange::new(start, end),
-            crc32,
-            verified: true,
-        }
-    }
-
-    // An article delivered again replaces the checksums its range overlaps,
-    // straight out of the kept map: the same checksums kept and the same
-    // starts marked, and nothing allocated to find them.
-    #[test]
-    fn a_redelivery_replaces_what_it_overlaps_without_allocating() {
-        let volume = VolumeIndex(3);
-        let mut checksums = Checksums::default();
-        checksums.record(
-            volume,
-            &[
-                segment(0, 10, 1),
-                segment(10, 20, 2),
-                segment(20, 30, 3),
-                segment(30, 40, 4),
-            ],
-        );
-        let marked = checksums.marks[&volume].at();
-        let redelivery = [segment(0, 25, 9)];
-
-        let before = crate::alloc_probe::allocations();
-        checksums.record(volume, &redelivery);
-        assert_eq!(
-            crate::alloc_probe::allocations(),
-            before,
-            "replacing overlapped checksums allocates nothing"
-        );
-
-        assert_eq!(checksums.kept, 2);
-        let mut held = Vec::new();
-        checksums.segments_for(NodeId::ROOT, volume, ByteRange::new(0, 40), &mut held);
-        assert_eq!(held, vec![segment(0, 25, 9), segment(30, 40, 4)]);
-        assert_eq!(
-            checksums.marks[&volume].since(marked).collect::<Vec<_>>(),
-            vec![20, 10, 0],
-            "each overlapped start is marked, nearest first; the new segment \
-             marks its start again last"
         );
     }
 }

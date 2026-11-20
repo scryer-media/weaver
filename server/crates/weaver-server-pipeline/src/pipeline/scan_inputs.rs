@@ -24,7 +24,7 @@ use weaver_server_base::jobs::ids::{JobId, NzbFileId};
 // mutable borrow of a job's graph moves that graph's counter first, since
 // the graph is the only thing that can say what the borrow changed.
 #[derive(Default)]
-pub(crate) struct GraphJobs {
+pub struct GraphJobs {
     jobs: HashMap<JobId, GraphJob>,
 }
 
@@ -37,13 +37,13 @@ impl Deref for GraphJobs {
 }
 
 impl GraphJobs {
-    pub(crate) fn get_mut(&mut self, job_id: &JobId) -> Option<&mut GraphJob> {
+    pub fn get_mut(&mut self, job_id: &JobId) -> Option<&mut GraphJob> {
         let job = self.jobs.get_mut(job_id)?;
         job.touched();
         Some(job)
     }
 
-    pub(crate) fn values_mut(&mut self) -> impl Iterator<Item = &mut GraphJob> {
+    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut GraphJob> {
         fn touch(job: &mut GraphJob) -> &mut GraphJob {
             job.touched();
             job
@@ -53,12 +53,12 @@ impl GraphJobs {
 
     // A graph put in may have been changed while it was out of this map,
     // where no borrow is counted, so its counter moves as it comes in.
-    pub(crate) fn insert(&mut self, job_id: JobId, mut job: GraphJob) -> Option<GraphJob> {
+    pub fn insert(&mut self, job_id: JobId, mut job: GraphJob) -> Option<GraphJob> {
         job.touched();
         self.jobs.insert(job_id, job)
     }
 
-    pub(crate) fn remove(&mut self, job_id: &JobId) -> Option<GraphJob> {
+    pub fn remove(&mut self, job_id: &JobId) -> Option<GraphJob> {
         self.jobs.remove(job_id)
     }
 
@@ -140,7 +140,7 @@ impl UuFiles {
         })
     }
 
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) fn insert(&mut self, file_id: NzbFileId, file: UuFileAssembly) {
         self.moved.fetch_add(1, Ordering::Relaxed);
         self.files.insert(file_id, Self::adopted(&self.moved, file));

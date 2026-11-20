@@ -4,13 +4,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use weaver_server_composition::{JobId, JobStatus};
+use weaver_server_pipeline::DownloadWork;
 use weaver_server_pipeline::pipeline::tests::dispatch_fixture::scheduler_lanes::{
     Handout, SaturationWake, YieldReason,
 };
 use weaver_server_pipeline::pipeline::tests::{
     dispatch_fixture::DispatchFixture, segmented_job_spec,
 };
-use weaver_server_pipeline::{DownloadWork, JobId, JobStatus};
 const SERVER_A: usize = 0;
 const SERVER_B: usize = 1;
 
@@ -626,7 +627,7 @@ fn taken(handout: Handout) -> Vec<DownloadWork> {
 
 #[tokio::test(start_paused = true)]
 async fn only_a_failed_pause_or_server_disable_holds_admission() {
-    use weaver_server_pipeline::bandwidth::schedule::{
+    use weaver_server_orchestration::bandwidth::schedule::{
         ScheduleServices, spawn_evaluator_with_services,
     };
     use weaver_server_pipeline::bandwidth::{ScheduleAction, ScheduleEntry};
@@ -1191,7 +1192,7 @@ async fn a_queued_job_is_built_on_its_first_handout_and_charged() {
 
     pipeline.deliver_activation().await;
     let state = pipeline.job(job);
-    let ordinals = |segments: &[weaver_server_pipeline::SegmentSpec]| -> Vec<(u32, u32)> {
+    let ordinals = |segments: &[weaver_server_composition::SegmentSpec]| -> Vec<(u32, u32)> {
         segments
             .iter()
             .map(|segment| (segment.ordinal, segment.bytes))

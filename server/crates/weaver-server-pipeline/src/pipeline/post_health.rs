@@ -58,6 +58,12 @@ use weaver_server_base::jobs::ids::{JobId, NzbFileId, SegmentId};
 
 mod first_articles;
 mod given_up;
+#[cfg(feature = "pipeline-test-fixtures")]
+pub(crate) mod units {
+    pub mod given_up {
+        pub use super::super::given_up::*;
+    }
+}
 
 pub(in crate::pipeline) use first_articles::FirstArticles;
 pub(in crate::pipeline) use given_up::GivenUp;
@@ -73,9 +79,9 @@ pub(crate) const FIRST_ARTICLE_GATE_MIN_FILES: usize = 10;
 pub(crate) const FIRST_ARTICLE_GATE_MISSING_PCT: usize = 80;
 
 // The least failed bytes a clean round waits for before the next.
-pub(crate) const REARM_MIN_BYTES: u64 = 128 * 1024 * 1024;
+pub const REARM_MIN_BYTES: u64 = 128 * 1024 * 1024;
 // A clean round also waits for this share of the payload to fail.
-pub(crate) const REARM_PAYLOAD_DIVISOR: u64 = 200;
+pub const REARM_PAYLOAD_DIVISOR: u64 = 200;
 
 // How far ahead of the delivered payload the losses must run before damage
 // confined to a single file is allowed to look like a dead release.
@@ -101,20 +107,20 @@ pub(crate) const SEATED_BATCH_ANSWERS_WITHIN: std::time::Duration =
 
 // What a round found, once every batch in it is back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ProbeUpdate {
+pub struct ProbeUpdate {
     pub(crate) job_id: JobId,
     pub(crate) round: u32,
     // The bytes every server had said are gone when the round was armed:
     // none of them was asked.
     pub(crate) known: u64,
     // Articles a batch answered for.
-    pub(crate) total: usize,
+    pub total: usize,
     // Of those, the ones no server holds.
-    pub(crate) missed: usize,
+    pub missed: usize,
     // Articles left unanswered by a batch that could not settle.
-    pub(crate) unverified: usize,
+    pub unverified: usize,
     // Nothing in the round answered.
-    pub(crate) inconclusive: bool,
+    pub inconclusive: bool,
 }
 
 // Running tally over one round's batches.
@@ -126,16 +132,16 @@ pub(crate) struct ProbeUpdate {
 // what `total` already stands for. Only a round that answered for nothing at
 // all has no verdict to give.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ProbeTally {
+pub struct ProbeTally {
     pub(crate) checked: usize,
     pub(crate) missed: usize,
     pub(crate) unverified: usize,
-    pub(crate) unverified_batches: usize,
+    pub unverified_batches: usize,
 }
 
 impl ProbeTally {
     // Fold in a batch that answered.
-    pub(crate) fn record_answered(&mut self, exists: &[bool]) {
+    pub fn record_answered(&mut self, exists: &[bool]) {
         for found in exists {
             self.checked = self.checked.saturating_add(1);
             if !found {
@@ -146,7 +152,7 @@ impl ProbeTally {
 
     // Fold in a batch that could not settle, so the round goes on with the
     // articles it could not reach counted against its coverage.
-    pub(crate) fn record_unsettled(&mut self, batch_len: usize) {
+    pub fn record_unsettled(&mut self, batch_len: usize) {
         self.unverified_batches = self.unverified_batches.saturating_add(1);
         self.unverified = self.unverified.saturating_add(batch_len);
     }
@@ -165,7 +171,7 @@ impl ProbeTally {
     }
 
     // The update the round reports once every batch is back.
-    pub(crate) fn update(&self, job_id: JobId, round: u32, known: u64) -> ProbeUpdate {
+    pub fn update(&self, job_id: JobId, round: u32, known: u64) -> ProbeUpdate {
         ProbeUpdate {
             job_id,
             round,
@@ -181,7 +187,7 @@ impl ProbeTally {
 // One batch of a round, carried from server to server until a server holds
 // every article in it or every server it may go to has answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProbeBatch {
+pub struct ProbeBatch {
     pub(crate) job_id: JobId,
     pub(crate) round: u32,
     ids: Vec<String>,
@@ -197,7 +203,7 @@ pub(crate) struct ProbeBatch {
 }
 
 impl ProbeBatch {
-    pub(crate) fn new(job_id: JobId, round: u32, ids: Vec<String>) -> Self {
+    pub fn new(job_id: JobId, round: u32, ids: Vec<String>) -> Self {
         Self {
             job_id,
             round,
@@ -210,7 +216,7 @@ impl ProbeBatch {
     }
 
     // The batch, its servers numbered in pool `generation`.
-    pub(crate) fn in_pool(mut self, generation: u64) -> Self {
+    pub fn in_pool(mut self, generation: u64) -> Self {
         self.pool_generation = generation;
         self
     }
@@ -220,7 +226,7 @@ impl ProbeBatch {
     // across the rebuild has whom it asked carried over by server identity:
     // a server that left the pool, or is no longer the same server, drops
     // out and is untried. What the batch found is kept.
-    pub(crate) fn rebase(&mut self, layouts: &super::PoolLayouts, generation: u64) -> bool {
+    pub fn rebase(&mut self, layouts: &super::PoolLayouts, generation: u64) -> bool {
         if self.pool_generation == generation {
             return true;
         }
@@ -231,7 +237,7 @@ impl ProbeBatch {
 
     // The articles no server has said it holds yet, in batch order: what the
     // next server is asked.
-    pub(crate) fn unfound(&self) -> Vec<String> {
+    pub fn unfound(&self) -> Vec<String> {
         self.ids
             .iter()
             .zip(&self.found)
@@ -241,7 +247,7 @@ impl ProbeBatch {
     }
 
     // The servers this batch has been put to.
-    pub(crate) fn asked(&self) -> weaver_nntp::ServerSet {
+    pub fn asked(&self) -> weaver_nntp::ServerSet {
         self.asked
     }
 
@@ -254,7 +260,7 @@ impl ProbeBatch {
     // The server is not asked again, whatever it answered: an answer that
     // could not settle the batch, or that does not cover it, leaves the batch
     // uncertain.
-    pub(crate) fn fold(&mut self, server: usize, result: ProbeBatchResult) {
+    pub fn fold(&mut self, server: usize, result: ProbeBatchResult) {
         self.asked.insert(server);
         let unfound = self.found.iter().filter(|found| !**found).count();
         if result.inconclusive || result.exists.len() != unfound {
@@ -270,16 +276,16 @@ impl ProbeBatch {
 
 // A lane's answer for one batch, on the server it was seated at.
 #[derive(Debug)]
-pub(crate) struct ProbeAnswer {
+pub struct ProbeAnswer {
     pub(crate) batch: ProbeBatch,
-    pub(crate) server: usize,
-    pub(crate) result: ProbeBatchResult,
+    pub server: usize,
+    pub result: ProbeBatchResult,
 }
 
 // What the probes' mail carries: a lane answering one batch, or handing
 // one back unasked because no lane could be had on its seat yet.
 #[derive(Debug)]
-pub(crate) enum ProbeMail {
+pub enum ProbeMail {
     Answered(ProbeAnswer),
     Unseated(ProbeBatch),
 }
@@ -458,7 +464,7 @@ impl Probes {
 
     // A round of `batches` batches out for the job, numbered `round`, every
     // one seated on a lane at `seated_at`, as the dispatch pass seats them.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) fn seat_round_for_test(
         &mut self,
         job_id: JobId,
@@ -508,7 +514,7 @@ pub(crate) fn declares_recovery(file: &FileSpec) -> bool {
 // or not, such a file is never one the user opens as it was posted. A
 // compressed stream or a tar is not one: posted whole, it is a file as it
 // stands, whatever opening it gave.
-pub(crate) fn names_a_piece(name: &str) -> bool {
+pub fn names_a_piece(name: &str) -> bool {
     let role = FileRole::from_filename(name);
     name.to_ascii_lowercase().ends_with(".rev")
         || weaver_model::files::names_a_z_part(name)
@@ -529,7 +535,7 @@ pub(crate) fn names_a_piece(name: &str) -> bool {
 // split part. Two files named into one place are one volume posted twice,
 // however each pads its number: `part01` and `part1`, `.7z.001` and
 // `.7z.0001`.
-pub(crate) fn names_a_place(name: &str) -> Option<Place> {
+pub fn names_a_place(name: &str) -> Option<Place> {
     let role = FileRole::from_filename(name);
     let number = match role {
         FileRole::RarVolume { volume_number } => volume_number,
@@ -552,7 +558,7 @@ pub(crate) fn names_nothing(name: &str) -> bool {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct Place {
+pub struct Place {
     kind: std::mem::Discriminant<FileRole>,
     stem: String,
     number: u32,
@@ -577,7 +583,7 @@ pub(crate) fn declared_recovery_bytes(spec: &JobSpec) -> u64 {
 
 // Where one payload file's first article stands in the sample.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Head {
+pub enum Head {
     // Every server failed it.
     Lost,
     // In hand, or ended some other way that is no loss.
@@ -588,7 +594,7 @@ pub(crate) enum Head {
 
 // The sample's word on the post.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Gate {
+pub enum Gate {
     // The lost reach the failure share of the whole sample: how many of the
     // sampled files every server failed the first article of, of how many.
     Dead { missing: usize, total: usize },
@@ -606,7 +612,7 @@ pub(crate) enum Gate {
 // the complete sample would have, and one that cannot reach it even were
 // every outstanding article lost has let the post through.
 #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-pub(crate) fn first_article_gate(heads: impl IntoIterator<Item = Head>) -> Gate {
+pub fn first_article_gate(heads: impl IntoIterator<Item = Head>) -> Gate {
     let mut total = 0;
     let mut lost = 0;
     let mut outstanding = 0;
@@ -687,11 +693,7 @@ impl<'a> Candidates<'a> {
 // exactly; asking for it again would count it twice. Each article is
 // looked at once at most, so a round costs its picks and the known losses
 // it steps over.
-pub(crate) fn sample_unknown(
-    total: usize,
-    round: u32,
-    mut gone: impl FnMut(usize) -> bool,
-) -> Vec<usize> {
+pub fn sample_unknown(total: usize, round: u32, mut gone: impl FnMut(usize) -> bool) -> Vec<usize> {
     let picks = sample_indices(total, round);
     let mut sampled = Vec::with_capacity(picks.len());
     for (at, start) in picks.iter().enumerate() {
@@ -706,7 +708,7 @@ pub(crate) fn sample_unknown(
 // The candidates a round asks for: an even stride of at least ten, or one
 // in twelve and a half, offset by the round so repeat rounds widen coverage
 // instead of asking the same articles again.
-pub(crate) fn sample_indices(total: usize, round: u32) -> Vec<usize> {
+pub fn sample_indices(total: usize, round: u32) -> Vec<usize> {
     if total == 0 {
         return Vec::new();
     }
@@ -724,12 +726,7 @@ pub(crate) fn sample_indices(total: usize, round: u32) -> Vec<usize> {
 // server already said are gone, exactly, and the share of what it asked
 // that is gone, taken over the bytes that count toward health past those.
 // The round asked none of the known losses.
-pub(crate) fn projected(
-    tracked_bytes: u64,
-    known: u64,
-    total: usize,
-    missed: usize,
-) -> Option<u64> {
+pub fn projected(tracked_bytes: u64, known: u64, total: usize, missed: usize) -> Option<u64> {
     if total == 0 || missed == 0 || tracked_bytes == 0 {
         return None;
     }
@@ -747,11 +744,7 @@ pub(crate) fn projected(
 // and getting nothing back, whether or not it has reached a second file yet.
 // One file failing while the rest of the posting arrives is neither. That is
 // a hole, and the recovery set decides what to do about it.
-pub(crate) fn looks_like_a_dead_release(
-    downloaded: u64,
-    failing_files: usize,
-    failed: u64,
-) -> bool {
+pub fn looks_like_a_dead_release(downloaded: u64, failing_files: usize, failed: u64) -> bool {
     failing_files > 1 || downloaded.saturating_mul(DEAD_RELEASE_LANDED_DIVISOR) < failed
 }
 
@@ -759,7 +752,7 @@ pub(crate) fn looks_like_a_dead_release(
 // articles missing, or answered nothing, arms the next on the next lost
 // byte; a clean one waits for a material share of the payload more to fail,
 // and never past the bytes that take the post below critical.
-pub(crate) fn next_failed_bytes(
+pub fn next_failed_bytes(
     decided: u64,
     tracked_bytes: u64,
     critical_failed_bytes: u64,
@@ -783,7 +776,7 @@ impl Pipeline {
     // The first article of each file the post names, its first segment:
     // lost when every server failed it, settled when the root holds it or
     // it ended some other way, and otherwise still to come.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     fn first_article(&self, job_id: JobId, index: u32, file: &FileSpec) -> Head {
         let first = file.segments.iter().map(|segment| segment.ordinal).min();
         self.first_article_head(job_id, index, first)
@@ -817,17 +810,20 @@ impl Pipeline {
         }
     }
 
-    // The files the post names as payload that lost at least one article.
-    // A lost recovery volume is not damage to the release.
+    // The files the post names as payload that lost at least one article,
+    // and those it names as recovery whose fronts said they are none. A lost
+    // recovery volume is not damage to the release.
     fn failing_files(&self, job_id: JobId, spec: &JobSpec) -> usize {
         let Some(given_up) = self.given_up.get(&job_id) else {
             return 0;
         };
+        let graph = self.graph_jobs.get(&job_id);
         given_up
             .missing_files()
             .filter(|index| {
                 spec.files.get(*index as usize).is_some_and(|file| {
-                    file.role.counts_toward_health() && !declares_recovery(file)
+                    (file.role.counts_toward_health() && !declares_recovery(file))
+                        || graph.is_some_and(|graph| graph.front_refutes_recovery(*index))
                 })
             })
             .count()
@@ -954,12 +950,14 @@ impl Pipeline {
                     .filter(|index| *index < files)
                     .collect();
                 for index in changed {
-                    sample.bind(index, graph.holds_as_recovery(index));
+                    let refuted = graph.front_refutes_recovery(index);
+                    sample.bind(index, graph.holds_as_recovery(index), refuted);
                 }
             }
             _ => {
                 for index in 0..files {
-                    sample.bind(index, graph.holds_as_recovery(index));
+                    let refuted = graph.front_refutes_recovery(index);
+                    sample.bind(index, graph.holds_as_recovery(index), refuted);
                 }
             }
         }
@@ -1017,7 +1015,7 @@ impl Pipeline {
 
     // The verdict as it is reached by walking every file of the post: what
     // the kept sample must always agree with.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(in crate::pipeline) fn post_health_verdict_walked(&self, job_id: JobId) -> Option<String> {
         if self.post_probes.dead.contains_key(&job_id) {
             return None;
@@ -1031,10 +1029,14 @@ impl Pipeline {
             .map(|(file, index)| (index, file, self.first_article(job_id, index, file)))
             .collect();
         let graph = self.graph_jobs.get(&job_id);
-        // A file the names count is weighed by its name, any other by what
-        // the graph holds it as.
+        // A file the names count is weighed by its name, unless its front
+        // said it is no recovery data; any other by what the graph holds it
+        // as.
+        let named = |index: u32, file: &FileSpec| {
+            names_recovery(file) && !graph.is_some_and(|graph| graph.front_refutes_recovery(index))
+        };
         let gate_recovery = |index: u32, file: &FileSpec| {
-            if names_recovery(file) {
+            if named(index, file) {
                 declares_recovery(file)
             } else {
                 graph.is_some_and(|graph| graph.holds_as_recovery(index))
@@ -1042,7 +1044,7 @@ impl Pipeline {
         };
         let unresolved_at = |index: u32, file: &FileSpec, head: Head| {
             head == Head::Outstanding
-                && !names_recovery(file)
+                && !named(index, file)
                 && !graph.is_some_and(|graph| graph.holds_as_recovery(index))
         };
         let payload = heads
@@ -1119,13 +1121,15 @@ impl Pipeline {
     }
 
     // The recovery the line is drawn from, by a walk of every posted file.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     fn recovery_walked(&self, job_id: JobId, spec: &JobSpec) -> u64 {
         let graph = self.graph_jobs.get(&job_id);
         (0u32..)
             .zip(&spec.files)
             .filter(|(index, file)| {
-                names_recovery(file) || graph.is_some_and(|graph| graph.holds_as_recovery(*index))
+                let refuted = graph.is_some_and(|graph| graph.front_refutes_recovery(*index));
+                (names_recovery(file) && !refuted)
+                    || graph.is_some_and(|graph| graph.holds_as_recovery(*index))
             })
             .flat_map(|(_, file)| file.segments.iter())
             .map(|segment| u64::from(segment.bytes))
@@ -1134,7 +1138,7 @@ impl Pipeline {
 
     // The job's sample as the feed keeps it, and as a whole read of the post
     // finds it now.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(in crate::pipeline) fn first_articles_kept_and_read(
         &self,
         job_id: JobId,
@@ -1755,12 +1759,12 @@ thread_local! {
     static HEADS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+#[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
 pub(in crate::pipeline) fn heads_read() -> usize {
     HEADS_READ.with(std::cell::Cell::get)
 }
 
-#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+#[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
 pub(in crate::pipeline) fn abandon_work() -> AbandonWork {
     ABANDON_WORK.with(std::cell::Cell::get)
 }
@@ -1784,7 +1788,7 @@ pub(in crate::pipeline) fn note_booked(segment: SegmentId, state: SegmentTermina
 
 // Keep the terminal states booked on this thread from now on, and give back
 // the ones kept until now.
-#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+#[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
 pub(in crate::pipeline) fn keep_booked() -> Vec<(SegmentId, SegmentTerminalState)> {
     BOOKED.with(|booked| booked.replace(Some(Vec::new())).unwrap_or_default())
 }
@@ -1800,7 +1804,7 @@ fn count_abandon_work(count: impl FnOnce(&mut AbandonWork)) {
 
 // Whether a post at `health` is dead against its `critical` line. At the
 // line itself it is still healthy; only below it is it dead.
-fn below_critical(health: u32, critical: u32) -> bool {
+pub fn below_critical(health: u32, critical: u32) -> bool {
     health < critical
 }
 
@@ -1808,6 +1812,3 @@ fn below_critical(health: u32, critical: u32) -> bool {
 fn critical_failed_bytes(total: u64, critical: u32) -> u64 {
     total.saturating_sub((u128::from(total) * u128::from(critical) / 1000) as u64)
 }
-
-#[cfg(test)]
-mod tests;

@@ -2,10 +2,10 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use weaver_model::files::FileRole;
-use weaver_server_pipeline::pipeline::tests::dispatch_fixture::DispatchFixture;
-use weaver_server_pipeline::{
+use weaver_server_composition::{
     FileSpec, JobId, JobSpec, JobStatus, MessageIds, SegmentId, SegmentSpec,
 };
+use weaver_server_pipeline::pipeline::tests::dispatch_fixture::DispatchFixture;
 
 // A job of `files` files, each of `segments` articles.
 fn multi_file_job_spec(name: &str, files: usize, segments: u32) -> JobSpec {

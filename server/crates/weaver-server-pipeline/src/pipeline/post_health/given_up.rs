@@ -23,19 +23,19 @@ use weaver_server_base::jobs::ids::SegmentId;
 
 // What one file of the post lost.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(in crate::pipeline) struct FileLosses {
+pub struct FileLosses {
     // Articles every server said are gone.
-    pub(in crate::pipeline) missing: usize,
+    pub missing: usize,
     // Articles given up for any end but the feed's having stopped asking.
-    pub(in crate::pipeline) lost: usize,
+    pub lost: usize,
     // The health-counted bytes of every article given up.
-    pub(in crate::pipeline) bytes: u64,
+    pub bytes: u64,
     // The health-counted bytes of the articles every server said are gone.
-    pub(in crate::pipeline) missing_bytes: u64,
+    pub missing_bytes: u64,
 }
 
 #[derive(Debug, Default)]
-pub(in crate::pipeline) struct GivenUp {
+pub struct GivenUp {
     // Each article with the end this run saw it come to: `None` for one
     // lost in a run before a restart, which every server had failed.
     articles: HashMap<SegmentId, Option<SegmentTerminalState>>,
@@ -60,7 +60,7 @@ pub(in crate::pipeline) struct GivenUp {
 
 impl GivenUp {
     // The losses of the post `spec` names, none yet.
-    pub(in crate::pipeline) fn new(spec: &JobSpec) -> Self {
+    pub fn new(spec: &JobSpec) -> Self {
         let mut given_up = Self::default();
         let mut named = HashMap::new();
         for (file, index) in spec.files.iter().zip(0u32..) {
@@ -131,12 +131,7 @@ impl GivenUp {
     // The article will never arrive, after `end`, and weighs `bytes`. The
     // first end an article reaches is the one it holds, so an article told
     // again, by a later path or by a restore, is already held.
-    pub(in crate::pipeline) fn give_up(
-        &mut self,
-        segment: SegmentId,
-        end: Option<SegmentTerminalState>,
-        bytes: u64,
-    ) {
+    pub fn give_up(&mut self, segment: SegmentId, end: Option<SegmentTerminalState>, bytes: u64) {
         // Even an article already held: the end it is booked at now may
         // change where its file's first article stands.
         if let Some(first_articles) = self.first_articles.as_mut() {
@@ -173,7 +168,7 @@ impl GivenUp {
         }
     }
 
-    pub(in crate::pipeline) fn holds(&self, segment: SegmentId) -> bool {
+    pub fn holds(&self, segment: SegmentId) -> bool {
         self.articles.contains_key(&segment)
     }
 
@@ -184,19 +179,19 @@ impl GivenUp {
     }
 
     // The health-counted bytes of every article given up.
-    pub(in crate::pipeline) fn bytes(&self) -> u64 {
+    pub fn bytes(&self) -> u64 {
         self.bytes
     }
 
     // The health-counted bytes of the articles every server said are gone,
     // each place counted where every posting of it lost them.
-    pub(in crate::pipeline) fn missing_bytes(&self) -> u64 {
+    pub fn missing_bytes(&self) -> u64 {
         self.missing_bytes
     }
 
     // The health-counted bytes the post declares past one posting of each
     // place: what its size counts twice.
-    pub(in crate::pipeline) fn again_bytes(&self) -> u64 {
+    pub fn again_bytes(&self) -> u64 {
         self.again_bytes
     }
 
@@ -215,12 +210,12 @@ impl GivenUp {
         self.first_articles = Some(first_articles);
     }
 
-    pub(in crate::pipeline) fn file(&self, index: u32) -> FileLosses {
+    pub fn file(&self, index: u32) -> FileLosses {
         self.files.get(&index).copied().unwrap_or_default()
     }
 
     // The files that lost an article every server said is gone.
-    pub(in crate::pipeline) fn missing_files(&self) -> impl Iterator<Item = u32> + '_ {
+    pub fn missing_files(&self) -> impl Iterator<Item = u32> + '_ {
         self.files
             .iter()
             .filter(|(_, file)| file.missing > 0)
@@ -255,108 +250,4 @@ fn overlaps(gone: Option<&BTreeMap<u64, u64>>, (start, end): (u64, u64)) -> Vec<
         .map(|(from, until)| ((*from).max(start), (*until).min(end)))
         .filter(|(from, until)| from < until)
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use weaver_server_base::jobs::ids::{JobId, NzbFileId};
-
-    fn segment(file_index: u32, segment_number: u32) -> SegmentId {
-        SegmentId {
-            file_id: NzbFileId {
-                job_id: JobId(1),
-                file_index,
-            },
-            segment_number,
-        }
-    }
-
-    // An article no server can bring because the one that might refuses
-    // the login counts missing, whether or not the servers asked said so.
-    #[test]
-    fn an_article_only_a_refusing_server_could_bring_counts_missing() {
-        for end in [
-            SegmentTerminalState::Unservable,
-            SegmentTerminalState::UnservableNotFound,
-        ] {
-            let mut given_up = GivenUp::default();
-            given_up.give_up(segment(0, 0), Some(end), 40);
-            assert_eq!(given_up.missing_bytes(), 40, "{end:?}");
-            assert_eq!(given_up.file(0).missing, 1, "{end:?}");
-            assert_eq!(given_up.missing_files().collect::<Vec<_>>(), vec![0]);
-        }
-    }
-
-    #[test]
-    fn an_article_told_again_is_held_once_at_its_first_end() {
-        let mut given_up = GivenUp::default();
-        given_up.give_up(segment(0, 1), None, 100);
-        given_up.give_up(segment(0, 1), Some(SegmentTerminalState::Abandoned), 100);
-        given_up.give_up(segment(0, 2), Some(SegmentTerminalState::Abandoned), 50);
-        given_up.give_up(segment(0, 2), Some(SegmentTerminalState::Missing), 50);
-        given_up.give_up(
-            segment(1, 0),
-            Some(SegmentTerminalState::RetriesExhausted),
-            10,
-        );
-        assert_eq!(given_up.bytes(), 160);
-        assert_eq!(given_up.missing_bytes(), 100);
-        assert_eq!(
-            given_up.file(0),
-            FileLosses {
-                missing: 1,
-                lost: 1,
-                bytes: 150,
-                missing_bytes: 100,
-            }
-        );
-        assert_eq!(given_up.missing_files().collect::<Vec<_>>(), vec![0]);
-        assert!(given_up.holds(segment(1, 0)));
-        assert!(!given_up.holds(segment(1, 1)));
-    }
-
-    // One volume posted twice under names numbered alike: the post is the
-    // size of one posting of it, and the volume is lost only where both
-    // postings lost it. Every article of one posting lost loses nothing.
-    #[test]
-    fn a_volume_posted_twice_is_lost_where_every_posting_lost_it() {
-        use crate::pipeline::tests::engines::harness::{Post, spec};
-        let posts = ["alpha.part01.rar", "alpha.part02.rar", "alpha.part1.rar"]
-            .map(|name| Post::plain(name, vec![7; 300]));
-        let mut given_up = GivenUp::new(&spec("alpha", &posts, 100));
-        assert_eq!(given_up.again_bytes(), 300);
-        for article in 0..3 {
-            given_up.give_up(
-                segment(0, article),
-                Some(SegmentTerminalState::Missing),
-                100,
-            );
-        }
-        assert_eq!(given_up.file(0).missing_bytes, 300);
-        assert_eq!(given_up.missing_bytes(), 0);
-        given_up.give_up(segment(2, 1), Some(SegmentTerminalState::Missing), 100);
-        assert_eq!(given_up.missing_bytes(), 100);
-        given_up.give_up(segment(1, 0), None, 100);
-        assert_eq!(given_up.missing_bytes(), 200);
-    }
-
-    // Two postings of one volume that lost different articles hold every
-    // byte of it between them: the post lost nothing. A byte both lost is
-    // lost, counted once.
-    #[test]
-    fn postings_that_lost_different_articles_lose_nothing() {
-        use crate::pipeline::tests::engines::harness::{Post, spec};
-        let posts =
-            ["alpha.part01.rar", "alpha.part1.rar"].map(|name| Post::plain(name, vec![7; 300]));
-        let mut given_up = GivenUp::new(&spec("alpha", &posts, 100));
-        given_up.give_up(segment(0, 0), Some(SegmentTerminalState::Missing), 100);
-        given_up.give_up(segment(1, 1), Some(SegmentTerminalState::Missing), 100);
-        given_up.give_up(segment(0, 2), None, 100);
-        assert_eq!(given_up.missing_bytes(), 0);
-        given_up.give_up(segment(1, 2), Some(SegmentTerminalState::Missing), 100);
-        assert_eq!(given_up.missing_bytes(), 100);
-        assert_eq!(given_up.file(0).missing_bytes, 200);
-        assert_eq!(given_up.file(1).missing_bytes, 200);
-    }
 }

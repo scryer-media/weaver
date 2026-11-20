@@ -20,69 +20,10 @@ pub(crate) static MOVING_ROW_REFUSED: std::sync::Mutex<
 pub(crate) static MOVING_ROWS_WRITTEN: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-// A job's runtime columns in its active row, as the pipeline writes them.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ActiveRuntimeValues {
-    pub(crate) status: &'static str,
-    pub(crate) download_state: Option<&'static str>,
-    pub(crate) post_state: Option<&'static str>,
-    pub(crate) run_state: Option<&'static str>,
-    pub(crate) error: Option<String>,
-    pub(crate) queued_repair_at_epoch_ms: Option<f64>,
-    pub(crate) queued_extract_at_epoch_ms: Option<f64>,
-    pub(crate) paused_resume_status: Option<&'static str>,
-    pub(crate) paused_resume_download_state: Option<&'static str>,
-    pub(crate) paused_resume_post_state: Option<&'static str>,
-}
-
-// A job's runtime columns as its active row holds them, read by a restart.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct StoredRuntimeValues {
-    status: String,
-    download_state: Option<String>,
-    post_state: Option<String>,
-    run_state: Option<String>,
-    error: Option<String>,
-    queued_repair_at_epoch_ms: Option<f64>,
-    queued_extract_at_epoch_ms: Option<f64>,
-    paused_resume_status: Option<String>,
-    paused_resume_download_state: Option<String>,
-    paused_resume_post_state: Option<String>,
-}
-
-impl StoredRuntimeValues {
-    pub(crate) fn of(row: &crate::jobs::record::RecoveredJob) -> Self {
-        Self {
-            status: row.status.clone(),
-            download_state: row.download_state.clone(),
-            post_state: row.post_state.clone(),
-            run_state: row.run_state.clone(),
-            error: row.error.clone(),
-            queued_repair_at_epoch_ms: row.queued_repair_at_epoch_ms,
-            queued_extract_at_epoch_ms: row.queued_extract_at_epoch_ms,
-            paused_resume_status: row.paused_resume_status.clone(),
-            paused_resume_download_state: row.paused_resume_download_state.clone(),
-            paused_resume_post_state: row.paused_resume_post_state.clone(),
-        }
-    }
-
-    // Whether the row already holds every one of `values`.
-    pub(crate) fn holds(&self, values: &ActiveRuntimeValues) -> bool {
-        self.status == values.status
-            && self.download_state.as_deref() == values.download_state
-            && self.post_state.as_deref() == values.post_state
-            && self.run_state.as_deref() == values.run_state
-            && self.error == values.error
-            && self.queued_repair_at_epoch_ms == values.queued_repair_at_epoch_ms
-            && self.queued_extract_at_epoch_ms == values.queued_extract_at_epoch_ms
-            && self.paused_resume_status.as_deref() == values.paused_resume_status
-            && self.paused_resume_download_state.as_deref() == values.paused_resume_download_state
-            && self.paused_resume_post_state.as_deref() == values.paused_resume_post_state
-    }
-}
+pub(crate) use weaver_server_composition::jobs::control::ActiveRuntimeValues;
 
 impl Pipeline {
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) fn status_enter_failpoint_for_transition(
         old_post_state: crate::jobs::model::PostState,
         old_run_state: crate::jobs::model::RunState,
@@ -325,7 +266,7 @@ impl Pipeline {
         }
     }
 
-    pub(crate) fn remove_pending_completion_check(&mut self, job_id: JobId) {
+    pub fn remove_pending_completion_check(&mut self, job_id: JobId) {
         self.pending_completion_checks
             .retain(|queued| *queued != job_id);
     }
@@ -550,7 +491,7 @@ impl Pipeline {
         self.transition_postprocessing_status(job_id, status, Some(persisted));
     }
 
-    pub(crate) fn pause_job_runtime(&mut self, job_id: JobId) -> Result<(), crate::SchedulerError> {
+    pub fn pause_job_runtime(&mut self, job_id: JobId) -> Result<(), crate::SchedulerError> {
         let (previous_status, previous_download_state, previous_post_state, previous_run_state) =
             match self.jobs.get(&job_id) {
                 Some(state) => (
@@ -605,10 +546,7 @@ impl Pipeline {
         Ok(())
     }
 
-    pub(crate) fn resume_job_runtime(
-        &mut self,
-        job_id: JobId,
-    ) -> Result<(), crate::SchedulerError> {
+    pub fn resume_job_runtime(&mut self, job_id: JobId) -> Result<(), crate::SchedulerError> {
         if self.blocked_restores.contains_key(&job_id) {
             return Err(crate::SchedulerError::Conflict(
                 "placement recovery must succeed before resume".into(),
@@ -695,7 +633,7 @@ impl Pipeline {
         Ok(())
     }
 
-    pub(crate) fn transition_postprocessing_status(
+    pub fn transition_postprocessing_status(
         &mut self,
         job_id: JobId,
         new_status: JobStatus,

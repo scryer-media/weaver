@@ -107,7 +107,7 @@ impl ArticleMap {
 
     // Each article of the volume that arrived with a known range, in
     // ordinal order: the bytes a restore reads back.
-    pub(crate) fn arrived_ranges(&self, volume: VolumeIndex) -> Vec<(u32, ByteRange)> {
+    pub fn arrived_ranges(&self, volume: VolumeIndex) -> Vec<(u32, ByteRange)> {
         let Some(found) = self.volumes.get(volume.0 as usize) else {
             return Vec::new();
         };
@@ -133,7 +133,7 @@ impl ArticleMap {
     // An arrived article whose bytes are not on disk is fetched again; an
     // article an earlier run fetched unseen is too, since nothing says where
     // its bytes went.
-    pub(crate) fn unarrive(&mut self, volume: VolumeIndex, ordinal: u32) {
+    pub fn unarrive(&mut self, volume: VolumeIndex, ordinal: u32) {
         let Some(found) = self.volumes.get_mut(volume.0 as usize) else {
             return;
         };
@@ -155,8 +155,8 @@ impl ArticleMap {
 
     // The post's encoded bytes of the articles `settled` names: what a
     // checkpoint taken now spares a restore fetching again.
-    #[cfg(test)]
-    pub(crate) fn settled_bytes(&self) -> u64 {
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn settled_bytes(&self) -> u64 {
         self.volumes.iter().map(|volume| volume.settled_bytes).sum()
     }
 
@@ -171,7 +171,7 @@ impl ArticleMap {
     }
 
     // Count `bytes` more in hand, as articles a test does not model would.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) fn add_in_hand_for_test(&mut self, bytes: u64) {
         self.open.in_hand += bytes;
     }
@@ -242,7 +242,7 @@ impl ArticleMap {
     }
 
     // The known boundaries of one chunk, by boundary index.
-    pub(crate) fn known_in(&self, volume: usize, chunk: u32) -> Vec<(u64, u64)> {
+    pub fn known_in(&self, volume: usize, chunk: u32) -> Vec<(u64, u64)> {
         let first = chunk as usize * CHUNK as usize;
         self.volumes[volume]
             .known

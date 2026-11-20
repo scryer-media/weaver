@@ -24,7 +24,7 @@ use super::facts::{Chunk, of_boundary, of_ordinal};
 // How soon an article is fetched, soonest first: the download queue's
 // dispatch classes, with the unlock window's draw order inside its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum Class {
+pub enum Class {
     // Something cannot progress until these bytes land.
     Critical,
     // Recovery blocks a repair is waiting on.
@@ -51,18 +51,18 @@ impl Class {
 // job's record, which fails the job and never the daemon.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("the article map of {volume} placed articles {start}..{end} at an inverted range")]
-pub(crate) struct Inconsistent {
-    pub(crate) volume: VolumeIndex,
-    pub(crate) start: usize,
-    pub(crate) end: usize,
+pub struct Inconsistent {
+    pub volume: VolumeIndex,
+    pub start: usize,
+    pub end: usize,
 }
 
 // A change of class the download queue has to apply.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Move {
-    pub(crate) volume: VolumeIndex,
-    pub(crate) ordinal: u32,
-    pub(crate) class: Class,
+pub struct Move {
+    pub volume: VolumeIndex,
+    pub ordinal: u32,
+    pub class: Class,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,7 +116,7 @@ struct Open {
     in_hand: u64,
     // The volumes and articles the readers looked at, for the tests that
     // hold them to the ones still open.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     visits: [std::sync::atomic::AtomicUsize; 2],
 }
 
@@ -137,7 +137,7 @@ impl Open {
     }
 
     fn visit(&self, _volumes: usize, _articles: usize) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         {
             use std::sync::atomic::Ordering::Relaxed;
             self.visits[0].fetch_add(_volumes, Relaxed);
@@ -217,6 +217,9 @@ struct Volume {
     // The bytes found carried by no article since the damage was last
     // taken.
     cuts: Vec<ByteRange>,
+    // The boundaries whose cut waits for the volume to settle: wider than
+    // a short article leaves, with articles after it still to come.
+    held: BTreeSet<usize>,
     // The chunks of the volume's facts each change touched.
     marks: Marks<Chunk>,
     // Bumped by every change a seek's answer reads: an article's state or
@@ -260,6 +263,7 @@ impl Volume {
             starts: BTreeMap::new(),
             cut: BTreeMap::new(),
             cuts: Vec::new(),
+            held: BTreeSet::new(),
             marks: Marks::default(),
             changes: 0,
             answered: HashMap::new(),
@@ -617,8 +621,13 @@ impl Volume {
                 self.set_state(open, at, State::Lost { damaged: true });
             }
         }
+        if settled {
+            for boundary in std::mem::take(&mut self.held) {
+                self.cut_at(open, boundary);
+            }
+        }
         out.append(&mut self.cuts);
-        if !untold {
+        if !untold && self.held.is_empty() {
             open.untold.remove(&self.at);
         }
         Ok(())
@@ -656,7 +665,38 @@ impl Volume {
         else {
             return;
         };
+        // An article in hand placed between the edges carries the bytes
+        // from its start: one whose header put it past the rest of the
+        // volume leaves them to the articles placed there.
+        let before = boundary
+            .checked_sub(1)
+            .map(|before| self.articles[before].ordinal);
+        let to = self
+            .starts
+            .range(from..)
+            .find(|(start, ordinals)| {
+                **start > from || ordinals.iter().any(|at| Some(*at) != before)
+            })
+            .map_or(to, |(start, _)| to.min(*start));
         let from = self.cut.get(&boundary).map_or(from, |told| from.max(*told));
+        // A short article leaves at most its posted bytes behind it. A
+        // wider cut, with articles after it still to come, may hold their
+        // bytes, so it waits until the volume settles. A post that
+        // understates its sizes only makes a cut wait. The gap before a
+        // volume's first article follows no short article and is cut at once.
+        let short = boundary.checked_sub(1).map_or(0, |before| {
+            self.encoded_at(before + 1) - self.encoded_at(before)
+        });
+        let to_come = open
+            .waiting
+            .get(&self.at)
+            .is_some_and(|waiting| waiting.range(boundary..).next().is_some());
+        if boundary > 0 && to > from && to - from > short && to_come {
+            self.held.insert(boundary);
+            open.untold.insert(self.at);
+            return;
+        }
+        self.held.remove(&boundary);
         if to > from {
             self.cuts.push(ByteRange::new(from, to));
             self.cut.insert(boundary, to);
@@ -666,7 +706,7 @@ impl Volume {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct ArticleMap {
+pub struct ArticleMap {
     volumes: Vec<Volume>,
     open: Open,
     moves: Vec<Move>,
@@ -675,7 +715,7 @@ pub(crate) struct ArticleMap {
 impl ArticleMap {
     // One entry per volume, in volume order: each article's ordinal and the
     // encoded size the post declares for it. Every article waits.
-    pub(crate) fn new(volumes: &[Vec<(u32, u32)>]) -> Self {
+    pub fn new(volumes: &[Vec<(u32, u32)>]) -> Self {
         let volumes: Vec<Volume> = volumes
             .iter()
             .zip(0u32..)
@@ -697,8 +737,8 @@ impl ArticleMap {
     }
 
     // The volumes and articles the readers looked at since the last call.
-    #[cfg(test)]
-    pub(crate) fn visits(&self) -> (usize, usize) {
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn visits(&self) -> (usize, usize) {
         use std::sync::atomic::Ordering::Relaxed;
         let [volumes, articles] = &self.open.visits;
         (volumes.swap(0, Relaxed), articles.swap(0, Relaxed))
@@ -709,7 +749,7 @@ impl ArticleMap {
     // declares, never where its bytes ended: a damaged body can decode
     // longer or shorter than its part. A next one already placed says where
     // it begins itself, and no declared end moves it.
-    pub(crate) fn arrived(
+    pub fn arrived(
         &mut self,
         volume: VolumeIndex,
         ordinal: u32,
@@ -770,7 +810,7 @@ impl ArticleMap {
         }
     }
 
-    pub(crate) fn set_ordered_only(&mut self, volume: VolumeIndex) {
+    pub fn set_ordered_only(&mut self, volume: VolumeIndex) {
         if let Some(found) = self.volumes.get_mut(volume.0 as usize) {
             found.set_ordered_only(true);
         }
@@ -817,7 +857,7 @@ impl ArticleMap {
     }
 
     // Every server failed the article.
-    pub(crate) fn lost(&mut self, volume: VolumeIndex, ordinal: u32) {
+    pub fn lost(&mut self, volume: VolumeIndex, ordinal: u32) {
         let Some(found) = self.volumes.get_mut(volume.0 as usize) else {
             return;
         };
@@ -829,7 +869,7 @@ impl ArticleMap {
     }
 
     // Articles this run will not fetch because an earlier run already did.
-    pub(crate) fn arrived_before(&mut self, mut queued: impl FnMut(VolumeIndex, u32) -> bool) {
+    pub fn arrived_before(&mut self, mut queued: impl FnMut(VolumeIndex, u32) -> bool) {
         for (index, found) in self.volumes.iter_mut().enumerate() {
             let volume = VolumeIndex(index as u32);
             for at in 0..found.articles.len() {
@@ -843,7 +883,7 @@ impl ArticleMap {
 
     // Whether the article is in hand or lost for good. An article the map
     // does not hold was never posted here, so nothing has settled it.
-    pub(crate) fn article_settled(&self, volume: VolumeIndex, ordinal: u32) -> bool {
+    pub fn article_settled(&self, volume: VolumeIndex, ordinal: u32) -> bool {
         self.volumes.get(volume.0 as usize).is_some_and(|found| {
             found
                 .index(ordinal)
@@ -909,7 +949,7 @@ impl ArticleMap {
     }
 
     // The class the article is fetched under now.
-    pub(crate) fn class(&self, volume: VolumeIndex, ordinal: u32) -> Option<Class> {
+    pub fn class(&self, volume: VolumeIndex, ordinal: u32) -> Option<Class> {
         let found = self.volumes.get(volume.0 as usize)?;
         Some(found.articles[found.index(ordinal)?].class)
     }
@@ -990,14 +1030,14 @@ impl ArticleMap {
             .count()
     }
 
-    pub(crate) fn volume_waiting(&self, volume: VolumeIndex) -> bool {
+    pub fn volume_waiting(&self, volume: VolumeIndex) -> bool {
         self.open.visit(1, 0);
         self.open.waiting.contains_key(&volume)
     }
 
     // Whether every article of the volume is in hand: none waits and every
     // server failed none.
-    pub(crate) fn volume_whole(&self, volume: VolumeIndex) -> bool {
+    pub fn volume_whole(&self, volume: VolumeIndex) -> bool {
         self.open.visit(1, 0);
         (volume.0 as usize) < self.volumes.len()
             && !self.open.waiting.contains_key(&volume)
@@ -1015,7 +1055,7 @@ impl ArticleMap {
 
     // The volumes with an article the queue fetches unasked still to come,
     // in volume order.
-    pub(crate) fn coming(&self) -> impl Iterator<Item = VolumeIndex> + '_ {
+    pub fn coming(&self) -> impl Iterator<Item = VolumeIndex> + '_ {
         self.open
             .waiting
             .iter()
@@ -1040,7 +1080,7 @@ impl ArticleMap {
 
     // The volumes still waited on, read without counting a visit, for the
     // tests that check a reader against a walk of them all.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn waiting_volumes_unseen(&self) -> Vec<VolumeIndex> {
         self.open.waiting.keys().copied().collect()
     }
@@ -1056,7 +1096,7 @@ impl ArticleMap {
 
     // The ranges of lost articles that can now be marked damaged: only the
     // volumes holding one not yet told are visited.
-    pub(crate) fn take_damage(
+    pub fn take_damage(
         &mut self,
         out: &mut Vec<(VolumeIndex, ByteRange)>,
     ) -> Result<(), Inconsistent> {
@@ -1091,21 +1131,16 @@ impl ArticleMap {
     // in the normal order, so one already raised keeps its class, and a
     // later raise takes a parked one as it takes any. A deferral is never
     // lost or unseekable to the asker: its answer is how many it parked.
-    pub(crate) fn seek(
-        &mut self,
-        volume: VolumeIndex,
-        range: ByteRange,
-        class: Option<Class>,
-    ) -> Pull {
-        #[cfg(test)]
-        super::tests::SEEK_CALLS.with(|calls| calls.set(calls.get() + 1));
+    pub fn seek(&mut self, volume: VolumeIndex, range: ByteRange, class: Option<Class>) -> Pull {
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+        super::hooks::SEEK_CALLS.with(|calls| calls.set(calls.get() + 1));
         // A seek asked again with nothing it reads changed since is told
         // what it was, without mapping its range again: one that moved
         // articles changed them, so only an answer that moved none stands.
         if let Some(found) = self.volumes.get(volume.0 as usize)
             && let Some(&pull) = found.answered.get(&(range, class))
         {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             {
                 let changes = found.changes;
                 assert_eq!(self.map_seek(volume, range, class), pull);
@@ -1113,8 +1148,8 @@ impl ArticleMap {
             }
             return pull;
         }
-        #[cfg(test)]
-        super::tests::SEEK_MAPPED.with(|calls| calls.set(calls.get() + 1));
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+        super::hooks::SEEK_MAPPED.with(|calls| calls.set(calls.get() + 1));
         let changes = self
             .volumes
             .get(volume.0 as usize)
@@ -1148,11 +1183,28 @@ impl ArticleMap {
             };
         }
         // A deferral moves only what it can park, and is never lost.
-        let covering: Vec<usize> = if parks {
+        let mut covering: Vec<usize> = if parks {
             found.parkable_covering(range).collect()
         } else {
             found.covering(range).collect()
         };
+        // Once the post's placements disagree, the bounds of an article
+        // still to come say nothing of where its own header puts it: one
+        // after an article placed past the volume's end is bounded past it
+        // too. A raise that runs to the volume's end takes every article of
+        // the volume still waited on, so none it may need is left behind.
+        if !parks
+            && found.disorder > 0
+            && range.end == end
+            && let Some(waiting) = self.open.waiting.get(&volume)
+        {
+            covering.extend(
+                waiting
+                    .iter()
+                    .copied()
+                    .filter(|index| !found.may_carry(*index, range)),
+            );
+        }
         let lost = !parks
             && covering.iter().any(|index| {
                 matches!(found.articles[*index].state, State::Lost { .. })
@@ -1189,7 +1241,7 @@ impl ArticleMap {
     // only parked work joins it, which is the one move this makes. An
     // article already raised keeps its class, and one already queued is
     // left as it is.
-    pub(crate) fn queue(&mut self, volume: VolumeIndex, range: ByteRange) {
+    pub fn queue(&mut self, volume: VolumeIndex, range: ByteRange) {
         let Some(found) = self.volumes.get_mut(volume.0 as usize) else {
             return;
         };
@@ -1208,7 +1260,7 @@ impl ArticleMap {
     }
 
     // The first article of every volume leads the payload.
-    pub(crate) fn sample(&mut self) {
+    pub fn sample(&mut self) {
         for index in 0..self.volumes.len() {
             let volume = VolumeIndex(index as u32);
             let found = &mut self.volumes[index];
@@ -1240,7 +1292,7 @@ impl ArticleMap {
     }
 
     // The class changes since the last call, soonest first.
-    pub(crate) fn take_moves(&mut self) -> Vec<Move> {
+    pub fn take_moves(&mut self) -> Vec<Move> {
         let mut moves = std::mem::take(&mut self.moves);
         // A later raise of the same article supersedes an earlier one.
         let mut latest: HashMap<(VolumeIndex, u32), Class> = HashMap::new();

@@ -46,7 +46,7 @@ use crate::pipeline::graph::leaf::Leaf;
 // before the checkpoint that would have said so, and that file is the
 // member's. A file at the name it wants while it still sits where it sat
 // is not the member's: the member's file never reached it.
-pub(crate) fn restored_at<'a>(
+pub fn restored_at<'a>(
     working_dir: &Path,
     output_name: &'a str,
     on_disk: Option<&'a str>,
@@ -75,16 +75,16 @@ pub(crate) fn restored_at<'a>(
 // across every writer a restart makes.
 #[cfg(any(test, feature = "pipeline-test-fixtures"))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Tally {
-    pub(crate) waiting_opens: u64,
-    pub(crate) moves: u64,
-    pub(crate) weighed: u64,
-    pub(crate) kept: u64,
+pub struct Tally {
+    pub waiting_opens: u64,
+    pub moves: u64,
+    pub weighed: u64,
+    pub kept: u64,
 }
 
 #[cfg(any(test, feature = "pipeline-test-fixtures"))]
 thread_local! {
-    pub(crate) static TALLY: std::cell::Cell<Tally> = std::cell::Cell::default();
+    pub static TALLY: std::cell::Cell<Tally> = std::cell::Cell::default();
 }
 
 #[cfg(any(test, feature = "pipeline-test-fixtures"))]
@@ -98,11 +98,11 @@ fn count(change: impl FnOnce(&mut Tally)) {
 
 // A member whose file waits to move to the name it wants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Waiting {
-    node: NodeId,
-    member: MemberId,
+pub struct Waiting {
+    pub node: NodeId,
+    pub member: MemberId,
     // The checkpoint that records the name it wants, once one is taken.
-    stamp: Option<u64>,
+    pub stamp: Option<u64>,
 }
 
 // Every waiting move, in the order asked for, with where each member's
@@ -110,17 +110,17 @@ pub(super) struct Waiting {
 // every move, so a long chain of members named again costs each one its own
 // moves. A dropped move leaves a gap until the gaps outnumber the moves.
 #[derive(Debug, Default)]
-pub(super) struct Moves {
+pub struct Moves {
     order: Vec<Option<Waiting>>,
     at: std::collections::HashMap<(NodeId, MemberId), Vec<usize>>,
     live: usize,
     // How many places in the order dropping and closing gaps read.
-    #[cfg(test)]
-    read: usize,
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub read: usize,
 }
 
 impl Moves {
-    pub(super) fn push(&mut self, waiting: Waiting) {
+    pub fn push(&mut self, waiting: Waiting) {
         self.at
             .entry((waiting.node, waiting.member))
             .or_default()
@@ -129,29 +129,29 @@ impl Moves {
         self.live += 1;
     }
 
-    pub(super) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.live == 0
     }
 
-    fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.live
     }
 
-    fn iter(&self) -> impl Iterator<Item = &Waiting> {
+    pub fn iter(&self) -> impl Iterator<Item = &Waiting> {
         self.order.iter().flatten()
     }
 
-    fn iter_mut(&mut self) -> impl Iterator<Item = &mut Waiting> {
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Waiting> {
         self.order.iter_mut().flatten()
     }
 
     // Every move of the member goes; the others keep their order.
-    pub(super) fn drop_member(&mut self, node: NodeId, member: MemberId) {
+    pub fn drop_member(&mut self, node: NodeId, member: MemberId) {
         let Some(places) = self.at.remove(&(node, member)) else {
             return;
         };
         for place in places {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             {
                 self.read += 1;
             }
@@ -161,10 +161,10 @@ impl Moves {
         }
         if self.order.len() > 2 * self.live + 16 {
             let kept = self.take();
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             let read = self.read;
             *self = Self::from(kept);
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             {
                 self.read = read;
             }
@@ -172,8 +172,8 @@ impl Moves {
     }
 
     // The moves in order, none left here.
-    fn take(&mut self) -> Vec<Waiting> {
-        #[cfg(test)]
+    pub fn take(&mut self) -> Vec<Waiting> {
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         {
             self.read += self.order.len();
         }
@@ -201,7 +201,7 @@ impl NamespaceWriter {
     // the checkpoint that records it has committed. A member named again
     // before it moved waits for the checkpoint that records the later name,
     // behind every move asked for before it.
-    pub(super) fn intend(&mut self, node: NodeId, member: MemberId, name: &str) {
+    pub fn intend(&mut self, node: NodeId, member: MemberId, name: &str) {
         self.moves.drop_member(node, member);
         let Some(leaf) = self
             .files
@@ -230,7 +230,7 @@ impl NamespaceWriter {
 
     // The restored members whose files wait to move, and the names the
     // files sit at.
-    pub(crate) fn waiting(&self) -> Vec<(NodeId, MemberId, String)> {
+    pub fn waiting(&self) -> Vec<(NodeId, MemberId, String)> {
         self.moves
             .iter()
             .filter_map(|waiting| {
@@ -246,7 +246,7 @@ impl NamespaceWriter {
     // so a file opened there would be left at a name no checkpoint may ever
     // record. Otherwise it waits under the internal directory until a
     // checkpoint records its ownership and intended name.
-    pub(super) fn new_leaf(
+    pub fn new_leaf(
         &mut self,
         (node, member): (NodeId, MemberId),
         name: &str,
@@ -283,7 +283,7 @@ impl NamespaceWriter {
     // file where it sits, so a restore finds it there. A file never written
     // is not on disk and leaves nothing: its name may be given again before
     // that commit, and removing it then would remove the file given it.
-    pub(super) fn discard(&mut self, leaf: Leaf) -> Result<(), WriteError> {
+    pub fn discard(&mut self, leaf: Leaf) -> Result<(), WriteError> {
         self.left.insert(key(leaf.name()), None);
         if leaf.on_disk() {
             self.leaving.push((leaf, None));
@@ -293,7 +293,7 @@ impl NamespaceWriter {
 
     // The checkpoint `stamp` records every name wanted, every name left and
     // every file that goes so far.
-    pub(crate) fn recorded(&mut self, stamp: u64) {
+    pub fn recorded(&mut self, stamp: u64) {
         for waiting in self.moves.iter_mut() {
             waiting.stamp.get_or_insert(stamp);
         }
@@ -326,14 +326,14 @@ impl NamespaceWriter {
 
     // Whether a file still waits to move, or a name a file left waits for
     // the checkpoint that frees it.
-    pub(crate) fn moves_waiting(&self) -> bool {
+    pub fn moves_waiting(&self) -> bool {
         !self.moves.is_empty() || !self.left.is_empty()
     }
 
     // Whether anything waits for a checkpoint to commit: a move, a name a
     // file left, a file that goes or is emptied, or scratch offsets to
     // start over, which the one the database holds may name.
-    pub(crate) fn awaits_commit(&self) -> bool {
+    pub fn awaits_commit(&self) -> bool {
         self.moves_waiting()
             || !self.leaving.is_empty()
             || !self.spills_emptying.is_empty()
@@ -342,7 +342,7 @@ impl NamespaceWriter {
 
     // The checkpoint whose commit lets every waiting move run, as far as
     // the database is what holds it back.
-    pub(crate) fn awaited(&self) -> u64 {
+    pub fn awaited(&self) -> u64 {
         let moves = self.moves.iter().filter_map(|waiting| waiting.stamp);
         let left = self.left.values().filter_map(|stamp| *stamp);
         let gone = self.leaving.iter().filter_map(|(_, stamp)| *stamp);
@@ -451,7 +451,7 @@ impl NamespaceWriter {
         emptied.sort_by_key(|name| std::cmp::Reverse(name.matches('/').count()));
         for name in emptied {
             let held = key(&name) == key(INTERNAL_DIR) || files.at(&key(&name)).1 > 0;
-            #[cfg(test)]
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             assert_eq!(
                 held,
                 key(&name) == key(INTERNAL_DIR) || self.directory_held_by_scan(&name),
@@ -471,7 +471,7 @@ impl NamespaceWriter {
     // Whether a directory member sits at the directory `name` or waits to
     // move to it, by a scan of every file: what `remove_emptied` read for
     // each directory before. Tests hold it to that.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     fn directory_held_by_scan(&self, name: &str) -> bool {
         self.files.values().any(|files| {
             files.leaves.values().any(|other| {
@@ -570,7 +570,7 @@ impl NamespaceWriter {
     // and the moves they cover run. A move that fails fails the commit
     // once the names already freed are given back. True when the next
     // checkpoint has something to record.
-    pub(crate) fn commit_moves(&mut self, tree: &mut Tree, stamp: u64) -> Result<bool, WriteError> {
+    pub fn commit_moves(&mut self, tree: &mut Tree, stamp: u64) -> Result<bool, WriteError> {
         let (freed, moved) = self.committed(stamp);
         let mut effects = Vec::new();
         for name in &freed {
@@ -586,7 +586,7 @@ impl NamespaceWriter {
     // The file lies under the directory its member's class gives, unless
     // it is found under the other one only, as a member whose class changed
     // after its file was opened left it.
-    pub(super) fn restored_leaf(
+    pub fn restored_leaf(
         &mut self,
         (node, member): (NodeId, MemberId),
         output_name: &str,
@@ -669,7 +669,7 @@ impl NamespaceWriter {
     // Where the files sit and wait is read from the kept count, brought up
     // to date with the files changed since the last new file asked, never
     // from a scan of every file for each new one.
-    fn free_for_new(&mut self, name: &str, (node, member): (NodeId, MemberId)) -> bool {
+    pub fn free_for_new(&mut self, name: &str, (node, member): (NodeId, MemberId)) -> bool {
         if self.name_shut(name) {
             return false;
         }
@@ -688,15 +688,15 @@ impl NamespaceWriter {
             Some(leaf) => held.free(name, leaf.name(), leaf.wants()),
             None => held.free_beside(name, std::iter::empty()),
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         assert_eq!(free, self.free_at(name, (node, member)), "{name}");
         free
     }
 
     // What `free_for_new` answers, by a scan of every file: what each new
     // file read before. Tests hold it to that.
-    #[cfg(test)]
-    fn free_at(&self, name: &str, mover: (NodeId, MemberId)) -> bool {
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn free_at(&self, name: &str, mover: (NodeId, MemberId)) -> bool {
         if self.name_shut(name) {
             return false;
         }
@@ -742,10 +742,10 @@ fn restore_moves(
 // waits to move to. One pass of the moves reads it in place of a scan of
 // every file for each move it weighs.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct Held(std::collections::HashMap<String, (usize, usize)>);
+pub struct Held(std::collections::HashMap<String, (usize, usize)>);
 
 impl Held {
-    fn of(writer: &NamespaceWriter) -> Self {
+    pub fn of(writer: &NamespaceWriter) -> Self {
         let mut held = Self::default();
         for files in writer.files.values() {
             for leaf in files.leaves.values() {
@@ -781,7 +781,7 @@ impl Held {
 
     // A file that wanted the name it sat at moved off `left`: the name it
     // waited for is the one it sits at now, held once less.
-    fn moved(&mut self, left: &str) {
+    pub fn moved(&mut self, left: &str) {
         self.add(left, -1);
     }
 
@@ -790,7 +790,7 @@ impl Held {
     // directory `name` runs through or waits to move to one. A directory
     // `name` shares its path with other directories. The same answer as the
     // scan in `free_at` gives once a move waits and nothing is shut.
-    fn free(&self, name: &str, sits: &str, waits: Option<&str>) -> bool {
+    pub fn free(&self, name: &str, sits: &str, waits: Option<&str>) -> bool {
         self.free_beside(name, std::iter::once(sits).chain(waits))
     }
 
@@ -834,7 +834,7 @@ impl Held {
 // file, to take them back when the file changes or goes; only the files the
 // job has open are in it.
 #[derive(Debug, Default)]
-pub(super) struct Kept {
+pub struct Kept {
     // The generation of the namespaces' marks it read up to.
     at: u64,
     nodes: std::collections::HashMap<NodeId, KeptFiles>,
@@ -851,7 +851,7 @@ struct KeptFiles {
 }
 
 impl Kept {
-    fn read(&mut self, files: &weaver_graph::Marked<NodeId, super::Files>) -> &Held {
+    pub fn read(&mut self, files: &weaver_graph::Marked<NodeId, super::Files>) -> &Held {
         let nodes: Vec<NodeId> = files.marks().since(self.at).collect();
         self.at = files.marks().at();
         for node in nodes {
@@ -930,304 +930,4 @@ fn waiting_name(
         &format!("{INTERNAL_DIR}/graph-waiting-{}-{}", node.0, member.0),
     );
     format!("{waiting}{directory}")
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
-
-    use super::*;
-    use weaver_server_disk::operations::disk::CapacityReader;
-
-    // Names that meet as one path in another case, as a file and a
-    // directory of one path, and as a directory another name runs through.
-    const NAMES: [&str; 14] = [
-        "a.bin",
-        "A.BIN",
-        "a (1).bin",
-        "d",
-        "d/",
-        "D/",
-        "d/a.bin",
-        "D/A.BIN",
-        "d/e/",
-        "d/e/f.bin",
-        "d/e",
-        "e/",
-        "e/a.bin",
-        "f.bin",
-    ];
-
-    // A small deterministic generator, so every seed replays one sequence.
-    struct Draw(u64);
-
-    impl Draw {
-        fn below(&mut self, bound: usize) -> usize {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            (self.0 % bound as u64) as usize
-        }
-
-        fn name(&mut self) -> &'static str {
-            NAMES[self.below(NAMES.len())]
-        }
-    }
-
-    fn writer(dir: &Path) -> NamespaceWriter {
-        let budgets = HoldBudgets {
-            resident_limit: u64::MAX,
-            scratch_total: u64::MAX,
-            scratch_ceiling: u64::MAX,
-            disk_reserve: 0,
-        };
-        NamespaceWriter::new(
-            1,
-            dir.to_path_buf(),
-            Arc::new(HoldsAccountant::new(budgets)),
-            CapacityReader::unknown(),
-        )
-    }
-
-    // Over seeded sets of files that sit at and wait for colliding names,
-    // a pass weighs each move as the scan of every file does, and what it
-    // keeps after each move it runs is what a fresh read of the files gives.
-    #[test]
-    fn a_pass_weighs_each_move_as_a_scan_of_every_file_would() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut weighed = [0usize; 2];
-        for seed in [1u64, 7, 42, 1_234_567, 0x9e37_79b9_7f4a_7c15, 31_337] {
-            let mut draw = Draw(seed);
-            let mut writer = writer(dir.path());
-            let mut holders = Vec::new();
-            for _ in 0..12 {
-                let holder = (NodeId(draw.below(3) as u32), MemberId(draw.below(6) as u32));
-                let mut leaf = Leaf::at(dir.path(), draw.name());
-                if draw.below(3) > 0 {
-                    leaf.intend(draw.name());
-                }
-                writer.files_mut(holder.0).leaves.insert(holder.1, leaf);
-                if !holders.contains(&holder) {
-                    holders.push(holder);
-                }
-            }
-            writer.moves.push(Waiting {
-                node: holders[0].0,
-                member: holders[0].1,
-                stamp: None,
-            });
-            let mut held = Held::of(&writer);
-            for _ in 0..400 {
-                let (node, member) = holders[draw.below(holders.len())];
-                let leaf = writer.files_mut(node).leaves.get(&member).unwrap();
-                let (sits, waits) = (leaf.name().to_owned(), leaf.wants().map(str::to_owned));
-                let name = draw.name();
-                let free = held.free(name, &sits, waits.as_deref());
-                assert_eq!(
-                    free,
-                    writer.free_at(name, (node, member)),
-                    "seed {seed} {name}"
-                );
-                weighed[usize::from(free)] += 1;
-                // Now and then a file that waits moves to the name it wants.
-                let moves_now = draw.below(4) == 0;
-                if let Some(waits) = waits.filter(|_| moves_now) {
-                    let leaf = writer.files_mut(node).leaves.get_mut(&member).unwrap();
-                    let left = leaf.move_on().expect("move").expect("a name it left");
-                    held.moved(&left);
-                    let mut leaf = Leaf::at(dir.path(), &waits);
-                    if draw.below(2) == 0 {
-                        leaf.intend(draw.name());
-                    }
-                    // A file named again: what the pass keeps is read again.
-                    if leaf.wants().is_some() {
-                        writer.files_mut(node).leaves.insert(member, leaf);
-                        held = Held::of(&writer);
-                    }
-                }
-                assert_eq!(held, Held::of(&writer), "seed {seed}");
-            }
-        }
-        // Both answers came up many times.
-        assert!(weighed.iter().all(|count| *count > 100), "{weighed:?}");
-    }
-
-    // Over seeded sequences of moves asked for, members named again, stamps
-    // and passes, the moves keep the order a list that drops each member's
-    // moves by a scan of every move keeps.
-    #[test]
-    fn the_moves_keep_the_order_a_scan_of_every_move_would() {
-        for seed in [1u64, 7, 42, 1_234_567, 0x9e37_79b9_7f4a_7c15, 31_337] {
-            let mut draw = Draw(seed);
-            let mut moves = Moves::default();
-            let mut scanned: Vec<Waiting> = Vec::new();
-            for step in 0..4_000 {
-                let (node, member) = (
-                    NodeId(draw.below(3) as u32),
-                    MemberId(draw.below(24) as u32),
-                );
-                match draw.below(8) {
-                    0..=3 => {
-                        let waiting = Waiting {
-                            node,
-                            member,
-                            stamp: (draw.below(2) == 0).then(|| draw.below(9) as u64),
-                        };
-                        moves.push(waiting);
-                        scanned.push(waiting);
-                    }
-                    4 | 5 => {
-                        moves.drop_member(node, member);
-                        scanned.retain(|waiting| (waiting.node, waiting.member) != (node, member));
-                    }
-                    6 => {
-                        let stamp = draw.below(9) as u64;
-                        for waiting in moves.iter_mut() {
-                            waiting.stamp.get_or_insert(stamp);
-                        }
-                        for waiting in &mut scanned {
-                            waiting.stamp.get_or_insert(stamp);
-                        }
-                    }
-                    _ => {
-                        // A pass takes them all and keeps some, in order.
-                        let keep = draw.below(3);
-                        let kept: Vec<Waiting> = moves
-                            .take()
-                            .into_iter()
-                            .filter(|waiting| waiting.member.0 as usize % 3 != keep)
-                            .collect();
-                        moves = kept.into();
-                        scanned.retain(|waiting| waiting.member.0 as usize % 3 != keep);
-                    }
-                }
-                let ours: Vec<Waiting> = moves.iter().copied().collect();
-                assert_eq!(ours, scanned, "seed {seed} step {step}");
-                assert_eq!(moves.len(), scanned.len());
-                assert_eq!(moves.is_empty(), scanned.is_empty());
-            }
-        }
-    }
-
-    // Every member of a long chain named again, twice over, while all of
-    // them wait: each drop reads that member's own moves, never every move.
-    #[test]
-    fn naming_a_chain_again_reads_each_members_moves_alone() {
-        const N: u32 = 20_000;
-        let mut moves = Moves::default();
-        let waiting = |member: u32| Waiting {
-            node: NodeId::ROOT,
-            member: MemberId(member),
-            stamp: None,
-        };
-        for member in 0..N {
-            moves.push(waiting(member));
-        }
-        for _ in 0..2 {
-            for member in 0..N {
-                moves.drop_member(NodeId::ROOT, MemberId(member));
-                moves.push(waiting(member));
-            }
-        }
-        let order: Vec<u32> = moves.iter().map(|waiting| waiting.member.0).collect();
-        assert_eq!(order, (0..N).collect::<Vec<_>>());
-        // Each drop reads one place, and closing the gaps reads each place
-        // once for the gaps it closes.
-        assert!(moves.read <= 8 * N as usize, "{} places read", moves.read);
-    }
-
-    // Over seeded sets of files that come, change, move and go, in
-    // namespaces that go and come again, the kept count is what a fresh read
-    // of every file gives, and a new file of a member with a file or without
-    // one is told what a scan of every file says (`free_for_new` holds
-    // itself to `free_at`).
-    #[test]
-    fn a_new_file_is_told_what_a_scan_of_every_file_would_say() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut answers = [0usize; 2];
-        for seed in [1u64, 7, 42, 1_234_567, 0x9e37_79b9_7f4a_7c15, 31_337] {
-            let mut draw = Draw(seed);
-            let mut writer = writer(dir.path());
-            writer.moves.push(Waiting {
-                node: NodeId::ROOT,
-                member: MemberId(0),
-                stamp: None,
-            });
-            for _ in 0..600 {
-                let (node, member) = (NodeId(draw.below(3) as u32), MemberId(draw.below(8) as u32));
-                match draw.below(10) {
-                    0..=3 => {
-                        let mut leaf = Leaf::at(dir.path(), draw.name());
-                        if draw.below(2) == 0 {
-                            leaf.intend(draw.name());
-                        }
-                        writer.files_mut(node).leaves.insert(member, leaf);
-                    }
-                    4 => {
-                        writer.files_mut(node).leaves.remove(&member);
-                    }
-                    5 => {
-                        if let Some(leaf) = writer.files_mut(node).leaves.get_mut(&member) {
-                            leaf.intend(draw.name());
-                        }
-                    }
-                    6 => {
-                        if let Some(leaf) = writer.files_mut(node).leaves.get_mut(&member) {
-                            leaf.move_on().expect("move");
-                        }
-                    }
-                    7 => {
-                        // The namespace goes, and may come again empty.
-                        writer.files.remove(&node);
-                        if draw.below(2) == 0 {
-                            writer.files_mut(node);
-                        }
-                    }
-                    _ => {}
-                }
-                let name = draw.name();
-                answers[usize::from(writer.free_for_new(name, (node, member)))] += 1;
-                let fresh = Held::of(&writer);
-                assert_eq!(*writer.kept.read(&writer.files), fresh, "seed {seed}");
-            }
-        }
-        // Both answers came up many times.
-        assert!(answers.iter().all(|count| *count > 100), "{answers:?}");
-    }
-
-    // A move waits while a long run of new files opens, one after another:
-    // the kept count reads each file once as it comes, never every file for
-    // each new one.
-    #[test]
-    fn new_files_read_each_file_once_while_a_move_waits() {
-        const N: u32 = 600;
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut writer = writer(dir.path());
-        for member in 0..N {
-            let leaf = Leaf::at(dir.path(), &format!("f{member}.bin"));
-            writer
-                .files_mut(NodeId::ROOT)
-                .leaves
-                .insert(MemberId(member), leaf);
-        }
-        writer.moves.push(Waiting {
-            node: NodeId::ROOT,
-            member: MemberId(0),
-            stamp: None,
-        });
-        let before = TALLY.with(std::cell::Cell::get);
-        for member in N..2 * N {
-            let at = (NodeId::ROOT, MemberId(member));
-            let leaf = writer.new_leaf(at, &format!("g{member}.bin"), false, dir.path());
-            assert_eq!(leaf.name(), format!("g{member}.bin"));
-            writer
-                .files_mut(NodeId::ROOT)
-                .leaves
-                .insert(MemberId(member), leaf);
-        }
-        let kept = TALLY.with(std::cell::Cell::get).kept - before.kept;
-        assert_eq!(kept, u64::from(2 * N - 1));
-    }
 }

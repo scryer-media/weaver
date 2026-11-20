@@ -11,16 +11,16 @@ use weaver_server_disk::operations::disk::reader::TurnStop;
 use super::super::{Segments, Write, WriteError};
 use super::*;
 
-pub(crate) struct Replay {
+pub struct Replay {
     pub(crate) node: NodeId,
-    pub(crate) stop: Arc<TurnStop>,
+    pub stop: Arc<TurnStop>,
     generation: u64,
     records: BTreeMap<NodeId, weaver_graph::records::NodeRecord>,
     ranges: Vec<(VolumeIndex, ByteRange)>,
     access: Lent,
 }
 
-pub(crate) struct Replayed {
+pub struct Replayed {
     pub(crate) node: NodeId,
     generation: u64,
     ranges: Vec<(VolumeIndex, ByteRange)>,
@@ -54,15 +54,11 @@ impl std::fmt::Debug for Replayed {
 }
 
 impl Replay {
-    pub(crate) fn run(self, shutdown: &Shutdown) -> Replayed {
+    pub fn run(self, shutdown: &Shutdown) -> Replayed {
         self.run_with(shutdown, || {})
     }
 
-    pub(crate) fn run_with(
-        mut self,
-        shutdown: &Shutdown,
-        mut chunk_read: impl FnMut(),
-    ) -> Replayed {
+    pub fn run_with(mut self, shutdown: &Shutdown, mut chunk_read: impl FnMut()) -> Replayed {
         self.access.begin(shutdown);
         let mut provenance = Vec::new();
         let staged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -149,8 +145,8 @@ impl Replay {
 }
 
 impl Replayed {
-    #[cfg(test)]
-    pub(crate) fn chunk_lengths(&self) -> Vec<u64> {
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn chunk_lengths(&self) -> Vec<u64> {
         self.bytes
             .runs
             .iter()
@@ -158,20 +154,17 @@ impl Replayed {
             .collect()
     }
 
-    pub(crate) fn remove(self) -> Result<(), LeafError> {
+    pub fn remove(self) -> Result<(), LeafError> {
         self.bytes.remove()
     }
 }
 
 impl NamespaceWriter {
-    pub(crate) fn rechecks_waiting(&self) -> bool {
+    pub fn rechecks_waiting(&self) -> bool {
         !self.rechecks.is_empty()
     }
 
-    pub(crate) fn queue_rechecks(
-        &mut self,
-        rechecks: Vec<(NodeId, Vec<(VolumeIndex, ByteRange)>)>,
-    ) {
+    pub fn queue_rechecks(&mut self, rechecks: Vec<(NodeId, Vec<(VolumeIndex, ByteRange)>)>) {
         for (node, ranges) in rechecks {
             let pending = self.rechecks.entry(node).or_default();
             pending.extend(ranges);
@@ -191,7 +184,7 @@ impl NamespaceWriter {
         }
     }
 
-    pub(crate) fn take_replay(&mut self, tree: &Tree) -> Result<Option<Replay>, LeafError> {
+    pub fn take_replay(&mut self, tree: &Tree) -> Result<Option<Replay>, LeafError> {
         while let Some((node, ranges)) = self.rechecks.pop_first() {
             if !tree.live().contains(&node) {
                 continue;
@@ -255,7 +248,7 @@ impl NamespaceWriter {
         Ok(None)
     }
 
-    pub(crate) fn replayed(
+    pub fn replayed(
         &mut self,
         tree: &mut Tree,
         builder: &mut dyn Builder,

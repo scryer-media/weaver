@@ -803,10 +803,10 @@ async fn the_nesting_limit_counts_where_a_lifted_volume_came_from() {
 // lost nothing cannot bring the rest of the member, so the run reading it
 // is told it holds all it will and the job goes quiet. It ends Complete
 // with the file inside the member delivered whole; it never sits waiting.
-const CORE: &str = "MacGourmet-Deluxe-3.2.6";
+pub(super) const CORE: &str = "MacGourmet-Deluxe-3.2.6";
 const SET: &str = "Mariner.Software.MacGourmet.Deluxe.v3.2.6.MacOSX.Incl.Keymaker-CORE";
 
-fn deflated_zip(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+pub(super) fn deflated_zip(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
     let options = ::zip::write::SimpleFileOptions::default()
         .compression_method(::zip::CompressionMethod::Deflated);
     let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
@@ -817,13 +817,17 @@ fn deflated_zip(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
     writer.finish().unwrap().into_inner()
 }
 
-const INNER: &str = "MacGourmet Deluxe.bin";
+pub(super) const INNER: &str = "MacGourmet Deluxe.bin";
 
-fn inner() -> Vec<u8> {
+pub(super) fn inner() -> Vec<u8> {
     payload(12 * ARTICLE + 41, 83)
 }
 
-fn nested_core(member: (&str, Vec<u8>), outer_deflated: bool, recovery: bool) -> Scenario {
+pub(super) fn nested_core(
+    member: (&str, Vec<u8>),
+    outer_deflated: bool,
+    recovery: bool,
+) -> Scenario {
     let files: Vec<(String, Vec<u8>)> = single_member_store_set(member.0, &member.1, 5)
         .into_iter()
         .enumerate()

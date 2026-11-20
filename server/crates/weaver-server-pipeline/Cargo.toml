@@ -7,13 +7,18 @@ license-file.workspace = true
 repository.workspace = true
 
 [features]
-pipeline-test-fixtures = ["test-support", "weaver-graph/test-support", "weaver-objects/test-support", "sevenz-turbo/compress", "lzma-turbo/enc"]
+pipeline-test-fixtures = ["test-support", "weaver-server-composition/pipeline-test-fixtures", "weaver-graph/test-support", "weaver-objects/test-support", "sevenz-turbo/compress", "lzma-turbo/enc"]
 slow-tests = []
+# The archive matrix and the extended campaigns: their test targets below and
+# the schedule harness only they use. Off unless a matrix run asks for it, so
+# no ordinary build or test run compiles a line of either.
+archive-matrix = ["pipeline-test-fixtures"]
 # Hooks that let other crates' tests move stored state directly instead of
 # waiting on the wall clock. Never enabled outside dev-dependencies. The
 # tunnel's loopback certificate backs the speed test's HTTPS fixture, and
 # NNTP's direct test route serves servers built with no route of their own.
 test-support = [
+    "weaver-server-composition/test-support",
     "weaver-server-migrations/test-support",
     "weaver-server-postproc/test-support",
     "weaver-tunnel/test-support",
@@ -21,11 +26,12 @@ test-support = [
     "weaver-server-base/test-support",
     "weaver-server-disk/test-support",
     "weaver-server-rss/test-support",
-    "weaver-server-torrents/test-support",
+    "weaver-server-torrent-store/test-support",
     "weaver-server-db/test-support",
     "weaver-server-net/test-support",
     "weaver-server-speedtest/test-support",
     "weaver-server-ingest/test-support",
+    "weaver-server-jobs/test-support",
     "weaver-server-auth/test-support",
 ]
 # e2e builds only; see weaver-torrent's feature of the same name.
@@ -33,11 +39,12 @@ e2e-local-trackers = ["weaver-torrent/e2e-local-trackers"]
 
 [dependencies]
 weaver-server-base = { path = "../weaver-server-base" }
+weaver-server-composition = { path = "../weaver-server-composition" }
 weaver-server-disk = { path = "../weaver-server-disk" }
 weaver-server-db = { path = "../weaver-server-db" }
 weaver-server-rss = { path = "../weaver-server-rss" }
 weaver-server-speedtest = { path = "../weaver-server-speedtest" }
-weaver-server-torrents = { path = "../weaver-server-torrents" }
+weaver-server-torrent-store = { path = "../weaver-server-torrent-store" }
 weaver-server-postproc = { path = "../weaver-server-postproc" }
 weaver-server-net = { path = "../weaver-server-net" }
 weaver-server-history = { path = "../weaver-server-history" }
@@ -48,17 +55,6 @@ weaver-server-settings = { path = "../weaver-server-settings" }
 weaver-server-migrations = { path = "../weaver-server-migrations" }
 weaver-tunnel = { path = "../../../engines/weaver-tunnel" }
 async-trait = "0.1"
-# The in-application upgrade core: manifest validation, installation
-# classification, download, verification, extraction, promotion, rollback, the
-# durable journal and the Windows helper handoff. Pinned to a signed tag rather
-# than a branch, because everything in it is release-critical.
-application-updater = { git = "https://github.com/scryer-media/application-updater", tag = "v0.1.1" }
-# The signer-policy types, plus the Sigstore trust-root refresh Weaver primes at
-# startup. `verification` is named explicitly rather than left to feature
-# unification through `application-updater`.
-artifact-trust = { git = "https://github.com/scryer-media/artifact-trust", tag = "v0.1.3", default-features = false, features = [
-    "verification",
-] }
 weaver-graph = { path = "../../../engines/weaver-graph" }
 weaver-objects = { path = "../../../engines/weaver-objects" }
 weaver-model = { path = "../../../shared/crates/weaver-model", default-features = false }
@@ -99,8 +95,6 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 sha2 = { workspace = true }
 reqwest = { workspace = true }
-semver = { workspace = true }
-httpdate = { workspace = true }
 regex = { workspace = true }
 quick-xml = { workspace = true }
 notify = { workspace = true }
@@ -123,6 +117,81 @@ getrandom = { workspace = true, default-features = false }
 hex = { workspace = true }
 pbkdf2 = { workspace = true }
 
+# Archive matrix and extended campaign targets: built only with the
+# `archive-matrix` feature, one per family so a re-run builds only its own tests.
+
+# The archive matrix: graph arrival schedules and two-set smokes.
+[[test]]
+name = "archive_matrix_graph"
+path = "tests/archive_matrix_graph.rs"
+required-features = ["archive-matrix"]
+
+# The archive matrix: combined graph, two-set and 7z campaigns.
+[[test]]
+name = "archive_matrix_combined"
+path = "tests/archive_matrix_combined.rs"
+required-features = ["archive-matrix"]
+
+# The archive matrix: grouping cross.
+[[test]]
+name = "archive_matrix_grouping"
+path = "tests/archive_matrix_grouping.rs"
+required-features = ["archive-matrix"]
+
+# The archive matrix: 7z store schedules.
+[[test]]
+name = "archive_matrix_sevenz"
+path = "tests/archive_matrix_sevenz.rs"
+required-features = ["archive-matrix"]
+
+# The archive matrix: PAR2 repair schedules.
+[[test]]
+name = "archive_matrix_par2"
+path = "tests/archive_matrix_par2.rs"
+required-features = ["archive-matrix"]
+
+# The archive matrix: PAR2 completion schedules.
+[[test]]
+name = "archive_matrix_par2_completion"
+path = "tests/archive_matrix_par2_completion.rs"
+required-features = ["archive-matrix"]
+
+# The archive matrix: direct-store PAR2 schedules.
+[[test]]
+name = "archive_matrix_par2_store"
+path = "tests/archive_matrix_par2_store.rs"
+required-features = ["archive-matrix"]
+
+# The extended campaigns: depth, graph formats and repair, tier-2 smokes.
+[[test]]
+name = "archive_matrix_extended"
+path = "tests/archive_matrix_extended.rs"
+required-features = ["archive-matrix"]
+
+# The extended campaigns: graph depth shards.
+[[test]]
+name = "archive_matrix_extended_depth"
+path = "tests/archive_matrix_extended_depth.rs"
+required-features = ["archive-matrix"]
+
+# The extended campaigns: tier-2 combined damage shards.
+[[test]]
+name = "archive_matrix_extended_damage"
+path = "tests/archive_matrix_extended_damage.rs"
+required-features = ["archive-matrix"]
+
+# The extended campaigns: tier-2 breadth, headers, par3 and uu shards.
+[[test]]
+name = "archive_matrix_extended_formats"
+path = "tests/archive_matrix_extended_formats.rs"
+required-features = ["archive-matrix"]
+
+# The extended campaigns: tier-2 PAR2 realism shards.
+[[test]]
+name = "archive_matrix_extended_par2_realism"
+path = "tests/archive_matrix_extended_par2_realism.rs"
+required-features = ["archive-matrix"]
+
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = { workspace = true }
 security-framework-sys = { workspace = true }
@@ -135,11 +204,16 @@ windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Securit
 
 [dev-dependencies]
 weaver-server-pipeline = { path = ".", features = ["pipeline-test-fixtures"] }
-weaver-server-torrents = { path = "../weaver-server-torrents", features = ["test-support"] }
+weaver-server-composition = { path = "../weaver-server-composition", features = ["pipeline-test-fixtures"] }
+# The integration tests that submit an NZB or recover a server go through the
+# services above the pipeline; no lib unit test names it.
+weaver-server-orchestration = { path = "../weaver-server-orchestration" }
+weaver-server-torrent-store = { path = "../weaver-server-torrent-store", features = ["test-support"] }
 weaver-server-rss = { path = "../weaver-server-rss", features = ["test-support"] }
 weaver-server-net = { path = "../weaver-server-net", features = ["test-support"] }
 weaver-server-auth = { path = "../weaver-server-auth", features = ["test-support"] }
 weaver-server-ingest = { path = "../weaver-server-ingest", features = ["test-support"] }
+weaver-server-jobs = { path = "../weaver-server-jobs", features = ["test-support"] }
 weaver-server-base = { path = "../weaver-server-base", features = ["test-support"] }
 weaver-server-disk = { path = "../weaver-server-disk", features = ["test-support"] }
 weaver-server-db = { path = "../weaver-server-db", features = ["test-support"] }
@@ -159,13 +233,6 @@ tempfile = { workspace = true }
 # never encodes 7z.
 sevenz-turbo = { workspace = true, features = ["compress"] }
 axum = { workspace = true }
-# The manifest-fetch-order tests drive the shared fetch against a local server
-# with signature verification stubbed. `test-seams` is a dev-dependency feature
-# on purpose: the shipped binary must never be able to skip verification.
-application-updater = { git = "https://github.com/scryer-media/application-updater", tag = "v0.1.1", features = ["test-seams"] }
-# `UpgradeManifestFetchOverrides::asset_base` is a `url::Url`; already in the
-# graph through reqwest, named here only so the test can build one.
-url = "2"
 lzma-turbo = { workspace = true, features = ["enc"] }
 # A tracker rule's certificate and keys, made in-test.
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }

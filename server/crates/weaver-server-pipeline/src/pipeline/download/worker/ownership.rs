@@ -8,7 +8,7 @@ use super::*;
 const UNSIZED_ARTICLE_BYTES: u64 = 1 << 20;
 
 impl Pipeline {
-    pub(in crate::pipeline) fn next_download_lane_id() -> u64 {
+    pub fn next_download_lane_id() -> u64 {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .expect("download lane identity exhausted")
@@ -111,7 +111,7 @@ impl Pipeline {
     // Standalone fixtures inject results from lane 0 without starting a
     // transport; this books what such a result releases, through the same
     // record a dispatched lease writes.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(in crate::pipeline) fn hold_test_lane_works(
         &mut self,
         works: Vec<DownloadWork>,
@@ -143,7 +143,7 @@ impl Pipeline {
 
     // Every live lane answers what it holds and parks with nothing left to
     // do, as the lane tasks would report once their batches were done.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(in crate::pipeline) fn finish_test_lanes(&mut self) {
         let lanes: Vec<(u64, Vec<SegmentId>)> = self
             .download_lane_owners
@@ -220,7 +220,7 @@ impl Pipeline {
     // Standalone fixtures book articles no lease reserved: they are
     // reserved here, whatever room the volume has, so what they release
     // was counted.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(in crate::pipeline) fn reserve_test_lane_work(&mut self, work: &DownloadWork) {
         let job_id = work.segment_id.file_id.job_id;
         let Some(volume) = self.article_volume(job_id) else {
@@ -379,7 +379,7 @@ impl Pipeline {
     // nothing is lowered, because whatever took the article off the lane's
     // record lowered them already. A result comes back through
     // `accept_lane_result`; this is for fixtures that end lanes whole.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(super) fn accept_lane_work(&mut self, lane_id: u64, segment: SegmentId) -> bool {
         self.accept_lane_work_with(lane_id, segment, 0, |_| {})
     }

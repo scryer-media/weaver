@@ -7,10 +7,12 @@
 
 use sevenz_turbo::encoder_options::Lzma2Options;
 
-use super::harness::{ARTICLE, JOB, Outcome, Post, Scenario, par2_set, payload, run};
+use super::harness::{ARTICLE, JOB, Outcome, Post, Scenario, par2_set, par3_set, payload, run};
 use super::rar::posts;
+use crate::jobs::model::JobStatus;
 use crate::pipeline::tests::direct_store::single_member_store_set;
 use weaver_server_base::events::model::PipelineEvent;
+use weaver_server_pipeline::pipeline::tests::engines::restart_fixtures::run_restarted_after_repairing;
 
 // The run's stage events as words a row can compare.
 fn stages(outcome: &Outcome) -> Vec<String> {
@@ -151,7 +153,115 @@ async fn a_repair_the_job_fails_on_says_it_failed() {
     let graph = run(&scenario).await;
     assert!(!graph.completed(), "{:?}", graph.status);
     let said = stages(&graph);
-    assert!(said.contains(&"RepairFailed".to_string()), "{said:?}");
+    assert_eq!(
+        said.iter().filter(|stage| *stage == "RepairFailed").count(),
+        1,
+        "{said:?}"
+    );
+    // The failure is said as the job ends and carries when its repair
+    // stopped running, for the timeline to record it there.
+    assert!(graph.events.iter().any(|event| matches!(
+        event,
+        PipelineEvent::RepairFailed {
+            job_id,
+            ended_at_ms: Some(_),
+            ..
+        } if *job_id == JOB
+    )));
+}
+
+// The repair failures and the job's end a restarted run said, in order.
+fn failures_and_end(events: &[PipelineEvent]) -> Vec<&'static str> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            PipelineEvent::RepairStarted { job_id } if *job_id == JOB => Some("RepairStarted"),
+            PipelineEvent::RepairFailed { job_id, .. } if *job_id == JOB => Some("RepairFailed"),
+            PipelineEvent::JobFailed { job_id, .. } if *job_id == JOB => Some("JobFailed"),
+            PipelineEvent::JobCompleted { job_id } if *job_id == JOB => Some("JobCompleted"),
+            _ => None,
+        })
+        .collect()
+}
+
+// A coded 7z with one damaged article beside a PAR2 set that repairs it, and
+// a plain file damaged in two slices beside a PAR2 set of one block, which
+// cannot. The job repairs the 7z, then extracts it, and the pipeline goes
+// down while it extracts: past its repair, before its end. The restored job
+// never reports Repairing again, and still ends saying the repair failed,
+// once.
+#[tokio::test]
+async fn a_job_restarted_after_its_repair_still_says_the_repair_failed_once() {
+    let archive = super::sevenz::container(Lzma2Options::from_level(1).into(), None);
+    let body = payload(6 * ARTICLE + 11, 74);
+    let mut all = vec![Post::plain("lantern.7z", archive.clone())];
+    all.extend(par2_set(
+        "lantern",
+        &[("lantern.7z", archive.as_slice())],
+        2,
+    ));
+    let ember = all.len() as u32;
+    all.push(Post::plain("ember.bin", body.clone()));
+    all.extend(par2_set("ember", &[("ember.bin", body.as_slice())], 1));
+    let scenario = Scenario::new(all)
+        .damaged(0, 0)
+        .damaged(ember, 1)
+        .damaged(ember, 4);
+    // Unrestarted, the job repairs, extracts, and ends saying the failure.
+    let whole = run(&scenario).await;
+    assert_eq!(
+        stages(&whole),
+        [
+            "RepairStarted",
+            "ExtractionReady",
+            "ExtractionComplete",
+            "RepairFailed"
+        ]
+    );
+    let restarted = run_restarted_after_repairing(&scenario).await;
+    assert_eq!(restarted.status, whole.status);
+    assert_eq!(restarted.status, Some(JobStatus::Partial));
+    let said = failures_and_end(&restarted.events);
+    assert_eq!(
+        said.iter()
+            .filter(|stage| **stage == "RepairFailed")
+            .count(),
+        1,
+        "{said:?}"
+    );
+}
+
+// One plain file damaged in two slices beside a PAR2 set of one recovery
+// block and a PAR3 set of eight. The PAR2 set rules first that it cannot
+// rebuild the damage and the job leaves repair with the PAR3 set still to
+// repair; the PAR3 set then rebuilds the file and the job ends Complete. A
+// ruling that a later repair made good is no failure of the job: no repair
+// is said to have failed.
+#[tokio::test]
+async fn a_short_set_outdone_by_a_later_repair_says_no_repair_failure() {
+    let body = payload(6 * ARTICLE + 11, 74);
+    let files: [(&str, &[u8]); 1] = [("ember.bin", &body)];
+    let mut all = vec![Post::plain("ember.bin", body.clone())];
+    all.extend(par2_set("ember", &files, 1));
+    all.extend(par3_set("ember.c", &files, 8));
+    let scenario = Scenario::new(all).damaged(0, 1).damaged(0, 4);
+    let graph = run(&scenario).await;
+    assert_eq!(
+        graph.status,
+        Some(JobStatus::Complete),
+        "{:?}",
+        graph.failure
+    );
+    assert_eq!(
+        stages(&graph),
+        [
+            "RepairStarted",
+            "RepairStarted",
+            "RepairComplete",
+            "JobVerificationStarted",
+            "JobVerificationComplete true"
+        ]
+    );
 }
 
 // Two plain files, one of which every server failed an article of: only the

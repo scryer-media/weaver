@@ -5,10 +5,11 @@
 // part, in NZB order, before it is booked missing. However many ids the part
 // carries, the booking does not nest in itself once per id.
 
+use weaver_server_composition::{JobId, JobStatus, MessageIds, NzbFileId, SegmentId};
+use weaver_server_pipeline::DownloadQueue;
 use weaver_server_pipeline::pipeline::tests::{
     dispatch_fixture::DispatchFixture, segmented_job_spec,
 };
-use weaver_server_pipeline::{DownloadQueue, JobId, JobStatus, MessageIds, NzbFileId, SegmentId};
 
 // What one booking left behind, for comparing runs.
 #[derive(Debug, PartialEq, Eq)]

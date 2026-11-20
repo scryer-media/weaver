@@ -5,10 +5,10 @@
 // itself before it took its order from it, over seeded queues of mixed
 // priorities with paused, admitted, cancelled, retiring and edited rows.
 
+use weaver_server_composition::{JobId, QueueMoveTarget};
 use weaver_server_pipeline::pipeline::tests::{
     dispatch_order_fixture::*, queue_scale_fixture::admitted_ids, window_fixture::settle,
 };
-use weaver_server_pipeline::{JobId, QueueMoveTarget};
 
 fn sorted(mut ids: Vec<JobId>) -> Vec<JobId> {
     ids.sort_unstable();

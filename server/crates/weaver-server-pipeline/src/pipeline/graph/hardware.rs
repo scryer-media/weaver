@@ -26,7 +26,7 @@ use crate::RuntimeTuner;
 use crate::runtime::{HardwareProfile, OverLimit};
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct Hardware {
+pub struct Hardware {
     grant: Arc<RwLock<Grant>>,
     shutdown: Shutdown,
     // The job was asked to run with no memory limit: a run whose window is
@@ -39,10 +39,10 @@ pub(crate) struct Hardware {
 // repair does not begin once it is set, and one going stops reading.
 // Outside a pipeline nothing sets it.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct Shutdown(Arc<AtomicBool>);
+pub struct Shutdown(Arc<AtomicBool>);
 
 impl Shutdown {
-    pub(crate) fn of(started: Arc<AtomicBool>) -> Self {
+    pub fn of(started: Arc<AtomicBool>) -> Self {
         Self(started)
     }
 
@@ -53,22 +53,22 @@ impl Shutdown {
 
 // What work starting now is given.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct Grant {
+pub struct Grant {
     // The post-processing pool, sized to the profile's extract threads.
     // None outside a pipeline: the work runs on the thread it was given.
-    pub(crate) pool: Option<Arc<rayon::ThreadPool>>,
+    pub pool: Option<Arc<rayon::ThreadPool>>,
     // The pool a repair runs inside, as wide as the repair's threads: a
     // PAR2 repair spreads across the pool it runs in. The post-processing
     // pool when that is as wide. None outside a pipeline.
-    pub(crate) repair_pool: Option<Arc<rayon::ThreadPool>>,
+    pub repair_pool: Option<Arc<rayon::ThreadPool>>,
     // An engine run: its decoder's memory and its threads.
-    pub(crate) run: Budget,
+    pub run: Budget,
     // A recovery set's repair: its workspace and its workers.
-    pub(crate) repair: Budget,
+    pub repair: Budget,
     // What a run whose window is over the run's ceiling gets.
-    pub(crate) over_limit: OverLimit,
+    pub over_limit: OverLimit,
     // The memory the machine can use, when it is known.
-    pub(crate) machine_bytes: Option<u64>,
+    pub machine_bytes: Option<u64>,
 }
 
 impl Grant {
@@ -223,8 +223,8 @@ impl Hardware {
     }
 
     // Hardware that grants `grant`, outside a pipeline.
-    #[cfg(test)]
-    pub(crate) fn granting(grant: Grant) -> Self {
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn granting(grant: Grant) -> Self {
         Self {
             grant: Arc::new(RwLock::new(grant)),
             ..Self::default()
@@ -239,7 +239,7 @@ impl Hardware {
     // The same hardware, for a job asked to run with no memory limit when
     // `lifted`: a window over the ceiling is lent from scratch, then RAM,
     // whatever the profile says. Other jobs keep the profile's policy.
-    pub(crate) fn lifted(self, lifted: bool) -> Self {
+    pub fn lifted(self, lifted: bool) -> Self {
         Self { lifted, ..self }
     }
 
