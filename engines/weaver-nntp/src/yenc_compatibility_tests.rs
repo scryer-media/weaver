@@ -578,8 +578,8 @@ fn table_article(body: &[u8], pcrc32: u32) -> Vec<u8> {
 }
 
 // A lone `=` ending the last body line before the trailer, and every related
-// shape: whole-buffer, streaming and fused decode each the way rapidyenc and
-// sabctools do, byte for byte and verdict for verdict, at every wire split.
+// shape: whole-buffer, streaming and fused decode each the way rapidyenc
+// does, byte for byte and verdict for verdict, at every wire split.
 // The `=` escapes the line's `\r` (0xA3), the `\r` still breaks the line, the
 // trailer is found, and a damaged article reports its CRC mismatch with its
 // data kept.
@@ -866,7 +866,7 @@ fn an_unstuffed_two_dot_line_deep_in_a_long_part_keeps_its_dot() {
 }
 
 // A kept dot that does not make the part check is not kept: the part stays
-// one byte short with its mismatch, as rapidyenc and sabctools read it.
+// one byte short with its mismatch, as rapidyenc reads it.
 #[test]
 fn an_unstuffed_two_dot_line_stays_a_mismatch_when_no_kept_dot_matches() {
     let lines = dot_lines(4, 10, 6);

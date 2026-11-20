@@ -808,8 +808,7 @@ async fn a_piece_posted_short_is_rebuilt_to_the_length_its_recovery_set_proves_i
 // Pieces posted under names that trail an underscore past the number,
 // `x.mkv.001_` onward, as a subject's closing quote leaves them: the trail is
 // no part of the number, so the pieces join into `x.mkv` at the root, one
-// split and no deeper. SABnzbd read these names as `.001` onward and joined
-// them. Unjoined, the first piece nested a split under a split until the
+// split and no deeper. Unjoined, the first piece nested a split under a split until the
 // nesting limit refused it.
 fn trailed(bytes: &[u8]) -> Vec<Post> {
     pieces(bytes)

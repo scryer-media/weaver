@@ -520,3 +520,184 @@ async fn a_zip_whose_only_whole_member_is_an_unread_par2_fails() {
         graph.status
     );
 }
+
+// Lost articles in a zip with no recovery beside it. Every post is cut into
+// 4 KiB articles, and an article is lost when no server has it.
+const LOST_FRAME: usize = 4096;
+
+// A stored zip of the named members, one after another.
+fn stored_of(members: &[(&str, &[u8], SimpleFileOptions)]) -> Vec<u8> {
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    for (name, bytes, options) in members {
+        writer.start_file(*name, *options).unwrap();
+        writer.write_all(bytes).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
+// Where `bytes` begin in the archive, as the member's data.
+fn data_at(archive: &[u8], bytes: &[u8]) -> usize {
+    archive
+        .windows(64)
+        .position(|window| window == &bytes[..64])
+        .expect("the member's data is in the archive")
+}
+
+// The articles lying wholly inside `range` of the archive.
+fn articles_inside(range: std::ops::Range<usize>) -> std::ops::Range<u32> {
+    (range.start.div_ceil(LOST_FRAME) as u32)..((range.end / LOST_FRAME) as u32)
+}
+
+fn lose(posts: Vec<Post>, articles: impl IntoIterator<Item = u32>) -> Scenario {
+    articles.into_iter().fold(
+        Scenario::new(posts).framed(LOST_FRAME),
+        |scenario, ordinal| scenario.lost(0, ordinal),
+    )
+}
+
+// The field post's shape: one stored member whose last two thirds are
+// zeros, and the articles lost all fall in them. Read as zeros, the lost
+// bytes are the member's own, its CRC-32 says so, and it is delivered
+// whole: the job completes.
+#[tokio::test]
+async fn a_stored_zip_member_whose_lost_bytes_were_zeros_is_delivered_by_its_crc() {
+    let mut member = payload(10 * LOST_FRAME, 61);
+    member.resize(30 * LOST_FRAME, 0);
+    let archive = stored_of(&[("ember.mkv", &member, stored())]);
+    let start = data_at(&archive, &member);
+    let lost = articles_inside(start + 12 * LOST_FRAME..start + member.len());
+    assert!(lost.len() >= 2, "{lost:?}");
+    let scenario = lose(vec![Post::plain("lantern.zip", archive)], lost.take(2));
+    let graph = run(&scenario).await;
+    assert_eq!(
+        graph.status,
+        Some(JobStatus::Complete),
+        "{:?} {:?}",
+        graph.failure,
+        kinds(&graph)
+    );
+    assert_eq!(
+        graph.files.keys().cloned().collect::<Vec<_>>(),
+        [delivered("ember.mkv")]
+    );
+    assert!(graph.files[&delivered("ember.mkv")] == member);
+}
+
+// The same lost articles over bytes that were not zeros: read as zeros, the
+// member fails its CRC-32 and is not delivered. Nothing usable came, so the
+// job fails.
+#[tokio::test]
+async fn a_stored_zip_member_whose_lost_bytes_were_not_zeros_fails_its_crc() {
+    let member = payload(30 * LOST_FRAME, 62);
+    let archive = stored_of(&[("ember.mkv", &member, stored())]);
+    let start = data_at(&archive, &member);
+    let lost = articles_inside(start + 12 * LOST_FRAME..start + member.len());
+    let scenario = lose(vec![Post::plain("lantern.zip", archive)], lost.take(2));
+    let graph = run(&scenario).await;
+    assert!(
+        matches!(graph.status, Some(JobStatus::Failed { .. })),
+        "{:?}",
+        graph.status
+    );
+    assert!(!graph.files.contains_key(&delivered("ember.mkv")));
+}
+
+// Three stored members, an article lost inside the middle one's data, whose
+// bytes were not zeros: the middle one fails its CRC-32, and the walk goes on
+// past it, so the first and the third are delivered. Two usable files
+// came: the job is Partial.
+#[tokio::test]
+async fn a_lost_article_in_the_middle_member_of_three_fails_that_member_only() {
+    let (ember, quill, cinder) = (
+        payload(8 * LOST_FRAME + 7, 63),
+        payload(8 * LOST_FRAME + 9, 64),
+        payload(8 * LOST_FRAME + 11, 65),
+    );
+    let archive = stored_of(&[
+        ("ember.mkv", &ember, stored()),
+        ("quill.mkv", &quill, stored()),
+        ("cinder.mkv", &cinder, stored()),
+    ]);
+    let start = data_at(&archive, &quill);
+    let lost = articles_inside(start..start + quill.len());
+    let scenario = lose(vec![Post::plain("lantern.zip", archive)], lost.take(1));
+    let graph = run(&scenario).await;
+    assert_eq!(
+        graph.status,
+        Some(JobStatus::Partial),
+        "{:?} {:?}",
+        graph.failure,
+        kinds(&graph)
+    );
+    assert!(graph.files.get(&delivered("ember.mkv")) == Some(&ember));
+    assert!(graph.files.get(&delivered("cinder.mkv")) == Some(&cinder));
+    assert!(!graph.files.contains_key(&delivered("quill.mkv")));
+}
+
+// A deflated or enciphered first member with an article lost inside it: no
+// read of it as zeros is tried, as the bytes it stores are not its own, and
+// it fails. The stored member after it is delivered, and the job is Partial.
+#[tokio::test]
+async fn a_deflated_or_enciphered_member_across_a_lost_article_fails_and_the_next_is_delivered() {
+    use ::zip::unstable::write::FileOptionsExt;
+    let mut ember = payload(3 * LOST_FRAME, 66);
+    ember.resize(8 * LOST_FRAME, 0);
+    let quill = payload(20 * LOST_FRAME + 5, 67);
+    let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    let zipcrypto = stored()
+        .with_deprecated_encryption(SECRET.as_bytes())
+        .unwrap();
+    let aes = stored().with_aes_encryption(AesMode::Aes256, SECRET);
+    for (kind, options) in [
+        ("deflated", deflated),
+        ("zipcrypto", zipcrypto),
+        ("aes", aes),
+    ] {
+        let archive = stored_of(&[
+            ("ember.mkv", &ember, options),
+            ("quill.mkv", &quill, stored()),
+        ]);
+        // The first member's data runs from its local header to the second's.
+        let lost = articles_inside(LOST_FRAME..second_local(&archive));
+        assert!(!lost.is_empty(), "{kind}: {lost:?}");
+        let scenario =
+            lose(vec![Post::plain("lantern.zip", archive)], lost.take(1)).password(SECRET);
+        let graph = run(&scenario).await;
+        assert_eq!(
+            graph.status,
+            Some(JobStatus::Partial),
+            "{kind}: {:?}",
+            graph.failure
+        );
+        assert!(
+            !graph.files.contains_key(&delivered("ember.mkv")),
+            "{kind}: ember.mkv"
+        );
+        assert!(
+            graph.files.get(&delivered("quill.mkv")) == Some(&quill),
+            "{kind}: quill.mkv"
+        );
+    }
+}
+
+// The article holding the directory and the end record is lost: the
+// archive cannot be read at all, and is refused. No member is delivered.
+#[tokio::test]
+async fn a_zip_whose_directory_is_lost_is_refused() {
+    let ember = payload(4 * LOST_FRAME + 3, 68);
+    let archive = stored_of(&[("ember.mkv", &ember, stored())]);
+    let last = (archive.len().div_ceil(LOST_FRAME) - 1) as u32;
+    let tail = archive.len() - 22;
+    assert!(
+        last as usize * LOST_FRAME <= u32_at(&archive, tail + 16) as usize,
+        "the last article holds the whole directory"
+    );
+    let scenario = lose(vec![Post::plain("lantern.zip", archive)], [last]);
+    let graph = run(&scenario).await;
+    assert!(
+        matches!(graph.status, Some(JobStatus::Failed { .. })),
+        "{:?}",
+        graph.status
+    );
+    assert!(!graph.files.contains_key(&delivered("ember.mkv")));
+}

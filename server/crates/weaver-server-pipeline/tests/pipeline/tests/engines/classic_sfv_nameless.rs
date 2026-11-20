@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// SFV listings posted under names that say nothing. SABnzbd looks for
-// listings by content when no file is named `*.sfv`
-// (sabnzbd/postproc.py:917-925, the sniff at sabnzbd/newsunpack.py:1805):
+// SFV listings posted under names that say nothing. Listings are looked
+// for by content when no file is named `*.sfv`:
 // comment and blank lines are skipped, every other line is a name and eight
 // hex digits. A listing found that way checks the files it names as a named
 // one does.

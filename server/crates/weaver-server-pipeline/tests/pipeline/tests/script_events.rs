@@ -369,7 +369,7 @@ async fn file_only_scripts_hold_the_pre_move_barrier_without_downloaded_subscrib
     barrier.await.unwrap();
 }
 
-// A job its post failed is deleted for health as NZBGet deletes one; any
+// A job its post failed is deleted for health; any
 // other failure, such as an extraction's, raises no deletion.
 #[tokio::test]
 async fn a_health_failure_raises_the_jobs_deletion_for_health() {

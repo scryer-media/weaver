@@ -287,7 +287,7 @@ const MIN_KEPT_DOT_TRIES: usize = 1024;
 // A line whose data begins with two encoded dots, sent by a poster that does
 // not stuff dots, goes out as `..` where stuffing makes it `...`. The server
 // takes the first dot as stuffing, and so does every reader after it
-// (rapidyenc, sabctools and this decoder), so the part decodes one byte short
+// (rapidyenc and this decoder), so the part decodes one byte short
 // of its declared length and fails its CRC. That part is retried keeping one
 // more dot, and the dot is kept only where the part then matches its CRC.
 //
@@ -431,7 +431,7 @@ fn keep_dot_in_place(
 
 // Decode a complete yEnc article with custom options.
 //
-// Rule: weaver never fails an article another tool would accept; where readings differ it decodes as rapidyenc and sabctools do.
+// Rule: weaver never fails an article another tool would accept; where readings differ it decodes as rapidyenc does.
 //
 // `output` is subject to the same [`max_decoded_len`] contract as [`decode`].
 pub fn decode_with_options(
@@ -472,7 +472,7 @@ fn decode_with_line_scan(
     let mut data_end = parsed.data_end.max(parsed.data_start);
     // A body whose last line ends in a lone `=` before the control line: the
     // `=` escapes the line's `\r` (0xA3) and the `\r` still breaks the line,
-    // as the kernel, rapidyenc and sabctools read it. Decoding through that
+    // as the kernel and rapidyenc read it. Decoding through that
     // `\r` keeps the escaped byte instead of failing on a dangling escape.
     if data_end < input.len()
         && input[data_end] == b'\r'
@@ -554,7 +554,7 @@ fn decode_raw_single_pass(
             // The kernel consumes the `=y` it stopped at.
             // A final `=` before the control line escapes the line's `\r`
             // (0xA3), and the article ends at the trailer with its CRC
-            // mismatch, exactly as the line scan, rapidyenc and sabctools read
+            // mismatch, exactly as the line scan and rapidyenc read
             // it.
             let keyword_start = data_start + outcome.consumed - 2;
             Some(header::parse_trailer_at(input, keyword_start)?)
@@ -3172,8 +3172,8 @@ mod tests {
     }
 
     // A lone `=` ending the last line before the trailer escapes the line's
-    // `\r` (0xA3) and the trailer still counts, as rapidyenc and sabctools
-    // read it; an input that ends inside an escape with no control line after
+    // `\r` (0xA3) and the trailer still counts, as rapidyenc
+    // reads it; an input that ends inside an escape with no control line after
     // it still fails on the dangling escape.
     #[test]
     fn raw_article_dangling_escape_before_trailer_decodes_the_cr() {

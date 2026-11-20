@@ -23,7 +23,7 @@ pub fn derive_release_name(primary: Option<&str>, secondary: Option<&str>) -> St
 }
 
 // The name of a job's completed folder: the release title as posted, kept
-// whole the way SABnzbd and NZBGet keep it, because download managers check
+// whole, because download managers check
 // the files they import against this folder's name and the shortened display
 // name drops the season or the later episodes they look for. Only what a
 // filesystem cannot hold is taken out. A job with no original title keeps its

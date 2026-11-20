@@ -225,6 +225,10 @@ pub struct NamespaceWriter {
     // files, envelopes, holds and repair staging stay in the working
     // directory.
     output_dir: PathBuf,
+    // The output directory is the working directory: every member's file
+    // lies on the one device. Set with the directories, so no write
+    // compares their paths.
+    delivers_in_place: bool,
     accountant: Arc<HoldsAccountant>,
     // The free space of the working directory's device, which the holds
     // page out against, and of the output directory's, which what an
@@ -317,6 +321,9 @@ pub struct NamespaceWriter {
     // The members whose file the file system refused to create for its
     // name (`skip_unnamable`), until the ledger renames them.
     unnamable: BTreeSet<(NodeId, MemberId)>,
+    // The members a loss marked, until each is tried for zeros once nothing
+    // can bring its bytes back (`zeros`).
+    lost_marked: BTreeSet<(NodeId, MemberId)>,
     // How many times a member was skipped for its name.
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub names_skipped: usize,
@@ -420,6 +427,7 @@ impl NamespaceWriter {
             scope,
             envelopes: Envelopes::new(working_dir.clone()),
             output_dir: working_dir.clone(),
+            delivers_in_place: true,
             working_dir,
             accountant,
             output_free_disk: free_disk.clone(),
@@ -450,6 +458,7 @@ impl NamespaceWriter {
             left_to_write: None,
             spills_said: BTreeSet::new(),
             unnamable: BTreeSet::new(),
+            lost_marked: BTreeSet::new(),
             #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             names_skipped: 0,
             unnamed_damage: Vec::new(),
@@ -473,6 +482,7 @@ impl NamespaceWriter {
     // The files of the members the job delivers lie under `output_dir`,
     // on the device `free_disk` reads.
     pub fn delivering_to(mut self, output_dir: PathBuf, free_disk: CapacityReader) -> Self {
+        self.delivers_in_place = output_dir == self.working_dir;
         self.output_dir = output_dir;
         self.output_free_disk = free_disk;
         self
@@ -2367,7 +2377,12 @@ impl NamespaceWriter {
             return self.keep_held(node, member, arrival.offset, arrival.bytes);
         }
         self.release_to_leaf(tree, node, member)?;
-        self.write_file(tree, node, member, arrival.offset, &arrival.bytes)
+        // A repair's bytes into a post were charged before they went out
+        // (`admit_repaired`), or write over room the post already holds:
+        // they do not land as fetched bytes do.
+        let lands = node != NodeId::ROOT || arrival.provenance != Provenance::Repaired;
+        let written = self.write_into(tree, (node, member), arrival.offset, &arrival.bytes, lands);
+        self.skip_unnamable(tree, (node, member), written)
     }
 
     // Hold bytes of the member in its namespace's ledger: in RAM, paged to
@@ -2888,17 +2903,19 @@ impl NamespaceWriter {
         offset: u64,
         bytes: &Evidenced,
     ) -> Result<(), WriteError> {
-        let written = self.write_into(tree, node, member, offset, bytes);
+        let written = self.write_into(tree, (node, member), offset, bytes, true);
         self.skip_unnamable(tree, (node, member), written)
     }
 
+    // `lands` is false for bytes whose room was taken another way: they
+    // write, and land on no promise.
     fn write_into(
         &mut self,
         tree: &Tree,
-        node: NodeId,
-        member: MemberId,
+        (node, member): (NodeId, MemberId),
         offset: u64,
         bytes: &Evidenced,
+        lands: bool,
     ) -> Result<(), WriteError> {
         let record = tree
             .namespace(node)
@@ -2909,7 +2926,8 @@ impl NamespaceWriter {
         let end = offset
             .saturating_add(bytes.len() as u64)
             .max(record.length.unwrap_or(0));
-        self.admit_file(tree, node, member, end, bytes.len() as u64)?;
+        let landing = if lands { bytes.len() as u64 } else { 0 };
+        self.admit_file(tree, node, member, end, landing)?;
         let leaf = self.leaf(tree, node, member)?;
         // The leaf folds the digest the member's stated check needs, from
         // the evidence the bytes came with, hashing only bytes no level above
@@ -3213,9 +3231,10 @@ impl NamespaceWriter {
     }
 
     // The member's file reaches `end`, by a write of `landing` bytes or by
-    // taking its length. Only what an object produces counts against the
-    // disk, and that is delivered, so it is judged against the output
-    // directory's device.
+    // taking its length. What an object produces is delivered, so it is
+    // judged against the output directory's device. A post lands on the
+    // device its directory lies on: the output directory's when no object
+    // reads it, else the device a member that waits lies on.
     fn admit_file(
         &mut self,
         tree: &Tree,
@@ -3224,14 +3243,54 @@ impl NamespaceWriter {
         end: u64,
         landing: u64,
     ) -> Result<(), WriteError> {
+        let device = if node != NodeId::ROOT
+            || matches!(self.device_for(tree, node, member), Device::Output)
+        {
+            Device::Output
+        } else {
+            self.kept_device()
+        };
+        let reader = match device {
+            Device::Output => &self.output_free_disk,
+            Device::Working => &self.free_disk,
+        };
         self.caps.admit_write(
             tree,
             (node, member),
             end,
             (Output::File, landing),
-            (&self.output_free_disk, Device::Output),
+            (reader, device),
         )?;
         Ok(())
+    }
+
+    // The job started with `working` bytes of its posts promised on the
+    // working disk and `output` on the output disk, when that is another:
+    // its posts and what it delivers there draw on them.
+    pub(crate) fn take_posted(&mut self, working: u64, output: u64) {
+        self.caps
+            .take_posted(Device::Working, working, &self.free_disk);
+        if output > 0 {
+            self.caps
+                .take_posted(Device::Output, output, &self.output_free_disk);
+        }
+    }
+
+    // What the start promised and did not land is given back.
+    pub(crate) fn release_posted(&mut self) {
+        self.caps.release_posted();
+    }
+
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn posted(&self) -> [u64; 2] {
+        self.caps.posted()
+    }
+
+    // A writer made by a test starts as a started job does, its posts
+    // promised.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn start_with_posted(&mut self, working: u64, output: u64) {
+        self.take_posted(working, output);
     }
 
     // Bytes up to `end` of a member an object produced that wait in the
@@ -3266,7 +3325,7 @@ impl NamespaceWriter {
     // The device a member that waits lies on: the working directory's,
     // unless that is the output directory.
     pub(super) fn kept_device(&self) -> Device {
-        if self.output_dir == self.working_dir {
+        if self.delivers_in_place {
             Device::Output
         } else {
             Device::Working
@@ -3714,28 +3773,47 @@ pub fn read_member(
     // What the object cannot rebuild is read from the member's own file
     // where that has it: a volume given back stays in its member's file,
     // and an object that takes it again reads it there in place.
-    let mut posted = |range: ByteRange, into: &mut Vec<u8>| {
+    let posted = |range: ByteRange, into: &mut Vec<u8>| {
         let start = into.len();
         source.posted(child, volume, range, &mut read, into) || {
             into.truncate(start);
             source.leaf(node, member, range, into)
         }
     };
+    held_first(source, (node, member), range, into, posted)
+}
+
+// A member's range, its held custody first and `rest` for what lies
+// between: held custody is current authority, even if its backing cannot be
+// read. An older derived copy, the member's file among them, must not
+// substitute for that failure. Whole, or nothing and `false`.
+fn held_first(
+    source: &dyn Source,
+    (node, member): (NodeId, MemberId),
+    range: ByteRange,
+    into: &mut Vec<u8>,
+    mut rest: impl FnMut(ByteRange, &mut Vec<u8>) -> bool,
+) -> bool {
+    let start = into.len();
     let mut at = range.start;
     let pieces = source.held(node, member, range);
-    for group in pieces.chunk_by(|(a, _), (b, _)| a.end == b.start) {
-        let held = ByteRange::new(group[0].0.start, group[group.len() - 1].0.end);
-        if at < held.start && !posted(ByteRange::new(at, held.start), into) {
-            return false;
+    let mut read = || {
+        for group in pieces.chunk_by(|(a, _), (b, _)| a.end == b.start) {
+            let held = ByteRange::new(group[0].0.start, group[group.len() - 1].0.end);
+            if at < held.start && !rest(ByteRange::new(at, held.start), into) {
+                return false;
+            }
+            if !read_held(source, (node, member), group, held, into) {
+                return false;
+            }
+            at = held.end;
         }
-        // Held custody is current authority, even if its backing cannot be
-        // read. An older derived copy must not substitute for that failure.
-        if !read_held(source, (node, member), group, held, into) {
-            return false;
-        }
-        at = held.end;
+        at == range.end || rest(ByteRange::new(at, range.end), into)
+    };
+    read() || {
+        into.truncate(start);
+        false
     }
-    at == range.end || posted(ByteRange::new(at, range.end), into)
 }
 
 // What one placement of the object at `child`, bound to `member` of `node`,
@@ -3761,8 +3839,8 @@ fn read_placed(
     }
 }
 
-// A member no object reads: its bytes are in its own file, or still held
-// while its front has not said what it is.
+// A member no object reads: its bytes still held while its front has not
+// said what it is, and the rest in its own file.
 fn read_own(
     source: &dyn Source,
     node: NodeId,
@@ -3770,13 +3848,9 @@ fn read_own(
     range: ByteRange,
     into: &mut Vec<u8>,
 ) -> bool {
-    let start = into.len();
-    if source.leaf(node, member, range, into) {
-        return true;
-    }
-    into.truncate(start);
-    let pieces = source.held(node, member, range);
-    read_held(source, (node, member), &pieces, range, into)
+    held_first(source, (node, member), range, into, |rest, into| {
+        source.leaf(node, member, rest, into)
+    })
 }
 
 // The held pieces of a range, read where each is kept.
@@ -4189,6 +4263,7 @@ mod moves;
 pub mod recovery;
 pub mod refusal;
 pub mod verification;
+mod zeros;
 
 #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
 pub(crate) use verification::checked;

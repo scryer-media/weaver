@@ -8,7 +8,7 @@
 // Three things weigh a post. The first-article sample: one article per file
 // the post names as payload, the cheapest sign of whether the post is still
 // there. The post's health, the share of its bytes that has not been lost,
-// against the critical line its declared recovery sets, as NZBGet draws it:
+// against the critical line its declared recovery sets draw:
 // a post that names no recovery is held to 85%, and the more recovery it
 // names the lower the line. And the STAT probe: once the losses take the
 // shape of a release nobody uploaded, the servers are asked whether a

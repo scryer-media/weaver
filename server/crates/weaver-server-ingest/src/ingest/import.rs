@@ -378,7 +378,7 @@ mod tests {
     }
 
     // Files with no subject and no poster are files of the job, each under a
-    // name of its own, as SABnzbd names them.
+    // name of its own.
     #[test]
     fn files_without_a_subject_get_names_of_their_own() {
         let xml = r#"<?xml version="1.0"?>

@@ -6,9 +6,8 @@
 // nameless one, and a listing naming the volumes of a RAR set the store
 // consumes.
 //
-// SABnzbd consults a listing only when no PAR2 set verified the job
-// (sabnzbd/postproc.py:869), and looks for listings by content only when no
-// file is named `*.sfv` (sabnzbd/postproc.py:917-925).
+// A listing is consulted only when no PAR2 set verified the job, and
+// listings are looked for by content only when no file is named `*.sfv`.
 
 use super::harness::{ARTICLE, Claim, Post, Scenario, assert_fetched_once, par2_set, payload, run};
 use super::rar::{delivered, posts};

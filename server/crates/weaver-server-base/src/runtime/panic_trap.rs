@@ -9,10 +9,6 @@
 // walks it straight back into the same panic, on every start, with nothing
 // in the log saying which job it is.
 //
-// SABnzbd catches an exception in a job's post-processing and fails that job
-// with the message (sabnzbd/postproc.py:668-676); its assembler logs the
-// exception and stops (sabnzbd/assembler.py:365-367). NZBGet has no per-job
-// isolation and only enables a core dump (daemon/main/StackTrace.cpp:252-258).
 // Weaver cannot catch under abort, so it remembers across the restart
 // instead:
 //

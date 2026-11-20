@@ -38,7 +38,7 @@ pub use submission_options::{
 pub use torrent_fetch::fetch_torrent_url;
 pub use xz::{XZ_DECODER_MEMORY_LIMIT_BYTES, xz_multistream_decoder};
 
-// Opens a decoder for bzip2 input that reads every stream in it, as SABnzbd's
+// Opens a decoder for bzip2 input that reads every stream in it, as Python's
 // `BZ2File` does for an `.nzb.bz2`.
 pub fn bzip2_multistream_decoder<R: std::io::Read>(reader: R) -> bzip2::read::MultiBzDecoder<R> {
     bzip2::read::MultiBzDecoder::new(reader)

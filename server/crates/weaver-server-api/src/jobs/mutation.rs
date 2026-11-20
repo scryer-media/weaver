@@ -48,7 +48,7 @@ use weaver_server_core::{
     Database, FieldUpdate, JobUpdate, QueueMoveTarget, SchedulerError, SchedulerHandle,
 };
 
-/// Longest timed pause, matching NZBGet's `scheduleresume` bound.
+/// Longest timed pause, the NZBGet facade's `scheduleresume` bound.
 const MAX_RESUME_AFTER_SECS: u64 = 60 * 60 * 24 * 30;
 
 /// Most history ids one `archiveHistory` call takes.

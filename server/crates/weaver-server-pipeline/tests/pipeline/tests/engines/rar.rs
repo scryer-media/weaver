@@ -679,7 +679,7 @@ async fn a_header_encrypted_rar5_set_without_a_password_check_goes_to_the_engine
 // volumes back as they were, short; a set with no volume past its last
 // ends its run silently, and once the job is quiet its object rules that
 // the member it named never closed, and withholds the volumes short of the
-// volume after its last, which it names, as SABnzbd's "unable to find" does.
+// volume after its last, which it names.
 const OLD_NAMES: [&str; 3] = [
     "silver.horizon.rar",
     "silver.horizon.r00",

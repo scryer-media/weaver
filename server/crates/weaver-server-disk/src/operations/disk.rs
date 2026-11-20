@@ -774,6 +774,9 @@ struct Counts {
     promised: [AtomicU64; LEDGERS],
     // Every byte that landed against the ledger, ever.
     landed: [AtomicU64; LEDGERS],
+    // How many times a promise on the ledger was given back: room a start
+    // may take, where a landing frees none.
+    releases: [AtomicU64; LEDGERS],
     // Writers waiting for room on the ledger's root.
     waiters: [AtomicU64; LEDGERS],
     // The filesystem the root's directory lies on as its sampler last found
@@ -789,6 +792,21 @@ struct Counts {
     // the ledgers cannot pass one check. Nothing is read from the disk
     // under it: only the cached reading and the counts.
     booking: std::sync::Mutex<()>,
+}
+
+// How many times anything took a booking lock, in this process: what a
+// test pins a path's cost on the ledgers by.
+#[cfg(any(test, feature = "test-support"))]
+pub static BOOKING_LOCKS: AtomicU64 = AtomicU64::new(0);
+
+impl Counts {
+    fn lock_booking(&self) -> std::sync::MutexGuard<'_, ()> {
+        #[cfg(any(test, feature = "test-support"))]
+        BOOKING_LOCKS.fetch_add(1, Ordering::Relaxed);
+        self.booking
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 impl fmt::Debug for DiskLedger {
@@ -947,11 +965,7 @@ impl DiskLedger {
         need: u64,
         extra: u64,
     ) -> Option<u64> {
-        let _booking = self
-            .counts
-            .booking
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _booking = self.counts.lock_booking();
         let room = checked_room(self, reader, reserve);
         if need > room {
             return None;
@@ -981,15 +995,7 @@ impl DiskLedger {
         let mut locks: Vec<&Counts> = parts.iter().map(|(ledger, ..)| &*ledger.counts).collect();
         locks.sort_by_key(|counts| std::ptr::from_ref::<Counts>(counts) as usize);
         locks.dedup_by(|one, other| std::ptr::eq(*one, *other));
-        let _booking: Vec<_> = locks
-            .iter()
-            .map(|counts| {
-                counts
-                    .booking
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-            })
-            .collect();
+        let _booking: Vec<_> = locks.iter().map(|counts| counts.lock_booking()).collect();
         let rooms: Vec<Option<u64>> = parts
             .iter()
             .map(|(ledger, reader, _)| waking_room(ledger, reader, reserve))
@@ -1018,6 +1024,91 @@ impl DiskLedger {
         true
     }
 
+    // A job that would start is promised `need`, the bytes it still has to
+    // fetch, when they fit in what a fresh, good reading of `reader` leaves
+    // above `reserve` once every promise on the filesystem is taken from it:
+    // checked and promised in one step under the booking lock, so no other
+    // writer books between the two. With no reading, a stale one, or one
+    // not `fresh`, nothing is judged and nothing is promised.
+    pub fn book_start(
+        &self,
+        reader: &CapacityReader,
+        reserve: u64,
+        need: u64,
+        fresh: bool,
+    ) -> StartBooking {
+        Self::book_start_on(
+            &[StartPart {
+                judge: self,
+                reader,
+                fresh,
+                promise: self,
+                need,
+            }],
+            reserve,
+        )
+    }
+
+    // [`Self::book_start`] for every part, or none: each is judged on its
+    // `judge` ledger's reading and promised on its `promise` ledger, the one
+    // its bytes land against and are given back to. Parts on one filesystem
+    // are judged once, together, by the first of them, for the sum of their
+    // needs. The answer is the first that refuses.
+    pub fn book_start_on(parts: &[StartPart<'_>], reserve: u64) -> StartBooking {
+        let mut locks: Vec<&Counts> = parts
+            .iter()
+            .flat_map(|part| [&*part.judge.counts, &*part.promise.counts])
+            .collect();
+        locks.sort_by_key(|counts| std::ptr::from_ref::<Counts>(counts) as usize);
+        locks.dedup_by(|one, other| std::ptr::eq(*one, *other));
+        let _booking: Vec<_> = locks.iter().map(|counts| counts.lock_booking()).collect();
+        for (at, part) in parts.iter().enumerate() {
+            if parts[..at]
+                .iter()
+                .any(|first| first.judge.same_disk(part.judge))
+            {
+                continue;
+            }
+            let need = parts[at..]
+                .iter()
+                .filter(|other| part.judge.same_disk(other.judge))
+                .fold(0u64, |sum, other| sum.saturating_add(other.need));
+            let answer = start_room(part.judge, part.reader, reserve, need, part.fresh);
+            if answer != StartBooking::Booked {
+                return answer;
+            }
+        }
+        for part in parts {
+            part.promise.promise(part.need);
+        }
+        StartBooking::Booked
+    }
+
+    // Everything promised on this ledger's filesystem and not yet landed.
+    pub fn promised_total(&self) -> u64 {
+        self.summed(&self.counts.promised)
+    }
+
+    // The room above `reserve` a start would be judged by now: what a
+    // fresh, good reading of `reader` leaves less every promise on the
+    // filesystem. `None` without one. It reads and books nothing.
+    pub fn start_room_now(
+        &self,
+        reader: &CapacityReader,
+        reserve: u64,
+        fresh: bool,
+    ) -> Option<u64> {
+        match start_room(self, reader, reserve, u64::MAX, fresh) {
+            StartBooking::Short { room } => Some(room),
+            StartBooking::TooLarge { .. } => {
+                let capacity = reader.current();
+                self.free_with(|| capacity)
+                    .map(|free| free.bytes.saturating_sub(reserve))
+            }
+            StartBooking::Booked | StartBooking::Unread => None,
+        }
+    }
+
     // `bytes` more are promised.
     pub fn promise(&self, bytes: u64) {
         if bytes > 0 {
@@ -1030,8 +1121,16 @@ impl DiskLedger {
     pub fn release(&self, bytes: u64) {
         if bytes > 0 {
             saturating_take(&self.counts.promised[self.index], bytes);
+            self.counts.releases[self.index].fetch_add(1, Ordering::AcqRel);
             self.rang();
         }
+    }
+
+    // How many times a promise on this ledger's filesystem was given back.
+    // A count that moved since a look means room was given back since; a
+    // promise that landed moves nothing.
+    pub fn releases(&self) -> u64 {
+        self.summed(&self.counts.releases)
     }
 
     // `promised` bytes of a promise landed, and `unpromised` bytes nobody
@@ -1189,6 +1288,58 @@ fn checked_room(ledger: &DiskLedger, reader: &CapacityReader, reserve: u64) -> u
         Some(free) if reserve > 0 && !free.stale => free.bytes.saturating_sub(reserve),
         _ => u64::MAX,
     }
+}
+
+// What a start check found: the job's bytes were promised; or they do not
+// fit now in the `room` left above the reserve; or they can never fit, the
+// disk holding at `most` that much above its reserve; or no fresh, good
+// reading says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartBooking {
+    Booked,
+    Short { room: u64 },
+    TooLarge { most: u64 },
+    Unread,
+}
+
+// One disk a start is booked on: judged by `judge`'s fresh reading through
+// `reader`, `need` promised on `promise`, which counts with `judge`.
+#[derive(Clone, Copy)]
+pub struct StartPart<'a> {
+    pub judge: &'a DiskLedger,
+    pub reader: &'a CapacityReader,
+    pub fresh: bool,
+    pub promise: &'a DiskLedger,
+    pub need: u64,
+}
+
+// Whether `need` fits on `ledger` by a fresh, good reading of `reader`.
+fn start_room(
+    ledger: &DiskLedger,
+    reader: &CapacityReader,
+    reserve: u64,
+    need: u64,
+    fresh: bool,
+) -> StartBooking {
+    if !fresh {
+        return StartBooking::Unread;
+    }
+    let capacity = reader.current();
+    let Some(reading) = capacity.reading().filter(|reading| !reading.stale) else {
+        return StartBooking::Unread;
+    };
+    let most = reading.total_bytes.saturating_sub(reserve);
+    if need > most {
+        return StartBooking::TooLarge { most };
+    }
+    let Some(free) = ledger.free_with(|| capacity) else {
+        return StartBooking::Unread;
+    };
+    let room = free.bytes.saturating_sub(reserve);
+    if need > room {
+        return StartBooking::Short { room };
+    }
+    StartBooking::Booked
 }
 
 // What a writer waiting here for room sees of a reading: the room above
@@ -2265,6 +2416,18 @@ impl StorageCapacity {
         None
     }
 
+    // Whether `root` has a current reading: a good one, younger than two
+    // intervals by this owner's clock, as `root_space` asks of one. A
+    // start is judged only on such a reading.
+    pub fn fresh(&self, root: StorageRoot) -> bool {
+        match self.slot(root).capacity.read() {
+            Capacity::Known(reading) => {
+                !reading.stale && self.clock.age(reading.sampled_at) < self.interval * 2
+            }
+            Capacity::Unknown => false,
+        }
+    }
+
     // The device a root's directory `path` lay on at its latest look, when
     // that look could read it.
     fn root_device(&self, path: &Path) -> Option<Option<u64>> {
@@ -2665,8 +2828,8 @@ impl StorageCapacity {
     }
 
     // Move a stopped clock on by `by`.
-    #[cfg(test)]
-    fn advance_clock(&self, by: Duration) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn advance_clock(&self, by: Duration) {
         let mut stopped = self
             .clock
             .stopped

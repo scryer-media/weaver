@@ -278,7 +278,7 @@ async fn a_damaged_article_without_par2_fails_with_the_file_claimed_damaged() {
 
 // A damaged member no set covers: the graph leaves it a damaged leaf and
 // delivers the rest repaired. The set vouched for the job, and nothing
-// checks a file no set describes (SABnzbd's rule), so the job completes
+// checks a file no set describes, so the job completes
 // with the leaf delivered as it stands.
 #[tokio::test]
 async fn a_damaged_member_no_set_covers_is_a_damaged_leaf() {
@@ -494,8 +494,7 @@ fn undescribed(data: Vec<u8>, lose_payload: bool) -> Scenario {
 // The field post's lie: every header declares a file two articles long, on
 // a file of 28 articles whose parts begin far past it. Every reference
 // decoder writes each part at its own `=ypart begin` and closes the file at
-// the furthest byte written (sabctools `src/yenc.cc:339-377`, NZBGet
-// `daemon/nntp/ArticleWriter.cpp:557-558`), so every byte arrives and the
+// the furthest byte written, so every byte arrives and the
 // file is delivered whole.
 #[tokio::test]
 async fn a_post_declaring_two_articles_of_many_is_delivered_whole() {

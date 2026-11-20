@@ -938,11 +938,11 @@ async fn an_old_style_set_whose_recovery_articles_are_another_posts_binds_no_set
     );
 }
 
-// The same post, read as SABnzbd's repair says it was: the PAR2 index and
+// The same post, as its repair shows it was: the PAR2 index and
 // volume carry their own bytes, every article of them under another post's
 // header (an obfuscated name, a 172 MB size and a place far past these
 // files), and the first volume's opening article is another post's whole.
-// Laid in the NZB's order, as SABnzbd lays them, the PAR2 files are whole
+// Laid in the NZB's order, the PAR2 files are whole
 // and repair the first volume; the job must complete.
 #[tokio::test]
 async fn an_old_style_set_whose_recovery_articles_carry_another_posts_headers_is_repaired() {

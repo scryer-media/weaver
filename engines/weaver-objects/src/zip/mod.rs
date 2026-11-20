@@ -555,6 +555,14 @@ impl Object for Zip {
         Kind::Zip
     }
 
+    // An entry whose stored bytes stream into its member, not enciphered.
+    fn verbatim(&self, member: MemberId) -> bool {
+        self.map
+            .as_ref()
+            .and_then(|map| map.entry(member))
+            .is_some_and(|entry| entry.streams && entry.cipher.is_none())
+    }
+
     fn deliver(
         &mut self,
         delivery: Delivery<'_>,

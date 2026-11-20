@@ -375,7 +375,13 @@ impl Pipeline {
             disk_rings_seen: 0,
             disk_idle: std::collections::BTreeSet::new(),
             admission_disk_held: false,
-            disk_unadmitted: std::collections::BTreeSet::new(),
+            admission_disk_need_min: u64::MAX,
+            admission_disk_unread: false,
+            admission_disk_releases: 0,
+            admission_disk_most: None,
+            admission_disk_waits_complete: false,
+            disk_unadmitted: std::collections::BTreeMap::new(),
+            start_promises: HashMap::new(),
             full_disk: std::collections::BTreeMap::new(),
             full_disk_moves: Vec::new(),
             archive_wait: None,
@@ -862,6 +868,7 @@ impl Pipeline {
                 self.jobs_finalizing_download.insert(job_id);
             } else {
                 self.jobs_finalizing_download.remove(&job_id);
+                self.release_finished_posted(job_id);
             }
             self.emit_job_event(PipelineEvent::DownloadFinished {
                 job_id,
@@ -875,7 +882,18 @@ impl Pipeline {
             return;
         }
         if self.jobs_finalizing_download.remove(&job_id) {
+            self.release_finished_posted(job_id);
             self.emit_job_event(PipelineEvent::DownloadPipelineDrained { job_id });
+        }
+    }
+
+    // A download that finished, with every article it fetched written, has
+    // landed all it will of what its start promised: the rest, the bytes a
+    // post declared and never sent, goes back. A fetch after it, such as
+    // recovery a repair asks for, books its bytes as they land.
+    fn release_finished_posted(&mut self, job_id: JobId) {
+        if let Some(graph) = self.graph_jobs.get_mut(&job_id) {
+            graph.release_posted();
         }
     }
 

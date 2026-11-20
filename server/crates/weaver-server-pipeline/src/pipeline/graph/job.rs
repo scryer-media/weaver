@@ -383,6 +383,24 @@ impl GraphJob {
         kept
     }
 
+    // The bytes promised on the disks when the job started, `working` on
+    // the working disk and `output` on the complete one: its downloaded
+    // bytes land against them.
+    pub(crate) fn take_posted(&mut self, working: u64, output: u64) {
+        self.writer.take_posted(working, output);
+    }
+
+    // What the start promised and did not land goes back.
+    pub(crate) fn release_posted(&mut self) {
+        self.writer.release_posted();
+    }
+
+    // What the start promised and has not landed, working and output.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn posted(&self) -> [u64; 2] {
+        self.writer.posted()
+    }
+
     // What the job did since this was last asked.
     pub fn take_notes(&mut self) -> Vec<Note> {
         let mut notes = std::mem::take(&mut self.notes);
@@ -1358,8 +1376,8 @@ impl GraphJob {
 
     // An article of a posted file named the file in its header (`=ybegin
     // ... name=`, or a uuencode `begin` line), and is about to be taken in.
-    // The file takes that name, as SABnzbd's `verify_nzf_filename`
-    // (nzb/object.py) decides it, only while none of its bytes are in: the
+    // The file takes that name, as `weaver_nzb::header_name` decides it,
+    // only while none of its bytes are in: the
     // first article taken in decides, and its write is under the name it
     // decided. A recovery set that already describes the file named it,
     // and its name stands; one that recognises the file by its content

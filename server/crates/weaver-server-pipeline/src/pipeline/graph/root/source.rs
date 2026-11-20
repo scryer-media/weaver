@@ -784,10 +784,7 @@ impl ArticleMap {
     // above its decoded bytes as encoding only adds. A length outside books
     // a file the post cannot fill, or one its parts run past: either way it
     // is a lie, every part is written where its own header puts it, and the
-    // file reaches as far as its bytes land (nzbfast
-    // `crates/nzbfast-engine/src/get/workers.rs:777-867`,
-    // `crates/nzbfast-unpack/src/repair/sidefetch.rs:376-382`; sabctools
-    // `src/yenc.cc:339-377`; NZBGet `daemon/nntp/ArticleWriter.cpp:557-558`).
+    // file reaches as far as its bytes land.
     pub(crate) fn reachable(&self, volume: VolumeIndex, part: u64, length: u64) -> bool {
         let Some(found) = self.volumes.get(volume.0 as usize) else {
             return false;

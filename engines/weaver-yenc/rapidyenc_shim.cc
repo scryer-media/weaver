@@ -34,7 +34,7 @@ extern "C" int weaver_rapidyenc_decode_end(
 }
 
 // The same decoder carrying its state across calls, the way an incremental
-// caller (sabctools) feeds a body in chunks. `state` is a YencDecoderState.
+// caller feeds a body in chunks. `state` is a YencDecoderState.
 extern "C" int weaver_rapidyenc_decode_end_state(
     const void* src,
     void* dest,

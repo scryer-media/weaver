@@ -1192,6 +1192,8 @@ pub(crate) fn job_info_from_history_row(row: &JobHistoryRow) -> JobInfo {
         error,
         download_wait_reason: None,
         download_retry_at_epoch_ms: None,
+        disk_need_bytes: None,
+        disk_free_bytes: None,
         created_at_epoch_ms: row.created_at as f64 * 1000.0,
         server_attribution:
             weaver_server_core::jobs::server_attribution::contributions_from_storage(

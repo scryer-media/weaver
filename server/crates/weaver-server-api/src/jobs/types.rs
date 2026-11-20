@@ -249,6 +249,9 @@ pub enum QueueWaitReason {
     PostProcessingCapacity,
     // The job waits for room on a disk, in whatever phase it is in.
     DiskSpace,
+    // The job has more to fetch than its disk holds above the reserve even
+    // empty: it never starts there, and never fails for it.
+    DiskTooSmall,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
@@ -362,6 +365,15 @@ pub struct QueueItem {
     pub wait_reason: Option<QueueWaitReason>,
     pub download_wait_reason: Option<String>,
     pub download_retry_at_epoch_ms: Option<f64>,
+    /// While the job waits to start for its disk (`DISK_SPACE` or
+    /// `DISK_TOO_SMALL`): the bytes it still has to fetch.
+    #[serde(default)]
+    pub disk_need_bytes: Option<u64>,
+    /// With `DISK_SPACE`, the room its disk leaves for them, null without
+    /// a fresh reading; with `DISK_TOO_SMALL`, the most the disk ever holds
+    /// above its reserve.
+    #[serde(default)]
+    pub disk_free_bytes: Option<u64>,
     pub error: Option<String>,
     pub progress_percent: f64,
     pub total_bytes: u64,
@@ -1677,6 +1689,8 @@ fn queue_item_from_display(
         wait_reason: wait_reason_for(info),
         download_wait_reason: info.download_wait_reason.clone(),
         download_retry_at_epoch_ms: info.download_retry_at_epoch_ms,
+        disk_need_bytes: info.disk_need_bytes,
+        disk_free_bytes: info.disk_free_bytes,
         error: info.error.clone(),
         progress_percent: normalize_progress_percent(info.progress),
         total_bytes: info.total_bytes,
@@ -1739,6 +1753,8 @@ pub fn queue_item_from_submission(
         wait_reason: None,
         download_wait_reason: None,
         download_retry_at_epoch_ms: None,
+        disk_need_bytes: None,
+        disk_free_bytes: None,
         error: None,
         progress_percent: 0.0,
         total_bytes: submitted.summary.total_bytes,
@@ -2079,6 +2095,11 @@ fn wait_reason_for(info: &weaver_server_core::JobInfo) -> Option<QueueWaitReason
         == Some(weaver_server_core::jobs::handle::DISK_SPACE_WAIT_REASON)
     {
         return Some(QueueWaitReason::DiskSpace);
+    }
+    if info.download_wait_reason.as_deref()
+        == Some(weaver_server_core::jobs::handle::DISK_TOO_SMALL_WAIT_REASON)
+    {
+        return Some(QueueWaitReason::DiskTooSmall);
     }
     match info.post_state {
         weaver_server_core::PostState::QueuedRepair => Some(QueueWaitReason::RepairCapacity),

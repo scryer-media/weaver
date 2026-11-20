@@ -988,7 +988,7 @@ impl PostProcessingSettings {
 
     // Return the matching configured extension-token pattern for `filename`.
     // Paths and leading-dot files without a basename are not treated as having
-    // an extension, matching SABnzbd's extension semantics.
+    // an extension.
     pub fn unacceptable_extension_match<'a>(&'a self, filename: &str) -> Option<&'a str> {
         let basename = filename.rsplit(['/', '\\']).next()?;
         let (stem, extension) = basename.rsplit_once('.')?;

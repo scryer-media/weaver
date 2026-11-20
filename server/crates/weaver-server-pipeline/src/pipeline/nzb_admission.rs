@@ -5,9 +5,69 @@ use super::*;
 use crate::jobs::persistence::JobsPersistenceInternalQueries;
 use crate::pipeline::download::LoginRefusalView;
 use crate::pipeline::queue::Change;
-use weaver_server_disk::operations::room_wait::ever_downloaded;
+use weaver_server_disk::operations::room_wait::StartBooking;
 
 pub(crate) const NZB_SLOT_WAIT_REASON: &str = "nzb_slot";
+
+// What a job holding a slot was promised on the disk when it started: the
+// bytes it still had to fetch, on the working root's count, and, when the
+// complete directory lies on another disk, its size on the complete root's
+// count; still with the walk until its graph takes them, or handed to its
+// graph, which settles them as its bytes land and gives back the rest when
+// it stops. A start is promised on those two counts whatever root it was
+// judged on: they are the ones its bytes land against, on its working and
+// output devices, and the ones every give-back goes to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StartPromise {
+    Pending { working: u64, output: u64 },
+    Handed,
+}
+
+// Why the last walk did not start a job the slots let start: its bytes do
+// not fit in the `room` the disk leaves now, `None` without a fresh
+// reading; or they never fit, the disk holding at `most` that much above
+// its reserve.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DiskUnadmitted {
+    Short { need: u64, room: Option<u64> },
+    TooSmall { need: u64, most: u64 },
+}
+
+// The most the disks could ever promise a start: `working` above the
+// reserve on the working disk, `output` on the complete disk when it is
+// another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StartMost {
+    working: u64,
+    output: Option<u64>,
+}
+
+impl StartMost {
+    // Why a job with `need` still to fetch and `size` to deliver can never
+    // start on these disks, if it cannot.
+    fn refuses(self, need: u64, size: u64) -> Option<DiskUnadmitted> {
+        if need > self.working {
+            return Some(DiskUnadmitted::TooSmall {
+                need,
+                most: self.working,
+            });
+        }
+        let output = self.output?;
+        let size = size.max(need);
+        (size > output).then_some(DiskUnadmitted::TooSmall {
+            need: size,
+            most: output,
+        })
+    }
+
+    // Whether these disks hold more than `before` did: a job turned away
+    // for its size may fit now.
+    fn grew_from(self, before: Option<Self>) -> bool {
+        before.is_some_and(|before| {
+            self.working > before.working || self.output.unwrap_or(0) > before.output.unwrap_or(0)
+        })
+    }
+}
 
 // How many candidates a walk looked at for a slot, or showed waiting for the
 // disk, on this thread, so a test can pin that a walk visits no more of a
@@ -29,8 +89,10 @@ struct AdmissionRow {
     cancelled_or_retiring: bool,
     // The row carries a fresh intake the actor has not installed yet.
     intake: bool,
-    // The job downloaded before: it held a slot, and let it go on a pause.
-    started: bool,
+    // The bytes the job still has to fetch, as its post declares them.
+    need: u64,
+    // What the job delivers: what its download is out to bring.
+    size: u64,
 }
 
 // What a walk over every queue row answers to besides the actor's own state:
@@ -92,17 +154,14 @@ impl Pipeline {
         position: usize,
         row: &crate::pipeline::queue::JobRow,
     ) -> AdmissionRow {
-        // The job's state is looked up where whether it is pending asks for
-        // it, and nowhere else: whether it started reads the same lookup.
-        let mut installed = None;
-        let pending = row.admission.is_some()
+        // A restore whose outline is unread says nothing yet of what it
+        // has to fetch, so it is not judged for a start until it does.
+        let pending = (row.admission.is_some()
             || row.intents.restore.is_some()
             || row.intents.paused == Some(false)
-            || {
-                installed = self.jobs.get(&row.id);
-                installed.is_some()
-            }
-            || self.window_parked(row.id);
+            || self.jobs.contains_key(&row.id)
+            || self.window_parked(row.id))
+            && !row.outline_pending();
         AdmissionRow {
             id: row.id,
             key: crate::pipeline::queue::order::DispatchKey::of_row(row, position, globals),
@@ -110,40 +169,240 @@ impl Pipeline {
             pending,
             cancelled_or_retiring: row.intents.cancelled.is_some() || row.report.retiring,
             intake: row.admission.is_some(),
-            started: ever_downloaded(row.report.job.downloaded_bytes)
-                || installed.is_some_and(|state| ever_downloaded(state.downloaded_bytes)),
+            need: row.report.job.remaining_bytes,
+            size: Self::start_size(row),
         }
     }
 
-    // The start check on the working disk, for a job that never downloaded:
-    // the owner every kind of job starts by.
-    fn working_disk_check(&self) -> weaver_server_disk::operations::room_wait::StartCheck {
+    // The start check on the working disk: the owner every usenet job
+    // starts by, a fresh one, a resumed one and one a full disk held alike.
+    pub(in crate::pipeline) fn working_disk_check(
+        &self,
+    ) -> weaver_server_disk::operations::room_wait::StartCheck {
         weaver_server_disk::operations::room_wait::StartCheck {
             root: crate::operations::StorageRoot::Intermediate,
             reserve: self.extraction_limits.min_free_bytes,
         }
     }
 
-    // Whether a job that never downloaded is kept from starting for the
-    // working disk; a good reading with no room over the reserve begins the
-    // hold.
-    fn admission_disk_short(&mut self) -> bool {
+    // Whether the complete directory lies on another disk than the working
+    // one: a job's bytes may land on either, so a start is promised on both.
+    pub(in crate::pipeline) fn complete_on_other_disk(&self) -> bool {
+        use crate::operations::StorageRoot;
+        !self
+            .storage_capacity
+            .ledger(StorageRoot::Intermediate)
+            .same_disk(self.storage_capacity.ledger(StorageRoot::Complete))
+    }
+
+    // What a start promises on the complete disk when that is another
+    // disk: the job's size, all it delivers there, never less than what it
+    // still has to fetch.
+    pub(in crate::pipeline) fn start_size(row: &crate::pipeline::queue::JobRow) -> u64 {
+        row.report
+            .job
+            .wanted_bytes
+            .max(row.report.job.remaining_bytes)
+    }
+
+    // `need` bytes still to fetch are promised for a job that would start,
+    // on the working disk, and its `size` on the complete disk when that is
+    // another, when they fit there by a fresh reading.
+    pub(in crate::pipeline) fn book_start_promise(
+        &self,
+        need: u64,
+        size: u64,
+    ) -> Result<StartPromise, StartBooking> {
+        self.book_start_promise_on(crate::operations::StorageRoot::Intermediate, need, size)
+    }
+
+    // The same, judged on `read` when both folders share one disk: a job
+    // held on the disk its write failed on is judged on that root's reading.
+    // It is promised on the working root's count all the same.
+    pub(in crate::pipeline) fn book_start_promise_on(
+        &self,
+        read: crate::operations::StorageRoot,
+        need: u64,
+        size: u64,
+    ) -> Result<StartPromise, StartBooking> {
+        use crate::operations::StorageRoot;
         let check = self.working_disk_check();
-        check.hold(&self.storage_capacity, &mut self.admission_disk_held)
+        let other = self.complete_on_other_disk();
+        let output = if other { size.max(need) } else { 0 };
+        let answer = if other {
+            check.admit_on(
+                &self.storage_capacity,
+                &[
+                    (StorageRoot::Intermediate, StorageRoot::Intermediate, need),
+                    (StorageRoot::Complete, StorageRoot::Complete, output),
+                ],
+            )
+        } else {
+            check.admit_on(
+                &self.storage_capacity,
+                &[(read, StorageRoot::Intermediate, need)],
+            )
+        };
+        match answer {
+            StartBooking::Booked => Ok(StartPromise::Pending {
+                working: need,
+                output,
+            }),
+            refused => Err(refused),
+        }
     }
 
-    // Whether the working disk's cached reading is a good one with no room
-    // over the reserve. It reads the cache and begins nothing.
-    fn working_disk_short(&self) -> bool {
-        self.working_disk_check().short(&self.storage_capacity)
+    // A job that held its slot across a restart is promised what it still
+    // has to fetch, unjudged: it started before, and keeps its place.
+    fn promise_held_start(&mut self, id: JobId, need: u64, size: u64) {
+        self.promise_start_unjudged(id, need, size);
+        self.hand_start_promise(id);
     }
 
-    // A reading came while jobs are kept from starting for the working
-    // disk: a good one with room over the reserve, or none at all, lets
-    // them start, and the next walk starts them.
+    // `need` is promised to the job's start on the working disk, and its
+    // `size` on the complete disk when that is another, with nothing
+    // judged: its room was judged otherwise. What it was promised before is
+    // given back first. Its graph takes it once it is in place.
+    pub(in crate::pipeline) fn promise_start_unjudged(&mut self, id: JobId, need: u64, size: u64) {
+        use crate::operations::StorageRoot;
+        self.release_start_promise(id);
+        let output = if self.complete_on_other_disk() {
+            size.max(need)
+        } else {
+            0
+        };
+        self.storage_capacity
+            .ledger(StorageRoot::Intermediate)
+            .promise(need);
+        self.storage_capacity
+            .ledger(StorageRoot::Complete)
+            .promise(output);
+        self.start_promises.insert(
+            id,
+            StartPromise::Pending {
+                working: need,
+                output,
+            },
+        );
+    }
+
+    // The job's graph takes the bytes promised at its start, once it is in
+    // place: from here they settle as its bytes land.
+    pub(in crate::pipeline) fn hand_start_promise(&mut self, id: JobId) {
+        let Some(StartPromise::Pending { working, output }) = self.start_promises.get(&id).copied()
+        else {
+            return;
+        };
+        let Some(graph) = self.graph_jobs.get_mut(&id) else {
+            return;
+        };
+        graph.take_posted(working, output);
+        self.start_promises.insert(id, StartPromise::Handed);
+    }
+
+    // The job lets its slot go, or never took it: what its start was
+    // promised and has not landed is given back, which rings the disk.
+    pub(in crate::pipeline) fn release_start_promise(&mut self, id: JobId) {
+        match self.start_promises.remove(&id) {
+            Some(StartPromise::Pending { working, output }) => {
+                self.give_back_start(working, output);
+            }
+            Some(StartPromise::Handed) => {
+                if let Some(graph) = self.graph_jobs.get_mut(&id) {
+                    graph.release_posted();
+                }
+            }
+            None => {}
+        }
+    }
+
+    // The disks the hold waits on begin or stop being waited on, so their
+    // readings, and the promises given back, ring.
+    fn admission_disk_wait(&mut self, held: bool) {
+        use crate::operations::StorageRoot;
+        if held == self.admission_disk_held {
+            return;
+        }
+        self.admission_disk_held = held;
+        if held {
+            self.admission_disk_waits_complete = self.complete_on_other_disk();
+            self.storage_capacity
+                .ledger(StorageRoot::Intermediate)
+                .wait();
+            if self.admission_disk_waits_complete {
+                self.storage_capacity.ledger(StorageRoot::Complete).wait();
+            }
+        } else {
+            self.storage_capacity
+                .ledger(StorageRoot::Intermediate)
+                .unwait();
+            if self.admission_disk_waits_complete {
+                self.storage_capacity.ledger(StorageRoot::Complete).unwait();
+            }
+            self.admission_disk_waits_complete = false;
+        }
+    }
+
+    // How many times a promise was given back on the disks a start is
+    // judged by. A promise that lands moves nothing here: it frees no room.
+    fn admission_disk_releases_now(&self) -> u64 {
+        use crate::operations::StorageRoot;
+        let working = self
+            .storage_capacity
+            .ledger(StorageRoot::Intermediate)
+            .releases();
+        if self.admission_disk_waits_complete {
+            working.saturating_add(
+                self.storage_capacity
+                    .ledger(StorageRoot::Complete)
+                    .releases(),
+            )
+        } else {
+            working
+        }
+    }
+
+    // A disk rang while jobs are kept from starting for it: a walk is
+    // brought only when one could start now, that is when a fresh reading
+    // leaves room for the least any of them needs, when the first fresh
+    // reading came to a hold begun without one, when a promise was given
+    // back, or when the disks grew, for a job turned away for its size.
+    // Bytes that land as promised bring none: they free no room. Each is
+    // one look at a cached reading or a count.
     pub(in crate::pipeline) fn release_admission_disk_hold(&mut self) {
+        use crate::operations::StorageRoot;
+        if !self.admission_disk_held {
+            return;
+        }
+        let capacity = &self.storage_capacity;
         let check = self.working_disk_check();
-        if check.release(&self.storage_capacity, &mut self.admission_disk_held) {
+        let complete = weaver_server_disk::operations::room_wait::StartCheck {
+            root: StorageRoot::Complete,
+            ..check
+        };
+        let fresh = capacity.fresh(StorageRoot::Intermediate)
+            && (!self.admission_disk_waits_complete || capacity.fresh(StorageRoot::Complete));
+        let room = check.room_now(capacity).map(|working| {
+            if self.admission_disk_waits_complete {
+                complete
+                    .room_now(capacity)
+                    .map_or(0, |output| working.min(output))
+            } else {
+                working
+            }
+        });
+        let releases = self.admission_disk_releases_now();
+        let given_back = releases != self.admission_disk_releases;
+        self.admission_disk_releases = releases;
+        let grew = self
+            .start_most()
+            .is_some_and(|most| most.grew_from(self.admission_disk_most));
+        let ring = (self.admission_disk_unread && fresh)
+            || given_back
+            || grew
+            || room.is_some_and(|room| room >= self.admission_disk_need_min);
+        if ring {
+            self.admission_disk_wait(false);
             self.queue_walk_due = true;
         }
     }
@@ -179,21 +438,49 @@ impl Pipeline {
                 }
             });
         }
-        // The rows of the jobs holding a slot, as (paused, intake), or None
-        // where the row is gone.
-        let held: Vec<(JobId, Option<(bool, bool)>)> = self.shared_state.queue.read(|inner| {
+        // The rows of the jobs holding a slot, as (paused, intake, the bytes
+        // still to fetch and the job's size, or None while the row waits for
+        // its outline and says neither), or None where the row is gone.
+        type HeldRow = Option<(bool, bool, Option<(u64, u64)>)>;
+        let held: Vec<(JobId, HeldRow)> = self.shared_state.queue.read(|inner| {
             self.nzb_admitted
                 .iter()
                 .map(|id| {
                     (
                         *id,
-                        inner
-                            .job(*id)
-                            .map(|row| (self.admission_paused(row), row.admission.is_some())),
+                        inner.job(*id).map(|row| {
+                            (
+                                self.admission_paused(row),
+                                row.admission.is_some(),
+                                (!row.outline_pending()).then(|| {
+                                    (row.report.job.remaining_bytes, Self::start_size(row))
+                                }),
+                            )
+                        }),
                     )
                 })
                 .collect()
         });
+        // A slot held across a restart is promised what its job still has
+        // to fetch, unjudged, once its row is read: no other start takes
+        // that room first. One paused, or held for a full disk, is promised
+        // when it is let go on again. Until every held slot's row is read,
+        // its outline among it, and every restore is in, no other job starts.
+        let mut unread_holders = self.restores_waiting;
+        for (id, row) in &held {
+            match row {
+                Some((paused, _, None)) => unread_holders |= !*paused,
+                Some((paused, _, Some((need, size)))) => {
+                    if !*paused
+                        && !self.start_promises.contains_key(id)
+                        && !self.full_disk.contains_key(id)
+                    {
+                        self.promise_held_start(*id, *need, *size);
+                    }
+                }
+                None => unread_holders |= !self.nzb_seen.contains(id),
+            }
+        }
         let releases: Vec<_> = held
             .iter()
             .filter(|(id, row)| {
@@ -201,9 +488,10 @@ impl Pipeline {
                 // History retry/reprocess can reuse an ID before this actor
                 // observes the old row's removal. The new run must compete
                 // for a slot and commit its own ownership flag.
-                let replaced = !self.jobs.contains_key(id) && row.is_some_and(|(_, intake)| intake);
-                let paused =
-                    self.nzb_pause_releases.contains(id) && row.is_some_and(|(paused, _)| paused);
+                let replaced =
+                    !self.jobs.contains_key(id) && row.is_some_and(|(_, intake, _)| intake);
+                let paused = self.nzb_pause_releases.contains(id)
+                    && row.is_some_and(|(paused, _, _)| paused);
                 (gone || replaced || paused)
                     && !self.nzb_releasing.contains(id)
                     && !self.nzb_work_in_flight(*id)
@@ -211,7 +499,7 @@ impl Pipeline {
             .map(|(id, row)| {
                 (
                     *id,
-                    !self.jobs.contains_key(id) && row.is_some_and(|(_, intake)| intake),
+                    !self.jobs.contains_key(id) && row.is_some_and(|(_, intake, _)| intake),
                 )
             })
             .collect();
@@ -271,12 +559,7 @@ impl Pipeline {
         if shutting_down {
             return true;
         }
-        // While the working disk may be short, the candidates that
-        // downloaded before are kept apart as they are found, in the one
-        // pass: only they start then. With room nothing is kept apart.
-        let may_be_short = self.admission_disk_held || self.working_disk_short();
         let mut candidates = Vec::new();
-        let mut started = Vec::new();
         for row in rows.iter().filter(|row| {
             row.pending
                 && !row.paused
@@ -284,22 +567,16 @@ impl Pipeline {
                 && !self.nzb_admitted.contains(&row.id)
                 && !self.nzb_admitting.contains(&row.id)
         }) {
-            candidates.push(row.key);
-            if may_be_short && row.started {
-                started.push(row.key);
-            }
+            candidates.push((row.key, row.need, row.size));
         }
         drop(rows);
         if !self.disk_unadmitted.is_empty() {
             self.disk_unadmitted.clear();
         }
-        candidates.sort_unstable();
-        if may_be_short {
-            started.sort_unstable();
-        }
+        candidates.sort_unstable_by_key(|(key, ..)| *key);
         let propagating: HashSet<_> = candidates
             .iter()
-            .filter_map(|key| {
+            .filter_map(|(key, ..)| {
                 self.propagation_hold_until(key.job_id())
                     .map(|_| key.job_id())
             })
@@ -317,53 +594,104 @@ impl Pipeline {
         for id in expired {
             self.propagation_hold_until(id);
         }
-        // The disk is judged once per walk, and only when a job that never
-        // downloaded would start. While it is short such a job is passed
-        // over: only as many as there are free slots are shown waiting for
-        // the disk, the next ones to start, and the rest wait for a slot as
-        // they would behind them. Once those are shown, the walk goes on
-        // over the candidates that started before, and no other. A hold
-        // that begins or ends restates no more rows than there are slots.
-        let mut short = None::<bool>;
+        // Each candidate, in dispatch order, starts when a slot is free and
+        // the bytes it still has to fetch fit on its disk by a fresh
+        // reading, less everything promised there: they are promised as it
+        // takes the slot. One that does not fit is passed over, and the walk
+        // goes on to the next, which may fit. Once one did not fit, a later
+        // one that needs as much or more is passed over without asking the
+        // disk again. As many as there are free slots are shown waiting for
+        // the disk, the next ones to start; the rest wait for a slot as they
+        // would behind them. A start judged without a fresh reading waits
+        // for one, as does every later one.
         let mut slots = None::<usize>;
         let mut shown = 0usize;
-        let mut shown_to = None;
-        for key in &candidates {
-            let id = key.job_id();
-            // A job that never downloaded does not start while the working
-            // disk has no room over its reserve: it waits, saying so, and a
-            // reading with room starts it. One that started, then paused and
-            // resumed, starts again whatever the disk holds: what it fetches
-            // is never held for the reserve.
-            if may_be_short
-                && started.binary_search(key).is_err()
-                && *short.get_or_insert_with(|| self.admission_disk_short())
-            {
-                #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-                ADMISSION_VISITS.with(|visits| visits.set(visits.get() + 1));
-                let slots = *slots.get_or_insert_with(|| self.admission_slots());
-                if !propagating.contains(&id)
-                    && self.nzb_admitted.len() + self.nzb_admitting.len() + shown < slots
-                {
-                    self.disk_unadmitted.insert(id);
-                    shown += 1;
-                }
-                if self.nzb_admitted.len() + self.nzb_admitting.len() + shown >= slots {
-                    shown_to = Some(*key);
+        // The least room a refusal showed in this walk, and whether a
+        // refusal found no fresh reading.
+        let mut short_room = None::<u64>;
+        let mut unread = false;
+        let mut need_min = u64::MAX;
+        let mut kept = false;
+        // The most the disks could ever promise a start, read once: a job
+        // larger is turned away by it, and the ledgers are not asked.
+        let most = self.start_most();
+        for (key, need, size) in &candidates {
+            let (id, need, size) = (key.job_id(), *need, *size);
+            if propagating.contains(&id) {
+                if !self.slot_allowed() {
                     break;
                 }
                 continue;
             }
-            if !self.admit_candidate(id, &propagating) {
+            if unread_holders {
+                break;
+            }
+            let refused = if unread {
+                Some(DiskUnadmitted::Short { need, room: None })
+            } else if let Some(room) = short_room.filter(|room| need > *room) {
+                Some(DiskUnadmitted::Short {
+                    need,
+                    room: Some(room),
+                })
+            } else {
+                if !self.slot_allowed() {
+                    break;
+                }
+                if let Some(too_small) = most.and_then(|most| most.refuses(need, size)) {
+                    Some(too_small)
+                } else {
+                    match self.book_start_promise(need, size) {
+                        Ok(promise) => {
+                            if self.queue_slot_write(id, true) {
+                                self.start_promises.insert(id, promise);
+                            } else if let StartPromise::Pending { working, output } = promise {
+                                self.give_back_start(working, output);
+                            }
+                            None
+                        }
+                        Err(StartBooking::Short { room }) => {
+                            short_room = Some(short_room.map_or(room, |least| least.min(room)));
+                            Some(DiskUnadmitted::Short {
+                                need,
+                                room: Some(room),
+                            })
+                        }
+                        Err(StartBooking::TooLarge { most }) => {
+                            Some(DiskUnadmitted::TooSmall { need, most })
+                        }
+                        Err(StartBooking::Unread | StartBooking::Booked) => {
+                            unread = true;
+                            Some(DiskUnadmitted::Short { need, room: None })
+                        }
+                    }
+                }
+            };
+            let Some(refused) = refused else {
+                continue;
+            };
+            kept = true;
+            if let DiskUnadmitted::Short { need, .. } = refused {
+                need_min = need_min.min(need);
+            }
+            let slots = *slots.get_or_insert_with(|| self.admission_slots());
+            let taken = self.nzb_admitted.len() + self.nzb_admitting.len();
+            if taken + shown < slots {
+                self.disk_unadmitted.insert(id, refused);
+                shown += 1;
+            } else if unread {
+                // Nothing more starts without a reading, and every slot
+                // left has its job shown waiting for one.
                 break;
             }
         }
-        if let Some(last) = shown_to {
-            for key in started.iter().filter(|key| **key > last) {
-                if !self.admit_candidate(key.job_id(), &propagating) {
-                    break;
-                }
-            }
+        // The hold begins, or goes on, while a job was kept for the disk,
+        // and ends once none was.
+        self.admission_disk_wait(kept);
+        if kept {
+            self.admission_disk_need_min = need_min;
+            self.admission_disk_unread = unread;
+            self.admission_disk_releases = self.admission_disk_releases_now();
+            self.admission_disk_most = most;
         }
         let login_refusals = self.login_refusal_view();
         self.shared_state.queue.write(|inner| {
@@ -388,6 +716,25 @@ impl Pipeline {
         true
     }
 
+    // The most a start could ever be promised on the working disk, and on
+    // the complete disk when that is another, by fresh, good readings:
+    // `None` while either has none, and the ledgers judge.
+    fn start_most(&self) -> Option<StartMost> {
+        let check = self.working_disk_check();
+        let working = check.most(&self.storage_capacity)?;
+        let output = match self.complete_on_other_disk() {
+            true => Some(
+                weaver_server_disk::operations::room_wait::StartCheck {
+                    root: crate::operations::StorageRoot::Complete,
+                    ..check
+                }
+                .most(&self.storage_capacity)?,
+            ),
+            false => None,
+        };
+        Some(StartMost { working, output })
+    }
+
     // How many jobs may hold a slot now: none while downloads are held.
     fn admission_slots(&self) -> usize {
         self.shared_state.queue.read(|inner| {
@@ -402,15 +749,15 @@ impl Pipeline {
         })
     }
 
-    // The candidate takes a slot if one is free. False once none is, which
-    // ends the walk's admissions.
-    fn admit_candidate(&mut self, id: JobId, propagating: &HashSet<JobId>) -> bool {
+    // Whether a slot is free for the next candidate. False once none is,
+    // which ends the walk's admissions.
+    fn slot_allowed(&self) -> bool {
         #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         ADMISSION_VISITS.with(|visits| visits.set(visits.get() + 1));
         // A settings edit or global hold can arrive while the previous
         // acquisition awaits its durable commit. Re-read before admitting
         // the next job rather than using the pass's earlier snapshot.
-        let allowed = self.shared_state.queue.read(|inner| {
+        self.shared_state.queue.read(|inner| {
             let globals = &inner.globals;
             self.nzb_admitted.len() + self.nzb_admitting.len()
                 < globals
@@ -418,17 +765,22 @@ impl Pipeline {
                     .unwrap_or(crate::settings::model::DEFAULT_MAX_CONCURRENT_NZBS)
                     .get() as usize
                 && !globals.holds_downloads()
-        });
-        if !allowed {
-            return false;
-        }
-        if !propagating.contains(&id) {
-            self.queue_slot_write(id, true);
-        }
-        true
+        })
+    }
+
+    // Bytes promised for a start that did not take its slot go back.
+    fn give_back_start(&self, working: u64, output: u64) {
+        use crate::operations::StorageRoot;
+        self.storage_capacity
+            .ledger(StorageRoot::Intermediate)
+            .release(working);
+        self.storage_capacity
+            .ledger(StorageRoot::Complete)
+            .release(output);
     }
 
     fn forget_retired(&mut self, id: JobId) {
+        self.release_start_promise(id);
         self.nzb_retired_busy.remove(&id);
         self.nzb_seen.remove(&id);
         self.nzb_pause_releases.remove(&id);
@@ -472,8 +824,18 @@ impl Pipeline {
     ) -> Option<std::borrow::Cow<'static, str>> {
         use std::borrow::Cow;
         if self.waits_for_nzb_slot(row) {
-            if !self.disk_unadmitted.is_empty() && self.disk_unadmitted.contains(&row.id) {
-                return Some(Cow::Borrowed(crate::jobs::handle::DISK_SPACE_WAIT_REASON));
+            if !self.disk_unadmitted.is_empty() {
+                match self.disk_unadmitted.get(&row.id) {
+                    Some(DiskUnadmitted::Short { .. }) => {
+                        return Some(Cow::Borrowed(crate::jobs::handle::DISK_SPACE_WAIT_REASON));
+                    }
+                    Some(DiskUnadmitted::TooSmall { .. }) => {
+                        return Some(Cow::Borrowed(
+                            crate::jobs::handle::DISK_TOO_SMALL_WAIT_REASON,
+                        ));
+                    }
+                    None => {}
+                }
             }
             return (!self.propagation_ready_at.contains_key(&row.id))
                 .then_some(Cow::Borrowed(NZB_SLOT_WAIT_REASON));
@@ -509,8 +871,8 @@ impl Pipeline {
     // A slot is taken or let go durably before the actor acts on it: the
     // write goes on the job's lane, behind every write the job queued
     // before, and the slot counts as held while it is out. Its answer comes
-    // back as a [`DbReply::Slot`].
-    fn queue_slot_write(&mut self, id: JobId, admitted: bool) {
+    // back as a [`DbReply::Slot`]. Returns whether the write is out.
+    fn queue_slot_write(&mut self, id: JobId, admitted: bool) -> bool {
         let replies = self.db_reply_tx.clone();
         let queued = self
             .db
@@ -526,13 +888,16 @@ impl Pipeline {
         match queued {
             Ok(()) if admitted => {
                 self.nzb_admitting.insert(id);
+                true
             }
             Ok(()) => {
                 self.nzb_releasing.insert(id);
+                true
             }
             Err(error) => {
                 error!(job_id = id.0, admitted, %error, "failed to queue the NZB slot write");
                 self.queue_walk_due = true;
+                false
             }
         }
     }
@@ -550,11 +915,18 @@ impl Pipeline {
                 job_id = id.0,
                 admitted, "failed to write the NZB slot; the next walk tries again"
             );
+            // A start that did not take its slot gives back its promise;
+            // the next walk judges it again.
+            if admitted {
+                self.release_start_promise(id);
+            }
             self.queue_walk_due = true;
             return;
         }
         if admitted {
             self.nzb_admitted.insert(id);
+            // A job already in place takes the bytes promised at its start.
+            self.hand_start_promise(id);
             // A job restored without a slot queued its engine runs; release
             // them now that it holds one.
             self.resume_graph_work(id);
@@ -562,6 +934,7 @@ impl Pipeline {
         } else {
             self.nzb_admitted.remove(&id);
             self.nzb_pause_releases.remove(&id);
+            self.release_start_promise(id);
         }
         // A slot that moved is walked to: the holder is installed wherever
         // it stands, and a slot let go is free for the next candidate.
@@ -597,10 +970,25 @@ impl Pipeline {
             let slot_wait = reason.as_deref() == Some(NZB_SLOT_WAIT_REASON);
             row.report.job.download_wait_reason = reason.map(std::borrow::Cow::into_owned);
             if slot_wait
-                || (!self.disk_unadmitted.is_empty() && self.disk_unadmitted.contains(&row.id))
+                || (!self.disk_unadmitted.is_empty() && self.disk_unadmitted.contains_key(&row.id))
             {
                 row.report.job.download_state = crate::DownloadState::Queued;
             }
+            changed = true;
+        }
+        // A job kept for the disk says what it needs and what the disk
+        // leaves, or the most it ever holds; the figures go when the wait
+        // does. Only a figure that changed restates the row.
+        let (need, free) = match self.disk_unadmitted.get(&row.id) {
+            Some(DiskUnadmitted::Short { need, room }) => (Some(*need), *room),
+            Some(DiskUnadmitted::TooSmall { need, most }) => (Some(*need), Some(*most)),
+            None if !self.full_disk.is_empty() => self.full_disk_figures(row.id),
+            None => (None, None),
+        };
+        let job = &mut row.report.job;
+        if job.disk_need_bytes != need || job.disk_free_bytes != free {
+            job.disk_need_bytes = need;
+            job.disk_free_bytes = free;
             changed = true;
         }
         changed
