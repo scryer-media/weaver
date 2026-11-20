@@ -5,7 +5,7 @@ use weaver_graph::{Kind, MemberId};
 use weaver_model::files::FileRole;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RecoveryFormat {
+pub enum RecoveryFormat {
     Par2,
     Par3,
 }
@@ -52,7 +52,7 @@ impl RecoveryFormat {
         metadata.then_some(Self::Par3)
     }
 
-    pub(crate) fn declared_index(role: &FileRole) -> Option<Self> {
+    pub fn declared_index(role: &FileRole) -> Option<Self> {
         match role {
             FileRole::Par2 { is_index: true, .. } => Some(Self::Par2),
             FileRole::Par3 { is_index: true } => Some(Self::Par3),
@@ -69,7 +69,7 @@ impl RecoveryFormat {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MetadataState {
+pub enum MetadataState {
     Unresolved,
     Ready,
     Unavailable,
@@ -80,21 +80,16 @@ pub(crate) enum MetadataState {
 // volumes discovered without an index use the root's bounded head sampling
 // and normal seeks; they never become payload prerequisites here.
 #[derive(Default)]
-pub(crate) struct RecoveryMetadata {
+pub struct RecoveryMetadata {
     candidates: Vec<(MemberId, RecoveryFormat, MetadataState)>,
 }
 
 impl RecoveryMetadata {
-    pub(crate) fn observe(
-        &mut self,
-        member: MemberId,
-        format: RecoveryFormat,
-        state: MetadataState,
-    ) {
+    pub fn observe(&mut self, member: MemberId, format: RecoveryFormat, state: MetadataState) {
         self.candidates.push((member, format, state));
     }
 
-    pub(crate) fn bootstrap_files(&self) -> Option<Vec<MemberId>> {
+    pub fn bootstrap_files(&self) -> Option<Vec<MemberId>> {
         let mut unresolved: Vec<_> = self
             .candidates
             .iter()
@@ -104,43 +99,5 @@ impl RecoveryMetadata {
         unresolved.sort_unstable();
         unresolved.dedup();
         (!unresolved.is_empty()).then_some(unresolved)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn formats_settle_independently_and_missing_indexes_release_the_hold() {
-        for (ready, pending) in [
-            (RecoveryFormat::Par2, RecoveryFormat::Par3),
-            (RecoveryFormat::Par3, RecoveryFormat::Par2),
-        ] {
-            let mut metadata = RecoveryMetadata::default();
-            metadata.observe(MemberId(0), ready, MetadataState::Ready);
-            metadata.observe(MemberId(1), pending, MetadataState::Unresolved);
-            assert_eq!(metadata.bootstrap_files(), Some(vec![MemberId(1)]));
-            let mut settled = RecoveryMetadata::default();
-            settled.observe(MemberId(0), ready, MetadataState::Ready);
-            settled.observe(MemberId(1), pending, MetadataState::Unavailable);
-            assert_eq!(settled.bootstrap_files(), None);
-        }
-    }
-
-    #[test]
-    fn indexless_discovery_does_not_hold_payload_for_recovery_volumes() {
-        assert_eq!(
-            RecoveryFormat::declared_index(&FileRole::Par3 { is_index: false }),
-            None
-        );
-        assert_eq!(
-            RecoveryFormat::declared_index(&FileRole::Par2 {
-                is_index: false,
-                recovery_block_count: 8
-            }),
-            None
-        );
-        assert_eq!(RecoveryMetadata::default().bootstrap_files(), None);
     }
 }

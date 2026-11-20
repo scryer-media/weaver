@@ -79,7 +79,7 @@ impl Pipeline {
     // "override disables it" case can be exercised without mutating a
     // process-global environment other tests are reading concurrently.
     pub(in crate::pipeline) fn par2_ignore_extensions(&self) -> Vec<String> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         if let Some(extensions) = self.par2_ignore_extensions_override.as_ref() {
             return extensions.clone();
         }
@@ -93,7 +93,7 @@ impl Pipeline {
     // Queued articles and delayed retries deliberately do not count: they are
     // the scheduler's backlog, not current transfer activity, and a started
     // job with only backlog still lists as Downloading on its own state.
-    pub(crate) fn job_has_current_download_activity(&self, job_id: JobId) -> bool {
+    pub fn job_has_current_download_activity(&self, job_id: JobId) -> bool {
         #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         if self.job_has_queued_decode(job_id) {
             return true;
@@ -186,7 +186,7 @@ impl Pipeline {
     // the job's own delivery goes on, and the pause holds what comes after
     // it (the repair and extraction slots the graph asks for, and the final
     // move).
-    pub(crate) async fn check_job_completion(&mut self, job_id: JobId) {
+    pub async fn check_job_completion(&mut self, job_id: JobId) {
         weaver_server_base::runtime::panic_trap::in_job(job_id, self.weigh_job_completion(job_id))
             .await;
     }

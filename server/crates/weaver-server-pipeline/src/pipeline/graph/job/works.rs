@@ -23,7 +23,7 @@ use super::super::engine::{Heard, Said};
 use super::super::hardware::Hardware;
 use super::super::namespace::{RewalkLoan, Rewalked};
 
-pub(crate) struct Works {
+pub struct Works {
     scope: u64,
     mail: mpsc::Sender<Said>,
     // The number the last loan went out under.
@@ -53,7 +53,7 @@ pub(crate) struct Works {
 // A loan a test keeps in hand: its node, its number, the object, and the
 // word that stops its work.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) type HeldLoan = (NodeId, u64, Box<dyn Object>, Arc<AtomicBool>);
+pub type HeldLoan = (NodeId, u64, Box<dyn Object>, Arc<AtomicBool>);
 
 struct Rewalking {
     serial: u64,
@@ -117,7 +117,7 @@ impl Works {
         self.held.as_mut().map(std::mem::take).unwrap_or_default()
     }
 
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) fn lent(&self) -> u64 {
         self.lent
     }

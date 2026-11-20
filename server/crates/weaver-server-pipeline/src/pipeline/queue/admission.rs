@@ -26,7 +26,7 @@ impl AdmissionResources {
     }
 }
 
-pub(crate) struct PreparedAdd {
+pub struct PreparedAdd {
     // The job's files, with their article lists let go once its NZB is
     // stored: an add waiting to be installed holds nothing per article.
     pub spec: JobSpec,
@@ -39,7 +39,7 @@ pub(crate) struct PreparedAdd {
     pub restart: Option<RestartAdmission>,
 }
 
-pub(crate) struct RestartAdmission {
+pub struct RestartAdmission {
     pub reprocess: bool,
     pub working_dir: PathBuf,
     pub downloaded_bytes: u64,
@@ -331,7 +331,7 @@ pub fn destination_root(
         .unwrap_or_else(|_| complete_dir.to_path_buf())
 }
 
-pub(crate) use crate::jobs::working_dir::{staging_dir_for, staging_dir_on};
+pub use crate::jobs::working_dir::{staging_dir_for, staging_dir_on};
 
 // [`staging_dir_on`] with the devices read on the spot, as the choice was
 // made before the disk owner answered it: what a test compares the owner's

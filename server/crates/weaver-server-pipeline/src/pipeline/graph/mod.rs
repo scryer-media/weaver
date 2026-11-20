@@ -5,11 +5,11 @@
 // root, the tree and the namespace writer to its files.
 
 pub mod checkpoint;
-pub(crate) mod decoding;
+pub mod decoding;
 pub(crate) mod disk;
 pub mod engine;
-pub(crate) mod envelope;
-pub(crate) mod hardware;
+pub mod envelope;
+pub mod hardware;
 pub mod job;
 pub mod leaf;
 pub mod limits;
@@ -27,7 +27,29 @@ pub(crate) mod window;
 // the only ranker: its classes raise what it wants sooner, and nothing about
 // a file's name or role orders the queue, so the posted order breaks every
 // tie. It sits behind the window volumes the root raises.
-pub(crate) const NEUTRAL_PRIORITY: u32 = 10;
+pub const NEUTRAL_PRIORITY: u32 = 10;
 
-#[cfg(test)]
-mod tests;
+// What the unit tests compiled apart in tests/pipeline_graph.rs reach in
+// this module's private modules.
+#[cfg(feature = "pipeline-test-fixtures")]
+#[doc(hidden)]
+pub mod units {
+    pub mod decoding {
+        pub use super::super::decoding::*;
+    }
+    pub mod disk {
+        pub use super::super::disk::*;
+    }
+    pub mod envelope {
+        pub use super::super::envelope::*;
+    }
+    pub mod envelope_durable {
+        pub use super::super::envelope::durable::*;
+    }
+    pub mod metadata {
+        pub use super::super::metadata::*;
+    }
+    pub mod window {
+        pub use super::super::window::*;
+    }
+}

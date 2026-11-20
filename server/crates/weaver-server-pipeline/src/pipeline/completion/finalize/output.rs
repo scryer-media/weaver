@@ -23,8 +23,8 @@ struct UnacceptableExtensionMatch {
 }
 
 #[derive(Debug, Default)]
-struct DeliverySourceValidation {
-    total_bytes: u64,
+pub struct DeliverySourceValidation {
+    pub total_bytes: u64,
     root_entry_bytes: HashMap<PathBuf, u64>,
 }
 
@@ -59,7 +59,7 @@ pub(in crate::pipeline) fn member_crc32_by_path(
 }
 
 // The unwanted extension policy a final move scans its delivery under.
-enum DeliveryPolicySource {
+pub enum DeliveryPolicySource {
     // The job's own copy, the one its graph read once and judged it by: a
     // job ends by the setting it started with.
     Job(Arc<PostProcessingSettings>),
@@ -71,7 +71,7 @@ enum DeliveryPolicySource {
 // Inspect exactly the entries the final move can publish, without following
 // links. This one iterative walk both enforces the extension policy and
 // supplies the byte totals used by move progress.
-fn validate_delivery_sources(
+pub fn validate_delivery_sources(
     working_dir: &Path,
     staging_dir: Option<&Path>,
     settings: &PostProcessingSettings,
@@ -286,7 +286,7 @@ fn remove_emptied_folders(
 // std, and `FileTypeExt` only exposes the symlink-shaped reparse points — so
 // the check reads the raw attribute bit off the metadata each caller already
 // holds.
-fn metadata_is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
+pub fn metadata_is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
     if metadata.file_type().is_symlink() {
         return true;
     }
@@ -300,7 +300,7 @@ fn metadata_is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
     false
 }
 
-fn move_path_with_copy_fallback(
+pub fn move_path_with_copy_fallback(
     src: &std::path::Path,
     dst: &std::path::Path,
     phase_counters: &PhaseCounters,
@@ -315,7 +315,7 @@ fn move_path_with_copy_fallback(
 
 // The copy that stands in for a move, each file created exclusively and
 // told to `on_copied` as it lands, which may stop it.
-fn move_path_by_copy(
+pub fn move_path_by_copy(
     src: &std::path::Path,
     dst: &std::path::Path,
     on_copied: &mut dyn FnMut(u64) -> std::io::Result<()>,
@@ -364,14 +364,14 @@ fn move_path_by_copy(
 // The step of a delivery move made by name alone: the metadata change, a
 // rename or a link and unlink, never a copy. What only a copy can place is
 // said, for the mover to copy.
-fn rename_path_for_publication(
+pub fn rename_path_for_publication(
     src: &std::path::Path,
     dst: &std::path::Path,
 ) -> std::io::Result<Placement> {
     rename_path_for_publication_with(src, dst, |src, dst| std::fs::hard_link(src, dst))
 }
 
-fn rename_path_for_publication_with(
+pub fn rename_path_for_publication_with(
     src: &std::path::Path,
     dst: &std::path::Path,
     link: impl FnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
@@ -403,7 +403,7 @@ fn rename_path_for_publication_with(
 // The step a move makes by name, given where it is made.
 type Place = fn(&std::path::Path, &std::path::Path) -> std::io::Result<Placement>;
 
-fn move_path_with_safe_rename_or_copy_fallback(
+pub fn move_path_with_safe_rename_or_copy_fallback(
     src: &std::path::Path,
     dst: &std::path::Path,
     source_bytes: u64,
@@ -420,12 +420,10 @@ fn move_path_with_safe_rename_or_copy_fallback(
 // a mount without links, comes back to the mover, which copies it on its
 // own thread, never the volume's.
 #[derive(Clone)]
-pub(crate) struct Renames(Arc<weaver_server_disk::operations::disk::writer::Submitter>);
+pub struct Renames(Arc<weaver_server_disk::operations::disk::writer::Submitter>);
 
 impl Renames {
-    pub(crate) fn through(
-        to: Arc<weaver_server_disk::operations::disk::writer::Submitter>,
-    ) -> Self {
+    pub fn through(to: Arc<weaver_server_disk::operations::disk::writer::Submitter>) -> Self {
         Self(to)
     }
 
@@ -460,7 +458,7 @@ fn move_path_through(
     )
 }
 
-fn move_path_through_using<C>(
+pub fn move_path_through_using<C>(
     renames: Option<&Renames>,
     src: &std::path::Path,
     dst: &std::path::Path,
@@ -488,7 +486,7 @@ where
 // The one place a move's copy is decided: the step by name says whether
 // only a copy can place the entry, and the copy then runs here, on the
 // mover's thread, reporting each file as it lands.
-fn move_path_with_safe_rename_or_copy_fallback_using<R, C>(
+pub fn move_path_with_safe_rename_or_copy_fallback_using<R, C>(
     src: &std::path::Path,
     dst: &std::path::Path,
     source_bytes: u64,
@@ -546,7 +544,7 @@ pub(crate) fn release_failed_delivery(
     )
 }
 
-fn release_failed_delivery_using<M>(
+pub fn release_failed_delivery_using<M>(
     root: &Path,
     working_dir: &Path,
     staging: Option<&Path>,
@@ -563,7 +561,7 @@ where
     returned.and(released)
 }
 
-fn return_staged_delivery_using<M>(
+pub fn return_staged_delivery_using<M>(
     staging: &Path,
     working_dir: &Path,
     move_entry: M,
@@ -680,7 +678,7 @@ fn entry_found_quota(rename_err: &std::io::Error, copy_err: &std::io::Error) -> 
 // left under it, since a copy takes each file out of the source as it
 // lands. An entry whose rename was refused for room copied nothing and took
 // nothing out, so it adds nothing to what the move waits for.
-async fn left_to_copy(src: &std::path::Path, copy_err: &std::io::Error) -> u64 {
+pub async fn left_to_copy(src: &std::path::Path, copy_err: &std::io::Error) -> u64 {
     if !crate::operations::is_out_of_space(copy_err) {
         return 0;
     }
@@ -778,7 +776,7 @@ fn move_delivered_entry(
     move_path_through(renames, src, dst, source_bytes, phase_counters)
 }
 
-async fn validate_script_move_destination(
+pub async fn validate_script_move_destination(
     db: crate::Database,
     context: crate::post_processing::runner::JobExecutionContext,
     expected: &std::path::Path,
@@ -867,7 +865,7 @@ pub(crate) static CLAIM_FULL: std::sync::atomic::AtomicBool =
 
 // Why a destination could not be claimed.
 #[derive(Debug)]
-pub(in crate::pipeline) enum ClaimFailure {
+pub enum ClaimFailure {
     // The disk had no room for the folder: the job waits for room on the
     // disk `path` lies on, the nearest folder above it that exists.
     // `quota` says a quota refused it, not the disk.
@@ -928,7 +926,7 @@ struct FinalMove {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_move_to_complete(
+pub async fn run_move_to_complete(
     job_id: JobId,
     working_dir: PathBuf,
     staging_dir: Option<PathBuf>,
@@ -1437,7 +1435,7 @@ async fn holds_more_than_marker(dir: &Path) -> bool {
     }
 }
 
-fn complete_parent_for_category(
+pub fn complete_parent_for_category(
     complete_dir: &std::path::Path,
     categories: &[weaver_server_settings::categories::CategoryConfig],
     category: Option<&str>,
@@ -1492,147 +1490,8 @@ pub async fn claim_complete_destination_path(
     }
 }
 
-#[cfg(test)]
-mod category_destination_tests {
-    use super::*;
-
-    fn category(
-        name: &str,
-        dest_dir: Option<&str>,
-    ) -> weaver_server_settings::categories::CategoryConfig {
-        weaver_server_settings::categories::CategoryConfig {
-            upload_cap: Default::default(),
-            seeding: None,
-            torrent_route: false,
-            unpack: None,
-            id: 1,
-            name: name.to_string(),
-            dest_dir: dest_dir.map(str::to_string),
-            aliases: String::new(),
-        }
-    }
-
-    #[test]
-    fn safe_categories_and_collision_suffixes_remain_beneath_complete_dir() {
-        let complete = std::path::Path::new("/downloads/complete");
-        let parent = complete_parent_for_category(complete, &[], Some("tv-hd")).unwrap();
-        assert_eq!(parent, complete.join("tv-hd"));
-
-        let collision = parent.join(weaver_model::files::path_component_with_suffix(
-            "release", ".#42.1",
-        ));
-        assert!(collision.starts_with(complete));
-    }
-
-    #[tokio::test]
-    async fn script_destination_worker_refuses_foreign_ownership_and_path_changes() {
-        use crate::post_processing::model::PipelineOutcome;
-        use crate::post_processing::runner::{CompatibilityFacts, JobExecutionContext};
-
-        let temp = tempfile::tempdir().unwrap();
-        let complete = temp.path().canonicalize().unwrap();
-        let source = complete.join("source");
-        let destination = complete.join("destination");
-        std::fs::create_dir(&source).unwrap();
-        std::fs::create_dir(&destination).unwrap();
-        std::fs::write(source.join("payload.bin"), b"payload").unwrap();
-        let db = crate::Database::open_in_memory().unwrap();
-        let context = JobExecutionContext {
-            job_id: 1,
-            name: "destination-check".into(),
-            nzb_filename: "destination-check.nzb".into(),
-            category: None,
-            group: None,
-            source_url: None,
-            working_directory: source.clone(),
-            final_directory: destination.clone(),
-            pipeline_outcome: PipelineOutcome::Succeeded,
-            par_status: 0,
-            unpack_status: 0,
-            compatibility: CompatibilityFacts {
-                complete_dir: Some(complete.clone()),
-                ..Default::default()
-            },
-        };
-        validate_script_move_destination(db.clone(), context.clone(), &destination)
-            .await
-            .unwrap();
-        let missing = complete.join("missing");
-        let error = validate_script_move_destination(db.clone(), context.clone(), &missing)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(error, MoveToCompleteFailure::Operational(message) if message.contains("does not exist"))
-        );
-        crate::jobs::working_dir::mark_weaver_owned_working_dir(&complete, &destination, JobId(2))
-            .unwrap();
-        std::fs::write(destination.join("foreign.bin"), b"foreign").unwrap();
-        let error = validate_script_move_destination(db.clone(), context.clone(), &destination)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(error, MoveToCompleteFailure::Security(message) if message.contains("foreign ownership marker"))
-        );
-        assert_eq!(
-            std::fs::read(source.join("payload.bin")).unwrap(),
-            b"payload"
-        );
-        assert_eq!(
-            std::fs::read(destination.join("foreign.bin")).unwrap(),
-            b"foreign"
-        );
-        assert!(!destination.join("payload.bin").exists());
-
-        #[cfg(unix)]
-        {
-            let actual = complete.join("actual");
-            let alias = complete.join("alias");
-            std::fs::create_dir(&actual).unwrap();
-            std::os::unix::fs::symlink(&actual, &alias).unwrap();
-            let error = validate_script_move_destination(db, context, &alias)
-                .await
-                .unwrap_err();
-            assert!(
-                matches!(error, MoveToCompleteFailure::Security(message) if message.contains("changed after reservation"))
-            );
-            assert!(actual.exists());
-            assert!(
-                std::fs::symlink_metadata(alias)
-                    .unwrap()
-                    .file_type()
-                    .is_symlink()
-            );
-        }
-    }
-
-    #[test]
-    fn configured_destination_override_remains_trusted_admin_input() {
-        let complete = std::path::Path::new("/downloads/complete");
-        let categories = vec![category("custom/name", Some("/mnt/admin-selected"))];
-
-        assert_eq!(
-            complete_parent_for_category(complete, &categories, Some("custom/name")).unwrap(),
-            PathBuf::from("/mnt/admin-selected")
-        );
-    }
-
-    #[test]
-    fn malicious_or_legacy_unsafe_categories_fail_before_a_destination_is_returned() {
-        let complete = std::path::Path::new("/downloads/complete");
-        for unsafe_category in ["/tmp", "../../outside", "nested/path", "C:\\outside"] {
-            assert!(
-                complete_parent_for_category(complete, &[], Some(unsafe_category)).is_err(),
-                "accepted {unsafe_category:?}"
-            );
-        }
-
-        let legacy = vec![category("legacy/unsafe", None)];
-        assert!(complete_parent_for_category(complete, &legacy, Some("legacy/unsafe")).is_err());
-    }
-}
-
 impl Pipeline {
-    async fn claim_complete_destination(
+    pub async fn claim_complete_destination(
         &self,
         job_id: JobId,
         dir_name: &str,
@@ -1724,7 +1583,7 @@ impl Pipeline {
     // On collision, appends `.#<job_id>` (and a numeric suffix if needed).
     //
     // Uses rename() for same-filesystem moves, falls back to copy+delete for cross-FS.
-    pub(crate) async fn start_move_to_complete(&mut self, job_id: JobId) -> Result<(), String> {
+    pub async fn start_move_to_complete(&mut self, job_id: JobId) -> Result<(), String> {
         self.start_move_to_complete_held(job_id, None).await
     }
 
@@ -2382,7 +2241,7 @@ impl Pipeline {
         ));
     }
 
-    pub(crate) async fn handle_move_to_complete_done(&mut self, done: MoveToCompleteDone) {
+    pub async fn handle_move_to_complete_done(&mut self, done: MoveToCompleteDone) {
         let MoveToCompleteDone {
             job_id,
             dest,
@@ -3279,6 +3138,3 @@ impl RestoredPostProcessing {
         read
     }
 }
-
-#[cfg(test)]
-mod tests;

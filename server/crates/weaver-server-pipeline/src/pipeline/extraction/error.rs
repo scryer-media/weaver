@@ -48,7 +48,7 @@ pub enum ExtractionErrorClass {
 pub(crate) const PASSWORD_REQUIRED_MARKER: &str = "WEAVER_PASSWORD_REQUIRED: ";
 
 #[derive(Debug, Clone)]
-pub(crate) struct ExtractionError {
+pub struct ExtractionError {
     class: ExtractionErrorClass,
     message: String,
     rejection: Option<ExtractionFailure>,

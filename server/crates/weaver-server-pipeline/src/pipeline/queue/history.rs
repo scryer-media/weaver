@@ -1023,7 +1023,7 @@ impl Queue {
     // same hold a history delete takes. An id in the queue, being admitted,
     // or held by another history operation is busy and nothing of it is
     // touched.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) async fn archive_history(
         self: Arc<Self>,
         ids: BTreeSet<JobId>,
@@ -1039,7 +1039,7 @@ impl Queue {
 
     // `archive_history`, keeping the record of at most `keep` files of
     // each archived entry's output directory.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) async fn archive_history_keeping(
         self: Arc<Self>,
         ids: BTreeSet<JobId>,
@@ -1174,6 +1174,7 @@ pub(crate) mod between_sweeps {
         static RUN: RefCell<Option<Hook>> = const { RefCell::new(None) };
     }
 
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) fn set(run: impl FnMut(JobId) + 'static) {
         RUN.with(|slot| *slot.borrow_mut() = Some(Box::new(run)));
     }

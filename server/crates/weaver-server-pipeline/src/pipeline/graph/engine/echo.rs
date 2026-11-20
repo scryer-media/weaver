@@ -17,38 +17,38 @@ use weaver_graph::{
     Object, ObjectId, Placement, Provenance, Pull, Seek, Sink, VolumeIndex, Volumes, Weight, Why,
 };
 
-pub(crate) const SIGNATURE: &[u8] = b"Rar!\x1a\x07\x01\x00";
-pub(crate) const HEADER: usize = SIGNATURE.len();
+pub const SIGNATURE: &[u8] = b"Rar!\x1a\x07\x01\x00";
+pub const HEADER: usize = SIGNATURE.len();
 const CHUNK: usize = 16;
 
 #[derive(Clone, Default)]
-pub(crate) struct Echoes {
+pub struct Echoes {
     // How many volumes each run reads.
-    pub(crate) volumes: u32,
-    pub(crate) bids: Arc<Mutex<Vec<Seek>>>,
+    pub volumes: u32,
+    pub bids: Arc<Mutex<Vec<Seek>>>,
     // The window each engine declares it holds resident while it runs.
-    pub(crate) window: u64,
-    pub(crate) gate: Option<Arc<RunGate>>,
+    pub window: u64,
+    pub gate: Option<Arc<RunGate>>,
     // Whether each run also reads every volume's closed length once it has
     // echoed its body, as a layout that sizes itself from a volume does.
-    pub(crate) lengths: bool,
+    pub lengths: bool,
 }
 
 // Hold a real worker across actor-side cancellation without relying on its
 // scheduling speed. The gate opens only when the test has checked ownership.
 #[derive(Default)]
-pub(crate) struct RunGate {
+pub struct RunGate {
     started: tokio::sync::Notify,
     released: Mutex<bool>,
     wake: std::sync::Condvar,
 }
 
 impl RunGate {
-    pub(crate) async fn started(&self) {
+    pub async fn started(&self) {
         self.started.notified().await;
     }
 
-    pub(crate) fn release(&self) {
+    pub fn release(&self) {
         *self.released.lock().unwrap() = true;
         self.wake.notify_all();
     }

@@ -3,4 +3,4 @@
 
 use super::*;
 
-pub(crate) mod finalize;
+pub mod finalize;

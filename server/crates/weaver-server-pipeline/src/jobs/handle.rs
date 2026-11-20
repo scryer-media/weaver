@@ -419,7 +419,7 @@ impl SharedPipelineState {
     // pipeline publishes, and say what the publish changed as the pipeline
     // says it of its own jobs. The class publishes through its handle, which
     // carries the events.
-    fn publish_class_jobs(&self, protocol: Protocol, jobs: Vec<JobInfo>) -> Vec<PipelineEvent> {
+    pub fn publish_class_jobs(&self, protocol: Protocol, jobs: Vec<JobInfo>) -> Vec<PipelineEvent> {
         self.queue.write(|inner| {
             // The same jobs as they stand: nothing changed, and nothing is
             // said, so an idle publish wakes no reader.
@@ -610,7 +610,7 @@ impl SharedPipelineState {
     }
 
     // How many times setting the egress block took its lock.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) fn egress_quota_block_lock_count(&self) -> u64 {
         self.egress_quota_block_locks.load(Ordering::Relaxed)
     }
@@ -806,7 +806,7 @@ fn owned_job_events(before: &[JobInfo], after: &[JobInfo]) -> Vec<PipelineEvent>
 #[derive(Clone)]
 pub struct SchedulerHandle {
     event_tx: broadcast::Sender<PipelineEvent>,
-    state: SharedPipelineState,
+    pub state: SharedPipelineState,
 }
 
 impl SchedulerHandle {
@@ -1998,6 +1998,3 @@ impl SchedulerHandle {
         self.state.metrics().pipeline_turn.read(now)
     }
 }
-
-#[cfg(test)]
-mod tests;

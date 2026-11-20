@@ -295,10 +295,10 @@ fn next_refusal_report(
 
 // The press a lane's refused dial for `lease` leaves, for the pipeline's
 // tests: it reports the refusal the way the lane does, and holds no demand.
-#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+#[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
 pub(in crate::pipeline) struct TestRoutePress(RoutePress);
 
-#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+#[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
 impl TestRoutePress {
     pub(in crate::pipeline) fn refused(
         state: &crate::jobs::handle::SharedPipelineState,
@@ -644,7 +644,7 @@ impl OwnedDownloadLanePool {
         lock_pool(&self.shared).live_workers()
     }
 
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) fn reset_calls(&self) -> usize {
         self.reset_calls.load(Ordering::Relaxed)
     }

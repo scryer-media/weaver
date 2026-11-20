@@ -650,7 +650,7 @@ impl DownloadQueue {
 
     // The newsgroups this queue shares among a file's items, once it has
     // queued one of them.
-    pub(crate) fn file_groups(&self, file_id: NzbFileId) -> Option<&Arc<[String]>> {
+    pub fn file_groups(&self, file_id: NzbFileId) -> Option<&Arc<[String]>> {
         self.files.get(&file_id)?.groups.as_ref()
     }
 
@@ -1388,9 +1388,9 @@ impl QueueItem {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 impl crate::pipeline::Pipeline {
-    pub(crate) fn dispatched(&self, item: QueueItem) -> DownloadWork {
+    pub fn dispatched(&self, item: QueueItem) -> DownloadWork {
         let spec = &self
             .jobs
             .get(&item.segment_id.file_id.job_id)

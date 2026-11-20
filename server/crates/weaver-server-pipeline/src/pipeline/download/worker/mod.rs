@@ -18,7 +18,7 @@ mod ownership;
 mod pressure;
 mod refill;
 mod spawn;
-pub(in crate::pipeline) mod volume_pace;
+pub mod volume_pace;
 
 #[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub use leases::queued_files_may_pass;
@@ -26,7 +26,7 @@ pub(in crate::pipeline::download) use leases::{
     BlockedBy, ScanMemo, ServableWork, ServableWorkFilter,
 };
 pub(in crate::pipeline) use refill::HeldDownloadRefill;
-#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+#[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
 pub(in crate::pipeline) use spawn::lane_acquire_failure_for_work;
 
 enum DispatchAttempt {
@@ -156,7 +156,7 @@ impl<K: std::hash::Hash + Eq + Copy> KeyedLogThrottle<K> {
         self.windows.retain(|key, _| keep(key));
     }
 
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) fn last_emitted_at(&self, job_id: K) -> Option<Instant> {
         self.windows.get(&job_id).map(|window| window.emitted_at)
     }
@@ -219,7 +219,7 @@ pub(crate) struct DispatchStallWatch {
 pub(in crate::pipeline) const DOWNLOAD_RETRY_STORM_THRESHOLD: u64 = 1_000;
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct DownloadPressure {
+pub struct DownloadPressure {
     pub(in crate::pipeline) state: DownloadPressureState,
     reason: DownloadPressureReason,
     decode_backlog_bytes: u64,

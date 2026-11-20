@@ -14,18 +14,15 @@
 //   phase    where the job stands, read off the tree
 //   seams    the pipeline's hooks into all of the above
 
-pub(crate) mod facts;
+pub mod facts;
 pub mod intake;
 pub mod phase;
-pub(crate) mod sample;
-mod seams;
-#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+pub mod sample;
+pub mod seams;
+#[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
 pub(crate) use seams::{DISK_WAIT_LOOKS, DISK_WAITS_SAID};
-pub(crate) mod source;
-pub(crate) mod window;
-
-#[cfg(test)]
-pub(super) mod tests;
+pub mod source;
+pub mod window;
 
 use std::collections::BTreeSet;
 
@@ -39,19 +36,19 @@ use crate::pipeline::graph::namespace::{Arrival, Segments};
 
 // A seek that reached the root, with the object that asked it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Ask {
-    pub(crate) seek: Seek,
-    pub(crate) bidder: NodeId,
-    pub(crate) in_order: bool,
+pub struct Ask {
+    pub seek: Seek,
+    pub bidder: NodeId,
+    pub in_order: bool,
 }
 
 #[derive(Debug)]
-pub(crate) struct ArticleRoot {
-    pub(crate) map: ArticleMap,
-    pub(crate) window: Window,
+pub struct ArticleRoot {
+    pub map: ArticleMap,
+    pub window: Window,
     // The waiting volumes of every set, which the bootstrap bids from.
     pub(crate) leading: sample::Leading,
-    checksums: Checksums,
+    pub checksums: Checksums,
     // Each file's name as the post lists it. A root member is the post's
     // file of its number whatever a recovery set renames it to, so this,
     // not the member's name, is what says a restore has the right post.
@@ -62,7 +59,7 @@ pub(crate) struct ArticleRoot {
 }
 
 impl ArticleRoot {
-    pub(crate) fn new(files: &[RootFile]) -> Self {
+    pub fn new(files: &[RootFile]) -> Self {
         let volumes: Vec<_> = files.iter().map(|file| file.articles.clone()).collect();
         Self {
             map: ArticleMap::new(&volumes),
@@ -83,7 +80,7 @@ impl ArticleRoot {
     // back the delivery for the namespace. The first intact copy of an
     // article stands: a further copy, however it decoded, brings nothing
     // until a seek sends the article back for another.
-    pub(crate) fn receive(&mut self, decoded: Decoded) -> Option<Arrival> {
+    pub fn receive(&mut self, decoded: Decoded) -> Option<Arrival> {
         if self.map.holds_intact(decoded.volume, decoded.ordinal) {
             return None;
         }
@@ -114,7 +111,7 @@ impl ArticleRoot {
     // one the post's articles can reach with parts the size of this one's,
     // and no less than where this one ends. Otherwise it sizes nothing and
     // bounds no part.
-    pub(crate) fn accepted_length(&self, decoded: &Decoded) -> Option<u64> {
+    pub fn accepted_length(&self, decoded: &Decoded) -> Option<u64> {
         let own_end = decoded
             .declared_end
             .unwrap_or(decoded.offset + decoded.bytes.len() as u64);
@@ -128,11 +125,7 @@ impl ArticleRoot {
     // promoted; an unweighted data seek is critical; a weighted one is a
     // bid, and only bids the window draws move anything. Bids already in
     // the window (the bootstrap's) take part in the same draw.
-    pub(crate) fn answer(
-        &mut self,
-        asks: &[Ask],
-        queued: impl FnMut(VolumeIndex) -> bool,
-    ) -> Vec<Pull> {
+    pub fn answer(&mut self, asks: &[Ask], queued: impl FnMut(VolumeIndex) -> bool) -> Vec<Pull> {
         for ask in asks {
             if is_bid(ask.seek) {
                 self.window.bid(Bid {
@@ -195,7 +188,7 @@ impl ArticleRoot {
     }
 
     // The ranges of lost articles that can now be marked damaged.
-    pub(crate) fn damage(&mut self) -> Result<Vec<(VolumeIndex, ByteRange)>, Inconsistent> {
+    pub fn damage(&mut self) -> Result<Vec<(VolumeIndex, ByteRange)>, Inconsistent> {
         let mut out = Vec::new();
         self.map.take_damage(&mut out)?;
         Ok(out)
@@ -219,4 +212,15 @@ impl Segments for ArticleRoot {
 
 fn is_bid(seek: Seek) -> bool {
     seek.when == When::Now && seek.purpose == Purpose::Data && seek.weight > Weight::FIRST
+}
+
+// How often the root mapped seeks, for its tests compiled apart in
+// tests/pipeline_graph.rs.
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+#[doc(hidden)]
+pub mod hooks {
+    thread_local! {
+        pub static SEEK_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        pub static SEEK_MAPPED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
 }

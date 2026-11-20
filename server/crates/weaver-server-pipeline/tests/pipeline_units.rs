@@ -13,13 +13,19 @@ mod jobs {
     pub(crate) use weaver_server_pipeline::jobs::*;
     pub(crate) mod handle {
 
+        use std::collections::BTreeSet;
+
+        use std::sync::Arc;
+
         use weaver_server_base::jobs::ids::JobId;
+
         use weaver_server_pipeline::jobs::error::SchedulerError;
 
         use weaver_server_composition::jobs::control::*;
         pub(crate) use weaver_server_pipeline::jobs::handle::*;
 
         mod splice_job_order_tests;
+        mod tests;
     }
     mod service {
 
@@ -79,6 +85,7 @@ mod torrents {
 }
 
 mod history {
+    pub(crate) use weaver_server_pipeline::history::*;
 
     pub(crate) mod timeline {
         pub(crate) use weaver_server_composition::history::timeline::*;
@@ -98,6 +105,9 @@ mod settings {
 
 mod pipeline {
     pub(crate) use weaver_server_pipeline::pipeline::*;
+    mod archive {
+        mod test_support;
+    }
     pub(crate) mod post_health {
 
         use weaver_nntp::client::ProbeBatchResult;
@@ -148,7 +158,8 @@ mod pipeline {
 
         mod tests;
     }
-    mod download {
+    pub(crate) mod download {
+        pub(crate) use weaver_server_pipeline::pipeline::download::*;
 
         pub(crate) mod worker {
             pub(crate) use weaver_server_pipeline::pipeline::download::units::queued_files_may_pass;
@@ -160,6 +171,14 @@ mod pipeline {
             use weaver_server_pipeline::pipeline::download::units::worker::*;
 
             mod job_log_throttle_tests;
+            mod eligibility {
+                use super::*;
+                use std::sync::Arc;
+                use std::sync::atomic::Ordering;
+                use weaver_server_base::jobs::ids::{NzbFileId, SegmentId};
+
+                mod dispatch_hold_reason_tests;
+            }
             mod warm_seat_tests;
 
             mod volume_pace {
@@ -277,6 +296,28 @@ mod pipeline {
     }
     mod completion {
         mod finalize {
+            mod output {
+
+                use crate::post_processing::model::PostProcessingSettings;
+
+                use crate::runtime::file_cache;
+                use std::collections::HashSet;
+                use std::path::{Path, PathBuf};
+                use weaver_server_disk::runtime::fs::Placement;
+                use weaver_server_pipeline::jobs::working_dir::WORKING_DIR_MARKER;
+                use weaver_server_pipeline::pipeline::completion::finalize::deobfuscate::DeliveryNamingPlan;
+
+                use std::sync::Arc;
+                use std::sync::atomic::Ordering;
+                use weaver_server_base::jobs::ids::JobId;
+                use weaver_server_pipeline::jobs::PhaseCounters;
+                use weaver_server_pipeline::pipeline::*;
+
+                use weaver_server_pipeline::pipeline::completion::finalize::output::*;
+
+                mod category_destination_tests;
+                mod tests;
+            }
             mod check {
 
                 use weaver_server_pipeline::pipeline::units::check::*;

@@ -347,7 +347,7 @@ impl GraphJob {
     }
 
     // Whether a repair the stop ended is kept for the writers to settle.
-    pub(in crate::pipeline) fn keeps_stopped_repair(&self) -> bool {
+    pub fn keeps_stopped_repair(&self) -> bool {
         self.stopped_repair.is_some()
     }
 
@@ -371,15 +371,15 @@ impl GraphJob {
             return Ok(false);
         }
         self.take_back(*returned, slots, limit)?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         {
             self.stopped_repairs_taken_back += 1;
         }
         Ok(true)
     }
 
-    #[cfg(test)]
-    pub(in crate::pipeline) fn stopped_repairs_taken_back(&self) -> u32 {
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn stopped_repairs_taken_back(&self) -> u32 {
         self.stopped_repairs_taken_back
     }
 
@@ -662,7 +662,7 @@ impl GraphJob {
 
     // What the parent tells every engine bound in it. `coming` is what the
     // root still fetches unasked, asked once a step.
-    fn facts(&self, parent: NodeId, coming: &mut Option<Coming>) -> Facts {
+    pub fn facts(&self, parent: NodeId, coming: &mut Option<Coming>) -> Facts {
         if self.fed.ended.contains(&parent) {
             return Facts::INPUT_ENDED;
         }
@@ -716,7 +716,7 @@ impl GraphJob {
 
     // A test's seam: what the job's volumes lost is never taken as lost for
     // good above them, so a run waiting on one waits for good.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) fn withhold_lost_for_good(&mut self) {
         self.fed.withheld = true;
     }
@@ -745,7 +745,7 @@ impl GraphJob {
     // (`Engine::placed`), and whether any more can join, as its parent's `facts`
     // say. A shelf already there is left as it is, and its run is not woken
     // to find nothing new.
-    fn feed(&mut self, node: NodeId, facts: Facts) -> Result<(), GraphError> {
+    pub fn feed(&mut self, node: NodeId, facts: Facts) -> Result<(), GraphError> {
         let Some((parent, volumes)) = self.tree.volumes(node) else {
             return Ok(());
         };
@@ -867,7 +867,7 @@ impl GraphJob {
 // still join, and whether what they lost is lost for good, so a volume
 // holding every byte it will reads as closed before its object closes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Facts {
+pub struct Facts {
     ended: bool,
     deciding: bool,
     held: bool,
@@ -915,10 +915,6 @@ struct FedAt {
     offered: u64,
     runs: u64,
 }
-
-#[cfg(test)]
-#[path = "runs_tests.rs"]
-mod tests;
 
 // Whether what a run said takes room on a disk where it lands: the members
 // it announces and the bytes it writes, and the bytes it hands to be placed

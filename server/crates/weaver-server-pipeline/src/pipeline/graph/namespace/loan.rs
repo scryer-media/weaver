@@ -14,8 +14,8 @@
 // back together, and the namespace applies them as one repair. What the
 // repair rebuilt waits on disk until then, never in memory.
 
-pub(super) mod replay;
-pub(super) mod rewalk;
+pub mod replay;
+pub mod rewalk;
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -40,7 +40,7 @@ use super::super::leaf::{Leaf, LeafError, read_exact_at};
 use super::{ALL, NamespaceWriter, READ_BACK, SetState, Source, held_volume, index, read_member};
 
 // A set's repair, ready to run anywhere.
-pub(crate) struct Loan {
+pub struct Loan {
     pub(crate) set: NodeId,
     // The namespace the set covers, where the repair writes.
     pub(crate) namespace: NodeId,
@@ -52,15 +52,15 @@ pub(crate) struct Loan {
 
 // What a repair came back with.
 pub struct Returned {
-    pub(crate) set: NodeId,
+    pub set: NodeId,
     pub(crate) namespace: NodeId,
     pub(crate) object: Box<dyn Object>,
-    pub(crate) outcome: Option<RepairOutcome>,
+    pub outcome: Option<RepairOutcome>,
     pub(crate) reads: u64,
     pub(crate) repaired: Repaired,
     // Ranges the object proved bad and could not rebuild.
     pub(crate) found: Vec<(MemberId, ByteRange)>,
-    pub(crate) diagnostics: Vec<RepairDiagnostic>,
+    pub diagnostics: Vec<RepairDiagnostic>,
     read: Read,
     inputs: Vec<Input>,
 }
@@ -127,7 +127,7 @@ struct Read {
 impl Returned {
     // The shutdown stopped the repair: it is not repaired, and nothing it
     // came to stands.
-    pub(crate) fn stopped(&self) -> bool {
+    pub fn stopped(&self) -> bool {
         self.read.stopped
     }
 }
@@ -148,7 +148,7 @@ impl Loan {
     // repair given after `shutdown` started, or after the job's working
     // directory went, reads nothing, and one going when either happens
     // reads nothing more: each comes back stopped.
-    pub(crate) fn run(mut self, budget: weaver_graph::Budget, shutdown: &Shutdown) -> Returned {
+    pub fn run(mut self, budget: weaver_graph::Budget, shutdown: &Shutdown) -> Returned {
         self.access.begin(shutdown);
         let given = !self.access.stopped();
         let outcome = self
@@ -203,7 +203,7 @@ impl Loan {
 }
 
 // One member as the repair found it.
-struct Taken {
+pub struct Taken {
     coverage: Coverage,
     length: Option<u64>,
     path: Option<PathBuf>,
@@ -224,7 +224,7 @@ struct Taken {
 }
 
 #[derive(Default)]
-struct Usage {
+pub struct Usage {
     // Each member the repair asked of, and the ranges of it it read: none
     // for one it only asked the length or binding of.
     members: BTreeMap<(NodeId, MemberId), Coverage>,
@@ -253,7 +253,7 @@ impl Lent {
 
     // The pipeline began shutting down, or the job's working directory was
     // released: the repair reads and writes nothing more.
-    fn stopped(&self) -> bool {
+    pub fn stopped(&self) -> bool {
         self.stop.raised() || self.shutdown.started() || self.unwritten || !self.internal.is_dir()
     }
 
@@ -286,13 +286,13 @@ impl Lent {
 }
 
 // The owned access a lent repair reads and writes through.
-struct Lent {
-    namespace: NodeId,
-    set: NodeId,
-    recovery: Option<NodeId>,
+pub struct Lent {
+    pub namespace: NodeId,
+    pub set: NodeId,
+    pub recovery: Option<NodeId>,
     // Replay validates every node's revisions on return, so it notes
     // nothing of what it reads.
-    defer_holds: bool,
+    pub defer_holds: bool,
     // Bytes held on scratch are read in place, through the loan's own
     // handle on the namespace's scratch file, as the work asks for them. A
     // span is written again only once every hold on scratch has left, which
@@ -300,54 +300,54 @@ struct Lent {
     // what it read. A rewalk's pieces are heard as read, so it notes here
     // the held ranges each piece found on scratch, and the loop checks
     // their revisions as it hears the piece (`scratch_stands`).
-    scratch_read: Option<RefCell<Vec<(NodeId, MemberId, ByteRange)>>>,
+    pub scratch_read: Option<RefCell<Vec<(NodeId, MemberId, ByteRange)>>>,
     // Each namespace's scratch file, opened when lent for a member that
     // holds bytes there.
-    held_scratch: BTreeMap<NodeId, File>,
+    pub held_scratch: BTreeMap<NodeId, File>,
     // Everything the job had submitted for its files when the loan was
     // made, when some of it had yet to return, and the scratch files to
     // open once it has. The loan waits for it on its own thread as it
     // begins, never the loop: the files then lie as the loop said them.
-    settled: Option<crate::pipeline::graph::disk::JobBarrier>,
-    scratch_later: BTreeMap<NodeId, PathBuf>,
+    pub settled: Option<crate::pipeline::graph::disk::JobBarrier>,
+    pub scratch_later: BTreeMap<NodeId, PathBuf>,
     // What the loan waited for did not all reach the disk: it reads and
     // writes nothing, as one stopped.
-    unwritten: bool,
+    pub unwritten: bool,
     // The directory the repair's scratch and output lie in, made when the
     // repair is lent. The repair never makes it again: once it is gone, the
     // job's working directory was released under the repair.
-    internal: PathBuf,
-    members: BTreeMap<(NodeId, MemberId), Taken>,
+    pub internal: PathBuf,
+    pub members: BTreeMap<(NodeId, MemberId), Taken>,
     // Members lifted out of their namespace, and where each lives now.
-    homes: BTreeMap<(NodeId, MemberId), (NodeId, MemberId)>,
-    usage: RefCell<Usage>,
-    postings: BTreeMap<NodeId, Box<dyn Posting>>,
-    shelves: BTreeMap<NodeId, (Arc<Shelf>, u64)>,
+    pub homes: BTreeMap<(NodeId, MemberId), (NodeId, MemberId)>,
+    pub usage: RefCell<Usage>,
+    pub postings: BTreeMap<NodeId, Box<dyn Posting>>,
+    pub shelves: BTreeMap<NodeId, (Arc<Shelf>, u64)>,
     // The set's own volumes: the member each is, in the namespace it was
     // posted in, and the range of it a window is.
-    volumes: BTreeMap<VolumeIndex, (NodeId, MemberId)>,
-    window: Option<ByteRange>,
+    pub volumes: BTreeMap<VolumeIndex, (NodeId, MemberId)>,
+    pub window: Option<ByteRange>,
     // The last file read, kept open: a repair reads a member slice after
     // slice.
-    open: RefCell<Option<((NodeId, MemberId), File)>>,
-    reads: u64,
-    repaired: Repaired,
-    found: Vec<(MemberId, ByteRange)>,
-    diagnostics: Vec<RepairDiagnostic>,
-    scratch: Option<PathBuf>,
+    pub open: RefCell<Option<((NodeId, MemberId), File)>>,
+    pub reads: u64,
+    pub repaired: Repaired,
+    pub found: Vec<(MemberId, ByteRange)>,
+    pub diagnostics: Vec<RepairDiagnostic>,
+    pub scratch: Option<PathBuf>,
     // The pipeline's shutdown: once it starts, no read is answered.
-    shutdown: Shutdown,
+    pub shutdown: Shutdown,
     // The members the disk has no room for the repair to rebuild.
-    withheld: BTreeSet<MemberId>,
+    pub withheld: BTreeSet<MemberId>,
     // The volume of the job's working directory, where its scratch and
     // spill files lie, and the read turn the loan holds (`Reading`): every
     // read of a file is made in a turn of the file's volume.
-    working: Option<Arc<Volume>>,
-    reading: RefCell<Reading>,
+    pub working: Option<Arc<Volume>>,
+    pub reading: RefCell<Reading>,
     // Raised when the job stops the loan (`Loans::request_stop`): a wait for
     // a read turn ends, and the loan reads nothing more and comes back
     // stopped, as it does once the shutdown starts.
-    stop: Arc<TurnStop>,
+    pub stop: Arc<TurnStop>,
 }
 
 // What a read the loan was stopped before gives.
@@ -359,13 +359,13 @@ fn stopped_read() -> std::io::Result<()> {
 }
 
 impl Lent {
-    fn stop(&self) -> Arc<TurnStop> {
+    pub fn stop(&self) -> Arc<TurnStop> {
         Arc::clone(&self.stop)
     }
 
     // `read` in a turn of `volume`, when the file read is written through
     // one, or `stopped` when the loan is stopped while it waits for the turn.
-    fn in_turn<R>(
+    pub fn in_turn<R>(
         &self,
         volume: Option<&Arc<Volume>>,
         stopped: impl FnOnce() -> R,
@@ -394,10 +394,10 @@ impl Lent {
 // repair's scratch directory, whose names are the object's own, and goes
 // once the namespace has applied the runs, or turned them away. A write
 // the file refuses fails the repair: nothing it rebuilt is applied.
-pub(crate) struct Repaired {
+pub struct Repaired {
     // The member, where in it the run goes, and where on the output it is.
     runs: Vec<(MemberId, u64, ByteRange)>,
-    output: Leaf,
+    pub output: Leaf,
     // How far the output file reaches: the next run is written there.
     written: u64,
     // The first write the output refused. Nothing is written after it.
@@ -434,7 +434,7 @@ impl Repaired {
     }
 
     // The repair says how much it writes in all when it runs.
-    pub(crate) fn will_write(&mut self, bytes: u64) {
+    pub fn will_write(&mut self, bytes: u64) {
         self.writes = self.writes.saturating_add(bytes);
     }
 
@@ -442,7 +442,7 @@ impl Repaired {
     // tree has uncovered it all, so a whole member said again is never in
     // memory at once. Each request gets its own file: one the replay
     // raises while an earlier one is being said again is staged apart.
-    pub(crate) fn again(working_dir: &std::path::Path, node: NodeId) -> Result<Self, LeafError> {
+    pub fn again(working_dir: &std::path::Path, node: NodeId) -> Result<Self, LeafError> {
         let internal = working_dir.join(weaver_graph::names::INTERNAL_DIR);
         std::fs::create_dir_all(&internal).map_err(|source| LeafError::Io {
             device: crate::pipeline::graph::limits::Device::Working,
@@ -466,7 +466,7 @@ impl Repaired {
         })
     }
 
-    pub(crate) fn write(&mut self, member: MemberId, offset: u64, bytes: &[u8]) {
+    pub fn write(&mut self, member: MemberId, offset: u64, bytes: &[u8]) {
         if self.failed.is_some() {
             return;
         }
@@ -498,7 +498,7 @@ impl Repaired {
     // The repair's scratch directory, which lies beside the output on the
     // working disk, refused a write for want of room. The repair failed with
     // it as it does when the output refuses one: nothing staged is applied.
-    pub(crate) fn refuse(&mut self, path: &std::path::Path, source: std::io::Error) {
+    pub fn refuse(&mut self, path: &std::path::Path, source: std::io::Error) {
         if self.failed.is_some() {
             return;
         }
@@ -513,14 +513,14 @@ impl Repaired {
     }
 
     // The write the output refused, if one did: the repair failed with it.
-    pub(crate) fn failed(&mut self) -> Option<LeafError> {
+    pub fn failed(&mut self) -> Option<LeafError> {
         self.failed.take()
     }
 
     // What a repair that failed needs free to run again; nothing when it
     // did not say what it writes, and the job then waits for more room than
     // the disk showed.
-    pub(crate) fn gave_back(&self) -> u64 {
+    pub fn gave_back(&self) -> u64 {
         self.gave_back
     }
 
@@ -575,7 +575,7 @@ impl Repaired {
 impl NamespaceWriter {
     // Lend the set's object out of the tree with everything its repair
     // reads. `None` when the node holds no recovery object.
-    pub(crate) fn lend(
+    pub fn lend(
         &self,
         tree: &mut Tree,
         namespace: NodeId,
@@ -667,7 +667,7 @@ impl NamespaceWriter {
     // than it found it, a file that is no longer where it was, or a shelf
     // whose generation moved on, which it does when what it holds is
     // replaced or goes away. Bytes past what it read leave it standing.
-    pub(crate) fn moved_since(&self, tree: &Tree, returned: &Returned) -> bool {
+    pub fn moved_since(&self, tree: &Tree, returned: &Returned) -> bool {
         let changed = returned.inputs.iter().any(|input| {
             let files = self.files.get(&input.node);
             let bound = tree
@@ -835,7 +835,7 @@ impl NamespaceWriter {
     // Whether every held range a rewalk's piece read on scratch is held
     // as it was when lent: the same holds, at the same revisions, so the
     // span the piece read was not written again under it.
-    pub(crate) fn scratch_stands(&self, read: &ScratchRead) -> bool {
+    pub fn scratch_stands(&self, read: &ScratchRead) -> bool {
         read.0.iter().all(|(node, member, range, basis)| {
             self.files
                 .get(node)
@@ -847,7 +847,7 @@ impl NamespaceWriter {
 // The held ranges one piece of a rewalk read on scratch, each with the
 // revisions its holds stood at when lent.
 #[derive(Default)]
-pub(crate) struct ScratchRead(Vec<(NodeId, MemberId, ByteRange, Revisions)>);
+pub struct ScratchRead(Vec<(NodeId, MemberId, ByteRange, Revisions)>);
 
 // Held ranges with the revision each stood at, as `Holds::revisions` gives
 // them.
@@ -1039,8 +1039,8 @@ impl Source for Lent {
         else {
             return false;
         };
-        #[cfg(test)]
-        super::tests::SCRATCH_READ_MOST.with(|most| most.set(most.get().max(len)));
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+        super::hooks::SCRATCH_READ_MOST.with(|most| most.set(most.get().max(len)));
         let start = into.len();
         into.resize(start + index(len), 0);
         let read = self.in_turn(self.working.as_ref(), stopped_read, || {
@@ -1186,151 +1186,5 @@ impl MemberAccess for Lent {
             into.truncate(start);
         }
         read
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::pipeline::graph::job::GraphError;
-    use crate::pipeline::graph::limits::Device;
-    use crate::pipeline::graph::namespace::WriteError;
-
-    // A loan with nothing taken, working in `dir`.
-    fn bare(dir: &std::path::Path) -> Lent {
-        Lent {
-            namespace: NodeId(1),
-            set: NodeId(2),
-            recovery: Some(NodeId(2)),
-            defer_holds: false,
-            scratch_read: None,
-            held_scratch: BTreeMap::new(),
-            settled: None,
-            scratch_later: BTreeMap::new(),
-            unwritten: false,
-            internal: dir.to_path_buf(),
-            members: BTreeMap::new(),
-            homes: BTreeMap::new(),
-            usage: RefCell::default(),
-            postings: BTreeMap::new(),
-            shelves: BTreeMap::new(),
-            volumes: BTreeMap::new(),
-            window: None,
-            open: RefCell::new(None),
-            reads: 0,
-            repaired: Repaired::again(dir, NodeId(2)).expect("an output"),
-            found: Vec::new(),
-            diagnostics: Vec::new(),
-            scratch: None,
-            shutdown: Shutdown::default(),
-            withheld: BTreeSet::new(),
-            working: None,
-            reading: RefCell::default(),
-            stop: Arc::default(),
-        }
-    }
-
-    // A repair or replay waiting for a read turn that the volume's other
-    // readers hold ends when its job stops the loan: the read is not made,
-    // and the loan reads as stopped, so nothing it came to stands. On solid
-    // state and on a spinning volume alike.
-    #[test]
-    fn a_loan_waiting_for_a_turn_ends_when_its_job_stops_it() {
-        use weaver_server_disk::operations::disk::StorageKind;
-        for kind in [StorageKind::Solid, StorageKind::Rotational] {
-            let dir = tempfile::tempdir().expect("a working directory");
-            let volume = Arc::new(Volume::new(None, "test".to_owned()));
-            let reads = volume.reads(|| kind);
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .build()
-                .unwrap();
-            let every = runtime
-                .block_on(Arc::clone(reads.turns()).acquire_many_owned(reads.readers() as u32))
-                .unwrap();
-            let lent = bare(dir.path());
-            assert!(!lent.stopped());
-            let stop = lent.stop();
-            let waiting = {
-                let volume = Arc::clone(&volume);
-                std::thread::spawn(move || {
-                    let read = lent.in_turn(Some(&volume), || "stopped", || "read");
-                    (read, lent.stopped())
-                })
-            };
-            stop.await_waiters(1);
-            stop.raise();
-            assert_eq!(waiting.join().unwrap(), ("stopped", true), "{kind:?}");
-            drop(every);
-            assert_eq!(
-                reads.turns().available_permits(),
-                reads.readers(),
-                "{kind:?}"
-            );
-        }
-    }
-
-    // A repair whose output finds the disk full part-way comes back as a
-    // write the working disk had no room for, which holds the job, whatever
-    // kind of recovery wrote it: every kind writes what it rebuilt here.
-    #[test]
-    fn a_repair_whose_output_finds_the_disk_full_comes_back_out_of_space() {
-        use crate::pipeline::graph::leaf::counting::fill_after;
-        let dir = tempfile::tempdir().expect("a working directory");
-        let mut repaired = Repaired::again(dir.path(), NodeId(4)).expect("an output");
-        // A repair that writes 500 MB finds the disk full 14 bytes in.
-        repaired.will_write(500 << 20);
-        fill_after(Some(10));
-        repaired.write(MemberId(0), 0, b"rebuilt");
-        repaired.write(MemberId(0), 7, b"rebuilt");
-        fill_after(None);
-        assert!(!repaired.output.path().exists());
-        // What it needs free to run again: all it writes, not the 14 bytes
-        // it had written when it failed.
-        assert_eq!(repaired.gave_back(), 500 << 20);
-
-        // One that did not say what it writes names no figure.
-        let mut unsaid = Repaired::again(dir.path(), NodeId(5)).expect("an output");
-        fill_after(Some(0));
-        unsaid.write(MemberId(0), 0, b"rebuilt");
-        fill_after(None);
-        assert_eq!(unsaid.gave_back(), 0);
-
-        let error = repaired.failed().expect("the repair failed");
-        let error = GraphError::from(WriteError::from(error));
-        assert_eq!(error.out_of_space(), Some(Device::Working));
-    }
-
-    // A repair whose scratch directory found the disk full comes back as a
-    // write the working disk had no room for, which holds the job: nothing
-    // it staged is applied, and its output is gone.
-    #[test]
-    fn a_repair_whose_scratch_found_the_disk_full_comes_back_out_of_space() {
-        let dir = tempfile::tempdir().expect("a working directory");
-        let mut repaired = Repaired::again(dir.path(), NodeId(3)).expect("an output");
-        // A restore that stages 5 GB and rebuilds 200 MB, which it then
-        // copies into its member.
-        let whole = (5u64 << 30) + 2 * (200 << 20);
-        repaired.will_write(whole);
-        repaired.write(MemberId(0), 0, b"rebuilt");
-        let output = repaired.output.path().to_path_buf();
-        assert!(output.exists());
-
-        let scratch = dir.path().join("scratch");
-        repaired.refuse(
-            &scratch,
-            std::io::Error::from(std::io::ErrorKind::StorageFull),
-        );
-        // A later write is not made, and a second refusal does not replace
-        // the first.
-        repaired.write(MemberId(0), 7, b"more");
-        repaired.refuse(&scratch, std::io::Error::from(std::io::ErrorKind::NotFound));
-        assert!(!output.exists());
-        // What it needs free to run again: all it stages, rebuilds and
-        // copies, not what it had staged when it failed.
-        assert_eq!(repaired.gave_back(), whole);
-
-        let error = repaired.failed().expect("the repair failed");
-        let error = GraphError::from(WriteError::from(error));
-        assert_eq!(error.out_of_space(), Some(Device::Working));
     }
 }

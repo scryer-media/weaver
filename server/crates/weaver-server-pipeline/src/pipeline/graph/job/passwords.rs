@@ -21,7 +21,7 @@ use super::GraphJob;
 use crate::jobs::{ArchivePasswordCandidate, ArchivePasswordSource};
 
 #[derive(Default)]
-pub(super) struct Passwords {
+pub struct Passwords {
     candidates: Vec<String>,
     // Where each candidate came from, by the same index, recorded as the
     // job's candidates are set; empty when they came without one.
@@ -43,7 +43,7 @@ impl fmt::Debug for Passwords {
 
 impl Passwords {
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-    pub(super) fn new(candidates: Vec<String>) -> Self {
+    pub fn new(candidates: Vec<String>) -> Self {
         Self {
             candidates,
             ..Self::default()
@@ -86,7 +86,7 @@ impl Passwords {
     // A restore takes up where the checkpoint left the node: the cursor is
     // past the candidate it was offered last, and that candidate is offered
     // again. `None` when the job no longer has it.
-    pub(super) fn resume_at(&mut self, node: NodeId, index: usize) -> Option<&str> {
+    pub fn resume_at(&mut self, node: NodeId, index: usize) -> Option<&str> {
         let candidate = self.candidates.get(index)?;
         self.offered.insert(node, index + 1);
         Some(candidate)
@@ -161,7 +161,7 @@ impl GraphJob {
     }
 
     // How many candidates each node has been offered, by node.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) fn passwords_offered(&self) -> std::collections::BTreeMap<NodeId, usize> {
         (*self.passwords.offered).clone()
     }

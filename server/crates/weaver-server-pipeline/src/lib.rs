@@ -15,15 +15,12 @@ pub mod torrents;
 // Imported, not re-exported: the facade of the old paths is
 // weaver-server-core's.
 use weaver_server_composition::*;
-#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+#[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
 use weaver_server_ingest::watch_folder;
 
 pub use jobs::{JobState, SchedulerHandle, SharedPipelineState};
 pub use pipeline::Pipeline;
 pub use pipeline::download::{DownloadQueue, DownloadWork};
-// The graph tests, left as they are, still name categories by this path.
-#[cfg(test)]
-use weaver_server_settings::categories;
 
 // Allocation counter for the tests that assert a hot path allocates nothing.
 //
@@ -31,8 +28,9 @@ use weaver_server_settings::categories;
 // counts allocations *per thread*, which is the only way to prove from inside
 // a multi-threaded test binary that one closure performed none: a
 // process-wide counter would pick up every other test running beside it.
-#[cfg(test)]
-pub(crate) mod alloc_probe {
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+#[doc(hidden)]
+pub mod alloc_probe {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
 
@@ -46,7 +44,7 @@ pub(crate) mod alloc_probe {
         let _ = ALLOCATIONS.try_with(|count| count.set(count.get().wrapping_add(1)));
     }
 
-    pub(crate) struct Counting;
+    pub struct Counting;
 
     unsafe impl GlobalAlloc for Counting {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -65,7 +63,7 @@ pub(crate) mod alloc_probe {
     }
 
     // Allocations the calling thread has made so far.
-    pub(crate) fn allocations() -> u64 {
+    pub fn allocations() -> u64 {
         ALLOCATIONS.try_with(Cell::get).unwrap_or(0)
     }
 }

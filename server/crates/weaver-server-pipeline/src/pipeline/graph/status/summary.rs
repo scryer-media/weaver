@@ -9,26 +9,26 @@ use weaver_graph::recovery::{RepairOutcome, ShortSets};
 use weaver_graph::{Kind, MemberId, NodeId};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct RecoverySummary {
-    pub(crate) sets: Vec<SetSummary>,
+pub struct RecoverySummary {
+    pub sets: Vec<SetSummary>,
 }
 
 // One recovery object of the namespace.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SetSummary {
+pub struct SetSummary {
     // The object's own node.
-    pub(crate) node: NodeId,
-    pub(crate) kind: Kind,
+    pub node: NodeId,
+    pub kind: Kind,
     // The namespace it lives in, at whatever depth.
-    pub(crate) namespace: NodeId,
+    pub namespace: NodeId,
     // What the object is called where it lives, for the operator.
-    pub(crate) name: String,
+    pub name: String,
     // `None` before it ran a repair.
-    pub(crate) outcome: Option<RepairOutcome>,
+    pub outcome: Option<RepairOutcome>,
     // Its sets that cannot rebuild what they bind, set by set, read only
     // when the object rules impossible and can say so set by set. `None`
     // otherwise: then its outcome rules every member it covers.
-    pub(crate) short: Option<ShortSets>,
+    pub short: Option<ShortSets>,
 }
 
 impl SetSummary {
@@ -58,7 +58,7 @@ pub(crate) fn vouches(outcome: Option<RepairOutcome>) -> bool {
 impl RecoverySummary {
     // What each object last ruled, in order; one that has not ruled yet
     // waits.
-    pub(crate) fn outcomes(&self) -> Vec<RepairOutcome> {
+    pub fn outcomes(&self) -> Vec<RepairOutcome> {
         self.sets
             .iter()
             .map(|set| set.outcome.unwrap_or(RepairOutcome::Waiting))
@@ -79,7 +79,7 @@ impl RecoverySummary {
     }
 
     // What the scripts are told: a recovery object vouched for the job.
-    pub(crate) fn verified(&self) -> bool {
+    pub fn verified(&self) -> bool {
         !self.sets.is_empty() && self.settled()
     }
 }

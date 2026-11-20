@@ -54,9 +54,9 @@ pub mod control_fixture;
 pub mod decode_fixture;
 pub mod password_fixture;
 pub mod progress_fixture;
-#[cfg(test)]
-pub(in crate::pipeline) mod delivered_restore {
-    pub(in crate::pipeline) use super::delivery_fixture::restart_and_restore;
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+pub mod delivered_restore {
+    pub use super::delivery_fixture::restart_and_restore;
 }
 pub mod attribution_fixture;
 pub mod delivery_fixture;
@@ -816,7 +816,7 @@ pub async fn hear_graph_mail(pipeline: &mut Pipeline, job_id: JobId) {
 // Hear the run mail until every restored recovery object of the graph job
 // heard what of its volumes arrived again, as it does before the job
 // fetches anything.
-pub(in crate::pipeline) async fn hear_rewalks(pipeline: &mut Pipeline, job_id: JobId) {
+pub async fn hear_rewalks(pipeline: &mut Pipeline, job_id: JobId) {
     while pipeline
         .graph_jobs
         .get(&job_id)
@@ -1540,12 +1540,8 @@ pub fn rar_job_spec(name: &str, files: &[(String, Vec<u8>)]) -> JobSpec {
 }
 
 // Article `segment_number` of file `file_index` in job `job_id`.
-#[cfg(test)]
-pub(in crate::pipeline) fn segment_id(
-    job_id: JobId,
-    file_index: u32,
-    segment_number: u32,
-) -> SegmentId {
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+pub fn segment_id(job_id: JobId, file_index: u32, segment_number: u32) -> SegmentId {
     SegmentId {
         file_id: NzbFileId { job_id, file_index },
         segment_number,
@@ -2031,7 +2027,7 @@ async fn settle_inflight_moves(pipeline: &mut Pipeline) {
 // Hands the actor the script settings each terminal pass read off it. A
 // pass still waiting on them holds the job and has no cancellation handle
 // yet; one that launched its scripts has.
-pub(in crate::pipeline) async fn settle_script_admissions(pipeline: &mut Pipeline) {
+pub async fn settle_script_admissions(pipeline: &mut Pipeline) {
     while pipeline.inflight_terminal_post_processing.iter().any(|id| {
         !pipeline
             .terminal_post_processing_cancellations
@@ -2052,7 +2048,7 @@ pub fn set_job_status_for_test(pipeline: &mut Pipeline, job_id: JobId, status: J
     state.refresh_runtime_lanes_from_status();
 }
 
-pub(in crate::pipeline) async fn submit_decoded_segment(
+pub async fn submit_decoded_segment(
     pipeline: &mut Pipeline,
     file_id: NzbFileId,
     segment_number: u32,
@@ -2210,10 +2206,7 @@ async fn submit_decoded_segment_declaring(
         .await;
 }
 
-pub(in crate::pipeline) fn job_status_for_assert(
-    pipeline: &Pipeline,
-    job_id: JobId,
-) -> Option<JobStatus> {
+pub fn job_status_for_assert(pipeline: &Pipeline, job_id: JobId) -> Option<JobStatus> {
     // A job retiring into history ended with the status kept beside its
     // row; readers see it only once history holds the job.
     pipeline

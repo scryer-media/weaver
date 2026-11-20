@@ -3,24 +3,24 @@
 
 use super::*;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) type FailedReleaseHook =
     Box<dyn FnOnce(&std::path::Path, Option<&super::graph::job::GraphJob>) + Send>;
 
 // Runs with a failed job's working directory, and its graph if it has one,
 // as the release of that directory starts.
-#[cfg(test)]
-pub(crate) static BEFORE_FAILED_RELEASE: std::sync::Mutex<Option<FailedReleaseHook>> =
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+pub static BEFORE_FAILED_RELEASE: std::sync::Mutex<Option<FailedReleaseHook>> =
     std::sync::Mutex::new(None);
 
-pub(crate) struct PendingGraphFailure {
+pub struct PendingGraphFailure {
     pub(super) error: String,
     pub(super) extraction_rejected: bool,
 }
 
 // The one terminal continuation for a graph whose workers still own files.
 // An accepted cancellation replaces a pending failure after its archive commits.
-pub(super) enum PendingGraphTerminal {
+pub enum PendingGraphTerminal {
     Failed(PendingGraphFailure),
     Cancelled {
         cleanup: super::orchestrator::CancelledJobCleanup,
@@ -53,7 +53,7 @@ impl Pipeline {
     }
 
     // Mark a job as failed and purge its queued segments.
-    pub(crate) fn fail_job(&mut self, job_id: JobId, error: String) {
+    pub fn fail_job(&mut self, job_id: JobId, error: String) {
         self.fail_job_with_rejection(job_id, error, false);
     }
 
@@ -331,7 +331,7 @@ impl Pipeline {
             graph.release_handles();
             graph.disk().map(|disk| disk.barrier().returned_later())
         });
-        #[cfg(test)]
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         {
             let hook = BEFORE_FAILED_RELEASE.lock().unwrap().take();
             if let Some(hook) = hook {
@@ -373,7 +373,7 @@ impl Pipeline {
         });
     }
 
-    pub(super) fn handle_failed_job_released(&mut self, released: super::FailedJobReleased) {
+    pub fn handle_failed_job_released(&mut self, released: super::FailedJobReleased) {
         self.releasing_failed_jobs.remove(&released.job_id);
         self.record_failed_job(released.job_id, released.error);
     }

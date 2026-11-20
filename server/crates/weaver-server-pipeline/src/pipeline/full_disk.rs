@@ -42,7 +42,7 @@ use super::{ParkedBytes, Pipeline};
 use crate::jobs::model::{FileSummaries, FileSummary, JobArticles, RunState};
 use crate::operations::StorageRoot;
 use weaver_server_base::jobs::ids::JobId;
-pub(crate) use weaver_server_disk::operations::room_wait::Wants;
+pub use weaver_server_disk::operations::room_wait::Wants;
 use weaver_server_disk::operations::room_wait::{Disk, Promised, RoomWait, Waiter};
 
 // The wait of the kept history archives: the folder read, how many
@@ -63,7 +63,7 @@ pub(in crate::pipeline) const ARCHIVE_RETRY_RISE: u64 = 16 << 20;
 
 // What the job was doing when its write failed, which is what it goes back
 // to when let go, the way a restart takes a job stored in that stage.
-pub(crate) enum Stage {
+pub enum Stage {
     // Fetching, verifying, repairing or unpacking: its graph is restored
     // from its last checkpoint.
     Graph,
@@ -724,13 +724,13 @@ impl Pipeline {
     }
 
     // What is promised on the disks to the jobs let go, in all.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(in crate::pipeline) fn full_disk_promised_bytes(&self) -> u64 {
         self.storage_capacity.promises().bytes_of(Waiter::Usenet)
     }
 
     // The names in the destination whose copy the held move cut short.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(in crate::pipeline) fn full_disk_cut_short(&self, job_id: JobId) -> Vec<PathBuf> {
         match self.full_disk.get(&job_id).map(|hold| &hold.stage) {
             Some(Stage::Moving(_, again)) => again.iter().cloned().collect(),
@@ -739,20 +739,20 @@ impl Pipeline {
     }
 
     // What a reading of the held job's disk has to show more than.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(in crate::pipeline) fn full_disk_mark(&self, job_id: JobId) -> Option<u64> {
         self.full_disk.get(&job_id).and_then(|hold| hold.wait.mark)
     }
 
     // What a reading of the held job's disk has to show at least.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(in crate::pipeline) fn full_disk_needs(&self, job_id: JobId) -> Option<u64> {
         self.full_disk.get(&job_id).and_then(|hold| hold.wait.needs)
     }
 
     // What a reading has to show over the mark, by what was left of the file
     // whose write was refused, and whether a quota refused it.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(in crate::pipeline) fn full_disk_rise(&self, job_id: JobId) -> (Option<u64>, bool) {
         self.full_disk
             .get(&job_id)
@@ -760,7 +760,7 @@ impl Pipeline {
     }
 
     // Whether the held job waits on a path of its own, not on a root.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(in crate::pipeline) fn full_disk_on_path(&self, job_id: JobId) -> bool {
         self.full_disk
             .get(&job_id)

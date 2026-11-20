@@ -32,7 +32,7 @@ use weaver_server_base::operations::instrumentation::{JobStageKind, StageOutcome
 // The completion gate hands the job here: there is no whole-file
 // verification, no listing check and no re-scan of the output, since the
 // tree already ruled on every member as it arrived.
-pub(in crate::pipeline) async fn advance(pipeline: &mut Pipeline, job_id: JobId) {
+pub async fn advance(pipeline: &mut Pipeline, job_id: JobId) {
     let Some(state) = pipeline.jobs.get(&job_id) else {
         return;
     };
@@ -313,7 +313,7 @@ fn is_payload(job: &GraphJob, posted: &dyn Fn(MemberId) -> bool, member: MemberI
 // is payload, and one no object holds yet is what its posted name says, so
 // the figure rises as a volume posted under another name binds. A set's
 // index is no volume, whoever holds it, when its name says it is one.
-pub(in crate::pipeline) fn recovery_volume(
+pub fn recovery_volume(
     job: &GraphJob,
     file: &crate::jobs::model::FileSpec,
     member: MemberId,
@@ -603,10 +603,7 @@ impl Pipeline {
     // The terminal record of the job's delivery, from the census of its
     // root namespace at the last gate before the payload leaves. Returns the
     // operator-facing failure message when the census refuses the delivery.
-    pub(in crate::pipeline) fn reconcile_terminal_delivery(
-        &mut self,
-        job_id: JobId,
-    ) -> Result<(), String> {
+    pub fn reconcile_terminal_delivery(&mut self, job_id: JobId) -> Result<(), String> {
         let (Some(job), Some(state)) = (self.graph_jobs.get(&job_id), self.jobs.get(&job_id))
         else {
             return Ok(());
@@ -880,7 +877,7 @@ impl Pipeline {
             .is_some_and(|failure| failure.from_feed)
     }
 
-    pub(in crate::pipeline) fn graph_delivery(&self, job_id: JobId) -> Option<Delivery> {
+    pub fn graph_delivery(&self, job_id: JobId) -> Option<Delivery> {
         self.graph_ruling(job_id).map(|(delivery, _)| delivery)
     }
 
@@ -888,10 +885,7 @@ impl Pipeline {
     // stage that left it short, and the error a recovery object that could
     // not rebuild what it found words, or else what was withheld. `None`
     // once the job has gone.
-    pub(in crate::pipeline) fn graph_shortfall(
-        &self,
-        job_id: JobId,
-    ) -> Option<(PipelineFailureStage, Option<String>)> {
+    pub fn graph_shortfall(&self, job_id: JobId) -> Option<(PipelineFailureStage, Option<String>)> {
         self.graph_delivered_verdict(job_id)
             .map(|verdict| (verdict.shortfall_stage, verdict.shortfall_message))
     }
@@ -915,7 +909,7 @@ impl Pipeline {
 
     // The status a graph job with nothing left to wait for ends in. `None`
     // once the job has gone.
-    pub(in crate::pipeline) fn graph_terminal_status(&self, job_id: JobId) -> Option<JobStatus> {
+    pub fn graph_terminal_status(&self, job_id: JobId) -> Option<JobStatus> {
         let (delivery, failure) = self.graph_ruling(job_id)?;
         let status = delivery.status(failure.as_ref());
         if status == JobStatus::Partial {
@@ -1120,7 +1114,7 @@ impl Pipeline {
 // clean is not a failure of the job, and says none. The failure carries when
 // the repair stopped running, so the job's timeline puts it there and not at
 // the job's end.
-pub(super) fn stage_events(
+pub fn stage_events(
     job_id: JobId,
     before: Option<RootPhase>,
     phase: RootPhase,

@@ -454,11 +454,7 @@ impl Pipeline {
     // the same path rather than through a second copy of the commit logic, so
     // there is exactly one place where a segment is placed, written and
     // accounted for.
-    pub(crate) async fn handle_decode_success(
-        &mut self,
-        result: DecodeResult,
-        source: SegmentSource,
-    ) {
+    pub async fn handle_decode_success(&mut self, result: DecodeResult, source: SegmentSource) {
         let file_id = result.segment_id.file_id;
         let segment_number = result.segment_id.segment_number;
         let is_uu = result.encoding.is_uu();

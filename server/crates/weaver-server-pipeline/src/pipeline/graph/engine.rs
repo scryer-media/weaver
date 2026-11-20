@@ -18,13 +18,11 @@
 // generation, and is not heard: a run stopped as the job goes down keeps its
 // generation, so no run starts under it again.
 
-mod pool;
-mod volumes;
+pub mod pool;
+pub mod volumes;
 
-#[cfg(test)]
-pub(crate) mod echo;
-#[cfg(test)]
-mod tests;
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+pub mod echo;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -51,7 +49,7 @@ const MAIL_CAPACITY: usize = 64;
 // window is a decoder's dictionary alone, so this is added to every
 // reservation, fixed, so the whole is known before the run starts and never
 // grows after.
-pub(crate) const RUN_OVERHEAD: u64 = 4 << 20;
+pub const RUN_OVERHEAD: u64 = 4 << 20;
 
 // What a run said, addressed to its job, its node, and the generation it
 // runs under.
@@ -435,7 +433,7 @@ fn extracting_hook(volumes: &RunVolumes) {
 
 // Whether a run may start on the memory it declares.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Reservation {
+pub enum Reservation {
     Granted,
     // It does not fit beside what the decode pool holds now: its slot went
     // to the nodes named, which may start now.
@@ -476,11 +474,11 @@ impl Drop for LetGo {
 // One job's runs, the slots they take, and the bytes they reserve in the
 // decode pool.
 #[derive(Debug)]
-pub(crate) struct Runs {
+pub struct Runs {
     scope: u64,
     mail: mpsc::Sender<Said>,
     slots: Slots,
-    pool: Arc<DecodePool>,
+    pub pool: Arc<DecodePool>,
     runs: BTreeMap<NodeId, Run>,
     // The nodes whose run came, went, or moved on in its life, each under
     // the generation of its latest change: a step reads again only the
@@ -508,12 +506,7 @@ pub(crate) struct Runs {
 }
 
 impl Runs {
-    pub(crate) fn new(
-        scope: u64,
-        slots: usize,
-        mail: mpsc::Sender<Said>,
-        pool: Arc<DecodePool>,
-    ) -> Self {
+    pub fn new(scope: u64, slots: usize, mail: mpsc::Sender<Said>, pool: Arc<DecodePool>) -> Self {
         Self {
             scope,
             mail,
@@ -539,19 +532,19 @@ impl Runs {
     }
 
     // The runs, lending their decoders windows from `windows`.
-    pub(crate) fn lending(mut self, windows: Arc<super::window::Windows>) -> Self {
+    pub fn lending(mut self, windows: Arc<super::window::Windows>) -> Self {
         self.windows = Some(windows);
         self
     }
 
     // The runs, granted what `hardware` grants as each starts.
-    pub(crate) fn on(mut self, hardware: Hardware) -> Self {
+    pub fn on(mut self, hardware: Hardware) -> Self {
         self.hardware = hardware;
         self
     }
 
     // The runs, keeping the time they decode on `clock`.
-    pub(crate) fn timed(mut self, clock: DecodeClock) -> Self {
+    pub fn timed(mut self, clock: DecodeClock) -> Self {
         self.clock = clock;
         self
     }
@@ -560,7 +553,7 @@ impl Runs {
         self.clock.clone()
     }
 
-    pub(crate) fn hardware(&self) -> Hardware {
+    pub fn hardware(&self) -> Hardware {
         self.hardware.clone()
     }
 
@@ -575,7 +568,7 @@ impl Runs {
 
     // A run is waiting for a slot, waiting for memory, running, or stopped
     // before it finished.
-    pub(crate) fn live(&self) -> bool {
+    pub fn live(&self) -> bool {
         debug_assert_eq!(
             self.ended,
             self.runs
@@ -586,34 +579,34 @@ impl Runs {
         self.runs.len() > self.ended
     }
 
-    pub(crate) fn in_flight(&self) -> bool {
+    pub fn in_flight(&self) -> bool {
         self.runs
             .values()
             .any(|run| matches!(run.life, Life::Running { .. }))
     }
 
-    pub(crate) fn has(&self, node: NodeId) -> bool {
+    pub fn has(&self, node: NodeId) -> bool {
         self.runs.contains_key(&node)
     }
 
     // Whether the node's run is waiting for a slot, waiting for memory,
     // running, or stopped before it finished: it may still announce members,
     // or close them.
-    pub(crate) fn reading(&self, node: NodeId) -> bool {
+    pub fn reading(&self, node: NodeId) -> bool {
         self.runs
             .get(&node)
             .is_some_and(|run| !matches!(run.life, Life::Ended { .. }))
     }
 
     // The bytes reserved for the node's run.
-    #[cfg(test)]
-    pub(crate) fn reserved(&self, node: NodeId) -> u64 {
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn reserved(&self, node: NodeId) -> u64 {
         self.runs.get(&node).map_or(0, |run| run.reserved)
     }
 
     // The nodes holding a slot, in node order.
-    #[cfg(test)]
-    pub(crate) fn holding(&self) -> Vec<NodeId> {
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn holding(&self) -> Vec<NodeId> {
         self.runs
             .iter()
             .filter(|(_, run)| run.ticket.is_some())
@@ -638,7 +631,7 @@ impl Runs {
     // job still holds bytes to make. When every byte the pool holds is this
     // job's, only its own runs can give one back, and a parent starved by
     // children that wait on it waits on them as they wait on it.
-    pub(crate) fn held_back(&self) -> bool {
+    pub fn held_back(&self) -> bool {
         let mut starved = false;
         let (mut pool, mut above) = (0_u64, 0_u64);
         for run in self.runs.values() {
@@ -671,7 +664,7 @@ impl Runs {
     }
 
     // The generation the node's run started under, once it started.
-    pub(crate) fn generation(&self, node: NodeId) -> Option<u64> {
+    pub fn generation(&self, node: NodeId) -> Option<u64> {
         match self.runs.get(&node)?.life {
             Life::Queued | Life::Starved { .. } => None,
             Life::Running { generation } | Life::Ended { generation } => Some(generation),
@@ -680,7 +673,7 @@ impl Runs {
     }
 
     // Whether what was said under `generation` is the node's run speaking.
-    pub(crate) fn current(&self, node: NodeId, generation: u64) -> bool {
+    pub fn current(&self, node: NodeId, generation: u64) -> bool {
         self.runs
             .get(&node)
             .is_some_and(|run| run.life == Life::Running { generation })
@@ -690,7 +683,7 @@ impl Runs {
     // pipeline reads now. Returns the nodes that may start now: the node
     // itself when it holds a slot or one was free, and any a raised limit
     // or released memory admitted.
-    pub(crate) fn ask(&mut self, node: NodeId, limit: usize) -> Vec<NodeId> {
+    pub fn ask(&mut self, node: NodeId, limit: usize) -> Vec<NodeId> {
         let mut admitted = self.follow(limit);
         admitted.extend(self.wake());
         self.marks.mark(node);
@@ -713,8 +706,8 @@ impl Runs {
     // only narrows as the object's first bytes say more, so a restarted run
     // never needs more than the first. It is bookkeeping: nothing is
     // allocated for it.
-    #[cfg(test)]
-    pub(crate) fn reserve(&mut self, node: NodeId, window: u64) -> Reservation {
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn reserve(&mut self, node: NodeId, window: u64) -> Reservation {
         self.reserve_for(node, window, false)
     }
 
@@ -744,7 +737,7 @@ impl Runs {
     // Where no window can be mapped (`weaver_server_disk::scratch::MAPS`), no run is lent: one
     // whose window is over the ceiling is placed in RAM from the start where
     // the policy lets it go above, and is refused where it does not.
-    pub(crate) fn reserve_for(&mut self, node: NodeId, window: u64, lends: bool) -> Reservation {
+    pub fn reserve_for(&mut self, node: NodeId, window: u64, lends: bool) -> Reservation {
         let grant = self.hardware.grant();
         self.held_back.remove(&node);
         let Some(run) = self.runs.get_mut(&node) else {
@@ -831,12 +824,7 @@ impl Runs {
 
     // Start the node's run over its shelf, on a blocking thread, with the
     // budget in force now: a later profile reaches the next run, not this.
-    pub(crate) fn start(
-        &mut self,
-        node: NodeId,
-        extraction: Box<dyn Extraction>,
-        shelf: Arc<Shelf>,
-    ) {
+    pub fn start(&mut self, node: NodeId, extraction: Box<dyn Extraction>, shelf: Arc<Shelf>) {
         let Some(run) = self.runs.get_mut(&node) else {
             return;
         };
@@ -925,7 +913,7 @@ impl Runs {
 
     // The node's run returned. Its slot and its memory go to whoever waits;
     // returns the nodes that may start now.
-    pub(crate) fn ended(&mut self, node: NodeId, generation: u64, limit: usize) -> Vec<NodeId> {
+    pub fn ended(&mut self, node: NodeId, generation: u64, limit: usize) -> Vec<NodeId> {
         let mut admitted = self.follow(limit);
         if let Some(run) = self.runs.get_mut(&node)
             && run.volumes.as_ref().is_some_and(|volumes| volumes.parked())
@@ -993,7 +981,7 @@ impl Runs {
     // narrower, or it already had that window: its refusal stands. Each
     // widening is wider than the last, so a run that refuses again with
     // nothing wider to ask for stands refused.
-    pub(crate) fn widen(&mut self, node: NodeId, needed: Option<u64>, widest: Option<u64>) -> bool {
+    pub fn widen(&mut self, node: NodeId, needed: Option<u64>, widest: Option<u64>) -> bool {
         let grant = self.hardware.grant();
         self.held_back.remove(&node);
         let Some(run) = self.runs.get_mut(&node) else {
@@ -1081,7 +1069,7 @@ impl Runs {
     // holds runs to the ceiling and the scratch refused it a window for want
     // of room: that refusal names no limit, and the run was held to the
     // grant's window. Any other refusal naming no limit is left so.
-    pub(crate) fn allowed(&self, node: NodeId) -> Option<u64> {
+    pub fn allowed(&self, node: NodeId) -> Option<u64> {
         let grant = self.hardware.grant();
         let run = self
             .runs
@@ -1095,7 +1083,7 @@ impl Runs {
     // node's run for want of room, under a policy that holds runs to the
     // ceiling: the widest window the run asked for and the free space the
     // disk keeps. The job waits for that room; it is not failed.
-    pub(crate) fn window_needs(&self, node: NodeId) -> Option<u64> {
+    pub fn window_needs(&self, node: NodeId) -> Option<u64> {
         let grant = self.hardware.grant();
         let run = self.runs.get(&node).filter(|run| {
             run.lends && (grant.over_limit == OverLimit::ScratchThenFail || run.no_ram)
@@ -1115,12 +1103,12 @@ impl Runs {
 
     // Whether a refusal stands in the job only because the policy holds runs
     // to the ceiling, so a reprocess with no memory limit could finish it.
-    pub(crate) fn held_to_ceiling(&self) -> bool {
+    pub fn held_to_ceiling(&self) -> bool {
         !self.held_back.is_empty()
     }
 
     // Whether the node's run was widened and is ending, to start again.
-    pub(crate) fn rerunning(&self, node: NodeId) -> bool {
+    pub fn rerunning(&self, node: NodeId) -> bool {
         self.runs.get(&node).is_some_and(|run| run.rerun)
     }
 
@@ -1130,7 +1118,7 @@ impl Runs {
     // it said already landed; nothing it says from here is heard.
     // A run widened, stopped already to start again, is parked as well: it
     // starts again at the wider window once the job has room.
-    pub(crate) fn park(&mut self, node: NodeId) {
+    pub fn park(&mut self, node: NodeId) {
         if let Some(run) = self.runs.get(&node)
             && let Some(volumes) = run.volumes.as_ref()
             && (volumes.current() || run.rerun)
@@ -1141,7 +1129,7 @@ impl Runs {
 
     // Whether the run stopped for its job to wait for room on a disk, and is
     // ending to run again from the start.
-    pub(crate) fn parked(&self, node: NodeId) -> bool {
+    pub fn parked(&self, node: NodeId) -> bool {
         self.runs.get(&node).is_some_and(|run| {
             matches!(run.life, Life::Running { .. })
                 && run.volumes.as_ref().is_some_and(|volumes| volumes.parked())
@@ -1153,7 +1141,7 @@ impl Runs {
     // memory are given back, but the run stays, stopped under its generation:
     // its thread may still speak under it, and a run started in its place
     // would read under the same generation and hear it as its own.
-    pub(crate) fn stop(&mut self, limit: usize) {
+    pub fn stop(&mut self, limit: usize) {
         self.request_stop();
         self.follow(limit);
         let all: Vec<NodeId> = self.runs.keys().copied().collect();
@@ -1178,7 +1166,7 @@ impl Runs {
         }
     }
 
-    pub(crate) fn request_stop(&self) {
+    pub fn request_stop(&self) {
         for run in self.runs.values() {
             if let Some(volumes) = &run.volumes {
                 volumes.stop();
@@ -1194,7 +1182,7 @@ impl Runs {
     // their memory go to whoever waits; returns the nodes that may start
     // now, as a raised limit or released memory admits them even when
     // nothing is gone.
-    pub(crate) fn forget(&mut self, gone: Vec<NodeId>, limit: usize) -> Vec<NodeId> {
+    pub fn forget(&mut self, gone: Vec<NodeId>, limit: usize) -> Vec<NodeId> {
         let mut admitted = self.follow(limit);
         // Out of the queue first, so a slot one of them frees cannot go to
         // another of them.
@@ -1227,7 +1215,7 @@ impl Runs {
 
     // Whether a run turned away for memory may ask again: the decode pool
     // was given bytes back since, by this job or any other, or it grew.
-    pub(crate) fn wakeable(&self) -> bool {
+    pub fn wakeable(&self) -> bool {
         let room = self.pool.room();
         self.runs.values().any(|run| woken(run.life, room))
     }
@@ -1336,4 +1324,14 @@ fn woken(life: Life, room: pool::Room) -> bool {
 
 fn asker(node: NodeId) -> AskerId {
     AskerId(u64::from(node.0))
+}
+
+// What the unit tests compiled apart in tests/pipeline_graph.rs reach in
+// this module's private modules.
+#[cfg(feature = "pipeline-test-fixtures")]
+#[doc(hidden)]
+pub mod units {
+    pub mod pool {
+        pub use super::super::pool::*;
+    }
 }

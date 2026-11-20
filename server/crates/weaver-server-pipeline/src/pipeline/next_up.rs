@@ -53,7 +53,7 @@ impl NextUp {
         }
     }
 
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) fn held(&self) -> Vec<JobId> {
         let mut held: Vec<JobId> = self
             .entries
@@ -73,7 +73,7 @@ impl NextUp {
     }
 
     // Every job the ring tracks, read or not.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) fn ids(&self) -> Vec<JobId> {
         let mut ids: Vec<JobId> = self.entries.keys().copied().collect();
         ids.sort_unstable();
@@ -81,7 +81,7 @@ impl NextUp {
     }
 
     // The number of the last read sent out.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) fn last_read(&self) -> u64 {
         self.next_read
     }
@@ -191,7 +191,7 @@ impl HeldLists {
     }
 
     // The bytes the lists hold on the heap.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) fn heap_bytes(&self) -> usize {
         self.ids.len()
             + std::mem::size_of_val(&*self.id_ends)

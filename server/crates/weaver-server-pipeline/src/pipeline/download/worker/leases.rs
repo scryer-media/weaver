@@ -682,7 +682,7 @@ impl Pipeline {
         }
     }
 
-    pub(in crate::pipeline) fn activate_download_batch_lease(
+    pub fn activate_download_batch_lease(
         &mut self,
         lease: &DownloadBatchLease,
         activation_items: &[(SegmentId, NzbFileId, u64)],

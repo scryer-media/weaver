@@ -276,7 +276,7 @@ impl Pipeline {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) async fn add_job(
+    pub async fn add_job(
         &mut self,
         job_id: JobId,
         spec: JobSpec,
@@ -303,7 +303,7 @@ impl Pipeline {
         Ok(())
     }
 
-    pub(crate) fn admission_resources(&self) -> crate::pipeline::queue::AdmissionResources {
+    pub fn admission_resources(&self) -> crate::pipeline::queue::AdmissionResources {
         crate::pipeline::queue::AdmissionResources {
             db: self.db.clone(),
             intermediate_dir: self.intermediate_dir.clone(),
@@ -312,7 +312,7 @@ impl Pipeline {
         }
     }
 
-    pub(crate) async fn prepare_add(
+    pub async fn prepare_add(
         resources: &crate::pipeline::queue::AdmissionResources,
         job_id: JobId,
         spec: JobSpec,
@@ -584,7 +584,7 @@ impl Pipeline {
         })
     }
 
-    pub(crate) fn install_prepared_add(
+    pub fn install_prepared_add(
         &mut self,
         job_id: JobId,
         prepared: crate::pipeline::queue::PreparedAdd,
@@ -762,7 +762,7 @@ impl Pipeline {
         (assembly, download_queue)
     }
 
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) async fn reprocess_job(
         &mut self,
         job_id: JobId,
@@ -770,7 +770,7 @@ impl Pipeline {
         self.reprocess_job_with_password(job_id, None).await
     }
 
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) async fn reprocess_job_with_password(
         &mut self,
         job_id: JobId,
@@ -780,7 +780,7 @@ impl Pipeline {
             .await
     }
 
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) async fn reprocess_job_with_no_memory_limit(
         &mut self,
         job_id: JobId,
@@ -790,7 +790,7 @@ impl Pipeline {
             .await
     }
 
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) async fn redownload_job_with_password(
         &mut self,
         job_id: JobId,
@@ -800,7 +800,7 @@ impl Pipeline {
             .await
     }
 
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     async fn restart_through_control_plane(
         &mut self,
         job_id: JobId,
@@ -1593,7 +1593,7 @@ impl InstallRead {
 
     // Whether the read carries what a job restored in post-processing is
     // finished or resumed from.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) fn carries_post_processing(&self) -> bool {
         self.restored
             .as_ref()

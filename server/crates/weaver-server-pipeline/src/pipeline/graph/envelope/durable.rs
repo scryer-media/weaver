@@ -14,19 +14,19 @@ use crate::pipeline::graph::leaf::{Leaf, LeafError};
 // One kept envelope: its node, its number, the runs of it that are on disk,
 // its length once its member closed, and whether nothing more will come.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct KeptRecord {
-    pub(crate) node: NodeId,
-    pub(crate) envelope: u32,
-    pub(crate) runs: Vec<Run>,
-    pub(crate) closed: Option<u64>,
-    pub(crate) settled: bool,
+pub struct KeptRecord {
+    pub node: NodeId,
+    pub envelope: u32,
+    pub runs: Vec<Run>,
+    pub closed: Option<u64>,
+    pub settled: bool,
     // The file it sits in, when not the one its node and number name.
-    pub(crate) file: Option<String>,
+    pub file: Option<String>,
 }
 
 impl Envelopes {
     // The node's kept envelopes, in envelope order.
-    pub(crate) fn records(&self, node: NodeId) -> Vec<KeptRecord> {
+    pub fn records(&self, node: NodeId) -> Vec<KeptRecord> {
         let Some(shelf) = self.shelves.get(&node) else {
             return Vec::new();
         };
@@ -59,7 +59,7 @@ impl Envelopes {
     }
 
     // An envelope as a checkpoint described it, over the file it left.
-    pub(crate) fn restore(&mut self, record: &KeptRecord) -> Result<(), LeafError> {
+    pub fn restore(&mut self, record: &KeptRecord) -> Result<(), LeafError> {
         let shelf = self.shelf(record.node);
         self.marks.mark(record.node);
         let name = record
@@ -106,6 +106,3 @@ impl Envelopes {
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod tests;

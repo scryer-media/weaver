@@ -20,7 +20,7 @@ use super::super::super::leaf::LeafError;
 use super::super::{NamespaceWriter, read_placed};
 use super::{Lent, Repaired, ScratchRead};
 
-pub(crate) struct RewalkLoan {
+pub struct RewalkLoan {
     rewalk: Rewalk,
     access: Lent,
 }
@@ -66,7 +66,7 @@ impl RewalkLoan {
     // not read back, which answers whether to go on, and whether every
     // piece was taken. A shutdown, or the job's working directory going,
     // ends it short: what was not read is asked again by the next restore.
-    pub(crate) fn run(
+    pub fn run(
         mut self,
         shutdown: &Shutdown,
         said: &mut dyn FnMut(VolumeIndex, Result<Posted, ByteRange>, ScratchRead) -> bool,
@@ -117,7 +117,7 @@ impl NamespaceWriter {
 
     // What the restored recovery object at `node` asked again, with the
     // access its volumes read through. `None` when it has nothing to read.
-    pub(crate) fn lend_rewalk(
+    pub fn lend_rewalk(
         &self,
         tree: &mut Tree,
         node: NodeId,

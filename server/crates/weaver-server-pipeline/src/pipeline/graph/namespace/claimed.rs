@@ -21,7 +21,7 @@ use crate::pipeline::graph::envelope::{envelope_name, free_name};
 
 impl NamespaceWriter {
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn replay_file(
+    pub fn replay_file(
         &mut self,
         tree: &mut Tree,
         builder: &mut dyn weaver_graph::Builder,
@@ -233,7 +233,7 @@ impl NamespaceWriter {
 // Give the file at `from` the second name `at`. Whether it has it: a file
 // system that gives a file no second name leaves nothing at `at`.
 fn second_name(from: &std::path::Path, at: &std::path::Path) -> bool {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     if refused::SECOND_NAMES.get() {
         return false;
     }
@@ -246,7 +246,7 @@ fn second_name(from: &std::path::Path, at: &std::path::Path) -> bool {
 // As `second_name`, for a name that must be a file after: where the file
 // system gives no second name, an empty file is made there. A disk that
 // cannot make even that says so on the first write to the file.
-fn second_name_or_empty(from: &std::path::Path, at: &std::path::Path) {
+pub fn second_name_or_empty(from: &std::path::Path, at: &std::path::Path) {
     if second_name(from, at) {
         return;
     }
@@ -264,57 +264,10 @@ fn second_name_or_empty(from: &std::path::Path, at: &std::path::Path) {
 
 // A test's file system that gives no file a second name: on the test's own
 // thread only, so a test that sets it never reaches another running beside it.
-#[cfg(test)]
-pub(crate) mod refused {
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+pub mod refused {
     thread_local! {
-        pub(crate) static SECOND_NAMES: std::cell::Cell<bool> =
+        pub static SECOND_NAMES: std::cell::Cell<bool> =
             const { std::cell::Cell::new(false) };
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::pipeline::graph::leaf::Leaf;
-
-    // A file system that gives no second name leaves a file at the name all
-    // the same, so the leaf that is told its file is there can be moved and
-    // measured before a byte is written to it.
-    #[test]
-    fn a_refused_second_name_still_leaves_a_file_the_leaf_can_move() {
-        refused::SECOND_NAMES.set(true);
-        let dir = tempfile::tempdir().unwrap();
-        let from = dir.path().join("lantern.part2.rar");
-        std::fs::write(&from, b"volume").unwrap();
-        let at = dir.path().join("kept").join("envelope-1");
-
-        second_name_or_empty(&from, &at);
-
-        let mut leaf = Leaf::over(dir.path(), "kept/envelope-1", true);
-        assert_eq!(leaf.len().unwrap(), 0, "nothing was copied");
-        leaf.intend("kept/moved");
-        assert_eq!(leaf.move_on().unwrap().as_deref(), Some("kept/envelope-1"));
-        assert!(dir.path().join("kept").join("moved").is_file());
-        assert!(!at.exists());
-        assert_eq!(std::fs::read(&from).unwrap(), b"volume");
-    }
-
-    // Where the second name is given, it is the file itself and nothing
-    // else is made.
-    #[cfg(unix)]
-    #[test]
-    fn a_given_second_name_is_the_file_itself() {
-        use std::os::unix::fs::MetadataExt;
-        let dir = tempfile::tempdir().unwrap();
-        let from = dir.path().join("lantern.part2.rar");
-        std::fs::write(&from, b"volume").unwrap();
-        let at = dir.path().join("envelope-1");
-
-        second_name_or_empty(&from, &at);
-
-        assert_eq!(
-            std::fs::metadata(&from).unwrap().ino(),
-            std::fs::metadata(&at).unwrap().ino()
-        );
     }
 }

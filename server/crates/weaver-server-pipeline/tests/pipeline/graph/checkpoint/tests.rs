@@ -13,6 +13,7 @@ use weaver_graph::{
 
 use weaver_graph::holds::ScratchHold;
 
+use super::hooks::borrowed_node_rows;
 use super::{
     CheckpointError, FileState, HoldRecord, Pending, Snapshot, envelope_rows, hold_rows,
     member_rows_built, node_rows, part_rows, root_row, snapshot,
@@ -259,91 +260,6 @@ fn encoding(facts: &RootFacts) -> Encoding {
         facts.reported,
         facts.pending_verifications.clone(),
     )
-}
-
-// The borrowed full-snapshot encoder, independent of incremental owned conversions.
-pub(super) fn borrowed_node_rows(
-    node: &NodeRecord,
-    files: impl Fn(MemberId) -> FileState,
-    password: Option<i64>,
-) -> GraphCheckpoint {
-    let id = i64::from(node.node.0);
-    let mut out = GraphCheckpoint::default();
-    if let (Some(kind), Some(facts)) = (node.kind, &node.facts) {
-        let volumes: Vec<(u32, u32)> = node
-            .volumes
-            .iter()
-            .map(|(volume, member)| (volume.0, member.0))
-            .collect();
-        out.nodes.push(super::NodeRow {
-            node: id,
-            parent: node.parent.map(|parent| i64::from(parent.0)),
-            parent_member: node.volumes.first().map(|(_, member)| i64::from(member.0)),
-            volumes: rmp_serde::to_vec(&volumes).ok(),
-            window: node
-                .window
-                .map(|window| (window.start as i64, window.end as i64)),
-            kind: kind.to_string(),
-            state: super::state_name(node.state).to_owned(),
-            reason: node.reason.map(super::why_text),
-            facts_version: i64::from(facts.version),
-            facts: facts.bytes.clone(),
-            winning_password: password,
-        });
-        out.parts.extend(facts.parts.iter().map(|part| PartRow {
-            node: id,
-            part: part.key as i64,
-            bytes: Arc::clone(&part.bytes),
-        }));
-    }
-    out.crypt
-        .extend(node.crypt.iter().map(|crypt| super::CryptRow {
-            node: id,
-            member: i64::from(crypt.member.0),
-            run_start: crypt.run_start,
-            seed: crypt.seed.to_vec(),
-        }));
-    out.members.extend(node.members.iter().map(|member| {
-        let state = files(member.member);
-        super::MemberRow {
-            node: id,
-            member: i64::from(member.member.0),
-            name: member.name.clone(),
-            output_name: member.output_name.clone(),
-            crc32: member.crc32.map(i64::from),
-            length: member.length.map(|length| length as i64),
-            closed: member.closed,
-            bound: member.bound_to.map(|object| i64::from(object.0)),
-            owner: member.owner.map(super::pair),
-            given_up: member.given_up.map(super::pair),
-            buried: member.buried,
-            undecided: member.undecided,
-            has_file: state.has_file,
-            on_disk: state.on_disk,
-            refused: state.refused.map(super::why_text),
-            copy_of: member.copy_of.map(|into| i64::from(into.0)),
-            refuted_kind: member.refuted.map(|kind| kind.to_string()),
-            lifted: member.lifted.as_ref().map(|lift| super::Lifted {
-                node: i64::from(lift.node.0),
-                member: i64::from(lift.member.0),
-                position: super::position_text(&lift.position),
-            }),
-        }
-    }));
-    out.coverage
-        .extend(node.coverage.iter().map(|run| super::CoverageRow {
-            node: id,
-            member: i64::from(run.member.0),
-            start: run.start as i64,
-            end: run.end as i64,
-            provenance: super::provenance_name(run.provenance).to_owned(),
-            verified: false,
-        }));
-    out.members.sort_by_key(Row::key);
-    out.coverage.sort_by_key(Row::key);
-    out.crypt.sort_by_key(Row::key);
-    out.parts.sort_by_key(Row::key);
-    out
 }
 
 #[test]

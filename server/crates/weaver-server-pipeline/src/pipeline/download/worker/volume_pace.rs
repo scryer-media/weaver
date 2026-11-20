@@ -100,7 +100,7 @@ pub fn volume_intake(counted_bytes: u64, limits: VolumeLimits) -> VolumeIntake {
 // The state of a volume as it stands: what it counts, against the limit
 // leases stop at (`VolumeLeases::lease_limit`). A volume that counts nothing is
 // open whatever its limit, for the one article it grants then.
-pub(in crate::pipeline) fn intake_of(volume: &Volume) -> VolumeIntake {
+pub fn intake_of(volume: &Volume) -> VolumeIntake {
     let (soft_bytes, _) = volume.buffer_limits();
     let counted = volume.unwritten_bytes();
     if counted == 0 {

@@ -11,6 +11,7 @@ use weaver_graph::{
     Delivery, Emit, Extent, Kind, Located, Object, ObjectId, Pull, RecoveryKind, Seek,
 };
 
+use super::hooks::*;
 use super::*;
 use crate::pipeline::graph::lines::Lines;
 
@@ -26,45 +27,11 @@ mod streams;
 mod threads;
 mod verification;
 mod windows;
-
 thread_local! {
-    // How many members a pass over the holds asked what is held of them.
-    pub(super) static RELEASE_ASKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    // How many held ranges a pass asked their object to place.
-    pub(crate) static RELEASE_LOCATED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    // How many passes over the holds are running, and the most that ran
-    // at once.
-    pub(super) static RELEASE_DEPTH: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
-    // The most bytes one read took back from a spill file.
-    pub(super) static SPILL_READ_MOST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    // The most bytes one read of a lent repair took from a scratch file.
-    pub(super) static SCRATCH_READ_MOST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static STORE_DELIVERIES: std::cell::RefCell<Option<Vec<(ByteRange, Provenance)>>> = const { std::cell::RefCell::new(None) };
     // Each delivery the pretend 7z store heard, with the CRC32 its bytes
     // came proven by, when every byte of them was.
     static LATE_HEARD: std::cell::RefCell<Vec<(ByteRange, Option<u64>)>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-// One pass over the holds, counted in `RELEASE_DEPTH` while it runs.
-pub(super) struct ReleasePass;
-
-impl ReleasePass {
-    pub(super) fn enter() -> Self {
-        RELEASE_DEPTH.with(|depth| {
-            let (now, most) = depth.get();
-            depth.set((now + 1, most.max(now + 1)));
-        });
-        Self
-    }
-}
-
-impl Drop for ReleasePass {
-    fn drop(&mut self) {
-        RELEASE_DEPTH.with(|depth| {
-            let (now, most) = depth.get();
-            depth.set((now - 1, most));
-        });
-    }
 }
 
 const SIGNATURE: &[u8] = b"Rar!\x1a\x07\x00";

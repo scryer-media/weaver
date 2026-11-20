@@ -25,7 +25,7 @@ const EVIDENCE_PERCENT: u64 = 10;
 const PARTIAL_NAMED: usize = 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Claim {
+pub enum Claim {
     // Whole: closed at its length, every byte clean.
     Complete,
     // Every byte is accounted for and some of it is damaged. Delivered as
@@ -38,7 +38,7 @@ pub(crate) enum Claim {
 impl Claim {
     // Only a whole member is usable: one covered and clean that nothing
     // closed, neither its producer nor a set's proof, was never checked.
-    pub(crate) fn of(member: &Member) -> Self {
+    pub fn of(member: &Member) -> Self {
         let damaged = damaged_bytes(member);
         match member.length {
             Some(_) if member.is_whole() => Self::Complete,
@@ -54,25 +54,25 @@ impl Claim {
 
 // One payload member as the job's census reads it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ClaimedMember {
+pub struct ClaimedMember {
     pub(crate) member: MemberId,
-    pub(crate) name: String,
+    pub name: String,
     pub(crate) claim: Claim,
     // The member's articles that reached a terminal state without arriving.
     pub(crate) lost_articles: usize,
     // The bytes the post declared for those articles: what the terminal
     // record counts as failed, in the unit the job's size is declared in.
-    pub(crate) lost_bytes: u64,
+    pub lost_bytes: u64,
     pub(crate) declared_bytes: u64,
     // A member whose absence never fails a job, such as a text file beside
     // the payload.
     pub(crate) furniture: bool,
     // At least a tenth of the member arrived undamaged.
-    pub(crate) evidence: bool,
+    pub evidence: bool,
 }
 
 impl ClaimedMember {
-    pub(crate) fn read(member: &Member, furniture: bool) -> Self {
+    pub fn read(member: &Member, furniture: bool) -> Self {
         let delivered = member
             .coverage
             .bytes_covered()
@@ -100,7 +100,7 @@ impl ClaimedMember {
     // later article made it whole. A damaged one owes its damaged bytes as
     // well as its lost ones; a lost span read on past as damage is counted
     // once.
-    pub(crate) fn failed_bytes(&self) -> u64 {
+    pub fn failed_bytes(&self) -> u64 {
         match self.claim {
             Claim::Complete => 0,
             Claim::Damaged { bytes } => self.lost_bytes.max(bytes),
@@ -114,10 +114,7 @@ impl ClaimedMember {
 // payload arrived either, and no file of the delivery is whole at any
 // depth; beside a delivered sibling it is ordinary damage and ships as it
 // stands.
-pub(crate) fn refused<'c>(
-    census: &'c [ClaimedMember],
-    delivery: &Delivery,
-) -> Vec<&'c ClaimedMember> {
+pub fn refused<'c>(census: &'c [ClaimedMember], delivery: &Delivery) -> Vec<&'c ClaimedMember> {
     let payload = || census.iter().filter(|row| !row.furniture);
     // Furniture delivered whole beside the payload is no delivery of it.
     let furniture: BTreeSet<&str> = census
@@ -164,7 +161,7 @@ pub struct Delivery {
     pub damaged: Vec<String>,
     // Posted files that never arrived under names that say nothing of what
     // they were: short unless a set extracted whole beside them.
-    pub(crate) unnamed: Vec<String>,
+    pub unnamed: Vec<String>,
     // Not whole, in a namespace a recovery set vouched for, and described
     // by none of its sets: nothing checks them, as SABnzbd checks only
     // what a set describes. With them, a whole volume a vouching set proved
@@ -178,19 +175,19 @@ pub struct Delivery {
     pub withheld: Vec<(String, Why)>,
     // Left out of the delivery for an unwanted extension
     // (`remove_unwanted`): no file of it, whole or short.
-    pub(crate) removed: Vec<String>,
+    pub removed: Vec<String>,
     // Every file delivered, whole or as it stands, as the walk met it.
     pub files: Vec<Delivered>,
     // The job was given a password to try, as its candidates say
     // (`GraphJob::has_passwords`): a member withheld for a password then
     // needs one that none given opens, not one never given.
-    pub(crate) password_given: bool,
+    pub password_given: bool,
 }
 
 // What the recovery sets of a member's namespace say of it, the one answer
 // the walk reads for every member it meets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Described {
+pub enum Described {
     // A set whose repair failed covers it, or recovery the post carried for
     // its namespace could not be used: what is short of it is unrepaired.
     Unrepaired,
@@ -225,7 +222,7 @@ pub enum Unarrived {
 pub struct Delivered {
     pub name: String,
     // The name the member wanted before the tree placed it.
-    pub(crate) from: String,
+    pub from: String,
     pub depth: u32,
     pub whole: bool,
     // The CRC32 its object's headers state for its bytes, when they do.
@@ -242,7 +239,7 @@ impl Delivery {
     // (`Described`). `refused` says why a member is a leaf, and `unarrived`
     // what a posted file that is not whole was, when none of its bytes
     // arrived.
-    pub(crate) fn read(
+    pub fn read(
         tree: &Tree,
         payload: impl Fn(MemberId) -> bool,
         furniture: impl Fn(&str) -> bool,
@@ -357,7 +354,7 @@ impl Delivery {
     // unwanted extension the policy deletes: each is `removed`, whole or
     // short, and no longer a file the delivery hands over. One pass over
     // what the walk found, a name judged once.
-    pub(crate) fn remove_unwanted(&mut self, removes: impl Fn(&str) -> bool) {
+    pub fn remove_unwanted(&mut self, removes: impl Fn(&str) -> bool) {
         let mut out: BTreeSet<String> = BTreeSet::new();
         self.files.retain(|file| {
             let removed = removes(&file.name);
@@ -391,7 +388,7 @@ impl Delivery {
 
     // What the policy left out, worded as the job's reason. `None` when
     // nothing was.
-    pub(crate) fn removed_error(&self) -> Option<String> {
+    pub fn removed_error(&self) -> Option<String> {
         crate::post_processing::model::unwanted_files_removed_reason(&self.removed)
     }
 
@@ -408,7 +405,7 @@ impl Delivery {
     // walk met it. A password withheld something, and the error opens with
     // the marker integrations read a password failure by. `None` when
     // nothing was.
-    pub(crate) fn withheld_error(&self) -> Option<String> {
+    pub fn withheld_error(&self) -> Option<String> {
         let marker = if self
             .withheld
             .iter()
@@ -510,7 +507,7 @@ impl Delivery {
     // covers, whether or not it bound a member it could name short, or
     // when a file is short because such an object covers it; otherwise the
     // engine that read it short.
-    pub(crate) fn shortfall_stage(&self, failure: Option<&Failure>) -> PipelineFailureStage {
+    pub fn shortfall_stage(&self, failure: Option<&Failure>) -> PipelineFailureStage {
         let ruled = failure.is_some_and(|failure| !failure.objects.is_empty());
         if ruled || !self.unrepaired.is_empty() {
             PipelineFailureStage::Repair

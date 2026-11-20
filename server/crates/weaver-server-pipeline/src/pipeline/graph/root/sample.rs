@@ -193,7 +193,7 @@ pub(crate) fn bootstrap(
     leading.at = Some(root.generation());
     leading.undecided = tree.undecided(NodeId::ROOT).next().is_some();
     let bids = leading_bids(tree, &leading.sets, &mut leading.unbound);
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     assert_eq!(bids, reference_bids(tree, map), "the bootstrap's bids");
     for bid in bids {
         window.bid(bid);
@@ -235,7 +235,7 @@ fn leading_bids(
 
 // The bids a walk of every waiting volume makes, which the filed sets must
 // match after every round.
-#[cfg(test)]
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub(crate) fn reference_bids(tree: &Tree, map: &ArticleMap) -> Vec<Bid> {
     let Some(root) = tree.namespace(NodeId::ROOT) else {
         return Vec::new();

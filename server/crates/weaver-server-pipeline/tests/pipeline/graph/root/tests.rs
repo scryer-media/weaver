@@ -39,12 +39,9 @@ use weaver_graph::recovery::RepairOutcome;
 use weaver_server_base::jobs::ids::{JobId, SegmentId};
 use weaver_server_disk::operations::disk::CapacityReader;
 
-const ZIP_FRONT: &[u8] = b"PK\x03\x04";
+use super::hooks::{SEEK_CALLS, SEEK_MAPPED};
 
-thread_local! {
-    pub(super) static SEEK_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    pub(super) static SEEK_MAPPED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
+const ZIP_FRONT: &[u8] = b"PK\x03\x04";
 
 // A stand-in for a format's object: it asks for what it was told to until
 // it is answered, and remembers the answers.

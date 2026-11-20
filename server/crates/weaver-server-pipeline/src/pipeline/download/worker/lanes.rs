@@ -111,7 +111,7 @@ impl Pipeline {
     // Every path that retires a segment comes through here, including the ones
     // with no wire outcome at all (see the foreign-layout breaker). Returns
     // whether this call is the edge.
-    pub(in crate::pipeline) fn book_terminal_segment(
+    pub fn book_terminal_segment(
         &mut self,
         seg_id: SegmentId,
         terminal_state: SegmentTerminalState,
@@ -343,9 +343,7 @@ impl Pipeline {
         }
     }
 
-    pub(in crate::pipeline) fn activation_items(
-        lease: &DownloadBatchLease,
-    ) -> Vec<(SegmentId, NzbFileId, u64)> {
+    pub fn activation_items(lease: &DownloadBatchLease) -> Vec<(SegmentId, NzbFileId, u64)> {
         lease
             .works
             .iter()

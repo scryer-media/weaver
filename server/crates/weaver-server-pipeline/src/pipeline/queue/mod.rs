@@ -25,17 +25,18 @@ mod intents;
 pub(crate) mod order;
 pub mod paging;
 pub use admission::destination_roots;
+pub use admission::staging_dir_for;
 pub(crate) use admission::{
     AdmissionResources, PreparedAdd, RestartAdmission, destination_root, make_staging_dir,
-    outline_read, staging_dir_for, staging_dir_on,
+    outline_read, staging_dir_on,
 };
-#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+#[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
 pub(crate) use counters::COUNTER_SAMPLES;
-#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+#[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
 pub(crate) use history::FAILED_SWEEP_PAGE;
-#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+#[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
 pub(crate) use history::SweepPlaces;
-#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+#[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
 pub(crate) use history::between_sweeps;
 pub(crate) use history::{MoveOut, clear_left_working_dirs, clear_restart_artifacts};
 
@@ -49,7 +50,7 @@ pub struct Queue {
     // The actor's word on whether anything is there for a periodic driver
     // to move. The counters ticker waits on it while it says no.
     drive: watch::Sender<bool>,
-    pub(crate) resources: std::sync::OnceLock<AdmissionResources>,
+    pub resources: std::sync::OnceLock<AdmissionResources>,
     pub(crate) closed: std::sync::atomic::AtomicBool,
     ticker_started: std::sync::atomic::AtomicBool,
     pub(crate) counters: Arc<TransferCounters>,
@@ -119,7 +120,7 @@ pub struct QueueInner {
     // debug; a sweep that removes them, an admission and a history delete
     // take them out. Bounded by the failed jobs whose files are stuck.
     pub(crate) sweep_warned: std::collections::HashSet<JobId>,
-    pub(crate) pending_cleanup: PendingCleanup,
+    pub pending_cleanup: PendingCleanup,
     // The jobs a move of a working folder is out for, counted: the move to
     // the intermediate folder set now, and the removal of a folder such a
     // move claimed for a job that left. Nothing else removes or makes the
@@ -167,7 +168,7 @@ impl PendingCleanup {
         self.0.contains_key(id)
     }
 
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) fn folders_held(&self, id: &JobId) -> bool {
         self.0
             .get(id)
@@ -713,7 +714,7 @@ impl Queue {
         read(&self.inner.lock().expect("queue lock poisoned"))
     }
 
-    pub(crate) fn history(&self) -> Arc<[JobInfo]> {
+    pub fn history(&self) -> Arc<[JobInfo]> {
         self.history.read().expect("history lock poisoned").clone()
     }
 

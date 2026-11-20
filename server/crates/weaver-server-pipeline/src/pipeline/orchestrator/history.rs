@@ -4,7 +4,7 @@
 use super::*;
 
 impl Pipeline {
-    pub(crate) fn purge_terminal_job_runtime(&mut self, job_id: JobId) {
+    pub fn purge_terminal_job_runtime(&mut self, job_id: JobId) {
         self.queue_scripts_completed.remove(&job_id);
         self.added_script_holds.remove(&job_id);
         self.release_job_articles(job_id);
@@ -43,11 +43,7 @@ impl Pipeline {
     // archive has committed. Terminal events are routed through here so every
     // caller keeps the same guarantee: a subscriber that observes the event can
     // immediately read the row back from the history facade.
-    pub(crate) fn record_job_history(
-        &mut self,
-        job_id: JobId,
-        terminal_event: Option<PipelineEvent>,
-    ) {
+    pub fn record_job_history(&mut self, job_id: JobId, terminal_event: Option<PipelineEvent>) {
         if !self.jobs.get(&job_id).is_some_and(|state| {
             matches!(
                 state.status,

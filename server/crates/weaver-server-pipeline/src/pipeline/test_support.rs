@@ -28,9 +28,9 @@ pub async fn idle_pipeline(
     let (events, _) = broadcast::channel(1024);
     let state = crate::SharedPipelineState::new(PipelineMetrics::new(), vec![]);
     let handle = crate::SchedulerHandle::new(events.clone(), state.clone());
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     let writers = crate::pipeline::graph::disk::threads::writers();
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "pipeline-test-fixtures")))]
     let writers = std::sync::Arc::new(crate::operations::VolumeWriters::new());
     let pipeline = Pipeline::new(
         events,

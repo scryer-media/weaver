@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use std::cell::RefCell;
 use std::sync::Arc;
 
 use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
@@ -21,12 +20,7 @@ use crate::pipeline::tests::engines::loans::{
 };
 use weaver_server_disk::operations::disk::CapacityReader;
 
-thread_local! {
-    // The namespaces the walk asked to rule, in the order it asked.
-    pub(super) static RULED: RefCell<Vec<NodeId>> = const { RefCell::new(Vec::new()) };
-    // The root members a seal pass asked whether the sets proved them.
-    pub(super) static SEAL_ASKED: RefCell<Vec<MemberId>> = const { RefCell::new(Vec::new()) };
-}
+use super::hooks::{RULED, SEAL_ASKED};
 
 // What `archives` built: the job, the directory its files are in, and the
 // plain file's bytes.

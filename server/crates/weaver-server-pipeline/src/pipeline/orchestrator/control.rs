@@ -31,7 +31,7 @@ impl Pipeline {
     // batch with more behind it, like a slot write that failed, is left for
     // the caller's next turn.
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) async fn apply_queue_intents(&mut self) {
+    pub async fn apply_queue_intents(&mut self) {
         loop {
             self.run_queue_intents().await;
             let mut walk_again = false;

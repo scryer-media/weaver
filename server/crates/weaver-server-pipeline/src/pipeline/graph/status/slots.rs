@@ -31,7 +31,7 @@ impl Default for RepairSlots {
 impl RepairSlots {
     // The asker's slot, if it has or gets one. The limit is set on every
     // ask so a tuning change applies to the next admission.
-    pub(crate) fn admit(&mut self, asker: AskerId, limit: usize) -> Option<Ticket> {
+    pub fn admit(&mut self, asker: AskerId, limit: usize) -> Option<Ticket> {
         let admissions = self.slots.set_limit(limit);
         self.note(admissions);
         if let Some(ticket) = self.tickets.remove(&asker) {

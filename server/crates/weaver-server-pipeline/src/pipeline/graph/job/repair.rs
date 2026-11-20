@@ -63,7 +63,7 @@ impl GraphJob {
     // loan comes to is read back through the objects its set covers, so
     // they stay home until it returns, and its return lends them. Under no
     // slot nothing is lent or done.
-    pub(crate) fn lend_work(&mut self, limit: usize) -> Result<(), GraphError> {
+    pub fn lend_work(&mut self, limit: usize) -> Result<(), GraphError> {
         let admit = self.works.admit();
         if limit == 0
             || self.writer.disk_held()
@@ -159,8 +159,8 @@ impl GraphJob {
             if !self.tree.is_live(node) {
                 continue;
             }
-            #[cfg(test)]
-            tests::RULED.with_borrow_mut(|ruled| ruled.push(node));
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+            hooks::RULED.with_borrow_mut(|ruled| ruled.push(node));
             let runs = &self.runs;
             let mut lending = self
                 .loans
@@ -260,8 +260,8 @@ impl GraphJob {
                 namespace.get(*member).is_some() && namespace.copy_of(*member).is_none()
             })
             .filter(|member| {
-                #[cfg(test)]
-                tests::SEAL_ASKED.with_borrow_mut(|asked| asked.push(*member));
+                #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+                hooks::SEAL_ASKED.with_borrow_mut(|asked| asked.push(*member));
                 writer.proven_whole(tree, (NodeId::ROOT, &sets), *member)
             })
             .collect();
@@ -377,7 +377,7 @@ impl GraphJob {
         self.writer.watch().ask(asked, tell);
     }
 
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) fn watch(&self) -> &crate::pipeline::graph::envelope::Watch {
         self.writer.watch()
     }
@@ -549,12 +549,12 @@ impl GraphJob {
     }
 
     // A test may hold the job to the one turn every give-up took before.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     fn one_turn_held(&self) -> bool {
         self.one_turn
     }
 
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "pipeline-test-fixtures")))]
     fn one_turn_held(&self) -> bool {
         false
     }
@@ -625,6 +625,19 @@ pub(super) struct Quieting {
     admitted: Vec<NodeId>,
 }
 
-#[cfg(test)]
-#[path = "repair_tests.rs"]
-pub(super) mod tests;
+// What the repair walk asked, for its tests compiled apart in
+// tests/pipeline_graph.rs.
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+#[doc(hidden)]
+pub mod hooks {
+    use std::cell::RefCell;
+
+    use weaver_graph::{MemberId, NodeId};
+
+    thread_local! {
+        // The namespaces the walk asked to rule, in the order it asked.
+        pub static RULED: RefCell<Vec<NodeId>> = const { RefCell::new(Vec::new()) };
+        // The root members a seal pass asked whether the sets proved them.
+        pub static SEAL_ASKED: RefCell<Vec<MemberId>> = const { RefCell::new(Vec::new()) };
+    }
+}

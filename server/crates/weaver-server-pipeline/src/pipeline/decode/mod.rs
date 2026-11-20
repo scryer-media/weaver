@@ -14,7 +14,7 @@ pub(super) mod units {
     }
 }
 mod worker;
-#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+#[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
 pub(in crate::pipeline) use worker::SegmentWriteError;
 
 // In-flight decode task count per job, with their sum kept beside them so the
@@ -92,7 +92,7 @@ impl ActiveDecodes {
         self.by_job.values()
     }
 
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(in crate::pipeline) fn walks(&self) -> u64 {
         self.walks.load(std::sync::atomic::Ordering::Relaxed)
     }

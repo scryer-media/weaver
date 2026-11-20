@@ -4,26 +4,26 @@
 use crate::jobs::persistence::JobsPersistenceQueries;
 use crate::jobs::queries::JobsQueries;
 use crate::settings::archive_passwords::SettingsArchivePasswordsInternalQueries;
-mod activation;
+pub mod activation;
 pub(crate) use activation::read_stored_spec_and_passwords;
 pub(crate) use completion::finalize::{ActiveRuntimeValues, RestoredPostProcessing};
 pub mod archive;
 mod capacity;
-mod completion;
+pub mod completion;
 pub use completion::finalize::claim_complete_destination_path;
 mod db_reply;
 mod decode;
 pub mod diagnostics;
 pub mod download;
-mod extraction;
-mod full_disk;
+pub mod extraction;
+pub mod full_disk;
 pub mod graph;
-mod health;
-pub(crate) mod held;
+pub mod health;
+pub mod held;
 mod infrastructure_retry;
 mod next_up;
 mod nzb_admission;
-mod orchestrator;
+pub mod orchestrator;
 pub(crate) mod post_health;
 mod progress;
 pub mod queue;
@@ -91,7 +91,7 @@ use bytes::Bytes;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
-#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+#[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
 use crate::RestoreJobRequest;
 use crate::jobs::{ArchivePasswordCandidate, ArchivePasswordSource};
 use crate::jobs::{JobPhase, PhaseCounters};
@@ -100,15 +100,15 @@ use crate::{
     JobState, JobStatus, NntpRuntimeActivation, PipelineMetrics, RuntimeTuner, SharedPipelineState,
     TokenBucket,
 };
-#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+#[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
 use par2_rs::checksum;
 use weaver_nntp::NntpClient;
-use weaver_server_base::events::model::PipelineEvent;
+pub use weaver_server_base::events::model::PipelineEvent;
 use weaver_server_base::jobs::ids::{JobId, NzbFileId, SegmentId};
 use weaver_server_base::runtime::system_profile::SystemProfile;
 
 use self::download::{DownloadLaneMode, DownloadLaneRuntimeState, LaneParkReason};
-pub(crate) use self::extraction::ExtractionError;
+pub use self::extraction::ExtractionError;
 use self::extraction::ProcessMemoryBudget;
 pub(crate) use self::extraction::safety::ProcessMemoryPermit;
 pub use weaver_server_disk::pipeline::extraction::safety::ExtractionLimits;
@@ -249,7 +249,7 @@ pub fn assemble_archive_password_candidates(
 // supplied with the job, then its persisted NZB's, and whether the NZB's
 // parse succeeded (`harvested`). A missing row is an empty list; a row that
 // did not load is the loader's error.
-pub(crate) fn read_job_password_candidates(
+pub fn read_job_password_candidates(
     db: &crate::Database,
     job_id: JobId,
 ) -> Result<(Vec<ArchivePasswordCandidate>, bool), crate::LoadError> {
@@ -560,14 +560,14 @@ impl RetryWork {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct DownloadWaitStatus {
-    pub(super) reason: &'static str,
-    pub(super) retry_at_epoch_ms: Option<f64>,
-    pub(super) pending_count: usize,
+pub struct DownloadWaitStatus {
+    pub reason: &'static str,
+    pub retry_at_epoch_ms: Option<f64>,
+    pub pending_count: usize,
     // The servers the article parked last under this wait excludes, so a
     // job whose refused article waits out its retry names the servers that
     // article waits on without walking the retry queue.
-    pub(super) exclude_servers: weaver_nntp::ServerSet,
+    pub exclude_servers: weaver_nntp::ServerSet,
 }
 
 #[derive(Debug, Clone)]
@@ -675,7 +675,7 @@ impl DownloadFailureKind {
 }
 
 // The wait an article refused for the login records for its one-second retry.
-pub(in crate::pipeline) const AUTH_WAIT_REASON: &str = "NNTP authentication blocked";
+pub const AUTH_WAIT_REASON: &str = "NNTP authentication blocked";
 
 // What a refusal for want of a selected group (412) says about the article.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -860,7 +860,7 @@ impl DownloadError {
         Self::Local { raw_size: 0, error }
     }
 
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(super) fn fetch(kind: DownloadFailureKind, message: impl Into<String>) -> Self {
         Self::Fetch(DownloadFailure::new(kind, message))
     }
@@ -928,16 +928,16 @@ pub(super) struct PendingDecodeWork {
 // Native outcomes share the existing repair completion queue. Dispatch occurs
 // once per operation; block reads and native evidence stay format-specific.
 #[derive(Debug)]
-pub(super) struct MoveToCompleteResult {
-    pub(super) moved_entries: u32,
+pub struct MoveToCompleteResult {
+    pub moved_entries: u32,
     // Delivered files the deobfuscation pass renamed on the way out.
-    pub(super) renamed_members: Vec<crate::ingest::FileRename>,
+    pub renamed_members: Vec<crate::ingest::FileRename>,
 }
 
 // A final-move refusal that must never enter terminal post-processing versus
 // an ordinary move failure, whose legacy script handling remains intact.
 #[derive(Debug)]
-pub(super) enum MoveToCompleteFailure {
+pub enum MoveToCompleteFailure {
     Security(String),
     Operational(String),
     // The row that says the move began could not be written for want of
@@ -974,18 +974,18 @@ impl std::fmt::Display for MoveToCompleteFailure {
 
 // A failed job's working directory, released off the actor: its history
 // is recorded once this comes back.
-pub(super) struct FailedJobReleased {
+pub struct FailedJobReleased {
     pub(super) job_id: JobId,
     pub(super) error: String,
 }
 
-pub(super) struct MoveToCompleteDone {
+pub struct MoveToCompleteDone {
     pub(super) job_id: JobId,
     pub(super) dest: PathBuf,
-    pub(super) result: Result<MoveToCompleteResult, MoveToCompleteFailure>,
+    pub result: Result<MoveToCompleteResult, MoveToCompleteFailure>,
 }
 
-pub(super) enum TerminalPostProcessingEvent {
+pub enum TerminalPostProcessingEvent {
     ScriptsAdmitted(TerminalScriptsAdmitted),
     QueueAdmitted(JobId),
     QueueDone(JobId, Result<(), crate::StateError>),
@@ -997,7 +997,7 @@ pub(super) enum TerminalPostProcessingEvent {
 
 // What the script settings said when a job's terminal pass began: read off
 // the actor, so the turn that hears a move finish reads no setting itself.
-pub(super) struct TerminalScriptsAdmitted {
+pub struct TerminalScriptsAdmitted {
     pub(super) job_id: JobId,
     pub(super) facts: crate::post_processing::model::PostProcessingFacts,
     pub(super) primary_failure: Option<String>,
@@ -1010,7 +1010,7 @@ pub(super) struct TerminalScriptsAdmitted {
     pub(super) queue_events_may_hold: bool,
 }
 
-pub(super) struct TerminalPostProcessingDone {
+pub struct TerminalPostProcessingDone {
     pub(super) job_id: JobId,
     pub(super) primary_failure: Option<String>,
     pub(super) result: Result<
@@ -1071,7 +1071,7 @@ pub(super) fn yenc_truncation_suspected(result: &weaver_yenc::DecodeResult) -> b
 // that. A uuencode article declares neither, so several stages that are
 // correct for yEnc are unsound for uuencode and gate on this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum SegmentEncoding {
+pub enum SegmentEncoding {
     // yEnc: per-part offsets and CRC, block-aligned CRC segments.
     Yenc,
     // uuencode: decoded bytes and a segment index, nothing more.
@@ -1080,7 +1080,7 @@ pub(super) enum SegmentEncoding {
 
 // The only things a uuencode article establishes beyond its bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct UuSegmentFacts {
+pub struct UuSegmentFacts {
     // A line in this part failed to decode. Its bytes are kept regardless —
     // PAR2 adjudicates, not the decoder — but the file is no longer clean.
     pub(super) damaged: bool,
@@ -1321,30 +1321,30 @@ impl Pipeline {
 
 // Result of a decode task.
 pub struct DecodeResult {
-    pub(super) segment_id: SegmentId,
-    pub(super) raw_size: u64,
+    pub segment_id: SegmentId,
+    pub raw_size: u64,
     // How the article was encoded. Everything below that reads like a
     // declared placement or a checksum is meaningful only for
     // [`SegmentEncoding::Yenc`].
-    pub(super) encoding: SegmentEncoding,
-    pub(super) yenc_layout: YencLayoutAssertions,
-    pub(super) crc_valid: bool,
+    pub encoding: SegmentEncoding,
+    pub yenc_layout: YencLayoutAssertions,
+    pub crc_valid: bool,
     // Evidence the body was cut short, with no checksum to say so. Such an
     // article is written but never counted as coverage: another server is
     // asked for it first. See [`yenc_truncation_suspected`].
-    pub(super) truncation_suspected: bool,
-    pub(super) part_crc_verified: bool,
-    pub(super) part_crc: u32,
-    pub(super) expected_file_crc: Option<u32>,
-    pub(super) data: DecodedChunk,
+    pub truncation_suspected: bool,
+    pub part_crc_verified: bool,
+    pub part_crc: u32,
+    pub expected_file_crc: Option<u32>,
+    pub data: DecodedChunk,
     // Original filename from the yEnc header (for swap detection observability).
-    pub(super) yenc_name: String,
+    pub yenc_name: String,
     // Geometry actually applied by the decoder for this response.
-    pub(super) checkpoint_plan: weaver_yenc::CheckpointPlan,
+    pub checkpoint_plan: weaver_yenc::CheckpointPlan,
     // The decode pass's CRC32 segments, cut at PAR2 block boundaries when the
     // recovery set's block size was known to the decoder. [`Self::part_crc`] is
     // their fold, so they add evidence without changing any verdict.
-    pub(super) segments: Vec<weaver_yenc::Segment>,
+    pub segments: Vec<weaver_yenc::Segment>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1362,14 +1362,14 @@ pub struct YencLayoutAssertions {
 // only through the map from its own: a body fetched before a rebuild and
 // decoded after it cannot pass old indices off as current ones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PoolServers {
+pub struct PoolServers {
     generation: u64,
     source: Option<usize>,
     excluded: weaver_nntp::ServerSet,
 }
 
 impl PoolServers {
-    pub(in crate::pipeline) fn stamped(
+    pub fn stamped(
         generation: u64,
         source: Option<usize>,
         excluded: weaver_nntp::ServerSet,
@@ -1488,8 +1488,8 @@ impl PoolLayouts {
 }
 
 #[derive(Debug)]
-pub(super) struct SegmentSource {
-    pub(in crate::pipeline) servers: PoolServers,
+pub struct SegmentSource {
+    pub servers: PoolServers,
 }
 
 // Completion of a decode task, including explicit failures so backlog
@@ -1509,7 +1509,7 @@ pub(super) enum DecodeDone {
     },
 }
 
-pub(super) enum DecodedChunk {
+pub enum DecodedChunk {
     Contiguous(Bytes),
     Batches { chunks: Vec<Bytes>, len: usize },
     Shared(Arc<download::repeated::SharedArticle>),
@@ -1655,11 +1655,11 @@ pub enum SegmentTerminalState {
 // from the live wire counters, which know only what the download layer saw and
 // nothing about what repair, verification or a discard did with it afterwards.
 #[derive(Debug, Clone, Default)]
-pub(in crate::pipeline) struct TerminalReconciliation {
+pub struct TerminalReconciliation {
     // Declared bytes of the delivered files that really are short.
-    pub(in crate::pipeline) failed_bytes: u64,
+    pub failed_bytes: u64,
     // Health over the delivered files alone, 0-1000.
-    pub(in crate::pipeline) health: u32,
+    pub health: u32,
     // Files that left the accounting, and why.
     pub(in crate::pipeline) discards: Vec<crate::jobs::model::TerminalDiscard>,
 }
@@ -1690,29 +1690,29 @@ impl RenameRetry {
 pub struct Pipeline {
     _control_runtime: queue::RuntimeGuard,
     // Broadcasts pipeline events to subscribers (API, journal, etc).
-    pub(super) event_tx: broadcast::Sender<PipelineEvent>,
+    pub event_tx: broadcast::Sender<PipelineEvent>,
     // NNTP client for fetching articles.
-    pub(super) nntp: Arc<NntpClient>,
+    pub nntp: Arc<NntpClient>,
     // Runtime tuner for adaptive concurrency.
-    pub(super) tuner: RuntimeTuner,
+    pub tuner: RuntimeTuner,
     // The operator's hardware profile, or the recommendation standing in
     // for one never chosen. In force whenever no schedule rule is.
-    pub(super) configured_hardware_profile: crate::runtime::HardwareProfile,
+    pub configured_hardware_profile: crate::runtime::HardwareProfile,
     // The profile the schedule has in force over the operator's choice, as
     // the schedule asked for it. It governs only while this machine can
     // honour it.
     pub(super) scheduled_hardware_profile: Option<crate::runtime::HardwareProfile>,
     // Shared atomic metrics.
-    pub(super) metrics: Arc<PipelineMetrics>,
+    pub metrics: Arc<PipelineMetrics>,
     // Per-job state.
-    pub(super) jobs: HashMap<JobId, JobState>,
+    pub jobs: HashMap<JobId, JobState>,
     // The graph runtime of each job holding its articles, given when they
     // are built.
-    pub(super) graph_jobs: scan_inputs::GraphJobs,
+    pub graph_jobs: scan_inputs::GraphJobs,
     // The graph runtimes of jobs that dropped their articles while something
     // of them was still out on a thread: each is stopped, and kept only until
     // the last of its mail is heard.
-    pub(super) retiring_graph_jobs: HashMap<JobId, graph::job::GraphJob>,
+    pub retiring_graph_jobs: HashMap<JobId, graph::job::GraphJob>,
     // The jobs whose working directory an activation is moving under the
     // intermediate folder, each with that activation's number. No other
     // activation is sent for one until that reply is heard, so one move at a
@@ -1721,17 +1721,17 @@ pub struct Pipeline {
     pub(super) moving_jobs: HashMap<JobId, (u64, Arc<activation::MoveWatch>)>,
     // The repair slots graph jobs share, and what each job's recovery
     // objects said when it last advanced.
-    pub(super) graph_status: graph::status::GraphStatus,
+    pub graph_status: graph::status::GraphStatus,
     // The holds accountant every graph job's namespaces share, so the
     // budgets bound the process, not each job.
-    pub(super) graph_holds: Arc<weaver_graph::holds::HoldsAccountant>,
+    pub graph_holds: Arc<weaver_graph::holds::HoldsAccountant>,
     // The decode pool every graph job's engine runs share, apart from the
     // holds, sized to the hardware profile in force.
-    pub(super) graph_decode: Arc<graph::engine::DecodePool>,
+    pub graph_decode: Arc<graph::engine::DecodePool>,
     // Where the engines graph jobs run say what they found.
-    pub(super) graph_runs: graph::engine::RunMail,
+    pub graph_runs: graph::engine::RunMail,
     // The jobs outside the pipeline whose runs speak on that mail too.
-    pub(super) graph_outside: Arc<graph::engine::Outside>,
+    pub graph_outside: Arc<graph::engine::Outside>,
     // Where a test hears the turn stamp as the select arm handling graph mail
     // left it, so the stamp of a turn woken by that mail can be pinned.
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
@@ -1743,7 +1743,7 @@ pub struct Pipeline {
     // Each graph job's health probe, and where its rounds say what they
     // found.
     pub(super) post_probes: post_health::Probes,
-    pub(crate) nzb_admitted: HashSet<JobId>,
+    pub nzb_admitted: HashSet<JobId>,
     pub(crate) nzb_seen: HashSet<JobId>,
     // The jobs whose rows ask for their folder to be renamed, each with its
     // backoff after a failed rename.
@@ -1836,7 +1836,7 @@ pub struct Pipeline {
     // which measured as a median 340 ms and a worst case of 2.3 s before the
     // freed connection was handed back out. Setting this makes the park
     // itself the wake, with no timer to poll.
-    pub(super) download_dispatch_wake: bool,
+    pub download_dispatch_wake: bool,
     // The graph jobs that wait for room on a disk, which a reading of a disk
     // anyone waits on wakes in the order they began to wait.
     pub(super) disk_waiting: std::collections::BTreeSet<JobId>,
@@ -1889,7 +1889,7 @@ pub struct Pipeline {
     // In-flight article download count per job.
     pub(super) articles_in_flight_by_job: HashMap<JobId, usize>,
     // In-flight NNTP connection task count per job.
-    pub(super) active_download_connections_by_job: HashMap<JobId, usize>,
+    pub active_download_connections_by_job: HashMap<JobId, usize>,
     // Completion-critical connection lanes per job. Kept separately from
     // article counts because pipelined lanes can carry several articles.
     pub(super) active_completion_critical_connections_by_job: HashMap<JobId, usize>,
@@ -1912,7 +1912,7 @@ pub struct Pipeline {
     // connection it is fetched on would otherwise retry forever — and, as the
     // highest-priority work, be every recovery probe of its server.
     pub(super) transport_failure_streaks: HashMap<SegmentId, TransportFailureStreak>,
-    pub(super) download_wait_by_job: HashMap<JobId, DownloadWaitStatus>,
+    pub download_wait_by_job: HashMap<JobId, DownloadWaitStatus>,
     // The one terminal state each segment reached, and the only thing the
     // per-job failed-byte ledger is derived from.
     pub(in crate::pipeline) segment_terminal_states: HashMap<SegmentId, SegmentTerminalState>,
@@ -1921,7 +1921,7 @@ pub struct Pipeline {
     pub(in crate::pipeline) given_up: HashMap<JobId, post_health::GivenUp>,
     // What the claim census concluded for a job on its way out, keyed until
     // the terminal record has been written from it.
-    pub(in crate::pipeline) terminal_reconciliations: HashMap<JobId, TerminalReconciliation>,
+    pub terminal_reconciliations: HashMap<JobId, TerminalReconciliation>,
     // Files already counted into `weaver_files_missing_total`. A completion
     // check re-enters many times per job; this keeps the counter per-file
     // rather than per-check. Per-file, so the set is bounded by the job's
@@ -1949,16 +1949,16 @@ pub struct Pipeline {
     // Forces the PAR2 ignore-extension list for a test, so the "override
     // disables it" case can be exercised without mutating a process-global
     // environment variable while other tests are running.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(super) par2_ignore_extensions_override: Option<Vec<String>>,
     // Undecoded article bodies waiting for a decode slot. Only tests hand
     // the pipeline an undecoded body; the download lanes decode inline.
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(super) pending_decode: VecDeque<PendingDecodeWork>,
     // Jobs that should re-enter completion/post-processing on the next loop pass.
-    pub(super) pending_completion_checks: VecDeque<JobId>,
+    pub pending_completion_checks: VecDeque<JobId>,
     // Presence gates every attempt to resume a partially restored job.
-    pub(crate) blocked_restores: HashMap<JobId, crate::jobs::handle::RestoreJobRequest>,
+    pub blocked_restores: HashMap<JobId, crate::jobs::handle::RestoreJobRequest>,
     // The jobs whose work crashed the daemon on its last run, each parked
     // paused as it installs instead of being restored into the same panic.
     pub(crate) crash_marks: weaver_server_base::runtime::panic_trap::CrashMarks,
@@ -1968,7 +1968,10 @@ pub struct Pipeline {
     // Channels for pipeline stage results. Every article now arrives as a
     // download lane event; the sender is held so the receiver stays open,
     // and tests still feed results through it.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(
+        not(all(feature = "pipeline-test-fixtures", not(test))),
+        allow(dead_code)
+    )]
     pub(super) download_done_tx: mpsc::Sender<DownloadResult>,
     pub(super) download_done_rx: mpsc::Receiver<DownloadResult>,
     pub(super) download_refill_tx: mpsc::Sender<DownloadLaneRefillRequest>,
@@ -1994,7 +1997,7 @@ pub struct Pipeline {
     // the generation they were computed under; delayed retries carry the
     // generation they were scheduled under so stale indices can be dropped
     // when they re-enter after a rebuild.
-    pub(super) pool_generation: u64,
+    pub pool_generation: u64,
     // The layouts of recent pool generations, to carry a set of servers
     // taken under one of them to the current pool.
     pub(in crate::pipeline) pool_layouts: PoolLayouts,
@@ -2033,12 +2036,12 @@ pub struct Pipeline {
     pub(super) db_reply_rx: mpsc::UnboundedReceiver<db_reply::DbReply>,
     pub(super) job_activated_rx: mpsc::Receiver<activation::JobActivated>,
     pub(super) move_done_tx: mpsc::Sender<MoveToCompleteDone>,
-    pub(super) move_done_rx: mpsc::Receiver<MoveToCompleteDone>,
+    pub move_done_rx: mpsc::Receiver<MoveToCompleteDone>,
     // Channel for failed jobs whose working directory was released.
     pub(super) failed_release_tx: mpsc::Sender<FailedJobReleased>,
-    pub(super) failed_release_rx: mpsc::Receiver<FailedJobReleased>,
+    pub failed_release_rx: mpsc::Receiver<FailedJobReleased>,
     pub(super) terminal_post_processing_done_tx: mpsc::Sender<TerminalPostProcessingEvent>,
-    pub(super) terminal_post_processing_done_rx: mpsc::Receiver<TerminalPostProcessingEvent>,
+    pub terminal_post_processing_done_rx: mpsc::Receiver<TerminalPostProcessingEvent>,
     pub(super) script_effects_rx: tokio::sync::watch::Receiver<()>,
     pub(super) terminal_post_processing_executor:
         crate::post_processing::executor::PostProcessingExecutor,
@@ -2125,7 +2128,7 @@ pub struct Pipeline {
     // Per-job delay after restart-durable-lead throttling parks primary work.
     pub(super) download_restart_durable_lead_retry_after: HashMap<JobId, Instant>,
     // The one over-limit article reserved until its result is processed or returned.
-    pub(super) checkpoint_progress_articles: HashMap<JobId, (u64, SegmentId)>,
+    pub checkpoint_progress_articles: HashMap<JobId, (u64, SegmentId)>,
     // The bytes still to come and the bytes wanted of each paused job, as its
     // graph root last said them before its articles were released, so a
     // paused job reports the figures it stopped at.
@@ -2159,11 +2162,11 @@ pub struct Pipeline {
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(super) spent_message_ids: Option<Vec<String>>,
     // Queued articles the dispatch-hold reason has read.
-    #[cfg(test)]
-    pub(super) dispatch_hold_items_examined: std::sync::atomic::AtomicUsize,
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub dispatch_hold_items_examined: std::sync::atomic::AtomicUsize,
     // Exclusion sets the login-refusal wait has asked about.
-    #[cfg(test)]
-    pub(super) login_refusal_sets_examined: std::sync::atomic::AtomicUsize,
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub login_refusal_sets_examined: std::sync::atomic::AtomicUsize,
     // Last time we logged a queued/no-active-download liveness stall.
     pub(super) last_download_dispatch_stall_log_at: Option<Instant>,
     // When the dispatch pass first found queued work and nothing in flight,
@@ -2249,25 +2252,25 @@ pub struct Pipeline {
     pub(super) uu_spool_debits: crate::operations::CapacityDebits,
     // One background free-space sampler per configured root. Everything on
     // the pipeline that gates work on free space reads these readings.
-    pub(super) storage_capacity: Arc<crate::operations::StorageCapacity>,
+    pub storage_capacity: Arc<crate::operations::StorageCapacity>,
     // The writer threads of the volumes graph jobs write to, what one says
     // when dispatch should look again (a volume fell below the line it
     // was stopped at, or an operation failed), and whether a job was
     // refused dispatch because a volume held its budget of bytes.
-    pub(super) volume_writers: Arc<crate::pipeline::graph::disk::PipelineWriters>,
-    pub(super) volume_rooms: tokio::sync::mpsc::UnboundedReceiver<()>,
+    pub volume_writers: Arc<crate::pipeline::graph::disk::PipelineWriters>,
+    pub volume_rooms: tokio::sync::mpsc::UnboundedReceiver<()>,
     pub(super) volume_budget_held: std::sync::atomic::AtomicBool,
     // The clock the shutdown settle of the volume writers goes by, and how
     // long a volume may stand still before it is left behind. The machine's
     // clock outside tests; a test may put one it moves by hand here.
-    pub(super) shutdown_settle: weaver_server_disk::operations::disk::writer::SettleBound,
+    pub shutdown_settle: weaver_server_disk::operations::disk::writer::SettleBound,
     // What queues each volume's first write-rate probe on its writer, once.
-    pub(super) volume_probes: Arc<crate::pipeline::graph::disk::VolumeProbes>,
+    pub volume_probes: Arc<crate::pipeline::graph::disk::VolumeProbes>,
     // The keeper of every volume's buffer limits.
-    pub(super) volume_buffers: Arc<crate::operations::VolumeBuffers>,
+    pub volume_buffers: Arc<crate::operations::VolumeBuffers>,
     // For each job with released results waiting for the loop: their bytes,
     // counted as arrived on the one volume they are held on.
-    pub(super) volume_arrived_by_job:
+    pub volume_arrived_by_job:
         HashMap<JobId, weaver_server_disk::operations::disk::volume::Reservation>,
     // For each job with articles leased to lanes: their bytes, reserved on
     // the volume the job writes to (`Reservation::reserve`). Each article
@@ -2345,11 +2348,11 @@ pub struct Pipeline {
     // info level.
     pub(super) body_fetch_failure_log_throttle: download::JobLogThrottle,
     // Jobs currently performing their final move into the complete directory.
-    pub(super) inflight_moves: HashSet<JobId>,
+    pub inflight_moves: HashSet<JobId>,
     // Failed jobs whose working directory is being released; each records
     // its history when the release comes back.
-    pub(super) releasing_failed_jobs: HashSet<JobId>,
-    pending_graph_terminals: HashMap<JobId, health::PendingGraphTerminal>,
+    pub releasing_failed_jobs: HashSet<JobId>,
+    pub pending_graph_terminals: HashMap<JobId, health::PendingGraphTerminal>,
     // Final moves admitted after the post-processing hold is lifted.
     pub(super) deferred_moves: HashSet<JobId>,
     // Jobs whose delivery waits for a volume's writer, with the barrier it
@@ -2357,20 +2360,20 @@ pub struct Pipeline {
     // one's report. The mail that says the barrier returned, or the report,
     // starts the delivery again; mail of the job's other file operations
     // does not.
-    pub(super) moves_awaiting_disk: HashMap<JobId, crate::pipeline::graph::disk::JobBarrier>,
+    pub moves_awaiting_disk: HashMap<JobId, crate::pipeline::graph::disk::JobBarrier>,
     // Complete destinations reserved for in-flight moves so concurrent jobs do not collide.
     pub(super) reserved_complete_destinations: HashMap<JobId, PathBuf>,
     // Shared state for control plane reads (API handlers read without channel round-trip).
-    pub(super) shared_state: SharedPipelineState,
+    pub shared_state: SharedPipelineState,
     // SQLite database for durable history.
-    pub(super) db: crate::Database,
+    pub db: crate::Database,
     // Tracks detached `db_fire_and_forget` writes so shutdown `drain` can join
     // them (bounded) instead of dropping in-flight writes. `db_fire_and_forget`
     // only has `&self`, so the JoinSet lives behind a shared mutex; the lock is
     // only ever held to spawn/drain, never across an await.
     pub(super) fire_and_forget_tasks: Arc<std::sync::Mutex<tokio::task::JoinSet<()>>>,
     // Shared config for runtime category lookups (dest_dir overrides).
-    pub(super) config: crate::settings::SharedConfig,
+    pub config: crate::settings::SharedConfig,
     // What the hardware profile in force grants graph work as it starts:
     // the low-priority post-processing pool repairs run inside, niced on
     // Unix so the OS scheduler prefers download/decode threads when CPU is
@@ -2396,6 +2399,6 @@ pub struct Pipeline {
     pub(super) process_memory_budget: Arc<ProcessMemoryBudget>,
 }
 
-#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+#[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
 #[doc(hidden)]
 pub mod tests;

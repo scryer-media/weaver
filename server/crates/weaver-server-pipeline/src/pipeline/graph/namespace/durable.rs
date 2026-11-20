@@ -22,7 +22,7 @@ use crate::pipeline::graph::envelope::durable::KeptRecord;
 use crate::pipeline::graph::leaf::Leaf;
 
 impl NamespaceWriter {
-    pub(crate) fn file_state(&self, node: NodeId, member: MemberId) -> FileState {
+    pub fn file_state(&self, node: NodeId, member: MemberId) -> FileState {
         let files = self.files.get(&node);
         let leaf = files.and_then(|files| files.leaves.get(&member));
         FileState {
@@ -38,12 +38,12 @@ impl NamespaceWriter {
     // namespace's members hold marks it under a later one. Its holds are
     // among what it holds: every hold, take and page-out reaches the ledger
     // through the marked map, so it marks the namespace too.
-    pub(crate) fn files_generation(&self) -> u64 {
+    pub fn files_generation(&self) -> u64 {
         self.files.marks().at()
     }
 
     // The namespaces whose members' states changed since generation `at`.
-    pub(crate) fn files_changed_since(&self, at: u64) -> impl Iterator<Item = NodeId> + '_ {
+    pub fn files_changed_since(&self, at: u64) -> impl Iterator<Item = NodeId> + '_ {
         self.files.marks().since(at)
     }
 
@@ -73,7 +73,7 @@ impl NamespaceWriter {
     // paged them out for a stop; none before, so no row names bytes a later
     // hold may replace. A spilled hold lies at its own offset, so its
     // scratch offset is that offset.
-    pub(crate) fn hold_records(&self, node: NodeId) -> Vec<(ScratchHold, bool)> {
+    pub fn hold_records(&self, node: NodeId) -> Vec<(ScratchHold, bool)> {
         if !self.stopped {
             return Vec::new();
         }
@@ -127,7 +127,7 @@ impl NamespaceWriter {
     // checkpoint and the database: what neither scratch nor the reserve
     // takes stays in RAM, unrecorded, and is fetched again after the
     // restart.
-    pub(crate) fn page_out_holds(&mut self) -> Result<(), WriteError> {
+    pub fn page_out_holds(&mut self) -> Result<(), WriteError> {
         self.stopped = true;
         let nodes: Vec<NodeId> = self
             .files
@@ -215,11 +215,7 @@ impl NamespaceWriter {
         }
     }
 
-    pub(crate) fn restore_holds(
-        &mut self,
-        tree: &Tree,
-        records: &[HoldRecord],
-    ) -> Result<(), WriteError> {
+    pub fn restore_holds(&mut self, tree: &Tree, records: &[HoldRecord]) -> Result<(), WriteError> {
         // The space a move to a spill file may take: what is free now, as
         // the copy adds to the scratch file it leaves on disk.
         let mut spill_free = self.free_disk_bytes();
@@ -388,7 +384,7 @@ impl NamespaceWriter {
     // what the source's checksums vouch for of what it holds, and nothing
     // is read: what they do not vouch for leaves the fold short, and its
     // check at close reads the file through the worker, as a pending one.
-    pub(crate) fn restore_file(
+    pub fn restore_file(
         &mut self,
         tree: &Tree,
         node: NodeId,
@@ -454,7 +450,7 @@ impl NamespaceWriter {
     // takes each such refusal back, the object that gave the member up goes
     // whole, and whatever owns its volumes now reads them from their files,
     // as after a repair proves a member.
-    pub(crate) fn lift_hold_refusals(
+    pub fn lift_hold_refusals(
         &mut self,
         tree: &mut Tree,
         builder: &mut dyn Builder,
@@ -523,7 +519,7 @@ impl NamespaceWriter {
         self.read_backs = read_backs;
     }
 
-    pub(crate) fn restore_kept(&mut self, record: &KeptRecord) -> Result<(), WriteError> {
+    pub fn restore_kept(&mut self, record: &KeptRecord) -> Result<(), WriteError> {
         Ok(self.envelopes.restore(record)?)
     }
 
@@ -531,7 +527,7 @@ impl NamespaceWriter {
     // inverse map of whatever owns it, as a repair reads them, from what is
     // on disk only: what a restart now would find.
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-    pub(crate) fn read_posted(
+    pub fn read_posted(
         &self,
         tree: &Tree,
         member: MemberId,
