@@ -1049,7 +1049,7 @@ impl Database {
         Self::open_target(DatabaseTarget::SqlitePath(path.to_path_buf()))
     }
 
-    pub(crate) fn open_target(target: DatabaseTarget) -> Result<Self, StateError> {
+    pub fn open_target(target: DatabaseTarget) -> Result<Self, StateError> {
         SqlDatabase::open_target(target, crate::schema_migrations::MigrationMode::Apply)
             .map(Self::with_writer)
     }

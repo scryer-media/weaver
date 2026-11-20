@@ -6897,6 +6897,7 @@ name = "weaver-server-core"
 version = "0.16.17"
 dependencies = [
  "blake3",
+ "chrono",
  "criterion",
  "hex",
  "http",

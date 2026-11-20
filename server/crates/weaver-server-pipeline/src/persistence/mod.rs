@@ -3,7 +3,7 @@
 
 pub(crate) mod checkpoint_write;
 pub mod connection;
-pub(crate) use weaver_server_db::persistence::database_target;
+pub use weaver_server_db::persistence::database_target;
 pub mod encryption;
 pub use weaver_server_db::persistence::error;
 use weaver_server_db::persistence::executor;
@@ -11,7 +11,7 @@ pub(crate) mod maintenance;
 pub mod migrations;
 pub(crate) mod postgres_migrations;
 pub mod setup;
-pub(crate) use weaver_server_db::persistence::sql_runtime;
+pub use weaver_server_db::persistence::sql_runtime;
 pub(crate) mod sql_services;
 pub(crate) mod sqlite_writer;
 pub(crate) mod wal_checkpoint;

@@ -166,7 +166,7 @@ const KNOWN_HOST_DNS: &[(&str, usize)] = &[
         2,
     ),
     (
-        "server/crates/weaver-server-pipeline/src/operations/usage_history/tests.rs",
+        "server/crates/weaver-server-core/src/operations/usage_history/tests.rs",
         1,
     ),
     (

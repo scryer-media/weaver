@@ -15,6 +15,7 @@ pub mod jobs {
 pub mod operations {
     pub mod instrumentation;
     pub mod metrics;
+    pub mod usage_history;
 }
 pub mod runtime;
 pub mod security;

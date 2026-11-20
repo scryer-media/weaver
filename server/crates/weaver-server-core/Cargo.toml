@@ -12,6 +12,8 @@ test-support = ["weaver-server-pipeline/test-support"]
 e2e-local-trackers = ["weaver-server-pipeline/e2e-local-trackers"]
 
 [dependencies]
+chrono = { workspace = true }
+tokio = { workspace = true }
 weaver-server-base = { path = "../weaver-server-base" }
 weaver-server-pipeline = { path = "../weaver-server-pipeline" }
 

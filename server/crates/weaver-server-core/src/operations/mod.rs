@@ -9,3 +9,12 @@ pub use health::{
     browse_directories, create_directory,
 };
 pub use logs::snapshot_service_logs;
+pub mod usage_history;
+pub use usage_history::{
+    FinishedJobCounts, JOBS_FINISHED, JOBS_REPAIRED, REMOVED_SERVER_ID_PREFIX, RecoveryBytes,
+    RemovedServerUsage, ServerStateReading, ServerUsageReading, StageReading, TorrentUsageReading,
+    USAGE_FLUSH_INTERVAL_SECS, USAGE_RETENTION_DAYS, UsageConsumerKind, UsageConsumerSummary,
+    UsageConsumerTotal, UsageCounts, UsageDayRow, UsageFlush, UsagePeriod, UsageReading,
+    UsageRecorder, UsageStart, UsageSummary, period_bounds, summarize_usage, summary_read_from,
+    week_start,
+};
