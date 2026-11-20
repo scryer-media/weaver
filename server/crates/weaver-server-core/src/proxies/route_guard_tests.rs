@@ -81,6 +81,7 @@ const LIFTED: &[(&str, usize)] = &[
     ("server/app/weaver/src/tray/shared.rs", 1),
     ("server/crates/weaver-server-composition/src/lib.rs", 1),
     ("server/crates/weaver-server-core/src/lib.rs", 1),
+    ("server/crates/weaver-server-net-runtime/src/lib.rs", 1),
     (
         "server/crates/weaver-server-net-runtime/src/proxies/network_runtime.rs",
         3,
@@ -114,6 +115,7 @@ const BLANKET_LIFTED: &[(&str, usize)] = &[
     // tests write their own rows: see the lift's own comment.
     ("server/crates/weaver-server-composition/src/lib.rs", 1),
     ("server/crates/weaver-server-core/src/lib.rs", 1),
+    ("server/crates/weaver-server-net-runtime/src/lib.rs", 1),
     ("server/crates/weaver-server-torrents/src/lib.rs", 1),
 ];
 

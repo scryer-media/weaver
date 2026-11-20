@@ -3,7 +3,7 @@
 
 // Live probe of every public endpoint a speed test reaches. It talks to the
 // internet, so it is ignored and runs only when asked for by name:
-// cargo nextest run -p weaver-server-core -E 'test(/providers::live/)' --run-ignored all
+// cargo nextest run -p weaver-server-net-runtime -E 'test(/providers::live/)' --run-ignored all
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

@@ -29,3 +29,7 @@ pub async fn discover_fast_com(
     let answer = fetch(fast_com_api_url(api, &token), "targets").await?;
     fast_com_endpoints(&answer)
 }
+
+#[cfg(test)]
+#[path = "providers_live.rs"]
+mod live;
