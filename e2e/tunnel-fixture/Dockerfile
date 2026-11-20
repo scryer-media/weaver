@@ -16,7 +16,7 @@ RUN --mount=type=cache,id=weaver-e2e-cargo-registry,target=/usr/local/cargo/regi
     --mount=type=cache,id=weaver-e2e-tunnel-fixture-target,target=/src/target,sharing=locked \
     cargo build --locked --release && cp target/release/tunnel-fixture /tmp/tunnel-fixture
 
-FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 COPY --from=builder /tmp/tunnel-fixture /usr/local/bin/tunnel-fixture
 EXPOSE 2221 2222 2223 2224 2225 51821/udp 51822/udp 51823/udp 8095
 ENTRYPOINT ["/usr/local/bin/tunnel-fixture"]
