@@ -154,6 +154,7 @@ async fn a_v2_piece_waits_for_its_layer_run_which_a_v2_peer_proves() {
     assert!(matches!(
         h.layer_fetch.pick(
             peer.addr,
+            0,
             |_| true,
             Duration::ZERO,
             tokio::time::Instant::now()
@@ -221,6 +222,7 @@ async fn a_rejected_run_goes_to_another_peer_and_an_unasked_answer_is_ignored() 
     assert!(matches!(
         h.layer_fetch.pick(
             first_peer.addr,
+            0,
             |_| true,
             Duration::from_secs(60),
             tokio::time::Instant::now()
@@ -416,6 +418,7 @@ async fn the_leaves_of_a_failed_v2_piece_blame_only_its_bad_blocks_sender(hybrid
     assert!(matches!(
         h.layer_fetch.pick(
             other.addr,
+            0,
             |_| true,
             Duration::ZERO,
             tokio::time::Instant::now()
@@ -459,6 +462,7 @@ async fn a_failed_v2_piece_that_passes_before_its_leaves_come_blames_by_the_good
     assert!(matches!(
         h.layer_fetch.pick(
             v2_peer.addr,
+            0,
             |_| true,
             Duration::ZERO,
             tokio::time::Instant::now()
@@ -486,6 +490,7 @@ async fn the_sole_sender_of_a_failed_v2_piece_is_banned_at_once() {
     assert!(matches!(
         h.layer_fetch.pick(
             v2_peer.addr,
+            0,
             |_| true,
             Duration::ZERO,
             tokio::time::Instant::now()
