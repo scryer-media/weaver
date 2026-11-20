@@ -321,6 +321,9 @@ pub struct NamespaceWriter {
     // The members whose file the file system refused to create for its
     // name (`skip_unnamable`), until the ledger renames them.
     unnamable: BTreeSet<(NodeId, MemberId)>,
+    // The members a loss marked, until each is tried for zeros once nothing
+    // can bring its bytes back (`zeros`).
+    lost_marked: BTreeSet<(NodeId, MemberId)>,
     // How many times a member was skipped for its name.
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub names_skipped: usize,
@@ -455,6 +458,7 @@ impl NamespaceWriter {
             left_to_write: None,
             spills_said: BTreeSet::new(),
             unnamable: BTreeSet::new(),
+            lost_marked: BTreeSet::new(),
             #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             names_skipped: 0,
             unnamed_damage: Vec::new(),
@@ -4259,6 +4263,7 @@ mod moves;
 pub mod recovery;
 pub mod refusal;
 pub mod verification;
+mod zeros;
 
 #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
 pub(crate) use verification::checked;

@@ -31,6 +31,7 @@ mod pipeline {
             mod unused_sets;
             mod volume_order;
             mod withheld_par2;
+            mod zero_lost;
             mod zip;
             mod zip_par3;
         }

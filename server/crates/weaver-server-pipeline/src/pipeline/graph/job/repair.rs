@@ -396,6 +396,25 @@ impl GraphJob {
             self.heard(out)?;
             return Ok(Some(true));
         }
+        // A stored member whose lost bytes nothing can bring back is tried
+        // with zeros there, against the checksum its headers state, before
+        // any object hears what was lost: one that passes is whole, and the
+        // objects hear quiet over it on the next pass.
+        if self.writer.lost_waiting() {
+            let mut out = Vec::new();
+            let coming = self.coming();
+            let filled = self.writer.fill_lost_zeros(
+                &mut self.tree,
+                &mut *self.builder,
+                &self.root,
+                &coming,
+                &mut out,
+            )?;
+            self.heard(out)?;
+            if filled {
+                return Ok(Some(true));
+            }
+        }
         // The tree owns the order: deepest first, nodes that may still
         // change the namespace above them first, the rest on a pass that
         // changed nothing more.

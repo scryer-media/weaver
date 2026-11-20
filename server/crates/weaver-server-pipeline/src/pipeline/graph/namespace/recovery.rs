@@ -467,7 +467,7 @@ impl NamespaceWriter {
     // to it hears its volume lost, and every set of its namespace hears it
     // refused as far as `origin` will never bring it.
     pub(crate) fn marked_lost(
-        &self,
+        &mut self,
         tree: &mut Tree,
         builder: &mut dyn Builder,
         origin: NodeId,
@@ -476,6 +476,7 @@ impl NamespaceWriter {
     ) {
         self.set_volume_lost(tree, builder, marked, effects);
         self.refuse_range(tree, origin, marked);
+        self.lost_marked.insert((marked.0, marked.1));
     }
 
     // The parent's other answer to a seek: the range of the member will
