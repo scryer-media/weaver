@@ -291,11 +291,14 @@ pub(super) fn asker(job_id: JobId) -> AskerId {
 // recovery object holds is recovery whatever its posted name, and one any
 // other object holds is payload. A member named as recovery that a
 // recovery object refused stays recovery; one another object refused is
-// payload. A member no object holds or refused is recovery data when the
-// tree spends it (`Tree::spends`: its posted name says it is recovery,
-// `.rev`, `.pNN` and `.parNN` among them), and otherwise what it was
-// posted as; one past the posted files is a file a recovery object
-// announced, which is payload.
+// payload. A member no object holds or refused is what its front says,
+// once the front has said, whatever its posted name: a `readme.par2` of
+// text is payload, a PAR1 volume under a hash is recovery
+// (`Namespace::recovery_by_front`). Short of a front, it is recovery data
+// when the tree spends it (`Tree::spends`: its posted name says it is
+// recovery among the names beside it, `.rev`, `.pNN` and `.parNN` among
+// them), and otherwise what it was posted as; one past the posted files is
+// a file a recovery object announced, which is payload.
 fn is_payload(job: &GraphJob, posted: &dyn Fn(MemberId) -> bool, member: MemberId) -> bool {
     let tree = job.tree();
     if let Some((owner, _)) = tree.child_of(NodeId::ROOT, member) {
@@ -304,15 +307,19 @@ fn is_payload(job: &GraphJob, posted: &dyn Fn(MemberId) -> bool, member: MemberI
     if let Some(owner) = tree.refused_by(NodeId::ROOT, member) {
         return posted(member) || !tree.recovers(owner);
     }
-    posted(member) && !tree.spends(NodeId::ROOT, member)
+    match job.namespace().recovery_by_front(member) {
+        Some(recovery) => !recovery,
+        None => posted(member) && !tree.spends(NodeId::ROOT, member),
+    }
 }
 
 // Whether a posted file is a recovery volume, the job's optional recovery
 // bytes, by the rule `is_payload` reads: a file a recovery object holds is
 // recovery whatever its posted name, one another object holds or refused
-// is payload, and one no object holds yet is what its posted name says, so
-// the figure rises as a volume posted under another name binds. A set's
-// index is no volume, whoever holds it, when its name says it is one.
+// is payload, and one no object holds yet is what its posted name says
+// until its front says it is no recovery data, so the figure rises as a
+// volume posted under another name binds. A set's index is no volume,
+// whoever holds it, when its name says it is one.
 pub fn recovery_volume(
     job: &GraphJob,
     file: &crate::jobs::model::FileSpec,
@@ -324,6 +331,7 @@ pub fn recovery_volume(
         return tree.recovers(owner) && !index;
     }
     file.role.is_recovery()
+        && job.namespace().recovery_by_front(member) != Some(false)
         && tree
             .refused_by(NodeId::ROOT, member)
             .is_none_or(|owner| tree.recovers(owner))
@@ -459,16 +467,19 @@ pub fn delivery_of(job: &GraphJob, posted: Posted<'_>) -> (Delivery, Option<Fail
             // no usable file at any depth: a joined split or an archive an
             // archive held is a piece as much as a posted volume is. A
             // member whose name the file system refused has no file at all,
-            // and is no usable file either, however long it is.
+            // and is no usable file either, however long it is. A name that
+            // says recovery data says nothing once the member's front rules
+            // recovery out (`Namespace::recovery_by_front`): it is the plain
+            // file its bytes are.
             |node, member| {
                 job.writer().unnamable(node, member)
-                    || job
-                        .tree()
-                        .namespace(node)
-                        .and_then(|ns| ns.get(member))
-                        .is_some_and(|member| {
-                            crate::pipeline::post_health::names_a_piece(&member.output_name)
+                    || job.tree().namespace(node).is_some_and(|ns| {
+                        ns.get(member).is_some_and(|record| {
+                            crate::pipeline::post_health::names_a_piece(&record.output_name)
+                                && !(weaver_graph::sniff::names_recovery(&record.output_name)
+                                    && ns.recovery_by_front(member) == Some(false))
                         })
+                    })
             },
             unarrived,
         );

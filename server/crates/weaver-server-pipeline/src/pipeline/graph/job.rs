@@ -899,11 +899,10 @@ impl GraphJob {
 
     // Seam for status: the bytes still to come and out to bring of the
     // posted recovery file at `file_index` that nothing has decided on yet.
-    // One whose first bytes do not open a PAR2 or PAR3 volume is data, said
-    // by its first article.
+    // One whose first bytes open no recovery format is data, said by its
+    // first article (`Namespace::recovery_by_front`).
     pub(crate) fn undecided_recovery(&self, file_index: u32) -> Option<(u64, u64)> {
-        let front = self.namespace().first_bytes(MemberId(file_index));
-        if !weaver_graph::sniff::may_open_par(front) {
+        if self.namespace().recovery_by_front(MemberId(file_index)) == Some(false) {
             return None;
         }
         self.root.map.undecided(VolumeIndex(file_index))
@@ -931,6 +930,13 @@ impl GraphJob {
     pub(crate) fn holds_as_recovery(&self, file_index: u32) -> bool {
         self.writer
             .carries_parity(&self.tree, NodeId::ROOT, MemberId(file_index))
+    }
+
+    // Seam for the post's health: the posted file at `file_index` showed a
+    // front that opens no recovery format, so whatever its name says, it is
+    // no recovery data (`Namespace::recovery_by_front`).
+    pub(crate) fn front_refutes_recovery(&self, file_index: u32) -> bool {
+        self.namespace().recovery_by_front(MemberId(file_index)) == Some(false)
     }
 
     // Seam for status: the posted file at `file_index` has an article

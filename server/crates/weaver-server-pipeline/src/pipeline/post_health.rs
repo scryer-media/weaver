@@ -810,17 +810,20 @@ impl Pipeline {
         }
     }
 
-    // The files the post names as payload that lost at least one article.
-    // A lost recovery volume is not damage to the release.
+    // The files the post names as payload that lost at least one article,
+    // and those it names as recovery whose fronts said they are none. A lost
+    // recovery volume is not damage to the release.
     fn failing_files(&self, job_id: JobId, spec: &JobSpec) -> usize {
         let Some(given_up) = self.given_up.get(&job_id) else {
             return 0;
         };
+        let graph = self.graph_jobs.get(&job_id);
         given_up
             .missing_files()
             .filter(|index| {
                 spec.files.get(*index as usize).is_some_and(|file| {
-                    file.role.counts_toward_health() && !declares_recovery(file)
+                    (file.role.counts_toward_health() && !declares_recovery(file))
+                        || graph.is_some_and(|graph| graph.front_refutes_recovery(*index))
                 })
             })
             .count()
@@ -947,12 +950,14 @@ impl Pipeline {
                     .filter(|index| *index < files)
                     .collect();
                 for index in changed {
-                    sample.bind(index, graph.holds_as_recovery(index));
+                    let refuted = graph.front_refutes_recovery(index);
+                    sample.bind(index, graph.holds_as_recovery(index), refuted);
                 }
             }
             _ => {
                 for index in 0..files {
-                    sample.bind(index, graph.holds_as_recovery(index));
+                    let refuted = graph.front_refutes_recovery(index);
+                    sample.bind(index, graph.holds_as_recovery(index), refuted);
                 }
             }
         }
@@ -1024,10 +1029,14 @@ impl Pipeline {
             .map(|(file, index)| (index, file, self.first_article(job_id, index, file)))
             .collect();
         let graph = self.graph_jobs.get(&job_id);
-        // A file the names count is weighed by its name, any other by what
-        // the graph holds it as.
+        // A file the names count is weighed by its name, unless its front
+        // said it is no recovery data; any other by what the graph holds it
+        // as.
+        let named = |index: u32, file: &FileSpec| {
+            names_recovery(file) && !graph.is_some_and(|graph| graph.front_refutes_recovery(index))
+        };
         let gate_recovery = |index: u32, file: &FileSpec| {
-            if names_recovery(file) {
+            if named(index, file) {
                 declares_recovery(file)
             } else {
                 graph.is_some_and(|graph| graph.holds_as_recovery(index))
@@ -1035,7 +1044,7 @@ impl Pipeline {
         };
         let unresolved_at = |index: u32, file: &FileSpec, head: Head| {
             head == Head::Outstanding
-                && !names_recovery(file)
+                && !named(index, file)
                 && !graph.is_some_and(|graph| graph.holds_as_recovery(index))
         };
         let payload = heads
@@ -1118,7 +1127,9 @@ impl Pipeline {
         (0u32..)
             .zip(&spec.files)
             .filter(|(index, file)| {
-                names_recovery(file) || graph.is_some_and(|graph| graph.holds_as_recovery(*index))
+                let refuted = graph.is_some_and(|graph| graph.front_refutes_recovery(*index));
+                (names_recovery(file) && !refuted)
+                    || graph.is_some_and(|graph| graph.holds_as_recovery(*index))
             })
             .flat_map(|(_, file)| file.segments.iter())
             .map(|segment| u64::from(segment.bytes))

@@ -150,13 +150,21 @@ async fn a_graph_job_fetches_repair_data_before_it_repairs() {
     );
 }
 
+// A PAR1 file's head and some body: its magic and its one file version.
+// No object reads PAR1; its bytes are recovery data all the same.
+fn par1(len: usize, seed: u8) -> Vec<u8> {
+    let mut bytes = b"PAR\0\0\0\0\0\0\0\x01\0".to_vec();
+    bytes.extend(payload(len - bytes.len(), seed));
+    bytes
+}
+
 // A whole movie beside a file posted under an older recovery volume's name,
 // `.p01` or `.par01`, beside a `.par2` of its stem, that no object holds:
-// its bytes say nothing an object reads. It is recovery data by its name
-// among the names beside it, as the `.par2` is by its own: no file of the
-// delivery, whole or short. The job hands over the movie and ends
-// Complete, also when the recovery file lost an article, and that loss
-// costs the job's health nothing.
+// its bytes open PAR1, which no object reads. It is recovery data by its
+// bytes, as the `.par2` is by its own: no file of the delivery, whole or
+// short. The job hands over the movie and ends Complete, also when the
+// recovery file lost an article, and that loss costs the job's health
+// nothing.
 #[tokio::test]
 async fn a_recovery_file_no_object_holds_is_no_file_of_the_delivery() {
     let movie = payload(4 * ARTICLE + 17, 91);
@@ -164,8 +172,8 @@ async fn a_recovery_file_no_object_holds_is_no_file_of_the_delivery() {
         for lost in [false, true] {
             let posts = vec![
                 Post::plain("lantern.mkv", movie.clone()),
-                Post::plain(name, payload(3 * ARTICLE + 5, 203)),
-                Post::plain("lantern.par2", payload(ARTICLE, 7)),
+                Post::plain(name, par1(3 * ARTICLE + 5, 203)),
+                Post::plain("lantern.par2", par1(ARTICLE, 7)),
             ];
             let mut scenario = Scenario::new(posts);
             if lost {
@@ -266,15 +274,15 @@ async fn a_plain_file_named_like_an_old_recovery_volume_counts_its_loss() {
 }
 
 // A `.p01` beside a PAR2 set of its stem that covers the movie, its bytes
-// no volume of the set, is recovery data: an article it lost leaves the
-// movie whole, the job Complete, the `.p01` out of the delivery and the
-// job's health untouched.
+// a PAR1 volume's and no volume of the set, is recovery data: an article it
+// lost leaves the movie whole, the job Complete, the `.p01` out of the
+// delivery and the job's health untouched.
 #[tokio::test]
 async fn an_unused_old_volume_beside_its_set_costs_nothing_when_it_loses_an_article() {
     let movie = payload(4 * ARTICLE + 17, 91);
     let mut posts = vec![
         Post::plain("lantern.mkv", movie.clone()),
-        Post::plain("lantern.p01", payload(3 * ARTICLE + 5, 203)),
+        Post::plain("lantern.p01", par1(3 * ARTICLE + 5, 203)),
     ];
     posts.extend(par2_set("lantern", &[("lantern.mkv", &movie)], 2));
     let graph = run(&Scenario::new(posts).lost(1, 1)).await;

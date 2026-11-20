@@ -713,14 +713,37 @@ fn named(name: &str, piece: bool) -> Option<Kind> {
         .or_else(|| piece.then_some(Kind::Split))
 }
 
-// Whether a member's first bytes may still open a PAR2 or PAR3 volume:
-// none yet may, and any that differ from both magics cannot, however many
-// more come.
-pub fn may_open_par(first_bytes: &[u8]) -> bool {
-    [PAR2_MAGIC, PAR3_MAGIC].iter().any(|magic| {
-        let seen = first_bytes.len().min(magic.len());
-        first_bytes[..seen] == magic[..seen]
-    })
+// A PAR1 file's head, an index's or a volume's alike: its magic and the
+// one file version PAR1 has, 0x00010000, as par2cmdline reads them. No
+// object reads PAR1; its files are recovery data all the same.
+const PAR1_HEAD: &[u8; 12] = b"PAR\0\0\0\0\0\0\0\x01\0";
+
+// What a member's front says of whether it is recovery data, whatever its
+// name: `Some(true)` when it opens a recovery format (a PAR2 or PAR3
+// packet, a RAR5 recovery volume, or a PAR1 file), `Some(false)` when it
+// rules every one out, and `None` while it says nothing yet: no front, or
+// one too short to decide. A RAR3 recovery volume opens on parity, which
+// signs nothing, so under RAR's own `.rev` a front that signs nothing
+// rules nothing out, and the name says. The bytes are the ones the sniffer
+// already holds: nothing is read to answer.
+pub fn recovery_by_front(name: &str, front: &[u8], length: Option<u64>) -> Option<bool> {
+    if front.is_empty() {
+        return None;
+    }
+    let seen = front.len().min(PAR1_HEAD.len());
+    if front[..seen] == PAR1_HEAD[..seen] {
+        if seen == PAR1_HEAD.len() {
+            return Some(true);
+        }
+        if length.is_none_or(|length| length >= PAR1_HEAD.len() as u64) {
+            return None;
+        }
+    }
+    match signed(front, length) {
+        Sniff::Object(kind) => Some(matches!(kind, Kind::Par2 | Kind::Par3 | Kind::RarRecovery)),
+        Sniff::Pending => None,
+        Sniff::Leaf => (!has_extension(trimmed(name), ".rev")).then_some(false),
+    }
 }
 
 // The kinds whose objects judge a member by the clean bytes past the hole
@@ -858,8 +881,9 @@ impl Listing {
     // their names alone; the older numbered `.p<N>` and `.par<N>` only beside
     // a `.par` or `.par2` of their stem. A short name with a letter and
     // digits for an extension, a `.p12`, is a plain file when no set of its
-    // stem is listed. The one rule a listing, a member no object holds and
-    // the job's health tell recovery data by.
+    // stem is listed. The rule a listing tells recovery data by, and a
+    // member no object holds while its front has not said
+    // (`Namespace::recovery_data`).
     pub(crate) fn recovery(&self, name: &str) -> bool {
         let name = trimmed(name).to_ascii_lowercase();
         let Some((stem, extension)) = name.rsplit_once('.') else {
@@ -964,10 +988,17 @@ impl Listing {
         {
             return Layered::Own;
         }
+        // A name that says recovery data is a file of its own once its front
+        // says it is none (`recovery_by_front`).
         match self.told(name) {
             Listed::Container => return Layered::Piece,
-            Listed::Recovery => return Layered::Furniture,
-            Listed::Plain => {}
+            Listed::Recovery
+                if !self.recovery(name)
+                    || recovery_by_front(name, front, length) != Some(false) =>
+            {
+                return Layered::Furniture;
+            }
+            Listed::Recovery | Listed::Plain => {}
         }
         if opens.is_some() {
             return Layered::Piece;

@@ -1116,6 +1116,27 @@ impl Namespace {
         self.listing.recovery(name)
     }
 
+    // Whether a member is recovery data: by its front, whatever its name,
+    // once the front has said (`sniff::recovery_by_front`); by its posted
+    // name among the names beside it (`names_recovery_beside`) only while
+    // the front has not, its first article lost or not yet come. The one
+    // answer the tree, the census, the delivery and the caps read for a
+    // member no object holds.
+    pub fn recovery_data(&self, member: MemberId) -> bool {
+        let Some(record) = self.get(member) else {
+            return false;
+        };
+        self.recovery_by_front(member)
+            .unwrap_or_else(|| self.names_recovery_beside(&record.name))
+    }
+
+    // What the member's front alone says of its being recovery data, `None`
+    // while it says nothing (`sniff::recovery_by_front`).
+    pub fn recovery_by_front(&self, member: MemberId) -> Option<bool> {
+        let record = self.get(member)?;
+        crate::sniff::recovery_by_front(&record.name, self.first_bytes(member), record.length)
+    }
+
     // Keep the part of a delivered range that lies in the member's first
     // FIRST_BYTES, with how it arrived. Bytes over what is kept replace it,
     // the way a repair replaces a damaged first article.

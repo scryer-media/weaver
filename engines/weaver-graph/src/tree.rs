@@ -928,10 +928,11 @@ impl Tree {
     // consumed, whose output is what the object hands over in its stead,
     // unless it is a recovery object's whose volumes are released, as a
     // listing is kept beside what it lists. A member no object holds is
-    // spent when its posted name, among the names beside it, says it is
-    // recovery data (`Listing::recovery`): one whose first bytes were lost
-    // never said by them which set it is. A `.p12` with no set of its stem
-    // beside it is a plain file, and is handed over. One an object that is
+    // spent when it is recovery data (`Namespace::recovery_data`): by its
+    // front, whatever its name, and by its posted name among the names
+    // beside it only when its first bytes were lost and never said. A
+    // `readme.par2` whose front is text, or a `.p12` with no set of its stem
+    // beside it, is a plain file, and is handed over. One an object that is
     // not a recovery object refused is that object's file, never spent, as
     // the status reads it.
     pub fn spends(&self, node: NodeId, member: MemberId) -> bool {
@@ -940,13 +941,11 @@ impl Tree {
                 .recovery(child)
                 .is_none_or(|recovery| !recovery.released()),
             None => {
-                self.namespace(node).is_some_and(|namespace| {
-                    namespace
-                        .get(member)
-                        .is_some_and(|record| namespace.names_recovery_beside(&record.name))
-                }) && self
-                    .refused_by(node, member)
-                    .is_none_or(|owner| self.recovers(owner))
+                self.namespace(node)
+                    .is_some_and(|namespace| namespace.recovery_data(member))
+                    && self
+                        .refused_by(node, member)
+                        .is_none_or(|owner| self.recovers(owner))
             }
         }
     }

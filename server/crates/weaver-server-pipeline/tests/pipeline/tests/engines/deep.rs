@@ -961,12 +961,12 @@ fn delivered_names(graph: &Outcome) -> Vec<String> {
 }
 
 // A two-volume RAR set holding `beacon.bin`, the PAR2 set over its volumes,
-// and `stray.par2`, which no set reads: posted at the root, and stored in
-// one RAR volume posted as `lantern.rar`. One article inside the second
-// volume is damaged, and the set rebuilds it. Below the root the volumes
-// and the set are spent as they are at the root, and the stray recovery
-// file is spent by its name in both: neither delivery holds a recovery
-// file or a volume.
+// and `stray.par2`, a PAR1 file by its bytes, which no set reads: posted at
+// the root, and stored in one RAR volume posted as `lantern.rar`. One
+// article inside the second volume is damaged, and the set rebuilds it.
+// Below the root the volumes and the set are spent as they are at the
+// root, and the stray recovery file is spent by its bytes in both: neither
+// delivery holds a recovery file or a volume.
 #[tokio::test]
 async fn an_archive_holding_a_par2_set_and_volumes_delivers_no_recovery_file() {
     let body = payload(6 * ARTICLE + 17, 57);
@@ -981,7 +981,9 @@ async fn an_archive_holding_a_par2_set_and_volumes_delivers_no_recovery_file() {
             .into_iter()
             .map(|post| (post.name, post.bytes)),
     );
-    entries.push(("stray.par2".to_string(), payload(ARTICLE / 2, 58)));
+    let mut stray = b"PAR\0\0\0\0\0\0\0\x01\0".to_vec();
+    stray.extend(payload(ARTICLE / 2, 58));
+    entries.push(("stray.par2".to_string(), stray));
 
     let root: Vec<Post> = entries
         .iter()
