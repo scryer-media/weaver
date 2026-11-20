@@ -8,6 +8,7 @@
 // it asks for again are the ones it held in memory when it went down.
 
 use crate::jobs::graph_checkpoint::JobsGraphCheckpointInternalQueries;
+use crate::jobs::model::SchedulingMemoryEstimate;
 use crate::jobs::queries::JobsQueries;
 use std::collections::{BTreeMap, BTreeSet};
 

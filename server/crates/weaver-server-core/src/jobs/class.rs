@@ -67,14 +67,7 @@ impl<T> std::ops::IndexMut<Protocol> for ByProtocol<T> {
 /// class published.
 pub const PIPELINE: Protocol = Protocol::Nzb;
 
-/// The rates a class's jobs move at, one per direction: their side of the
-/// download split, and the whole upload limit, since usenet uploads
-/// nothing. `None` is no limit.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ClassRates {
-    pub download: Option<u64>,
-    pub upload: Option<u64>,
-}
+pub use weaver_server_net::bandwidth::limits::ClassRates;
 
 /// A class's side of the global limits.
 pub trait ClassRate: Send + Sync {

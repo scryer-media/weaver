@@ -2,16 +2,16 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 mod classify;
-mod import;
-pub mod metadata;
-pub mod naming;
-pub(crate) mod outline;
-mod persisted_nzb;
 #[cfg(test)]
 pub(crate) use persisted_nzb::NZB_PARSES;
+use weaver_server_ingest::ingest::import;
+pub use weaver_server_ingest::ingest::metadata;
+pub use weaver_server_ingest::ingest::naming;
+pub(crate) use weaver_server_ingest::ingest::outline;
+use weaver_server_ingest::ingest::persisted_nzb;
 mod submission;
 mod torrent_fetch;
-mod xz;
+use weaver_server_ingest::ingest::xz;
 
 pub use classify::{Kind, classify, declared_protocol};
 pub use import::{

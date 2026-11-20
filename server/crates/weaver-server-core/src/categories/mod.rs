@@ -2,10 +2,10 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 pub mod making;
-pub mod model;
+pub use weaver_server_settings::categories::model;
 pub mod persistence;
-pub mod queries;
-pub mod record;
+pub use weaver_server_settings::categories::queries;
+pub use weaver_server_settings::categories::record;
 pub mod repository;
 pub mod service;
 

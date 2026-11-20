@@ -69,3 +69,4 @@ pub(crate) mod alloc_probe {
 #[cfg(test)]
 #[global_allocator]
 static ALLOCATOR: alloc_probe::Counting = alloc_probe::Counting;
+pub mod ingest;

@@ -1,0 +1,171 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+use crate::servers::{ServerConfig, ServerDownloadQuotaPeriod, record::ServerRecord};
+use weaver_server_db::persistence::StateError;
+use weaver_server_db::persistence::connection::Database;
+use weaver_server_db::persistence::sql_runtime::{SqlArg, SqlRuntime};
+
+pub trait ServersQueries {
+    fn list_servers(&self) -> Result<Vec<ServerConfig>, StateError>;
+    fn next_server_id(&self) -> Result<u32, StateError>;
+    fn server_pipelining_depth(&self, id: u32) -> Result<Option<u8>, StateError>;
+}
+
+impl ServersQueries for Database {
+    fn list_servers(&self) -> Result<Vec<ServerConfig>, StateError> {
+        use weaver_server_db::persistence::encryption::maybe_decrypt;
+
+        let datastore = self.datastore();
+        let encryption_key = self.encryption_key().cloned();
+        self.run_sql_blocking_read(async move {
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT id, host, port, tls, username, password, connections, active, supports_pipelining, pipelining_depth, priority, backfill, retention_days, max_download_speed, download_quota_enabled, download_quota_limit_bytes, download_quota_period, download_quota_reset_time_minutes_local, download_quota_weekly_reset_weekday, download_quota_monthly_reset_day, tls_ca_cert, tls_name_mismatch_certificate_der
+                   FROM servers ORDER BY priority, id",
+                &[],
+            )
+            .await?;
+
+            rows.into_iter()
+                .map(|row| {
+                    let mut record = ServerRecord {
+                        id: u32_from_i64(row.i64("id")?, "server id")?,
+                        host: row.text("host")?,
+                        port: u16_from_i64(row.i64("port")?, "server port")?,
+                        tls: row.bool("tls")?,
+                        username: row.opt_text("username")?,
+                        password: row.opt_text("password")?,
+                        connections: u16_from_i64(
+                            row.i64("connections")?,
+                            "server connections",
+                        )?,
+                        active: row.bool("active")?,
+                        supports_pipelining: row.bool("supports_pipelining")?,
+                        pipelining_depth: row
+                            .opt_i64("pipelining_depth")?
+                            .and_then(|depth| u8::try_from(depth).ok()),
+                        priority: u32_from_i64(row.i64("priority")?, "server priority")?,
+                        backfill: row.bool("backfill")?,
+                        retention_days: u32_from_i64(
+                            row.i64("retention_days")?,
+                            "server retention days",
+                        )?,
+                        max_download_speed: u64_from_i64(
+                            row.i64("max_download_speed")?,
+                            "server max download speed",
+                        )?,
+                        download_quota_enabled: row.bool("download_quota_enabled")?,
+                        download_quota_limit_bytes: u64_from_i64(
+                            row.i64("download_quota_limit_bytes")?,
+                            "server download quota limit",
+                        )?,
+                        download_quota_period: {
+                            let value = row.text("download_quota_period")?;
+                            ServerDownloadQuotaPeriod::parse(&value).ok_or_else(|| {
+                                StateError::Database(format!(
+                                    "invalid server download quota period '{value}'"
+                                ))
+                            })?
+                        },
+                        download_quota_reset_time_minutes_local: u16_from_i64(
+                            row.i64("download_quota_reset_time_minutes_local")?,
+                            "server download quota reset time",
+                        )?,
+                        download_quota_weekly_reset_weekday: {
+                            let value = row.text("download_quota_weekly_reset_weekday")?;
+                            crate::servers::record::parse_quota_weekday(&value).ok_or_else(|| {
+                                StateError::Database(format!(
+                                    "invalid server download quota weekday '{value}'"
+                                ))
+                            })?
+                        },
+                        download_quota_monthly_reset_day: u8_from_i64(
+                            row.i64("download_quota_monthly_reset_day")?,
+                            "server download quota monthly reset day",
+                        )?,
+                        tls_ca_cert: row.opt_text("tls_ca_cert")?,
+                        tls_name_mismatch_certificate_der: row.opt_bytes("tls_name_mismatch_certificate_der")?,
+                    };
+                    record.password = maybe_decrypt(encryption_key.as_ref(), record.password);
+                    Ok(record.into_config())
+                })
+                .collect()
+        })
+    }
+
+    fn next_server_id(&self) -> Result<u32, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let row = SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT MAX(id) AS id FROM servers",
+                &[],
+            )
+            .await?;
+            let max = row
+                .map(|row| row.opt_i64("id"))
+                .transpose()?
+                .flatten()
+                .unwrap_or(0);
+            let max = u32_from_i64(max, "server id")?;
+            max.checked_add(1).ok_or_else(|| {
+                StateError::Database("no server IDs remain in the database range".to_string())
+            })
+        })
+    }
+
+    // Read just the proven BODY pipelining depth. The download runtime writes
+    // this column behind the in-memory config, so an editor that wants to keep
+    // it has to ask the database rather than the config it already holds.
+    fn server_pipelining_depth(&self, id: u32) -> Result<Option<u8>, StateError> {
+        let datastore = self.datastore();
+        let args = vec![SqlArg::I64(i64::from(id))];
+        self.run_sql_blocking_read(async move {
+            let row = SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT pipelining_depth FROM servers WHERE id = {}",
+                &args,
+            )
+            .await?;
+            row.map(|row| row.opt_i64("pipelining_depth"))
+                .transpose()?
+                .flatten()
+                .map(|depth| u8_from_i64(depth, "server pipelining depth"))
+                .transpose()
+        })
+    }
+}
+
+fn u64_from_i64(value: i64, field: &str) -> Result<u64, StateError> {
+    u64::try_from(value).map_err(|_| StateError::Database(format!("{field} must not be negative")))
+}
+
+fn u32_from_i64(value: i64, field: &str) -> Result<u32, StateError> {
+    u32::try_from(value)
+        .map_err(|_| StateError::Database(format!("{field} is outside the supported range")))
+}
+
+fn u16_from_i64(value: i64, field: &str) -> Result<u16, StateError> {
+    u16::try_from(value)
+        .map_err(|_| StateError::Database(format!("{field} is outside the supported range")))
+}
+
+fn u8_from_i64(value: i64, field: &str) -> Result<u8, StateError> {
+    u8::try_from(value)
+        .map_err(|_| StateError::Database(format!("{field} is outside the supported range")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persisted_server_integer_conversions_reject_narrowing() {
+        assert!(u64_from_i64(-1, "bytes").is_err());
+        assert!(u32_from_i64(-1, "id").is_err());
+        assert!(u32_from_i64(i64::from(u32::MAX) + 1, "id").is_err());
+        assert!(u16_from_i64(i64::from(u16::MAX) + 1, "port").is_err());
+        assert!(u8_from_i64(i64::from(u8::MAX) + 1, "day").is_err());
+    }
+}

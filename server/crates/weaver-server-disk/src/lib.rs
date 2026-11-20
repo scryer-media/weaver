@@ -16,6 +16,9 @@ pub mod operations {
     };
 }
 pub mod pipeline {
+    pub mod archive {
+        pub mod split_reader;
+    }
     pub mod graph {
         pub mod sparse;
     }

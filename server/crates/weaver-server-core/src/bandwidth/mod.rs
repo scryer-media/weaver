@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-pub mod caps;
-pub mod limits;
+pub use weaver_server_net::bandwidth::caps;
+pub use weaver_server_net::bandwidth::limits;
 pub mod model;
-pub mod persistence;
-pub mod queries;
-pub mod rate_limiter;
+pub use weaver_server_net::bandwidth::persistence;
+pub use weaver_server_net::bandwidth::queries;
+pub use weaver_server_net::bandwidth::rate_limiter;
 pub mod record;
 pub mod repository;
 pub mod schedule;

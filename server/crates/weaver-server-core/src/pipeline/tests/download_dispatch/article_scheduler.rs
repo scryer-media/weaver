@@ -10,6 +10,7 @@
 // others.
 
 use super::*;
+use crate::jobs::model::SchedulingMemoryEstimate;
 use crate::jobs::persistence::JobsPersistenceInternalQueries;
 use crate::jobs::repository::JobsRepositoryQueries;
 use crate::pipeline::download::scheduler::{Handout, LaneShare, SaturationWake, YieldReason};

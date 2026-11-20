@@ -12,6 +12,35 @@ use http::uri::Authority;
 use ipnet::IpNet;
 use url::Url;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallerScope {
+    Local,
+    Read,
+    Control,
+    Admin,
+    // A running script calling with its run's token. The API limits its
+    // queries to an explicit allowlist and its changes to its own run.
+    // It is neither control nor admin anywhere.
+    ScriptRun,
+}
+
+impl CallerScope {
+    pub fn can_read(&self) -> bool {
+        true
+    }
+
+    pub fn can_control(&self) -> bool {
+        matches!(
+            self,
+            CallerScope::Local | CallerScope::Control | CallerScope::Admin
+        )
+    }
+
+    pub fn is_admin(&self) -> bool {
+        matches!(self, CallerScope::Local | CallerScope::Admin)
+    }
+}
+
 pub const ENV_HTTP_BIND_ADDRESS: &str = "WEAVER_HTTP_BIND_ADDRESS";
 pub const ENV_HTTP_ALLOWED_HOSTS: &str = "WEAVER_HTTP_ALLOWED_HOSTS";
 pub const ENV_METRICS_AUTH_REQUIRED: &str = "WEAVER_METRICS_AUTH_REQUIRED";

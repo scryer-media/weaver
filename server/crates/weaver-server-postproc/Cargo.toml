@@ -1,0 +1,20 @@
+[package]
+name = "weaver-server-postproc"
+description = "Post-processing script discovery, declarations and directives"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[dependencies]
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+weaver-server-base = { path = "../weaver-server-base" }
+weaver-server-history = { path = "../weaver-server-history" }
+weaver-server-net = { path = "../weaver-server-net" }
+
+[dev-dependencies]
+weaver-nzb = { path = "../../../engines/weaver-nzb", default-features = false }
+tempfile = { workspace = true }

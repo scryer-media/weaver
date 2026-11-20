@@ -17,7 +17,7 @@ pub(crate) use network_persistence::lock_network;
 mod network_runtime;
 pub(crate) mod persistence;
 pub use persistence::ProxiesPersistenceQueries;
-mod pool_stage;
+use weaver_server_net::proxies::pool_stage;
 mod refusal;
 #[cfg(test)]
 mod route_guard_tests;

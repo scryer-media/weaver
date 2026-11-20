@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use crate::history::timeline::HistoryTimelineInternalQueries;
+use crate::jobs::model::SchedulingMemoryEstimate;
 use crate::jobs::persistence::JobsPersistenceInternalQueries;
 use crate::jobs::persistence::JobsPersistenceQueries;
 use crate::jobs::queries::JobsInternalQueries;

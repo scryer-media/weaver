@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-pub mod attributes;
+pub use weaver_server_history::history::attributes;
 pub(crate) mod cache;
 pub(crate) mod delete_files;
 pub mod delete_queue;
 pub mod failure_kind;
-pub mod model;
+pub use weaver_server_history::history::model;
 pub mod nzbget_state;
 pub mod output_files;
 pub mod persistence;

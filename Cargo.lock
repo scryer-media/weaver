@@ -6679,6 +6679,134 @@ dependencies = [
 ]
 
 [[package]]
+name = "weaver-server-settings"
+version = "0.16.17"
+dependencies = [
+ "blake3",
+ "crc-turbo",
+ "getrandom 0.4.3",
+ "libc",
+ "rcgen",
+ "serde",
+ "serde_json",
+ "sevenz-turbo",
+ "thiserror 2.0.21",
+ "tokio",
+ "toml",
+ "tracing",
+ "unrar-rs",
+ "url",
+ "weaver-model",
+ "weaver-server-base",
+ "weaver-server-db",
+ "weaver-server-jobs",
+ "weaver-torrent",
+ "x509-parser",
+ "zip",
+]
+
+[[package]]
+name = "weaver-server-auth"
+version = "0.16.17"
+dependencies = [
+ "argon2",
+ "base64 0.23.1",
+ "getrandom 0.4.3",
+ "hex",
+ "hmac 0.13.0",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "weaver-server-base",
+ "weaver-server-db",
+ "weaver-server-settings",
+]
+
+[[package]]
+name = "weaver-server-ingest"
+version = "0.16.17"
+dependencies = [
+ "blake3",
+ "brotli",
+ "bzip2",
+ "flate2",
+ "http",
+ "lzma-turbo",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "sevenz-turbo",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tracing",
+ "unrar-rs",
+ "weaver-model",
+ "weaver-nzb",
+ "weaver-server-base",
+ "weaver-server-disk",
+ "weaver-server-jobs",
+ "weaver-server-settings",
+ "zip",
+ "zstd",
+]
+
+[[package]]
+name = "weaver-server-jobs"
+version = "0.16.17"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+ "unicase",
+ "unicode-normalization",
+ "weaver-model",
+ "weaver-server-base",
+ "weaver-server-db",
+]
+
+[[package]]
+name = "weaver-server-history"
+version = "0.16.17"
+dependencies = [
+ "serde_json",
+ "unicode-normalization",
+ "weaver-server-ingest",
+]
+
+[[package]]
+name = "weaver-server-net"
+version = "0.16.17"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "serde",
+ "tokio",
+ "weaver-nntp",
+ "weaver-server-base",
+ "weaver-server-db",
+ "weaver-tunnel",
+]
+
+[[package]]
+name = "weaver-server-postproc"
+version = "0.16.17"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "weaver-nzb",
+ "weaver-server-base",
+ "weaver-server-history",
+ "weaver-server-net",
+]
+
+[[package]]
 name = "weaver-server-db"
 version = "0.16.17"
 dependencies = [
@@ -6795,10 +6923,17 @@ dependencies = [
  "weaver-nntp",
  "weaver-nzb",
  "weaver-objects",
+ "weaver-server-auth",
  "weaver-server-base",
  "weaver-server-db",
  "weaver-server-disk",
+ "weaver-server-history",
+ "weaver-server-ingest",
+ "weaver-server-jobs",
  "weaver-server-migrations",
+ "weaver-server-net",
+ "weaver-server-postproc",
+ "weaver-server-settings",
  "weaver-torrent",
  "weaver-tunnel",
  "weaver-yenc",

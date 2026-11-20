@@ -5,7 +5,7 @@ use crate::torrents::queries::TorrentsInternalQueries;
 pub mod admission;
 pub mod availability;
 pub(crate) mod files;
-pub mod identity;
+pub use weaver_server_settings::torrents::identity;
 pub(crate) mod intake;
 pub(crate) mod layout;
 pub mod metrics;

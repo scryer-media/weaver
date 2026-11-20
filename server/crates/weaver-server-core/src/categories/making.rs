@@ -49,24 +49,6 @@ impl Made {
     }
 }
 
-impl CategoryConfig {
-    /// A category of `name` with every setting at its default: no folder of
-    /// its own (it saves under the default save folder), no aliases, and
-    /// everything else inherited.
-    pub fn named(name: String) -> Self {
-        Self {
-            id: 0,
-            name,
-            dest_dir: None,
-            aliases: String::new(),
-            seeding: None,
-            torrent_route: false,
-            unpack: None,
-            upload_cap: Default::default(),
-        }
-    }
-}
-
 /// Makes `category`, under the next free id, unless a category of its name
 /// is there. The row is one write through the writer gate, off the async
 /// runtime; the settings take it once it is written. Its name is the

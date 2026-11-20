@@ -4,17 +4,17 @@
 pub(crate) mod archive_passwords;
 pub use archive_passwords::SettingsArchivePasswordsQueries;
 pub mod env_seed;
-pub mod levels;
+pub use weaver_server_settings::settings::levels;
 pub mod model;
-pub mod persistence;
-pub mod queries;
-pub mod record;
+pub use weaver_server_settings::settings::persistence;
+pub use weaver_server_settings::settings::queries;
+pub use weaver_server_settings::settings::record;
 pub mod repository;
 mod schedules;
 pub(crate) use schedules::SettingsSchedulesInternalQueries;
 pub use schedules::SettingsSchedulesQueries;
 pub mod service;
-pub mod tracker_file;
+pub use weaver_server_settings::settings::tracker_file;
 
 pub use model::{
     BlocklistSource, Client, Config, DEFAULT_HISTORY_RETENTION_DAYS, DeliveryNamingOverrides,

@@ -5,16 +5,16 @@
 // instances that each run one script on one trigger.
 
 pub mod callbacks;
-pub mod directives;
+pub use weaver_server_postproc::post_processing::directives;
 pub mod effects;
 pub mod events;
 pub mod executor;
 pub mod feed;
 pub mod hooks;
 pub mod instances;
-pub mod listing;
-pub mod manifest;
-pub mod model;
+pub use weaver_server_postproc::post_processing::listing;
+pub use weaver_server_postproc::post_processing::manifest;
+pub use weaver_server_postproc::post_processing::model;
 pub mod output;
 pub mod preset;
 pub mod quota_events;
@@ -29,12 +29,6 @@ pub mod test_run;
 
 #[cfg(test)]
 mod executor_tests;
-#[cfg(test)]
-mod listing_tests;
-#[cfg(test)]
-mod manifest_tests;
-#[cfg(test)]
-mod model_tests;
 #[cfg(test)]
 pub(crate) mod runner_tests;
 #[cfg(test)]

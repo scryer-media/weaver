@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::Database;
 
 fn test_hash(seed: u8) -> [u8; 32] {
     let mut h = [0u8; 32];
