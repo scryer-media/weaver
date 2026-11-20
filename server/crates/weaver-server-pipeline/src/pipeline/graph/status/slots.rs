@@ -49,6 +49,11 @@ impl RepairSlots {
         self.tickets.contains_key(&asker)
     }
 
+    // Whether the asker waits in the queue for a slot: a release wakes it.
+    pub(crate) fn waits(&self, asker: AskerId) -> bool {
+        self.slots.waits(asker)
+    }
+
     pub fn release(&mut self, ticket: Ticket) {
         let admissions = self.slots.release(ticket);
         self.note(admissions);

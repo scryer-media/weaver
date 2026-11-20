@@ -207,7 +207,7 @@ enum Entry {
     Fatal(String),
 }
 
-pub(crate) struct RepeatedArticles {
+pub struct RepeatedArticles {
     entries: HashMap<MessageId, Arc<tokio::sync::Mutex<Option<Entry>>>>,
     root: Arc<CacheRoot>,
     memory: Arc<ProcessMemoryBudget>,

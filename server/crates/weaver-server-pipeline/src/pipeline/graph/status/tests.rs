@@ -81,6 +81,11 @@ impl RootJob for Prepared {
         true
     }
 
+    // One namespace, bound in nothing.
+    fn vouched_above(&self, _: NodeId) -> bool {
+        false
+    }
+
     fn repair(&mut self) -> Vec<RepairOutcome> {
         let outcomes = self.outcomes.get(self.repairs).cloned().unwrap_or_default();
         self.repairs += 1;
@@ -500,13 +505,19 @@ fn a_repair_of_one_set_never_excuses_another() {
 
 // The repair failures the job says as it leaves repair.
 fn repair_failures(job: &Prepared) -> Vec<String> {
-    super::seams::stage_events(JobId(7), Some(RootPhase::Repairing), RootPhase::Done, job)
-        .into_iter()
-        .filter_map(|event| match event {
-            PipelineEvent::RepairFailed { error, .. } => Some(error),
-            _ => None,
-        })
-        .collect()
+    super::seams::stage_events(
+        JobId(7),
+        Some(RootPhase::Repairing),
+        RootPhase::Done,
+        job,
+        true,
+    )
+    .into_iter()
+    .filter_map(|event| match event {
+        PipelineEvent::RepairFailed { error, .. } => Some(error),
+        _ => None,
+    })
+    .collect()
 }
 
 // A listing that ruled past repair beside a PAR2 set that repaired the

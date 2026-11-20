@@ -12,11 +12,13 @@
 //   slots     the repair slots the graph jobs share
 //   metrics   the `graph.*` family
 //   seams     the pipeline's hooks: completion, the census, scripts
+//   stall     a job that waits on nothing ends
 
 mod claims;
 mod metrics;
 mod seams;
 mod slots;
+mod stall;
 mod summary;
 
 #[cfg(test)]
@@ -61,6 +63,9 @@ pub(crate) trait RootJob {
     fn recovery_summary(&self) -> RecoverySummary;
     // Whether the recovery object at `set` covers `member` of its namespace.
     fn covers(&self, set: NodeId, member: MemberId) -> bool;
+    // What the namespace `node` came out of, at some depth, a recovery set
+    // proved (`Tree::vouched_above`). Never the root.
+    fn vouched_above(&self, node: NodeId) -> bool;
     // Run every recovery object of the root namespace.
     fn repair(&mut self) -> Vec<RepairOutcome>;
     // An object below the root produced members.
@@ -117,6 +122,10 @@ impl RootJob for GraphJob {
         self.tree()
             .recovery(set)
             .is_some_and(|recovery| recovery.covers(member))
+    }
+
+    fn vouched_above(&self, node: NodeId) -> bool {
+        self.tree().vouched_above(node)
     }
 
     fn repair(&mut self) -> Vec<RepairOutcome> {
@@ -208,7 +217,9 @@ pub(crate) fn drive(
 // fails for its short sets alone, each named as it was posted, and leaves
 // short only what they bind (`SetSummary::leaves_short`).
 // Each set is judged in the namespace it lives
-// in, at whatever depth. A breach of the job's extraction budget fails the
+// in, at whatever depth. An SFV in a namespace that came out of volumes a
+// set above proved makes no claim: what it lists is what was posted, and
+// its ruling fails nothing. A breach of the job's extraction budget fails the
 // job before any of that: it carries the budget's refusal, worded as the
 // job's failure reason, and names no object. When no set failed and the
 // feed gave the post up, the failure is the feed's, in its words.
@@ -277,7 +288,10 @@ pub(crate) fn failure(
     let failed: Vec<(&SetSummary, u64, u64)> = ruled
         .iter()
         .filter_map(|(set, outcome)| match outcome {
-            RepairOutcome::Impossible { damaged, reachable } if !excused(set) => {
+            RepairOutcome::Impossible { damaged, reachable }
+                if !excused(set)
+                    && !(set.kind == Kind::Sfv && job.vouched_above(set.namespace)) =>
+            {
                 Some((*set, *damaged, *reachable))
             }
             _ => None,

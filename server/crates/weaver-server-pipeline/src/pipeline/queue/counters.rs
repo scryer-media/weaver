@@ -25,7 +25,7 @@ pub(crate) struct PhaseSample {
 }
 
 impl Queue {
-    pub(crate) fn begin_phase(
+    pub fn begin_phase(
         &self,
         id: JobId,
         phase: JobPhase,

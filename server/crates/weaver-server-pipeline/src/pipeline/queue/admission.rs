@@ -213,7 +213,7 @@ pub(crate) fn outline_read(row: &mut JobRow, request: crate::jobs::handle::Resto
 // article not in hand still to come at its share of its file's bytes, and
 // every PAR2 or PAR3 file, index included, with an article still to come.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct LeanFigures {
+pub struct LeanFigures {
     pub remaining_bytes: u64,
     pub wanted_bytes: u64,
     pub optional_recovery_bytes: u64,
@@ -222,10 +222,7 @@ pub(crate) struct LeanFigures {
 }
 
 impl LeanFigures {
-    pub(crate) fn of(
-        spec: &JobSpec,
-        summaries: Option<&crate::jobs::model::FileSummaries>,
-    ) -> Self {
+    pub fn of(spec: &JobSpec, summaries: Option<&crate::jobs::model::FileSummaries>) -> Self {
         use weaver_model::files::FileRole;
         let mut figures = Self::default();
         for (index, file) in spec.files.iter().enumerate() {
@@ -265,7 +262,7 @@ impl LeanFigures {
     }
 }
 
-pub(super) fn initial_info(
+pub fn initial_info(
     id: JobId,
     spec: &JobSpec,
     summaries: Option<&crate::jobs::model::FileSummaries>,
@@ -325,7 +322,7 @@ pub(super) fn initial_info(
 // folder, else the complete directory. A category whose folder cannot be
 // resolved stages under the complete directory; its move then says why it
 // cannot deliver.
-pub(crate) fn destination_root(
+pub fn destination_root(
     complete_dir: &Path,
     categories: &[weaver_server_settings::categories::CategoryConfig],
     category: Option<&str>,
@@ -339,8 +336,8 @@ pub(crate) use crate::jobs::working_dir::{staging_dir_for, staging_dir_on};
 // [`staging_dir_on`] with the devices read on the spot, as the choice was
 // made before the disk owner answered it: what a test compares the owner's
 // choice with.
-#[cfg(test)]
-pub(crate) fn delivery_staging_dir(
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+pub fn delivery_staging_dir(
     intermediate_dir: &Path,
     destination_root: &Path,
     job_id: JobId,
@@ -355,7 +352,7 @@ pub(crate) fn delivery_staging_dir(
 // Make the job's staging directory and mark it the job's, as its working
 // directory is. Nothing under the destination is reached through a symbolic
 // link.
-pub(crate) fn make_staging_dir(staging_dir: &Path, job_id: JobId) -> std::io::Result<()> {
+pub fn make_staging_dir(staging_dir: &Path, job_id: JobId) -> std::io::Result<()> {
     crate::jobs::working_dir::make_job_staging_dir(staging_dir, job_id)
 }
 
@@ -376,225 +373,4 @@ pub fn destination_roots(
         }))
         .filter(|root| seen.insert(root.clone()))
         .collect()
-}
-
-#[cfg(test)]
-mod staging_tests {
-    use super::*;
-
-    #[test]
-    fn one_device_stages_nothing() {
-        let root = tempfile::tempdir().expect("temp dir");
-        let intermediate = root.path().join("intermediate");
-        let complete = root.path().join("complete");
-        assert_eq!(
-            delivery_staging_dir(&intermediate, &complete, JobId(7)),
-            None
-        );
-    }
-
-    #[test]
-    fn two_devices_stage_under_the_destination() {
-        let root = tempfile::tempdir().expect("temp dir");
-        let intermediate = root.path().join("intermediate");
-        let complete = root.path().join("complete");
-        weaver_server_disk::runtime::fs::test_devices::assign(&intermediate, 1);
-        weaver_server_disk::runtime::fs::test_devices::assign(&complete, 2);
-        assert_eq!(
-            delivery_staging_dir(&intermediate, &complete, JobId(7)),
-            Some(complete.join(".weaver-staging").join("7"))
-        );
-    }
-
-    fn category(
-        name: &str,
-        dest_dir: Option<&Path>,
-    ) -> weaver_server_settings::categories::CategoryConfig {
-        weaver_server_settings::categories::CategoryConfig {
-            id: 1,
-            name: name.to_string(),
-            dest_dir: dest_dir.map(|dir| dir.display().to_string()),
-            aliases: String::new(),
-            upload_cap: Default::default(),
-            seeding: None,
-            torrent_route: false,
-            unpack: None,
-        }
-    }
-
-    // A category with its own folder on another device stages there, never
-    // on the complete directory's device; one on the intermediate device
-    // stages nothing.
-    #[test]
-    fn a_category_folder_decides_where_the_job_stages() {
-        let root = tempfile::tempdir().expect("temp dir");
-        let intermediate = root.path().join("intermediate");
-        let complete = root.path().join("complete");
-        let movies = root.path().join("movies");
-        let beside = root.path().join("beside");
-        weaver_server_disk::runtime::fs::test_devices::assign(&intermediate, 1);
-        weaver_server_disk::runtime::fs::test_devices::assign(&complete, 2);
-        weaver_server_disk::runtime::fs::test_devices::assign(&movies, 3);
-        weaver_server_disk::runtime::fs::test_devices::assign(&beside, 1);
-        let categories = vec![
-            category("movies", Some(&movies)),
-            category("beside", Some(&beside)),
-            category("tv", None),
-        ];
-        let stage = |name: Option<&str>| {
-            delivery_staging_dir(
-                &intermediate,
-                &destination_root(&complete, &categories, name),
-                JobId(7),
-            )
-        };
-        assert_eq!(
-            stage(Some("movies")),
-            Some(movies.join(".weaver-staging").join("7"))
-        );
-        assert_eq!(stage(Some("beside")), None);
-        assert_eq!(
-            stage(Some("tv")),
-            Some(complete.join("tv").join(".weaver-staging").join("7"))
-        );
-        assert_eq!(
-            stage(None),
-            Some(complete.join(".weaver-staging").join("7"))
-        );
-        // A category that cannot be resolved stages under the complete
-        // directory.
-        assert_eq!(
-            stage(Some("../outside")),
-            Some(complete.join(".weaver-staging").join("7"))
-        );
-        assert_eq!(
-            destination_roots(&complete, &categories),
-            vec![complete.clone(), movies, beside, complete.join("tv")]
-        );
-    }
-
-    #[test]
-    fn a_staging_directory_is_made_and_marked_the_job_s() {
-        let complete = tempfile::tempdir().expect("temp dir");
-        let staging = staging_dir_for(complete.path(), JobId(9));
-        make_staging_dir(&staging, JobId(9)).expect("staging");
-        assert!(crate::jobs::working_dir::is_weaver_owned_working_dir(
-            &staging
-        ));
-        assert!(
-            crate::jobs::working_dir::is_job_working_dir(
-                &complete.path().join(".weaver-staging"),
-                &staging,
-                JobId(9)
-            )
-            .expect("marker")
-        );
-    }
-}
-
-#[cfg(test)]
-mod lean_figure_tests {
-    use super::*;
-    use crate::jobs::model::{FileSpec, FileSummaries, FileSummary, MessageIds, SegmentSpec};
-    use weaver_model::files::FileRole;
-
-    fn file(name: &str, sizes: &[u32]) -> FileSpec {
-        FileSpec {
-            filename: name.to_string(),
-            role: FileRole::from_filename(name),
-            groups: Vec::new(),
-            posted_at_epoch: None,
-            segments: (0u32..)
-                .zip(sizes)
-                .map(|(ordinal, &bytes)| SegmentSpec {
-                    ordinal,
-                    article_number: ordinal + 1,
-                    bytes,
-                    message_ids: MessageIds::new(vec![format!("{name}-{ordinal}")]),
-                })
-                .collect(),
-        }
-    }
-
-    fn spec() -> JobSpec {
-        JobSpec {
-            name: "post".to_string(),
-            password: None,
-            files: vec![
-                file("post.part01.rar", &[100, 100]),
-                file("post.par2", &[10]),
-                file("post.vol00+02.par2", &[50, 50]),
-                file("post.vol00+04.par3", &[40]),
-                file("post.part01.rev", &[30]),
-            ],
-            total_bytes: 430,
-            category: None,
-            metadata: Vec::new(),
-        }
-    }
-
-    // A job that never ran shows every PAR2 and PAR3 file to come, its
-    // recovery volumes apart from what it is out to bring, and the same
-    // wanted bytes the queue showed before.
-    #[test]
-    fn a_job_that_never_ran_counts_its_recovery_from_the_spec() {
-        let spec = spec();
-        let figures = LeanFigures::of(&spec, None);
-        let summaries = FileSummaries(spec.files.iter().map(FileSummary::of).collect());
-        assert_eq!(figures, LeanFigures::of(&spec, Some(&summaries)));
-        assert_eq!(figures.wanted_bytes, spec.wanted_bytes());
-        assert_eq!(figures.wanted_bytes, summaries.wanted_bytes(&spec));
-        assert_eq!(
-            figures,
-            LeanFigures {
-                remaining_bytes: 240,
-                wanted_bytes: 240,
-                optional_recovery_bytes: 140,
-                optional_recovery_downloaded_bytes: 0,
-                remaining_par_files: 3,
-            }
-        );
-    }
-
-    // A job waiting its turn after it ran shows what its summaries hold in
-    // hand, without its article lists.
-    #[test]
-    fn a_job_that_ran_counts_what_its_summaries_hold_in_hand() {
-        let mut spec = spec();
-        let in_hand = |file: &FileSpec, held: u32| FileSummary {
-            remaining: file.segments.len() as u32 - held,
-            ..FileSummary::of(file)
-        };
-        let summaries = FileSummaries(vec![
-            in_hand(&spec.files[0], 1),
-            in_hand(&spec.files[1], 1),
-            in_hand(&spec.files[2], 1),
-            in_hand(&spec.files[3], 0),
-            in_hand(&spec.files[4], 1),
-        ]);
-        spec.drop_article_lists();
-        assert_eq!(
-            LeanFigures::of(&spec, Some(&summaries)),
-            LeanFigures {
-                remaining_bytes: 100,
-                wanted_bytes: 240,
-                optional_recovery_bytes: 140,
-                optional_recovery_downloaded_bytes: 50,
-                remaining_par_files: 2,
-            }
-        );
-        let info = initial_info(
-            JobId(1),
-            &spec,
-            Some(&summaries),
-            [0; 32],
-            Path::new("/work"),
-            true,
-        );
-        assert_eq!(info.optional_recovery_bytes, 140);
-        assert_eq!(info.optional_recovery_downloaded_bytes, 50);
-        assert_eq!(info.remaining_par_files, 2);
-        assert_eq!((info.remaining_bytes, info.wanted_bytes), (100, 240));
-        assert!((info.progress - 140.0 / 240.0).abs() < 1e-9);
-    }
 }

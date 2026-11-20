@@ -217,6 +217,9 @@ struct Volume {
     // The bytes found carried by no article since the damage was last
     // taken.
     cuts: Vec<ByteRange>,
+    // The boundaries whose cut waits for the volume to settle: wider than
+    // a short article leaves, with articles after it still to come.
+    held: BTreeSet<usize>,
     // The chunks of the volume's facts each change touched.
     marks: Marks<Chunk>,
     // Bumped by every change a seek's answer reads: an article's state or
@@ -260,6 +263,7 @@ impl Volume {
             starts: BTreeMap::new(),
             cut: BTreeMap::new(),
             cuts: Vec::new(),
+            held: BTreeSet::new(),
             marks: Marks::default(),
             changes: 0,
             answered: HashMap::new(),
@@ -617,8 +621,13 @@ impl Volume {
                 self.set_state(open, at, State::Lost { damaged: true });
             }
         }
+        if settled {
+            for boundary in std::mem::take(&mut self.held) {
+                self.cut_at(open, boundary);
+            }
+        }
         out.append(&mut self.cuts);
-        if !untold {
+        if !untold && self.held.is_empty() {
             open.untold.remove(&self.at);
         }
         Ok(())
@@ -656,7 +665,37 @@ impl Volume {
         else {
             return;
         };
+        // An article in hand placed between the edges carries the bytes
+        // from its start: one whose header put it past the rest of the
+        // volume leaves them to the articles placed there.
+        let before = boundary
+            .checked_sub(1)
+            .map(|before| self.articles[before].ordinal);
+        let to = self
+            .starts
+            .range(from..)
+            .find(|(start, ordinals)| {
+                **start > from || ordinals.iter().any(|at| Some(*at) != before)
+            })
+            .map_or(to, |(start, _)| to.min(*start));
         let from = self.cut.get(&boundary).map_or(from, |told| from.max(*told));
+        // A short article leaves at most its posted bytes behind it. A
+        // wider cut, with articles after it still to come, may hold their
+        // bytes, so it waits until the volume settles. A post that
+        // understates its sizes only makes a cut wait.
+        let short = boundary.checked_sub(1).map_or(0, |before| {
+            self.encoded_at(before + 1) - self.encoded_at(before)
+        });
+        let to_come = open
+            .waiting
+            .get(&self.at)
+            .is_some_and(|waiting| waiting.range(boundary..).next().is_some());
+        if to > from && to - from > short && to_come {
+            self.held.insert(boundary);
+            open.untold.insert(self.at);
+            return;
+        }
+        self.held.remove(&boundary);
         if to > from {
             self.cuts.push(ByteRange::new(from, to));
             self.cut.insert(boundary, to);
@@ -1148,11 +1187,28 @@ impl ArticleMap {
             };
         }
         // A deferral moves only what it can park, and is never lost.
-        let covering: Vec<usize> = if parks {
+        let mut covering: Vec<usize> = if parks {
             found.parkable_covering(range).collect()
         } else {
             found.covering(range).collect()
         };
+        // Once the post's placements disagree, the bounds of an article
+        // still to come say nothing of where its own header puts it: one
+        // after an article placed past the volume's end is bounded past it
+        // too. A raise that runs to the volume's end takes every article of
+        // the volume still waited on, so none it may need is left behind.
+        if !parks
+            && found.disorder > 0
+            && range.end == end
+            && let Some(waiting) = self.open.waiting.get(&volume)
+        {
+            covering.extend(
+                waiting
+                    .iter()
+                    .copied()
+                    .filter(|index| !found.may_carry(*index, range)),
+            );
+        }
         let lost = !parks
             && covering.iter().any(|index| {
                 matches!(found.articles[*index].state, State::Lost { .. })

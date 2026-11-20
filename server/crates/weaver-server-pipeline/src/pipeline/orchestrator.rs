@@ -5,6 +5,12 @@ use super::*;
 
 mod commands;
 mod control;
+#[cfg(feature = "pipeline-test-fixtures")]
+pub(super) mod units {
+    pub mod control {
+        pub use super::super::control::*;
+    }
+}
 mod hardware_profile;
 mod history;
 mod report;

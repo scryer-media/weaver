@@ -27,7 +27,7 @@ pub(super) const HELD_SPOOL_PREFIX: &str = "held-";
 const SEGMENT_BYTES: usize = 8 + 8 + 4;
 
 // The directory a job's held parts are spooled to.
-pub(super) fn held_spool_dir(working_dir: &Path) -> PathBuf {
+pub fn held_spool_dir(working_dir: &Path) -> PathBuf {
     working_dir.join(weaver_graph::names::INTERNAL_DIR)
 }
 
@@ -47,7 +47,7 @@ fn check_held_spool_dir(dir: &Path) -> std::io::Result<()> {
 
 // Make `dir` ready for a spill: checked when it is there, created when it
 // is not.
-pub(super) fn prepare_held_spool_dir(dir: &Path) -> std::io::Result<()> {
+pub fn prepare_held_spool_dir(dir: &Path) -> std::io::Result<()> {
     match check_held_spool_dir(dir) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir_all(dir),
         checked => checked,
@@ -56,9 +56,9 @@ pub(super) fn prepare_held_spool_dir(dir: &Path) -> std::io::Result<()> {
 
 // A held part a checkpoint names whose spool file is on disk, as a restore
 // gives it to the job's activation.
-pub(crate) struct HeldPart {
+pub struct HeldPart {
     pub(super) segment_id: SegmentId,
-    pub(super) path: PathBuf,
+    pub path: PathBuf,
     pub(super) decoded_bytes: usize,
     // What a held article's decode found, with no data of its own; `None`
     // for a uuencode part.
@@ -77,7 +77,7 @@ impl HeldPart {
 // no decode could have found, names a part that is fetched again; so does
 // every row when the spool directory is not one a spill would write to.
 // Blocks: it reads each file's length.
-pub(crate) fn held_parts_from_rows(
+pub fn held_parts_from_rows(
     job_id: JobId,
     working_dir: &Path,
     rows: &[HeldPartRow],
@@ -313,6 +313,3 @@ impl Pipeline {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

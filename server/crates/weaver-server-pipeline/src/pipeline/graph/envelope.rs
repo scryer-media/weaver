@@ -37,6 +37,9 @@ pub(crate) struct Envelopes {
     // latest change: every way to change what a checkpoint says of them
     // marks the node.
     marks: Marks<NodeId>,
+    // Shared with every shelf: whether the job asks to hear of the next
+    // run to begin waiting on one.
+    watch: Arc<Watch>,
     // Rung as a run begins to wait on any of the job's shelves.
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     blocked: Arc<tokio::sync::Notify>,
@@ -52,8 +55,74 @@ pub(crate) struct Shelf {
     state: Mutex<Shelved>,
     changed: Condvar,
     readers: Mutex<Vec<Weak<ReadFiles>>>,
+    watch: Arc<Watch>,
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     blocked: Arc<tokio::sync::Notify>,
+}
+
+// A job that waits on nothing but runs still reading asks to hear of the
+// next one to begin waiting on its shelf: that run says so once, on the
+// mail the job's root notices go by, and the flag is down again. A run
+// records its wait under the shelf's lock before it reads the flag, and the
+// job raises the flag before it reads the shelves under the same lock, so
+// one of the two always sees the other.
+#[derive(Debug, Default)]
+pub(crate) struct Watch {
+    raised: std::sync::atomic::AtomicBool,
+    tell: std::sync::OnceLock<(tokio::sync::mpsc::UnboundedSender<super::engine::Said>, u64)>,
+    // The gate turns that asked and the notices sent, for a test to count.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    asks: std::sync::atomic::AtomicU64,
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    told: std::sync::atomic::AtomicU64,
+}
+
+impl Watch {
+    // Ask to hear of the next run to begin waiting, through `tell`, for
+    // the job `scope`, or ask no longer.
+    pub(crate) fn ask(
+        &self,
+        asked: bool,
+        tell: impl FnOnce() -> (tokio::sync::mpsc::UnboundedSender<super::engine::Said>, u64),
+    ) {
+        if asked {
+            self.tell.get_or_init(tell);
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+            self.asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.raised
+            .store(asked, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub(crate) fn asks(&self) -> u64 {
+        self.asks.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub(crate) fn told(&self) -> u64 {
+        self.told.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    // A run began to wait on the shelf of `node`: one load while nobody
+    // asks, and the one notice when the job did.
+    fn began_to_wait(&self, node: NodeId, generation: u64) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if !self.raised.load(SeqCst) || !self.raised.swap(false, SeqCst) {
+            return;
+        }
+        let Some((tell, scope)) = self.tell.get() else {
+            return;
+        };
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+        self.told.fetch_add(1, SeqCst);
+        let _ = tell.send(super::engine::Said {
+            scope: *scope,
+            node,
+            generation,
+            heard: super::engine::Heard::Blocked,
+        });
+    }
 }
 
 // What a run reads its envelopes with, which a drain reaches.
@@ -135,9 +204,7 @@ pub(crate) struct Shelved {
     pub(crate) generation: u64,
     // How many times the shelf woke its waiters, and the count a run last
     // began to wait at: a run waits for good while the two agree.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) woken: u64,
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) waits_since: Option<u64>,
 }
 
@@ -213,9 +280,15 @@ impl Envelopes {
             given: Given::default(),
             shelves: BTreeMap::new(),
             marks: Marks::default(),
+            watch: Arc::default(),
             #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             blocked: Arc::default(),
         }
+    }
+
+    // What the job asks through to hear of a run beginning to wait.
+    pub(crate) fn watch(&self) -> &Watch {
+        &self.watch
     }
 
     // What rings as a run begins to wait on one of the shelves.
@@ -245,6 +318,7 @@ impl Envelopes {
         let dir = &self.working_dir;
         let to = &self.to;
         let given = &self.given;
+        let watch = &self.watch;
         #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         let blocked = &self.blocked;
         Arc::clone(self.shelves.entry(node).or_insert_with(|| {
@@ -256,6 +330,7 @@ impl Envelopes {
                 state: Mutex::default(),
                 changed: Condvar::new(),
                 readers: Mutex::default(),
+                watch: Arc::clone(watch),
                 #[cfg(any(test, feature = "pipeline-test-fixtures"))]
                 blocked: Arc::clone(blocked),
             })
@@ -566,10 +641,7 @@ impl Shelf {
     pub(crate) fn update<R>(&self, change: impl FnOnce(&mut Shelved) -> R) -> R {
         let mut state = self.lock();
         let result = change(&mut state);
-        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-        {
-            state.woken += 1;
-        }
+        state.woken += 1;
         drop(state);
         self.changed.notify_all();
         result
@@ -585,7 +657,6 @@ impl Shelf {
         let mut state = self.lock();
         let result = change(&mut state);
         let wakes = !matches!(result, Ok(false));
-        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         if wakes {
             state.woken += 1;
         }
@@ -597,30 +668,22 @@ impl Shelf {
     }
 
     // Wait for the shelf to change; the guard is given back once it did.
-    pub(crate) fn wait<'a>(
-        &self,
-        #[cfg_attr(not(any(test, feature = "pipeline-test-fixtures")), expect(unused_mut))]
-        mut state: MutexGuard<'a, Shelved>,
-    ) -> MutexGuard<'a, Shelved> {
+    // The wait is recorded before the job's watch is read, both under the
+    // lock: a job that asked to hear of it is told once.
+    pub(crate) fn wait<'a>(&self, mut state: MutexGuard<'a, Shelved>) -> MutexGuard<'a, Shelved> {
+        state.waits_since = Some(state.woken);
+        self.watch.began_to_wait(self.node, state.generation);
         #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-        {
-            state.waits_since = Some(state.woken);
-            self.blocked.notify_one();
-        }
-        #[cfg_attr(not(any(test, feature = "pipeline-test-fixtures")), expect(unused_mut))]
+        self.blocked.notify_one();
         let mut state = self
             .changed
             .wait(state)
             .unwrap_or_else(PoisonError::into_inner);
-        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-        {
-            state.waits_since = None;
-        }
+        state.waits_since = None;
         state
     }
 
     // Whether a run waits on the shelf for a change that has not come.
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn blocked(&self) -> bool {
         let state = self.lock();
         state.waits_since == Some(state.woken)

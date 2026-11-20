@@ -186,6 +186,9 @@ pub struct GraphJob {
     passwords: Passwords,
     // The phase last reported, so only a change is reported.
     reported: Option<RootPhase>,
+    // Whether the job reported Repairing in this run, or was restored
+    // reporting it: its end says a repair failed only then.
+    repair_reported: bool,
     // The checkpoint waiting for the database, if one is.
     pending: Pending,
     // A member's file waits to move on a checkpoint the database has not
@@ -320,6 +323,7 @@ impl GraphJob {
             runs,
             passwords: Passwords::default(),
             reported: None,
+            repair_reported: false,
             pending: Pending::default(),
             mail_owed: None,
             stopped_repair: None,
@@ -389,6 +393,11 @@ impl GraphJob {
     // The phase the job last reported, if it reported one.
     pub(crate) fn reported_phase(&self) -> Option<RootPhase> {
         self.reported
+    }
+
+    // Whether the job reported Repairing since it was added or restored.
+    pub(crate) fn repair_reported(&self) -> bool {
+        self.repair_reported
     }
 
     // The candidates offered to an object that asks for a password.
@@ -1596,6 +1605,7 @@ impl GraphJob {
         let phase = self.phase();
         (self.reported != Some(phase)).then(|| {
             self.reported = Some(phase);
+            self.repair_reported |= phase == RootPhase::Repairing;
             phase
         })
     }

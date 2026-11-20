@@ -58,6 +58,12 @@ use weaver_server_base::jobs::ids::{JobId, NzbFileId, SegmentId};
 
 mod first_articles;
 mod given_up;
+#[cfg(feature = "pipeline-test-fixtures")]
+pub(crate) mod units {
+    pub mod given_up {
+        pub use super::super::given_up::*;
+    }
+}
 
 pub(in crate::pipeline) use first_articles::FirstArticles;
 pub(in crate::pipeline) use given_up::GivenUp;
@@ -73,9 +79,9 @@ pub(crate) const FIRST_ARTICLE_GATE_MIN_FILES: usize = 10;
 pub(crate) const FIRST_ARTICLE_GATE_MISSING_PCT: usize = 80;
 
 // The least failed bytes a clean round waits for before the next.
-pub(crate) const REARM_MIN_BYTES: u64 = 128 * 1024 * 1024;
+pub const REARM_MIN_BYTES: u64 = 128 * 1024 * 1024;
 // A clean round also waits for this share of the payload to fail.
-pub(crate) const REARM_PAYLOAD_DIVISOR: u64 = 200;
+pub const REARM_PAYLOAD_DIVISOR: u64 = 200;
 
 // How far ahead of the delivered payload the losses must run before damage
 // confined to a single file is allowed to look like a dead release.
@@ -101,20 +107,20 @@ pub(crate) const SEATED_BATCH_ANSWERS_WITHIN: std::time::Duration =
 
 // What a round found, once every batch in it is back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ProbeUpdate {
+pub struct ProbeUpdate {
     pub(crate) job_id: JobId,
     pub(crate) round: u32,
     // The bytes every server had said are gone when the round was armed:
     // none of them was asked.
     pub(crate) known: u64,
     // Articles a batch answered for.
-    pub(crate) total: usize,
+    pub total: usize,
     // Of those, the ones no server holds.
-    pub(crate) missed: usize,
+    pub missed: usize,
     // Articles left unanswered by a batch that could not settle.
-    pub(crate) unverified: usize,
+    pub unverified: usize,
     // Nothing in the round answered.
-    pub(crate) inconclusive: bool,
+    pub inconclusive: bool,
 }
 
 // Running tally over one round's batches.
@@ -126,16 +132,16 @@ pub(crate) struct ProbeUpdate {
 // what `total` already stands for. Only a round that answered for nothing at
 // all has no verdict to give.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ProbeTally {
+pub struct ProbeTally {
     pub(crate) checked: usize,
     pub(crate) missed: usize,
     pub(crate) unverified: usize,
-    pub(crate) unverified_batches: usize,
+    pub unverified_batches: usize,
 }
 
 impl ProbeTally {
     // Fold in a batch that answered.
-    pub(crate) fn record_answered(&mut self, exists: &[bool]) {
+    pub fn record_answered(&mut self, exists: &[bool]) {
         for found in exists {
             self.checked = self.checked.saturating_add(1);
             if !found {
@@ -146,7 +152,7 @@ impl ProbeTally {
 
     // Fold in a batch that could not settle, so the round goes on with the
     // articles it could not reach counted against its coverage.
-    pub(crate) fn record_unsettled(&mut self, batch_len: usize) {
+    pub fn record_unsettled(&mut self, batch_len: usize) {
         self.unverified_batches = self.unverified_batches.saturating_add(1);
         self.unverified = self.unverified.saturating_add(batch_len);
     }
@@ -165,7 +171,7 @@ impl ProbeTally {
     }
 
     // The update the round reports once every batch is back.
-    pub(crate) fn update(&self, job_id: JobId, round: u32, known: u64) -> ProbeUpdate {
+    pub fn update(&self, job_id: JobId, round: u32, known: u64) -> ProbeUpdate {
         ProbeUpdate {
             job_id,
             round,
@@ -181,7 +187,7 @@ impl ProbeTally {
 // One batch of a round, carried from server to server until a server holds
 // every article in it or every server it may go to has answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProbeBatch {
+pub struct ProbeBatch {
     pub(crate) job_id: JobId,
     pub(crate) round: u32,
     ids: Vec<String>,
@@ -197,7 +203,7 @@ pub(crate) struct ProbeBatch {
 }
 
 impl ProbeBatch {
-    pub(crate) fn new(job_id: JobId, round: u32, ids: Vec<String>) -> Self {
+    pub fn new(job_id: JobId, round: u32, ids: Vec<String>) -> Self {
         Self {
             job_id,
             round,
@@ -210,7 +216,7 @@ impl ProbeBatch {
     }
 
     // The batch, its servers numbered in pool `generation`.
-    pub(crate) fn in_pool(mut self, generation: u64) -> Self {
+    pub fn in_pool(mut self, generation: u64) -> Self {
         self.pool_generation = generation;
         self
     }
@@ -220,7 +226,7 @@ impl ProbeBatch {
     // across the rebuild has whom it asked carried over by server identity:
     // a server that left the pool, or is no longer the same server, drops
     // out and is untried. What the batch found is kept.
-    pub(crate) fn rebase(&mut self, layouts: &super::PoolLayouts, generation: u64) -> bool {
+    pub fn rebase(&mut self, layouts: &super::PoolLayouts, generation: u64) -> bool {
         if self.pool_generation == generation {
             return true;
         }
@@ -231,7 +237,7 @@ impl ProbeBatch {
 
     // The articles no server has said it holds yet, in batch order: what the
     // next server is asked.
-    pub(crate) fn unfound(&self) -> Vec<String> {
+    pub fn unfound(&self) -> Vec<String> {
         self.ids
             .iter()
             .zip(&self.found)
@@ -241,7 +247,7 @@ impl ProbeBatch {
     }
 
     // The servers this batch has been put to.
-    pub(crate) fn asked(&self) -> weaver_nntp::ServerSet {
+    pub fn asked(&self) -> weaver_nntp::ServerSet {
         self.asked
     }
 
@@ -254,7 +260,7 @@ impl ProbeBatch {
     // The server is not asked again, whatever it answered: an answer that
     // could not settle the batch, or that does not cover it, leaves the batch
     // uncertain.
-    pub(crate) fn fold(&mut self, server: usize, result: ProbeBatchResult) {
+    pub fn fold(&mut self, server: usize, result: ProbeBatchResult) {
         self.asked.insert(server);
         let unfound = self.found.iter().filter(|found| !**found).count();
         if result.inconclusive || result.exists.len() != unfound {
@@ -270,16 +276,16 @@ impl ProbeBatch {
 
 // A lane's answer for one batch, on the server it was seated at.
 #[derive(Debug)]
-pub(crate) struct ProbeAnswer {
+pub struct ProbeAnswer {
     pub(crate) batch: ProbeBatch,
-    pub(crate) server: usize,
-    pub(crate) result: ProbeBatchResult,
+    pub server: usize,
+    pub result: ProbeBatchResult,
 }
 
 // What the probes' mail carries: a lane answering one batch, or handing
 // one back unasked because no lane could be had on its seat yet.
 #[derive(Debug)]
-pub(crate) enum ProbeMail {
+pub enum ProbeMail {
     Answered(ProbeAnswer),
     Unseated(ProbeBatch),
 }
@@ -508,7 +514,7 @@ pub(crate) fn declares_recovery(file: &FileSpec) -> bool {
 // or not, such a file is never one the user opens as it was posted. A
 // compressed stream or a tar is not one: posted whole, it is a file as it
 // stands, whatever opening it gave.
-pub(crate) fn names_a_piece(name: &str) -> bool {
+pub fn names_a_piece(name: &str) -> bool {
     let role = FileRole::from_filename(name);
     name.to_ascii_lowercase().ends_with(".rev")
         || weaver_model::files::names_a_z_part(name)
@@ -529,7 +535,7 @@ pub(crate) fn names_a_piece(name: &str) -> bool {
 // split part. Two files named into one place are one volume posted twice,
 // however each pads its number: `part01` and `part1`, `.7z.001` and
 // `.7z.0001`.
-pub(crate) fn names_a_place(name: &str) -> Option<Place> {
+pub fn names_a_place(name: &str) -> Option<Place> {
     let role = FileRole::from_filename(name);
     let number = match role {
         FileRole::RarVolume { volume_number } => volume_number,
@@ -552,7 +558,7 @@ pub(crate) fn names_nothing(name: &str) -> bool {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct Place {
+pub struct Place {
     kind: std::mem::Discriminant<FileRole>,
     stem: String,
     number: u32,
@@ -577,7 +583,7 @@ pub(crate) fn declared_recovery_bytes(spec: &JobSpec) -> u64 {
 
 // Where one payload file's first article stands in the sample.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Head {
+pub enum Head {
     // Every server failed it.
     Lost,
     // In hand, or ended some other way that is no loss.
@@ -588,7 +594,7 @@ pub(crate) enum Head {
 
 // The sample's word on the post.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Gate {
+pub enum Gate {
     // The lost reach the failure share of the whole sample: how many of the
     // sampled files every server failed the first article of, of how many.
     Dead { missing: usize, total: usize },
@@ -606,7 +612,7 @@ pub(crate) enum Gate {
 // the complete sample would have, and one that cannot reach it even were
 // every outstanding article lost has let the post through.
 #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-pub(crate) fn first_article_gate(heads: impl IntoIterator<Item = Head>) -> Gate {
+pub fn first_article_gate(heads: impl IntoIterator<Item = Head>) -> Gate {
     let mut total = 0;
     let mut lost = 0;
     let mut outstanding = 0;
@@ -687,11 +693,7 @@ impl<'a> Candidates<'a> {
 // exactly; asking for it again would count it twice. Each article is
 // looked at once at most, so a round costs its picks and the known losses
 // it steps over.
-pub(crate) fn sample_unknown(
-    total: usize,
-    round: u32,
-    mut gone: impl FnMut(usize) -> bool,
-) -> Vec<usize> {
+pub fn sample_unknown(total: usize, round: u32, mut gone: impl FnMut(usize) -> bool) -> Vec<usize> {
     let picks = sample_indices(total, round);
     let mut sampled = Vec::with_capacity(picks.len());
     for (at, start) in picks.iter().enumerate() {
@@ -706,7 +708,7 @@ pub(crate) fn sample_unknown(
 // The candidates a round asks for: an even stride of at least ten, or one
 // in twelve and a half, offset by the round so repeat rounds widen coverage
 // instead of asking the same articles again.
-pub(crate) fn sample_indices(total: usize, round: u32) -> Vec<usize> {
+pub fn sample_indices(total: usize, round: u32) -> Vec<usize> {
     if total == 0 {
         return Vec::new();
     }
@@ -724,12 +726,7 @@ pub(crate) fn sample_indices(total: usize, round: u32) -> Vec<usize> {
 // server already said are gone, exactly, and the share of what it asked
 // that is gone, taken over the bytes that count toward health past those.
 // The round asked none of the known losses.
-pub(crate) fn projected(
-    tracked_bytes: u64,
-    known: u64,
-    total: usize,
-    missed: usize,
-) -> Option<u64> {
+pub fn projected(tracked_bytes: u64, known: u64, total: usize, missed: usize) -> Option<u64> {
     if total == 0 || missed == 0 || tracked_bytes == 0 {
         return None;
     }
@@ -747,11 +744,7 @@ pub(crate) fn projected(
 // and getting nothing back, whether or not it has reached a second file yet.
 // One file failing while the rest of the posting arrives is neither. That is
 // a hole, and the recovery set decides what to do about it.
-pub(crate) fn looks_like_a_dead_release(
-    downloaded: u64,
-    failing_files: usize,
-    failed: u64,
-) -> bool {
+pub fn looks_like_a_dead_release(downloaded: u64, failing_files: usize, failed: u64) -> bool {
     failing_files > 1 || downloaded.saturating_mul(DEAD_RELEASE_LANDED_DIVISOR) < failed
 }
 
@@ -759,7 +752,7 @@ pub(crate) fn looks_like_a_dead_release(
 // articles missing, or answered nothing, arms the next on the next lost
 // byte; a clean one waits for a material share of the payload more to fail,
 // and never past the bytes that take the post below critical.
-pub(crate) fn next_failed_bytes(
+pub fn next_failed_bytes(
     decided: u64,
     tracked_bytes: u64,
     critical_failed_bytes: u64,
@@ -1800,7 +1793,7 @@ fn count_abandon_work(count: impl FnOnce(&mut AbandonWork)) {
 
 // Whether a post at `health` is dead against its `critical` line. At the
 // line itself it is still healthy; only below it is it dead.
-fn below_critical(health: u32, critical: u32) -> bool {
+pub fn below_critical(health: u32, critical: u32) -> bool {
     health < critical
 }
 
@@ -1808,6 +1801,3 @@ fn below_critical(health: u32, critical: u32) -> bool {
 fn critical_failed_bytes(total: u64, critical: u32) -> u64 {
     total.saturating_sub((u128::from(total) * u128::from(critical) / 1000) as u64)
 }
-
-#[cfg(test)]
-mod tests;

@@ -196,6 +196,46 @@ impl Tree {
         Some(landing[..=at].to_owned())
     }
 
+    // `member` of `node` took another name, and landed at `before` until
+    // then. Below the top, what the container it is a volume of holds
+    // lands in the folder its first volume sits in, so when the member's
+    // folder changed every member under that container, at any depth, is
+    // placed again. The ledger gives a member asking for its name again the
+    // one it holds, so only members whose landing changed move.
+    pub(super) fn land_again_below(
+        &mut self,
+        node: NodeId,
+        member: MemberId,
+        before: Option<&str>,
+        effects: &mut Vec<Effect>,
+    ) {
+        let in_folder = |name: &str| name[..name.rfind(['/', '\\']).unwrap_or(0)].to_owned();
+        if self.at_top(node)
+            || self.landing(node, member).as_deref().map(in_folder) == before.map(in_folder)
+        {
+            return;
+        }
+        let Some((child, _)) = self.child_of(node, member) else {
+            return;
+        };
+        let mut seen = BTreeSet::from([child]);
+        let mut nodes = vec![child];
+        while let Some(at) = nodes.pop() {
+            let members: Vec<MemberId> = self
+                .namespace(at)
+                .map(|namespace| namespace.members().map(|record| record.id).collect())
+                .unwrap_or_default();
+            for held in members {
+                self.place(at, held, effects);
+                if let Some((below, _)) = self.child_of(at, held)
+                    && seen.insert(below)
+                {
+                    nodes.push(below);
+                }
+            }
+        }
+    }
+
     // Whether `node`'s namespace lands at the top: the root's, or a
     // stream's opened there.
     fn at_top(&self, node: NodeId) -> bool {

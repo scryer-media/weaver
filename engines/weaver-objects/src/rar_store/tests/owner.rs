@@ -201,6 +201,14 @@ impl Owner {
         self.deliver_as(volume, range, Provenance::Fresh, None);
     }
 
+    // Deliver a range as the tree does inside one delivery: no work is lent
+    // and nothing is answered.
+    pub fn deliver_unworked(&mut self, volume: usize, range: ByteRange) {
+        self.bind(volume);
+        self.doing = ("deliver", volume);
+        self.push(VolumeIndex(volume as u32), range, Provenance::Fresh, None);
+    }
+
     // Deliver a range, optionally with other bytes than the volume's.
     pub fn deliver_as(
         &mut self,
@@ -404,6 +412,14 @@ impl Owner {
         self.object.offer_password(secret, &mut out);
         self.apply(out);
         self.settle();
+    }
+
+    // Offer a password as the tree does inside one offer: no work is lent.
+    pub fn offer_unworked(&mut self, secret: &str) {
+        self.doing = ("password", 0);
+        let mut out = Vec::new();
+        self.object.offer_password(secret, &mut out);
+        self.apply(out);
     }
 
     pub fn held(&self) -> usize {

@@ -876,11 +876,14 @@ impl NamespaceWriter {
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
         for (node, member) in std::mem::take(&mut self.refused_in_batch) {
-            if self.refused(node, member).is_none() || tree.child_of(node, member).is_some() {
+            let Some(why) = self.refused(node, member) else {
+                continue;
+            };
+            if tree.child_of(node, member).is_some() {
                 continue;
             }
             let mut effects = Vec::new();
-            tree.refused_written(node, member, &mut self.placing(builder), &mut effects);
+            tree.refused_written(node, member, why, &mut self.placing(builder), &mut effects);
             #[cfg(test)]
             tree.bound_kinds_recounted().unwrap();
             self.prune(tree)?;
@@ -1602,9 +1605,13 @@ impl NamespaceWriter {
         self.envelopes.shelf(node)
     }
 
-    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub(crate) fn shelf_of(&self, node: NodeId) -> Option<Arc<Shelf>> {
         self.envelopes.shelf_of(node)
+    }
+
+    // What the job asks through to hear of a run beginning to wait.
+    pub(crate) fn watch(&self) -> &super::envelope::Watch {
+        self.envelopes.watch()
     }
 
     // What rings as a run begins to wait on one of the shelves.
@@ -1711,7 +1718,20 @@ impl NamespaceWriter {
                     provenance: *provenance,
                 };
                 self.taken(tree, segments, &arrival, write);
-                return self.write_leaf(tree, arrival);
+                // A repair landing on a member that closed without passing
+                // its checksum lifts the damage it closed with, though
+                // nothing closes it again: its bytes are judged as they are
+                // now, as at a close. A set above can rebuild a member after
+                // its own namespace ended, when its obligation was dropped.
+                // One whose bytes had passed has had its verdict; the repair
+                // is the set's proof, as on any member.
+                let unproven = *provenance == Provenance::Repaired
+                    && self.closed_unproven(tree, *node, *member);
+                self.write_leaf(tree, arrival)?;
+                if unproven {
+                    self.judge_closed(tree, builder, segments, (*node, *member), out)?;
+                }
+                return Ok(());
             }
             Effect::Reached {
                 node,
@@ -1752,12 +1772,7 @@ impl NamespaceWriter {
                 // member another object owns has no file to close.
                 if in_own_file(tree, *node, *member) {
                     self.close_leaf(tree, *node, *member)?;
-                    match &mut self.acknowledging {
-                        Some(batch) => {
-                            batch.closed.insert((*node, *member));
-                        }
-                        None => self.judge(tree, builder, segments, (*node, *member), out)?,
-                    }
+                    self.judge_closed(tree, builder, segments, (*node, *member), out)?;
                 }
                 self.bind_recoveries(tree, builder, segments, *node, out)?;
             }
@@ -1798,6 +1813,7 @@ impl NamespaceWriter {
                         tree.refused_written(
                             *node,
                             *member,
+                            *why,
                             &mut self.placing(builder),
                             &mut effects,
                         );
@@ -3050,6 +3066,49 @@ impl NamespaceWriter {
             "a refused leaf raised more than its own damage: {:?}",
             &self.unnamed_damage[from..]
         );
+    }
+
+    // A closed member in its own file is judged now, or, inside a set's
+    // batch, once the batch is down, on the bytes it ends with.
+    fn judge_closed(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        (node, member): (NodeId, MemberId),
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        match &mut self.acknowledging {
+            Some(batch) => {
+                batch.closed.insert((node, member));
+                Ok(())
+            }
+            None => self.judge(tree, builder, segments, (node, member), out),
+        }
+    }
+
+    // Whether the member closed and its file, as it stands, holds no bytes
+    // that passed the checksum its object states: no fold of the whole
+    // file, or one that differs. A member with no stated checksum has none
+    // to pass, and `judge` says nothing of it.
+    fn closed_unproven(&self, tree: &Tree, node: NodeId, member: MemberId) -> bool {
+        let Some(record) = tree
+            .namespace(node)
+            .and_then(|namespace| namespace.get(member))
+        else {
+            return false;
+        };
+        if !record.closed {
+            return false;
+        }
+        let (Some(stated), Some(length)) = (record.crc32, record.length) else {
+            return false;
+        };
+        self.files
+            .get(&node)
+            .and_then(|files| files.leaves.get(&member))
+            .and_then(|leaf| leaf.folded(length, Algorithm::Crc32))
+            != Some(u64::from(stated))
     }
 
     // A file whose bytes fail the checksum its object states for them is

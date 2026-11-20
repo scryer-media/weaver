@@ -12,7 +12,7 @@ const PAR2_IGNORE_EXTENSIONS_ENV: &str = "WEAVER_PAR2_IGNORE_EXTENSIONS";
 // when it is missing entirely. This default is the union of the two lists,
 // overridable through the env var above (comma- or semicolon-separated; an
 // empty value disables the behaviour).
-const DEFAULT_PAR2_IGNORE_EXTENSIONS: [&str; 4] = ["nfo", "sfv", "srr", "nzb"];
+pub const DEFAULT_PAR2_IGNORE_EXTENSIONS: [&str; 4] = ["nfo", "sfv", "srr", "nzb"];
 
 // The extension list [`par2_damage_ignorable`] matches against, as read from
 // the environment once per verdict.
@@ -26,7 +26,7 @@ pub fn configured_par2_ignore_extensions() -> Vec<String> {
 //
 // Entries are separated by `,` or `;`, may carry a leading dot, and are
 // compared case-insensitively.
-fn parse_par2_ignore_extensions(raw: Option<&str>) -> Vec<String> {
+pub fn parse_par2_ignore_extensions(raw: Option<&str>) -> Vec<String> {
     let Some(value) = raw else {
         return DEFAULT_PAR2_IGNORE_EXTENSIONS
             .iter()
@@ -57,10 +57,7 @@ fn parse_par2_ignore_extensions(raw: Option<&str>) -> Vec<String> {
 // with a hole in it is strictly better for the user than refusing the payload
 // it describes. Matching is on the file's own extension so a payload that
 // merely *mentions* one of these names is unaffected.
-pub(in crate::pipeline) fn par2_damage_ignorable(
-    filename: &str,
-    ignore_extensions: &[String],
-) -> bool {
+pub fn par2_damage_ignorable(filename: &str, ignore_extensions: &[String]) -> bool {
     if ignore_extensions.is_empty() {
         return false;
     }
@@ -221,6 +218,3 @@ impl Pipeline {
         crate::pipeline::graph::status::advance(self, job_id).await;
     }
 }
-
-#[cfg(test)]
-mod tests;

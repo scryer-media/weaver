@@ -1011,6 +1011,14 @@ impl NamespaceWriter {
                 return Err(error);
             }
             removed?;
+            // An SFV below the root whose namespace came out of volumes a
+            // recovery set above proved makes no claim of damage: every
+            // byte of what it lists is what was posted.
+            let found = if tree.kind(set) == Some(Kind::Sfv) && tree.vouched_above(node) {
+                Vec::new()
+            } else {
+                found
+            };
             for (member, range) in found {
                 let marked = (node, member, range, Provenance::Refuted);
                 self.redeliver(tree, builder, segments, marked, out)?;

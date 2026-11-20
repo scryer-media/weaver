@@ -291,6 +291,100 @@ impl GraphJob {
         if self.quieting.is_some() || !self.quiet() {
             return Ok(false);
         }
+        Ok(self.begin_quiet()?.unwrap_or(false))
+    }
+
+    // The job stalled: nothing of it is out, due or owed, nothing more of
+    // its posts is to come, and still a set or an object waits. No event
+    // will bring what it waits for, so its objects hear what the quiet
+    // tells them whether every set ruled or not, and what that frees is
+    // stepped and lent as after any quiet. A pass that changed something
+    // is followed by another while the job still waits on nothing, as the
+    // runs' step tells quiet again. Whether anything changed; a give-up
+    // with volumes left goes on at the job's next turns.
+    pub(crate) fn end_input(
+        &mut self,
+        slots: &mut RepairSlots,
+        limit: usize,
+    ) -> Result<bool, GraphError> {
+        let mut changed = false;
+        while self.quieting.is_none() && self.waits_on_nothing() {
+            match self.begin_quiet()? {
+                Some(false) => break,
+                Some(true) => changed = true,
+                None => return Ok(true),
+            }
+            self.step_runs(Vec::new(), limit)?;
+            self.lend(slots, limit)?;
+        }
+        Ok(changed)
+    }
+
+    // Nothing of the job is out on a thread, due, owed to a checkpoint or
+    // waiting on a disk, nothing more of any of its posts is to come, and
+    // the pipeline is not stopping: nothing the job itself is owed will
+    // step it again.
+    pub(crate) fn waits_on_nothing(&self) -> bool {
+        self.waits_on_runs_only() && self.runs.running().next().is_none()
+    }
+
+    // As `waits_on_nothing`, but for runs still reading: none waits for a
+    // slot or memory or stands stopped, and nothing else is out.
+    pub(crate) fn waits_on_runs_only(&self) -> bool {
+        if self.work_pending()
+            || self.runs.held_back()
+            || self.loans.out()
+            || self.works.out()
+            || self.mail_owed.is_some()
+            || self.works.stopping()
+            || self.owes_checkpoint()
+            || self.moves_waiting()
+            || self.awaits_commit()
+            || self.writer.disk_held()
+            || self.writer.disk().is_some_and(|disk| !disk.quiet())
+        {
+            return false;
+        }
+        let coming = self.coming();
+        !coming.payload && coming.sets.is_empty()
+    }
+
+    // Whether any run is reading.
+    pub(crate) fn reads(&self) -> bool {
+        self.runs.running().next().is_some()
+    }
+
+    // Whether every run reading waits on its shelf for a change that has
+    // not come. A run with no shelf is not waiting on one.
+    pub(crate) fn runs_blocked(&self) -> bool {
+        self.runs.running().all(|node| {
+            self.writer
+                .shelf_of(node)
+                .is_some_and(|shelf| shelf.blocked())
+        })
+    }
+
+    // Ask to hear of the next run to begin waiting on its shelf, or ask no
+    // longer: see `envelope::Watch`.
+    pub(crate) fn watch_runs(
+        &self,
+        asked: bool,
+        tell: impl FnOnce() -> (
+            tokio::sync::mpsc::UnboundedSender<super::super::engine::Said>,
+            u64,
+        ),
+    ) {
+        self.writer.watch().ask(asked, tell);
+    }
+
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub(crate) fn watch(&self) -> &crate::pipeline::graph::envelope::Watch {
+        self.writer.watch()
+    }
+
+    // Every object hears its losses then quiet, deepest first: whether
+    // anything changed, `None` while a give-up has volumes left.
+    fn begin_quiet(&mut self) -> Result<Option<bool>, GraphError> {
         // Nothing more comes into any namespace: the containers below the
         // root no name opened learn whether their folders make them layers,
         // before any object hears quiet, since what opens may hold more.
@@ -299,7 +393,7 @@ impl GraphJob {
             self.writer
                 .decide_layers(&mut self.tree, &mut *self.builder, &self.root, &mut out)?;
             self.heard(out)?;
-            return Ok(true);
+            return Ok(Some(true));
         }
         // The tree owns the order: deepest first, nodes that may still
         // change the namespace above them first, the rest on a pass that
@@ -319,7 +413,7 @@ impl GraphJob {
             rung: false,
             admitted: Vec::new(),
         });
-        Ok(self.quieten()?.unwrap_or(false))
+        self.quieten()
     }
 
     // Whether a give-up the job went quiet into still has volumes to read

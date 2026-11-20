@@ -1166,19 +1166,23 @@ async fn a_par2_set_two_deep_crashed_before_its_repair_landed_repairs_and_delive
 }
 
 // The pipeline drained and taken down while the repair of `ember.bin` two
-// deep is out on its thread: the drain hears it back, so the restored job
-// holds the repair, replays the damaged article of `lantern.7z` as the
-// damage the repair already answered, lends no second repair, and announces
-// the one once.
+// deep is out on its thread: the drain stops the repair and hears it back
+// stopped, so nothing it came to is applied and its set is due again. The
+// restored job lends the repair again, applies it once, delivers what the
+// whole run delivered, and announces the one repair once.
 #[tokio::test]
-async fn a_par2_set_two_deep_restarted_while_its_repair_is_out_applies_the_repair_once() {
+async fn a_par2_set_two_deep_restarted_while_its_repair_is_out_lends_the_stopped_repair_again_and_applies_it_once()
+ {
     let (ember, scenario) = repaired_two_deep();
     let whole = run(&scenario).await;
     let [Some(RepairOutcome::Repaired { slices })] = whole.graph().outcomes[..] else {
         panic!("{:?}", whole.graph().outcomes);
     };
     let (restarted, lent_again) = run_restarted_while_repairing(&scenario).await;
-    assert!(!lent_again, "the restored job lent the repair again");
+    assert!(
+        lent_again,
+        "the restored job did not lend the stopped repair again"
+    );
     assert_eq!(restarted.status, whole.status);
     assert!(
         restarted.files == whole.files,

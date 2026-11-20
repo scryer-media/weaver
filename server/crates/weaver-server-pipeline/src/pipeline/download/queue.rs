@@ -78,7 +78,7 @@ pub struct QueuedWork<'a> {
 impl QueuedWork<'_> {
     // Whether the work is steered off a server: excluded from one or hinted
     // away from one.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     fn is_steered(&self) -> bool {
         !self.exclude_servers.is_empty() || self.avoid_server.is_some()
     }
@@ -211,10 +211,10 @@ const SEQUENCE_MASK: u64 = (1 << SEQUENCE_BITS) - 1;
 // asked, with a sequence counted down from here, so its walk to the next
 // level starts as soon as a server of that level is free instead of after
 // every untried first article has been asked once.
-pub(crate) const SEQUENCE_START: u64 = 1 << 59;
+pub const SEQUENCE_START: u64 = 1 << 59;
 
 // Whether a first article goes back ahead of the untried ones.
-pub(crate) fn walks_ahead(first_article: bool, exclude_servers: weaver_nntp::ServerSet) -> bool {
+pub fn walks_ahead(first_article: bool, exclude_servers: weaver_nntp::ServerSet) -> bool {
     first_article && !exclude_servers.is_empty()
 }
 
@@ -479,7 +479,7 @@ pub struct DownloadQueue {
 // neither and changes no count.
 type CountsStamp = (u64, u64, usize);
 
-type BootstrapAnswer = Result<(), crate::pipeline::download::worker::BlockedBy>;
+pub type BootstrapAnswer = Result<(), crate::pipeline::download::worker::BlockedBy>;
 
 // Where a walk of the queue starts or stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -530,7 +530,7 @@ impl DownloadQueue {
     // `bootstrap_files`, walked only when a count changed or the list is
     // another one since it was last asked. The list is held, so the same
     // pointer is the same list.
-    pub(in crate::pipeline::download) fn bootstrap_answer(
+    pub fn bootstrap_answer(
         &mut self,
         bootstrap_files: &Arc<[u32]>,
         walk: impl FnOnce(&Self) -> BootstrapAnswer,
@@ -641,7 +641,7 @@ impl DownloadQueue {
 
     // Room for a file's items with segment numbers below `segments`, sized
     // once, for a queue built from the file's whole article list.
-    pub(crate) fn reserve_file(&mut self, file_id: NzbFileId, segments: u32) {
+    pub fn reserve_file(&mut self, file_id: NzbFileId, segments: u32) {
         let slots = self.files.entry(file_id).or_default();
         slots
             .dense
@@ -657,7 +657,7 @@ impl DownloadQueue {
     // Queues an article of the job as its article list gives it: fetched by
     // the id its part has in use when it is dispatched, from `groups`, never
     // tried, steered nowhere.
-    pub(crate) fn push_article(
+    pub fn push_article(
         &mut self,
         segment_id: SegmentId,
         groups: &Arc<[String]>,
@@ -978,9 +978,9 @@ impl DownloadQueue {
 
     // Every queued item in dispatch order, with its key and the fields its
     // class sets, for the tests that compare two queues.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     #[allow(clippy::type_complexity)]
-    pub(crate) fn snapshot(&self) -> Vec<(bool, u8, u32, Option<u32>, u64, SegmentId, u32, bool)> {
+    pub fn snapshot(&self) -> Vec<(bool, u8, u32, Option<u32>, u64, SegmentId, u32, bool)> {
         self.iter_keyed()
             .map(|(key, work)| {
                 (
@@ -999,8 +999,8 @@ impl DownloadQueue {
 
     // The derived counts as a walk of every queued item finds them, for the
     // tests that hold the maintained ones to it.
-    #[cfg(test)]
-    pub(crate) fn counts_match_a_walk(&self) -> bool {
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn counts_match_a_walk(&self) -> bool {
         let mut by_file: HashMap<NzbFileId, u32> = HashMap::new();
         for work in self.iter() {
             *by_file.entry(work.segment_id.file_id).or_default() += 1;
@@ -1338,11 +1338,7 @@ impl DownloadQueue {
     // Keeps `message_id` as the id every queued copy of the segment that
     // carries none of its own is fetched by. Called before the part's id in
     // use moves on, so a copy queued under the old id is still fetched by it.
-    pub(crate) fn pin_message_id(
-        &mut self,
-        segment_id: SegmentId,
-        message_id: impl Fn() -> MessageId,
-    ) {
+    pub fn pin_message_id(&mut self, segment_id: SegmentId, message_id: impl Fn() -> MessageId) {
         let Some(slots) = self.files.get(&segment_id.file_id) else {
             return;
         };
@@ -1403,9 +1399,3 @@ impl crate::pipeline::Pipeline {
         item.dispatched(spec)
     }
 }
-
-#[cfg(test)]
-mod reference;
-
-#[cfg(test)]
-mod tests;

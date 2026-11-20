@@ -17,10 +17,14 @@ mod pipeline {
                 harness, rar_fixtures as rar, sfv, stream_fixtures as streams, zip,
             };
             mod classic_rar_crypt;
+            mod furniture;
             mod header_names;
+            mod nested_sfv;
             mod partial;
             mod restart;
             mod scene_zips;
+            mod short_nested_sets;
+            mod stall_rule;
             mod unlisted_par2;
         }
     }

@@ -327,7 +327,7 @@ async fn a_store_read_out_of_a_stream_reads_in_stream_order() {
 // difference between the rows.
 async fn par2_in_a_store(wrap: impl Fn(Vec<u8>) -> Post) -> (Scenario, Vec<u8>) {
     let body = payload(6 * ARTICLE, 111);
-    let set = par2_set("ember", &[("ember.bin", &body)], 2);
+    let set = par2_set("ember", &[("ember.bin", &body)], 3);
     let mut bad = body.clone();
     bad[2 * ARTICLE + 3] ^= 0x41;
     let inside: Vec<(String, Vec<u8>)> = vec![
@@ -382,7 +382,7 @@ async fn a_par2_set_in_a_store_in_a_stream_repairs_the_member_beside_it() {
 #[tokio::test]
 async fn a_par2_volume_posted_in_a_stream_is_not_bound_to_its_set() {
     let body = payload(6 * ARTICLE, 113);
-    let set = par2_set("ember", &[("ember.bin", &body)], 2);
+    let set = par2_set("ember", &[("ember.bin", &body)], 3);
     let scenario = Scenario::new(vec![
         Post::plain("ember.bin", body.clone()),
         Post::plain(&set[0].name, set[0].bytes.clone()),
@@ -543,4 +543,63 @@ async fn a_root_member_the_set_announced_restores_across_a_restart() {
     let scenario = Scenario::new(posts);
     let (status, _, _) = restart_after_announcement(&scenario, posted).await;
     assert_eq!(status, Some(JobStatus::Complete));
+}
+
+// A recovery volume whose second article a news server answers with
+// another post's: its header places it far past the volume's end, so the
+// articles after it are bounded past the end as well. The PAR2 index comes
+// first, then the volume, then the damaged file. Served one article at a
+// time, the volume's head parks the rest, the repair's open-ended seek
+// raises them all, and the other post's article lands after the seek.
+// Served eleven at a time, it is handed out beside the volume's head and
+// lands parked, before the seek: the seek must still bring every article of
+// the volume not yet in hand, or the job waits on them for ever. Either
+// way the job ends the same.
+async fn a_recovery_volume_with_another_posts_article(foreign: u32, batch: usize) -> Outcome {
+    let foreign_at: (u32, u32) = (1, foreign);
+    const DAMAGED: (u32, u32) = (2, 2);
+    let body = payload(5 * ARTICLE, 161);
+    let mut posts = par2_set("ember", &[("ember.bin", &body)], 2);
+    posts.push(Post::plain("ember.bin", body));
+    assert!(
+        recovery_blocks(&posts[1])
+            .iter()
+            .any(|block| block.iter().all(|ordinal| *ordinal > foreign_at.1)),
+        "a block lies past the other post's article"
+    );
+    let scenario = Scenario::new(posts)
+        .damaged(DAMAGED.0, DAMAGED.1)
+        .foreign(foreign_at.0, foreign_at.1)
+        .batched(batch);
+    let graph = run(&scenario).await;
+    let at = |article: (u32, u32)| graph.order.iter().position(|asked| *asked == article);
+    let (foreign, damaged) = (at(foreign_at).unwrap(), at(DAMAGED).unwrap());
+    // At the first block the two batchings bring the articles in opposite
+    // orders: the seek ahead of the other post's article, or after it.
+    match (foreign_at.1, batch) {
+        (1, 1) => assert!(damaged < foreign, "the seek leads: {:?}", graph.order),
+        (1, _) => assert!(
+            foreign < damaged,
+            "the article lands parked: {:?}",
+            graph.order
+        ),
+        _ => {}
+    }
+    graph
+}
+
+#[tokio::test]
+async fn a_recovery_article_placed_past_the_volume_ends_the_job_alike_in_either_order() {
+    // The other post's article at the volume's first block ends the job as
+    // it does further in: the intact block after it repairs the damage.
+    for foreign in [1, 5] {
+        for batch in [1, 11] {
+            let graph = a_recovery_volume_with_another_posts_article(foreign, batch).await;
+            assert_eq!(
+                graph.status,
+                Some(JobStatus::Complete),
+                "foreign {foreign} batch {batch}"
+            );
+        }
+    }
 }

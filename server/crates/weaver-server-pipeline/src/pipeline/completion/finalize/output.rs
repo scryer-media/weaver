@@ -3187,6 +3187,15 @@ impl Pipeline {
         job_id: JobId,
     ) {
         self.transition_completed_runtime(job_id);
+        // The job's graph may rule it failed here; it is announced as it
+        // ended, as its history row says.
+        let terminal_event = match self.jobs.get(&job_id).map(|state| &state.status) {
+            Some(JobStatus::Failed { error }) => PipelineEvent::JobFailed {
+                job_id,
+                error: error.clone(),
+            },
+            _ => PipelineEvent::JobCompleted { job_id },
+        };
         if self.active_download_passes.remove(&job_id) {
             self.phase_end(job_id, JobPhase::Downloading);
             self.emit_job_event(PipelineEvent::DownloadFinished {
@@ -3200,7 +3209,7 @@ impl Pipeline {
             job_id = job_id.0,
             "job completed after terminal post-processing"
         );
-        self.record_job_history(job_id, Some(PipelineEvent::JobCompleted { job_id }));
+        self.record_job_history(job_id, Some(terminal_event));
         self.report_job(job_id);
     }
 }

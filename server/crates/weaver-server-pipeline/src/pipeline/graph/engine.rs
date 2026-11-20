@@ -108,6 +108,10 @@ pub enum Heard {
     // The job's give-up has another volume to read back, on a turn of its
     // own. Addressed to the root, under no run's generation.
     GivingUp,
+    // A run began to wait on its shelf after its job, waiting on nothing
+    // but its runs, asked to hear of it: the job's gate looks again. Sent
+    // once per ask, on the root's mail.
+    Blocked,
 }
 
 // Where every graph job's runs speak, and where the database says a
@@ -626,6 +630,36 @@ impl Runs {
     // them.
     pub(crate) fn changed_since(&self, at: u64) -> impl Iterator<Item = NodeId> + '_ {
         self.marks.since(at)
+    }
+
+    // Whether a run waits for a slot or for memory, or was stopped and has
+    // not ended: each is lifted by an event of its own. A run turned away
+    // for memory is lifted by a release: one already made, or one another
+    // job still holds bytes to make. When every byte the pool holds is this
+    // job's, only its own runs can give one back, and a parent starved by
+    // children that wait on it waits on them as they wait on it.
+    pub(crate) fn held_back(&self) -> bool {
+        let mut starved = false;
+        let (mut pool, mut above) = (0_u64, 0_u64);
+        for run in self.runs.values() {
+            match run.life {
+                Life::Queued | Life::Stopped { .. } => return true,
+                Life::Starved { .. } => starved = true,
+                Life::Running { .. } | Life::Ended { .. } => {}
+            }
+            if run.above {
+                above = above.saturating_add(run.reserved);
+            } else {
+                pool = pool.saturating_add(run.reserved);
+            }
+        }
+        if !starved {
+            return false;
+        }
+        let room = self.pool.room();
+        room.reserved > pool
+            || room.above > above
+            || self.runs.values().any(|run| woken(run.life, room))
     }
 
     // The nodes whose runs are reading, in node order.

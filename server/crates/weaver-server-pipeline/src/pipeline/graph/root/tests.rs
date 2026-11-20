@@ -2056,6 +2056,41 @@ fn a_deferral_never_lowers_a_raised_article_and_is_never_lost() {
     );
 }
 
+// The traced state of the bench's hang: a parked volume of three articles,
+// its head in hand, its second placed by its own header past the volume's
+// end, its third still to come and bounded past the end with it. A raise to
+// the end brings the third whether the second landed before the raise or
+// after it.
+#[test]
+fn a_raise_to_the_end_brings_an_article_behind_one_placed_past_it() {
+    for landed_first in [true, false] {
+        let mut root = ArticleRoot::new(&[file("vol.par2", &[100, 100, 100])]);
+        let volume = VolumeIndex(0);
+        root.receive(decoded(0, 0, 0, &[7; 100], Some(300)));
+        assert_eq!(
+            root.map
+                .seek(volume, ByteRange::new(100, u64::MAX), Some(Class::Parked)),
+            Pull::Moved(2)
+        );
+        let raise = |root: &mut ArticleRoot| {
+            root.map
+                .seek(volume, ByteRange::new(100, u64::MAX), Some(Class::Recovery))
+        };
+        let pull = if landed_first {
+            root.receive(decoded(0, 1, 10_000, &[9; 100], None));
+            raise(&mut root)
+        } else {
+            let pull = raise(&mut root);
+            root.receive(decoded(0, 1, 10_000, &[9; 100], None));
+            pull
+        };
+        let moved = if landed_first { 1 } else { 2 };
+        assert_eq!(pull, Pull::Moved(moved), "landed first: {landed_first}");
+        assert_eq!(root.map.class(volume, 2), Some(Class::Recovery));
+        assert!(!root.map.article_settled(volume, 2));
+    }
+}
+
 #[test]
 fn pending_verification_changes_only_the_small_root_record() {
     use super::facts::{Encoded, Parts, decode};

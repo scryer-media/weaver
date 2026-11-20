@@ -17,14 +17,14 @@ use crate::jobs::JobId;
 // A job's place in dispatch order. Keys compare by priority, then position,
 // then id; positions are unique, so the id only makes the order total.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct DispatchKey {
+pub struct DispatchKey {
     priority: u8,
     position: usize,
     job_id: JobId,
 }
 
 impl DispatchKey {
-    pub(crate) fn new(priority: u8, position: usize, job_id: JobId) -> Self {
+    pub fn new(priority: u8, position: usize, job_id: JobId) -> Self {
         Self {
             priority,
             position,
@@ -38,13 +38,13 @@ impl DispatchKey {
         Self::new(row_priority(row, globals), position, row.id)
     }
 
-    pub(crate) fn job_id(self) -> JobId {
+    pub fn job_id(self) -> JobId {
         self.job_id
     }
 }
 
 // A job's priority from its metadata: high 0, normal 1, low 2.
-pub(crate) fn metadata_priority(metadata: &[(String, String)]) -> u8 {
+pub fn metadata_priority(metadata: &[(String, String)]) -> u8 {
     metadata
         .iter()
         .find(|(key, _)| key.eq_ignore_ascii_case("priority"))
@@ -71,7 +71,7 @@ pub(crate) fn row_priority(row: &JobRow, globals: &Globals) -> u8 {
 
 // Keeps the first `n` keys in dispatch order, in no particular order, by a
 // selection rather than a sort.
-pub(crate) fn keep_first(keys: &mut Vec<DispatchKey>, n: usize) {
+pub fn keep_first(keys: &mut Vec<DispatchKey>, n: usize) {
     if n == 0 {
         keys.clear();
     } else if keys.len() > n {
@@ -100,49 +100,5 @@ impl QueueInner {
                 .position(|installed| *installed == id)
                 .map(|index| self.jobs.len() + index)
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn keys_order_by_priority_then_position() {
-        let mut keys = [
-            DispatchKey::new(1, 0, JobId(1)),
-            DispatchKey::new(0, 5, JobId(2)),
-            DispatchKey::new(2, 1, JobId(3)),
-            DispatchKey::new(1, 3, JobId(4)),
-        ];
-        keys.sort_unstable();
-        let ids: Vec<u64> = keys.iter().map(|key| key.job_id().0).collect();
-        assert_eq!(ids, [2, 1, 4, 3]);
-    }
-
-    #[test]
-    fn keep_first_keeps_the_first_n_in_order() {
-        let all: Vec<DispatchKey> = (0..20u64)
-            .map(|i| DispatchKey::new((i % 3) as u8, (19 - i) as usize, JobId(i)))
-            .collect();
-        for n in [0, 1, 3, 5, 19, 20, 25] {
-            let mut kept = all.clone();
-            keep_first(&mut kept, n);
-            kept.sort_unstable();
-            let mut sorted = all.clone();
-            sorted.sort_unstable();
-            sorted.truncate(n);
-            assert_eq!(kept, sorted, "n = {n}");
-        }
-    }
-
-    #[test]
-    fn priority_reads_high_normal_low_in_any_case() {
-        let meta = |value: &str| vec![("Priority".to_string(), value.to_string())];
-        assert_eq!(metadata_priority(&meta("HIGH")), 0);
-        assert_eq!(metadata_priority(&meta("normal")), 1);
-        assert_eq!(metadata_priority(&meta("low")), 2);
-        assert_eq!(metadata_priority(&meta("other")), 1);
-        assert_eq!(metadata_priority(&[]), 1);
     }
 }

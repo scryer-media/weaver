@@ -1501,3 +1501,123 @@ async fn a_pause_and_resume_between_intent_turns_leaves_no_run_held() {
         files.keys()
     );
 }
+
+// The terminal event a job ends with once its terminal post-processing has
+// finished, and every event heard for it before that one.
+async fn terminal_after_post_processing(
+    pipeline: &mut Pipeline,
+    job: JobId,
+) -> (PipelineEvent, Vec<PipelineEvent>) {
+    use weaver_server_pipeline::pipeline::tests::history_fixture::complete_after_post_processing;
+
+    let mut events = queue_handle(pipeline).subscribe_events();
+    complete_after_post_processing(pipeline, job);
+    let mut heard = Vec::new();
+    loop {
+        let event = events.recv().await.expect("pipeline event channel closed");
+        if matches!(
+            &event,
+            PipelineEvent::JobCompleted { job_id } | PipelineEvent::JobFailed { job_id, .. }
+                if *job_id == job
+        ) {
+            return (event, heard);
+        }
+        heard.push(event);
+    }
+}
+
+// A job its graph rules Failed when its post-processing finishes, its one
+// file never delivered, is announced failed with its history row's reason,
+// never completed.
+#[tokio::test]
+async fn a_job_ruled_failed_after_post_processing_is_announced_failed() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job = JobId(9301);
+    insert_active_job(
+        &mut pipeline,
+        job,
+        weaver_server_pipeline::pipeline::tests::segmented_job_spec(
+            "never delivered",
+            "payload.bin",
+            &[100],
+        ),
+    )
+    .await;
+    let (terminal, heard) = terminal_after_post_processing(&mut pipeline, job).await;
+
+    let row = history(&mut pipeline, job).await;
+    assert_eq!(row.status, "failed");
+    match terminal {
+        PipelineEvent::JobFailed { job_id, error } => {
+            assert_eq!(job_id, job);
+            assert_eq!(Some(error), row.error_message);
+        }
+        other => panic!("a failed job was announced as {other:?}"),
+    }
+    assert!(
+        !heard
+            .iter()
+            .any(|event| matches!(event, PipelineEvent::JobCompleted { job_id } if *job_id == job)),
+        "a failed job was also announced complete"
+    );
+}
+
+// A job delivered whole is still announced completed on the same path, and
+// never failed.
+#[tokio::test]
+async fn a_job_ruled_complete_after_post_processing_is_announced_completed() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job = JobId(9302);
+    weaver_server_pipeline::pipeline::tests::insert_delivered_job(
+        &mut pipeline,
+        job,
+        "delivered whole",
+        "delivered.mkv",
+        b"delivered payload",
+    )
+    .await;
+    let (terminal, heard) = terminal_after_post_processing(&mut pipeline, job).await;
+
+    assert_eq!(history(&mut pipeline, job).await.status, "complete");
+    assert!(
+        matches!(terminal, PipelineEvent::JobCompleted { job_id } if job_id == job),
+        "a complete job was announced as {terminal:?}"
+    );
+    assert!(
+        !heard.iter().any(
+            |event| matches!(event, PipelineEvent::JobFailed { job_id, .. } if *job_id == job)
+        ),
+        "a complete job was also announced failed"
+    );
+}
+
+// A job's terminal event waits for the subscriber that keeps the job event
+// rows: it is not heard until that subscriber has answered for it.
+#[tokio::test]
+async fn the_terminal_event_waits_for_the_job_event_rows() {
+    let scenario = Scenario::new(vec![Post::plain("ember.bin", payload(3 * ARTICLE, 88))]);
+    let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
+    let mut settles = database(&pipeline).keep_job_event_rows();
+    let mut events = queue_handle(&pipeline).subscribe_events();
+    drive(&mut pipeline, &scenario, JOB, |_| false).await;
+
+    let waiting = settles
+        .recv()
+        .await
+        .expect("the terminal event waits for its rows");
+    assert!(matches!(waiting.terminal, PipelineEvent::JobCompleted { job_id } if job_id == JOB));
+    while let Ok(event) = events.try_recv() {
+        assert!(
+            !matches!(event, PipelineEvent::JobCompleted { job_id } if job_id == JOB),
+            "the terminal event was heard before its rows were answered for"
+        );
+    }
+    waiting.written.send(()).unwrap();
+    wait_for_job_event(
+        &mut events,
+        |event| matches!(event, PipelineEvent::JobCompleted { job_id } if *job_id == JOB),
+    )
+    .await;
+}

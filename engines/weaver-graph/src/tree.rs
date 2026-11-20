@@ -929,16 +929,22 @@ impl Tree {
     // unless it is a recovery object's whose volumes are released, as a
     // listing is kept beside what it lists. A member no object holds is
     // spent when its posted name says it is recovery data: one whose first
-    // bytes were lost never said by them which set it is.
+    // bytes were lost never said by them which set it is. One an object
+    // that is not a recovery object refused is that object's file, never
+    // spent, as the status reads it.
     pub fn spends(&self, node: NodeId, member: MemberId) -> bool {
         match self.child_of(node, member) {
             Some((child, _)) => self
                 .recovery(child)
                 .is_none_or(|recovery| !recovery.released()),
-            None => self
-                .namespace(node)
-                .and_then(|namespace| namespace.get(member))
-                .is_some_and(|record| crate::sniff::names_recovery(&record.name)),
+            None => {
+                self.namespace(node)
+                    .and_then(|namespace| namespace.get(member))
+                    .is_some_and(|record| crate::sniff::names_recovery(&record.name))
+                    && self
+                        .refused_by(node, member)
+                        .is_none_or(|owner| self.recovers(owner))
+            }
         }
     }
 
@@ -2313,9 +2319,11 @@ impl Tree {
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) -> Option<String> {
+        let landed = self.landing(node, member);
         self.namespace_mut(node)?.rename(member, name)?;
         self.place(node, member, effects);
         self.renamed(node, member, builder, effects);
+        self.land_again_below(node, member, landed.as_deref(), effects);
         self.namespace(node)?
             .get(member)
             .map(|record| record.output_name.clone())

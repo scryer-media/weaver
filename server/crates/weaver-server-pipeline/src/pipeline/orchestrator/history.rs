@@ -322,6 +322,9 @@ impl Pipeline {
     ) {
         let event_tx = self.event_tx.clone();
         let queue = self.shared_state.queue.clone();
+        let keeper = terminal_event
+            .as_ref()
+            .and_then(|_| self.db.job_event_rows_keeper());
         // An archive the database has no room for is kept by the writer and
         // answers here once room is made; the writer tells the pipeline of
         // it, not this task.
@@ -329,6 +332,15 @@ impl Pipeline {
             if archived.await.is_err() {
                 tracing::error!(job_id = job_id.0, "history archive completion was lost");
                 return;
+            }
+            // The job's event list is final once its terminal event is
+            // heard: the subscriber that keeps the rows commits every row
+            // sent before this event, and this event's own, first. Only this
+            // task waits; with no subscriber, or one gone, the event goes.
+            if let (Some(event), Some(keeper)) = (&terminal_event, keeper)
+                && let Some(written) = keeper.settle(event.clone()).await
+            {
+                let _ = written.await;
             }
             queue.write(|inner| {
                 inner.remove_job(job_id);

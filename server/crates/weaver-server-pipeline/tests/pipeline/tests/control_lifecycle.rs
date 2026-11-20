@@ -343,7 +343,9 @@ async fn terminal_capture_keeps_updates_accepted_before_retirement() {
         .unwrap();
     let mut events = handle.subscribe_events();
     complete_after_post_processing(&mut pipeline, id);
-    while !matches!(events.recv().await.unwrap(), PipelineEvent::JobCompleted { job_id } if job_id == id)
+    // Its one file never arrived, so the job ends failed; what is asked here
+    // is only that the terminal row keeps the accepted update.
+    while !matches!(events.recv().await.unwrap(), PipelineEvent::JobFailed { job_id, .. } if job_id == id)
     {
     }
     let history = database(&pipeline).get_job_history(id.0).unwrap().unwrap();

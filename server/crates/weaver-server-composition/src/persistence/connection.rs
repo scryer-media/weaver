@@ -1022,6 +1022,61 @@ pub struct Database {
     pub(crate) job_history_cache: Arc<Mutex<JobHistoryCache>>,
     // Every tag and each job's tags, as last read, and their revision.
     pub(crate) tags: Arc<crate::tags::TagCache>,
+    // Where a job's terminal event waits for its job event rows, while the
+    // event persistence subscriber runs.
+    job_event_rows: Arc<Mutex<Option<mpsc::Sender<SettleJobEventRows>>>>,
+}
+
+// A job's terminal event, held until the job event persistence subscriber
+// has committed every row of an event sent before it, and the terminal
+// event's own row. `written` answers then; dropped unanswered, the event
+// goes out as it is.
+pub struct SettleJobEventRows {
+    pub terminal: weaver_server_base::events::model::PipelineEvent,
+    pub written: oneshot::Sender<()>,
+}
+
+impl Database {
+    // Taken by the one job event persistence subscriber: from now on each
+    // terminal event of a job archived through the history archive waits on
+    // it. Dropping the receiver lets every waiting event go.
+    pub fn keep_job_event_rows(&self) -> mpsc::Receiver<SettleJobEventRows> {
+        let (keeper, settles) = mpsc::channel(64);
+        *self
+            .job_event_rows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(keeper);
+        settles
+    }
+
+    // The subscriber that keeps the job event rows, while one does. The
+    // keeper holds only that subscriber's channel open, never the writer's.
+    pub fn job_event_rows_keeper(&self) -> Option<JobEventRowsKeeper> {
+        self.job_event_rows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .map(JobEventRowsKeeper)
+    }
+}
+
+// Where a terminal event is handed to wait for its job's event rows.
+pub struct JobEventRowsKeeper(mpsc::Sender<SettleJobEventRows>);
+
+impl JobEventRowsKeeper {
+    // Hand the terminal event over. The answer comes once its rows have
+    // committed; `None`, or an answer dropped, when the subscriber has gone.
+    pub async fn settle(
+        self,
+        terminal: weaver_server_base::events::model::PipelineEvent,
+    ) -> Option<oneshot::Receiver<()>> {
+        let (written, answer) = oneshot::channel();
+        self.0
+            .send(SettleJobEventRows { terminal, written })
+            .await
+            .ok()?;
+        Some(answer)
+    }
 }
 
 impl std::ops::Deref for Database {
@@ -1089,6 +1144,7 @@ impl Database {
             history_delete_wake: Arc::new(Notify::new()),
             job_history_cache: Arc::new(Mutex::new(JobHistoryCache::default())),
             tags: Arc::default(),
+            job_event_rows: Arc::default(),
         };
         db.spawn_writer_task(writer_rx);
         db
@@ -1161,6 +1217,7 @@ impl Database {
             history_delete_wake: self.history_delete_wake.clone(),
             job_history_cache: self.job_history_cache.clone(),
             tags: self.tags.clone(),
+            job_event_rows: self.job_event_rows.clone(),
             script_runtime: self.script_runtime.clone(),
             rss_schedule_cache: self.rss_schedule_cache.clone(),
         }

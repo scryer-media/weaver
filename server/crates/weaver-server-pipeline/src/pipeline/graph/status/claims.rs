@@ -5,7 +5,7 @@
 // namespace's marks. Nothing refetches and damaged bytes are kept, so a
 // claim never changes what ships; it only says what the shipment is.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use weaver_graph::{Member, MemberId, NodeId, Sniff, Tree, VolumeIndex, Why, usable_type};
 
@@ -119,7 +119,18 @@ pub(crate) fn refused<'c>(
     delivery: &Delivery,
 ) -> Vec<&'c ClaimedMember> {
     let payload = || census.iter().filter(|row| !row.furniture);
-    if !delivery.whole.is_empty() || payload().any(|row| row.evidence) {
+    // Furniture delivered whole beside the payload is no delivery of it.
+    let furniture: BTreeSet<&str> = census
+        .iter()
+        .filter(|row| row.furniture)
+        .map(|row| row.name.as_str())
+        .collect();
+    if delivery
+        .whole
+        .iter()
+        .any(|name| !furniture.contains(name.as_str()))
+        || payload().any(|row| row.evidence)
+    {
         return Vec::new();
     }
     payload().filter(|row| !row.evidence).collect()
@@ -223,8 +234,10 @@ pub struct Delivered {
 
 impl Delivery {
     // `payload` picks the root members that are the post's files,
-    // `furniture` the names of those files whose state never decides a
-    // job, such as a text file posted beside the payload, and `described`
+    // `furniture` the names of those files that are side files, such as a
+    // text file posted beside the payload: delivered whole, each is a file
+    // of the delivery, and short beside a file that is no furniture it
+    // decides nothing. `described`
     // what the recovery sets of a member's namespace say of it
     // (`Described`). `refused` says why a member is a leaf, and `unarrived`
     // what a posted file that is not whole was, when none of its bytes
@@ -238,14 +251,21 @@ impl Delivery {
         piece: impl Fn(NodeId, MemberId) -> bool,
         unarrived: impl Fn(MemberId) -> Unarrived,
     ) -> Self {
+        // Whether the post holds a file of its own that is no furniture.
+        let beside = tree.namespace(NodeId::ROOT).is_some_and(|root| {
+            root.members()
+                .any(|member| payload(member.id) && !furniture(&member.output_name))
+        });
         let mut walk = Walk {
             tree,
+            beside,
             piece: &piece,
             unarrived: &unarrived,
             furniture: &furniture,
             described: &described,
             refused: &refused,
             opened: BTreeSet::new(),
+            proved: BTreeMap::new(),
             delivery: Self::default(),
         };
         if let Some(root) = tree.namespace(NodeId::ROOT) {
@@ -502,6 +522,8 @@ impl Delivery {
 
 struct Walk<'t, F, R> {
     tree: &'t Tree,
+    // The post holds a file of its own that is no furniture.
+    beside: bool,
     furniture: &'t F,
     described: &'t R,
     refused: &'t dyn Fn(NodeId, MemberId) -> Option<Why>,
@@ -511,6 +533,9 @@ struct Walk<'t, F, R> {
     unarrived: &'t dyn Fn(MemberId) -> Unarrived,
     // Every volume of a set opens the same namespace; it is read once.
     opened: BTreeSet<NodeId>,
+    // Whether each namespace below the root asked of was unpacked from
+    // volumes a set that vouched proved (`proved_namespace`), read once.
+    proved: BTreeMap<NodeId, bool>,
     delivery: Delivery,
 }
 
@@ -531,11 +556,18 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> Described> Walk<'_, F, R> {
                 // root is no payload: no file of the delivery, whole or short,
                 // unless an object that is not a recovery object refused it.
                 let spent = node != NodeId::ROOT
-                    && weaver_graph::sniff::names_recovery(&member.name)
+                    && tree.spends(node, member.id)
                     && tree
                         .refused_by(node, member.id)
                         .is_none_or(|owner| tree.recovers(owner));
-                if !spent && !(node == NodeId::ROOT && (self.furniture)(&member.output_name)) {
+                // Furniture posted at the root is a file of the delivery when
+                // it is whole, and when the post holds nothing else; one that
+                // is not whole beside other files decides nothing.
+                let ignored = node == NodeId::ROOT
+                    && self.beside
+                    && Claim::of(member) != Claim::Complete
+                    && (self.furniture)(&member.output_name);
+                if !spent && !ignored {
                     self.leaf(node, member, short, vouched);
                 }
                 for kept in tree.kept(node, member.id) {
@@ -567,7 +599,18 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> Described> Walk<'_, F, R> {
         // by the tree, which holds its parse beside it.
         let refused =
             (self.refused)(node, member.id).or_else(|| self.tree.withholds(node, member.id));
-        if let Some(why) = refused.filter(|why| why.withholds()) {
+        // A whole volume below the root of a set that lacks a volume, where a
+        // set that vouched proved what it was unpacked from: every byte of
+        // it is what was posted, so the poster never shipped what the set
+        // lacks. It is kept as it stands, below.
+        let lacking =
+            |why: Why| matches!(why, Why::Unmapped | Why::Unfound { .. } | Why::Scattered);
+        let never_shipped = |walk: &mut Self| {
+            claim == Claim::Complete && walk.proved_below(node, member.id, vouched)
+        };
+        if let Some(why) = refused.filter(|why| why.withholds())
+            && !(lacking(why) && never_shipped(self))
+        {
             self.delivery.withheld.push((name, why));
             return;
         }
@@ -594,11 +637,22 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> Described> Walk<'_, F, R> {
         // checked them, and they ship as they stand. So does a whole volume
         // of a set whose first volume the release never carried, which a
         // set that vouched proved, here or in what it was unpacked from: no
-        // object can open it, and its bytes are what was posted. A set that
-        // holds its first volume and lost another is short as it was.
+        // object can open it, and its bytes are what was posted. Below the
+        // root, so does a whole volume of a set short of a volume, or one no
+        // object took, where a set that vouched proved what it was unpacked
+        // from, at whatever depth it was lifted to: the poster never shipped
+        // the rest. A set at the root, or one nothing proved, that holds its
+        // first volume and lacks another is short as it was.
         let proved = vouched || described == Described::Vouched;
         let unchecked = (claim != Claim::Complete && described == Described::Unchecked)
-            || (claim == Claim::Complete && !whole && proved && self.headless(node, member.id));
+            || (claim == Claim::Complete
+                && !whole
+                && ((proved && self.headless(node, member.id))
+                    || ((refused.is_some_and(lacking)
+                        || self.headless(node, member.id)
+                        || (self.tree.refused_by(node, member.id).is_none()
+                            && (self.piece)(node, member.id)))
+                        && never_shipped(self))));
         self.delivery.deliver(
             Delivered {
                 name,
@@ -649,6 +703,44 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> Described> Walk<'_, F, R> {
                         && (above || (self.described)(parent, volume.id) == Described::Vouched)
                 })
             })
+    }
+
+    // Every byte of the member at `node` was unpacked from volumes a set
+    // that vouched proved, `vouched` saying so of `node` itself; for a
+    // member lifted into `node`, of the namespace it was lifted out of.
+    // Never of a member posted at the root.
+    fn proved_below(&mut self, node: NodeId, member: MemberId, vouched: bool) -> bool {
+        if node != NodeId::ROOT && vouched {
+            return true;
+        }
+        let tree = self.tree;
+        match tree.lift_of(node, member) {
+            Some(lift) => {
+                let (from, below) = lift.from;
+                let vouched = self.proved_namespace(from);
+                self.proved_below(from, below, vouched)
+            }
+            None => false,
+        }
+    }
+
+    // `node` lies below the root and was unpacked from volumes a set that
+    // vouched proved, here or in what they were unpacked from
+    // (`vouched_volumes`). Each namespace is read once.
+    fn proved_namespace(&mut self, node: NodeId) -> bool {
+        if node == NodeId::ROOT {
+            return false;
+        }
+        if let Some(proved) = self.proved.get(&node) {
+            return *proved;
+        }
+        let tree = self.tree;
+        let above = tree
+            .volumes(node)
+            .is_some_and(|(parent, _)| self.proved_namespace(parent));
+        let proved = self.vouched_volumes(node, above);
+        self.proved.insert(node, proved);
+        proved
     }
 
     // The member is a volume of an object that refused it and was bound

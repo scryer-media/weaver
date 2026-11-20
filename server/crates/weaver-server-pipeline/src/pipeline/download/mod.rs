@@ -36,6 +36,26 @@ pub(crate) use worker::{
 };
 
 pub use queue::{DownloadQueue, DownloadWork, QueueItem, QueuedWork};
+
+// What the unit tests compiled apart in tests/pipeline_units.rs reach in the
+// private download modules.
+#[cfg(feature = "pipeline-test-fixtures")]
+#[doc(hidden)]
+pub mod units {
+    pub use super::worker::queued_files_may_pass;
+    pub mod owned_lane {
+        pub use super::super::owned_lane::*;
+    }
+    pub mod transport {
+        pub use super::super::transport::*;
+    }
+    pub mod volume_pace {
+        pub use super::super::worker::volume_pace::*;
+    }
+    pub mod worker {
+        pub use super::super::worker::*;
+    }
+}
 pub(super) use transport::{DownloadLaneMode, DownloadLaneRuntimeState, LaneParkReason};
 
 // The NNTP wire arguments for a batch of leased work, in lease order.
@@ -48,8 +68,8 @@ pub(super) use transport::{DownloadLaneMode, DownloadLaneRuntimeState, LaneParkR
 // answers 430 for every article — a silent, total download failure that only
 // shows up against real providers. Borrowing the stored `Arc<str>` to save an
 // allocation is exactly how that regression happened.
-#[cfg(test)]
-pub(super) fn lease_message_id_wire_forms(works: &[DownloadWork]) -> Vec<String> {
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+pub fn lease_message_id_wire_forms(works: &[DownloadWork]) -> Vec<String> {
     works
         .iter()
         .map(|work| work.message_id.wire_form())

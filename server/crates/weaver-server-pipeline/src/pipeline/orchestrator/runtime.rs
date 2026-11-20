@@ -2393,6 +2393,14 @@ impl Pipeline {
         // What the volume holds has the stop's span to be put down, after
         // this. The runs are stopped first, so one that goes on says no
         // more.
+        //
+        // The wait ends only because nothing new goes out: a repair the
+        // stop ended lends the set's next as it is taken back, and that one
+        // is stopped in turn, round and round. So the drain raises the
+        // shutdown that refuses every loan itself, whoever began it.
+        self.shared_state
+            .shutdown_started()
+            .store(true, std::sync::atomic::Ordering::Release);
         let limit = self.graph_slot_limit();
         for job in self.graph_jobs.values_mut() {
             job.stop_runs(limit);

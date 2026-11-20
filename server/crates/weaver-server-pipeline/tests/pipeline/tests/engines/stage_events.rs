@@ -7,8 +7,9 @@
 
 use sevenz_turbo::encoder_options::Lzma2Options;
 
-use super::harness::{ARTICLE, JOB, Outcome, Post, Scenario, par2_set, payload, run};
+use super::harness::{ARTICLE, JOB, Outcome, Post, Scenario, par2_set, par3_set, payload, run};
 use super::rar::posts;
+use crate::jobs::model::JobStatus;
 use crate::pipeline::tests::direct_store::single_member_store_set;
 use weaver_server_base::events::model::PipelineEvent;
 
@@ -151,7 +152,44 @@ async fn a_repair_the_job_fails_on_says_it_failed() {
     let graph = run(&scenario).await;
     assert!(!graph.completed(), "{:?}", graph.status);
     let said = stages(&graph);
-    assert!(said.contains(&"RepairFailed".to_string()), "{said:?}");
+    assert_eq!(
+        said.iter().filter(|stage| *stage == "RepairFailed").count(),
+        1,
+        "{said:?}"
+    );
+}
+
+// One plain file damaged in two slices beside a PAR2 set of one recovery
+// block and a PAR3 set of eight. The PAR2 set rules first that it cannot
+// rebuild the damage and the job leaves repair with the PAR3 set still to
+// repair; the PAR3 set then rebuilds the file and the job ends Complete. A
+// ruling that a later repair made good is no failure of the job: no repair
+// is said to have failed.
+#[tokio::test]
+async fn a_short_set_outdone_by_a_later_repair_says_no_repair_failure() {
+    let body = payload(6 * ARTICLE + 11, 74);
+    let files: [(&str, &[u8]); 1] = [("ember.bin", &body)];
+    let mut all = vec![Post::plain("ember.bin", body.clone())];
+    all.extend(par2_set("ember", &files, 1));
+    all.extend(par3_set("ember.c", &files, 8));
+    let scenario = Scenario::new(all).damaged(0, 1).damaged(0, 4);
+    let graph = run(&scenario).await;
+    assert_eq!(
+        graph.status,
+        Some(JobStatus::Complete),
+        "{:?}",
+        graph.failure
+    );
+    assert_eq!(
+        stages(&graph),
+        [
+            "RepairStarted",
+            "RepairStarted",
+            "RepairComplete",
+            "JobVerificationStarted",
+            "JobVerificationComplete true"
+        ]
+    );
 }
 
 // Two plain files, one of which every server failed an article of: only the

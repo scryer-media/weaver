@@ -34,6 +34,48 @@ mod server_attribution;
 mod support_facts;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
+// What the unit tests compiled apart in tests/pipeline_units.rs reach in the
+// private pipeline modules.
+#[cfg(feature = "pipeline-test-fixtures")]
+#[doc(hidden)]
+pub mod units {
+    pub mod post_health {
+        pub use super::super::post_health::*;
+    }
+    pub mod layout {
+        pub use super::super::decode::units::layout::*;
+    }
+    pub mod finalize {
+        pub use super::super::completion::finalize::*;
+    }
+    pub mod deobfuscate {
+        pub use super::super::completion::finalize::deobfuscate::*;
+    }
+    pub mod extraction_error {
+        pub use super::super::extraction::error::*;
+    }
+    pub mod adapters {
+        pub use super::super::extraction::error::units::adapters::*;
+    }
+    pub mod given_up {
+        pub use super::super::post_health::units::given_up::*;
+    }
+    pub mod held {
+        pub use super::super::held::*;
+    }
+    pub mod check {
+        pub use super::super::completion::finalize::check::*;
+    }
+    pub mod order {
+        pub use super::super::queue::order::*;
+    }
+    pub mod decode {
+        pub use super::super::decode::units::decode::*;
+    }
+    pub mod control {
+        pub use super::super::orchestrator::units::control::*;
+    }
+}
 
 pub(crate) use orchestrator::is_terminal_status;
 
@@ -347,42 +389,42 @@ pub(super) struct DownloadLaneOwner {
     outstanding_bytes: u64,
 }
 
-pub(super) struct DownloadBatchLease {
-    pub(super) body_activity: Arc<std::sync::atomic::AtomicU64>,
-    pub(super) lane_id: u64,
-    pub(super) job_id: JobId,
-    pub(super) runtime_generation: u64,
-    pub(super) lane_mode: DownloadLaneMode,
-    pub(super) server_modes: Vec<(usize, DownloadLaneMode)>,
+pub struct DownloadBatchLease {
+    pub body_activity: Arc<std::sync::atomic::AtomicU64>,
+    pub lane_id: u64,
+    pub job_id: JobId,
+    pub runtime_generation: u64,
+    pub lane_mode: DownloadLaneMode,
+    pub server_modes: Vec<(usize, DownloadLaneMode)>,
     // The class every work in this batch is counted under. A batch is cut
     // from one job and one class; the worker reports it back on park so the
     // class gauges are released against what was booked.
-    pub(super) completion_critical: bool,
+    pub completion_critical: bool,
     // The job's retention exclusions — the set server ordering and lane
     // acquisition use. Job-derived, so a server-config change applies without
     // rewriting queued work, and the same for every article on the lane:
     // each result unions it with its own work's failure ledger rather than
     // reporting this set alone.
-    pub(super) effective_exclude_servers: weaver_nntp::ServerSet,
+    pub effective_exclude_servers: weaver_nntp::ServerSet,
     // The servers the lane's adopt or dial must not use. A batch is cut for
     // one server, so this is every other server: the connection goes where
     // the scheduler's answer was for. Kept apart from the excludes above,
     // which reach the failure ledger — a pin is not a failure.
-    pub(super) dial_exclude_servers: weaver_nntp::ServerSet,
+    pub dial_exclude_servers: weaver_nntp::ServerSet,
     // Immutable common-refinement geometry captured when this batch was
     // leased. Each response carries this same snapshot through durable commit
     // so grids admitted later cannot reinterpret old decoder output.
-    pub(super) checkpoint_plan: weaver_yenc::CheckpointPlan,
+    pub checkpoint_plan: weaver_yenc::CheckpointPlan,
     // Byte pressure at lease time. Carried onto every observation this lease
     // produces so the depth explorer can discard distorted samples.
-    pub(super) pressure_clear: bool,
+    pub pressure_clear: bool,
     // The job's repeated-article cache, when several of its files share an
     // article: the lane answers those references from it.
-    pub(super) repeated: Option<Arc<download::repeated::RepeatedArticles>>,
-    pub(super) works: Vec<DownloadWork>,
+    pub repeated: Option<Arc<download::repeated::RepeatedArticles>>,
+    pub works: Vec<DownloadWork>,
 }
 
-pub(super) struct DownloadLaneRefillRequest {
+pub struct DownloadLaneRefillRequest {
     pub(super) lane_id: u64,
     pub(super) runtime_generation: u64,
     pub(super) server_idx: usize,
@@ -395,24 +437,24 @@ pub(super) struct DownloadLaneRefillRequest {
     // `download_lanes_active{mode="sequential"}`. Lanes therefore carry the
     // booked mode forward and update it from each granted lease.
     pub(super) current_mode: DownloadLaneMode,
-    pub(super) response_tx: oneshot::Sender<DownloadLaneRefillResponse>,
+    pub response_tx: oneshot::Sender<DownloadLaneRefillResponse>,
 }
 
-pub(super) struct DownloadLaneRefillResponse {
-    pub(super) lease: Option<DownloadBatchLease>,
-    pub(super) park_reason: LaneParkReason,
+pub struct DownloadLaneRefillResponse {
+    pub lease: Option<DownloadBatchLease>,
+    pub park_reason: LaneParkReason,
 }
 
-pub(super) struct DownloadLaneParked {
+pub struct DownloadLaneParked {
     pub(super) lane_id: u64,
     pub(super) job_id: JobId,
     pub(super) mode: DownloadLaneMode,
-    pub(super) completion_critical: bool,
-    pub(super) reason: LaneParkReason,
-    pub(super) release_connection_slot: bool,
+    pub completion_critical: bool,
+    pub reason: LaneParkReason,
+    pub release_connection_slot: bool,
 }
 
-pub(super) enum OwnedDownloadLaneEvent {
+pub enum OwnedDownloadLaneEvent {
     LeaseObsolete {
         lease: DownloadBatchLease,
     },
@@ -464,24 +506,24 @@ impl DownloadResultOrigin {
 }
 
 // Result of a download task.
-pub(super) struct DownloadResult {
+pub struct DownloadResult {
     pub(super) lane_id: u64,
     // Job this article belongs to. Carried on the result itself so the
     // completion path never has to ask which job owns the lane it arrived on.
     pub(super) job_id: JobId,
-    pub(super) segment_id: SegmentId,
-    pub(super) runtime_generation: u64,
-    pub(super) data: std::result::Result<DownloadPayload, DownloadError>,
+    pub segment_id: SegmentId,
+    pub runtime_generation: u64,
+    pub data: std::result::Result<DownloadPayload, DownloadError>,
     pub(super) attempts: Vec<weaver_nntp::client::FetchAttemptTrace>,
-    pub(super) lane_observation: Option<DownloadLaneObservation>,
+    pub lane_observation: Option<DownloadLaneObservation>,
     // Server that successfully served this payload, if known.
     pub(super) source_server_idx: Option<usize>,
     // Scheduler attribution for metrics, warmup, and retry semantics.
     pub(super) origin: DownloadResultOrigin,
     // How many times this segment has been retried so far.
-    pub(super) retry_count: u32,
+    pub retry_count: u32,
     // Servers intentionally excluded for this fetch attempt.
-    pub(super) exclude_servers: weaver_nntp::ServerSet,
+    pub exclude_servers: weaver_nntp::ServerSet,
     // Whether this result releases one NNTP connection dispatch slot.
     pub(super) release_connection_slot: bool,
 }
@@ -529,55 +571,55 @@ pub(super) struct DownloadWaitStatus {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct DownloadLaneObservation {
-    pub(super) server_idx: Option<usize>,
-    pub(super) mode: DownloadLaneMode,
-    pub(super) supports_pipelining: bool,
+pub struct DownloadLaneObservation {
+    pub server_idx: Option<usize>,
+    pub mode: DownloadLaneMode,
+    pub supports_pipelining: bool,
     // Command-to-status-line wait this one response measured, present only
     // when the lane could take an unbiased sample (nothing else outstanding
     // when the request went out).
-    pub(super) latency_sample: Option<Duration>,
+    pub latency_sample: Option<Duration>,
     // This response was its connection's first. Its timings carry setup
     // costs no later response repeats, so the depth explorer keeps it out
     // of the link model and the rung comparison.
-    pub(super) cold: bool,
+    pub cold: bool,
     // Status-line-to-terminator wait: what the article cost on the wire,
     // smoothed over the lane's warm responses.
-    pub(super) transfer: Option<Duration>,
+    pub transfer: Option<Duration>,
     // Decoded payload of this one response, for the depth explorer's
     // throughput window.
-    pub(super) payload_bytes: u64,
+    pub payload_bytes: u64,
     // This response's elapsed time with deliberate throttle waits removed.
-    pub(super) policy_elapsed: Duration,
+    pub policy_elapsed: Duration,
     // Whether byte pressure was clear when the batch was leased. Samples
     // taken under pressure say nothing about the depth under test.
-    pub(super) pressure_clear: bool,
+    pub pressure_clear: bool,
     // The lane held a full rung of articles, in flight and queued behind,
     // when this response was read. A response read with less waited on the
     // lane's next lease, so its time says how late the work came as well as
     // how fast the server is.
-    pub(super) fed: bool,
-    pub(super) batch_complete: bool,
-    pub(super) batch_clean: bool,
-    pub(super) unresolved_count: u64,
-    pub(super) connection_discarded: bool,
+    pub fed: bool,
+    pub batch_complete: bool,
+    pub batch_clean: bool,
+    pub unresolved_count: u64,
+    pub connection_discarded: bool,
     // The server answered a request on this connection while a later one
     // was already on the wire, since the connection last had nothing
     // outstanding: it demonstrably took pipelined requests. A fault without
     // it is how any connection fails (an idle close, a restart, an outage)
     // and says nothing about pipelining; a clean batch without it ran one
     // request at a time and proves nothing either.
-    pub(super) answered_pipelined: bool,
+    pub answered_pipelined: bool,
 }
 
-pub(super) enum DownloadPayload {
+pub enum DownloadPayload {
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     Raw(Bytes),
     Decoded(DecodeResult),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum DownloadFailureKind {
+pub enum DownloadFailureKind {
     ArticleNotFound,
     CapacityUnavailable,
     ServerQuota,
@@ -600,7 +642,7 @@ pub(super) enum DownloadFailureKind {
 }
 
 impl DownloadFailureKind {
-    fn preserves_article_retry_budget(&self) -> bool {
+    pub fn preserves_article_retry_budget(&self) -> bool {
         matches!(
             self,
             Self::CapacityUnavailable
@@ -637,7 +679,7 @@ pub(in crate::pipeline) const AUTH_WAIT_REASON: &str = "NNTP authentication bloc
 
 // What a refusal for want of a selected group (412) says about the article.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(super) enum GroupRefusal {
+pub enum GroupRefusal {
     // The failure is not a 412.
     #[default]
     None,
@@ -652,16 +694,16 @@ pub(super) enum GroupRefusal {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct DownloadFailure {
-    pub(super) kind: DownloadFailureKind,
+pub struct DownloadFailure {
+    pub kind: DownloadFailureKind,
     pub(super) message: String,
     pub(super) retry_after: Option<Duration>,
     pub(super) quota_rejection: Option<weaver_nntp::transfer::QuotaRejection>,
-    pub(super) group_refusal: GroupRefusal,
+    pub group_refusal: GroupRefusal,
 }
 
 impl DownloadFailure {
-    pub(super) fn new(kind: DownloadFailureKind, message: impl Into<String>) -> Self {
+    pub fn new(kind: DownloadFailureKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
@@ -672,14 +714,14 @@ impl DownloadFailure {
     }
 
     // Whether the article keeps its retry count for this failure.
-    pub(super) fn preserves_article_retry_budget(&self) -> bool {
+    pub fn preserves_article_retry_budget(&self) -> bool {
         self.kind.preserves_article_retry_budget() && self.group_refusal != GroupRefusal::Settled
     }
 
     // Settle a 412 the next connection cannot answer by selecting a group:
     // `no_group` when the work lists none, `group_selected` when the
     // connection that was refused had one selected.
-    pub(super) fn settle_group_refusal(&mut self, no_group: bool, group_selected: bool) {
+    pub fn settle_group_refusal(&mut self, no_group: bool, group_selected: bool) {
         if self.group_refusal == GroupRefusal::Learning && (no_group || group_selected) {
             self.group_refusal = GroupRefusal::Settled;
         }
@@ -779,7 +821,7 @@ impl DownloadFailure {
         Self::new(kind, error.to_string())
     }
 
-    pub(super) fn from_nntp(error: weaver_nntp::NntpError) -> Self {
+    pub fn from_nntp(error: weaver_nntp::NntpError) -> Self {
         use weaver_nntp::NntpError;
 
         if let NntpError::QuotaBlocked(rejection) = &error {
@@ -806,7 +848,7 @@ impl DownloadFailure {
 }
 
 #[derive(Debug, Clone)]
-pub(super) enum DownloadError {
+pub enum DownloadError {
     Fetch(DownloadFailure),
     // Local cache or resource failure; never evidence that an article is missing.
     Local { raw_size: u64, error: String },
@@ -865,7 +907,7 @@ impl DownloadError {
 // Whether a download outcome leaves the lane's connection reusable.
 //
 // See [`DownloadError::leaves_connection_clean`].
-pub(super) fn download_outcome_keeps_connection(
+pub fn download_outcome_keeps_connection(
     data: &std::result::Result<DownloadPayload, DownloadError>,
 ) -> bool {
     match data {
@@ -1278,7 +1320,7 @@ impl Pipeline {
 }
 
 // Result of a decode task.
-pub(super) struct DecodeResult {
+pub struct DecodeResult {
     pub(super) segment_id: SegmentId,
     pub(super) raw_size: u64,
     // How the article was encoded. Everything below that reads like a
@@ -1306,12 +1348,12 @@ pub(super) struct DecodeResult {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct YencLayoutAssertions {
-    pub(super) file_size: u64,
-    pub(super) part: Option<u32>,
-    pub(super) total: Option<u32>,
-    pub(super) begin: Option<u64>,
-    pub(super) end: Option<u64>,
+pub struct YencLayoutAssertions {
+    pub file_size: u64,
+    pub part: Option<u32>,
+    pub total: Option<u32>,
+    pub begin: Option<u64>,
+    pub end: Option<u64>,
 }
 
 // The server a body came from and the servers its article had excluded, as
@@ -1375,7 +1417,7 @@ const POOL_LAYOUTS_KEPT: usize = 16;
 // server that left the pool for one generation and came back is still the
 // same server to work taken before it left.
 #[derive(Default)]
-pub(crate) struct PoolLayouts {
+pub struct PoolLayouts {
     held: std::collections::VecDeque<(
         u64,
         Vec<weaver_nntp::ServerIdentity>,
@@ -1388,7 +1430,7 @@ impl PoolLayouts {
     // is the generation it replaced and how that one was laid out, used
     // when no layout is held yet. Returns the map from the previous
     // generation to this one.
-    pub(in crate::pipeline) fn activate(
+    pub fn activate(
         &mut self,
         previous: (u64, Vec<weaver_nntp::ServerIdentity>),
         generation: u64,
@@ -1584,7 +1626,7 @@ impl From<Vec<Box<[u8]>>> for DecodedChunk {
 // place a segment can acquire a state and no place at all where bytes are
 // added without one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::pipeline) enum SegmentTerminalState {
+pub enum SegmentTerminalState {
     // Every configured server refused the article.
     Missing,
     // The download retry budget ran out without a usable body.

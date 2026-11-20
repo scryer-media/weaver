@@ -40,6 +40,7 @@ impl Tree {
         &mut self,
         node: NodeId,
         member: MemberId,
+        why: Why,
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) {
@@ -49,6 +50,9 @@ impl Tree {
             .and_then(|found| found.refused)
         {
             Some(Why::Scattered) => self.lift_scattered(node, member, set, builder, effects),
+            // A member refused as not its object's to open is the posted
+            // file, whole, and never a piece of another.
+            _ if why.disclaims() => {}
             _ => self.refused_whole(node, member, builder, effects),
         }
     }

@@ -416,6 +416,12 @@ impl Pipeline {
             self.graph_give_up_next(job_id);
             return;
         }
+        if matches!(said.heard, Heard::Blocked) {
+            if self.graph_jobs.contains_key(&job_id) {
+                self.schedule_job_completion_check(job_id);
+            }
+            return;
+        }
         if let Some(graph) = self.retiring_graph_jobs.get_mut(&job_id) {
             if self.pending_graph_terminals.contains_key(&job_id)
                 || matches!(
@@ -917,7 +923,7 @@ impl Pipeline {
 
     // After anything reached the tree: answer the objects' seeks, move the
     // articles they moved, and report the phase if it changed.
-    fn after_graph_step(&mut self, job_id: JobId) {
+    pub(in crate::pipeline::graph) fn after_graph_step(&mut self, job_id: JobId) {
         let limit = self.graph_job_slot_limit(job_id);
         let (Some(graph), Some(state)) =
             (self.graph_jobs.get_mut(&job_id), self.jobs.get_mut(&job_id))

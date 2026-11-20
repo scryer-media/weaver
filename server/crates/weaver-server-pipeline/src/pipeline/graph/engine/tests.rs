@@ -678,6 +678,160 @@ async fn a_run_takes_a_slot_and_the_next_queues_behind_the_limit() {
     assert!(!runs.live());
 }
 
+// A run that asks for its first volume and ends once it has an answer.
+struct Waits;
+
+impl Extraction for Waits {
+    fn run(self: Box<Self>, volumes: Arc<dyn Volumes>, _: &mut Sink<'_>, _: weaver_graph::Budget) {
+        let _ = volumes.next(None);
+    }
+}
+
+// The shelf's set is complete with no volume: the waiting run's `next`
+// answers `None`.
+fn end_set(shelf: &Shelf) {
+    shelf.update(|state| {
+        state.complete = true;
+        state.deciding = false;
+    });
+}
+
+// A run waiting on its shelf, with a second queued behind the one slot:
+// the job is held back by the queued run. Asked, the shelf tells of the
+// wait once, on the root's mail; a run that waits while nobody asks tells
+// nothing.
+#[tokio::test]
+async fn a_run_waiting_on_its_shelf_is_told_of_once_and_the_queued_one_holds_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut envelopes = Envelopes::new(dir.path().to_path_buf());
+    let mut mail = RunMail::default();
+    let mut runs = Runs::new(1, 1, mail.sender(), unbounded());
+    let (first, second) = (NodeId(1), NodeId(2));
+    assert_eq!(runs.ask(first, 1), vec![first]);
+    assert!(runs.ask(second, 1).is_empty());
+    let shelf = envelopes.shelf(first);
+    shelf.update(|state| state.deciding = true);
+    let blocked = envelopes.blocked();
+    envelopes.watch().ask(true, || (mail.written(), 1));
+    runs.start(first, Box::new(Waits), Arc::clone(&shelf));
+
+    let said = mail.recv().await.unwrap();
+    assert_eq!(said.node, first);
+    assert!(matches!(said.heard, Heard::Blocked));
+    assert!(shelf.blocked());
+    assert!(runs.held_back(), "the second waits for the slot");
+    assert_eq!((envelopes.watch().asks(), envelopes.watch().told()), (1, 1));
+
+    end_set(&shelf);
+    let said = mail.recv().await.unwrap();
+    assert!(matches!(said.heard, Heard::Ended));
+    assert_eq!(runs.ended(first, said.generation, 1), vec![second]);
+    assert!(
+        runs.held_back(),
+        "the second has the slot and has yet to run"
+    );
+
+    // Nobody asks now: the second waits on its shelf and tells nothing.
+    envelopes.watch().ask(false, || unreachable!());
+    let shelf = envelopes.shelf(second);
+    shelf.update(|state| state.deciding = true);
+    runs.start(second, Box::new(Waits), Arc::clone(&shelf));
+    while !shelf.blocked() {
+        blocked.notified().await;
+    }
+    assert!(!runs.held_back());
+    assert_eq!(envelopes.watch().told(), 1);
+    end_set(&shelf);
+    let said = mail.recv().await.unwrap();
+    assert_eq!(said.node, second);
+    assert!(matches!(said.heard, Heard::Ended));
+    assert!(runs.ended(second, said.generation, 1).is_empty());
+    assert_eq!(envelopes.watch().told(), 1);
+}
+
+// A parent's run, asked again, is turned away for the decode memory its
+// child's run holds while it waits on its shelf, in a pool of `limit`
+// bytes. `other` holds the rest of the pool for another job, when given.
+async fn starved_beside_a_waiting_child(
+    limit: u64,
+    other: Option<&mut Runs>,
+) -> (Runs, Arc<Shelf>, RunMail, tempfile::TempDir) {
+    const WINDOW: u64 = 1 << 20;
+    let dir = tempfile::tempdir().unwrap();
+    let mut envelopes = Envelopes::new(dir.path().to_path_buf());
+    let mail = RunMail::default();
+    let pool = match &other {
+        Some(other) => Arc::clone(&other.pool),
+        None => bounded(limit),
+    };
+    if let Some(other) = other {
+        assert_eq!(other.ask(NodeId(7), 1), vec![NodeId(7)]);
+        assert_eq!(other.reserve(NodeId(7), WINDOW), Reservation::Granted);
+    }
+    let mut runs = Runs::new(1, 2, mail.sender(), pool);
+    let (parent, child) = (NodeId(1), NodeId(2));
+    assert_eq!(runs.ask(child, 2), vec![child]);
+    assert_eq!(runs.reserve(child, WINDOW), Reservation::Granted);
+    let shelf = envelopes.shelf(child);
+    shelf.update(|state| state.deciding = true);
+    let blocked = envelopes.blocked();
+    runs.start(child, Box::new(Waits), Arc::clone(&shelf));
+    while !shelf.blocked() {
+        blocked.notified().await;
+    }
+    assert_eq!(runs.ask(parent, 2), vec![parent]);
+    assert_eq!(
+        runs.reserve(parent, WINDOW),
+        Reservation::Starved(Vec::new())
+    );
+    (runs, shelf, mail, dir)
+}
+
+// A child's run waits on its shelf, holding the decode memory its parent's
+// run is turned away for. While another job holds part of the pool, that
+// job's end may wake the parent, and the job is held back. When every byte
+// the pool holds is the job's own, only the waiting child could give one
+// back: the starved parent does not hold the job back, and the stall rule
+// reads the job as waiting on its blocked run alone. The child's end then
+// wakes the parent.
+#[tokio::test]
+async fn a_parent_starved_by_its_waiting_child_holds_back_only_while_another_job_holds_memory() {
+    const WINDOW: u64 = 1 << 20;
+    let (mut runs, shelf, mut mail, _dir) =
+        starved_beside_a_waiting_child(WINDOW + RUN_OVERHEAD, None).await;
+    assert!(!runs.wakeable());
+    assert!(
+        !runs.held_back(),
+        "only the waiting child holds what the parent waits for"
+    );
+    end_set(&shelf);
+    let said = mail.recv().await.unwrap();
+    assert!(matches!(said.heard, Heard::Ended));
+    assert_eq!(
+        runs.ended(NodeId(2), said.generation, 2),
+        vec![NodeId(1)],
+        "the child's end freed the pool for the parent"
+    );
+    assert!(
+        runs.held_back(),
+        "the parent has its slot and has yet to run"
+    );
+
+    let mut other = Runs::new(
+        2,
+        1,
+        RunMail::default().sender(),
+        bounded(2 * (WINDOW + RUN_OVERHEAD)),
+    );
+    let (runs, shelf, mut mail, _dir) = starved_beside_a_waiting_child(0, Some(&mut other)).await;
+    assert!(!runs.wakeable());
+    assert!(runs.held_back(), "the other job's end may wake the parent");
+    assert!(other.ended(NodeId(7), 0, 1).is_empty());
+    assert!(runs.held_back(), "a release the parent has yet to hear");
+    end_set(&shelf);
+    assert!(matches!(mail.recv().await.unwrap().heard, Heard::Ended));
+}
+
 // A run that panics as it reads.
 struct Panics;
 
