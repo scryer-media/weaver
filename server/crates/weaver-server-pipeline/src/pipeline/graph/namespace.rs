@@ -252,6 +252,11 @@ pub struct NamespaceWriter {
     // Members whose files wait to move to the names the ledger gave them,
     // in the order it gave them.
     pub moves: moves::Moves,
+    // Whether the job is ready to deliver, so the waiting moves may run.
+    // Until then a file keeps the name it opened at, whatever the ledger
+    // names its member meanwhile. Not stored: a restored job reaches the
+    // delivery again and says so again.
+    delivering: bool,
     // Where every file sits and waits to move, kept for new files to ask.
     pub kept: moves::Kept,
     // The names members left that the database may still give them, by the
@@ -414,6 +419,7 @@ impl NamespaceWriter {
             stopped: false,
             renamed: Vec::new(),
             moves: moves::Moves::default(),
+            delivering: false,
             kept: moves::Kept::default(),
             left: BTreeMap::new(),
             leaving: Vec::new(),

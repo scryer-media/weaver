@@ -19,6 +19,7 @@ mod pipeline {
             mod classic_rar_crypt;
             mod furniture;
             mod header_names;
+            mod names_at_delivery;
             mod nested_sfv;
             mod partial;
             mod restart;

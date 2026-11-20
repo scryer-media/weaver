@@ -583,12 +583,15 @@ impl Job {
     fn new(budgets: HoldBudgets) -> Self {
         let dir = tempfile::tempdir().expect("temp dir");
         let accountant = Arc::new(HoldsAccountant::new(budgets));
-        let writer = NamespaceWriter::new(
+        let mut writer = NamespaceWriter::new(
             1,
             dir.path().to_path_buf(),
             Arc::clone(&accountant),
             CapacityReader::unknown(),
         );
+        // These tests drive how the moves run once they may: the job here
+        // has reached its delivery.
+        writer.deliver_names();
         Self {
             dir,
             tree: Tree::new(),
@@ -693,6 +696,7 @@ impl Job {
     // records what is wanted, and its commit runs the moves it covers and
     // frees the names they left.
     fn commit(&mut self) {
+        self.writer.deliver_names();
         while self.writer.moves_waiting() {
             let stamp = self.writer.committed + 1;
             self.writer.recorded(stamp);

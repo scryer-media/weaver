@@ -244,6 +244,10 @@ pub struct Slot {
     owed: Option<Owed>,
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     named: Named,
+    // Each member's output name and the name its file sits at, as the last
+    // write took them, so a test counts the writes that change a name.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    names_taken: std::collections::HashMap<(i64, i64), (String, Option<String>)>,
 }
 
 // A change held until the disk bears it out.
@@ -499,6 +503,10 @@ pub struct Tally {
     pub checkpoints: usize,
     pub rows: usize,
     pub(crate) facts: usize,
+    // Counted in tests only: the writes taken that change a member's output
+    // name or the name its file sits at, and the member rows they change so.
+    pub(crate) naming_writes: usize,
+    pub(crate) naming_rows: usize,
 }
 
 impl Pending {
@@ -716,6 +724,24 @@ impl Pending {
         #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         {
             slot.named.taken = slot.named.put.clone();
+            let mut changed = 0;
+            if let Some(queued) = slot.queued.as_ref() {
+                let rows: Vec<_> = queued
+                    .members
+                    .values()
+                    .flatten()
+                    .map(|row| {
+                        let names = (row.output_name.clone(), row.on_disk.clone());
+                        ((row.node, row.member), names)
+                    })
+                    .collect();
+                for (key, names) in rows {
+                    let was = slot.names_taken.insert(key, names.clone());
+                    changed += usize::from(was.is_some_and(|was| was != names));
+                }
+            }
+            slot.tally.naming_writes += usize::from(changed > 0);
+            slot.tally.naming_rows += changed;
         }
         (slot.queued.take(), slot.released)
     }

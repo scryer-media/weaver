@@ -77,15 +77,6 @@ pub async fn advance(pipeline: &mut Pipeline, job_id: JobId) {
     if pipeline.graph_status.repairs.handed(asker(job_id)) {
         pipeline.lend_graph_repairs(job_id);
     }
-    // A file waiting to move waits on a checkpoint's commit: one is taken,
-    // so the database says when.
-    if pipeline
-        .graph_jobs
-        .get(&job_id)
-        .is_some_and(GraphJob::moves_waiting)
-    {
-        pipeline.checkpoint_graph_job(job_id);
-    }
     let limit = pipeline.graph_job_slot_limit(job_id);
     let Some(job) = pipeline.graph_jobs.get_mut(&job_id) else {
         return;
@@ -103,6 +94,16 @@ pub async fn advance(pipeline: &mut Pipeline, job_id: JobId) {
         asker(job_id),
         limit,
     );
+    // A file waiting to move waits on a checkpoint's commit once the job is
+    // ready to deliver: one is taken, so the database says when. Before
+    // then a move waits for the delivery, and no checkpoint is taken for it.
+    if pipeline
+        .graph_jobs
+        .get(&job_id)
+        .is_some_and(|job| job.moves_waiting() && job.awaits_commit())
+    {
+        pipeline.checkpoint_graph_job(job_id);
+    }
     pipeline.report_graph_phase(job_id);
     for woken in pipeline.graph_status.repairs.take_woken() {
         pipeline.schedule_job_completion_check(JobId(woken.0));

@@ -74,6 +74,8 @@ pub trait RootJob {
     fn work_pending(&self) -> bool;
     // A member's file still waits to move to its name.
     fn moves_waiting(&self) -> bool;
+    // The job is ready to deliver: the files move to their names now.
+    fn deliver_names(&mut self);
 }
 
 // The job's own seams. GraphJob repairs inside its article path, once the
@@ -149,6 +151,10 @@ impl RootJob for GraphJob {
     fn moves_waiting(&self) -> bool {
         GraphJob::moves_waiting(self)
     }
+
+    fn deliver_names(&mut self) {
+        GraphJob::deliver_names(self);
+    }
 }
 
 // What an advance came to.
@@ -193,8 +199,12 @@ pub fn drive(job: &mut dyn RootJob, slots: &mut RepairSlots, asker: AskerId, lim
     match job.phase() {
         RootPhase::Extracting => Step::Wait,
         // The delivery takes every file from its name, so it waits for
-        // each file still moving there.
-        _ if job.moves_waiting() => Step::Wait,
+        // each file still moving there. Only now do the files move: each
+        // once, to the name the ledger settled on while the job downloaded.
+        _ if job.moves_waiting() => {
+            job.deliver_names();
+            Step::Wait
+        }
         _ => Step::Deliver,
     }
 }

@@ -604,7 +604,21 @@ async fn a_hex_named_member_bound_by_its_prefix_is_renamed_and_its_file_moves() 
     assert_eq!(read(&hex), data);
     assert!(!working_dir.join("lantern.bin").exists());
 
+    // The checkpoint that records the name commits; the file keeps the
+    // name it sits at until the job is ready to deliver.
     release.send(()).unwrap();
+    hear_graph_mail(&mut pipeline, job_id).await;
+    assert!(pipeline.graph_jobs[&job_id].moves_waiting());
+    assert_eq!(member_file(&pipeline, job_id, 0), Some(hex.clone()));
+    assert_eq!(read(&hex), data);
+
+    // The queues owe nothing more, so the job is ready to deliver: the
+    // move asks for its checkpoint and runs.
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+    state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
+    pipeline.check_job_completion(job_id).await;
+    assert!(pipeline.graph_jobs[&job_id].delivering_names());
     hear_graph_mail(&mut pipeline, job_id).await;
     assert!(!pipeline.graph_jobs[&job_id].moves_waiting());
     let stored = pipeline.db.load_graph_checkpoint(job_id).unwrap().unwrap();

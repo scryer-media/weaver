@@ -588,6 +588,18 @@ impl GraphJob {
         self.writer.moves_waiting()
     }
 
+    // The job is ready to deliver: each file moves to the name the ledger
+    // gives its member now, as the checkpoints that record it commit.
+    pub fn deliver_names(&mut self) {
+        self.writer.deliver_names();
+    }
+
+    // Whether the job's files have begun moving to their names.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn delivering_names(&self) -> bool {
+        self.writer.delivering_names()
+    }
+
     // Whether a run's refusal stands only because the policy holds runs to
     // the profile's ceiling, so a reprocess with no memory limit could
     // finish what it withheld.
