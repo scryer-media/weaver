@@ -14,7 +14,9 @@ use weaver_server_composition::operations::StorageRoot;
 use weaver_server_pipeline::jobs::handle::DISK_SPACE_WAIT_REASON;
 use weaver_server_pipeline::jobs::model::JobStatus;
 use weaver_server_pipeline::pipeline::Pipeline;
-use weaver_server_pipeline::pipeline::tests::disk_start_fixture::{promised_here, shown};
+use weaver_server_pipeline::pipeline::tests::disk_start_fixture::{
+    promised_here, remaining, shown, started,
+};
 use weaver_server_pipeline::pipeline::tests::queue_fixture::{apply_intents, cancel_batch, handle};
 
 // What each root's own count holds promised.
@@ -248,4 +250,94 @@ async fn a_full_disk_hold_goes_on_only_at_a_later_reading_with_the_room_it_needs
     restarts(&mut pipeline).await;
     finish_disk_job(&mut pipeline, &scenario).await;
     assert_eq!(status(&pipeline), Some(JobStatus::Complete));
+}
+
+// A job paused while it holds its slot, its graph parked, and resumed before
+// its slot is let go, runs on with what it still has to fetch promised, as
+// one started anew is: the promise its old graph gave back as it stopped is
+// made again for the graph that takes its place.
+#[tokio::test]
+async fn a_resume_before_the_slot_is_let_go_promises_the_new_graph_again() {
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let body = payload(4 * ARTICLE, 76);
+    let scenario = on_disk_posting(&room, vec![Post::plain("ember.bin", body.clone())]);
+    let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
+    apply_intents(&mut pipeline).await;
+    assert_eq!(promised_by_root(&pipeline), [0, body.len() as u64, 0]);
+
+    // The pause is taken and its graph parks; its slot is not let go yet.
+    handle(&pipeline).pause_job(JOB).await.unwrap();
+    apply_intents(&mut pipeline).await;
+    old_graph_heard(&mut pipeline).await;
+    assert!(holds_slot(&pipeline), "the slot is still held");
+    assert_eq!(
+        promised_by_root(&pipeline),
+        [0, 0, 0],
+        "the graph gave it back"
+    );
+
+    handle(&pipeline).resume_job(JOB).await.unwrap();
+    apply_intents(&mut pipeline).await;
+    activates(&mut pipeline).await;
+    apply_intents(&mut pipeline).await;
+    assert!(
+        holds_slot(&pipeline) && graph_in_place(&pipeline),
+        "it runs again"
+    );
+    let left = remaining(&pipeline, JOB.0).expect("its row");
+    assert!(left > 0, "it has something left to fetch");
+    assert_eq!(
+        promised_by_root(&pipeline),
+        [0, left, 0],
+        "the new graph runs with what it has left promised"
+    );
+}
+
+fn holds_slot(pipeline: &Pipeline) -> bool {
+    started(pipeline).contains(&JOB.0)
+}
+
+// A resume of a job held for a full disk that finds the disk short keeps it
+// held, its row showing what it needs and what is free, and keeps it judged
+// as any start is: room that comes later lets it go, though the disk shows
+// no more than it did as the write failed.
+#[tokio::test]
+async fn a_resume_found_short_is_judged_as_a_start_when_room_comes() {
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let body = payload(4 * ARTICLE, 113);
+    let scenario = on_disk_posting(&room, vec![Post::plain("ember.bin", body)]);
+    let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
+
+    fill_after(Some(ARTICLE as u64 + ARTICLE as u64 / 2));
+    until_full(&mut pipeline, &scenario).await;
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY);
+    assert_full_disk_held(&pipeline);
+    let need = full_disk_start_need(&pipeline);
+    assert!(need <= PLENTY);
+
+    // Another job holds every byte of room as the user resumes: short.
+    working(&pipeline).promise(PLENTY);
+    fill_after(None);
+    handle(&pipeline).resume_job(JOB).await.unwrap();
+    apply_intents(&mut pipeline).await;
+    assert_full_disk_held(&pipeline);
+    assert_eq!(
+        shown(&pipeline, JOB.0),
+        (
+            Some(DISK_SPACE_WAIT_REASON.to_string()),
+            Some(need),
+            Some(0)
+        ),
+        "a resume while short shows what it needs and what is free"
+    );
+
+    // That promise is given back, which rings the disk; it reads as before,
+    // with the room the job needs.
+    working(&pipeline).release(PLENTY);
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY);
+    apply_intents(&mut pipeline).await;
+    assert!(
+        !full_disk_held(&pipeline),
+        "room for its need ({need} of {PLENTY}) lets the resumed job go"
+    );
 }

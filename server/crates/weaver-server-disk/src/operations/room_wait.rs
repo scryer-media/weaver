@@ -17,7 +17,7 @@
 // must also leave more than the reserve free to spend. A disk with no good
 // reading keeps it waiting.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
@@ -480,11 +480,33 @@ fn take<K: std::hash::Hash + Eq>(totals: &mut HashMap<K, u128>, key: &K, bytes: 
     }
 }
 
-// The promises, and their totals by disk and device.
+// The promises, and their totals by disk and device: of all of them, and
+// of those whose bytes are not also promised on a disk ledger, which a start
+// judged on the ledger counts beside it.
 #[derive(Default)]
 struct Book {
     promised: BTreeMap<(Waiter, JobId), Promised>,
     totals: PromisedTotals,
+    ledgered: BTreeSet<(Waiter, JobId)>,
+    off_ledger: PromisedTotals,
+}
+
+impl Book {
+    fn add(&mut self, key: (Waiter, JobId), promised: &Promised, ledgered: bool) {
+        self.totals.add(promised);
+        if ledgered {
+            self.ledgered.insert(key);
+        } else {
+            self.off_ledger.add(promised);
+        }
+    }
+
+    fn take_back(&mut self, key: (Waiter, JobId), promised: &Promised) {
+        self.totals.remove(promised);
+        if !self.ledgered.remove(&key) {
+            self.off_ledger.remove(promised);
+        }
+    }
 }
 
 // Whose a promise is: a usenet job's, or a torrent's.
@@ -536,14 +558,26 @@ impl RoomPromises {
     // `job_id` of `waiter`'s kind is promised `promised`, in place of any
     // promise it held.
     pub fn insert(&self, waiter: Waiter, job_id: JobId, promised: Promised) {
+        self.insert_as(waiter, job_id, promised, false);
+    }
+
+    // [`Self::insert`] for a waiter whose bytes are promised on the disk's
+    // ledger as well, as a usenet start let go on its figure is: a start
+    // judged on the ledger counts them once, there.
+    pub fn insert_ledgered(&self, waiter: Waiter, job_id: JobId, promised: Promised) {
+        self.insert_as(waiter, job_id, promised, true);
+    }
+
+    fn insert_as(&self, waiter: Waiter, job_id: JobId, promised: Promised, ledgered: bool) {
+        let key = (waiter, job_id);
         let mut book = self.locked();
-        book.totals.add(&promised);
-        match book.promised.insert((waiter, job_id), promised) {
-            Some(replaced) => book.totals.remove(&replaced),
-            None => {
-                self.count(waiter).fetch_add(1, Ordering::AcqRel);
-            }
+        if let Some(replaced) = book.promised.remove(&key) {
+            book.take_back(key, &replaced);
+        } else {
+            self.count(waiter).fetch_add(1, Ordering::AcqRel);
         }
+        book.add(key, &promised, ledgered);
+        book.promised.insert(key, promised);
     }
 
     // The promise to `job_id` of `waiter`'s kind ends: what it was.
@@ -554,7 +588,7 @@ impl RoomPromises {
         let mut book = self.locked();
         let removed = book.promised.remove(&(waiter, job_id));
         if let Some(removed) = &removed {
-            book.totals.remove(removed);
+            book.take_back((waiter, job_id), removed);
             self.count(waiter).fetch_sub(1, Ordering::AcqRel);
         }
         removed
@@ -608,17 +642,25 @@ impl RoomPromises {
             return;
         }
         let mut book = self.locked();
-        let Book { promised, totals } = &mut *book;
+        let Book {
+            promised,
+            totals,
+            ledgered,
+            off_ledger,
+        } = &mut *book;
         let mut left = 0;
-        promised.retain(|(of, job_id), promise| {
-            if *of != waiter {
+        promised.retain(|key, promise| {
+            if key.0 != waiter {
                 return true;
             }
-            if keep(*job_id) {
+            if keep(key.1) {
                 left += 1;
                 return true;
             }
             totals.remove(promise);
+            if !ledgered.remove(key) {
+                off_ledger.remove(promise);
+            }
             false
         });
         self.count(waiter).store(left, Ordering::Release);
@@ -633,14 +675,28 @@ impl RoomPromises {
         self.locked().totals.on(disk, device)
     }
 
-    // The walk the totals replace: every promise, for one disk.
+    // What of [`Self::on`] no disk ledger counts: the room a start judged on
+    // the ledger of `disk` leaves aside for those let go before it.
+    pub fn off_ledger(&self, disk: &Disk, device: Option<u64>) -> u64 {
+        if self.none_of(Waiter::Usenet) && self.none_of(Waiter::Torrent) {
+            return 0;
+        }
+        self.locked().off_ledger.on(disk, device)
+    }
+
+    // The walk the totals replace: every promise, for one disk, or only
+    // those no ledger counts.
     #[cfg(test)]
-    fn on_by_walk(&self, disk: &Disk, device: Option<u64>) -> u64 {
-        self.locked()
-            .promised
-            .values()
-            .filter(|promised| promised.on(disk, device))
-            .fold(0u64, |sum, promised| sum.saturating_add(promised.bytes))
+    fn on_by_walk(&self, disk: &Disk, device: Option<u64>, off_ledger: bool) -> u64 {
+        let book = self.locked();
+        book.promised
+            .iter()
+            .filter(|(key, promised)| {
+                promised.on(disk, device) && !(off_ledger && book.ledgered.contains(key))
+            })
+            .fold(0u64, |sum, (_, promised)| {
+                sum.saturating_add(promised.bytes)
+            })
     }
 
     // What is promised to `waiter`'s kind, in all.
@@ -743,6 +799,14 @@ impl LedgerWait {
     }
 }
 
+// The room on `root`'s disk promised to writers let go from a wait for room
+// and not counted on its ledger: a start judged there leaves it aside.
+fn held_on(capacity: &StorageCapacity, root: StorageRoot) -> u64 {
+    capacity
+        .promises()
+        .off_ledger(&Disk::Root(root), capacity.root_slot_device(root))
+}
+
 // Whether a torrent ever downloaded, from the bytes it counts as
 // downloaded: one that has is not kept from starting by
 // [`StartCheck::hold`], since what it writes next waits for room as a write
@@ -772,12 +836,7 @@ impl StartCheck {
     // good reading leaves above the reserve less every promise there.
     // Nothing else is judged or promised; see [`DiskLedger::book_start`].
     pub fn admit(self, capacity: &StorageCapacity, need: u64) -> StartBooking {
-        capacity.ledger(self.root).book_start(
-            &capacity.reader(self.root),
-            self.reserve,
-            need,
-            capacity.fresh(self.root),
-        )
+        self.admit_on(capacity, &[(self.root, self.root, need)])
     }
 
     // A usenet job would start: each `(judged, promised, need)` is judged
@@ -801,6 +860,7 @@ impl StartCheck {
                 judge: capacity.ledger(*judged),
                 reader,
                 fresh: capacity.fresh(*judged),
+                held: held_on(capacity, *judged),
                 promise: capacity.ledger(*promised),
                 need: *need,
             })
@@ -830,6 +890,7 @@ impl StartCheck {
         capacity.ledger(self.root).start_room_now(
             &capacity.reader(self.root),
             self.reserve,
+            held_on(capacity, self.root),
             capacity.fresh(self.root),
         )
     }
@@ -1016,9 +1077,10 @@ mod tests {
     }
 
     // Over seeded promises of both kinds, on roots and paths that share
-    // devices and ones whose device is not known, the totals give what the
-    // walk over every promise gave, for every disk and device after each
-    // promise made, replaced, ended, taken back or dropped by `retain`.
+    // devices and ones whose device is not known, some also on a ledger, the
+    // totals, of all and of those off the ledger, give what the walk over
+    // every promise gave, for every disk and device after each promise made,
+    // replaced, ended, taken back or dropped by `retain`.
     #[test]
     fn promised_totals_match_the_walk_over_every_promise() {
         let disks = [
@@ -1034,8 +1096,13 @@ mod tests {
                 for device in DEVICES {
                     assert_eq!(
                         promises.on(disk, device),
-                        promises.on_by_walk(disk, device),
+                        promises.on_by_walk(disk, device, false),
                         "{disk:?} {device:?}"
+                    );
+                    assert_eq!(
+                        promises.off_ledger(disk, device),
+                        promises.on_by_walk(disk, device, true),
+                        "{disk:?} {device:?} off the ledger"
                     );
                 }
             }
@@ -1061,15 +1128,17 @@ mod tests {
                             0 => u64::MAX - seeded.next(1_000),
                             _ => seeded.next(1 << 30),
                         };
-                        promises.insert(
-                            waiter,
-                            job_id,
-                            Promised {
-                                disk: disks[seeded.next(disks.len() as u64) as usize].clone(),
-                                bytes,
-                                device: DEVICES[seeded.next(3) as usize],
-                            },
-                        );
+                        let promised = Promised {
+                            disk: disks[seeded.next(disks.len() as u64) as usize].clone(),
+                            bytes,
+                            device: DEVICES[seeded.next(3) as usize],
+                        };
+                        // Some are promised on a ledger as well.
+                        if seeded.next(3) == 0 {
+                            promises.insert_ledgered(waiter, job_id, promised);
+                        } else {
+                            promises.insert(waiter, job_id, promised);
+                        }
                     }
                 }
                 changes += 1;
@@ -1087,6 +1156,10 @@ mod tests {
             assert!(book.totals.disk.is_empty());
             assert!(book.totals.device.is_empty());
             assert!(book.totals.both.is_empty());
+            assert!(book.ledgered.is_empty());
+            assert!(book.off_ledger.disk.is_empty());
+            assert!(book.off_ledger.device.is_empty());
+            assert!(book.off_ledger.both.is_empty());
         }
         assert!(changes > 5_000, "{changes}");
     }

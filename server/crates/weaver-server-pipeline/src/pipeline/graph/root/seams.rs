@@ -172,7 +172,7 @@ impl Pipeline {
         self.graph_jobs.insert(job_id, graph);
         // The bytes promised when the job took its slot land against its
         // graph from here.
-        self.hand_start_promise(job_id);
+        self.start_promise_to_graph(job_id);
         if let Some(phase) = reported {
             self.time_graph_stage(job_id, phase);
         }

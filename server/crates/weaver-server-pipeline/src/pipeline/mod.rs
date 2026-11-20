@@ -1857,9 +1857,11 @@ pub struct Pipeline {
     // readings and the promises given back ring, and one that may let a job
     // start brings the next walk.
     pub(super) admission_disk_held: bool,
-    // The least any job kept waiting needs: a reading whose room reaches it
-    // brings a walk, a smaller one does not.
-    pub(super) admission_disk_need_min: u64,
+    // The least any job kept waiting on a disk needs there, the working
+    // disk first, then the complete disk when it is another: a reading of a
+    // disk whose room reaches its figure brings a walk, a smaller one does
+    // not.
+    pub(super) admission_disk_need_min: [u64; 2],
     // A job was kept waiting for want of a fresh reading: the first one
     // brings a walk.
     pub(super) admission_disk_unread: bool,

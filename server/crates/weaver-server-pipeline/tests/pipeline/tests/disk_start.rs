@@ -15,7 +15,7 @@ use weaver_server_pipeline::pipeline::tests::{
     new_direct_pipeline,
     nzb_admission_fixture::{enqueue_saved, prepare_add},
     nzb_zstd_for,
-    queue_fixture::{apply_intents, cancel_batch, handle as queue_handle},
+    queue_fixture::{apply_intents, cancel_batch, handle as queue_handle, report_job},
     queue_scale_fixture::{actor_awaited_db_calls, actor_thread_db_calls, admission_visits, sql},
     retire_pipeline_database, segmented_job_spec,
     window_fixture::settle,
@@ -341,10 +341,10 @@ async fn seed(pipeline: &mut Pipeline, ids: std::ops::RangeInclusive<u64>, gib: 
 }
 
 // 4 (review). On a disk smaller than any of ten thousand queued rows, a walk
-// refuses each row by the disk's size, read once, and takes the ledger's
-// booking lock for none of them.
+// refuses each row by the disk's size, read once, and neither looks at the
+// slots nor takes the ledger's booking lock for any of them.
 #[tokio::test]
-async fn rows_too_large_for_the_disk_take_no_booking_lock() {
+async fn rows_too_large_for_the_disk_take_no_slot_look_and_no_booking_lock() {
     const LONG: u64 = 10_000;
     let temp = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
@@ -361,7 +361,7 @@ async fn rows_too_large_for_the_disk_take_no_booking_lock() {
         )
     );
 
-    let (walked, locked) = (walks(), booking_locks());
+    let (walked, locked, visited) = (walks(), booking_locks(), admission_visits());
     let moves: Vec<_> = (0..100)
         .map(|step| {
             (
@@ -372,11 +372,19 @@ async fn rows_too_large_for_the_disk_take_no_booking_lock() {
         .collect();
     handle.reorder_jobs(moves).await.unwrap();
     apply_intents(&mut pipeline).await;
-    let (walked, locked) = (walks() - walked, booking_locks() - locked);
+    let (walked, locked, visited) = (
+        walks() - walked,
+        booking_locks() - locked,
+        admission_visits() - visited,
+    );
     assert!(walked > 0);
     assert!(
         locked <= walked,
         "{walked} walks over {LONG} rows too large took the booking lock {locked} times"
+    );
+    assert_eq!(
+        visited, 0,
+        "{walked} walks over {LONG} rows too large looked at the slots {visited} times"
     );
 }
 
@@ -555,4 +563,148 @@ async fn held_slots_restored_with_no_outline_are_promised_what_they_have_left() 
     assert_eq!(started(&pipeline), [1, 2]);
     assert_eq!(promised_on(&pipeline, StorageRoot::Intermediate), 2 * need);
     assert_eq!(shown(&pipeline, 3), disk_space(need, Some(need - 1)));
+}
+
+// A job that held its slot across a restart, partly fetched, with the
+// complete folder on a filesystem of its own, is promised there only what
+// it still has to fetch: what it fetched before is not promised again.
+#[tokio::test]
+async fn a_restored_slot_is_promised_on_the_complete_disk_only_what_it_has_left() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _handle, _disk) = queue(&temp, 3, BIG).await;
+    enqueue_saved(&mut pipeline, 1).await;
+    assert_eq!(started(&pipeline), [1]);
+    retire_pipeline_database(pipeline).await;
+
+    let (mut pipeline, intermediate, _) = new_direct_pipeline(&temp).await;
+    let _disk = StartDisk::split(&mut pipeline, RESERVE, (BIG, BIG), BIG);
+    let handle = slots_of(&mut pipeline, 3).await;
+    let recovered = recover_server_state(
+        database(&pipeline),
+        &temp.path().join("data"),
+        &intermediate,
+    )
+    .await
+    .unwrap();
+    for candidate in recovered.to_restore {
+        handle.restore_job(candidate.request).await.unwrap();
+    }
+    settle(&mut pipeline).await;
+    assert_eq!(started(&pipeline), [1]);
+    let left = remaining(&pipeline, 1).unwrap();
+    eprintln!(
+        "DBG left {left} graph {} working {} complete {}",
+        has_graph(&pipeline, 1),
+        promised_here(&pipeline, StorageRoot::Intermediate),
+        promised_here(&pipeline, StorageRoot::Complete)
+    );
+    assert!(left > 0);
+    assert_eq!(promised_here(&pipeline, StorageRoot::Intermediate), left);
+    assert_eq!(
+        promised_here(&pipeline, StorageRoot::Complete),
+        left,
+        "the complete disk is promised what is left, not the whole job"
+    );
+}
+
+// With the complete folder on a filesystem of its own, a job partly fetched
+// (2 GiB left of 8) that the complete disk cannot take shows the figures of
+// that disk: all it delivers there, and the room there. Readings of the same
+// disks bring no walk.
+#[tokio::test]
+async fn a_start_refused_by_the_complete_disk_shows_its_figures_and_waits_quietly() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    let disk = StartDisk::split(
+        &mut pipeline,
+        RESERVE,
+        (RESERVE + 100 * GIB, RESERVE + 3 * GIB),
+        BIG,
+    );
+    slots_of(&mut pipeline, 2).await;
+    let spec = sized_spec(1, 8);
+    let nzb = nzb_zstd_for(&spec);
+    prepare_add(&pipeline, JobId(1), spec, "sized-1.nzb".into(), nzb).await;
+    says_left(&pipeline, 1, 2 * GIB);
+    apply_intents(&mut pipeline).await;
+    apply_intents(&mut pipeline).await;
+    assert!(started(&pipeline).is_empty(), "the complete disk is short");
+    assert_eq!(shown(&pipeline, 1), disk_space(8 * GIB, Some(3 * GIB)));
+
+    let walked = walks();
+    for _ in 0..5 {
+        disk.complete_reads(&mut pipeline, RESERVE + 3 * GIB);
+        apply_intents(&mut pipeline).await;
+    }
+    assert_eq!(walks(), walked, "unchanged readings bring no walk");
+    assert_eq!(shown(&pipeline, 1), disk_space(8 * GIB, Some(3 * GIB)));
+
+    disk.complete_reads(&mut pipeline, RESERVE + 8 * GIB);
+    apply_intents(&mut pipeline).await;
+    assert_eq!(
+        started(&pipeline),
+        [1],
+        "room on the complete disk lets it start"
+    );
+}
+
+// A job waiting to start for its disk keeps its figures across a report of
+// its row.
+#[tokio::test]
+async fn a_report_of_a_job_kept_for_the_disk_keeps_its_figures() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _handle, _disk) = queue(&temp, 2, RESERVE + 3 * GIB).await;
+    add_sized(&mut pipeline, 1, 4).await;
+    let before = shown(&pipeline, 1);
+    assert_eq!(before, disk_space(4 * GIB, Some(3 * GIB)));
+    report_job(&mut pipeline, JobId(1));
+    apply_intents(&mut pipeline).await;
+    assert_eq!(
+        shown(&pipeline, 1),
+        before,
+        "the figures stay with a report"
+    );
+}
+
+// Room promised to a torrent let go from a full disk is not promised again
+// to a usenet start, and the job waiting for it says how much is free.
+#[tokio::test]
+async fn a_start_is_not_promised_room_a_torrent_was_let_go_on() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _handle, disk) = queue(&temp, 2, RESERVE + 5 * GIB).await;
+    torrent_let_go_on_working(&pipeline, 4 * GIB);
+    add_sized(&mut pipeline, 1, 4).await;
+    assert!(
+        started(&pipeline).is_empty(),
+        "4 GiB of 5 are the torrent's"
+    );
+    assert_eq!(shown(&pipeline, 1), disk_space(4 * GIB, Some(GIB)));
+
+    // The torrent's step ends; the next reading lets the job start.
+    torrent_step_ends(&pipeline);
+    disk.reads(&mut pipeline, RESERVE + 5 * GIB);
+    apply_intents(&mut pipeline).await;
+    assert_eq!(started(&pipeline), [1]);
+}
+
+// With one slot and a job the disk can never hold at the head, a job behind
+// it kept for disk space says so, not that it waits for a slot.
+#[tokio::test]
+async fn a_job_too_large_for_the_disk_does_not_hide_why_the_next_waits() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    let _disk = StartDisk::under(&mut pipeline, RESERVE, RESERVE + 3 * GIB, RESERVE + 5 * GIB);
+    slots_of(&mut pipeline, 1).await;
+    add_sized(&mut pipeline, 1, 6).await;
+    add_sized(&mut pipeline, 2, 4).await;
+    assert!(started(&pipeline).is_empty());
+    assert_eq!(
+        shown(&pipeline, 1),
+        (
+            Some(DISK_TOO_SMALL_WAIT_REASON.to_string()),
+            Some(6 * GIB),
+            Some(5 * GIB)
+        )
+    );
+    assert_eq!(shown(&pipeline, 2), disk_space(4 * GIB, Some(3 * GIB)));
 }

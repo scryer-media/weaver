@@ -90,9 +90,10 @@ pub(crate) struct FullDisk {
     stage: Stage,
     // Room was made, or the user asked: the job goes on once it has parked.
     go: bool,
-    // Its user resumed it while it was held in its download: the next wake
+    // Its user resumed it while it was held in its download: each wake
     // judges its start by room alone, as any start is judged, and not by
-    // whether its disk showed more than at the failure.
+    // whether its disk showed more than at the failure, until it starts,
+    // is paused again or is held anew.
     resumed: bool,
     // What the job's graph said was left to fetch, taken before it went:
     // what the job's summaries say once it parks, with no graph to ask.
@@ -335,7 +336,7 @@ impl Pipeline {
         // also has to show more than the disk did as the write failed, as
         // every wait's does: a disk whose free figure never moves, as one
         // whose free space is not what stops the write, does not send it
-        // round. A resume by its user is judged by room alone, once. One
+        // round. A resumed job is judged by room alone until it goes on. One
         // not paused is judged; one held on a path, its root pointed
         // elsewhere, waits as a move does. One a quota refused keeps waiting
         // for its figure to rise: the free figure shows room the quota does
@@ -374,17 +375,6 @@ impl Pipeline {
                     .then_some((*job_id, root, remaining, size))
             })
             .collect();
-        // A resume counts for the wake that follows it, once the job is not
-        // paused: one still paused keeps it until then.
-        for (job_id, hold) in &mut self.full_disk {
-            if self
-                .jobs
-                .get(job_id)
-                .is_none_or(|state| state.run_state != RunState::Paused)
-            {
-                hold.resumed = false;
-            }
-        }
         for (job_id, root, remaining, size) in starts {
             if let Ok(promise) = self.book_start_promise_on(root, remaining, size) {
                 self.release_start_promise(job_id);
@@ -416,18 +406,23 @@ impl Pipeline {
             );
             if let Some((bytes, device)) = room {
                 hold.go = true;
+                let promised = Promised {
+                    disk: hold.wait.disk.clone(),
+                    bytes,
+                    device,
+                };
+                // A start let go here is promised on the ledger as well,
+                // below: a start judged on the ledger counts it there once.
                 if matches!(hold.stage, Stage::Graph) {
                     judged_starts.push(*job_id);
+                    capacity
+                        .promises()
+                        .insert_ledgered(Waiter::Usenet, *job_id, promised);
+                } else {
+                    capacity
+                        .promises()
+                        .insert(Waiter::Usenet, *job_id, promised);
                 }
-                capacity.promises().insert(
-                    Waiter::Usenet,
-                    *job_id,
-                    Promised {
-                        disk: hold.wait.disk.clone(),
-                        bytes,
-                        device,
-                    },
-                );
             }
             // A move let go starts as a first move does, which waits while
             // post-processing is paused: the job stays held until then.
@@ -845,10 +840,19 @@ impl Pipeline {
         (remaining, remaining.max(step))
     }
 
-    // Its user resumed the held job: its next start is judged by room.
+    // Its user resumed the held job: its start is judged by room from here,
+    // at every wake, until it goes on.
     pub(in crate::pipeline) fn full_disk_resumed(&mut self, job_id: JobId) {
         if let Some(hold) = self.full_disk.get_mut(&job_id) {
             hold.resumed = true;
+        }
+    }
+
+    // Its user paused the held job: a resume before ends here, and its
+    // start waits again for its disk to show more than at the failure.
+    pub(in crate::pipeline) fn full_disk_paused(&mut self, job_id: JobId) {
+        if let Some(hold) = self.full_disk.get_mut(&job_id) {
+            hold.resumed = false;
         }
     }
 
