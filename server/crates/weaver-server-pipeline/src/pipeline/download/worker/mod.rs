@@ -11,6 +11,7 @@ use weaver_server_disk::operations::disk::writer::Prepaid;
 
 mod completion;
 mod eligibility;
+mod landing;
 mod lanes;
 mod leases;
 mod metrics;
@@ -19,6 +20,9 @@ mod pressure;
 mod refill;
 mod spawn;
 pub mod volume_pace;
+
+use landing::{Armed, Landing};
+pub use landing::{ParkedResults, StepCredit, VolumeHolds};
 
 #[cfg(any(test, feature = "pipeline-test-fixtures"))]
 pub use leases::queued_files_may_pass;

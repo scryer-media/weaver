@@ -17,6 +17,8 @@ use crate::pipeline::tests::{job_status_for_assert, settle_failed_releases};
 use weaver_server_disk::operations::disk::volume::Volume;
 use weaver_server_disk::operations::disk::writer::Hold;
 
+mod landing;
+
 // The volume the job writes to and a hold on its thread.
 fn held(pipeline: &Pipeline, job_id: JobId) -> (Arc<Volume>, Hold) {
     let volume = Arc::clone(

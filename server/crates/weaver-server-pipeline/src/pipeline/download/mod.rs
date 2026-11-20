@@ -12,6 +12,7 @@ pub mod scheduler;
 pub(crate) mod transport;
 mod worker;
 pub use worker::volume_pace;
+pub use worker::{ParkedResults, StepCredit, VolumeHolds};
 
 #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
 pub(in crate::pipeline) use worker::lane_acquire_failure_for_work;

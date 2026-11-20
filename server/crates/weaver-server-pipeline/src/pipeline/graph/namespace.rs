@@ -578,6 +578,44 @@ impl NamespaceWriter {
         }
     }
 
+    // The volume the bytes of the posted file `member` land on as the loop
+    // hands them on, and, while its first bytes have not decided its owner,
+    // the other volume the article that decides it may land on in the same
+    // step. Bytes an object holds lie under the working directory, and so do
+    // those of a member not yet decided: its owner keeps them in memory, in
+    // scratch or in spill (`Tree::is_undecided`). A member with a file of its
+    // own lands where that file lies, and any other where its file opens
+    // (`Self::root_for`). A job whose directories lie on one volume lands
+    // everything there. `None` for a job that writes through no writer. A
+    // few lookups by key; nothing is walked.
+    pub(crate) fn landing(
+        &self,
+        tree: &Tree,
+        member: MemberId,
+    ) -> Option<(
+        &Arc<weaver_server_disk::operations::disk::volume::Volume>,
+        Option<&Arc<weaver_server_disk::operations::disk::volume::Volume>>,
+    )> {
+        let disk = self.disk.as_ref()?;
+        let working = disk.working().volume();
+        let output = disk.under(&self.output_dir).volume();
+        if Arc::ptr_eq(working, output) || tree.child_of(NodeId::ROOT, member).is_some() {
+            return Some((working, None));
+        }
+        if tree.is_undecided(NodeId::ROOT, member) {
+            return Some((working, Some(output)));
+        }
+        let member = tree
+            .namespace(NodeId::ROOT)
+            .map_or(member, |namespace| namespace.resolve(member));
+        let leaf = self
+            .files
+            .get(&NodeId::ROOT)
+            .and_then(|files| files.leaves.get(&member))
+            .and_then(Leaf::volume);
+        Some((leaf.unwrap_or(output), None))
+    }
+
     // The job's extraction budget, which every write, announcement, name
     // and binding here is held to.
     pub fn capped(mut self, caps: Caps) -> Self {

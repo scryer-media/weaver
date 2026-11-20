@@ -179,41 +179,27 @@ impl Pipeline {
         }
     }
 
-    // The volume the job's articles are written to, when it writes through
-    // a writer.
-    fn article_volume(
-        &self,
-        job_id: JobId,
-    ) -> Option<Arc<weaver_server_disk::operations::disk::volume::Volume>> {
-        if let Some(reserved) = self.volume_reserved_by_job.get(&job_id) {
-            return Some(Arc::clone(reserved.volume()));
-        }
-        self.graph_jobs
-            .get(&job_id)
-            .and_then(|graph| graph.disk())
-            .map(|disk| Arc::clone(disk.working().volume()))
-    }
-
-    // Reserve `work` on the volume its job writes to, as it is leased:
-    // false when it does not fit below the lease limit there
-    // (`VolumeLeases::lease_limit`). A job that writes through no writer
-    // reserves nothing.
+    // Reserve `work` on the volume its bytes land on, as it is leased
+    // (`Self::article_landing`): false when it does not fit below the lease
+    // limit there (`VolumeLeases::lease_limit`). A member not yet decided
+    // reserves on the volume its owner holds its bytes on. A job that
+    // writes through no writer reserves nothing.
     pub(in crate::pipeline) fn reserve_lane_work(&mut self, work: &DownloadWork) -> bool {
         let job_id = work.segment_id.file_id.job_id;
         let bytes = Self::reserved_bytes_of(work.byte_estimate);
-        if let Some(reserved) = self.volume_reserved_by_job.get_mut(&job_id) {
-            let share = reserved.volume().loop_share();
-            return reserved.reserve(bytes, share);
-        }
-        let Some(volume) = self.article_volume(job_id) else {
+        let Some(landing) = self.article_landing(work.segment_id.file_id) else {
             return true;
         };
-        let share = volume.loop_share();
-        let mut reserved = Reservation::none(volume);
+        let share = landing.volume.loop_share();
+        let mut reserved = Reservation::none(landing.volume);
         if !reserved.reserve(bytes, share) {
             return false;
         }
-        self.volume_reserved_by_job.insert(job_id, reserved);
+        self.volume_reserved_by_job
+            .entry(job_id)
+            .or_default()
+            .entry(reserved.volume())
+            .join(reserved);
         true
     }
 
@@ -223,13 +209,14 @@ impl Pipeline {
     #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(in crate::pipeline) fn reserve_test_lane_work(&mut self, work: &DownloadWork) {
         let job_id = work.segment_id.file_id.job_id;
-        let Some(volume) = self.article_volume(job_id) else {
+        let Some(landing) = self.article_landing(work.segment_id.file_id) else {
             return;
         };
         let bytes = Self::reserved_bytes_of(work.byte_estimate);
         self.volume_reserved_by_job
             .entry(job_id)
-            .or_insert_with(|| Reservation::none(volume))
+            .or_default()
+            .entry(&landing.volume)
             .count(bytes);
     }
 
@@ -243,27 +230,63 @@ impl Pipeline {
     // `arrived` bytes of it: those count from here as arrived, in the same
     // step (`Reservation::settle`), until the loop hands them on. Whoever
     // asked to be woken at the line the volume has now reached is woken.
-    fn settle_lane_work(&mut self, work: &DownloadWork, arrived: u64) {
+    // The article's reservation is taken first from the volume it lands on
+    // now, then from the job's other volume, where it was reserved while
+    // its member was undecided: what arrived counts on the volume each part
+    // of it was reserved on, and moves only as the loop hands it on, where
+    // it fits (`Self::arm_or_park`).
+    pub(super) fn settle_lane_work(&mut self, work: &DownloadWork, arrived: u64) {
         let job_id = work.segment_id.file_id.job_id;
+        let landing = self.article_landing(work.segment_id.file_id);
         let Some(reserved) = self.volume_reserved_by_job.get_mut(&job_id) else {
             if arrived != 0 {
-                self.note_volume_arrived(job_id, arrived);
+                self.note_volume_arrived(job_id, landing, arrived);
             }
             return;
         };
-        let bytes = Self::reserved_bytes_of(work.byte_estimate).min(reserved.bytes());
-        let mut part = reserved.split(bytes);
+        let bytes = Self::reserved_bytes_of(work.byte_estimate);
+        // At most one part on each of the job's volumes.
+        let mut parts: [Option<Reservation>; 2] = [None, None];
+        let mut stale = Vec::new();
+        let mut put = |part: Reservation| match parts.iter_mut().find(|slot| slot.is_none()) {
+            Some(slot) => *slot = Some(part),
+            None => stale.push(part),
+        };
+        reserved.take(
+            landing.as_ref().map(|landing| &landing.volume),
+            bytes,
+            &mut put,
+        );
         if reserved.bytes() == 0 {
             self.volume_reserved_by_job.remove(&job_id);
         }
-        let woke = if arrived != 0 {
-            self.hold_volume_arrived(job_id, part, arrived, true)
-        } else {
-            part.give_back(bytes);
-            self.volume_writers.take_wake(part.volume())
-        };
+        let mut arrived_left = arrived;
+        let mut woke = false;
+        let mut parts = parts.into_iter().flatten().chain(stale).peekable();
+        while let Some(mut part) = parts.next() {
+            // What arrived counts on the parts in turn, the last taking
+            // whatever is left.
+            let share = if parts.peek().is_none() {
+                arrived_left
+            } else {
+                arrived_left.min(part.bytes())
+            };
+            arrived_left -= share;
+            woke |= if share != 0 {
+                self.hold_volume_arrived(job_id, part, share, true)
+            } else {
+                let bytes = part.bytes();
+                part.give_back(bytes);
+                self.volume_writers.take_wake(part.volume())
+            };
+        }
+        if arrived_left != 0 {
+            // Nothing of the article was reserved: what arrived is counted
+            // where it lands.
+            self.note_volume_arrived(job_id, landing, arrived_left);
+        }
         if woke {
-            self.volume_room_changed();
+            self.volume_room_taken();
         }
     }
 
@@ -436,7 +459,8 @@ impl Pipeline {
             #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             if lane_id == 0 {
                 if arrived != 0 {
-                    self.note_volume_arrived(segment.file_id.job_id, arrived);
+                    let landing = self.article_landing(segment.file_id);
+                    self.note_volume_arrived(segment.file_id.job_id, landing, arrived);
                 }
                 return true;
             }

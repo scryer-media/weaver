@@ -91,41 +91,14 @@ async fn decode_as(
     body: Vec<u8>,
     intact: bool,
 ) {
-    let post = &posts[index as usize];
-    let offset = ordinal as usize * ARTICLE;
-    let crc = par2_rs::checksum::crc32(&body);
     let len = body.len() as u64;
     // The article arrives and the loop hands it on, as a lane's result is:
-    // its bytes count on the volume from arrival and are the credit its
-    // writes take.
-    let credit = pipeline.begin_hand_on_for_test(job_id, len);
+    // its bytes count from arrival on the volume they land on and are the
+    // credit its writes take.
+    let credit = pipeline.begin_hand_on_for_test(segment_id(job_id, index, ordinal), len);
     pipeline
         .handle_decode_success(
-            DecodeResult {
-                segment_id: segment_id(job_id, index, ordinal),
-                raw_size: len,
-                encoding: SegmentEncoding::Yenc,
-                yenc_layout: YencLayoutAssertions {
-                    file_size: post.bytes.len() as u64,
-                    part: Some(ordinal + 1),
-                    total: Some(post.articles(ARTICLE).count() as u32),
-                    begin: Some(offset as u64 + 1),
-                    end: Some(offset as u64 + len),
-                },
-                crc_valid: intact,
-                part_crc_verified: intact,
-                part_crc: crc,
-                truncation_suspected: false,
-                expected_file_crc: None,
-                data: DecodedChunk::from(body),
-                yenc_name: post.name.clone(),
-                checkpoint_plan: weaver_yenc::CheckpointPlan::None,
-                segments: vec![weaver_yenc::Segment {
-                    file_offset: offset as u64,
-                    len,
-                    crc32: crc,
-                }],
-            },
+            decoded_article(job_id, posts, index, ordinal, body, intact),
             SegmentSource {
                 servers: crate::pipeline::PoolServers::stamped(
                     pipeline.pool_generation,
@@ -136,6 +109,47 @@ async fn decode_as(
         )
         .await;
     pipeline.end_hand_on_for_test(job_id, credit);
+}
+
+// Article `ordinal` of file `index` as the decoder hands it over, its bytes
+// `body`: one checksummed segment over them.
+fn decoded_article(
+    job_id: JobId,
+    posts: &[Post],
+    index: u32,
+    ordinal: u32,
+    body: Vec<u8>,
+    intact: bool,
+) -> DecodeResult {
+    let post = &posts[index as usize];
+    let offset = ordinal as usize * ARTICLE;
+    let crc = par2_rs::checksum::crc32(&body);
+    let len = body.len() as u64;
+    DecodeResult {
+        segment_id: segment_id(job_id, index, ordinal),
+        raw_size: len,
+        encoding: SegmentEncoding::Yenc,
+        yenc_layout: YencLayoutAssertions {
+            file_size: post.bytes.len() as u64,
+            part: Some(ordinal + 1),
+            total: Some(post.articles(ARTICLE).count() as u32),
+            begin: Some(offset as u64 + 1),
+            end: Some(offset as u64 + len),
+        },
+        crc_valid: intact,
+        part_crc_verified: intact,
+        part_crc: crc,
+        truncation_suspected: false,
+        expected_file_crc: None,
+        data: DecodedChunk::from(body),
+        yenc_name: post.name.clone(),
+        checkpoint_plan: weaver_yenc::CheckpointPlan::None,
+        segments: vec![weaver_yenc::Segment {
+            file_offset: offset as u64,
+            len,
+            crc32: crc,
+        }],
+    }
 }
 
 async fn decode_all(pipeline: &mut Pipeline, job_id: JobId, posts: &[Post], index: u32) {
