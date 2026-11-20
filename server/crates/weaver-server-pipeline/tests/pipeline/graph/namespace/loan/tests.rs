@@ -37,6 +37,7 @@ fn bare(dir: &std::path::Path) -> Lent {
         working: None,
         reading: RefCell::default(),
         stop: Arc::default(),
+        timing: RefCell::default(),
     }
 }
 

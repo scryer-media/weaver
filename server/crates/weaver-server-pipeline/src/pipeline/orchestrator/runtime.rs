@@ -375,7 +375,7 @@ impl Pipeline {
             disk_rings_seen: 0,
             disk_idle: std::collections::BTreeSet::new(),
             admission_disk_held: false,
-            admission_disk_need_min: u64::MAX,
+            admission_disk_need_min: [u64::MAX; 2],
             admission_disk_unread: false,
             admission_disk_releases: 0,
             admission_disk_most: None,

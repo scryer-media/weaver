@@ -234,7 +234,7 @@ fn idle(next: impl std::future::Future<Output = TorrentChanges>) -> bool {
 }
 
 // Stored paused magnets, `count` of them, written as the add writes them.
-fn stored_magnets(db: &Database, count: u64) -> Vec<JobId> {
+pub(super) fn stored_magnets(db: &Database, count: u64) -> Vec<JobId> {
     (1..=count)
         .map(|job_id| {
             let record = TorrentRecord {

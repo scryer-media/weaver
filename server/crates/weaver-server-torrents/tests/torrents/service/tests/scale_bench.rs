@@ -31,7 +31,7 @@ fn bench_service(db: &Database, dir: &Path, routes: &Arc<FakeRoutes>) -> Torrent
     let settings = TorrentSettings {
         upload_cap: None,
         complete_dir: dir.join("complete"),
-        categories: vec![],
+        categories: vec![].into(),
         seeding: None,
         torrent: TorrentConfig {
             enabled: true,

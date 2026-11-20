@@ -122,7 +122,7 @@ pub enum Window {
 
 impl Window {
     // Its places among `kept` torrents.
-    fn places(self, kept: usize) -> Range<usize> {
+    pub(super) fn places(self, kept: usize) -> Range<usize> {
         let Range { start, end } = match self {
             Self::Every => 0..kept,
             Self::Page { offset, first } => offset..offset.saturating_add(first),
@@ -197,7 +197,7 @@ impl Pick<'_> {
                     ..CategoryIds::default()
                 };
                 // The first category of an id is the one a torrent of it is in.
-                for category in &settings.categories {
+                for category in settings.categories.iter() {
                     if seen.insert(category.id) {
                         categories.known.push(category.id);
                         if pick.keeps(Some(&category.name)) {

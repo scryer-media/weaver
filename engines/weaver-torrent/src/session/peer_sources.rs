@@ -24,7 +24,6 @@ use crate::{
     type_aliases::{PeerSource, PeerStream},
 };
 use futures::{FutureExt, future::BoxFuture};
-use tokio::sync::Notify;
 use tracing::{trace, warn};
 
 use super::peer_finder::{self, PeerAsk, TrackerAsk};
@@ -183,7 +182,7 @@ pub(super) async fn follow_fetch(
     mut unable: tokio::sync::watch::Receiver<HashSet<SocketAddr>>,
     discovery: bool,
     phase: tokio::sync::watch::Sender<FetchPhase>,
-    changed: Option<Arc<Notify>>,
+    changed: Option<(super::options::TrackersChanged, crate::core::Id20)>,
 ) {
     loop {
         let now = {
@@ -194,9 +193,9 @@ pub(super) async fn follow_fetch(
             }
         };
         if phase.send_if_modified(|was| std::mem::replace(was, now) != now)
-            && let Some(changed) = &changed
+            && let Some((changed, hash)) = &changed
         {
-            changed.notify_one();
+            changed.ring(*hash);
         }
         if now == FetchPhase::Discovery {
             return;
@@ -387,10 +386,11 @@ impl Session {
         // table is gone.
         if let Some(changed) = &self.trackers_changed {
             let mut table = task.status.subscribe();
-            let changed = Arc::clone(changed);
+            let changed = changed.clone();
+            let hash = info_hashes.best();
             tokio::spawn(async move {
                 while table.changed().await.is_ok() {
-                    changed.notify_one();
+                    changed.ring(hash);
                 }
             });
         }

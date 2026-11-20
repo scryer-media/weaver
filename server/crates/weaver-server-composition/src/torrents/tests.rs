@@ -1592,3 +1592,200 @@ fn setting_what_many_torrents_hold_matches_the_per_torrent_statements() {
     );
     assert_eq!(flags.iter().filter(|(_, set)| *set).count(), 2_000);
 }
+
+// A start's archive of many retiring torrents at once leaves the history,
+// its files, attributes and duplicate identities, and the torrents' rows,
+// as writing each torrent on its own did, past the bind limit of one
+// statement.
+#[test]
+fn archiving_many_retiring_torrents_at_once_ends_as_one_at_a_time_did() {
+    use crate::history::record::JobHistoryRow;
+    use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+    use crate::torrents::persistence::{HistoryFile, write_history_files_tx};
+    use weaver_server_torrent_store::torrents::persistence::delete_torrent_tx;
+
+    const COUNT: u64 = 1_600;
+    fn seeded() -> Database {
+        let db = Database::open_in_memory().unwrap();
+        for n in 1..=COUNT + 1 {
+            let mut v1 = [0u8; 20];
+            v1[..8].copy_from_slice(&n.to_be_bytes());
+            db.insert_torrent(&torrent(n, Some(v1), None), &[]).unwrap();
+        }
+        let datastore = db.datastore();
+        db.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "seed_duplicates", |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        "INSERT INTO semantic_duplicate_groups (group_id, normalized_key, created_at, updated_at) \
+                         VALUES (1, 'key', 0, 0)",
+                        &[],
+                    )
+                    .await?;
+                    for n in 1..=COUNT as i64 + 1 {
+                        tx.execute(
+                            "INSERT INTO duplicate_job_snapshots \
+                             (job_id, lifecycle, normalized_name, admission_action, origin, created_at, updated_at, reservation_expires_at) \
+                             VALUES ({}, 'active', 'name', 'admit', 'test', 0, 0, 5)",
+                            &[SqlArg::I64(n)],
+                        )
+                        .await?;
+                        tx.execute(
+                            "INSERT INTO semantic_duplicate_candidates \
+                             (job_id, group_id, score, candidate_state, promotion_claimed_at, created_at, updated_at) \
+                             VALUES ({}, 1, 1, {}, 3, 0, 0)",
+                            &[
+                                SqlArg::I64(n),
+                                SqlArg::Text(if n % 5 == 0 { "nonblocking" } else { "active" }.into()),
+                            ],
+                        )
+                        .await?;
+                        tx.execute(
+                            "INSERT INTO job_history_files (job_id, path, whole) VALUES ({}, {}, {})",
+                            &[SqlArg::I64(n), SqlArg::Text(format!("/old/{n}")), SqlArg::Bool(false)],
+                        )
+                        .await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+        })
+        .unwrap();
+        db
+    }
+
+    let statuses = ["complete", "failed", "cancelled", "partial", "queued"];
+    let rows: Vec<(JobId, JobHistoryRow, Vec<HistoryFile>)> = (1..=COUNT)
+        .map(|n| {
+            let entry = JobHistoryRow {
+                job_id: n,
+                job_hash: Some(n.to_be_bytes().to_vec()),
+                name: format!("torrent {n}"),
+                status: statuses[n as usize % statuses.len()].to_owned(),
+                error_message: (n % 3 == 0).then(|| "no space left on device".to_owned()),
+                total_bytes: n * 10,
+                downloaded_bytes: n * 7,
+                optional_recovery_bytes: 0,
+                optional_recovery_downloaded_bytes: 0,
+                failed_bytes: n % 4,
+                health: 1000 - (n % 900) as u32,
+                category: (n % 2 == 0).then(|| "tv".to_owned()),
+                output_dir: Some(format!("/done/{n}")),
+                nzb_path: None,
+                created_at: n as i64,
+                completed_at: 1_000 + n as i64,
+                metadata: Some(format!(
+                    r#"[["show","s{n}"],["show","s{n}"],["season","{}"]]"#,
+                    n % 9
+                )),
+                server_attribution: None,
+                protocol: crate::jobs::model::Protocol::Torrent,
+                archived_at: (n % 7 == 0).then_some(9),
+            };
+            let files = vec![
+                HistoryFile {
+                    path: format!("/done/{n}/b"),
+                    whole: false,
+                },
+                HistoryFile {
+                    path: format!("/done/{n}/a"),
+                    whole: false,
+                },
+                HistoryFile {
+                    path: format!("/done/{n}/a"),
+                    whole: true,
+                },
+            ];
+            (JobId(n), entry, files)
+        })
+        .collect();
+
+    // As each torrent was written before: its own statements, in turn.
+    let one_at_a_time = seeded();
+    let datastore = one_at_a_time.datastore();
+    let each = rows.clone();
+    one_at_a_time
+        .run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "old_archive_retiring", |tx| {
+                let each = each.clone();
+                Box::pin(async move {
+                    for (job_id, entry, files) in &each {
+                        crate::history::persistence::insert_job_history_tx(tx, entry).await?;
+                        write_history_files_tx(tx, job_id.0 as i64, files).await?;
+                        delete_torrent_tx(tx, job_id.0 as i64).await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+        })
+        .unwrap();
+    let at_once = seeded();
+    let archived = at_once.archive_retiring_torrents(rows);
+    assert_eq!(archived.written.len(), COUNT as usize);
+
+    let dump = |db: &Database| -> Vec<String> {
+        let datastore = db.datastore();
+        db.run_sql_blocking_read(async move {
+            let mut out = Vec::new();
+            for (sql, columns) in [
+                (
+                    "SELECT job_id, name, status, error_message, total_bytes, health, category, \
+                     completed_at, metadata, release_name, search_key, archived_at \
+                     FROM job_history ORDER BY job_id",
+                    &["job_id", "name", "status", "error_message", "total_bytes", "health", "category", "completed_at", "metadata", "release_name", "search_key", "archived_at"][..],
+                ),
+                ("SELECT job_id, key, value, completed_at FROM job_history_attributes ORDER BY job_id, key, value", &["job_id", "key", "value", "completed_at"][..]),
+                ("SELECT job_id, path, whole FROM job_history_files ORDER BY job_id, path", &["job_id", "path", "whole"][..]),
+                ("SELECT job_id, lifecycle, updated_at, reservation_expires_at FROM duplicate_job_snapshots ORDER BY job_id", &["job_id", "lifecycle", "updated_at", "reservation_expires_at"][..]),
+                ("SELECT job_id, candidate_state, terminal_cause, promotion_state, promotion_claimed_at, updated_at FROM semantic_duplicate_candidates ORDER BY job_id", &["job_id", "candidate_state", "terminal_cause", "promotion_state", "promotion_claimed_at", "updated_at"][..]),
+                ("SELECT job_id FROM torrents ORDER BY job_id", &["job_id"][..]),
+            ] {
+                for row in SqlRuntime::fetch_all(datastore.read_exec(), sql, &[]).await? {
+                    let mut line = String::new();
+                    for column in columns {
+                        let value = match row.opt_i64(column) {
+                            Ok(value) => format!("{value:?}"),
+                            Err(_) => format!("{:?}", row.opt_text(column)?),
+                        };
+                        line.push_str(&value);
+                        line.push('|');
+                    }
+                    out.push(line);
+                }
+            }
+            Ok(out)
+        })
+        .unwrap()
+    };
+    let (new, old) = (dump(&at_once), dump(&one_at_a_time));
+    assert_eq!(new.len(), old.len());
+    for (new, old) in new.iter().zip(&old) {
+        assert_eq!(new, old);
+    }
+    // Only torrent COUNT + 1 is left; attributes, files and the duplicate
+    // moves were written.
+    assert!(
+        new.iter()
+            .any(|line| line == &format!("Some({})|", COUNT + 1))
+    );
+    assert!(!new.iter().any(|line| line == "Some(1)|"));
+    assert!(
+        new.iter()
+            .any(|line| line.contains(r#"Some("show")|Some("s12")"#))
+    );
+    assert!(
+        new.iter()
+            .any(|line| line == r#"Some(12)|Some("/done/12/a")|Some(1)|"#)
+    );
+    assert!(!new.iter().any(|line| line.contains("/old/12")));
+    assert!(
+        new.iter()
+            .any(|line| line.starts_with(r#"Some(1)|Some("nonblocking")|"#))
+    );
+    assert!(
+        new.iter()
+            .any(|line| line.starts_with(r#"Some(5)|Some("succeeded")|Some(1005)|None|"#))
+    );
+}

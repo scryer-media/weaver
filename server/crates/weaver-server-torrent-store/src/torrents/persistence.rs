@@ -677,6 +677,18 @@ pub async fn delete_torrent_tx(tx: &mut SqlTx<'_>, id: i64) -> Result<bool, Stat
     Ok(changed > 0)
 }
 
+// `delete_torrent_tx` of each of `ids`, in `tx`: one statement per table
+// and bind-sized chunk. Returns how many torrents were there.
+pub async fn delete_torrents_tx(tx: &mut SqlTx<'_>, ids: &[i64]) -> Result<u64, StateError> {
+    use weaver_server_history::history::persistence::delete_by_job_tx;
+    let changed = delete_by_job_tx(tx, "torrents", ids).await?;
+    delete_by_job_tx(tx, "torrent_held_paths", ids).await?;
+    for table in weaver_server_base::jobs::graph_checkpoint::TABLES {
+        delete_by_job_tx(tx, table, ids).await?;
+    }
+    Ok(changed)
+}
+
 // What was there before, written even when nothing was: a row whose
 // `adopted` was never written (a row from before it was kept) reads as not
 // known, never as nothing there (`retiring_row`).

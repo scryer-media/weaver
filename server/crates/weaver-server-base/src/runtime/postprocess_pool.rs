@@ -2,12 +2,22 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static BUILT: AtomicU64 = AtomicU64::new(0);
+
+// How many post-processing pools this process has built, for a repair's
+// timing to say whether its pool is the one earlier work ran on.
+pub fn pools_built() -> u64 {
+    BUILT.load(Ordering::Relaxed)
+}
 
 // Build a dedicated rayon thread pool for post-processing work
 // (extraction, PAR2 verify/repair). Threads are niced on Unix
 // so the OS scheduler prefers download/decode threads when CPU
 // is contended.
 pub fn build_postprocess_pool(thread_count: usize) -> Arc<rayon::ThreadPool> {
+    BUILT.fetch_add(1, Ordering::Relaxed);
     let _affinity = super::affinity::PostprocessAffinity::enter();
     Arc::new(
         rayon::ThreadPoolBuilder::new()

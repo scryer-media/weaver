@@ -209,7 +209,8 @@ fn service_over(
             seeding: None,
             torrent_route: true,
             unpack: None,
-        }],
+        }]
+        .into(),
         seeding: None,
         torrent: TorrentConfig {
             enabled: true,
@@ -1032,7 +1033,8 @@ fn chain() -> (TorrentRecord, TrackerRule, TorrentSettings) {
             seeding: None,
             torrent_route: false,
             unpack: None,
-        }],
+        }]
+        .into(),
         // As the global terms load: nothing there inherits.
         seeding: Some(SeedingPolicy::default().at_global()),
         torrent: TorrentConfig::default(),
@@ -1132,6 +1134,22 @@ fn values(values: &[&str]) -> Vec<String> {
 // and its torrent's route is its member's session.
 async fn pins(service: &TorrentService, db: &Database, jobs: &[JobId]) -> Vec<Option<u32>> {
     let live = service.inner.live.lock().await;
+    // The shared route counts placement reads are the torrents' routes
+    // counted one by one, on every member and on no route left.
+    let mut walked: HashMap<crate::torrents::sessions::RouteKey, usize> = HashMap::new();
+    for key in live.values().filter_map(|torrent| torrent.route.key()) {
+        *walked.entry(key.clone()).or_default() += 1;
+    }
+    for member in 0..=8 {
+        let key = pool_member_key(member);
+        assert_eq!(
+            service.inner.route_loads.of(&key),
+            walked.get(&key).copied().unwrap_or(0)
+        );
+    }
+    for (key, count) in &walked {
+        assert_eq!(service.inner.route_loads.of(key), *count);
+    }
     jobs.iter()
         .map(|job_id| {
             let torrent = &live[job_id];

@@ -840,7 +840,7 @@ async fn started_with(count: u64) -> (tempfile::TempDir, Database, TorrentServic
         TorrentSettings {
             upload_cap: None,
             complete_dir: dir.path().join("complete"),
-            categories: Vec::new(),
+            categories: Default::default(),
             seeding: None,
             torrent: TorrentConfig {
                 enabled: false,

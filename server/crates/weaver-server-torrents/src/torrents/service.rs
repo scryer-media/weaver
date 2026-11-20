@@ -90,7 +90,7 @@ use queue::QueueEnd;
 #[cfg(test)]
 pub(in crate::torrents) use retire::{delete_written, deletion, listed_files};
 pub use settings::{
-    DHT, ENCRYPTION, Field, INACTIVE_GOAL, LSD, PEX, Presence, RATIO_GOAL, SCOPE,
+    Categories, DHT, ENCRYPTION, Field, INACTIVE_GOAL, LSD, PEX, Presence, RATIO_GOAL, SCOPE,
     SEED_TIME_COUNTING, SEED_TIME_GOAL, SEEDING_ACTION, SEEDING_MODE, ScheduleSeeding,
     SeedingLevels, TorrentSettings, UNPACK, UPLOAD_CAP, WindDown,
 };
@@ -490,7 +490,7 @@ pub fn hashes_of(record: &TorrentRecord) -> InfoHashes {
 // each pool member is when a torrent is placed.
 fn load_of<'a>(torrents: impl Iterator<Item = &'a Live>) -> HashMap<RouteKey, usize> {
     let mut load = HashMap::new();
-    for key in torrents.filter_map(|torrent| torrent.route.as_ref()) {
+    for key in torrents.filter_map(|torrent| torrent.route.key()) {
         *load.entry(key.clone()).or_default() += 1;
     }
     load
@@ -893,6 +893,8 @@ pub struct Inner {
     pub env: JobEnv,
     pub clock: Arc<dyn Clock>,
     pub live: tokio::sync::Mutex<BTreeMap<JobId, Live>>,
+    // How many torrents read as each route, kept by their route slots.
+    pub route_loads: live::RouteLoads,
     // Held while a torrent's job is restored, from the check that it waits
     // for one to the job given: one restore of a torrent at a time, and at
     // most RESTORES_AT_ONCE torrents restoring. The blocking restore owns
@@ -956,6 +958,10 @@ pub struct Inner {
     pub releases: [std::sync::atomic::AtomicUsize; 2],
     // The torrents and their sessions as last published, for the exporter.
     pub published: watch::Sender<Arc<Published>>,
+    // Where each torrent sits in the published torrents, written with
+    // them: a publish of some torrents puts theirs in place. Held while the
+    // published torrents are written.
+    published_at: Mutex<HashMap<JobId, usize>>,
     // Each route's session as last read. The tick reads them, and turning
     // torrents on or off, under the sessions' lock each takes anyway: a
     // publish from an action never waits on a session that is opening.
@@ -1050,6 +1056,7 @@ impl TorrentService {
                 env,
                 clock,
                 live: tokio::sync::Mutex::new(BTreeMap::new()),
+                route_loads: live::RouteLoads::default(),
                 restoring: std::sync::Mutex::new(HashMap::new()),
                 restore_permits: Arc::new(tokio::sync::Semaphore::new(RESTORES_AT_ONCE)),
                 restores: watch::channel(Restores::Idle).0,
@@ -1079,6 +1086,7 @@ impl TorrentService {
                 #[cfg(any(test, feature = "test-support"))]
                 releases: Default::default(),
                 published: watch::channel(Arc::default()).0,
+                published_at: Mutex::default(),
                 sessions_read: Mutex::default(),
                 counters: Counters::default(),
                 next_queue_position: AtomicI64::new(0),

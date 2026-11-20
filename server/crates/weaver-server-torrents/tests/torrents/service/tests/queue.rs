@@ -1461,6 +1461,29 @@ fn a_batch_of_moves_ends_where_the_splices_and_reads_ended() {
             .map(|&(job_id, target)| batch.splice(job_id, target))
             .collect();
         assert_eq!(spliced_now, spliced_then, "seed {seed}");
-        assert_eq!(batch.order, by_splices, "seed {seed}");
+        assert_eq!(batch.order(), by_splices, "seed {seed}");
     }
+}
+
+// The latter half of a long queue moved to its top one torrent at a time,
+// last first as an NZBGet client's group move sends them, ends as one move
+// of them all: the half in queue order, then the rest.
+#[test]
+fn moving_half_a_long_queue_to_the_top_one_at_a_time_ends_as_one_move() {
+    use crate::torrents::service::batch::Spliced;
+    use crate::torrents::service::queue::moved_order;
+    use std::collections::HashSet;
+    const LENGTH: u64 = 40_000;
+    let order: Vec<JobId> = (0..LENGTH).map(JobId).collect();
+    let places: Vec<i64> = (0..LENGTH as i64).collect();
+    let named: Vec<JobId> = order[LENGTH as usize / 2..].to_vec();
+    let mut batch = Spliced::new(order.clone(), &places);
+    for &job_id in named.iter().rev() {
+        assert!(batch.splice(job_id, QueueMoveTarget::Top));
+    }
+    let set: HashSet<JobId> = named.iter().copied().collect();
+    assert_eq!(
+        batch.order(),
+        moved_order(order, &set, QueueMoveTarget::Top)
+    );
 }

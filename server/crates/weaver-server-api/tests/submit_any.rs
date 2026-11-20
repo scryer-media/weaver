@@ -109,7 +109,7 @@ async fn rig_seated(seated: bool) -> Rig {
         sessions,
         TorrentSettings {
             complete_dir: dir.path().join("complete"),
-            categories: Vec::new(),
+            categories: Default::default(),
             seeding: None,
             upload_cap: None,
             torrent: TorrentConfig {
@@ -372,7 +372,7 @@ async fn staging_refuses_a_torrent_while_torrents_are_off() {
     rig.torrents
         .set_settings(TorrentSettings {
             complete_dir: rig._dir.path().join("complete"),
-            categories: Vec::new(),
+            categories: Default::default(),
             seeding: None,
             upload_cap: None,
             torrent: TorrentConfig {

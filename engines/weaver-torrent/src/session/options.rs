@@ -659,9 +659,46 @@ pub struct SessionOptions {
     /// they make it.
     pub port_map_events: Option<PortMapEvents>,
 
-    /// Rung as any announce table of the session changes, and as a magnet's
-    /// metadata fetch moves to another phase.
-    pub trackers_changed: Option<Arc<Notify>>,
+    /// Told, by the torrent's hash, as any announce table of the session
+    /// changes, and as a magnet's metadata fetch moves to another phase.
+    pub trackers_changed: Option<TrackersChanged>,
+}
+
+/// Which torrents' announce tables changed, and which magnets' metadata
+/// fetches moved to another phase, each by the hash Weaver knows it by
+/// ([`InfoHashes::best`]): gathered as they change, until taken, so a
+/// watcher reads only the torrents that changed.
+#[derive(Clone, Debug, Default)]
+pub struct TrackersChanged {
+    changed: Arc<std::sync::Mutex<HashSet<Id20>>>,
+    rung: Arc<Notify>,
+}
+
+impl TrackersChanged {
+    /// The torrent of `hash` changed.
+    pub fn ring(&self, hash: Id20) {
+        self.changed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(hash);
+        self.rung.notify_one();
+    }
+
+    /// The torrents that changed since the last take, once there is one.
+    pub async fn changed(&self) -> HashSet<Id20> {
+        loop {
+            let taken = std::mem::take(
+                &mut *self
+                    .changed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            if !taken.is_empty() {
+                return taken;
+            }
+            self.rung.notified().await;
+        }
+    }
 }
 
 impl SessionOptions {

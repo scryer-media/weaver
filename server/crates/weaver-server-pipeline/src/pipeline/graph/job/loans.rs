@@ -338,7 +338,12 @@ impl Lender for Lending<'_> {
             weaver_server_base::e2e_failpoint::maybe_trip(
                 weaver_server_base::e2e_failpoint::REPAIR_TASK_START,
             );
-            let returned = grant.install_repair(|| loan.run(grant.repair.clone(), &shutdown));
+            let returned = grant.install_repair(|| {
+                // What the repair says, its timing line among it, names the
+                // job.
+                let _job = tracing::debug_span!("graph_repair", job_id = scope).entered();
+                loan.run(grant.repair.clone(), &shutdown)
+            });
             tracing::info!(
                 job_id = scope,
                 node = set.0,

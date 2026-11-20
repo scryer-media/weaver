@@ -413,7 +413,7 @@ fn ns_to_us(ns: u128) -> u64 {
 
 // Cumulative process (or thread) CPU time split by mode.
 #[derive(Clone, Copy)]
-pub(crate) struct CpuUsage {
+pub struct CpuUsage {
     user: Duration,
     system: Duration,
 }
@@ -423,7 +423,16 @@ impl CpuUsage {
         self.user.saturating_add(self.system)
     }
 
-    fn saturating_sub(self, earlier: Self) -> Self {
+    pub fn user(self) -> Duration {
+        self.user
+    }
+
+    // Time in the kernel: system calls, and page faults served.
+    pub fn system(self) -> Duration {
+        self.system
+    }
+
+    pub fn saturating_sub(self, earlier: Self) -> Self {
         Self {
             user: self.user.saturating_sub(earlier.user),
             system: self.system.saturating_sub(earlier.system),
@@ -447,16 +456,63 @@ fn cpu_util_pct(cpu: Duration, wall: Duration) -> u64 {
 // `runtime::process_metrics`, which samples it at scrape time.
 #[cfg(unix)]
 pub(crate) fn process_cpu_usage() -> Option<CpuUsage> {
+    process_counters().map(|counters| counters.cpu)
+}
+
+// The process's CPU time so far, user and kernel apart, and the page faults
+// it has taken, soft and hard together: one call where the system gives
+// both. A repair reads it at its plan and at its end, on its own thread.
+#[derive(Clone, Copy)]
+pub struct ProcessCounters {
+    pub cpu: CpuUsage,
+    pub faults: Option<u64>,
+}
+
+#[cfg(unix)]
+pub fn process_counters() -> Option<ProcessCounters> {
     let mut usage = MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: `getrusage` fills the struct it is given and nothing else.
     let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
     if rc != 0 {
         return None;
     }
+    // SAFETY: a zero return means the struct was filled.
     let usage = unsafe { usage.assume_init() };
-    Some(CpuUsage {
-        user: timeval_to_duration(usage.ru_utime),
-        system: timeval_to_duration(usage.ru_stime),
+    let soft = u64::try_from(usage.ru_minflt).unwrap_or(0);
+    let hard = u64::try_from(usage.ru_majflt).unwrap_or(0);
+    Some(ProcessCounters {
+        cpu: CpuUsage {
+            user: timeval_to_duration(usage.ru_utime),
+            system: timeval_to_duration(usage.ru_stime),
+        },
+        faults: Some(soft.saturating_add(hard)),
     })
+}
+
+#[cfg(windows)]
+pub fn process_counters() -> Option<ProcessCounters> {
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let cpu = process_cpu_usage()?;
+    // SAFETY: the struct is plain data, for which all zeroes is valid.
+    let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    counters.cb = size;
+    // SAFETY: the pseudo-handle needs no closing and the buffer is exactly
+    // the size the call is told it is.
+    let ok = unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, size) };
+    Some(ProcessCounters {
+        cpu,
+        faults: (ok != 0).then_some(u64::from(counters.PageFaultCount)),
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn process_counters() -> Option<ProcessCounters> {
+    None
 }
 
 #[cfg(unix)]

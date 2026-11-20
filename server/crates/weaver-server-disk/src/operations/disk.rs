@@ -1042,6 +1042,7 @@ impl DiskLedger {
                 judge: self,
                 reader,
                 fresh,
+                held: 0,
                 promise: self,
                 need,
             }],
@@ -1050,10 +1051,11 @@ impl DiskLedger {
     }
 
     // [`Self::book_start`] for every part, or none: each is judged on its
-    // `judge` ledger's reading and promised on its `promise` ledger, the one
-    // its bytes land against and are given back to. Parts on one filesystem
-    // are judged once, together, by the first of them, for the sum of their
-    // needs. The answer is the first that refuses.
+    // `judge` ledger's reading, less the room `held` beside the ledger on
+    // that disk, and promised on its `promise` ledger, the one its bytes
+    // land against and are given back to. Parts on one filesystem are
+    // judged once, together, by the first of them, for the sum of their
+    // needs. The answer is the first that refuses, naming that part.
     pub fn book_start_on(parts: &[StartPart<'_>], reserve: u64) -> StartBooking {
         let mut locks: Vec<&Counts> = parts
             .iter()
@@ -1073,9 +1075,30 @@ impl DiskLedger {
                 .iter()
                 .filter(|other| part.judge.same_disk(other.judge))
                 .fold(0u64, |sum, other| sum.saturating_add(other.need));
-            let answer = start_room(part.judge, part.reader, reserve, need, part.fresh);
-            if answer != StartBooking::Booked {
-                return answer;
+            match start_room(
+                part.judge,
+                part.reader,
+                reserve,
+                part.held,
+                need,
+                part.fresh,
+            ) {
+                StartBooking::Booked => {}
+                StartBooking::Short { room, .. } => {
+                    return StartBooking::Short {
+                        room,
+                        need,
+                        part: at,
+                    };
+                }
+                StartBooking::TooLarge { most, .. } => {
+                    return StartBooking::TooLarge {
+                        most,
+                        need,
+                        part: at,
+                    };
+                }
+                StartBooking::Unread => return StartBooking::Unread,
             }
         }
         for part in parts {
@@ -1091,22 +1114,22 @@ impl DiskLedger {
 
     // The room above `reserve` a start would be judged by now: what a
     // fresh, good reading of `reader` leaves less every promise on the
-    // filesystem. `None` without one. It reads and books nothing.
+    // filesystem and the room `held` beside the ledger there. `None`
+    // without one. It reads and books nothing.
     pub fn start_room_now(
         &self,
         reader: &CapacityReader,
         reserve: u64,
+        held: u64,
         fresh: bool,
     ) -> Option<u64> {
-        match start_room(self, reader, reserve, u64::MAX, fresh) {
-            StartBooking::Short { room } => Some(room),
-            StartBooking::TooLarge { .. } => {
-                let capacity = reader.current();
-                self.free_with(|| capacity)
-                    .map(|free| free.bytes.saturating_sub(reserve))
-            }
-            StartBooking::Booked | StartBooking::Unread => None,
+        if !fresh {
+            return None;
         }
+        let capacity = reader.current();
+        capacity.reading().filter(|reading| !reading.stale)?;
+        self.free_with(|| capacity)
+            .map(|free| free.bytes.saturating_sub(reserve.saturating_add(held)))
     }
 
     // `bytes` more are promised.
@@ -1293,31 +1316,39 @@ fn checked_room(ledger: &DiskLedger, reader: &CapacityReader, reserve: u64) -> u
 // What a start check found: the job's bytes were promised; or they do not
 // fit now in the `room` left above the reserve; or they can never fit, the
 // disk holding at `most` that much above its reserve; or no fresh, good
-// reading says.
+// reading says. A refusal names the `part` whose disk refused, by its
+// index among the parts booked, and the `need` judged on that disk, the
+// sum of every part on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartBooking {
     Booked,
-    Short { room: u64 },
-    TooLarge { most: u64 },
+    Short { room: u64, need: u64, part: usize },
+    TooLarge { most: u64, need: u64, part: usize },
     Unread,
 }
 
 // One disk a start is booked on: judged by `judge`'s fresh reading through
-// `reader`, `need` promised on `promise`, which counts with `judge`.
+// `reader`, less the room `held` on that disk outside any ledger (promised
+// to writers let go from a wait and not yet booked), `need` promised on
+// `promise`, which counts with `judge`.
 #[derive(Clone, Copy)]
 pub struct StartPart<'a> {
     pub judge: &'a DiskLedger,
     pub reader: &'a CapacityReader,
     pub fresh: bool,
+    pub held: u64,
     pub promise: &'a DiskLedger,
     pub need: u64,
 }
 
-// Whether `need` fits on `ledger` by a fresh, good reading of `reader`.
+// Whether `need` fits on `ledger` by a fresh, good reading of `reader`:
+// never past the disk's size above `reserve`, and now only in the room the
+// ledger leaves above `reserve` and `held`.
 fn start_room(
     ledger: &DiskLedger,
     reader: &CapacityReader,
     reserve: u64,
+    held: u64,
     need: u64,
     fresh: bool,
 ) -> StartBooking {
@@ -1330,14 +1361,22 @@ fn start_room(
     };
     let most = reading.total_bytes.saturating_sub(reserve);
     if need > most {
-        return StartBooking::TooLarge { most };
+        return StartBooking::TooLarge {
+            most,
+            need,
+            part: 0,
+        };
     }
     let Some(free) = ledger.free_with(|| capacity) else {
         return StartBooking::Unread;
     };
-    let room = free.bytes.saturating_sub(reserve);
+    let room = free.bytes.saturating_sub(reserve.saturating_add(held));
     if need > room {
-        return StartBooking::Short { room };
+        return StartBooking::Short {
+            room,
+            need,
+            part: 0,
+        };
     }
     StartBooking::Booked
 }

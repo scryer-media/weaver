@@ -1525,6 +1525,147 @@ pub async fn transition_duplicate_snapshot_for_history_tx(
     Ok(())
 }
 
+/// One job's move to history, as `transition_duplicate_snapshot_for_history_tx`
+/// takes it, for a batch of them.
+#[derive(Clone, Copy, Debug)]
+pub struct HistoryTransition<'a> {
+    pub job_id: JobId,
+    pub history_status: &'a str,
+    pub raw_error: Option<&'a str>,
+    pub typed_terminal_cause: Option<SemanticTerminalCause>,
+    pub health: u32,
+    pub failed_bytes: u64,
+    pub now: i64,
+}
+
+/// `transition_duplicate_snapshot_for_history_tx` of each of `moves`, in
+/// few statements: the jobs that move alike are updated together, in
+/// bind-sized chunks, each its own `updated_at`. A job appears once.
+pub async fn transition_duplicate_snapshots_for_history_tx(
+    tx: &mut SqlTx<'_>,
+    moves: &[HistoryTransition<'_>],
+) -> Result<(), StateError> {
+    // (job id, now) of each job by lifecycle, and of the failed or
+    // cancelled ones by their cause and promotion.
+    let mut snapshots: BTreeMap<&'static str, Vec<(i64, i64)>> = BTreeMap::new();
+    let mut succeeded = Vec::new();
+    let mut ended: BTreeMap<(String, String), Vec<(i64, i64)>> = BTreeMap::new();
+    for one in moves {
+        let lifecycle = match one.history_status {
+            "complete" | "succeeded" => DuplicateJobLifecycle::Succeeded,
+            // A partial delivery reads as failed outside the engine.
+            "failed" | "partial" => DuplicateJobLifecycle::Failed,
+            "cancelled" => DuplicateJobLifecycle::Cancelled,
+            _ => continue,
+        };
+        let row = (one.job_id.0 as i64, one.now);
+        snapshots.entry(lifecycle.as_str()).or_default().push(row);
+        if matches!(lifecycle, DuplicateJobLifecycle::Succeeded) {
+            succeeded.push(row);
+        } else {
+            let cause = one.typed_terminal_cause.unwrap_or_else(|| {
+                classify_semantic_terminal_cause(
+                    one.history_status,
+                    one.raw_error,
+                    one.health,
+                    one.failed_bytes,
+                )
+            });
+            let promotion_state = if cause.is_promotable() {
+                SemanticPromotionState::Pending
+            } else {
+                SemanticPromotionState::None
+            };
+            ended
+                .entry((
+                    cause.as_str().to_string(),
+                    promotion_state.as_str().to_string(),
+                ))
+                .or_default()
+                .push(row);
+        }
+    }
+    let active = SemanticCandidateState::Active.as_str().to_string();
+    for (lifecycle, rows) in &snapshots {
+        update_by_job_tx(
+            tx,
+            "UPDATE duplicate_job_snapshots
+             SET lifecycle = {}, reservation_expires_at = NULL, updated_at = ",
+            "",
+            &[SqlArg::Text((*lifecycle).to_string())],
+            &[],
+            rows,
+        )
+        .await?;
+    }
+    update_by_job_tx(
+        tx,
+        "UPDATE semantic_duplicate_candidates
+         SET terminal_cause = {}, promotion_state = {}, promotion_claimed_at = NULL,
+             promotion_lease_expires_at = NULL, updated_at = ",
+        " AND candidate_state = {}",
+        &[
+            SqlArg::Text(SemanticTerminalCause::Success.as_str().to_string()),
+            SqlArg::Text(SemanticPromotionState::None.as_str().to_string()),
+        ],
+        &[SqlArg::Text(active.clone())],
+        &succeeded,
+    )
+    .await?;
+    for ((cause, promotion_state), rows) in &ended {
+        update_by_job_tx(
+            tx,
+            "UPDATE semantic_duplicate_candidates
+             SET candidate_state = {}, terminal_cause = {}, promotion_state = {},
+                 promotion_claimed_at = NULL, promotion_lease_expires_at = NULL, updated_at = ",
+            " AND candidate_state = {}",
+            &[
+                SqlArg::Text(SemanticCandidateState::Nonblocking.as_str().to_string()),
+                SqlArg::Text(cause.clone()),
+                SqlArg::Text(promotion_state.clone()),
+            ],
+            &[SqlArg::Text(active.clone())],
+            rows,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+// `set` (ending in `updated_at = `) with each of `rows`' own `updated_at`,
+// for the jobs of `rows`, then `filter`: one statement per bind-sized chunk.
+async fn update_by_job_tx(
+    tx: &mut SqlTx<'_>,
+    set: &str,
+    filter: &str,
+    set_args: &[SqlArg],
+    filter_args: &[SqlArg],
+    rows: &[(i64, i64)],
+) -> Result<(), StateError> {
+    let fixed = set_args.len() + filter_args.len();
+    let per = max_rows_for_tx(tx, 3)
+        .saturating_sub(fixed.div_ceil(3))
+        .max(1);
+    for chunk in rows.chunks(per) {
+        let cases = "WHEN {} THEN {} ".repeat(chunk.len());
+        let ids = vec!["{}"; chunk.len()].join(", ");
+        let mut args = Vec::with_capacity(fixed + chunk.len() * 3);
+        args.extend_from_slice(set_args);
+        for &(job_id, now) in chunk {
+            args.push(SqlArg::I64(job_id));
+            args.push(SqlArg::I64(now));
+        }
+        args.extend(chunk.iter().map(|&(job_id, _)| SqlArg::I64(job_id)));
+        args.extend_from_slice(filter_args);
+        tx.execute(
+            &format!("{set}CASE job_id {cases}END WHERE job_id IN ({ids}){filter}"),
+            &args,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 async fn admit_duplicate_submission_tx(
     tx: &mut SqlTx<'_>,
     request: &DuplicateAdmissionRequest,

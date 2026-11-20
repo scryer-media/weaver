@@ -574,7 +574,9 @@ impl TorrentService {
                 self.tag_added(job_id, &request.tags);
                 let identity = identity_of(torrent.rule(&rules), &torrent.identity);
                 let terms = PeerTerms::of(&self.settings(), torrent.rule(&rules));
-                torrent.route = Some(plan.key.clone());
+                torrent
+                    .route
+                    .set(Some(plan.key.clone()), &self.inner.route_loads);
                 self.raise_script_event(&torrent, QueueEvent::TorrentAdded, &[]);
                 self.enqueue(torrent).await;
                 self.spawn_resolve(job_id, plan, uri, None, identity, terms)
@@ -1234,7 +1236,9 @@ impl TorrentService {
         // to tiers, not to a bare list.
         let mut tiers = Vec::new();
         if let Some(torrent) = self.inner.live.lock().await.get_mut(&job_id) {
-            torrent.route = Some(plan.key.clone());
+            torrent
+                .route
+                .set(Some(plan.key.clone()), &self.inner.route_loads);
             torrent.held = None;
             tiers = tracker_tiers(&torrent.trackers);
         }
