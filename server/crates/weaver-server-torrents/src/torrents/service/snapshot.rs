@@ -368,6 +368,18 @@ impl Snapshot {
         self.settle(rows, moved);
     }
 
+    // The rows of some torrents, read as a publish of every torrent reads
+    // them; the others stand. `stamp` is the one taken before they were read.
+    pub fn put_some(&self, views: &[(TorrentView, FileTotals)], stamp: u64) {
+        let mut rows = self.write();
+        let next = rows.revision + 1;
+        let mut moved = false;
+        for (view, totals) in views {
+            moved |= rows.put(view, *totals, next, stamp);
+        }
+        self.settle(rows, moved);
+    }
+
     // One torrent's view, read whole, or none when it is gone; `stamp` is
     // the one taken before it was read.
     pub fn put_one(&self, job_id: JobId, view: Option<&TorrentView>, stamp: u64) {

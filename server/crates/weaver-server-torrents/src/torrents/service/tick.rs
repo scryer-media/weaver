@@ -130,14 +130,14 @@ impl TorrentService {
     }
 
     // A tracker's answer, and a fetch moving on, are published as the
-    // sessions ring them: the exporter reads them when the views do, not
-    // at the next tick.
+    // sessions tell them, for the torrents they name alone: the exporter
+    // reads them when the views do, not at the next tick.
     pub(super) fn spawn_follow_trackers(&self) {
         let service = self.clone();
         self.keep(tokio::spawn(async move {
             loop {
-                service.inner.sessions.trackers_changed().await;
-                service.publish().await;
+                let hashes = service.inner.sessions.trackers_changed().await;
+                service.publish_hashes(&hashes).await;
             }
         }));
     }

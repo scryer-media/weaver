@@ -953,6 +953,10 @@ pub struct Inner {
     pub releases: [std::sync::atomic::AtomicUsize; 2],
     // The torrents and their sessions as last published, for the exporter.
     pub published: watch::Sender<Arc<Published>>,
+    // Where each torrent sits in the published torrents, written with
+    // them: a publish of some torrents puts theirs in place. Held while the
+    // published torrents are written.
+    published_at: Mutex<HashMap<JobId, usize>>,
     // Each route's session as last read. The tick reads them, and turning
     // torrents on or off, under the sessions' lock each takes anyway: a
     // publish from an action never waits on a session that is opening.
@@ -1077,6 +1081,7 @@ impl TorrentService {
                 #[cfg(any(test, feature = "test-support"))]
                 releases: Default::default(),
                 published: watch::channel(Arc::default()).0,
+                published_at: Mutex::default(),
                 sessions_read: Mutex::default(),
                 counters: Counters::default(),
                 next_queue_position: AtomicI64::new(0),
