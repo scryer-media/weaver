@@ -209,6 +209,11 @@ pub trait MemberAccess {
     ) -> bool {
         false
     }
+
+    // A repair has its plan: how long each of its own steps before it took,
+    // by name. Told once per repair, for the namespace to report with what
+    // its reads cost.
+    fn planned(&mut self, _steps: &[(&'static str, std::time::Duration)]) {}
 }
 
 pub trait Recovery {
