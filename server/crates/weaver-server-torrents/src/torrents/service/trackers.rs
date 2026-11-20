@@ -141,7 +141,11 @@ impl TorrentService {
 
     /// The torrent's trackers, each with how announcing to it went.
     pub async fn trackers(&self, job_id: JobId) -> Result<Vec<TorrentTracker>, ActionError> {
-        self.torrent(job_id)
+        let shown = super::listing::Shown {
+            trackers: true,
+            ..super::listing::Shown::BARE
+        };
+        self.torrent_shown(job_id, shown)
             .await
             .map(|view| view.trackers)
             .ok_or(ActionError::NotFound(job_id))
@@ -383,6 +387,50 @@ impl TorrentService {
             handle.force_reannounce(Duration::ZERO, Some(&url), true);
         }
         Ok(())
+    }
+
+    /// [`Self::reannounce_tracker`] for each of `urls` in turn, with one
+    /// read of the torrent's trackers and one publish of its table: those
+    /// before the first refused announce, as one at a time they did.
+    pub async fn reannounce_trackers(
+        &self,
+        job_id: JobId,
+        urls: &[String],
+    ) -> Result<(), ActionError> {
+        let handle = self.handle_of(job_id).await?;
+        let mut parsed = Vec::with_capacity(urls.len());
+        let mut refused = Ok(());
+        {
+            let live = self.inner.live.lock().await;
+            let listed: HashSet<&str> = live
+                .get(&job_id)
+                .map(|torrent| torrent.trackers.iter().map(|t| t.url.as_str()).collect())
+                .unwrap_or_default();
+            for url in urls {
+                let url = url.trim();
+                if !listed.contains(url) {
+                    refused = Err(ActionError::Invalid(format!(
+                        "no tracker {}",
+                        redacted_tracker_url(url)
+                    )));
+                    break;
+                }
+                match weaver_torrent::Url::parse(url) {
+                    Ok(url) => parsed.push(url),
+                    Err(error) => {
+                        refused = Err(ActionError::Invalid(format!(
+                            "tracker {}: {error}",
+                            redacted_tracker_url(url)
+                        )));
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(handle) = handle {
+            handle.force_reannounce_each(Duration::ZERO, &parsed, true);
+        }
+        refused
     }
 
     /// Look the torrent up on the DHT now (libtorrent

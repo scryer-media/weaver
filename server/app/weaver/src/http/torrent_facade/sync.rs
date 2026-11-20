@@ -18,8 +18,8 @@
 //! values last built, so a poll answers from those alone and never walks
 //! every torrent.
 
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
@@ -564,10 +564,17 @@ fn rest_changes(
         kept_categories.insert(name, keys);
     }
     let (tags_added, tags_removed) = match from {
-        Some(from) => (
-            strings(now.tags.iter().filter(|tag| !from.tags.contains(tag))),
-            strings(from.tags.iter().filter(|tag| !now.tags.contains(tag))),
-        ),
+        Some(from) => {
+            // Each list's membership as a set, built once, so the change of
+            // either costs the tags, not their product; the lists' order is
+            // kept.
+            let had: HashSet<&String> = from.tags.iter().collect();
+            let has: HashSet<&String> = now.tags.iter().collect();
+            (
+                strings(now.tags.iter().filter(|tag| !had.contains(tag))),
+                strings(from.tags.iter().filter(|tag| !has.contains(tag))),
+            )
+        }
         None => (strings(now.tags.iter()), Value::Array(Vec::new())),
     };
     let (server_state, kept_server_state) =

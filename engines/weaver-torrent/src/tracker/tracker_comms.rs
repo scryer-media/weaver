@@ -754,6 +754,37 @@ impl TrackerList {
         found
     }
 
+    /// [`Self::force`] of each of `trackers` alone, in their order, in one
+    /// pass over the list: what calling it for each in turn does.
+    fn force_each(
+        &mut self,
+        at: Instant,
+        trackers: &[SupportedTracker],
+        ignore_min_interval: bool,
+    ) {
+        let named: HashSet<&SupportedTracker> = trackers.iter().collect();
+        let mut found: HashSet<SupportedTracker> = HashSet::new();
+        for entry in self
+            .entries
+            .iter_mut()
+            .filter(|e| named.contains(&e.tracker))
+        {
+            entry.next_announce = if ignore_min_interval {
+                entry.min_announce = at;
+                at
+            } else {
+                at.max(entry.min_announce)
+            } + Duration::from_secs(1);
+            found.insert(entry.tracker.clone());
+        }
+        let mut forced: HashSet<SupportedTracker> = self.forced.iter().cloned().collect();
+        for tracker in trackers {
+            if found.contains(tracker) && forced.insert(tracker.clone()) {
+                self.forced.push(tracker.clone());
+            }
+        }
+    }
+
     /// The walk of libtorrent `torrent::announce_with_tracker` with
     /// `announce_to_all_tiers` and not `announce_to_all_trackers`, as
     /// qBittorrent sets them: over the `considered` trackers in list order,
@@ -1471,6 +1502,37 @@ impl TrackerStatus {
                 (comms, gone)
             })
             .collect()
+    }
+
+    /// [`Self::reannounce`] to each of `trackers` alone, in their order, with
+    /// one pass over each table and one publish: what calling it for each
+    /// in turn does. Those that are not the torrent's are passed over.
+    pub fn reannounce_each(&self, after: Duration, trackers: &[Url], ignore_min_interval: bool) {
+        let protocols = &self.0.protocols;
+        let known: HashSet<String> = self
+            .0
+            .announces
+            .borrow()
+            .iter()
+            .map(|a| a.url.clone())
+            .collect();
+        let trackers: Vec<SupportedTracker> = trackers
+            .iter()
+            .filter_map(|url| SupportedTracker::new(Tracker::torrent(url.clone()), protocols))
+            .filter(|t| known.contains(t.url().as_str()))
+            .collect();
+        if trackers.is_empty() {
+            return;
+        }
+        for comms in self.runs() {
+            let at = Instant::now() + after;
+            comms
+                .list
+                .lock()
+                .force_each(at, &trackers, ignore_min_interval);
+            comms.publish(Instant::now(), SystemTime::now());
+            comms.poke.notify_one();
+        }
     }
 
     /// Brings the next announce forward to `after` from now, to every
