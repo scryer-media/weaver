@@ -61,6 +61,8 @@ pub fn job_info_from_history(row: crate::JobHistoryRow) -> JobInfo {
         },
         download_wait_reason: None,
         download_retry_at_epoch_ms: None,
+        disk_need_bytes: None,
+        disk_free_bytes: None,
         created_at_epoch_ms: row.created_at as f64 * 1000.0,
     }
 }

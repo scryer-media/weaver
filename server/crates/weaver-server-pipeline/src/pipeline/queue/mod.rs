@@ -409,6 +409,17 @@ impl JobRow {
         )
     }
 
+    // Whether the row's restore waits for its stored NZB outline to be read:
+    // until then the row says nothing of the job's files, its bytes still to
+    // fetch among them.
+    pub(crate) fn outline_pending(&self) -> bool {
+        self.intents
+            .restore
+            .as_ref()
+            .and_then(|request| request.restart.as_ref())
+            .is_some_and(|read| read.outline_pending)
+    }
+
     pub fn info(&self, globals: &Globals) -> JobInfo {
         let mut job = self.report.job.clone();
         let activity = self.download_activity();

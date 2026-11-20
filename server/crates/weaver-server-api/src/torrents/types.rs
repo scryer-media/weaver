@@ -795,6 +795,15 @@ impl From<TorrentChanges> for TorrentChangesGql {
 
 impl From<TorrentView> for Torrent {
     fn from(view: TorrentView) -> Self {
+        let one_file = view.is_one_file();
+        Self::of(view, one_file)
+    }
+}
+
+impl Torrent {
+    /// `view`, its save path read as one file named as the torrent is when
+    /// `one_file`: for a view read without its files.
+    pub(crate) fn of(view: TorrentView, one_file: bool) -> Self {
         let files = view
             .files
             .iter()
@@ -807,7 +816,7 @@ impl From<TorrentView> for Torrent {
                 progress: view.file_progress(file),
             })
             .collect();
-        let (save_path, _) = view.paths();
+        let (save_path, _) = view.paths_as(one_file);
         Self {
             id: view.job_id.0,
             name: view.name,

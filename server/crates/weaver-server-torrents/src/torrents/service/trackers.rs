@@ -11,6 +11,7 @@ use crate::torrents::{NamedBy, PeerInfo, TorrentTracker, TrackerEntry};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::time::Duration;
+use weaver_torrent::tracker::redacted_tracker_url;
 
 // Refuse an edit naming a tracker that is no URL.
 fn tracker_urls(trackers: &[TrackerEntry]) -> Result<(), ActionError> {
@@ -19,9 +20,9 @@ fn tracker_urls(trackers: &[TrackerEntry]) -> Result<(), ActionError> {
         .map(|tracker| tracker.url.trim())
         .filter(|url| !url.is_empty())
         .try_for_each(|url| {
-            weaver_torrent::Url::parse(url)
-                .map(drop)
-                .map_err(|error| ActionError::Invalid(format!("tracker {url}: {error}")))
+            weaver_torrent::Url::parse(url).map(drop).map_err(|error| {
+                ActionError::Invalid(format!("tracker {}: {error}", redacted_tracker_url(url)))
+            })
         })
 }
 
@@ -140,7 +141,11 @@ impl TorrentService {
 
     /// The torrent's trackers, each with how announcing to it went.
     pub async fn trackers(&self, job_id: JobId) -> Result<Vec<TorrentTracker>, ActionError> {
-        self.torrent(job_id)
+        let shown = super::listing::Shown {
+            trackers: true,
+            ..super::listing::Shown::BARE
+        };
+        self.torrent_shown(job_id, shown)
             .await
             .map(|view| view.trackers)
             .ok_or(ActionError::NotFound(job_id))
@@ -210,11 +215,15 @@ impl TorrentService {
             let mut live = self.inner.live.lock().await;
             let torrent = live.get_mut(&job_id).ok_or(ActionError::NotFound(job_id))?;
             let trackers = edited(torrent, edit)?;
-            let stored = self
-                .inner
-                .db
-                .set_torrent_trackers(job_id, &trackers)
-                .map_err(|error| ActionError::State(state_error(error)))?;
+            // The write runs off the runtime; the list stays held, so no
+            // other change of this torrent lands between it and its own.
+            let db = self.inner.db.clone();
+            let written = trackers.clone();
+            let stored =
+                tokio::task::spawn_blocking(move || db.set_torrent_trackers(job_id, &written))
+                    .await
+                    .map_err(|error| ActionError::State(error.to_string()))?
+                    .map_err(|error| ActionError::State(state_error(error)))?;
             if !stored {
                 return Err(ActionError::NotFound(job_id));
             }
@@ -296,16 +305,23 @@ impl TorrentService {
             if edits.is_empty() {
                 return outcome;
             }
-            let stored = match self.inner.db.set_torrents_trackers(&edits) {
-                Ok(stored) => stored,
-                Err(error) => {
-                    let error = state_error(error);
-                    for (job_id, _) in edits {
-                        outcome.insert(job_id, Err(ActionError::State(error.clone())));
+            // Off the runtime, as one torrent's edit writes.
+            let db = self.inner.db.clone();
+            let written = edits.clone();
+            let stored =
+                match tokio::task::spawn_blocking(move || db.set_torrents_trackers(&written))
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result.map_err(state_error))
+                {
+                    Ok(stored) => stored,
+                    Err(error) => {
+                        for (job_id, _) in edits {
+                            outcome.insert(job_id, Err(ActionError::State(error.clone())));
+                        }
+                        return outcome;
                     }
-                    return outcome;
-                }
-            };
+                };
             for (job_id, trackers) in edits {
                 match live.get_mut(&job_id) {
                     Some(torrent) if stored.contains(&job_id) => {
@@ -359,14 +375,62 @@ impl TorrentService {
             .get(&job_id)
             .is_some_and(|torrent| torrent.trackers.iter().any(|tracker| tracker.url == url));
         if !listed {
-            return Err(ActionError::Invalid(format!("no tracker {url}")));
+            return Err(ActionError::Invalid(format!(
+                "no tracker {}",
+                redacted_tracker_url(url)
+            )));
         }
-        let url = weaver_torrent::Url::parse(url)
-            .map_err(|error| ActionError::Invalid(format!("tracker {url}: {error}")))?;
+        let url = weaver_torrent::Url::parse(url).map_err(|error| {
+            ActionError::Invalid(format!("tracker {}: {error}", redacted_tracker_url(url)))
+        })?;
         if let Some(handle) = handle {
             handle.force_reannounce(Duration::ZERO, Some(&url), true);
         }
         Ok(())
+    }
+
+    /// [`Self::reannounce_tracker`] for each of `urls` in turn, with one
+    /// read of the torrent's trackers and one publish of its table: those
+    /// before the first refused announce, as one at a time they did.
+    pub async fn reannounce_trackers(
+        &self,
+        job_id: JobId,
+        urls: &[String],
+    ) -> Result<(), ActionError> {
+        let handle = self.handle_of(job_id).await?;
+        let mut parsed = Vec::with_capacity(urls.len());
+        let mut refused = Ok(());
+        {
+            let live = self.inner.live.lock().await;
+            let listed: HashSet<&str> = live
+                .get(&job_id)
+                .map(|torrent| torrent.trackers.iter().map(|t| t.url.as_str()).collect())
+                .unwrap_or_default();
+            for url in urls {
+                let url = url.trim();
+                if !listed.contains(url) {
+                    refused = Err(ActionError::Invalid(format!(
+                        "no tracker {}",
+                        redacted_tracker_url(url)
+                    )));
+                    break;
+                }
+                match weaver_torrent::Url::parse(url) {
+                    Ok(url) => parsed.push(url),
+                    Err(error) => {
+                        refused = Err(ActionError::Invalid(format!(
+                            "tracker {}: {error}",
+                            redacted_tracker_url(url)
+                        )));
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(handle) = handle {
+            handle.force_reannounce_each(Duration::ZERO, &parsed, true);
+        }
+        refused
     }
 
     /// Look the torrent up on the DHT now (libtorrent

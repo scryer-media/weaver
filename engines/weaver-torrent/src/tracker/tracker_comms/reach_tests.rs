@@ -780,6 +780,73 @@ async fn a_tracker_answering_at_its_local_address_may_move_an_announce_to_a_priv
     token.cancel();
 }
 
+// The network resolves the operator's tracker at its exit, so where it
+// answered is not known here: its redirect to a local name is held as one
+// from a tracker that came with the torrent, and refused before any
+// client is built for it.
+#[cfg(not(feature = "e2e-local-trackers"))]
+#[tokio::test]
+async fn an_operators_tracker_resolved_at_the_exit_may_not_move_an_announce_to_a_local_name() {
+    struct AtExit;
+    impl Resolver for AtExit {
+        fn resolve<'a>(
+            &'a self,
+            _: &'a str,
+            _: u16,
+        ) -> crate::core::net::BoxFuture<'a, std::io::Result<crate::core::net::Resolved>> {
+            Box::pin(async { Ok(crate::core::net::Resolved::AtExit) })
+        }
+    }
+    let (tracker, at) = http_listener().await;
+    let port = at.port().unwrap();
+    let url = Url::parse(&format!("http://exit.invalid:{port}/announce")).unwrap();
+    let clients = Wired::new(&at);
+    let token = CancellationToken::new();
+    let stopped = StoppedAnnounces::default();
+    let udp_client = UdpTrackerClient::new_with_socket(
+        token.clone(),
+        crate::test_support::loopback_udp_now(),
+        Some(Arc::new(AtExit)),
+    );
+    let TrackerTask { mut peers, status } = TrackerComms::start_with_tiers(TrackerSetup {
+        info_hashes: v1_hash(),
+        identity: identity(),
+        tiers: vec![vec![Tracker {
+            url: url.clone(),
+            named_by: NamedBy::Operator,
+        }]],
+        stats: Box::new(()),
+        force_interval: None,
+        listen_port: tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
+        vote: no_vote(),
+        protocols: protocols(
+            clients.clone(),
+            reach_all(),
+            udp_client,
+            Default::default(),
+            false,
+        ),
+        stopped: stopped.clone(),
+        counts: Default::default(),
+    });
+    let serve = async {
+        let (conn, q) = read_announce(&tracker).await;
+        redirect(conn, &format!("http://nas.lan:{port}/announce?{q}")).await;
+        std::future::pending::<()>().await
+    };
+    let e = tokio::select! {
+        _ = serve => unreachable!(),
+        e = refusal_of(&status, &mut peers, &url) => e,
+    };
+    assert!(e.contains("local one"), "{e}");
+    // The first hop's client was built, with no address known; none for
+    // the local name.
+    assert!(clients.built.lock().is_empty());
+    drop(peers);
+    stopped.wait_idle().await;
+    token.cancel();
+}
+
 struct CountingResolver {
     calls: AtomicUsize,
 }

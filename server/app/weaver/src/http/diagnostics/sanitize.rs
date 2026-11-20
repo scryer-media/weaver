@@ -23,7 +23,10 @@
 //   queue in memory and the loaded configuration, and the package is built
 //   under a guard: a log line naming such a job, or holding a dotted name
 //   the table does not hold, is left out, as is a string value holding such
-//   a name; the file says how many. If the table cannot be built at all,
+//   a name. A log line naming a job id the table holds no row for is left
+//   out whether or not the read was whole: a job cancelled before the
+//   package, older than the recent history, or one that joined or left the
+//   queue during the read. The file says how many. If the table cannot be built at all,
 //   the package is built again from the host's names alone, under the
 //   strictest guard. A component the pass cannot sanitize is left out alone,
 //   with its reason.
@@ -57,7 +60,9 @@
 //   replaced host become their shape.
 //
 // What it cannot catch: a plain one-word name, or a name the table does not
-// hold, inside running text outside any field or path; a category or
+// hold, inside running text outside any field or path, on a line that names
+// no job id (on a whole read such a line ships, a dotted name included,
+// since a panic message, a source path or a host name reads the same); a category or
 // metadata value inside running text; a name written in another Unicode
 // normal form or a non-ASCII case; a path written from an unknown root
 // other than a drive; a message-ID whose domain has no dot.
@@ -277,14 +282,16 @@ pub(super) struct StoredNames {
 // whose names it did not read whole (`None` when it cannot tell which, so
 // every job is one). With a guard, a line or value of running text that names
 // one of those jobs, or holds a dotted name the table does not know, is left
-// out in place, since the table cannot replace what it never read.
+// out in place, since the table cannot replace what it never read. Guard or
+// no guard, a line that names a job the table holds no names for is left out
+// the same way.
 #[derive(Debug, Clone, Default)]
 pub(super) struct Guard {
     pub(super) jobs: Option<BTreeSet<u64>>,
 }
 
-// What a line or value of running text becomes when the guard keeps it.
-pub(super) const GUARDED_LINE: &str = "<left out: the stand-in table was partial>";
+// What a line or value of running text becomes when it is left out.
+pub(super) const GUARDED_LINE: &str = "<left out: it named what the stand-in table does not hold>";
 
 // How many stand-ins the package allocated: those for names the table read,
 // and those the field rule gave names it did not hold.
@@ -303,8 +310,8 @@ impl StandInCount {
 // Sanitizes every component in place, its member name included, and returns
 // how many stand-ins the table holds, and `texts` (the manifest's own
 // sentences) the same way. Each component is sanitized on its own:
-// one that cannot be is left out with its reason, and the rest ship. With a
-// guard, every component that had text left out says how much. Fails only
+// one that cannot be is left out with its reason, and the rest ship. Every
+// component that had text left out says how much. Fails only
 // when the table cannot be built. `schema_keys` are the field names the
 // GraphQL schema declares. Blocking: run it off the async runtime.
 pub(super) fn sanitize_package(
@@ -339,7 +346,7 @@ pub(super) fn sanitize_package(
         if guarded > 0 && component.outcome.is_ok() {
             component.partial = Some(format!(
                 "{guarded} lines or values left out: each named a job the stand-in table did \
-                 not read whole, or held a dotted name the table did not hold"
+                 not hold or did not read whole, or held a dotted name the table did not hold"
             ));
         }
     }
@@ -507,11 +514,9 @@ fn is_stand_in_stem(stem: &[u8]) -> bool {
     })
 }
 
-// Whether `text` names a job of `jobs` (every job when `None`) by its
-// stand-in (`job-17`, `job-12+40`) or its id (`job_id=17`, `"job_id":17`,
-// `job 17`).
-fn names_unread_job(text: &[u8], jobs: Option<&BTreeSet<u64>>) -> bool {
-    let unread = |id: u64| jobs.is_none_or(|jobs| jobs.contains(&id));
+// Whether `text` names a job `unread` holds true for, by its stand-in
+// (`job-17`, `job-12+40`) or its id (`job_id=17`, `"job_id":17`, `job 17`).
+fn names_unread_job(text: &[u8], unread: impl Fn(u64) -> bool) -> bool {
     let mut at = 0;
     while let Some(offset) = find_bytes(&text[at..], b"job") {
         let start = at + offset;
@@ -544,7 +549,7 @@ fn names_unread_job(text: &[u8], jobs: Option<&BTreeSet<u64>>) -> bool {
             let id = std::str::from_utf8(&text[cursor..cursor + digits])
                 .ok()
                 .and_then(|digits| digits.parse::<u64>().ok());
-            if id.is_some_and(unread) {
+            if id.is_some_and(&unread) {
                 return true;
             }
             cursor += digits;
@@ -1147,6 +1152,8 @@ pub(super) struct StandIns {
     log_names: Vec<(String, &'static str)>,
     // The field names the GraphQL schema declares, kept as JSON keys.
     schema_keys: HashSet<String>,
+    // Every job the table holds names for.
+    known_jobs: BTreeSet<u64>,
     // What the table did not read, when it did not read everything, and how
     // many lines or values of the component in the pass it left out.
     guard: Option<Guard>,
@@ -1241,6 +1248,7 @@ impl StandIns {
         }
         let no_record = JobNameRecord::default();
         let no_nzb = NzbNames::default();
+        let known_jobs = ids.clone();
         for id in ids {
             let record = stored.jobs.get(&id).unwrap_or(&no_record);
             let nzb = stored.posted.get(&id).unwrap_or(&no_nzb);
@@ -1487,6 +1495,7 @@ impl StandIns {
             registry: RefCell::new(registry),
             log_names,
             schema_keys: HashSet::new(),
+            known_jobs,
             guard: None,
             guarded: Cell::new(0),
         };
@@ -1869,17 +1878,23 @@ impl StandIns {
         out
     }
 
-    // Whether the guard keeps a sanitized line of running text out: with a
-    // guard only, when it names a job the table did not read whole, whose
-    // other names on the line the table cannot know, or holds a dotted name
-    // the table does not hold. Counts each one kept out.
+    // Whether a sanitized line of running text is kept out. Guard or no
+    // guard, when it names a job the table holds no names for, since the
+    // table cannot know its other names on the line: one cancelled or
+    // deleted before the package, older than the recent history, or one
+    // that joined or left the queue while the package was collected. With a
+    // guard only, when it names a job the guard says was not read whole, or
+    // holds a dotted name the table does not hold. Counts each one kept out.
     fn keeps_out(&self, text: &[u8]) -> bool {
-        let Some(guard) = &self.guard else {
-            return false;
+        let unread = |id: u64| {
+            !self.known_jobs.contains(&id)
+                || self
+                    .guard
+                    .as_ref()
+                    .is_some_and(|guard| guard.jobs.as_ref().is_none_or(|jobs| jobs.contains(&id)))
         };
-        self.count_out(
-            names_unread_job(text, guard.jobs.as_ref()) || holds_unknown_dotted_name(text),
-        )
+        let guarded_dotted = self.guard.is_some() && holds_unknown_dotted_name(text);
+        self.count_out(names_unread_job(text, unread) || guarded_dotted)
     }
 
     // A value under its field: kept out when it holds a dotted name the

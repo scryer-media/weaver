@@ -281,9 +281,10 @@ impl Response {
                     .ok()
                     .and_then(|s| s.to_str().ok())
                     .or_else(|| std::str::from_utf8(buf).ok())
-                    .unwrap_or("<invalid UTF-8>")
-                    .to_owned();
-                return Ok(Response::Error(msg));
+                    .unwrap_or("<invalid UTF-8>");
+                return Ok(Response::Error(
+                    crate::tracker::tracker_comms::redacted_tracker_text(msg),
+                ));
             }
             _ => bail!("unsupported action {action}"),
         };
@@ -697,6 +698,23 @@ mod tests {
         let b = include_bytes!("../../resources/test/udp-tracker-announce-response.bin");
         let (tid, response) = Response::parse(b, false).unwrap();
         dbg!(tid, response);
+    }
+
+    // A UDP tracker's error that echoes its announce URL keeps only the
+    // URL's scheme, host and port: the passkey in it reaches no log or view.
+    #[test]
+    fn a_udp_error_naming_its_url_keeps_no_passkey() {
+        let mut b = Vec::new();
+        b.extend_from_slice(&super::ACTION_ERROR.to_be_bytes());
+        b.extend_from_slice(&7u32.to_be_bytes());
+        b.extend_from_slice(b"unknown passkey for udp://t.example:6969/abcdef123/announce\0");
+        let (_, response) = Response::parse(&b, false).unwrap();
+        match response {
+            Response::Error(said) => {
+                assert_eq!(said, "unknown passkey for udp://t.example:6969/\u{2026}")
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

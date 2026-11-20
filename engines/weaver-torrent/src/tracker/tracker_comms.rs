@@ -352,6 +352,33 @@ pub fn redacted_tracker_url(url: &str) -> String {
     }
 }
 
+/// `text` a tracker sent (a failure reason, a warning, a UDP error) with
+/// every URL in it shown as [`redacted_tracker_url`] shows one: a tracker
+/// that echoes its announce URL echoes the passkey in it. A URL runs from
+/// its scheme to the next space, quote or angle bracket.
+pub fn redacted_tracker_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("://") {
+        let start = rest[..at]
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+            .map_or(0, |before| before + 1);
+        let end = rest[at..]
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>'))
+            .map_or(rest.len(), |after| at + after);
+        out.push_str(&rest[..start]);
+        if start == at {
+            // No scheme before it: not a URL, kept as it came.
+            out.push_str(&rest[at..end]);
+        } else {
+            out.push_str(&redacted_tracker_url(&rest[start..end]));
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// `e` without the URL an HTTP client error names, which carries the
 /// tracker's passkey. Every tracker request's error passes through it
 /// before it is logged or kept as the tracker's message.
@@ -727,6 +754,37 @@ impl TrackerList {
         found
     }
 
+    /// [`Self::force`] of each of `trackers` alone, in their order, in one
+    /// pass over the list: what calling it for each in turn does.
+    fn force_each(
+        &mut self,
+        at: Instant,
+        trackers: &[SupportedTracker],
+        ignore_min_interval: bool,
+    ) {
+        let named: HashSet<&SupportedTracker> = trackers.iter().collect();
+        let mut found: HashSet<SupportedTracker> = HashSet::new();
+        for entry in self
+            .entries
+            .iter_mut()
+            .filter(|e| named.contains(&e.tracker))
+        {
+            entry.next_announce = if ignore_min_interval {
+                entry.min_announce = at;
+                at
+            } else {
+                at.max(entry.min_announce)
+            } + Duration::from_secs(1);
+            found.insert(entry.tracker.clone());
+        }
+        let mut forced: HashSet<SupportedTracker> = self.forced.iter().cloned().collect();
+        for tracker in trackers {
+            if found.contains(tracker) && forced.insert(tracker.clone()) {
+                self.forced.push(tracker.clone());
+            }
+        }
+    }
+
     /// The walk of libtorrent `torrent::announce_with_tracker` with
     /// `announce_to_all_tiers` and not `announce_to_all_trackers`, as
     /// qBittorrent sets them: over the `considered` trackers in list order,
@@ -1039,7 +1097,7 @@ fn read_answer(bytes: &[u8]) -> anyhow::Result<tracker_comms_http::TrackerRespon
         return Err(Refused::error(
             format!(
                 "tracker returned failure. Failure reason: {}",
-                error.failure_reason
+                redacted_tracker_text(&error.failure_reason.to_string())
             ),
             error.interval,
             true,
@@ -1444,6 +1502,37 @@ impl TrackerStatus {
                 (comms, gone)
             })
             .collect()
+    }
+
+    /// [`Self::reannounce`] to each of `trackers` alone, in their order, with
+    /// one pass over each table and one publish: what calling it for each
+    /// in turn does. Those that are not the torrent's are passed over.
+    pub fn reannounce_each(&self, after: Duration, trackers: &[Url], ignore_min_interval: bool) {
+        let protocols = &self.0.protocols;
+        let known: HashSet<String> = self
+            .0
+            .announces
+            .borrow()
+            .iter()
+            .map(|a| a.url.clone())
+            .collect();
+        let trackers: Vec<SupportedTracker> = trackers
+            .iter()
+            .filter_map(|url| SupportedTracker::new(Tracker::torrent(url.clone()), protocols))
+            .filter(|t| known.contains(t.url().as_str()))
+            .collect();
+        if trackers.is_empty() {
+            return;
+        }
+        for comms in self.runs() {
+            let at = Instant::now() + after;
+            comms
+                .list
+                .lock()
+                .force_each(at, &trackers, ignore_min_interval);
+            comms.publish(Instant::now(), SystemTime::now());
+            comms.poke.notify_one();
+        }
     }
 
     /// Brings the next announce forward to `after` from now, to every
@@ -2703,7 +2792,7 @@ fn read_http_announce(
         warning: response
             .warning_message
             .as_ref()
-            .map(|m| String::from_utf8_lossy(m.as_ref()).into_owned()),
+            .map(|m| redacted_tracker_text(&String::from_utf8_lossy(m.as_ref()))),
         seen_as: response.external_ip().zip(answer.from),
         body_len: Some(answer.body.len()),
         accepted: Accepted::default(),

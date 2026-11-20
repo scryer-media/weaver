@@ -20,6 +20,9 @@ pub const FINISHED_JOBS_RUNTIME_CAP: usize = 1_000;
 pub const PROPAGATION_WAIT_REASON: &str = "propagation_delay";
 // The job waits for room on a disk, in whatever phase it is in.
 pub const DISK_SPACE_WAIT_REASON: &str = "disk_space";
+// The job has more to fetch than its disk holds above the reserve even
+// empty: it never starts there, and never fails for it.
+pub const DISK_TOO_SMALL_WAIT_REASON: &str = "disk_too_small";
 // The job waits on a fill server refusing the login until the refusal is
 // the verdict. The stored reason is this code, a colon, and the servers as
 // `host:port`, joined by ", ".
@@ -668,6 +671,14 @@ pub struct JobInfo {
     pub download_wait_reason: Option<String>,
     #[serde(default)]
     pub download_retry_at_epoch_ms: Option<f64>,
+    // While the job waits to start for its disk: the bytes it still has to
+    // fetch, and the room the disk leaves for them, `None` without a fresh
+    // reading; for `disk_too_small`, the most the disk ever holds above its
+    // reserve. Kept in memory only, never stored.
+    #[serde(skip)]
+    pub disk_need_bytes: Option<u64>,
+    #[serde(skip)]
+    pub disk_free_bytes: Option<u64>,
     // Wall-clock creation time (Unix epoch milliseconds).
     pub created_at_epoch_ms: f64,
 }
@@ -711,6 +722,8 @@ impl std::fmt::Debug for JobInfo {
             error,
             download_wait_reason,
             download_retry_at_epoch_ms,
+            disk_need_bytes,
+            disk_free_bytes,
             created_at_epoch_ms,
         } = self;
         f.debug_struct("JobInfo")
@@ -764,6 +777,8 @@ impl std::fmt::Debug for JobInfo {
             .field("error", error)
             .field("download_wait_reason", download_wait_reason)
             .field("download_retry_at_epoch_ms", download_retry_at_epoch_ms)
+            .field("disk_need_bytes", disk_need_bytes)
+            .field("disk_free_bytes", disk_free_bytes)
             .field("created_at_epoch_ms", created_at_epoch_ms)
             .finish()
     }

@@ -96,6 +96,8 @@ fn job(id: u64) -> JobInfo {
             ("nzbget.dupe_key".to_string(), format!("tvdb-{id}")),
         ],
         output_dir: Some(format!("/data/complete/tv/Silver.Horizon.S05E{id:05}")),
+        disk_need_bytes: None,
+        disk_free_bytes: None,
         created_at_epoch_ms: 1_900_000_000_000.0,
         server_attribution: Vec::new(),
     }

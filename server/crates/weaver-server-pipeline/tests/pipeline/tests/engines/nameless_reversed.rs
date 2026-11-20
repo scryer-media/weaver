@@ -342,6 +342,84 @@ async fn a_run_reads_on_once_the_tail_it_waits_on_is_read() {
     }
 }
 
+// The compressed two-volume set, whose second volume is longer than the
+// 16 KiB PAR2 names a file by.
+fn lz_two() -> Set {
+    let dir = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../weaver-server-core/tests/fixtures/extraction_profiles"
+    );
+    let four = sets().remove(1);
+    Set {
+        label: "lz_two",
+        volumes: (1..=2)
+            .map(|part| {
+                let bytes = std::fs::read(format!("{dir}/rar4_lz_two.part0{part}.rar")).unwrap();
+                (format!("silver.horizon.part{part}.rar"), bytes)
+            })
+            .collect(),
+        ..four
+    }
+}
+
+// The compressed two-volume set posted under names that number nothing,
+// beside a PAR2 set that names its volumes, the server holding the last
+// article of the second post, where that volume's end record lies, and
+// serving it as `scenario` says once the hold ends. PAR2 names the volume
+// by its first 16 KiB, which come before the tail, and the name states its
+// place, so the run reads into it while its tail is still held. The job
+// completes with the member as written. No real post is named: it stands
+// for an obfuscated two-volume RAR4 release with a PAR2 set beside it.
+async fn reads_on_into_the_named_volume(
+    set: &Set,
+    scenario: impl FnOnce(Scenario, (u32, u32)) -> Scenario,
+) {
+    assert!(set.volumes[1].1.len() > 16 * 1024);
+    let posted = posted(&set.volumes, &[0, 1], true, false);
+    let held = tail_article(&posted, 1);
+    let scenario = scenario(posted, held);
+    let mut read = Vec::new();
+    let outcome = run_holding_inspecting_reads(
+        &scenario,
+        |article| article == held,
+        |positions| read = positions,
+    )
+    .await;
+    assert!(
+        read.iter()
+            .any(|(_, reached)| reached.get(&1).is_some_and(|reached| *reached > 0)),
+        "no run read into the named volume while its tail was held: {read:?}"
+    );
+    let whole = outcome
+        .files
+        .get(&delivered(set.member))
+        .is_some_and(|bytes| hex::encode(sha2::Sha256::digest(bytes)) == set.sha256);
+    assert!(
+        outcome.status == Some(JobStatus::Complete) && whole,
+        "{:?} {:?}",
+        outcome.status,
+        outcome.files.keys()
+    );
+}
+
+// Release by a recovery rename: the tail the run waited on is held, and the
+// run reads on once PAR2 names the volume.
+#[tokio::test]
+async fn a_run_reads_on_once_a_recovery_names_the_volume_it_waits_on() {
+    reads_on_into_the_named_volume(&lz_two(), |scenario, _| scenario).await;
+}
+
+// The same, with the held tail served damaged once the hold ends: a damaged
+// tail states nothing, and the named volume no longer waits on it, so the
+// run is fed while the tail is held and PAR2 repairs the damaged article.
+#[tokio::test]
+async fn a_run_a_recovery_named_is_fed_though_its_tail_comes_damaged() {
+    reads_on_into_the_named_volume(&lz_two(), |scenario, (file, ordinal)| {
+        scenario.damaged(file, ordinal)
+    })
+    .await;
+}
+
 // Each set posted in its own order completes in one run per node: a wait
 // for a tail that confirms the place costs no run started again.
 #[tokio::test]

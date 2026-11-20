@@ -22,7 +22,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 
-use super::disk::{CapacityReader, DiskLedger, StorageCapacity, StorageRoot};
+pub use super::disk::StartBooking;
+use super::disk::{CapacityReader, DiskLedger, StartPart, StorageCapacity, StorageRoot};
 use crate::jobs::ids::JobId;
 
 // The disk a wait is on: a root's, or the disk of a path that lies on none
@@ -317,6 +318,45 @@ impl RoomWait {
             }
         }
         None
+    }
+
+    // Whether the newest reading of the wait's root, a good one whose probe
+    // began after the write failed, shows more than the disk did then: the
+    // floor `judge` lets a waiter go on, less what is promised. A step that
+    // gave its output back as it failed names what it needs, which the
+    // start's room judges, and has no mark to beat. It changes nothing; a
+    // wait with no mark yet shows none.
+    pub fn shows_rise(&self, capacity: &StorageCapacity) -> bool {
+        let Disk::Root(root) = &self.disk else {
+            return false;
+        };
+        let look = capacity.look(*root);
+        if look.moved != self.moved || look.probe <= self.since || !look.good {
+            return false;
+        }
+        let Some(shown) = look.shown else {
+            return false;
+        };
+        match (self.needs, self.mark, self.rise) {
+            (Some(_), _, _) if !self.quota => true,
+            (Some(bytes), Some(mark), _) | (None, Some(mark), Some(bytes)) => {
+                shown >= mark.saturating_add(self.freed).saturating_add(bytes)
+            }
+            _ => false,
+        }
+    }
+
+    // Whether the wait's root has a good reading whose probe began after
+    // the write failed: the only kind a start after a full disk is judged
+    // on. `None` when the wait is on a path, not a root.
+    pub fn root_read_since(&self, capacity: &StorageCapacity) -> Option<(StorageRoot, bool)> {
+        match &self.disk {
+            Disk::Root(root) if capacity.look(*root).moved == self.moved => {
+                let look = capacity.look(*root);
+                Some((*root, look.probe > self.since && look.good))
+            }
+            _ => None,
+        }
     }
 
     // The wait ends: the waiter went on, or is gone.
@@ -703,9 +743,11 @@ impl LedgerWait {
     }
 }
 
-// Whether a job ever downloaded, from the bytes it counts as downloaded:
-// one that has is not kept from starting by [`StartCheck`], since what it
-// writes next waits for room as a write that finds none does.
+// Whether a torrent ever downloaded, from the bytes it counts as
+// downloaded: one that has is not kept from starting by
+// [`StartCheck::hold`], since what it writes next waits for room as a write
+// that finds none does. A usenet job starts by [`StartCheck::admit`]
+// instead, which judges what it still has to fetch, whatever it fetched.
 pub fn ever_downloaded(downloaded_bytes: u64) -> bool {
     downloaded_bytes > 0
 }
@@ -725,6 +767,73 @@ pub struct StartCheck {
 }
 
 impl StartCheck {
+    // A usenet job would start with `need` bytes still to fetch: they are
+    // promised on the root's ledger when they fit within what a fresh,
+    // good reading leaves above the reserve less every promise there.
+    // Nothing else is judged or promised; see [`DiskLedger::book_start`].
+    pub fn admit(self, capacity: &StorageCapacity, need: u64) -> StartBooking {
+        capacity.ledger(self.root).book_start(
+            &capacity.reader(self.root),
+            self.reserve,
+            need,
+            capacity.fresh(self.root),
+        )
+    }
+
+    // A usenet job would start: each `(judged, promised, need)` is judged
+    // by a fresh, good reading of the `judged` root and promised on the
+    // `promised` root, the one its bytes land against and are given back
+    // to; all, or none. Roots on one filesystem are judged once, for the sum
+    // of their needs. See [`DiskLedger::book_start_on`].
+    pub fn admit_on(
+        self,
+        capacity: &StorageCapacity,
+        parts: &[(StorageRoot, StorageRoot, u64)],
+    ) -> StartBooking {
+        let readers: Vec<CapacityReader> = parts
+            .iter()
+            .map(|(judged, ..)| capacity.reader(*judged))
+            .collect();
+        let parts: Vec<StartPart<'_>> = parts
+            .iter()
+            .zip(&readers)
+            .map(|((judged, promised, need), reader)| StartPart {
+                judge: capacity.ledger(*judged),
+                reader,
+                fresh: capacity.fresh(*judged),
+                promise: capacity.ledger(*promised),
+                need: *need,
+            })
+            .collect();
+        DiskLedger::book_start_on(&parts, self.reserve)
+    }
+
+    // The most a start on this root could ever be promised: what a fresh,
+    // good reading says the disk holds above the reserve. `None` without
+    // one. It takes no lock and books nothing, so a walk reads it once and
+    // turns away every job larger than it without asking the ledger.
+    pub fn most(self, capacity: &StorageCapacity) -> Option<u64> {
+        if !capacity.fresh(self.root) {
+            return None;
+        }
+        capacity
+            .reader(self.root)
+            .current()
+            .reading()
+            .filter(|reading| !reading.stale)
+            .map(|reading| reading.total_bytes.saturating_sub(self.reserve))
+    }
+
+    // The room a start on this root would be judged by now, `None` without
+    // a fresh, good reading. It books nothing.
+    pub fn room_now(self, capacity: &StorageCapacity) -> Option<u64> {
+        capacity.ledger(self.root).start_room_now(
+            &capacity.reader(self.root),
+            self.reserve,
+            capacity.fresh(self.root),
+        )
+    }
+
     // Whether the root's cached reading is a good one with no room over the
     // reserve. It reads the cache and begins nothing.
     pub fn short(self, capacity: &StorageCapacity) -> bool {

@@ -35,6 +35,7 @@ const RAR3_FOOTER: u64 = 7;
 use crate::volume::{ByteRange, VolumeIndex};
 
 mod bound_kinds;
+mod held;
 mod layers;
 mod lent;
 mod lift;
@@ -600,10 +601,11 @@ pub struct Tree {
     // Lost ranges of a node's volumes its object could not place yet, by
     // node, each with where the loss was told: bytes the object holds until
     // a header or a directory says where they go. Sorted by volume and
-    // offset, and merged. Located again once the object places what it
-    // held, and marked then on the members they fall in. Never recorded:
-    // a restore walks the root's losses down again and finds them anew.
-    held_lost: BTreeMap<NodeId, Vec<(VolumeIndex, ByteRange, NodeId)>>,
+    // offset, and merged (`HeldLost`). Located again once the object places
+    // what it held, and marked then on the members they fall in. Never
+    // recorded: a restore walks the root's losses down again and finds them
+    // anew.
+    held_lost: BTreeMap<NodeId, held::HeldLost>,
     // The placement number each node's held losses were last located
     // under (`Object::placement`): while the object's number stands, they
     // locate as they did, and are not located again. Never recorded.
@@ -4855,8 +4857,9 @@ impl Tree {
     }
 
     // Hold a lost range of `node`'s volume its object cannot place yet.
-    // The node's list stays sorted and merged, so it holds one entry per
-    // run of held loss, however many articles the run lost.
+    // The node's runs stay sorted and merged, so it holds one entry per
+    // run of held loss, however many articles the run lost, and a hold
+    // costs a lookup, not a walk of the runs held.
     fn hold_lost(
         &mut self,
         node: NodeId,
@@ -4866,19 +4869,10 @@ impl Tree {
         if range.is_empty() {
             return;
         }
-        let list = self.held_lost.entry(node).or_default();
-        let at = list.partition_point(|(v, r, _)| (*v, r.start) < (volume, range.start));
-        list.insert(at, (volume, range, origin));
-        let mut merged: Vec<(VolumeIndex, ByteRange, NodeId)> = Vec::with_capacity(list.len());
-        for (volume, range, origin) in list.drain(..) {
-            match merged.last_mut() {
-                Some((v, r, o)) if *v == volume && *o == origin && range.start <= r.end => {
-                    *r = ByteRange::new(r.start, r.end.max(range.end));
-                }
-                _ => merged.push((volume, range, origin)),
-            }
-        }
-        *list = merged;
+        self.held_lost
+            .entry(node)
+            .or_default()
+            .hold(volume, range, origin);
     }
 
     // Once the object at `node` placed something, each of its held losses
@@ -4906,21 +4900,15 @@ impl Tree {
         if number.is_some() && self.held_located.get(&node) == number.as_ref() {
             return;
         }
-        let list = self.held_lost.remove(&node).unwrap_or_default();
+        let mut waiting = self.held_lost.remove(&node).unwrap_or_default();
         let mut probe = std::mem::take(&mut self.placements);
-        let mut placing = Vec::new();
-        let mut waiting = Vec::new();
-        for (volume, range, origin) in list {
+        let placing = waiting.take_placed(|volume, range| {
             probe.clear();
             object.locate(volume, range, &mut probe);
-            match probe
+            probe
                 .iter()
                 .any(|piece| matches!(piece, Placement::Member { .. }))
-            {
-                true => placing.push((volume, range, origin)),
-                false => waiting.push((volume, range, origin)),
-            }
-        }
+        });
         probe.clear();
         self.placements = probe;
         match (waiting.is_empty(), number) {

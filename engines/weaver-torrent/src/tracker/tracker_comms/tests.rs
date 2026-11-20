@@ -2660,6 +2660,70 @@ async fn a_refused_stopped_announce_counts_a_failure_and_leaves_none_due() {
     token.cancel();
 }
 
+// A tracker that echoes its announce URL, passkey and all, in why it
+// refused or in a warning: the message a view, a log or an export reads
+// shows the URL as scheme, host and port alone.
+#[tokio::test]
+async fn a_trackers_refusal_or_warning_naming_its_url_keeps_no_passkey() {
+    let echoed = "http://t.example:2710/0123456789abcdef/announce?passkey=0123456789abcdef";
+    let said = format!("passkey invalid for {echoed}, check it");
+    let shown = "passkey invalid for http://t.example:2710/\u{2026} check it";
+
+    // Refused, with the URL in why.
+    let (listener, url) = http_listener().await;
+    let stopped = StoppedAnnounces::default();
+    let (task, token) = start(vec![vec![url.clone()]], &stopped).await;
+    let TrackerTask { mut peers, status } = task;
+    let mut rx = status.subscribe();
+    tokio::select! {
+        _ = peers.next() => panic!("a refused tracker gave peers"),
+        () = async {
+            let (conn, _) = read_announce(&listener).await;
+            let answer = format!("d14:failure reason{}:{said}e", said.len());
+            respond(conn, answer.as_bytes()).await;
+            rx.wait_for(|a| a[0].last.is_some() && !a[0].in_flight).await.unwrap();
+        } => {}
+    }
+    let error = status.announces()[0]
+        .clone()
+        .last
+        .unwrap()
+        .result
+        .unwrap_err();
+    assert!(!error.message.contains("0123456789abcdef"), "{error}");
+    assert!(error.message.contains(shown), "{error}");
+    drop(peers);
+    stopped.wait_idle().await;
+    token.cancel();
+
+    // Answered, with the URL in a warning.
+    let (listener, url) = http_listener().await;
+    let stopped = StoppedAnnounces::default();
+    let (task, token) = start(vec![vec![url.clone()]], &stopped).await;
+    let TrackerTask { mut peers, status } = task;
+    let mut rx = status.subscribe();
+    tokio::select! {
+        _ = peers.next() => panic!("the tracker sent no peers"),
+        () = async {
+            let (conn, _) = read_announce(&listener).await;
+            let answer = format!(
+                "d8:intervali1800e5:peers0:15:warning message{}:{said}e",
+                said.len()
+            );
+            respond(conn, answer.as_bytes()).await;
+            rx.wait_for(|a| a[0].last.is_some() && !a[0].in_flight).await.unwrap();
+        } => {}
+    }
+    let answered = status.announces()[0].clone().last.unwrap().result.unwrap();
+    assert_eq!(answered.warning.as_deref(), Some(shown));
+    drop(peers);
+    let (conn, q) = read_announce(&listener).await;
+    assert_eq!(query_param(&q, "event"), Some("stopped"));
+    respond(conn, b"d8:intervali1800e5:peers0:e").await;
+    stopped.wait_idle().await;
+    token.cancel();
+}
+
 #[tokio::test]
 async fn each_announce_is_counted_under_its_event_and_how_it_ended() {
     let (listener, url) = http_listener().await;

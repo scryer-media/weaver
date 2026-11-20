@@ -486,3 +486,312 @@ fn changed_input_verdict_discards_replay_without_a_backing_write() {
     assert_eq!(job.tree.record(node).unwrap(), before);
     assert_eq!(job.file("inner.bin"), expected);
 }
+
+// What a hand-over of a leaf's file to a whole-volume archive left.
+#[derive(Debug, PartialEq)]
+struct HandedOver {
+    heard: Vec<(ByteRange, Provenance)>,
+    member: Vec<(ByteRange, Provenance)>,
+    kept: Vec<(ByteRange, Provenance)>,
+    envelope: Vec<u8>,
+    leaf_released: bool,
+}
+
+// How a hand-over runs: writing every byte over itself as before the
+// envelope knew they were there, and on a file system that gives a file a
+// second name or one that gives none.
+#[derive(Clone, Copy)]
+struct HandOver {
+    writes_over: bool,
+    second_names: bool,
+}
+
+// A 7z whose front arrived damaged is a leaf first. A repair rewrites the
+// front, the front reads as the archive, and the archive, which keeps its
+// volume whole at the volume's own offsets, takes the file as its envelope
+// under a second name. What it left, the bytes the volume holds, the
+// effects, and the bytes the repair wrote to disk. No real post named: the
+// shape stands for a 7z volume whose first article came damaged and that a
+// PAR2 set rebuilt.
+fn whole_hand_over(how: HandOver) -> (HandedOver, Vec<u8>, String, u64) {
+    use crate::pipeline::graph::envelope::in_place::WRITES_OVER;
+    use crate::pipeline::graph::leaf::counting;
+    use crate::pipeline::graph::namespace::claimed::refused::SECOND_NAMES;
+
+    WRITES_OVER.set(how.writes_over);
+    SECOND_NAMES.set(!how.second_names);
+    WHOLE_HEARD.with_borrow_mut(Vec::clear);
+    let mut front = seven_z().to_vec();
+    front.resize(FIRST_BYTES, 0x71);
+    let front: &'static [u8] = Box::leak(front.into_boxed_slice());
+    let body: Vec<u8> = (0..2 * READ_BACK + 13).map(|at| (at % 251) as u8).collect();
+    let volume = [front, body.as_slice()].concat();
+    let mut job = Job::new(PLENTY);
+    job.whole = true;
+    let mut job = job.with_set(Some(Fix {
+        name: "archive.7z",
+        read: ByteRange::new(0, front.len() as u64),
+        fix: (0, front),
+    }));
+    job.par.lock().unwrap().proof = Some(ByteRange::new(0, front.len() as u64));
+    let member = job.member("archive.7z", Some(volume.len() as u64));
+    job.send(member, 0, b"broken!", Provenance::Damaged);
+    let mut effects = Vec::new();
+    job.tree.damage(
+        NodeId::ROOT,
+        VolumeIndex(member.0),
+        ByteRange::new(7, front.len() as u64),
+        &mut effects,
+    );
+    let mut build = job.build();
+    job.writer
+        .apply_all(&mut job.tree, &mut build, &Source, effects, &mut job.out)
+        .unwrap();
+    job.send(member, front.len() as u64, &body, Provenance::Fresh);
+    assert!(
+        job.tree.child_of(NodeId::ROOT, member).is_none(),
+        "a leaf first"
+    );
+    assert_eq!(job.file("archive.7z").len(), volume.len());
+
+    let before = counting::so_far();
+    let due = job.tree.recovery_nodes(NodeId::ROOT);
+    assert_eq!(job.repair(&mut build, NodeId::ROOT, &due).len(), 1);
+    let after = counting::so_far();
+    WRITES_OVER.set(false);
+    SECOND_NAMES.set(false);
+
+    let (child, _) = job.tree.child_of(NodeId::ROOT, member).expect("claimed");
+    let envelope = job.writer.kept_file(child, VolumeIndex(0)).expect("kept");
+    let kept = job.writer.envelopes.shelf_of(child).unwrap().lock().kept[&0]
+        .coverage
+        .runs()
+        .map(|run| (run.range, run.provenance))
+        .collect();
+    let handed = HandedOver {
+        heard: WHOLE_HEARD.with_borrow(Clone::clone),
+        member: job
+            .root()
+            .get(member)
+            .unwrap()
+            .coverage
+            .runs()
+            .map(|run| (run.range, run.provenance))
+            .collect(),
+        kept,
+        envelope: std::fs::read(envelope).unwrap(),
+        leaf_released: !job.writer.files[&NodeId::ROOT].leaves.contains_key(&member),
+    };
+    (handed, volume, format!("{:?}", job.out), after.1 - before.1)
+}
+
+// The archive hears every run of the file with the provenance it arrived
+// with, as before, and keeps the same record; only the write of each byte
+// over itself is gone.
+#[test]
+fn a_leaf_handed_to_a_whole_volume_archive_is_not_written_over_itself() {
+    let (written_over, volume, effects_over, rewrote) = whole_hand_over(HandOver {
+        writes_over: true,
+        second_names: true,
+    });
+    let (in_place, _, effects, wrote) = whole_hand_over(HandOver {
+        writes_over: false,
+        second_names: true,
+    });
+    assert_eq!(in_place, written_over);
+    assert_eq!(effects, effects_over);
+    assert_eq!(in_place.envelope, volume);
+    assert!(in_place.leaf_released);
+    assert!(in_place.heard.len() >= 3, "{:?}", in_place.heard);
+    assert!(
+        in_place
+            .heard
+            .iter()
+            .all(|(range, _)| range.len() <= READ_BACK)
+    );
+    assert_eq!(
+        in_place
+            .heard
+            .iter()
+            .map(|(range, _)| range.len())
+            .sum::<u64>(),
+        volume.len() as u64
+    );
+    assert!(
+        in_place
+            .heard
+            .contains(&(ByteRange::new(0, FIRST_BYTES as u64), Provenance::Repaired)),
+        "{:?}",
+        in_place.heard
+    );
+    // The replay wrote every byte of the volume over itself before, and
+    // now writes none of it: what is still written is the repair's front,
+    // staged once and put in the file once.
+    assert_eq!(rewrote - wrote, volume.len() as u64);
+    assert_eq!(wrote, 2 * FIRST_BYTES as u64);
+}
+
+// A file system that gives a file no second name leaves the envelope a file
+// of its own: every byte of the volume goes down to it and is written, as
+// it was before, and the envelope holds the volume.
+#[test]
+fn a_hand_over_with_no_second_name_writes_every_byte() {
+    let (written_over, volume, _, rewrote) = whole_hand_over(HandOver {
+        writes_over: true,
+        second_names: false,
+    });
+    let (unlinked, _, _, wrote) = whole_hand_over(HandOver {
+        writes_over: false,
+        second_names: false,
+    });
+    assert_eq!(unlinked, written_over);
+    assert_eq!(unlinked.envelope, volume);
+    assert!(unlinked.leaf_released);
+    assert_eq!(wrote, rewrote);
+    assert!(wrote >= volume.len() as u64, "{wrote} of {}", volume.len());
+}
+
+// The file a test's leaf over `name` in `dir` is, as the file system tells.
+fn file_of(dir: &Path, name: &str) -> crate::pipeline::graph::leaf::FileId {
+    Leaf::over(dir, name, true)
+        .file_id()
+        .expect("a unix file system")
+}
+
+// Only bytes read from the very file an envelope began in, landing at the
+// offset they were read from, skip the write.
+#[cfg(unix)]
+#[test]
+fn only_bytes_read_from_the_envelope_s_own_file_at_their_own_offset_skip_the_write() {
+    use crate::pipeline::graph::envelope::{Envelopes, InPlace};
+    use crate::pipeline::graph::leaf::counting;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("volume"), b"abcdef").unwrap();
+    std::fs::write(dir.path().join("other"), b"ABCDEF").unwrap();
+    let mut envelopes = Envelopes::new(dir.path().to_path_buf());
+    let node = NodeId(3);
+    assert!(envelopes.start_in(node, 0, "volume", true));
+    let whole = [Placement::Envelope {
+        envelope: 0,
+        range: ByteRange::new(0, 6),
+    }];
+    let written = |envelopes: &mut Envelopes,
+                   placements: &[Placement],
+                   bytes: &[u8],
+                   in_place: Option<InPlace>| {
+        let before = counting::so_far().1;
+        envelopes
+            .capture(node, placements, bytes, Provenance::Fresh, in_place)
+            .unwrap();
+        counting::so_far().1 - before
+    };
+    let own = Some(InPlace {
+        file: file_of(dir.path(), "volume"),
+        offset: 0,
+    });
+    assert_eq!(written(&mut envelopes, &whole, b"abcdef", own), 0);
+    assert!(envelopes.keeps(node, 0, ByteRange::new(0, 6)));
+    // Another file's bytes, bytes from elsewhere, and bytes read at another
+    // offset are written.
+    let other = Some(InPlace {
+        file: file_of(dir.path(), "other"),
+        offset: 0,
+    });
+    assert_eq!(written(&mut envelopes, &whole, b"ABCDEF", other), 6);
+    assert_eq!(written(&mut envelopes, &whole, b"abcdef", None), 6);
+    let moved = own.map(|read| InPlace { offset: 10, ..read });
+    assert_eq!(written(&mut envelopes, &whole, b"abcdef", moved), 6);
+    // An envelope begun in a file of its own is written whatever it is told.
+    let fresh = [Placement::Envelope {
+        envelope: 1,
+        range: ByteRange::new(0, 6),
+    }];
+    assert_eq!(written(&mut envelopes, &fresh, b"abcdef", own), 6);
+    assert_eq!(std::fs::read(dir.path().join("volume")).unwrap(), b"abcdef");
+}
+
+// Where the file system gives no second name, the envelope begins in the
+// empty file made at the name instead: that is another file than the one
+// the bytes were read from, so every byte is written, and the envelope
+// holds the volume.
+#[cfg(unix)]
+#[test]
+fn an_envelope_begun_in_the_empty_file_a_refused_second_name_left_is_written() {
+    use crate::pipeline::graph::envelope::{Envelopes, InPlace};
+    use crate::pipeline::graph::leaf::counting;
+    use crate::pipeline::graph::namespace::claimed::{refused::SECOND_NAMES, second_name_or_empty};
+
+    let dir = tempfile::tempdir().unwrap();
+    let from = dir.path().join("archive.7z");
+    std::fs::write(&from, b"abcdef").unwrap();
+    SECOND_NAMES.set(true);
+    second_name_or_empty(&from, &dir.path().join("envelope"));
+    SECOND_NAMES.set(false);
+    let mut envelopes = Envelopes::new(dir.path().to_path_buf());
+    let node = NodeId(3);
+    assert!(envelopes.start_in(node, 0, "envelope", true));
+    let whole = [Placement::Envelope {
+        envelope: 0,
+        range: ByteRange::new(0, 6),
+    }];
+    let read = Some(InPlace {
+        file: file_of(dir.path(), "archive.7z"),
+        offset: 0,
+    });
+    let before = counting::so_far().1;
+    envelopes
+        .capture(node, &whole, b"abcdef", Provenance::Fresh, read)
+        .unwrap();
+    assert_eq!(counting::so_far().1 - before, 6);
+    assert_eq!(
+        std::fs::read(dir.path().join("envelope")).unwrap(),
+        b"abcdef"
+    );
+    assert_eq!(std::fs::read(&from).unwrap(), b"abcdef");
+}
+
+// A member's file made anew after the envelope took a second name of it, as
+// a move that copies and a repair that rewrites it would leave it, is
+// another file: bytes read from it are written to the envelope, which then
+// holds them, not the bytes the old file held.
+#[cfg(unix)]
+#[test]
+fn bytes_read_from_a_file_made_anew_after_the_hand_over_are_written() {
+    use crate::pipeline::graph::envelope::{Envelopes, InPlace};
+    use crate::pipeline::graph::leaf::counting;
+
+    let dir = tempfile::tempdir().unwrap();
+    let from = dir.path().join("archive.7z");
+    std::fs::write(&from, b"broken").unwrap();
+    std::fs::hard_link(&from, dir.path().join("envelope")).unwrap();
+    let mut envelopes = Envelopes::new(dir.path().to_path_buf());
+    let node = NodeId(3);
+    assert!(envelopes.start_in(node, 0, "envelope", true));
+    let shared = file_of(dir.path(), "archive.7z");
+    assert_eq!(file_of(dir.path(), "envelope"), shared);
+    // The file goes and comes back at its name holding the repaired bytes.
+    std::fs::remove_file(&from).unwrap();
+    std::fs::write(&from, b"abcdef").unwrap();
+    let mut bytes = Vec::new();
+    let member = Leaf::over(dir.path(), "archive.7z", true);
+    member.read(0, 6, &mut bytes).unwrap();
+    let read = Some(InPlace {
+        file: member.file_id().unwrap(),
+        offset: 0,
+    });
+    assert_ne!(read.map(|read| read.file), Some(shared));
+    let whole = [Placement::Envelope {
+        envelope: 0,
+        range: ByteRange::new(0, 6),
+    }];
+    let before = counting::so_far().1;
+    envelopes
+        .capture(node, &whole, &bytes, Provenance::Fresh, read)
+        .unwrap();
+    assert_eq!(counting::so_far().1 - before, 6);
+    assert_eq!(
+        std::fs::read(dir.path().join("envelope")).unwrap(),
+        b"abcdef"
+    );
+}

@@ -52,6 +52,7 @@ pub mod bandwidth_fixture;
 pub mod completion_fixture;
 pub mod control_fixture;
 pub mod decode_fixture;
+pub mod disk_start_fixture;
 pub mod password_fixture;
 pub mod progress_fixture;
 #[cfg(any(test, feature = "pipeline-test-fixtures"))]
@@ -433,6 +434,8 @@ pub fn finished_job_info(job_id: JobId) -> JobInfo {
         metadata: vec![],
         output_dir: None,
         server_attribution: Vec::new(),
+        disk_need_bytes: None,
+        disk_free_bytes: None,
         created_at_epoch_ms: job_id.0 as f64,
     }
 }

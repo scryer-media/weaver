@@ -146,3 +146,88 @@ async fn a_right_sfv_over_files_of_a_proved_archive_completes() {
         said(&outcome)
     );
 }
+
+// A real RARLAB archive of three files, two stored and one compressed.
+const RAR_OF_THREE: &str = "rar5_multifile_lz.rar";
+// Where the stored member `hello.txt` begins its data in it.
+const HELLO_DATA: usize = 0x45;
+
+// `entries` in one LZMA2 7z: the store gives it up and the engine reads it.
+fn in_lzma2_7z(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
+    use sevenz_turbo::encoder_options::Lzma2Options;
+    use sevenz_turbo::{ArchiveEntry, ArchiveWriter};
+    use std::io::Cursor;
+
+    let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+    writer.set_content_methods(vec![Lzma2Options::from_level(1).into()]);
+    for (name, bytes) in entries {
+        let mut entry = ArchiveEntry::new_file(name);
+        entry.size = bytes.len() as u64;
+        writer
+            .push_archive_entry(entry, Some(Cursor::new(bytes.clone())))
+            .unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
+// Two folders, each a RAR the RAR engine reads and an SFV over it; the
+// first folder's SFV states a CRC its RAR volume does not have. With
+// `spoil_member`, a byte of the first RAR's stored member `hello.txt` is
+// flipped, so that member fails its own CRC as it extracts. No PAR2 set.
+// No real post is named: it stands for a game release posted as one 7z of
+// per-disc folders, each a RAR with its SFV.
+fn folders(spoil_member: bool) -> Vec<(String, Vec<u8>)> {
+    let mut entries = Vec::new();
+    for folder in 0..2u8 {
+        let name = format!("game{folder}.rar");
+        let mut volume = weaver_server_pipeline::pipeline::tests::rar5_fixture_bytes(RAR_OF_THREE);
+        assert_eq!(&volume[HELLO_DATA..HELLO_DATA + 5], b"Hello");
+        let listed = crc(&volume) ^ u32::from(folder == 0);
+        if spoil_member && folder == 0 {
+            volume[HELLO_DATA] ^= 0x20;
+        }
+        entries.push((format!("Game {folder}/{name}"), volume));
+        let sfv = listing_text("; game\n", &[(&name, listed)]);
+        entries.push((format!("Game {folder}/game{folder}.sfv"), sfv));
+    }
+    entries
+}
+
+// The SFV below the root disagrees with a RAR volume whose members all
+// extract with their own CRCs passing: it makes no damage claim, nothing is
+// short, and the job ends Complete.
+#[tokio::test]
+async fn a_listing_inside_an_archive_that_disagrees_with_a_volume_extracted_whole_does_not_shorten_the_job()
+ {
+    let scenario = Scenario::new(vec![Post::plain(
+        "lantern.7z",
+        in_lzma2_7z(&folders(false)),
+    )]);
+    let outcome = run(&scenario).await;
+    let view = outcome.graph();
+    assert_eq!(view.delivery.whole.len(), 6, "{}", said(&outcome));
+    assert!(view.delivery.damaged.is_empty(), "{}", said(&outcome));
+    assert!(view.delivery.unrepaired.is_empty(), "{}", said(&outcome));
+    assert!(view.delivery.withheld.is_empty(), "{}", said(&outcome));
+    assert_eq!(
+        outcome.status,
+        Some(JobStatus::Complete),
+        "{}",
+        said(&outcome)
+    );
+}
+
+// Guard: the same shape, the first RAR's `hello.txt` failing its own CRC.
+// The volume did not extract whole, so the SFV's claim against it stands:
+// the job is not Complete.
+#[tokio::test]
+async fn a_listing_inside_an_archive_over_a_volume_whose_member_fails_its_crc_keeps_its_claim() {
+    let scenario = Scenario::new(vec![Post::plain("lantern.7z", in_lzma2_7z(&folders(true)))]);
+    let outcome = run(&scenario).await;
+    assert_ne!(
+        outcome.status,
+        Some(JobStatus::Complete),
+        "{}",
+        said(&outcome)
+    );
+}

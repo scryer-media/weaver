@@ -214,6 +214,8 @@ fn live_info(id: u64) -> JobInfo {
         download_wait_reason: Some(SENTINEL.to_string()),
         download_retry_at_epoch_ms: None,
         server_attribution: Vec::new(),
+        disk_need_bytes: None,
+        disk_free_bytes: None,
         created_at_epoch_ms: 0.0,
     }
 }

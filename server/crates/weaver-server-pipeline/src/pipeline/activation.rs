@@ -824,7 +824,10 @@ impl Pipeline {
         }
         self.charge_job_article_memory(job_id);
         match graph {
-            Some(graph) => self.install_graph_job(job_id, graph, held_parts),
+            Some(graph) => {
+                self.install_graph_job(job_id, graph, held_parts);
+                self.post_restored(job_id);
+            }
             None => self.admit_graph_job(job_id, volumes),
         }
         self.abandon_dead_files(job_id);
@@ -1059,6 +1062,9 @@ impl Pipeline {
         self.disk_waiting.remove(&job_id);
         self.disk_idle.remove(&job_id);
         let mut graph = self.graph_jobs.remove(&job_id)?;
+        // A job that stops fetches no more: what its start promised and did
+        // not land goes back before the graph may be kept.
+        graph.release_posted();
         let pending = graph.pending().clone();
         if !pending.control().cancelled()
             && pending

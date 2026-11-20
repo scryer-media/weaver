@@ -34,9 +34,9 @@ pub struct TorrentUpdates {
     revision: watch::Receiver<u64>,
     // Each torrent last given, by its print.
     last: Option<HashMap<JobId, u64>>,
-    // One torrent's follower: the revision its row had moved at when it was
-    // last read, none while it has no row.
-    seen: Option<u64>,
+    // One torrent's follower: the revisions its row and its files had moved
+    // at when it was last read, none while it has no row.
+    seen: Option<(u64, u64)>,
 }
 
 /// What moved since the last push.
@@ -121,7 +121,9 @@ impl TorrentUpdates {
         let snapshot = self.service.snapshot();
         match &self.follow {
             Follow::One(job_id) => {
-                let moved = snapshot.row(*job_id).map(|row| row.moved);
+                let moved = snapshot
+                    .row(*job_id)
+                    .map(|row| (row.moved, row.files_moved));
                 if self.last.is_some() && moved == self.seen {
                     return None;
                 }

@@ -16,6 +16,7 @@ use super::*;
 use crate::pipeline::graph::lines::Lines;
 
 mod again;
+mod disk_start;
 mod held_release;
 mod recovery;
 mod recovery_contracts;
@@ -263,6 +264,51 @@ impl Object for Late {
     }
 }
 
+// A pretend 7z that keeps its volume whole, every byte in envelope 0 at the
+// volume's own offset, as an engine keeps its volumes. It says nothing; it
+// only hears each delivery, as `WHOLE_HEARD` records.
+struct Whole;
+
+thread_local! {
+    static WHOLE_HEARD: std::cell::RefCell<Vec<(ByteRange, Provenance)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl Object for Whole {
+    fn unposted(&mut self, _: weaver_graph::VolumeIndex, _: weaver_graph::ByteRange) {}
+
+    fn kind(&self) -> Kind {
+        Kind::SevenZipStore
+    }
+
+    fn deliver(
+        &mut self,
+        delivery: Delivery<'_>,
+        _: &mut dyn FnMut(&weaver_graph::Placement, &mut Vec<u8>) -> bool,
+        _: &mut Vec<Emit>,
+    ) {
+        let range = ByteRange::at(delivery.offset, delivery.bytes.len() as u64);
+        WHOLE_HEARD.with_borrow_mut(|heard| heard.push((range, delivery.provenance)));
+    }
+
+    fn volume_closed(&mut self, _: VolumeIndex, _: &mut Vec<Emit>) {}
+    fn volume_lost(&mut self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Emit>) {}
+    fn wants(&self, _: &mut Vec<Seek>) {}
+    fn pulled(&mut self, _: Seek, _: Pull, _: &mut Vec<Emit>) {}
+
+    fn locate(&self, _: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
+        out.push(Placement::Envelope { envelope: 0, range });
+    }
+
+    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) -> Located {
+        Located::Never
+    }
+
+    fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
+        None
+    }
+}
+
 // Builds the pretend store, and the pretend recovery set with the job's
 // record of what it was fed and the fix it makes when asked to repair.
 struct Build {
@@ -272,6 +318,8 @@ struct Build {
     inner_name: &'static str,
     checksum_on_repair: Option<u32>,
     heard: Arc<Mutex<Vec<u64>>>,
+    // A 7z is `Whole` rather than `Late`.
+    whole: bool,
 }
 
 impl Builder for Build {
@@ -283,6 +331,7 @@ impl Builder for Build {
                 length: self.inner,
                 checksum_on_repair: self.checksum_on_repair,
             })),
+            Kind::SevenZipStore if self.whole => Some(Box::new(Whole)),
             Kind::SevenZipStore => Some(Box::new(Late::new())),
             Kind::Xz => Some(Box::new(streams::Decoded::new(Arc::clone(&self.heard)))),
             Kind::Par2 => Some(Box::new(Par {
@@ -576,6 +625,7 @@ struct Job {
     // What every pretend stream had been delivered each time it heard its
     // volume closed.
     heard: Arc<Mutex<Vec<u64>>>,
+    whole: bool,
     out: Vec<Effect>,
 }
 
@@ -603,6 +653,7 @@ impl Job {
             inner_name: "inner.bin",
             checksum_on_repair: None,
             heard: Arc::default(),
+            whole: false,
             out: Vec::new(),
         }
     }
@@ -678,6 +729,7 @@ impl Job {
             inner_name: self.inner_name,
             checksum_on_repair: self.checksum_on_repair,
             heard: Arc::clone(&self.heard),
+            whole: self.whole,
         }
     }
 
@@ -4341,9 +4393,21 @@ const RESERVE: u64 = 1 << 30;
 
 fn reserved(free: &Arc<std::sync::atomic::AtomicU64>, size: u64, par3: bool, fix: Fix) -> Job {
     let reader = disk(free, size, &Arc::default());
-    let job = on_disk(&reader, RESERVE, 5);
+    let mut job = on_disk(&reader, RESERVE, 5);
     job.par.lock().unwrap().par3 = par3;
+    // The job started with its set's bytes promised, as a started job is:
+    // they land on that promise, and only the repair's own writes are
+    // judged.
+    posting(&mut job, PAR2_SIGNATURE.len() as u64);
     job.with_set(Some(fix))
+}
+
+// The job's start promised `bytes` more of posts on the disk it delivers
+// to, the only one these jobs read, as a start does: on the ledger, and in
+// the writer, which its posts draw on.
+fn posting(job: &mut Job, bytes: u64) {
+    job.writer.output_free_disk.ledger().promise(bytes);
+    job.writer.start_with_posted(0, bytes);
 }
 
 // How many of the repair's staged outputs are left in the job's folder.
@@ -4471,6 +4535,7 @@ fn a_post_that_arrives_while_its_rebuild_waits_is_no_longer_waited_for() {
         },
     );
     let video = job.member("video.mkv", Some(DECLARED));
+    posting(&mut job, DECLARED);
     let due = job.tree.recovery_nodes(NodeId::ROOT);
     let mut lent = Inline::default();
     let rechecks = || super::recovery::HELD_RECHECKS.with(std::cell::Cell::get);
@@ -4588,6 +4653,7 @@ fn a_repair_into_the_posts_is_promised_its_room_before_it_goes_out() {
             },
         );
         let member = job.member("video.mkv", Some(8));
+        posting(&mut job, 8);
         if arrived {
             job.send(member, 0, b"go", Provenance::Fresh);
             job.send(member, 2, b"XX", Provenance::Damaged);
@@ -4619,7 +4685,10 @@ fn a_repair_into_the_posts_is_promised_its_room_before_it_goes_out() {
         );
         assert_eq!(result.unwrap(), Some(1));
         assert!(job.writer.refusal().is_none());
-        assert!(!job.writer.disk_held(), "its room was promised before");
+        assert!(
+            !job.writer.disk_held(),
+            "its room was promised before: par3 {par3}, arrived {arrived}, free {before} then {after}"
+        );
         assert_eq!(job.file("video.mkv"), b"goOKgood");
     }
 }

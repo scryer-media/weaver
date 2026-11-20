@@ -525,11 +525,12 @@ async fn a_paused_job_waiting_for_room_completes_once_there_is_room_and_it_resum
     assert_eq!(status(&pipeline), Some(JobStatus::Complete));
 }
 
-// A job that started, was paused, giving back its slot, and resumed while
-// the working disk reads no room over its reserve counts as started: it
-// takes its slot again, fetches on and completes.
+// A job that started, was paused, giving back its slot and its promise, and
+// resumed while the working disk reads no room over its reserve is judged as
+// any start is: it waits for room, and a reading with room starts it again.
+// It fetches on and completes.
 #[tokio::test]
-async fn a_started_job_paused_and_resumed_under_the_reserve_fetches_on_and_completes() {
+async fn a_started_job_paused_and_resumed_under_the_reserve_waits_for_room_and_completes() {
     let room = Arc::new(AtomicU64::new(0));
     let scenario = on_disk_posting(
         &room,
@@ -544,9 +545,19 @@ async fn a_started_job_paused_and_resumed_under_the_reserve_fetches_on_and_compl
     apply_intents(&mut pipeline).await;
     assert_eq!(run_state(&pipeline), RunState::Paused);
     assert!(!admitted(&pipeline, JOB), "the pause gave back its slot");
+    assert_eq!(working(&pipeline).promised(), 0, "and its promise");
 
     handle.resume_job(JOB).await.unwrap();
     apply_intents(&mut pipeline).await;
+    apply_intents(&mut pipeline).await;
+    assert!(!admitted(&pipeline, JOB), "no room: it does not start");
+    assert_eq!(
+        row_reason(&pipeline, JOB).as_deref(),
+        Some(weaver_server_pipeline::jobs::handle::DISK_SPACE_WAIT_REASON)
+    );
+    assert!(waiting(&pipeline));
+
+    room_freed(&mut pipeline, &room).await;
     apply_intents(&mut pipeline).await;
     assert!(admitted(&pipeline, JOB), "it took its slot again");
     assert_eq!(run_state(&pipeline), RunState::Active);
@@ -1072,6 +1083,84 @@ async fn a_job_let_go_that_fails_again_waits_for_more_room_than_its_disk_has_sho
     );
 }
 
+// A job let go that finds its disk full again, having saved nothing new,
+// starts again only as any job starts: on a reading, begun after its write
+// failed, that leaves room for what it has left to fetch past the reserve
+// and every promise. Readings that show no room do not send it round, and
+// neither does a resume by its user while the disk is short.
+#[tokio::test]
+async fn a_job_let_go_that_fails_again_waits_for_room_for_what_it_has_left() {
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let body = payload(4 * ARTICLE, 113);
+    let scenario = on_disk_posting(&room, vec![Post::plain("ember.bin", body.clone())]);
+    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
+
+    // The write finds the disk full, as its last reading showed: no room
+    // over its reserve.
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, 0);
+    fill_after(Some(ARTICLE as u64 + ARTICLE as u64 / 2));
+    until_full(&mut pipeline, &scenario).await;
+    // Parked, it counts as left to fetch every article its last checkpoint
+    // does not hold: what it fetches when it goes on.
+    let left = queued_articles(&pipeline);
+    assert!((1..=4).contains(&left), "{left} of 4 articles are left");
+
+    // The disk reads the same at every look: none was made.
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, 0);
+    assert_full_disk_held(&pipeline);
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, 0);
+    assert_full_disk_held(&pipeline);
+    assert!(
+        articles_queued(&pipeline),
+        "no reading without room restarts it"
+    );
+
+    // Its user resumes it, though it is not paused: the disk is short, so
+    // it stays held and fetches nothing.
+    handle(&pipeline).resume_job(JOB).await.unwrap();
+    apply_intents(&mut pipeline).await;
+    assert_full_disk_held(&pipeline);
+    assert!(
+        articles_queued(&pipeline),
+        "a resume while short restarts nothing"
+    );
+
+    // A byte short of what it needs keeps it; the room it needs lets it go,
+    // and that room is promised to it.
+    let need = full_disk_start_need(&pipeline);
+    assert!(need > 0, "it has something left to fetch");
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, need - 1);
+    assert_full_disk_held(&pipeline);
+    fill_after(Some(0));
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, need);
+    assert_eq!(working(&pipeline).promised(), need);
+    restarts(&mut pipeline).await;
+    assert_eq!(
+        active_download_queue_len(&pipeline),
+        Some(left),
+        "restored, it has left to fetch what it showed left while it waited"
+    );
+
+    // The disk fills again before its write lands: it is held, and gives
+    // back what it was promised.
+    room.store(0, Ordering::Release);
+    until_full(&mut pipeline, &scenario).await;
+    assert_eq!(working(&pipeline).promised(), 0);
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, 0);
+    assert_full_disk_held(&pipeline);
+
+    // Room was made, and this time the write lands.
+    fill_after(None);
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY);
+    restarts(&mut pipeline).await;
+    finish_disk_job(&mut pipeline, &scenario).await;
+    assert_eq!(status(&pipeline), Some(JobStatus::Complete));
+    assert_eq!(
+        file_named(&delivered(&complete_dir), "ember.bin"),
+        body.as_slice()
+    );
+}
+
 // A reading that shows more than the disk did as the write failed, with too
 // little of it free to spend, lets no job go and changes nothing: when what
 // is promised on the disk is given back, the same figure lets the job go.
@@ -1142,42 +1231,45 @@ async fn a_job_let_go_whose_disk_is_filled_again_goes_on_when_less_room_is_made(
     );
 }
 
-// A job held on one disk, let go, and held again on another waits for more
-// than that other disk showed, whatever the first one did.
+// A job held on one disk, let go, and held again on the output disk is
+// judged on that disk: a reading of the working disk lets it go no more than
+// one of its own disk with no room; one of its own disk with room does.
 #[tokio::test]
-async fn a_second_wait_on_another_disk_takes_that_disks_figure() {
+async fn a_second_wait_on_another_disk_is_judged_on_that_disks_reading() {
     let room = Arc::new(AtomicU64::new(0));
     let body = payload(4 * ARTICLE, 151);
     let scenario = on_disk_posting(&room, vec![Post::plain("ember.bin", body.clone())]);
     let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
 
-    // The output disk shows little, the working disk much.
-    hears(&mut pipeline, &room, StorageRoot::Complete, 0);
-    hears(&mut pipeline, &room, StorageRoot::Intermediate, 2 * PLENTY);
     fill_after(Some(ARTICLE as u64 + ARTICLE as u64 / 2));
     until_full(&mut pipeline, &scenario).await;
-    assert_eq!(full_disk_mark(&pipeline), Some(RESERVE + 2 * PLENTY));
+    assert_eq!(full_disk_mark(&pipeline), Some(RESERVE));
 
     fill_after(None);
-    resume_disk_held_job(&mut pipeline);
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY);
     restarts(&mut pipeline).await;
 
-    // Its next write fails on the output disk, which still shows little.
+    // Its next write fails on the output disk, which shows little.
     room.store(0, Ordering::Release);
     hold_on_root(&mut pipeline, StorageRoot::Complete);
     assert_eq!(
         full_disk_mark(&pipeline),
         Some(RESERVE),
-        "the wait has its own disk's figure to beat"
+        "the wait has its own disk's figure"
     );
     park_disk_held_jobs(&mut pipeline);
     old_graph_heard(&mut pipeline).await;
     hears(&mut pipeline, &room, StorageRoot::Complete, 0);
     assert!(full_disk_held(&pipeline));
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY);
+    assert!(
+        full_disk_held(&pipeline),
+        "room on the working disk does not let it go"
+    );
     hears(&mut pipeline, &room, StorageRoot::Complete, PLENTY);
     assert!(
         !full_disk_held(&pipeline),
-        "more than the output disk showed lets it go"
+        "room on the output disk lets it go"
     );
 }
 
@@ -1377,40 +1469,31 @@ async fn held_with_a_file_part_written(
 }
 
 // With nothing kept free, a few bytes freed on a full disk do not let a
-// held download go: it waits for the room of what was left of the file it
-// was writing, over what the disk showed as the write failed.
+// held download go: it waits for the room of what it has left to fetch, at
+// least what was left of the file it was writing.
 #[tokio::test]
-async fn a_held_download_waits_for_the_room_of_what_was_left_of_its_file() {
-    let room = Arc::new(AtomicU64::new(PLENTY));
+async fn a_held_download_waits_for_the_room_of_what_it_has_left() {
+    let room = Arc::new(AtomicU64::new(0));
     let (_temp_dir, mut pipeline, scenario, complete_dir, body, left) =
         held_with_a_file_part_written(&room, 0, 151).await;
-    assert_eq!(full_disk_mark(&pipeline), Some(PLENTY));
+    assert_eq!(full_disk_mark(&pipeline), Some(0));
     assert_eq!(full_disk_rise(&pipeline), (Some(left), false));
+    let need = full_disk_start_need(&pipeline);
+    assert!(need >= left, "{need} needed, {left} left of its file");
 
-    // Another program removed a small file, a few bytes where the file
-    // has more than an article left: that much more shows.
-    hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY + 4);
+    // Another program removed a small file: a few bytes show.
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, 4);
     assert_full_disk_held(&pipeline);
-    // One byte short of what was left.
-    hears(
-        &mut pipeline,
-        &room,
-        StorageRoot::Intermediate,
-        PLENTY + left - 1,
-    );
+    // One byte short of what it needs.
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, need - 1);
     assert_full_disk_held(&pipeline);
-    assert_eq!(full_disk_mark(&pipeline), Some(PLENTY), "the mark stands");
+    assert_eq!(full_disk_mark(&pipeline), Some(0), "the mark stands");
 
-    // The room of what was left shows: the job goes on, and what it was
-    // let go on is promised to it.
+    // The room it needs shows: the job goes on, and that room is promised
+    // to it.
     fill_after(None);
-    hears(
-        &mut pipeline,
-        &room,
-        StorageRoot::Intermediate,
-        PLENTY + left,
-    );
-    assert_eq!(promised_bytes(&pipeline), left);
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, need);
+    assert_eq!(working(&pipeline).promised(), need);
     restarts(&mut pipeline).await;
     finish_disk_job(&mut pipeline, &scenario).await;
     assert_eq!(status(&pipeline), Some(JobStatus::Complete));
@@ -1420,29 +1503,28 @@ async fn a_held_download_waits_for_the_room_of_what_was_left_of_its_file() {
     );
 }
 
-// With free space kept, a held download goes on only when both hold: the
-// disk shows the room of what was left over the mark, and more than the
-// reserve is free to spend.
+// With free space kept, a held download goes on only when the disk leaves
+// what it needs free past the reserve and every promise on it.
 #[tokio::test]
-async fn a_held_download_with_a_reserve_waits_for_the_rise_and_the_reserve() {
+async fn a_held_download_with_a_reserve_waits_for_its_need_past_the_reserve_and_promises() {
     let room = Arc::new(AtomicU64::new(0));
-    let (_temp_dir, mut pipeline, scenario, complete_dir, body, left) =
+    let (_temp_dir, mut pipeline, scenario, complete_dir, body, _) =
         held_with_a_file_part_written(&room, RESERVE, 157).await;
     assert_eq!(full_disk_mark(&pipeline), Some(RESERVE));
+    let need = full_disk_start_need(&pipeline);
 
-    // More than the reserve is free, the rise is short by a byte.
-    hears(&mut pipeline, &room, StorageRoot::Intermediate, left - 1);
+    // More than the reserve is free, short of the need by a byte.
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, need - 1);
     assert_full_disk_held(&pipeline);
-    // The rise shows, and all of it is promised to another job: no more
-    // than the reserve is free to spend.
-    working(&pipeline).promise(left);
-    hears(&mut pipeline, &room, StorageRoot::Intermediate, left);
+    // The need shows, and all of it is promised to another job.
+    working(&pipeline).promise(need);
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, need);
     assert_full_disk_held(&pipeline);
 
-    // Both hold.
-    working(&pipeline).release(left);
+    // That job gives it back: the same figure lets it go.
+    working(&pipeline).release(need);
     fill_after(None);
-    hears(&mut pipeline, &room, StorageRoot::Intermediate, left);
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, need);
     restarts(&mut pipeline).await;
     finish_disk_job(&mut pipeline, &scenario).await;
     assert_eq!(status(&pipeline), Some(JobStatus::Complete));
@@ -1529,7 +1611,8 @@ async fn a_download_a_quota_refused_waits_for_the_figure_to_rise_by_what_was_lef
 // A step that names what it needs, refused by a quota: the disk showed that
 // much free already, so the job goes when the figure has risen by it from
 // the mark, not at the mark and not a byte over it. The same step refused by
-// the disk goes as soon as the disk shows what it needs.
+// the disk goes as soon as the disk leaves what it needs, and that room is
+// promised to it as its start.
 #[tokio::test]
 async fn a_step_a_quota_refused_waits_for_the_figure_to_rise_by_what_it_needs() {
     // Fifteen units of a file, on a disk that shows far more free.
@@ -1554,6 +1637,7 @@ async fn a_step_a_quota_refused_waits_for_the_figure_to_rise_by_what_it_needs() 
             room.store(PLENTY, Ordering::Release);
         }
         hold_step(&mut pipeline, NEEDS, quota);
+        let need = full_disk_start_need(&pipeline);
         park_disk_held_jobs(&mut pipeline);
         old_graph_heard(&mut pipeline).await;
 
@@ -1587,11 +1671,12 @@ async fn a_step_a_quota_refused_waits_for_the_figure_to_rise_by_what_it_needs() 
                 PLENTY + NEEDS,
             );
         }
-        assert_eq!(
-            promised_bytes(&pipeline),
-            NEEDS,
-            "the room it goes on is promised to it"
-        );
+        let (promised, went_on) = if quota {
+            (promised_bytes(&pipeline), NEEDS)
+        } else {
+            (working(&pipeline).promised(), need)
+        };
+        assert_eq!(promised, went_on, "the room it goes on is promised to it");
         restarts(&mut pipeline).await;
         finish_disk_job(&mut pipeline, &scenario).await;
         assert_eq!(status(&pipeline), Some(JobStatus::Complete));
@@ -1671,9 +1756,10 @@ async fn room_promised_to_one_held_job_is_not_promised_to_the_next() {
 
 // No hold is let go by less than the write that was refused. A spool write
 // that found no room waits for the free figure to rise by the part it could
-// not write. A site with no figure at all, here refused by a quota on a
-// disk that shows plenty free, waits for it to rise by the reserve: a few
-// bytes freed let nothing go.
+// not write. A site with no figure at all, refused by a quota on a disk that
+// shows plenty free, waits for it to rise by the reserve: a few bytes freed
+// let nothing go. A spool write the disk refused waits for the room of what
+// the job needs, at least that part, past the reserve.
 #[tokio::test]
 async fn a_hold_with_no_figure_is_not_let_go_by_a_few_bytes() {
     let room = Arc::new(AtomicU64::new(PLENTY));
@@ -1689,6 +1775,10 @@ async fn a_hold_with_no_figure_is_not_let_go_by_a_few_bytes() {
         refuse_spool_write(&mut pipeline, kind, 4096);
         assert_eq!(full_disk_rise(&pipeline), (Some(4096), quota));
         assert_eq!(full_disk_mark(&pipeline), Some(RESERVE + PLENTY));
+        // A disk refusal's start is promised what the job has left, in the
+        // ledger; a quota's figure is promised as the wait's own.
+        let before = working(&pipeline).promised();
+        let left = full_disk_start_promise(&pipeline);
         hears(
             &mut pipeline,
             &room,
@@ -1696,14 +1786,19 @@ async fn a_hold_with_no_figure_is_not_let_go_by_a_few_bytes() {
             PLENTY + 4095,
         );
         assert_eq!(promised_bytes(&pipeline), 0);
+        assert_eq!(working(&pipeline).promised(), before);
         hears(
             &mut pipeline,
             &room,
             StorageRoot::Intermediate,
             PLENTY + 4096,
         );
-        assert_eq!(promised_bytes(&pipeline), 4096);
-        end_disk_promise(&mut pipeline);
+        if quota {
+            assert_eq!(promised_bytes(&pipeline), 4096);
+            end_disk_promise(&mut pipeline);
+        } else {
+            assert_eq!(working(&pipeline).promised(), before + left);
+        }
         assert!(drop_disk_hold(&mut pipeline));
         hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY);
     }
@@ -1732,6 +1827,29 @@ async fn a_hold_with_no_figure_is_not_let_go_by_a_few_bytes() {
         PLENTY + RESERVE,
     );
     assert_eq!(promised_bytes(&pipeline), RESERVE);
+    end_disk_promise(&mut pipeline);
+    assert!(drop_disk_hold(&mut pipeline));
+
+    // The disk refuses a spool write, showing no room as it does: the mark
+    // is the reserve, and a start needs room for what is left over it.
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, 0);
+    refuse_spool_write(&mut pipeline, std::io::ErrorKind::StorageFull, 4096);
+    assert_eq!(full_disk_rise(&pipeline), (Some(4096), false));
+    let need = full_disk_start_need(&pipeline);
+    assert!(need >= 4096, "{need} needed for a part of 4096");
+    let left = full_disk_start_promise(&pipeline);
+    let before = working(&pipeline).promised();
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, 4095);
+    assert!(full_disk_held(&pipeline));
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, need - 1);
+    assert!(full_disk_held(&pipeline));
+    assert_eq!(working(&pipeline).promised(), before);
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, need);
+    assert_eq!(
+        working(&pipeline).promised(),
+        before + left,
+        "what it has left to fetch is promised to it"
+    );
 }
 
 // A job held on a root and a job held on a path below it, on the same
@@ -1859,11 +1977,11 @@ async fn a_usenet_job_and_a_torrent_held_on_one_disk_are_promised_the_same_room_
     assert_eq!(promised_bytes(&pipeline), 60 * UNIT);
 }
 
-// The user's resume lets a held job go, whatever the readings say: one
-// that was paused while held goes at that one resume, and one a quota
-// holds, not paused, goes too.
+// The user's resume is no way past the disk: a held job, paused while held
+// or not, stays held at its resume while the disk shows no room, and goes
+// when a reading shows the room it waits for.
 #[tokio::test]
-async fn one_resume_lets_a_held_job_go_paused_or_not() {
+async fn a_resume_does_not_let_a_held_job_go_while_the_disk_is_short() {
     const UNIT: u64 = 1 << 20;
     for paused in [true, false] {
         let room = Arc::new(AtomicU64::new(0));
@@ -1883,8 +2001,13 @@ async fn one_resume_lets_a_held_job_go_paused_or_not() {
         }
         resume_disk_held_job(&mut pipeline);
         assert!(
+            disk_held(&pipeline, JOB),
+            "a resume while short lets nothing go (paused: {paused})"
+        );
+        hears(&mut pipeline, &room, StorageRoot::Complete, 60 * UNIT);
+        assert!(
             !disk_held(&pipeline, JOB),
-            "one resume lets it go (paused: {paused})"
+            "the room it waits for lets it go (paused: {paused})"
         );
     }
 }
@@ -1944,12 +2067,15 @@ async fn a_job_held_for_a_full_disk_keeps_only_the_spooled_parts_its_checkpoint_
     // A reading that shows them, or them and nine bytes more, lets nothing
     // go; one that shows the ten over them does.
     assert_eq!(full_disk_mark(&pipeline), Some(RESERVE + PLENTY));
+    let before = working(&pipeline).promised();
+    let start = full_disk_start_promise(&pipeline);
     hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY + 5);
-    assert_eq!(promised_bytes(&pipeline), 0);
+    assert_eq!(working(&pipeline).promised(), before);
     hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY + 14);
-    assert_eq!(promised_bytes(&pipeline), 0);
+    assert_eq!(working(&pipeline).promised(), before);
     hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY + 15);
-    assert_eq!(promised_bytes(&pipeline), 10);
+    // What it has left to fetch is promised to its start.
+    assert_eq!(working(&pipeline).promised(), before + start);
 
     assert!(
         named.exists(),
@@ -2352,3 +2478,123 @@ async fn a_job_outside_the_pipeline_and_a_pipeline_job_waiting_wake_in_ticket_or
 }
 
 include!("disk_wait_move.rs");
+
+// A job held on one disk, let go, and held again on another waits for more
+// than that other disk showed, whatever the first one did.
+#[tokio::test]
+async fn a_second_wait_on_another_disk_takes_that_disks_figure() {
+    let room = Arc::new(AtomicU64::new(0));
+    let body = payload(4 * ARTICLE, 151);
+    let scenario = on_disk_posting(&room, vec![Post::plain("ember.bin", body.clone())]);
+    let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
+
+    // The output disk shows little, the working disk much.
+    hears(&mut pipeline, &room, StorageRoot::Complete, 0);
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, 2 * PLENTY);
+    fill_after(Some(ARTICLE as u64 + ARTICLE as u64 / 2));
+    until_full(&mut pipeline, &scenario).await;
+    assert_eq!(full_disk_mark(&pipeline), Some(RESERVE + 2 * PLENTY));
+
+    fill_after(None);
+    resume_disk_held_job(&mut pipeline);
+    restarts(&mut pipeline).await;
+
+    // Its next write fails on the output disk, which still shows little.
+    room.store(0, Ordering::Release);
+    hold_on_root(&mut pipeline, StorageRoot::Complete);
+    assert_eq!(
+        full_disk_mark(&pipeline),
+        Some(RESERVE),
+        "the wait has its own disk's figure to beat"
+    );
+    park_disk_held_jobs(&mut pipeline);
+    old_graph_heard(&mut pipeline).await;
+    hears(&mut pipeline, &room, StorageRoot::Complete, 0);
+    assert!(full_disk_held(&pipeline));
+    hears(&mut pipeline, &room, StorageRoot::Complete, PLENTY);
+    assert!(
+        !full_disk_held(&pipeline),
+        "more than the output disk showed lets it go"
+    );
+}
+
+// With nothing kept free, a few bytes freed on a full disk do not let a
+// held download go: it waits for the room of what was left of the file it
+// was writing, over what the disk showed as the write failed.
+#[tokio::test]
+async fn a_held_download_waits_for_the_room_of_what_was_left_of_its_file() {
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let (_temp_dir, mut pipeline, scenario, complete_dir, body, left) =
+        held_with_a_file_part_written(&room, 0, 151).await;
+    assert_eq!(full_disk_mark(&pipeline), Some(PLENTY));
+    assert_eq!(full_disk_rise(&pipeline), (Some(left), false));
+    let before = working(&pipeline).promised();
+    let start = full_disk_start_promise(&pipeline);
+
+    // Another program removed a small file, a few bytes where the file
+    // has more than an article left: that much more shows.
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY + 4);
+    assert_full_disk_held(&pipeline);
+    // One byte short of what was left.
+    hears(
+        &mut pipeline,
+        &room,
+        StorageRoot::Intermediate,
+        PLENTY + left - 1,
+    );
+    assert_full_disk_held(&pipeline);
+    assert_eq!(full_disk_mark(&pipeline), Some(PLENTY), "the mark stands");
+
+    // The room of what was left shows: the job goes on, and what it was
+    // let go on is promised to it.
+    fill_after(None);
+    hears(
+        &mut pipeline,
+        &room,
+        StorageRoot::Intermediate,
+        PLENTY + left,
+    );
+    // What it has left to fetch is promised to its start.
+    assert_eq!(working(&pipeline).promised(), before + start);
+    restarts(&mut pipeline).await;
+    finish_disk_job(&mut pipeline, &scenario).await;
+    assert_eq!(status(&pipeline), Some(JobStatus::Complete));
+    assert_eq!(
+        file_named(&delivered(&complete_dir), "ember.bin"),
+        body.as_slice()
+    );
+}
+
+// With free space kept, a held download goes on only when both hold: the
+// disk shows the room of what was left over the mark, and more than the
+// reserve is free to spend.
+#[tokio::test]
+async fn a_held_download_with_a_reserve_waits_for_the_rise_and_the_reserve() {
+    let room = Arc::new(AtomicU64::new(0));
+    let (_temp_dir, mut pipeline, scenario, complete_dir, body, left) =
+        held_with_a_file_part_written(&room, RESERVE, 157).await;
+    assert_eq!(full_disk_mark(&pipeline), Some(RESERVE));
+
+    // A start needs the rise and room for what is left past the reserve.
+    let go = full_disk_start_need(&pipeline).max(left);
+    // More than the reserve is free, the rise is short by a byte.
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, left - 1);
+    assert_full_disk_held(&pipeline);
+    // The rise shows, and all of it is promised to another job: no more
+    // than the reserve is free to spend.
+    working(&pipeline).promise(go);
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, go);
+    assert_full_disk_held(&pipeline);
+
+    // Both hold.
+    working(&pipeline).release(go);
+    fill_after(None);
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, go);
+    restarts(&mut pipeline).await;
+    finish_disk_job(&mut pipeline, &scenario).await;
+    assert_eq!(status(&pipeline), Some(JobStatus::Complete));
+    assert_eq!(
+        file_named(&delivered(&complete_dir), "ember.bin"),
+        body.as_slice()
+    );
+}

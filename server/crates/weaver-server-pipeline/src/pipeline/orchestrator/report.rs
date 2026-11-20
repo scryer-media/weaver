@@ -359,6 +359,8 @@ impl Pipeline {
             metadata: state.spec.metadata.clone(),
             output_dir: Some(state.working_dir.display().to_string()),
             server_attribution: state.server_attribution.contributions().to_vec(),
+            disk_need_bytes: None,
+            disk_free_bytes: None,
             created_at_epoch_ms: state.created_at_epoch_ms,
         })
     }
