@@ -215,3 +215,18 @@ pub fn walked_verdict(pipeline: &Pipeline) -> Option<String> {
 pub fn kept_verdict(pipeline: &mut Pipeline) -> Option<String> {
     pipeline.post_health_verdict(JOB)
 }
+
+// Whether the post's health verdict is held on first articles still to come.
+pub fn verdict_held(pipeline: &Pipeline) -> bool {
+    pipeline.post_probes.held.contains(&JOB)
+}
+
+// Whether a lost article of the job is still known after a restart: the
+// files that lost one, as the feed holds them.
+pub fn files_with_losses(pipeline: &Pipeline) -> Vec<u32> {
+    pipeline
+        .given_up
+        .get(&JOB)
+        .map(|given_up| given_up.missing_files().collect())
+        .unwrap_or_default()
+}

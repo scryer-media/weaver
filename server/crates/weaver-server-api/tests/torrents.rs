@@ -348,6 +348,20 @@ async fn one_torrent_reads_only_what_the_query_selects() {
     // The save path alone still reads the files it is made from.
     let saved = read(format!("{{ torrent(id: {id}) {{ savePath }} }}")).await;
     assert_eq!(saved["savePath"], full["savePath"]);
+    // And a list's save path is the one torrent's, whether or not the list
+    // selects the files: a torrent of one file saves in its folder.
+    for query in [
+        "{ torrents { savePath } }",
+        "{ torrents { savePath files { path } } }",
+    ] {
+        let response = rig.execute(query).await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        let listed = response.data.into_json().unwrap();
+        assert_eq!(
+            listed["torrents"][0]["savePath"], full["savePath"],
+            "{query}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

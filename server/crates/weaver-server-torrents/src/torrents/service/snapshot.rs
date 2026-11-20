@@ -50,12 +50,20 @@ pub struct TorrentRow {
     pub listed: u64,
     /// The revision at which any of its fields last moved.
     pub moved: u64,
+    /// The revision at which its files last moved where nothing a list
+    /// shows did: what one torrent's follower reads beside `moved`.
+    pub files_moved: u64,
     // The view's prints, its tags left out, with the totals: so the tags
     // alone can move the row.
     steady: u64,
     whole: u64,
-    // The stamp of the reading its view came from, and of the one its tags
-    // came from.
+}
+
+// The stamps of the reading a row's view came from, and of the one its tags
+// came from: kept beside the rows, so a reading that finds a row unchanged
+// records that it read it without building the row again.
+#[derive(Debug, Clone, Copy, Default)]
+struct Stamps {
     read: u64,
     tagged: u64,
 }
@@ -113,10 +121,9 @@ impl TorrentRow {
             trackers: TrackerSummary::of(view),
             listed: 0,
             moved: 0,
+            files_moved: 0,
             steady,
             whole,
-            read: 0,
-            tagged: 0,
         }
     }
 
@@ -185,6 +192,8 @@ struct Rows {
     // The torrents gone, each with the stamp of the reading that found it
     // gone: a reading older than that does not bring it back.
     gone: HashMap<JobId, u64>,
+    // Each row's stamps.
+    stamps: HashMap<JobId, Stamps>,
     sums: RowSums,
 }
 
@@ -346,9 +355,9 @@ impl Snapshot {
         // A row a newer reading put is not one this reading missed.
         let gone: Vec<JobId> = rows
             .rows
-            .iter()
-            .filter(|(job_id, row)| !seen.contains_key(job_id) && row.read < stamp)
-            .map(|(job_id, _)| *job_id)
+            .keys()
+            .filter(|job_id| !seen.contains_key(job_id) && rows.stamps_of(**job_id).read < stamp)
+            .copied()
             .collect();
         for job_id in gone {
             moved |= rows.take(job_id, next, stamp);
@@ -371,30 +380,50 @@ impl Snapshot {
         self.settle(rows, moved);
     }
 
+    /// `job_id`'s files moved where nothing its row shows did (a file's
+    /// level): its row is marked for one torrent's followers alone, and no
+    /// list reads it as moved.
+    pub fn files_moved(&self, job_id: JobId) {
+        let mut rows = self.write();
+        let next = rows.revision + 1;
+        let Some(row) = rows.rows.get(&job_id) else {
+            return;
+        };
+        let mut row = TorrentRow::clone(row);
+        row.files_moved = next;
+        rows.rows.insert(job_id, Arc::new(row));
+        self.settle(rows, true);
+    }
+
     // Each row's tags as `tags_of` gives them; `stamp` is the one taken
     // before the tags were read.
     pub fn retag(&self, tags_of: impl Fn(JobId) -> Vec<String>, stamp: u64) {
         let mut rows = self.write();
         let next = rows.revision + 1;
-        let changed: Vec<(JobId, Vec<String>)> = rows
-            .rows
-            .iter()
-            .filter_map(|(job_id, row)| {
+        // Each row's tags as read, unless a newer reading set them; the
+        // stamp of this one is kept for every row it read, changed or not.
+        let mut changed: Vec<(JobId, Vec<String>)> = Vec::new();
+        {
+            let rows = &mut *rows;
+            for (job_id, row) in &rows.rows {
+                let stamps = rows.stamps.entry(*job_id).or_default();
+                if stamps.tagged > stamp {
+                    continue;
+                }
+                stamps.tagged = stamp;
                 let tags = tags_of(*job_id);
-                (tags != row.view.tags).then_some((*job_id, tags))
-            })
-            .collect();
+                if tags != row.view.tags {
+                    changed.push((*job_id, tags));
+                }
+            }
+        }
         let moved = !changed.is_empty();
         for (job_id, tags) in changed {
             let Some(row) = rows.rows.get(&job_id) else {
                 continue;
             };
-            if row.tagged > stamp {
-                continue;
-            }
             let mut row = TorrentRow::clone(row);
             row.view.tags = tags;
-            row.tagged = stamp;
             rows.moved.remove(&(row.moved, job_id));
             row.listed = next;
             row.moved = next;
@@ -431,13 +460,12 @@ impl Rows {
     // Tags a newer reading set stay. Whether it was put.
     fn put(&mut self, view: &TorrentView, totals: FileTotals, next: u64, stamp: u64) -> bool {
         let job_id = view.job_id;
-        let before = self.rows.get(&job_id).cloned();
-        if before.as_ref().is_some_and(|row| row.read > stamp)
-            || self.gone.get(&job_id).is_some_and(|gone| *gone > stamp)
-        {
+        let stamps = self.stamps_of(job_id);
+        if stamps.read > stamp || self.gone.get(&job_id).is_some_and(|gone| *gone > stamp) {
             return false;
         }
-        let tagged = before.as_ref().filter(|row| row.tagged > stamp);
+        let before = self.rows.get(&job_id).cloned();
+        let tagged = before.as_ref().filter(|_| stamps.tagged > stamp);
         let retagged;
         let view = match tagged {
             Some(row) if row.view.tags != view.tags => {
@@ -449,6 +477,17 @@ impl Rows {
             }
             _ => view,
         };
+        // The reading is newer than any the row came from, whether or not
+        // the row moved: an older reading that lands later does not set it.
+        let kept = Stamps {
+            read: stamp,
+            tagged: if tagged.is_some() {
+                stamps.tagged
+            } else {
+                stamp
+            },
+        };
+        self.stamps.insert(job_id, kept);
         let prints = prints(view, totals);
         let listed = match &before {
             Some(row) if row.view.tags != view.tags => next,
@@ -459,8 +498,7 @@ impl Rows {
         let mut row = TorrentRow::of(view, totals, prints);
         row.listed = listed;
         row.moved = next;
-        row.read = stamp;
-        row.tagged = tagged.map_or(stamp, |row| row.tagged);
+        row.files_moved = before.as_ref().map_or(0, |row| row.files_moved);
         if let Some(before) = before {
             self.moved.remove(&(before.moved, job_id));
             self.order.remove(&before.place());
@@ -473,13 +511,19 @@ impl Rows {
         true
     }
 
+    // The stamps `job_id`'s row was read at; none for a torrent with no row.
+    fn stamps_of(&self, job_id: JobId) -> Stamps {
+        self.stamps.get(&job_id).copied().unwrap_or_default()
+    }
+
     // The row of `job_id` taken out at revision `next`, unless a reading
     // newer than `stamp` set it. Whether there was one.
     fn take(&mut self, job_id: JobId, next: u64, stamp: u64) -> bool {
-        if self.rows.get(&job_id).is_some_and(|row| row.read > stamp) {
+        if self.stamps_of(job_id).read > stamp {
             return false;
         }
         self.went(job_id, stamp);
+        self.stamps.remove(&job_id);
         let Some(row) = self.rows.remove(&job_id) else {
             return false;
         };
@@ -495,11 +539,18 @@ impl Rows {
     fn went(&mut self, job_id: JobId, stamp: u64) {
         let gone = self.gone.entry(job_id).or_default();
         *gone = (*gone).max(stamp);
+        // Past the number kept, the older half goes, ordered by stamp and
+        // then by id: torrents found gone by one reading share a stamp, and
+        // the id parts them, so each pruning halves the map.
         if self.gone.len() > GONE_KEPT {
-            let mut stamps: Vec<u64> = self.gone.values().copied().collect();
+            let mut stamps: Vec<(u64, JobId)> = self
+                .gone
+                .iter()
+                .map(|(job_id, gone)| (*gone, *job_id))
+                .collect();
             let (_, half, _) = stamps.select_nth_unstable(GONE_KEPT / 2);
             let half = *half;
-            self.gone.retain(|_, gone| *gone >= half);
+            self.gone.retain(|job_id, gone| (*gone, *job_id) >= half);
         }
     }
 

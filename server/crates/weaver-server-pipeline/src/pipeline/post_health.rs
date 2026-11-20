@@ -1569,6 +1569,27 @@ impl Pipeline {
         }
     }
 
+    // A job came back with articles a run before it lost. Its post is
+    // weighed once on them, as each loss weighed it then: a verdict held
+    // then is held again, so the first articles it waited for weigh it as
+    // they arrive, and a verdict now due is given.
+    pub(in crate::pipeline) fn post_restored(&mut self, job_id: JobId) {
+        if !self
+            .jobs
+            .get(&job_id)
+            .is_some_and(|state| state.status.in_progress())
+            || !self
+                .given_up
+                .get(&job_id)
+                .is_some_and(|given_up| given_up.missing_files().next().is_some())
+        {
+            return;
+        }
+        if let Some(error) = self.post_health_verdict(job_id) {
+            self.stop_feeding_post(job_id, error);
+        }
+    }
+
     // An article of the post arrived. When the post's health verdict is
     // held and the article is its file's first, the post is weighed again:
     // that file may have bound as recovery, or was the last the hold waited

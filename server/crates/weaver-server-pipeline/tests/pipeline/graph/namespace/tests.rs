@@ -264,6 +264,51 @@ impl Object for Late {
     }
 }
 
+// A pretend 7z that keeps its volume whole, every byte in envelope 0 at the
+// volume's own offset, as an engine keeps its volumes. It says nothing; it
+// only hears each delivery, as `WHOLE_HEARD` records.
+struct Whole;
+
+thread_local! {
+    static WHOLE_HEARD: std::cell::RefCell<Vec<(ByteRange, Provenance)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl Object for Whole {
+    fn unposted(&mut self, _: weaver_graph::VolumeIndex, _: weaver_graph::ByteRange) {}
+
+    fn kind(&self) -> Kind {
+        Kind::SevenZipStore
+    }
+
+    fn deliver(
+        &mut self,
+        delivery: Delivery<'_>,
+        _: &mut dyn FnMut(&weaver_graph::Placement, &mut Vec<u8>) -> bool,
+        _: &mut Vec<Emit>,
+    ) {
+        let range = ByteRange::at(delivery.offset, delivery.bytes.len() as u64);
+        WHOLE_HEARD.with_borrow_mut(|heard| heard.push((range, delivery.provenance)));
+    }
+
+    fn volume_closed(&mut self, _: VolumeIndex, _: &mut Vec<Emit>) {}
+    fn volume_lost(&mut self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Emit>) {}
+    fn wants(&self, _: &mut Vec<Seek>) {}
+    fn pulled(&mut self, _: Seek, _: Pull, _: &mut Vec<Emit>) {}
+
+    fn locate(&self, _: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
+        out.push(Placement::Envelope { envelope: 0, range });
+    }
+
+    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) -> Located {
+        Located::Never
+    }
+
+    fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
+        None
+    }
+}
+
 // Builds the pretend store, and the pretend recovery set with the job's
 // record of what it was fed and the fix it makes when asked to repair.
 struct Build {
@@ -273,6 +318,8 @@ struct Build {
     inner_name: &'static str,
     checksum_on_repair: Option<u32>,
     heard: Arc<Mutex<Vec<u64>>>,
+    // A 7z is `Whole` rather than `Late`.
+    whole: bool,
 }
 
 impl Builder for Build {
@@ -284,6 +331,7 @@ impl Builder for Build {
                 length: self.inner,
                 checksum_on_repair: self.checksum_on_repair,
             })),
+            Kind::SevenZipStore if self.whole => Some(Box::new(Whole)),
             Kind::SevenZipStore => Some(Box::new(Late::new())),
             Kind::Xz => Some(Box::new(streams::Decoded::new(Arc::clone(&self.heard)))),
             Kind::Par2 => Some(Box::new(Par {
@@ -577,6 +625,7 @@ struct Job {
     // What every pretend stream had been delivered each time it heard its
     // volume closed.
     heard: Arc<Mutex<Vec<u64>>>,
+    whole: bool,
     out: Vec<Effect>,
 }
 
@@ -584,12 +633,15 @@ impl Job {
     fn new(budgets: HoldBudgets) -> Self {
         let dir = tempfile::tempdir().expect("temp dir");
         let accountant = Arc::new(HoldsAccountant::new(budgets));
-        let writer = NamespaceWriter::new(
+        let mut writer = NamespaceWriter::new(
             1,
             dir.path().to_path_buf(),
             Arc::clone(&accountant),
             CapacityReader::unknown(),
         );
+        // These tests drive how the moves run once they may: the job here
+        // has reached its delivery.
+        writer.deliver_names();
         Self {
             dir,
             tree: Tree::new(),
@@ -601,6 +653,7 @@ impl Job {
             inner_name: "inner.bin",
             checksum_on_repair: None,
             heard: Arc::default(),
+            whole: false,
             out: Vec::new(),
         }
     }
@@ -676,6 +729,7 @@ impl Job {
             inner_name: self.inner_name,
             checksum_on_repair: self.checksum_on_repair,
             heard: Arc::clone(&self.heard),
+            whole: self.whole,
         }
     }
 
@@ -694,6 +748,7 @@ impl Job {
     // records what is wanted, and its commit runs the moves it covers and
     // frees the names they left.
     fn commit(&mut self) {
+        self.writer.deliver_names();
         while self.writer.moves_waiting() {
             let stamp = self.writer.committed + 1;
             self.writer.recorded(stamp);

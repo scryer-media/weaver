@@ -459,8 +459,9 @@ fn moved_by_a_public_tracker(endpoint: Option<IpAddr>, addrs: &[IpAddr]) -> bool
 /// goes only where [`reach`] lets it. A redirect is a GET of where it
 /// points, reached the same way before it is sent, at most
 /// [`MAX_REDIRECTS`] of them; past that the redirect is the answer. A hop
-/// answered at a public address (see [`moved_by_a_public_tracker`]) moves
-/// the GET to public addresses only,
+/// answered at a public address (see [`moved_by_a_public_tracker`]), or
+/// one whose name was resolved at the network's exit, moves the GET to
+/// public addresses only,
 /// as a tracker that came with the torrent is held, whoever named the
 /// first. The answer fails when the tracker sends nothing for
 /// [`RECEIVE_TIMEOUT`], the status is not a success, or the body passes
@@ -514,8 +515,12 @@ pub(crate) async fn get(
         url = url
             .join(location)
             .context("the tracker redirected to no URL")?;
+        // A hop whose name was resolved where the session's network exits
+        // was answered at an address nothing here knows: the operator's
+        // trust stays with what was looked up here, and the redirect is
+        // held as a tracker that came with the torrent is.
         let endpoint = response.remote_addr().map(|a| a.ip());
-        if moved_by_a_public_tracker(endpoint, &addrs) {
+        if addrs.is_empty() || moved_by_a_public_tracker(endpoint, &addrs) {
             named_by = NamedBy::Torrent;
         }
         redirects += 1;

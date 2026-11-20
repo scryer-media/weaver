@@ -383,7 +383,7 @@ impl TorrentService {
             .inner
             .rules
             .write()
-            .unwrap_or_else(PoisonError::into_inner) = Arc::from(rules);
+            .unwrap_or_else(PoisonError::into_inner) = Arc::new(super::live::Rules::new(rules));
         Ok(())
     }
 

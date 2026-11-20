@@ -797,6 +797,21 @@ async fn tracker_edits_outlive_a_restart() {
             .await,
         Err(ActionError::Invalid(_))
     ));
+    // Its error names no passkey: the tracker shows as scheme, host and
+    // port, or not at all when it is no URL.
+    for named in [
+        "https://tracker.example:bad/announce?passkey=secret",
+        "https://user:secret@/announce",
+    ] {
+        let Err(ActionError::Invalid(said)) = rig
+            .service
+            .add_trackers(job_id, vec![vec![named.into()]])
+            .await
+        else {
+            panic!("{named} was taken");
+        };
+        assert!(!said.contains("secret"), "{said}");
+    }
     assert_eq!(
         rig.service
             .add_trackers(JobId(9_999), vec![vec![b.into()]])
@@ -996,6 +1011,15 @@ async fn a_reannounce_reaches_the_tracker_now() {
             .await,
         Err(ActionError::Invalid(_))
     ));
+    // Nor does one naming a tracker the torrent does not list.
+    assert_eq!(
+        rig.service
+            .reannounce_tracker(job_id, "http://other.invalid/announce?passkey=secret")
+            .await,
+        Err(ActionError::Invalid(
+            "no tracker http://other.invalid:80/…".to_owned()
+        ))
+    );
     rig.service.reannounce_tracker(job_id, &url).await.unwrap();
     let mut once_more = heard_announce(&listener).await;
     once_more.write_all(&answer).await.unwrap();

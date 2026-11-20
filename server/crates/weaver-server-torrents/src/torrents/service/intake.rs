@@ -278,6 +278,15 @@ pub fn parse(bytes: &[u8]) -> Result<Parsed, AddError> {
     metainfo::parse(bytes).map_err(AddError::Invalid)
 }
 
+// `parse` off the runtime: a large metainfo's decode and hashing are work
+// for a blocking thread, not for the task that awaits it.
+async fn parse_off(bytes: &Bytes) -> Result<Parsed, AddError> {
+    let bytes = bytes.clone();
+    tokio::task::spawn_blocking(move || parse(&bytes))
+        .await
+        .map_err(|error| AddError::State(error.to_string()))?
+}
+
 // A magnet's metadata fetch on its route's session, for the run that
 // follows it: the session, the identity its trackers heard `started` under,
 // and its tracker task.
@@ -450,7 +459,7 @@ impl TorrentService {
         match request.source.clone() {
             AddSource::Metainfo(bytes) => {
                 let bytes = Bytes::from(bytes);
-                let parsed = parse(&bytes)?;
+                let parsed = parse_off(&bytes).await?;
                 let left_out = self.admit(&parsed.manifest)?;
                 self.duplicate(parsed.hashes)?;
                 let (settings, category) = self.made(settings, category).await?;
@@ -1080,7 +1089,7 @@ impl TorrentService {
         selected: &[FilePriority],
         fetched: Option<Fetched>,
     ) -> Result<(), AddError> {
-        let parsed = parse(&bytes)?;
+        let parsed = parse_off(&bytes).await?;
         let left_out = self.admit(&parsed.manifest)?;
         let settings = self.settings();
         let Some(record) = self

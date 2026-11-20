@@ -9,7 +9,6 @@
 
 use super::*;
 use crate::post_processing::model::{QueueEvent, vars};
-use crate::settings::model::TrackerRule;
 use crate::settings::{Seeding, SeedingAction};
 use crate::torrents::persistence::TorrentsPersistenceInsertPlacedTorrentInternalQueries;
 use crate::torrents::persistence::TorrentsPersistenceInsertTorrentQueries;
@@ -26,7 +25,7 @@ use std::sync::PoisonError;
 
 fn old_goal_met(
     settings: &TorrentSettings,
-    rules: &[TrackerRule],
+    rules: &super::live::Rules,
     torrent: &Live,
     now: i64,
 ) -> Option<Seeding> {

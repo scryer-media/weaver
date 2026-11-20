@@ -587,6 +587,10 @@ pub struct Scenario {
     pub article: usize,
     // Every batch the download queue hands out is served last article first.
     pub backwards: bool,
+    // After each article served, every word the run owes is heard before
+    // the next article: each checkpoint a step waits on commits between
+    // arrivals, as on a database that commits faster than articles land.
+    pub settle: bool,
     // Every handout is this many articles at once, served in the order the
     // queue handed them out, as that many workers fetching side by side
     // land; none is one at a time.
@@ -663,6 +667,7 @@ impl Scenario {
             global_passwords: Vec::new(),
             article: ARTICLE,
             backwards: false,
+            settle: false,
             batch: 0,
             together: Vec::new(),
             reversed: Vec::new(),
@@ -872,6 +877,13 @@ impl Scenario {
     // Whatever the download queue hands out at once arrives in reverse.
     pub fn backwards(mut self) -> Self {
         self.backwards = true;
+        self
+    }
+
+    // Every checkpoint a step waits on commits before the next article: see
+    // `settle`.
+    pub fn settled(mut self) -> Self {
+        self.settle = true;
         self
     }
 
@@ -1155,6 +1167,13 @@ impl GraphView {
         )
     }
 
+    // The writes the job's checkpoints took that changed a member's output
+    // name or the name its file sits at, and the member rows they changed
+    // so, at the last look.
+    pub fn naming_writes(&self) -> (usize, usize) {
+        (self.checkpoints.naming_writes, self.checkpoints.naming_rows)
+    }
+
     pub fn checkpoint_debug(&self) -> &impl std::fmt::Debug {
         &self.checkpoints
     }
@@ -1381,6 +1400,17 @@ async fn try_run_then(
                 .await;
                 hear_probe(&mut pipeline).await;
                 observe(&pipeline, &mut graph, &mut reads);
+                while scenario.settle
+                    && (pipeline
+                        .graph_jobs
+                        .get(&JOB)
+                        .is_some_and(|job| job.awaits_mail())
+                        || pipeline.moves_awaiting_disk.contains_key(&JOB))
+                {
+                    let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
+                    pipeline.graph_run_said(said);
+                    observe(&pipeline, &mut graph, &mut reads);
+                }
             }
         }
         if finished(&pipeline) {

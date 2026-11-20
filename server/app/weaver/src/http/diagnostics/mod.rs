@@ -231,7 +231,12 @@ async fn collect_components(
 
     // The table is read beside the collection, from its start, so the ten
     // seconds between the Prometheus samples are the read's too.
-    let read = Arc::new(stored_read::NameRead::new());
+    // It takes the queue's names when it begins, so a job that leaves the
+    // queue before its page is read is still known.
+    let read = Arc::new(stored_read::NameRead::new().with_queue({
+        let handle = handle.clone();
+        move || handle.diagnostic_queue_names()
+    }));
     let read_deadline = tokio::time::Instant::now() + STORED_NAMES_WAIT;
     let reader = {
         let db = db.clone();
@@ -347,8 +352,10 @@ async fn collect_components(
         disk_space.volume_labels(),
     );
     // The read gets until its deadline; what it read by then is the table,
-    // and memory covers the rest. A job added during the collection is not
-    // in the read, so memory names it and the guard covers its files.
+    // and memory covers the rest. A job that joined or left the queue
+    // during the collection is not in the read: memory names it where it
+    // can, and the guard covers it. A job in no list has no names in the
+    // table, and every line naming it is left out.
     let _ = tokio::time::timeout_at(read_deadline, reader).await;
     let state = read.finish();
     let memory = stored_read::MemoryNames::current(handle, config).await;

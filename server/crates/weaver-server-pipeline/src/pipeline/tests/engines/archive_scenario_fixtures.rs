@@ -345,6 +345,14 @@ pub mod sets {
         (tally.moves, tally.waiting_opens)
     }
 
+    // How many times, on this thread, the ledger named again a member that
+    // has a file.
+    pub fn namespace_rename_count() -> u64 {
+        crate::pipeline::graph::namespace::TALLY
+            .with(std::cell::Cell::get)
+            .renamed
+    }
+
     use super::super::harness::Outcome;
     use std::collections::BTreeMap;
 

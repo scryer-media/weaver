@@ -16,6 +16,7 @@ mod pipeline {
             };
             mod classic_streams;
             mod delivery;
+            mod misnamed_described;
             mod rar_engine;
             mod renamed_sets;
             mod streams;

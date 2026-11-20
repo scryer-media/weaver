@@ -63,6 +63,12 @@ pub trait RootJob {
     // What the namespace `node` came out of, at some depth, a recovery set
     // proved (`Tree::vouched_above`). Never the root.
     fn vouched_above(&self, node: NodeId) -> bool;
+    // Every disagreement of the checking set `set`, below the root at
+    // `node`, is with an archive volume whose object delivered every member
+    // whole against its own CRC (`Tree::answered_below`).
+    fn answered_below(&self, _node: NodeId, _set: NodeId) -> bool {
+        false
+    }
     // Run every recovery object of the root namespace.
     fn repair(&mut self) -> Vec<RepairOutcome>;
     // An object below the root produced members.
@@ -74,6 +80,8 @@ pub trait RootJob {
     fn work_pending(&self) -> bool;
     // A member's file still waits to move to its name.
     fn moves_waiting(&self) -> bool;
+    // The job is ready to deliver: the files move to their names now.
+    fn deliver_names(&mut self);
 }
 
 // The job's own seams. GraphJob repairs inside its article path, once the
@@ -125,6 +133,10 @@ impl RootJob for GraphJob {
         self.tree().vouched_above(node)
     }
 
+    fn answered_below(&self, node: NodeId, set: NodeId) -> bool {
+        self.tree().answered_below(node, set)
+    }
+
     fn repair(&mut self) -> Vec<RepairOutcome> {
         RootJob::recovery_summary(self).outcomes()
     }
@@ -148,6 +160,10 @@ impl RootJob for GraphJob {
 
     fn moves_waiting(&self) -> bool {
         GraphJob::moves_waiting(self)
+    }
+
+    fn deliver_names(&mut self) {
+        GraphJob::deliver_names(self);
     }
 }
 
@@ -193,8 +209,12 @@ pub fn drive(job: &mut dyn RootJob, slots: &mut RepairSlots, asker: AskerId, lim
     match job.phase() {
         RootPhase::Extracting => Step::Wait,
         // The delivery takes every file from its name, so it waits for
-        // each file still moving there.
-        _ if job.moves_waiting() => Step::Wait,
+        // each file still moving there. Only now do the files move: each
+        // once, to the name the ledger settled on while the job downloaded.
+        _ if job.moves_waiting() => {
+            job.deliver_names();
+            Step::Wait
+        }
         _ => Step::Deliver,
     }
 }
@@ -211,7 +231,9 @@ pub fn drive(job: &mut dyn RootJob, slots: &mut RepairSlots, asker: AskerId, lim
 // Each set is judged in the namespace it lives
 // in, at whatever depth. An SFV in a namespace that came out of volumes a
 // set above proved makes no claim: what it lists is what was posted, and
-// its ruling fails nothing. A breach of the job's extraction budget fails the
+// its ruling fails nothing; nor does one below the root whose every
+// disagreement is with an archive volume whose object delivered every member
+// whole against the CRC its own headers state. A breach of the job's extraction budget fails the
 // job before any of that: it carries the budget's refusal, worded as the
 // job's failure reason, and names no object. When no set failed and the
 // feed gave the post up, the failure is the feed's, in its words.
@@ -282,7 +304,9 @@ pub fn failure(
         .filter_map(|(set, outcome)| match outcome {
             RepairOutcome::Impossible { damaged, reachable }
                 if !excused(set)
-                    && !(set.kind == Kind::Sfv && job.vouched_above(set.namespace)) =>
+                    && !(set.kind == Kind::Sfv
+                        && (job.vouched_above(set.namespace)
+                            || job.answered_below(set.namespace, set.node))) =>
             {
                 Some((*set, *damaged, *reachable))
             }

@@ -196,9 +196,11 @@ impl Refusing {
         }
     }
 
-    // The checkpoint `stamp`, taken of the job as it stands, has committed:
-    // a file waiting for it moves to its name.
+    // The job is ready to deliver and the checkpoint `stamp`, taken of the
+    // job as it stands, has committed: a file waiting for it moves to its
+    // name.
     fn checkpoint(&mut self, stamp: u64) {
+        self.job.deliver_names();
         self.job.recorded(stamp);
         self.job.committed(stamp).unwrap();
     }
@@ -366,7 +368,9 @@ async fn a_store_that_needs_an_engine_hands_its_volumes_to_one() {
         "one engine over both"
     );
     refusing.until_ended().await;
-    // Publication waits for the checkpoints that record the final names.
+    // Publication waits for the delivery and the checkpoints that record
+    // the final names.
+    refusing.job.deliver_names();
     let mut stamp = 1;
     while refusing.job.moves_waiting() {
         refusing.job.recorded(stamp);

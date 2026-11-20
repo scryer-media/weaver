@@ -1810,6 +1810,59 @@ async fn a_move_of_many_torrents_is_one_unit() {
     alone.service.stop().await;
 }
 
+// A move of many torrents whose request is dropped once it began still
+// moves them all and shows them where they went: the batch, its pass of
+// the queue and its publish run on their own task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_move_of_many_torrents_still_shows_them_moved() {
+    let rig = rig(set_clock());
+    rig.routes.set_down(Some("the leg is down"));
+    rig.service.open().await.unwrap();
+    let mut ids = Vec::new();
+    for n in 1..=3u8 {
+        let source = AddSource::Metainfo(plain(&format!("t{n}"), n));
+        ids.push(rig.service.add_opened(request(source)).await.unwrap());
+    }
+    rig.service.publish().await;
+    let last = *ids.last().unwrap();
+    let mut follow = rig.service.updates(last);
+    follow.next().await;
+    let elsewhere = rig.dir.path().join("elsewhere");
+    let to = elsewhere.to_string_lossy().into_owned();
+    {
+        let moving = rig.service.set_location_many_as(
+            weaver_server_auth::auth::CallerScope::Admin,
+            &ids,
+            &to,
+        );
+        let mut moving = std::pin::pin!(moving);
+        // Polled once, so begun, then dropped as a client that goes away
+        // drops it.
+        tokio::select! {
+            biased;
+            _ = &mut moving => {}
+            () = std::future::ready(()) => {}
+        }
+    }
+    loop {
+        let told = follow.next().await.torrents;
+        let view = &told[0];
+        let placed = view
+            .storage_dir
+            .as_deref()
+            .is_some_and(|dir| std::path::Path::new(dir).starts_with(&elsewhere));
+        if placed && view.state != TorrentState::Moving {
+            break;
+        }
+    }
+    for job_id in ids {
+        let view = rig.service.torrent(job_id).await.unwrap();
+        let dir = view.storage_dir.unwrap();
+        assert!(std::path::Path::new(&dir).starts_with(&elsewhere), "{dir}");
+    }
+    rig.service.stop().await;
+}
+
 // A removal of many torrents with their files reads what each made, and
 // what was there before it, for all of them in a few statements, not two
 // reads a torrent. What it deletes, keeps and stores is what the same

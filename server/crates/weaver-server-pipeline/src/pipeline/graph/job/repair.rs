@@ -338,8 +338,9 @@ impl GraphJob {
             || self.mail_owed.is_some()
             || self.works.stopping()
             || self.owes_checkpoint()
-            || self.moves_waiting()
-            || self.awaits_commit()
+            // A file's move waits for the delivery, and is out only once
+            // the job delivers: until then it is nothing a run waits on.
+            || self.writer.awaits_commit()
             || self.writer.disk_held()
             || self.writer.disk().is_some_and(|disk| !disk.quiet())
         {

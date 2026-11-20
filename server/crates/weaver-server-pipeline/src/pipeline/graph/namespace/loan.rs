@@ -987,7 +987,16 @@ impl Source for Lent {
         };
         // The file is read where the lent coverage tiles the range with runs
         // of any provenance, lost included: a lost run does not stop it.
-        taken.coverage.covered(range) && self.read_file((node, member), path, range, into)
+        // What is held for the member is not in its file, whatever length
+        // the file has: the hold gives those bytes, never the file.
+        let from = taken
+            .held
+            .partition_point(|(held, _)| held.end <= range.start);
+        let held = taken
+            .held
+            .get(from)
+            .is_some_and(|(held, _)| held.start < range.end);
+        taken.coverage.covered(range) && !held && self.read_file((node, member), path, range, into)
     }
 
     fn held(&self, node: NodeId, member: MemberId, range: ByteRange) -> Vec<(ByteRange, Location)> {

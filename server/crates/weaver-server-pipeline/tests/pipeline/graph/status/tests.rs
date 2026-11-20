@@ -108,6 +108,8 @@ impl RootJob for Prepared {
     fn moves_waiting(&self) -> bool {
         false
     }
+
+    fn deliver_names(&mut self) {}
 }
 
 // A member: its name, its length, and the runs it holds with how each came.

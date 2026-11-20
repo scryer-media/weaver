@@ -2,13 +2,15 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // A job that goes down around the first move a rename asks for. A file
-// moves only after the checkpoint that records the name it wants has
-// committed, so wherever the job goes down, the restore finds every file
-// at a name its checkpoint gives it, and fetches nothing it had on disk.
+// moves only once the job is ready to deliver, and then only after the
+// checkpoint that records the name it wants has committed, so wherever the
+// job goes down, the restore finds every file at a name its checkpoint gives
+// it, and fetches nothing it had on disk.
 
 use crate::jobs::graph_checkpoint::JobsGraphCheckpointInternalQueries;
 use std::sync::Arc;
 
+use super::archive_scenario_fixtures::sets::{namespace_move_counts, namespace_rename_count};
 use super::harness::{
     GraphView, JOB, Scenario, collect, finished, observe, run, serve_work, take_retry,
 };
@@ -32,9 +34,12 @@ pub enum Stop {
     // The checkpoint that records the name committed, and the moves it
     // lets run never ran.
     Committed,
-    // The moves ran until a file sat at `.0`, and the checkpoint that says
-    // so never committed.
+    // The job was ready to deliver, its moves ran until a file sat at
+    // `.0`, and the checkpoint that says so never committed.
     Moved(&'static str),
+    // The job was ready to deliver, `.0` of its files moved, and no
+    // checkpoint since the one taken as the delivery began committed.
+    Moves(u64),
     // As `Committed`, and the job comes back to a directory it never wrote
     // and cannot remove at `.0`, the name the file wants, so the move fails.
     Blocked(&'static str),
@@ -95,8 +100,11 @@ async fn rows(pipeline: &mut Pipeline) -> GraphCheckpoint {
 }
 
 // The database goes back to `rows`, as when every write after them was
-// lost.
-async fn lose_writes_after(pipeline: &Pipeline, rows: &GraphCheckpoint) {
+// lost. What the job holds and has not yet written goes the same way: it is
+// written first, so the restart that stops the job finds nothing left to
+// write over `rows`.
+async fn lose_writes_after(pipeline: &mut Pipeline, rows: &GraphCheckpoint) {
+    pipeline.flush_graph_checkpoint(JOB);
     pipeline.db.flush_write_queue().await.unwrap();
     let mut delta = Delta {
         whole: true,
@@ -119,9 +127,47 @@ pub fn waiting(rows: &MoveCheckpoint) -> Vec<(&str, &str)> {
         .collect()
 }
 
+thread_local! {
+    static STARTUP_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+// How many restores on this thread brought back a job with files waiting to
+// move and nothing left to fetch, each found queued for its check.
+pub fn startup_checks() -> u64 {
+    STARTUP_CHECKS.with(std::cell::Cell::get)
+}
+
+// When the job goes down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum At {
+    // After the first step that renamed a member of the root.
+    Rename,
+    // After the first step that renamed a member with a file, in any
+    // namespace.
+    AnyRename,
+    // At the first completion check that found the job ready to deliver,
+    // with files waiting to move.
+    Delivery,
+}
+
 // What a run that went down at `stop` came to, and the checkpoint it was
-// restored from.
+// restored from. A file moves only once the job is ready to deliver, so a
+// run that goes down once a file moved goes down then; any other goes down
+// at the first rename of a root member.
 pub async fn run_stopping(scenario: &Scenario, stop: Stop) -> (Restarted, MoveCheckpoint) {
+    let at = match stop {
+        Stop::Moved(_) | Stop::Moves(_) => At::Delivery,
+        _ => At::Rename,
+    };
+    run_stopping_at(scenario, stop, at).await
+}
+
+// As `run_stopping`, going down at `at`.
+pub async fn run_stopping_at(
+    scenario: &Scenario,
+    stop: Stop,
+    at: At,
+) -> (Restarted, MoveCheckpoint) {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) =
         new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
@@ -152,12 +198,13 @@ pub async fn run_stopping(scenario: &Scenario, stop: Stop) -> (Restarted, MoveCh
                 from_disk.insert(article);
             }
             let was = before(&mut pipeline, restored.as_ref()).await;
+            let renames = namespace_rename_count();
             serve_work(&mut pipeline, scenario, &work).await;
             observe(&pipeline, &mut graph, &mut reads);
             if finished(&pipeline) {
                 break;
             }
-            if let Some(was) = was.filter(|_| renamed(&pipeline, &mut seen)) {
+            if let Some(was) = was.filter(|_| renamed_at(at, &pipeline, &mut seen, renames)) {
                 // The article this step wrote is described by no
                 // checkpoint that commits: it is fetched again.
                 owed.insert(article);
@@ -166,7 +213,7 @@ pub async fn run_stopping(scenario: &Scenario, stop: Stop) -> (Restarted, MoveCh
                     pipeline,
                     scenario,
                     stop,
-                    was,
+                    (was, namespace_move_counts().0),
                     &mut owed,
                     &mut blocker,
                 )
@@ -180,13 +227,56 @@ pub async fn run_stopping(scenario: &Scenario, stop: Stop) -> (Restarted, MoveCh
             break;
         }
         let asked = requests.values().sum::<usize>();
+        let was = before(&mut pipeline, restored.as_ref()).await;
+        let renames = namespace_rename_count();
+        let moved_from = namespace_move_counts().0;
         if pipeline.jobs.contains_key(&JOB) {
             pipeline.check_job_completion(JOB).await;
+        }
+        if let Some(was) = was.clone().filter(|_| {
+            at == At::Delivery
+                && pipeline
+                    .graph_jobs
+                    .get(&JOB)
+                    .is_some_and(|job| job.delivering_names() && job.moves_waiting())
+        }) {
+            let (down, rows) = go_down(
+                &temp_dir,
+                pipeline,
+                scenario,
+                stop,
+                (was, moved_from),
+                &mut owed,
+                &mut blocker,
+            )
+            .await;
+            pipeline = down;
+            restored = Some(rows);
+            in_memory.extend(owed.iter().copied());
+            continue;
         }
         pump_pipeline_runtime_queues(&mut pipeline).await;
         observe(&pipeline, &mut graph, &mut reads);
         if finished(&pipeline) {
             break;
+        }
+        // The check and the queues it pumped step the job too: a rename
+        // there goes down as one in an article's step does.
+        if let Some(was) = was.filter(|_| renamed_at(at, &pipeline, &mut seen, renames)) {
+            let (down, rows) = go_down(
+                &temp_dir,
+                pipeline,
+                scenario,
+                stop,
+                (was, namespace_move_counts().0),
+                &mut owed,
+                &mut blocker,
+            )
+            .await;
+            pipeline = down;
+            restored = Some(rows);
+            in_memory.extend(owed.iter().copied());
+            continue;
         }
         if pipeline
             .graph_jobs
@@ -194,16 +284,17 @@ pub async fn run_stopping(scenario: &Scenario, stop: Stop) -> (Restarted, MoveCh
             .is_some_and(|job| job.awaits_mail())
         {
             let was = before(&mut pipeline, restored.as_ref()).await;
+            let renames = namespace_rename_count();
             let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
             pipeline.graph_run_said(said);
             observe(&pipeline, &mut graph, &mut reads);
-            if let Some(was) = was.filter(|_| renamed(&pipeline, &mut seen)) {
+            if let Some(was) = was.filter(|_| renamed_at(at, &pipeline, &mut seen, renames)) {
                 let (down, rows) = go_down(
                     &temp_dir,
                     pipeline,
                     scenario,
                     stop,
-                    was,
+                    (was, namespace_move_counts().0),
                     &mut owed,
                     &mut blocker,
                 )
@@ -265,6 +356,17 @@ async fn before(
     }
 }
 
+// Whether the step just taken is where the job goes down at `at`: the
+// ledger renamed a member, of the root, or of any namespace since the
+// writer's rename count read `renames`.
+fn renamed_at(at: At, pipeline: &Pipeline, seen: &mut BTreeMap<u32, String>, renames: u64) -> bool {
+    match at {
+        At::Rename => renamed(pipeline, seen),
+        At::AnyRename => namespace_rename_count() > renames,
+        At::Delivery => false,
+    }
+}
+
 // Whether a root member's output name changed since it was first seen:
 // the ledger renamed it.
 fn renamed(pipeline: &Pipeline, seen: &mut BTreeMap<u32, String>) -> bool {
@@ -285,19 +387,19 @@ fn renamed(pipeline: &Pipeline, seen: &mut BTreeMap<u32, String>) -> bool {
 }
 
 // The job goes down at `stop`, from the step whose rows before it were
-// `was`, and a new pipeline restores it. The rows it restored from.
+// `was`, with `moved_from` moves run then, and a new pipeline restores it. The rows it restored from.
 async fn go_down(
     temp_dir: &tempfile::TempDir,
     mut pipeline: Pipeline,
     scenario: &Scenario,
     stop: Stop,
-    was: GraphCheckpoint,
+    (was, moved_from): (GraphCheckpoint, u64),
     owed: &mut BTreeSet<(u32, u32)>,
     blocker: &mut Option<Unremovable>,
 ) -> (Pipeline, GraphCheckpoint) {
     let working_dir = pipeline.jobs[&JOB].working_dir.clone();
     match stop {
-        Stop::Uncommitted => lose_writes_after(&pipeline, &was).await,
+        Stop::Uncommitted => lose_writes_after(&mut pipeline, &was).await,
         Stop::Committed => {
             pipeline.db.flush_write_queue().await.unwrap();
         }
@@ -306,7 +408,12 @@ async fn go_down(
             *blocker = Some(Unremovable::at(working_dir.join(name)));
         }
         Stop::Moved(name) => {
-            let recorded = rows(&mut pipeline).await;
+            // Each move runs as the continuation of a commit, so each is
+            // heard in the run's mail; the job is ready to deliver, so every
+            // move is under way. The first can run inside the checkpoint the
+            // delivery takes: what records the moves is lost from the rows
+            // `was` holds, taken before the delivery began.
+            let recorded = was;
             while !working_dir.join(name).exists() {
                 let said = pipeline
                     .graph_runs
@@ -315,7 +422,31 @@ async fn go_down(
                     .expect("the commit is said");
                 pipeline.graph_run_said(said);
             }
-            lose_writes_after(&pipeline, &recorded).await;
+            lose_writes_after(&mut pipeline, &recorded).await;
+        }
+        Stop::Moves(moves) => {
+            // Each move runs once the checkpoint that records the move
+            // before it has committed, so what the database holds as the
+            // `moves`th move runs is every write before the mail that let
+            // it run; what records it is lost. The first move can run inside
+            // the checkpoint the delivery takes, before this is reached:
+            // the moves count from the rows `was` holds.
+            let mut committed = was;
+            while namespace_move_counts().0 - moved_from < moves {
+                pipeline.db.flush_write_queue().await.unwrap();
+                committed = pipeline
+                    .db
+                    .load_graph_checkpoint(JOB)
+                    .unwrap()
+                    .expect("a checkpoint committed");
+                let said = pipeline
+                    .graph_runs
+                    .recv()
+                    .await
+                    .expect("the commit is said");
+                pipeline.graph_run_said(said);
+            }
+            lose_writes_after(&mut pipeline, &committed).await;
         }
     }
     let mut seen = None;
@@ -323,6 +454,23 @@ async fn go_down(
         seen = Some(rows.clone());
     })
     .await;
+    // A job restored with files waiting to move and nothing left to fetch
+    // hears no article that would check it: the restore itself queues the
+    // check that delivers it, as for every job it restores.
+    if pipeline
+        .graph_jobs
+        .get(&JOB)
+        .is_some_and(|job| job.moves_waiting() && !job.delivering_names())
+        && !pipeline.jobs[&JOB].articles.has_queued_download_work()
+    {
+        STARTUP_CHECKS.with(|checks| {
+            checks.set(checks.get() + 1);
+        });
+        assert!(
+            pipeline.pending_completion_checks.contains(&JOB),
+            "the restore checks a job with nothing left to fetch"
+        );
+    }
     (pipeline, seen.expect("the restore read a checkpoint"))
 }
 

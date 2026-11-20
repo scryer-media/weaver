@@ -247,6 +247,17 @@ lto = "thin"
 codegen-units = 16
 debug-assertions = true
 
+# Pull-request builds on macOS and Windows: they only prove the tree compiles
+# and links, and the binaries are never shipped.
+[profile.ci-throwaway]
+inherits = "release"
+opt-level = 1
+lto = false
+codegen-units = 256
+debug = 0
+strip = false
+incremental = false
+
 # Tests run without debug assertions: the suite proves behaviour, and the
 # assertions cost build and run time on every nextest run, in CI and locally.
 [profile.test]

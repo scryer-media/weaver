@@ -2,12 +2,16 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // Where a member's file sits, and when it moves. A member the ledger names
-// again keeps its file where it is: the name it wants is an intent, which
-// the next checkpoint records beside the name the file sits at. Only once
-// that checkpoint has committed does the file move, as the continuation of
-// the commit, so a crash at any moment leaves the database naming a place
-// the file is: where it sat, or, when the move ran before the next
-// checkpoint said so, the name the database already says it wants.
+// again keeps its file where it is: the name it wants is an intent, held in
+// memory and recorded by the next checkpoint taken, beside the name the file
+// sits at. The ledger may name a member many times while its job downloads;
+// the file moves once, when the job is ready to deliver (`deliver_names`),
+// to the name the ledger gives it then. No move hurries a checkpoint before
+// that. From then on a move runs once the checkpoint that records it has
+// committed, as the continuation of the commit, so a crash at any moment
+// leaves the database naming a place the file is: where it sat, or, when the
+// move ran before the next checkpoint said so, the name the database already
+// says it wants.
 //
 // A file enters a name only once nothing sits there, on disk or in the
 // database's record. A file that left a name still sits there in the
@@ -78,6 +82,8 @@ pub fn restored_at<'a>(
 pub struct Tally {
     pub waiting_opens: u64,
     pub moves: u64,
+    // How many times the ledger named again a member that has a file.
+    pub renamed: u64,
     pub weighed: u64,
     pub kept: u64,
 }
@@ -198,7 +204,8 @@ impl From<Vec<Waiting>> for Moves {
 
 impl NamespaceWriter {
     // The member wants `name`: its file, if it has one, moves there once
-    // the checkpoint that records it has committed. A member named again
+    // the job is ready to deliver and the checkpoint that records it has
+    // committed. Nothing else is written for it now. A member named again
     // before it moved waits for the checkpoint that records the later name,
     // behind every move asked for before it.
     pub fn intend(&mut self, node: NodeId, member: MemberId, name: &str) {
@@ -210,6 +217,8 @@ impl NamespaceWriter {
         else {
             return;
         };
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+        count(|tally| tally.renamed += 1);
         leaf.intend(name);
         if leaf.wants().is_some() {
             self.moves.push(Waiting {
@@ -330,11 +339,25 @@ impl NamespaceWriter {
         !self.moves.is_empty() || !self.left.is_empty()
     }
 
-    // Whether anything waits for a checkpoint to commit: a move, a name a
-    // file left, a file that goes or is emptied, or scratch offsets to
-    // start over, which the one the database holds may name.
+    // The job is ready to deliver: from now on the waiting moves run as
+    // checkpoints that record them commit.
+    pub fn deliver_names(&mut self) {
+        self.delivering = true;
+    }
+
+    // Whether the job said it is ready to deliver.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn delivering_names(&self) -> bool {
+        self.delivering
+    }
+
+    // Whether anything waits for a checkpoint to commit: a move once the
+    // job is ready to deliver, a name a file left, a file that goes or is
+    // emptied, or scratch offsets to start over, which the one the database
+    // holds may name.
     pub fn awaits_commit(&self) -> bool {
-        self.moves_waiting()
+        (self.delivering && !self.moves.is_empty())
+            || !self.left.is_empty()
             || !self.leaving.is_empty()
             || !self.spills_emptying.is_empty()
             || !self.scratch_rewinding.is_empty()
@@ -483,13 +506,17 @@ impl NamespaceWriter {
     }
 
     // Run every waiting move the checkpoints through `committed` record
-    // whose name nothing sits at. True when a file moved.
+    // whose name nothing sits at, once the job is ready to deliver. True
+    // when a file moved.
     //
     // Where every file sits or waits to move is read once per pass, the
     // first time a move's name is not shut, and kept as the moves run: a
     // pass over a long chain of waiting moves costs the files once, never
     // the files for each move.
     fn run_moves(&mut self, committed: u64) -> Result<bool, WriteError> {
+        if !self.delivering {
+            return Ok(false);
+        }
         let mut moved = false;
         let mut held: Option<Held> = None;
         let mut kept = Vec::with_capacity(self.moves.len());

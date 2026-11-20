@@ -494,12 +494,7 @@ fn load_of<'a>(torrents: impl Iterator<Item = &'a Live>) -> HashMap<RouteKey, us
 // `torrent` as the download queue and its holds see it. A seeding torrent
 // under a tracker rule that never pauses seeds through the schedule's holds
 // until its goal is met.
-pub fn queued(
-    settings: &TorrentSettings,
-    rules: &[TrackerRule],
-    torrent: &Live,
-    now: i64,
-) -> Queued {
+pub fn queued(settings: &TorrentSettings, rules: &live::Rules, torrent: &Live, now: i64) -> Queued {
     let seeding = torrent.seeding();
     // A torrent under a never-pause rule still owes its tracker while it
     // downloads, and while it seeds with a goal left.
@@ -889,7 +884,7 @@ pub struct Inner {
     pub sessions: Sessions,
     pub settings: RwLock<TorrentSettings>,
     // The tracker rules, as the database last held them.
-    rules: RwLock<Arc<[TrackerRule]>>,
+    rules: RwLock<Arc<live::Rules>>,
     pub env: JobEnv,
     pub clock: Arc<dyn Clock>,
     pub live: tokio::sync::Mutex<BTreeMap<JobId, Live>>,
@@ -1046,7 +1041,7 @@ impl TorrentService {
                 db,
                 sessions,
                 settings: RwLock::new(settings),
-                rules: RwLock::new(Arc::from([])),
+                rules: RwLock::new(Arc::default()),
                 env,
                 clock,
                 live: tokio::sync::Mutex::new(BTreeMap::new()),
@@ -1164,7 +1159,7 @@ impl TorrentService {
                 .enabled
     }
 
-    fn rules(&self) -> Arc<[TrackerRule]> {
+    fn rules(&self) -> Arc<live::Rules> {
         Arc::clone(
             &self
                 .inner

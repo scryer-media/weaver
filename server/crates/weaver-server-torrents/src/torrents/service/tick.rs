@@ -893,6 +893,9 @@ impl TorrentService {
             self.inner.signal.want_pass();
         }
         torrent.levels = held;
+        // Its files' levels moved, which its row may not show: one torrent's
+        // followers read them.
+        self.inner.snapshot.files_moved(torrent.record.job_id);
         // No piece comes for a change that leaves nothing it wants
         // missing: the settle is told, as an add's is (libtorrent
         // `update_peer_interest` calls `finished()`).
@@ -1004,6 +1007,8 @@ impl TorrentService {
     pub async fn routes(&self) -> Vec<TorrentRoute> {
         let sessions = &self.inner.sessions;
         let mut listed: Vec<TorrentRoute> = Vec::new();
+        // Each route's place in `listed`, by its key.
+        let mut at: BTreeMap<RouteKey, usize> = BTreeMap::new();
         for (scope, name) in self.route_scopes() {
             // A pool route is listed as each member's session.
             let plan = sessions.routes().plan(scope);
@@ -1016,28 +1021,34 @@ impl TorrentService {
                     .collect()
             };
             for (key, down, names) in planned {
-                match listed.iter_mut().find(|route| route.key == key) {
-                    Some(route) => route.scopes.push((scope, name.clone())),
-                    None => listed.push(TorrentRoute {
-                        key,
-                        scopes: vec![(scope, name.clone())],
-                        session: None,
-                        down: sessions.off().or(down),
-                        names,
-                    }),
+                match at.get(&key) {
+                    Some(&place) => listed[place].scopes.push((scope, name.clone())),
+                    None => {
+                        at.insert(key.clone(), listed.len());
+                        listed.push(TorrentRoute {
+                            key,
+                            scopes: vec![(scope, name.clone())],
+                            session: None,
+                            down: sessions.off().or(down),
+                            names,
+                        });
+                    }
                 }
             }
         }
         for view in self.inner.sessions.views().await {
-            match listed.iter_mut().find(|route| route.key == view.key) {
-                Some(route) => route.session = Some(view),
-                None => listed.push(TorrentRoute {
-                    key: view.key.clone(),
-                    scopes: Vec::new(),
-                    session: Some(view),
-                    down: None,
-                    names: None,
-                }),
+            match at.get(&view.key) {
+                Some(&place) => listed[place].session = Some(view),
+                None => {
+                    at.insert(view.key.clone(), listed.len());
+                    listed.push(TorrentRoute {
+                        key: view.key.clone(),
+                        scopes: Vec::new(),
+                        session: Some(view),
+                        down: None,
+                        names: None,
+                    });
+                }
             }
         }
         listed

@@ -124,6 +124,7 @@ pub(super) enum Cut {
 }
 
 type CutHook = Box<dyn Fn(&str, u64) -> Option<Cut> + Send + Sync>;
+type QueueNames = Box<dyn Fn() -> Vec<(u64, JobNameRecord)> + Send + Sync>;
 
 // What the read has gathered so far, shared with the request that waits on
 // it.
@@ -140,6 +141,9 @@ pub(super) struct ReadState {
     pub(super) opened: BTreeSet<u64>,
     // The recent finished jobs the read set out to name.
     pub(super) recent: Vec<u64>,
+    // Every queued job memory held when the read began, before it read any
+    // job, with its names.
+    pub(super) queue_at_start: Vec<(u64, JobNameRecord)>,
     pub(super) statements: u64,
     pub(super) rows: u64,
     pub(super) nzb_bytes: u64,
@@ -173,6 +177,7 @@ pub(super) struct NameRead {
     stop: AtomicBool,
     state: Mutex<ReadState>,
     cut: Option<CutHook>,
+    queue: Option<QueueNames>,
     started: Instant,
 }
 
@@ -182,7 +187,20 @@ impl NameRead {
             stop: AtomicBool::new(false),
             state: Mutex::new(ReadState::default()),
             cut: None,
+            queue: None,
             started: Instant::now(),
+        }
+    }
+
+    // A read that takes the queue's names from `queue` when it begins: the
+    // queue's shared rows, never the pipeline.
+    pub(super) fn with_queue(
+        self,
+        queue: impl Fn() -> Vec<(u64, JobNameRecord)> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            queue: Some(Box::new(queue)),
+            ..self
         }
     }
 
@@ -325,6 +343,9 @@ pub(super) fn read_stored_names(db: &Database, read: &NameRead) {
 }
 
 fn read_steps(db: &Database, read: &NameRead) -> Option<()> {
+    // Before any job is read: the queue in memory.
+    let queue = read.queue.as_ref().map(|queue| queue()).unwrap_or_default();
+    read.lock().queue_at_start = queue;
     go(read.one(
         STEP_SERVERS,
         || db.list_servers(),
@@ -914,34 +935,23 @@ impl TableNames {
     // a job the read did not name gets the names memory holds for it, and a
     // server or category step that did not finish takes the loaded
     // configuration's. Every job whose names were not all read is under
-    // the guard. A read that covered everything uses no memory at all, so
-    // its table is the one the read alone builds.
+    // the guard (see [`Uncovered`]). A read that covered everything, while
+    // no job joined or left, uses no memory at all, so its table is the one
+    // the read alone builds. A job in no list at all, such as one that
+    // joined the queue and left it inside the window, has no names in the
+    // table, and the sanitiser leaves out every line that names it.
     pub(super) fn from_read(mut state: ReadState, memory: MemoryNames) -> Self {
         let mut stored = std::mem::take(&mut state.stored);
-        let mut unread = BTreeSet::new();
-        let mut from_memory = 0u64;
-        let history_read =
-            state.complete(STEP_RECENT_HISTORY) && state.complete(STEP_HISTORY_NAMES);
-        let history = if history_read {
-            Vec::new()
-        } else {
-            memory.history
-        };
-        for (id, record) in memory.queue.into_iter().chain(history) {
-            if state.covers(id) {
-                continue;
-            }
-            unread.insert(id);
-            if let std::collections::btree_map::Entry::Vacant(entry) = stored.jobs.entry(id) {
-                entry.insert(record);
-                from_memory += 1;
-            }
-        }
-        for id in state.recent.iter().chain(stored.jobs.keys()) {
-            if !state.covers(*id) {
-                unread.insert(*id);
-            }
-        }
+        let queue_at_start = std::mem::take(&mut state.queue_at_start);
+        let (uncovered, from_memory) = Uncovered::of(
+            &state,
+            &mut stored,
+            memory
+                .queue
+                .into_iter()
+                .chain(queue_at_start)
+                .chain(memory.history),
+        );
         let mut fallback = Vec::new();
         if from_memory > 0 {
             fallback.push(format!(
@@ -957,12 +967,12 @@ impl TableNames {
             fallback.push("the categories came from the loaded configuration".to_string());
         }
         let steps_complete = state.steps.iter().all(|step| step.state == STATE_COMPLETE);
-        let complete = steps_complete && unread.is_empty();
+        let complete = steps_complete && uncovered.jobs.is_empty();
         if !complete {
             fallback.push(format!(
                 "{} jobs were not read whole; a line or value that names one of them, or \
                  holds a dotted name the table does not hold, is left out in place",
-                unread.len()
+                uncovered.jobs.len()
             ));
         }
         let history_total = state
@@ -971,7 +981,7 @@ impl TableNames {
         Self {
             stored,
             guard: (!complete).then(|| Guard {
-                jobs: Some(unread.clone()),
+                jobs: Some(uncovered.jobs.clone()),
             }),
             manifest: ManifestTable {
                 complete,
@@ -979,11 +989,50 @@ impl TableNames {
                 names_from_table: 0,
                 names_from_fallback: 0,
                 jobs_from_memory: from_memory,
-                jobs_not_fully_read: unread.len() as u64,
+                jobs_not_fully_read: uncovered.jobs.len() as u64,
                 read_ms: state.read_ms,
                 fallback: (!fallback.is_empty()).then(|| fallback.join("; ")),
             },
             history_total,
         }
+    }
+}
+
+// The one answer to which jobs the read did not cover: every job whose lines
+// the collected logs can hold and whose names were not all read.
+struct Uncovered {
+    jobs: BTreeSet<u64>,
+}
+
+impl Uncovered {
+    // The jobs the table can name are those queued when the read began and
+    // when the logs were in, the finished jobs memory holds, and the jobs
+    // the read set out to name. Each of them the read did not cover is
+    // uncovered, and takes the names `memory` holds for it, first row
+    // first, where the read has none. Returns how many jobs were named from
+    // memory.
+    fn of(
+        state: &ReadState,
+        stored: &mut StoredNames,
+        memory: impl Iterator<Item = (u64, JobNameRecord)>,
+    ) -> (Self, u64) {
+        let mut jobs = BTreeSet::new();
+        let mut from_memory = 0u64;
+        for (id, record) in memory {
+            if state.covers(id) {
+                continue;
+            }
+            jobs.insert(id);
+            if let std::collections::btree_map::Entry::Vacant(entry) = stored.jobs.entry(id) {
+                entry.insert(record);
+                from_memory += 1;
+            }
+        }
+        for id in state.recent.iter().chain(stored.jobs.keys()) {
+            if !state.covers(*id) {
+                jobs.insert(*id);
+            }
+        }
+        (Self { jobs }, from_memory)
     }
 }
