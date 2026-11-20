@@ -6,8 +6,6 @@
 
 use super::archive_scenario_fixtures::sets::{delivered, delivered_as_described};
 use super::harness::{ARTICLE, Claim, Post, Scenario, assert_fetched_once, par2_set, payload, run};
-use crate::history::HistoryFailureKind;
-use crate::jobs::model::JobStatus;
 use std::collections::BTreeMap;
 use weaver_graph::recovery::RepairOutcome;
 use weaver_server_pipeline::pipeline::tests::engines::archive_scenario_fixtures::sets::namespace_move_counts;

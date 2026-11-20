@@ -682,7 +682,8 @@ impl Volume {
         // A short article leaves at most its posted bytes behind it. A
         // wider cut, with articles after it still to come, may hold their
         // bytes, so it waits until the volume settles. A post that
-        // understates its sizes only makes a cut wait.
+        // understates its sizes only makes a cut wait. The gap before a
+        // volume's first article follows no short article and is cut at once.
         let short = boundary.checked_sub(1).map_or(0, |before| {
             self.encoded_at(before + 1) - self.encoded_at(before)
         });
@@ -690,7 +691,7 @@ impl Volume {
             .waiting
             .get(&self.at)
             .is_some_and(|waiting| waiting.range(boundary..).next().is_some());
-        if to > from && to - from > short && to_come {
+        if boundary > 0 && to > from && to - from > short && to_come {
             self.held.insert(boundary);
             open.untold.insert(self.at);
             return;
