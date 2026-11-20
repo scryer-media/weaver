@@ -7039,6 +7039,8 @@ dependencies = [
  "weaver-server-base",
  "weaver-server-db",
  "weaver-server-disk",
+ "weaver-server-history",
+ "weaver-server-jobs",
  "weaver-server-net",
  "weaver-server-postproc",
  "weaver-server-settings",

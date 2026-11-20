@@ -4,6 +4,7 @@
 pub mod admission;
 pub mod availability;
 pub mod files;
+pub mod history_persistence;
 pub mod intake;
 pub mod layout;
 pub mod metainfo;
@@ -15,6 +16,7 @@ pub mod queries;
 pub mod rate;
 pub mod relocate;
 pub mod sealed;
+pub mod service;
 pub mod side;
 pub mod status;
 pub mod storage;

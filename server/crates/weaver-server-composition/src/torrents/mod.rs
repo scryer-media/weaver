@@ -6,15 +6,14 @@ pub use weaver_server_net::torrents::net;
 pub use weaver_server_settings::torrents::identity;
 pub use weaver_server_torrent_store::torrents::admission;
 pub use weaver_server_torrent_store::torrents::availability;
-pub(crate) use weaver_server_torrent_store::torrents::files;
 pub use weaver_server_torrent_store::torrents::metrics;
 pub use weaver_server_torrent_store::torrents::model;
 pub mod persistence;
 pub mod queries;
 pub use weaver_server_torrent_store::torrents::rate;
 pub mod sealed;
-pub mod service;
 pub use weaver_server_net_runtime::torrents::sessions;
+pub use weaver_server_torrent_store::torrents::service;
 pub use weaver_server_torrent_store::torrents::status;
 
 pub use availability::{

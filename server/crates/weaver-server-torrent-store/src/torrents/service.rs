@@ -5,18 +5,19 @@
 //! of it removes, what live torrents still hold, and the retiring rows a
 //! start finishes. The torrent client lives in weaver-server-torrents.
 
-use crate::StateError;
-use crate::jobs::JobId;
-use crate::persistence::Database;
 use crate::torrents::files;
 use crate::torrents::files::Files;
+use crate::torrents::history_persistence::HistoryFile;
+use crate::torrents::history_persistence::TorrentHistoryDatabase;
+use crate::torrents::history_persistence::TorrentsPersistenceMarkTorrentRetiringInternalQueries;
+use crate::torrents::metainfo;
 use crate::torrents::model::Adopted;
-use crate::torrents::persistence::HistoryFile;
 use crate::torrents::persistence::TorrentsPersistenceLiveHeldPathsInternalQueries;
-use crate::torrents::persistence::TorrentsPersistenceMarkTorrentRetiringInternalQueries;
+use crate::torrents::queries::TorrentDatabase;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use weaver_server_torrent_store::torrents::metainfo;
+use weaver_server_base::jobs::ids::JobId;
+use weaver_server_db::persistence::StateError;
 
 // What a deletion of a torrent's files removes: see `written_paths`.
 #[derive(Debug, Default)]
@@ -87,7 +88,7 @@ pub fn listed_files(deletion: &Deletion) -> Vec<HistoryFile> {
             .filter(|path| is_file(path))
             .map(|path| (path.clone(), false));
         let work = deletion.work.as_ref().and_then(|(root, work, job_id)| {
-            let owned = crate::jobs::working_dir::working_dir_owner(root, work)
+            let owned = weaver_server_jobs::jobs::working_dir::working_dir_owner(root, work)
                 .is_ok_and(|owner| owner == Some(*job_id));
             owned.then(|| (work.clone(), true))
         });
@@ -114,10 +115,17 @@ pub fn listed_files(deletion: &Deletion) -> Vec<HistoryFile> {
 // is read once for all of them; when that read fails, those that would
 // delete stay retiring for the next try. Reads and deletes on the calling
 // thread: run off the runtime.
-pub fn finish_retiring(
-    db: &Database,
+pub fn finish_retiring<D: TorrentHistoryDatabase>(
+    db: &D,
     work: &Path,
-) -> Result<Vec<(JobId, crate::history::JobHistoryRow, Vec<HistoryFile>)>, StateError> {
+) -> Result<
+    Vec<(
+        JobId,
+        weaver_server_history::history::record::JobHistoryRow,
+        Vec<HistoryFile>,
+    )>,
+    StateError,
+> {
     let rows = db.retiring_torrents()?;
     if rows.is_empty() {
         return Ok(Vec::new());
@@ -159,7 +167,10 @@ pub fn finish_retiring(
 // folder by its marker. One whose metainfo or what was there before it does
 // not read takes no file, and one with no folder takes only its unpacking
 // folder.
-fn retiring_deletion(row: &crate::torrents::persistence::RetiringRow, work: &Path) -> Deletion {
+fn retiring_deletion(
+    row: &crate::torrents::history_persistence::RetiringRow,
+    work: &Path,
+) -> Deletion {
     let job_id = row.job_id;
     let claimed = row
         .files_dir
@@ -200,7 +211,7 @@ fn retiring_deletion(row: &crate::torrents::persistence::RetiringRow, work: &Pat
 // in a folder that is a link, and, in a folder of its own, everything while
 // that folder's marker does not name its job.
 fn spare_held(deletion: &mut Deletion, held: &LiveHeld, job_id: JobId) {
-    use crate::jobs::working_dir::{OutputDirOwner, output_dir_owner};
+    use weaver_server_jobs::jobs::working_dir::{OutputDirOwner, output_dir_owner};
     let dir = deletion.dir.clone();
     let linked = std::fs::symlink_metadata(&dir).is_ok_and(|found| found.file_type().is_symlink());
     let unowned = deletion.own && output_dir_owner(&dir) != Some(OutputDirOwner::Job(job_id));
@@ -350,7 +361,7 @@ impl LiveHeld {
     // the rows an upgrade seeds hold a torrent's folder as its row typed it,
     // until its first start writes them again as the filesystem spells
     // them. Reads the filesystem: run off the runtime.
-    pub fn under(db: &Database, dirs: &[PathBuf]) -> Result<Self, StateError> {
+    pub fn under<D: TorrentDatabase>(db: &D, dirs: &[PathBuf]) -> Result<Self, StateError> {
         let mut keys: Vec<PathBuf> = dirs.iter().map(|dir| held_key(dir)).collect();
         keys.extend(dirs.iter().cloned());
         keys.sort();
@@ -454,8 +465,10 @@ pub fn remove_history_files(
         }
         _ => {}
     }
-    if crate::jobs::working_dir::output_dir_owner(dir)
-        != Some(crate::jobs::working_dir::OutputDirOwner::Job(job_id))
+    if weaver_server_jobs::jobs::working_dir::output_dir_owner(dir)
+        != Some(weaver_server_jobs::jobs::working_dir::OutputDirOwner::Job(
+            job_id,
+        ))
     {
         tracing::warn!(job_id = job_id.0, dir = %dir.display(), "a torrent's folder does not carry its job's marker; history leaves its files");
         removal.not_managed.push(dir.to_path_buf());
@@ -514,7 +527,7 @@ pub fn remove_history_files(
     for (_, folder) in folders.iter().rev() {
         let _ = std::fs::remove_dir(folder);
     }
-    match crate::jobs::working_dir::remove_emptied_output_dir(dir, job_id) {
+    match weaver_server_jobs::jobs::working_dir::remove_emptied_output_dir(dir, job_id) {
         Ok(true) => removal.removed += 1,
         Ok(false) => {}
         Err(error) => {
@@ -535,7 +548,7 @@ pub fn remove_history_files(
 // directory (`Links`), on a live removal as at a start.
 pub fn delete_written(deletion: &Deletion) {
     if let Some((root, work, job_id)) = &deletion.work {
-        match crate::jobs::working_dir::remove_job_working_dir(root, work, *job_id) {
+        match weaver_server_jobs::jobs::working_dir::remove_job_working_dir(root, work, *job_id) {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
@@ -611,7 +624,8 @@ pub fn delete_written(deletion: &Deletion) {
             (deletion.own && *folder == deletion.dir) || deletion.claimed.as_ref() == Some(folder);
         match deletion.owner.filter(|_| marked) {
             Some(owner) => {
-                let _ = crate::jobs::working_dir::remove_emptied_output_dir(folder, owner);
+                let _ =
+                    weaver_server_jobs::jobs::working_dir::remove_emptied_output_dir(folder, owner);
             }
             None => {
                 let _ = std::fs::remove_dir(folder);
@@ -626,5 +640,9 @@ pub fn delete_written(deletion: &Deletion) {
 // Found by its marker first, so the name a job's folder took is the one it
 // keeps (`own_named_dir`).
 pub fn unpacking_dir(work: &Path, job_id: JobId) -> PathBuf {
-    crate::jobs::working_dir::own_named_dir(work, &format!("torrent-{}", job_id.0), job_id)
+    weaver_server_jobs::jobs::working_dir::own_named_dir(
+        work,
+        &format!("torrent-{}", job_id.0),
+        job_id,
+    )
 }
