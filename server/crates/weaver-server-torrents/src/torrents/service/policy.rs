@@ -23,7 +23,7 @@ use crate::jobs::JobId;
 use crate::jobs::handle::HoldSet;
 use crate::post_processing::events::EventContext;
 use crate::post_processing::model::{QueueEvent, vars};
-use crate::settings::model::{TorrentConfig, TrackerRule};
+use crate::settings::model::TorrentConfig;
 use crate::settings::{Seeding, SeedingAction};
 use crate::torrents::persistence::TorrentSeedWrites;
 use crate::torrents::persistence::TorrentsPersistenceInsertPlacedTorrentInternalQueries;
@@ -40,7 +40,7 @@ use weaver_torrent::limits::LimitsConfig;
 #[derive(Clone, Copy)]
 pub struct Context<'a> {
     pub settings: &'a TorrentSettings,
-    pub rules: &'a [TrackerRule],
+    pub rules: &'a super::live::Rules,
     pub holds: &'a HoldSet,
     pub now: i64,
     // Reading: the peers are taken now, not once a minute.
@@ -188,7 +188,7 @@ impl Policy for Goals {
 // is left or for a forced torrent, which seeds past its goal.
 pub(super) fn goal_met(
     settings: &TorrentSettings,
-    rules: &[TrackerRule],
+    rules: &super::live::Rules,
     torrent: &Live,
     now: i64,
 ) -> Option<Seeding> {
@@ -482,12 +482,15 @@ static NO_SETTINGS: LazyLock<TorrentSettings> = LazyLock::new(|| TorrentSettings
     torrent: TorrentConfig::default(),
 });
 
+// No tracker rules, for the same passes.
+static NO_RULES: LazyLock<super::live::Rules> = LazyLock::new(super::live::Rules::default);
+
 impl TorrentService {
     // A pass's context with nothing of the reading, goals, checkpoint or
     // turn steps set.
     fn context<'a>(
         settings: &'a TorrentSettings,
-        rules: &'a [TrackerRule],
+        rules: &'a super::live::Rules,
         holds: &'a HoldSet,
         now: i64,
     ) -> Context<'a> {
@@ -1024,7 +1027,7 @@ impl TorrentService {
         let holds = HoldSet::default();
         let cx = Context {
             at_once,
-            ..Self::context(&NO_SETTINGS, &[], &holds, now)
+            ..Self::context(&NO_SETTINGS, &NO_RULES, &holds, now)
         };
         let mut gathered = Gathered::default();
         {
@@ -1059,7 +1062,7 @@ impl TorrentService {
     // no settings.
     pub(super) async fn pick(&self, only: Option<&BTreeSet<JobId>>) {
         let holds = HoldSet::default();
-        let cx = Self::context(&NO_SETTINGS, &[], &holds, self.inner.clock.unix_ms());
+        let cx = Self::context(&NO_SETTINGS, &NO_RULES, &holds, self.inner.clock.unix_ms());
         self.walk_alone(only, &[&Picking], &cx).await;
     }
 

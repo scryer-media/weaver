@@ -25,10 +25,42 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use weaver_torrent::{ResumePeers, TorrentTotals, TrackerAnnounce};
 
-// The tracker rule of id `id`, while it stands.
-fn rule_of(id: Option<u32>, rules: &[TrackerRule]) -> Option<&TrackerRule> {
-    let id = id?;
-    rules.iter().find(|rule| rule.id == id)
+/// The tracker rules in force, in their order, with each one's place by
+/// its id (the first of an id kept): a torrent's settings read its rule for
+/// each field, and a publish reads every torrent's.
+#[derive(Debug, Default)]
+pub struct Rules {
+    list: Vec<TrackerRule>,
+    at: std::collections::HashMap<u32, usize>,
+}
+
+impl Rules {
+    pub fn new(list: Vec<TrackerRule>) -> Self {
+        let mut at = std::collections::HashMap::with_capacity(list.len());
+        for (place, rule) in list.iter().enumerate() {
+            at.entry(rule.id).or_insert(place);
+        }
+        Self { list, at }
+    }
+
+    /// The rule of id `id`, while it stands.
+    pub fn of(&self, id: Option<u32>) -> Option<&TrackerRule> {
+        self.list.get(*self.at.get(&id?)?)
+    }
+}
+
+impl From<Vec<TrackerRule>> for Rules {
+    fn from(list: Vec<TrackerRule>) -> Self {
+        Self::new(list)
+    }
+}
+
+impl std::ops::Deref for Rules {
+    type Target = [TrackerRule];
+
+    fn deref(&self) -> &[TrackerRule] {
+        &self.list
+    }
 }
 
 // What the service keeps of each torrent while it lives.
@@ -162,8 +194,8 @@ impl Live {
     }
 
     // The tracker rule it is under, while that rule stands.
-    pub(super) fn rule<'r>(&self, rules: &'r [TrackerRule]) -> Option<&'r TrackerRule> {
-        rule_of(self.rule_id, rules)
+    pub(super) fn rule<'r>(&self, rules: &'r Rules) -> Option<&'r TrackerRule> {
+        rules.of(self.rule_id)
     }
 
     // A torrent whose ledger and peers the database holds as given, as of

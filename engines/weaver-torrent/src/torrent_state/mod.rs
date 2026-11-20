@@ -1214,6 +1214,33 @@ impl ManagedTorrent {
         known
     }
 
+    /// [`Self::force_reannounce`] to each of `trackers` alone, in their
+    /// order, with one pass over the torrent's trackers and one publish of
+    /// its table (`TrackerStatus::reannounce_each`). Those that are not the
+    /// torrent's are passed over.
+    pub fn force_reannounce_each(
+        &self,
+        after: Duration,
+        trackers: &[url::Url],
+        ignore_min_interval: bool,
+    ) {
+        let known: Vec<url::Url> = {
+            let tiers = self.shared.tracker_tiers.read();
+            let listed: std::collections::HashSet<&url::Url> =
+                tiers.iter().flatten().map(|u| &u.url).collect();
+            trackers
+                .iter()
+                .filter(|t| listed.contains(t))
+                .cloned()
+                .collect()
+        };
+        if !known.is_empty()
+            && let Some(status) = self.tracker_status()
+        {
+            status.reannounce_each(after, &known, ignore_min_interval);
+        }
+    }
+
     /// Starts a new DHT announce of the running torrent under each of its
     /// hashes (libtorrent `torrent_handle::force_dht_announce`).
     pub fn force_dht_announce(&self) {

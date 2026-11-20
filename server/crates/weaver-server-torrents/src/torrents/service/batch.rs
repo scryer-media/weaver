@@ -201,7 +201,14 @@ impl TorrentService {
                     TorrentSetting::Policy(policy) => rows.policy_override.push((job_id, policy)),
                 }
             }
-            if let Err(error) = self.inner.db.set_torrent_settings(&rows) {
+            // The write runs off the runtime; the list stays held, so no
+            // other change of these torrents lands between it and theirs.
+            let db = self.inner.db.clone();
+            let written = tokio::task::spawn_blocking(move || db.set_torrent_settings(&rows))
+                .await
+                .map_err(|error| StateError::Database(error.to_string()))
+                .and_then(|result| result);
+            if let Err(error) = written {
                 return failed(outcome, &ids_of(&checked), &error);
             }
             for (job_id, change) in checked {

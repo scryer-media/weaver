@@ -63,32 +63,53 @@ impl TorrentService {
     /// was named is passed over; the first refused or failed ends them, as
     /// it ended them one at a time: those before it moved and those after
     /// it did not.
+    /// The batch runs on its own task, the pass and publish with it: a
+    /// request dropped part way leaves no move it began unshown.
     pub async fn set_location_many_as(
         &self,
         caller: CallerScope,
         job_ids: &[JobId],
         parent: &str,
     ) -> super::batch::Outcome {
-        let mut outcome = super::batch::Outcome::new();
-        let mut owed = Owed::new(Shown::ByBatch);
-        for &job_id in job_ids {
-            let moved = if self.may_place(caller, Path::new(parent.trim())) {
-                let (moved, left) = self
-                    .move_storage_owing(job_id, parent.to_owned(), Existing::Keep, Shown::ByBatch)
-                    .await;
-                owed.take(left);
-                moved
-            } else {
-                Err(ActionError::Forbidden(OUTSIDE_SAVE_FOLDERS.to_owned()))
-            };
-            let ends = matches!(&moved, Err(error) if !matches!(error, ActionError::NotFound(_)));
-            outcome.insert(job_id, moved);
-            if ends {
-                break;
+        let service = self.clone();
+        let named = job_ids.to_vec();
+        let parent = parent.to_owned();
+        let moving = tokio::spawn(async move {
+            let mut outcome = super::batch::Outcome::new();
+            let mut owed = Owed::new(Shown::ByBatch);
+            for job_id in named {
+                let moved = if service.may_place(caller, Path::new(parent.trim())) {
+                    service
+                        .move_storage_now(job_id, parent.clone(), Existing::Keep, &mut owed)
+                        .await
+                } else {
+                    Err(ActionError::Forbidden(OUTSIDE_SAVE_FOLDERS.to_owned()))
+                };
+                let ends =
+                    matches!(&moved, Err(error) if !matches!(error, ActionError::NotFound(_)));
+                outcome.insert(job_id, moved);
+                if ends {
+                    break;
+                }
             }
+            service.pay(owed).await;
+            outcome
+        });
+        match moving.await {
+            Ok(outcome) => outcome,
+            Err(error) => job_ids
+                .first()
+                .map(|job_id| {
+                    (
+                        *job_id,
+                        Err(ActionError::State(format!(
+                            "the move did not finish: {error}"
+                        ))),
+                    )
+                })
+                .into_iter()
+                .collect(),
         }
-        self.pay(owed).await;
-        outcome
     }
 
     /// Whether `caller` may have a torrent saved or moved under `path`, by
@@ -1067,14 +1088,6 @@ impl Owed {
             places: Vec::new(),
             publish: false,
         }
-    }
-
-    // What one more move of the batch left owed.
-    fn take(&mut self, other: Owed) {
-        self.pass |= other.pass;
-        self.attach.extend(other.attach);
-        self.places.extend(other.places);
-        self.publish |= other.publish;
     }
 }
 

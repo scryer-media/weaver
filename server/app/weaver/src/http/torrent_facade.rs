@@ -5,7 +5,7 @@
 //! torrent automation drives, served beside the first-party GraphQL API.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU32;
@@ -2832,6 +2832,7 @@ async fn reannounce(ctx: &TorrentFacadeContext, params: &Params) -> Response {
         && let Some(torrents) = &ctx.inner.torrents
     {
         let ids: Vec<JobId> = views.iter().map(|view| view.job_id).collect();
+        let asked: HashSet<&String> = urls.iter().collect();
         named = torrents
             .row_parts(&ids, false, true)
             .await
@@ -2841,7 +2842,7 @@ async fn reannounce(ctx: &TorrentFacadeContext, params: &Params) -> Response {
                     .trackers
                     .into_iter()
                     .map(|tracker| tracker.url)
-                    .filter(|url| urls.contains(url))
+                    .filter(|url| asked.contains(url))
                     .collect();
                 (job_id, kept)
             })
@@ -2856,10 +2857,12 @@ async fn reannounce(ctx: &TorrentFacadeContext, params: &Params) -> Response {
                 torrents.reannounce(view.job_id).await?;
                 return torrents.dht_announce(view.job_id).await;
             }
-            for url in named.get(&view.job_id).into_iter().flatten() {
-                torrents.reannounce_tracker(view.job_id, url).await?;
+            match named.get(&view.job_id) {
+                Some(urls) if !urls.is_empty() => {
+                    torrents.reannounce_trackers(view.job_id, urls).await
+                }
+                _ => Ok(()),
             }
-            Ok(())
         }
     })
     .await

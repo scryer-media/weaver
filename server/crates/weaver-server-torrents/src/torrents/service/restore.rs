@@ -1186,7 +1186,7 @@ impl TorrentService {
     fn held_back(
         &self,
         settings: &TorrentSettings,
-        rules: &[TrackerRule],
+        rules: &super::live::Rules,
         torrent: &Live,
         now: i64,
     ) -> bool {
