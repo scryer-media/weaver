@@ -3714,28 +3714,47 @@ pub fn read_member(
     // What the object cannot rebuild is read from the member's own file
     // where that has it: a volume given back stays in its member's file,
     // and an object that takes it again reads it there in place.
-    let mut posted = |range: ByteRange, into: &mut Vec<u8>| {
+    let posted = |range: ByteRange, into: &mut Vec<u8>| {
         let start = into.len();
         source.posted(child, volume, range, &mut read, into) || {
             into.truncate(start);
             source.leaf(node, member, range, into)
         }
     };
+    held_first(source, (node, member), range, into, posted)
+}
+
+// A member's range, its held custody first and `rest` for what lies
+// between: held custody is current authority, even if its backing cannot be
+// read. An older derived copy, the member's file among them, must not
+// substitute for that failure. Whole, or nothing and `false`.
+fn held_first(
+    source: &dyn Source,
+    (node, member): (NodeId, MemberId),
+    range: ByteRange,
+    into: &mut Vec<u8>,
+    mut rest: impl FnMut(ByteRange, &mut Vec<u8>) -> bool,
+) -> bool {
+    let start = into.len();
     let mut at = range.start;
     let pieces = source.held(node, member, range);
-    for group in pieces.chunk_by(|(a, _), (b, _)| a.end == b.start) {
-        let held = ByteRange::new(group[0].0.start, group[group.len() - 1].0.end);
-        if at < held.start && !posted(ByteRange::new(at, held.start), into) {
-            return false;
+    let mut read = || {
+        for group in pieces.chunk_by(|(a, _), (b, _)| a.end == b.start) {
+            let held = ByteRange::new(group[0].0.start, group[group.len() - 1].0.end);
+            if at < held.start && !rest(ByteRange::new(at, held.start), into) {
+                return false;
+            }
+            if !read_held(source, (node, member), group, held, into) {
+                return false;
+            }
+            at = held.end;
         }
-        // Held custody is current authority, even if its backing cannot be
-        // read. An older derived copy must not substitute for that failure.
-        if !read_held(source, (node, member), group, held, into) {
-            return false;
-        }
-        at = held.end;
+        at == range.end || rest(ByteRange::new(at, range.end), into)
+    };
+    read() || {
+        into.truncate(start);
+        false
     }
-    at == range.end || posted(ByteRange::new(at, range.end), into)
 }
 
 // What one placement of the object at `child`, bound to `member` of `node`,
@@ -3761,8 +3780,8 @@ fn read_placed(
     }
 }
 
-// A member no object reads: its bytes are in its own file, or still held
-// while its front has not said what it is.
+// A member no object reads: its bytes still held while its front has not
+// said what it is, and the rest in its own file.
 fn read_own(
     source: &dyn Source,
     node: NodeId,
@@ -3770,13 +3789,9 @@ fn read_own(
     range: ByteRange,
     into: &mut Vec<u8>,
 ) -> bool {
-    let start = into.len();
-    if source.leaf(node, member, range, into) {
-        return true;
-    }
-    into.truncate(start);
-    let pieces = source.held(node, member, range);
-    read_held(source, (node, member), &pieces, range, into)
+    held_first(source, (node, member), range, into, |rest, into| {
+        source.leaf(node, member, rest, into)
+    })
 }
 
 // The held pieces of a range, read where each is kept.
