@@ -741,9 +741,20 @@ pub fn recovery_by_front(name: &str, front: &[u8], length: Option<u64>) -> Optio
     }
     match signed(front, length) {
         Sniff::Object(kind) => Some(matches!(kind, Kind::Par2 | Kind::Par3 | Kind::RarRecovery)),
-        Sniff::Pending => None,
-        Sniff::Leaf => (!has_extension(trimmed(name), ".rev")).then_some(false),
+        // Other signatures may still be waiting on bytes further in; the
+        // recovery ones all stand at the head, so a front that rules those
+        // out has said, however short it is.
+        Sniff::Pending if may_open_recovery(front, length) => None,
+        Sniff::Pending | Sniff::Leaf => (!has_extension(trimmed(name), ".rev")).then_some(false),
     }
+}
+
+// Whether a front may still open a recovery format a signature tells.
+fn may_open_recovery(front: &[u8], length: Option<u64>) -> bool {
+    SIGNATURES
+        .iter()
+        .filter(|signature| matches!(signature.kind, Kind::Par2 | Kind::Par3 | Kind::RarRecovery))
+        .any(|signature| !matches!(signature.test(front, length), Test::No))
 }
 
 // The kinds whose objects judge a member by the clean bytes past the hole

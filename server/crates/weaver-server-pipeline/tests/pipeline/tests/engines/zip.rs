@@ -450,9 +450,10 @@ async fn a_single_zip_whose_every_entry_fails_its_crc_fails() {
 }
 
 // A stored zip whose `ember.mkv` arrives wrong under a good article
-// checksum, beside a whole `lantern.par2` whose packets are not PAR2 (so
-// nothing reads it as recovery), all under `gallery/` when `directory`
-// says so. Neither the directory nor the recovery file is a usable file.
+// checksum, beside a whole `lantern.par2` that opens as a PAR1 file (so it
+// is recovery data by its bytes, and nothing reads it), all under
+// `gallery/` when `directory` says so. Neither the directory nor the
+// recovery file is a usable file.
 fn nothing_usable(directory: bool) -> Vec<u8> {
     let prefix = if directory { "gallery/" } else { "" };
     let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
@@ -462,6 +463,7 @@ fn nothing_usable(directory: bool) -> Vec<u8> {
     writer
         .start_file(format!("{prefix}lantern.par2"), stored())
         .unwrap();
+    writer.write_all(b"PAR\0\0\0\0\0\0\0\x01\0").unwrap();
     writer.write_all(&payload(2 * ARTICLE, 53)).unwrap();
     let ember = &members()[0].1;
     writer
