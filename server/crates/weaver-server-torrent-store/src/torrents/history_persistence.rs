@@ -4,13 +4,15 @@
 use std::path::PathBuf;
 
 use super::model::HistoryEnd;
-use super::persistence::{RetiringMark, delete_torrent_tx, stored, update_column_tx};
+use super::persistence::{RetiringMark, delete_torrents_tx, stored, update_column_tx};
 use super::queries::{TorrentDatabase, count};
 use weaver_server_base::jobs::ids::JobId;
 use weaver_server_db::persistence::StateError;
 use weaver_server_db::persistence::connection::Database as SqlDatabase;
 use weaver_server_db::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx};
-use weaver_server_history::history::persistence::insert_job_history_tx;
+use weaver_server_history::history::persistence::{
+    delete_by_job_tx, insert_job_histories_tx, unique_runs,
+};
 use weaver_server_history::history::record::JobHistoryRow;
 
 pub trait TorrentsPersistenceMarkTorrentRetiringInternalQueries {
@@ -200,15 +202,19 @@ impl<D: TorrentDatabase + 'static> TorrentsPersistenceWriteRetiringLocalQueries 
             SqlRuntime::run_in_transaction(&datastore, "archive_retiring_torrents", |tx| {
                 let rows = rows.clone();
                 Box::pin(async move {
-                    let mut written = Vec::with_capacity(rows.len());
-                    for (job_id, entry, files) in &rows {
-                        let id = stored(job_id.0)?;
-                        insert_job_history_tx(tx, entry).await?;
-                        write_history_files_tx(tx, id, files).await?;
-                        delete_torrent_tx(tx, id).await?;
-                        written.push(*job_id);
+                    for run in unique_runs(&rows, |(job_id, ..)| *job_id) {
+                        let entries: Vec<&JobHistoryRow> =
+                            run.iter().map(|(_, entry, _)| entry).collect();
+                        insert_job_histories_tx(tx, &entries).await?;
+                        let lists = run
+                            .iter()
+                            .map(|(job_id, _, files)| Ok((stored(job_id.0)?, files.as_slice())))
+                            .collect::<Result<Vec<_>, StateError>>()?;
+                        write_histories_files_tx(tx, &lists).await?;
+                        let ids: Vec<i64> = lists.iter().map(|(id, _)| *id).collect();
+                        delete_torrents_tx(tx, &ids).await?;
                     }
-                    Ok(written)
+                    Ok(rows.iter().map(|(job_id, ..)| *job_id).collect())
                 })
             })
             .await
@@ -375,6 +381,40 @@ pub async fn write_history_files_tx(
         let mut args = Vec::with_capacity(chunk.len() * 3);
         for file in chunk {
             args.push(SqlArg::I64(job_id));
+            args.push(SqlArg::Text(file.path.clone()));
+            args.push(SqlArg::Bool(file.whole));
+        }
+        tx.execute(
+            &format!("INSERT INTO job_history_files (job_id, path, whole) VALUES {values}"),
+            &args,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+// `write_history_files_tx` of each of `lists`, a job's id and its files, in
+// `tx`: one statement per bind-sized chunk. A job appears once.
+pub async fn write_histories_files_tx(
+    tx: &mut SqlTx<'_>,
+    lists: &[(i64, &[HistoryFile])],
+) -> Result<(), StateError> {
+    let ids: Vec<i64> = lists.iter().map(|(job_id, _)| *job_id).collect();
+    delete_by_job_tx(tx, "job_history_files", &ids).await?;
+    let mut rows: Vec<(i64, &HistoryFile)> = Vec::new();
+    for (job_id, files) in lists {
+        // One row a path: one listed twice goes whole if either says so.
+        let mut files: Vec<&HistoryFile> = files.iter().collect();
+        files.sort_unstable_by(|a, b| a.path.cmp(&b.path).then(b.whole.cmp(&a.whole)));
+        files.dedup_by(|later, kept| later.path == kept.path);
+        rows.extend(files.into_iter().map(|file| (*job_id, file)));
+    }
+    let per = weaver_server_db::persistence::sql_runtime::max_rows_for_tx(tx, 3);
+    for chunk in rows.chunks(per) {
+        let values = vec!["({}, {}, {})"; chunk.len()].join(", ");
+        let mut args = Vec::with_capacity(chunk.len() * 3);
+        for (job_id, file) in chunk {
+            args.push(SqlArg::I64(*job_id));
             args.push(SqlArg::Text(file.path.clone()));
             args.push(SqlArg::Bool(file.whole));
         }
