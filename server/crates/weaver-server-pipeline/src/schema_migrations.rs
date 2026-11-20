@@ -14,6 +14,7 @@ use runner::{
     sqlite_connect_options,
 };
 pub use runner::{embedded_catalog, max_recorded_migration_version};
+#[cfg(test)]
 pub(crate) use runner::{embedded_payload_bytes, validate_payload_checksum};
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{AssertSqlSafe, Row, SqlitePool};

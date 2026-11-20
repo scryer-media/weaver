@@ -6676,7 +6676,10 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "tracing",
+ "weaver-server-base",
  "weaver-server-db",
+ "weaver-server-settings",
  "zstd",
 ]
 

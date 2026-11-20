@@ -82,8 +82,12 @@ const LIFTED: &[(&str, usize)] = &[
         1,
     ),
     (
+        "server/crates/weaver-server-migrations/src/postgres_migrations.rs",
+        7,
+    ),
+    (
         "server/crates/weaver-server-pipeline/src/persistence/postgres_migrations.rs",
-        8,
+        1,
     ),
     (
         "server/crates/weaver-server-db/src/persistence/sql_runtime.rs",

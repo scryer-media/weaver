@@ -3,8 +3,10 @@
 
 pub mod migration_assets;
 pub mod migration_hook_ids;
+pub mod postgres_migrations;
 pub mod schema_migrations;
 pub mod schema_upgrade;
+pub mod upgrade_compat;
 
 pub const EMBEDDED_MIGRATION_CATALOG: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/migration_catalog.json.zst"));

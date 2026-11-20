@@ -7,6 +7,9 @@ license-file.workspace = true
 repository.workspace = true
 
 [dependencies]
+tracing = { workspace = true }
+weaver-server-base = { path = "../weaver-server-base" }
+weaver-server-settings = { path = "../weaver-server-settings" }
 sqlx = { workspace = true }
 weaver-server-db = { path = "../weaver-server-db" }
 blake3 = { workspace = true }
