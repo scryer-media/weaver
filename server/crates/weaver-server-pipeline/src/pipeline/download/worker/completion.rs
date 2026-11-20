@@ -1,0 +1,1830 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+use super::*;
+
+impl Pipeline {
+    // The job's root says which of its articles it waits on.
+    pub(crate) fn segment_is_completion_critical(&self, segment_id: SegmentId) -> bool {
+        self.graph_article_waited_on(segment_id).unwrap_or(false)
+    }
+
+    pub(crate) fn note_retry_scheduled(&mut self, segment_id: SegmentId) {
+        let job_id = segment_id.file_id.job_id;
+        *self.pending_retries_by_job.entry(job_id).or_default() += 1;
+        *self
+            .pending_retries_by_segment
+            .entry(segment_id)
+            .or_default() += 1;
+    }
+
+    // The exclusions an article carries to the next server once its tries
+    // on `source` are spent, or `None` when it stays where it is: the failure
+    // is of another kind, no server is named, the server is already excluded,
+    // or no other server may serve the article (then the spent tries end it).
+    //
+    // Two kinds spend tries this way: answers to BODY the client has no class
+    // for, and established-transport failures (a dropped connection, a 503 or
+    // 499 to BODY) once they have become the article's own, which happens
+    // only while other segments keep downloading. Transport failures that
+    // still say nothing about the article spend no tries and never get here.
+    //
+    // The server joins the exclusions as one without the article does, so a
+    // fill server spent this way counts toward opening the backfill tier: it
+    // could not produce the article in its tries, which is what backfill is
+    // for. Constant work per article: one pass over the configured servers.
+    fn next_server_after_spent_tries(
+        &mut self,
+        job_id: JobId,
+        kind: DownloadFailureKind,
+        source: Option<usize>,
+        excludes: weaver_nntp::ServerSet,
+    ) -> Option<weaver_nntp::ServerSet> {
+        if !matches!(
+            kind,
+            DownloadFailureKind::ContentOrProtocol | DownloadFailureKind::EstablishedTransport
+        ) {
+            return None;
+        }
+        let source = source?;
+        if source >= self.nntp.pool().server_count() || excludes.contains(source) {
+            return None;
+        }
+        let mut next = excludes;
+        next.insert(source);
+        (!self.no_server_can_serve(job_id, next)).then_some(next)
+    }
+
+    fn note_infrastructure_retry_scheduled(
+        &mut self,
+        job_id: JobId,
+        kind: DownloadFailureKind,
+        delay: Option<std::time::Duration>,
+        exclude_servers: weaver_nntp::ServerSet,
+    ) {
+        let Some(reason) = kind.infrastructure_wait_reason() else {
+            return;
+        };
+        let retry_at_epoch_ms = delay.map(|delay| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64()
+                * 1000.0
+                + delay.as_secs_f64() * 1000.0
+        });
+        let wait = self
+            .download_wait_by_job
+            .entry(job_id)
+            .or_insert(DownloadWaitStatus {
+                reason,
+                retry_at_epoch_ms,
+                pending_count: 0,
+                exclude_servers,
+            });
+        wait.reason = reason;
+        wait.exclude_servers = exclude_servers;
+        wait.retry_at_epoch_ms = match (wait.retry_at_epoch_ms, retry_at_epoch_ms) {
+            (Some(current), Some(next)) => Some(current.min(next)),
+            (Some(current), None) => Some(current),
+            (None, next) => next,
+        };
+        wait.pending_count += 1;
+    }
+
+    // Extends or ends `segment_id`'s run of established-transport failures,
+    // returning the run when this failure belongs to one. A failure that left
+    // the article unanswered says nothing about it, so the run is neither
+    // extended nor ended by one.
+    fn note_transport_failure_streak(
+        &mut self,
+        segment_id: SegmentId,
+        failure: &DownloadFailure,
+    ) -> Option<TransportFailureStreak> {
+        match failure.kind {
+            DownloadFailureKind::EstablishedTransport => {}
+            DownloadFailureKind::Unanswered => return None,
+            _ => {
+                self.transport_failure_streaks.remove(&segment_id);
+                return None;
+            }
+        }
+        let downloaded = self.metrics.segments_downloaded.load(Ordering::Relaxed);
+        let streak =
+            self.transport_failure_streaks
+                .entry(segment_id)
+                .or_insert(TransportFailureStreak {
+                    failures: 0,
+                    downloaded_at_start: downloaded,
+                });
+        streak.failures = streak.failures.saturating_add(1);
+        Some(*streak)
+    }
+
+    // Whether a segment in a run of established-transport failures has its
+    // retry held past the server recovery backoff. The hold exists for a
+    // quarantined server's one probe, which takes the highest-priority work:
+    // this segment again. A server that is not quarantined has no probe to
+    // protect, so its retry is not held; the run still makes the article pay
+    // for its retries once other segments download. A failure with no source
+    // server keeps the hold.
+    fn transport_streak_holds_retry(
+        &self,
+        streak: Option<TransportFailureStreak>,
+        source_server_idx: Option<usize>,
+    ) -> bool {
+        streak.is_some_and(|streak| streak.failures >= SEGMENT_TRANSPORT_STREAK_HOLD)
+            && source_server_idx.is_none_or(|idx| {
+                idx >= self.nntp.pool().server_count() || self.nntp.pool().requires_recovery(idx)
+            })
+    }
+
+    pub(crate) fn note_retry_requeued(&mut self, segment_id: SegmentId) {
+        let job_id = segment_id.file_id.job_id;
+        if let Some(pending) = self.pending_retries_by_job.get_mut(&job_id) {
+            *pending = pending.saturating_sub(1);
+            if *pending == 0 {
+                self.pending_retries_by_job.remove(&job_id);
+            }
+        }
+        if let Some(pending) = self.pending_retries_by_segment.get_mut(&segment_id) {
+            *pending = pending.saturating_sub(1);
+            if *pending == 0 {
+                self.pending_retries_by_segment.remove(&segment_id);
+            }
+        }
+    }
+
+    pub(crate) fn note_infrastructure_retry_requeued(&mut self, job_id: JobId) {
+        let clear_wait = self
+            .download_wait_by_job
+            .get_mut(&job_id)
+            .is_some_and(|wait| {
+                wait.pending_count = wait.pending_count.saturating_sub(1);
+                wait.pending_count == 0
+            });
+        if clear_wait {
+            self.download_wait_by_job.remove(&job_id);
+        }
+    }
+
+    pub(in crate::pipeline::download::worker) fn restore_download_result_work_without_retry(
+        &mut self,
+        segment_id: SegmentId,
+        retry_count: u32,
+        exclude_servers: weaver_nntp::ServerSet,
+    ) -> bool {
+        // Built as a retry is: park/restore drops any rotation hint, which
+        // is advisory, and the next transport failure recomputes it.
+        let Some(work) = self.download_retry_work(segment_id, retry_count, exclude_servers) else {
+            return false;
+        };
+        self.enqueue_download_work(work);
+        self.update_queue_metrics();
+        true
+    }
+
+    // The article's id in use is spent: it failed on every server it may use,
+    // or arrived and failed to decode. When the NZB gave the part another id,
+    // the article moves to it and is queued afresh; false when every id is
+    // spent and the article is lost.
+    pub(in crate::pipeline) fn spend_message_id(&mut self, segment_id: SegmentId) -> bool {
+        let Some(work) = self.spend_message_id_for_work(segment_id) else {
+            return false;
+        };
+        self.enqueue_download_work(work);
+        self.update_queue_metrics();
+        true
+    }
+
+    // Spends the article's id in use and returns its work under the next
+    // id, not yet queued; `None` when every id is spent.
+    pub(in crate::pipeline) fn spend_message_id_for_work(
+        &mut self,
+        segment_id: SegmentId,
+    ) -> Option<DownloadWork> {
+        let moved = self
+            .jobs
+            .get_mut(&segment_id.file_id.job_id)
+            .and_then(|state| {
+                let segment = state
+                    .spec
+                    .files
+                    .get_mut(segment_id.file_id.file_index as usize)?
+                    .segment_mut(segment_id.segment_number)?;
+                // A copy of the article still queued, which reads its id from
+                // the part when it is dispatched, keeps the id it was queued
+                // under.
+                if segment.message_ids.has_next()
+                    && let Some(active) = state.articles.active_mut()
+                {
+                    let in_use = segment.message_ids.in_use();
+                    let pin = || weaver_server_base::jobs::ids::MessageId::new(in_use);
+                    active.download_queue.pin_message_id(segment_id, pin);
+                    active.recovery_queue.pin_message_id(segment_id, pin);
+                }
+                #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+                if let Some(spent) = &mut self.spent_message_ids {
+                    spent.push(segment.message_ids.in_use().to_string());
+                }
+                Some(segment.message_ids.spend())
+            })
+            .unwrap_or(false);
+        moved
+            .then(|| self.download_retry_work(segment_id, 0, weaver_nntp::ServerSet::EMPTY))
+            .flatten()
+    }
+
+    // Whether the NZB gave `segment_id`'s part an id behind the one in use.
+    pub(in crate::pipeline) fn message_id_left(&self, segment_id: SegmentId) -> bool {
+        self.jobs
+            .get(&segment_id.file_id.job_id)
+            .and_then(|state| state.spec.files.get(segment_id.file_id.file_index as usize))
+            .and_then(|file| file.segment(segment_id.segment_number))
+            .is_some_and(|segment| segment.message_ids.has_next())
+    }
+
+    // The download block names the server quota whenever queued work cannot
+    // move because every normal fill server is out of quota. Queued work is
+    // what the queues hold plus what a quota rejection parked; dispatch never
+    // sends to a blocked server, so most of it never parks at all.
+    pub(in crate::pipeline) fn refresh_server_quota_block_presentation(&self) {
+        let queued = !self.server_quota_parked.is_empty()
+            || self.metrics.download_queue_depth.load(Ordering::Relaxed) != 0;
+        let blocked = queued && self.nntp.all_normal_fill_servers_quota_blocked();
+        self.shared_state.set_server_quota_blocked(blocked);
+        self.shared_state
+            .set_egress_quota_block(self.parked_egress_quota_block());
+    }
+
+    // The egress quota holding parked work back, if one still is. Work parks
+    // on an egress only when no server could be reached over any other leg,
+    // so a parked entry whose egress is still out of quota is a real block.
+    fn parked_egress_quota_block(&self) -> Option<crate::jobs::handle::EgressQuotaBlock> {
+        if self.egress_quota_parked.is_empty() {
+            return None;
+        }
+        let policy = self.shared_state.server_transfer_policy()?;
+        let mut egress_ids = self
+            .egress_quota_parked
+            .values()
+            .copied()
+            .collect::<Vec<_>>();
+        egress_ids.sort_unstable();
+        egress_ids.dedup();
+        let snapshot = egress_ids
+            .into_iter()
+            .filter_map(|egress_id| policy.egress_snapshot(egress_id))
+            .find(|snapshot| snapshot.blocked)?;
+        let egress = self
+            .shared_state
+            .proxy_runtime()
+            .and_then(|runtime| runtime.network.egress_configuration(snapshot.server_id));
+        let limit_bytes = egress
+            .as_ref()
+            .and_then(|egress| egress.quota.download_bytes)
+            .unwrap_or(0);
+        let egress_name = egress
+            .map(|egress| egress.name)
+            .unwrap_or_else(|| format!("Egress {}", snapshot.server_id));
+        Some(crate::jobs::handle::EgressQuotaBlock {
+            egress_id: snapshot.server_id,
+            egress_name,
+            used_bytes: snapshot.used_bytes,
+            limit_bytes,
+            remaining_bytes: snapshot.remaining_bytes.unwrap_or(0),
+            window_starts_at_epoch_ms: snapshot
+                .window_start
+                .map(|start| start.timestamp_millis() as f64),
+            window_ends_at_epoch_ms: snapshot.window_end.map(|end| end.timestamp_millis() as f64),
+            timezone_name: snapshot.timezone,
+        })
+    }
+
+    pub(in crate::pipeline) fn download_retry_work(
+        &self,
+        segment_id: SegmentId,
+        retry_count: u32,
+        exclude_servers: weaver_nntp::ServerSet,
+    ) -> Option<DownloadWork> {
+        let job_id = segment_id.file_id.job_id;
+        let file_idx = segment_id.file_id.file_index as usize;
+        let completion_critical = self.segment_is_completion_critical(segment_id);
+        let state = self.jobs.get(&job_id)?;
+        let file_spec = state.spec.files.get(file_idx)?;
+        let seg_spec = file_spec.segment(segment_id.segment_number)?;
+        Some(DownloadWork {
+            counters: None,
+            segment_id,
+            message_id: weaver_server_base::jobs::ids::MessageId::new(
+                seg_spec.message_ids.in_use(),
+            ),
+            groups: state
+                .articles
+                .file_groups(segment_id.file_id, &file_spec.groups),
+            priority: file_spec.role.download_priority(),
+            byte_estimate: seg_spec.bytes,
+            retry_count,
+            is_recovery: file_spec.role.is_recovery(),
+            completion_critical,
+            exclude_servers,
+            avoid_server: None,
+        })
+    }
+
+    fn schedule_centralized_download_work_without_retry_budget(
+        &mut self,
+        segment_id: SegmentId,
+        retry_count: u32,
+        exclude_servers: weaver_nntp::ServerSet,
+        delay: Option<Duration>,
+        failure_kind: DownloadFailureKind,
+    ) -> bool {
+        let Some(work) = self.download_retry_work(segment_id, retry_count, exclude_servers) else {
+            return false;
+        };
+        self.note_retry_scheduled(segment_id);
+        let scheduled_pool_generation = self.pool_generation;
+        self.note_infrastructure_retry_scheduled(
+            segment_id.file_id.job_id,
+            failure_kind,
+            delay,
+            exclude_servers,
+        );
+        self.schedule_infrastructure_retry(
+            delay,
+            RetryWork {
+                scheduled_pool_generation,
+                infrastructure_retry: true,
+                hold: crate::pipeline::RetryHold::Ordinary,
+                work,
+            },
+        );
+        true
+    }
+
+    pub(in crate::pipeline) async fn wait_for_egress_quota_capacity(
+        mut changes: tokio::sync::watch::Receiver<u64>,
+        runtime: std::sync::Arc<crate::proxies::ProxyRuntime>,
+        nntp: std::sync::Arc<weaver_nntp::NntpClient>,
+        rejection: weaver_nntp::transfer::QuotaRejection,
+        excludes: weaver_nntp::ServerSet,
+    ) {
+        loop {
+            // A shared capacity revision can come from an unrelated transfer.
+            // Recheck admission before letting a notification unpark this work.
+            let control = runtime
+                .network
+                .egress_controls
+                .control(rejection.stable_server_id);
+            if control
+                .quota_rejection_for_dispatch(rejection.requested_body_bytes)
+                .is_none()
+            {
+                return;
+            }
+            let selection = nntp
+                .body_server_selection_with_estimate(excludes, rejection.requested_body_bytes)
+                .await;
+            if selection.eligible.iter().any(|server| {
+                nntp.pool().stable_server_id(*server).is_none_or(|stable| {
+                    runtime
+                        .network
+                        .has_leg_in_quota(crate::proxies::Consumer::Server(stable.0))
+                })
+            }) {
+                return;
+            }
+            if changes.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    pub(in crate::pipeline::download::worker) fn schedule_download_work_without_retry_budget(
+        &mut self,
+        segment_id: SegmentId,
+        retry_count: u32,
+        exclude_servers: weaver_nntp::ServerSet,
+        delay: Option<Duration>,
+        wake_on_server_policy_change: bool,
+        quota_rejection: Option<weaver_nntp::transfer::QuotaRejection>,
+    ) -> bool {
+        let job_id = segment_id.file_id.job_id;
+        let Some(work) = self.download_retry_work(segment_id, retry_count, exclude_servers) else {
+            return false;
+        };
+        self.note_retry_scheduled(segment_id);
+        let scheduled_pool_generation = self.pool_generation;
+        if wake_on_server_policy_change {
+            self.server_quota_parked.insert(segment_id);
+            self.refresh_server_quota_block_presentation();
+        }
+        let retry_tx = self.retry_tx.clone();
+        let server_transfer_policy = wake_on_server_policy_change
+            .then(|| self.shared_state.server_transfer_policy())
+            .flatten();
+        let server_policy_changes = server_transfer_policy
+            .as_ref()
+            .map(|policy| policy.subscribe_changes());
+        let server_capacity_changes = server_transfer_policy
+            .as_ref()
+            .map(|policy| policy.subscribe_capacity_changes());
+        let rejection_is_current = server_transfer_policy
+            .as_ref()
+            .zip(quota_rejection.as_ref())
+            .is_none_or(|(policy, rejection)| policy.quota_rejection_is_current(rejection));
+        let egress_wait = quota_rejection
+            .filter(|rejection| rejection.scope == weaver_nntp::transfer::TransferScope::Egress)
+            .zip(self.shared_state.proxy_runtime())
+            .map(|(rejection, runtime)| {
+                (
+                    rejection,
+                    runtime,
+                    self.nntp.clone(),
+                    self.effective_exclude_servers(job_id, work.exclude_servers),
+                )
+            });
+        let mut delay = if rejection_is_current || egress_wait.is_some() {
+            delay
+        } else {
+            Some(Duration::ZERO)
+        };
+        if delay.is_none() && server_policy_changes.is_none() && server_capacity_changes.is_none() {
+            delay = Some(Duration::from_secs(1));
+        }
+        let shared_state = self.shared_state.clone();
+        let mut job_changes = shared_state.subscribe_job_changes();
+        tokio::spawn(async move {
+            let wait_for_delay = async move {
+                if let Some(delay) = delay {
+                    tokio::time::sleep(delay).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
+            let wait_for_policy = async move {
+                if let Some(mut changes) = server_policy_changes {
+                    let _ = changes.changed().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
+            let wait_for_capacity = async move {
+                if let Some(mut changes) = server_capacity_changes {
+                    if let Some((rejection, runtime, nntp, excludes)) = egress_wait {
+                        Self::wait_for_egress_quota_capacity(
+                            changes, runtime, nntp, rejection, excludes,
+                        )
+                        .await;
+                    } else {
+                        let _ = changes.changed().await;
+                    }
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
+            let wait_until_retry = async move {
+                tokio::select! {
+                    _ = wait_for_delay => {}
+                    _ = wait_for_policy => {}
+                    _ = wait_for_capacity => {}
+                }
+            };
+            tokio::pin!(wait_until_retry);
+            loop {
+                tokio::select! {
+                    _ = &mut wait_until_retry => break,
+                    _ = retry_tx.closed() => return,
+                    changed = job_changes.changed() => {
+                        let job_inactive = shared_state
+                            .get_job(job_id)
+                            .is_none_or(|job| is_terminal_status(&job.status));
+                        if changed.is_err() || job_inactive {
+                            break;
+                        }
+                    }
+                }
+            }
+            let _ = retry_tx
+                .send(crate::pipeline::RetryWork {
+                    scheduled_pool_generation,
+                    infrastructure_retry: false,
+                    hold: crate::pipeline::RetryHold::Ordinary,
+                    work,
+                })
+                .await;
+        });
+        true
+    }
+
+    pub(crate) fn release_download_result(&mut self, result: &DownloadResult) -> bool {
+        let arrived = Self::released_download_result_lead_bytes(result);
+        if !self.accept_lane_result(result.lane_id, result.segment_id, arrived) {
+            let bytes = match &result.data {
+                #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+                Ok(DownloadPayload::Raw(raw)) => raw.len() as u64,
+                Ok(DownloadPayload::Decoded(decoded)) => decoded.raw_size,
+                Err(DownloadError::Decode { raw_size, .. }) => *raw_size,
+                Err(_) => 0,
+            };
+            self.rate_limiter.consume(bytes);
+            return false;
+        }
+        if result.release_connection_slot
+            && let Some(owner) = self.download_lane_owners.get_mut(&result.lane_id)
+        {
+            owner.connection = false;
+            if owner.outstanding.is_empty() {
+                self.download_lane_owners.remove(&result.lane_id);
+            }
+        }
+        let _cpu_scope =
+            weaver_server_base::runtime::perf_probe::cpu_scope("download.release_result");
+        let stale_generation = result.runtime_generation != self.pool_generation;
+        // The same list the lanes mark a refused lease clean by: none of
+        // these says anything of the server's connection.
+        let policy_outcome = matches!(
+            &result.data,
+            Err(DownloadError::Fetch(failure))
+                if matches!(
+                    failure.kind,
+                    DownloadFailureKind::ServerQuota
+                        | DownloadFailureKind::Unrequested
+                        | DownloadFailureKind::RouteCapacity
+                )
+        );
+        if !policy_outcome && !stale_generation {
+            self.record_download_lane_observation(result);
+        }
+        if result.release_connection_slot {
+            if let Some(observation) = result.lane_observation.as_ref() {
+                let reason = if observation.connection_discarded || !observation.batch_clean {
+                    LaneParkReason::Error
+                } else {
+                    LaneParkReason::NoWork
+                };
+                self.note_download_lane_released(observation.mode, reason);
+            }
+            self.active_download_connections = self.active_download_connections.saturating_sub(1);
+            let job_id = result.job_id;
+            if let Some(in_flight) = self.active_download_connections_by_job.get_mut(&job_id) {
+                *in_flight = in_flight.saturating_sub(1);
+                if *in_flight == 0 {
+                    self.active_download_connections_by_job.remove(&job_id);
+                }
+            }
+            if result.origin.is_completion_critical() {
+                self.active_completion_critical_connections = self
+                    .active_completion_critical_connections
+                    .saturating_sub(1);
+                if let Some(in_flight) = self
+                    .active_completion_critical_connections_by_job
+                    .get_mut(&job_id)
+                {
+                    *in_flight = in_flight.saturating_sub(1);
+                    if *in_flight == 0 {
+                        self.active_completion_critical_connections_by_job
+                            .remove(&job_id);
+                    }
+                }
+            }
+        }
+        self.note_download_activity(result.job_id);
+        self.publish_active_stage_metrics();
+        let actual_raw_bytes = match &result.data {
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+            Ok(DownloadPayload::Raw(raw)) => Some(raw.len() as u64),
+            Ok(DownloadPayload::Decoded(decoded)) => Some(decoded.raw_size),
+            Err(DownloadError::Decode { raw_size, .. } | DownloadError::Local { raw_size, .. }) => {
+                Some(*raw_size)
+            }
+            Err(_) => None,
+        };
+        self.reconcile_rate_limit_for_download(result.segment_id, actual_raw_bytes);
+        true
+    }
+
+    pub(crate) async fn handle_download_done(&mut self, result: DownloadResult) {
+        let released = self.release_download_result(&result);
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+        self.audit_lane_holdings();
+        if released {
+            // What arrived is handed on in this step, as a released result
+            // is (`process_released_download_done`).
+            let job_id = result.job_id;
+            let credit =
+                self.arm_volume_credit(job_id, Self::released_download_result_lead_bytes(&result));
+            self.process_download_done(result).await;
+            self.settle_volume_credit(credit);
+            if !self
+                .pending_released_download_results_by_job
+                .contains_key(&job_id)
+            {
+                self.note_volume_handed_on(job_id);
+            }
+        }
+    }
+
+    pub(crate) fn released_download_result_lead_bytes(result: &DownloadResult) -> u64 {
+        match &result.data {
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+            Ok(DownloadPayload::Raw(bytes)) => bytes.len() as u64,
+            Ok(DownloadPayload::Decoded(decoded)) => decoded.data.len_bytes() as u64,
+            Err(_) => 0,
+        }
+    }
+
+    pub(crate) fn note_released_download_result_pending(&mut self, job_id: JobId, bytes: u64) {
+        let pending = self
+            .pending_released_download_results_by_job
+            .entry(job_id)
+            .or_insert(0);
+        *pending = pending.saturating_add(1);
+        if bytes != 0 {
+            let pending_bytes = self
+                .pending_released_download_result_bytes_by_job
+                .entry(job_id)
+                .or_insert(0);
+            *pending_bytes = pending_bytes.saturating_add(bytes);
+        }
+    }
+
+    // A result of `bytes` that arrived for the job is booked as waiting for
+    // the loop and counted on its volume, as an accepted lane result is
+    // (`Self::accept_lane_result`), for fixtures that book results no lane
+    // returned.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub(crate) fn note_arrived_result_for_test(&mut self, job_id: JobId, bytes: u64) {
+        self.note_released_download_result_pending(job_id, bytes);
+        self.note_volume_arrived(job_id, bytes);
+    }
+
+    // The loop hands on one waiting result of the job of `bytes` whose
+    // writes took nothing, as `process_released_download_done` does.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub(crate) fn hand_on_result_for_test(&mut self, job_id: JobId, bytes: u64) {
+        let credit = self.arm_volume_credit(job_id, bytes);
+        self.settle_volume_credit(credit);
+        self.finish_released_download_result_processing(job_id, bytes);
+    }
+
+    // An article of the job of `bytes` arrives and the loop starts to hand
+    // it on in one step, as `handle_download_done` does: its bytes count on
+    // the volume and become the step's loop credit. The fixture writes it
+    // and ends the step with `Self::end_hand_on_for_test`.
+    #[cfg(test)]
+    pub(crate) fn begin_hand_on_for_test(&mut self, job_id: JobId, bytes: u64) -> Option<Prepaid> {
+        self.note_volume_arrived(job_id, bytes);
+        self.arm_volume_credit(job_id, bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn end_hand_on_for_test(&mut self, job_id: JobId, credit: Option<Prepaid>) {
+        self.settle_volume_credit(credit);
+        if !self
+            .pending_released_download_results_by_job
+            .contains_key(&job_id)
+        {
+            self.note_volume_handed_on(job_id);
+        }
+    }
+
+    // Count `bytes` that arrived for the job, from no lane's reservation,
+    // on the volume its articles are written to (`Self::hold_volume_arrived`).
+    pub(in crate::pipeline) fn note_volume_arrived(&mut self, job_id: JobId, bytes: u64) {
+        let Some(volume) = self
+            .graph_jobs
+            .get(&job_id)
+            .and_then(|graph| graph.disk())
+            .map(|disk| Arc::clone(disk.working().volume()))
+        else {
+            return;
+        };
+        if self.hold_volume_arrived(job_id, Reservation::none(volume), bytes, false) {
+            self.volume_room_changed();
+        }
+    }
+
+    // Hold `bytes` that arrived for the job as counted on the volume of
+    // `from`, the volume its articles are written to, until the loop has
+    // handed them on. `from` is what of the article's lease is reserved
+    // there, settled here to what arrived; nothing for bytes no lease
+    // reserved, which are counted here. One map entry per job with results
+    // waiting; nothing is walked. A job whose bytes now count on another
+    // volume than those it holds, its volume having changed while they
+    // waited, moves those it holds there as well: the entry names the one
+    // volume all of them count on, so each volume gives back only what it
+    // counted. Whether a wake was taken: on the volume left, and, when
+    // `take` says so, on the volume settled.
+    pub(in crate::pipeline) fn hold_volume_arrived(
+        &mut self,
+        job_id: JobId,
+        mut from: Reservation,
+        bytes: u64,
+        take: bool,
+    ) -> bool {
+        let volume = from.volume();
+        let held = self
+            .volume_arrived_by_job
+            .entry(job_id)
+            .or_insert_with(|| Reservation::none(Arc::clone(volume)));
+        let moved = (!Arc::ptr_eq(held.volume(), volume))
+            .then(|| std::mem::replace(held, Reservation::none(Arc::clone(volume))));
+        volume.arrived_bytes.fetch_add(bytes, Ordering::SeqCst);
+        let mut woke = false;
+        if let Some(mut before) = moved {
+            let bytes = before.bytes();
+            before
+                .volume()
+                .arrived_bytes
+                .fetch_sub(bytes, Ordering::SeqCst);
+            before.give_back(bytes);
+            volume.arrived_bytes.fetch_add(bytes, Ordering::SeqCst);
+            held.count(bytes);
+            woke = self.volume_writers.take_wake(before.volume());
+        }
+        let of = from.bytes();
+        from.settle(of, bytes);
+        if take {
+            woke |= self.volume_writers.take_wake(from.volume());
+        }
+        held.join(from);
+        woke
+    }
+
+    // The loop is about to hand on `bytes` of the job that arrived: they
+    // are prepaid for the writes of this step, which take them first
+    // (`Owner::prepay`). What was prepaid, for `settle_volume_credit`.
+    fn arm_volume_credit(&mut self, job_id: JobId, bytes: u64) -> Option<Prepaid> {
+        let held = self.volume_arrived_by_job.get_mut(&job_id)?;
+        let moved = bytes.min(held.bytes());
+        held.volume()
+            .arrived_bytes
+            .fetch_sub(moved, Ordering::SeqCst);
+        Some(self.volume_writers.prepay(held, moved))
+    }
+
+    // The step is done: what was prepaid and its writes did not take no
+    // longer counts.
+    fn settle_volume_credit(&mut self, credit: Option<Prepaid>) {
+        let Some(credit) = credit else {
+            return;
+        };
+        let left = credit.settle();
+        if left != 0 && self.volume_writers.take_wake(credit.volume()) {
+            self.volume_room_changed();
+        }
+    }
+
+    // The job has no result left waiting: whatever of it is still counted
+    // as arrived no longer counts, and dispatch that asked to be woken at
+    // the line the volume has now reached looks again.
+    fn note_volume_handed_on(&mut self, job_id: JobId) {
+        let Some(mut held) = self.volume_arrived_by_job.remove(&job_id) else {
+            return;
+        };
+        let bytes = held.bytes();
+        if bytes != 0 {
+            held.volume()
+                .arrived_bytes
+                .fetch_sub(bytes, Ordering::SeqCst);
+            held.give_back(bytes);
+        }
+        if self.volume_writers.take_wake(held.volume()) {
+            self.volume_room_changed();
+        }
+    }
+
+    pub(crate) fn finish_released_download_result_processing(&mut self, job_id: JobId, bytes: u64) {
+        let remove = if let Some(pending) = self
+            .pending_released_download_results_by_job
+            .get_mut(&job_id)
+        {
+            *pending = pending.saturating_sub(1);
+            *pending == 0
+        } else {
+            false
+        };
+        if remove {
+            self.pending_released_download_results_by_job
+                .remove(&job_id);
+        }
+        if remove {
+            self.note_volume_handed_on(job_id);
+        }
+        if bytes != 0 {
+            let remove_bytes = if let Some(pending_bytes) = self
+                .pending_released_download_result_bytes_by_job
+                .get_mut(&job_id)
+            {
+                *pending_bytes = pending_bytes.saturating_sub(bytes);
+                *pending_bytes == 0
+            } else {
+                false
+            };
+            if remove_bytes {
+                self.pending_released_download_result_bytes_by_job
+                    .remove(&job_id);
+            }
+        }
+    }
+
+    pub(crate) async fn process_released_download_done(&mut self, result: DownloadResult) {
+        let job_id = result.job_id;
+        let lead_bytes = Self::released_download_result_lead_bytes(&result);
+        let credit = self.arm_volume_credit(job_id, lead_bytes);
+        self.process_download_done(result).await;
+        self.settle_volume_credit(credit);
+        self.finish_released_download_result_processing(job_id, lead_bytes);
+        // `process_download_done` ran the drain sequence for this job while
+        // *this* result was still booked as a pending released result — pending
+        // download work by definition — so every drain-conditional step in it
+        // was necessarily refused. That is why an in-flight health probe was
+        // never retired at drain: the last article of a job is very often one
+        // that failed, which produces no decode, and the decode seam is the
+        // only other place that re-runs the sequence.
+        //
+        // So it is re-run once this result's own accounting is closed. The
+        // sequence's `in_flight == 0 && nothing queued` gate makes this a no-op
+        // for every result that is not the job's last, and each step inside it
+        // is idempotent.
+        if self.jobs.contains_key(&job_id) {
+            self.maybe_finish_download_pass(job_id);
+        }
+    }
+
+    pub(crate) async fn process_download_done(&mut self, result: DownloadResult) {
+        let segment_id = result.segment_id;
+        let lane_id = result.lane_id;
+        self.process_download_done_inner(result).await;
+        // A wire outcome that retired this ordinal may have settled damaged
+        // bytes a parked part was waiting to start after. Booking cannot write
+        // a part; this seam can.
+        self.release_settled_unanchored_runs().await;
+        self.finish_checkpoint_progress_article(lane_id, segment_id);
+    }
+
+    async fn process_download_done_inner(&mut self, result: DownloadResult) {
+        let job_id = result.job_id;
+        if !self.job_takes_results(job_id) {
+            debug!(
+                job_id = job_id.0,
+                segment = %result.segment_id,
+                "discarding download result for inactive job"
+            );
+            self.maybe_finish_download_pass(job_id);
+            return;
+        }
+
+        if result.runtime_generation != self.pool_generation && result.data.is_err() {
+            // The servers the article was tried on, carried into the pool as
+            // it is now laid out; a 430 from the server that answered counts
+            // as tried too, when that server is still in the pool.
+            let generation = result.runtime_generation;
+            let mut tried = self.pool_layouts.set(generation, result.exclude_servers);
+            if matches!(
+                &result.data,
+                Err(DownloadError::Fetch(failure))
+                    if failure.kind == DownloadFailureKind::ArticleNotFound
+            ) && let Some(source) = result
+                .source_server_idx
+                .and_then(|source| self.pool_layouts.index(generation, source))
+            {
+                tried.insert(source);
+            }
+            let restored = self.restore_download_result_work_without_retry(
+                result.segment_id,
+                result.retry_count,
+                tried,
+            );
+            self.metrics
+                .nntp_generation_recovery_requeues
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(
+                job_id = job_id.0,
+                segment = %result.segment_id,
+                dispatched_generation = result.runtime_generation,
+                active_generation = self.pool_generation,
+                restored,
+                "returned stale NNTP generation failure without charging retry budget"
+            );
+            self.maybe_finish_download_pass(job_id);
+            return;
+        }
+
+        let (excluded_servers, source_server_idx) = {
+            let _cpu_scope = weaver_server_base::runtime::perf_probe::cpu_scope(
+                "download.process_done.pre_match",
+            );
+            let excluded_servers = result.exclude_servers;
+            let source_server_idx = result.source_server_idx;
+
+            let is_recovery = result.origin.is_recovery();
+            // Per-server counters are indexed by the runtime `server_idx` of
+            // the generation the result was dispatched under. After a rebuild
+            // the same index may name a different server, so results from a
+            // superseded generation are not attributed at all (an out-of-range
+            // index is caught by the bounds check below either way). One
+            // integer compare; the stale case only exists around a config
+            // reload.
+            let attribute_to_servers = result.runtime_generation == self.pool_generation;
+            if attribute_to_servers {
+                self.nntp.record_fetch_attempts(&result.attempts);
+            }
+            for (attempt_index, attempt) in result.attempts.iter().enumerate() {
+                // Per-server metric accounting. Hot-path safe: a bounds-checked
+                // index into a lock-free `Vec<Arc<ServerCounters>>` followed by
+                // `Relaxed` `fetch_add`s and a histogram observation over the
+                // `elapsed` this attempt already carries. No allocation, no
+                // lock, no clock read, no map lookup.
+                let metric_outcome = match attempt.outcome {
+                    FetchAttemptOutcome::Success => {
+                        weaver_server_base::operations::instrumentation::ServerAttemptOutcomeKind::Success
+                    }
+                    FetchAttemptOutcome::NotFound => {
+                        weaver_server_base::operations::instrumentation::ServerAttemptOutcomeKind::NotFound
+                    }
+                    FetchAttemptOutcome::AuthenticationFailure => {
+                        weaver_server_base::operations::instrumentation::ServerAttemptOutcomeKind::AuthFailure
+                    }
+                    FetchAttemptOutcome::TransientFailure
+                    | FetchAttemptOutcome::GroupSelectionRequired => {
+                        weaver_server_base::operations::instrumentation::ServerAttemptOutcomeKind::TransientFailure
+                    }
+                    FetchAttemptOutcome::PermanentFailure => {
+                        weaver_server_base::operations::instrumentation::ServerAttemptOutcomeKind::PermanentFailure
+                    }
+                    FetchAttemptOutcome::QuotaBlocked | FetchAttemptOutcome::QuotaUnrequested => {
+                        weaver_server_base::operations::instrumentation::ServerAttemptOutcomeKind::QuotaBlocked
+                    }
+                };
+                if let Some(counters) = attribute_to_servers
+                    .then(|| self.server_counters.get(attempt.server_idx))
+                    .flatten()
+                {
+                    counters.note_attempt(metric_outcome, is_recovery);
+                    // A quota block never reached the wire, so its `elapsed` is
+                    // not a round-trip and would poison the latency histogram.
+                    if metric_outcome.has_round_trip() {
+                        counters.observe_latency(attempt.elapsed);
+                    }
+                }
+
+                let outcome = match attempt.outcome {
+                    FetchAttemptOutcome::QuotaBlocked | FetchAttemptOutcome::QuotaUnrequested => {
+                        continue;
+                    }
+                    FetchAttemptOutcome::Success => {
+                        weaver_server_base::events::model::ServerAttemptOutcome::Success
+                    }
+                    FetchAttemptOutcome::NotFound => {
+                        weaver_server_base::events::model::ServerAttemptOutcome::NotFound
+                    }
+                    FetchAttemptOutcome::AuthenticationFailure => {
+                        weaver_server_base::events::model::ServerAttemptOutcome::AuthenticationFailure
+                    }
+                    FetchAttemptOutcome::TransientFailure
+                    | FetchAttemptOutcome::GroupSelectionRequired => {
+                        weaver_server_base::events::model::ServerAttemptOutcome::TransientFailure
+                    }
+                    FetchAttemptOutcome::PermanentFailure => {
+                        weaver_server_base::events::model::ServerAttemptOutcome::PermanentFailure
+                    }
+                };
+                self.send_segment_event(|| PipelineEvent::ServerAttempt {
+                    segment_id: result.segment_id,
+                    server_id: crate::ServerId(attempt.server_idx as u16),
+                    attempt: (attempt_index as u32) + 1,
+                    retry_count: result.retry_count,
+                    latency_ms: attempt.elapsed.as_millis().min(u64::MAX as u128) as u64,
+                    outcome,
+                    error: attempt.error.clone(),
+                    is_recovery,
+                });
+            }
+
+            (excluded_servers, source_server_idx)
+        };
+
+        // Per-job attribution reads the same runtime index the per-server
+        // counters above do, and carries the same caveat: after a pool rebuild
+        // the index may name a different server, so a result dispatched under a
+        // superseded generation is left uncounted rather than charged to
+        // whoever now holds its slot. One integer compare per result.
+        let attributed_server_idx = (result.runtime_generation == self.pool_generation)
+            .then_some(source_server_idx)
+            .flatten();
+
+        if result.data.is_ok() {
+            self.refresh_server_quota_block_presentation();
+        }
+
+        match result.data {
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+            Ok(DownloadPayload::Raw(raw)) => {
+                // Empty unless something is failing: skip the hash per article.
+                if !self.transport_failure_streaks.is_empty() {
+                    self.transport_failure_streaks.remove(&result.segment_id);
+                }
+                let raw_size_bytes = raw.len() as u64;
+                let raw_size = raw.len() as u32;
+                self.metrics
+                    .bytes_downloaded
+                    .fetch_add(raw_size_bytes, Ordering::Relaxed);
+                self.metrics
+                    .segments_downloaded
+                    .fetch_add(1, Ordering::Relaxed);
+
+                self.note_job_wire_bytes(result.segment_id, raw_size_bytes, attributed_server_idx);
+
+                self.send_segment_event(|| PipelineEvent::ArticleDownloaded {
+                    segment_id: result.segment_id,
+                    raw_size,
+                });
+
+                self.metrics.note_decode_work_queued(raw_size_bytes);
+                self.pending_decode.push_back(PendingDecodeWork {
+                    segment_id: result.segment_id,
+                    raw,
+                    servers: PoolServers::stamped(
+                        result.runtime_generation,
+                        source_server_idx,
+                        excluded_servers,
+                    ),
+                });
+                self.pump_decode_queue();
+            }
+            Ok(DownloadPayload::Decoded(decoded)) => {
+                // Empty unless something is failing: skip the hash per article.
+                if !self.transport_failure_streaks.is_empty() {
+                    self.transport_failure_streaks.remove(&result.segment_id);
+                }
+                let raw_size_bytes = decoded.raw_size;
+                let raw_size = raw_size_bytes.min(u64::from(u32::MAX)) as u32;
+                {
+                    let _cpu_scope = weaver_server_base::runtime::perf_probe::cpu_scope(
+                        "download.process_done.decoded_pre_success",
+                    );
+                    self.metrics
+                        .bytes_downloaded
+                        .fetch_add(raw_size_bytes, Ordering::Relaxed);
+                    self.metrics
+                        .segments_downloaded
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.note_job_wire_bytes(
+                        result.segment_id,
+                        raw_size_bytes,
+                        attributed_server_idx,
+                    );
+                    self.send_segment_event(|| PipelineEvent::ArticleDownloaded {
+                        segment_id: result.segment_id,
+                        raw_size,
+                    });
+                }
+
+                self.handle_decode_success(
+                    decoded,
+                    SegmentSource {
+                        servers: PoolServers::stamped(
+                            result.runtime_generation,
+                            source_server_idx,
+                            excluded_servers,
+                        ),
+                    },
+                )
+                .await;
+            }
+            Err(DownloadError::Decode { raw_size, error }) => {
+                let raw_size_for_event = raw_size.min(u64::from(u32::MAX)) as u32;
+                self.metrics
+                    .bytes_downloaded
+                    .fetch_add(raw_size, Ordering::Relaxed);
+                self.metrics
+                    .segments_downloaded
+                    .fetch_add(1, Ordering::Relaxed);
+                self.note_job_wire_bytes(result.segment_id, raw_size, attributed_server_idx);
+                self.metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
+
+                self.send_segment_event(|| PipelineEvent::ArticleDownloaded {
+                    segment_id: result.segment_id,
+                    raw_size: raw_size_for_event,
+                });
+                warn!(segment = %result.segment_id, error = %error, "streamed yEnc decode failed");
+                self.handle_decode_failure(
+                    result.segment_id,
+                    &error,
+                    PoolServers::stamped(
+                        result.runtime_generation,
+                        source_server_idx,
+                        excluded_servers,
+                    ),
+                );
+            }
+            Err(DownloadError::Local { raw_size, error }) => {
+                self.metrics
+                    .bytes_downloaded
+                    .fetch_add(raw_size, Ordering::Relaxed);
+                self.note_job_wire_bytes(result.segment_id, raw_size, attributed_server_idx);
+                self.fail_job(job_id, error);
+            }
+            Err(DownloadError::Fetch(failure)) => {
+                if matches!(
+                    failure.kind,
+                    DownloadFailureKind::CapacityUnavailable
+                        | DownloadFailureKind::ConnectionEstablishment
+                        | DownloadFailureKind::EstablishedTransport
+                        | DownloadFailureKind::Unanswered
+                        | DownloadFailureKind::Auth
+                        | DownloadFailureKind::ContentOrProtocol
+                ) && self.unclean_batch_is_server_fault(job_id)
+                    && let Some(suppressed_since_last) = self
+                        .body_fetch_failure_log_throttle
+                        .admit(job_id, BODY_FETCH_FAILURE_LOG_INTERVAL)
+                {
+                    info!(
+                        job_id = job_id.0,
+                        segment = %result.segment_id,
+                        failure_kind = ?failure.kind,
+                        retry_count = result.retry_count,
+                        attempt_count = result.attempts.len(),
+                        source_server_idx = ?source_server_idx,
+                        suppressed_since_last,
+                        error = %failure.message,
+                        "NNTP BODY fetch failed"
+                    );
+                    self.dump_job_debug_ring(job_id, "NNTP BODY fetch failed");
+                }
+                if failure.kind == DownloadFailureKind::ServerQuota {
+                    let mut retry_after = failure.retry_after;
+                    let mut quota_rejection = failure.quota_rejection;
+                    let egress_rejection = quota_rejection
+                        .as_ref()
+                        .filter(|rejection| {
+                            rejection.scope == weaver_nntp::transfer::TransferScope::Egress
+                        })
+                        .cloned();
+                    if egress_rejection.is_some()
+                        && let Some(runtime) = self.shared_state.proxy_runtime()
+                    {
+                        // Take the exhausted egress out of every route now, so
+                        // the selection below sees only legs with quota left,
+                        // the same way a dead link drops out.
+                        runtime.network.refresh_health_if_changed();
+                    }
+                    let mut park_for_quota =
+                        source_server_idx.is_none() && egress_rejection.is_none();
+                    let mut parked_egress = None;
+                    if (source_server_idx.is_some() || egress_rejection.is_some())
+                        && let Some(rejection) = quota_rejection.as_ref()
+                    {
+                        let effective_excludes =
+                            self.effective_exclude_servers(job_id, excluded_servers);
+                        let mut selection = self
+                            .nntp
+                            .body_server_selection_with_estimate(
+                                effective_excludes,
+                                rejection.requested_body_bytes,
+                            )
+                            .await;
+                        if egress_rejection.is_some()
+                            && let Some(runtime) = self.shared_state.proxy_runtime()
+                        {
+                            // A server whose every route leg is out of quota
+                            // cannot dial; retrying it would only queue work
+                            // no lane can take.
+                            let pool = self.nntp.pool();
+                            selection.eligible.retain(|server| {
+                                pool.stable_server_id(*server).is_none_or(|stable| {
+                                    runtime.network.has_leg_in_quota(
+                                        crate::proxies::Consumer::Server(stable.0),
+                                    )
+                                })
+                            });
+                        }
+                        if selection.eligible.is_empty() {
+                            if let Some(current) = selection.quota_blocked {
+                                retry_after = current.retry_at.map(|deadline| {
+                                    deadline.saturating_duration_since(Instant::now())
+                                });
+                                quota_rejection = Some(current);
+                                park_for_quota = true;
+                            } else if let Some(egress) = egress_rejection.as_ref() {
+                                // No server is reachable over any leg with
+                                // quota left: the egress quota holds the work.
+                                retry_after = egress.retry_at.map(|deadline| {
+                                    deadline.saturating_duration_since(Instant::now())
+                                });
+                                parked_egress = Some(egress.stable_server_id.0);
+                                park_for_quota = true;
+                            }
+                        }
+                    }
+
+                    if park_for_quota {
+                        if let Some(egress_id) = parked_egress {
+                            self.egress_quota_parked
+                                .insert(result.segment_id, egress_id);
+                        } else {
+                            self.egress_quota_parked.remove(&result.segment_id);
+                        }
+                        if self.schedule_download_work_without_retry_budget(
+                            result.segment_id,
+                            result.retry_count,
+                            excluded_servers,
+                            retry_after,
+                            true,
+                            quota_rejection,
+                        ) {
+                            debug!(
+                                segment = %result.segment_id,
+                                egress = ?parked_egress,
+                                retry_after_ms = ?retry_after.map(|value| value.as_millis()),
+                                "download quota blocked this work's eligible servers; parked without consuming retry budget"
+                            );
+                        } else {
+                            self.egress_quota_parked.remove(&result.segment_id);
+                        }
+                    } else if egress_rejection.is_some()
+                        && self.schedule_download_work_without_retry_budget(
+                            result.segment_id,
+                            result.retry_count,
+                            excluded_servers,
+                            Some(Duration::ZERO),
+                            false,
+                            None,
+                        )
+                    {
+                        debug!(
+                            segment = %result.segment_id,
+                            "egress quota refused BODY admission; retrying over the legs still in quota"
+                        );
+                    } else if let Some(source_server_idx) = source_server_idx
+                        && self.schedule_download_work_without_retry_budget(
+                            result.segment_id,
+                            result.retry_count,
+                            excluded_servers,
+                            Some(Duration::ZERO),
+                            false,
+                            None,
+                        )
+                    {
+                        debug!(
+                            segment = %result.segment_id,
+                            source_server_idx,
+                            "server quota rejected BODY admission; retrying eligible fill servers without unlocking backfill"
+                        );
+                    }
+                    self.maybe_finish_download_pass(job_id);
+                    return;
+                }
+                if failure.kind == DownloadFailureKind::Unrequested {
+                    if self.restore_download_result_work_without_retry(
+                        result.segment_id,
+                        result.retry_count,
+                        excluded_servers,
+                    ) {
+                        debug!(
+                            segment = %result.segment_id,
+                            error = %failure.message,
+                            "restored unrequested download work without consuming retry budget"
+                        );
+                    }
+                    self.maybe_finish_download_pass(job_id);
+                    return;
+                }
+                if matches!(
+                    failure.kind,
+                    DownloadFailureKind::LaneUnavailable | DownloadFailureKind::RouteCapacity
+                ) {
+                    let route_full = failure.kind == DownloadFailureKind::RouteCapacity;
+                    // A work item no server may serve (failure exclusions,
+                    // retention, credential refusals) can never be served: the
+                    // order it builds is empty, so it would requeue through
+                    // this arm forever without a fetch to fail. A job older
+                    // than every server's retention window hits exactly this.
+                    // Book it as missing instead.
+                    let server_count = self.nntp.pool().server_count();
+                    let retention_excludes = self.job_retention_excludes(job_id);
+                    let unavailable_server_count = Self::unavailable_server_count_from_excludes(
+                        self.nntp.pool(),
+                        excluded_servers,
+                        retention_excludes,
+                    );
+                    if server_count > 0 && unavailable_server_count >= server_count {
+                        self.book_unservable_segment(result.segment_id, excluded_servers);
+                        self.maybe_finish_download_pass(job_id);
+                        return;
+                    }
+                    // Servers exist that could serve this article but none is
+                    // eligible right now. When that is a health condition
+                    // rather than saturation (empty order, not just busy
+                    // permits), surface it — a fill server stuck in
+                    // auth-disable cycles otherwise stalls the queue silently.
+                    let availability = self
+                        .nntp
+                        .body_server_availability(excluded_servers, retention_excludes, 0)
+                        .await;
+                    let retry_delay = match availability {
+                        weaver_nntp::pool::BodyServerAvailability::Eligible => {
+                            Some(BODY_LANE_UNAVAILABLE_RETRY_DELAY)
+                        }
+                        weaver_nntp::pool::BodyServerAvailability::WaitingUntil(delay) => {
+                            Some(delay)
+                        }
+                        // Eligibility can change without rebuilding the
+                        // client (for example, a quota reservation refund).
+                        // Keep a bounded recheck so these articles cannot
+                        // become an indefinite wait with no wake source.
+                        weaver_nntp::pool::BodyServerAvailability::Blocked => {
+                            Some(BODY_SERVER_BLOCKED_RECHECK_DELAY)
+                        }
+                    };
+                    // An eligible server means nothing about the *servers*
+                    // turned this work away: the lane was not opened because
+                    // local lane capacity was spent. That is self-clearing and
+                    // has nothing to do with server health or credentials, so
+                    // it neither warns nor sends anyone to their account page.
+                    // A full network route is the same kind of wait, told as
+                    // what it is.
+                    let eligible = matches!(
+                        availability,
+                        weaver_nntp::pool::BodyServerAvailability::Eligible
+                    );
+                    if eligible && route_full {
+                        if let Some(suppressed_since_last) = self
+                            .body_lane_capacity_log_throttle
+                            .admit(job_id, BODY_LANE_CAPACITY_LOG_INTERVAL)
+                        {
+                            info!(
+                                job_id = job_id.0,
+                                segment = %result.segment_id,
+                                configured_server_count = server_count,
+                                excluded_server_count = unavailable_server_count,
+                                retry_delay_ms = BODY_LANE_UNAVAILABLE_RETRY_DELAY.as_millis() as u64,
+                                failure_kind = ?failure.kind,
+                                suppressed_since_last,
+                                error = %failure.message,
+                                "downloads waiting: the news server's network route is full; the work retries as the route frees"
+                            );
+                            self.dump_job_debug_ring(
+                                job_id,
+                                "downloads waiting: the news server's network route is full",
+                            );
+                        }
+                    } else if eligible {
+                        if let Some(suppressed_since_last) = self
+                            .body_lane_capacity_log_throttle
+                            .admit(job_id, BODY_LANE_CAPACITY_LOG_INTERVAL)
+                        {
+                            info!(
+                                job_id = job_id.0,
+                                segment = %result.segment_id,
+                                configured_server_count = server_count,
+                                excluded_server_count = unavailable_server_count,
+                                retry_delay_ms = BODY_LANE_UNAVAILABLE_RETRY_DELAY.as_millis() as u64,
+                                failure_kind = ?failure.kind,
+                                suppressed_since_last,
+                                error = %failure.message,
+                                "downloads waiting: local BODY lane capacity is saturated; a server is eligible and the work retries as lanes free"
+                            );
+                            self.dump_job_debug_ring(
+                                job_id,
+                                "downloads waiting: local BODY lane capacity is saturated",
+                            );
+                        }
+                    } else if let Some(suppressed_since_last) = self
+                        .no_eligible_server_warn_throttle
+                        .admit(job_id, NO_ELIGIBLE_SERVER_WARN_INTERVAL)
+                    {
+                        warn!(
+                            job_id = job_id.0,
+                            segment = %result.segment_id,
+                            configured_server_count = server_count,
+                            excluded_server_count = unavailable_server_count,
+                            availability = ?availability,
+                            failure_kind = ?failure.kind,
+                            suppressed_since_last,
+                            error = %failure.message,
+                            "downloads waiting: no eligible news server (cooling down, disabled, or outside retention); check server health and credentials"
+                        );
+                        self.dump_job_debug_ring(
+                            job_id,
+                            "downloads waiting: no eligible news server",
+                        );
+                    }
+                    self.metrics
+                        .download_failures_capacity_unavailable
+                        .fetch_add(1, Ordering::Relaxed);
+                    if self.schedule_centralized_download_work_without_retry_budget(
+                        result.segment_id,
+                        result.retry_count,
+                        excluded_servers,
+                        retry_delay,
+                        failure.kind,
+                    ) {
+                        debug!(
+                            job_id = job_id.0,
+                            segment = %result.segment_id,
+                            retry_count = result.retry_count,
+                            retry_delay_ms = ?retry_delay.map(|delay| delay.as_millis() as u64),
+                            error = %failure.message,
+                            "body lane unavailable; requeued without consuming article retry budget"
+                        );
+                    } else {
+                        warn!(
+                            job_id = job_id.0,
+                            segment = %result.segment_id,
+                            error = %failure.message,
+                            "body lane unavailable (job gone, not retrying)"
+                        );
+                    }
+                    self.maybe_finish_download_pass(job_id);
+                    return;
+                }
+                let terminal_cause = match &failure.kind {
+                    DownloadFailureKind::ArticleNotFound => {
+                        crate::jobs::SemanticTerminalCause::MissingArticlesOrLowHealth
+                    }
+                    DownloadFailureKind::Auth
+                    | DownloadFailureKind::ServerQuota
+                    | DownloadFailureKind::CapacityUnavailable
+                    | DownloadFailureKind::LaneUnavailable
+                    | DownloadFailureKind::RouteCapacity
+                    | DownloadFailureKind::ConnectionEstablishment
+                    | DownloadFailureKind::EstablishedTransport
+                    | DownloadFailureKind::Unanswered
+                    | DownloadFailureKind::Unrequested => {
+                        crate::jobs::SemanticTerminalCause::ServerAuthQuotaOrOutage
+                    }
+                    DownloadFailureKind::ContentOrProtocol => {
+                        crate::jobs::SemanticTerminalCause::DecodeOrCorruptData
+                    }
+                };
+                // The failure becomes the job's cause only where it ends the
+                // article, below. A failure the article is retried past says
+                // nothing of the job once the article is served, and left
+                // standing a login or transport failure would keep a later
+                // failure of the job from trying its next duplicate.
+                match &failure.kind {
+                    DownloadFailureKind::ArticleNotFound => self
+                        .metrics
+                        .download_failures_article_not_found
+                        .fetch_add(1, Ordering::Relaxed),
+                    DownloadFailureKind::CapacityUnavailable
+                    | DownloadFailureKind::LaneUnavailable
+                    | DownloadFailureKind::RouteCapacity => self
+                        .metrics
+                        .download_failures_capacity_unavailable
+                        .fetch_add(1, Ordering::Relaxed),
+                    DownloadFailureKind::Unrequested | DownloadFailureKind::ServerQuota => 0,
+                    DownloadFailureKind::ConnectionEstablishment
+                    | DownloadFailureKind::EstablishedTransport
+                    | DownloadFailureKind::Unanswered => self
+                        .metrics
+                        .download_failures_transient
+                        .fetch_add(1, Ordering::Relaxed),
+                    DownloadFailureKind::Auth => self
+                        .metrics
+                        .download_failures_auth
+                        .fetch_add(1, Ordering::Relaxed),
+                    DownloadFailureKind::ContentOrProtocol => self
+                        .metrics
+                        .download_failures_permanent
+                        .fetch_add(1, Ordering::Relaxed),
+                };
+                let article_not_found_server_idx =
+                    if failure.kind == DownloadFailureKind::ArticleNotFound {
+                        source_server_idx.or_else(|| {
+                            result.attempts.iter().rev().find_map(|attempt| {
+                                matches!(
+                                    attempt.outcome,
+                                    weaver_nntp::client::FetchAttemptOutcome::NotFound
+                                )
+                                .then_some(attempt.server_idx)
+                            })
+                        })
+                    } else {
+                        source_server_idx
+                    };
+                let source_not_found = failure.kind == DownloadFailureKind::ArticleNotFound
+                    && article_not_found_server_idx.is_some();
+                // A server refusing the credentials leaves the article's
+                // candidates through the pool's refusal, not through the
+                // article's exclusions: those record servers that lack the
+                // article, and a fill server listed there would open the
+                // backfill tier to an article no fill server has missed.
+                let retry_exclude_servers = match failure.kind {
+                    DownloadFailureKind::ArticleNotFound => Self::decode_retry_exclude_servers(
+                        excluded_servers,
+                        article_not_found_server_idx,
+                    ),
+                    _ => excluded_servers,
+                };
+                // A 430 from a server the article already excluded taught
+                // the retry nothing: the next attempt re-enters selection
+                // with the same set, comes back the same way at zero delay,
+                // and — because a sourced 430 preserves retry budget — would
+                // do so forever. Treat it as terminal rather than spin, and
+                // count it: the article is not necessarily missing
+                // everywhere, but nothing on this path can still prove
+                // otherwise. A 430 without a source spends budget on each
+                // retry and cannot spin, so it keeps retrying with the set it
+                // has.
+                let article_not_found_learned_nothing = source_not_found
+                    && !retry_exclude_servers.is_empty()
+                    && retry_exclude_servers.len() == excluded_servers.len();
+                let article_not_found_exhausted = failure.kind
+                    == DownloadFailureKind::ArticleNotFound
+                    && (retry_exclude_servers.is_empty() || article_not_found_learned_nothing || {
+                        let server_count = self.nntp.pool().server_count();
+                        server_count > 0 && {
+                            // Retention-excluded servers can never 430; they
+                            // count as unavailable or exhaustion could not
+                            // complete while one is configured.
+                            self.unavailable_server_count(job_id, retry_exclude_servers)
+                                >= server_count
+                        }
+                    });
+                if article_not_found_learned_nothing {
+                    self.metrics
+                        .articles_not_found_without_new_server
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                // No server left that may serve it once the refusal is
+                // counted: a verdict, booked now, not a retry to wait on.
+                let credentials_exhausted = failure.kind == DownloadFailureKind::Auth
+                    && self.no_server_can_serve(job_id, retry_exclude_servers);
+
+                // Transport rotation: point the retry away from the server
+                // whose established connection just failed, when an
+                // alternative FILL server remains. Without this the retry
+                // re-enters selection that still prefers the same
+                // healthy-looking primary, so under sustained stochastic
+                // stall (e.g. 10% of bodies timing out) every retry can land
+                // on the flaky server while a clean backup idles. Replace
+                // semantics — only the most recent failure is avoided — so
+                // rotation can never exclude every server, and single-server
+                // setups are untouched. The alternative must be a fill
+                // server: the avoid hint joins the lease's effective
+                // excludes, and an exclude set covering the whole fill tier
+                // unlocks backfill (`fill_servers_exhausted`) — backfill is
+                // reserved for articles the fill tier is missing, never for
+                // transient blips the primary can serve on the next attempt.
+                let avoid_server = if matches!(
+                    failure.kind,
+                    DownloadFailureKind::EstablishedTransport | DownloadFailureKind::Unanswered
+                ) && let Some(idx) = source_server_idx
+                {
+                    let retention_excludes = self.job_retention_excludes(job_id);
+                    let backfill = self.nntp.pool().server_backfill_flags();
+                    let other_fill_available =
+                        backfill.iter().enumerate().any(|(other, is_backfill)| {
+                            other != idx
+                                && !is_backfill
+                                && !retry_exclude_servers.contains(other)
+                                && !retention_excludes.contains(other)
+                        });
+                    (idx < backfill.len() && other_fill_available).then_some(idx)
+                } else {
+                    None
+                };
+
+                if article_not_found_exhausted {
+                    // Every server is missing the id in use: the article moves
+                    // to its next id, or with every id spent is booked missing.
+                    if !self.spend_message_id(result.segment_id) {
+                        warn!(
+                            segment = %result.segment_id,
+                            error = %failure.message,
+                            "article missing on every server; segment lost"
+                        );
+                        self.semantic_terminal_causes.insert(job_id, terminal_cause);
+                        self.metrics
+                            .articles_not_found
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.send_segment_event(|| PipelineEvent::ArticleNotFound {
+                            segment_id: result.segment_id,
+                        });
+                        // A server that refuses the login was never asked:
+                        // the article is unservable, not known to be gone,
+                        // and the job keeps which server refused.
+                        let refused_by = self.login_refused_unasked(job_id, retry_exclude_servers);
+                        let booked = if refused_by.is_empty() {
+                            self.book_failed_segment(result.segment_id)
+                        } else {
+                            self.book_terminal_segment(
+                                result.segment_id,
+                                SegmentTerminalState::UnservableNotFound,
+                            )
+                        };
+                        if booked {
+                            self.note_gap_servers_support_fact(job_id, retry_exclude_servers);
+                        }
+                        self.note_login_refusals(job_id, refused_by);
+                    }
+                } else if credentials_exhausted {
+                    // The refusal is not the job's cause: the article may move
+                    // to its next id and be served, and booked past a refusing
+                    // server it records the missing articles itself.
+                    self.book_unservable_segment(result.segment_id, retry_exclude_servers);
+                    // The refusal holds for the job's queued articles too:
+                    // every one only refusing servers could serve is booked
+                    // in this pass, not leased one batch at a time to be
+                    // refused again.
+                    self.retire_unservable_queued_work(job_id);
+                    // A login refused past the give-up time is the verdict
+                    // for every job that waited on the server, not this
+                    // one alone.
+                    self.tell_login_refusal_verdicts();
+                } else {
+                    let seg_id = result.segment_id;
+                    let completion_critical = self.segment_is_completion_critical(seg_id);
+                    let transport_streak = self.note_transport_failure_streak(seg_id, &failure);
+                    // A transport fault normally says nothing about the
+                    // article. A run of them on one segment while other
+                    // segments keep downloading does: the article is what
+                    // breaks the connection, so it starts paying for retries
+                    // like any other bad article.
+                    let article_local_transport = transport_streak.is_some_and(|streak| {
+                        streak.failures >= SEGMENT_TRANSPORT_STREAK_ARTICLE_LOCAL
+                            && self.metrics.segments_downloaded.load(Ordering::Relaxed)
+                                > streak.downloaded_at_start
+                    });
+                    let preserves_retry_budget =
+                        failure.preserves_article_retry_budget() && !article_local_transport;
+                    let mut infrastructure_retry =
+                        failure.kind.infrastructure_wait_reason().is_some();
+                    let mut transport_streak = transport_streak;
+                    let mut next_retry = if preserves_retry_budget || source_not_found {
+                        result.retry_count
+                    } else {
+                        result.retry_count + 1
+                    };
+                    // A server that answered BODY with something unreadable,
+                    // or whose transport failed on this article alone, for
+                    // every try could not produce the article: with its tries
+                    // spent it joins the article's exclusions, as a server
+                    // without the article does, and the next server is asked
+                    // at once with a fresh count and no transport run. Only
+                    // with none left is the article booked below.
+                    let mut retry_exclude_servers = retry_exclude_servers;
+                    let next_server_excludes = (next_retry > MAX_SEGMENT_RETRIES)
+                        .then(|| {
+                            self.next_server_after_spent_tries(
+                                job_id,
+                                failure.kind,
+                                source_server_idx,
+                                retry_exclude_servers,
+                            )
+                        })
+                        .flatten();
+                    let moved_to_next_server = next_server_excludes.is_some();
+                    if let Some(excludes) = next_server_excludes {
+                        debug!(
+                            segment = %seg_id,
+                            error = %failure.message,
+                            server = ?source_server_idx,
+                            "article's tries spent on one server; asking the next server"
+                        );
+                        retry_exclude_servers = excludes;
+                        next_retry = 0;
+                        self.transport_failure_streaks.remove(&seg_id);
+                        transport_streak = None;
+                        infrastructure_retry = false;
+                    }
+
+                    if next_retry > MAX_SEGMENT_RETRIES {
+                        warn!(
+                            segment = %seg_id,
+                            error = %failure.message,
+                            retries = MAX_SEGMENT_RETRIES,
+                            "segment failed permanently after max retries"
+                        );
+                        self.metrics
+                            .segments_failed_permanent
+                            .fetch_add(1, Ordering::Relaxed);
+                        // Retry exhaustion is as terminal as a missing
+                        // article: without this, health stays optimistic and
+                        // recovery promotion waits for post-download verify.
+                        self.transport_failure_streaks.remove(&seg_id);
+                        self.semantic_terminal_causes.insert(job_id, terminal_cause);
+                        if self
+                            .book_terminal_segment(seg_id, SegmentTerminalState::RetriesExhausted)
+                        {
+                            self.note_gap_servers_support_fact(
+                                job_id,
+                                source_server_idx.into_iter().collect(),
+                            );
+                        }
+                    } else if let Some(state) = self.jobs.get(&job_id) {
+                        let file_idx = seg_id.file_id.file_index as usize;
+                        if let Some(file_spec) = state.spec.files.get(file_idx)
+                            && let Some(seg_spec) = file_spec.segment(seg_id.segment_number)
+                        {
+                            let priority = file_spec.role.download_priority();
+                            let work = DownloadWork {
+                                counters: None,
+                                segment_id: seg_id,
+                                message_id: weaver_server_base::jobs::ids::MessageId::new(
+                                    seg_spec.message_ids.in_use(),
+                                ),
+                                groups: state
+                                    .articles
+                                    .file_groups(seg_id.file_id, &file_spec.groups),
+                                priority,
+                                byte_estimate: seg_spec.bytes,
+                                retry_count: next_retry,
+                                is_recovery: file_spec.role.is_recovery(),
+                                completion_critical,
+                                exclude_servers: retry_exclude_servers,
+                                avoid_server,
+                            };
+                            self.metrics
+                                .segments_retried
+                                .fetch_add(1, Ordering::Relaxed);
+                            let hold = if self
+                                .transport_streak_holds_retry(transport_streak, source_server_idx)
+                            {
+                                crate::pipeline::RetryHold::ProbeHold
+                            } else {
+                                crate::pipeline::RetryHold::Ordinary
+                            };
+                            let delay = if hold == crate::pipeline::RetryHold::ProbeHold {
+                                // The failure that quarantines a server is
+                                // followed by one probe, and the probe takes
+                                // the highest-priority work — this segment
+                                // again. Hold it past the recovery backoff so
+                                // the probe carries different work and a
+                                // healthy server can prove itself.
+                                warn!(
+                                    segment = %seg_id,
+                                    error = %failure.message,
+                                    hold_secs = SEGMENT_TRANSPORT_HOLD_DELAY.as_secs(),
+                                    "segment keeps failing on an established connection to a \
+                                     quarantined server; holding its retry so other work \
+                                     reaches the server first"
+                                );
+                                SEGMENT_TRANSPORT_HOLD_DELAY
+                            } else if infrastructure_retry {
+                                std::time::Duration::from_secs(1)
+                            } else if source_not_found || moved_to_next_server {
+                                std::time::Duration::ZERO
+                            } else {
+                                std::time::Duration::from_secs(1 << (next_retry - 1))
+                            };
+                            self.note_retry_scheduled(seg_id);
+                            if infrastructure_retry {
+                                self.note_infrastructure_retry_scheduled(
+                                    job_id,
+                                    failure.kind,
+                                    Some(delay),
+                                    retry_exclude_servers,
+                                );
+                            }
+                            debug!(
+                                segment = %seg_id,
+                                error = %failure.message,
+                                retry = next_retry,
+                                delay_secs = delay.as_secs(),
+                                "download failed, scheduling retry"
+                            );
+                            let scheduled_pool_generation = self.pool_generation;
+                            let retry = crate::pipeline::RetryWork {
+                                scheduled_pool_generation,
+                                infrastructure_retry,
+                                hold,
+                                work,
+                            };
+                            if infrastructure_retry {
+                                self.schedule_infrastructure_retry(Some(delay), retry);
+                            } else if delay.is_zero() {
+                                // A server without the article says nothing
+                                // about the others: the article is theirs to
+                                // ask at once. Sent round the retry channel it
+                                // would wait for a turn with no results to
+                                // handle, which a busy link never has.
+                                self.receive_retry_work(retry);
+                                self.report_job_soon(job_id);
+                            } else {
+                                let retry_tx = self.retry_tx.clone();
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(delay).await;
+                                    let _ = retry_tx.send(retry).await;
+                                });
+                            }
+                        }
+                    } else {
+                        warn!(
+                            segment = %seg_id,
+                            error = %failure.message,
+                            "download failed (job gone, not retrying)"
+                        );
+                    }
+                }
+            }
+        }
+
+        self.maybe_finish_download_pass(job_id);
+    }
+}

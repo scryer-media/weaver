@@ -2,6 +2,10 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use std::collections::{HashMap, HashSet};
+use weaver_server_core::history::queries::HistoryQueries;
+use weaver_server_core::jobs::duplicate_persistence::JobsDuplicatePersistenceAdmitDuplicateSubmissionQueries;
+use weaver_server_core::operations::async_ops::OperationsAsyncOpsQueries;
+use weaver_server_core::post_processing::settings::PostProcessingSettingsQueries;
 
 use async_graphql::{Context, Object, Result, UploadValue};
 use base64::Engine;
@@ -1866,6 +1870,9 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use weaver_server_core::JobHistoryRow;
+    use weaver_server_core::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
+    use weaver_server_core::history::queries::HistoryQueries;
+    use weaver_server_core::settings::service::SettingsServiceQueries;
 
     // A history row whose output directory is `output_dir`, a working
     // directory the pipeline owns.

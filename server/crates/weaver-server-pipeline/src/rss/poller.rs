@@ -1,0 +1,592 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+use crate::rss::RssInternalQueries;
+use crate::rss::RssPersistenceQueries;
+use crate::rss::RssQueries;
+use tracing::{info, warn};
+
+use crate::proxies::read_body;
+use crate::rss::model::{
+    RSS_SEEN_RETENTION_SECS, RSS_SYNC_TICK_SECS, compile_rules, evaluate_item, is_due,
+    parse_feed_items,
+};
+use crate::rss::service::{
+    DueSyncOutcome, MAX_RSS_FEED_BODY_BYTES, NotAdded, RssFeedSyncReport, RssService,
+    RssServiceError, RssSyncReport,
+};
+use crate::{RssFeedRow, RssRuleAction, RssSeenDecision};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RssSyncTarget {
+    AllEnabledFeeds,
+    Feed(u32),
+}
+
+impl RssService {
+    // Fetch and filter without recording seen items or submitting downloads.
+    pub async fn preview_feed(
+        &self,
+        feed_id: u32,
+    ) -> Result<Vec<crate::RssSeenItemRow>, RssServiceError> {
+        let db = self.inner.db.clone();
+        let mut feed = tokio::task::spawn_blocking(move || db.get_rss_feed(feed_id))
+            .await
+            .map_err(|error| RssServiceError::Http(error.to_string()))?
+            .map_err(|error| RssServiceError::Http(error.to_string()))?
+            .ok_or(RssServiceError::FeedNotFound(feed_id))?;
+        feed.etag = None;
+        feed.last_modified = None;
+        let response = self.fetch_feed_response(&feed).await?;
+        if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+            return Ok(Vec::new());
+        }
+        if !response.status().is_success() {
+            return Err(RssServiceError::Http(format!(
+                "feed returned HTTP {}",
+                response.status()
+            )));
+        }
+        let body = read_body(response, MAX_RSS_FEED_BODY_BYTES)
+            .await
+            .map_err(RssServiceError::Http)?;
+        let body = crate::post_processing::feed::transform_feed(
+            &self.inner.db,
+            &self.inner.config,
+            &feed,
+            body,
+            MAX_RSS_FEED_BODY_BYTES,
+        )
+        .await
+        .map_err(RssServiceError::Parse)?;
+        let items = parse_feed_items(&body).map_err(RssServiceError::Parse)?;
+        let db = self.inner.db.clone();
+        let rules =
+            tokio::task::spawn_blocking(move || db.list_rss_rules(feed_id).map(compile_rules))
+                .await
+                .map_err(|error| RssServiceError::Http(error.to_string()))?
+                .map_err(|error| RssServiceError::Http(error.to_string()))?;
+        Ok(items
+            .into_iter()
+            .map(|item| {
+                let decision = evaluate_item(&rules, &item).map_or(
+                    RssSeenDecision::Ignored,
+                    |rule| match rule.row.action {
+                        RssRuleAction::Accept => RssSeenDecision::Accepted,
+                        RssRuleAction::Reject => RssSeenDecision::Rejected,
+                    },
+                );
+                crate::RssSeenItemRow {
+                    feed_id,
+                    item_id: item.item_id,
+                    item_title: item.title,
+                    published_at: item.published_at,
+                    size_bytes: item.size_bytes,
+                    decision,
+                    seen_at: self.now(),
+                    job_id: None,
+                    item_url: item.download_url.or(item.display_url),
+                    error: None,
+                }
+            })
+            .collect())
+    }
+
+    pub fn start_background_loop(&self) -> tokio::task::JoinHandle<()> {
+        let service = self.clone();
+        tokio::spawn(async move {
+            let mut paused = service.inner.scheduled_paused.subscribe();
+            let mut changed = service.inner.db.rss_schedule_cache.changed.subscribe();
+            loop {
+                paused.borrow_and_update();
+                changed.borrow_and_update();
+                let svc = service.clone();
+                match tokio::spawn(async move { svc.try_run_due_sync().await }).await {
+                    Ok(Ok(DueSyncOutcome::Completed(report))) => {
+                        if report.feeds_polled > 0 {
+                            info!(
+                                feeds_polled = report.feeds_polled,
+                                items_submitted = report.items_submitted,
+                                "RSS due sync complete"
+                            );
+                        }
+                    }
+                    Ok(Ok(DueSyncOutcome::SkippedActiveSync | DueSyncOutcome::NoFeedsDue)) => {}
+                    Ok(Err(error)) => warn!(error = %error, "RSS due sync failed"),
+                    Err(panic) => {
+                        tracing::error!(error = %panic, "CRITICAL: RSS sync task panicked — loop continues");
+                    }
+                }
+                let svc = service.clone();
+                let delay = tokio::task::spawn_blocking(move || svc.next_due_sync_delay())
+                    .await
+                    .unwrap_or(Some(std::time::Duration::from_secs(RSS_SYNC_TICK_SECS)));
+                tokio::select! {
+                    _ = paused.changed() => {},
+                    _ = changed.changed() => {},
+                    _ = async {
+                        match delay {
+                            Some(delay) => tokio::time::sleep(delay).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {},
+                }
+            }
+        })
+    }
+
+    // How long the poller sleeps before looking again: until the earliest
+    // enabled feed falls due, and never longer than one tick, so a wall-clock
+    // jump after a host suspend is noticed. Pauses and an empty feed list
+    // park the timer; edits and resume transitions wake the loop through
+    // watch channels.
+    pub(super) fn next_due_sync_delay(&self) -> Option<std::time::Duration> {
+        if self.is_scheduled_paused() {
+            return None;
+        }
+        let tick = std::time::Duration::from_secs(RSS_SYNC_TICK_SECS);
+        let Ok(schedules) = self.inner.db.list_rss_feed_schedules() else {
+            return Some(tick);
+        };
+        let now = self.now();
+        schedules
+            .iter()
+            .filter(|schedule| schedule.enabled)
+            .map(|schedule| schedule.next_due_at().saturating_sub(now))
+            .min()
+            .map(|secs| {
+                // A feed already due is retried on the next second rather
+                // than in a tight loop, should its poll keep failing to land.
+                std::time::Duration::from_secs(secs.max(1) as u64).min(tick)
+            })
+    }
+
+    pub async fn run_all_sync(&self) -> Result<RssSyncReport, RssServiceError> {
+        let _guard = self.inner.sync_lock.lock().await;
+        self.run_sync_inner(RssSyncTarget::AllEnabledFeeds, false)
+            .await
+    }
+
+    pub async fn run_feed_sync(&self, feed_id: u32) -> Result<RssSyncReport, RssServiceError> {
+        let _guard = self.inner.sync_lock.lock().await;
+        self.run_sync_inner(RssSyncTarget::Feed(feed_id), false)
+            .await
+    }
+
+    pub(crate) async fn try_run_due_sync(&self) -> Result<DueSyncOutcome, RssServiceError> {
+        if self.is_scheduled_paused() {
+            return Ok(DueSyncOutcome::NoFeedsDue);
+        }
+        let Ok(_guard) = self.inner.sync_lock.try_lock() else {
+            return Ok(DueSyncOutcome::SkippedActiveSync);
+        };
+        let report = self
+            .run_sync_inner(RssSyncTarget::AllEnabledFeeds, true)
+            .await?;
+        if report.feeds_polled == 0 {
+            Ok(DueSyncOutcome::NoFeedsDue)
+        } else {
+            Ok(DueSyncOutcome::Completed(report))
+        }
+    }
+
+    // Fire-and-forget trigger used by the NZBGet `fetchfeeds` facade.
+    //
+    // Spawns a background sync and returns immediately. Concurrent callers
+    // are coalesced: if a sync is already running, this drops the request
+    // instead of queueing another full indexer sweep behind `sync_lock`.
+    pub fn request_background_sync(&self) {
+        let service = self.clone();
+        tokio::spawn(async move {
+            let Ok(_guard) = service.inner.sync_lock.try_lock() else {
+                // A sync is already in flight; drop this request rather than
+                // queueing another one behind the lock.
+                return;
+            };
+            if let Err(error) = service
+                .run_sync_inner(RssSyncTarget::AllEnabledFeeds, false)
+                .await
+            {
+                warn!(error = %error, "RSS background sync failed");
+            }
+        });
+    }
+
+    async fn run_sync_inner(
+        &self,
+        target: RssSyncTarget,
+        due_only: bool,
+    ) -> Result<RssSyncReport, RssServiceError> {
+        self.run_sync_inner_cancellable(
+            target,
+            due_only,
+            crate::bandwidth::schedule::ScheduleCancellation::new(),
+        )
+        .await
+    }
+
+    async fn run_sync_inner_cancellable(
+        &self,
+        target: RssSyncTarget,
+        due_only: bool,
+        cancellation: crate::bandwidth::schedule::ScheduleCancellation,
+    ) -> Result<RssSyncReport, RssServiceError> {
+        self.take_up_waiting_items().await;
+        let service = self.clone();
+        let feeds =
+            tokio::task::spawn_blocking(move || service.load_target_feeds(target, due_only))
+                .await
+                .map_err(|error| RssServiceError::Http(error.to_string()))??;
+        if feeds.is_empty() {
+            return Ok(RssSyncReport::default());
+        }
+
+        let mut report = RssSyncReport::default();
+        for feed in feeds {
+            if cancellation.is_cancelled() {
+                break;
+            }
+            let feed_report = self.sync_feed(&feed, &cancellation).await;
+            if cancellation.is_cancelled() {
+                break;
+            }
+            match feed_report {
+                Ok(feed_report) => {
+                    report.feeds_polled += 1;
+                    report.items_fetched += feed_report.items_fetched;
+                    report.items_new += feed_report.items_new;
+                    report.items_accepted += feed_report.items_accepted;
+                    report.items_submitted += feed_report.items_submitted;
+                    report.items_ignored += feed_report.items_ignored;
+                    report.errors.extend(feed_report.errors.iter().cloned());
+                    report.feed_results.push(feed_report);
+                }
+                // The routes were mid-reload: the feed is left due, with no
+                // error recorded, and the reload's end wakes the poller.
+                Err(RssServiceError::RoutesChanging) => {
+                    if !due_only {
+                        report.errors.push(format!(
+                            "{}: {}",
+                            feed.name,
+                            RssServiceError::RoutesChanging
+                        ));
+                    }
+                }
+                Err(error) => {
+                    let now = self.now();
+                    let message = error.to_string();
+                    // One line per failed poll of a feed: a feed is polled
+                    // again only at its next interval, so this is bounded.
+                    warn!(feed_id = feed.id, feed = %feed.name, error = %message, "RSS feed poll failed");
+                    let _ = self
+                        .inner
+                        .db
+                        .record_rss_poll_failure(feed.id, now, &message);
+                    report.feeds_polled += 1;
+                    report.errors.push(format!("{}: {message}", feed.name));
+                    report.feed_results.push(RssFeedSyncReport {
+                        feed_id: feed.id,
+                        feed_name: feed.name.clone(),
+                        errors: vec![message],
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+
+        let _ = self
+            .inner
+            .db
+            .purge_old_rss_seen_items(self.now() - RSS_SEEN_RETENTION_SECS);
+
+        Ok(report)
+    }
+
+    // While torrents take new ones, every sync first takes up the items
+    // held while they were off, before the feeds are read: those feeds are
+    // then read whole. With none held this is one indexed read, no write.
+    async fn take_up_waiting_items(&self) {
+        if !self.classes_take_new() {
+            return;
+        }
+        let db = self.inner.db.clone();
+        match tokio::task::spawn_blocking(move || db.release_rss_waiting_items()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                warn!(error = %error, "the RSS items held while torrents were off were not taken up");
+            }
+            Err(error) => {
+                warn!(error = %error, "the RSS items held while torrents were off were not taken up");
+            }
+        }
+    }
+
+    pub(super) fn load_target_feeds(
+        &self,
+        target: RssSyncTarget,
+        due_only: bool,
+    ) -> Result<Vec<RssFeedRow>, RssServiceError> {
+        let feeds = match target {
+            RssSyncTarget::Feed(feed_id) => {
+                let Some(feed) = self
+                    .inner
+                    .db
+                    .get_rss_feed(feed_id)
+                    .map_err(|e| RssServiceError::Http(e.to_string()))?
+                else {
+                    return Err(RssServiceError::FeedNotFound(feed_id));
+                };
+                vec![feed]
+            }
+            RssSyncTarget::AllEnabledFeeds if due_only => {
+                // The due check needs four columns; the full rows, with their
+                // decrypted credentials and attached scripts, are read only
+                // for the feeds that are actually due.
+                let now = self.now();
+                let due: Vec<u32> = self
+                    .inner
+                    .db
+                    .list_rss_feed_schedules()
+                    .map_err(|e| RssServiceError::Http(e.to_string()))?
+                    .into_iter()
+                    .filter(|schedule| schedule.enabled && schedule.is_due(now))
+                    .map(|schedule| schedule.id)
+                    .collect();
+                let mut feeds = Vec::with_capacity(due.len());
+                for feed_id in due {
+                    #[cfg(test)]
+                    self.inner
+                        .full_feed_loads
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if let Some(feed) = self
+                        .inner
+                        .db
+                        .get_rss_feed(feed_id)
+                        .map_err(|e| RssServiceError::Http(e.to_string()))?
+                        // Re-checked on the full row: it may have been
+                        // edited between the two reads.
+                        .filter(|feed| feed.enabled && is_due(feed, now) && self.has_route(feed.id))
+                    {
+                        feeds.push(feed);
+                    }
+                }
+                return Ok(feeds);
+            }
+            RssSyncTarget::AllEnabledFeeds => self
+                .inner
+                .db
+                .list_rss_feeds()
+                .map_err(|e| RssServiceError::Http(e.to_string()))?
+                .into_iter()
+                .filter(|feed| feed.enabled && self.has_route(feed.id))
+                .collect(),
+        };
+
+        if !due_only {
+            return Ok(feeds);
+        }
+
+        let now = self.now();
+        Ok(feeds.into_iter().filter(|feed| is_due(feed, now)).collect())
+    }
+
+    // A feed is polled only through its routed, kill-switch-governed path.
+    // Between the row insert and the proxy runtime reload that installs its
+    // route, a new feed has none, so a sweep leaves it for the wake the
+    // reload sends instead of polling it unrouted or recording a failure.
+    // A feed is left the same way while any reload is in progress.
+    // Without a runtime no feed has a route.
+    fn has_route(&self, feed_id: u32) -> bool {
+        self.inner
+            .handle
+            .proxy_runtime()
+            .is_some_and(|runtime| runtime.feed_routable(crate::proxies::Consumer::Rss(feed_id)))
+    }
+
+    async fn sync_feed(
+        &self,
+        feed: &RssFeedRow,
+        cancellation: &crate::bandwidth::schedule::ScheduleCancellation,
+    ) -> Result<RssFeedSyncReport, RssServiceError> {
+        let now = self.now();
+        let response = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Ok(RssFeedSyncReport::default()),
+            result = self.fetch_feed_response(feed) => result?,
+        };
+        if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+            self.inner
+                .db
+                .record_rss_poll_success(
+                    feed.id,
+                    now,
+                    feed.etag.as_deref(),
+                    feed.last_modified.as_deref(),
+                )
+                .map_err(|e| RssServiceError::Http(e.to_string()))?;
+            return Ok(RssFeedSyncReport {
+                feed_id: feed.id,
+                feed_name: feed.name.clone(),
+                ..Default::default()
+            });
+        }
+        if !response.status().is_success() {
+            return Err(RssServiceError::Http(format!(
+                "feed {} returned HTTP {}",
+                feed.id,
+                response.status()
+            )));
+        }
+
+        let etag = response
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+            .or_else(|| feed.etag.clone());
+        let last_modified = response
+            .headers()
+            .get(reqwest::header::LAST_MODIFIED)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+            .or_else(|| feed.last_modified.clone());
+        let body = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Ok(RssFeedSyncReport::default()),
+            result = read_body(response, MAX_RSS_FEED_BODY_BYTES) => result.map_err(RssServiceError::Http)?,
+        };
+        let body = crate::post_processing::feed::transform_feed(
+            &self.inner.db,
+            &self.inner.config,
+            feed,
+            body,
+            MAX_RSS_FEED_BODY_BYTES,
+        )
+        .await
+        .map_err(RssServiceError::Parse)?;
+        let items = parse_feed_items(&body).map_err(RssServiceError::Parse)?;
+
+        let rules = self
+            .inner
+            .db
+            .list_rss_rules(feed.id)
+            .map_err(|e| RssServiceError::Http(e.to_string()))?;
+        let compiled_rules = compile_rules(rules);
+        let accepts_any = compiled_rules
+            .iter()
+            .any(|rule| rule.row.action == RssRuleAction::Accept);
+
+        let mut report = RssFeedSyncReport {
+            feed_id: feed.id,
+            feed_name: feed.name.clone(),
+            items_fetched: items.len() as u32,
+            ..Default::default()
+        };
+
+        // Which items are seen is read once, and the rows this poll records
+        // are written together with its success. An item the page lists
+        // twice is judged once, as when each row was written as it came.
+        let item_ids = items
+            .iter()
+            .map(|item| item.item_id.clone())
+            .collect::<Vec<_>>();
+        let mut seen = self
+            .inner
+            .db
+            .seen_rss_item_ids(feed.id, &item_ids)
+            .map_err(|e| RssServiceError::Http(e.to_string()))?;
+        let mut rows = Vec::new();
+        macro_rules! record {
+            ($item:expr, $decision:expr, $job:expr, $error:expr) => {{
+                seen.insert($item.item_id.clone());
+                rows.push(RssService::seen_row(
+                    feed.id, $item, $decision, $job, $error,
+                ));
+            }};
+        }
+
+        for item in items {
+            if cancellation.is_cancelled() {
+                return self.keep_cut_short(rows, report);
+            }
+            if seen.contains(&item.item_id) {
+                continue;
+            }
+
+            report.items_new += 1;
+            let decision = evaluate_item(&compiled_rules, &item);
+            match decision {
+                Some(rule) if rule.row.action == RssRuleAction::Reject => {
+                    report.items_ignored += 1;
+                    record!(&item, RssSeenDecision::Rejected, None, None);
+                }
+                Some(rule) => {
+                    report.items_accepted += 1;
+                    match self
+                        .accept_item_cancellable(feed, &rule.row, &item, cancellation)
+                        .await
+                    {
+                        Ok(job_id) => {
+                            report.items_submitted += 1;
+                            record!(&item, RssSeenDecision::Submitted, Some(job_id), None);
+                        }
+                        Err(NotAdded::Ignored(reason)) => {
+                            report.items_ignored += 1;
+                            record!(&item, RssSeenDecision::Ignored, None, Some(&reason));
+                        }
+                        // A torrent while torrents are off: held, once, so
+                        // later polls fetch nothing for it, and judged anew
+                        // once torrents are on.
+                        Err(NotAdded::Waiting(reason)) => {
+                            record!(&item, RssSeenDecision::Waiting, None, Some(&reason));
+                        }
+                        Err(NotAdded::Failed(error)) => {
+                            if cancellation.is_cancelled() {
+                                return self.keep_cut_short(rows, report);
+                            }
+                            report.items_ignored += 1;
+                            report.errors.push(error.clone());
+                            record!(&item, RssSeenDecision::Error, None, Some(&error));
+                        }
+                    }
+                }
+                None => {
+                    report.items_ignored += 1;
+                    // Seen only once a rule could have taken it. A feed is
+                    // polled as soon as it is added, before its rules are;
+                    // recording its items then would leave them for good
+                    // before the first accept rule could ever see them.
+                    if accepts_any {
+                        record!(&item, RssSeenDecision::Ignored, None, None);
+                    }
+                }
+            }
+        }
+
+        self.inner
+            .db
+            .record_rss_feed_sync(
+                feed.id,
+                &rows,
+                now,
+                etag.as_deref(),
+                last_modified.as_deref(),
+            )
+            .map_err(|e| RssServiceError::Http(e.to_string()))?;
+        Ok(report)
+    }
+
+    // A poll cut short keeps the rows of the items it judged, as it did when
+    // each was written as it came, and records no success.
+    fn keep_cut_short(
+        &self,
+        rows: Vec<crate::RssSeenItemRow>,
+        report: RssFeedSyncReport,
+    ) -> Result<RssFeedSyncReport, RssServiceError> {
+        self.inner
+            .db
+            .insert_rss_seen_items(&rows)
+            .map_err(|e| RssServiceError::Http(e.to_string()))?;
+        Ok(report)
+    }
+}

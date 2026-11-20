@@ -6639,13 +6639,346 @@ dependencies = [
 ]
 
 [[package]]
+name = "weaver-server-base"
+version = "0.16.17"
+dependencies = [
+ "chrono",
+ "crc-turbo",
+ "flate2",
+ "http",
+ "ipnet",
+ "libc",
+ "par2-rs",
+ "par3-rs",
+ "rayon",
+ "reedsolomon-rs",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "url",
+ "weaver-model",
+ "weaver-tunnel",
+ "weaver-yenc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "weaver-server-migrations"
+version = "0.16.17"
+dependencies = [
+ "blake3",
+ "chrono",
+ "getrandom 0.4.3",
+ "hex",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+ "weaver-server-base",
+ "weaver-server-db",
+ "weaver-server-history",
+ "weaver-server-ingest",
+ "weaver-server-jobs",
+ "weaver-server-net",
+ "weaver-server-postproc",
+ "weaver-server-settings",
+ "weaver-server-torrents",
+ "zstd",
+]
+
+[[package]]
+name = "weaver-server-settings"
+version = "0.16.17"
+dependencies = [
+ "blake3",
+ "crc-turbo",
+ "getrandom 0.4.3",
+ "libc",
+ "rcgen",
+ "serde",
+ "serde_json",
+ "sevenz-turbo",
+ "thiserror 2.0.21",
+ "tokio",
+ "toml",
+ "tracing",
+ "unrar-rs",
+ "url",
+ "weaver-model",
+ "weaver-server-base",
+ "weaver-server-db",
+ "weaver-server-jobs",
+ "weaver-server-net",
+ "weaver-torrent",
+ "x509-parser",
+ "zip",
+]
+
+[[package]]
+name = "weaver-server-auth"
+version = "0.16.17"
+dependencies = [
+ "argon2",
+ "base64 0.23.1",
+ "getrandom 0.4.3",
+ "hex",
+ "hmac 0.13.0",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "weaver-server-base",
+ "weaver-server-db",
+ "weaver-server-settings",
+]
+
+[[package]]
+name = "weaver-server-ingest"
+version = "0.16.17"
+dependencies = [
+ "blake3",
+ "brotli",
+ "bzip2",
+ "flate2",
+ "http",
+ "lzma-turbo",
+ "serde",
+ "sevenz-turbo",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tracing",
+ "unrar-rs",
+ "weaver-model",
+ "weaver-nzb",
+ "weaver-server-base",
+ "weaver-server-disk",
+ "weaver-server-jobs",
+ "weaver-server-settings",
+ "zip",
+ "zstd",
+]
+
+[[package]]
+name = "weaver-server-jobs"
+version = "0.16.17"
+dependencies = [
+ "blake3",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "unicase",
+ "unicode-normalization",
+ "weaver-model",
+ "weaver-server-base",
+ "weaver-server-db",
+ "zstd",
+]
+
+[[package]]
+name = "weaver-server-history"
+version = "0.16.17"
+dependencies = [
+ "serde_json",
+ "sqlx",
+ "unicode-normalization",
+ "weaver-server-base",
+ "weaver-server-db",
+ "weaver-server-ingest",
+]
+
+[[package]]
+name = "weaver-server-net"
+version = "0.16.17"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "chrono",
+ "http",
+ "if-addrs",
+ "serde",
+ "serde_json",
+ "tokio",
+ "weaver-nntp",
+ "weaver-server-base",
+ "weaver-server-db",
+ "weaver-server-disk",
+ "weaver-tunnel",
+]
+
+[[package]]
+name = "weaver-server-postproc"
+version = "0.16.17"
+dependencies = [
+ "chrono",
+ "getrandom 0.4.3",
+ "hex",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "url",
+ "weaver-nzb",
+ "weaver-server-base",
+ "weaver-server-db",
+ "weaver-server-history",
+ "weaver-server-net",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "weaver-server-torrents"
+version = "0.16.17"
+dependencies = [
+ "anyhow",
+ "base64 0.23.1",
+ "bitvec",
+ "bytes",
+ "libc",
+ "memmap2",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "weaver-graph",
+ "weaver-model",
+ "weaver-nzb",
+ "weaver-server-base",
+ "weaver-server-db",
+ "weaver-server-disk",
+ "weaver-server-net",
+ "weaver-server-postproc",
+ "weaver-server-settings",
+ "weaver-torrent",
+ "weaver-tunnel",
+]
+
+[[package]]
+name = "weaver-server-speedtest"
+version = "0.16.17"
+dependencies = [
+ "chrono",
+ "http",
+ "serde",
+ "serde_json",
+ "tokio",
+ "url",
+ "weaver-server-base",
+]
+
+[[package]]
+name = "weaver-server-rss"
+version = "0.16.17"
+dependencies = [
+ "blake3",
+ "hex",
+ "serde_json",
+ "sha2 0.11.1",
+ "tokio",
+ "weaver-server-db",
+]
+
+[[package]]
+name = "weaver-server-db"
+version = "0.16.17"
+dependencies = [
+ "aes-gcm",
+ "base64 0.23.1",
+ "chrono",
+ "getrandom 0.4.3",
+ "hmac 0.13.0",
+ "keyring",
+ "security-framework",
+ "security-framework-sys",
+ "serde_json",
+ "sha2 0.11.1",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "weaver-server-base",
+ "weaver-server-disk",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "weaver-server-disk"
+version = "0.16.17"
+dependencies = [
+ "bytes",
+ "cap-std",
+ "getrandom 0.4.3",
+ "libc",
+ "serde",
+ "serde_json",
+ "sevenz-turbo",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "weaver-graph",
+ "weaver-server-base",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "weaver-server-core"
 version = "0.16.17"
 dependencies = [
  "aes-gcm",
+ "argon2",
+ "blake3",
+ "chrono",
+ "criterion",
+ "getrandom 0.4.3",
+ "hex",
+ "http",
+ "pbkdf2",
+ "rmp-serde",
+ "semver",
+ "serde",
+ "serde_json",
+ "sevenz-turbo",
+ "sha1 0.11.0",
+ "sha2 0.11.1",
+ "sqlx",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "toml",
+ "tracing",
+ "weaver-model",
+ "weaver-nntp",
+ "weaver-nzb",
+ "weaver-server-base",
+ "weaver-server-db",
+ "weaver-server-pipeline",
+ "weaver-torrent",
+ "windows-sys 0.61.2",
+ "zstd",
+]
+
+[[package]]
+name = "weaver-server-pipeline"
+version = "0.16.17"
+dependencies = [
  "anyhow",
  "application-updater",
- "argon2",
  "artifact-trust",
  "async-trait",
  "axum",
@@ -6660,22 +6993,16 @@ dependencies = [
  "cap-std",
  "chrono",
  "crc-turbo",
- "criterion",
- "crossbeam-queue",
  "filetime",
  "flate2",
  "getrandom 0.4.3",
  "hex",
- "hmac 0.13.0",
  "http",
  "httpdate",
- "if-addrs",
- "ipnet",
  "keyring",
  "keyring-core",
  "libc",
  "lzma-turbo",
- "memmap2",
  "notify",
  "par2-rs",
  "par3-rs",
@@ -6703,8 +7030,6 @@ dependencies = [
  "tokio-rustls",
  "toml",
  "tracing",
- "unicase",
- "unicode-normalization",
  "unrar-rs",
  "url",
  "weaver-graph",
@@ -6712,11 +7037,25 @@ dependencies = [
  "weaver-nntp",
  "weaver-nzb",
  "weaver-objects",
+ "weaver-server-auth",
+ "weaver-server-base",
+ "weaver-server-db",
+ "weaver-server-disk",
+ "weaver-server-history",
+ "weaver-server-ingest",
+ "weaver-server-jobs",
+ "weaver-server-migrations",
+ "weaver-server-net",
+ "weaver-server-pipeline",
+ "weaver-server-postproc",
+ "weaver-server-rss",
+ "weaver-server-settings",
+ "weaver-server-speedtest",
+ "weaver-server-torrents",
  "weaver-torrent",
  "weaver-tunnel",
  "weaver-yenc",
  "windows-sys 0.61.2",
- "x509-parser",
  "zip",
  "zstd",
 ]

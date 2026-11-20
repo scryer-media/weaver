@@ -4,6 +4,9 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use weaver_server_core::auth::repository::AuthRepositoryQueries;
+use weaver_server_core::settings::persistence::SettingsPersistenceQueries;
+use weaver_server_core::settings::queries::SettingsQueries;
 
 use tracing::{error, info, warn};
 
@@ -388,6 +391,10 @@ mod tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock};
+    use weaver_server_core::auth::repository::AuthRepositoryQueries;
+    use weaver_server_core::settings::persistence::SettingsPersistenceQueries;
+    use weaver_server_core::settings::queries::SettingsQueries;
+    use weaver_server_core::settings::service::SettingsServiceQueries;
 
     use super::*;
 

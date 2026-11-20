@@ -13,7 +13,7 @@ use argon2::{Algorithm, Argon2, Params, Version};
 
 use super::manifest::{BackupManifest, BackupServiceError, io_err, validate_manifest_structure};
 use super::permissions::set_file_owner_only;
-use crate::security::RuntimeSecurityConfig;
+use weaver_server_base::security::RuntimeSecurityConfig;
 
 #[cfg(test)]
 pub(crate) fn write_plain_archive(
@@ -57,36 +57,7 @@ const MAX_BACKUP_ZSTD_WINDOW_LOG: u32 = 26;
 // longer writes it; the name survives only to recognize and skip those entries.
 const LEGACY_MANAGED_PACKAGE_DIR: &str = "managed-extensions";
 
-#[derive(Clone, Default)]
-pub(super) struct BackupCancellation {
-    cancelled: Arc<std::sync::atomic::AtomicBool>,
-    notify: Arc<tokio::sync::Notify>,
-}
-
-impl BackupCancellation {
-    pub(super) fn new() -> Self {
-        Self::default()
-    }
-    pub(super) fn cancel(&self) {
-        self.cancelled
-            .store(true, std::sync::atomic::Ordering::Release);
-        self.notify.notify_waiters();
-    }
-    pub(super) fn is_cancelled(&self) -> bool {
-        self.cancelled.load(std::sync::atomic::Ordering::Acquire)
-    }
-    pub(super) async fn cancelled(&self) {
-        loop {
-            let notified = self.notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self.is_cancelled() {
-                return;
-            }
-            notified.await;
-        }
-    }
-}
+pub(super) use weaver_server_pipeline::operations::backup::archive::BackupCancellation;
 
 struct AtomicOutputWriter {
     temp: tempfile::NamedTempFile,

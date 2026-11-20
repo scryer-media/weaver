@@ -1,0 +1,35 @@
+[package]
+name = "weaver-server-postproc"
+description = "Post-processing script discovery, declarations and directives"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[features]
+test-support = []
+
+[dependencies]
+chrono = { workspace = true }
+getrandom = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+weaver-server-db = { path = "../weaver-server-db" }
+weaver-server-base = { path = "../weaver-server-base" }
+weaver-server-history = { path = "../weaver-server-history" }
+weaver-server-net = { path = "../weaver-server-net" }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
+[dev-dependencies]
+weaver-nzb = { path = "../../../engines/weaver-nzb", default-features = false }

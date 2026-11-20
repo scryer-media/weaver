@@ -13,6 +13,7 @@ use crate::system::types::{
 use std::path::PathBuf;
 use std::sync::Arc;
 use weaver_nntp::pool::NntpPool;
+use weaver_server_core::operations::metrics_store::OperationsMetricsStoreQueries;
 use weaver_server_core::operations::{OnDemandSpace, Reach, StorageCapacity};
 
 #[derive(Default)]

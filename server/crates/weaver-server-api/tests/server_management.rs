@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use weaver_server_core::servers::persistence::ServersPersistenceQueries;
+use weaver_server_core::servers::queries::ServersQueries;
 mod common;
 
 use common::{

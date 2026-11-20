@@ -2,16 +2,28 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::auth::api_keys::AuthApiKeysQueries;
+use crate::bandwidth::persistence::BandwidthPersistenceInternalQueries;
+use crate::bandwidth::queries::BandwidthQueries;
+use crate::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
+use crate::history::queries::HistoryQueries;
+use crate::history::timeline::HistoryTimelineQueries;
+use crate::operations::metrics_store::OperationsMetricsStoreQueries;
+use crate::rss::RssPersistenceQueries;
+use crate::rss::RssQueries;
+use crate::servers::repository::ServersRepositoryQueries;
+use crate::settings::service::SettingsServiceQueries;
 use std::path::Path;
 
 use crate::categories::CategoryConfig;
-use crate::operations::metrics::PipelineMetrics;
+use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::servers::{ServerConfig, ServerDownloadUsage};
 use crate::settings::{Config, RetryOverrides};
 use crate::{
     HistoryFilter, JobEvent, JobHistoryRow, RssFeedRow, RssRuleAction, RssRuleRow, RssSeenItemRow,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use weaver_server_base::operations::metrics::PipelineMetrics;
 
 async fn open_artifact_pool(path: &Path) -> sqlx::SqlitePool {
     SqlitePoolOptions::new()
@@ -352,7 +364,9 @@ async fn import_stable_state_ignores_legacy_integration_events_table() {
     src.export_stable_state(temp.path()).unwrap();
 
     let legacy_pool = open_artifact_pool(temp.path()).await;
-    sqlx::query(
+    let store = artifact_datastore(&legacy_pool);
+    SqlRuntime::execute(
+        store.write_exec(),
         "CREATE TABLE integration_events (
              id           INTEGER PRIMARY KEY AUTOINCREMENT,
              timestamp    INTEGER NOT NULL,
@@ -360,19 +374,21 @@ async fn import_stable_state_ignores_legacy_integration_events_table() {
              item_id      INTEGER,
              payload_json TEXT NOT NULL
          )",
+        &[],
     )
-    .execute(&legacy_pool)
     .await
     .unwrap();
-    sqlx::query(
+    SqlRuntime::execute(
+        store.write_exec(),
         "INSERT INTO integration_events (timestamp, kind, item_id, payload_json)
-         VALUES (?, ?, ?, ?)",
+         VALUES ({}, {}, {}, {})",
+        &[
+            SqlArg::I64(1),
+            SqlArg::Text("ITEM_CREATED".into()),
+            SqlArg::I64(77),
+            SqlArg::Text("{}".into()),
+        ],
     )
-    .bind(1_i64)
-    .bind("ITEM_CREATED")
-    .bind(77_i64)
-    .bind("{}")
-    .execute(&legacy_pool)
     .await
     .unwrap();
     legacy_pool.close().await;
@@ -398,8 +414,8 @@ async fn import_stable_state_defaults_limits_missing_from_old_archive_schema() {
     src.export_stable_state(temp.path()).unwrap();
 
     let legacy_pool = open_artifact_pool(temp.path()).await;
-    sqlx::query("DROP TABLE server_download_usage")
-        .execute(&legacy_pool)
+    let store = artifact_datastore(&legacy_pool);
+    SqlRuntime::execute(store.write_exec(), "DROP TABLE server_download_usage", &[])
         .await
         .unwrap();
     for column in [
@@ -413,8 +429,7 @@ async fn import_stable_state_defaults_limits_missing_from_old_archive_schema() {
         "tls_name_mismatch_certificate_der",
     ] {
         let statement = format!("ALTER TABLE servers DROP COLUMN {column}");
-        sqlx::raw_sql(sqlx::AssertSqlSafe(statement.as_str()))
-            .execute(&legacy_pool)
+        SqlRuntime::execute(store.write_exec(), &statement, &[])
             .await
             .unwrap();
     }
@@ -492,25 +507,35 @@ async fn a_legacy_backup_with_a_sealed_blob_is_proved_against_the_key() {
         )
         .await
         .unwrap();
-    sqlx::query("CREATE TABLE torrents (job_id INTEGER PRIMARY KEY, metainfo BLOB) WITHOUT ROWID")
-        .execute(&pool)
-        .await
-        .unwrap();
+    let store = artifact_datastore(&pool);
+    SqlRuntime::execute(
+        store.write_exec(),
+        "CREATE TABLE torrents (job_id INTEGER PRIMARY KEY, metainfo BLOB) WITHOUT ROWID",
+        &[],
+    )
+    .await
+    .unwrap();
     // A blob in the clear is no sealed value: nothing to prove, key or not.
-    sqlx::query("INSERT INTO torrents (job_id, metainfo) VALUES (1, ?)")
-        .bind(b"d4:infod4:name3:onee".to_vec())
-        .execute(&pool)
-        .await
-        .unwrap();
+    SqlRuntime::execute(
+        store.write_exec(),
+        "INSERT INTO torrents (job_id, metainfo) VALUES (1, {})",
+        &[SqlArg::Bytes(b"d4:infod4:name3:onee".to_vec())],
+    )
+    .await
+    .unwrap();
     super::logical::validate_legacy_encryption_key(&path, None)
         .await
         .unwrap();
 
-    sqlx::query("INSERT INTO torrents (job_id, metainfo) VALUES (2, ?)")
-        .bind(encrypt_bytes(&key, b"d4:infod4:name3:twoee").unwrap())
-        .execute(&pool)
-        .await
-        .unwrap();
+    SqlRuntime::execute(
+        store.write_exec(),
+        "INSERT INTO torrents (job_id, metainfo) VALUES (2, {})",
+        &[SqlArg::Bytes(
+            encrypt_bytes(&key, b"d4:infod4:name3:twoee").unwrap(),
+        )],
+    )
+    .await
+    .unwrap();
     pool.close().await;
     super::logical::validate_legacy_encryption_key(&path, Some(&key))
         .await

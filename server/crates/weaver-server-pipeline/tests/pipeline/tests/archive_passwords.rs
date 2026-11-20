@@ -1,0 +1,440 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+// The archive-password harvest and the persisted NZB it reads: what
+// admission keeps, what the first harvest reads from the row and remembers,
+// and what a reprocess or a redownload rebuilds from the row.
+
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use weaver_server_pipeline::jobs::queries::JobsQueries;
+
+use std::path::PathBuf;
+use weaver_server_pipeline::jobs::{ArchivePasswordCandidate, ArchivePasswordSource};
+use weaver_server_pipeline::pipeline::tests::history_fixture::database as pipeline_database;
+use weaver_server_pipeline::pipeline::tests::password_fixture::*;
+use weaver_server_pipeline::pipeline::tests::queue_fixture::{
+    download_queue_len, installed_spec, installed_status,
+};
+use weaver_server_pipeline::pipeline::tests::{
+    activate_job, history_row_with_output_dir, insert_active_job_with_persisted_nzb,
+    insert_active_job_with_persisted_nzb_named, insert_history_row_with_nzb_zstd,
+    new_direct_pipeline, sample_nzb_zstd, standalone_job_spec,
+};
+use weaver_server_pipeline::{JobId, JobStatus};
+
+fn sample_nzb_zstd_with_password(password: &str) -> Vec<u8> {
+    let nzb = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+        <nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+          <head><meta type="password">{password}</meta></head>
+          <file poster="poster" date="1700000000" subject="Silver Horizon.Sample.rar">
+            <groups><group>alt.binaries.test</group></groups>
+            <segments><segment bytes="100" number="1">msgid@example.com</segment></segments>
+          </file>
+        </nzb>"#
+    );
+    weaver_server_pipeline::ingest::compress_nzb_bytes(nzb.as_bytes()).unwrap()
+}
+
+async fn database(temp_dir: &tempfile::TempDir) -> sqlx::SqlitePool {
+    SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(temp_dir.path().join("weaver.db"))
+                .create_if_missing(false),
+        )
+        .await
+        .unwrap()
+}
+
+// Overwrites the job's persisted NZB with bytes that cannot be parsed, so a
+// harvest that still returns the NZB's candidates provably did not read it.
+async fn corrupt_persisted_nzb(pipeline: &weaver_server_pipeline::Pipeline, job_id: JobId) {
+    set_persisted_nzb(pipeline, job_id, Some(vec![0xFFu8; 64])).await;
+}
+
+async fn set_persisted_nzb(
+    pipeline: &weaver_server_pipeline::Pipeline,
+    job_id: JobId,
+    nzb_zstd: Option<Vec<u8>>,
+) {
+    use weaver_server_db::persistence::sql_runtime::{SqlArg, SqlRuntime};
+    let id = SqlArg::I64(job_id.0 as i64);
+    let (statement, args) = match nzb_zstd {
+        Some(bytes) => (
+            "INSERT INTO job_nzbs (job_id, nzb_zstd) VALUES ({}, {})
+             ON CONFLICT(job_id) DO UPDATE SET nzb_zstd = excluded.nzb_zstd",
+            vec![id, SqlArg::Bytes(bytes)],
+        ),
+        None => ("DELETE FROM job_nzbs WHERE job_id = {}", vec![id]),
+    };
+    let db = pipeline_database(pipeline).datastore();
+    let updated = SqlRuntime::execute(db.write_exec(), statement, &args)
+        .await
+        .unwrap();
+    assert_eq!(updated, 1);
+}
+
+fn nzb_half_candidates() -> Vec<ArchivePasswordCandidate> {
+    vec![
+        ArchivePasswordCandidate::new(ArchivePasswordSource::NzbMeta, "meta-key".to_string()),
+        ArchivePasswordCandidate::new(
+            ArchivePasswordSource::FilenameConvention,
+            "harbour-key".to_string(),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn add_job_records_streamed_nzb_hash_in_active_jobs() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30036);
+    let spec = standalone_job_spec("Streamed Hash", &[("episode.mkv".to_string(), 123)]);
+    let nzb_path = PathBuf::from(format!("job-{}.nzb", job_id.0));
+    let nzb_zstd = sample_nzb_zstd();
+    let expected_hash = weaver_server_pipeline::ingest::hash_persisted_nzb_bytes(&nzb_zstd);
+
+    add_job(
+        &mut pipeline,
+        job_id,
+        spec,
+        nzb_path,
+        nzb_zstd,
+        weaver_server_pipeline::jobs::AddJobOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    let pool = database(&temp_dir).await;
+    let stored_hash: Vec<u8> =
+        sqlx::query_scalar("SELECT nzb_hash FROM active_jobs WHERE job_id = ?")
+            .bind(job_id.0 as i64)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stored_hash, expected_hash);
+}
+
+#[tokio::test]
+async fn add_job_keeps_nzb_password_candidates_so_the_harvest_never_rereads_the_nzb() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30037);
+    let mut spec = standalone_job_spec("Silver Horizon", &[("episode.mkv".to_string(), 123)]);
+    spec.password = Some("spec-key".to_string());
+    add_job(
+        &mut pipeline,
+        job_id,
+        spec,
+        PathBuf::from("Silver Horizon {{harbour-key}}.nzb"),
+        sample_nzb_zstd_with_password("meta-key"),
+        weaver_server_pipeline::jobs::AddJobOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    // Before any archive file completes: the persisted NZB is now unreadable,
+    // so every candidate below came from what admission derived.
+    corrupt_persisted_nzb(&pipeline, job_id).await;
+
+    let mut expected = nzb_half_candidates();
+    expected.insert(
+        0,
+        ArchivePasswordCandidate::new(ArchivePasswordSource::Explicit, "spec-key".to_string()),
+    );
+    for _ in 0..2 {
+        let (candidates, remembered) = harvest(&pipeline, job_id);
+        assert!(remembered);
+        assert!(candidates == expected);
+    }
+}
+
+#[tokio::test]
+async fn the_first_harvest_parses_the_persisted_nzb_and_later_ones_read_memory() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30038);
+    let spec = standalone_job_spec("Silver Horizon", &[("episode.mkv".to_string(), 123)]);
+    // A job that entered without the NZB in hand: the first harvest has to
+    // read the row.
+    insert_active_job_with_persisted_nzb_named(
+        &mut pipeline,
+        job_id,
+        spec,
+        sample_nzb_zstd_with_password("meta-key"),
+        Some("Silver Horizon {{harbour-key}}.nzb"),
+    )
+    .await;
+    forget_harvest(&mut pipeline, job_id);
+
+    let (first, remembered) = harvest(&pipeline, job_id);
+    assert!(remembered);
+    assert!(first == nzb_half_candidates());
+
+    corrupt_persisted_nzb(&pipeline, job_id).await;
+
+    let (second, remembered) = harvest(&pipeline, job_id);
+    assert!(remembered);
+    assert!(
+        second == nzb_half_candidates(),
+        "a later harvest must not read the persisted NZB again"
+    );
+}
+
+#[tokio::test]
+async fn a_harvest_that_finds_no_persisted_nzb_remembers_the_empty_list() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30040);
+    let spec = standalone_job_spec("Silver Horizon", &[("episode.mkv".to_string(), 123)]);
+    insert_active_job_with_persisted_nzb_named(
+        &mut pipeline,
+        job_id,
+        spec,
+        sample_nzb_zstd_with_password("meta-key"),
+        Some("Silver Horizon {{harbour-key}}.nzb"),
+    )
+    .await;
+    forget_harvest(&mut pipeline, job_id);
+    set_persisted_nzb(&pipeline, job_id, None).await;
+
+    let (first, remembered) = harvest(&pipeline, job_id);
+    assert!(remembered);
+    assert!(first.is_empty());
+
+    // Bytes that appear afterwards are not read: the first harvest's answer
+    // stands for the rest of the job.
+    set_persisted_nzb(
+        &pipeline,
+        job_id,
+        Some(sample_nzb_zstd_with_password("meta-key")),
+    )
+    .await;
+    let (second, remembered) = harvest(&pipeline, job_id);
+    assert!(remembered);
+    assert!(
+        second.is_empty(),
+        "a later harvest must not read the persisted NZB again"
+    );
+}
+
+#[tokio::test]
+async fn a_harvest_whose_nzb_failed_to_parse_reads_the_row_again() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30039);
+    let spec = standalone_job_spec("Silver Horizon", &[("episode.mkv".to_string(), 123)]);
+    insert_active_job_with_persisted_nzb(&mut pipeline, job_id, spec, vec![0xFFu8; 64]).await;
+
+    for _ in 0..2 {
+        let (candidates, remembered) = harvest(&pipeline, job_id);
+        assert!(!remembered, "a parse failure is never remembered");
+        assert!(candidates.is_empty());
+    }
+
+    // The row read again finds the NZB once it parses.
+    set_persisted_nzb(
+        &pipeline,
+        job_id,
+        Some(sample_nzb_zstd_with_password("meta-key")),
+    )
+    .await;
+    let (candidates, remembered) = harvest(&pipeline, job_id);
+    assert!(remembered);
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|candidate| candidate.value())
+            .collect::<Vec<_>>(),
+        ["meta-key"]
+    );
+}
+
+#[tokio::test]
+async fn archive_password_override_is_durable_for_history_reprocess_and_redownload() {
+    for reprocess in [false, true] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let job_id = JobId(30902);
+        let mut row = history_row_with_output_dir(
+            job_id,
+            "Archive Fixture",
+            "failed",
+            temp_dir.path().join("unused-output"),
+        );
+        row.output_dir = None;
+        row.error_message = Some("password required".into());
+        insert_history_row_with_nzb_zstd(
+            pipeline_database(&pipeline),
+            &row,
+            &sample_nzb_zstd_with_password("metadata-key"),
+        );
+        if reprocess {
+            reprocess_job_with_password(&mut pipeline, job_id, Some("replacement-key".into()))
+                .await
+                .unwrap();
+        } else {
+            redownload_job_with_password(&mut pipeline, job_id, Some("replacement-key".into()))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            installed_spec(&pipeline, job_id)
+                .unwrap()
+                .password
+                .as_deref(),
+            Some("replacement-key")
+        );
+        assert_eq!(harvest(&pipeline, job_id).0[0].value(), "replacement-key");
+        let restored = pipeline_database(&pipeline).load_active_jobs().unwrap();
+        assert_eq!(
+            restored.get(&job_id).unwrap().password_override.as_deref(),
+            Some("replacement-key")
+        );
+    }
+}
+
+// A reprocess with no memory limit keeps the flag with the job, so a
+// restart restores it; a later plain reprocess of a row that carried it
+// drops it, so it never reaches the next run unasked. Either reprocess drops
+// the mark that the job failed for memory: the retry is offered again only
+// if the new run fails the same way.
+#[tokio::test]
+async fn the_no_memory_limit_flag_is_kept_with_the_job_and_dropped_by_a_plain_reprocess() {
+    use weaver_server_pipeline::history::attributes::{
+        FAILED_FOR_MEMORY_ATTRIBUTE_KEY, NO_MEMORY_LIMIT_ATTRIBUTE_KEY, failed_for_memory,
+        no_memory_limit,
+    };
+    for lifted in [true, false] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let job_id = JobId(30903);
+        let mut row = history_row_with_output_dir(
+            job_id,
+            "Wide Fixture",
+            "failed",
+            temp_dir.path().join("unused-output"),
+        );
+        row.output_dir = None;
+        row.error_message =
+            Some("lantern.7z needs 4.0 GiB of decode memory, 512.0 MiB allowed".into());
+        // A row from a run that already carried the flag.
+        row.metadata = Some(
+            serde_json::to_string(&vec![
+                (NO_MEMORY_LIMIT_ATTRIBUTE_KEY, "1"),
+                (FAILED_FOR_MEMORY_ATTRIBUTE_KEY, "1"),
+            ])
+            .unwrap(),
+        );
+        insert_history_row_with_nzb_zstd(pipeline_database(&pipeline), &row, &sample_nzb_zstd());
+        if lifted {
+            reprocess_job_with_no_memory_limit(&mut pipeline, job_id, None)
+                .await
+                .unwrap();
+        } else {
+            reprocess_job(&mut pipeline, job_id).await.unwrap();
+        }
+        let metadata = &installed_spec(&pipeline, job_id).unwrap().metadata;
+        assert_eq!(no_memory_limit(metadata), lifted);
+        assert_eq!(
+            metadata
+                .iter()
+                .filter(|(key, _)| key == NO_MEMORY_LIMIT_ATTRIBUTE_KEY)
+                .count(),
+            usize::from(lifted),
+            "{metadata:?}"
+        );
+        assert!(!failed_for_memory(metadata), "{metadata:?}");
+        let restored = pipeline_database(&pipeline).load_active_jobs().unwrap();
+        assert_eq!(no_memory_limit(&restored[&job_id].metadata), lifted);
+        assert!(!failed_for_memory(&restored[&job_id].metadata));
+    }
+}
+
+// A passworded job retried with no memory limit is told its password as a
+// plain reprocess is, and keeps it beside the lifted limit, through a
+// restart too.
+#[tokio::test]
+async fn a_passworded_job_retried_with_no_memory_limit_keeps_its_password() {
+    use weaver_server_pipeline::history::attributes::no_memory_limit;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30904);
+    let mut row = history_row_with_output_dir(
+        job_id,
+        "Wide Password Fixture",
+        "failed",
+        temp_dir.path().join("unused-output"),
+    );
+    row.output_dir = None;
+    row.error_message = Some("lantern.7z needs 4.0 GiB of decode memory, 512.0 MiB allowed".into());
+    insert_history_row_with_nzb_zstd(pipeline_database(&pipeline), &row, &sample_nzb_zstd());
+    reprocess_job_with_no_memory_limit(&mut pipeline, job_id, Some("lantern-key".into()))
+        .await
+        .unwrap();
+    let spec = installed_spec(&pipeline, job_id).unwrap();
+    assert_eq!(spec.password.as_deref(), Some("lantern-key"));
+    assert!(no_memory_limit(&spec.metadata));
+    assert_eq!(harvest(&pipeline, job_id).0[0].value(), "lantern-key");
+    let restored = pipeline_database(&pipeline).load_active_jobs().unwrap();
+    assert_eq!(
+        restored[&job_id].password_override.as_deref(),
+        Some("lantern-key")
+    );
+    assert!(no_memory_limit(&restored[&job_id].metadata));
+}
+
+// A reprocess over nothing on disk fetches the job again: its spec is
+// rebuilt from the history row's persisted NZB, and its articles are queued.
+async fn reprocess_rebuilds_from_history(job_id: JobId, name: &str, status: &str) {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut row = history_row_with_output_dir(
+        job_id,
+        name,
+        status,
+        temp_dir.path().join("unused-output-dir"),
+    );
+    row.output_dir = None;
+    if status == "failed" {
+        row.error_message = Some("boom".to_string());
+    }
+    row.category = Some("tv".to_string());
+    row.metadata = Some(serde_json::to_string(&vec![("source", "history")]).unwrap());
+    insert_history_row_with_nzb_zstd(pipeline_database(&pipeline), &row, &sample_nzb_zstd());
+
+    reprocess_job(&mut pipeline, job_id).await.unwrap();
+
+    let spec = installed_spec(&pipeline, job_id).unwrap();
+    assert_eq!(
+        installed_status(&pipeline, job_id),
+        Some(&JobStatus::Queued)
+    );
+    assert_eq!(spec.files.len(), 1);
+    assert_eq!(spec.category.as_deref(), Some("tv"));
+    assert_eq!(
+        spec.metadata,
+        vec![
+            ("source".to_string(), "history".to_string()),
+            (
+                "weaver.original_title".to_string(),
+                format!("job-{}", job_id.0),
+            ),
+        ]
+    );
+    assert_eq!(queued_articles(&pipeline, job_id), 1);
+    activate_job(&mut pipeline, job_id).await;
+    assert_eq!(download_queue_len(&pipeline, job_id), 1);
+}
+
+#[tokio::test]
+async fn reprocess_job_rebuilds_failed_history_from_streamed_persisted_nzb() {
+    reprocess_rebuilds_from_history(JobId(30037), "Failed History Job", "failed").await;
+}
+
+#[tokio::test]
+async fn reprocess_job_rebuilds_complete_history_from_streamed_persisted_nzb() {
+    reprocess_rebuilds_from_history(JobId(30039), "Complete History Job", "complete").await;
+}

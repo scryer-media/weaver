@@ -1,0 +1,1272 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+use tokio::{
+    sync::{Notify, oneshot},
+    task::JoinSet,
+    time::Instant,
+};
+use weaver_nntp::{
+    ADDRESS_ATTEMPT_LIMIT, SUSPECT_AFTER_FAILURES,
+    candidate_plan::{Attempt, CandidatePlan, PlanSnapshot},
+};
+use weaver_tunnel::{
+    pipe::{DialError, Dialed, Dialer, Names, Resolution, SetupHandle, Target},
+    resolution::record::Recording,
+};
+
+// How far back a member's rate looks, as far as a leg's does.
+const MEMBER_RATE_WINDOW: Duration = Duration::from_secs(4);
+
+#[derive(Clone, Debug)]
+pub struct PoolMemberStatus {
+    pub id: u32,
+    pub open: u32,
+    pub opening: u32,
+    pub session_handshake: Option<Duration>,
+    pub blocked: Option<String>,
+    pub warmed: bool,
+    // What the member's connections carry now, over the last few seconds.
+    pub bytes_per_second: u64,
+}
+
+// A member's rate, read off the bytes its connections carried whenever the
+// pool is looked at. Readings are kept at least a second apart and the rate
+// spans the oldest one still inside the window, so a pool looked at every
+// second reports what each member moved over the last few. Nothing runs
+// while nobody looks.
+#[derive(Default)]
+struct MemberRate {
+    readings: VecDeque<(Instant, u64)>,
+    rate: u64,
+}
+impl MemberRate {
+    fn read(&mut self, total: u64, now: Instant) -> u64 {
+        while self
+            .readings
+            .front()
+            .is_some_and(|(at, _)| now.duration_since(*at) > MEMBER_RATE_WINDOW)
+        {
+            self.readings.pop_front();
+        }
+        match self.readings.front() {
+            Some(&(at, bytes)) if now.duration_since(at) >= Duration::from_secs(1) => {
+                self.rate = (total.saturating_sub(bytes) as f64
+                    / now.duration_since(at).as_secs_f64()) as u64;
+            }
+            // A reading less than a second old is too short a span to rate.
+            Some(_) => {}
+            None => self.rate = 0,
+        }
+        if self
+            .readings
+            .back()
+            .is_none_or(|(at, _)| now.duration_since(*at) >= Duration::from_secs(1))
+        {
+            self.readings.push_back((now, total));
+        }
+        self.rate
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct FailedOpens {
+    count: u32,
+    last: Option<Instant>,
+}
+
+struct Member {
+    id: u32,
+    dialer: Arc<dyn Dialer>,
+    streams: weaver_tunnel::pipe::Revocable,
+    status: Mutex<PoolMemberStatus>,
+    idle_since: Mutex<Instant>,
+    session_gate: tokio::sync::Mutex<()>,
+    retiring: AtomicBool,
+    outcomes: Mutex<Vec<std::sync::Weak<weaver_tunnel::bridge::ConnectionOutcome>>>,
+    read: AtomicU64,
+    rate: Mutex<MemberRate>,
+    // Holders pinned to this member for their whole life: while one is, the
+    // member's session is never retired as idle.
+    pinned: AtomicU64,
+    // The sessions a holder could not open on the member in a row, for a
+    // hop of its path, and when the last of them failed; none since one
+    // opened.
+    failed_opens: Mutex<FailedOpens>,
+    // The pool's signal that its members changed, raised when this member
+    // becomes blocked.
+    changed: Arc<Notify>,
+}
+impl Member {
+    fn new(id: u32, dialer: Arc<dyn Dialer>, changed: Arc<Notify>) -> Arc<Self> {
+        Arc::new(Self {
+            id,
+            changed,
+            streams: weaver_tunnel::pipe::Revocable::new(dialer.clone()),
+            dialer,
+            status: Mutex::new(PoolMemberStatus {
+                id,
+                open: 0,
+                opening: 0,
+                session_handshake: None,
+                blocked: None,
+                warmed: false,
+                bytes_per_second: 0,
+            }),
+            idle_since: Mutex::new(Instant::now()),
+            session_gate: tokio::sync::Mutex::new(()),
+            retiring: AtomicBool::new(false),
+            outcomes: Mutex::new(Vec::new()),
+            read: AtomicU64::new(0),
+            rate: Mutex::new(MemberRate::default()),
+            pinned: AtomicU64::new(0),
+            failed_opens: Mutex::new(FailedOpens::default()),
+        })
+    }
+    // How many sessions in a row failed to open on the member, while that
+    // is often enough to pass it over: as often as the pool's plan takes to
+    // call a member suspect, the last of them within the plan's replan
+    // interval. Past that interval the member is tried again, as a plan's
+    // interval race tries every candidate again: the next session placed on
+    // it opens, which ends the run, or fails, which passes it over for
+    // another interval.
+    fn failing(&self, now: Instant) -> Option<u32> {
+        let failed = *self.failed_opens.lock().expect("member opens");
+        (failed.count >= SUSPECT_AFTER_FAILURES
+            && failed.last.is_some_and(|at| {
+                now.saturating_duration_since(at)
+                    < weaver_nntp::plan_timing::timing().replan_interval
+            }))
+        .then_some(failed.count)
+    }
+    // Blocks the member for `error`, and wakes whoever waits on the pool's
+    // members: a dial that waited for room on a member now fails at once
+    // when no member is left to dial.
+    fn block(&self, error: &weaver_tunnel::TunnelError) {
+        self.status.lock().expect("pool member").blocked = Some(error.to_string());
+        self.changed.notify_waiters();
+    }
+    fn status(&self, now: Instant) -> PoolMemberStatus {
+        let mut status = self.status.lock().expect("pool member").clone();
+        status.bytes_per_second = self
+            .rate
+            .lock()
+            .expect("member rate")
+            .read(self.read.load(Ordering::Relaxed), now);
+        status
+    }
+    fn recall(&self) {
+        self.retiring.store(true, Ordering::Release);
+        let outcomes = std::mem::take(&mut *self.outcomes.lock().expect("member outcomes"));
+        for outcome in outcomes.into_iter().filter_map(|outcome| outcome.upgrade()) {
+            outcome.retire();
+        }
+    }
+    async fn warm(&self) -> Result<(), DialError> {
+        match tokio::time::timeout(self.dialer.budget(), self.warm_inner()).await {
+            Ok(result) => result,
+            Err(_) => {
+                self.dialer.retire_idle().await;
+                Err(DialError::Timeout {
+                    stage: format!("pool member {} preparation", self.id),
+                })
+            }
+        }
+    }
+    async fn warm_inner(&self) -> Result<(), DialError> {
+        let _gate = self.session_gate.lock().await;
+        {
+            let status = self.status.lock().expect("pool member");
+            if let Some(reason) = &status.blocked {
+                return Err(DialError::Fatal(weaver_tunnel::TunnelError::Engine(
+                    reason.clone(),
+                )));
+            }
+            if status.warmed {
+                return Ok(());
+            }
+        }
+        let started = Instant::now();
+        let result = self.dialer.prepare().await;
+        {
+            let mut status = self.status.lock().expect("pool member");
+            status.session_handshake = Some(started.elapsed());
+            status.warmed = result.is_ok();
+        }
+        if let Err(DialError::Fatal(error)) = &result {
+            self.block(error);
+        }
+        result
+    }
+    async fn dial(self: &Arc<Self>, target: &Target) -> Result<(Dialed, Duration), DialError> {
+        if self.retiring.load(Ordering::Acquire) {
+            return Err(DialError::Skipped("pool member removed".into()));
+        }
+        if let Some(reason) = self.status.lock().expect("pool member").blocked.clone() {
+            return Err(DialError::Fatal(weaver_tunnel::TunnelError::Engine(reason)));
+        }
+        let guard = MemberOpening::new(self.clone());
+        self.warm().await?;
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            self.dialer.budget().min(ADDRESS_ATTEMPT_LIMIT),
+            self.streams.dial(target),
+        )
+        .await
+        .map_err(|_| DialError::Timeout {
+            stage: format!("pool member {}", self.id),
+        })?;
+        if let Err(DialError::Fatal(error)) = &result {
+            self.block(error);
+        }
+        let mut dialed = result?;
+        guard.connected(&mut dialed);
+        Ok((dialed, started.elapsed()))
+    }
+    async fn retire_if_idle(&self) {
+        let _gate = self.session_gate.lock().await;
+        let retire = {
+            let status = self.status.lock().expect("pool member");
+            status.warmed
+                && self.pinned.load(Ordering::Acquire) == 0
+                && status.open == 0
+                && status.opening == 0
+                && self.idle_since.lock().expect("member idle").elapsed()
+                    >= weaver_nntp::plan_timing::timing().pool_idle_retire
+        };
+        if retire && self.dialer.retire_idle().await {
+            self.status.lock().expect("pool member").warmed = false;
+        }
+    }
+}
+struct MemberOpening {
+    member: Arc<Member>,
+    done: bool,
+}
+impl MemberOpening {
+    fn new(member: Arc<Member>) -> Self {
+        member.status.lock().expect("pool member").opening += 1;
+        Self {
+            member,
+            done: false,
+        }
+    }
+    fn connected(mut self, dialed: &mut Dialed) {
+        {
+            let mut status = self.member.status.lock().expect("pool member");
+            status.opening -= 1;
+            status.open += 1;
+        }
+        self.done = true;
+        {
+            let mut outcomes = self.member.outcomes.lock().expect("member outcomes");
+            outcomes.retain(|outcome| outcome.strong_count() > 0);
+            outcomes.push(Arc::downgrade(&dialed.outcome));
+        }
+        if self.member.retiring.load(Ordering::Acquire) {
+            dialed.outcome.retire();
+        }
+        let member = self.member.clone();
+        dialed.outcome.on_read(move |bytes| {
+            member.read.fetch_add(bytes as u64, Ordering::Relaxed);
+        });
+        let member = self.member.clone();
+        dialed.outcome.on_close(move || {
+            let mut status = member.status.lock().expect("pool member");
+            status.open -= 1;
+            if status.open == 0 {
+                *member.idle_since.lock().expect("member idle") = Instant::now();
+            }
+        });
+    }
+}
+impl Drop for MemberOpening {
+    fn drop(&mut self) {
+        if !self.done {
+            self.member.status.lock().expect("pool member").opening -= 1;
+        }
+    }
+}
+
+// A member's dial, noting into a recording of its own when the pool's dial
+// runs in one, so the pool keeps the notes of the member it settled on, or
+// of the last to fail, rather than a mix of every member's.
+async fn noted<T>(
+    noting: bool,
+    dial: impl std::future::Future<Output = T>,
+) -> (T, Option<Arc<Recording>>) {
+    if !noting {
+        return (dial.await, None);
+    }
+    let notes = Arc::new(Recording::default());
+    (notes.scope(dial).await, Some(notes))
+}
+fn keep(recording: Option<&Arc<Recording>>, notes: Option<Arc<Recording>>) {
+    if let (Some(recording), Some(notes)) = (recording, notes) {
+        recording.adopt(&notes);
+    }
+}
+
+// Whether a pool has room on a member it would dial.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Room {
+    Some,
+    None,
+    Undialable,
+}
+
+struct PoolState {
+    id: u32,
+    plan: Mutex<CandidatePlan<u32>>,
+    members: RwLock<HashMap<u32, Arc<Member>>>,
+    changed: Arc<Notify>,
+    stopped: AtomicBool,
+    revision: AtomicU64,
+}
+impl PoolState {
+    fn record(&self, member: &Arc<Member>, update: impl FnOnce(&mut CandidatePlan<u32>)) -> bool {
+        let members = self.members.read().expect("pool members");
+        if !members
+            .get(&member.id)
+            .is_some_and(|current| Arc::ptr_eq(current, member))
+        {
+            return false;
+        }
+        update(&mut self.plan.lock().expect("pool plan"));
+        true
+    }
+    fn decorate(self: &Arc<Self>, member: Arc<Member>, mut dialed: Dialed) -> Dialed {
+        let id = member.id;
+        dialed.path.pool = Some(self.id);
+        dialed.path.member = Some(id);
+        let latency_state = self.clone();
+        let latency_member = member.clone();
+        dialed.outcome.on_body_latency(move |elapsed| {
+            latency_state.record(&latency_member, |plan| {
+                plan.body_latency(id, elapsed, Instant::now().into_std())
+            });
+        });
+        let delivery_state = self.clone();
+        let delivery_member = member.clone();
+        dialed.outcome.on_delivery(move |bytes, wire| {
+            delivery_state.record(&delivery_member, |plan| {
+                plan.delivered(id, bytes, wire, Instant::now().into_std())
+            });
+        });
+        let state = self.clone();
+        let upstream = dialed.setup.take();
+        dialed.setup = Some(SetupHandle::new(move |reached| {
+            if let Some(setup) = upstream {
+                setup.complete(reached);
+            }
+            state.record(&member, |plan| {
+                plan.setup(id, reached, Instant::now().into_std())
+            });
+        }));
+        // A connection that fails after it was set up says nothing about
+        // whether its member can be connected, so it is not a connect failure
+        // of the pin: a server that drops sessions mid-transfer would otherwise
+        // race the pool on every pair of drops, and every race starts the
+        // pin's age and its delivery evidence over, so no challenger could
+        // ever be measured against a throttled pin. Addresses are judged the
+        // same way: only connects and setups count against them.
+        dialed
+    }
+    // Whether `member` is still the pool's, as when it was leased.
+    fn current(&self, member: &Arc<Member>) -> Result<(), DialError> {
+        if self.stopped.load(Ordering::Acquire)
+            || !self
+                .members
+                .read()
+                .expect("pool members")
+                .get(&member.id)
+                .is_some_and(|m| Arc::ptr_eq(m, member))
+        {
+            return Err(DialError::Skipped("pool member changed".into()));
+        }
+        Ok(())
+    }
+    // A dial through `member` alone, its connection counted as the pool's.
+    async fn dial_member(
+        self: &Arc<Self>,
+        member: &Arc<Member>,
+        target: &Target,
+    ) -> Result<Dialed, DialError> {
+        let (dialed, elapsed) = member
+            .dial(target)
+            .await
+            .map_err(|error| self.pool_error(error))?;
+        if !self.record(member, |plan| {
+            plan.connected(member.id, elapsed, Instant::now().into_std())
+        }) {
+            return Err(DialError::Skipped("pool member changed".into()));
+        }
+        Ok(self.decorate(member.clone(), dialed))
+    }
+    // Whether a member the pool would dial has room for `purpose`, with the
+    // pool's signal and every such member's that has none. The members are
+    // asked with the members lock released: a route's lock can be held
+    // around this call, and a member edit takes the members lock.
+    fn room(&self, purpose: &weaver_tunnel::pipe::Purpose) -> (Room, Vec<Arc<Notify>>) {
+        let members: Vec<_> = self
+            .members
+            .read()
+            .expect("pool members")
+            .values()
+            .cloned()
+            .collect();
+        let mut waits = vec![self.changed.clone()];
+        let mut room = Room::Undialable;
+        for member in members {
+            if member.status.lock().expect("pool member").blocked.is_some() {
+                continue;
+            }
+            match member.dialer.room(purpose) {
+                Ok(()) => room = Room::Some,
+                Err(freed) => {
+                    waits.extend(freed);
+                    if room == Room::Undialable {
+                        room = Room::None;
+                    }
+                }
+            }
+        }
+        (room, waits)
+    }
+    fn all_blocked(&self) -> bool {
+        let members = self.members.read().expect("pool members");
+        !members.is_empty()
+            && members
+                .values()
+                .all(|member| member.status.lock().expect("pool member").blocked.is_some())
+    }
+    // The fatal error of a pool that has members and every one of them is
+    // blocked; `None` while any member is not blocked, or there are none.
+    fn blocked(&self) -> Option<DialError> {
+        self.all_blocked().then(|| {
+            DialError::Fatal(weaver_tunnel::TunnelError::Engine(
+                "all pool members are blocked".into(),
+            ))
+        })
+    }
+    fn pool_error(&self, error: DialError) -> DialError {
+        if let Some(blocked) = self.blocked() {
+            blocked
+        } else if matches!(error, DialError::Fatal(_)) {
+            DialError::Egress(std::io::Error::other(error))
+        } else {
+            error
+        }
+    }
+    async fn run(
+        self: Arc<Self>,
+        target: Target,
+        reply: oneshot::Sender<Result<Dialed, DialError>>,
+        recording: Option<Arc<Recording>>,
+    ) {
+        let mut reply = Some(reply);
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.stopped.load(Ordering::Acquire) {
+                return;
+            }
+            {
+                let members = self.members.read().expect("pool members");
+                let mut plan = self.plan.lock().expect("pool plan");
+                let eligible = plan
+                    .snapshot()
+                    .candidates
+                    .into_iter()
+                    .map(|candidate| candidate.candidate)
+                    .filter(|id| {
+                        members.get(id).is_some_and(|member| {
+                            member.status.lock().expect("pool member").blocked.is_none()
+                        })
+                    })
+                    .collect();
+                plan.set_candidates(eligible, Instant::now().into_std());
+            }
+            let action = self
+                .plan
+                .lock()
+                .expect("pool plan")
+                .next_attempt(Instant::now().into_std());
+            match action {
+                Attempt::Wait(_) => notified.await,
+                Attempt::Fail(_, message) => {
+                    let _ = reply
+                        .take()
+                        .unwrap()
+                        .send(Err(self.pool_error(DialError::Skipped(message))));
+                    return;
+                }
+                Attempt::Dial {
+                    order,
+                    shadow,
+                    announce,
+                } => {
+                    if let Some(announce) = announce {
+                        announce.log(&format!("pool {}", self.id));
+                    }
+                    let mut last = DialError::Skipped("no enabled pool member".into());
+                    let mut last_notes = None;
+                    for id in order {
+                        let member = self.members.read().expect("pool members").get(&id).cloned();
+                        let Some(member) = member else {
+                            continue;
+                        };
+                        let (result, notes) =
+                            noted(recording.is_some(), member.dial(&target)).await;
+                        match result {
+                            Ok((dialed, elapsed)) => {
+                                if !self.record(&member, |plan| {
+                                    plan.connected(id, elapsed, Instant::now().into_std())
+                                }) {
+                                    continue;
+                                }
+                                keep(recording.as_ref(), notes);
+                                let dialed = self.decorate(member.clone(), dialed);
+                                if shadow == Some(id) {
+                                    // The plan judges a challenger by what its
+                                    // shadow connection delivers; one that ends
+                                    // first is owed another, and the plan hears
+                                    // whether this one answered at all.
+                                    let responses = Arc::new(AtomicU64::new(0));
+                                    let answered = responses.clone();
+                                    dialed.outcome.on_body_latency(move |_| {
+                                        answered.fetch_add(1, Ordering::Relaxed);
+                                    });
+                                    let state = self.clone();
+                                    dialed.outcome.on_close(move || {
+                                        let responses = responses.load(Ordering::Relaxed);
+                                        state.record(&member, |plan| {
+                                            plan.shadow_ended(
+                                                id,
+                                                responses,
+                                                Instant::now().into_std(),
+                                            )
+                                        });
+                                    });
+                                }
+                                let _ = reply.take().unwrap().send(Ok(dialed));
+                                return;
+                            }
+                            Err(error) => {
+                                if error.is_evidence() {
+                                    self.record(&member, |plan| {
+                                        plan.failed(id, Instant::now().into_std())
+                                    });
+                                }
+                                last = error;
+                                last_notes = notes;
+                            }
+                        }
+                    }
+                    keep(recording.as_ref(), last_notes);
+                    let _ = reply.take().unwrap().send(Err(self.pool_error(last)));
+                    return;
+                }
+                Attempt::Race { candidates, reason } => {
+                    let revision = self.revision.load(Ordering::Acquire);
+                    let members: Vec<_> = {
+                        let members = self.members.read().expect("pool members");
+                        candidates
+                            .iter()
+                            .filter_map(|id| members.get(id).cloned())
+                            .collect()
+                    };
+                    let mut last = DialError::Skipped("no enabled pool member".into());
+                    let mut last_notes = None;
+                    let mut race = JoinSet::new();
+                    for member in members {
+                        if member.status.lock().expect("pool member").blocked.is_some() {
+                            continue;
+                        }
+                        let target = target.clone();
+                        let noting = recording.is_some();
+                        // Each member dials in a task of its own, with the
+                        // names of the route dialling.
+                        let names = Names::current();
+                        race.spawn(Names::scope(names, async move {
+                            let (result, notes) = noted(noting, member.dial(&target)).await;
+                            (member, result, notes)
+                        }));
+                    }
+                    let mut winner = None;
+                    let mut slow = Vec::new();
+                    while let Some(result) = race.join_next().await {
+                        let Ok((member, result, notes)) = result else {
+                            continue;
+                        };
+                        let id = member.id;
+                        if revision != self.revision.load(Ordering::Acquire) {
+                            continue;
+                        }
+                        match result {
+                            Ok((dialed, elapsed)) => {
+                                if !self.record(&member, |plan| {
+                                    plan.connected(id, elapsed, Instant::now().into_std())
+                                }) {
+                                    continue;
+                                }
+                                if winner.is_none() && reply.is_some() {
+                                    winner = Some(id);
+                                    keep(recording.as_ref(), notes);
+                                    let _ = reply
+                                        .take()
+                                        .unwrap()
+                                        .send(Ok(self.decorate(member, dialed)));
+                                }
+                            }
+                            Err(error) => {
+                                if matches!(&error, DialError::Timeout { stage } if !stage.ends_with("preparation"))
+                                {
+                                    slow.push(id);
+                                } else if error.is_evidence() {
+                                    self.record(&member, |plan| {
+                                        plan.failed(id, Instant::now().into_std())
+                                    });
+                                }
+                                last = error;
+                                last_notes = notes;
+                            }
+                        }
+                    }
+                    let members_guard = self.members.read().expect("pool members");
+                    if revision == self.revision.load(Ordering::Acquire) {
+                        let mut plan = self.plan.lock().expect("pool plan");
+                        if winner.is_none() {
+                            for id in slow {
+                                plan.failed(id, Instant::now().into_std());
+                            }
+                        }
+                        plan.race_finished(
+                            winner.ok_or_else(|| {
+                                (std::io::ErrorKind::NotConnected, last.to_string())
+                            }),
+                            reason,
+                            Instant::now().into_std(),
+                        );
+                    }
+                    let changed = revision != self.revision.load(Ordering::Acquire);
+                    drop(members_guard);
+                    self.changed.notify_waiters();
+                    if changed && reply.is_some() {
+                        continue;
+                    }
+                    if let Some(reply) = reply {
+                        keep(recording.as_ref(), last_notes);
+                        let _ = reply.send(Err(self.pool_error(last)));
+                    }
+                    return;
+                }
+            }
+        }
+    }
+}
+
+pub struct PoolStage {
+    state: Arc<PoolState>,
+    // A consumer dials through the pool as a whole, as a server or a feed
+    // does, rather than holding one member, as a torrent session does: only
+    // then does the pool open its members' tunnels ahead of a dial.
+    whole: AtomicBool,
+    // The pool opened its members ahead since it was first dialled whole.
+    warmed_whole: AtomicBool,
+    tasks: Mutex<JoinSet<()>>,
+    retirement: tokio::task::JoinHandle<()>,
+    handle: tokio::runtime::Handle,
+}
+impl PoolStage {
+    pub fn new(
+        id: u32,
+        members: Vec<(u32, Arc<dyn Dialer>)>,
+        handle: tokio::runtime::Handle,
+    ) -> Arc<Self> {
+        let mut plan = CandidatePlan::default();
+        plan.set_candidates(
+            members.iter().map(|(id, _)| *id).collect(),
+            Instant::now().into_std(),
+        );
+        let changed = Arc::new(Notify::new());
+        let members = members
+            .into_iter()
+            .map(|(id, dialer)| (id, Member::new(id, dialer, changed.clone())))
+            .collect();
+        let state = Arc::new(PoolState {
+            id,
+            plan: Mutex::new(plan),
+            members: RwLock::new(members),
+            changed,
+            stopped: AtomicBool::new(false),
+            revision: AtomicU64::new(0),
+        });
+        let weak = Arc::downgrade(&state);
+        let retirement = handle.spawn(async move {
+            // Only sweeps for members idle past the plan timing's idle
+            // retire; it never decides which member new connections use.
+            let mut interval =
+                tokio::time::interval(weaver_nntp::plan_timing::timing().pool_idle_sweep);
+            loop {
+                interval.tick().await;
+                let Some(state) = weak.upgrade() else {
+                    return;
+                };
+                let pin = state.plan.lock().expect("pool plan").snapshot().pinned;
+                let members: Vec<_> = state
+                    .members
+                    .read()
+                    .expect("pool members")
+                    .values()
+                    .filter(|m| Some(m.id) != pin)
+                    .cloned()
+                    .collect();
+                for member in members {
+                    member.retire_if_idle().await;
+                }
+            }
+        });
+        Arc::new(Self {
+            state,
+            whole: AtomicBool::new(false),
+            warmed_whole: AtomicBool::new(false),
+            tasks: Mutex::new(JoinSet::new()),
+            retirement,
+            handle,
+        })
+    }
+    pub fn snapshot(&self) -> (PlanSnapshot<u32>, Vec<PoolMemberStatus>) {
+        let now = Instant::now();
+        let plan = self
+            .state
+            .plan
+            .lock()
+            .expect("pool plan")
+            .snapshot_at(now.into_std());
+        let mut members: Vec<_> = self
+            .state
+            .members
+            .read()
+            .expect("pool members")
+            .values()
+            .map(|m| m.status(now))
+            .collect();
+        members.sort_by_key(|m| m.id);
+        (plan, members)
+    }
+    pub fn delivered(&self, member: u32, bytes: u64, wire: Duration) {
+        self.state.plan.lock().expect("pool plan").delivered(
+            member,
+            bytes,
+            wire,
+            Instant::now().into_std(),
+        );
+    }
+    pub fn set_members(&self, next: Vec<(u32, Arc<dyn Dialer>)>) -> Vec<u32> {
+        let mut members = self.state.members.write().expect("pool members");
+        let order: Vec<_> = next.iter().map(|(id, _)| *id).collect();
+        if members.len() == next.len()
+            && next.iter().all(|(id, stage)| {
+                members
+                    .get(id)
+                    .is_some_and(|m| Arc::ptr_eq(&m.dialer, stage))
+            })
+        {
+            // The same members, perhaps in another order: only the order the
+            // plan tries its candidates in moves. A blocked member the plan
+            // already dropped stays out.
+            let mut plan = self.state.plan.lock().expect("pool plan");
+            let current: Vec<_> = plan
+                .snapshot()
+                .candidates
+                .into_iter()
+                .map(|candidate| candidate.candidate)
+                .collect();
+            let reordered: Vec<_> = order
+                .into_iter()
+                .filter(|id| current.contains(id))
+                .collect();
+            if reordered != current {
+                plan.set_candidates(reordered, Instant::now().into_std());
+            }
+            return Vec::new();
+        }
+        // Recalled once the members lock is released: recalling a member
+        // closes its idle connections on this thread, and a close can take
+        // the lock of the route over the pool or record on this pool.
+        let recalled: Vec<_> = members
+            .iter()
+            .filter(|(id, member)| {
+                !next
+                    .iter()
+                    .any(|(next, stage)| next == *id && Arc::ptr_eq(stage, &member.dialer))
+            })
+            .map(|(_, member)| member.clone())
+            .collect();
+        let removed = members
+            .keys()
+            .filter(|id| !next.iter().any(|(next, _)| next == *id))
+            .copied()
+            .collect();
+        let next = next
+            .into_iter()
+            .map(|(id, dialer)| {
+                let member = members
+                    .get(&id)
+                    .filter(|m| Arc::ptr_eq(&m.dialer, &dialer))
+                    .cloned()
+                    .unwrap_or_else(|| Member::new(id, dialer, self.state.changed.clone()));
+                (id, member)
+            })
+            .collect();
+        let replaced = std::mem::replace(&mut *members, next);
+        self.state.revision.fetch_add(1, Ordering::AcqRel);
+        {
+            let mut plan = self.state.plan.lock().expect("pool plan");
+            // A member dialled through another session now is a proxy the
+            // plan has not tried: what the one it replaces did says nothing
+            // about it.
+            for member in &recalled {
+                plan.forget(member.id);
+            }
+            plan.set_candidates(order, Instant::now().into_std());
+            plan.replan();
+        }
+        drop(members);
+        for member in &recalled {
+            member.recall();
+        }
+        drop(replaced);
+        self.state.changed.notify_waiters();
+        removed
+    }
+    /// A consumer dials through the pool as a whole from here, for as long
+    /// as the pool runs.
+    pub fn serve_whole(&self) {
+        self.whole.store(true, Ordering::Release);
+    }
+    /// Whether a consumer dials the pool whole and it has not yet opened its
+    /// members ahead since.
+    pub fn unwarmed(&self) -> bool {
+        self.whole.load(Ordering::Acquire) && !self.warmed_whole.load(Ordering::Acquire)
+    }
+    /// Open every member's tunnel ahead of a dial, on a pool a consumer
+    /// dials through as a whole. A pool whose consumers each hold one member
+    /// opens a member's tunnel only when a holder dials through it.
+    pub fn prewarm(&self) {
+        if !self.whole.load(Ordering::Acquire) {
+            return;
+        }
+        self.warmed_whole.store(true, Ordering::Release);
+        let members: Vec<_> = self
+            .state
+            .members
+            .read()
+            .expect("pool members")
+            .values()
+            .cloned()
+            .collect();
+        let mut tasks = self.tasks.lock().expect("pool tasks");
+        while tasks.try_join_next().is_some() {}
+        for member in members {
+            tasks.spawn_on(
+                async move {
+                    let _ = member.warm().await;
+                },
+                &self.handle,
+            );
+        }
+    }
+    // The member preparations the pool started ahead of a dial.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn warmings(&self) -> usize {
+        self.tasks.lock().expect("pool tasks").len()
+    }
+    pub fn revision(&self) -> u64 {
+        self.state.revision.load(Ordering::Acquire)
+    }
+    // Whether every member is blocked, which is when the pool reports a
+    // dial through it as fatal.
+    pub fn all_blocked(&self) -> bool {
+        self.state.all_blocked()
+    }
+    // The error a dial through the pool fails with when every member is
+    // blocked, so a fetch fails the same way instead of skipping the pool.
+    pub fn blocked(&self) -> Option<DialError> {
+        self.state.blocked()
+    }
+    // Each lease keeps the same member for DNS validation and its HTTP fetch.
+    pub fn lease_members(&self) -> Vec<(u32, Arc<dyn Dialer>)> {
+        let members = self.state.members.read().expect("pool members");
+        let order = self.state.plan.lock().expect("pool plan").lease_order();
+        order
+            .into_iter()
+            .filter_map(|id| members.get(&id))
+            .filter(|member| member.status.lock().expect("pool member").blocked.is_none())
+            .map(|member| {
+                (
+                    member.id,
+                    Arc::new(MemberLease {
+                        member: member.clone(),
+                        state: self.state.clone(),
+                        reservation: Mutex::new(None),
+                    }) as Arc<dyn Dialer>,
+                )
+            })
+            .collect()
+    }
+    // Member `id` alone, for a holder that keeps one exit for its whole
+    // life: every dial goes through that member and none moves to another
+    // when it fails. None while `id` is no member or is blocked.
+    pub fn pin_member(&self, id: u32) -> Option<Arc<MemberPin>> {
+        self.pin_where(id, |_| true)
+    }
+    // The member `pin` holds, as this pool has it: the same proxy, dialled
+    // through the same session, and not blocked. A holder whose own pool let
+    // that member go keeps its exit through this one.
+    pub fn pin_same(&self, pin: &MemberPin) -> Option<Arc<MemberPin>> {
+        self.pin_where(pin.member.id, |member| {
+            Arc::ptr_eq(&member.dialer, &pin.member.dialer)
+        })
+    }
+    fn pin_where(&self, id: u32, like: impl Fn(&Member) -> bool) -> Option<Arc<MemberPin>> {
+        if self.state.stopped.load(Ordering::Acquire) {
+            return None;
+        }
+        let member = self
+            .state
+            .members
+            .read()
+            .expect("pool members")
+            .get(&id)
+            .filter(|member| {
+                like(member) && member.status.lock().expect("pool member").blocked.is_none()
+            })
+            .cloned()?;
+        member.pinned.fetch_add(1, Ordering::AcqRel);
+        Some(Arc::new(MemberPin {
+            member,
+            state: self.state.clone(),
+        }))
+    }
+    // Why member `id` carries nothing now, when it does not: it is no
+    // member, or it is down as `members_down` says.
+    pub fn member_down(&self, id: u32) -> Option<String> {
+        let members = self.state.members.read().expect("pool members");
+        if !members.contains_key(&id) {
+            return Some(format!(
+                "proxy {id} is no longer a member of pool {}",
+                self.state.id
+            ));
+        }
+        down_of(&members).remove(&id)
+    }
+    /// Why each member that carries nothing now does not, by id: it is
+    /// blocked, or no session opened on it [`SUSPECT_AFTER_FAILURES`] times
+    /// in a row, the last within the plan's replan interval, while another
+    /// member is neither. A member is passed over for failed opens only
+    /// while there is another to go to: with none, each stays up and its
+    /// holders keep opening on it.
+    pub fn members_down(&self) -> HashMap<u32, String> {
+        down_of(&self.state.members.read().expect("pool members"))
+    }
+    pub fn lease_member(&self) -> Result<(u32, Arc<dyn Dialer>), DialError> {
+        self.lease_members()
+            .into_iter()
+            .next()
+            .ok_or_else(|| DialError::Skipped("no enabled pool member".into()))
+    }
+    pub fn lease(&self) -> Result<Arc<dyn Dialer>, DialError> {
+        self.lease_member().map(|(_, stage)| stage)
+    }
+}
+// Why each of `members` that carries nothing does not, as
+// `PoolStage::members_down` says, in one pass.
+fn down_of(members: &HashMap<u32, Arc<Member>>) -> HashMap<u32, String> {
+    let now = Instant::now();
+    let mut down = HashMap::new();
+    let mut failing = Vec::new();
+    let mut usable = false;
+    for member in members.values() {
+        if let Some(reason) = member.status.lock().expect("pool member").blocked.clone() {
+            down.insert(member.id, reason);
+        } else if let Some(failed) = member.failing(now) {
+            failing.push((member, failed));
+        } else {
+            usable = true;
+        }
+    }
+    if usable {
+        down.extend(failing.into_iter().map(|(member, failed)| {
+            let reason = match member.dialer.failing_hop() {
+                Some(hop) => format!(
+                    "proxy {} opened no session {failed} times in a row: proxy {}: {}",
+                    member.id, hop.proxy, hop.fault
+                ),
+                None => format!(
+                    "proxy {} opened no session {failed} times in a row",
+                    member.id
+                ),
+            };
+            (member.id, reason)
+        }));
+    }
+    down
+}
+struct MemberLease {
+    member: Arc<Member>,
+    state: Arc<PoolState>,
+    reservation: Mutex<Option<MemberOpening>>,
+}
+impl MemberLease {
+    fn reserve(&self) {
+        self.reservation
+            .lock()
+            .expect("member lease")
+            .get_or_insert_with(|| MemberOpening::new(self.member.clone()));
+    }
+}
+#[async_trait::async_trait]
+impl Dialer for MemberLease {
+    fn report_request(&self, error: Option<&DialError>) {
+        self.state.record(&self.member, |plan| {
+            let now = Instant::now().into_std();
+            match error {
+                None => plan.lease_succeeded(self.member.id, now),
+                Some(error) if error.is_path_evidence() => plan.failed(self.member.id, now),
+                _ => {}
+            }
+        });
+    }
+    async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
+        self.state.current(&self.member)?;
+        self.reserve();
+        self.state.dial_member(&self.member, target).await
+    }
+    async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {
+        self.reserve();
+        self.member.dialer.resolve(host).await
+    }
+    fn budget(&self) -> Duration {
+        self.member.dialer.budget()
+    }
+    fn describe(&self) -> String {
+        format!("pool {} member {}", self.state.id, self.member.id)
+    }
+}
+/// One member held for a holder's whole life, as a torrent session holds its
+/// exit: its connections and bytes count as the member's, as a lease's do,
+/// and it dials, listens and sends datagrams through that member only.
+pub struct MemberPin {
+    member: Arc<Member>,
+    state: Arc<PoolState>,
+}
+impl MemberPin {
+    /// Why the member held is no longer the pool's, when it is not: the pool
+    /// stopped, let the proxy go, or holds it as it is now after an edit.
+    pub fn stale(&self) -> Option<String> {
+        let (pool, id) = (self.state.id, self.member.id);
+        if self.state.stopped.load(Ordering::Acquire) {
+            return Some(format!("pool {pool} stopped"));
+        }
+        match self.state.members.read().expect("pool members").get(&id) {
+            None => Some(format!("proxy {id} is no longer a member of pool {pool}")),
+            Some(member) if !Arc::ptr_eq(member, &self.member) => {
+                Some(format!("proxy {id} changed in pool {pool}"))
+            }
+            Some(_) => None,
+        }
+    }
+    /// Why the member held carries nothing, when it is blocked.
+    pub fn blocked(&self) -> Option<String> {
+        self.member
+            .status
+            .lock()
+            .expect("pool member")
+            .blocked
+            .clone()
+    }
+    /// A session the holder opened on the member came up, or could not for
+    /// a hop of the member's path: setup evidence for the pool's plan, as a
+    /// connection's setup is, and the member's run of failed opens, which
+    /// one that comes up ends.
+    pub fn opened(&self, reached: bool) {
+        let id = self.member.id;
+        self.state.record(&self.member, |plan| {
+            plan.setup(id, reached, Instant::now().into_std())
+        });
+        let mut failed = self.member.failed_opens.lock().expect("member opens");
+        *failed = if reached {
+            FailedOpens::default()
+        } else {
+            FailedOpens {
+                count: failed.count.saturating_add(1),
+                last: Some(Instant::now()),
+            }
+        };
+    }
+    /// Resolves once the pool's members may have changed since this was
+    /// called, or at once when the member held is no longer the pool's.
+    pub async fn changed(&self) {
+        let notified = self.state.changed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.stale().is_none() {
+            notified.await;
+        }
+    }
+}
+impl Drop for MemberPin {
+    fn drop(&mut self) {
+        self.member.pinned.fetch_sub(1, Ordering::AcqRel);
+        *self.member.idle_since.lock().expect("member idle") = Instant::now();
+    }
+}
+#[async_trait::async_trait]
+impl Dialer for MemberPin {
+    async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
+        self.state.current(&self.member)?;
+        self.state.dial_member(&self.member, target).await
+    }
+    async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {
+        self.state.current(&self.member)?;
+        self.member.dialer.resolve(host).await
+    }
+    fn offers(&self) -> weaver_tunnel::pipe::Transports {
+        self.member.dialer.offers()
+    }
+    fn room(&self, purpose: &weaver_tunnel::pipe::Purpose) -> Result<(), Vec<Arc<Notify>>> {
+        self.member.dialer.room(purpose)
+    }
+    fn wait_room(
+        &self,
+        purpose: &weaver_tunnel::pipe::Purpose,
+    ) -> Result<(), weaver_tunnel::pipe::Capacity> {
+        self.member.dialer.wait_room(purpose)
+    }
+    fn datagrams(self: Arc<Self>) -> Option<Arc<dyn weaver_tunnel::endpoint::DatagramTransport>> {
+        Arc::clone(&self.member.dialer).datagrams()
+    }
+    fn inbound(self: Arc<Self>) -> Option<Arc<dyn weaver_tunnel::pipe::Inbound>> {
+        Arc::clone(&self.member.dialer).inbound()
+    }
+    fn bind_local_udp(
+        &self,
+        local: std::net::SocketAddr,
+    ) -> Option<std::io::Result<std::net::UdpSocket>> {
+        self.member.dialer.bind_local_udp(local)
+    }
+    fn source_toward(&self, to: std::net::SocketAddr) -> Option<std::io::Result<std::net::IpAddr>> {
+        self.member.dialer.source_toward(to)
+    }
+    fn ipv6_sources(&self) -> Option<std::io::Result<weaver_tunnel::egress::Ipv6Sources>> {
+        self.member.dialer.ipv6_sources()
+    }
+    fn failing_hop(&self) -> Option<weaver_tunnel::pipe::FailingHop> {
+        self.member.dialer.failing_hop()
+    }
+    fn budget(&self) -> Duration {
+        self.member.dialer.budget()
+    }
+    fn describe(&self) -> String {
+        format!("pool {} member {}", self.state.id, self.member.id)
+    }
+}
+impl Drop for PoolStage {
+    fn drop(&mut self) {
+        self.state.stopped.store(true, Ordering::Release);
+        self.state.changed.notify_waiters();
+        self.retirement.abort();
+        self.tasks.get_mut().expect("pool tasks").abort_all();
+    }
+}
+#[async_trait::async_trait]
+impl Dialer for PoolStage {
+    fn over_limit_cleared(&self) {
+        self.state
+            .plan
+            .lock()
+            .expect("pool plan")
+            .over_limit_cleared(Instant::now().into_std());
+    }
+    // Room on any member the pool would dial, or every such member's signal
+    // and the pool's own when none has room. A pool with no member to dial
+    // says it has room, so the dial reports why it cannot connect.
+    fn room(&self, purpose: &weaver_tunnel::pipe::Purpose) -> Result<(), Vec<Arc<Notify>>> {
+        match self.state.room(purpose) {
+            (Room::Some | Room::Undialable, _) => Ok(()),
+            (Room::None, waits) => Err(waits),
+        }
+    }
+    async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
+        if self.state.stopped.load(Ordering::Acquire) {
+            return Err(DialError::Skipped("pool stopped".into()));
+        }
+        let (reply, answer) = oneshot::channel();
+        // The pool dials in a task of its own. The names of the route
+        // dialling go with it, and so does a test's recording.
+        let recording = Recording::current();
+        let names = Names::current();
+        {
+            let mut tasks = self.tasks.lock().expect("pool tasks");
+            while tasks.try_join_next().is_some() {}
+            tasks.spawn_on(
+                Names::scope(
+                    names,
+                    self.state.clone().run(target.clone(), reply, recording),
+                ),
+                &self.handle,
+            );
+        }
+        match answer
+            .await
+            .map_err(|_| DialError::Skipped("pool stopped".into()))?
+        {
+            // The member that answered last is not the only one whose room
+            // the caller waits for: a socket freed on any member, or a change
+            // to the members, is room again.
+            Err(DialError::AtCapacity(mut waits)) => {
+                waits.waits.extend(self.state.room(&target.purpose).1);
+                Err(DialError::AtCapacity(waits))
+            }
+            result => result,
+        }
+    }
+    async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {
+        self.lease()?.resolve(host).await
+    }
+    fn budget(&self) -> Duration {
+        self.state
+            .members
+            .read()
+            .expect("pool members")
+            .values()
+            .map(|m| m.dialer.budget().saturating_add(ADDRESS_ATTEMPT_LIMIT))
+            .fold(Duration::ZERO, Duration::saturating_add)
+    }
+    async fn shutdown(&self) {
+        self.state.stopped.store(true, Ordering::Release);
+        self.state.changed.notify_waiters();
+        self.retirement.abort();
+        let mut tasks = std::mem::take(&mut *self.tasks.lock().expect("pool tasks"));
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+    }
+    fn describe(&self) -> String {
+        format!("proxy pool {}", self.state.id)
+    }
+}
+
+#[cfg(test)]
+#[path = "pool_stage_tests.rs"]
+mod tests;

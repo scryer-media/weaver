@@ -3,6 +3,9 @@
 
 // Windows and everything else get different allocators, so the module that
 // `allocator` names differs by target; both define the same three items.
+use weaver_server_core::post_processing::settings::PostProcessingSettingsQueries;
+use weaver_server_core::settings::persistence::SettingsPersistenceQueries;
+use weaver_server_core::settings::service::SettingsServiceQueries;
 #[cfg(target_os = "windows")]
 #[path = "allocator_mimalloc.rs"]
 mod allocator;

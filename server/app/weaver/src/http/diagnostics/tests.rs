@@ -2,6 +2,21 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use weaver_server_core::auth::repository::AuthRepositoryQueries;
+use weaver_server_core::categories::persistence::CategoriesPersistenceQueries;
+use weaver_server_core::categories::queries::CategoriesQueries;
+use weaver_server_core::jobs::diagnostic_names::JobsDiagnosticNamesDiagnosticRecentHistoryIdsQueries;
+use weaver_server_core::jobs::diagnostic_names::reference::JobsDiagnosticNamesDiagnosticJobNamesWholeQueries;
+use weaver_server_core::jobs::persistence::JobsPersistenceQueries;
+use weaver_server_core::jobs::repository::JobsRepositoryQueries;
+use weaver_server_core::post_processing::instances::PostProcessingInstancesQueries;
+use weaver_server_core::proxies::ProxiesDnsPersistenceQueries;
+use weaver_server_core::proxies::ProxiesNetworkPersistenceQueries;
+use weaver_server_core::proxies::ProxiesPersistenceQueries;
+use weaver_server_core::rss::RssQueries;
+use weaver_server_core::servers::persistence::ServersPersistenceQueries;
+use weaver_server_core::servers::queries::ServersQueries;
+use weaver_server_core::settings::SettingsSchedulesQueries;
 
 #[tokio::test]
 async fn config_collection_redacts_and_refuses_unparseable_files() {

@@ -79,19 +79,25 @@ const LIFTED: &[(&str, usize)] = &[
         1,
     ),
     ("server/app/weaver/src/tray/shared.rs", 1),
-    ("server/crates/weaver-server-core/src/lib.rs", 1),
+    ("server/crates/weaver-server-pipeline/src/lib.rs", 1),
     (
-        "server/crates/weaver-server-core/src/proxies/network_runtime.rs",
+        "server/crates/weaver-server-pipeline/src/proxies/network_runtime.rs",
         3,
     ),
     (
-        "server/crates/weaver-server-core/src/proxies/routed_http.rs",
+        "server/crates/weaver-server-pipeline/src/proxies/routed_http.rs",
         2,
     ),
-    ("server/crates/weaver-server-core/src/speed_test/http.rs", 1),
+    (
+        "server/crates/weaver-server-pipeline/src/speed_test/http.rs",
+        1,
+    ),
     // A leg's clients, one built for each target and shape and kept for
     // the leg.
-    ("server/crates/weaver-server-core/src/torrents/net.rs", 1),
+    (
+        "server/crates/weaver-server-pipeline/src/torrents/net.rs",
+        1,
+    ),
     ("xtask/src/main.rs", 1),
 ];
 
@@ -104,7 +110,7 @@ const LIFTED: &[(&str, usize)] = &[
 const BLANKET_LIFTED: &[(&str, usize)] = &[
     // One lint carries the route ban and the writer gate, and the crate's
     // tests write their own rows: see the lift's own comment.
-    ("server/crates/weaver-server-core/src/lib.rs", 1),
+    ("server/crates/weaver-server-pipeline/src/lib.rs", 1),
 ];
 
 // Built here so this file never counts as a lift of the host name lookup
@@ -152,7 +158,7 @@ const KNOWN_HOST_DNS: &[(&str, usize)] = &[
         1,
     ),
     (
-        "server/crates/weaver-server-core/src/operations/backup/logical.rs",
+        "server/crates/weaver-server-pipeline/src/operations/backup/logical.rs",
         1,
     ),
     (
@@ -164,19 +170,19 @@ const KNOWN_HOST_DNS: &[(&str, usize)] = &[
         1,
     ),
     (
-        "server/crates/weaver-server-core/src/persistence/connection/tests.rs",
+        "server/crates/weaver-server-pipeline/src/persistence/connection/tests.rs",
         3,
     ),
     (
-        "server/crates/weaver-server-core/src/persistence/postgres_migrations.rs",
+        "server/crates/weaver-server-pipeline/src/persistence/postgres_migrations.rs",
         2,
     ),
     (
-        "server/crates/weaver-server-core/src/persistence/setup.rs",
+        "server/crates/weaver-server-pipeline/src/persistence/setup.rs",
         1,
     ),
     (
-        "server/crates/weaver-server-core/src/persistence/sql_services.rs",
+        "server/crates/weaver-server-db/src/persistence/sql_services.rs",
         1,
     ),
     (
@@ -203,7 +209,7 @@ const CLIENT_CRATES: &[(&str, &[&str])] = &[
             "artifact-trust",
             "weaver",
             "weaver-server-api",
-            "weaver-server-core",
+            "weaver-server-pipeline",
             // The torrent session builds no client: it takes every one,
             // the port mappers' too, from `torrents::net`, built on the route.
             "weaver-torrent",

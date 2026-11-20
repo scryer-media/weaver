@@ -1,0 +1,42 @@
+[package]
+name = "weaver-server-migrations"
+description = "Database schema migrations for the Weaver server"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[features]
+test-support = []
+
+[dependencies]
+blake3 = { workspace = true }
+chrono = { workspace = true }
+getrandom = { workspace = true, default-features = false }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+weaver-server-base = { path = "../weaver-server-base" }
+weaver-server-db = { path = "../weaver-server-db" }
+weaver-server-history = { path = "../weaver-server-history" }
+weaver-server-ingest = { path = "../weaver-server-ingest" }
+weaver-server-jobs = { path = "../weaver-server-jobs" }
+weaver-server-net = { path = "../weaver-server-net" }
+weaver-server-postproc = { path = "../weaver-server-postproc" }
+weaver-server-settings = { path = "../weaver-server-settings" }
+weaver-server-torrents = { path = "../weaver-server-torrents" }
+zstd = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[build-dependencies]
+blake3 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+zstd = { workspace = true }

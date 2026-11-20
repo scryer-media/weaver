@@ -15,6 +15,8 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast};
 use tower::ServiceExt;
 use weaver_server_core::Database;
+use weaver_server_core::auth::api_keys::AuthApiKeysQueries;
+use weaver_server_core::auth::repository::AuthRepositoryQueries;
 use weaver_server_core::auth::{self as jwt, JWT_TTL_SECS};
 use weaver_server_core::auth::{
     ApiKeyAuthRow, ApiKeyCache, CachedLoginAuth, CallerScope, LoginAuthCache, hash_api_key,
@@ -24,6 +26,7 @@ use weaver_server_core::events::model::PipelineEvent;
 use weaver_server_core::jobs::handle::{DownloadBlockKind, DownloadBlockState};
 use weaver_server_core::jobs::ids::JobId;
 use weaver_server_core::operations::metrics::PipelineMetrics;
+use weaver_server_core::post_processing::settings::PostProcessingSettingsQueries;
 use weaver_server_core::settings::model::{Config, SharedConfig};
 use weaver_server_core::{
     JobInfo, JobStatus, MetricsSnapshot, Par3MetricsSnapshot, SharedPipelineState,

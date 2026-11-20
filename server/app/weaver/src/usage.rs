@@ -8,6 +8,7 @@
 //! path itself is untouched: no article pays anything for the ledger.
 
 use std::sync::Arc;
+use weaver_server_core::operations::usage_history::OperationsUsageHistoryQueries;
 
 use chrono::Local;
 use tracing::warn;
@@ -260,6 +261,8 @@ pub(crate) fn spawn_usage_history_task(
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
+    use weaver_server_core::operations::usage_history::OperationsUsageHistoryQueries;
+    use weaver_server_core::servers::persistence::ServersPersistenceQueries;
 
     use weaver_nntp::ServerState;
     use weaver_nntp::health::{CooldownReason, DisableReason};

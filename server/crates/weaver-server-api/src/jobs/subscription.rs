@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use weaver_server_core::tags::TagsQueries;
 
 use super::*;
 use crate::jobs::types::{

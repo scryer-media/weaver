@@ -1,0 +1,1504 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+use weaver_nntp::client::{NntpClient, NntpClientConfig};
+use weaver_server_base::events::model::PipelineEvent;
+use weaver_server_pipeline::history::queries::HistoryQueries;
+use weaver_server_pipeline::pipeline::tests::{
+    TestHarness, nzb_zstd_for, segmented_job_spec, standalone_job_spec, wait_until,
+};
+use weaver_server_pipeline::pipeline::tests::{
+    delivery_fixture::{finish_delivery, install_delivery_job},
+    history_fixture::finished_jobs,
+    new_direct_pipeline,
+};
+use weaver_server_pipeline::pipeline::tests::{
+    progress_fixture::*,
+    queue_fixture::{handle as scheduler, metrics},
+    sample_nzb_bytes,
+    uu_fixture::{refresh_download_pressure, set_write_budget},
+};
+use weaver_server_pipeline::{
+    DownloadPressureReason, DownloadPressureState, JobId, JobPhase, JobStatus,
+};
+use weaver_server_pipeline::{
+    ingest::submit_nzb_bytes, jobs::queries::JobsQueries, tags::TagsQueries,
+};
+
+use weaver_model::files::FileRole;
+use weaver_server_pipeline::pipeline::tests::{
+    completion_fixture::*,
+    control_fixture::{completion_pending, rename_when_quiet, start_move_to_complete},
+    decode_fixture::{raw_download, rebuild},
+    drain_decode_results, encode_article_part, hear_graph_mail,
+    history_fixture::{
+        check_completion, database, schedule_completion_check, set_installed_status,
+    },
+    insert_active_job, insert_delivered_job, pump_pipeline_runtime_queues, settle_failed_releases,
+    terminal_fixture::{settle_moves, terminal_in_flight},
+    uu_fixture::{has_job, job_status},
+};
+use weaver_server_pipeline::pipeline::tests::{queue_fixture::working_dir, rename_fixture::*};
+use weaver_server_pipeline::post_processing::{
+    instances::PostProcessingInstancesQueries, settings::PostProcessingSettingsQueries,
+};
+use weaver_server_pipeline::{
+    DownloadWork, FileSpec, JobSpec, MessageId, MessageIds, NzbFileId, SegmentId, SegmentSpec,
+};
+
+fn capacity_test_client(port: u16, connections: usize) -> NntpClient {
+    NntpClient::new(NntpClientConfig::single(
+        weaver_nntp::ServerConfig {
+            host: "127.0.0.1".to_string(),
+            port,
+            tls: false,
+            connect_timeout: Duration::from_secs(2),
+            command_timeout: Duration::from_secs(2),
+            ..Default::default()
+        },
+        connections,
+    ))
+}
+
+// A fake provider that is deliberately **strict** about the BODY argument.
+//
+// Per RFC 3977 §6.2 a message-id argument must be enclosed in angle brackets;
+// an unbracketed argument is an article-number reference, which real providers
+// answer with 430 for every article. A lenient harness hid exactly that
+// regression, so this one answers 430 for anything unbracketed and records the
+// raw command lines so tests can assert on the wire frame directly.
+async fn spawn_capacity_limited_body_server(
+    connection_limit: usize,
+    payload: Vec<u8>,
+    total_segments: usize,
+) -> (
+    u16,
+    tokio::sync::watch::Sender<bool>,
+    Arc<AtomicUsize>,
+    Arc<std::sync::Mutex<Vec<String>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (release_final_body, final_body_released) = tokio::sync::watch::channel(false);
+    let active_connections = Arc::new(AtomicUsize::new(0));
+    let body_commands: Arc<std::sync::Mutex<Vec<String>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut encoded = Vec::new();
+    weaver_yenc::encode(&payload, &mut encoded, 128, "capacity-recovery.bin").unwrap();
+    let header_end = encoded
+        .windows(2)
+        .position(|bytes| bytes == b"\r\n")
+        .unwrap()
+        + 2;
+    let trailer_start = encoded
+        .windows(b"\r\n=yend".len())
+        .rposition(|bytes| bytes == b"\r\n=yend")
+        .unwrap();
+    let crc_start = encoded
+        .windows(b"crc32=".len())
+        .position(|bytes| bytes == b"crc32=")
+        .unwrap()
+        + b"crc32=".len();
+    let encoded_body = Arc::new(encoded[header_end..trailer_start].to_vec());
+    let part_crc = Arc::new(String::from_utf8(encoded[crc_start..crc_start + 8].to_vec()).unwrap());
+    let part_size = payload.len();
+    let total_size = part_size * total_segments;
+
+    let active_for_server = Arc::clone(&active_connections);
+    let body_commands_for_server = Arc::clone(&body_commands);
+    let server = tokio::spawn(async move {
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            // Claim a provider slot only when one is free, so a refused
+            // attempt never counts as a held session, even while its 502 is
+            // still being written.
+            let admitted = active_for_server
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |active| {
+                    (active < connection_limit).then_some(active + 1)
+                })
+                .is_ok();
+            let active_for_connection = Arc::clone(&active_for_server);
+            let mut final_body_released = final_body_released.clone();
+            let encoded_body = Arc::clone(&encoded_body);
+            let part_crc = Arc::clone(&part_crc);
+            let body_commands = Arc::clone(&body_commands_for_server);
+            tokio::spawn(async move {
+                let (reader, mut writer) = socket.into_split();
+                if !admitted {
+                    let _ = writer.write_all(b"502 Too Many Connections\r\n").await;
+                    return;
+                }
+
+                if writer.write_all(b"200 test server ready\r\n").await.is_ok() {
+                    let mut lines = BufReader::new(reader).lines();
+                    'commands: while let Ok(Some(line)) = lines.next_line().await {
+                        if line == "CAPABILITIES" {
+                            if writer
+                                .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        } else if line.starts_with("GROUP ") {
+                            if writer
+                                .write_all(b"211 1000 1 1000 alt.binaries.test\r\n")
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        } else if let Some(argument) = line.strip_prefix("BODY ") {
+                            body_commands
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .push(line.clone());
+                            // Strict, like a real provider: only the bracketed
+                            // message-id form names an article. An unbracketed
+                            // argument is an article-number reference into the
+                            // selected group, which answers 430.
+                            let Some(message_id) = argument
+                                .trim()
+                                .strip_prefix('<')
+                                .and_then(|rest| rest.strip_suffix('>'))
+                            else {
+                                if writer.write_all(b"430 No such article\r\n").await.is_err() {
+                                    break;
+                                }
+                                continue;
+                            };
+                            let part_index = message_id
+                                .split("segment-")
+                                .nth(1)
+                                .and_then(|suffix| suffix.split('@').next())
+                                .and_then(|index| index.parse::<usize>().ok())
+                                .unwrap();
+                            let part_number = part_index + 1;
+                            // Keep the job active until the test changes its
+                            // generation, without slowing every BODY into a
+                            // transport timeout. This server is sequential;
+                            // a closed old-generation socket must release its
+                            // provider slot even while the final body is held.
+                            while part_number == total_segments && !*final_body_released.borrow() {
+                                tokio::select! {
+                                    changed = final_body_released.changed() => {
+                                        if changed.is_err() {
+                                            break 'commands;
+                                        }
+                                    }
+                                    _ = lines.next_line() => break 'commands,
+                                }
+                            }
+                            let part_begin = part_index * part_size + 1;
+                            let part_end = part_begin + part_size - 1;
+                            let header = format!(
+                                "222 0 <test> body follows\r\n=ybegin part={part_number} total={total_segments} line=128 size={total_size} name=capacity-recovery.bin\r\n=ypart begin={part_begin} end={part_end}\r\n"
+                            );
+                            let trailer = format!(
+                                "\r\n=yend size={part_size} part={part_number} pcrc32={}\r\n.\r\n",
+                                part_crc
+                            );
+                            if writer.write_all(header.as_bytes()).await.is_err()
+                                || writer.write_all(&encoded_body).await.is_err()
+                                || writer.write_all(trailer.as_bytes()).await.is_err()
+                            {
+                                break;
+                            }
+                        } else if line == "QUIT" {
+                            let _ = writer.write_all(b"205 closing\r\n").await;
+                            break;
+                        } else if writer.write_all(b"500 unsupported\r\n").await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                active_for_connection.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+    });
+
+    (
+        port,
+        release_final_body,
+        active_connections,
+        body_commands,
+        server,
+    )
+}
+
+// The provider must keep serving while the pipeline handles an 80-lane
+// connection burst; sharing one executor thread turns scheduler contention
+// into fake provider timeouts and can park every article before any progress.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn active_job_recovers_from_provider_cap_and_live_80_to_20_generation_change() {
+    const TOTAL_SEGMENTS: usize = 1_000;
+    let payload = vec![b'A'; 1024];
+    let (port, release_final_body, active_connections, _body_commands, server) =
+        spawn_capacity_limited_body_server(20, payload.clone(), TOTAL_SEGMENTS).await;
+    let initial_client = capacity_test_client(port, 80);
+    let old_pool = Arc::clone(initial_client.pool());
+    let harness = TestHarness::new_with_nntp(initial_client, 80).await;
+    let job_id = JobId(80_020);
+    let segment_sizes = vec![payload.len() as u32; TOTAL_SEGMENTS];
+    let spec = segmented_job_spec(
+        "active 80 to 20 capacity recovery",
+        "capacity-recovery.bin",
+        &segment_sizes,
+    );
+
+    harness
+        .handle
+        .add_job(
+            job_id,
+            spec.clone(),
+            PathBuf::from("capacity-recovery.nzb"),
+            nzb_zstd_for(&spec),
+        )
+        .await
+        .unwrap();
+
+    wait_until(|| {
+        harness.handle.get_job(job_id).is_ok_and(|job| {
+            job.downloaded_bytes > 0
+                && !matches!(job.status, JobStatus::Complete | JobStatus::Failed { .. })
+        })
+    })
+    .await;
+
+    wait_until(|| old_pool.is_over_limit(weaver_nntp::ServerId(0))).await;
+    // The holdoff never edits the operator's configuration.
+    assert_eq!(
+        old_pool.configured_connections(weaver_nntp::ServerId(0)),
+        Some(80)
+    );
+    assert!(active_connections.load(Ordering::Acquire) <= 20);
+    let progress_before_rebuild = harness.handle.get_job(job_id).unwrap().downloaded_bytes;
+
+    let replacement_client = capacity_test_client(port, 20);
+    let replacement_pool = Arc::clone(replacement_client.pool());
+    let activation = harness
+        .handle
+        .rebuild_nntp(replacement_client, 20)
+        .await
+        .unwrap();
+    assert_eq!(activation.generation, 1);
+    assert_eq!(activation.configured_connections, 20);
+    release_final_body.send_replace(true);
+
+    wait_until(|| {
+        harness
+            .handle
+            .get_job(job_id)
+            .is_ok_and(|job| job.downloaded_bytes > progress_before_rebuild)
+    })
+    .await;
+    assert_eq!(replacement_pool.fill_connection_capacity(), 20);
+    assert_eq!(
+        replacement_pool.over_limit_until_epoch_ms(weaver_nntp::ServerId(0)),
+        None
+    );
+
+    wait_until(|| {
+        harness
+            .handle
+            .get_job(job_id)
+            .is_ok_and(|job| matches!(job.status, JobStatus::Complete | JobStatus::Failed { .. }))
+    })
+    .await;
+    assert!(
+        harness
+            .handle
+            .get_job(job_id)
+            .is_ok_and(|job| matches!(job.status, JobStatus::Complete)),
+        "same no-PAR2 job did not complete: job={:?} metrics={:?}",
+        harness.handle.get_job(job_id),
+        harness.handle.get_live_metrics()
+    );
+
+    let job = harness.handle.get_job(job_id).unwrap();
+    assert_eq!(job.failed_bytes, 0);
+    assert_eq!(job.health, 1000);
+    assert_eq!(job.remaining_par_files, 0);
+    let metrics = harness.handle.get_live_metrics();
+    assert_eq!(metrics.segments_failed_permanent, 0);
+    assert_eq!(metrics.download_failures_article_not_found, 0);
+
+    harness.shutdown().await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn held_off_server_stops_reconnecting_inside_the_holdoff_window() {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let accepted_by_server = Arc::clone(&accepted);
+    let server = tokio::spawn(async move {
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            accepted_by_server.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let (_reader, mut writer) = socket.into_split();
+                let _ = writer.write_all(b"502 Too Many Connections\r\n").await;
+            });
+        }
+    });
+
+    const CONNECTIONS: usize = 8;
+    let client = capacity_test_client(port, CONNECTIONS);
+    let pool = Arc::clone(client.pool());
+    // Finish one real rejection before dispatching the concurrent workload.
+    // Sockets admitted before holdoff may reach accept() after it is armed;
+    // counting those as reconnects made this assertion depend on scheduling.
+    let client = tokio::task::spawn_blocking(move || {
+        assert!(matches!(
+            client.try_acquire_blocking_body_lane(&[], weaver_nntp::ServerSet::EMPTY),
+            Err(
+                weaver_nntp::client::BlockingBodyLaneAcquireError::ProviderCapacity(
+                    weaver_nntp::NntpError::TooManyConnections
+                )
+            )
+        ));
+        client
+    })
+    .await
+    .unwrap();
+    assert!(pool.is_over_limit(weaver_nntp::ServerId(0)));
+    assert_eq!(pool.active_connections(0), 0);
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    // Every later lane meets the holdoff without a socket.
+    let client = tokio::task::spawn_blocking(move || {
+        for _ in 0..CONNECTIONS {
+            assert!(matches!(
+                client.try_acquire_blocking_body_lane(&[], weaver_nntp::ServerSet::EMPTY),
+                Err(
+                    weaver_nntp::client::BlockingBodyLaneAcquireError::ProviderCapacity(
+                        weaver_nntp::NntpError::ServerOverLimit { .. }
+                    )
+                )
+            ));
+        }
+        client
+    })
+    .await
+    .unwrap();
+    let harness = TestHarness::new_with_nntp(client, CONNECTIONS).await;
+    let job_id = JobId(80_021);
+    const SEGMENTS: usize = 64;
+    let spec = segmented_job_spec(
+        "held off provider",
+        "held-off.bin",
+        &vec![1024_u32; SEGMENTS],
+    );
+    let leased_before = harness
+        .handle
+        .get_live_metrics()
+        .download_lane_lease_items_total;
+
+    harness
+        .handle
+        .add_job(
+            job_id,
+            spec.clone(),
+            PathBuf::from("held-off.nzb"),
+            nzb_zstd_for(&spec),
+        )
+        .await
+        .unwrap();
+
+    // Wait for this job's activated queue, then cross another actor turn.
+    // A held provider offers no fresh seats, so there must be no refused
+    // handouts to wait for: those were the dispatch spin this test guards.
+    loop {
+        let snapshot = harness.handle.pipeline_diagnostics().await.unwrap();
+        if snapshot
+            .jobs
+            .iter()
+            .any(|job| job.job_id == job_id.0 && job.download_queue_len == SEGMENTS)
+        {
+            break;
+        }
+    }
+    harness.handle.pipeline_diagnostics().await.unwrap();
+    assert_eq!(
+        harness
+            .handle
+            .get_live_metrics()
+            .download_lane_lease_items_total,
+        leased_before,
+        "a held-off provider must not receive and return leases"
+    );
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        1,
+        "a held-off server must not be reconnected inside its window"
+    );
+
+    // Work waits for the deadline instead of failing the job.
+    let job = harness.handle.get_job(job_id).unwrap();
+    assert!(!matches!(job.status, JobStatus::Failed { .. }));
+    assert_eq!(
+        pool.configured_connections(weaver_nntp::ServerId(0)),
+        Some(CONNECTIONS)
+    );
+
+    harness.shutdown().await;
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn download_lanes_send_bracketed_message_ids_on_the_wire() {
+    const TOTAL_SEGMENTS: usize = 4;
+    let payload = vec![b'Z'; 1024];
+    let (port, release_final_body, _active_connections, body_commands, server) =
+        spawn_capacity_limited_body_server(8, payload.clone(), TOTAL_SEGMENTS).await;
+    release_final_body.send_replace(true);
+
+    let harness = TestHarness::new_with_nntp(capacity_test_client(port, 4), 4).await;
+    let job_id = JobId(80_021);
+    let spec = segmented_job_spec(
+        "Silver Horizon Wire Frame",
+        "wire-frame.bin",
+        &[payload.len() as u32; TOTAL_SEGMENTS],
+    );
+
+    harness
+        .handle
+        .add_job(
+            job_id,
+            spec.clone(),
+            PathBuf::from("wire-frame.nzb"),
+            nzb_zstd_for(&spec),
+        )
+        .await
+        .unwrap();
+
+    wait_until(|| {
+        harness
+            .handle
+            .get_job(job_id)
+            .is_ok_and(|job| matches!(job.status, JobStatus::Complete | JobStatus::Failed { .. }))
+    })
+    .await;
+    assert!(
+        harness
+            .handle
+            .get_job(job_id)
+            .is_ok_and(|job| matches!(job.status, JobStatus::Complete)),
+        "job did not complete against a bracket-strict provider: job={:?}",
+        harness.handle.get_job(job_id)
+    );
+
+    let commands = body_commands
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    assert!(
+        !commands.is_empty(),
+        "provider recorded no BODY commands at all"
+    );
+    for command in &commands {
+        let argument = command.strip_prefix("BODY ").unwrap();
+        assert!(
+            argument.starts_with('<') && argument.ends_with('>'),
+            "BODY argument must be a bracketed message-id, got {command:?}"
+        );
+        assert!(
+            argument.contains("segment-") && argument.contains("@example.com"),
+            "unexpected BODY argument {command:?}"
+        );
+    }
+
+    let metrics = harness.handle.get_live_metrics();
+    assert_eq!(metrics.download_failures_article_not_found, 0);
+
+    harness.shutdown().await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn repeated_articles_fetch_once_and_preserve_every_admitted_file() {
+    repeated_article_case(false).await;
+}
+
+#[tokio::test]
+async fn repeated_uuencode_articles_preserve_each_file_and_wire_accounting() {
+    repeated_article_case(true).await;
+}
+
+#[tokio::test]
+async fn cancel_mid_download_archives_then_cleans_up() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read, mut write) = stream.into_split();
+        write.write_all(b"200 fixture ready\r\n").await.unwrap();
+        let mut lines = BufReader::new(read).lines();
+        while let Some(line) = lines.next_line().await.unwrap() {
+            if line.starts_with("BODY ") {
+                write.write_all(b"222 0 <held@example.com> body\r\n=ybegin line=128 size=100 name=payload.bin\r\n").await.unwrap();
+                started_tx.send(()).unwrap();
+                let _ = release_rx.await;
+                break;
+            }
+            let response: &[u8] = if line == "CAPABILITIES" {
+                b"101 capabilities\r\nVERSION 2\r\nREADER\r\n.\r\n"
+            } else if line.starts_with("GROUP ") {
+                b"211 1 1 1 alt.binaries.test\r\n"
+            } else {
+                b"500 unsupported\r\n"
+            };
+            write.write_all(response).await.unwrap();
+        }
+    });
+    let harness = TestHarness::new_with_nntp(capacity_test_client(port, 1), 1).await;
+    let id = JobId(80032);
+    let script = weaver_server_pipeline::post_processing::events::hold_test_event_run(
+        &harness.db,
+        id.0,
+        "cancel-cleanup",
+    );
+    let mut events = harness.handle.subscribe_events();
+    let mut revisions = harness.handle.subscribe_job_changes();
+    harness
+        .handle
+        .add_job(
+            id,
+            segmented_job_spec("Held download", "payload.bin", &[100]),
+            PathBuf::from("held.nzb"),
+            nzb_zstd_for(&(segmented_job_spec("Held download", "payload.bin", &[100]))),
+        )
+        .await
+        .unwrap();
+    started_rx.await.unwrap();
+    let path = PathBuf::from(harness.handle.get_job(id).unwrap().output_dir.unwrap());
+    let watermark = harness.handle.job_revision();
+    harness.handle.cancel_job(id).await.unwrap();
+    assert!(harness.handle.job_revision() > watermark);
+    assert!(path.exists());
+    release_tx.send(()).unwrap();
+    server.await.unwrap();
+    while !matches!(events.recv().await.unwrap(), PipelineEvent::JobCancelled { job_id } if job_id == id)
+    {
+    }
+    assert_eq!(
+        harness.db.get_job_history(id.0).unwrap().unwrap().status,
+        "cancelled"
+    );
+    assert!(path.exists());
+    drop(script);
+    loop {
+        revisions.mark_unchanged();
+        if !path.exists() {
+            break;
+        }
+        revisions.changed().await.unwrap();
+    }
+    assert!(
+        !harness
+            .handle
+            .list_jobs()
+            .iter()
+            .any(|job| job.job_id == id)
+    );
+    harness.shutdown().await;
+}
+
+async fn repeated_article_case(uuencode: bool) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let payload: &[u8] = if uuencode {
+        b"abc"
+    } else {
+        b"one article, several independent file placements"
+    };
+    let mut body = Vec::new();
+    if uuencode {
+        body.extend_from_slice(b"begin 644 shared.bin\r\n#86)C\r\n`\r\nend\r\n");
+    } else {
+        weaver_yenc::encode(payload, &mut body, 128, "shared.bin").unwrap();
+    }
+    let expected_wire = body.len() as u64;
+    let body = Arc::new(body);
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counted = requests.clone();
+    let server = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (stream, _) = accepted.unwrap();
+                    let body = body.clone(); let counted = counted.clone();
+                    connections.spawn(async move {
+                        let (read, mut write) = stream.into_split();
+                        write.write_all(b"200 fixture ready\r\n").await.unwrap();
+                        let mut lines = BufReader::new(read).lines();
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            let response: &[u8] = if line == "CAPABILITIES" {
+                                b"101 capabilities\r\nVERSION 2\r\nREADER\r\n.\r\n"
+                            } else if line.starts_with("GROUP ") {
+                                b"211 1 1 1 alt.binaries.test\r\n"
+                            } else if line == "BODY <shared@example.com>" {
+                                counted.fetch_add(1, Ordering::SeqCst);
+                                if write.write_all(b"222 0 <shared@example.com> body\r\n").await.is_err() { break; }
+                                if write.write_all(&body).await.is_err() { break; }
+                                b".\r\n"
+                            } else if line == "QUIT" { break; }
+                            else { b"500 unsupported\r\n" };
+                            if write.write_all(response).await.is_err() { break; }
+                        }
+                    });
+                }
+                Some(_) = connections.join_next(), if !connections.is_empty() => {}
+            }
+        }
+    });
+    let harness = TestHarness::new_with_nntp(capacity_test_client(port, 4), 4).await;
+    let id = JobId(80031);
+    let mut spec = standalone_job_spec(
+        "Repeated Article",
+        &(0..4)
+            .map(|n| (format!("copy-{n}.bin"), payload.len() as u32))
+            .collect::<Vec<_>>(),
+    );
+    for file in &mut spec.files {
+        file.segments[0].message_ids = "shared@example.com".into();
+    }
+    harness
+        .handle
+        .add_job(
+            id,
+            spec.clone(),
+            PathBuf::from("repeat.nzb"),
+            nzb_zstd_for(&spec),
+        )
+        .await
+        .unwrap();
+    let mut revisions = harness.handle.subscribe_job_changes();
+    let status = loop {
+        revisions.mark_unchanged();
+        let job = harness.handle.get_job(id).unwrap();
+        if matches!(job.status, JobStatus::Complete | JobStatus::Failed { .. }) {
+            break job.status;
+        }
+        revisions.changed().await.unwrap();
+    };
+    let output = harness.root().join("complete/Repeated Article");
+    let files: Vec<_> = std::fs::read_dir(&output)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.file_type().unwrap().is_file())
+        .map(|entry| std::fs::read(entry.path()).unwrap())
+        .collect();
+    let wire_bytes = harness.handle.get_live_metrics().bytes_downloaded;
+    harness.shutdown().await;
+    server.abort();
+    let _ = server.await;
+    assert_eq!(status, JobStatus::Complete);
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        files
+            .iter()
+            .filter(|bytes| bytes.as_slice() == payload)
+            .count(),
+        4
+    );
+    assert_eq!(
+        wire_bytes, expected_wire,
+        "cached placements must not count as new network transfers"
+    );
+}
+
+#[tokio::test]
+async fn move_to_complete_uses_unique_destination_for_duplicate_job_names() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(10067);
+    let job_name = "Silver Horizon Beyond the Vale";
+    let payload_dir =
+        "Silver Horizon.Beyond.Journeys.End.S01.1080p.BluRay.Opus2.0.x265.DUAL-Anitsu";
+    let episode_name = "Silver Horizon.Beyond.Journeys.End.S01E01.mkv";
+
+    let existing_dest = complete_dir.join(
+        weaver_server_pipeline::jobs::working_dir::sanitize_dirname(job_name),
+    );
+    tokio::fs::create_dir_all(existing_dest.join(payload_dir))
+        .await
+        .unwrap();
+    tokio::fs::write(
+        existing_dest.join(payload_dir).join(episode_name),
+        b"existing",
+    )
+    .await
+    .unwrap();
+
+    let working_dir = intermediate_dir.join(format!(
+        "{}.#{}",
+        weaver_server_pipeline::jobs::working_dir::sanitize_dirname(job_name),
+        job_id.0
+    ));
+    tokio::fs::create_dir_all(working_dir.join(payload_dir))
+        .await
+        .unwrap();
+    tokio::fs::write(working_dir.join(payload_dir).join(episode_name), b"new")
+        .await
+        .unwrap();
+
+    install_delivery_job(&mut pipeline, job_id, job_name, working_dir.clone());
+    let (dest, succeeded) = finish_delivery(&mut pipeline, job_id).await;
+    assert!(succeeded);
+    let expected_dest = complete_dir.join(format!(
+        "{}.#{}",
+        weaver_server_pipeline::jobs::working_dir::sanitize_dirname(job_name),
+        job_id.0
+    ));
+
+    assert_eq!(dest, expected_dest);
+    assert!(!weaver_server_pipeline::pipeline::tests::uu_fixture::has_job(&pipeline, job_id));
+    assert!(
+        finished_jobs(&mut pipeline)
+            .await
+            .into_iter()
+            .any(|job| job.job_id == job_id
+                && job.output_dir.as_deref() == Some(expected_dest.to_str().unwrap()))
+    );
+    assert!(!working_dir.exists());
+    assert_eq!(
+        tokio::fs::read(dest.join(payload_dir).join(episode_name))
+            .await
+            .unwrap(),
+        b"new"
+    );
+    assert_eq!(
+        tokio::fs::read(existing_dest.join(payload_dir).join(episode_name))
+            .await
+            .unwrap(),
+        b"existing"
+    );
+}
+
+#[tokio::test]
+async fn metrics_refresh_advances_without_pipeline_turns() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    tokio::time::pause();
+    // Bytes move only while the actor says there is something to drive.
+    set_driving(&pipeline, true);
+    let handle = scheduler(&pipeline);
+    let mut changes = handle.subscribe_job_changes();
+    for downloaded in [1, 2, 99] {
+        let watermark = *changes.borrow_and_update();
+        metrics(&pipeline)
+            .bytes_downloaded
+            .store(downloaded, Ordering::Relaxed);
+        tokio::time::advance(Duration::from_millis(250)).await;
+        while downloaded_snapshot(&pipeline) != downloaded {
+            changes.changed().await.unwrap();
+        }
+        assert!(*changes.borrow() > watermark);
+    }
+}
+
+#[tokio::test]
+async fn moving_progress_advances_without_another_pipeline_turn() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    tokio::time::pause();
+    let handle = scheduler(&pipeline);
+    let job_id = JobId(99);
+    push_finished_row(&pipeline, job_id);
+    assert!(!driving(&pipeline));
+    let counters = phase_begin(&mut pipeline, job_id, JobPhase::Moving, Some(100));
+    assert!(driving(&pipeline));
+    let mut changes = handle.subscribe_job_changes();
+    for completed in [25, 60, 100] {
+        counters.completed_bytes.store(completed, Ordering::Relaxed);
+        tokio::time::advance(Duration::from_millis(250)).await;
+        loop {
+            let phase = scheduler(&pipeline).get_job(job_id).unwrap().phase_progress;
+            if phase[0].completed_bytes == completed {
+                assert_eq!(phase[0].phase, JobPhase::Moving);
+                assert_eq!(phase[0].total_bytes, 100);
+                assert_eq!(phase[0].progress_percent, completed as f32);
+                break;
+            }
+            changes.changed().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn phase_end_removes_only_the_ended_phase_snapshot() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(99);
+
+    push_finished_row(&pipeline, job_id);
+    let repairing = phase_begin(&mut pipeline, job_id, JobPhase::Repairing, Some(100));
+    repairing.completed_bytes.store(25, Ordering::Relaxed);
+    let extracting = phase_begin(&mut pipeline, job_id, JobPhase::Extracting, Some(200));
+    extracting.completed_bytes.store(50, Ordering::Relaxed);
+    sample_phases(&pipeline);
+    assert_eq!(
+        scheduler(&pipeline)
+            .get_job(job_id)
+            .unwrap()
+            .phase_progress
+            .len(),
+        2
+    );
+    phase_end(&mut pipeline, job_id, JobPhase::Extracting);
+    let remaining = scheduler(&pipeline).get_job(job_id).unwrap().phase_progress;
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].phase, JobPhase::Repairing);
+    clear_phases(&mut pipeline, job_id);
+    assert!(
+        scheduler(&pipeline)
+            .get_job(job_id)
+            .unwrap()
+            .phase_progress
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_submitted_nzb_takes_its_tags() {
+    let harness = TestHarness::new().await;
+    let submitted = weaver_server_pipeline::ingest::submit_nzb_bytes_with_options(
+        &harness.db,
+        &harness.handle,
+        &harness.config,
+        &sample_nzb_bytes(),
+        Some("Tagged.nzb".to_string()),
+        None,
+        None,
+        Vec::new(),
+        weaver_server_pipeline::ingest::SubmissionOptions {
+            tags: vec![" tv ".to_string(), "".to_string(), "HD".to_string()],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(harness.db.job_tags(submitted.job_id).unwrap(), ["HD", "tv"]);
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn submit_nzb_persists_zstd_and_creates_active_job() {
+    let harness = TestHarness::new().await;
+    let nzb_bytes = sample_nzb_bytes();
+
+    let submitted = submit_nzb_bytes(
+        &harness.db,
+        &harness.handle,
+        &harness.config,
+        &nzb_bytes,
+        Some("Silver Horizon.Sample.nzb".to_string()),
+        None,
+        None,
+        vec![("source".to_string(), "test".to_string())],
+    )
+    .await
+    .unwrap();
+
+    wait_until(|| {
+        harness
+            .db
+            .load_active_jobs()
+            .map(|jobs| jobs.contains_key(&submitted.job_id))
+            .unwrap_or(false)
+    })
+    .await;
+
+    let info = harness.handle.get_job(submitted.job_id).unwrap();
+    assert_eq!(info.status, JobStatus::Queued);
+    assert!(
+        info.metadata
+            .contains(&("source".to_string(), "test".to_string()))
+    );
+    assert!(info.metadata.iter().any(|(key, value)| {
+        key == "weaver.original_title" && value == "Silver Horizon.Sample"
+    }));
+
+    let (stored_path, stored_nzb) = harness
+        .db
+        .load_active_job_persisted_nzb(submitted.job_id)
+        .unwrap()
+        .and_then(|(path, nzb_zstd)| nzb_zstd.map(|nzb_zstd| (path, nzb_zstd)))
+        .unwrap();
+    assert_eq!(stored_path, PathBuf::from("Silver Horizon.Sample.nzb"));
+    assert!(stored_nzb.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]));
+
+    let decoded = weaver_server_pipeline::ingest::decode_persisted_nzb_bytes(&stored_nzb).unwrap();
+    assert_eq!(decoded, nzb_bytes);
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn hard_write_pressure_latches_until_soft_watermark() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    set_write_budget(&mut pipeline, 1000);
+
+    metrics(&pipeline)
+        .write_buffered_bytes
+        .store(1000, Ordering::Relaxed);
+    refresh_download_pressure(&mut pipeline);
+    assert_eq!(
+        metrics(&pipeline)
+            .download_pressure_state
+            .load(Ordering::Relaxed),
+        DownloadPressureState::Hard.as_code()
+    );
+    assert_eq!(
+        metrics(&pipeline)
+            .download_pressure_reason
+            .load(Ordering::Relaxed),
+        DownloadPressureReason::Write.as_code()
+    );
+
+    metrics(&pipeline)
+        .write_buffered_bytes
+        .store(701, Ordering::Relaxed);
+    refresh_download_pressure(&mut pipeline);
+    assert_eq!(
+        metrics(&pipeline)
+            .download_pressure_state
+            .load(Ordering::Relaxed),
+        DownloadPressureState::Hard.as_code()
+    );
+    assert_eq!(
+        metrics(&pipeline)
+            .download_pressure_stalls_total
+            .load(Ordering::Relaxed),
+        1
+    );
+
+    metrics(&pipeline)
+        .write_buffered_bytes
+        .store(699, Ordering::Relaxed);
+    refresh_download_pressure(&mut pipeline);
+    assert_eq!(
+        metrics(&pipeline)
+            .download_pressure_state
+            .load(Ordering::Relaxed),
+        DownloadPressureState::Clear.as_code()
+    );
+    assert_eq!(
+        metrics(&pipeline)
+            .download_pressure_reason
+            .load(Ordering::Relaxed),
+        DownloadPressureReason::None.as_code()
+    );
+}
+
+#[tokio::test]
+async fn rename_preserves_an_existing_working_directory_collision() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(10067);
+    let old_dir = intermediate_dir.join("original");
+    std::fs::create_dir(&old_dir).unwrap();
+    weaver_server_pipeline::jobs::working_dir::mark_weaver_owned_working_dir(
+        &intermediate_dir,
+        &old_dir,
+        job_id,
+    )
+    .unwrap();
+    install_rename_job(&mut pipeline, job_id, "renamed", &old_dir);
+
+    std::fs::create_dir(intermediate_dir.join("renamed")).unwrap();
+    let collision = intermediate_dir.join("renamed.#10067");
+    std::fs::create_dir(&collision).unwrap();
+    std::fs::write(collision.join("keep.bin"), b"another job's data").unwrap();
+
+    assert!(!rename_when_quiet(&mut pipeline, job_id, "renamed").await);
+
+    assert_eq!(
+        std::fs::read(collision.join("keep.bin")).unwrap(),
+        b"another job's data"
+    );
+    assert_eq!(*working_dir(&pipeline, job_id), old_dir);
+    assert!(weaver_server_pipeline::jobs::working_dir::is_weaver_owned_working_dir(&old_dir));
+}
+
+// Each failure in a row doubles the wait before the next try, up to a cap.
+#[test]
+fn a_rename_backoff_doubles_up_to_its_cap() {
+    let now = tokio::time::Instant::now();
+    let mut retry = RenameBackoff::default();
+    let mut waits = Vec::new();
+    for _ in 0..12 {
+        waits.push((retry.failed(now) - now).as_secs());
+    }
+    assert_eq!(waits, [1, 2, 4, 8, 16, 32, 64, 128, 256, 300, 300, 300]);
+}
+
+// A rename that fails is not tried again until its backoff runs out, and a
+// job busy with a move is renamed by the first turn after the move ends.
+// Neither leaves a walk over the queue due.
+#[tokio::test]
+async fn a_failed_rename_waits_out_its_backoff_and_a_busy_one_needs_no_walk() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(10068);
+    let old_dir = intermediate_dir.join("original");
+    std::fs::create_dir(&old_dir).unwrap();
+    weaver_server_pipeline::jobs::working_dir::mark_weaver_owned_working_dir(
+        &intermediate_dir,
+        &old_dir,
+        job_id,
+    )
+    .unwrap();
+    install_rename_job(&mut pipeline, job_id, "renamed", &old_dir);
+    request_rename(&pipeline, job_id, "renamed");
+    std::fs::create_dir(intermediate_dir.join("renamed")).unwrap();
+    let collision = intermediate_dir.join("renamed.#10068");
+    std::fs::create_dir(&collision).unwrap();
+
+    let before = tokio::time::Instant::now();
+    set_retry_at(&mut pipeline, job_id, None);
+    retry_pending(&mut pipeline).await;
+    let (failures, retry_at) = retry_state(&pipeline, job_id).unwrap();
+    assert_eq!(failures, 1);
+    let retry_at = retry_at.expect("a backoff after the failure");
+    assert!(retry_at >= before + std::time::Duration::from_secs(1));
+    assert_eq!(next_retry_at(&pipeline), Some(retry_at));
+    assert!(!queue_walk_due(&pipeline));
+
+    // Inside the backoff nothing is tried.
+    let far = tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
+    set_retry_at(&mut pipeline, job_id, Some(far));
+    retry_pending(&mut pipeline).await;
+    assert_eq!(retry_state(&pipeline, job_id).unwrap().0, 1);
+    assert_eq!(retry_state(&pipeline, job_id).unwrap().1, Some(far));
+
+    // Once it runs out the rename is tried, and fails again.
+    set_retry_at(&mut pipeline, job_id, Some(tokio::time::Instant::now()));
+    retry_pending(&mut pipeline).await;
+    assert_eq!(retry_state(&pipeline, job_id).unwrap().0, 2);
+
+    // A move holds the folder: the turn passes without a try or a walk.
+    std::fs::remove_dir(intermediate_dir.join("renamed")).unwrap();
+    std::fs::remove_dir(&collision).unwrap();
+    set_retry_at(&mut pipeline, job_id, Some(tokio::time::Instant::now()));
+    hold_move(&mut pipeline, job_id);
+    retry_pending(&mut pipeline).await;
+    assert_eq!(retry_state(&pipeline, job_id).unwrap().0, 2);
+    assert_eq!(retry_state(&pipeline, job_id).unwrap().1, None);
+    assert_eq!(next_retry_at(&pipeline), None);
+    assert!(!queue_walk_due(&pipeline));
+    assert_eq!(*working_dir(&pipeline, job_id), old_dir);
+
+    release_move(&mut pipeline, job_id);
+    retry_pending(&mut pipeline).await;
+    assert!(no_pending_renames(&pipeline));
+    assert_eq!(
+        *working_dir(&pipeline, job_id),
+        intermediate_dir.join("renamed")
+    );
+    let asked = requested_name(&pipeline, job_id);
+    assert_eq!(asked, None);
+}
+
+#[tokio::test]
+async fn completion_check_during_post_processing_does_not_finalize_again() {
+    for status in [JobStatus::QueuedPostProcessing, JobStatus::PostProcessing] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
+        let job_id = JobId(10070);
+        let job_name = "Copper Lantern Late Completion Check";
+        let working_dir = intermediate_dir.join("copper-lantern");
+        tokio::fs::create_dir_all(&working_dir).await.unwrap();
+        tokio::fs::write(working_dir.join("payload.mkv"), b"payload")
+            .await
+            .unwrap();
+        install_at_status(
+            &mut pipeline,
+            job_id,
+            job_name,
+            working_dir.clone(),
+            status.clone(),
+        );
+
+        // A late completion check landing while scripts run must not run the
+        // final move a second time: that claims `<name>.#<id>` and repoints the
+        // job's output directory out from under the running script.
+        check_completion(&mut pipeline, job_id).await;
+        settle_moves(&mut pipeline).await;
+
+        assert_eq!(job_status(&pipeline, job_id).unwrap(), status);
+        assert!(working_dir.join("payload.mkv").exists());
+        let mut entries = tokio::fs::read_dir(&complete_dir).await.unwrap();
+        assert!(
+            entries.next_entry().await.unwrap().is_none(),
+            "{status:?}: completion check published into {}",
+            complete_dir.display()
+        );
+    }
+}
+
+#[tokio::test]
+async fn unacceptable_extension_rejection_never_starts_a_final_move_or_scripts() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(10069);
+    let job_name = "Rejected Before Publication";
+    database(&pipeline)
+        .save_post_processing_settings(&weaver_server_pipeline::post_processing::model::PostProcessingSettings {
+            execution_enabled: true,
+            unacceptable_extensions: vec!["exe".into()],
+            unwanted_extension_action:
+                weaver_server_pipeline::post_processing::model::UnwantedExtensionAction::FailJob,
+            ..Default::default()
+        })
+        .unwrap();
+    database(&pipeline)
+        .create_script_instance(
+            weaver_server_pipeline::post_processing::instances::ScriptInstanceDraft::new(
+                weaver_server_pipeline::post_processing::model::ScriptName::new("sentinel.sh")
+                    .unwrap(),
+                weaver_server_pipeline::post_processing::instances::InstanceTrigger::PostProcessing,
+            ),
+        )
+        .unwrap();
+
+    let working_dir = intermediate_dir.join("rejected-before-publication");
+    tokio::fs::create_dir_all(working_dir.join("nested"))
+        .await
+        .unwrap();
+    tokio::fs::write(working_dir.join("nested/payload.EXE"), b"rejected")
+        .await
+        .unwrap();
+    install_delivery_job(&mut pipeline, job_id, job_name, working_dir.clone());
+    start_move_to_complete(&mut pipeline, job_id).await.unwrap();
+
+    settle_moves(&mut pipeline).await;
+    assert!(!terminal_in_flight(&pipeline));
+    assert!(
+        !complete_dir
+            .join(weaver_server_pipeline::jobs::working_dir::sanitize_dirname(
+                job_name
+            ))
+            .exists()
+    );
+    let status = job_status(&pipeline, job_id).unwrap();
+    let JobStatus::Failed { error } = status else {
+        panic!("unacceptable extension must fail the job");
+    };
+    assert_eq!(error, "unwanted extension '.exe' in 'nested/payload.EXE'");
+    assert!(
+        database(&pipeline)
+            .job_post_processing_summary(job_id.0)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        working_dir.exists(),
+        "the rejected source was never published"
+    );
+}
+
+#[tokio::test]
+async fn delayed_retry_carries_exclusions_across_a_pool_rebuild() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    set_client(&mut pipeline, &[0, 1]);
+    let job_id = JobId(40041);
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    let segment_id = SegmentId {
+        file_id,
+        segment_number: 0,
+    };
+    let spec = JobSpec {
+        name: "Stale Exclusion Rebuild".to_string(),
+        password: None,
+        total_bytes: 128,
+        category: None,
+        metadata: vec![],
+        files: vec![FileSpec {
+            filename: "payload.bin".to_string(),
+            role: FileRole::from_filename("payload.bin"),
+            groups: vec!["alt.binaries.test".to_string()],
+            posted_at_epoch: None,
+            segments: vec![SegmentSpec {
+                ordinal: 0,
+                article_number: 0,
+                bytes: 128,
+                message_ids: MessageIds::new(vec!["stale-exclusion@example.com".to_string()]),
+            }],
+        }],
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    reset_download_queue(&mut pipeline, job_id);
+
+    let make_work = || DownloadWork {
+        counters: None,
+        segment_id,
+        message_id: MessageId::new("stale-exclusion@example.com"),
+        groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
+        priority: 100,
+        byte_estimate: 128,
+        retry_count: 1,
+        is_recovery: false,
+        completion_critical: false,
+        exclude_servers: weaver_nntp::ServerSet::from([0]),
+        avoid_server: None,
+    };
+
+    // A rebuild swapped the two servers after this retry was scheduled under
+    // gen 0: server 0 of that pool is server 1 of the new one, and the retry
+    // keeps it tried under that number.
+    rebuild(&mut pipeline, &[1, 0], 4, 1);
+    receive_ordinary_retry(&mut pipeline, make_work(), 0);
+    let queued = pop_work(&mut pipeline, job_id).expect("stale retry should still requeue");
+    assert_eq!(queued.segment_id, segment_id);
+    assert_eq!(
+        queued.exclude_servers,
+        [1],
+        "server exclusions are carried by server identity across a pool rebuild"
+    );
+
+    // Scheduled under a generation no layout is held for: nothing can be
+    // read from its numbers, so the retry tries every server.
+    receive_ordinary_retry(&mut pipeline, make_work(), 77);
+    let queued =
+        pop_work(&mut pipeline, job_id).expect("an unknown-generation retry should still requeue");
+    assert!(queued.exclude_servers.is_empty());
+
+    // No rebuild since scheduling: exclusions are still valid and preserved.
+    receive_ordinary_retry(&mut pipeline, make_work(), 1);
+    let queued = pop_work(&mut pipeline, job_id).expect("same-generation retry should requeue");
+    assert_eq!(
+        queued.exclude_servers,
+        vec![0],
+        "current-generation exclusions must be preserved"
+    );
+}
+
+#[tokio::test]
+async fn restored_post_processing_is_interrupted_without_rerunning_scripts() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(31237);
+    let spec = JobSpec {
+        name: "interrupted-post-processing".to_string(),
+        password: None,
+        files: vec![],
+        total_bytes: 0,
+        category: None,
+        metadata: vec![],
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    set_installed_status(&mut pipeline, job_id, JobStatus::PostProcessing);
+    // The executor stamps this marker before the first script runs.
+    database(&pipeline)
+        .mark_job_post_processing_running(job_id.0)
+        .unwrap();
+    // The startup scan is the whole recovery: a `running` marker can only have
+    // been left behind by a process that died mid-pass.
+    assert_eq!(
+        database(&pipeline)
+            .recover_interrupted_post_processing()
+            .unwrap(),
+        1
+    );
+    schedule_completion_check(&mut pipeline, job_id);
+
+    assert!(recover_terminal(&mut pipeline, job_id));
+    settle_failed_releases(&mut pipeline).await;
+
+    assert!(!completion_pending(&pipeline, job_id));
+    assert!(!has_job(&pipeline, job_id));
+    assert!(matches!(
+        finished_jobs(&mut pipeline)
+            .await
+            .into_iter()
+            .find(|job| job.job_id == job_id)
+            .map(|job| job.status),
+        Some(JobStatus::Failed { .. })
+    ));
+}
+
+#[tokio::test]
+async fn restored_post_processing_that_already_finished_archives_as_complete() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(31238);
+    insert_delivered_job(
+        &mut pipeline,
+        job_id,
+        "completed-post-processing",
+        "payload.mkv",
+        b"payload",
+    )
+    .await;
+    set_installed_status(&mut pipeline, job_id, JobStatus::PostProcessing);
+    database(&pipeline)
+        .save_job_post_processing_results(
+            job_id.0,
+            weaver_server_pipeline::post_processing::model::PostProcessingSummary::Succeeded,
+            &[],
+        )
+        .unwrap();
+    // A job whose summary is already terminal is not swept by the scan.
+    assert_eq!(
+        database(&pipeline)
+            .recover_interrupted_post_processing()
+            .unwrap(),
+        0
+    );
+    schedule_completion_check(&mut pipeline, job_id);
+
+    assert!(recover_terminal(&mut pipeline, job_id));
+
+    assert!(!completion_pending(&pipeline, job_id));
+    assert!(!has_job(&pipeline, job_id));
+    assert!(matches!(
+        finished_jobs(&mut pipeline)
+            .await
+            .into_iter()
+            .find(|job| job.job_id == job_id)
+            .map(|job| job.status),
+        Some(JobStatus::Complete)
+    ));
+}
+
+// The wire frame regression guard: BODY must carry the **bracketed**
+// message-id.
+//
+// `DownloadWork::message_id` stores the bare id (the NZB parser strips the
+// brackets), so a lane that borrows it directly emits `BODY segment-0@…`.
+// That is a legal article-*number* reference, and every real provider answers
+// 430 to it — a total, silent download failure. The fake provider here is
+// strict about brackets, so this test fails outright on a regression.
+#[tokio::test]
+async fn failed_final_move_marks_job_failed_instead_of_complete() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(10068);
+    let job_name = "Silver Horizon Broken Final Move";
+    let working_dir =
+        insert_delivered_job(&mut pipeline, job_id, job_name, "payload.mkv", b"payload").await;
+    // Nothing is left to deliver from when the move runs.
+    std::fs::remove_dir_all(&working_dir).unwrap();
+    hear_graph_mail(&mut pipeline, job_id).await;
+    check_completion(&mut pipeline, job_id).await;
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+
+    let status = job_status(&pipeline, job_id).unwrap();
+    assert!(matches!(status, JobStatus::Failed { .. }), "{status:?}");
+    let JobStatus::Failed { error } = &status else {
+        unreachable!();
+    };
+    assert!(error.contains("no delivery source exists"), "{error}");
+    assert!(
+        !complete_dir
+            .join(weaver_server_pipeline::jobs::working_dir::sanitize_dirname(
+                job_name
+            ))
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn sparse_article_numbers_commit_cleanly_with_dense_ordinals() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20009);
+    let filename = "sparse.bin";
+    let payload_size = 128u32;
+    let total_size = payload_size as u64 * 3;
+    let spec = JobSpec {
+        name: "Sparse Segment Ordinals".to_string(),
+        password: None,
+        total_bytes: total_size,
+        category: None,
+        metadata: vec![],
+        files: vec![FileSpec {
+            filename: filename.to_string(),
+            role: FileRole::Standalone,
+            groups: vec!["alt.binaries.test".to_string()],
+            posted_at_epoch: None,
+            segments: vec![
+                SegmentSpec {
+                    ordinal: 0,
+                    article_number: 1,
+                    bytes: payload_size,
+                    message_ids: MessageIds::new(vec!["sparse-0@example.com".to_string()]),
+                },
+                SegmentSpec {
+                    ordinal: 1,
+                    article_number: 4,
+                    bytes: payload_size,
+                    message_ids: MessageIds::new(vec!["sparse-1@example.com".to_string()]),
+                },
+                SegmentSpec {
+                    ordinal: 2,
+                    article_number: 6,
+                    bytes: payload_size,
+                    message_ids: MessageIds::new(vec!["sparse-2@example.com".to_string()]),
+                },
+            ],
+        }],
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    for _ in 0..3u32 {
+        // Each article is fetched as dispatch hands it out.
+        let work = pop_work(&mut pipeline, job_id).unwrap();
+        let segment_number = work.segment_id.segment_number;
+        let payload = vec![segment_number as u8 + 1; payload_size as usize];
+        let raw = encode_article_part(
+            filename,
+            &payload,
+            segment_number + 1,
+            3,
+            segment_number as u64 * payload_size as u64 + 1,
+            total_size,
+        );
+
+        raw_download(&mut pipeline, work.segment_id, raw, None).await;
+    }
+
+    drain_decode_results(&mut pipeline, 3).await;
+    // The graph job's runs and its completion check settle it.
+    hear_graph_mail(&mut pipeline, job_id).await;
+    check_completion(&mut pipeline, job_id).await;
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+
+    assert_eq!(
+        metrics(&pipeline)
+            .segments_committed
+            .load(Ordering::Relaxed),
+        3
+    );
+    assert!(matches!(
+        job_status(&pipeline, job_id),
+        Some(JobStatus::Complete)
+    ));
+}

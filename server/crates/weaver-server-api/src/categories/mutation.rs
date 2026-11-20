@@ -3,6 +3,7 @@
 
 use async_graphql::{Context, Object, Result};
 use tracing::info;
+use weaver_server_core::categories::persistence::CategoriesPersistenceQueries;
 
 use crate::auth::{AdminGuard, graphql_error};
 use crate::categories::types::{Category, CategoryInput};

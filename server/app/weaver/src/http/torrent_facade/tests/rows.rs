@@ -6,6 +6,9 @@
 // across a run of ids with torrents added, changed and removed.
 
 use std::collections::HashMap;
+use weaver_server_core::operations::async_ops::OperationsAsyncOpsQueries;
+use weaver_server_core::torrents::persistence::TorrentsPersistenceInsertTorrentQueries;
+use weaver_server_core::torrents::queries::TorrentsQueries;
 
 use weaver_server_core::torrents::service::fingerprint::ViewParts;
 use weaver_server_core::torrents::service::listing::FileTotals;

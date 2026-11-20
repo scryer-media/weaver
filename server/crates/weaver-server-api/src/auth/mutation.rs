@@ -3,6 +3,9 @@
 
 use async_graphql::{Context, Object, Result};
 use tracing::info;
+use weaver_server_core::auth::api_keys::AuthApiKeysQueries;
+use weaver_server_core::auth::repository::AuthRepositoryQueries;
+use weaver_server_core::settings::persistence::SettingsPersistenceQueries;
 
 use crate::auth::types::{ApiKey, ApiKeyScope, CreateApiKeyResult};
 use crate::auth::{FreshAdminGuard, generate_api_key, hash_api_key};

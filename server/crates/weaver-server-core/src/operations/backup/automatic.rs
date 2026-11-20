@@ -4,80 +4,14 @@
 use super::manifest::io_err;
 use super::{BackupInfo, BackupService, BackupServiceError, BackupTrigger};
 use crate::persistence::encryption::{decrypt_value, encrypt_value};
+use crate::settings::persistence::SettingsPersistenceQueries;
+use crate::settings::queries::SettingsQueries;
 use chrono::{DateTime, Duration, Local, LocalResult, TimeZone, Utc};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
-pub(super) const AUTO_SETTINGS_KEY: &str = "backup.automatic";
-
-#[derive(Clone, Serialize, Deserialize)]
-pub(super) struct StoredAutoSettings {
-    pub enabled: bool,
-    pub daily_time_local: String,
-    pub encrypted_key: Option<String>,
-}
-
-pub(super) fn decode_auto_settings(value: &str) -> Result<StoredAutoSettings, String> {
-    let value: serde_json::Value = match serde_json::from_str(value) {
-        Ok(value) => value,
-        Err(error) => {
-            tracing::error!(%error, "corrupt automatic backup settings disabled in memory; original settings retained for recovery");
-            return Ok(StoredAutoSettings::default());
-        }
-    };
-    let Some(object) = value.as_object() else {
-        tracing::error!(
-            "non-object automatic backup settings disabled in memory; original settings retained for recovery"
-        );
-        return Ok(StoredAutoSettings::default());
-    };
-    let encrypted_key = match object.get("encrypted_key") {
-        None | Some(serde_json::Value::Null) => None,
-        Some(serde_json::Value::String(key)) => Some(key.clone()),
-        Some(_) => {
-            tracing::error!(
-                "automatic backup settings with invalid password type disabled in memory; original settings retained for recovery"
-            );
-            return Ok(StoredAutoSettings::default());
-        }
-    };
-    match serde_json::from_value(value) {
-        Ok(settings) => Ok(settings),
-        Err(error) => {
-            tracing::warn!(%error, "invalid automatic backup schedule disabled; stored encryption key preserved");
-            Ok(StoredAutoSettings {
-                encrypted_key,
-                ..StoredAutoSettings::default()
-            })
-        }
-    }
-}
-
-impl crate::Database {
-    pub(crate) fn automatic_backup_ciphertext(&self) -> Result<Option<String>, crate::StateError> {
-        self.get_setting(AUTO_SETTINGS_KEY)?
-            .map(|value| {
-                decode_auto_settings(&value)
-                    .map(|settings| settings.encrypted_key)
-                    .map_err(|error| {
-                        crate::StateError::Database(format!(
-                            "invalid automatic backup settings: {error}"
-                        ))
-                    })
-            })
-            .transpose()
-            .map(Option::flatten)
-    }
-}
-
-impl Default for StoredAutoSettings {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            daily_time_local: "03:00".into(),
-            encrypted_key: None,
-        }
-    }
-}
+pub(super) use weaver_server_pipeline::operations::backup::automatic::{
+    AUTO_SETTINGS_KEY, StoredAutoSettings, decode_auto_settings,
+};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct AutoBackupSettings {
@@ -168,7 +102,7 @@ impl BackupService {
         let _guard = self.inner.settings_lock.lock().await;
         let next = compute_next_auto_backup_run_at(
             &input.daily_time_local,
-            crate::e2e_clock::local_now(),
+            weaver_server_base::e2e_clock::local_now(),
         )?;
         let mut settings = self.stored_auto_settings().await?;
         if input.clear_auto_backup_key && input.set_auto_backup_key.is_some() {
@@ -246,7 +180,7 @@ impl BackupService {
     }
 
     pub fn start_background_auto_backup_scheduler(&self) -> tokio::task::JoinHandle<()> {
-        self.start_auto_backup_scheduler_with_clock(crate::e2e_clock::local_now)
+        self.start_auto_backup_scheduler_with_clock(weaver_server_base::e2e_clock::local_now)
     }
 
     pub(super) fn start_auto_backup_scheduler_with_clock(
@@ -309,7 +243,7 @@ impl BackupService {
                 let delay = (next - now)
                     .to_std()
                     .unwrap_or_default()
-                    .min(crate::e2e_clock::schedule_poll_interval());
+                    .min(weaver_server_base::e2e_clock::schedule_poll_interval());
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {
                         if clock() < next { continue; }
@@ -334,6 +268,9 @@ impl BackupService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operations::recovery::credentials::StoredCredentialQueries;
+    use crate::settings::persistence::SettingsPersistenceQueries;
+    use crate::settings::queries::SettingsQueries;
     use chrono::{FixedOffset, NaiveDate, Timelike};
 
     #[test]

@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use tracing::error;
+use weaver_server_core::operations::metrics_store::OperationsMetricsStoreQueries;
 
 use weaver_server_core::operations::metrics::MetricsSnapshot;
 use weaver_server_core::operations::{JobStatusCounts, MetricsHistoryCadence};
@@ -112,6 +113,7 @@ fn epoch_sec_now() -> i64 {
 mod tests {
     use super::*;
     use weaver_server_core::operations::metrics::PipelineMetrics;
+    use weaver_server_core::operations::metrics_store::OperationsMetricsStoreQueries;
     use weaver_server_core::operations::{MetricsHistoryQueryData, MetricsHistoryTier};
 
     async fn raw_rows(db: &Database) -> usize {

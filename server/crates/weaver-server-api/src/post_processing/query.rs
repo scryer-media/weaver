@@ -4,8 +4,13 @@
 use super::*;
 use crate::auth::graphql_error;
 use weaver_server_core::post_processing::executor::strict_security_enabled;
+use weaver_server_core::post_processing::instances::PostProcessingInstancesQueries;
 use weaver_server_core::post_processing::listing::list_scripts;
+use weaver_server_core::post_processing::output::PostProcessingOutputQueries;
 use weaver_server_core::post_processing::output::ScriptRunFilter;
+use weaver_server_core::post_processing::secrets::PostProcessingSecretsQueries;
+use weaver_server_core::post_processing::settings::PostProcessingSettingsQueries;
+use weaver_server_core::post_processing::test_run::PostProcessingTestRunQueries;
 
 // The scripts directory as it is now. A directory that cannot be read is not
 // an error here: it is the reason every script job reports for being unable to

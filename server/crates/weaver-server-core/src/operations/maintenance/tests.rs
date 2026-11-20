@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
 use std::io::Write as _;
 use std::path::Path;
 

@@ -2,6 +2,8 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use std::path::PathBuf;
+use weaver_server_core::history::queries::HistoryQueries;
+use weaver_server_core::jobs::duplicate_persistence::JobsDuplicatePersistenceAdmitDuplicateSubmissionQueries;
 
 use super::*;
 use crate::jobs::paging::{PageRead, PageWants, read_row};

@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use weaver_server_core::jobs::JobsSupportFactsPersistenceQueries;
+use weaver_server_core::jobs::persistence::JobsPersistenceQueries;
+use weaver_server_core::jobs::repository::JobsRepositoryQueries;
 mod common;
 
 use std::io::Write;

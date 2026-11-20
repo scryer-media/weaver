@@ -14,6 +14,7 @@ use crate::{
 use async_graphql::{ComplexObject, Context, Enum, InputObject, Object, Result, SimpleObject};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::OnceCell;
+use weaver_server_core::proxies::ProxiesDnsPersistenceQueries;
 use weaver_server_core::{Database, proxies as core, proxies::NetworkRefusal};
 
 /// What a profile answers for, set when it is created.

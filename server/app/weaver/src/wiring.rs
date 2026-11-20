@@ -231,6 +231,12 @@ async fn flush_job_event_batch(db: &Database, batch: &mut Vec<weaver_server_core
 #[cfg(test)]
 mod tests {
     use super::*;
+    use weaver_server_core::history::queries::HistoryQueries;
+    use weaver_server_core::history::timeline::HistoryTimelineQueries;
+    use weaver_server_core::proxies::ProxiesNetworkPersistenceQueries;
+    use weaver_server_core::proxies::ProxiesPersistenceQueries;
+    use weaver_server_core::servers::persistence::ServersPersistenceQueries;
+    use weaver_server_core::settings::service::SettingsServiceQueries;
 
     use weaver_server_core::jobs::ids::JobId;
 

@@ -1,0 +1,15 @@
+[package]
+name = "weaver-server-history"
+description = "History records for the Weaver server"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+unicode-normalization = { workspace = true }
+weaver-server-base = { path = "../weaver-server-base" }
+weaver-server-db = { path = "../weaver-server-db" }
+weaver-server-ingest = { path = "../weaver-server-ingest" }

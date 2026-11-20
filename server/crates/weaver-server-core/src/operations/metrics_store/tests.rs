@@ -3,8 +3,8 @@
 
 use super::*;
 
-use crate::operations::metrics::Par3MetricsSnapshot;
 use crate::{DownloadState, JobId, PostState, RunState};
+use weaver_server_base::operations::metrics::Par3MetricsSnapshot;
 
 fn upsert_raw_point_for_test(db: &Database, point: RawMetricsHistoryPoint) {
     let datastore = db.datastore();

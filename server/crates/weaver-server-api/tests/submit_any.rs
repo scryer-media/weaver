@@ -5,6 +5,7 @@
 // URL, a magnet link or an infohash, and an upload is an NZB, torrent or
 // magnet file whatever its name.
 
+use weaver_server_core::torrents::queries::TorrentsQueries;
 mod common;
 
 use std::future::Future;

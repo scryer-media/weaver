@@ -4,7 +4,9 @@
 use async_graphql::{ComplexObject, Enum, InputObject, SimpleObject};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use weaver_server_core::history::timeline::HistoryTimelineQueries;
 use weaver_server_core::history::timeline::JOB_EVENT_DOWNLOAD_FINALIZATION_MARKER;
+use weaver_server_core::jobs::JobsDownloadSummaryPersistenceQueries;
 use weaver_server_core::{
     AsyncOperationState, AsyncOperationTargetState,
     HistoryDeleteOperationSummary as CoreHistoryDeleteOperationSummary,

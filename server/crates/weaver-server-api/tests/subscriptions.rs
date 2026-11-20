@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use weaver_server_core::history::queries::HistoryQueries;
 mod common;
 
 use std::time::Duration;

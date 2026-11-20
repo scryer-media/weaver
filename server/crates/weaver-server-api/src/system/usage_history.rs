@@ -8,6 +8,7 @@
 use async_graphql::{Enum, InputObject, SimpleObject};
 use chrono::{Days, Local, NaiveDate, TimeZone};
 use serde::{Deserialize, Serialize};
+use weaver_server_core::operations::usage_history::OperationsUsageHistoryQueries;
 
 use weaver_server_core::operations::{
     FinishedJobCounts, REMOVED_SERVER_ID_PREFIX, RecoveryBytes, UsageConsumerKind as CoreKind,

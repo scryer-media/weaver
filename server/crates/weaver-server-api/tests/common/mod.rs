@@ -7,6 +7,8 @@
 use std::sync::{
     Arc, Condvar, Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock, RwLock as StdRwLock,
 };
+use weaver_server_core::auth::repository::AuthRepositoryQueries;
+use weaver_server_core::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
 
 use async_graphql::{Request, Response, Variables};
 use serde_json::Value;

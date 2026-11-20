@@ -2,10 +2,12 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use weaver_server_core::auth::repository::AuthRepositoryQueries;
 use weaver_server_core::security::{
     BindAddressSource, RuntimeSecurityConfig, SETTING_ACCESS_MODE, SETTING_HTTP_BIND_ADDRESS,
     SETTING_TRUSTED_NETWORKS,
 };
+use weaver_server_core::settings::queries::SettingsQueries;
 
 fn setup_test_router(
     db: Database,

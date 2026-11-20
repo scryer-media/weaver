@@ -3,6 +3,10 @@
 
 use super::*;
 use crate::observability::with_timed_config_read;
+use weaver_server_core::settings::SettingsArchivePasswordsQueries;
+use weaver_server_core::settings::SettingsSchedulesQueries;
+use weaver_server_core::settings::repository::SettingsRepositoryQueries;
+use weaver_server_core::torrents::queries::TorrentsQueries;
 
 #[derive(Default)]
 pub(crate) struct SettingsQuery;

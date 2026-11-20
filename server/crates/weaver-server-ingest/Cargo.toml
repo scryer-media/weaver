@@ -1,0 +1,42 @@
+[package]
+name = "weaver-server-ingest"
+description = "Input decoding and metadata for the Weaver server"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[dependencies]
+sevenz-turbo = { workspace = true }
+bzip2 = { workspace = true }
+brotli = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
+zip = { workspace = true }
+thiserror = { workspace = true }
+unrar-rs = { workspace = true, features = [
+    "crypto-aws-lc",
+] }
+weaver-server-disk = { path = "../weaver-server-disk" }
+http = { workspace = true }
+tracing = { workspace = true }
+tempfile = { workspace = true }
+weaver-server-base = { path = "../weaver-server-base" }
+weaver-server-settings = { path = "../weaver-server-settings" }
+weaver-server-jobs = { path = "../weaver-server-jobs" }
+blake3 = { workspace = true }
+lzma-turbo = { workspace = true }
+serde = { workspace = true }
+weaver-model = { path = "../../../shared/crates/weaver-model", default-features = false }
+weaver-nzb = { path = "../../../engines/weaver-nzb", default-features = false }
+zstd = { workspace = true }
+
+[features]
+test-support = []
+
+[dev-dependencies]
+zip = { workspace = true }
+unrar-rs = { workspace = true, features = [
+    "crypto-aws-lc",
+] }
+lzma-turbo = { workspace = true, features = ["enc"] }

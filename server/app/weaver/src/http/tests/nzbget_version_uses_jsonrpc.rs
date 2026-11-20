@@ -4,6 +4,22 @@
 // `tests` tests, part of a mechanical split of the original file.
 
 use super::*;
+use weaver_server_core::auth::repository::AuthRepositoryQueries;
+use weaver_server_core::history::nzbget_state::HistoryNzbgetStateQueries;
+use weaver_server_core::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
+use weaver_server_core::history::queries::HistoryQueries;
+use weaver_server_core::history::timeline::HistoryTimelineQueries;
+use weaver_server_core::jobs::persistence::JobsPersistenceQueries;
+use weaver_server_core::jobs::repository::JobsRepositoryQueries;
+use weaver_server_core::post_processing::callbacks::PostProcessingCallbacksQueries;
+use weaver_server_core::post_processing::instances::PostProcessingInstancesQueries;
+use weaver_server_core::post_processing::settings::PostProcessingSettingsQueries;
+use weaver_server_core::proxies::ProxiesNetworkPersistenceQueries;
+use weaver_server_core::rss::RssPersistenceQueries;
+use weaver_server_core::servers::persistence::ServersPersistenceQueries;
+use weaver_server_core::servers::repository::ServersRepositoryQueries;
+use weaver_server_core::settings::persistence::SettingsPersistenceQueries;
+use weaver_server_core::settings::queries::SettingsQueries;
 
 const RPC_EXTENSION_ORIGINS: [&str; 3] = [
     "chrome-extension://mpejfoghnejnbfkpbiafklkmlhebkapb",

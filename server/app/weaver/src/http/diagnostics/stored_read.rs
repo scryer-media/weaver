@@ -19,6 +19,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Condvar, Mutex};
 use std::time::Instant;
+use weaver_server_core::auth::repository::AuthRepositoryQueries;
+use weaver_server_core::categories::queries::CategoriesQueries;
+use weaver_server_core::jobs::diagnostic_names::JobsDiagnosticNamesDiagnosticRecentHistoryIdsQueries;
+use weaver_server_core::post_processing::instances::PostProcessingInstancesQueries;
+use weaver_server_core::proxies::ProxiesDnsPersistenceQueries;
+use weaver_server_core::proxies::ProxiesNetworkPersistenceQueries;
+use weaver_server_core::proxies::ProxiesPersistenceQueries;
+use weaver_server_core::rss::RssQueries;
+use weaver_server_core::servers::queries::ServersQueries;
+use weaver_server_core::settings::SettingsSchedulesQueries;
 
 use weaver_nzb::NzbNames;
 use weaver_server_core::Database;

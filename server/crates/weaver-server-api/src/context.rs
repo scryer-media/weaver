@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use std::sync::{Arc, RwLock};
+use weaver_server_core::post_processing::settings::PostProcessingSettingsQueries;
 
 use async_graphql::{Schema, SchemaBuilder};
 use weaver_nntp::pool::NntpPool;

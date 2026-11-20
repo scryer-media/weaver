@@ -11,6 +11,10 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use weaver_server_api::auth::CallerIdentity;
+use weaver_server_core::auth::api_keys::AuthApiKeysQueries;
+use weaver_server_core::auth::repository::AuthRepositoryQueries;
+use weaver_server_core::post_processing::callbacks::PostProcessingCallbacksQueries;
+use weaver_server_core::settings::persistence::SettingsPersistenceQueries;
 
 use weaver_server_core::Database;
 use weaver_server_core::auth::{self as jwt, JWT_TTL_SECS};
@@ -1661,6 +1665,10 @@ fn browser_session_cookie(token: &str, base_url: &str, secure: bool, remember: b
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+    use weaver_server_core::auth::api_keys::AuthApiKeysQueries;
+    use weaver_server_core::auth::repository::AuthRepositoryQueries;
+    use weaver_server_core::post_processing::callbacks::PostProcessingCallbacksQueries;
+    use weaver_server_core::settings::queries::SettingsQueries;
 
     fn authenticated_request_context(
         db: Database,

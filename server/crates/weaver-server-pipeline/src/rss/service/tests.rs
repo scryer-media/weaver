@@ -1,0 +1,1351 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+use super::*;
+use crate::rss::RssPersistenceQueries;
+use crate::rss::RssQueries;
+use std::time::Duration;
+mod proxy_body;
+mod proxy_routing;
+mod torrents;
+
+use std::io::Write;
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
+
+use axum::Router;
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::response::{IntoResponse, Redirect, Response};
+use axum::routing::get;
+use flate2::{Compression, write::GzEncoder};
+use tempfile::TempDir;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::RwLock;
+
+use crate::settings::Config;
+use crate::{PipelineMetrics, SharedPipelineState};
+use weaver_server_base::security::RuntimeSecurityConfig;
+
+#[derive(Clone)]
+struct TestHttpState {
+    feed_body: String,
+    nzb_body: Vec<u8>,
+    etag: Option<String>,
+    require_auth: bool,
+    feed_hold: Option<Arc<FeedHold>>,
+    feed_requests: Arc<AtomicUsize>,
+    nzb_requests: Arc<AtomicUsize>,
+    auth_failures: Arc<AtomicUsize>,
+    conditional_hits: Arc<AtomicUsize>,
+}
+
+// Parks the feed response until the test releases it, so a test can act while
+// a sync is known to be mid-request.
+#[derive(Default)]
+struct FeedHold {
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[tokio::test]
+async fn feed_item_parsing_prefers_enclosure_and_supports_direct_link_fallback() {
+    let rss = r#"<?xml version="1.0"?>
+            <rss version="2.0">
+              <channel>
+                <title>Example</title>
+                <item>
+                  <guid>guid-1</guid>
+                  <title>Silver Horizon - enclosure</title>
+                  <link>https://example.com/detail</link>
+                  <enclosure url="https://example.com/download.nzb" length="1234" type="application/x-nzb"/>
+                  <category>TV</category>
+                </item>
+              </channel>
+            </rss>"#
+            .to_string();
+    let item = parse_feed_items(rss.as_bytes())
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(
+        item.download_url.as_deref(),
+        Some("https://example.com/download.nzb")
+    );
+    assert_eq!(item.categories, vec!["TV".to_string()]);
+
+    let atom = r#"<?xml version="1.0" encoding="utf-8"?>
+            <feed xmlns="http://www.w3.org/2005/Atom">
+              <title>Atom Example</title>
+              <entry>
+                <id>tag:example.com,2026:test</id>
+                <title>Silver Horizon - link fallback</title>
+                <link href="https://example.com/api?t=get&id=1" />
+              </entry>
+            </feed>"#;
+    let item = parse_feed_items(atom.as_bytes())
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(
+        item.download_url.as_deref(),
+        Some("https://example.com/api?t=get&id=1")
+    );
+}
+
+// An element's text is whole across its references.
+#[test]
+fn feed_item_text_keeps_every_piece_around_its_references() {
+    let rss = r#"<?xml version="1.0"?>
+            <rss version="2.0">
+              <channel>
+                <item>
+                  <guid>guid-1</guid>
+                  <title>Silver &amp; Horizon &#x31;</title>
+                  <link>https://example.com/api?t=get&amp;id=1</link>
+                </item>
+              </channel>
+            </rss>"#;
+    let item = parse_feed_items(rss.as_bytes())
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(item.title, "Silver & Horizon 1");
+    assert_eq!(
+        item.download_url.as_deref(),
+        Some("https://example.com/api?t=get&id=1")
+    );
+}
+
+#[test]
+fn first_matching_rule_wins() {
+    let item = FeedItem {
+        item_id: "guid-1".to_string(),
+        title: "Silver Horizon".to_string(),
+        published_at: None,
+        size_bytes: Some(500),
+        categories: vec!["tv".to_string()],
+        download_url: Some("https://example.com/download.nzb".to_string()),
+        display_url: None,
+        declared: None,
+    };
+    let rules = compile_rules(vec![
+        RssRuleRow {
+            id: 1,
+            feed_id: 1,
+            sort_order: 0,
+            enabled: true,
+            action: RssRuleAction::Reject,
+            title_regex: Some("Silver Horizon".to_string()),
+            item_categories: vec![],
+            min_size_bytes: None,
+            max_size_bytes: None,
+            category_override: None,
+            metadata: vec![],
+        },
+        RssRuleRow {
+            id: 2,
+            feed_id: 1,
+            sort_order: 1,
+            enabled: true,
+            action: RssRuleAction::Accept,
+            title_regex: Some("Silver Horizon".to_string()),
+            item_categories: vec![],
+            min_size_bytes: None,
+            max_size_bytes: None,
+            category_override: None,
+            metadata: vec![],
+        },
+    ]);
+    let decision = evaluate_item(&rules, &item).unwrap();
+    assert_eq!(decision.row.action, RssRuleAction::Reject);
+}
+
+#[tokio::test]
+async fn run_sync_submits_matching_items_and_dedupes_across_restart() {
+    let temp = TempDir::new().unwrap();
+    let db_path = temp.path().join("rss.sqlite");
+    let state = TestHttpState {
+        feed_body: sample_rss_feed("guid-1", "Silver Horizon 01", "/download.nzb"),
+        nzb_body: sample_nzb_bytes(),
+        etag: None,
+        require_auth: false,
+        feed_hold: None,
+        feed_requests: Arc::new(AtomicUsize::new(0)),
+        nzb_requests: Arc::new(AtomicUsize::new(0)),
+        auth_failures: Arc::new(AtomicUsize::new(0)),
+        conditional_hits: Arc::new(AtomicUsize::new(0)),
+    };
+    let (base_url, server_task) = start_test_server(state.clone()).await;
+
+    // A restart reads with the instance key the first start wrote with.
+    let key = crate::persistence::encryption::EncryptionKey::generate();
+    let mut db = Database::open(&db_path).unwrap();
+    db.set_encryption_key(key.clone());
+    let feed = RssFeedRow {
+        scripts: Vec::new(),
+        id: 1,
+        name: "Test Feed".to_string(),
+        url: format!("{base_url}/feed"),
+        enabled: true,
+        poll_interval_secs: 900,
+        username: None,
+        password: None,
+        default_category: Some("tv".to_string()),
+        default_metadata: vec![("source".to_string(), "rss".to_string())],
+        etag: None,
+        last_modified: None,
+        last_polled_at: None,
+        last_success_at: None,
+        last_error: None,
+        consecutive_failures: 0,
+    };
+    db.insert_rss_feed(&feed).unwrap();
+    db.insert_rss_rule(&RssRuleRow {
+        id: 1,
+        feed_id: 1,
+        sort_order: 0,
+        enabled: true,
+        action: RssRuleAction::Accept,
+        title_regex: Some("Silver Horizon".to_string()),
+        item_categories: vec!["TV".to_string()],
+        min_size_bytes: Some(1),
+        max_size_bytes: Some(10_000),
+        category_override: Some("anime".to_string()),
+        metadata: vec![("profile".to_string(), "hevc".to_string())],
+    })
+    .unwrap();
+
+    let service = build_service(temp.path(), db.clone());
+    let report = service.run_all_sync().await.unwrap();
+    assert_eq!(report.feeds_polled, 1);
+    assert_eq!(report.items_submitted, 1);
+    assert_eq!(service.inner.handle.list_jobs().len(), 1);
+    let first = service.inner.handle.list_jobs().remove(0);
+    assert_eq!(first.category.as_deref(), Some("anime"));
+    assert!(
+        first
+            .metadata
+            .iter()
+            .any(|(k, v)| k == "rss.feed_name" && v == "Test Feed")
+    );
+
+    drop(service);
+    drop(db);
+
+    let mut db = Database::open(&db_path).unwrap();
+    db.set_encryption_key(key);
+    let service_restart = build_service(temp.path(), db);
+    let report = service_restart.run_all_sync().await.unwrap();
+    assert_eq!(report.items_new, 0);
+    assert!(service_restart.inner.handle.list_jobs().is_empty());
+
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn run_sync_uses_conditional_get_and_basic_auth() {
+    let temp = TempDir::new().unwrap();
+    let mut db = Database::open(&temp.path().join("rss-auth.sqlite")).unwrap();
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
+    let state = TestHttpState {
+        feed_body: sample_rss_feed("guid-1", "Silver Horizon 01", "/download.nzb"),
+        nzb_body: sample_nzb_bytes(),
+        etag: Some("v1".to_string()),
+        require_auth: true,
+        feed_hold: None,
+        feed_requests: Arc::new(AtomicUsize::new(0)),
+        nzb_requests: Arc::new(AtomicUsize::new(0)),
+        auth_failures: Arc::new(AtomicUsize::new(0)),
+        conditional_hits: Arc::new(AtomicUsize::new(0)),
+    };
+    let (base_url, server_task) = start_test_server(state.clone()).await;
+
+    db.insert_rss_feed(&RssFeedRow {
+        scripts: Vec::new(),
+        id: 1,
+        name: "Auth Feed".to_string(),
+        url: format!("{base_url}/feed"),
+        enabled: true,
+        poll_interval_secs: 900,
+        username: Some("user".to_string()),
+        password: Some("pass".to_string()),
+        default_category: None,
+        default_metadata: vec![],
+        etag: None,
+        last_modified: None,
+        last_polled_at: None,
+        last_success_at: None,
+        last_error: None,
+        consecutive_failures: 0,
+    })
+    .unwrap();
+    db.insert_rss_rule(&RssRuleRow {
+        id: 1,
+        feed_id: 1,
+        sort_order: 0,
+        enabled: true,
+        action: RssRuleAction::Accept,
+        title_regex: Some("Silver Horizon".to_string()),
+        item_categories: vec![],
+        min_size_bytes: None,
+        max_size_bytes: None,
+        category_override: None,
+        metadata: vec![],
+    })
+    .unwrap();
+
+    let service = build_service(temp.path(), db.clone());
+    let first = service.run_all_sync().await.unwrap();
+    assert_eq!(first.items_submitted, 1);
+    let second = service.run_all_sync().await.unwrap();
+    assert_eq!(second.items_fetched, 0);
+    // A 304 is the feed unchanged, not a redirect.
+    assert!(second.errors.is_empty(), "{:?}", second.errors);
+    assert_eq!(state.conditional_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(state.auth_failures.load(Ordering::SeqCst), 0);
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn failed_fetch_is_marked_seen_and_not_retried_immediately() {
+    let temp = TempDir::new().unwrap();
+    let mut db = Database::open(&temp.path().join("rss-failure.sqlite")).unwrap();
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
+    let state = TestHttpState {
+        feed_body: sample_rss_feed("guid-1", "Silver Horizon 01", "/download.nzb"),
+        nzb_body: b"not an nzb".to_vec(),
+        etag: None,
+        require_auth: false,
+        feed_hold: None,
+        feed_requests: Arc::new(AtomicUsize::new(0)),
+        nzb_requests: Arc::new(AtomicUsize::new(0)),
+        auth_failures: Arc::new(AtomicUsize::new(0)),
+        conditional_hits: Arc::new(AtomicUsize::new(0)),
+    };
+    let (base_url, server_task) = start_test_server(state.clone()).await;
+    db.insert_rss_feed(&RssFeedRow {
+        scripts: Vec::new(),
+        id: 1,
+        name: "Broken Feed".to_string(),
+        url: format!("{base_url}/feed"),
+        enabled: true,
+        poll_interval_secs: 900,
+        username: None,
+        password: None,
+        default_category: None,
+        default_metadata: vec![],
+        etag: None,
+        last_modified: None,
+        last_polled_at: None,
+        last_success_at: None,
+        last_error: None,
+        consecutive_failures: 0,
+    })
+    .unwrap();
+    db.insert_rss_rule(&RssRuleRow {
+        id: 1,
+        feed_id: 1,
+        sort_order: 0,
+        enabled: true,
+        action: RssRuleAction::Accept,
+        title_regex: Some("Silver Horizon".to_string()),
+        item_categories: vec![],
+        min_size_bytes: None,
+        max_size_bytes: None,
+        category_override: None,
+        metadata: vec![],
+    })
+    .unwrap();
+
+    let service = build_service(temp.path(), db);
+    let first = service.run_all_sync().await.unwrap();
+    assert_eq!(first.items_submitted, 0);
+    assert_eq!(first.items_new, 1);
+    assert_eq!(first.errors.len(), 1);
+
+    let second = service.run_all_sync().await.unwrap();
+    assert_eq!(second.items_new, 0);
+    assert_eq!(second.items_submitted, 0);
+    assert_eq!(state.nzb_requests.load(Ordering::SeqCst), 1);
+    server_task.abort();
+}
+
+// Keeps the fields of every WARN event the code under test emits.
+struct WarnRecorder(Arc<StdMutex<Vec<std::collections::BTreeMap<String, String>>>>);
+
+impl tracing::Subscriber for WarnRecorder {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Fields(std::collections::BTreeMap<String, String>);
+        impl tracing::field::Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.insert(field.name().into(), format!("{value:?}"));
+            }
+        }
+        if *event.metadata().level() == tracing::Level::WARN {
+            let mut fields = Fields(Default::default());
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+// A failed fetch leaves one WARN line naming the feed and the error, beside
+// the failure the feed row records; a feed that fetches cleanly in the same
+// pass leaves none.
+#[tokio::test]
+async fn a_failed_feed_fetch_logs_one_warning_per_poll() {
+    let warnings = Arc::new(StdMutex::new(Vec::new()));
+    let _subscriber = tracing::subscriber::set_default(WarnRecorder(warnings.clone()));
+    let temp = TempDir::new().unwrap();
+    let mut db = Database::open(&temp.path().join("rss-failure-log.sqlite")).unwrap();
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
+    let state = TestHttpState {
+        feed_body: sample_rss_feed("guid-1", "Silver Horizon 01", "/download.nzb"),
+        nzb_body: sample_nzb_bytes(),
+        etag: None,
+        require_auth: false,
+        feed_hold: None,
+        feed_requests: Arc::new(AtomicUsize::new(0)),
+        nzb_requests: Arc::new(AtomicUsize::new(0)),
+        auth_failures: Arc::new(AtomicUsize::new(0)),
+        conditional_hits: Arc::new(AtomicUsize::new(0)),
+    };
+    let (base_url, server_task) = start_test_server(state.clone()).await;
+    let mut broken = scheduled_feed(1, None);
+    broken.name = "Broken Feed".into();
+    broken.url = format!("{base_url}/missing");
+    db.insert_rss_feed(&broken).unwrap();
+    let mut working = scheduled_feed(2, None);
+    working.url = format!("{base_url}/feed");
+    db.insert_rss_feed(&working).unwrap();
+
+    let service = build_service(temp.path(), db.clone());
+    let report = service.run_all_sync().await.unwrap();
+    assert_eq!(report.feeds_polled, 2);
+    assert_eq!(state.feed_requests.load(Ordering::SeqCst), 1);
+
+    let logged = warnings.lock().unwrap().clone();
+    assert_eq!(
+        logged.len(),
+        1,
+        "one warning for the one failed feed: {logged:?}"
+    );
+    let line = &logged[0];
+    assert_eq!(line["message"], "RSS feed poll failed");
+    assert_eq!(line["feed_id"], "1");
+    assert_eq!(line["feed"], "Broken Feed");
+    assert!(line["error"].contains("HTTP 404"), "error field: {line:?}");
+    let row = db.get_rss_feed(1).unwrap().unwrap();
+    assert!(
+        row.last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("HTTP 404"))
+    );
+    assert_eq!(row.consecutive_failures, 1);
+    assert_eq!(db.get_rss_feed(2).unwrap().unwrap().last_error, None);
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn background_due_sync_skips_when_manual_sync_is_active() {
+    let temp = TempDir::new().unwrap();
+    let mut db = Database::open(&temp.path().join("rss-due.sqlite")).unwrap();
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
+    let hold = Arc::new(FeedHold::default());
+    let state = TestHttpState {
+        feed_body: sample_rss_feed("guid-1", "Silver Horizon 01", "/download.nzb"),
+        nzb_body: sample_nzb_bytes(),
+        etag: None,
+        require_auth: false,
+        feed_hold: Some(hold.clone()),
+        feed_requests: Arc::new(AtomicUsize::new(0)),
+        nzb_requests: Arc::new(AtomicUsize::new(0)),
+        auth_failures: Arc::new(AtomicUsize::new(0)),
+        conditional_hits: Arc::new(AtomicUsize::new(0)),
+    };
+    let (base_url, server_task) = start_test_server(state).await;
+    db.insert_rss_feed(&RssFeedRow {
+        scripts: Vec::new(),
+        id: 1,
+        name: "Due Feed".to_string(),
+        url: format!("{base_url}/feed"),
+        enabled: true,
+        poll_interval_secs: 1,
+        username: None,
+        password: None,
+        default_category: None,
+        default_metadata: vec![],
+        etag: None,
+        last_modified: None,
+        last_polled_at: Some(unix_now_secs() - 10),
+        last_success_at: None,
+        last_error: None,
+        consecutive_failures: 0,
+    })
+    .unwrap();
+    db.insert_rss_rule(&RssRuleRow {
+        id: 1,
+        feed_id: 1,
+        sort_order: 0,
+        enabled: true,
+        action: RssRuleAction::Accept,
+        title_regex: Some("Silver Horizon".to_string()),
+        item_categories: vec![],
+        min_size_bytes: None,
+        max_size_bytes: None,
+        category_override: None,
+        metadata: vec![],
+    })
+    .unwrap();
+
+    let service = build_service(temp.path(), db);
+    let running = {
+        let service = service.clone();
+        tokio::spawn(async move { service.run_all_sync().await.unwrap() })
+    };
+    // The feed request only goes out under the sync lock, and the held
+    // response keeps that sync running until the probe below has run.
+    hold.arrived.notified().await;
+    assert!(matches!(
+        service.try_run_due_sync().await.unwrap(),
+        DueSyncOutcome::SkippedActiveSync
+    ));
+    hold.release.notify_one();
+    let _ = running.await.unwrap();
+    server_task.abort();
+}
+
+#[derive(Clone)]
+struct AuthOriginState {
+    require_auth: bool,
+    redirect_to: Arc<StdMutex<Option<String>>>,
+    requests: Arc<AtomicUsize>,
+    authorized_requests: Arc<AtomicUsize>,
+}
+
+impl AuthOriginState {
+    fn new(require_auth: bool) -> Self {
+        Self {
+            require_auth,
+            redirect_to: Arc::new(StdMutex::new(None)),
+            requests: Arc::new(AtomicUsize::new(0)),
+            authorized_requests: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+async fn auth_origin_resource(
+    State(state): State<AuthOriginState>,
+    headers: HeaderMap,
+) -> Response {
+    state.requests.fetch_add(1, Ordering::SeqCst);
+    if auth_ok(&headers) {
+        state.authorized_requests.fetch_add(1, Ordering::SeqCst);
+    }
+    if state.require_auth && !auth_ok(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    StatusCode::OK.into_response()
+}
+
+async fn auth_origin_redirect(
+    State(state): State<AuthOriginState>,
+    headers: HeaderMap,
+) -> Response {
+    state.requests.fetch_add(1, Ordering::SeqCst);
+    if auth_ok(&headers) {
+        state.authorized_requests.fetch_add(1, Ordering::SeqCst);
+    }
+    if state.require_auth && !auth_ok(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let redirect_to = state.redirect_to.lock().unwrap().clone().unwrap();
+    Redirect::temporary(&redirect_to).into_response()
+}
+
+async fn start_auth_origin_server(state: AuthOriginState) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new()
+        .route("/resource", get(auth_origin_resource))
+        .route("/redirect", get(auth_origin_redirect))
+        .with_state(state);
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), task)
+}
+
+fn basic_auth_feed(url: String) -> RssFeedRow {
+    RssFeedRow {
+        scripts: Vec::new(),
+        id: 1,
+        name: "Basic Auth Feed".to_string(),
+        url,
+        enabled: true,
+        poll_interval_secs: 900,
+        username: Some("user".to_string()),
+        password: Some("pass".to_string()),
+        default_category: None,
+        default_metadata: vec![],
+        etag: None,
+        last_modified: None,
+        last_polled_at: None,
+        last_success_at: None,
+        last_error: None,
+        consecutive_failures: 0,
+    }
+}
+
+#[tokio::test]
+async fn rss_private_network_hardening_rejects_loopback_feed() {
+    let temp = TempDir::new().unwrap();
+    let mut security = RuntimeSecurityConfig::default();
+    security.rss_allow_private_network = false;
+    let mut db = Database::open(&temp.path().join("rss-private-disabled.sqlite")).unwrap();
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
+    let feed = basic_auth_feed("http://127.0.0.1:8080/feed.xml".to_string());
+    db.insert_rss_feed(&feed).unwrap();
+    let service = build_service_with_security(temp.path(), db, security);
+
+    let error = service.fetch_feed_response(&feed).await.unwrap_err();
+    assert!(error.to_string().contains("not allowed"), "{error}");
+}
+
+#[tokio::test]
+async fn rss_basic_auth_is_sent_to_same_origin_feed_and_item_requests() {
+    let temp = TempDir::new().unwrap();
+    let state = AuthOriginState::new(true);
+    let (base_url, server_task) = start_auth_origin_server(state.clone()).await;
+    let mut db = Database::open(&temp.path().join("rss-auth-origin.sqlite")).unwrap();
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
+    let feed = basic_auth_feed(format!("{base_url}/resource"));
+    db.insert_rss_feed(&feed).unwrap();
+    let service = build_service(temp.path(), db);
+
+    service.fetch_feed_response(&feed).await.unwrap();
+    service
+        .send_rss_request(&feed, &format!("{base_url}/resource?item=1"), false)
+        .await
+        .unwrap();
+
+    assert_eq!(state.requests.load(Ordering::SeqCst), 2);
+    assert_eq!(state.authorized_requests.load(Ordering::SeqCst), 2);
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn rss_basic_auth_is_not_sent_to_cross_origin_items() {
+    let temp = TempDir::new().unwrap();
+    let feed_state = AuthOriginState::new(true);
+    let item_state = AuthOriginState::new(false);
+    let (feed_url, feed_task) = start_auth_origin_server(feed_state.clone()).await;
+    let (item_url, item_task) = start_auth_origin_server(item_state.clone()).await;
+    let mut db = Database::open(&temp.path().join("rss-cross-origin.sqlite")).unwrap();
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
+    let feed = basic_auth_feed(format!("{feed_url}/resource"));
+    db.insert_rss_feed(&feed).unwrap();
+    let service = build_service(temp.path(), db);
+
+    service.fetch_feed_response(&feed).await.unwrap();
+    service
+        .send_rss_request(&feed, &format!("{item_url}/resource"), false)
+        .await
+        .unwrap();
+
+    assert_eq!(feed_state.authorized_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(item_state.requests.load(Ordering::SeqCst), 1);
+    assert_eq!(item_state.authorized_requests.load(Ordering::SeqCst), 0);
+    feed_task.abort();
+    item_task.abort();
+}
+
+#[tokio::test]
+async fn rss_basic_auth_follows_same_origin_redirects_and_strips_cross_origin_redirects() {
+    let temp = TempDir::new().unwrap();
+    let same_origin_state = AuthOriginState::new(true);
+    let (same_origin_url, same_origin_task) =
+        start_auth_origin_server(same_origin_state.clone()).await;
+    *same_origin_state.redirect_to.lock().unwrap() = Some(format!("{same_origin_url}/resource"));
+    let mut db = Database::open(&temp.path().join("rss-redirect-origin.sqlite")).unwrap();
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
+    let feed = basic_auth_feed(format!("{same_origin_url}/resource"));
+    db.insert_rss_feed(&feed).unwrap();
+    let service = build_service(temp.path(), db);
+
+    service
+        .send_rss_request(&feed, &format!("{same_origin_url}/redirect"), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        same_origin_state.authorized_requests.load(Ordering::SeqCst),
+        2
+    );
+
+    let cross_origin_state = AuthOriginState::new(false);
+    let (cross_origin_url, cross_origin_task) =
+        start_auth_origin_server(cross_origin_state.clone()).await;
+    *same_origin_state.redirect_to.lock().unwrap() = Some(format!("{cross_origin_url}/resource"));
+
+    service
+        .send_rss_request(&feed, &format!("{same_origin_url}/redirect"), false)
+        .await
+        .unwrap();
+    assert_eq!(cross_origin_state.requests.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        cross_origin_state
+            .authorized_requests
+            .load(Ordering::SeqCst),
+        0
+    );
+    same_origin_task.abort();
+    cross_origin_task.abort();
+}
+
+#[derive(Clone, Copy, Debug)]
+enum OversizedFeedBodyMode {
+    Declared,
+    Chunked,
+    Gzip,
+}
+
+#[derive(Clone)]
+struct OversizedFeedBodyState {
+    body: Arc<Vec<u8>>,
+    mode: OversizedFeedBodyMode,
+    requests: Arc<AtomicUsize>,
+}
+
+async fn oversized_feed_handler(State(state): State<OversizedFeedBodyState>) -> Response {
+    state.requests.fetch_add(1, Ordering::SeqCst);
+    let mut response = Response::new(Body::from(state.body.as_ref().clone()));
+    match state.mode {
+        OversizedFeedBodyMode::Declared => {
+            response.headers_mut().insert(
+                header::CONTENT_LENGTH,
+                HeaderValue::from_str(&state.body.len().to_string()).unwrap(),
+            );
+        }
+        OversizedFeedBodyMode::Chunked => unreachable!("chunked feeds use a raw HTTP fixture"),
+        OversizedFeedBodyMode::Gzip => {
+            response
+                .headers_mut()
+                .insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        }
+    }
+    response
+}
+
+async fn start_chunked_feed_server(
+    body: Vec<u8>,
+    requests: Arc<AtomicUsize>,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 4096];
+        let _ = socket.read(&mut request).await.unwrap();
+        requests.fetch_add(1, Ordering::SeqCst);
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+            .await
+            .unwrap();
+        for chunk in body.chunks(64 * 1024) {
+            socket
+                .write_all(format!("{:X}\r\n", chunk.len()).as_bytes())
+                .await
+                .unwrap();
+            socket.write_all(chunk).await.unwrap();
+            socket.write_all(b"\r\n").await.unwrap();
+        }
+        socket.write_all(b"0\r\n\r\n").await.unwrap();
+    });
+    (format!("http://{address}"), task)
+}
+
+async fn assert_oversized_feed_is_rejected(mode: OversizedFeedBodyMode) {
+    let temp = TempDir::new().unwrap();
+    let expanded = vec![b'x'; MAX_RSS_FEED_BODY_BYTES as usize + 1];
+    let body = match mode {
+        OversizedFeedBodyMode::Gzip => {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(&expanded).unwrap();
+            encoder.finish().unwrap()
+        }
+        OversizedFeedBodyMode::Declared | OversizedFeedBodyMode::Chunked => expanded,
+    };
+    let requests = Arc::new(AtomicUsize::new(0));
+    let (base_url, server_task) = if matches!(mode, OversizedFeedBodyMode::Chunked) {
+        start_chunked_feed_server(body, requests.clone()).await
+    } else {
+        let state = OversizedFeedBodyState {
+            body: Arc::new(body),
+            mode,
+            requests: requests.clone(),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/feed", get(oversized_feed_handler))
+            .with_state(state);
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), server_task)
+    };
+
+    let mut db = Database::open(&temp.path().join("oversized-rss.sqlite")).unwrap();
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
+    let mut feed = basic_auth_feed(format!("{base_url}/feed"));
+    feed.username = None;
+    feed.password = None;
+    db.insert_rss_feed(&feed).unwrap();
+    let report = build_service(temp.path(), db).run_all_sync().await.unwrap();
+
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    assert_eq!(report.items_fetched, 0);
+    assert_eq!(report.items_submitted, 0);
+    assert_eq!(report.errors.len(), 1);
+    assert!(
+        report.errors[0].contains("response exceeds"),
+        "unexpected poll error for {mode:?}: {:?}",
+        report.errors,
+    );
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn rss_feed_body_limit_rejects_declared_chunked_and_compressed_bodies() {
+    assert_oversized_feed_is_rejected(OversizedFeedBodyMode::Declared).await;
+    assert_oversized_feed_is_rejected(OversizedFeedBodyMode::Chunked).await;
+    assert_oversized_feed_is_rejected(OversizedFeedBodyMode::Gzip).await;
+}
+
+fn build_service(data_dir: &Path, db: Database) -> RssService {
+    build_service_with_security(data_dir, db, RuntimeSecurityConfig::default())
+}
+
+fn build_service_with_security(
+    data_dir: &Path,
+    db: Database,
+    security: RuntimeSecurityConfig,
+) -> RssService {
+    let config = Arc::new(RwLock::new(Config {
+        upload_cap: None,
+        seeding: None,
+        torrent: Default::default(),
+        data_dir: data_dir.display().to_string(),
+        hardware_profile: None,
+        intermediate_dir: None,
+        complete_dir: None,
+        servers: vec![],
+        categories: vec![],
+        retry: None,
+        bandwidth: Default::default(),
+        propagation_delay_secs: None,
+        max_concurrent_nzbs: None,
+        cleanup_after_extract: Some(true),
+        delete_failed_job_files: None,
+        history_retention_days: None,
+        watch_folder: crate::watch_folder::WatchFolderConfig::default(),
+        duplicate_policy: Default::default(),
+        direct_store: None,
+        delivery_naming: None,
+        metrics: Default::default(),
+        config_path: None,
+    }));
+    let handle = test_scheduler_handle(data_dir, db.clone());
+    crate::ingest::init_job_counter(20_000);
+    let service = RssService::new_with_security(handle, config, db.clone(), security);
+    route_feeds(&service, &db);
+    service
+}
+
+// Routes every feed saved so far, direct: a feed is fetched only on a route.
+fn route_feeds(service: &RssService, db: &Database) {
+    service.inner.handle.set_proxy_runtime(
+        crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap(),
+    );
+}
+
+fn test_scheduler_handle(data_dir: &Path, db: Database) -> SchedulerHandle {
+    let (events, _) = tokio::sync::broadcast::channel(8);
+    let state = SharedPipelineState::new(PipelineMetrics::new(), vec![]);
+    let _ = state
+        .queue
+        .resources
+        .set(crate::pipeline::test_support::admission_resources(
+            db, data_dir,
+        ));
+    SchedulerHandle::new(events, state)
+}
+
+async fn start_test_server(state: TestHttpState) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{}", addr);
+    let mut state = state;
+    state.feed_body = state.feed_body.replace("http://localhost", &base_url);
+    let app = Router::new()
+        .route("/feed", get(feed_handler))
+        .route("/download.nzb", get(nzb_handler))
+        .route("/api", get(nzb_handler))
+        .with_state(state);
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (base_url, task)
+}
+
+async fn feed_handler(State(state): State<TestHttpState>, headers: HeaderMap) -> impl IntoResponse {
+    state.feed_requests.fetch_add(1, Ordering::SeqCst);
+    if state.require_auth && !auth_ok(&headers) {
+        state.auth_failures.fetch_add(1, Ordering::SeqCst);
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if let Some(hold) = &state.feed_hold {
+        hold.arrived.notify_one();
+        hold.release.notified().await;
+    }
+    if let Some(etag) = &state.etag
+        && headers
+            .get(IF_NONE_MATCH)
+            .and_then(|value| value.to_str().ok())
+            == Some(etag.as_str())
+    {
+        state.conditional_hits.fetch_add(1, Ordering::SeqCst);
+        return StatusCode::NOT_MODIFIED.into_response();
+    }
+    let mut response_headers = HeaderMap::new();
+    if let Some(etag) = &state.etag {
+        response_headers.insert(ETAG, HeaderValue::from_str(etag).unwrap());
+    }
+    (response_headers, state.feed_body.clone()).into_response()
+}
+
+async fn nzb_handler(State(state): State<TestHttpState>, headers: HeaderMap) -> impl IntoResponse {
+    state.nzb_requests.fetch_add(1, Ordering::SeqCst);
+    if state.require_auth && !auth_ok(&headers) {
+        state.auth_failures.fetch_add(1, Ordering::SeqCst);
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/x-nzb")],
+        state.nzb_body,
+    )
+        .into_response()
+}
+
+fn auth_ok(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        == Some("Basic dXNlcjpwYXNz")
+}
+
+fn sample_rss_feed(guid: &str, title: &str, path: &str) -> String {
+    format!(
+        r#"<?xml version="1.0"?>
+            <rss version="2.0">
+              <channel>
+                <title>Example</title>
+                <item>
+                  <guid>{guid}</guid>
+                  <title>{title}</title>
+                  <link>https://example.com/details</link>
+                  <enclosure url="http://localhost{path}" length="321" type="application/x-nzb"/>
+                  <category>TV</category>
+                  <pubDate>Mon, 10 Mar 2025 12:00:00 GMT</pubDate>
+                </item>
+              </channel>
+            </rss>"#
+    )
+}
+
+fn sample_nzb_bytes() -> Vec<u8> {
+    br#"<?xml version="1.0" encoding="UTF-8"?>
+        <nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+          <file poster="poster" date="1700000000" subject="Silver Horizon.Sample.rar">
+            <groups><group>alt.binaries.test</group></groups>
+            <segments><segment bytes="100" number="1">msgid@example.com</segment></segments>
+          </file>
+        </nzb>"#
+        .to_vec()
+}
+
+#[tokio::test]
+async fn pause_all_holds_regular_rss_but_not_manual_fetch() {
+    let temp = TempDir::new().unwrap();
+    let mut db = Database::open(&temp.path().join("state.db")).unwrap();
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
+    let requests = Arc::new(AtomicUsize::new(0));
+    let state = TestHttpState {
+        feed_body: "<rss version=\"2.0\"><channel><title>Empty</title></channel></rss>".into(),
+        nzb_body: sample_nzb_bytes(),
+        etag: None,
+        require_auth: false,
+        feed_hold: None,
+        feed_requests: requests.clone(),
+        nzb_requests: Arc::new(AtomicUsize::new(0)),
+        auth_failures: Arc::new(AtomicUsize::new(0)),
+        conditional_hits: Arc::new(AtomicUsize::new(0)),
+    };
+    let (base_url, server) = start_test_server(state).await;
+    db.insert_rss_feed(&RssFeedRow {
+        id: 1,
+        name: "Scheduled feed".into(),
+        url: format!("{base_url}/feed"),
+        enabled: true,
+        poll_interval_secs: 60,
+        username: None,
+        password: None,
+        default_category: None,
+        default_metadata: vec![],
+        etag: None,
+        last_modified: None,
+        last_polled_at: None,
+        last_success_at: None,
+        last_error: None,
+        consecutive_failures: 0,
+        scripts: Vec::new(),
+    })
+    .unwrap();
+    let service = build_service(temp.path(), db);
+    service.set_scheduled_paused(true);
+    assert!(matches!(
+        service.try_run_due_sync().await.unwrap(),
+        DueSyncOutcome::NoFeedsDue
+    ));
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    assert_eq!(service.run_feed_sync(1).await.unwrap().feeds_polled, 1);
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+fn scheduled_feed(id: u32, last_polled_at: Option<i64>) -> RssFeedRow {
+    RssFeedRow {
+        id,
+        name: format!("Scheduled feed {id}"),
+        // Never fetched: these tests stop before any feed is due.
+        url: "http://127.0.0.1:9/feed".into(),
+        enabled: true,
+        poll_interval_secs: 900,
+        username: None,
+        password: None,
+        default_category: None,
+        default_metadata: vec![],
+        etag: None,
+        last_modified: None,
+        last_polled_at,
+        last_success_at: None,
+        last_error: None,
+        consecutive_failures: 0,
+        scripts: Vec::new(),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn due_sync_uses_a_cached_schedule_until_the_actual_deadline() {
+    let temp = TempDir::new().unwrap();
+    let db = Database::open_in_memory().unwrap();
+    let service = build_service(temp.path(), db.clone());
+    db.insert_rss_feed(&scheduled_feed(1, Some(service.now())))
+        .unwrap();
+    route_feeds(&service, &db);
+    // The feed is 900 s away; the poller still looks again within one tick.
+    assert_eq!(
+        service.next_due_sync_delay(),
+        Some(Duration::from_secs(crate::rss::model::RSS_SYNC_TICK_SECS))
+    );
+    let delay = Duration::from_secs(900);
+    let target = crate::rss::poller::RssSyncTarget::AllEnabledFeeds;
+    assert!(service.load_target_feeds(target, true).unwrap().is_empty());
+    assert_eq!(
+        db.rss_schedule_cache
+            .loads
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    tokio::time::advance(delay).await;
+    assert_eq!(
+        service
+            .load_target_feeds(target, true)
+            .unwrap()
+            .iter()
+            .map(|feed| feed.id)
+            .collect::<Vec<_>>(),
+        [1]
+    );
+    assert_eq!(
+        db.rss_schedule_cache
+            .loads
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    db.record_rss_poll_success(1, service.now(), None, None)
+        .unwrap();
+    assert_eq!(
+        service.next_due_sync_delay(),
+        Some(Duration::from_secs(crate::rss::model::RSS_SYNC_TICK_SECS))
+    );
+    assert_eq!(
+        db.rss_schedule_cache
+            .loads
+            .load(std::sync::atomic::Ordering::Relaxed),
+        2
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_feed_without_a_route_waits_for_the_runtime_reload() {
+    let temp = TempDir::new().unwrap();
+    let db = Database::open_in_memory().unwrap();
+    let service = build_service(temp.path(), db.clone());
+    let runtime =
+        crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
+    service.inner.handle.set_proxy_runtime(runtime.clone());
+    // Inserted the way the API does it, before the runtime has reloaded:
+    // the row is due but has no consumer route yet.
+    db.insert_rss_feed(&scheduled_feed(1, None)).unwrap();
+    let target = crate::rss::poller::RssSyncTarget::AllEnabledFeeds;
+    assert!(service.load_target_feeds(target, true).unwrap().is_empty());
+    assert!(service.load_target_feeds(target, false).unwrap().is_empty());
+    assert!(matches!(
+        service.try_run_due_sync().await.unwrap(),
+        DueSyncOutcome::NoFeedsDue
+    ));
+    assert_eq!(db.get_rss_feed(1).unwrap().unwrap().last_error, None);
+    let mut changed = db.rss_schedule_cache.changed.subscribe();
+    runtime.reload().await.unwrap();
+    changed.changed().await.unwrap();
+    assert_eq!(
+        service
+            .load_target_feeds(target, true)
+            .unwrap()
+            .iter()
+            .map(|feed| feed.id)
+            .collect::<Vec<_>>(),
+        [1]
+    );
+}
+
+// A poll that meets a route reload is not a feed failure: nothing is fetched
+// or recorded, the feed stays due, and the reload's end wakes the poller,
+// which then reads it.
+#[tokio::test]
+async fn a_poll_during_a_route_reload_records_nothing_and_runs_when_it_ends() {
+    let temp = TempDir::new().unwrap();
+    let mut db = Database::open(&temp.path().join("state.db")).unwrap();
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
+    let requests = Arc::new(AtomicUsize::new(0));
+    let (base_url, server) = start_test_server(TestHttpState {
+        feed_body: "<rss version=\"2.0\"><channel><title>Empty</title></channel></rss>".into(),
+        nzb_body: sample_nzb_bytes(),
+        etag: None,
+        require_auth: false,
+        feed_hold: None,
+        feed_requests: requests.clone(),
+        nzb_requests: Arc::new(AtomicUsize::new(0)),
+        auth_failures: Arc::new(AtomicUsize::new(0)),
+        conditional_hits: Arc::new(AtomicUsize::new(0)),
+    })
+    .await;
+    let mut feed = scheduled_feed(1, None);
+    feed.url = format!("{base_url}/feed");
+    db.insert_rss_feed(&feed).unwrap();
+    let service = build_service(temp.path(), db.clone());
+    let runtime = service.inner.handle.proxy_runtime().unwrap();
+    let untouched = |db: &Database| {
+        let feed = db.get_rss_feed(1).unwrap().unwrap();
+        assert_eq!(feed.last_error, None);
+        assert_eq!(feed.consecutive_failures, 0);
+        assert_eq!(feed.last_polled_at, None);
+    };
+
+    let reloading = runtime.begin_reload().unwrap();
+    // The due sweep passes the feed over.
+    assert!(matches!(
+        service.try_run_due_sync().await.unwrap(),
+        DueSyncOutcome::NoFeedsDue
+    ));
+    // A poll that gets as far as the route meets its refusal.
+    let report = service.run_feed_sync(1).await.unwrap();
+    assert_eq!(report.feeds_polled, 0);
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    untouched(&db);
+
+    let mut changed = db.rss_schedule_cache.changed.subscribe();
+    drop(reloading);
+    changed.changed().await.unwrap();
+    let DueSyncOutcome::Completed(report) = service.try_run_due_sync().await.unwrap() else {
+        panic!("the feed passed over by the reload is due once it ends");
+    };
+    assert_eq!(report.feeds_polled, 1);
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    let feed = db.get_rss_feed(1).unwrap().unwrap();
+    assert_eq!(feed.last_error, None);
+    assert!(feed.last_polled_at.is_some());
+    server.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_scheduled_pause_parks_the_due_timer_until_resume() {
+    let temp = TempDir::new().unwrap();
+    let db = Database::open_in_memory().unwrap();
+    let service = build_service(temp.path(), db.clone());
+    db.insert_rss_feed(&scheduled_feed(1, None)).unwrap();
+    route_feeds(&service, &db);
+    service.set_scheduled_paused(true);
+    let mut resumed = service.inner.scheduled_paused.subscribe();
+    assert_eq!(service.next_due_sync_delay(), None);
+    assert!(matches!(
+        service.try_run_due_sync().await.unwrap(),
+        DueSyncOutcome::NoFeedsDue
+    ));
+    assert_eq!(
+        db.rss_schedule_cache
+            .loads
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    service.set_scheduled_paused(false);
+    resumed.changed().await.unwrap();
+    assert!(!*resumed.borrow());
+    assert_eq!(service.next_due_sync_delay(), Some(Duration::from_secs(1)));
+    let mut changed = db.rss_schedule_cache.changed.subscribe();
+    db.delete_rss_feed(1).unwrap();
+    changed.changed().await.unwrap();
+    assert_eq!(service.next_due_sync_delay(), None);
+}
+
+#[tokio::test]
+async fn due_feed_selection_loads_only_the_due_feed() {
+    let temp = TempDir::new().unwrap();
+    let db = Database::open_in_memory().unwrap();
+    db.insert_rss_feed(&scheduled_feed(1, Some(unix_now_secs())))
+        .unwrap();
+    db.insert_rss_feed(&scheduled_feed(2, None)).unwrap();
+    let service = build_service(temp.path(), db);
+
+    let due = service
+        .load_target_feeds(crate::rss::poller::RssSyncTarget::AllEnabledFeeds, true)
+        .unwrap();
+
+    assert_eq!(due.iter().map(|feed| feed.id).collect::<Vec<_>>(), vec![2]);
+    assert_eq!(
+        service
+            .inner
+            .full_feed_loads
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    // A due feed brings the next look forward to now, floored at a second.
+    assert_eq!(service.next_due_sync_delay(), Some(Duration::from_secs(1)));
+}
+
+// The release gate's feed: one item, polled by the background sweep as soon
+// as the feed is added and before its accept rule exists. The item must still
+// be new when the rule arrives, so the operator's poll submits it.
+#[tokio::test]
+async fn a_new_feeds_first_sweep_leaves_its_items_for_the_rule_added_after_it() {
+    let temp = TempDir::new().unwrap();
+    let mut db = Database::open(&temp.path().join("rss-new-feed.sqlite")).unwrap();
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
+    let title = "Weaver E2E RSS Behavior Probe";
+    let fixture = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel>
+  <title>Weaver E2E RSS fixture</title>
+  <item>
+    <title>Weaver E2E RSS Behavior Probe</title>
+    <guid isPermaLink="false">weaver-e2e-rss-behavior-probe</guid>
+    <link>{nzb}</link>
+    <pubDate>Fri, 14 Mar 2032 08:00:00 GMT</pubDate>
+    <enclosure url="{nzb}" length="1" type="application/x-nzb" />
+  </item>
+</channel></rss>"#;
+    // The server puts its own address where the body names localhost.
+    let state = TestHttpState {
+        feed_body: fixture.replace("{nzb}", "http://localhost/download.nzb"),
+        nzb_body: sample_nzb_bytes(),
+        etag: None,
+        require_auth: false,
+        feed_hold: None,
+        feed_requests: Arc::new(AtomicUsize::new(0)),
+        nzb_requests: Arc::new(AtomicUsize::new(0)),
+        auth_failures: Arc::new(AtomicUsize::new(0)),
+        conditional_hits: Arc::new(AtomicUsize::new(0)),
+    };
+    let (base_url, server_task) = start_test_server(state.clone()).await;
+    db.insert_rss_feed(&RssFeedRow {
+        scripts: Vec::new(),
+        id: 1,
+        name: "E2E Controlled Feed".to_string(),
+        url: format!("{base_url}/feed"),
+        enabled: true,
+        poll_interval_secs: 900,
+        username: None,
+        password: None,
+        default_category: None,
+        default_metadata: vec![],
+        etag: None,
+        last_modified: None,
+        last_polled_at: None,
+        last_success_at: None,
+        last_error: None,
+        consecutive_failures: 0,
+    })
+    .unwrap();
+    let service = build_service(temp.path(), db.clone());
+
+    // The sweep the new feed wakes, before any rule.
+    let DueSyncOutcome::Completed(swept) = service.try_run_due_sync().await.unwrap() else {
+        panic!("the new feed is due at once");
+    };
+    assert_eq!((swept.feeds_polled, swept.items_fetched), (1, 1));
+    assert_eq!(swept.items_submitted, 0);
+
+    db.insert_rss_rule(&RssRuleRow {
+        id: 1,
+        feed_id: 1,
+        sort_order: 0,
+        enabled: true,
+        action: RssRuleAction::Accept,
+        title_regex: Some(title.to_string()),
+        item_categories: vec![],
+        min_size_bytes: None,
+        max_size_bytes: None,
+        category_override: None,
+        metadata: vec![],
+    })
+    .unwrap();
+
+    let first = service.run_feed_sync(1).await.unwrap();
+    assert_eq!(
+        (first.feeds_polled, first.items_new, first.items_submitted),
+        (1, 1, 1),
+        "{first:?}"
+    );
+    assert_eq!(service.inner.handle.list_jobs().len(), 1);
+    let again = service.run_feed_sync(1).await.unwrap();
+    assert_eq!((again.items_new, again.items_submitted), (0, 0));
+    assert_eq!(state.nzb_requests.load(Ordering::SeqCst), 1);
+    server_task.abort();
+}

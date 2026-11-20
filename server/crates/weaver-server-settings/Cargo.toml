@@ -1,0 +1,36 @@
+[package]
+name = "weaver-server-settings"
+description = "Settings and configuration records for the Weaver server"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[dependencies]
+libc = { workspace = true }
+tracing = { workspace = true }
+weaver-server-jobs = { path = "../weaver-server-jobs" }
+weaver-server-net = { path = "../weaver-server-net" }
+weaver-model = { path = "../../../shared/crates/weaver-model", default-features = false }
+thiserror = { workspace = true }
+getrandom = { workspace = true, default-features = false }
+sevenz-turbo = { workspace = true }
+zip = { workspace = true }
+blake3 = { workspace = true }
+unrar-rs = { workspace = true, features = [
+    "crypto-aws-lc",
+] }
+url = "2"
+x509-parser = { version = "0.18", default-features = false }
+weaver-torrent = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+weaver-server-base = { path = "../weaver-server-base" }
+weaver-server-db = { path = "../weaver-server-db" }
+
+[dev-dependencies]
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
+sevenz-turbo = { workspace = true, features = ["compress"] }
+crc-turbo = { workspace = true }
