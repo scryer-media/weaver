@@ -8,7 +8,7 @@ use super::*;
 use crate::jobs::handle::HoldSet;
 use crate::torrents::FilePriority;
 use crate::torrents::service::disk_room::DiskHeld;
-use crate::torrents::service::live::Live;
+use crate::torrents::service::live::{Live, Rules};
 use crate::torrents::service::policy::{
     self, Checkpoint, Context, Goals, Intent, Limits, Picking, Picks, Policy, QueueOrder, Reading,
     RunCommand, Seats, Standing, Turns,
@@ -65,7 +65,7 @@ fn decide(
     let holds = HoldSet::default();
     let cx = Context {
         settings,
-        rules: &[],
+        rules: &Rules::default(),
         holds: &holds,
         now: EPOCH_MS,
         at_once: false,
@@ -246,7 +246,12 @@ fn a_torrents_standing_is_how_the_queue_stands_it() {
     for torrent in [downloading(), seed(0.0, SeedingAction::Stop)] {
         assert_eq!(
             decide(&Standing, &torrent, &settings, &Ask::default()),
-            [Intent::Stand(queued(&settings, &[], &torrent, EPOCH_MS))]
+            [Intent::Stand(queued(
+                &settings,
+                &Rules::default(),
+                &torrent,
+                EPOCH_MS
+            ))]
         );
     }
 }
