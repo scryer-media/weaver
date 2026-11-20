@@ -31,6 +31,121 @@ fn pending() -> (Job, MemberId, Vec<u8>) {
     (job, member, bytes)
 }
 
+// A member closed whole whose fold is missing: its obligation waits for a
+// check that can be lent now.
+fn pend(job: &mut Job, name: &str) -> MemberId {
+    let bytes = name.as_bytes().to_vec();
+    let member = job.member(name, Some(bytes.len() as u64));
+    job.send(member, 0, &bytes, Provenance::Fresh);
+    job.close(member);
+    job.tree
+        .namespace_mut(NodeId::ROOT)
+        .unwrap()
+        .get_mut(member)
+        .unwrap()
+        .crc32 = Some(crc32(&bytes));
+    job.writer
+        .files_mut(NodeId::ROOT)
+        .leaves
+        .insert(member, Leaf::at(job.dir.path(), name));
+    assert!(
+        !job.writer
+            .fails_its_checksum(&job.tree, NodeId::ROOT, member)
+            .unwrap()
+    );
+    member
+}
+
+// One sweep: what it kept, checked against the full walk it replaces, and
+// how many obligations it asked about.
+fn sweep(job: &mut Job, coming: &Coming) -> u64 {
+    let expected = job.writer.owed_by_full_walk(&job.tree, coming);
+    let before = crate::pipeline::graph::namespace::hooks::SWEEP_ASKED.get();
+    job.writer.drop_unmet_verifications(&job.tree, coming);
+    assert_eq!(job.writer.pending_verifications(), expected);
+    crate::pipeline::graph::namespace::hooks::SWEEP_ASKED.get() - before
+}
+
+// An ended namespace holding many checkable obligations, as an archive of
+// many small members does while its checks are lent one at a time: each
+// sweep asks only the obligations whose member or leaf changed since the
+// last, or that came since, and keeps what the full walk kept.
+#[test]
+fn a_sweep_of_an_ended_namespace_asks_only_what_changed() {
+    let mut job = Job::new(PLENTY);
+    let members: Vec<MemberId> = (0..48)
+        .map(|at| pend(&mut job, &format!("m{at:02}.bin")))
+        .collect();
+    let ended = Coming::default();
+    assert_eq!(sweep(&mut job, &ended), 48);
+    assert_eq!(job.writer.pending_verifications().len(), 48);
+    // Nothing changed: nothing is asked.
+    assert_eq!(sweep(&mut job, &ended), 0);
+    assert_eq!(sweep(&mut job, &ended), 0);
+    // One more member: only it is asked.
+    pend(&mut job, "late.bin");
+    assert_eq!(sweep(&mut job, &ended), 1);
+    assert_eq!(job.writer.pending_verifications().len(), 49);
+    // A leaf an object took: only its member is asked, and its obligation
+    // goes.
+    job.writer
+        .files_mut(NodeId::ROOT)
+        .leaves
+        .remove(&members[3]);
+    assert_eq!(sweep(&mut job, &ended), 1);
+    assert_eq!(job.writer.pending_verifications().len(), 48);
+    // A record that no longer states its checksum: the same.
+    job.tree
+        .namespace_mut(NodeId::ROOT)
+        .unwrap()
+        .get_mut(members[5])
+        .unwrap()
+        .crc32 = None;
+    assert_eq!(sweep(&mut job, &ended), 1);
+    assert_eq!(job.writer.pending_verifications().len(), 47);
+    assert_eq!(sweep(&mut job, &ended), 0);
+}
+
+// While payload is still to come nothing is dropped and nothing is asked,
+// an obligation that cannot be checked yet among them; once the namespace
+// ends again its obligations are all asked, and the one no check can meet
+// goes.
+#[test]
+fn a_namespace_that_ends_again_is_swept_whole() {
+    let mut job = Job::new(PLENTY);
+    for at in 0..8 {
+        pend(&mut job, &format!("m{at}.bin"));
+    }
+    let ended = Coming::default();
+    assert_eq!(sweep(&mut job, &ended), 8);
+    let open = job.member("open.bin", Some(4));
+    job.send(open, 0, b"ab", Provenance::Fresh);
+    job.tree
+        .namespace_mut(NodeId::ROOT)
+        .unwrap()
+        .get_mut(open)
+        .unwrap()
+        .crc32 = Some(crc32(b"abcd"));
+    assert!(
+        !job.writer
+            .fails_its_checksum(&job.tree, NodeId::ROOT, open)
+            .unwrap()
+    );
+    let coming = Coming {
+        payload: true,
+        ..Coming::default()
+    };
+    assert_eq!(sweep(&mut job, &coming), 0);
+    assert_eq!(job.writer.pending_verifications().len(), 9);
+    assert_eq!(sweep(&mut job, &ended), 9);
+    assert_eq!(job.writer.pending_verifications().len(), 8);
+    assert!(
+        !job.writer
+            .pending_verifications()
+            .contains(&(NodeId::ROOT.0, open.0))
+    );
+}
+
 fn apply(job: &mut Job, verified: Verified) -> Result<(), WriteError> {
     let mut build = job.build();
     job.writer

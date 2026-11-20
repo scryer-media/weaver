@@ -350,7 +350,7 @@ pub struct NamespaceWriter {
     // off the loop, before coverage or inverse mappings can be changed.
     rechecks: BTreeMap<NodeId, Vec<(VolumeIndex, ByteRange)>>,
     // Sparse durable obligations, retained until a current verification answers.
-    verifications: BTreeSet<(NodeId, MemberId)>,
+    verifications: verification::Obligations,
     // Whether the job's holds have been paged out for a stop. Only then do
     // the holds on scratch go in the checkpoint. Once rows are written, the
     // bytes they name are kept until a later checkpoint commits, as
@@ -547,7 +547,7 @@ impl NamespaceWriter {
             files: Marked::default(),
             read_backs: 0,
             rechecks: BTreeMap::new(),
-            verifications: BTreeSet::new(),
+            verifications: verification::Obligations::default(),
             stopped: false,
             renamed: Vec::new(),
             moves: moves::Moves::default(),
@@ -4491,6 +4491,9 @@ pub mod hooks {
         pub static SPILL_READ_MOST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         // The most bytes one read of a lent repair took from a scratch file.
         pub static SCRATCH_READ_MOST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        // How many checksum obligations a sweep of the unmet ones asked
+        // about.
+        pub static SWEEP_ASKED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
 
     // One pass over the holds, counted in `RELEASE_DEPTH` while it runs.

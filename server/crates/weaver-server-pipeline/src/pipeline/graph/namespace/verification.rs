@@ -162,6 +162,83 @@ impl Verification {
     }
 }
 
+// The members whose checksum is still owed, each `(namespace, member)`, and
+// what keeps the sweep of the unmet ones bounded by what changed: an
+// obligation of an ended namespace is met only by a check that can be lent,
+// and whether one can turns only on its member's record and its leaf, both
+// of which mark every change (`Marked`). A sweep that found every
+// obligation of an ended namespace checkable keeps the generations it saw,
+// and the next asks only the members marked since, and the obligations
+// taken in since.
+#[derive(Debug, Default)]
+pub struct Obligations {
+    held: BTreeSet<(NodeId, MemberId)>,
+    // Taken in since the last sweep.
+    fresh: BTreeSet<(NodeId, MemberId)>,
+    // Each ended namespace the last sweep left with only checkable
+    // obligations, with the generations it read.
+    swept: BTreeMap<NodeId, Swept>,
+}
+
+// The generations of a namespace's member records and of its leaves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Swept {
+    members: u64,
+    leaves: u64,
+}
+
+impl Obligations {
+    pub fn insert(&mut self, key: (NodeId, MemberId)) -> bool {
+        self.fresh.insert(key);
+        self.held.insert(key)
+    }
+
+    pub fn remove(&mut self, key: &(NodeId, MemberId)) -> bool {
+        self.fresh.remove(key);
+        self.held.remove(key)
+    }
+
+    pub fn contains(&self, key: &(NodeId, MemberId)) -> bool {
+        self.held.contains(key)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.held.is_empty()
+    }
+
+    pub fn iter(&self) -> std::collections::btree_set::Iter<'_, (NodeId, MemberId)> {
+        self.held.iter()
+    }
+
+    pub fn extend(&mut self, keys: impl IntoIterator<Item = (NodeId, MemberId)>) {
+        for key in keys {
+            self.insert(key);
+        }
+    }
+
+    // The namespaces holding an obligation, each once, in order: one seek
+    // per namespace, not a walk of its obligations.
+    fn nodes(&self) -> impl Iterator<Item = NodeId> + '_ {
+        let mut at = self.held.first().map(|&(node, _)| node);
+        std::iter::from_fn(move || {
+            let node = at?;
+            at = node.0.checked_add(1).and_then(|next| {
+                self.held
+                    .range((NodeId(next), MemberId(0))..)
+                    .next()
+                    .map(|&(node, _)| node)
+            });
+            Some(node)
+        })
+    }
+
+    fn of(&self, node: NodeId) -> impl Iterator<Item = MemberId> + '_ {
+        self.held
+            .range((node, MemberId(0))..=(node, MemberId(u32::MAX)))
+            .map(|&(_, member)| member)
+    }
+}
+
 impl NamespaceWriter {
     pub fn verifications_waiting(&self) -> bool {
         !self.verifications.is_empty()
@@ -195,20 +272,100 @@ impl NamespaceWriter {
     }
 
     // The namespace ended: its obligations nothing can meet are dropped.
-    pub(crate) fn drop_unmet_verifications(&mut self, tree: &Tree, coming: &Coming) {
-        let unmet: Vec<(NodeId, MemberId)> = self
-            .verifications
-            .iter()
-            .copied()
-            .filter(|&(node, member)| !self.owed(tree, coming, node, member))
-            .collect();
+    // Each namespace is asked once whether it ended. Of one that did, the
+    // obligations asked are those whose member's record or leaf was marked
+    // since the last sweep found the namespace's obligations all checkable,
+    // and those taken in since; every one when no such sweep stands.
+    pub fn drop_unmet_verifications(&mut self, tree: &Tree, coming: &Coming) {
+        let mut unmet = Vec::new();
+        let mut swept = BTreeMap::new();
+        let obligations = &self.verifications;
+        for node in obligations.nodes() {
+            if !self.ended(tree, node, coming) {
+                continue;
+            }
+            let now = self.generations(tree, node);
+            let since = obligations
+                .swept
+                .get(&node)
+                .copied()
+                .zip(now)
+                .filter(|(was, now)| was.members <= now.members && was.leaves <= now.leaves)
+                .map(|(was, _)| was);
+            let mut ask = |member: MemberId| {
+                #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+                super::hooks::SWEEP_ASKED.with(|asked| asked.set(asked.get() + 1));
+                if !self.checks(tree, node, member) {
+                    unmet.push((node, member));
+                }
+            };
+            match since {
+                Some(was) => {
+                    let mut marked: BTreeSet<MemberId> = obligations
+                        .fresh
+                        .range((node, MemberId(0))..=(node, MemberId(u32::MAX)))
+                        .map(|&(_, member)| member)
+                        .collect();
+                    if let Some(namespace) = tree.namespace(node) {
+                        marked.extend(namespace.changed_since(was.members));
+                    }
+                    if let Some(files) = self.files.get(&node) {
+                        marked.extend(files.leaves.marks().since(was.leaves));
+                    }
+                    for member in marked {
+                        if obligations.contains(&(node, member)) {
+                            ask(member);
+                        }
+                    }
+                }
+                None => obligations.of(node).for_each(&mut ask),
+            }
+            if let Some(now) = now {
+                swept.insert(node, now);
+            }
+        }
         for key in unmet {
             self.verifications.remove(&key);
         }
+        self.verifications.swept = swept;
+        self.verifications.fresh.clear();
+    }
+
+    // The obligations the sweep keeps, found as it found them before it
+    // asked only what changed: every obligation, each with its own ended
+    // namespace and a check built for it.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn owed_by_full_walk(&self, tree: &Tree, coming: &Coming) -> Vec<(u32, u32)> {
+        self.verifications
+            .iter()
+            .filter(|&&(node, member)| {
+                !self.ended(tree, node, coming) || self.verification(tree, node, member).is_some()
+            })
+            .map(|(node, member)| (node.0, member.0))
+            .collect()
+    }
+
+    // The generations a sweep of the namespace reads: of its member
+    // records and of its leaves. `None` when it has either no longer.
+    fn generations(&self, tree: &Tree, node: NodeId) -> Option<Swept> {
+        Some(Swept {
+            members: tree.namespace(node)?.generation(),
+            leaves: self.files.get(&node)?.leaves.marks().at(),
+        })
     }
 
     fn owed(&self, tree: &Tree, coming: &Coming, node: NodeId, member: MemberId) -> bool {
-        !self.ended(tree, node, coming) || self.verification(tree, node, member).is_some()
+        !self.ended(tree, node, coming) || self.checks(tree, node, member)
+    }
+
+    // Whether a check of the member can be lent now: `verification` would
+    // make one. Nothing is built.
+    fn checks(&self, tree: &Tree, node: NodeId, member: MemberId) -> bool {
+        self.checkable(tree, node, member).is_some()
+            && self
+                .files
+                .get(&node)
+                .is_some_and(|files| files.leaves.contains_key(&member))
     }
 
     // The member's stated CRC and length, when its bytes can be checked:
@@ -255,7 +412,8 @@ impl NamespaceWriter {
     pub fn take_verification(&self, tree: &Tree) -> Option<Verification> {
         self.verifications
             .iter()
-            .find_map(|&(node, member)| self.verification(tree, node, member))
+            .find(|&&(node, member)| self.checks(tree, node, member))
+            .and_then(|&(node, member)| self.verification(tree, node, member))
     }
 
     pub fn verified(
