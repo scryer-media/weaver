@@ -32,6 +32,7 @@ mod pipeline {
             mod nameless_reversed;
             mod post_health_seats;
             mod refused_then_repaired;
+            mod restored_verdict;
             mod settled_rulings;
             mod spent;
             mod too_large;
