@@ -22,6 +22,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use weaver_graph::holds::Location;
@@ -149,6 +150,7 @@ impl Loan {
     // directory went, reads nothing, and one going when either happens
     // reads nothing more: each comes back stopped.
     pub fn run(mut self, budget: weaver_graph::Budget, shutdown: &Shutdown) -> Returned {
+        let (_running, running) = Running::enter();
         self.access.begin(shutdown);
         let given = !self.access.stopped();
         let outcome = self
@@ -157,6 +159,7 @@ impl Loan {
             .filter(|_| given)
             .map(|recovery| recovery.repair(&mut self.access, budget));
         self.access.let_go();
+        self.access.report_end(running);
         let stopped = self.access.stopped();
         let access = self.access;
         if let Some(dir) = &access.scratch {
@@ -262,16 +265,28 @@ impl Lent {
     // it to open.
     fn begin(&mut self, shutdown: &Shutdown) {
         self.shutdown = shutdown.clone();
+        // The repair's timing is gathered only for its debug line.
+        let on = tracing::enabled!(tracing::Level::DEBUG);
+        let timing = self.timing.get_mut();
+        timing.on = on;
+        if on {
+            timing.ran = Some(Instant::now());
+        }
         let Some(settled) = self.settled.take() else {
             return;
         };
+        let began = on.then(Instant::now);
         settled.wait_aside();
+        if let Some(began) = began {
+            self.timing.get_mut().settled = began.elapsed();
+        }
         // A write of the job's failed: its files are not as the loop said
         // them, so the loan reads nothing. The failure fails the job.
         if settled.unwritten() {
             self.unwritten = true;
             return;
         }
+        let began = on.then(Instant::now);
         for (node, path) in std::mem::take(&mut self.scratch_later) {
             if let Ok(file) = File::open(path) {
                 self.held_scratch.insert(node, file);
@@ -281,6 +296,9 @@ impl Lent {
             if let Some(path) = taken.spill_later.take() {
                 taken.spill = File::open(path).ok();
             }
+        }
+        if let Some(began) = began {
+            self.timing.get_mut().opened_at_begin = began.elapsed();
         }
     }
 }
@@ -348,7 +366,194 @@ pub struct Lent {
     // a read turn ends, and the loan reads nothing more and comes back
     // stopped, as it does once the shutdown starts.
     pub stop: Arc<TurnStop>,
+    // What the repair's steps cost, for its one debug line as it ends.
+    pub timing: RefCell<Timing>,
 }
+
+// What a repair's loan cost, gathered only while its debug line is on and
+// said once, as the repair ends: the time from the loan's making to its
+// thread, the wait for the job's writes, the files opened as it began, the
+// engine's own steps to its plan, each file it opened and read, its held
+// reads, and every read and repaired write it asked, before its plan and
+// after, with where the process stood at the plan and at the end.
+pub struct Timing {
+    on: bool,
+    lent: Instant,
+    ran: Option<Instant>,
+    settled: Duration,
+    opened_at_begin: Duration,
+    // The engine's steps to its plan, by name, as it told them.
+    steps: Vec<(&'static str, Duration)>,
+    // Each file the loan opened and read, in the order first opened, found
+    // by the member it is; the one read last is at hand without a lookup.
+    files: Vec<FileTiming>,
+    file_at: BTreeMap<(NodeId, MemberId), usize>,
+    current: Option<((NodeId, MemberId), usize)>,
+    held: Duration,
+    held_bytes: u64,
+    asked: Asked,
+    // Where the process stood at the repair's plan: what the repair cost
+    // after it is the difference from there to its end.
+    plan: Option<Mark>,
+}
+
+impl Default for Timing {
+    fn default() -> Self {
+        Self {
+            on: false,
+            lent: Instant::now(),
+            ran: None,
+            settled: Duration::ZERO,
+            opened_at_begin: Duration::ZERO,
+            steps: Vec::new(),
+            files: Vec::new(),
+            file_at: BTreeMap::new(),
+            current: None,
+            held: Duration::ZERO,
+            held_bytes: 0,
+            asked: Asked::default(),
+            plan: None,
+        }
+    }
+}
+
+impl Timing {
+    // The timing of the file the member is, the one read last at hand.
+    fn file(&mut self, at: (NodeId, MemberId), path: &std::path::Path) -> &mut FileTiming {
+        let index = match self.current {
+            Some((held, index)) if held == at => index,
+            _ => {
+                let files = &mut self.files;
+                let index = *self.file_at.entry(at).or_insert_with(|| {
+                    files.push(FileTiming::named(path));
+                    files.len() - 1
+                });
+                self.current = Some((at, index));
+                index
+            }
+        };
+        &mut self.files[index]
+    }
+}
+
+// One file the loan opened and read: how often, how long, how much.
+struct FileTiming {
+    name: String,
+    opens: u32,
+    open: Duration,
+    reads: u64,
+    bytes: u64,
+    read: Duration,
+}
+
+impl FileTiming {
+    fn named(path: &std::path::Path) -> Self {
+        Self {
+            name: path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            opens: 0,
+            open: Duration::ZERO,
+            reads: 0,
+            bytes: 0,
+            read: Duration::ZERO,
+        }
+    }
+}
+
+// Every read the repair asked and every repaired write it made, so far,
+// with how long each took on this thread, and the files its reads opened.
+#[derive(Clone, Copy, Default)]
+struct Asked {
+    reads: u64,
+    read_bytes: u64,
+    read: Duration,
+    writes: u64,
+    write_bytes: u64,
+    write: Duration,
+    opens: u64,
+    open: Duration,
+}
+
+impl Asked {
+    fn since(self, earlier: Self) -> Self {
+        Self {
+            reads: self.reads.saturating_sub(earlier.reads),
+            read_bytes: self.read_bytes.saturating_sub(earlier.read_bytes),
+            read: self.read.saturating_sub(earlier.read),
+            writes: self.writes.saturating_sub(earlier.writes),
+            write_bytes: self.write_bytes.saturating_sub(earlier.write_bytes),
+            write: self.write.saturating_sub(earlier.write),
+            opens: self.opens.saturating_sub(earlier.opens),
+            open: self.open.saturating_sub(earlier.open),
+        }
+    }
+
+    fn said(self) -> String {
+        format!(
+            "reads={} read_mb={} read_ms={:.1} opens={} open_ms={:.1} writes={} write_mb={} write_ms={:.1}",
+            self.reads,
+            self.read_bytes / MIB,
+            ms(self.read),
+            self.opens,
+            ms(self.open),
+            self.writes,
+            self.write_bytes / MIB,
+            ms(self.write),
+        )
+    }
+}
+
+const MIB: u64 = 1024 * 1024;
+
+// The process at one moment of a repair: its CPU, user and kernel apart,
+// the page faults it has taken, the memory the system has free, and what
+// the repair had asked by then. Taken twice per repair, at its plan and at
+// its end, on the repair's own thread.
+#[derive(Clone, Copy)]
+struct Mark {
+    at: Instant,
+    counters: Option<weaver_server_base::runtime::perf_probe::ProcessCounters>,
+    available: Option<u64>,
+    asked: Asked,
+}
+
+impl Mark {
+    fn now(asked: Asked) -> Self {
+        Self {
+            at: Instant::now(),
+            counters: weaver_server_base::runtime::perf_probe::process_counters(),
+            available: weaver_server_disk::runtime::system_probe::available_memory_bytes(),
+            asked,
+        }
+    }
+}
+
+// Repairs running in this process now, this one among them.
+static RUNNING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+struct Running;
+
+impl Running {
+    fn enter() -> (Self, u64) {
+        let now = RUNNING.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        (Self, now)
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        RUNNING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
+// The files the line names, the slowest first: no more than this many.
+const FILES_SAID: usize = 8;
 
 // What a read the loan was stopped before gives.
 fn stopped_read() -> std::io::Result<()> {
@@ -612,6 +817,7 @@ impl NamespaceWriter {
             working: self.working_volume(),
             reading: RefCell::default(),
             stop: Arc::default(),
+            timing: RefCell::default(),
         };
         let mut seen = BTreeSet::new();
         self.take_namespace(tree, namespace, &mut access, &mut seen);
@@ -899,8 +1105,20 @@ impl Lent {
         into: &mut Vec<u8>,
     ) -> bool {
         let mut open = self.open.borrow_mut();
+        let mut timing = self.timing.borrow_mut();
+        let on = timing.on;
         if open.as_ref().is_none_or(|(held, _)| *held != at) {
-            let Ok(file) = File::open(path) else {
+            let began = on.then(Instant::now);
+            let opened = File::open(path);
+            if let Some(began) = began {
+                let took = began.elapsed();
+                timing.asked.opens += 1;
+                timing.asked.open += took;
+                let file = timing.file(at, path);
+                file.opens += 1;
+                file.open += took;
+            }
+            let Ok(file) = opened else {
                 *open = None;
                 return false;
             };
@@ -911,11 +1129,122 @@ impl Lent {
         };
         let start = into.len();
         into.resize(start + index(range.len()), 0);
+        let began = on.then(Instant::now);
         let read = read_exact_at(file, range.start, &mut into[start..]).is_ok();
+        if let Some(began) = began {
+            let file = timing.file(at, path);
+            file.reads += 1;
+            file.bytes += range.len();
+            file.read += began.elapsed();
+        }
         if !read {
             into.truncate(start);
         }
         read
+    }
+
+    // A read of bytes held on scratch or spilled, for the timing line.
+    fn held_read(&self, began: Option<Instant>, len: u64) {
+        let Some(began) = began else {
+            return;
+        };
+        let mut timing = self.timing.borrow_mut();
+        timing.held += began.elapsed();
+        timing.held_bytes += len;
+    }
+
+    fn timing_on(&self) -> bool {
+        self.timing.borrow().on
+    }
+
+    // The repair has its plan: the engine's steps to it, and where the
+    // process stood then.
+    fn report_planned(&mut self, steps: &[(&'static str, Duration)]) {
+        let timing = self.timing.get_mut();
+        if !timing.on || timing.plan.is_some() {
+            return;
+        }
+        timing.steps = steps.to_vec();
+        timing.plan = Some(Mark::now(timing.asked));
+    }
+
+    // Said once, as a repair that came to a plan ends: the time from the
+    // loan's making to the plan, step by step, and from the plan to the
+    // end; what the repair read and wrote before its plan and after it;
+    // the CPU, user and kernel apart, and the page faults the process took
+    // after the plan; and the memory the system had free at the plan and
+    // at the end. Repair workers spinning for input burn user time while
+    // the reads here take long; workers faulting in memory burn kernel time
+    // with the faults. The repairs running and the pools built say what
+    // earlier work left.
+    fn report_end(&self, running: u64) {
+        use std::fmt::Write as _;
+        let timing = self.timing.borrow();
+        if !timing.on {
+            return;
+        }
+        let Some(plan) = timing.plan else {
+            return;
+        };
+        let end = Mark::now(timing.asked);
+        let ran = timing.ran.unwrap_or(timing.lent);
+        let mut engine = String::new();
+        for (name, took) in &timing.steps {
+            let _ = write!(engine, "{name}={:.1} ", ms(*took));
+        }
+        let mut slowest: Vec<&FileTiming> = timing.files.iter().collect();
+        slowest.sort_unstable_by_key(|file| std::cmp::Reverse(file.open + file.read));
+        let mut files = String::new();
+        for file in slowest.into_iter().take(FILES_SAID) {
+            let _ = write!(
+                files,
+                "[{} opens={} open_ms={:.1} reads={} bytes={} read_ms={:.1}] ",
+                file.name,
+                file.opens,
+                ms(file.open),
+                file.reads,
+                file.bytes,
+                ms(file.read),
+            );
+        }
+        let after = plan
+            .counters
+            .zip(end.counters)
+            .map(|(from, to)| (to.cpu.saturating_sub(from.cpu), from.faults.zip(to.faults)));
+        let cpu_after_plan = after.map_or_else(
+            || "-".to_string(),
+            |(cpu, _)| format!("user={:.0} kernel={:.0}", ms(cpu.user()), ms(cpu.system())),
+        );
+        let faults_after_plan = after
+            .and_then(|(_, faults)| faults)
+            .map(|(from, to)| to.saturating_sub(from));
+        let mb = |bytes: Option<u64>| bytes.map(|bytes| bytes / MIB);
+        tracing::debug!(
+            namespace = self.namespace.0,
+            set = self.set.0,
+            since_lent_ms = format_args!("{:.1}", ms(timing.lent.elapsed())),
+            to_thread_ms = format_args!("{:.1}", ms(ran.duration_since(timing.lent))),
+            settle_wait_ms = format_args!("{:.1}", ms(timing.settled)),
+            begin_open_ms = format_args!("{:.1}", ms(timing.opened_at_begin)),
+            to_plan_ms = format_args!("{:.1}", ms(plan.at.duration_since(ran))),
+            after_plan_ms = format_args!("{:.1}", ms(end.at.duration_since(plan.at))),
+            engine_ms = engine.trim_end(),
+            asked_to_plan = plan.asked.said(),
+            asked_after_plan = end.asked.since(plan.asked).said(),
+            held_read_ms = format_args!("{:.1}", ms(timing.held)),
+            held_bytes = timing.held_bytes,
+            files_read = timing.files.len(),
+            files = files.trim_end(),
+            cpu_after_plan_ms = cpu_after_plan,
+            faults_after_plan,
+            free_mb_plan = mb(plan.available),
+            free_mb_end = mb(end.available),
+            repairs_running = running,
+            pools_built = weaver_server_base::runtime::postprocess_pool::pools_built(),
+            pool_threads = rayon::current_num_threads(),
+            pool_thread = std::thread::current().name().unwrap_or("-"),
+            "graph repair timing"
+        );
     }
 }
 
@@ -1052,9 +1381,11 @@ impl Source for Lent {
         super::hooks::SCRATCH_READ_MOST.with(|most| most.set(most.get().max(len)));
         let start = into.len();
         into.resize(start + index(len), 0);
+        let began = self.timing_on().then(Instant::now);
         let read = self.in_turn(self.working.as_ref(), stopped_read, || {
             read_exact_at(file, offset, &mut into[start..])
         });
+        self.held_read(began, len);
         if read.is_err() {
             into.truncate(start);
             return false;
@@ -1078,9 +1409,11 @@ impl Source for Lent {
         };
         let start = into.len();
         into.resize(start + index(range.len()), 0);
+        let began = self.timing_on().then(Instant::now);
         let read = self.in_turn(self.working.as_ref(), stopped_read, || {
             read_exact_at(file, range.start, &mut into[start..])
         });
+        self.held_read(began, range.len());
         if read.is_err() {
             into.truncate(start);
             return false;
@@ -1101,7 +1434,9 @@ impl MemberAccess for Lent {
         }
         self.reads += 1;
         let start = into.len();
+        let began = self.timing.get_mut().on.then(Instant::now);
         let read = read_member(self, self.namespace, member, range, into);
+        self.asked_read(began, range.len());
         if !read {
             into.truncate(start);
         }
@@ -1112,7 +1447,18 @@ impl MemberAccess for Lent {
         if self.stopped() {
             return;
         }
+        let began = self.timing.get_mut().on.then(Instant::now);
         self.repaired.write(member, offset, bytes);
+        if let Some(began) = began {
+            let asked = &mut self.timing.get_mut().asked;
+            asked.writes += 1;
+            asked.write_bytes += bytes.len() as u64;
+            asked.write += began.elapsed();
+        }
+    }
+
+    fn planned(&mut self, steps: &[(&'static str, Duration)]) {
+        self.report_planned(steps);
     }
 
     fn found_damaged(&mut self, member: MemberId, range: ByteRange) {
@@ -1190,10 +1536,25 @@ impl MemberAccess for Lent {
             return false;
         };
         let start = into.len();
+        let began = self.timing.get_mut().on.then(Instant::now);
         let read = read_member(self, parent, member, within, into);
+        self.asked_read(began, within.len());
         if !read {
             into.truncate(start);
         }
         read
+    }
+}
+
+impl Lent {
+    // A read the repair asked, for the timing line.
+    fn asked_read(&mut self, began: Option<Instant>, len: u64) {
+        let Some(began) = began else {
+            return;
+        };
+        let asked = &mut self.timing.get_mut().asked;
+        asked.reads += 1;
+        asked.read_bytes += len;
+        asked.read += began.elapsed();
     }
 }

@@ -281,6 +281,19 @@ pub fn detect_total_memory_bytes() -> Option<u64> {
     })
 }
 
+// The physical memory the system has free to hand out now, where reading
+// it is one cheap call: Windows and Linux. `None` elsewhere.
+pub fn available_memory_bytes() -> Option<u64> {
+    #[cfg(any(windows, target_os = "linux"))]
+    {
+        detect_memory_bytes().map(|(_, available)| available)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        None
+    }
+}
+
 // Returns (total_bytes, available_bytes).
 fn detect_memory_bytes() -> Option<(u64, u64)> {
     #[cfg(target_os = "macos")]

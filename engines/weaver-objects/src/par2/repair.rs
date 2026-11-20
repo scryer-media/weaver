@@ -94,9 +94,11 @@ pub(super) fn repair_set(
     access: &mut dyn MemberAccess,
 ) -> SetRepair {
     let mut read = false;
+    let began = std::time::Instant::now();
     for (file, member) in known_by_slices(state, access, &mut read) {
         state.know(file, member);
     }
+    let bound = began.elapsed();
     let Some(index) = state.usable() else {
         return SetRepair::clean(read);
     };
@@ -110,6 +112,7 @@ pub(super) fn repair_set(
     // it more passes over every source slice. The slices the verification
     // keeps sit on top of it, at most half the limit again.
     let mut kept = Kept::new(memory_limit / 2);
+    let began = std::time::Instant::now();
     let mut validity: Vec<(FileId, Vec<bool>)> = index
         .recovery_file_ids
         .iter()
@@ -126,6 +129,7 @@ pub(super) fn repair_set(
             )
         })
         .collect();
+    let verified = began.elapsed();
     // Every slice of a bound member that is not valid is written, copied or
     // rebuilt, so that many slices is what this repair writes: once into
     // its staged output, and once more into the member while the staged
@@ -142,7 +146,9 @@ pub(super) fn repair_set(
     // are done before par2-rs starts.
     let working = memory_limit.saturating_sub(kept.bytes);
     let mut donors = BTreeMap::new();
+    let began = std::time::Instant::now();
     let copied = copy_held(state, index, &mut validity, working, access, &mut donors);
+    let copying = began.elapsed();
     proven.retain(|(member, range)| {
         !copied.iter().any(|(into, slice)| {
             into == member && slice.start <= range.start && range.end <= slice.end
@@ -208,15 +214,23 @@ pub(super) fn repair_set(
     // A block whose payload does not read while the repair spends it is
     // forgotten, as one that fails its check is, and the plan made again
     // from the blocks left: each time round there is one block fewer.
+    let mut spending = std::time::Duration::ZERO;
+    let mut planning = std::time::Duration::ZERO;
+    let mut told = false;
     loop {
         let plan = loop {
+            let began = std::time::Instant::now();
             spend(state, slice_size, wanted, &mut set.recovery_slices, access);
+            spending += began.elapsed();
             let available = set.recovery_slices.len() as u64;
             if available < wanted {
                 return short(available, access);
             }
+            let began = std::time::Instant::now();
             let verification = verification(&set, &validity, damaged);
-            match plan_repair_with_memory_limit(&set, &verification, Some(memory_limit)) {
+            let planned = plan_repair_with_memory_limit(&set, &verification, Some(memory_limit));
+            planning += began.elapsed();
+            match planned {
                 Ok(plan) => break plan,
                 Err(Par2Error::InsufficientRecoveryData { deficit, .. }) => {
                     wanted = available + u64::from(deficit);
@@ -231,6 +245,16 @@ pub(super) fn repair_set(
                 }
             }
         };
+        if !told {
+            told = true;
+            access.planned(&[
+                ("bind", bound),
+                ("verify", verified),
+                ("copy", copying),
+                ("spend", spending),
+                ("plan", planning),
+            ]);
+        }
         let mut files = Files {
             access: RefCell::new(&mut *access),
             members: &members,
