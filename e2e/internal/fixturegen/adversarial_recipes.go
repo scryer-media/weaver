@@ -176,7 +176,7 @@ func AdversarialRecipes() []Recipe {
 		},
 		{
 			Slug: "adv-zip-directory-memory-lie", Family: "adversarial", ByteReproducible: true,
-			Notes: "The oversized directory reports a size of one byte. Invalid directory metadata must not reopen the whole archive through an unbounded library fallback.",
+			Notes: "The oversized directory reports a size of one byte. The zip store keeps the archive: the directory is damaged, and the members its local headers place are delivered. Nothing reopens the whole archive through an unbounded library fallback.",
 			Build: sequence(
 				writeAdversarialZip("directory.zip", oversizedDirectoryEntries()),
 				func(_ context.Context, env *Env) error {

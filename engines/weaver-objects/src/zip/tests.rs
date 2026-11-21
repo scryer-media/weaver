@@ -450,8 +450,7 @@ fn a_walk_whose_headers_the_directory_contradicts_goes_to_an_engine() {
     assert!(has(&owner, &Emit::NeedsEngine(Why::Unsupported)));
 }
 
-// The archive with its end record saying a directory of one byte, which the
-// end record does not follow.
+// The archive with its end record saying a directory of one byte.
 fn one_byte_directory() -> Vec<u8> {
     let mut bytes = archive();
     let end = records::find_end(&bytes).unwrap().at as usize;
@@ -459,25 +458,26 @@ fn one_byte_directory() -> Vec<u8> {
     bytes
 }
 
+// A directory size that lies is the store's to read, not an engine's: the
+// one byte it names does not parse, so it is said damaged, and the members
+// the walk said stand.
 #[test]
-fn a_directory_the_end_record_does_not_follow_goes_to_an_engine_after_a_walk() {
-    let mut owner = Owner::single(Zip::new(), one_byte_directory());
+fn a_directory_said_one_byte_long_is_damaged_and_the_walked_members_stand() {
+    let bytes = one_byte_directory();
+    let end = records::find_end(&bytes).unwrap();
+    let mut owner = Owner::single(Zip::new(), bytes);
     owner.pull = Pull::Unseekable;
     owner.frames(0, 4096);
     owner.close(0);
-    // The walk said the members before the end record arrived.
     assert_eq!(owner.members.len(), files().len());
-    assert_eq!(owner.said, vec![Emit::NeedsEngine(Why::Unsupported)]);
-    assert!(owner.object.gone);
-}
-
-#[test]
-fn a_directory_the_end_record_does_not_follow_goes_to_an_engine_before_any_member() {
-    let mut owner = Owner::single(Zip::new(), one_byte_directory());
-    owner.whole(4096);
-    assert_eq!(owner.said, vec![Emit::NeedsEngine(Why::Unsupported)]);
-    assert!(owner.members.is_empty());
-    assert!(owner.object.gone);
+    assert_eq!(
+        owner.said,
+        vec![Emit::Damaged {
+            volume: VolumeIndex(0),
+            range: ByteRange::at(end.offset, 1)
+        }]
+    );
+    assert!(!owner.object.gone);
 }
 
 #[test]
