@@ -779,6 +779,9 @@ struct Counts {
     releases: [AtomicU64; LEDGERS],
     // Writers waiting for room on the ledger's root.
     waiters: [AtomicU64; LEDGERS],
+    // What jobs held for a full disk wait for on the ledger's root and have
+    // not been promised: a new start leaves it aside, a write does not.
+    waiting: [AtomicU64; LEDGERS],
     // The filesystem the root's directory lies on as its sampler last found
     // it, plus one: zero while it is not known.
     device: [AtomicU64; LEDGERS],
@@ -1045,6 +1048,7 @@ impl DiskLedger {
                 held: 0,
                 promise: self,
                 need,
+                waiters: true,
             }],
             reserve,
         )
@@ -1081,7 +1085,7 @@ impl DiskLedger {
                 reserve,
                 part.held,
                 need,
-                part.fresh,
+                (part.fresh, part.waiters),
             ) {
                 StartBooking::Booked => {}
                 StartBooking::Short { room, .. } => {
@@ -1114,22 +1118,60 @@ impl DiskLedger {
 
     // The room above `reserve` a start would be judged by now: what a
     // fresh, good reading of `reader` leaves less every promise on the
-    // filesystem and the room `held` beside the ledger there. `None`
+    // filesystem and the room `held` beside the ledger there, and, with
+    // `waiters`, less what jobs held for a full disk there wait for. `None`
     // without one. It reads and books nothing.
     pub fn start_room_now(
         &self,
         reader: &CapacityReader,
         reserve: u64,
         held: u64,
-        fresh: bool,
+        (fresh, waiters): (bool, bool),
     ) -> Option<u64> {
         if !fresh {
             return None;
         }
         let capacity = reader.current();
         capacity.reading().filter(|reading| !reading.stale)?;
+        let held = held.saturating_add(self.waiting_aside(waiters));
         self.free_with(|| capacity)
             .map(|free| free.bytes.saturating_sub(reserve.saturating_add(held)))
+    }
+
+    // What jobs held for a full disk wait for on this ledger's filesystem
+    // and have not been promised: what a start that leaves it aside
+    // subtracts, `waiters`; nothing for one that does not.
+    fn waiting_aside(&self, waiters: bool) -> u64 {
+        if waiters {
+            self.summed(&self.counts.waiting)
+        } else {
+            0
+        }
+    }
+
+    // A job held for a full disk on this ledger's root waits for `bytes`
+    // more: a new start leaves them aside from here.
+    pub fn hold_waiting(&self, bytes: u64) {
+        if bytes > 0 {
+            self.counts.waiting[self.index].fetch_add(bytes, Ordering::AcqRel);
+        }
+    }
+
+    // A job held for a full disk here waits no more for `bytes`: let go,
+    // promised them, paused, or gone. The room rings as a promise given
+    // back does, so a start waiting is judged again.
+    pub fn end_waiting(&self, bytes: u64) {
+        if bytes > 0 {
+            saturating_take(&self.counts.waiting[self.index], bytes);
+            self.counts.releases[self.index].fetch_add(1, Ordering::AcqRel);
+            self.rang();
+        }
+    }
+
+    // What jobs held for a full disk wait for on this ledger's filesystem.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn waiting(&self) -> u64 {
+        self.summed(&self.counts.waiting)
     }
 
     // `bytes` more are promised.
@@ -1339,18 +1381,23 @@ pub struct StartPart<'a> {
     pub held: u64,
     pub promise: &'a DiskLedger,
     pub need: u64,
+    // The start leaves aside what jobs held for a full disk on that disk
+    // wait for: a new start does; a held job's own start again does not,
+    // since it is one of them.
+    pub waiters: bool,
 }
 
 // Whether `need` fits on `ledger` by a fresh, good reading of `reader`:
 // never past the disk's size above `reserve`, and now only in the room the
-// ledger leaves above `reserve` and `held`.
+// ledger leaves above `reserve` and `held`, and, with `waiters`, above what
+// jobs held for a full disk there wait for. Read under the booking lock.
 fn start_room(
     ledger: &DiskLedger,
     reader: &CapacityReader,
     reserve: u64,
     held: u64,
     need: u64,
-    fresh: bool,
+    (fresh, waiters): (bool, bool),
 ) -> StartBooking {
     if !fresh {
         return StartBooking::Unread;
@@ -1370,6 +1417,7 @@ fn start_room(
     let Some(free) = ledger.free_with(|| capacity) else {
         return StartBooking::Unread;
     };
+    let held = held.saturating_add(ledger.waiting_aside(waiters));
     let room = free.bytes.saturating_sub(reserve.saturating_add(held));
     if need > room {
         return StartBooking::Short {

@@ -278,6 +278,45 @@ impl TorrentService {
         released
     }
 
+    // The root whose start wait keeps `torrent`, if one does: kept from
+    // starting, or its download held, on a root's disk.
+    pub(super) fn start_kept_on(torrent: &Live) -> Option<usize> {
+        if !matches!(
+            torrent.disk_held,
+            Some(DiskHeld::Starting | DiskHeld::Fetching)
+        ) {
+            return None;
+        }
+        match torrent.intake.as_ref()?.room().place()?.disk {
+            Disk::Root(root) => Some(root_index(root)),
+            Disk::Path(_) => None,
+        }
+    }
+
+    // A walk gave every torrent its turn, and `kept` says which roots'
+    // start waits still keep one: a wait that keeps none, its last torrent
+    // paused, removed or let go, ends, and its disks are no longer waited
+    // on. Called under `live`, so no keep between the walk and this is
+    // missed.
+    pub(super) fn end_unkept_start_holds(&self, kept: [bool; 3]) {
+        let Some(capacity) = &self.inner.env.capacity else {
+            return;
+        };
+        let mut ended = false;
+        let mut held = locked(&self.inner.start_held);
+        for root in StorageRoot::ALL {
+            let at = root_index(root);
+            if held[at].held() && !kept[at] {
+                held[at].wait(capacity, self.start_rule(root), false);
+                ended = true;
+            }
+        }
+        drop(held);
+        if ended {
+            self.inner.disk_waits_moved.send_modify(|moved| *moved += 1);
+        }
+    }
+
     // Where `torrent`, whose turn lets it run, stands at the start rule on
     // the disk its folder lies on. One with bytes to fetch waits for that
     // disk to be known, since its pieces book there. Then it starts only
@@ -486,8 +525,15 @@ impl TorrentService {
             if !same {
                 return;
             }
+            let was = torrent.disk_held;
             service.rejudge_start(torrent);
+            let moved = torrent.disk_held != was;
             drop(live);
+            // A hold the judgement began or ended is a wait moved, heard as
+            // one the start rule's wait began is.
+            if moved {
+                service.inner.disk_waits_moved.send_modify(|moved| *moved += 1);
+            }
             service.publish_job(job_id).await;
         }));
     }

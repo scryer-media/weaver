@@ -465,6 +465,9 @@ pub(super) struct Gathered {
     // The looks for disks the walks began, which ask one pass between
     // them as the last ends.
     looks: Option<std::sync::Arc<PlaceBatch>>,
+    // By root, whether a torrent the walk gave its turn is still kept by
+    // that root's start wait.
+    start_kept: [bool; 3],
     // The walks made, and the writes queued or made, counted in tests.
     walks: u64,
     writes: u64,
@@ -558,6 +561,7 @@ impl TorrentService {
                 };
                 self.walk(&mut live, None, ON_TURNS, &cx, &mut gathered)
                     .await;
+                self.end_unkept_start_holds(std::mem::take(&mut gathered.start_kept));
             }
         }
         // Their checkpoints were queued with the walk's.
@@ -610,6 +614,7 @@ impl TorrentService {
             ..cx
         };
         self.walk(&mut live, None, then, &cx, &mut gathered).await;
+        self.end_unkept_start_holds(std::mem::take(&mut gathered.start_kept));
         debug_assert!(gathered.taken.is_empty() && gathered.seed.is_empty());
         gathered.walks
     }
@@ -830,6 +835,9 @@ impl TorrentService {
                 {
                     torrent.disk_held = None;
                     torrent.start_refused = None;
+                }
+                if let Some(at) = Self::start_kept_on(torrent) {
+                    gathered.start_kept[at] = true;
                 }
                 if run && torrent.start_waits_on_move() {
                     return None;

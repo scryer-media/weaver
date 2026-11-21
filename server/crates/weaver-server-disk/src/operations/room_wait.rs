@@ -828,6 +828,10 @@ pub fn ever_downloaded(downloaded_bytes: u64) -> bool {
 pub struct StartCheck {
     pub root: StorageRoot,
     pub reserve: u64,
+    // A new start: it leaves aside what jobs held for a full disk wait for
+    // there. A held job's own start again is judged without it, as one of
+    // them, ordered among them by the promises each is given as it goes.
+    pub waiters: bool,
 }
 
 impl StartCheck {
@@ -863,6 +867,7 @@ impl StartCheck {
                 held: held_on(capacity, *judged),
                 promise: capacity.ledger(*promised),
                 need: *need,
+                waiters: self.waiters,
             })
             .collect();
         DiskLedger::book_start_on(&parts, self.reserve)
@@ -891,7 +896,7 @@ impl StartCheck {
             &capacity.reader(self.root),
             self.reserve,
             held_on(capacity, self.root),
-            capacity.fresh(self.root),
+            (capacity.fresh(self.root), self.waiters),
         )
     }
 

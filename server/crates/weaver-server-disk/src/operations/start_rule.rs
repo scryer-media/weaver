@@ -101,6 +101,7 @@ impl StartRule {
         StartCheck {
             root: self.working,
             reserve: self.reserve,
+            waiters: true,
         }
     }
 
@@ -108,6 +109,7 @@ impl StartRule {
         StartCheck {
             root: self.output,
             reserve: self.reserve,
+            waiters: true,
         }
     }
 
@@ -131,7 +133,34 @@ impl StartRule {
         need: u64,
         size: u64,
     ) -> Result<(u64, u64), StartBooking> {
-        let check = self.check();
+        self.book_judged(self.check(), capacity, read, need, size)
+    }
+
+    // [`Self::book_on`] for a job held for a full disk starting again: it
+    // is one of those whose wait a new start leaves aside, so its start is
+    // judged without them.
+    pub fn book_held_on(
+        self,
+        capacity: &StorageCapacity,
+        read: StorageRoot,
+        need: u64,
+        size: u64,
+    ) -> Result<(u64, u64), StartBooking> {
+        let check = StartCheck {
+            waiters: false,
+            ..self.check()
+        };
+        self.book_judged(check, capacity, read, need, size)
+    }
+
+    fn book_judged(
+        self,
+        check: StartCheck,
+        capacity: &StorageCapacity,
+        read: StorageRoot,
+        need: u64,
+        size: u64,
+    ) -> Result<(u64, u64), StartBooking> {
         let other = self.other_disk(capacity);
         let output = if other { size.max(need) } else { 0 };
         let answer = if other {
@@ -326,5 +355,133 @@ impl StartWait {
             self.wait(capacity, rule, false);
         }
         ring
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::operations::disk::DiskSpace;
+
+    const RESERVE: u64 = 1 << 20;
+    // What a job held for a full disk waits for.
+    const WAITS: u64 = 60;
+
+    // One disk under every root, read with `RESERVE + 100` free.
+    fn one_disk(dir: &Path) -> StorageCapacity {
+        let capacity = StorageCapacity::with_probe(
+            [0, 1, 2].map(|_| dir.to_path_buf()),
+            Duration::from_secs(365 * 24 * 60 * 60),
+            Arc::new(|_: &Path| {
+                Ok(DiskSpace {
+                    total_bytes: 1 << 40,
+                    available_bytes: RESERVE + 100,
+                })
+            }),
+        );
+        for root in StorageRoot::ALL {
+            capacity.wait_for_probes(root, 1);
+        }
+        capacity
+    }
+
+    fn rule() -> StartRule {
+        StartRule {
+            working: StorageRoot::Intermediate,
+            output: StorageRoot::Intermediate,
+            reserve: RESERVE,
+        }
+    }
+
+    // A held job waiting for N keeps out a new start of S when free less
+    // the reserve less N is under S, and lets one in that fits beside N.
+    // The held job's own start again is not kept out by it, and neither is
+    // a write.
+    #[test]
+    fn a_new_start_leaves_aside_what_a_held_job_waits_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let capacity = one_disk(dir.path());
+        let ledger = capacity.ledger(StorageRoot::Intermediate);
+        ledger.hold_waiting(WAITS);
+
+        let root = StorageRoot::Intermediate;
+        assert_eq!(
+            rule().book_on(&capacity, root, 41, 41),
+            Err(StartBooking::Short {
+                room: 40,
+                need: 41,
+                part: 0
+            }),
+            "100 free past the reserve, 60 of it waited for"
+        );
+        assert_eq!(rule().check().room_now(&capacity), Some(40));
+        assert_eq!(rule().book_on(&capacity, root, 40, 40), Ok((40, 0)));
+        rule().give_back(&capacity, 40, 0);
+
+        assert_eq!(
+            rule().book_held_on(&capacity, root, 100, 100),
+            Ok((100, 0)),
+            "a held job's start again is judged without the waits"
+        );
+        rule().give_back(&capacity, 100, 0);
+        let reader = capacity.reader(root);
+        assert_eq!(
+            ledger.book(&reader, RESERVE, 100, 0),
+            Some(0),
+            "a write may take the room a held job waits for"
+        );
+        ledger.release(100);
+    }
+
+    // Let go and promised its figure, the held job's wait comes off in the
+    // same step: a start counts the room once.
+    #[test]
+    fn a_held_job_let_go_is_counted_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let capacity = one_disk(dir.path());
+        let ledger = capacity.ledger(StorageRoot::Intermediate);
+        ledger.hold_waiting(WAITS);
+        assert_eq!(rule().check().room_now(&capacity), Some(100 - WAITS));
+
+        ledger.promise(WAITS);
+        ledger.end_waiting(WAITS);
+        assert_eq!(ledger.waiting(), 0);
+        assert_eq!(
+            rule().check().room_now(&capacity),
+            Some(100 - WAITS),
+            "promised, not also waited for"
+        );
+        ledger.release(WAITS);
+        assert_eq!(rule().check().room_now(&capacity), Some(100));
+    }
+
+    // A start kept out by a held job's wait is woken when that wait ends,
+    // as by a promise given back, though the disk reads as before.
+    #[test]
+    fn a_start_waiting_wakes_when_the_hold_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let capacity = one_disk(dir.path());
+        let ledger = capacity.ledger(StorageRoot::Intermediate);
+        ledger.hold_waiting(WAITS);
+        let refused = StartRefused::of(
+            rule()
+                .book_on(&capacity, StorageRoot::Intermediate, 41, 41)
+                .unwrap_err(),
+            41,
+        )
+        .unwrap();
+        let mut wait = StartWait::default();
+        wait.kept(&capacity, rule(), refused);
+        assert!(wait.held());
+        assert!(!wait.ring(&capacity, rule()), "nothing changed");
+
+        ledger.end_waiting(WAITS);
+        assert!(wait.ring(&capacity, rule()), "the hold ended");
+        assert!(!wait.held());
+        assert!(!ledger.waited_on());
     }
 }

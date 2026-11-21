@@ -263,7 +263,7 @@ pub fn complete_room_now(pipeline: &Pipeline) -> Option<u64> {
         &capacity.reader(StorageRoot::Complete),
         0,
         0,
-        true,
+        (true, false),
     )
 }
 
