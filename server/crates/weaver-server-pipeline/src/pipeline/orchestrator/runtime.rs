@@ -222,10 +222,13 @@ impl Pipeline {
         ));
         // Each volume's first write rate comes from a probe queued on its
         // writer; the figures an earlier run kept are read here, off the
-        // runtime. A pipeline under test probes nothing, nor does one run
-        // with `WEAVER_VOLUME_WRITE_PROBE=off`.
+        // runtime. A pipeline under test probes nothing, whether the test
+        // is built into this crate or drives it through the test fixtures,
+        // nor does one run with `WEAVER_VOLUME_WRITE_PROBE=off`.
         let volume_probes = Arc::new(
-            if cfg!(test) || weaver_server_disk::operations::disk::volume_write_probe_disabled() {
+            if cfg!(any(test, feature = "pipeline-test-fixtures"))
+                || weaver_server_disk::operations::disk::volume_write_probe_disabled()
+            {
                 crate::pipeline::graph::disk::VolumeProbes::none()
             } else {
                 let data_dir = data_dir.clone();
