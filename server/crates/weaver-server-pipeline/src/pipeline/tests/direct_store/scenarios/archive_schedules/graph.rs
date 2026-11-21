@@ -655,6 +655,17 @@ fn file_waits(pipeline: &Pipeline) -> bool {
         .is_some_and(|job| !job.writer().waiting().is_empty())
 }
 
+// The member files of the job that wait to move, and the names they want.
+type Waiting = Vec<(weaver_graph::NodeId, weaver_graph::MemberId, String)>;
+
+fn waiting_files(pipeline: &Pipeline) -> Waiting {
+    pipeline
+        .graph_jobs
+        .get(&JOB)
+        .map(|job| job.writer().waiting())
+        .unwrap_or_default()
+}
+
 // The database files under `from` replace those under `to`: the main file
 // and its write-ahead log. The shared-memory index goes, and the next open
 // builds it again from the log.
@@ -712,11 +723,58 @@ impl MoveCrash {
         }
     }
 
-    // The process dies the first time a member's file waits to move, with
-    // the move in the schedule's state: the checkpoint naming where the file
-    // goes rolled back, committed with its word unheard, or heard so the file
-    // moved and the checkpoint saying so rolled back. Returns the pipeline
-    // that goes on, and the status the job went down with when it did not
+    // An unrecorded move, if hearing what the job has not heard yet, the
+    // commits' word the turns kept back and the runs' mail, moves a waiting
+    // file now: the files that waited, and what the job held only in memory,
+    // with the database as it stood before any of it was heard kept in
+    // `kept`. When no file moves this is not the point: all of it stays
+    // heard, as the next turn would hear it, a repair's answer the schedule
+    // holds stays held, and the move is still to come.
+    async fn unrecorded(
+        pipeline: &mut Pipeline,
+        root: &std::path::Path,
+        kept: &std::path::Path,
+        turns: &mut Turns,
+    ) -> Option<(Waiting, Vec<(u32, u32)>)> {
+        pipeline.db.flush_write_queue().await.unwrap();
+        let mut unheard = std::mem::take(&mut turns.written);
+        unheard.extend(pipeline.graph_runs.waiting());
+        if unheard.is_empty() {
+            return None;
+        }
+        let waiting = waiting_files(pipeline);
+        copy_database(root, kept);
+        let in_memory = pipeline
+            .graph_jobs
+            .get(&JOB)
+            .map(|job| job.in_memory())
+            .unwrap_or_default();
+        let mut held = Vec::new();
+        for said in unheard {
+            if turns.answers == Answers::Held && matches!(said.heard, Heard::Repaired(_)) {
+                held.push(said);
+            } else {
+                pipeline.graph_run_said(said);
+            }
+        }
+        let still = waiting_files(pipeline);
+        if waiting.iter().all(|file| still.contains(file)) {
+            turns.held.extend(held);
+            return None;
+        }
+        // The process dies here, so nothing is held back from it.
+        for said in held {
+            pipeline.graph_run_said(said);
+        }
+        Some((waiting, in_memory))
+    }
+
+    // The process dies at a move in the schedule's state: the first time a
+    // member's file waits, with the checkpoint naming where the file goes
+    // rolled back or committed with its word unheard; or the first time
+    // what the job has not heard moves a waiting file once heard, with the
+    // checkpoint saying so rolled back. Returns the pipeline that
+    // goes on, and the status the job went down with when it did not
     // restore. The commits' word the turns kept back dies with the process,
     // or is heard first when the commit's word is.
     async fn crash(
@@ -729,6 +787,14 @@ impl MoveCrash {
         let Some(state) = self.state.filter(|_| file_waits(&pipeline)) else {
             return (pipeline, None);
         };
+        let kept = tempfile::tempdir().unwrap();
+        let mut unrecorded = None;
+        if state == MoveState::Unrecorded {
+            unrecorded = Self::unrecorded(&mut pipeline, root.path(), kept.path(), turns).await;
+            if unrecorded.is_none() {
+                return (pipeline, None);
+            }
+        }
         self.state = None;
         let written = std::mem::take(&mut turns.written);
         // No crash is still to come, so nothing is kept back from here on:
@@ -736,12 +802,10 @@ impl MoveCrash {
         // before it goes, and a word kept back would never reach it.
         turns.holds_written = false;
         pipeline.db.flush_write_queue().await.unwrap();
-        let waiting = pipeline
-            .graph_jobs
-            .get(&JOB)
-            .map(|job| job.writer().waiting())
-            .unwrap_or_default();
-        let kept = tempfile::tempdir().unwrap();
+        let waiting = match &unrecorded {
+            Some((waiting, _)) => waiting.clone(),
+            None => waiting_files(&pipeline),
+        };
         let back_to = match state {
             MoveState::Uncommitted => {
                 for article in self.since.drain(..) {
@@ -751,30 +815,17 @@ impl MoveCrash {
             }
             MoveState::Unheard => None,
             MoveState::Unrecorded => {
-                copy_database(root.path(), kept.path());
-                // The job comes back to the database kept here: what it held
-                // only in memory now is not on disk by that database's
-                // account, wherever the steps the commit's word lets run
-                // then write it.
-                if let Some(job) = pipeline.graph_jobs.get(&JOB) {
-                    for article in job.in_memory() {
-                        run.delivered.remove(&article);
-                    }
+                // The job comes back to the database kept before any of it
+                // was heard: what it held only in memory then is not on disk
+                // by that database's account, wherever the steps that ran
+                // since then write it.
+                for article in unrecorded.into_iter().flat_map(|(_, in_memory)| in_memory) {
+                    run.delivered.remove(&article);
                 }
                 for said in written {
                     pipeline.graph_run_said(said);
                 }
                 pipeline.hear_graph_runs();
-                let still = pipeline
-                    .graph_jobs
-                    .get(&JOB)
-                    .map(|job| job.writer().waiting())
-                    .unwrap_or_default();
-                assert!(
-                    waiting.iter().any(|file| !still.contains(file)),
-                    "the commit's word moves a waiting file: {waiting:?} still {still:?}: {:?}",
-                    run.trace
-                );
                 Some(kept.path())
             }
         };
