@@ -737,6 +737,48 @@ fn every_weaver_state_maps_to_one_client_state() {
             },
             "error",
         ),
+        // A seed Weaver holds is queued, never stopped: the schedule's hold,
+        // a speed test's, and a stop that is neither an error nor a met goal
+        // (a wind-down, torrents off). The user's own hold is stopped.
+        (
+            TorrentView {
+                completed_at_ms: done,
+                paused_by: Some(HoldOrigin::Scheduled),
+                ..view(TorrentState::Queued)
+            },
+            "queuedUP",
+        ),
+        (
+            TorrentView {
+                completed_at_ms: done,
+                paused_by: Some(HoldOrigin::SpeedTest),
+                ..view(TorrentState::Queued)
+            },
+            "queuedUP",
+        ),
+        (
+            TorrentView {
+                paused_by: Some(HoldOrigin::Manual),
+                ..view(TorrentState::Queued)
+            },
+            "stoppedDL",
+        ),
+        (
+            TorrentView {
+                completed_at_ms: done,
+                paused_by: Some(HoldOrigin::Manual),
+                ..view(TorrentState::Queued)
+            },
+            "stoppedUP",
+        ),
+        (
+            TorrentView {
+                completed_at_ms: done,
+                ..view(TorrentState::Stopped)
+            },
+            "queuedUP",
+        ),
+        (view(TorrentState::Stopped), "queuedDL"),
     ];
     for (view, expected) in cases {
         assert_eq!(state(&view), expected, "{:?}", view.state);
@@ -1007,6 +1049,140 @@ fn share_limits_report_the_torrents_own_and_those_in_force() {
     // Not yet complete: no time seeding, and last active when added.
     assert_eq!(own["seeding_time"], 0);
     assert_eq!(own["last_activity"], 1_700_000_000);
+    // A goal a tracker rule or category puts in force reads as its number,
+    // `-1` where it puts none, never `-2`: `-2` would send a client to the
+    // global preference, which is not the limit in force.
+    let ruled = info(
+        &TorrentView {
+            seeding_policy: Seeding {
+                ratio_goal: Some(2.0),
+                seed_time_goal_minutes: None,
+                inactive_goal_minutes: Some(30),
+                ..Seeding::default()
+            },
+            seeding_levels: weaver_server_core::torrents::service::SeedingLevels {
+                ratio_goal: Level::TrackerRule,
+                seed_time_goal_minutes: Level::TrackerRule,
+                inactive_goal_minutes: Level::Category,
+                ..Default::default()
+            },
+            ..view(TorrentState::Seeding)
+        },
+        CallerScope::Admin,
+    );
+    assert_eq!(ruled["ratio_limit"], 2.0);
+    assert_eq!(ruled["seeding_time_limit"], -1);
+    assert_eq!(ruled["inactive_seeding_time_limit"], 30);
+    assert_eq!(ruled["max_ratio"], 2.0);
+    assert_eq!(ruled["max_seeding_time"], -1);
+    assert_eq!(ruled["max_inactive_seeding_time"], 30);
+}
+
+// Sonarr's qBittorrent removal check, as its source has it
+// (QBittorrent.cs:283-288, 712-760): the torrent must be `pausedUP` or
+// `stoppedUP`, and past its seed limit, which is the torrent's own
+// `ratio_limit` when it is zero or more, else the global `max_ratio` when it
+// is `-2`; the same for the seeding time limit. Sonarr reads the seeding
+// time from the torrent's properties; here it is the row's.
+fn arr_removes(row: &Value, preferences: &Value) -> bool {
+    let removable_state = matches!(row["state"].as_str(), Some("pausedUP" | "stoppedUP"));
+    removable_state && arr_has_reached_seed_limit(row, preferences)
+}
+
+fn arr_has_reached_seed_limit(row: &Value, preferences: &Value) -> bool {
+    let number = |value: &Value| value.as_f64().unwrap();
+    let ratio = number(&row["ratio"]);
+    let ratio_limit = number(&row["ratio_limit"]);
+    if ratio_limit >= 0.0 {
+        if ratio_limit - ratio <= 0.001 {
+            return true;
+        }
+    } else if ratio_limit == -2.0
+        && preferences["max_ratio_enabled"] == true
+        && number(&preferences["max_ratio"]) - ratio <= 0.001
+    {
+        return true;
+    }
+    let time_limit = number(&row["seeding_time_limit"]);
+    let seconds = if time_limit >= 0.0 {
+        Some(time_limit * 60.0)
+    } else if time_limit == -2.0 && preferences["max_seeding_time_enabled"] == true {
+        Some(number(&preferences["max_seeding_time"]) * 60.0)
+    } else {
+        None
+    };
+    seconds.is_some_and(|limit| number(&row["seeding_time"]) >= limit)
+}
+
+// A seed held by the schedule at ratio 1.2, under a global goal of 1.0 and
+// a tracker rule's goal of 2.0, is not one Sonarr removes: it reads as
+// queued, with the rule's 2.0 as its limit. Once it meets 2.0 and stops, it
+// is. A goal of 1.0 an Arr set on the torrent itself, under the rule's 2.0,
+// is met at 1.0.
+#[test]
+fn an_arr_removes_a_seed_only_once_the_limit_in_force_is_met() {
+    let shared = config(Path::new("/complete"));
+    let mut settings = shared.try_write().unwrap();
+    settings.seeding = Some(SeedingPolicy {
+        ratio_goal: Leaf::Set(1.0),
+        ..SeedingPolicy::default()
+    });
+    let preferences = preferences(&settings, false);
+    assert_eq!(preferences["max_ratio"], 1.0);
+    let ruled = |state: TorrentState, ratio: f64| TorrentView {
+        ratio,
+        completed_at_ms: Some(1_700_000_100_000),
+        seeding_policy: Seeding {
+            ratio_goal: Some(2.0),
+            ..Seeding::default()
+        },
+        seeding_levels: weaver_server_core::torrents::service::SeedingLevels {
+            ratio_goal: Level::TrackerRule,
+            ..Default::default()
+        },
+        ..view(state)
+    };
+    let row = |view: &TorrentView| info(view, CallerScope::Admin);
+
+    let held = TorrentView {
+        paused_by: Some(weaver_server_core::jobs::HoldOrigin::Scheduled),
+        ..ruled(TorrentState::Queued, 1.2)
+    };
+    assert_eq!(row(&held)["state"], "queuedUP");
+    assert_eq!(row(&held)["ratio_limit"], 2.0);
+    assert!(!arr_removes(&row(&held), &preferences));
+    // A seed Weaver stopped for a reason of its own reads as queued too.
+    assert!(!arr_removes(&row(&ruled(TorrentState::Stopped, 1.2)), &preferences));
+    // One the user stopped short of the rule's goal is stopped, not removed.
+    let paused = ruled(TorrentState::Paused, 1.2);
+    assert_eq!(row(&paused)["state"], "stoppedUP");
+    assert!(!arr_removes(&row(&paused), &preferences));
+
+    let met = TorrentView {
+        stated: Some(status::Stated::GoalMet),
+        ..ruled(TorrentState::Stopped, 2.0)
+    };
+    assert_eq!(row(&met)["state"], "stoppedUP");
+    assert!(arr_removes(&row(&met), &preferences));
+
+    let own = TorrentView {
+        stated: Some(status::Stated::GoalMet),
+        seeding_override: Some(SeedingPolicy {
+            ratio_goal: Leaf::Set(1.0),
+            ..SeedingPolicy::default()
+        }),
+        seeding_policy: Seeding {
+            ratio_goal: Some(1.0),
+            ..Seeding::default()
+        },
+        seeding_levels: weaver_server_core::torrents::service::SeedingLevels {
+            ratio_goal: Level::Torrent,
+            ..Default::default()
+        },
+        ..ruled(TorrentState::Stopped, 1.0)
+    };
+    assert_eq!(row(&own)["ratio_limit"], 1.0);
+    assert!(arr_removes(&row(&own), &preferences));
 }
 
 // Every time a torrent row carries, in qBittorrent's unit: points in time

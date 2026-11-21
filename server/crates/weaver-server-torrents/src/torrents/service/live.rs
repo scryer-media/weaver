@@ -773,6 +773,8 @@ impl Live {
                 && self
                     .start_refused
                     .is_some_and(|refused| refused.too_small()),
+            // Read by the view, which holds the torrent's terms.
+            goal_met: false,
         }
     }
 }
