@@ -264,6 +264,16 @@ impl Frontless {
     async fn settled(mut self) -> Ended {
         self.free().await;
         hear_repair(&mut self.pipeline, self.job_id).await;
+        // The repair is done with its rebuilt slice still held: the release
+        // that queues it is heard as the job's work, and the file is read
+        // once every write the job queued is in it.
+        while self.pipeline.graph_jobs[&self.job_id].work_pending() {
+            let said = self.pipeline.graph_runs.recv().await.unwrap();
+            self.pipeline.graph_run_said(said);
+        }
+        if let Some(disk) = self.pipeline.graph_jobs[&self.job_id].disk() {
+            disk.working().barrier().wait_aside();
+        }
         let status = self.pipeline.graph_terminal_status(self.job_id);
         let whole = std::fs::read(self.working_dir.join("lantern.bin"))
             .is_ok_and(|bytes| bytes == self.posts[0].bytes);
