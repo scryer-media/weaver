@@ -15,8 +15,8 @@ pub mod output;
 pub use output::claim_complete_destination_path;
 #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
 pub(in crate::pipeline) use output::{
-    CLAIM_FULL, DESTINATION_ROOM, FIXTURE_MOVE_HOOKS, FIXTURE_SPENT_HOOKS, PARTIAL_STAYS,
-    member_crc32_by_path,
+    CLAIM_FULL, COPY_ACROSS, DESTINATION_ROOM, FIXTURE_BOOKED_HOOKS, FIXTURE_MOVE_HOOKS,
+    FIXTURE_SPENT_HOOKS, PARTIAL_STAYS, member_crc32_by_path,
 };
 pub(crate) use output::{RestoredPostProcessing, release_failed_delivery};
 mod status;
