@@ -488,6 +488,17 @@ pub(in super::super) struct Turns {
     held: Vec<Said>,
     holds_written: bool,
     written: Vec<Said>,
+    catch: Option<Catch>,
+}
+
+// A crash at an unrecorded move still to come, for the move a completion
+// check makes itself: the database as it stood before the check that moved a
+// waiting file, the files that waited then, and what the job held only in
+// memory.
+struct Catch {
+    root: std::path::PathBuf,
+    kept: tempfile::TempDir,
+    caught: Option<(Waiting, Vec<(u32, u32)>)>,
 }
 
 impl Turns {
@@ -497,7 +508,61 @@ impl Turns {
             held: Vec::new(),
             holds_written: false,
             written: Vec::new(),
+            catch: None,
         }
+    }
+
+    // A completion check that moves a waiting file is where the process
+    // dies, and the checks after it do not run.
+    fn catching(mut self, root: Option<&std::path::Path>) -> Self {
+        self.catch = root.map(|root| Catch {
+            root: root.to_path_buf(),
+            kept: tempfile::tempdir().unwrap(),
+            caught: None,
+        });
+        self
+    }
+
+    fn caught(&self) -> bool {
+        self.catch
+            .as_ref()
+            .is_some_and(|catch| catch.caught.is_some())
+    }
+
+    // One completion check, and whether the process dies at it: every
+    // queued write is committed and the database kept first when a file
+    // waits, so a check that moves one leaves the move unrecorded there.
+    async fn check(&mut self, pipeline: &mut Pipeline, job: JobId) -> bool {
+        let Some(catch) = self.catch.as_mut().filter(|_| file_waits(pipeline)) else {
+            Box::pin(pipeline.check_job_completion(job)).await;
+            return false;
+        };
+        pipeline.db.flush_write_queue().await.unwrap();
+        let waiting = waiting_files(pipeline);
+        copy_database(&catch.root, catch.kept.path());
+        let in_memory = pipeline
+            .graph_jobs
+            .get(&JOB)
+            .map(|job| job.in_memory())
+            .unwrap_or_default();
+        Box::pin(pipeline.check_job_completion(job)).await;
+        let still = waiting_files(pipeline);
+        if waiting.iter().all(|file| still.contains(file)) {
+            return false;
+        }
+        catch.caught = Some((waiting, in_memory));
+        true
+    }
+
+    // Every completion check a step scheduled runs, and the runtime queues
+    // settle, unless the process dies at a check.
+    async fn settle(&mut self, pipeline: &mut Pipeline) {
+        while let Some(queued) = pipeline.pending_completion_checks.pop_front() {
+            if Box::pin(self.check(pipeline, queued)).await {
+                return;
+            }
+        }
+        pump_pipeline_runtime_queues(pipeline).await;
     }
 
     // A crash at a move comes back to the database as it stood before the
@@ -536,8 +601,10 @@ impl Turns {
                     pipeline.graph_run_said(said);
                 }
             }
-            settle(pipeline).await;
-            if !self.held.is_empty() || !pipeline.graph_jobs.get(&JOB).is_some_and(|job| job.lent())
+            self.settle(pipeline).await;
+            if self.caught()
+                || !self.held.is_empty()
+                || !pipeline.graph_jobs.get(&JOB).is_some_and(|job| job.lent())
             {
                 break;
             }
@@ -555,18 +622,9 @@ impl Turns {
         for said in written.into_iter().chain(std::mem::take(&mut self.held)) {
             pipeline.graph_run_said(said);
         }
-        settle(pipeline).await;
+        self.settle(pipeline).await;
         true
     }
-}
-
-// Every completion check a step scheduled runs, and the runtime queues
-// settle.
-async fn settle(pipeline: &mut Pipeline) {
-    while let Some(queued) = pipeline.pending_completion_checks.pop_front() {
-        pipeline.check_job_completion(queued).await;
-    }
-    pump_pipeline_runtime_queues(pipeline).await;
 }
 
 // What a gate round can change: when none of it moved, nothing will.
@@ -784,6 +842,9 @@ impl MoveCrash {
         spec: &JobSpec,
         (run, turns): (&mut Run<'_>, &mut Turns),
     ) -> (Pipeline, Option<Option<JobStatus>>) {
+        if turns.caught() {
+            return Box::pin(self.caught(pipeline, root, spec, (run, turns))).await;
+        }
         let Some(state) = self.state.filter(|_| file_waits(&pipeline)) else {
             return (pipeline, None);
         };
@@ -796,6 +857,7 @@ impl MoveCrash {
             }
         }
         self.state = None;
+        turns.catch = None;
         let written = std::mem::take(&mut turns.written);
         // No crash is still to come, so nothing is kept back from here on:
         // a job that fails on the restore waits for its commits' word
@@ -829,6 +891,47 @@ impl MoveCrash {
                 Some(kept.path())
             }
         };
+        Box::pin(Self::die(
+            pipeline,
+            root,
+            spec,
+            run,
+            (state, waiting, back_to),
+        ))
+        .await
+    }
+
+    // The process dies at the completion check that moved a waiting file,
+    // if one did: the job comes back to the database kept before that
+    // check, where the move is not recorded.
+    async fn caught(
+        &mut self,
+        pipeline: Pipeline,
+        root: &tempfile::TempDir,
+        spec: &JobSpec,
+        (run, turns): (&mut Run<'_>, &mut Turns),
+    ) -> (Pipeline, Option<Option<JobStatus>>) {
+        let Some(catch) = turns.catch.take_if(|catch| catch.caught.is_some()) else {
+            return (pipeline, None);
+        };
+        self.state = None;
+        turns.holds_written = false;
+        turns.written.clear();
+        let (waiting, in_memory) = catch.caught.unwrap();
+        for article in in_memory {
+            run.delivered.remove(&article);
+        }
+        let died = (MoveState::Unrecorded, waiting, Some(catch.kept.path()));
+        Box::pin(Self::die(pipeline, root, spec, run, died)).await
+    }
+
+    async fn die(
+        pipeline: Pipeline,
+        root: &tempfile::TempDir,
+        spec: &JobSpec,
+        run: &mut Run<'_>,
+        (state, waiting, back_to): (MoveState, Waiting, Option<&std::path::Path>),
+    ) -> (Pipeline, Option<Option<JobStatus>>) {
         let status = job_status_for_assert(&pipeline, JOB);
         if let Some(job) = pipeline.graph_jobs.get(&JOB) {
             for article in job.in_memory() {
@@ -863,7 +966,10 @@ async fn drive_graph_schedule(
     (interruption, answers): (Interruption, Answers),
 ) -> GraphOutcome {
     enable_schedule_trace();
-    let mut turns = Turns::new(answers).holding_written(interruption.moving().is_some());
+    let root = tempfile::tempdir().unwrap();
+    let mut turns = Turns::new(answers)
+        .holding_written(interruption.moving().is_some())
+        .catching((interruption.moving() == Some(MoveState::Unrecorded)).then_some(root.path()));
     // Every volume the set is written as: what a recovery set or a listing
     // describes. The run serves the ones the post carries.
     let written = volumes;
@@ -887,7 +993,6 @@ async fn drive_graph_schedule(
         outcomes: Vec::new(),
         trace: Vec::new(),
     };
-    let root = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete) = new_direct_pipeline(&root).await;
     let output = complete.join(crate::jobs::working_dir::sanitize_dirname(&spec.name));
     insert_active_job(&mut pipeline, JOB, spec.clone()).await;
@@ -1009,7 +1114,15 @@ async fn drive_graph_schedule(
         if retired.is_some() {
             break;
         }
-        if turns.release(&mut pipeline).await {
+        let released = turns.release(&mut pipeline).await;
+        let gone;
+        (pipeline, gone) =
+            Box::pin(moving.caught(pipeline, &root, &spec, (&mut run, &mut turns))).await;
+        if gone.is_some() {
+            retired = gone;
+            break;
+        }
+        if released {
             run.look(&pipeline);
             continue;
         }
@@ -1017,8 +1130,15 @@ async fn drive_graph_schedule(
             break;
         }
         let before = fingerprint(&pipeline);
-        if pipeline.jobs.contains_key(&JOB) {
-            pipeline.check_job_completion(JOB).await;
+        if pipeline.jobs.contains_key(&JOB) && Box::pin(turns.check(&mut pipeline, JOB)).await {
+            let gone;
+            (pipeline, gone) =
+                Box::pin(moving.caught(pipeline, &root, &spec, (&mut run, &mut turns))).await;
+            if gone.is_some() {
+                retired = gone;
+                break;
+            }
+            continue;
         }
         pump_pipeline_runtime_queues(&mut pipeline).await;
         run.look(&pipeline);
