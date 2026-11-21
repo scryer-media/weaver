@@ -118,8 +118,7 @@ func torrentScenarios() []torrentScenario {
 			Asserts: []string{
 				"remove without data leaves every file in place with its BLAKE3",
 				"remove with data deletes storageDir",
-				"a private torrent with an unmet goal refuses removal with SEEDING_GOAL_UNMET and stays",
-				"the confirmed removal of that torrent goes through",
+				"a private torrent with an unmet goal is removed when asked, never refused",
 			},
 			Run: scenarioRemove,
 		},
@@ -403,10 +402,10 @@ func (lane *torrentLane) downloadScenario(slug string, options submitOptions, ev
 	return nil
 }
 
-// cleanupTorrent removes a scenario's torrent with its data, confirming
-// any unmet goal; a torrent already gone is fine.
+// cleanupTorrent removes a scenario's torrent with its data; a torrent
+// already gone is fine.
 func (lane *torrentLane) cleanupTorrent(id int, evidence map[string]any) {
-	err := lane.remove(id, true, true)
+	err := lane.remove(id, true)
 	if err != nil && graphqlCode(err) != "NOT_FOUND" {
 		evidence["cleanup_error"] = err.Error()
 	}
@@ -515,8 +514,8 @@ func scenarioRatioGoal(lane *torrentLane, evidence map[string]any) error {
 		return err
 	}
 	evidence["stopped_announce"] = event
-	if err := lane.remove(view.ID, false, false); err != nil {
-		return fmt.Errorf("remove a private torrent whose goal is met, unconfirmed: %w", err)
+	if err := lane.remove(view.ID, false); err != nil {
+		return fmt.Errorf("remove a private torrent whose goal is met: %w", err)
 	}
 	return nil
 }
@@ -607,7 +606,7 @@ func scenarioRemove(lane *torrentLane, evidence map[string]any) error {
 		return err
 	}
 	dir := deref(view.StorageDir)
-	if err := lane.remove(view.ID, false, false); err != nil {
+	if err := lane.remove(view.ID, false); err != nil {
 		return fmt.Errorf("remove without data: %w", err)
 	}
 	if gone, err := lane.torrent(view.ID); err != nil || gone != nil {
@@ -624,7 +623,7 @@ func scenarioRemove(lane *torrentLane, evidence map[string]any) error {
 		return err
 	}
 	dir = deref(view.StorageDir)
-	if err := lane.remove(view.ID, true, false); err != nil {
+	if err := lane.remove(view.ID, true); err != nil {
 		return fmt.Errorf("remove with data: %w", err)
 	}
 	exists, err := remoteExists("weaver", dir)
@@ -635,25 +634,18 @@ func scenarioRemove(lane *torrentLane, evidence map[string]any) error {
 	if exists {
 		return fmt.Errorf("%s is still on disk after remove with data", dir)
 	}
-	// A private torrent with an unmet goal.
+	// A private torrent with an unmet goal: the operator's remove is
+	// never refused for it.
 	view, err = lane.downloadOnly("private-goal", submitOptions{Seeding: ratioGoalTerms(50.0)})
 	if err != nil {
 		return err
 	}
-	err = lane.remove(view.ID, true, false)
-	evidence["unconfirmed_error"] = fmt.Sprint(err)
-	if code := graphqlCode(err); code != "SEEDING_GOAL_UNMET" {
+	if err := lane.remove(view.ID, true); err != nil {
 		lane.cleanupTorrent(view.ID, evidence)
-		return fmt.Errorf("unconfirmed remove of an unmet private goal: code %q (%v)", code, err)
-	}
-	if still, err := lane.torrent(view.ID); err != nil || still == nil || still.State != "SEEDING" {
-		return fmt.Errorf("refused removal left %s (%v)", still.summary(), err)
-	}
-	if err := lane.remove(view.ID, true, true); err != nil {
-		return fmt.Errorf("confirmed remove: %w", err)
+		return fmt.Errorf("remove of an unmet private goal: %w", err)
 	}
 	if gone, err := lane.torrent(view.ID); err != nil || gone != nil {
-		return fmt.Errorf("confirmed removal left %s (%v)", gone.summary(), err)
+		return fmt.Errorf("removal of an unmet private goal left %s (%v)", gone.summary(), err)
 	}
 	return nil
 }
@@ -1284,7 +1276,7 @@ func scenarioFacade(lane *torrentLane, evidence map[string]any) error {
 		return fmt.Errorf("add by magnet: %d %q", status, body)
 	}
 	defer func() {
-		_, _, _ = client.form("torrents/delete", map[string]string{"hashes": fileFixture.Infohash + "|" + magnetFixture.Infohash, "deleteFiles": "true", "confirmUnmetGoal": "true"})
+		_, _, _ = client.form("torrents/delete", map[string]string{"hashes": fileFixture.Infohash + "|" + magnetFixture.Infohash, "deleteFiles": "true"})
 	}()
 	for _, fixture := range []*torrentFixture{fileFixture, magnetFixture} {
 		state, err := client.waitState(fixture.Infohash, fixture.Slug+" seeds through the facade", facadeSeedingStates...)

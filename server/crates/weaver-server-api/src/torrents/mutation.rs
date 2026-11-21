@@ -97,11 +97,8 @@ impl TorrentsMutation {
         ctx: &Context<'_>,
         id: u64,
         #[graphql(default)] delete_files: bool,
-        // Kept for the clients that send it: a remove is never refused for
-        // a seeding goal still to meet.
-        #[graphql(default)] confirm_unmet_goal: bool,
     ) -> Result<bool> {
-        let _ = confirm_unmet_goal;
+        // Never refused for a seeding goal still to meet.
         service(ctx)?
             .remove(JobId(id), delete_files)
             .await
