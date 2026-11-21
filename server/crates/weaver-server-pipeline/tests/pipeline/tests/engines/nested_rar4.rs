@@ -286,10 +286,9 @@ type Breaks = fn(&mut Vec<u8>);
 // repairs nothing and rules nothing impossible, nothing is marked damaged,
 // and the innermost RAR fails as an archive that cannot be read, its error
 // in the log under its name. The nfo and diz beside it are delivered whole,
-// but furniture never stands for a delivery, so the job fails and its
-// reason names the archive.
+// so the job is delivered in part, and what it withheld names the archive.
 #[tokio::test]
-async fn a_broken_rar4_in_a_zip_in_an_outer_rar_with_whole_bytes_fails_as_an_archive() {
+async fn a_broken_rar4_in_a_zip_in_an_outer_rar_with_whole_bytes_is_withheld_as_an_archive() {
     // Each breaks the book's compressed stream: its data CRC fails.
     let cases: [(&str, Breaks); 2] = [
         ("data", |bytes| {
@@ -318,11 +317,7 @@ async fn a_broken_rar4_in_a_zip_in_an_outer_rar_with_whole_bytes_fails_as_an_arc
             let delivery = &outcome.graph().delivery;
             let failed = lines.of("extraction failed");
             assert!(
-                outcome.status
-                    == Some(JobStatus::Failed {
-                        error: "tn60025.rar is an invalid archive rejected by validation"
-                            .to_owned()
-                    })
+                outcome.status == Some(JobStatus::Partial)
                     && par2_ruling(&outcome) == Some(RepairOutcome::Clean)
                     && delivery.damaged.is_empty()
                     && delivery.unrepaired.is_empty()
@@ -344,8 +339,7 @@ async fn a_broken_rar4_in_a_zip_in_an_outer_rar_with_whole_bytes_fails_as_an_arc
                 delivery.unrepaired,
                 outcome.graph().withheld_error(),
             );
-            // A failed job publishes nothing: the furniture is delivered
-            // whole and stays in its working directory.
+            // The furniture is delivered whole.
             for name in ["tn60025.nfo", "file_id.diz", "toner.nfo"] {
                 assert!(
                     delivery.whole.iter().any(|whole| whole == name),

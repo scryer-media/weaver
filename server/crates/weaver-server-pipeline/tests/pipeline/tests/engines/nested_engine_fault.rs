@@ -147,20 +147,12 @@ async fn short_article_in_nested_zip(par2: Option<u32>) -> Outcome {
 }
 
 #[tokio::test]
-async fn a_short_article_inside_a_nested_zip_ends_the_job() {
+async fn a_short_article_inside_a_nested_zip_leaves_the_job_partial() {
     let outcome = short_article_in_nested_zip(None).await;
     // Nothing can rebuild the lost byte: the zip is kept as it came, and
-    // the files delivered whole beside it are furniture alone, so the job
-    // fails.
-    assert_eq!(
-        outcome.status,
-        Some(JobStatus::Failed {
-            error: "no usable file was delivered whole; 1 short: inner.zip".to_owned()
-        })
-    );
-    // A failed job publishes nothing: the zip stays in its working
-    // directory, delivered as it stands.
-    assert!(outcome.files.is_empty(), "{:?}", outcome.files.keys());
+    // the furniture delivered whole beside it leaves the job delivered in
+    // part.
+    assert_eq!(outcome.status, Some(JobStatus::Partial));
     assert_eq!(outcome.graph().delivery.damaged, ["inner.zip"]);
 }
 

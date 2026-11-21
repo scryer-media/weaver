@@ -187,9 +187,7 @@ fn rar_recovers(
 
 // Some whole file is one a job can end partial by.
 fn usable<'n>(whole: impl IntoIterator<Item = &'n String>) -> bool {
-    whole
-        .into_iter()
-        .any(|name| weaver_graph::usable_type(name))
+    whole.into_iter().any(|name| weaver_graph::known_type(name))
 }
 
 // What a schedule loses: an article of a volume, or a volume the post never
