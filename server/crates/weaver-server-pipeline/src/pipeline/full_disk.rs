@@ -101,6 +101,10 @@ pub(crate) struct FullDisk {
     // The spool files of the held parts the job's last checkpoint names:
     // the ones its restore reads back, so the ones that stay on disk.
     named: HashSet<PathBuf>,
+    // What the job waits for on a root's ledger and has not been promised,
+    // and the root: a new start there leaves it aside. Set while the job
+    // waits on a root, not paused, not let go, and not refused by a quota.
+    waiting: Option<(StorageRoot, u64)>,
 }
 
 impl Pipeline {
@@ -230,8 +234,10 @@ impl Pipeline {
                 resumed: false,
                 left,
                 named,
+                waiting: None,
             },
         );
+        self.note_full_disk_waiting(job_id);
         self.forget_parts_past_checkpoint(job_id);
         self.parking_jobs.insert(job_id);
         self.download_dispatch_wake = true;
@@ -376,11 +382,14 @@ impl Pipeline {
             })
             .collect();
         for (job_id, root, remaining, size) in starts {
-            if let Ok(promise) = self.book_start_promise_on(root, remaining, size) {
+            if let Ok(promise) = self.book_held_start_promise_on(root, remaining, size) {
                 self.release_start_promise(job_id);
                 self.start_promises.insert(job_id, promise);
+                // Promised now: what it waited for comes off in the same
+                // step, so a start counts it once.
                 if let Some(hold) = self.full_disk.get_mut(&job_id) {
                     hold.go = true;
+                    set_waiting(&self.storage_capacity, hold, None);
                 }
             }
         }
@@ -423,6 +432,9 @@ impl Pipeline {
                         .promises()
                         .insert(Waiter::Usenet, *job_id, promised);
                 }
+                // Promised now: what it waited for comes off in the same
+                // step, so a start counts it once.
+                set_waiting(capacity, hold, None);
             }
             // A move let go starts as a first move does, which waits while
             // post-processing is paused: the job stays held until then.
@@ -474,6 +486,19 @@ impl Pipeline {
         }
         for job_id in given_back {
             self.release_start_promise(job_id);
+        }
+        // What each job still held waits for, as it stands after this pass:
+        // one paused or let go waits for nothing, one whose root was pointed
+        // elsewhere waits on a path, which no ledger counts.
+        let waits: Vec<(JobId, Option<(StorageRoot, u64)>)> = self
+            .full_disk
+            .iter()
+            .map(|(job_id, hold)| (*job_id, self.full_disk_waiting_of(*job_id, hold)))
+            .collect();
+        for (job_id, waiting) in waits {
+            if let Some(hold) = self.full_disk.get_mut(&job_id) {
+                set_waiting(&self.storage_capacity, hold, waiting);
+            }
         }
         for job_id in judged_starts {
             if self.full_disk.get(&job_id).is_some_and(|hold| hold.go) {
@@ -560,8 +585,10 @@ impl Pipeline {
                 resumed: false,
                 left: None,
                 named: HashSet::new(),
+                waiting: None,
             },
         );
+        self.note_full_disk_waiting(job_id);
         self.report_job(job_id);
     }
 
@@ -853,7 +880,52 @@ impl Pipeline {
     pub(in crate::pipeline) fn full_disk_paused(&mut self, job_id: JobId) {
         if let Some(hold) = self.full_disk.get_mut(&job_id) {
             hold.resumed = false;
+            // Paused, it waits for nothing a start need leave aside; the
+            // wake once it is active again counts it anew.
+            set_waiting(&self.storage_capacity, hold, None);
         }
+    }
+
+    // What the held job waits for on its root, as it stands: set as its
+    // hold begins, and at each wake.
+    fn note_full_disk_waiting(&mut self, job_id: JobId) {
+        let Some(waiting) = self
+            .full_disk
+            .get(&job_id)
+            .map(|hold| self.full_disk_waiting_of(job_id, hold))
+        else {
+            return;
+        };
+        if let Some(hold) = self.full_disk.get_mut(&job_id) {
+            set_waiting(&self.storage_capacity, hold, waiting);
+        }
+    }
+
+    // What a held job waits for past the reserve on the root it waits on,
+    // which a new start there leaves aside: what a job held in its download
+    // needs to start again, or what a held move needs free to go on. None
+    // for one let go, paused, refused by a quota, whose free figure is not
+    // its room, or waiting on a path.
+    fn full_disk_waiting_of(&self, job_id: JobId, hold: &FullDisk) -> Option<(StorageRoot, u64)> {
+        if hold.go || hold.wait.quota {
+            return None;
+        }
+        if self
+            .jobs
+            .get(&job_id)
+            .is_some_and(|state| state.run_state == RunState::Paused)
+        {
+            return None;
+        }
+        let (root, _) = hold.wait.root_read_since(&self.storage_capacity)?;
+        let bytes = match hold.stage {
+            Stage::Graph => self.held_start_need(job_id, &hold.wait).1,
+            Stage::Moving(..) | Stage::Claim(_) | Stage::Restored => match hold.wait.needs {
+                Some(needs) => needs.saturating_sub(self.extraction_limits.min_free_bytes),
+                None => hold.wait.rise.unwrap_or(0),
+            },
+        };
+        (bytes > 0).then_some((root, bytes))
     }
 
     // What a job held in its download delivers, which its start promises
@@ -883,6 +955,7 @@ impl Pipeline {
         };
         let room = weaver_server_disk::operations::room_wait::StartCheck {
             root,
+            waiters: false,
             ..self.working_disk_check()
         }
         .room_now(&self.storage_capacity);
@@ -892,8 +965,13 @@ impl Pipeline {
     // Whether a fresh, good reading of `root` leaves `need` past the
     // reserve and every promise, and, when the complete folder is on
     // another disk, a reading of that disk leaves `size`. It books nothing.
+    // It is judged without what the jobs held for a full disk wait for,
+    // being one of them.
     fn held_start_room(&self, root: StorageRoot, need: u64, size: u64) -> bool {
-        let check = self.working_disk_check();
+        let check = weaver_server_disk::operations::room_wait::StartCheck {
+            waiters: false,
+            ..self.working_disk_check()
+        };
         let room = |root, need| {
             weaver_server_disk::operations::room_wait::StartCheck { root, ..check }
                 .room_now(&self.storage_capacity)
@@ -957,8 +1035,29 @@ impl Pipeline {
         if self.full_disk.is_empty() {
             return None;
         }
-        let hold = self.full_disk.remove(&job_id)?;
+        let mut hold = self.full_disk.remove(&job_id)?;
+        set_waiting(&self.storage_capacity, &mut hold, None);
         hold.wait.end(&self.storage_capacity);
         Some(hold.stage)
+    }
+}
+
+// The held job waits for `waiting` on a root's ledger from here: what it
+// waited for there before comes off, ringing, and the new figure goes on.
+// Nothing moves while the figure stands.
+fn set_waiting(
+    capacity: &crate::operations::StorageCapacity,
+    hold: &mut FullDisk,
+    waiting: Option<(StorageRoot, u64)>,
+) {
+    if hold.waiting == waiting {
+        return;
+    }
+    if let Some((root, bytes)) = hold.waiting.take() {
+        capacity.ledger(root).end_waiting(bytes);
+    }
+    if let Some((root, bytes)) = waiting {
+        capacity.ledger(root).hold_waiting(bytes);
+        hold.waiting = Some((root, bytes));
     }
 }

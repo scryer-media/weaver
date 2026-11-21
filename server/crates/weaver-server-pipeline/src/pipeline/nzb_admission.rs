@@ -190,6 +190,20 @@ impl Pipeline {
             .map(|(working, output)| StartPromise::Pending { working, output })
     }
 
+    // The same for a job held for a full disk starting again: judged
+    // without what the jobs held for a full disk wait for, being one of
+    // them.
+    pub(in crate::pipeline) fn book_held_start_promise_on(
+        &self,
+        read: crate::operations::StorageRoot,
+        need: u64,
+        size: u64,
+    ) -> Result<StartPromise, StartBooking> {
+        self.start_rule()
+            .book_held_on(&self.storage_capacity, read, need, size)
+            .map(|(working, output)| StartPromise::Pending { working, output })
+    }
+
     // A job that held its slot across a restart is promised what it still
     // has to fetch, unjudged: it started before, and keeps its place. On a
     // complete disk of its own it is promised that much and no more: what

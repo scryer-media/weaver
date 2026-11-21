@@ -912,6 +912,72 @@ async fn a_usenet_promise_holds_a_torrent_and_its_pieces_draw_on_its_own() {
     disk.seeding.stop().await;
 }
 
+// A usenet job held for a full disk keeps a torrent from starting: with
+// 70,000 bytes over the reserve and 10,000 of them waited for by the held
+// job, the 65,536 byte torrent waits for the 60,000 left. The hold ends,
+// which rings as a promise given back does, and the torrent starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_usenet_job_waiting_for_room_holds_a_torrent_start() {
+    let disk = on_disks(
+        |_: &Path| {
+            Ok(DiskSpace {
+                total_bytes: 1 << 40,
+                available_bytes: RESERVE + 70_000,
+            })
+        },
+        None,
+        None,
+        |capacity| capacity.ledger(StorageRoot::Complete).hold_waiting(10_000),
+    )
+    .await;
+    let service = &disk.rig.service;
+    let ledger = disk.capacity.ledger(StorageRoot::Complete);
+    let view = view_once(service, disk.job_id, |view| {
+        view.stated == Some(Stated::DiskSpace)
+    })
+    .await;
+    assert_eq!(
+        (view.disk_need_bytes, view.disk_free_bytes),
+        (Some(65_536), Some(60_000))
+    );
+    assert!(not_running(service, disk.job_id).await, "it does not start");
+
+    ledger.end_waiting(10_000);
+    let torrent = handle_of(service, disk.job_id).await;
+    torrent.wait_until_completed().await.unwrap();
+    promised(ledger, 0).await;
+    service.stop().await;
+    disk.seeding.stop().await;
+}
+
+// A torrent kept from starting is paused: no torrent on its disk is kept by
+// the start wait any more, so the wait ends at that pass and the disk is no
+// longer waited on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_wait_ends_when_its_last_torrent_is_paused() {
+    let room = Arc::new(AtomicU64::new(0));
+    let disk = on_disk(&room).await;
+    let service = &disk.rig.service;
+    view_once(service, disk.job_id, |view| {
+        view.stated == Some(Stated::DiskSpace)
+    })
+    .await;
+    assert!(locked(&service.inner.start_held).iter().any(|wait| wait.held()));
+    assert!(disk.capacity.ledger(StorageRoot::Complete).waited_on());
+
+    service.pause(disk.job_id).await.unwrap();
+    service
+        .inner
+        .disk_waits_moved
+        .subscribe()
+        .wait_for(|_| !locked(&service.inner.start_held).iter().any(|wait| wait.held()))
+        .await
+        .unwrap();
+    assert!(!disk.capacity.ledger(StorageRoot::Complete).waited_on());
+    service.stop().await;
+    disk.seeding.stop().await;
+}
+
 // A magnet's bytes are known only at its metadata, which comes while it
 // runs: it is judged then by the start rule. With 1,000 bytes over the
 // reserve its 3,000 bytes do not fit, so it is held as a torrent refused
@@ -1191,7 +1257,17 @@ async fn a_wait_for_room_ends_with_its_run() {
         match how {
             "remove" => service.remove(job_id, false, true).await.unwrap(),
             "pause" => service.pause(job_id).await.unwrap(),
-            "recheck" => service.recheck(job_id).await.unwrap(),
+            "recheck" => {
+                // The check ends a run, and once it ends the start rule
+                // judges the torrent again: with no room over the reserve
+                // for what it has left, its download is held from starting.
+                // The recheck lets go of the run's hold before it answers.
+                let mut moved = service.inner.disk_waits_moved.subscribe();
+                service.recheck(job_id).await.unwrap();
+                while disk_held(service, job_id).await != Some(DiskHeld::Fetching) {
+                    moved.changed().await.unwrap();
+                }
+            }
             _ => {
                 disk.rig.routes.route(TorrentScope::Category(1), 9);
                 service
@@ -1217,7 +1293,10 @@ async fn a_wait_for_room_ends_with_its_run() {
         let ledger = disk.capacity.ledger(StorageRoot::Complete);
         assert_eq!(ledger.promised(), 0, "{how}");
         if let Some(torrent) = service.inner.live.lock().await.get(&job_id) {
-            assert_ne!(torrent.disk_held, Some(DiskHeld::Fetching), "{how}");
+            // Held again only from starting, by the start rule, after a
+            // check; never the wait of the run that ended.
+            let start_held = (how == "recheck").then_some(DiskHeld::Fetching);
+            assert_eq!(torrent.disk_held, start_held, "{how}");
             assert_ne!(torrent.disk_held, Some(DiskHeld::Writing), "{how}");
             let room = torrent.intake.as_ref().unwrap().room();
             assert_eq!(room.in_hand(), 0, "{how}");

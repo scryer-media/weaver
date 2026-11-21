@@ -582,6 +582,10 @@ impl CopyRoom {
             held,
             promise: ledger,
             need: bytes,
+            // A move books the room its copy writes, as a write does: it
+            // takes room a job held for a full disk waits for, as a write
+            // may, and a move let go from its own hold waits for nothing.
+            waiters: false,
         };
         match DiskLedger::book_start_on(&[part], self.reserve) {
             StartBooking::Booked => {}
