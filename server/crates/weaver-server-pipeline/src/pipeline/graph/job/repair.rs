@@ -94,15 +94,7 @@ impl GraphJob {
                     object.work(&mut said);
                 }
                 moved |= !said.is_empty();
-                let mut effects = Vec::new();
-                self.tree.take_back_worked(
-                    node,
-                    object,
-                    said,
-                    &mut self.writer.placing(&mut *self.builder),
-                    &mut effects,
-                );
-                self.settle_worked(effects)?;
+                self.took_back_worked(node, object, said, limit)?;
             }
             if admit || !moved {
                 return Ok(());

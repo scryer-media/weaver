@@ -561,7 +561,30 @@ rows! {
 
     send_back_inline_flat_in_order_first: sent_back(Described, Flat, InOrder, Inline, First, 2);
     send_back_inline_flat_in_order_middle: sent_back(Described, Flat, InOrder, Inline, Middle, 2);
-    send_back_inline_flat_backwards_late: sent_back(Described, Flat, Backwards, Inline, Late, 2);
+    // The last article is the neighbour that refutes the bad copy: the
+    // decoder sends the bad copy back before that article is taken in, and
+    // its good copy comes after.
+    send_back_inline_flat_backwards_late: {
+        let mut rig = Rig::new(posts(Described, Flat), &[SECRET], Inline);
+        let articles = rig.articles(Backwards);
+        let last = articles.len() - 1;
+        let bad = last - 2;
+        for (index, article) in articles.iter().copied().enumerate() {
+            if index == last {
+                rig.send_back(articles[bad]);
+            }
+            if index == bad {
+                rig.intake_damaged(article);
+            } else {
+                rig.intake(article);
+            }
+            rig.give_back();
+        }
+        rig.intake(articles[bad]);
+        rig.settle();
+        assert!(rig.delivered(), "the member delivered whole");
+        assert_eq!(rig.job.checked_phase(), RootPhase::Done);
+    };
     send_back_inline_nested_in_order_middle: sent_back(Described, Nested, InOrder, Inline, Middle, 2);
     send_back_inline_nested_backwards_first: sent_back(Described, Nested, Backwards, Inline, First, 2);
     send_back_inline_rar5_middle: sent_back(Rar5, Flat, InOrder, Inline, Middle, 2);
@@ -588,4 +611,53 @@ rows! {
     send_back_returned_sevenz_aes: sent_back_then_returned(SevenZipAes, Flat, InOrder);
     send_back_lost_sevenz_aes: sent_back_then_lost(SevenZipAes, Flat, InOrder);
     send_back_after_the_last_sevenz_aes: sent_back_after_the_last(SevenZipAes, Flat, InOrder);
+}
+
+// A RAR4 set with enciphered headers and compressed members: the store
+// opens its headers in its work, and the walk under them hands the set to
+// an engine.
+fn enciphered_rar4_headers() -> Vec<(String, Vec<u8>)> {
+    const RAR: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../weaver-server-core/tests/fixtures/extraction_profiles/rar4_hp_lz.rar"
+    ));
+    vec![("rar4_hp_lz.rar".into(), RAR.to_vec())]
+}
+
+// While a checkpoint is owed the store's work is done on the loop: the
+// engine it hands its set to there starts as one it hands over off the
+// loop does.
+#[tokio::test]
+async fn an_engine_a_store_hands_its_set_to_on_the_loop_starts() {
+    let mut rig = Rig::new(enciphered_rar4_headers(), &["secretpass"], Mode::Inline);
+    for article in rig.articles(Serve::InOrder) {
+        rig.intake(article);
+    }
+    assert!(rig.job.tree.working().is_empty(), "work left due");
+    assert!(
+        rig.job.runs.in_flight(),
+        "the engine the store handed its set to is started"
+    );
+}
+
+// A checkpoint finds the store's loan out and is owed: once the loan comes
+// back, the work its return makes due is done on the loop, and the engine
+// that work hands the set to starts.
+#[tokio::test]
+async fn an_engine_handed_the_set_after_a_loan_found_out_by_a_checkpoint_starts() {
+    let mut rig = Rig::new(enciphered_rar4_headers(), &["secretpass"], Mode::Held);
+    for article in rig.articles(Serve::InOrder) {
+        rig.intake(article);
+        if !rig.in_hand.is_empty() {
+            rig.job.owe_checkpoint();
+        }
+        rig.give_back();
+    }
+    assert!(rig.lent, "a loan went out");
+    assert!(rig.job.owes_checkpoint(), "the checkpoint is still owed");
+    assert!(rig.job.tree.working().is_empty(), "work left due");
+    assert!(
+        rig.job.runs.in_flight(),
+        "the engine the store handed its set to is started"
+    );
 }
