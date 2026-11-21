@@ -61,20 +61,24 @@ func runCommittedFeedVerdictRestart(ctx *restartCaseContext) (restartCaseResult,
 		return restartCaseResult{}, err
 	}
 	// Nyuu may finish either file first and write its NZB entry first.
-	// Withhold broken.mkv by identity and hold survivor.mkv so a committed
-	// verdict cannot race terminalization.
+	// Withhold broken.mkv by identity and hold survivor.mkv past its first
+	// article so a committed verdict cannot race terminalization. The first
+	// article comes: the feed holds its verdict while a file's first article
+	// is still to come, since that file might yet be recovery.
 	var abandonedIDs, survivorIDs []string
 	for _, segment := range segments {
 		switch segment.FileIndex {
 		case abandonedIndex:
 			abandonedIDs = append(abandonedIDs, segment.MessageID)
 		case 1 - abandonedIndex:
-			survivorIDs = append(survivorIDs, segment.MessageID)
+			if segment.Ordinal > 0 {
+				survivorIDs = append(survivorIDs, segment.MessageID)
+			}
 		default:
 			return restartCaseResult{}, fmt.Errorf("unexpected feed fixture file %d", segment.FileIndex)
 		}
 	}
-	if len(abandonedIDs) < 2 || len(survivorIDs) < 2 {
+	if len(abandonedIDs) < 2 || len(survivorIDs) < 1 {
 		return restartCaseResult{}, fmt.Errorf("feed fixture is not two multipart files")
 	}
 	putBack, err := withholdArticles(nntpHost(), nntpPort(), abandonedIDs)
