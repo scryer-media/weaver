@@ -9,6 +9,7 @@
 // pages what it can to scratch first.
 
 use std::collections::BTreeMap;
+use weaver_server_disk::operations::disk::volume::LoopSite;
 
 use weaver_graph::holds::{Reserve, ScratchHold};
 use weaver_graph::{
@@ -153,10 +154,16 @@ impl NamespaceWriter {
                 files.leaves.mark(member);
             }
             let (page_outs, spills) = files.holds.page_out_all(free_disk);
+            // Nothing of the namespace stays in memory to be carried for.
+            self.uncredit_node(node);
             for page_out in &page_outs {
                 free_disk = free_disk.saturating_sub(page_out.range.len());
-                self.scratch(node)?
-                    .write(page_out.scratch_offset, &page_out.bytes, None)?;
+                self.scratch(node)?.write(
+                    LoopSite::Durable,
+                    page_out.scratch_offset,
+                    &page_out.bytes,
+                    None,
+                )?;
             }
             for spill in &spills {
                 free_disk = free_disk.saturating_sub(spill.range.len());
@@ -246,7 +253,7 @@ impl NamespaceWriter {
             }
             let scratch = Leaf::found(&self.working_dir, &scratch_name(node))?
                 .through(self.disk_under(&self.working_dir).as_ref());
-            let written = scratch.len().unwrap_or(0);
+            let written = scratch.len(LoopSite::Durable).unwrap_or(0);
             // The file's bytes are already on disk, so the disk reserve
             // judges them against the space they would leave if absent.
             let mut free_disk = self.free_disk_bytes().saturating_add(written);
@@ -259,7 +266,7 @@ impl NamespaceWriter {
                     let reaches = files
                         .spills
                         .get(&member)
-                        .and_then(|spill| spill.len().ok())
+                        .and_then(|spill| spill.len(LoopSite::Durable).ok())
                         .is_some_and(|len| held.range.end <= len);
                     if reaches {
                         files.holds.restore_spilled(held.volume, held.range);
@@ -335,7 +342,12 @@ impl NamespaceWriter {
         while done < len {
             let take = (len - done).min(super::READ_BACK);
             bytes.clear();
-            scratch.read(held.scratch_offset + done, super::index(take), &mut bytes)?;
+            scratch.read(
+                LoopSite::Durable,
+                held.scratch_offset + done,
+                super::index(take),
+                &mut bytes,
+            )?;
             self.spill_write(node, member, held.range.start + done, &bytes)?;
             done += take;
         }
@@ -534,7 +546,7 @@ impl NamespaceWriter {
         range: weaver_graph::ByteRange,
         into: &mut Vec<u8>,
     ) -> bool {
-        let mut access = self.access(tree);
+        let mut access = self.access(tree, LoopSite::Durable);
         access.held = false;
         access.read_at(NodeId::ROOT, member, range, into)
     }

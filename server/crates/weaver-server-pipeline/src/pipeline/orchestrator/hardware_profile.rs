@@ -75,7 +75,7 @@ impl Pipeline {
             .volume_buffers
             .set_figure(figure_bytes, memory_ceiling_bytes)
         {
-            self.volume_room_changed();
+            self.volume_room_taken();
         }
     }
 

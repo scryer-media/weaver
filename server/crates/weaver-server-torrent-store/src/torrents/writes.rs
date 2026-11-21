@@ -731,7 +731,14 @@ impl Batch<'_> {
                 })
             }
         };
-        submitter.write_from(&mut self.paid.reservation, file, offset, bytes, create);
+        submitter.write_from(
+            weaver_server_disk::operations::disk::volume::LoopSite::Torrent,
+            &mut self.paid.reservation,
+            file,
+            offset,
+            bytes,
+            create,
+        );
     }
 
     // Run `land` on the writer once every write queued before it is

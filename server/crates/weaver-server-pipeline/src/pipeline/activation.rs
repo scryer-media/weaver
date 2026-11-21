@@ -1058,6 +1058,9 @@ impl Pipeline {
         job_id: JobId,
     ) -> Option<crate::pipeline::graph::job::GraphJob> {
         let keep_files = self.pipeline_failure_stages.contains_key(&job_id);
+        // What of it waits for a volume's room no longer waits, nor holds
+        // its decoded bytes or what it counts on each volume.
+        self.drop_parked_download_results(job_id);
         self.forget_graph_repair(job_id);
         self.disk_waiting.remove(&job_id);
         self.disk_idle.remove(&job_id);

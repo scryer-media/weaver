@@ -4,6 +4,7 @@
 use super::*;
 use crate::pipeline::graph::hardware::Shutdown;
 use std::sync::atomic::AtomicBool;
+use weaver_server_disk::operations::disk::volume::LoopSite;
 
 // A PAR3 set over `body` as `payload.bin`: `recovery` blocks of 512 bytes,
 // at most `per_volume` to a volume, the index first.
@@ -164,7 +165,7 @@ fn cancelled_and_stale_par3_returns_keep_damaged_carriers_repairable() {
                 .leaves
                 .get_mut(&member)
                 .unwrap()
-                .write(1700, &wrong[1700..1701], None)
+                .write(LoopSite::LeafWrite, 1700, &wrong[1700..1701], None)
                 .unwrap();
             assert!(
                 job.file("payload.bin") == wrong,

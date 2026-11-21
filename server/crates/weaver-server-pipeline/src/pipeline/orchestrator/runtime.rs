@@ -218,7 +218,7 @@ impl Pipeline {
         let volume_writers = Arc::new(crate::pipeline::graph::disk::PipelineWriters::new(
             volume_writers,
             graph_runs.written(),
-            volume_room_tx,
+            volume_room_tx.clone(),
         ));
         // Each volume's first write rate comes from a probe queued on its
         // writer; the figures an earlier run kept are read here, off the
@@ -545,6 +545,10 @@ impl Pipeline {
             volume_writers,
             volume_rooms,
             volume_budget_held: std::sync::atomic::AtomicBool::new(false),
+            disk_vote: crate::pipeline::disk_vote::DiskVote::new(Instant::now()),
+            disk_limits: Arc::default(),
+            disk_tells: HashMap::new(),
+            disk_tell: volume_room_tx,
             shutdown_settle: weaver_server_disk::operations::disk::writer::SettleBound::wall(
                 Self::SHUTDOWN_DRAIN_IDLE_TIMEOUT,
             ),
@@ -552,6 +556,8 @@ impl Pipeline {
             volume_buffers,
             volume_arrived_by_job: HashMap::new(),
             volume_reserved_by_job: HashMap::new(),
+            parked_download_results: Default::default(),
+            parked_results_room: false,
             window_ledgers: Default::default(),
             extraction_limits,
             process_memory_budget,
@@ -1114,6 +1120,8 @@ impl Pipeline {
     // pipeline holds now, since no tick will refresh them.
     fn settle_parked_gauges(&mut self) {
         self.refresh_periodic_snapshot();
+        // No tick counts the vote again, and nothing dispatches to be held.
+        self.clear_disk_vote();
         self.refresh_download_pressure();
         self.publish_download_transport_health();
     }
@@ -1257,7 +1265,11 @@ impl Pipeline {
             self.drain_ready_download_results(&mut pending_download_results);
             self.drain_ready_lane_control_messages();
             turn_active |= self.hear_graph_runs();
-            turn_active |= self.hear_volume_rooms();
+            if self.hear_volume_rooms() {
+                turn_active = true;
+                self.parked_results_room = true;
+                self.refresh_parked_disk_limits();
+            }
             #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             self.pump_decode_queue();
 
@@ -1467,6 +1479,9 @@ impl Pipeline {
                                 hear!(5);
                                 turn_timer.resume(PipelinePhase::GraphRun);
                                 self.graph_run_said(said);
+                                if !drive {
+                                    self.refresh_parked_disk_limits();
+                                }
                                 #[cfg(any(test, feature = "pipeline-test-fixtures"))]
                                 if let Some(stamps) = &self.graph_mail_stamps {
                                     let _ = stamps.send(
@@ -1477,7 +1492,8 @@ impl Pipeline {
                             Some(()) = self.volume_rooms.recv(), if open!(6) => {
                                 hear!(6);
                                 turn_timer.resume(PipelinePhase::GraphRun);
-                                self.volume_room_heard();
+                                self.hear_disk_room();
+                                self.parked_results_room = true;
                             }
                             Some(mail) = self.post_probes.recv(), if open!(7) => {
                                 hear!(7);
@@ -1567,6 +1583,9 @@ impl Pipeline {
                                 idle_tick = true;
                                 count_periodic_tick();
                                 self.refresh_periodic_snapshot();
+                                // Which volumes held dispatch for their write
+                                // buffer; a flag read while none has.
+                                self.tally_disk_vote(Instant::now());
                                 // Lanes whose refill found nothing wait here for the
                                 // next wake; the tick is what ends the wait when no
                                 // wake comes.
@@ -1625,7 +1644,7 @@ impl Pipeline {
                                 // lost its last are heard here. With neither
                                 // nothing is written.
                                 if self.volume_buffers.follow_rates() {
-                                    self.volume_room_changed();
+                                    self.volume_room_taken();
                                 }
 
                                 if tracing::enabled!(tracing::Level::DEBUG) {
@@ -1751,11 +1770,25 @@ impl Pipeline {
         // once if its stage moved, else on the snapshot tick.
         let mut reported = BTreeSet::new();
         while processed < Self::DOWNLOAD_RESULTS_PER_TURN {
-            let Some(result) = pending.pop_front() else {
+            // Parked fronts their volume has room for go first once a volume
+            // may have some, the previous result's step among what may have
+            // given it.
+            self.unpark_download_results();
+            let handed = if let Some(result) = self.take_retried_download_result() {
+                let job_id = result.job_id;
+                (job_id, self.process_retried_download_done(result).await)
+            } else if let Some(result) = pending.pop_front() {
+                let job_id = result.job_id;
+                (job_id, self.process_released_download_done(result).await)
+            } else {
                 break;
             };
-            reported.insert(result.job_id);
-            self.process_released_download_done(result).await;
+            let (job_id, handed) = handed;
+            // One parked again waits for its wake and is not counted.
+            if !handed {
+                continue;
+            }
+            reported.insert(job_id);
             processed += 1;
             // Return freed connections during ingestion rather than waiting
             // until the entire result batch has been processed.
@@ -2124,6 +2157,8 @@ impl Pipeline {
             Arc::clone(&self.shutdown_settle.clock),
             self.shutdown_settle.end(),
         );
+        // Results parked for a volume's room are handed on within that span.
+        self.hand_on_parked_results_at_stop().await;
         // Unblock lanes waiting on deferred refills so they can finish their
         // batches and exit; dropping the senders answers them with an error.
         self.drain_inflight_download_and_decode_work().await;
@@ -2303,7 +2338,10 @@ impl Pipeline {
                     self.handle_owned_download_lane_event(event, &mut pending);
                     while let Some(result) = pending.pop_front() {
                         let reported_job = result.job_id;
-                        self.process_released_download_done(result).await;
+                        // At the stop nothing parks: the writes are bounded
+                        // by its span.
+                        self.process_released_download_done_with(result, false, false)
+                            .await;
                         self.report_job(reported_job);
                     }
                     #[cfg(any(test, feature = "pipeline-test-fixtures"))]

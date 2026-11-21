@@ -147,7 +147,7 @@ impl VolumeReads {
         seq: u64,
         read: impl FnOnce() -> io::Result<R>,
     ) -> io::Result<R> {
-        submitter.wait_for(seq)?;
+        submitter.wait_for(super::volume::LoopSite::ReadOn, seq)?;
         let _turn = self.turn_here();
         read()
     }
@@ -330,7 +330,7 @@ mod tests {
 
     use super::{SOLID_READERS, SPINNING_READERS, VolumeReads};
     use crate::operations::disk::StorageKind;
-    use crate::operations::disk::volume::Volume;
+    use crate::operations::disk::volume::{LoopSite, Volume};
     use crate::operations::disk::writer::{Create, OpenSteps, Opened, VolumeWriters};
 
     // A thread waiting for a turn the volume's other readers hold returns
@@ -532,6 +532,7 @@ mod tests {
         let mut seq = 0;
         for (at, chunk) in [b"abcd", b"efgh", b"ijkl"].into_iter().enumerate() {
             seq = submitter.write(
+                LoopSite::LeafWrite,
                 1,
                 at as u64 * 4,
                 bytes::Bytes::from_static(chunk),

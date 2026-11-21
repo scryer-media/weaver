@@ -621,6 +621,56 @@ async fn a_lane_held_for_room_is_asked_again_once_its_volume_falls_to_its_resume
     assert_eq!(counted(&pipeline), (1, 1));
 }
 
+// A volume whose whole count is held run output its queuing thread
+// carries, above its lease limit, with nothing for its writer: carried
+// bytes use no lease budget, so each of eighteen lanes is served a lease
+// beside them at once, as on an empty volume, and none is held for room.
+#[tokio::test]
+async fn lanes_lease_beside_carried_bytes_above_the_lease_limit_as_on_an_empty_volume() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut pipeline = DispatchFixture::scheduler(&temp_dir).await;
+    let job_id = JobId(41403);
+    pipeline
+        .add_job(
+            job_id,
+            segmented_job_spec("Carried", "payload.bin", &vec![512u32; 600]),
+        )
+        .await;
+    let hard = 256 * 512;
+    pipeline.set_volume_budget(hard);
+    let volume = pipeline.volume(job_id);
+    assert_eq!(volume.buffer_limits().1, hard);
+    let limit = volume_lease_limit(&volume);
+    let credit = pipeline.carry_on_working(job_id, limit + 8 * 512);
+    assert!(volume.carried_bytes() > limit);
+    assert_eq!(volume.buffered_bytes.load(Ordering::SeqCst), 0);
+    let held = |pipeline: &DispatchFixture| {
+        pipeline
+            .metrics()
+            .download_lane_room_held_total
+            .load(Ordering::Relaxed)
+    };
+    let mut leased = 0;
+    for _ in 0..18 {
+        let lane_id = pipeline.book_connected_lane(job_id, false);
+        // The ask is heard in the call: a lane served has its answer now,
+        // and one held for room has none.
+        let mut refill = pipeline.ask_sequential_refill(lane_id);
+        assert_eq!(held(&pipeline), 0, "a lane was held for room");
+        let lease = refill
+            .try_recv()
+            .ok()
+            .and_then(|answer| answer.lease)
+            .expect("a lane beside only carried bytes is served");
+        assert_eq!(lease.job_id(), job_id);
+        leased += lease.works().len();
+    }
+    assert!(leased >= 18, "{leased}");
+    assert!(volume.uncarried_bytes() <= limit);
+    assert!(!pipeline.volume_holds_budget(job_id));
+    drop(credit);
+}
+
 // Results of 512 bytes arrive for the job until less than one more article
 // fits below its volume's lease limit: one byte of room is left.
 fn fill_to_room_short(pipeline: &mut DispatchFixture, job_id: JobId, volume: &Volume) {

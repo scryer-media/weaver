@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::pipeline::graph::leaf::Leaf;
+use weaver_server_disk::operations::disk::volume::LoopSite;
 
 // A file system that gives no second name leaves a file at the name all
 // the same, so the leaf that is told its file is there can be moved and
@@ -18,7 +19,11 @@ fn a_refused_second_name_still_leaves_a_file_the_leaf_can_move() {
     second_name_or_empty(&from, &at);
 
     let mut leaf = Leaf::over(dir.path(), "kept/envelope-1", true);
-    assert_eq!(leaf.len().unwrap(), 0, "nothing was copied");
+    assert_eq!(
+        leaf.len(LoopSite::LeafWrite).unwrap(),
+        0,
+        "nothing was copied"
+    );
     leaf.intend("kept/moved");
     assert_eq!(leaf.move_on().unwrap().as_deref(), Some("kept/envelope-1"));
     assert!(dir.path().join("kept").join("moved").is_file());

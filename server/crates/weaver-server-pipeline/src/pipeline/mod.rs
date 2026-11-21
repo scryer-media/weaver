@@ -14,6 +14,7 @@ pub use completion::finalize::claim_complete_destination_path;
 mod db_reply;
 mod decode;
 pub mod diagnostics;
+pub mod disk_vote;
 pub mod download;
 pub mod extraction;
 pub mod full_disk;
@@ -2264,6 +2265,16 @@ pub struct Pipeline {
     pub volume_writers: Arc<crate::pipeline::graph::disk::PipelineWriters>,
     pub volume_rooms: tokio::sync::mpsc::UnboundedReceiver<()>,
     pub(super) volume_budget_held: std::sync::atomic::AtomicBool,
+    // Which volumes held dispatch for their write buffer in most of the
+    // last seconds, and what of that was last published for requests.
+    pub(super) disk_vote: crate::pipeline::disk_vote::DiskVote,
+    pub(super) disk_limits: Arc<crate::pipeline::disk_vote::DiskLimits>,
+    // The barriers each job listed as still writing out asked to be told
+    // of, one set per listed job, and what rings when they return: the
+    // room channel the volumes' writers already ring.
+    pub(super) disk_tells:
+        HashMap<JobId, Vec<weaver_server_disk::operations::disk::writer::Barrier>>,
+    pub(super) disk_tell: tokio::sync::mpsc::UnboundedSender<()>,
     // The clock the shutdown settle of the volume writers goes by, and how
     // long a volume may stand still before it is left behind. The machine's
     // clock outside tests; a test may put one it moves by hand here.
@@ -2273,15 +2284,18 @@ pub struct Pipeline {
     // The keeper of every volume's buffer limits.
     pub volume_buffers: Arc<crate::operations::VolumeBuffers>,
     // For each job with released results waiting for the loop: their bytes,
-    // counted as arrived on the one volume they are held on.
-    pub volume_arrived_by_job:
-        HashMap<JobId, weaver_server_disk::operations::disk::volume::Reservation>,
+    // counted as arrived on each volume they are held on.
+    pub volume_arrived_by_job: HashMap<JobId, crate::pipeline::download::VolumeHolds>,
     // For each job with articles leased to lanes: their bytes, reserved on
-    // the volume the job writes to (`Reservation::reserve`). Each article
-    // is reserved once, as it is leased, and given back once, as it leaves
-    // its lane's record however it ends (`note_lane_work_left`).
-    pub(super) volume_reserved_by_job:
-        HashMap<JobId, weaver_server_disk::operations::disk::volume::Reservation>,
+    // the volume each lands on (`Reservation::reserve`). Each article is
+    // reserved once, as it is leased, and given back once, as it leaves its
+    // lane's record however it ends (`note_lane_work_left`).
+    pub(super) volume_reserved_by_job: HashMap<JobId, crate::pipeline::download::VolumeHolds>,
+    // Released results whose bytes land on a volume that had no room for
+    // them, kept per job in the order they came until that volume has room
+    // (`ParkedResults`); and whether a volume may have room since.
+    pub(super) parked_download_results: crate::pipeline::download::ParkedResults,
+    pub(super) parked_results_room: bool,
     // What decode windows took from each disk they go on, for every graph
     // job together.
     pub(super) window_ledgers: weaver_server_disk::scratch::ScratchLedgers,

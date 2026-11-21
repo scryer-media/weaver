@@ -21,6 +21,7 @@ fn a_volume_is_listed_with_every_figure_held_for_it() {
         buffered_bytes: 65_536,
         arrived_bytes: 0,
         counted_bytes: 70_000,
+        carried_bytes: 0,
         peak_bytes: 90_000,
         buffer_soft_bytes: 0,
         buffer_limit_bytes: 0,

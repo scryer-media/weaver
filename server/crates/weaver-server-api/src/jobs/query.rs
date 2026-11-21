@@ -62,6 +62,12 @@ impl JobsQuery {
         .iter()
         .map(queue_item_from_job)
         .collect();
+        if ctx.look_ahead().field("diskWrite").exists() {
+            crate::jobs::types::attach_disk_writes(
+                ctx.data::<weaver_server_core::SharedPipelineState>()?,
+                &mut items,
+            );
+        }
         if ctx.look_ahead().field("duplicateSummary").exists() {
             attach_duplicate_summaries(ctx.data::<Database>()?.clone(), &mut items).await?;
         }
@@ -124,6 +130,12 @@ impl JobsQuery {
         .iter()
         .map(queue_item_from_job)
         .collect();
+        if ctx.look_ahead().field("items").field("diskWrite").exists() {
+            crate::jobs::types::attach_disk_writes(
+                ctx.data::<weaver_server_core::SharedPipelineState>()?,
+                &mut items,
+            );
+        }
         if ctx
             .look_ahead()
             .field("items")
@@ -517,6 +529,7 @@ pub(crate) fn page_wants(ctx: &Context<'_>) -> PageWants {
     let fields = ctx.look_ahead();
     PageWants {
         rows: fields.field("items").exists() || fields.field("etaThrough").exists(),
+        disk_write: fields.field("items").field("diskWrite").exists(),
     }
 }
 
@@ -612,6 +625,9 @@ pub(crate) async fn build_queue_page(
         .iter()
         .map(queue_table_item_from_job)
         .collect::<Vec<_>>();
+    if wants.disk_write {
+        crate::jobs::types::attach_disk_writes(state, &mut items);
+    }
     duplicates.attach(db, revision, &mut items).await?;
 
     Ok(QueuePage {

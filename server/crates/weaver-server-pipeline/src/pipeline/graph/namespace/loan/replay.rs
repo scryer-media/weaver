@@ -7,6 +7,7 @@
 
 use weaver_graph::{Builder, Effect, Posted, Provenance};
 use weaver_server_disk::operations::disk::reader::TurnStop;
+use weaver_server_disk::operations::disk::volume::LoopSite;
 
 use super::super::{Segments, Write, WriteError};
 use super::*;
@@ -368,7 +369,7 @@ impl NamespaceWriter {
         for ((volume, offset, bytes), provenance) in
             replayed.bytes.slices().zip(&replayed.provenance)
         {
-            self.below_budget()?;
+            self.below_budget(LoopSite::ObjectRelease)?;
             let mut effects = Vec::new();
             tree.replay_piece(
                 replayed.node,
@@ -382,7 +383,14 @@ impl NamespaceWriter {
                 &mut effects,
             );
             let mut applied = Vec::new();
-            self.apply_each(tree, builder, segments, effects, Write::Again, &mut applied)?;
+            self.apply_each(
+                tree,
+                builder,
+                segments,
+                effects,
+                Write::Again(LoopSite::ObjectRelease),
+                &mut applied,
+            )?;
             // The job answers password requests; payload effects have
             // already reached disk and must not accumulate across chunks.
             out.extend(

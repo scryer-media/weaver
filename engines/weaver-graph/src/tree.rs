@@ -927,6 +927,16 @@ impl Tree {
         self.object(node).is_some_and(Object::again_waits)
     }
 
+    // Whether bytes delivered to the object at `node` may go on to its
+    // members in the same step: see `Object::passes_on`. An object lent out
+    // answers as it did when it left.
+    pub fn passes_on(&self, node: NodeId) -> bool {
+        self.object(node)
+            .map(Object::passes_on)
+            .or_else(|| self.lent_passes_on(node))
+            .unwrap_or(false)
+    }
+
     // The recovery face of the object at `node`, if it has one and is in
     // its node.
     pub fn recovery(&self, node: NodeId) -> Option<&dyn Recovery> {
@@ -4088,10 +4098,13 @@ impl Tree {
         let Some(reading) = self.reading_on.get_mut(&(node, member)) else {
             return;
         };
-        reading.asked = false;
+        // An answer to an ask made before the member was offered afresh is
+        // not the one out: the newer ask stays out, and nothing is read
+        // again for it.
         if reading.next != at {
             return;
         }
+        reading.asked = false;
         if bytes.is_empty() {
             self.reading_on.remove(&(node, member));
             return;
@@ -6519,6 +6532,30 @@ mod tests {
                 assert_eq!(GIVEN_READ.with(std::cell::Cell::get) - before, own);
             }
         }
+    }
+
+    // An answer to a read asked before the member was offered afresh comes
+    // after the newer ask: it leaves that one out, so nothing reads the
+    // same bytes again while it is, and the newer answer is heard.
+    #[test]
+    fn a_stale_read_on_answer_leaves_the_newer_ask_out() {
+        let mut tree = Tree::new();
+        let at = (NodeId::ROOT, MemberId(0));
+        tree.reading_on.insert(
+            at,
+            ReadingOn {
+                objects: Vec::new(),
+                prospects: Vec::new(),
+                next: 4096,
+                asked: true,
+            },
+        );
+        let mut effects = Vec::new();
+        tree.read_on(at.0, at.1, 1024, b"stale", &mut effects);
+        assert!(effects.is_empty());
+        assert!(tree.reading_on[&at].asked, "the newer ask was let go");
+        tree.read_on(at.0, at.1, 4096, b"", &mut effects);
+        assert!(!tree.reading_on.contains_key(&at), "the newer answer heard");
     }
 
     // The root's `copy` folded into `into`, whatever it brought before.

@@ -25,6 +25,20 @@ export interface LiveConnectionState {
   isPolling: boolean;
 }
 
+/**
+ * A destination volume a download waits on or still writes to. A slow one is
+ * one dispatch keeps waiting on for its write buffer.
+ */
+export interface DiskVolume {
+  label: string;
+  /** Downloads keep waiting on it. */
+  slow: boolean;
+  /** Measured write rate; 0 until one is measured. */
+  writeRateBytesPerSec: number;
+  /** Bytes in memory waiting for its writer, from every download. */
+  waitingBytes: number;
+}
+
 export interface DownloadBlockState {
   kind: "NONE" | "MANUAL_PAUSE" | "SPEED_TEST" | "SCHEDULED" | "EGRESS_QUOTA" | "SERVER_QUOTA";
   /** The egress whose download quota is holding downloads, while one is. */

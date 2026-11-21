@@ -9,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use weaver_server_disk::operations::disk::volume::LoopSite;
 
 use crate::JobId;
 use crate::jobs::model::JobStatus;
@@ -22,7 +23,7 @@ use crate::pipeline::graph::leaf::LeafError;
 use crate::pipeline::graph::namespace::WriteError;
 use weaver_server_disk::operations::disk::volume::{Reservation, Volume};
 use weaver_server_disk::operations::disk::writer::{
-    Barrier, DiskOwner, Failure, Owner, Prepaid, Submitter, VolumeWriters,
+    Barrier, Credit, DiskOwner, Failure, Owner, Prepaid, Stand, Submitter, VolumeWriters,
 };
 
 // The volumes' writers as the pipeline writes through them: the writers
@@ -75,7 +76,8 @@ pub trait VolumeLeases {
     // The bytes below which leases are granted: the hard limit less the
     // loop's share. `u64::MAX` when the volume is not sized.
     fn lease_limit(&self) -> u64;
-    // The bytes a lease may still take.
+    // The bytes a lease may still take, beside what the volume counts
+    // besides carried bytes (`Volume::uncarried_bytes`), as it grants.
     fn lease_room(&self) -> u64;
 }
 
@@ -93,7 +95,7 @@ impl VolumeLeases for Volume {
     }
 
     fn lease_room(&self) -> u64 {
-        self.lease_limit().saturating_sub(self.unwritten_bytes())
+        self.lease_limit().saturating_sub(self.uncarried_bytes())
     }
 }
 
@@ -376,15 +378,16 @@ impl Pipeline {
             .min()
     }
 
-    // Whether every volume the job writes to counts nothing: each grants
-    // one article then, whatever its size (`Reservation::reserve`).
+    // Whether every volume the job writes to counts nothing besides held
+    // bytes its queuing threads carry (`Volume::uncarried_bytes`): each
+    // grants one article then, whatever its size (`Volume::grant`).
     pub(in crate::pipeline) fn volume_counts_nothing(&self, job_id: JobId) -> bool {
         self.graph_jobs
             .get(&job_id)
             .and_then(|graph| graph.disk())
             .is_some_and(|disk| {
                 disk.each()
-                    .all(|submitter| submitter.volume().unwritten_bytes() == 0)
+                    .all(|submitter| submitter.volume().uncarried_bytes() == 0)
             })
     }
 
@@ -632,14 +635,6 @@ pub struct JobDisk {
     _writing: Option<Arc<Writing>>,
 }
 
-// The bytes a volume may hold in memory for its writer before a thread
-// that produces a job's output waits for it: the volume's own hard limit.
-// It paces the thread only; what it hands the loop counts against the limit
-// as the loop queues it (`Submitter::write`).
-fn output_limit(submitter: &Submitter) -> u64 {
-    submitter.volume().buffer_limits().1
-}
-
 impl JobDisk {
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub fn new(working: Arc<Submitter>, output: Option<(PathBuf, Arc<Submitter>)>) -> Self {
@@ -650,15 +645,19 @@ impl JobDisk {
         }
     }
 
-    // Stand still until no volume the job writes to holds more than its
-    // hard limit for its writer: the wait of a thread that produces what
-    // the job writes, an extraction's run, before it hands the loop more.
-    // Never for the loop. Returns at once for a job whose writes failed
-    // or were given up.
-    pub(crate) fn wait_below(&self) {
-        for submitter in self.each() {
-            submitter.wait_below(output_limit(submitter));
-        }
+    // Count `bytes` on every volume the job writes to, standing still on the
+    // calling thread until each has them below its hard limit: what a
+    // thread that produces the job's output hands the loop with the bytes
+    // (`Credit::reserve`). Never the loop's own wait.
+    pub(crate) fn reserve_ahead(&self, bytes: u64, stand: Stand) -> Credit {
+        Credit::reserve(self.each(), bytes, stand)
+    }
+
+    // The same for the loop, which never stands: `None` when a volume
+    // refuses the bytes now (`Credit::try_reserve`). A stop keeps the
+    // volumes' limits until its end, as the loop's own writes do.
+    pub(crate) fn try_reserve(&self, bytes: u64) -> Option<Credit> {
+        Credit::try_reserve(self.each(), bytes, Stand::UntilStopsEnd)
     }
 
     // The writer of the volume a file under `root` lies on.
@@ -693,10 +692,10 @@ impl JobDisk {
     // the stop gives its volumes; false then, and the caller queues no
     // more of the job.
     #[must_use]
-    pub(crate) fn loop_wait_below(&self) -> bool {
+    pub(crate) fn loop_wait_below(&self, site: LoopSite) -> bool {
         self.each().all(|submitter| {
             let share = submitter.volume().loop_share();
-            submitter.wait_room(share)
+            submitter.wait_room(site, share)
         })
     }
 
@@ -705,6 +704,12 @@ impl JobDisk {
     // and every later one, stands on bytes that are not written.
     pub fn left_at_stop(&self) -> bool {
         self.each().any(|submitter| submitter.gave_up())
+    }
+
+    // Whether the owner is stopping on one of the job's volumes
+    // (`Submitter::stopping`): a wait aside there ends at once.
+    pub fn stopping(&self) -> bool {
+        self.each().any(|submitter| submitter.stopping())
     }
 
     // What the volumes the job writes to ask of its lanes: the most held
@@ -904,9 +909,9 @@ impl JobBarrier {
     // Wait until every operation behind it returned, counted against the
     // loop.
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-    pub fn wait(&self) {
+    pub fn wait(&self, site: LoopSite) {
         for barrier in &self.0 {
-            barrier.wait();
+            barrier.wait(site);
         }
     }
 

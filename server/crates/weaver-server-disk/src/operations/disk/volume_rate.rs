@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 use tracing::warn;
 
 use super::reader::VolumeReads;
-use super::volume::{LoopWait, Volume};
+use super::volume::{LoopSite, LoopWait, Volume};
 use super::{StorageCapacity, StorageKind, lock_paths};
 use crate::operations::instrumentation::VolumeSnapshot;
 
@@ -524,6 +524,7 @@ impl StorageCapacity {
                     buffered_bytes: volume.buffered_bytes.load(Ordering::Relaxed),
                     arrived_bytes: volume.arrived_bytes.load(Ordering::Relaxed),
                     counted_bytes: volume.unwritten_bytes(),
+                    carried_bytes: volume.carried_bytes(),
                     peak_bytes: volume.peak_bytes(),
                     idle_turns: volume.idle_turns.load(Ordering::Relaxed),
                     writer: writer_counts(volume),
@@ -600,10 +601,17 @@ fn written_to(volume: &Volume) -> bool {
 }
 
 // A volume's writer counts as they stand, each an atomic read.
-fn writer_counts(volume: &Volume) -> crate::operations::instrumentation::VolumeWriterSnapshot {
+pub(crate) fn writer_counts(
+    volume: &Volume,
+) -> crate::operations::instrumentation::VolumeWriterSnapshot {
     let counts = &volume.writer;
     let by_kind = |of: &[AtomicU64; LoopWait::COUNT]| {
         LoopWait::ALL.map(|kind| of[kind as usize].load(Ordering::Relaxed))
+    };
+    let by_site = |of: &[[AtomicU64; LoopSite::COUNT]; LoopWait::COUNT]| {
+        LoopWait::ALL.map(|kind| {
+            LoopSite::ALL.map(|site| of[kind as usize][site as usize].load(Ordering::Relaxed))
+        })
     };
     crate::operations::instrumentation::VolumeWriterSnapshot {
         batches: counts.batches.load(Ordering::Relaxed),
@@ -612,6 +620,8 @@ fn writer_counts(volume: &Volume) -> crate::operations::instrumentation::VolumeW
         loop_wait_nanos: counts.loop_wait_nanos.load(Ordering::Relaxed),
         loop_waits_by_kind: by_kind(&counts.loop_waits_by_kind),
         loop_wait_nanos_by_kind: by_kind(&counts.loop_wait_nanos_by_kind),
+        loop_waits_by_site: by_site(&counts.loop_waits_by_site),
+        loop_wait_nanos_by_site: by_site(&counts.loop_wait_nanos_by_site),
         loop_reads: counts.loop_reads.load(Ordering::Relaxed),
         loop_read_nanos: counts.loop_read_nanos.load(Ordering::Relaxed),
         aside_waits: counts.aside_waits.load(Ordering::Relaxed),
@@ -629,6 +639,8 @@ fn writer_counts(volume: &Volume) -> crate::operations::instrumentation::VolumeW
         length_sets_skipped: counts.length_sets_skipped.load(Ordering::Relaxed),
         closes: counts.closes.load(Ordering::Relaxed),
         close_nanos: counts.close_nanos.load(Ordering::Relaxed),
+        write_outs: counts.write_outs.load(Ordering::Relaxed),
+        write_out_nanos: counts.write_out_nanos.load(Ordering::Relaxed),
         failed_operations: counts.failed_operations.load(Ordering::Relaxed),
         abandoned_operations: counts.abandoned_operations.load(Ordering::Relaxed),
         threads: counts.threads.load(Ordering::Relaxed),
@@ -1337,6 +1349,7 @@ mod tests {
                     buffered_bytes: 0,
                     arrived_bytes: 0,
                     counted_bytes: 0,
+                    carried_bytes: 0,
                     peak_bytes: 0,
                     buffer_soft_bytes: 0,
                     buffer_limit_bytes: 0,
@@ -1356,6 +1369,7 @@ mod tests {
                     buffered_bytes: 65_536,
                     arrived_bytes: 0,
                     counted_bytes: 0,
+                    carried_bytes: 0,
                     peak_bytes: 0,
                     buffer_soft_bytes: 700_000,
                     buffer_limit_bytes: 1_000_000,
@@ -1375,6 +1389,7 @@ mod tests {
                     buffered_bytes: 0,
                     arrived_bytes: 0,
                     counted_bytes: 0,
+                    carried_bytes: 0,
                     peak_bytes: 0,
                     // Not sized yet: no limit to tell.
                     buffer_soft_bytes: 0,

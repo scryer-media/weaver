@@ -39,6 +39,9 @@ pub(super) struct Lent {
     queued: Vec<(NodeId, MemberId)>,
     // Lent for the work it held, not for a repair.
     work: bool,
+    // Its `Object::passes_on` when it left: what the node answers while it
+    // is out.
+    passes_on: bool,
 }
 
 // Bytes for one of an object's volumes, owned, so a delivery can wait.
@@ -145,6 +148,7 @@ impl Tree {
             waiting: Vec::new(),
             queued: Vec::new(),
             work: false,
+            passes_on: object.passes_on(),
         });
         Some(object)
     }
@@ -210,12 +214,13 @@ impl Tree {
             waiting: Vec::new(),
             queued: Vec::new(),
             work: true,
+            passes_on: object.passes_on(),
         });
         Some(object)
     }
 
-    #[cfg(test)]
-    pub(super) fn lend_for_test(&mut self, node: NodeId) -> Option<Box<dyn Object>> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn lend_for_test(&mut self, node: NodeId) -> Option<Box<dyn Object>> {
         self.lend_out(node)
     }
 
@@ -303,6 +308,11 @@ impl Tree {
 
     pub(super) fn lent_kind(&self, node: NodeId) -> Option<Kind> {
         Some(self.nodes.get(&node)?.lent.as_ref()?.kind)
+    }
+
+    // What the object at `node` said of `Object::passes_on` as it left.
+    pub(super) fn lent_passes_on(&self, node: NodeId) -> Option<bool> {
+        Some(self.nodes.get(&node)?.lent.as_ref()?.passes_on)
     }
 
     // The facts of the object at `node` as they were when it was lent for a

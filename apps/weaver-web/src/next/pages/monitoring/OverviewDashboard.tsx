@@ -25,7 +25,7 @@ import {
 } from "../../data/format";
 import { useNextData } from "../../data/next-data";
 import { WV } from "../../data/palette";
-import { queuePageInput, queueSelection } from "../../data/queue-page";
+import { nothingDownloading, queuePageInput, queueSelection, slowDiskRate } from "../../data/queue-page";
 import { useQueuePage } from "../../data/use-live-queue";
 import { countLabel } from "../../i18n/labels";
 import { NextShell } from "../../shell/NextShell";
@@ -59,13 +59,14 @@ function downloadsWord(t: Translate, state: ReturnType<typeof downloadsState>["s
 
 export function OverviewDashboard() {
   const t = useTranslate();
-  const { speed, peakSpeed, downloadBlock, isPaused, queue, providers } = useNextData(
+  const { speed, peakSpeed, downloadBlock, isPaused, queue, providers, diskVolumes } = useNextData(
     "speed",
     "peakSpeed",
     "downloadBlock",
     "isPaused",
     "queue",
     "providers",
+    "diskVolumes",
   );
   const midnight = useStartOfToday();
   const range = useMemo(() => ({ period: "CUSTOM" as const, ...lastDays(midnight, 30) }), [midnight]);
@@ -94,7 +95,12 @@ export function OverviewDashboard() {
   );
   // The limit the daemon holds the wire to, as the queue header shows it.
   const limit = downloadBlock.speedLimitInForce;
-  const etaConditions = useMemo(() => ({ paused: isPaused, speedLimit: limit ?? 0 }), [isPaused, limit]);
+  const idle = useMemo(() => nothingDownloading(page.stateCounts), [page.stateCounts]);
+  const diskRate = useMemo(() => slowDiskRate(diskVolumes), [diskVolumes]);
+  const etaConditions = useMemo(
+    () => ({ paused: isPaused, speedLimit: limit ?? 0, idle, diskRate }),
+    [isPaused, limit, idle, diskRate],
+  );
   const etaSpeed = useStableEtaSpeed(etaSample, speed, etaConditions);
   const remaining = page.remainingBytes;
 

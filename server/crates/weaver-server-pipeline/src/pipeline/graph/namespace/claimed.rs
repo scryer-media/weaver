@@ -11,6 +11,7 @@
 // whose volumes live in their files.
 
 use std::sync::Arc;
+use weaver_server_disk::operations::disk::volume::LoopSite;
 
 use bytes::Bytes;
 use weaver_graph::{ByteRange, Coverage, Effect, MemberId, NodeId, Tree};
@@ -85,7 +86,7 @@ impl NamespaceWriter {
                 .and_then(|files| files.leaves.get(&member))
                 .ok_or(WriteError::UnknownMember { node, member })?;
             let end = if run.provenance.is_damaged() {
-                run.range.end.min(leaf.len()?)
+                run.range.end.min(leaf.len(LoopSite::ReplayFile)?)
             } else {
                 run.range.end
             };
@@ -106,16 +107,23 @@ impl NamespaceWriter {
             let chunk = ByteRange::new(start, end.min(start.saturating_add(READ_BACK)));
             at = chunk.end;
             let mut bytes = Vec::new();
-            leaf.read(chunk.start, super::index(chunk.len()), &mut bytes)?;
+            leaf.read(
+                LoopSite::ReplayFile,
+                chunk.start,
+                super::index(chunk.len()),
+                &mut bytes,
+            )?;
             // The file the chunk came from, asked at each read: an envelope
             // whose file is that very file takes the chunk where it was
             // read without writing it over itself.
-            let read_from = leaf.file_id().map(|file| super::FromFile {
-                node,
-                member,
-                range: chunk,
-                file,
-            });
+            let read_from = leaf
+                .file_id(LoopSite::ReplayFile)
+                .map(|file| super::FromFile {
+                    node,
+                    member,
+                    range: chunk,
+                    file,
+                });
             let arrival = Arrival {
                 node,
                 member,

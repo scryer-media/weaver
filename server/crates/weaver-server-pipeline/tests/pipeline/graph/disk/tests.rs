@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, mpsc};
+use weaver_server_disk::operations::disk::volume::LoopSite;
 
 use super::JobDisk;
 use crate::pipeline::graph::checkpoint::Pending;
@@ -131,7 +132,7 @@ fn a_job_written_through_a_volume_matches_one_that_writes_itself() {
         arrive(&mut inline, volume, ordinal);
         arrive(&mut queued, volume, ordinal);
     }
-    disk.barrier().wait();
+    disk.barrier().wait(LoopSite::LeafWrite);
     assert!(disk.barrier().passed());
     assert_eq!(through.buffered(), 0);
     assert_eq!(on_disk(queued_dir.path()), on_disk(inline_dir.path()));
@@ -167,7 +168,7 @@ fn settled_bytes_are_said_once_the_disk_bears_them_out() {
     assert_eq!(pending.in_hand_bytes(), 0);
     let barrier = disk.barrier();
     hold.open();
-    barrier.wait();
+    barrier.wait(LoopSite::LeafWrite);
     assert!(pending.take().0.is_some());
     assert_eq!(pending.in_hand_bytes(), job.in_hand_bytes());
 }
@@ -196,7 +197,7 @@ fn a_checkpoint_taken_while_writes_are_held_records_none() {
     assert!(pending.take().0.is_none());
     let barrier = disk.barrier();
     hold.open();
-    barrier.wait();
+    barrier.wait(LoopSite::LeafWrite);
     assert!(pending.take().0.is_some());
     assert!(!pending.gated());
 }
@@ -229,7 +230,7 @@ fn a_held_change_goes_once_its_own_writes_returned() {
     assert!(pending.take().0.is_some(), "the first change is released");
     assert!(pending.gated(), "the second still waits");
     hold.open();
-    disk.barrier().wait();
+    disk.barrier().wait(LoopSite::LeafWrite);
     assert!(pending.take().0.is_some());
 }
 
@@ -242,15 +243,16 @@ fn a_read_waits_for_the_writes_of_its_range() {
     let hold = through.hold();
     let to = through.writers.test_submitter(&through.volume, 1);
     let mut leaf = Leaf::at(dir.path(), "a.bin").through(Some(&to));
-    leaf.write(0, b"lantern", None).unwrap();
-    leaf.write(7, b"light", None).unwrap();
+    leaf.write(LoopSite::LeafWrite, 0, b"lantern", None)
+        .unwrap();
+    leaf.write(LoopSite::LeafWrite, 7, b"light", None).unwrap();
     assert!(leaf.settled().is_some_and(|barrier| !barrier.passed()));
     hold.wait_held();
     assert!(!leaf.path().exists(), "nothing is on disk yet");
     std::thread::scope(|scope| {
         let reader = scope.spawn(|| {
             let mut read = Vec::new();
-            leaf.read(0, 12, &mut read).unwrap();
+            leaf.read(LoopSite::LeafWrite, 0, 12, &mut read).unwrap();
             read
         });
         hold.open();
@@ -270,27 +272,28 @@ fn the_loop_reads_an_open_file_through_one_handle_until_it_closes() {
     let to = through.writers.test_submitter(&through.volume, 1);
     let reads = || through.volume.writer.loop_reads.load(Ordering::Relaxed);
     let mut leaf = Leaf::at(dir.path(), "a.bin").through(Some(&to));
-    leaf.write(0, b"lanternlight", None).unwrap();
+    leaf.write(LoopSite::LeafWrite, 0, b"lanternlight", None)
+        .unwrap();
     assert!(!leaf.holds_reader(), "nothing was read yet");
 
     let mut read = Vec::new();
-    leaf.read(0, 7, &mut read).unwrap();
+    leaf.read(LoopSite::LeafWrite, 0, 7, &mut read).unwrap();
     assert!(leaf.holds_reader());
-    leaf.read(7, 5, &mut read).unwrap();
+    leaf.read(LoopSite::LeafWrite, 7, 5, &mut read).unwrap();
     assert_eq!(read, b"lanternlight");
     assert_eq!(reads(), 2);
 
-    leaf.close(12).unwrap();
+    leaf.close(LoopSite::LeafWrite, 12).unwrap();
     assert!(!leaf.holds_reader(), "the handle goes before the close");
     read.clear();
-    leaf.read(0, 12, &mut read).unwrap();
+    leaf.read(LoopSite::LeafWrite, 0, 12, &mut read).unwrap();
     assert_eq!(read, b"lanternlight");
     assert!(!leaf.holds_reader(), "a closed file is not held");
     assert_eq!(reads(), 3);
 
-    leaf.write(12, b"!", None).unwrap();
+    leaf.write(LoopSite::LeafWrite, 12, b"!", None).unwrap();
     read.clear();
-    leaf.read(12, 1, &mut read).unwrap();
+    leaf.read(LoopSite::LeafWrite, 12, 1, &mut read).unwrap();
     assert_eq!(read, b"!");
     assert!(leaf.holds_reader());
     leaf.release_handle();
@@ -309,8 +312,9 @@ fn the_length_of_a_file_whose_write_failed_is_an_error() {
     let hold = through.hold();
     let to = through.writers.test_submitter(&through.volume, 1);
     let mut leaf = Leaf::at(dir.path(), "a.bin").through(Some(&to));
-    leaf.write(0, b"lantern", None).unwrap();
-    leaf.write(7, b"light", None).unwrap();
+    leaf.write(LoopSite::LeafWrite, 0, b"lantern", None)
+        .unwrap();
+    leaf.write(LoopSite::LeafWrite, 7, b"light", None).unwrap();
     hold.wait_held();
     // The first write goes down; the second fails.
     hold.release(1);
@@ -318,7 +322,7 @@ fn the_length_of_a_file_whose_write_failed_is_an_error() {
     hold.fail_next(std::io::Error::other("no room"));
     hold.open();
 
-    let error = leaf.len().unwrap_err();
+    let error = leaf.len(LoopSite::LeafWrite).unwrap_err();
 
     assert!(error.to_string().contains("failed"), "{error}");
     assert_eq!(std::fs::metadata(leaf.path()).unwrap().len(), 7);
@@ -332,8 +336,9 @@ fn a_move_follows_the_last_write_of_its_file() {
     let hold = through.hold();
     let to = through.writers.test_submitter(&through.volume, 1);
     let mut leaf = Leaf::at(dir.path(), "from.bin").through(Some(&to));
-    leaf.write(0, b"lantern", None).unwrap();
-    leaf.write(7, b"light", None).unwrap();
+    leaf.write(LoopSite::LeafWrite, 0, b"lantern", None)
+        .unwrap();
+    leaf.write(LoopSite::LeafWrite, 7, b"light", None).unwrap();
     leaf.intend("to.bin");
     leaf.move_on().unwrap();
     let moved = to.barrier();
@@ -348,7 +353,7 @@ fn a_move_follows_the_last_write_of_its_file() {
     assert!(!dir.path().join("to.bin").exists());
     assert!(!moved.returned());
     hold.open();
-    moved.wait();
+    moved.wait(LoopSite::LeafWrite);
     assert!(moved.passed());
     assert!(!dir.path().join("from.bin").exists());
     assert_eq!(
@@ -374,7 +379,7 @@ fn a_stopped_job_is_kept_until_its_last_write_returned() {
     assert!(!job.awaits_mail());
     let barrier = disk.barrier();
     hold.open();
-    barrier.wait();
+    barrier.wait(LoopSite::LeafWrite);
     assert!(!job.holds_retirement());
     assert_eq!(on_disk(dir.path()), on_disk(inline_dir.path()));
 }
@@ -399,7 +404,7 @@ fn nothing_is_written_once_a_job_gives_its_files_up() {
     assert!(job.holds_retirement());
     let barrier = disk.barrier();
     hold.open();
-    barrier.wait();
+    barrier.wait(LoopSite::LeafWrite);
     assert!(!job.holds_retirement());
     assert_eq!(on_disk(dir.path()), before, "nothing was written after");
     assert_eq!(through.buffered(), 0);
@@ -429,7 +434,7 @@ fn a_failed_write_comes_back_under_the_jobs_key() {
     hold.fail_next(std::io::Error::other("the disk is gone"));
     let barrier = disk.barrier();
     hold.open();
-    barrier.wait();
+    barrier.wait(LoopSite::LeafWrite);
     let mut failures = Vec::new();
     while failures.is_empty() {
         failures.extend(through.reports.recv().unwrap().failures);
@@ -467,7 +472,7 @@ fn a_volume_is_at_its_limit_only_while_the_bytes_wait() {
     assert_eq!(disk.intake(), VolumeIntake::Stopped);
     let barrier = disk.barrier();
     hold.open();
-    barrier.wait();
+    barrier.wait(LoopSite::LeafWrite);
     assert_eq!(through.volume.unwritten_bytes(), 0);
     assert_eq!(disk.intake(), VolumeIntake::Open);
 }
@@ -532,14 +537,14 @@ fn a_job_on_two_volumes_waits_for_both() {
     let barrier = disk.barrier();
     assert!(!disk.quiet());
     hold.open();
-    disk.working().barrier().wait();
+    disk.working().barrier().wait(LoopSite::LeafWrite);
     assert!(working_dir.join("lantern.bin").exists());
     assert!(!barrier.returned(), "the other volume still holds its part");
     assert!(!disk.quiet());
     assert!(!output_dir.join("lantern.bin").exists());
     other_hold.fail_next(std::io::Error::other("the other disk is gone"));
     other_hold.open();
-    barrier.wait();
+    barrier.wait(LoopSite::LeafWrite);
     assert!(disk.quiet());
     assert!(barrier.returned());
     assert!(
@@ -746,7 +751,7 @@ fn operations_that_return_between_a_deliverys_two_looks_do_not_strand_it() {
     let returning = barrier.clone();
     super::between_looks::set(move || {
         hold.open();
-        returning.wait();
+        returning.wait(LoopSite::LeafWrite);
     });
     let passed = barrier.passed_or_tell(crate::JobId(1), &mail);
     assert!(barrier.passed());
@@ -772,7 +777,7 @@ fn a_delivery_behind_held_operations_is_told_when_they_return() {
     assert!(!barrier.passed_or_tell(crate::JobId(1), &mail));
     assert!(heard.try_recv().is_err());
     hold.open();
-    barrier.wait();
+    barrier.wait(LoopSite::LeafWrite);
     let said = heard.blocking_recv().expect("the job is told");
     assert_eq!(said.scope, 1);
     assert!(matches!(
@@ -794,7 +799,8 @@ fn a_released_file_is_released_again_only_after_another_operation() {
     let hold = through.hold();
     let to = through.writers.test_submitter(&through.volume, 1);
     let mut leaf = Leaf::at(dir.path(), "a.bin").through(Some(&to));
-    leaf.write(0, b"lantern", None).unwrap();
+    leaf.write(LoopSite::LeafWrite, 0, b"lantern", None)
+        .unwrap();
     leaf.release_handle();
     let released = to.barrier();
     leaf.release_handle();
@@ -803,13 +809,13 @@ fn a_released_file_is_released_again_only_after_another_operation() {
     // them is still held.
     hold.wait_held();
     hold.release(2);
-    released.wait();
+    released.wait(LoopSite::LeafWrite);
     assert!(
         to.barrier().returned(),
         "nothing was queued behind the release"
     );
 
-    leaf.write(7, b"light", None).unwrap();
+    leaf.write(LoopSite::LeafWrite, 7, b"light", None).unwrap();
     leaf.release_handle();
     let again = to.barrier();
     assert!(
@@ -817,7 +823,7 @@ fn a_released_file_is_released_again_only_after_another_operation() {
         "the file was opened again and is released"
     );
     hold.open();
-    again.wait();
+    again.wait(LoopSite::LeafWrite);
     assert!(again.passed());
     assert_eq!(std::fs::read(leaf.path()).unwrap(), b"lanternlight");
 }
@@ -837,12 +843,13 @@ fn a_fold_never_waits_for_the_file_s_operations() {
     let hold = through.hold();
     let to = through.writers.test_submitter(&through.volume, 1);
     let mut leaf = Leaf::at(dir.path(), "a.bin").through(Some(&to));
-    leaf.write(0, b"lantern", None).unwrap();
+    leaf.write(LoopSite::LeafWrite, 0, b"lantern", None)
+        .unwrap();
     leaf.release_handle();
     hold.wait_held();
     hold.release(1);
     let written = to.barrier();
-    leaf.write(7, b"light", None).unwrap();
+    leaf.write(LoopSite::LeafWrite, 7, b"light", None).unwrap();
     let digest = Algorithm::Crc32.hash(b"lantern");
 
     leaf.fold_read(7, digest);

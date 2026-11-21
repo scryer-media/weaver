@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use std::sync::Mutex;
+use weaver_server_disk::operations::disk::volume::LoopSite;
 
 use weaver_graph::holds::{HoldBudgets, ScratchHold};
 
@@ -1012,7 +1013,7 @@ fn holds_paged_out_at_a_stop_read_back_in_a_writer_rebuilt_from_their_records() 
         .expect("restore holds");
     assert_eq!(job.accountant.usage().scratch, 7);
     let mut bytes = Vec::new();
-    assert!(job.writer.access(&job.tree).read_at(
+    assert!(job.writer.access(&job.tree, LoopSite::ReadOn).read_at(
         NodeId::ROOT,
         member,
         ByteRange::new(6, 11),
@@ -1020,7 +1021,7 @@ fn holds_paged_out_at_a_stop_read_back_in_a_writer_rebuilt_from_their_records() 
     ));
     assert_eq!(bytes, b"world");
     bytes.clear();
-    assert!(job.writer.access(&job.tree).read_at(
+    assert!(job.writer.access(&job.tree, LoopSite::ReadOn).read_at(
         NodeId::ROOT,
         member,
         ByteRange::new(0, 2),
@@ -1052,7 +1053,7 @@ fn a_hold_record_past_its_scratch_file_is_not_adopted() {
         .expect("restore holds");
     assert_eq!(job.accountant.usage().scratch, 0);
     let mut bytes = Vec::new();
-    assert!(!job.writer.access(&job.tree).read_at(
+    assert!(!job.writer.access(&job.tree, LoopSite::ReadOn).read_at(
         NodeId::ROOT,
         member,
         ByteRange::new(6, 11),
@@ -1106,7 +1107,7 @@ fn nothing_held(job: &Job, budget: &str) {
     for (member, spill) in &files.spills {
         assert!(files.spills_empty.contains(member), "{budget}");
         assert!(
-            spill.len().expect("spill length") == 0
+            spill.len(LoopSite::LeafWrite).expect("spill length") == 0
                 || job
                     .writer
                     .spills_emptying
@@ -1289,11 +1290,12 @@ fn holds_restored_under_a_lower_ceiling_come_back_on_file() {
         (ByteRange::new(2, 9), b"r! mid."),
     ] {
         let mut bytes = Vec::new();
-        assert!(
-            job.writer
-                .access(&job.tree)
-                .read_at(NodeId::ROOT, member, range, &mut bytes)
-        );
+        assert!(job.writer.access(&job.tree, LoopSite::ReadOn).read_at(
+            NodeId::ROOT,
+            member,
+            range,
+            &mut bytes
+        ));
         assert_eq!(bytes, held);
     }
 
@@ -1367,7 +1369,7 @@ fn a_second_stop_marks_a_namespace_whose_holds_are_already_on_scratch() {
 fn read_at(job: &Job, node: NodeId, member: MemberId, range: ByteRange) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
     job.writer
-        .access(&job.tree)
+        .access(&job.tree, LoopSite::ReadOn)
         .read_at(node, member, range, &mut bytes)
         .then_some(bytes)
 }
@@ -2115,7 +2117,7 @@ fn bytes_held_before_a_store_knows_its_map_reach_the_member_once_it_does() {
     assert_eq!(job.file("inner.bin"), b"hello");
 
     // The volume reads back whole through the object's placements.
-    let access = job.writer.access(&job.tree);
+    let access = job.writer.access(&job.tree, LoopSite::ReadOn);
     let mut posted = Vec::new();
     assert!(access.read_at(
         NodeId::ROOT,
@@ -2537,10 +2539,12 @@ fn delivery_releases_partial_and_retired_files_without_changing_their_bytes() {
     let member = job.member("partial.bin", Some(10));
     job.send(member, 0, b"front", Provenance::Fresh);
     let mut retired = Leaf::at(job.dir.path(), "retired.bin");
-    retired.write(0, b"old", None).unwrap();
+    retired.write(LoopSite::LeafWrite, 0, b"old", None).unwrap();
     job.writer.discard(retired).unwrap();
     let mut scratch = Leaf::at(job.dir.path(), ".weaver-chunks/scratch");
-    scratch.write(0, b"held", None).unwrap();
+    scratch
+        .write(LoopSite::LeafWrite, 0, b"held", None)
+        .unwrap();
     job.writer.files_mut(NodeId::ROOT).scratch = Some(scratch);
     assert_eq!(job.writer.open_files().len(), 3);
     let partial = job.file("partial.bin");
@@ -2835,7 +2839,7 @@ fn a_bound_member_reads_back_through_its_envelope_and_its_child() {
     assert_eq!(job.file("inner.bin"), b"hello");
     assert!(!job.dir.path().join("pack.bin").exists());
 
-    let access = job.writer.access(&job.tree);
+    let access = job.writer.access(&job.tree, LoopSite::ReadOn);
     let mut posted = Vec::new();
     assert!(access.read_at(NodeId::ROOT, member, ByteRange::new(0, 12), &mut posted));
     assert_eq!(posted, [SIGNATURE, b"hello"].concat());
@@ -3012,10 +3016,10 @@ fn give_back_retains_the_unreplayed_leaf_without_adopting_sparse_holes() {
         job.writer
             .write_file(
                 &mut job.tree,
-                NodeId::ROOT,
-                member,
+                (NodeId::ROOT, member),
                 offset,
                 &bytes.to_vec().into(),
+                LoopSite::LeafWrite,
             )
             .unwrap();
         let original = job.writer.files[&NodeId::ROOT].leaves[&member]
@@ -3060,7 +3064,7 @@ fn give_back_retains_the_unreplayed_leaf_without_adopting_sparse_holes() {
         let leaf = &job.writer.files[&NodeId::ROOT].leaves[&member];
         assert_eq!(leaf.path(), original, "handover keeps the recorded source");
         let mut actual = Vec::new();
-        leaf.read(0, 12, &mut actual).unwrap();
+        leaf.read(LoopSite::LeafWrite, 0, 12, &mut actual).unwrap();
         assert_eq!(&actual[..HEADER as usize], SIGNATURE);
         assert_eq!(&actual[10..], &source[10..]);
         if !sparse {
@@ -3078,10 +3082,10 @@ fn give_back_does_not_retain_a_truncated_leaf_tail() {
     job.writer
         .write_file(
             &mut job.tree,
-            NodeId::ROOT,
-            member,
+            (NodeId::ROOT, member),
             0,
             &[SIGNATURE, b"hello"].concat().into(),
+            LoopSite::LeafWrite,
         )
         .unwrap();
     let leaf = job
@@ -3090,7 +3094,7 @@ fn give_back_does_not_retain_a_truncated_leaf_tail() {
         .leaves
         .get_mut(&member)
         .unwrap();
-    leaf.close(12).unwrap();
+    leaf.close(LoopSite::LeafWrite, 12).unwrap();
     std::fs::OpenOptions::new()
         .write(true)
         .open(leaf.path())
@@ -3132,10 +3136,10 @@ fn give_back_reports_a_missing_recorded_leaf_without_discarding_the_source_recor
     job.writer
         .write_file(
             &mut job.tree,
-            NodeId::ROOT,
-            member,
+            (NodeId::ROOT, member),
             0,
             &[SIGNATURE, b"hello"].concat().into(),
+            LoopSite::LeafWrite,
         )
         .unwrap();
     let leaf = job
@@ -3144,7 +3148,7 @@ fn give_back_reports_a_missing_recorded_leaf_without_discarding_the_source_recor
         .leaves
         .get_mut(&member)
         .unwrap();
-    leaf.close(12).unwrap();
+    leaf.close(LoopSite::LeafWrite, 12).unwrap();
     std::fs::remove_file(leaf.path()).unwrap();
 
     assert!(
@@ -3220,7 +3224,7 @@ fn a_member_given_back_after_a_restore_holds_only_what_its_envelope_kept() {
         .coverage;
     assert!(coverage.covered(ByteRange::new(0, 3)));
     assert!(!coverage.covered(ByteRange::new(3, 4)), "{coverage:?}");
-    let access = job.writer.access(&job.tree);
+    let access = job.writer.access(&job.tree, LoopSite::ReadOn);
     let mut posted = Vec::new();
     assert!(access.read_at(NodeId::ROOT, member, ByteRange::new(0, 3), &mut posted));
     assert_eq!(posted, &SIGNATURE[..3]);
@@ -3726,7 +3730,7 @@ fn bytes_held_below_the_root_reach_their_member_once_its_store_knows_its_map() {
     job.send(member, HEADER + map_at().start, MAP, Provenance::Fresh);
     assert_eq!(job.writer.held_bytes(store), 0);
     assert_eq!(job.accountant.usage().resident, 0);
-    let access = job.writer.access(&job.tree);
+    let access = job.writer.access(&job.tree, LoopSite::ReadOn);
     let mut inner = Vec::new();
     assert!(access.read_at(
         late,
@@ -4683,7 +4687,10 @@ fn a_repair_into_the_posts_is_promised_its_room_before_it_goes_out() {
             returned,
             &mut job.out,
         );
-        assert_eq!(result.unwrap(), Some(1));
+        assert_eq!(
+            result.unwrap(),
+            crate::pipeline::graph::namespace::Tailed::Done(Some(1))
+        );
         assert!(job.writer.refusal().is_none());
         assert!(
             !job.writer.disk_held(),
@@ -5004,7 +5011,7 @@ fn a_lent_repair_reads_held_bytes_in_place_and_nothing_it_does_not_ask_for() {
         assert!(!job.writer.moved_since(&job.tree, &returned));
         assert_eq!(job.writer.held_bytes(NodeId::ROOT), held);
         let mut backlog_back = Vec::new();
-        assert!(job.writer.access(&job.tree).read_at(
+        assert!(job.writer.access(&job.tree, LoopSite::ReadOn).read_at(
             NodeId::ROOT,
             other,
             ByteRange::at(0, backlog.len() as u64),
@@ -5172,7 +5179,7 @@ fn a_scratch_hold_replaced_while_its_repair_is_out_takes_the_repair_back() {
         .unwrap_err();
     assert!(matches!(error, WriteError::StaleRecovery { .. }));
     let mut now = Vec::new();
-    assert!(job.writer.access(&job.tree).read_at(
+    assert!(job.writer.access(&job.tree, LoopSite::ReadOn).read_at(
         NodeId::ROOT,
         member,
         ByteRange::new(0, 8),
@@ -5271,7 +5278,7 @@ fn a_returned_ruling_stands_while_its_file_changes_past_what_it_read() {
                 .leaves
                 .get_mut(&member)
                 .unwrap()
-                .write(offset, bytes, None)
+                .write(LoopSite::LeafWrite, offset, bytes, None)
                 .unwrap();
         };
         write(&mut job, 8, b"AND MORE");

@@ -6,6 +6,7 @@ use super::*;
 use crate::pipeline::graph::disk::VolumeLeases;
 use tokio::sync::oneshot;
 use weaver_nntp::client::BlockingBodyLaneAcquireError;
+use weaver_server_disk::operations::disk::volume::LoopSite;
 use weaver_server_disk::operations::disk::{volume::Volume, writer::Hold};
 
 pub enum VolumeFetchFailure {
@@ -120,7 +121,7 @@ fn written(pipeline: &Pipeline, job_id: JobId) {
         .disk()
         .unwrap()
         .barrier()
-        .wait();
+        .wait(LoopSite::LeafWrite);
 }
 
 fn batch_complete(
@@ -194,6 +195,24 @@ impl DispatchFixture {
 
     pub fn set_volume_budget(&self, hard: u64) {
         self.0.volume_buffers.set_figure(hard, u64::MAX);
+    }
+
+    // `bytes` counted on the job's working volume and carried there by its
+    // queuing thread, as held run output is, until the credit is dropped.
+    pub fn carry_on_working(
+        &self,
+        id: JobId,
+        bytes: u64,
+    ) -> weaver_server_disk::operations::disk::writer::Credit {
+        use weaver_server_disk::operations::disk::writer::{Credit, Stand};
+        let disk = self.0.graph_jobs[&id]
+            .disk()
+            .expect("the job writes through its volume's writer");
+        let mut credit = Credit::try_reserve([disk.working()], bytes, Stand::UntilStopsEnd)
+            .expect("a volume counting nothing grants one request whatever its size");
+        assert!(credit.covers(bytes));
+        credit.carry();
+        credit
     }
 
     pub fn lane_and_volume_reservations(&self) -> (u64, u64) {

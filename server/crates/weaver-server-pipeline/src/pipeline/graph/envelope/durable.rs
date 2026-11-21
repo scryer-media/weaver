@@ -7,6 +7,7 @@
 // are instead of starting them over.
 
 use weaver_graph::{Coverage, NodeId, Run};
+use weaver_server_disk::operations::disk::volume::LoopSite;
 
 use super::{Envelopes, Kept, envelope_name};
 use crate::pipeline::graph::leaf::{Leaf, LeafError};
@@ -71,7 +72,7 @@ impl Envelopes {
         // or shortened since. Missing bytes must wait for refetch before
         // a run starts: stale coverage would let it fail on an absent
         // file, then never restart when fresh bytes replace that coverage.
-        let length = match leaf.len() {
+        let length = match leaf.len(LoopSite::Durable) {
             Ok(length) => length,
             Err(LeafError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => 0,
             Err(error) => return Err(error),

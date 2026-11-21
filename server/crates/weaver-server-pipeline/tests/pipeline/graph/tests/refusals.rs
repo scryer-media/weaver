@@ -706,3 +706,60 @@ fn a_cancel_between_volumes_of_a_give_up_drops_the_rest() {
     assert_eq!(refusing.refused_count(), 1, "nothing more is copied");
     assert_eq!(refusing.internal(), internal);
 }
+
+// A give-up does not go on over a release that stands: its turns take no
+// step and it is not rung, and mail under another number changes nothing.
+// Once the release's mail is heard the give-up is rung again and goes on,
+// and it ends with the same statuses, events and files as the give-up no
+// release stood in front of.
+#[test]
+fn a_give_up_behind_a_standing_release_ends_as_with_room() {
+    use weaver_server_disk::operations::disk::writer::Credit;
+    let paid = |refusing: &mut Refusing, generation: u64| {
+        refusing
+            .job
+            .run_said(
+                Said {
+                    scope: 1,
+                    node: NodeId::ROOT,
+                    generation,
+                    heard: Heard::ReleasePaid(Box::new(Credit::none())),
+                },
+                &mut RepairSlots::default(),
+                1,
+            )
+            .unwrap();
+    };
+    let mut whole = given_up(3, true);
+    let mut stood = given_up(3, false);
+    assert_eq!(stood.refused_count(), 1, "one volume on the quiet's turn");
+    let serial = stood.job.stand_release();
+    assert!(
+        !stood.job.ring_give_up(),
+        "not rung while the release stands"
+    );
+    stood.give_up_turn();
+    stood.give_up_turn();
+    assert!(stood.job.giving_up());
+    assert_eq!(stood.refused_count(), 1, "no step over the release");
+    paid(&mut stood, serial + 1);
+    assert!(!stood.job.ring_give_up(), "other mail does not ring it");
+    stood.give_up_turn();
+    assert_eq!(stood.refused_count(), 1, "still no step");
+    paid(&mut stood, serial);
+    assert!(stood.job.ring_give_up(), "the paid release rings it again");
+    while stood.job.giving_up() {
+        stood.give_up_turn();
+    }
+    assert_eq!(stood.refused_count(), 3);
+    assert_eq!(said(&mut stood), said(&mut whole));
+    assert_eq!(stood.internal(), whole.internal());
+    stood.checkpoint(1);
+    whole.checkpoint(1);
+    for volume in 0..3 {
+        let name = format!("lantern.part{}.rar", volume + 1);
+        assert_eq!(stood.file(&name), whole.file(&name));
+    }
+    assert_eq!(said(&mut stood), said(&mut whole));
+    assert_eq!(stood.job.phase(), RootPhase::Done);
+}

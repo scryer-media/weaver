@@ -2247,7 +2247,7 @@ pub async fn pump_pipeline_runtime_queues(pipeline: &mut Pipeline) {
     }
     // An object lent out for its work comes back before the next article,
     // as the runtime's loop takes its mail while a lane fetches.
-    while pipeline.graph_jobs.values().any(|job| job.working()) {
+    while pipeline.graph_jobs.values().any(|job| job.held_by_work()) {
         let said = pipeline
             .graph_runs
             .recv()

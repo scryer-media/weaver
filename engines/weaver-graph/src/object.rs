@@ -689,6 +689,15 @@ pub trait Object: Send + Sync {
         false
     }
 
+    // Whether bytes delivered to me may go on to my members inside that
+    // delivery (`Emit::Bytes` from `deliver`), so the owner writes them to
+    // my members' files in the same step. An object that only keeps its
+    // volumes' bytes, for an engine or a run to read later, says no; so
+    // does one that gave up.
+    fn passes_on(&self) -> bool {
+        false
+    }
+
     // My recovery face, if I am a recovery object: the namespace I live in
     // feeds, binds and repairs through it.
     fn recovery(&self) -> Option<&dyn crate::recovery::Recovery> {

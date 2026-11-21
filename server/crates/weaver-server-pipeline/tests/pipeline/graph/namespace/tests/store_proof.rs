@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use weaver_server_disk::operations::disk::volume::LoopSite;
 
 struct Unsegmented;
 
@@ -380,7 +381,7 @@ impl Rig {
         let mut bytes = Vec::new();
         assert!(
             self.writer
-                .access(&self.tree)
+                .access(&self.tree, LoopSite::ReadOn)
                 .read_at(store, member, range, &mut bytes)
         );
         bytes
@@ -632,11 +633,12 @@ fn replacement_map_custody(
     send(&mut tree, &mut writer, &mut objects, member, 0, &archive);
     let payload_range = ByteRange::new(data_at as u64, footer as u64);
     let mut before = Vec::new();
-    assert!(
-        writer
-            .access(&tree)
-            .read_at(NodeId::ROOT, member, payload_range, &mut before)
-    );
+    assert!(writer.access(&tree, LoopSite::ReadOn).read_at(
+        NodeId::ROOT,
+        member,
+        payload_range,
+        &mut before
+    ));
     assert_eq!(before, payload);
     let from = if spanning { footer - 64 } else { footer };
     let mut replacement = archive[from..].to_vec();
@@ -656,9 +658,12 @@ fn replacement_map_custody(
     );
     let mut still_owned = Vec::new();
     assert!(
-        writer
-            .access(&tree)
-            .read_at(NodeId::ROOT, member, payload_range, &mut still_owned),
+        writer.access(&tree, LoopSite::ReadOn).read_at(
+            NodeId::ROOT,
+            member,
+            payload_range,
+            &mut still_owned
+        ),
         "rejected replacement metadata cannot revoke source-byte custody"
     );
     // Which copy of the payload a read shows is not this contract: in a job
@@ -673,7 +678,7 @@ fn replacement_map_custody(
         &archive[from..],
     );
     let mut whole = Vec::new();
-    assert!(writer.access(&tree).read_at(
+    assert!(writer.access(&tree, LoopSite::ReadOn).read_at(
         NodeId::ROOT,
         member,
         ByteRange::new(0, archive.len() as u64),

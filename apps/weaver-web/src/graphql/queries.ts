@@ -54,6 +54,11 @@ const QUEUE_TABLE_ITEM_FIELDS = `
     downloadRetryAtEpochMs
     diskNeedBytes
     diskFreeBytes
+    diskWrite {
+      volume
+      slow
+      draining
+    }
     progressPercent
     totalBytes
     downloadedBytes
@@ -1061,6 +1066,12 @@ export const LIVE_METRICS_QUERY = gql`
       resumeAtEpochMs
       downloadBlock {
         ...DownloadBlockFields
+        diskVolumes {
+          label
+          slow
+          writeRateBytesPerSec
+          waitingBytes
+        }
       }
     }
     torrents: torrentPresence {
@@ -1435,6 +1446,12 @@ export const LIVE_METRICS_SUBSCRIPTION = gql`
         resumeAtEpochMs
         downloadBlock {
           ...DownloadBlockFields
+          diskVolumes {
+            label
+            slow
+            writeRateBytesPerSec
+            waitingBytes
+          }
         }
       }
       providerHoldoffs {

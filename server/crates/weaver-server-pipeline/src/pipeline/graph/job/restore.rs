@@ -23,6 +23,7 @@
 // Step 1, refusing a graph job with no checkpoint, is the caller's.
 
 use weaver_graph::{MemberId, NodeId, RestoreError, Tree, VolumeIndex};
+use weaver_server_disk::operations::disk::volume::LoopSite;
 
 use super::loans::Loans;
 use super::passwords::Passwords;
@@ -89,6 +90,7 @@ impl GraphJob {
         tree.never_open(writer.never_opens());
         writer.restore_verifications(&snapshot.root.pending_verifications);
         writer.restore_members(&tree);
+        writer.note_subtrees(&tree);
         writer.note_recorded_holds(&tree, &snapshot.holds);
         for ((node, member), state) in &snapshot.files {
             if tree
@@ -133,6 +135,9 @@ impl GraphJob {
             repair_ended_at: None,
             pending: Pending::default(),
             mail_owed: None,
+            releasing: None,
+            reading: None,
+            landed_owed: Vec::new(),
             stopped_repair: None,
             #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             stopped_repairs_taken_back: 0,
@@ -177,6 +182,7 @@ impl GraphJob {
         // What the restore closed again landed before the restart, and was
         // said then.
         job.notes.clear();
+        job.landed_owed.clear();
         #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         job.pending.restored(&job);
         Ok(Restored {
@@ -262,7 +268,7 @@ impl GraphJob {
     fn reach(&mut self) -> Result<Vec<(VolumeIndex, u32)>, GraphError> {
         let mut missing = Vec::new();
         let mut scratch = Vec::new();
-        let access = self.writer.access(&self.tree);
+        let access = self.writer.access(&self.tree, LoopSite::Durable);
         for index in 0..self.root.map.volume_count() {
             let volume = VolumeIndex(index as u32);
             let member = MemberId(volume.0);
@@ -293,7 +299,7 @@ impl GraphJob {
     // again.
     fn fronts_again(&mut self) -> Result<(), GraphError> {
         for (node, member, runs) in self.tree.fronts_away() {
-            let access = self.writer.access(&self.tree);
+            let access = self.writer.access(&self.tree, LoopSite::Durable);
             let pieces: Vec<(u64, Vec<u8>)> = runs
                 .into_iter()
                 .filter_map(|run| {

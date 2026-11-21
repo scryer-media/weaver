@@ -1443,6 +1443,10 @@ pub struct VolumeSnapshot {
     // the writer. Never more than the hard limit, but for one article
     // granted alone to a volume that counted nothing.
     pub counted_bytes: u64,
+    // Of `counted_bytes`, what the queuing threads carry for output they
+    // hold in memory to be written there: held bytes, which only more of
+    // that output frees, never the writer.
+    pub carried_bytes: u64,
     // The most `counted_bytes` has been.
     pub peak_bytes: u64,
     // The volume's buffer limits, over the bytes it counts: the soft one
@@ -1460,6 +1464,44 @@ pub struct VolumeSnapshot {
 // `VolumeWriterSnapshot::loop_waits_by_kind`.
 pub const LOOP_WAIT_KINDS: [&str; 3] = ["read", "settle", "budget"];
 
+// The label of each place a loop wait is made from, in the order of the
+// inner index of `VolumeWriterSnapshot::loop_waits_by_site`: the caller
+// path that stood the loop, named where it calls the wait.
+pub const LOOP_WAIT_SITES: [&str; 32] = [
+    "leaf_write",
+    "leaf_release",
+    "object_release",
+    "tail",
+    "recovery_volume",
+    "capture",
+    "given_back",
+    "spill",
+    "refused",
+    "shut",
+    "apply_all",
+    "hand_over",
+    "answer_again",
+    "again_staged",
+    "front_settle",
+    "unnamed",
+    "judge",
+    "verified",
+    "repair",
+    "reopen",
+    "bind_sets",
+    "recovery_at",
+    "give_up",
+    "materialise",
+    "zeros",
+    "read_on",
+    "object_read",
+    "take_held",
+    "replay_file",
+    "durable",
+    "unkept",
+    "torrent",
+];
+
 // One volume's writer counts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct VolumeWriterSnapshot {
@@ -1474,6 +1516,10 @@ pub struct VolumeWriterSnapshot {
     // produced output itself (`LOOP_WAIT_KINDS`, in that order).
     pub loop_waits_by_kind: [u64; 3],
     pub loop_wait_nanos_by_kind: [u64; 3],
+    // The same again, by kind and then by the place the wait was made from
+    // (`LOOP_WAIT_SITES`, in that order).
+    pub loop_waits_by_site: [[u64; 32]; 3],
+    pub loop_wait_nanos_by_site: [[u64; 32]; 3],
     // Reads the pipeline loop made itself of the writer's files, after its
     // wait, and how long they took, the open included.
     pub loop_reads: u64,
@@ -1501,6 +1547,11 @@ pub struct VolumeWriterSnapshot {
     // Handles the writer dropped, and the time inside those drops.
     pub closes: u64,
     pub close_nanos: u64,
+    // Write-outs the writer started on a share, each after a stride of a
+    // file's writes, and the time inside those calls, which wait for the
+    // write-out the one before started.
+    pub write_outs: u64,
+    pub write_out_nanos: u64,
     // Operations that came back with an error.
     pub failed_operations: u64,
     // Operations not run: their caller gave its files up, or an earlier

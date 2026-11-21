@@ -611,10 +611,15 @@ impl Pipeline {
         self.audit_lane_holdings();
         if released {
             // What arrived is handed on in this step, as a released result
-            // is (`process_released_download_done`).
+            // is (`process_released_download_done`), never parked: this
+            // result was never booked as waiting.
             let job_id = result.job_id;
-            let credit =
-                self.arm_volume_credit(job_id, Self::released_download_result_lead_bytes(&result));
+            let landing = self.article_landing(result.segment_id.file_id);
+            let credit = self.arm_volume_credit(
+                job_id,
+                landing,
+                Self::released_download_result_lead_bytes(&result),
+            );
             self.process_download_done(result).await;
             self.settle_volume_credit(credit);
             if !self
@@ -657,30 +662,36 @@ impl Pipeline {
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub fn note_arrived_result_for_test(&mut self, job_id: JobId, bytes: u64) {
         self.note_released_download_result_pending(job_id, bytes);
-        self.note_volume_arrived(job_id, bytes);
+        let landing = self.working_landing(job_id);
+        self.note_volume_arrived(job_id, landing, bytes);
     }
 
     // The loop hands on one waiting result of the job of `bytes` whose
-    // writes took nothing, as `process_released_download_done` does.
+    // writes took nothing, as `process_released_download_done` does. Its
+    // bytes land on the job's working volume.
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub fn hand_on_result_for_test(&mut self, job_id: JobId, bytes: u64) {
-        let credit = self.arm_volume_credit(job_id, bytes);
+        let landing = self.working_landing(job_id);
+        let credit = self.arm_volume_credit(job_id, landing, bytes);
         self.settle_volume_credit(credit);
         self.finish_released_download_result_processing(job_id, bytes);
     }
 
-    // An article of the job of `bytes` arrives and the loop starts to hand
-    // it on in one step, as `handle_download_done` does: its bytes count on
-    // the volume and become the step's loop credit. The fixture writes it
-    // and ends the step with `Self::end_hand_on_for_test`.
+    // An article of `segment` of `bytes` arrives and the loop starts to
+    // hand it on in one step, as `handle_download_done` does: its bytes
+    // count on the volume they land on and become the step's loop credit.
+    // The fixture writes it and ends the step with
+    // `Self::end_hand_on_for_test`.
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-    pub fn begin_hand_on_for_test(&mut self, job_id: JobId, bytes: u64) -> Option<Prepaid> {
-        self.note_volume_arrived(job_id, bytes);
-        self.arm_volume_credit(job_id, bytes)
+    pub fn begin_hand_on_for_test(&mut self, segment: SegmentId, bytes: u64) -> StepCredit {
+        let job_id = segment.file_id.job_id;
+        let landing = self.article_landing(segment.file_id);
+        self.note_volume_arrived(job_id, landing.clone(), bytes);
+        self.arm_volume_credit(job_id, landing, bytes)
     }
 
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
-    pub fn end_hand_on_for_test(&mut self, job_id: JobId, credit: Option<Prepaid>) {
+    pub fn end_hand_on_for_test(&mut self, job_id: JobId, credit: StepCredit) {
         self.settle_volume_credit(credit);
         if !self
             .pending_released_download_results_by_job
@@ -691,32 +702,35 @@ impl Pipeline {
     }
 
     // Count `bytes` that arrived for the job, from no lane's reservation,
-    // on the volume its articles are written to (`Self::hold_volume_arrived`).
-    pub(in crate::pipeline) fn note_volume_arrived(&mut self, job_id: JobId, bytes: u64) {
-        let Some(volume) = self
-            .graph_jobs
-            .get(&job_id)
-            .and_then(|graph| graph.disk())
-            .map(|disk| Arc::clone(disk.working().volume()))
-        else {
+    // on the volume they land on (`Self::hold_volume_arrived`).
+    pub(in crate::pipeline) fn note_volume_arrived(
+        &mut self,
+        job_id: JobId,
+        landing: Option<Landing>,
+        bytes: u64,
+    ) {
+        let Some(landing) = landing else {
             return;
         };
-        if self.hold_volume_arrived(job_id, Reservation::none(volume), bytes, false) {
-            self.volume_room_changed();
+        if self.hold_volume_arrived(job_id, Reservation::none(landing.volume), bytes, false) {
+            self.volume_room_taken();
         }
     }
 
     // Hold `bytes` that arrived for the job as counted on the volume of
-    // `from`, the volume its articles are written to, until the loop has
-    // handed them on. `from` is what of the article's lease is reserved
-    // there, settled here to what arrived; nothing for bytes no lease
-    // reserved, which are counted here. One map entry per job with results
-    // waiting; nothing is walked. A job whose bytes now count on another
-    // volume than those it holds, its volume having changed while they
-    // waited, moves those it holds there as well: the entry names the one
-    // volume all of them count on, so each volume gives back only what it
-    // counted. Whether a wake was taken: on the volume left, and, when
-    // `take` says so, on the volume settled.
+    // `from`, the volume they land on, until the loop has handed them on.
+    // `from` is what of the article's lease is reserved there, settled here
+    // to what arrived; nothing for bytes no lease reserved, which are
+    // counted here. One map entry per job with results waiting, one
+    // reservation in it per volume; nothing is walked. Bytes the job holds
+    // on a volume it no longer writes to, its volume having changed while
+    // they waited, stay counted there: they move only where they fit, as
+    // the loop hands them on (`Self::arm_or_park`), or are given back there.
+    // Whether a wake was taken, when `take` says so, on the volume settled.
+    // A front waiting for room on this volume is looked at again: bytes
+    // settled here from a lease to arrived ones may leave the volume
+    // counting only bytes that wait to be handed on, beside which a step is
+    // taken (`room_for`), and no writer's wake says so.
     pub(in crate::pipeline) fn hold_volume_arrived(
         &mut self,
         job_id: JobId,
@@ -724,75 +738,39 @@ impl Pipeline {
         bytes: u64,
         take: bool,
     ) -> bool {
-        let volume = from.volume();
-        let held = self
-            .volume_arrived_by_job
-            .entry(job_id)
-            .or_insert_with(|| Reservation::none(Arc::clone(volume)));
-        let moved = (!Arc::ptr_eq(held.volume(), volume))
-            .then(|| std::mem::replace(held, Reservation::none(Arc::clone(volume))));
-        volume.arrived_bytes.fetch_add(bytes, Ordering::SeqCst);
-        let mut woke = false;
-        if let Some(mut before) = moved {
-            let bytes = before.bytes();
-            before
-                .volume()
-                .arrived_bytes
-                .fetch_sub(bytes, Ordering::SeqCst);
-            before.give_back(bytes);
-            volume.arrived_bytes.fetch_add(bytes, Ordering::SeqCst);
-            held.count(bytes);
-            woke = self.volume_writers.take_wake(before.volume());
+        let volume = Arc::clone(from.volume());
+        let holds = self.volume_arrived_by_job.entry(job_id).or_default();
+        if bytes != 0 && self.parked_download_results.parked_on(&volume) {
+            self.parked_results_room = true;
         }
+        volume.arrived_bytes.fetch_add(bytes, Ordering::SeqCst);
         let of = from.bytes();
         from.settle(of, bytes);
-        if take {
-            woke |= self.volume_writers.take_wake(from.volume());
-        }
-        held.join(from);
+        let woke = take && self.volume_writers.take_wake(from.volume());
+        holds.entry(&volume).join(from);
         woke
-    }
-
-    // The loop is about to hand on `bytes` of the job that arrived: they
-    // are prepaid for the writes of this step, which take them first
-    // (`Owner::prepay`). What was prepaid, for `settle_volume_credit`.
-    fn arm_volume_credit(&mut self, job_id: JobId, bytes: u64) -> Option<Prepaid> {
-        let held = self.volume_arrived_by_job.get_mut(&job_id)?;
-        let moved = bytes.min(held.bytes());
-        held.volume()
-            .arrived_bytes
-            .fetch_sub(moved, Ordering::SeqCst);
-        Some(self.volume_writers.prepay(held, moved))
-    }
-
-    // The step is done: what was prepaid and its writes did not take no
-    // longer counts.
-    fn settle_volume_credit(&mut self, credit: Option<Prepaid>) {
-        let Some(credit) = credit else {
-            return;
-        };
-        let left = credit.settle();
-        if left != 0 && self.volume_writers.take_wake(credit.volume()) {
-            self.volume_room_changed();
-        }
     }
 
     // The job has no result left waiting: whatever of it is still counted
     // as arrived no longer counts, and dispatch that asked to be woken at
-    // the line the volume has now reached looks again.
+    // the line a volume has now reached looks again.
     fn note_volume_handed_on(&mut self, job_id: JobId) {
-        let Some(mut held) = self.volume_arrived_by_job.remove(&job_id) else {
+        let Some(holds) = self.volume_arrived_by_job.remove(&job_id) else {
             return;
         };
-        let bytes = held.bytes();
-        if bytes != 0 {
-            held.volume()
-                .arrived_bytes
-                .fetch_sub(bytes, Ordering::SeqCst);
-            held.give_back(bytes);
+        let mut woke = false;
+        for mut held in holds.into_parts() {
+            let bytes = held.bytes();
+            if bytes != 0 {
+                held.volume()
+                    .arrived_bytes
+                    .fetch_sub(bytes, Ordering::SeqCst);
+                held.give_back(bytes);
+            }
+            woke |= self.volume_writers.take_wake(held.volume());
         }
-        if self.volume_writers.take_wake(held.volume()) {
-            self.volume_room_changed();
+        if woke {
+            self.volume_room_taken();
         }
     }
 
@@ -830,13 +808,56 @@ impl Pipeline {
         }
     }
 
-    pub(crate) async fn process_released_download_done(&mut self, result: DownloadResult) {
+    // Hand on a result booked as waiting. One whose bytes land on a volume
+    // with no room for them is parked for that volume's room wake instead,
+    // behind any of its job's already parked (`Self::park_download_result`),
+    // and false is returned: it is still waiting.
+    pub(crate) async fn process_released_download_done(&mut self, result: DownloadResult) -> bool {
+        self.process_released_download_done_with(result, true, false)
+            .await
+    }
+
+    // Hand on a parked front taken out to be tried again
+    // (`Self::take_retried_download_result`): it parks again, at its job's
+    // front, while there is still no room for it, and false is returned.
+    pub(in crate::pipeline) async fn process_retried_download_done(
+        &mut self,
+        result: DownloadResult,
+    ) -> bool {
+        self.process_released_download_done_with(result, true, true)
+            .await
+    }
+
+    // `retried` says `result` is its job's parked front, tried again: it is
+    // not put behind its own job.
+    pub(in crate::pipeline) async fn process_released_download_done_with(
+        &mut self,
+        result: DownloadResult,
+        may_park: bool,
+        retried: bool,
+    ) -> bool {
         let job_id = result.job_id;
+        if may_park && !retried && self.job_results_parked(job_id) {
+            self.park_behind_download_results(result);
+            return false;
+        }
         let lead_bytes = Self::released_download_result_lead_bytes(&result);
-        let credit = self.arm_volume_credit(job_id, lead_bytes);
+        // A job that no longer takes results has nothing to wait for.
+        let may_park = may_park && self.jobs.contains_key(&job_id);
+        let landing = self.article_landing(result.segment_id.file_id);
+        let credit = match self.arm_or_park(job_id, landing, lead_bytes, may_park) {
+            Armed::Credit(credit) => credit,
+            Armed::Park { volume, bytes, own } => {
+                self.park_download_front(result, volume, (bytes, own));
+                return false;
+            }
+        };
         self.process_download_done(result).await;
         self.settle_volume_credit(credit);
         self.finish_released_download_result_processing(job_id, lead_bytes);
+        if retried {
+            self.parked_front_handed_on(job_id);
+        }
         // `process_download_done` ran the drain sequence for this job while
         // *this* result was still booked as a pending released result — pending
         // download work by definition — so every drain-conditional step in it
@@ -852,6 +873,7 @@ impl Pipeline {
         if self.jobs.contains_key(&job_id) {
             self.maybe_finish_download_pass(job_id);
         }
+        true
     }
 
     pub(crate) async fn process_download_done(&mut self, result: DownloadResult) {
