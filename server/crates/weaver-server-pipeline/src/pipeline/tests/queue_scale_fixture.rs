@@ -455,7 +455,7 @@ pub fn admission_visits() -> u64 {
 }
 
 pub fn admission_disk_held(pipeline: &Pipeline) -> bool {
-    pipeline.admission_disk_held
+    pipeline.admission_disk.held()
 }
 
 pub fn disk_unadmitted(pipeline: &Pipeline) -> usize {

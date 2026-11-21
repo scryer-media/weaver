@@ -511,7 +511,7 @@ pub fn hear_disk_reading(pipeline: &mut Pipeline) {
 }
 
 pub fn admission_held(pipeline: &Pipeline) -> bool {
-    pipeline.admission_disk_held
+    pipeline.admission_disk.held()
 }
 
 pub fn capacity(pipeline: &Pipeline) -> &crate::operations::StorageCapacity {
