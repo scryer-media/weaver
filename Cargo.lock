@@ -3692,7 +3692,7 @@ dependencies = [
  "md-5",
  "memmap2",
  "rayon",
- "reedsolomon-rs 0.4.11",
+ "reedsolomon-rs",
  "thiserror 2.0.21",
  "tracing",
 ]
@@ -3708,7 +3708,7 @@ dependencies = [
  "crc-turbo",
  "libc",
  "rayon",
- "reedsolomon-rs 0.4.11",
+ "reedsolomon-rs",
  "thiserror 2.0.21",
  "tracing",
  "unicode-normalization",
@@ -4317,17 +4317,9 @@ dependencies = [
 
 [[package]]
 name = "reedsolomon-rs"
-version = "0.4.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81f4afa0094e231cfcb6b23f9f6f568db67097fa7a2a9bae0992d339e7555fc3"
-dependencies = [
- "memmap2",
- "rayon",
-]
-
-[[package]]
-name = "reedsolomon-rs"
 version = "0.4.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf1e4e028b1a313a24f4fb7155a7ce374a53fb2d2d0ab7b4de38cb2d2c6ab12a"
 dependencies = [
  "memmap2",
  "rayon",
@@ -6227,6 +6219,8 @@ dependencies = [
 [[package]]
 name = "unrar-rs"
 version = "0.16.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6baf20fd1d5ca100a72e822e105df57a005eb7327a216dd2a81d5663a8a5839b"
 dependencies = [
  "aws-lc-rs",
  "blake2s_simd",
@@ -6236,7 +6230,7 @@ dependencies = [
  "memchr",
  "ppmd-turbo",
  "rayon",
- "reedsolomon-rs 0.4.12",
+ "reedsolomon-rs",
  "rmp-serde",
  "serde",
  "sha2 0.11.1",
@@ -6677,7 +6671,7 @@ dependencies = [
  "par2-rs",
  "par3-rs",
  "rayon",
- "reedsolomon-rs 0.4.11",
+ "reedsolomon-rs",
  "serde",
  "serde_json",
  "tempfile",
@@ -6725,7 +6719,7 @@ dependencies = [
  "quick-xml",
  "rayon",
  "rcgen",
- "reedsolomon-rs 0.4.11",
+ "reedsolomon-rs",
  "regex",
  "reqwest",
  "rmp-serde",
@@ -7095,7 +7089,7 @@ dependencies = [
  "quick-xml",
  "rayon",
  "rcgen",
- "reedsolomon-rs 0.4.11",
+ "reedsolomon-rs",
  "regex",
  "reqwest",
  "rmp-serde",
