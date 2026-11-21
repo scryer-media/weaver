@@ -909,6 +909,21 @@ impl NamespaceWriter {
                 .volumes(set)
                 .map(|(parent, volumes)| volumes.values().map(|member| (parent, *member)).collect())
                 .unwrap_or_default();
+            // What arrived of the volumes, which `replay_file` reads again.
+            let bytes: u64 = volumes
+                .iter()
+                .filter_map(|&(parent, member)| tree.namespace(parent)?.get(member))
+                .flat_map(|record| record.coverage.runs())
+                .filter(|run| run.provenance.arrived())
+                .map(|run| run.range.len())
+                .sum();
+            tracing::info!(
+                job_id = self.scope,
+                node = set.0,
+                volumes = volumes.len(),
+                bytes,
+                "repair return stale, volumes replayed"
+            );
             for (parent, member) in volumes {
                 self.replay_file(tree, builder, segments, parent, member, None, out)?;
             }
@@ -1133,6 +1148,7 @@ impl NamespaceWriter {
             paid: 0,
             stood: 0,
             said: Vec::new(),
+            redelivered: (0, 0),
         });
         self.tail_on(tree, builder, segments, out)
     }
@@ -1269,6 +1285,14 @@ impl NamespaceWriter {
                     tail.step = TailStep::Proved;
                 }
                 TailStep::Close => {
+                    let (ranges, bytes) = tail.redelivered;
+                    tracing::info!(
+                        job_id = self.scope,
+                        node = tail.node.0,
+                        ranges,
+                        bytes,
+                        "repair tail redelivered"
+                    );
                     self.tail_close(tree, builder, segments, tail, out)?;
                     tail.step = TailStep::Last;
                 }
@@ -1550,6 +1574,8 @@ impl NamespaceWriter {
                 };
                 tail.member = member;
                 tail.provenance = provenance;
+                tail.redelivered.0 += 1;
+                tail.redelivered.1 += range.len();
                 tail.parts = tree
                     .namespace(node)
                     .and_then(|namespace| namespace.get(member))
