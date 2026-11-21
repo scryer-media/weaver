@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 import { useMemo, useRef, useState, type ReactNode } from "react";
+import { Globe, Lock } from "lucide-react";
 import { Link } from "react-router";
 import { useMutation, useQuery } from "urql";
 import {
@@ -19,8 +20,8 @@ import {
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { UNPACK_CHOICES, routeExposureText, routeReasonText, type TorrentRouteReason, unpackChoice, unpackOf, type TorrentExposure } from "@/lib/torrents";
 import type { ResolvedBy } from "@/lib/test-via";
-import { announceHosts, patternsOf, torrentAnnounces } from "@/lib/tracker-hosts";
-import { toBase64 } from "@/lib/utils";
+import { announceHosts, hostPatterns, patternsOf, trackerHost, torrentTrackers } from "@/lib/tracker-hosts";
+import { cn, toBase64 } from "@/lib/utils";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { Dialog } from "../../../components/Dialog";
 import {
@@ -32,7 +33,7 @@ import {
   type TorrentDisableMode,
 } from "../../../data/torrents-shown";
 import { testIds } from "@/next/testids";
-import { SecondaryButton, Segmented, Select, TextField, Toggle } from "../../../components/controls";
+import { CheckBox, PrimaryButton, SecondaryButton, Segmented, Select, TextField, Toggle } from "../../../components/controls";
 import { RecordEditor } from "../../../components/RecordEditor";
 import { Cell } from "../../../components/rows";
 import { EM_DASH } from "../../../data/format";
@@ -49,6 +50,7 @@ import {
   seedingFields,
   seedingFrom,
   seedingInherits,
+  seedingEffectiveText,
   seedingInput,
   uploadCapField,
   type Leaf,
@@ -191,6 +193,63 @@ const DISCOVERY_SWITCHES = [
   { key: "lsd", label: "next.torrents.trackerRuleLsd", keywords: "lsd local peer discovery private" },
 ] as const;
 
+/** A rule's tracker as private or public: two buttons, one pressed. */
+function TrackerTypePicker({
+  label,
+  privateLabel,
+  publicLabel,
+  value,
+  onChange,
+}: {
+  label: string;
+  privateLabel: string;
+  publicLabel: string;
+  /** Null while neither is picked. */
+  value: "private" | "public" | null;
+  onChange: (isPrivate: boolean) => void;
+}) {
+  const choices = [
+    { value: true, text: privateLabel, Icon: Lock },
+    { value: false, text: publicLabel, Icon: Globe },
+  ];
+  return (
+    <div role="radiogroup" aria-label={label} className="grid w-full max-w-[420px] grid-cols-2 gap-2">
+      {choices.map(({ value: choice, text, Icon }) => {
+        const active = value !== null && choice === (value === "private");
+        return (
+          <button
+            key={text}
+            type="button"
+            role="radio"
+            aria-checked={active}
+            onClick={() => onChange(choice)}
+            className={cn(
+              "flex cursor-pointer flex-col items-center gap-2 border px-4 py-4 text-center",
+              active ? "border-wv-accent bg-wv-segment-active" : "border-wv-control bg-wv-input hover:border-wv-control-focus",
+            )}
+          >
+            <Icon aria-hidden="true" strokeWidth={1.5} className={cn("h-6 w-6", active ? "text-wv-accent" : "text-wv-muted")} />
+            <span className={cn("font-wv-title text-[13.5px] font-semibold", active ? "text-wv-strong" : "text-wv-fg")}>{text}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/** Whether a rule sets anything the editor keeps behind its advanced settings. */
+function hasAdvanced(rule: TrackerRule): boolean {
+  return (
+    rule.peerTcp !== null ||
+    rule.peerUtp !== null ||
+    rule.preferDownloading !== null ||
+    rule.preferSeeding !== null ||
+    JSON.stringify(leafFrom(rule.uploadCap)) !== JSON.stringify(INHERIT) ||
+    rule.forced ||
+    rule.hasSsl
+  );
+}
+
 /** The certificate a rule's save sends: pasted, cleared, or left out to keep the rule's. */
 function sslInput(form: TrackerRuleForm) {
   if (form.certificatePem.trim() !== "" || form.privateKeyPem.trim() !== "") {
@@ -238,7 +297,8 @@ function HostPicker({
   known: readonly string[];
 }) {
   const [chosen, setChosen] = useState<HostSource | null>(null);
-  const [file, setFile] = useState<{ name: string; patterns: string[] } | null>(null);
+  // The file's patterns, its main tracker's first.
+  const [file, setFile] = useState<{ name: string; patterns: string[]; main: string[] } | null>(null);
   const [fileError, setFileError] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const source = chosen ?? ((value === "" ? known.length > 0 : known.includes(value)) ? "known" : "custom");
@@ -254,8 +314,11 @@ function HostPicker({
   };
 
   const read = async (picked: File) => {
-    const announces = torrentAnnounces(new Uint8Array(await picked.arrayBuffer()));
-    const patterns = announces ? patternsOf(announceHosts(announces)) : [];
+    const trackers = torrentTrackers(new Uint8Array(await picked.arrayBuffer()));
+    const announces = trackers?.all ?? null;
+    const mainHost = trackers?.main ? trackerHost(trackers.main) : null;
+    const main = mainHost ? hostPatterns(mainHost) : [];
+    const patterns = announces ? [...new Set([...main, ...patternsOf(announceHosts(announces))])] : [];
     setFileError(
       announces === null
         ? t("next.torrents.trackerRuleFileInvalid")
@@ -263,7 +326,7 @@ function HostPicker({
           ? t("next.torrents.trackerRuleFileEmpty")
           : null,
     );
-    setFile({ name: picked.name, patterns });
+    setFile({ name: picked.name, patterns, main });
     onChange(patterns[0] ?? "");
   };
 
@@ -327,10 +390,18 @@ function HostPicker({
               placeholder={t("next.torrents.trackerRuleHostChoose")}
               onChange={onChange}
               className="font-wv-mono text-[12px]"
-              options={file.patterns.map((pattern) => ({ value: pattern, label: pattern }))}
+              options={file.patterns.map((pattern) => ({
+                value: pattern,
+                label: file.main.includes(pattern) ? t("next.torrents.trackerRuleFileMain", { pattern }) : pattern,
+              }))}
             />
           ) : null}
         </>
+      )}
+      {value.trim() === "" ? null : (
+        <span className="text-[12px] leading-[1.45] text-pretty text-wv-muted">
+          {t("next.torrents.trackerRuleCovers", { pattern: value.trim() })}
+        </span>
       )}
     </div>
   );
@@ -679,7 +750,12 @@ function useTorrentRoutes(t: Translate): SettingsBlock {
  * The tracker rules table and editor. `global` is the saved connection
  * settings, which a rule's transports resolve over.
  */
-function useTrackerRules(t: Translate, global: TorrentConnection): { block: SettingsBlock; overlays: ReactNode } {
+function useTrackerRules(
+  t: Translate,
+  global: TorrentConnection,
+  globalSeeding: SeedingPolicy,
+  globalUploadCap: number | null,
+): { block: SettingsBlock; overlays: ReactNode } {
   const [{ data }, reexecute] = useQuery<{ trackerRules: TrackerRule[] }>({ query: TRACKER_RULES_QUERY });
   const [, saveRule] = useMutation(SAVE_TRACKER_RULE_MUTATION);
   const [, deleteRule] = useMutation(DELETE_TRACKER_RULE_MUTATION);
@@ -695,6 +771,10 @@ function useTrackerRules(t: Translate, global: TorrentConnection): { block: Sett
   const [importOpen, setImportOpen] = useState(false);
   // Counts the editor's openings, so each one starts its host picker afresh.
   const [opening, setOpening] = useState(0);
+  // Whether the editor shows its advanced settings.
+  const [advanced, setAdvanced] = useState(false);
+  // Private or public, picked first: a new rule's other fields wait for it.
+  const [trackerType, setTrackerType] = useState<"private" | "public" | null>(null);
   const [{ data: hosts }] = useQuery<{ trackerHosts: string[] }>({
     query: TRACKER_HOSTS_QUERY,
     pause: editingId === null,
@@ -706,6 +786,8 @@ function useTrackerRules(t: Translate, global: TorrentConnection): { block: Sett
   const editing = typeof editingId === "number" ? rules.find((rule) => rule.id === editingId) : null;
   // The tracker that locked `field` on the rule being edited.
   const lockedBy = (field: string) => (editing?.bound?.locked.includes(field) ? editing.bound.name : null);
+  // A private tracker's rule turns every other peer source off.
+  const privateTracker = trackerType === "private";
 
   const open = (rule: TrackerRule | null) => {
     setError(null);
@@ -734,6 +816,8 @@ function useTrackerRules(t: Translate, global: TorrentConnection): { block: Sett
         }
       : NEW_TRACKER_RULE;
     setForm(start);
+    setAdvanced(rule !== null && hasAdvanced(rule));
+    setTrackerType(rule === null ? null : rule.dht === false && rule.pex === false && rule.lsd === false ? "private" : "public");
     setOpening((count) => count + 1);
     setEditingId(rule ? rule.id : "new");
   };
@@ -820,6 +904,43 @@ function useTrackerRules(t: Translate, global: TorrentConnection): { block: Sett
         };
   };
 
+  // What each field left to inherit gives the rule's torrents now, by field id.
+  const effective = (() => {
+    const onOff = (on: boolean) => t(on ? "next.common.on" : "next.common.off");
+    const transport = (prefer: PeerTransport) => PEER_TRANSPORTS.find((option) => option.value === prefer)?.label ?? prefer;
+    const only = onlyTransport(form.peerTcp ?? global.peerTcp, form.peerUtp ?? global.peerUtp);
+    const seedingText = seedingEffectiveText(t, globalSeeding, globalUploadCap, "trackerRuleSeeding", "trackerRule");
+    const inherits = (leaf: Leaf<unknown>) => leaf.state === "INHERIT";
+    const encryption = ENCRYPTIONS.find((option) => option.value === global.encryption);
+    const entries: [string, boolean, string][] = [
+      ["unpack", form.unpack === null, onOff(global.unpack)],
+      ...DISCOVERY_SWITCHES.map(({ key }): [string, boolean, string] => [key, form[key] === null, onOff(true)]),
+      ["encryption", form.encryption === null, encryption ? t(encryption.label) : global.encryption],
+      ["peerTcp", form.peerTcp === null, onOff(global.peerTcp)],
+      ["peerUtp", form.peerUtp === null, onOff(global.peerUtp)],
+      ["preferDownloading", form.preferDownloading === null && only === null, transport(global.preferDownloading)],
+      ["preferSeeding", form.preferSeeding === null && only === null, transport(global.preferSeeding)],
+      ["trackerRule-uploadCap", inherits(form.uploadCap), seedingText["trackerRule-uploadCap"]],
+      ...(["ratioGoal", "seedTimeGoalMinutes", "inactiveGoalMinutes", "mode", "seedTimeCounting", "action"] as const).map(
+        (key): [string, boolean, string] => [
+          `trackerRuleSeeding-${key}`,
+          inherits(form.seeding[key]),
+          seedingText[`trackerRuleSeeding-${key}`],
+        ],
+      ),
+    ];
+    return new Map(
+      entries
+        .filter(([, inheriting]) => inheriting)
+        .map(([id, , value]) => [id, t("next.torrents.trackerRuleEffective", { value })]),
+    );
+  })();
+  // Each field left to inherit says, under its control, what it gives.
+  const withEffective = (field: FieldSpec): FieldSpec => {
+    const under = effective.get(field.id);
+    return under === undefined ? field : { ...field, under };
+  };
+
   const block: SettingsBlock = {
     kind: "table",
     id: "trackerRules",
@@ -872,6 +993,7 @@ function useTrackerRules(t: Translate, global: TorrentConnection): { block: Sett
         error={error}
         busy={busy}
         onSave={() => void save()}
+        saveDisabled={trackerType === null}
         onDismiss={() => setEditingId(null)}
         onDelete={editing ? () => setConfirmDelete(editing) : undefined}
         deleteLabel={t("next.rss.removeRule")}
@@ -880,6 +1002,41 @@ function useTrackerRules(t: Translate, global: TorrentConnection): { block: Sett
             id: "trackerRule",
             title: t("next.torrents.trackerRule"),
             fields: [
+              {
+                id: "trackerType",
+                label: t("next.torrents.trackerRuleType"),
+                keywords: "private public tracker dht pex lsd",
+                wide: true,
+                control: {
+                  kind: "custom",
+                  // Not saved: read from the peer sources it sets.
+                  control: (
+                    <TrackerTypePicker
+                      label={t("next.torrents.trackerRuleType")}
+                      privateLabel={t("next.torrents.trackerRulePrivate")}
+                      publicLabel={t("next.torrents.trackerRulePublic")}
+                      value={trackerType}
+                      onChange={(isPrivate) => {
+                        setTrackerType(isPrivate ? "private" : "public");
+                        setForm((current) => {
+                          const next = { ...current };
+                          for (const { key } of DISCOVERY_SWITCHES) {
+                            if (lockedBy(key) === null) {
+                              next[key] = isPrivate ? false : null;
+                            }
+                          }
+                          return next;
+                        });
+                      }}
+                    />
+                  ),
+                },
+              },
+            ],
+            // Every other field slides open as one once the tracker's type is picked.
+            folded: {
+              open: trackerType !== null,
+              fields: ([
               ...(editing?.bound
                 ? [
                     {
@@ -986,17 +1143,21 @@ function useTrackerRules(t: Translate, global: TorrentConnection): { block: Sett
               },
               ...DISCOVERY_SWITCHES.map(({ key, label, keywords }) => {
                 const options = UNPACK_CHOICES.map((option) => ({ ...option, label: t(option.label) }));
-                return lockable(key, unpackChoice(form[key]), options, {
-                  id: key,
-                  label: t(label),
-                  keywords,
-                  control: {
-                    kind: "segmented" as const,
-                    value: unpackChoice(form[key]),
-                    options,
-                    onChange: (choice: string) => setForm((current) => ({ ...current, [key]: unpackOf(choice) })),
-                  },
-                });
+                return {
+                  ...lockable(key, unpackChoice(form[key]), options, {
+                    id: key,
+                    label: t(label),
+                    keywords,
+                    control: {
+                      kind: "segmented" as const,
+                      value: unpackChoice(form[key]),
+                      options,
+                      onChange: (choice: string) => setForm((current) => ({ ...current, [key]: unpackOf(choice) })),
+                    },
+                  }),
+                  // A private tracker's torrents use no other peer source.
+                  collapsed: privateTracker,
+                };
               }),
               ((options) =>
                 lockable("encryption", form.encryption ?? "inherit", options, {
@@ -1017,6 +1178,40 @@ function useTrackerRules(t: Translate, global: TorrentConnection): { block: Sett
                 { value: "inherit", label: t("next.torrents.unpackInherit") },
                 ...ENCRYPTIONS.map((option) => ({ ...option, label: t(option.label) })),
               ]),
+              ...(editing && editing.archivePasswordCount > 0 && !form.passwordsCleared
+                ? [
+                    {
+                      id: "archivePasswords",
+                      label: t("next.torrents.trackerFileArchivePasswords"),
+                      keywords: "archive passwords tracker",
+                      control: {
+                        kind: "custom" as const,
+                        control: (
+                          <div className="flex min-w-0 items-center gap-[10px]">
+                            <span className="font-wv-mono text-[12px] text-wv-fg">{editing.archivePasswordCount}</span>
+                            <SecondaryButton
+                              onClick={() => setForm((current) => ({ ...current, passwordsCleared: true }))}
+                            >
+                              {t("next.torrents.trackerRuleCertificateClear")}
+                            </SecondaryButton>
+                          </div>
+                        ),
+                      },
+                    },
+                  ]
+                : ([] as FieldSpec[])),
+              ...seedingFields(t, form.seeding, (seeding) => setForm((current) => ({ ...current, seeding })), {
+                inherits: true,
+                idPrefix: "trackerRuleSeeding",
+              }),
+              {
+                id: "advanced",
+                label: t("next.torrents.trackerRuleAdvanced"),
+                keywords: "advanced transport tcp utp prefer upload speed limit forced ssl certificate",
+                control: { kind: "toggle", value: advanced, onChange: setAdvanced },
+              },
+              // Shown behind the toggle above.
+              ...([
               // Each transport field inherits the global one while unset. A
               // preference is kept as set; while the resolved transports leave
               // one off, it shows locked to the one left on.
@@ -1064,28 +1259,6 @@ function useTrackerRules(t: Translate, global: TorrentConnection): { block: Sett
                   onChange: (forced) => setForm((current) => ({ ...current, forced })),
                 },
               },
-              ...(editing && editing.archivePasswordCount > 0 && !form.passwordsCleared
-                ? [
-                    {
-                      id: "archivePasswords",
-                      label: t("next.torrents.trackerFileArchivePasswords"),
-                      keywords: "archive passwords tracker",
-                      control: {
-                        kind: "custom" as const,
-                        control: (
-                          <div className="flex min-w-0 items-center gap-[10px]">
-                            <span className="font-wv-mono text-[12px] text-wv-fg">{editing.archivePasswordCount}</span>
-                            <SecondaryButton
-                              onClick={() => setForm((current) => ({ ...current, passwordsCleared: true }))}
-                            >
-                              {t("next.torrents.trackerRuleCertificateClear")}
-                            </SecondaryButton>
-                          </div>
-                        ),
-                      },
-                    },
-                  ]
-                : ([] as FieldSpec[])),
               ...(editing?.hasSsl && !form.sslCleared
                 ? [
                     {
@@ -1152,11 +1325,9 @@ function useTrackerRules(t: Translate, global: TorrentConnection): { block: Sett
                 },
               },
                 ] as FieldSpec[])),
-              ...seedingFields(t, form.seeding, (seeding) => setForm((current) => ({ ...current, seeding })), {
-                inherits: true,
-                idPrefix: "trackerRuleSeeding",
-              }),
-            ],
+              ] as FieldSpec[]).map((field) => ({ ...field, collapsed: !advanced })),
+              ] as FieldSpec[]).map(withEffective),
+            },
           },
         ]}
       />
@@ -1332,14 +1503,19 @@ export function TorrentsPanel() {
   // Whether torrents still run, so turning them off asks how they end; every
   // other screen follows the same reading, pushed when the save lands.
   const { torrentPresence } = useNextData("torrentPresence");
+  // Turning off asks first; with torrents running, how they end.
   const [asking, setAsking] = useState(false);
+  const [finish, setFinish] = useState({ downloads: true, seeding: true });
+  // Neither finished: every torrent stops now, after a second ask.
+  const [forcing, setForcing] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const savedConnection = useMemo<TorrentConnection>(
     () => ({ ...DEFAULT_CONNECTION, ...(data?.settings?.torrent ?? {}) }),
     [data?.settings?.torrent],
   );
-  const trackerRules = useTrackerRules(t, savedConnection);
+  const savedSeeding = useMemo(() => seedingAtGlobal(seedingFrom(data?.settings?.seeding ?? null)), [data?.settings?.seeding]);
+  const trackerRules = useTrackerRules(t, savedConnection, savedSeeding, data?.settings?.uploadCap ?? null);
   const torrentRoutes = useTorrentRoutes(t);
 
   const source = useMemo<TorrentForm | null>(() => {
@@ -1361,14 +1537,13 @@ export function TorrentsPanel() {
 
   // Saves the form; `whenDisabled` says how running torrents end when the
   // save turns torrents off.
-  const send = (whenDisabled?: TorrentDisableMode) => {
+  const send = () => {
     if (!values || !source) {
       return;
     }
     const seeding = seedingInput(values.seeding);
     const seedingChanged = JSON.stringify(seeding) !== JSON.stringify(seedingInput(source.seeding));
-    const changed = connectionChanges(values.torrent, source.torrent);
-    const torrent = whenDisabled === undefined ? changed : { ...changed, whenDisabled };
+    const torrent = connectionChanges(values.torrent, source.torrent);
     setError(null);
     void updateSettings({
       input: {
@@ -1408,17 +1583,53 @@ export function TorrentsPanel() {
         setError(t("next.torrents.portInvalid"));
         return;
       }
-      // Turning torrents off while some run asks first how they end.
-      if (asksHowTorrentsEnd(source.torrent.enabled, values.torrent.enabled, torrentPresence)) {
-        setAsking(true);
-        return;
-      }
       send();
     },
   });
 
   const patchTorrent = (next: Partial<TorrentConnection>) =>
     values && draft.set({ torrent: { ...values.torrent, ...next } });
+
+  // Turning torrents on or off saves at once, after a confirm; no Save.
+  // Other edits still waiting stay waiting.
+  const [confirmEnable, setConfirmEnable] = useState(false);
+  const saveEnabled = (enabled: boolean, whenDisabled?: TorrentDisableMode) => {
+    const pending = draft.dirty;
+    setError(null);
+    void updateSettings({
+      input: { torrent: whenDisabled === undefined ? { enabled } : { enabled, whenDisabled } },
+    }).then((result) => {
+      setConfirmEnable(false);
+      setAsking(false);
+      setForcing(false);
+      if (result.error || !result.data?.updateSettings) {
+        setError(result.error?.message ?? t("next.torrents.saveFailed"));
+        return;
+      }
+      patchTorrent({ enabled });
+      if (!pending) {
+        draft.markSaved();
+      }
+      setStatus(t("next.settings.saved"));
+      void reexecute({ requestPolicy: "network-only" });
+    });
+  };
+  // With torrents running, the boxes say how they end; with none, there is
+  // nothing to choose.
+  const asksHow = asksHowTorrentsEnd(true, false, torrentPresence);
+  const askOff = () => {
+    setFinish({ downloads: true, seeding: true });
+    setAsking(true);
+  };
+  const turnOff = () => {
+    if (!asksHow) {
+      saveEnabled(false);
+    } else if (finish.downloads || finish.seeding) {
+      saveEnabled(false, disableMode(finish));
+    } else {
+      setForcing(true);
+    }
+  };
 
   // A wind-down under way, cut short: every torrent stops now.
   const stopNow = () => {
@@ -1450,7 +1661,7 @@ export function TorrentsPanel() {
               value: values.torrent.enabled,
               // Turning off asks how running torrents end, which waits on the server's answer.
               disabled: torrentSwitchWaits(values.torrent.enabled, torrentPresence),
-              onChange: (enabled) => patchTorrent({ enabled }),
+              onChange: (enabled) => (enabled ? setConfirmEnable(true) : askOff()),
             },
           },
           ...(windDownStoppable(values.torrent.enabled, torrentPresence)
@@ -1460,7 +1671,7 @@ export function TorrentsPanel() {
                   label: t("next.torrents.offStopNow"),
                   // Letting every torrent finish never ends one that is forced or has no seeding limit.
                   help: t(
-                    torrentPresence?.windDown === "FINISH_ALL"
+                    torrentPresence?.windDown === "FINISH_ALL" || torrentPresence?.windDown === "FINISH_SEEDING"
                       ? "next.torrents.finishAllForced"
                       : "next.torrents.offStopNowNote",
                   ),
@@ -1781,23 +1992,53 @@ export function TorrentsPanel() {
         },
       ]);
 
-  const choose = (mode: TorrentDisableMode) => {
-    setAsking(false);
-    send(mode);
-  };
-
   return (
     <>
       <SettingsBlocks blocks={blocks} loading={fetching && !data} />
+      {values && source && !values.torrent.enabled && !source.torrent.enabled ? (
+        <div className="flex justify-center px-4 py-16">
+          <PrimaryButton
+            icon="resume"
+            onClick={() => setConfirmEnable(true)}
+            disabled={updateState.fetching}
+            className="h-[52px] px-10 text-[15px]"
+            testId={testIds.field("enableTorrents")}
+          >
+            {t("next.torrents.enableButton")}
+          </PrimaryButton>
+        </div>
+      ) : null}
+      <ConfirmDialog
+        open={confirmEnable}
+        title={t("next.torrents.enableButton")}
+        body={t("next.torrents.enableBody")}
+        confirmLabel={t("next.torrents.enableButton")}
+        destructive={false}
+        busy={updateState.fetching}
+        onConfirm={() => saveEnabled(true)}
+        onDismiss={() => setConfirmEnable(false)}
+        testId={testIds.dialog("enable-torrents")}
+      />
       {trackerRules.overlays}
       <TorrentsOffDialog
-        open={asking}
-        onChoose={choose}
-        // Cancel leaves torrents on: the switch goes back.
-        onDismiss={() => {
-          setAsking(false);
-          patchTorrent({ enabled: true });
-        }}
+        open={asking && !forcing}
+        asksHow={asksHow}
+        finish={finish}
+        onFinish={setFinish}
+        busy={updateState.fetching}
+        onConfirm={turnOff}
+        onDismiss={() => setAsking(false)}
+      />
+      <ConfirmDialog
+        open={forcing}
+        title={t("next.torrents.offForceTitle")}
+        body={t("next.torrents.offForceBody")}
+        confirmLabel={t("next.torrents.offTitle")}
+        solid
+        busy={updateState.fetching}
+        onConfirm={() => saveEnabled(false, "STOP_NOW")}
+        onDismiss={() => setForcing(false)}
+        testId={testIds.dialog("torrents-off-force")}
       />
     </>
   );
@@ -1805,29 +2046,53 @@ export function TorrentsPanel() {
 
 const TORRENTS_OFF_DIALOG = "torrents-off";
 
-/** How the torrents still running end when torrents are turned off. */
-const TORRENTS_OFF_CHOICES: { mode: TorrentDisableMode; label: string; note: string; also?: string }[] = [
-  {
-    mode: "FINISH_ALL",
-    label: "next.torrents.offFinishAll",
-    note: "next.torrents.offFinishAllNote",
-    also: "next.torrents.finishAllForced",
-  },
-  { mode: "FINISH_DOWNLOADS", label: "next.torrents.offFinishDownloads", note: "next.torrents.offFinishDownloadsNote" },
-  { mode: "STOP_NOW", label: "next.torrents.offStopNow", note: "next.torrents.offStopNowNote" },
-];
+type Finish = { downloads: boolean; seeding: boolean };
 
-/** Asks how running torrents end before torrents are turned off. */
+/** How the torrents still running end, from the two boxes; neither is `STOP_NOW`. */
+function disableMode(finish: Finish): TorrentDisableMode {
+  if (finish.downloads && finish.seeding) {
+    return "FINISH_ALL";
+  }
+  if (finish.downloads) {
+    return "FINISH_DOWNLOADS";
+  }
+  return finish.seeding ? "FINISH_SEEDING" : "STOP_NOW";
+}
+
+/**
+ * Asks before torrents are turned off and, while some run, how they end:
+ * each box on lets that part finish.
+ */
 function TorrentsOffDialog({
   open,
-  onChoose,
+  asksHow,
+  finish,
+  onFinish,
+  busy,
+  onConfirm,
   onDismiss,
 }: {
   open: boolean;
-  onChoose: (mode: TorrentDisableMode) => void;
+  asksHow: boolean;
+  finish: Finish;
+  onFinish: (next: Finish) => void;
+  busy: boolean;
+  onConfirm: () => void;
   onDismiss: () => void;
 }) {
   const t = useTranslate();
+  const boxes: { key: keyof Finish; label: string; note: string }[] = [
+    {
+      key: "downloads",
+      label: "next.torrents.offFinishDownloadsBox",
+      note: finish.downloads ? "next.torrents.offFinishDownloadsOn" : "next.torrents.offFinishDownloadsOff",
+    },
+    {
+      key: "seeding",
+      label: "next.torrents.offFinishSeedingBox",
+      note: finish.seeding ? "next.torrents.finishAllForced" : "next.torrents.offFinishSeedingOff",
+    },
+  ];
   return (
     <Dialog
       open={open}
@@ -1835,30 +2100,46 @@ function TorrentsOffDialog({
       onDismiss={onDismiss}
       testId={testIds.dialog(TORRENTS_OFF_DIALOG)}
       footer={
-        <SecondaryButton onClick={onDismiss} testId={testIds.confirmDismiss}>
-          {t("action.cancel")}
-        </SecondaryButton>
+        <>
+          <SecondaryButton onClick={onDismiss} testId={testIds.confirmDismiss}>
+            {t("action.cancel")}
+          </SecondaryButton>
+          <PrimaryButton onClick={onConfirm} disabled={busy} testId={testIds.confirmAccept}>
+            {t("next.torrents.offTitle")}
+          </PrimaryButton>
+        </>
       }
     >
       <div className="flex flex-col gap-3 px-4 py-5 sm:px-6">
-        <p className="text-[13px] leading-[1.55] text-pretty text-wv-secondary">{t("next.torrents.offBody")}</p>
-        {TORRENTS_OFF_CHOICES.map((choice) => (
-          <button
-            key={choice.mode}
-            type="button"
-            data-testid={testIds.option(TORRENTS_OFF_DIALOG, choice.mode)}
-            onClick={() => onChoose(choice.mode)}
-            className="flex flex-col items-start gap-1 border border-wv-control bg-wv-button px-4 py-3 text-left hover:border-wv-control-hover-strong"
-          >
-            <span className="text-[13px] font-medium text-wv-strong">{t(choice.label)}</span>
-            <span className="text-[12px] text-wv-muted">{t(choice.note)}</span>
-            {choice.also === undefined ? null : (
-              <span data-testid={testIds.optionNote(TORRENTS_OFF_DIALOG, choice.mode)} className="text-[12px] text-wv-muted">
-                {t(choice.also)}
-              </span>
-            )}
-          </button>
-        ))}
+        <p className="text-[13px] leading-[1.55] text-pretty text-wv-secondary">
+          {t(asksHow ? "next.torrents.offBody" : "next.torrents.offIdleBody")}
+        </p>
+        {asksHow
+          ? boxes.map((box) => {
+              const toggle = () => onFinish({ ...finish, [box.key]: !finish[box.key] });
+              return (
+                <div
+                  key={box.key}
+                  onClick={toggle}
+                  className="flex cursor-pointer items-start gap-3 border border-wv-control bg-wv-button px-4 py-3 hover:border-wv-control-hover-strong"
+                >
+                  <CheckBox
+                    checked={finish[box.key]}
+                    onChange={toggle}
+                    label={t(box.label)}
+                    className="mt-[2px]"
+                    testId={testIds.option(TORRENTS_OFF_DIALOG, box.key)}
+                  />
+                  <div className="flex flex-col gap-1">
+                    <span className="text-[13px] font-medium text-wv-strong">{t(box.label)}</span>
+                    <span data-testid={testIds.optionNote(TORRENTS_OFF_DIALOG, box.key)} className="text-[12px] text-wv-muted">
+                      {t(box.note)}
+                    </span>
+                  </div>
+                </div>
+              );
+            })
+          : null}
       </div>
     </Dialog>
   );

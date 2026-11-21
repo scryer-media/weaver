@@ -6630,6 +6630,11 @@ enum TorrentDisableMode {
 	"""
 	FINISH_DOWNLOADS
 	"""
+	Seeding finishes to its own limits; downloads stop; then torrents
+	are off.
+	"""
+	FINISH_SEEDING
+	"""
 	Torrents download and seed to their own limits; then torrents are
 	off.
 	"""

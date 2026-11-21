@@ -161,6 +161,10 @@ export interface FieldSpec {
    * slides it shut, `false` slides it open. Rows without it are always shown.
    */
   collapsed?: boolean;
+  /** The control alone, centered across the row, with no label beside it; the label still names it for search. */
+  wide?: boolean;
+  /** A short line under the control, such as what an inherited value gives. */
+  under?: string;
 }
 
 /** Draw one field's control. Shared by the panels and by the record editor. */
@@ -323,29 +327,47 @@ export function FieldRows({ fields }: { fields: readonly FieldSpec[] }) {
 
 /** One field's row; a field a panel kept from its last render is not drawn again. */
 const FieldRow = memo(function FieldRow({ field }: { field: FieldSpec }) {
-  const row = (
-    <FormRow label={field.label} help={field.help} helpTestId={testIds.fieldHelp(field.id)}>
+  const row = field.wide ? (
+    <div className="flex justify-center border-b border-wv-hairline px-4 py-[14px] sm:px-6">
       <FieldControlView spec={field} />
+    </div>
+  ) : (
+    <FormRow label={field.label} help={field.help} helpTestId={testIds.fieldHelp(field.id)}>
+      {field.under === undefined ? (
+        <FieldControlView spec={field} />
+      ) : (
+        <div className="flex min-w-0 flex-col items-start gap-[6px] sm:items-end">
+          <FieldControlView spec={field} />
+          <div className="font-wv-mono text-[11.5px] text-wv-muted">{field.under}</div>
+        </div>
+      )}
     </FormRow>
   );
   if (field.collapsed === undefined) {
     return row;
   }
-  // Animating the grid track from 0fr to 1fr slides the row to its real
-  // height without measuring it; `inert` keeps a shut row out of the tab
-  // order and away from assistive technology.
+  return <Fold open={!field.collapsed}>{row}</Fold>;
+});
+
+/**
+ * Anything that slides shut and open: a row behind another row's toggle, or
+ * a run of rows behind a choice. Animating the grid track from 0fr to 1fr
+ * slides it to its real height without measuring it; `inert` keeps a shut
+ * fold out of the tab order and away from assistive technology.
+ */
+export function Fold({ open, children }: { open: boolean; children: ReactNode }) {
   return (
     <div
-      inert={field.collapsed}
+      inert={!open}
       className={cn(
         "grid transition-[grid-template-rows,opacity] duration-200 ease-out motion-reduce:transition-none",
-        field.collapsed ? "grid-rows-[0fr] opacity-0" : "grid-rows-[1fr] opacity-100",
+        open ? "grid-rows-[1fr] opacity-100" : "grid-rows-[0fr] opacity-0",
       )}
     >
-      <div className="min-h-0 overflow-hidden">{row}</div>
+      <div className="min-h-0 overflow-hidden">{children}</div>
     </div>
   );
-});
+}
 
 /* ------------------------------------------------------------------- blocks */
 

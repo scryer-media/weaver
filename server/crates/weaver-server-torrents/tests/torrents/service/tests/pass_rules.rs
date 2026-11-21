@@ -8,6 +8,7 @@ use super::*;
 use crate::jobs::handle::HoldSet;
 use crate::torrents::FilePriority;
 use crate::torrents::service::disk_room::DiskHeld;
+use crate::torrents::service::WindDown;
 use crate::torrents::service::live::{Live, Rules};
 use crate::torrents::service::policy::{
     self, Checkpoint, Context, Goals, Intent, Limits, Picking, Picks, Policy, QueueOrder, Reading,
@@ -50,7 +51,7 @@ fn downloading() -> Live {
 // What the pass's context holds besides the settings, for one question.
 #[derive(Default)]
 struct Ask {
-    downloads_only: bool,
+    wind_down: Option<WindDown>,
     unsaved: BTreeSet<JobId>,
     seats: Seats,
 }
@@ -69,7 +70,7 @@ fn decide(
         holds: &holds,
         now: EPOCH_MS,
         at_once: false,
-        downloads_only: ask.downloads_only,
+        wind_down: ask.wind_down,
         unsaved: &ask.unsaved,
         seats: &ask.seats,
     };
@@ -212,7 +213,7 @@ fn no_goal_is_met_for_a_goal_left_a_forced_or_stopped_seed_or_a_download() {
 fn winding_down_to_the_downloads_stops_those_done_unless_their_goal_is_met() {
     let settings = settings();
     let only = &Ask {
-        downloads_only: true,
+        wind_down: Some(WindDown::FinishDownloads),
         ..Ask::default()
     };
     assert_eq!(
@@ -237,6 +238,46 @@ fn winding_down_to_the_downloads_stops_those_done_unless_their_goal_is_met() {
     let mut stopped = seed(2.0, SeedingAction::Stop);
     stopped.record.kept = KeptIntent::Intent(TorrentIntent::Stopped);
     assert_eq!(decide(&Goals, &stopped, &settings, only), []);
+}
+
+// Goals, winding down to the seeds alone: one still downloading stops for
+// it; a seed, forced or with a goal left, seeds on; a seed meeting its goal
+// ends by its goal; one stopped is left. Letting every torrent finish stops
+// none.
+#[test]
+fn winding_down_to_the_seeds_stops_those_still_downloading() {
+    let settings = settings();
+    let only = &Ask {
+        wind_down: Some(WindDown::FinishSeeding),
+        ..Ask::default()
+    };
+    assert_eq!(
+        decide(&Goals, &downloading(), &settings, only),
+        [Intent::WindDown]
+    );
+    assert_eq!(
+        decide(&Goals, &seed(2.0, SeedingAction::Stop), &settings, only),
+        []
+    );
+    let mut forced = seed(0.0, SeedingAction::Stop);
+    forced.record.forced = true;
+    assert_eq!(decide(&Goals, &forced, &settings, only), []);
+    assert_eq!(
+        decide(&Goals, &seed(0.0, SeedingAction::Remove), &settings, only),
+        [Intent::GoalMet(SeedingAction::Remove)]
+    );
+    let mut stopped = downloading();
+    stopped.record.kept = KeptIntent::Intent(TorrentIntent::Stopped);
+    assert_eq!(decide(&Goals, &stopped, &settings, only), []);
+    let all = &Ask {
+        wind_down: Some(WindDown::Finish),
+        ..Ask::default()
+    };
+    assert_eq!(decide(&Goals, &downloading(), &settings, all), []);
+    assert_eq!(
+        decide(&Goals, &seed(2.0, SeedingAction::Stop), &settings, all),
+        []
+    );
 }
 
 // Standing: how the queue stands the torrent, as the queue reads it.

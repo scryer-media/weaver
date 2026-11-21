@@ -611,3 +611,34 @@ export function globalUploadCapField(t: Translate, cap: number | null, onChange:
     control: { kind: "custom", control: <LimitControl label={label} value={cap} suffix="MB/s" onChange={onChange} /> },
   };
 }
+
+/**
+ * What each seeding field and the upload limit read at the global level, as
+ * text by the field ids `seedingFields` and `uploadCapField` give under
+ * `prefix`: what a level that inherits them falls back to.
+ */
+export function seedingEffectiveText(
+  t: Translate,
+  policy: SeedingPolicy,
+  uploadCap: number | null,
+  prefix: string,
+  capPrefix: string,
+): Record<string, string> {
+  const noGoal = t("next.seeding.noGoal");
+  const goal = (leaf: Leaf<number>, text: (value: number) => string) =>
+    leaf.state === "SET" && leaf.value !== null ? text(leaf.value) : noGoal;
+  const pick = <T extends string>(leaf: Leaf<T>, options: { value: T; label: string }[]) => {
+    const option = options.find((entry) => entry.value === leaf.value);
+    return option ? t(option.label) : "";
+  };
+  return {
+    [`${prefix}-ratioGoal`]: goal(policy.ratioGoal, (ratio) => ratio.toFixed(2)),
+    [`${prefix}-seedTimeGoalMinutes`]: goal(policy.seedTimeGoalMinutes, (minutes) => durationText(t, minutes)),
+    [`${prefix}-inactiveGoalMinutes`]: goal(policy.inactiveGoalMinutes, (minutes) => durationText(t, minutes)),
+    [`${prefix}-mode`]: pick(policy.mode, MODES),
+    [`${prefix}-seedTimeCounting`]: pick(policy.seedTimeCounting, COUNTINGS),
+    [`${prefix}-action`]: pick(policy.action, ACTIONS),
+    [`${capPrefix}-uploadCap`]:
+      uploadCap === null ? t("next.networking.unlimited") : `${Math.round((uploadCap / (1024 * 1024)) * 10) / 10} MB/s`,
+  };
+}

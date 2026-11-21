@@ -224,6 +224,54 @@ async fn turning_torrents_off_to_finish_downloads_stops_seeding() {
     assert_eq!(kept_wind_down(&rig), None);
 }
 
+// Turning off to finish the seeding stops every torrent still
+// downloading and lets the seeds seed to their limits; once the last ends,
+// torrents are off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turning_torrents_off_to_finish_seeding_stops_downloads() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let seeding = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(plain("seeding", 1))))
+        .await
+        .unwrap();
+    let downloading = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(plain("downloading", 2))))
+        .await
+        .unwrap();
+    complete(&rig, seeding).await;
+    rig.service
+        .wind_down_when_off(Some(WindDown::FinishSeeding))
+        .await;
+    rig.service.set_settings(turned_off(&rig.service)).await;
+    assert_eq!(kept_wind_down(&rig).as_deref(), Some("finish_seeding"));
+
+    let kept = |job_id| {
+        let row = rig.db.get_torrent(job_id).unwrap().unwrap();
+        (row.intent(), row.wound_down())
+    };
+    rig.service.tick().await;
+    rig.service.restored().await;
+    assert_eq!(kept(downloading), (TorrentIntent::Stopped, true));
+    assert_eq!(kept(seeding), (TorrentIntent::Resumed, false));
+    assert!(rig.service.inner.sessions.on());
+    assert_eq!(rig.service.wind_down(), Some(WindDown::FinishSeeding));
+
+    let mut wind_downs = rig.service.wind_downs();
+    rig.service.pause(seeding).await.unwrap();
+    rig.service.tick().await;
+    rig.service.restored().await;
+    wind_downs
+        .wait_for(|wind_down| wind_down.is_none())
+        .await
+        .unwrap();
+    let _turning = rig.service.inner.turning.lock().await;
+    assert!(!rig.service.inner.sessions.on());
+    assert_eq!(kept_wind_down(&rig), None);
+}
+
 // A wind-down asked for with nothing running is over before it starts:
 // torrents are off at once. One asked for while torrents are already off
 // is not taken.
