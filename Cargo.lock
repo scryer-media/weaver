@@ -3154,6 +3154,8 @@ dependencies = [
 [[package]]
 name = "lzma-turbo"
 version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1ef81665372dceeff7cf5bd7ceb56d28b48661b544ac78a70edb46ba7e5c361"
 dependencies = [
  "aws-lc-rs",
  "crc-turbo",

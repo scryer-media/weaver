@@ -370,10 +370,8 @@ lto = false
 # any build without that exact checkout cannot compile the workspace. When a
 # rarpar change is needed, publish it and bump the requirement here instead.
 
-# Until lzma-turbo 0.12.1 and unrar-rs 0.16.8 are published: the same code
-# from the sibling checkouts their pull requests are open from. The paths
-# are for a checkout beside `lzma-turbo` and `rarpar`. Remove this block when
-# both are on crates.io; the e2e image build refuses it.
+# Until unrar-rs 0.16.8 is published: the same code from the sibling checkout
+# its pull request is open from. The path is for a checkout beside `rarpar`.
+# Remove this block when it is on crates.io; the e2e image build refuses it.
 [patch.crates-io]
-lzma-turbo = { path = "../lzma-turbo/.worktrees/budget-hardening" }
 unrar-rs = { path = "../rarpar/.worktrees/linear-index/crates/unrar-rs" }
