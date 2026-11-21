@@ -277,10 +277,23 @@ fn a_paid_release_with_no_room_stands_and_the_next_pass_asks_again() {
     assert!(run.inside() == run.payload, "the member is whole");
 }
 
-// With room, a paid release hands the store the same bytes, in the same
-// order, and says the same, as the unpaid release over the same holds.
+// With room, the release the loop runs after a write (`release_held`) and
+// a paid one hand the store the same bytes, in the same order, and say the
+// same, as the release did before it was counted on the job's volumes,
+// over the same holds: the span goes whole, as it did, never cut.
 #[test]
-fn a_paid_release_with_room_releases_as_the_unpaid_one_does() {
+fn a_release_with_room_releases_as_the_uncounted_one_did() {
+    let mut before = placed_behind();
+    let mut said_before = Vec::new();
+    before
+        .writer
+        .release_held_uncounted(
+            &mut before.tree,
+            &mut before.objects,
+            &Unsegmented,
+            &mut said_before,
+        )
+        .unwrap();
     let mut unpaid = placed_behind();
     let mut said_unpaid = Vec::new();
     unpaid
@@ -292,13 +305,16 @@ fn a_paid_release_with_room_releases_as_the_unpaid_one_does() {
             &mut said_unpaid,
         )
         .unwrap();
+    assert_eq!(unpaid.writer.release_owed(), None, "nothing is owed");
     let mut paid = placed_behind();
     let mut said_paid = Vec::new();
     let mut prepaid = false;
     assert_eq!(paid.release_paid(&mut prepaid, &mut said_paid), None);
-    assert_eq!(unpaid.writer.held_bytes(NodeId::ROOT), 0);
-    assert_eq!(paid.writer.held_bytes(NodeId::ROOT), 0);
-    assert_eq!(said_paid, said_unpaid);
+    for run in [&before, &unpaid, &paid] {
+        assert_eq!(run.writer.held_bytes(NodeId::ROOT), 0);
+    }
+    assert_eq!(said_unpaid, said_before);
+    assert_eq!(said_paid, said_before);
     // What the store's member recorded of the bytes it was handed.
     let coverage = |run: &PlacedBehind| {
         let (child, _) = run.tree.child_of(NodeId::ROOT, run.member).expect("a 7z");
@@ -309,8 +325,57 @@ fn a_paid_release_with_room_releases_as_the_unpaid_one_does() {
             .expect("the store's member");
         format!("{:?}", record.coverage)
     };
-    assert_eq!(coverage(&paid), coverage(&unpaid));
-    let (bytes_unpaid, bytes_paid) = (unpaid.inside(), paid.inside());
-    assert!(bytes_unpaid == unpaid.payload, "the unpaid member is whole");
-    assert!(bytes_paid == bytes_unpaid, "the paid member is the same");
+    assert_eq!(coverage(&unpaid), coverage(&before));
+    assert_eq!(coverage(&paid), coverage(&before));
+    let bytes_before = before.inside();
+    assert!(bytes_before == before.payload, "the member is whole");
+    assert!(
+        unpaid.inside() == bytes_before,
+        "the release's member is the same"
+    );
+    assert!(paid.inside() == bytes_before, "the paid member is the same");
+}
+
+// The release the loop runs after a write, onto a volume with no room for
+// the held span, writes nothing and never stands the loop still: the bytes
+// stay held, and what it stood for is owed, a read-back piece credited in
+// the store's namespace. Paid that off the loop (`release_paid`), the
+// release goes on and the member is written whole; nothing is owed after.
+#[test]
+fn a_release_with_no_room_keeps_the_bytes_held_until_it_is_paid() {
+    use weaver_server_disk::operations::disk::writer::{Credit, Stand};
+    let mut run = placed_behind();
+    let (child, _) = run.tree.child_of(NodeId::ROOT, run.member).expect("a 7z");
+    // Another producer counts the volume's whole limit.
+    let hard = 64 * 1024;
+    run.volume.set_buffer_limits(hard, hard);
+    let full = Credit::reserve(std::iter::once(&run.submitter), hard, Stand::UntilStop);
+    assert!(full.covers(hard));
+    let mut out = Vec::new();
+    run.writer
+        .release_held(&mut run.tree, &mut run.objects, &Unsegmented, &mut out)
+        .unwrap();
+    assert_eq!(
+        run.writer.held_bytes(NodeId::ROOT),
+        run.payload.len() as u64,
+        "the span is still held"
+    );
+    assert_eq!(run.writer.release_owed(), Some((READ_BACK, child)));
+    // The volume's room comes back, and a thread counts what is owed.
+    drop(full);
+    run.volume.set_buffer_limits(u64::MAX, u64::MAX);
+    let credit = Credit::reserve(std::iter::once(&run.submitter), READ_BACK, Stand::UntilStop);
+    assert!(credit.covers(READ_BACK));
+    run.writer
+        .release_paid(
+            &mut run.tree,
+            &mut run.objects,
+            &Unsegmented,
+            credit,
+            &mut out,
+        )
+        .unwrap();
+    assert_eq!(run.writer.release_owed(), None, "nothing is owed");
+    assert_eq!(run.writer.held_bytes(NodeId::ROOT), 0);
+    assert!(run.inside() == run.payload, "the member is whole");
 }

@@ -92,6 +92,9 @@ impl GraphJob {
                     self.pending().left_at_stop();
                 }
             }
+            // What a release was counted goes back as it drops; its bytes
+            // stay held with the job.
+            Heard::ReleasePaid(_) => self.releasing = false,
             Heard::Emit(_)
             | Heard::Paid(..)
             | Heard::Ended
@@ -205,6 +208,26 @@ impl GraphJob {
                     &mut out,
                 )?;
                 return self.tailed(node, tailed, out, slots, limit);
+            }
+            // What a release of held bytes stood for was counted: the
+            // release goes on with it, and what it makes placeable is heard.
+            // One this job did not send is dropped, and what it counted goes
+            // back as it drops.
+            Heard::ReleasePaid(credit) => {
+                if !std::mem::take(&mut self.releasing) {
+                    return Ok(());
+                }
+                let mut out = Vec::new();
+                self.writer.release_paid(
+                    &mut self.tree,
+                    &mut *self.builder,
+                    &self.root,
+                    *credit,
+                    &mut out,
+                )?;
+                self.heard(out)?;
+                self.step_runs(Vec::new(), limit)?;
+                return self.lend(slots, limit);
             }
             Heard::Replayed(replayed) => {
                 if !self.loans.returned(node, said.generation) {

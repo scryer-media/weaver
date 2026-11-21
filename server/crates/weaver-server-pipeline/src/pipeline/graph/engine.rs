@@ -80,6 +80,10 @@ pub enum Heard {
     // addressed to the set's node, under the tail's loan number
     // (`Loans::pay`).
     TailPaid(Box<Credit>),
+    // What a thread counted on the job's volumes for the next piece a
+    // release of held bytes goes on with, the loop having found no room for
+    // it: addressed to the job's root, under no loan (`Loans::pay_release`).
+    ReleasePaid(Box<Credit>),
     // The run returned: nothing more will be said under its generation.
     Ended,
     // A recovery set's repair, lent off the loop, came back: addressed to

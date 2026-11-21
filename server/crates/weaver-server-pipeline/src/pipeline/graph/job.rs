@@ -199,6 +199,9 @@ pub struct GraphJob {
     // A member's file waits to move on a checkpoint the database has not
     // said it committed, and the run mail will say when it has.
     mail_owed: Option<u64>,
+    // A thread is counting on the job's volumes what a release of held bytes
+    // stands for (`pay_release`), and will mail it (`Heard::ReleasePaid`).
+    releasing: bool,
     // A repair the stop ended while a volume's writer still held operations
     // of the job, kept until the stop has given that writer its time.
     stopped_repair: Option<Box<crate::pipeline::graph::namespace::Returned>>,
@@ -318,7 +321,7 @@ impl GraphJob {
         }
         // The deadline counts the time the runs and the loans decode.
         let runs = runs.timed(writer.decode_clock());
-        Self {
+        let mut job = Self {
             tree,
             root,
             builder,
@@ -332,6 +335,7 @@ impl GraphJob {
             repair_ended_at: None,
             pending: Pending::default(),
             mail_owed: None,
+            releasing: false,
             stopped_repair: None,
             #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             stopped_repairs_taken_back: 0,
@@ -344,7 +348,10 @@ impl GraphJob {
             one_turn: false,
             moved: 0,
             indexes_kept: None,
-        }
+        };
+        // What the announcements released may stand for room.
+        job.pay_release();
+        job
     }
 
     // The job is about to be borrowed mutably: what was derived from it no
@@ -779,6 +786,25 @@ impl GraphJob {
             || self.writer.rechecks_waiting()
             || self.verifications_due()
             || self.tree.work_due()
+            || self.releasing
+            || self.writer.release_owed().is_some()
+    }
+
+    // A release of held bytes stands for room on the job's volumes
+    // (`NamespaceWriter::release_owed`): a thread counts it, off the loop,
+    // and the release goes on as its credit is heard (`Heard::ReleasePaid`).
+    // One at a time; while a return's tail is on, the tail is what goes on,
+    // and what is owed is paid once it ends.
+    pub(crate) fn pay_release(&mut self) {
+        if self.releasing || self.writer.tail_into().is_some() {
+            return;
+        }
+        let (Some((bytes, _)), Some(disk)) = (self.writer.release_owed(), self.writer.disk())
+        else {
+            return;
+        };
+        self.loans.pay_release(bytes, disk.clone());
+        self.releasing = true;
     }
 
     // A checksum obligation something can still meet: one an ended
@@ -1730,6 +1756,7 @@ impl GraphJob {
             }
             if !offered {
                 self.fetch_unkept();
+                self.pay_release();
                 return Ok(());
             }
             self.writer.apply_all(

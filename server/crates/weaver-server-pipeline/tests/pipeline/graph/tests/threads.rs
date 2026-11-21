@@ -2731,6 +2731,87 @@ async fn a_repairs_tail_releasing_held_bytes_onto_a_full_output_volume_never_sto
     retire_pipeline_database(pipeline).await;
 }
 
+// A stored 7z whose body arrives before its end header: the body is held,
+// with no place until the header says where it goes. The output volume the
+// member lands on is full as the header's article arrives, and the release
+// after that delivery, no repair's tail, writes the held body. The loop
+// never stands still for the volume: the release stands for room on a
+// thread of its own (`Heard::ReleasePaid`) and goes on as that thread
+// counts, and every byte lands.
+#[tokio::test]
+async fn a_delivery_releasing_held_bytes_onto_a_full_output_volume_never_stops_the_loop() {
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_499);
+    let inside = payload(8 * ARTICLE, 4);
+    let archive = stored_7z(&inside);
+    let footer = 32 + inside.len();
+    let articles = archive.len().div_ceil(ARTICLE) as u32;
+    let header_from = (footer / ARTICLE) as u32;
+    let posts = vec![Post::plain("lantern.7z", archive.clone())];
+    let (mut pipeline, staging_dir) = delivered_apart(&temp_dir, job_id, &posts, Some(1)).await;
+    for ordinal in 0..header_from {
+        decode(&mut pipeline, job_id, &posts, 0, ordinal, true).await;
+    }
+    let held = |pipeline: &Pipeline| {
+        pipeline.graph_jobs[&job_id]
+            .writer()
+            .held_bytes(weaver_graph::NodeId::ROOT)
+    };
+    assert!(held(&pipeline) > 0, "the body is held behind the header");
+    let disk = pipeline.graph_jobs[&job_id].disk().unwrap().clone();
+    let (_, output) = working_and_output(&pipeline, job_id, &staging_dir);
+    // Every write so far is down. Another producer counts the volume's
+    // whole limit and the writer is said to hold bytes, until a thread
+    // stands for room; then both go.
+    disk.barrier().wait_aside();
+    let downloaded = budget_waits(&output);
+    let submitter = Arc::clone(disk.under(&staging_dir));
+    let (_, hard) = output.buffer_limits();
+    assert!(hard < u64::MAX, "the volume is sized");
+    let full = weaver_server_disk::operations::disk::writer::Credit::reserve(
+        std::iter::once(&submitter),
+        hard,
+        weaver_server_disk::operations::disk::writer::Stand::UntilStop,
+    );
+    assert!(full.covers(hard));
+    output.buffered_bytes.fetch_add(hard, Ordering::SeqCst);
+    let (hold, filled) = (pipeline.volume_writers.hold(&output), Arc::clone(&output));
+    hold.open();
+    let watcher = std::thread::spawn(move || {
+        hold.wait_below_waiters(1);
+        filled.buffered_bytes.fetch_sub(hard, Ordering::SeqCst);
+        drop(full);
+    });
+    for ordinal in header_from..articles {
+        decode(&mut pipeline, job_id, &posts, 0, ordinal, true).await;
+    }
+    assert!(held(&pipeline) > 0, "the release stood for room");
+    assert!(
+        pipeline.graph_jobs[&job_id].work_pending(),
+        "what the release owes keeps the job from ending"
+    );
+    let mut paid = 0u32;
+    while held(&pipeline) > 0 {
+        let said = pipeline.graph_runs.recv().await.unwrap();
+        if matches!(&said.heard, Heard::ReleasePaid(_)) {
+            paid += 1;
+        }
+        pipeline.graph_run_said(said);
+    }
+    assert_eq!(
+        budget_waits(&output) - downloaded,
+        0,
+        "the loop stood still for the output volume"
+    );
+    assert!(paid > 0, "the release never stood for room");
+    assert_eq!(pipeline.graph_jobs[&job_id].writer().release_owed(), None);
+    watcher.join().unwrap();
+    disk.barrier().wait_aside();
+    assert_eq!(read(&staging_dir.join("inside.bin")), inside);
+    retire_pipeline_database(pipeline).await;
+}
+
 // An article of a file outside the set arrives between two slices of a
 // repair being applied: both files end whole.
 #[tokio::test]
@@ -2772,7 +2853,7 @@ async fn an_article_between_a_repairs_slices_lands_whole() {
 async fn a_lost_article_arriving_during_its_repair_leaves_the_member_whole() {
     let _threads = threads::real();
     let temp_dir = tempfile::tempdir().unwrap();
-    let job_id = JobId(92_493);
+    let job_id = JobId(92_498);
     let data = payload(8 * ARTICLE, 4);
     let mut posts = vec![Post::plain("lantern.bin", data.clone())];
     posts.extend(par2_set("lantern", &[("lantern.bin", &data)], 4));

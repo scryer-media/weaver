@@ -430,6 +430,10 @@ pub struct NamespaceWriter {
     applying: Option<Applying>,
     // A return's tail standing for room for its next piece.
     tail: Option<ReturnTail>,
+    // What a release of held bytes outside a tail stands for: the bytes of
+    // the piece a volume had no room for, and the namespace it is credited
+    // in (`release_held`). The job pays it off the loop (`release_paid`).
+    release_owed: Option<(u64, NodeId)>,
     // The credit the loop carries for a run's output it holds (`carried`).
     carried: carried::Carried,
     // Members refused while a repair's return was applied, each read as the
@@ -587,6 +591,7 @@ impl NamespaceWriter {
             acknowledging: None,
             applying: None,
             tail: None,
+            release_owed: None,
             carried: carried::Carried::default(),
             refused_in_batch: BTreeSet::new(),
             given_back: Vec::new(),
@@ -663,6 +668,12 @@ impl NamespaceWriter {
     // The namespace the piece a standing tail waits for is credited in.
     pub(crate) fn tail_into(&self) -> Option<NodeId> {
         self.tail.as_ref().map(|tail| tail.into)
+    }
+
+    // The bytes a release of held bytes stands for, and the namespace they
+    // are credited in (`release_held`).
+    pub fn release_owed(&self) -> Option<(u64, NodeId)> {
+        self.release_owed
     }
 
     // The writer of the volume a file under `root` lies on, when the job
@@ -1110,6 +1121,21 @@ impl NamespaceWriter {
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub fn holds_asked(&self, node: NodeId, member: MemberId) -> bool {
         self.asked.contains_key(&(node, held_volume(member)))
+    }
+
+    // The release as it ran before it was counted on the job's volumes:
+    // every span goes down, paid by whatever the step was prepaid with.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn release_held_uncounted(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        self.apply_unnamed(tree, builder, segments, out)?;
+        while self.release_placed(tree, builder, segments, None, out)? == Released::Some {}
+        Ok(())
     }
 
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
@@ -2775,7 +2801,7 @@ impl NamespaceWriter {
         member: MemberId,
     ) -> Result<(), WriteError> {
         let paid = self.pay_held(tree, node, member);
-        for span in self.held_spans(node, member, ALL, false) {
+        for span in self.held_spans(node, member, ALL) {
             for (offset, bytes) in self.take_held(node, member, span)? {
                 self.write_file(tree, node, member, offset, &bytes)?;
             }
@@ -2795,10 +2821,12 @@ impl NamespaceWriter {
     // still held.
     //
     // `pay` counts each span on the job's volumes before it leaves the
-    // ledger, as a return's tail counts its pieces (`ReturnTail`): paid by
-    // what the step was prepaid with while the flag is set, which the span
-    // clears, else by the loop when every volume has room for it now. `Some`
-    // with the span's bytes when one has not, the span left held. Unpaid,
+    // ledger (`ReturnTail`, `release_held`): the loop counts the span whole
+    // when every volume has room for it now, and only a span refused whole
+    // is cut a `READ_BACK` at a time, each piece counted as it goes. While
+    // the flag is set, the piece at the head is paid by what the step was
+    // prepaid with, and the flag is cleared. `Some` with the bytes of the
+    // first piece a volume has no room for, which is left held; unpaid,
     // never `Some`.
     #[allow(clippy::too_many_arguments)]
     fn replay(
@@ -2813,37 +2841,57 @@ impl NamespaceWriter {
         mut pay: Option<&mut bool>,
         out: &mut Vec<Effect>,
     ) -> Result<Option<u64>, WriteError> {
+        let head = |rest: ByteRange| {
+            ByteRange::new(
+                rest.start,
+                rest.end.min(rest.start.saturating_add(READ_BACK)),
+            )
+        };
         let paid = self.pay_held(tree, node, member);
         let mut stood = None;
-        for span in self.held_spans(node, member, range, pay.is_some()) {
-            let credit = match pay.as_deref_mut().map(std::mem::take) {
-                None | Some(true) => None,
-                Some(false) => match self.disk.as_ref() {
-                    Some(disk) => match disk.try_reserve(span.len()) {
-                        Some(credit) => Some(credit),
-                        None => {
-                            stood = Some(span.len());
-                            break;
+        'spans: for span in self.held_spans(node, member, range) {
+            let mut cut = false;
+            let mut at = span.start;
+            while at < span.end {
+                let rest = ByteRange::new(at, span.end);
+                let (piece, credit) = match pay.as_deref_mut().map(std::mem::take) {
+                    None => (rest, None),
+                    Some(true) => (head(rest), None),
+                    Some(false) => match self.disk.as_ref() {
+                        None => (rest, None),
+                        Some(disk) => {
+                            let piece = if cut { head(rest) } else { rest };
+                            match disk.try_reserve(piece.len()) {
+                                Some(credit) => (piece, Some(credit)),
+                                None if !cut && piece.len() > READ_BACK => {
+                                    cut = true;
+                                    continue;
+                                }
+                                None => {
+                                    stood = Some(piece.len());
+                                    break 'spans;
+                                }
+                            }
                         }
                     },
-                    None => None,
-                },
-            };
-            let into = Self::held_into(tree, node, member);
-            self.with_credit(tree, into, credit, |writer, tree| {
-                for piece in writer.take_held(node, member, span)? {
-                    writer.replay_piece(
-                        tree,
-                        builder,
-                        segments,
-                        (node, member),
-                        piece,
-                        said,
-                        out,
-                    )?;
-                }
-                Ok::<_, WriteError>(())
-            })?;
+                };
+                let into = Self::held_into(tree, node, member);
+                self.with_credit(tree, into, credit, |writer, tree| {
+                    for piece in writer.take_held(node, member, piece)? {
+                        writer.replay_piece(
+                            tree,
+                            builder,
+                            segments,
+                            (node, member),
+                            piece,
+                            said,
+                            out,
+                        )?;
+                    }
+                    Ok::<_, WriteError>(())
+                })?;
+                at = piece.end;
+            }
         }
         self.paid_held(node, member, paid);
         Ok(stood)
@@ -2966,7 +3014,10 @@ impl NamespaceWriter {
     // stays held. This runs once a call into the writer has done everything
     // else, and never inside one: held bytes never overtake the effects of
     // the bytes before them, and what one release makes placeable goes in
-    // the next pass, not from inside this one.
+    // the next pass, not from inside this one. The loop never stands for a
+    // volume here: each span is counted on the job's volumes before it goes
+    // (`replay`), and the first a volume has no room for stays held, owed
+    // (`release_owed`), until the job pays it off the loop (`release_paid`).
     pub fn release_held(
         &mut self,
         tree: &mut Tree,
@@ -2974,8 +3025,33 @@ impl NamespaceWriter {
         segments: &dyn Segments,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
-        self.apply_unnamed(tree, builder, segments, out)?;
-        while self.release_placed(tree, builder, segments, None, out)? == Released::Some {}
+        self.release_owed = self.release_held_paid(tree, builder, segments, &mut false, out)?;
+        Ok(())
+    }
+
+    // A thread counted on the job's volumes what a release stood for
+    // (`release_owed`): the release goes on with that credit, which pays the
+    // piece it stood at, and stands again at the next a volume has no room
+    // for. What the credit did not pay is settled as the step ends. A wait
+    // the end of a stop cut short leaves the bytes held, as a tail's does
+    // (`tail_paid`).
+    pub fn release_paid(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        credit: weaver_server_disk::operations::disk::writer::Credit,
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        let Some((_, into)) = self.release_owed.take() else {
+            return Ok(());
+        };
+        if self.disk.as_ref().is_some_and(|disk| disk.left_at_stop()) {
+            return Err(WriteError::LeftAtStop);
+        }
+        self.release_owed = self.with_credit(tree, into, Some(credit), |writer, tree| {
+            writer.release_held_paid(tree, builder, segments, &mut true, out)
+        })?;
         Ok(())
     }
 
@@ -3135,22 +3211,14 @@ impl NamespaceWriter {
     // budget bounds, a `READ_BACK` at a time. However much a member spilled,
     // no more than that of it is read back into memory at once, and what is
     // not yet read stays held on file, so a refusal or a second release
-    // among the pieces still sees it there. `cut_all` cuts every hold so,
-    // wherever it lives, for a release that counts each span on the job's
-    // volumes before it goes: no more than that is counted at once.
-    fn held_spans(
-        &self,
-        node: NodeId,
-        member: MemberId,
-        range: ByteRange,
-        cut_all: bool,
-    ) -> Vec<ByteRange> {
+    // among the pieces still sees it there.
+    fn held_spans(&self, node: NodeId, member: MemberId, range: ByteRange) -> Vec<ByteRange> {
         let Some(files) = self.files.get(&node) else {
             return Vec::new();
         };
         let mut spans = Vec::new();
         for piece in files.holds.peek(held_volume(member), range) {
-            if !cut_all && piece.location != Location::Spilled {
+            if piece.location != Location::Spilled {
                 spans.push(piece.range);
                 continue;
             }

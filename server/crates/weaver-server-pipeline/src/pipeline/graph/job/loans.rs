@@ -200,7 +200,7 @@ impl Loans {
     // volumes' limits until its end, which ends the wait short.
     pub(crate) fn pay(&mut self, set: NodeId, bytes: u64, disk: JobDisk) {
         self.serial += 1;
-        let (scope, serial) = (self.scope, self.serial);
+        let serial = self.serial;
         self.out = Some(Out {
             set,
             serial,
@@ -209,6 +209,31 @@ impl Loans {
             kind: Work::Apply,
             ends: Arc::new(AtomicBool::new(false)),
         });
+        self.reserve_ahead(set, serial, bytes, disk, Heard::TailPaid);
+    }
+
+    // A release of held bytes outside a tail found no room on the job's
+    // volumes for the next piece (`NamespaceWriter::release_owed`): a thread
+    // counts `bytes` for it on each, as for a tail (`pay`), and mails what it
+    // counted (`Heard::ReleasePaid`). It is no loan: the job keeps its own
+    // note that one is out (`GraphJob::releasing`).
+    pub(crate) fn pay_release(&self, bytes: u64, disk: JobDisk) {
+        self.reserve_ahead(NodeId::ROOT, 0, bytes, disk, Heard::ReleasePaid);
+    }
+
+    // The thread `pay` and `pay_release` send: it counts `bytes` on the
+    // job's volumes, standing still while one is at its limit, and mails the
+    // credit as `heard` says. A stop keeps the volumes' limits until its
+    // end, which ends the wait short.
+    fn reserve_ahead(
+        &self,
+        node: NodeId,
+        generation: u64,
+        bytes: u64,
+        disk: JobDisk,
+        heard: fn(Box<Credit>) -> Heard,
+    ) {
+        let scope = self.scope;
         let mail = self.mail.clone();
         tokio::task::spawn_blocking(move || {
             let _job =
@@ -218,9 +243,9 @@ impl Loans {
             // back as it drops.
             let _ = mail.blocking_send(Said {
                 scope,
-                node: set,
-                generation: serial,
-                heard: Heard::TailPaid(Box::new(credit)),
+                node,
+                generation,
+                heard: heard(Box::new(credit)),
             });
         });
     }

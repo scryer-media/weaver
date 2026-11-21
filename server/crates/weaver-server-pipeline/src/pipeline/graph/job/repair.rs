@@ -521,6 +521,8 @@ impl GraphJob {
                     if one_turn {
                         continue;
                     }
+                    // What this volume released may stand for room.
+                    self.pay_release();
                     return Ok(None);
                 }
                 self.heard(batch.into_out())?;

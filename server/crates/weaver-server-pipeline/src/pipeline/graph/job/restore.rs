@@ -133,6 +133,7 @@ impl GraphJob {
             repair_ended_at: None,
             pending: Pending::default(),
             mail_owed: None,
+            releasing: false,
             stopped_repair: None,
             #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             stopped_repairs_taken_back: 0,
