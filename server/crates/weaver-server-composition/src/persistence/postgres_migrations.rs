@@ -586,6 +586,58 @@ mod tests {
         .await;
     }
 
+    // 0135: signing keys are derived from the master key, so the stored
+    // signing secret goes, whether it was written plain or sealed.
+    #[tokio::test]
+    async fn postgres_0135_deletes_the_stored_signing_secret_when_configured() {
+        in_scoped_schema(|pool| async move {
+            upgrade_from(&pool, 134, |pool| async move {
+                for (key, value) in [
+                    ("auth.jwt_signing_secret", "enc:v1:sealed-secret"),
+                    ("auth.username", "admin"),
+                ] {
+                    sqlx::query("INSERT INTO settings (key, value) VALUES ($1, $2)")
+                        .bind(key)
+                        .bind(value)
+                        .execute(&pool)
+                        .await
+                        .unwrap();
+                }
+                sqlx::query(
+                    "INSERT INTO browser_sessions
+                        (token_hash, csrf_verifier, origin, remembered, created_at, expires_at)
+                     VALUES ('session', 'verifier', 'http://localhost', TRUE, 1, 4102444800)",
+                )
+                .execute(&pool)
+                .await
+                .unwrap();
+                sqlx::query(
+                    "INSERT INTO browser_session_verifications (token_hash, verified_at)
+                     VALUES ('session', 2)",
+                )
+                .execute(&pool)
+                .await
+                .unwrap();
+            })
+            .await;
+            let keys: Vec<String> =
+                sqlx::query_scalar("SELECT key FROM settings WHERE key LIKE 'auth.%' ORDER BY key")
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(keys, vec!["auth.username".to_string()]);
+            // Every browser session ends, with its verification.
+            for query in [
+                "SELECT COUNT(*) FROM browser_sessions",
+                "SELECT COUNT(*) FROM browser_session_verifications",
+            ] {
+                let rows: i64 = sqlx::query_scalar(query).fetch_one(&pool).await.unwrap();
+                assert_eq!(rows, 0, "{query}");
+            }
+        })
+        .await;
+    }
+
     async fn insert_v26_history_row(pool: &PgPool, job_id: i64, metadata: Option<&str>) {
         sqlx::query(
             "INSERT INTO job_history

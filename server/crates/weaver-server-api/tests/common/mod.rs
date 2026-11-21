@@ -7,7 +7,6 @@
 use std::sync::{
     Arc, Condvar, Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock, RwLock as StdRwLock,
 };
-use weaver_server_core::auth::repository::AuthRepositoryQueries;
 use weaver_server_core::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
 
 use async_graphql::{Request, Response, Variables};
@@ -176,8 +175,10 @@ impl TestHarness {
             handle.clone(),
             shared_config.clone(),
         );
-        let auth_cache =
-            LoginAuthCache::from_credentials(None, db.get_or_create_jwt_signing_secret().unwrap());
+        let auth_cache = LoginAuthCache::from_credentials(
+            None,
+            &weaver_server_core::auth::SigningKeys::for_database(&db).unwrap(),
+        );
         let api_key_cache = ApiKeyCache::from_rows(vec![]);
         let shared_schedules: weaver_server_core::bandwidth::schedule::SharedSchedules =
             Arc::new(RwLock::new(vec![]));

@@ -6826,6 +6826,7 @@ name = "weaver-server-db"
 version = "0.16.17"
 dependencies = [
  "aes-gcm",
+ "aws-lc-rs",
  "base64 0.23.1",
  "chrono",
  "getrandom 0.4.3",

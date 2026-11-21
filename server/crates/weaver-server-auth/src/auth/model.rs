@@ -8,11 +8,14 @@ use tokio::sync::watch;
 
 use super::ApiKeyAuthRow;
 use crate::auth::repository::AuthCredentials;
+use crate::auth::signing::SigningKeys;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedLoginAuth {
     pub username: String,
     pub password_hash: String,
+    // Signs this credential's login and CSRF tokens. Derived from the
+    // password hash, so a new password is a new key.
     pub jwt_secret: [u8; 32],
 }
 
@@ -20,17 +23,18 @@ impl CachedLoginAuth {
     pub fn new(
         username: impl Into<String>,
         password_hash: impl Into<String>,
-        jwt_secret: [u8; 32],
+        keys: &SigningKeys,
     ) -> Self {
+        let password_hash = password_hash.into();
         Self {
             username: username.into(),
-            password_hash: password_hash.into(),
-            jwt_secret,
+            jwt_secret: keys.login_key(&password_hash),
+            password_hash,
         }
     }
 
-    pub fn from_credentials(credentials: AuthCredentials, jwt_secret: [u8; 32]) -> Self {
-        Self::new(credentials.username, credentials.password_hash, jwt_secret)
+    pub fn from_credentials(credentials: AuthCredentials, keys: &SigningKeys) -> Self {
+        Self::new(credentials.username, credentials.password_hash, keys)
     }
 }
 
@@ -63,9 +67,9 @@ pub struct LoginAuthCache {
 }
 
 impl LoginAuthCache {
-    pub fn from_credentials(credentials: Option<AuthCredentials>, jwt_secret: [u8; 32]) -> Self {
+    pub fn from_credentials(credentials: Option<AuthCredentials>, keys: &SigningKeys) -> Self {
         let cache = Self::default();
-        cache.replace_credentials(credentials, jwt_secret);
+        cache.replace_credentials(credentials, keys);
         cache
     }
 
@@ -84,15 +88,15 @@ impl LoginAuthCache {
         self.changes.notify();
     }
 
-    // Resolves after every credential or signing-secret replacement.
+    // Resolves after every credential replacement, and so after every change
+    // of the key that signs login tokens.
     pub fn subscribe(&self) -> watch::Receiver<()> {
         self.changes.subscribe()
     }
 
-    pub fn replace_credentials(&self, credentials: Option<AuthCredentials>, jwt_secret: [u8; 32]) {
+    pub fn replace_credentials(&self, credentials: Option<AuthCredentials>, keys: &SigningKeys) {
         self.replace(
-            credentials
-                .map(|credentials| CachedLoginAuth::from_credentials(credentials, jwt_secret)),
+            credentials.map(|credentials| CachedLoginAuth::from_credentials(credentials, keys)),
         );
     }
 

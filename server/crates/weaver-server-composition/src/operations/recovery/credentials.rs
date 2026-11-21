@@ -4,7 +4,6 @@
 use crate::jobs::JobsArchivePasswordInternalQueries;
 use crate::settings::queries::SettingsQueries;
 use crate::{Database, StateError};
-use weaver_server_auth::auth::repository::AuthRepositoryInternalQueries;
 
 // The start-up credential reads of the queue. Each predicate is the one a
 // partial index of migration 90 is built on, so the reads walk only the jobs
@@ -84,10 +83,7 @@ impl StoredCredentialQueries for Database {
         if encrypted_credentials_exist {
             return Ok(true);
         }
-        if self.has_sealed_secrets()? {
-            return Ok(true);
-        }
-        self.has_encrypted_persisted_jwt_signing_secret()
+        self.has_sealed_secrets()
     }
 
     // Prove that every encrypted persisted credential can be authenticated by
@@ -205,8 +201,7 @@ impl StoredCredentialQueries for Database {
                 })?;
             }
             Ok(())
-        })?;
-        self.validate_persisted_jwt_signing_secret(key)
+        })
     }
 
     // Re-encrypt any plaintext passwords in the database.

@@ -255,7 +255,9 @@ pub(crate) async fn run(
     );
     db.set_setting("last_started_version", env!("CARGO_PKG_VERSION"))?;
     let auto_backup_scheduler = backup.start_background_auto_backup_scheduler();
-    let jwt_secret = db.get_or_create_jwt_signing_secret()?;
+    // Login and CSRF tokens are signed with a key derived from the master
+    // key and the stored password hash; nothing is read for it.
+    let signing_keys = weaver_server_core::auth::SigningKeys::for_database(&db)?;
     let auth_credentials = db.get_auth_credentials()?;
     let login_enabled = auth_credentials.is_some();
     if let Some(message) = security.strict_security_violation(login_enabled) {
@@ -268,7 +270,7 @@ pub(crate) async fn run(
         );
     }
     let login_auth_cache =
-        weaver_server_core::auth::LoginAuthCache::from_credentials(auth_credentials, jwt_secret);
+        weaver_server_core::auth::LoginAuthCache::from_credentials(auth_credentials, &signing_keys);
     let api_key_cache =
         weaver_server_core::auth::ApiKeyCache::from_rows(db.list_api_key_auth_rows()?);
 

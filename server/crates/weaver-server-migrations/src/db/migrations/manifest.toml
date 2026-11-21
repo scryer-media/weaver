@@ -1935,3 +1935,20 @@ kind = "sql"
 file = "migrations/0134_torrent_unpack_end/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 135
+description = "drop the stored signing secret; signing keys are derived"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0135_derived_signing_keys/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0135_derived_signing_keys/postgres.sql"
+engine = "postgres"
+scope = "all"

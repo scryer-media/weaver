@@ -23,7 +23,11 @@ fn login_auth_cache_roundtrip() {
     let cache = LoginAuthCache::default();
     assert!(cache.snapshot().is_none());
 
-    let auth = CachedLoginAuth::new("admin", "$argon2id$hash", [9u8; 32]);
+    let keys =
+        SigningKeys::derive(&weaver_server_db::persistence::encryption::EncryptionKey::generate())
+            .unwrap();
+    let auth = CachedLoginAuth::new("admin", "$argon2id$hash", &keys);
+    assert_eq!(auth.jwt_secret, keys.login_key("$argon2id$hash"));
     cache.replace(Some(auth.clone()));
     assert_eq!(cache.snapshot(), Some(auth));
 

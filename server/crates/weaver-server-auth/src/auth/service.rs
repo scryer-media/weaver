@@ -36,14 +36,6 @@ pub enum JwtError {
     InvalidClaims(String),
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum JwtSecretError {
-    #[error("JWT signing secret must be 64 hex characters")]
-    InvalidLength,
-    #[error("JWT signing secret is not valid hex: {0}")]
-    InvalidHex(#[from] hex::FromHexError),
-}
-
 // Share a small CPU/memory budget across browser password operations.
 // Move the permit into the blocking closure so cancellation cannot free it early.
 pub fn password_work_permit() -> Result<tokio::sync::OwnedSemaphorePermit, &'static str> {
@@ -153,7 +145,8 @@ pub fn find_setup_code(line: &str) -> Option<&str> {
 }
 
 // Stable per-session CSRF value. Only a verifier is persisted; this value is
-// regenerated from the server secret after a browser reload or process restart.
+// regenerated from the login signing key after a browser reload or process
+// restart.
 pub fn derive_browser_csrf_token(session_token: &str, server_secret: &[u8; 32]) -> String {
     hex::encode(sign_hs256(
         server_secret,
@@ -165,24 +158,6 @@ pub fn hash_api_key(raw_key: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(raw_key.as_bytes());
     hasher.finalize().into()
-}
-
-pub fn generate_jwt_secret() -> [u8; 32] {
-    let mut bytes = [0u8; 32];
-    getrandom::fill(&mut bytes).expect("getrandom failed");
-    bytes
-}
-
-pub fn encode_jwt_secret(secret: &[u8; 32]) -> String {
-    hex::encode(secret)
-}
-
-pub fn decode_jwt_secret(value: &str) -> Result<[u8; 32], JwtSecretError> {
-    if value.len() != 64 {
-        return Err(JwtSecretError::InvalidLength);
-    }
-    let bytes = hex::decode(value)?;
-    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| JwtSecretError::InvalidLength)
 }
 
 pub fn create_jwt(username: &str, secret: &[u8], ttl_secs: u64) -> String {
@@ -298,7 +273,7 @@ fn unexpired(exp: u64) -> Result<(), JwtError> {
     Ok(())
 }
 
-fn sign_hs256(secret: &[u8], data: &[u8]) -> Vec<u8> {
+pub(crate) fn sign_hs256(secret: &[u8], data: &[u8]) -> Vec<u8> {
     let mut mac = <HmacSha256 as KeyInit>::new_from_slice(secret)
         .expect("HMAC-SHA256 accepts any key length");
     mac.update(data);
