@@ -50,8 +50,8 @@ type LogFilterPreset = "default" | "download" | "graphEngine" | "everything" | "
 /** Directives per preset. Blank asks the server for its startup filter. */
 const PRESET_DIRECTIVES: Record<Exclude<LogFilterPreset, "custom">, string> = {
   default: "",
-  download: "info,weaver_server_core::pipeline::download=debug,weaver_nntp=debug",
-  graphEngine: "info,weaver_server_core::pipeline::graph=debug,weaver_graph=debug",
+  download: "info,weaver_server_pipeline::pipeline::download=debug,weaver_nntp=debug",
+  graphEngine: "info,weaver_server_pipeline::pipeline::graph=debug,weaver_graph=debug",
   everything: "debug",
 };
 
