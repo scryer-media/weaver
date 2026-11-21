@@ -176,7 +176,10 @@ pub(crate) fn send_run(
     runs::send(socket.as_raw_fd(), bytes, segment, target)
 }
 
+// The casts here hand the host struct sizes, address families and counts
+// bounded by a fixed array, each far inside the C type it goes to.
 #[cfg(any(target_os = "linux", target_os = "android"))]
+#[allow(clippy::cast_possible_truncation)]
 mod runs {
     use std::{io, mem, os::fd::RawFd};
 
@@ -277,7 +280,10 @@ pub(crate) fn send_many(
     many::send(socket.as_raw_fd(), bytes, parts)
 }
 
+// The casts here hand the host struct sizes, address families and counts
+// bounded by a fixed array, each far inside the C type it goes to.
 #[cfg(any(target_os = "linux", target_os = "android"))]
+#[allow(clippy::cast_possible_truncation)]
 mod many {
     use std::{
         io, mem,

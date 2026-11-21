@@ -937,7 +937,7 @@ mod tests {
         let fetch = LayerFetch {
             wanted: Mutex::new(Wants::new((0..RUNS).map(|i| Wanted {
                 request: request(i),
-                pieces: vec![i..i + 1],
+                pieces: std::iter::once(i..i + 1).collect(),
                 kind: Kind::Layer,
                 out: Vec::new(),
                 rejected_by: Vec::new(),

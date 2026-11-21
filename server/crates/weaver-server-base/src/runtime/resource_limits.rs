@@ -52,6 +52,7 @@ pub fn raise_open_file_limit() -> u64 {
 // be read; off Unix, 10,000.
 #[allow(clippy::unnecessary_cast)]
 pub fn open_file_limit() -> usize {
+    #[cfg(unix)]
     const NONE: usize = 10_000_000;
     #[cfg(unix)]
     // SAFETY: `rlimit` is an integer-only C struct, and `getrlimit` only
