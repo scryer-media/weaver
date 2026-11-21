@@ -440,6 +440,12 @@ impl GraphJob {
         self.quieting.is_some()
     }
 
+    // The job goes, stopped or failed: the volumes of its give-up not yet
+    // read back are not, and a later wake finds nothing to read back.
+    pub fn end_give_up(&mut self) {
+        self.quieting = None;
+    }
+
     // Whether the pipeline is to wake the job for the next volume of its
     // give-up: once per volume, and not once the pipeline is stopping,
     // when the give-up waits where it stands and the job keeps the

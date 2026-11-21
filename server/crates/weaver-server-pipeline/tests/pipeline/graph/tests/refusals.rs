@@ -707,6 +707,24 @@ fn a_cancel_between_volumes_of_a_give_up_drops_the_rest() {
     assert_eq!(refusing.internal(), internal);
 }
 
+// A job failed between volumes of a give-up, its graph kept unstopped, ends
+// the give-up as a cancel does: nothing holds the loop for it, and a wake
+// already rung copies nothing.
+#[test]
+fn a_failure_between_volumes_of_a_give_up_ends_it() {
+    let mut refusing = given_up(3, false);
+    assert_eq!(refusing.refused_count(), 1);
+    assert!(refusing.job.held_by_work(), "the give-up holds the loop");
+    refusing.job.end_give_up();
+    assert!(!refusing.job.giving_up());
+    assert!(!refusing.job.held_by_work());
+    assert!(!refusing.job.ring_give_up(), "nothing is left to wake");
+    let internal = refusing.internal();
+    refusing.give_up_turn();
+    assert_eq!(refusing.refused_count(), 1, "nothing more is copied");
+    assert_eq!(refusing.internal(), internal);
+}
+
 // A give-up does not go on over a release that stands: its turns take no
 // step and it is not rung, and mail under another number changes nothing.
 // Once the release's mail is heard the give-up is rung again and goes on,

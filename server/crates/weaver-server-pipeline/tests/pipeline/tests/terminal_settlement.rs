@@ -79,3 +79,31 @@ async fn a_post_whose_every_article_is_missing_is_refused_at_the_delivery_gate()
         Some(&weaver_server_pipeline::jobs::SemanticTerminalCause::MissingArticlesOrLowHealth)
     );
 }
+
+// A job that fails while a store it gave up still has volumes to read back,
+// its graph kept unstopped, drops the rest of the give-up: nothing holds the
+// loop for it, the wake rung before the failure reads nothing back, and the
+// job ends Failed.
+#[tokio::test]
+async fn a_job_failed_between_volumes_of_a_give_up_is_not_held_by_it() {
+    use weaver_server_pipeline::pipeline::tests::engines::give_up_failure::fail_mid_give_up;
+    let failed = fail_mid_give_up().await;
+    assert!(failed.giving_up_at_failure, "the give-up had volumes left");
+    assert!(
+        failed.kept_unstopped,
+        "the failure kept the graph unstopped"
+    );
+    assert!(!failed.giving_up_after, "the failure ended the give-up");
+    assert!(
+        !failed.held_after,
+        "nothing holds the loop for the failed job"
+    );
+    assert!(
+        matches!(
+            failed.status,
+            Some(weaver_server_composition::JobStatus::Failed { .. })
+        ),
+        "{:?}",
+        failed.status
+    );
+}
