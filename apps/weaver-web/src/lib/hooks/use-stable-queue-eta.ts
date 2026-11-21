@@ -131,13 +131,18 @@ export function nextEtaSpeed(
   now: number,
   conditions: EtaConditions = FREE_RUNNING,
 ): number {
-  // A new limit, a pause or an idle queue starts the peak again with the samples.
-  if (conditions.speedLimit !== state.speedLimit) {
+  // A new limit, a pause or an emptied queue starts the peak again. A queue
+  // whose jobs only wait (behind a full disk, say) keeps it: the wire is as
+  // fast when they go on, and the samples start again from nothing.
+  if (
+    conditions.speedLimit !== state.speedLimit
+    || conditions.paused
+    || activeEtaJobs(jobs).length === 0
+  ) {
     state.peakSpeed = 0;
   }
   const eased = easedEtaSpeed(state, jobs, instantaneousSpeed, now, conditions);
   if (state.samples.length === 0) {
-    state.peakSpeed = 0;
     return eased;
   }
   state.peakSpeed = Math.max(state.peakSpeed, state.smoothedSpeed);

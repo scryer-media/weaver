@@ -194,6 +194,23 @@ test("a job leaving the queue during a stall behind a slow disk keeps the speed"
   assert.equal(clock.run(30, 0, behind), 4 * MB);
 });
 
+test("a wait with nothing downloading keeps the disk's rate for the stall after it", () => {
+  const clock = new Clock();
+  clock.run(120, 10 * MB, FREE);
+
+  const behind: EtaConditions = { paused: false, speedLimit: 0, diskRate: 4 * MB };
+  // The jobs left only wait for a while: no speed is shown.
+  assert.equal(clock.tick(0, { ...behind, idle: true }), 0);
+  // They go on at a trickle behind the same disk: the speed is the disk's
+  // rate at once, not the trickle's.
+  assert.equal(clock.tick(0.5 * MB, behind), 4 * MB);
+  assert.equal(clock.run(60, 0.5 * MB, behind), 4 * MB);
+
+  // A pause starts again from nothing: the trickle is all that is known.
+  clock.tick(0, { ...behind, paused: true });
+  assert.ok(clock.run(60, 0.5 * MB, behind) <= 0.6 * MB);
+});
+
 test("a disk faster than the downloads lifts nothing", () => {
   const clock = new Clock();
   const fast: EtaConditions = { paused: false, speedLimit: 0, diskRate: 50 * MB };
