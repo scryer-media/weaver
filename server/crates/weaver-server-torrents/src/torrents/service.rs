@@ -993,10 +993,10 @@ pub struct Inner {
     // or ended, or a torrent's disk became known.
     pub disk_waits: Mutex<BTreeMap<JobId, DiskWait>>,
     pub disk_waits_moved: watch::Sender<u64>,
-    // Torrents that never downloaded are kept from starting for their
-    // root's disk, by the start check every kind of job shares: one latch
-    // per root, in `StorageRoot::ALL`'s order.
-    pub start_held: Mutex<[bool; 3]>,
+    // Torrents whose start their root's disk had no room for wait, by the
+    // start rule's wait every kind of job shares: one per root, in
+    // `StorageRoot::ALL`'s order.
+    pub start_held: Mutex<[weaver_server_disk::operations::start_rule::StartWait; 3]>,
     // Torrents whose disk could not be looked up: each is looked up again
     // at the next reading of a root's disk, which the complete root's
     // ledger is waited on for while any is listed. A torrent leaves at that
@@ -1115,7 +1115,7 @@ impl TorrentService {
                 sweep_held: watch::channel(false).0,
                 #[cfg(any(test, feature = "test-support"))]
                 sweeps_held: watch::channel(0).0,
-                start_held: Mutex::new([false; 3]),
+                start_held: Mutex::default(),
                 relook: Mutex::default(),
                 entering: Mutex::default(),
                 stopping: AtomicBool::new(false),
@@ -1811,5 +1811,7 @@ pub fn report(view: TorrentView, status: JobStatus, now_ms: i64) -> JobReport {
         created_at_ms: view.added_at_ms,
         metadata: view.metadata,
         shortfall: None,
+        disk_need_bytes: view.disk_need_bytes,
+        disk_free_bytes: view.disk_free_bytes,
     }
 }

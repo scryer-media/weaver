@@ -321,6 +321,9 @@ pub struct TorrentRouteGql {
 pub enum TorrentStatedReasonGql {
     /// Kept from starting for room on its disk, as a usenet job waits.
     DiskSpace,
+    /// Kept from starting by a disk that never holds what it has left to
+    /// fetch, as a usenet job is.
+    DiskTooSmall,
     /// A write found no room: it fetches nothing and keeps seeding.
     DiskFull,
     /// Stopped once its seeding goal was met.
@@ -343,6 +346,7 @@ impl From<Stated> for TorrentStatedReasonGql {
     fn from(stated: Stated) -> Self {
         match stated {
             Stated::DiskSpace => Self::DiskSpace,
+            Stated::DiskTooSmall => Self::DiskTooSmall,
             Stated::DiskFull => Self::DiskFull,
             Stated::GoalMet => Self::GoalMet,
             Stated::Held(HoldOrigin::Manual) => Self::HeldManual,
@@ -1087,6 +1091,7 @@ mod tests {
             names,
             [
                 "DISK_SPACE",
+                "DISK_TOO_SMALL",
                 "DISK_FULL",
                 "GOAL_MET",
                 "HELD_MANUAL",

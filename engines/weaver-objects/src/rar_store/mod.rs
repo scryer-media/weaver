@@ -270,6 +270,18 @@ mod counts {
     thread_local! {
         static COUNTS: RefCell<Counts> = RefCell::default();
         static OLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static WHOLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    // Whether a layout is handed a volume's whole facts every time, as it
+    // was before it took what changed: a test hands the same volumes both
+    // ways and compares the layouts.
+    pub(crate) fn whole() -> bool {
+        WHOLE.with(std::cell::Cell::get)
+    }
+
+    pub(crate) fn set_whole(whole: bool) {
+        WHOLE.with(|cell| cell.set(whole));
     }
 
     // Whether the store looks again the way it did before it kept track of

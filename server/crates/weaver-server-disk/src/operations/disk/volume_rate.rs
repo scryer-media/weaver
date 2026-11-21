@@ -1263,9 +1263,12 @@ mod tests {
         assert_ne!(Some(held), real);
         assert_ne!(Some(other), real);
         assert_ne!(held, other);
-        // The root's own look is over before its reading is replaced, and
-        // the next is an hour off.
-        storage.wait_for_probes(super::super::StorageRoot::ALL[0], 1);
+        // Each root's own look is over before its reading is replaced, and
+        // the next is an hour off: one still under way would write over
+        // what is put in its slot here.
+        for root in super::super::StorageRoot::ALL {
+            storage.wait_for_probes(root, 1);
+        }
         {
             let mut state = storage.slots[0].lock();
             state.device = Some(Some(held));

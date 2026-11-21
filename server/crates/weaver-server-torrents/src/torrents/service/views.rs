@@ -52,6 +52,10 @@ pub struct TorrentView {
     pub detail: Option<String>,
     /// The reason the service states itself, when `detail` is its words.
     pub stated: Option<status::Stated>,
+    /// While its start waits for room: what it needs on its disk, and what
+    /// the disk leaves, or the most it ever holds, as a usenet job shows.
+    pub disk_need_bytes: Option<u64>,
+    pub disk_free_bytes: Option<u64>,
     /// Why its route holds it, while the state comes from that hold.
     pub route_reason: Option<TorrentRouteReason>,
     /// Who holds it stopped, while a hold does.
@@ -670,6 +674,12 @@ impl TorrentService {
             state,
             detail,
             stated,
+            disk_need_bytes: torrent
+                .start_refused
+                .and_then(|refused| refused.figures().0),
+            disk_free_bytes: torrent
+                .start_refused
+                .and_then(|refused| refused.figures().1),
             route_reason,
             paused_by: torrent.paused_by,
             category: settings

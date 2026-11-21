@@ -2086,6 +2086,7 @@ export const nextDe: LocaleDictionary = {
   "next.torrents.routeReason.SESSION_LIMIT": "Sitzungslimit erreicht",
   "next.torrents.routeReason.OPENING": "Wird geöffnet",
   "next.torrents.stated.DISK_SPACE": "Wenig Speicherplatz",
+  "next.torrents.stated.DISK_TOO_SMALL": "Datenträger zu klein",
   "next.torrents.stated.DISK_FULL": "Datenträger voll: nur Seeden",
   "next.torrents.stated.GOAL_MET": "Seeding-Ziel erreicht",
   "next.torrents.stated.HELD_MANUAL": "Durch eine Pause angehalten",

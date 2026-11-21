@@ -235,9 +235,10 @@ pub fn runs(turn: Turn, resumed: bool) -> bool {
 
 // Whether a torrent that would `run` has its disk looked at: one not
 // running yet whose turn lets it run is kept from starting while the disk is
-// short, and one held for that is let go once it has room.
+// short, and one held for that, paused or with its download held, is let go
+// once it has room.
 pub fn checks_start(run: bool, starting: bool, disk_held: Option<DiskHeld>) -> bool {
-    run && (starting || disk_held == Some(DiskHeld::Starting))
+    run && (starting || matches!(disk_held, Some(DiskHeld::Starting | DiskHeld::Fetching)))
 }
 
 /// What a session is told of a torrent's run.
@@ -459,6 +460,9 @@ pub(super) struct Gathered {
     // The looks for disks the walks began, which ask one pass between
     // them as the last ends.
     looks: Option<std::sync::Arc<PlaceBatch>>,
+    // By root, whether a torrent the walk gave its turn is still kept by
+    // that root's start wait.
+    start_kept: [bool; 3],
     // The walks made, and the writes queued or made, counted in tests.
     walks: u64,
     writes: u64,
@@ -552,6 +556,7 @@ impl TorrentService {
                 };
                 self.walk(&mut live, None, ON_TURNS, &cx, &mut gathered)
                     .await;
+                self.end_unkept_start_holds(std::mem::take(&mut gathered.start_kept));
             }
         }
         // Their checkpoints were queued with the walk's.
@@ -604,6 +609,7 @@ impl TorrentService {
             ..cx
         };
         self.walk(&mut live, None, then, &cx, &mut gathered).await;
+        self.end_unkept_start_holds(std::mem::take(&mut gathered.start_kept));
         debug_assert!(gathered.taken.is_empty() && gathered.seed.is_empty());
         gathered.walks
     }
@@ -788,21 +794,45 @@ impl TorrentService {
                     .attached
                     .as_ref()
                     .is_none_or(|attached| attached.handle.is_paused());
+                // A magnet whose metadata came while it ran is judged now.
+                let starting = starting || (run && self.start_unjudged(torrent));
                 if checks_start(run, starting, torrent.disk_held) {
                     let looks = gathered.looks.get_or_insert_with(|| PlaceBatch::new(self));
-                    match self.start_hold_in(torrent, Some(looks)) {
-                        StartHold::Short => {
+                    match self.start_hold_in(torrent, Some(looks), false) {
+                        // One running that holds verified data has its
+                        // download held and seeds; one yet to run, or with
+                        // nothing to seed, stays paused.
+                        StartHold::Short(refused)
+                            if torrent.disk_held == Some(DiskHeld::Fetching)
+                                || self.seeding_run(torrent) =>
+                        {
+                            self.hold_download(torrent, refused);
+                        }
+                        StartHold::Short(refused) => {
                             torrent.disk_held = Some(DiskHeld::Starting);
+                            torrent.start_refused = Some(refused);
                             run = false;
                         }
-                        StartHold::Unplaced => run = false,
+                        StartHold::Unplaced => {
+                            run &= torrent.disk_held == Some(DiskHeld::Fetching);
+                        }
                         StartHold::Free if torrent.disk_held == Some(DiskHeld::Starting) => {
                             torrent.disk_held = None;
+                            torrent.start_refused = None;
                         }
-                        StartHold::Free => {}
+                        StartHold::Free => self.end_fetch_hold(torrent),
                     }
-                } else if !run && torrent.disk_held == Some(DiskHeld::Starting) {
+                } else if !run
+                    && matches!(
+                        torrent.disk_held,
+                        Some(DiskHeld::Starting | DiskHeld::Fetching)
+                    )
+                {
                     torrent.disk_held = None;
+                    torrent.start_refused = None;
+                }
+                if let Some(at) = Self::start_kept_on(torrent) {
+                    gathered.start_kept[at] = true;
                 }
                 if run && torrent.start_waits_on_move() {
                     return None;
@@ -843,6 +873,13 @@ impl TorrentService {
         };
         match command {
             Command::Run(command) => {
+                // A pause gives back what its start promised and did not
+                // land: its next start is judged again.
+                if matches!(command, RunCommand::Pause)
+                    && let Some(intake) = &torrent.intake
+                {
+                    intake.room().release_start();
+                }
                 let result = match command {
                     RunCommand::Unpause => attached.session.unpause(&attached.handle).await,
                     RunCommand::Pause => attached.session.pause(&attached.handle).await,

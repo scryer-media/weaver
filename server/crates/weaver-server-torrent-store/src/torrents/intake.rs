@@ -24,6 +24,7 @@ use weaver_server_disk::operations::disk::{
     CapacityReader, DiskLedger, StorageRoot, is_out_of_space, is_quota_exceeded,
 };
 use weaver_server_disk::operations::room_wait::{Disk, Wants};
+use weaver_server_disk::operations::spend::Spend;
 use weaver_server_disk::pipeline::extraction::safety::ExtractionLimits;
 use weaver_torrent::storage::HeldRoom;
 
@@ -78,6 +79,11 @@ pub struct Room {
 struct Spot {
     aim: Option<PathBuf>,
     place: Option<Place>,
+    // What the torrent's start was promised on the place's disk, drawn as
+    // its pieces land, by the account every job class keeps its room by.
+    start: Spend,
+    // Its start was judged and promised in this run.
+    started: bool,
 }
 
 impl Room {
@@ -108,7 +114,12 @@ impl Room {
     fn with(limits: Arc<ExtractionLimits>, aim: Option<PathBuf>, place: Option<Place>) -> Self {
         Self {
             limits,
-            spot: Mutex::new(Spot { aim, place }),
+            spot: Mutex::new(Spot {
+                aim,
+                place,
+                start: Spend::default(),
+                started: false,
+            }),
             in_hand: AtomicU64::new(0),
             promised: AtomicBool::new(false),
             placing: AtomicBool::new(false),
@@ -165,6 +176,7 @@ impl Room {
         if spot.place.as_ref().is_some_and(|place| place.dir != dir) {
             let left = spot.place.take();
             self.give_in_hand(left.as_ref());
+            Self::give_start(&mut spot);
         }
         spot.aim = Some(dir.to_path_buf());
         spot.place.is_none()
@@ -179,9 +191,56 @@ impl Room {
         if spot.aim.as_ref().is_some_and(|aim| *aim != place.dir) {
             return false;
         }
+        let moved = spot
+            .place
+            .as_ref()
+            .is_some_and(|left| !same_disk(left, &place));
         let left = spot.place.replace(place);
         self.give_in_hand(left.as_ref());
+        if moved {
+            Self::give_start(&mut spot);
+        }
         true
+    }
+
+    // What the start promised on the disk the pieces no longer land on goes
+    // back there, and the start is judged again on the new disk, as the
+    // look that finds it asks: the promise follows the torrent. Until then
+    // its pieces book as they are written.
+    fn give_start(spot: &mut Spot) {
+        std::mem::take(&mut spot.start).release_all();
+        spot.started = false;
+    }
+
+    // Whether the torrent's start was promised its room in this run.
+    pub fn started(&self) -> bool {
+        self.locked().started
+    }
+
+    // The torrent starts with `bytes` still to fetch promised on its
+    // place's ledger, by the start rule: its pieces draw on that promise
+    // as they land.
+    pub fn take_start(&self, bytes: u64) {
+        let mut spot = self.locked();
+        let spot = &mut *spot;
+        if let Some(reader) = spot.place.as_ref().and_then(Place::reader) {
+            spot.start.take_posted(bytes, reader);
+        }
+        spot.started = true;
+    }
+
+    // What the start promised and did not land goes back, and the next
+    // start is judged again: the torrent paused, stopped, ended or its
+    // wanted files changed.
+    pub fn release_start(&self) {
+        let mut spot = self.locked();
+        Self::give_start(&mut spot);
+        spot.started = false;
+    }
+
+    // What the start promised and has not landed.
+    pub fn start_left(&self) -> u64 {
+        self.locked().start.posted()
     }
 
     // What a wake handed this torrent on `place` goes back.
@@ -223,7 +282,8 @@ impl Room {
     // disk not known yet refuses every piece. The booking goes back unless
     // it is landed.
     fn admits(&self, bytes: u64) -> Option<Booked> {
-        let spot = self.locked();
+        let mut spot = self.locked();
+        let spot = &mut *spot;
         let place = spot.place.as_ref()?;
         let Some(reader) = place.reader() else {
             return Some(Booked::none());
@@ -235,11 +295,9 @@ impl Room {
                 have.checked_sub(bytes)
             })
             .is_ok();
-        if !spent
-            && ledger
-                .book(reader, self.limits.min_free_bytes, bytes, 0)
-                .is_none()
-        {
+        // Drawn from what the start promised, then booked on the ledger a
+        // slab at a time, as every job class's writes are.
+        if !spent && !spot.start.draw(bytes, reader, self.limits.min_free_bytes) {
             return None;
         }
         Some(Booked {
@@ -253,6 +311,17 @@ impl Room {
 impl Drop for Room {
     fn drop(&mut self) {
         self.give_back();
+        self.release_start();
+    }
+}
+
+// Whether two places lie on one disk: on one ledger, or both off the
+// roots'.
+fn same_disk(left: &Place, place: &Place) -> bool {
+    match (left.reader(), place.reader()) {
+        (Some(left), Some(place)) => left.ledger().same_disk(place.ledger()),
+        (None, None) => true,
+        _ => false,
     }
 }
 
@@ -764,8 +833,10 @@ mod tests {
     }
 
     // Two writers on one volume book on the one ledger: what the first
-    // promised the second cannot spend, a write that failed gives its
-    // promise back, and one that landed counts against the reading.
+    // promised, its slab of what was left included, the second cannot
+    // spend; the first's next piece draws on its slab; a write that failed
+    // gives its promise back, and one that landed counts against the
+    // reading.
     #[test]
     fn writers_on_one_volume_share_the_ledger() {
         use weaver_server_disk::operations::disk::{Capacity, CapacityReading};
@@ -779,14 +850,19 @@ mod tests {
         let reader = CapacityReader::from_fn(move || Capacity::Known(reading));
         let first = room(reader.clone());
         let second = room(reader.clone());
-        // Ten bytes over the reserve: six promised to one leave four.
+        // Ten bytes over the reserve: six promised to one, and the four
+        // left are its slab.
         let six = first.admits(6).unwrap();
-        assert!(second.admits(5).is_none());
-        let four = second.admits(4).unwrap();
+        assert_eq!(reader.ledger().promised(), 10);
+        assert!(second.admits(4).is_none());
+        let four = first.admits(4).unwrap();
         assert_eq!(reader.ledger().promised(), 10);
         // A write that failed gives its room back for the other.
         drop(four);
         assert_eq!(reader.ledger().promised(), 6);
+        let theirs = second.admits(4).unwrap();
+        assert_eq!(reader.ledger().promised(), 10);
+        drop(theirs);
         // One that landed is no longer promised but still spent against
         // the reading it followed.
         six.landed();
@@ -795,7 +871,9 @@ mod tests {
         assert!(second.admits(4).is_some());
     }
 
-    // A piece the store could not write gives back what it was promised.
+    // A piece the store could not write gives back what it was promised;
+    // the slab booked with it stays the torrent's for its next piece, which
+    // draws on it, and goes back with the torrent's room.
     #[test]
     fn a_refused_write_gives_its_promise_back() {
         use weaver_server_disk::operations::disk::{Capacity, CapacityReading};
@@ -816,11 +894,17 @@ mod tests {
         );
         disk.full.store(true, Ordering::SeqCst);
         assert!(intake.verified(0, &piece(b"aaaa")).is_err());
-        assert_eq!(reader.ledger().promised(), 0);
+        assert_eq!(reader.ledger().promised(), SLAB_LEFT);
         disk.full.store(false, Ordering::SeqCst);
         intake.verified(0, &piece(b"aaaa")).unwrap();
+        assert_eq!(reader.ledger().promised(), SLAB_LEFT - 4);
+        drop(intake);
         assert_eq!(reader.ledger().promised(), 0);
     }
+
+    // The slab a four-byte piece books with it on a disk 900 bytes over the
+    // reserve: the rest.
+    const SLAB_LEFT: u64 = 900 - 4;
 
     fn known(available_bytes: u64) -> CapacityReader {
         use weaver_server_disk::operations::disk::{Capacity, CapacityReading};
@@ -852,6 +936,8 @@ mod tests {
         assert!(
             matches!(&said.lock().unwrap()[..], [Heard::Refused(why)] if why.contains("writing a share"))
         );
+        assert_eq!(reader.ledger().promised(), SLAB_LEFT);
+        drop(intake);
         assert_eq!(reader.ledger().promised(), 0);
     }
 
@@ -872,6 +958,8 @@ mod tests {
             intake.verified(0, &piece(b"aaaa"))
         }));
         assert!(unwound.is_err());
+        assert_eq!(reader.ledger().promised(), SLAB_LEFT);
+        drop(intake);
         assert_eq!(reader.ledger().promised(), 0);
     }
 

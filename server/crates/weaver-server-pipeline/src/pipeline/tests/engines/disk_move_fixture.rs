@@ -10,7 +10,8 @@ use super::harness::{JOB, Scenario, admit_with};
 use crate::operations::{DiskSpace, StorageCapacity, StorageRoot};
 use crate::pipeline::Pipeline;
 use crate::pipeline::completion::finalize::{
-    CLAIM_FULL, DESTINATION_ROOM, MOVING_ROW_REFUSED, MOVING_ROWS_WRITTEN, PARTIAL_STAYS,
+    CLAIM_FULL, COPY_ACROSS, DESTINATION_ROOM, FIXTURE_BOOKED_HOOKS, MOVING_ROW_REFUSED,
+    MOVING_ROWS_WRITTEN, PARTIAL_STAYS,
 };
 use crate::pipeline::full_disk::Stage;
 use crate::post_processing::model::{PipelineOutcome, PostProcessingFacts};
@@ -168,6 +169,120 @@ pub async fn admit_library_move(
     let (_, pipeline, _) = &mut admitted;
     pipeline.jobs.get_mut(&JOB).unwrap().spec.category = Some("library".to_string());
     admitted
+}
+
+// The complete folder on a disk of its own, which reads `complete_room`
+// over the reserve; the other folders on another, which reads `room` over
+// it. A rename between the two cannot be made and is copied.
+pub async fn admit_split_move(
+    scenario: &Scenario,
+    room: Arc<AtomicU64>,
+    complete_room: Arc<AtomicU64>,
+) -> (tempfile::TempDir, Pipeline, PathBuf) {
+    COPY_ACROSS.store(true, Ordering::Release);
+    admit_with(scenario, move |pipeline, _| {
+        use weaver_server_disk::runtime::fs::test_devices::assign;
+        assign(&pipeline.script_data_dir, 1);
+        assign(&pipeline.intermediate_dir, 1);
+        assign(&pipeline.complete_dir, 2);
+        let roots = [
+            pipeline.script_data_dir.clone(),
+            pipeline.intermediate_dir.clone(),
+            pipeline.complete_dir.clone(),
+        ];
+        let complete_dir = pipeline.complete_dir.clone();
+        let probe = Arc::new(move |path: &Path| {
+            let room = if path.starts_with(&complete_dir) {
+                &complete_room
+            } else {
+                &room
+            };
+            Ok(DiskSpace {
+                total_bytes: RESERVE * 8,
+                available_bytes: RESERVE + room.load(Ordering::Acquire),
+            })
+        });
+        let capacity = StorageCapacity::with_probe(roots, NEVER, probe);
+        for root in StorageRoot::ALL {
+            capacity.wait_for_probes(root, 1);
+        }
+        pipeline.storage_capacity = Arc::new(capacity);
+    })
+    .await
+}
+
+// A rename between a test's devices that differ is copied.
+pub fn copy_across(across: bool) {
+    COPY_ACROSS.store(across, Ordering::Release);
+}
+
+// Once the job's move has booked its copy on the complete folder's disk,
+// and before it moves an entry, `then` is told what that disk's ledger
+// holds promised, on a thread of its own the move waits for.
+pub fn when_booked(pipeline: &Pipeline, then: impl FnOnce(u64) + Send + 'static) {
+    let capacity = Arc::clone(&pipeline.storage_capacity);
+    FIXTURE_BOOKED_HOOKS.lock().unwrap().insert(
+        pipeline.complete_dir.clone(),
+        Box::new(move |_| then(capacity.ledger(StorageRoot::Complete).promised_total())),
+    );
+}
+
+// Once the job's moving row is written, and before its move books or moves
+// anything, the complete folder's disk is read afresh showing `value` over
+// the reserve. The loop has not heard that reading.
+pub fn complete_reads_before_move(pipeline: &Pipeline, complete_room: &Arc<AtomicU64>, value: u64) {
+    let capacity = Arc::clone(&pipeline.storage_capacity);
+    let complete_room = Arc::clone(complete_room);
+    crate::pipeline::completion::finalize::FIXTURE_MOVE_HOOKS
+        .lock()
+        .unwrap()
+        .insert(
+            pipeline.complete_dir.clone(),
+            Box::new(move |_| {
+                complete_room.store(value, Ordering::Release);
+                let begun = capacity.probes_begun(StorageRoot::Complete);
+                capacity.request_refresh(StorageRoot::Complete);
+                capacity.wait_for_reading_begun_after(StorageRoot::Complete, begun);
+            }),
+        );
+}
+
+// What the waits' register holds promised on the complete folder's disk.
+pub fn register_on_complete(pipeline: &Pipeline) -> u64 {
+    use weaver_server_disk::operations::room_wait::Disk;
+    let capacity = &pipeline.storage_capacity;
+    let disk = Disk::Root(StorageRoot::Complete);
+    capacity.promises().on(&disk, disk.device(capacity))
+}
+
+// What the complete folder's disk has free to spend by its ledger: its
+// last reading less what landed since and what is promised there.
+pub fn complete_room_now(pipeline: &Pipeline) -> Option<u64> {
+    let capacity = &pipeline.storage_capacity;
+    capacity.ledger(StorageRoot::Complete).start_room_now(
+        &capacity.reader(StorageRoot::Complete),
+        0,
+        0,
+        (true, false),
+    )
+}
+
+// `bytes` more are promised on the complete folder's ledger, as a job
+// started with that folder on a disk of its own promises them.
+pub fn promise_on_complete(pipeline: &Pipeline, bytes: u64) {
+    pipeline
+        .storage_capacity
+        .ledger(StorageRoot::Complete)
+        .promise(bytes);
+}
+
+// What the complete folder's own ledger holds promised; on a disk of its
+// own, everything promised there.
+pub fn complete_promised(pipeline: &Pipeline) -> u64 {
+    pipeline
+        .storage_capacity
+        .ledger(StorageRoot::Complete)
+        .promised()
 }
 
 pub async fn admit_database_move(

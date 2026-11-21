@@ -37,6 +37,10 @@ pub struct JobReport {
     pub metadata: Vec<(String, String)>,
     // Why a partial job is short of whole.
     pub shortfall: Option<String>,
+    // While its start waits for room: what it needs on its disk, and what
+    // the disk leaves, or the most it ever holds.
+    pub disk_need_bytes: Option<u64>,
+    pub disk_free_bytes: Option<u64>,
 }
 
 impl JobReport {
@@ -87,8 +91,8 @@ impl JobReport {
             wanted_bytes: self.wanted_bytes,
             download_wait_reason: self.wait_reason,
             download_retry_at_epoch_ms: None,
-            disk_need_bytes: None,
-            disk_free_bytes: None,
+            disk_need_bytes: self.disk_need_bytes,
+            disk_free_bytes: self.disk_free_bytes,
             created_at_epoch_ms: self.created_at_ms as f64,
         }
     }

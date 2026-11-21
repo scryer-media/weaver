@@ -24,6 +24,7 @@ use crate::pipeline::graph::job::RootFile;
 use crate::pipeline::graph::leaf::Leaf;
 use crate::post_processing::model::{PostProcessingSettings, unwanted_extension_reason};
 use weaver_server_disk::operations::disk::{CapacityReader, DiskLedger};
+use weaver_server_disk::operations::spend::Spend;
 
 // The hold settings, resolved once at pipeline construction. Each value is
 // read from the environment, then from the `[direct_store]` settings table,
@@ -379,290 +380,6 @@ pub struct DiskWait {
     pub reserve: u64,
 }
 
-// How much is promised from a device beyond what a write needs when the
-// ledger is asked, so that most writes touch nothing shared, and how much
-// that was promised may land before the ledger hears of it.
-const SLAB_BYTES: u64 = 64 * 1024 * 1024;
-
-// What the job owes one device: the bytes its members took and have not
-// written yet, and how much of that the device's ledger holds promised for
-// it. While the job waits for room on the device, nothing it owes there is
-// promised, so a job that waits holds no room another could use.
-#[derive(Debug, Default)]
-pub struct Spend {
-    ledger: Option<Arc<DiskLedger>>,
-    // Taken for members, not landed yet.
-    pub owed: u64,
-    // Of `owed`, what is not promised: all of it while the job waits.
-    unbooked: u64,
-    // What a repair the job holds back until there is room would write:
-    // promised in hand when the job wakes, for the repair to spend.
-    wanted: u64,
-    // What members removed while the job waits held: the runs that built
-    // them write them again once it wakes, so it is promised then, to spend
-    // as they write.
-    again: u64,
-    // Promised beyond what is owed, spent before the ledger is asked again.
-    slab: u64,
-    // Of `slab`, what was promised for a held repair when the job woke and
-    // no repair has taken yet.
-    in_hand: u64,
-    // What landed since the ledger last heard: of what was promised, and of
-    // what was not.
-    landed: u64,
-    landed_unbooked: u64,
-    // The job's place among those waiting for room on the device.
-    waiting: Option<u64>,
-    // What its start promised here for the posts it still had to fetch, and
-    // has not landed yet: drawn as posts land, and on a disk of its own by
-    // what the job delivers there. A wait for room leaves it promised.
-    posted: u64,
-}
-
-impl Spend {
-    // The ledger of the device `reader` reads, kept from the first use.
-    fn bind(&mut self, reader: &CapacityReader) -> Arc<DiskLedger> {
-        Arc::clone(
-            self.ledger
-                .get_or_insert_with(|| Arc::clone(reader.ledger())),
-        )
-    }
-
-    // The ledger hears what landed.
-    fn settle(&mut self) {
-        if let Some(ledger) = &self.ledger {
-            ledger.landed(self.landed, self.landed_unbooked);
-        }
-        self.landed = 0;
-        self.landed_unbooked = 0;
-    }
-
-    // `bytes` of what is owed landed: what was not promised first. The
-    // ledger hears of it once a slab's worth has landed, or sooner when it
-    // is next asked.
-    fn land(&mut self, bytes: u64) {
-        let unbooked = bytes.min(self.unbooked);
-        self.unbooked -= unbooked;
-        self.owed = self.owed.saturating_sub(bytes);
-        self.landed += bytes - unbooked;
-        self.landed_unbooked += unbooked;
-        if self.landed >= SLAB_BYTES {
-            self.settle();
-        }
-    }
-
-    // `bytes` that were owed will not land.
-    fn forgo(&mut self, bytes: u64) {
-        let unbooked = bytes.min(self.unbooked);
-        self.unbooked -= unbooked;
-        self.owed = self.owed.saturating_sub(bytes);
-        if let Some(ledger) = &self.ledger {
-            ledger.release(bytes - unbooked);
-        }
-    }
-
-    // `bytes` more are owed to the device `reader` reads: promised from
-    // what is in hand, or from the ledger while the device has room for
-    // them above `reserve`, with up to a slab more. When it has not, the
-    // job begins to wait for room and gives back all it promised here;
-    // what it owes is promised again when it wakes. A device with no
-    // reading, or only the last good one held across a failed probe, or a
-    // job with no reserve, is not checked: only a good reading begins a
-    // wait.
-    fn book(&mut self, bytes: u64, reader: &CapacityReader, reserve: u64) {
-        if bytes == 0 {
-            return;
-        }
-        self.owed += bytes;
-        if self.waiting.is_some() {
-            self.unbooked += bytes;
-            return;
-        }
-        // What is in hand is spent first, as a repair's promise is, then
-        // what the start promised here for the job's bytes.
-        let bytes = {
-            let drawn = bytes.saturating_sub(self.slab).min(self.posted);
-            self.posted -= drawn;
-            bytes - drawn
-        };
-        if bytes <= self.slab {
-            self.slab -= bytes;
-            self.in_hand = self.in_hand.min(self.slab);
-            return;
-        }
-        self.in_hand = 0;
-        let ledger = self.bind(reader);
-        self.settle();
-        let need = bytes - self.slab;
-        if let Some(extra) = ledger.book(reader, reserve, need, SLAB_BYTES) {
-            self.slab = extra;
-            return;
-        }
-        self.hold(&ledger, self.owed - bytes);
-    }
-
-    // The job begins to wait: all it promised here is given back, and all
-    // it owes is unbooked until it wakes. `promised` is what of `owed` was
-    // promised.
-    fn hold(&mut self, ledger: &DiskLedger, promised: u64) {
-        ledger.release(self.slab + promised.saturating_sub(self.unbooked));
-        self.slab = 0;
-        self.in_hand = 0;
-        self.unbooked = self.owed;
-        self.waiting = Some(ledger.wait());
-    }
-
-    // A repair would write `bytes` on the device `reader` reads before it
-    // can start. Whether it may: the bytes are then promised in hand for
-    // it. When the device has no room for them above `reserve`, the job
-    // begins to wait, as it does for a write, and the repair waits with it;
-    // what it would write is promised in hand when the job wakes. Each
-    // repair that goes out is promised its own bytes: from what was put in
-    // hand for a held one, else from the ledger, so two cannot go out on
-    // one promise.
-    pub fn want(&mut self, bytes: u64, reader: &CapacityReader, reserve: u64) -> bool {
-        if self.waiting.is_some() {
-            self.wanted = self.wanted.max(bytes);
-            return false;
-        }
-        if bytes == 0 {
-            return true;
-        }
-        if bytes <= self.in_hand {
-            self.in_hand -= bytes;
-            return true;
-        }
-        let ledger = self.bind(reader);
-        self.settle();
-        let need = bytes - self.in_hand;
-        if ledger.book(reader, reserve, need, 0).is_some() {
-            self.slab = self.slab.saturating_add(need);
-            self.in_hand = 0;
-            return true;
-        }
-        self.hold(&ledger, self.owed);
-        self.wanted = bytes;
-        false
-    }
-
-    // What `want` may take from what this holds: given back with
-    // `give_back` should the repair not go out after all.
-    fn taking(&self) -> (u64, u64) {
-        (self.slab, self.in_hand)
-    }
-
-    // A `want` since `taken` is undone: what it promised is given back.
-    fn give_back(&mut self, (slab, in_hand): (u64, u64)) {
-        let promised = self.slab.saturating_sub(slab);
-        if promised > 0
-            && let Some(ledger) = &self.ledger
-        {
-            ledger.release(promised);
-        }
-        self.slab = slab;
-        self.in_hand = in_hand;
-    }
-
-    // A repair that would write `bytes` here waits with the job: if the job
-    // waits here already, for those bytes too; else it begins to, for them.
-    fn wait_for(&mut self, bytes: u64, reader: &CapacityReader) {
-        if self.waiting.is_some() {
-            self.wanted = self.wanted.max(bytes);
-            return;
-        }
-        if bytes == 0 {
-            return;
-        }
-        let ledger = self.bind(reader);
-        self.settle();
-        self.hold(&ledger, self.owed);
-        self.wanted = bytes;
-    }
-
-    // What the device must have room for before the job wakes.
-    fn needed(&self) -> u64 {
-        self.unbooked
-            .saturating_add(self.wanted)
-            .saturating_add(self.again)
-    }
-
-    // The job has room again: all it owes is promised, what a held repair
-    // would write is promised in hand for it, and it no longer waits.
-    pub fn rebook(&mut self) {
-        let Some(ledger) = &self.ledger else {
-            return;
-        };
-        if self.waiting.is_some() {
-            ledger.promise(self.needed());
-            self.rebooked();
-        }
-    }
-
-    // The job has room again, and all it owes was promised by the wake that
-    // judged it: what it holds says so, and it no longer waits.
-    fn rebooked(&mut self) {
-        let Some(ledger) = &self.ledger else {
-            return;
-        };
-        if self.waiting.take().is_some() {
-            self.slab = self
-                .slab
-                .saturating_add(self.wanted)
-                .saturating_add(self.again);
-            self.in_hand = self.wanted;
-            self.unbooked = 0;
-            self.wanted = 0;
-            self.again = 0;
-            ledger.unwait();
-        }
-    }
-
-    // `bytes` of the posts landed here: drawn from what the start promised,
-    // which moves to landed on the ledger once a slab of it has, and what
-    // lands past that promise is booked as it lands, as a repair's write
-    // is. Constant work per write; the booking lock is taken once per slab
-    // of the overflow at most.
-    fn land_posted(&mut self, bytes: u64, reader: &CapacityReader, reserve: u64) {
-        let drawn = bytes.min(self.posted);
-        self.posted -= drawn;
-        self.landed += drawn;
-        if self.landed >= SLAB_BYTES {
-            self.settle();
-        }
-        let over = bytes - drawn;
-        if over > 0 {
-            self.book(over, reader, reserve);
-            self.land(over);
-        }
-    }
-
-    // What the start promised for the posts and did not land is given back.
-    fn release_posted(&mut self) {
-        let posted = std::mem::take(&mut self.posted);
-        self.settle();
-        if let Some(ledger) = &self.ledger {
-            ledger.release(posted);
-        }
-    }
-
-    // All that was promised is given back, and the job no longer waits.
-    fn release_all(&mut self) {
-        self.release_posted();
-        if let Some(ledger) = &self.ledger {
-            ledger.release(self.slab + (self.owed - self.unbooked));
-            if self.waiting.take().is_some() {
-                ledger.unwait();
-            }
-        }
-        self.owed = 0;
-        self.unbooked = 0;
-        self.wanted = 0;
-        self.again = 0;
-        self.slab = 0;
-        self.in_hand = 0;
-    }
-}
-
 impl Caps {
     // The policy is read once here; a read that fails is tried again.
     pub fn new(limits: Arc<ExtractionLimits>, read_policy: PolicyRead, declared: Vec<u64>) -> Self {
@@ -950,7 +667,7 @@ impl Caps {
     // takes its whole length at its first write and fills as its bytes
     // land; what waits for an object lands as it is admitted. A write the
     // device has no room for above the reserve lands all the same, and the
-    // job waits for room: see `Spend::book`.
+    // job waits for room: see `weaver_server_disk::operations::spend::Spend::book`.
     pub fn admit_write(
         &mut self,
         tree: &Tree,
@@ -1071,9 +788,7 @@ impl Caps {
     // the ledger `reader` reads, for `device`: its posts' landings there
     // draw on that promise. The ledger is not touched; the promise exists.
     pub fn take_posted(&mut self, device: Device, bytes: u64, reader: &CapacityReader) {
-        let spend = &mut self.spend[device as usize];
-        spend.bind(reader);
-        spend.posted = spend.posted.saturating_add(bytes);
+        self.spend[device as usize].take_posted(bytes, reader);
     }
 
     // What the start promised for the posts and did not land is given
@@ -1087,7 +802,7 @@ impl Caps {
     // What the start promised and has not landed, on each device.
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub fn posted(&self) -> [u64; 2] {
-        [self.spend[0].posted, self.spend[1].posted]
+        [self.spend[0].posted(), self.spend[1].posted()]
     }
 
     // `landing` bytes of a post landed on `device`, which `reader` reads. A
@@ -1101,8 +816,7 @@ impl Caps {
         let device = match device {
             Device::Output
                 if self.spend[Device::Working as usize]
-                    .ledger
-                    .as_ref()
+                    .ledger()
                     .is_some_and(|working| working.same_disk(reader.ledger())) =>
             {
                 Device::Working
@@ -1162,13 +876,13 @@ impl Caps {
     // repair that would still write wants its bytes anew.
     pub(crate) fn rewant(&mut self) {
         for spend in &mut self.spend {
-            spend.wanted = 0;
+            spend.rewant();
         }
     }
 
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub fn wanted(&self) -> u64 {
-        self.spend.iter().map(|spend| spend.wanted).sum()
+        self.spend.iter().map(|spend| spend.wanted()).sum()
     }
 
     // The free space every disk the job writes keeps.
@@ -1179,19 +893,19 @@ impl Caps {
     // Whether the job waits for room on a device: its runs decode nothing
     // until it has room again.
     pub fn disk_held(&self) -> bool {
-        self.spend.iter().any(|spend| spend.waiting.is_some())
+        self.spend.iter().any(|spend| spend.waiting().is_some())
     }
 
     // The job's place among those waiting for room: the first device it
     // began to wait on.
     pub(crate) fn disk_ticket(&self) -> Option<u64> {
-        self.spend.iter().filter_map(|spend| spend.waiting).min()
+        self.spend.iter().filter_map(|spend| spend.waiting()).min()
     }
 
     // The job's place on each device it waits on: a wait begun anew takes
     // a new one.
     pub(crate) fn disk_tickets(&self) -> [Option<u64>; 2] {
-        [self.spend[0].waiting, self.spend[1].waiting]
+        [self.spend[0].waiting(), self.spend[1].waiting()]
     }
 
     // What the job waits for on the first device it waits on, `output` read
@@ -1206,14 +920,13 @@ impl Caps {
         let readers = [output, working];
         let ledger = |index: usize| {
             self.spend[index]
-                .ledger
-                .as_ref()
+                .ledger()
                 .unwrap_or_else(|| readers[index].ledger())
         };
         let index = self
             .spend
             .iter()
-            .position(|spend| spend.waiting.is_some())?;
+            .position(|spend| spend.waiting().is_some())?;
         let owes = match ledger(0).same_disk(ledger(1)) {
             true => self.spend[0]
                 .needed()
@@ -1245,7 +958,7 @@ impl Caps {
         let readers = [output, working];
         let mut ledgers = Vec::with_capacity(2);
         for (index, spend) in self.spend.iter_mut().enumerate() {
-            if spend.waiting.is_none() {
+            if spend.waiting().is_none() {
                 continue;
             }
             let ledger = spend.bind(readers[index]);
@@ -1321,8 +1034,8 @@ impl Caps {
             self.written[entry.level] = self.written[entry.level].saturating_sub(entry.end);
             let spend = &mut self.spend[entry.device as usize];
             spend.forgo(entry.owed);
-            if self.rewriting && spend.waiting.is_some() {
-                spend.again = spend.again.saturating_add(entry.end);
+            if self.rewriting {
+                spend.write_again(entry.end);
             }
         }
     }

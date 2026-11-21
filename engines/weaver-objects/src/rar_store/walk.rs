@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use unrar_rs::{
     ArchiveFormat, KdfCache, RarArchive, RarError, RarVolumeFacts, RarVolumeFactsCursor,
-    RarVolumeFactsWalk, RarVolumeHeaderEncryption,
+    RarVolumeFactsDelta, RarVolumeHeaderEncryption,
 };
 use weaver_graph::{ByteRange, Emit, Why};
 use zeroize::Zeroizing;
@@ -67,6 +67,28 @@ pub(super) struct Walk {
     // drawn each time they change, so a layout laid on them can tell
     // they did not.
     pub(super) stamp: u64,
+    // The facts last handed to a layout, and how much of them still stands.
+    handed: Handed,
+}
+
+// The facts a layout last took a volume on, by their stamp, and what of
+// them every step since left standing: the members before `members` and
+// the services before `services`. A stamp no facts have matches no layout.
+#[derive(Debug)]
+struct Handed {
+    stamp: u64,
+    members: usize,
+    services: usize,
+}
+
+impl Default for Handed {
+    fn default() -> Self {
+        Self {
+            stamp: 0,
+            members: usize::MAX,
+            services: usize::MAX,
+        }
+    }
 }
 
 static STAMPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -119,6 +141,74 @@ pub(super) mod began {
 
     pub(crate) fn take() -> Vec<u64> {
         BEGAN.with(RefCell::take)
+    }
+}
+
+// Every fact of a volume but its members and services.
+fn scalars(facts: &RarVolumeFacts) -> RarVolumeFacts {
+    let RarVolumeFacts {
+        format,
+        volume_number,
+        more_volumes,
+        is_solid,
+        is_encrypted,
+        is_volume,
+        has_recovery_record,
+        is_locked,
+        has_authenticity_verification,
+        has_locator,
+        quick_open_offset,
+        headers_from_quick_open,
+        recovery_record_offset,
+        original_name,
+        original_name_raw,
+        original_creation_time_ns,
+        members: _,
+        services: _,
+    } = facts;
+    RarVolumeFacts {
+        format: *format,
+        volume_number: *volume_number,
+        more_volumes: *more_volumes,
+        is_solid: *is_solid,
+        is_encrypted: *is_encrypted,
+        is_volume: *is_volume,
+        has_recovery_record: *has_recovery_record,
+        is_locked: *is_locked,
+        has_authenticity_verification: *has_authenticity_verification,
+        has_locator: *has_locator,
+        quick_open_offset: *quick_open_offset,
+        headers_from_quick_open: *headers_from_quick_open,
+        recovery_record_offset: *recovery_record_offset,
+        original_name: original_name.clone(),
+        original_name_raw: original_name_raw.clone(),
+        original_creation_time_ns: *original_creation_time_ns,
+        members: Vec::new(),
+        services: Vec::new(),
+    }
+}
+
+// Whether a step's delta changes the facts held before it, in the work of
+// the delta: the members and services it states again, and the rest.
+fn changes(held: Option<&RarVolumeFacts>, delta: &RarVolumeFactsDelta) -> bool {
+    let Some(held) = held else {
+        return true;
+    };
+    held.members.get(delta.members_from..) != Some(delta.facts.members.as_slice())
+        || held.services.get(delta.services_from..) != Some(delta.facts.services.as_slice())
+        || scalars(held) != scalars(&delta.facts)
+}
+
+// The facts held before a step with its delta applied: what `step` returns.
+fn applied(held: Option<RarVolumeFacts>, delta: &RarVolumeFactsDelta) -> RarVolumeFacts {
+    match held {
+        Some(mut facts) => {
+            delta.apply_to(&mut facts);
+            facts
+        }
+        // Only a step from the signature follows no facts, and it states
+        // them all.
+        None => delta.facts.clone(),
     }
 }
 
@@ -265,16 +355,16 @@ fn quick_open_cross_check(
 // is the answer the length judges: a walk short past the length, on headers
 // placing no data past it, is asked again over the image stating the length.
 fn past_length(
-    walk: &RarVolumeFactsWalk,
+    facts: &RarVolumeFacts,
+    short_at: Option<u64>,
     kept: &Kept,
     length: Option<u64>,
     password: Option<&str>,
     kdf: &Arc<KdfCache>,
     closed: bool,
 ) -> Option<u64> {
-    let short_at = walk.short_at?;
-    let Some(length) =
-        length.filter(|length| short_at > *length && data_end(&walk.facts) <= *length)
+    let short_at = short_at?;
+    let Some(length) = length.filter(|length| short_at > *length && data_end(facts) <= *length)
     else {
         return Some(short_at);
     };
@@ -288,7 +378,7 @@ fn past_length(
     #[cfg(test)]
     assert_eq!(
         stated.as_ref().ok().map(|stated| &stated.facts),
-        Some(&walk.facts),
+        Some(facts),
         "a walk over the image stating its length reads the same headers"
     );
     Some(
@@ -304,6 +394,38 @@ impl Walk {
     pub(super) fn restore(&mut self, facts: Option<RarVolumeFacts>) {
         self.facts = facts;
         self.stamp = next_stamp();
+        self.handed = Handed::default();
+    }
+
+    // A layout took the volume on the facts it holds now.
+    pub(super) fn handed(&mut self) {
+        self.handed = Handed {
+            stamp: self.stamp,
+            ..Handed::default()
+        };
+    }
+
+    // What changed since the facts stamped `stamp` were handed to a layout,
+    // as one delta from the first member and service any step since stated
+    // again, with the facts as they are now: none when those were not the
+    // facts last handed on. The layout takes it in the work of the delta.
+    pub(super) fn delta_since(&self, stamp: u64) -> Option<RarVolumeFactsDelta> {
+        let facts = self.facts.as_ref()?;
+        if self.handed.stamp != stamp {
+            return None;
+        }
+        let members_from = self.handed.members.min(facts.members.len());
+        let services_from = self.handed.services.min(facts.services.len());
+        Some(RarVolumeFactsDelta {
+            facts: RarVolumeFacts {
+                members: facts.members[members_from..].to_vec(),
+                services: facts.services[services_from..].to_vec(),
+                ..scalars(facts)
+            },
+            members_from,
+            services_from,
+            short_at: None,
+        })
     }
 
     // How far the headers place bytes: nothing before any are read, every
@@ -461,13 +583,19 @@ impl Walk {
         #[cfg(test)]
         imaged::note(from);
         let image = SparseImage::past(kept, closed, from);
-        let walked = self.cursor.step(image, password, Arc::clone(kdf));
+        let walked = self.cursor.step_delta(image, password, Arc::clone(kdf));
         self.keyed = Keyed(password.map(|password| Zeroizing::new(password.to_owned())));
-        // A walk read on from the cursor reads what one from the signature
-        // reads over the same bytes.
+        // A walk read on from the cursor, its delta applied to the facts held,
+        // reads what one from the signature reads over the same bytes.
         #[cfg(test)]
         assert_eq!(
-            format!("{walked:?}"),
+            format!(
+                "{:?}",
+                walked.as_ref().map(|delta| unrar_rs::RarVolumeFactsWalk {
+                    facts: applied(self.facts.clone(), delta),
+                    short_at: delta.short_at,
+                })
+            ),
             format!(
                 "{:?}",
                 RarArchive::parse_volume_facts_walk_with_shared_kdf_cache(
@@ -478,8 +606,8 @@ impl Walk {
             ),
             "a resumed walk reads as a fresh one"
         );
-        let walk = match walked {
-            Ok(walk) => walk,
+        let delta = match walked {
+            Ok(delta) => delta,
             Err(RarError::EncryptedArchive) => {
                 let image = SparseImage::of(kept, closed);
                 return match RarArchive::parse_volume_header_encryption(image) {
@@ -499,8 +627,11 @@ impl Walk {
             Err(_) => return self.unparsed(kept, length, closed),
         };
         self.locked = None;
-        if walk.facts.headers_from_quick_open {
-            match quick_open_cross_check(&walk.facts, kept, closed, password, kdf) {
+        if delta.facts.headers_from_quick_open {
+            // A Quick Open answer is a walk from the signature: its delta
+            // states every member and service.
+            debug_assert_eq!((delta.members_from, delta.services_from), (0, 0));
+            match quick_open_cross_check(&delta.facts, kept, closed, password, kdf) {
                 QuickOpenCrossCheck::Agreed => {}
                 QuickOpenCrossCheck::Inconclusive => return self.waiting(kept, closed, false),
                 QuickOpenCrossCheck::Mismatch => {
@@ -508,22 +639,27 @@ impl Walk {
                 }
             }
         }
-        self.accept(walk, kept, length, password, kdf, closed)
+        self.accept(delta, kept, length, password, kdf, closed)
     }
 
     fn accept(
         &mut self,
-        walk: RarVolumeFactsWalk,
+        delta: RarVolumeFactsDelta,
         kept: &mut Kept,
         length: Option<u64>,
         password: Option<&str>,
         kdf: &Arc<KdfCache>,
         closed: bool,
     ) -> Step {
-        let past = past_length(&walk, kept, length, password, kdf, closed);
-        let facts = walk.facts;
         #[cfg(test)]
-        super::counts::bump(|counts| counts.read_members += facts.members.len());
+        super::counts::bump(|counts| counts.read_members += delta.facts.members.len());
+        let differs = changes(self.facts.as_ref(), &delta);
+        // What stands of the facts last handed to a layout.
+        self.handed.members = self.handed.members.min(delta.members_from);
+        self.handed.services = self.handed.services.min(delta.services_from);
+        let facts = applied(self.facts.take(), &delta);
+        let short_at = delta.short_at;
+        let past = past_length(&facts, short_at, kept, length, password, kdf, closed);
         let reach = data_end(&facts);
         let ended = match (past, length) {
             (None, _) => true,
@@ -549,15 +685,13 @@ impl Walk {
                 damaged = Some(ByteRange::new(length, short_at.max(length)));
             }
         }
-        if let (false, Some(short_at)) = (ended, walk.short_at) {
+        if let (false, Some(short_at)) = (ended, short_at) {
             let end = length.map_or(short_at, |length| short_at.min(length));
             kept.want(ByteRange::new(reach, end.max(reach)));
         }
         // The end record lies past the last data area: a damaged byte there
         // may be its own.
-        let more =
-            (walk.short_at.is_none() && !damaged_past(kept, reach)).then_some(facts.more_volumes);
-        let differs = self.facts.as_ref() != Some(&facts);
+        let more = (short_at.is_none() && !damaged_past(kept, reach)).then_some(facts.more_volumes);
         let moved = differs || self.ended != ended || self.more != more;
         self.blocks = facts
             .members

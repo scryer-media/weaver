@@ -592,12 +592,6 @@ async fn a_restored_slot_is_promised_on_the_complete_disk_only_what_it_has_left(
     settle(&mut pipeline).await;
     assert_eq!(started(&pipeline), [1]);
     let left = remaining(&pipeline, 1).unwrap();
-    eprintln!(
-        "DBG left {left} graph {} working {} complete {}",
-        has_graph(&pipeline, 1),
-        promised_here(&pipeline, StorageRoot::Intermediate),
-        promised_here(&pipeline, StorageRoot::Complete)
-    );
     assert!(left > 0);
     assert_eq!(promised_here(&pipeline, StorageRoot::Intermediate), left);
     assert_eq!(

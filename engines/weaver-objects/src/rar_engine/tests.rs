@@ -1283,6 +1283,26 @@ fn the_files_of_a_set_that_is_not_solid_decode_side_by_side_and_are_said_in_orde
     assert_eq!(beside.opens(), alone.opens());
 }
 
+#[test]
+fn each_member_decoded_apart_from_the_walk_gets_a_copy_holding_it_alone() {
+    for files in [6u8, 40] {
+        let volumes = vec![
+            [
+                rar5::start_flagged(0, 0),
+                stored(0..files, 0),
+                rar5::end(false),
+            ]
+            .concat(),
+        ];
+        run::copied::take();
+        let beside = on_threads(volumes.clone(), 4);
+        let copies = run::copied::take();
+        assert!(copies.iter().all(|&members| members == 1), "{copies:?}");
+        assert_eq!(copies.iter().sum::<usize>(), usize::from(files));
+        assert_eq!(beside.said, on_threads(volumes, 1).said);
+    }
+}
+
 // Four files over three volumes, the second and third running on from one
 // volume into the next.
 fn spanning_files() -> Vec<Vec<u8>> {

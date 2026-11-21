@@ -797,7 +797,7 @@ impl Pipeline {
     pub(in crate::pipeline) fn waits_for_disk_room(&self) -> bool {
         !self.disk_waiting.is_empty()
             || self.graph_outside.waits_for_disk()
-            || self.admission_disk_held
+            || self.admission_disk.held()
             || !self.full_disk.is_empty()
             || self.archive_wait.is_some()
     }

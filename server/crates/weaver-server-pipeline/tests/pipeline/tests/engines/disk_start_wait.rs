@@ -341,3 +341,73 @@ async fn a_resume_found_short_is_judged_as_a_start_when_room_comes() {
         "room for its need ({need} of {PLENTY}) lets the resumed job go"
     );
 }
+
+// A job held for a full disk, its step needing N past the reserve, keeps a
+// new start of S out while the room past the reserve less N is under S, and
+// lets one in that fits beside N. A pause takes its wait off, and so does
+// its let-go, in the step its start is promised: the room is counted once.
+#[tokio::test]
+async fn a_new_start_leaves_aside_what_a_held_job_waits_for() {
+    use weaver_server_disk::operations::start_rule::StartRule;
+
+    const UNIT: u64 = 1 << 20;
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let scenario = on_disk_posting(
+        &room,
+        vec![Post::plain("ember.bin", payload(4 * ARTICLE, 77))],
+    );
+    let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
+    apply_intents(&mut pipeline).await;
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, 0);
+    hold_step_of(&mut pipeline, JOB, RESERVE + 60 * UNIT);
+    park_disk_held_jobs(&mut pipeline);
+    old_graphs_heard(&mut pipeline).await;
+    assert_eq!(promised_by_root(&pipeline), [0, 0, 0], "held");
+    let need = full_disk_start_need(&pipeline);
+    assert_eq!(need, 60 * UNIT, "its step's need past the reserve");
+    assert_eq!(working(&pipeline).waiting(), need);
+    let left = full_disk_start_promise(&pipeline);
+    assert!(left < 20 * UNIT, "little left to fetch: {left}");
+
+    // The disk reads 80 units past the reserve, not yet heard by the
+    // pipeline, so the job is still held.
+    let capacity = Arc::clone(&pipeline.storage_capacity);
+    room.store(80 * UNIT, Ordering::Release);
+    let begun = capacity.probes_begun(StorageRoot::Intermediate);
+    capacity.request_refresh(StorageRoot::Intermediate);
+    capacity.wait_for_reading_begun_after(StorageRoot::Intermediate, begun);
+    let rule = StartRule {
+        working: StorageRoot::Intermediate,
+        output: StorageRoot::Complete,
+        reserve: RESERVE,
+    };
+    let at = StorageRoot::Intermediate;
+    assert!(
+        rule.book_on(&capacity, at, 20 * UNIT + 1, 0).is_err(),
+        "80 - 60 leaves 20 units for a new start"
+    );
+    assert_eq!(
+        rule.book_on(&capacity, at, 20 * UNIT, 0),
+        Ok((20 * UNIT, 0))
+    );
+    rule.give_back(&capacity, 20 * UNIT, 0);
+
+    // Paused, it waits for nothing a start leaves aside.
+    handle(&pipeline).pause_job(JOB).await.unwrap();
+    apply_intents(&mut pipeline).await;
+    assert_eq!(working(&pipeline).waiting(), 0, "paused");
+    handle(&pipeline).resume_job(JOB).await.unwrap();
+    apply_intents(&mut pipeline).await;
+    if full_disk_held(&pipeline) {
+        assert_eq!(working(&pipeline).waiting(), need, "resumed, held");
+        hears(&mut pipeline, &room, StorageRoot::Intermediate, 80 * UNIT);
+    }
+    assert!(!full_disk_held(&pipeline), "the room it needs lets it go");
+    assert_eq!(working(&pipeline).waiting(), 0, "let go");
+    assert_eq!(
+        promised_by_root(&pipeline),
+        [0, left, 0],
+        "promised what it has left, and waited for no more"
+    );
+    assert_eq!(rule.check().room_now(&capacity), Some(80 * UNIT - left));
+}

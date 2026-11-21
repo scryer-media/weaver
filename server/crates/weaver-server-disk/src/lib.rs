@@ -8,6 +8,8 @@ pub mod operations {
     pub use weaver_server_base::operations::instrumentation;
     pub mod disk;
     pub mod room_wait;
+    pub mod spend;
+    pub mod start_rule;
 
     pub use disk::{
         Capacity, CapacityDebits, CapacityReader, CapacityReading, DiskProbeError, DiskSpace,

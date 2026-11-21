@@ -743,9 +743,12 @@ impl TorrentService {
                 .force_recheck(&attached.handle)
                 .await
                 .map_err(|error| ActionError::State(format!("{error:#}")))?;
+            let (session, handle) = (Arc::clone(&attached.session), Arc::clone(&attached.handle));
             // The check runs its pieces again: a wait for room from before
-            // it ends, and a write it refuses holds it anew.
+            // it ends, and a write it refuses holds it anew. What it finds
+            // is judged once it ends.
             self.end_disk_room(torrent);
+            self.rejudge_after_check(job_id, &session, &handle);
         }
         Ok(false)
     }
@@ -975,9 +978,13 @@ impl TorrentService {
                     Err(error) => Err(error),
                 };
                 // The check runs its pieces again: a wait for room from
-                // before it ends, as a recheck asked for ends it.
+                // before it ends, as a recheck asked for ends it, and what
+                // it finds is judged once it ends.
                 if let Some(torrent) = self.inner.live.lock().await.get_mut(&job_id) {
                     self.end_disk_room(torrent);
+                }
+                if checked.is_ok() {
+                    self.rejudge_after_check(job_id, &session, &handle);
                 }
                 checked
             }

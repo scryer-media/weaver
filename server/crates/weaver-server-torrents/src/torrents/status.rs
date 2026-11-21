@@ -20,6 +20,9 @@ use crate::torrents::{TorrentIntent, TorrentState};
 pub enum Stated {
     /// Kept from starting for room on its disk, as a usenet job waits.
     DiskSpace,
+    /// Kept from starting by a disk that never holds what it has left to
+    /// fetch, as a usenet job is.
+    DiskTooSmall,
     /// A write found no room: it fetches nothing and keeps seeding.
     DiskFull,
     /// Stopped once its seeding goal was met.
@@ -31,8 +34,9 @@ pub enum Stated {
 }
 
 impl Stated {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::DiskSpace,
+        Self::DiskTooSmall,
         Self::DiskFull,
         Self::GoalMet,
         Self::Held(HoldOrigin::Manual),
@@ -49,6 +53,7 @@ impl Stated {
     pub const fn key(self) -> &'static str {
         match self {
             Self::DiskSpace => crate::jobs::handle::DISK_SPACE_WAIT_REASON,
+            Self::DiskTooSmall => crate::jobs::handle::DISK_TOO_SMALL_WAIT_REASON,
             Self::DiskFull => "disk_full",
             Self::GoalMet => "goal_met",
             Self::Held(origin) => origin.reason(),
@@ -269,11 +274,22 @@ pub struct Observed {
     /// It waits for room on its disk, as a usenet job held for disk space
     /// does: in upload mode, seeding, until room is made.
     pub disk_space: bool,
+    /// The disk it waits on never holds what it has left to fetch.
+    pub disk_too_small: bool,
 }
 
 impl Observed {
     fn seeding(&self) -> bool {
         seeding(self.complete, &self.engine)
+    }
+
+    // Why it waits for its disk: for room, or for a disk that holds it.
+    fn disk_stated(&self) -> Stated {
+        if self.disk_too_small {
+            Stated::DiskTooSmall
+        } else {
+            Stated::DiskSpace
+        }
     }
 }
 
@@ -344,7 +360,7 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<Why>) {
     // Kept from starting for room on its disk, it waits in the queue and
     // says so as a usenet job does. Waiting in upload mode is told below.
     if seen.disk_space && !matches!(seen.engine, Engine::Live { .. }) {
-        return (TorrentState::Queued, Some(Stated::DiskSpace.into()));
+        return (TorrentState::Queued, Some(seen.disk_stated().into()));
     }
     match &seen.engine {
         // In no session yet: it waits for one to take it.
@@ -358,7 +374,7 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<Why>) {
         // Waiting for room, it says so as a usenet job does.
         Engine::Live {
             upload_mode: true, ..
-        } if seen.disk_space => (TorrentState::Stalled, Some(Stated::DiskSpace.into())),
+        } if seen.disk_space => (TorrentState::Stalled, Some(seen.disk_stated().into())),
         Engine::Live {
             upload_mode: true, ..
         } => (TorrentState::Stalled, Some(Stated::DiskFull.into())),
@@ -493,6 +509,7 @@ mod tests {
             restore_held: None,
             files_missing: false,
             disk_space: false,
+            disk_too_small: false,
         }
     }
 
@@ -505,6 +522,7 @@ mod tests {
             Stated::ALL.map(Stated::key),
             [
                 "disk_space",
+                "disk_too_small",
                 "disk_full",
                 "goal_met",
                 "paused",
@@ -518,6 +536,10 @@ mod tests {
         assert_eq!(
             Stated::DiskSpace.key(),
             crate::jobs::handle::DISK_SPACE_WAIT_REASON
+        );
+        assert_eq!(
+            Stated::DiskTooSmall.key(),
+            crate::jobs::handle::DISK_TOO_SMALL_WAIT_REASON
         );
         for origin in [
             HoldOrigin::Manual,
@@ -917,6 +939,28 @@ mod tests {
                 ..seen(Engine::Paused { finished: false })
             }),
             (TorrentState::Queued, Some(Stated::DiskSpace.into()))
+        );
+        // Kept from starting by a disk that never holds it, it says so, as
+        // a usenet job does, waiting or seeding.
+        assert_eq!(
+            project(&Observed {
+                disk_space: true,
+                disk_too_small: true,
+                ..seen(Engine::Paused { finished: false })
+            }),
+            (TorrentState::Queued, Some(Stated::DiskTooSmall.into()))
+        );
+        assert_eq!(
+            project(&Observed {
+                disk_space: true,
+                disk_too_small: true,
+                ..seen(Engine::Live {
+                    finished: false,
+                    peers: 3,
+                    upload_mode: true,
+                })
+            }),
+            (TorrentState::Stalled, Some(Stated::DiskTooSmall.into()))
         );
         assert_eq!(
             project(&Observed {
