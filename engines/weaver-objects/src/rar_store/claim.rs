@@ -899,7 +899,12 @@ pub(crate) fn states_position(facts: &RarVolumeFacts) -> bool {
 // place, whichever it is.
 pub(super) fn settled(index: VolumeIndex, volume: &Volume) -> bool {
     let facts = volume.stated();
-    let named = volume.numbered.as_ref().map(|name| name.index() == index.0);
+    // A name the volume's own headers refute numbers it nowhere, as in `placing`.
+    let named = volume
+        .numbered
+        .as_ref()
+        .filter(|name| !volume.misplaced(VolumeIndex(name.index())))
+        .map(|name| name.index() == index.0);
     !volume.misplaced(index)
         && ((volume.walk.ended && named != Some(false))
             || facts.is_some_and(states_position)
