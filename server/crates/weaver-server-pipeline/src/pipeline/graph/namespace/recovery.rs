@@ -24,8 +24,8 @@ use weaver_graph::{
 
 use super::{
     Acknowledging, Apply, Applying, Arrival, HeldWant, LeafError, Loan, NamespaceWriter, READ_BACK,
-    ReturnTail, Returned, Segments, Tailed, Write, WriteError, absent_from_posts, in_own_file,
-    index,
+    ReturnTail, Returned, Segments, TailStep, Tailed, Write, WriteError, absent_from_posts,
+    in_own_file, index,
 };
 
 // How many times a job waiting for room asked again what its due sets
@@ -1120,7 +1120,8 @@ impl NamespaceWriter {
             rejected,
             rewritten,
             turned_away: offered && !landed,
-            vouched: false,
+            step: TailStep::Found,
+            into: node,
             ranges: found
                 .into_iter()
                 .map(|(member, range)| (member, range, Provenance::Refuted))
@@ -1214,8 +1215,10 @@ impl NamespaceWriter {
 
     // The tail's steps from where it stands: what the set found delivered
     // again, what was held behind it released, what the set vouches for
-    // delivered again, and the rest of the ruling. `Some` with the bytes of
-    // the next piece when the job's volumes have no room for it now.
+    // delivered again, and the rest of the ruling, each released hold paid
+    // as a piece is. `Some` with the bytes of the next piece or span when
+    // the job's volumes have no room for it now; the tail goes on at the
+    // same step.
     fn tail_steps(
         &mut self,
         tree: &mut Tree,
@@ -1225,30 +1228,71 @@ impl NamespaceWriter {
         out: &mut Vec<Effect>,
     ) -> Result<Option<u64>, WriteError> {
         loop {
-            if let Some(bytes) = self.redeliver_paid(tree, builder, segments, tail, out)? {
-                return Ok(Some(bytes));
-            }
-            if tail.vouched {
-                break;
-            }
-            tail.vouched = true;
-            // A rebuilt volume can let its object place bytes held behind
-            // it; they go down before the set's proof is read back through
-            // the map.
-            self.release_held(tree, builder, segments, out)?;
-            // The ruling as the set stands now: one given before the bind
-            // changed what it covers is void, and vouches for nothing.
-            if self.stands_proved(tree, tail.set) {
-                let marked = self.vouched(tree, (tail.node, tail.set));
-                tail.rewritten
-                    .extend(marked.iter().map(|(member, _)| *member));
-                tail.ranges.extend(
-                    marked
-                        .into_iter()
-                        .map(|(member, range)| (member, range, Provenance::Repaired)),
-                );
+            match tail.step {
+                TailStep::Found | TailStep::Proved => {
+                    if let Some(bytes) = self.redeliver_paid(tree, builder, segments, tail, out)? {
+                        tail.into = tail.node;
+                        return Ok(Some(bytes));
+                    }
+                    tail.step = match tail.step {
+                        TailStep::Found => TailStep::Held,
+                        _ => TailStep::Close,
+                    };
+                }
+                // A rebuilt volume can let its object place bytes held
+                // behind it; they go down before the set's proof is read
+                // back through the map.
+                TailStep::Held => {
+                    let paid = &mut tail.paid;
+                    if let Some((bytes, into)) =
+                        self.release_held_paid(tree, builder, segments, paid, out)?
+                    {
+                        tail.into = into;
+                        return Ok(Some(bytes));
+                    }
+                    // The ruling as the set stands now: one given before the
+                    // bind changed what it covers is void, and vouches for
+                    // nothing.
+                    if self.stands_proved(tree, tail.set) {
+                        let marked = self.vouched(tree, (tail.node, tail.set));
+                        tail.rewritten
+                            .extend(marked.iter().map(|(member, _)| *member));
+                        tail.ranges.extend(
+                            marked
+                                .into_iter()
+                                .map(|(member, range)| (member, range, Provenance::Repaired)),
+                        );
+                    }
+                    tail.step = TailStep::Proved;
+                }
+                TailStep::Close => {
+                    self.tail_close(tree, builder, segments, tail, out)?;
+                    tail.step = TailStep::Last;
+                }
+                TailStep::Last => {
+                    let paid = &mut tail.paid;
+                    if let Some((bytes, into)) =
+                        self.release_held_paid(tree, builder, segments, paid, out)?
+                    {
+                        tail.into = into;
+                        return Ok(Some(bytes));
+                    }
+                    return Ok(None);
+                }
             }
         }
+    }
+
+    // The members the set rewrote or proved are reopened and shut, and the
+    // damage their changed inputs make auditable is queued to be checked.
+    fn tail_close(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        tail: &mut ReturnTail,
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
         let node = tail.node;
         let rewritten = std::mem::take(&mut tail.rewritten);
         let mut rejected = std::mem::take(&mut tail.rejected);
@@ -1269,8 +1313,7 @@ impl NamespaceWriter {
             }
         }
         self.queue_rechecks(rejected);
-        self.release_held(tree, builder, segments, out)?;
-        Ok(None)
+        Ok(())
     }
 
     // How many slices of the return being applied were placed so far.
@@ -1559,27 +1602,21 @@ impl NamespaceWriter {
                 range: chunk,
             });
         }
-        let paying = credit.map(|fresh| {
-            let mut credit = self.take_credit();
-            credit.join(fresh);
-            self.crediting(Some(node));
-            credit.prepay()
-        });
-        let arrival = Arrival {
-            node,
-            member,
-            offset: chunk.start,
-            // Read back: no evidence comes with it.
-            bytes: Bytes::from(bytes).into(),
-            provenance,
-        };
-        let rereading = self.rereading(true);
-        let delivered = self.arrive(tree, builder, segments, Write::new(&arrival), arrival, out);
-        self.rereading(rereading);
-        if let Some(paying) = paying {
-            self.settle_credit(tree, paying);
-        }
-        delivered
+        self.with_credit(tree, node, credit, |writer, tree| {
+            let arrival = Arrival {
+                node,
+                member,
+                offset: chunk.start,
+                // Read back: no evidence comes with it.
+                bytes: Bytes::from(bytes).into(),
+                provenance,
+            };
+            let rereading = writer.rereading(true);
+            let delivered =
+                writer.arrive(tree, builder, segments, Write::new(&arrival), arrival, out);
+            writer.rereading(rereading);
+            delivered
+        })
     }
 
     // Mark the bytes being delivered as ones the namespace held already, or

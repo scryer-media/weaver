@@ -127,3 +127,190 @@ fn a_body_held_in_thousands_of_pieces_releases_from_one_pass() {
         assert!(run.inside == run.payload, "{pieces}: the member is whole");
     }
 }
+
+// An archive whose body came whole, as one hold larger than a read-back
+// piece, and whose end header was heard last without a release after it:
+// the store places the body, which is still held. Its files are written
+// through a volume's own writer thread.
+struct PlacedBehind {
+    _dir: tempfile::TempDir,
+    path: std::path::PathBuf,
+    writer: NamespaceWriter,
+    tree: Tree,
+    objects: weaver_objects::Objects,
+    member: MemberId,
+    payload: Vec<u8>,
+    _writers: weaver_server_disk::operations::disk::writer::VolumeWriters,
+    volume: Arc<weaver_server_disk::operations::disk::volume::Volume>,
+    submitter: Arc<weaver_server_disk::operations::disk::writer::Submitter>,
+}
+
+fn placed_behind() -> PlacedBehind {
+    use crate::pipeline::graph::disk::JobDisk;
+    use weaver_server_disk::operations::disk::volume::Volume;
+    use weaver_server_disk::operations::disk::writer::VolumeWriters;
+    let payload: Vec<u8> = (0..(5 * READ_BACK / 2) as usize)
+        .map(|n| ((n * 31 + n / 97) % 251) as u8)
+        .collect();
+    let archive = stored(&payload);
+    let data_at = 32;
+    let footer = data_at + payload.len();
+    let dir = tempfile::tempdir().unwrap();
+    let writers = VolumeWriters::reporting(|_| {});
+    let volume = Arc::new(Volume::new(None, "test".to_owned()));
+    let submitter = writers.test_submitter(&volume, 1);
+    let mut writer = NamespaceWriter::new(
+        1,
+        dir.path().to_path_buf(),
+        Arc::new(HoldsAccountant::new(PLENTY)),
+        CapacityReader::unknown(),
+    );
+    writer.move_disk_for_test(JobDisk::new(Arc::clone(&submitter), None));
+    let mut tree = Tree::new();
+    let mut objects = weaver_objects::Objects::default();
+    let member = tree.announce_root("archive.7z", Some(archive.len() as u64), &mut Vec::new());
+    writer
+        .announced(
+            &mut tree,
+            &mut objects,
+            &Unsegmented,
+            NodeId::ROOT,
+            member,
+            &mut Vec::new(),
+        )
+        .unwrap();
+    let arrival = |offset: usize, bytes: &[u8]| Arrival {
+        node: NodeId::ROOT,
+        member,
+        offset: offset as u64,
+        bytes: Bytes::copy_from_slice(bytes).into(),
+        provenance: Provenance::Fresh,
+    };
+    for (at, end) in [(0, data_at), (data_at, footer)] {
+        writer
+            .deliver(
+                &mut tree,
+                &mut objects,
+                &Unsegmented,
+                arrival(at, &archive[at..end]),
+                &mut Vec::new(),
+            )
+            .unwrap();
+    }
+    writer
+        .arrive(
+            &mut tree,
+            &mut objects,
+            &Unsegmented,
+            crate::pipeline::graph::namespace::Write::New {
+                entered: NodeId::ROOT,
+                posting: member,
+            },
+            arrival(footer, &archive[footer..]),
+            &mut Vec::new(),
+        )
+        .unwrap();
+    assert_eq!(writer.held_bytes(NodeId::ROOT), payload.len() as u64);
+    PlacedBehind {
+        path: dir.path().join("inside.bin"),
+        _dir: dir,
+        writer,
+        tree,
+        objects,
+        member,
+        payload,
+        _writers: writers,
+        volume,
+        submitter,
+    }
+}
+
+impl PlacedBehind {
+    fn release_paid(&mut self, paid: &mut bool, out: &mut Vec<Effect>) -> Option<(u64, NodeId)> {
+        self.writer
+            .release_held_paid(&mut self.tree, &mut self.objects, &Unsegmented, paid, out)
+            .unwrap()
+    }
+
+    // What the member's file holds once every write submitted returned.
+    fn inside(&self) -> Vec<u8> {
+        self.writer.disk().unwrap().barrier().wait_aside();
+        std::fs::read(&self.path).unwrap_or_default()
+    }
+}
+
+// A paid release onto a volume with no room for the first span stands with
+// that span's bytes, a read-back piece of the larger hold, credited in the
+// store's namespace; nothing leaves the ledger, and the hold is not counted
+// as asked. The next pass asks it again and, with room, releases it whole.
+#[test]
+fn a_paid_release_with_no_room_stands_and_the_next_pass_asks_again() {
+    use weaver_server_disk::operations::disk::writer::{Credit, Stand};
+    let mut run = placed_behind();
+    let (child, _) = run.tree.child_of(NodeId::ROOT, run.member).expect("a 7z");
+    // Another producer counts the volume's whole limit.
+    let hard = 64 * 1024;
+    run.volume.set_buffer_limits(hard, hard);
+    let full = Credit::reserve(std::iter::once(&run.submitter), hard, Stand::UntilStop);
+    assert!(full.covers(hard));
+    let mut out = Vec::new();
+    let mut paid = false;
+    assert_eq!(
+        run.release_paid(&mut paid, &mut out),
+        Some((READ_BACK, child))
+    );
+    assert_eq!(
+        run.writer.held_bytes(NodeId::ROOT),
+        run.payload.len() as u64,
+        "the span is still held"
+    );
+    assert!(
+        !run.writer.holds_asked(NodeId::ROOT, run.member),
+        "the hold is asked again"
+    );
+    drop(full);
+    run.volume.set_buffer_limits(u64::MAX, u64::MAX);
+    RELEASE_LOCATED.set(0);
+    assert_eq!(run.release_paid(&mut paid, &mut out), None);
+    assert!(RELEASE_LOCATED.get() > 0, "the next pass asked the hold");
+    assert_eq!(run.writer.held_bytes(NodeId::ROOT), 0);
+    assert!(run.inside() == run.payload, "the member is whole");
+}
+
+// With room, a paid release hands the store the same bytes, in the same
+// order, and says the same, as the unpaid release over the same holds.
+#[test]
+fn a_paid_release_with_room_releases_as_the_unpaid_one_does() {
+    let mut unpaid = placed_behind();
+    let mut said_unpaid = Vec::new();
+    unpaid
+        .writer
+        .release_held(
+            &mut unpaid.tree,
+            &mut unpaid.objects,
+            &Unsegmented,
+            &mut said_unpaid,
+        )
+        .unwrap();
+    let mut paid = placed_behind();
+    let mut said_paid = Vec::new();
+    let mut prepaid = false;
+    assert_eq!(paid.release_paid(&mut prepaid, &mut said_paid), None);
+    assert_eq!(unpaid.writer.held_bytes(NodeId::ROOT), 0);
+    assert_eq!(paid.writer.held_bytes(NodeId::ROOT), 0);
+    assert_eq!(said_paid, said_unpaid);
+    // What the store's member recorded of the bytes it was handed.
+    let coverage = |run: &PlacedBehind| {
+        let (child, _) = run.tree.child_of(NodeId::ROOT, run.member).expect("a 7z");
+        let record = run
+            .tree
+            .namespace(child)
+            .and_then(|below| below.find_by_name("inside.bin"))
+            .expect("the store's member");
+        format!("{:?}", record.coverage)
+    };
+    assert_eq!(coverage(&paid), coverage(&unpaid));
+    let (bytes_unpaid, bytes_paid) = (unpaid.inside(), paid.inside());
+    assert!(bytes_unpaid == unpaid.payload, "the unpaid member is whole");
+    assert!(bytes_paid == bytes_unpaid, "the paid member is the same");
+}

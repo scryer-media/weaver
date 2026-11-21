@@ -2618,6 +2618,119 @@ async fn a_repairs_tail_onto_a_full_output_volume_never_stops_the_loop() {
     retire_pipeline_database(pipeline).await;
 }
 
+// One stored member, "inside.bin", in a 7z whose end header follows its
+// body.
+fn stored_7z(inside: &[u8]) -> Vec<u8> {
+    use sevenz_turbo::{ArchiveEntry, ArchiveWriter, EncoderConfiguration, EncoderMethod};
+    let mut archive = ArchiveWriter::new(std::io::Cursor::new(Vec::new())).unwrap();
+    archive.set_content_methods(vec![EncoderConfiguration::new(EncoderMethod::COPY)]);
+    let mut entry = ArchiveEntry::new_file("inside.bin");
+    entry.size = inside.len() as u64;
+    archive
+        .push_archive_entry(entry, Some(std::io::Cursor::new(inside.to_vec())))
+        .unwrap();
+    archive.finish().unwrap().into_inner()
+}
+
+// A stored 7z whose articles from the end of its body on are lost: the body
+// that came is held, with no place until the end header says where it goes.
+// The repair rebuilds the header, and the tail of its return releases the
+// held body, downloaded bytes and no run's output, onto the volume the
+// member lands on, full as the tail begins. The loop never stands still for
+// the volume: the tail stands for room on a thread of its own and goes on
+// as that thread counts each span, and every byte lands.
+#[tokio::test]
+async fn a_repairs_tail_releasing_held_bytes_onto_a_full_output_volume_never_stops_the_loop() {
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_497);
+    let inside = payload(8 * ARTICLE, 4);
+    let archive = stored_7z(&inside);
+    let footer = 32 + inside.len();
+    let articles = archive.len().div_ceil(ARTICLE) as u32;
+    let lost_from = (footer / ARTICLE) as u32;
+    assert!(
+        articles - lost_from <= 4,
+        "the set rebuilds every lost article"
+    );
+    let mut posts = vec![Post::plain("lantern.7z", archive.clone())];
+    posts.extend(par2_set("lantern", &[("lantern.7z", &archive)], 4));
+    let (mut pipeline, staging_dir) = delivered_apart(&temp_dir, job_id, &posts, Some(1)).await;
+    let last = posts.len() as u32;
+    for ordinal in 0..lost_from {
+        decode(&mut pipeline, job_id, &posts, 0, ordinal, true).await;
+    }
+    for ordinal in lost_from..articles {
+        pipeline.book_terminal_segment(
+            segment_id(job_id, 0, ordinal),
+            SegmentTerminalState::Missing,
+        );
+    }
+    for index in 1..last {
+        decode_all(&mut pipeline, job_id, &posts, index).await;
+    }
+    assert!(pipeline.graph_jobs[&job_id].repair_out());
+    let disk = pipeline.graph_jobs[&job_id].disk().unwrap().clone();
+    let (_, output) = working_and_output(&pipeline, job_id, &staging_dir);
+    // What the downloads waited, before any repair.
+    let downloaded = budget_waits(&output);
+    let (mut watcher, mut stood) = (None, 0u32);
+    while pipeline.graph_jobs[&job_id].repair_out() {
+        let said = pipeline.graph_runs.recv().await.unwrap();
+        if matches!(&said.heard, Heard::RepairRead(_)) {
+            // Every slice is down, and the body is still held. Another
+            // producer counts the volume's whole limit and the writer is
+            // said to hold bytes, until a thread stands for room; then both
+            // go.
+            disk.barrier().wait_aside();
+            assert!(
+                pipeline.graph_jobs[&job_id]
+                    .writer()
+                    .held_bytes(weaver_graph::NodeId::ROOT)
+                    > 0,
+                "the body is held behind the header"
+            );
+            let submitter = Arc::clone(disk.under(&staging_dir));
+            let (_, hard) = output.buffer_limits();
+            assert!(hard < u64::MAX, "the volume is sized");
+            let full = weaver_server_disk::operations::disk::writer::Credit::reserve(
+                std::iter::once(&submitter),
+                hard,
+                weaver_server_disk::operations::disk::writer::Stand::UntilStop,
+            );
+            assert!(full.covers(hard));
+            output.buffered_bytes.fetch_add(hard, Ordering::SeqCst);
+            let (hold, filled) = (pipeline.volume_writers.hold(&output), Arc::clone(&output));
+            hold.open();
+            watcher = Some(std::thread::spawn(move || {
+                hold.wait_below_waiters(1);
+                filled.buffered_bytes.fetch_sub(hard, Ordering::SeqCst);
+                drop(full);
+            }));
+        }
+        if matches!(&said.heard, Heard::TailPaid(_)) {
+            stood += 1;
+        }
+        pipeline.graph_run_said(said);
+    }
+    assert_eq!(
+        budget_waits(&output) - downloaded,
+        0,
+        "the loop stood still for the output volume"
+    );
+    assert!(stood > 0, "the tail never stood for room");
+    watcher.expect("the repair was read back").join().unwrap();
+    disk.barrier().wait_aside();
+    assert_eq!(
+        pipeline.graph_jobs[&job_id]
+            .writer()
+            .held_bytes(weaver_graph::NodeId::ROOT),
+        0
+    );
+    assert_eq!(read(&staging_dir.join("inside.bin")), inside);
+    retire_pipeline_database(pipeline).await;
+}
+
 // An article of a file outside the set arrives between two slices of a
 // repair being applied: both files end whole.
 #[tokio::test]

@@ -176,7 +176,17 @@ impl NamespaceWriter {
                 self.reached_now
                     .extend(reached.iter().map(|range| (node, member, owner, *range)));
                 self.share_file(tree, node, member, None);
-                self.replay(tree, builder, segments, node, member, super::ALL, None, out)?;
+                self.replay(
+                    tree,
+                    builder,
+                    segments,
+                    node,
+                    member,
+                    super::ALL,
+                    None,
+                    None,
+                    out,
+                )?;
                 self.replay_file(tree, builder, segments, node, member, None, out)?;
             } else {
                 self.release_to_leaf(tree, node, member)?;
@@ -225,7 +235,17 @@ impl NamespaceWriter {
             None => None,
         };
         if tree.child_of(node, member).is_some() {
-            self.replay(tree, builder, segments, node, member, super::ALL, None, out)?;
+            self.replay(
+                tree,
+                builder,
+                segments,
+                node,
+                member,
+                super::ALL,
+                None,
+                None,
+                out,
+            )?;
         } else {
             self.release_to_leaf(tree, node, member)?;
         }
