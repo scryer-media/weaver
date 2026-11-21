@@ -458,7 +458,7 @@ impl SocketFactory for CrowdedTcp {
 // is possible: the connect loop looks again and lets the want go. Neither
 // side has the payload, so the run never completes, and nothing but the dial
 // ending can wake the loop. Real loopback uTP runs on real time; the test
-// waits on the want's release alone.
+// waits on the want's release, then on the peer coming live.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_want_goes_once_the_last_dial_comes_live_over_utp() -> anyhow::Result<()> {
     setup_test_logging();
@@ -543,8 +543,18 @@ async fn the_want_goes_once_the_last_dial_comes_live_over_utp() -> anyhow::Resul
         }
         gone.await;
     }
+    // The dial ends before the peer's handshake makes it live.
     let live = handle.live().context("the torrent runs")?;
     let peers = live.peer_states();
+    loop {
+        let went_live = peers.live_changed.notified();
+        tokio::pin!(went_live);
+        went_live.as_mut().enable();
+        if peers.stats().live_utp > 0 {
+            break;
+        }
+        went_live.await;
+    }
     assert_eq!(peers.stats().live_utp, 1, "the dial came live over uTP");
     assert_eq!(peers.dialling(), 0);
     assert_eq!(CountingFactory::count(&client.inner.connect_tcp), 0);

@@ -169,6 +169,9 @@ pub(crate) struct PeerStates {
     // Wakes the run's rate-tick join each time a peer goes live, so a run
     // with no connection costs the session's rate tick nothing.
     pub(crate) went_live: Arc<Notify>,
+    // Wakes every test waiting for a peer to come live.
+    #[cfg(test)]
+    pub(crate) live_changed: Notify,
     // Held while a piece is handed to a peer to super-seed, so two peers
     // are not handed one piece at once.
     super_seeding: Mutex<()>,
@@ -588,6 +591,8 @@ impl PeerStates {
             session_bans: Default::default(),
             candidates_changed: Notify::new(),
             went_live: Arc::new(Notify::new()),
+            #[cfg(test)]
+            live_changed: Notify::new(),
             super_seeding: Mutex::new(()),
             web_seeds: AtomicUsize::new(0),
             dialling: AtomicUsize::new(0),
@@ -1747,6 +1752,8 @@ impl PeerStates {
             self.pex_changed();
             self.availability.add(&live.bitfield);
             self.went_live.notify_one();
+            #[cfg(test)]
+            self.live_changed.notify_waiters();
         }
     }
 

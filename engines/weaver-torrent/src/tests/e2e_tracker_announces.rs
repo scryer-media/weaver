@@ -1343,6 +1343,15 @@ async fn accept_handshake(peer: &TcpListener) -> anyhow::Result<TcpStream> {
     Ok(conn)
 }
 
+/// The next connection to `peer` once its handshake is read, or `None` for
+/// one that ends first, as a dial from a run just deleted does. Only the
+/// listener failing is an error.
+async fn next_handshake(peer: &TcpListener) -> anyhow::Result<Option<TcpStream>> {
+    let (mut conn, _) = peer.accept().await?;
+    let mut theirs = [0u8; 68];
+    Ok(conn.read_exact(&mut theirs).await.ok().map(|_| conn))
+}
+
 /// Answers a handshake for `info_hash` with no extension bit set: the peer
 /// cannot serve metadata.
 async fn answer_without_extensions(
@@ -2949,9 +2958,12 @@ async fn hold_over(
     let handshake = out[..len].to_vec();
     let mut held = Vec::new();
     loop {
-        let mut conn = accept_handshake(&listener).await?;
-        conn.write_all(&handshake).await?;
-        conn.write_all(&bitfield).await?;
+        let Some(mut conn) = next_handshake(&listener).await? else {
+            continue;
+        };
+        if conn.write_all(&handshake).await.is_err() || conn.write_all(&bitfield).await.is_err() {
+            continue;
+        }
         if interested(&mut conn).await {
             let _ = delivered.send(addr);
             held.push(conn);
@@ -3144,8 +3156,12 @@ async fn pex_peer(
     let task = tokio::spawn(async move {
         let mut held = Vec::new();
         loop {
-            let mut conn = accept_handshake(&listener).await?;
-            conn.write_all(&hello).await?;
+            let Some(mut conn) = next_handshake(&listener).await? else {
+                continue;
+            };
+            if conn.write_all(&hello).await.is_err() {
+                continue;
+            }
             // The torrent's extended handshake, then its interest.
             let mut told = false;
             while let Ok(frame) = conn.read_u32().await {
