@@ -231,6 +231,7 @@ async fn a_plain_file_onto_a_full_output_volume_stops_dispatch_not_the_loop() {
         take_when_room(&mut pipeline, job_id, &posts, 0, ordinal).await;
     }
     let disk = pipeline.graph_jobs[&job_id].disk().unwrap().clone();
+    settle(&mut pipeline, job_id).await;
     disk.barrier().wait_aside();
     assert!(!disk.barrier().unwritten());
     assert_eq!(read(&staging_dir.join("lantern.bin")), data);
@@ -321,6 +322,7 @@ async fn an_article_counted_on_the_other_volume_moves_where_it_fits_or_parks() {
         take_when_room(&mut pipeline, job_id, &posts, 0, ordinal).await;
     }
     let disk = pipeline.graph_jobs[&job_id].disk().unwrap().clone();
+    settle(&mut pipeline, job_id).await;
     disk.barrier().wait_aside();
     assert!(!disk.barrier().unwritten());
     assert_eq!(read(&staging_dir.join("lantern.bin")), data);
@@ -377,6 +379,7 @@ async fn an_archives_volumes_count_on_working_as_before() {
     }
     drain_runs(&mut pipeline, job_id).await;
     let disk = pipeline.graph_jobs[&job_id].disk().unwrap().clone();
+    settle(&mut pipeline, job_id).await;
     disk.barrier().wait_aside();
     assert_eq!(read(&staging_dir.join("echo-0.mkv")), body);
     no_budget_waits(&working);
@@ -428,6 +431,7 @@ async fn a_single_volume_job_counts_each_article_as_before() {
         take_when_room(&mut pipeline, job_id, &posts, 0, ordinal).await;
     }
     let disk = pipeline.graph_jobs[&job_id].disk().unwrap().clone();
+    settle(&mut pipeline, job_id).await;
     disk.barrier().wait_aside();
     assert_eq!(read(&working_dir.join("lantern.bin")), data);
     no_budget_waits(&volume);
@@ -936,6 +940,7 @@ async fn stored_run(
         take_through(&mut pipeline, job_id, &posts, index, ordinal).await;
     }
     let disk = pipeline.graph_jobs[&job_id].disk().unwrap().clone();
+    settle(&mut pipeline, job_id).await;
     disk.barrier().wait_aside();
     assert!(!disk.barrier().unwritten());
     let delivered = read(&staging_dir.join("inside.mkv"));
@@ -1102,6 +1107,18 @@ fn two_plain_posts(articles: usize, seed: u8) -> (Vec<Post>, Vec<u8>) {
     (posts, dawn)
 }
 
+// The job's mail is heard while it still owes work its threads answer: a
+// release of held bytes that found no room in its step is paid off the
+// loop, and its bytes go down only once that mail is heard. A barrier
+// taken before then stands for less than the job will write, and the
+// payer's credit is counted on the volume but not yet buffered.
+async fn settle(pipeline: &mut Pipeline, job_id: JobId) {
+    while pipeline.graph_jobs[&job_id].work_pending() {
+        let said = pipeline.graph_runs.recv().await.unwrap();
+        pipeline.graph_run_said(said);
+    }
+}
+
 // The output volume counts only what its writer was given.
 fn counts_only_buffered(output: &Volume) {
     assert_eq!(
@@ -1158,6 +1175,7 @@ async fn held_plain_run(
         hold.open();
         take_through(&mut pipeline, job_id, &posts, 1, 0).await;
     }
+    settle(&mut pipeline, job_id).await;
     counts_only_buffered(&output);
     let mut rest: Vec<(u32, u32)> = (3..articles(&posts, 1)).map(|o| (1, o)).collect();
     rest.extend((next..articles(&posts, 0)).map(|o| (0, o)));
@@ -1165,6 +1183,7 @@ async fn held_plain_run(
         take_through(&mut pipeline, job_id, &posts, index, ordinal).await;
     }
     let disk = pipeline.graph_jobs[&job_id].disk().unwrap().clone();
+    settle(&mut pipeline, job_id).await;
     disk.barrier().wait_aside();
     assert!(!disk.barrier().unwritten());
     let delivered = read(&staging_dir.join("dawn.bin"));
@@ -1246,11 +1265,13 @@ async fn held_store_run(
         hold.open();
         take_through(&mut pipeline, job_id, &posts, 1, last).await;
     }
+    settle(&mut pipeline, job_id).await;
     counts_only_buffered(&output);
     for ordinal in next..articles(&posts, 0) {
         take_through(&mut pipeline, job_id, &posts, 0, ordinal).await;
     }
     let disk = pipeline.graph_jobs[&job_id].disk().unwrap().clone();
+    settle(&mut pipeline, job_id).await;
     disk.barrier().wait_aside();
     assert!(!disk.barrier().unwritten());
     let delivered = read(&staging_dir.join("inside.mkv"));
@@ -1313,11 +1334,13 @@ async fn a_release_above_outputs_limit_parks_until_output_holds_nothing_then_goe
     hold.open();
     assert_eq!(hand_on_all_parked(&mut pipeline).await, 1);
     assert!(output.peak_bytes() > hard);
+    settle(&mut pipeline, job_id).await;
     counts_only_buffered(&output);
     for ordinal in next..articles(&posts, 0) {
         take_through(&mut pipeline, job_id, &posts, 0, ordinal).await;
     }
     let disk = pipeline.graph_jobs[&job_id].disk().unwrap().clone();
+    settle(&mut pipeline, job_id).await;
     disk.barrier().wait_aside();
     assert!(!disk.barrier().unwritten());
     assert_eq!(read(&staging_dir.join("dawn.bin")), dawn);
@@ -1506,6 +1529,7 @@ async fn a_front_a_look_leaves_parked_is_woken_once_output_holds_nothing() {
     for ordinal in next..articles(&posts, 0) {
         take_through(&mut pipeline, job_id, &posts, 0, ordinal).await;
     }
+    settle(&mut pipeline, job_id).await;
     disk.barrier().wait_aside();
     assert_eq!(read(&staging_dir.join("dawn.bin")), dawn);
     no_budget_waits(&working);
@@ -1563,6 +1587,7 @@ async fn a_release_above_outputs_limit_passes_it_by_its_held_bytes_at_most() {
     for ordinal in next..articles(&posts, 0) {
         take_through(&mut pipeline, job_id, &posts, 0, ordinal).await;
     }
+    settle(&mut pipeline, job_id).await;
     disk.barrier().wait_aside();
     assert_eq!(read(&staging_dir.join("dawn.bin")), dawn);
     no_budget_waits(&working);
@@ -1622,6 +1647,7 @@ async fn a_release_beside_only_carried_bytes_on_output_goes_on() {
     for ordinal in next..articles(&posts, 0) {
         take_through(&mut pipeline, job_id, &posts, 0, ordinal).await;
     }
+    settle(&mut pipeline, job_id).await;
     disk.barrier().wait_aside();
     assert_eq!(output.carried_bytes(), 0);
     assert_eq!(read(&staging_dir.join("dawn.bin")), dawn);
@@ -1699,6 +1725,7 @@ async fn carried_run(
     for ordinal in first..articles(&posts, 2) {
         take_through(&mut pipeline, job_id, &posts, 2, ordinal).await;
     }
+    settle(&mut pipeline, job_id).await;
     disk.barrier().wait_aside();
     assert!(!disk.barrier().unwritten());
     assert_eq!(working.carried_bytes(), 0);
@@ -1798,6 +1825,7 @@ async fn a_front_beside_only_anothers_arrived_bytes_is_handed_on() {
     );
     assert_eq!(pipeline.parked_download_results_for_test(), 0);
     pipeline.let_go_result_for_test(other, away);
+    settle(&mut pipeline, job_id).await;
     disk.barrier().wait_aside();
     assert_eq!(output.unwritten_bytes(), 0);
     assert_eq!(output.arrived_bytes.load(Ordering::SeqCst), 0);
@@ -1852,6 +1880,7 @@ async fn bytes_arriving_on_a_volume_a_front_waits_on_have_it_looked_at_again() {
     for ordinal in next..articles(&posts, 0) {
         take_through(&mut pipeline, job_id, &posts, 0, ordinal).await;
     }
+    settle(&mut pipeline, job_id).await;
     disk.barrier().wait_aside();
     assert_eq!(read(&staging_dir.join("dawn.bin")), dawn);
     assert_eq!(output.unwritten_bytes(), 0);
