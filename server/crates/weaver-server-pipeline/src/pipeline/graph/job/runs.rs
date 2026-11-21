@@ -302,16 +302,7 @@ impl GraphJob {
                     return Ok(());
                 }
                 let super::Worked { object, said } = *worked;
-                let mut effects = Vec::new();
-                self.tree.take_back_worked(
-                    node,
-                    object,
-                    said,
-                    &mut self.writer.placing(&mut *self.builder),
-                    &mut effects,
-                );
-                self.settle_worked(effects)?;
-                self.step_runs(Vec::new(), limit)?;
+                self.took_back_worked(node, object, said, limit)?;
                 return self.lend(slots, limit);
             }
             Heard::Rewalked(rewalked) => {

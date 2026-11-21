@@ -1864,6 +1864,28 @@ impl GraphJob {
         self.heard(out)
     }
 
+    // An object back from its work, on the loop or off it: what it said is
+    // taken back and settled, and the runs are stepped, so an engine it
+    // handed its set to starts here whichever way the work was done.
+    fn took_back_worked(
+        &mut self,
+        node: NodeId,
+        object: Box<dyn weaver_graph::Object>,
+        said: Vec<weaver_graph::Emit>,
+        limit: usize,
+    ) -> Result<(), GraphError> {
+        let mut effects = Vec::new();
+        self.tree.take_back_worked(
+            node,
+            object,
+            said,
+            &mut self.writer.placing(&mut *self.builder),
+            &mut effects,
+        );
+        self.settle_worked(effects)?;
+        self.step_runs(Vec::new(), limit)
+    }
+
     // What the writer passed on that is the job's to answer: an object that
     // asks for a password is offered one, and what it says back is applied
     // and answered the same way. An offer goes through the writer even when
