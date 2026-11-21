@@ -1121,10 +1121,27 @@ impl Tree {
         // its end only here: a run past its hole that reaches that end is
         // whole now, and no more of it will come.
         if lengthened {
-            let short = self
-                .namespace(node)
-                .is_some_and(|namespace| namespace.clean(member).bytes.len() < FIRST_BYTES);
-            if short {
+            let undecided = self.is_undecided(node, member);
+            let (says, short) = self.namespace(node).map_or((false, false), |namespace| {
+                let clean = namespace.clean(member);
+                let says = undecided
+                    && clean.at == 0
+                    && namespace.get(member).is_some_and(|record| {
+                        let front = namespace.first_bytes(member);
+                        matches!(
+                            record.said(front, namespace, &*self.never_open),
+                            Sniff::Object(_)
+                        )
+                    });
+                (says, clean.bytes.len() < FIRST_BYTES)
+            });
+            // A front left undecided for want of a length may say an object
+            // now that it has one: it founds it here. One that says a leaf
+            // stays undecided for the owner to settle at `Closed`, which
+            // writes what it held.
+            if says {
+                self.identify_again(node, member, builder, effects);
+            } else if short {
                 self.past_hole(node, member, (0, 0), None, builder, effects);
             }
         }

@@ -13,6 +13,7 @@ use super::harness::{ARTICLE, Claim, Post, Scenario, assert_fetched_once, par2_s
 use super::rar::{delivered, posts};
 use super::sfv::{crc, listing_text};
 use crate::pipeline::tests::direct_store::single_member_store_set;
+use weaver_server_pipeline::pipeline::tests::engines::loans::stored_zip;
 
 // A PAR2 set that verifies every file outranks a listing that disagrees
 // with one of them: the job completes with both files whole.
@@ -94,4 +95,59 @@ async fn an_sfv_naming_the_volumes_of_a_rar_set_verifies_and_the_member_is_deliv
     assert_fetched_once(&graph);
     assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
     assert_eq!(graph.files[&delivered("beacon.mkv")], body);
+}
+
+// The same listing posted in one article whose header declares a size the
+// article cannot reach, so the member learns its length only at its close:
+// the listing is still the job's listing, and a job whose every file came
+// whole completes.
+#[tokio::test]
+async fn an_sfv_whose_length_comes_only_at_its_close_is_the_listing() {
+    let body = payload(7 * ARTICLE + 13, 79);
+    let volumes = single_member_store_set("beacon.mkv", &body, 2);
+    let entries: Vec<(String, u32)> = volumes
+        .iter()
+        .map(|(name, bytes)| (name.clone(), crc(bytes)))
+        .collect();
+    let named: Vec<(&str, u32)> = entries
+        .iter()
+        .map(|(name, crc)| (name.as_str(), *crc))
+        .collect();
+    let mut posts = posts(volumes);
+    let listing = listing_text("; generated listing\n", &named);
+    let declared = listing.len() as u64 + 64;
+    let sfv = posts.len() as u32;
+    posts.push(Post::plain("lantern.sfv", listing));
+    let graph = run(&Scenario::new(posts).declares(sfv, declared)).await;
+    assert!(
+        graph.completed(),
+        "{:?} {:?} damaged {:?}",
+        graph.status,
+        graph.failure,
+        graph.graph().delivery.damaged
+    );
+    assert_eq!(graph.files[&delivered("beacon.mkv")], body);
+}
+
+// Small files whose one article declares a size it cannot reach, so each
+// learns its length only at its close: a stored zip opens on its own
+// signature and its member is delivered, and a plain text file that names
+// no object is delivered as it came.
+#[tokio::test]
+async fn small_files_whose_length_comes_only_at_their_close_are_delivered() {
+    let member = b"ember, a short member\n".to_vec();
+    let zip = stored_zip("ember.txt", &member);
+    let notes = b"lantern notes, a short plain text file\n".to_vec();
+    let declared = (zip.len() as u64 + 64, notes.len() as u64 + 64);
+    let posts = vec![
+        Post::plain("lantern.zip", zip),
+        Post::plain("lantern.txt", notes.clone()),
+    ];
+    let scenario = Scenario::new(posts)
+        .declares(0, declared.0)
+        .declares(1, declared.1);
+    let graph = run(&scenario).await;
+    assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+    assert_eq!(graph.files.get(&delivered("ember.txt")), Some(&member));
+    assert_eq!(graph.files.get(&delivered("lantern.txt")), Some(&notes));
 }
