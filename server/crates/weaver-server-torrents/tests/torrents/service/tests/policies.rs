@@ -1037,13 +1037,21 @@ async fn completes_again(service: &TorrentService, db: &Database, job_id: JobId,
     }
     let mut settles = service.inner.settled.subscribe();
     service.inner.signal.look(job_id);
+    // The settle that wrote the completion is over, with what it raises
+    // after the write: the row is written mid-settle, and the wait looks at
+    // it at once as well as at each settle's end.
     settles
         .wait_for(|_| {
-            db.get_torrent(job_id)
-                .unwrap()
-                .unwrap()
-                .completed_at_ms
-                .is_some()
+            !service
+                .inner
+                .settling
+                .load(std::sync::atomic::Ordering::SeqCst)
+                && db
+                    .get_torrent(job_id)
+                    .unwrap()
+                    .unwrap()
+                    .completed_at_ms
+                    .is_some()
         })
         .await
         .unwrap();

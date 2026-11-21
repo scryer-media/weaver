@@ -642,27 +642,39 @@ async fn a_magnet_added_paused_announces_only_once_resumed() {
     rig.service.stop().await;
 }
 
-// The magnet added, and the figures published for it once its metainfo is
-// in hand. A magnet retired first, as a failed fetch retires it, fails.
-async fn resolved_magnet(service: &TorrentService, magnet: String) -> (JobId, TorrentSeries) {
-    let mut retired = service.retired();
-    let before = *retired.borrow_and_update();
-    let mut published = service.inner.published.subscribe();
+// The magnet added, the `fetch`th whose fetch ends on `service`, and the
+// figures published for it once its metainfo is in hand. A fetch's end
+// publishes only the torrents already in the figures; a new one joins them
+// at the next publish of every torrent, the tick's, which this rig's clock
+// never makes, so the test makes it. A magnet retired, as a failed fetch
+// retires it, fails.
+async fn resolved_magnet(
+    service: &TorrentService,
+    magnet: String,
+    fetch: u64,
+) -> (JobId, TorrentSeries) {
+    let retired = *service.retired().borrow();
     let job_id = service
         .add(request(AddSource::Magnet(magnet)))
         .await
         .unwrap();
-    tokio::select! {
-        published = published.wait_for(|published| {
-            published
-                .job(job_id)
-                .is_some_and(|job| job.torrent.total_bytes != 0)
-        }) => (job_id, published.unwrap().job(job_id).unwrap().torrent.clone()),
-        _ = retired.wait_for(|retired| *retired > before) => panic!(
-            "the magnet was retired: {:?}",
-            service.inner.db.get_job_history(job_id.0).unwrap().map(|job| job.error_message)
-        ),
-    }
+    service.fetches_ended(fetch).await;
+    assert_eq!(
+        *service.retired().borrow(),
+        retired,
+        "the magnet was retired: {:?}",
+        service
+            .inner
+            .db
+            .get_job_history(job_id.0)
+            .unwrap()
+            .map(|job| job.error_message)
+    );
+    service.publish().await;
+    let published = service.inner.published.borrow();
+    let torrent = published.job(job_id).unwrap().torrent;
+    assert_ne!(torrent.total_bytes, 0, "the metainfo is in hand");
+    (job_id, TorrentSeries::clone(torrent))
 }
 
 // A magnet of `metainfo` naming the seeder at `peer` as its one source:
@@ -694,11 +706,11 @@ async fn a_magnet_that_names_its_peers_needs_no_dht() {
     rig.service.open().await.unwrap();
     // The route's session is opened by this magnet's fetch.
     let magnet = magnet_of_peer(&first, one.listen_addr().unwrap(), "");
-    let (_, resolved) = resolved_magnet(&rig.service, magnet).await;
+    let (_, resolved) = resolved_magnet(&rig.service, magnet, 1).await;
     assert_eq!(resolved.total_bytes, 40_000);
     // The route's session runs now.
     let magnet = magnet_of_peer(&second, two.listen_addr().unwrap(), "");
-    let (_, resolved) = resolved_magnet(&rig.service, magnet).await;
+    let (_, resolved) = resolved_magnet(&rig.service, magnet, 2).await;
     assert_eq!(resolved.total_bytes, 30_000);
     rig.service.stop().await;
     one.stop().await;
@@ -723,7 +735,7 @@ async fn a_magnets_selection_is_kept_with_its_metainfo() {
     on_loopback(&rig.routes);
     rig.service.open().await.unwrap();
     let magnet = magnet_of_peer(&shared, seeding.listen_addr().unwrap(), "&so=0");
-    let (job_id, resolved) = resolved_magnet(&rig.service, magnet).await;
+    let (job_id, resolved) = resolved_magnet(&rig.service, magnet, 1).await;
     assert_eq!(resolved.total_bytes, 50_000);
     assert_eq!(resolved.wanted_bytes, 20_000);
     assert_eq!(
@@ -810,7 +822,7 @@ async fn a_magnets_web_seeds_are_stored_with_its_metainfo_and_kept_across_a_rest
         seeding.listen_addr().unwrap(),
         &format!("&ws={one}&ws={two}&ws={one}"),
     );
-    let (job_id, _) = resolved_magnet(&rig.service, magnet).await;
+    let (job_id, _) = resolved_magnet(&rig.service, magnet, 1).await;
     assert_eq!(attached_seeds(&rig.service, job_id).await, [one, two]);
 
     // Stored once each, after the fetched metainfo's own (it has none), in
@@ -949,7 +961,7 @@ async fn a_magnets_web_seed_is_asked_once_its_metainfo_is_known_and_after_a_rest
     let service = service_over(&db, dir.path(), Arc::clone(&routes), job_env(), set_clock());
     service.open().await.unwrap();
     let magnet = magnet_of_peer(&shared, peer_addr, "&ws=http://seed.example/");
-    let (job_id, _) = resolved_magnet(&service, magnet).await;
+    let (job_id, _) = resolved_magnet(&service, magnet, 1).await;
     asked(&heads.recv().await.unwrap());
     service.stop().await;
     // What the first run asked is behind it.
