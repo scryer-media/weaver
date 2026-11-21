@@ -379,3 +379,108 @@ fn a_release_with_no_room_keeps_the_bytes_held_until_it_is_paid() {
     assert_eq!(run.writer.held_bytes(NodeId::ROOT), 0);
     assert!(run.inside() == run.payload, "the member is whole");
 }
+
+// The member's close comes while the release of its held bytes is owed:
+// the close waits, the member stays open, and once the release is paid the
+// close is made after the bytes went down. The job ends with the same
+// files, bytes, coverage and effects, in the same order, as the same job
+// with room on the volume, where the release went and the close followed.
+#[test]
+fn a_close_while_a_release_is_owed_ends_as_the_job_with_room() {
+    use weaver_server_disk::operations::disk::writer::{Credit, Stand};
+    let closed = |run: &PlacedBehind| {
+        run.tree
+            .namespace(NodeId::ROOT)
+            .and_then(|root| root.get(run.member))
+            .is_some_and(|record| record.closed)
+    };
+    let coverage = |run: &PlacedBehind| {
+        let (child, _) = run.tree.child_of(NodeId::ROOT, run.member).expect("a 7z");
+        let record = run
+            .tree
+            .namespace(child)
+            .and_then(|below| below.find_by_name("inside.bin"))
+            .expect("the store's member");
+        format!("{:?} closed {}", record.coverage, record.closed)
+    };
+    let close = |run: &mut PlacedBehind, out: &mut Vec<Effect>| {
+        let member = run.member;
+        run.writer
+            .close(
+                &mut run.tree,
+                &mut run.objects,
+                &Unsegmented,
+                NodeId::ROOT,
+                member,
+                out,
+            )
+            .unwrap();
+    };
+    // With room: the release goes, then the close.
+    let mut room = placed_behind();
+    let mut said_room = Vec::new();
+    room.writer
+        .release_held(
+            &mut room.tree,
+            &mut room.objects,
+            &Unsegmented,
+            &mut said_room,
+        )
+        .unwrap();
+    assert_eq!(room.writer.release_owed(), None);
+    close(&mut room, &mut said_room);
+    assert!(closed(&room));
+    // With no room: the release is owed, and the close waits for it.
+    let mut owed = placed_behind();
+    let hard = 64 * 1024;
+    owed.volume.set_buffer_limits(hard, hard);
+    let full = Credit::reserve(std::iter::once(&owed.submitter), hard, Stand::UntilStop);
+    assert!(full.covers(hard));
+    let mut said_owed = Vec::new();
+    owed.writer
+        .release_held(
+            &mut owed.tree,
+            &mut owed.objects,
+            &Unsegmented,
+            &mut said_owed,
+        )
+        .unwrap();
+    assert!(owed.writer.release_owed().is_some(), "the release is owed");
+    close(&mut owed, &mut said_owed);
+    assert!(owed.writer.closes_owed(), "the close waits");
+    assert!(!closed(&owed), "the member stays open while bytes are held");
+    // The same close again is owed once.
+    close(&mut owed, &mut said_owed);
+    assert_eq!(
+        owed.writer.held_bytes(NodeId::ROOT),
+        owed.payload.len() as u64
+    );
+    drop(full);
+    owed.volume.set_buffer_limits(u64::MAX, u64::MAX);
+    while let Some((bytes, _)) = owed.writer.release_owed() {
+        let credit = Credit::reserve(std::iter::once(&owed.submitter), bytes, Stand::UntilStop);
+        assert!(credit.covers(bytes));
+        owed.writer
+            .release_paid(
+                &mut owed.tree,
+                &mut owed.objects,
+                &Unsegmented,
+                credit,
+                &mut said_owed,
+            )
+            .unwrap();
+    }
+    assert!(!owed.writer.closes_owed(), "the owed close was made");
+    assert!(closed(&owed));
+    for run in [&room, &owed] {
+        assert_eq!(run.writer.held_bytes(NodeId::ROOT), 0);
+    }
+    assert_eq!(said_owed, said_room);
+    assert_eq!(coverage(&owed), coverage(&room));
+    let bytes_room = room.inside();
+    assert!(bytes_room == room.payload, "the member is whole");
+    assert!(
+        owed.inside() == bytes_room,
+        "the owed job's member is the same"
+    );
+}

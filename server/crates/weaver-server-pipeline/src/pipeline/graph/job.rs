@@ -788,6 +788,7 @@ impl GraphJob {
             || self.tree.work_due()
             || self.releasing
             || self.writer.release_owed().is_some()
+            || self.writer.closes_owed()
     }
 
     // A release of held bytes stands for room on the job's volumes

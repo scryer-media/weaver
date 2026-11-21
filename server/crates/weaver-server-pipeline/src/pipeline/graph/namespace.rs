@@ -434,6 +434,14 @@ pub struct NamespaceWriter {
     // the piece a volume had no room for, and the namespace it is credited
     // in (`release_held`). The job pays it off the loop (`release_paid`).
     release_owed: Option<(u64, NodeId)>,
+    // Members whose close came while a release was owed, oldest first: a
+    // close says nothing more will arrive, and bytes still held for the
+    // member may yet, so it waits until no release stands
+    // (`close_owed_members`). Each is owed once.
+    closes_owed: std::collections::VecDeque<(NodeId, MemberId)>,
+    closes_owed_set: BTreeSet<(NodeId, MemberId)>,
+    // Owed closes are being made (`close_owed_members`).
+    closing_owed: bool,
     // The credit the loop carries for a run's output it holds (`carried`).
     carried: carried::Carried,
     // Members refused while a repair's return was applied, each read as the
@@ -592,6 +600,9 @@ impl NamespaceWriter {
             applying: None,
             tail: None,
             release_owed: None,
+            closes_owed: std::collections::VecDeque::new(),
+            closes_owed_set: BTreeSet::new(),
+            closing_owed: false,
             carried: carried::Carried::default(),
             refused_in_batch: BTreeSet::new(),
             given_back: Vec::new(),
@@ -674,6 +685,11 @@ impl NamespaceWriter {
     // are credited in (`release_held`).
     pub fn release_owed(&self) -> Option<(u64, NodeId)> {
         self.release_owed
+    }
+
+    // Whether a member's close waits for a release that stands (`close`).
+    pub fn closes_owed(&self) -> bool {
+        !self.closes_owed.is_empty()
     }
 
     // The writer of the volume a file under `root` lies on, when the job
@@ -1220,7 +1236,10 @@ impl NamespaceWriter {
     }
 
     // Nothing more will arrive for the member. The tree closes it and says
-    // so, and the owning object hears it as a closed volume.
+    // so, and the owning object hears it as a closed volume. While a release
+    // of held bytes stands (`release_owed`), bytes held for the member may
+    // still go down: the close is owed, and is made once no release stands
+    // (`close_owed_members`).
     pub fn close(
         &mut self,
         tree: &mut Tree,
@@ -1230,6 +1249,12 @@ impl NamespaceWriter {
         member: MemberId,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
+        if self.release_owed.is_some() {
+            if self.closes_owed_set.insert((node, member)) {
+                self.closes_owed.push_back((node, member));
+            }
+            return Ok(());
+        }
         self.shut(tree, builder, segments, node, member, out)?;
         self.release_held(tree, builder, segments, out)
     }
@@ -3026,6 +3051,44 @@ impl NamespaceWriter {
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
         self.release_owed = self.release_held_paid(tree, builder, segments, &mut false, out)?;
+        self.close_owed_members(tree, builder, segments, out)
+    }
+
+    // The closes owed while a release stood (`close`), made oldest first
+    // once none stands: each member is shut and what that lets go of is
+    // released, until a release stands again and the rest stay owed. A
+    // close made here that ends in another release does not come back in.
+    fn close_owed_members(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        if self.closing_owed {
+            return Ok(());
+        }
+        self.closing_owed = true;
+        let closed = self.close_owed_in_turn(tree, builder, segments, out);
+        self.closing_owed = false;
+        closed
+    }
+
+    fn close_owed_in_turn(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        while self.release_owed.is_none() {
+            let Some((node, member)) = self.closes_owed.pop_front() else {
+                break;
+            };
+            self.closes_owed_set.remove(&(node, member));
+            self.shut(tree, builder, segments, node, member, out)?;
+            self.release_owed = self.release_held_paid(tree, builder, segments, &mut false, out)?;
+        }
         Ok(())
     }
 
@@ -3052,7 +3115,7 @@ impl NamespaceWriter {
         self.release_owed = self.with_credit(tree, into, Some(credit), |writer, tree| {
             writer.release_held_paid(tree, builder, segments, &mut true, out)
         })?;
-        Ok(())
+        self.close_owed_members(tree, builder, segments, out)
     }
 
     // The same for a return's tail, which never stands the loop still for a
