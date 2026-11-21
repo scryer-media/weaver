@@ -4,7 +4,9 @@
 use async_graphql::{ComplexObject, Enum, InputObject, SimpleObject};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use weaver_server_core::history::timeline::HistoryTimelineQueries;
 use weaver_server_core::history::timeline::JOB_EVENT_DOWNLOAD_FINALIZATION_MARKER;
+use weaver_server_core::jobs::JobsDownloadSummaryPersistenceQueries;
 use weaver_server_core::{
     AsyncOperationState, AsyncOperationTargetState,
     HistoryDeleteOperationSummary as CoreHistoryDeleteOperationSummary,
@@ -16,20 +18,26 @@ use crate::jobs::release_display::{
     ReleaseDisplayCache, ReleaseDisplayInput, release_display_info,
 };
 use crate::jobs::types::{
-    Attribute, DuplicateSummaryInfo, JobStatusGql, ParsedRelease, PreparedQueueFilter,
-    QueueAttention, QueueFilterInput, QueueItemState, matches_attribute_filter_prepared,
+    Attribute, DuplicateSummaryInfo, JobOutcome, JobStatusGql, ParsedRelease, PreparedQueueFilter,
+    ProtocolGql, QueueAttention, QueueFilterInput, QueueItemState,
+    matches_attribute_filter_prepared,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
 #[graphql(complex)]
 pub struct HistoryItem {
     pub id: u64,
+    #[serde(default)]
+    pub protocol: ProtocolGql,
     pub job_hash: Option<String>,
     pub name: String,
     pub display_title: String,
     pub original_title: String,
     pub parsed_release: ParsedRelease,
     pub state: QueueItemState,
+    /// How the job ended, a partial delivery as its own value.
+    #[serde(default)]
+    pub outcome: Option<JobOutcome>,
     pub error: Option<String>,
     pub progress_percent: f64,
     pub total_bytes: u64,
@@ -40,7 +48,15 @@ pub struct HistoryItem {
     pub health: u32,
     pub has_password: bool,
     pub category: Option<String>,
+    /// The job's public attributes. GraphQL answers them through the
+    /// `attributes` resolver, which adds the RSS link for an admin.
+    #[graphql(skip)]
     pub attributes: Vec<Attribute>,
+    /// The job's RSS link and id as stored, for `rss_link_for_caller`
+    /// alone: never answered or serialised as they are.
+    #[graphql(skip)]
+    #[serde(skip)]
+    pub rss_link: Vec<(String, String)>,
     pub client_request_id: Option<String>,
     pub output_dir: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -67,6 +83,17 @@ pub struct HistoryItem {
 
 #[ComplexObject]
 impl HistoryItem {
+    /// The job's attributes. An RSS job's item link and id are among them
+    /// for an admin only.
+    async fn attributes(&self, ctx: &async_graphql::Context<'_>) -> Vec<Attribute> {
+        crate::jobs::types::attributes_for_caller(ctx, &self.attributes, &self.rss_link)
+    }
+
+    /// The job's tags, in tag order.
+    async fn tags(&self, ctx: &async_graphql::Context<'_>) -> async_graphql::Result<Vec<String>> {
+        crate::tags::tags_of(ctx, self.id).await
+    }
+
     /// The files Weaver gave a name other than their full one, each with its
     /// full name. Empty when every file carries its full name.
     async fn full_file_names(&self) -> Vec<FullFileName> {
@@ -317,8 +344,13 @@ pub struct HistoryPageInput {
     /// with no category at all, which is how "uncategorised" is asked for
     /// without a second field.
     pub categories: Option<Vec<String>>,
+    /// Keep only rows whose job carries this tag; the empty string keeps rows
+    /// whose job carries none.
+    pub tag: Option<String>,
     pub sort_field: Option<HistorySortField>,
     pub sort_direction: Option<HistorySortDirection>,
+    /// Keep only rows that finished at or after this epoch second.
+    pub completed_since_epoch_sec: Option<i64>,
 }
 
 #[derive(Debug, Clone, SimpleObject)]
@@ -495,6 +527,8 @@ pub enum EventKind {
     ExtractionFailed,
     // An archive given up on as an archive for one of its members.
     ArchiveDemoted,
+    // A recovery set the job ended with that bound no file.
+    RecoverySetUnused,
     MoveToCompleteStarted,
     MoveToCompleteFinished,
     SegmentRetryScheduled,
@@ -552,6 +586,7 @@ impl std::str::FromStr for EventKind {
             "ExtractionComplete" => Ok(Self::ExtractionComplete),
             "ExtractionFailed" => Ok(Self::ExtractionFailed),
             "ArchiveDemoted" => Ok(Self::ArchiveDemoted),
+            "RecoverySetUnused" => Ok(Self::RecoverySetUnused),
             "MoveToCompleteStarted" => Ok(Self::MoveToCompleteStarted),
             "MoveToCompleteFinished" => Ok(Self::MoveToCompleteFinished),
             "SegmentRetryScheduled" => Ok(Self::SegmentRetryScheduled),
@@ -758,12 +793,14 @@ fn history_item_from_display(
     };
     HistoryItem {
         id: row.job_id,
+        protocol: row.protocol.into(),
         job_hash: row.job_hash.as_ref().map(hex::encode),
         name: row.name.clone(),
         display_title,
         original_title,
         parsed_release,
         state,
+        outcome: JobOutcome::of_history(&row.status),
         error: row.error_message.clone(),
         progress_percent,
         total_bytes: row.total_bytes,
@@ -777,6 +814,7 @@ fn history_item_from_display(
         ),
         category: row.category.clone(),
         attributes,
+        rss_link: weaver_server_core::history::attributes::rss_link_pairs(metadata),
         client_request_id,
         output_dir: row.output_dir.clone(),
         created_at: secs_to_datetime(row.created_at),

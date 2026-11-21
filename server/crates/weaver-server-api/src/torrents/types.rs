@@ -1,0 +1,1106 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+use async_graphql::{ComplexObject, Context, Enum, InputObject, Result, SimpleObject};
+use weaver_server_core::auth::CallerScope;
+use weaver_server_core::jobs::handle::HoldOrigin;
+use weaver_server_core::jobs::ids::JobId;
+use weaver_server_core::proxies::{TorrentRouteFault, TorrentScope};
+use weaver_server_core::settings::Seeding;
+use weaver_server_core::torrents::net::Exposure;
+use weaver_server_core::torrents::service::{
+    ScheduleSeeding, SeedingLevels, TorrentRoute, TorrentView, updates::TorrentChanges,
+};
+use weaver_server_core::torrents::sessions::TorrentRouteReason;
+use weaver_server_core::torrents::sessions::{PortMapped, PortmapProtocol, PortmapTransport};
+use weaver_server_core::torrents::status::Stated;
+use weaver_server_core::torrents::{
+    ConnectionKind, Encryption, FetchPhase, FilePriority, NamedBy, PeerInfo, PeerSourceFlag,
+    TorrentState, TorrentTracker, TorrentVersion, TrackerStatus, UnpackEnd, UnpackResult,
+    UnpackedFile, redacted_tracker_url,
+};
+
+use crate::networking::ResolvedBy;
+use crate::settings::types::{
+    SeedTimeCountingGql, SeedingActionGql, SeedingGoalModeGql, SeedingPolicyInput,
+    SeedingPolicySettings, SettingLevelGql,
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+#[graphql(name = "TorrentState")]
+pub enum TorrentStateGql {
+    Queued,
+    FetchingMetadata,
+    CheckingFiles,
+    Downloading,
+    Stalled,
+    Seeding,
+    Paused,
+    Stopped,
+    Moving,
+    NeedsCertificate,
+    CheckingResumeData,
+    FilesMissing,
+}
+
+impl From<TorrentState> for TorrentStateGql {
+    fn from(state: TorrentState) -> Self {
+        match state {
+            TorrentState::Queued => Self::Queued,
+            TorrentState::FetchingMetadata => Self::FetchingMetadata,
+            TorrentState::CheckingFiles => Self::CheckingFiles,
+            TorrentState::Downloading => Self::Downloading,
+            TorrentState::Stalled => Self::Stalled,
+            TorrentState::Seeding => Self::Seeding,
+            TorrentState::Paused => Self::Paused,
+            TorrentState::Stopped => Self::Stopped,
+            TorrentState::Moving => Self::Moving,
+            TorrentState::NeedsCertificate => Self::NeedsCertificate,
+            TorrentState::CheckingResumeData => Self::CheckingResumeData,
+            TorrentState::FilesMissing => Self::FilesMissing,
+        }
+    }
+}
+
+/// Which hashes verify a torrent's pieces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+#[graphql(name = "TorrentVersion")]
+pub enum TorrentVersionGql {
+    V1,
+    V2,
+    Hybrid,
+}
+
+impl From<TorrentVersion> for TorrentVersionGql {
+    fn from(version: TorrentVersion) -> Self {
+        match version {
+            TorrentVersion::V1 => Self::V1,
+            TorrentVersion::V2 => Self::V2,
+            TorrentVersion::Hybrid => Self::Hybrid,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+#[graphql(name = "TrackerStatus")]
+pub enum TrackerStatusGql {
+    NotContacted,
+    Working,
+    NotWorking,
+    TrackerError,
+    Unreachable,
+    Disabled,
+}
+
+impl From<TrackerStatus> for TrackerStatusGql {
+    fn from(status: TrackerStatus) -> Self {
+        match status {
+            TrackerStatus::NotContacted => Self::NotContacted,
+            TrackerStatus::Working => Self::Working,
+            TrackerStatus::NotWorking => Self::NotWorking,
+            TrackerStatus::TrackerError => Self::TrackerError,
+            TrackerStatus::Unreachable => Self::Unreachable,
+            TrackerStatus::Disabled => Self::Disabled,
+        }
+    }
+}
+
+/// The level each of a torrent's seeding terms comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, SimpleObject)]
+#[graphql(name = "SeedingLevels")]
+pub struct SeedingLevelsGql {
+    pub ratio_goal: SettingLevelGql,
+    pub seed_time_goal_minutes: SettingLevelGql,
+    pub inactive_goal_minutes: SettingLevelGql,
+    pub mode: SettingLevelGql,
+    pub action: SettingLevelGql,
+    pub seed_time_counting: SettingLevelGql,
+    pub upload_cap: SettingLevelGql,
+}
+
+impl From<SeedingLevels> for SeedingLevelsGql {
+    fn from(levels: SeedingLevels) -> Self {
+        Self {
+            ratio_goal: levels.ratio_goal.into(),
+            seed_time_goal_minutes: levels.seed_time_goal_minutes.into(),
+            inactive_goal_minutes: levels.inactive_goal_minutes.into(),
+            mode: levels.mode.into(),
+            action: levels.action.into(),
+            seed_time_counting: levels.seed_time_counting.into(),
+            upload_cap: levels.upload_cap.into(),
+        }
+    }
+}
+
+/// The seeding terms a torrent is held to, each resolved over its levels.
+#[derive(Clone, Copy, Debug, PartialEq, SimpleObject)]
+#[graphql(name = "SeedingTerms")]
+pub struct SeedingTermsGql {
+    pub ratio_goal: Option<f32>,
+    pub seed_time_goal_minutes: Option<u32>,
+    pub inactive_goal_minutes: Option<u32>,
+    pub mode: SeedingGoalModeGql,
+    pub action: SeedingActionGql,
+    pub seed_time_counting: SeedTimeCountingGql,
+    /// The upload cap in bytes per second; absent is none.
+    pub upload_cap: Option<u64>,
+    pub levels: SeedingLevelsGql,
+}
+
+impl SeedingTermsGql {
+    fn of(seeding: Seeding, upload_cap: Option<u64>, levels: SeedingLevels) -> Self {
+        Self {
+            ratio_goal: seeding.ratio_goal,
+            seed_time_goal_minutes: seeding.seed_time_goal_minutes,
+            inactive_goal_minutes: seeding.inactive_goal_minutes,
+            mode: seeding.mode.into(),
+            action: seeding.action.into(),
+            seed_time_counting: seeding.seed_time_counting.into(),
+            upload_cap,
+            levels: levels.into(),
+        }
+    }
+}
+
+/// The torrents the schedule's pause leaves seeding under one tracker rule.
+#[derive(Clone, Debug, SimpleObject)]
+#[graphql(name = "ScheduleSeeding")]
+pub struct ScheduleSeedingGql {
+    pub host_pattern: String,
+    pub torrents: u32,
+}
+
+impl From<ScheduleSeeding> for ScheduleSeedingGql {
+    fn from(seeding: ScheduleSeeding) -> Self {
+        Self {
+            host_pattern: seeding.host_pattern,
+            torrents: seeding.torrents,
+        }
+    }
+}
+
+/// What runs on a torrent route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+#[graphql(name = "TorrentRouteScope")]
+pub enum TorrentRouteScopeGql {
+    Default,
+    Category,
+    TrackerRule,
+}
+
+/// A scope that runs on a torrent route: the default, or a category or
+/// tracker rule by its id and name.
+#[derive(Clone, Debug, SimpleObject)]
+#[graphql(name = "TorrentRouteUse")]
+pub struct TorrentRouteUseGql {
+    pub scope: TorrentRouteScopeGql,
+    pub id: Option<u32>,
+    pub name: Option<String>,
+}
+
+impl From<(TorrentScope, Option<String>)> for TorrentRouteUseGql {
+    fn from((scope, name): (TorrentScope, Option<String>)) -> Self {
+        let (scope, id) = match scope {
+            TorrentScope::Default => (TorrentRouteScopeGql::Default, None),
+            TorrentScope::Category(id) => (TorrentRouteScopeGql::Category, Some(id)),
+            TorrentScope::TrackerRule(id) => (TorrentRouteScopeGql::TrackerRule, Some(id)),
+        };
+        Self { scope, id, name }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+#[graphql(name = "PortMapper")]
+pub enum PortMapperGql {
+    Upnp,
+    NatPmp,
+    /// PCP from a global IPv6 address.
+    PcpIpv6,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+#[graphql(name = "PortMapProtocol")]
+pub enum PortMapProtocolGql {
+    Tcp,
+    Udp,
+}
+
+/// A gateway's last word on one port mapping.
+#[derive(Clone, Debug, SimpleObject)]
+#[graphql(name = "TorrentPortMapping")]
+pub struct TorrentPortMappingGql {
+    pub mapper: PortMapperGql,
+    pub protocol: PortMapProtocolGql,
+    pub local_port: u16,
+    /// The port the gateway forwards; none once the mapping failed or was
+    /// removed.
+    pub external_port: Option<u16>,
+    /// The gateway's external address, when it told it.
+    pub gateway_address: Option<String>,
+    pub error: Option<String>,
+}
+
+impl From<PortMapped> for TorrentPortMappingGql {
+    fn from(mapped: PortMapped) -> Self {
+        Self {
+            mapper: match mapped.transport {
+                PortmapTransport::Upnp => PortMapperGql::Upnp,
+                PortmapTransport::NatPmp => PortMapperGql::NatPmp,
+                PortmapTransport::PcpIpv6 => PortMapperGql::PcpIpv6,
+            },
+            protocol: match mapped.protocol {
+                PortmapProtocol::Tcp => PortMapProtocolGql::Tcp,
+                PortmapProtocol::Udp => PortMapProtocolGql::Udp,
+            },
+            local_port: mapped.local_port,
+            external_port: mapped.external_port,
+            gateway_address: mapped.external_ip.map(|ip| ip.to_string()),
+            error: mapped.error,
+        }
+    }
+}
+
+/// What a torrent session shows the trackers and peers it reaches.
+#[derive(Clone, Debug, PartialEq, Eq, SimpleObject)]
+#[graphql(name = "TorrentExposure")]
+pub struct TorrentExposureGql {
+    /// Who resolves the names the session looks up.
+    pub resolved_by: Option<ResolvedBy>,
+    /// The address a tracker sees; none until one is known.
+    pub address: Option<String>,
+    /// The port announced; 0 when none is.
+    pub announced_port: u16,
+    pub inbound: bool,
+    pub udp_trackers: bool,
+    pub dht: bool,
+    pub utp: bool,
+}
+
+impl From<Exposure> for TorrentExposureGql {
+    fn from(exposure: Exposure) -> Self {
+        Self {
+            resolved_by: exposure.resolved_by.map(Into::into),
+            address: exposure.address.map(|ip| ip.to_string()),
+            announced_port: exposure.announced_port,
+            inbound: exposure.inbound,
+            udp_trackers: exposure.udp_trackers,
+            dht: exposure.dht,
+            utp: exposure.utp,
+        }
+    }
+}
+
+/// A torrent route and whether peers can reach its session.
+#[derive(Clone, Debug, SimpleObject)]
+#[graphql(name = "TorrentRoute")]
+pub struct TorrentRouteGql {
+    pub key: String,
+    pub scopes: Vec<TorrentRouteUseGql>,
+    /// Whether its session is open.
+    pub open: bool,
+    /// The address its session listens on, TCP's, and uTP's when `utp`.
+    pub listen_address: Option<String>,
+    pub utp: bool,
+    pub mappings: Vec<TorrentPortMappingGql>,
+    /// Its address as the internet sees it.
+    pub external_addresses: Vec<String>,
+    /// Why its session is closed: held closed, its leg down, or not opened
+    /// as nothing has asked it to open. None while open.
+    pub reason: Option<TorrentRouteReasonGql>,
+    /// The cause behind `reason`, as the server logged it, when there is one.
+    pub detail: Option<String>,
+    /// Who resolves the names its sessions look up.
+    pub resolved_by: Option<ResolvedBy>,
+    /// What its session shows trackers and peers, while open.
+    pub exposure: Option<TorrentExposureGql>,
+}
+
+/// Why a torrent is in its state, as the server states it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+#[graphql(name = "TorrentStatedReason")]
+pub enum TorrentStatedReasonGql {
+    /// Kept from starting for room on its disk, as a usenet job waits.
+    DiskSpace,
+    /// Kept from starting by a disk that never holds what it has left to
+    /// fetch, as a usenet job is.
+    DiskTooSmall,
+    /// A write found no room: it fetches nothing and keeps seeding.
+    DiskFull,
+    /// Stopped once its seeding goal was met.
+    GoalMet,
+    /// Held in the queue by the operator's pause.
+    HeldManual,
+    /// Held in the queue by the schedule.
+    HeldScheduled,
+    /// Held in the queue while a speed test runs.
+    HeldSpeedTest,
+    /// Fetching its metadata from its trackers.
+    FetchTrackers,
+    /// Fetching its metadata from its trackers, the DHT and local discovery.
+    FetchDiscovery,
+    /// Fetching its metadata, with no peers named that may serve it.
+    FetchWaiting,
+}
+
+impl From<Stated> for TorrentStatedReasonGql {
+    fn from(stated: Stated) -> Self {
+        match stated {
+            Stated::DiskSpace => Self::DiskSpace,
+            Stated::DiskTooSmall => Self::DiskTooSmall,
+            Stated::DiskFull => Self::DiskFull,
+            Stated::GoalMet => Self::GoalMet,
+            Stated::Held(HoldOrigin::Manual) => Self::HeldManual,
+            Stated::Held(HoldOrigin::Scheduled) => Self::HeldScheduled,
+            Stated::Held(HoldOrigin::SpeedTest) => Self::HeldSpeedTest,
+            Stated::Fetching(FetchPhase::Trackers) => Self::FetchTrackers,
+            Stated::Fetching(FetchPhase::Discovery) => Self::FetchDiscovery,
+            Stated::Fetching(FetchPhase::Waiting) => Self::FetchWaiting,
+        }
+    }
+}
+
+/// Why a torrent route's session is unavailable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+#[graphql(name = "TorrentRouteReason")]
+pub enum TorrentRouteReasonGql {
+    NotAskedToOpen,
+    LegDown,
+    LegMissing,
+    LegRevoked,
+    QuotaSilenced,
+    TorrentsDisabled,
+    TorrentRouteLegs,
+    TorrentRouteDirectFallback,
+    TorrentRouteRungs,
+    LegOpenFailed,
+    StateDirectoryFailed,
+    ListenPortUnavailable,
+    ListenPortBindFailed,
+    SessionStateUnreadable,
+    SessionBuildFailed,
+    UtpUnavailable,
+    BlocklistFailed,
+    SessionLimit,
+    Opening,
+}
+
+impl From<TorrentRouteReason> for TorrentRouteReasonGql {
+    fn from(reason: TorrentRouteReason) -> Self {
+        match reason {
+            TorrentRouteReason::NotAskedToOpen => Self::NotAskedToOpen,
+            TorrentRouteReason::LegDown => Self::LegDown,
+            TorrentRouteReason::LegMissing => Self::LegMissing,
+            TorrentRouteReason::LegRevoked => Self::LegRevoked,
+            TorrentRouteReason::QuotaSilenced => Self::QuotaSilenced,
+            TorrentRouteReason::TorrentsDisabled => Self::TorrentsDisabled,
+            TorrentRouteReason::RouteBroken(fault) => match fault {
+                TorrentRouteFault::Legs => Self::TorrentRouteLegs,
+                TorrentRouteFault::DirectFallback => Self::TorrentRouteDirectFallback,
+                TorrentRouteFault::Rungs => Self::TorrentRouteRungs,
+            },
+            TorrentRouteReason::LegOpenFailed => Self::LegOpenFailed,
+            TorrentRouteReason::StateDirectoryFailed => Self::StateDirectoryFailed,
+            TorrentRouteReason::ListenPortUnavailable => Self::ListenPortUnavailable,
+            TorrentRouteReason::ListenPortBindFailed => Self::ListenPortBindFailed,
+            TorrentRouteReason::SessionStateUnreadable => Self::SessionStateUnreadable,
+            TorrentRouteReason::SessionBuildFailed => Self::SessionBuildFailed,
+            TorrentRouteReason::UtpUnavailable => Self::UtpUnavailable,
+            TorrentRouteReason::BlocklistFailed => Self::BlocklistFailed,
+            TorrentRouteReason::SessionLimit => Self::SessionLimit,
+            TorrentRouteReason::Opening => Self::Opening,
+        }
+    }
+}
+
+impl From<TorrentRoute> for TorrentRouteGql {
+    fn from(route: TorrentRoute) -> Self {
+        let reason = route.down.or_else(|| match &route.session {
+            Some(session) => session.held.clone(),
+            None => Some(TorrentRouteReason::NotAskedToOpen.into()),
+        });
+        // A previous session can outlive the route becoming unavailable.
+        let session = route.session.filter(|_| reason.is_none());
+        let detail = reason
+            .as_ref()
+            .and_then(|failure| failure.detail.clone())
+            .filter(|detail| !detail.is_empty());
+        let reason = reason.map(|failure| failure.reason.into());
+        Self {
+            key: route.key.as_str().to_owned(),
+            scopes: route.scopes.into_iter().map(Into::into).collect(),
+            open: session.is_some(),
+            listen_address: session
+                .as_ref()
+                .and_then(|session| session.listen)
+                .map(|addr| addr.to_string()),
+            utp: session.as_ref().is_some_and(|session| session.utp),
+            mappings: session
+                .as_ref()
+                .map(|session| session.mappings.iter().cloned().map(Into::into).collect())
+                .unwrap_or_default(),
+            exposure: session
+                .as_ref()
+                .and_then(|session| session.exposure)
+                .map(Into::into),
+            external_addresses: session
+                .map(|session| session.external.iter().map(ToString::to_string).collect())
+                .unwrap_or_default(),
+            reason,
+            detail,
+            resolved_by: route.names.map(Into::into),
+        }
+    }
+}
+
+/// How eagerly a torrent file is fetched: qBittorrent's four levels. An
+/// ignored file is not fetched; padding is always ignored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+#[graphql(name = "TorrentFilePriority")]
+pub enum TorrentFilePriorityGql {
+    Ignored,
+    Normal,
+    High,
+    Maximum,
+}
+
+impl From<FilePriority> for TorrentFilePriorityGql {
+    fn from(priority: FilePriority) -> Self {
+        match priority {
+            FilePriority::Ignored => Self::Ignored,
+            FilePriority::Normal => Self::Normal,
+            FilePriority::High => Self::High,
+            FilePriority::Maximum => Self::Maximum,
+        }
+    }
+}
+
+impl From<TorrentFilePriorityGql> for FilePriority {
+    fn from(priority: TorrentFilePriorityGql) -> Self {
+        match priority {
+            TorrentFilePriorityGql::Ignored => Self::Ignored,
+            TorrentFilePriorityGql::Normal => Self::Normal,
+            TorrentFilePriorityGql::High => Self::High,
+            TorrentFilePriorityGql::Maximum => Self::Maximum,
+        }
+    }
+}
+
+/// A file's level, by its index in the torrent.
+#[derive(Debug, InputObject)]
+pub struct TorrentFilePriorityInput {
+    pub index: u32,
+    pub priority: TorrentFilePriorityGql,
+}
+
+#[derive(Clone, Debug, SimpleObject)]
+#[graphql(name = "TorrentFile")]
+pub struct TorrentFileGql {
+    pub index: u32,
+    pub path: String,
+    pub length: u64,
+    /// Whether the file is fetched at all: its level is above ignored.
+    pub selected: bool,
+    pub priority: TorrentFilePriorityGql,
+    /// The share of the file in hand, from 0 to 1.
+    pub progress: f64,
+}
+
+#[derive(Clone, Debug, SimpleObject)]
+#[graphql(name = "TorrentTracker", complex)]
+pub struct TorrentTrackerGql {
+    pub tier: u32,
+    #[graphql(skip)]
+    pub url: String,
+    pub source: TrackerSourceGql,
+    pub status: TrackerStatusGql,
+    /// An announce to it is in flight.
+    pub updating: bool,
+    pub message: Option<String>,
+    pub seeders: Option<u32>,
+    pub leechers: Option<u32>,
+    /// The completed downloads it last counted.
+    pub downloaded: Option<u32>,
+    /// The peers its last answer named.
+    pub peers: Option<u32>,
+    /// Announces to it that failed in a row.
+    pub fails: u32,
+    pub last_announce_ms: Option<i64>,
+    pub next_announce_ms: Option<i64>,
+    /// The earliest the tracker takes the next announce.
+    pub min_announce_ms: Option<i64>,
+    /// Who resolves its host; none for an address.
+    pub resolved_by: Option<ResolvedBy>,
+}
+
+impl From<TorrentTracker> for TorrentTrackerGql {
+    fn from(tracker: TorrentTracker) -> Self {
+        Self {
+            tier: tracker.tier,
+            url: tracker.url,
+            source: tracker.named_by.into(),
+            status: tracker.status.into(),
+            updating: tracker.updating,
+            message: tracker.message,
+            seeders: tracker.seeders,
+            leechers: tracker.leechers,
+            downloaded: tracker.downloaded,
+            peers: tracker.peers,
+            fails: tracker.fails,
+            last_announce_ms: tracker.last_announce_ms,
+            next_announce_ms: tracker.next_announce_ms,
+            min_announce_ms: tracker.min_announce_ms,
+            resolved_by: tracker.resolved_by.map(Into::into),
+        }
+    }
+}
+
+#[ComplexObject]
+impl TorrentTrackerGql {
+    /// The tracker's whole URL to a caller that may change trackers;
+    /// its scheme, host and port to one that only reads.
+    async fn url(&self, ctx: &Context<'_>) -> Result<String> {
+        Ok(if ctx.data::<CallerScope>()?.can_control() {
+            self.url.clone()
+        } else {
+            redacted_tracker_url(&self.url)
+        })
+    }
+}
+
+/// Who named a tracker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+#[graphql(name = "TrackerSource")]
+pub enum TrackerSourceGql {
+    Torrent,
+    Operator,
+}
+
+impl From<NamedBy> for TrackerSourceGql {
+    fn from(named_by: NamedBy) -> Self {
+        match named_by {
+            NamedBy::Torrent => Self::Torrent,
+            NamedBy::Operator => Self::Operator,
+        }
+    }
+}
+
+/// A tracker in a torrent's list, by tier.
+#[derive(Clone, Debug, InputObject)]
+#[graphql(name = "TorrentTrackerInput")]
+pub struct TorrentTrackerInput {
+    pub tier: u32,
+    pub url: String,
+}
+
+/// How a torrent's unpacking came out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+#[graphql(name = "TorrentUnpackResult")]
+pub enum TorrentUnpackResultGql {
+    /// Everything it would deliver is beside the torrent's files.
+    Whole,
+    /// Some of it is; the reason says what is short.
+    Part,
+    /// Nothing usable was delivered.
+    Failed,
+    /// The unpacking refused the torrent's files.
+    Refused,
+}
+
+impl From<UnpackResult> for TorrentUnpackResultGql {
+    fn from(result: UnpackResult) -> Self {
+        match result {
+            UnpackResult::Whole => Self::Whole,
+            UnpackResult::Part => Self::Part,
+            UnpackResult::Failed => Self::Failed,
+            UnpackResult::Refused => Self::Refused,
+        }
+    }
+}
+
+/// A torrent's unpacking, once over. It is the unpacking's own: the
+/// torrent's state, history and counters never read it.
+#[derive(Clone, Debug, SimpleObject)]
+#[graphql(name = "TorrentUnpacking", complex)]
+pub struct TorrentUnpackingGql {
+    #[graphql(skip)]
+    pub id: u64,
+    pub result: TorrentUnpackResultGql,
+    /// Why it is short of whole.
+    pub reason: Option<String>,
+}
+
+#[ComplexObject]
+impl TorrentUnpackingGql {
+    /// The files it placed beside the torrent's own, which the torrent's
+    /// file list shows after them: read from the torrent's row and disk
+    /// only when asked for.
+    async fn files(&self, ctx: &Context<'_>) -> Result<Vec<TorrentUnpackedFileGql>> {
+        Ok(super::service(ctx)?
+            .unpacked_files(JobId(self.id))
+            .await
+            .map_err(super::mutation::action_error)?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+}
+
+/// A file a torrent's unpacking placed beside the torrent's own: no piece
+/// of the torrent, so it has no index, level or progress of its own.
+#[derive(Clone, Debug, SimpleObject)]
+#[graphql(name = "TorrentUnpackedFile")]
+pub struct TorrentUnpackedFileGql {
+    pub path: String,
+    pub length: u64,
+}
+
+impl From<UnpackedFile> for TorrentUnpackedFileGql {
+    fn from(file: UnpackedFile) -> Self {
+        Self {
+            path: file.name,
+            length: file.length,
+        }
+    }
+}
+
+#[derive(Clone, Debug, SimpleObject)]
+#[graphql(complex)]
+pub struct Torrent {
+    pub id: u64,
+    pub name: String,
+    /// Its v1 hash; empty when it has none.
+    pub infohash: String,
+    pub infohash_v2: Option<String>,
+    /// Which hashes verify its pieces, once its metainfo is in hand.
+    pub version: Option<TorrentVersionGql>,
+    pub state: TorrentStateGql,
+    /// Why the torrent is in its state, when the server states the reason
+    /// itself.
+    pub stated: Option<TorrentStatedReasonGql>,
+    /// Why the torrent is in its state, in free words (an error, an
+    /// unpacking refusal), when that is the reason. While its route holds
+    /// it, the cause behind `routeReason`, when one is known.
+    pub detail: Option<String>,
+    /// Why its route holds it, while its state comes from that hold.
+    pub route_reason: Option<TorrentRouteReasonGql>,
+    pub category: Option<String>,
+    /// Its job's tags, in tag order.
+    pub tags: Vec<String>,
+    pub private: bool,
+    pub forced: bool,
+    pub progress: f64,
+    pub total_bytes: u64,
+    pub have_bytes: u64,
+    pub uploaded_bytes: u64,
+    pub downloaded_bytes: u64,
+    pub ratio: f64,
+    pub download_bps: u64,
+    pub upload_bps: u64,
+    /// The torrent's own upload limit in bytes per second; null is
+    /// unlimited and 0 closed.
+    pub upload_limit: Option<u64>,
+    /// The torrent's own download limit in bytes per second; null is
+    /// unlimited and 0 closed.
+    pub download_limit: Option<u64>,
+    pub eta_seconds: Option<u64>,
+    pub peers: u32,
+    pub seeds: u32,
+    pub leechers: u32,
+    /// The most peers a torrent connects to.
+    pub max_peers: u32,
+    /// The swarm's seeds and leechers as its trackers last counted them.
+    pub swarm_seeds: Option<u32>,
+    pub swarm_leechers: Option<u32>,
+    /// Seconds until the next tracker announce.
+    pub reannounce_seconds: Option<u64>,
+    /// Seconds spent running in a session.
+    pub active_seconds: u64,
+    /// Seconds spent complete and seeding, in all.
+    pub seeding_seconds: u64,
+    /// Seconds of the current unbroken seeding run.
+    pub consecutive_seeding_seconds: u64,
+    pub download_avg_bps: u64,
+    pub upload_avg_bps: u64,
+    /// Bytes received and thrown away this run: pieces that failed their
+    /// check, and blocks that arrived when already in hand. Counts from zero
+    /// each time the torrent starts.
+    pub wasted_bytes: u64,
+    /// The last time a complete copy was in reach.
+    pub last_seen_complete_ms: Option<i64>,
+    pub piece_count: Option<u32>,
+    pub piece_size: Option<u64>,
+    /// The pieces in hand, verified.
+    pub pieces_have: Option<u32>,
+    pub created_by: Option<String>,
+    pub created_at_ms: Option<i64>,
+    pub comment: Option<String>,
+    pub added_at_ms: i64,
+    pub completed_at_ms: Option<i64>,
+    pub storage_dir: Option<String>,
+    /// The folder that holds the torrent's output.
+    pub save_path: Option<String>,
+    /// The seeding goal still to meet; absent once it is met.
+    pub seeding_left: Option<String>,
+    /// The torrent's own seeding terms; absent when it inherits every one.
+    pub seeding_override: Option<SeedingPolicySettings>,
+    /// The seeding terms in effect.
+    pub seeding_policy: SeedingTermsGql,
+    /// The host pattern of the tracker rule the torrent is under, when it is.
+    pub tracker_rule: Option<String>,
+    /// Whether its archives are extracted.
+    pub unpack: bool,
+    /// The torrent's own unpack; absent inherits.
+    pub unpack_override: Option<bool>,
+    pub route: Option<String>,
+    pub files: Vec<TorrentFileGql>,
+    /// Whether its pieces are fetched in order.
+    pub sequential: bool,
+    /// Whether each file's first and last pieces are fetched first.
+    pub first_last_piece_first: bool,
+    pub trackers: Vec<TorrentTrackerGql>,
+    #[graphql(skip)]
+    pub unpack_end: Option<UnpackEnd>,
+}
+
+#[ComplexObject]
+impl Torrent {
+    /// How its unpacking came out, once over; absent while it runs, and for
+    /// a torrent with nothing to unpack.
+    async fn unpacking(&self) -> Option<TorrentUnpackingGql> {
+        self.unpack_end.as_ref().map(|end| TorrentUnpackingGql {
+            id: self.id,
+            result: end.result.into(),
+            reason: end.why.clone(),
+        })
+    }
+}
+
+/// What a `torrentUpdates` push carries.
+#[derive(Clone, Debug, SimpleObject)]
+#[graphql(name = "TorrentChanges")]
+pub struct TorrentChangesGql {
+    /// The first push: `torrents` is every followed torrent.
+    pub full_update: bool,
+    /// The torrents that changed or came.
+    pub torrents: Vec<Torrent>,
+    /// The ids of the torrents gone since the last push.
+    pub removed_ids: Vec<u64>,
+}
+
+impl From<TorrentChanges> for TorrentChangesGql {
+    fn from(changes: TorrentChanges) -> Self {
+        Self {
+            full_update: changes.full_update,
+            torrents: changes.torrents.into_iter().map(Into::into).collect(),
+            removed_ids: changes.removed.into_iter().map(|job_id| job_id.0).collect(),
+        }
+    }
+}
+
+impl From<TorrentView> for Torrent {
+    fn from(view: TorrentView) -> Self {
+        let one_file = view.is_one_file();
+        Self::of(view, one_file)
+    }
+}
+
+impl Torrent {
+    /// `view`, its save path read as one file named as the torrent is when
+    /// `one_file`: for a view read without its files.
+    pub(crate) fn of(view: TorrentView, one_file: bool) -> Self {
+        let files = view
+            .files
+            .iter()
+            .map(|file| TorrentFileGql {
+                index: file.index,
+                path: file.path.clone(),
+                length: file.length,
+                selected: file.selected(),
+                priority: file.priority.into(),
+                progress: view.file_progress(file),
+            })
+            .collect();
+        let (save_path, _) = view.paths_as(one_file);
+        Self {
+            id: view.job_id.0,
+            name: view.name,
+            infohash: view.infohash_v1.clone().unwrap_or_default(),
+            infohash_v2: view.infohash_v2.clone(),
+            version: view.version.map(Into::into),
+            state: view.state.into(),
+            stated: view.stated.map(Into::into),
+            detail: view.detail,
+            route_reason: view.route_reason.map(Into::into),
+            category: view.category,
+            tags: view.tags,
+            private: view.private,
+            forced: view.forced,
+            progress: view.progress,
+            total_bytes: view.total_bytes,
+            have_bytes: view.have_bytes,
+            uploaded_bytes: view.uploaded_bytes,
+            downloaded_bytes: view.downloaded_bytes,
+            ratio: view.ratio,
+            download_bps: view.download_bps,
+            upload_bps: view.upload_bps,
+            upload_limit: view.upload_limit,
+            download_limit: view.download_limit,
+            eta_seconds: view.eta_seconds,
+            peers: view.peers,
+            seeds: view.seeds,
+            leechers: view.leechers,
+            max_peers: view.max_peers,
+            swarm_seeds: view.swarm_seeds,
+            swarm_leechers: view.swarm_leechers,
+            reannounce_seconds: view.reannounce_seconds,
+            active_seconds: view.active_seconds,
+            seeding_seconds: view.seeding_seconds,
+            consecutive_seeding_seconds: view.consecutive_seeding_seconds,
+            download_avg_bps: view.download_avg_bps,
+            upload_avg_bps: view.upload_avg_bps,
+            wasted_bytes: view.wasted_bytes,
+            last_seen_complete_ms: view.last_seen_complete_ms,
+            piece_count: view.pieces.map(|pieces| pieces.count),
+            piece_size: view.pieces.map(|pieces| pieces.size),
+            pieces_have: view.pieces.map(|pieces| pieces.have),
+            created_by: view.created_by,
+            created_at_ms: view.created_at_ms,
+            comment: view.comment,
+            added_at_ms: view.added_at_ms,
+            completed_at_ms: view.completed_at_ms,
+            storage_dir: view.storage_dir,
+            save_path: (!save_path.is_empty()).then_some(save_path),
+            seeding_left: view.seeding_left,
+            seeding_override: view.seeding_override.map(Into::into),
+            seeding_policy: SeedingTermsGql::of(
+                view.seeding_policy,
+                view.upload_cap,
+                view.seeding_levels,
+            ),
+            tracker_rule: view.tracker_rule,
+            unpack: view.unpack,
+            unpack_override: view.unpack_override,
+            route: view.route,
+            files,
+            sequential: view.sequential,
+            first_last_piece_first: view.first_last_piece_first,
+            trackers: view.trackers.into_iter().map(Into::into).collect(),
+            unpack_end: view.unpack_end,
+        }
+    }
+}
+
+/// The transport a peer connection runs over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+#[graphql(name = "PeerConnection")]
+pub enum PeerConnectionGql {
+    Tcp,
+    Utp,
+}
+
+impl From<ConnectionKind> for PeerConnectionGql {
+    fn from(kind: ConnectionKind) -> Self {
+        match kind {
+            ConnectionKind::Tcp => Self::Tcp,
+            ConnectionKind::Utp => Self::Utp,
+        }
+    }
+}
+
+/// What of a peer connection is encrypted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+#[graphql(name = "PeerEncryption")]
+pub enum PeerEncryptionGql {
+    None,
+    /// The handshake only.
+    HeaderOnly,
+    /// All of it.
+    #[graphql(name = "RC4")]
+    Rc4,
+}
+
+/// A source that named a peer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+#[graphql(name = "PeerSource")]
+pub enum PeerSourceGql {
+    Tracker,
+    Dht,
+    Pex,
+    Lsd,
+    /// The torrent's own list.
+    ResumeData,
+    /// The peer connected to us.
+    Incoming,
+}
+
+impl From<PeerSourceFlag> for PeerSourceGql {
+    fn from(source: PeerSourceFlag) -> Self {
+        match source {
+            PeerSourceFlag::Tracker => Self::Tracker,
+            PeerSourceFlag::Dht => Self::Dht,
+            PeerSourceFlag::Pex => Self::Pex,
+            PeerSourceFlag::Lsd => Self::Lsd,
+            PeerSourceFlag::ResumeData => Self::ResumeData,
+            PeerSourceFlag::Incoming => Self::Incoming,
+        }
+    }
+}
+
+/// What a connection shows of a peer and of us.
+#[derive(Clone, Copy, Debug, SimpleObject)]
+#[graphql(name = "TorrentPeerFlags")]
+pub struct TorrentPeerFlagsGql {
+    /// We want pieces the peer has.
+    pub interesting: bool,
+    /// We choke the peer.
+    pub choked: bool,
+    /// The peer wants pieces we have.
+    pub remote_interested: bool,
+    /// The peer chokes us.
+    pub remote_choked: bool,
+    pub snubbed: bool,
+    pub optimistic_unchoke: bool,
+    pub seed: bool,
+    pub upload_only: bool,
+    pub on_parole: bool,
+    pub holepunched: bool,
+}
+
+/// One connection to a peer of a torrent.
+#[derive(Clone, Debug, SimpleObject)]
+#[graphql(name = "TorrentPeer")]
+pub struct TorrentPeerGql {
+    /// The peer's address and port.
+    pub address: String,
+    pub client: String,
+    /// The peer id, hex.
+    pub peer_id: String,
+    pub connection: PeerConnectionGql,
+    /// We made the connection.
+    pub outgoing: bool,
+    pub encryption: PeerEncryptionGql,
+    pub flags: TorrentPeerFlagsGql,
+    /// Every source that named the peer.
+    pub sources: Vec<PeerSourceGql>,
+    /// How many of the torrent's pieces the peer has.
+    pub pieces: u32,
+    pub progress: f64,
+    pub download_bps: u64,
+    pub upload_bps: u64,
+    /// Bytes over this connection.
+    pub downloaded_bytes: u64,
+    pub uploaded_bytes: u64,
+}
+
+impl From<PeerInfo> for TorrentPeerGql {
+    fn from(peer: PeerInfo) -> Self {
+        let flags = peer.flags;
+        Self {
+            address: peer.addr.to_string(),
+            client: peer.client,
+            peer_id: peer.peer_id.as_string(),
+            connection: peer.connection.into(),
+            outgoing: peer.outgoing,
+            encryption: match peer.encryption {
+                Encryption::None => PeerEncryptionGql::None,
+                Encryption::HeaderOnly => PeerEncryptionGql::HeaderOnly,
+                Encryption::Rc4 => PeerEncryptionGql::Rc4,
+            },
+            flags: TorrentPeerFlagsGql {
+                interesting: flags.interesting,
+                choked: flags.choked,
+                remote_interested: flags.remote_interested,
+                remote_choked: flags.remote_choked,
+                snubbed: flags.snubbed,
+                optimistic_unchoke: flags.optimistic_unchoke,
+                seed: flags.seed,
+                upload_only: flags.upload_only,
+                on_parole: flags.on_parole,
+                holepunched: flags.holepunched,
+            },
+            sources: peer.sources.iter().map(PeerSourceGql::from).collect(),
+            pieces: peer.pieces,
+            progress: peer.progress,
+            download_bps: peer.download_rate,
+            upload_bps: peer.upload_rate,
+            downloaded_bytes: peer.downloaded,
+            uploaded_bytes: peer.uploaded,
+        }
+    }
+}
+
+/// A torrent to add: its metainfo file, base64, or a magnet link.
+#[derive(Debug, InputObject)]
+pub struct SubmitTorrentInput {
+    pub metainfo_base64: Option<String>,
+    pub magnet: Option<String>,
+    pub category: Option<String>,
+    #[graphql(default)]
+    pub paused: bool,
+    #[graphql(default)]
+    pub forced: bool,
+    pub seeding: Option<SeedingPolicyInput>,
+    /// Whether its archives are extracted; absent inherits.
+    pub unpack: Option<bool>,
+    /// The tags its job is added with.
+    #[graphql(default)]
+    pub tags: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A torrent held for its files missing reads as FILES_MISSING.
+    #[test]
+    fn a_torrent_missing_its_files_reads_as_files_missing() {
+        let state = TorrentStateGql::from(TorrentState::FilesMissing);
+        assert_eq!(state, TorrentStateGql::FilesMissing);
+        assert_eq!(
+            async_graphql::InputType::to_value(&state),
+            async_graphql::Value::Enum(async_graphql::Name::new("FILES_MISSING"))
+        );
+    }
+
+    // Each connection kind reads in GraphQL as its key in the kinds' name
+    // table, upper case: TCP, UTP.
+    #[test]
+    fn a_connection_kind_reads_as_its_key_upper_case() {
+        for &kind in ConnectionKind::ALL {
+            assert_eq!(
+                async_graphql::InputType::to_value(&PeerConnectionGql::from(kind)),
+                async_graphql::Value::Enum(async_graphql::Name::new(
+                    kind.names().key.to_ascii_uppercase()
+                )),
+                "{kind:?}"
+            );
+        }
+    }
+
+    // Each reason the server states reads in GraphQL as its own name, one
+    // per reason.
+    #[test]
+    fn a_stated_reason_reads_as_its_name() {
+        let names = Stated::ALL.map(|stated| {
+            match async_graphql::InputType::to_value(&TorrentStatedReasonGql::from(stated)) {
+                async_graphql::Value::Enum(name) => name.to_string(),
+                other => panic!("{other:?}"),
+            }
+        });
+        assert_eq!(
+            names,
+            [
+                "DISK_SPACE",
+                "DISK_TOO_SMALL",
+                "DISK_FULL",
+                "GOAL_MET",
+                "HELD_MANUAL",
+                "HELD_SCHEDULED",
+                "HELD_SPEED_TEST",
+                "FETCH_TRACKERS",
+                "FETCH_DISCOVERY",
+                "FETCH_WAITING",
+            ]
+        );
+    }
+}

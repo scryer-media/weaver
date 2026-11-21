@@ -3,8 +3,8 @@
 
 use super::*;
 
-use crate::operations::metrics::Par3MetricsSnapshot;
 use crate::{DownloadState, JobId, PostState, RunState};
+use weaver_server_base::operations::metrics::Par3MetricsSnapshot;
 
 fn upsert_raw_point_for_test(db: &Database, point: RawMetricsHistoryPoint) {
     let datastore = db.datastore();
@@ -271,6 +271,7 @@ fn rollup_metrics_history_point_deserializes_legacy_metric_array_lengths() {
 
 fn job_info(job_id: u64, status: JobStatus) -> JobInfo {
     JobInfo {
+        protocol: crate::jobs::Protocol::Nzb,
         job_id: JobId(job_id),
         job_hash: None,
         name: format!("job-{job_id}"),
@@ -304,6 +305,8 @@ fn job_info(job_id: u64, status: JobStatus) -> JobInfo {
         download_wait_reason: None,
         download_retry_at_epoch_ms: None,
         server_attribution: Vec::new(),
+        disk_need_bytes: None,
+        disk_free_bytes: None,
         created_at_epoch_ms: 0.0,
     }
 }

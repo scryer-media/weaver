@@ -25,6 +25,24 @@ fn base_job(status: JobStatus) -> weaver_server_core::JobInfo {
             weaver_server_core::RunState::Active,
             None,
         ),
+        JobStatus::FetchingMetadata | JobStatus::Stalled => (
+            weaver_server_core::DownloadState::Downloading,
+            weaver_server_core::PostState::Idle,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
+        JobStatus::CheckingFiles => (
+            weaver_server_core::DownloadState::Checking,
+            weaver_server_core::PostState::Idle,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
+        JobStatus::Seeding => (
+            weaver_server_core::DownloadState::Complete,
+            weaver_server_core::PostState::Completed,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
         JobStatus::Checking => (
             weaver_server_core::DownloadState::Checking,
             weaver_server_core::PostState::Idle,
@@ -99,6 +117,7 @@ fn base_job(status: JobStatus) -> weaver_server_core::JobInfo {
         ),
     };
     weaver_server_core::JobInfo {
+        protocol: weaver_server_core::Protocol::Nzb,
         job_id: JobId(42),
         job_hash: None,
         name: "Facade.Test.Release".to_string(),
@@ -137,6 +156,8 @@ fn base_job(status: JobStatus) -> weaver_server_core::JobInfo {
         error,
         download_wait_reason: None,
         download_retry_at_epoch_ms: None,
+        disk_need_bytes: None,
+        disk_free_bytes: None,
         created_at_epoch_ms: 1_700_000_000_000.0,
         server_attribution: Vec::new(),
     }
@@ -619,6 +640,28 @@ fn queue_filter_supports_exact_attribute_matches() {
         ..QueueFilterInput::default()
     };
     assert!(!matches_queue_filter(&item, Some(&misses)));
+}
+
+// A torrent's phases reach the queue as themselves, the same states the
+// history outcome names, while a pause still reads as paused.
+#[test]
+fn torrent_phases_project_one_to_one() {
+    for (status, expected) in [
+        (
+            JobStatus::FetchingMetadata,
+            QueueItemState::FetchingMetadata,
+        ),
+        (JobStatus::CheckingFiles, QueueItemState::CheckingFiles),
+        (JobStatus::Seeding, QueueItemState::Seeding),
+        (JobStatus::Stalled, QueueItemState::Stalled),
+    ] {
+        let job = base_job(status.clone());
+        assert_eq!(queue_item_from_job(&job).state, expected);
+        assert_eq!(QueueItemState::from(&status), expected);
+        let mut paused = base_job(status);
+        paused.run_state = weaver_server_core::RunState::Paused;
+        assert_eq!(queue_item_from_job(&paused).state, QueueItemState::Paused);
+    }
 }
 
 #[test]

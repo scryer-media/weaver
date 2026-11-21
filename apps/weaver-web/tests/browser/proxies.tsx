@@ -1,20 +1,22 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { StrictMode } from "react";
+import { StrictMode, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { MemoryRouter } from "react-router";
 import { Client, Provider, fetchExchange } from "urql";
 import { TranslateContext } from "@/lib/context/translate-context";
 import en from "@/lib/i18n/locales/en";
 import { PasswordManagersKeptOut } from "@/lib/password-manager";
-import type { ProxyKind, ProxyResolver } from "@/lib/proxies";
+import type { ProxyKind } from "@/lib/proxies";
+import { NextDataContext, useDnsProfileReads, type NextData } from "@/next/data/next-data";
 import type { NetworkingData } from "@/next/features/networking/data";
 import { PoolsPage } from "@/next/features/networking/PoolsPage";
 import { RoutesPage } from "@/next/features/networking/RoutesPage";
 import { nextEn } from "@/next/i18n/en";
 import { ProxiesPanel } from "@/next/pages/settings/panels/ProxiesPanel";
 import { SettingsShellProvider } from "@/next/pages/settings/framework";
+import { SearchRegistry } from "@/next/pages/settings/search";
 import "@/next/fonts.css";
 import "@/next/theme.css";
 
@@ -23,14 +25,14 @@ import "@/next/theme.css";
 const SECRETS = ["username", "password", "privateKey", "passphrase", "presharedKey"] as const;
 type Stored = {
   id: number; name: string; kind: ProxyKind; enabled: boolean; host: string; port: number;
-  resolver: ProxyResolver; dnsServers: string[]; tunnelAddresses: string[]; peerPublicKey: string | null; mtu: number;
-  keepaliveSeconds: number | null; timeoutSeconds: number; hostKeyFingerprint: string | null;
+  dnsServers: string[]; dnsProfileId: number; tunnelAddresses: string[]; peerPublicKey: string | null; mtu: number;
+  keepaliveSeconds: number | null; timeoutSeconds: number; hostKeyFingerprint: string | null; natpmp: boolean; forwardedPort: number | null;
   secrets: Partial<Record<(typeof SECRETS)[number], string>>;
 };
 const stored = (id: number, name: string, kind: ProxyKind, port: number, extra: Partial<Stored> = {}): Stored => ({
   id, name, kind, enabled: true, host: `${name.toLowerCase()}.fixture.invalid`, port,
-  resolver: kind === "WIRE_GUARD" ? "WEAVER" : "PROXY", dnsServers: [], tunnelAddresses: [], peerPublicKey: null, mtu: 1280, keepaliveSeconds: 25, timeoutSeconds: 30,
-  hostKeyFingerprint: null, secrets: {}, ...extra,
+  dnsServers: [], dnsProfileId: 0, tunnelAddresses: [], peerPublicKey: null, mtu: 1280, keepaliveSeconds: 25, timeoutSeconds: 30,
+  hostKeyFingerprint: null, natpmp: false, forwardedPort: null, secrets: {}, ...extra,
 });
 const profiles: Stored[] = [
   stored(1, "Amsterdam", "WIRE_GUARD", 51820, {
@@ -69,18 +71,29 @@ function graphql(name: string, variables: Record<string, unknown>) {
     const saved: Stored = {
       id: existing?.id ?? Math.max(0, ...profiles.map((profile) => profile.id)) + 1,
       name: input.name as string, kind: input.kind as ProxyKind, enabled: input.enabled as boolean,
-      host: input.host as string, port: input.port as number, resolver: input.resolver as ProxyResolver,
-      dnsServers: input.dnsServers as string[],
+      host: input.host as string, port: input.port as number, dnsServers: input.dnsServers as string[],
+      dnsProfileId: (input.dnsProfileId as number | undefined) ?? existing?.dnsProfileId ?? 0,
       tunnelAddresses: input.tunnelAddresses as string[], peerPublicKey: input.peerPublicKey as string | null,
       mtu: input.mtu as number, keepaliveSeconds: input.keepaliveSeconds as number,
-      timeoutSeconds: input.timeoutSeconds as number, hostKeyFingerprint: existing?.hostKeyFingerprint ?? null, secrets,
+      timeoutSeconds: input.timeoutSeconds as number, hostKeyFingerprint: existing?.hostKeyFingerprint ?? null,
+      natpmp: input.natpmp as boolean, forwardedPort: input.forwardedPort as number | null, secrets,
     };
     if (existing) Object.assign(existing, saved);
     else profiles.push(saved);
     return { data: { saveProxyProfile: { id: saved.id } } };
   }
-  if (name === "Networking") return { data: { ...pools, egressInterfaces: egresses, proxyProfiles: profiles.map(view) } };
+  if (name === "Networking" || name === "DraftRoute") return { data: { ...pools, egressInterfaces: egresses, proxyProfiles: profiles.map(view) } };
   if (name === "TestVia") return testVia(variables);
+  // As `dnsProfiles(kind:)` answers: System, then a route profile a proxy never offers, or a proxy name profile.
+  if (name === "DnsProfileChoices") {
+    return { data: { dnsProfiles: [
+      { id: 0, name: "System", who: "SYSTEM", trust: "AS_SENT", systemFallback: false },
+      { id: 3, name: "Checked", who: "WEAVER", trust: "VALIDATE", systemFallback: false },
+    ] } };
+  }
+  if (name === "DnsProfileNames") {
+    return { data: { dnsProfiles: [{ id: 0, name: "System" }, { id: 6, name: "Proxy names" }] } };
+  }
   if (name === "DeleteProxyProfile") {
     const id = variables.id as number;
     // As the daemon does: a pool's member stays until it leaves the pool.
@@ -97,7 +110,7 @@ function graphql(name: string, variables: Record<string, unknown>) {
  * so whatever it carries or is fails at it.
  */
 const egress = (id: number, name: string, enabled: boolean) => ({
-  id, name, bindingKind: "SYSTEM", interfaceName: null, sourceAddress: null, enabled, maxDownloadSpeed: 0, health: "UP", reason: null,
+  id, name, bindingKind: "SYSTEM", interfaceName: null, sourceAddress: null, enabled, downloadBps: null, uploadBps: null, health: "UP", reason: null,
 });
 const egresses = [egress(4, "Backup", false), egress(0, "System", true), egress(5, "Fiber", true)];
 const SILENT = 2;
@@ -148,6 +161,7 @@ function testVia(variables: Record<string, unknown>) {
         // Given a host, a path says how it was resolved: by DNS servers asked through the proxy on top, else by this machine.
         const resolution = target && {
           host: target.host, resolvedBy: proxyId === null ? "HOST" : "PROXY_SERVERS", proxyId, dnsServers: proxyId === null ? [] : ["192.0.2.53"],
+          wire: proxyId === null ? null : "TLS", answeredBy: proxyId === null ? null : "192.0.2.53", trust: proxyId === null ? null : "VALIDATED",
           addresses: ["192.0.2.80", "192.0.2.81"], cached: false, connectedAddress: "192.0.2.81", error: null,
         };
         return { ...shown, success: true, code, sourceAddress: "192.0.2.10:40000", connectMillis: 12.5, resolution };
@@ -184,6 +198,11 @@ window.fetch = async (request, init) => {
 };
 const dictionary: Record<string, string> = { ...en, ...nextEn };
 const shell = {
-  search: "", actionsRef: { current: null }, setFlags: () => {}, controlsHost: document.getElementById("controls"),
+  search: "", actionsRef: { current: null }, setFlags: () => {}, controlsHost: document.getElementById("controls"), registry: new SearchRegistry(),
 };
-createRoot(document.getElementById("root")!).render(<StrictMode><Provider value={client}><TranslateContext.Provider value={{ t: (key, values) => Object.entries(values ?? {}).reduce((text, [name, value]) => text.replaceAll(`{{${name}}}`, String(value)), dictionary[key] ?? key), uiLanguage: "eng", selectedLanguage: { code: "eng", label: "English" }, setLanguagePreference: () => {} }}><MemoryRouter><SettingsShellProvider {...shell}><main className="mx-auto flex max-w-[1400px] flex-col p-8"><PasswordManagersKeptOut value>{screen}</PasswordManagersKeptOut></main></SettingsShellProvider></MemoryRouter></TranslateContext.Provider></Provider></StrictMode>);
+createRoot(document.getElementById("root")!).render(<StrictMode><Provider value={client}><TranslateContext.Provider value={{ t: (key, values) => Object.entries(values ?? {}).reduce((text, [name, value]) => text.replaceAll(`{{${name}}}`, String(value)), dictionary[key] ?? key), uiLanguage: "eng", selectedLanguage: { code: "eng", label: "English" }, setLanguagePreference: () => {} }}><MemoryRouter><SettingsShellProvider {...shell}><main className="mx-auto flex max-w-[1400px] flex-col p-8"><DnsReads><PasswordManagersKeptOut value>{screen}</PasswordManagersKeptOut></DnsReads></main></SettingsShellProvider></MemoryRouter></TranslateContext.Provider></Provider></StrictMode>);
+
+/* Holds the DNS profile reads as NextDataProvider does, for the editors that offer them. */
+function DnsReads({ children }: { children: ReactNode }) {
+  return <NextDataContext.Provider value={useDnsProfileReads() as NextData}>{children}</NextDataContext.Provider>;
+}

@@ -11,7 +11,7 @@ repository.workspace = true
 default = []
 # A direct route dialer, and server configs built on it, for other crates'
 # tests that have no route of their own. Never enabled in a product build.
-test-support = []
+test-support = ["weaver-tunnel/test-support"]
 
 [dependencies]
 async-trait = "0.1"

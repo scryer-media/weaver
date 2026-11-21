@@ -4,6 +4,9 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use weaver_server_core::auth::repository::AuthRepositoryQueries;
+use weaver_server_core::settings::persistence::SettingsPersistenceQueries;
+use weaver_server_core::settings::queries::SettingsQueries;
 
 use tracing::{error, info, warn};
 
@@ -388,6 +391,10 @@ mod tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock};
+    use weaver_server_core::auth::repository::AuthRepositoryQueries;
+    use weaver_server_core::settings::persistence::SettingsPersistenceQueries;
+    use weaver_server_core::settings::queries::SettingsQueries;
+    use weaver_server_core::settings::service::SettingsServiceQueries;
 
     use super::*;
 
@@ -432,6 +439,9 @@ mod tests {
 
     fn empty_config() -> Config {
         Config {
+            upload_cap: None,
+            seeding: None,
+            torrent: Default::default(),
             data_dir: String::new(),
             hardware_profile: None,
             intermediate_dir: None,
@@ -439,7 +449,7 @@ mod tests {
             servers: Vec::new(),
             categories: Vec::new(),
             retry: None,
-            max_download_speed: None,
+            bandwidth: Default::default(),
             cleanup_after_extract: None,
             delete_failed_job_files: None,
             history_retention_days: None,

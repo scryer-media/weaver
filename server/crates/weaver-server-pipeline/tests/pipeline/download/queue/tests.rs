@@ -1,0 +1,360 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+use weaver_server_base::jobs::ids::{JobId, MessageId, NzbFileId, SegmentId};
+
+use super::*;
+
+mod equivalence;
+
+fn make_work(job_id: u64, file_index: u32, seg: u32, priority: u32) -> DownloadWork {
+    DownloadWork {
+        counters: None,
+        segment_id: SegmentId {
+            file_id: NzbFileId {
+                job_id: JobId(job_id),
+                file_index,
+            },
+            segment_number: seg,
+        },
+        message_id: MessageId::new(&format!("msg-{job_id}-{file_index}-{seg}@example.com")),
+        groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
+        priority,
+        byte_estimate: 768_000,
+        retry_count: 0,
+        is_recovery: false,
+        completion_critical: false,
+        exclude_servers: weaver_nntp::ServerSet::from([]),
+        avoid_server: None,
+    }
+}
+
+#[test]
+fn empty_queue() {
+    let mut q = DownloadQueue::new();
+    assert!(q.is_empty());
+    assert_eq!(q.len(), 0);
+    assert!(q.pop().is_none());
+}
+
+#[test]
+fn excluded_work_count_tracks_push_pop_and_bulk_removal() {
+    let mut q = DownloadQueue::new();
+    let mut excluded = make_work(1, 0, 0, 10);
+    excluded.exclude_servers = weaver_nntp::ServerSet::from([0]);
+    q.push(excluded);
+    q.push(make_work(1, 0, 1, 20));
+    let mut other_job = make_work(2, 0, 0, 30);
+    other_job.exclude_servers = weaver_nntp::ServerSet::from([1]);
+    q.push(other_job);
+    assert_eq!(q.excluded_work_count(), 2);
+
+    let first = q.pop().unwrap();
+    assert_eq!(first.exclude_servers, vec![0]);
+    assert_eq!(q.excluded_work_count(), 1);
+
+    let removed = q.extract_matching(|work| work.segment_id.file_id.job_id == JobId(2));
+    assert_eq!(removed.len(), 1);
+    assert_eq!(q.excluded_work_count(), 0);
+    assert_eq!(q.len(), 1);
+
+    let mut again = make_work(3, 0, 0, 5);
+    again.exclude_servers = weaver_nntp::ServerSet::from([2]);
+    q.push(again);
+    assert_eq!(
+        q.extract_matching(|work| work.segment_id.file_id.job_id == JobId(3))
+            .len(),
+        1
+    );
+    assert_eq!(q.excluded_work_count(), 0);
+
+    let mut last = make_work(4, 0, 0, 5);
+    last.exclude_servers = weaver_nntp::ServerSet::from([3]);
+    q.push(last);
+    q.drain_all();
+    assert_eq!(q.excluded_work_count(), 0);
+}
+
+#[test]
+fn remap_servers_carries_tried_servers_by_identity() {
+    let mut q = DownloadQueue::new();
+    let mut excluded = make_work(1, 0, 0, 10);
+    excluded.exclude_servers = weaver_nntp::ServerSet::from([4, 7]);
+    q.push(excluded);
+    let mut gone = make_work(1, 0, 1, 20);
+    gone.exclude_servers = weaver_nntp::ServerSet::from([5]);
+    q.push(gone);
+    q.push(make_work(1, 0, 2, 30));
+    assert_eq!(q.excluded_work_count(), 2);
+
+    // Server 7 moves to 0, server 4 to 1, server 5 leaves the pool.
+    let old: Vec<u32> = (0..8).collect();
+    let remap = weaver_nntp::ServerRemap::between(&old, &[7, 4, 0, 1]);
+    q.remap_servers(&remap);
+    assert_eq!(q.excluded_work_count(), 1);
+    assert_eq!(q.len(), 3);
+    let sets: Vec<_> = std::iter::from_fn(|| q.pop())
+        .map(|work| work.exclude_servers.to_vec())
+        .collect();
+    assert!(sets.contains(&vec![0, 1]));
+    assert_eq!(sets.iter().filter(|set| set.is_empty()).count(), 2);
+}
+
+#[test]
+fn remap_servers_moves_hints_and_drops_a_departed_one() {
+    let mut q = DownloadQueue::new();
+    let mut moved = make_work(1, 0, 0, 10);
+    moved.avoid_server = Some(3);
+    q.push(moved);
+    let mut departed = make_work(1, 0, 1, 20);
+    departed.avoid_server = Some(1);
+    q.push(departed);
+    assert_eq!(q.excluded_work_count(), 2);
+
+    let remap = weaver_nntp::ServerRemap::between(&[0u32, 1, 2, 3], &[3, 0, 2]);
+    q.remap_servers(&remap);
+    assert_eq!(q.excluded_work_count(), 1);
+    let hints: Vec<_> = std::iter::from_fn(|| q.pop())
+        .map(|work| work.avoid_server)
+        .collect();
+    assert!(hints.contains(&Some(0)));
+    assert!(hints.contains(&None));
+}
+
+#[test]
+fn priority_ordering() {
+    let mut q = DownloadQueue::new();
+    q.push(make_work(1, 0, 0, 100));
+    q.push(make_work(1, 0, 1, 10));
+    q.push(make_work(1, 0, 2, 50));
+
+    let first = q.pop().unwrap();
+    assert_eq!(first.priority, 10);
+
+    let second = q.pop().unwrap();
+    assert_eq!(second.priority, 50);
+
+    let third = q.pop().unwrap();
+    assert_eq!(third.priority, 100);
+
+    assert!(q.pop().is_none());
+}
+
+#[test]
+fn completion_critical_work_precedes_ordinary_priority() {
+    let mut q = DownloadQueue::new();
+    q.push(make_work(1, 0, 0, 0));
+    let mut critical = make_work(1, 1, 0, 1000);
+    critical.is_recovery = true;
+    critical.completion_critical = true;
+    q.push(critical);
+
+    let first = q.pop().unwrap();
+    assert!(first.completion_critical);
+    assert_eq!(first.priority, 1000);
+    assert!(!q.pop().unwrap().completion_critical);
+}
+
+#[test]
+fn compatibility_does_not_mix_critical_and_optional_recovery() {
+    let mut q = DownloadQueue::new();
+    let mut critical = make_work(1, 1, 0, 1000);
+    critical.is_recovery = true;
+    critical.completion_critical = true;
+    let mut optional = make_work(1, 1, 1, 1000);
+    optional.is_recovery = true;
+    q.push(optional);
+    q.push(critical);
+
+    let first = q.pop().unwrap();
+    assert!(first.completion_critical);
+    assert!(
+        q.pop_next_matching_in_class(first.completion_critical, |work| {
+            work.completion_critical == first.completion_critical
+        })
+        .is_none()
+    );
+    assert_eq!(q.len(), 1);
+}
+
+#[test]
+fn class_constrained_pop_preserves_constant_time_queue_class_counts() {
+    let mut q = DownloadQueue::new();
+    let ordinary = make_work(1, 0, 0, 0);
+    let mut critical = make_work(1, 1, 0, 1000);
+    critical.is_recovery = true;
+    critical.completion_critical = true;
+    q.push(ordinary);
+    q.push(critical);
+
+    assert_ne!(q.len_in_class(true), 0);
+    assert_ne!(q.len_in_class(false), 0);
+    let selected = q
+        .pop_first_matching(|work| !work.completion_critical)
+        .expect("ordinary work must be selectable behind the critical heap head");
+    assert!(!selected.completion_critical);
+    assert_ne!(q.len_in_class(true), 0);
+    assert_eq!(q.len_in_class(false), 0);
+
+    q.push(make_work(1, 2, 0, 0));
+    let extracted = q.extract_matching(|work| work.completion_critical);
+    assert_eq!(extracted.len(), 1);
+    assert_eq!(q.len_in_class(true), 0);
+    assert_ne!(q.len_in_class(false), 0);
+
+    q.drain_all();
+    assert_eq!(q.len_in_class(true), 0);
+    assert_eq!(q.len_in_class(false), 0);
+}
+
+#[test]
+fn class_constrained_head_pop_does_not_scan_past_incompatible_work() {
+    let mut q = DownloadQueue::new();
+    q.push(make_work(1, 0, 0, 10));
+    q.push(make_work(1, 0, 1, 20));
+
+    assert!(
+        q.pop_next_matching_in_class(false, |work| work.segment_id.segment_number == 1)
+            .is_none(),
+        "ordinary dispatch must remain a heap-head operation"
+    );
+    assert_eq!(q.pop().unwrap().segment_id.segment_number, 0);
+    assert_eq!(q.pop().unwrap().segment_id.segment_number, 1);
+}
+
+#[test]
+fn rar_unlock_reprioritize_matching_uses_rank_inside_priority_band() {
+    let mut q = DownloadQueue::new();
+    q.push(make_work(1, 4, 0, 14));
+    q.push(make_work(1, 2, 0, 12));
+    q.push(make_work(1, 99, 0, 3));
+    q.push(make_work(1, 3, 0, 13));
+
+    q.reprioritize_matching_with_rank(|work| match work.segment_id.file_id.file_index {
+        2 => Some((3, Some(0))),
+        3 => Some((3, Some(1))),
+        4 => Some((3, Some(2))),
+        _ => None,
+    });
+
+    let popped = [
+        q.pop().unwrap().segment_id.file_id.file_index,
+        q.pop().unwrap().segment_id.file_id.file_index,
+        q.pop().unwrap().segment_id.file_id.file_index,
+        q.pop().unwrap().segment_id.file_id.file_index,
+    ];
+    assert_eq!(popped, [2, 3, 4, 99]);
+}
+
+#[test]
+fn mixed_priorities() {
+    let mut q = DownloadQueue::new();
+
+    // PAR2 index file: priority 0.
+    q.push(make_work(1, 0, 0, 0));
+    // First RAR volume: priority 1.
+    q.push(make_work(1, 1, 0, 1));
+    // Second RAR volume: priority 11.
+    q.push(make_work(1, 2, 0, 11));
+    // PAR2 recovery: priority 1000.
+    q.push(make_work(1, 3, 0, 1000));
+
+    let items: Vec<_> = std::iter::from_fn(|| q.pop()).collect();
+    assert_eq!(items.len(), 4);
+    assert_eq!(items[0].priority, 0); // PAR2 index
+    assert_eq!(items[1].priority, 1); // First RAR
+    assert_eq!(items[2].priority, 11); // Second RAR
+    assert_eq!(items[3].priority, 1000); // PAR2 recovery
+}
+
+// The per-file walk behind the index bootstrap's answer is made once for a
+// queue and a list of index files, and again only after an item came or
+// went or the list is another one. The steps are counted by the lookup the
+// walk is given.
+#[test]
+fn an_unchanged_queue_answers_the_bootstrap_without_a_step_per_file() {
+    use crate::pipeline::download::worker::queued_files_may_pass;
+
+    const FILES: u32 = 3_000;
+    let mut q = DownloadQueue::new();
+    for file_index in 1..FILES {
+        q.push(make_work(1, file_index, 0, 10));
+    }
+    let steps = std::cell::Cell::new(0usize);
+    let ask = |q: &mut DownloadQueue, bootstrap: &Arc<[u32]>| {
+        steps.set(0);
+        let answer = q.bootstrap_answer(bootstrap, |q| {
+            queued_files_may_pass(FILES as usize, bootstrap, q.len(), |file_index| {
+                steps.set(steps.get() + 1);
+                q.queued_count_for_file(NzbFileId {
+                    job_id: JobId(1),
+                    file_index,
+                }) as usize
+            })
+        });
+        (answer.is_ok(), steps.get())
+    };
+
+    // The index, file 0, has nothing queued: every queued file is held.
+    let index: Arc<[u32]> = Arc::from(vec![0u32]);
+    assert_eq!(ask(&mut q, &index), (false, FILES as usize));
+    assert_eq!(ask(&mut q, &index), (false, 0));
+    assert_eq!(ask(&mut q, &index), (false, 0));
+
+    // An item taken, and one put back in its place, are each a change.
+    let taken = q.pop().unwrap();
+    assert_eq!(ask(&mut q, &index), (false, FILES as usize));
+    q.push(taken);
+    assert_eq!(ask(&mut q, &index), (false, FILES as usize));
+    assert_eq!(ask(&mut q, &index), (false, 0));
+
+    // A re-key changes no file's count.
+    q.rank_ordinary_file(
+        NzbFileId {
+            job_id: JobId(1),
+            file_index: 7,
+        },
+        5,
+        0,
+    );
+    assert_eq!(ask(&mut q, &index), (false, 0));
+
+    // Another list is asked afresh, and stops at its first queued file.
+    let other: Arc<[u32]> = Arc::from(vec![1u32]);
+    assert_eq!(ask(&mut q, &other), (true, 2));
+    assert_eq!(ask(&mut q, &other), (true, 0));
+
+    // The index's own article queued lets work pass.
+    q.push(make_work(1, 0, 0, 10));
+    assert_eq!(ask(&mut q, &index), (true, 1));
+    assert_eq!(ask(&mut q, &index), (true, 0));
+}
+
+#[test]
+fn queued_count_per_file_tracks_push_pop_removal_and_drain() {
+    let mut q = DownloadQueue::new();
+    let file0 = NzbFileId {
+        job_id: JobId(1),
+        file_index: 0,
+    };
+    let file1 = NzbFileId {
+        job_id: JobId(1),
+        file_index: 1,
+    };
+    q.push(make_work(1, 0, 0, 10));
+    q.push(make_work(1, 0, 1, 10));
+    q.push(make_work(1, 1, 0, 10));
+    assert_eq!(q.queued_count_for_file(file0), 2);
+    assert_eq!(q.queued_count_for_file(file1), 1);
+
+    q.pop();
+    assert_eq!(
+        q.queued_count_for_file(file0) + q.queued_count_for_file(file1),
+        2
+    );
+
+    let drained = q.drain_all();
+    assert_eq!(drained.len(), 2);
+    assert_eq!(q.queued_count_for_file(file0), 0);
+    assert_eq!(q.queued_count_for_file(file1), 0);
+}

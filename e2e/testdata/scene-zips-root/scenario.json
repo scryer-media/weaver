@@ -1,0 +1,18 @@
+{
+  "slug": "scene-zips-root",
+  "title": "E2E.Test.Lantern.Beacon.No.02.2026.COMiC.eBook-TESTGRP",
+  "description": "A scene zip-with-diz release at the root of the posting: five stored zips, each holding one volume of an old-style RAR4 set beside a file_id.diz and an .nfo. The inner set unpacks to four end files, the first spanning three volumes. The job must end Complete with every end file whole and no zip or RAR volume delivered.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "Lantern.Beacon.001.2026.pdf": "6b0ee6c62c87b5310d5925cb5496594ca5f9be79f4049f33578ce3356987ee84",
+    "Lantern.Beacon.002.2026.pdf": "6bd7fa24df8513d7f4456a40bb198eccf58ebb73c1c18f1f547de80137480e88",
+    "Lantern.Beacon.003.2026.pdf": "f4099af4793a51e748eaf9812950ad3467f8c68bbbe21d5d6ae2014621e2e024",
+    "Lantern.Beacon.Cover.2026.jpg": "82894915ef45046535a78aaac56263f0d6ccb7b26de76cdf8ce58322d9479401"
+  },
+  "forbiddenOutputPaths": [
+    "*.zip",
+    "*.rar",
+    "*.r[0-9][0-9]"
+  ]
+}

@@ -2,16 +2,28 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::auth::api_keys::AuthApiKeysQueries;
+use crate::bandwidth::persistence::BandwidthPersistenceInternalQueries;
+use crate::bandwidth::queries::BandwidthQueries;
+use crate::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
+use crate::history::queries::HistoryQueries;
+use crate::history::timeline::HistoryTimelineQueries;
+use crate::operations::metrics_store::OperationsMetricsStoreQueries;
+use crate::rss::RssPersistenceQueries;
+use crate::rss::RssQueries;
+use crate::servers::repository::ServersRepositoryQueries;
+use crate::settings::service::SettingsServiceQueries;
 use std::path::Path;
 
 use crate::categories::CategoryConfig;
-use crate::operations::metrics::PipelineMetrics;
+use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::servers::{ServerConfig, ServerDownloadUsage};
 use crate::settings::{Config, RetryOverrides};
 use crate::{
     HistoryFilter, JobEvent, JobHistoryRow, RssFeedRow, RssRuleAction, RssRuleRow, RssSeenItemRow,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use weaver_server_base::operations::metrics::PipelineMetrics;
 
 async fn open_artifact_pool(path: &Path) -> sqlx::SqlitePool {
     SqlitePoolOptions::new()
@@ -28,6 +40,9 @@ async fn open_artifact_pool(path: &Path) -> sqlx::SqlitePool {
 
 fn sample_config() -> Config {
     Config {
+        upload_cap: None,
+        seeding: None,
+        torrent: Default::default(),
         data_dir: "/old/data".into(),
         hardware_profile: None,
         intermediate_dir: Some("/old/data/intermediate".into()),
@@ -59,6 +74,10 @@ fn sample_config() -> Config {
             tls_ca_cert: None,
         }],
         categories: vec![CategoryConfig {
+            upload_cap: Default::default(),
+            seeding: None,
+            torrent_route: false,
+            unpack: None,
             id: 1,
             name: "tv".into(),
             dest_dir: Some("/old/data/complete/tv".into()),
@@ -69,7 +88,11 @@ fn sample_config() -> Config {
             base_delay_secs: Some(1.0),
             multiplier: Some(2.0),
         }),
-        max_download_speed: Some(42),
+        bandwidth: crate::proxies::Bandwidth {
+            download_bps: Some(42),
+            upload_bps: None,
+            split: None,
+        },
         propagation_delay_secs: None,
         max_concurrent_nzbs: None,
         cleanup_after_extract: Some(true),
@@ -123,6 +146,7 @@ async fn export_and_import_stable_state_roundtrip() {
     src.insert_api_key("integration", &hash, "integration")
         .unwrap();
     src.insert_job_history(&JobHistoryRow {
+        protocol: crate::jobs::Protocol::Nzb,
         job_id: 77,
         job_hash: None,
         name: "test".into(),
@@ -194,7 +218,7 @@ async fn export_and_import_stable_state_roundtrip() {
         item_title: "release".into(),
         published_at: Some(5),
         size_bytes: Some(10),
-        decision: "accepted".into(),
+        decision: crate::RssSeenDecision::Accepted,
         seen_at: 6,
         job_id: Some(77),
         item_url: Some("https://example.com/file.nzb".into()),
@@ -228,7 +252,10 @@ async fn export_and_import_stable_state_roundtrip() {
     assert_eq!(integration_events_tables, 0);
     export_pool.close().await;
 
-    let dest = Database::open_in_memory().unwrap();
+    // The instance key comes back with the state it encrypted: a seen
+    // item's link is encrypted under it.
+    let mut dest = Database::open_in_memory().unwrap();
+    dest.set_encryption_key(src.encryption_key().unwrap().clone());
     assert!(dest.restore_target_is_pristine().unwrap());
     dest.import_stable_state(temp.path()).unwrap();
     assert_eq!(dest.sum_bandwidth_usage_minutes(42, 43).unwrap(), 420);
@@ -253,9 +280,7 @@ async fn export_and_import_stable_state_roundtrip() {
     assert_eq!(restored_usage.updated_at, usage_updated_at);
     assert_eq!(restored.categories.len(), 1);
     assert_eq!(dest.list_api_keys().unwrap().len(), 1);
-    let history = dest
-        .list_job_history(&HistoryFilter::default(), crate::HistoryRows::All)
-        .unwrap();
+    let history = dest.list_job_history(&HistoryFilter::default()).unwrap();
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].optional_recovery_bytes, 45);
     assert_eq!(history[0].optional_recovery_downloaded_bytes, 12);
@@ -276,6 +301,7 @@ fn restore_target_is_not_pristine_with_history() {
     let db = Database::open_in_memory().unwrap();
     assert!(db.restore_target_is_pristine().unwrap());
     db.insert_job_history(&JobHistoryRow {
+        protocol: crate::jobs::Protocol::Nzb,
         job_id: 1,
         job_hash: None,
         name: "x".into(),
@@ -338,7 +364,9 @@ async fn import_stable_state_ignores_legacy_integration_events_table() {
     src.export_stable_state(temp.path()).unwrap();
 
     let legacy_pool = open_artifact_pool(temp.path()).await;
-    sqlx::query(
+    let store = artifact_datastore(&legacy_pool);
+    SqlRuntime::execute(
+        store.write_exec(),
         "CREATE TABLE integration_events (
              id           INTEGER PRIMARY KEY AUTOINCREMENT,
              timestamp    INTEGER NOT NULL,
@@ -346,19 +374,21 @@ async fn import_stable_state_ignores_legacy_integration_events_table() {
              item_id      INTEGER,
              payload_json TEXT NOT NULL
          )",
+        &[],
     )
-    .execute(&legacy_pool)
     .await
     .unwrap();
-    sqlx::query(
+    SqlRuntime::execute(
+        store.write_exec(),
         "INSERT INTO integration_events (timestamp, kind, item_id, payload_json)
-         VALUES (?, ?, ?, ?)",
+         VALUES ({}, {}, {}, {})",
+        &[
+            SqlArg::I64(1),
+            SqlArg::Text("ITEM_CREATED".into()),
+            SqlArg::I64(77),
+            SqlArg::Text("{}".into()),
+        ],
     )
-    .bind(1_i64)
-    .bind("ITEM_CREATED")
-    .bind(77_i64)
-    .bind("{}")
-    .execute(&legacy_pool)
     .await
     .unwrap();
     legacy_pool.close().await;
@@ -384,8 +414,8 @@ async fn import_stable_state_defaults_limits_missing_from_old_archive_schema() {
     src.export_stable_state(temp.path()).unwrap();
 
     let legacy_pool = open_artifact_pool(temp.path()).await;
-    sqlx::query("DROP TABLE server_download_usage")
-        .execute(&legacy_pool)
+    let store = artifact_datastore(&legacy_pool);
+    SqlRuntime::execute(store.write_exec(), "DROP TABLE server_download_usage", &[])
         .await
         .unwrap();
     for column in [
@@ -399,8 +429,7 @@ async fn import_stable_state_defaults_limits_missing_from_old_archive_schema() {
         "tls_name_mismatch_certificate_der",
     ] {
         let statement = format!("ALTER TABLE servers DROP COLUMN {column}");
-        sqlx::raw_sql(sqlx::AssertSqlSafe(statement.as_str()))
-            .execute(&legacy_pool)
+        SqlRuntime::execute(store.write_exec(), &statement, &[])
             .await
             .unwrap();
     }
@@ -457,4 +486,70 @@ async fn postgres_export_and_import_use_the_portable_sqlite_backup() {
     drop(target);
     drop_postgres_backup_test_schema(source_admin, source_schema).await;
     drop_postgres_backup_test_schema(target_admin, target_schema).await;
+}
+
+// A legacy backup's key check reads values sealed as bytes too: a torrent
+// file sealed with another key, or met with no key, refuses the backup as a
+// sealed text value does.
+#[tokio::test]
+async fn a_legacy_backup_with_a_sealed_blob_is_proved_against_the_key() {
+    use crate::persistence::encryption::{EncryptionKey, encrypt_bytes};
+    let key = EncryptionKey::generate();
+    let other = EncryptionKey::generate();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy.db");
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true),
+        )
+        .await
+        .unwrap();
+    let store = artifact_datastore(&pool);
+    SqlRuntime::execute(
+        store.write_exec(),
+        "CREATE TABLE torrents (job_id INTEGER PRIMARY KEY, metainfo BLOB) WITHOUT ROWID",
+        &[],
+    )
+    .await
+    .unwrap();
+    // A blob in the clear is no sealed value: nothing to prove, key or not.
+    SqlRuntime::execute(
+        store.write_exec(),
+        "INSERT INTO torrents (job_id, metainfo) VALUES (1, {})",
+        &[SqlArg::Bytes(b"d4:infod4:name3:onee".to_vec())],
+    )
+    .await
+    .unwrap();
+    super::logical::validate_legacy_encryption_key(&path, None)
+        .await
+        .unwrap();
+
+    SqlRuntime::execute(
+        store.write_exec(),
+        "INSERT INTO torrents (job_id, metainfo) VALUES (2, {})",
+        &[SqlArg::Bytes(
+            encrypt_bytes(&key, b"d4:infod4:name3:twoee").unwrap(),
+        )],
+    )
+    .await
+    .unwrap();
+    pool.close().await;
+    super::logical::validate_legacy_encryption_key(&path, Some(&key))
+        .await
+        .unwrap();
+    assert!(
+        super::logical::validate_legacy_encryption_key(&path, Some(&other))
+            .await
+            .is_err()
+    );
+    let refused = super::logical::validate_legacy_encryption_key(&path, None)
+        .await
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("no encryption key"),
+        "{refused}"
+    );
 }

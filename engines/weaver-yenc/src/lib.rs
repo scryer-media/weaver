@@ -37,8 +37,8 @@ pub mod types;
 // Convenience re-exports.
 pub use crc::{Crc32Combine, crc32_combine};
 pub use decode::{
-    DecodeOptions, DecodeState, DecodedArticle, RapidyencDecodeEnd, RapidyencDecodeProgress,
-    RapidyencDecodeState, StreamingArticleDecoder, decode, decode_body,
+    DecodeOptions, DecodeState, DecodedArticle, DroppedDot, RapidyencDecodeEnd,
+    RapidyencDecodeProgress, RapidyencDecodeState, StreamingArticleDecoder, decode, decode_body,
     decode_body_chunk_until_control, decode_chunk, decode_nntp, decode_nntp_append,
     decode_rapidyenc, decode_rapidyenc_ex, decode_rapidyenc_incremental, decode_with_options,
     finish_streaming_article, finish_streaming_result, max_decoded_len,

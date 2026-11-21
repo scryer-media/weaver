@@ -316,6 +316,114 @@ fn infrastructure_admission_failures_do_not_poison_server_health() {
     );
 }
 
+// A plain server that greets with `greeting`, answers GROUP with 411 and
+// anything else with 500, until the client hangs up.
+fn spawn_setup_server(greeting: &'static [u8]) -> (u16, std::thread::JoinHandle<()>) {
+    use std::io::{BufRead, BufReader, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket.write_all(greeting).unwrap();
+        let mut reader = BufReader::new(socket.try_clone().unwrap());
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let upper = line.to_ascii_uppercase();
+            let reply: &[u8] = if upper.starts_with("GROUP ") {
+                b"411 no such newsgroup\r\n"
+            } else if upper.starts_with("QUIT") {
+                let _ = socket.write_all(b"205 closing\r\n");
+                break;
+            } else {
+                b"500 command not recognized\r\n"
+            };
+            if socket.write_all(reply).is_err() {
+                break;
+            }
+        }
+    });
+    (port, handle)
+}
+
+fn setup_server_client(port: u16) -> NntpClient {
+    NntpClient::new(NntpClientConfig::single(
+        ServerConfig {
+            host: "127.0.0.1".into(),
+            port,
+            tls: false,
+            ..Default::default()
+        },
+        2,
+    ))
+}
+
+// A greeting the client has no class for is the server refusing the
+// connection: the dial cools the server as a refused connect does, and the
+// refusal reaches the caller as a server fault, not as an answer about the
+// work's articles.
+#[test]
+fn an_odd_greeting_cools_the_server() {
+    let (port, handle) = spawn_setup_server(b"500 maintenance\r\n");
+    let client = setup_server_client(port);
+
+    let Err(error) = client.try_acquire_blocking_body_lane(&[], crate::ServerSet::EMPTY) else {
+        panic!("a 500 greeting opens no lane");
+    };
+    handle.join().unwrap();
+    assert!(
+        matches!(
+            &error,
+            BlockingBodyLaneAcquireError::Other(NntpError::UnexpectedResponse { .. })
+        ),
+        "{error:?}"
+    );
+    assert!(error.nntp_error().unwrap().is_unclassed_setup_answer());
+    assert_eq!(error.server(), None);
+    let health = client.pool().health().blocking_lock();
+    assert_eq!(
+        health.server(0).failure_count,
+        1,
+        "the server took a failure"
+    );
+}
+
+// A server that needs a group selected and answers 411 for every newsgroup
+// the work lists does not carry the post. The refusal names that server, so
+// the work can leave it for the next one, and the server's health is not
+// touched: carrying a group is not a fault.
+#[test]
+fn every_group_refused_names_the_server_that_does_not_carry_it() {
+    let (port, handle) = spawn_setup_server(b"200 ready\r\n");
+    crate::server_caps::forget("127.0.0.1", port);
+    crate::server_caps::note_group_required("127.0.0.1", port);
+    let client = setup_server_client(port);
+
+    let groups = vec!["alt.binaries.missing".to_string(), "alt.other".to_string()];
+    let Err(error) = client.try_acquire_blocking_body_lane(&groups, crate::ServerSet::EMPTY) else {
+        panic!("no group carried opens no lane");
+    };
+    drop(client);
+    handle.join().unwrap();
+    crate::server_caps::forget("127.0.0.1", port);
+    assert!(
+        matches!(
+            &error,
+            BlockingBodyLaneAcquireError::GroupsNotCarried {
+                server: ServerId(0),
+                error: NntpError::NoSuchGroup,
+            }
+        ),
+        "{error:?}"
+    );
+    assert_eq!(error.server(), Some(ServerId(0)));
+    assert!(!error.should_requeue_owned_work());
+}
+
 const READER_CAPABILITIES: &[u8] = b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n";
 
 // A dial the provider declined is paced by the holdoff alone. A lane asked
@@ -595,6 +703,329 @@ fn blocking_lane_preserves_provider_capacity_rejection() {
     );
 }
 
+// A route that refuses every dial with `refusal`: the tunnel behind the
+// server is full, or its session budget spent. Nothing reaches a server.
+struct FullRoute(fn() -> weaver_tunnel::pipe::DialError);
+
+#[async_trait::async_trait]
+impl weaver_tunnel::pipe::Dialer for FullRoute {
+    async fn dial(
+        &self,
+        _: &weaver_tunnel::pipe::Target,
+    ) -> std::result::Result<weaver_tunnel::pipe::Dialed, weaver_tunnel::pipe::DialError> {
+        Err((self.0)())
+    }
+    fn budget(&self) -> Duration {
+        UNREACHED_TIMEOUT
+    }
+    fn describe(&self) -> String {
+        "full route fixture".into()
+    }
+}
+
+// A client of one server behind a route that refuses with `refusal`. The
+// blocking dial runs on a runtime of its own, as the download lanes' does.
+fn client_behind_full_route(
+    runtime: &tokio::runtime::Runtime,
+    refusal: fn() -> weaver_tunnel::pipe::DialError,
+) -> NntpClient {
+    let dialer = Arc::new(crate::route_dialer::RouteDialer {
+        inner: Arc::new(FullRoute(refusal)),
+        plan: None,
+        egress_controls: Arc::new(crate::transfer::ServerTransferRegistry::new()),
+        runtime: runtime.handle().clone(),
+        server: 1,
+    });
+    let mut server = scripted_server(119, 0);
+    server.server.dialer = dialer;
+    NntpClient::new(NntpClientConfig {
+        servers: vec![server],
+        max_idle_age: Duration::from_secs(30),
+        max_retries_per_server: 1,
+        soft_timeout: Duration::from_secs(15),
+    })
+}
+
+// A full tunnel, or a spent WireGuard session budget, is room the route lacks,
+// not a fault of the server: the lane is refused for capacity, the work is
+// handed back, and the server keeps a clean health record and every permit.
+#[test]
+fn a_full_route_refuses_the_lane_for_capacity_and_spares_the_server() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let refusals: [fn() -> weaver_tunnel::pipe::DialError; 2] = [
+        || weaver_tunnel::pipe::DialError::AtCapacity(Default::default()),
+        || weaver_tunnel::pipe::DialError::SessionBudget,
+    ];
+    for refusal in refusals {
+        let client = client_behind_full_route(&runtime, refusal);
+        let (free_before, configured) = client.pool().server_load(0);
+        let Err(error) =
+            client.try_acquire_blocking_body_lane_with_estimate(&[], crate::ServerSet::EMPTY, 0)
+        else {
+            panic!("a full route opens no lane");
+        };
+        assert!(
+            matches!(&error, BlockingBodyLaneAcquireError::RouteCapacity(inner) if inner.is_route_capacity()),
+            "{error:?}"
+        );
+        assert!(error.is_capacity_admission());
+        assert!(error.should_requeue_owned_work());
+        assert!(error.is_route_capacity());
+        assert_eq!(error.kind(), "route_capacity");
+        assert!(error.server().is_none());
+        let health = client.pool().health().blocking_lock();
+        assert_eq!(health.server(0).failure_count, 0);
+        assert!(matches!(health.server(0).state(), ServerState::Healthy));
+        drop(health);
+        assert_eq!(client.pool().server_load(0), (free_before, configured));
+        assert!(!client.pool().is_over_limit(ServerId(0)));
+    }
+}
+
+// Every other route refusal keeps its class: a leg that is down is not room
+// the route lacks.
+#[test]
+fn a_route_fault_is_not_route_capacity() {
+    let fault = NntpError::Route(Arc::new(weaver_tunnel::pipe::DialError::Egress(
+        std::io::Error::other("leg down"),
+    )));
+    assert!(!fault.is_route_capacity());
+    let error = BlockingBodyLaneAcquireError::from_connect_error(ServerId(0), fault);
+    assert!(
+        matches!(error, BlockingBodyLaneAcquireError::Other(_)),
+        "{error:?}"
+    );
+    assert!(!error.should_requeue_owned_work());
+    let skipped = NntpError::Route(Arc::new(weaver_tunnel::pipe::DialError::Skipped(
+        "leg revoked".into(),
+    )));
+    assert!(matches!(
+        BlockingBodyLaneAcquireError::from_connect_error(ServerId(0), skipped),
+        BlockingBodyLaneAcquireError::Other(_)
+    ));
+}
+
+// A client of two servers, each behind a route that refuses with its own
+// refusal.
+fn client_behind_two_routes(
+    runtime: &tokio::runtime::Runtime,
+    refusals: [fn() -> weaver_tunnel::pipe::DialError; 2],
+) -> NntpClient {
+    let servers = refusals
+        .into_iter()
+        .enumerate()
+        .map(|(index, refusal)| {
+            let mut server = scripted_server(119 + index as u16, 0);
+            server.server.dialer = Arc::new(crate::route_dialer::RouteDialer {
+                inner: Arc::new(FullRoute(refusal)),
+                plan: None,
+                egress_controls: Arc::new(crate::transfer::ServerTransferRegistry::new()),
+                runtime: runtime.handle().clone(),
+                server: index as u32 + 1,
+            });
+            server
+        })
+        .collect();
+    NntpClient::new(NntpClientConfig {
+        servers,
+        max_idle_age: Duration::from_secs(30),
+        max_retries_per_server: 1,
+        soft_timeout: Duration::from_secs(15),
+    })
+}
+
+// A server that failed for real is the answer over another whose route is
+// full, whichever is asked first, as a failed rung outranks a full one in a
+// route's ladder. With every route full, the answer is the full route.
+#[test]
+fn a_real_fault_outranks_a_full_route_and_two_full_routes_wait() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let full: fn() -> weaver_tunnel::pipe::DialError =
+        || weaver_tunnel::pipe::DialError::AtCapacity(Default::default());
+    let refused: fn() -> weaver_tunnel::pipe::DialError = || {
+        weaver_tunnel::pipe::DialError::Refused(std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused,
+        ))
+    };
+    for refusals in [[full, refused], [refused, full]] {
+        let client = client_behind_two_routes(&runtime, refusals);
+        let Err(error) =
+            client.try_acquire_blocking_body_lane_with_estimate(&[], crate::ServerSet::EMPTY, 0)
+        else {
+            panic!("no route opens a lane");
+        };
+        assert!(
+            matches!(
+                &error,
+                BlockingBodyLaneAcquireError::Other(NntpError::Route(route))
+                    if matches!(route.as_ref(), weaver_tunnel::pipe::DialError::Refused(_))
+            ),
+            "{error:?}"
+        );
+        assert!(!error.should_requeue_owned_work());
+    }
+    let client = client_behind_two_routes(&runtime, [full, full]);
+    let Err(error) =
+        client.try_acquire_blocking_body_lane_with_estimate(&[], crate::ServerSet::EMPTY, 0)
+    else {
+        panic!("no route opens a lane");
+    };
+    assert!(error.is_route_capacity(), "{error:?}");
+    assert!(error.should_requeue_owned_work());
+}
+
+// Gives the sides nothing: every usenet socket is refused, and presses.
+struct NoRoom;
+
+impl weaver_tunnel::pipe::SocketDivider for NoRoom {
+    fn shares(&self, _: u64) -> [u64; weaver_tunnel::pipe::SIDES] {
+        [0; weaver_tunnel::pipe::SIDES]
+    }
+
+    fn share_out(&self, _: u64, shares: &[u64], _: &[Option<u64>], _: &[u64]) -> Vec<u64> {
+        shares.to_vec()
+    }
+
+    fn presses(&self, used: u64, given: u64) -> bool {
+        used >= given
+    }
+}
+
+fn full_tunnel() -> Arc<weaver_tunnel::pipe::SessionSockets> {
+    const MTU: u16 = 1420;
+    Arc::new(weaver_tunnel::pipe::SessionSockets::new(
+        weaver_tunnel::pipe::SocketBudget {
+            bytes: weaver_tunnel::pipe::overhead_bytes(MTU),
+            reserve: 0,
+            torrent_kept: 0,
+            mtu: MTU,
+        },
+        Arc::new(NoRoom),
+    ))
+}
+
+// A route whose tunnel has no room: each dial is refused by the tunnel's
+// ledger, and the refusal carries the press it leaves.
+struct LedgerRoute(Arc<weaver_tunnel::pipe::SessionSockets>);
+
+#[async_trait::async_trait]
+impl weaver_tunnel::pipe::Dialer for LedgerRoute {
+    async fn dial(
+        &self,
+        _: &weaver_tunnel::pipe::Target,
+    ) -> std::result::Result<weaver_tunnel::pipe::Dialed, weaver_tunnel::pipe::DialError> {
+        let refused = match self.0.take(
+            weaver_tunnel::pipe::SocketClass::Nntp,
+            weaver_tunnel::pipe::stream_bytes(None),
+        ) {
+            Err(refused) => refused,
+            Ok(_) => panic!("a tunnel with no room hands out no socket"),
+        };
+        Err(weaver_tunnel::pipe::DialError::AtCapacity(refused.into()))
+    }
+    fn budget(&self) -> Duration {
+        UNREACHED_TIMEOUT
+    }
+    fn describe(&self) -> String {
+        "ledger route fixture".into()
+    }
+}
+
+// A client of two servers, each behind its own full tunnel.
+fn client_behind_two_tunnels(
+    runtime: &tokio::runtime::Runtime,
+    tunnels: &[Arc<weaver_tunnel::pipe::SessionSockets>; 2],
+) -> NntpClient {
+    let servers = tunnels
+        .iter()
+        .enumerate()
+        .map(|(index, tunnel)| {
+            let mut server = scripted_server(119 + index as u16, 0);
+            server.server.dialer = Arc::new(crate::route_dialer::RouteDialer {
+                inner: Arc::new(LedgerRoute(Arc::clone(tunnel))),
+                plan: None,
+                egress_controls: Arc::new(crate::transfer::ServerTransferRegistry::new()),
+                runtime: runtime.handle().clone(),
+                server: index as u32 + 1,
+            });
+            server
+        })
+        .collect();
+    NntpClient::new(NntpClientConfig {
+        servers,
+        max_idle_age: Duration::from_secs(30),
+        max_retries_per_server: 1,
+        soft_timeout: Duration::from_secs(15),
+    })
+}
+
+// Every tunnel that refused a lane keeps its press while the work waits, not
+// only the last one asked, and whichever error answers. The press ends when
+// the work drops its demand.
+#[test]
+fn every_tunnel_that_refused_a_lane_keeps_its_press() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let usenet = weaver_tunnel::pipe::SocketClass::Nntp;
+
+    // Both tunnels full: the route's error answers, and both press.
+    let tunnels = [full_tunnel(), full_tunnel()];
+    let client = client_behind_two_tunnels(&runtime, &tunnels);
+    let mut route_demand = Vec::new();
+    let Err(error) = client.try_acquire_blocking_body_lane_pressing(
+        &[],
+        crate::ServerSet::EMPTY,
+        0,
+        &mut route_demand,
+    ) else {
+        panic!("no tunnel opens a lane");
+    };
+    assert!(error.is_route_capacity(), "{error:?}");
+    assert!(tunnels.iter().all(|tunnel| tunnel.pressing(usenet)));
+    drop(error);
+    assert!(
+        tunnels.iter().all(|tunnel| tunnel.pressing(usenet)),
+        "the work's demand holds both presses"
+    );
+    drop(route_demand);
+    assert!(tunnels.iter().all(|tunnel| !tunnel.pressing(usenet)));
+
+    // A's tunnel full and B at its provider's limit: the provider's error
+    // answers, as before, and A's tunnel still presses.
+    let tunnels = [full_tunnel(), full_tunnel()];
+    let client = client_behind_two_tunnels(&runtime, &tunnels);
+    client.pool().note_provider_over_limit(ServerId(1));
+    let mut route_demand = Vec::new();
+    let Err(error) = client.try_acquire_blocking_body_lane_pressing(
+        &[],
+        crate::ServerSet::EMPTY,
+        0,
+        &mut route_demand,
+    ) else {
+        panic!("no server opens a lane");
+    };
+    assert!(
+        matches!(error, BlockingBodyLaneAcquireError::ProviderCapacity(_)),
+        "{error:?}"
+    );
+    drop(error);
+    assert!(tunnels[0].pressing(usenet), "A's refusal still presses");
+    assert!(!tunnels[1].pressing(usenet), "B was never dialled");
+    drop(route_demand);
+    assert!(!tunnels[0].pressing(usenet));
+}
+
 #[test]
 fn transient_failure_recording_counts_soft_timeouts() {
     assert_eq!(
@@ -784,6 +1215,7 @@ fn quota_selection_client(
                     transfers.configure(
                         stable_id,
                         crate::transfer::ServerTransferConfig {
+                            closed: false,
                             rate_bytes_per_sec: 0,
                             quota: Some(crate::transfer::QuotaRuntimeConfig {
                                 limit_bytes: 0,
@@ -822,6 +1254,7 @@ async fn estimate_selection_fails_over_large_request_but_keeps_smaller_work_movi
     let limited = transfers.configure(
         limited_id,
         crate::transfer::ServerTransferConfig {
+            closed: false,
             rate_bytes_per_sec: 0,
             quota: Some(crate::transfer::QuotaRuntimeConfig {
                 limit_bytes: 100,
@@ -918,6 +1351,7 @@ fn earliest_quota_selection_preserves_first_blocked_registry_revision() {
     let first = transfers.configure(
         StableServerId(3_000),
         crate::transfer::ServerTransferConfig {
+            closed: false,
             rate_bytes_per_sec: 0,
             quota: Some(crate::transfer::QuotaRuntimeConfig {
                 limit_bytes: 0,
@@ -930,6 +1364,7 @@ fn earliest_quota_selection_preserves_first_blocked_registry_revision() {
     let second = transfers.configure(
         StableServerId(3_001),
         crate::transfer::ServerTransferConfig {
+            closed: false,
             rate_bytes_per_sec: 0,
             quota: Some(crate::transfer::QuotaRuntimeConfig {
                 limit_bytes: 0,
@@ -1094,6 +1529,7 @@ async fn blocking_quota_rejection_fails_over_to_another_fill_server() {
     let capped_control = transfers.configure(
         StableServerId(111),
         crate::transfer::ServerTransferConfig {
+            closed: false,
             rate_bytes_per_sec: 0,
             quota: Some(crate::transfer::QuotaRuntimeConfig {
                 limit_bytes: 0,
@@ -1301,6 +1737,7 @@ fn quota_policy_client(quotas: &[Option<Option<u64>>]) -> NntpClient {
                             generation: 1,
                             retry_at: None,
                         }),
+                        closed: false,
                     },
                 )
             }),
@@ -1827,6 +2264,7 @@ fn candidacy_probe_leaves_the_quota_blocked_signal_alone() {
     let limited = transfers.configure(
         limited_id,
         crate::transfer::ServerTransferConfig {
+            closed: false,
             rate_bytes_per_sec: 0,
             quota: Some(crate::transfer::QuotaRuntimeConfig {
                 limit_bytes: 100,

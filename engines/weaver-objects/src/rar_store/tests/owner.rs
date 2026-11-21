@@ -40,6 +40,8 @@ pub(super) struct Owner {
     pub members: BTreeMap<u32, Got>,
     // Everything said but members and their bytes.
     pub said: Vec<Emit>,
+    // Everything said, in the order it was said.
+    pub log: Vec<Emit>,
     // What the object wants as of the last round.
     pub seeks: Vec<Seek>,
     // How seeks are answered; a range moved ahead is delivered at once.
@@ -85,6 +87,7 @@ impl Owner {
             volumes,
             members: BTreeMap::new(),
             said: Vec::new(),
+            log: Vec::new(),
             seeks: Vec::new(),
             // Seeks are answered by the normal order unless a test says.
             pull: Pull::Moved(0),
@@ -104,7 +107,7 @@ impl Owner {
         let front = &bytes[..bytes.len().min(FRONT)];
         let volume = owner
             .object
-            .claim(name, front, None)
+            .claim(name, (front).into(), None)
             .first()
             .copied()
             .unwrap_or(VolumeIndex(0));
@@ -157,7 +160,7 @@ impl Owner {
         let (name, bytes) = &self.volumes[volume];
         let first = &bytes[..bytes.len().min(FRONT)];
         assert_eq!(
-            self.object.claim(name, first, None),
+            self.object.claim(name, (first).into(), None),
             vec![VolumeIndex(volume as u32)],
             "claims {name}"
         );
@@ -196,6 +199,14 @@ impl Owner {
 
     pub fn deliver(&mut self, volume: usize, range: ByteRange) {
         self.deliver_as(volume, range, Provenance::Fresh, None);
+    }
+
+    // Deliver a range as the tree does inside one delivery: no work is lent
+    // and nothing is answered.
+    pub fn deliver_unworked(&mut self, volume: usize, range: ByteRange) {
+        self.bind(volume);
+        self.doing = ("deliver", volume);
+        self.push(VolumeIndex(volume as u32), range, Provenance::Fresh, None);
     }
 
     // Deliver a range, optionally with other bytes than the volume's.
@@ -403,11 +414,20 @@ impl Owner {
         self.settle();
     }
 
+    // Offer a password as the tree does inside one offer: no work is lent.
+    pub fn offer_unworked(&mut self, secret: &str) {
+        self.doing = ("password", 0);
+        let mut out = Vec::new();
+        self.object.offer_password(secret, &mut out);
+        self.apply(out);
+    }
+
     pub fn held(&self) -> usize {
         self.held.len()
     }
 
     fn apply(&mut self, out: Vec<Emit>) {
+        self.log.extend(out.iter().cloned());
         let mut again = Vec::new();
         for emit in out {
             match emit {

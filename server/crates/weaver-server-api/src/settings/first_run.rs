@@ -17,6 +17,8 @@
 use async_graphql::SimpleObject;
 use weaver_server_core::Database;
 use weaver_server_core::settings::SharedConfig;
+use weaver_server_core::settings::persistence::SettingsPersistenceQueries;
+use weaver_server_core::settings::queries::SettingsQueries;
 
 use crate::observability::spawn_blocking_db;
 

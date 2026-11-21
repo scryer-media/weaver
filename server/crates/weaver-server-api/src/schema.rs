@@ -54,6 +54,7 @@ pub struct JobsSnapshot {
 #[derive(Default, MergedObject)]
 pub struct QueryRoot(
     crate::backup::BackupQuery,
+    crate::dns::DnsQuery,
     crate::networking::NetworkingQuery,
     crate::proxies::ProxiesQuery,
     crate::speed_test::SpeedTestQuery,
@@ -66,6 +67,8 @@ pub struct QueryRoot(
     servers_query::ServersQuery,
     settings_query::SettingsQuery,
     system_query::SystemQuery,
+    crate::torrents::TorrentsQuery,
+    crate::tags::TagsQuery,
 );
 
 #[derive(Default, MergedObject)]
@@ -75,12 +78,14 @@ pub struct MutationRoot(ConnectivityMutations, ApplicationMutations);
 // crates' default compiler recursion limit when laying out resolver futures.
 #[derive(Default, MergedObject)]
 struct ConnectivityMutations(
+    crate::dns::DnsMutation,
     crate::networking::NetworkingMutation,
     crate::proxies::ProxiesMutation,
     crate::speed_test::SpeedTestMutation,
     auth_mutation::AuthMutation,
     rss_mutation::RssMutation,
     servers_mutation::ServersMutation,
+    crate::tags::TagsMutation,
 );
 
 #[derive(Default, MergedObject)]
@@ -91,6 +96,7 @@ struct ApplicationMutations(
     post_processing_mutation::PostProcessingMutation,
     settings_mutation::SettingsMutation,
     system_mutation::SystemMutation,
+    crate::torrents::TorrentsMutation,
 );
 
 #[derive(Default, MergedSubscription)]
@@ -99,6 +105,7 @@ pub struct SubscriptionRoot(
     history_subscription::HistorySubscription,
     jobs_subscription::JobsSubscription,
     system_subscription::SystemSubscription,
+    crate::torrents::TorrentsSubscription,
 );
 
 #[path = "auth/query.rs"]

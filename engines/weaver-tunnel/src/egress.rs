@@ -5,11 +5,14 @@
 
 use std::{
     io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket},
     time::Duration,
 };
 
 use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
+
+mod multicast;
+pub use multicast::MulticastSocket;
 
 // Binding is exclusive: choosing a device leaves source selection to the kernel.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
@@ -77,6 +80,93 @@ fn interface_supports(name: &str, ipv4: bool) -> bool {
         .families
         .iter()
         .any(|(interface, family)| interface == name && *family == ipv4)
+}
+
+/// One IPv6 address an egress's sockets may leave from, with what libtorrent
+/// reads of its interface to tell whether a listen socket on it reaches only
+/// the local network (`expand_unspecified_address`, session_impl.cpp:288-345,
+/// v2.0.15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ipv6Source {
+    pub ip: Ipv6Addr,
+    /// Its interface is a loopback one: it holds a loopback address.
+    pub loopback_interface: bool,
+    /// Its interface is a point-to-point link.
+    pub point_to_point: bool,
+    /// Its interface holds the address IPv6 traffic toward a public address
+    /// leaves from: it has an IPv6 internet route.
+    pub internet_route: bool,
+}
+
+/// The IPv6 addresses an egress's sockets may leave from, and whether the
+/// egress has an internet route of either family.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Ipv6Sources {
+    pub addresses: Vec<Ipv6Source>,
+    pub any_internet_route: bool,
+}
+
+// Documentation addresses no host answers at: where a datagram toward one
+// would leave from names the route toward the internet. Nothing is sent.
+const PUBLIC_PROBE: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 9);
+const PUBLIC_PROBE_V6: SocketAddr = SocketAddr::new(
+    IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+    9,
+);
+
+// One address of one interface, as the system lists it.
+struct Listed {
+    name: String,
+    ip: IpAddr,
+    up: bool,
+    point_to_point: bool,
+}
+
+// The IPv6 sources of `egress` among `listed`, whose (deprecated,
+// tentative) flags are `flags`, in the same order. libtorrent takes only an
+// interface's preferred addresses, of an interface that is up
+// (session_impl.cpp:299-322, enum_net.cpp:451, v2.0.15).
+fn pick_ipv6_sources(
+    egress: &SocketEgress,
+    listed: &[Listed],
+    flags: &[(bool, bool)],
+    v6_source: Option<IpAddr>,
+    any_internet_route: bool,
+) -> Ipv6Sources {
+    let holds = |name: &str, wanted: &dyn Fn(IpAddr) -> bool| {
+        listed.iter().any(|l| l.name == name && wanted(l.ip))
+    };
+    let internet_interface = v6_source.and_then(|source| {
+        listed
+            .iter()
+            .find(|l| l.ip == source)
+            .map(|l| l.name.as_str())
+    });
+    let mut addresses: Vec<Ipv6Source> = Vec::new();
+    for (l, &(deprecated, tentative)) in listed.iter().zip(flags) {
+        let IpAddr::V6(ip) = l.ip else { continue };
+        if !l.up || deprecated || tentative {
+            continue;
+        }
+        let in_scope = match egress {
+            SocketEgress::System => true,
+            SocketEgress::Interface(name) => l.name == *name,
+            SocketEgress::SourceAddress(source) => *source == l.ip,
+        };
+        if !in_scope || addresses.iter().any(|a| a.ip == ip) {
+            continue;
+        }
+        addresses.push(Ipv6Source {
+            ip,
+            loopback_interface: holds(&l.name, &|ip: IpAddr| ip.is_loopback()),
+            point_to_point: l.point_to_point,
+            internet_route: internet_interface == Some(l.name.as_str()),
+        });
+    }
+    Ipv6Sources {
+        addresses,
+        any_internet_route,
+    }
 }
 
 impl SocketEgress {
@@ -181,6 +271,12 @@ impl SocketEgress {
 
     // Bind a datagram socket for a tunnel peer of the supplied address family.
     pub fn bind_udp(&self, peer: SocketAddr) -> io::Result<UdpSocket> {
+        let socket = self.udp_socket(peer)?;
+        socket.set_nonblocking(true)?;
+        Ok(socket.into())
+    }
+
+    fn udp_socket(&self, peer: SocketAddr) -> io::Result<Socket> {
         let socket = self.socket(peer, Type::DGRAM, Protocol::UDP)?;
         if !matches!(self, Self::SourceAddress(_)) {
             let unspecified = if peer.is_ipv4() {
@@ -190,8 +286,145 @@ impl SocketEgress {
             };
             socket.bind(&SocketAddr::new(unspecified, 0).into())?;
         }
+        Ok(socket)
+    }
+
+    // The address a datagram to `to` leaves this egress from: a socket bound
+    // as the egress binds, connected to `to`, which sends nothing and fails
+    // when no route reaches it.
+    pub(crate) fn source_toward(&self, to: SocketAddr) -> io::Result<IpAddr> {
+        let socket = UdpSocket::from(self.udp_socket(to)?);
+        socket.connect(to)?;
+        Ok(socket.local_addr()?.ip())
+    }
+
+    /// The IPv6 addresses this egress's sockets may leave from: each
+    /// preferred address of an interface that is up, on the egress's device
+    /// when it names one, or the source address it pins. Nothing is sent.
+    pub fn ipv6_sources(&self) -> io::Result<Ipv6Sources> {
+        if let Self::Interface(name) = self
+            && (name.is_empty() || name.as_bytes().contains(&0))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "interface name must be nonempty and contain no NUL",
+            ));
+        }
+        let listed: Vec<Listed> = if_addrs::get_if_addrs()?
+            .into_iter()
+            .map(|interface| Listed {
+                up: interface.is_oper_up(),
+                point_to_point: interface.is_p2p(),
+                ip: interface.ip(),
+                name: interface.name,
+            })
+            .collect();
+        let v6_source = self.source_toward(PUBLIC_PROBE_V6).ok();
+        let any_internet_route = v6_source.is_some() || self.source_toward(PUBLIC_PROBE).is_ok();
+        let pairs: Vec<(&str, IpAddr)> = listed.iter().map(|l| (l.name.as_str(), l.ip)).collect();
+        let flags = address_flags_many(&pairs);
+        Ok(pick_ipv6_sources(
+            self,
+            &listed,
+            &flags,
+            v6_source,
+            any_internet_route,
+        ))
+    }
+
+    // Bind a datagram socket a direct leg's consumer sends from itself, on
+    // `local`'s port: at the source address this egress pins, else at
+    // `local`'s address, on the egress's device when it names one. A socket
+    // bound at an IPv4 host address sends its multicast out of the interface
+    // holding that address, never where the host routes multicast.
+    pub(crate) fn bind_udp_at(&self, local: SocketAddr) -> io::Result<UdpSocket> {
+        let (socket, local, _) = self.local_socket(local, Type::DGRAM, Protocol::UDP)?;
+        if let IpAddr::V4(ip) = local.ip()
+            && !ip.is_unspecified()
+        {
+            socket.set_multicast_if_v4(&ip)?;
+        }
+        socket.bind(&local.into())?;
         socket.set_nonblocking(true)?;
         Ok(socket.into())
+    }
+
+    /// A datagram socket bound as [`Self::bind_udp_at`] binds, and whether it
+    /// takes IPv4 as well as IPv6. With `reuse` it binds on an address a
+    /// socket bound before it may have left in use. Without, the bind fails
+    /// on a port another socket of the family holds at any address, and a
+    /// port the kernel chooses is one no socket of the family holds: with
+    /// reuse a BSD kernel checks only the exact address, so a socket at the
+    /// unspecified address shares its port with one at a host address, which
+    /// then takes the datagrams sent to that address.
+    pub fn bind_udp_reusing(
+        &self,
+        local: SocketAddr,
+        reuse: bool,
+    ) -> io::Result<(UdpSocket, bool)> {
+        let (socket, local, dual_stack) = self.local_socket(local, Type::DGRAM, Protocol::UDP)?;
+        #[cfg(not(windows))]
+        socket.set_reuse_address(reuse)?;
+        #[cfg(windows)]
+        let _ = reuse;
+        socket.bind(&local.into())?;
+        socket.set_nonblocking(true)?;
+        Ok((socket.into(), dual_stack))
+    }
+
+    /// A stream listener bound as [`Self::bind_udp_at`] binds a datagram
+    /// socket. With `reuse` it binds on an address a listener before it may
+    /// have left in use; without, as [`Self::bind_udp_reusing`] binds
+    /// without.
+    pub fn listen_tcp(&self, local: SocketAddr, reuse: bool) -> io::Result<TcpListener> {
+        let (socket, local, _) = self.local_socket(local, Type::STREAM, Protocol::TCP)?;
+        socket.set_reuse_address(reuse)?;
+        socket.bind(&local.into())?;
+        socket.listen(1024)?;
+        socket.set_nonblocking(true)?;
+        Ok(socket.into())
+    }
+
+    // An unbound socket for `local` as this egress binds it, the address it
+    // binds at, and whether it takes IPv4 as well as IPv6.
+    fn local_socket(
+        &self,
+        local: SocketAddr,
+        kind: Type,
+        protocol: Protocol,
+    ) -> io::Result<(Socket, SocketAddr, bool)> {
+        let local = match self {
+            Self::SourceAddress(source) => SocketAddr::new(*source, local.port()),
+            _ => local,
+        };
+        let socket = Socket::new(Domain::for_address(local), kind, Some(protocol))?;
+        let mut dual_stack = false;
+        if local.is_ipv6() && local.ip().is_unspecified() {
+            match self {
+                // On a device the unspecified IPv6 address keeps to IPv6 on
+                // every host, as one socket cannot be held to the device for
+                // both families everywhere; IPv4 is a socket of its own.
+                Self::Interface(_) => socket.set_only_v6(true)?,
+                // Elsewhere it takes IPv4 as well, whatever the host's
+                // default, unless the host keeps the socket to IPv6.
+                _ => match socket.set_only_v6(false) {
+                    Ok(()) => dual_stack = true,
+                    Err(error) => {
+                        tracing::debug!(%local, %error, "the host keeps the socket to IPv6 alone");
+                    }
+                },
+            }
+        }
+        if let Self::Interface(name) = self {
+            bind_interface(&socket, name, local.is_ipv6())?;
+        }
+        Ok((socket, local, dual_stack))
+    }
+
+    /// The egress held to the interface called `name`, which must exist.
+    pub fn existing_interface(name: &str) -> io::Result<Self> {
+        interface_index(name)?;
+        Ok(Self::Interface(name.to_owned()))
     }
 }
 
@@ -200,6 +433,280 @@ mod connect_tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
+    // Loopback is reached from loopback, by the host's own route or from a
+    // pinned source address; a socket held to an IPv4 address has no route
+    // to an IPv6 one.
+    #[test]
+    fn a_route_leaves_from_the_address_its_egress_pins() {
+        let loopback = IpAddr::from(Ipv4Addr::LOCALHOST);
+        let to = SocketAddr::new(loopback, 9);
+        assert_eq!(SocketEgress::System.source_toward(to).unwrap(), loopback);
+        let pinned = SocketEgress::SourceAddress(loopback);
+        assert_eq!(pinned.source_toward(to).unwrap(), loopback);
+        assert!(pinned.source_toward("[::1]:9".parse().unwrap()).is_err());
+    }
+
+    // A socket bound at an IPv4 host address, or at the source address its
+    // egress pins, sends its multicast out of that address's interface; one
+    // bound at no address leaves it to the host.
+    #[test]
+    fn a_socket_at_a_host_address_sends_its_multicast_from_there() {
+        let loopback = Ipv4Addr::LOCALHOST;
+        let pinned = SocketEgress::SourceAddress(loopback.into())
+            .bind_udp_at(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
+            .unwrap();
+        assert_eq!(
+            socket2::SockRef::from(&pinned).multicast_if_v4().unwrap(),
+            loopback
+        );
+        let at = SocketEgress::System
+            .bind_udp_at(SocketAddr::from((loopback, 0)))
+            .unwrap();
+        assert_eq!(
+            socket2::SockRef::from(&at).multicast_if_v4().unwrap(),
+            loopback
+        );
+        let anywhere = SocketEgress::System
+            .bind_udp_at(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
+            .unwrap();
+        assert!(
+            socket2::SockRef::from(&anywhere)
+                .multicast_if_v4()
+                .unwrap()
+                .is_unspecified()
+        );
+    }
+
+    // A socket bound at the unspecified IPv6 address takes IPv4 as well.
+    #[test]
+    fn an_unspecified_v6_socket_is_dual_stack() {
+        let socket = SocketEgress::System
+            .bind_udp_at("[::]:0".parse().unwrap())
+            .unwrap();
+        assert!(!socket2::SockRef::from(&socket).only_v6().unwrap());
+    }
+
+    // A socket on an interface at the unspecified IPv6 address keeps to
+    // IPv6, held to the device.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn an_unspecified_v6_socket_on_an_interface_keeps_to_ipv6() {
+        let device = if cfg!(target_os = "linux") {
+            "lo"
+        } else {
+            "lo0"
+        };
+        let socket =
+            match SocketEgress::Interface(device.into()).bind_udp_at("[::]:0".parse().unwrap()) {
+                Ok(socket) => socket,
+                // Binding to a device needs a privilege some Linux hosts withhold.
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+                Err(error) => panic!("{error}"),
+            };
+        let socket = socket2::SockRef::from(&socket);
+        assert!(socket.only_v6().unwrap());
+        #[cfg(target_os = "macos")]
+        {
+            let name = std::ffi::CString::new(device).unwrap();
+            // SAFETY: CString supplies the NUL-terminated name required by libc.
+            let index = std::num::NonZeroU32::new(unsafe { libc::if_nametoindex(name.as_ptr()) });
+            assert_eq!(socket.device_index_v6().unwrap(), index);
+        }
+        #[cfg(target_os = "linux")]
+        assert_eq!(socket.device().unwrap().as_deref(), Some(device.as_bytes()));
+    }
+
+    // A local socket binds where it is asked, or at the pinned source
+    // address on the port asked for.
+    #[test]
+    fn a_local_socket_binds_at_the_pinned_source() {
+        let loopback = IpAddr::from(Ipv4Addr::LOCALHOST);
+        let socket = SocketEgress::System
+            .bind_udp_at(SocketAddr::new(loopback, 0))
+            .unwrap();
+        assert_eq!(socket.local_addr().unwrap().ip(), loopback);
+        let socket = SocketEgress::SourceAddress(loopback)
+            .bind_udp_at(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0))
+            .unwrap();
+        assert_eq!(socket.local_addr().unwrap().ip(), loopback);
+    }
+
+    // A datagram socket on an address in use before takes IPv4 as well at
+    // the unspecified IPv6 address, and says so; at an IPv4 address it
+    // takes IPv4 alone.
+    #[test]
+    #[expect(clippy::disallowed_methods, reason = "a loopback fixture")]
+    fn a_reusing_datagram_socket_says_whether_it_takes_both_families() {
+        let (socket, dual_stack) = SocketEgress::System
+            .bind_udp_reusing("[::]:0".parse().unwrap(), true)
+            .unwrap();
+        assert!(dual_stack);
+        let socket = socket2::SockRef::from(&socket);
+        assert!(!socket.only_v6().unwrap());
+        #[cfg(not(windows))]
+        assert!(socket.reuse_address().unwrap());
+        let loopback = IpAddr::from(Ipv4Addr::LOCALHOST);
+        let (socket, dual_stack) = SocketEgress::System
+            .bind_udp_reusing(SocketAddr::new(loopback, 0), false)
+            .unwrap();
+        assert!(!dual_stack);
+        assert_eq!(socket.local_addr().unwrap().ip(), loopback);
+        assert!(!socket2::SockRef::from(&socket).reuse_address().unwrap());
+    }
+
+    // Without reuse, a datagram socket or a listener at the unspecified
+    // IPv4 address is refused a port a socket at a host address holds; with
+    // reuse it shares it.
+    #[cfg(not(windows))]
+    #[test]
+    #[expect(clippy::disallowed_methods, reason = "a loopback fixture")]
+    fn without_reuse_a_port_held_at_a_host_address_is_refused() {
+        let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let (held, _) = SocketEgress::System
+            .bind_udp_reusing(loopback, false)
+            .unwrap();
+        let unspecified =
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, held.local_addr().unwrap().port()));
+        let refused = SocketEgress::System
+            .bind_udp_reusing(unspecified, false)
+            .unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::AddrInUse);
+
+        let held = SocketEgress::System.listen_tcp(loopback, false).unwrap();
+        let unspecified =
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, held.local_addr().unwrap().port()));
+        let refused = SocketEgress::System
+            .listen_tcp(unspecified, false)
+            .unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::AddrInUse);
+    }
+
+    // A listener at the unspecified IPv6 address is dual stack, so it takes
+    // an IPv4 peer.
+    #[test]
+    #[expect(clippy::disallowed_methods, reason = "a loopback fixture")]
+    fn a_listener_at_the_unspecified_v6_address_takes_an_ipv4_peer() {
+        let listener = SocketEgress::System
+            .listen_tcp("[::]:0".parse().unwrap(), true)
+            .unwrap();
+        let socket = socket2::SockRef::from(&listener);
+        assert!(socket.reuse_address().unwrap());
+        assert!(!socket.only_v6().unwrap());
+        assert!(listener.local_addr().unwrap().ip().is_unspecified());
+    }
+
+    // A listener on an interface at the unspecified IPv6 address keeps to
+    // IPv6; an egress held to an interface names one that exists.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    #[expect(clippy::disallowed_methods, reason = "a loopback fixture")]
+    fn an_interface_listener_keeps_to_ipv6_on_an_existing_interface() {
+        let device = if cfg!(target_os = "linux") {
+            "lo"
+        } else {
+            "lo0"
+        };
+        assert_eq!(
+            SocketEgress::existing_interface("weaver-none0")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        let egress = SocketEgress::existing_interface(device).unwrap();
+        assert_eq!(egress, SocketEgress::Interface(device.into()));
+        let listener = match egress.listen_tcp("[::]:0".parse().unwrap(), false) {
+            Ok(listener) => listener,
+            // Binding to a device needs a privilege some Linux hosts withhold.
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("{error}"),
+        };
+        assert!(socket2::SockRef::from(&listener).only_v6().unwrap());
+    }
+
+    // The IPv6 sources an egress may leave from are the preferred addresses
+    // of interfaces that are up, in its scope, with what libtorrent reads of
+    // their interface: whether it holds a loopback address, is a
+    // point-to-point link, and holds the address the internet route leaves
+    // from.
+    #[test]
+    fn the_ipv6_sources_are_the_preferred_addresses_of_interfaces_up_in_scope() {
+        let at = |name: &str, ip: &str, up: bool, point_to_point: bool| Listed {
+            name: name.into(),
+            ip: ip.parse().unwrap(),
+            up,
+            point_to_point,
+        };
+        let listed = [
+            at("lo0", "::1", true, false),
+            at("lo0", "fe80::1", true, false),
+            at("en0", "192.0.2.4", true, false),
+            at("en0", "2001:db8::4", true, false),
+            at("en0", "2001:db8::5", true, false),
+            at("en0", "2001:db8::6", true, false),
+            at("utun1", "fd00::9", true, true),
+            at("en1", "2001:db8::8", false, false),
+        ];
+        // 2001:db8::5 is deprecated, 2001:db8::6 tentative.
+        let flags = [
+            (false, false),
+            (false, false),
+            (false, false),
+            (false, false),
+            (true, false),
+            (false, true),
+            (false, false),
+            (false, false),
+        ];
+        let source = |ip: &str, loopback_interface, point_to_point, internet_route| Ipv6Source {
+            ip: ip.parse().unwrap(),
+            loopback_interface,
+            point_to_point,
+            internet_route,
+        };
+        let internet = Some("2001:db8::4".parse().unwrap());
+
+        let all = pick_ipv6_sources(&SocketEgress::System, &listed, &flags, internet, true);
+        assert_eq!(
+            all,
+            Ipv6Sources {
+                addresses: vec![
+                    source("::1", true, false, false),
+                    source("fe80::1", true, false, false),
+                    source("2001:db8::4", false, false, true),
+                    source("fd00::9", false, true, false),
+                ],
+                any_internet_route: true,
+            }
+        );
+
+        let on_tunnel = pick_ipv6_sources(
+            &SocketEgress::Interface("utun1".into()),
+            &listed,
+            &flags,
+            None,
+            false,
+        );
+        assert_eq!(
+            on_tunnel,
+            Ipv6Sources {
+                addresses: vec![source("fd00::9", false, true, false)],
+                any_internet_route: false,
+            }
+        );
+
+        let held = pick_ipv6_sources(
+            &SocketEgress::SourceAddress("2001:db8::4".parse().unwrap()),
+            &listed,
+            &flags,
+            internet,
+            true,
+        );
+        assert_eq!(
+            held.addresses,
+            vec![source("2001:db8::4", false, false, true)]
+        );
+    }
 
     #[test]
     fn connected_hangup_preserves_the_peers_last_reply() {
@@ -210,7 +717,7 @@ mod connect_tests {
             peer.write_all(b"502 Too Many Connections\r\n").unwrap();
         });
         let socket = SocketEgress::System.tcp_socket(target).unwrap();
-        socket.connect(&target.into()).unwrap();
+        crate::test_support::loopback::connect_socket(&socket, target).unwrap();
         server.join().unwrap();
 
         // Inject the connect poll's synthesized hangup after the peer has
@@ -244,7 +751,7 @@ mod connect_tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let target = listener.local_addr().unwrap();
         let socket = SocketEgress::System.tcp_socket(target).unwrap();
-        socket.connect(&target.into()).unwrap();
+        crate::test_support::loopback::connect_socket(&socket, target).unwrap();
         let (_peer, _) = listener.accept().unwrap();
         let error = SocketEgress::finish_blocking_connect(
             socket,
@@ -279,13 +786,7 @@ fn bind_interface(socket: &Socket, name: &str, ipv6: bool) -> io::Result<()> {
     }
     #[cfg(target_os = "macos")]
     {
-        let name = std::ffi::CString::new(name)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid interface name"))?;
-        // SAFETY: CString supplies the NUL-terminated name required by libc.
-        let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
-        let index = std::num::NonZeroU32::new(index).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "egress interface does not exist")
-        })?;
+        let index = interface_index(name)?;
         if ipv6 {
             socket.bind_device_by_index_v6(Some(index))
         } else {
@@ -300,6 +801,25 @@ fn bind_interface(socket: &Socket, name: &str, ipv6: bool) -> io::Result<()> {
             "interface binding is not supported on this platform; use a source address",
         ))
     }
+}
+
+// The index of the interface called `name`.
+#[cfg(unix)]
+fn interface_index(name: &str) -> io::Result<std::num::NonZeroU32> {
+    let name = std::ffi::CString::new(name)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid interface name"))?;
+    // SAFETY: CString supplies the NUL-terminated name required by libc.
+    let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+    std::num::NonZeroU32::new(index)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "egress interface does not exist"))
+}
+
+#[cfg(not(unix))]
+fn interface_index(_name: &str) -> io::Result<std::num::NonZeroU32> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "interface binding is not supported on this platform; use a source address",
+    ))
 }
 
 // Address flags used both by health discovery and address-race family filtering.

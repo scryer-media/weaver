@@ -1,0 +1,265 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+pub fn derive_release_name(primary: Option<&str>, secondary: Option<&str>) -> String {
+    for candidate in [primary, secondary].into_iter().flatten() {
+        let trimmed = candidate.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if let Some(extracted) = extract_title_from_candidate(trimmed) {
+            let name = finalize_release_name(extracted.name);
+            return append_episode_suffix(name, extracted.episode);
+        }
+
+        let fallback = basic_release_name(trimmed);
+        if !fallback.is_empty() {
+            return finalize_release_name(fallback);
+        }
+    }
+
+    "Untitled".to_string()
+}
+
+// The name of a job's completed folder: the release title as posted, kept
+// whole, because download managers check
+// the files they import against this folder's name and the shortened display
+// name drops the season or the later episodes they look for. Only what a
+// filesystem cannot hold is taken out. A job with no original title keeps its
+// display name.
+pub fn completed_folder_name(display_name: &str, metadata: &[(String, String)]) -> String {
+    if let Some(renamed) = super::metadata::renamed_title(metadata) {
+        return weaver_model::files::sanitize_path_component(renamed);
+    }
+    metadata
+        .iter()
+        .find(|(key, _)| key == super::metadata::ORIGINAL_TITLE_METADATA_KEY)
+        .and_then(|(_, title)| release_folder_name(title))
+        .unwrap_or_else(|| weaver_model::files::sanitize_path_component(display_name))
+}
+
+// `None` when nothing a folder could be named after is left.
+fn release_folder_name(title: &str) -> Option<String> {
+    let title: String = title.chars().filter(|ch| !ch.is_control()).collect();
+    let title = strip_nzb_source_suffix(title.trim()).unwrap_or(title.trim());
+    let title = title.trim_matches([' ', '.']);
+    (!title.is_empty()).then(|| weaver_model::files::sanitize_path_component(title))
+}
+
+// Removes the source-container suffix from an uploaded NZB filename.
+pub fn strip_nzb_source_suffix(value: &str) -> Option<&str> {
+    for suffix in [".nzb.xz", ".nzb"] {
+        let suffix_start = value.len().saturating_sub(suffix.len());
+        if value
+            .get(suffix_start..)
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(suffix))
+        {
+            return value.get(..suffix_start);
+        }
+    }
+    None
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EpisodeSuffix {
+    season: Option<u32>,
+    episode: Option<u32>,
+    absolute: Option<u32>,
+}
+
+struct TitleExtraction {
+    name: String,
+    episode: Option<EpisodeSuffix>,
+}
+
+fn extract_title_from_candidate(raw: &str) -> Option<TitleExtraction> {
+    let raw = strip_nzb_suffix(raw.trim());
+    let tokens = split_release_tokens(raw);
+    if tokens.is_empty() {
+        return None;
+    }
+
+    let boundary = tokens
+        .iter()
+        .enumerate()
+        .find_map(|(index, token)| metadata_boundary(token).map(|episode| (index, episode)))?;
+
+    if boundary.0 == 0 {
+        return None;
+    }
+
+    let name = basic_release_name(&tokens[..boundary.0].join(" "));
+    if name.is_empty() {
+        return None;
+    }
+
+    Some(TitleExtraction {
+        name,
+        episode: boundary.1,
+    })
+}
+
+fn append_episode_suffix(name: String, episode: Option<EpisodeSuffix>) -> String {
+    let Some(episode) = episode else {
+        return name;
+    };
+
+    if let (Some(season), Some(episode)) = (episode.season, episode.episode) {
+        return format!("{name} — S{season:02}E{episode:02}");
+    }
+
+    if let Some(abs) = episode.absolute {
+        return format!("{name} — {abs:03}");
+    }
+
+    name
+}
+
+fn metadata_boundary(token: &str) -> Option<Option<EpisodeSuffix>> {
+    let upper = token.to_ascii_uppercase();
+    if let Some(episode) = parse_standard_episode_token(&upper) {
+        return Some(Some(episode));
+    }
+
+    if is_generic_season_token(&upper)
+        || is_plausible_year(&upper)
+        || is_quality_token(&upper)
+        || matches!(
+            upper.as_str(),
+            "PROPER"
+                | "REPACK"
+                | "REMUX"
+                | "HDR"
+                | "HDR10"
+                | "HDR10PLUS"
+                | "HLG"
+                | "DV"
+                | "DOVI"
+                | "DUAL"
+                | "DUALAUDIO"
+                | "MULTI"
+                | "TRUEHD"
+                | "ATMOS"
+                | "WEB"
+                | "WEBRIP"
+                | "WEBDL"
+                | "WEB-DL"
+                | "BLURAY"
+                | "BDRIP"
+                | "BDREMUX"
+                | "BDMUX"
+                | "BDMV"
+                | "COMPLETE"
+                | "X264"
+                | "X265"
+                | "H264"
+                | "H265"
+                | "HEVC"
+                | "AVC"
+                | "AAC"
+                | "AC3"
+                | "EAC3"
+                | "DTS"
+                | "FLAC"
+        )
+    {
+        return Some(None);
+    }
+
+    None
+}
+
+fn parse_standard_episode_token(token: &str) -> Option<EpisodeSuffix> {
+    let rest = token.strip_prefix('S')?;
+    let split = rest.find('E')?;
+    let season = rest[..split].parse::<u32>().ok()?;
+    let episode = rest[split + 1..].parse::<u32>().ok()?;
+    Some(EpisodeSuffix {
+        season: Some(season),
+        episode: Some(episode),
+        absolute: None,
+    })
+}
+
+pub fn split_release_tokens(raw: &str) -> Vec<String> {
+    raw.split(|ch: char| {
+        matches!(
+            ch,
+            '.' | '_' | '-' | '[' | ']' | '(' | ')' | '{' | '}' | ' '
+        )
+    })
+    .filter(|token| !token.is_empty())
+    .map(ToString::to_string)
+    .collect()
+}
+
+pub fn basic_release_name(raw: &str) -> String {
+    strip_nzb_suffix(raw)
+        .trim_matches(|ch: char| matches!(ch, '[' | ']' | '(' | ')' | '{' | '}'))
+        .replace(['.', '_'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn strip_nzb_suffix(raw: &str) -> &str {
+    let raw = raw.trim();
+    strip_nzb_source_suffix(raw).unwrap_or(raw).trim()
+}
+
+fn is_generic_season_token(token: &str) -> bool {
+    if let Some(season) = token.strip_prefix('S') {
+        return !season.is_empty()
+            && season.len() <= 2
+            && season.chars().all(|ch| ch.is_ascii_digit());
+    }
+
+    if let Some(season) = token.strip_prefix("SEASON") {
+        return !season.is_empty() && season.chars().all(|ch| ch.is_ascii_digit());
+    }
+
+    false
+}
+
+fn is_quality_token(token: &str) -> bool {
+    let Some(resolution) = token.strip_suffix('P') else {
+        return false;
+    };
+    matches!(resolution, "480" | "576" | "720" | "1080" | "2160" | "4320")
+}
+
+fn is_plausible_year(token: &str) -> bool {
+    let Ok(year) = token.parse::<u32>() else {
+        return false;
+    };
+    (1900..=2100).contains(&year)
+}
+
+fn finalize_release_name(name: String) -> String {
+    if name.chars().any(|ch| ch.is_ascii_lowercase()) {
+        return name;
+    }
+
+    name.split_whitespace()
+        .map(title_case_word)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn title_case_word(word: &str) -> String {
+    let mut chars = word.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+
+    let mut out = String::new();
+    out.extend(first.to_uppercase());
+    for ch in chars {
+        out.extend(ch.to_lowercase());
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests;

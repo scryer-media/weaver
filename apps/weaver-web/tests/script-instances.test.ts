@@ -14,10 +14,12 @@ import {
   inputFromForm,
   inputFromInstance,
   inputNameProblem,
+  isTorrentQueueEvent,
   jobSchedule,
   NO_SCHEDULE,
   MAX_TIMEOUT_SECONDS,
   newInstanceForm,
+  QUEUE_EVENTS,
   reorderedIds,
   scheduleFromHeader,
   triggerTitle,
@@ -28,6 +30,7 @@ import {
   type DiscoveredScript,
   type ScriptInstance,
 } from "../src/next/data/script-instances.ts";
+import { withoutTorrentOnly } from "../src/next/data/torrents-shown.ts";
 import { englishTranslate as t } from "./english-translate.ts";
 
 function instance(id: string, patch: Partial<ScriptInstance> = {}): ScriptInstance {
@@ -448,4 +451,17 @@ test("a schedule job is saved with its run times and a job of any other trigger 
   });
   assert.deepEqual(formFromInstance(saved, nightly).schedule, { times: "*:15, 23:00", days: ["mon"], startup: false });
   assert.deepEqual(inputFromInstance(saved).schedule, saved.schedule);
+});
+
+test("the events a server without torrents offers leave out the torrents' own, and only those", () => {
+  const offered = withoutTorrentOnly(QUEUE_EVENTS, false, isTorrentQueueEvent);
+  assert.ok(offered.length > 0);
+  assert.ok(offered.every((event) => !event.startsWith("TORRENT_") && !event.startsWith("SEEDING_")));
+  assert.deepEqual(
+    QUEUE_EVENTS.filter((event) => !offered.includes(event)),
+    QUEUE_EVENTS.filter((event) => isTorrentQueueEvent(event)),
+  );
+  assert.ok(QUEUE_EVENTS.some((event) => isTorrentQueueEvent(event)));
+  // With torrents, every event is offered.
+  assert.deepEqual(withoutTorrentOnly(QUEUE_EVENTS, true, isTorrentQueueEvent), [...QUEUE_EVENTS]);
 });

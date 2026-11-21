@@ -55,6 +55,7 @@ fn job(id: u64) -> JobInfo {
     };
     JobInfo {
         job_id: JobId(id),
+        protocol: Default::default(),
         job_hash: None,
         name: format!("Silver.Horizon.S05E{id:05}.1080p.BluRay.DD5.1.x264-WVR"),
         error: None,
@@ -95,6 +96,8 @@ fn job(id: u64) -> JobInfo {
             ("nzbget.dupe_key".to_string(), format!("tvdb-{id}")),
         ],
         output_dir: Some(format!("/data/complete/tv/Silver.Horizon.S05E{id:05}")),
+        disk_need_bytes: None,
+        disk_free_bytes: None,
         created_at_epoch_ms: 1_900_000_000_000.0,
         server_attribution: Vec::new(),
     }

@@ -157,7 +157,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -168,7 +168,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -208,6 +208,24 @@ dependencies = [
  "tracing",
  "url",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "ar_archive_writer"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73cd58deff2140a0a8eae87e417bd01db68a33e148aa93d1e8cd837e55e312b6"
+dependencies = [
+ "object",
+]
+
+[[package]]
+name = "arc-swap"
+version = "1.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "380962b3d93b99642e50b9febf72c071e97e8b32d86eae9cf4ef582bb960ae6e"
+dependencies = [
+ "rustversion",
 ]
 
 [[package]]
@@ -567,6 +585,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "atoi"
+version = "3.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d12c37257553c19e9aee6cba77814fdc9e07844abfc8b3a2c377cd920ee5a993"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -656,6 +683,17 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
+]
+
+[[package]]
+name = "backon"
+version = "1.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cffb0e931875b666fc4fcb20fee52e9bbd1ef836fd9e9e04ec21555f9f85f7ef"
+dependencies = [
+ "fastrand",
+ "gloo-timers",
+ "tokio",
 ]
 
 [[package]]
@@ -870,6 +908,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6bb31b46c14244e20ee9984b11bf5c992b91fb6939fea616e3512c8baecdbe5f"
 dependencies = [
  "memchr",
+ "regex-automata",
  "serde_core",
 ]
 
@@ -921,7 +960,7 @@ dependencies = [
  "cap-primitives",
  "cap-std",
  "io-lifetimes 3.0.1",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -938,7 +977,7 @@ dependencies = [
  "maybe-owned",
  "rustix",
  "rustix-linux-procfs",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
  "winx",
 ]
 
@@ -1028,6 +1067,17 @@ dependencies = [
  "cipher 0.4.4",
  "poly1305 0.8.0",
  "zeroize",
+]
+
+[[package]]
+name = "chardetng"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13de944a44b5064ee5d3a5ceccc49a41bfec50f2580e66f82e87703acdb88b53"
+dependencies = [
+ "cfg-if",
+ "encoding_rs",
+ "memchr",
 ]
 
 [[package]]
@@ -1371,6 +1421,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
+name = "crypto-bigint"
+version = "0.7.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "914c195c4d7fbc5ed7f88d14cbf85914d5c664967658d43404b263913a477e82"
+dependencies = [
+ "cpubits",
+ "ctutils",
+ "hybrid-array",
+ "num-traits",
+ "rand_core 0.10.1",
+ "serdect",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1393,6 +1459,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "crypto-primes"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3633a51a39c69ebbaa4feaa694bd83d241e4093901c84a0963b19d9bb3f0cf8f"
+dependencies = [
+ "crypto-bigint",
+ "rand_core 0.10.1",
+]
+
+[[package]]
 name = "ctr"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1408,6 +1484,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "261af4dc7a06ea8a527a8717d8cbba3417530d6ea14e1edb3de6b67806be474f"
 dependencies = [
  "cmov",
+ "subtle",
 ]
 
 [[package]]
@@ -1491,6 +1568,21 @@ dependencies = [
  "darling_core",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "dashmap"
+version = "6.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6361d5c062261c78a176addb82d4c821ae42bed6089de0e12603cd25de2059c"
+dependencies = [
+ "cfg-if",
+ "crossbeam-utils",
+ "hashbrown 0.14.5",
+ "lock_api",
+ "once_cell",
+ "parking_lot_core",
+ "serde",
 ]
 
 [[package]]
@@ -1679,6 +1771,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
+name = "ecdsa"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0681a4fc24c767085329728d8dfba959af91228aa4610cca4f8ce317ba46ae0"
+dependencies = [
+ "der",
+ "digest 0.11.3",
+ "elliptic-curve",
+ "rfc6979",
+ "signature",
+ "zeroize",
+]
+
+[[package]]
 name = "ed25519"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1711,6 +1817,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "elliptic-curve"
+version = "0.14.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "900f37e7e18d74a2347389af6cd69e3a30d5cc9e697f40004865679aa75e9c7c"
+dependencies = [
+ "base16ct",
+ "crypto-bigint",
+ "crypto-common 0.2.2",
+ "digest 0.11.3",
+ "ff",
+ "group",
+ "hybrid-array",
+ "rand_core 0.10.1",
+ "sec1",
+ "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -1793,7 +1918,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1842,6 +1967,16 @@ name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
+
+[[package]]
+name = "ff"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1f686ab92a9fb0eaf188f6c6c87b89490baa6fdb0db4544ba4dc47f7942489f"
+dependencies = [
+ "rand_core 0.10.1",
+ "subtle",
+]
 
 [[package]]
 name = "fiat-crypto"
@@ -2045,6 +2180,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cd417de3d1d015fc3bfd2b1ea46dfc7bab72ef86f1cc7cc9c78e728b34a6d1fd"
 
 [[package]]
+name = "futures-timer"
+version = "3.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af43fadb8a98512d547e37b4e92e0ced13e205c061b87b4623eff01d918d6968"
+
+[[package]]
 name = "futures-util"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2102,9 +2243,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -2145,6 +2288,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "gloo-timers"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbb143cf96099802033e0d4f4963b19fd2e0b728bcf076cd9cf7f6634f092994"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "js-sys",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "gotatun"
 version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2179,15 +2334,68 @@ dependencies = [
  "tokio-util",
  "tracing",
  "typed-builder",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
  "x25519-dalek",
  "zerocopy",
 ]
 
 [[package]]
+name = "governor"
+version = "0.10.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9efcab3c1958580ff1f25a2a41be1668f7603d849bb63af523b208a3cc1223b8"
+dependencies = [
+ "cfg-if",
+ "dashmap",
+ "futures-sink",
+ "futures-timer",
+ "futures-util",
+ "getrandom 0.3.4",
+ "hashbrown 0.16.1",
+ "nonzero_ext",
+ "parking_lot",
+ "portable-atomic",
+ "quanta",
+ "rand 0.9.5",
+ "smallvec",
+ "spinning_top",
+ "web-time",
+]
+
+[[package]]
+name = "group"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7fd1a1c7a5206c5b7a3f5a0d7ccd3ff85d0c8f5133d62a02680255b0004af5f4"
+dependencies = [
+ "ff",
+ "rand_core 0.10.1",
+ "subtle",
+]
+
+[[package]]
+name = "h2"
+version = "0.4.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d29020232d6aa3fb1daca64c1127cf662cf97f254ae16c18c05b8ab635fc118"
+dependencies = [
+ "atomic-waker",
+ "bytes",
+ "fnv",
+ "futures-core",
+ "futures-sink",
+ "http",
+ "indexmap",
+ "slab",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "h3"
 version = "0.0.8"
-source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.5.2#726e91a360e69df2c7f48f226e7b3674a1efaae4"
+source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.7.0#0769732cfb921d7eb8ea6557c7d89c2e617217b4"
 dependencies = [
  "bytes",
  "fastrand",
@@ -2200,7 +2408,7 @@ dependencies = [
 [[package]]
 name = "h3-quinn"
 version = "0.0.10"
-source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.5.2#726e91a360e69df2c7f48f226e7b3674a1efaae4"
+source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.7.0#0769732cfb921d7eb8ea6557c7d89c2e617217b4"
 dependencies = [
  "bytes",
  "futures",
@@ -2229,6 +2437,12 @@ checksum = "47d60b12902ba28e2730cd37e95b8c9223af2808df9e902d4df49588d1470606"
 dependencies = [
  "byteorder",
 ]
+
+[[package]]
+name = "hashbrown"
+version = "0.14.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
 
 [[package]]
 name = "hashbrown"
@@ -2380,6 +2594,8 @@ version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27f864f10dfb56725ce5ce5472bc52252c8f93a4ab86327122cebf62c5f59a17"
 dependencies = [
+ "ctutils",
+ "subtle",
  "typenum",
  "zeroize",
 ]
@@ -2392,7 +2608,9 @@ checksum = "2c3e324da4c95177d6291d4c8730197c0d1822f8a9766814a4a44fa5ab797c9c"
 dependencies = [
  "atomic-waker",
  "bytes",
+ "futures-channel",
  "futures-core",
+ "h2",
  "http",
  "http-body",
  "httparse",
@@ -2792,6 +3010,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "keccak"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8f198d1db720e4940b5a493201d199d9f24f568f8f746bd13706243a2f71598"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.1",
+]
+
+[[package]]
 name = "keyring"
 version = "4.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2925,9 +3153,9 @@ dependencies = [
 
 [[package]]
 name = "lzma-turbo"
-version = "0.12.0"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c0ad0959852261cd7449e6de6da34dc6cc310d0dc5fa459bb65f5bd81afa37e"
+checksum = "a1ef81665372dceeff7cf5bd7ceb56d28b48661b544ac78a70edb46ba7e5c361"
 dependencies = [
  "aws-lc-rs",
  "crc-turbo",
@@ -3048,6 +3276,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "ml-dsa"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f6d49c3f3f0e10e18ca975ffda66f8da0ec36521c1d911adcbc521bf0743f5c"
+dependencies = [
+ "crypto-common 0.2.2",
+ "ctutils",
+ "hybrid-array",
+ "module-lattice",
+ "pkcs8",
+ "shake",
+ "signature",
+]
+
+[[package]]
+name = "module-lattice"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4a1e412c8ee83a1c678f427806219c49c96b2511b9f07497514f0e43fb26155"
+dependencies = [
+ "ctutils",
+ "hybrid-array",
+ "num-traits",
+]
+
+[[package]]
 name = "multer"
 version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3071,6 +3325,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
+name = "network-interface"
+version = "2.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ddcb8865ad3d9950f22f42ffa0ef0aecbfbf191867b3122413602b0a360b2a6"
+dependencies = [
+ "cc",
+ "libc",
+ "thiserror 2.0.21",
+ "winapi",
+]
+
+[[package]]
 name = "nix"
 version = "0.31.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3092,6 +3358,12 @@ dependencies = [
  "memchr",
  "minimal-lexical",
 ]
+
+[[package]]
+name = "nonzero_ext"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38bf9645c8b145698bb0b18a4637dcacbc421ea49bef2317e4fd8065a387cf21"
 
 [[package]]
 name = "notify"
@@ -3127,7 +3399,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3283,6 +3555,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "object"
+version = "0.39.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e5a6c098c7a3b6547378093f5cc30bc54fd361ce711e05293a5cc589562739b"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "oid-registry"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3343,6 +3624,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "p256"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2c9239b2dbc807adbbe147e8cf72ea7450c3a0aabe62cb8e75ff4ec22e1f72a"
+dependencies = [
+ "ecdsa",
+ "elliptic-curve",
+ "primefield",
+ "primeorder",
+ "sha2 0.11.1",
+]
+
+[[package]]
+name = "p384"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d17b851e6b3e378ab4ecb07fa2ed23f4d15f075735f8fec9fa1e7bdce5f8301f"
+dependencies = [
+ "ecdsa",
+ "elliptic-curve",
+ "fiat-crypto 0.3.0",
+ "primefield",
+ "primeorder",
+ "sha2 0.11.1",
+]
+
+[[package]]
 name = "page_size"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3373,9 +3681,9 @@ dependencies = [
 
 [[package]]
 name = "par2-rs"
-version = "0.12.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c26ff4dc62c0d93420fe90d87c905c66da3bd13d2a1036a67004a48d00103c8a"
+checksum = "6c77c65675099cc57866d63a55cca3d8b28167c5bbf77315a1d04922049c4964"
 dependencies = [
  "bytes",
  "cap-std",
@@ -3502,9 +3810,9 @@ dependencies = [
 
 [[package]]
 name = "pest_stack_guard"
-version = "1.0.0"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97e6cd2217057fa86b6eaa512917e58089d875b957a31e35e7ab729977e0a5f2"
+checksum = "9ac6154fd4418b8f0b82532c59c26f303f9ca59a64c883e8ce3971fd82733439"
 dependencies = [
  "psm",
  "stacker",
@@ -3669,6 +3977,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "portable-atomic"
+version = "1.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
+
+[[package]]
 name = "potential_utf"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3699,6 +4013,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "primefield"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c555a6e4eb7d4e158fcb028c835c3b8642206ddc279b5c6b202ef9a8bdb592f4"
+dependencies = [
+ "crypto-bigint",
+ "crypto-common 0.2.2",
+ "ff",
+ "rand_core 0.10.1",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "primeorder"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c9f42978c78a00e3d68f69fc03e57a234debae69da4020a4fb588fcdcd07b06"
+dependencies = [
+ "elliptic-curve",
+ "primefield",
+ "wnaf",
+]
+
+[[package]]
 name = "proc-macro-crate"
 version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3718,8 +4057,8 @@ dependencies = [
 
 [[package]]
 name = "proxy-tunnels"
-version = "0.5.2"
-source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.5.2#726e91a360e69df2c7f48f226e7b3674a1efaae4"
+version = "0.7.0"
+source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.7.0#0769732cfb921d7eb8ea6557c7d89c2e617217b4"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3742,11 +4081,27 @@ dependencies = [
 
 [[package]]
 name = "psm"
-version = "0.1.24"
+version = "0.1.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "200b9ff220857e53e184257720a14553b2f4aa02577d2ed9842d45d4b9654810"
+checksum = "4dcd034599e63b970727f70d79e02d62390a4a84f7c6b827c27c46d5ac3fa622"
 dependencies = [
+ "ar_archive_writer",
  "cc",
+]
+
+[[package]]
+name = "quanta"
+version = "0.12.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3ab5a9d756f0d97bdc89019bd2e4ea098cf9cde50ee7564dde6b81ccc8f06c7"
+dependencies = [
+ "crossbeam-utils",
+ "libc",
+ "once_cell",
+ "raw-cpuid",
+ "wasi",
+ "web-sys",
+ "winapi",
 ]
 
 [[package]]
@@ -3756,6 +4111,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "41b1177fdf999d2321d3fb46ff47159d9c1fb9ad66a4879f8c50a0b504615e9b"
 dependencies = [
  "memchr",
+ "serde",
 ]
 
 [[package]]
@@ -3813,7 +4169,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3908,6 +4264,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "raw-cpuid"
+version = "11.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "498cd0dc59d73224351ee52a95fee0f1a617a2eae0e7d9d720cc622c73a54186"
+dependencies = [
+ "bitflags 2.13.2",
+]
+
+[[package]]
 name = "rayon"
 version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3952,9 +4317,9 @@ dependencies = [
 
 [[package]]
 name = "reedsolomon-rs"
-version = "0.4.11"
+version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81f4afa0094e231cfcb6b23f9f6f568db67097fa7a2a9bae0992d339e7555fc3"
+checksum = "cf1e4e028b1a313a24f4fb7155a7ce374a53fb2d2d0ab7b4de38cb2d2c6ab12a"
 dependencies = [
  "memmap2",
  "rayon",
@@ -4030,6 +4395,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rfc6979"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4a459cddafb3fe76b31fd8f1108007566c40301feb64dc7b54656eb7388172b"
+dependencies = [
+ "crypto-bigint",
+ "hmac 0.13.0",
+]
+
+[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4060,6 +4435,25 @@ checksum = "72f81bee8c8ef9b577d1681a70ebbc962c232461e397b22c208c43c04b67a155"
 dependencies = [
  "rmp",
  "serde",
+]
+
+[[package]]
+name = "rsa"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23e77fd77e0dea28b3011fd62d15445b7de7959333b0276d930e03be0f755699"
+dependencies = [
+ "const-oid",
+ "crypto-bigint",
+ "crypto-common 0.2.2",
+ "crypto-primes",
+ "digest 0.11.3",
+ "hmac 0.13.0",
+ "rand_core 0.10.1",
+ "sha1 0.11.0",
+ "sha2 0.11.1",
+ "signature",
+ "zeroize",
 ]
 
 [[package]]
@@ -4207,7 +4601,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4275,7 +4669,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4419,7 +4813,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d56d437c2f19203ce5f7122e507831de96f3d2d4d3be5af44a0b0a09d8a80e4d"
 dependencies = [
  "base16ct",
+ "ctutils",
+ "der",
  "hybrid-array",
+ "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -4583,10 +4981,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "sevenz-turbo"
-version = "0.30.1"
+name = "serdect"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7737abec9967c66dde8305e31f7f9476d13977f41b82a593929e86f4928e9584"
+checksum = "66cf8fedced2fcf12406bcb34223dffb92eaf34908ede12fed414c82b7f00b3e"
+dependencies = [
+ "base16ct",
+ "serde",
+]
+
+[[package]]
+name = "sevenz-turbo"
+version = "0.30.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "784d55b4665741045e1ec4fbc3985225c720f5268d5d87de4445ea26b2b68594"
 dependencies = [
  "aws-lc-rs",
  "brotli",
@@ -4648,6 +5056,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "shake"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09057cb2149ad4cbd2da1e26b351f9a4c354219421229c69c3063e6f61947c4a"
+dependencies = [
+ "digest 0.11.3",
+ "keccak",
+ "sponge-cursor",
+]
+
+[[package]]
 name = "sharded-slab"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4678,6 +5097,7 @@ version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28d567dcbaf0049cb8ac2608a76cd95ff9e4412e1899d389ee400918ca7537f5"
 dependencies = [
+ "digest 0.11.3",
  "rand_core 0.10.1",
 ]
 
@@ -4762,7 +5182,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4781,6 +5201,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
 
 [[package]]
+name = "spinning_top"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9cf02766a1eb909bc7653557c66b384e44edc3ad979e6257c6173c65ea51bc7d"
+dependencies = [
+ "lock_api",
+]
+
+[[package]]
 name = "spki"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4789,6 +5218,12 @@ dependencies = [
  "base64ct",
  "der",
 ]
+
+[[package]]
+name = "sponge-cursor"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a0219bd7d979d58245a4f41f695e1ac9f8befdffadd7f61f1bae9e39abc6620"
 
 [[package]]
 name = "sqlx"
@@ -4912,7 +5347,7 @@ version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "87a2bdd6e83f6b3ea525ca9fee568030508b58355a43d0b2c1674d5f79dcd65e"
 dependencies = [
- "atoi",
+ "atoi 2.0.0",
  "base64 0.22.1",
  "bitflags 2.13.2",
  "byteorder",
@@ -4948,7 +5383,7 @@ version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488e99c397a62007e4229aec669a179816339afc6d2620ca6fa420dbee2e982c"
 dependencies = [
- "atoi",
+ "atoi 2.0.0",
  "chrono",
  "flume",
  "form_urlencoded",
@@ -5037,7 +5472,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5170,7 +5605,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5403,6 +5838,7 @@ dependencies = [
  "futures-core",
  "futures-io",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "tokio",
@@ -5724,7 +6160,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5782,9 +6218,9 @@ dependencies = [
 
 [[package]]
 name = "unrar-rs"
-version = "0.16.3"
+version = "0.16.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68a270e0acc3c80936322a437e8ab0bd4affed2745304744e0a81fe4c035b9c8"
+checksum = "6baf20fd1d5ca100a72e822e105df57a005eb7327a216dd2a81d5663a8a5839b"
 dependencies = [
  "aws-lc-rs",
  "blake2s_simd",
@@ -5829,6 +6265,7 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+ "serde_derive",
 ]
 
 [[package]]
@@ -5858,6 +6295,7 @@ version = "1.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a0e2d11620c50695fe12bbbfde96b3477fe606e7284c22d505c12ce51214514"
 dependencies = [
+ "getrandom 0.4.3",
  "js-sys",
  "serde_core",
  "wasm-bindgen",
@@ -6005,7 +6443,7 @@ dependencies = [
 
 [[package]]
 name = "weaver"
-version = "0.16.16"
+version = "0.16.17"
 dependencies = [
  "aho-corasick",
  "application-updater",
@@ -6066,8 +6504,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "weaver-dnssec"
+version = "0.16.17"
+dependencies = [
+ "aws-lc-rs",
+ "ed25519-dalek",
+ "ml-dsa",
+ "p256",
+ "p384",
+ "rsa",
+ "sha1 0.11.0",
+ "sha2 0.11.1",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "weaver-graph"
-version = "0.16.16"
+version = "0.16.17"
 dependencies = [
  "bytes",
  "crc-turbo",
@@ -6080,14 +6533,14 @@ dependencies = [
 
 [[package]]
 name = "weaver-model"
-version = "0.16.16"
+version = "0.16.17"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "weaver-nntp"
-version = "0.16.16"
+version = "0.16.17"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6116,7 +6569,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-nzb"
-version = "0.16.16"
+version = "0.16.17"
 dependencies = [
  "blake3",
  "html-escape 0.3.0",
@@ -6130,7 +6583,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-objects"
-version = "0.16.16"
+version = "0.16.17"
 dependencies = [
  "aws-lc-rs",
  "brotli",
@@ -6155,7 +6608,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-api"
-version = "0.16.16"
+version = "0.16.17"
 dependencies = [
  "async-graphql",
  "async-stream",
@@ -6166,6 +6619,7 @@ dependencies = [
  "flate2",
  "hex",
  "lzma-turbo",
+ "rcgen",
  "regex",
  "reqwest",
  "scryer-release-parser",
@@ -6185,13 +6639,57 @@ dependencies = [
 ]
 
 [[package]]
-name = "weaver-server-core"
-version = "0.16.16"
+name = "weaver-server-auth"
+version = "0.16.17"
 dependencies = [
- "aes-gcm",
- "application-updater",
  "argon2",
- "artifact-trust",
+ "base64 0.23.1",
+ "getrandom 0.4.3",
+ "hex",
+ "hmac 0.13.0",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "weaver-server-base",
+ "weaver-server-db",
+ "weaver-server-settings",
+]
+
+[[package]]
+name = "weaver-server-base"
+version = "0.16.17"
+dependencies = [
+ "chrono",
+ "crc-turbo",
+ "flate2",
+ "http",
+ "ipnet",
+ "libc",
+ "par2-rs",
+ "par3-rs",
+ "rayon",
+ "reedsolomon-rs",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "url",
+ "weaver-model",
+ "weaver-tunnel",
+ "weaver-yenc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "weaver-server-composition"
+version = "0.16.17"
+dependencies = [
+ "anyhow",
  "async-trait",
  "axum",
  "base64 0.23.1",
@@ -6205,17 +6703,11 @@ dependencies = [
  "cap-std",
  "chrono",
  "crc-turbo",
- "criterion",
- "crossbeam-queue",
  "filetime",
  "flate2",
  "getrandom 0.4.3",
  "hex",
- "hmac 0.13.0",
  "http",
- "httpdate",
- "if-addrs",
- "ipnet",
  "keyring",
  "keyring-core",
  "libc",
@@ -6226,16 +6718,17 @@ dependencies = [
  "pbkdf2",
  "quick-xml",
  "rayon",
+ "rcgen",
  "reedsolomon-rs",
  "regex",
  "reqwest",
  "rmp-serde",
  "security-framework",
  "security-framework-sys",
- "semver",
  "serde",
  "serde_json",
  "sevenz-turbo",
+ "sha1 0.11.0",
  "sha2 0.11.1",
  "sqlx",
  "tar",
@@ -6245,15 +6738,29 @@ dependencies = [
  "tokio-rustls",
  "toml",
  "tracing",
- "unicase",
- "unicode-normalization",
  "unrar-rs",
- "url",
  "weaver-graph",
  "weaver-model",
  "weaver-nntp",
  "weaver-nzb",
  "weaver-objects",
+ "weaver-server-auth",
+ "weaver-server-base",
+ "weaver-server-composition",
+ "weaver-server-db",
+ "weaver-server-disk",
+ "weaver-server-history",
+ "weaver-server-ingest",
+ "weaver-server-jobs",
+ "weaver-server-migrations",
+ "weaver-server-net",
+ "weaver-server-net-runtime",
+ "weaver-server-postproc",
+ "weaver-server-rss",
+ "weaver-server-settings",
+ "weaver-server-speedtest",
+ "weaver-server-torrent-store",
+ "weaver-torrent",
  "weaver-tunnel",
  "weaver-yenc",
  "windows-sys 0.61.2",
@@ -6262,31 +6769,653 @@ dependencies = [
 ]
 
 [[package]]
+name = "weaver-server-core"
+version = "0.16.17"
+dependencies = [
+ "aes-gcm",
+ "application-updater",
+ "argon2",
+ "artifact-trust",
+ "axum",
+ "blake3",
+ "chrono",
+ "criterion",
+ "flate2",
+ "getrandom 0.4.3",
+ "hex",
+ "http",
+ "httpdate",
+ "pbkdf2",
+ "reqwest",
+ "rmp-serde",
+ "semver",
+ "serde",
+ "serde_json",
+ "sevenz-turbo",
+ "sha1 0.11.0",
+ "sha2 0.11.1",
+ "sqlx",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "toml",
+ "tracing",
+ "url",
+ "weaver-model",
+ "weaver-nntp",
+ "weaver-nzb",
+ "weaver-server-auth",
+ "weaver-server-base",
+ "weaver-server-composition",
+ "weaver-server-db",
+ "weaver-server-migrations",
+ "weaver-server-orchestration",
+ "weaver-server-pipeline",
+ "weaver-server-settings",
+ "weaver-server-torrents",
+ "weaver-torrent",
+ "weaver-tunnel",
+ "windows-sys 0.61.2",
+ "zstd",
+]
+
+[[package]]
+name = "weaver-server-db"
+version = "0.16.17"
+dependencies = [
+ "aes-gcm",
+ "aws-lc-rs",
+ "base64 0.23.1",
+ "chrono",
+ "getrandom 0.4.3",
+ "hmac 0.13.0",
+ "keyring",
+ "security-framework",
+ "security-framework-sys",
+ "serde_json",
+ "sha2 0.11.1",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "weaver-server-base",
+ "weaver-server-disk",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "weaver-server-disk"
+version = "0.16.17"
+dependencies = [
+ "bytes",
+ "cap-std",
+ "getrandom 0.4.3",
+ "libc",
+ "serde",
+ "serde_json",
+ "sevenz-turbo",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "weaver-graph",
+ "weaver-server-base",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "weaver-server-history"
+version = "0.16.17"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "unicode-normalization",
+ "weaver-server-base",
+ "weaver-server-db",
+ "weaver-server-ingest",
+ "weaver-server-jobs",
+ "weaver-server-settings",
+]
+
+[[package]]
+name = "weaver-server-ingest"
+version = "0.16.17"
+dependencies = [
+ "blake3",
+ "brotli",
+ "bzip2",
+ "flate2",
+ "http",
+ "lzma-turbo",
+ "rayon",
+ "serde",
+ "sevenz-turbo",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tracing",
+ "unrar-rs",
+ "url",
+ "weaver-model",
+ "weaver-nzb",
+ "weaver-server-base",
+ "weaver-server-db",
+ "weaver-server-disk",
+ "weaver-server-jobs",
+ "weaver-server-settings",
+ "zip",
+ "zstd",
+]
+
+[[package]]
+name = "weaver-server-jobs"
+version = "0.16.17"
+dependencies = [
+ "bitvec",
+ "blake3",
+ "cap-fs-ext",
+ "cap-std",
+ "chrono",
+ "libc",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "unicase",
+ "unicode-normalization",
+ "url",
+ "weaver-graph",
+ "weaver-model",
+ "weaver-server-base",
+ "weaver-server-db",
+ "zstd",
+]
+
+[[package]]
+name = "weaver-server-migrations"
+version = "0.16.17"
+dependencies = [
+ "blake3",
+ "chrono",
+ "getrandom 0.4.3",
+ "hex",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+ "weaver-server-base",
+ "weaver-server-db",
+ "weaver-server-history",
+ "weaver-server-ingest",
+ "weaver-server-jobs",
+ "weaver-server-net",
+ "weaver-server-postproc",
+ "weaver-server-settings",
+ "weaver-server-torrent-store",
+ "zstd",
+]
+
+[[package]]
+name = "weaver-server-net"
+version = "0.16.17"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "chrono",
+ "hex",
+ "http",
+ "if-addrs",
+ "serde",
+ "serde_json",
+ "sha1 0.11.0",
+ "tokio",
+ "weaver-nntp",
+ "weaver-server-base",
+ "weaver-server-db",
+ "weaver-server-disk",
+ "weaver-server-jobs",
+ "weaver-torrent",
+ "weaver-tunnel",
+]
+
+[[package]]
+name = "weaver-server-net-runtime"
+version = "0.16.17"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "getrandom 0.4.3",
+ "hex",
+ "http",
+ "quick-xml",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "weaver-nntp",
+ "weaver-nzb",
+ "weaver-server-base",
+ "weaver-server-db",
+ "weaver-server-history",
+ "weaver-server-ingest",
+ "weaver-server-jobs",
+ "weaver-server-net",
+ "weaver-server-postproc",
+ "weaver-server-rss",
+ "weaver-server-settings",
+ "weaver-server-speedtest",
+ "weaver-server-torrent-store",
+ "weaver-torrent",
+ "weaver-tunnel",
+ "weaver-yenc",
+]
+
+[[package]]
+name = "weaver-server-orchestration"
+version = "0.16.17"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "chrono",
+ "filetime",
+ "flate2",
+ "notify",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "weaver-model",
+ "weaver-nntp",
+ "weaver-nzb",
+ "weaver-server-base",
+ "weaver-server-composition",
+ "weaver-server-disk",
+ "weaver-server-ingest",
+ "weaver-server-pipeline",
+ "weaver-server-settings",
+ "weaver-tunnel",
+ "zstd",
+]
+
+[[package]]
+name = "weaver-server-pipeline"
+version = "0.16.17"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "bitvec",
+ "blake3",
+ "brotli",
+ "bytes",
+ "bzip2",
+ "cap-fs-ext",
+ "cap-primitives",
+ "cap-std",
+ "chrono",
+ "crc-turbo",
+ "filetime",
+ "flate2",
+ "getrandom 0.4.3",
+ "hex",
+ "http",
+ "keyring",
+ "keyring-core",
+ "libc",
+ "lzma-turbo",
+ "notify",
+ "par2-rs",
+ "par3-rs",
+ "pbkdf2",
+ "quick-xml",
+ "rayon",
+ "rcgen",
+ "reedsolomon-rs",
+ "regex",
+ "reqwest",
+ "rmp-serde",
+ "security-framework",
+ "security-framework-sys",
+ "serde",
+ "serde_json",
+ "sevenz-turbo",
+ "sha1 0.11.0",
+ "sha2 0.11.1",
+ "sqlx",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "toml",
+ "tracing",
+ "unrar-rs",
+ "weaver-graph",
+ "weaver-model",
+ "weaver-nntp",
+ "weaver-nzb",
+ "weaver-objects",
+ "weaver-server-auth",
+ "weaver-server-base",
+ "weaver-server-composition",
+ "weaver-server-db",
+ "weaver-server-disk",
+ "weaver-server-history",
+ "weaver-server-ingest",
+ "weaver-server-jobs",
+ "weaver-server-migrations",
+ "weaver-server-net",
+ "weaver-server-orchestration",
+ "weaver-server-pipeline",
+ "weaver-server-postproc",
+ "weaver-server-rss",
+ "weaver-server-settings",
+ "weaver-server-speedtest",
+ "weaver-server-torrent-store",
+ "weaver-torrent",
+ "weaver-tunnel",
+ "weaver-yenc",
+ "windows-sys 0.61.2",
+ "zip",
+ "zstd",
+]
+
+[[package]]
+name = "weaver-server-postproc"
+version = "0.16.17"
+dependencies = [
+ "blake3",
+ "chrono",
+ "getrandom 0.4.3",
+ "hex",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "url",
+ "weaver-nzb",
+ "weaver-server-auth",
+ "weaver-server-base",
+ "weaver-server-db",
+ "weaver-server-history",
+ "weaver-server-ingest",
+ "weaver-server-jobs",
+ "weaver-server-net",
+ "weaver-server-rss",
+ "weaver-server-settings",
+ "windows-sys 0.61.2",
+ "zstd",
+]
+
+[[package]]
+name = "weaver-server-rss"
+version = "0.16.17"
+dependencies = [
+ "blake3",
+ "hex",
+ "serde_json",
+ "sha2 0.11.1",
+ "tokio",
+ "weaver-server-db",
+]
+
+[[package]]
+name = "weaver-server-settings"
+version = "0.16.17"
+dependencies = [
+ "blake3",
+ "crc-turbo",
+ "getrandom 0.4.3",
+ "libc",
+ "rcgen",
+ "serde",
+ "serde_json",
+ "sevenz-turbo",
+ "thiserror 2.0.21",
+ "tokio",
+ "toml",
+ "tracing",
+ "unrar-rs",
+ "url",
+ "weaver-model",
+ "weaver-server-base",
+ "weaver-server-db",
+ "weaver-server-disk",
+ "weaver-server-jobs",
+ "weaver-server-net",
+ "weaver-torrent",
+ "x509-parser",
+ "zip",
+]
+
+[[package]]
+name = "weaver-server-speedtest"
+version = "0.16.17"
+dependencies = [
+ "chrono",
+ "http",
+ "serde",
+ "serde_json",
+ "tokio",
+ "url",
+ "weaver-server-base",
+]
+
+[[package]]
+name = "weaver-server-torrent-store"
+version = "0.16.17"
+dependencies = [
+ "anyhow",
+ "base64 0.23.1",
+ "bitvec",
+ "bytes",
+ "libc",
+ "memmap2",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "weaver-graph",
+ "weaver-model",
+ "weaver-nzb",
+ "weaver-server-base",
+ "weaver-server-db",
+ "weaver-server-disk",
+ "weaver-server-history",
+ "weaver-server-jobs",
+ "weaver-server-net",
+ "weaver-server-postproc",
+ "weaver-server-settings",
+ "weaver-torrent",
+ "weaver-tunnel",
+]
+
+[[package]]
+name = "weaver-server-torrents"
+version = "0.16.17"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "bitvec",
+ "bytes",
+ "chrono",
+ "flate2",
+ "hex",
+ "libc",
+ "par2-rs",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha1 0.11.0",
+ "sqlx",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "weaver-graph",
+ "weaver-model",
+ "weaver-nntp",
+ "weaver-server-auth",
+ "weaver-server-base",
+ "weaver-server-composition",
+ "weaver-server-disk",
+ "weaver-server-orchestration",
+ "weaver-server-pipeline",
+ "weaver-server-settings",
+ "weaver-server-speedtest",
+ "weaver-server-torrent-store",
+ "weaver-server-torrents",
+ "weaver-torrent",
+ "weaver-tunnel",
+ "zip",
+]
+
+[[package]]
+name = "weaver-torrent"
+version = "0.16.17"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "arrayvec",
+ "async-compression",
+ "async-stream",
+ "async-trait",
+ "atoi 3.1.1",
+ "aws-lc-rs",
+ "backon",
+ "base64 0.23.1",
+ "bitvec",
+ "bstr",
+ "byteorder",
+ "bytes",
+ "chardetng",
+ "chrono",
+ "dashmap",
+ "data-encoding",
+ "either",
+ "encoding_rs",
+ "futures",
+ "governor",
+ "hex",
+ "http",
+ "httparse",
+ "indexmap",
+ "memchr",
+ "memmap2",
+ "mime_guess",
+ "network-interface",
+ "nix",
+ "parking_lot",
+ "percent-encoding",
+ "quick-xml",
+ "rand 0.10.3",
+ "rcgen",
+ "regex",
+ "reqwest",
+ "rustls-pki-types",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "serde_urlencoded",
+ "socket2",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "unicode-normalization",
+ "url",
+ "uuid",
+ "walkdir",
+ "weaver-model",
+ "weaver-tunnel",
+ "weaver-utp",
+ "windows",
+ "x509-parser",
+]
+
+[[package]]
 name = "weaver-tunnel"
-version = "0.16.16"
+version = "0.16.17"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
  "bytes",
+ "h2",
  "h3",
  "h3-quinn",
  "http",
+ "httparse",
+ "hyper",
  "if-addrs",
  "libc",
  "proxy-tunnels",
  "quinn",
  "rcgen",
+ "reqwest",
+ "rustls-native-certs",
  "socket2",
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
  "tracing",
+ "weaver-dnssec",
+ "webpki-roots",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
+name = "weaver-utp"
+version = "0.16.17"
+dependencies = [
+ "anyhow",
+ "bitvec",
+ "futures",
+ "libc",
+ "parking_lot",
+ "rand 0.10.3",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "weaver-yenc"
-version = "0.16.16"
+version = "0.16.17"
 dependencies = [
  "cc",
  "crc-turbo",
@@ -6397,7 +7526,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6710,7 +7839,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d6f32a0ff4a9f6f01231eb2059cc85479330739333e0e58cadf03b6af2cca10"
 dependencies = [
  "cfg-if",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6728,6 +7857,18 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+
+[[package]]
+name = "wnaf"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "795ca18b3fdb5e62bf982199278341ddcf7ebf7d32e25e212ad05d496e95f6fa"
+dependencies = [
+ "ff",
+ "group",
+ "hybrid-array",
+ "primefield",
+]
 
 [[package]]
 name = "writeable"
@@ -7029,9 +8170,9 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "9.2.2"
+version = "9.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e408c6cc4699dd017d53dc080cd51c2cea2b5354af57a1479bd265ed42911487"
+checksum = "eaeb7f16d2605b49aef586996ded29e65642fab7259a3077e537351df6d80426"
 dependencies = [
  "aes",
  "bzip2",

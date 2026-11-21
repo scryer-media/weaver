@@ -578,8 +578,8 @@ fn table_article(body: &[u8], pcrc32: u32) -> Vec<u8> {
 }
 
 // A lone `=` ending the last body line before the trailer, and every related
-// shape: whole-buffer, streaming and fused decode each the way rapidyenc and
-// sabctools do, byte for byte and verdict for verdict, at every wire split.
+// shape: whole-buffer, streaming and fused decode each the way rapidyenc
+// does, byte for byte and verdict for verdict, at every wire split.
 // The `=` escapes the line's `\r` (0xA3), the `\r` still breaks the line, the
 // trailer is found, and a damaged article reports its CRC mismatch with its
 // data kept.
@@ -745,4 +745,211 @@ fn escape_before_trailer_agrees_at_every_window_offset() {
             expected
         );
     }
+}
+
+// A part as a poster that does not stuff dots sends it: every line as
+// encoded, so one whose data begins with two encoded dots goes out as `..`
+// where stuffing makes it `...`. The server and every decoder after it take
+// the first dot as stuffing, and the part reads one byte short.
+fn unstuffed_article(lines: &[Vec<u8>], pcrc32: u32) -> Vec<u8> {
+    let size: usize = lines.iter().map(Vec::len).sum();
+    let mut wire = format!(
+        "=ybegin part=1 total=1 line=128 size={size} name=a\r\n=ypart begin=1 end={size}\r\n"
+    )
+    .into_bytes();
+    for line in lines {
+        let encoded: Vec<u8> = line.iter().map(|byte| byte.wrapping_add(42)).collect();
+        assert!(
+            !encoded.iter().any(|byte| matches!(byte, 0 | 10 | 13 | 61)),
+            "fixture lines carry no escapes"
+        );
+        // A line that begins with one dot is stuffed as the poster's tools
+        // stuff it; the two-dot line is the one they missed.
+        if encoded.first() == Some(&b'.') && encoded.get(1) != Some(&b'.') {
+            wire.push(b'.');
+        }
+        wire.extend_from_slice(&encoded);
+        wire.extend_from_slice(b"\r\n");
+    }
+    wire.extend_from_slice(format!("=yend size={size} part=1 pcrc32={pcrc32:08x}\r\n").as_bytes());
+    wire
+}
+
+// The byte an encoded dot decodes to.
+const DOT: u8 = b'.'.wrapping_sub(42);
+
+fn dot_lines(at: usize, count: usize, width: usize) -> Vec<Vec<u8>> {
+    (0..count)
+        .map(|index| {
+            let mut line = vec![b'A' + (index % 26) as u8; width];
+            if index == at {
+                line[0] = DOT;
+                line[1] = DOT;
+            } else if index % 7 == 3 {
+                // A rightly stuffed one-dot line on either side.
+                line[0] = DOT;
+            }
+            line
+        })
+        .collect()
+}
+
+// The part checks once the dot is kept, so it is kept: on the first line,
+// a middle one and the last, on every path at every wire split.
+#[test]
+fn an_unstuffed_two_dot_line_keeps_its_dot_when_the_part_crc_then_matches() {
+    for at in [0, 4, 9] {
+        let lines = dot_lines(at, 10, 6);
+        let data = lines.concat();
+        let article = unstuffed_article(&lines, crc32(&data));
+        let expected = Verdict {
+            data,
+            crc: CrcVerification::Verified,
+            has_trailer: true,
+            defects: YencHeaderDefects::default(),
+        };
+        assert_three_way(&article, &expected, &format!("line {at}"));
+    }
+}
+
+// Deep in a body long enough for the SIMD kernels, the kept dot lands where
+// it was dropped, and the part's segments are those of the repaired bytes.
+#[test]
+fn an_unstuffed_two_dot_line_deep_in_a_long_part_keeps_its_dot() {
+    let lines = dot_lines(377, 600, 128);
+    let data = lines.concat();
+    let crc = crc32(&data);
+    let article = unstuffed_article(&lines, crc);
+    let expected = Verdict {
+        data: data.clone(),
+        crc: CrcVerification::Verified,
+        has_trailer: true,
+        defects: YencHeaderDefects::default(),
+    };
+    assert_eq!(whole_buffer_verdict(&article), expected, "whole buffer");
+    let response = wire(&article);
+    let line = memchr::memmem::find(&response, b"\r\n..").unwrap();
+    let mut splits = vec![
+        vec![&response[..]],
+        response.chunks(64 * 1024).collect::<Vec<_>>(),
+        response.chunks(1000).collect(),
+    ];
+    for split in [line, line + 1, line + 2, line + 3, line + 4] {
+        splits.push(vec![&response[..split], &response[split..]]);
+    }
+    for chunks in &splits {
+        let sizes: Vec<_> = chunks.iter().map(|chunk| chunk.len()).collect();
+        let (streamed, _) = streaming(chunks);
+        assert_eq!(
+            Verdict::of(streamed.data, &streamed.result),
+            expected,
+            "streaming {sizes:?}"
+        );
+        let (decoded, _) = fused(chunks);
+        let result = decoded.yenc_result();
+        assert_eq!(result.part_crc, crc, "fused {sizes:?}");
+        assert_eq!(
+            result
+                .segments
+                .iter()
+                .map(|segment| (segment.file_offset, segment.len, segment.crc32))
+                .collect::<Vec<_>>(),
+            vec![(0, data.len() as u64, crc)],
+            "fused {sizes:?}"
+        );
+        assert_eq!(
+            Verdict::of(decoded.to_data(), result),
+            expected,
+            "fused {sizes:?}"
+        );
+    }
+}
+
+// A kept dot that does not make the part check is not kept: the part stays
+// one byte short with its mismatch, as rapidyenc reads it.
+#[test]
+fn an_unstuffed_two_dot_line_stays_a_mismatch_when_no_kept_dot_matches() {
+    let lines = dot_lines(4, 10, 6);
+    let data = lines.concat();
+    let article = unstuffed_article(&lines, crc32(&data) ^ 1);
+    let mut short = data.clone();
+    short.remove(4 * 6);
+    let expected = Verdict {
+        data: short,
+        crc: CrcVerification::Mismatch,
+        has_trailer: true,
+        defects: YencHeaderDefects {
+            yend_size_mismatch: true,
+            ypart_size_mismatch: true,
+            ..YencHeaderDefects::default()
+        },
+    };
+    assert_three_way(&article, &expected, "no match");
+}
+
+// A part past the 16 MiB reservation leaves the decoder in several batches,
+// and the lane takes each as it is cut, as `stream_yenc_article_response`
+// does. The dot is kept once the lane puts the batches back.
+#[test]
+fn a_dot_dropped_from_a_part_drained_in_batches_is_kept_once_the_batches_are_back() {
+    let lines = dot_lines(120_000, 17 * 1024 * 8, 128);
+    let data = lines.concat();
+    let article = unstuffed_article(&lines, crc32(&data));
+    let response = wire(&article);
+    let mut decoder = FusedYencArticleDecoder::new();
+    let mut src = BytesMut::new();
+    let mut drained = Vec::new();
+    let mut finished = None;
+    for chunk in response.chunks(64 * 1024) {
+        src.extend_from_slice(chunk);
+        match decoder.decode_available(&mut src).unwrap() {
+            Some(article) => finished = Some(article),
+            None => drained.extend(decoder.drain_output_chunks()),
+        }
+    }
+    let mut finished = finished.expect("complete response must finish");
+    assert!(!drained.is_empty(), "the part must leave in batches");
+    assert_eq!(
+        finished.yenc_result().crc_status,
+        CrcVerification::Mismatch,
+        "the decoder holds only the last batch"
+    );
+    drained.append(&mut finished.chunks);
+    finished.chunks = drained;
+    finished.keep_dropped_dot().unwrap();
+    let result = finished.yenc_result();
+    assert_eq!(result.crc_status, CrcVerification::Verified);
+    assert_eq!(result.bytes_written, data.len());
+    assert_eq!(finished.stats.decoded_bytes_written, data.len() as u64);
+    assert!(
+        finished.to_data() == data,
+        "kept dot lands where it was dropped"
+    );
+}
+
+// A single-part article checks by `crc32` and its `=ybegin size=`; the dot is
+// kept the same way.
+#[test]
+fn an_unstuffed_two_dot_line_in_a_single_part_article_keeps_its_dot() {
+    let lines = dot_lines(4, 10, 6);
+    let data = lines.concat();
+    let crc = crc32(&data);
+    let part = unstuffed_article(&lines, crc);
+    let body_start = memchr::memmem::find(&part, b"=ypart").unwrap();
+    let body_start = body_start + memchr::memchr(b'\n', &part[body_start..]).unwrap() + 1;
+    let trailer = memchr::memmem::rfind(&part, b"=yend").unwrap();
+    let size = data.len();
+    let article = [
+        format!("=ybegin line=128 size={size} name=a\r\n").as_bytes(),
+        &part[body_start..trailer],
+        format!("=yend size={size} crc32={crc:08x}\r\n").as_bytes(),
+    ]
+    .concat();
+    let expected = Verdict {
+        data,
+        crc: CrcVerification::Verified,
+        has_trailer: true,
+        defects: YencHeaderDefects::default(),
+    };
+    assert_three_way(&article, &expected, "single part");
 }

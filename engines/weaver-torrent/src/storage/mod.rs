@@ -1,0 +1,836 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+//
+// Derived from rqbit (https://github.com/ikatson/rqbit), Copyright 2021 Igor Katson,
+// licensed under the Apache License 2.0 (see LICENSE-APACHE). Modified by the
+// Weaver authors from 2026-10-20 onward.
+
+//! Storage engine for torrent data.
+//!
+//! This is deliberately sync, not async by design, for several reasons.
+//!
+//! Reason 1. Performance: avoiding copying.
+//!
+//! Torrent files are large so memcpy costs can compound. Tokio FS does all file writes in a thread
+//! pool. To do those writes it has a buffer per file. When you call e.g. "write", your request is first
+//! memcpy'ed to that buffer, and only then written to the file.
+//!
+//! On the write path (download), we write straight from the peer's socket buffer into the file.
+//! On the read path (upload), we read straight into the peer's socket buffer also.
+//!
+//! Reason 2. Memory use: memory bloat would be a problem if tokio::fs was used.
+//!
+//! The said buffers above default to 2MB. We have a lot of files open, so this can compound into a pretty large
+//! memory use.
+//!
+//! Reason 3. Performance: advanced FS APIs.
+//!
+//! We use positioned vectored writes (pwritev). Tokio doesn't support that.
+//! Positioned so that writing can be done to files in parallel without locks.
+//! Vectored so that we issue 1 write call for a potentially non-contiguous chunk.
+
+pub mod filesystem;
+
+/// A read the storage refuses because its files changed under the torrent
+/// and are not read until every piece is forgotten
+/// ([`TorrentStorage::on_check_everything`]): what is there may not be the
+/// torrent's own. Not a piece that is missing: a check that meets it ends
+/// there and has every piece checked again, and passes nothing on what it
+/// could not read.
+#[derive(Debug)]
+pub struct FilesShut;
+
+impl std::fmt::Display for FilesShut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the torrent's files are not read until its pieces are checked again")
+    }
+}
+
+impl std::error::Error for FilesShut {}
+
+impl FilesShut {
+    /// The error a read refused for it returns.
+    pub fn refused() -> std::io::Error {
+        std::io::Error::other(Self)
+    }
+
+    /// Whether `err` is a read refused for it.
+    pub fn refused_in(err: &anyhow::Error) -> bool {
+        err.chain().any(|cause| {
+            cause.is::<Self>()
+                || cause
+                    .downcast_ref::<std::io::Error>()
+                    .and_then(std::io::Error::get_ref)
+                    .is_some_and(|inner| inner.is::<Self>())
+        })
+    }
+}
+
+use std::{
+    any::{Any, TypeId},
+    io::IoSlice,
+    path::Path,
+    sync::Arc,
+    time::SystemTime,
+};
+
+use crate::core::lengths::ValidPieceIndex;
+use tokio::sync::Notify;
+
+use crate::torrent_state::{ManagedTorrentShared, TorrentMetadata};
+
+pub use crate::torrent_state::StoredPiece;
+
+/// Whether a write failed in a way later writes likely will too while reads
+/// still work: no space, a quota, a read-only or forbidding file system, a
+/// file past its size limit. The torrent stops downloading and keeps seeding
+/// (libtorrent `torrent::handle_disk_error` enters upload mode on these write
+/// errors).
+pub fn write_refused(error: &anyhow::Error) -> bool {
+    use std::io::ErrorKind::*;
+    error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                StorageFull | QuotaExceeded | ReadOnlyFilesystem | PermissionDenied | FileTooLarge
+            )
+        })
+    })
+}
+
+/// Whether a refused write was refused for want of room: no space, or a
+/// quota. Room made on the disk lets such a write go on; a read-only or
+/// forbidding file system, or a file past its size limit, does not.
+pub fn wants_room(error: &anyhow::Error) -> bool {
+    use std::io::ErrorKind::*;
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| matches!(error.kind(), StorageFull | QuotaExceeded))
+    })
+}
+
+/// Where a storage's reads take their turn: the volume its files lie on
+/// reads so many at once, for every reader of it in the process, and a
+/// spinning one reads a whole piece at a time. A storage hands its turns
+/// over when a torrent starts, and again when its files move
+/// ([`TorrentStorage::read_turns`]); every read of the torrent's files
+/// takes one of them for as long as it reads, on the thread it reads on.
+/// Cloning it is cheap.
+#[derive(Clone, Debug)]
+pub struct ReadTurns {
+    turns: Arc<tokio::sync::Semaphore>,
+    whole_pieces: bool,
+}
+
+/// Reads at once of a storage that names no volume: what one session read
+/// with before its reads took turns on their volume.
+const PRIVATE_READERS: usize = 8;
+
+impl ReadTurns {
+    /// Turns that are `turns`' permits, a whole piece read at a time when
+    /// `whole_pieces`.
+    pub fn new(turns: Arc<tokio::sync::Semaphore>, whole_pieces: bool) -> Self {
+        Self {
+            turns,
+            whole_pieces,
+        }
+    }
+
+    /// The one set of turns every storage that names no volume shares, as
+    /// one on a solid-state disk.
+    pub fn private() -> Self {
+        static PRIVATE: std::sync::LazyLock<ReadTurns> = std::sync::LazyLock::new(|| {
+            ReadTurns::new(
+                Arc::new(tokio::sync::Semaphore::new(PRIVATE_READERS)),
+                false,
+            )
+        });
+        PRIVATE.clone()
+    }
+
+    /// Whether a reader reads a whole piece at a time.
+    pub fn whole_pieces(&self) -> bool {
+        self.whole_pieces
+    }
+
+    /// A turn, waited for on the async runtime: taken without waiting when
+    /// one is free, and counted as a blocking permit is.
+    pub(crate) async fn turn(
+        &self,
+        stats: &crate::session_stats::disk::DiskStats,
+    ) -> tokio::sync::SemaphorePermit<'_> {
+        if let Ok(turn) = self.turns.try_acquire() {
+            stats.permit_taken();
+            return turn;
+        }
+        let since = std::time::Instant::now();
+        let turn = self
+            .turns
+            .acquire()
+            .await
+            .expect("read turns are never closed");
+        stats.permit_waited(since);
+        turn
+    }
+
+    /// The same turn, held apart from these turns, to hand to another
+    /// thread with the read.
+    pub(crate) async fn owned_turn(
+        &self,
+        stats: &crate::session_stats::disk::DiskStats,
+    ) -> tokio::sync::OwnedSemaphorePermit {
+        if let Ok(turn) = Arc::clone(&self.turns).try_acquire_owned() {
+            stats.permit_taken();
+            return turn;
+        }
+        let since = std::time::Instant::now();
+        let turn = Arc::clone(&self.turns)
+            .acquire_owned()
+            .await
+            .expect("read turns are never closed");
+        stats.permit_waited(since);
+        turn
+    }
+
+    /// A turn waited for on the calling thread, uncounted: a check's reader
+    /// takes one for each read, which the blocking permit counters, that
+    /// count a check once, never saw.
+    pub(crate) fn wait_here(&self) -> tokio::sync::SemaphorePermit<'_> {
+        crate::spawn_utils::no_block_on_utp_thread();
+        match self.turns.try_acquire() {
+            Ok(turn) => turn,
+            Err(_) => futures::executor::block_on(self.turns.acquire())
+                .expect("read turns are never closed"),
+        }
+    }
+
+    /// The turns themselves: whose they are, and how many are free.
+    pub fn semaphore(&self) -> &Arc<tokio::sync::Semaphore> {
+        &self.turns
+    }
+}
+
+/// Where room a [`HeldRoom`] held goes back to: the budget it was charged
+/// to.
+pub trait GivesRoomBack: Send + Sync {
+    /// `bytes` held no more.
+    fn give_back(&self, bytes: u64);
+}
+
+/// Room in a storage's memory budget for one piece an upload holds whole
+/// ([`TorrentStorage::hold_whole_piece`]): `bytes` charged before the piece
+/// is read, given back when this is dropped.
+pub struct HeldRoom {
+    bytes: u64,
+    budget: Arc<dyn GivesRoomBack>,
+}
+
+impl HeldRoom {
+    /// `bytes` the caller charged to `budget`, given back to it when this
+    /// is dropped.
+    pub fn new(bytes: u64, budget: Arc<dyn GivesRoomBack>) -> Self {
+        Self { bytes, budget }
+    }
+
+    /// The bytes held.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl Drop for HeldRoom {
+    fn drop(&mut self) {
+        self.budget.give_back(self.bytes);
+    }
+}
+
+impl std::fmt::Debug for HeldRoom {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeldRoom")
+            .field("bytes", &self.bytes)
+            .finish()
+    }
+}
+
+pub trait StorageFactory: Send + Sync + Any {
+    type Storage: TorrentStorage;
+
+    fn create(
+        &self,
+        shared: &ManagedTorrentShared,
+        metadata: &TorrentMetadata,
+    ) -> anyhow::Result<Self::Storage>;
+    fn create_and_init(
+        &self,
+        shared: &ManagedTorrentShared,
+        metadata: &TorrentMetadata,
+    ) -> anyhow::Result<Self::Storage> {
+        let mut storage = self.create(shared, metadata)?;
+        storage.init(shared, metadata)?;
+        Ok(storage)
+    }
+
+    /// Whether this factory, or the one it ultimately wraps, is of the given type.
+    ///
+    /// It has to survive both wrapping and boxing: this is how e.g. session persistence
+    /// asks whether it's dealing with a FilesystemStorageFactory, and a middleware in
+    /// between must not hide it. A middleware forwards this to what it wraps.
+    fn is_type_id(&self, type_id: TypeId) -> bool {
+        Self::type_id(self) == type_id
+    }
+    fn clone_box(&self) -> BoxStorageFactory;
+}
+
+pub type BoxStorageFactory = Box<dyn StorageFactory<Storage = Box<dyn TorrentStorage>>>;
+
+pub trait StorageFactoryExt {
+    fn boxed(self) -> BoxStorageFactory;
+}
+
+impl<SF: StorageFactory> StorageFactoryExt for SF {
+    fn boxed(self) -> BoxStorageFactory {
+        struct Wrapper<SF> {
+            sf: SF,
+        }
+
+        impl<SF: StorageFactory> StorageFactory for Wrapper<SF> {
+            type Storage = Box<dyn TorrentStorage>;
+
+            fn create(
+                &self,
+                shared: &ManagedTorrentShared,
+                metadata: &TorrentMetadata,
+            ) -> anyhow::Result<Self::Storage> {
+                let s = self.sf.create(shared, metadata)?;
+                Ok(Box::new(s))
+            }
+
+            fn is_type_id(&self, type_id: TypeId) -> bool {
+                self.sf.is_type_id(type_id)
+            }
+
+            fn clone_box(&self) -> BoxStorageFactory {
+                self.sf.clone_box()
+            }
+        }
+
+        Box::new(Wrapper { sf: self })
+    }
+}
+
+impl<U: StorageFactory + ?Sized> StorageFactory for Box<U> {
+    type Storage = U::Storage;
+
+    fn create(
+        &self,
+        shared: &ManagedTorrentShared,
+        metadata: &TorrentMetadata,
+    ) -> anyhow::Result<U::Storage> {
+        (**self).create(shared, metadata)
+    }
+
+    fn is_type_id(&self, type_id: TypeId) -> bool {
+        (**self).is_type_id(type_id)
+    }
+
+    fn clone_box(&self) -> BoxStorageFactory {
+        (**self).clone_box()
+    }
+}
+
+/// What a file of the storage is from outside: its length and when it was
+/// last written. A checkpoint records each file's, and the next run trusts
+/// the checkpoint only while every file's is the same (libtorrent 1.x
+/// `file_sizes` in the resume data, which `verify_resume_data` compared).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileStamp {
+    pub len: u64,
+    pub modified: SystemTime,
+}
+
+pub trait TorrentStorage: Send + Sync {
+    // Create/open files etc.
+    fn init(
+        &mut self,
+        shared: &ManagedTorrentShared,
+        metadata: &TorrentMetadata,
+    ) -> anyhow::Result<()>;
+
+    /// Given a file_id (which you can get more info from in init_storage() through torrent info)
+    /// read buf.len() bytes into buf at offset.
+    fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()>;
+
+    /// The `len` bytes of file `file_id` from `offset` on are about to be
+    /// read, front to back: a storage that can tell the system so does,
+    /// and the system reads them ahead of the reads that follow. A hint
+    /// only: nothing is read here, and nothing fails.
+    fn will_read(&self, _file_id: usize, _offset: u64, _len: u64) {}
+
+    /// `bufs` filled whole, one after the other, from the file's bytes at
+    /// `offset`: a storage that can read them in one go does.
+    fn preadv_exact(
+        &self,
+        file_id: usize,
+        mut offset: u64,
+        bufs: &mut [&mut [u8]],
+    ) -> anyhow::Result<()> {
+        for buf in bufs.iter_mut() {
+            self.pread_exact(file_id, offset, buf)?;
+            offset += buf.len() as u64;
+        }
+        Ok(())
+    }
+
+    /// Given a file_id (which you can get more info from in init_storage() through torrent info)
+    /// write buf.len() bytes into the file at offset.
+    fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()>;
+
+    fn pwrite_all_vectored(
+        &self,
+        file_id: usize,
+        offset: u64,
+        bufs: [IoSlice<'_>; 2],
+    ) -> anyhow::Result<usize> {
+        let mut offset = offset;
+        let mut size = 0;
+
+        for ioslice in bufs {
+            self.pwrite_all(file_id, offset, &ioslice)?;
+            offset += ioslice.len() as u64;
+            size += ioslice.len();
+        }
+
+        Ok(size)
+    }
+
+    /// [`Self::pwrite_all_vectored`] into memory the storage holds, on a
+    /// thread that must not wait on a disk: true once written there; false,
+    /// having written nothing a file holds, when the bytes would go to a
+    /// file, for the caller to write them where it may wait. Default
+    /// implementation writes when [`Self::writes_to_memory`] says so.
+    fn pwrite_held(
+        &self,
+        file_id: usize,
+        offset: u64,
+        bufs: [IoSlice<'_>; 2],
+    ) -> anyhow::Result<bool> {
+        if !self.writes_to_memory() {
+            return Ok(false);
+        }
+        self.pwrite_all_vectored(file_id, offset, bufs)?;
+        Ok(true)
+    }
+
+    /// Remove a file from the storage. If not supported, or it doesn't matter, just return Ok(())
+    fn remove_file(&self, file_id: usize, filename: &Path) -> anyhow::Result<()>;
+
+    fn remove_directory_if_empty(&self, path: &Path) -> anyhow::Result<()>;
+
+    /// E.g. for filesystem backend ensure that the file has a certain length, and grow/shrink as needed.
+    fn ensure_file_length(&self, file_id: usize, length: u64) -> anyhow::Result<()>;
+
+    /// Replace the current storage with a dummy, and return a new one that should be used instead.
+    /// This is used to make the underlying object useless when e.g. pausing the torrent.
+    fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>>;
+
+    /// Callback called every time a piece has completed and has been validated.
+    /// Default implementation does nothing, but can be override in trait implementations.
+    fn on_piece_completed(&self, _piece_index: ValidPieceIndex) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Callback called once when a completed piece made file `file_id` whole: the file lacked
+    /// bytes before the piece and lacks none now (libtorrent `file_completed_alert`). A file
+    /// already whole when the torrent starts, an empty file, and a padding file are never
+    /// told of. Called after [`Self::on_piece_completed`] for that piece, with no lock of the
+    /// torrent held. Default implementation does nothing.
+    fn on_file_completed(&self, _file_id: usize) {}
+
+    /// Hands `update` the whole piece, in order, straight from where the
+    /// storage holds it in memory, and returns true; false, having handed it
+    /// nothing, when the storage holds no copy of the piece in memory, so
+    /// the caller reads it. A downloaded piece is then hashed where its
+    /// blocks landed, with no read back.
+    fn hash_held_piece(
+        &self,
+        _piece_index: ValidPieceIndex,
+        _update: &mut dyn FnMut(&[u8]),
+    ) -> bool {
+        false
+    }
+
+    /// Whether every write lands in memory the storage holds and touches no
+    /// file, so a block is written by copying it, which needs no blocking
+    /// thread. Default implementation says no.
+    fn writes_to_memory(&self) -> bool {
+        false
+    }
+
+    /// A piece the storage holds in memory (`writes_to_memory`) passed its
+    /// check: write it whole, and say how that ended through
+    /// [`StoredPiece::stored`], from any thread, once it did. The piece is
+    /// had only then; until then it is still read from the storage's
+    /// memory. The call must not wait for the write. A `stored` dropped
+    /// unsaid means the piece was not written: it is fetched again. Only a
+    /// storage that holds pieces in memory is handed pieces this way.
+    /// Default implementation writes it here and now through
+    /// [`Self::on_piece_completed`].
+    fn store_verified_piece(&self, piece_index: ValidPieceIndex, stored: StoredPiece) {
+        stored.stored(self.on_piece_completed(piece_index));
+    }
+
+    /// Callback called every time a piece failed its hash check, before it is queued again:
+    /// a downloaded piece, or one a check of the files did not find, which the storage then
+    /// holds no longer. Default implementation does nothing, but can be override in trait
+    /// implementations.
+    fn on_piece_hash_failed(&self, _piece_index: ValidPieceIndex) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Called when a run that checks every piece and trusts nothing saved begins, before it
+    /// reads anything: from here the storage has no piece the check has not found, and what it
+    /// saves must not vouch for one. Each piece comes back through
+    /// [`Self::on_piece_checked`] or [`Self::on_piece_hash_failed`] as the check finds it or not.
+    /// Default implementation does nothing.
+    fn on_check_everything(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Callback called when a check of the files found a piece whole: the storage has it again.
+    /// Default implementation does nothing.
+    fn on_piece_checked(&self, _piece_index: ValidPieceIndex) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Asked by a check of the files before it reads a piece: whether the storage wants the
+    /// piece's bytes as the check hashed them. One it wants is read whole into one buffer and
+    /// handed to [`Self::on_piece_hashed`] if it passes, so the storage need not read it again.
+    /// Default implementation wants none.
+    fn wants_hashed_piece(&self, _piece_index: ValidPieceIndex) -> bool {
+        false
+    }
+
+    /// A piece a check of the files read whole and found, as it hashed it: called from the
+    /// check's thread before the verdict reaches [`Self::on_piece_checked`]. Default
+    /// implementation does nothing.
+    fn on_piece_hashed(&self, _piece_index: ValidPieceIndex, _bytes: bytes::Bytes) {}
+
+    /// Asked when the first block of a piece arrives from the peer that owns it, before the
+    /// block is written, under the torrent's lock: whether the storage has room for the whole
+    /// piece. Must not wait. A storage that holds pieces in memory is asked nothing at the
+    /// grant; one that writes every piece block by block is asked at the grant too. On false
+    /// the connection stops reading and waits on `room`, which the storage rings once it has
+    /// room again; true for a piece that holds its room already. Default implementation
+    /// always has room.
+    fn reserve_piece(&self, _piece_index: ValidPieceIndex, _room: &Arc<Notify>) -> bool {
+        true
+    }
+
+    /// [`Self::reserve_piece`] for a block of a piece no peer owns, or another peer owns: the
+    /// storage may write such a piece block by block, holding room for one block only.
+    /// Default implementation asks [`Self::reserve_piece`].
+    fn reserve_unowned_piece(&self, piece_index: ValidPieceIndex, room: &Arc<Notify>) -> bool {
+        self.reserve_piece(piece_index, room)
+    }
+
+    /// A piece some of whose blocks arrived went back to the queue without its owner: the
+    /// storage may write what it holds of it to its files and give back the room it held for
+    /// the whole piece, taking the rest of it block by block. Must not wait for the disk.
+    /// Default implementation does nothing.
+    fn on_piece_requeued(&self, _piece_index: ValidPieceIndex) {}
+
+    /// The operator paused the torrent: its run has ended, and it keeps the blocks it received.
+    /// The storage writes the pieces it holds in memory unfinished to their files, as it does a
+    /// piece given back, and gives back the room they held; one it held whole for a check
+    /// that will not run is fetched again, and gives back its room too. Not told when the
+    /// torrent is removed or the session stops. Must not wait for the disk (libtorrent
+    /// `torrent::do_pause` flushes the torrent's write cache, `async_stop_torrent`). Default
+    /// implementation does nothing.
+    fn on_paused(&self) {}
+
+    /// Asked before a downloaded piece is checked, on a thread that may wait on a disk:
+    /// whether every block of it the storage took is where the check reads it. An error is a
+    /// write of a block taken earlier that failed, as of a piece given back whose blocks went
+    /// to its files: the piece is then not checked, and goes the way of a piece the storage
+    /// refused. Waits for such writes under way. Default implementation lost none.
+    fn piece_written(&self, _piece_index: ValidPieceIndex) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Whether a block of the piece is copied into memory the storage holds, rather than
+    /// written to a file: asked per block, so a lookup. Default implementation answers
+    /// [`Self::writes_to_memory`].
+    fn writes_piece_to_memory(&self, _piece_index: ValidPieceIndex) -> bool {
+        self.writes_to_memory()
+    }
+
+    /// The stamp of file `file_id`, or None when the storage keeps no file
+    /// for it. Default implementation keeps no files.
+    fn stamp(&self, _file_id: usize) -> anyhow::Result<Option<FileStamp>> {
+        Ok(None)
+    }
+
+    /// Where the torrent's reads take their turn: its files' volume's
+    /// turns. Asked when a torrent starts, when a check begins and when its
+    /// files move while it runs, never per read. Default implementation names no volume and shares
+    /// [`ReadTurns::private`].
+    fn read_turns(&self) -> ReadTurns {
+        ReadTurns::private()
+    }
+
+    /// Room for `bytes` of a piece an upload holds whole in memory, read
+    /// from a volume that reads whole pieces, charged to the budget the
+    /// storage holds pieces in memory against before the piece is read.
+    /// None when that budget has no room for it, or the storage keeps none:
+    /// the upload then reads the blocks asked for. Default implementation
+    /// keeps none.
+    fn hold_whole_piece(&self, _bytes: u64) -> Option<HeldRoom> {
+        None
+    }
+
+    /// Room for one block of `bytes` of a piece a storage that holds pieces in memory writes
+    /// block by block ([`Self::writes_piece_to_memory`] says no for it), held for that block's
+    /// write alone: the block goes to the disk threads with it, and it goes back as the write
+    /// returns. Such a piece holds no room of its own. Refused when the budget has none: the
+    /// connection then stops reading and waits on `room`, which the storage rings once it has
+    /// room again. Asked on the connection's task; must not wait. Default implementation needs
+    /// no room.
+    fn hold_block(&self, _bytes: u64, _room: &Arc<Notify>) -> BlockRoom {
+        BlockRoom::Free
+    }
+
+    /// Asked by a connection stopped for room each time `room` rings, before it lands its
+    /// block again under the torrent's lock: whether `bytes` of room may be free now. False
+    /// keeps it waiting, and `room` is rung again once room comes back anywhere in the budget,
+    /// so a ring wakes each waiter for one cheap look, not a turn at the lock. A look that
+    /// holds nothing: true may still be refused. Must not wait. Default implementation says
+    /// there may be.
+    fn room_for(&self, _bytes: u64, _room: &Arc<Notify>) -> bool {
+        true
+    }
+}
+
+/// What [`TorrentStorage::hold_block`] has for a block's write.
+#[derive(Debug)]
+pub enum BlockRoom {
+    /// The write needs no room.
+    Free,
+    /// The room, held until this is dropped.
+    Held(HeldRoom),
+    /// No room now: the storage rings once it has some.
+    Refused,
+}
+
+impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
+    fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
+        (**self).pread_exact(file_id, offset, buf)
+    }
+
+    fn will_read(&self, file_id: usize, offset: u64, len: u64) {
+        (**self).will_read(file_id, offset, len)
+    }
+
+    fn preadv_exact(
+        &self,
+        file_id: usize,
+        offset: u64,
+        bufs: &mut [&mut [u8]],
+    ) -> anyhow::Result<()> {
+        (**self).preadv_exact(file_id, offset, bufs)
+    }
+
+    fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
+        (**self).pwrite_all(file_id, offset, buf)
+    }
+
+    fn pwrite_all_vectored(
+        &self,
+        file_id: usize,
+        offset: u64,
+        bufs: [IoSlice<'_>; 2],
+    ) -> anyhow::Result<usize> {
+        (**self).pwrite_all_vectored(file_id, offset, bufs)
+    }
+
+    fn pwrite_held(
+        &self,
+        file_id: usize,
+        offset: u64,
+        bufs: [IoSlice<'_>; 2],
+    ) -> anyhow::Result<bool> {
+        (**self).pwrite_held(file_id, offset, bufs)
+    }
+
+    fn remove_file(&self, file_id: usize, filename: &Path) -> anyhow::Result<()> {
+        (**self).remove_file(file_id, filename)
+    }
+
+    fn ensure_file_length(&self, file_id: usize, length: u64) -> anyhow::Result<()> {
+        (**self).ensure_file_length(file_id, length)
+    }
+
+    fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>> {
+        (**self).take()
+    }
+
+    fn remove_directory_if_empty(&self, path: &Path) -> anyhow::Result<()> {
+        (**self).remove_directory_if_empty(path)
+    }
+
+    fn init(
+        &mut self,
+        shared: &ManagedTorrentShared,
+        metadata: &TorrentMetadata,
+    ) -> anyhow::Result<()> {
+        (**self).init(shared, metadata)
+    }
+
+    fn on_piece_completed(&self, piece_id: ValidPieceIndex) -> anyhow::Result<()> {
+        (**self).on_piece_completed(piece_id)
+    }
+
+    fn on_file_completed(&self, file_id: usize) {
+        (**self).on_file_completed(file_id)
+    }
+
+    fn hash_held_piece(&self, piece_id: ValidPieceIndex, update: &mut dyn FnMut(&[u8])) -> bool {
+        (**self).hash_held_piece(piece_id, update)
+    }
+
+    fn writes_to_memory(&self) -> bool {
+        (**self).writes_to_memory()
+    }
+
+    fn store_verified_piece(&self, piece_id: ValidPieceIndex, stored: StoredPiece) {
+        (**self).store_verified_piece(piece_id, stored)
+    }
+
+    fn on_piece_hash_failed(&self, piece_id: ValidPieceIndex) -> anyhow::Result<()> {
+        (**self).on_piece_hash_failed(piece_id)
+    }
+
+    fn on_check_everything(&self) -> anyhow::Result<()> {
+        (**self).on_check_everything()
+    }
+
+    fn on_piece_checked(&self, piece_id: ValidPieceIndex) -> anyhow::Result<()> {
+        (**self).on_piece_checked(piece_id)
+    }
+
+    fn wants_hashed_piece(&self, piece_id: ValidPieceIndex) -> bool {
+        (**self).wants_hashed_piece(piece_id)
+    }
+
+    fn on_piece_hashed(&self, piece_id: ValidPieceIndex, bytes: bytes::Bytes) {
+        (**self).on_piece_hashed(piece_id, bytes)
+    }
+
+    fn reserve_piece(&self, piece_id: ValidPieceIndex, room: &Arc<Notify>) -> bool {
+        (**self).reserve_piece(piece_id, room)
+    }
+
+    fn reserve_unowned_piece(&self, piece_id: ValidPieceIndex, room: &Arc<Notify>) -> bool {
+        (**self).reserve_unowned_piece(piece_id, room)
+    }
+
+    fn on_piece_requeued(&self, piece_id: ValidPieceIndex) {
+        (**self).on_piece_requeued(piece_id)
+    }
+
+    fn on_paused(&self) {
+        (**self).on_paused()
+    }
+
+    fn piece_written(&self, piece_id: ValidPieceIndex) -> anyhow::Result<()> {
+        (**self).piece_written(piece_id)
+    }
+
+    fn writes_piece_to_memory(&self, piece_id: ValidPieceIndex) -> bool {
+        (**self).writes_piece_to_memory(piece_id)
+    }
+
+    fn stamp(&self, file_id: usize) -> anyhow::Result<Option<FileStamp>> {
+        (**self).stamp(file_id)
+    }
+
+    fn read_turns(&self) -> ReadTurns {
+        (**self).read_turns()
+    }
+
+    fn hold_whole_piece(&self, bytes: u64) -> Option<HeldRoom> {
+        (**self).hold_whole_piece(bytes)
+    }
+
+    fn hold_block(&self, bytes: u64, room: &Arc<Notify>) -> BlockRoom {
+        (**self).hold_block(bytes, room)
+    }
+
+    fn room_for(&self, bytes: u64, room: &Arc<Notify>) -> bool {
+        (**self).room_for(bytes, room)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::any::TypeId;
+
+    use super::{
+        BoxStorageFactory, StorageFactory, StorageFactoryExt, filesystem::FilesystemStorageFactory,
+    };
+    use crate::torrent_state::{ManagedTorrentShared, TorrentMetadata};
+
+    // A middleware like the ones in storage::middleware: it wraps another factory and
+    // forwards is_type_id, so that what it wraps stays recognizable through it.
+    #[derive(Clone)]
+    struct Middleware<U> {
+        underlying_factory: U,
+    }
+
+    impl<U: StorageFactory + Clone> StorageFactory for Middleware<U> {
+        type Storage = U::Storage;
+
+        fn create(
+            &self,
+            shared: &ManagedTorrentShared,
+            metadata: &TorrentMetadata,
+        ) -> anyhow::Result<Self::Storage> {
+            self.underlying_factory.create(shared, metadata)
+        }
+
+        fn is_type_id(&self, type_id: TypeId) -> bool {
+            self.underlying_factory.is_type_id(type_id)
+        }
+
+        fn clone_box(&self) -> BoxStorageFactory {
+            self.clone().boxed()
+        }
+    }
+
+    #[test]
+    fn test_is_type_id_survives_boxing() {
+        let fs = TypeId::of::<FilesystemStorageFactory>();
+
+        assert!(FilesystemStorageFactory::default().is_type_id(fs));
+        // Box<U> has to forward, or the answer is the TypeId of the box itself.
+        assert!(FilesystemStorageFactory::default().boxed().is_type_id(fs));
+
+        // And boxed() has to forward too, or every middleware's override is lost and the
+        // answer is the middleware's own type.
+        let wrapped = Middleware {
+            underlying_factory: FilesystemStorageFactory::default(),
+        };
+        assert!(wrapped.is_type_id(fs));
+        assert!(wrapped.clone().boxed().is_type_id(fs));
+        assert!(wrapped.boxed().clone_box().is_type_id(fs));
+
+        // A factory that isn't the one asked about still says so.
+        assert!(
+            !Middleware {
+                underlying_factory: FilesystemStorageFactory::default(),
+            }
+            .boxed()
+            .is_type_id(TypeId::of::<Middleware<FilesystemStorageFactory>>())
+        );
+    }
+}

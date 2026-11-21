@@ -13,12 +13,14 @@ use std::collections::{HashMap, HashSet};
 
 use weaver_server_core::pipeline::queue::QueueInner;
 use weaver_server_core::pipeline::queue::paging::JobView;
+use weaver_server_core::tags::TagSnapshot;
 use weaver_server_core::{JobId, JobInfo, SharedPipelineState};
 
 use super::types::{
-    PreparedQueueFilter, QueueCategoryCount, QueueEtaBytes, QueueItemState, QueuePageInput,
-    QueuePriority, QueueSelectionInput, QueueSortDirection, QueueSortField, QueueStateCount,
-    QueueStateFacts, QueueSummary, matches_view_filter_prepared, queue_item_state,
+    PreparedQueueFilter, ProtocolGql, QueueCategoryCount, QueueEtaBytes, QueueItemState,
+    QueuePageInput, QueuePriority, QueueProtocolCount, QueueSelectionInput, QueueSortDirection,
+    QueueSortField, QueueStateCount, QueueStateFacts, QueueSummary, matches_info_filter_prepared,
+    matches_view_filter_prepared, queue_item_state,
 };
 
 pub(crate) const MAX_QUEUE_PAGE_SIZE: usize = 500;
@@ -51,6 +53,9 @@ pub(crate) fn queue_page_display_name(
 pub(crate) struct WalkedRow {
     pub(crate) id: JobId,
     pub(crate) state: QueueItemState,
+    protocol: ProtocolGql,
+    // Where the row's report is read from.
+    source: RowSource,
     priority: QueuePriority,
     // Index into the walk's category names; `None` for no category.
     category: Option<u32>,
@@ -88,7 +93,11 @@ impl WalkedRow {
             | QueueItemState::Repairing
             | QueueItemState::Extracting
             | QueueItemState::Finalizing
-            | QueueItemState::PostProcessing => 0,
+            | QueueItemState::PostProcessing
+            | QueueItemState::FetchingMetadata
+            | QueueItemState::CheckingFiles
+            | QueueItemState::Stalled => 0,
+            QueueItemState::Seeding => 2,
         }
     }
 
@@ -130,6 +139,14 @@ impl WalkedRow {
             QueueItemState::Queued | QueueItemState::Downloading
         ) && !self.propagating
     }
+}
+
+/// Where a walked row's report lives: the queue's own rows, or the rows
+/// another class published, by index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RowSource {
+    Queue,
+    Owned(weaver_server_core::jobs::Protocol, usize),
 }
 
 /// One walk of the queue: a row per job, in queue order.
@@ -176,21 +193,60 @@ impl QueueWalk {
             leading: 0,
         };
         let mut category_index: HashMap<String, u32> = HashMap::new();
+        let titles = |job: &JobInfo| {
+            needs.titles.then(|| {
+                (
+                    job.name.clone(),
+                    weaver_server_core::ingest::original_release_title(&job.name, &job.metadata),
+                )
+            })
+        };
+        // Other classes' rows fall in among the queue's rows by when each
+        // was added, as the job list orders them.
+        let mut owned = inner.owned_rows().peekable();
+        let push_owned = |walk: &mut QueueWalk,
+                          category_index: &mut HashMap<String, u32>,
+                          source: RowSource,
+                          job: &JobInfo| {
+            let category = walk.category_of(category_index, job);
+            walk.rows.push(WalkedRow {
+                id: job.job_id,
+                state: queue_item_state(QueueStateFacts::of_job(job)),
+                protocol: job.protocol.into(),
+                source,
+                priority: QueuePriority::from_metadata(&job.metadata),
+                category,
+                total_bytes: job.total_bytes,
+                downloaded_bytes: job.downloaded_bytes,
+                remaining: job.remaining_bytes.min(job.wanted_bytes),
+                wanted: job.wanted_bytes,
+                progress: job_progress(job),
+                rate: job
+                    .phase_progress
+                    .iter()
+                    .filter_map(|phase| phase.rate_bps)
+                    .max()
+                    .unwrap_or_default(),
+                propagating: false,
+                titles: titles(job),
+            });
+            walk.leading += usize::from(walk.rows.last().is_some_and(WalkedRow::leads));
+        };
         for row in &inner.jobs {
             let view = row.view(&inner.globals);
             let job = view.job();
-            let category = job.category.as_deref().map(|name| {
-                if let Some(index) = category_index.get(name) {
-                    return *index;
-                }
-                let index = walk.category_names.len() as u32;
-                walk.category_names.push(name.to_string());
-                category_index.insert(name.to_string(), index);
-                index
-            });
+            while let Some((protocol, index, owned_job)) = owned.next_if(|(_, _, owned_job)| {
+                owned_job.created_at_epoch_ms < job.created_at_epoch_ms
+            }) {
+                let source = RowSource::Owned(protocol, index);
+                push_owned(&mut walk, &mut category_index, source, owned_job);
+            }
+            let category = walk.category_of(&mut category_index, job);
             walk.rows.push(WalkedRow {
                 id: row.id,
                 state: row_state(&view),
+                protocol: job.protocol.into(),
+                source: RowSource::Queue,
                 priority: QueuePriority::from_metadata(&job.metadata),
                 category,
                 total_bytes: job.total_bytes,
@@ -206,19 +262,29 @@ impl QueueWalk {
                     .unwrap_or_default(),
                 propagating: view.download_wait_reason()
                     == Some(weaver_server_core::jobs::handle::PROPAGATION_WAIT_REASON),
-                titles: needs.titles.then(|| {
-                    (
-                        job.name.clone(),
-                        weaver_server_core::ingest::original_release_title(
-                            &job.name,
-                            &job.metadata,
-                        ),
-                    )
-                }),
+                titles: titles(job),
             });
             walk.leading += usize::from(walk.rows.last().is_some_and(WalkedRow::leads));
         }
+        for (protocol, index, owned_job) in owned {
+            let source = RowSource::Owned(protocol, index);
+            push_owned(&mut walk, &mut category_index, source, owned_job);
+        }
         walk
+    }
+
+    // The index of the job's category name, added to the walk's names the
+    // first time it is seen; `None` for no category.
+    fn category_of(&mut self, names: &mut HashMap<String, u32>, job: &JobInfo) -> Option<u32> {
+        job.category.as_deref().map(|name| {
+            if let Some(index) = names.get(name) {
+                return *index;
+            }
+            let index = self.category_names.len() as u32;
+            self.category_names.push(name.to_string());
+            names.insert(name.to_string(), index);
+            index
+        })
     }
 
     fn category(&self, row: &WalkedRow) -> &str {
@@ -344,9 +410,14 @@ fn like_contains(text: &str, pieces: &[String]) -> bool {
 /// long the lists are.
 pub(crate) struct QueueSelection<'a> {
     search: Option<SearchQuery>,
+    protocol: Option<ProtocolGql>,
     states: Option<Vec<QueueItemState>>,
     priorities: Option<Vec<QueuePriority>>,
     categories: Option<HashSet<&'a str>>,
+    // A tag the job carries, the empty one naming jobs with none, read
+    // against `tags`. With no tags given, no job passes a tag.
+    tag: Option<&'a str>,
+    tags: Option<&'a TagSnapshot>,
 }
 
 fn distinct<T: Copy + PartialEq>(values: Option<&Vec<T>>) -> Option<Vec<T>> {
@@ -364,44 +435,61 @@ impl<'a> QueueSelection<'a> {
     pub(crate) fn of_page(input: &'a QueuePageInput) -> Self {
         Self::new(
             input.search.as_deref(),
+            input.protocol,
             input.states.as_ref(),
             input.priorities.as_ref(),
             input.categories.as_ref(),
+            input.tag.as_deref(),
         )
     }
 
     pub(crate) fn of_input(input: &'a QueueSelectionInput) -> Self {
         Self::new(
             input.search.as_deref(),
+            input.protocol,
             input.states.as_ref(),
             input.priorities.as_ref(),
             input.categories.as_ref(),
+            input.tag.as_deref(),
         )
     }
 
     fn new(
         search: Option<&str>,
+        protocol: Option<ProtocolGql>,
         states: Option<&'a Vec<QueueItemState>>,
         priorities: Option<&'a Vec<QueuePriority>>,
         categories: Option<&'a Vec<String>>,
+        tag: Option<&'a str>,
     ) -> Self {
         Self {
             search: search.and_then(SearchQuery::parse),
+            protocol,
             states: distinct(states),
             priorities: distinct(priorities),
             categories: categories
                 .filter(|categories| !categories.is_empty())
                 .map(|categories| categories.iter().map(String::as_str).collect()),
+            tag,
+            tags: None,
         }
     }
 
-    /// Whether the selection keeps every job: no search, state, priority or
-    /// category filter.
+    /// The tags a tag filter reads.
+    pub(crate) fn tagged(mut self, tags: Option<&'a TagSnapshot>) -> Self {
+        self.tags = tags;
+        self
+    }
+
+    /// Whether the selection keeps every job: no search, protocol, state,
+    /// priority, category or tag filter.
     pub(crate) fn is_unfiltered(&self) -> bool {
         self.search.is_none()
+            && self.protocol.is_none()
             && self.states.is_none()
             && self.priorities.is_none()
             && self.categories.is_none()
+            && self.tag.is_none()
     }
 
     pub(crate) fn needs(&self, sort: Option<QueueSortField>) -> WalkNeeds {
@@ -410,12 +498,17 @@ impl<'a> QueueSelection<'a> {
         }
     }
 
-    // Search and priorities: the stage category counts are taken after.
+    // Search, priorities and tag: the stage category counts are taken after.
     fn matches_search(&self, row: &WalkedRow) -> bool {
         if self
             .priorities
             .as_ref()
             .is_some_and(|priorities| !priorities.contains(&row.priority))
+        {
+            return false;
+        }
+        if let Some(tag) = self.tag
+            && !self.tags.is_some_and(|tags| tags.passes(row.id, tag))
         {
             return false;
         }
@@ -451,6 +544,12 @@ impl<'a> QueueSelection<'a> {
             .is_none_or(|categories| categories.contains(walk.category(row)))
     }
 
+    // Protocol: counted beside categories, each under the other's filter.
+    fn matches_protocol(&self, row: &WalkedRow) -> bool {
+        self.protocol
+            .is_none_or(|protocol| protocol == row.protocol)
+    }
+
     fn matches_state(&self, row: &WalkedRow) -> bool {
         self.states
             .as_ref()
@@ -463,6 +562,7 @@ impl<'a> QueueSelection<'a> {
             .iter()
             .filter(|row| {
                 self.matches_search(row)
+                    && self.matches_protocol(row)
                     && self.matches_category(walk, row)
                     && self.matches_state(row)
             })
@@ -475,8 +575,11 @@ impl<'a> QueueSelection<'a> {
 /// themselves are read.
 pub(crate) struct PagePlan {
     pub(crate) ids: Vec<JobId>,
+    // Where each page row's report is read from, in page order.
+    sources: Vec<RowSource>,
     pub(crate) total_count: u32,
     pub(crate) category_counts: Vec<QueueCategoryCount>,
+    pub(crate) protocol_counts: Vec<QueueProtocolCount>,
     pub(crate) state_counts: Vec<QueueStateCount>,
     pub(crate) remaining_bytes: u64,
     pub(crate) eta_total_bytes: u64,
@@ -512,6 +615,10 @@ fn display_state(state: QueueItemState) -> &'static str {
         QueueItemState::Completed => "COMPLETE",
         QueueItemState::Failed => "FAILED",
         QueueItemState::Paused => "PAUSED",
+        QueueItemState::FetchingMetadata => "FETCHING_METADATA",
+        QueueItemState::CheckingFiles => "CHECKING_FILES",
+        QueueItemState::Seeding => "SEEDING",
+        QueueItemState::Stalled => "STALLED",
     }
 }
 
@@ -522,15 +629,24 @@ pub(crate) struct PageWants {
     /// screen-wide counts every screen reads) asks for neither, and is then
     /// planned without listing, ordering or copying any row.
     pub(crate) rows: bool,
+    /// The rows' writes to disk, read once for the page.
+    pub(crate) disk_write: bool,
 }
 
 impl PagePlan {
-    pub(crate) fn plan(walk: &QueueWalk, input: &QueuePageInput, wants: PageWants) -> Self {
-        let selection = QueueSelection::of_page(input);
+    pub(crate) fn plan(
+        walk: &QueueWalk,
+        input: &QueuePageInput,
+        wants: PageWants,
+        tags: Option<&TagSnapshot>,
+    ) -> Self {
+        let selection = QueueSelection::of_page(input).tagged(tags);
 
         // Everything a page counts follows from three nested stages: search
-        // (with priorities), then categories, then states.
+        // (with priorities), then categories and protocol (each counted under
+        // the other), then states.
         let mut category_counts: HashMap<&str, u32> = HashMap::new();
+        let mut protocol_counts: Vec<(ProtocolGql, u32)> = Vec::new();
         let mut state_counts: Vec<(QueueItemState, u32)> = Vec::new();
         let mut matching: Vec<usize> = if wants.rows {
             Vec::with_capacity(walk.rows.len())
@@ -542,8 +658,21 @@ impl PagePlan {
             if !selection.matches_search(row) {
                 continue;
             }
-            *category_counts.entry(walk.category(row)).or_default() += 1;
-            if !selection.matches_category(walk, row) {
+            let in_protocol = selection.matches_protocol(row);
+            let in_category = selection.matches_category(walk, row);
+            if in_protocol {
+                *category_counts.entry(walk.category(row)).or_default() += 1;
+            }
+            if in_category {
+                match protocol_counts
+                    .iter_mut()
+                    .find(|(protocol, _)| *protocol == row.protocol)
+                {
+                    Some((_, count)) => *count += 1,
+                    None => protocol_counts.push((row.protocol, 1)),
+                }
+            }
+            if !(in_protocol && in_category) {
                 continue;
             }
             match state_counts
@@ -589,8 +718,13 @@ impl PagePlan {
 
         PagePlan {
             ids: page.iter().map(|&index| walk.rows[index].id).collect(),
+            sources: page.iter().map(|&index| walk.rows[index].source).collect(),
             total_count,
             category_counts,
+            protocol_counts: protocol_counts
+                .into_iter()
+                .map(|(protocol, count)| QueueProtocolCount { protocol, count })
+                .collect(),
             state_counts: state_counts
                 .into_iter()
                 .map(|(state, count)| QueueStateCount { state, count })
@@ -831,15 +965,22 @@ impl PageRead {
         state: &SharedPipelineState,
         input: &QueuePageInput,
         wants: PageWants,
+        tags: Option<&TagSnapshot>,
     ) -> Self {
         let needs = QueueSelection::of_page(input).needs(input.sort_field);
         state.read_queue(|inner| {
             let walk = QueueWalk::of(inner, needs);
-            let plan = PagePlan::plan(&walk, input, wants);
+            let plan = PagePlan::plan(&walk, input, wants, tags);
             let rows = plan
                 .ids
                 .iter()
-                .filter_map(|id| inner.row(*id).map(|row| row.info(&inner.globals)))
+                .zip(&plan.sources)
+                .filter_map(|(id, source)| match source {
+                    RowSource::Queue => inner.row(*id).map(|row| row.info(&inner.globals)),
+                    RowSource::Owned(protocol, index) => {
+                        inner.owned(*protocol).get(*index).cloned()
+                    }
+                })
                 .collect();
             PageRead {
                 walk,
@@ -852,9 +993,9 @@ impl PageRead {
 }
 
 /// Copies the queued rows `filter` keeps, in queue order, as a listing shows
-/// them: no per-file bytes, server attribution or discards. The first `skip`
-/// kept rows are passed over and at most `take` are copied; the rest are
-/// matched in place.
+/// them: no per-file bytes, server attribution or discards. The torrents fall
+/// in among them by when each was added. The first `skip` kept rows are
+/// passed over and at most `take` are copied; the rest are matched in place.
 pub(crate) fn read_listing(
     state: &SharedPipelineState,
     filter: Option<&PreparedQueueFilter>,
@@ -862,21 +1003,50 @@ pub(crate) fn read_listing(
     take: usize,
 ) -> Vec<JobInfo> {
     state.read_queue(|inner| {
-        inner
-            .jobs
-            .iter()
-            .map(|row| row.view(&inner.globals))
-            .filter(|view| matches_view_filter_prepared(view, filter))
-            .skip(skip)
-            .take(take)
-            .map(|view| view.list_info())
-            .collect()
+        let mut owned = inner.owned_rows().map(|(_, _, job)| job).peekable();
+        let mut listing = Vec::new();
+        let mut skipped = 0;
+        // Whether a kept row is passed over, copied, or ends the listing.
+        let mut keep = |listing: &mut Vec<JobInfo>, info: &dyn Fn() -> JobInfo| {
+            if skipped < skip {
+                skipped += 1;
+            } else if listing.len() < take {
+                listing.push(info());
+            }
+            listing.len() < take
+        };
+        for row in &inner.jobs {
+            let view = row.view(&inner.globals);
+            let created_at = view.job().created_at_epoch_ms;
+            while let Some(job) = owned.next_if(|job| job.created_at_epoch_ms < created_at) {
+                if matches_info_filter_prepared(job, filter) && !keep(&mut listing, &|| job.clone())
+                {
+                    return listing;
+                }
+            }
+            if matches_view_filter_prepared(&view, filter)
+                && !keep(&mut listing, &|| view.list_info())
+            {
+                return listing;
+            }
+        }
+        for job in owned {
+            if matches_info_filter_prepared(job, filter) && !keep(&mut listing, &|| job.clone()) {
+                break;
+            }
+        }
+        listing
     })
 }
 
-/// Copies one row, found through the position index.
+/// Copies one row, found through the position index, or another class's.
 pub(crate) fn read_row(state: &SharedPipelineState, id: JobId) -> Option<JobInfo> {
-    state.read_queue(|inner| inner.row(id).map(|row| row.info(&inner.globals)))
+    state.read_queue(|inner| {
+        inner
+            .row(id)
+            .map(|row| row.info(&inner.globals))
+            .or_else(|| inner.owned_job(id).cloned())
+    })
 }
 
 /// The queue's totals, counted under the lock without copying a row.
@@ -892,6 +1062,12 @@ pub(crate) fn summary(
             summary.total_bytes += view.job().total_bytes;
             summary.downloaded_bytes += view.job().downloaded_bytes;
             summary.count_state(row_state(&view));
+        }
+        for (_, _, job) in inner.owned_rows() {
+            summary.total_items += 1;
+            summary.total_bytes += job.total_bytes;
+            summary.downloaded_bytes += job.downloaded_bytes;
+            summary.count_state(queue_item_state(QueueStateFacts::of_job(job)));
         }
         summary
     })
@@ -955,6 +1131,7 @@ mod tests {
         };
         JobInfo {
             job_id: JobId(id),
+            protocol: Default::default(),
             job_hash: None,
             name: format!("Show.{id:05}.1080p"),
             status,
@@ -987,6 +1164,8 @@ mod tests {
             error: None,
             download_wait_reason: None,
             download_retry_at_epoch_ms: None,
+            disk_need_bytes: None,
+            disk_free_bytes: None,
             created_at_epoch_ms: 0.0,
         }
     }
@@ -996,9 +1175,11 @@ mod tests {
             page_index,
             page_size,
             search: None,
+            protocol: None,
             states: None,
             priorities: None,
             categories: None,
+            tag: None,
             sort_field: None,
             sort_direction: None,
         }
@@ -1098,8 +1279,14 @@ mod tests {
         }
     }
 
-    const ROWS: PageWants = PageWants { rows: true };
-    const TOTALS: PageWants = PageWants { rows: false };
+    const ROWS: PageWants = PageWants {
+        rows: true,
+        disk_write: false,
+    };
+    const TOTALS: PageWants = PageWants {
+        rows: false,
+        disk_write: false,
+    };
 
     fn ids(plan: &PagePlan) -> Vec<u64> {
         plan.ids.iter().map(|id| id.0).collect()
@@ -1121,13 +1308,13 @@ mod tests {
         let walk = QueueWalk::read(&state, WalkNeeds::default());
         assert_eq!(walk.rows.len(), 1_200);
 
-        let first = PagePlan::plan(&walk, &page_input(0, 500), ROWS);
+        let first = PagePlan::plan(&walk, &page_input(0, 500), ROWS, None);
         assert_eq!(first.total_count, 1_200);
         let mut expected = vec![700, 900];
         expected.extend((1..=498).collect::<Vec<_>>());
         assert_eq!(ids(&first), expected);
 
-        let last = PagePlan::plan(&walk, &page_input(2, 500), ROWS);
+        let last = PagePlan::plan(&walk, &page_input(2, 500), ROWS, None);
         let expected: Vec<u64> = (1_001..=1_200).collect();
         assert_eq!(ids(&last), expected);
 
@@ -1173,7 +1360,7 @@ mod tests {
         input.sort_direction = Some(QueueSortDirection::Desc);
         let selection = QueueSelection::of_page(&input);
         let walk = QueueWalk::read(&state, selection.needs(input.sort_field));
-        let plan = PagePlan::plan(&walk, &input, ROWS);
+        let plan = PagePlan::plan(&walk, &input, ROWS, None);
 
         // Each word matches anywhere in the name, as LIKE '%0001%' does:
         // "show 0001" finds Show.00001 and Show.00010..=00019.
@@ -1232,7 +1419,10 @@ mod tests {
             &state,
             QueueSelection::of_page(&input).needs(input.sort_field),
         );
-        assert_eq!(ids(&PagePlan::plan(&walk, &input, ROWS)), vec![1, 2, 3]);
+        assert_eq!(
+            ids(&PagePlan::plan(&walk, &input, ROWS, None)),
+            vec![1, 2, 3]
+        );
     }
 
     #[test]
@@ -1438,13 +1628,46 @@ mod tests {
             .map(|id| job(id, JobStatus::Queued, None, 1))
             .collect();
         let state = SharedPipelineState::new(PipelineMetrics::new(), jobs);
-        let read = PageRead::read(&state, &page_input(1, 20), ROWS);
+        let read = PageRead::read(&state, &page_input(1, 20), ROWS, None);
         assert_eq!(ids(&read.plan), (21..=40).collect::<Vec<_>>());
         assert_eq!(
             read.rows.iter().map(|job| job.job_id.0).collect::<Vec<_>>(),
             (21..=40).collect::<Vec<_>>()
         );
         assert_eq!(read.revision, state.queue_revision());
+    }
+
+    // 6 (review). A job kept for the disk shows what it needs and what the
+    // disk leaves on a page and in a listing alike, copied from its row.
+    #[test]
+    fn a_page_and_a_listing_show_a_kept_job_s_disk_figures() {
+        use super::super::types::queue_item_from_job;
+        let jobs = (1..=3u64)
+            .map(|id| {
+                let mut info = job(id, JobStatus::Queued, None, 10);
+                if id == 2 {
+                    info.disk_need_bytes = Some(4 << 30);
+                    info.disk_free_bytes = Some(1 << 30);
+                }
+                info
+            })
+            .collect();
+        let state = SharedPipelineState::new(PipelineMetrics::new(), jobs);
+        let figures = |rows: &[JobInfo]| -> Vec<(u64, Option<u64>, Option<u64>)> {
+            rows.iter()
+                .map(queue_item_from_job)
+                .map(|item| (item.id, item.disk_need_bytes, item.disk_free_bytes))
+                .collect()
+        };
+        let expected = vec![
+            (1, None, None),
+            (2, Some(4 << 30), Some(1 << 30)),
+            (3, None, None),
+        ];
+        let page = PageRead::read(&state, &page_input(0, 20), ROWS, None);
+        assert_eq!(figures(&page.rows), expected, "the page");
+        let listing = read_listing(&state, None, 0, usize::MAX);
+        assert_eq!(figures(&listing), expected, "the listing");
     }
 
     #[test]
@@ -1467,16 +1690,16 @@ mod tests {
             .collect();
         let state = SharedPipelineState::new(PipelineMetrics::new(), jobs);
         let walk = QueueWalk::read(&state, WalkNeeds::default());
-        let first = PagePlan::plan(&walk, &page_input(0, 4), ROWS);
+        let first = PagePlan::plan(&walk, &page_input(0, 4), ROWS, None);
         assert_eq!(ids(&first), vec![1_800, 1_500, 1_600, 1]);
-        let last = PagePlan::plan(&walk, &page_input(499, 4), ROWS);
+        let last = PagePlan::plan(&walk, &page_input(499, 4), ROWS, None);
         assert_eq!(ids(&last), vec![1_998, 1_999, 2_000, 1_700]);
 
         // A sort keeps the sections and orders by its field within each.
         let mut by_size = page_input(0, 3);
         by_size.sort_field = Some(QueueSortField::Size);
         assert_eq!(
-            ids(&PagePlan::plan(&walk, &by_size, ROWS)),
+            ids(&PagePlan::plan(&walk, &by_size, ROWS, None)),
             vec![1_500, 1_800, 1_600]
         );
     }
@@ -1501,7 +1724,7 @@ mod tests {
             &state,
             QueueSelection::of_page(&input).needs(input.sort_field),
         );
-        let ordered: Vec<&str> = ids(&PagePlan::plan(&walk, &input, ROWS))
+        let ordered: Vec<&str> = ids(&PagePlan::plan(&walk, &input, ROWS, None))
             .iter()
             .map(|id| names[*id as usize - 1])
             .collect();
@@ -1530,7 +1753,7 @@ mod tests {
             .collect();
         let state = SharedPipelineState::new(PipelineMetrics::new(), jobs);
         let walk = QueueWalk::read(&state, WalkNeeds::default());
-        let plan = PagePlan::plan(&walk, &page_input(0, 6), ROWS);
+        let plan = PagePlan::plan(&walk, &page_input(0, 6), ROWS, None);
         let through: Vec<(u64, u64)> = plan
             .eta_through
             .iter()
@@ -1565,7 +1788,7 @@ mod tests {
         let state = SharedPipelineState::new(PipelineMetrics::new(), jobs);
         let walk = QueueWalk::read(&state, WalkNeeds::default());
         let before = crate::alloc_probe::allocations();
-        let plan = PagePlan::plan(&walk, &page_input(0, 1), TOTALS);
+        let plan = PagePlan::plan(&walk, &page_input(0, 1), TOTALS, None);
         let made = crate::alloc_probe::allocations() - before;
         assert_eq!(plan.total_count as u64, rows);
         assert!(plan.ids.is_empty() && plan.eta_through.is_empty());
@@ -1587,7 +1810,7 @@ mod tests {
         let state = SharedPipelineState::new(PipelineMetrics::new(), jobs);
         let walk = QueueWalk::read(&state, WalkNeeds::default());
         let before = crate::alloc_probe::allocations();
-        let plan = PagePlan::plan(&walk, &page_input(3, 50), ROWS);
+        let plan = PagePlan::plan(&walk, &page_input(3, 50), ROWS, None);
         let made = crate::alloc_probe::allocations() - before;
         assert_eq!(plan.ids.len(), 50);
         made
@@ -1628,6 +1851,46 @@ mod tests {
         assert_eq!(cache.reads(), 2, "a new revision reads again");
     }
 
+    // A disk figure moving is no queue change: the queue's revision stays,
+    // so the duplicate summaries are not read again and no queue reader
+    // is woken, the rows signal stays, and the figure is read where it is
+    // shown, on the download block.
+    #[tokio::test]
+    async fn a_disk_figure_moves_neither_the_queue_revision_nor_the_duplicate_memo() {
+        let db = weaver_server_core::Database::open_in_memory().unwrap();
+        let rows: Vec<JobInfo> = (1..=60)
+            .map(|id| job(id, JobStatus::Downloading, None, 1))
+            .collect();
+        let state = SharedPipelineState::new(PipelineMetrics::new(), rows.clone());
+        let mut page: Vec<_> = rows[..50]
+            .iter()
+            .map(crate::jobs::types::queue_table_item_from_job)
+            .collect();
+        let held = [JobId(1)];
+        state.mark_disk_for_test("/mnt/nas", 28 << 20, 240 << 20, true, &held, &[]);
+        let revision = state.job_revision();
+        let disk_rows = state.disk_rows_revision();
+        let mut cache = crate::jobs::query::DuplicateSummaryCache::default();
+        cache.attach(db.clone(), revision, &mut page).await.unwrap();
+        state.mark_disk_for_test("/mnt/nas", 9 << 20, 300 << 20, true, &held, &[]);
+        assert_eq!(state.job_revision(), revision);
+        assert_eq!(state.disk_rows_revision(), disk_rows);
+        cache
+            .attach(db.clone(), state.job_revision(), &mut page)
+            .await
+            .unwrap();
+        assert_eq!(cache.reads(), 1);
+        let shown = state.download_block().disk_volumes;
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].write_rate_bytes_per_sec, 9 << 20);
+        assert_eq!(shown[0].waiting_bytes, 300 << 20);
+        // Which job waits on which disk is a row change: the rows signal
+        // moves, the queue revision still does not.
+        state.mark_disk_for_test("/mnt/nas", 9 << 20, 300 << 20, true, &[JobId(2)], &[]);
+        assert_ne!(state.disk_rows_revision(), disk_rows);
+        assert_eq!(state.job_revision(), revision);
+    }
+
     #[test]
     fn time_left_counts_what_each_job_still_has_to_come() {
         // The download has every wanted article; only recovery held back
@@ -1642,7 +1905,7 @@ mod tests {
         queued.remaining_bytes = 150;
         let state = SharedPipelineState::new(PipelineMetrics::new(), vec![downloading, queued]);
         let walk = QueueWalk::read(&state, WalkNeeds::default());
-        let plan = PagePlan::plan(&walk, &page_input(0, 10), ROWS);
+        let plan = PagePlan::plan(&walk, &page_input(0, 10), ROWS, None);
 
         assert_eq!(plan.remaining_bytes, 150);
         assert_eq!(plan.eta_total_bytes, 1_300);

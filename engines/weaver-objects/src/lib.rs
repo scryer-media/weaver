@@ -6,6 +6,7 @@
 // faces; nothing outside a format's own module knows its fields. The graph
 // asks for an object by kind through `build`.
 
+mod beside;
 pub mod crypt;
 mod elimination;
 pub mod engine;
@@ -16,6 +17,7 @@ mod lent;
 mod lost;
 pub mod par2;
 pub mod par3;
+mod past_hole;
 mod placed;
 mod quiet;
 pub mod rar_engine;

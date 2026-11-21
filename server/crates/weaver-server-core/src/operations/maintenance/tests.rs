@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
 use std::io::Write as _;
 use std::path::Path;
 
@@ -210,6 +211,7 @@ fn staging_cleanup_keeps_a_history_job_s_staging_until_its_record_goes() {
         completed_at: 1_700_001_000,
         metadata: None,
         server_attribution: None,
+        protocol: crate::jobs::Protocol::Nzb,
         archived_at: None,
     })
     .unwrap();

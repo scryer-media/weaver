@@ -25,7 +25,7 @@ import { EmptyState } from "../../components/chrome";
 import { SecondaryButton, Select } from "../../components/controls";
 import { Icon } from "../../components/icons";
 import { countLabel } from "../../i18n/labels";
-import { metered, quotaSummary } from "./egress-quota";
+import { metered, quotaHeldState, quotaStateLabel, quotaSummary } from "./egress-quota";
 import { formatRate, stateColor, stateLabel, stateTone } from "./presentation";
 
 type FlowConsumer = { key: string; name: string; cap?: number; route?: NetworkRoute | null };
@@ -163,9 +163,16 @@ const legKey = (leg: LegFlow) => `${leg.consumer}:${leg.position}`;
 
 /** The limits an egress is held to, each a row at the bottom of its card: its speed limit, then its quota. */
 const heldTo = (egress: Egress) => [
-  ...(egress.maxDownloadSpeed > 0 ? (["speed"] as const) : []),
+  ...(egress.downloadBps !== null || egress.uploadBps !== null ? (["speed"] as const) : []),
   ...(metered(egress) ? (["quota"] as const) : []),
 ];
+
+/** An egress's own speed limits, each direction that has one. */
+const speedSummary = (egress: Egress) =>
+  [
+    ...(egress.downloadBps !== null ? [`↓ ${formatRate(egress.downloadBps)}`] : []),
+    ...(egress.uploadBps !== null ? [`↑ ${formatRate(egress.uploadBps)}`] : []),
+  ].join(" · ");
 
 /** Monospaced text cut to the width it has, ending in an ellipsis when it was cut. */
 function fit(text: string, width: number, size: number) {
@@ -266,6 +273,46 @@ function endpointCards(consumers: FlowConsumer[], legs: LegFlow[]): Map<string, 
     y += height + ENDPOINT_GAP;
   }
   return cards;
+}
+
+/**
+ * The legs and the endpoints in the order that crosses the fewest lines. A leg stands with the
+ * others leaving through its egress, under that egress's card, in its endpoint's order; an endpoint
+ * stands where the legs reaching it lie, at their mean row. Each order is swept against the other
+ * until neither moves. A consumer no shown leg reaches keeps its place after the ones one does.
+ */
+function uncrossed(
+  consumers: FlowConsumer[],
+  legs: LegFlow[],
+  egressRank: Map<number, number>,
+): { consumers: FlowConsumer[]; legs: LegFlow[] } {
+  const under = (order: FlowConsumer[]) => {
+    const rank = new Map(order.map((consumer, index) => [consumer.key, index]));
+    return [...legs].sort(
+      (a, b) =>
+        (egressRank.get(a.egressId) ?? 0) - (egressRank.get(b.egressId) ?? 0) ||
+        (rank.get(a.consumer) ?? 0) - (rank.get(b.consumer) ?? 0) ||
+        a.position - b.position,
+    );
+  };
+  let order = consumers;
+  for (let sweep = 0; sweep < 4; sweep += 1) {
+    const rows = under(order);
+    const reached = new Map<string, number[]>();
+    for (const [index, leg] of rows.entries()) {
+      reached.set(leg.consumer, [...(reached.get(leg.consumer) ?? []), index]);
+    }
+    const middle = (consumer: FlowConsumer) => {
+      const at = reached.get(consumer.key);
+      return at ? at.reduce((sum, index) => sum + index, 0) / at.length : rows.length;
+    };
+    const next = [...order].sort((a, b) => middle(a) - middle(b));
+    if (next.every((consumer, index) => consumer === order[index])) {
+      break;
+    }
+    order = next;
+  }
+  return { consumers: order, legs: under(order) };
 }
 
 /** A linear map from [0, domain] onto [0, range], clamped at both ends. */
@@ -711,16 +758,22 @@ export const NetworkFlow = memo(function NetworkFlow({
   }, [used]);
   const egressBottom = egressCards.reduce((bottom, card) => Math.max(bottom, card.y + card.height), 38);
   const grouped = !single && (used.length > 6 || shownLegs.length > 40);
-  const cards = useMemo(() => endpointCards(shown, flow.legs), [shown, flow.legs]);
+  const order = useMemo(
+    () =>
+      uncrossed(
+        shown,
+        shownLegs.filter((leg) => !grouped || group === leg.egressId),
+        new Map(used.map((egress, index) => [egress.id, index])),
+      ),
+    [shown, shownLegs, grouped, group, used],
+  );
+  const cards = useMemo(() => endpointCards(order.consumers, flow.legs), [order.consumers, flow.legs]);
   const cardsBottom = [...cards.values()].reduce((bottom, card) => Math.max(bottom, card.y + card.height), 0);
 
   const layout = useMemo(() => {
-    const legs = shownLegs
-      .filter((leg) => !grouped || group === leg.egressId)
-      .sort((a, b) => a.egressId - b.egressId || a.consumer.localeCompare(b.consumer) || a.position - b.position);
     let offset = 58;
     const rows: Row[] = [];
-    for (const leg of legs) {
+    for (const leg of order.legs) {
       let bottom = 0;
       const blocks: Block[] = [];
       const rungs: Rung[] = leg.path.kind === "DIRECT" ? [] : leg.path.rungs;
@@ -809,8 +862,13 @@ export const NetworkFlow = memo(function NetworkFlow({
       single ? endpointY + ENDPOINT_BOX_HEIGHT : cardsBottom,
     );
     return { rows, endpointY, height: single ? bottom + 12 : Math.max(bottom + 52, 260) };
-  }, [shownLegs, flow.pools, grouped, group, pools, profiles, egressBottom, cardsBottom, single, toggleWidth, overrides, t]);
+  }, [order.legs, flow.pools, pools, profiles, egressBottom, cardsBottom, single, toggleWidth, overrides, t]);
 
+  // A flow no leg tunnels through has no proxy lane: the endpoints stand where it would start, and
+  // a leg's line runs straight to its endpoint with nothing written on it.
+  const tunnelled = layout.rows.some(({ blocks, closed }) => blocks.length > 0 || closed);
+  const endpoints = tunnelled ? ENDPOINTS : lane(PROXY.x, ENDPOINTS.width);
+  const span = tunnelled ? WIDTH : endpoints.end + 16;
   const width = scale(Math.max(RIBBON_FULL, ...consumers.map((consumer) => consumer.cap ?? 1)), 28);
   const profile = (id: number | null) => profiles.find((candidate) => candidate.id === id);
   const name = (id: number) => profile(id)?.name ?? t("next.networking.proxyNumber", { id });
@@ -1120,18 +1178,18 @@ export const NetworkFlow = memo(function NetworkFlow({
       <div className="min-w-0 overflow-x-auto bg-wv-app">
         <svg
           xmlns="http://www.w3.org/2000/svg"
-          viewBox={`0 0 ${WIDTH} ${layout.height}`}
+          viewBox={`0 0 ${span} ${layout.height}`}
           role="group"
           aria-label={t("next.networking.flow.diagram")}
           data-testid={networkIds.flowDiagram}
-          className="block w-full min-w-[1160px]"
-          style={{ background: INK.ground, fontFamily: FONT }}
+          className="block"
+          style={{ background: INK.ground, fontFamily: FONT, width: `${(100 * span) / WIDTH}%`, minWidth: (1160 * span) / WIDTH }}
         >
           {[
             [EGRESS.x, t("next.networking.flow.egressColumn")],
             [LEGS.x, t("next.networking.flow.legsColumn")],
-            [PROXY.x, t("next.networking.flow.proxyColumn")],
-            [ENDPOINTS.x, t(single ? "next.networking.flow.endpointColumn" : "next.networking.flow.consumersColumn")],
+            ...(tunnelled ? [[PROXY.x, t("next.networking.flow.proxyColumn")]] : []),
+            [endpoints.x, t(single ? "next.networking.flow.endpointColumn" : "next.networking.flow.consumersColumn")],
           ].map(([x, label]) => (
             <text key={String(x)} x={Number(x) + 4} y="30" fill={INK.faint} fontSize="10.5" fontWeight="600" letterSpacing="1.5" fontFamily={TITLE_FONT}>
               {String(label).toUpperCase()}
@@ -1255,18 +1313,23 @@ export const NetworkFlow = memo(function NetworkFlow({
                   moves: passable && stateTone(way.status) !== "bad" && (way === taken || focus?.kind === "way"),
                 };
                 const enter = way.branches.map(({ at, share }) => ({
-                  points: [
-                    [LEGS.end, legY],
-                    [PROXY.x, at],
-                    ...(way.stop > PROXY.x ? [[way.stop, at] satisfies Point] : []),
-                  ] satisfies Point[],
+                  points: tunnelled
+                    ? ([
+                        [LEGS.end, legY],
+                        [PROXY.x, at],
+                        ...(way.stop > PROXY.x ? [[way.stop, at] satisfies Point] : []),
+                      ] satisfies Point[])
+                    : ([
+                        [LEGS.end, legY],
+                        [endpoints.x, consumerY],
+                      ] satisfies Point[]),
                   share,
                 }));
                 const leave = way.branches.map(({ at, share }) => ({
                   points: [
                     ...(way.resume < PROXY.end ? [[way.resume, at] satisfies Point] : []),
                     [PROXY.end, at],
-                    [ENDPOINTS.x, consumerY],
+                    [endpoints.x, consumerY],
                   ] satisfies Point[],
                   share,
                 }));
@@ -1284,7 +1347,7 @@ export const NetworkFlow = memo(function NetworkFlow({
                 return [
                   { ...line, branches: enter, fan: "start" as const },
                   ...across,
-                  { ...line, branches: leave, fan: "end" as const },
+                  ...(tunnelled ? [{ ...line, branches: leave, fan: "end" as const }] : []),
                 ];
               }),
             ];
@@ -1387,20 +1450,21 @@ export const NetworkFlow = memo(function NetworkFlow({
                     )}
                     {heldTo(egress).map((limit, row) => {
                       const baseline = y + EGRESS_HEIGHT + shift + 7 + row * EGRESS_LIMIT_ROW;
-                      const tone = limit === "quota" && egress.downloadQuotaUsage?.blocked ? stateColor("HOLD") : INK.muted;
+                      const held = limit === "quota" ? quotaHeldState(egress) : null;
+                      const tone = held ? stateColor("HOLD") : INK.muted;
                       return (
                         <g key={limit} color={tone}>
                           <title>
-                            {t(limit === "speed" ? "next.networking.egress.downloadLimit" : "next.networking.egress.quotaSection")}
+                            {t(limit === "speed" ? "next.networking.egress.limit" : "next.networking.egress.quota")}
                           </title>
                           <g transform={`translate(${x} ${baseline - 10})`}>
                             <Icon name={limit === "speed" ? "bandwidth" : "quota"} size={12} />
                           </g>
                           <text x={x + 18} y={baseline} fill={tone} fontSize="10">
                             {limit === "speed"
-                              ? formatRate(egress.maxDownloadSpeed)
-                              : egress.downloadQuotaUsage?.blocked
-                                ? `${quotaSummary(egress)} · ${t("next.quota.blocked")}`
+                              ? speedSummary(egress)
+                              : held
+                                ? `${quotaSummary(egress)} · ${quotaStateLabel(t, held)}`
                                 : quotaSummary(egress)}
                           </text>
                         </g>
@@ -1518,7 +1582,7 @@ export const NetworkFlow = memo(function NetworkFlow({
                     )}
                   </g>
                 ) : null}
-                {bypass == null ? null : (
+                {bypass == null || !tunnelled ? null : (
                   <g opacity={onWay(leg, blocks.length) ? undefined : FADE}>
                     {/* Written on the line, in the break the line leaves for it. */}
                     <StateText
@@ -1541,19 +1605,19 @@ export const NetworkFlow = memo(function NetworkFlow({
               {...(consumers[0] ? point({ kind: "endpoint", key: consumers[0].key }) : {})}
             >
               <title>{`${endpoint.title} · ${endpoint.detail}`}</title>
-              <rect x={ENDPOINTS.x} y={layout.endpointY} width={ENDPOINTS.width} height={ENDPOINT_BOX_HEIGHT} fill={INK.card} stroke={INK.line} />
-              <StateBar x={ENDPOINTS.x} y={layout.endpointY} height={ENDPOINT_BOX_HEIGHT} state={endpoint.state} />
-              <text x={ENDPOINTS.x + 14} y={layout.endpointY + 23} fill={INK.fg} fontSize="12.5" fontFamily={TITLE_FONT} fontWeight="600">
-                {fit(endpoint.title, ENDPOINTS.width - 28, 12.5)}
+              <rect x={endpoints.x} y={layout.endpointY} width={endpoints.width} height={ENDPOINT_BOX_HEIGHT} fill={INK.card} stroke={INK.line} />
+              <StateBar x={endpoints.x} y={layout.endpointY} height={ENDPOINT_BOX_HEIGHT} state={endpoint.state} />
+              <text x={endpoints.x + 14} y={layout.endpointY + 23} fill={INK.fg} fontSize="12.5" fontFamily={TITLE_FONT} fontWeight="600">
+                {fit(endpoint.title, endpoints.width - 28, 12.5)}
               </text>
-              <text x={ENDPOINTS.x + 14} y={layout.endpointY + 41} fill={INK.muted} fontSize="9.5">
-                {fit(endpoint.detail, ENDPOINTS.width - 28, 9.5)}
+              <text x={endpoints.x + 14} y={layout.endpointY + 41} fill={INK.muted} fontSize="9.5">
+                {fit(endpoint.detail, endpoints.width - 28, 9.5)}
               </text>
               <StateText
-                x={ENDPOINTS.x + 14}
+                x={endpoints.x + 14}
                 y={layout.endpointY + 61}
                 state={endpoint.state}
-                label={fit(endpoint.label, ENDPOINTS.width - 41, 10.5)}
+                label={fit(endpoint.label, endpoints.width - 41, 10.5)}
               />
             </g>
           ) : (
@@ -1571,7 +1635,7 @@ export const NetworkFlow = memo(function NetworkFlow({
                 const outbound = consumer.key === OUTBOUND_CONSUMER;
                 // Only a server's card counts its connections.
                 const server = !rss && !outbound;
-                const x = ENDPOINTS.x + 14;
+                const x = endpoints.x + 14;
                 return (
                   <g
                     key={consumer.key}
@@ -1582,13 +1646,13 @@ export const NetworkFlow = memo(function NetworkFlow({
                       { kind: "route", consumer: consumer.key },
                       routePage(consumer.key),
                       <>
-                        <rect x={ENDPOINTS.x} y={y} width={ENDPOINTS.width} height={height} fill={INK.card} stroke={down ? stateColor("DOWN") : INK.line} />
-                        <StateBar x={ENDPOINTS.x} y={y} height={height} state={down ? "DOWN" : open > 0 ? "UP" : "IDLE"} />
+                        <rect x={endpoints.x} y={y} width={endpoints.width} height={height} fill={INK.card} stroke={down ? stateColor("DOWN") : INK.line} />
+                        <StateBar x={endpoints.x} y={y} height={height} state={down ? "DOWN" : open > 0 ? "UP" : "IDLE"} />
                         <text x={x} y={y + 23} fill={INK.fg} fontSize="12.5" fontFamily={TITLE_FONT} fontWeight="600">
-                          {rss ? fit(consumer.name, ENDPOINTS.width - 50, 12.5) : consumer.name.slice(0, 24)}
+                          {rss ? fit(consumer.name, endpoints.width - 50, 12.5) : consumer.name.slice(0, 24)}
                         </text>
                         {rss ? (
-                          <g transform={`translate(${ENDPOINTS.end - 26} ${y + 12})`} color={INK.muted}>
+                          <g transform={`translate(${endpoints.end - 26} ${y + 12})`} color={INK.muted}>
                             <Icon name="rss" size={12} />
                           </g>
                         ) : null}

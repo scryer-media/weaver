@@ -39,3 +39,17 @@ by Microsoft's own license terms, not by Weaver's license. The exact
 `Cargo.lock`. The upstream package is available at
 <https://crates.io/crates/webview2-com-sys>, and the SDK it repackages at
 <https://developer.microsoft.com/microsoft-edge/webview2/>.
+
+## rqbit / librqbit
+
+`engines/weaver-torrent` is derived from the Rust crates of rqbit
+(<https://github.com/ikatson/rqbit>), Copyright 2021 Igor Katson, licensed
+under the Apache License, Version 2.0. The full licence text is in
+`LICENSE-APACHE`. The code was imported from ikatson/rqbit commit
+57e95d16c830863a1fde32d8fa98153b53a3d0b4 (2026-10-08) by way of the
+scryer-media/rqbit fork at 78baa6ebee97ca088a729da647aa42d166741460, and has
+been modified by the Weaver authors from 2026-10-20 onward; every imported
+file carries a header saying so. The HTTP API, web UI, UPnP server, desktop
+app and the rqbit binary were not imported. The modified work as a whole is
+distributed under Weaver's licence (GPL-3.0-or-later), which is compatible
+with Apache-2.0.

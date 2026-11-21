@@ -16,8 +16,7 @@ pub const MAX_NZB_SEGMENTS: usize = 2_000_000;
 pub const MAX_DECLARED_BYTES: u64 = 16 * 1024 * 1024 * 1024 * 1024;
 const MAX_SEGMENT_BYTES: u32 = 32 * 1024 * 1024;
 
-// The subject of a `<file>` that has none, or an empty one: SABnzbd's
-// (`sabnzbd/nzbparser.py`, `file_name = "unknown"`). The job names such a
+// The subject of a `<file>` that has none, or an empty one. The job names such a
 // file after it, and keeps two of them apart as it keeps any two files that
 // share a name.
 pub const MISSING_SUBJECT: &str = "unknown";
@@ -342,9 +341,9 @@ fn visit_nzb_files<R: BufRead>(
                                 _ => {}
                             }
                         }
-                        // A file without a poster or a subject is still fetched,
-                        // as SABnzbd fetches it: the poster is empty, and the
-                        // subject is the one SABnzbd gives it.
+                        // A file without a poster or a subject is still fetched:
+                        // the poster is empty, and the subject is
+                        // `MISSING_SUBJECT`.
                         let poster = poster.unwrap_or_default();
                         if poster.is_empty() {
                             diagnostics.files_without_poster =
@@ -427,7 +426,7 @@ fn visit_nzb_files<R: BufRead>(
                     "head" => in_head = false,
                     "meta" if in_head => {
                         // `Password` and `TITLE` are the password and the
-                        // title, as NZBGet reads them.
+                        // title.
                         if let Some(key) = current_meta_type.take() {
                             if key.eq_ignore_ascii_case("title") {
                                 meta_title = Some(text_buf.trim().to_owned());
@@ -736,8 +735,8 @@ fn resolve_entity(name: &str) -> Option<&'static str> {
 // Passes UTF-8 through and reads every byte that is not UTF-8 as Latin-1.
 //
 // Older NZBs declare `encoding="iso-8859-1"` and carry a subject or poster
-// with a byte such as 0xE9 for an accented letter. expat, which SABnzbd parses
-// with, honours the declaration; the XML reader here takes UTF-8 only and
+// with a byte such as 0xE9 for an accented letter. expat honours the
+// declaration; the XML reader here takes UTF-8 only and
 // would refuse the whole document. Text that is valid UTF-8 is unchanged.
 struct Utf8OrLatin1<R> {
     inner: R,
@@ -943,7 +942,7 @@ impl SegmentBuilder {
         }
 
         // Part numbers are labels the parts are ordered by. A post numbered
-        // from 0 keeps its first part, as SABnzbd keeps it.
+        // from 0 keeps its first part.
         if self.number.is_none() {
             return Some("missing number attribute");
         }
@@ -1341,7 +1340,7 @@ mod tests {
         assert!(matches!(err, NzbError::EmptyNzb));
     }
 
-    // 9. A file without a poster or a subject is fetched, as SABnzbd fetches it
+    // 9. A file without a poster or a subject is fetched
     #[test]
     fn missing_poster_parses_with_an_empty_poster() {
         let xml = br#"<?xml version="1.0"?>
@@ -1572,7 +1571,7 @@ mod tests {
         assert_eq!(nzb.files[0].segments[0].message_id(), "valid");
     }
 
-    // SABnzbd orders parts by number and takes any number, so a post
+    // Parts are ordered by number and any number is taken, so a post
     // numbered from 0 keeps its first part.
     #[test]
     fn part_number_zero_is_kept_and_sorts_first() {
@@ -1592,8 +1591,7 @@ mod tests {
         assert_eq!(nzb.files[0].segments[0].message_id(), "zero@x");
     }
 
-    // Python's `int` and C's `atol`, which SABnzbd and NZBGet read these
-    // with, both take surrounding whitespace.
+    // Python's `int` and C's `atol` both take surrounding whitespace.
     #[test]
     fn numbers_with_surrounding_whitespace_parse() {
         let xml = br#"<?xml version="1.0"?>
@@ -1630,8 +1628,7 @@ mod tests {
         assert_eq!(nzb.files[0].segments[0].message_id(), "one@x");
     }
 
-    // SABnzbd finds a `<group>` anywhere under its file, and NZBGet a
-    // `<segment>`.
+    // A `<group>` or a `<segment>` counts anywhere under its file.
     #[test]
     fn groups_and_segments_count_without_their_wrappers() {
         let xml = br#"<?xml version="1.0"?>
@@ -1666,7 +1663,7 @@ mod tests {
     }
 
     // An older NZB declares Latin-1 and writes an accented letter as one
-    // byte. expat honours the declaration, so SABnzbd reads it.
+    // byte. expat honours the declaration, and so does Weaver.
     #[test]
     fn latin1_bytes_are_read_and_utf8_is_unchanged() {
         let mut xml = Vec::new();
@@ -2227,6 +2224,33 @@ mod tests {
         let nzb = parse_nzb(&one_file("&quot;sh&notanentity;ow.rar&quot; yEnc (1/1)")).unwrap();
         assert_eq!(nzb.files[0].subject, "\"show.rar\" yEnc (1/1)");
         assert_eq!(nzb.files[0].filename(), Some("show.rar"));
+    }
+
+    // `&quot;` in the XML is a quote mark once parsed, and an unpaired one
+    // is no part of the name, by either naming call.
+    #[test]
+    fn an_unpaired_escaped_quote_is_no_part_of_the_name() {
+        let nzb = parse_nzb(&one_file(
+            "Show.S01E01.[71ECB6A7].mkv.001&quot; yEnc (1/50)",
+        ))
+        .unwrap();
+        let file = &nzb.files[0];
+        assert_eq!(file.subject, "Show.S01E01.[71ECB6A7].mkv.001\" yEnc (1/50)");
+        assert_eq!(file.filename(), Some("Show.S01E01.[71ECB6A7].mkv.001"));
+        assert_eq!(
+            file.extract_filename(),
+            Some(("Show.S01E01.[71ECB6A7].mkv.001".to_string(), 0.5))
+        );
+    }
+
+    // An escape escaped twice parses to the text `&quot;`, which is not a
+    // quote mark and stays in the word.
+    #[test]
+    fn a_twice_escaped_quote_is_text_in_the_subject_and_no_part_of_the_name() {
+        let nzb = parse_nzb(&one_file("&amp;quot;show.rar&amp;quot; yEnc (1/1)")).unwrap();
+        let file = &nzb.files[0];
+        assert_eq!(file.subject, "&quot;show.rar&quot; yEnc (1/1)");
+        assert_eq!(file.filename(), Some("show.rar"));
     }
 
     #[test]

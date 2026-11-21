@@ -1,0 +1,69 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+//
+// Derived from rqbit (https://github.com/ikatson/rqbit), Copyright 2021 Igor Katson,
+// licensed under the Apache License 2.0 (see LICENSE-APACHE). Modified by the
+// Weaver authors from 2026-10-20 onward.
+
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU32, AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+
+#[derive(Default, Debug)]
+pub(crate) struct PeerCountersAtomic {
+    pub fetched_bytes: AtomicU64,
+    pub uploaded_bytes: AtomicU64,
+    /// Bytes received and sent that were not block payload: handshakes and
+    /// every other message (libtorrent `stat`, the protocol half of each
+    /// channel).
+    pub fetched_protocol_bytes: AtomicU64,
+    pub uploaded_protocol_bytes: AtomicU64,
+    /// Bytes of IP and TCP headers the reads and writes of the peer's
+    /// sockets are taken to have cost (libtorrent `stat`, the IP overhead
+    /// of each channel, which a read and a write both add to).
+    pub ip_overhead_bytes: AtomicU64,
+    pub total_time_connecting_ms: AtomicU64,
+    pub incoming_connections: AtomicU32,
+    pub outgoing_connection_attempts: AtomicU32,
+    pub outgoing_connections: AtomicU32,
+    pub errors: AtomicU32,
+    pub fetched_chunks: AtomicU32,
+    pub downloaded_and_checked_pieces: AtomicU32,
+    pub downloaded_and_checked_bytes: AtomicU64,
+    pub total_piece_download_ms: AtomicU64,
+    pub times_stolen_from_me: AtomicU32,
+    pub times_i_stole: AtomicU32,
+}
+
+impl PeerCountersAtomic {
+    pub(crate) fn on_piece_completed(&self, piece_len: u64, elapsed: Duration) {
+        #[allow(clippy::cast_possible_truncation)]
+        let elapsed = elapsed.as_millis() as u64;
+        self.total_piece_download_ms
+            .fetch_add(elapsed, Ordering::Release);
+        self.downloaded_and_checked_pieces
+            .fetch_add(1, Ordering::Release);
+        self.downloaded_and_checked_bytes
+            .fetch_add(piece_len, Ordering::Relaxed);
+    }
+
+    pub(crate) fn average_piece_download_time(&self) -> Option<Duration> {
+        let downloaded_pieces = self.downloaded_and_checked_pieces.load(Ordering::Acquire);
+        let total_download_time = self.total_piece_download_ms.load(Ordering::Acquire);
+        if total_download_time == 0 || downloaded_pieces == 0 {
+            return None;
+        }
+        Some(Duration::from_millis(
+            total_download_time / downloaded_pieces as u64,
+        ))
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct PeerStats {
+    pub counters: Arc<PeerCountersAtomic>,
+}

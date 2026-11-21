@@ -1650,6 +1650,7 @@ func Recipes() []Recipe {
 	recipes = append(recipes, GraphGapRecipes()...)
 	recipes = append(recipes, GraphBoundaryRecipes()...)
 	recipes = append(recipes, AdversarialVolumeRecipes()...)
+	recipes = append(recipes, SceneZipRecipes()...)
 	return recipes
 }
 

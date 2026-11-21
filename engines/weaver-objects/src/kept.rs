@@ -190,11 +190,37 @@ impl Kept {
         }
     }
 
+    // The pieces meeting a range, in order: from the last piece starting at
+    // or before its start, since pieces are disjoint and every one before
+    // that one ends at or before it, up to its end.
     fn overlapping(&self, range: ByteRange) -> impl Iterator<Item = &Piece> {
+        let first = self
+            .pieces
+            .range(..=range.start)
+            .next_back()
+            .map_or(range.start, |(start, _)| *start);
         self.pieces
-            .range(..range.end.max(range.start + 1))
+            .range(first..range.end.max(range.start + 1))
             .map(|(_, piece)| piece)
             .filter(move |piece| piece.range.intersect(range).is_some())
+    }
+
+    // The bytes of a range by the scan from the first piece that `read`
+    // made before its lookup started at the range, for a test to compare
+    // with and to time against.
+    #[cfg(test)]
+    pub(crate) fn read_scanning(&self, range: ByteRange) -> Option<&[u8]> {
+        let piece = self
+            .pieces
+            .range(..range.end.max(range.start + 1))
+            .map(|(_, piece)| piece)
+            .filter(|piece| piece.range.intersect(range).is_some())
+            .find(|piece| piece.range.covers(range))?;
+        if !piece.coverage.covered(range) {
+            return None;
+        }
+        let at = (range.start - piece.range.start) as usize;
+        Some(&piece.bytes[at..at + range.len() as usize])
     }
 
     // Whether absorbing a delivery would change anything kept, in its bytes
@@ -299,7 +325,7 @@ impl Kept {
         else {
             return &[];
         };
-        let Some(run) = piece.coverage.runs().find(|run| run.range.contains(offset)) else {
+        let Some(run) = piece.coverage.overlapping(ByteRange::at(offset, 1)).next() else {
             return &[];
         };
         let at = (offset - piece.range.start) as usize;
@@ -312,8 +338,8 @@ impl Kept {
         let (_, piece) = self.pieces.range(..=offset).next_back()?;
         piece
             .coverage
-            .runs()
-            .find(|run| run.range.contains(offset))
+            .overlapping(ByteRange::new(offset, offset.saturating_add(1)))
+            .next()
             .map(|run| run.provenance)
     }
 
@@ -346,14 +372,24 @@ impl Kept {
         })
     }
 
-    // Where the next byte in hand at or after `offset` is, if any.
+    // Where the next byte in hand at or after `offset` is, if any. Pieces
+    // are disjoint and in order, and each one's runs lie inside it in
+    // order, so the first run ending past `offset`, looked for from the
+    // piece holding it or the last one before it, is the nearest.
     pub(crate) fn next_in_hand(&self, offset: u64) -> Option<u64> {
+        let first = self
+            .pieces
+            .range(..=offset)
+            .next_back()
+            .map_or(offset, |(start, _)| *start);
         self.pieces
-            .values()
-            .flat_map(|piece| piece.coverage.runs())
-            .filter(|run| run.range.end > offset)
+            .range(first..)
+            .filter(|(_, piece)| piece.range.end > offset)
+            .find_map(|(_, piece)| {
+                let after = ByteRange::new(offset.max(piece.range.start), piece.range.end);
+                piece.coverage.overlapping(after).next()
+            })
             .map(|run| run.range.start.max(offset))
-            .min()
     }
 
     // The bytes in hand that run unbroken to the end of a range, within it.
@@ -614,6 +650,232 @@ mod tests {
         }
         assert!(ranged.pieces.len() > 100, "{}", ranged.pieces.len());
         assert!(ranged.sound());
+    }
+
+    // The pieces meeting a range, by the scan from the first piece that
+    // `overlapping` made before its lookup started at the range.
+    fn overlapping_scan(kept: &Kept, range: ByteRange) -> Vec<&Piece> {
+        kept.pieces
+            .range(..range.end.max(range.start + 1))
+            .map(|(_, piece)| piece)
+            .filter(|piece| piece.range.intersect(range).is_some())
+            .collect()
+    }
+
+    // Over many pieces, touching, apart and partly filled, every range,
+    // empty, inside one piece, across several, on a piece's edges and past
+    // the last, meets the same pieces and reads the same bytes as the scan
+    // from the first piece did.
+    #[test]
+    fn overlapping_from_the_range_meets_what_the_scan_from_the_first_piece_met() {
+        let mut kept = Kept::default();
+        let mut seed = 0x9e37_79b9_u64;
+        let mut next = move |bound: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % bound
+        };
+        for step in 0..3_000 {
+            let start = next(200_000);
+            let range = ByteRange::new(start, start + 1 + next(64));
+            if step % 2 == 0 {
+                kept.want(range);
+            } else {
+                let bytes: Vec<u8> = (0..range.len()).map(|at| (next(3) + at) as u8).collect();
+                kept.absorb(range, &bytes, Provenance::Fresh);
+            }
+        }
+        assert!(kept.pieces.len() > 500, "{}", kept.pieces.len());
+        let mut queries: Vec<ByteRange> = kept
+            .pieces
+            .values()
+            .flat_map(|piece| {
+                let (start, end) = (piece.range.start, piece.range.end);
+                [
+                    piece.range,
+                    ByteRange::new(start, start),
+                    ByteRange::new(end, end),
+                    ByteRange::new(start.saturating_sub(1), start + 1),
+                    ByteRange::new(end - 1, end + 1),
+                    ByteRange::new(start + 1, end),
+                ]
+            })
+            .collect();
+        for _ in 0..3_000 {
+            let start = next(210_000);
+            queries.push(ByteRange::new(start, start + next(5_000)));
+        }
+        for range in queries {
+            let met: Vec<&Piece> = kept.overlapping(range).collect();
+            assert_eq!(met, overlapping_scan(&kept, range), "{range:?}");
+            assert_eq!(kept.read(range), kept.read_scanning(range), "{range:?}");
+        }
+    }
+
+    // The lookups by bytes in hand as they were before they looked from the
+    // offset: every piece and every run of each.
+    fn next_in_hand_scanning(kept: &Kept, offset: u64) -> Option<u64> {
+        kept.pieces
+            .values()
+            .flat_map(|piece| piece.coverage.runs())
+            .filter(|run| run.range.end > offset)
+            .map(|run| run.range.start.max(offset))
+            .min()
+    }
+
+    fn from_scanning(kept: &Kept, offset: u64) -> &[u8] {
+        let Some(piece) = kept
+            .pieces
+            .range(..=offset)
+            .next_back()
+            .map(|(_, piece)| piece)
+            .filter(|piece| piece.range.contains(offset))
+        else {
+            return &[];
+        };
+        let Some(run) = piece.coverage.runs().find(|run| run.range.contains(offset)) else {
+            return &[];
+        };
+        let at = (offset - piece.range.start) as usize;
+        let end = (run.range.end - piece.range.start) as usize;
+        &piece.bytes[at..end]
+    }
+
+    fn provenance_at_scanning(kept: &Kept, offset: u64) -> Option<Provenance> {
+        let (_, piece) = kept.pieces.range(..=offset).next_back()?;
+        piece
+            .coverage
+            .runs()
+            .find(|run| run.range.contains(offset))
+            .map(|run| run.provenance)
+    }
+
+    fn missing_scanning(kept: &Kept, range: ByteRange) -> Vec<ByteRange> {
+        let mut out = Vec::new();
+        let mut cursor = range.start;
+        while cursor < range.end {
+            let run = from_scanning(kept, cursor).len() as u64;
+            if run > 0 {
+                cursor += run;
+                continue;
+            }
+            let next =
+                next_in_hand_scanning(kept, cursor).map_or(range.end, |next| next.min(range.end));
+            out.push(ByteRange::new(cursor, next));
+            cursor = next;
+        }
+        out
+    }
+
+    // Over many pieces, empty, partly and wholly in hand, with runs of
+    // several provenances, every offset on and around a piece's and a run's
+    // edges, and ranges across them, find the same next byte, the same run,
+    // the same provenance and the same gaps as the scans over every piece.
+    #[test]
+    fn lookups_from_the_offset_answer_as_the_scans_over_every_piece() {
+        let kinds = [Provenance::Fresh, Provenance::Damaged, Provenance::Repaired];
+        let mut kept = Kept::default();
+        let mut seed = 0x51_7cc1_b727_u64;
+        let mut next = move |bound: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % bound
+        };
+        for step in 0..4_000 {
+            let start = next(200_000);
+            if step % 2 == 0 {
+                kept.want(ByteRange::new(start, start + 1 + next(200)));
+            } else {
+                let range = ByteRange::new(start, start + 1 + next(48));
+                let bytes: Vec<u8> = (0..range.len()).map(|at| (next(3) + at) as u8).collect();
+                kept.absorb(range, &bytes, kinds[next(3) as usize]);
+            }
+        }
+        let empty = kept
+            .pieces
+            .values()
+            .filter(|piece| piece.coverage.runs().next().is_none())
+            .count();
+        let runs: usize = kept
+            .pieces
+            .values()
+            .map(|piece| piece.coverage.runs().count())
+            .sum();
+        assert!(kept.pieces.len() > 500, "{}", kept.pieces.len());
+        assert!(empty > 50 && runs > kept.pieces.len(), "{empty} {runs}");
+        let mut offsets: Vec<u64> = vec![0, 210_000];
+        for piece in kept.pieces.values() {
+            for edge in [piece.range.start, piece.range.end] {
+                offsets.extend([edge.saturating_sub(1), edge, edge + 1]);
+            }
+            for run in piece.coverage.runs() {
+                for edge in [run.range.start, run.range.end] {
+                    offsets.extend([edge.saturating_sub(1), edge, edge + 1]);
+                }
+            }
+        }
+        for _ in 0..2_000 {
+            offsets.push(next(210_000));
+        }
+        let mut gaps = Vec::new();
+        for (index, &offset) in offsets.iter().enumerate() {
+            assert_eq!(
+                kept.next_in_hand(offset),
+                next_in_hand_scanning(&kept, offset),
+                "{offset}"
+            );
+            assert_eq!(kept.from(offset), from_scanning(&kept, offset), "{offset}");
+            assert_eq!(
+                kept.provenance_at(offset),
+                provenance_at_scanning(&kept, offset),
+                "{offset}"
+            );
+            let range = ByteRange::new(offset, offset + offsets[(index * 7) % offsets.len()] % 900);
+            gaps.clear();
+            kept.missing(range, &mut gaps);
+            assert_eq!(gaps, missing_scanning(&kept, range), "{range:?}");
+        }
+    }
+
+    // The 13,000-entry shape: a local header wanted for each entry, every
+    // one in hand but each tenth. Each entry asks for the gaps of its
+    // header, as a pass over the entries does. Prints the time of both.
+    #[test]
+    fn a_header_looks_for_its_gaps_near_itself_not_over_every_header() {
+        const ENTRIES: u64 = 13_000;
+        const STRIDE: u64 = 4_096;
+        const HEADER: u64 = 46;
+        let mut kept = Kept::default();
+        for entry in 0..ENTRIES {
+            let header = ByteRange::at(entry * STRIDE, HEADER);
+            kept.want(header);
+            if entry % 10 != 0 {
+                kept.absorb(header, &[entry as u8; HEADER as usize], Provenance::Fresh);
+            }
+        }
+        let headers: Vec<ByteRange> = (0..ENTRIES)
+            .map(|entry| ByteRange::at(entry * STRIDE, HEADER))
+            .collect();
+        let began = std::time::Instant::now();
+        let mut now = Vec::new();
+        for header in &headers {
+            kept.missing(*header, &mut now);
+        }
+        let narrowed = began.elapsed();
+        let began = std::time::Instant::now();
+        let before: Vec<ByteRange> = headers
+            .iter()
+            .flat_map(|header| missing_scanning(&kept, *header))
+            .collect();
+        let scanning = began.elapsed();
+        assert_eq!(now, before);
+        assert_eq!(now.len() as u64, ENTRIES / 10);
+        eprintln!(
+            "{ENTRIES} headers: gaps looked up from the offset in {narrowed:?}, \
+             by the scan over every piece in {scanning:?}"
+        );
     }
 
     #[test]

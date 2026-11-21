@@ -1,0 +1,576 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+// Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
+// Modified by the Weaver authors, 2026-11-13.
+
+use std::{
+    collections::HashMap,
+    future::{Future, poll_fn},
+    net::SocketAddr,
+    sync::Arc,
+    task::Poll,
+};
+
+use crate::{
+    Fragmenting, PollSendToVectored, SocketOpts, Transport, message::UtpMessage, raw::UtpHeader,
+};
+use parking_lot::Mutex;
+use tokio::sync::{
+    Notify,
+    mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+};
+
+use super::{MockUtpSocket, env::MockUtpEnvironment};
+
+type Msg = (SocketAddr, Vec<u8>);
+
+pub struct MockInterface {
+    sockets: Mutex<HashMap<SocketAddr, UnboundedSender<Msg>>>,
+    pub env: MockUtpEnvironment,
+    // The threads datagrams were sent from, by name; size probes and
+    // packets given up on as too large apart.
+    pub sending_threads: Mutex<std::collections::BTreeSet<Option<String>>>,
+    pub fragmenting_threads: Mutex<std::collections::BTreeSet<Option<String>>>,
+    pub fragmenting_sends: std::sync::atomic::AtomicUsize,
+    // The kind of runtime each transport was registered with.
+    pub registered_on: Mutex<Vec<Option<tokio::runtime::RuntimeFlavor>>>,
+    // How many datagrams each call for several addresses was given.
+    pub many_sends: Mutex<Vec<usize>>,
+    // How many datagrams each receive call for several returned.
+    pub many_receives: Mutex<Vec<usize>>,
+}
+
+impl MockInterface {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            sockets: Default::default(),
+            env: MockUtpEnvironment::new(),
+            sending_threads: Default::default(),
+            fragmenting_threads: Default::default(),
+            fragmenting_sends: Default::default(),
+            registered_on: Default::default(),
+            many_sends: Default::default(),
+            many_receives: Default::default(),
+        })
+    }
+
+    pub fn create_socket(self: &Arc<Self>, bind_addr: SocketAddr) -> Arc<MockUtpSocket> {
+        self.create_socket_with_opts(bind_addr, SocketOpts::default())
+    }
+
+    pub fn create_socket_with_opts(
+        self: &Arc<Self>,
+        bind_addr: SocketAddr,
+        opts: SocketOpts,
+    ) -> Arc<MockUtpSocket> {
+        MockUtpSocket::new_with_opts(self.transport(bind_addr), self.env.clone(), opts).unwrap()
+    }
+
+    pub fn transport(self: &Arc<Self>, bind_addr: SocketAddr) -> MockUtpTransport {
+        let (tx, rx) = unbounded_channel();
+        if self.sockets.lock().insert(bind_addr, tx).is_some() {
+            panic!("socket with {} already existed", bind_addr)
+        }
+        MockUtpTransport::new(bind_addr, rx, self.clone())
+    }
+}
+
+// Without this indirection rust analyzer doesn't work somehow
+struct MockUtpTransportInnerLocked {
+    rx: UnboundedReceiver<Msg>,
+}
+
+struct MockUtpTransportInner {
+    locked: Mutex<MockUtpTransportInnerLocked>,
+    interface: Arc<MockInterface>,
+}
+
+#[derive(Clone)]
+pub struct MockUtpTransport {
+    inner: Arc<MockUtpTransportInner>,
+    bind_addr: SocketAddr,
+    // Streams hand their datagrams to the socket's I/O task, as over a
+    // kernel socket.
+    one_task: bool,
+    // Streams may run on other uTP threads than the I/O task's.
+    spreads: bool,
+    // Its registration fails.
+    refuses_registration: bool,
+    // How many datagrams one call sends to several addresses, and how many
+    // one call receives.
+    many: usize,
+    // It says it receives several a call and has no call that does.
+    many_unsupported: bool,
+}
+
+impl MockUtpTransport {
+    pub fn new(
+        bind_addr: SocketAddr,
+        rx: UnboundedReceiver<Msg>,
+        interface: Arc<MockInterface>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(MockUtpTransportInner {
+                locked: Mutex::new(MockUtpTransportInnerLocked { rx }),
+                interface,
+            }),
+            bind_addr,
+            one_task: false,
+            spreads: false,
+            refuses_registration: false,
+            many: 1,
+            many_unsupported: false,
+        }
+    }
+
+    pub fn taking_many(mut self, most: usize) -> Self {
+        self.many = most;
+        self
+    }
+
+    pub fn claiming_many(mut self, most: usize) -> Self {
+        self.many = most;
+        self.many_unsupported = true;
+        self
+    }
+
+    pub fn refusing_registration(mut self) -> Self {
+        self.refuses_registration = true;
+        self
+    }
+
+    pub fn sending_from_one_task(mut self) -> Self {
+        self.one_task = true;
+        self
+    }
+
+    pub fn spreading_streams(mut self) -> Self {
+        self.spreads = true;
+        self
+    }
+
+    pub fn send(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+        self.deliver(buf, target, &self.inner.interface.sending_threads)
+    }
+
+    fn deliver(
+        &self,
+        buf: &[u8],
+        target: SocketAddr,
+        threads: &Mutex<std::collections::BTreeSet<Option<String>>>,
+    ) -> std::io::Result<usize> {
+        threads
+            .lock()
+            .insert(std::thread::current().name().map(str::to_owned));
+        match self.inner.interface.sockets.lock().get(&target) {
+            Some(tx) => match tx.send((self.bind_addr, buf.to_owned())) {
+                Ok(_) => {}
+                Err(_) => return Err(std::io::Error::other(format!("target {target} is dead"))),
+            },
+            None => return Err(std::io::Error::other(format!("no route to {target}"))),
+        };
+
+        Ok(buf.len())
+    }
+}
+
+impl Transport for MockUtpTransport {
+    fn register_io(&self) -> std::io::Result<()> {
+        if self.refuses_registration {
+            return Err(std::io::Error::other("registration refused"));
+        }
+        let flavor = tokio::runtime::Handle::try_current()
+            .ok()
+            .map(|handle| handle.runtime_flavor());
+        self.inner.interface.registered_on.lock().push(flavor);
+        Ok(())
+    }
+
+    fn sends_from_one_task(&self) -> bool {
+        self.one_task
+    }
+
+    fn spreads_streams(&self) -> bool {
+        self.spreads
+    }
+
+    fn send_many_most(&self) -> usize {
+        self.many
+    }
+
+    fn poll_send_many(
+        &self,
+        _cx: &mut std::task::Context<'_>,
+        bytes: &[u8],
+        parts: &[(usize, SocketAddr)],
+    ) -> Poll<std::io::Result<usize>> {
+        self.inner.interface.many_sends.lock().push(parts.len());
+        let mut at = 0;
+        for (sent, (len, target)) in parts.iter().enumerate() {
+            match self.send(&bytes[at..at + len], *target) {
+                Ok(_) => at += len,
+                Err(error) if sent == 0 => return Poll::Ready(Err(error)),
+                Err(_) => return Poll::Ready(Ok(sent)),
+            }
+        }
+        Poll::Ready(Ok(parts.len()))
+    }
+
+    fn recv_many_most(&self) -> usize {
+        self.many
+    }
+
+    fn poll_recv_many(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        into: &mut [crate::Received],
+        spill: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if self.many_unsupported {
+            return Poll::Ready(Err(std::io::ErrorKind::Unsupported.into()));
+        }
+        let mut locked = self.inner.locked.lock();
+        let mut count = 0;
+        let mut long = None;
+        while count < into.len() {
+            let Poll::Ready(next) = locked.rx.poll_recv(cx) else {
+                break;
+            };
+            let (from, data) = next.unwrap();
+            let first = data.len().min(into[count].head.len());
+            if data.len() > first {
+                // The rest of a long one is written over the rest of the
+                // long one before it in the call.
+                if let Some(before) = long.replace(count) {
+                    into[before].len = spill.len();
+                }
+                spill[..data.len() - first].copy_from_slice(&data[first..]);
+            }
+            let entry = &mut into[count];
+            entry.head[..first].copy_from_slice(&data[..first]);
+            entry.len = data.len();
+            entry.from = from;
+            count += 1;
+        }
+        if count == 0 {
+            return Poll::Pending;
+        }
+        self.inner.interface.many_receives.lock().push(count);
+        Poll::Ready(Ok(count))
+    }
+
+    async fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        let f = poll_fn(|cx| self.inner.locked.lock().rx.poll_recv(cx));
+        let (addr, data) = f.await.unwrap();
+        assert!(data.len() <= buf.len());
+        buf[..data.len()].copy_from_slice(&data);
+        Ok((data.len(), addr))
+    }
+
+    async fn send_to<'a>(&'a self, buf: &'a [u8], target: SocketAddr) -> std::io::Result<usize> {
+        self.send(buf, target)
+    }
+
+    fn poll_send_to(
+        &self,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+        target: SocketAddr,
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        Poll::Ready(self.send(buf, target))
+    }
+
+    fn bind_addr(&self) -> SocketAddr {
+        self.bind_addr
+    }
+
+    fn poll_send_to_vectored_fragmenting(
+        &self,
+        _cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+        target: SocketAddr,
+        _fragmenting: Fragmenting,
+    ) -> Poll<std::io::Result<usize>> {
+        let mut buf = Vec::new();
+        bufs.iter().for_each(|b| buf.extend_from_slice(b.as_ref()));
+        self.inner
+            .interface
+            .fragmenting_sends
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Poll::Ready(self.deliver(&buf, target, &self.inner.interface.fragmenting_threads))
+    }
+}
+
+impl PollSendToVectored for MockUtpTransport {
+    fn poll_send_to_vectored(
+        &self,
+        _cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+        target: SocketAddr,
+    ) -> Poll<std::io::Result<usize>> {
+        let mut buf = Vec::new();
+        bufs.iter().for_each(|b| buf.extend_from_slice(b.as_ref()));
+        Poll::Ready(self.send(&buf, target))
+    }
+}
+
+#[derive(Default)]
+struct RememberingTransportLocked {
+    messages: Vec<Msg>,
+    // For each message, how a send that controls fragmenting sent it.
+    fragmenting: Vec<Option<Fragmenting>>,
+    // Whether the transport controls fragmenting, as a kernel socket does.
+    controls_fragmenting: bool,
+    max_payload_len: Option<usize>,
+    link_mtu: Option<u16>,
+    poll_send_pending: bool,
+    // Woken when sends are taken again, as a socket's writable wake.
+    send_waker: Option<std::task::Waker>,
+    refused: usize,
+    // The socket's streams queue their datagrams for its dispatcher.
+    sends_from_one_task: bool,
+    // Sends still taken before the transport refuses them.
+    refuse_after: Option<usize>,
+}
+
+#[derive(Clone)]
+pub struct RememberingTransport {
+    pub bind_addr: SocketAddr,
+    locked: Arc<Mutex<RememberingTransportLocked>>,
+    sent: Arc<Notify>,
+}
+
+impl RememberingTransport {
+    pub fn new(bind_addr: SocketAddr) -> Self {
+        Self {
+            bind_addr,
+            locked: Default::default(),
+            sent: Arc::default(),
+        }
+    }
+
+    // Tests that poll the stream themselves control when sends become
+    // writable. Becoming writable wakes the last waker a refused send left,
+    // as a kernel socket does.
+    pub fn set_poll_send_pending(&self, pending: bool) {
+        let waker = {
+            let mut g = self.locked.lock();
+            g.poll_send_pending = pending;
+            if pending { None } else { g.send_waker.take() }
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    // Takes `sends` more sends, then refuses until told to take them
+    // again.
+    pub fn refuse_after(&self, sends: usize) {
+        self.locked.lock().refuse_after = Some(sends);
+    }
+
+    // How many sends the transport refused.
+    pub fn refused(&self) -> usize {
+        self.locked.lock().refused
+    }
+
+    // Sockets built on the transport from now on send from their
+    // dispatcher, as a kernel socket's do.
+    pub fn set_sends_from_one_task(&self) {
+        self.locked.lock().sends_from_one_task = true;
+    }
+
+    // Refuses a send, keeping the waker it was polled with.
+    fn refuse(&self, cx: &std::task::Context<'_>) -> bool {
+        let mut g = self.locked.lock();
+        match g.refuse_after {
+            Some(0) => {
+                g.poll_send_pending = true;
+                g.refuse_after = None;
+            }
+            Some(left) => g.refuse_after = Some(left - 1),
+            None => {}
+        }
+        if !g.poll_send_pending {
+            return false;
+        }
+        g.refused += 1;
+        g.send_waker = Some(cx.waker().clone());
+        drop(g);
+        self.sent.notify_waiters();
+        true
+    }
+
+    // Waits until `done` holds of the datagrams sent and the sends refused.
+    pub async fn wait_until(&self, done: impl Fn(&[Msg], usize) -> bool) {
+        loop {
+            let sent = self.sent.notified();
+            tokio::pin!(sent);
+            sent.as_mut().enable();
+            {
+                let g = self.locked.lock();
+                if done(&g.messages, g.refused) {
+                    return;
+                }
+            }
+            sent.await;
+        }
+    }
+
+    pub fn set_link_mtu(&self, mtu: u16) {
+        self.locked.lock().link_mtu = Some(mtu);
+    }
+
+    pub fn set_max_payload_len(&mut self, len: usize) {
+        self.locked.lock().max_payload_len = Some(len);
+    }
+
+    // Sends that say how they may be fragmented are recorded as such from
+    // now on; until then they are sent as any other datagram.
+    pub fn set_controls_fragmenting(&self) {
+        self.locked.lock().controls_fragmenting = true;
+    }
+
+    pub fn send(&self, addr: SocketAddr, buf: &[u8]) -> std::io::Result<()> {
+        self.send_as(addr, buf, None)
+    }
+
+    fn send_as(
+        &self,
+        addr: SocketAddr,
+        buf: &[u8],
+        fragmenting: Option<Fragmenting>,
+    ) -> std::io::Result<()> {
+        let mut g = self.locked.lock();
+        let too_large = g.max_payload_len.is_some_and(|l| buf.len() > l);
+        // A failed send is kept too, so tests can inspect the rejected packet.
+        g.messages.push((addr, buf.to_owned()));
+        g.fragmenting.push(fragmenting);
+        drop(g);
+        self.sent.notify_waiters();
+        if too_large {
+            Err(crate::message_size_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub async fn wait_for_sent(&self, matches: impl Fn(&UtpHeader) -> bool) {
+        loop {
+            let sent = self.sent.notified();
+            tokio::pin!(sent);
+            sent.as_mut().enable();
+            if self.locked.lock().messages.iter().any(|(_, data)| {
+                UtpHeader::deserialize(data).is_some_and(|(header, _)| matches(&header))
+            }) {
+                return;
+            }
+            sent.await;
+        }
+    }
+
+    pub fn take_sent(&self) -> Vec<Msg> {
+        let mut g = self.locked.lock();
+        g.fragmenting.clear();
+        std::mem::take(&mut g.messages)
+    }
+
+    // The messages sent, each with how a send that controls fragmenting
+    // sent it.
+    pub fn take_sent_fragmenting(&self) -> Vec<(UtpMessage, Option<Fragmenting>)> {
+        let (messages, fragmenting) = {
+            let mut g = self.locked.lock();
+            (
+                std::mem::take(&mut g.messages),
+                std::mem::take(&mut g.fragmenting),
+            )
+        };
+        messages
+            .into_iter()
+            .map(|(_, msg)| UtpMessage::deserialize(&msg, tokio::time::Instant::now()).unwrap())
+            .zip(fragmenting)
+            .collect()
+    }
+
+    pub fn take_sent_utpmessages(&self) -> Vec<UtpMessage> {
+        let sent = self.take_sent();
+        sent.into_iter()
+            .map(|(_, msg)| UtpMessage::deserialize(&msg, tokio::time::Instant::now()).unwrap())
+            .collect()
+    }
+}
+
+impl Transport for RememberingTransport {
+    fn sends_from_one_task(&self) -> bool {
+        self.locked.lock().sends_from_one_task
+    }
+
+    fn recv_from<'a>(
+        &'a self,
+        _buf: &'a mut [u8],
+    ) -> impl Future<Output = std::io::Result<(usize, SocketAddr)>> {
+        std::future::pending()
+    }
+
+    async fn send_to<'a>(&'a self, buf: &'a [u8], target: SocketAddr) -> std::io::Result<usize> {
+        self.send(target, buf)?;
+        Ok(buf.len())
+    }
+
+    fn poll_send_to(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+        target: SocketAddr,
+    ) -> Poll<std::io::Result<usize>> {
+        if self.refuse(cx) {
+            return Poll::Pending;
+        }
+        self.send(target, buf)?;
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_send_to_vectored_fragmenting(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+        target: SocketAddr,
+        fragmenting: Fragmenting,
+    ) -> Poll<std::io::Result<usize>> {
+        if !self.locked.lock().controls_fragmenting {
+            return self.poll_send_to_vectored(cx, bufs, target);
+        }
+        if self.refuse(cx) {
+            return Poll::Pending;
+        }
+        let mut buf = Vec::new();
+        bufs.iter().for_each(|b| buf.extend_from_slice(b.as_ref()));
+        self.send_as(target, &buf, Some(fragmenting))?;
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn bind_addr(&self) -> SocketAddr {
+        self.bind_addr
+    }
+
+    fn link_mtu(&self) -> Option<u16> {
+        self.locked.lock().link_mtu
+    }
+}
+
+impl PollSendToVectored for RememberingTransport {
+    fn poll_send_to_vectored(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+        target: SocketAddr,
+    ) -> Poll<std::io::Result<usize>> {
+        if self.refuse(cx) {
+            return Poll::Pending;
+        }
+        let mut buf = Vec::new();
+        bufs.iter().for_each(|b| buf.extend_from_slice(b.as_ref()));
+        self.send(target, &buf)?;
+        Poll::Ready(Ok(buf.len()))
+    }
+}

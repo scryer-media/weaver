@@ -4,15 +4,18 @@
 import { memo, useContext, useMemo, useRef } from "react";
 import { useTranslate } from "@/lib/context/translate-context";
 import { formatJobReleaseName, type JobData } from "@/lib/job-types";
+import type { TorrentSummaryData } from "@/lib/torrents";
 import { isActiveStatus, statusToken } from "@/lib/status-tokens";
 import { Square } from "@/next/components/chrome";
 import { CheckBox } from "@/next/components/controls";
 import { PhaseBars, useJobProgress } from "@/next/components/PhaseBars";
 import { ListRow, RowIconButton, ValueCell } from "@/next/components/rows";
+import { TagChips } from "@/next/components/Tags";
 import { EM_DASH, formatRate, formatSize } from "@/next/data/format";
 
 import { statusColor, WV } from "@/next/data/palette";
 import { useDownloadRate } from "@/next/data/use-download-rate";
+import { torrentIds } from "@/next/testids";
 import { QueueEtaContext } from "./queue-eta";
 
 /**
@@ -34,6 +37,8 @@ export const DownloadRow = memo(function DownloadRow({
   statusTitle,
   onPause,
   onCancel,
+  seeding = null,
+  seedingColumn = false,
 }: {
   job: JobData;
   selected: boolean;
@@ -52,12 +57,20 @@ export const DownloadRow = memo(function DownloadRow({
   onPause: (id: number, paused: boolean) => void;
   /** Ask to cancel the download; the page confirms first. */
   onCancel: (id: number) => void;
+  /** A seeding or stopped torrent's ratio and upload rate. */
+  seeding?: TorrentSummaryData | null;
+  /** Whether the queue draws the seeding column, so a row without figures keeps it empty. */
+  seedingColumn?: boolean;
 }) {
   const t = useTranslate();
   const progress = useJobProgress(job);
   const liveRate = useDownloadRate(job);
   // A held download moves nothing, whatever the last rate the daemon sent.
-  const rate = useHeldRate(held === null ? liveRate : 0, held === null && isActiveStatus(progress.status) ? progress.status : null);
+  // A torrent's zero is its swarm gone quiet, so it shows as it comes.
+  const rate = useHeldRate(
+    held === null ? liveRate : 0,
+    held === null && job.protocol !== "TORRENT" && isActiveStatus(progress.status) ? progress.status : null,
+  );
   const name = formatJobReleaseName(job);
   const isPaused = statusToken(job.status) === "paused";
   // The phase the label names, or failing that the last one with a bar; a
@@ -78,29 +91,48 @@ export const DownloadRow = memo(function DownloadRow({
       picked={picked}
       onClick={() => onSelect(job.id)}
       title={name}
+      testId={torrentIds.queueRow(job.id)}
       lead={lead}
       left={
-        <div className="flex min-w-0 flex-[1_1_240px] flex-col gap-[9px]">
-          <span className="truncate text-[13.5px] font-medium tracking-[-0.005em] text-wv-fg">
+        // The name is never cut short. Where the list is wide the bars are a
+        // column beside it, so the row is a single line, but only while the
+        // whole name fits there; one that does not sends the bars under it,
+        // and one longer than the row wraps.
+        <div className="flex min-w-0 flex-[1_1_240px] flex-wrap items-center gap-x-5 gap-y-[9px]">
+          <span
+            data-testid={torrentIds.queueRowName}
+            className="max-w-full min-w-0 flex-[1_1_auto] text-[13.5px] font-medium tracking-[-0.005em] [overflow-wrap:anywhere] text-wv-fg">
             {name}
           </span>
+          <TagChips tags={job.tags} />
           <PhaseBars
             job={job}
             view={progress}
             height={10}
-            // 49 whole cells of the 7px period a 10px bar takes; a cap off that
-            // multiple leaves dead track before the percentage.
+            // 49 whole cells of the 7px period a 10px bar takes, or 28 in a
+            // column that is not yet as wide as that; a cap off that multiple
+            // leaves dead track before the percentage.
             barClassName="max-w-[343px] min-w-[56px] flex-1"
             percentClassName="w-[34px] text-[11.5px] text-wv-muted"
+            className="basis-full @6xl:flex-[0_0_242px] @min-[100rem]:flex-[0_0_389px]"
           />
         </div>
       }
       right={
         <>
+          <span
+            data-testid={torrentIds.queueRowProtocol(job.protocol === "TORRENT" ? "TORRENT" : "NZB")}
+            className="min-w-[56px] truncate text-[12.5px] text-wv-secondary"
+          >
+            {job.protocol === "TORRENT" ? t("next.protocol.torrent") : t("next.protocol.usenet")}
+          </span>
           <div className="flex min-w-[96px] items-center gap-[9px]" title={statusTitle}>
             <Square color={statusColor(progress.status)} />
             <span className="flex min-w-0 flex-col">
-              <span className="truncate text-[12.5px] text-wv-secondary">
+              <span
+                data-testid={torrentIds.queueRowStatus(progress.status)}
+                className="truncate text-[12.5px] text-wv-secondary"
+              >
                 {statusLabel(progress.status)}
               </span>
               {hold !== null ? (
@@ -117,6 +149,15 @@ export const DownloadRow = memo(function DownloadRow({
               ) : null}
             </span>
           </div>
+          {seedingColumn ? (
+            <ValueCell width={112}>
+              {seeding === null ? null : (
+                <span data-testid={torrentIds.queueRowSeeding} title={t("next.torrent.seedingCell")}>
+                  {`${seeding.ratio.toFixed(2)} · ↑ ${formatRate(seeding.uploadBps)}`}
+                </span>
+              )}
+            </ValueCell>
+          ) : null}
           <ValueCell>{formatSize(job.totalBytes)}</ValueCell>
           <ValueCell>
             <RowWait id={job.id} held={held} fallback={progressText} />
@@ -166,6 +207,7 @@ const RowActions = memo(function RowActions({
         icon={paused ? "resume" : "pause"}
         label={paused ? t("action.resume") : t("action.pause")}
         onClick={() => onPause(id, !paused)}
+        testId={paused ? torrentIds.queueRowResume : torrentIds.queueRowPause}
       />
       <RowIconButton
         icon="cancelDownload"

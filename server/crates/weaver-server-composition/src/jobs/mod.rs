@@ -1,0 +1,67 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+mod archive_password;
+pub use archive_password::JobsArchivePasswordInternalQueries;
+pub use weaver_server_jobs::jobs::assembly;
+pub mod diagnostic_names;
+pub mod diagnostic_tables;
+pub use weaver_server_jobs::jobs::download_summary;
+mod download_summary_persistence;
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+pub use download_summary_persistence::JobsDownloadSummaryPersistenceInternalQueries;
+pub use download_summary_persistence::JobsDownloadSummaryPersistenceQueries;
+pub use weaver_server_jobs::jobs::duplicate;
+pub mod duplicate_persistence;
+pub use weaver_server_jobs::jobs::error;
+pub use weaver_server_jobs::jobs::feed_verdict;
+pub mod control;
+pub mod graph_checkpoint;
+pub mod model;
+pub mod outline_persistence;
+pub mod persistence;
+pub use weaver_server_jobs::jobs::phase_progress;
+pub mod queries;
+pub use weaver_server_jobs::jobs::record;
+pub mod report;
+pub mod repository;
+pub use support_facts_persistence::JobsSupportFactsPersistenceQueries;
+pub use weaver_server_jobs::jobs::JobsServerAttributionPersistenceInternalQueries;
+pub use weaver_server_jobs::jobs::server_attribution;
+pub use weaver_server_jobs::jobs::support_facts;
+use weaver_server_jobs::jobs::support_facts_persistence;
+pub mod working_dir;
+
+pub use weaver_server_base::jobs::ids;
+
+pub use control::{
+    AddJobOptions, ArchiveHistoryOutcome, ArchiveHistoryResult, CancelJobsOutcome,
+    DownloadBlockKind, DownloadBlockState, EgressQuotaBlock, FINISHED_JOBS_RUNTIME_CAP,
+    HISTORY_DELETE_BATCH_SIZE, HardwareProfileInForce, HeldSpeedTest, HistoryDeleteBatchOutcome,
+    HistoryDeleteOutcome, Hold, HoldOrigin, HoldOwner, HoldScope, HoldSet, JobInfo,
+    NntpRuntimeActivation, QueueMoveTarget, RestartRead, RestoreJobRequest, ServerTransportHealth,
+};
+pub use duplicate::{
+    CallerScopedIdempotency, DuplicateAction, DuplicateDecision, DuplicateJobLifecycle,
+    DuplicateMatch, DuplicateMode, DuplicatePolicy, FingerprintEvidence, FingerprintKind,
+    JobFingerprint, SemanticDuplicate, SemanticDuplicateLifecycleEvent, SemanticTerminalCause,
+    SubmissionOrigin, classify_semantic_terminal_cause, duplicate_admission_metrics_snapshot,
+    normalize_semantic_duplicate_key, record_duplicate_admission_metric,
+    record_semantic_duplicate_lifecycle_metric, semantic_duplicate_lifecycle_metrics_snapshot,
+};
+pub use duplicate_persistence::{
+    DuplicateAdmission, DuplicateAdmissionRequest, DuplicateBackfillEntry, DuplicateBackfillSource,
+    DuplicateBackfillState, DuplicateJobSummary, SemanticAdmission, SemanticCandidateSnapshot,
+    SemanticCandidateSource, SemanticCandidateState, SemanticPromotionClaim,
+    SemanticPromotionState,
+};
+pub use error::SchedulerError;
+pub use ids::{ConnectionId, JobId, MessageId, NzbFileId, SegmentId, ServerId};
+pub use model::{
+    ArchivePasswordCandidate, ArchivePasswordSource, ClassHold, ClassNames, DownloadState,
+    FieldUpdate, FileSpec, HeldClass, JobSpec, JobStatus, JobUpdate, MessageIds, PostState,
+    Protocol, RunState, SegmentSpec, derive_legacy_job_status, epoch_ms_now,
+    job_status_from_persisted_str, runtime_lanes_from_status_snapshot,
+};
+pub use phase_progress::{JobPhase, JobPhaseProgress, PhaseAttemptCounters, PhaseCounters};
+pub use record::{ActiveFileIdentity, ActiveJob, FileIdentitySource, RecoveredJob};

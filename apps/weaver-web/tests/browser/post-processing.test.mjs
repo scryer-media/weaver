@@ -347,7 +347,7 @@ test("a new instance starts from what the chosen script's header declares", asyn
     await row(page, "Notify").waitFor();
     await action(table(page), "Add job").click();
     const editor = creator(page);
-    await editor.getByText("new job", { exact: true }).waitFor();
+    await editor.waitFor();
     // Nothing can be saved until there is a script to run.
     await action(editor, "Script").getByText("Choose a script", { exact: true }).waitFor();
     assert.equal(await action(editor, "Save").isDisabled(), true);
@@ -442,6 +442,9 @@ test("a queue instance names its event, and each input the header declares draws
     await action(editor, "Queue event").click();
     assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), [
       "FILE_DOWNLOADED", "URL_COMPLETED", "NZB_MARKED", "NZB_ADDED", "NZB_NAMED", "NZB_DOWNLOADED", "NZB_DELETED",
+      "SEEDING_FINISHED", "SEEDING_STOPPED", "QUOTA_NORMAL", "QUOTA_TRICKLE", "QUOTA_STOPPED", "ROUTE_DOWN",
+      "TORRENT_MARKED", "TORRENT_ADDED", "TORRENT_DOWNLOADED", "TORRENT_DELETED", "JOB_ADDED", "JOB_DOWNLOADED",
+      "JOB_DELETED", "ROUTE_UP",
     ]);
     await page.getByRole("menuitemradio", { name: "NZB_NAMED", exact: true }).click();
     // Saved with no name and no secret chosen: it takes its script's name, and the secret is not sent at all.
@@ -479,6 +482,9 @@ test("a queue instance names its event, and each input the header declares draws
     await action(editor, "Queue event").click();
     assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), [
       "FILE_DOWNLOADED", "URL_COMPLETED", "NZB_MARKED", "NZB_ADDED", "NZB_NAMED", "NZB_DOWNLOADED", "NZB_DELETED",
+      "SEEDING_FINISHED", "SEEDING_STOPPED", "QUOTA_NORMAL", "QUOTA_TRICKLE", "QUOTA_STOPPED", "ROUTE_DOWN",
+      "TORRENT_MARKED", "TORRENT_ADDED", "TORRENT_DOWNLOADED", "TORRENT_DELETED", "JOB_ADDED", "JOB_DOWNLOADED",
+      "JOB_DELETED", "ROUTE_UP",
     ]);
     await page.getByRole("menuitemradio", { name: "NZB_DOWNLOADED", exact: true }).click();
     // Only a download has a category, so only its triggers can be narrowed to one.

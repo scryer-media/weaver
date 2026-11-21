@@ -6,7 +6,7 @@ use crate::error::YencError;
 use crate::types::{YencHeaderDefects, YencMetadata};
 
 // Parsed =yend trailer fields.
-#[derive(Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct YendFields {
     pub size: Option<u64>,
     pub part: Option<u32>,

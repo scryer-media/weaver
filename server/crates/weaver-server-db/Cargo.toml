@@ -1,0 +1,36 @@
+[package]
+name = "weaver-server-db"
+description = "SQL runtime and writer gate for the Weaver server"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[features]
+test-support = []
+
+[dependencies]
+tempfile = { workspace = true }
+aes-gcm = { workspace = true }
+aws-lc-rs = { workspace = true }
+base64 = { workspace = true }
+getrandom = { workspace = true, default-features = false }
+hmac = { workspace = true, default-features = false }
+sha2 = { workspace = true }
+chrono = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+weaver-server-base = { path = "../weaver-server-base" }
+weaver-server-disk = { path = "../weaver-server-disk" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { workspace = true }
+security-framework-sys = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { workspace = true }
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Security"] }
+

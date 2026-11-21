@@ -1,0 +1,26 @@
+[package]
+name = "weaver-server-auth"
+description = "Authentication and credential queries for the Weaver server"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[features]
+test-support = []
+
+[dependencies]
+argon2 = { workspace = true }
+base64 = { workspace = true }
+getrandom = { workspace = true, default-features = false }
+hex = { workspace = true }
+hmac = { workspace = true, default-features = false }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+weaver-server-base = { path = "../weaver-server-base" }
+weaver-server-db = { path = "../weaver-server-db" }
+weaver-server-settings = { path = "../weaver-server-settings" }

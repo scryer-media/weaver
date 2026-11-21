@@ -19,6 +19,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bytes::Bytes;
@@ -81,6 +82,11 @@ impl NamespaceUsage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HoldsUsage {
     pub resident: u64,
+    // The most `resident` has been since the accountant was made.
+    pub resident_peak: u64,
+    // Bytes ever taken into RAM past the resident limit
+    // (`HoldsAccountant::reserve_resident_past_limit`), summed.
+    pub past_limit_total: u64,
     pub scratch: u64,
     // Namespaces with anything accounted. An idle namespace is forgotten, so
     // the map never outgrows the work in flight.
@@ -91,6 +97,8 @@ pub struct HoldsUsage {
 struct Accounts {
     budgets: HoldBudgets,
     resident: u64,
+    resident_peak: u64,
+    past_limit_total: u64,
     scratch: u64,
     namespaces: HashMap<HoldsNamespace, NamespaceUsage>,
 }
@@ -106,6 +114,29 @@ impl Accounts {
         } else {
             self.namespaces.insert(namespace, usage);
         }
+    }
+
+    fn fits_resident(&self, len: u64) -> bool {
+        self.resident
+            .checked_add(len)
+            .is_some_and(|sum| sum <= self.budgets.resident_limit)
+    }
+
+    // Room `len` new bytes of RAM, or say which ceiling they would cross.
+    fn reserve_resident(&mut self, namespace: HoldsNamespace, len: u64) -> Reserve {
+        if !self.fits_resident(len) {
+            return Reserve::Breached(Budget::ResidentLimit);
+        }
+        let mut usage = self.usage(namespace);
+        usage.resident += len;
+        self.grow_resident(len);
+        self.store(namespace, usage);
+        Reserve::Granted
+    }
+
+    fn grow_resident(&mut self, len: u64) {
+        self.resident += len;
+        self.resident_peak = self.resident_peak.max(self.resident);
     }
 
     // The scratch checks shared by a page-out and a direct spill. The
@@ -137,9 +168,61 @@ fn released(held: u64, len: u64, what: &str) -> u64 {
     }
 }
 
+// A wake for resident room, by the key its caller names it with.
+pub type ResidentWake = Arc<dyn Fn() + Send + Sync>;
+
+// Who waits for resident room to come back, each told once, the next time
+// any namespace gives some back. The count lets a release with no one
+// waiting, as nearly every release is, pass with one load.
+#[derive(Default)]
+struct Waiters {
+    count: std::sync::atomic::AtomicUsize,
+    wakes: Mutex<HashMap<usize, ResidentWake>>,
+}
+
+impl std::fmt::Debug for Waiters {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Waiters")
+            .field("count", &self.count)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Waiters {
+    fn wakes(&self) -> MutexGuard<'_, HashMap<usize, ResidentWake>> {
+        self.wakes.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    // Called with the accounts locked, by a caller they just refused: a
+    // release that gives room back takes that lock after this, and rings
+    // after it lets go, so it finds this wake kept.
+    fn add(&self, key: usize, wake: ResidentWake) {
+        let mut wakes = self.wakes();
+        wakes.entry(key).or_insert(wake);
+        self.count
+            .store(wakes.len(), std::sync::atomic::Ordering::SeqCst);
+    }
+
+    // Called with no lock of the accounts held: a wake may ask for room.
+    fn ring(&self) {
+        if self.count.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            return;
+        }
+        let rung = {
+            let mut wakes = self.wakes();
+            self.count.store(0, std::sync::atomic::Ordering::SeqCst);
+            std::mem::take(&mut *wakes)
+        };
+        for wake in rung.into_values() {
+            wake();
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct HoldsAccountant {
     accounts: Mutex<Accounts>,
+    waiters: Waiters,
 }
 
 impl HoldsAccountant {
@@ -148,10 +231,46 @@ impl HoldsAccountant {
             accounts: Mutex::new(Accounts {
                 budgets,
                 resident: 0,
+                resident_peak: 0,
+                past_limit_total: 0,
                 scratch: 0,
                 namespaces: HashMap::new(),
             }),
+            waiters: Waiters::default(),
         }
+    }
+
+    // Whether `len` more resident bytes fit now. When they do not, `wake`
+    // is kept under `key`, one wake a key, and called once the next time
+    // any namespace gives resident room back. The look and the keeping are
+    // one step under the accounts' lock, so room given back after the look
+    // always finds the wake kept. A caller that waits on a no asks this, or
+    // [`Self::reserve_resident_or_wake`], last.
+    pub fn resident_fits_or_wake(&self, len: u64, key: usize, wake: ResidentWake) -> bool {
+        let accounts = self.lock();
+        if accounts.fits_resident(len) {
+            return true;
+        }
+        self.waiters.add(key, wake);
+        false
+    }
+
+    // [`Self::reserve_resident`], with `wake` kept as
+    // [`Self::resident_fits_or_wake`] keeps it when the room is refused:
+    // a refusal always leaves a wake behind it.
+    pub fn reserve_resident_or_wake(
+        &self,
+        namespace: HoldsNamespace,
+        len: u64,
+        key: usize,
+        wake: ResidentWake,
+    ) -> Reserve {
+        let mut accounts = self.lock();
+        let reserve = accounts.reserve_resident(namespace, len);
+        if reserve != Reserve::Granted {
+            self.waiters.add(key, wake);
+        }
+        reserve
     }
 
     // Every mutation checks before it writes, so a panic under the lock
@@ -193,6 +312,8 @@ impl HoldsAccountant {
         let accounts = self.lock();
         HoldsUsage {
             resident: accounts.resident,
+            resident_peak: accounts.resident_peak,
+            past_limit_total: accounts.past_limit_total,
             scratch: accounts.scratch,
             namespaces: accounts.namespaces.len(),
         }
@@ -205,19 +326,7 @@ impl HoldsAccountant {
 
     // Room `len` new bytes of RAM, or say which ceiling they would cross.
     pub fn reserve_resident(&self, namespace: HoldsNamespace, len: u64) -> Reserve {
-        let mut accounts = self.lock();
-        let Some(resident) = accounts
-            .resident
-            .checked_add(len)
-            .filter(|&sum| sum <= accounts.budgets.resident_limit)
-        else {
-            return Reserve::Breached(Budget::ResidentLimit);
-        };
-        let mut usage = accounts.usage(namespace);
-        usage.resident += len;
-        accounts.resident = resident;
-        accounts.store(namespace, usage);
-        Reserve::Granted
+        self.lock().reserve_resident(namespace, len)
     }
 
     // Move `len` resident bytes of this namespace to scratch. The bytes stay
@@ -234,6 +343,8 @@ impl HoldsAccountant {
         accounts.resident = released(accounts.resident, len, "resident");
         accounts.scratch += len;
         accounts.store(namespace, usage);
+        drop(accounts);
+        self.waiters.ring();
         Reserve::Granted
     }
 
@@ -259,7 +370,8 @@ impl HoldsAccountant {
         let mut accounts = self.lock();
         let mut usage = accounts.usage(namespace);
         usage.resident += len;
-        accounts.resident += len;
+        accounts.grow_resident(len);
+        accounts.past_limit_total += len;
         accounts.store(namespace, usage);
     }
 
@@ -270,6 +382,10 @@ impl HoldsAccountant {
         usage.resident = released(usage.resident, len, "resident");
         accounts.resident = total;
         accounts.store(namespace, usage);
+        drop(accounts);
+        if len > 0 {
+            self.waiters.ring();
+        }
     }
 
     pub fn release_scratch(&self, namespace: HoldsNamespace, len: u64) {
@@ -462,6 +578,14 @@ pub struct HoldLedger {
     // kept as holds come and go, so asking after them costs the spans, not
     // the holds.
     spans: BTreeMap<VolumeIndex, HeldSpans>,
+    // Bytes each volume holds, wherever they live, kept as holds come and
+    // go, so asking costs one lookup.
+    held_in: BTreeMap<VolumeIndex, u64>,
+    // Of those, the bytes each volume holds in RAM, kept the same way.
+    resident_in: BTreeMap<VolumeIndex, u64>,
+    // A total this ledger's holds are counted in beside other ledgers'
+    // (`tally_into`), kept as holds come and go.
+    tally: Option<Arc<AtomicU64>>,
 }
 
 #[derive(Debug, Default)]
@@ -563,7 +687,37 @@ impl HoldLedger {
             spilled_in: BTreeMap::new(),
             off_file: BTreeMap::new(),
             spans: BTreeMap::new(),
+            held_in: BTreeMap::new(),
+            resident_in: BTreeMap::new(),
+            tally: None,
         }
+    }
+
+    // Count what this ledger holds in `tally` from here, beside whatever
+    // else counts there, until the ledger goes.
+    pub fn tally_into(&mut self, tally: Arc<AtomicU64>) {
+        tally.fetch_add(self.total_held(), Ordering::Relaxed);
+        if let Some(old) = self.tally.replace(tally) {
+            old.fetch_sub(self.total_held(), Ordering::Relaxed);
+        }
+    }
+
+    // The bytes `volume` holds, in RAM, on scratch or spilled.
+    // Whether this ledger tallies into `tally` already.
+    pub fn tallies_into(&self, tally: &Arc<AtomicU64>) -> bool {
+        self.tally
+            .as_ref()
+            .is_some_and(|own| Arc::ptr_eq(own, tally))
+    }
+
+    pub fn held_bytes(&self, volume: VolumeIndex) -> u64 {
+        self.held_in.get(&volume).copied().unwrap_or(0)
+    }
+
+    // The bytes `volume` holds in RAM: what its resident spans add up to,
+    // in one lookup.
+    pub fn resident_bytes_in(&self, volume: VolumeIndex) -> u64 {
+        self.resident_in.get(&volume).copied().unwrap_or(0)
     }
 
     pub fn namespace(&self) -> HoldsNamespace {
@@ -764,6 +918,11 @@ impl HoldLedger {
             .release_resident(self.namespace, self.resident);
         self.accountant
             .release_scratch(self.namespace, self.scratch);
+        if let Some(tally) = &self.tally {
+            tally.fetch_sub(self.total_held(), Ordering::Relaxed);
+        }
+        self.held_in.clear();
+        self.resident_in.clear();
         self.volumes.clear();
         self.resident_by_age.clear();
         self.resident = 0;
@@ -1043,12 +1202,17 @@ impl HoldLedger {
 
     fn place(&mut self, volume: VolumeIndex, hold: Hold) {
         let len = hold.range.len();
+        *self.held_in.entry(volume).or_default() += len;
+        if let Some(tally) = &self.tally {
+            tally.fetch_add(len, Ordering::Relaxed);
+        }
         let spans = self.spans.entry(volume).or_default();
         spans.all.add(hold.range);
         match hold.location {
             Location::Ram(_) => {
                 spans.resident.add(hold.range);
                 self.resident += len;
+                *self.resident_in.entry(volume).or_default() += len;
                 self.resident_by_age
                     .insert((hold.age, volume, hold.range.start));
             }
@@ -1074,6 +1238,15 @@ impl HoldLedger {
             self.volumes.remove(&volume);
         }
         let len = hold.range.len();
+        if let Some(held) = self.held_in.get_mut(&volume) {
+            *held -= len;
+            if *held == 0 {
+                self.held_in.remove(&volume);
+            }
+        }
+        if let Some(tally) = &self.tally {
+            tally.fetch_sub(len, Ordering::Relaxed);
+        }
         if let Some(spans) = self.spans.get_mut(&volume) {
             spans.all.remove(hold.range);
             if matches!(hold.location, Location::Ram(_)) {
@@ -1086,6 +1259,12 @@ impl HoldLedger {
         match hold.location {
             Location::Ram(_) => {
                 self.resident -= len;
+                if let Some(held) = self.resident_in.get_mut(&volume) {
+                    *held -= len;
+                    if *held == 0 {
+                        self.resident_in.remove(&volume);
+                    }
+                }
                 self.resident_by_age.remove(&(hold.age, volume, start));
             }
             Location::Scratch { .. } => self.scratch -= len,
@@ -1286,6 +1465,43 @@ mod tests {
         assert_eq!(ledger.held_volumes().count(), 0);
     }
 
+    // Each volume's held bytes and the shared tally follow every hold, cut,
+    // page-out, take and discard, wherever the bytes live.
+    #[test]
+    fn held_bytes_and_the_tally_follow_the_holds() {
+        let accountant = Arc::new(HoldsAccountant::new(HoldBudgets {
+            resident_limit: 8,
+            scratch_total: u64::MAX,
+            scratch_ceiling: u64::MAX,
+            disk_reserve: 0,
+        }));
+        let tally = Arc::new(AtomicU64::new(5));
+        let mut ledger = HoldLedger::new(NS, Arc::clone(&accountant));
+        let (volume, other) = (VolumeIndex(0), VolumeIndex(1));
+        ledger.hold(volume, 0, Bytes::from_static(b"abcd"), u64::MAX);
+        ledger.tally_into(Arc::clone(&tally));
+        assert_eq!(tally.load(Ordering::Relaxed), 9);
+        for offset in [4u64, 8] {
+            ledger.hold(volume, offset, Bytes::from_static(b"abcd"), u64::MAX);
+        }
+        ledger.hold(other, 0, Bytes::from_static(b"xy"), u64::MAX);
+        // Paged out or not, every byte counts, and an overlap is cut.
+        ledger.hold(volume, 2, Bytes::from_static(b"zz"), u64::MAX);
+        assert_eq!(ledger.held_bytes(volume), 12);
+        assert_eq!(ledger.held_bytes(other), 2);
+        assert_eq!(tally.load(Ordering::Relaxed), 5 + 14);
+        ledger.take(volume, ByteRange::new(2, 6));
+        assert_eq!(ledger.held_bytes(volume), 8);
+        assert_eq!(tally.load(Ordering::Relaxed), 5 + 10);
+        ledger.discard();
+        assert_eq!(ledger.held_bytes(volume), 0);
+        assert_eq!(tally.load(Ordering::Relaxed), 5);
+        ledger.hold(other, 0, Bytes::from_static(b"xy"), u64::MAX);
+        assert_eq!(tally.load(Ordering::Relaxed), 7);
+        drop(ledger);
+        assert_eq!(tally.load(Ordering::Relaxed), 5);
+    }
+
     const NS: HoldsNamespace = HoldsNamespace {
         scope: 1,
         node: NodeId(0),
@@ -1309,15 +1525,104 @@ mod tests {
         Bytes::from(vec![fill; len])
     }
 
-    fn assert_idle(accountant: &HoldsAccountant) {
+    // A caller refused resident room is told once when any namespace gives
+    // room back, by a release or a page-out, and never again unless it asks
+    // again; one wake a key, however often it asks; and room given back
+    // before it asked is answered at once, with nothing kept.
+    #[test]
+    fn a_wait_for_resident_room_is_rung_once_by_any_release() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let accountant = HoldsAccountant::new(budgets(10));
+        let rung = Arc::new(AtomicUsize::new(0));
+        let wake = || -> ResidentWake {
+            let rung = Arc::clone(&rung);
+            Arc::new(move || {
+                rung.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        assert_eq!(accountant.reserve_resident(OTHER, 10), Reserve::Granted);
+        assert!(!accountant.resident_fits_or_wake(4, 7, wake()));
+        assert!(!accountant.resident_fits_or_wake(4, 7, wake()));
+        accountant.release_resident(OTHER, 2);
+        assert_eq!(rung.load(Ordering::SeqCst), 1, "one wake for the key");
+        accountant.release_resident(OTHER, 2);
+        assert_eq!(rung.load(Ordering::SeqCst), 1, "told once");
+
+        assert!(!accountant.resident_fits_or_wake(8, 7, wake()));
+        assert_eq!(accountant.page_out(OTHER, 1, PLENTY), Reserve::Granted);
+        assert_eq!(rung.load(Ordering::SeqCst), 2, "a page-out gives room back");
+
+        assert!(accountant.resident_fits_or_wake(5, 7, wake()));
+        accountant.release_resident(OTHER, 5);
         assert_eq!(
-            accountant.usage(),
-            HoldsUsage {
-                resident: 0,
-                scratch: 0,
-                namespaces: 0
-            }
+            rung.load(Ordering::SeqCst),
+            2,
+            "nothing kept for room that fit"
         );
+        accountant.release_scratch(OTHER, 1);
+        assert_idle(&accountant);
+    }
+
+    // A reservation refused keeps its wake in the same step: the release
+    // that follows rings it, and a reservation granted keeps nothing.
+    #[test]
+    fn a_reservation_refused_is_rung_by_the_next_release() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let accountant = HoldsAccountant::new(budgets(10));
+        let rung = Arc::new(AtomicUsize::new(0));
+        let wake = || -> ResidentWake {
+            let rung = Arc::clone(&rung);
+            Arc::new(move || {
+                rung.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        assert_eq!(
+            accountant.reserve_resident_or_wake(OTHER, 6, 7, wake()),
+            Reserve::Granted
+        );
+        accountant.release_resident(OTHER, 1);
+        assert_eq!(rung.load(Ordering::SeqCst), 0, "nothing kept for a grant");
+        assert_eq!(
+            accountant.reserve_resident_or_wake(OTHER, 6, 7, wake()),
+            Reserve::Breached(Budget::ResidentLimit)
+        );
+        accountant.release_resident(OTHER, 5);
+        assert_eq!(rung.load(Ordering::SeqCst), 1, "the refusal is rung");
+        assert_idle(&accountant);
+    }
+
+    // Nothing held; the peak and the past-limit total stay, as they are
+    // since the accountant was made.
+    fn assert_idle(accountant: &HoldsAccountant) {
+        let usage = accountant.usage();
+        assert_eq!((usage.resident, usage.scratch, usage.namespaces), (0, 0, 0));
+    }
+
+    // Bytes taken past the limit raise the past-limit total and the peak,
+    // and a release lowers what is resident but leaves both.
+    #[test]
+    fn a_reserve_past_the_limit_raises_the_total_and_the_peak_and_a_release_keeps_them() {
+        let accountant = HoldsAccountant::new(budgets(10));
+        assert_eq!(accountant.reserve_resident(OTHER, 8), Reserve::Granted);
+        let usage = accountant.usage();
+        assert_eq!((usage.resident_peak, usage.past_limit_total), (8, 0));
+        accountant.reserve_resident_past_limit(OTHER, 5);
+        let usage = accountant.usage();
+        assert_eq!(usage.resident, 13, "past the limit of 10");
+        assert_eq!((usage.resident_peak, usage.past_limit_total), (13, 5));
+        accountant.release_resident(OTHER, 13);
+        let usage = accountant.usage();
+        assert_eq!(usage.resident, 0);
+        assert_eq!((usage.resident_peak, usage.past_limit_total), (13, 5));
+        assert_eq!(accountant.reserve_resident(OTHER, 4), Reserve::Granted);
+        let usage = accountant.usage();
+        assert_eq!(
+            (usage.resident_peak, usage.past_limit_total),
+            (13, 5),
+            "a lower hold moves neither"
+        );
+        accountant.release_resident(OTHER, 4);
+        assert_idle(&accountant);
     }
 
     // A take hands back what a peek of the same range shows, in the same
@@ -1387,6 +1692,37 @@ mod tests {
             );
             assert_eq!(ledger.held_ranges(VolumeIndex(0)).len() as u64, pieces / 4);
         }
+    }
+
+    #[test]
+    fn resident_bytes_in_is_what_the_resident_spans_add_up_to() {
+        let accountant = Arc::new(HoldsAccountant::new(budgets(40)));
+        let mut ledger = HoldLedger::new(NS, Arc::clone(&accountant));
+        let agrees = |ledger: &HoldLedger| {
+            for volume in [VolumeIndex(0), VolumeIndex(1)] {
+                let spans: u64 = ledger.resident_spans(volume).map(|span| span.len()).sum();
+                assert_eq!(ledger.resident_bytes_in(volume), spans, "{volume:?}");
+            }
+        };
+        // Past the RAM budget the older holds page out to scratch.
+        for (volume, offset) in [(0, 0), (1, 0), (0, 10), (0, 20), (1, 30), (0, 40)] {
+            ledger.hold(VolumeIndex(volume), offset, bytes(1, 10), PLENTY);
+            agrees(&ledger);
+        }
+        // A hold replaced in part, and parts of holds taken.
+        ledger.hold(VolumeIndex(0), 15, bytes(2, 10), PLENTY);
+        agrees(&ledger);
+        ledger.take(VolumeIndex(0), ByteRange::new(5, 18));
+        agrees(&ledger);
+        ledger.take(VolumeIndex(1), ByteRange::new(32, 34));
+        agrees(&ledger);
+        ledger.page_out_all(PLENTY);
+        agrees(&ledger);
+        assert_eq!(ledger.resident_bytes_in(VolumeIndex(0)), 0);
+        ledger.hold(VolumeIndex(1), 50, bytes(3, 10), PLENTY);
+        agrees(&ledger);
+        ledger.discard();
+        agrees(&ledger);
     }
 
     #[test]

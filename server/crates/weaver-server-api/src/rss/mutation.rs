@@ -3,6 +3,8 @@
 
 use async_graphql::{Context, Object, Result};
 use regex::Regex;
+use weaver_server_core::rss::RssPersistenceQueries;
+use weaver_server_core::rss::RssQueries;
 
 use crate::auth::AdminGuard;
 use crate::jobs::types::MetadataInput;

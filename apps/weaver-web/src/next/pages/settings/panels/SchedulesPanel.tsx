@@ -18,6 +18,8 @@ import { Toggle } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
 import { settingsIds, testIds } from "../../../testids";
 import { SCHEDULE_TRACKS, type ScheduleTrack } from "../../../data/schedule-tracks";
+import { withoutTorrentOnly } from "../../../data/torrents-shown";
+import { useTorrentsShown } from "../../../data/use-torrents-shown";
 import {
   profileName,
   type HardwareProfileName,
@@ -25,7 +27,7 @@ import {
 } from "../../../data/hardware-profiles";
 import { SettingsBlocks, usePanelStatus, type SettingsBlock } from "../framework";
 import { scheduleActionFields, scheduleActionHelp, scheduleSpeedSections, scheduleTimingFields, useScheduleTargets } from "../../../components/ScheduleOptionsFields";
-import { NEW_SCHEDULE_OPTIONS, SCHEDULE_ACTIONS, SCHEDULE_DAYS, isOneShot, optionsFromSchedule, optionsInput, scheduleActionDetails, scheduleDaysLabel, scheduleTimeLabel, speedProblem, type ScheduleOptions, type ScheduleOptionsForm, type ScheduleTargets } from "../../../data/schedule-options";
+import { NEW_SCHEDULE_OPTIONS, SCHEDULE_ACTIONS, SCHEDULE_DAYS, isOneShot, optionsFromSchedule, scheduleActionKey, scheduleActionOfKey, optionsInput, scheduleActionDetails, scheduleDaysLabel, scheduleTimeLabel, speedProblem, speedTarget, torrentOnlyAction, type ScheduleClass, type ScheduleOptions, type ScheduleOptionsForm, type ScheduleTargets } from "../../../data/schedule-options";
 
 /**
  * Schedules: a clock that pauses, resumes or throttles the queue, or switches
@@ -43,6 +45,7 @@ interface Schedule extends ScheduleOptions {
   days: string[];
   time: string;
   actionType: string;
+  class: ScheduleClass | null;
   track: ScheduleTrack;
   hardwareProfile: HardwareProfileName | null;
 }
@@ -53,6 +56,7 @@ interface ScheduleForm {
   label: string;
   days: string[];
   time: string;
+  /** The picker's key: the action, and the class a class's pause holds. */
   actionType: string;
   /** Null until one is picked; the editor then offers the recommendation. */
   hardwareProfile: HardwareProfileName | null;
@@ -74,13 +78,14 @@ function actionLabel(t: Translate, schedule: Schedule, targets?: ScheduleTargets
   if (schedule.actionType === "hardware_profile" && schedule.hardwareProfile) {
     return t("next.schedules.profileTo", { profile: profileName(t, schedule.hardwareProfile) });
   }
-  const action = SCHEDULE_ACTIONS.find((option) => option.value === schedule.actionType);
+  const action = SCHEDULE_ACTIONS.find((option) => option.value === scheduleActionKey(schedule));
   return action ? t(action.label) : schedule.actionType;
 }
 
 export function SchedulesPanel() {
   const t = useTranslate();
   const targets = useScheduleTargets();
+  const torrentsOn = useTorrentsShown();
   const [{ data, fetching }, reexecute] = useQuery<{ schedules: Schedule[] }>({ query: SCHEDULES_QUERY });
   const [, createSchedule] = useMutation(CREATE_SCHEDULE_MUTATION);
   const [, updateSchedule] = useMutation(UPDATE_SCHEDULE_MUTATION);
@@ -121,7 +126,7 @@ export function SchedulesPanel() {
             label: schedule.label ?? "",
             days: schedule.days,
             time: schedule.time,
-            actionType: schedule.actionType,
+            actionType: scheduleActionKey(schedule),
             hardwareProfile: schedule.hardwareProfile,
             options: optionsFromSchedule(schedule),
           }
@@ -133,12 +138,12 @@ export function SchedulesPanel() {
   const save = async () => {
     if (form.actionType === "speed_limit") {
       // What is wrong with a rate, or a rule that sets nothing, is said before saving.
-      const typed = Object.values(form.options.speeds);
-      if (typed.some((text) => speedProblem(text) !== null)) {
+      const typed = Object.entries(form.options.speeds);
+      if (typed.some(([key, entry]) => speedProblem(entry, speedTarget(key).kind) !== null)) {
         setError(t("next.schedules.speedInvalid"));
         return;
       }
-      if (typed.every((text) => text.trim() === "")) {
+      if (typed.length === 0) {
         setError(t("next.schedules.speedNeeded"));
         return;
       }
@@ -146,7 +151,7 @@ export function SchedulesPanel() {
     setBusy(true);
     const input: Record<string, unknown> = {
       time: form.time,
-      actionType: form.actionType,
+      ...scheduleActionOfKey(form.actionType),
       days: form.days.length > 0 ? form.days : null,
       label: form.label.trim() || null,
       enabled: form.enabled,
@@ -251,9 +256,13 @@ export function SchedulesPanel() {
         title: t(track.label),
         // The one group whose rules do not hold says so in place of the list's note.
         note: track.value === "ONE_SHOT" ? t("next.schedules.oneShotNote") : undefined,
-        rows: schedules
-          .filter((schedule) => schedule.track === track.value)
-          .map((schedule) => row(schedule)),
+        // A torrent-only rule is hidden with torrent things. Each rule saves
+        // on its own, so a hidden one is left as it is.
+        rows: withoutTorrentOnly(
+          schedules.filter((schedule) => schedule.track === track.value),
+          torrentsOn,
+          (schedule) => torrentOnlyAction(scheduleActionKey(schedule)),
+        ).map((schedule) => row(schedule)),
       })),
     },
   ];
@@ -352,7 +361,13 @@ export function SchedulesPanel() {
                 control: {
                   kind: "select",
                   value: form.actionType,
-                  options: SCHEDULE_ACTIONS.map((option) => ({ value: option.value, label: t(option.label) })),
+                  // Torrent-only actions are offered while torrents are on; a
+                  // rule that already takes one keeps it in the picker.
+                  options: withoutTorrentOnly(
+                    SCHEDULE_ACTIONS,
+                    torrentsOn,
+                    (option) => "torrentOnly" in option && option.value !== form.actionType,
+                  ).map((option) => ({ value: option.value, label: t(option.label) })),
                   onChange: (next) => setForm((current) => ({ ...current, actionType: next })),
                 },
               },
@@ -406,6 +421,7 @@ export function SchedulesPanel() {
             ? scheduleSpeedSections({
                 ...optionFields,
                 targets,
+                uploads: torrentsOn,
                 // A rate typed after a refused save takes back what was said about it.
                 onChange: (options) => {
                   setError(null);

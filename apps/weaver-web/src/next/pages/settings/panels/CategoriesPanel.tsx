@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 import { useMemo, useState } from "react";
+import { Link } from "react-router";
 import { useMutation, useQuery } from "urql";
 import {
   ADD_CATEGORY_MUTATION,
@@ -11,14 +12,29 @@ import {
   UPDATE_CATEGORY_MUTATION,
 } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
+import { UNPACK_CHOICES, unpackChoice, unpackOf } from "@/lib/torrents";
 import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
-import { RecordEditor } from "../../../components/RecordEditor";
+import { Toggle } from "../../../components/controls";
+import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
 import { Cell } from "../../../components/rows";
 import { testIds } from "../../../testids";
 import { useNextData } from "../../../data/next-data";
+import { useTorrentsShown } from "../../../data/use-torrents-shown";
 import { categoryColor } from "../../../data/palette";
 import { SettingsBlocks, type SettingsBlock } from "../framework";
+import {
+  INHERIT,
+  leafFrom,
+  leafInput,
+  seedingFields,
+  seedingFrom,
+  seedingInherits,
+  seedingInput,
+  uploadCapField,
+  type Leaf,
+  type SeedingPolicy,
+} from "../seeding";
 
 /**
  * Categories: where a release lands, and the names an indexer may call it.
@@ -33,21 +49,57 @@ interface Category {
   name: string;
   destDir: string | null;
   aliases: string;
+  /** The category's own seeding terms; each that inherits takes the global one. */
+  seeding?: SeedingPolicy | null;
+  /** The upload cap its torrents take in place of the global one. */
+  uploadCap?: Leaf<number> | null;
+  /** Whether the category's torrents take their own route rather than the default torrent one. */
+  torrentRoute?: boolean;
+  /** Whether the category's torrents have their archives extracted; null inherits. */
+  unpack?: boolean | null;
 }
 
 interface CategoryForm {
   name: string;
   destDir: string;
   aliases: string;
+  seeding: SeedingPolicy;
+  torrentRoute: boolean;
+  unpack: boolean | null;
+  uploadCap: Leaf<number>;
 }
 
-const NEW_CATEGORY: CategoryForm = { name: "", destDir: "", aliases: "" };
+const NEW_CATEGORY: CategoryForm = {
+  name: "",
+  destDir: "",
+  aliases: "",
+  seeding: seedingFrom(null),
+  torrentRoute: false,
+  unpack: null,
+  uploadCap: INHERIT,
+};
+
+const formOf = (category: Category): CategoryForm => ({
+  name: category.name,
+  destDir: category.destDir ?? "",
+  aliases: category.aliases ?? "",
+  seeding: seedingFrom(category.seeding),
+  torrentRoute: category.torrentRoute ?? false,
+  unpack: category.unpack ?? null,
+  uploadCap: leafFrom(category.uploadCap),
+});
+
+/** The terms as the input takes them, comparable with others; terms that all inherit are none. */
+const seedingValue = (policy: SeedingPolicy) => (seedingInherits(policy) ? null : seedingInput(policy));
 
 export function CategoriesPanel() {
   const t = useTranslate();
   const [{ data, fetching }, reexecute] = useQuery<{ categories: Category[] }>({ query: CATEGORIES_QUERY });
   // The rails and pickers elsewhere read the shared copy, which this panel's own query does not reach.
   const { refreshCategories } = useNextData("refreshCategories");
+  // A category's Torrents section shows only while torrents are on; a save
+  // sends its fields only when they were edited, so hiding it keeps them.
+  const torrentsOn = useTorrentsShown();
   const [{ data: settingsData }] = useQuery<{ settings: { completeDir: string; dataDir: string } }>({
     query: SETTINGS_QUERY,
   });
@@ -57,6 +109,8 @@ export function CategoriesPanel() {
 
   const [editingId, setEditingId] = useState<number | "new" | null>(null);
   const [form, setForm] = useState<CategoryForm>(NEW_CATEGORY);
+  // What the editor opened with, so a save sends the torrent fields only when they were edited.
+  const [opened, setOpened] = useState<CategoryForm>(NEW_CATEGORY);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [confirmRemove, setConfirmRemove] = useState<Category | null>(null);
@@ -72,11 +126,9 @@ export function CategoriesPanel() {
 
   const open = (category: Category | null) => {
     setError(null);
-    setForm(
-      category
-        ? { name: category.name, destDir: category.destDir ?? "", aliases: category.aliases ?? "" }
-        : NEW_CATEGORY,
-    );
+    const start = category ? formOf(category) : NEW_CATEGORY;
+    setForm(start);
+    setOpened(start);
     setEditingId(category ? category.id : "new");
   };
 
@@ -87,7 +139,16 @@ export function CategoriesPanel() {
       return;
     }
     setBusy(true);
-    const input = { name, destDir: form.destDir.trim() || null, aliases: form.aliases.trim() };
+    const seeding = seedingValue(form.seeding);
+    const input = {
+      name,
+      destDir: form.destDir.trim() || null,
+      aliases: form.aliases.trim(),
+      ...(JSON.stringify(seeding) !== JSON.stringify(seedingValue(opened.seeding)) ? { seeding } : {}),
+      ...(form.torrentRoute !== opened.torrentRoute ? { torrentRoute: form.torrentRoute } : {}),
+      ...(form.unpack !== opened.unpack ? { unpack: form.unpack } : {}),
+      ...(JSON.stringify(form.uploadCap) !== JSON.stringify(opened.uploadCap) ? { uploadCap: leafInput(form.uploadCap) } : {}),
+    };
     const result =
       editingId === "new"
         ? await addCategory({ input })
@@ -207,6 +268,60 @@ export function CategoriesPanel() {
               },
             ],
           },
+          ...(torrentsOn ? [{
+            id: "torrents",
+            title: t("next.categories.torrents"),
+            fields: [
+              {
+                id: "torrentRoute",
+                label: t("next.categories.torrentRoute"),
+                keywords: "torrent route networking",
+                control: {
+                  kind: "custom",
+                  // Off, the category's torrents ride the default torrent route; on,
+                  // the category owns a route, edited under Networking's routes.
+                  control: (
+                    <div className="flex items-center gap-[10px]">
+                      <Toggle
+                        checked={form.torrentRoute}
+                        label={t("next.categories.torrentRoute")}
+                        onChange={(torrentRoute) => setForm((current) => ({ ...current, torrentRoute }))}
+                        testId={testIds.field("torrentRoute")}
+                      />
+                      {form.torrentRoute && typeof editingId === "number" ? (
+                        <Link
+                          to={`/settings/networking/routes?consumer=torrent:category:${editingId}`}
+                          className="font-wv-mono text-[11.5px] text-wv-accent hover:text-wv-accent-hover"
+                        >
+                          {t("next.categories.routeOwn")}
+                        </Link>
+                      ) : form.torrentRoute ? (
+                        <span className="font-wv-mono text-[11.5px] text-wv-muted">{t("next.categories.routeOwn")}</span>
+                      ) : (
+                        <span className="font-wv-mono text-[11.5px] text-wv-muted">{t("next.networking.defaultTorrent")}</span>
+                      )}
+                    </div>
+                  ),
+                },
+              },
+              {
+                id: "unpack",
+                label: t("next.torrents.unpack"),
+                keywords: "unpack extract archive",
+                control: {
+                  kind: "segmented",
+                  value: unpackChoice(form.unpack),
+                  options: UNPACK_CHOICES.map((option) => ({ ...option, label: t(option.label) })),
+                  onChange: (choice) => setForm((current) => ({ ...current, unpack: unpackOf(choice) })),
+                },
+              },
+              ...seedingFields(t, form.seeding, (seeding) => setForm((current) => ({ ...current, seeding })), {
+                inherits: true,
+                idPrefix: "categorySeeding",
+              }),
+              uploadCapField(t, form.uploadCap, (uploadCap) => setForm((current) => ({ ...current, uploadCap })), "categorySeeding"),
+            ],
+          } satisfies EditorSection] : []),
         ]}
       />
 

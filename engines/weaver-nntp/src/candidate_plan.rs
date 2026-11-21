@@ -611,6 +611,19 @@ impl<C: Candidate> Default for CandidatePlan<C> {
     }
 }
 impl<C: Candidate> CandidatePlan<C> {
+    // Drops every address and what was learnt about it, keeping only the
+    // counts, so the next connect races what a fresh lookup answers and a
+    // lookup that answers nothing dials nothing. Never called mid-race.
+    pub(crate) fn forget_candidates(&mut self) {
+        *self = Self {
+            generation: self.generation,
+            races_won: self.races_won,
+            races_failed: self.races_failed,
+            repins: self.repins,
+            ..Self::default()
+        };
+    }
+
     // Ordered leases do not start a detached race: DNS and HTTP must share a member.
     pub fn lease_order(&self) -> Vec<C> {
         let mut order = self.dial_order();
@@ -664,6 +677,18 @@ impl<C: Candidate> CandidatePlan<C> {
             self.pending = Some(RaceReason::Initial);
         }
         self.candidates = unique;
+    }
+    // Drop what the plan learnt of `candidate`: it stands for something
+    // else now, untried. It stays a candidate, and the pin if it was one.
+    pub fn forget(&mut self, candidate: C) {
+        self.per_addr.remove(&candidate.key());
+        if self.delivery_leader == Some(candidate) {
+            self.delivery_leader = None;
+        }
+        if self.shadow_owed == Some(candidate) {
+            self.shadow_owed = None;
+            self.idle_shadows = 0;
+        }
     }
     pub fn replan(&mut self) {
         self.racing = false;

@@ -39,6 +39,9 @@ pub(crate) struct Options {
     // RAR5: a password check value, and checksums keyed by the hash key.
     pub(crate) check: bool,
     pub(crate) hash_key: bool,
+    // RAR4: each volume's end record states its number, as rar writes a
+    // set's volumes; without it a RAR4 volume states no number anywhere.
+    pub(crate) numbered: bool,
 }
 
 impl Options {
@@ -54,6 +57,7 @@ impl Options {
             recovery_headers: 1,
             check: true,
             hash_key: false,
+            numbered: false,
         }
     }
 }
@@ -113,7 +117,7 @@ trait Layout {
     fn main(&self, volume: usize, multi: bool) -> Vec<u8>;
     fn file(&self, part: &Part<'_>) -> Vec<u8>;
     fn recovery(&self, data: &[u8]) -> Vec<u8>;
-    fn end(&self, more: bool) -> Vec<u8>;
+    fn end(&self, more: bool, volume: usize) -> Vec<u8>;
     // The bytes before the headers that are enciphered, after the main
     // header for RAR4, after the signature for RAR5.
     fn crypt_header(&self) -> Vec<u8>;
@@ -254,7 +258,7 @@ impl Layout for Rar5<'_> {
         )
     }
 
-    fn end(&self, more: bool) -> Vec<u8> {
+    fn end(&self, more: bool, _volume: usize) -> Vec<u8> {
         Self::header(5, 0, &[], None, &vint(u64::from(more)))
     }
 
@@ -392,8 +396,11 @@ impl Layout for Rar4<'_> {
         )
     }
 
-    fn end(&self, more: bool) -> Vec<u8> {
-        Self::block(0x7b, u16::from(more), &[])
+    fn end(&self, more: bool, volume: usize) -> Vec<u8> {
+        match self.options.numbered {
+            true => Self::block(0x7b, u16::from(more) | 0x8, &(volume as u16).to_le_bytes()),
+            false => Self::block(0x7b, u16::from(more), &[]),
+        }
     }
 
     fn crypt_header(&self) -> Vec<u8> {
@@ -472,7 +479,7 @@ impl Volumes<'_> {
     }
 
     fn finish(&mut self, more: bool) {
-        let end = self.layout.end(more);
+        let end = self.layout.end(more, self.done.len());
         let end = self.seal(end);
         self.current.extend(end);
         self.done.push(std::mem::take(&mut self.current));

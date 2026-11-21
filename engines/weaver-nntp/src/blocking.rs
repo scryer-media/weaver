@@ -1255,6 +1255,9 @@ impl BlockingNntpConnection {
     ) -> Result<Self> {
         let dialer = &config.dialer;
         let dialed = dialer.runtime.block_on(dialer.dial(config))?;
+        // The route's part is done: a lane waiting behind this one for the
+        // route may dial now.
+        crate::route_line::routed();
         let remote_addr = dialed.stream.tcp().and_then(|s| s.peer_addr().ok());
         let socket = dialer.blocking_stream(dialed.stream, config)?;
         let mut result = Self::from_tcp(
@@ -2099,73 +2102,73 @@ impl BlockingNntpConnection {
         Ok(exists)
     }
 
-    // One pipelined STAT batch. Every response is read even after a refusal,
-    // so the socket is left exactly where the next command expects it.
+    // One pipelined STAT batch.
     fn stat_batch(&mut self, message_ids: &[String]) -> Result<Vec<bool>> {
-        let pipelined = self.capabilities.supports_pipelining();
-        if pipelined {
-            self.write_probe_batch(message_ids.iter().map(String::as_str), Command::Stat)?;
-        }
-
-        let mut results = Vec::with_capacity(message_ids.len());
-        let mut refusal = None;
-        for message_id in message_ids {
-            if !pipelined {
-                self.write_probe_batch(std::iter::once(message_id.as_str()), Command::Stat)?;
-            }
-            let response = self.read_response()?;
-            match self.classify_stat_response(&response) {
-                Ok(exists) => results.push(exists),
-                Err(error) => {
-                    results.push(false);
-                    let _ = refusal.get_or_insert(error);
-                }
-            }
-        }
-        match refusal {
-            Some(error) => Err(error),
-            None => Ok(results),
-        }
+        let ids: Vec<&str> = message_ids.iter().map(String::as_str).collect();
+        self.probe_batch(&ids, Command::Stat, Self::classify_stat_response)
     }
 
     // One pipelined HEAD batch, used to second-guess a STAT miss.
-    //
-    // A 221 carries headers that have to be drained before the next status
-    // line can be read, so the multi-line body is consumed and discarded in
-    // place; only its arrival matters.
     fn head_batch(&mut self, message_ids: &[&str]) -> Result<Vec<bool>> {
-        let pipelined = self.capabilities.supports_pipelining();
-        if pipelined {
-            self.write_probe_batch(message_ids.iter().copied(), Command::Head)?;
-        }
+        self.probe_batch(message_ids, Command::Head, Self::classify_head_response)
+    }
 
-        let mut results = Vec::with_capacity(message_ids.len());
+    // Ask `command` of every id, in one write where the server pipelines,
+    // and turn each status line into a verdict with `classify`. Every reply
+    // is read even after a refusal, so the socket is left exactly where the
+    // next command expects it.
+    //
+    // A 480 asks for a login, as it does at a BODY: once every reply of the
+    // batch is read, the connection logs in on the same socket (the stored
+    // account, or the empty login the BODY path sends) and the ids the 480s
+    // answered are asked once more. A 480 to that second asking, or to the
+    // first command after an earlier 480's login, is the server refusing the
+    // account it took.
+    fn probe_batch(
+        &mut self,
+        message_ids: &[&str],
+        command: fn(ArticleId) -> Command,
+        classify: fn(&mut Self, &Response) -> Result<Result<bool>>,
+    ) -> Result<Vec<bool>> {
+        let mut results = vec![false; message_ids.len()];
         let mut refusal = None;
-        for message_id in message_ids {
-            if !pipelined {
-                self.write_probe_batch(std::iter::once(*message_id), Command::Head)?;
+        let mut asking: Vec<usize> = (0..message_ids.len()).collect();
+        let mut logged_in = false;
+        loop {
+            let pipelined = self.capabilities.supports_pipelining();
+            if pipelined {
+                self.write_probe_batch(asking.iter().map(|&index| message_ids[index]), command)?;
             }
-            let response = self.read_response()?;
-            match response.code.raw() {
-                221 => {
-                    self.note_answered();
-                    self.read_multiline_data()?;
-                    results.push(true);
+            let mut wants_login = Vec::new();
+            for &index in &asking {
+                if !pipelined {
+                    self.write_probe_batch(std::iter::once(message_ids[index]), command)?;
                 }
-                430 | 423 => results.push(false),
-                code if crate::server_caps::is_command_unsupported(code) => {
-                    if crate::server_caps::note_head_unsupported(&self.host, self.port) {
-                        debug!(host = %self.host, port = self.port, "server does not implement HEAD");
+                let response = self.read_response()?;
+                if response.code.raw() == 480 && !logged_in && !self.login_unproven {
+                    wants_login.push(index);
+                    continue;
+                }
+                if response.code.raw() != 480 {
+                    // Any other answer: the login holds.
+                    self.login_unproven = false;
+                }
+                match classify(self, &response)? {
+                    Ok(exists) => results[index] = exists,
+                    Err(error) => {
+                        let _ = refusal.get_or_insert(error);
                     }
-                    results.push(false);
-                    let _ = refusal.get_or_insert(NntpError::CommandNotRecognized);
-                }
-                _ => {
-                    results.push(false);
-                    let _ = refusal
-                        .get_or_insert(NntpError::from_status(response.code, &response.message));
                 }
             }
+            if wants_login.is_empty() {
+                break;
+            }
+            if let Err(error) = self.log_in_for_body(None) {
+                self.fail_body_pipeline();
+                return Err(error);
+            }
+            logged_in = true;
+            asking = wants_login;
         }
         match refusal {
             Some(error) => Err(error),
@@ -2210,13 +2213,17 @@ impl BlockingNntpConnection {
     // A 500/501 is the server saying it does not implement STAT. That is an
     // answer about the command, not a fault on the socket: it is recorded so
     // the probe switches to HEAD, and the connection stays healthy.
-    fn classify_stat_response(&mut self, response: &Response) -> Result<bool> {
-        match response.code.raw() {
+    //
+    // The outer result is the socket failing; the inner one is the server's
+    // answer, a verdict or a refusal. 451 is the article missing, beside 430
+    // and 423, as it is at a BODY.
+    fn classify_stat_response(&mut self, response: &Response) -> Result<Result<bool>> {
+        Ok(match response.code.raw() {
             223 => {
                 self.note_answered();
                 Ok(true)
             }
-            430 | 423 => Ok(false),
+            430 | 423 | 451 => Ok(false),
             code if crate::server_caps::is_command_unsupported(code) => {
                 if crate::server_caps::note_stat_unsupported(&self.host, self.port) {
                     debug!(host = %self.host, port = self.port, "server does not implement STAT");
@@ -2224,7 +2231,31 @@ impl BlockingNntpConnection {
                 Err(NntpError::CommandNotRecognized)
             }
             _ => Err(NntpError::from_status(response.code, &response.message)),
-        }
+        })
+    }
+
+    // Turn one HEAD status line into an existence verdict.
+    //
+    // A 221 carries headers that have to be drained before the next status
+    // line can be read, so the multi-line body is consumed and discarded in
+    // place; only its arrival matters. The outer result is the socket
+    // failing, the inner one the server's answer.
+    fn classify_head_response(&mut self, response: &Response) -> Result<Result<bool>> {
+        Ok(match response.code.raw() {
+            221 => {
+                self.note_answered();
+                self.read_multiline_data()?;
+                Ok(true)
+            }
+            430 | 423 | 451 => Ok(false),
+            code if crate::server_caps::is_command_unsupported(code) => {
+                if crate::server_caps::note_head_unsupported(&self.host, self.port) {
+                    debug!(host = %self.host, port = self.port, "server does not implement HEAD");
+                }
+                Err(NntpError::CommandNotRecognized)
+            }
+            _ => Err(NntpError::from_status(response.code, &response.message)),
+        })
     }
 
     pub fn select_group(&mut self, group: &str) -> Result<()> {
@@ -2264,7 +2295,10 @@ impl BlockingNntpConnection {
     //
     // The batches handed to `on_chunk` are exactly the ones that end up in
     // [`FusedYencArticle::chunks`], in the same order, so a caller can hash or
-    // write incrementally and still fall back to the buffered article.
+    // write incrementally and still fall back to the buffered article. One
+    // exception: a part an unstuffed `..` line left one dot short, and that
+    // checks once the dot is kept, gets the dot in its buffered chunks only
+    // (see [`FusedYencArticle::keep_dropped_dot`]).
     pub fn stream_yenc_article_with_chunks<F>(
         &mut self,
         message_id: &str,
@@ -2497,6 +2531,9 @@ impl BlockingNntpConnection {
                         lane_stats.decoded_articles += 1;
                     }
                     self.finish_active_body();
+                    // The whole part is in hand only now: a dot an unstuffed
+                    // line lost is kept here, after `on_chunk` saw the batch.
+                    article.keep_dropped_dot()?;
                     return Ok(article);
                 }
                 Ok(None) => {

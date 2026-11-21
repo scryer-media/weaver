@@ -15,7 +15,10 @@ import {
   type ReactNode,
 } from "react";
 import { useQuery, useSubscription } from "urql";
+import type { DocumentNode } from "graphql";
 import { useGraphqlConnectionState, type GraphqlConnectionStatus } from "@/graphql/client";
+import { DNS_PROFILE_CHOICES_QUERY, DNS_PROFILE_NAMES_QUERY } from "@/graphql/dns";
+import type { DnsProfileChoice, DnsProfileName } from "@/lib/dns";
 import {
   CATEGORIES_QUERY,
   HISTORY_JOBS_COUNT_QUERY,
@@ -32,14 +35,16 @@ import { useTranslate } from "@/lib/context/translate-context";
 import {
   LiveJobDownloadRatesProvider,
   type DownloadBlockState,
+  type DiskVolume,
 } from "@/lib/context/live-data-context";
 import type { JobDownloadRate } from "@/lib/live-job-download-rates";
 import { formatRate } from "./format";
 import { sameItems, shallowEqual, useSettled } from "./settled";
+import { torrentsStateFrom, type TorrentPresence, type TorrentsState } from "./torrents-shown";
 import { withLiveConnections, type ProviderConnections } from "./provider-connections";
 import { useHistoryLiveRefresh } from "./use-history-live-refresh";
 import { useLiveQueue, type LiveQueue } from "./use-live-queue";
-import { useVisibleInterval } from "./timers";
+import { usePageVisible, useVisibleInterval } from "./timers";
 
 /**
  * Everything the Next chrome needs, resolved once above the router.
@@ -85,6 +90,12 @@ export interface ProviderHealth {
   failureCount: number;
   consecutiveFailures: number;
   prematureDeaths: number;
+  /** Out of use: switched off by a fault, or a transport cooldown still running. */
+  down?: boolean;
+  /** The saved server id the data-used ledger counts it under. */
+  serverId?: number | null;
+  /** When the server was first seen in its current state, epoch ms. */
+  stateSinceEpochMs?: number | null;
   /** The resolved address new connections dial, once a race has picked one. */
   pinnedAddress: string | null;
 }
@@ -98,14 +109,16 @@ interface LiveMetricsSnapshot {
   metrics: { currentDownloadSpeed: number };
   globalState: {
     isPaused: boolean;
-    speedLimitBytesPerSec: number;
+    pausedClasses?: string[];
+    speedLimitBytesPerSec: number | null;
     resumeAtEpochMs?: number | null;
-    downloadBlock: DownloadBlockState;
+    downloadBlock: DownloadBlockState & { diskVolumes?: DiskVolume[] };
   };
   providerHoldoffs?: ProviderHoldoff[];
   providerConnections?: ProviderConnections[];
   /** Per-job download rates on the same tick as the speed; only the push carries them. */
   jobDownloadRates?: JobDownloadRate[];
+  torrents?: TorrentPresence;
 }
 
 /** A category as it is configured, not as the queue happens to use it. */
@@ -123,11 +136,31 @@ export interface NextData {
   /** Highest speed seen since the tab opened; the rail and stat strip both note it. */
   peakSpeed: number;
   isPaused: boolean;
+  /** The classes of job held paused as a whole, as `TORRENT`. */
+  pausedClasses: readonly string[];
+  /**
+   * Whether torrent things show. Read through `useTorrentsShown` or
+   * `TorrentsOnly`, never here, so every screen hides the same things the
+   * same way.
+   */
+  torrents: TorrentsState;
+  /**
+   * Whether torrents are on and the torrents there are; undefined until known.
+   * Screens read it through `useTorrentAddsOffered`; only the Torrents panel
+   * reads it here.
+   */
+  torrentPresence: TorrentPresence | undefined;
   /** When a timed pause resumes on its own, in epoch milliseconds; null when none is set. */
   resumeAt: number | null;
-  /** The configured download ceiling in bytes per second; 0 is unlimited. */
-  speedLimit: number;
+  /** The configured download limit in bytes per second; null is no limit, and 0 lets nothing through. */
+  speedLimit: number | null;
   downloadBlock: DownloadBlockState;
+  /**
+   * The destination volumes a download waits on or still writes to, each
+   * with whether it is slow, its write rate and the bytes waiting for it;
+   * empty while none is. Queue rows name theirs by label.
+   */
+  diskVolumes: readonly DiskVolume[];
   queue: LiveQueue;
   /**
    * The categories a person configured, in the order the daemon returns them.
@@ -140,6 +173,14 @@ export interface NextData {
   categories: ConfiguredCategory[];
   /** Re-read the categories after a change made elsewhere in the interface. */
   refreshCategories: () => void;
+  /** The saved DNS profiles a route can follow, and the System profile; undefined until read. */
+  dnsRouteProfiles: DnsProfileChoice[] | undefined;
+  /** The saved DNS profiles' names, for finding proxies; undefined until read. */
+  dnsProfileNames: DnsProfileName[] | undefined;
+  /** An editor shows the profiles: read them once, or again if the last read failed. */
+  wantDnsProfiles: (read: DnsProfileRead) => void;
+  /** Re-read the DNS profiles after one is saved or deleted. */
+  refreshDnsProfiles: () => void;
   historyCount: number;
   /** Re-read the history count after a change made elsewhere in the interface. */
   refreshHistoryCount: () => void;
@@ -164,12 +205,20 @@ const DEFAULT_DOWNLOAD_BLOCK: DownloadBlockState = {
   windowStartsAtEpochMs: null,
   windowEndsAtEpochMs: null,
   timezoneName: "",
-  scheduledSpeedLimit: 0,
-  speedLimitInForce: 0,
+  scheduledSpeedLimit: null,
+  speedLimitInForce: null,
   speedLimitBySchedule: false,
 };
 
 const EMPTY_CATEGORIES: ConfiguredCategory[] = [];
+const NO_DISK_VOLUMES: readonly DiskVolume[] = [];
+const NO_CLASSES: readonly string[] = [];
+const sameClasses = (left: readonly string[], right: readonly string[]) =>
+  left.length === right.length && left.every((held, index) => held === right[index]);
+
+function sameTorrentPresence(left: TorrentPresence | undefined, right: TorrentPresence | undefined): boolean {
+  return left === right || (left !== undefined && right !== undefined && shallowEqual(left, right));
+}
 const EMPTY_PROVIDERS: ProviderHealth[] = [];
 const EMPTY_HOLDOFFS: ProviderHoldoff[] = [];
 
@@ -284,6 +333,59 @@ function pick<K extends keyof NextData>(data: NextData, keys: readonly K[]): Pic
   return picked;
 }
 
+/** The two reads of the saved DNS profiles: what a route editor offers, and the names a proxy editor offers. */
+export type DnsProfileRead = "ROUTE" | "PROXY_NAME";
+
+/**
+ * One read of the saved DNS profiles, shared by every editor that offers them.
+ * Like the categories it is read once and again after a change made here, but
+ * only from the first editor that asks, so a screen without one sends nothing.
+ * A failed read is not kept: the next editor that opens asks again.
+ */
+function useWantedProfiles<T>(query: DocumentNode) {
+  const [wanted, setWanted] = useState(false);
+  const [{ data, fetching }, reexecute] = useQuery<{ dnsProfiles: T[] }>({ query, pause: !wanted });
+  const state = useRef({ wanted, failed: false });
+  useLayoutEffect(() => {
+    state.current = { wanted, failed: wanted && !fetching && data === undefined };
+  }, [data, fetching, wanted]);
+  const want = useCallback(() => {
+    if (!state.current.wanted) {
+      state.current = { wanted: true, failed: false };
+      setWanted(true);
+    } else if (state.current.failed) {
+      state.current = { wanted: true, failed: false };
+      reexecute({ requestPolicy: "network-only" });
+    }
+  }, [reexecute]);
+  const refresh = useCallback(() => {
+    if (state.current.wanted) {
+      reexecute({ requestPolicy: "network-only" });
+    }
+  }, [reexecute]);
+  return { profiles: data?.dnsProfiles, want, refresh };
+}
+
+/**
+ * The DNS profile reads the provider holds. Exported so a fixture that renders
+ * an editor without the whole provider holds them the same way.
+ */
+export function useDnsProfileReads(): Pick<NextData, "dnsRouteProfiles" | "dnsProfileNames" | "wantDnsProfiles" | "refreshDnsProfiles"> {
+  const route = useWantedProfiles<DnsProfileChoice>(DNS_PROFILE_CHOICES_QUERY);
+  const names = useWantedProfiles<DnsProfileName>(DNS_PROFILE_NAMES_QUERY);
+  const { want: wantRoute, refresh: refreshRoute } = route;
+  const { want: wantNames, refresh: refreshNames } = names;
+  const wantDnsProfiles = useCallback(
+    (read: DnsProfileRead) => (read === "ROUTE" ? wantRoute() : wantNames()),
+    [wantNames, wantRoute],
+  );
+  const refreshDnsProfiles = useCallback(() => {
+    refreshRoute();
+    refreshNames();
+  }, [refreshNames, refreshRoute]);
+  return { dnsRouteProfiles: route.profiles, dnsProfileNames: names.profiles, wantDnsProfiles, refreshDnsProfiles };
+}
+
 export function NextDataProvider({ children }: { children: ReactNode }) {
   const connectionState = useGraphqlConnectionState();
   const queue = useLiveQueue();
@@ -302,11 +404,11 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
   const [{ data: categoryData }, reexecuteCategories] = useQuery<{ categories: ConfiguredCategory[] }>({
     query: CATEGORIES_QUERY,
   });
+  const { dnsRouteProfiles, dnsProfileNames, wantDnsProfiles, refreshDnsProfiles } = useDnsProfileReads();
   const [{ data: providerData }, reexecuteProviders] = useQuery<{
     serverHealth: ProviderHealth[];
   }>({ query: SERVER_HEALTH_QUERY });
-
-  const [{ data: metricsQueryData }, reexecuteMetrics] = useQuery<LiveMetricsSnapshot>({
+  const [{ data: metricsQueryData, error: metricsQueryError }, reexecuteMetrics] = useQuery<LiveMetricsSnapshot>({
     query: LIVE_METRICS_QUERY,
   });
   const [{ data: metricsSubscriptionData, error: metricsSubscriptionError }] = useSubscription<{
@@ -361,6 +463,19 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
     void reexecuteMetrics({ requestPolicy: "network-only" });
   }, [metricsSubscriptionError, reexecuteMetrics]);
 
+  // Whether torrent things show rides on the live metrics: read with them,
+  // pushed when it changes, and polled with them while the socket is down.
+  // A failed read is unknown, never off; it is read again once the tab is
+  // shown.
+  const torrentPresence = useSettled(snapshot?.torrents, sameTorrentPresence);
+  const torrents = torrentsStateFrom(torrentPresence);
+  const pageVisible = usePageVisible();
+  useEffect(() => {
+    if (pageVisible && torrentPresence === undefined && metricsQueryError) {
+      void reexecuteMetrics({ requestPolicy: "network-only" });
+    }
+  }, [pageVisible, torrentPresence, metricsQueryError, reexecuteMetrics]);
+
   const speed = snapshot?.metrics?.currentDownloadSpeed ?? 0;
   // Raised while rendering, so the published peak never trails the speed.
   const [peakSpeed, setPeakSpeed] = useState(0);
@@ -369,10 +484,21 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
   }
 
   const globalState = snapshot?.globalState;
-  const downloadBlock = useSettled(globalState?.downloadBlock ?? DEFAULT_DOWNLOAD_BLOCK, shallowEqual);
+  // The disk volumes' figures move on pushes while a download waits on one;
+  // they are settled apart, so the block itself stays the same object
+  // meanwhile.
+  const pushedBlock = globalState?.downloadBlock;
+  const blockOnly = useMemo(() => {
+    if (!pushedBlock) return DEFAULT_DOWNLOAD_BLOCK;
+    const { diskVolumes: _disks, ...block } = pushedBlock;
+    return block;
+  }, [pushedBlock]);
+  const downloadBlock = useSettled(blockOnly, shallowEqual);
+  const diskVolumes = useSettled(pushedBlock?.diskVolumes ?? NO_DISK_VOLUMES, sameItems);
   const isPaused = globalState?.isPaused ?? false;
+  const pausedClasses = useSettled(globalState?.pausedClasses ?? NO_CLASSES, sameClasses);
   const resumeAt = globalState?.resumeAtEpochMs ?? null;
-  const speedLimit = globalState?.speedLimitBytesPerSec ?? 0;
+  const speedLimit = globalState?.speedLimitBytesPerSec ?? null;
   const categories = categoryData?.categories ?? EMPTY_CATEGORIES;
   const refreshCategories = useCallback(
     () => reexecuteCategories({ requestPolicy: "network-only" }),
@@ -418,12 +544,20 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
       speed,
       peakSpeed,
       isPaused,
+      pausedClasses,
+      torrents,
+      torrentPresence,
       resumeAt,
       speedLimit,
       downloadBlock,
+      diskVolumes,
       queue,
       categories,
       refreshCategories,
+      dnsRouteProfiles,
+      dnsProfileNames,
+      wantDnsProfiles,
+      refreshDnsProfiles,
       historyCount,
       refreshHistoryCount,
       providers,
@@ -434,7 +568,10 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
     [
       categories,
       connection,
+      dnsProfileNames,
+      dnsRouteProfiles,
       downloadBlock,
+      diskVolumes,
       historyCount,
       holdoffs,
       isPaused,
@@ -443,12 +580,17 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
       providersLoaded,
       queue,
       refreshCategories,
+      refreshDnsProfiles,
       resumeAt,
       refreshHistoryCount,
       speed,
       speedLimit,
+      torrents,
+      torrentPresence,
+      pausedClasses,
       update,
       version,
+      wantDnsProfiles,
     ],
   );
 

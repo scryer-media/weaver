@@ -84,6 +84,19 @@ pub struct MemberRecord {
     // it after a restart too.
     #[serde(default)]
     pub refuted: Option<Kind>,
+    // It was lifted here from the namespace below (`Tree::lift_scattered`):
+    // where it came from, and the position its name ranks at.
+    #[serde(default)]
+    pub lifted: Option<LiftRecord>,
+}
+
+// Where a lifted member came from, and the member ids from the root down to
+// it there: the position its name ranks at, as it did before it moved.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiftRecord {
+    pub node: NodeId,
+    pub member: MemberId,
+    pub position: Vec<MemberId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

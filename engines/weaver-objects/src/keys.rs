@@ -100,6 +100,10 @@ pub struct Keys {
     inner: Mutex<Inner>,
     capacity: usize,
     kdf: Arc<KdfCache>,
+    // A test's stand-in for other jobs pushing every entry out: the next
+    // lookup answers, then the cache is emptied.
+    #[cfg(test)]
+    evict_after_get: std::sync::atomic::AtomicBool,
 }
 
 impl fmt::Debug for Keys {
@@ -114,7 +118,16 @@ impl Keys {
             inner: Mutex::new(Inner::default()),
             capacity: capacity.max(1),
             kdf: Arc::new(KdfCache::new()),
+            #[cfg(test)]
+            evict_after_get: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    // The next lookup answers from the cache, then every entry goes.
+    #[cfg(test)]
+    pub(crate) fn evict_after_next_get(&self) {
+        self.evict_after_get
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     // unrar-rs's derivations, for the walks and checks that run inside it.
@@ -137,7 +150,20 @@ impl Keys {
     }
 
     pub fn get(&self, tuple: &Tuple<'_>) -> Option<Derived> {
-        self.lock().entries.get(&tuple.digest()).cloned()
+        #[cfg(test)]
+        let mut inner = self.lock();
+        #[cfg(not(test))]
+        let inner = self.lock();
+        let found = inner.entries.get(&tuple.digest()).cloned();
+        #[cfg(test)]
+        if self
+            .evict_after_get
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            inner.entries.clear();
+            inner.order.clear();
+        }
+        found
     }
 
     pub fn is_wrong(&self, tuple: &Tuple<'_>) -> bool {

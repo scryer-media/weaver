@@ -9,64 +9,11 @@
 use std::collections::HashMap;
 
 use serde::Serialize;
-use serde::ser::Serializer;
+
+pub use weaver_model::files::{FileExt, file_ext};
 
 use crate::deobfuscate::extract_filename;
 use crate::types::Nzb;
-
-// A file extension from a fixed list, or a shape class for numbered ones.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FileExt(&'static str);
-
-impl FileExt {
-    pub const NONE: Self = Self("none");
-    pub const OTHER: Self = Self("other");
-
-    pub fn as_str(self) -> &'static str {
-        self.0
-    }
-}
-
-impl Serialize for FileExt {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.0)
-    }
-}
-
-// Extensions a report may name. Anything else is reported as `other`.
-const KNOWN_EXTENSIONS: &[&str] = &[
-    "rar", "par2", "par3", "7z", "zip", "tar", "gz", "tgz", "bz2", "tbz", "tbz2", "xz", "txz",
-    "zst", "zstd", "br", "deflate", "nfo", "sfv", "srr", "srs", "nzb", "txt", "md5", "url", "jpg",
-    "jpeg", "png", "gif", "mkv", "mp4", "m4v", "avi", "wmv", "mov", "ts", "m2ts", "vob", "iso",
-    "img", "bin", "cue", "flac", "mp3", "m4a", "m4b", "aac", "ogg", "opus", "wav", "epub", "mobi",
-    "azw3", "pdf", "cbz", "cbr", "srt", "ass", "sub", "idx", "sup", "exe", "msi", "dmg", "apk",
-];
-
-// Classify the extension of a name.
-pub fn file_ext(name: &str) -> FileExt {
-    let lower = name.to_ascii_lowercase();
-    let Some((_, ext)) = lower.rsplit_once('.') else {
-        return FileExt::NONE;
-    };
-    if ext.is_empty() {
-        return FileExt::NONE;
-    }
-    let bytes = ext.as_bytes();
-    if bytes.len() == 3 && bytes.iter().all(u8::is_ascii_digit) {
-        return FileExt("NNN");
-    }
-    if bytes.len() == 3 && bytes[1..].iter().all(u8::is_ascii_digit) {
-        match bytes[0] {
-            b'r' => return FileExt("rNN"),
-            b's' => return FileExt("sNN"),
-            _ => {}
-        }
-    }
-    KNOWN_EXTENSIONS
-        .iter()
-        .find(|known| **known == ext)
-        .map_or(FileExt::OTHER, |known| FileExt(known))
-}
 
 // How a name is numbered, without the name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]

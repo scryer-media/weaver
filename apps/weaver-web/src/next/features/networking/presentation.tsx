@@ -4,6 +4,7 @@
 import type { ReactNode } from "react";
 import type { Translate } from "@/lib/context/translate-context";
 import type { Egress, RouteProblem } from "@/lib/networking";
+import { refusalKey } from "@/lib/refusal";
 import { cn } from "@/lib/utils";
 import { Square } from "../../components/chrome";
 import { CheckBox } from "../../components/controls";
@@ -127,6 +128,10 @@ export function routeProblemText(t: Translate, problem: RouteProblem): string {
       return t("next.networking.problem.egressDisabled");
     case "proxyRepeated":
       return t("next.networking.problem.proxyRepeated");
+    case "TORRENT_ROUTE_LEGS":
+    case "TORRENT_ROUTE_DIRECT_FALLBACK":
+    case "TORRENT_ROUTE_RUNGS":
+      return t(refusalKey(problem));
   }
 }
 
@@ -136,8 +141,9 @@ export function formatRate(bytesPerSecond = 0): string {
   return `${(bytesPerSecond / MIB).toFixed(2)} MiB/s`;
 }
 
-export function formatLimit(t: Translate, bytesPerSecond: number): string {
-  return bytesPerSecond > 0
+/** A limit as a rate, or Unlimited for none; 0 is a limit like any other. */
+export function formatLimit(t: Translate, bytesPerSecond: number | null): string {
+  return bytesPerSecond !== null
     ? `${(bytesPerSecond / MIB).toFixed(1)} MiB/s`
     : t("next.networking.unlimited");
 }
@@ -225,15 +231,18 @@ export function IconButton({
   label,
   onClick,
   disabled = false,
+  testId,
 }: {
   icon: IconName;
   label: string;
   onClick: () => void;
   disabled?: boolean;
+  testId?: string;
 }) {
   return (
     <button
       type="button"
+      data-testid={testId}
       aria-label={label}
       title={label}
       disabled={disabled}
@@ -242,7 +251,9 @@ export function IconButton({
         "flex size-8 flex-none items-center justify-center border border-wv-control bg-wv-button",
         disabled
           ? "cursor-default text-wv-disabled"
-          : "cursor-pointer text-wv-fg hover:border-wv-control-hover hover:bg-wv-button-hover",
+          : icon === "remove"
+            ? "cursor-pointer !border-wv-danger-border text-wv-error-text hover:!border-wv-danger-border-hover hover:bg-wv-danger-bg-hover"
+            : "cursor-pointer text-wv-fg hover:border-wv-control-hover hover:bg-wv-button-hover",
       )}
     >
       <Icon name={icon} size={13} />
@@ -257,12 +268,15 @@ export function CheckRow({
   label,
   detail,
   disabled,
+  testId,
 }: {
   checked: boolean;
   onChange: (next: boolean) => void;
   label: string;
   detail?: ReactNode;
   disabled?: boolean;
+  /** The box's own test ID. */
+  testId?: string;
 }) {
   return (
     <label
@@ -271,7 +285,7 @@ export function CheckRow({
         disabled ? "cursor-default" : "cursor-pointer",
       )}
     >
-      <CheckBox checked={checked} onChange={onChange} label={label} disabled={disabled} />
+      <CheckBox checked={checked} onChange={onChange} label={label} disabled={disabled} testId={testId} />
       <span className="min-w-0 truncate">{label}</span>
       {detail === undefined ? null : (
         <span className="flex-none font-wv-mono text-[11px] text-wv-muted">{detail}</span>

@@ -4,6 +4,7 @@
 use super::*;
 use crate::observability::with_timed_config_read;
 use crate::servers::types::ServerDetails;
+use weaver_server_core::servers::tls_diagnostics::ServersTlsDiagnosticsQueries;
 
 #[derive(Default)]
 pub(crate) struct ServersQuery;

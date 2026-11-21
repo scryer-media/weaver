@@ -1,22 +1,68 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// The file types people open. A whole file whose name ends in one of these
-// is a usable delivery; any other whole file ships but is not one. Archive
-// volumes, split parts, recovery and check data, and bare `.bin` are not on
-// it: they exist to make something else, or say nothing of what they are.
+// The file types people open. A whole file whose name ends in one of these,
+// furniture beside the payload among them, is a usable delivery; any other
+// whole file ships but is not one. Archive volumes, split parts, recovery
+// and check data, and bare `.bin` are not on it: they exist to make
+// something else, or say nothing of what they are.
 
 // A file name's extension, after its last dot, is a type people open.
+// Archives Weaver does not unpack, such as an `.apk` or an `.iso`, are.
 pub fn known_type(name: &str) -> bool {
-    let base = name.rsplit('/').next().unwrap_or(name);
-    let Some((_, extension)) = base.rsplit_once('.') else {
+    extension(name).is_some_and(|extension| {
+        KNOWN_TYPES
+            .iter()
+            .any(|group| group.binary_search(&extension.as_str()).is_ok())
+    })
+}
+
+// Furniture a release posts beside its payload: text (`BESIDE`) or a sample,
+// a file whose name, its extension off, is `sample` or ends in `-sample`,
+// `.sample` or `_sample`, or one under a folder named `sample`, in any case.
+// Recovery data and listings are the sniffer's to tell.
+pub fn furniture(name: &str) -> bool {
+    let beside =
+        extension(name).is_some_and(|extension| BESIDE.binary_search(&extension.as_str()).is_ok());
+    beside || sample(name)
+}
+
+fn sample(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let mut parts: Vec<&str> = lower
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty())
+        .collect();
+    let Some(base) = parts.pop() else {
         return false;
     };
-    let extension = extension.to_ascii_lowercase();
-    KNOWN_TYPES
-        .iter()
-        .any(|group| group.binary_search(&extension.as_str()).is_ok())
+    if parts.contains(&"sample") {
+        return true;
+    }
+    let stem = base.rsplit_once('.').map_or(base, |(stem, _)| stem);
+    stem == "sample"
+        || ["-sample", ".sample", "_sample"]
+            .iter()
+            .any(|suffix| stem.ends_with(suffix))
 }
+
+fn extension(name: &str) -> Option<String> {
+    let base = name.rsplit('/').next().unwrap_or(name);
+    let (_, extension) = base.rsplit_once('.')?;
+    Some(extension.to_ascii_lowercase())
+}
+
+// Text posted beside a payload.
+#[rustfmt::skip]
+const BESIDE: &[&str] = &[
+    "diz",
+    "edl",
+    "info",
+    "log",
+    "nfo",
+    "releaseinfo",
+    "url",
+];
 
 #[rustfmt::skip]
 const KNOWN_TYPES: &[&[&str]] = &[
@@ -607,16 +653,7 @@ const KNOWN_TYPES: &[&[&str]] = &[
         "xlsx",
         "xps",
     ],
-    // Text posted beside a payload.
-    &[
-        "diz",
-        "edl",
-        "info",
-        "log",
-        "nfo",
-        "releaseinfo",
-        "url",
-    ],
+    BESIDE,
     // Disc, disk and firmware images.
     &[
         "2mg",
@@ -809,7 +846,59 @@ const KNOWN_TYPES: &[&[&str]] = &[
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{KNOWN_TYPES, known_type};
+    use super::{BESIDE, KNOWN_TYPES, furniture, known_type};
+
+    #[test]
+    fn furniture_is_text_beside_a_payload_or_a_sample() {
+        for name in [
+            "ember.nfo",
+            "disc/file_id.DIZ",
+            "Sample/ember.mkv",
+            "ember/SAMPLE/clip.mkv",
+            "ember-sample.mkv",
+            "ember.sample.mkv",
+            "ember_Sample.mkv",
+            "sample.mkv",
+            "CD1\\Sample\\ember.mkv",
+        ] {
+            assert!(furniture(name), "{name}");
+        }
+        for name in [
+            "ember.mkv",
+            "samples/ember.mkv",
+            "ember.samplepack",
+            "examples.mkv",
+            "ember.rar",
+            "ember.par2",
+            "sampler.mkv",
+        ] {
+            assert!(!furniture(name), "{name}");
+        }
+    }
+
+    // Furniture is a known type, as is an archive Weaver does not unpack;
+    // volumes, recovery and check data and a bare `.bin` are not.
+    #[test]
+    fn furniture_beside_a_payload_is_a_known_type() {
+        for extension in BESIDE {
+            let name = format!("disc/ember.{}", extension.to_ascii_uppercase());
+            assert!(known_type(&name), "{name}");
+        }
+        assert!(BESIDE.windows(2).all(|pair| pair[0] < pair[1]));
+        for name in [
+            "ember.mkv",
+            "ember.apk",
+            "ember.iso",
+            "ember.cbz",
+            "ember.epub",
+            "ember.txt",
+        ] {
+            assert!(known_type(name), "{name}");
+        }
+        for name in ["ember.bin", "ember.r03", "ember.par2", "ember.sfv", "ember"] {
+            assert!(!known_type(name), "{name}");
+        }
+    }
 
     #[test]
     fn known_types_are_sorted_lower_case_unique_and_bare() {

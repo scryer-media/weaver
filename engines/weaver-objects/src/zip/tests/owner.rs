@@ -177,7 +177,7 @@ impl Owner {
         let (name, bytes) = &self.volumes[volume];
         let first = &bytes[..bytes.len().min(32)];
         assert_eq!(
-            self.object.claim(name, first, None),
+            self.object.claim(name, (first).into(), None),
             vec![self.index[volume]]
         );
         let name = name.clone();

@@ -17,8 +17,19 @@
 //   active job and the 2,000 most recently finished, with their names,
 //   files, metadata, NZB title and posted files, and the title the API
 //   derives from each name; and the host's directories, user and host name.
-//   Older history is only counted, in the manifest. Any read, parse or build
-//   failure leaves every component out.
+//   Older history is only counted, in the manifest. The read runs in steps
+//   (`stored_read.rs`); a step that fails or is cut costs only its own
+//   names. Then the jobs the read did not read whole are named from the
+//   queue in memory and the loaded configuration, and the package is built
+//   under a guard: a log line naming such a job, or holding a dotted name
+//   the table does not hold, is left out, as is a string value holding such
+//   a name. A log line naming a job id the table holds no row for is left
+//   out whether or not the read was whole: a job cancelled before the
+//   package, older than the recent history, or one that joined or left the
+//   queue during the read. The file says how many. If the table cannot be built at all,
+//   the package is built again from the host's names alone, under the
+//   strictest guard. A component the pass cannot sanitize is left out alone,
+//   with its reason.
 // - The structure decides first. A string under a field that carries a name
 //   (its field name ends in `name`, `file`, `path`, `dir`, `member`, `set`,
 //   `title`, `volume`, `archive`, `release`, `label`, `user`, `host` and the
@@ -49,14 +60,16 @@
 //   replaced host become their shape.
 //
 // What it cannot catch: a plain one-word name, or a name the table does not
-// hold, inside running text outside any field or path; a category or
+// hold, inside running text outside any field or path, on a line that names
+// no job id (on a whole read such a line ships, a dotted name included,
+// since a panic message, a source path or a host name reads the same); a category or
 // metadata value inside running text; a name written in another Unicode
 // normal form or a non-ASCII case; a path written from an unknown root
 // other than a drive; a message-ID whose domain has no dot.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::io::{BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 
@@ -64,11 +77,13 @@ use aho_corasick::{AhoCorasick, AhoCorasickBuilder, Anchored, Input, MatchKind, 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use weaver_nzb::NzbNames;
-use weaver_server_core::Database;
 use weaver_server_core::bandwidth::ScheduleEntry;
 use weaver_server_core::categories::CategoryConfig;
-use weaver_server_core::jobs::diagnostic_names::{DiagnosticNzbSource, JobNameRecord};
-use weaver_server_core::proxies::{EgressBinding, EgressInterface, ProxyPool, ProxyProfile};
+use weaver_server_core::jobs::diagnostic_names::JobNameRecord;
+use weaver_server_core::proxies::{
+    DnsProfile, DnsServerList, EgressBinding, EgressInterface, ListedServer, ListedWire, ProxyPool,
+    ProxyProfile,
+};
 use weaver_server_core::rss::RssFeedRow;
 use weaver_server_core::servers::ServerConfig;
 
@@ -88,8 +103,6 @@ const PATH_STAND_IN: &str = "/<path>";
 const LOG_FILE_STAND_IN: &str = "weaver.log";
 const LOG_STEM_STAND_IN: &str = "weaver";
 
-const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
-
 // What the manifest says about the stand-ins, so a reader knows the names in
 // the package are not real.
 pub(super) const SANITIZED_NOTE: &str = "Provider, proxy, egress, schedule, script, feed, \
@@ -104,7 +117,11 @@ pub(super) const SANITIZED_NOTE: &str = "Provider, proxy, egress, schedule, scri
      a host-N stand-in. A file stand-in keeps the segments that name its kind (extension, \
      part, volume and recovery markers), so one set reads as one stand-in. IP, MAC \
      and e-mail addresses, and URL credentials, query strings and paths after a replaced host \
-     are replaced by their shape. Configuration \
+     are replaced by their shape. When the stand-in table is partial (table.complete is \
+     false, and table.steps says which reads were cut or failed), jobs not read whole are \
+     named from the queue in memory, and a line or value that names such a job or holds a \
+     dotted name the table lacks is left out; each file's partial field counts them. \
+     Configuration \
      files are numbered, and a log starts at its first whole line when truncated and ends at \
      its last whole line.";
 
@@ -252,6 +269,8 @@ pub(super) struct StoredNames {
     pub(super) proxies: Vec<ProxyProfile>,
     pub(super) egress: Vec<EgressInterface>,
     pub(super) pools: Vec<ProxyPool>,
+    pub(super) dns_lists: Vec<DnsServerList>,
+    pub(super) dns_profiles: Vec<DnsProfile>,
     pub(super) feeds: Vec<RssFeedRow>,
     pub(super) script_dirs: Vec<String>,
     // Every script file in the scripts directory, every script an instance
@@ -259,135 +278,82 @@ pub(super) struct StoredNames {
     pub(super) scripts: Vec<String>,
 }
 
-// Reads every table source the database and the host hold. One that cannot
-// be read fails the read, and with it the package. Blocking: run it off the
-// async runtime.
-pub(super) fn read_stored_names(db: &Database) -> Result<StoredNames, String> {
-    fn failed(source: &str, error: impl std::fmt::Display) -> String {
-        format!("the stand-in table could not read {source}: {error}")
-    }
-
-    let servers = db
-        .list_servers()
-        .map_err(|error| failed("the servers", error))?;
-    let jobs = db
-        .diagnostic_job_names()
-        .map_err(|error| failed("the job names", error))?;
-
-    // A page at a time, so no more than one page of NZBs is held at once.
-    let mut posted = BTreeMap::new();
-    for source in [DiagnosticNzbSource::Active, DiagnosticNzbSource::History] {
-        let mut after = 0;
-        loop {
-            let page = db
-                .diagnostic_persisted_nzbs(source, after)
-                .map_err(|error| failed("the persisted NZBs", error))?;
-            let Some(last) = page.last().map(|nzb| nzb.job_id) else {
-                break;
-            };
-            for nzb in page {
-                if let Some(document) = nzb.nzb.filter(|document| !document.is_empty()) {
-                    let names = posted_names(&document).map_err(|error| {
-                        failed(&format!("the NZB of job {}", nzb.job_id), error)
-                    })?;
-                    posted.insert(nzb.job_id, names);
-                }
-            }
-            after = last;
-        }
-    }
-
-    let script_dir = db
-        .diagnostic_script_directory()
-        .map_err(|error| failed("the scripts directory", error))?;
-    let mut scripts = Vec::new();
-    if let Some(dir) = &script_dir {
-        match std::fs::read_dir(dir) {
-            Ok(entries) => {
-                for entry in entries {
-                    let entry = entry.map_err(|error| failed("the scripts directory", error))?;
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    if !name.starts_with('.') {
-                        scripts.push(name);
-                    }
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(failed("the scripts directory", error)),
-        }
-    }
-    for instance in db
-        .script_instances()
-        .map_err(|error| failed("the script instances", error))?
-    {
-        scripts.push(instance.script.as_str().to_string());
-        scripts.push(instance.name);
-    }
-
-    Ok(StoredNames {
-        jobs,
-        posted,
-        history_total: db
-            .diagnostic_history_total()
-            .map_err(|error| failed("the history", error))?,
-        categories: db
-            .list_categories()
-            .map_err(|error| failed("the categories", error))?,
-        logins: db
-            .get_auth_credentials()
-            .map_err(|error| failed("the login", error))?
-            .map(|credentials| credentials.username)
-            .into_iter()
-            .collect(),
-        servers,
-        schedules: db
-            .list_schedules()
-            .map_err(|error| failed("the schedules", error))?,
-        proxies: db
-            .list_proxy_profiles()
-            .map_err(|error| failed("the proxy profiles", error))?,
-        egress: db
-            .list_egress_interfaces()
-            .map_err(|error| failed("the egress interfaces", error))?,
-        pools: db
-            .list_proxy_pools()
-            .map_err(|error| failed("the proxy pools", error))?,
-        feeds: db
-            .list_rss_feeds()
-            .map_err(|error| failed("the RSS feeds", error))?,
-        script_dirs: script_dir.into_iter().collect(),
-        scripts,
-    })
+// What the read did not cover, when it did not cover everything: the jobs
+// whose names it did not read whole (`None` when it cannot tell which, so
+// every job is one). With a guard, a line or value of running text that names
+// one of those jobs, or holds a dotted name the table does not know, is left
+// out in place, since the table cannot replace what it never read. Guard or
+// no guard, a line that names a job the table holds no names for is left out
+// the same way.
+#[derive(Debug, Clone, Default)]
+pub(super) struct Guard {
+    pub(super) jobs: Option<BTreeSet<u64>>,
 }
 
-// The title and file names of a persisted NZB, read without its segments.
-fn posted_names(nzb: &[u8]) -> Result<NzbNames, String> {
-    if nzb.starts_with(&ZSTD_MAGIC) {
-        let decoder = zstd::stream::read::Decoder::new(nzb).map_err(|error| error.to_string())?;
-        weaver_nzb::parse_nzb_names_reader(BufReader::new(decoder))
-    } else {
-        weaver_nzb::parse_nzb_names_reader(nzb)
+// What a line or value of running text becomes when it is left out.
+pub(super) const GUARDED_LINE: &str = "<left out: it named what the stand-in table does not hold>";
+
+// How many stand-ins the package allocated: those for names the table read,
+// and those the field rule gave names it did not hold.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct StandInCount {
+    pub(super) from_table: usize,
+    pub(super) from_fallback: usize,
+}
+
+impl StandInCount {
+    pub(super) fn total(self) -> usize {
+        self.from_table + self.from_fallback
     }
-    .map_err(|error| error.to_string())
 }
 
 // Sanitizes every component in place, its member name included, and returns
-// how many stand-ins the table holds. A table that cannot be built fails the
-// package. `schema_keys` are the field names the GraphQL schema declares.
-// Blocking: run it off the async runtime.
+// how many stand-ins the table holds, and `texts` (the manifest's own
+// sentences) the same way. Each component is sanitized on its own:
+// one that cannot be is left out with its reason, and the rest ship. Every
+// component that had text left out says how much. Fails only
+// when the table cannot be built. `schema_keys` are the field names the
+// GraphQL schema declares. Blocking: run it off the async runtime.
 pub(super) fn sanitize_package(
     components: &mut [Component],
     local: &LocalNames,
     stored: &StoredNames,
     schema_keys: HashSet<String>,
-) -> Result<usize, String> {
+    guard: Option<Guard>,
+    texts: &mut [String],
+) -> Result<StandInCount, String> {
     components.iter_mut().for_each(open_gzip);
-    let mut table = StandIns::build(components, local, stored)?;
+    let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        StandIns::build(components, local, stored)
+    }))
+    .unwrap_or_else(|_| Err("the stand-in table could not be built".to_string()));
+    let mut table = built?;
     table.schema_keys = schema_keys;
+    table.guard = guard;
     for component in components.iter_mut() {
-        table.apply(component);
+        table.guarded.set(0);
+        let name = component.name.clone();
+        let applied =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| table.apply(component)));
+        if applied.is_err() {
+            *component = Component::failed(
+                table.member_name(&name),
+                "left out because it could not be sanitized",
+            );
+            continue;
+        }
+        let guarded = table.guarded.get();
+        if guarded > 0 && component.outcome.is_ok() {
+            component.partial = Some(format!(
+                "{guarded} lines or values left out: each named a job the stand-in table did \
+                 not hold or did not read whole, or held a dotted name the table did not hold"
+            ));
+        }
     }
-    Ok(table.stand_in_count())
+    for text in texts.iter_mut() {
+        *text = table.guarded_value(table.sanitize_str(text));
+    }
+    Ok(table.stand_in_split())
 }
 
 // Every component left out because the table could not be built, named
@@ -445,6 +411,7 @@ pub(super) fn shell_of(component: &Component) -> Component {
         outcome: Err(String::new()),
         reason: component.reason,
         without_table: component.without_table.clone(),
+        partial: None,
     }
 }
 
@@ -457,6 +424,149 @@ pub(super) fn from_first_line(text: &mut Vec<u8>) {
         }
         None => text.clear(),
     }
+}
+
+// The stand-ins the pass writes, by the word before their number
+// (`job-17`, `name-3`, `dns-list-2`): a token that starts with one of these
+// was written by the pass, not read from the operator.
+const STAND_IN_WORDS: &[&str] = &[
+    "provider",
+    "category",
+    "job",
+    "file",
+    "title",
+    "meta",
+    "schedule",
+    "egress",
+    "proxy",
+    "proxy-pool",
+    "dns-list",
+    "dns-profile",
+    "script",
+    "feed",
+    "name",
+    "host",
+    "dir",
+    "volume",
+    "config",
+];
+
+fn is_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'+') || byte >= 0x80
+}
+
+// Whether `text` holds a word of two or more dotted parts with a letter in
+// it (`Some.Release.mkv`) that the pass did not write: not a stand-in, not
+// a number or version (`0.17.0`, `v2.1`), not Weaver's own file names.
+fn holds_unknown_dotted_name(text: &[u8]) -> bool {
+    text.split(|byte| !is_token_byte(*byte)).any(|token| {
+        let start = token
+            .iter()
+            .position(|byte| !matches!(byte, b'.' | b'_' | b'-' | b'+'));
+        let end = token
+            .iter()
+            .rposition(|byte| !matches!(byte, b'.' | b'_' | b'-' | b'+'));
+        let (Some(start), Some(end)) = (start, end) else {
+            return false;
+        };
+        let token = &token[start..=end];
+        let labels: Vec<&[u8]> = token
+            .split(|byte| *byte == b'.')
+            .filter(|label| !label.is_empty())
+            .collect();
+        if labels.len() < 2 {
+            return false;
+        }
+        if !token
+            .iter()
+            .any(|byte| byte.is_ascii_alphabetic() || *byte >= 0x80)
+        {
+            return false;
+        }
+        let numeric = |label: &&[u8]| {
+            label[0].is_ascii_digit()
+                || (matches!(label[0], b'v' | b'V')
+                    && label.len() > 1
+                    && label[1..].iter().all(u8::is_ascii_digit))
+        };
+        if labels.iter().all(numeric) {
+            return false;
+        }
+        !is_stand_in_stem(labels[0])
+    })
+}
+
+// Whether a stem is one the pass writes: a stand-in word and its number
+// (`job-12+40`, `file-3`), or Weaver's own log and database name.
+fn is_stand_in_stem(stem: &[u8]) -> bool {
+    if stem == b"weaver" {
+        return true;
+    }
+    STAND_IN_WORDS.iter().any(|word| {
+        stem.strip_prefix(word.as_bytes())
+            .and_then(|rest| rest.strip_prefix(b"-"))
+            .is_some_and(|number| {
+                !number.is_empty()
+                    && number
+                        .split(|byte| *byte == b'+')
+                        .all(|part| !part.is_empty() && part.iter().all(u8::is_ascii_digit))
+            })
+    })
+}
+
+// Whether `text` names a job `unread` holds true for, by its stand-in
+// (`job-17`, `job-12+40`) or its id (`job_id=17`, `"job_id":17`, `job 17`).
+fn names_unread_job(text: &[u8], unread: impl Fn(u64) -> bool) -> bool {
+    let mut at = 0;
+    while let Some(offset) = find_bytes(&text[at..], b"job") {
+        let start = at + offset;
+        at = start + 3;
+        if start > 0 && is_word_byte(text[start - 1]) {
+            continue;
+        }
+        let mut cursor = start + 3;
+        if text[cursor..].starts_with(b"_id") {
+            cursor += 3;
+        }
+        if text.get(cursor) == Some(&b'"') {
+            cursor += 1;
+        }
+        match text.get(cursor) {
+            Some(b'-' | b'=' | b':' | b' ') => cursor += 1,
+            _ => continue,
+        }
+        while text.get(cursor) == Some(&b' ') {
+            cursor += 1;
+        }
+        loop {
+            let digits = text[cursor..]
+                .iter()
+                .take_while(|byte| byte.is_ascii_digit())
+                .count();
+            if digits == 0 {
+                break;
+            }
+            let id = std::str::from_utf8(&text[cursor..cursor + digits])
+                .ok()
+                .and_then(|digits| digits.parse::<u64>().ok());
+            if id.is_some_and(&unread) {
+                return true;
+            }
+            cursor += digits;
+            if text.get(cursor) == Some(&b'+') {
+                cursor += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    false
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 // Drops everything after the last whole line of a log read while it is
@@ -896,6 +1006,30 @@ impl Table {
         self.insert(value, stand_in, Scope::Identity)
     }
 
+    // A DNS server's TLS name is a host name, and a DNS over HTTPS path can
+    // name the operator's account at the service, so each is held as close
+    // as a proxy's host.
+    fn dns_servers(&mut self, servers: &[ListedServer], stand_in: &str) {
+        for (index, server) in servers.iter().enumerate() {
+            match &server.wire {
+                ListedWire::Plain => {}
+                ListedWire::Tls { name } => {
+                    if let Some(name) = name {
+                        self.identity(name, &format!("{stand_in}/dns-{}", index + 1));
+                    }
+                }
+                ListedWire::Https { path } => {
+                    let bare = path.split('?').next().unwrap_or(path);
+                    for spelling in [path.as_str(), bare] {
+                        if spelling != "/" {
+                            self.identity(spelling, PATH_STAND_IN);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn dir(&mut self, value: &str, stand_in: &str, content: bool) -> bool {
         let scope = if content {
             Scope::ContentDir
@@ -1018,6 +1152,12 @@ pub(super) struct StandIns {
     log_names: Vec<(String, &'static str)>,
     // The field names the GraphQL schema declares, kept as JSON keys.
     schema_keys: HashSet<String>,
+    // Every job the table holds names for.
+    known_jobs: BTreeSet<u64>,
+    // What the table did not read, when it did not read everything, and how
+    // many lines or values of the component in the pass it left out.
+    guard: Option<Guard>,
+    guarded: Cell<u64>,
 }
 
 impl StandIns {
@@ -1108,6 +1248,7 @@ impl StandIns {
         }
         let no_record = JobNameRecord::default();
         let no_nzb = NzbNames::default();
+        let known_jobs = ids.clone();
         for id in ids {
             let record = stored.jobs.get(&id).unwrap_or(&no_record);
             let nzb = stored.posted.get(&id).unwrap_or(&no_nzb);
@@ -1270,6 +1411,19 @@ impl StandIns {
         for pool in &stored.pools {
             table.name(&pool.name, &format!("proxy-pool-{}", pool.id));
         }
+        for list in &stored.dns_lists {
+            let stand_in = format!("dns-list-{}", list.id);
+            table.name(&list.name, &stand_in);
+            table.dns_servers(&list.servers, &stand_in);
+        }
+        // The built-in System profile's name is Weaver's, not the operator's.
+        for profile in stored
+            .dns_profiles
+            .iter()
+            .filter(|profile| profile.id != weaver_server_core::proxies::SYSTEM_DNS_PROFILE_ID)
+        {
+            table.name(&profile.name, &format!("dns-profile-{}", profile.id));
+        }
         let scripts: BTreeSet<&String> = stored.scripts.iter().collect();
         for (index, script) in scripts.into_iter().enumerate() {
             table.name(script, &format!("script-{}", index + 1));
@@ -1341,6 +1495,9 @@ impl StandIns {
             registry: RefCell::new(registry),
             log_names,
             schema_keys: HashSet::new(),
+            known_jobs,
+            guard: None,
+            guarded: Cell::new(0),
         };
         for component in components {
             if let Ok(data) = &component.outcome {
@@ -1378,15 +1535,19 @@ impl StandIns {
         Ok(stand_ins)
     }
 
-    // How many stand-ins the package allocated.
-    fn stand_in_count(&self) -> usize {
+    // How many stand-ins the package allocated, split between the names the
+    // table read and those the field rule found.
+    fn stand_in_split(&self) -> StandInCount {
         let registry = self.registry.borrow();
-        self.table.stand_ins.len()
-            + registry
+        StandInCount {
+            from_table: self
+                .table
                 .stand_ins
                 .iter()
-                .filter(|stand_in| !self.table.stand_ins.contains(*stand_in))
-                .count()
+                .filter(|stand_in| !registry.stand_ins.contains(*stand_in))
+                .count(),
+            from_fallback: registry.stand_ins.len(),
+        }
     }
 
     // A member is named by the package, or for a log, by the log file: only
@@ -1409,7 +1570,7 @@ impl StandIns {
         component.name = self.member_name(&component.name);
         let outcome = std::mem::replace(&mut component.outcome, Ok(Vec::new()));
         component.outcome = match outcome {
-            Err(error) => Err(self.sanitize_str(&error)),
+            Err(error) => Err(self.guarded_value(self.sanitize_str(&error))),
             Ok(data) => self.sanitize_form(component.form, &data),
         };
     }
@@ -1439,7 +1600,7 @@ impl StandIns {
     // items are its field's.
     fn sanitize_json_value(&self, value: &mut Value, key: Option<&str>) {
         match value {
-            Value::String(text) => *text = self.sanitize_value(key, text),
+            Value::String(text) => *text = self.guarded_field(key, text),
             Value::Array(items) => items
                 .iter_mut()
                 .for_each(|item| self.sanitize_json_value(item, key)),
@@ -1633,7 +1794,7 @@ impl StandIns {
 
     fn sanitize_toml_value(&self, value: &mut toml::Value, key: Option<&str>) {
         match value {
-            toml::Value::String(text) => *text = self.sanitize_value(key, text),
+            toml::Value::String(text) => *text = self.guarded_field(key, text),
             toml::Value::Array(items) => items
                 .iter_mut()
                 .for_each(|item| self.sanitize_toml_value(item, key)),
@@ -1659,7 +1820,7 @@ impl StandIns {
         if self.schema_keys.contains(&key) {
             return key;
         }
-        let sanitized = self.sanitize_string(&key);
+        let sanitized = self.guarded_value(self.sanitize_string(&key));
         let mut candidate = sanitized.clone();
         let mut count = 1;
         while taken(&candidate) {
@@ -1696,11 +1857,80 @@ impl StandIns {
                 self.sanitize_json_line(text)
                     .or_else(|| self.sanitize_prometheus_line(text))
             });
-            match structured {
-                Some(text) => out.extend_from_slice(text.as_bytes()),
-                None => out.extend_from_slice(&self.sanitize_fields_line(body)),
+            let json = structured.is_some() && body.trim_ascii_start().starts_with(b"{");
+            let sanitized = match structured {
+                Some(text) => text.into_bytes(),
+                None => self.sanitize_fields_line(body),
+            };
+            if self.keeps_out(&sanitized) {
+                if json {
+                    out.extend_from_slice(b"{\"left_out\":\"");
+                    out.extend_from_slice(GUARDED_LINE.as_bytes());
+                    out.extend_from_slice(b"\"}");
+                } else {
+                    out.extend_from_slice(GUARDED_LINE.as_bytes());
+                }
+            } else {
+                out.extend_from_slice(&sanitized);
             }
             out.extend_from_slice(ending);
+        }
+        out
+    }
+
+    // Whether a sanitized line of running text is kept out. Guard or no
+    // guard, when it names a job the table holds no names for, since the
+    // table cannot know its other names on the line: one cancelled or
+    // deleted before the package, older than the recent history, or one
+    // that joined or left the queue while the package was collected. With a
+    // guard only, when it names a job the guard says was not read whole, or
+    // holds a dotted name the table does not hold. Counts each one kept out.
+    fn keeps_out(&self, text: &[u8]) -> bool {
+        let unread = |id: u64| {
+            !self.known_jobs.contains(&id)
+                || self
+                    .guard
+                    .as_ref()
+                    .is_some_and(|guard| guard.jobs.as_ref().is_none_or(|jobs| jobs.contains(&id)))
+        };
+        let guarded_dotted = self.guard.is_some() && holds_unknown_dotted_name(text);
+        self.count_out(names_unread_job(text, unread) || guarded_dotted)
+    }
+
+    // A value under its field: kept out when it holds a dotted name the
+    // table does not hold. A value that is a job's stand-in is the job's
+    // field and ships.
+    fn guarded_value(&self, text: String) -> String {
+        if self.guard.is_some() && self.count_out(holds_unknown_dotted_name(text.as_bytes())) {
+            GUARDED_LINE.to_string()
+        } else {
+            text
+        }
+    }
+
+    // A string under its field, sanitized and then guarded. Under a guard, a
+    // category the table did not replace is kept out too: a category is a
+    // whole value, which only the table can name.
+    fn guarded_field(&self, key: Option<&str>, text: &str) -> String {
+        let sanitized = self.sanitize_value(key, text);
+        let unnamed_category = self.guard.is_some()
+            && sanitized == text
+            && key.is_some_and(|key| {
+                key_words(key)
+                    .last()
+                    .is_some_and(|word| matches!(word.as_str(), "category" | "categories"))
+            })
+            && !is_stand_in_stem(text.as_bytes())
+            && worth_a_stand_in(text);
+        if unnamed_category && self.count_out(true) {
+            return GUARDED_LINE.to_string();
+        }
+        self.guarded_value(sanitized)
+    }
+
+    fn count_out(&self, out: bool) -> bool {
+        if out {
+            self.guarded.set(self.guarded.get() + 1);
         }
         out
     }
@@ -3008,7 +3238,7 @@ mod json_log_spellings {
     fn wireguard_proxy(private_key: String) -> ProxyProfile {
         use base64::Engine as _;
         use base64::engine::general_purpose::STANDARD;
-        use weaver_server_core::proxies::{ProxyKind, ProxySecrets, Resolver};
+        use weaver_server_core::proxies::{ProxyKind, ProxySecrets};
 
         ProxyProfile {
             id: 1,
@@ -3017,7 +3247,6 @@ mod json_log_spellings {
             enabled: true,
             host: "fra.vpn.example".into(),
             port: 51820,
-            resolver: Resolver::Proxy,
             dns_servers: vec!["10.2.0.1".parse().unwrap()],
             tunnel_addresses: vec!["10.2.0.2/32".into()],
             peer_public_key: Some(STANDARD.encode([9u8; 32])),
@@ -3026,11 +3255,14 @@ mod json_log_spellings {
             timeout_seconds: 30,
             host_key_fingerprint: None,
             revision: 1,
+            natpmp: false,
+            forwarded_port: None,
             secrets: ProxySecrets {
                 private_key: Some(private_key),
                 preshared_key: Some(STANDARD.encode([5u8; 32])),
                 ..ProxySecrets::default()
             },
+            dns_profile_id: 0,
         }
     }
 
@@ -3093,6 +3325,75 @@ mod json_log_spellings {
         assert_eq!(
             table.sanitize_str(listening),
             "INFO DHT listening on <ip>:54180"
+        );
+    }
+
+    // A listed DNS server can be named by a TLS name and reached at a DNS
+    // over HTTPS path that names an account. Neither reaches the package,
+    // in a URL or on its own, and nor do the list's and profile's names.
+    #[test]
+    fn a_dns_servers_tls_name_and_path_are_held_like_a_proxys_host() {
+        let list = DnsServerList {
+            id: 3,
+            name: "Quad home".into(),
+            servers: vec![
+                ListedServer {
+                    address: "192.0.2.53:853".parse().unwrap(),
+                    wire: ListedWire::Tls {
+                        name: Some("dns.private.example".into()),
+                    },
+                },
+                ListedServer {
+                    address: "192.0.2.54:443".parse().unwrap(),
+                    wire: ListedWire::Https {
+                        path: "/acct-7f3k9/dns-query?key=4q8z".into(),
+                    },
+                },
+            ],
+        };
+        let profile = DnsProfile {
+            id: 5,
+            name: "Family resolver".into(),
+            who: weaver_server_core::proxies::DnsWho::Weaver,
+            transit: Some(weaver_server_core::proxies::DnsTransit::Egress),
+            trust: weaver_server_core::proxies::DnsTrust::Validate,
+            server_list_id: Some(3),
+            system_fallback: false,
+            kind: weaver_server_core::proxies::DnsProfileKind::Route,
+        };
+        let stored = StoredNames {
+            dns_lists: vec![list],
+            dns_profiles: vec![profile],
+            ..StoredNames::default()
+        };
+        let table = StandIns::build(&[], &local_unix(), &stored).expect("table");
+
+        for line in [
+            "WARN routed DNS failed server=tls://dns.private.example@192.0.2.53",
+            "WARN routed DNS failed url=https://192.0.2.54/acct-7f3k9/dns-query?key=4q8z",
+            "WARN routed DNS failed path=/acct-7f3k9/dns-query?key=4q8z",
+            "WARN routed DNS failed path=/acct-7f3k9/dns-query",
+            "INFO saved list Quad home for profile Family resolver",
+        ] {
+            let text = table.sanitize_str(line);
+            for value in [
+                "dns.private.example",
+                "acct-7f3k9",
+                "4q8z",
+                "Quad home",
+                "Family resolver",
+            ] {
+                assert!(!text.contains(value), "{value} in {text}");
+            }
+        }
+        assert!(
+            table
+                .sanitize_str("tls name dns.private.example")
+                .contains("dns-list-3/dns-1")
+        );
+        assert_eq!(
+            table.sanitize_str("WARN routed DNS failed path=/acct-7f3k9/dns-query"),
+            format!("WARN routed DNS failed path={PATH_STAND_IN}")
         );
     }
 
@@ -3159,6 +3460,8 @@ mod json_log_spellings {
             &local,
             &StoredNames::default(),
             HashSet::new(),
+            None,
+            &mut [],
         )
         .expect("a sanitized package");
 

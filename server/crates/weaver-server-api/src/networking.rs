@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use crate::{
-    auth::AdminGuard,
+    auth::{AdminGuard, ControlGuard, ReadGuard},
     observability::{refusal_error, spawn_blocking_db},
     proxies::ProxyKind,
 };
@@ -10,6 +10,13 @@ use async_graphql::{
     Context, Enum, InputObject, Object, OneofObject, Result, SimpleObject, Subscription,
 };
 use std::{sync::Arc, time::Duration};
+use weaver_server_core::categories::queries::CategoriesQueries;
+use weaver_server_core::proxies::ProxiesNetworkPersistenceQueries;
+use weaver_server_core::proxies::ProxiesPersistenceQueries;
+use weaver_server_core::rss::RssQueries;
+use weaver_server_core::servers::queries::ServersQueries;
+use weaver_server_core::settings::SettingsSchedulesQueries;
+use weaver_server_core::settings::repository::SettingsRepositoryQueries;
 use weaver_server_core::{
     Database,
     proxies::{self as core, NetworkRefusal, ProxyRuntime},
@@ -94,19 +101,28 @@ pub struct RouteInput {
     pub legs: Vec<RouteLegInput>,
     #[graphql(default)]
     pub failover: RouteFailover,
+    /// The DNS profile the route's names follow. Null or absent keeps a
+    /// saved route's profile, and is the built-in System profile, 0, for a
+    /// new one.
+    pub dns_profile_id: Option<u32>,
 }
 #[derive(Clone, PartialEq, SimpleObject)]
 #[graphql(name = "Route")]
 pub struct RouteGql {
     pub legs: Vec<RouteLegGql>,
     pub failover: RouteFailover,
+    /// The DNS profile the route's names follow; 0 is the built-in System
+    /// profile.
+    pub dns_profile_id: u32,
 }
 impl From<core::RoutingPolicy> for RouteGql {
     fn from(policy: core::RoutingPolicy) -> Self {
+        let dns_profile_id = policy.dns_profile();
         let route = policy.route();
         Self {
             legs: route.legs.into_iter().map(Into::into).collect(),
             failover: route.failover.into(),
+            dns_profile_id,
         }
     }
 }
@@ -118,10 +134,12 @@ pub(crate) fn selected_policy(
         (Some(_), Some(_)) => Err(refusal_error(NetworkRefusal::RouteAndRoutingBoth)),
         (Some(legacy), None) => Ok(Some(legacy.into())),
         (None, Some(input)) => {
+            let dns_profile_id = input.dns_profile_id;
             let route = input.route()?;
             Ok(Some(core::RoutingPolicy {
                 legs: route.legs,
                 failover: route.failover,
+                dns_profile_id,
                 ..Default::default()
             }))
         }
@@ -238,23 +256,13 @@ pub struct EgressInterfaceInput {
     pub source_address: Option<String>,
     #[graphql(default = true)]
     pub enabled: bool,
-    #[graphql(default)]
-    pub max_download_speed: u64,
-    /// The download allowance on this egress. Omitted on an update, the
-    /// saved quota stays as it is; omitted on a create, there is none.
-    pub download_quota: Option<crate::servers::types::ServerDownloadQuotaInput>,
+    /// Bytes per second; null is no limit.
+    pub download_bps: Option<u64>,
+    /// Bytes per second; null is no limit.
+    pub upload_bps: Option<u64>,
 }
 impl EgressInterfaceInput {
-    fn egress(
-        self,
-        id: u32,
-        saved_quota: weaver_server_core::servers::ServerDownloadQuotaConfig,
-    ) -> Result<core::EgressInterface> {
-        // The egress checks its own quota below, so a refusal names an egress.
-        let download_quota = match self.download_quota {
-            Some(quota) => quota.config(),
-            None => saved_quota,
-        };
+    fn egress(self, id: u32, quota: core::EgressQuota) -> Result<core::EgressInterface> {
         let binding = match self.binding_kind {
             EgressBindingKind::System => core::EgressBinding::System,
             EgressBindingKind::Interface => {
@@ -282,8 +290,9 @@ impl EgressInterfaceInput {
             name: self.name,
             binding,
             enabled: self.enabled,
-            max_download_speed: self.max_download_speed,
-            download_quota,
+            download_bps: self.download_bps,
+            upload_bps: self.upload_bps,
+            quota,
         };
         egress.validate().map_err(refusal_error)?;
         Ok(egress)
@@ -299,12 +308,11 @@ pub struct EgressInterfaceGql {
     pub source_address: Option<String>,
     pub addresses: Vec<String>,
     pub enabled: bool,
-    pub max_download_speed: u64,
-    /// The download allowance and its live usage.
-    pub download_quota: crate::servers::types::ServerDownloadQuota,
-    /// The live usage of the download allowance, or null while this Weaver
-    /// is not tracking it.
-    pub download_quota_usage: Option<crate::servers::types::DownloadQuotaUsage>,
+    pub download_bps: Option<u64>,
+    pub upload_bps: Option<u64>,
+    pub quota: EgressQuotaGql,
+    /// Null while this Weaver is not tracking usage.
+    pub quota_usage: Option<EgressQuotaUsageGql>,
     pub health: String,
     pub reason: Option<String>,
 }
@@ -322,9 +330,7 @@ fn egress_gql(
         core::EgressHealth::Up => ("UP", None),
         core::EgressHealth::Unknown => ("UNKNOWN", interfaces.error.clone()),
     };
-    let download_quota =
-        crate::servers::types::ServerDownloadQuota::from_config(&e.download_quota, usage.as_ref());
-    let download_quota_usage = usage.as_ref().map(Into::into);
+    let quota_usage = network.egress_usage(e.id).map(Into::into);
     let addresses = interfaces
         .interfaces
         .iter()
@@ -362,11 +368,223 @@ fn egress_gql(
         source_address,
         addresses,
         enabled: e.enabled,
-        max_download_speed: e.max_download_speed,
-        download_quota,
-        download_quota_usage,
+        download_bps: e.download_bps,
+        upload_bps: e.upload_bps,
+        quota: e.quota.into(),
+        quota_usage,
         health: health.into(),
         reason,
+    }
+}
+/// Bytes per second in each direction; null is no limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, SimpleObject)]
+#[graphql(name = "Bandwidth")]
+pub struct BandwidthGql {
+    pub download_bps: Option<u64>,
+    pub upload_bps: Option<u64>,
+    /// How the download limit is shared between usenet and torrents; null
+    /// is no split.
+    pub split: Option<BandwidthSplitGql>,
+}
+impl From<core::Bandwidth> for BandwidthGql {
+    fn from(value: core::Bandwidth) -> Self {
+        Self {
+            download_bps: value.download_bps,
+            upload_bps: value.upload_bps,
+            split: value.split.map(Into::into),
+        }
+    }
+}
+/// Usenet's percentage of the global download limit; torrents get the rest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, SimpleObject)]
+#[graphql(name = "BandwidthSplit")]
+pub struct BandwidthSplitGql {
+    pub usenet_pct: u8,
+}
+impl From<weaver_server_core::bandwidth::BandwidthSplit> for BandwidthSplitGql {
+    fn from(value: weaver_server_core::bandwidth::BandwidthSplit) -> Self {
+        Self {
+            usenet_pct: value.usenet_pct,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, InputObject)]
+pub struct BandwidthSplitInput {
+    pub usenet_pct: u8,
+}
+#[derive(Clone, Copy, Debug, InputObject)]
+pub struct BandwidthInput {
+    pub download_bps: Option<u64>,
+    pub upload_bps: Option<u64>,
+    /// Left out keeps the split; null clears it.
+    pub split: async_graphql::MaybeUndefined<BandwidthSplitInput>,
+}
+impl BandwidthInput {
+    fn into_bandwidth(self, stored: core::Bandwidth) -> core::Bandwidth {
+        core::Bandwidth {
+            download_bps: self.download_bps,
+            upload_bps: self.upload_bps,
+            split: match self.split {
+                async_graphql::MaybeUndefined::Undefined => stored.split,
+                async_graphql::MaybeUndefined::Null => None,
+                async_graphql::MaybeUndefined::Value(split) => {
+                    Some(weaver_server_core::bandwidth::BandwidthSplit {
+                        usenet_pct: split.usenet_pct,
+                    })
+                }
+            },
+        }
+    }
+}
+/// The usenet/torrent split as it stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, SimpleObject)]
+#[graphql(name = "BandwidthSplitState")]
+pub struct BandwidthSplitStateGql {
+    /// The operator's split.
+    pub stored: Option<BandwidthSplitGql>,
+    /// The split in force: a scheduled one over the operator's.
+    pub in_force: Option<BandwidthSplitGql>,
+    /// No global download limit is in force, so the split does nothing.
+    pub needs_download_limit: bool,
+    /// The download limit usenet is held to this tick; null is no limit.
+    pub usenet_bps: Option<u64>,
+    /// The download limit torrents are held to this tick; null is no limit.
+    pub torrent_bps: Option<u64>,
+}
+impl From<weaver_server_core::bandwidth::SplitState> for BandwidthSplitStateGql {
+    fn from(value: weaver_server_core::bandwidth::SplitState) -> Self {
+        Self {
+            stored: value.stored.map(Into::into),
+            in_force: value.in_force.map(Into::into),
+            needs_download_limit: value.cap.is_none(),
+            usenet_bps: value.rates.usenet,
+            torrent_bps: value.rates.torrent,
+        }
+    }
+}
+pub struct Networking;
+#[Object]
+impl Networking {
+    async fn bandwidth(&self, ctx: &Context<'_>) -> Result<BandwidthGql> {
+        let config = ctx.data::<weaver_server_core::settings::SharedConfig>()?;
+        Ok(config.read().await.bandwidth.into())
+    }
+    async fn bandwidth_split(&self, ctx: &Context<'_>) -> Result<BandwidthSplitStateGql> {
+        let handle = ctx.data::<weaver_server_core::SchedulerHandle>()?;
+        Ok(handle.state().bandwidth_split().into())
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+pub enum QuotaStateGql {
+    Normal,
+    Trickle,
+    Stopped,
+}
+impl From<weaver_server_core::bandwidth::QuotaState> for QuotaStateGql {
+    fn from(value: weaver_server_core::bandwidth::QuotaState) -> Self {
+        use weaver_server_core::bandwidth::QuotaState;
+        match value {
+            QuotaState::Normal => Self::Normal,
+            QuotaState::Trickle => Self::Trickle,
+            QuotaState::Stopped => Self::Stopped,
+        }
+    }
+}
+/// Caps per period; null is no cap, 0 a budget of nothing.
+#[derive(Clone, Debug, PartialEq, SimpleObject)]
+#[graphql(name = "EgressQuota")]
+pub struct EgressQuotaGql {
+    pub download_bytes: Option<u64>,
+    pub upload_soft_bytes: Option<u64>,
+    pub upload_trickle_bps: u64,
+    pub upload_hard_bytes: Option<u64>,
+    pub period: crate::servers::types::ServerDownloadQuotaPeriodGql,
+    pub reset_time_minutes_local: u16,
+    pub weekly_reset_weekday: crate::servers::types::ServerDownloadQuotaWeekdayGql,
+    pub monthly_reset_day: u8,
+}
+impl From<core::EgressQuota> for EgressQuotaGql {
+    fn from(value: core::EgressQuota) -> Self {
+        Self {
+            download_bytes: value.download_bytes,
+            upload_soft_bytes: value.upload_soft_bytes,
+            upload_trickle_bps: value.upload_trickle_bps,
+            upload_hard_bytes: value.upload_hard_bytes,
+            period: value.period.into(),
+            reset_time_minutes_local: value.reset_time_minutes_local,
+            weekly_reset_weekday: value.weekly_reset_weekday.into(),
+            monthly_reset_day: value.monthly_reset_day,
+        }
+    }
+}
+#[derive(Clone, Debug, InputObject)]
+pub struct EgressQuotaInput {
+    pub download_bytes: Option<u64>,
+    pub upload_soft_bytes: Option<u64>,
+    #[graphql(default = 2048)]
+    pub upload_trickle_bps: u64,
+    pub upload_hard_bytes: Option<u64>,
+    #[graphql(default)]
+    pub period: crate::servers::types::ServerDownloadQuotaPeriodGql,
+    #[graphql(default = 0)]
+    pub reset_time_minutes_local: u16,
+    #[graphql(default)]
+    pub weekly_reset_weekday: crate::servers::types::ServerDownloadQuotaWeekdayGql,
+    #[graphql(default = 1)]
+    pub monthly_reset_day: u8,
+}
+impl From<EgressQuotaInput> for core::EgressQuota {
+    fn from(value: EgressQuotaInput) -> Self {
+        Self {
+            download_bytes: value.download_bytes,
+            upload_soft_bytes: value.upload_soft_bytes,
+            upload_trickle_bps: value.upload_trickle_bps,
+            upload_hard_bytes: value.upload_hard_bytes,
+            period: value.period.into(),
+            reset_time_minutes_local: value.reset_time_minutes_local,
+            weekly_reset_weekday: value.weekly_reset_weekday.into(),
+            monthly_reset_day: value.monthly_reset_day,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, SimpleObject)]
+pub struct QuotaDirectionUsage {
+    pub used_bytes: u64,
+    /// Null when the direction has no cap.
+    pub remaining_bytes: Option<u64>,
+    pub state: QuotaStateGql,
+}
+impl From<weaver_server_core::servers::transfer_policy::DirectionUsage> for QuotaDirectionUsage {
+    fn from(value: weaver_server_core::servers::transfer_policy::DirectionUsage) -> Self {
+        Self {
+            used_bytes: value.used_bytes,
+            remaining_bytes: value.remaining_bytes,
+            state: value.state.into(),
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, SimpleObject)]
+pub struct EgressQuotaUsageGql {
+    pub down: QuotaDirectionUsage,
+    pub up: QuotaDirectionUsage,
+    /// The tighter of the two directions.
+    pub state: QuotaStateGql,
+    pub period_start_epoch_ms: Option<f64>,
+    pub period_end_epoch_ms: Option<f64>,
+    pub timezone_name: String,
+}
+impl From<weaver_server_core::servers::transfer_policy::EgressQuotaUsage> for EgressQuotaUsageGql {
+    fn from(value: weaver_server_core::servers::transfer_policy::EgressQuotaUsage) -> Self {
+        Self {
+            down: value.download.into(),
+            up: value.upload.into(),
+            state: value.download.state.max(value.upload.state).into(),
+            period_start_epoch_ms: value
+                .window_start
+                .map(|start| start.timestamp_millis() as f64),
+            period_end_epoch_ms: value.window_end.map(|end| end.timestamp_millis() as f64),
+            timezone_name: value.timezone,
+        }
     }
 }
 #[derive(SimpleObject)]
@@ -446,6 +664,85 @@ pub struct PathTestResult {
     pub connect_millis: f64,
     // How the host the path's final dial named was resolved.
     pub resolution: Option<HostResolution>,
+    // The test torrent over the path, when the test asked for it and the
+    // path reached its target.
+    #[graphql(name = "p2p")]
+    pub p2p: Option<P2pTestResult>,
+}
+// One step of the test torrent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+#[graphql(name = "P2pStep")]
+pub enum P2pStep {
+    // The torrent, fetched through the path.
+    Torrent,
+    // An announce to its tracker.
+    Announce,
+    // Peers dialled and answering the handshake.
+    Handshake,
+    // One piece downloaded and verified.
+    Piece,
+    // Peers able to connect in.
+    Inbound,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+#[graphql(name = "P2pRungOutcome")]
+pub enum P2pRungOutcome {
+    Passed,
+    Failed,
+    // An earlier step failed.
+    NotReached,
+}
+#[derive(SimpleObject)]
+#[graphql(name = "P2pRung")]
+pub struct P2pRung {
+    pub step: P2pStep,
+    pub outcome: P2pRungOutcome,
+    // What passed, or what stopped it, in the words of whatever did.
+    pub message: Option<String>,
+}
+#[derive(SimpleObject)]
+#[graphql(name = "P2pTestResult")]
+pub struct P2pTestResult {
+    pub rungs: Vec<P2pRung>,
+    // The port a gateway mapped to the test session's listener.
+    pub mapped_port: Option<u16>,
+    // What the test session showed trackers and peers, once it opened.
+    pub exposure: Option<crate::torrents::types::TorrentExposureGql>,
+}
+impl From<weaver_server_core::speed_test::P2pReport> for P2pTestResult {
+    fn from(report: weaver_server_core::speed_test::P2pReport) -> Self {
+        use weaver_server_core::speed_test as speed;
+        Self {
+            rungs: report
+                .rungs
+                .into_iter()
+                .map(|rung| {
+                    let (outcome, message) = match rung.outcome {
+                        speed::P2pOutcome::Passed(message) => {
+                            (P2pRungOutcome::Passed, Some(message))
+                        }
+                        speed::P2pOutcome::Failed(message) => {
+                            (P2pRungOutcome::Failed, Some(message))
+                        }
+                        speed::P2pOutcome::NotReached => (P2pRungOutcome::NotReached, None),
+                    };
+                    P2pRung {
+                        step: match rung.step {
+                            speed::P2pStep::Torrent => P2pStep::Torrent,
+                            speed::P2pStep::Announce => P2pStep::Announce,
+                            speed::P2pStep::Handshake => P2pStep::Handshake,
+                            speed::P2pStep::Piece => P2pStep::Piece,
+                            speed::P2pStep::Inbound => P2pStep::Inbound,
+                        },
+                        outcome,
+                        message,
+                    }
+                })
+                .collect(),
+            mapped_port: report.mapped_port,
+            exposure: report.exposure.map(Into::into),
+        }
+    }
 }
 // Who turned a test's host into addresses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
@@ -479,6 +776,11 @@ pub enum LookupErrorCode {
     TimedOut,
     ServerFailure,
     NoReply,
+    // The answer failed DNSSEC validation.
+    Bogus,
+    // The server returns no DNSSEC records, so nothing could be validated.
+    DnssecUnavailable,
+    TlsFailed,
     Other,
 }
 impl From<core::LookupFailure> for LookupErrorCode {
@@ -489,7 +791,31 @@ impl From<core::LookupFailure> for LookupErrorCode {
             core::LookupFailure::TimedOut => Self::TimedOut,
             core::LookupFailure::ServerFailure => Self::ServerFailure,
             core::LookupFailure::NoReply => Self::NoReply,
+            core::LookupFailure::Bogus => Self::Bogus,
+            core::LookupFailure::DnssecUnavailable => Self::DnssecUnavailable,
+            core::LookupFailure::TlsFailed => Self::TlsFailed,
             core::LookupFailure::Other => Self::Other,
+        }
+    }
+}
+// What a lookup's answer from listed servers was taken as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+pub enum LookupTrust {
+    AsSent,
+    // Weaver checked its DNSSEC signatures and they held.
+    Validated,
+    // The zone is not signed, so there was nothing to check.
+    Unsigned,
+    // Refused, as its DNSSEC signatures failed Weaver's check.
+    Bogus,
+}
+impl From<core::TrustOutcome> for LookupTrust {
+    fn from(value: core::TrustOutcome) -> Self {
+        match value {
+            core::TrustOutcome::AsSent => Self::AsSent,
+            core::TrustOutcome::Validated => Self::Validated,
+            core::TrustOutcome::Unsigned => Self::Unsigned,
+            core::TrustOutcome::Bogus => Self::Bogus,
         }
     }
 }
@@ -506,6 +832,12 @@ pub struct HostResolution {
     // The proxy that resolved it, or that Weaver asked through.
     pub proxy_id: Option<u32>,
     pub dns_servers: Vec<String>,
+    // The wire the servers were asked over, when servers were asked.
+    pub wire: Option<crate::dns::DnsWire>,
+    // The listed server whose answer was used, when one answered.
+    pub answered_by: Option<String>,
+    // What the servers' answer was taken as, when one came to judge.
+    pub trust: Option<LookupTrust>,
     pub addresses: Vec<String>,
     // The answer was held from an earlier lookup.
     pub cached: bool,
@@ -519,6 +851,9 @@ impl From<core::HostResolution> for HostResolution {
             resolved_by: value.by.into(),
             proxy_id: value.proxy,
             dns_servers: value.servers.iter().map(ToString::to_string).collect(),
+            wire: value.wire.map(Into::into),
+            answered_by: value.answered_by.map(|ip| ip.to_string()),
+            trust: value.trust.map(Into::into),
             addresses: value.addresses.iter().map(ToString::to_string).collect(),
             cached: value.cached,
             connected_address: value.connected.map(|ip| ip.to_string()),
@@ -554,6 +889,7 @@ impl From<core::PathTest> for PathTestResult {
             source_address: test.source_address.map(|s| s.to_string()),
             connect_millis: test.elapsed.as_secs_f64() * 1000.0,
             resolution: test.resolution.map(Into::into),
+            p2p: test.p2p.map(Into::into),
         }
     }
 }
@@ -571,6 +907,7 @@ fn direct_on(egress_id: u32) -> core::Route {
 async fn test_via(
     runtime: &ProxyRuntime,
     route: &core::Route,
+    dns_profile: u32,
     subject: core::TestSubject,
     target: Option<(String, u16)>,
 ) -> Result<Vec<core::PathTest>> {
@@ -582,8 +919,68 @@ async fn test_via(
                 > + Send
                 + '_,
         >,
-    > = Box::pin(runtime.network.test_via(route, subject, target));
+    > = Box::pin(
+        runtime
+            .network
+            .test_via(route, dns_profile, subject, target),
+    );
     test.await.map_err(refusal_error)
+}
+// The test torrent over every path through a route of one torrent leg.
+async fn test_via_torrent(
+    ctx: &Context<'_>,
+    runtime: &ProxyRuntime,
+    route: &core::Route,
+    dns_profile: u32,
+    subject: core::TestSubject,
+    target: Option<(String, u16)>,
+) -> Result<Vec<core::PathTest>> {
+    // A server without torrents runs no test torrent: nothing is fetched,
+    // announced or dialled.
+    ctx.data::<weaver_server_core::torrents::TorrentAvailability>()?
+        .may_test()
+        .map_err(refusal_error)?;
+    route.legs.first().ok_or("the route has no leg")?;
+    // Tests point the test torrent at a loopback source.
+    let source = ctx
+        .data_opt::<weaver_server_core::speed_test::TestTorrentSource>()
+        .cloned()
+        .unwrap_or_default();
+    let torrent = ctx
+        .data::<weaver_server_core::settings::SharedConfig>()?
+        .read()
+        .await
+        .torrent
+        .clone();
+    let allow_private_network = runtime.allow_private_network();
+    let speed_test = ctx.data::<weaver_server_core::speed_test::SpeedTestService>()?;
+    let ip_filter = speed_test.ip_filter(&torrent).await;
+    let clock = speed_test.clock();
+    let tests = {
+        let _guard = runtime.mutations.lock().await;
+        let test: std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = std::result::Result<Vec<core::PathTest>, NetworkRefusal>,
+                    > + Send
+                    + '_,
+            >,
+        > = Box::pin(runtime.network.test_via_torrent(
+            route,
+            dns_profile,
+            subject,
+            target,
+            core::P2pTest {
+                source,
+                torrent,
+                ip_filter,
+                allow_private_network,
+                clock,
+            },
+        ));
+        test.await.map_err(refusal_error)?
+    };
+    Ok(tests)
 }
 #[derive(Clone, Debug, InputObject)]
 pub struct ProxyPoolInput {
@@ -630,6 +1027,13 @@ pub enum NetworkConsumerKind {
     Rss,
     // Default outbound. There is one, so its id is ignored.
     Outbound,
+    // The torrent route every category without its own takes. There is one,
+    // so its id is ignored.
+    TorrentDefault,
+    // One category's torrent route; the id is the category's.
+    TorrentCategory,
+    // One tracker rule's torrent route; the id is the rule's.
+    TorrentTracker,
 }
 impl NetworkConsumerKind {
     pub(crate) fn consumer(self, id: u32) -> core::Consumer {
@@ -637,6 +1041,9 @@ impl NetworkConsumerKind {
             Self::Server => core::Consumer::Server(id),
             Self::Rss => core::Consumer::Rss(id),
             Self::Outbound => core::Consumer::Outbound,
+            Self::TorrentDefault => core::Consumer::Torrent(core::TorrentScope::Default),
+            Self::TorrentCategory => core::Consumer::Torrent(core::TorrentScope::Category(id)),
+            Self::TorrentTracker => core::Consumer::Torrent(core::TorrentScope::TrackerRule(id)),
         }
     }
 }
@@ -645,6 +1052,9 @@ pub struct NetworkRoute {
     pub consumer: String,
     pub legs: Vec<RouteLegGql>,
     pub failover: RouteFailover,
+    /// The DNS profile the route's names follow; 0 is the built-in System
+    /// profile.
+    pub dns_profile_id: u32,
 }
 #[derive(Clone, PartialEq, SimpleObject)]
 pub struct NetworkLegFlow {
@@ -724,6 +1134,26 @@ pub struct NetworkPoolMemberFlow {
     // What the member's open connections carry now, all together.
     pub live_bytes_per_second: u64,
 }
+// A leg that is up with nothing open or opening is idle, unless every rung
+// of its path fails at a hop: it then has nothing it can carry, and is down
+// for its first failing hop. Short of that, a leg a torrent session is
+// being built on is opening, as that session's route and torrents read.
+fn settle_unused(leg: &mut NetworkLegFlow, sessions_opening: u64) {
+    if leg.state != "UP" || leg.open != 0 || leg.opening != 0 {
+        return;
+    }
+    let failing = (!leg.rung_states.is_empty() && leg.failing_hops.len() == leg.rung_states.len())
+        .then(|| leg.failing_hops.first())
+        .flatten();
+    match failing {
+        Some(hop) => {
+            leg.reason = Some(format!("proxy {}: {}", hop.proxy_id, hop.reason));
+            leg.state = "DOWN".into();
+        }
+        None if sessions_opening > 0 => leg.state = "OPENING".into(),
+        None => leg.state = "IDLE".into(),
+    }
+}
 // One pool on one egress as its plan and members report it. Members keep
 // their id order; `rank` carries where the plan dials each one.
 fn pool_flow(
@@ -775,6 +1205,20 @@ fn pool_flow(
 pub(crate) fn flow(runtime: &ProxyRuntime) -> NetworkFlow {
     let mut legs = Vec::new();
     for route in runtime.network.live_routes() {
+        // A leg whose path cannot be used, a proxy or pool on it gone or
+        // disabled, is down for that reason, as its route reads. Read off
+        // the legs' lock: a reload takes the configuration before the legs.
+        let paths: Vec<_> = route
+            .legs
+            .read()
+            .expect("route legs")
+            .iter()
+            .map(|leg| leg.definition.path.clone())
+            .collect();
+        let unusable: Vec<_> = paths
+            .iter()
+            .map(|path| runtime.network.path_unusable(path))
+            .collect();
         let definitions = route.legs.read().expect("route legs");
         for allocation in route.weighted.allocations() {
             let Some(leg) = definitions.get(allocation.position) else {
@@ -790,7 +1234,13 @@ pub(crate) fn flow(runtime: &ProxyRuntime) -> NetworkFlow {
                 && allocation.opening == 0
                 && !rung_states.is_empty()
                 && rung_states.iter().all(|state| state == "COOLDOWN");
+            let unusable = unusable
+                .get(allocation.position)
+                .cloned()
+                .flatten()
+                .filter(|_| paths.get(allocation.position) == Some(&leg.definition.path));
             let (state, reason) = match allocation.health {
+                core::LegHealthState::Up if unusable.is_some() => ("DOWN", unusable),
                 core::LegHealthState::Up if ladder_cooling => {
                     ("DOWN", Some("every rung is cooling down".to_owned()))
                 }
@@ -807,12 +1257,7 @@ pub(crate) fn flow(runtime: &ProxyRuntime) -> NetworkFlow {
                 target: allocation.target,
                 open: allocation.open,
                 opening: allocation.opening,
-                state: if state == "UP" && allocation.open == 0 && allocation.opening == 0 {
-                    "IDLE"
-                } else {
-                    state
-                }
-                .into(),
+                state: state.into(),
                 reason: reason.or_else(|| leg.warning.clone()),
                 path: RouteLegGql::from(leg.definition.clone()).path,
                 pinned_address: leg
@@ -849,8 +1294,12 @@ pub(crate) fn flow(runtime: &ProxyRuntime) -> NetworkFlow {
     // inactive server, are part of the picture too: the operator configured
     // them, and an egress they depend on may already be missing.
     for leg in runtime.network.dormant_legs() {
+        let unusable = runtime.network.path_unusable(&leg.definition.path);
         let (state, reason) = match leg.health {
-            core::LegHealthState::Up | core::LegHealthState::Probing => ("IDLE", None),
+            core::LegHealthState::Up | core::LegHealthState::Probing if unusable.is_some() => {
+                ("DOWN", unusable)
+            }
+            core::LegHealthState::Up | core::LegHealthState::Probing => ("UP", None),
             core::LegHealthState::Down(reason) => ("DOWN", Some(reason)),
             core::LegHealthState::Blocked(reason) => ("BLOCKED", Some(reason)),
         };
@@ -873,6 +1322,22 @@ pub(crate) fn flow(runtime: &ProxyRuntime) -> NetworkFlow {
             rung_states: Vec::new(),
             failing_hops: Vec::new(),
         });
+    }
+    // A leg torrent sessions run on carries what they hold on it, whether
+    // they dial through its route or on sockets of their own. A leg that is
+    // up with nothing open or opening is idle, or opening while a session
+    // is being built on it.
+    let sessions = runtime.network.torrent_traffic();
+    for leg in &mut legs {
+        let mut sessions_opening = 0;
+        if let Some(traffic) = sessions.get(&(leg.consumer.clone(), leg.position as usize)) {
+            let (open, opening) = traffic.connections(u64::from(leg.open), u64::from(leg.opening));
+            leg.open = u16::try_from(open).unwrap_or(u16::MAX);
+            leg.opening = u16::try_from(opening).unwrap_or(u16::MAX);
+            leg.bytes_per_second += traffic.bytes_per_second;
+            sessions_opening = traffic.sessions_opening;
+        }
+        settle_unused(leg, sessions_opening);
     }
     let mut pools: Vec<_> = runtime
         .network
@@ -925,6 +1390,15 @@ pub(crate) fn flow(runtime: &ProxyRuntime) -> NetworkFlow {
                 core::Consumer::Server(id) => (NetworkConsumerKind::Server, id),
                 core::Consumer::Rss(id) => (NetworkConsumerKind::Rss, id),
                 core::Consumer::Outbound => (NetworkConsumerKind::Outbound, 0),
+                core::Consumer::Torrent(core::TorrentScope::Default) => {
+                    (NetworkConsumerKind::TorrentDefault, 0)
+                }
+                core::Consumer::Torrent(core::TorrentScope::Category(id)) => {
+                    (NetworkConsumerKind::TorrentCategory, id)
+                }
+                core::Consumer::Torrent(core::TorrentScope::TrackerRule(id)) => {
+                    (NetworkConsumerKind::TorrentTracker, id)
+                }
             };
             NetworkConsumerFlow {
                 key: consumer.key(),
@@ -958,6 +1432,10 @@ fn runtime(ctx: &Context<'_>) -> Result<Arc<ProxyRuntime>> {
 pub struct NetworkingQuery;
 #[Object]
 impl NetworkingQuery {
+    #[graphql(guard = "ReadGuard")]
+    async fn networking(&self) -> Networking {
+        Networking
+    }
     #[graphql(guard = "AdminGuard")]
     async fn egress_interfaces(&self, ctx: &Context<'_>) -> Result<Vec<EgressInterfaceGql>> {
         let runtime = runtime(ctx)?;
@@ -1013,7 +1491,7 @@ impl NetworkingQuery {
             && matches!(visible.as_slice(), [interface]
             if interface.name == "eth0" && interface.addresses.iter().any(|address|
                 matches!(address.address, std::net::IpAddr::V4(ip) if ip.is_private())));
-        let mut notes = vec!["Direct destinations and proxy endpoints use the system DNS resolver; selecting an egress does not bind those DNS lookups.".into()];
+        let mut notes = vec!["Every name a route dials is looked up as its DNS profile says. The built-in System profile uses the system DNS resolver, and selecting an egress does not bind those lookups.".into()];
         if bridge_network_suspected {
             notes.push("Only container interfaces are visible. Use host networking for host-link selection, or attach multiple container networks.".into());
         }
@@ -1041,11 +1519,13 @@ impl NetworkingQuery {
                 .await?
                 .into_iter()
                 .map(|(consumer, p)| {
+                    let dns_profile_id = p.dns_profile();
                     let r = p.route();
                     NetworkRoute {
                         consumer,
                         legs: r.legs.into_iter().map(Into::into).collect(),
                         failover: r.failover.into(),
+                        dns_profile_id,
                     }
                 })
                 .collect(),
@@ -1121,9 +1601,7 @@ impl NetworkingMutation {
         let runtime = runtime(ctx)?;
         let _guard = runtime.mutations.lock().await;
         let db = ctx.data::<Database>()?.clone();
-        let saved_quota = if input.download_quota.is_some() {
-            Default::default()
-        } else {
+        let saved_quota = {
             let db = db.clone();
             spawn_blocking_db("network.update_egress.saved_quota", move || {
                 db.list_egress_interfaces()
@@ -1131,7 +1609,7 @@ impl NetworkingMutation {
             .await?
             .into_iter()
             .find(|egress| egress.id == id)
-            .map(|egress| egress.download_quota)
+            .map(|egress| egress.quota)
             .unwrap_or_default()
         };
         let egress = input.egress(id, saved_quota)?;
@@ -1145,6 +1623,55 @@ impl NetworkingMutation {
             &runtime.network.interfaces(),
             &runtime.network,
         ))
+    }
+    #[graphql(guard = "AdminGuard")]
+    async fn set_egress_quota(
+        &self,
+        ctx: &Context<'_>,
+        id: u32,
+        input: EgressQuotaInput,
+    ) -> Result<EgressInterfaceGql> {
+        let runtime = runtime(ctx)?;
+        let _guard = runtime.mutations.lock().await;
+        let db = ctx.data::<Database>()?.clone();
+        let quota = core::EgressQuota::from(input);
+        let saved = spawn_blocking_db("network.set_egress_quota", move || {
+            let mut egress = db
+                .list_egress_interfaces()?
+                .into_iter()
+                .find(|egress| egress.id == id)
+                .ok_or(NetworkRefusal::EgressNotFound)?;
+            egress.quota = quota;
+            db.update_egress_interface(&egress)
+        })
+        .await?;
+        runtime.reload().await.map_err(async_graphql::Error::new)?;
+        Ok(egress_gql(
+            saved,
+            &runtime.network.interfaces(),
+            &runtime.network,
+        ))
+    }
+    #[graphql(guard = "ControlGuard")]
+    async fn set_bandwidth(
+        &self,
+        ctx: &Context<'_>,
+        input: BandwidthInput,
+    ) -> Result<BandwidthGql> {
+        let handle = ctx.data::<weaver_server_core::SchedulerHandle>()?;
+        let config = ctx.data::<weaver_server_core::settings::SharedConfig>()?;
+        let db = ctx.data::<Database>()?;
+        let bandwidth = input.into_bandwidth(config.read().await.bandwidth);
+        handle
+            .save_bandwidth(db, config, bandwidth)
+            .await
+            .map_err(|error| match error {
+                weaver_server_core::SchedulerError::State(error) => {
+                    crate::observability::state_error(error)
+                }
+                error => async_graphql::Error::new(error.to_string()),
+            })?;
+        Ok(bandwidth.into())
     }
     #[graphql(guard = "AdminGuard")]
     async fn delete_egress_interface(&self, ctx: &Context<'_>, id: u32) -> Result<bool> {
@@ -1228,25 +1755,37 @@ impl NetworkingMutation {
         let runtime = runtime(ctx)?;
         let _guard = runtime.mutations.lock().await;
         let db = ctx.data::<Database>()?.clone();
+        let dns_profile_id = input.dns_profile_id;
         let route = input.route()?;
         let consumer = kind.consumer(id);
         let policy = core::RoutingPolicy {
             legs: route.legs.clone(),
             failover: route.failover,
+            dns_profile_id,
             ..Default::default()
         };
-        spawn_blocking_db("network.save_route", move || {
+        let saved = spawn_blocking_db("network.save_route", move || {
             let exists = match consumer {
                 core::Consumer::Server(id) => {
                     db.list_servers()?.iter().any(|server| server.id == id)
                 }
                 core::Consumer::Rss(id) => db.get_rss_feed(id)?.is_some(),
-                core::Consumer::Outbound => true,
+                core::Consumer::Outbound | core::Consumer::Torrent(core::TorrentScope::Default) => {
+                    true
+                }
+                core::Consumer::Torrent(core::TorrentScope::Category(id)) => db
+                    .list_categories()?
+                    .iter()
+                    .any(|category| category.id == id),
+                core::Consumer::Torrent(core::TorrentScope::TrackerRule(id)) => {
+                    db.list_tracker_rules()?.iter().any(|rule| rule.id == id)
+                }
             };
             if !exists {
                 return Err(NetworkRefusal::RouteConsumerGone.into());
             }
-            db.save_proxy_routing_policy(consumer, &policy)
+            db.save_proxy_routing_policy(consumer, &policy)?;
+            db.proxy_routing_policy(consumer)
         })
         .await?;
         runtime.reload().await.map_err(async_graphql::Error::new)?;
@@ -1254,12 +1793,16 @@ impl NetworkingMutation {
             consumer: consumer.key(),
             legs: route.legs.into_iter().map(Into::into).collect(),
             failover: route.failover.into(),
+            dns_profile_id: saved.dns_profile(),
         })
     }
     // Tests every path through a drafted route, with a proxy or a pool on
     // top of it. A pool carries the target through the member it picks;
     // without a target each member is tried on its own. Nothing is dialled
     // outside the route.
+    // With `torrent`, the route is a torrent leg: each path that reaches
+    // its target, the test torrent's host when none is given, also runs the
+    // test torrent.
     #[graphql(guard = "AdminGuard")]
     async fn test_via(
         &self,
@@ -1267,8 +1810,10 @@ impl NetworkingMutation {
         route: RouteInput,
         subject: Option<TestSubjectInput>,
         target: Option<TestTargetInput>,
+        #[graphql(default = false)] torrent: bool,
     ) -> Result<Vec<PathTestResult>> {
         let runtime = runtime(ctx)?;
+        let dns_profile = route.dns_profile_id.unwrap_or(core::SYSTEM_DNS_PROFILE_ID);
         let route = route.route()?;
         let subject = match subject {
             None => core::TestSubject::Route,
@@ -1276,11 +1821,12 @@ impl NetworkingMutation {
             Some(TestSubjectInput::Pool(id)) => core::TestSubject::Pool(id),
         };
         let target = target.map(|target| (target.host, target.port));
-        Ok(test_via(&runtime, &route, subject, target)
-            .await?
-            .into_iter()
-            .map(Into::into)
-            .collect())
+        let tests = if torrent {
+            test_via_torrent(ctx, &runtime, &route, dns_profile, subject, target).await?
+        } else {
+            test_via(&runtime, &route, dns_profile, subject, target).await?
+        };
+        Ok(tests.into_iter().map(Into::into).collect())
     }
     #[graphql(
         guard = "AdminGuard",
@@ -1296,12 +1842,18 @@ impl NetworkingMutation {
     ) -> Result<EgressTestResult> {
         let runtime = runtime(ctx)?;
         let subject = proxy_id.map_or(core::TestSubject::Route, core::TestSubject::Proxy);
-        test_via(&runtime, &direct_on(id), subject, Some((host, port)))
-            .await?
-            .into_iter()
-            .next()
-            .map(Into::into)
-            .ok_or_else(|| "the test tried no path".into())
+        test_via(
+            &runtime,
+            &direct_on(id),
+            core::SYSTEM_DNS_PROFILE_ID,
+            subject,
+            Some((host, port)),
+        )
+        .await?
+        .into_iter()
+        .next()
+        .map(Into::into)
+        .ok_or_else(|| "the test tried no path".into())
     }
     #[graphql(
         guard = "AdminGuard",
@@ -1333,6 +1885,7 @@ impl NetworkingMutation {
         Ok(test_via(
             &runtime,
             &direct_on(egress_id),
+            core::SYSTEM_DNS_PROFILE_ID,
             core::TestSubject::Members(id),
             target,
         )

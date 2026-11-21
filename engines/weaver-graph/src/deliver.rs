@@ -200,12 +200,28 @@ pub enum Why {
     // never placed every member it named: its map never came, or never
     // closed what it announced.
     Unmapped,
+    // Unmapped for want of one volume the object can name: every volume is
+    // in, and the set runs on into volume `volume`, counted from zero in
+    // the set's own numbering, which never came.
+    Unfound {
+        volume: u32,
+    },
     // The object would sit deeper than a job's namespaces may nest. What
     // the member holds is the container, delivered as it is.
     TooDeep,
+    // A container below the root that is no layer of the release: its name
+    // says no archive, and files of their own stand beside it. It is a file
+    // of what the release holds, delivered as posted (`Tree::layers`).
+    Packed,
     // Recognised container rejected by structural or security validation.
     // Its posted bytes are not a usable substitute for its members.
     InvalidArchive,
+    // A volume of a set whose other volumes lie elsewhere: its namespace
+    // holds every member it will, its headers say the set has volumes it
+    // does not hold, and none of them is beside it. The tree lifts the
+    // volume, in its own file, into the namespace above, where the set's
+    // other volumes may be lifted too (`Tree::lift_scattered`).
+    Scattered,
     // Decoding it needs more memory than a decode may hold: `needed` bytes
     // against the `allowed` ceiling. Either is `None` where the decoder that
     // refused did not say it, as an allocator that failed names no ceiling.
@@ -232,7 +248,9 @@ impl Why {
             | Why::EncryptedHeader
             | Why::Compressed
             | Why::Unmapped
+            | Why::Unfound { .. }
             | Why::InvalidArchive
+            | Why::Scattered
             | Why::TooLarge { .. }
             | Why::OverMachine { .. } => true,
             Why::TailUnreachable
@@ -242,8 +260,16 @@ impl Why {
             | Why::FirstBytesLost
             | Why::HoldsBreached
             | Why::Unsupported
-            | Why::TooDeep => false,
+            | Why::TooDeep
+            | Why::Packed => false,
         }
+    }
+
+    // Whether a member refused for this reason is given back to its
+    // namespace as a file there. A scattered set's volume is not: it moves
+    // to the namespace above (`Tree::refused_written`).
+    pub fn gives_back(self) -> bool {
+        !matches!(self, Why::Scattered)
     }
 
     // Whether a store that hands its volumes to an engine for this reason
@@ -260,7 +286,7 @@ impl Why {
     // member, which is delivered as it stands, never whole.
     pub fn disclaims(self) -> bool {
         match self {
-            Why::Unsupported | Why::TooDeep => true,
+            Why::Unsupported | Why::TooDeep | Why::Packed => true,
             Why::Compressed
             | Why::TailUnreachable
             | Why::EncryptedHeader
@@ -271,7 +297,9 @@ impl Why {
             | Why::FirstBytesLost
             | Why::HoldsBreached
             | Why::Unmapped
+            | Why::Unfound { .. }
             | Why::InvalidArchive
+            | Why::Scattered
             | Why::TooLarge { .. }
             | Why::OverMachine { .. } => false,
         }
@@ -303,6 +331,13 @@ pub enum Emit {
     Checksum {
         member: MemberId,
         crc32: u32,
+    },
+    // "Member M ends at `length`, short of the length I announced it with:
+    // its checksum proved its bytes whole there." Said just before its
+    // close, which takes it as the member's length.
+    Ends {
+        member: MemberId,
+        length: u64,
     },
     // "Member M is complete."
     MemberClosed(MemberId),
@@ -369,6 +404,15 @@ pub enum Emit {
     // mine": a sibling holding there a volume it may carry lets it go to
     // me, where I claim it at that place. Said once per place.
     Wants(VolumeIndex),
+    // "I know more than I did when I was offered what no object holds": a
+    // member offered by clean bytes past the hole where its front stopped,
+    // and taken by no object then, is offered to me again. Said once per
+    // thing learned, never per delivery.
+    Learned,
+    // "My run ended on this error": its text, for the job's log, said just
+    // before what the error means. It changes nothing in the tree. The text
+    // names no path outside the job and no secret.
+    Failed(String),
 }
 
 #[cfg(test)]
@@ -382,7 +426,9 @@ mod tests {
             Why::EncryptedHeader,
             Why::Compressed,
             Why::Unmapped,
+            Why::Unfound { volume: 2 },
             Why::InvalidArchive,
+            Why::Scattered,
             Why::TooLarge {
                 needed: Some(2 << 30),
                 allowed: Some(1 << 30),
@@ -401,6 +447,7 @@ mod tests {
             Why::HoldsBreached,
             Why::Unsupported,
             Why::TooDeep,
+            Why::Packed,
         ];
         for why in withheld {
             assert!(why.withholds(), "{why:?}");
@@ -408,13 +455,14 @@ mod tests {
         for why in delivered {
             assert!(!why.withholds(), "{why:?}");
         }
-        // Only a shape the object does not implement, or an object the job
-        // never opens for its depth, leaves the member the posted file;
-        // every other refusal is its set failing.
+        // Only a shape the object does not implement, an object the job
+        // never opens for its depth, or a container below the root that is
+        // no layer, leaves the member the posted file; every other refusal
+        // is its set failing.
         for why in withheld.into_iter().chain(delivered) {
             assert_eq!(
                 why.disclaims(),
-                matches!(why, Why::Unsupported | Why::TooDeep),
+                matches!(why, Why::Unsupported | Why::TooDeep | Why::Packed),
                 "{why:?}"
             );
         }

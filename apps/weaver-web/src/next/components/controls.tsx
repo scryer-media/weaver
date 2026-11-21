@@ -339,6 +339,44 @@ export function Segmented<T extends string>({
   );
 }
 
+/* --------------------------------------------------------------- unit strip */
+
+/**
+ * The unit the number beside it is typed in: one pressed segment of a short
+ * strip, each segment the unit's own short word.
+ */
+export function UnitStrip<T extends string>({
+  options,
+  value,
+  onChange,
+}: {
+  options: readonly { value: T; label: string }[];
+  value: T;
+  onChange: (next: T) => void;
+}) {
+  return (
+    <div className="flex border border-wv-control bg-wv-input">
+      {options.map((option, index) => (
+        <button
+          key={option.value}
+          type="button"
+          aria-pressed={value === option.value}
+          onClick={() => onChange(option.value)}
+          className={cn(
+            "flex h-8 cursor-pointer items-center px-[13px] font-wv-mono text-[12px]",
+            index > 0 && "border-l border-wv-control",
+            value === option.value
+              ? "bg-wv-segment-active font-medium text-wv-strong"
+              : "text-wv-muted hover:text-wv-strong",
+          )}
+        >
+          {option.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 /* ------------------------------------------------------------------- select */
 
 /**
@@ -359,12 +397,15 @@ export function Select<T extends string>({
   className,
   menuClassName,
   disabled = false,
+  placeholder,
   testId,
 }: {
   value: T;
   options: readonly { value: T; label: string; icon?: ReactNode }[];
   onChange: (next: T) => void;
   label: string;
+  /** What the trigger says while the value is none of the options. */
+  placeholder?: string;
   /** Shown before the current choice, for a control without a visible label. */
   icon?: IconName;
   className?: string;
@@ -397,9 +438,9 @@ export function Select<T extends string>({
         {current?.icon}
         <span
           data-testid={testId === undefined ? undefined : testIds.selected(testId, value)}
-          className="min-w-0 flex-1 truncate text-left"
+          className={cn("min-w-0 flex-1 truncate text-left", !current && placeholder && "text-wv-muted")}
         >
-          {current?.label ?? value}
+          {current?.label ?? placeholder ?? value}
         </span>
         <Icon name="dropdown" size={13} className="flex-none text-wv-muted" />
       </button>

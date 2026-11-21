@@ -24,9 +24,11 @@ fn each_resolver_says_why_in_its_own_words() {
             "No such host is known. (os error 11001)",
             LookupFailure::NoSuchName,
         ),
+        // The tunnel's resolver says this of every answer without an
+        // address, so it names no cause.
         (
             "the tunnel's DNS server does not know this name",
-            LookupFailure::NoSuchName,
+            LookupFailure::Other,
         ),
         (
             "failed to lookup address information: No address associated with hostname",
@@ -65,13 +67,23 @@ async fn the_first_note_of_each_kind_stands() {
     let recording = Arc::new(Recording::default());
     recording
         .scope(async {
-            asking("Name.Test.", || Asker::servers(&[ip("192.0.2.53")]));
+            asking("Name.Test.", || {
+                Asker::servers(&[DnsServer::plain(ip("192.0.2.53"))], Trust::AsSent)
+            });
             asking("name.test", Asker::host);
             cached("name.test", false);
             cached("name.test", true);
             found("name.test", &[ip("192.0.2.1"), ip("192.0.2.2")]);
             failed("name.test", LookupFailure::Other, || "later".into());
             connected("name.test", ip("192.0.2.2"));
+            let first = DnsServer::plain(ip("192.0.2.53"));
+            answered(
+                "name.test",
+                Some(Answerer::of(&first)),
+                TrustOutcome::AsSent,
+            );
+            let later = DnsServer::plain(ip("192.0.2.54"));
+            answered("name.test", Some(Answerer::of(&later)), TrustOutcome::Bogus);
         })
         .await;
     assert_eq!(
@@ -81,6 +93,9 @@ async fn the_first_note_of_each_kind_stands() {
             by: ResolvedBy::Servers,
             proxy: None,
             servers: vec![ip("192.0.2.53")],
+            wire: Some(WireKind::Plain),
+            answered_by: Some(ip("192.0.2.53")),
+            trust: Some(TrustOutcome::AsSent),
             addresses: vec![ip("192.0.2.1"), ip("192.0.2.2")],
             cached: false,
             connected: Some(ip("192.0.2.2")),
@@ -113,6 +128,9 @@ async fn a_recording_is_carried_and_adopts_notes_without_overriding_its_own() {
             by: ResolvedBy::Proxy,
             proxy: Some(7),
             servers: Vec::new(),
+            wire: None,
+            answered_by: None,
+            trust: None,
             addresses: Vec::new(),
             cached: true,
             connected: Some(ip("192.0.2.7")),
@@ -132,7 +150,11 @@ async fn a_recording_is_carried_and_adopts_notes_without_overriding_its_own() {
 async fn a_lookup_still_out_when_the_dial_ended_ran_out_of_time() {
     let recording = Arc::new(Recording::default());
     recording
-        .scope(async { asking("slow.test", || Asker::proxy_servers(4, &[ip("192.0.2.53")])) })
+        .scope(async {
+            asking("slow.test", || {
+                Asker::proxy_servers(4, &[DnsServer::plain(ip("192.0.2.53"))], Trust::AsSent)
+            })
+        })
         .await;
     let resolution = recording.finish("slow.test", 80, None).unwrap();
     assert_eq!(resolution.by, ResolvedBy::ProxyServers);
@@ -220,7 +242,9 @@ async fn a_held_answer_is_noted_as_held_and_a_held_negative_says_what_kind() {
     let second = Arc::new(Recording::default());
     second
         .scope(async {
-            asking("gone.test", || Asker::servers(&[ip("192.0.2.53")]));
+            asking("gone.test", || {
+                Asker::servers(&[DnsServer::plain(ip("192.0.2.53"))], Trust::AsSent)
+            });
             cache
                 .resolve(Resolver::Routed, "gone.test", negative)
                 .await
@@ -236,4 +260,105 @@ async fn a_held_answer_is_noted_as_held_and_a_held_negative_says_what_kind() {
             detail: "NXDOMAIN".into(),
         })
     );
+}
+
+// A lookup judges its answer whatever the naming's trust, so one that
+// failed under As sent claims no trust, as under Validate.
+#[tokio::test]
+async fn a_failed_lookup_claims_no_trust_under_any_naming() {
+    for trust in [Trust::AsSent, Trust::Validate] {
+        let recording = Arc::new(Recording::default());
+        recording
+            .scope(async {
+                asking("down.test", || {
+                    Asker::servers(&[DnsServer::plain(ip("192.0.2.53"))], trust)
+                });
+                failed("down.test", LookupFailure::ServerFailure, || {
+                    "192.0.2.53: SERVFAIL".into()
+                });
+            })
+            .await;
+        let resolution = recording.finish("down.test", 80, None).unwrap();
+        assert_eq!(resolution.trust, None, "{trust:?}");
+        assert_eq!(resolution.answered_by, None, "{trust:?}");
+        assert_eq!(resolution.wire, Some(WireKind::Plain), "{trust:?}");
+    }
+}
+
+// A tunnel's own resolver gives the same words for a name that does not
+// exist, a server failure and silence, so its failure names no cause, and
+// says so; any other words it gives are read as usual.
+#[tokio::test]
+async fn a_tunnel_resolver_failure_names_no_cause_it_cannot_tell() {
+    let recording = Arc::new(Recording::default());
+    recording
+        .scope(async {
+            tunnel_failed(
+                "gone.test",
+                "the tunnel's DNS server does not know this name",
+            );
+            tunnel_failed(
+                "late.test",
+                "the tunnel's DNS server did not answer in time",
+            );
+        })
+        .await;
+    let error = |host| {
+        recording.names.lock().unwrap()[host]
+            .answer
+            .clone()
+            .unwrap()
+            .unwrap_err()
+    };
+    assert_eq!(
+        error("gone.test"),
+        LookupError {
+            failure: LookupFailure::Other,
+            detail: TUNNEL_NO_ADDRESS_SAID.into(),
+        }
+    );
+    assert_eq!(error("late.test").failure, LookupFailure::TimedOut);
+}
+
+// A caller that finds an answer held, or joins the lookup that asks, names
+// the server that gave it, as the lookup itself does.
+#[tokio::test]
+async fn a_held_answer_names_the_server_that_gave_it() {
+    let cache = ResolutionCache::<std::io::Error>::default();
+    let server = DnsServer::plain(ip("192.0.2.54"));
+    let answered = || async {
+        (
+            Ok(Lookup {
+                addresses: vec![ip("192.0.2.1")],
+                ttl: Ttl::Seconds(30),
+                nonexistent: false,
+            }),
+            crate::resolution::Account {
+                judged: Some(TrustOutcome::AsSent),
+                failure: None,
+                from: Some(Answerer::of(&server)),
+            },
+        )
+    };
+    for held in [false, true] {
+        let recording = Arc::new(Recording::default());
+        recording
+            .scope(async {
+                asking("held.test", || {
+                    Asker::servers(
+                        &[DnsServer::plain(ip("192.0.2.53")), server.clone()],
+                        Trust::AsSent,
+                    )
+                });
+                cache
+                    .resolve_accounted(Resolver::Routed, "held.test", answered)
+                    .await
+                    .unwrap()
+            })
+            .await;
+        let resolution = recording.finish("held.test", 80, None).unwrap();
+        assert_eq!(resolution.cached, held);
+        assert_eq!(resolution.answered_by, Some(ip("192.0.2.54")));
+        assert_eq!(resolution.trust, Some(TrustOutcome::AsSent));
+    }
 }

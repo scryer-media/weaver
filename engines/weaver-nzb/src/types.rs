@@ -77,13 +77,9 @@ impl NzbFile {
         let subject = &self.subject;
 
         // Strategy 1: extract from double-quoted string (most common Usenet pattern).
-        if let Some(start) = subject.find('"')
-            && let Some(end) = subject[start + 1..].find('"')
-        {
-            let name = &subject[start + 1..start + 1 + end];
-            if !name.is_empty() {
-                return Some(name);
-            }
+        // The same quote rule as `extract_filename`.
+        if let Some(name) = crate::deobfuscate::quoted_name(subject) {
+            return Some(name);
         }
 
         // Strategy 2: grab the last filename-like token before yEnc or (N/N).
@@ -101,11 +97,11 @@ impl NzbFile {
             return None;
         }
 
-        // Take the last whitespace-delimited token if it looks like a filename (has a dot).
-        let last_token = trimmed
-            .rsplit_once(char::is_whitespace)
-            .map_or(trimmed, |(_, t)| t);
-        if last_token.contains('.') && !last_token.is_empty() {
+        // Take the last word if it looks like a filename (has a dot). An
+        // unpaired quote splits words and is never part of one.
+        if let Some(last_token) = crate::deobfuscate::last_word(trimmed)
+            && last_token.contains('.')
+        {
             return Some(last_token);
         }
 

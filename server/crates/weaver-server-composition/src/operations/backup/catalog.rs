@@ -1,0 +1,227 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+use std::collections::BTreeSet;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackupTableClassification {
+    Export,
+    ResetOnRestore,
+    Rebuild,
+    Ignore,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BackupTableCatalogEntry {
+    pub table: &'static str,
+    pub classification: BackupTableClassification,
+    pub restore_target_policy: RestoreTargetPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RestoreTargetPolicy {
+    Replace,
+    RequireEmpty,
+    RequireZeroUsage,
+}
+
+macro_rules! table {
+    ($name:literal, $classification:ident, $restore_target_policy:ident) => {
+        BackupTableCatalogEntry {
+            table: $name,
+            classification: BackupTableClassification::$classification,
+            restore_target_policy: RestoreTargetPolicy::$restore_target_policy,
+        }
+    };
+}
+
+// Exhaustive policy for every application-owned table. Database engine tables
+// such as `sqlite_sequence` are filtered before catalog validation.
+pub(crate) const BACKUP_TABLE_CATALOG: &[BackupTableCatalogEntry] = &[
+    table!("_sqlx_migrations", Ignore, Replace),
+    table!("schema_version", Ignore, Replace),
+    table!("weaver_internal_metadata", Ignore, Replace),
+    table!("settings", Export, Replace),
+    table!("servers", Export, Replace),
+    table!("proxy_profiles", Export, RequireEmpty),
+    table!("proxy_routes", Export, RequireEmpty),
+    table!("egress_interfaces", Export, Replace),
+    // Background HTTP requests also count toward egress usage on a fresh
+    // instance. Job state and NNTP usage below guard against replacing downloads.
+    table!("egress_download_usage", Export, Replace),
+    table!("network_bandwidth", Export, Replace),
+    table!("proxy_pools", Export, RequireEmpty),
+    // The DNS presets the routes name, restored with them.
+    table!("dns_server_lists", Export, RequireEmpty),
+    table!("dns_profiles", Export, RequireEmpty),
+    table!("server_download_usage", Export, RequireZeroUsage),
+    table!("server_tls_diagnostics", Export, Replace),
+    // Data used per day is history a person keeps across a move.
+    table!("usage_daily", Export, Replace),
+    // The removed servers whose rows usage_daily still keeps, with them.
+    table!("usage_removed_servers", Export, Replace),
+    table!("categories", Export, Replace),
+    // Tracker rules are configuration. The torrents that matched one are
+    // reset on restore and match the rules again when added.
+    table!("tracker_rules", Export, Replace),
+    table!("api_keys", Export, RequireEmpty),
+    table!("auth_credentials", Export, Replace),
+    // Restoring configuration must never resurrect browser authority.
+    table!("browser_session_verifications", ResetOnRestore, Replace),
+    table!("browser_sessions", ResetOnRestore, Replace),
+    table!("bandwidth_usage_minute_buckets", Export, RequireEmpty),
+    table!("rss_feeds", Export, RequireEmpty),
+    table!("rss_rules", Export, RequireEmpty),
+    table!("rss_seen_items", Export, RequireEmpty),
+    table!("job_history", Export, RequireEmpty),
+    table!("job_history_attributes", Export, RequireEmpty),
+    table!("job_events", Export, RequireEmpty),
+    // A history job keeps its tags across a move; a queued job does not
+    // come back, so neither do its tags. Every tag made comes back.
+    table!("job_tags", Export, RequireEmpty),
+    table!("tags", Export, Replace),
+    // The record of the files a history entry's archive took travels with
+    // the entry.
+    table!("job_history_archived_files", Export, RequireEmpty),
+    // The files a torrent's history entry lists for its archive travel with
+    // the entry.
+    table!("job_history_files", Export, RequireEmpty),
+    // Finished jobs' stored NZBs travel with their history; an active job's
+    // goes with the rest of its active rows.
+    table!("job_nzbs", Export, RequireEmpty),
+    // Execution queues and output caches cannot be resumed from a logical
+    // configuration backup. History keeps its result excerpts.
+    table!("script_event_queue", ResetOnRestore, RequireEmpty),
+    table!("script_job_state", ResetOnRestore, RequireEmpty),
+    table!("script_outputs", ResetOnRestore, Replace),
+    table!("script_output_state", Rebuild, Replace),
+    // An instance is configuration: the script it names, its trigger, and
+    // what the operator typed into it.
+    table!("script_instances", Export, Replace),
+    // Named secrets travel encrypted, under the same key as every other
+    // credential in the bundle.
+    table!("secrets", Export, Replace),
+    table!("script_instance_inputs", Export, Replace),
+    table!("script_instance_categories", Export, Replace),
+    table!("feed_scripts", Export, RequireEmpty),
+    table!("duplicate_job_snapshots", Export, RequireEmpty),
+    table!("job_fingerprints", Export, RequireEmpty),
+    table!("duplicate_admission_claims", Export, RequireEmpty),
+    table!("submission_idempotency", Export, RequireEmpty),
+    table!("forgotten_duplicate_identities", Export, RequireEmpty),
+    table!("semantic_duplicate_groups", Export, RequireEmpty),
+    table!("semantic_duplicate_candidates", Export, RequireEmpty),
+    table!("duplicate_backfill_state", Rebuild, Replace),
+    table!("active_jobs", ResetOnRestore, RequireEmpty),
+    table!("active_file_progress", ResetOnRestore, RequireEmpty),
+    table!("active_files", ResetOnRestore, RequireEmpty),
+    table!("active_extracted", ResetOnRestore, RequireEmpty),
+    table!("active_detected_archives", ResetOnRestore, RequireEmpty),
+    table!("active_file_identities", ResetOnRestore, RequireEmpty),
+    table!("active_job_outlines", ResetOnRestore, RequireEmpty),
+    // Direct-store coverage is claimed against working-directory destination
+    // files that a database restore does not restore, so the claim must be
+    // discarded with every other `active_*` table. `Export`
+    // would be actively wrong here.
+    // A graph checkpoint describes bytes in the working directory, which a
+    // database restore does not bring back, so it goes with the other
+    // `active_*` rows.
+    table!("graph_nodes", ResetOnRestore, RequireEmpty),
+    table!("graph_members", ResetOnRestore, RequireEmpty),
+    table!("graph_coverage", ResetOnRestore, RequireEmpty),
+    table!("graph_envelopes", ResetOnRestore, RequireEmpty),
+    table!("graph_crypt", ResetOnRestore, RequireEmpty),
+    table!("graph_recovery", ResetOnRestore, RequireEmpty),
+    table!("graph_holds", ResetOnRestore, RequireEmpty),
+    // A torrent's rows describe its files in storage, which a database
+    // restore does not bring back.
+    table!("torrents", ResetOnRestore, RequireEmpty),
+    table!("torrent_trackers", ResetOnRestore, RequireEmpty),
+    table!("torrent_counters", ResetOnRestore, RequireEmpty),
+    table!("torrent_held_paths", ResetOnRestore, RequireEmpty),
+    table!("torrent_file_stamps", ResetOnRestore, RequireEmpty),
+    // The hosts torrents have announced to outlive the torrents, and a
+    // restore brings them back with the tracker rules picked from them.
+    table!("tracker_hosts", Export, Replace),
+    table!("graph_facts_parts", ResetOnRestore, RequireEmpty),
+    table!("graph_held_parts", ResetOnRestore, RequireEmpty),
+    table!("integration_events", ResetOnRestore, Replace),
+    table!("metrics_history_chunks", ResetOnRestore, Replace),
+    table!("async_operations", ResetOnRestore, Replace),
+    table!("async_operation_targets", ResetOnRestore, Replace),
+];
+
+pub(crate) fn is_optional_catalog_table(table: &str) -> bool {
+    table == "weaver_internal_metadata"
+}
+
+pub fn catalog_tables(classifications: &[BackupTableClassification]) -> BTreeSet<String> {
+    BACKUP_TABLE_CATALOG
+        .iter()
+        .filter(|entry| classifications.contains(&entry.classification))
+        .map(|entry| entry.table.to_string())
+        .collect()
+}
+
+pub(crate) fn export_query(table: &str, columns: &[String]) -> String {
+    let quoted = quote_identifier(table);
+    let projection = columns
+        .iter()
+        .map(|column| export_column(table, column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let predicate = match table {
+        "settings" => "key <> 'nzbget.scheduled_resume_at'",
+        "job_history_attributes"
+        | "job_events"
+        | "job_tags"
+        | "job_nzbs"
+        | "job_history_archived_files"
+        | "job_history_files" => "job_id IN (SELECT job_id FROM job_history)",
+        "duplicate_job_snapshots" => "lifecycle IN ('succeeded', 'failed', 'cancelled')",
+        "job_fingerprints" | "duplicate_admission_claims" | "submission_idempotency" => {
+            "job_id IN (
+                SELECT job_id FROM duplicate_job_snapshots
+                 WHERE lifecycle IN ('succeeded', 'failed', 'cancelled')
+             )"
+        }
+        "semantic_duplicate_candidates" => {
+            "candidate_state IN ('active', 'nonblocking', 'suppressed')
+             AND job_id IN (
+                SELECT job_id FROM duplicate_job_snapshots
+                 WHERE lifecycle IN ('succeeded', 'failed', 'cancelled')
+             )"
+        }
+        "semantic_duplicate_groups" => {
+            "group_id IN (
+                SELECT group_id FROM semantic_duplicate_candidates
+                 WHERE candidate_state IN ('active', 'nonblocking', 'suppressed')
+                   AND job_id IN (
+                    SELECT job_id FROM duplicate_job_snapshots
+                     WHERE lifecycle IN ('succeeded', 'failed', 'cancelled')
+                 )
+             )"
+        }
+        _ => return format!("SELECT {projection} FROM {quoted}"),
+    };
+    format!("SELECT {projection} FROM {quoted} WHERE {predicate}")
+}
+
+fn export_column(table: &str, column: &str) -> String {
+    let quoted = quote_identifier(column);
+    match (table, column) {
+        ("rss_seen_items", "job_id") => format!(
+            "CASE WHEN {quoted} IN (SELECT job_id FROM job_history)
+                  THEN {quoted} ELSE NULL END AS {quoted}"
+        ),
+        _ => quoted,
+    }
+}
+
+pub(crate) fn quote_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+pub(crate) fn is_engine_internal_table(table: &str) -> bool {
+    table.starts_with("sqlite_")
+}

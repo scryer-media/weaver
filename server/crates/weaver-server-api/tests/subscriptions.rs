@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use weaver_server_core::history::queries::HistoryQueries;
 mod common;
 
 use std::time::Duration;
@@ -461,6 +462,81 @@ async fn system_metrics_updates_emit_metrics_and_global_state() {
         third_data["systemMetricsUpdates"]["globalState"]["isPaused"]
             .as_bool()
             .unwrap()
+    );
+}
+
+// A disk figure moving reaches the live metrics and pushes no queue page;
+// which job waits on which disk moving pushes the page.
+#[tokio::test(start_paused = true)]
+async fn a_disk_figure_reaches_the_metrics_and_not_the_queue_page() {
+    use weaver_server_core::JobId;
+    let h = TestHarness::new().await;
+    let held = h.submit_test_nzb("held-by-disk").await;
+    let other = h.submit_test_nzb("writing-out").await;
+    h.shared_state
+        .mark_disk_for_test("/mnt/nas", 28 << 20, 240 << 20, true, &[JobId(held)], &[]);
+
+    let mut metrics = h.schema.execute_stream(
+        Request::new(
+            "subscription { systemMetricsUpdates { globalState { downloadBlock { \
+               diskVolumes { label slow writeRateBytesPerSec waitingBytes } } } } }",
+        )
+        .data(CallerScope::Read),
+    );
+    let mut pages = h.schema.execute_stream(
+        Request::new(
+            "subscription { queuePageUpdates(input: { pageIndex: 0, pageSize: 10 }) { \
+               items { id diskWrite { volume slow draining } } } }",
+        )
+        .data(CallerScope::Read),
+    );
+    let volumes = |response: async_graphql::Response| {
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        response.data.into_json().unwrap()["systemMetricsUpdates"]["globalState"]
+            ["downloadBlock"]["diskVolumes"]
+            .clone()
+    };
+    let disk_writes = |response: async_graphql::Response| {
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        let mut items = response.data.into_json().unwrap()["queuePageUpdates"]["items"]
+            .as_array()
+            .unwrap()
+            .clone();
+        items.sort_by_key(|item| item["id"].as_u64());
+        items
+            .into_iter()
+            .map(|item| item["diskWrite"].clone())
+            .collect::<Vec<_>>()
+    };
+    let nas =
+        |slow: bool| serde_json::json!({ "volume": "/mnt/nas", "slow": slow, "draining": !slow });
+
+    assert_eq!(
+        volumes(metrics.next().await.unwrap()),
+        serde_json::json!([{ "label": "/mnt/nas", "slow": true,
+            "writeRateBytesPerSec": 28 << 20, "waitingBytes": 240 << 20 }])
+    );
+    assert_eq!(
+        disk_writes(pages.next().await.unwrap()),
+        [nas(true), serde_json::Value::Null]
+    );
+
+    // Only the figures move.
+    h.shared_state
+        .mark_disk_for_test("/mnt/nas", 9 << 20, 300 << 20, true, &[JobId(held)], &[]);
+    assert_eq!(
+        volumes(metrics.next().await.unwrap()),
+        serde_json::json!([{ "label": "/mnt/nas", "slow": true,
+            "writeRateBytesPerSec": 9 << 20, "waitingBytes": 300 << 20 }])
+    );
+    // Which job waits on which disk moves: the page is sent, and it is the
+    // first page since the last, so none was sent for the figures alone.
+    h.shared_state
+        .mark_disk_for_test("/mnt/nas", 9 << 20, 300 << 20, false, &[], &[JobId(other)]);
+    assert_eq!(
+        disk_writes(pages.next().await.unwrap()),
+        [serde_json::Value::Null, nas(false)],
+        "the first page after the figures moved is the one for the move"
     );
 }
 

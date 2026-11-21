@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use par2_rs::checksum::md5;
 use par2_rs::{FileId, Packet, Par2FileSet};
 use serde::{Deserialize, Serialize};
-use weaver_graph::recovery::RepairOutcome;
+use weaver_graph::recovery::{RepairOutcome, UnboundReason};
 use weaver_graph::{ByteRange, Coverage, MemberId, Sealed, Seek, VolumeIndex, Weight};
 
 use super::facts::Packets;
@@ -97,13 +97,20 @@ impl SetState {
         true
     }
 
+    // A verdict was on the index it ruled over: one that rules alike, as
+    // when a packet that changes no file, slice or checksum arrives (a
+    // creator packet, say), keeps it. Ruling again would read back what
+    // the repair already wrote and find nothing damaged.
     pub(super) fn rebuild(&mut self, output_limit: u64) {
-        self.index = index_of(&self.packets.get().0, output_limit);
+        let index = index_of(&self.packets.get().0, output_limit);
+        if !rules_alike(self.index.as_ref(), index.as_ref()) {
+            self.last = None;
+        }
+        self.index = index;
         self.whole = whole_of(self.index.as_ref());
         self.alike = alike_of(self.index.as_ref());
         self.fronts = fronts_of(self.index.as_ref());
         self.index_changed();
-        self.last = None;
     }
 
     // Readiness is a property of metadata, never work for a dispatch query.
@@ -182,6 +189,29 @@ impl SetState {
 
     pub(super) fn members(&self) -> &BTreeMap<FileId, MemberId> {
         &self.members
+    }
+
+    // Why the set bound no member, when it bound none. With no index, a
+    // main packet among its packets is an index that did not build, and
+    // none is an index that never came.
+    pub(super) fn unbound(&self) -> Option<UnboundReason> {
+        if !self.members.is_empty() {
+            return None;
+        }
+        Some(match &self.index {
+            Some(_) if self.described => UnboundReason::Unmatched,
+            Some(_) => UnboundReason::Undescribed,
+            None if self
+                .packets
+                .get()
+                .0
+                .iter()
+                .any(|packet| matches!(packet, Packet::Main(_))) =>
+            {
+                UnboundReason::Unreadable
+            }
+            None => UnboundReason::Undescribed,
+        })
     }
 
     // A verdict was on the members bound then and the unnamed ones it read;
@@ -395,6 +425,31 @@ fn index_of(packets: &[Packet], output_limit: u64) -> Option<Par2FileSet> {
     Par2FileSet::from_packets(packets.to_vec())
         .ok()
         .filter(|set| validate_par2_geometry(set, output_limit).is_ok())
+}
+
+// Whether a repair over either index rules the same: the same files, by
+// the same descriptions, cut into the same slices with the same checksums.
+// Recovery blocks are not in it; a set counts those apart.
+fn rules_alike(before: Option<&Par2FileSet>, after: Option<&Par2FileSet>) -> bool {
+    let (Some(before), Some(after)) = (before, after) else {
+        return before.is_none() && after.is_none();
+    };
+    before.recovery_set_id == after.recovery_set_id
+        && before.slice_size == after.slice_size
+        && before.recovery_file_ids == after.recovery_file_ids
+        && before.non_recovery_file_ids == after.non_recovery_file_ids
+        && before.slice_checksums == after.slice_checksums
+        && before.files.len() == after.files.len()
+        && before.files.iter().all(|(id, was)| {
+            after.files.get(id).is_some_and(|now| {
+                was.file_id == now.file_id
+                    && was.hash_full == now.hash_full
+                    && was.hash_16k == now.hash_16k
+                    && was.length == now.length
+                    && was.par2_name == now.par2_name
+                    && was.filename == now.filename
+            })
+        })
 }
 
 fn whole_of(index: Option<&Par2FileSet>) -> BTreeMap<FileId, u32> {

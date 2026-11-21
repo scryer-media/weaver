@@ -38,8 +38,8 @@ export const nextRouter = createBrowserRouter(
           ...lazyRoute(() => import("./pages/JobDetailPage"), "JobDetailPage"),
         },
         {
-          path: "monitoring",
-          ...lazyRoute(() => import("./pages/MonitoringPage"), "MonitoringPage"),
+          path: "monitoring/:dashboard?",
+          ...lazyRoute(() => import("./pages/monitoring/dashboards"), "MonitoringRoute"),
         },
         {
           path: "system-info",
@@ -47,9 +47,10 @@ export const nextRouter = createBrowserRouter(
         },
         { path: "logs", ...lazyRoute(() => import("./pages/LogsPage"), "LogsPage") },
         {
-          path: "tools/nzb-analyzer",
-          ...lazyRoute(() => import("./pages/NzbAnalyzerPage"), "NzbAnalyzerPage"),
+          path: "tools/analyzer",
+          ...lazyRoute(() => import("./pages/AnalyzerPage"), "AnalyzerPage"),
         },
+        { path: "tools/nzb-analyzer", element: <Navigate to="/tools/analyzer" replace /> },
         {
           path: "settings",
           children: [

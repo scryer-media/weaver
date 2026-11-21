@@ -35,7 +35,9 @@ impl Object for Front {
             self.announced = true;
             out.push(Emit::Member {
                 member: MemberId(0),
-                name: "inner.bin".into(),
+                // A name that says an archive: it opens as its bytes come
+                // (`Tree::opens_as_layer`).
+                name: "inner.rar".into(),
                 length: None,
             });
         }

@@ -33,7 +33,7 @@ jobs:
       rust: ${{ steps.scope.outputs.rust }}
       web: ${{ steps.scope.outputs.web }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
       - id: scope
@@ -132,7 +132,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Setup Node
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
@@ -149,7 +149,7 @@ jobs:
       - name: Verify static output
         run: test -f apps/weaver-web/dist/index.html
       - name: Upload web artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ${{ env.WEB_ARTIFACT_NAME }}
           path: apps/weaver-web/dist
@@ -164,11 +164,11 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           cache-bin: false
       - name: Check formatting
@@ -188,7 +188,7 @@ jobs:
       SCCACHE_IDLE_TIMEOUT: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install sccache
@@ -203,7 +203,7 @@ jobs:
           access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
           secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
           key-prefix: weaver/trusted-release/v1/rust-1.97.1/x86_64-unknown-linux-gnu/
-      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2
+      - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2
         with:
           tool: cargo-audit
       - name: Run cargo audit
@@ -225,7 +225,7 @@ jobs:
       SCCACHE_IDLE_TIMEOUT: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
@@ -233,7 +233,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y nasm
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           cache-bin: false
       - name: Install sccache
@@ -249,22 +249,80 @@ jobs:
           secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
           key-prefix: weaver/trusted-release/v1/rust-1.97.1/x86_64-unknown-linux-gnu/
       - name: Download embedded web artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: ${{ env.WEB_ARTIFACT_NAME }}
           path: apps/weaver-web/dist
       - name: Run clippy
         run: cargo clippy --workspace --locked --lib --bins --tests --examples --benches -- -D warnings
+      - name: Run clippy on the pure-Rust DNSSEC backend
+        run: |
+          cargo clippy --locked -p weaver-dnssec --all-targets --no-default-features --features rust-crypto,test-support -- -D warnings
+          cargo clippy --locked -p weaver-dnssec --all-targets --features rust-crypto,test-support -- -D warnings
+      - name: Cache the dylint tools
+        id: dylint-tools
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/bin/cargo-dylint
+            ~/.cargo/bin/dylint-link
+          key: dylint-tools-v1-6.3.2-${{ runner.os }}
+      - name: Install the host name lookup lint's nightly
+        run: rustup toolchain install nightly-2026-08-20 --profile minimal --component llvm-tools-preview,rustc-dev
+      - name: Install the dylint tools
+        if: ${{ steps.dylint-tools.outputs.cache-hit != 'true' }}
+        run: |
+          cargo install --locked cargo-dylint --version 6.3.2
+          cargo install --locked dylint-link --version 6.3.2
+      - name: Run the host name lookup lint
+        env:
+          RUSTC_WRAPPER: ""
+        run: cargo dylint --path lints/host_name_lookup --workspace -- --locked --lib --bins --tests --examples --benches
       - name: Show trusted tag sccache stats
         if: ${{ always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         run: sccache --show-stats || true
 
-  rust-test:
-    name: rust-test
-    if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.web-build.result == 'success' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
+  # The test suite runs one crate per runner, on Linux and on Windows. The
+  # crate list is read from the workspace, so a new member is tested without a
+  # workflow edit and none can fall out of CI.
+  rust-test-crates:
+    name: rust-test-crates
+    needs: [changes, verify-release-tag]
+    if: ${{ always() && needs.changes.outputs.rust == 'true' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      crates: ${{ steps.crates.outputs.crates }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: List workspace crates
+        id: crates
+        run: |
+          set -euo pipefail
+          # A crate tested alone does not get the features other members'
+          # dev-dependencies turn on in a workspace run. Every crate that
+          # declares `test-support` is tested with it, as the workspace run
+          # tests it, so the per-crate runners run the same tests.
+          crates="$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -c '[.packages[] | {crate: .name, features: (if .features["test-support"] then "test-support" else "" end)}] | sort_by(.crate)')"
+          count="$(jq length <<<"$crates")"
+          test "$count" -gt 0
+          echo "Testing $count crates: $crates"
+          echo "crates=$crates" >> "$GITHUB_OUTPUT"
+
+  rust-test-crate:
+    name: rust-test (${{ matrix.crate }})
+    if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.web-build.result == 'success' && needs.rust-test-crates.result == 'success' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
-    needs: [changes, verify-release-tag, web-build]
+    needs: [changes, verify-release-tag, web-build, rust-test-crates]
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.rust-test-crates.outputs.crates) }}
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_BASEDIRS: ${{ github.workspace }}
@@ -277,14 +335,14 @@ jobs:
         run: |
           git lfs install --local
           git lfs pull --include="$WEAVER_LFS_RUST_TEST_INCLUDE" --exclude=""
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install native build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y nasm par2 xz-utils zip
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: e2e/go.mod
           cache-dependency-path: e2e/go.sum
@@ -309,14 +367,18 @@ jobs:
           access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
           secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
           key-prefix: weaver/trusted-release/v1/rust-1.97.1/x86_64-unknown-linux-gnu/
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # Every crate's runner restores the one shared cache. Only the weaver
+      # runner, whose dependency tree covers nearly the whole workspace, saves
+      # it, so the crates do not evict each other's entries.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           cache-bin: false
-      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2
+          save-if: ${{ matrix.crate == 'weaver' }}
+      - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2
         with:
           tool: nextest
       - name: Download embedded web artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: ${{ env.WEB_ARTIFACT_NAME }}
           path: apps/weaver-web/dist
@@ -324,10 +386,97 @@ jobs:
         run: |
           sccache --start-server || true
           sccache --zero-stats || true
-      - name: Run Rust tests
+      - name: Run Rust tests (${{ matrix.crate }})
         # The default nextest profile excludes every schedule family; it is
-        # the single source of truth, so no filter is repeated here.
-        run: cargo nextest run --workspace --locked --no-fail-fast
+        # the single source of truth, so no filter is repeated here. A crate
+        # with no tests passes rather than failing its runner.
+        env:
+          CRATE: ${{ matrix.crate }}
+          FEATURES: ${{ matrix.features }}
+        run: cargo nextest run -p "$CRATE" ${FEATURES:+--features "$FEATURES"} --locked --no-fail-fast --no-tests=pass
+      - name: Run the DNSSEC tests on the pure-Rust backend
+        if: ${{ matrix.crate == 'weaver-dnssec' }}
+        run: |
+          cargo nextest run --locked -p weaver-dnssec --features rust-crypto,test-support --no-fail-fast
+          cargo nextest run --locked -p weaver-dnssec --no-default-features --features rust-crypto,test-support --no-fail-fast
+      - name: Show sccache stats
+        if: always()
+        run: |
+          if command -v sccache >/dev/null 2>&1; then
+            sccache --show-stats
+          else
+            echo "sccache not installed; skipping stats"
+          fi
+      - name: Save sccache directory
+        if: always() && matrix.crate == 'weaver' && steps.rust-test-sccache-restore.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: ${{ steps.rust-test-sccache-restore.outputs.cache-primary-key }}
+
+  # The archive e2e proofs ran after the whole suite in one job; they now run
+  # once, beside the crate runners.
+  rust-test-archive-e2e:
+    name: rust-test-archive-e2e
+    if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.web-build.result == 'success' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    needs: [changes, verify-release-tag, web-build]
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_BASEDIRS: ${{ github.workspace }}
+      SCCACHE_CACHE_SIZE: 10G
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      SCCACHE_IDLE_TIMEOUT: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Hydrate Rust test fixtures
+        run: |
+          git lfs install --local
+          git lfs pull --include="$WEAVER_LFS_RUST_TEST_INCLUDE" --exclude=""
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm par2 xz-utils zip
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: e2e/go.mod
+          cache-dependency-path: e2e/go.sum
+      - name: Restore sccache directory
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: gha-sccache-v1-weaver-rust-test-${{ github.run_id }}
+          restore-keys: |
+            gha-sccache-v1-weaver-rust-test-
+            gha-sccache-v1-weaver-rust-test-build-
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      - name: Configure trusted tag sccache
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
+        uses: ./.github/actions/configure-sccache-r2
+        with:
+          endpoint: ${{ secrets.SCCACHE_ENDPOINT }}
+          access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
+          secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
+          key-prefix: weaver/trusted-release/v1/rust-1.97.1/x86_64-unknown-linux-gnu/
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          cache-bin: false
+      - name: Download embedded web artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: ${{ env.WEB_ARTIFACT_NAME }}
+          path: apps/weaver-web/dist
+      - name: Prime sccache server
+        run: |
+          sccache --start-server || true
+          sccache --zero-stats || true
       - name: Build the archive e2e binary
         run: cargo build --locked -p weaver
       - name: Prove direct unpack and PAR2 recovery for every sequential format
@@ -344,7 +493,7 @@ jobs:
         run: go test ./internal/weaver -run '^TestPoisonArticleE2E$' -count=1 -v -timeout 25m
       - name: Upload archive e2e evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: direct-unpack-evidence
           if-no-files-found: ignore
@@ -360,12 +509,33 @@ jobs:
           else
             echo "sccache not installed; skipping stats"
           fi
-      - name: Save sccache directory
-        if: always() && steps.rust-test-sccache-restore.outcome == 'success'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: ${{ steps.rust-test-sccache-restore.outputs.cache-primary-key }}
+
+  # Keeps the required `rust-test` check: it passes only when every crate's
+  # runner and the archive e2e proofs passed, or when the change has no Rust.
+  rust-test:
+    name: rust-test
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    needs: [changes, rust-test-crates, rust-test-crate, rust-test-archive-e2e]
+    steps:
+      - name: Require every crate's tests
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          RUST: ${{ needs.changes.outputs.rust }}
+          CRATES: ${{ needs.rust-test-crates.result }}
+          TESTS: ${{ needs.rust-test-crate.result }}
+          E2E: ${{ needs.rust-test-archive-e2e.result }}
+        run: |
+          set -euo pipefail
+          echo "changes=$CHANGES rust=$RUST crates=$CRATES tests=$TESTS e2e=$E2E"
+          test "$CHANGES" = success
+          if [ "$RUST" != true ]; then
+            exit 0
+          fi
+          test "$CRATES" = success
+          test "$TESTS" = success
+          test "$E2E" = success
 
   rust-clippy-windows:
     name: rust-clippy-windows-x86_64
@@ -388,13 +558,14 @@ jobs:
       # Windows builds use the rustls/aws-lc TLS backend; s2n-tls is a
       # cfg(not(windows)) dependency and is never compiled here.
       CC_x86_64_pc_windows_msvc: clang-cl
-      CXX_x86_64_pc_windows_msvc: clang-cl
+      # C++ builds with MSVC's cl.exe, cc's default: the hosted VS2026 STL
+      # headers refuse the runner's clang-cl, which is older than they need.
     steps:
       - name: Keep checked-out line endings as committed
         shell: bash
         run: git config --global core.autocrlf false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
@@ -420,7 +591,7 @@ jobs:
           } catch {
             Write-Warning "Unable to configure Windows Defender exclusion: $($_.Exception.Message)"
           }
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           cache-bin: false
           key: clippy-windows-x86_64
@@ -437,19 +608,23 @@ jobs:
           secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
           key-prefix: weaver/trusted-release/v1/rust-1.97.1/x86_64-pc-windows-msvc/
       - name: Download embedded web artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: ${{ env.WEB_ARTIFACT_NAME }}
           path: apps/weaver-web/dist
       - name: Run clippy
         run: cargo clippy --workspace --locked --lib --bins --tests --examples --benches -- -D warnings
 
-  rust-test-windows:
-    name: rust-test-windows-x86_64
-    if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.web-build.result == 'success' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
+  rust-test-windows-crate:
+    name: rust-test-windows-x86_64 (${{ matrix.crate }})
+    if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.web-build.result == 'success' && needs.rust-test-crates.result == 'success' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
     runs-on: windows-2025-vs2026
     timeout-minutes: 120
-    needs: [changes, verify-release-tag, web-build]
+    needs: [changes, verify-release-tag, web-build, rust-test-crates]
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.rust-test-crates.outputs.crates) }}
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_BASEDIRS: ${{ github.workspace }}
@@ -465,7 +640,8 @@ jobs:
       # Windows builds use the rustls/aws-lc TLS backend; s2n-tls is a
       # cfg(not(windows)) dependency and is never compiled here.
       CC_x86_64_pc_windows_msvc: clang-cl
-      CXX_x86_64_pc_windows_msvc: clang-cl
+      # C++ builds with MSVC's cl.exe, cc's default: the hosted VS2026 STL
+      # headers refuse the runner's clang-cl, which is older than they need.
     steps:
       - name: Keep checked-out line endings as committed
         shell: bash
@@ -476,7 +652,7 @@ jobs:
         run: |
           git lfs install --local
           git lfs pull --include="$WEAVER_LFS_RUST_TEST_INCLUDE" --exclude=""
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install NASM
@@ -501,10 +677,13 @@ jobs:
           } catch {
             Write-Warning "Unable to configure Windows Defender exclusion: $($_.Exception.Message)"
           }
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # One cache shared by every crate's runner, saved only by the weaver
+      # runner, as on Linux.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           cache-bin: false
           key: test-windows-x86_64
+          save-if: ${{ matrix.crate == 'weaver' }}
       - name: Install sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
@@ -517,18 +696,51 @@ jobs:
           access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
           secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
           key-prefix: weaver/trusted-release/v1/rust-1.97.1/x86_64-pc-windows-msvc/
-      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2
+      - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2
         with:
           tool: nextest
       - name: Download embedded web artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: ${{ env.WEB_ARTIFACT_NAME }}
           path: apps/weaver-web/dist
-      - name: Run Rust tests
+      - name: Run Rust tests (${{ matrix.crate }})
         # The default nextest profile excludes every schedule family; it is
-        # the single source of truth, so no filter is repeated here.
-        run: cargo nextest run --workspace --locked --no-fail-fast
+        # the single source of truth, so no filter is repeated here. A crate
+        # with no tests on Windows passes rather than failing its runner.
+        env:
+          CRATE: ${{ matrix.crate }}
+          FEATURES: ${{ matrix.features }}
+        run: |
+          $features = @()
+          if ($env:FEATURES) { $features = @('--features', $env:FEATURES) }
+          cargo nextest run -p "$env:CRATE" @features --locked --no-fail-fast --no-tests=pass
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  # Keeps the `rust-test-windows-x86_64` check: it passes only when every
+  # crate's Windows runner passed, or when the change has no Rust.
+  rust-test-windows:
+    name: rust-test-windows-x86_64
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    needs: [changes, rust-test-crates, rust-test-windows-crate]
+    steps:
+      - name: Require every crate's Windows tests
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          RUST: ${{ needs.changes.outputs.rust }}
+          CRATES: ${{ needs.rust-test-crates.result }}
+          TESTS: ${{ needs.rust-test-windows-crate.result }}
+        run: |
+          set -euo pipefail
+          echo "changes=$CHANGES rust=$RUST crates=$CRATES tests=$TESTS"
+          test "$CHANGES" = success
+          if [ "$RUST" != true ]; then
+            exit 0
+          fi
+          test "$CRATES" = success
+          test "$TESTS" = success
 
   rust-test-arm:
     name: rust-test-arm-yenc
@@ -544,7 +756,7 @@ jobs:
       SCCACHE_IDLE_TIMEOUT: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install sccache
@@ -559,13 +771,13 @@ jobs:
           access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
           secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
           key-prefix: weaver/trusted-release/v1/rust-1.97.1/aarch64-unknown-linux-gnu/
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           cache-bin: false
       - name: Run ARM-specific yEnc crate tests (NEON)
         run: cargo test --locked --no-fail-fast -p weaver-yenc
       - name: Check out rapidyenc C oracle (pinned)
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: animetosho/rapidyenc
           ref: 27f435afa0a3a15995001219beca08de29f87a0f
@@ -610,7 +822,7 @@ jobs:
         run: |
           git lfs install --local
           git lfs pull --include="$WEAVER_LFS_SDE_INCLUDE" --exclude=""
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install native build dependencies
@@ -629,7 +841,7 @@ jobs:
           access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
           secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
           key-prefix: weaver/trusted-release/v1/rust-1.97.1/x86_64-unknown-linux-gnu/
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           cache-bin: false
       - name: Install Intel SDE
@@ -749,7 +961,7 @@ jobs:
             rustflags: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install target
@@ -766,7 +978,7 @@ jobs:
           access-key-id: ${{ secrets.SCCACHE_S3_ACCESS_ID }}
           secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
           key-prefix: weaver/trusted-release/v1/rust-1.97.1/${{ matrix.target }}/
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           cache-bin: false
           cache-on-failure: false
@@ -786,7 +998,7 @@ jobs:
   rust-package-linux-x86_64-portable:
     name: rust-package-linux-x86_64-portable
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     needs: [changes, verify-release-tag, web-build]
     if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.web-build.result == 'success' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
     env:
@@ -803,7 +1015,7 @@ jobs:
       SCCACHE_IDLE_TIMEOUT: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install target
@@ -812,7 +1024,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools mold nasm
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           cache-bin: false
           cache-on-failure: false
@@ -830,7 +1042,7 @@ jobs:
           secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
           key-prefix: weaver/trusted-release/v1/rust-1.97.1/x86_64-unknown-linux-musl/
       - name: Download embedded web artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: ${{ env.WEB_ARTIFACT_NAME }}
           path: apps/weaver-web/dist
@@ -868,7 +1080,7 @@ jobs:
           tar -czf weaver-linux-x86_64-portable.tar.gz -C dist/package weaver
           test -f weaver-linux-x86_64-portable.tar.gz
       - name: Upload release package
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: weaver-linux-x86_64-portable-${{ github.run_id }}
           path: weaver-linux-x86_64-portable.tar.gz
@@ -880,8 +1092,10 @@ jobs:
 
   rust-package-linux-arm64-portable:
     name: rust-package-linux-arm64-portable
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 60
+    # Pull requests build the lighter rc profile on the hosted runner;
+    # releases build on the larger paid runner.
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04-arm' || 'linux_arm_release' }}
+    timeout-minutes: 90
     needs: [changes, verify-release-tag, web-build]
     if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.web-build.result == 'success' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
     env:
@@ -889,6 +1103,7 @@ jobs:
       AWS_LC_SYS_STATIC: "1"
       AWS_LC_SYS_SMALL: "0"
       AWS_LC_SYS_CMAKE_BUILDER: "0"
+      WEAVER_CARGO_PROFILE: ${{ github.event_name == 'pull_request' && 'rc' || 'release' }}
       # Ubuntu's aarch64 gcc defaults to -moutline-atomics, which drags
       # libgcc's lse-init.o into every link that touches an atomic. That object
       # calls __getauxval, which glibc has and musl does not, so the link fails
@@ -902,7 +1117,7 @@ jobs:
       SCCACHE_IDLE_TIMEOUT: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install target
@@ -911,7 +1126,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools mold
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           cache-bin: false
           cache-on-failure: false
@@ -929,7 +1144,7 @@ jobs:
           secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
           key-prefix: weaver/trusted-release/v1/rust-1.97.1/aarch64-unknown-linux-musl/
       - name: Download embedded web artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: ${{ env.WEB_ARTIFACT_NAME }}
           path: apps/weaver-web/dist
@@ -950,10 +1165,10 @@ jobs:
           export JEMALLOC_SYS_WITH_LG_PAGE=16
           entropy_headers="$(bash .github/scripts/prepare-musl-entropy.sh "$RUNNER_TEMP")"
           export AWS_LC_SYS_CFLAGS="${CFLAGS_aarch64_unknown_linux_musl} -idirafter ${entropy_headers}"
-          mold -run cargo build -p weaver --release --locked --target aarch64-unknown-linux-musl
+          mold -run cargo build -p weaver --profile "${WEAVER_CARGO_PROFILE}" --locked --target aarch64-unknown-linux-musl
       - name: Verify native libraries are statically bundled
         run: |
-          BINARY="target/aarch64-unknown-linux-musl/release/weaver"
+          BINARY="target/aarch64-unknown-linux-musl/${WEAVER_CARGO_PROFILE}/weaver"
           readelf -d "$BINARY" | tee weaver-linux-arm64-portable-native-linkage.txt
           if grep -q '(NEEDED)' weaver-linux-arm64-portable-native-linkage.txt; then
             echo "release binary has dynamic native dependencies" >&2
@@ -962,13 +1177,13 @@ jobs:
       - name: Package tarball
         run: |
           mkdir -p dist/package
-          cp target/aarch64-unknown-linux-musl/release/weaver dist/package/weaver
+          cp "target/aarch64-unknown-linux-musl/${WEAVER_CARGO_PROFILE}/weaver" dist/package/weaver
           # Name the binary rather than packing `.`: installed builds refuse the
           # `./` root entry that `.` adds, and the upgrade manifest step fails on it.
           tar -czf weaver-linux-arm64-portable.tar.gz -C dist/package weaver
           test -f weaver-linux-arm64-portable.tar.gz
       - name: Upload release package
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: weaver-linux-arm64-portable-${{ github.run_id }}
           path: weaver-linux-arm64-portable.tar.gz
@@ -982,7 +1197,7 @@ jobs:
     name: rust-package-darwin-x86_64-portable
     # Intel image: this artifact is built natively, never cross-arch.
     runs-on: macos-15-intel
-    timeout-minutes: 90
+    timeout-minutes: 120
     needs: [changes, verify-release-tag, web-build]
     if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.web-build.result == 'success' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
     env:
@@ -994,6 +1209,9 @@ jobs:
       CXXFLAGS_x86_64_apple_darwin: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
       # Fat LTO on the Intel runner is the slowest link in the release.
       CARGO_PROFILE_RELEASE_LTO: thin
+      # Pull requests only prove the tree compiles and links, so they build
+      # the fast ci-throwaway profile, as Scryer does. Tags build release.
+      WEAVER_CARGO_PROFILE: ${{ github.event_name == 'pull_request' && 'ci-throwaway' || 'release' }}
       RUSTC_WRAPPER: sccache
       SCCACHE_BASEDIRS: ${{ github.workspace }}
       SCCACHE_CACHE_SIZE: 10G
@@ -1001,18 +1219,18 @@ jobs:
       SCCACHE_IDLE_TIMEOUT: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install target
         run: rustup target add x86_64-apple-darwin
       - name: Install NASM
         run: brew install nasm
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           cache-bin: false
           cache-on-failure: false
-          key: package-darwin-x86_64-portable
+          key: ${{ github.event_name == 'pull_request' && 'package-darwin-x86_64-portable-ci-throwaway' || 'package-darwin-x86_64-portable' }}
       - name: Install sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
@@ -1026,7 +1244,7 @@ jobs:
           secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
           key-prefix: weaver/trusted-release/v1/rust-1.97.1/x86_64-apple-darwin/
       - name: Download embedded web artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: ${{ env.WEB_ARTIFACT_NAME }}
           path: apps/weaver-web/dist
@@ -1050,12 +1268,12 @@ jobs:
           # built for a smaller page than the kernel it runs on will not work.
           # Pinned per target so the artifact never inherits a runner's page size.
           export JEMALLOC_SYS_WITH_LG_PAGE=12
-          cargo build -p weaver --bins --release --locked --target x86_64-apple-darwin
+          cargo build -p weaver --bins --profile ${{ env.WEAVER_CARGO_PROFILE }} --locked --target x86_64-apple-darwin
       - name: Verify native libraries are statically bundled
         run: |
           : > weaver-darwin-x86_64-portable-native-linkage.txt
           for BINARY in weaver weaver-tray; do
-            otool -L "target/x86_64-apple-darwin/release/$BINARY" \
+            otool -L "target/x86_64-apple-darwin/${{ env.WEAVER_CARGO_PROFILE }}/$BINARY" \
               | tee -a weaver-darwin-x86_64-portable-native-linkage.txt
           done
           if grep -Eiq 'liblzma|aws[-_]?lc|libcrypto' weaver-darwin-x86_64-portable-native-linkage.txt; then
@@ -1072,8 +1290,8 @@ jobs:
             | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "weaver"))')"
           packaging/macos/build-app.sh \
             --version "$version" \
-            --weaver target/x86_64-apple-darwin/release/weaver \
-            --tray target/x86_64-apple-darwin/release/weaver-tray \
+            --weaver target/x86_64-apple-darwin/${{ env.WEAVER_CARGO_PROFILE }}/weaver \
+            --tray target/x86_64-apple-darwin/${{ env.WEAVER_CARGO_PROFILE }}/weaver-tray \
             --output dist/app
       - name: Codesign binary
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
@@ -1090,8 +1308,8 @@ jobs:
           security import /tmp/cert.p12 -k "$KEYCHAIN" -P "$CERT_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN"
           security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
-          codesign --sign "Scryer Media Signing" --identifier media.weaver.app --force target/x86_64-apple-darwin/release/weaver
-          codesign --verify --verbose target/x86_64-apple-darwin/release/weaver
+          codesign --sign "Scryer Media Signing" --identifier media.weaver.app --force target/x86_64-apple-darwin/${{ env.WEAVER_CARGO_PROFILE }}/weaver
+          codesign --verify --verbose target/x86_64-apple-darwin/${{ env.WEAVER_CARGO_PROFILE }}/weaver
           # The bundle carries its own copies, made before the signature above,
           # so each executable is signed where it will actually be shipped and
           # the bundle is sealed around them last. Hardened runtime and a secure
@@ -1105,7 +1323,7 @@ jobs:
       - name: Package tarball
         run: |
           mkdir -p dist/package
-          cp target/x86_64-apple-darwin/release/weaver dist/package/weaver
+          cp target/x86_64-apple-darwin/${{ env.WEAVER_CARGO_PROFILE }}/weaver dist/package/weaver
           # Name the binary rather than packing `.`: installed builds refuse the
           # `./` root entry that `.` adds, and the upgrade manifest step fails on it.
           tar -czf weaver-darwin-x86_64-portable.tar.gz -C dist/package weaver
@@ -1221,11 +1439,11 @@ jobs:
       - name: Install Syft
         id: syft_first
         continue-on-error: true
-        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
       - name: Install Syft (second attempt)
         id: syft_retry
         if: steps.syft_first.outcome == 'failure'
-        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
       # The release-provenance job runs on Linux and cannot mount a UDZO image,
       # so the bundle's SBOM is produced here, from the staged tree the image
       # was built out of.
@@ -1236,7 +1454,7 @@ jobs:
             -o "spdx-json=weaver-darwin-x86_64.spdx.json"
           test -s weaver-darwin-x86_64.spdx.json
       - name: Upload release package
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: weaver-darwin-x86_64-portable-${{ github.run_id }}
           path: |
@@ -1253,7 +1471,7 @@ jobs:
   rust-package-darwin-arm64-portable:
     name: rust-package-darwin-arm64-portable
     runs-on: macos-26
-    timeout-minutes: 90
+    timeout-minutes: 120
     needs: [changes, verify-release-tag, web-build]
     if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.web-build.result == 'success' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
     env:
@@ -1263,6 +1481,9 @@ jobs:
       AWS_LC_SYS_CMAKE_BUILDER: "0"
       CFLAGS_aarch64_apple_darwin: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
       CXXFLAGS_aarch64_apple_darwin: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+      # Pull requests only prove the tree compiles and links, so they build
+      # the fast ci-throwaway profile, as Scryer does. Tags build release.
+      WEAVER_CARGO_PROFILE: ${{ github.event_name == 'pull_request' && 'ci-throwaway' || 'release' }}
       RUSTC_WRAPPER: sccache
       SCCACHE_BASEDIRS: ${{ github.workspace }}
       SCCACHE_CACHE_SIZE: 10G
@@ -1270,16 +1491,16 @@ jobs:
       SCCACHE_IDLE_TIMEOUT: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install target
         run: rustup target add aarch64-apple-darwin
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           cache-bin: false
           cache-on-failure: false
-          key: package-darwin-arm64-portable
+          key: ${{ github.event_name == 'pull_request' && 'package-darwin-arm64-portable-ci-throwaway' || 'package-darwin-arm64-portable' }}
       - name: Install sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
@@ -1293,7 +1514,7 @@ jobs:
           secret-access-key: ${{ secrets.SCCACHE_S3_SECRET }}
           key-prefix: weaver/trusted-release/v1/rust-1.97.1/aarch64-apple-darwin/
       - name: Download embedded web artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: ${{ env.WEB_ARTIFACT_NAME }}
           path: apps/weaver-web/dist
@@ -1316,12 +1537,12 @@ jobs:
           # jemalloc fixes its page size when it is compiled; Apple Silicon is
           # 16 KiB. Pinned so the artifact never inherits a runner's page size.
           export JEMALLOC_SYS_WITH_LG_PAGE=14
-          cargo build -p weaver --bins --release --locked --target aarch64-apple-darwin
+          cargo build -p weaver --bins --profile ${{ env.WEAVER_CARGO_PROFILE }} --locked --target aarch64-apple-darwin
       - name: Verify native libraries are statically bundled
         run: |
           : > weaver-darwin-arm64-portable-native-linkage.txt
           for BINARY in weaver weaver-tray; do
-            otool -L "target/aarch64-apple-darwin/release/$BINARY" \
+            otool -L "target/aarch64-apple-darwin/${{ env.WEAVER_CARGO_PROFILE }}/$BINARY" \
               | tee -a weaver-darwin-arm64-portable-native-linkage.txt
           done
           if grep -Eiq 'liblzma|aws[-_]?lc|libcrypto' weaver-darwin-arm64-portable-native-linkage.txt; then
@@ -1333,7 +1554,7 @@ jobs:
       # This is the native-architecture job, so it is where the check runs.
       - name: Smoke test WebKit wrapper
         run: |
-          target/aarch64-apple-darwin/release/weaver-tray --webview-smoke \
+          target/aarch64-apple-darwin/${{ env.WEAVER_CARGO_PROFILE }}/weaver-tray --webview-smoke \
             2>&1 | tee weaver-darwin-arm64-webview-smoke.log
       - name: Assemble Weaver.app
         run: |
@@ -1341,8 +1562,8 @@ jobs:
             | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "weaver"))')"
           packaging/macos/build-app.sh \
             --version "$version" \
-            --weaver target/aarch64-apple-darwin/release/weaver \
-            --tray target/aarch64-apple-darwin/release/weaver-tray \
+            --weaver target/aarch64-apple-darwin/${{ env.WEAVER_CARGO_PROFILE }}/weaver \
+            --tray target/aarch64-apple-darwin/${{ env.WEAVER_CARGO_PROFILE }}/weaver-tray \
             --output dist/app
       - name: Codesign binary
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
@@ -1359,8 +1580,8 @@ jobs:
           security import /tmp/cert.p12 -k "$KEYCHAIN" -P "$CERT_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN"
           security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
-          codesign --sign "Scryer Media Signing" --identifier media.weaver.app --force target/aarch64-apple-darwin/release/weaver
-          codesign --verify --verbose target/aarch64-apple-darwin/release/weaver
+          codesign --sign "Scryer Media Signing" --identifier media.weaver.app --force target/aarch64-apple-darwin/${{ env.WEAVER_CARGO_PROFILE }}/weaver
+          codesign --verify --verbose target/aarch64-apple-darwin/${{ env.WEAVER_CARGO_PROFILE }}/weaver
           # The bundle carries its own copies, made before the signature above,
           # so each executable is signed where it will actually be shipped and
           # the bundle is sealed around them last. Hardened runtime and a secure
@@ -1374,7 +1595,7 @@ jobs:
       - name: Package tarball
         run: |
           mkdir -p dist/package
-          cp target/aarch64-apple-darwin/release/weaver dist/package/weaver
+          cp target/aarch64-apple-darwin/${{ env.WEAVER_CARGO_PROFILE }}/weaver dist/package/weaver
           # Name the binary rather than packing `.`: installed builds refuse the
           # `./` root entry that `.` adds, and the upgrade manifest step fails on it.
           tar -czf weaver-darwin-arm64-portable.tar.gz -C dist/package weaver
@@ -1489,11 +1710,11 @@ jobs:
       - name: Install Syft
         id: syft_first
         continue-on-error: true
-        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
       - name: Install Syft (second attempt)
         id: syft_retry
         if: steps.syft_first.outcome == 'failure'
-        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
       # The release-provenance job runs on Linux and cannot mount a UDZO image,
       # so the bundle's SBOM is produced here, from the staged tree the image
       # was built out of.
@@ -1504,7 +1725,7 @@ jobs:
             -o "spdx-json=weaver-darwin-arm64.spdx.json"
           test -s weaver-darwin-arm64.spdx.json
       - name: Upload release package
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: weaver-darwin-arm64-portable-${{ github.run_id }}
           path: |
@@ -1522,7 +1743,7 @@ jobs:
   rust-package-windows-x86_64:
     name: rust-package-windows-x86_64
     runs-on: windows-2025-vs2026
-    timeout-minutes: 90
+    timeout-minutes: 120
     needs: [changes, verify-release-tag, web-build]
     if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.web-build.result == 'success' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
     env:
@@ -1537,7 +1758,11 @@ jobs:
       # Windows builds use the rustls/aws-lc TLS backend; s2n-tls is a
       # cfg(not(windows)) dependency and is never compiled here.
       CC_x86_64_pc_windows_msvc: clang-cl
-      CXX_x86_64_pc_windows_msvc: clang-cl
+      # C++ builds with MSVC's cl.exe, cc's default: the hosted VS2026 STL
+      # headers refuse the runner's clang-cl, which is older than they need.
+      # Pull requests only prove the tree compiles and links, so they build
+      # the fast ci-throwaway profile, as Scryer does. Tags build release.
+      WEAVER_CARGO_PROFILE: ${{ github.event_name == 'pull_request' && 'ci-throwaway' || 'release' }}
       RUSTC_WRAPPER: sccache
       SCCACHE_BASEDIRS: ${{ github.workspace }}
       SCCACHE_CACHE_SIZE: 10G
@@ -1545,7 +1770,7 @@ jobs:
       SCCACHE_IDLE_TIMEOUT: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install target
@@ -1561,9 +1786,9 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ github.workspace }}\.sccache
-          key: gha-sccache-v1-weaver-package-windows-x86_64-${{ github.run_id }}
+          key: gha-sccache-v1-weaver-package-windows-x86_64-${{ github.event_name == 'pull_request' && 'ci-throwaway-' || '' }}${{ github.run_id }}
           restore-keys: |
-            gha-sccache-v1-weaver-package-windows-x86_64-
+            gha-sccache-v1-weaver-package-windows-x86_64-${{ github.event_name == 'pull_request' && 'ci-throwaway-' || '' }}
       - name: Install sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
@@ -1598,11 +1823,11 @@ jobs:
           } catch {
             Write-Warning "Unable to configure Windows Defender exclusion: $($_.Exception.Message)"
           }
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           cache-bin: false
           cache-on-failure: false
-          key: package-windows-x86_64
+          key: ${{ github.event_name == 'pull_request' && 'package-windows-x86_64-ci-throwaway' || 'package-windows-x86_64' }}
       - name: Prime sccache server
         shell: pwsh
         run: |
@@ -1610,7 +1835,7 @@ jobs:
           sccache --start-server
           sccache --zero-stats
       - name: Download embedded web artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: ${{ env.WEB_ARTIFACT_NAME }}
           path: apps/weaver-web/dist
@@ -1625,9 +1850,8 @@ jobs:
           $ErrorActionPreference = "Stop"
           if ($env:WEAVER_SCCACHE_ENABLED -eq "true") {
             $env:CC_x86_64_pc_windows_msvc = "sccache clang-cl"
-            $env:CXX_x86_64_pc_windows_msvc = "sccache clang-cl"
           }
-          cargo build -p weaver --bins --release --locked --target x86_64-pc-windows-msvc 2>&1 | Tee-Object -FilePath weaver-windows-x86_64-build.log
+          cargo build -p weaver --bins --profile ${{ env.WEAVER_CARGO_PROFILE }} --locked --target x86_64-pc-windows-msvc 2>&1 | Tee-Object -FilePath weaver-windows-x86_64-build.log
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }
@@ -1635,7 +1859,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $exe = "target\x86_64-pc-windows-msvc\release\weaver.exe"
+          $exe = "target\x86_64-pc-windows-msvc\${{ env.WEAVER_CARGO_PROFILE }}\weaver.exe"
           $dumpbin = (Get-Command dumpbin.exe -ErrorAction SilentlyContinue).Source
           if (-not $dumpbin) {
             $roots = @("${env:ProgramFiles}\Microsoft Visual Studio", "${env:ProgramFiles(x86)}\Microsoft Visual Studio")
@@ -1661,7 +1885,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $exe = "target\x86_64-pc-windows-msvc\release\weaver.exe"
+          $exe = "target\x86_64-pc-windows-msvc\${{ env.WEAVER_CARGO_PROFILE }}\weaver.exe"
           $mt = (Get-Command mt.exe -ErrorAction SilentlyContinue).Source
           if (-not $mt) {
             $mt = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter mt.exe |
@@ -1701,7 +1925,7 @@ jobs:
           Remove-Item $out -ErrorAction SilentlyContinue
           # weaver-tray.exe must link the WebView2 loader statically: a
           # WebView2Loader.dll import would mean the MSI ships a broken tray.
-          foreach ($exe in @("target\x86_64-pc-windows-msvc\release\weaver.exe", "target\x86_64-pc-windows-msvc\release\weaver-tray.exe")) {
+          foreach ($exe in @("target\x86_64-pc-windows-msvc\${{ env.WEAVER_CARGO_PROFILE }}\weaver.exe", "target\x86_64-pc-windows-msvc\${{ env.WEAVER_CARGO_PROFILE }}\weaver-tray.exe")) {
             & $dumpbin /dependents $exe 2>&1 | Tee-Object -Append -FilePath $out
             if ($LASTEXITCODE -ne 0) {
               exit $LASTEXITCODE
@@ -1715,7 +1939,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $exe = "target\x86_64-pc-windows-msvc\release\weaver.exe"
+          $exe = "target\x86_64-pc-windows-msvc\${{ env.WEAVER_CARGO_PROFILE }}\weaver.exe"
           $smokeRoot = Join-Path $env:RUNNER_TEMP "weaver-startup-smoke-x86_64"
           $configDir = Join-Path $smokeRoot "config"
           $logFile = Join-Path $smokeRoot "weaver.log"
@@ -1801,7 +2025,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $exe = "target\x86_64-pc-windows-msvc\release\weaver-tray.exe"
+          $exe = "target\x86_64-pc-windows-msvc\${{ env.WEAVER_CARGO_PROFILE }}\weaver-tray.exe"
           $log = "weaver-windows-x86_64-webview-smoke.log"
 
           $runtimeKeys = @(
@@ -1850,7 +2074,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           $stage = "weaver-windows-x86_64-stage"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          Copy-Item target\x86_64-pc-windows-msvc\release\weaver.exe, target\x86_64-pc-windows-msvc\release\weaver-tray.exe, LICENSE -Destination $stage -Force
+          Copy-Item target\x86_64-pc-windows-msvc\${{ env.WEAVER_CARGO_PROFILE }}\weaver.exe, target\x86_64-pc-windows-msvc\${{ env.WEAVER_CARGO_PROFILE }}\weaver-tray.exe, LICENSE -Destination $stage -Force
           Compress-Archive -Path "$stage\*" -DestinationPath weaver-windows-x86_64.zip
           if (-not (Test-Path weaver-windows-x86_64.zip)) { throw "missing weaver-windows-x86_64.zip" }
           Copy-Item server\app\weaver\resources\windows\weaver.ico -Destination $stage -Force
@@ -1880,8 +2104,8 @@ jobs:
             -ZipPath weaver-windows-x86_64.zip `
             -MsiPath weaver-windows-x86_64.msi `
             -MsiMetadataPath weaver-windows-x86_64.msi.json `
-            -BuiltExePath target\x86_64-pc-windows-msvc\release\weaver.exe `
-            -BuiltTrayPath target\x86_64-pc-windows-msvc\release\weaver-tray.exe
+            -BuiltExePath target\x86_64-pc-windows-msvc\${{ env.WEAVER_CARGO_PROFILE }}\weaver.exe `
+            -BuiltTrayPath target\x86_64-pc-windows-msvc\${{ env.WEAVER_CARGO_PROFILE }}\weaver-tray.exe
       - name: Show sccache stats
         if: always()
         shell: pwsh
@@ -1894,7 +2118,7 @@ jobs:
           }
       - name: Upload release package
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: weaver-windows-x86_64-${{ github.run_id }}
           path: |
@@ -1924,7 +2148,7 @@ jobs:
   rust-package-windows-arm64:
     name: rust-package-windows-arm64
     runs-on: windows-11-arm
-    timeout-minutes: 90
+    timeout-minutes: 120
     needs: [changes, verify-release-tag, web-build]
     if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.web-build.result == 'success' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
     env:
@@ -1939,6 +2163,9 @@ jobs:
       # cfg(not(windows)) dependency and is never compiled here.
       CC_aarch64_pc_windows_msvc: clang-cl
       CXX_aarch64_pc_windows_msvc: clang-cl
+      # Pull requests only prove the tree compiles and links, so they build
+      # the fast ci-throwaway profile, as Scryer does. Tags build release.
+      WEAVER_CARGO_PROFILE: ${{ github.event_name == 'pull_request' && 'ci-throwaway' || 'release' }}
       RUSTC_WRAPPER: sccache
       SCCACHE_BASEDIRS: ${{ github.workspace }}
       SCCACHE_CACHE_SIZE: 10G
@@ -1946,7 +2173,7 @@ jobs:
       SCCACHE_IDLE_TIMEOUT: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install target
@@ -1962,9 +2189,9 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ github.workspace }}\.sccache
-          key: gha-sccache-v1-weaver-package-windows-arm64-${{ github.run_id }}
+          key: gha-sccache-v1-weaver-package-windows-arm64-${{ github.event_name == 'pull_request' && 'ci-throwaway-' || '' }}${{ github.run_id }}
           restore-keys: |
-            gha-sccache-v1-weaver-package-windows-arm64-
+            gha-sccache-v1-weaver-package-windows-arm64-${{ github.event_name == 'pull_request' && 'ci-throwaway-' || '' }}
       - name: Install sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
@@ -1985,11 +2212,11 @@ jobs:
           } catch {
             Write-Warning "Unable to configure Windows Defender exclusion: $($_.Exception.Message)"
           }
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           cache-bin: false
           cache-on-failure: false
-          key: package-windows-arm64
+          key: ${{ github.event_name == 'pull_request' && 'package-windows-arm64-ci-throwaway' || 'package-windows-arm64' }}
       - name: Prime sccache server
         shell: pwsh
         run: |
@@ -1997,7 +2224,7 @@ jobs:
           sccache --start-server
           sccache --zero-stats
       - name: Download embedded web artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: ${{ env.WEB_ARTIFACT_NAME }}
           path: apps/weaver-web/dist
@@ -2014,7 +2241,7 @@ jobs:
             $env:CC_aarch64_pc_windows_msvc = "sccache clang-cl"
             $env:CXX_aarch64_pc_windows_msvc = "sccache clang-cl"
           }
-          cargo build -p weaver --bins --release --locked --target aarch64-pc-windows-msvc 2>&1 | Tee-Object -FilePath weaver-windows-arm64-build.log
+          cargo build -p weaver --bins --profile ${{ env.WEAVER_CARGO_PROFILE }} --locked --target aarch64-pc-windows-msvc 2>&1 | Tee-Object -FilePath weaver-windows-arm64-build.log
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }
@@ -2022,7 +2249,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $exe = "target\aarch64-pc-windows-msvc\release\weaver.exe"
+          $exe = "target\aarch64-pc-windows-msvc\${{ env.WEAVER_CARGO_PROFILE }}\weaver.exe"
           $mt = (Get-Command mt.exe -ErrorAction SilentlyContinue).Source
           if (-not $mt) {
             $mt = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter mt.exe |
@@ -2062,7 +2289,7 @@ jobs:
           Remove-Item $out -ErrorAction SilentlyContinue
           # weaver-tray.exe must link the WebView2 loader statically: a
           # WebView2Loader.dll import would mean the MSI ships a broken tray.
-          foreach ($exe in @("target\aarch64-pc-windows-msvc\release\weaver.exe", "target\aarch64-pc-windows-msvc\release\weaver-tray.exe")) {
+          foreach ($exe in @("target\aarch64-pc-windows-msvc\${{ env.WEAVER_CARGO_PROFILE }}\weaver.exe", "target\aarch64-pc-windows-msvc\${{ env.WEAVER_CARGO_PROFILE }}\weaver-tray.exe")) {
             & $dumpbin /dependents $exe 2>&1 | Tee-Object -Append -FilePath $out
             if ($LASTEXITCODE -ne 0) {
               exit $LASTEXITCODE
@@ -2076,7 +2303,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $exe = "target\aarch64-pc-windows-msvc\release\weaver.exe"
+          $exe = "target\aarch64-pc-windows-msvc\${{ env.WEAVER_CARGO_PROFILE }}\weaver.exe"
           $smokeRoot = Join-Path $env:RUNNER_TEMP "weaver-startup-smoke-arm64"
           $configDir = Join-Path $smokeRoot "config"
           $logFile = Join-Path $smokeRoot "weaver.log"
@@ -2162,7 +2389,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $exe = "target\aarch64-pc-windows-msvc\release\weaver-tray.exe"
+          $exe = "target\aarch64-pc-windows-msvc\${{ env.WEAVER_CARGO_PROFILE }}\weaver-tray.exe"
           $log = "weaver-windows-arm64-webview-smoke.log"
 
           $runtimeKeys = @(
@@ -2211,7 +2438,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           $stage = "weaver-windows-arm64-stage"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          Copy-Item target\aarch64-pc-windows-msvc\release\weaver.exe, target\aarch64-pc-windows-msvc\release\weaver-tray.exe, LICENSE -Destination $stage -Force
+          Copy-Item target\aarch64-pc-windows-msvc\${{ env.WEAVER_CARGO_PROFILE }}\weaver.exe, target\aarch64-pc-windows-msvc\${{ env.WEAVER_CARGO_PROFILE }}\weaver-tray.exe, LICENSE -Destination $stage -Force
           Compress-Archive -Path "$stage\*" -DestinationPath weaver-windows-arm64.zip
           if (-not (Test-Path weaver-windows-arm64.zip)) { throw "missing weaver-windows-arm64.zip" }
           Copy-Item server\app\weaver\resources\windows\weaver.ico -Destination $stage -Force
@@ -2241,8 +2468,8 @@ jobs:
             -ZipPath weaver-windows-arm64.zip `
             -MsiPath weaver-windows-arm64.msi `
             -MsiMetadataPath weaver-windows-arm64.msi.json `
-            -BuiltExePath target\aarch64-pc-windows-msvc\release\weaver.exe `
-            -BuiltTrayPath target\aarch64-pc-windows-msvc\release\weaver-tray.exe
+            -BuiltExePath target\aarch64-pc-windows-msvc\${{ env.WEAVER_CARGO_PROFILE }}\weaver.exe `
+            -BuiltTrayPath target\aarch64-pc-windows-msvc\${{ env.WEAVER_CARGO_PROFILE }}\weaver-tray.exe
       - name: Show sccache stats
         if: always()
         shell: pwsh
@@ -2255,7 +2482,7 @@ jobs:
           }
       - name: Upload release package
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: weaver-windows-arm64-${{ github.run_id }}
           path: |
@@ -2297,12 +2524,12 @@ jobs:
         with:
           persist-credentials: false
       - name: Download linux amd64 portable artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: weaver-linux-x86_64-portable-${{ github.run_id }}
           path: artifacts
       - name: Download linux arm64 portable artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: weaver-linux-arm64-portable-${{ github.run_id }}
           path: artifacts
@@ -2343,20 +2570,20 @@ jobs:
       - name: Install Cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Download linux amd64 portable artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: weaver-linux-x86_64-portable-${{ github.run_id }}
           path: artifacts
       - name: Download linux arm64 portable artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: weaver-linux-arm64-portable-${{ github.run_id }}
           path: artifacts
       - name: Prepare build context
         run: sh docker/prepare-build-context.sh artifacts docker-ctx
-      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
-      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -2386,7 +2613,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
       - name: Build and push base image
         id: build_base
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: docker-ctx
           file: docker/weaver.Dockerfile
@@ -2517,7 +2744,7 @@ jobs:
       SCCACHE_IDLE_TIMEOUT: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Install sccache
@@ -2542,13 +2769,13 @@ jobs:
       # inputs), so the merge yields exactly the layout the -maxdepth 1 asset
       # census and the release-upload globs expect.
       - name: Download release artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: weaver-*-${{ github.run_id }}
           path: artifacts
           merge-multiple: true
       - name: Download signed SLSA provenance
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: weaver-provenance.intoto.jsonl
           path: artifacts
@@ -2590,7 +2817,7 @@ jobs:
       # verify <file> -R <repo>` works for the packages a desktop user
       # downloads by hand.
       - name: Attest installer release artifacts
-        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: |
             artifacts/weaver-windows-*.zip
@@ -2912,10 +3139,10 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Download generated WinGet manifests
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: weaver-winget-manifests-${{ github.run_id }}
           path: winget-submission
@@ -2946,7 +3173,7 @@ jobs:
     environment: release-credentials
     steps:
       - name: Download verified WinGet manifests
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: weaver-winget-manifests-${{ github.run_id }}
           path: winget-submission
@@ -3048,12 +3275,12 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
       - name: Download Windows release artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: release-artifacts
           pattern: weaver-windows-*-${{ github.run_id }}
@@ -3080,7 +3307,7 @@ jobs:
           test -s weaver-winget-manifests.tar.gz
 
       - name: Upload WinGet manifest artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: weaver-winget-manifests-${{ github.run_id }}
           path: weaver-winget-manifests.tar.gz
@@ -3107,7 +3334,7 @@ jobs:
       base64_subjects: ${{ steps.subjects.outputs.base64_subjects }}
     steps:
       - name: Download release assets and WinGet package
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: weaver-*-${{ github.run_id }}
           path: artifacts
@@ -3117,11 +3344,11 @@ jobs:
       - name: Install Syft
         id: syft_first
         continue-on-error: true
-        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
       - name: Install Syft (second attempt)
         id: syft_retry
         if: steps.syft_first.outcome == 'failure'
-        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
       - name: Generate archive SBOMs and SLSA subject list
         run: |
           set -euo pipefail
@@ -3173,7 +3400,7 @@ jobs:
       # manifest archive is not bundled here; it reaches github-release via
       # its own weaver-winget-manifests artifact.
       - name: Upload release provenance inputs
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: weaver-release-provenance-inputs-${{ github.run_id }}
           path: release-inputs/

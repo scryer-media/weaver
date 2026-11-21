@@ -1,0 +1,285 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+use super::*;
+use crate::jobs::queries::JobsQueries;
+use crate::settings::persistence::SettingsPersistenceQueries;
+use crate::settings::service::SettingsServiceQueries;
+use std::io::Write;
+
+fn sample_nzb_bytes() -> &'static [u8] {
+    br#"<?xml version="1.0" encoding="UTF-8"?>
+        <nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+          <file poster="poster" date="1700000000" subject="sample">
+            <groups><group>alt.binaries.test</group></groups>
+            <segments>
+              <segment bytes="10" number="1">abc@test</segment>
+            </segments>
+          </file>
+        </nzb>"#
+}
+
+#[test]
+fn migrate_from_toml_file() {
+    let dir = std::env::temp_dir().join(format!(
+        "weaver_migration_test_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let toml_path = dir.join("weaver.toml");
+    let mut f = std::fs::File::create(&toml_path).unwrap();
+    write!(
+        f,
+        r#"
+data_dir = "/tmp/weaver-data"
+
+[[servers]]
+id = 1
+host = "news.example.com"
+port = 443
+tls = true
+username = "user"
+password = "pass"
+connections = 10
+active = true
+"#
+    )
+    .unwrap();
+
+    let mut db = Database::open_in_memory().unwrap();
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
+    assert!(db.migrate_from_toml(&toml_path).unwrap());
+
+    // Verify config was imported.
+    let config = db.load_config().unwrap();
+    assert_eq!(config.data_dir, "/tmp/weaver-data");
+    assert_eq!(config.servers.len(), 1);
+    assert_eq!(config.servers[0].host, "news.example.com");
+    // The file named no torrent listen port, so one was drawn.
+    assert!(crate::torrents::sessions::LISTEN_PORTS.contains(&config.torrent.base_port));
+
+    // Verify TOML was renamed.
+    assert!(!toml_path.exists());
+    assert!(dir.join("weaver.toml.migrated").exists());
+
+    // Running again should be a no-op (DB not empty).
+    // Create a dummy toml to verify it's not read.
+    std::fs::write(&toml_path, "data_dir = \"/other\"").unwrap();
+    assert!(!db.migrate_from_toml(&toml_path).unwrap());
+
+    // Cleanup.
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn migrate_from_toml_into_a_stamped_new_database() {
+    let dir = std::env::temp_dir().join(format!(
+        "weaver_migration_stamped_test_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let toml_path = dir.join("weaver.toml");
+    std::fs::write(
+        &toml_path,
+        r#"
+data_dir = "/tmp/weaver-data"
+
+[[servers]]
+id = 1
+host = "news.example.com"
+port = 563
+tls = true
+connections = 4
+active = true
+"#,
+    )
+    .unwrap();
+
+    let mut db = Database::open_in_memory().unwrap();
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
+    db.set_setting(
+        weaver_server_base::security::SETTING_INSTALL_GENERATION,
+        weaver_server_base::security::AUTHENTICATED_INSTALL_GENERATION,
+    )
+    .unwrap();
+    assert!(db.is_empty().unwrap());
+    assert!(db.migrate_from_toml(&toml_path).unwrap());
+    assert_eq!(db.load_config().unwrap().servers.len(), 1);
+    assert!(!db.is_empty().unwrap());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn migrate_from_toml_after_the_started_version_is_recorded() {
+    // Startup records the running version before first-run configuration is
+    // imported; that marker must not make a new database look configured.
+    let dir = std::env::temp_dir().join(format!(
+        "weaver_migration_started_version_test_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let toml_path = dir.join("weaver.toml");
+    std::fs::write(
+        &toml_path,
+        r#"
+data_dir = "/tmp/weaver-data"
+
+[[servers]]
+id = 1
+host = "news.example.com"
+port = 563
+tls = true
+connections = 4
+active = true
+"#,
+    )
+    .unwrap();
+
+    let mut db = Database::open_in_memory().unwrap();
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
+    db.set_setting(
+        weaver_server_base::security::SETTING_INSTALL_GENERATION,
+        weaver_server_base::security::AUTHENTICATED_INSTALL_GENERATION,
+    )
+    .unwrap();
+    crate::operations::backup::record_started_version_for(&db, env!("CARGO_PKG_VERSION")).unwrap();
+    assert!(db.is_empty().unwrap());
+    assert!(db.migrate_from_toml(&toml_path).unwrap());
+    let config = db.load_config().unwrap();
+    assert_eq!(config.servers.len(), 1);
+    assert_eq!(config.servers[0].host, "news.example.com");
+    assert!(!db.is_empty().unwrap());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn migrate_no_toml_file() {
+    let db = Database::open_in_memory().unwrap();
+    assert!(
+        !db.migrate_from_toml(Path::new("/nonexistent/weaver.toml"))
+            .unwrap()
+    );
+}
+
+#[test]
+fn migrate_no_journal_file() {
+    let db = Database::open_in_memory().unwrap();
+    assert!(
+        !db.migrate_from_journal(Path::new("/nonexistent/weaver.journal"))
+            .unwrap()
+    );
+}
+
+// Write a journal entry in the binary format: [4-byte LE len][payload][4-byte LE CRC].
+fn write_journal_entry(buf: &mut Vec<u8>, entry: &JournalEntry) {
+    let payload = rmp_serde::to_vec(entry).unwrap();
+    let len = payload.len() as u32;
+    buf.extend_from_slice(&len.to_le_bytes());
+    buf.extend_from_slice(&payload);
+    let crc = par2_rs::checksum::crc32(&payload);
+    buf.extend_from_slice(&crc.to_le_bytes());
+}
+
+#[test]
+fn migrate_journal_to_sqlite() {
+    use std::path::PathBuf;
+    use weaver_server_base::jobs::ids::{JobId, NzbFileId, SegmentId};
+
+    let dir = std::env::temp_dir().join(format!(
+        "weaver_journal_migration_test_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let journal_path = dir.join("weaver.journal");
+
+    // Build a journal with 1 job, legacy segment events, and 1 completed file.
+    let mut data = Vec::new();
+    let nzb_path = dir.join("test.nzb");
+    std::fs::write(&nzb_path, sample_nzb_bytes()).unwrap();
+    write_journal_entry(
+        &mut data,
+        &JournalEntry::JobCreated {
+            job_id: JobId(1),
+            nzb_hash: [0xAA; 32],
+            nzb_path: nzb_path.clone(),
+            output_dir: PathBuf::from("/tmp/output"),
+            created_at: 1700000000,
+            category: Some("movies".to_string()),
+            metadata: vec![],
+        },
+    );
+    for i in 0..3u32 {
+        write_journal_entry(
+            &mut data,
+            &JournalEntry::SegmentCommitted {
+                segment_id: SegmentId {
+                    file_id: NzbFileId {
+                        job_id: JobId(1),
+                        file_index: 0,
+                    },
+                    segment_number: i,
+                },
+                file_offset: i as u64 * 768000,
+                decoded_size: 768000,
+                crc32: 0xDEADBEEF,
+            },
+        );
+    }
+    write_journal_entry(
+        &mut data,
+        &JournalEntry::FileComplete {
+            file_id: NzbFileId {
+                job_id: JobId(1),
+                file_index: 0,
+            },
+            filename: "data.rar".to_string(),
+            md5: [0x11; 16],
+        },
+    );
+    write_journal_entry(
+        &mut data,
+        &JournalEntry::JobStatusChanged {
+            job_id: JobId(1),
+            status: PersistedJobStatus::Verifying,
+            timestamp: 1700000050,
+        },
+    );
+    std::fs::write(&journal_path, &data).unwrap();
+
+    let db = Database::open_in_memory().unwrap();
+    assert!(db.migrate_from_journal(&journal_path).unwrap());
+
+    // Verify active state.
+    let jobs = db.load_active_jobs().unwrap();
+    assert_eq!(jobs.len(), 1);
+    let job = &jobs[&JobId(1)];
+    assert_eq!(job.nzb_path, nzb_path);
+    assert_eq!(job.status, "verifying");
+    assert_eq!(job.complete_files.len(), 1);
+    assert_eq!(job.category, Some("movies".to_string()));
+
+    // Journal should be renamed.
+    assert!(!journal_path.exists());
+    assert!(dir.join("weaver.journal.migrated").exists());
+
+    // Running again should be a no-op.
+    std::fs::write(&journal_path, &data).unwrap();
+    assert!(!db.migrate_from_journal(&journal_path).unwrap());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

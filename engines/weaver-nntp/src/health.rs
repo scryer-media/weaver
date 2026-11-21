@@ -37,6 +37,23 @@ pub enum ServerState {
     },
 }
 
+impl ServerState {
+    // Whether the server is down at `now`: switched off by a fault, or in a
+    // transport cooldown that is still running. A capacity hold is not down;
+    // the server works, it is only being given fewer requests.
+    pub fn is_down(&self, now: Instant) -> bool {
+        match self {
+            Self::Disabled { until, .. } => *until > now,
+            Self::CoolingDown {
+                until,
+                reason: CooldownReason::Transport,
+                ..
+            } => *until > now,
+            _ => false,
+        }
+    }
+}
+
 // Why a server entered a short-lived cooldown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CooldownReason {

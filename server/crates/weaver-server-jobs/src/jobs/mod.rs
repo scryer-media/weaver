@@ -1,0 +1,42 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+pub mod active_lock;
+pub mod active_report;
+pub mod archive_password;
+pub mod assembly;
+pub mod attributes;
+pub mod child_rows;
+pub mod control;
+pub mod database;
+pub mod diagnostic_tables;
+pub mod dir_markers;
+pub mod download_summary;
+pub mod download_summary_persistence;
+pub mod nzb_persistence;
+pub mod outline_persistence;
+pub mod persistence;
+pub mod phase_progress;
+pub mod queries;
+pub mod record;
+pub mod server_attribution;
+mod server_attribution_persistence;
+pub use server_attribution_persistence::JobsServerAttributionPersistenceInternalQueries;
+pub mod stored_passwords;
+pub mod support_facts;
+pub mod support_facts_persistence;
+pub mod working_dir;
+pub use weaver_server_base::jobs::ids;
+pub mod duplicate;
+pub mod duplicate_persistence;
+pub mod error;
+pub mod failure_stage;
+pub mod feed_verdict;
+pub mod graph_checkpoint;
+pub mod job_id_reservation;
+pub mod metadata_json;
+pub mod metrics_store;
+pub mod model;
+pub use ids::JobId;
+pub use model::{ArchivePasswordCandidate, ArchivePasswordSource};
+pub use model::{FileSpec, JobSpec, MessageIds, SegmentSpec};

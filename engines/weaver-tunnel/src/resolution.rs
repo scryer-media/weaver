@@ -111,24 +111,54 @@ impl Replicate for io::Error {
     }
 }
 
+// What a lookup says of itself, beside its answer or failure: how its
+// answer was judged, which server gave it, and why it failed. A caller that
+// joins the lookup or finds its answer held records the same, never a guess
+// from the error.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Account {
+    pub(crate) judged: Option<record::TrustOutcome>,
+    pub(crate) failure: Option<record::LookupError>,
+    pub(crate) from: Option<record::Answerer>,
+}
+
+impl Account {
+    // Notes this account in the test recording the caller runs in, if any.
+    fn note(&self, name: &str) {
+        if let Some(failure) = &self.failure {
+            record::failed(name, failure.failure, || failure.detail.clone());
+        }
+        if let Some(judged) = self.judged {
+            record::answered(name, self.from, judged);
+        }
+    }
+}
+
 // An answer as the cache holds it.
 #[derive(Clone)]
 struct Answer {
     addresses: Arc<[IpAddr]>,
     nonexistent: bool,
+    judged: Option<record::TrustOutcome>,
+    from: Option<record::Answerer>,
 }
 
 impl Answer {
-    fn of(lookup: &Lookup) -> Self {
+    fn of(lookup: &Lookup, account: &Account) -> Self {
         Self {
             addresses: lookup.addresses.as_slice().into(),
             nonexistent: lookup.nonexistent,
+            judged: account.judged,
+            from: account.from,
         }
     }
     // The addresses, after noting the answer in the test recording the
     // caller runs in, if any. `held` says it was held from before.
     fn noted(&self, name: &str, held: bool) -> Vec<IpAddr> {
         record::cached(name, held);
+        if let Some(judged) = self.judged {
+            record::answered(name, self.from, judged);
+        }
         if self.addresses.is_empty() {
             let (failure, said) = if self.nonexistent {
                 (record::LookupFailure::NoSuchName, "NXDOMAIN")
@@ -142,7 +172,7 @@ impl Answer {
 }
 
 // What a lookup came to, once it lands.
-type Landed<E> = Option<Result<Answer, Arc<E>>>;
+type Landed<E> = Option<Result<Answer, (Arc<E>, Account)>>;
 
 enum Slot<E> {
     Held {
@@ -229,6 +259,24 @@ impl<E: Replicate> ResolutionCache<E> {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Lookup, E>>,
     {
+        self.resolve_accounted(resolver, name, || async {
+            (lookup().await, Account::default())
+        })
+        .await
+    }
+
+    // `resolve` for a lookup that gives its account, which callers that
+    // join it or find its answer held record as their own.
+    pub(crate) async fn resolve_accounted<F, Fut>(
+        &self,
+        resolver: Resolver,
+        name: &str,
+        lookup: F,
+    ) -> Result<Vec<IpAddr>, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = (Result<Lookup, E>, Account)>,
+    {
         if let Ok(ip) = name.parse() {
             return Ok(vec![ip]);
         }
@@ -275,8 +323,9 @@ impl<E: Replicate> ResolutionCache<E> {
                     metrics::record_cache(resolver, CacheOutcome::Joined);
                     return match answer.as_ref().expect("a landed lookup") {
                         Ok(answer) => Ok(answer.noted(name, false)),
-                        Err(error) => {
+                        Err((error, account)) => {
                             record::cached(name, false);
+                            account.note(name);
                             Err(error.replicate())
                         }
                     };
@@ -292,7 +341,8 @@ impl<E: Replicate> ResolutionCache<E> {
                     };
                     let lookup = lookup.take().expect("a caller asks at most once");
                     record::cached(name, false);
-                    return flight.land(name, lookup().await);
+                    let (found, account) = lookup().await;
+                    return flight.land(name, found, account);
                 }
             }
         }
@@ -329,7 +379,7 @@ impl<E: Replicate> ResolutionCache<E> {
                 slots.names.insert(
                     key,
                     Slot::Held {
-                        answer: Answer::of(&lookup),
+                        answer: Answer::of(&lookup, &Account::default()),
                         until: now + held,
                     },
                 );
@@ -352,7 +402,7 @@ impl<E: Replicate> ResolutionCache<E> {
     // How many callers wait on the lookup in flight for `name`, or `None`
     // when none is.
     #[cfg(test)]
-    fn waiting(&self, name: &str) -> Option<usize> {
+    pub(crate) fn waiting(&self, name: &str) -> Option<usize> {
         match self
             .slots
             .lock()
@@ -397,12 +447,17 @@ struct Flight<'a, E> {
 }
 
 impl<E: Replicate> Flight<'_, E> {
-    fn land(mut self, name: &str, found: Result<Lookup, E>) -> Result<Vec<IpAddr>, E> {
+    fn land(
+        mut self,
+        name: &str,
+        found: Result<Lookup, E>,
+        account: Account,
+    ) -> Result<Vec<IpAddr>, E> {
         let now = Instant::now();
         let mut slots = self.cache.slots.lock().expect("resolution cache");
         let (shared, result) = match found {
             Ok(lookup) => {
-                let answer = Answer::of(&lookup);
+                let answer = Answer::of(&lookup, &account);
                 answer.noted(name, false);
                 match self.cache.policy.hold(&lookup) {
                     Some(held) => {
@@ -423,7 +478,8 @@ impl<E: Replicate> Flight<'_, E> {
             }
             Err(error) => {
                 slots.names.remove(self.key);
-                (Err(Arc::new(error.replicate())), Err(error))
+                account.note(name);
+                (Err((Arc::new(error.replicate()), account)), Err(error))
             }
         };
         self.sender.send_replace(Some(shared));
@@ -458,33 +514,19 @@ static HOST: LazyLock<ResolutionCache<io::Error>> = LazyLock::new(ResolutionCach
     clippy::disallowed_methods,
     reason = "the host resolver every Host-resolved leg shares"
 )]
-pub async fn host_lookup(host: &str) -> io::Result<Vec<IpAddr>> {
-    if host.parse::<IpAddr>().is_err() {
-        record::asking(host, record::Asker::host);
-    }
-    HOST.resolve(Resolver::Host, host, || async {
-        let found = tokio::net::lookup_host((host, 0)).await;
-        metrics::record_resolution(Resolver::Host, found.is_ok());
-        Ok(untimed(found?.map(|peer| peer.ip())))
-    })
-    .await
-    .inspect(|addresses| record::found(host, addresses))
-    .inspect_err(|error| record::failed_saying(host, error))
-}
-
-// Resolves the name of a tunnel's own endpoint with the host's own DNS: the
-// endpoint carries the tunnel, so nothing inside the tunnel can answer it.
-pub struct HostEndpoints;
-
-#[async_trait::async_trait]
-impl crate::endpoint::EndpointResolver for HostEndpoints {
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a tunnel's own endpoint is the first hop of the route"
-    )]
-    async fn resolve(&self, host: &str) -> io::Result<Vec<IpAddr>> {
-        host_lookup(host).await
-    }
+// The one place a name reaches the host resolver: a leg whose naming is Host.
+#[cfg_attr(dylint_lib = "host_name_lookup", allow(host_name_lookup))]
+pub(crate) async fn host_lookup(host: &str) -> io::Result<Vec<IpAddr>> {
+    asking_host(host);
+    noted_by_host(
+        host,
+        HOST.resolve(Resolver::Host, host, || async {
+            let found = tokio::net::lookup_host((host, 0)).await;
+            metrics::record_resolution(Resolver::Host, found.is_ok());
+            Ok(untimed(found?.map(|peer| peer.ip())))
+        })
+        .await,
+    )
 }
 
 // `host_lookup` for a thread that may block.
@@ -492,12 +534,33 @@ impl crate::endpoint::EndpointResolver for HostEndpoints {
     clippy::disallowed_methods,
     reason = "the host resolver every Host-resolved leg shares"
 )]
-pub fn host_lookup_blocking(host: &str) -> io::Result<Vec<IpAddr>> {
-    HOST.resolve_blocking(Resolver::Host, host, || {
-        let found = std::net::ToSocketAddrs::to_socket_addrs(&(host, 0));
-        metrics::record_resolution(Resolver::Host, found.is_ok());
-        Ok(untimed(found?.map(|peer| peer.ip())))
-    })
+// The one place a name reaches the host resolver: a leg whose naming is Host.
+#[cfg_attr(dylint_lib = "host_name_lookup", allow(host_name_lookup))]
+pub(crate) fn host_lookup_blocking(host: &str) -> io::Result<Vec<IpAddr>> {
+    asking_host(host);
+    noted_by_host(
+        host,
+        HOST.resolve_blocking(Resolver::Host, host, || {
+            let found = std::net::ToSocketAddrs::to_socket_addrs(&(host, 0));
+            metrics::record_resolution(Resolver::Host, found.is_ok());
+            Ok(untimed(found?.map(|peer| peer.ip())))
+        }),
+    )
+}
+
+// Notes in the test recording, if any, that the host's own DNS is asked for
+// `host`. An address is asked of no one.
+fn asking_host(host: &str) {
+    if host.parse::<IpAddr>().is_err() {
+        record::asking(host, record::Asker::host);
+    }
+}
+
+// Notes what the host's own DNS answered for `host`.
+fn noted_by_host(host: &str, found: io::Result<Vec<IpAddr>>) -> io::Result<Vec<IpAddr>> {
+    found
+        .inspect(|addresses| record::found(host, addresses))
+        .inspect_err(|error| record::failed_saying(host, error))
 }
 
 // Drops what the host's own DNS gave for `host`.

@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use async_graphql::{Enum, InputObject, MaybeUndefined, SimpleObject};
+use async_graphql::{Enum, InputObject, InputType, MaybeUndefined, OutputType, SimpleObject};
 use serde::{Deserialize, Serialize};
-use weaver_server_core::jobs::DuplicatePolicy;
+use weaver_server_core::jobs::{DuplicatePolicy, HeldClass, Protocol};
 use weaver_server_core::runtime::HardwareProfile;
 use weaver_server_core::runtime::system_profile::SystemProfile;
+use weaver_server_core::settings::{Leaf, Level};
 
-use crate::jobs::types::DuplicateActionGql;
+use crate::jobs::types::{DuplicateActionGql, ProtocolGql};
 
 #[derive(SimpleObject)]
 pub struct ArchivePasswordSettings {
@@ -156,13 +157,17 @@ pub struct GeneralSettings {
     /// Days a history entry is kept after its job finished; 0 keeps history
     /// forever.
     pub history_retention_days: u32,
-    pub max_download_speed: u64,
     pub max_retries: u32,
     pub propagation_delay_secs: u32,
     pub max_concurrent_nzbs: u32,
     pub enable_srrdb_lookup: bool,
     pub watch_folder: WatchFolderSettings,
     pub duplicate_policy: DuplicatePolicySettings,
+    // The global seeding policy, absent when none is set.
+    pub seeding: Option<SeedingPolicySettings>,
+    /// The global upload cap in bytes per second; absent is none.
+    pub upload_cap: Option<u64>,
+    pub torrent: TorrentSettings,
 }
 
 #[derive(Debug, InputObject)]
@@ -173,7 +178,6 @@ pub struct GeneralSettingsInput {
     pub delete_failed_job_files: Option<bool>,
     /// Days a history entry is kept, from 0 (forever) to 36500.
     pub history_retention_days: Option<i32>,
-    pub max_download_speed: Option<u64>,
     pub max_retries: Option<u32>,
     pub propagation_delay_secs: Option<u32>,
     #[graphql(validator(minimum = 1, maximum = 2147483647))]
@@ -181,6 +185,11 @@ pub struct GeneralSettingsInput {
     pub enable_srrdb_lookup: Option<bool>,
     pub watch_folder: Option<WatchFolderSettingsInput>,
     pub duplicate_policy: Option<DuplicatePolicySettingsInput>,
+    // Replaces the global seeding policy; null removes it.
+    pub seeding: MaybeUndefined<SeedingPolicyInput>,
+    /// The global upload cap in bytes per second; null removes it.
+    pub upload_cap: MaybeUndefined<u64>,
+    pub torrent: Option<TorrentSettingsInput>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, SimpleObject)]
@@ -328,10 +337,12 @@ impl From<weaver_server_core::watch_folder::MarkerRename> for WatchFolderMarkerR
 #[graphql(name = "ScheduleTrack")]
 pub enum ScheduleTrackGql {
     Downloads,
+    Torrents,
     PostProcessing,
     WatchFolder,
     Rss,
     Speed,
+    Split,
     Profile,
     Quota,
     Server,
@@ -368,15 +379,17 @@ pub enum ScheduleTargetKind {
     Server,
 }
 
-/// One target of a `speed_limit` rule and the rate it sets. 0 removes the
-/// limit at that level.
+/// One target of a `speed_limit` rule and the rates it sets, in bytes per
+/// second. Null is no limit; 0 lets nothing through.
 #[derive(Debug, Clone, Copy, SimpleObject, InputObject)]
 #[graphql(input_name = "ScheduleSpeedLimitInput")]
 pub struct ScheduleSpeedLimit {
     pub kind: ScheduleTargetKind,
     /// The egress or provider id; null for the global limit.
     pub id: Option<u32>,
-    pub bytes_per_sec: u64,
+    pub download: Option<u64>,
+    /// Global limit only.
+    pub upload: Option<u64>,
 }
 
 impl From<weaver_server_core::bandwidth::SpeedLimitChange> for ScheduleSpeedLimit {
@@ -390,7 +403,8 @@ impl From<weaver_server_core::bandwidth::SpeedLimitChange> for ScheduleSpeedLimi
         Self {
             kind,
             id,
-            bytes_per_sec: change.bytes_per_sec,
+            download: change.bytes_per_sec,
+            upload: change.upload_bytes_per_sec,
         }
     }
 }
@@ -406,10 +420,15 @@ impl TryFrom<ScheduleSpeedLimit> for weaver_server_core::bandwidth::SpeedLimitCh
             (ScheduleTargetKind::Server, Some(id)) => SpeedTarget::Server(id),
             (_, None) => return Err("an egress or provider speed limit needs its id".into()),
         };
-        Ok(Self {
+        let change = Self {
             target,
-            bytes_per_sec: limit.bytes_per_sec,
-        })
+            bytes_per_sec: limit.download,
+            upload_bytes_per_sec: limit.upload,
+        };
+        match change.fault() {
+            Some(fault) => Err(fault.into()),
+            None => Ok(change),
+        }
     }
 }
 
@@ -432,6 +451,10 @@ pub struct Schedule {
     pub prune_completed: Option<SchedulePruneFiles>,
     pub prune_cancelled: Option<SchedulePruneFiles>,
     pub action_type: String,
+    /// The class of job a `pause_class` or `resume_class` rule holds; null
+    /// for every other action.
+    #[graphql(name = "class")]
+    pub held_class: Option<ProtocolGql>,
     /// Rules on this track hold independently of every other track. A rule
     /// touching several tracks reports the first.
     pub track: ScheduleTrackGql,
@@ -444,6 +467,10 @@ pub struct Schedule {
     /// The profile a `hardware_profile` rule puts in force; null for every
     /// other action.
     pub hardware_profile: Option<HardwareProfileGql>,
+    /// Usenet's percentage of the download limit a `bandwidth_split` rule
+    /// puts in force; null lifts back to the operator's split, and is null
+    /// for every other action.
+    pub split_usenet_pct: Option<u8>,
 }
 
 impl From<weaver_server_core::bandwidth::ScheduleEntry> for Schedule {
@@ -453,10 +480,18 @@ impl From<weaver_server_core::bandwidth::ScheduleEntry> for Schedule {
         };
         let track = match e.action.tracks().first() {
             Some(ScheduleTrack::Downloads) => ScheduleTrackGql::Downloads,
+            // A held class keeps its own lane, a fixed value the web lays
+            // out and names; the pipeline has no hold apart and would sit
+            // on the downloads lane.
+            Some(ScheduleTrack::Class(class)) => match class.protocol() {
+                Protocol::Nzb => ScheduleTrackGql::Downloads,
+                Protocol::Torrent => ScheduleTrackGql::Torrents,
+            },
             Some(ScheduleTrack::PostProcessing) => ScheduleTrackGql::PostProcessing,
             Some(ScheduleTrack::WatchFolder) => ScheduleTrackGql::WatchFolder,
             Some(ScheduleTrack::Rss) => ScheduleTrackGql::Rss,
             Some(ScheduleTrack::Speed(_)) => ScheduleTrackGql::Speed,
+            Some(ScheduleTrack::Split) => ScheduleTrackGql::Split,
             Some(ScheduleTrack::Profile) => ScheduleTrackGql::Profile,
             Some(ScheduleTrack::Quota(_)) => ScheduleTrackGql::Quota,
             Some(ScheduleTrack::Server(_)) => ScheduleTrackGql::Server,
@@ -490,13 +525,22 @@ impl From<weaver_server_core::bandwidth::ScheduleEntry> for Schedule {
             ),
             _ => (None, None, None),
         };
+        let held_class = match e.action {
+            ScheduleAction::PauseClass { class } | ScheduleAction::ResumeClass { class } => {
+                Some(class.protocol().into())
+            }
+            _ => None,
+        };
         let mut hardware_profile = None;
+        let mut split_usenet_pct = None;
         let mut speed_limits = Vec::new();
         let mut speed_limit_bytes = None;
         let action_type = match &e.action {
             ScheduleAction::Pause => "pause",
             ScheduleAction::Resume => "resume",
             ScheduleAction::PauseAll => "pause_all",
+            ScheduleAction::PauseClass { .. } => "pause_class",
+            ScheduleAction::ResumeClass { .. } => "resume_class",
             ScheduleAction::PausePostProcessing => "pause_post_processing",
             ScheduleAction::ResumePostProcessing => "resume_post_processing",
             ScheduleAction::PauseWatchFolderScanning => "pause_watch_folder_scanning",
@@ -510,13 +554,17 @@ impl From<weaver_server_core::bandwidth::ScheduleEntry> for Schedule {
                 speed_limit_bytes = limits
                     .iter()
                     .find(|change| change.target == SpeedTarget::Global)
-                    .map(|change| change.bytes_per_sec);
+                    .and_then(|change| change.bytes_per_sec);
                 speed_limits = limits.iter().copied().map(Into::into).collect();
                 "speed_limit"
             }
             ScheduleAction::HardwareProfile { profile } => {
                 hardware_profile = Some((*profile).into());
                 "hardware_profile"
+            }
+            ScheduleAction::BandwidthSplit { usenet_pct } => {
+                split_usenet_pct = *usenet_pct;
+                "bandwidth_split"
             }
         };
         Self {
@@ -536,9 +584,11 @@ impl From<weaver_server_core::bandwidth::ScheduleEntry> for Schedule {
             prune_completed,
             prune_cancelled,
             action_type: action_type.to_string(),
+            held_class,
             speed_limit_bytes,
             speed_limits,
             hardware_profile,
+            split_usenet_pct,
         }
     }
 }
@@ -561,15 +611,23 @@ pub struct ScheduleInput {
     pub prune_completed: Option<SchedulePruneFiles>,
     pub prune_cancelled: Option<SchedulePruneFiles>,
     pub action_type: String,
+    /// The class of job a `pause_class` or `resume_class` rule holds, one
+    /// with a hold of its own; refused for every other action.
+    #[graphql(name = "class")]
+    pub held_class: Option<ProtocolGql>,
     /// A global rate for a `speed_limit` rule, read only when `speedLimits`
-    /// is omitted.
+    /// is omitted. 0 is no limit.
     #[graphql(deprecation = "Use speedLimits.")]
     pub speed_limit_bytes: Option<u64>,
     /// Every target a `speed_limit` rule sets. A target left out is left as
-    /// it is; 0 removes the limit at that level.
+    /// it is.
     pub speed_limits: Option<Vec<ScheduleSpeedLimit>>,
     /// Required when the action is `hardware_profile`, ignored otherwise.
     pub hardware_profile: Option<HardwareProfileGql>,
+    /// Usenet's percentage of the download limit for a `bandwidth_split`
+    /// rule, 1 to 99; omit to lift back to the operator's split. Ignored
+    /// for every other action.
+    pub split_usenet_pct: Option<u8>,
 }
 
 impl ScheduleInput {
@@ -589,16 +647,19 @@ impl ScheduleInput {
                 .speed_limit_bytes
                 .map(|bytes_per_sec| SpeedLimitChange {
                     target: SpeedTarget::Global,
-                    bytes_per_sec,
+                    bytes_per_sec: (bytes_per_sec != 0).then_some(bytes_per_sec),
+                    upload_bytes_per_sec: None,
                 })
                 .into_iter()
                 .collect(),
         };
         // Egress and provider limits are stored as signed 64-bit values.
-        if changes
-            .iter()
-            .any(|change| i64::try_from(change.bytes_per_sec).is_err())
-        {
+        if changes.iter().any(|change| {
+            [change.bytes_per_sec, change.upload_bytes_per_sec]
+                .into_iter()
+                .flatten()
+                .any(|rate| i64::try_from(rate).is_err())
+        }) {
             return Err("speed limit is too large".into());
         }
         let mut seen = std::collections::HashSet::new();
@@ -617,23 +678,26 @@ impl ScheduleInput {
     // honour: a rule that could never apply is refused by name here rather
     // than saved and skipped every time it fires.
     pub fn validate(&self, probe: &SystemProfile) -> Result<(), String> {
-        if !matches!(
-            self.action_type.as_str(),
-            "pause"
-                | "resume"
-                | "pause_all"
-                | "pause_post_processing"
-                | "resume_post_processing"
-                | "pause_watch_folder_scanning"
-                | "resume_watch_folder_scanning"
-                | "pause_rss"
-                | "resume_rss"
-                | "speed_limit"
-                | "hardware_profile"
-                | "set_server_active"
-                | "set_quota_metering"
-                | "prune_history"
-        ) {
+        if self.class_action()?.is_none()
+            && !matches!(
+                self.action_type.as_str(),
+                "pause"
+                    | "resume"
+                    | "pause_all"
+                    | "pause_post_processing"
+                    | "resume_post_processing"
+                    | "pause_watch_folder_scanning"
+                    | "resume_watch_folder_scanning"
+                    | "pause_rss"
+                    | "resume_rss"
+                    | "speed_limit"
+                    | "bandwidth_split"
+                    | "hardware_profile"
+                    | "set_server_active"
+                    | "set_quota_metering"
+                    | "prune_history"
+            )
+        {
             return Err(format!("unknown schedule actionType: {}", self.action_type));
         }
         let one_shot = self.action_type == "prune_history";
@@ -666,6 +730,11 @@ impl ScheduleInput {
         if self.action_type == "speed_limit" && self.speed_limit_changes()?.is_empty() {
             return Err("a speed_limit schedule needs at least one limit".into());
         }
+        if self.action_type == "bandwidth_split"
+            && let Some(usenet_pct) = self.split_usenet_pct
+        {
+            weaver_server_core::bandwidth::BandwidthSplit::new(usenet_pct)?;
+        }
         if self.action_type == "set_server_active"
             && (self.server_id.is_none() || self.server_active.is_none())
         {
@@ -693,54 +762,92 @@ impl ScheduleInput {
         }
     }
 
+    // The pause or resume of one class's own hold this rule names, if it
+    // names one: `pause_class` or `resume_class` and a class with a hold of
+    // its own. A class named on any other action is refused.
+    fn class_action(
+        &self,
+    ) -> Result<Option<weaver_server_core::bandwidth::ScheduleAction>, String> {
+        use weaver_server_core::bandwidth::ScheduleAction;
+        let pause = match self.action_type.as_str() {
+            "pause_class" => true,
+            "resume_class" => false,
+            other => {
+                return match self.held_class {
+                    Some(_) => Err(format!("a {other} schedule takes no class")),
+                    None => Ok(None),
+                };
+            }
+        };
+        let protocol = Protocol::from(
+            self.held_class
+                .ok_or_else(|| format!("a {} schedule needs a class", self.action_type))?,
+        );
+        let class = HeldClass::of(protocol)
+            .ok_or_else(|| format!("the {} class has no pause of its own", protocol.as_str()))?;
+        Ok(Some(if pause {
+            ScheduleAction::PauseClass { class }
+        } else {
+            ScheduleAction::ResumeClass { class }
+        }))
+    }
+
     pub fn into_entry(self) -> Result<weaver_server_core::bandwidth::ScheduleEntry, String> {
         use weaver_server_core::bandwidth::{QuotaTarget, ScheduleAction, Weekday};
 
-        let action = match self.action_type.as_str() {
-            "pause" => ScheduleAction::Pause,
-            "resume" => ScheduleAction::Resume,
-            "pause_all" => ScheduleAction::PauseAll,
-            "pause_post_processing" => ScheduleAction::PausePostProcessing,
-            "resume_post_processing" => ScheduleAction::ResumePostProcessing,
-            "pause_watch_folder_scanning" => ScheduleAction::PauseWatchFolderScanning,
-            "resume_watch_folder_scanning" => ScheduleAction::ResumeWatchFolderScanning,
-            "pause_rss" => ScheduleAction::PauseRss,
-            "resume_rss" => ScheduleAction::ResumeRss,
-            "set_server_active" => ScheduleAction::SetServerActive {
-                server_id: self
-                    .server_id
-                    .ok_or("set_server_active requires serverId")?,
-                active: self
-                    .server_active
-                    .ok_or("set_server_active requires serverActive")?,
-            },
-            "set_quota_metering" => ScheduleAction::SetQuotaMetering {
-                enabled: self
-                    .quota_metering_enabled
-                    .ok_or("set_quota_metering requires quotaMeteringEnabled")?,
-                target: self
-                    .quota_egress_id
-                    .map_or(QuotaTarget::AllEgresses, QuotaTarget::Egress),
-            },
-            "prune_history" => ScheduleAction::PruneHistory {
-                failed: self.prune_failed.map(Into::into),
-                completed: self.prune_completed.map(Into::into),
-                cancelled: self.prune_cancelled.map(Into::into),
-            },
-            "speed_limit" => {
-                let limits = self.speed_limit_changes()?;
-                if limits.is_empty() {
-                    return Err("a speed_limit schedule needs at least one limit".into());
-                }
-                ScheduleAction::SpeedLimit { limits }
-            }
-            "hardware_profile" => match self.hardware_profile {
-                Some(profile) => ScheduleAction::HardwareProfile {
-                    profile: profile.into(),
+        let action = match self.class_action()? {
+            Some(action) => action,
+            None => match self.action_type.as_str() {
+                "pause" => ScheduleAction::Pause,
+                "resume" => ScheduleAction::Resume,
+                "pause_all" => ScheduleAction::PauseAll,
+                "pause_post_processing" => ScheduleAction::PausePostProcessing,
+                "resume_post_processing" => ScheduleAction::ResumePostProcessing,
+                "pause_watch_folder_scanning" => ScheduleAction::PauseWatchFolderScanning,
+                "resume_watch_folder_scanning" => ScheduleAction::ResumeWatchFolderScanning,
+                "pause_rss" => ScheduleAction::PauseRss,
+                "resume_rss" => ScheduleAction::ResumeRss,
+                "set_server_active" => ScheduleAction::SetServerActive {
+                    server_id: self
+                        .server_id
+                        .ok_or("set_server_active requires serverId")?,
+                    active: self
+                        .server_active
+                        .ok_or("set_server_active requires serverActive")?,
                 },
-                None => return Err("a hardware_profile schedule needs a hardwareProfile".into()),
+                "set_quota_metering" => ScheduleAction::SetQuotaMetering {
+                    enabled: self
+                        .quota_metering_enabled
+                        .ok_or("set_quota_metering requires quotaMeteringEnabled")?,
+                    target: self
+                        .quota_egress_id
+                        .map_or(QuotaTarget::AllEgresses, QuotaTarget::Egress),
+                },
+                "prune_history" => ScheduleAction::PruneHistory {
+                    failed: self.prune_failed.map(Into::into),
+                    completed: self.prune_completed.map(Into::into),
+                    cancelled: self.prune_cancelled.map(Into::into),
+                },
+                "speed_limit" => {
+                    let limits = self.speed_limit_changes()?;
+                    if limits.is_empty() {
+                        return Err("a speed_limit schedule needs at least one limit".into());
+                    }
+                    ScheduleAction::SpeedLimit { limits }
+                }
+                "bandwidth_split" => ScheduleAction::BandwidthSplit {
+                    usenet_pct: self.split_usenet_pct,
+                },
+                "hardware_profile" => match self.hardware_profile {
+                    Some(profile) => ScheduleAction::HardwareProfile {
+                        profile: profile.into(),
+                    },
+                    None => {
+                        return Err("a hardware_profile schedule needs a hardwareProfile".into());
+                    }
+                },
+                _ => return Err(format!("unknown schedule actionType: {}", self.action_type)),
             },
-            _ => return Err(format!("unknown schedule actionType: {}", self.action_type)),
         };
         // A day the rule names must be a weekday; dropping an unknown one
         // would quietly widen or narrow when the rule fires.
@@ -827,9 +934,11 @@ mod schedule_input_tests {
             prune_completed: None,
             prune_cancelled: None,
             action_type: action_type.into(),
+            held_class: None,
             speed_limit_bytes: None,
             speed_limits: None,
             hardware_profile: None,
+            split_usenet_pct: None,
         }
     }
 
@@ -837,7 +946,8 @@ mod schedule_input_tests {
         ScheduleSpeedLimit {
             kind,
             id,
-            bytes_per_sec,
+            download: Some(bytes_per_sec),
+            upload: None,
         }
     }
 
@@ -845,7 +955,7 @@ mod schedule_input_tests {
     fn a_speed_rule_sets_each_target_it_names_in_global_egress_provider_order() {
         let mut rule = input("speed_limit");
         rule.speed_limits = Some(vec![
-            limit(ScheduleTargetKind::Server, Some(4), 0),
+            limit(ScheduleTargetKind::Server, Some(4), 1_000_000),
             limit(ScheduleTargetKind::Egress, Some(2), 2_000_000),
             limit(ScheduleTargetKind::Global, None, 5_000_000),
         ]);
@@ -857,15 +967,18 @@ mod schedule_input_tests {
                 limits: vec![
                     SpeedLimitChange {
                         target: SpeedTarget::Global,
-                        bytes_per_sec: 5_000_000,
+                        bytes_per_sec: Some(5_000_000),
+                        upload_bytes_per_sec: None,
                     },
                     SpeedLimitChange {
                         target: SpeedTarget::Egress(2),
-                        bytes_per_sec: 2_000_000,
+                        bytes_per_sec: Some(2_000_000),
+                        upload_bytes_per_sec: None,
                     },
                     SpeedLimitChange {
                         target: SpeedTarget::Server(4),
-                        bytes_per_sec: 0,
+                        bytes_per_sec: Some(1_000_000),
+                        upload_bytes_per_sec: None,
                     },
                 ],
             }
@@ -886,10 +999,62 @@ mod schedule_input_tests {
             ScheduleAction::SpeedLimit {
                 limits: vec![SpeedLimitChange {
                     target: SpeedTarget::Global,
-                    bytes_per_sec: 1024,
+                    bytes_per_sec: Some(1024),
+                    upload_bytes_per_sec: None,
                 }],
             }
         );
+        // The old field's 0 was no limit.
+        let mut rule = input("speed_limit");
+        rule.speed_limit_bytes = Some(0);
+        assert_eq!(
+            rule.into_entry().unwrap().action,
+            ScheduleAction::SpeedLimit {
+                limits: vec![SpeedLimitChange {
+                    target: SpeedTarget::Global,
+                    bytes_per_sec: None,
+                    upload_bytes_per_sec: None,
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn only_the_global_target_takes_an_upload_limit_and_a_provider_no_zero() {
+        let mut rule = input("speed_limit");
+        rule.speed_limits = Some(vec![ScheduleSpeedLimit {
+            kind: ScheduleTargetKind::Global,
+            id: None,
+            download: None,
+            upload: Some(0),
+        }]);
+        let entry = rule.into_entry().unwrap();
+        assert_eq!(
+            entry.action,
+            ScheduleAction::SpeedLimit {
+                limits: vec![SpeedLimitChange {
+                    target: SpeedTarget::Global,
+                    bytes_per_sec: None,
+                    upload_bytes_per_sec: Some(0),
+                }],
+            }
+        );
+        let shown = Schedule::from(entry);
+        assert_eq!(shown.speed_limits[0].upload, Some(0));
+        for (kind, download, upload) in [
+            (ScheduleTargetKind::Egress, None, Some(1)),
+            (ScheduleTargetKind::Server, None, Some(1)),
+            (ScheduleTargetKind::Server, Some(0), None),
+        ] {
+            let mut rule = input("speed_limit");
+            rule.speed_limits = Some(vec![ScheduleSpeedLimit {
+                kind,
+                id: Some(1),
+                download,
+                upload,
+            }]);
+            assert!(rule.validate(&probe()).is_err());
+        }
     }
 
     #[test]
@@ -978,5 +1143,889 @@ mod schedule_input_tests {
             delete_files: false,
         });
         rule.validate(&probe()).unwrap();
+    }
+
+    #[test]
+    fn a_split_rule_sets_a_percentage_or_lifts_and_refuses_one_out_of_range() {
+        let mut rule = input("bandwidth_split");
+        rule.split_usenet_pct = Some(80);
+        rule.validate(&probe()).unwrap();
+        let entry = rule.into_entry().unwrap();
+        assert_eq!(
+            entry.action,
+            ScheduleAction::BandwidthSplit {
+                usenet_pct: Some(80)
+            }
+        );
+        let shown = Schedule::from(entry);
+        assert_eq!(shown.action_type, "bandwidth_split");
+        assert_eq!(shown.track, ScheduleTrackGql::Split);
+        assert_eq!(shown.split_usenet_pct, Some(80));
+
+        let lift = input("bandwidth_split");
+        lift.validate(&probe()).unwrap();
+        assert_eq!(
+            lift.into_entry().unwrap().action,
+            ScheduleAction::BandwidthSplit { usenet_pct: None }
+        );
+
+        for usenet_pct in [0, 100] {
+            let mut rule = input("bandwidth_split");
+            rule.split_usenet_pct = Some(usenet_pct);
+            assert!(rule.validate(&probe()).is_err());
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Enum)]
+#[graphql(name = "SeedingGoalMode")]
+pub enum SeedingGoalModeGql {
+    #[default]
+    Any,
+    All,
+}
+
+impl From<weaver_server_core::settings::SeedingGoalMode> for SeedingGoalModeGql {
+    fn from(value: weaver_server_core::settings::SeedingGoalMode) -> Self {
+        use weaver_server_core::settings::SeedingGoalMode;
+        match value {
+            SeedingGoalMode::Any => Self::Any,
+            SeedingGoalMode::All => Self::All,
+        }
+    }
+}
+
+impl From<SeedingGoalModeGql> for weaver_server_core::settings::SeedingGoalMode {
+    fn from(value: SeedingGoalModeGql) -> Self {
+        match value {
+            SeedingGoalModeGql::Any => Self::Any,
+            SeedingGoalModeGql::All => Self::All,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Enum)]
+#[graphql(name = "SeedingAction")]
+pub enum SeedingActionGql {
+    #[default]
+    Stop,
+    Remove,
+    RemoveWithData,
+}
+
+impl From<weaver_server_core::settings::SeedingAction> for SeedingActionGql {
+    fn from(value: weaver_server_core::settings::SeedingAction) -> Self {
+        use weaver_server_core::settings::SeedingAction;
+        match value {
+            SeedingAction::Stop => Self::Stop,
+            SeedingAction::Remove => Self::Remove,
+            SeedingAction::RemoveWithData => Self::RemoveWithData,
+        }
+    }
+}
+
+impl From<SeedingActionGql> for weaver_server_core::settings::SeedingAction {
+    fn from(value: SeedingActionGql) -> Self {
+        match value {
+            SeedingActionGql::Stop => Self::Stop,
+            SeedingActionGql::Remove => Self::Remove,
+            SeedingActionGql::RemoveWithData => Self::RemoveWithData,
+        }
+    }
+}
+
+/// Which seconds a seed-time goal counts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Enum)]
+#[graphql(name = "SeedTimeCounting")]
+pub enum SeedTimeCountingGql {
+    /// Every second the torrent has seeded.
+    #[default]
+    Cumulative,
+    /// The seconds since it last stopped seeding.
+    Consecutive,
+}
+
+impl From<weaver_server_core::settings::SeedTimeCounting> for SeedTimeCountingGql {
+    fn from(value: weaver_server_core::settings::SeedTimeCounting) -> Self {
+        use weaver_server_core::settings::SeedTimeCounting;
+        match value {
+            SeedTimeCounting::Cumulative => Self::Cumulative,
+            SeedTimeCounting::Consecutive => Self::Consecutive,
+        }
+    }
+}
+
+impl From<SeedTimeCountingGql> for weaver_server_core::settings::SeedTimeCounting {
+    fn from(value: SeedTimeCountingGql) -> Self {
+        match value {
+            SeedTimeCountingGql::Cumulative => Self::Cumulative,
+            SeedTimeCountingGql::Consecutive => Self::Consecutive,
+        }
+    }
+}
+
+/// How a level holds one setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+#[graphql(name = "LeafState")]
+pub enum LeafStateGql {
+    /// Taken from the level above.
+    Inherit,
+    /// Switched off here: no goal, no cap.
+    Off,
+    /// Set here, to `value`.
+    Set,
+}
+
+/// One setting at one level.
+#[derive(Debug, Clone, Copy, PartialEq, SimpleObject)]
+#[graphql(concrete(name = "RatioLeaf", params(f32)))]
+#[graphql(concrete(name = "MinutesLeaf", params(u32)))]
+#[graphql(concrete(name = "BpsLeaf", params(u64)))]
+#[graphql(concrete(name = "GoalModeLeaf", params(SeedingGoalModeGql)))]
+#[graphql(concrete(name = "SeedingActionLeaf", params(SeedingActionGql)))]
+#[graphql(concrete(name = "SeedTimeCountingLeaf", params(SeedTimeCountingGql)))]
+pub struct LeafGql<T: OutputType> {
+    pub state: LeafStateGql,
+    /// The value while `state` is `SET`.
+    pub value: Option<T>,
+}
+
+impl<T: OutputType> LeafGql<T> {
+    pub fn of<U: Into<T>>(leaf: Leaf<U>) -> Self {
+        match leaf {
+            Leaf::Inherit => Self {
+                state: LeafStateGql::Inherit,
+                value: None,
+            },
+            Leaf::Off => Self {
+                state: LeafStateGql::Off,
+                value: None,
+            },
+            Leaf::Set(value) => Self {
+                state: LeafStateGql::Set,
+                value: Some(value.into()),
+            },
+        }
+    }
+}
+
+/// One setting at one level; `value` is given with `SET` and only then.
+#[derive(Debug, Clone, Copy, InputObject)]
+#[graphql(concrete(name = "RatioLeafInput", params(f32)))]
+#[graphql(concrete(name = "MinutesLeafInput", params(u32)))]
+#[graphql(concrete(name = "BpsLeafInput", params(u64)))]
+#[graphql(concrete(name = "GoalModeLeafInput", params(SeedingGoalModeGql)))]
+#[graphql(concrete(name = "SeedingActionLeafInput", params(SeedingActionGql)))]
+#[graphql(concrete(name = "SeedTimeCountingLeafInput", params(SeedTimeCountingGql)))]
+pub struct LeafInput<T: InputType> {
+    pub state: LeafStateGql,
+    pub value: Option<T>,
+}
+
+impl<T: InputType> LeafInput<T> {
+    pub fn into_leaf<U: From<T>>(self) -> async_graphql::Result<Leaf<U>> {
+        match (self.state, self.value) {
+            (LeafStateGql::Inherit, None) => Ok(Leaf::Inherit),
+            (LeafStateGql::Off, None) => Ok(Leaf::Off),
+            (LeafStateGql::Set, Some(value)) => Ok(Leaf::Set(value.into())),
+            (LeafStateGql::Set, None) => Err(async_graphql::Error::new(
+                "a setting that is set needs its value",
+            )),
+            (_, Some(_)) => Err(async_graphql::Error::new(
+                "only a setting that is set takes a value",
+            )),
+        }
+    }
+}
+
+/// A leaf left out inherits.
+pub fn leaf_of<T: InputType, U: From<T>>(
+    input: Option<LeafInput<T>>,
+) -> async_graphql::Result<Leaf<U>> {
+    input.map_or(Ok(Leaf::Inherit), LeafInput::into_leaf)
+}
+
+/// A level a torrent takes a setting from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+#[graphql(name = "SettingLevel")]
+pub enum SettingLevelGql {
+    Torrent,
+    TrackerRule,
+    Category,
+    Global,
+}
+
+impl From<Level> for SettingLevelGql {
+    fn from(level: Level) -> Self {
+        match level {
+            Level::Torrent => Self::Torrent,
+            Level::TrackerRule => Self::TrackerRule,
+            Level::Category => Self::Category,
+            Level::Global => Self::Global,
+        }
+    }
+}
+
+/// Seeding terms at one level: each one inherited, off or set.
+#[derive(Debug, Clone, Copy, PartialEq, SimpleObject)]
+pub struct SeedingPolicySettings {
+    pub ratio_goal: LeafGql<f32>,
+    pub seed_time_goal_minutes: LeafGql<u32>,
+    pub inactive_goal_minutes: LeafGql<u32>,
+    pub mode: LeafGql<SeedingGoalModeGql>,
+    pub action: LeafGql<SeedingActionGql>,
+    pub seed_time_counting: LeafGql<SeedTimeCountingGql>,
+}
+
+impl From<weaver_server_core::settings::SeedingPolicy> for SeedingPolicySettings {
+    fn from(value: weaver_server_core::settings::SeedingPolicy) -> Self {
+        Self {
+            ratio_goal: LeafGql::of(value.ratio_goal),
+            seed_time_goal_minutes: LeafGql::of(value.seed_time_goal_minutes),
+            inactive_goal_minutes: LeafGql::of(value.inactive_goal_minutes),
+            mode: LeafGql::of(value.mode),
+            action: LeafGql::of(value.action),
+            seed_time_counting: LeafGql::of(value.seed_time_counting),
+        }
+    }
+}
+
+/// Seeding terms at one level; a term left out inherits.
+#[derive(Debug, Clone, Copy, InputObject)]
+pub struct SeedingPolicyInput {
+    pub ratio_goal: Option<LeafInput<f32>>,
+    pub seed_time_goal_minutes: Option<LeafInput<u32>>,
+    pub inactive_goal_minutes: Option<LeafInput<u32>>,
+    pub mode: Option<LeafInput<SeedingGoalModeGql>>,
+    pub action: Option<LeafInput<SeedingActionGql>>,
+    pub seed_time_counting: Option<LeafInput<SeedTimeCountingGql>>,
+}
+
+impl SeedingPolicyInput {
+    pub fn into_policy(self) -> async_graphql::Result<weaver_server_core::settings::SeedingPolicy> {
+        let policy = weaver_server_core::settings::SeedingPolicy {
+            ratio_goal: leaf_of(self.ratio_goal)?,
+            seed_time_goal_minutes: leaf_of(self.seed_time_goal_minutes)?,
+            inactive_goal_minutes: leaf_of(self.inactive_goal_minutes)?,
+            mode: leaf_of(self.mode)?,
+            action: leaf_of(self.action)?,
+            seed_time_counting: leaf_of(self.seed_time_counting)?,
+        };
+        policy.validate().map_err(async_graphql::Error::new)?;
+        Ok(policy)
+    }
+}
+
+/// Seeding goals for the torrents announcing to a host, and whether the
+/// schedule's pause leaves them seeding until their goal is met.
+#[derive(Debug, Clone, PartialEq, SimpleObject)]
+pub struct TrackerRule {
+    pub id: u32,
+    /// A host, or `*.` and a host for it and every host under it.
+    pub host_pattern: String,
+    /// The goals this rule sets; absent leaves them to the category and the
+    /// global policy.
+    pub seeding: Option<SeedingPolicySettings>,
+    pub never_pause: bool,
+    /// Whether its torrents' archives are extracted; absent inherits.
+    pub unpack: Option<bool>,
+    /// The client its torrents name themselves as; absent is Weaver.
+    pub client: Option<TorrentClientGql>,
+    /// Whether its torrents route through their own consumer.
+    pub torrent_route: bool,
+    /// Whether its torrents look for peers on the DHT; absent inherits. A
+    /// private torrent does not, whatever this says.
+    pub dht: Option<bool>,
+    /// Whether its torrents exchange peers with their peers (PEX); absent
+    /// inherits. A private torrent does not, whatever this says.
+    pub pex: Option<bool>,
+    /// Whether its torrents look for peers on the local network (LSD);
+    /// absent inherits. A private torrent does not, whatever this says.
+    pub lsd: Option<bool>,
+    /// The encryption its torrents' connections are made under; absent
+    /// inherits.
+    pub encryption: Option<TorrentEncryptionGql>,
+    /// Whether its torrents dial peers over TCP; absent inherits. The
+    /// session listens as the global setting says.
+    pub peer_tcp: Option<bool>,
+    /// Whether its torrents dial peers over uTP; absent inherits.
+    pub peer_utp: Option<bool>,
+    /// The transport its torrents try first while downloading; absent
+    /// inherits.
+    pub prefer_downloading: Option<PeerTransportGql>,
+    /// The transport its torrents try first while seeding; absent inherits.
+    pub prefer_seeding: Option<PeerTransportGql>,
+    /// The upload cap its torrents take in place of their category's and
+    /// the global one.
+    pub upload_cap: LeafGql<u64>,
+    /// Whether a torrent admitted under it starts forced.
+    pub forced: bool,
+    /// Whether it holds a certificate for its SSL torrents.
+    pub has_ssl: bool,
+    /// The certificate's subject.
+    pub ssl_subject: Option<String>,
+    /// When the certificate expires, in milliseconds since the epoch.
+    pub ssl_not_after: Option<i64>,
+    /// The tracker file that filled it; absent when none binds it.
+    pub bound: Option<TrackerBinding>,
+    /// How many archive passwords it holds for its torrents. The values are
+    /// never returned.
+    pub archive_password_count: u32,
+}
+
+/// The tracker file a rule was filled from.
+#[derive(Debug, Clone, PartialEq, SimpleObject)]
+pub struct TrackerBinding {
+    /// The tracker's name, as its file states it.
+    pub name: String,
+    pub revision: String,
+    /// When it was imported, in milliseconds since the epoch.
+    pub imported_at: i64,
+    /// The fields the file locked: dht, pex, lsd, encryption, ssl.
+    pub locked: Vec<String>,
+}
+
+impl From<weaver_server_core::settings::tracker_file::Binding> for TrackerBinding {
+    fn from(bound: weaver_server_core::settings::tracker_file::Binding) -> Self {
+        Self {
+            name: bound.name,
+            revision: bound.revision,
+            imported_at: bound.imported_at_ms,
+            locked: bound.locked,
+        }
+    }
+}
+
+/// What importing a tracker file would do. It holds nothing secret.
+#[derive(Debug, Clone, PartialEq, SimpleObject)]
+pub struct TrackerFilePreview {
+    pub name: String,
+    pub revision: String,
+    pub host_pattern: String,
+    /// The rule the file fills; absent makes a new rule.
+    pub rule_id: Option<u32>,
+    pub changes: Vec<TrackerFileChange>,
+    pub has_ssl: bool,
+    pub ssl_subject: Option<String>,
+    /// When the certificate expires, in milliseconds since the epoch.
+    pub ssl_not_after: Option<i64>,
+    /// How many archive passwords it carries; absent when it names none.
+    pub archive_password_count: Option<u32>,
+    /// Pass back to `applyTrackerFile`.
+    pub fingerprint: String,
+}
+
+/// One value a tracker file sets: as the rule holds it and as the import
+/// leaves it, absent when not set.
+#[derive(Debug, Clone, PartialEq, SimpleObject)]
+pub struct TrackerFileChange {
+    pub field: String,
+    pub locked: bool,
+    pub old: Option<String>,
+    pub new: Option<String>,
+}
+
+impl From<weaver_server_core::settings::tracker_file::Preview> for TrackerFilePreview {
+    fn from(preview: weaver_server_core::settings::tracker_file::Preview) -> Self {
+        Self {
+            name: preview.name,
+            revision: preview.revision,
+            host_pattern: preview.host_pattern,
+            rule_id: preview.rule_id,
+            changes: preview
+                .changes
+                .into_iter()
+                .map(|change| TrackerFileChange {
+                    field: change.field.to_owned(),
+                    locked: change.locked,
+                    old: change.old,
+                    new: change.new,
+                })
+                .collect(),
+            has_ssl: preview.has_ssl,
+            ssl_subject: preview.ssl.as_ref().map(|ssl| ssl.subject.clone()),
+            ssl_not_after: preview.ssl.map(|ssl| ssl.not_after_ms),
+            archive_password_count: preview
+                .archive_passwords
+                .map(|count| u32::try_from(count).unwrap_or(u32::MAX)),
+            fingerprint: preview.fingerprint,
+        }
+    }
+}
+
+/// The certificate and private key a tracker issued, each PEM.
+#[derive(Clone, InputObject)]
+pub struct TrackerCertificateInput {
+    pub certificate_pem: String,
+    pub private_key_pem: String,
+}
+
+// The private key is never printed.
+impl std::fmt::Debug for TrackerCertificateInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TrackerCertificateInput")
+            .field("certificate_pem", &self.certificate_pem)
+            .finish_non_exhaustive()
+    }
+}
+
+impl From<weaver_server_core::settings::model::TrackerRule> for TrackerRule {
+    fn from(rule: weaver_server_core::settings::model::TrackerRule) -> Self {
+        let summary = rule.ssl.as_ref().and_then(|ssl| ssl.summary());
+        Self {
+            id: rule.id,
+            host_pattern: rule.host_pattern,
+            seeding: rule.seeding.map(Into::into),
+            never_pause: rule.never_pause,
+            unpack: rule.unpack,
+            client: rule.client.map(Into::into),
+            torrent_route: rule.torrent_route,
+            dht: rule.dht,
+            pex: rule.pex,
+            lsd: rule.lsd,
+            encryption: rule.encryption.map(Into::into),
+            peer_tcp: rule.transports.tcp,
+            peer_utp: rule.transports.utp,
+            prefer_downloading: rule.transports.prefer_downloading.map(Into::into),
+            prefer_seeding: rule.transports.prefer_seeding.map(Into::into),
+            upload_cap: LeafGql::of(rule.upload_cap),
+            forced: rule.forced,
+            has_ssl: rule.ssl.is_some(),
+            ssl_subject: summary.as_ref().map(|summary| summary.subject.clone()),
+            ssl_not_after: summary.map(|summary| summary.not_after_ms),
+            bound: rule.bound.map(Into::into),
+            archive_password_count: u32::try_from(rule.archive_passwords.len()).unwrap_or(u32::MAX),
+        }
+    }
+}
+
+#[derive(Debug, Clone, InputObject)]
+pub struct TrackerRuleInput {
+    pub host_pattern: String,
+    pub seeding: Option<SeedingPolicyInput>,
+    #[graphql(default)]
+    pub never_pause: bool,
+    pub unpack: Option<bool>,
+    pub client: Option<TorrentClientGql>,
+    #[graphql(default)]
+    pub torrent_route: bool,
+    pub dht: Option<bool>,
+    pub pex: Option<bool>,
+    pub lsd: Option<bool>,
+    pub encryption: Option<TorrentEncryptionGql>,
+    /// Left out inherits. TCP and uTP may not both be off once resolved
+    /// over the global setting. A preference is kept as set; while its
+    /// transport is off, the one left on is used.
+    pub peer_tcp: Option<bool>,
+    /// Left out inherits.
+    pub peer_utp: Option<bool>,
+    /// Left out inherits.
+    pub prefer_downloading: Option<PeerTransportGql>,
+    /// Left out inherits.
+    pub prefer_seeding: Option<PeerTransportGql>,
+    /// Left out inherits.
+    pub upload_cap: Option<LeafInput<u64>>,
+    #[graphql(default)]
+    pub forced: bool,
+    /// Absent keeps the rule's certificate; null clears it.
+    pub ssl: MaybeUndefined<TrackerCertificateInput>,
+    /// True clears the rule's archive passwords; false keeps them.
+    #[graphql(default)]
+    pub clear_archive_passwords: bool,
+}
+
+impl TrackerRuleInput {
+    pub fn into_rule(
+        self,
+        id: u32,
+    ) -> async_graphql::Result<weaver_server_core::settings::model::TrackerRule> {
+        use weaver_server_core::settings::model::{TrackerCertificate, TrackerRule};
+        TrackerRule {
+            archive_passwords: Default::default(),
+            bound: None,
+            id,
+            host_pattern: self.host_pattern,
+            seeding: self
+                .seeding
+                .map(SeedingPolicyInput::into_policy)
+                .transpose()?,
+            never_pause: self.never_pause,
+            unpack: self.unpack,
+            client: self.client.map(Into::into),
+            torrent_route: self.torrent_route,
+            dht: self.dht,
+            pex: self.pex,
+            lsd: self.lsd,
+            encryption: self.encryption.map(Into::into),
+            transports: weaver_server_core::settings::TransportRule {
+                tcp: self.peer_tcp,
+                utp: self.peer_utp,
+                prefer_downloading: self.prefer_downloading.map(Into::into),
+                prefer_seeding: self.prefer_seeding.map(Into::into),
+            },
+            upload_cap: leaf_of(self.upload_cap)?,
+            forced: self.forced,
+            ssl: self.ssl.take().map(|ssl| TrackerCertificate {
+                certificate_pem: ssl.certificate_pem,
+                private_key_pem: ssl.private_key_pem,
+            }),
+        }
+        .checked()
+        .map_err(async_graphql::Error::new)
+    }
+}
+
+/// A client a torrent may name itself as to its peers and trackers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+#[graphql(name = "TorrentClient")]
+pub enum TorrentClientGql {
+    Weaver,
+    #[graphql(name = "QBITTORRENT")]
+    QBittorrent,
+}
+
+impl From<weaver_server_core::settings::Client> for TorrentClientGql {
+    fn from(value: weaver_server_core::settings::Client) -> Self {
+        use weaver_server_core::settings::Client;
+        match value {
+            Client::Weaver => Self::Weaver,
+            Client::QBittorrent => Self::QBittorrent,
+        }
+    }
+}
+
+impl From<TorrentClientGql> for weaver_server_core::settings::Client {
+    fn from(value: TorrentClientGql) -> Self {
+        match value {
+            TorrentClientGql::Weaver => Self::Weaver,
+            TorrentClientGql::QBittorrent => Self::QBittorrent,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Enum)]
+#[graphql(name = "TorrentEncryption")]
+pub enum TorrentEncryptionGql {
+    #[default]
+    Prefer,
+    Require,
+    Disabled,
+}
+
+impl From<weaver_server_core::settings::TorrentEncryption> for TorrentEncryptionGql {
+    fn from(value: weaver_server_core::settings::TorrentEncryption) -> Self {
+        use weaver_server_core::settings::TorrentEncryption;
+        match value {
+            TorrentEncryption::Prefer => Self::Prefer,
+            TorrentEncryption::Require => Self::Require,
+            TorrentEncryption::Disabled => Self::Disabled,
+        }
+    }
+}
+
+impl From<TorrentEncryptionGql> for weaver_server_core::settings::TorrentEncryption {
+    fn from(value: TorrentEncryptionGql) -> Self {
+        match value {
+            TorrentEncryptionGql::Prefer => Self::Prefer,
+            TorrentEncryptionGql::Require => Self::Require,
+            TorrentEncryptionGql::Disabled => Self::Disabled,
+        }
+    }
+}
+
+/// A transport peers are reached and taken on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+#[graphql(name = "PeerTransport")]
+pub enum PeerTransportGql {
+    Tcp,
+    Utp,
+}
+
+impl From<weaver_server_core::settings::PeerTransport> for PeerTransportGql {
+    fn from(value: weaver_server_core::settings::PeerTransport) -> Self {
+        use weaver_server_core::settings::PeerTransport;
+        match value {
+            PeerTransport::Tcp => Self::Tcp,
+            PeerTransport::Utp => Self::Utp,
+        }
+    }
+}
+
+impl From<PeerTransportGql> for weaver_server_core::settings::PeerTransport {
+    fn from(value: PeerTransportGql) -> Self {
+        match value {
+            PeerTransportGql::Tcp => Self::Tcp,
+            PeerTransportGql::Utp => Self::Utp,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SimpleObject)]
+pub struct TorrentSettings {
+    pub enabled: bool,
+    pub base_port: u16,
+    pub announce_port: Option<u16>,
+    pub upnp: bool,
+    pub encryption: TorrentEncryptionGql,
+    pub max_active_downloads: u32,
+    pub max_peers_total: u32,
+    pub session_dir: Option<String>,
+    pub unpack: bool,
+    /// Null for no limit.
+    pub connections_limit: Option<std::num::NonZeroU32>,
+    /// Null for no limit.
+    pub unchoke_slots_limit: Option<std::num::NonZeroU32>,
+    pub connection_speed: std::num::NonZeroU32,
+    pub allow_multiple_connections_per_ip: bool,
+    /// Whether peers are reached and taken over TCP: listened on and
+    /// dialed.
+    pub peer_tcp: bool,
+    /// Whether peers are reached and taken over uTP.
+    pub peer_utp: bool,
+    /// The transport a dial tries first while its torrent downloads, as
+    /// set; while one transport is off, the one left on is used.
+    pub prefer_downloading: PeerTransportGql,
+    /// The transport a dial tries first once its torrent holds every piece
+    /// it wants, as set; while one transport is off, the one left on is
+    /// used.
+    pub prefer_seeding: PeerTransportGql,
+    pub dht_bootstrap_nodes: String,
+    pub blocklist_enabled: bool,
+    /// An http, https or file URL, or a path.
+    pub blocklist: Option<String>,
+    pub stop_tracker_timeout_secs: u32,
+    /// Each one address or `first - last`.
+    pub banned_ips: Vec<String>,
+    pub block_privileged_ports: bool,
+    pub filter_trackers: bool,
+    /// Whether SSL torrents' peers are taken, on a port of their own.
+    pub ssl_enabled: bool,
+    /// The first route's SSL port; each further route takes the next.
+    /// Absent, one is chosen at random and kept.
+    pub ssl_port: Option<u16>,
+}
+
+impl From<&weaver_server_core::settings::TorrentConfig> for TorrentSettings {
+    fn from(value: &weaver_server_core::settings::TorrentConfig) -> Self {
+        Self {
+            enabled: value.enabled,
+            base_port: value.base_port,
+            announce_port: value.announce_port,
+            upnp: value.upnp,
+            encryption: value.encryption.into(),
+            max_active_downloads: value.max_active_downloads,
+            max_peers_total: value.max_peers_total,
+            session_dir: value
+                .session_dir
+                .as_ref()
+                .map(|dir| dir.display().to_string()),
+            unpack: value.unpack,
+            connections_limit: value.connections_limit.count(),
+            unchoke_slots_limit: value.unchoke_slots_limit.count(),
+            connection_speed: value.connection_speed,
+            allow_multiple_connections_per_ip: value.allow_multiple_connections_per_ip,
+            peer_tcp: value.transports.tcp,
+            peer_utp: value.transports.utp,
+            prefer_downloading: value.transports.prefer_downloading.into(),
+            prefer_seeding: value.transports.prefer_seeding.into(),
+            dht_bootstrap_nodes: value.dht_bootstrap_nodes.clone(),
+            blocklist_enabled: value.blocklist_enabled,
+            blocklist: value.blocklist.clone(),
+            stop_tracker_timeout_secs: value.stop_tracker_timeout_secs,
+            banned_ips: value.banned_ips.clone(),
+            block_privileged_ports: value.block_privileged_ports,
+            filter_trackers: value.filter_trackers,
+            ssl_enabled: value.ssl_enabled,
+            ssl_port: value.ssl_port,
+        }
+    }
+}
+
+#[derive(Debug, Clone, InputObject)]
+pub struct TorrentSettingsInput {
+    pub enabled: Option<bool>,
+    pub base_port: Option<u16>,
+    pub announce_port: MaybeUndefined<u16>,
+    pub upnp: Option<bool>,
+    pub encryption: Option<TorrentEncryptionGql>,
+    pub max_active_downloads: Option<u32>,
+    pub max_peers_total: Option<u32>,
+    pub session_dir: MaybeUndefined<String>,
+    pub unpack: Option<bool>,
+    /// Null for no limit.
+    pub connections_limit: MaybeUndefined<std::num::NonZeroU32>,
+    /// Null for no limit.
+    pub unchoke_slots_limit: MaybeUndefined<std::num::NonZeroU32>,
+    pub connection_speed: Option<std::num::NonZeroU32>,
+    pub allow_multiple_connections_per_ip: Option<bool>,
+    /// TCP and uTP may not both be off. The preferences are kept as set
+    /// either way.
+    pub peer_tcp: Option<bool>,
+    pub peer_utp: Option<bool>,
+    pub prefer_downloading: Option<PeerTransportGql>,
+    pub prefer_seeding: Option<PeerTransportGql>,
+    pub dht_bootstrap_nodes: Option<String>,
+    pub blocklist_enabled: Option<bool>,
+    /// An http, https or file URL, or a path.
+    pub blocklist: MaybeUndefined<String>,
+    pub stop_tracker_timeout_secs: Option<u32>,
+    /// Each an address, `first - last` or a subnet; the whole list.
+    pub banned_ips: Option<Vec<String>>,
+    pub block_privileged_ports: Option<bool>,
+    pub filter_trackers: Option<bool>,
+    pub ssl_enabled: Option<bool>,
+    /// Null leaves the port to be chosen at random and kept.
+    pub ssl_port: MaybeUndefined<u16>,
+    /// With `enabled: false`: how the torrents still running end. Left
+    /// out, they stop at once.
+    pub when_disabled: Option<TorrentDisableModeGql>,
+}
+
+/// How the torrents still running end when torrents are turned off. No new
+/// torrent is taken in any of them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Enum, Serialize, Deserialize)]
+#[graphql(name = "TorrentDisableMode")]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TorrentDisableModeGql {
+    /// Every torrent stops now.
+    #[default]
+    StopNow,
+    /// Downloads finish; seeding stops; then torrents are off.
+    FinishDownloads,
+    /// Torrents download and seed to their own limits; then torrents are
+    /// off.
+    FinishAll,
+}
+
+impl TorrentDisableModeGql {
+    pub fn wind_down(self) -> Option<weaver_server_core::torrents::service::WindDown> {
+        use weaver_server_core::torrents::service::WindDown;
+        match self {
+            Self::StopNow => None,
+            Self::FinishDownloads => Some(WindDown::FinishDownloads),
+            Self::FinishAll => Some(WindDown::Finish),
+        }
+    }
+
+    /// The mode a wind-down under way was taken by.
+    pub fn of_wind_down(wind_down: weaver_server_core::torrents::service::WindDown) -> Self {
+        use weaver_server_core::torrents::service::WindDown;
+        match wind_down {
+            WindDown::FinishDownloads => Self::FinishDownloads,
+            WindDown::Finish => Self::FinishAll,
+        }
+    }
+}
+
+impl TorrentSettingsInput {
+    pub fn apply(&self, torrent: &mut weaver_server_core::settings::TorrentConfig) {
+        if let Some(enabled) = self.enabled {
+            torrent.enabled = enabled;
+        }
+        if let Some(port) = self.base_port {
+            torrent.base_port = port;
+        }
+        match self.announce_port {
+            MaybeUndefined::Undefined => {}
+            MaybeUndefined::Null => torrent.announce_port = None,
+            MaybeUndefined::Value(port) => torrent.announce_port = Some(port),
+        }
+        if let Some(upnp) = self.upnp {
+            torrent.upnp = upnp;
+        }
+        if let Some(encryption) = self.encryption {
+            torrent.encryption = encryption.into();
+        }
+        if let Some(limit) = self.max_active_downloads {
+            torrent.max_active_downloads = limit;
+        }
+        if let Some(limit) = self.max_peers_total {
+            torrent.max_peers_total = limit;
+        }
+        match &self.session_dir {
+            MaybeUndefined::Undefined => {}
+            MaybeUndefined::Null => torrent.session_dir = None,
+            MaybeUndefined::Value(dir) if dir.trim().is_empty() => torrent.session_dir = None,
+            MaybeUndefined::Value(dir) => torrent.session_dir = Some(dir.trim().into()),
+        }
+        if let Some(unpack) = self.unpack {
+            torrent.unpack = unpack;
+        }
+        use weaver_server_core::settings::TorrentLimit;
+        let limit = |given: &MaybeUndefined<std::num::NonZeroU32>, limit: &mut TorrentLimit| {
+            if !given.is_undefined() {
+                *limit = TorrentLimit::of(given.value().copied());
+            }
+        };
+        limit(&self.connections_limit, &mut torrent.connections_limit);
+        limit(&self.unchoke_slots_limit, &mut torrent.unchoke_slots_limit);
+        if let Some(speed) = self.connection_speed {
+            torrent.connection_speed = speed;
+        }
+        if let Some(allow) = self.allow_multiple_connections_per_ip {
+            torrent.allow_multiple_connections_per_ip = allow;
+        }
+        let transports = &mut torrent.transports;
+        if let Some(tcp) = self.peer_tcp {
+            transports.tcp = tcp;
+        }
+        if let Some(utp) = self.peer_utp {
+            transports.utp = utp;
+        }
+        if let Some(prefer) = self.prefer_downloading {
+            transports.prefer_downloading = prefer.into();
+        }
+        if let Some(prefer) = self.prefer_seeding {
+            transports.prefer_seeding = prefer.into();
+        }
+        if let Some(nodes) = &self.dht_bootstrap_nodes {
+            torrent.dht_bootstrap_nodes.clone_from(nodes);
+        }
+        if let Some(enabled) = self.blocklist_enabled {
+            torrent.blocklist_enabled = enabled;
+        }
+        if !self.blocklist.is_undefined() {
+            torrent.blocklist = self.blocklist.value().cloned();
+        }
+        if let Some(secs) = self.stop_tracker_timeout_secs {
+            torrent.stop_tracker_timeout_secs = secs;
+        }
+        if let Some(banned) = &self.banned_ips {
+            torrent.banned_ips.clone_from(banned);
+        }
+        if let Some(block) = self.block_privileged_ports {
+            torrent.block_privileged_ports = block;
+        }
+        if let Some(filter) = self.filter_trackers {
+            torrent.filter_trackers = filter;
+        }
+        if let Some(enabled) = self.ssl_enabled {
+            torrent.ssl_enabled = enabled;
+        }
+        if !self.ssl_port.is_undefined() {
+            torrent.ssl_port = self.ssl_port.value().copied();
+        }
+    }
+}
+
+impl From<&weaver_server_core::settings::Config> for GeneralSettings {
+    fn from(cfg: &weaver_server_core::settings::Config) -> Self {
+        Self {
+            data_dir: cfg.data_dir.clone(),
+            intermediate_dir: cfg.intermediate_dir(),
+            complete_dir: cfg.complete_dir(),
+            cleanup_after_extract: cfg.cleanup_after_extract(),
+            delete_failed_job_files: cfg.delete_failed_job_files(),
+            history_retention_days: cfg.history_retention_days(),
+            propagation_delay_secs: cfg.propagation_delay_secs(),
+            max_concurrent_nzbs: cfg.max_concurrent_nzbs(),
+            max_retries: cfg.retry.as_ref().and_then(|r| r.max_retries).unwrap_or(3),
+            enable_srrdb_lookup: cfg.enable_srrdb_lookup(),
+            watch_folder: (&cfg.watch_folder).into(),
+            duplicate_policy: cfg.duplicate_policy.into(),
+            seeding: cfg.seeding.map(Into::into),
+            upload_cap: cfg.upload_cap,
+            torrent: (&cfg.torrent).into(),
+        }
     }
 }

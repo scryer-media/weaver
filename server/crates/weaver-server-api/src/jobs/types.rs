@@ -2,13 +2,14 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use weaver_server_core::jobs::duplicate_persistence::JobsDuplicatePersistenceAdmitDuplicateSubmissionQueries;
 
 use async_graphql::{Enum, InputObject, SimpleObject, Upload};
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use weaver_server_core::jobs::duplicate::DuplicateJobSnapshot;
-use weaver_server_core::jobs::handle::DownloadBlockState;
+use weaver_server_core::jobs::handle::{DownloadBlockState, HoldOrigin, HoldOwner, HoldSet};
 use weaver_server_core::jobs::{
     DuplicateAction, DuplicateDecision, DuplicateJobLifecycle, DuplicateJobSummary, DuplicateMatch,
     DuplicateMode, FingerprintKind, JobId, SemanticAdmission, SemanticCandidateSnapshot,
@@ -49,6 +50,46 @@ pub struct Attribute {
     pub value: String,
 }
 
+/// Put in a request's data to leave every job's RSS link and id out of
+/// its answer whatever the caller's scope: a diagnostics bundle is read by
+/// people other than the admin who made it.
+pub struct HideRssLinks;
+
+// A job's RSS link and id as this request's caller is shown them: opened
+// for an admin, nothing for anyone else. `link` is the job's stored pairs
+// (`rss_link_pairs`); the core owner decides.
+pub(crate) fn rss_link_for_caller(
+    ctx: &async_graphql::Context<'_>,
+    link: &[(String, String)],
+) -> Vec<(String, String)> {
+    if link.is_empty() || ctx.data_opt::<HideRssLinks>().is_some() {
+        return Vec::new();
+    }
+    match (
+        ctx.data_opt::<weaver_server_core::Database>(),
+        ctx.data_opt::<weaver_server_core::auth::CallerScope>(),
+    ) {
+        (Some(db), Some(scope)) => db.rss_link_attributes(link, *scope),
+        _ => Vec::new(),
+    }
+}
+
+// A job's public attributes, then its RSS link and id as this request's
+// caller is shown them.
+pub(crate) fn attributes_for_caller(
+    ctx: &async_graphql::Context<'_>,
+    attributes: &[Attribute],
+    link: &[(String, String)],
+) -> Vec<Attribute> {
+    let mut shown = attributes.to_vec();
+    shown.extend(
+        rss_link_for_caller(ctx, link)
+            .into_iter()
+            .map(|(key, value)| Attribute { key, value }),
+    );
+    shown
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, InputObject)]
 pub struct AttributeInput {
     pub key: String,
@@ -74,6 +115,10 @@ pub enum QueueItemState {
     Completed,
     Failed,
     Paused,
+    FetchingMetadata,
+    CheckingFiles,
+    Seeding,
+    Stalled,
 }
 
 impl From<&weaver_server_core::JobStatus> for QueueItemState {
@@ -96,6 +141,43 @@ impl From<&weaver_server_core::JobStatus> for QueueItemState {
             weaver_server_core::JobStatus::Partial
             | weaver_server_core::JobStatus::Failed { .. } => Self::Failed,
             weaver_server_core::JobStatus::Paused => Self::Paused,
+            weaver_server_core::JobStatus::FetchingMetadata => Self::FetchingMetadata,
+            weaver_server_core::JobStatus::CheckingFiles => Self::CheckingFiles,
+            weaver_server_core::JobStatus::Seeding => Self::Seeding,
+            weaver_server_core::JobStatus::Stalled => Self::Stalled,
+        }
+    }
+}
+
+/// How a finished job ended. `state` and `status` show a job that delivered
+/// in part as failed, for the clients that do not model it; a client that
+/// does selects `outcome`, where it is `PARTIAL`. Null while the job has not
+/// ended.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Enum)]
+pub enum JobOutcome {
+    Complete,
+    Partial,
+    Failed,
+}
+
+impl JobOutcome {
+    pub fn of(status: &weaver_server_core::JobStatus) -> Option<Self> {
+        match status {
+            weaver_server_core::JobStatus::Complete => Some(Self::Complete),
+            weaver_server_core::JobStatus::Partial => Some(Self::Partial),
+            weaver_server_core::JobStatus::Failed { .. } => Some(Self::Failed),
+            _ => None,
+        }
+    }
+
+    // The outcome of a history row with persisted `status`, read as its
+    // `state` is (`history_state_from_status`) but for a partial delivery.
+    pub(crate) fn of_history(status: &str) -> Option<Self> {
+        match status.to_ascii_lowercase().as_str() {
+            "complete" => Some(Self::Complete),
+            "partial" => Some(Self::Partial),
+            "paused" => None,
+            _ => Some(Self::Failed),
         }
     }
 }
@@ -167,6 +249,9 @@ pub enum QueueWaitReason {
     PostProcessingCapacity,
     // The job waits for room on a disk, in whatever phase it is in.
     DiskSpace,
+    // The job has more to fetch than its disk holds above the reserve even
+    // empty: it never starts there, and never fails for it.
+    DiskTooSmall,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
@@ -230,15 +315,49 @@ impl From<weaver_server_core::JobPhaseProgress> for QueuePhaseProgress {
     }
 }
 
+// How a job's content is fetched.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Enum)]
+#[graphql(name = "Protocol")]
+pub enum ProtocolGql {
+    #[default]
+    Nzb,
+    Torrent,
+}
+
+impl From<weaver_server_core::Protocol> for ProtocolGql {
+    fn from(value: weaver_server_core::Protocol) -> Self {
+        match value {
+            weaver_server_core::Protocol::Nzb => Self::Nzb,
+            weaver_server_core::Protocol::Torrent => Self::Torrent,
+        }
+    }
+}
+
+impl From<ProtocolGql> for weaver_server_core::Protocol {
+    fn from(value: ProtocolGql) -> Self {
+        match value {
+            ProtocolGql::Nzb => Self::Nzb,
+            ProtocolGql::Torrent => Self::Torrent,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
+#[graphql(complex)]
 pub struct QueueItem {
     pub id: u64,
+    #[serde(default)]
+    pub protocol: ProtocolGql,
     pub job_hash: Option<String>,
     pub name: String,
     pub display_title: String,
     pub original_title: String,
     pub parsed_release: ParsedRelease,
     pub state: QueueItemState,
+    /// How the job ended, a partial delivery as its own value; null while
+    /// it has not ended.
+    #[serde(default)]
+    pub outcome: Option<JobOutcome>,
     #[serde(default = "default_queue_download_state")]
     pub download_state: QueueDownloadState,
     #[serde(default = "default_queue_post_state")]
@@ -246,6 +365,15 @@ pub struct QueueItem {
     pub wait_reason: Option<QueueWaitReason>,
     pub download_wait_reason: Option<String>,
     pub download_retry_at_epoch_ms: Option<f64>,
+    /// While the job waits to start for its disk (`DISK_SPACE` or
+    /// `DISK_TOO_SMALL`): the bytes it still has to fetch.
+    #[serde(default)]
+    pub disk_need_bytes: Option<u64>,
+    /// With `DISK_SPACE`, the room its disk leaves for them, null without
+    /// a fresh reading; with `DISK_TOO_SMALL`, the most the disk ever holds
+    /// above its reserve.
+    #[serde(default)]
+    pub disk_free_bytes: Option<u64>,
     pub error: Option<String>,
     pub progress_percent: f64,
     pub total_bytes: u64,
@@ -277,7 +405,15 @@ pub struct QueueItem {
     pub remaining_par_count: u32,
     pub has_password: bool,
     pub category: Option<String>,
+    /// The job's public attributes. GraphQL answers them through the
+    /// `attributes` resolver, which adds the RSS link for an admin.
+    #[graphql(skip)]
     pub attributes: Vec<Attribute>,
+    /// The job's RSS link and id as stored, for `rss_link_for_caller`
+    /// alone: never answered or serialised as they are.
+    #[graphql(skip)]
+    #[serde(skip)]
+    pub rss_link: Vec<(String, String)>,
     pub client_request_id: Option<String>,
     pub output_dir: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -286,6 +422,84 @@ pub struct QueueItem {
     /// NZB material and credentials, which remain unavailable to GraphQL.
     #[serde(default)]
     pub duplicate_summary: Option<DuplicateSummaryInfo>,
+    /// The job's write to disk as a list read it, from the one read of the
+    /// disk state the list made for all its rows; None when no list did,
+    /// and `disk_write` then reads it for this row alone.
+    #[graphql(skip)]
+    #[serde(skip)]
+    pub disk_write: Option<Option<QueueDiskWrite>>,
+}
+
+/// A job's write to its destination disk, while the disk is slow or the
+/// job has nothing left to fetch and bytes still waiting in memory to be
+/// written. The disk's figures are on `downloadBlock.diskVolumes`, under the
+/// same label, so a figure change moves no queue row.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
+pub struct QueueDiskWrite {
+    /// The disk, by the label `downloadBlock.diskVolumes` gives it.
+    pub volume: String,
+    /// Whether the disk cannot keep up: downloads keep waiting on it.
+    pub slow: bool,
+    /// Whether the job has nothing left to fetch and bytes still waiting in
+    /// memory for the disk.
+    pub draining: bool,
+}
+
+impl QueueDiskWrite {
+    fn of(
+        limits: &weaver_server_core::pipeline::disk_vote::DiskLimits,
+        job_id: u64,
+    ) -> Option<Self> {
+        limits.job(JobId(job_id)).map(|write| Self {
+            volume: write.volume,
+            slow: write.slow,
+            draining: write.draining,
+        })
+    }
+}
+
+/// Give each row of a list its disk write from one read of the disk state,
+/// shared by every row. Nothing is read for an empty list.
+pub(crate) fn attach_disk_writes(
+    state: &weaver_server_core::SharedPipelineState,
+    items: &mut [QueueItem],
+) {
+    if items.is_empty() {
+        return;
+    }
+    let limits = state.disk_limits();
+    for item in items {
+        item.disk_write = Some(QueueDiskWrite::of(&limits, item.id));
+    }
+}
+
+#[async_graphql::ComplexObject]
+impl QueueItem {
+    /// The job's attributes. An RSS job's item link and id are among them
+    /// for an admin only.
+    async fn attributes(&self, ctx: &async_graphql::Context<'_>) -> Vec<Attribute> {
+        attributes_for_caller(ctx, &self.attributes, &self.rss_link)
+    }
+
+    /// The job's tags, in tag order.
+    async fn tags(&self, ctx: &async_graphql::Context<'_>) -> async_graphql::Result<Vec<String>> {
+        crate::tags::tags_of(ctx, self.id).await
+    }
+
+    /// The job's write to its destination disk while the disk is slow,
+    /// or while the job has nothing left to fetch and bytes still waiting
+    /// to be written; null otherwise. A list reads the disk state once for
+    /// all its rows.
+    async fn disk_write(
+        &self,
+        ctx: &async_graphql::Context<'_>,
+    ) -> async_graphql::Result<Option<QueueDiskWrite>> {
+        if let Some(attached) = &self.disk_write {
+            return Ok(attached.clone());
+        }
+        let state = ctx.data::<weaver_server_core::SharedPipelineState>()?;
+        Ok(QueueDiskWrite::of(&state.disk_limits(), self.id))
+    }
 }
 
 fn default_queue_download_state() -> QueueDownloadState {
@@ -315,7 +529,11 @@ pub struct QueueSummary {
 #[graphql(complex)]
 pub struct GlobalQueueState {
     pub is_paused: bool,
-    pub speed_limit_bytes_per_sec: u64,
+    /// The classes of job the operator's or the schedule's pause of the
+    /// whole class holds.
+    #[serde(default)]
+    pub paused_classes: Vec<ProtocolGql>,
+    pub speed_limit_bytes_per_sec: Option<u64>,
     pub download_block: DownloadBlock,
 }
 
@@ -393,10 +611,14 @@ pub struct QueuePageInput {
     pub page_index: u32,
     pub page_size: u32,
     pub search: Option<String>,
+    /// Torrents or Usenet jobs only; omit for both.
+    pub protocol: Option<ProtocolGql>,
     pub states: Option<Vec<QueueItemState>>,
     pub priorities: Option<Vec<QueuePriority>>,
     /// The empty string names jobs with no category.
     pub categories: Option<Vec<String>>,
+    /// Jobs carrying this tag; the empty string names jobs with none.
+    pub tag: Option<String>,
     /// Omit both fields to retain the scheduler's hot-download order.
     pub sort_field: Option<QueueSortField>,
     pub sort_direction: Option<QueueSortDirection>,
@@ -408,10 +630,14 @@ pub struct QueuePageInput {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, InputObject)]
 pub struct QueueSelectionInput {
     pub search: Option<String>,
+    /// Torrents or Usenet jobs only; omit for both.
+    pub protocol: Option<ProtocolGql>,
     pub states: Option<Vec<QueueItemState>>,
     pub priorities: Option<Vec<QueuePriority>>,
     /// The empty string names jobs with no category.
     pub categories: Option<Vec<String>>,
+    /// Jobs carrying this tag; the empty string names jobs with none.
+    pub tag: Option<String>,
     /// The whole queue, stated outright. Required when no filter is given.
     pub all: Option<bool>,
 }
@@ -447,11 +673,20 @@ pub struct QueueBatchResult {
     pub refused: Vec<QueueBatchRefusal>,
 }
 
-/// Jobs matching the search and priorities, counted by category before the
-/// category and state filters apply. The empty string is no category.
+/// Jobs matching the search, priorities and protocol, counted by category
+/// before the category and state filters apply. The empty string is no
+/// category.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
 pub struct QueueCategoryCount {
     pub category: String,
+    pub count: u32,
+}
+
+/// Jobs matching the search, priorities and categories, counted by protocol
+/// before the protocol and state filters apply.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
+pub struct QueueProtocolCount {
+    pub protocol: ProtocolGql,
     pub count: u32,
 }
 
@@ -478,6 +713,8 @@ pub struct QueuePage {
     pub summary: QueueSummary,
     pub categories: Vec<String>,
     pub category_counts: Vec<QueueCategoryCount>,
+    /// Jobs per protocol, counted under every filter but the protocol one.
+    pub protocol_counts: Vec<QueueProtocolCount>,
     pub state_counts: Vec<QueueStateCount>,
     /// Bytes still to fetch across queued and downloading jobs.
     pub remaining_bytes: u64,
@@ -928,6 +1165,9 @@ pub struct SubmitNzbInput {
     pub dupe_key: Option<String>,
     pub dupe_score: Option<i64>,
     pub dupe_mode: Option<DuplicateModeGql>,
+    /// The tags the job is added with.
+    #[graphql(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, InputObject)]
@@ -936,8 +1176,34 @@ pub struct StageNzbUploadInput {
     pub filename: Option<String>,
 }
 
+/// What a submission became, read from its bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+pub enum SubmissionKind {
+    Nzb,
+    Torrent,
+}
+
+/// One thing to add: text that is an NZB or torrent URL, a magnet link or
+/// an infohash, or an uploaded NZB, torrent or magnet file.
+#[derive(Debug, InputObject)]
+pub struct SubmitInput {
+    pub text: Option<String>,
+    pub upload: Option<Upload>,
+    pub category: Option<String>,
+    #[graphql(default)]
+    pub paused: bool,
+    pub password: Option<String>,
+    /// Whether a torrent's archives are extracted; absent inherits. An NZB
+    /// ignores it.
+    pub unpack: Option<bool>,
+    /// The tags the job is added with.
+    #[graphql(default)]
+    pub tags: Vec<String>,
+}
+
 #[derive(Debug, Clone, SimpleObject)]
 pub struct StagedNzbUploadResult {
+    pub kind: SubmissionKind,
     pub accepted: bool,
     pub staged_upload_id: Option<String>,
     pub filename: Option<String>,
@@ -959,6 +1225,11 @@ pub struct SubmitStagedNzbsInput {
     pub dupe_key: Option<String>,
     pub dupe_score: Option<i64>,
     pub dupe_mode: Option<DuplicateModeGql>,
+    #[graphql(default)]
+    pub paused: bool,
+    /// The tags each job is added with.
+    #[graphql(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, SimpleObject)]
@@ -1113,6 +1384,7 @@ pub struct ParsedRelease {
 }
 
 #[derive(Debug, Clone, SimpleObject)]
+#[graphql(complex)]
 pub struct Job {
     pub id: u64,
     pub name: String,
@@ -1120,6 +1392,9 @@ pub struct Job {
     pub original_title: String,
     pub parsed_release: ParsedRelease,
     pub status: JobStatusGql,
+    /// How the job ended, a partial delivery as its own value; null while
+    /// it has not ended.
+    pub outcome: Option<JobOutcome>,
     pub error: Option<String>,
     pub progress: f64,
     pub total_bytes: u64,
@@ -1130,9 +1405,36 @@ pub struct Job {
     pub health: u32,
     pub has_password: bool,
     pub category: Option<String>,
+    /// The job's public metadata. GraphQL answers it through the
+    /// `metadata` resolver, which adds the RSS link for an admin.
+    #[graphql(skip)]
     pub metadata: Vec<MetadataEntry>,
+    /// The job's RSS link and id as stored, for `rss_link_for_caller`
+    /// alone.
+    #[graphql(skip)]
+    pub rss_link: Vec<(String, String)>,
     pub output_dir: Option<String>,
     pub created_at: Option<f64>,
+}
+
+#[async_graphql::ComplexObject]
+impl Job {
+    /// The job's metadata. An RSS job's item link and id are in it for an
+    /// admin only.
+    async fn metadata(&self, ctx: &async_graphql::Context<'_>) -> Vec<MetadataEntry> {
+        let mut shown = self.metadata.clone();
+        shown.extend(
+            rss_link_for_caller(ctx, &self.rss_link)
+                .into_iter()
+                .map(|(key, value)| MetadataEntry { key, value }),
+        );
+        shown
+    }
+
+    /// The job's tags, in tag order.
+    async fn tags(&self, ctx: &async_graphql::Context<'_>) -> async_graphql::Result<Vec<String>> {
+        crate::tags::tags_of(ctx, self.id).await
+    }
 }
 
 impl From<&weaver_server_core::JobInfo> for Job {
@@ -1151,6 +1453,7 @@ impl From<&weaver_server_core::JobInfo> for Job {
             original_title: display.original_title,
             parsed_release: display.parsed_release,
             status: JobStatusGql::from(&info.status),
+            outcome: JobOutcome::of(&info.status),
             error: info.error.clone(),
             progress: info.progress,
             total_bytes: info.total_bytes,
@@ -1170,6 +1473,7 @@ impl From<&weaver_server_core::JobInfo> for Job {
                     value: v.clone(),
                 })
                 .collect(),
+            rss_link: weaver_server_core::history::attributes::rss_link_pairs(&info.metadata),
             output_dir: info.output_dir.clone(),
             created_at: Some(info.created_at_epoch_ms),
         }
@@ -1196,6 +1500,10 @@ pub enum JobStatusGql {
     Complete,
     Failed,
     Paused,
+    FetchingMetadata,
+    CheckingFiles,
+    Seeding,
+    Stalled,
 }
 
 impl From<&weaver_server_core::JobStatus> for JobStatusGql {
@@ -1217,6 +1525,10 @@ impl From<&weaver_server_core::JobStatus> for JobStatusGql {
             weaver_server_core::JobStatus::Partial
             | weaver_server_core::JobStatus::Failed { .. } => Self::Failed,
             weaver_server_core::JobStatus::Paused => Self::Paused,
+            weaver_server_core::JobStatus::FetchingMetadata => Self::FetchingMetadata,
+            weaver_server_core::JobStatus::CheckingFiles => Self::CheckingFiles,
+            weaver_server_core::JobStatus::Seeding => Self::Seeding,
+            weaver_server_core::JobStatus::Stalled => Self::Stalled,
         }
     }
 }
@@ -1322,7 +1634,7 @@ pub fn encode_output_files_cursor(cursor: &OutputFilesCursor) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(body)
 }
 
-pub const PRIORITY_ATTRIBUTE_KEY: &str = "priority";
+pub use weaver_server_core::jobs::model::PRIORITY_ATTRIBUTE_KEY;
 
 pub fn normalize_priority_value(value: &str) -> std::result::Result<String, String> {
     let trimmed = value.trim();
@@ -1428,17 +1740,21 @@ fn queue_item_from_display(
 ) -> QueueItem {
     QueueItem {
         id: info.job_id.0,
+        protocol: info.protocol.into(),
         job_hash: info.job_hash.as_ref().map(hex::encode),
         name: info.name.clone(),
         display_title,
         original_title,
         parsed_release,
         state,
+        outcome: JobOutcome::of(&info.status),
         download_state: QueueDownloadState::from(info.download_state),
         post_state: QueuePostState::from(info.post_state),
         wait_reason: wait_reason_for(info),
         download_wait_reason: info.download_wait_reason.clone(),
         download_retry_at_epoch_ms: info.download_retry_at_epoch_ms,
+        disk_need_bytes: info.disk_need_bytes,
+        disk_free_bytes: info.disk_free_bytes,
         error: info.error.clone(),
         progress_percent: normalize_progress_percent(info.progress),
         total_bytes: info.total_bytes,
@@ -1463,11 +1779,13 @@ fn queue_item_from_display(
         }),
         category: info.category.clone(),
         attributes,
+        rss_link: weaver_server_core::history::attributes::rss_link_pairs(&info.metadata),
         client_request_id,
         output_dir: info.output_dir.clone(),
         created_at: ms_to_datetime(info.created_at_epoch_ms as i64),
         attention: attention_for_live_job(info, state),
         duplicate_summary: None,
+        disk_write: None,
     }
 }
 
@@ -1483,6 +1801,7 @@ pub fn queue_item_from_submission(
     });
     QueueItem {
         id: submitted.job_id.0,
+        protocol: ProtocolGql::Nzb,
         job_hash: Some(hex::encode(submitted.job_hash)),
         name: submitted.summary.name.clone(),
         display_title: display.display_title,
@@ -1493,11 +1812,14 @@ pub fn queue_item_from_submission(
         } else {
             QueueItemState::Queued
         },
+        outcome: None,
         download_state: QueueDownloadState::Queued,
         post_state: QueuePostState::Idle,
         wait_reason: None,
         download_wait_reason: None,
         download_retry_at_epoch_ms: None,
+        disk_need_bytes: None,
+        disk_free_bytes: None,
         error: None,
         progress_percent: 0.0,
         total_bytes: submitted.summary.total_bytes,
@@ -1515,11 +1837,15 @@ pub fn queue_item_from_submission(
         has_password: submitted.summary.password.is_some(),
         category: submitted.summary.category.clone(),
         attributes,
+        rss_link: weaver_server_core::history::attributes::rss_link_pairs(
+            &submitted.summary.metadata,
+        ),
         client_request_id,
         output_dir: None,
         created_at: ms_to_datetime(submitted.created_at_epoch_ms as i64),
         attention: None,
         duplicate_summary: None,
+        disk_write: None,
     }
 }
 
@@ -1643,7 +1969,9 @@ impl QueueSummary {
             QueueItemState::Queued => self.queued_items += 1,
             QueueItemState::Paused => self.paused_items += 1,
             QueueItemState::Failed => self.failed_items += 1,
-            QueueItemState::Verifying | QueueItemState::Checking => {
+            QueueItemState::Verifying
+            | QueueItemState::Checking
+            | QueueItemState::CheckingFiles => {
                 self.active_items += 1;
                 self.verifying_items += 1;
             }
@@ -1659,8 +1987,10 @@ impl QueueSummary {
             | QueueItemState::FetchingRepairData
             | QueueItemState::FinalizingDownload
             | QueueItemState::Finalizing
-            | QueueItemState::PostProcessing => self.active_items += 1,
-            QueueItemState::Completed => {}
+            | QueueItemState::PostProcessing
+            | QueueItemState::FetchingMetadata
+            | QueueItemState::Stalled => self.active_items += 1,
+            QueueItemState::Completed | QueueItemState::Seeding => {}
         }
     }
 }
@@ -1680,12 +2010,20 @@ pub fn queue_event_from_record(id: i64, record: PersistedQueueEvent) -> QueueEve
 }
 
 pub fn global_queue_state(
-    is_paused: bool,
+    holds: &HoldSet,
     download_block: &DownloadBlockState,
-    speed_limit_bytes_per_sec: u64,
+    speed_limit_bytes_per_sec: Option<u64>,
 ) -> GlobalQueueState {
     GlobalQueueState {
-        is_paused,
+        is_paused: holds.stops(HoldOwner::All, false),
+        paused_classes: weaver_server_core::jobs::HeldClass::all()
+            .filter(|class| {
+                [HoldOrigin::Manual, HoldOrigin::Scheduled]
+                    .into_iter()
+                    .any(|origin| holds.held_by(origin, HoldOwner::Class(*class)))
+            })
+            .map(|class| class.protocol().into())
+            .collect(),
         speed_limit_bytes_per_sec,
         download_block: DownloadBlock::from(download_block),
     }
@@ -1716,6 +2054,30 @@ pub(crate) fn matches_view_filter_prepared(
         job.job_id.0,
         queue_item_state(QueueStateFacts::of_view(view)),
         job.category.as_ref(),
+        &attributes,
+        filter,
+    )
+}
+
+// Whether a queued row copied out as `info`, a torrent's, passes `filter`,
+// as its queue item would.
+pub(crate) fn matches_info_filter_prepared(
+    info: &weaver_server_core::JobInfo,
+    filter: Option<&PreparedQueueFilter>,
+) -> bool {
+    let Some(prepared) = filter else {
+        return true;
+    };
+    let attributes = if prepared.has_attribute_key.is_some() || prepared.attribute_equals.is_some()
+    {
+        split_attributes(&info.metadata).1
+    } else {
+        Vec::new()
+    };
+    matches_item_filter_prepared(
+        info.job_id.0,
+        queue_item_state(QueueStateFacts::of_job(info)),
+        info.category.as_ref(),
         &attributes,
         filter,
     )
@@ -1800,6 +2162,11 @@ fn wait_reason_for(info: &weaver_server_core::JobInfo) -> Option<QueueWaitReason
     {
         return Some(QueueWaitReason::DiskSpace);
     }
+    if info.download_wait_reason.as_deref()
+        == Some(weaver_server_core::jobs::handle::DISK_TOO_SMALL_WAIT_REASON)
+    {
+        return Some(QueueWaitReason::DiskTooSmall);
+    }
     match info.post_state {
         weaver_server_core::PostState::QueuedRepair => Some(QueueWaitReason::RepairCapacity),
         weaver_server_core::PostState::QueuedExtract => Some(QueueWaitReason::ExtractionCapacity),
@@ -1872,6 +2239,15 @@ fn terminal_queue_item_state(info: QueueStateFacts<'_>) -> Option<QueueItemState
     ) || matches!(info.post_state, weaver_server_core::PostState::Failed)
     {
         return Some(QueueItemState::Failed);
+    }
+
+    // A torrent's phases are named by its status alone: the lanes fold them.
+    if let state @ (QueueItemState::FetchingMetadata
+    | QueueItemState::CheckingFiles
+    | QueueItemState::Seeding
+    | QueueItemState::Stalled) = QueueItemState::from(info.status)
+    {
+        return Some(state);
     }
 
     if matches!(

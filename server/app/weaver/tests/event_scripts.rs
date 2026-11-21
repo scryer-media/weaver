@@ -8,6 +8,12 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use weaver_server_core::jobs::persistence::JobsPersistenceQueries;
+use weaver_server_core::post_processing::effects::PostProcessingEffectsQueries;
+use weaver_server_core::post_processing::events::PostProcessingEventsCancelEventScriptsQueries;
+use weaver_server_core::post_processing::instances::PostProcessingInstancesQueries;
+use weaver_server_core::post_processing::output::PostProcessingOutputQueries;
+use weaver_server_core::post_processing::settings::PostProcessingSettingsQueries;
 
 use weaver_server_core::jobs::record::ActiveJob;
 use weaver_server_core::post_processing::directives::{Directive, ScriptOutputEvent};

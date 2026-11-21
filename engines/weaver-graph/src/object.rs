@@ -18,6 +18,48 @@ use crate::member::MemberId;
 use crate::seek::Seek;
 use crate::volume::{ByteRange, VolumeIndex};
 
+// The clean bytes a member has, and where they start, as a claim is asked
+// by: its front when `at` is zero, or, when its front will not come, the
+// first clean run past the hole where it stopped. An object that knows its
+// volumes only by how they open reads `front`; one whose bytes say what
+// they are anywhere in them may read the run wherever it starts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Clean<'a> {
+    pub at: u64,
+    pub bytes: &'a [u8],
+}
+
+impl<'a> Clean<'a> {
+    // A front: clean bytes from the member's start.
+    pub fn start(bytes: &'a [u8]) -> Self {
+        Self { at: 0, bytes }
+    }
+
+    // The member's front: these bytes when they start at its start, else
+    // none.
+    pub fn front(&self) -> &'a [u8] {
+        if self.at == 0 { self.bytes } else { &[] }
+    }
+}
+
+impl<'a> From<&'a [u8]> for Clean<'a> {
+    fn from(bytes: &'a [u8]) -> Self {
+        Self::start(bytes)
+    }
+}
+
+impl<'a, const N: usize> From<&'a [u8; N]> for Clean<'a> {
+    fn from(bytes: &'a [u8; N]) -> Self {
+        Self::start(bytes)
+    }
+}
+
+impl<'a> From<&'a Vec<u8>> for Clean<'a> {
+    fn from(bytes: &'a Vec<u8>) -> Self {
+        Self::start(bytes)
+    }
+}
+
 // An object's answer to a claim: the places the member could take, none
 // when there are none, or not yet, while the front in hand is too short for
 // the object to judge the member by, with the places that front gives it.
@@ -313,9 +355,24 @@ pub trait Standing {
     // has answered it.
     fn asking(&self) -> bool;
 
+    // My run said bytes of my volumes were damaged, and a recovery object
+    // above had proved every byte my volumes came from: the bytes are whole,
+    // so it is I who cannot read them. No run started since has said
+    // otherwise.
+    fn refuted(&self) -> bool {
+        false
+    }
+
     // The members beside my volumes that no object owns, as a claim reads
     // them: what I can say of them is mine to say.
     fn beside(&self) -> Vec<Beside<'_>>;
+
+    // My volumes lie in a namespace below the root, and no other object of
+    // my kind is bound there: a volume my set lacks is nowhere beside me,
+    // and the namespace above may hold it (`Why::Scattered`).
+    fn liftable(&self) -> bool {
+        false
+    }
 }
 
 // A member no object owns, as the namespace holds it: its name, its first
@@ -454,6 +511,14 @@ pub trait Object: Send + Sync {
     // close reads nothing of its file. An object that keeps none says none.
     fn vouched(&self, _member: MemberId, _out: &mut Vec<(ByteRange, u32)>) {}
 
+    // Whether my member's bytes are my volumes' bytes as they lie: stored,
+    // not enciphered, so what my volumes lost it lost byte for byte, and
+    // the checksum my headers state of it says whether zeros were what was
+    // lost. An object that transforms its bytes says no.
+    fn verbatim(&self, _member: MemberId) -> bool {
+        false
+    }
+
     // My volume's length is known: its member declared one, or it closed at
     // the length it reached. Said ahead of every delivery while it is known
     // and once more at the close, so an object acts on it once and ignores
@@ -524,7 +589,10 @@ pub trait Object: Send + Sync {
     // that cannot judge the member by the front it has so far answers not
     // yet, with the places that front gives it, and is asked again as the
     // front grows; once no more of it can come, those places are its answer.
-    fn claim(&mut self, _name: &str, _first_bytes: &[u8], _length: Option<u64>) -> Claim {
+    // A member whose front will not come is asked with the first clean run
+    // past where it stopped, which only an object whose bytes say what they
+    // are wherever they are read can judge it by.
+    fn claim(&mut self, _name: &str, _clean: Clean<'_>, _length: Option<u64>) -> Claim {
         Claim::default()
     }
 
@@ -618,6 +686,15 @@ pub trait Object: Send + Sync {
     // hold, or ask for again myself. The owner then answers it after that
     // replay, not inside it.
     fn again_waits(&self) -> bool {
+        false
+    }
+
+    // Whether bytes delivered to me may go on to my members inside that
+    // delivery (`Emit::Bytes` from `deliver`), so the owner writes them to
+    // my members' files in the same step. An object that only keeps its
+    // volumes' bytes, for an engine or a run to read later, says no; so
+    // does one that gave up.
+    fn passes_on(&self) -> bool {
         false
     }
 

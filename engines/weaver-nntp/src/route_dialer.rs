@@ -39,15 +39,24 @@ impl Dialer for AddressPlanned {
         ) {
             return self.egress.dial(target).await;
         }
-        let dialer = Arc::new(
-            crate::address_plan::TcpDialer::new(&target.host, target.port, self.egress.timeout())
-                .with_egress(self.egress.binding().clone()),
-        );
+        let dialer = Arc::new(crate::address_plan::TcpDialer::new(
+            &target.host,
+            target.port,
+            self.egress.timeout(),
+            self.egress.clone(),
+        ));
         let plan = self.plan.clone();
-        let (socket, peer) = tokio::task::spawn_blocking(move || plan.connect(&dialer))
-            .await
-            .map_err(|e| DialError::Egress(std::io::Error::other(e)))?
-            .map_err(|error| self.egress.connect_error(error))?;
+        // A blocking thread is outside the task, so the route's names go
+        // with the work.
+        let names = weaver_tunnel::pipe::Names::current();
+        let (socket, peer) = tokio::task::spawn_blocking(move || {
+            weaver_tunnel::pipe::Names::sync_scope(names, || {
+                weaver_tunnel::pipe::blocking(|| plan.connect(&dialer))
+            })
+        })
+        .await
+        .map_err(|e| DialError::Egress(std::io::Error::other(e)))?
+        .map_err(|error| self.egress.connect_error(error))?;
         socket.set_nonblocking(true).map_err(DialError::Egress)?;
         let source = socket.local_addr().ok();
         let stream = tokio::net::TcpStream::from_std(socket).map_err(DialError::Egress)?;
@@ -108,14 +117,25 @@ impl std::fmt::Debug for RouteDialer {
     }
 }
 #[cfg(any(test, feature = "test-support"))]
+impl AddressPlanned {
+    // A direct leg on the loopback egress, for tests whose servers are on
+    // loopback: everything it dials stays on this machine.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "tests reach their loopback servers on a direct leg"
+    )]
+    pub fn loopback_for_tests(label: &str, timeout: std::time::Duration) -> Arc<Self> {
+        Arc::new(Self::new(
+            label.into(),
+            Arc::new(weaver_tunnel::test_support::loopback::egress(0, timeout)),
+        ))
+    }
+}
+#[cfg(any(test, feature = "test-support"))]
 impl RouteDialer {
     // The direct route out of the System egress, for tests whose servers are
     // on loopback and that have no route of their own. Blocking dials run on
     // a runtime of its own, so a test outside any runtime can still connect.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "tests reach their loopback servers on the direct route"
-    )]
     pub fn direct_for_tests() -> Arc<Self> {
         static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
         let runtime = RUNTIME.get_or_init(|| {
@@ -125,14 +145,10 @@ impl RouteDialer {
                 .build()
                 .expect("test route runtime")
         });
-        let planned = Arc::new(AddressPlanned::new(
-            "test direct route".into(),
-            Arc::new(weaver_tunnel::pipe::Egress::new(
-                0,
-                crate::egress::SocketEgress::System,
-                std::time::Duration::from_secs(30),
-            )),
-        ));
+        let planned = AddressPlanned::loopback_for_tests(
+            "test direct route",
+            std::time::Duration::from_secs(30),
+        );
         Arc::new(Self {
             plan: Some(planned.plan.clone()),
             inner: planned,
@@ -143,15 +159,26 @@ impl RouteDialer {
     }
 }
 impl RouteDialer {
+    fn purpose(&self) -> Purpose {
+        Purpose::Nntp {
+            server: self.server,
+            leg: 0,
+            probing: false,
+        }
+    }
+
+    // Whether the route has room for a dial now, or the slots that ring as
+    // it frees. Asks only: nothing is reserved.
+    pub(crate) fn room(&self) -> Result<(), Vec<Arc<tokio::sync::Notify>>> {
+        self.inner.room(&self.purpose())
+    }
+
     pub async fn dial(&self, config: &ServerConfig) -> Result<Dialed, NntpError> {
         let target = Target {
             host: config.host.clone(),
             port: config.port,
             addresses: Vec::new(),
-            purpose: Purpose::Nntp {
-                server: self.server,
-                leg: 0,
-            },
+            purpose: self.purpose(),
         };
         // A dialer that enforces its own budget (a weighted route books a
         // timed-out leg) must see its deadline first; this one is a backstop.

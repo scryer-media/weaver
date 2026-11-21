@@ -30,12 +30,18 @@ pub(super) struct Lent {
     covers: Vec<MemberId>,
     // Its `Recovery::precedence` when it left.
     precedence: u8,
+    // Its `Recovery::rebuilds` and `Recovery::carried_inside` when it left.
+    rebuilds: bool,
+    carried_inside: bool,
     waiting: Vec<Waiting>,
     // Members that could not be asked whether they are its volumes, in the
     // order they asked.
     queued: Vec<(NodeId, MemberId)>,
     // Lent for the work it held, not for a repair.
     work: bool,
+    // Its `Object::passes_on` when it left: what the node answers while it
+    // is out.
+    passes_on: bool,
 }
 
 // Bytes for one of an object's volumes, owned, so a delivery can wait.
@@ -109,13 +115,53 @@ impl Lent {
     pub(super) fn wait(&mut self, waiting: Waiting) {
         self.waiting.push(waiting);
     }
+
+    // What waited for it is counted as it goes: taken back, or dropped with
+    // its node.
+    pub(super) fn count(&self, waits: &mut LentWaits) {
+        waits.count(&self.waiting);
+    }
+}
+
+// How many bytes ever waited behind lent objects in the tree: the loans that
+// ended with bytes queued, the most one loan's queue held as it ended, and
+// the sum over all of them. Kept in memory for the tree's life; never
+// recorded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LentWaits {
+    pub loans_that_queued_bytes: u64,
+    pub peak_queued_bytes: u64,
+    pub total_queued_bytes: u64,
+}
+
+impl LentWaits {
+    fn count(&mut self, waiting: &[Waiting]) {
+        let mut queued = 0;
+        let mut delivered = false;
+        for waiting in waiting {
+            if let Waiting::Delivered { arrived, .. } = waiting {
+                delivered = true;
+                queued += arrived.bytes.bytes().len() as u64;
+            }
+        }
+        if delivered {
+            self.loans_that_queued_bytes += 1;
+            self.peak_queued_bytes = self.peak_queued_bytes.max(queued);
+            self.total_queued_bytes += queued;
+        }
+    }
 }
 
 impl Tree {
     // Lend the recovery object at `node` out of the tree. `None` when the
     // node holds no recovery object.
     pub fn lend(&mut self, node: NodeId) -> Option<Box<dyn Object>> {
-        let precedence = self.recovery(node)?.precedence();
+        let recovery = self.recovery(node)?;
+        let (precedence, rebuilds, carried_inside) = (
+            recovery.precedence(),
+            recovery.rebuilds(),
+            recovery.carried_inside(),
+        );
         let covers = self
             .consult_recovery(node, |recovery, namespace| {
                 namespace
@@ -132,9 +178,12 @@ impl Tree {
             facts: Some(object.facts()),
             covers,
             precedence,
+            rebuilds,
+            carried_inside,
             waiting: Vec::new(),
             queued: Vec::new(),
             work: false,
+            passes_on: object.passes_on(),
         });
         Some(object)
     }
@@ -180,9 +229,14 @@ impl Tree {
 
     // Out of its node as if for its work, whatever it holds.
     fn lend_out(&mut self, node: NodeId) -> Option<Box<dyn Object>> {
-        let precedence = self
-            .recovery(node)
-            .map_or(0, |recovery| recovery.precedence());
+        let (precedence, rebuilds, carried_inside) =
+            self.recovery(node).map_or((0, false, false), |recovery| {
+                (
+                    recovery.precedence(),
+                    recovery.rebuilds(),
+                    recovery.carried_inside(),
+                )
+            });
         let found = self.nodes.get_mut(&node)?;
         let object = found.object.take()?;
         found.lent = Some(Lent {
@@ -190,16 +244,24 @@ impl Tree {
             facts: None,
             covers: Vec::new(),
             precedence,
+            rebuilds,
+            carried_inside,
             waiting: Vec::new(),
             queued: Vec::new(),
             work: true,
+            passes_on: object.passes_on(),
         });
         Some(object)
     }
 
-    #[cfg(test)]
-    pub(super) fn lend_for_test(&mut self, node: NodeId) -> Option<Box<dyn Object>> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn lend_for_test(&mut self, node: NodeId) -> Option<Box<dyn Object>> {
         self.lend_out(node)
+    }
+
+    // How many bytes waited behind lent objects so far.
+    pub fn lent_waits(&self) -> LentWaits {
+        self.lent_waits
     }
 
     pub fn lent(&self, node: NodeId) -> bool {
@@ -232,6 +294,34 @@ impl Tree {
             .is_some_and(|lent| !lent.covers.is_empty())
     }
 
+    // Whether the object at `node` is a recovery object that rebuilds what
+    // it covers (`Recovery::rebuilds`), as it left when it is out for a
+    // repair. Wherever `recovers` answers no, so does this.
+    pub fn rebuilds(&self, node: NodeId) -> bool {
+        match self.recovery(node) {
+            Some(recovery) => recovery.rebuilds(),
+            None => self
+                .nodes
+                .get(&node)
+                .and_then(|found| found.lent.as_ref())
+                .is_some_and(|lent| !lent.work && lent.rebuilds),
+        }
+    }
+
+    // Whether the object at `node` is a recovery object carried inside the
+    // one member it covers (`Recovery::carried_inside`), as it left when it
+    // is out for a repair. Wherever `recovers` answers no, so does this.
+    pub fn carried_inside(&self, node: NodeId) -> bool {
+        match self.recovery(node) {
+            Some(recovery) => recovery.carried_inside(),
+            None => self
+                .nodes
+                .get(&node)
+                .and_then(|found| found.lent.as_ref())
+                .is_some_and(|lent| !lent.work && lent.carried_inside),
+        }
+    }
+
     // The set's `Recovery::precedence`, as it left when it is out.
     fn precedence(&self, set: NodeId) -> u8 {
         match self.recovery(set) {
@@ -258,6 +348,11 @@ impl Tree {
 
     pub(super) fn lent_kind(&self, node: NodeId) -> Option<Kind> {
         Some(self.nodes.get(&node)?.lent.as_ref()?.kind)
+    }
+
+    // What the object at `node` said of `Object::passes_on` as it left.
+    pub(super) fn lent_passes_on(&self, node: NodeId) -> Option<bool> {
+        Some(self.nodes.get(&node)?.lent.as_ref()?.passes_on)
     }
 
     // The facts of the object at `node` as they were when it was lent for a
@@ -299,6 +394,7 @@ impl Tree {
             .lent
             .take()
             .map_or_else(Default::default, |lent| (lent.waiting, lent.queued));
+        self.lent_waits.count(&waiting);
         if let Some(binding) = &found.binding {
             object.handed(&binding.handed);
         }
@@ -422,27 +518,7 @@ impl Tree {
             } => match down {
                 // Marked now, in its turn: bytes that waited behind it land
                 // after it, as they came.
-                Down::Lost { origin } => {
-                    let from = effects.len();
-                    self.descend(vec![(node, volume, range)], down, effects);
-                    let marked: Vec<Effect> = effects[from..]
-                        .iter()
-                        .filter_map(|effect| match *effect {
-                            Effect::Damaged {
-                                node,
-                                member,
-                                range,
-                            } => Some(Effect::Lost {
-                                origin,
-                                node,
-                                member,
-                                range,
-                            }),
-                            _ => None,
-                        })
-                        .collect();
-                    effects.extend(marked);
-                }
+                Down::Lost { origin } => self.descend_lost(node, (volume, range), origin, effects),
                 Down::Refuted => self.descend(vec![(node, volume, range)], down, effects),
                 Down::Forget { keep_repairs } => {
                     self.forget_input(node, volume, range, keep_repairs);

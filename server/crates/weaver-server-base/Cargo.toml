@@ -1,0 +1,45 @@
+[package]
+name = "weaver-server-base"
+description = "Errors, clocks, events, runtime primitives for the Weaver server"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[features]
+# Test hooks that other crates' tests use. Never enabled outside
+# dev-dependencies.
+test-support = []
+
+[dependencies]
+weaver-model = { path = "../../../shared/crates/weaver-model", default-features = false }
+weaver-yenc = { path = "../../../engines/weaver-yenc", default-features = false }
+par2-rs = { workspace = true, features = [
+    "crypto-aws-lc",
+] }
+par3-rs = { workspace = true }
+reedsolomon-rs = { version = "0.4.11", default-features = false }
+serde = { workspace = true }
+crc-turbo = { workspace = true }
+thiserror = { workspace = true }
+http = { workspace = true, features = ["std"] }
+tokio = { workspace = true }
+rayon = { workspace = true, default-features = false }
+libc = { workspace = true }
+chrono = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+ipnet = { workspace = true }
+flate2 = { workspace = true }
+tempfile = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_JobObjects", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+
+[dev-dependencies]
+weaver-tunnel = { path = "../../../engines/weaver-tunnel", features = ["test-support"] }
+# `test-util` for the paused clock.
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = { workspace = true }
+serde_json = { workspace = true }

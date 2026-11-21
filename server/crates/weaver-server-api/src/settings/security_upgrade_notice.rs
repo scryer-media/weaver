@@ -23,6 +23,8 @@ use weaver_server_core::runtime::environment::detect_runtime_environment;
 use weaver_server_core::security::{
     AUTHENTICATED_INSTALL_GENERATION, RuntimeSecurityConfig, SETTING_INSTALL_GENERATION,
 };
+use weaver_server_core::settings::persistence::SettingsPersistenceQueries;
+use weaver_server_core::settings::queries::SettingsQueries;
 
 use crate::observability::spawn_blocking_db;
 

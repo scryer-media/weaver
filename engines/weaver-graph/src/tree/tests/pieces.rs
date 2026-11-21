@@ -52,6 +52,18 @@ impl Object for Proven {
 }
 
 impl Recovery for Proven {
+    fn rebuilds(&self) -> bool {
+        true
+    }
+
+    fn carried_inside(&self) -> bool {
+        false
+    }
+
+    fn outgrows_recovery(&self) -> bool {
+        false
+    }
+
     fn covers(&self, _: MemberId) -> bool {
         true
     }
@@ -102,6 +114,12 @@ fn deliver(tree: &mut Tree, member: MemberId, bytes: Vec<u8>) {
 // and signing nothing, and a set over both. The store is refused whole:
 // whether the split store is founded over the two.
 fn joins(other: &str) -> bool {
+    joins_refused(other, None)
+}
+
+// `joins`, with the store's member read back as refused for `why` when one
+// is given, as the owner reads every refused member back.
+fn joins_refused(other: &str, why: Option<Why>) -> bool {
     let mut tree = Tree::new();
     let first = tree.announce_root("lantern.rar", Some(LENGTH), &mut Vec::new());
     let beside = tree.announce_root(other, Some(LENGTH / 2), &mut Vec::new());
@@ -119,7 +137,10 @@ fn joins(other: &str) -> bool {
         "the set is bound"
     );
     let mut effects = Vec::new();
-    tree.refused_whole(NodeId::ROOT, first, &mut Joining, &mut effects);
+    match why {
+        Some(why) => tree.refused_written(NodeId::ROOT, first, why, &mut Joining, &mut effects),
+        None => tree.refused_whole(NodeId::ROOT, first, &mut Joining, &mut effects),
+    }
     tree.bound_below(NodeId::ROOT)
         .into_iter()
         .any(|node| tree.kind(node) == Some(Kind::Split))
@@ -138,4 +159,166 @@ fn a_member_whose_name_carries_a_known_type_is_never_a_piece() {
 #[test]
 fn a_hash_named_member_beside_a_refused_store_is_its_last_piece() {
     assert!(joins("5f0c9a1e7b2d4c38a6e1f9b0d2c4a7e3"));
+}
+
+// A member refused for a reason that disclaims it (no layer of the release,
+// too deep, a shape nothing opens) is the posted file, whole: it is never
+// the first piece of a split set, though the set proves it and a member
+// beside it names nothing. One its object refused for what lies past it
+// still is.
+#[test]
+fn a_member_refused_as_the_posted_file_is_never_the_first_piece() {
+    let other = "5f0c9a1e7b2d4c38a6e1f9b0d2c4a7e3";
+    for why in [Why::Packed, Why::TooDeep, Why::Unsupported] {
+        assert!(!joins_refused(other, Some(why)), "{why:?}");
+    }
+    assert!(joins_refused(other, Some(Why::Unmapped)));
+}
+
+// A recovery set that refuses whatever it is handed.
+struct RefusingSet;
+
+impl Object for RefusingSet {
+    fn unposted(&mut self, _: VolumeIndex, _: ByteRange) {}
+
+    fn kind(&self) -> Kind {
+        Kind::Par2
+    }
+    fn deliver(
+        &mut self,
+        _: Delivery<'_>,
+        _: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
+        out: &mut Vec<Emit>,
+    ) {
+        out.push(Emit::Refuse(Why::Unrepairable));
+    }
+    fn volume_closed(&mut self, _: VolumeIndex, _: &mut Vec<Emit>) {}
+    fn volume_lost(&mut self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Emit>) {}
+    fn wants(&self, _: &mut Vec<Seek>) {}
+    fn pulled(&mut self, _: Seek, _: Pull, _: &mut Vec<Emit>) {}
+    fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
+        out.push(Placement::Envelope {
+            envelope: volume.0,
+            range,
+        });
+    }
+    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) -> Located {
+        Located::Never
+    }
+    fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
+        None
+    }
+    fn recovery(&self) -> Option<&dyn Recovery> {
+        Some(self)
+    }
+    fn recovery_mut(&mut self) -> Option<&mut dyn Recovery> {
+        Some(self)
+    }
+}
+
+impl Recovery for RefusingSet {
+    fn rebuilds(&self) -> bool {
+        true
+    }
+    fn carried_inside(&self) -> bool {
+        false
+    }
+    fn outgrows_recovery(&self) -> bool {
+        false
+    }
+    fn covers(&self, _: MemberId) -> bool {
+        true
+    }
+    fn feed(&mut self, _: MemberId, _: &[Segment]) {}
+    fn verdicts(&self, _: MemberId, _: &mut Vec<SliceVerdict>) {}
+    fn wants(&self, _: &mut Vec<Seek>) {}
+    fn repair(&mut self, _: &mut dyn MemberAccess, _: crate::Budget) -> RepairOutcome {
+        RepairOutcome::Clean
+    }
+    fn outcome(&self) -> Option<RepairOutcome> {
+        None
+    }
+}
+
+struct RefusingSets;
+
+impl Builder for RefusingSets {
+    fn build(&mut self, kind: Kind, id: ObjectId) -> Option<Box<dyn Object>> {
+        match kind {
+            Kind::Par2 => Some(Box::new(RefusingSet)),
+            _ => Build.build(kind, id),
+        }
+    }
+
+    fn read(&self, _: &Tree, _: NodeId, _: VolumeIndex, _: &Placement, _: &mut Vec<u8>) -> bool {
+        false
+    }
+}
+
+// A member posted under `name`, its front `front`, then handed `then` once
+// bound, which the store doubles refuse on: whether the job spends it.
+fn spent_after(name: &str, front: Vec<u8>, then: Option<&'static [u8]>) -> (bool, Option<bool>) {
+    let mut tree = Tree::new();
+    let member = tree.announce_root(name, None, &mut Vec::new());
+    let posted = |offset, bytes: Vec<u8>| Posted {
+        offset,
+        bytes: Bytes::from(bytes).into(),
+        provenance: Provenance::Fresh,
+    };
+    if !front.is_empty() {
+        let at = front.len() as u64;
+        tree.deliver(
+            NodeId::ROOT,
+            member,
+            posted(0, front),
+            &mut RefusingSets,
+            &mut Vec::new(),
+        );
+        if let Some(then) = then {
+            tree.deliver(
+                NodeId::ROOT,
+                member,
+                posted(at, then.to_vec()),
+                &mut RefusingSets,
+                &mut Vec::new(),
+            );
+        }
+        tree.bury(NodeId::ROOT, member, &mut Vec::new());
+    }
+    assert_eq!(
+        tree.child_of(NodeId::ROOT, member),
+        None,
+        "{name} is bound to nothing"
+    );
+    let refuser = tree
+        .refused_by(NodeId::ROOT, member)
+        .map(|owner| tree.recovers(owner));
+    (tree.spends(NodeId::ROOT, member), refuser)
+}
+
+// The job spends a member bound to nothing whose name says recovery data
+// unless an object that is not a recovery object refused it: that object
+// read it as its own, so it is a file of the delivery, as the status says.
+#[test]
+fn a_recovery_named_member_an_archive_refused_is_not_spent() {
+    let mut rar = SIGNATURE.to_vec();
+    rar.extend_from_slice(b"hello");
+    // Refused by the archive its bytes founded: kept.
+    assert_eq!(
+        spent_after("show.p01", rar, Some(b"REFUSE")),
+        (false, Some(false))
+    );
+    // Bound to nothing and refused by nothing: spent by its name.
+    assert_eq!(
+        spent_after("show.vol00+01.par2", Vec::new(), None),
+        (true, None)
+    );
+    // Refused by the recovery set its bytes founded: spent.
+    let mut par2 = b"PAR2\0PKT".to_vec();
+    par2.extend_from_slice(&64u64.to_le_bytes());
+    par2.resize(64, 0);
+    assert_eq!(
+        spent_after("show.vol00+01.par2", par2, None),
+        (true, Some(true))
+    );
 }

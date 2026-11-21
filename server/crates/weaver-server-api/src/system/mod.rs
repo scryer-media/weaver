@@ -4,6 +4,7 @@
 pub mod metrics_history;
 pub mod runtime;
 pub mod types;
+pub mod usage_history;
 
 pub use crate::schema::system_mutation as mutation;
 pub use crate::schema::system_query as query;

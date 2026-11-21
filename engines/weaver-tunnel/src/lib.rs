@@ -9,13 +9,11 @@
 // revocable streams. NNTP uses direct in-process I/O; RSS uses authenticated
 // loopback SOCKS bridges. The server owns policy, persistence and the runtime.
 
-// Tests dial their own loopback fixtures.
-#![cfg_attr(test, allow(clippy::disallowed_methods))]
-
 pub mod bridge;
 pub mod direct;
 pub mod dns;
 pub mod egress;
+pub mod endpoint_names;
 pub mod fault;
 pub mod metrics;
 pub mod pipe;
@@ -34,11 +32,19 @@ pub mod transport;
 #[path = "shared_wireguard.rs"]
 pub mod wireguard;
 
-// Fixtures dial their own loopback listeners.
-#[allow(clippy::disallowed_methods)]
 #[cfg(any(test, feature = "test-support"))]
 #[path = "shared_test_support.rs"]
-pub mod test_support;
+mod fixtures;
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
+    pub use crate::fixtures::*;
+    #[cfg(feature = "test-support")]
+    #[path = "http_client.rs"]
+    pub mod http_client;
+    #[cfg(feature = "test-support")]
+    pub use http_client::system_dialer;
+}
 
 pub use error::TunnelError;
 pub use http3::{Http3ProxyCredentials, Http3TunnelProvider, Http3TunnelSpec};

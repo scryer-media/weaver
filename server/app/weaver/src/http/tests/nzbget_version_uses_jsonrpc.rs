@@ -4,6 +4,22 @@
 // `tests` tests, part of a mechanical split of the original file.
 
 use super::*;
+use weaver_server_core::auth::repository::AuthRepositoryQueries;
+use weaver_server_core::history::nzbget_state::HistoryNzbgetStateQueries;
+use weaver_server_core::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
+use weaver_server_core::history::queries::HistoryQueries;
+use weaver_server_core::history::timeline::HistoryTimelineQueries;
+use weaver_server_core::jobs::persistence::JobsPersistenceQueries;
+use weaver_server_core::jobs::repository::JobsRepositoryQueries;
+use weaver_server_core::post_processing::callbacks::PostProcessingCallbacksQueries;
+use weaver_server_core::post_processing::instances::PostProcessingInstancesQueries;
+use weaver_server_core::post_processing::settings::PostProcessingSettingsQueries;
+use weaver_server_core::proxies::ProxiesNetworkPersistenceQueries;
+use weaver_server_core::rss::RssPersistenceQueries;
+use weaver_server_core::servers::persistence::ServersPersistenceQueries;
+use weaver_server_core::servers::repository::ServersRepositoryQueries;
+use weaver_server_core::settings::persistence::SettingsPersistenceQueries;
+use weaver_server_core::settings::queries::SettingsQueries;
 
 const RPC_EXTENSION_ORIGINS: [&str; 3] = [
     "chrome-extension://mpejfoghnejnbfkpbiafklkmlhebkapb",
@@ -795,6 +811,10 @@ fn tv_category_config() -> SharedConfig {
         .unwrap()
         .categories
         .push(weaver_server_core::categories::CategoryConfig {
+            upload_cap: Default::default(),
+            unpack: None,
+            seeding: None,
+            torrent_route: false,
             id: 1,
             name: "TV".into(),
             dest_dir: None,
@@ -1359,7 +1379,7 @@ async fn nzbget_status_clamps_download_rate_to_arr_int() {
     let config = test_config();
     {
         let mut config_write = config.write().await;
-        config_write.max_download_speed = Some((i32::MAX as u64) * 4);
+        config_write.bandwidth.download_bps = Some((i32::MAX as u64) * 4);
     }
     let app = nzbget_test_router(
         Database::open_in_memory().unwrap(),
@@ -1403,6 +1423,7 @@ async fn nzbget_history_returns_arr_status_fields_and_drone_parameter() {
     ])
     .unwrap();
     db.insert_job_history(&weaver_server_core::JobHistoryRow {
+        protocol: weaver_server_core::Protocol::Nzb,
         job_id: 100,
         job_hash: None,
         name: "Complete.Release".into(),
@@ -1425,6 +1446,7 @@ async fn nzbget_history_returns_arr_status_fields_and_drone_parameter() {
     })
     .unwrap();
     db.insert_job_history(&weaver_server_core::JobHistoryRow {
+        protocol: weaver_server_core::Protocol::Nzb,
         job_id: 101,
         job_hash: None,
         name: "Failed.Release".into(),
@@ -1487,6 +1509,112 @@ async fn nzbget_history_returns_arr_status_fields_and_drone_parameter() {
     assert_eq!(failed["Message"], "article failures");
 }
 
+// An RSS job's item link and id are Parameters for an admin key only,
+// opened; a read key's history lists neither, and no caller is given the
+// sealed text.
+#[tokio::test]
+async fn nzbget_history_gives_an_rss_link_to_an_admin_key_only() {
+    use weaver_server_core::persistence::encryption::{EncryptionKey, encrypt_value};
+
+    const LINK: &str = "https://tracker.invalid/dl/1?passkey=f00d";
+    let key = EncryptionKey::generate();
+    let mut db = Database::open_in_memory().unwrap();
+    db.set_encryption_key(key.clone());
+    let metadata = serde_json::to_string(&[
+        (
+            weaver_server_api::CLIENT_REQUEST_ID_ATTRIBUTE_KEY.to_string(),
+            "drone-rss".to_string(),
+        ),
+        (
+            "rss.item_id".to_string(),
+            encrypt_value(&key, LINK).unwrap(),
+        ),
+        (
+            "rss.item_url".to_string(),
+            encrypt_value(&key, LINK).unwrap(),
+        ),
+        ("rss.feed_name".to_string(), "feed".to_string()),
+    ])
+    .unwrap();
+    db.insert_job_history(&weaver_server_core::JobHistoryRow {
+        protocol: weaver_server_core::Protocol::Nzb,
+        job_id: 100,
+        job_hash: None,
+        name: "Linked.Release".into(),
+        status: "complete".into(),
+        error_message: None,
+        total_bytes: 123,
+        downloaded_bytes: 123,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1000,
+        category: None,
+        output_dir: None,
+        nzb_path: None,
+        created_at: 1_700_000_000,
+        completed_at: 1_700_000_100,
+        metadata: Some(metadata),
+        server_attribution: None,
+        archived_at: None,
+    })
+    .unwrap();
+    let app = nzbget_test_router(
+        db,
+        test_scheduler_handle(),
+        test_config(),
+        api_key_cache("read-key", "read"),
+    );
+    let parameters = |payload: serde_json::Value| {
+        let text = payload.to_string();
+        assert!(!text.contains("enc:v1:"), "{text}");
+        payload["result"][0]["Parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|parameter| {
+                (
+                    parameter["Name"].as_str().unwrap().to_owned(),
+                    parameter["Value"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let history = serde_json::json!({ "method": "history", "params": [], "id": "history" });
+    // Twice as an admin: the second answer comes from the facade's cache.
+    for _ in 0..2 {
+        let (status, payload) =
+            post_nzbget(app.clone(), history.clone(), "Bearer session-token").await;
+        assert_eq!(status, StatusCode::OK);
+        let shown = parameters(payload);
+        assert!(
+            shown.contains(&("rss.item_id".to_owned(), LINK.to_owned())),
+            "{shown:?}"
+        );
+        assert!(
+            shown.contains(&("rss.item_url".to_owned(), LINK.to_owned())),
+            "{shown:?}"
+        );
+        assert!(
+            shown.contains(&("drone".to_owned(), "drone-rss".to_owned())),
+            "{shown:?}"
+        );
+    }
+    let (status, payload) = post_nzbget(app, history, "Bearer read-key").await;
+    assert_eq!(status, StatusCode::OK);
+    let shown = parameters(payload);
+    assert!(
+        shown
+            .iter()
+            .all(|(name, _)| !name.starts_with("rss.item_") || name == "rss.item_title"),
+        "{shown:?}"
+    );
+    assert!(
+        shown.contains(&("rss.feed_name".to_owned(), "feed".to_owned())),
+        "{shown:?}"
+    );
+}
+
 #[tokio::test]
 async fn nzbget_history_reports_the_folder_named_after_the_original_title() {
     let original = "Copper.Meadow.S11E42-E43.720p.HDTV.x264-GRP";
@@ -1498,6 +1626,7 @@ async fn nzbget_history_reports_the_folder_named_after_the_original_title() {
     let folder = weaver_server_core::ingest::completed_folder_name(&display, &metadata);
     let db = Database::open_in_memory().unwrap();
     db.insert_job_history(&weaver_server_core::JobHistoryRow {
+        protocol: weaver_server_core::Protocol::Nzb,
         job_id: 110,
         job_hash: None,
         name: display.clone(),
@@ -1931,6 +2060,10 @@ async fn nzbget_config_exposes_real_categories_and_keep_history() {
         config_write
             .categories
             .push(weaver_server_core::categories::CategoryConfig {
+                upload_cap: Default::default(),
+                unpack: None,
+                seeding: None,
+                torrent_route: false,
                 id: 1,
                 name: "tv".into(),
                 dest_dir: Some("/media/tv".into()),
@@ -1993,6 +2126,10 @@ async fn nzbget_config_emits_virtual_literal_alias_categories_for_arr_test() {
         config_write
             .categories
             .push(weaver_server_core::categories::CategoryConfig {
+                upload_cap: Default::default(),
+                unpack: None,
+                seeding: None,
+                torrent_route: false,
                 id: 1,
                 name: "TV".into(),
                 dest_dir: Some("/media/tv".into()),
@@ -2638,6 +2775,13 @@ async fn nzbget_global_pause_resume_and_scheduleresume_auto_resume() {
 async fn nzbget_rate_persists_limit_and_pausescan_toggles_watch_folder() {
     let db = Database::open_in_memory().unwrap();
     let config = test_config();
+    let kept_upload = weaver_server_core::proxies::Bandwidth {
+        download_bps: None,
+        upload_bps: Some(4096),
+        split: None,
+    };
+    db.set_network_bandwidth(&kept_upload).unwrap();
+    config.write().await.bandwidth = kept_upload;
     let handle = scheduler_handle_with_jobs(vec![]).await;
     let app = nzbget_test_router(
         db.clone(),
@@ -2654,15 +2798,23 @@ async fn nzbget_rate_persists_limit_and_pausescan_toggles_watch_folder() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["result"], true);
-    assert_eq!(
-        config.read().await.max_download_speed,
-        Some(2500 * 1024),
-        "rate should update the shared config in KB/s -> bytes/s"
-    );
-    assert_eq!(
-        db.get_setting("max_download_speed").unwrap().as_deref(),
-        Some("2560000")
-    );
+    let limited = weaver_server_core::proxies::Bandwidth {
+        download_bps: Some(2500 * 1024),
+        upload_bps: Some(4096),
+        split: None,
+    };
+    assert_eq!(config.read().await.bandwidth, limited);
+    assert_eq!(db.network_bandwidth().unwrap(), limited);
+
+    let (_, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({"method": "rate", "params": [0], "id": "unlimited"}),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(payload["result"], true);
+    assert_eq!(config.read().await.bandwidth, kept_upload);
+    assert_eq!(db.network_bandwidth().unwrap(), kept_upload);
 
     let (_, payload) = post_nzbget(
         app.clone(),
@@ -2695,6 +2847,148 @@ async fn nzbget_rate_persists_limit_and_pausescan_toggles_watch_folder() {
     .await;
     assert_eq!(payload["result"], true);
     assert!(!config.read().await.watch_folder.scanning_paused);
+}
+
+// NZBGet's DownloadLimit of 0 is no limit, and it has no stopped rate. With no
+// limit Weaver answers 0 and not paused; with a limit, that limit; with the
+// limit at 0, which in Weaver lets nothing through, paused and standing by,
+// never no limit. `rate 0` keeps NZBGet's meaning: no limit, not a stop.
+#[tokio::test]
+async fn nzbget_status_reports_a_stopped_rate_as_paused_never_as_unlimited() {
+    let db = Database::open_in_memory().unwrap();
+    let config = test_config();
+    let handle = scheduler_handle_with_jobs(vec![]).await;
+    let app = nzbget_test_router(
+        db.clone(),
+        handle,
+        config.clone(),
+        api_key_cache("control-key", "control"),
+    );
+    let fields = |status: &serde_json::Value| {
+        (
+            status["DownloadLimit"].clone(),
+            status["DownloadPaused"].clone(),
+            status["ServerPaused"].clone(),
+            status["Download2Paused"].clone(),
+            status["ServerStandBy"].clone(),
+        )
+    };
+    let answer = |limit: u64, paused: bool| {
+        (
+            serde_json::json!(limit),
+            serde_json::json!(paused),
+            serde_json::json!(paused),
+            serde_json::json!(paused),
+            serde_json::json!(true),
+        )
+    };
+
+    config.write().await.bandwidth.download_bps = None;
+    let status = rpc_result(app.clone(), "status", serde_json::json!([])).await;
+    assert_eq!(fields(&status), answer(0, false), "no limit");
+
+    config.write().await.bandwidth.download_bps = Some(2500 * 1024);
+    let status = rpc_result(app.clone(), "status", serde_json::json!([])).await;
+    assert_eq!(fields(&status), answer(2500 * 1024, false), "a limit");
+
+    config.write().await.bandwidth.download_bps = Some(0);
+    let status = rpc_result(app.clone(), "status", serde_json::json!([])).await;
+    assert_eq!(fields(&status), answer(0, true), "stopped");
+
+    // From the stop, NZBGet's `rate 0` lifts the limit.
+    assert_eq!(
+        rpc_result(app.clone(), "rate", serde_json::json!([0])).await,
+        true
+    );
+    assert_eq!(config.read().await.bandwidth.download_bps, None);
+    assert_eq!(db.network_bandwidth().unwrap().download_bps, None);
+    let status = rpc_result(app, "status", serde_json::json!([])).await;
+    assert_eq!(fields(&status), answer(0, false), "rate 0 after the stop");
+
+    // A schedule window that sets the limit to 0 stops downloads too, with
+    // no saved limit: paused and standing by. DownloadLimit stays the saved
+    // limit, none.
+    let queue = scheduler_handle_with_jobs(vec![]).await;
+    let state = queue.state.clone();
+    let app = nzbget_test_router(
+        db.clone(),
+        queue,
+        config.clone(),
+        api_key_cache("control-key", "control"),
+    );
+    state.set_download_block(weaver_server_core::DownloadBlockState {
+        scheduled_speed_limit: Some(0),
+        speed_limit_in_force: Some(0),
+        speed_limit_by_schedule: true,
+        ..weaver_server_core::DownloadBlockState::default()
+    });
+    let status = rpc_result(app, "status", serde_json::json!([])).await;
+    assert_eq!(fields(&status), answer(0, true), "scheduled stop");
+}
+
+// With a job downloading, Weaver is not standing by, until a stop holds every
+// download back: then it stands by because of the stop, saved or scheduled.
+#[tokio::test]
+async fn nzbget_status_stands_by_for_a_stop_with_a_job_downloading() {
+    let db = Database::open_in_memory().unwrap();
+    let config = test_config();
+    let job = nzbget_test_job(
+        97,
+        JobStatus::Downloading,
+        weaver_server_core::DownloadState::Downloading,
+        5_174_000_000,
+        815_000_000,
+        vec![],
+    );
+    let queue = scheduler_handle_with_jobs(vec![job]).await;
+    let state = queue.state.clone();
+    let app = nzbget_test_router(
+        db,
+        queue,
+        config.clone(),
+        api_key_cache("control-key", "control"),
+    );
+    let fields = |status: &serde_json::Value| {
+        (
+            status["DownloadPaused"].clone(),
+            status["ServerStandBy"].clone(),
+        )
+    };
+    let paused_and_standing_by = |both: bool| (serde_json::json!(both), serde_json::json!(both));
+
+    config.write().await.bandwidth.download_bps = None;
+    let status = rpc_result(app.clone(), "status", serde_json::json!([])).await;
+    assert_eq!(
+        fields(&status),
+        paused_and_standing_by(false),
+        "downloading"
+    );
+
+    config.write().await.bandwidth.download_bps = Some(0);
+    let status = rpc_result(app.clone(), "status", serde_json::json!([])).await;
+    assert_eq!(fields(&status), paused_and_standing_by(true), "saved stop");
+
+    config.write().await.bandwidth.download_bps = None;
+    state.set_download_block(weaver_server_core::DownloadBlockState {
+        scheduled_speed_limit: Some(0),
+        speed_limit_in_force: Some(0),
+        speed_limit_by_schedule: true,
+        ..weaver_server_core::DownloadBlockState::default()
+    });
+    let status = rpc_result(app.clone(), "status", serde_json::json!([])).await;
+    assert_eq!(
+        fields(&status),
+        paused_and_standing_by(true),
+        "scheduled stop"
+    );
+
+    state.set_download_block(weaver_server_core::DownloadBlockState::default());
+    let status = rpc_result(app, "status", serde_json::json!([])).await;
+    assert_eq!(
+        fields(&status),
+        paused_and_standing_by(false),
+        "window over"
+    );
 }
 
 #[tokio::test]
@@ -2753,6 +3047,76 @@ async fn nzbget_history_reports_compound_status_history_time_and_stage_timings()
     assert_eq!(by_id(401)["DownloadTimeSec"], 0);
     assert_eq!(by_id(402)["Status"], "DELETED/MANUAL");
     assert_eq!(by_id(402)["Deleted"], true);
+}
+
+// A failed job whose repair ran from 310 s to 340 s, then extracted until
+// 400 s and ended at 405 s. Its repair failure is said as the job ends and
+// recorded at the moment its repair stopped, so the facade's repair time is
+// the 30 s the repair ran, and extraction keeps its own 60 s.
+#[tokio::test]
+async fn nzbget_history_repair_time_of_a_failed_job_is_the_repair_alone() {
+    let db = Database::open_in_memory().unwrap();
+    db.insert_job_history(&nzbget_history_row(403, "failed", 1_700_000_405, None))
+        .unwrap();
+    let job_id = JobId(403);
+    let repair_ended = 1_700_000_340_000;
+    let recorded = [
+        (PipelineEvent::DownloadStarted { job_id }, 1_700_000_000_000),
+        (
+            PipelineEvent::DownloadFinished {
+                job_id,
+                finalization_pending: false,
+            },
+            1_700_000_300_000,
+        ),
+        (PipelineEvent::RepairStarted { job_id }, 1_700_000_310_000),
+        (PipelineEvent::ExtractionReady { job_id }, repair_ended),
+        (
+            PipelineEvent::ExtractionComplete { job_id },
+            1_700_000_400_000,
+        ),
+        (
+            PipelineEvent::RepairFailed {
+                job_id,
+                error: "not repairable".into(),
+                ended_at_ms: Some(repair_ended),
+            },
+            1_700_000_405_000,
+        ),
+    ];
+    let rows: Vec<_> = recorded
+        .iter()
+        .filter_map(|(event, now)| crate::wiring::job_event_row(event, *now))
+        .collect();
+    assert_eq!(rows.len(), recorded.len());
+    assert_eq!(
+        rows.last().map(|row| (row.kind.as_str(), row.timestamp)),
+        Some(("RepairFailed", repair_ended)),
+        "the failure is recorded when its repair stopped"
+    );
+    db.insert_job_events(&rows).unwrap();
+    let app = nzbget_test_router(
+        db,
+        test_scheduler_handle(),
+        test_config(),
+        ApiKeyCache::default(),
+    );
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({"method": "history", "params": [false], "id": "history"}),
+        "Bearer session-token",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let item = payload["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["ID"] == 403)
+        .unwrap();
+    assert_eq!(item["RepairTimeSec"], 30);
+    assert_eq!(item["UnpackTimeSec"], 60);
+    assert_eq!(item["PostTotalTimeSec"], 90);
 }
 
 #[tokio::test]
@@ -3488,7 +3852,7 @@ async fn nzbget_feed_bridge_exposes_weaver_rss() {
         item_title: "Show.S01E01.720p".into(),
         published_at: Some(1_700_000_000),
         size_bytes: Some(750 * 1024 * 1024),
-        decision: "submitted".into(),
+        decision: weaver_server_core::RssSeenDecision::Submitted,
         seen_at: 1_700_000_100,
         job_id: Some(10),
         item_url: Some("https://indexer.example/get/1".into()),
@@ -3501,7 +3865,7 @@ async fn nzbget_feed_bridge_exposes_weaver_rss() {
         item_title: "Show.S01E02.720p".into(),
         published_at: Some(1_700_000_200),
         size_bytes: None,
-        decision: "ignored".into(),
+        decision: weaver_server_core::RssSeenDecision::Ignored,
         seen_at: 1_700_000_300,
         job_id: None,
         item_url: None,
@@ -3676,7 +4040,10 @@ async fn resolve_scope_rejects_trusted_session_cookie_when_login_is_enabled() {
     auth_cache.replace(Some(CachedLoginAuth::new(
         "admin",
         password_hash,
-        jwt::generate_jwt_secret(),
+        &weaver_server_core::auth::SigningKeys::derive(
+            &weaver_server_core::persistence::encryption::EncryptionKey::generate(),
+        )
+        .unwrap(),
     )));
     let api_key_cache = ApiKeyCache::default();
     let mut headers = HeaderMap::new();
@@ -3827,7 +4194,14 @@ async fn resolve_scope_accepts_cached_jwt_without_db_lookup() {
     let password_hash = hash_password(&test_password()).unwrap();
     let auth_cache = LoginAuthCache::default();
     let api_key_cache = ApiKeyCache::default();
-    let auth = CachedLoginAuth::new("admin", password_hash, jwt::generate_jwt_secret());
+    let auth = CachedLoginAuth::new(
+        "admin",
+        password_hash,
+        &weaver_server_core::auth::SigningKeys::derive(
+            &weaver_server_core::persistence::encryption::EncryptionKey::generate(),
+        )
+        .unwrap(),
+    );
     let token = jwt::create_jwt("admin", &auth.jwt_secret, JWT_TTL_SECS);
     auth_cache.replace(Some(auth));
 
@@ -3893,7 +4267,7 @@ async fn login_handler_rejects_legacy_scrypt_hash() {
     db.set_auth_credentials("admin", &legacy_hash).unwrap();
     let auth_cache = LoginAuthCache::from_credentials(
         db.get_auth_credentials().unwrap(),
-        db.get_or_create_jwt_signing_secret().unwrap(),
+        &weaver_server_core::auth::SigningKeys::for_database(&db).unwrap(),
     );
     let app = auth_test_router(db.clone(), auth_cache.clone());
 
@@ -3923,7 +4297,7 @@ async fn login_handler_wrong_password_keeps_argon2_hash_and_cache() {
     db.set_auth_credentials("admin", &argon2_hash).unwrap();
     let auth_cache = LoginAuthCache::from_credentials(
         db.get_auth_credentials().unwrap(),
-        db.get_or_create_jwt_signing_secret().unwrap(),
+        &weaver_server_core::auth::SigningKeys::for_database(&db).unwrap(),
     );
     let original = auth_cache.snapshot().unwrap();
     let app = auth_test_router(db.clone(), auth_cache.clone());
@@ -3954,7 +4328,7 @@ async fn login_handler_wrong_username_with_valid_password_is_unauthorized() {
     db.set_auth_credentials("admin", &argon2_hash).unwrap();
     let auth_cache = LoginAuthCache::from_credentials(
         db.get_auth_credentials().unwrap(),
-        db.get_or_create_jwt_signing_secret().unwrap(),
+        &weaver_server_core::auth::SigningKeys::for_database(&db).unwrap(),
     );
     let original = auth_cache.snapshot().unwrap();
     let app = auth_test_router(db.clone(), auth_cache.clone());
@@ -3985,7 +4359,7 @@ async fn login_handler_rate_limits_repeated_failures() {
     db.set_auth_credentials("admin", &argon2_hash).unwrap();
     let auth_cache = LoginAuthCache::from_credentials(
         db.get_auth_credentials().unwrap(),
-        db.get_or_create_jwt_signing_secret().unwrap(),
+        &weaver_server_core::auth::SigningKeys::for_database(&db).unwrap(),
     );
     let app = auth_test_router(db, auth_cache);
 
@@ -4040,7 +4414,7 @@ async fn login_handler_malformed_hash_fails_cleanly() {
     db.set_auth_credentials("admin", "not-a-phc-hash").unwrap();
     let auth_cache = LoginAuthCache::from_credentials(
         db.get_auth_credentials().unwrap(),
-        db.get_or_create_jwt_signing_secret().unwrap(),
+        &weaver_server_core::auth::SigningKeys::for_database(&db).unwrap(),
     );
     let original = auth_cache.snapshot().unwrap();
     let app = auth_test_router(db.clone(), auth_cache.clone());
@@ -4068,7 +4442,14 @@ async fn auth_status_handler_uses_cached_auth_state() {
     let db = Database::open_in_memory().unwrap();
     let password_hash = hash_password(&test_password()).unwrap();
     let auth_cache = LoginAuthCache::default();
-    let auth = CachedLoginAuth::new("admin", password_hash, jwt::generate_jwt_secret());
+    let auth = CachedLoginAuth::new(
+        "admin",
+        password_hash,
+        &weaver_server_core::auth::SigningKeys::derive(
+            &weaver_server_core::persistence::encryption::EncryptionKey::generate(),
+        )
+        .unwrap(),
+    );
     let token = jwt::create_jwt("admin", &auth.jwt_secret, JWT_TTL_SECS);
     auth_cache.replace(Some(auth));
     let app = auth_test_router(db, auth_cache);
@@ -4113,7 +4494,10 @@ async fn a_trusted_network_is_not_signed_in_once_a_login_exists() {
     auth_cache.replace(Some(CachedLoginAuth::new(
         "admin",
         "not-a-phc-hash",
-        jwt::generate_jwt_secret(),
+        &weaver_server_core::auth::SigningKeys::derive(
+            &weaver_server_core::persistence::encryption::EncryptionKey::generate(),
+        )
+        .unwrap(),
     )));
     let after_login = auth_status_payload(auth_status_test_router_from_peer(
         Database::open_in_memory().unwrap(),
@@ -4166,7 +4550,10 @@ async fn auth_status_omits_the_setup_facts_once_setup_cannot_run() {
     auth_cache.replace(Some(CachedLoginAuth::new(
         "admin",
         hash_password(&test_password()).unwrap(),
-        jwt::generate_jwt_secret(),
+        &weaver_server_core::auth::SigningKeys::derive(
+            &weaver_server_core::persistence::encryption::EncryptionKey::generate(),
+        )
+        .unwrap(),
     )));
     let payload = auth_status_payload(auth_status_test_router(
         db,
@@ -4322,6 +4709,7 @@ async fn job_nzb_download_handler_returns_uncompressed_history_nzb() {
     db.archive_job(
         JobId(10_000),
         &weaver_server_core::JobHistoryRow {
+            protocol: weaver_server_core::Protocol::Nzb,
             job_id: 10_000,
             job_hash: None,
             name: "Silver Horizon".to_string(),
@@ -4403,6 +4791,7 @@ async fn job_output_file_download_handler_streams_history_file() {
     let file_path = output_dir.join("episode-01.mkv");
     std::fs::write(&file_path, b"video-bytes").unwrap();
     db.insert_job_history(&weaver_server_core::JobHistoryRow {
+        protocol: weaver_server_core::Protocol::Nzb,
         job_id: 10_001,
         job_hash: None,
         name: "Silver Horizon".to_string(),
@@ -4563,11 +4952,7 @@ async fn nzbget_hidden_history_does_not_consume_the_visible_page() {
     assert_eq!(all.as_array().unwrap().len(), 1000);
     assert!(!history_ids(&all).contains(&1));
     // Visibility changes neither retained history nor duplicate-check data.
-    assert_eq!(
-        db.count_job_history(&Default::default(), weaver_server_core::HistoryRows::All)
-            .unwrap(),
-        1001
-    );
+    assert_eq!(db.count_job_history(&Default::default()).unwrap(), 1001);
 }
 
 #[tokio::test]
@@ -4638,9 +5023,10 @@ async fn nzbget_history_delete_hides_the_row_and_final_delete_erases_it() {
 
 // An Arr's "Remove Completed" sends a non-final HistoryDelete. NZBGet keeps
 // the entry as a hidden duplicate and its own history view stops showing it;
-// Weaver's history listings leave it out the same way.
+// the facade leaves it out of history the same way. Weaver keeps the job in
+// its own history: every listing and count still shows it.
 #[tokio::test]
-async fn nzbget_history_delete_takes_the_row_off_weavers_history_listings() {
+async fn nzbget_history_delete_keeps_the_row_on_weavers_history_listings() {
     let db = Database::open_in_memory().unwrap();
     db.insert_job_history(&nzbget_history_row(801, "complete", 1_700_000_100, None))
         .unwrap();
@@ -4689,8 +5075,8 @@ async fn nzbget_history_delete_takes_the_row_off_weavers_history_listings() {
     };
 
     let data = query("{ historyItems { id } historyItemsCount }").await;
-    assert_eq!(ids(&data["historyItems"]), vec![802]);
-    assert_eq!(data["historyItemsCount"], 1);
+    assert_eq!(ids(&data["historyItems"]), vec![802, 801]);
+    assert_eq!(data["historyItemsCount"], 2);
     // Both page paths: the SQL one, and the Rust one a category facet takes.
     for input in [
         "{ pageIndex: 0, pageSize: 25 }",
@@ -4702,21 +5088,24 @@ async fn nzbget_history_delete_takes_the_row_off_weavers_history_listings() {
         ))
         .await;
         let page = &data["historyPage"];
-        assert_eq!(ids(&page["items"]), vec![802], "{input}");
-        assert_eq!(page["totalCount"], 1, "{input}");
+        assert_eq!(ids(&page["items"]), vec![802, 801], "{input}");
+        assert_eq!(page["totalCount"], 2, "{input}");
         assert_eq!(
             page["counts"],
-            serde_json::json!({ "all": 1, "success": 1, "failure": 0 }),
+            serde_json::json!({ "all": 2, "success": 2, "failure": 0 }),
             "{input}"
         );
         assert_eq!(
             page["categoryCounts"],
-            serde_json::json!([{ "category": "tv", "count": 1 }]),
+            serde_json::json!([{ "category": "tv", "count": 2 }]),
             "{input}"
         );
     }
 
-    // The facade's history(true) still lists both, the hidden one as DUP.
+    // The facade's own poll leaves it out; history(true) lists both, the
+    // hidden one as DUP.
+    let entries = rpc_result(app.clone(), "history", serde_json::json!([])).await;
+    assert_eq!(history_ids(&entries), vec![802]);
     let entries = rpc_result(app, "history", serde_json::json!([true])).await;
     let mut listed = history_ids(&entries);
     listed.sort_unstable();
@@ -4758,6 +5147,495 @@ async fn nzbget_history_delete_survives_reopening_the_database() {
     assert!(history_ids(&entries).is_empty());
     let entries = rpc_result(app, "history", serde_json::json!([true])).await;
     assert_eq!(history_ids(&entries), vec![601]);
+}
+
+// The facade and the GraphQL schema over one database and one running
+// pipeline, with the history worker running as production has it.
+struct ArchiveServer {
+    app: Router,
+    schema: weaver_server_api::WeaverSchema,
+    db: Database,
+    intermediate: std::path::PathBuf,
+    complete: std::path::PathBuf,
+    _root: tempfile::TempDir,
+}
+
+async fn archive_server_with(spawn_history_delete_worker: bool) -> ArchiveServer {
+    let root = tempfile::tempdir().unwrap();
+    let mut db = Database::open_in_memory().unwrap();
+    db.set_encryption_key(weaver_server_core::persistence::encryption::EncryptionKey::generate());
+    let config = test_config();
+    config.write().await.data_dir = root.path().to_string_lossy().into_owned();
+    let intermediate = std::path::PathBuf::from(config.read().await.intermediate_dir());
+    let complete = root.path().join("complete");
+    std::fs::create_dir_all(&intermediate).unwrap();
+    std::fs::create_dir_all(complete.join("tv")).unwrap();
+    let (mut pipeline, handle, state) =
+        weaver_server_core::pipeline::test_support::idle_pipeline(db.clone(), config.clone()).await;
+    tokio::spawn(async move { pipeline.run().await });
+    let queue = TestQueue {
+        handle: handle.clone(),
+        state: state.clone(),
+    };
+    let server_transfer_policy = Arc::new(
+        weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry::new(
+            db.clone(),
+            &[],
+        )
+        .unwrap(),
+    );
+    let proxies = weaver_server_core::proxies::ProxyRuntime::new(
+        db.clone(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    handle.set_proxy_runtime(proxies.clone());
+    let update_check =
+        weaver_server_core::update_check::UpdateCheckService::new(db.clone(), proxies.clone());
+    let application_upgrade =
+        weaver_server_core::application_upgrade::ApplicationUpgradeService::new(
+            db.clone(),
+            update_check.clone(),
+            root.path(),
+            weaver_server_core::application_upgrade::collect_installation_assessment(),
+            None,
+            proxies,
+        );
+    use weaver_server_core::runtime::system_profile as sp;
+    let schema = weaver_server_api::build_schema(weaver_server_api::SchemaContext {
+        handle: handle.clone(),
+        pipeline_state: state,
+        scheduled_resume: weaver_server_api::ScheduledResumeCoordinator::new(
+            db.clone(),
+            handle.clone(),
+        ),
+        config: config.clone(),
+        db: db.clone(),
+        server_transfer_policy,
+        auth_cache: LoginAuthCache::from_credentials(
+            None,
+            &weaver_server_core::auth::SigningKeys::for_database(&db).unwrap(),
+        ),
+        api_key_cache: ApiKeyCache::default(),
+        security: weaver_server_core::security::RuntimeSecurityConfig::default(),
+        rss: weaver_server_api::RssService::new(handle.clone(), config.clone(), db.clone()),
+        watch_folder: weaver_server_core::watch_folder::WatchFolderService::new(
+            db.clone(),
+            handle.clone(),
+            config.clone(),
+        ),
+        update_check,
+        application_upgrade,
+        schedules: Arc::new(RwLock::new(vec![])),
+        log_buffer: weaver_server_core::runtime::log_buffer::LogRingBuffer::with_default_capacity(),
+        system_runtime: weaver_server_api::SystemRuntimeContext {
+            profile: Arc::new(std::sync::RwLock::new(sp::SystemProfile {
+                cpu: sp::CpuProfile {
+                    physical_cores: 4,
+                    logical_cores: 8,
+                    simd: sp::SimdSupport::default(),
+                    cgroup_limit: None,
+                },
+                memory: sp::MemoryProfile {
+                    total_bytes: 8 << 30,
+                    available_bytes: 4 << 30,
+                    cgroup_limit: None,
+                    guessed: false,
+                },
+                disk: sp::DiskProfile {
+                    storage_class: sp::StorageClass::Unknown,
+                    filesystem: sp::FilesystemType::Unknown(String::new()),
+                    sequential_write_mbps: 0.0,
+                    random_read_iops: 0.0,
+                    same_filesystem: true,
+                },
+            })),
+            started_at: std::time::Instant::now(),
+        },
+        nntp_pool: None,
+        spawn_history_delete_worker,
+        post_processing_executor: None,
+        torrents: None,
+        torrent_availability: weaver_server_core::torrents::TorrentAvailability::AVAILABLE,
+        usage_recorder: None,
+    });
+    let app = nzbget_test_router(
+        db.clone(),
+        queue,
+        config,
+        api_key_cache("control-key", "control"),
+    );
+    ArchiveServer {
+        app,
+        schema,
+        db,
+        intermediate,
+        complete,
+        _root: root,
+    }
+}
+
+async fn archive_server() -> ArchiveServer {
+    archive_server_with(true).await
+}
+
+impl ArchiveServer {
+    // A finished job whose output folder Weaver made, holding one file.
+    fn owned_output(&self, job_id: u64, status: &str) -> std::path::PathBuf {
+        let mut row = nzbget_history_row(job_id, status, 1_700_000_000 + job_id as i64, None);
+        let dir = self.complete.join("tv").join(&row.name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("episode.mkv"), b"episode").unwrap();
+        weaver_server_core::jobs::working_dir::mark_weaver_owned_output_dir(&dir, JobId(job_id))
+            .unwrap();
+        row.output_dir = Some(dir.to_string_lossy().into_owned());
+        self.db.insert_job_history(&row).unwrap();
+        dir
+    }
+
+    // A failed job that kept its working folder, and recorded no output.
+    fn failed_working_dir(&self, job_id: u64) -> std::path::PathBuf {
+        let mut row = nzbget_history_row(job_id, "failed", 1_700_000_000 + job_id as i64, None);
+        row.output_dir = None;
+        let dir = weaver_server_core::jobs::working_dir::compute_working_dir(
+            &self.intermediate,
+            JobId(job_id),
+            &row.name,
+        );
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("episode.part01.rar"), b"part").unwrap();
+        weaver_server_core::jobs::working_dir::mark_weaver_owned_working_dir(
+            &self.intermediate,
+            &dir,
+            JobId(job_id),
+        )
+        .unwrap();
+        self.db.insert_job_history(&row).unwrap();
+        dir
+    }
+
+    async fn history_delete(&self, ids: &[u64]) -> serde_json::Value {
+        rpc_result(
+            self.app.clone(),
+            "editqueue",
+            serde_json::json!(["HistoryDelete", "", ids]),
+        )
+        .await
+    }
+
+    // Wait until `job_id`'s history entry, on the job page's update stream,
+    // passes `done`, and return the entry.
+    async fn history_item_when(
+        &self,
+        job_id: u64,
+        done: impl Fn(&serde_json::Value) -> bool,
+    ) -> serde_json::Value {
+        use async_graphql::futures_util::StreamExt;
+        let request = async_graphql::Request::new(format!(
+            "subscription {{ jobDetailUpdates(jobId: {job_id}) {{ historyItem {{ archivedAt \
+             deleteOperation {{ state action archiveOutcome }} }} }} }}"
+        ))
+        .data(CallerScope::Read);
+        let mut stream = self.schema.execute_stream(request);
+        loop {
+            let next = stream.next().await.expect("the stream stays open");
+            assert!(next.errors.is_empty(), "{:?}", next.errors);
+            let item = next.data.into_json().unwrap()["jobDetailUpdates"]["historyItem"].take();
+            if done(&item) {
+                return item;
+            }
+        }
+    }
+
+    // Wait for the worker to stamp `job_id` archived, and return the stamp.
+    async fn archived(&self, job_id: u64) -> String {
+        let item = self
+            .history_item_when(job_id, |item| item["archivedAt"].is_string())
+            .await;
+        item["archivedAt"].as_str().unwrap().to_string()
+    }
+
+    // Weaver's History page as the web asks for it, and the plain listing.
+    async fn weaver_history(&self) -> WeaverHistory {
+        let data = self
+            .graphql(
+                "{ historyPage(input: { pageIndex: 0, pageSize: 25 }) { items { id name \
+                 protocol displayTitle originalTitle status: state error totalBytes \
+                 downloadedBytes health hasPassword category tags createdAt completedAt \
+                 archivedAt deleteOperation { state locked action errorMessage \
+                 archiveOutcome } } totalCount counts { all success failure } \
+                 categoryCounts { category count } } \
+                 historyItems { id archivedAt } historyItemsCount }",
+            )
+            .await;
+        WeaverHistory(data)
+    }
+
+    async fn graphql(&self, query: &str) -> serde_json::Value {
+        let response = self
+            .schema
+            .execute(async_graphql::Request::new(query).data(CallerScope::Local))
+            .await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        response.data.into_json().unwrap()
+    }
+}
+
+// Weaver's own history listings, as one GraphQL answer.
+struct WeaverHistory(serde_json::Value);
+
+impl WeaverHistory {
+    // The History page's entry for `id`, which both listings must hold.
+    fn entry(&self, id: u64) -> &serde_json::Value {
+        fn listed(items: &serde_json::Value, id: u64) -> Option<&serde_json::Value> {
+            items
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["id"] == id)
+        }
+        let plain = listed(&self.0["historyItems"], id)
+            .unwrap_or_else(|| panic!("historyItems lists {id}"));
+        let page = listed(&self.0["historyPage"]["items"], id)
+            .unwrap_or_else(|| panic!("historyPage lists {id}"));
+        assert_eq!(plain["archivedAt"], page["archivedAt"], "{id}");
+        page
+    }
+
+    fn total(&self) -> u64 {
+        let total = self.0["historyPage"]["totalCount"].as_u64().unwrap();
+        assert_eq!(self.0["historyItemsCount"].as_u64().unwrap(), total);
+        assert_eq!(
+            self.0["historyPage"]["counts"]["all"].as_u64().unwrap(),
+            total
+        );
+        total
+    }
+}
+
+// Every client's HistoryDelete archives the job: the row is kept, the files
+// Weaver made for it go, and neither listing a client polls shows it again,
+// while history(true) and Weaver's own history still do.
+#[tokio::test]
+async fn nzbget_history_delete_archives_a_completed_job() {
+    let server = archive_server().await;
+    let output = server.owned_output(901, "complete");
+    server.owned_output(902, "complete");
+
+    assert_eq!(server.history_delete(&[901]).await, true);
+    server.archived(901).await;
+
+    assert!(!output.exists(), "the output folder Weaver made is removed");
+    let row = server.db.get_job_history(901).unwrap().unwrap();
+    assert!(row.archived_at.is_some());
+    assert_eq!(row.status, "complete");
+    // The next poll, in either shape, leaves it out.
+    for params in [serde_json::json!([]), serde_json::json!([false])] {
+        let entries = rpc_result(server.app.clone(), "history", params).await;
+        assert_eq!(history_ids(&entries), vec![902]);
+    }
+    let entries = rpc_result(server.app.clone(), "history", serde_json::json!([true])).await;
+    let entry = entries
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["NZBID"] == 901)
+        .expect("history(true) still lists it");
+    assert_eq!(entry["Kind"], "DUP");
+    assert_eq!(entry["Status"], "SUCCESS/ALL");
+    let item = server
+        .graphql("{ historyItem(id: 901) { id archivedAt } }")
+        .await;
+    assert!(item["historyItem"]["archivedAt"].is_string());
+    // Weaver's History lists both, the archived one stamped.
+    let history = server.weaver_history().await;
+    assert_eq!(history.total(), 2);
+    assert!(history.entry(901)["archivedAt"].is_string());
+    assert!(history.entry(901)["deleteOperation"].is_null());
+    assert!(history.entry(902)["archivedAt"].is_null());
+}
+
+// An entry archived through the facade shows in Weaver's History exactly as
+// one archived with Weaver's own archive action.
+#[tokio::test]
+async fn nzbget_history_delete_shows_like_weavers_own_archive() {
+    let server = archive_server().await;
+    let through_facade = server.owned_output(951, "complete");
+    let through_weaver = server.owned_output(952, "complete");
+
+    assert_eq!(server.history_delete(&[951]).await, true);
+    server
+        .graphql("mutation { archiveHistory(ids: [952]) { __typename } }")
+        .await;
+    server.archived(951).await;
+    server.archived(952).await;
+
+    assert!(!through_facade.exists());
+    assert!(!through_weaver.exists());
+    let history = server.weaver_history().await;
+    assert_eq!(history.total(), 2);
+    // Everything but the entry's own identity and times is the same.
+    let shown = |id: u64| {
+        let mut entry = history.entry(id).clone();
+        assert!(entry["archivedAt"].is_string(), "{id}");
+        for own in [
+            "id",
+            "name",
+            "displayTitle",
+            "originalTitle",
+            "createdAt",
+            "completedAt",
+            "archivedAt",
+        ] {
+            entry.as_object_mut().unwrap().remove(own);
+        }
+        entry
+    };
+    assert_eq!(shown(951), shown(952));
+    // Only the facade's own poll tells them apart.
+    let entries = rpc_result(server.app.clone(), "history", serde_json::json!([])).await;
+    assert_eq!(history_ids(&entries), vec![952]);
+}
+
+#[tokio::test]
+async fn nzbget_history_delete_archives_a_failed_job() {
+    let server = archive_server().await;
+    let working = server.failed_working_dir(911);
+
+    assert_eq!(server.history_delete(&[911]).await, true);
+    server.archived(911).await;
+
+    assert!(
+        !working.exists(),
+        "the failed job's working folder is removed"
+    );
+    let row = server.db.get_job_history(911).unwrap().unwrap();
+    assert_eq!(row.status, "failed");
+    let entries = rpc_result(server.app.clone(), "history", serde_json::json!([])).await;
+    assert!(history_ids(&entries).is_empty());
+    let entries = rpc_result(server.app.clone(), "history", serde_json::json!([true])).await;
+    assert_eq!(history_ids(&entries), vec![911]);
+    let history = server.weaver_history().await;
+    assert_eq!(history.total(), 1);
+    assert!(history.entry(911)["archivedAt"].is_string());
+    assert_eq!(history.entry(911)["status"], "FAILED");
+}
+
+// Sonarr and Radarr delete the output folder themselves before they send
+// HistoryDelete. A folder that is already gone is done, not an error: the
+// entry is stamped archived and nothing else is touched.
+#[tokio::test]
+async fn nzbget_history_delete_archives_a_job_whose_folder_is_already_gone() {
+    let server = archive_server().await;
+    let output = server.owned_output(921, "complete");
+    std::fs::remove_dir_all(&output).unwrap();
+    let neighbour = server.complete.join("tv").join("Someone.Elses.Release");
+    std::fs::create_dir_all(&neighbour).unwrap();
+
+    assert_eq!(server.history_delete(&[921]).await, true);
+    server.archived(921).await;
+
+    assert!(
+        server
+            .db
+            .get_job_history(921)
+            .unwrap()
+            .unwrap()
+            .archived_at
+            .is_some()
+    );
+    assert!(neighbour.is_dir(), "a folder Weaver did not make stays");
+    assert!(server.complete.join("tv").is_dir());
+    let history = server.weaver_history().await;
+    assert!(history.entry(921)["archivedAt"].is_string());
+}
+
+// When the folder that held the output is gone too, the drive may be
+// unmounted, so the archive fails rather than calling the files removed. The
+// row is kept, hidden from the client's poll, shown in Weaver unstamped with
+// the failed archive on it.
+#[tokio::test]
+async fn nzbget_history_delete_keeps_a_job_whose_parent_folder_is_gone() {
+    let server = archive_server().await;
+    let output = server.owned_output(941, "complete");
+    std::fs::remove_dir_all(output.parent().unwrap()).unwrap();
+
+    assert_eq!(server.history_delete(&[941]).await, true);
+    let item = server
+        .history_item_when(941, |item| item["deleteOperation"]["state"] == "FAILED")
+        .await;
+    assert!(item["archivedAt"].is_null());
+    assert_eq!(item["deleteOperation"]["action"], "ARCHIVE");
+
+    let row = server.db.get_job_history(941).unwrap().unwrap();
+    assert!(row.archived_at.is_none());
+    let entries = rpc_result(server.app.clone(), "history", serde_json::json!([])).await;
+    assert!(history_ids(&entries).is_empty());
+    let entries = rpc_result(server.app.clone(), "history", serde_json::json!([true])).await;
+    assert_eq!(history_ids(&entries), vec![941]);
+    let history = server.weaver_history().await;
+    assert_eq!(history.total(), 1);
+    let entry = history.entry(941);
+    assert!(entry["archivedAt"].is_null());
+    assert_eq!(entry["deleteOperation"]["state"], "FAILED");
+    assert_eq!(entry["deleteOperation"]["locked"], false);
+}
+
+// Several ids in one request: one archive operation takes them all, ids with
+// no history row are passed over, and a folder Weaver did not make is left.
+#[tokio::test]
+async fn nzbget_history_delete_archives_a_batch_in_one_operation() {
+    let server = archive_server().await;
+    let completed = server.owned_output(931, "complete");
+    let failed = server.failed_working_dir(932);
+    let gone = server.owned_output(933, "complete");
+    std::fs::remove_dir_all(&gone).unwrap();
+    // A folder with no Weaver marker is not Weaver's to remove.
+    let mut foreign = nzbget_history_row(934, "complete", 1_700_000_934, None);
+    let foreign_dir = server.complete.join("tv").join(&foreign.name);
+    std::fs::create_dir_all(&foreign_dir).unwrap();
+    std::fs::write(foreign_dir.join("episode.mkv"), b"episode").unwrap();
+    foreign.output_dir = Some(foreign_dir.to_string_lossy().into_owned());
+    server.db.insert_job_history(&foreign).unwrap();
+
+    assert_eq!(
+        server.history_delete(&[931, 932, 999, 933, 934]).await,
+        true
+    );
+    for id in [931, 932, 933] {
+        server.archived(id).await;
+    }
+
+    assert!(!completed.exists());
+    assert!(!failed.exists());
+    assert!(foreign_dir.join("episode.mkv").is_file());
+    assert!(
+        server
+            .db
+            .get_job_history(934)
+            .unwrap()
+            .unwrap()
+            .archived_at
+            .is_none()
+    );
+    // Every row is kept and hidden from the client's poll.
+    for id in [931, 932, 933, 934] {
+        assert!(server.db.get_job_history(id).unwrap().is_some(), "{id}");
+    }
+    let entries = rpc_result(server.app.clone(), "history", serde_json::json!([])).await;
+    assert!(history_ids(&entries).is_empty());
+    let entries = rpc_result(server.app.clone(), "history", serde_json::json!([true])).await;
+    let mut listed = history_ids(&entries);
+    listed.sort_unstable();
+    assert_eq!(listed, vec![931, 932, 933, 934]);
+    // Weaver's History shows all four: the archived ones stamped, the one
+    // whose folder was not Weaver's unstamped.
+    let history = server.weaver_history().await;
+    assert_eq!(history.total(), 4);
+    for id in [931, 932, 933] {
+        assert!(history.entry(id)["archivedAt"].is_string(), "{id}");
+    }
+    assert!(history.entry(934)["archivedAt"].is_null());
 }
 
 #[tokio::test]
@@ -5835,6 +6713,7 @@ async fn nzbget_listgroups_and_history_never_carry_a_job_password() {
         metadata: Some(metadata),
         server_attribution: None,
         archived_at: None,
+        protocol: weaver_server_core::Protocol::Nzb,
     })
     .unwrap();
     let app = nzbget_test_router(
@@ -5865,4 +6744,70 @@ async fn nzbget_listgroups_and_history_never_carry_a_job_password() {
             "{text}"
         );
     }
+}
+
+// Before the worker runs, one HistoryDelete of several ids has queued one
+// archive operation that holds every id with a history row, and has touched
+// nothing on disk.
+#[tokio::test]
+async fn nzbget_history_delete_queues_one_archive_for_the_whole_request() {
+    let server = archive_server_with(false).await;
+    let dirs = [
+        server.owned_output(941, "complete"),
+        server.owned_output(942, "complete"),
+        server.failed_working_dir(943),
+    ];
+
+    assert_eq!(server.history_delete(&[941, 999, 942, 943]).await, true);
+
+    let mut operations = Vec::new();
+    for id in [941, 942, 943] {
+        let item = server
+            .graphql(&format!(
+                "{{ historyItem(id: {id}) {{ deleteOperation {{ operationId action state }} }} }}"
+            ))
+            .await;
+        let operation = item["historyItem"]["deleteOperation"].clone();
+        assert_eq!(operation["action"], "ARCHIVE", "{id}");
+        assert_eq!(operation["state"], "QUEUED", "{id}");
+        operations.push(operation["operationId"].clone());
+    }
+    operations.dedup();
+    assert_eq!(operations.len(), 1, "one archive operation for the request");
+    for dir in &dirs {
+        assert!(dir.is_dir(), "{}", dir.display());
+    }
+    let states = server.db.nzbget_history_states(&[941, 942, 943]).unwrap();
+    assert!(states.values().all(|state| state.hidden));
+    assert_eq!(states.len(), 3);
+}
+
+// An entry another operation holds is not archived by HistoryDelete, so it
+// stays in the client's history and the client's next remove tries again.
+// The answer is true when at least one entry was taken, as NZBGet answers
+// true when any id it named was acted on.
+#[tokio::test]
+async fn nzbget_history_delete_leaves_a_busy_entry_listed() {
+    let server = archive_server_with(false).await;
+    let held = server.owned_output(971, "complete");
+    let free = server.owned_output(972, "complete");
+    // Weaver's own archive holds 971 until the worker runs it.
+    server
+        .graphql("mutation { archiveHistory(ids: [971]) { __typename } }")
+        .await;
+
+    assert_eq!(server.history_delete(&[971]).await, false);
+    let entries = rpc_result(server.app.clone(), "history", serde_json::json!([])).await;
+    let mut listed = history_ids(&entries);
+    listed.sort_unstable();
+    assert_eq!(listed, vec![971, 972]);
+
+    assert_eq!(server.history_delete(&[971, 972]).await, true);
+    let entries = rpc_result(server.app.clone(), "history", serde_json::json!([])).await;
+    assert_eq!(history_ids(&entries), vec![971]);
+    let states = server.db.nzbget_history_states(&[971, 972]).unwrap();
+    assert!(!states[&971].hidden);
+    assert!(states[&972].hidden);
+    assert!(held.is_dir());
+    assert!(free.is_dir());
 }

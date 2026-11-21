@@ -35,9 +35,28 @@ export const QUEUE_EVENTS = [
   "NZB_NAMED",
   "NZB_DOWNLOADED",
   "NZB_DELETED",
+  "SEEDING_FINISHED",
+  "SEEDING_STOPPED",
+  "QUOTA_NORMAL",
+  "QUOTA_TRICKLE",
+  "QUOTA_STOPPED",
+  "ROUTE_DOWN",
+  "TORRENT_MARKED",
+  "TORRENT_ADDED",
+  "TORRENT_DOWNLOADED",
+  "TORRENT_DELETED",
+  "JOB_ADDED",
+  "JOB_DOWNLOADED",
+  "JOB_DELETED",
+  "ROUTE_UP",
 ] as const;
 
 export type QueueEvent = (typeof QUEUE_EVENTS)[number];
+
+/** Whether only a torrent raises `event`: one a server without torrents never raises. */
+export function isTorrentQueueEvent(event: string): boolean {
+  return event.startsWith("TORRENT_") || event.startsWith("SEEDING_");
+}
 
 export type ScriptOptionType = "STRING" | "INTEGER" | "NUMBER" | "BOOLEAN" | "SECRET";
 

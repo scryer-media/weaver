@@ -19,6 +19,8 @@
 pub(super) mod catalog;
 pub(super) mod encode;
 mod render;
+mod torrent_services;
+mod torrent_swarm;
 
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -40,7 +42,7 @@ pub(super) use render::PrometheusRenderInput;
 #[cfg(test)]
 pub(super) use render::{
     OBSERVED_LIMITERS, job_status_label, render_post_processing, render_prometheus_metrics,
-    render_prometheus_metrics_input,
+    render_prometheus_metrics_input, render_torrents,
 };
 #[cfg(test)]
 pub(super) use weaver_server_core::operations::metrics_store::JobStatusCounts;
@@ -164,6 +166,8 @@ pub(crate) struct PrometheusMetricsExporter {
     // The configured schedule rules; absent when the exporter is built
     // without a schedule evaluator.
     schedules: Option<weaver_server_core::bandwidth::schedule::SharedSchedules>,
+    // The torrent service; absent when the server runs none.
+    torrents: Option<weaver_server_core::torrents::service::TorrentService>,
     build: BuildInfo,
 }
 
@@ -186,6 +190,7 @@ impl PrometheusMetricsExporter {
             transfer_policy,
             config,
             schedules: None,
+            torrents: None,
             build,
         }
     }
@@ -195,6 +200,14 @@ impl PrometheusMetricsExporter {
         schedules: weaver_server_core::bandwidth::schedule::SharedSchedules,
     ) -> Self {
         self.schedules = Some(schedules);
+        self
+    }
+
+    pub(crate) fn with_torrents(
+        mut self,
+        torrents: Option<weaver_server_core::torrents::service::TorrentService>,
+    ) -> Self {
+        self.torrents = torrents;
         self
     }
 
@@ -253,7 +266,10 @@ impl PrometheusMetricsExporter {
             weaver_server_core::proxies::network_metrics::snapshot(&runtime.network)
         });
         let tunnel = weaver_server_core::proxies::network_metrics::tunnel::snapshot();
+        let dns = weaver_server_core::proxies::network_metrics::tunnel::dns_snapshot();
         let speed_tests = weaver_server_core::speed_test::speed_test_metrics_snapshot();
+        // What the torrent service last published, and its event counters.
+        let torrents = self.torrents.as_ref().map(|torrents| torrents.metrics());
         // The samplers' last readings: a scrape never stats a filesystem, so a
         // slow mount cannot hold it.
         // Each volume's write counters where they stand: atomic reads.
@@ -263,6 +279,8 @@ impl PrometheusMetricsExporter {
         let server_metrics = self.handle.server_metrics_snapshot();
         let job_lifecycle = self.handle.job_lifecycle_metrics_snapshot();
         let pipeline_histograms = self.handle.pipeline_histograms_snapshot();
+        // The holds accountant's counts, under its own lock.
+        let holds = self.handle.holds_metrics_snapshot();
         let db_runtime = self.db.runtime_metrics_snapshot();
         let wal_checkpoint = self.db.wal_checkpoint_metrics_snapshot();
         let process = weaver_server_core::runtime::process_metrics::sample();
@@ -295,7 +313,9 @@ impl PrometheusMetricsExporter {
         input.schedules = Some(&schedules);
         input.network = network.as_ref();
         input.tunnel = Some(&tunnel);
+        input.dns = Some(&dns);
         input.speed_tests = Some(&speed_tests);
+        input.torrents = torrents.as_ref();
         input.build = self.build;
         input.start_time_seconds = process_start_epoch_seconds();
         input.per_job_series = per_job_series;
@@ -307,6 +327,7 @@ impl PrometheusMetricsExporter {
         input.process = Some(&process);
         input.disk_space = &disk_space;
         input.volumes = &volumes;
+        input.holds = holds.as_ref();
         input.http_metrics = Some(&http_metrics);
         render::render_prometheus_metrics_input(&input)
     }
@@ -608,6 +629,40 @@ async fn collect_server_health(pool: &NntpPool) -> Vec<ServerHealthInfo> {
             address_plan: pre.address_plan,
         })
         .collect()
+}
+
+// Which torrents earn their own `weaver_torrent_*` series, and their
+// trackers', under the configured mode. `Active` is a torrent at work on its
+// own data: downloading, checking its files, fetching its metadata or moving.
+// One that seeds, waits or is held has none, so the scrape does not grow
+// with the torrents kept; `weaver_torrents` counts every one by state.
+pub(super) fn torrent_is_exported(
+    state: weaver_server_core::torrents::TorrentState,
+    mode: PerJobSeries,
+) -> bool {
+    use weaver_server_core::torrents::TorrentState;
+    match mode {
+        PerJobSeries::Off => false,
+        PerJobSeries::All => true,
+        PerJobSeries::Active => match state {
+            TorrentState::Downloading
+            | TorrentState::CheckingFiles
+            | TorrentState::FetchingMetadata
+            | TorrentState::Moving => true,
+            // A download with no peer, or with a full disk: it holds a
+            // download's turn and is watched as one.
+            TorrentState::Stalled => true,
+            // Every torrent passes through this at each start, the seeding
+            // ones included; it reads what was saved and moves no figure.
+            TorrentState::CheckingResumeData => false,
+            TorrentState::Queued
+            | TorrentState::Seeding
+            | TorrentState::Paused
+            | TorrentState::Stopped
+            | TorrentState::NeedsCertificate
+            | TorrentState::FilesMissing => false,
+        },
+    }
 }
 
 // Which jobs earn their own `weaver_job_*` series under the configured mode.

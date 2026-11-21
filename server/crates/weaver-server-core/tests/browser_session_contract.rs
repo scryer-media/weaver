@@ -8,6 +8,7 @@
 )]
 
 use std::time::{SystemTime, UNIX_EPOCH};
+use weaver_server_core::auth::repository::AuthRepositoryQueries;
 
 use weaver_server_core::Database;
 use weaver_server_core::auth::hash_api_key;

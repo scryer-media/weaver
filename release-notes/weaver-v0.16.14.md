@@ -28,7 +28,7 @@ Everything below is new since 0.16.13.
   finds `Show.S01E01.1080p`. On Postgres it also matches close spellings
   when the `pg_trgm` extension can be installed. Sorting by name uses the
   full release name too.
-- **NZBs that SABnzbd and NZBGet accept are accepted.** A file with no
+- **More NZBs are accepted.** A file with no
   poster, subject or date is no longer refused. Text that is not UTF-8 is
   read as Latin-1, and an upload is recognised by its content, including
   bzip2-compressed and misnamed files. The 2,000,000-article and 128 MB

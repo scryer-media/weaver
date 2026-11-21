@@ -1,0 +1,22 @@
+[package]
+name = "host_name_lookup"
+version = "0.1.0"
+description = "Refuses any call that can hand a host name to the host resolver"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+dylint_linting = "=6.3.2"
+
+[dev-dependencies]
+dylint_testing = "=6.3.2"
+
+# Its own workspace: it builds on the nightly it pins, apart from Weaver.
+[workspace]
+
+[package.metadata.rust-analyzer]
+rustc_private = true

@@ -16,6 +16,8 @@
 // The object is pure: no I/O, no threads, no files. Bytes it cannot place yet
 // are held by its owner, who hands them back once the map places them.
 
+mod basis;
+mod bids;
 mod carried;
 mod crypto;
 mod directory;
@@ -29,6 +31,38 @@ mod walk;
 
 #[cfg(test)]
 mod tests;
+
+// How many entries the passes over local headers and over keys looked at
+// on this thread, and how many the passes over every entry would have, for
+// a test to measure.
+#[cfg(test)]
+pub(super) mod looked {
+    use std::cell::Cell;
+
+    thread_local! {
+        static LOCALS: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+        static OPENED: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+    }
+
+    fn add(cell: &'static std::thread::LocalKey<Cell<(u64, u64)>>, now: usize, every: usize) {
+        cell.with(|count| {
+            let (was_now, was_every) = count.get();
+            count.set((was_now + now as u64, was_every + every as u64));
+        });
+    }
+
+    pub(super) fn locals(now: usize, every: usize) {
+        add(&LOCALS, now, every);
+    }
+
+    pub(super) fn opened(now: usize, every: usize) {
+        add(&OPENED, now, every);
+    }
+
+    pub(super) fn counts() -> ((u64, u64), (u64, u64)) {
+        (LOCALS.with(Cell::get), OPENED.with(Cell::get))
+    }
+}
 
 // What a test reads of where a zip's work ran: the bytes delivered to it on
 // this thread, and the cipher bytes its keys ran over on this thread and on
@@ -146,11 +180,11 @@ pub struct Zip {
     // The bytes the map was built on, by range and checksum; none once any
     // of them changed under a map held against its directory, until the
     // directory is read again.
-    basis: Vec<(ByteRange, u32)>,
+    basis: basis::Basis,
     members: Vec<Out>,
     grid: Grid,
     // Container ranges wanted ahead of the normal order.
-    bids: Vec<(ByteRange, Weight)>,
+    bids: bids::Bids,
     damage_said: HashSet<(u64, u64, u32)>,
     // Whether the container's tail was looked at for a recovery set.
     #[serde(default)]
@@ -409,8 +443,8 @@ impl Zip {
     // Keep a range, and bid for it unless it comes in the normal order.
     fn want(&mut self, range: ByteRange, bid: bool) {
         self.kept.want(range);
-        if bid && !range.is_empty() && !self.bids.iter().any(|(wanted, _)| *wanted == range) {
-            self.bids.push((range, Weight::FIRST));
+        if bid && !range.is_empty() {
+            self.bids.bid(range, Weight::FIRST);
         }
     }
 
@@ -475,19 +509,16 @@ impl Zip {
         let Some(map) = &self.map else {
             return;
         };
-        if !self
-            .basis
-            .iter()
-            .any(|(basis, _)| basis.intersect(range).is_some())
-        {
-            return;
-        }
-        let same = self.basis.iter().all(|(basis, crc)| {
-            self.kept
-                .read(*basis)
-                .is_some_and(|bytes| crc32(bytes) == *crc)
-        });
-        if same {
+        // Only the ranges the delivery meets can have changed: `basis` says
+        // why that answers as looking at every one did.
+        let changed = self.basis.changed(&self.kept, range);
+        #[cfg(test)]
+        assert_eq!(
+            changed,
+            self.basis.changed_looking_at_every_range(&self.kept, range),
+            "the narrowed look answers as the look at every range did"
+        );
+        if changed != Some(true) {
             return;
         }
         if !map.checked {
@@ -522,6 +553,20 @@ impl Zip {
 impl Object for Zip {
     fn kind(&self) -> Kind {
         Kind::Zip
+    }
+
+    // Stored entries take their bytes as they arrive, until a compressed or
+    // unmapped one gives the archive to an engine.
+    fn passes_on(&self) -> bool {
+        !self.gone
+    }
+
+    // An entry whose stored bytes stream into its member, not enciphered.
+    fn verbatim(&self, member: MemberId) -> bool {
+        self.map
+            .as_ref()
+            .and_then(|map| map.entry(member))
+            .is_some_and(|entry| entry.streams && entry.cipher.is_none())
     }
 
     fn deliver(
@@ -645,7 +690,7 @@ impl Object for Zip {
                     })
                     .map(|_| Why::Encrypted)
             })
-            .or_else(|| crate::quiet::unplaced(standing))
+            .or_else(|| crate::quiet::unplaced(standing, None))
         {
             self.give_up(Emit::Refuse(why), out);
         }
@@ -656,7 +701,7 @@ impl Object for Zip {
             return;
         }
         let mut pieces = Vec::new();
-        for (range, weight) in &self.bids {
+        for (range, weight) in self.bids.iter() {
             // A range in hand is wanted no more.
             if self.kept.read(*range).is_some() {
                 continue;
@@ -846,7 +891,12 @@ impl Object for Zip {
         }
     }
 
-    fn claim(&mut self, name: &str, _first_bytes: &[u8], _length: Option<u64>) -> Claim {
+    fn claim(
+        &mut self,
+        name: &str,
+        _first_bytes: weaver_graph::Clean<'_>,
+        _length: Option<u64>,
+    ) -> Claim {
         self.volume_of(name).into_iter().collect()
     }
 

@@ -99,6 +99,11 @@ impl Slots {
         self.queue.len()
     }
 
+    // Whether the asker waits in the queue for a slot.
+    pub fn waits(&self, asker: AskerId) -> bool {
+        self.waiting.contains(&asker)
+    }
+
     pub fn ask(&mut self, asker: AskerId) -> Asked {
         if self.holders.contains_key(&asker) {
             return Asked::Holding;

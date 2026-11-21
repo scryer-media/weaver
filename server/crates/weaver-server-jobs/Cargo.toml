@@ -1,0 +1,33 @@
+[package]
+name = "weaver-server-jobs"
+description = "Job records and persistence for the Weaver server"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[features]
+test-support = []
+
+[dependencies]
+rmp-serde = { workspace = true, default-features = false }
+zstd = { workspace = true }
+unicase = { version = "2.10.0", default-features = false }
+unicode-normalization = { workspace = true }
+blake3 = { workspace = true }
+cap-std = { workspace = true }
+cap-fs-ext = { workspace = true }
+tokio = { workspace = true }
+libc = { workspace = true }
+weaver-graph = { path = "../../../engines/weaver-graph" }
+chrono = { workspace = true }
+weaver-model = { path = "../../../shared/crates/weaver-model", default-features = false }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+bitvec = { workspace = true }
+url = "2"
+weaver-server-base = { path = "../weaver-server-base" }
+weaver-server-db = { path = "../weaver-server-db" }

@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 import { useCallback, useMemo, useState } from "react";
-import { useNavigate } from "react-router";
+import { useNavigate, useSearchParams } from "react-router";
 import { useMutation, useQuery } from "urql";
 import {
   REDOWNLOAD_JOB_MUTATION,
@@ -11,11 +11,11 @@ import {
   SYSTEM_INFO_QUERY,
 } from "@/graphql/queries";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
-import { formatJobReleaseName, normalizeGraphqlTimestamp } from "@/lib/job-types";
+import { formatJobReleaseName, normalizeGraphqlTimestamp, type JobProtocol } from "@/lib/job-types";
 import { saveBlobAsDownload } from "@/lib/download";
 import { cn } from "@/lib/utils";
 import { statusToken } from "@/lib/status-tokens";
-import { EmptyState, MetricCell, MetricStrip, SectionHeader, Square } from "../components/chrome";
+import { EmptyState, MetricCell, MetricStrip, ProtocolTag, SectionHeader, Square } from "../components/chrome";
 import { BulkBar, BulkButton, BulkCluster } from "../components/BulkBar";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { ArchivePasswordDialog } from "../components/ArchivePassword";
@@ -44,7 +44,8 @@ import { countLabel } from "../i18n/labels";
 import { useStatusLabel } from "../data/status";
 import { jobIds, testIds } from "@/next/testids";
 import { NextShell, RailBlock } from "../shell/NextShell";
-import { CategoryListBlock } from "../shell/rail-blocks";
+import { CategoryListBlock, TagFilterBlock } from "../shell/rail-blocks";
+import { TagChips } from "../components/Tags";
 import {
   categoryFacets,
   countsByFacet,
@@ -93,6 +94,8 @@ const COLUMNS = {
 const PAGE_SIZES = [25, 50, 100] as const;
 /** Deep enough to cover a busy day, cheap enough to ask for on every visit. */
 const SAMPLE_SIZE = 200;
+// A tag change answers with JobTag rows; refetch the page when one lands.
+const TAG_CONTEXT = { additionalTypenames: ["JobTag"] };
 /** Typing is one search once the keys stop, not one per key. */
 const SEARCH_SETTLE_MS = 300;
 const NO_COUNTS = { all: 0, success: 0, failure: 0 };
@@ -122,6 +125,7 @@ const TAB_STATUS: Record<TabId, "ALL" | "SUCCESS" | "FAILURE"> = {
 interface HistoryRow {
   id: number;
   name: string;
+  protocol?: JobProtocol;
   displayTitle: string;
   originalTitle: string;
   status: string;
@@ -131,6 +135,7 @@ interface HistoryRow {
   health: number;
   hasPassword: boolean;
   category: string | null;
+  tags?: string[];
   createdAt: string | number | null;
   completedAt: string | number | null;
   /** When the entry was archived, or null while it is not. */
@@ -223,6 +228,7 @@ export function HistoryPage() {
   const [pageSize, setPageSize] = useState<number>(50);
   const [picked, setPicked] = useState<ReadonlySet<number>>(() => new Set());
   const [facets, setFacets] = useState<ReadonlySet<string>>(NO_FACETS);
+  const [tag, setTag] = useState<string | null>(null);
   // The entries a confirm dialog acts on: the picked ones, or one row's own.
   const [confirmDelete, setConfirmDelete] = useState<ConfirmTargets | null>(null);
   const [confirmArchive, setConfirmArchive] = useState<ConfirmTargets | null>(null);
@@ -232,6 +238,19 @@ export function HistoryPage() {
   const [busy, setBusy] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const midnight = useStartOfToday();
+  // `?since=<epoch seconds>` keeps only jobs finished from then on; the
+  // Overview's finished-today count links here with today's midnight.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const sinceParam = Number(searchParams.get("since"));
+  const since = Number.isFinite(sinceParam) && sinceParam > 0 ? Math.floor(sinceParam) : null;
+  const clearSince = useCallback(() => {
+    setPageIndex(0);
+    setSearchParams((previous) => {
+      const next = new URLSearchParams(previous);
+      next.delete("since");
+      return next;
+    });
+  }, [setSearchParams]);
   const search = useDebouncedValue(query.trim(), SEARCH_SETTLE_MS);
   // A new search starts from its first page, once it is the search in force.
   const [searchedFor, setSearchedFor] = useState(search);
@@ -251,13 +270,16 @@ export function HistoryPage() {
       categories,
       sortField: sortOption.field,
       sortDirection: sortOption.direction,
+      completedSinceEpochSec: since ?? undefined,
+      tag: tag ?? undefined,
     }),
-    [categories, pageIndex, pageSize, search, sortOption.direction, sortOption.field, tab],
+    [categories, pageIndex, pageSize, search, since, sortOption.direction, sortOption.field, tab, tag],
   );
 
   const [{ data, fetching }, reexecute] = useQuery<HistoryPageResponse>({
     query: NEXT_HISTORY_PAGE_QUERY,
     variables: { input },
+    context: TAG_CONTEXT,
   });
   // The strip's own numbers — today's jobs and what they averaged — need rows
   // the current page may not hold, so they come from a shallow newest-first
@@ -272,8 +294,10 @@ export function HistoryPage() {
         categories,
         sortField: "COMPLETED_AT",
         sortDirection: "DESC",
+        tag: tag ?? undefined,
       },
     },
+    context: TAG_CONTEXT,
   });
   const [{ data: systemInfo }] = useQuery<{
     systemInfo: { configuredStorage: StorageVolume[] };
@@ -575,12 +599,15 @@ export function HistoryPage() {
         </>
       }
       railMiddle={
-        <CategoryListBlock
-          items={facetItems}
-          selected={facets}
-          onToggle={(key) => reset(() => setFacets((current) => toggleFacet(current, key)))}
-          onClear={() => reset(() => setFacets(NO_FACETS))}
-        />
+        <>
+          <CategoryListBlock
+            items={facetItems}
+            selected={facets}
+            onToggle={(key) => reset(() => setFacets((current) => toggleFacet(current, key)))}
+            onClear={() => reset(() => setFacets(NO_FACETS))}
+          />
+          <TagFilterBlock selected={tag} onSelect={(next) => reset(() => setTag(next))} />
+        </>
       }
       railFooter={
         <RailBlock eyebrow={t("next.completed.storage")}>
@@ -643,7 +670,19 @@ export function HistoryPage() {
               )
             }
             right={
-              <div className="relative">
+              <div className="relative flex items-center gap-4">
+                {since === null ? null : (
+                  <span className="flex items-center gap-2 font-wv-mono text-[11px] text-wv-secondary">
+                    {t("next.completed.since", { time: formatClock(since * 1000) })}
+                    <button
+                      type="button"
+                      onClick={clearSince}
+                      className="cursor-pointer text-wv-muted hover:text-wv-fg"
+                    >
+                      {t("next.completed.showAll")}
+                    </button>
+                  </span>
+                )}
                 <button
                   type="button"
                   data-wv-menu-trigger=""
@@ -783,23 +822,27 @@ export function HistoryPage() {
                       disabled={locked}
                       onChange={() => togglePicked(row.id)}
                     />
-                    <div className="min-w-0 truncate font-wv-mono text-[12.5px] text-wv-fg">
-                      {formatJobReleaseName(row)}
-                      {row.hasPassword ? (
-                        <Icon name="lock" size={11} className="ml-[6px] inline-block align-[-1px] text-wv-muted" />
-                      ) : null}
-                      {row.archivedAt !== null ? (
-                        <span
-                          data-testid={jobIds.historyArchived(row.id)}
-                          className="ml-[8px] font-wv-mono text-[10.5px] tracking-[0.06em] text-wv-faint uppercase"
-                        >
-                          {t("next.historyArchive.mark")}
-                        </span>
-                      ) : archiveFailed !== null ? (
-                        <span className="ml-[8px] font-wv-mono text-[10.5px] tracking-[0.06em] text-wv-error-text uppercase">
-                          {archiveFailed}
-                        </span>
-                      ) : null}
+                    <div className="flex min-w-0 items-center gap-[7px]">
+                      <ProtocolTag protocol={row.protocol} />
+                      <div className="min-w-0 truncate font-wv-mono text-[12.5px] text-wv-fg">
+                        {formatJobReleaseName(row)}
+                        {row.hasPassword ? (
+                          <Icon name="lock" size={11} className="ml-[6px] inline-block align-[-1px] text-wv-muted" />
+                        ) : null}
+                        {row.archivedAt !== null ? (
+                          <span
+                            data-testid={jobIds.historyArchived(row.id)}
+                            className="ml-[8px] font-wv-mono text-[10.5px] tracking-[0.06em] text-wv-faint uppercase"
+                          >
+                            {t("next.historyArchive.mark")}
+                          </span>
+                        ) : archiveFailed !== null ? (
+                          <span className="ml-[8px] font-wv-mono text-[10.5px] tracking-[0.06em] text-wv-error-text uppercase">
+                            {archiveFailed}
+                          </span>
+                        ) : null}
+                      </div>
+                      <TagChips tags={row.tags} className="flex-none flex-nowrap" />
                     </div>
                     <div className="flex min-w-0 items-center gap-[7px]">
                       <Square

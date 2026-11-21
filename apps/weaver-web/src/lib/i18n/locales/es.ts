@@ -32,6 +32,10 @@ const es: LocaleDictionary = {
   // Status labels
   "status.queued": "En cola",
   "status.downloading": "Descargando",
+  "status.fetchingMetadata": "Obteniendo metadatos",
+  "status.checkingFiles": "Comprobando archivos",
+  "status.seeding": "Compartiendo",
+  "status.stalled": "Estancado",
   "status.fetchingRepairData": "Obteniendo datos de reparación",
   "status.verifying": "Verificando",
   "status.repairing": "Reparando",
@@ -89,6 +93,7 @@ const es: LocaleDictionary = {
   "jobs.egressQuotaEta": "Hasta {{resetAt}}",
   "jobs.serverQuotaBadge": "Cuota del servidor",
   "jobs.serverQuotaEta": "Esperando cuota del servidor",
+  "jobs.speedTestBadge": "Prueba",
 
   // Table headers
   "table.name": "Nombre",

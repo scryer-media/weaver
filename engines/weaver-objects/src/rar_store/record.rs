@@ -207,28 +207,38 @@ impl RarStore {
         let gaps = entry.plain_runs.feed(range, digest, provenance);
         let said = (member, 0, &entry.out.coverage);
         refeed(&mut entry.plain_runs, gaps, said, read);
-        let plain_len = entry.plain_len();
+        let (plain_len, short) = (entry.plain_len(), entry.short());
+        let hash_key = entry.hash_key.as_deref();
+        let verdict = plain_len.zip(entry.crc).map(|(length, expected)| {
+            gate(
+                &entry.plain_runs,
+                length,
+                expected,
+                entry.uses_mac,
+                hash_key,
+            )
+        });
         let said = Arc::make_mut(&mut entry.out);
         said.coverage.write(range, provenance);
         let Some(length) = plain_len else {
             return;
         };
         let whole = ByteRange::new(0, length);
-        if !said.closed && said.coverage.covered(whole) {
+        // A member its parts carry short of its stated size ends where they
+        // do once its CRC proves the bytes there, as unrar's ValidCRC check
+        // judges what it wrote. One whose verified bytes fail it closes at
+        // its stated size, as any member does, and fails its checksum there;
+        // one not judged yet waits for its bytes to be.
+        let proved = matches!(verdict, Some((SliceVerdict::Intact, _)));
+        let judged = proved || matches!(verdict, Some((SliceVerdict::Damaged, _)));
+        if !said.closed && said.coverage.covered(whole) && (!short || judged) {
             said.closed = true;
+            if short && proved {
+                out.push(Emit::Ends { member, length });
+            }
             out.push(Emit::MemberClosed(member));
         }
-        let Some(expected) = entry.crc else {
-            return;
-        };
-        let hash_key = entry.hash_key.as_deref();
-        let (SliceVerdict::Damaged, composed) = gate(
-            &entry.plain_runs,
-            length,
-            expected,
-            entry.uses_mac,
-            hash_key,
-        ) else {
+        let Some((SliceVerdict::Damaged, composed)) = verdict else {
             return;
         };
         // The gate composes verified runs only, so a failure here is on

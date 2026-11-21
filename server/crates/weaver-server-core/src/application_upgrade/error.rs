@@ -3,7 +3,7 @@
 
 // The boundary between Weaver's upgrade errors and the shared upgrade core.
 //
-// Weaver's own [`crate::error::Error`] covers configuration and I/O, which is
+// Weaver's own [`weaver_server_base::error::Error`] covers configuration and I/O, which is
 // not the shape an upgrade fails in: the three outcomes that matter to the API
 // are "the request was wrong", "the machine was wrong", and "there is nothing
 // there". Those are exactly the shared core's non-host variants, so this type

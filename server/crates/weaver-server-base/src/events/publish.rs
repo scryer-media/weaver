@@ -1,0 +1,104 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+use crate::events::model::PipelineEvent;
+
+// Whether an event describes one article or segment rather than a job or
+// file: the per-article stream a download emits several of per article.
+//
+// Nothing that renders a queue item needs these. The item's progress comes
+// from `PhaseProgressUpdated`, which the orchestrator samples on its metrics
+// cadence, and its state from the job-level events. These events travel on
+// their own stream (`SchedulerHandle::subscribe_segment_events`), not the
+// job-level broadcast; this predicate lets a consumer that merges both keep
+// telling them apart.
+pub fn is_segment_event(event: &PipelineEvent) -> bool {
+    matches!(
+        event,
+        PipelineEvent::ArticleDownloaded { .. }
+            | PipelineEvent::ServerAttempt { .. }
+            | PipelineEvent::ArticleNotFound { .. }
+            | PipelineEvent::SegmentQueued { .. }
+            | PipelineEvent::SegmentDecoded { .. }
+            | PipelineEvent::SegmentDecodeFailed { .. }
+            | PipelineEvent::SegmentCommitted { .. }
+            | PipelineEvent::SegmentRetryScheduled { .. }
+            | PipelineEvent::SegmentFailedPermanent { .. }
+    )
+}
+
+pub fn should_record_job_event(event: &PipelineEvent) -> bool {
+    !matches!(
+        event,
+        PipelineEvent::ArticleDownloaded { .. }
+            | PipelineEvent::ServerAttempt { .. }
+            | PipelineEvent::ArticleNotFound { .. }
+            | PipelineEvent::SegmentQueued { .. }
+            | PipelineEvent::SegmentDecoded { .. }
+            | PipelineEvent::SegmentDecodeFailed { .. }
+            | PipelineEvent::SegmentCommitted { .. }
+            | PipelineEvent::SegmentRetryScheduled { .. }
+            | PipelineEvent::SegmentFailedPermanent { .. }
+            | PipelineEvent::FileComplete { .. }
+            | PipelineEvent::FileClassified { .. }
+            | PipelineEvent::VerificationStarted { .. }
+            | PipelineEvent::VerificationComplete { .. }
+            | PipelineEvent::ExtractionProgress { .. }
+            | PipelineEvent::PhaseProgressUpdated { .. }
+            | PipelineEvent::RepairConfidenceUpdated { .. }
+    )
+}
+
+pub fn pipeline_job_id(event: &PipelineEvent) -> Option<u64> {
+    match event {
+        PipelineEvent::JobCreated { job_id, .. }
+        | PipelineEvent::JobPaused { job_id }
+        | PipelineEvent::JobResumed { job_id }
+        | PipelineEvent::JobCancelled { job_id }
+        | PipelineEvent::JobCompleted { job_id }
+        | PipelineEvent::JobFailed { job_id, .. }
+        | PipelineEvent::DownloadStarted { job_id }
+        | PipelineEvent::DownloadFinished { job_id, .. }
+        | PipelineEvent::DownloadPipelineDrained { job_id }
+        | PipelineEvent::Par2MetadataLoaded { job_id }
+        | PipelineEvent::JobVerificationStarted { job_id }
+        | PipelineEvent::JobVerificationComplete { job_id, .. }
+        | PipelineEvent::Par3VerificationComplete { job_id, .. }
+        | PipelineEvent::RepairConfidenceUpdated { job_id, .. }
+        | PipelineEvent::RepairStarted { job_id }
+        | PipelineEvent::RepairComplete { job_id, .. }
+        | PipelineEvent::RepairFailed { job_id, .. }
+        | PipelineEvent::EmbeddedProtectionReplaced { job_id, .. }
+        | PipelineEvent::ExtractionReady { job_id }
+        | PipelineEvent::ExtractionMemberStarted { job_id, .. }
+        | PipelineEvent::ExtractionMemberWaitingStarted { job_id, .. }
+        | PipelineEvent::ExtractionMemberWaitingFinished { job_id, .. }
+        | PipelineEvent::ExtractionMemberAppendStarted { job_id, .. }
+        | PipelineEvent::ExtractionMemberAppendFinished { job_id, .. }
+        | PipelineEvent::ExtractionProgress { job_id, .. }
+        | PipelineEvent::ExtractionMemberFinished { job_id, .. }
+        | PipelineEvent::ExtractionMemberFailed { job_id, .. }
+        | PipelineEvent::ExtractionComplete { job_id }
+        | PipelineEvent::ExtractionFailed { job_id, .. }
+        | PipelineEvent::ArchiveDemoted { job_id, .. }
+        | PipelineEvent::RecoverySetUnused { job_id, .. }
+        | PipelineEvent::MoveToCompleteStarted { job_id }
+        | PipelineEvent::MoveToCompleteFinished { job_id }
+        | PipelineEvent::PhaseProgressUpdated { job_id } => Some(job_id.0),
+        PipelineEvent::FileClassified { file_id, .. }
+        | PipelineEvent::VerificationStarted { file_id }
+        | PipelineEvent::VerificationComplete { file_id, .. }
+        | PipelineEvent::FileComplete { file_id, .. }
+        | PipelineEvent::FileMissing { file_id, .. } => Some(file_id.job_id.0),
+        PipelineEvent::SegmentQueued { segment_id, .. }
+        | PipelineEvent::ArticleDownloaded { segment_id, .. }
+        | PipelineEvent::ServerAttempt { segment_id, .. }
+        | PipelineEvent::ArticleNotFound { segment_id }
+        | PipelineEvent::SegmentRetryScheduled { segment_id, .. }
+        | PipelineEvent::SegmentFailedPermanent { segment_id, .. }
+        | PipelineEvent::SegmentDecoded { segment_id, .. }
+        | PipelineEvent::SegmentDecodeFailed { segment_id, .. }
+        | PipelineEvent::SegmentCommitted { segment_id } => Some(segment_id.file_id.job_id.0),
+        PipelineEvent::GlobalPaused | PipelineEvent::GlobalResumed => None,
+    }
+}

@@ -20,6 +20,8 @@
 //   tags are ignored, and `update_available` is set only when the discovered
 //   version is strictly greater than the running one.
 
+use crate::settings::persistence::SettingsPersistenceQueries;
+use crate::settings::queries::SettingsQueries;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;

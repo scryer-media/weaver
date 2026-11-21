@@ -283,7 +283,7 @@ const RailHead = memo(function RailHead({
     { to: "/monitoring", label: t("next.nav.monitoring"), icon: "monitoring" },
     { to: "/system-info", label: t("next.nav.systemInfo"), icon: "systemInfo" },
     { to: "/logs", label: t("next.nav.logs"), icon: "logs" },
-    { to: "/tools/nzb-analyzer", label: t("next.nav.nzbAnalyzer"), icon: "inspectFile" },
+    { to: "/tools/analyzer", label: t("next.nav.analyzer"), icon: "inspectFile" },
     { to: "/settings", label: t("nav.settings"), icon: "settings" },
   ];
 
@@ -474,7 +474,7 @@ const ThroughputBlock = memo(function ThroughputBlock() {
   // Held, nothing moves: 0 at once, not once the daemon's rate window drains.
   const now = splitSpeed(isPaused ? 0 : speed);
   const peak = splitSpeed(peakSpeed);
-  const limit = splitSpeed(inForce);
+  const limit = splitSpeed(inForce ?? 0);
   const title = bySchedule ? t("next.speedLimit.bySchedule") : t("next.speedLimit.buttonTitle");
   return (
     <RailBlock>
@@ -490,7 +490,7 @@ const ThroughputBlock = memo(function ThroughputBlock() {
                 : t("next.shell.noTraffic")
             }
           />
-          {inForce > 0 ? (
+          {inForce !== null ? (
             <div className="-mt-[4px] font-wv-mono text-[11px] text-wv-warn">
               {t(bySchedule ? "next.shell.scheduledLimit" : "next.shell.limit", {
                 value: limit.value,
@@ -506,7 +506,7 @@ const ThroughputBlock = memo(function ThroughputBlock() {
           aria-label={title}
           className={cn(
             "flex size-9 flex-none cursor-pointer items-center justify-center border bg-wv-button hover:bg-wv-button-hover",
-            inForce > 0
+            inForce !== null
               ? "border-wv-warn/60 text-wv-warn hover:border-wv-warn"
               : "border-wv-control text-wv-fg hover:border-wv-control-hover",
           )}

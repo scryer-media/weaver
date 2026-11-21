@@ -10,6 +10,8 @@ import {
   routeProblem,
   routeTargets,
   rungProxyIds,
+  isTorrentConsumer,
+  torrentRouteFault,
   type ConsumerKind,
   type Egress,
   type Leg,
@@ -19,7 +21,9 @@ import {
   type Rung,
 } from "@/lib/networking";
 import { chainHopProfiles, proxyLabels, withChainHop, type ChainLimits, type ProxyProfile } from "@/lib/proxies";
+import { SYSTEM_DNS_PROFILE_ID, dnsRouteProblem, dnsRouteProblemKey, wireGuardWithoutDns, type DnsProfileChoice } from "@/lib/dns";
 import { cn } from "@/lib/utils";
+import { networkIds, testIds } from "@/next/testids";
 import { Square } from "../../components/chrome";
 import { Icon } from "../../components/icons";
 import { NumberField, SecondaryButton, Segmented, Select } from "../../components/controls";
@@ -57,12 +61,18 @@ function LadderArrow() {
   );
 }
 
+/** The egress fields a route editor reads. */
+export type RouteEgress = Pick<Egress, "id" | "name" | "enabled">;
+/** The proxy fields a route editor reads. */
+export type RouteProxy = Pick<ProxyProfile, "id" | "name" | "kind" | "enabled" | "dnsServers">;
+
 /**
  * A consumer's route: its legs and the path each leg takes from its egress.
  * A server's connections are split across the legs by weight, and the route
  * says what happens to a leg's share when it drops. Anything else fetches one
  * request at a time, so it gets one leg and nothing about shares; a route
- * saved with more keeps them listed until they are removed.
+ * saved with more keeps them listed until they are removed. A torrent route
+ * is offered only what keeps it one exit: one rung, no pool, no going direct.
  *
  * Built narrow-first. It lives in the routes page's dialog and in a server's
  * or feed's own editor, where it gets a third of the dialog, so every row
@@ -77,32 +87,45 @@ export function RouteEditor({
   cap = 1,
   kind = "SERVER",
   status = [],
+  dnsProfiles,
 }: {
   value: NetworkRoute;
   onChange: (route: NetworkRoute) => void;
-  egresses: Egress[];
-  profiles: ProxyProfile[];
+  egresses: RouteEgress[];
+  profiles: RouteProxy[];
   pools: ProxyPool[];
   cap?: number;
   /** What owns the route. Only a server's connections are split across legs; anything else has one. */
   kind?: ConsumerKind;
   status?: LegFlow[];
+  /** The saved DNS profiles the route can follow; without them the route's DNS is not offered. */
+  dnsProfiles?: readonly DnsProfileChoice[];
 }) {
   const t = useTranslate();
   // Only a server's connections are shared out across legs by weight.
   const split = kind === "SERVER";
+  const torrent = isTorrentConsumer(kind);
   // A lone leg is the whole route, so it is not boxed and numbered as one of several.
   const framed = value.legs.length > 1;
   const Frame = framed ? "fieldset" : "div";
   // Weights, the split they make and what a dropped leg does to its share matter once a second leg is added.
   const shared = split && framed;
   const [down, setDown] = useState<Set<number>>(new Set());
-  const update = (index: number, leg: Leg) =>
-    onChange({ ...value, legs: value.legs.map((current, position) => (position === index ? leg : current)) });
+  const withLeg = (index: number, leg: Leg): NetworkRoute => ({
+    ...value,
+    legs: value.legs.map((current, position) => (position === index ? leg : current)),
+  });
+  const update = (index: number, leg: Leg) => onChange(withLeg(index, leg));
+  /** Whether the owner may run on the route a change makes: a torrent route stays one leg with one exit. */
+  const allows = (route: NetworkRoute) => !torrent || torrentRouteFault(route) === null;
   const targets = routeTargets(value, cap, down);
   const assigned = targets.reduce((sum, target) => sum + target, 0);
   const weight = (index: number, next: number) => onChange({ ...value, legs: adjustWeight(value.legs, index, next) });
-  const problem = routeProblem(value, { egresses, pools });
+  const problem = routeProblem(value, { egresses, pools, kind });
+  const dnsProfileId = value.dnsProfileId ?? SYSTEM_DNS_PROFILE_ID;
+  const dnsProblem = dnsProfiles
+    ? dnsRouteProblem(value, dnsProfiles.find((choice) => choice.id === dnsProfileId), { proxies: profiles, pools })
+    : null;
   const reorder = (legs: Leg[]) => {
     setDown(new Set());
     onChange({ ...value, legs });
@@ -210,7 +233,10 @@ export function RouteEditor({
 
       {value.legs.map((leg, index) => {
         const path = leg.path;
-        const setRungs = (rungs: Rung[]) => update(index, { ...leg, path: { ...path, rungs } });
+        const withRungs = (rungs: Rung[]) => withLeg(index, { ...leg, path: { ...path, rungs } });
+        const setRungs = (rungs: Rung[]) => onChange(withRungs(rungs));
+        const added = [...path.rungs, emptyRung()];
+        const falling = withLeg(index, { ...leg, path: { ...path, directFallback: true } });
         const live = status.find((sample) => sample.position === index);
         return (
           <Frame
@@ -247,6 +273,7 @@ export function RouteEditor({
                   label={t("next.networking.route.egress")}
                   value={String(leg.egressId)}
                   onChange={(next) => update(index, { ...leg, egressId: Number(next) })}
+                  testId={networkIds.routeLegEgress(index)}
                   className="w-full min-w-0"
                   options={egresses
                     .filter((egress) => egress.enabled || egress.id === leg.egressId)
@@ -273,13 +300,12 @@ export function RouteEditor({
               <Segmented
                 label={t("next.networking.route.path")}
                 value={path.kind}
-                onChange={(kind) =>
-                  // A new ladder falls back to direct until that is turned off.
-                  update(index, {
-                    ...leg,
-                    path: { kind, rungs: kind === "LADDER" ? seedRung([emptyRung()], 0, "PROXY") : [], directFallback: kind === "LADDER" },
-                  })
-                }
+                onChange={(kind) => {
+                  // A new ladder falls back to direct until that is turned off, where the route may fall back.
+                  const rungs = kind === "LADDER" ? seedRung([emptyRung()], 0, "PROXY") : [];
+                  const next = withLeg(index, { ...leg, path: { kind, rungs, directFallback: kind === "LADDER" } });
+                  onChange(allows(next) ? next : withLeg(index, { ...leg, path: { kind, rungs, directFallback: false } }));
+                }}
                 className="self-start"
                 options={[
                   { value: "DIRECT", label: t("next.networking.route.direct") },
@@ -305,7 +331,9 @@ export function RouteEditor({
                           onChange={(kind) => setRungs(seedRung(path.rungs, rungIndex, kind))}
                           options={[
                             { value: "PROXY", label: t("next.networking.route.proxy") },
-                            { value: "POOL", label: t("next.networking.route.pool") },
+                            ...(rung.kind === "POOL" || allows(withRungs(seedRung(path.rungs, rungIndex, "POOL")))
+                              ? [{ value: "POOL" as const, label: t("next.networking.route.pool") }]
+                              : []),
                             { value: "CHAIN", label: t("next.networking.route.chain") },
                           ]}
                         />
@@ -396,25 +424,33 @@ export function RouteEditor({
                 {path.rungs.length === 0 ? (
                   <p className="text-[12px] text-wv-muted">{t("next.networking.route.noRungs")}</p>
                 ) : null}
-                {/* A new rung goes in below the last, so Add sits on the ladder where it lands. */}
-                <LadderArrow />
-                <SecondaryButton
-                  size="compact"
-                  icon="add"
-                  className="self-center"
-                  disabled={path.rungs.length >= MAX_RUNGS}
-                  onClick={() => setRungs(seedRung([...path.rungs, emptyRung()], path.rungs.length, "PROXY"))}
-                >
-                  {t("next.networking.route.addRung")}
-                </SecondaryButton>
-                <LadderArrow />
-                <div className="flex min-w-0 items-center border border-wv-control bg-wv-app px-3 py-[10px]">
-                  <CheckRow
-                    checked={path.directFallback}
-                    onChange={(checked) => update(index, { ...leg, path: { ...path, directFallback: checked } })}
-                    label={t("next.networking.route.directFallback")}
-                  />
-                </div>
+                {allows(withRungs(added)) ? (
+                  // A new rung goes in below the last, so Add sits on the ladder where it lands.
+                  <>
+                    <LadderArrow />
+                    <SecondaryButton
+                      size="compact"
+                      icon="add"
+                      className="self-center"
+                      disabled={path.rungs.length >= MAX_RUNGS}
+                      onClick={() => setRungs(seedRung(added, path.rungs.length, "PROXY"))}
+                    >
+                      {t("next.networking.route.addRung")}
+                    </SecondaryButton>
+                  </>
+                ) : null}
+                {path.directFallback || allows(falling) ? (
+                  <>
+                    <LadderArrow />
+                    <div className="flex min-w-0 items-center border border-wv-control bg-wv-app px-3 py-[10px]">
+                      <CheckRow
+                        checked={path.directFallback}
+                        onChange={(checked) => update(index, { ...leg, path: { ...path, directFallback: checked } })}
+                        label={t("next.networking.route.directFallback")}
+                      />
+                    </div>
+                  </>
+                ) : null}
               </div>
             ) : null}
 
@@ -492,9 +528,35 @@ export function RouteEditor({
         </div>
       ) : null}
 
+      {dnsProfiles ? (
+        <ControlLabel label={t("next.dns.routeProfile")} className="w-[268px] max-w-full">
+          <Select<string>
+            label={t("next.dns.routeProfile")}
+            value={String(dnsProfileId)}
+            options={dnsProfiles.map((choice) => ({ value: String(choice.id), label: choice.name }))}
+            testId={testIds.field("dnsProfile")}
+            onChange={(id) => onChange({ ...value, dnsProfileId: Number(id) })}
+          />
+        </ControlLabel>
+      ) : null}
+
       {problem ? (
         <p role="alert" className={cn("text-[12.5px] leading-[1.5] text-wv-error-text")}>
           {routeProblemText(t, problem)}
+        </p>
+      ) : null}
+      {dnsProblem ? (
+        <p
+          role="alert"
+          data-testid={testIds.fieldHelp("dnsProfile")}
+          data-problem={dnsProblem}
+          className="text-[12.5px] leading-[1.5] text-wv-error-text"
+        >
+          {t(dnsRouteProblemKey(dnsProblem), {
+            proxies: wireGuardWithoutDns(value, { proxies: profiles, pools })
+              .map((id) => profiles.find((profile) => profile.id === id)?.name ?? t("next.networking.proxyNumber", { id }))
+              .join(", "),
+          })}
         </p>
       ) : null}
     </div>

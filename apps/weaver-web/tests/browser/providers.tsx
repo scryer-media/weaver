@@ -3,12 +3,13 @@
 
 import { createRoot } from "react-dom/client";
 import { MemoryRouter } from "react-router";
-import { Client, CombinedError, Provider } from "urql";
-import { fromValue, mergeMap, pipe } from "wonka";
+import { Client, CombinedError, Provider, type OperationResult } from "urql";
+import { fromValue, mergeMap, pipe, type Source } from "wonka";
 import { TranslateContext } from "@/lib/context/translate-context";
 import en from "@/lib/i18n/locales/en";
 import { nextEn } from "@/next/i18n/en";
-import { SettingsShellProvider } from "@/next/pages/settings/framework";
+import { SettingsShellProvider, type PanelFlags } from "@/next/pages/settings/framework";
+import { SearchRegistry } from "@/next/pages/settings/search";
 import { ProvidersPanel } from "@/next/pages/settings/panels/ProvidersPanel";
 import "@/next/fonts.css";
 import "@/next/theme.css";
@@ -37,28 +38,28 @@ const refused = () => new CombinedError({
   graphQLErrors: [{ message: "admin scope required", extensions: { code: "FORBIDDEN" } }],
 });
 
-const client = new Client({ url: "http://fixture.invalid/graphql", exchanges: [() => (operations) => pipe(operations, mergeMap((operation) => {
+const client = new Client({ url: "http://fixture.invalid/graphql", exchanges: [() => (operations) => pipe(operations, mergeMap((operation): Source<OperationResult> => {
   const definition = operation.query.definitions.find((entry) => entry.kind === "OperationDefinition");
   const name = definition?.kind === "OperationDefinition" ? definition.name?.value ?? "" : "";
   if (name !== "Servers") {
-    return fromValue({ operation, data: {} });
+    return fromValue({ operation, data: {}, stale: false, hasNext: false });
   }
   reads.push(name);
   if (partial) {
-    return fromValue({ operation, data: { servers }, error: refused() });
+    return fromValue({ operation, data: { servers }, error: refused(), stale: false, hasNext: false });
   }
   if (fixture.refusing) {
-    return fromValue({ operation, data: undefined, error: refused() });
+    return fromValue({ operation, data: undefined, error: refused(), stale: false, hasNext: false });
   }
-  return fromValue({ operation, data: { servers } });
+  return fromValue({ operation, data: { servers }, stale: false, hasNext: false });
 }))] });
 
 const dictionary = { ...en, ...nextEn } as Record<string, string>;
 const status = document.getElementById("status")!;
 const shell = {
-  search: "", actionsRef: { current: null }, controlsHost: document.getElementById("controls"), registry: new Map(),
-  setFlags: (next: { status: string | null; failed: boolean }) => {
-    status.textContent = `${next.failed ? "failed" : "ok"} ${next.status ?? ""}`.trim();
+  search: "", actionsRef: { current: null }, controlsHost: document.getElementById("controls"), registry: new SearchRegistry(),
+  setFlags: (next: PanelFlags) => {
+    status.textContent = `${next.failed ? "failed" : "ok"} ${typeof next.status === "string" ? next.status : ""}`.trim();
   },
 };
 

@@ -2,12 +2,11 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // Opt-in encrypted download measurements using only loopback fixtures.
-#![allow(clippy::disallowed_methods)]
 
 use std::{sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::TcpListener,
     task::JoinSet,
     time::Instant,
 };
@@ -117,8 +116,11 @@ async fn wireguard_download_throughput() {
                     let mut streams: Vec<Box<dyn TunnelStream>> = Vec::new();
                     for _ in 0..connections {
                         let stream: Box<dyn TunnelStream> = if mode == "relay" {
-                            let mut stream =
-                                TcpStream::connect(bridge.addr().unwrap()).await.unwrap();
+                            let mut stream = weaver_tunnel::test_support::loopback::connect(
+                                bridge.addr().unwrap(),
+                            )
+                            .await
+                            .unwrap();
                             weaver_tunnel::transport::socks_connect(
                                 &mut stream,
                                 &peer.tunnel_address().to_string(),

@@ -1,0 +1,189 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+// Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
+// Modified by the Weaver authors, 2026-11-10.
+
+use bitvec::{BitArr, order::Lsb0, slice::BitSlice};
+
+/// The longest SACK the wire can carry: its length is one byte. libtorrent
+/// sizes the SACK it sends to its whole receive buffer, up to the packet
+/// (v2.0.15 utp_stream.cpp:1536-1547), and reads every byte of one it
+/// receives (utp_stream.cpp:1238-1281).
+pub const SACK_MAX_BYTES: usize = u8::MAX as usize;
+
+// What the extension adds to a packet before the SACK's own bytes: the next
+// extension's number and the length.
+pub(crate) const SACK_EXTENSION_HEADER: usize = 2;
+
+// The most bits Weaver sends: 252 bytes, the most whole four-byte words
+// the length byte allows.
+pub(crate) const SACK_SENT_MAX_BITS: usize = SACK_MAX_BYTES / 4 * 4 * 8;
+
+type SelectiveAckData = BitArr!(for SACK_MAX_BYTES * 8, in u8, Lsb0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectiveAck {
+    data: SelectiveAckData,
+    // In bits; a whole number of bytes.
+    len: usize,
+}
+
+impl SelectiveAck {
+    /// The SACK Weaver sends: the fewest whole bytes that hold a bit for
+    /// every packet held past the first missing one, and no more than
+    /// `SACK_SENT_MAX_BITS`. Bit 0 speaks for the packet two past the last
+    /// one acknowledged in order, so `held` indices 0..=7 take one byte and
+    /// index 8 takes two. A sender sees a packet lost only when later ones
+    /// were SACKed, so the SACK reaches the last packet held. libtorrent
+    /// sizes its own from its first held packet to its last
+    /// (v2.0.15 utp_stream.cpp:1546), which can stop short of the last.
+    /// With nothing held the SACK is empty, and none is sent.
+    pub fn new(held: impl Iterator<Item = usize>) -> Self {
+        let mut data = SelectiveAckData::default();
+        let mut len = 0;
+        for idx in held.take_while(|i| *i < SACK_SENT_MAX_BITS) {
+            data.set(idx, true);
+            len = len.max((idx / 8 + 1) * 8);
+        }
+        Self { data, len }
+    }
+
+    #[cfg(test)]
+    pub fn new_test(acked: impl IntoIterator<Item = usize>) -> Option<Self> {
+        let mut data = SelectiveAckData::default();
+        let mut count = 0;
+        // A peer's SACK as BEP 29 describes one: whole four-byte words, and
+        // here at least two of them.
+        let mut len = 64;
+        for idx in acked {
+            data.get_mut(idx).unwrap().set(true);
+            count += 1;
+            len = len.max((idx / 32 + 1) * 32);
+        }
+        if count > 0 {
+            Some(Self { data, len })
+        } else {
+            None
+        }
+    }
+
+    /// The SACK cut to what `max_bytes` hold, for a packet with no room
+    /// for all of it: the packets nearest the hole. None when that leaves
+    /// no packet reported.
+    pub fn truncated(mut self, max_bytes: usize) -> Option<Self> {
+        self.len = self.len.min(max_bytes * 8);
+        self.as_bitslice().any().then_some(self)
+    }
+
+    /// How many packets the SACK speaks for, in bits.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.data.as_raw_slice()[..self.len / 8]
+    }
+
+    pub fn deserialize(bytes: &[u8]) -> Self {
+        // The spec says the len must be a multiple of 4, but there's a ton of messages
+        // in the wild that are 1 bytes long. So we can
+        // thus deserialize any payload. Every byte is read: the length
+        // field is one byte, so the data always fits.
+        let len = bytes.len().min(SACK_MAX_BYTES);
+        let mut data = SelectiveAckData::default();
+        data.as_raw_mut_slice()[..len].copy_from_slice(&bytes[..len]);
+        Self { data, len: len * 8 }
+    }
+
+    pub fn as_bitslice(&self) -> &BitSlice<u8> {
+        &self.data.as_bitslice()[..self.len]
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = bool> + '_ {
+        self.as_bitslice().iter().map(|b| *b)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroUsize;
+
+    use crate::{
+        message::UtpMessage,
+        raw::{Type::Data, selective_ack::SelectiveAck},
+        stream_rx::OutOfOrderQueue,
+    };
+
+    fn asm() -> OutOfOrderQueue {
+        OutOfOrderQueue::new(NonZeroUsize::new(65).unwrap())
+    }
+
+    fn msg() -> UtpMessage {
+        UtpMessage::new_test(
+            crate::raw::UtpHeader {
+                htype: Data,
+                ..Default::default()
+            },
+            b"a",
+        )
+    }
+
+    #[test]
+    fn test_empty_is_none() {
+        let asm = asm();
+        assert!(asm.selective_ack().is_none());
+    }
+
+    #[test]
+    fn test_holes() {
+        let mut asm = asm();
+        asm.add_remove(msg(), 8).unwrap();
+        asm.add_remove(msg(), 1).unwrap();
+        asm.add_remove(msg(), 2).unwrap();
+        asm.add_remove(msg(), 64).unwrap();
+
+        let sack = asm.selective_ack().unwrap();
+        assert_eq!(
+            sack.as_bytes(),
+            [0b1000_0011, 0, 0, 0, 0, 0, 0, 0b1000_0000]
+        );
+
+        assert_eq!(sack, SelectiveAck::deserialize(sack.as_bytes()));
+    }
+
+    // A packet held 100 places past the hole is reported, so the sender
+    // can see the hole lost however wide its flight; the SACK is the
+    // fewest bytes that reach the last packet held and stops at what its
+    // length byte allows.
+    #[test]
+    fn the_sack_sent_covers_every_packet_held() {
+        let sack = SelectiveAck::new([0, 99].into_iter());
+        assert_eq!(sack.as_bytes().len(), 13);
+        assert!(sack.as_bitslice()[0]);
+        assert!(sack.as_bitslice()[99]);
+        assert_eq!(sack.as_bitslice().count_ones(), 2);
+        assert_eq!(sack, SelectiveAck::deserialize(sack.as_bytes()));
+
+        let far = SelectiveAck::new([2015, 2016, 5000].into_iter());
+        assert_eq!(far.len(), 2016);
+        assert_eq!(far.as_bytes().len(), 252);
+        assert!(far.as_bitslice()[2015]);
+    }
+
+    #[test]
+    fn the_sack_sent_is_the_fewest_bytes_that_cover_what_is_held() {
+        assert_eq!(SelectiveAck::new([1].into_iter()).as_bytes(), [0b10]);
+        assert_eq!(SelectiveAck::new(0..=7).as_bytes(), [0xff]);
+        assert_eq!(SelectiveAck::new([8].into_iter()).as_bytes(), [0, 1]);
+        // Ten packets lost, then eight held: indices 9 to 16.
+        let burst = SelectiveAck::new(9..=16);
+        assert_eq!(burst.as_bytes(), [0, 0b1111_1110, 1]);
+        assert_eq!(burst.as_bitslice().count_ones(), 8);
+        // Nothing held: nothing to send.
+        assert!(SelectiveAck::new(std::iter::empty()).is_empty());
+    }
+}

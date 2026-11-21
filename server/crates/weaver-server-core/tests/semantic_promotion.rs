@@ -10,6 +10,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use weaver_server_core::jobs::duplicate_persistence::JobsDuplicatePersistenceAdmitDuplicateSubmissionQueries;
+use weaver_server_core::jobs::queries::JobsQueries;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use tempfile::TempDir;
@@ -51,6 +53,9 @@ impl Harness {
         let complete_dir = temp_dir.path().join("complete");
         let db = Database::open(&db_path).unwrap();
         let config: SharedConfig = Arc::new(RwLock::new(Config {
+            upload_cap: None,
+            seeding: None,
+            torrent: Default::default(),
             data_dir: data_dir.display().to_string(),
             hardware_profile: None,
             intermediate_dir: Some(intermediate_dir.display().to_string()),
@@ -58,7 +63,7 @@ impl Harness {
             servers: vec![],
             categories: vec![],
             retry: None,
-            max_download_speed: None,
+            bandwidth: Default::default(),
             propagation_delay_secs: None,
             max_concurrent_nzbs: None,
             cleanup_after_extract: Some(true),
@@ -113,11 +118,13 @@ impl Harness {
             0,
             4,
             vec![],
-            false,
+            weaver_server_core::jobs::HoldSet::default(),
             state,
             db.clone(),
             config,
             weaver_server_core::runtime::StartupDiskGate::opened(),
+            std::sync::Arc::new(weaver_server_core::operations::VolumeWriters::new()),
+            std::sync::Arc::new(weaver_server_core::operations::VolumeBuffers::new()),
         )
         .await
         .unwrap();

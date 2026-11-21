@@ -8,8 +8,12 @@
 // descriptions binds nothing, unless the member's length rules out all but
 // one. Content evidence outranks a name-only claim; equal claims to one
 // description stay unbound and remain available for slice verification. A
-// member whose content answers in two sets is the first set's: the others count it
-// missing in their arithmetic and never write it. A member bound by its
+// member whose content answers in two sets is the first set's that has not
+// given it up, and the first set's once every one of them has: the others
+// count it missing in their arithmetic and never write it. A set gives a
+// member up when it rules it cannot rebuild what it binds (`Par2::give_up`),
+// and the member then moves to the next set whose content it answers in
+// (`next_holder`), which verifies it and may rebuild it. A member bound by its
 // content under another name takes the described name. Each posting of a
 // member posted more than once answers for it: the member is every file
 // one of its postings is.
@@ -17,7 +21,7 @@
 #[cfg(test)]
 use std::cell::Cell;
 use std::cell::OnceCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use par2_rs::{FileDescription, FileId, Par2FileSet};
 use weaver_graph::{Member, MemberId, Namespace, ObjectId};
@@ -125,12 +129,62 @@ pub(super) fn bind_catalogued(
     namespace: &Namespace,
     own: ObjectId,
     fronts: &mut Fronts,
+    given_up: &BTreeSet<([u8; 16], MemberId)>,
 ) -> Bound<BTreeMap<[u8; 16], Bindings>> {
-    bind_over(namespace, own, fronts, catalogue.any(), |front, name| {
-        catalogue
-            .candidates(front, name)
-            .map(|(_, key)| (key, &sets[&key]))
-    })
+    bind_over(
+        namespace,
+        own,
+        fronts,
+        catalogue.any(),
+        |front, name| {
+            catalogue
+                .candidates(front, name)
+                .map(|(_, key)| (key, &sets[&key]))
+        },
+        |key, member| given_up.contains(&(key, member)),
+    )
+}
+
+// The set a member bound to `file` of the set `key` moves to once that set
+// gave it up: the first, in the catalogue's order, whose content the member
+// answers in that has not given it up, or else the first it answers in at
+// all. The member's content is the front `key` describes for the file, and
+// a set answers when exactly one of its files has that front at a length
+// that fits it. Asked only of a set that gave its members up, through the
+// catalogue's entries for the one front: never of every set or member.
+pub(super) fn next_holder(
+    sets: &BTreeMap<[u8; 16], SetState>,
+    catalogue: &Catalogue,
+    (key, file): ([u8; 16], FileId),
+    member: MemberId,
+    given_up: &BTreeSet<([u8; 16], MemberId)>,
+) -> Option<([u8; 16], FileId)> {
+    let description = sets.get(&key)?.usable()?.file_description(&file)?;
+    let front = Front::described(description.length, description.hash_16k);
+    let length = description.length;
+    let mut first = None;
+    for (_, other) in catalogue.fronted(front) {
+        let Some(state) = sets.get(&other) else {
+            continue;
+        };
+        let Some(index) = state.usable() else {
+            continue;
+        };
+        let [found] = state.fronted(&front) else {
+            continue;
+        };
+        if index
+            .file_description(found)
+            .is_none_or(|described| described.length != length)
+        {
+            continue;
+        }
+        if !given_up.contains(&(other, member)) {
+            return Some((other, *found));
+        }
+        first.get_or_insert((other, *found));
+    }
+    first
 }
 
 // Bind each set over the namespace, matching every member against every
@@ -142,11 +196,17 @@ pub(super) fn bind_sets(
     namespace: &Namespace,
     own: ObjectId,
     fronts: &mut Fronts,
+    passed: impl Fn(usize, MemberId) -> bool,
 ) -> Bound<Vec<Bindings>> {
     let any = sets.iter().any(|state| state.usable().is_some());
-    let found = bind_over(namespace, own, fronts, any, |_, _| {
-        sets.iter().copied().enumerate()
-    });
+    let found = bind_over(
+        namespace,
+        own,
+        fronts,
+        any,
+        |_, _| sets.iter().copied().enumerate(),
+        passed,
+    );
     let mut bound = found.sets;
     Bound {
         sets: (0..sets.len())
@@ -160,13 +220,15 @@ pub(super) fn bind_sets(
 
 // Bind the sets `candidates` lists for each member's front and name, in
 // their order, over the namespace. `any` says whether a usable set is
-// listed at all: only then is a member's front hashed.
+// listed at all: only then is a member's front hashed. `passed` says
+// whether a set gave the member up.
 fn bind_over<'s, K, I>(
     namespace: &Namespace,
     own: ObjectId,
     fronts: &mut Fronts,
     any: bool,
     candidates: impl Fn(Option<Front>, &str) -> I,
+    passed: impl Fn(K, MemberId) -> bool,
 ) -> Bound<BTreeMap<K, Bindings>>
 where
     K: Copy + Ord,
@@ -199,6 +261,9 @@ where
             complete.insert(member, length);
         }
         let mut first = None;
+        // The first set the content answers in, kept while each such set
+        // gave the member up: it is the member's once all of them have.
+        let mut given_up = None;
         let listed = any.then(|| candidates(candidate.front(), candidate.name));
         for (at, state) in listed.into_iter().flatten() {
             #[cfg(test)]
@@ -207,11 +272,20 @@ where
             }
             if let Some((file, content)) = match_member(state, &candidate) {
                 if content {
+                    if passed(at, member) {
+                        given_up.get_or_insert((at, (file, content)));
+                        continue;
+                    }
                     first = Some((at, (file, content)));
                     break;
                 }
                 first.get_or_insert((at, (file, content)));
             }
+        }
+        if let Some(fallback) = given_up
+            && first.is_none_or(|(_, (_, content))| !content)
+        {
+            first = Some(fallback);
         }
         if let Some((at, (file, content))) = first {
             let claimants = claims.entry(at).or_default().entry(file).or_default();

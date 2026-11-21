@@ -13,6 +13,12 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use weaver_server_core::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
+use weaver_server_core::post_processing::events::PostProcessingEventsCancelEventScriptsQueries;
+use weaver_server_core::post_processing::instances::PostProcessingInstancesQueries;
+use weaver_server_core::post_processing::output::PostProcessingOutputQueries;
+use weaver_server_core::post_processing::secrets::PostProcessingSecretsQueries;
+use weaver_server_core::post_processing::settings::PostProcessingSettingsQueries;
 
 use weaver_server_core::persistence::Database;
 use weaver_server_core::post_processing::executor::PostProcessingExecutor;
@@ -155,6 +161,7 @@ async fn wait_at_gate(gate: PathBuf) {
 // A finished job for script runs to be recorded against.
 fn finished_job(db: &Database, job_id: u64, working_directory: &Path) {
     db.insert_job_history(&weaver_server_core::JobHistoryRow {
+        protocol: weaver_server_core::Protocol::Nzb,
         job_id,
         job_hash: None,
         name: "finished".into(),
@@ -727,6 +734,7 @@ async fn results_are_persisted_on_the_job_and_a_rerun_replaces_them() {
     let db = Database::open_in_memory().unwrap();
     enable_execution(&db);
     db.insert_job_history(&weaver_server_core::JobHistoryRow {
+        protocol: weaver_server_core::Protocol::Nzb,
         job_id: 106,
         job_hash: None,
         name: "rerun".into(),

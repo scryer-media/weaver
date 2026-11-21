@@ -17,10 +17,14 @@ import {
   JOB_OUTPUT_FILES_QUERY,
   JOB_QUERY,
   PAUSE_JOB_MUTATION,
+  RECHECK_TORRENT_MUTATION,
   REDOWNLOAD_JOB_MUTATION,
   REPROCESS_JOB_MUTATION,
   RERUN_POST_PROCESSING_MUTATION,
   RESUME_JOB_MUTATION,
+  SET_TORRENT_CATEGORY_MUTATION,
+  SET_TORRENT_FORCED_MUTATION,
+  SET_TORRENT_LOCATION_MUTATION,
 } from "@/graphql/queries";
 import { authHeaders } from "@/graphql/client";
 import { copyText } from "@/lib/clipboard";
@@ -29,6 +33,7 @@ import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { openUrlAsDownload, readDownloadErrorMessage, saveResponseAsDownload } from "@/lib/download";
 import { normalizeJobData, type GraphqlJobData, type JobData } from "@/lib/job-types";
 import { statusToken } from "@/lib/status-tokens";
+import { torrentStateLabelKey } from "@/lib/torrents";
 import {
   Bar,
   DetailBlock,
@@ -41,9 +46,11 @@ import {
   StateChip,
 } from "../components/chrome";
 import { ConfirmDialog } from "../components/ConfirmDialog";
+import { RecordEditor } from "../components/RecordEditor";
 import { ArchivePasswordDialog } from "../components/ArchivePassword";
 import { DangerButton, SecondaryButton } from "../components/controls";
 import { Icon } from "../components/icons";
+import { TagEditor } from "../components/Tags";
 import { PhaseBars, useJobProgress } from "../components/PhaseBars";
 import { GridRow } from "../components/rows";
 import { Waterfall } from "../components/Waterfall";
@@ -69,8 +76,10 @@ import { NextShell } from "../shell/NextShell";
 import { describeFailedArchive, describeArchiveHistory, rowOperationKind } from "../data/history-archive";
 import { useArchiveHistory } from "../data/use-archive-history";
 import { extendKept, LIST_PAGE_SIZE, prependOlder, showsMore } from "../data/list-pages";
-import { jobIds, testIds } from "@/next/testids";
+import { jobIds, testIds, torrentIds } from "@/next/testids";
 import { SupportReportActions } from "../features/SupportReportActions";
+import { TorrentDetail, useTorrent } from "../features/torrents/TorrentDetail";
+import { TorrentRemoveDialog } from "../features/torrents/TorrentRemoveDialog";
 import { DownloadSummaryPanel } from "../components/DownloadSummary";
 import type { DownloadSummaryData } from "../data/download-summary";
 
@@ -303,8 +312,16 @@ function JobDetailContent() {
   const [, resumeJob] = useMutation(RESUME_JOB_MUTATION);
   const [, cancelJob] = useMutation(CANCEL_JOB_MUTATION);
   const [, cancelPostProcessing] = useMutation(CANCEL_JOB_POST_PROCESSING_MUTATION);
+  const [, setTorrentForced] = useMutation(SET_TORRENT_FORCED_MUTATION);
+  const [, recheckTorrent] = useMutation(RECHECK_TORRENT_MUTATION);
+  const [, setTorrentLocation] = useMutation(SET_TORRENT_LOCATION_MUTATION);
+  const [, setTorrentCategory] = useMutation(SET_TORRENT_CATEGORY_MUTATION);
+  const [removingTorrent, setRemovingTorrent] = useState(false);
+  // The draft of the torrent's location or category while its editor is open.
+  const [torrentEdit, setTorrentEdit] = useState<{ kind: "move" | "category"; value: string } | null>(null);
+  const { categories } = useNextData("categories");
 
-  const [confirm, setConfirm] = useState<"delete" | "deleteAll" | "archive" | "cancel" | "forget" | null>(null);
+  const [confirm, setConfirm] = useState<"delete" | "deleteAll" | "archive" | "cancel" | "forget" | "recheck" | null>(null);
   const [report, setReport] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -315,6 +332,9 @@ function JobDetailContent() {
   const raw = snapshot?.queueItem ?? snapshot?.historyItem ?? null;
   const job = useMemo(() => (raw ? normalizeJobData(raw) : null), [raw]);
   const progress = useJobProgress(job ?? NO_JOB);
+  const isTorrent = job?.protocol === "TORRENT";
+  const { torrent, refresh: refreshTorrent } = useTorrent(jobId, isTorrent);
+  const stateKey = torrentStateLabelKey(torrent?.state);
   // The output folder fills in as the job moves through post-processing and
   // settles when it finishes, so the listing is re-read on each status change
   // rather than kept from the page's first render.
@@ -427,12 +447,15 @@ function JobDetailContent() {
   }
 
   const token = statusToken(job.status);
-  const failed = token === "failed";
+  // A job that delivered in part reads as failed in its status; its outcome
+  // says it moved the files it had whole.
+  const partial = job.outcome === "PARTIAL";
+  const failed = token === "failed" && !partial;
   const done = token === "completed";
   // Weaver holds a finished job in its queue for a while before history takes
   // it, so whether the job is over comes from its status, not from where the
   // snapshot found it: pausing or cancelling a finished job means nothing.
-  const terminal = done || failed;
+  const terminal = done || failed || partial;
   const color = statusColor(progress.status);
   const percent = job.progress * 100;
   // While queued, the payload is what the download is out to bring, so a
@@ -455,7 +478,9 @@ function JobDetailContent() {
     job.optionalRecoveryBytes - job.optionalRecoveryDownloadedBytes,
   );
 
-  const outcome = failed
+  const outcome = partial
+    ? t("next.job.outcomePartial")
+    : failed
     ? t("next.job.outcomeFailed")
     : done
       ? repaired
@@ -463,7 +488,12 @@ function JobDetailContent() {
         : t("next.job.outcomeVerified")
       : t("next.job.outcomeRunning", { status: statusLabel(progress.status), percent: Math.round(percent) });
 
-  const statusSentence = failed
+  const statusSentence = partial
+    ? t("next.job.deliveredInPart", {
+        time: formatClockSeconds(job.completedAt),
+        reason: job.error || t("next.job.partialReason"),
+      })
+    : failed
     ? t("next.job.stopped", {
         time: formatClockSeconds(job.completedAt),
         reason: job.error || t("next.job.stoppedReason"),
@@ -605,19 +635,24 @@ function JobDetailContent() {
             <h1 className="min-w-0 truncate font-wv-title text-[15px] font-semibold tracking-[-0.01em]">
               {job.displayTitle || job.name}
             </h1>
-            <StateChip label={statusLabel(progress.status)} tone={failed ? "bad" : "ok"} />
+            <StateChip
+              label={stateKey ? t(stateKey) : partial ? t("next.job.partial") : statusLabel(progress.status)}
+              tone={failed || partial ? "bad" : "ok"}
+            />
           </div>
           <div className="flex min-w-0 flex-wrap items-center gap-2">
-            <SecondaryButton
-              icon="downloadFile"
-              size="compact"
-              disabled={busy}
-              onClick={() => {
-                void downloadNzb();
-              }}
-            >
-              {t("next.job.downloadNzb")}
-            </SecondaryButton>
+            {isTorrent ? null : (
+              <SecondaryButton
+                icon="downloadFile"
+                size="compact"
+                disabled={busy}
+                onClick={() => {
+                  void downloadNzb();
+                }}
+              >
+                {t("next.job.downloadNzb")}
+              </SecondaryButton>
+            )}
             <SupportReportActions jobId={job.id} size="compact" onReport={setReport} />
             {/* Only while scripts run: a job waiting for a script slot reports itself as queued. */}
             {job.status === "POST_PROCESSING" ? (
@@ -632,7 +667,63 @@ function JobDetailContent() {
                 {t("next.inspector.stopScripts")}
               </SecondaryButton>
             ) : null}
-            {inQueue && !terminal ? (
+            {isTorrent && inQueue ? (
+              <>
+                <SecondaryButton
+                  icon={token === "paused" ? "resume" : "pause"}
+                  size="compact"
+                  disabled={busy}
+                  testId={token === "paused" ? torrentIds.jobResume : torrentIds.jobPause}
+                  onClick={() => {
+                    void run(
+                      token === "paused" ? t("next.job.report.resumed") : t("next.job.report.paused"),
+                      () => (token === "paused" ? resumeJob({ id: job.id }) : pauseJob({ id: job.id })),
+                    ).then(refreshTorrent);
+                  }}
+                >
+                  {token === "paused" ? t("action.resume") : t("action.pause")}
+                </SecondaryButton>
+                <SecondaryButton
+                  size="compact"
+                  disabled={busy || torrent === null}
+                  testId={torrent?.forced ? torrentIds.jobUnforce : torrentIds.jobForce}
+                  onClick={() => {
+                    const forced = !(torrent?.forced ?? false);
+                    void run(t(forced ? "next.torrent.forced" : "next.torrent.unforced"), () =>
+                      setTorrentForced({ id: job.id, forced }),
+                    ).then(refreshTorrent);
+                  }}
+                >
+                  {torrent?.forced ? t("next.torrent.unforce") : t("next.torrent.force")}
+                </SecondaryButton>
+                <SecondaryButton size="compact" disabled={busy || torrent === null} onClick={() => setConfirm("recheck")}>
+                  {t("next.torrent.recheck")}
+                </SecondaryButton>
+                <SecondaryButton
+                  size="compact"
+                  disabled={busy || torrent === null}
+                  onClick={() => setTorrentEdit({ kind: "move", value: torrent?.savePath ?? "" })}
+                >
+                  {t("next.torrent.move")}
+                </SecondaryButton>
+                <SecondaryButton
+                  size="compact"
+                  disabled={busy || torrent === null}
+                  onClick={() => setTorrentEdit({ kind: "category", value: torrent?.category ?? "" })}
+                >
+                  {t("next.categories.category")}
+                </SecondaryButton>
+                <DangerButton
+                  icon="remove"
+                  size="compact"
+                  disabled={busy}
+                  onClick={() => setRemovingTorrent(true)}
+                  testId={torrentIds.jobRemove}
+                >
+                  {t("next.common.remove")}
+                </DangerButton>
+              </>
+            ) : inQueue && !terminal ? (
               <>
                 <SecondaryButton
                   icon={token === "paused" ? "resume" : "pause"}
@@ -665,6 +756,7 @@ function JobDetailContent() {
               </>
             ) : (
               <>
+                {isTorrent ? null : (
                 <SecondaryButton
                   icon="redownload"
                   size="compact"
@@ -675,6 +767,7 @@ function JobDetailContent() {
                 >
                   {t("next.completed.redownload")}
                 </SecondaryButton>
+                )}
                 <SecondaryButton
                   icon="postProcessing"
                   size="compact"
@@ -687,6 +780,7 @@ function JobDetailContent() {
                 >
                   {t("next.completed.rerunScripts")}
                 </SecondaryButton>
+                {isTorrent ? null : (
                 <SecondaryButton
                   icon="reprocess"
                   size="compact"
@@ -697,6 +791,7 @@ function JobDetailContent() {
                 >
                   {t("next.job.reprocess")}
                 </SecondaryButton>
+                )}
                 {job.failedForMemory ? (
                   <SecondaryButton
                     icon="reprocess"
@@ -778,6 +873,7 @@ function JobDetailContent() {
             decimals={1}
             barClassName="min-w-0 flex-1"
             percentClassName="text-[13px] font-medium text-wv-fg"
+            percentTestId={jobIds.jobProgress}
           />
           <div className="font-wv-mono text-[11.5px] text-wv-muted">{statusSentence}</div>
         </div>
@@ -792,16 +888,16 @@ function JobDetailContent() {
           <MetricCell
             variant="stat"
             eyebrow={t("next.job.integrity")}
-            value={verified || done || failed ? `${(job.health / 10).toFixed(1)}%` : EM_DASH}
+            value={verified || terminal ? `${(job.health / 10).toFixed(1)}%` : EM_DASH}
             valueClassName={
-              !verified && !done && !failed
+              !verified && !terminal
                 ? "text-wv-muted"
                 : HEALTH_TONE_CLASS[
                     healthTone(job.health, criticalHealthMilli(job.totalBytes, job.optionalRecoveryBytes))
                   ]
             }
             note={
-              verified || done || failed
+              verified || terminal
                 ? job.failedBytes > 0
                   ? t("next.job.neverRecovered", { size: formatSize(job.failedBytes) })
                   : t("next.job.noDamage")
@@ -856,6 +952,14 @@ function JobDetailContent() {
             }
           />
         </MetricStrip>
+
+        {torrent ? (
+          <TorrentDetail
+            torrent={torrent}
+            onChanged={refreshTorrent}
+            onReport={setReport}
+          />
+        ) : null}
 
         <DetailBlock id="pipeline" title={t("next.job.pipeline")} note={timeline?.note} bodyClassName="gap-0">
           {timeline ? (
@@ -1077,6 +1181,11 @@ function JobDetailContent() {
               label={t("table.category")}
               value={job.category || t("next.categories.uncategorised")}
             />
+            <Field
+              variant="stacked"
+              label={t("next.tags.title")}
+              value={<TagEditor jobId={job.id} tags={job.tags ?? []} />}
+            />
             {job.metadata.map((entry) => (
               <Field
                 key={entry.key}
@@ -1091,34 +1200,36 @@ function JobDetailContent() {
             The prototype's last panel. It lists only the providers that served
             something: the ledger omits a provider that contributed nothing
             rather than carrying it at zero, so "this backup went untouched" is
-            read from its absence here, not from a row.
+            read from its absence here, not from a row. A torrent has no
+            providers.
           */}
-          <DetailBlock
-            id="providers"
-            title={t("next.job.providersUsed")}
-            tone="panel"
-            note={providers.length === 0 ? undefined : t("next.job.providersNote")}
-            bodyClassName="gap-[11px]"
-          >
-            {providers.length === 0 ? (
-              <div className="text-[12.5px] leading-[1.5] text-wv-muted">
-                {t("next.job.providersEmpty")}
-              </div>
-            ) : (
-              providers.map((provider, index) => (
-                <ShareRow
-                  key={provider.serverId}
-                  label={provider.serverHost ?? t("next.job.serverId", { id: provider.serverId })}
-                  title={countLabel(t, "next.job.articles", provider.articles, {
-                    count: provider.articles.toLocaleString(),
-                  })}
-                  note={`${formatSize(provider.wireBytes)} · ${Math.round(provider.share)}%`}
-                  percent={provider.share}
-                  color={PROVIDER_COLORS[index % PROVIDER_COLORS.length]}
-                />
-              ))
-            )}
-          </DetailBlock>
+          {isTorrent ? null : (
+            <DetailBlock
+              id="providers"
+              title={t("next.job.providersUsed")}
+              tone="panel"
+              bodyClassName="gap-[11px]"
+            >
+              {providers.length === 0 ? (
+                <div className="text-[12.5px] leading-[1.5] text-wv-muted">
+                  {t("next.job.providersEmpty")}
+                </div>
+              ) : (
+                providers.map((provider, index) => (
+                  <ShareRow
+                    key={provider.serverId}
+                    label={provider.serverHost ?? t("next.job.serverId", { id: provider.serverId })}
+                    title={countLabel(t, "next.job.articles", provider.articles, {
+                      count: provider.articles.toLocaleString(),
+                    })}
+                    note={`${formatSize(provider.wireBytes)} · ${Math.round(provider.share)}%`}
+                    percent={provider.share}
+                    color={PROVIDER_COLORS[index % PROVIDER_COLORS.length]}
+                  />
+                ))
+              )}
+            </DetailBlock>
+          )}
 
           <DetailBlock id="recovery" title={t("next.job.bytes")} tone="panel" bodyClassName="gap-[11px]">
             <ShareRow
@@ -1239,6 +1350,87 @@ function JobDetailContent() {
             return result;
           });
         }}
+      />
+      <ConfirmDialog
+        open={confirm === "recheck"}
+        title={t("next.torrent.recheck")}
+        note={job.displayTitle || job.name}
+        busy={busy}
+        confirmLabel={t("next.torrent.recheck")}
+        body={t("next.torrent.recheckBody")}
+        onDismiss={() => setConfirm(null)}
+        onConfirm={() => {
+          setConfirm(null);
+          void run(t("next.torrent.rechecking"), () => recheckTorrent({ id: job.id })).then(refreshTorrent);
+        }}
+      />
+      <RecordEditor
+        open={torrentEdit !== null}
+        title={torrentEdit?.kind === "move" ? t("next.torrent.move") : t("next.categories.category")}
+        note={job.displayTitle || job.name}
+        busy={busy}
+        saveDisabled={torrentEdit?.kind === "move" && torrentEdit.value.trim() === ""}
+        sections={
+          torrentEdit === null
+            ? []
+            : [
+                {
+                  id: torrentEdit.kind,
+                  title: torrentEdit.kind === "move" ? t("next.torrent.savePath") : t("next.categories.category"),
+                  fields: [
+                    torrentEdit.kind === "move"
+                      ? {
+                          id: "location",
+                          label: t("next.torrent.savePath"),
+                          control: {
+                            kind: "path" as const,
+                            value: torrentEdit.value,
+                            onChange: (value: string) => setTorrentEdit({ kind: "move", value }),
+                          },
+                        }
+                      : {
+                          id: "category",
+                          label: t("next.categories.category"),
+                          control: {
+                            kind: "select" as const,
+                            value: torrentEdit.value,
+                            options: [
+                              { value: "", label: t("next.torrent.noCategory") },
+                              ...categories.map((category) => ({ value: category.name, label: category.name })),
+                            ],
+                            onChange: (value: string) => setTorrentEdit({ kind: "category", value }),
+                          },
+                        },
+                  ],
+                },
+              ]
+        }
+        onDismiss={() => setTorrentEdit(null)}
+        onSave={() => {
+          if (torrentEdit === null) return;
+          const { kind, value } = torrentEdit;
+          setTorrentEdit(null);
+          void run(
+            kind === "move" ? t("next.torrent.moved") : t("next.torrent.categoryChanged"),
+            () =>
+              kind === "move"
+                ? setTorrentLocation({ id: job.id, path: value.trim() })
+                : setTorrentCategory({ id: job.id, category: value === "" ? null : value }),
+          ).then(refreshTorrent);
+        }}
+      />
+      <TorrentRemoveDialog
+        id={removingTorrent ? job.id : null}
+        name={job.displayTitle || job.name}
+        onRemoved={() => {
+          setRemovingTorrent(false);
+          navigate("/");
+        }}
+        onFailed={(message) => {
+          setRemovingTorrent(false);
+          setReport(message);
+        }}
+        onDismiss={() => setRemovingTorrent(false)}
       />
     </NextShell>
   );

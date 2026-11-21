@@ -3,6 +3,11 @@
 
 use std::path::PathBuf;
 use std::sync::LazyLock;
+use weaver_server_core::settings::SettingsArchivePasswordsQueries;
+use weaver_server_core::settings::SettingsSchedulesQueries;
+use weaver_server_core::settings::persistence::SettingsPersistenceQueries;
+use weaver_server_core::settings::repository::SettingsRepositoryQueries;
+use weaver_server_core::settings::service::SettingsServiceQueries;
 
 use async_graphql::{Context, MaybeUndefined, Object, Result};
 
@@ -13,6 +18,7 @@ use crate::settings::types::{
     WatchFolderSettingsInput,
 };
 use weaver_server_core::settings::SharedConfig;
+use weaver_server_core::settings::tracker_file;
 use weaver_server_core::watch_folder::{WatchFolderConfig, WatchFolderMode, WatchFolderService};
 use weaver_server_core::{Database, SchedulerHandle};
 
@@ -170,7 +176,6 @@ impl SettingsMutation {
                     })
             })
             .transpose()?;
-        let max_download_speed = input.max_download_speed;
         let max_retries = input.max_retries;
         let propagation_delay_secs = input.propagation_delay_secs;
         let max_concurrent_nzbs = input
@@ -191,6 +196,45 @@ impl SettingsMutation {
             apply_watch_folder_update(&mut candidate, watch);
             candidate.validate().map_err(async_graphql::Error::new)?;
         }
+        let seeding_update = match input.seeding {
+            MaybeUndefined::Undefined => None,
+            MaybeUndefined::Null => Some(None),
+            // At the global level nothing is inherited.
+            MaybeUndefined::Value(policy) => Some(Some(policy.into_policy()?.at_global())),
+        };
+        let upload_cap_update = match input.upload_cap {
+            MaybeUndefined::Undefined => None,
+            MaybeUndefined::Null => Some(None),
+            MaybeUndefined::Value(cap) => Some(Some(cap)),
+        };
+        // Turning torrents off, or choosing again how a wind-down ends: how
+        // the torrents still running end, `None` for at once.
+        let mut wind_down = None;
+        let torrent_update = match &input.torrent {
+            Some(update) => {
+                // Torrents this run of the server does not have cannot be
+                // turned on; the rest of their settings still save.
+                if update.enabled == Some(true) {
+                    ctx.data::<weaver_server_core::torrents::TorrentAvailability>()?
+                        .may_turn_on()
+                        .map_err(|refusal| {
+                            crate::auth::graphql_error("TORRENTS_UNAVAILABLE", refusal)
+                        })?;
+                }
+                let mut torrent = config.read().await.torrent.clone();
+                if update.enabled == Some(false)
+                    && (torrent.enabled || update.when_disabled.is_some())
+                {
+                    wind_down = Some(update.when_disabled.unwrap_or_default().wind_down());
+                }
+                update.apply(&mut torrent);
+                let torrent = torrent
+                    .checked()
+                    .map_err(|errors| async_graphql::Error::new(errors.join("; ")))?;
+                Some(torrent)
+            }
+            None => None,
+        };
         let should_reconcile_watch_folder = watch_folder_update.is_some();
         let should_update_paths =
             !normalized_intermediate_dir.is_undefined() || !normalized_complete_dir.is_undefined();
@@ -199,13 +243,15 @@ impl SettingsMutation {
             normalized_intermediate_dir.clone(),
             normalized_complete_dir.clone(),
             cleanup_after_extract,
-            max_download_speed,
             max_retries,
             watch_folder_update.clone(),
             duplicate_policy_update.clone(),
             enable_srrdb_lookup,
             propagation_delay_secs,
+            seeding_update,
+            torrent_update.clone(),
             max_concurrent_nzbs,
+            upload_cap_update,
             delete_failed_job_files,
             history_retention_days,
         );
@@ -229,12 +275,9 @@ impl SettingsMutation {
                             db.set_setting("cleanup_after_extract", &v.to_string())?;
                         }
                         if let Some(v) = persist_input.3 {
-                            db.set_setting("max_download_speed", &v.to_string())?;
-                        }
-                        if let Some(v) = persist_input.4 {
                             db.set_setting("retry.max_retries", &v.to_string())?;
                         }
-                        if let Some(ref watch) = persist_input.5 {
+                        if let Some(ref watch) = persist_input.4 {
                             if let Some(mode) = watch.mode {
                                 db.set_setting("watch_folder.mode", mode.as_str())?;
                             }
@@ -264,7 +307,7 @@ impl SettingsMutation {
                                 db.set_setting("watch_folder.scanning_paused", &value.to_string())?;
                             }
                         }
-                        if let Some(ref duplicate_policy) = persist_input.6 {
+                        if let Some(ref duplicate_policy) = persist_input.5 {
                             if let Some(value) = duplicate_policy.strict_active_or_success {
                                 db.set_setting(
                                     "duplicate_policy.strict_active_or_success",
@@ -303,22 +346,31 @@ impl SettingsMutation {
                                 )?;
                             }
                         }
-                        if let Some(limit) = persist_input.9 {
+                        if let Some(limit) = persist_input.10 {
                             db.set_setting("max_concurrent_nzbs", &limit.to_string())?;
                         }
-                        if let Some(seconds) = persist_input.8 {
+                        if let Some(seconds) = persist_input.7 {
                             db.set_setting("propagation_delay_secs", &seconds.to_string())?;
                         }
-                        if let Some(enabled) = persist_input.7 {
+                        if let Some(enabled) = persist_input.6 {
                             db.set_setting(
                                 "delivery_naming.enable_srrdb_lookup",
                                 &enabled.to_string(),
                             )?;
                         }
-                        if let Some(delete) = persist_input.10 {
+                        if let Some(policy) = persist_input.8 {
+                            db.save_seeding_policy(policy.as_ref())?;
+                        }
+                        if let Some(cap) = persist_input.11 {
+                            db.save_upload_cap(cap)?;
+                        }
+                        if let Some(ref torrent) = persist_input.9 {
+                            db.save_torrent_config(torrent)?;
+                        }
+                        if let Some(delete) = persist_input.12 {
                             db.set_setting("delete_failed_job_files", &delete.to_string())?;
                         }
-                        if let Some(days) = persist_input.11 {
+                        if let Some(days) = persist_input.13 {
                             db.set_setting("history_retention_days", &days.to_string())?;
                         }
                         Ok(())
@@ -328,7 +380,15 @@ impl SettingsMutation {
             }
         };
 
-        let (settings, runtime_paths) = persist_then_update_config(
+        // How the torrents still running end is taken before the settings
+        // that turn torrents off are saved: any caller that hands the saved
+        // settings to the torrents before this mutation does finds it.
+        let torrents = ctx.data_opt::<weaver_server_core::torrents::service::TorrentService>();
+        let wind_down_was = match (wind_down, torrents) {
+            (Some(wind_down), Some(torrents)) => Some(torrents.wind_down_when_off(wind_down).await),
+            _ => None,
+        };
+        let saved = persist_then_update_config(
             config,
             "settings.mutation.update_settings.apply",
             settings_persist,
@@ -355,9 +415,6 @@ impl SettingsMutation {
                 }
                 if let Some(days) = history_retention_days {
                     cfg.history_retention_days = Some(days);
-                }
-                if let Some(speed) = max_download_speed {
-                    cfg.max_download_speed = Some(speed);
                 }
                 if let Some(limit) = max_concurrent_nzbs {
                     cfg.max_concurrent_nzbs = Some(limit);
@@ -386,6 +443,15 @@ impl SettingsMutation {
                 if let Some(ref duplicate_policy) = duplicate_policy_update {
                     apply_duplicate_policy_update(&mut cfg.duplicate_policy, duplicate_policy);
                 }
+                if let Some(policy) = seeding_update {
+                    cfg.seeding = policy;
+                }
+                if let Some(cap) = upload_cap_update {
+                    cfg.upload_cap = cap;
+                }
+                if let Some(ref torrent) = torrent_update {
+                    cfg.torrent = torrent.clone();
+                }
 
                 let runtime_paths = should_update_paths.then(|| {
                     (
@@ -394,35 +460,26 @@ impl SettingsMutation {
                         PathBuf::from(cfg.complete_dir()),
                     )
                 });
-                let settings = GeneralSettings {
-                    data_dir: cfg.data_dir.clone(),
-                    intermediate_dir: cfg.intermediate_dir(),
-                    complete_dir: cfg.complete_dir(),
-                    cleanup_after_extract: cfg.cleanup_after_extract(),
-                    delete_failed_job_files: cfg.delete_failed_job_files(),
-                    history_retention_days: cfg.history_retention_days(),
-                    max_download_speed: cfg.max_download_speed.unwrap_or(0),
-                    propagation_delay_secs: cfg.propagation_delay_secs(),
-                    max_concurrent_nzbs: cfg.max_concurrent_nzbs(),
-                    max_retries: cfg.retry.as_ref().and_then(|r| r.max_retries).unwrap_or(3),
-                    enable_srrdb_lookup: cfg.enable_srrdb_lookup(),
-                    watch_folder: (&cfg.watch_folder).into(),
-                    duplicate_policy: cfg.duplicate_policy.into(),
-                };
+                let settings = GeneralSettings::from(&*cfg);
                 (settings, runtime_paths)
             },
         )
-        .await?;
+        .await;
+        let (settings, runtime_paths) = match saved {
+            Ok(saved) => saved,
+            Err(error) => {
+                if let (Some(was), Some(torrents)) = (wind_down_was, torrents) {
+                    torrents.keep_wind_down_after_failed_save(was).await;
+                }
+                return Err(error);
+            }
+        };
 
         if let Some(seconds) = propagation_delay_secs {
             handle.set_propagation_delay(seconds).await?;
         }
         if let Some(limit) = max_concurrent_nzbs {
             handle.set_max_concurrent_nzbs(limit).await?;
-        }
-        // Apply speed limit immediately.
-        if let Some(speed) = max_download_speed {
-            let _ = handle.set_speed_limit(speed).await;
         }
 
         // Apply directory changes immediately so new jobs use them without restart.
@@ -438,6 +495,7 @@ impl SettingsMutation {
                 .await
                 .map_err(|error| async_graphql::Error::new(error.to_string()))?;
         }
+        crate::torrents::reconcile(ctx).await?;
 
         Ok(settings)
     }
@@ -603,6 +661,167 @@ impl SettingsMutation {
         drop(schedules_guard);
         schedule_response(ctx, entries).await
     }
+
+    /// Add a tracker rule, or replace the one `id` names. Every torrent's
+    /// trackers are matched against the rules again.
+    #[graphql(guard = "AdminGuard")]
+    async fn save_tracker_rule(
+        &self,
+        ctx: &Context<'_>,
+        id: Option<u32>,
+        input: crate::settings::types::TrackerRuleInput,
+    ) -> Result<Vec<crate::settings::types::TrackerRule>> {
+        // An input naming no certificate keeps the rule's.
+        let keeps_ssl = input.ssl.is_undefined();
+        // Archive passwords come only from a tracker file; the editor may
+        // clear them, never set them.
+        let keeps_passwords = !input.clear_archive_passwords;
+        let rule = input.into_rule(id.unwrap_or(0))?;
+        let db = ctx.data::<Database>()?.clone();
+        let _guard = SETTINGS_MUTATION_GUARD.lock().await;
+        // The rule's transports, resolved over the global ones, leave one
+        // on; its preferences are kept as set.
+        let global = ctx.data::<SharedConfig>()?.read().await.torrent.transports;
+        rule.transports
+            .checked(global)
+            .map_err(async_graphql::Error::new)?;
+        let rules = tokio::task::spawn_blocking(move || {
+            let now = chrono::Utc::now().timestamp_millis();
+            db.save_tracker_rule(id, rule, keeps_ssl, keeps_passwords, now)
+        })
+        .await??
+        .map_err(async_graphql::Error::new)?;
+        // A tracker rule is a torrent route's consumer.
+        crate::proxies::refresh(ctx).await?;
+        crate::torrents::reload_tracker_rules(ctx).await?;
+        Ok(rules.into_iter().map(Into::into).collect())
+    }
+
+    /// Delete a tracker rule. The torrents it matched follow the rule their
+    /// trackers match next, or none.
+    #[graphql(guard = "AdminGuard")]
+    async fn delete_tracker_rule(
+        &self,
+        ctx: &Context<'_>,
+        id: u32,
+    ) -> Result<Vec<crate::settings::types::TrackerRule>> {
+        let db = ctx.data::<Database>()?.clone();
+        let _guard = SETTINGS_MUTATION_GUARD.lock().await;
+        let rules = tokio::task::spawn_blocking(move || {
+            db.delete_tracker_rule(id)?;
+            db.list_tracker_rules()
+        })
+        .await??;
+        // A tracker rule is a torrent route's consumer.
+        crate::proxies::refresh(ctx).await?;
+        crate::torrents::reload_tracker_rules(ctx).await?;
+        Ok(rules.into_iter().map(Into::into).collect())
+    }
+
+    /// What importing a tracker file, base64, would do. Nothing is kept.
+    #[graphql(guard = "AdminGuard")]
+    async fn preview_tracker_file(
+        &self,
+        ctx: &Context<'_>,
+        file: String,
+        password: Option<String>,
+    ) -> Result<crate::settings::types::TrackerFilePreview> {
+        let db = ctx.data::<Database>()?.clone();
+        let bytes = decode_tracker_file(&file)?;
+        let preview = tokio::task::spawn_blocking(move || {
+            let read = tracker_file::read(&bytes, password.as_deref());
+            let file = match read {
+                Ok(file) => file,
+                Err(refusal) => return Ok(Err(refusal)),
+            };
+            let rules = db.list_tracker_rules()?;
+            let rule = rules
+                .iter()
+                .find(|rule| rule.host_pattern == file.host_pattern);
+            let fingerprint = tracker_file::fingerprint(&bytes, rule);
+            Ok::<_, weaver_server_core::StateError>(Ok(file.preview(rule, fingerprint)))
+        })
+        .await??
+        .map_err(async_graphql::Error::new)?;
+        Ok(preview.into())
+    }
+
+    /// Import a tracker file, base64, as its preview showed it, and return
+    /// every rule. A file or rule changed since the preview is refused.
+    #[graphql(guard = "AdminGuard")]
+    async fn apply_tracker_file(
+        &self,
+        ctx: &Context<'_>,
+        file: String,
+        password: Option<String>,
+        fingerprint: String,
+    ) -> Result<Vec<crate::settings::types::TrackerRule>> {
+        let db = ctx.data::<Database>()?.clone();
+        let bytes = decode_tracker_file(&file)?;
+        let _guard = SETTINGS_MUTATION_GUARD.lock().await;
+        let rules = tokio::task::spawn_blocking(move || {
+            let file = match tracker_file::read(&bytes, password.as_deref()) {
+                Ok(file) => file,
+                Err(refusal) => return Ok(Err(refusal)),
+            };
+            let rules = db.list_tracker_rules()?;
+            let rule = rules
+                .iter()
+                .find(|rule| rule.host_pattern == file.host_pattern);
+            if tracker_file::fingerprint(&bytes, rule) != fingerprint {
+                return Ok(Err("stale preview".to_owned()));
+            }
+            let now = chrono::Utc::now().timestamp_millis();
+            db.apply_tracker_file(&file, now)?;
+            db.list_tracker_rules().map(Ok)
+        })
+        .await??
+        .map_err(async_graphql::Error::new)?;
+        // A tracker rule is a torrent route's consumer.
+        crate::proxies::refresh(ctx).await?;
+        crate::torrents::reload_tracker_rules(ctx).await?;
+        Ok(rules.into_iter().map(Into::into).collect())
+    }
+
+    /// Release a rule from the tracker file that filled it, keeping every
+    /// value it holds, and return every rule.
+    #[graphql(guard = "AdminGuard")]
+    async fn unbind_tracker_rule(
+        &self,
+        ctx: &Context<'_>,
+        id: u32,
+    ) -> Result<Vec<crate::settings::types::TrackerRule>> {
+        let db = ctx.data::<Database>()?.clone();
+        let _guard = SETTINGS_MUTATION_GUARD.lock().await;
+        let rules = tokio::task::spawn_blocking(move || {
+            let now = chrono::Utc::now().timestamp_millis();
+            if !db.unbind_tracker_rule(id, now)? {
+                return Ok(Err(format!("no tracker rule {id}")));
+            }
+            db.list_tracker_rules().map(Ok)
+        })
+        .await??
+        .map_err(async_graphql::Error::new)?;
+        crate::proxies::refresh(ctx).await?;
+        crate::torrents::reload_tracker_rules(ctx).await?;
+        Ok(rules.into_iter().map(Into::into).collect())
+    }
+}
+
+// The bytes of an uploaded tracker file, refused past the largest a tracker
+// file may be before any of it is decoded.
+fn decode_tracker_file(file: &str) -> Result<Vec<u8>> {
+    use base64::Engine as _;
+    let limit = tracker_file::MAX_UPLOAD_BYTES;
+    if file.len() > limit.div_ceil(3) * 4 {
+        return Err(async_graphql::Error::new(format!(
+            "The tracker file is larger than {} KiB.",
+            limit / 1024
+        )));
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(file.trim())
+        .map_err(|_| async_graphql::Error::new("The tracker file is not base64."))
 }
 
 fn normalize_settings_path_update(input: &MaybeUndefined<String>) -> MaybeUndefined<String> {
@@ -719,6 +938,9 @@ mod tests {
 
     fn test_config() -> SharedConfig {
         Arc::new(RwLock::new(weaver_server_core::settings::Config {
+            seeding: None,
+            upload_cap: None,
+            torrent: Default::default(),
             data_dir: "/tmp/weaver".to_string(),
             hardware_profile: None,
             intermediate_dir: None,
@@ -726,7 +948,7 @@ mod tests {
             servers: vec![],
             categories: vec![],
             retry: None,
-            max_download_speed: None,
+            bandwidth: Default::default(),
             cleanup_after_extract: None,
             delete_failed_job_files: None,
             history_retention_days: None,
@@ -757,7 +979,7 @@ mod tests {
                         Ok(())
                     },
                     |cfg| {
-                        cfg.max_download_speed = Some(42);
+                        cfg.propagation_delay_secs = Some(42);
                     },
                 )
                 .await
@@ -767,9 +989,10 @@ mod tests {
 
         tokio::task::yield_now().await;
 
-        let read_result =
-            with_timed_config_read(&config, "tests.settings.read", |cfg| cfg.max_download_speed)
-                .await;
+        let read_result = with_timed_config_read(&config, "tests.settings.read", |cfg| {
+            cfg.propagation_delay_secs
+        })
+        .await;
         assert_eq!(read_result, None);
 
         release_tx

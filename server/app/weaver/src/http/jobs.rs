@@ -2,6 +2,8 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use std::path::{Path as FsPath, PathBuf};
+use weaver_server_core::history::queries::HistoryQueries;
+use weaver_server_core::jobs::queries::JobsQueries;
 
 use axum::Form;
 use axum::body::Body;

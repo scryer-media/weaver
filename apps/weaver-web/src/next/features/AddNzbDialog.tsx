@@ -5,16 +5,18 @@ import { useEffect, useRef, useState } from "react";
 import { useTranslate } from "@/lib/context/translate-context";
 import { submissionStatusCanForceRetry } from "@/next/features/duplicates/duplicate-presentation";
 import { useUploadNzb, type UploadNzbEntry } from "@/next/features/upload/use-upload-nzb";
-import { NZB_UPLOAD_ACCEPT } from "@/next/features/upload/upload-file-types";
 import { cn } from "@/lib/utils";
 import { ConfirmDialog } from "@/next/components/ConfirmDialog";
 import { Dialog } from "@/next/components/Dialog";
 import { Eyebrow } from "@/next/components/chrome";
 import { FormRow } from "@/next/components/rows";
-import { PrimaryButton, SecondaryButton, Select, TextField } from "@/next/components/controls";
+import { PrimaryButton, SecondaryButton, Select, TextField, Toggle } from "@/next/components/controls";
 import { formatSize } from "@/next/data/format";
 import { WV } from "@/next/data/palette";
 import { countLabel } from "@/next/i18n/labels";
+import { UNPACK_CHOICES, unpackChoice, unpackOf } from "@/lib/torrents";
+import { testIds, torrentIds } from "@/next/testids";
+import { useTorrentAddsOffered } from "@/next/data/use-torrents-shown";
 
 const NO_CATEGORY_VALUE = "__none__";
 
@@ -31,13 +33,12 @@ function entryTone(entry: UploadNzbEntry): string {
 }
 
 /**
- * "Add NZB", in the Next vocabulary.
+ * "Add": one drop zone and one text box for NZBs and torrents alike.
  *
- * The whole upload pipeline — staging, duplicate scoring, submission — is the
- * existing `useUploadNzb` hook untouched; this is only a second view of it, so
- * the two interfaces cannot drift in behaviour. Files picked or dropped here
- * are added to the list rather than replacing it, so a second trip through the
- * file browser keeps the first.
+ * The daemon reads each file and the text for what they are, so nothing here
+ * tells an NZB from a torrent. Files picked or dropped are added to the list
+ * rather than replacing it, so a second trip through the file browser keeps
+ * the first.
  */
 export function AddNzbDialog({
   open,
@@ -53,6 +54,14 @@ export function AddNzbDialog({
   const upload = useUploadNzb({ open, resetOnOpen: true, onSubmitted: onClose });
   const { addFiles, fileInputRef } = upload;
   const blocked = upload.entries.filter(isBlocked);
+  // While torrents are off the dialog speaks of NZBs only, even with torrent jobs left.
+  const torrentsOn = useTorrentAddsOffered();
+  // Unpack is a torrent's choice: the row stands once a file read as a torrent is in the list, or
+  // the link is a magnet or an infohash.
+  const torrent =
+    torrentsOn &&
+    (upload.entries.some((entry) => entry.kind === "TORRENT") ||
+      /^(magnet:|[0-9a-f]{40}$|[0-9a-f]{64}$|[a-z2-7]{32}$)/i.test(upload.text.trim()));
   // Set once a submit has answered, so its verdict is read from the entries it updated.
   const [awaitingVerdict, setAwaitingVerdict] = useState(false);
   const [confirmForce, setConfirmForce] = useState(false);
@@ -73,6 +82,7 @@ export function AddNzbDialog({
     await upload.submit();
     setAwaitingVerdict(true);
   };
+  const readyCount = upload.readyCount;
 
   // The hook clears the list as the dialog opens; this runs after that, and
   // only once for a given drop.
@@ -108,15 +118,19 @@ export function AddNzbDialog({
       title={t("next.addNzb.title")}
       onDismiss={onClose}
       width={620}
+      testId={testIds.dialog("add")}
       footer={
         <>
           <SecondaryButton onClick={onClose}>{t("action.cancel")}</SecondaryButton>
           <PrimaryButton
-            disabled={upload.readyCount === 0 || upload.staging || upload.fetching}
+            disabled={
+              readyCount === 0 || upload.staging || upload.fetching
+            }
             onClick={() => void submit()}
+            testId={torrentIds.addSubmit}
           >
-            {upload.readyCount > 1
-              ? t("next.addNzb.submitMany", { count: upload.readyCount })
+            {readyCount > 1
+              ? t("next.addNzb.submitMany", { count: readyCount })
               : t("next.addNzb.submitOne")}
           </PrimaryButton>
         </>
@@ -125,6 +139,7 @@ export function AddNzbDialog({
       <div className="flex flex-col">
         <button
           type="button"
+          data-testid={torrentIds.addDrop}
           onClick={upload.openPicker}
           onDragOver={(event) => {
             event.preventDefault();
@@ -147,7 +162,6 @@ export function AddNzbDialog({
           <input
             ref={fileInputRef}
             type="file"
-            accept={NZB_UPLOAD_ACCEPT}
             multiple
             className="hidden"
             onChange={(event) => {
@@ -155,7 +169,9 @@ export function AddNzbDialog({
               event.target.value = "";
             }}
           />
-          <span className="font-medium text-wv-fg">{t("next.addNzb.dropZone")}</span>
+          <span className="font-medium text-wv-fg">
+            {t(torrentsOn ? "next.addNzb.dropZone" : "next.addNzb.dropZoneNzb")}
+          </span>
           {upload.entries.length === 0 ? null : (
             <span className="font-wv-mono text-[11px] text-wv-faint">
               {`${t("bulk.selected", { count: upload.entries.length })} · ${formatSize(upload.totalBytes)}`}
@@ -210,12 +226,36 @@ export function AddNzbDialog({
         )}
 
         <div className="mt-2 flex flex-col">
+          <FormRow label={t("next.addNzb.link")}>
+            <div className="flex w-[268px] max-w-full min-w-0 flex-col gap-1">
+              <TextField
+                label={t("next.addNzb.link")}
+                value={upload.text}
+                onChange={upload.setText}
+                placeholder={torrentsOn ? "https:// · magnet:?" : "https://"}
+                className="w-full"
+                testId={torrentIds.addLink}
+              />
+              {upload.textError === null ? null : (
+                <span className="text-[11.5px] text-wv-error-text">{upload.textError}</span>
+              )}
+            </div>
+          </FormRow>
           <FormRow label={t("table.category")}>
             <Select
               label={t("table.category")}
               value={upload.category}
               options={categoryOptions}
               onChange={upload.setCategory}
+            />
+          </FormRow>
+          <FormRow label={t("next.tags.title")}>
+            <TextField
+              label={t("next.tags.title")}
+              value={upload.tags}
+              onChange={upload.setTags}
+              placeholder={t("next.tags.placeholder")}
+              className="w-[268px] max-w-full"
             />
           </FormRow>
           <FormRow label={t("table.priority")}>
@@ -226,6 +266,24 @@ export function AddNzbDialog({
               onChange={upload.setPriority}
             />
           </FormRow>
+          <FormRow label={t("next.addNzb.paused")}>
+            <Toggle
+              label={t("next.addNzb.paused")}
+              checked={upload.paused}
+              onChange={upload.setPaused}
+              testId={torrentIds.addPaused}
+            />
+          </FormRow>
+          {torrent ? (
+            <FormRow label={t("next.torrents.unpack")}>
+              <Select
+                label={t("next.torrents.unpack")}
+                value={unpackChoice(upload.unpack)}
+                options={UNPACK_CHOICES.map((option) => ({ ...option, label: t(option.label) }))}
+                onChange={(choice) => upload.setUnpack(unpackOf(choice))}
+              />
+            </FormRow>
+          ) : null}
           <FormRow label={t("servers.password")}>
             <TextField
               label={t("servers.password")}

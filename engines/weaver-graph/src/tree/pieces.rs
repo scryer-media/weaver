@@ -16,6 +16,7 @@
 use std::collections::BTreeMap;
 
 use super::{Builder, Effect, NodeId, Tree};
+use crate::deliver::Why;
 use crate::member::MemberId;
 use crate::object::Kind;
 use crate::recovery::RepairOutcome;
@@ -100,7 +101,13 @@ impl Tree {
                 *first != member
                     && signs(*first)
                     && self.child_of(node, *first).is_none()
-                    && self.refused_by(node, *first).is_some()
+                    && self.refused_by(node, *first).is_some_and(|set| {
+                        !self
+                            .nodes
+                            .get(&set)
+                            .and_then(|found| found.refused)
+                            .is_some_and(Why::disclaims)
+                    })
             })
             .find_map(|first| {
                 self.pieces(node, first)

@@ -5,6 +5,7 @@ mod bounded;
 mod elimination;
 mod facts;
 mod indexes;
+mod past_hole;
 mod readback;
 mod rebuild_absent;
 mod recovery_contracts;

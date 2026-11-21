@@ -56,7 +56,7 @@ fn rev(job: &mut Job<RarRecovery>, name: &str, bytes: &[u8]) -> Option<VolumeInd
 // A recovery volume every byte of which has arrived, not yet closed.
 fn arriving(job: &mut Job<RarRecovery>, name: &str, bytes: &[u8]) -> Option<VolumeIndex> {
     let front = &bytes[..bytes.len().min(64)];
-    let volume = match job.object.claim(name, front, None)[..] {
+    let volume = match job.object.claim(name, (front).into(), None)[..] {
         [volume] => volume,
         [] if job.store.volumes.is_empty() => VolumeIndex(0),
         _ => return None,
@@ -274,7 +274,7 @@ fn recovery_volumes_of_one_set_are_claimed_and_another_sets_are_not() {
     );
     assert_eq!(
         job.object
-            .claim("lantern.part2.rar", b"Rar!\x1a\x07\x01\x00", None),
+            .claim("lantern.part2.rar", (b"Rar!\x1a\x07\x01\x00").into(), None),
         Vec::<VolumeIndex>::new()
     );
 }
@@ -989,7 +989,7 @@ fn a_set_survives_a_restart() {
 // A recovery volume whose front was handed over, the rest still to come.
 fn sampled(job: &mut Job<RarRecovery>, name: &str, bytes: &[u8]) -> VolumeIndex {
     let front = &bytes[..bytes.len().min(64)];
-    let volume = match job.object.claim(name, front, None)[..] {
+    let volume = match job.object.claim(name, (front).into(), None)[..] {
         [volume] => volume,
         _ => VolumeIndex(0),
     };
@@ -1352,7 +1352,7 @@ fn a_set_that_covers_no_data_volume_rules_on_nothing_whenever_its_footers_arrive
         let name = format!("stem-{index:02}.rev");
         let bytes = noise_rev(index, footer(index));
         let front = &bytes[..64];
-        let volume = match early.object.claim(&name, front, None)[..] {
+        let volume = match early.object.claim(&name, (front).into(), None)[..] {
             [volume] => volume,
             [] if early.store.volumes.is_empty() => VolumeIndex(0),
             _ => panic!("{name} is a volume of the set"),
@@ -1406,4 +1406,37 @@ fn a_rar3_footer_counts_the_volumes_of_a_set_that_covers_one() {
     data(&mut job, "lantern.part01.rar");
     bind(&mut job);
     assert_eq!(job.object.slots(), 3);
+}
+
+// A set kept before the sets passed over were kept restores as passing over
+// none, and one kept before an unnamed RAR3 volume was told apart restores
+// as named and proving nothing: its encoding is the same array without the
+// last fields.
+#[test]
+fn a_set_kept_without_the_sets_passed_over_restores_passing_over_none() {
+    let fresh = rmp_serde::to_vec(&RarRecovery::new(OWN)).unwrap();
+    let fields = fresh[0] & 0x0f;
+    assert_eq!(fresh[0] & 0xf0, 0x90, "a fixed array of fields");
+    assert_eq!(
+        &fresh[fresh.len() - 3..],
+        &[0x80, 0xc2, 0xc0],
+        "the empty map of sets passed over, named, proving no set"
+    );
+    for dropped in [2u8, 3] {
+        let mut kept = vec![0x90 | (fields - dropped)];
+        kept.extend_from_slice(&fresh[1..fresh.len() - dropped as usize]);
+
+        let restored: RarRecovery = rmp_serde::from_slice(&kept).unwrap();
+        assert!(restored.passed.is_empty());
+        assert!(!restored.unnamed);
+        assert_eq!(restored.proven, None);
+        assert_eq!(restored.id, OWN);
+    }
+
+    let mut passing = RarRecovery::new(OWN);
+    passing
+        .passed
+        .insert("amber.coast".to_owned(), BTreeSet::from([MemberId(3)]));
+    let again: RarRecovery = rmp_serde::from_slice(&rmp_serde::to_vec(&passing).unwrap()).unwrap();
+    assert_eq!(again.passed, passing.passed);
 }

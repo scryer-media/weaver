@@ -2,6 +2,9 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use weaver_server_core::history::queries::HistoryQueries;
+use weaver_server_core::operations::async_ops::OperationsAsyncOpsQueries;
+use weaver_server_core::tags::TagsQueries;
 
 #[derive(Default)]
 pub(crate) struct HistorySubscription;
@@ -71,8 +74,12 @@ impl HistorySubscription {
         ))
         .map(|_| JobDetailTrigger::Heartbeat);
         let initial = tokio_stream::once(JobDetailTrigger::Initial);
+        // The first value is the tags as they are now, which the initial
+        // read already shows.
+        let tags = tokio_stream::wrappers::WatchStream::from_changes(db.subscribe_tag_changes())
+            .map(|_| JobDetailTrigger::Tags);
         let triggers = throttle(
-            initial.merge(event_stream).merge(heartbeat),
+            initial.merge(event_stream).merge(tags).merge(heartbeat),
             JOB_DETAIL_THROTTLE,
         );
 
@@ -231,6 +238,8 @@ fn raw_pipeline_event_stream(handle: SchedulerHandle) -> impl Stream<Item = Pipe
 enum JobDetailTrigger {
     Initial,
     Event,
+    // The tags changed; the job may show other ones.
+    Tags,
     Heartbeat,
 }
 
@@ -257,6 +266,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use weaver_server_core::history::nzbget_state::HistoryNzbgetStateQueries;
+    use weaver_server_core::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
 
     fn handle_with(jobs: Vec<weaver_server_core::JobInfo>) -> SchedulerHandle {
         let (event_tx, _event_rx) = tokio::sync::broadcast::channel(1);
@@ -290,6 +301,7 @@ mod tests {
             metadata: None,
             server_attribution: None,
             archived_at: None,
+            protocol: weaver_server_core::jobs::Protocol::Nzb,
         }
     }
 

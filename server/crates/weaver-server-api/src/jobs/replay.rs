@@ -490,7 +490,7 @@ async fn global_state_record(
     handle: &SchedulerHandle,
     config: &SharedConfig,
 ) -> PersistedQueueEvent {
-    let max_download_speed = config.read().await.max_download_speed.unwrap_or(0);
+    let max_download_speed = config.read().await.bandwidth.download_bps;
     PersistedQueueEvent {
         occurred_at_ms: chrono::Utc::now().timestamp_millis(),
         kind: QueueEventKind::GlobalStateChanged,
@@ -500,7 +500,7 @@ async fn global_state_record(
         previous_state: None,
         attention: None,
         global_state: Some(global_queue_state(
-            handle.is_globally_paused(),
+            &handle.state().holds(),
             &handle.get_download_block(),
             max_download_speed,
         )),
@@ -592,6 +592,9 @@ mod tests {
 
     fn test_config() -> SharedConfig {
         Arc::new(RwLock::new(Config {
+            seeding: None,
+            upload_cap: None,
+            torrent: Default::default(),
             data_dir: "/tmp/weaver".to_string(),
             hardware_profile: None,
             intermediate_dir: None,
@@ -599,7 +602,7 @@ mod tests {
             servers: vec![],
             categories: vec![],
             retry: None,
-            max_download_speed: None,
+            bandwidth: Default::default(),
             cleanup_after_extract: None,
             delete_failed_job_files: None,
             history_retention_days: None,
@@ -616,6 +619,7 @@ mod tests {
 
     fn finalizing_job_info() -> JobInfo {
         JobInfo {
+            protocol: weaver_server_core::Protocol::Nzb,
             job_id: JobId(PURGED_JOB_ID),
             job_hash: None,
             name: "Purged Completion".to_string(),
@@ -648,6 +652,8 @@ mod tests {
             category: None,
             metadata: Vec::new(),
             output_dir: None,
+            disk_need_bytes: None,
+            disk_free_bytes: None,
             created_at_epoch_ms: 0.0,
             server_attribution: Vec::new(),
         }

@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::deliver::Provenance;
 use crate::evidence::Algorithm;
 use crate::marks::Marked;
-use crate::object::{Kind, ObjectId};
+use crate::object::{Clean, Kind, ObjectId};
 use crate::recovery::Recovery;
 use crate::sniff::{Sniff, signed, sniff_among};
 use crate::volume::ByteRange;
@@ -66,8 +66,20 @@ impl Member {
     // What the member is, as founding asks it: by its name and its front,
     // among the members of its namespace, except that the kind whose
     // reading of it was refuted is no answer, and then its bytes alone say.
-    // The one question every path asks that decides who owns a member.
-    pub fn said(&self, front: &[u8], namespace: &Namespace) -> Sniff {
+    // The one question every path asks that decides who owns a member. A
+    // member whose name `never_open` names is a leaf whatever its front is;
+    // while the rule is not known (`None`) nothing is said of it yet.
+    pub fn said(
+        &self,
+        front: &[u8],
+        namespace: &Namespace,
+        never_open: &dyn Fn(&str) -> Option<bool>,
+    ) -> Sniff {
+        match never_open(&self.name) {
+            Some(true) => return Sniff::Leaf,
+            None => return Sniff::Pending,
+            Some(false) => {}
+        }
         let beside = namespace.members().map(|member| member.name.as_str());
         match sniff_among(&self.name, front, self.length, beside) {
             Sniff::Object(kind) if Some(kind) == self.refuted => signed(front, self.length),
@@ -129,6 +141,9 @@ impl Coverage {
         self.runs.values().map(|run| run.range.len()).sum()
     }
 
+    // Whether runs tile every byte of `range`, whatever their provenance:
+    // a lost run counts, so this says the range is accounted for, not that
+    // its bytes arrived (`Provenance::arrived`).
     pub fn covered(&self, range: ByteRange) -> bool {
         if range.is_empty() {
             return true;
@@ -308,6 +323,9 @@ pub struct Namespace {
     // The members posted more than once whose own posting ended. Such a
     // member closes once its own posting and every further one have.
     ended: BTreeSet<MemberId>,
+    // The names of every record, kept as they come, change and go, so
+    // what a member is by the names beside it is a lookup.
+    listing: crate::sniff::Listing,
     // How many further postings' records `copies_of` has read.
     #[cfg(test)]
     copies_read: AtomicUsize,
@@ -320,11 +338,16 @@ struct Folded {
     open: usize,
 }
 
-// What arrived of a member's first FIRST_BYTES, and how: bytes past a
+// What arrived of FIRST_BYTES of a member from `at`, and how: bytes past a
 // hole are kept, so the front reaches as far as they do once it fills, and
 // damage is a hole with bytes in it, filled by the repair that replaces it.
+// The window starts at the member's start, unless no clean byte arrived in
+// its first FIRST_BYTES: then it starts at the lowest clean byte that did,
+// so a member whose first article never comes clean still shows its clean
+// bytes, and where they start. A clean byte lower down moves it back.
 #[derive(Debug, Default)]
 struct Front {
+    at: u64,
     bytes: Vec<u8>,
     arrived: Coverage,
     // Which write left the front as it is: drawn from one sequence every
@@ -341,6 +364,79 @@ static FRONT_WRITES: AtomicU64 = AtomicU64::new(1);
 // by the MD5 of its first 16 KiB, and nothing needs more.
 pub const FIRST_BYTES: usize = 16 * 1024;
 
+// Where the kept window starts for a member whose lowest clean byte is at
+// `lowest`: at the start when that byte is inside the first FIRST_BYTES,
+// else at that byte.
+pub fn window_start(lowest: u64) -> u64 {
+    if lowest < FIRST_BYTES as u64 {
+        0
+    } else {
+        lowest
+    }
+}
+
+impl Front {
+    // The window moved to start at `at`: what it held there stays, the rest
+    // goes.
+    fn move_to(&mut self, at: u64) {
+        let window = ByteRange::at(at, FIRST_BYTES as u64);
+        let mut moved = Front {
+            at,
+            bytes: Vec::new(),
+            arrived: Coverage::new(),
+            stamp: self.stamp,
+        };
+        for run in self.arrived.runs() {
+            let Some(range) = run
+                .range
+                .intersect(window)
+                .filter(|range| !range.is_empty())
+            else {
+                continue;
+            };
+            let from = (range.start - self.at) as usize;
+            let to = (range.end - self.at) as usize;
+            let into = (range.start - at) as usize;
+            let end = into + (to - from);
+            if end > moved.bytes.len() {
+                moved.bytes.resize(end, 0);
+            }
+            moved.bytes[into..end].copy_from_slice(&self.bytes[from..to]);
+            moved.arrived.write(range, run.provenance);
+        }
+        *self = moved;
+    }
+
+    fn holds_clean(&self) -> bool {
+        self.arrived.runs().any(|run| !run.provenance.is_damaged())
+    }
+
+    // The first clean run the window holds, and where it starts.
+    fn clean(&self) -> (u64, &[u8]) {
+        let mut start = None;
+        let mut reached = 0;
+        for run in self.arrived.runs() {
+            match start {
+                None if !run.provenance.is_damaged() => {
+                    start = Some(run.range.start);
+                    reached = run.range.end;
+                }
+                None => {}
+                Some(_) if run.range.start == reached && !run.provenance.is_damaged() => {
+                    reached = run.range.end;
+                }
+                Some(_) => break,
+            }
+        }
+        let Some(start) = start else {
+            return (0, &[]);
+        };
+        let from = ((start - self.at) as usize).min(self.bytes.len());
+        let to = ((reached - self.at) as usize).min(self.bytes.len());
+        (start, &self.bytes[from..to])
+    }
+}
+
 impl Namespace {
     pub fn new() -> Self {
         Self::default()
@@ -351,6 +447,7 @@ impl Namespace {
     pub fn announce(&mut self, name: &str, length: Option<u64>) -> MemberId {
         let id = MemberId(self.next);
         self.next += 1;
+        self.listing.add(name);
         self.members.insert(
             id,
             Member {
@@ -376,7 +473,9 @@ impl Namespace {
     pub fn restore(&mut self, member: Member) {
         self.next = self.next.max(member.id.0 + 1);
         let (id, now) = (member.id, member.closed);
+        self.listing.add(&member.name);
         if let Some(was) = self.members.insert(id, member) {
+            self.listing.forget(&was.name);
             self.closing(id, was.closed, now);
         }
     }
@@ -391,8 +490,14 @@ impl Namespace {
 
     // The member's rows changed by what the tree keeps of it beside its
     // record: its owner, whether it waits on one, what it was given up as.
+    // A further posting of it answers by it, so each is marked with it.
     pub fn mark(&mut self, member: MemberId) {
         self.members.mark(member);
+        if let Some(folded) = self.folded.get(&member) {
+            for copy in &folded.copies {
+                self.members.mark(*copy);
+            }
+        }
     }
 
     // The generation of the members' marks: a change to one marks it under
@@ -407,7 +512,7 @@ impl Namespace {
     }
 
     // The members, each once: a further posting of one is not listed.
-    pub fn members(&self) -> impl Iterator<Item = &Member> {
+    pub fn members(&self) -> impl Iterator<Item = &Member> + Clone {
         self.members
             .values()
             .filter(|member| !self.copies.contains_key(&member.id))
@@ -902,6 +1007,8 @@ impl Namespace {
     // whose ledger moves its output name, in `Tree::rename`.
     pub fn rename(&mut self, member: MemberId, name: &str) -> Option<&Member> {
         let found = self.members.get_mut(&member)?;
+        self.listing.forget(&found.name);
+        self.listing.add(name);
         found.name = name.to_owned();
         Some(found)
     }
@@ -912,6 +1019,8 @@ impl Namespace {
     // past the length is not it.
     pub fn recognise(&mut self, member: MemberId, name: &str, length: u64) -> Option<&Member> {
         let found = self.members.get_mut(&member)?;
+        self.listing.forget(&found.name);
+        self.listing.add(name);
         found.name = name.to_owned();
         let reached = found.coverage.runs().last().map_or(0, |run| run.range.end);
         if reached > length {
@@ -989,12 +1098,60 @@ impl Namespace {
         for copy in copies {
             self.unlink(copy);
             self.first_bytes.remove(&copy);
-            self.members.remove(&copy);
+            if let Some(gone) = self.members.remove(&copy) {
+                self.listing.forget(&gone.name);
+            }
         }
         self.unlink(member);
         self.ended.remove(&member);
         self.first_bytes.remove(&member);
-        self.members.remove(&member)
+        let gone = self.members.remove(&member)?;
+        self.listing.forget(&gone.name);
+        Some(gone)
+    }
+
+    // Whether a member's name is a recovery volume's by the names of the
+    // namespace beside it (`Listing::recovery`).
+    pub fn names_recovery_beside(&self, name: &str) -> bool {
+        self.listing.recovery(name)
+    }
+
+    // Whether a member is recovery data: by its front, whatever its name,
+    // once the front has said (`sniff::recovery_by_front`); by its posted
+    // name among the names beside it (`names_recovery_beside`) only while
+    // the front has not, its first article lost or not yet come. The one
+    // answer the tree, the census, the delivery and the caps read for a
+    // member no object holds.
+    pub fn recovery_data(&self, member: MemberId) -> bool {
+        let Some(record) = self.get(member) else {
+            return false;
+        };
+        self.recovery_by_front(member)
+            .unwrap_or_else(|| self.names_recovery_beside(&record.name))
+    }
+
+    // What the member's front alone says of its being recovery data, `None`
+    // while it says nothing (`sniff::recovery_by_front`). A RAR3 recovery
+    // volume's front signs nothing, so under RAR's `.rev` it says nothing,
+    // unless the RAR recovery object that held the member refuted it by the
+    // footer it ends on (`RarRecovery::deliver`): then a front that signs
+    // nothing is no recovery data, as under any other name.
+    pub fn recovery_by_front(&self, member: MemberId) -> Option<bool> {
+        let record = self.get(member)?;
+        let front = self.first_bytes(member);
+        let said = crate::sniff::recovery_by_front(&record.name, front, record.length);
+        match said {
+            None if record.refuted == Some(crate::object::Kind::RarRecovery)
+                && !front.is_empty()
+                && matches!(
+                    crate::sniff::signed(front, record.length),
+                    crate::sniff::Sniff::Leaf
+                ) =>
+            {
+                Some(false)
+            }
+            said => said,
+        }
     }
 
     // Keep the part of a delivered range that lies in the member's first
@@ -1010,21 +1167,36 @@ impl Namespace {
         if !self.members.contains_key(&member) {
             return;
         }
-        let Ok(start) = usize::try_from(offset) else {
-            return;
-        };
-        if start >= FIRST_BYTES || bytes.is_empty() {
+        if bytes.is_empty() {
             return;
         }
-        let end = start.saturating_add(bytes.len()).min(FIRST_BYTES);
+        // A clean byte below the window, or one anywhere while the window
+        // holds none, moves it.
+        let (held_at, holds_clean) = self
+            .first_bytes
+            .get(&member)
+            .map_or((0, false), |front| (front.at, front.holds_clean()));
+        let at = window_start(offset);
+        let moves = !provenance.is_damaged() && at != held_at && (at < held_at || !holds_clean);
+        let window = ByteRange::at(if moves { at } else { held_at }, FIRST_BYTES as u64);
+        let Some(kept) = ByteRange::at(offset, bytes.len() as u64)
+            .intersect(window)
+            .filter(|kept| !kept.is_empty())
+        else {
+            return;
+        };
         let front = self.first_bytes.entry(member).or_default();
+        if moves {
+            front.move_to(at);
+        }
+        let start = (kept.start - front.at) as usize;
+        let end = (kept.end - front.at) as usize;
+        let from = (kept.start - offset) as usize;
         if end > front.bytes.len() {
             front.bytes.resize(end, 0);
         }
-        front.bytes[start..end].copy_from_slice(&bytes[..end - start]);
-        front
-            .arrived
-            .write(ByteRange::new(start as u64, end as u64), provenance);
+        front.bytes[start..end].copy_from_slice(&bytes[from..from + (end - start)]);
+        front.arrived.write(kept, provenance);
         front.stamp = FRONT_WRITES.fetch_add(1, Ordering::Relaxed);
         if !self.first_bytes(member).is_empty()
             && let Some(record) = self.members.get_mut(&member)
@@ -1040,11 +1212,27 @@ impl Namespace {
         self.stamped_front(member).1
     }
 
+    // The clean bytes the member has, and where they start: its front, or,
+    // with none, the first clean run the kept window holds past the hole
+    // where its front stopped, at most FIRST_BYTES of it. What an object is
+    // offered the member by.
+    pub fn clean(&self, member: MemberId) -> Clean<'_> {
+        let front = self.first_bytes(member);
+        if !front.is_empty() {
+            return Clean::start(front);
+        }
+        let (at, bytes) = self
+            .first_bytes
+            .get(&member)
+            .map_or((0, &[][..]), Front::clean);
+        Clean { at, bytes }
+    }
+
     // The member's front with the stamp of the write that left it so: the
     // same stamp is the same front, and zero is none. Fronts are not kept
     // across a restart, so a restored front comes again under a new stamp.
     pub fn stamped_front(&self, member: MemberId) -> (u64, &[u8]) {
-        let Some(front) = self.first_bytes.get(&member) else {
+        let Some(front) = self.first_bytes.get(&member).filter(|front| front.at == 0) else {
             return (0, &[]);
         };
         let mut reached = 0;
@@ -1152,6 +1340,31 @@ fn gaps(range: ByteRange, covered: &Coverage) -> Vec<ByteRange> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A namespace's listing follows its members' names as they come,
+    // change and go: an old `.p01` is recovery data only while a `.par2`
+    // of its stem is a member's name.
+    #[test]
+    fn a_namespace_tells_old_numbered_volumes_by_its_members_now() {
+        let mut namespace = Namespace::new();
+        namespace.announce("x.p01", Some(10));
+        assert!(!namespace.names_recovery_beside("x.p01"));
+        let index = namespace.announce("a9f3c1e0", Some(10));
+        assert!(!namespace.names_recovery_beside("x.p01"));
+        namespace.rename(index, "x.par2");
+        assert!(namespace.names_recovery_beside("x.p01"));
+        let again = namespace.announce("x.par2", Some(10));
+        namespace.remove(index);
+        assert!(namespace.names_recovery_beside("x.p01"));
+        namespace.recognise(again, "x.bin", 10);
+        assert!(!namespace.names_recovery_beside("x.p01"));
+        let restored = namespace.get(again).cloned().map(|mut member| {
+            member.name = "x.par2".to_owned();
+            member
+        });
+        namespace.restore(restored.expect("member"));
+        assert!(namespace.names_recovery_beside("x.p01"));
+    }
 
     fn runs(coverage: &Coverage) -> Vec<(u64, u64, Provenance)> {
         coverage
@@ -1668,6 +1881,37 @@ mod tests {
         );
     }
 
+    // A lookup meets only the runs that can touch its range, however many
+    // runs come before it: the one it starts inside, and those starting
+    // before it ends. A member fetched out of order has thousands of runs,
+    // and a restore looks each of them up.
+    #[test]
+    fn a_lookup_meets_only_the_runs_near_its_range() {
+        let mut coverage = Coverage::new();
+        for run in 0..10_000u64 {
+            coverage.write(ByteRange::new(run * 10, run * 10 + 5), Provenance::Fresh);
+        }
+        let met = |range: ByteRange| {
+            coverage
+                .overlapping(range)
+                .map(|run| (run.range.start, run.range.end))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(met(ByteRange::new(50_002, 50_004)), vec![(50_000, 50_005)]);
+        assert_eq!(met(ByteRange::new(50_007, 50_009)), Vec::new());
+        assert_eq!(
+            met(ByteRange::new(50_003, 50_012)),
+            vec![(50_000, 50_005), (50_010, 50_015)]
+        );
+        assert_eq!(met(ByteRange::new(50_005, 50_010)), Vec::new());
+        assert!(coverage.covered(ByteRange::new(99_990, 99_995)));
+        assert!(!coverage.covered(ByteRange::new(99_990, 99_996)));
+        assert_eq!(coverage.overlapping(ByteRange::new(4, 11)).count(), 2);
+        coverage.erase(ByteRange::new(99_992, 99_993));
+        assert_eq!(coverage.runs().count(), 10_001);
+        assert!(!coverage.covered(ByteRange::new(99_990, 99_995)));
+    }
+
     // Thousands of disjoint runs with gaps between them, then overwrites
     // and erases scattered over them, against a map of every byte: each
     // probe reads only the runs it spans, and answers as the byte map does,
@@ -1850,5 +2094,37 @@ mod tests {
         let restored = namespace.remove(member).unwrap();
         namespace.restore(restored);
         assert_eq!(namespace.announce("b.bin", None), MemberId(1));
+    }
+
+    // A member whose first article is lost keeps the clean run past the
+    // hole: inside the first FIRST_BYTES from the start, from its lowest
+    // clean byte past them. A lower clean byte moves the window down, and a
+    // front that comes moves it back to the start; damage moves nothing.
+    #[test]
+    fn the_window_past_a_lost_front_follows_the_lowest_clean_byte() {
+        let first = FIRST_BYTES as u64;
+        let mut namespace = Namespace::new();
+        let member = namespace.announce("k3x9q0.bin", Some(4 * first));
+        namespace.keep_first_bytes(member, 0, &[0; 64], Provenance::Damaged);
+        namespace.keep_first_bytes(member, 64, &[1; 64], Provenance::Fresh);
+        let clean = namespace.clean(member);
+        assert_eq!((clean.at, clean.bytes), (64, &[1; 64][..]));
+        assert!(clean.front().is_empty());
+
+        // Past the first FIRST_BYTES, the window starts at the clean byte.
+        let mut namespace = Namespace::new();
+        let member = namespace.announce("k3x9q0.bin", Some(4 * first));
+        namespace.keep_first_bytes(member, 0, &[0; 64], Provenance::Damaged);
+        namespace.keep_first_bytes(member, 3 * first, &[3; 32], Provenance::Fresh);
+        assert_eq!(namespace.clean(member).at, 3 * first);
+        // A clean byte lower down moves it there, and damage does not.
+        namespace.keep_first_bytes(member, 2 * first, &[2; 32], Provenance::Fresh);
+        namespace.keep_first_bytes(member, first + 7, &[9; 32], Provenance::Damaged);
+        let clean = namespace.clean(member);
+        assert_eq!((clean.at, clean.bytes), (2 * first, &[2; 32][..]));
+        // The front that comes takes the window back to the start.
+        namespace.keep_first_bytes(member, 0, &[5; 64], Provenance::Repaired);
+        let clean = namespace.clean(member);
+        assert_eq!((clean.at, clean.front()), (0, &[5; 64][..]));
     }
 }

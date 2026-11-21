@@ -1,0 +1,90 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+[package]
+name = "weaver-torrent"
+description = "BitTorrent session: peers, trackers, DHT, piece tracking"
+publish = false
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[features]
+# e2e builds only: a torrent's trackers may be announced to at loopback,
+# private and unique-local addresses. Refuses to build without debug
+# assertions, so it can never reach a release binary.
+e2e-local-trackers = []
+
+[dependencies]
+anyhow = { workspace = true }
+arc-swap = { workspace = true }
+arrayvec = { workspace = true }
+async-compression = { workspace = true, features = ["tokio", "gzip"] }
+async-stream = { workspace = true }
+async-trait = { workspace = true }
+atoi = { workspace = true }
+aws-lc-rs = { workspace = true }
+backon = { workspace = true, features = ["tokio-sleep"] }
+base64 = { workspace = true }
+bitvec = { workspace = true }
+bstr = { workspace = true }
+byteorder = { workspace = true }
+bytes = { workspace = true }
+chardetng = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+dashmap = { workspace = true, features = ["serde"] }
+data-encoding = { workspace = true }
+either = { workspace = true }
+encoding_rs = { workspace = true }
+futures = { workspace = true }
+governor = { workspace = true }
+hex = { workspace = true }
+http = { workspace = true }
+httparse = { workspace = true }
+indexmap = { workspace = true }
+memchr = { workspace = true }
+memmap2 = { workspace = true }
+percent-encoding = { workspace = true }
+mime_guess = { workspace = true }
+network-interface = { workspace = true }
+nix = { workspace = true, features = ["uio"] }
+parking_lot = { workspace = true }
+quick-xml = { workspace = true, features = ["serialize"] }
+rand = { workspace = true }
+regex = { workspace = true }
+reqwest = { workspace = true, features = ["json", "stream"] }
+rustls-pki-types = { workspace = true }
+serde = { workspace = true, features = ["rc"] }
+serde_derive = { workspace = true }
+serde_json = { workspace = true }
+serde_urlencoded = { workspace = true }
+socket2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+tokio-stream = { workspace = true, features = ["sync"] }
+tokio-util = { workspace = true, features = ["io", "rt"] }
+tracing = { workspace = true, features = ["attributes"] }
+unicode-normalization = { workspace = true }
+url = { workspace = true, features = ["serde"] }
+uuid = { workspace = true, features = ["v4"] }
+walkdir = { workspace = true }
+x509-parser = { version = "0.18", default-features = false }
+weaver-model = { path = "../../shared/crates/weaver-model", default-features = false }
+weaver-utp = { workspace = true }
+weaver-tunnel = { path = "../weaver-tunnel" }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32", "Win32_System", "Win32_System_IO", "Win32_System_Ioctl", "Win32_Networking_WinSock"] }
+
+[dev-dependencies]
+# The e2e tests lift the open-file limit.
+nix = { workspace = true, features = ["resource", "uio"] }
+# A CA and the identities issued under it, for SSL torrent tests.
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
+tempfile = { workspace = true }
+# `test-util` for the paused clock: the request timeout, DHT and connect rate
+# tests advance it past a deadline instead of waiting for one.
+tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber = { workspace = true }
+# The routing layer's HTTP clients, for tests that make requests.
+weaver-tunnel = { path = "../weaver-tunnel", features = ["test-support"] }

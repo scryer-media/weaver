@@ -20,9 +20,6 @@
 // and takes a [`BlockingBodyLane`] with
 // [`NntpClient::try_acquire_blocking_body_lane`] on a blocking thread.
 
-// Tests dial their own loopback fixtures.
-#![cfg_attr(test, allow(clippy::disallowed_methods))]
-
 mod address_plan;
 pub mod blocking;
 pub mod candidate_plan;
@@ -41,6 +38,7 @@ pub mod recovery;
 pub mod response;
 pub mod revocation;
 pub mod route_dialer;
+pub mod route_line;
 mod route_stream;
 pub mod server_caps;
 pub mod server_set;
@@ -56,7 +54,7 @@ mod test_support;
 // Re-export primary types for convenience.
 pub use address_plan::{
     ADDRESS_ATTEMPT_LIMIT, ADDRESS_REPLAN_INTERVAL, AddressPlanSnapshot, AddressSnapshot,
-    RaceReason,
+    RaceReason, SUSPECT_AFTER_FAILURES,
 };
 pub use blocking::{BlockingBodyLane, BlockingLaneStats, BlockingNntpConnection};
 pub use client::{

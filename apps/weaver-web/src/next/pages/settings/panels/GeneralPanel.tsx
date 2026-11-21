@@ -8,6 +8,7 @@ import {
   HARDWARE_PROFILE_QUERY,
   SET_HARDWARE_PROFILE_MUTATION,
   SET_UNACCEPTABLE_EXTENSIONS_MUTATION,
+  SET_UNWANTED_EXTENSION_ACTION_MUTATION,
   SETTINGS_QUERY,
   UNACCEPTABLE_EXTENSIONS_QUERY,
   UPDATE_ARCHIVE_PASSWORD_LIST_MUTATION,
@@ -62,6 +63,16 @@ interface GeneralSettings {
   duplicatePolicy: DuplicatePolicy;
 }
 
+/** What a download holding a file with an unwanted extension comes to. */
+type UnwantedExtensionAction = "FAIL_JOB" | "DELETE_FILES";
+
+const UNWANTED_EXTENSION_ACTIONS: UnwantedExtensionAction[] = ["FAIL_JOB", "DELETE_FILES"];
+
+const UNWANTED_EXTENSION_ACTION_LABEL: Record<UnwantedExtensionAction, string> = {
+  FAIL_JOB: "next.general.unwantedExtensionAction.fail",
+  DELETE_FILES: "next.general.unwantedExtensionAction.delete",
+};
+
 interface ArchivePasswordSettings {
   hasPasswords: boolean;
   passwordFile: string | null;
@@ -83,6 +94,7 @@ interface Form extends DuplicatePolicy {
   archivePasswordFile: string;
   /** The unwanted extension list, comma-separated. */
   unacceptableExtensions: string;
+  unwantedExtensionAction: UnwantedExtensionAction;
 }
 
 type FieldKey = keyof Form;
@@ -192,16 +204,20 @@ export function GeneralPanel() {
     archivePasswordSettings: ArchivePasswordSettings;
   }>({ query: ARCHIVE_PASSWORD_SETTINGS_QUERY });
   const [{ data: extensionsData }] = useQuery<{
-    postProcessingSettings: { unacceptableExtensions: string[] };
+    postProcessingSettings: { unacceptableExtensions: string[]; unwantedExtensionAction: UnwantedExtensionAction };
   }>({ query: UNACCEPTABLE_EXTENSIONS_QUERY });
   const [, updateSettings] = useMutation(UPDATE_SETTINGS_MUTATION);
   const [, updateArchivePasswords] = useMutation(UPDATE_ARCHIVE_PASSWORD_SETTINGS_MUTATION);
   const [, updateArchivePasswordList] = useMutation(UPDATE_ARCHIVE_PASSWORD_LIST_MUTATION);
   const [, setExtensions] = useMutation(SET_UNACCEPTABLE_EXTENSIONS_MUTATION);
+  const [, setExtensionAction] = useMutation(SET_UNWANTED_EXTENSION_ACTION_MUTATION);
   // Each save answers with the setting as stored, so nothing is read again.
   const [settings, answerSettings] = useAnswered(data?.settings);
   const [archive, answerArchive] = useAnswered(archiveData?.archivePasswordSettings);
   const [extensions, answerExtensions] = useAnswered(extensionsData?.postProcessingSettings.unacceptableExtensions);
+  const [extensionAction, answerExtensionAction] = useAnswered(
+    extensionsData?.postProcessingSettings.unwantedExtensionAction,
+  );
 
   // What is typed or chosen and not stored yet: still being typed, on its way,
   // or refused. A refused value stays in its field beside the daemon's reason.
@@ -226,7 +242,7 @@ export function GeneralPanel() {
 
   const stored = useMemo<Form | null>(
     () =>
-      settings && archive && extensions
+      settings && archive && extensions && extensionAction
         ? {
             ...normalizeDuplicatePolicy(settings.duplicatePolicy),
             intermediateDir: settings.intermediateDir,
@@ -241,9 +257,10 @@ export function GeneralPanel() {
             archivePasswords: "",
             archivePasswordFile: archive.passwordFile ?? "",
             unacceptableExtensions: extensions.join(", "),
+            unwantedExtensionAction: extensionAction,
           }
         : null,
-    [settings, archive, extensions],
+    [settings, archive, extensions, extensionAction],
   );
   const values = stored ? { ...stored, ...edits } : null;
   const dataDir = settings?.dataDir ?? "";
@@ -282,6 +299,16 @@ export function GeneralPanel() {
       return refusal(result.error);
     }
     answerExtensions(answer);
+    return null;
+  };
+
+  const sendExtensionAction = async (action: UnwantedExtensionAction) => {
+    const result = await setExtensionAction({ action });
+    const answer = result.data?.setUnwantedExtensionAction as UnwantedExtensionAction | undefined;
+    if (result.error || !answer) {
+      return refusal(result.error);
+    }
+    answerExtensionAction(answer);
     return null;
   };
 
@@ -333,9 +360,11 @@ export function GeneralPanel() {
     run(key, value, () =>
       key === "unacceptableExtensions"
         ? sendExtensions(splitExtensions(String(value)))
-        : key === "archivePasswordFile"
-          ? sendArchive({ passwordFile: String(value).trim() || null })
-          : sendSettings(settingsInput(key, value)),
+        : key === "unwantedExtensionAction"
+          ? sendExtensionAction(value as UnwantedExtensionAction)
+          : key === "archivePasswordFile"
+            ? sendArchive({ passwordFile: String(value).trim() || null })
+            : sendSettings(settingsInput(key, value)),
     );
   };
 
@@ -476,6 +505,21 @@ export function GeneralPanel() {
                 className: "w-[420px] max-w-full",
                 onChange: (next) => edit("unacceptableExtensions", next),
                 onCommit: (typed) => commit("unacceptableExtensions", typed),
+              },
+            },
+            {
+              id: "unwantedExtensionAction",
+              label: t("next.general.unwantedExtensionAction"),
+              help: t("next.general.unwantedExtensionActionHelp"),
+              keywords: "unwanted extension fail delete partial",
+              control: {
+                kind: "select",
+                value: values.unwantedExtensionAction,
+                options: UNWANTED_EXTENSION_ACTIONS.map((action) => ({
+                  value: action,
+                  label: t(UNWANTED_EXTENSION_ACTION_LABEL[action]),
+                })),
+                onChange: (next: string) => commit("unwantedExtensionAction", next as UnwantedExtensionAction),
               },
             },
           ],

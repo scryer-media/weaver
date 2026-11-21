@@ -3,6 +3,8 @@
 
 use async_graphql::parser::types::OperationType;
 use async_graphql::{Context, Error, ErrorExtensions, Guard, Result};
+use weaver_server_core::auth::repository::AuthRepositoryQueries;
+use weaver_server_core::post_processing::callbacks::PostProcessingCallbacksQueries;
 
 use crate::auth::CallerIdentity;
 use weaver_server_core::auth::CallerScope;

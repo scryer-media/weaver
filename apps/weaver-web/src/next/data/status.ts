@@ -5,8 +5,10 @@ import { useCallback } from "react";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { statusI18nKey } from "@/lib/status-tokens";
 import type { JobData } from "@/lib/job-types";
+import type { DiskVolume } from "@/lib/context/live-data-context";
+import { diskDetail } from "./disk-detail";
 import { latestPhase } from "./phase-bars";
-import { waitReasonDetail } from "./wait-reason";
+import { diskWaitDetail, waitReasonDetail } from "./wait-reason";
 
 /**
  * Status vocabulary shared by every screen.
@@ -34,11 +36,11 @@ export const DOWNLOAD_GROUP_LABEL: Record<DownloadGroup, string> = {
   attention: "next.group.attention",
 };
 
-/** Translation keys for each group's section note; the in-progress group has none. */
+/** Translation keys for each group's section note; the in-progress and queued groups have none. */
 export const DOWNLOAD_GROUP_NOTE: Record<DownloadGroup, string | null> = {
   active: null,
   paused: "next.group.note.paused",
-  queued: "next.group.note.queued",
+  queued: null,
   attention: "next.group.note.attention",
 };
 
@@ -58,12 +60,21 @@ export function statusDetail(
   phase = latestPhase(job.phaseProgress),
   /** The status the screen labels the job with, which the detail does not repeat. */
   shownStatus = job.status,
+  /** The live disk list, whose figures a disk write is shown with. */
+  diskVolumes: readonly DiskVolume[] = [],
 ): string | null {
   if (job.error) {
     return job.error;
   }
   if (job.downloadWaitReason) {
-    return waitReasonDetail(t, job.downloadWaitReason);
+    return (
+      diskWaitDetail(t, job.downloadWaitReason, job.diskNeedBytes, job.diskFreeBytes)
+      ?? waitReasonDetail(t, job.downloadWaitReason)
+    );
+  }
+  const disk = diskDetail(t, job, diskVolumes);
+  if (disk) {
+    return disk;
   }
   if (phase && phase.totalBytes > 0) {
     const percent = `${Math.round(phase.progressPercent)}%`;
@@ -72,4 +83,5 @@ export function statusDetail(
   return null;
 }
 
+export { diskDetail, diskShort } from "./disk-detail";
 export { eventTone } from "./event-tone";

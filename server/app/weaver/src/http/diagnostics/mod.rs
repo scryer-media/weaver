@@ -28,10 +28,15 @@
 //    they identify nobody. The manifest records how many stand-ins the
 //    package allocated, so a reader knows the names are not real, and how
 //    many finished jobs the history holds: names are read for the 2,000 most
-//    recent. A table source that cannot be read leaves every component out
-//    but the few that name nothing by construction, `database.json` and the
-//    pipeline-internals fallback, which then ship with fixed sentences in
-//    place of any error text. There is no way to turn this off. The one file that skips the pass is
+//    recent. The table is read while the rest is collected, step by step,
+//    each page of names kept as it is read, so a step that fails or a read
+//    that runs out of time costs only the names it did not reach. Memory
+//    covers those: the queue's shared rows name the jobs, the loaded
+//    configuration the servers and categories. Whatever the table still did
+//    not read is guarded: a line or value that names a job not read whole, or
+//    holds a dotted name the table does not hold, is left out in place, and
+//    its file says how many. The manifest lists every step of the read.
+//    There is no way to turn this off. The one file that skips the pass is
 //    `nzb-reports.json`: the support reports in it are built from fixed
 //    names and generated tokens only, and join the package as written.
 // 3. **A failed component never fails the package.** Each piece records
@@ -46,6 +51,7 @@ mod nzb_reports;
 mod pipeline_internals;
 mod redact;
 mod sanitize;
+mod stored_read;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -79,10 +85,11 @@ const MAX_LOG_BYTES: u64 = 32 * 1024 * 1024;
 // config, and reading it into memory to redact it should stay bounded.
 const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
 
-// How long the stand-in table may take to read. It reads every table source,
-// the NZB of every job named in the package among them, so a healthy but
-// large instance takes far longer than a single read; the bound is the one
-// the support reports already give their NZB reads.
+// How long the stand-in table may take to read, from the start of the
+// collection, which it runs beside. It reads every table source, the NZB of
+// every job named in the package among them; the bound is the one the
+// support reports already give their NZB reads. A read still running then
+// stops after its statement and leaves every page it read.
 const STORED_NAMES_WAIT: Duration = nzb_reports::REPORT_BUDGET;
 
 // How long the GraphQL root fields may take together. They run at once, so
@@ -222,6 +229,21 @@ async fn collect_components(
     let started = Instant::now();
     let mut components = Vec::new();
 
+    // The table is read beside the collection, from its start, so the ten
+    // seconds between the Prometheus samples are the read's too.
+    // It takes the queue's names when it begins, so a job that leaves the
+    // queue before its page is read is still known.
+    let read = Arc::new(stored_read::NameRead::new().with_queue({
+        let handle = handle.clone();
+        move || handle.diagnostic_queue_names()
+    }));
+    let read_deadline = tokio::time::Instant::now() + STORED_NAMES_WAIT;
+    let reader = {
+        let db = db.clone();
+        let read = read.clone();
+        tokio::task::spawn_blocking(move || stored_read::read_stored_names(&db, &read))
+    };
+
     components.push(Component::text(
         "metrics-1.txt",
         exporter.render(disk_space, http_metrics).await,
@@ -329,66 +351,117 @@ async fn collect_components(
         watch_dir,
         disk_space.volume_labels(),
     );
-    // The table is read once everything is collected, so a name added
-    // during the collection is in it.
-    // A table that cannot be read in time is a table that cannot be read:
-    // every component is left out, as for any other failure to read it.
-    let stored = {
-        let db = db.clone();
-        bounded::within(
-            tokio::time::Instant::now() + STORED_NAMES_WAIT,
-            bounded::blocking(move || sanitize::read_stored_names(&db)),
-        )
-        .await
-    };
-    let (mut components, sanitized) = sanitize_components(components, stored, local).await;
+    // The read gets until its deadline; what it read by then is the table,
+    // and memory covers the rest. A job that joined or left the queue
+    // during the collection is not in the read: memory names it where it
+    // can, and the guard covers it. A job in no list has no names in the
+    // table, and every line naming it is left out.
+    let _ = tokio::time::timeout_at(read_deadline, reader).await;
+    let state = read.finish();
+    let memory = stored_read::MemoryNames::current(handle, config).await;
+    let names = stored_read::TableNames::from_read(state, memory);
+    let (mut components, sanitized) = sanitize_components(components, names, local).await;
     components.push(nzb_reports);
     (components, sanitized)
 }
 
-// The one sanitizing pass over a collected package. A table source that
-// cannot be read, or a table that cannot be built, leaves every component
-// out but those that name nothing by construction: a table missing a source
-// would let that source's names leave. The
-// pass scans every byte, so it runs off the async runtime.
+// The one sanitizing pass over a collected package, with the table as far
+// as it was read. Each component is sanitized on its own. A table that holds
+// too much to build is built again from the host's own names alone, with
+// every job under the guard; only when that cannot be built either is every
+// component left out but those that name nothing by construction. The pass
+// scans every byte, so it runs off the async runtime.
 async fn sanitize_components(
     components: Vec<Component>,
-    stored: Result<sanitize::StoredNames, bounded::ReadRefused>,
+    names: stored_read::TableNames,
     local: sanitize::LocalNames,
 ) -> (Vec<Component>, archive::ManifestSanitized) {
     let shells: Vec<Component> = components.iter().map(sanitize::shell_of).collect();
-    let history_jobs_total = stored.as_ref().ok().map(|stored| stored.history_total);
+    let stored_read::TableNames {
+        stored,
+        guard,
+        manifest: mut table,
+        history_total,
+    } = names;
     let schema_keys = SchemaShape::current()
         .map(SchemaShape::field_names)
         .unwrap_or_default();
+    // The manifest's step errors are database text, sanitized with the rest.
+    let errors: Vec<String> = table
+        .steps
+        .iter()
+        .map(|step| step.error.clone().unwrap_or_default())
+        .collect();
     let fallback = local.clone();
     let pass = tokio::task::spawn_blocking(move || {
         let mut components = components;
-        let result = match stored {
-            Ok(stored) => sanitize::sanitize_package(&mut components, &local, &stored, schema_keys)
-                .map_err(|error| (error, None)),
-            Err(refused) => Err((
-                format!(
-                    "the stand-in table could not read the database: {}",
-                    refused.message
-                ),
-                Some(refused.reason),
-            )),
+        let mut errors = errors;
+        let first = sanitize::sanitize_package(
+            &mut components,
+            &local,
+            &stored,
+            schema_keys.clone(),
+            guard,
+            &mut errors,
+        );
+        let error = match first {
+            Ok(count) => return (components, count, errors, None),
+            Err(error) => error,
         };
-        match result {
-            Ok(stand_ins) => (components, stand_ins),
-            Err((error, code)) => (sanitize::left_out(&local, components, &error, code), 0),
+        let strict = sanitize::sanitize_package(
+            &mut components,
+            &local,
+            &sanitize::StoredNames::default(),
+            schema_keys,
+            Some(sanitize::Guard { jobs: None }),
+            &mut errors,
+        );
+        match strict {
+            Ok(count) => (components, count, errors, Some(error)),
+            Err(_) => (
+                sanitize::left_out(&local, components, &error, None),
+                sanitize::StandInCount::default(),
+                Vec::new(),
+                Some(error),
+            ),
         }
     })
     .await;
-    let (components, stand_ins) = pass.unwrap_or_else(|error| {
+    let (components, count, errors, built) = pass.unwrap_or_else(|error| {
         let reason = format!("the stand-in table could not be built: {error}");
-        (sanitize::left_out(&fallback, shells, &reason, None), 0)
+        (
+            sanitize::left_out(&fallback, shells, &reason, None),
+            sanitize::StandInCount::default(),
+            Vec::new(),
+            Some(reason),
+        )
     });
+    // A sentence the pass did not sanitize is not written.
+    let mut errors = errors.into_iter();
+    for step in &mut table.steps {
+        let sanitized = errors.next();
+        if step.error.is_some() {
+            step.error = Some(
+                sanitized
+                    .unwrap_or_else(|| "the step failed; its error was not sanitized".to_string()),
+            );
+        }
+    }
+    if built.is_some() {
+        table.complete = false;
+        table.fallback = Some(
+            "the table could not be built from what was read, so it was built from the \
+             host's own names alone and every job was guarded"
+                .to_string(),
+        );
+    }
+    table.names_from_table = count.from_table as u64;
+    table.names_from_fallback = count.from_fallback as u64;
     let sanitized = archive::ManifestSanitized {
-        stand_ins: stand_ins as u64,
-        history_jobs_total,
+        stand_ins: count.total() as u64,
+        history_jobs_total: history_total,
         note: sanitize::SANITIZED_NOTE.to_string(),
+        table,
     };
     (components, sanitized)
 }

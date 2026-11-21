@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use std::sync::{Arc, RwLock};
+use weaver_server_core::post_processing::settings::PostProcessingSettingsQueries;
 
 use async_graphql::{Schema, SchemaBuilder};
 use weaver_nntp::pool::NntpPool;
@@ -74,6 +75,14 @@ pub struct SchemaContext {
     // reruns share concurrency and cancellation state.
     pub post_processing_executor:
         Option<weaver_server_core::post_processing::executor::PostProcessingExecutor>,
+    // The torrent client, when the server started with torrents on.
+    pub torrents: Option<weaver_server_core::torrents::service::TorrentService>,
+    // Whether this run of the server has torrents at all, as the app read
+    // it once at start. Unavailable, `torrents` is `None`.
+    pub torrent_availability: weaver_server_core::torrents::TorrentAvailability,
+    // The data-used-per-day recorder, for when each server entered its state.
+    // `None` where nothing records (tests).
+    pub usage_recorder: Option<Arc<weaver_server_core::operations::UsageRecorder>>,
 }
 
 // Render the GraphQL SDL for the public API without constructing any runtime
@@ -153,6 +162,10 @@ pub fn build_schema_with_backup(
         context.db.clone(),
         context.security.rss_allow_private_network,
     );
+    speed_test.set_torrent_availability(context.torrent_availability);
+    if let Some(torrents) = &context.torrents {
+        speed_test.use_torrents(torrents.clone());
+    }
     let schema = apply_graphql_query_guards(Schema::build(
         QueryRoot::default(),
         MutationRoot::default(),
@@ -176,10 +189,15 @@ pub fn build_schema_with_backup(
     .data(context.log_buffer)
     .data(context.system_runtime)
     .data(context.nntp_pool)
+    .data(context.usage_recorder)
+    .data(context.torrent_availability)
     .data(replay)
     .data(history_delete_manager)
     .data(staged_upload_manager)
     .data(speed_test);
-    let schema = schema.data(post_processing_executor);
+    let mut schema = schema.data(post_processing_executor);
+    if let Some(torrents) = context.torrents {
+        schema = schema.data(torrents);
+    }
     schema.finish()
 }

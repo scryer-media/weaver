@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -164,7 +164,9 @@ impl FileRole {
     // ordinary files (`map.t01`, `setup.x64`), and `.zNN` a split zip's part.
     // Such a name is a RAR volume when the post holds a RAR volume of its
     // stem, and for a `.zNN` no `name.zip`; otherwise its role stays the one
-    // its name gives.
+    // its name gives. A two-digit `name.01`, `name.02`, … is a split piece
+    // when the post holds its set: the set's first piece, `.00` or `.01`, and
+    // the piece after it, of the same stem (`short_split`).
     pub fn of_post<'a>(names: impl IntoIterator<Item = Option<&'a str>>) -> Vec<Self> {
         let names: Vec<Option<&str>> = names.into_iter().collect();
         let mut roles: Vec<Self> = names
@@ -174,6 +176,10 @@ impl FileRole {
         let mut later = Vec::new();
         let mut rar_stems = HashSet::new();
         let mut zip_stems = HashSet::new();
+        // The two-digit pieces, and which of `.00`, `.01` and `.02` each
+        // stem holds.
+        let mut short = Vec::new();
+        let mut short_sets: HashMap<String, [bool; 3]> = HashMap::new();
         for (at, (name, role)) in names.iter().zip(&roles).enumerate() {
             let Some(name) = name else { continue };
             match role {
@@ -191,8 +197,28 @@ impl FileRole {
                     if let Some(volume) = later_volume(name) {
                         later.push((at, volume));
                     }
+                    if let Some((stem, number)) = short_split(name) {
+                        if let Some(held) = short_sets
+                            .entry(stem.clone())
+                            .or_default()
+                            .get_mut(number as usize)
+                        {
+                            *held = true;
+                        }
+                        short.push((at, stem, number));
+                    }
                 }
                 _ => {}
+            }
+        }
+        for (at, stem, number) in short {
+            if short_sets
+                .get(&stem)
+                .is_some_and(|held| (held[0] && held[1]) || (held[1] && held[2]))
+            {
+                roles[at] = FileRole::SplitFile {
+                    number: number.saturating_sub(1),
+                };
             }
         }
         for (at, (stem, letter, volume_number)) in later {
@@ -222,8 +248,8 @@ impl FileRole {
             FileRole::XzArchive => 3,
             FileRole::Standalone => 5,
             FileRole::RarVolume { volume_number } => 10 + *volume_number,
-            FileRole::SevenZipSplit { number } => 10 + *number,
-            FileRole::SplitFile { number } => 10 + *number,
+            FileRole::SevenZipSplit { number } => number.saturating_add(10),
+            FileRole::SplitFile { number } => number.saturating_add(10),
             FileRole::Unknown => 50,
             FileRole::Par2 {
                 is_index: false, ..
@@ -377,19 +403,42 @@ fn parse_7z_file(lower: &str) -> Option<FileRole> {
     None
 }
 
+// The digits a split piece's number has at the least, by its name alone:
+// `.001`.
+const SPLIT_PIECE_DIGITS: usize = 3;
+
+// A piece of a file split into numbered pieces, `name.001`, `name.002`, …:
+// a stem, then a last extension of three or more digits. `lower` has had
+// the quotes, underscores and dots a posted name trails taken off
+// (`role_filename_view`). The same rule as `split_piece_among` in
+// `engines/weaver-graph/src/sniff.rs`, which the graph founds its split
+// store by: three digits name a piece alone, and two only beside their set,
+// which `FileRole::of_post` reads (`short_split`). The two cannot share
+// code, since neither crate depends on the other, so both tests pin one
+// table of names and one of posts.
 fn parse_split_file(lower: &str) -> Option<FileRole> {
-    if let Some(dot_pos) = lower.rfind('.') {
-        let ext = &lower[dot_pos + 1..];
-        if ext.len() == 3
-            && ext.bytes().all(|b| b.is_ascii_digit())
-            && let Ok(n) = ext.parse::<u32>()
-        {
-            return Some(FileRole::SplitFile {
-                number: n.saturating_sub(1),
-            });
-        }
+    let (stem, digits) = lower.rsplit_once('.')?;
+    if stem.is_empty()
+        || digits.len() < SPLIT_PIECE_DIGITS
+        || !digits.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
     }
-    None
+    let number = digits
+        .parse::<u32>()
+        .map_or(u32::MAX, |n| n.saturating_sub(1));
+    Some(FileRole::SplitFile { number })
+}
+
+// The stem, lower-cased, and the number of a two-digit piece's name,
+// `name.01`: what it is in a set posted beside it.
+fn short_split(name: &str) -> Option<(String, u32)> {
+    let lower = role_filename_view(name).to_ascii_lowercase();
+    let (stem, digits) = lower.rsplit_once('.')?;
+    if stem.is_empty() || digits.len() != 2 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((stem.to_owned(), digits.parse().ok()?))
 }
 
 fn is_standalone_extension(lower: &str) -> bool {

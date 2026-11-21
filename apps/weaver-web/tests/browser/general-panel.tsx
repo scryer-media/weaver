@@ -8,7 +8,8 @@ import { fromValue, mergeMap, pipe } from "wonka";
 import { TranslateContext } from "@/lib/context/translate-context";
 import en from "@/lib/i18n/locales/en";
 import { nextEn } from "@/next/i18n/en";
-import { SettingsShellProvider } from "@/next/pages/settings/framework";
+import { SettingsShellProvider, type PanelFlags } from "@/next/pages/settings/framework";
+import { SearchRegistry } from "@/next/pages/settings/search";
 import { GeneralPanel } from "@/next/pages/settings/panels/GeneralPanel";
 import "@/next/fonts.css";
 import "@/next/theme.css";
@@ -25,6 +26,7 @@ let settings = {
 let archive: { hasPasswords: boolean; passwordFile: string | null } = { hasPasswords: true, passwordFile: "/data/archive-passwords.txt" };
 // The unwanted extension list, saved apart from the rest and normalized as the daemon does.
 let extensions = ["bat", "cmd", "com", "exe", "js", "lnk", "msi", "ps1", "scr", "vbs"];
+let extensionAction = "FAIL_JOB";
 // A machine that can run more than one hardware profile, so the panel offers the choice.
 const option = (profile: string, threads: number) => ({
   profile, sevenzDecodeMemoryBytes: threads * 256 * 1024 ** 2, decodeThreads: threads, extractThreads: threads, maxConcurrentDownloads: null,
@@ -37,7 +39,7 @@ const hardwareProfile = {
 
 const sent: { name: string; variables: Record<string, unknown> }[] = [];
 // Every state the panel gave the top bar, in order.
-const flags: { dirty: boolean; status: string | null; failed: boolean }[] = [];
+const flags: PanelFlags[] = [];
 // A mutation named here is refused with that message instead of stored.
 const refuse: Record<string, string> = {};
 const actionsRef: { current: { save: () => void; revert: () => void } | null } = { current: null };
@@ -63,6 +65,10 @@ function store(name: string, variables: Record<string, unknown>): unknown {
     extensions = [...new Set((variables as { extensions: string[] }).extensions.map((entry) => entry.toLowerCase()))].sort();
     return { setUnacceptableExtensions: extensions };
   }
+  if (name === "SetUnwantedExtensionAction") {
+    extensionAction = (variables as { action: string }).action;
+    return { setUnwantedExtensionAction: extensionAction };
+  }
   return {};
 }
 
@@ -74,7 +80,7 @@ const client = new Client({ url: "http://fixture.invalid/graphql", exchanges: [(
     const variables = operation.variables as Record<string, unknown>;
     sent.push({ name, variables });
     if (refuse[name] !== undefined) {
-      return fromValue({ operation, data: undefined, error: new CombinedError({ graphQLErrors: [{ message: refuse[name] }] }) });
+      return fromValue({ operation, data: undefined, error: new CombinedError({ graphQLErrors: [{ message: refuse[name] }] }), stale: false, hasNext: false });
     }
     const argumentsForStore = { ...variables };
     if (name === "UpdateArchivePasswordSettings" && definition?.kind === "OperationDefinition") {
@@ -85,23 +91,23 @@ const client = new Client({ url: "http://fixture.invalid/graphql", exchanges: [(
         argumentsForStore.passwordFile = null;
       }
     }
-    return fromValue({ operation, data: store(name, argumentsForStore) });
+    return fromValue({ operation, data: store(name, argumentsForStore), stale: false, hasNext: false });
   }
   const answer = name === "Settings" ? { settings, globalState: null }
     : name === "ArchivePasswordSettings" ? { archivePasswordSettings: archive }
     : name === "HardwareProfile" ? { hardwareProfile }
-    : name === "UnacceptableExtensions" ? { postProcessingSettings: { unacceptableExtensions: extensions } }
+    : name === "UnacceptableExtensions" ? { postProcessingSettings: { unacceptableExtensions: extensions, unwantedExtensionAction: extensionAction } }
     : {};
-  return fromValue({ operation, data: answer });
+  return fromValue({ operation, data: answer, stale: false, hasNext: false });
 }))] });
 
 const dictionary = { ...en, ...nextEn } as Record<string, string>;
 const status = document.getElementById("status")!;
 const shell = {
-  search: "", actionsRef, controlsHost: document.getElementById("controls"), registry: new Map(),
-  setFlags: (next: { dirty: boolean; status: string | null; failed: boolean }) => {
+  search: "", actionsRef, controlsHost: document.getElementById("controls"), registry: new SearchRegistry(),
+  setFlags: (next: PanelFlags) => {
     flags.push(next);
-    status.textContent = `${next.dirty ? "dirty" : "clean"} ${next.status ?? ""}`.trim();
+    status.textContent = `${next.dirty ? "dirty" : "clean"} ${typeof next.status === "string" ? next.status : ""}`.trim();
   },
 };
 

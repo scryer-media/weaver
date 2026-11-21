@@ -11,6 +11,10 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use weaver_server_api::auth::CallerIdentity;
+use weaver_server_core::auth::api_keys::AuthApiKeysQueries;
+use weaver_server_core::auth::repository::AuthRepositoryQueries;
+use weaver_server_core::post_processing::callbacks::PostProcessingCallbacksQueries;
+use weaver_server_core::settings::persistence::SettingsPersistenceQueries;
 
 use weaver_server_core::Database;
 use weaver_server_core::auth::{self as jwt, JWT_TTL_SECS};
@@ -53,7 +57,7 @@ struct LoginFailureWindow {
 }
 
 impl LoginRateLimiter {
-    fn too_many_failures(&self, username: &str, client_id: &str) -> bool {
+    pub(super) fn too_many_failures(&self, username: &str, client_id: &str) -> bool {
         let now = Instant::now();
         let keys = Self::limiter_keys(username, client_id);
         let mut attempts = self.inner.lock().unwrap();
@@ -66,7 +70,7 @@ impl LoginRateLimiter {
             && keys.iter().any(|key| !attempts.contains_key(key)))
     }
 
-    fn record_failure(&self, username: &str, client_id: &str) {
+    pub(super) fn record_failure(&self, username: &str, client_id: &str) {
         let now = Instant::now();
         let keys = Self::limiter_keys(username, client_id);
         let mut attempts = self.inner.lock().unwrap();
@@ -86,7 +90,7 @@ impl LoginRateLimiter {
         }
     }
 
-    fn record_success(&self, username: &str, client_id: &str) {
+    pub(super) fn record_success(&self, username: &str, client_id: &str) {
         let keys = Self::limiter_keys(username, client_id);
         let mut attempts = self.inner.lock().unwrap();
         for key in keys {
@@ -114,7 +118,7 @@ impl LoginRateLimiter {
 // meters each browser separately instead of pooling every attempt under the
 // proxy's own address. Headers are believed only from a configured proxy; a
 // direct peer is metered on its socket address exactly as before.
-fn login_client_id(
+pub(super) fn login_client_id(
     security: &RuntimeSecurityConfig,
     headers: &HeaderMap,
     peer_addr: Option<SocketAddr>,
@@ -172,8 +176,30 @@ fn canonical_browser_origin(headers: &HeaderMap) -> Result<String, StatusCode> {
 // Same-origin GETs normally omit Origin. Use their Referer to keep session
 // discovery consistent with the mandatory Origin check on browser writes.
 fn browser_session_origin_matches(headers: &HeaderMap, session_origin: &str) -> bool {
+    browser_origin_matches(headers, |origin| origin == session_origin)
+}
+
+// Whether a request sent with a cookie comes from a page of this listener:
+// the browser says so in `Sec-Fetch-Site`, or else its Origin, or Referer
+// without one, names the host and port the request was sent to. A request
+// with none of them came from no browser page.
+pub(super) fn same_origin_request(headers: &HeaderMap) -> bool {
+    let mut sites = headers.get_all("sec-fetch-site").iter();
+    if let Some(site) = sites.next() {
+        return sites.next().is_none() && matches!(site.to_str(), Ok("same-origin" | "none"));
+    }
+    let host = super::routes::host_header_authority(headers).ok().flatten();
+    browser_origin_matches(headers, |origin| {
+        host.as_ref()
+            .is_some_and(|host| origin_host_matches(origin, host))
+    })
+}
+
+// Whether the origin a request names, by its Origin or else its Referer, is
+// one `matches` accepts. A request that names none matches.
+fn browser_origin_matches(headers: &HeaderMap, matches: impl Fn(&str) -> bool) -> bool {
     if headers.contains_key(header::ORIGIN) {
-        return canonical_browser_origin(headers).ok().as_deref() == Some(session_origin);
+        return canonical_browser_origin(headers).is_ok_and(|origin| matches(&origin));
     }
     let mut values = headers.get_all(header::REFERER).iter();
     let Some(value) = values.next() else {
@@ -193,7 +219,7 @@ fn browser_session_origin_matches(headers: &HeaderMap, session_origin: &str) -> 
         && url.host_str().is_some()
         && url.username().is_empty()
         && url.password().is_none()
-        && url.origin().ascii_serialization() == session_origin
+        && matches(&url.origin().ascii_serialization())
 }
 
 // Whether a canonical browser origin names the same host and port as the
@@ -929,17 +955,27 @@ pub(super) async fn setup_handler(
                     );
                 }
             };
-        let secret = jwt::generate_jwt_secret();
+        let Ok(signing_keys) = weaver_server_core::auth::SigningKeys::for_database(&db) else {
+            return failure(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "SETUP_SAVE_FAILED",
+                "Could not save setup. No changes were committed; check storage and try again.",
+            );
+        };
+        let login = weaver_server_core::auth::CachedLoginAuth::new(
+            username.clone(),
+            password_hash.clone(),
+            &signing_keys,
+        );
         let token = generate_browser_session_secret();
-        let csrf = derive_browser_csrf_token(&token, &secret);
+        let csrf = derive_browser_csrf_token(&token, &login.jwt_secret);
         let now = epoch_seconds();
         let restart_required = bind_address
             .as_deref()
             .is_some_and(|value| value != security.http_bind_address.to_string());
         let setup = InitialAuthenticatedSetup {
-            username: username.clone(),
-            password_hash: password_hash.clone(),
-            jwt_secret: secret,
+            username,
+            password_hash,
             completed_at: now,
             bind_address,
             trusted_networks: (!security.trust_env_pinned).then_some(networks_json),
@@ -979,11 +1015,7 @@ pub(super) async fn setup_handler(
             }
         }
         challenge.consume();
-        auth_cache.replace(Some(weaver_server_core::auth::CachedLoginAuth::new(
-            username,
-            password_hash,
-            secret,
-        )));
+        auth_cache.replace(Some(login));
         if !security.trust_env_pinned {
             security.set_trusted_cidrs(parsed_networks);
         }
@@ -1181,9 +1213,15 @@ pub(super) async fn setup_handler(
     let mode_value = mode.as_setting_value().to_string();
     let networks_json = networks_json.clone();
     let bind_for_write = bind_to_store.clone();
-    let hashed_for_write = hashed.clone();
+    let hashed_for_write = hashed;
     let store_trusted = matches!(mode, AccessMode::LoginExceptLocal) && !trust_pinned_by_env;
     let write_result = tokio::task::spawn_blocking(move || {
+        // The login's signing key comes from the master key and the new
+        // hash. Without a master key nothing is written.
+        let signing_keys = hashed_for_write
+            .as_ref()
+            .map(|_| weaver_server_core::auth::SigningKeys::for_database(&db_for_write))
+            .transpose()?;
         if !trust_pinned_by_env {
             db_for_write.set_setting(SETTING_ACCESS_MODE, &mode_value)?;
         }
@@ -1199,18 +1237,20 @@ pub(super) async fn setup_handler(
         if let Some(address) = bind_for_write.as_deref() {
             db_for_write.set_setting(SETTING_HTTP_BIND_ADDRESS, address)?;
         }
-        let jwt_secret = match hashed_for_write {
-            Some((username, hash)) => {
+        let login = match (hashed_for_write, signing_keys) {
+            (Some((username, hash)), Some(keys)) => {
                 db_for_write.set_auth_credentials(&username, &hash)?;
-                Some(db_for_write.rotate_jwt_signing_secret()?)
+                Some(weaver_server_core::auth::CachedLoginAuth::new(
+                    username, hash, &keys,
+                ))
             }
-            None => None,
+            _ => None,
         };
-        Ok::<_, weaver_server_core::StateError>(jwt_secret)
+        Ok::<_, weaver_server_core::StateError>(login)
     })
     .await;
-    let jwt_secret = match write_result {
-        Ok(Ok(secret)) => secret,
+    let login = match write_result {
+        Ok(Ok(login)) => login,
         Ok(Err(error)) => {
             return super::error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
         }
@@ -1242,8 +1282,7 @@ pub(super) async fn setup_handler(
             session_cookie_value(session_token.0.as_str(), &security),
         ));
     }
-    if let (Some((username, hash)), Some(secret)) = (hashed, jwt_secret) {
-        let cached = weaver_server_core::auth::CachedLoginAuth::new(username, hash, secret);
+    if let Some(cached) = login {
         auth_cache.replace(Some(cached.clone()));
         if let Some((origin, secure)) = browser_binding {
             let token = generate_browser_session_secret();
@@ -1639,6 +1678,9 @@ fn browser_session_cookie(token: &str, base_url: &str, secure: bool, remember: b
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+    use weaver_server_core::auth::api_keys::AuthApiKeysQueries;
+    use weaver_server_core::auth::repository::AuthRepositoryQueries;
+    use weaver_server_core::post_processing::callbacks::PostProcessingCallbacksQueries;
 
     fn authenticated_request_context(
         db: Database,
@@ -1705,10 +1747,13 @@ mod tests {
     async fn browser_session_discovery_matches_the_page_origin() {
         let db = Database::open_in_memory().unwrap();
         let cache = LoginAuthCache::default();
-        let secret = [7; 32];
-        cache.replace(Some(weaver_server_core::auth::CachedLoginAuth::new(
-            "admin", "unused", secret,
-        )));
+        let auth = weaver_server_core::auth::CachedLoginAuth::new(
+            "admin",
+            "unused",
+            &weaver_server_core::auth::SigningKeys::for_database(&db).unwrap(),
+        );
+        let secret = auth.jwt_secret;
+        cache.replace(Some(auth));
         let security = RuntimeSecurityConfig::default();
         security.apply_stored_access_policy_revision(None, None, false);
         let token = "browser-session-origin-test";
@@ -1788,10 +1833,13 @@ mod tests {
     async fn authenticated_policy_rejects_legacy_jwt_and_shared_cookie() {
         let db = Database::open_in_memory().unwrap();
         let cache = LoginAuthCache::default();
-        let secret = [7; 32];
-        cache.replace(Some(weaver_server_core::auth::CachedLoginAuth::new(
-            "admin", "unused", secret,
-        )));
+        let auth = weaver_server_core::auth::CachedLoginAuth::new(
+            "admin",
+            "unused",
+            &weaver_server_core::auth::SigningKeys::for_database(&db).unwrap(),
+        );
+        let secret = auth.jwt_secret;
+        cache.replace(Some(auth));
         let security = RuntimeSecurityConfig::default();
         security.apply_stored_access_policy_revision(None, None, false);
         security.set_trusted_cidrs(vec!["127.0.0.0/8".parse().unwrap()]);
@@ -1868,16 +1916,22 @@ mod tests {
         }
 
         // Nothing else is taken for one: no credential at all, an API key, a
-        // login token signed with the same secret, or a token changed after
-        // it was signed.
-        let secret = db.get_or_create_jwt_signing_secret().unwrap();
-        let login = jwt::create_jwt("admin", &secret, JWT_TTL_SECS);
+        // login token signed with this master key's login key or with its
+        // script-run key, or a token changed after it was signed.
+        let keys = weaver_server_core::auth::SigningKeys::for_database(&db).unwrap();
+        let login = jwt::create_jwt("admin", &keys.login_key("$argon2id$hash"), JWT_TTL_SECS);
+        let login_on_run_key = jwt::create_jwt("admin", keys.script_run_key(), JWT_TTL_SECS);
         db.insert_api_key("admin", &hash_api_key("an-admin-key"), "admin")
             .unwrap();
         let mut tampered = token.clone();
         tampered.push('A');
         assert!(resolve_script_run(&db, &HeaderMap::new()).await.is_none());
-        for other in ["an-admin-key", login.as_str(), tampered.as_str()] {
+        for other in [
+            "an-admin-key",
+            login.as_str(),
+            login_on_run_key.as_str(),
+            tampered.as_str(),
+        ] {
             assert!(
                 resolve_script_run(&db, &bearer(other)).await.is_none(),
                 "{other}"
@@ -1929,18 +1983,17 @@ mod tests {
             );
             headers
         }
-        const SIGNING_SECRET: &str = "auth.jwt_signing_secret";
-
-        // A fresh database has no signing secret until something asks for
-        // one, and asking is the only way into it from here: one still
-        // missing afterwards means nothing was read.
+        // Every statement takes the datastore; a count that does not move
+        // means nothing was read or written.
         let db = Database::open_in_memory().unwrap();
+        let before = db.datastore_takes();
         let login = jwt::create_jwt("admin", &[9; 32], JWT_TTL_SECS);
         assert!(jwt::service::is_signed_token_shape(&login));
         assert!(resolve_script_run(&db, &bearer(&login)).await.is_none());
-        assert_eq!(db.get_setting(SIGNING_SECRET).unwrap(), None);
+        assert_eq!(db.datastore_takes(), before);
 
-        // A run's token is still read and verified.
+        // A run's token is still signed and verified, with the key held in
+        // memory: no statement for it, at the start of the run or after.
         db.set_script_api_url("http://127.0.0.1:6789/graphql");
         let mut identity = RunIdentity {
             run_id: "run-1".into(),
@@ -1952,6 +2005,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(caller.identity, CallerIdentity::ScriptRun(run) if run == "run-1"));
+        assert_eq!(db.datastore_takes(), before);
     }
 
     #[tokio::test]

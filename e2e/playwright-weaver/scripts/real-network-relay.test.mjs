@@ -49,7 +49,7 @@ test("real Usenet relays forward CONNECT and SOCKS only to the configured destin
   const port = origin.address().port;
   const fixture = await startProxyFixture({
     ip: "127.0.0.1", publicTargets: [{ host: "news.example.com", port, addresses: ["127.0.0.1"] }],
-    ports: { primary: 0, secondary: 0, tertiary: 0, dns: 0, nntp: 0, http: 0, control: 0 },
+    ports: { primary: 0, secondary: 0, tertiary: 0, dns: 0, dnsAlt: 0, nntp: 0, http: 0, control: 0 },
   });
   const exchange = async (proxyPort, handshake, marker) => {
     const client = net.connect(proxyPort, "127.0.0.1");

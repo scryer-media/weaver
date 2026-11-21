@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use weaver_server_core::operations::metrics_store::OperationsMetricsStoreQueries;
+use weaver_server_core::settings::queries::SettingsQueries;
 mod common;
 
 use common::{TestHarness, assert_no_errors, response_data};
@@ -114,6 +116,7 @@ fn history_snapshot(speed: u64, bytes_downloaded: u64) -> MetricsSnapshot {
 
 fn history_job(job_id: u64, status: JobStatus) -> JobInfo {
     JobInfo {
+        protocol: weaver_server_core::Protocol::Nzb,
         job_id: JobId(job_id),
         job_hash: None,
         name: format!("job-{job_id}"),
@@ -146,6 +149,8 @@ fn history_job(job_id: u64, status: JobStatus) -> JobInfo {
         error: None,
         download_wait_reason: None,
         download_retry_at_epoch_ms: None,
+        disk_need_bytes: None,
+        disk_free_bytes: None,
         created_at_epoch_ms: 0.0,
         server_attribution: Vec::new(),
     }
@@ -298,6 +303,125 @@ async fn download_block_idle_by_default() {
     let data = response_data(&resp);
     let kind = data["downloadBlock"]["kind"].as_str().unwrap();
     assert_eq!(kind, "NONE");
+}
+
+#[tokio::test]
+async fn download_block_names_no_slow_volume_by_default() {
+    let h = TestHarness::new().await;
+    let id = h.submit_test_nzb("Idle.Disk").await;
+    let resp = h
+        .execute(
+            "{ globalQueueState { downloadBlock { diskVolumes { label } } } \
+               queuePage(input: { pageIndex: 0, pageSize: 50 }) { items { id diskWrite { volume } } } \
+               queueItems { id diskWrite { volume } } \
+               queueItem(id: ID) { id diskWrite { volume } } }"
+                .replace("ID", &id.to_string())
+                .as_str(),
+        )
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    assert_eq!(
+        data["globalQueueState"]["downloadBlock"]["diskVolumes"],
+        serde_json::json!([])
+    );
+    let row = serde_json::json!({ "id": id, "diskWrite": null });
+    assert_eq!(data["queuePage"]["items"], serde_json::json!([row]));
+    assert_eq!(data["queueItems"], serde_json::json!([row]));
+    assert_eq!(data["queueItem"], row);
+}
+
+// Figures a screen shows exactly: 28 MiB/s and 240 MiB waiting.
+const RATE: u64 = 28 << 20;
+const WAITING: u64 = 240 << 20;
+
+#[tokio::test]
+async fn a_slow_volume_shows_its_figures_and_names_its_jobs() {
+    let h = TestHarness::new().await;
+    let held = h.submit_test_nzb("Held.By.Disk").await;
+    let free = h.submit_test_nzb("Elsewhere").await;
+    h.shared_state
+        .mark_disk_for_test("/mnt/nas", RATE, WAITING, true, &[JobId(held)], &[]);
+
+    let resp = h
+        .execute(
+            "{ downloadBlock { kind diskVolumes { label slow writeRateBytesPerSec waitingBytes } } \
+               globalQueueState { downloadBlock { diskVolumes { label } } } \
+               queuePage(input: { pageIndex: 0, pageSize: 50 }) { items { id \
+                 diskWrite { volume slow draining } } } \
+               queueItem(id: HELD) { diskWrite { volume } } }"
+                .replace("HELD", &held.to_string())
+                .as_str(),
+        )
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    // A slow disk is no hold of its own: the block's kind is unchanged.
+    assert_eq!(data["downloadBlock"]["kind"], "NONE");
+    assert_eq!(
+        data["downloadBlock"]["diskVolumes"],
+        serde_json::json!([{
+            "label": "/mnt/nas",
+            "slow": true,
+            "writeRateBytesPerSec": RATE,
+            "waitingBytes": WAITING,
+        }])
+    );
+    assert_eq!(
+        data["globalQueueState"]["downloadBlock"]["diskVolumes"],
+        serde_json::json!([{ "label": "/mnt/nas" }])
+    );
+    let mut items = data["queuePage"]["items"].as_array().unwrap().clone();
+    items.sort_by_key(|item| item["id"].as_u64());
+    assert_eq!(
+        items,
+        vec![
+            serde_json::json!({ "id": held, "diskWrite": {
+                "volume": "/mnt/nas",
+                "slow": true,
+                "draining": false,
+            } }),
+            serde_json::json!({ "id": free, "diskWrite": null }),
+        ]
+    );
+    // One row alone reads the disk state for itself.
+    assert_eq!(
+        data["queueItem"]["diskWrite"],
+        serde_json::json!({ "volume": "/mnt/nas" })
+    );
+}
+
+// A job with nothing left to fetch and bytes still waiting is named on its
+// disk, though the disk is not slow; the disk is listed with its figures,
+// not slow.
+#[tokio::test]
+async fn a_draining_job_shows_its_volume_while_not_slow() {
+    let h = TestHarness::new().await;
+    let draining = h.submit_test_nzb("Writing.Out").await;
+    h.shared_state
+        .mark_disk_for_test("/mnt/usb", RATE, WAITING, false, &[], &[JobId(draining)]);
+
+    let resp = h
+        .execute(
+            "{ downloadBlock { diskVolumes { label slow waitingBytes } } \
+               queuePage(input: { pageIndex: 0, pageSize: 50 }) { items { id \
+                 diskWrite { volume slow draining } } } }",
+        )
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    assert_eq!(
+        data["downloadBlock"]["diskVolumes"],
+        serde_json::json!([{ "label": "/mnt/usb", "slow": false, "waitingBytes": WAITING }])
+    );
+    assert_eq!(
+        data["queuePage"]["items"],
+        serde_json::json!([{ "id": draining, "diskWrite": {
+            "volume": "/mnt/usb",
+            "slow": false,
+            "draining": true,
+        } }])
+    );
 }
 
 #[tokio::test]

@@ -3,6 +3,10 @@
 
 use super::*;
 use crate::observability::with_timed_config_read;
+use weaver_server_core::settings::SettingsArchivePasswordsQueries;
+use weaver_server_core::settings::SettingsSchedulesQueries;
+use weaver_server_core::settings::repository::SettingsRepositoryQueries;
+use weaver_server_core::torrents::queries::TorrentsQueries;
 
 #[derive(Default)]
 pub(crate) struct SettingsQuery;
@@ -28,20 +32,8 @@ impl SettingsQuery {
     async fn settings(&self, ctx: &Context<'_>) -> Result<GeneralSettings> {
         let config = ctx.data::<SharedConfig>()?;
         Ok(
-            with_timed_config_read(config, "settings.query.settings", |cfg| GeneralSettings {
-                data_dir: cfg.data_dir.clone(),
-                intermediate_dir: cfg.intermediate_dir(),
-                complete_dir: cfg.complete_dir(),
-                cleanup_after_extract: cfg.cleanup_after_extract(),
-                delete_failed_job_files: cfg.delete_failed_job_files(),
-                history_retention_days: cfg.history_retention_days(),
-                max_download_speed: cfg.max_download_speed.unwrap_or(0),
-                propagation_delay_secs: cfg.propagation_delay_secs(),
-                max_concurrent_nzbs: cfg.max_concurrent_nzbs(),
-                max_retries: cfg.retry.as_ref().and_then(|r| r.max_retries).unwrap_or(3),
-                enable_srrdb_lookup: cfg.enable_srrdb_lookup(),
-                watch_folder: (&cfg.watch_folder).into(),
-                duplicate_policy: cfg.duplicate_policy.into(),
+            with_timed_config_read(config, "settings.query.settings", |cfg| {
+                GeneralSettings::from(cfg)
             })
             .await,
         )
@@ -96,6 +88,24 @@ impl SettingsQuery {
         let security = ctx.data::<weaver_server_core::security::RuntimeSecurityConfig>()?;
         let auth_cache = ctx.data::<crate::auth::LoginAuthCache>()?;
         crate::settings::security_upgrade_notice::status(db, security, auth_cache).await
+    }
+
+    #[graphql(guard = "AdminGuard")]
+    async fn tracker_rules(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Vec<crate::settings::types::TrackerRule>> {
+        let db = ctx.data::<Database>()?.clone();
+        let rules = tokio::task::spawn_blocking(move || db.list_tracker_rules()).await??;
+        Ok(rules.into_iter().map(Into::into).collect())
+    }
+
+    /// Every host a torrent has announced to, which a tracker rule's host is
+    /// picked from.
+    #[graphql(guard = "AdminGuard")]
+    async fn tracker_hosts(&self, ctx: &Context<'_>) -> Result<Vec<String>> {
+        let db = ctx.data::<Database>()?.clone();
+        Ok(tokio::task::spawn_blocking(move || db.list_tracker_hosts()).await??)
     }
 
     #[graphql(guard = "AdminGuard")]

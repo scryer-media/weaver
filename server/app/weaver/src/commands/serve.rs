@@ -4,11 +4,17 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use weaver_server_core::auth::api_keys::AuthApiKeysQueries;
+use weaver_server_core::auth::repository::AuthRepositoryQueries;
+use weaver_server_core::post_processing::callbacks::PostProcessingCallbacksQueries;
+use weaver_server_core::settings::SettingsSchedulesQueries;
+use weaver_server_core::settings::persistence::SettingsPersistenceQueries;
+use weaver_server_core::settings::queries::SettingsQueries;
 
 use tokio::sync::{RwLock, broadcast};
 use tracing::{debug, error, info, warn};
 
-use crate::{heartbeat, http, restart, shutdown, wiring};
+use crate::{heartbeat, http, restart, shutdown, usage, wiring};
 use weaver_server_core::events::model::PipelineEvent;
 use weaver_server_core::runtime::shutdown_steps::{
     bounded_shutdown_step, waited_shutdown_step, waited_shutdown_write,
@@ -150,6 +156,15 @@ pub(crate) async fn run(
         .await??,
     );
     let server_transfer_maintenance = server_transfer_policy.spawn_maintenance();
+    let quota_events = weaver_server_core::post_processing::quota_events::spawn_quota_events(
+        &server_transfer_policy,
+        db.clone(),
+        weaver_server_core::post_processing::quota_events::QuotaEventDirs {
+            data: data_dir.clone(),
+            intermediate: intermediate_dir.clone(),
+            complete: complete_dir.clone(),
+        },
+    );
     let proxy_db = db.clone();
     let runtime_handle = tokio::runtime::Handle::current();
     let proxy_policy = Arc::clone(&server_transfer_policy);
@@ -162,6 +177,17 @@ pub(crate) async fn run(
     })
     .await??;
     proxies.set_allow_private_network(security.rss_allow_private_network);
+    let route_events = proxies.network.route_health().map(|health| {
+        weaver_server_core::post_processing::route_events::spawn_route_events(
+            &health,
+            db.clone(),
+            weaver_server_core::post_processing::quota_events::QuotaEventDirs {
+                data: data_dir.clone(),
+                intermediate: intermediate_dir.clone(),
+                complete: complete_dir.clone(),
+            },
+        )
+    });
     let nntp = wiring::build_nntp_client(&config, &profile, &server_transfer_policy, &proxies)?;
     let total_connections: usize = config
         .servers
@@ -189,14 +215,27 @@ pub(crate) async fn run(
         handle.note_server_probe_latency(server_id, latency);
     }
 
-    let recovered_state =
-        weaver_server_core::operations::recover_server_state(&db, &data_dir, &intermediate_dir)
-            .await?;
+    // Whether this run has torrents at all: the first of their two opt-ins,
+    // read here once and handed down. Nothing below reads the environment
+    // for it.
+    let torrent_availability = weaver_server_core::torrents::TorrentAvailability::of_env_value(
+        std::env::var(weaver_server_core::torrents::TORRENTS_ENV)
+            .ok()
+            .as_deref(),
+    );
+    let recovered_state = weaver_server_core::operations::recover_server_state_with(
+        &db,
+        &data_dir,
+        &intermediate_dir,
+        torrent_availability,
+    )
+    .await?;
     let initial_history = recovered_state.initial_history;
     let to_restore = recovered_state.to_restore;
-    let initial_global_paused = recovered_state.initial_global_paused;
+    let initial_holds = recovered_state.initial_holds;
     let after_boot = recovered_state.after_boot;
     let crashed = recovered_state.crashed;
+    let crashed_torrents = recovered_state.crashed_torrents;
 
     // Publish recovered history to shared state so the API has data immediately.
     shared_state.load_history(initial_history.clone());
@@ -216,7 +255,9 @@ pub(crate) async fn run(
     );
     db.set_setting("last_started_version", env!("CARGO_PKG_VERSION"))?;
     let auto_backup_scheduler = backup.start_background_auto_backup_scheduler();
-    let jwt_secret = db.get_or_create_jwt_signing_secret()?;
+    // Login and CSRF tokens are signed with a key derived from the master
+    // key and the stored password hash; nothing is read for it.
+    let signing_keys = weaver_server_core::auth::SigningKeys::for_database(&db)?;
     let auth_credentials = db.get_auth_credentials()?;
     let login_enabled = auth_credentials.is_some();
     if let Some(message) = security.strict_security_violation(login_enabled) {
@@ -229,7 +270,7 @@ pub(crate) async fn run(
         );
     }
     let login_auth_cache =
-        weaver_server_core::auth::LoginAuthCache::from_credentials(auth_credentials, jwt_secret);
+        weaver_server_core::auth::LoginAuthCache::from_credentials(auth_credentials, &signing_keys);
     let api_key_cache =
         weaver_server_core::auth::ApiKeyCache::from_rows(db.list_api_key_auth_rows()?);
 
@@ -262,6 +303,11 @@ pub(crate) async fn run(
     // skipped. Database maintenance and the free-space samplers wait on it,
     // so their first disk work does not land on top of the probe's.
     let startup_disk_work = weaver_server_core::runtime::StartupDiskGate::closed();
+    // The volumes' writer threads, one set for the process, and the one
+    // keeper of their buffer limits: the pipeline and the torrent service
+    // both write through them.
+    let volume_writers = std::sync::Arc::new(weaver_server_core::operations::VolumeWriters::new());
+    let volume_buffers = std::sync::Arc::new(weaver_server_core::operations::VolumeBuffers::new());
     let mut pipeline = Pipeline::new(
         event_tx,
         nntp,
@@ -273,11 +319,13 @@ pub(crate) async fn run(
         total_connections,
         backlog.pending_writes_per_file,
         initial_history,
-        initial_global_paused,
+        initial_holds,
         shared_state,
         db.clone(),
         pipeline_config,
         startup_disk_work.clone(),
+        std::sync::Arc::clone(&volume_writers),
+        std::sync::Arc::clone(&volume_buffers),
     )
     .await?;
     pipeline.park_crashed_jobs(crashed);
@@ -316,6 +364,46 @@ pub(crate) async fn run(
         Some(Arc::clone(&system_profile)),
     );
     let post_processing_executor = pipeline.post_processing_executor();
+    // The torrent client starts with the server, on when the settings turn it
+    // on, and runs on the pipeline's budget; one that cannot start leaves the
+    // rest of the server running. A run without torrents builds no client:
+    // nothing of theirs opens, listens or loads, the stored torrents stay as
+    // they are, and an intake's torrent is refused as it is while the
+    // settings turn torrents off.
+    if !torrent_availability.available() {
+        info!(
+            variable = weaver_server_core::torrents::TORRENTS_ENV,
+            "torrents are not available in this run; set the variable to 1 to make them available"
+        );
+    }
+    let torrents = torrent_availability
+        .client(&handle, || async {
+            let config = shared_config.read().await.clone();
+            match weaver_server_core::torrents::service::TorrentService::for_server(
+                &config,
+                db.clone(),
+                &proxies,
+                &pipeline,
+                volume_writers,
+                volume_buffers,
+                handle.clone(),
+                crashed_torrents,
+            )
+            .await
+            {
+                Ok(torrents) => {
+                    // An add that names a category Weaver does not have
+                    // makes it in the server's settings.
+                    torrents.make_categories_in(shared_config.clone());
+                    Some(torrents)
+                }
+                Err(error) => {
+                    error!(%error, "the torrent client did not start");
+                    None
+                }
+            }
+        })
+        .await;
     let scheduled_resume =
         weaver_server_api::ScheduledResumeCoordinator::new(db.clone(), handle.clone());
 
@@ -419,6 +507,16 @@ pub(crate) async fn run(
         weaver_server_core::application_upgrade::spawn_sigstore_trust_root_priming(proxies.clone());
     }
 
+    // Data used per day starts from the totals as they stand now, before any
+    // download moves them.
+    let usage_recorder = Arc::new(weaver_server_core::operations::UsageRecorder::new());
+    let usage_sources = usage::UsageSources {
+        handle: handle.clone(),
+        transfer_policy: Arc::clone(&server_transfer_policy),
+        torrents: torrents.clone(),
+    };
+    usage::prime(&usage_recorder, &usage_sources, &db).await;
+
     // Build the GraphQL schema now that the live NNTP pool exists (for server-health metrics).
     let schema = weaver_server_api::context::build_schema_with_backup(
         weaver_server_api::SchemaContext {
@@ -444,6 +542,9 @@ pub(crate) async fn run(
             nntp_pool: Some(nntp_pool.clone()),
             spawn_history_delete_worker: true,
             post_processing_executor: Some(post_processing_executor),
+            torrents: torrents.clone(),
+            torrent_availability,
+            usage_recorder: Some(Arc::clone(&usage_recorder)),
         },
         backup.clone(),
     );
@@ -455,7 +556,8 @@ pub(crate) async fn run(
         Arc::clone(&server_transfer_policy),
         shared_config.clone(),
     )
-    .with_schedules(shared_schedules);
+    .with_schedules(shared_schedules)
+    .with_torrents(torrents.clone());
 
     let mut pipeline_task = tokio::spawn(async move {
         pipeline.run().await;
@@ -474,6 +576,11 @@ pub(crate) async fn run(
     let update_check_task = update_check.start_background_loop();
     watch_folder.reconcile_from_config().await?;
     let metrics_history_task = shutdown::spawn_metrics_history_task(handle.clone(), db.clone());
+    let usage_history_task = usage::spawn_usage_history_task(
+        Arc::clone(&usage_recorder),
+        usage_sources.clone(),
+        db.clone(),
+    );
     let heartbeat_task = heartbeat::spawn_heartbeat_task();
     let maintenance_task = weaver_server_core::operations::spawn_maintenance_worker(
         db.clone(),
@@ -512,6 +619,8 @@ pub(crate) async fn run(
         security,
         disk_space: storage_capacity,
         restart: restart_controller.clone(),
+        torrents: torrents.clone(),
+        torrent_availability,
     };
     let mut server_task = tokio::spawn(http::run_server(server_runtime, listener));
     // Start-up housekeeping nothing serving a request waits on runs once the
@@ -610,6 +719,11 @@ pub(crate) async fn run(
                 waited_shutdown_write("backup in progress", backup.shutdown()),
                 waited_shutdown_write("schedule actions", schedule_task.shutdown()),
             );
+            stop_torrents(torrents.as_ref()).await;
+            // A route the shutdown takes down is not down.
+            if let Some(task) = &route_events {
+                task.abort();
+            }
             bounded_shutdown_step("proxies", proxies.stop_all()).await;
             let error = shutdown::pipeline_exit_error(result);
             finalize_event_persistence(event_persistence_task, &event_persistence_shutdown).await;
@@ -617,11 +731,13 @@ pub(crate) async fn run(
             rss_task.abort();
             bounded_shutdown_step("watch folder", watch_folder.stop()).await;
             metrics_history_task.abort();
+            usage_history_task.abort();
             heartbeat_task.abort();
             maintenance_task.abort();
             update_check_task.abort();
             semantic_promotion_task.abort();
             server_transfer_maintenance.abort();
+            quota_events.abort();
             waited_shutdown_write(
                 "server download usage flush",
                 wiring::flush_server_transfer_usage(
@@ -630,6 +746,7 @@ pub(crate) async fn run(
                 ),
             )
             .await;
+            usage::record_and_flush(&usage_recorder, &usage_sources, &db).await;
             return Err(error.into());
         }
         result = &mut server_task => {
@@ -641,9 +758,15 @@ pub(crate) async fn run(
             );
             // The pipeline learns it is stopping before the network goes:
             // a batch torn down by the shutdown is then not read as the
-            // server failing it. It sets flags and waits on nothing, so it
-            // has no bound.
+            // server failing it. The torrent client stops first, before the
+            // routes it rides go away. The pipeline's flag setting waits on
+            // nothing, so it has no bound.
+            stop_torrents(torrents.as_ref()).await;
             handle.shutdown().await.ok();
+            // A route the shutdown takes down is not down.
+            if let Some(task) = &route_events {
+                task.abort();
+            }
             bounded_shutdown_step("proxies", proxies.stop_all()).await;
             // The pipeline's end is its drain, and the drain ends in database
             // writes, so it is waited for and never left behind. Each wait
@@ -655,11 +778,13 @@ pub(crate) async fn run(
             rss_task.abort();
             bounded_shutdown_step("watch folder", watch_folder.stop()).await;
             metrics_history_task.abort();
+            usage_history_task.abort();
             heartbeat_task.abort();
             maintenance_task.abort();
             update_check_task.abort();
             semantic_promotion_task.abort();
             server_transfer_maintenance.abort();
+            quota_events.abort();
             waited_shutdown_write(
                 "server download usage flush",
                 wiring::flush_server_transfer_usage(
@@ -668,6 +793,7 @@ pub(crate) async fn run(
                 ),
             )
             .await;
+            usage::record_and_flush(&usage_recorder, &usage_sources, &db).await;
             return match result {
                 Ok(Ok(())) => Err("HTTP server exited unexpectedly".into()),
                 Ok(Err(error)) => Err(error),
@@ -694,7 +820,12 @@ pub(crate) async fn run(
         waited_shutdown_write("schedule actions", schedule_task.shutdown()),
     );
     // Before the network stops; see the HTTP shutdown arm above.
+    stop_torrents(torrents.as_ref()).await;
     handle.shutdown().await.ok();
+    // A route the shutdown takes down is not down.
+    if let Some(task) = &route_events {
+        task.abort();
+    }
     bounded_shutdown_step("proxies", proxies.stop_all()).await;
     // Waited for, not bounded: see the HTTP shutdown arm above.
     if let Err(join_error) = pipeline_task.await {
@@ -715,10 +846,12 @@ pub(crate) async fn run(
     rss_task.abort();
     bounded_shutdown_step("watch folder", watch_folder.stop()).await;
     metrics_history_task.abort();
+    usage_history_task.abort();
     heartbeat_task.abort();
     maintenance_task.abort();
     semantic_promotion_task.abort();
     server_transfer_maintenance.abort();
+    quota_events.abort();
     waited_shutdown_write(
         "server download usage flush",
         wiring::flush_server_transfer_usage(
@@ -727,12 +860,21 @@ pub(crate) async fn run(
         ),
     )
     .await;
+    usage::record_and_flush(&usage_recorder, &usage_sources, &db).await;
     // The last thing an orderly run says about itself: how much memory it ever
     // held. A run that ended on purpose and one that was killed for its size
     // are only distinguishable if the orderly one leaves this behind.
     heartbeat::log_peak_rss();
 
     Ok(stop)
+}
+
+// The torrent client's tick and jobs stop and its sessions close, before
+// the routes they ride go away.
+async fn stop_torrents(torrents: Option<&weaver_server_core::torrents::service::TorrentService>) {
+    if let Some(torrents) = torrents {
+        torrents.stop().await;
+    }
 }
 
 // Start-up says once how many jobs it queued for restoration; each job's own
@@ -895,12 +1037,15 @@ fn prepare_credentialless_legacy_migration(
 mod migration_tests {
     use super::prepare_credentialless_legacy_migration;
     use weaver_server_core::Database;
+    use weaver_server_core::auth::repository::AuthRepositoryQueries;
     use weaver_server_core::auth::repository::{
         SETUP_COMPLETED_SETTING_KEY, SETUP_PENDING_SETTING_KEY,
     };
     use weaver_server_core::security::{
         AUTHENTICATED_POLICY_REVISION, SETTING_SECURITY_POLICY_REVISION,
     };
+    use weaver_server_core::settings::persistence::SettingsPersistenceQueries;
+    use weaver_server_core::settings::queries::SettingsQueries;
 
     #[test]
     fn credentialless_legacy_migration_resumes_after_restart_without_override() {

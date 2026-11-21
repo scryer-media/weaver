@@ -2,6 +2,10 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use std::collections::{HashMap, HashSet};
+use weaver_server_core::history::queries::HistoryQueries;
+use weaver_server_core::jobs::duplicate_persistence::JobsDuplicatePersistenceAdmitDuplicateSubmissionQueries;
+use weaver_server_core::operations::async_ops::OperationsAsyncOpsQueries;
+use weaver_server_core::post_processing::settings::PostProcessingSettingsQueries;
 
 use async_graphql::{Context, Object, Result, UploadValue};
 use base64::Engine;
@@ -16,32 +20,35 @@ use crate::jobs::batch::{QueueBatchOp, batch_result};
 use crate::jobs::staging::{StagedUploadManager, normalize_uploaded_nzb_reader};
 use crate::jobs::types::{
     CancelJobResult, DuplicateDecisionInfo, DuplicateModeGql, PRIORITY_ATTRIBUTE_KEY,
-    PersistedQueueEvent, QueueBatchResult, QueueBatchTarget, QueueCommandResult, QueueEventKind,
-    QueueMoveKind, QueuePriority, SemanticDuplicateAdmissionInfo, SemanticPromotionResult,
-    StageNzbUploadInput, StagedNzbSubmissionResult, StagedNzbUploadResult, SubmissionResult,
-    SubmissionStatus, SubmitNzbInput, SubmitStagedNzbsInput, SubmitStagedNzbsResult,
-    global_queue_state, normalize_priority_value, queue_item_from_job, queue_item_from_submission,
-    submit_metadata,
+    PersistedQueueEvent, ProtocolGql, QueueBatchResult, QueueBatchTarget, QueueCommandResult,
+    QueueEventKind, QueueMoveKind, QueuePriority, SemanticDuplicateAdmissionInfo,
+    SemanticPromotionResult, StageNzbUploadInput, StagedNzbSubmissionResult, StagedNzbUploadResult,
+    SubmissionKind, SubmissionResult, SubmissionStatus, SubmitInput, SubmitNzbInput,
+    SubmitStagedNzbsInput, SubmitStagedNzbsResult, global_queue_state, normalize_priority_value,
+    queue_item_from_job, queue_item_from_submission, submit_metadata,
 };
 use crate::{ScheduledResumeCoordinator, ScheduledResumeError};
 use weaver_server_core::ingest::{
-    ORIGINAL_TITLE_METADATA_KEY, SubmissionDuplicateOutcome, SubmissionOptions, SubmitNzbError,
-    SubmittedJob, fetch_nzb_from_url, materialize_semantic_promotion,
+    FetchedNzb, Kind, ORIGINAL_TITLE_METADATA_KEY, SubmissionDuplicateOutcome, SubmissionOptions,
+    SubmitNzbError, SubmittedJob, classify, fetch_nzb_from_url, materialize_semantic_promotion,
     normalize_archive_password_candidate, submit_nzb_bytes_with_options,
     submit_staged_nzb_zstd_with_options, submit_staged_prepared_nzb_with_options,
     submit_uploaded_nzb_reader_with_options,
 };
+use weaver_server_core::jobs::Protocol;
+use weaver_server_core::jobs::class::{AddRefusal, RefusalReason, Submission};
 use weaver_server_core::jobs::ids::JobId;
 use weaver_server_core::jobs::{
     CallerScopedIdempotency, DuplicateAction, DuplicateMode, SemanticDuplicate, SubmissionOrigin,
 };
+use weaver_server_core::jobs::{HeldClass, Route};
 use weaver_server_core::post_processing::hooks::UrlStatus;
 use weaver_server_core::settings::SharedConfig;
 use weaver_server_core::{
     Database, FieldUpdate, JobUpdate, QueueMoveTarget, SchedulerError, SchedulerHandle,
 };
 
-/// Longest timed pause, matching NZBGet's `scheduleresume` bound.
+/// Longest timed pause, the NZBGet facade's `scheduleresume` bound.
 const MAX_RESUME_AFTER_SECS: u64 = 60 * 60 * 24 * 30;
 
 /// Most history ids one `archiveHistory` call takes.
@@ -70,6 +77,17 @@ impl JobsMutation {
         crate::jobs::support_report::resolve_analyze_nzb(ctx, input).await
     }
 
+    /// Analyze a torrent without adding it: a .torrent file or a magnet
+    /// link. Reads nothing and changes nothing, as `analyzeNzb`.
+    #[graphql(guard = "ReadGuard")]
+    async fn analyze_torrent(
+        &self,
+        ctx: &Context<'_>,
+        input: crate::jobs::support_report::AnalyzeTorrentInput,
+    ) -> Result<crate::jobs::support_report::SupportReport> {
+        crate::jobs::support_report::resolve_analyze_torrent(ctx, input).await
+    }
+
     /// Submit an NZB for download through the public integration facade.
     #[graphql(guard = "ControlGuard")]
     async fn submit_nzb(
@@ -78,6 +96,99 @@ impl JobsMutation {
         input: SubmitNzbInput,
     ) -> Result<SubmissionResult> {
         submit_from_facade_input(ctx, input).await
+    }
+
+    /// Add an NZB or a torrent, told apart by what it holds. Text is an NZB
+    /// or torrent URL, a magnet link or an infohash; an upload is an NZB,
+    /// torrent or magnet file.
+    #[graphql(guard = "ControlGuard")]
+    async fn submit(&self, ctx: &Context<'_>, input: SubmitInput) -> Result<SubmissionResult> {
+        let caller = caller_identity(ctx)?;
+        let mut options = graphql_submission_options(&caller, None, None, None, None, None, None);
+        options.add_paused = input.paused;
+        options.tags = input.tags.clone();
+        let tags = input.tags;
+        let category = input.category;
+        let (source, filename, source_url) = match (input.text, input.upload) {
+            (Some(text), None) => {
+                let mut bytes = text.trim().as_bytes().to_vec();
+                let mut kind = classify(&bytes);
+                let mut source_url = None;
+                let mut filename = None;
+                if let Kind::Url(url) = kind {
+                    let fetched = fetch_url(ctx, url.as_str(), category.as_deref()).await?;
+                    options.supplied_password_candidates =
+                        weaver_server_core::ingest::header_archive_password_candidates(
+                            fetched.header_passwords.iter().map(String::as_str),
+                        );
+                    bytes = fetched.bytes;
+                    kind = classify(&bytes);
+                    filename = fetched.filename;
+                    source_url = Some(url.to_string());
+                }
+                if goes_to_class(ctx, &kind)? {
+                    let mut submission = Submission::of(kind, bytes);
+                    submission.category = category.clone();
+                    submission.paused = input.paused;
+                    submission.unpack = input.unpack;
+                    submission.tags = tags;
+                    let added = add_to_class(ctx, submission).await;
+                    if let Some(url) = source_url {
+                        let status = if added.is_ok() {
+                            UrlStatus::Success
+                        } else {
+                            UrlStatus::ScanFailure
+                        };
+                        raise_url_completed(
+                            ctx.data::<Database>()?,
+                            &url,
+                            category.as_deref(),
+                            status,
+                        )
+                        .await;
+                    }
+                    return added;
+                }
+                (NzbSource::Bytes(bytes), filename, source_url)
+            }
+            (None, Some(upload)) => {
+                let upload = upload
+                    .value(ctx)
+                    .map_err(|e| graphql_error("INVALID_INPUT", format!("invalid upload: {e}")))?;
+                let filename =
+                    (!upload.filename.trim().is_empty()).then_some(upload.filename.clone());
+                let kind = classify(&upload.content);
+                if goes_to_class(ctx, &kind)? {
+                    let mut submission = Submission::of(kind, upload.content.to_vec());
+                    submission.category = category;
+                    submission.paused = input.paused;
+                    submission.unpack = input.unpack;
+                    submission.tags = tags;
+                    return add_to_class(ctx, submission).await;
+                }
+                (NzbSource::Upload(upload), filename, None)
+            }
+            _ => {
+                return Err(graphql_error(
+                    "INVALID_INPUT",
+                    "submit requires exactly one of text or upload",
+                ));
+            }
+        };
+        submit_nzb_source(
+            ctx,
+            NzbSubmission {
+                source,
+                filename,
+                source_url,
+                password: input.password,
+                category,
+                metadata: Vec::new(),
+                options,
+                client_request_id: None,
+            },
+        )
+        .await
     }
     #[graphql(guard = "ControlGuard")]
     async fn stage_nzb_upload(
@@ -97,6 +208,27 @@ impl JobsMutation {
                 ));
             }
         };
+        // A torrent is not staged: it is added whole, through `submit`. While
+        // torrents take no new ones it is refused here, for every client, so
+        // its row says so before anything is submitted.
+        let kind = classify(&upload.content);
+        let refusal = match ctx
+            .data::<SchedulerHandle>()?
+            .state()
+            .classes()
+            .route(&kind)
+        {
+            Ok(Route::Pipeline) => None,
+            Ok(Route::Class(intake)) => Some(intake.takes_new().err().map(|refusal| refusal.text)),
+            Err(refusal) => Some(Some(refusal.text)),
+        };
+        if let Some(refusal) = refusal {
+            return Ok(StagedNzbUploadResult {
+                kind: SubmissionKind::Torrent,
+                error: refusal,
+                ..rejected_stage_upload_result(filename, String::new())
+            });
+        }
 
         let db = ctx.data::<Database>()?.clone();
         let scan_before_parse = tokio::task::spawn_blocking(move || {
@@ -124,6 +256,7 @@ impl JobsMutation {
             .await
         {
             Ok(staged) => Ok(StagedNzbUploadResult {
+                kind: SubmissionKind::Nzb,
                 accepted: true,
                 staged_upload_id: Some(staged.staged_upload_id),
                 filename: Some(staged.filename),
@@ -163,6 +296,8 @@ impl JobsMutation {
         let dupe_key = input.dupe_key.clone();
         let dupe_score = input.dupe_score;
         let dupe_mode = input.dupe_mode;
+        let paused = input.paused;
+        let tags = input.tags.clone();
         let (entries, missing) =
             manager.take_for_submit(&caller_identity, &input.staged_upload_ids);
         let mut found_by_id = entries
@@ -196,15 +331,19 @@ impl JobsMutation {
                 .as_deref()
                 .or(client_request_id.as_deref())
                 .map(|key| format!("{key}:staged:{staged_upload_id}"));
-            let options = graphql_submission_options(
-                &caller_identity,
-                None,
-                staged_idempotency_key.as_deref(),
-                force,
-                dupe_key.as_deref(),
-                dupe_score,
-                dupe_mode,
-            );
+            let options = SubmissionOptions {
+                add_paused: paused,
+                tags: tags.clone(),
+                ..graphql_submission_options(
+                    &caller_identity,
+                    None,
+                    staged_idempotency_key.as_deref(),
+                    force,
+                    dupe_key.as_deref(),
+                    dupe_score,
+                    dupe_mode,
+                )
+            };
 
             let original_title = entry.preparation.as_ref().and_then(|preparation| {
                 preparation
@@ -465,7 +604,7 @@ impl JobsMutation {
         let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?;
         let db = ctx.data::<Database>()?.clone();
         delete_history_ids(handle, replay, [id], delete_files).await?;
-        history_items_from_db(db, crate::history::query::live_job_ids(handle)).await
+        history_items_from_db(ctx, db, crate::history::query::live_job_ids(handle)).await
     }
     /// Explicitly forget durable duplicate identity for a job without deleting history or files.
     #[graphql(guard = "ControlGuard")]
@@ -589,7 +728,7 @@ impl JobsMutation {
         let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?;
         let db = ctx.data::<Database>()?.clone();
         delete_history_ids(handle, replay, ids, delete_files).await?;
-        history_items_from_db(db, crate::history::query::live_job_ids(handle)).await
+        history_items_from_db(ctx, db, crate::history::query::live_job_ids(handle)).await
     }
     /// Archive up to 100 history entries: remove their files and keep the
     /// entries and their stored NZBs. Only folders Weaver manages are
@@ -661,7 +800,7 @@ impl JobsMutation {
         // rest, and a job that reaches history after the listing stays.
         let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?;
         delete_history_ids(handle, replay, ids, delete_files).await?;
-        history_items_from_db(db, crate::history::query::live_job_ids(handle)).await
+        history_items_from_db(ctx, db, crate::history::query::live_job_ids(handle)).await
     }
     /// Update category and/or priority for one or more jobs.
     #[graphql(guard = "ControlGuard")]
@@ -781,6 +920,30 @@ impl JobsMutation {
         map_scheduler_result(handle.reorder_job(JobId(id), target).await)?;
         Ok(true)
     }
+    /// Pause every job of a class, as one hold, its jobs' own pauses and
+    /// resumes standing under it. A class with no hold of its own is
+    /// refused.
+    #[graphql(guard = "ControlGuard")]
+    async fn pause_class(&self, ctx: &Context<'_>, class: ProtocolGql) -> Result<bool> {
+        let class = held_class(class)?;
+        ctx.data::<SchedulerHandle>()?
+            .pause_class(class)
+            .await
+            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+        Ok(true)
+    }
+
+    /// Lift the operator's pause of every job of a class.
+    #[graphql(guard = "ControlGuard")]
+    async fn resume_class(&self, ctx: &Context<'_>, class: ProtocolGql) -> Result<bool> {
+        let class = held_class(class)?;
+        ctx.data::<SchedulerHandle>()?
+            .resume_class(class)
+            .await
+            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+        Ok(true)
+    }
+
     /// Pause all download dispatch globally. With `resumeAfterSecs`, downloads
     /// resume on their own after that many seconds (1 to 30 days).
     #[graphql(guard = "ControlGuard")]
@@ -813,11 +976,9 @@ impl JobsMutation {
         Ok(true)
     }
     /// Set the global download speed limit in bytes/sec. 0 means unlimited.
-    #[graphql(guard = "ControlGuard")]
+    #[graphql(guard = "ControlGuard", deprecation = "Use setBandwidth.")]
     async fn set_speed_limit(&self, ctx: &Context<'_>, bytes_per_sec: u64) -> Result<bool> {
-        let handle = ctx.data::<SchedulerHandle>()?;
-        handle.set_speed_limit(bytes_per_sec).await?;
-        persist_operator_speed_limit(ctx, bytes_per_sec).await?;
+        save_legacy_download_limit(ctx, bytes_per_sec).await?;
         Ok(true)
     }
     /// Pause one queue item and return its updated facade state.
@@ -966,9 +1127,9 @@ impl JobsMutation {
             message: None,
             item: None,
             global_state: Some(global_queue_state(
-                handle.is_globally_paused(),
+                &handle.state().holds(),
                 &handle.get_download_block(),
-                cfg.max_download_speed.unwrap_or(0),
+                cfg.bandwidth.download_bps,
             )),
         })
     }
@@ -985,32 +1146,29 @@ impl JobsMutation {
             message: None,
             item: None,
             global_state: Some(global_queue_state(
-                handle.is_globally_paused(),
+                &handle.state().holds(),
                 &handle.get_download_block(),
-                cfg.max_download_speed.unwrap_or(0),
+                cfg.bandwidth.download_bps,
             )),
         })
     }
     /// Set the queue speed limit in bytes/sec. 0 means unlimited.
-    #[graphql(guard = "ControlGuard")]
+    #[graphql(guard = "ControlGuard", deprecation = "Use setBandwidth.")]
     async fn set_queue_speed_limit(
         &self,
         ctx: &Context<'_>,
         bytes_per_sec: u64,
     ) -> Result<QueueCommandResult> {
         let handle = ctx.data::<SchedulerHandle>()?;
-        let config = ctx.data::<SharedConfig>()?;
-        map_scheduler_result(handle.set_speed_limit(bytes_per_sec).await)?;
-        persist_operator_speed_limit(ctx, bytes_per_sec).await?;
-        let cfg = config.read().await;
+        let bandwidth = save_legacy_download_limit(ctx, bytes_per_sec).await?;
         Ok(QueueCommandResult {
             success: true,
             message: None,
             item: None,
             global_state: Some(global_queue_state(
-                handle.is_globally_paused(),
+                &handle.state().holds(),
                 &handle.get_download_block(),
-                cfg.max_download_speed.unwrap_or(bytes_per_sec),
+                bandwidth.download_bps,
             )),
         })
     }
@@ -1136,7 +1294,12 @@ async fn run_batch(
 ) -> Result<QueueBatchResult> {
     let handle = ctx.data::<SchedulerHandle>()?;
     let state = ctx.data::<weaver_server_core::SharedPipelineState>()?;
-    let ids = crate::jobs::batch::resolve_target(state, target)?;
+    let tag = target
+        .selection
+        .as_ref()
+        .and_then(|selection| selection.tag.as_deref());
+    let tags = crate::tags::tags_for(ctx.data::<Database>()?, tag).await?;
+    let ids = crate::jobs::batch::resolve_target(state, target, tags.as_deref())?;
     Ok(batch_result(
         crate::jobs::batch::apply(handle, ids, op).await,
     ))
@@ -1160,6 +1323,7 @@ fn caller_identity(ctx: &Context<'_>) -> Result<CallerIdentity> {
 
 fn rejected_stage_upload_result(filename: Option<String>, error: String) -> StagedNzbUploadResult {
     StagedNzbUploadResult {
+        kind: SubmissionKind::Nzb,
         accepted: false,
         staged_upload_id: None,
         filename,
@@ -1356,9 +1520,6 @@ async fn submit_from_facade_input(
     ctx: &Context<'_>,
     input: SubmitNzbInput,
 ) -> Result<SubmissionResult> {
-    let handle = ctx.data::<SchedulerHandle>()?;
-    let db = ctx.data::<Database>()?;
-    let config = ctx.data::<SharedConfig>()?;
     let caller = caller_identity(ctx)?;
     let source_url = input.url.clone();
     let mut supplied_password_candidates =
@@ -1379,14 +1540,7 @@ async fn submit_from_facade_input(
             (Some(bytes), None, input.filename)
         }
         (None, Some(url), None) => {
-            let fetched = match handle.proxy_runtime() {
-                Some(runtime) => fetch_nzb_from_url(&runtime, &url).await,
-                None => Err(SubmitNzbError::Fetch("NZB request has no route".into())),
-            };
-            if fetched.is_err() {
-                raise_url_completed(db, &url, input.category.as_deref(), UrlStatus::Failure).await;
-            }
-            let fetched = fetched.map_err(|e| graphql_error("INVALID_INPUT", e.to_string()))?;
+            let fetched = fetch_url(ctx, &url, input.category.as_deref()).await?;
             supplied_password_candidates.extend(
                 weaver_server_core::ingest::header_archive_password_candidates(
                     fetched.header_passwords.iter().map(String::as_str),
@@ -1415,8 +1569,6 @@ async fn submit_from_facade_input(
     };
 
     let client_request_id = input.client_request_id.clone();
-    let category = input.category.clone();
-    let url_event = source_url.clone().map(|url| (url, category.clone()));
     let mut options = graphql_submission_options(
         &caller,
         client_request_id.as_deref(),
@@ -1427,44 +1579,99 @@ async fn submit_from_facade_input(
         input.dupe_mode,
     );
     options.supplied_password_candidates = supplied_password_candidates;
-    let mut metadata = submit_metadata(input.attributes, input.client_request_id.clone())
+    options.tags = input.tags;
+    let metadata = submit_metadata(input.attributes, input.client_request_id.clone())
         .map_err(|message| graphql_error("INVALID_INPUT", message))?;
-    if let Some(url) = source_url {
+    let source = match (nzb_bytes, upload) {
+        (_, Some(upload)) => NzbSource::Upload(upload),
+        (bytes, None) => NzbSource::Bytes(bytes.expect("nzb bytes should be present")),
+    };
+    submit_nzb_source(
+        ctx,
+        NzbSubmission {
+            source,
+            filename,
+            source_url,
+            password: input.password,
+            category: input.category,
+            metadata,
+            options,
+            client_request_id,
+        },
+    )
+    .await
+}
+
+// An NZB to submit: its bytes in hand, or an upload parsed as it is read.
+enum NzbSource {
+    Bytes(Vec<u8>),
+    Upload(UploadValue),
+}
+
+struct NzbSubmission {
+    source: NzbSource,
+    filename: Option<String>,
+    source_url: Option<String>,
+    password: Option<String>,
+    category: Option<String>,
+    metadata: Vec<(String, String)>,
+    options: SubmissionOptions,
+    client_request_id: Option<String>,
+}
+
+async fn submit_nzb_source(ctx: &Context<'_>, nzb: NzbSubmission) -> Result<SubmissionResult> {
+    let handle = ctx.data::<SchedulerHandle>()?;
+    let db = ctx.data::<Database>()?;
+    let config = ctx.data::<SharedConfig>()?;
+    let NzbSubmission {
+        source,
+        filename,
+        source_url,
+        password,
+        category,
+        mut metadata,
+        options,
+        client_request_id,
+    } = nzb;
+    if let Some(url) = &source_url {
         metadata.push((
             weaver_server_core::post_processing::scan::SOURCE_URL_KEY.into(),
-            url,
+            url.clone(),
         ));
     }
 
-    let submitted = if let Some(upload) = upload {
-        submit_uploaded_nzb(
-            db,
-            handle,
-            config,
-            upload,
-            filename,
-            input.password,
-            category,
-            metadata,
-            options,
-        )
-        .await
-    } else {
-        submit_nzb_bytes_with_options(
-            db,
-            handle,
-            config,
-            &nzb_bytes.expect("nzb bytes should be present"),
-            filename,
-            input.password,
-            category,
-            metadata,
-            options,
-        )
-        .await
+    let submitted = match source {
+        NzbSource::Upload(upload) => {
+            submit_uploaded_nzb(
+                db,
+                handle,
+                config,
+                upload,
+                filename,
+                password,
+                category.clone(),
+                metadata,
+                options,
+            )
+            .await
+        }
+        NzbSource::Bytes(bytes) => {
+            submit_nzb_bytes_with_options(
+                db,
+                handle,
+                config,
+                &bytes,
+                filename,
+                password,
+                category.clone(),
+                metadata,
+                options,
+            )
+            .await
+        }
     };
     // The URL outcome is known only once its NZB has been accepted or refused.
-    if let Some((url, category)) = url_event {
+    if let Some(url) = source_url {
         let status = if submitted.is_ok() {
             UrlStatus::Success
         } else {
@@ -1480,6 +1687,89 @@ async fn submit_from_facade_input(
         Err(error) => submission_result_from_error(client_request_id, error)
             .map_err(|e| graphql_error("INVALID_INPUT", e.to_string())),
     }
+}
+
+// Fetch a URL on the default outbound. A fetch that fails is the URL's outcome.
+async fn fetch_url(ctx: &Context<'_>, url: &str, category: Option<&str>) -> Result<FetchedNzb> {
+    let fetched = match ctx.data::<SchedulerHandle>()?.proxy_runtime() {
+        Some(runtime) => fetch_nzb_from_url(&runtime, url).await,
+        None => Err(SubmitNzbError::Fetch("NZB request has no route".into())),
+    };
+    if fetched.is_err() {
+        raise_url_completed(ctx.data::<Database>()?, url, category, UrlStatus::Failure).await;
+    }
+    fetched.map_err(|e| graphql_error("INVALID_INPUT", e.to_string()))
+}
+
+// A submission another class takes goes to it, with its refusal in its own
+// words.
+async fn add_to_class(ctx: &Context<'_>, submission: Submission) -> Result<SubmissionResult> {
+    let Some(protocol) = submission.kind.protocol() else {
+        return Err(graphql_error(
+            "INVALID_INPUT",
+            "nothing takes this submission",
+        ));
+    };
+    let handle = ctx.data::<SchedulerHandle>()?;
+    let added = match handle.state().classes().route(&submission.kind) {
+        Ok(Route::Class(intake)) => intake.add(submission).await,
+        Ok(Route::Pipeline) => {
+            return Err(graphql_error(
+                "INVALID_INPUT",
+                "the pipeline takes this submission, not a class",
+            ));
+        }
+        Err(refusal) => Err(refusal),
+    };
+    let job_id = added.map_err(|refusal| add_refusal_error(protocol, refusal))?;
+    Ok(SubmissionResult {
+        accepted: true,
+        status: SubmissionStatus::Accepted,
+        job_id: Some(job_id.0),
+        client_request_id: None,
+        item: None,
+        duplicate_decision: None,
+        semantic_duplicate: None,
+        error_code: None,
+        message: None,
+    })
+}
+
+// The class a pause of a whole class is over, refused when the class has no
+// hold of its own.
+fn held_class(class: ProtocolGql) -> Result<HeldClass> {
+    let protocol = Protocol::from(class);
+    HeldClass::of(protocol).ok_or_else(|| {
+        graphql_error(
+            "INVALID_INPUT",
+            format!("the {} class has no pause of its own", protocol.as_str()),
+        )
+    })
+}
+
+// Whether the registry hands a submission of `kind` to a class, not the
+// pipeline: a refusal is the class's to give, in `add_to_class`.
+fn goes_to_class(ctx: &Context<'_>, kind: &Kind) -> Result<bool> {
+    Ok(!matches!(
+        ctx.data::<SchedulerHandle>()?.state().classes().route(kind),
+        Ok(Route::Pipeline)
+    ))
+}
+
+/// The GraphQL error of an add a class refused: the one mapping of every
+/// refusal to its code.
+pub(crate) fn add_refusal_error(protocol: Protocol, refusal: AddRefusal) -> async_graphql::Error {
+    let code = match refusal.reason {
+        RefusalReason::Invalid => "INVALID_INPUT",
+        RefusalReason::Refused | RefusalReason::Removing | RefusalReason::NoIntake => "REFUSED",
+        RefusalReason::Duplicate(_) => "DUPLICATE",
+        RefusalReason::NoNetwork => "NO_NETWORK",
+        RefusalReason::State => "INTERNAL",
+        RefusalReason::Off | RefusalReason::Unavailable | RefusalReason::NotRunning => {
+            protocol.names().disabled_code
+        }
+    };
+    graphql_error(code, refusal.text)
 }
 
 async fn raise_url_completed(db: &Database, url: &str, category: Option<&str>, status: UrlStatus) {
@@ -1520,56 +1810,59 @@ async fn submit_uploaded_nzb(
 //
 // This is the same read surface as the `historyItems` query, so it applies the
 // same exclusion: a job the scheduler still owns is not history, however it
-// came to have a row.
-async fn history_items_from_db(db: Database, live_jobs: HashSet<u64>) -> Result<Vec<HistoryItem>> {
-    tokio::task::spawn_blocking(move || {
-        let rows = crate::history::query::exclude_live_rows(
-            db.list_job_history(
-                &weaver_server_core::HistoryFilter::default(),
-                weaver_server_core::HistoryRows::Shown,
-            )?,
-            &live_jobs,
-        );
-        let ids = rows.iter().map(|row| row.job_id).collect::<Vec<_>>();
-        let delete_states = db.list_history_delete_row_states(&ids)?;
-        Ok::<_, weaver_server_core::StateError>(
-            rows.into_iter()
-                .map(|row| {
-                    let delete_state = delete_states
-                        .get(&row.job_id)
-                        .cloned()
-                        .map(history_delete_row_state_from_core);
-                    history_item_from_row(&row, delete_state)
-                })
-                .collect(),
-        )
+// came to have a row. Each row's delete state is read only when the caller
+// selects `deleteOperation`.
+async fn history_items_from_db(
+    ctx: &Context<'_>,
+    db: Database,
+    live_jobs: HashSet<u64>,
+) -> Result<Vec<HistoryItem>> {
+    let want_delete_states = ctx.look_ahead().field("deleteOperation").exists();
+    let internal = |error: async_graphql::Error| graphql_error("INTERNAL", error.message);
+    let rows = crate::observability::spawn_blocking_db("jobs.mutation.history_items.list", {
+        let db = db.clone();
+        move || {
+            db.list_job_history(&weaver_server_core::HistoryFilter::default())
+                .map(|rows| crate::history::query::exclude_live_rows(rows, &live_jobs))
+        }
     })
     .await
-    .map_err(|e| graphql_error("INTERNAL", e.to_string()))?
-    .map_err(|e| graphql_error("INTERNAL", e.to_string()))
+    .map_err(internal)?;
+    let mut delete_states = HashMap::new();
+    if want_delete_states && !rows.is_empty() {
+        let ids = rows.iter().map(|row| row.job_id).collect::<Vec<_>>();
+        delete_states = crate::observability::spawn_blocking_db(
+            "jobs.mutation.history_items.delete_states",
+            move || db.list_history_delete_row_states(&ids),
+        )
+        .await
+        .map_err(internal)?;
+    }
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let delete_state = delete_states
+                .remove(&row.job_id)
+                .map(history_delete_row_state_from_core);
+            history_item_from_row(&row, delete_state)
+        })
+        .collect())
 }
 
 // The operator's speed limit is the saved global limit from now on: the queue
 // state reads it from the configuration, and a reload restores it, so the edit
 // lands in the settings as the settings screen's own edit would.
-async fn persist_operator_speed_limit(ctx: &Context<'_>, bytes_per_sec: u64) -> Result<()> {
+// Save a download limit sent the old way, where 0 is no limit, onto the
+// global bandwidth row.
+async fn save_legacy_download_limit(
+    ctx: &Context<'_>,
+    bytes_per_sec: u64,
+) -> Result<weaver_server_core::proxies::Bandwidth> {
+    let handle = ctx.data::<SchedulerHandle>()?;
     let config = ctx.data::<SharedConfig>()?;
-    let db = ctx.data::<Database>()?.clone();
-    let persist = async move {
-        crate::observability::spawn_blocking_db(
-            "jobs.mutation.set_speed_limit.persist",
-            move || db.set_setting("max_download_speed", &bytes_per_sec.to_string()),
-        )
-        .await
-    };
-    crate::observability::persist_then_update_config(
-        config,
-        "jobs.mutation.set_speed_limit.apply",
-        persist,
-        move |cfg| cfg.max_download_speed = Some(bytes_per_sec),
-    )
-    .await?;
-    Ok(())
+    let db = ctx.data::<Database>()?;
+    let download_bps = (bytes_per_sec != 0).then_some(bytes_per_sec);
+    map_scheduler_result(handle.save_download_limit(db, config, download_bps).await)
 }
 
 #[cfg(test)]
@@ -1577,11 +1870,15 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use weaver_server_core::JobHistoryRow;
+    use weaver_server_core::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
+    use weaver_server_core::history::queries::HistoryQueries;
+    use weaver_server_core::settings::service::SettingsServiceQueries;
 
     // A history row whose output directory is `output_dir`, a working
     // directory the pipeline owns.
     fn history_row(job_id: u64, output_dir: &std::path::Path) -> JobHistoryRow {
         JobHistoryRow {
+            protocol: weaver_server_core::jobs::Protocol::Nzb,
             job_id,
             job_hash: None,
             name: format!("job-{job_id}"),

@@ -24,7 +24,7 @@ fn range_named(files: &[(String, Vec<u8>)]) -> Vec<(String, Vec<u8>, u64)> {
 
 // A volume claimed by its name alone, before any byte of it arrived.
 fn claimed_by_name(job: &mut Job<Par2>, name: &str, bytes: &[u8]) -> VolumeIndex {
-    let claimed = job.object.claim(name, &[], None);
+    let claimed = job.object.claim(name, (&[]).into(), None);
     let [volume] = claimed[..] else {
         panic!("{name} is claimed by its name: {claimed:?}");
     };

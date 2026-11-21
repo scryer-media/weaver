@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use weaver_server_core::settings::SettingsSchedulesQueries;
 mod common;
 
 #[test]
@@ -46,14 +47,14 @@ async fn deleting_a_provider_takes_its_limit_out_of_a_speed_rule() {
     };
     let response = h.schema.execute(request(format!(r#"mutation {{
         createSchedule(input: {{ enabled: false, time: "08:00", actionType: "speed_limit",
-            speedLimits: [{{ kind: GLOBAL, bytesPerSec: 5000000 }}, {{ kind: SERVER, id: {id}, bytesPerSec: 0 }}] }}) {{
-            speedLimits {{ kind id bytesPerSec }}
+            speedLimits: [{{ kind: GLOBAL, download: 5000000 }}, {{ kind: SERVER, id: {id}, download: 1000 }}] }}) {{
+            speedLimits {{ kind id download upload }}
         }}
     }}"#))).await;
     common::assert_no_errors(&response);
     assert_eq!(
         common::response_data(&response)["createSchedule"][0]["speedLimits"][1],
-        serde_json::json!({ "kind": "SERVER", "id": id, "bytesPerSec": 0 })
+        serde_json::json!({ "kind": "SERVER", "id": id, "download": 1000, "upload": null })
     );
     let removed = h
         .schema
@@ -68,7 +69,8 @@ async fn deleting_a_provider_takes_its_limit_out_of_a_speed_rule() {
         ScheduleAction::SpeedLimit {
             limits: vec![SpeedLimitChange {
                 target: SpeedTarget::Global,
-                bytes_per_sec: 5_000_000,
+                bytes_per_sec: Some(5_000_000),
+                upload_bytes_per_sec: None,
             }],
         }
     );
@@ -154,7 +156,7 @@ async fn one_shot_and_hourly_inputs_validate_and_update_every_field() {
     for input in [
         r#"{ time: "08:00", actionType: "pause", everyHourAtMinute: 10 }"#,
         r#"{ time: "08:00", actionType: "prune_history", pruneFailed: { deleteFiles: false }, everyHourAtMinute: 60 }"#,
-        r#"{ time: "08:00", times: ["01:00", "02:00"], actionType: "speed_limit", speedLimits: [{ kind: GLOBAL, bytesPerSec: 1 }] }"#,
+        r#"{ time: "08:00", times: ["01:00", "02:00"], actionType: "speed_limit", speedLimits: [{ kind: GLOBAL, download: 1 }] }"#,
         r#"{ time: "08:00", actionType: "speed_limit" }"#,
         r#"{ time: "08:00", actionType: "fetch_rss" }"#,
         r#"{ time: "08:00", actionType: "scan_watch_folder" }"#,
@@ -728,4 +730,113 @@ async fn a_hardware_profile_the_machine_cannot_honour_is_refused_in_a_schedule()
             .unwrap(),
         "BALANCED"
     );
+}
+
+#[tokio::test]
+async fn a_split_rule_holds_the_split_track_and_lifts_without_a_percentage() {
+    let h = common::TestHarness::new().await;
+    for (input, pct) in [
+        (r#"splitUsenetPct: 80"#, serde_json::json!(80)),
+        ("", serde_json::Value::Null),
+    ] {
+        let response = h
+            .execute(&format!(
+                r#"mutation {{ createSchedule(input: {{ enabled: false, label: "split-{pct}", time: "08:00", actionType: "bandwidth_split", {input} }}) {{ label actionType track splitUsenetPct }} }}"#
+            ))
+            .await;
+        common::assert_no_errors(&response);
+        let data = common::response_data(&response);
+        let rule = data["createSchedule"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|rule| rule["label"] == format!("split-{pct}"))
+            .cloned()
+            .unwrap();
+        assert_eq!(rule["actionType"], "bandwidth_split");
+        assert_eq!(rule["track"], "SPLIT");
+        assert_eq!(rule["splitUsenetPct"], pct);
+    }
+    common::assert_has_errors(
+        &h.execute(r#"mutation { createSchedule(input: { enabled: false, time: "08:00", actionType: "bandwidth_split", splitUsenetPct: 100 }) { id } }"#)
+            .await,
+    );
+}
+
+#[tokio::test]
+async fn class_pause_actions_round_trip_on_their_own_track() {
+    use weaver_server_core::bandwidth::ScheduleAction;
+    let h = TestHarness::new().await;
+    for (time, action) in [("22:00", "pause_class"), ("06:00", "resume_class")] {
+        let resp = h
+            .execute(&format!(
+                r#"mutation {{ createSchedule(input: {{ time: "{time}", actionType: "{action}", class: TORRENT }}) {{ actionType class track }} }}"#
+            ))
+            .await;
+        assert_no_errors(&resp);
+        let data = response_data(&resp);
+        let rules = data["createSchedule"].as_array().unwrap();
+        assert!(rules.iter().any(|rule| rule["actionType"] == action));
+        assert!(rules.iter().all(|rule| rule["track"] == "TORRENTS"));
+        assert!(rules.iter().all(|rule| rule["class"] == "TORRENT"));
+    }
+    let resp = h
+        .execute("{ schedules { time actionType class track } }")
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    let mut listed: Vec<(String, String)> = data["schedules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|rule| {
+            assert_eq!(rule["track"], "TORRENTS");
+            assert_eq!(rule["class"], "TORRENT");
+            (
+                rule["time"].as_str().unwrap().to_owned(),
+                rule["actionType"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    listed.sort();
+    assert_eq!(
+        listed,
+        [
+            ("06:00".to_owned(), "resume_class".to_owned()),
+            ("22:00".to_owned(), "pause_class".to_owned()),
+        ]
+    );
+    let mut persisted: Vec<ScheduleAction> =
+        h.db.list_schedules()
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.action)
+            .collect();
+    persisted.sort_by_key(|action| format!("{action:?}"));
+    assert_eq!(
+        persisted,
+        [
+            ScheduleAction::PauseClass {
+                class: weaver_server_core::torrents::CLASS,
+            },
+            ScheduleAction::ResumeClass {
+                class: weaver_server_core::torrents::CLASS,
+            },
+        ]
+    );
+    // A class with no hold of its own, a class action with no class, and a
+    // class on any other action are refused.
+    for input in [
+        r#"{ time: "08:00", actionType: "pause_class", class: NZB }"#,
+        r#"{ time: "08:00", actionType: "resume_class" }"#,
+        r#"{ time: "08:00", actionType: "pause", class: TORRENT }"#,
+        r#"{ time: "08:00", actionType: "pause_torrent" }"#,
+    ] {
+        common::assert_has_errors(
+            &h.execute(&format!(
+                "mutation {{ createSchedule(input: {input}) {{ id }} }}"
+            ))
+            .await,
+        );
+    }
 }

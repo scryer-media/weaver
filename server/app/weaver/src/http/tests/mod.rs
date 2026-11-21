@@ -15,6 +15,8 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast};
 use tower::ServiceExt;
 use weaver_server_core::Database;
+use weaver_server_core::auth::api_keys::AuthApiKeysQueries;
+use weaver_server_core::auth::repository::AuthRepositoryQueries;
 use weaver_server_core::auth::{self as jwt, JWT_TTL_SECS};
 use weaver_server_core::auth::{
     ApiKeyAuthRow, ApiKeyCache, CachedLoginAuth, CallerScope, LoginAuthCache, hash_api_key,
@@ -24,6 +26,7 @@ use weaver_server_core::events::model::PipelineEvent;
 use weaver_server_core::jobs::handle::{DownloadBlockKind, DownloadBlockState};
 use weaver_server_core::jobs::ids::JobId;
 use weaver_server_core::operations::metrics::PipelineMetrics;
+use weaver_server_core::post_processing::settings::PostProcessingSettingsQueries;
 use weaver_server_core::settings::model::{Config, SharedConfig};
 use weaver_server_core::{
     JobInfo, JobStatus, MetricsSnapshot, Par3MetricsSnapshot, SharedPipelineState,
@@ -152,6 +155,7 @@ fn nzbget_history_row(
     metadata: Option<String>,
 ) -> weaver_server_core::JobHistoryRow {
     weaver_server_core::JobHistoryRow {
+        protocol: weaver_server_core::Protocol::Nzb,
         job_id,
         job_hash: None,
         name: format!("History.Release.{job_id}"),
@@ -210,6 +214,9 @@ fn test_scheduler_handle() -> TestQueue {
 
 fn test_config() -> SharedConfig {
     Arc::new(RwLock::new(Config {
+        upload_cap: None,
+        seeding: None,
+        torrent: Default::default(),
         data_dir: "/tmp/weaver".to_string(),
         hardware_profile: None,
         intermediate_dir: None,
@@ -217,7 +224,7 @@ fn test_config() -> SharedConfig {
         servers: vec![],
         categories: vec![],
         retry: None,
-        max_download_speed: None,
+        bandwidth: Default::default(),
         cleanup_after_extract: None,
         delete_failed_job_files: None,
         history_retention_days: None,
@@ -409,6 +416,7 @@ fn nzbget_test_job(
     metadata: Vec<(String, String)>,
 ) -> JobInfo {
     JobInfo {
+        protocol: weaver_server_core::Protocol::Nzb,
         job_id: JobId(job_id),
         job_hash: None,
         name: "Silver.Horizon.S05.720p.BluRay.DD5.1.x264-WVR".into(),
@@ -445,6 +453,8 @@ fn nzbget_test_job(
         error: None,
         download_wait_reason: None,
         download_retry_at_epoch_ms: None,
+        disk_need_bytes: None,
+        disk_free_bytes: None,
         created_at_epoch_ms: 1_700_000_000_000.0,
         server_attribution: Vec::new(),
     }
@@ -876,6 +886,7 @@ fn populated_metrics_snapshot() -> MetricsSnapshot {
 
 fn sample_job(job_id: u64, name: &str, status: JobStatus) -> JobInfo {
     JobInfo {
+        protocol: weaver_server_core::Protocol::Nzb,
         job_id: JobId(job_id),
         job_hash: None,
         name: name.into(),
@@ -908,6 +919,8 @@ fn sample_job(job_id: u64, name: &str, status: JobStatus) -> JobInfo {
         error: None,
         download_wait_reason: None,
         download_retry_at_epoch_ms: None,
+        disk_need_bytes: None,
+        disk_free_bytes: None,
         created_at_epoch_ms: 1_700_000_000_000.0,
         server_attribution: Vec::new(),
     }
@@ -1011,10 +1024,19 @@ fn sample_schedules() -> weaver_server_core::bandwidth::schedule_metrics::Schedu
         actions: ActionKind::ALL
             .into_iter()
             .flat_map(|action| {
-                action.tracks().iter().flat_map(move |track| {
-                    ActionOutcome::ALL
-                        .into_iter()
-                        .map(move |outcome| (action, *track, outcome, 1))
+                let classes: Vec<_> = if action.over_class() {
+                    weaver_server_core::jobs::HeldClass::all()
+                        .map(Some)
+                        .collect()
+                } else {
+                    vec![None]
+                };
+                classes.into_iter().flat_map(move |class| {
+                    action.tracks().iter().flat_map(move |track| {
+                        ActionOutcome::ALL
+                            .into_iter()
+                            .map(move |outcome| (action, class, *track, outcome, 1))
+                    })
                 })
             })
             .collect(),
@@ -1042,6 +1064,7 @@ fn sample_network() -> weaver_server_core::proxies::network_metrics::NetworkMetr
     use weaver_server_core::proxies::network_metrics::{
         EgressHealthLabel, EgressMetrics, LegDialResult, LegMetrics, LegStateLabel,
         NetworkMetricsSnapshot, PROXY_KINDS, PoolMemberMetrics, PoolMetrics, RungStateLabel,
+        TunnelBytesMetrics,
     };
     NetworkMetricsSnapshot {
         legs: vec![
@@ -1081,6 +1104,7 @@ fn sample_network() -> weaver_server_core::proxies::network_metrics::NetworkMetr
             health_since_epoch_ms: 1_700_000_010_000,
             dials: LegDialResult::ALL.map(|result| (result, 3)),
             cooldowns: 2,
+            upload_bytes: 4_096,
         }],
         pools: vec![PoolMetrics {
             pool_id: 4,
@@ -1110,6 +1134,22 @@ fn sample_network() -> weaver_server_core::proxies::network_metrics::NetworkMetr
             .into_iter()
             .flat_map(|kind| [(kind, true, 1), (kind, false, 0)])
             .collect(),
+        tunnels: vec![
+            TunnelBytesMetrics {
+                egress_id: 2,
+                proxy_id: 11,
+                via: Vec::new(),
+                reserved_bytes: 120 * 1024 * 1024,
+                limit_bytes: 516 * 1024 * 1024,
+            },
+            TunnelBytesMetrics {
+                egress_id: 2,
+                proxy_id: 13,
+                via: vec![11, 12],
+                reserved_bytes: 40 * 1024 * 1024,
+                limit_bytes: 516 * 1024 * 1024,
+            },
+        ],
     }
 }
 
@@ -1139,6 +1179,20 @@ fn sample_tunnel() -> weaver_server_core::proxies::network_metrics::tunnel::Tunn
         rung_cooldowns: vec![1; RUNGS],
         rung_fallbacks: vec![2; RUNGS],
         revocations: 3,
+        socket_give_backs: 2,
+        socket_give_back_bytes: 4096,
+        socket_peers_dropped: 5,
+        socket_idle_retired: 6,
+    }
+}
+
+fn sample_dns() -> weaver_server_core::proxies::network_metrics::tunnel::DnsMetricsSnapshot {
+    use weaver_server_core::proxies::network_metrics::tunnel::DnsMetricsSnapshot;
+    use weaver_server_core::proxies::{TrustOutcome, WireKind};
+    DnsMetricsSnapshot {
+        wires: WireKind::ALL.into_iter().zip([7, 5, 3]).collect(),
+        trust: TrustOutcome::ALL.into_iter().zip([9, 6, 8, 1]).collect(),
+        dnssec_queries: 11,
     }
 }
 
@@ -1211,10 +1265,11 @@ fn manual_pause_block() -> DownloadBlockState {
         window_starts_at_epoch_ms: None,
         window_ends_at_epoch_ms: None,
         timezone_name: "MDT".into(),
-        scheduled_speed_limit: 4_096,
-        speed_limit_in_force: 4_096,
+        scheduled_speed_limit: Some(4_096),
+        speed_limit_in_force: Some(4_096),
         speed_limit_by_schedule: true,
         schedule_hold_reason: None,
+        disk_volumes: Vec::new(),
     }
 }
 
@@ -1343,6 +1398,7 @@ fn sample_job_lifecycle() -> instr::JobLifecycleMetricsSnapshot {
             .map(|outcome| (outcome.as_str(), 2u64))
             .collect(),
         repair_slices_repaired_total: 17,
+        jobs_repaired_total: 0,
         extractions: instr::StageOutcomeKind::ALL
             .iter()
             .map(|outcome| (outcome.as_str(), 1u64))
@@ -1430,6 +1486,7 @@ fn sample_volumes() -> Vec<instr::VolumeSnapshot> {
             buffered_bytes: 65_536,
             arrived_bytes: 4_096,
             counted_bytes: 69_632,
+            carried_bytes: 32_768,
             peak_bytes: 900_000,
             buffer_soft_bytes: 700_000,
             buffer_limit_bytes: 1_000_000,
@@ -1441,6 +1498,22 @@ fn sample_volumes() -> Vec<instr::VolumeSnapshot> {
                 loop_wait_nanos: 1_500_000_000,
                 loop_waits_by_kind: [1, 2, 0],
                 loop_wait_nanos_by_kind: [250_000_000, 1_250_000_000, 0],
+                // The read at `leaf_write`; the settles at `leaf_release`
+                // and `tail` (`instr::LOOP_WAIT_SITES`).
+                loop_waits_by_site: {
+                    let mut by = [[0; 32]; 3];
+                    by[0][0] = 1;
+                    by[1][1] = 1;
+                    by[1][3] = 1;
+                    by
+                },
+                loop_wait_nanos_by_site: {
+                    let mut by = [[0; 32]; 3];
+                    by[0][0] = 250_000_000;
+                    by[1][1] = 500_000_000;
+                    by[1][3] = 750_000_000;
+                    by
+                },
                 loop_reads: 6,
                 loop_read_nanos: 750_000_000,
                 aside_waits: 4,
@@ -1458,6 +1531,8 @@ fn sample_volumes() -> Vec<instr::VolumeSnapshot> {
                 length_sets_skipped: 8,
                 closes: 10,
                 close_nanos: 250_000_000,
+                write_outs: 7,
+                write_out_nanos: 1_750_000_000,
                 failed_operations: 2,
                 abandoned_operations: 5,
                 threads: 1,
@@ -1479,6 +1554,7 @@ fn sample_volumes() -> Vec<instr::VolumeSnapshot> {
             buffered_bytes: 0,
             arrived_bytes: 0,
             counted_bytes: 0,
+            carried_bytes: 0,
             peak_bytes: 0,
             buffer_soft_bytes: 0,
             buffer_limit_bytes: 0,
@@ -1520,6 +1596,7 @@ struct CollectionFixtures {
     process: instr::ProcessMetricsSnapshot,
     disk_space: Vec<instr::DiskSpaceSnapshot>,
     volumes: Vec<instr::VolumeSnapshot>,
+    holds: instr::HoldsMetricsSnapshot,
     http_metrics: instr::HttpMetricsSnapshot,
 }
 
@@ -1534,6 +1611,12 @@ impl CollectionFixtures {
             process: sample_process_metrics(),
             disk_space: sample_disk_space(),
             volumes: sample_volumes(),
+            holds: instr::HoldsMetricsSnapshot {
+                resident_bytes: 3_000,
+                resident_limit_bytes: 4_096,
+                resident_peak_bytes: 4_500,
+                resident_past_limit_bytes: 404,
+            },
             http_metrics: sample_http_metrics(),
         }
     }
@@ -1549,6 +1632,7 @@ impl CollectionFixtures {
         input.process = Some(&self.process);
         input.disk_space = &self.disk_space;
         input.volumes = &self.volumes;
+        input.holds = Some(&self.holds);
         input.http_metrics = Some(&self.http_metrics);
     }
 }
@@ -1567,6 +1651,359 @@ fn sample_speed_tests() -> weaver_server_core::speed_test::SpeedTestMetricsSnaps
     metrics
 }
 
+// Two torrents on one route: a seeding one with every figure, two trackers
+// and a seeding policy, and a magnet still fetching its metadata; one open
+// session with a DHT and one held route.
+/// A session's connection counts with a figure of its own in each family.
+fn sample_swarm() -> weaver_server_core::torrents::metrics::swarm::SwarmSnapshot {
+    use weaver_server_core::torrents::metrics::swarm::{
+        BlockArrival, ByteKind, ClosePhase, CloseReason, Direction, Encryption, MessageKind,
+        PeerSource, PieceCheck, PiecePick, RequestEvent, SwarmSnapshot, Transport, Waste,
+    };
+    let mut swarm = SwarmSnapshot::default();
+    swarm.messages[Direction::In as usize][MessageKind::Have as usize] = 410;
+    swarm.messages[Direction::In as usize][MessageKind::Piece as usize] = 4100;
+    swarm.messages[Direction::Out as usize][MessageKind::Request as usize] = 4200;
+    swarm.messages[Direction::Out as usize][MessageKind::Pex as usize] = 7;
+    swarm.handshakes[Transport::Utp as usize][Direction::In as usize][Encryption::Rc4 as usize] =
+        51;
+    swarm.closes[ClosePhase::Live as usize][CloseReason::PeerClosed as usize] = 52;
+    swarm.closes[ClosePhase::Connecting as usize][CloseReason::Timeout as usize] = 53;
+    swarm.bytes[Transport::Tcp as usize][Direction::In as usize][ByteKind::Payload as usize] = 5400;
+    swarm.bytes[Transport::Utp as usize][Direction::Out as usize][ByteKind::Protocol as usize] = 55;
+    swarm.request_events[RequestEvent::TimedOut as usize] = 56;
+    swarm.blocks[BlockArrival::Unrequested as usize] = 57;
+    swarm.piece_checks[PieceCheck::Failed as usize] = 58;
+    swarm.piece_picks[PiecePick::EndGame as usize] = 59;
+    swarm.wasted_bytes[Waste::CutShort as usize] = 60;
+    swarm.peers_named[PeerSource::Dht as usize] = 61;
+    swarm.pex_encrypted_skipped = 62;
+    swarm
+}
+
+fn sample_trackers() -> weaver_server_core::torrents::metrics::tracker::TrackerSnapshot {
+    use weaver_server_core::torrents::metrics::tracker::{
+        AnnounceEvent, TrackerKind, TrackerResult, TrackerSnapshot,
+    };
+
+    let mut trackers = TrackerSnapshot::default();
+    let (http, udp) = (TrackerKind::Http as usize, TrackerKind::Udp as usize);
+    trackers.announces[http][AnnounceEvent::Started as usize][TrackerResult::Ok as usize] = 70;
+    trackers.announces[udp][AnnounceEvent::Periodic as usize][TrackerResult::Timeout as usize] = 71;
+    trackers.announce_nanos = [2_500_000_000, 30_000_000_000];
+    trackers.peers = [72, 73];
+    trackers
+}
+
+fn sample_incoming() -> weaver_server_core::torrents::metrics::incoming::IncomingSnapshot {
+    use weaver_server_core::torrents::metrics::incoming::{IncomingEnd, IncomingSnapshot};
+    use weaver_server_core::torrents::metrics::swarm::Transport;
+
+    let mut incoming = IncomingSnapshot::default();
+    incoming.ends[Transport::Tcp as usize][IncomingEnd::Accepted as usize] = 85;
+    incoming.ends[Transport::Utp as usize][IncomingEnd::SessionLimit as usize] = 86;
+    incoming
+}
+
+fn sample_torrent_network() -> weaver_server_core::torrents::metrics::network::NetworkSnapshot {
+    use weaver_server_core::torrents::metrics::network::{
+        HolepunchEvent, NetworkSnapshot, PortMapResult, PortMapper,
+    };
+
+    let mut network = NetworkSnapshot::default();
+    network.port_maps[PortMapper::Upnp as usize][PortMapResult::Mapped as usize] = 93;
+    network.holepunch[HolepunchEvent::Introduced as usize] = 94;
+    network
+}
+
+fn sample_dht_counts() -> weaver_server_core::torrents::metrics::dht::DhtSnapshot {
+    use weaver_server_core::torrents::metrics::dht::{
+        DhtIgnored, DhtQuery, DhtQueryEnd, DhtSnapshot,
+    };
+
+    let mut dht = DhtSnapshot::default();
+    dht.sent[DhtQuery::GetPeers as usize] = 80;
+    dht.ended[DhtQuery::GetPeers as usize][DhtQueryEnd::Timeout as usize] = 81;
+    dht.received[DhtQuery::FindNode as usize] = 82;
+    dht.ignored[DhtIgnored::SourceLimit as usize] = 83;
+    dht.peers_found = 84;
+    dht
+}
+
+fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMetrics {
+    use weaver_server_core::torrents::metrics::{
+        FetchOutcome, Published, SeedingGoal, SeedingSeries, SessionSeries, TorrentEvent,
+        TorrentMetrics, TorrentSeries, TrackerSeries, UtpStatsSnapshot,
+    };
+    use weaver_server_core::torrents::service::TorrentPieces;
+    use weaver_server_core::torrents::{FetchPhase, TorrentState, TrackerStatus};
+
+    let seeding = TorrentSeries {
+        job_id: JobId(7),
+        category: "linux".into(),
+        route: "00aa11bb22cc33dd".into(),
+        state: TorrentState::Seeding,
+        have_bytes: 4096,
+        total_bytes: 8192,
+        wanted_bytes: 4096,
+        pieces: Some(TorrentPieces {
+            count: 8,
+            size: 1024,
+            have: 4,
+        }),
+        downloaded_bytes: 5000,
+        uploaded_bytes: 12_500,
+        hash_failed_bytes: 1024,
+        redundant_bytes: 16,
+        active_seconds: 900,
+        seeding_seconds: 600,
+        consecutive_seeding_seconds: 300,
+        download_bps: 0,
+        upload_bps: 2048,
+        ratio: 2.5,
+        peers_established: 6,
+        peers_connecting: 2,
+        peer_seeders: 1,
+        leg: Some(("torrent:category:3".into(), 1)),
+        fetch: None,
+        seeding: SeedingSeries {
+            goals: vec![
+                (SeedingGoal::Ratio, 3.0, 0.5),
+                (SeedingGoal::SeedTime, 3600.0, 3000.0),
+            ],
+            met: false,
+        },
+        trackers: vec![
+            TrackerSeries {
+                host: "tracker.example".into(),
+                status: TrackerStatus::Working,
+                last_announce_ms: Some(1_700_000_000_000),
+                next_announce_ms: Some(1_700_001_800_500),
+                interval_seconds: Some(1800),
+                seeders: Some(40),
+                leechers: Some(3),
+                completed: Some(912),
+                fails: 0,
+            },
+            TrackerSeries {
+                host: "backup.example".into(),
+                status: TrackerStatus::Unreachable,
+                last_announce_ms: None,
+                next_announce_ms: None,
+                interval_seconds: None,
+                seeders: None,
+                leechers: None,
+                completed: None,
+                fails: 4,
+            },
+        ],
+    };
+    let magnet = TorrentSeries {
+        job_id: JobId(8),
+        category: String::new(),
+        route: "00aa11bb22cc33dd".into(),
+        state: TorrentState::FetchingMetadata,
+        have_bytes: 0,
+        total_bytes: 0,
+        wanted_bytes: 0,
+        pieces: None,
+        downloaded_bytes: 0,
+        uploaded_bytes: 0,
+        hash_failed_bytes: 0,
+        redundant_bytes: 0,
+        active_seconds: 12,
+        seeding_seconds: 0,
+        consecutive_seeding_seconds: 0,
+        download_bps: 0,
+        upload_bps: 0,
+        ratio: 0.0,
+        peers_established: 0,
+        peers_connecting: 3,
+        peer_seeders: 0,
+        leg: None,
+        fetch: Some(FetchPhase::Discovery),
+        seeding: SeedingSeries::default(),
+        trackers: Vec::new(),
+    };
+    let open = SessionSeries {
+        route: "00aa11bb22cc33dd".into(),
+        open: true,
+        listen_port: Some(6881),
+        external_addresses: 1,
+        external_ips: vec!["203.0.113.7".parse().unwrap()],
+        uptime_seconds: 1200,
+        received_payload_bytes: 5000,
+        received_protocol_bytes: 700,
+        sent_payload_bytes: 12_500,
+        sent_protocol_bytes: 900,
+        blocked_incoming: 2,
+        blocked_outgoing: 5,
+        utp: UtpStatsSnapshot {
+            delay_samples_above_target: 11,
+            delay_samples_below_target: 12,
+            packets_lost: 13,
+            timeouts: 14,
+            invalid_packets: 15,
+            redundant_packets: 16,
+            syn_flood_dropped: 33,
+            syn_rst: 34,
+            immediate_acks: 17,
+            delayed_acks: 18,
+            window_update_acks: 19,
+            ack_packets_sent: 20,
+            data_packets_received: 21,
+            data_packets_sent: 28,
+            sent_control_packets: 22,
+            send_window_exhausted: 23,
+            data_retransmissions: 24,
+            duplicate_acks_received: 25,
+            out_of_order_packets: 26,
+            max_congestion_window_bytes: 27,
+            streams_given_up: 29,
+            receive_drains: 30,
+            streams_marked: 31,
+            drain_marks_with_packets_queued: 32,
+            acks_with_sack: 33,
+            data_packets_with_sack: 34,
+            sack_bytes_sent: 35,
+            sacks_received: 36,
+            sack_bits_received: 37,
+            duplicate_acks_sent: 38,
+            receive_cuts: 39,
+            send_runs: 40,
+            send_run_datagrams: 41,
+            send_run_errors: 42,
+            receive_calls: 43,
+            receive_call_datagrams: 44,
+            send_batches: 45,
+            send_batch_datagrams: 46,
+            datagrams_too_long: 47,
+            send_batch_errors: 48,
+        },
+        peers: vec![
+            ("established", 6),
+            ("connecting", 5),
+            ("queued", 9),
+            ("dead", 4),
+            ("not_needed", 1),
+        ],
+        connects: vec![
+            ("tcp", "v4", [30, 20, 3, 4, 2, 1]),
+            ("tcp", "v6", [0, 0, 0, 0, 0, 0]),
+            ("utp", "v4", [12, 7, 0, 0, 5, 0]),
+            ("utp", "v6", [0, 0, 0, 0, 0, 0]),
+        ],
+        dht: Some((150, 20, 6)),
+        swarm: sample_swarm(),
+        trackers: sample_trackers(),
+        dht_counts: sample_dht_counts(),
+        incoming: sample_incoming(),
+        unchoke_slots_held: 87,
+        network: sample_torrent_network(),
+        lsd: Some(
+            weaver_server_core::torrents::metrics::network::LsdSnapshot {
+                sent: 95,
+                received: 96,
+                peers_found: 97,
+            },
+        ),
+        limiter: weaver_server_core::torrents::metrics::network::LimiterSnapshot {
+            waits: [98, 99],
+            wait_nanos: [1_500_000_000, 0],
+        },
+        web_seeds: weaver_server_core::torrents::metrics::web_seed::WebSeedSnapshot {
+            requests: [88, 0, 0, 89, 0, 0],
+            bytes: 90,
+            waits: 91,
+            failed: 92,
+        },
+        connected: weaver_server_core::torrents::metrics::ConnectedPeers {
+            tcp: 4,
+            utp: 2,
+            seeders: 3,
+        },
+        piece_steals: 8,
+        untracked_dropped: 9,
+        outgoing_encryption: [50, 30, 6, 4, 3],
+        disk: {
+            use weaver_server_core::torrents::metrics::{
+                DiskOp, DiskOpSnapshot, DiskStatsSnapshot, SocketSnapshot, Transport,
+            };
+            let mut disk = DiskStatsSnapshot {
+                upload_read_blocks: [64, 32],
+                permit_acquisitions: 50,
+                permit_waits: 7,
+                permit_wait_nanos: 250_000_000,
+                permits_in_use: 3,
+                permits: 8,
+                write_jobs_queued: 4,
+                hash_jobs_queued: 1,
+                read_jobs_queued: 2,
+                queued_write_bytes: 65_536,
+                peers_stopped: 9,
+                peers_resumed: 8,
+                check_waits: 40,
+                check_wait_nanos: 2_000_000_000,
+                check_pieces_waiting: 5,
+                check_bytes_waiting: 5_242_880,
+                hash_busy_nanos: 3_500_000_000,
+                read_buffer_growths: 6,
+                batch_buffers: 2,
+                receive_buffers: 3,
+                read_seeks: 12,
+                write_seeks: 5,
+                ..Default::default()
+            };
+            disk.ops[DiskOp::PieceWrite.index()] = DiskOpSnapshot {
+                calls: 39,
+                bytes: 4_096_000,
+                nanos: 1_500_000_000,
+                in_flight: 1,
+                most_in_flight: 3,
+            };
+            disk.sockets[Transport::Tcp as usize] = SocketSnapshot {
+                receive_calls: 100,
+                send_calls: 60,
+                request_sends: 12,
+                requests_sent: 96,
+            };
+            disk
+        },
+    };
+    let held = SessionSeries {
+        route: "ff00ee11dd22cc33".into(),
+        ..SessionSeries::default()
+    };
+    TorrentMetrics {
+        published: Arc::new(Published {
+            torrents: vec![seeding, magnet],
+            sessions: vec![open, held],
+        }),
+        events: vec![
+            (TorrentEvent::Added, 5),
+            (TorrentEvent::Completed, 3),
+            (TorrentEvent::Removed, 1),
+            (TorrentEvent::Failed, 0),
+        ],
+        fetches: vec![
+            (FetchOutcome::Resolved, 2),
+            (FetchOutcome::Failed, 1),
+            (FetchOutcome::NoSession, 0),
+            (FetchOutcome::Cancelled, 1),
+        ],
+        check: weaver_server_core::torrents::metrics::CheckSeries {
+            read_calls: 100,
+            read_bytes: 101,
+            read_nanos: 2_250_000_000,
+            read_seeks: 102,
+            pieces_hashed: 103,
+            hash_nanos: 500_000_000,
+            seed_checks_started: 104,
+            seed_checks_joined: 105,
+        },
+    }
+}
+
 fn fully_populated_render() -> String {
     let snapshot = populated_metrics_snapshot();
     let block = manual_pause_block();
@@ -1581,7 +2018,9 @@ fn fully_populated_render() -> String {
     let schedules = sample_schedules();
     let network = sample_network();
     let tunnel = sample_tunnel();
+    let dns = sample_dns();
     let speed_tests = sample_speed_tests();
+    let torrents = sample_torrent_metrics();
     let collection = CollectionFixtures::new();
 
     let mut input = metrics::PrometheusRenderInput::new(&snapshot, &block);
@@ -1597,7 +2036,11 @@ fn fully_populated_render() -> String {
     input.schedules = Some(&schedules);
     input.network = Some(&network);
     input.tunnel = Some(&tunnel);
+    input.dns = Some(&dns);
     input.speed_tests = Some(&speed_tests);
+    input.torrents = Some(&torrents);
+    // The fixture's seeding torrent has series of its own only under `All`.
+    input.per_job_series = weaver_server_core::settings::PerJobSeries::All;
     input.runtime_generation = 3;
     input.start_time_seconds = 1_700_000_000.0;
     collection.apply(&mut input);
@@ -1635,6 +2078,7 @@ mod nzbget_version_uses_jsonrpc;
 mod renders_prometheus_metrics_for;
 mod restart_handler_tests;
 mod setup_handler_tests;
+mod torrent_graphql;
 
 #[tokio::test]
 async fn stored_backup_create_challenges_only_expired_administrators() {

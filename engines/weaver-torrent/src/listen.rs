@@ -1,0 +1,573 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+//
+// Derived from rqbit (https://github.com/ikatson/rqbit), Copyright 2021 Igor Katson,
+// licensed under the Apache License 2.0 (see LICENSE-APACHE). Modified by the
+// Weaver authors from 2026-10-20 onward.
+
+use std::{
+    net::{Ipv6Addr, SocketAddr},
+    sync::Arc,
+};
+
+use anyhow::Context;
+use futures::future::BoxFuture;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info};
+
+use crate::{
+    network::{DatagramTransport, DhtShare, DhtTap, SocketFactory, StreamListener, UtpSocket},
+    stream_connect::{ConnectionKind, Link},
+};
+
+/// Why a session failed to build when its listeners could not start: a
+/// port of theirs could not be bound.
+#[derive(Debug, Clone, Copy)]
+pub struct ListenFailed;
+
+impl std::fmt::Display for ListenFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("error starting listeners")
+    }
+}
+
+/// A listener's sockets, and the address they took.
+pub(crate) struct Listening {
+    pub tcp_socket: Option<Box<dyn StreamListener>>,
+    pub utp_socket: Option<UtpSocket>,
+    pub addr: SocketAddr,
+}
+
+/// A bound listener's sockets, and the datagram socket of its uTP socket the
+/// DHT may share, on the session's peer listener.
+struct Bound {
+    listening: Listening,
+    dht_share: Option<DhtShare>,
+}
+
+pub(crate) struct ListenResult {
+    /// The SSL listener: SSL torrents' peers connect to it, TLS from their
+    /// first byte.
+    pub ssl: Option<Listening>,
+    /// The TCP listener the session's `SocketFactory` opened.
+    pub tcp_socket: Option<Box<dyn StreamListener>>,
+    pub utp_socket: Option<UtpSocket>,
+    /// The datagram socket of the peer listener's uTP socket, for the DHT
+    /// to share when it runs on the same port: one UDP socket on a port,
+    /// never two.
+    pub dht_share: Option<DhtShare>,
+    pub enable_upnp_port_forwarding: bool,
+    pub addr: SocketAddr,
+    /// The port told to trackers and the DHT: the one set in the options,
+    /// else the listen port, and none on a loopback address with none set.
+    pub announce_port: Option<u16>,
+    /// The announce port was set in the options: a port a gateway maps does
+    /// not replace it (libtorrent `session_impl::queue_tracker_request`).
+    pub announce_port_set: bool,
+    pub max_pending_incoming_handshake_checks: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ListenerMode {
+    TcpOnly,
+    UtpOnly,
+    TcpAndUtp,
+}
+
+pub const DEFAULT_MAX_PENDING_INCOMING_HANDSHAKE_CHECKS: usize = 256;
+
+impl ListenerMode {
+    pub fn tcp_enabled(&self) -> bool {
+        match self {
+            ListenerMode::TcpOnly => true,
+            ListenerMode::UtpOnly => false,
+            ListenerMode::TcpAndUtp => true,
+        }
+    }
+
+    pub fn utp_enabled(&self) -> bool {
+        match self {
+            ListenerMode::TcpOnly => false,
+            ListenerMode::UtpOnly => true,
+            ListenerMode::TcpAndUtp => true,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ListenerOptions {
+    pub mode: ListenerMode,
+    pub listen_addr: SocketAddr,
+    pub enable_upnp_port_forwarding: bool,
+    pub utp_opts: Option<weaver_utp::SocketOpts>,
+    pub announce_port: Option<u16>,
+    pub ipv4_only: bool,
+    pub max_pending_incoming_handshake_checks: usize,
+    /// The port of the SSL listener, on the listen address, over the same
+    /// transports; 0 takes any free port. `None` opens none, and SSL
+    /// torrents then take no incoming connection.
+    pub ssl_listen_port: Option<u16>,
+}
+
+impl Default for ListenerOptions {
+    fn default() -> Self {
+        Self {
+            // TODO: once uTP is stable upgrade default to both
+            mode: ListenerMode::TcpOnly,
+            listen_addr: (Ipv6Addr::UNSPECIFIED, 0).into(),
+            enable_upnp_port_forwarding: false,
+            utp_opts: None,
+            announce_port: None,
+            ipv4_only: false,
+            max_pending_incoming_handshake_checks: DEFAULT_MAX_PENDING_INCOMING_HANDSHAKE_CHECKS,
+            ssl_listen_port: None,
+        }
+    }
+}
+
+impl ListenerOptions {
+    /// Bind the listener's sockets. Its uTP socket's receive buffer holds a
+    /// receive window for each of the `connections_limit` connections the
+    /// session may hold, as far as the host allows.
+    pub(crate) async fn start(
+        mut self,
+        parent_span: Option<tracing::Id>,
+        cancellation_token: CancellationToken,
+        socket_factory: &Arc<dyn SocketFactory>,
+        connection_slots: &crate::connection_slots::ConnectionSlots,
+    ) -> anyhow::Result<ListenResult> {
+        let receive_buffer = crate::udp_options::receive_buffer_for(connection_slots.limit());
+        let mut utp_opts = self.utp_opts.take().unwrap_or_default();
+        utp_opts.cancellation_token = cancellation_token.clone();
+        utp_opts.parent_span = parent_span;
+        utp_opts.dont_wait_for_lastack = true;
+
+        let listen_addr = if self.ipv4_only {
+            if self.listen_addr.is_ipv6() && self.listen_addr.ip().is_unspecified() {
+                // Force to IPv4 unspecified if IPv6 unspecified was requested but we are v4 only
+                SocketAddr::from(([0, 0, 0, 0], self.listen_addr.port()))
+            } else {
+                self.listen_addr
+            }
+        } else {
+            self.listen_addr
+        };
+
+        let bound = bind(
+            self.mode,
+            listen_addr,
+            utp_opts.clone(),
+            receive_buffer,
+            socket_factory,
+            true,
+            connection_slots,
+        )
+        .await?;
+        let dht_share = bound.dht_share;
+        let listen_addr = bound.listening.addr;
+        let (tcp_socket, utp_socket) = (bound.listening.tcp_socket, bound.listening.utp_socket);
+
+        let ssl = match self.ssl_listen_port {
+            Some(port) => Some(
+                bind(
+                    self.mode,
+                    SocketAddr::new(listen_addr.ip(), port),
+                    utp_opts,
+                    receive_buffer,
+                    socket_factory,
+                    false,
+                    connection_slots,
+                )
+                .await
+                .context("error starting the SSL listener")?
+                .listening,
+            ),
+            None => None,
+        };
+        if let Some(ssl) = &ssl {
+            info!(addr = ?ssl.addr, "Listening for SSL torrents' peers");
+        }
+
+        let announce_port = if let Some(p) = self.announce_port {
+            Some(p)
+        } else if listen_addr.ip().is_loopback() {
+            None
+        } else {
+            Some(listen_addr.port())
+        };
+        Ok(ListenResult {
+            ssl,
+            tcp_socket,
+            utp_socket,
+            dht_share,
+            announce_port,
+            announce_port_set: self.announce_port.is_some(),
+            addr: listen_addr,
+            enable_upnp_port_forwarding: self.enable_upnp_port_forwarding,
+            max_pending_incoming_handshake_checks: self.max_pending_incoming_handshake_checks,
+        })
+    }
+}
+
+// A listener's sockets on `listen_addr`, as `mode` says; a port of 0 takes
+// TCP's free port, and uTP binds the port TCP took. A port TCP chose that a
+// datagram socket already holds is given up for another, as a socket pair is
+// (`network::bind_pair`); the listeners given up stay open until uTP binds,
+// so TCP never chooses one again. A port the caller names is never given
+// up: uTP there fails, and the listener goes on over TCP alone. The
+// session's `peers` listener is the one
+// a factory's forwarded port reaches, and its uTP socket's datagram socket is
+// kept for the DHT to share. Its uTP socket asks for a receive buffer of
+// `receive_buffer` bytes.
+async fn bind(
+    mode: ListenerMode,
+    asked_addr: SocketAddr,
+    utp_opts: weaver_utp::SocketOpts,
+    receive_buffer: usize,
+    factory: &Arc<dyn SocketFactory>,
+    peers: bool,
+    connection_slots: &crate::connection_slots::ConnectionSlots,
+) -> anyhow::Result<Bound> {
+    let mut given_up = Vec::new();
+    loop {
+        let mut listen_addr = asked_addr;
+        let tcp_socket = if mode.tcp_enabled() {
+            let listening = if peers {
+                factory.listen_peers_tcp(listen_addr)
+            } else {
+                factory.listen_tcp(listen_addr)
+            };
+            let listener = listening.await.context("error starting TCP listener")?;
+            listen_addr = listener.local_addr();
+            Some(listener)
+        } else {
+            None
+        };
+
+        let (utp_socket, dht_share) = if mode.utp_enabled() {
+            match bind_shared_utp(
+                factory.as_ref(),
+                listen_addr,
+                utp_opts.clone(),
+                receive_buffer,
+                Some(connection_slots),
+                peers,
+            )
+            .await
+            {
+                Ok((sock, share)) => {
+                    // A TCP listener's address stays the session's: a
+                    // tunnel's forwarded port reaches TCP, and a uTP socket
+                    // the factory placed elsewhere does not move it.
+                    if tcp_socket.is_none() {
+                        listen_addr = sock.bind_addr();
+                    }
+                    info!(
+                        "Listening on UDP {:?} for incoming uTP peer connections",
+                        sock.bind_addr()
+                    );
+                    (Some(sock), share)
+                }
+                Err(e)
+                    if asked_addr.port() == 0
+                        && given_up.len() + 1 < crate::network::PAIR_ATTEMPTS
+                        && is_addr_in_use(&e) =>
+                {
+                    if let Some(listener) = tcp_socket {
+                        debug!("UDP {listen_addr:?} is in use; the listener takes another port");
+                        given_up.push(listener);
+                        continue;
+                    }
+                    return Err(e);
+                }
+                Err(e) if tcp_socket.is_some() => {
+                    // If we listen over TCP, it's not a fatal error if we can't listen over uTP.
+                    tracing::error!("Error listening on UDP {listen_addr:?}: {e:#}");
+                    (None, None)
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            (None, None)
+        };
+        if let Some(listener) = &tcp_socket {
+            info!(
+                "Listening on TCP {:?} for incoming peer connections",
+                listener.local_addr()
+            );
+        }
+
+        return Ok(Bound {
+            listening: Listening {
+                tcp_socket,
+                utp_socket,
+                addr: listen_addr,
+            },
+            dht_share,
+        });
+    }
+}
+
+// Whether `error` says the address was already in use.
+fn is_addr_in_use(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::AddrInUse)
+    })
+}
+
+/// A uTP socket over a datagram socket `factory` binds for uTP on
+/// `listen_addr`, asking for a receive buffer of `receive_buffer` bytes.
+pub(crate) async fn bind_utp(
+    factory: &dyn SocketFactory,
+    listen_addr: SocketAddr,
+    utp_opts: weaver_utp::SocketOpts,
+    receive_buffer: usize,
+    connection_slots: Option<&crate::connection_slots::ConnectionSlots>,
+) -> anyhow::Result<UtpSocket> {
+    bind_shared_utp(
+        factory,
+        listen_addr,
+        utp_opts,
+        receive_buffer,
+        connection_slots,
+        false,
+    )
+    .await
+    .map(|(socket, _)| socket)
+}
+
+// A uTP socket as `bind_utp` binds it, and its datagram socket for the DHT
+// to share when `shared`.
+async fn bind_shared_utp(
+    factory: &dyn SocketFactory,
+    listen_addr: SocketAddr,
+    utp_opts: weaver_utp::SocketOpts,
+    receive_buffer: usize,
+    connection_slots: Option<&crate::connection_slots::ConnectionSlots>,
+    shared: bool,
+) -> anyhow::Result<(UtpSocket, Option<DhtShare>)> {
+    // Bound on the session's runtime: the factory's own tasks (a tunnel's
+    // send worker, a proxy's association) live there. A kernel socket is
+    // registered by uTP with the uTP thread its I/O runs on; the DHT
+    // sharing it holds those threads, so they outlive the uTP socket.
+    let transport = factory
+        .bind_utp(listen_addr, receive_buffer)
+        .await
+        .context("error binding UDP socket")?;
+    let share = shared.then(|| DhtShare {
+        socket: Arc::clone(&transport),
+        tap: Arc::new(DhtTap::default()),
+        shards: utp_opts.shards.clone(),
+    });
+    let tap = share.as_ref().map(|share| Arc::clone(&share.tap));
+    let sock = weaver_utp::UtpSocket::new_with_opts_and_init(
+        DatagramTransport(transport, tap),
+        Default::default(),
+        utp_opts,
+        |socket| {
+            if let Some(slots) = connection_slots {
+                slots.register_utp(&UtpSocket(Arc::clone(socket)));
+            }
+        },
+    )?;
+    Ok((UtpSocket(sock), share))
+}
+
+impl Listening {
+    /// One acceptor for each socket the listener's mode bound, TCP's first:
+    /// the session runs one accept task for each.
+    pub(crate) fn acceptors(self) -> Vec<Box<dyn PeerAcceptor>> {
+        let tcp = self
+            .tcp_socket
+            .map(|listener| Box::new(listener) as Box<dyn PeerAcceptor>);
+        let utp = self
+            .utp_socket
+            .map(|socket| Box::new(socket) as Box<dyn PeerAcceptor>);
+        tcp.into_iter().chain(utp).collect()
+    }
+}
+
+/// Takes the connections peers open to one of a listener's sockets.
+pub(crate) trait Accept: Send + Sync {
+    const KIND: ConnectionKind;
+
+    /// Whether `error` says the listener is gone for good, so no later
+    /// accept can succeed.
+    fn is_closed(_error: &anyhow::Error) -> bool {
+        false
+    }
+
+    /// The next connection a peer opened.
+    fn accept(&self) -> impl Future<Output = anyhow::Result<Link>> + Send;
+}
+
+/// An [`Accept`] as the session's accept task holds it, whatever its
+/// transport. It is reached once per accept, never per message or packet.
+pub(crate) trait PeerAcceptor: Send + Sync {
+    fn kind(&self) -> ConnectionKind;
+
+    /// As [`Accept::is_closed`].
+    fn is_closed(&self, error: &anyhow::Error) -> bool;
+
+    /// As [`Accept::accept`].
+    fn accept(&self) -> BoxFuture<'_, anyhow::Result<Link>>;
+}
+
+impl<A: Accept> PeerAcceptor for A {
+    fn kind(&self) -> ConnectionKind {
+        A::KIND
+    }
+
+    fn is_closed(&self, error: &anyhow::Error) -> bool {
+        A::is_closed(error)
+    }
+
+    fn accept(&self) -> BoxFuture<'_, anyhow::Result<Link>> {
+        Box::pin(Accept::accept(self))
+    }
+}
+
+impl Accept for Box<dyn StreamListener + '_> {
+    const KIND: ConnectionKind = ConnectionKind::Tcp;
+
+    async fn accept(&self) -> anyhow::Result<Link> {
+        let (remote, read, write) = StreamListener::accept(self.as_ref())
+            .await
+            .context("error accepting TCP")?;
+        Ok(Link::new(Self::KIND, remote, read, write, None))
+    }
+}
+
+impl Accept for UtpSocket {
+    const KIND: ConnectionKind = ConnectionKind::Utp;
+
+    // The socket's dispatcher ended: the socket was shut down, or died.
+    fn is_closed(error: &anyhow::Error) -> bool {
+        matches!(
+            error.downcast_ref::<weaver_utp::Error>(),
+            Some(weaver_utp::Error::DispatcherDead | weaver_utp::Error::TaskCancelled)
+        )
+    }
+
+    async fn accept(&self) -> anyhow::Result<Link> {
+        let stream = self.accept().await.context("error accepting uTP")?;
+        let remote = stream.remote_addr();
+        let home = stream.home().cloned();
+        let (read, write) = stream.split();
+        Ok(Link::new(
+            Self::KIND,
+            remote,
+            Box::new(read),
+            Box::new(write),
+            home,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+
+    use super::*;
+
+    // Each listener mode binds the sockets it did, and gives one acceptor for
+    // each, TCP's first; the session test
+    // `each_listener_mode_runs_one_accept_task_per_socket` proves the tasks
+    // it runs for them.
+    #[tokio::test]
+    async fn each_mode_gives_one_acceptor_for_each_socket_it_binds() {
+        use ConnectionKind::{Tcp, Utp};
+        let factory = crate::test_support::socket_factory();
+        let slots = crate::connection_slots::ConnectionSlots::new(
+            8,
+            0,
+            std::num::NonZeroU32::new(10).unwrap(),
+        );
+        for (mode, kinds) in [
+            (ListenerMode::TcpOnly, &[Tcp][..]),
+            (ListenerMode::UtpOnly, &[Utp]),
+            (ListenerMode::TcpAndUtp, &[Tcp, Utp]),
+        ] {
+            let listening = bind(
+                mode,
+                (Ipv4Addr::LOCALHOST, 0).into(),
+                Default::default(),
+                crate::udp_options::STREAM_WINDOW,
+                &factory,
+                false,
+                &slots,
+            )
+            .await
+            .unwrap()
+            .listening;
+            assert_eq!(
+                (
+                    listening.tcp_socket.is_some(),
+                    listening.utp_socket.is_some()
+                ),
+                (mode.tcp_enabled(), mode.utp_enabled()),
+                "{mode:?}"
+            );
+            let acceptors: Vec<_> = listening
+                .acceptors()
+                .iter()
+                .map(|acceptor| acceptor.kind())
+                .collect();
+            assert_eq!(acceptors, kinds, "{mode:?}");
+        }
+    }
+
+    // A uTP socket that shut down tells its accept loop it is gone, which
+    // then ends instead of retrying; any other accept error is retried.
+    #[tokio::test]
+    async fn an_accept_on_a_shut_down_utp_socket_reports_the_listener_closed() {
+        let sock = bind_utp(
+            crate::test_support::socket_factory().as_ref(),
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            Default::default(),
+            crate::udp_options::STREAM_WINDOW,
+            None,
+        )
+        .await
+        .unwrap();
+        sock.shutdown().await.unwrap();
+        let Err(error) = Accept::accept(&sock).await else {
+            panic!("accepted on a shut down socket");
+        };
+        assert!(<UtpSocket as Accept>::is_closed(&error), "{error:#}");
+        assert!(!<UtpSocket as Accept>::is_closed(&anyhow::anyhow!(
+            "too many open files"
+        )));
+    }
+    // The DHT sharing a uTP socket's datagram socket still sends on it after
+    // the uTP socket has shut down and gone: the uTP thread the socket's I/O
+    // is registered on runs while the DHT holds the socket.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_dht_sends_on_a_shared_socket_after_utp_ends() {
+        let opts = weaver_utp::SocketOpts {
+            shards: Some(weaver_utp::Shards::new("utp-dht-share", 1)),
+            ..Default::default()
+        };
+        let (sock, share) = bind_shared_utp(
+            crate::test_support::socket_factory().as_ref(),
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            opts,
+            crate::udp_options::STREAM_WINDOW,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        let dht = share.unwrap().dht_socket();
+        sock.shutdown().await.unwrap();
+        drop(sock);
+
+        let peer = crate::test_support::loopback_udp().await;
+        dht.send_to(b"ping", peer.bind_addr()).await.unwrap();
+        let mut buf = [0u8; 16];
+        let (len, from) = peer.recv_from(&mut buf).await.unwrap();
+        assert_eq!((&buf[..len], from), (&b"ping"[..], dht.bind_addr()));
+    }
+}

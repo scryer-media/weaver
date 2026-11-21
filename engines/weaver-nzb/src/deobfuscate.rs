@@ -62,7 +62,7 @@ pub fn is_obfuscated(filename: &str) -> bool {
     }
 
     // Clear-naming signals: if the name looks like a real release or title,
-    // it's not obfuscated. Adapted from SABnzbd's explicit false returns.
+    // it's not obfuscated.
     if is_clearly_named(bare) {
         return false;
     }
@@ -78,14 +78,14 @@ pub fn is_obfuscated(filename: &str) -> bool {
         }
     }
 
-    // Known obfuscator prefixes (NZBGet patterns)
+    // Known obfuscator prefixes
     let lower_bare = bare.to_ascii_lowercase();
     if lower_bare.starts_with("abc.xyz.") || lower_bare.starts_with("b00bs.") {
         return true;
     }
 
-    // Pure hex (with optional dots), 16+ hex chars: almost certainly a hash.
-    // Matches NZBGet's `[0-9a-f.]{16}` pattern.
+    // Pure hex (with optional dots), 16+ hex chars: almost certainly a hash
+    // (`[0-9a-f.]{16}`).
     {
         let hex_chars: usize = bare.chars().filter(|c| c.is_ascii_hexdigit()).count();
         let all_hex_or_dot = bare.chars().all(|c| c.is_ascii_hexdigit() || c == '.');
@@ -125,7 +125,7 @@ pub fn is_obfuscated(filename: &str) -> bool {
         }
     }
 
-    // Backup_NNNNN_SNN-NN pattern (NZBGet: `Backup_[0-9]{5,}S[0-9]{2}-[0-9]{2}`)
+    // Backup_NNNNN_SNN-NN pattern (`Backup_[0-9]{5,}S[0-9]{2}-[0-9]{2}`)
     if let Some(rest) = bare.strip_prefix("Backup_") {
         let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
         if digits.len() >= 5 {
@@ -141,7 +141,7 @@ pub fn is_obfuscated(filename: &str) -> bool {
         }
     }
 
-    // Timestamp-like: NNNNNN_NN (NZBGet: `[0-9]{6}_[0-9]{2}`)
+    // Timestamp-like: NNNNNN_NN (`[0-9]{6}_[0-9]{2}`)
     if bare.len() >= 9 {
         let parts: Vec<&str> = bare.splitn(2, '_').collect();
         if parts.len() == 2
@@ -154,7 +154,7 @@ pub fn is_obfuscated(filename: &str) -> bool {
         }
     }
 
-    // Bracketed tags wrapping a hex hash (SABnzbd pattern):
+    // Bracketed tags wrapping a hex hash:
     // e.g. "[BlaBla] something [More] b2.bef89a622e4a23f07b0d3757ad5e8a.a0 [Brrr]"
     // If there are 30+ contiguous hex+dot characters anywhere in the string, it's obfuscated.
     {
@@ -207,13 +207,149 @@ pub fn extract_filename(subject: &str) -> Option<(String, f32)> {
 
 // Strategy 1: Extract filename from double-quoted string.
 fn extract_quoted(subject: &str) -> Option<String> {
-    let first = subject.find('"')?;
-    let second = subject[first + 1..].find('"')?;
-    let name = &subject[first + 1..first + 1 + second];
-    if name.is_empty() {
+    quoted_name(subject).map(str::to_string)
+}
+
+// The first closed quote pair of a subject that holds more than spaces,
+// with the spaces trimmed (`"([^"]*)"`, then `strip(' "')`). A quote mark is never part of a name:
+// an unpaired one is left to the later strategies, which split on it.
+pub(crate) fn quoted_name(subject: &str) -> Option<&str> {
+    let mut runs = subject.split('"');
+    runs.next();
+    loop {
+        let inside = runs.next()?;
+        // The pair is closed only when a quote follows the run.
+        runs.next()?;
+        let name = inside.trim_matches(' ');
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+}
+
+// The last word of `text`, words split by whitespace and by quote marks, so
+// an unpaired quote (`name.mkv.001" yEnc`) is never part of the word. A
+// quote escaped twice in the NZB (`&amp;quot;`) reaches here as the text
+// `&quot;` once the XML is read, and is a quote mark too: a filename word
+// has neither `&` nor `;` in it, so `&quot;Show.Name.mkv&quot;` names `Show.Name.mkv`.
+pub(crate) fn last_word(text: &str) -> Option<&str> {
+    text.rsplit(|ch: char| ch.is_whitespace() || ch == '"')
+        .find_map(|word| word.rsplit(ESCAPED_QUOTE).find(|piece| !piece.is_empty()))
+}
+
+// A quote mark as an NZB escaped twice leaves it once read.
+const ESCAPED_QUOTE: &str = "&quot;";
+
+// Whether a file posted as `posted` takes the name its article header gives
+// (`=ybegin ... name=`, or a uuencode `begin` line), and the name it takes,
+// cleaned as a posted name is. The header name is taken when it differs,
+// is not `is_probably_obfuscated`, and the posted name has no `.par2` in
+// it, which is usually right. A header
+// that names nothing is no name.
+pub fn header_name(posted: &str, header: &str) -> Option<String> {
+    if header.trim().is_empty()
+        || posted.to_ascii_lowercase().contains(".par2")
+        || is_probably_obfuscated(header)
+    {
         return None;
     }
-    Some(name.to_string())
+    let name = weaver_model::files::sanitize_download_filename(header);
+    (name != posted).then_some(name)
+}
+
+// Whether a name is likely obfuscated. The name's last path component
+// without its extension (as Python's `os.path.splitext` cuts it) is judged: certainly obfuscated patterns
+// first, then the shapes of a clear name, and obfuscated by default. A
+// name with nothing left to judge is obfuscated.
+pub fn is_probably_obfuscated(name: &str) -> bool {
+    let file = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let base = python_splitext_stem(file);
+    let lower_hex = |ch: char| matches!(ch, '0'..='9' | 'a'..='f');
+
+    // `^[a-f0-9]{32}$`: `b082fa0beaa644d3aa01045d5b8d0b36.mkv`.
+    if base.len() == 32 && base.chars().all(lower_hex) {
+        return true;
+    }
+    // `^[a-f0-9.]{40,}$`: `0675e29e9abfd2.f7d069dab0b853283cc1b069a25f82.6547`.
+    if base.len() >= 40 && base.chars().all(|ch| lower_hex(ch) || ch == '.') {
+        return true;
+    }
+    // `[a-f0-9]{30}` with two or more `\[\w+\]`: a hash dressed in tags.
+    if longest_run(base, lower_hex) >= 30 && bracketed_words(base) >= 2 {
+        return true;
+    }
+    // `^abc\.xyz`.
+    if base.starts_with("abc.xyz") {
+        return true;
+    }
+
+    let decimals = base.chars().filter(|ch| ch.is_numeric()).count();
+    let upperchars = base.chars().filter(|ch| ch.is_uppercase()).count();
+    let lowerchars = base.chars().filter(|ch| ch.is_lowercase()).count();
+    let spacesdots = base
+        .chars()
+        .filter(|ch| matches!(ch, ' ' | '.' | '_'))
+        .count();
+
+    // "Great Distro".
+    if upperchars >= 2 && lowerchars >= 2 && spacesdots >= 1 {
+        return false;
+    }
+    // "this is a download".
+    if spacesdots >= 3 {
+        return false;
+    }
+    // "Beast 2020".
+    if upperchars + lowerchars >= 4 && decimals >= 4 && spacesdots >= 1 {
+        return false;
+    }
+    // "Catullus": starts with a capital, and most letters are lower case.
+    let Some(first) = base.chars().next() else {
+        return true;
+    };
+    if first.is_uppercase() && lowerchars > 2 && upperchars as f64 / lowerchars as f64 <= 0.25 {
+        return false;
+    }
+    true
+}
+
+// `name` without its extension, as Python's `os.path.splitext` cuts it: at
+// the last dot, unless only dots come before it (`.bashrc` has none).
+fn python_splitext_stem(name: &str) -> &str {
+    match name.rfind('.') {
+        Some(dot) if name[..dot].bytes().any(|byte| byte != b'.') => &name[..dot],
+        _ => name,
+    }
+}
+
+// The longest run of characters `of` holds.
+fn longest_run(text: &str, of: impl Fn(char) -> bool) -> usize {
+    let (mut run, mut longest) = (0, 0);
+    for ch in text.chars() {
+        run = if of(ch) { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    longest
+}
+
+// How many times `\[\w+\]` matches, as Python's `re.findall` counts: each
+// match starts where the one before ended, and a failed start moves on one
+// character. A word character is a letter, a digit or `_`.
+fn bracketed_words(text: &str) -> usize {
+    let word = |ch: char| ch.is_alphanumeric() || ch == '_';
+    let mut found = 0;
+    let mut rest = text;
+    while let Some(open) = rest.find('[') {
+        let after = &rest[open + 1..];
+        let inside = after.find(|ch: char| !word(ch)).unwrap_or(after.len());
+        if inside > 0 && after[inside..].starts_with(']') {
+            found += 1;
+            rest = &after[inside + 1..];
+        } else {
+            rest = after;
+        }
+    }
+    found
 }
 
 // Strategy 2: Extract filename from `[PRiVATE]` format.
@@ -294,16 +430,9 @@ fn extract_fallback(subject: &str) -> Option<String> {
         trimmed
     };
 
-    // Take the last whitespace-delimited token. Prefer tokens with dots (filenames),
-    // but accept dotless tokens as a last resort (handles "Re: A" edge cases).
-    let token = after_prefix
-        .rsplit_once(' ')
-        .map_or(after_prefix, |(_, t)| t);
-    if !token.is_empty() {
-        Some(token.to_string())
-    } else {
-        None
-    }
+    // Take the last word. Prefer words with dots (filenames), but accept
+    // dotless words as a last resort (handles "Re: A" edge cases).
+    last_word(after_prefix).map(str::to_string)
 }
 
 // Check if a string looks like a segment marker (e.g. "1/10", "34/44")
@@ -347,7 +476,7 @@ fn strip_trailing_part_info(s: &str) -> &str {
 }
 
 // Returns `true` if the filename clearly looks like a real title or release name
-// rather than an obfuscated hash. Adapted from SABnzbd's explicit false-return rules.
+// rather than an obfuscated hash.
 //
 // Only triggers on names with word-like tokens (3+ alpha chars). Pure hex/digits
 // with dots still fall through to the obfuscation checks.
@@ -559,10 +688,198 @@ mod tests {
 
     #[test]
     fn empty_quotes_fall_through_to_fallback() {
-        // Empty quotes should not match strategy 1
-        let result = extract_filename(r#"[1/1] - "" yEnc some.file.rar"#);
-        // Should fall through to fallback and get some.file.rar or None
-        assert!(result.is_some() || result.is_none());
+        // Empty quotes are no name, and the quotes are no word either: the
+        // text before the yEnc marker names nothing.
+        assert_eq!(extract_filename(r#"[1/1] - "" yEnc some.file.rar"#), None);
+    }
+
+    // A quote mark is never part of a posted name. Each row: the subject,
+    // the name, and the confidence. The quoted rows read the first closed
+    // pair, the rest the last word.
+    const QUOTE_SHAPES: &[(&str, &str, f32)] = &[
+        (r#""name.ext" yEnc (1/5)"#, "name.ext", 1.0),
+        (r#"[1/5] - "name.ext" yEnc (1/5)"#, "name.ext", 1.0),
+        // The shape of job f586b14d13974344: the opening quote is missing.
+        (
+            r#"Show.S01E01.1080p.WEB.H264-GRP.[71ECB6A7].mkv.001" yEnc (1/50)"#,
+            "Show.S01E01.1080p.WEB.H264-GRP.[71ECB6A7].mkv.001",
+            0.5,
+        ),
+        (r#"name.mkv.001" yEnc"#, "name.mkv.001", 0.5),
+        (r#"[1/5] - name.mkv.001" yEnc (1/5)"#, "name.mkv.001", 0.5),
+        // The closing quote is missing.
+        (r#"[1/5] - "name.mkv.001 yEnc (1/5)"#, "name.mkv.001", 0.5),
+        (r#""name.mkv.001 yEnc (1/5)"#, "name.mkv.001", 0.5),
+        // A doubled closing quote.
+        (r#"[1/5] - "name.mkv.001"" yEnc (1/5)"#, "name.mkv.001", 1.0),
+        // Spaces inside the quotes are trimmed.
+        (r#"[1/5] - " name.mkv " yEnc (1/5)"#, "name.mkv", 1.0),
+        // An empty or blank pair is passed over for the next one.
+        (r#""" - "name.mkv" yEnc (1/5)"#, "name.mkv", 1.0),
+        (r#"" " - "name.mkv" yEnc (1/5)"#, "name.mkv", 1.0),
+        // Quotes inside the name end it at the first pair.
+        (r#"[1/5] - "He said "hi".mkv" yEnc (1/5)"#, "He said", 1.0),
+        // A quote the NZB escaped twice (`&amp;quot;`) is left as the text
+        // `&quot;` and is a quote mark too.
+        (
+            r#"&quot;Show.Name.mkv&quot; yEnc (1/50)"#,
+            "Show.Name.mkv",
+            0.5,
+        ),
+        (
+            r#"[1/5] - &quot;Show.Name.mkv&quot; yEnc (1/5)"#,
+            "Show.Name.mkv",
+            0.5,
+        ),
+        (r#"Show.Name.mkv&quot; yEnc (1/5)"#, "Show.Name.mkv", 0.5),
+        (
+            r#"&quot;&quot; - Show.Name.mkv yEnc (1/5)"#,
+            "Show.Name.mkv",
+            0.5,
+        ),
+        // A closed pair of real quotes keeps what it holds.
+        (r#""a&quot;b.mkv" yEnc (1/5)"#, "a&quot;b.mkv", 1.0),
+    ];
+
+    // The subject of an NZB that escaped its quotes twice, read through the
+    // parser, names the file without them.
+    #[test]
+    fn a_quote_escaped_twice_in_the_nzb_is_no_part_of_the_name() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <file poster="p" date="1" subject="&amp;quot;Show.Name.mkv&amp;quot; yEnc (1/50)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments><segment bytes="100" number="1">a@b</segment></segments>
+  </file>
+</nzb>"#;
+        let nzb = crate::parse_nzb(xml).unwrap();
+        let file = &nzb.files[0];
+        assert_eq!(file.subject, "&quot;Show.Name.mkv&quot; yEnc (1/50)");
+        assert_eq!(
+            file.extract_filename(),
+            Some(("Show.Name.mkv".to_string(), 0.5))
+        );
+        assert_eq!(file.filename(), Some("Show.Name.mkv"));
+    }
+
+    // ── is_probably_obfuscated: names in the field, and the header name
+    // of the ruling's counter-example.
+
+    #[test]
+    fn probably_obfuscated_judges_field_names() {
+        for name in [
+            "599c1c9e2bdfb5114044bf25152b7eaa.mkv",
+            "/my/blabla/directory/stuff/599c1c9e2bdfb5114044bf25152b7eaa.mkv",
+            "/my/blabla/directory/A Directory Should Not Count 2020/599c1c9e2bdfb5114044bf25152b7eaa.mkv",
+            "/my/blabla/directory/stuff/afgm.avi",
+            "/my/blabla/directory/stuff/afgm2020.avi",
+            "MUGNjK3zi65TtN.mkv",
+            "T306077.avi",
+            "bar10nmbkkjjdfr.mkv",
+            "4rFF-fdtd480p.bin",
+            "e0nFmxBNTprpbQiVQ44WeEwSrBkLlJ7IgaSj3uzFu455FVYG3q.bin",
+            "e0nFmxBNTprpbQiVQ44WeEwSrBkLlJ7IgaSj3uzFu455FVYG3q",
+            "greatdistro.iso",
+            "my.download.2020",
+            "abc.xyz.a4c567edbcbf27.BLA",
+            "abc.xyz.iso",
+            "0675e29e9abfd2.f7d069dab0b853283cc1b069a25f82.6547",
+            "[BlaBla] something [More] something b2.bef89a622e4a23f07b0d3757ad5e8a.a0 [Brrr]",
+            "b082fa0beaa644d3aa01045d5b8d0b36.mkv",
+            // Nothing to judge.
+            "",
+        ] {
+            assert!(is_probably_obfuscated(name), "{name:?}");
+        }
+        for name in [
+            "/my/blabla/directory/stuff/My Favorite Distro S03E04.iso",
+            "/my/blabla/directory/stuff/Great Distro (2020).iso",
+            "ubuntu.2004.iso",
+            "/my/blabla/directory/stuff/GreatDistro2020.iso",
+            "Catullus.avi",
+            "Der.Mechaniker.HDRip.XviD-SG.avi",
+            "Bonjour.1969.FRENCH.BRRiP.XviD.AC3-HuSh.avi",
+            "Bonjour.1969.avi",
+            "This That S01E11",
+            "This_That_S01E11",
+            "this_that_S01E11",
+            "My.Download.2020",
+            "this_that_there_here.avi",
+            "Lorem Ipsum.avi",
+            "Lorem Ipsum",
+            "Show.Name.S01E01.1080p.WEB.h264-GRP.mkv.001",
+        ] {
+            assert!(!is_probably_obfuscated(name), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn probably_obfuscated_counts_bracketed_words_as_findall_does() {
+        assert_eq!(bracketed_words("[a] [b]"), 2);
+        assert_eq!(bracketed_words("[ab[cd]"), 1);
+        assert_eq!(bracketed_words("[] [x y] [ok_1]"), 1);
+        assert_eq!(bracketed_words("[[a]]"), 1);
+        // 30 lowercase hex and two tags; and with one tag, no rule fires.
+        let hex = "5937bc5e32146ebef89a622e4a23f0";
+        assert!(is_probably_obfuscated(&format!("[A] [B] {hex}")));
+        assert_eq!(python_splitext_stem("a.b.c"), "a.b");
+        assert_eq!(python_splitext_stem("..a"), "..a");
+        assert_eq!(python_splitext_stem("a."), "a");
+    }
+
+    // ── header_name
+
+    #[test]
+    fn a_file_takes_its_header_name_by_the_rules() {
+        // A clear name that differs is taken.
+        assert_eq!(
+            header_name(
+                "[71ECB6A7].mkv.001",
+                "Show.Name.S01E01.1080p.WEB.h264-GRP.mkv.001"
+            ),
+            Some("Show.Name.S01E01.1080p.WEB.h264-GRP.mkv.001".to_string())
+        );
+        // An obfuscated header name is not.
+        assert_eq!(
+            header_name("Show Name.mkv", "b082fa0beaa644d3aa01045d5b8d0b36.mkv"),
+            None
+        );
+        // Nor one the file already carries.
+        assert_eq!(header_name("Great Distro.iso", "Great Distro.iso"), None);
+        // A posted PAR2 name is kept, whatever the header says.
+        assert_eq!(header_name("lantern.par2", "Great Distro.par2"), None);
+        assert_eq!(
+            header_name("lantern.vol00+01.PAR2", "Great Distro.iso"),
+            None
+        );
+        // A header that names nothing is no name.
+        assert_eq!(header_name("a.bin", ""), None);
+        assert_eq!(header_name("a.bin", "   "), None);
+        // The header name is cleaned as a posted name is: no directory.
+        assert_eq!(
+            header_name("a.bin", "../Great Distro.iso"),
+            Some(".._Great Distro.iso".to_string())
+        );
+    }
+
+    #[test]
+    fn a_quote_mark_is_never_part_of_a_posted_name() {
+        for &(subject, name, confidence) in QUOTE_SHAPES {
+            assert_eq!(
+                extract_filename(subject),
+                Some((name.to_string(), confidence)),
+                "{subject}"
+            );
+            // The quick name a file's role is read from agrees.
+            let file = crate::NzbFile {
+                poster: String::new(),
+                subject: subject.to_string(),
+                date: 0,
+                groups: Vec::new(),
+                segments: Vec::new(),
+            };
+            assert_eq!(file.filename(), Some(name), "{subject}");
+        }
     }
 
     // ── strip_archive_extension ─────────────────────────────────────────
@@ -588,7 +905,7 @@ mod tests {
         assert_eq!(strip_archive_extension("movie.mkv"), "movie.mkv");
     }
 
-    // ── NZBGet parity tests (patterns from nzbget/tests/queue/Deobfuscation.cpp)
+    // ── Obfuscation patterns
 
     #[test]
     fn hex_with_dots_is_obfuscated() {

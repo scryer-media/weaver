@@ -4,7 +4,9 @@
 import type { Translate } from "@/lib/context/translate-context";
 import { directLeg, type Egress, type NetworkRoute, type ProxyPool } from "./networking.ts";
 import { proxyTestSentence } from "./proxy-fault.ts";
+import { dnsWireKey, lookupTrustKey, type DnsWire, type LookupTrust } from "./dns.ts";
 import { codedSentence } from "./refusal.ts";
+import type { TorrentExposure } from "./torrents.ts";
 
 /**
  * What a test stacks on top of the route it is drafted through: one proxy,
@@ -36,7 +38,15 @@ export type PathTestResult = {
   connectMillis: number;
   /** How the host the path's final dial named was resolved. */
   resolution: HostResolution | null;
+  /** The test torrent over the path, for a torrent route's test. */
+  p2p: P2pTestResult | null;
 };
+
+/** The test torrent's steps, in the order a path takes them. */
+export type P2pStep = "TORRENT" | "ANNOUNCE" | "HANDSHAKE" | "PIECE" | "INBOUND";
+export type P2pRung = { step: P2pStep; outcome: "PASSED" | "FAILED" | "NOT_REACHED"; message: string | null };
+/** `mappedPort` is the port a gateway mapped to the test session's listener. */
+export type P2pTestResult = { rungs: P2pRung[]; mappedPort: number | null; exposure: TorrentExposure | null };
 
 /** Who turned a test's host into addresses. */
 export type ResolvedBy = "LITERAL" | "HOST" | "SERVERS" | "PROXY" | "PROXY_SERVERS";
@@ -48,6 +58,12 @@ export type HostResolution = {
   /** The proxy that resolved the name, or that the servers were asked through. */
   proxyId: number | null;
   dnsServers: string[];
+  /** How the query reached the servers, when servers were asked. */
+  wire: DnsWire | null;
+  /** The listed server whose answer was used, when one answered. */
+  answeredBy: string | null;
+  /** What the answer was taken as, when an answer came to judge. */
+  trust: LookupTrust | null;
   addresses: string[];
   /** The answer was held from an earlier lookup. */
   cached: boolean;
@@ -77,17 +93,27 @@ export function resolutionParts(
   names: { egress: string; proxy: (id: number) => string },
 ): ResolutionParts {
   const proxy = resolution.proxyId === null ? "" : names.proxy(resolution.proxyId);
-  const servers = resolution.dnsServers.join(", ");
+  // The server that answered, else every server asked.
+  const servers = resolution.answeredBy ?? resolution.dnsServers.join(", ");
   const by: Record<ResolvedBy, string> = {
     LITERAL: t("next.networking.testVia.resolvedLiteral"),
-    HOST: t("next.networking.testVia.resolvedHost"),
-    SERVERS: t("next.networking.testVia.resolvedServers", { servers, name: names.egress }),
+    HOST: t("next.networking.testVia.resolvedSystem"),
+    SERVERS: t("next.networking.testVia.resolvedWeaver", { servers, name: names.egress }),
     PROXY: t("next.networking.testVia.resolvedProxy", { name: proxy }),
+    // Asked through the proxy: Weaver's listed servers, or a WireGuard tunnel's own.
     PROXY_SERVERS: t("next.networking.testVia.resolvedServers", { servers, name: proxy }),
   };
   const error = resolution.error
     ? codedSentence(t, lookupErrorKey(resolution.error.code), undefined, resolution.error.detail)
     : null;
+  // Who answered, then how the query went and what its answer was taken as.
+  const answered = [
+    by[resolution.resolvedBy],
+    resolution.wire ? t(dnsWireKey(resolution.wire)) : null,
+    resolution.trust ? t(lookupTrustKey(resolution.trust)) : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
   const marked = resolution.addresses.length > 1;
   return {
     host: resolution.host,
@@ -99,7 +125,7 @@ export function resolutionParts(
             connected: marked && address === resolution.connectedAddress,
           })),
     said: [
-      [by[resolution.resolvedBy], error].filter(Boolean).join(": "),
+      [answered, error].filter(Boolean).join(": "),
       ...(resolution.cached ? [t("next.networking.testVia.cached")] : []),
     ]
       .filter(Boolean)

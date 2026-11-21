@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::operations::backup::OperationsBackupLogicalInternalQueries;
+use crate::operations::backup::OperationsBackupQueries;
+use crate::operations::recovery::credentials::StoredCredentialQueries;
+use crate::settings::service::SettingsServiceQueries;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 

@@ -15,10 +15,12 @@ pub(crate) fn damaged(standing: &dyn Standing) -> Option<Why> {
 
 // A member named and never placed, or none named at all: lost with the
 // object's own bytes when those were lost, since what it never placed lay
-// in them, and otherwise never mapped.
-pub(crate) fn unplaced(standing: &dyn Standing) -> Option<Why> {
-    standing.unplaced().then(|| match standing.lost() {
-        true => Why::Unrepairable,
-        false => Why::Unmapped,
+// in them, and otherwise never mapped: for want of the volume `lacks`, where
+// the object knows which volume of its set it lacks.
+pub(crate) fn unplaced(standing: &dyn Standing, lacks: Option<u32>) -> Option<Why> {
+    standing.unplaced().then(|| match (standing.lost(), lacks) {
+        (true, _) => Why::Unrepairable,
+        (false, Some(volume)) => Why::Unfound { volume },
+        (false, None) => Why::Unmapped,
     })
 }

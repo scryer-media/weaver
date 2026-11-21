@@ -9,6 +9,7 @@ import { TranslateContext } from "@/lib/context/translate-context";
 import en from "@/lib/i18n/locales/en";
 import { SecurityPanel } from "@/next/pages/settings/panels/SecurityPanel";
 import { SettingsShellProvider } from "@/next/pages/settings/framework";
+import { SearchRegistry } from "@/next/pages/settings/search";
 import "@/next/fonts.css";
 import "@/next/theme.css";
 
@@ -49,12 +50,13 @@ const client = new Client({ url: "http://fixture.invalid/graphql", exchanges: [(
     const definition = operation.query.definitions.find((entry) => entry.kind === "OperationDefinition");
     const name = definition?.kind === "OperationDefinition" ? definition.name?.value ?? "" : "";
     if (operation.kind === "teardown") return make<OperationResult>((observer) => { observer.complete(); return () => {}; });
+    const variables = operation.variables ?? {};
     const data = name === "NetworkAccess" ? { networkAccess }
       : name === "LoginStatus" ? { adminLoginStatus: { enabled: true, username: "admin" } }
       : name === "ApiKeys" ? { apiKeys: [] }
-      : name === "CreateApiKey" ? { createApiKey: { key: { ...key, name: operation.variables.name, scope: operation.variables.scope }, rawKey: RAW_KEY } }
+      : name === "CreateApiKey" ? { createApiKey: { key: { ...key, name: variables.name, scope: variables.scope }, rawKey: RAW_KEY } }
       : {};
-    return fromValue({ operation, data });
+    return fromValue({ operation, data, stale: false, hasNext: false });
   }))],
 });
 
@@ -62,5 +64,5 @@ createRoot(document.getElementById("root")!).render(
   <Provider value={client}><TranslateContext.Provider value={{
     t: (key, values) => Object.entries(values ?? {}).reduce((text, [name, value]) => text.replaceAll(`{${name}}`, String(value)), en[key] ?? key),
     uiLanguage: "eng", selectedLanguage: { code: "eng", label: "English" }, setLanguagePreference: () => {},
-  }}><MemoryRouter><SettingsShellProvider search="" actionsRef={{ current: null }} setFlags={() => {}} controlsHost={document.getElementById("controls")}><SecurityPanel /></SettingsShellProvider></MemoryRouter></TranslateContext.Provider></Provider>,
+  }}><MemoryRouter><SettingsShellProvider search="" actionsRef={{ current: null }} setFlags={() => {}} registry={new SearchRegistry()} controlsHost={document.getElementById("controls")}><SecurityPanel /></SettingsShellProvider></MemoryRouter></TranslateContext.Provider></Provider>,
 );

@@ -3,12 +3,14 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use weaver_server_core::tags::TagsQueries;
 
 use super::*;
 use crate::jobs::types::{
     DuplicateSummaryInfo, PreparedQueueFilter, load_duplicate_summaries_chunked,
     matches_queue_event_filter_prepared,
 };
+use weaver_server_core::jobs::handle::{HoldOwner, HoldSet};
 
 #[derive(Default)]
 pub(crate) struct JobsSubscription;
@@ -24,7 +26,11 @@ impl JobsSubscription {
     #[graphql(guard = "AdminGuard")]
     async fn job_updates(&self, ctx: &Context<'_>) -> Result<impl Stream<Item = JobsSnapshot>> {
         let handle = ctx.data::<SchedulerHandle>()?.clone();
-        let throttled = Box::pin(snapshot_triggers(&handle, FULL_SNAPSHOT_PERIOD));
+        let throttled = Box::pin(snapshot_triggers(
+            &handle,
+            ctx.data::<Database>()?,
+            FULL_SNAPSHOT_PERIOD,
+        ));
 
         let mut last_state: Option<SnapshotState> = None;
         let stream = throttled.filter_map(move |trigger| {
@@ -35,7 +41,7 @@ impl JobsSubscription {
             }
             let jobs = handle.list_jobs().iter().map(Job::from).collect();
             let metrics = Metrics::from(&state.metrics);
-            let is_paused = state.is_paused;
+            let is_paused = state.holds.stops(HoldOwner::All, false);
             let download_block = DownloadBlock::from(&state.download_block);
             last_state = Some(state);
 
@@ -66,7 +72,8 @@ impl JobsSubscription {
             .data::<weaver_server_core::SharedPipelineState>()?
             .clone();
         let prepared_filter = PreparedQueueFilter::new(filter.as_ref());
-        let throttled = Box::pin(snapshot_triggers(&handle, FULL_SNAPSHOT_PERIOD));
+        let wants_disk_write = ctx.look_ahead().field("items").field("diskWrite").exists();
+        let throttled = Box::pin(snapshot_triggers(&handle, &db, FULL_SNAPSHOT_PERIOD));
 
         let memo = Arc::new(std::sync::Mutex::new(QueueSnapshotMemo::default()));
         let stream = throttled
@@ -80,7 +87,7 @@ impl JobsSubscription {
                 let state_handle = state_handle.clone();
                 async move {
                     let state = SnapshotState::capture(&handle);
-                    let max_download_speed = config.read().await.max_download_speed.unwrap_or(0);
+                    let max_download_speed = config.read().await.bandwidth.download_bps;
                     {
                         let mut memo = memo.lock().expect("queue snapshot memo poisoned");
                         let unchanged = memo.last.as_ref().is_some_and(|(last, speed)| {
@@ -100,6 +107,9 @@ impl JobsSubscription {
                     .iter()
                     .map(queue_item_from_job)
                     .collect();
+                    if wants_disk_write {
+                        crate::jobs::types::attach_disk_writes(&state_handle, &mut items);
+                    }
                     let cached = {
                         let memo = memo.lock().expect("queue snapshot memo poisoned");
                         memo.summaries
@@ -136,7 +146,7 @@ impl JobsSubscription {
                         summary: queue_summary(&items, metrics),
                         metrics: metrics_from_snapshot(metrics),
                         global_state: global_queue_state(
-                            state.is_paused,
+                            &state.holds,
                             &state.download_block,
                             max_download_speed,
                         ),
@@ -166,18 +176,23 @@ impl JobsSubscription {
         let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?.clone();
         let db = ctx.data::<Database>()?.clone();
         let wants = crate::jobs::query::page_wants(ctx);
-        let mut triggers = Box::pin(snapshot_triggers(&handle, PAGE_UPDATE_PERIOD));
+        let mut triggers = Box::pin(snapshot_triggers(&handle, &db, PAGE_UPDATE_PERIOD));
         Ok(async_stream::stream! {
             // What a page shows beyond its rows' revision: the live speed in
-            // its summary, and the global pause its row states read. A wake
-            // that moves none of it sends nothing.
-            let mut last: Option<(u64, u64, bool)> = None;
+            // its summary, the global pause its row states read, and the tags
+            // its rows show and its filter reads, and which rows wait on
+            // which disk. The disk figures are not here: they move on the
+            // live metrics, not the page. A wake that moves none of it sends
+            // nothing.
+            let mut last: Option<(u64, u64, bool, u64, u64)> = None;
             let mut duplicates = crate::jobs::query::DuplicateSummaryCache::default();
             while triggers.next().await.is_some() {
                 let captured = (
                     handle.job_revision(),
                     handle.get_metrics().current_download_speed,
                     handle.is_globally_paused(),
+                    db.tag_revision(),
+                    handle.disk_rows_revision(),
                 );
                 if last == Some(captured) {
                     continue;
@@ -322,7 +337,7 @@ async fn attach_duplicate_summaries(db: Database, items: &mut [QueueItem]) -> Re
 struct SnapshotState {
     revision: u64,
     metrics: weaver_server_core::operations::metrics::MetricsSnapshot,
-    is_paused: bool,
+    holds: HoldSet,
     download_block: weaver_server_core::jobs::handle::DownloadBlockState,
 }
 
@@ -331,7 +346,7 @@ impl SnapshotState {
         Self {
             revision: handle.job_revision(),
             metrics: handle.get_metrics(),
-            is_paused: handle.is_globally_paused(),
+            holds: handle.state().holds(),
             download_block: handle.get_download_block(),
         }
     }
@@ -339,7 +354,7 @@ impl SnapshotState {
 
 #[derive(Default)]
 struct QueueSnapshotMemo {
-    last: Option<(SnapshotState, u64)>,
+    last: Option<(SnapshotState, Option<u64>)>,
     summaries: Option<(u64, Arc<HashMap<u64, DuplicateSummaryInfo>>)>,
 }
 
@@ -365,12 +380,14 @@ const FULL_SNAPSHOT_PERIOD: Duration = Duration::from_secs(1);
 const PAGE_UPDATE_PERIOD: Duration = Duration::from_millis(500);
 
 /// What wakes a snapshot subscriber: the published job list moving, the
-/// global pause flipping, or the heartbeat. Everything that moves within one
+/// global pause flipping, the tags changing, which job waits on which disk
+/// changing (not the disk figures), or the heartbeat. Everything that moves within one
 /// `period` folds into one trigger, so a subscriber builds at most one answer
 /// per period however fast the queue publishes. The first trigger fires at
 /// once.
 fn snapshot_triggers(
     handle: &SchedulerHandle,
+    db: &Database,
     period: Duration,
 ) -> impl Stream<Item = SnapshotTrigger> + Send + use<> {
     use tokio::sync::broadcast::error::RecvError;
@@ -378,8 +395,12 @@ fn snapshot_triggers(
 
     let mut changes = handle.subscribe_job_changes();
     let mut events = handle.subscribe_events();
+    let mut tags = db.subscribe_tag_changes();
+    let mut disk_rows = handle.subscribe_disk_rows();
     async_stream::stream! {
         changes.borrow_and_update();
+        tags.borrow_and_update();
+        disk_rows.borrow_and_update();
         yield SnapshotTrigger::ItemsChanged;
         let mut last_sent = tokio::time::Instant::now();
         let mut heartbeat = tokio::time::interval_at(
@@ -390,6 +411,14 @@ fn snapshot_triggers(
         loop {
             let trigger = tokio::select! {
                 changed = changes.changed() => match changed {
+                    Ok(()) => SnapshotTrigger::ItemsChanged,
+                    Err(_) => break,
+                },
+                changed = tags.changed() => match changed {
+                    Ok(()) => SnapshotTrigger::ItemsChanged,
+                    Err(_) => break,
+                },
+                changed = disk_rows.changed() => match changed {
                     Ok(()) => SnapshotTrigger::ItemsChanged,
                     Err(_) => break,
                 },
@@ -405,6 +434,8 @@ fn snapshot_triggers(
             // publish in between is read by the one answer that follows.
             tokio::time::sleep_until(last_sent + period).await;
             changes.borrow_and_update();
+            tags.borrow_and_update();
+            disk_rows.borrow_and_update();
             last_sent = tokio::time::Instant::now();
             yield trigger;
         }

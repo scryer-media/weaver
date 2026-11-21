@@ -89,7 +89,9 @@ fn inspect_fragmented_shutdown(mut inspect: impl FnMut() -> bool, fixture: IdleT
 #[test]
 fn rustls_idle_inspection_preserves_fragments_and_detects_close_notify() {
     let fixture = idle_tls_fixture();
-    let tcp = TcpStream::connect(("127.0.0.1", fixture.port)).unwrap();
+    let tcp =
+        weaver_tunnel::test_support::loopback::connect_blocking(([127, 0, 0, 1], fixture.port))
+            .unwrap();
     let stream = BlockingManualTlsStream::connect(
         tcp,
         "localhost",
@@ -108,7 +110,9 @@ fn rustls_idle_inspection_preserves_fragments_and_detects_close_notify() {
 fn s2n_idle_inspection_preserves_fragments_and_detects_close_notify() {
     let _guard = s2n_test_guard();
     let fixture = idle_tls_fixture();
-    let tcp = TcpStream::connect(("127.0.0.1", fixture.port)).unwrap();
+    let tcp =
+        weaver_tunnel::test_support::loopback::connect_blocking(([127, 0, 0, 1], fixture.port))
+            .unwrap();
     let stream =
         BlockingS2nStream::connect(tcp, "localhost", Some(&fixture.ca), Duration::from_secs(5))
             .unwrap();
@@ -122,7 +126,9 @@ fn s2n_idle_inspection_preserves_fragments_and_detects_close_notify() {
 #[test]
 fn rustls_idle_inspection_after_the_read_buffer_is_freed_tells_open_from_closed() {
     let fixture = idle_tls_fixture();
-    let tcp = TcpStream::connect(("127.0.0.1", fixture.port)).unwrap();
+    let tcp =
+        weaver_tunnel::test_support::loopback::connect_blocking(([127, 0, 0, 1], fixture.port))
+            .unwrap();
     let mut stream = BlockingManualTlsStream::connect(
         tcp,
         "localhost",

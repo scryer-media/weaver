@@ -32,6 +32,7 @@ export function ListRow({
   markSelection = false,
   className,
   title,
+  testId,
 }: {
   left: ReactNode;
   right?: ReactNode;
@@ -45,6 +46,7 @@ export function ListRow({
   markSelection?: boolean;
   className?: string;
   title?: string;
+  testId?: string;
 }) {
   const interactive = typeof onClick === "function";
   // A button cannot hold another control, so a row with a lead is a div that
@@ -71,6 +73,7 @@ export function ListRow({
             }
         : {})}
       title={title}
+      data-testid={testId}
       className={cn(
         "flex w-full flex-wrap items-center gap-x-5 gap-y-[10px] border-b border-wv-hairline text-left",
         markSelection

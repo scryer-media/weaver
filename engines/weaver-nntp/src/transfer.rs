@@ -53,6 +53,8 @@ pub struct ServerTransferConfig {
     // Aggregate BODY payload bytes per second. Zero means unlimited.
     pub rate_bytes_per_sec: u64,
     pub quota: Option<QuotaRuntimeConfig>,
+    // Admits no BODY at all, whether or not the quota is metered.
+    pub closed: bool,
 }
 
 // Durable counters restored before download workers start.
@@ -218,6 +220,9 @@ pub(crate) enum BodyTransferAccounting {
 struct RegistryCapacitySignal {
     revision: AtomicU64,
     changed: watch::Sender<u64>,
+    // Rung each time a holder starts or stops turning work away for its
+    // quota.
+    quota: watch::Sender<u64>,
 }
 
 impl Default for RegistryCapacitySignal {
@@ -226,11 +231,17 @@ impl Default for RegistryCapacitySignal {
         Self {
             revision: AtomicU64::new(1),
             changed,
+            quota: watch::channel(0).0,
         }
     }
 }
 
 impl RegistryCapacitySignal {
+    fn quota_changed(&self) {
+        self.quota
+            .send_modify(|count| *count = count.wrapping_add(1));
+    }
+
     fn revision(&self) -> u64 {
         self.revision.load(Ordering::Acquire)
     }
@@ -261,6 +272,8 @@ pub struct ServerTransferRegistry {
     // holder given the same id follows the registry-wide setting; dropping
     // every control at once with [`Self::clear`] keeps them.
     quota_metering_overrides: RwLock<HashMap<StableServerId, bool>>,
+    // BODY bytes every holder received, counted as they come off the wire.
+    received: Arc<AtomicU64>,
 }
 
 impl Default for ServerTransferRegistry {
@@ -282,6 +295,7 @@ impl ServerTransferRegistry {
             capacity: Arc::new(RegistryCapacitySignal::default()),
             quota_metering: AtomicBool::new(true),
             quota_metering_overrides: RwLock::new(HashMap::new()),
+            received: Arc::default(),
         }
     }
 
@@ -295,11 +309,19 @@ impl ServerTransferRegistry {
             capacity: Arc::clone(&self.capacity),
             quota_metering: AtomicBool::new(true),
             quota_metering_overrides: RwLock::new(HashMap::new()),
+            received: Arc::default(),
         }
     }
 
     pub fn scope(&self) -> TransferScope {
         self.scope
+    }
+
+    // BODY bytes every holder of this registry received since it was made,
+    // counted read by read as they come off the wire, not per finished
+    // article. A sibling counts its own.
+    pub fn received_bytes(&self) -> u64 {
+        self.received.load(Ordering::Relaxed)
     }
 
     // Monotonic revision for capacity changes in any registered server.
@@ -311,6 +333,12 @@ impl ServerTransferRegistry {
     // changes racing selection cannot be missed.
     pub fn subscribe_capacity_changes(&self) -> watch::Receiver<u64> {
         self.capacity.subscribe()
+    }
+
+    // Rings each time a holder, here or in a sibling, starts or stops
+    // turning work away for its quota.
+    pub fn subscribe_quota_changes(&self) -> watch::Receiver<u64> {
+        self.capacity.quota.subscribe()
     }
 
     // Return an existing durable control without creating one.
@@ -329,10 +357,11 @@ impl ServerTransferRegistry {
         }
 
         let capacity = Arc::clone(&self.capacity);
+        let received = Arc::clone(&self.received);
         let scope = self.scope;
         let mut controls = self.controls.write().expect("transfer registry poisoned");
         Arc::clone(controls.entry(id).or_insert_with(|| {
-            let control = ServerTransferControl::new(id, scope, capacity);
+            let control = ServerTransferControl::new(id, scope, capacity, received);
             control
                 .quota_metering
                 .store(self.quota_metering_of(id), Ordering::Release);
@@ -491,6 +520,8 @@ pub struct ServerTransferControl {
     blocking_changed: Condvar,
     capacity_changed: watch::Sender<u64>,
     registry_capacity: Arc<RegistryCapacitySignal>,
+    // The registry's count of BODY bytes received over all its holders.
+    registry_received: Arc<AtomicU64>,
     lifetime_body_bytes: AtomicU64,
     throttle_wait_nanos: AtomicU64,
     quota_epoch: AtomicU64,
@@ -576,6 +607,7 @@ impl ServerTransferControl {
         id: StableServerId,
         scope: TransferScope,
         registry_capacity: Arc<RegistryCapacitySignal>,
+        registry_received: Arc<AtomicU64>,
     ) -> Self {
         let (capacity_changed, _) = watch::channel(1);
         Self {
@@ -589,12 +621,14 @@ impl ServerTransferControl {
                 quota_used_bytes: 0,
                 quota_reserved_bytes: 0,
                 quota_saturated: false,
-                quota_epoch: 0,
+                // Never 0, which the published epoch keeps for the lock-free path.
+                quota_epoch: 1,
                 capacity_revision: 1,
             }),
             blocking_changed: Condvar::new(),
             capacity_changed,
             registry_capacity,
+            registry_received,
             lifetime_body_bytes: AtomicU64::new(0),
             throttle_wait_nanos: AtomicU64::new(0),
             quota_epoch: AtomicU64::new(0),
@@ -681,8 +715,13 @@ impl ServerTransferControl {
 
             state.config = config;
             state.initialized = true;
+            // A closed server takes the locked admission path, as a quota does.
             self.quota_epoch.store(
-                state.config.quota.map_or(0, |_| state.quota_epoch),
+                if state.config.quota.is_some() || state.config.closed {
+                    state.quota_epoch
+                } else {
+                    0
+                },
                 Ordering::Release,
             );
             state.capacity_revision = state.capacity_revision.wrapping_add(1).max(1);
@@ -758,6 +797,12 @@ impl ServerTransferControl {
     #[doc(hidden)]
     pub fn record_unlimited_body_bytes(&self, bytes: usize) {
         self.record_lifetime_bytes(bytes as u64);
+    }
+
+    // Bytes received over the holder by a carrier that keeps its own pacing:
+    // counted in its lifetime total, and nowhere else.
+    pub fn record_received_bytes(&self, bytes: u64) {
+        self.record_lifetime_bytes(bytes);
     }
 
     // Read-path pacing without quota admission, shared by all connections on an egress.
@@ -853,20 +898,25 @@ impl ServerTransferControl {
     }
 
     // Called at the end of every change to the quota's state, under its lock.
+    // A change of whether it turns work away is heard by every subscriber
+    // to the registry's quota changes.
     fn publish_quota_blocked(&self, state: &TransferState) {
-        self.quota_blocked
-            .store(self.quota_blocked_locked(state), Ordering::Release);
+        let blocked = self.quota_blocked_locked(state);
+        if self.quota_blocked.swap(blocked, Ordering::AcqRel) != blocked {
+            self.registry_capacity.quota_changed();
+        }
     }
 
     fn quota_blocked_locked(&self, state: &TransferState) -> bool {
         let projected = state
             .quota_used_bytes
             .saturating_add(state.quota_reserved_bytes);
-        self.quota_metering.load(Ordering::Acquire)
-            && state
-                .config
-                .quota
-                .is_some_and(|quota| projected >= quota.limit_bytes || state.quota_saturated)
+        state.config.closed
+            || (self.quota_metering.load(Ordering::Acquire)
+                && state
+                    .config
+                    .quota
+                    .is_some_and(|quota| projected >= quota.limit_bytes || state.quota_saturated))
     }
 
     #[cfg(test)]
@@ -986,17 +1036,19 @@ impl ServerTransferControl {
         state: &TransferState,
         requested_body_bytes: u64,
     ) -> Option<QuotaRejection> {
-        let quota = state.config.quota?;
-        if !self.quota_metering.load(Ordering::Acquire) {
-            return None;
-        }
-        let projected = state
-            .quota_used_bytes
-            .saturating_add(state.quota_reserved_bytes);
-        if projected < quota.limit_bytes
-            && projected.saturating_add(requested_body_bytes) <= quota.limit_bytes
-        {
-            return None;
+        if !state.config.closed {
+            let quota = state.config.quota?;
+            if !self.quota_metering.load(Ordering::Acquire) {
+                return None;
+            }
+            let projected = state
+                .quota_used_bytes
+                .saturating_add(state.quota_reserved_bytes);
+            if projected < quota.limit_bytes
+                && projected.saturating_add(requested_body_bytes) <= quota.limit_bytes
+            {
+                return None;
+            }
         }
         let snapshot = Box::new(self.snapshot_locked(state));
         Some(QuotaRejection {
@@ -1013,6 +1065,7 @@ impl ServerTransferControl {
     fn record_lifetime_bytes(&self, bytes: u64) {
         if bytes != 0 {
             self.lifetime_body_bytes.fetch_add(bytes, Ordering::Relaxed);
+            self.registry_received.fetch_add(bytes, Ordering::Relaxed);
         }
     }
 
@@ -1517,6 +1570,7 @@ mod tests {
 
     fn quota(limit_bytes: u64, generation: u64) -> ServerTransferConfig {
         ServerTransferConfig {
+            closed: false,
             rate_bytes_per_sec: 0,
             quota: Some(QuotaRuntimeConfig {
                 limit_bytes,
@@ -1524,6 +1578,44 @@ mod tests {
                 retry_at: None,
             }),
         }
+    }
+
+    #[test]
+    fn a_closed_server_admits_nothing_even_unmetered_until_it_reopens() {
+        let registry = ServerTransferRegistry::new();
+        let closed = ServerTransferConfig {
+            rate_bytes_per_sec: 0,
+            quota: None,
+            closed: true,
+        };
+        let control = registry.configure(StableServerId(7), closed);
+        registry.set_quota_metering(false);
+        let rejection = control.try_reserve(1).err().unwrap();
+        assert_eq!(rejection.stable_server_id, StableServerId(7));
+        assert!(control.start_body(1).is_err());
+        assert!(control.quota_rejection_for(1).is_some());
+        assert!(control.quota_rejection_for_dispatch(1).is_some());
+        assert!(control.snapshot().quota_blocked);
+
+        // Closed over a quota with room to spare still admits nothing.
+        control.update_config(ServerTransferConfig {
+            quota: quota(1_000, 1).quota,
+            ..closed
+        });
+        registry.set_quota_metering(true);
+        assert!(control.try_reserve(1).is_err());
+
+        control.update_config(ServerTransferConfig {
+            closed: false,
+            ..closed
+        });
+        assert!(control.quota_rejection_for(1).is_none());
+        assert!(!control.snapshot().quota_blocked);
+        assert!(matches!(
+            control.start_body(1),
+            Ok(BodyTransferAccounting::Unlimited)
+        ));
+        control.try_reserve(1).unwrap().finish();
     }
 
     #[test]
@@ -1537,6 +1629,7 @@ mod tests {
 
         let snapshot = control.snapshot();
         assert_eq!(snapshot.lifetime_body_bytes, 600);
+        assert_eq!(registry.received_bytes(), 600);
         assert_eq!(snapshot.quota_used_bytes, 600);
         assert_eq!(snapshot.quota_reserved_bytes, 0);
         assert_eq!(snapshot.quota_remaining_bytes, 400);
@@ -1711,6 +1804,40 @@ mod tests {
         assert!(control.try_reserve(300).is_ok());
     }
 
+    // The registry counts BODY bytes read by read as they arrive, over all
+    // its holders: a lifetime total restored from storage is no read, and a
+    // sibling counts its own.
+    #[test]
+    fn the_registry_counts_body_bytes_as_they_arrive() {
+        let registry = ServerTransferRegistry::new();
+        let egresses = registry.sibling(TransferScope::Egress);
+        registry.restore(
+            StableServerId(1),
+            ServerTransferConfig::default(),
+            ServerTransferInitialState {
+                lifetime_body_bytes: 8_000,
+                quota_used_bytes: 0,
+            },
+        );
+        assert_eq!(registry.received_bytes(), 0);
+        registry
+            .control(StableServerId(1))
+            .pace_read_without_wait(300);
+        assert_eq!(registry.received_bytes(), 300);
+        registry
+            .control(StableServerId(2))
+            .record_received_bytes(200);
+        registry
+            .control(StableServerId(1))
+            .pace_read_without_wait(100);
+        assert_eq!(registry.received_bytes(), 600);
+        egresses
+            .control(StableServerId(1))
+            .pace_read_without_wait(50);
+        assert_eq!(registry.received_bytes(), 600);
+        assert_eq!(egresses.received_bytes(), 50);
+    }
+
     #[test]
     fn restore_is_monotonic_and_snapshots_are_stable_id_sorted() {
         let registry = ServerTransferRegistry::new();
@@ -1751,6 +1878,7 @@ mod tests {
         let control = registry.configure(
             StableServerId(30),
             ServerTransferConfig {
+                closed: false,
                 rate_bytes_per_sec: 100,
                 quota: None,
             },
@@ -1780,6 +1908,7 @@ mod tests {
             let control = registry.configure(
                 StableServerId(1),
                 ServerTransferConfig {
+                    closed: false,
                     rate_bytes_per_sec: rate,
                     quota: None,
                 },
@@ -1800,6 +1929,7 @@ mod tests {
         let control = registry.configure(
             StableServerId(31),
             ServerTransferConfig {
+                closed: false,
                 rate_bytes_per_sec: 1_000,
                 quota: None,
             },
@@ -1812,6 +1942,7 @@ mod tests {
         let worker = std::thread::spawn(move || worker_control.reserve_rate(1_000).unwrap());
         schedule_loaded.wait();
         control.update_config(ServerTransferConfig {
+            closed: false,
             rate_bytes_per_sec: 100,
             quota: None,
         });
@@ -1858,6 +1989,7 @@ mod tests {
         let control = registry.configure(
             StableServerId(11),
             ServerTransferConfig {
+                closed: false,
                 rate_bytes_per_sec: 20_000,
                 quota: None,
             },
@@ -1923,6 +2055,7 @@ mod tests {
         let control = registry.configure(
             StableServerId(12),
             ServerTransferConfig {
+                closed: false,
                 rate_bytes_per_sec: 1,
                 quota: None,
             },
@@ -1938,6 +2071,7 @@ mod tests {
         registry.configure(
             StableServerId(12),
             ServerTransferConfig {
+                closed: false,
                 rate_bytes_per_sec: 1_000_000_000,
                 quota: None,
             },
@@ -1951,6 +2085,7 @@ mod tests {
         let control = registry.configure(
             StableServerId(13),
             ServerTransferConfig {
+                closed: false,
                 rate_bytes_per_sec: 1_000,
                 quota: None,
             },
@@ -1960,6 +2095,7 @@ mod tests {
         registry.configure(
             StableServerId(13),
             ServerTransferConfig {
+                closed: false,
                 rate_bytes_per_sec: 100,
                 quota: None,
             },
@@ -1983,6 +2119,7 @@ mod tests {
         let control = registry.configure(
             StableServerId(14),
             ServerTransferConfig {
+                closed: false,
                 rate_bytes_per_sec: 10,
                 quota: Some(QuotaRuntimeConfig {
                     limit_bytes: 1_000,
@@ -2015,6 +2152,7 @@ mod tests {
         let control = registry.configure(
             StableServerId(15),
             ServerTransferConfig {
+                closed: false,
                 rate_bytes_per_sec: 0,
                 quota: Some(QuotaRuntimeConfig {
                     limit_bytes: 1_000,
@@ -2033,6 +2171,7 @@ mod tests {
             configure_registry.configure(
                 StableServerId(15),
                 ServerTransferConfig {
+                    closed: false,
                     rate_bytes_per_sec: 0,
                     quota: Some(QuotaRuntimeConfig {
                         limit_bytes: 1_000,
@@ -2312,6 +2451,7 @@ mod tests {
         let control = registry.configure(
             StableServerId(41),
             ServerTransferConfig {
+                closed: false,
                 rate_bytes_per_sec: 1_000_000,
                 quota: None,
             },
@@ -2377,6 +2517,7 @@ mod tests {
         let control = registry.configure(
             StableServerId(43),
             ServerTransferConfig {
+                closed: false,
                 rate_bytes_per_sec: 1_000_000,
                 quota: Some(QuotaRuntimeConfig {
                     limit_bytes: 10_000,
@@ -2427,6 +2568,7 @@ mod tests {
         let control = registry.configure(
             StableServerId(11),
             ServerTransferConfig {
+                closed: false,
                 rate_bytes_per_sec: 1,
                 quota: None,
             },
@@ -2535,6 +2677,7 @@ mod tests {
         let servers = ServerTransferRegistry::new();
         let egresses = servers.sibling(TransferScope::Egress);
         let rate = |rate_bytes_per_sec| ServerTransferConfig {
+            closed: false,
             rate_bytes_per_sec,
             quota: None,
         };

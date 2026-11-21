@@ -34,6 +34,26 @@ const testEvidenceMarginMs = 15_000;
 
 const expectedHttpErrorsByPage = new WeakMap<Page, ExpectedHttpError[]>();
 
+type ExpectedGraphqlError = {
+  /// The error message a GraphQL response must carry.
+  message: RegExp;
+  /// How many responses must carry it.
+  count: number;
+  seen: number;
+};
+
+const expectedGraphqlErrorsByPage = new WeakMap<Page, ExpectedGraphqlError[]>();
+
+/// A refusal the flow under test provokes on purpose comes back as a GraphQL
+/// error; name it so the clean-page check accepts exactly that many.
+export function expectGraphqlErrors(page: Page, message: RegExp, count = 1): void {
+  const expectations = expectedGraphqlErrorsByPage.get(page);
+  if (!expectations) {
+    throw new Error("expectGraphqlErrors requires the cleanPage fixture");
+  }
+  expectations.push({ message, count, seen: 0 });
+}
+
 export function expectHttpErrors(
   page: Page,
   expected: Omit<ExpectedHttpError, "count"> & { count?: number },
@@ -65,6 +85,8 @@ export const test = base.extend<WeaverFixtures>({
     const httpErrors: RecordedHttpError[] = [];
     const expectedHttpErrors: ExpectedHttpError[] = [];
     expectedHttpErrorsByPage.set(page, expectedHttpErrors);
+    const expectedGraphqlErrors: ExpectedGraphqlError[] = [];
+    expectedGraphqlErrorsByPage.set(page, expectedGraphqlErrors);
     const responseInspections: Promise<void>[] = [];
     page.on("console", (message) => {
       if (message.type() !== "error") return;
@@ -102,7 +124,7 @@ export const test = base.extend<WeaverFixtures>({
           ||
           request.method() !== "POST"
           || !response.url().includes("/graphql")
-          || !response.headers()["content-type"]?.includes("application/json")
+          || !/application\/(graphql-response\+)?json/.test(response.headers()["content-type"] ?? "")
         ) {
           return;
         }
@@ -111,9 +133,15 @@ export const test = base.extend<WeaverFixtures>({
           | undefined;
         const messages = (payload?.errors ?? [])
           .map(({ message }) => message ?? "unknown GraphQL error");
-        const unexpected = messages.filter(
-          (message) => !/source run has no failed or interrupted attempt/i.test(message),
-        );
+        const unexpected = messages.filter((message) => {
+          if (/source run has no failed or interrupted attempt/i.test(message)) return false;
+          const expected = expectedGraphqlErrors.find(
+            (candidate) => candidate.seen < candidate.count && candidate.message.test(message),
+          );
+          if (expected === undefined) return true;
+          expected.seen += 1;
+          return false;
+        });
         if (unexpected.length > 0) {
           failures.push(`graphql: ${unexpected.join(" | ")}`);
         }
@@ -148,6 +176,14 @@ export const test = base.extend<WeaverFixtures>({
       }
     }
     expectedHttpErrorsByPage.delete(page);
+    for (const expected of expectedGraphqlErrors) {
+      if (expected.seen < expected.count) {
+        failures.push(
+          `expected-graphql-error: wanted ${expected.count}x ${expected.message}, observed ${expected.seen}`,
+        );
+      }
+    }
+    expectedGraphqlErrorsByPage.delete(page);
     expect(failures, failures.join("\n")).toEqual([]);
   },
 });
