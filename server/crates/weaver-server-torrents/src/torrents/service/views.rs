@@ -502,15 +502,35 @@ impl TorrentService {
         &self,
         hashes: &std::collections::HashSet<weaver_torrent::core::Id20>,
     ) {
+        self.publish_picked(|live| {
+            live.values()
+                .filter(|torrent| hashes.contains(&hashes_of(&torrent.record).best()))
+                .map(|torrent| torrent.record.job_id)
+                .collect()
+        })
+        .await;
+    }
+
+    // The torrent of `job_id`, whose metadata fetch began or ended,
+    // published as a tracker change publishes its torrents: its row, its
+    // figures for the exporter and its job in the queue.
+    pub(super) async fn publish_fetch(&self, job_id: JobId) {
+        self.publish_picked(|live| {
+            live.contains_key(&job_id)
+                .then_some(job_id)
+                .into_iter()
+                .collect()
+        })
+        .await;
+    }
+
+    // The torrents `pick` takes from the live ones, published as
+    // `publish_hashes` says.
+    async fn publish_picked(&self, pick: impl FnOnce(&BTreeMap<JobId, Live>) -> Vec<JobId>) {
         let now = self.inner.clock.unix_ms();
         let stamp = self.inner.snapshot.stamp();
         let listed = self
-            .listed_by(Shown::LISTED, true, true, now, |_, live| {
-                live.values()
-                    .filter(|torrent| hashes.contains(&hashes_of(&torrent.record).best()))
-                    .map(|torrent| torrent.record.job_id)
-                    .collect()
-            })
+            .listed_by(Shown::LISTED, true, true, now, |_, live| pick(live))
             .await;
         if listed.is_empty() {
             return;

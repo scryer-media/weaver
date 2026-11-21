@@ -587,6 +587,13 @@ mod sys {
         set_to(socket, family, 0)
     }
 
+    // The socket's handle, which is pointer sized: a `SOCKET` is a `UINT_PTR`.
+    fn handle(socket: &impl super::AsSocket) -> io::Result<SOCKET> {
+        usize::try_from(socket.as_raw_socket())
+            .map(SOCKET)
+            .map_err(|_| io::Error::other("a socket handle wider than a pointer"))
+    }
+
     fn set_to(socket: &impl super::AsSocket, family: Family, value: i32) -> io::Result<()> {
         let (level, name) = option(family);
         let value = value.to_ne_bytes();
@@ -594,7 +601,7 @@ mod sys {
         // the option takes an int, which `value` holds.
         let done = unsafe {
             setsockopt(
-                SOCKET(socket.as_raw_socket() as usize),
+                handle(socket)?,
                 level,
                 name,
                 Some(&value),
@@ -607,11 +614,11 @@ mod sys {
     pub(super) fn get(socket: &impl super::AsSocket, family: Family) -> io::Result<bool> {
         let (level, name) = option(family);
         let mut value = [0u8; 4];
-        let mut len = value.len() as i32;
+        let mut len = 4_i32;
         // SAFETY: as in `set`; `value` has room for the int the option is.
         let done = unsafe {
             windows::Win32::Networking::WinSock::getsockopt(
-                SOCKET(socket.as_raw_socket() as usize),
+                handle(socket)?,
                 level,
                 name,
                 windows::core::PSTR(value.as_mut_ptr()),

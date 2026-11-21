@@ -390,6 +390,7 @@ async fn a_torrent_that_meets_its_goals_raises_seeding_finished_once() {
 // A torrent whose goal removes it queues SEEDING_FINISHED once its row is
 // gone, and the queue worker still runs it. Its TORRENT_ADDED, run only now,
 // is skipped: the file its script writes comes from SEEDING_FINISHED.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_queue_runs_seeding_finished_of_a_torrent_its_goal_removed() {
     let rig = rig(set_clock());
@@ -462,6 +463,7 @@ async fn a_torrent_raises_nothing_without_queue_scripts() {
 
 // A torrent's queue script is told its job's tags as it starts, as an NZB
 // job's is: one put on before the event was queued and one put on after.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_torrents_queue_script_is_told_its_jobs_tags() {
     let rig = rig(set_clock());
@@ -501,6 +503,7 @@ async fn a_torrents_queue_script_is_told_its_jobs_tags() {
 
 // The queue worker runs a live torrent's event: its job has a row in
 // `torrents`, not `active_jobs`.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_queue_runs_a_live_torrents_event() {
     let rig = rig(set_clock());
@@ -535,6 +538,7 @@ async fn the_queue_runs_a_live_torrents_event() {
 
 // One script saved for both TORRENT_ADDED and JOB_ADDED runs once for each,
 // told the name of the one it runs for.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_script_on_the_own_and_the_generic_event_runs_for_each() {
     use std::os::unix::fs::PermissionsExt;
@@ -664,6 +668,7 @@ async fn a_torrent_file_made_whole_queues_nothing_at_interval_minus_one() {
 // At interval 0 each file queues FILE_DOWNLOADED, but a job holds at most
 // one not yet started: files made whole while one waits add none. Once the
 // torrent's download is over, a file heard after raises nothing.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn each_file_of_a_torrent_queues_file_downloaded_one_waiting_at_a_time() {
     let rig = rig(set_clock());

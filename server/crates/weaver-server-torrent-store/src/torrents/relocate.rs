@@ -13,8 +13,14 @@ use std::path::{Path, PathBuf};
 
 use weaver_server_disk::operations::disk::beneath;
 
+// The name `path` is to a volume that folds names, built part by part so
+// that a path joined with `/` and one with `\` are one key on Windows.
 pub fn key_of(path: &Path) -> String {
-    weaver_graph::names::key(&path.to_string_lossy())
+    let parts: Vec<_> = path
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect();
+    weaver_graph::names::key(&parts.join("/"))
 }
 
 // What a move of placed files does with a file already at its destination

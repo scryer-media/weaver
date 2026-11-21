@@ -937,10 +937,12 @@ connections_limit = 0
             source("https://lists.example/level1.p2p"),
             BlocklistSource::Http(_)
         ));
-        assert_eq!(
-            source("file:///var/lib/weaver/level1.p2p"),
-            BlocklistSource::File("/var/lib/weaver/level1.p2p".into())
-        );
+        // A file URL is the platform's path it names.
+        #[cfg(not(windows))]
+        let (file_url, file_path) = ("file:///var/lib/weaver/level1.p2p", "/var/lib/weaver/level1.p2p");
+        #[cfg(windows)]
+        let (file_url, file_path) = ("file:///C:/lists/level1.p2p", r"C:\lists\level1.p2p");
+        assert_eq!(source(file_url), BlocklistSource::File(file_path.into()));
         // Every other scheme is a path, a Windows drive letter among them.
         for path in [
             r"C:\lists\level1.p2p",

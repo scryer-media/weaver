@@ -1158,7 +1158,8 @@ pub trait PostProcessingEventsInvalidateQueueScriptAdmissionInternalQueries {
     fn admitted_so_far(&self) -> impl std::future::Future<Output = ()> + Send;
     #[cfg(any(test, feature = "test-support"))]
     fn enable_queue_scripts_for_test(&self, root: &std::path::Path);
-    #[cfg(any(test, feature = "test-support"))]
+    // A shell script and its supervisor wrapper: Unix only.
+    #[cfg(all(unix, any(test, feature = "test-support")))]
     fn tag_reporting_queue_script_for_test(&self, out: &std::path::Path) -> PathBuf;
     #[cfg(any(test, feature = "test-support"))]
     fn run_next_queue_event_for_test(
@@ -1459,7 +1460,7 @@ impl<D: PostprocDatabase> PostProcessingEventsInvalidateQueueScriptAdmissionInte
     // it, or `unset`, to a file under `out` named for the job id, or `none`
     // for a jobless event. Returns the supervisor a run must be given: this
     // test binary, run as the real one.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(all(unix, any(test, feature = "test-support")))]
     fn tag_reporting_queue_script_for_test(&self, out: &std::path::Path) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         std::fs::create_dir_all(out).unwrap();
@@ -2383,6 +2384,8 @@ pub fn post_processing_supervisor_child_for_test() {
         // the harness to /dev/null; hand the pipe back before speaking.
         // SAFETY: descriptor 3 is the wrapper's duplicate of the runner's
         // stdout pipe, and nothing in this process has opened another 3.
+        // Only the Unix wrapper sets the variable.
+        #[cfg(unix)]
         unsafe {
             assert_eq!(libc::dup2(3, 1), 1);
             libc::close(3);

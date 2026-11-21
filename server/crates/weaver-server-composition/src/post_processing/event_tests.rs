@@ -873,6 +873,7 @@ async fn every_script_shares_one_pool_whose_size_applies_to_the_next_waiter() {
 // A queue script is told the job's tags as it starts, comma separated, not
 // the tags the job had when its event was queued. A job with no tag is told
 // an empty list; a jobless event is told nothing.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_queue_script_is_told_the_jobs_tags_as_it_starts() {
     let (db, data) = configured();
@@ -943,6 +944,7 @@ async fn a_queue_script_is_told_the_jobs_tags_as_it_starts() {
 }
 
 // ROUTE_DOWN belongs to no job, and the queue worker runs it.
+#[cfg(unix)]
 #[tokio::test]
 async fn the_queue_runs_a_route_down_that_belongs_to_no_job() {
     let (db, data) = configured();
@@ -973,6 +975,7 @@ async fn the_queue_runs_a_route_down_that_belongs_to_no_job() {
 
 // ROUTE_UP reaches a queue script with the route's egress, kind and name,
 // and no reason at all.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_queue_script_gets_route_up_with_its_route() {
     use std::os::unix::fs::PermissionsExt;
@@ -1020,6 +1023,7 @@ async fn a_queue_script_gets_route_up_with_its_route() {
 // the ones raised as or after a job leaves: NZB_DELETED, TORRENT_DELETED,
 // JOB_DELETED, NZB_MARKED, TORRENT_MARKED, SEEDING_STOPPED and
 // SEEDING_FINISHED.
+#[cfg(unix)]
 #[tokio::test]
 async fn the_queue_runs_only_leaving_events_of_a_job_in_no_queue() {
     let (db, data) = configured();

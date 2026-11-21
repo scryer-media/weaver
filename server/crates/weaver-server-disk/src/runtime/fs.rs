@@ -201,7 +201,8 @@ impl JobMoves {
             let copy = folder.join(move_copy_name(self.job, n));
             // Made new, so it is this move's own; a name something else
             // holds is passed over. The copy that failed removed what it
-            // made.
+            // made, so a name still held is held by something else, which
+            // Windows answers as denied when it is a folder.
             match file_cache::copy_large_file(src, &copy) {
                 Ok(_) => {
                     made = Some(Ok(copy));
@@ -209,6 +210,9 @@ impl JobMoves {
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                     made = Some(Err(error));
+                }
+                Err(_) if std::fs::symlink_metadata(&copy).is_ok() => {
+                    made = Some(Err(io::Error::from(io::ErrorKind::AlreadyExists)));
                 }
                 Err(error) => return Err(error),
             }

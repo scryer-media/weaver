@@ -1074,7 +1074,7 @@ impl TorrentService {
         {
             torrent.fetching = fetch;
         }
-        self.publish_job(job_id).await;
+        self.publish_fetch(job_id).await;
         #[cfg(any(test, feature = "test-support"))]
         if ended {
             self.inner.fetches_ended.send_modify(|ended| *ended += 1);

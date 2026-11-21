@@ -331,7 +331,8 @@ fn each_change_patches_the_tags_in_memory_as_a_whole_read_finds_them() {
     let every_seventh: Vec<JobId> = ids.iter().copied().step_by(7).collect();
     db.add_job_tags(&ids[..400], ["tag10", "TV"]).unwrap();
     db.tag_snapshot().unwrap();
-    let changes: Vec<(&str, Box<dyn Fn(&Database)>)> = vec![
+    type Change<'a> = Box<dyn Fn(&Database) + 'a>;
+    let changes: Vec<(&str, Change<'_>)> = vec![
         (
             "add",
             Box::new(|db| db.add_job_tags(&every_third, ["tag2", "tv"]).unwrap()),
