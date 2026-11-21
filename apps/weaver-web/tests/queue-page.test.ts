@@ -109,9 +109,17 @@ test("a row a slow disk holds back runs at the disk's rate, with what waits for 
   const pace = diskPace(rows, volumes);
   assert.deepEqual([...pace.byId], [[7, { rate: 50, waiting: 400 }]]);
   assert.equal(pace.slowest, 25);
-  // While something downloads, the other rows keep the download speed.
-  assert.deepEqual([...etaById(through, 100, format, pace)], [
+  // While something downloads below the disk's rate, the held row runs at
+  // the disk's rate and the other rows keep the download speed.
+  assert.deepEqual([...etaById(through, 20, format, pace)], [
     [7, "10s"],
+    [3, "15s"],
+    [9, "25s"],
+  ]);
+  // A speed above the disk's measured rate: the held row runs no slower
+  // than the queue does, and still counts what waits for the disk.
+  assert.deepEqual([...etaById(through, 100, format, pace)], [
+    [7, "5s"],
     [3, "3s"],
     [9, "5s"],
   ]);

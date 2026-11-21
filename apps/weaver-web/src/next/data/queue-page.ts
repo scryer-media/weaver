@@ -167,7 +167,9 @@ const NO_DISK_PACE: DiskPace = { byId: new Map(), slowest: 0 };
  * waiting or downloading job's ahead of it, at `speed`.
  *
  * With `disk`, a row a slow disk holds back counts its volume's waiting bytes
- * too, at that volume's write rate; any other row falls back to the slowest
+ * too, at that volume's write rate or at `speed` when that is higher (a
+ * measured rate sags while the disk is shared, and no row runs slower than
+ * the queue's own time left); any other row falls back to the slowest
  * disk's rate when nothing is downloading, since the queue drains no faster.
  * Without a slow disk the estimates are the plain ones.
  */
@@ -185,7 +187,7 @@ export function etaById(
   for (const { id, bytesThrough } of etaThrough) {
     const held = disk.byId.get(id);
     if (held && held.rate > 0) {
-      estimates.set(id, format(bytesThrough + held.waiting, held.rate));
+      estimates.set(id, format(bytesThrough + held.waiting, Math.max(held.rate, speed)));
     } else if (fallback > 0) {
       estimates.set(id, format(bytesThrough, fallback));
     }
