@@ -1181,7 +1181,7 @@ fn rig_order(torrents: &TorrentService) -> Vec<TorrentView> {
 // across filters, sorts, pages, hashes, privacy and the trackers and files
 // listed, and the limit readings of every torrent, build no torrent's view
 // and take the database for no statement. Torrents are off, so no tick
-// publishes while the polls run.
+// publishes while the polls run, and the tick is held so none writes.
 #[tokio::test]
 async fn torrents_info_polls_build_no_view_and_read_nothing() {
     const STORED: u64 = 10_000;
@@ -1203,6 +1203,9 @@ async fn torrents_info_polls_build_no_view_and_read_nothing() {
     // The facade's first request of any kind takes the database once, an
     // `app/version` as much as a list: that one is not a poll's.
     assert_eq!(rig.get("/api/v2/app/version").await.status, StatusCode::OK);
+    // The service's tick runs on its own interval and may write a
+    // checkpoint; held, it cannot land among the polls on a slow runner.
+    let _tick = torrents.hold_tick().await;
     let (views, statements) = (torrents.views_built(), rig.db.datastore_takes());
     let mut answered = Vec::new();
     for _ in 0..3 {
