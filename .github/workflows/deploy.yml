@@ -996,7 +996,7 @@ jobs:
   rust-package-linux-x86_64-portable:
     name: rust-package-linux-x86_64-portable
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     needs: [changes, verify-release-tag, web-build]
     if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.web-build.result == 'success' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
     env:
@@ -1091,7 +1091,7 @@ jobs:
   rust-package-linux-arm64-portable:
     name: rust-package-linux-arm64-portable
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 60
+    timeout-minutes: 90
     needs: [changes, verify-release-tag, web-build]
     if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.web-build.result == 'success' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
     env:
@@ -1192,7 +1192,7 @@ jobs:
     name: rust-package-darwin-x86_64-portable
     # Intel image: this artifact is built natively, never cross-arch.
     runs-on: macos-15-intel
-    timeout-minutes: 90
+    timeout-minutes: 120
     needs: [changes, verify-release-tag, web-build]
     if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.web-build.result == 'success' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
     env:
@@ -1466,7 +1466,7 @@ jobs:
   rust-package-darwin-arm64-portable:
     name: rust-package-darwin-arm64-portable
     runs-on: macos-26
-    timeout-minutes: 90
+    timeout-minutes: 120
     needs: [changes, verify-release-tag, web-build]
     if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.web-build.result == 'success' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
     env:
@@ -1738,7 +1738,7 @@ jobs:
   rust-package-windows-x86_64:
     name: rust-package-windows-x86_64
     runs-on: windows-2025-vs2026
-    timeout-minutes: 90
+    timeout-minutes: 120
     needs: [changes, verify-release-tag, web-build]
     if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.web-build.result == 'success' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
     env:
@@ -2143,7 +2143,7 @@ jobs:
   rust-package-windows-arm64:
     name: rust-package-windows-arm64
     runs-on: windows-11-arm
-    timeout-minutes: 90
+    timeout-minutes: 120
     needs: [changes, verify-release-tag, web-build]
     if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.web-build.result == 'success' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
     env:
