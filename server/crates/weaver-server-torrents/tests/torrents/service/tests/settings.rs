@@ -846,8 +846,9 @@ fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_defaul
 // Each seeding term resolves on its own over the levels. A torrent's terms
 // kept before terms were leaves read with their mode and action set, so
 // they resolve as they did; terms set now that give only a ratio take the
-// time goal and the mode from the category, and the action from the global
-// terms, and each term names the level it came from.
+// time goal from the category and the action from the global terms, and
+// each term names the level it came from. The mode is never inherited: the
+// torrent sets a goal, so its own mode holds, Any, over the category's All.
 #[test]
 fn each_seeding_term_resolves_over_the_levels_on_its_own() {
     let (mut record, rule, mut settings) = chain();
@@ -892,7 +893,7 @@ fn each_seeding_term_resolves_over_the_levels_on_its_own() {
             ratio_goal: Some(2.0),
             seed_time_goal_minutes: Some(72 * 60),
             inactive_goal_minutes: None,
-            mode: SeedingGoalMode::All,
+            mode: SeedingGoalMode::Any,
             action: SeedingAction::Stop,
         }
     );
@@ -903,11 +904,18 @@ fn each_seeding_term_resolves_over_the_levels_on_its_own() {
             ratio_goal: Level::Torrent,
             seed_time_goal_minutes: Level::Category,
             inactive_goal_minutes: Level::Global,
-            mode: Level::Category,
+            mode: Level::Torrent,
             action: Level::Global,
             upload_cap: Level::Global,
         }
     );
+
+    // A torrent with no goal of its own takes the category's mode with the
+    // category's goals.
+    record.policy_override = None;
+    let (seeding, levels) = settings.seeding(&record, Some(&rule));
+    assert_eq!(seeding.mode, SeedingGoalMode::All);
+    assert_eq!(levels.mode, Level::Category);
 }
 
 // A term switched off at a level drops what the levels above set; one left

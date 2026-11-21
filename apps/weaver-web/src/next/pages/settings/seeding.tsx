@@ -386,7 +386,7 @@ const durationField = (label: string, fieldId: string) => (value: number, onValu
 /**
  * The terms' fields: their three goals, whether any or all of them end
  * seeding, and what is done then. `inherits` is true below the global level,
- * where each term can inherit.
+ * where each term but the mode can inherit.
  */
 export function seedingFields(
   t: Translate,
@@ -491,17 +491,16 @@ export function seedingFields(
         />
       ),
     ),
+    // The mode is never inherited: each level holds its own, Any unless set,
+    // and the most specific level that sets a goal decides with it.
     {
       id: `${prefix}-mode`,
       label: t("next.seeding.mode"),
       control: {
         kind: "segmented",
-        value: choice(policy.mode, "ANY"),
-        options: [
-          ...(options.inherits ? [inherit] : []),
-          ...MODES.map((option) => ({ ...option, label: t(option.label) })),
-        ],
-        onChange: (mode) => patch({ mode: fromChoice<SeedingMode>(mode) }),
+        value: leafValue(policy.mode) ?? "ANY",
+        options: MODES.map((option) => ({ ...option, label: t(option.label) })),
+        onChange: (mode) => patch({ mode: leafSet(mode as SeedingMode) }),
       },
     },
     {
@@ -534,7 +533,7 @@ export function seedingFields(
   ];
 }
 
-// The mode or action choice that inherits.
+// The action or counting choice that inherits.
 const INHERIT_CHOICE = "INHERIT";
 
 /** The rate a cap starts from when it is first set: 10 MB/s. */

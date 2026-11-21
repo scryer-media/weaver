@@ -148,6 +148,28 @@ impl SeedingPolicy {
             || self.inactive_goal_minutes.set().is_some()
     }
 
+    /// Its own goal mode: a mode is never inherited, and one kept as
+    /// inherited reads as Any.
+    pub fn own_mode(&self) -> SeedingGoalMode {
+        self.mode.set().unwrap_or_default()
+    }
+
+    /// The goal mode in force for a torrent, from the policy at each of its
+    /// levels, most specific first (torrent, tracker rule, category,
+    /// global): the own mode of the first level that sets a goal value. A
+    /// level that sets no goal gives no mode; with a goal at none, Any at
+    /// the global level.
+    pub fn mode_in_force(levels: [(Level, Option<Self>); 4]) -> (SeedingGoalMode, Level) {
+        levels
+            .into_iter()
+            .find_map(|(level, policy)| {
+                policy
+                    .filter(Self::sets_a_goal)
+                    .map(|policy| (policy.own_mode(), level))
+            })
+            .unwrap_or((SeedingGoalMode::default(), Level::Global))
+    }
+
     /// The policy as a level keeps it: none when every leaf inherits.
     pub fn kept(policy: Option<Self>) -> Option<Self> {
         policy.filter(|policy| !policy.inherits())

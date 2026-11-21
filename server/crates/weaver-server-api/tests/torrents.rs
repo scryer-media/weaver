@@ -581,7 +581,9 @@ async fn a_torrent_reads_its_leechers_file_progress_and_seeding_policy() {
     );
     assert_eq!(torrent["seedingPolicy"]["ratioGoal"], 2.0);
     assert_eq!(torrent["seedingPolicy"]["levels"]["ratioGoal"], "TORRENT");
-    assert_eq!(torrent["seedingPolicy"]["levels"]["mode"], "GLOBAL");
+    // The mode is never inherited: the torrent sets a goal, so its own
+    // mode holds.
+    assert_eq!(torrent["seedingPolicy"]["levels"]["mode"], "TORRENT");
 
     // A goal switched off at the torrent drops the one its category sets.
     let off = id(&read(submit(
