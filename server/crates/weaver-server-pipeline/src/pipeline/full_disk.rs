@@ -407,11 +407,28 @@ impl Pipeline {
             // held job of this pass is judged against it. So is a torrent
             // let go on the same disk. A job held in its download on its
             // root was judged above; here only its mark moves.
+            //
+            // A move held on a root for a figure it named is judged as the
+            // booking of its copy judges it: above everything the root's
+            // ledger takes off the reading, the promises of jobs started
+            // there with it, and the room promised beside the ledger. Let go
+            // on less, its booking would refuse it and the job would be held
+            // again, its delivery scanned once more, at every reading. One
+            // that named none waits for the figure to rise from what the
+            // disk showed with those promises on it already.
+            let moves = !matches!(hold.stage, Stage::Graph);
+            let booked = moves && hold.wait.needs.is_some() && !hold.wait.quota;
             let room = hold.wait.judge(
                 capacity,
                 reserve,
                 hold.go || graph_on_root,
-                |disk, device| capacity.promises().on(disk, device),
+                |disk, device| match disk {
+                    Disk::Root(root) if booked => capacity
+                        .promises()
+                        .off_ledger(disk, device)
+                        .saturating_add(capacity.taken_by_ledger(*root)),
+                    _ => capacity.promises().on(disk, device),
+                },
             );
             if let Some((bytes, device)) = room {
                 hold.go = true;
@@ -438,7 +455,6 @@ impl Pipeline {
             }
             // A move let go starts as a first move does, which waits while
             // post-processing is paused: the job stays held until then.
-            let moves = !matches!(hold.stage, Stage::Graph);
             if moves && self.shared_state.is_post_processing_paused() {
                 continue;
             }

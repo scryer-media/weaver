@@ -207,6 +207,47 @@ async fn a_move_with_no_room_for_its_copy_waits_before_writing_and_goes_on_with_
     all_delivered(&split.complete_dir, &split.working_dir);
 }
 
+// A job waiting for room for its copy, with another job's start promised
+// on the complete disk: a reading with room for the copy only inside that
+// promise keeps it waiting, as its booking would refuse it. One with room
+// for the copy above the promise lets it go, and the promise stands.
+#[tokio::test]
+async fn a_move_waiting_for_room_is_not_let_go_into_room_promised_to_a_start() {
+    let mut split = split_job(PLENTY).await;
+    complete_reads_before_move(&split.pipeline, &split.complete_room, BYTES - 1);
+    drive(&mut split.pipeline, &split.scenario, JOB, |pipeline| {
+        disk_held(pipeline, JOB)
+    })
+    .await;
+    move_held(&split.pipeline);
+    promise_on_complete(&split.pipeline, OTHER);
+
+    let booked = booked_told(&split.pipeline);
+    for short in [BYTES, BYTES + OTHER - 1] {
+        hears(
+            &mut split.pipeline,
+            &split.complete_room,
+            StorageRoot::Complete,
+            short,
+        );
+        move_held(&split.pipeline);
+        assert_eq!(register_on_complete(&split.pipeline), 0, "{short}");
+    }
+    assert!(booked.try_recv().is_err(), "no move ran to book");
+
+    hears(
+        &mut split.pipeline,
+        &split.complete_room,
+        StorageRoot::Complete,
+        BYTES + OTHER,
+    );
+    move_goes_on(&mut split).await;
+    assert_eq!(booked.try_recv(), Ok(OTHER + BYTES));
+    assert_eq!(complete_promised(&split.pipeline), OTHER);
+    assert_eq!(register_on_complete(&split.pipeline), 0);
+    all_delivered(&split.complete_dir, &split.working_dir);
+}
+
 // While the move holds its booking, a job whose start needs a GiB on the
 // complete disk, which reads a GiB and half the copy over its reserve, is
 // refused for room there, shown waiting for disk space. Once the move ends

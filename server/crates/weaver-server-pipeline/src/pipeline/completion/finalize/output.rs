@@ -1338,7 +1338,9 @@ async fn run_move_to_claimed_destination(
                         "the disk of {} has no room above its reserve for the {bytes} bytes the move copies",
                         dest.display()
                     ),
-                    path: dest,
+                    // The folder the destination is made in, whose disk the
+                    // booking was judged on: the job waits on that root.
+                    path: dest.parent().unwrap_or(&dest).to_path_buf(),
                     needs,
                     again: again.iter().cloned().collect(),
                     quota: false,
