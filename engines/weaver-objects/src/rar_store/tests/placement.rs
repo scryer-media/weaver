@@ -10,7 +10,8 @@
 
 use bytes::Bytes;
 use weaver_graph::{
-    Effect, Kind, MemberId, NodeId, Object, Posted, Provenance, Tree, VolumeIndex, Why,
+    ByteRange, Effect, Emit, Kind, MemberId, NodeId, Object, Posted, Provenance, Tree, VolumeIndex,
+    Why,
 };
 
 use super::super::{claim, counts};
@@ -1905,5 +1906,63 @@ fn a_set_overstating_its_member_restored_after_every_step_ends_it_whole() {
             vec![(MemberId(0), body.len() as u64)],
             "{shape}"
         );
+    }
+}
+
+// A two-volume RAR4 set whose end records state no number, posted with its
+// old-numbering names swapped: the first volume under `<hex>.r00`, the
+// second under `<hex>.rar`. The second continues a member, so its headers
+// refute the first place its name gives it, and that name numbers it
+// nowhere: its end read settles it where its links hold it. Delivered in
+// order, and fronts first, the member streams whole.
+#[test]
+fn a_continued_volume_named_first_is_settled_by_its_end() {
+    let mut options = super::split(Version::Rar4);
+    options.split = Some(5_000);
+    let body = payload(9, 2 * 5_000 - 700);
+    let set = write(&[Item::File("track.flac", body.clone())], &options);
+    assert_eq!(set.len(), 2);
+    let named = || {
+        vec![
+            (
+                "5f0c9e2ab1d74c6e8a3f1b0d9c2e7a41.r00".to_owned(),
+                set[0].clone(),
+            ),
+            (
+                "5f0c9e2ab1d74c6e8a3f1b0d9c2e7a41.rar".to_owned(),
+                set[1].clone(),
+            ),
+        ]
+    };
+    for fronts_first in [false, true] {
+        let mut owner = Owner::new(store(), named());
+        if fronts_first {
+            for (volume, bytes) in set.iter().enumerate() {
+                owner.deliver(volume, ByteRange::new(0, front(bytes).len() as u64));
+            }
+            for (volume, bytes) in set.iter().enumerate() {
+                let at = front(bytes).len() as u64;
+                owner.deliver(volume, ByteRange::new(at, bytes.len() as u64));
+            }
+            owner.close(0);
+            owner.close(1);
+        } else {
+            for volume in 0..2 {
+                owner.frames(volume, 1024);
+                owner.close(volume);
+            }
+        }
+        let got = owner.member("track.flac");
+        assert!(got.closed, "fronts first {fronts_first}");
+        assert_eq!(got.bytes, body, "fronts first {fronts_first}");
+        for emit in &owner.said {
+            assert!(
+                !matches!(
+                    emit,
+                    Emit::NeedsEngine(_) | Emit::Refuse(_) | Emit::Gap { .. }
+                ),
+                "fronts first {fronts_first}: {emit:?}"
+            );
+        }
     }
 }
