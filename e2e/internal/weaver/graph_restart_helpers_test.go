@@ -542,6 +542,7 @@ var testRustSteps = map[string][]string{
 	// These tests hold no torrents and no proxies.
 	"fill_tracker_hosts_v105":        nil,
 	"dns_profiles_from_proxies_v125": nil,
+	"fill_torrent_private_v126":      nil,
 }
 
 func TestEngineStampedRewindAllowsLaterGraphMigrationsToReplay(t *testing.T) {
@@ -598,8 +599,8 @@ func TestEngineStampedRewindAllowsLaterGraphMigrationsToReplay(t *testing.T) {
 		`CREATE TABLE servers (id INTEGER PRIMARY KEY NOT NULL)`,
 		`INSERT INTO servers (id) VALUES (1), (2)`,
 		`CREATE TABLE categories (id INTEGER PRIMARY KEY NOT NULL)`,
-		// Migration 21's seen RSS items, which migration 123 indexes.
-		`CREATE TABLE rss_seen_items (feed_id INTEGER NOT NULL, decision TEXT)`,
+		// Migration 21's seen RSS items, which migrations 123 and 136 index.
+		`CREATE TABLE rss_seen_items (feed_id INTEGER NOT NULL, decision TEXT, seen_at INTEGER NOT NULL)`,
 		`CREATE TABLE proxy_profiles (id INTEGER PRIMARY KEY NOT NULL, config TEXT NOT NULL)`,
 		`CREATE TABLE proxy_routes (consumer TEXT PRIMARY KEY NOT NULL, policy TEXT NOT NULL)`,
 		// Migration 53's egress tables, with a global limit and an egress
@@ -613,6 +614,12 @@ func TestEngineStampedRewindAllowsLaterGraphMigrationsToReplay(t *testing.T) {
 		`CREATE TABLE graph_members (job_id INTEGER, member_id INTEGER)`,
 		`CREATE TABLE graph_envelopes (job_id INTEGER, node_id INTEGER)`,
 		`CREATE TABLE graph_holds (job_id INTEGER)`,
+		// Migration 52's queue of script events, which migration 133 gives
+		// an occurrence, and migration 49's browser sessions, which
+		// migration 135 ends.
+		`CREATE TABLE script_event_queue (id INTEGER PRIMARY KEY NOT NULL)`,
+		`CREATE TABLE browser_sessions (id TEXT PRIMARY KEY NOT NULL)`,
+		`CREATE TABLE browser_session_verifications (session_id TEXT NOT NULL)`,
 		`INSERT INTO active_jobs (job_id, nzb_zstd) VALUES (7, x'0107'), (8, NULL)`,
 		`INSERT INTO job_history (job_id, name, status, nzb_zstd) VALUES (3, 'done', 'complete', x'0203')`,
 	}); err != nil {
