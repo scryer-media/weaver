@@ -1097,7 +1097,7 @@ const graphEngineMigration = 74
 // weaverMigrationsDir is the migration folder of the weaver under test, the
 // one its manifest and SQL steps are read from.
 func weaverMigrationsDir() string {
-	return filepath.Join(weaverRepoPath(), "server", "crates", "weaver-server-core", "src", "db", "migrations")
+	return filepath.Join(weaverRepoPath(), "server", "crates", "weaver-server-migrations", "src", "db", "migrations")
 }
 
 // migrationStep is one step of a migration as the manifest lists it: its kind

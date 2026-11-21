@@ -97,7 +97,7 @@ func TestSchemaRewindPlanTouchesOnlyWhatIsThere(t *testing.T) {
 
 // testMigrationsDir is the migration folder of the weaver this harness
 // lives in.
-var testMigrationsDir = filepath.Join("..", "..", "..", "server", "crates", "weaver-server-core", "src", "db", "migrations")
+var testMigrationsDir = filepath.Join("..", "..", "..", "server", "crates", "weaver-server-migrations", "src", "db", "migrations")
 
 // What the rewind drops is read from the migrations after the graph-engine
 // one, so a migration that adds a table or a column needs no line here.
