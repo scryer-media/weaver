@@ -122,7 +122,8 @@ impl Pipeline {
         // Whether it still holds anything is known only as it stops: a
         // volume's thread may return its last operation first, and the
         // graph then stays for the release below, as one that held nothing
-        // does.
+        // does. A graph kept unstopped drops the rest of its give-up, as a
+        // stopped one does: the job goes, and no wake reads more back.
         if self
             .graph_jobs
             .get(&job_id)
@@ -130,6 +131,8 @@ impl Pipeline {
             && let Some(graph) = self.stop_graph_job(job_id)
         {
             self.graph_jobs.insert(job_id, graph);
+        } else if let Some(graph) = self.graph_jobs.get_mut(&job_id) {
+            graph.end_give_up();
         }
         // A job whose graph is kept, for its mail or for a volume's writer,
         // whether stopped now or earlier, fails when that retirement ends:

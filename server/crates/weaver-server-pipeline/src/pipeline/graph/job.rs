@@ -768,7 +768,7 @@ impl GraphJob {
     // Keep ownership until stopped workers report that they ended. A
     // give-up's volumes not yet read back are not: the job goes.
     pub fn request_stop(&mut self) {
-        self.quieting = None;
+        self.end_give_up();
         self.runs.request_stop();
         self.loans.request_stop();
         self.works.request_stop();

@@ -78,6 +78,7 @@ pub mod disk_archive;
 pub mod disk_move_fixture;
 pub mod disk_reserve;
 pub mod feed_fixtures;
+pub mod give_up_failure;
 pub mod harness;
 pub mod rar_fixtures;
 pub mod recovery_actor;
