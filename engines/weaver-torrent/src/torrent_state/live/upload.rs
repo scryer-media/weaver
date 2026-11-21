@@ -133,6 +133,16 @@ impl TorrentStateLive {
         self.set_upload_mode(false);
     }
 
+    /// Enters upload mode at its owner's word, with no write refused: the
+    /// torrent fetches nothing and keeps seeding until its owner leaves it
+    /// by [`Self::leave_upload_mode`], as a mode a refused write entered
+    /// for a torrent added with
+    /// [`AddTorrentOptions::owner_wakes_full_disk`](crate::AddTorrentOptions::owner_wakes_full_disk)
+    /// does. Entered already, it goes on waiting for its owner.
+    pub fn hold_download(&self) {
+        self.enter_upload_mode(false, self.upload_epoch());
+    }
+
     /// How many times upload mode was left: taken before a write, it is
     /// what that write's refusal is read against.
     pub(crate) fn upload_epoch(&self) -> u64 {

@@ -13,6 +13,7 @@ use std::sync::atomic::AtomicU64;
 
 use super::*;
 use crate::jobs::handle::DISK_SPACE_WAIT_REASON;
+use crate::torrents::service::disk_room::DiskHeld;
 use crate::torrents::status::Stated;
 use weaver_server_disk::operations::disk::{
     DiskProbeError, DiskSpace, StorageCapacity, StorageRoot,
@@ -127,32 +128,82 @@ async fn waits_for_room(service: &TorrentService, job_id: JobId, waits: bool) {
         .unwrap();
 }
 
-// Until the torrent waits for room in upload mode: its handle, then.
-async fn held(disk: &OnDisk) -> Arc<ManagedTorrent> {
-    let torrent = handle_of(&disk.rig.service, disk.job_id).await;
+// The torrent's disk hold.
+async fn disk_held(service: &TorrentService, job_id: JobId) -> Option<DiskHeld> {
+    service
+        .inner
+        .live
+        .lock()
+        .await
+        .get(&job_id)
+        .and_then(|torrent| torrent.disk_held)
+}
+
+// Until the torrent, kept from starting by a disk with no room for its
+// 65,536 bytes, runs wanting none of them: its start is judged with nothing
+// to fetch. Its handle, then.
+async fn runs_wanting_nothing(disk: &OnDisk) -> Arc<ManagedTorrent> {
+    let service = &disk.rig.service;
+    view_once(service, disk.job_id, |view| {
+        view.stated == Some(Stated::DiskSpace)
+    })
+    .await;
+    service
+        .set_file_priorities(disk.job_id, &[(0, FilePriority::Ignored)])
+        .await
+        .unwrap();
+    service.apply_queue().await;
+    let torrent = handle_of(service, disk.job_id).await;
     torrent.wait_until_initialized().await.unwrap();
-    torrent.live().unwrap().wait_for_upload_mode(true).await;
-    waits_for_room(&disk.rig.service, disk.job_id, true).await;
+    assert!(!torrent.is_paused(), "it runs, wanting nothing");
     torrent
 }
 
-// A piece that would eat into the reserve finds no room: the torrent goes
-// upload-only and keeps its run, shown waiting for disk space as a usenet
-// job is, and only the disk's ledger is waited on. Room made on the disk
-// wakes it at the next reading, with no click.
+// Until the torrent, running and wanting none of its bytes, wants them
+// again on a disk with no room for them: the start rule refuses what it has
+// left, its download is held and it seeds, in upload mode, not paused,
+// waiting on the start rule's wait. Its handle, then.
+async fn held(disk: &OnDisk) -> Arc<ManagedTorrent> {
+    let torrent = runs_wanting_nothing(disk).await;
+    let service = &disk.rig.service;
+    service
+        .set_file_priorities(disk.job_id, &[(0, FilePriority::Normal)])
+        .await
+        .unwrap();
+    assert!(torrent.live().unwrap().upload_mode());
+    assert!(!torrent.is_paused());
+    assert_eq!(
+        disk_held(service, disk.job_id).await,
+        Some(DiskHeld::Fetching)
+    );
+    torrent
+}
+
+// A running torrent that wants its file again on a disk with no room over
+// the reserve for it has its download held: the start rule refuses what it
+// has left, its promise goes back, and its session goes upload-only and
+// keeps its run, seeding, shown waiting for disk space with the figures of
+// why, as a usenet job kept from starting is. Only the disk's ledger is
+// waited on, and no wait for a piece's room is installed. Room made on the
+// disk wakes it at the next reading, with no click: it is judged and
+// promised what it has left, and fetches again. No piece came while it was
+// held: what it is promised is all 65,536 bytes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_full_disk_holds_the_torrent_seeding_until_a_reading_shows_room() {
-    // Room to start over the reserve, none for a piece.
     let room = Arc::new(AtomicU64::new(1));
     let disk = on_disk(&room).await;
     let service = &disk.rig.service;
+    let ledger = disk.capacity.ledger(StorageRoot::Complete);
     let torrent = held(&disk).await;
     let run = torrent.live().unwrap();
     assert!(!torrent.is_paused(), "the run goes on, seeding");
-    assert!(run.upload_mode());
     let view = service.torrent(disk.job_id).await.unwrap();
     assert_eq!(view.state, TorrentState::Stalled);
     assert_eq!(view.stated, Some(Stated::DiskSpace));
+    assert_eq!(
+        (view.disk_need_bytes, view.disk_free_bytes),
+        (Some(65_536), Some(1))
+    );
     service.publish_job(disk.job_id).await;
     assert_eq!(
         service.inner.queue.lock().unwrap().as_ref().map(|queue| {
@@ -163,38 +214,47 @@ async fn a_full_disk_holds_the_torrent_seeding_until_a_reading_shows_room() {
         }),
         Some(Some(DISK_SPACE_WAIT_REASON.to_owned()))
     );
+    assert_eq!(ledger.promised_total(), 0, "its promise went back");
+    assert!(ledger.waited_on());
+    assert!(locked(&service.inner.start_held).iter().any(|wait| wait.held()));
+    assert!(!locked(&service.inner.disk_waits).contains_key(&disk.job_id));
 
-    // Room is made: the next reading lets it fetch again. The run leaves
-    // upload mode before its wait ends. Whether it completes then rests on
-    // the seeder taking it back, which is the engine's to time.
+    // Nothing more comes from here, so what it is promised as it is let go
+    // is what it had left while held.
+    disk.seeding.stop().await;
     room.store(PLENTY, Ordering::Release);
     disk.capacity.request_refresh(StorageRoot::Complete);
-    waits_for_room(service, disk.job_id, false).await;
-    assert!(!run.upload_mode());
+    run.wait_for_upload_mode(false).await;
+    assert_eq!(disk_held(service, disk.job_id).await, None);
+    assert_eq!(ledger.promised_total(), 65_536);
     assert!(!torrent.is_paused());
-    assert!(!disk.capacity.ledger(StorageRoot::Complete).waited_on());
+    assert!(!ledger.waited_on());
+    assert!(!locked(&service.inner.start_held).iter().any(|wait| wait.held()));
     service.stop().await;
-    disk.seeding.stop().await;
 }
 
-// A resume lets the torrent fetch again at once, whatever the readings
-// say, as a usenet job held for a full disk is let go by its user.
+// A resume of a torrent whose download is held is judged by the start rule,
+// as a usenet job's resume is: with no room it stays held, seeding, with
+// its figures, and is not let go whatever the readings say.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_resume_lets_a_torrent_waiting_for_room_fetch_again() {
-    // Room to start over the reserve, none for a piece.
     let room = Arc::new(AtomicU64::new(1));
     let disk = on_disk(&room).await;
     let service = &disk.rig.service;
     let run = held(&disk).await.live().unwrap();
-    // Nothing more comes, so no write finds the disk full again.
     disk.seeding.stop().await;
 
     service.resume(disk.job_id).await.unwrap();
-    assert!(!locked(&service.inner.disk_waits).contains_key(&disk.job_id));
-    assert!(!run.upload_mode());
+    assert!(run.upload_mode());
+    assert_eq!(
+        disk_held(service, disk.job_id).await,
+        Some(DiskHeld::Fetching)
+    );
     let view = service.torrent(disk.job_id).await.unwrap();
-    assert_ne!(view.stated, Some(Stated::DiskSpace));
-    assert!(!disk.capacity.ledger(StorageRoot::Complete).waited_on());
+    assert_eq!(view.stated, Some(Stated::DiskSpace));
+    assert_eq!(view.disk_need_bytes, Some(65_536));
+    assert!(!not_running(service, disk.job_id).await);
+    assert!(disk.capacity.ledger(StorageRoot::Complete).waited_on());
     service.stop().await;
 }
 
@@ -223,7 +283,7 @@ async fn a_short_disk_keeps_a_torrent_with_bytes_to_fetch_from_starting() {
     assert_eq!(view.state, TorrentState::Queued);
     assert_eq!(view.downloaded_bytes, 0);
     assert!(not_running(service, disk.job_id).await, "it does not start");
-    assert!(locked(&service.inner.start_held).iter().any(|held| *held));
+    assert!(locked(&service.inner.start_held).iter().any(|wait| wait.held()));
     assert!(disk.capacity.ledger(StorageRoot::Complete).waited_on());
 
     room.store(PLENTY, Ordering::Release);
@@ -234,7 +294,7 @@ async fn a_short_disk_keeps_a_torrent_with_bytes_to_fetch_from_starting() {
     .await;
     let torrent = handle_of(service, disk.job_id).await;
     torrent.wait_until_completed().await.unwrap();
-    assert!(!locked(&service.inner.start_held).iter().any(|held| *held));
+    assert!(!locked(&service.inner.start_held).iter().any(|wait| wait.held()));
     assert!(!disk.capacity.ledger(StorageRoot::Complete).waited_on());
     service.stop().await;
     disk.seeding.stop().await;
@@ -287,7 +347,7 @@ async fn a_short_disk_starts_a_complete_torrent_seeding() {
     assert!(
         !locked(&rig.service.inner.start_held)
             .iter()
-            .any(|held| *held)
+            .any(|wait| wait.held())
     );
     rig.service.stop().await;
 }
@@ -318,9 +378,9 @@ async fn placed(service: &TorrentService, job_id: JobId) -> crate::torrents::int
 }
 
 // A torrent saved on a disk with no room, while the complete root's has
-// plenty: its pieces book on its own disk's ledger, it waits there, and a
-// reading of that disk with room wakes it. Nothing is booked or waited on
-// on the complete root's.
+// plenty: what it has left is judged on its own disk, its download is held
+// there, and a reading of that disk with room lets it go, promised there.
+// Nothing is promised or waited on on the complete root's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_torrent_saved_on_another_disk_waits_on_that_disk() {
     let complete = tempfile::tempdir().unwrap();
@@ -329,7 +389,6 @@ async fn a_torrent_saved_on_another_disk_waits_on_that_disk() {
     std::fs::create_dir_all(&save).unwrap();
     weaver_server_disk::runtime::fs::test_devices::assign(complete.path(), 71_001);
     weaver_server_disk::runtime::fs::test_devices::assign(working.path(), 71_002);
-    // Room to start over the reserve on the working disk, none for a piece.
     let room = Arc::new(AtomicU64::new(1));
     let read = Arc::clone(&room);
     let full = working.path().to_path_buf();
@@ -358,47 +417,59 @@ async fn a_torrent_saved_on_another_disk_waits_on_that_disk() {
     let place = placed(service, disk.job_id).await;
     assert_eq!(place.disk, Disk::Root(StorageRoot::Intermediate));
     let run = held(&disk).await.live().unwrap();
-    assert_eq!(ledger_wait(service, disk.job_id), Some(16_384));
-    assert!(disk.capacity.ledger(StorageRoot::Intermediate).waited_on());
+    let view = service.torrent(disk.job_id).await.unwrap();
+    assert_eq!(
+        (view.disk_need_bytes, view.disk_free_bytes),
+        (Some(65_536), Some(1))
+    );
+    let working_ledger = disk.capacity.ledger(StorageRoot::Intermediate);
+    assert!(working_ledger.waited_on());
     let complete_ledger = disk.capacity.ledger(StorageRoot::Complete);
     assert!(!complete_ledger.waited_on());
     assert_eq!(complete_ledger.promised(), 0);
 
-    // Room on its own disk wakes it.
+    // Room on its own disk lets it go.
+    disk.seeding.stop().await;
     room.store(PLENTY, Ordering::Release);
     disk.capacity.request_refresh(StorageRoot::Intermediate);
-    waits_for_room(service, disk.job_id, false).await;
-    assert!(!run.upload_mode());
-    assert!(!disk.capacity.ledger(StorageRoot::Intermediate).waited_on());
+    run.wait_for_upload_mode(false).await;
+    assert_eq!(disk_held(service, disk.job_id).await, None);
+    assert_eq!(working_ledger.promised_total(), 65_536);
+    assert!(!working_ledger.waited_on());
     assert_eq!(complete_ledger.promised(), 0);
     service.stop().await;
-    disk.seeding.stop().await;
 }
 
-// A piece the ledger refuses because what other writers promised leaves
-// no room over the reserve waits on the ledger, as a usenet job's refused
-// booking does. Those writers give their promises back: the disk's free
-// figure never moves, and the torrent is woken by the ledger's ring, its
-// piece promised to it at once. The seeds it let go while it only
-// uploaded are dialled again at once, and it completes.
+// A torrent whose grown files do not fit because what other writers
+// promised leaves no room over the reserve has its download held, showing
+// the room those promises leave. Those writers give their promises back:
+// the disk's free figure never moves, and the torrent is let go by the
+// ledger's ring, promised what it has left. The seeds it let go while it
+// only uploaded are dialled again at once, and it completes with nothing
+// left promised.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_torrent_held_by_promises_wakes_when_they_are_released() {
-    // 70 KiB over the reserve, 60 of them promised elsewhere: room to start,
-    // none for a 16 KiB piece. Given back, all four pieces fit.
+    // 70 KiB over the reserve, 60 of them promised elsewhere: no room for
+    // 64 KiB. Given back, it fits.
     let room = Arc::new(AtomicU64::new(70 << 10));
     let disk = on_disk_promised(&room, 60 << 10).await;
     let service = &disk.rig.service;
     let ledger = disk.capacity.ledger(StorageRoot::Complete);
     let torrent = held(&disk).await;
     let run = torrent.live().unwrap();
-    assert_eq!(ledger_wait(service, disk.job_id), Some(16_384));
+    let view = service.torrent(disk.job_id).await.unwrap();
+    assert_eq!(
+        (view.disk_need_bytes, view.disk_free_bytes),
+        (Some(65_536), Some(10 << 10))
+    );
 
     ledger.release(60 << 10);
     run.wait_for_upload_mode(false).await;
-    waits_for_room(service, disk.job_id, false).await;
     torrent.wait_until_completed().await.unwrap();
     assert!(!run.upload_mode());
+    assert_eq!(disk_held(service, disk.job_id).await, None);
     assert!(!locked(&service.inner.disk_waits).contains_key(&disk.job_id));
+    promised(ledger, 0).await;
     assert!(!ledger.waited_on());
     service.stop().await;
     disk.seeding.stop().await;
@@ -418,12 +489,11 @@ async fn a_refusal_heard_after_the_wake_installs_no_wait() {
     disk.seeding.stop().await;
     ledger.release(60 << 10);
     run.wait_for_upload_mode(false).await;
-    waits_for_room(service, disk.job_id, false).await;
+    assert_eq!(disk_held(service, disk.job_id).await, None);
     // The refusal of a write made before the wake, heard now. It is said as
-    // the intake says one, and the ledger is left with room: a piece the
-    // run fetched before the wake may still be written after it, and with
-    // room for all four pieces no such write is refused and enters upload
-    // mode on its own.
+    // the intake says one, and the ledger is left with room: with the
+    // seeder gone, no write is made after the wake to be refused and enter
+    // upload mode on its own.
     service.inner.signal.heard(
         disk.job_id,
         crate::torrents::intake::Heard::NotBooked(16_384),
@@ -461,13 +531,315 @@ async fn on_disk_promised(room: &Arc<AtomicU64>, promised: u64) -> OnDisk {
     .await
 }
 
-// Two torrents that never fetched a byte on a disk with no room over the
-// reserve are kept from starting, as a usenet job that never downloaded
-// is. One that downloaded before, by the bytes its ledger counts, starts
-// at the next pass: what it writes next waits for room as a write that
-// finds none does.
+// Until `ledger` holds `bytes` promised.
+async fn promised(ledger: &weaver_server_disk::operations::disk::DiskLedger, bytes: u64) {
+    while ledger.promised_total() != bytes {
+        tokio::task::yield_now().await;
+    }
+}
+
+// The start rule usenet jobs start by, on the complete root.
+fn usenet_rule() -> weaver_server_disk::operations::start_rule::StartRule {
+    weaver_server_disk::operations::start_rule::StartRule {
+        working: StorageRoot::Complete,
+        output: StorageRoot::Complete,
+        reserve: RESERVE,
+    }
+}
+
+// 4,000 bytes over the reserve: the 65,536 byte torrent does not fit and
+// waits, showing what it needs and what the disk leaves; a 3,000 byte one
+// added after it fits, starts, and is promised its bytes on the ledger. A
+// usenet start of 2,000 is then refused for the 1,000 left. A pause gives
+// the promise back, and a resume promises it again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_short_disk_holds_a_torrent_that_never_downloaded_and_starts_one_that_did() {
+async fn a_start_is_promised_what_it_fetches_and_one_that_does_not_fit_waits() {
+    let room = Arc::new(AtomicU64::new(4_000));
+    let disk = on_disk(&room).await;
+    let service = &disk.rig.service;
+    let capacity = &disk.capacity;
+    let ledger = capacity.ledger(StorageRoot::Complete);
+    let view = view_once(service, disk.job_id, |view| {
+        view.stated == Some(Stated::DiskSpace)
+    })
+    .await;
+    assert_eq!(view.disk_need_bytes, Some(65_536));
+    assert!(matches!(view.disk_free_bytes, Some(4_000 | 1_000)));
+    assert!(not_running(service, disk.job_id).await);
+
+    let small = service
+        .add_opened(request(AddSource::Metainfo(plain("small", 1))))
+        .await
+        .unwrap();
+    promised(ledger, 3_000).await;
+    assert!(!not_running(service, small).await, "the smaller one starts");
+    assert_eq!(
+        usenet_rule().book_on(capacity, StorageRoot::Complete, 2_000, 2_000),
+        Err(weaver_server_disk::operations::disk::StartBooking::Short {
+            room: 1_000,
+            need: 2_000,
+            part: 0
+        })
+    );
+    assert!(not_running(service, disk.job_id).await, "the large one waits");
+
+    service.pause(small).await.unwrap();
+    promised(ledger, 0).await;
+    service.resume(small).await.unwrap();
+    promised(ledger, 3_000).await;
+    service.stop().await;
+    disk.seeding.stop().await;
+}
+
+// A usenet start's promise counts against a torrent: with 70,000 bytes
+// over the reserve and 10,000 of them promised to a usenet job by the
+// shared rule, the 65,536 byte torrent waits for the 60,000 left. Given
+// back, it starts, and its pieces draw on its own promise: once it is
+// complete nothing stays promised, so no byte was charged twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_usenet_promise_holds_a_torrent_and_its_pieces_draw_on_its_own() {
+    let room = Arc::new(AtomicU64::new(70_000));
+    let disk = on_disks(
+        {
+            let read = Arc::clone(&room);
+            move |_: &Path| {
+                Ok(DiskSpace {
+                    total_bytes: 1 << 40,
+                    available_bytes: RESERVE + read.load(Ordering::Acquire),
+                })
+            }
+        },
+        None,
+        None,
+        |capacity| {
+            assert_eq!(
+                usenet_rule().book_on(capacity, StorageRoot::Complete, 10_000, 10_000),
+                Ok((10_000, 0))
+            );
+        },
+    )
+    .await;
+    let service = &disk.rig.service;
+    let ledger = disk.capacity.ledger(StorageRoot::Complete);
+    let view = view_once(service, disk.job_id, |view| {
+        view.stated == Some(Stated::DiskSpace)
+    })
+    .await;
+    assert_eq!(view.disk_need_bytes, Some(65_536));
+    assert_eq!(view.disk_free_bytes, Some(60_000));
+
+    usenet_rule().give_back(&disk.capacity, 10_000, 0);
+    let torrent = handle_of(service, disk.job_id).await;
+    torrent.wait_until_completed().await.unwrap();
+    promised(ledger, 0).await;
+    service.stop().await;
+    disk.seeding.stop().await;
+}
+
+// A magnet's bytes are known only at its metadata, which comes while it
+// runs: it is judged then by the start rule. With 1,000 bytes over the
+// reserve its 3,000 bytes do not fit, so it is held as a torrent refused
+// at start is, showing need 3,000 and free 1,000. A reading with room lets
+// it go, promised its 3,000 bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_magnet_is_judged_when_its_metadata_comes() {
+    use crate::torrents::net::{LegKind, LegSockets};
+
+    let room = Arc::new(AtomicU64::new(1_000));
+    let read = Arc::clone(&room);
+    let dir = tempfile::tempdir().unwrap();
+    let capacity = Arc::new(StorageCapacity::with_probe(
+        [0, 1, 2].map(|_| dir.path().to_path_buf()),
+        NEVER,
+        Arc::new(move |_: &Path| {
+            Ok(DiskSpace {
+                total_bytes: 1 << 40,
+                available_bytes: RESERVE + read.load(Ordering::Acquire),
+            })
+        }),
+    ));
+    for root in StorageRoot::ALL {
+        capacity.wait_for_probes(root, 1);
+    }
+    let ledger = capacity.ledger(StorageRoot::Complete);
+    let rig = rig_with(set_clock(), disk_env(&capacity));
+    let loopback = Arc::new(weaver_tunnel::pipe::Revocable::new(Arc::new(
+        weaver_tunnel::pipe::Egress::new(
+            4,
+            weaver_tunnel::egress::SocketEgress::SourceAddress("127.0.0.1".parse().unwrap()),
+            Duration::MAX,
+        ),
+    )));
+    rig.routes.set_leg(
+        LegKind::Ladder,
+        Arc::new(LegSockets::new(loopback, &LegKind::Ladder)),
+    );
+    rig.service.publish_to(queue());
+    rig.service.open().await.unwrap();
+    let service = &rig.service;
+    let bytes = plain("late", 1);
+    let hash = parse(&bytes).unwrap().hashes.v1.unwrap().as_string();
+    // Its one named peer is a closed loopback port: no metadata comes but
+    // the one handed over below.
+    let job_id = service
+        .add_opened(request(AddSource::Magnet(format!(
+            "magnet:?xt=urn:btih:{hash}&x.pe=127.0.0.1:1"
+        ))))
+        .await
+        .unwrap();
+    // It runs: its metadata is fetched.
+    while !matches!(
+        service.inner.live.lock().await[&job_id].resolving,
+        Some(Resolving::Fetching(_))
+    ) {
+        tokio::task::yield_now().await;
+    }
+    service
+        .resolved(job_id, Bytes::from(bytes), &[], None)
+        .await
+        .unwrap();
+    let view = view_once(service, job_id, |view| {
+        view.stated == Some(Stated::DiskSpace)
+    })
+    .await;
+    assert_eq!(view.disk_need_bytes, Some(3_000));
+    assert_eq!(view.disk_free_bytes, Some(1_000));
+    assert!(not_running(service, job_id).await, "it is held");
+    assert_eq!(ledger.promised_total(), 0);
+
+    room.store(PLENTY, Ordering::Release);
+    capacity.request_refresh(StorageRoot::Complete);
+    view_once(service, job_id, |view| view.stated != Some(Stated::DiskSpace)).await;
+    promised(ledger, 3_000).await;
+    service.stop().await;
+}
+
+// A change to what a running torrent wants judges its start again. With
+// 4,000 bytes over the reserve a torrent of a 1,000 and a 2,000 byte file,
+// no peer serving it, is promised 3,000; skipping the second leaves 1,000
+// promised. A usenet start then takes 2,500. Wanting the second again
+// needs 3,000 of the 1,500 left: refused, so its promise goes back and
+// its download is held, its session in upload mode, not paused, showing
+// need 3,000 and free 1,500. The usenet promise given back lets it go:
+// judged, promised its 3,000, and out of upload mode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wanted_change_judges_the_start_again() {
+    let room = Arc::new(AtomicU64::new(4_000));
+    let disk = on_disk(&room).await;
+    let service = &disk.rig.service;
+    let capacity = &disk.capacity;
+    let ledger = capacity.ledger(StorageRoot::Complete);
+    view_once(service, disk.job_id, |view| {
+        view.stated == Some(Stated::DiskSpace)
+    })
+    .await;
+    let two = metainfo(
+        "two",
+        &[("two/a.bin", &[1; 1_000]), ("two/b.bin", &[2; 2_000])],
+        1024,
+        false,
+    );
+    let job_id = service
+        .add_opened(request(AddSource::Metainfo(two)))
+        .await
+        .unwrap();
+    promised(ledger, 3_000).await;
+
+    service
+        .set_file_priorities(job_id, &[(1, FilePriority::Ignored)])
+        .await
+        .unwrap();
+    promised(ledger, 1_000).await;
+    assert_eq!(
+        usenet_rule().book_on(capacity, StorageRoot::Complete, 2_500, 2_500),
+        Ok((2_500, 0))
+    );
+    assert_eq!(ledger.promised_total(), 3_500);
+
+    service
+        .set_file_priorities(job_id, &[(1, FilePriority::Normal)])
+        .await
+        .unwrap();
+    assert_eq!(ledger.promised_total(), 2_500, "its promise went back");
+    assert!(!not_running(service, job_id).await, "it keeps running");
+    assert_eq!(disk_held(service, job_id).await, Some(DiskHeld::Fetching));
+    let run = handle_of(service, job_id).await.live().unwrap();
+    assert!(run.upload_mode(), "its download is held");
+    let view = service.torrent(job_id).await.unwrap();
+    assert_eq!(view.stated, Some(Stated::DiskSpace));
+    assert_eq!(
+        (view.disk_need_bytes, view.disk_free_bytes),
+        (Some(3_000), Some(1_500))
+    );
+
+    usenet_rule().give_back(capacity, 2_500, 0);
+    run.wait_for_upload_mode(false).await;
+    assert_eq!(disk_held(service, job_id).await, None);
+    assert_eq!(ledger.promised_total(), 3_000);
+    service.stop().await;
+    disk.seeding.stop().await;
+}
+
+// A torrent that downloaded in a run before is promised what it has left
+// at a restart, unjudged: with 1 byte over the reserve it starts, and its
+// pieces draw on that promise, so none is refused and it completes with
+// nothing left promised.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_promises_a_torrent_that_downloaded_unjudged() {
+    let room = Arc::new(AtomicU64::new(1));
+    let disk = on_disk(&room).await;
+    let job_id = disk.job_id;
+    view_once(&disk.rig.service, job_id, |view| {
+        view.stated == Some(Stated::DiskSpace)
+    })
+    .await;
+    disk.rig
+        .service
+        .inner
+        .live
+        .lock()
+        .await
+        .get_mut(&job_id)
+        .unwrap()
+        .counters
+        .downloaded_bytes = 32_768;
+    disk.rig.service.stop().await;
+
+    let read = Arc::clone(&room);
+    let probe = Arc::new(move |_: &Path| {
+        Ok(DiskSpace {
+            total_bytes: 1 << 40,
+            available_bytes: RESERVE + read.load(Ordering::Acquire),
+        })
+    });
+    let roots = [0, 1, 2].map(|_| disk._seeds.path().to_path_buf());
+    let capacity = Arc::new(StorageCapacity::with_probe(roots, NEVER, probe));
+    for root in StorageRoot::ALL {
+        capacity.wait_for_probes(root, 1);
+    }
+    let again = service_on(
+        &disk.rig.db,
+        disk.rig.dir.path(),
+        &disk.rig.routes,
+        disk_env(&capacity),
+        set_clock(),
+    );
+    again.publish_to(queue());
+    reopen(&again).await;
+    let torrent = handle_of(&again, job_id).await;
+    torrent.wait_until_completed().await.unwrap();
+    assert!(!torrent.live().is_some_and(|run| run.upload_mode()));
+    assert!(!locked(&again.inner.disk_waits).contains_key(&job_id));
+    promised(capacity.ledger(StorageRoot::Complete), 0).await;
+    again.stop().await;
+    disk.seeding.stop().await;
+}
+
+// Two torrents on a disk with no room over the reserve are kept from
+// starting, as usenet jobs are. One that downloaded earlier in this run is
+// judged by the same rule and stays held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_short_disk_holds_a_torrent_whatever_it_fetched_in_this_run() {
     let room = Arc::new(AtomicU64::new(0));
     let disk = on_disk(&room).await;
     let service = &disk.rig.service;
@@ -508,11 +880,13 @@ async fn a_short_disk_holds_a_torrent_that_never_downloaded_and_starts_one_that_
         .counters
         .downloaded_bytes = 8_192;
     service.apply_queue().await;
+    // In this run it is judged as the other is: what it has left does not
+    // fit, so it stays held. Only a restart keeps a start unjudged.
     let view = service.torrent(second).await.unwrap();
-    assert_ne!(view.stated, Some(Stated::DiskSpace));
+    assert_eq!(view.stated, Some(Stated::DiskSpace));
     assert!(
-        !not_running(service, second).await,
-        "the one that downloaded starts"
+        not_running(service, second).await,
+        "the one that downloaded is judged too"
     );
     let view = service.torrent(disk.job_id).await.unwrap();
     assert_eq!(view.stated, Some(Stated::DiskSpace));
@@ -524,9 +898,10 @@ async fn a_short_disk_holds_a_torrent_that_never_downloaded_and_starts_one_that_
     disk.seeding.stop().await;
 }
 
-// The wait for room ends with the run it began in: no new run, and no
-// torrent gone, keeps it. Nothing stays promised or waited on, and nothing
-// its intake said is kept for a torrent removed.
+// A torrent's download held for room ends with the run it was held in: no
+// new run, and no torrent gone, keeps it. Nothing stays promised or handed
+// to it, no wait for a piece's room is left, and nothing its intake said is
+// kept for a torrent removed. A run that begins again is judged as a start.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_wait_for_room_ends_with_its_run() {
     for how in ["remove", "pause", "recheck", "route move"] {
@@ -561,96 +936,26 @@ async fn a_wait_for_room_ends_with_its_run() {
             .unwrap();
         assert!(
             !locked(&service.inner.disk_waits).contains_key(&job_id),
-            "{how}: the wait ends"
+            "{how}: no wait for a piece's room"
         );
         let ledger = disk.capacity.ledger(StorageRoot::Complete);
-        assert!(!ledger.waited_on(), "{how}");
         assert_eq!(ledger.promised(), 0, "{how}");
         if let Some(torrent) = service.inner.live.lock().await.get(&job_id) {
-            assert_eq!(torrent.disk_held, None, "{how}");
+            assert_ne!(torrent.disk_held, Some(DiskHeld::Fetching), "{how}");
+            assert_ne!(torrent.disk_held, Some(DiskHeld::Writing), "{how}");
             let room = torrent.intake.as_ref().unwrap().room();
             assert_eq!(room.in_hand(), 0, "{how}");
+            assert!(!room.started(), "{how}: judged again as it starts");
         }
         service.stop().await;
     }
 }
 
-// A torrent that downloaded in a run before, restarted, books its pieces
-// on its disk's ledger from the first: its disk is looked up as its store
-// is handed over, and no piece is let through before it is known. With no
-// room for a piece over the reserve, its first piece waits on the ledger
-// and nothing of it lands.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_restarted_torrent_that_downloaded_books_its_pieces_on_its_disk() {
-    let room = Arc::new(AtomicU64::new(1));
-    let disk = on_disk(&room).await;
-    let job_id = disk.job_id;
-    held(&disk).await;
-    // It fetched half of itself in a run before this one.
-    disk.rig
-        .service
-        .inner
-        .live
-        .lock()
-        .await
-        .get_mut(&job_id)
-        .unwrap()
-        .counters
-        .downloaded_bytes = 32_768;
-    disk.rig.service.stop().await;
-
-    // The process starts again on the same disks, read afresh.
-    let read = Arc::clone(&room);
-    let probe = Arc::new(move |_: &Path| {
-        Ok(DiskSpace {
-            total_bytes: 1 << 40,
-            available_bytes: RESERVE + read.load(Ordering::Acquire),
-        })
-    });
-    let roots = [0, 1, 2].map(|_| disk._seeds.path().to_path_buf());
-    let capacity = Arc::new(StorageCapacity::with_probe(roots, NEVER, probe));
-    for root in StorageRoot::ALL {
-        capacity.wait_for_probes(root, 1);
-    }
-    let again = service_on(
-        &disk.rig.db,
-        disk.rig.dir.path(),
-        &disk.rig.routes,
-        disk_env(&capacity),
-        set_clock(),
-    );
-    again.publish_to(queue());
-    reopen(&again).await;
-    let torrent = handle_of(&again, job_id).await;
-    torrent.wait_until_initialized().await.unwrap();
-    assert!(
-        again.inner.live.lock().await[&job_id]
-            .counters
-            .downloaded_bytes
-            >= 32_768
-    );
-    torrent.live().unwrap().wait_for_upload_mode(true).await;
-    waits_for_room(&again, job_id, true).await;
-    assert_eq!(ledger_wait(&again, job_id), Some(16_384));
-    assert_eq!(
-        placed(&again, job_id).await.disk,
-        Disk::Root(StorageRoot::Complete)
-    );
-    assert!(capacity.ledger(StorageRoot::Complete).waited_on());
-    assert_eq!(
-        job_have(&again, job_id).await,
-        0,
-        "nothing landed unchecked"
-    );
-    again.stop().await;
-    disk.seeding.stop().await;
-}
-
 // A torrent that joins its session again, after a pause, keeps the disk
-// found for its folder: a piece of its new run books there, refused on
-// that disk's ledger with no room over the reserve, with no new look. The
-// run is not in upload mode for this refusal, so it is kept to be heard
-// once it is.
+// found for its folder: what it has left is judged there with no new look,
+// and with nothing of it to seed it is kept from starting there. A piece
+// written there books on that disk's ledger, refused with no room over the
+// reserve.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_torrent_that_joins_again_books_on_the_disk_it_kept() {
     let room = Arc::new(AtomicU64::new(1));
@@ -658,17 +963,20 @@ async fn a_torrent_that_joins_again_books_on_the_disk_it_kept() {
     let service = &disk.rig.service;
     let job_id = disk.job_id;
     held(&disk).await;
-    // Nothing more comes: the piece below is the new run's only one.
     disk.seeding.stop().await;
     let place = placed(service, job_id).await;
     service.pause(job_id).await.unwrap();
-    waits_for_room(service, job_id, false).await;
+    assert_eq!(disk_held(service, job_id).await, None);
     let looks = disk.capacity.root_looks();
 
     service.resume(job_id).await.unwrap();
-    let torrent = handle_of(service, job_id).await;
-    torrent.wait_until_initialized().await.unwrap();
-    assert!(!torrent.is_paused());
+    let view = view_once(service, job_id, |view| {
+        view.stated == Some(Stated::DiskSpace)
+    })
+    .await;
+    assert_eq!(view.disk_need_bytes, Some(65_536));
+    assert!(not_running(service, job_id).await, "nothing to seed: paused");
+    assert_eq!(disk_held(service, job_id).await, Some(DiskHeld::Starting));
     let intake = service.inner.live.lock().await[&job_id]
         .intake
         .clone()
@@ -677,19 +985,6 @@ async fn a_torrent_that_joins_again_books_on_the_disk_it_kept() {
     assert!(weaver_torrent::storage::write_refused(
         &intake.verified(0, &piece).unwrap_err()
     ));
-    let entering = |_: &u64| {
-        locked(&service.inner.entering)
-            .get(&job_id)
-            .map(|(_, no_room)| *no_room)
-    };
-    service
-        .inner
-        .settled
-        .subscribe()
-        .wait_for(|seen| entering(seen).is_some())
-        .await
-        .unwrap();
-    assert_eq!(entering(&0), Some(NoRoom::Ledger(16_384)));
     let kept = placed(service, job_id).await;
     assert_eq!((kept.disk, kept.dir), (place.disk, place.dir));
     assert_eq!(disk.capacity.root_looks(), looks);
@@ -697,23 +992,21 @@ async fn a_torrent_that_joins_again_books_on_the_disk_it_kept() {
 }
 
 // A refusal kept while the run was out of upload mode is heard again once
-// the run enters it: a seeder named by a new tracker sends a piece, its
-// write finds no room, and the run waits on the ledger, shown waiting for
-// disk space, with nothing kept aside.
+// the run enters it. A piece of a running torrent wanting nothing, promised
+// nothing, is refused on a disk with no room over the reserve and kept
+// aside; the torrent then wants its file again, which the start rule
+// refuses, so its download is held and the run enters upload mode. The
+// refusal is heard then, and the start rule's wait is the torrent's only
+// one: no wait for a piece's room is installed beside it, and nothing is
+// left kept aside.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refusal_kept_aside_is_heard_once_the_run_enters_upload_mode() {
     let room = Arc::new(AtomicU64::new(1));
     let disk = on_disk(&room).await;
     let service = &disk.rig.service;
     let job_id = disk.job_id;
-    held(&disk).await;
-    // No peer is left until the new seeder below is named.
+    let torrent = runs_wanting_nothing(&disk).await;
     disk.seeding.stop().await;
-    service.pause(job_id).await.unwrap();
-    waits_for_room(service, job_id, false).await;
-    service.resume(job_id).await.unwrap();
-    let torrent = handle_of(service, job_id).await;
-    torrent.wait_until_initialized().await.unwrap();
     let run = torrent.live().unwrap();
     let intake = service.inner.live.lock().await[&job_id]
         .intake
@@ -732,20 +1025,11 @@ async fn a_refusal_kept_aside_is_heard_once_the_run_enters_upload_mode() {
         .unwrap();
     assert!(!run.upload_mode());
 
-    // A seeder of the same torrent, named by a tracker of its own.
-    let data: Vec<u8> = (0..65_536u32).map(|at| (at % 251) as u8).collect();
-    let files = [("set/a.bin", data.as_slice())];
-    let plain = metainfo("set", &files, 16_384, false);
-    let seeds = tempfile::tempdir().unwrap();
-    let seeding = seeder(seeds.path(), &plain, &files).await;
-    let std::net::SocketAddr::V4(peer) = seeding.listen_addr().unwrap() else {
-        panic!("the seeder listens on IPv4 loopback");
-    };
-    let url = tracker(peer).await;
-    service.add_trackers(job_id, vec![vec![url]]).await.unwrap();
-    run.wait_for_upload_mode(true).await;
-    waits_for_room(service, job_id, true).await;
-    assert_eq!(ledger_wait(service, job_id), Some(16_384));
+    service
+        .set_file_priorities(job_id, &[(0, FilePriority::Normal)])
+        .await
+        .unwrap();
+    assert!(run.upload_mode());
     service
         .inner
         .settled
@@ -753,31 +1037,33 @@ async fn a_refusal_kept_aside_is_heard_once_the_run_enters_upload_mode() {
         .wait_for(|_| !locked(&service.inner.entering).contains_key(&job_id))
         .await
         .unwrap();
+    assert!(!locked(&service.inner.disk_waits).contains_key(&job_id));
+    assert_eq!(disk_held(service, job_id).await, Some(DiskHeld::Fetching));
     let view = service.torrent(job_id).await.unwrap();
     assert_eq!(view.stated, Some(Stated::DiskSpace));
     service.stop().await;
-    seeding.stop().await;
 }
 
 // A piece refused on the ledger while the place known is that of a folder
 // the torrent no longer goes to waits for the disk of its new folder,
 // then on that disk's ledger: its run stays in upload mode with a wait,
-// never with none. Room made there wakes it.
+// never with none. Room made there wakes it. The run is a running torrent
+// wanting nothing whose session is in upload mode, as one is once a write
+// it made was refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refusal_for_a_folder_moved_since_waits_for_its_disk_then_its_ledger() {
     let room = Arc::new(AtomicU64::new(1));
     let disk = on_disk(&room).await;
     let service = &disk.rig.service;
     let job_id = disk.job_id;
-    let run = held(&disk).await.live().unwrap();
-    // Nothing more comes, so no other write finds the disk full.
+    let run = runs_wanting_nothing(&disk).await.live().unwrap();
     disk.seeding.stop().await;
+    run.hold_download();
     let moved = disk._seeds.path().join("moved");
     std::fs::create_dir_all(&moved).unwrap();
     {
         let mut live = service.inner.live.lock().await;
         let torrent = live.get_mut(&job_id).unwrap();
-        service.end_disk_wait(job_id, Some(torrent));
         torrent.record.files_dir = Some(moved.to_string_lossy().into_owned());
     }
     service.hold_for_room(job_id, NoRoom::Ledger(16_384)).await;

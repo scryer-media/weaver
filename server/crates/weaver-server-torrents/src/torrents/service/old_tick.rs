@@ -237,7 +237,7 @@ impl TorrentService {
                 .is_none_or(|attached| attached.handle.is_paused());
             if run && (starting || torrent.disk_held == Some(DiskHeld::Starting)) {
                 match self.start_hold(torrent) {
-                    StartHold::Short => {
+                    StartHold::Short(_) => {
                         torrent.disk_held = Some(DiskHeld::Starting);
                         run = false;
                     }

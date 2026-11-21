@@ -633,6 +633,8 @@ fn held_torrent(
         detail: None,
         unpack_end: None,
         stated: None,
+        disk_need_bytes: None,
+        disk_free_bytes: None,
         route_reason: Some(TorrentRouteReason::LegDown),
         paused_by: None,
         category: Some(SENTINEL.into()),

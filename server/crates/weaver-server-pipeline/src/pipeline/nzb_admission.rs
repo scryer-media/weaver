@@ -861,8 +861,7 @@ impl Pipeline {
     // gives. The figures go when the wait does.
     pub(in crate::pipeline) fn disk_figures(&self, id: JobId) -> (Option<u64>, Option<u64>) {
         match self.disk_unadmitted.get(&id) {
-            Some(DiskUnadmitted::Short { need, room }) => (Some(*need), *room),
-            Some(DiskUnadmitted::TooSmall { need, most }) => (Some(*need), Some(*most)),
+            Some(refused) => refused.figures(),
             None if !self.full_disk.is_empty() => self.full_disk_figures(id),
             None => (None, None),
         }

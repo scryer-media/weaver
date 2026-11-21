@@ -166,6 +166,8 @@ fn a_downloading_torrent_carries_its_speed_and_eta_to_the_queue() {
         detail: None,
         unpack_end: None,
         stated: None,
+        disk_need_bytes: None,
+        disk_free_bytes: None,
         route_reason: None,
         paused_by: None,
         category: None,

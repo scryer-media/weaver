@@ -468,6 +468,8 @@ fn view(state: TorrentState) -> TorrentView {
         state,
         detail: None,
         stated: None,
+        disk_need_bytes: None,
+        disk_free_bytes: None,
         route_reason: None,
         paused_by: None,
         category: None,

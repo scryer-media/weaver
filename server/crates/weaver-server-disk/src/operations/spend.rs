@@ -113,17 +113,47 @@ impl Spend {
             self.unbooked += bytes;
             return;
         }
-        // What is in hand is spent first, as a repair's promise is, then
-        // what the start promised here for the job's bytes.
-        let bytes = {
-            let drawn = bytes.saturating_sub(self.slab).min(self.posted);
-            self.posted -= drawn;
-            bytes - drawn
-        };
+        if let Err((ledger, drawn)) = self.take(bytes, reader, reserve) {
+            self.hold(&ledger, self.owed - (bytes - drawn));
+        }
+    }
+
+    // `bytes` are about to be written on the device `reader` reads, by a
+    // job that turns a write back rather than wait with it written: drawn
+    // as `book` draws them, and promised on the ledger until they land
+    // there or are given back. Whether they may be written. When the device
+    // has no room for them above `reserve`, nothing changes here and the
+    // job does not begin to wait.
+    pub fn draw(&mut self, bytes: u64, reader: &CapacityReader, reserve: u64) -> bool {
+        if bytes == 0 {
+            return true;
+        }
+        match self.take(bytes, reader, reserve) {
+            Ok(()) => true,
+            Err((_, drawn)) => {
+                self.posted += drawn;
+                false
+            }
+        }
+    }
+
+    // What is in hand is spent first, as a repair's promise is, then what
+    // the start promised here for the job's bytes, then the ledger is asked
+    // for the rest with up to a slab more. Refused, the ledger and what was
+    // drawn from the start's promise.
+    fn take(
+        &mut self,
+        bytes: u64,
+        reader: &CapacityReader,
+        reserve: u64,
+    ) -> Result<(), (Arc<DiskLedger>, u64)> {
+        let drawn = bytes.saturating_sub(self.slab).min(self.posted);
+        self.posted -= drawn;
+        let bytes = bytes - drawn;
         if bytes <= self.slab {
             self.slab -= bytes;
             self.in_hand = self.in_hand.min(self.slab);
-            return;
+            return Ok(());
         }
         self.in_hand = 0;
         let ledger = self.bind(reader);
@@ -131,9 +161,9 @@ impl Spend {
         let need = bytes - self.slab;
         if let Some(extra) = ledger.book(reader, reserve, need, SLAB_BYTES) {
             self.slab = extra;
-            return;
+            return Ok(());
         }
-        self.hold(&ledger, self.owed - bytes);
+        Err((ledger, drawn))
     }
 
     // The job begins to wait: all it promised here is given back, and all
@@ -332,5 +362,49 @@ impl Spend {
         self.again = 0;
         self.slab = 0;
         self.in_hand = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::operations::disk::{DiskSpace, SharedProbeFn, StorageCapacity, StorageRoot};
+
+    // A start promised 65,536 bytes; four 16,384 byte pieces draw on it,
+    // each landing as a torrent's booking lands: the ledger's promised
+    // figure falls by each piece's bytes and ends at zero, so no byte was
+    // promised twice, and nothing is left to give back.
+    #[test]
+    fn pieces_draw_on_the_start_promise_and_land_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe: SharedProbeFn = Arc::new(|_: &Path| {
+            Ok(DiskSpace {
+                total_bytes: 1 << 40,
+                available_bytes: 1 << 30,
+            })
+        });
+        let capacity = StorageCapacity::with_probe(
+            [0, 1, 2].map(|_| dir.path().to_path_buf()),
+            Duration::from_secs(365 * 24 * 60 * 60),
+            probe,
+        );
+        capacity.wait_for_probes(StorageRoot::Complete, 1);
+        let reader = capacity.reader(StorageRoot::Complete);
+        let ledger = capacity.ledger(StorageRoot::Complete);
+        ledger.promise(65_536);
+        let mut spend = Spend::default();
+        spend.take_posted(65_536, &reader);
+        for left in [49_152, 32_768, 16_384, 0] {
+            assert!(spend.draw(16_384, &reader, 100));
+            assert_eq!(ledger.promised_total(), left + 16_384, "a draw books nothing");
+            ledger.landed(16_384, 0);
+            assert_eq!(ledger.promised_total(), left);
+        }
+        assert_eq!(spend.posted(), 0);
+        spend.release_all();
+        assert_eq!(ledger.promised_total(), 0);
     }
 }

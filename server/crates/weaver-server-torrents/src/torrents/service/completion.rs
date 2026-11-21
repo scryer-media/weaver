@@ -499,6 +499,11 @@ impl TorrentService {
             let finished = !torrent.record.seed_mode || occurrence > 0;
             torrent.record.download_ends = occurrence.saturating_add(1);
             torrent.record.completed_at_ms = Some(now);
+            // What its start promised and did not land goes back: it
+            // fetches nothing more.
+            if let Some(intake) = &torrent.intake {
+                intake.room().release_start();
+            }
             // It seeds now: its slot and rank go to the torrents after it.
             // One that seeded already, as a seed-mode add does, held none.
             if !was_seeding {

@@ -19,6 +19,36 @@ pub enum StartRefused {
     TooSmall { need: u64, most: u64 },
 }
 
+impl StartRefused {
+    // A refused start from the start check's answer: `None` when it was
+    // booked. No fresh reading is a shortage of `need` with no room known.
+    pub fn of(answer: StartBooking, need: u64) -> Option<Self> {
+        match answer {
+            StartBooking::Booked => None,
+            StartBooking::Short { room, need, .. } => Some(Self::Short {
+                need,
+                room: Some(room),
+            }),
+            StartBooking::TooLarge { most, need, .. } => Some(Self::TooSmall { need, most }),
+            StartBooking::Unread => Some(Self::Short { need, room: None }),
+        }
+    }
+
+    // What a job kept for the disk shows: what it needs, and what the disk
+    // leaves, or the most it ever holds.
+    pub fn figures(self) -> (Option<u64>, Option<u64>) {
+        match self {
+            Self::Short { need, room } => (Some(need), room),
+            Self::TooSmall { need, most } => (Some(need), Some(most)),
+        }
+    }
+
+    // Whether the job never fits on the disk as it stands.
+    pub fn too_small(self) -> bool {
+        matches!(self, Self::TooSmall { .. })
+    }
+}
+
 // The most the disks could ever promise a start: `working` above the
 // reserve on the working disk, `output` on the output disk when it is
 // another.
@@ -229,6 +259,23 @@ impl StartWait {
             self.releases = self.releases_now(capacity, rule);
             self.most = most;
         }
+    }
+
+    // A job judged on its own, not in a walk, was `refused`: the hold
+    // begins, or goes on, waking for the least any job kept short needs.
+    pub fn kept(&mut self, capacity: &StorageCapacity, rule: StartRule, refused: StartRefused) {
+        let held = self.held;
+        let mut need_min = if held {
+            self.need_min
+        } else {
+            [u64::MAX; 2]
+        };
+        let mut unread = held && self.unread;
+        if let StartRefused::Short { need, room } = refused {
+            need_min[0] = need_min[0].min(need);
+            unread |= room.is_none();
+        }
+        self.walked(capacity, rule, true, (need_min, unread, rule.most(capacity)));
     }
 
     // How many times a promise was given back on the disks a start is

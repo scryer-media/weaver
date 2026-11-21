@@ -895,6 +895,8 @@ impl TorrentService {
             self.inner.signal.want_pass();
         }
         torrent.levels = held;
+        // What it wants changed: so does what its start is promised.
+        self.rejudge_start(torrent);
         // Its files' levels moved, which its row may not show: one torrent's
         // followers read them.
         self.inner.snapshot.files_moved(torrent.record.job_id);
