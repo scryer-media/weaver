@@ -232,7 +232,11 @@ async fn a_full_disk_holds_the_torrent_seeding_until_a_reading_shows_room() {
     );
     assert_eq!(ledger.promised_total(), 0, "its promise went back");
     assert!(ledger.waited_on());
-    assert!(locked(&service.inner.start_held).iter().any(|wait| wait.held()));
+    assert!(
+        locked(&service.inner.start_held)
+            .iter()
+            .any(|wait| wait.held())
+    );
     assert!(!locked(&service.inner.disk_waits).contains_key(&disk.job_id));
 
     // Nothing more comes from here, so what it is promised as it is let go
@@ -245,7 +249,11 @@ async fn a_full_disk_holds_the_torrent_seeding_until_a_reading_shows_room() {
     assert_eq!(ledger.promised_total(), 65_536);
     assert!(!torrent.is_paused());
     assert!(!ledger.waited_on());
-    assert!(!locked(&service.inner.start_held).iter().any(|wait| wait.held()));
+    assert!(
+        !locked(&service.inner.start_held)
+            .iter()
+            .any(|wait| wait.held())
+    );
     service.stop().await;
 }
 
@@ -299,7 +307,11 @@ async fn a_short_disk_keeps_a_torrent_with_bytes_to_fetch_from_starting() {
     assert_eq!(view.state, TorrentState::Queued);
     assert_eq!(view.downloaded_bytes, 0);
     assert!(not_running(service, disk.job_id).await, "it does not start");
-    assert!(locked(&service.inner.start_held).iter().any(|wait| wait.held()));
+    assert!(
+        locked(&service.inner.start_held)
+            .iter()
+            .any(|wait| wait.held())
+    );
     assert!(disk.capacity.ledger(StorageRoot::Complete).waited_on());
 
     room.store(PLENTY, Ordering::Release);
@@ -310,7 +322,11 @@ async fn a_short_disk_keeps_a_torrent_with_bytes_to_fetch_from_starting() {
     .await;
     let torrent = handle_of(service, disk.job_id).await;
     torrent.wait_until_completed().await.unwrap();
-    assert!(!locked(&service.inner.start_held).iter().any(|wait| wait.held()));
+    assert!(
+        !locked(&service.inner.start_held)
+            .iter()
+            .any(|wait| wait.held())
+    );
     assert!(!disk.capacity.ledger(StorageRoot::Complete).waited_on());
     service.stop().await;
     disk.seeding.stop().await;
@@ -452,7 +468,11 @@ async fn a_recheck_that_finds_less_judges_the_start_again() {
     let mut moved = service.inner.disk_waits_moved.subscribe();
     service.recheck(disk.job_id).await.unwrap();
     moved
-        .wait_for(|_| locked(&service.inner.start_held).iter().any(|wait| wait.held()))
+        .wait_for(|_| {
+            locked(&service.inner.start_held)
+                .iter()
+                .any(|wait| wait.held())
+        })
         .await
         .unwrap();
     assert_eq!(
@@ -557,7 +577,11 @@ async fn a_moved_torrent_is_judged_on_its_new_disk() {
         .await
         .unwrap();
     moved
-        .wait_for(|_| locked(&service.inner.start_held).iter().any(|wait| wait.held()))
+        .wait_for(|_| {
+            locked(&service.inner.start_held)
+                .iter()
+                .any(|wait| wait.held())
+        })
         .await
         .unwrap();
     assert_eq!(disk_held(service, job_id).await, Some(DiskHeld::Fetching));
@@ -857,7 +881,10 @@ async fn a_start_is_promised_what_it_fetches_and_one_that_does_not_fit_waits() {
             part: 0
         })
     );
-    assert!(not_running(service, disk.job_id).await, "the large one waits");
+    assert!(
+        not_running(service, disk.job_id).await,
+        "the large one waits"
+    );
 
     service.pause(small).await.unwrap();
     promised(ledger, 0).await;
@@ -962,7 +989,11 @@ async fn a_start_wait_ends_when_its_last_torrent_is_paused() {
         view.stated == Some(Stated::DiskSpace)
     })
     .await;
-    assert!(locked(&service.inner.start_held).iter().any(|wait| wait.held()));
+    assert!(
+        locked(&service.inner.start_held)
+            .iter()
+            .any(|wait| wait.held())
+    );
     assert!(disk.capacity.ledger(StorageRoot::Complete).waited_on());
 
     service.pause(disk.job_id).await.unwrap();
@@ -970,7 +1001,11 @@ async fn a_start_wait_ends_when_its_last_torrent_is_paused() {
         .inner
         .disk_waits_moved
         .subscribe()
-        .wait_for(|_| !locked(&service.inner.start_held).iter().any(|wait| wait.held()))
+        .wait_for(|_| {
+            !locked(&service.inner.start_held)
+                .iter()
+                .any(|wait| wait.held())
+        })
         .await
         .unwrap();
     assert!(!disk.capacity.ledger(StorageRoot::Complete).waited_on());
@@ -1051,7 +1086,10 @@ async fn a_magnet_is_judged_when_its_metadata_comes() {
 
     room.store(PLENTY, Ordering::Release);
     capacity.request_refresh(StorageRoot::Complete);
-    view_once(service, job_id, |view| view.stated != Some(Stated::DiskSpace)).await;
+    view_once(service, job_id, |view| {
+        view.stated != Some(Stated::DiskSpace)
+    })
+    .await;
     promised(ledger, 3_000).await;
     service.stop().await;
 }
@@ -1330,7 +1368,10 @@ async fn a_torrent_that_joins_again_books_on_the_disk_it_kept() {
     })
     .await;
     assert_eq!(view.disk_need_bytes, Some(65_536));
-    assert!(not_running(service, job_id).await, "nothing to seed: paused");
+    assert!(
+        not_running(service, job_id).await,
+        "nothing to seed: paused"
+    );
     assert_eq!(disk_held(service, job_id).await, Some(DiskHeld::Starting));
     let intake = service.inner.live.lock().await[&job_id]
         .intake

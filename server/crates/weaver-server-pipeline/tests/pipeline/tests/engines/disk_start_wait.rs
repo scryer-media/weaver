@@ -386,7 +386,10 @@ async fn a_new_start_leaves_aside_what_a_held_job_waits_for() {
         rule.book_on(&capacity, at, 20 * UNIT + 1, 0).is_err(),
         "80 - 60 leaves 20 units for a new start"
     );
-    assert_eq!(rule.book_on(&capacity, at, 20 * UNIT, 0), Ok((20 * UNIT, 0)));
+    assert_eq!(
+        rule.book_on(&capacity, at, 20 * UNIT, 0),
+        Ok((20 * UNIT, 0))
+    );
     rule.give_back(&capacity, 20 * UNIT, 0);
 
     // Paused, it waits for nothing a start leaves aside.

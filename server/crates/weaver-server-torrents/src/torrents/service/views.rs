@@ -674,8 +674,12 @@ impl TorrentService {
             state,
             detail,
             stated,
-            disk_need_bytes: torrent.start_refused.and_then(|refused| refused.figures().0),
-            disk_free_bytes: torrent.start_refused.and_then(|refused| refused.figures().1),
+            disk_need_bytes: torrent
+                .start_refused
+                .and_then(|refused| refused.figures().0),
+            disk_free_bytes: torrent
+                .start_refused
+                .and_then(|refused| refused.figures().1),
             route_reason,
             paused_by: torrent.paused_by,
             category: settings
