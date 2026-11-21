@@ -252,7 +252,7 @@ pub fn has_graph(pipeline: &Pipeline, id: u64) -> bool {
 // Whether jobs are kept from starting for the disk, and that hold waits on
 // it for a reading.
 pub fn kept_for_disk(pipeline: &Pipeline) -> bool {
-    pipeline.admission_disk_held
+    pipeline.admission_disk.held()
 }
 
 // `bytes` of what a started job was promised land on the working disk, as

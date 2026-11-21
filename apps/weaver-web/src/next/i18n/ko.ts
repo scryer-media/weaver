@@ -2080,6 +2080,7 @@ export const nextKo: LocaleDictionary = {
   "next.torrents.routeReason.SESSION_LIMIT": "세션 한도 도달",
   "next.torrents.routeReason.OPENING": "여는 중",
   "next.torrents.stated.DISK_SPACE": "디스크 공간 부족",
+  "next.torrents.stated.DISK_TOO_SMALL": "디스크가 너무 작음",
   "next.torrents.stated.DISK_FULL": "디스크 가득 참: 시딩만",
   "next.torrents.stated.GOAL_MET": "시딩 목표 달성",
   "next.torrents.stated.HELD_MANUAL": "일시 중지로 보류됨",

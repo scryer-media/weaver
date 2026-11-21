@@ -129,6 +129,7 @@ pub(crate) mod pipeline {
             pub(crate) use weaver_graph::{MemberId, NodeId, Tree};
 
             pub(crate) use weaver_server_disk::operations::disk::CapacityReader;
+            pub(crate) use weaver_server_disk::operations::spend::Spend;
             pub(crate) use weaver_server_pipeline::pipeline::graph::limits::*;
 
             mod tests;

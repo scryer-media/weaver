@@ -77,6 +77,10 @@ impl TorrentService {
             self.unlive(&mut live, job_id)
         };
         let Some(mut torrent) = torrent else { return };
+        // What its start promised and did not land goes back.
+        if let Some(intake) = &torrent.intake {
+            intake.room().release_start();
+        }
         let stopped = self.seeding_stopped(&torrent, StoppedSeeding::Failed);
         // Its slot and rank go to the torrents after it.
         self.inner.signal.want_pass();

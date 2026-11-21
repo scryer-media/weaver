@@ -208,6 +208,9 @@ pub struct Live {
     // Waits for room on its disk, and how: the service's wait for it is in
     // `Inner::disk_waits`.
     pub disk_held: Option<DiskHeld>,
+    // Why its start was refused, while it is held from starting: the
+    // figures it shows, as a usenet job kept for the disk shows them.
+    pub start_refused: Option<weaver_server_disk::operations::start_rule::StartRefused>,
     pub queued: bool,
     // Its place among the torrents still downloading, from 1, as the queue
     // was last applied; None while it seeds (qBittorrent
@@ -327,6 +330,7 @@ impl Live {
             sealed: None,
             files_missing: false,
             disk_held: None,
+            start_refused: None,
             queued: false,
             queue_rank: None,
             paused_by: None,
@@ -727,7 +731,7 @@ impl Live {
     pub fn observed(&self, engine: Engine) -> Observed {
         // Shown once its session is in upload mode for it.
         let disk_space = match self.disk_held {
-            Some(DiskHeld::Writing) => matches!(
+            Some(DiskHeld::Writing | DiskHeld::Fetching) => matches!(
                 engine,
                 Engine::Live {
                     upload_mode: true,
@@ -764,6 +768,11 @@ impl Live {
             restore_held: self.restore_held.clone(),
             files_missing: self.files_missing,
             disk_space,
+            // Its start was refused by a disk that never holds it.
+            disk_too_small: disk_space
+                && self
+                    .start_refused
+                    .is_some_and(|refused| refused.too_small()),
         }
     }
 }

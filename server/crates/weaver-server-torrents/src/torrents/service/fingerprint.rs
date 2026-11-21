@@ -51,6 +51,8 @@ impl TorrentView {
             state,
             detail,
             stated,
+            disk_need_bytes,
+            disk_free_bytes,
             route_reason,
             paused_by,
             category,
@@ -146,6 +148,7 @@ impl TorrentView {
         )
             .hash(hasher);
         (private, forced, progress.to_bits(), total_bytes, have_bytes).hash(hasher);
+        (disk_need_bytes, disk_free_bytes).hash(hasher);
         check_progress.map(f64::to_bits).hash(hasher);
         (
             wanted_bytes,
