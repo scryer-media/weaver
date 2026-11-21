@@ -259,6 +259,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migration_135_deletes_the_stored_signing_secret() {
+        let catalog = embedded_catalog().unwrap();
+        let payload = embedded_payload_bytes().unwrap();
+        // The secret was written plain by old builds and sealed by later ones.
+        let sealed = crate::persistence::encryption::encrypt_value(
+            &crate::persistence::encryption::EncryptionKey::generate(),
+            &"ab".repeat(32),
+        )
+        .unwrap();
+        for stored in ["ab".repeat(32), sealed] {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .unwrap();
+            replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(134), true)
+                .await
+                .unwrap();
+            for (key, value) in [
+                ("auth.jwt_signing_secret", stored.as_str()),
+                ("auth.username", "admin"),
+            ] {
+                sqlx::query("INSERT INTO settings (key, value) VALUES (?, ?)")
+                    .bind(key)
+                    .bind(value)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            sqlx::query(
+                "INSERT INTO browser_sessions
+                    (token_hash, csrf_verifier, origin, remembered, created_at, expires_at)
+                 VALUES ('session', 'verifier', 'http://localhost', 1, 1, 4102444800)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO browser_session_verifications (token_hash, verified_at)
+                 VALUES ('session', 2)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+
+            apply_version_range(
+                &pool,
+                &catalog,
+                &payload,
+                MigrationInstallKind::Upgrade,
+                135,
+                135,
+            )
+            .await
+            .unwrap();
+
+            let keys: Vec<String> =
+                sqlx::query_scalar("SELECT key FROM settings WHERE key LIKE 'auth.%' ORDER BY key")
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(keys, vec!["auth.username".to_string()]);
+            // Every browser session ends, with its verification.
+            for query in [
+                "SELECT COUNT(*) FROM browser_sessions",
+                "SELECT COUNT(*) FROM browser_session_verifications",
+            ] {
+                let rows: i64 = sqlx::query_scalar(query).fetch_one(&pool).await.unwrap();
+                assert_eq!(rows, 0, "{query}");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn migration_39_forgets_only_orphaned_duplicate_identities() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -595,7 +669,7 @@ mod tests {
         run_embedded_migrations_on_path_blocking(&db_path).unwrap();
 
         let pool = open_test_pool(&db_path).await;
-        assert_eq!(CURRENT_SCHEMA_VERSION, 134);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 135);
         assert_eq!(
             max_recorded_migration_version(&pool).await.unwrap(),
             Some(CURRENT_SCHEMA_VERSION)

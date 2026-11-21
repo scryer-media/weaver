@@ -46,21 +46,21 @@ fn persisted_credentials_validate_the_selected_key_before_startup() {
 }
 
 #[test]
-fn persisted_jwt_secret_is_encrypted_state_and_rejects_the_wrong_key() {
+fn signing_keys_are_derived_and_hold_no_encrypted_state() {
     let directory = tempfile::tempdir().unwrap();
     let mut db = crate::Database::open(&directory.path().join("weaver.db")).unwrap();
     let persisted_key = EncryptionKey::generate();
     db.set_encryption_key(persisted_key.clone());
-    let persisted_secret = db.get_or_create_jwt_signing_secret().unwrap();
+    db.set_auth_credentials("admin", "$argon2id$hash").unwrap();
+    let keys = weaver_server_auth::auth::SigningKeys::for_database(&db).unwrap();
 
-    assert!(db.has_encrypted_credentials().unwrap());
-    db.validate_encrypted_credentials(&persisted_key).unwrap();
-
-    let wrong_key = EncryptionKey::generate();
-    assert!(db.validate_encrypted_credentials(&wrong_key).is_err());
+    // Login and script-run keys are derived, never stored, so they give the
+    // key check nothing to decrypt.
+    assert!(!db.has_encrypted_credentials().unwrap());
+    db.validate_encrypted_credentials(&EncryptionKey::generate())
+        .unwrap();
     assert_eq!(
-        db.get_or_create_jwt_signing_secret().unwrap(),
-        persisted_secret,
-        "validation must not rotate persisted JWT state"
+        weaver_server_auth::auth::SigningKeys::derive(&persisted_key).unwrap(),
+        keys
     );
 }

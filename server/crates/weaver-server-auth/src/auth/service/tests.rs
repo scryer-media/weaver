@@ -101,6 +101,30 @@ fn a_login_token_and_a_script_run_token_are_never_taken_for_each_other() {
         verify_jwt(&run, &secret),
         Err(JwtError::InvalidSignature)
     ));
+
+    // As the server holds them: a login key and the script-run key derived
+    // from one master key.
+    let keys = crate::auth::signing::SigningKeys::derive(
+        &weaver_server_db::persistence::encryption::EncryptionKey::generate(),
+    )
+    .unwrap();
+    let login_key = keys.login_key("$argon2id$hash");
+    let login = create_jwt("admin", &login_key, 3600);
+    let run = create_script_run_jwt(&run_claims(u64::MAX), keys.script_run_key());
+    assert!(verify_jwt(&login, &login_key).is_ok());
+    assert!(verify_script_run_jwt(&run, keys.script_run_key()).is_ok());
+    assert!(matches!(
+        verify_script_run_jwt(&login, keys.script_run_key()),
+        Err(JwtError::InvalidSignature)
+    ));
+    assert!(matches!(
+        verify_jwt(&run, &login_key),
+        Err(JwtError::InvalidSignature)
+    ));
+    assert!(matches!(
+        verify_jwt(&run, keys.script_run_key()),
+        Err(JwtError::InvalidSignature)
+    ));
 }
 
 #[test]
@@ -130,26 +154,6 @@ fn malformed_token_fails() {
     assert!(matches!(
         verify_jwt("only-one-part", &secret),
         Err(JwtError::Malformed)
-    ));
-}
-
-#[test]
-fn jwt_secret_hex_roundtrip() {
-    let secret = generate_jwt_secret();
-    let encoded = encode_jwt_secret(&secret);
-    assert_eq!(encoded.len(), 64);
-    assert_eq!(decode_jwt_secret(&encoded).unwrap(), secret);
-}
-
-#[test]
-fn jwt_secret_decode_rejects_malformed_values() {
-    assert!(matches!(
-        decode_jwt_secret("short"),
-        Err(JwtSecretError::InvalidLength)
-    ));
-    assert!(matches!(
-        decode_jwt_secret(&"z".repeat(64)),
-        Err(JwtSecretError::InvalidHex(_))
     ));
 }
 

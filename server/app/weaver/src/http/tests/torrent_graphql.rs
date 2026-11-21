@@ -7,7 +7,6 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::RwLock as StdRwLock;
-use weaver_server_core::auth::repository::AuthRepositoryQueries;
 use weaver_server_core::categories::queries::CategoriesQueries;
 
 use base64::Engine;
@@ -165,8 +164,10 @@ async fn endpoint(dir: &std::path::Path, db: Database, torrents: TorrentService)
             None,
             proxies,
         );
-    let auth_cache =
-        LoginAuthCache::from_credentials(None, db.get_or_create_jwt_signing_secret().unwrap());
+    let auth_cache = LoginAuthCache::from_credentials(
+        None,
+        &weaver_server_core::auth::SigningKeys::for_database(&db).unwrap(),
+    );
     let api_key_cache = ApiKeyCache::default();
     api_key_cache.upsert(ApiKeyAuthRow {
         key_hash: hash_api_key(KEY),

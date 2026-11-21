@@ -190,8 +190,8 @@ async fn assert_closed_forbidden(client: &mut Client) {
 fn login_enabled(db: &Database) -> LoginAuthCache {
     let hash = jwt::hash_password(&test_password()).unwrap();
     db.set_auth_credentials(USERNAME, &hash).unwrap();
-    let secret = db.get_or_create_jwt_signing_secret().unwrap();
-    LoginAuthCache::from_credentials(db.get_auth_credentials().unwrap(), secret)
+    let keys = weaver_server_core::auth::SigningKeys::for_database(db).unwrap();
+    LoginAuthCache::from_credentials(db.get_auth_credentials().unwrap(), &keys)
 }
 
 fn jwt_cookie(auth_cache: &LoginAuthCache) -> (header::HeaderName, String) {
@@ -213,10 +213,10 @@ async fn changing_the_password_closes_sockets_opened_with_the_old_login() {
     // What `changePassword` does once the current password checks out.
     let hash = jwt::hash_password("a-different-long-password").unwrap();
     server.db.set_auth_credentials(USERNAME, &hash).unwrap();
-    let secret = server.db.rotate_jwt_signing_secret().unwrap();
+    let keys = weaver_server_core::auth::SigningKeys::for_database(&server.db).unwrap();
     server
         .auth_cache
-        .replace(Some(CachedLoginAuth::new(USERNAME, hash, secret)));
+        .replace(Some(CachedLoginAuth::new(USERNAME, hash, &keys)));
 
     assert_closed_forbidden(&mut client).await;
     // The old cookie cannot come back in through a new socket either.

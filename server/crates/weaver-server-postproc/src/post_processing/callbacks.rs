@@ -13,7 +13,7 @@ use crate::post_processing::database::PostprocDatabase;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use weaver_server_auth::auth::repository::AuthRepositoryQueries;
+use weaver_server_auth::auth::signing::SigningKeys;
 
 use tokio::sync::{mpsc, oneshot};
 
@@ -129,11 +129,20 @@ struct Registered {
     output: OutputInjector,
 }
 
+// Where scripts reach this server, and the key their runs' tokens are
+// signed and verified with: derived from the master key once, when the
+// address is set, and held here so no token reads the database.
+#[derive(Clone)]
+struct ScriptApi {
+    url: String,
+    key: [u8; 32],
+}
+
 // The runs going on now, and where their scripts reach this server.
 #[derive(Default)]
 pub(crate) struct LiveRuns {
     runs: Mutex<HashMap<String, Registered>>,
-    api_url: Mutex<Option<String>>,
+    api: Mutex<Option<ScriptApi>>,
 }
 
 impl LiveRuns {
@@ -141,8 +150,8 @@ impl LiveRuns {
         self.runs.lock().unwrap_or_else(|error| error.into_inner())
     }
 
-    fn api_url(&self) -> Option<String> {
-        self.api_url
+    fn api(&self) -> Option<ScriptApi> {
+        self.api
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone()
@@ -240,14 +249,27 @@ pub trait PostProcessingCallbacksQueries {
 
 impl<D: PostprocDatabase> PostProcessingCallbacksQueries for D {
     // Where scripts reach this server's API. Set by the server once it is
-    // listening; until then runs are handed no address and no token.
+    // listening; until then runs are handed no address and no token. Without
+    // a master key there is no key to sign run tokens with, and runs stay
+    // without both.
     fn set_script_api_url(&self, url: impl Into<String>) {
+        let database: &weaver_server_db::persistence::connection::Database = self.borrow();
+        let api = match SigningKeys::for_database(database) {
+            Ok(keys) => Some(ScriptApi {
+                url: url.into(),
+                key: *keys.script_run_key(),
+            }),
+            Err(error) => {
+                tracing::warn!(%error, "could not derive the script run signing key; scripts cannot call back");
+                None
+            }
+        };
         *self
             .script_runtime()
             .live
-            .api_url
+            .api
             .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(url.into());
+            .unwrap_or_else(|error| error.into_inner()) = api;
     }
 
     // Put a run among the live runs and tell `identity` how its script may
@@ -274,29 +296,22 @@ impl<D: PostprocDatabase> PostProcessingCallbacksQueries for D {
             event: event.clone(),
             test,
         };
-        if let Some(url) = live.api_url() {
-            match self.get_or_create_jwt_signing_secret() {
-                Ok(secret) => {
-                    let lasts = time_limit
-                        .map_or(UNLIMITED_RUN, |limit| limit.saturating_add(TOKEN_MARGIN));
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default();
-                    identity.token = Some(create_script_run_jwt(
-                        &ScriptRunClaims {
-                            run_id: run.run_id.clone(),
-                            instance_id: run.instance_id.clone(),
-                            job_id,
-                            exp: now.saturating_add(lasts).as_secs(),
-                        },
-                        &secret,
-                    ));
-                    identity.api_url = Some(url);
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "could not sign a script run token; the script cannot call back");
-                }
-            }
+        if let Some(api) = live.api() {
+            let lasts =
+                time_limit.map_or(UNLIMITED_RUN, |limit| limit.saturating_add(TOKEN_MARGIN));
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            identity.token = Some(create_script_run_jwt(
+                &ScriptRunClaims {
+                    run_id: run.run_id.clone(),
+                    instance_id: run.instance_id.clone(),
+                    job_id,
+                    exp: now.saturating_add(lasts).as_secs(),
+                },
+                &api.key,
+            ));
+            identity.api_url = Some(api.url);
         }
         let run_id = run.run_id.clone();
         let registered = match live.runs().entry(run_id.clone()) {
@@ -345,8 +360,8 @@ impl<D: PostprocDatabase> PostProcessingCallbacksQueries for D {
         if !is_script_run_token_shape(token) {
             return None;
         }
-        let secret = self.get_or_create_jwt_signing_secret().ok()?;
-        let claims = verify_script_run_jwt(token, &secret).ok()?;
+        let api = self.script_runtime().live.api()?;
+        let claims = verify_script_run_jwt(token, &api.key).ok()?;
         let run = self.live_script_run(&claims.run_id)?;
         (run.instance_id == claims.instance_id && run.job_id == claims.job_id).then_some(run)
     }

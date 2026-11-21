@@ -731,7 +731,10 @@ mod tests {
         auth_cache.replace(Some(weaver_server_core::auth::CachedLoginAuth::new(
             "operator",
             "not-a-real-hash",
-            [7; 32],
+            &weaver_server_core::auth::SigningKeys::derive(
+                &weaver_server_core::persistence::encryption::EncryptionKey::generate(),
+            )
+            .unwrap(),
         )));
         for authenticated in [false, true] {
             let security = RuntimeSecurityConfig::default();

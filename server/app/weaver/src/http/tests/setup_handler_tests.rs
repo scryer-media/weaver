@@ -154,7 +154,7 @@ async fn setup_is_refused_once_credentials_exist() {
         .unwrap();
     let auth_cache = LoginAuthCache::from_credentials(
         db.get_auth_credentials().unwrap(),
-        db.get_or_create_jwt_signing_secret().unwrap(),
+        &weaver_server_core::auth::SigningKeys::for_database(&db).unwrap(),
     );
     let app = setup_test_router(
         db.clone(),

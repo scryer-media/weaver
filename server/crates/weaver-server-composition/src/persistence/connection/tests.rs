@@ -30,7 +30,6 @@ use crate::settings::persistence::SettingsPersistenceQueries;
 use crate::settings::queries::SettingsQueries;
 use crate::settings::service::SettingsServiceQueries;
 use weaver_server_auth::auth::api_keys::AuthApiKeysQueries;
-use weaver_server_auth::auth::repository::AuthRepositoryQueries;
 use weaver_server_settings::categories::queries::CategoriesQueries;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -2015,16 +2014,6 @@ async fn postgres_converted_autocommit_ops_roundtrip_when_configured() {
         api_key_id
     );
     assert_eq!(db.list_api_keys().unwrap().len(), 1);
-
-    // --- rotate_jwt_signing_secret (autocommit upsert) --------------------
-    let before = db.get_or_create_jwt_signing_secret().unwrap();
-    let rotated = db.rotate_jwt_signing_secret().unwrap();
-    assert_ne!(before, rotated, "rotation must produce a new secret");
-    assert_eq!(
-        db.get_or_create_jwt_signing_secret().unwrap(),
-        rotated,
-        "rotated secret must round-trip through the encrypted settings row"
-    );
 
     // --- insert_history_delete_operation with >900 targets ----------------
     // Chunked IN-list existence check + bulk multi-row target insert.
