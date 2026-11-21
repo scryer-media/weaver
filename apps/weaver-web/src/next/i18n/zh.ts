@@ -2109,6 +2109,7 @@ export const nextZh: LocaleDictionary = {
   "next.seeding.seedTimeCounting": "时间计算",
   "next.seeding.countingCumulative": "累计",
   "next.seeding.countingConsecutive": "连续",
+  "next.seeding.continuous": "连续",
   "next.seeding.actionStop": "停止",
   "next.seeding.actionRemove": "移除",
   "next.seeding.actionRemoveWithData": "连同数据移除",

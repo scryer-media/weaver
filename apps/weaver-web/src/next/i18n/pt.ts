@@ -2109,6 +2109,7 @@ export const nextPt: LocaleDictionary = {
   "next.seeding.seedTimeCounting": "Tempo contado",
   "next.seeding.countingCumulative": "Total",
   "next.seeding.countingConsecutive": "Sequência atual",
+  "next.seeding.continuous": "Contínuo",
   "next.seeding.actionStop": "Parar",
   "next.seeding.actionRemove": "Remover",
   "next.seeding.actionRemoveWithData": "Remover com dados",

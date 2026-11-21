@@ -2109,6 +2109,7 @@ export const nextJa: LocaleDictionary = {
   "next.seeding.seedTimeCounting": "時間の数え方",
   "next.seeding.countingCumulative": "累計",
   "next.seeding.countingConsecutive": "連続",
+  "next.seeding.continuous": "連続",
   "next.seeding.actionStop": "停止",
   "next.seeding.actionRemove": "削除",
   "next.seeding.actionRemoveWithData": "データごと削除",

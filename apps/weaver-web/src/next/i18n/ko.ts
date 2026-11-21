@@ -2109,6 +2109,7 @@ export const nextKo: LocaleDictionary = {
   "next.seeding.seedTimeCounting": "시간 계산",
   "next.seeding.countingCumulative": "누적",
   "next.seeding.countingConsecutive": "연속",
+  "next.seeding.continuous": "연속",
   "next.seeding.actionStop": "중지",
   "next.seeding.actionRemove": "제거",
   "next.seeding.actionRemoveWithData": "데이터와 함께 제거",

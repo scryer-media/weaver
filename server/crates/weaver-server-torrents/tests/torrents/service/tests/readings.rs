@@ -1315,6 +1315,47 @@ fn a_break_in_seeding_keeps_the_whole_and_restarts_the_run() {
     assert_eq!(run(&[(1_900, true), (1_000, false), (1_600, true)]), (3, 1));
 }
 
+// Seeding readings further apart than the gap (the machine slept) end the
+// run as a restart does, while the active and seeding durations take the
+// whole time; a gap at the limit or under it runs on, and a clock stepped
+// back credits nothing.
+#[test]
+fn a_gap_between_seeding_readings_restarts_the_run_and_keeps_the_whole() {
+    let gap = crate::torrents::service::live::SEEDING_RUN_GAP_MS;
+    let run = |steps: &[i64]| {
+        let mut counters = TorrentCounters::default();
+        let mut timed = Timed::at(EPOCH_MS);
+        let mut now = EPOCH_MS;
+        for step in steps {
+            now += step;
+            timed = timed.advanced(now, true, true, &mut counters);
+        }
+        (
+            counters.active_duration_s,
+            counters.finished_duration_s,
+            counters.consecutive_seeding_s,
+        )
+    };
+    let secs = |ms: i64| u64::try_from(ms / 1000).unwrap();
+    // 10 s, then an hour asleep: 3610 s in all, a run of zero.
+    assert_eq!(run(&[10_000, 3_600_000]), (3_610, 3_610, 0));
+    // Then 10 s more: the run counts from the wake.
+    assert_eq!(run(&[10_000, 3_600_000, 10_000]), (3_620, 3_620, 10));
+    // Just over the gap: the run restarts.
+    assert_eq!(
+        run(&[10_000, gap + 1]),
+        (secs(10_000 + gap), secs(10_000 + gap), 0)
+    );
+    // At the gap and under it: both credited in full.
+    let at = secs(10_000 + gap);
+    assert_eq!(run(&[10_000, gap]), (at, at, at));
+    assert_eq!(run(&[10_000, 60_000]), (70, 70, 70));
+    // Stepped back an hour: nothing for that reading, the run kept, then
+    // 5 s from there.
+    assert_eq!(run(&[10_000, -3_600_000]), (10, 10, 10));
+    assert_eq!(run(&[10_000, -3_600_000, 5_000]), (15, 15, 15));
+}
+
 // A peer on `listener` that says it saw a complete copy `ago` seconds ago,
 // then that it has piece 0: the BitTorrent handshake with the extension
 // bit, an extended handshake carrying `complete_ago` (BEP 10), and a have.
