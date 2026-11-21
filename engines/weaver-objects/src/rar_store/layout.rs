@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use unrar_rs::{
     ArchiveFormat, IneligibilityReason, MalformedReason, MemberEligibility, RarVolumeFacts,
-    RarVolumeMemberFacts, StoredLayoutBuilder, StoredMember,
+    RarVolumeFactsDelta, RarVolumeMemberFacts, StoredLayoutBuilder, StoredMember,
 };
 use weaver_graph::{ByteRange, Coverage, Emit, Handed, MemberId, RecoveryKind, VolumeIndex, Why};
 
@@ -137,10 +137,23 @@ fn lays(index: VolumeIndex, found: &Volume) -> Option<(&RarVolumeFacts, bool)> {
     Some((facts, found.walk.ended && !found.walk.is_last()))
 }
 
-// The member a volume ends on, when it carries on into the next one.
-fn carried_on(facts: &RarVolumeFacts) -> Option<&RarVolumeMemberFacts> {
-    let last = facts.members.iter().max_by_key(|member| member.order)?;
-    last.split_after.then_some(last)
+// The member a volume ends on, and where it sits, when it carries on into
+// the next one.
+fn carried_on(facts: &RarVolumeFacts) -> Option<(usize, &RarVolumeMemberFacts)> {
+    let (at, last) = facts
+        .members
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, member)| member.order)?;
+    last.split_after.then_some((at, last))
+}
+
+// A member renamed as the member the volume before carries on: the name
+// and size its first part gives it.
+fn rename(member: &mut RarVolumeMemberFacts, tail: &RarVolumeMemberFacts) {
+    member.name.clone_from(&tail.name);
+    member.name_raw.clone_from(&tail.name_raw);
+    member.unpacked_size = tail.unpacked_size;
 }
 
 // Where among `facts`' members sits the one the volume opens on, when it
@@ -251,19 +264,41 @@ impl Laid {
     // first part gives it, as unrar extracts it. The sum of the parts' bytes
     // must still come to that size, and the last part's CRC proves them.
     fn joined<'a>(&self, index: u32, facts: &'a RarVolumeFacts) -> Cow<'a, RarVolumeFacts> {
-        let carried = index
-            .checked_sub(1)
-            .and_then(|before| self.tails.get(&before))
-            .and_then(|tail| Some((tail, continuation(tail, facts)?)));
-        let Some((tail, at)) = carried else {
+        let Some((tail, at)) = self.carried(index, facts) else {
             return Cow::Borrowed(facts);
         };
         let mut joined = facts.clone();
-        let head = &mut joined.members[at];
-        head.name.clone_from(&tail.name);
-        head.name_raw.clone_from(&tail.name_raw);
-        head.unpacked_size = tail.unpacked_size;
+        rename(&mut joined.members[at], tail);
         Cow::Owned(joined)
+    }
+
+    // The member the volume before carries on, and where among `facts`'
+    // members sits the one the volume opens on, when it says otherwise of
+    // it.
+    fn carried(
+        &self,
+        index: u32,
+        facts: &RarVolumeFacts,
+    ) -> Option<(&RarVolumeMemberFacts, usize)> {
+        index
+            .checked_sub(1)
+            .and_then(|before| self.tails.get(&before))
+            .and_then(|tail| Some((tail, continuation(tail, facts)?)))
+    }
+
+    // A delta of a volume's facts as the layout takes them: the member the
+    // volume opens on is renamed as `joined` renames it when the delta
+    // states it again, and is left as the layout took it when not.
+    fn joined_delta(&self, index: u32, facts: &RarVolumeFacts, delta: &mut RarVolumeFactsDelta) {
+        let Some((tail, at)) = self.carried(index, facts) else {
+            return;
+        };
+        if let Some(head) = at
+            .checked_sub(delta.members_from)
+            .and_then(|at| delta.facts.members.get_mut(at))
+        {
+            rename(head, tail);
+        }
     }
 
     // Add a volume on its walk's facts, or say the layout refuses them.
@@ -272,6 +307,10 @@ impl Laid {
     // builder's to judge: it takes the volume it added last again on the
     // headers it took it on followed by more, learning only those, and
     // refuses the rest without changing the layout.
+    //
+    // A volume it holds is handed only what changed in its facts since it
+    // took them, when the walk can say: the work is in the size of what
+    // changed, and the answer the one the whole facts get.
     fn add(&mut self, index: u32, walk: &Walk) -> bool {
         let Some(facts) = walk.facts.as_ref() else {
             return false;
@@ -306,31 +345,61 @@ impl Laid {
             }
             None => {
                 #[cfg(test)]
-                super::counts::bump(|counts| {
-                    counts.asked.push((index, walk.stamp));
-                    counts.laid_members += facts.members.len();
-                });
-                let joined = self.joined(index, facts);
-                let added = self.builder.add_volume(index, &joined).is_ok();
+                super::counts::bump(|counts| counts.asked.push((index, walk.stamp)));
+                let delta = held.and_then(|(stamp, _)| walk.delta_since(stamp));
+                #[cfg(test)]
+                let delta = delta.filter(|_| !super::counts::whole());
+                // The members the layout is handed, and the first of them.
+                let (added, members_from, members): (_, _, Cow<'_, [RarVolumeMemberFacts]>) =
+                    match delta {
+                        Some(mut delta) => {
+                            self.joined_delta(index, facts, &mut delta);
+                            let added = self.builder.add_volume_delta(index, &delta).is_ok();
+                            (added, delta.members_from, Cow::Owned(delta.facts.members))
+                        }
+                        None => {
+                            let joined = self.joined(index, facts);
+                            let added = self.builder.add_volume(index, &joined).is_ok();
+                            let members = match joined {
+                                Cow::Borrowed(facts) => Cow::Borrowed(facts.members.as_slice()),
+                                Cow::Owned(facts) => Cow::Owned(facts.members),
+                            };
+                            (added, 0, members)
+                        }
+                    };
+                #[cfg(test)]
+                super::counts::bump(|counts| counts.laid_members += members.len());
                 if added {
-                    match carried_on(&joined) {
-                        Some(tail) => self.tails.insert(index, tail.clone()),
+                    match carried_on(facts) {
+                        Some((at, tail)) => {
+                            // The member the volume ends on as the layout
+                            // took it: renamed when it is the one it opens on.
+                            let mut tail = tail.clone();
+                            if let Some((before, opens)) = self.carried(index, facts)
+                                && opens == at
+                            {
+                                rename(&mut tail, before);
+                            }
+                            self.tails.insert(index, tail)
+                        }
                         None => self.tails.remove(&index),
                     };
                     // A volume changes only the members it names: those it
                     // carries a part of, and so every one whose chain runs
                     // through it, the layout holding the first volumes only.
-                    let members = self.builder.members();
-                    for (at, member) in members.iter().enumerate().skip(self.names.len()) {
+                    let builder_members = self.builder.members();
+                    for (at, member) in builder_members.iter().enumerate().skip(self.names.len()) {
                         self.names.insert(member.name.clone(), at);
                     }
                     // A volume it held taken on more headers changes only
                     // the members those name: the builder learns only them.
+                    let count = members_from + members.len();
                     let grown = held
                         .map(|(_, members)| members)
-                        .filter(|members| *members < joined.members.len());
+                        .filter(|members| *members < count);
                     self.grew |= grown.is_some();
-                    let low = joined.members[grown.unwrap_or(0)..]
+                    let skip = grown.map_or(0, |held| held - members_from);
+                    let low = members[skip..]
                         .iter()
                         .filter_map(|member| self.names.get(&member.name).copied())
                         .min();
@@ -357,19 +426,24 @@ fn laid(layout: &StoredLayoutBuilder) -> u32 {
 // changes nothing, and the tail on those followed by more learns only
 // those; on others it is refused, and the layout is laid afresh.
 fn stands(
-    volumes: &BTreeMap<VolumeIndex, Volume>,
+    volumes: &mut BTreeMap<VolumeIndex, Volume>,
     layout: &mut Laid,
     touched: &BTreeSet<VolumeIndex>,
 ) -> bool {
     let laid = laid(layout);
     touched.range(..VolumeIndex(laid)).all(|index| {
-        let Some(found) = volumes.get(index) else {
+        let Some(found) = volumes.get_mut(index) else {
             return false;
         };
         let Some((facts, on)) = lays(*index, found) else {
             return false;
         };
-        (on || index.0 + 1 == laid) && !facts.is_solid && layout.add(index.0, &found.walk)
+        let added =
+            (on || index.0 + 1 == laid) && !facts.is_solid && layout.add(index.0, &found.walk);
+        if added {
+            found.walk.handed();
+        }
+        added
     })
 }
 
@@ -495,9 +569,9 @@ impl RarStore {
         };
         #[cfg(test)]
         super::counts::bump(|counts| counts.syncs += 1);
-        let mut kept = self
-            .layout
-            .take_if(|layout| layout.format() == format && stands(&self.volumes, layout, touched));
+        let mut kept = self.layout.take_if(|layout| {
+            layout.format() == format && stands(&mut self.volumes, layout, touched)
+        });
         let afresh = kept.is_none();
         // A volume taken again on more headers is what laying the layout
         // afresh once took it on: the volume refuted is looked at again.
@@ -532,12 +606,13 @@ impl RarStore {
             }
         };
         let mut refusal = None;
-        for (index, found) in self.volumes.range(VolumeIndex(from)..VolumeIndex(end)) {
+        for (index, found) in self.volumes.range_mut(VolumeIndex(from)..VolumeIndex(end)) {
             if !layout.add(index.0, &found.walk) {
                 refusal = Some(Emit::Refuse(Why::Unsupported));
                 end = index.0 + 1;
                 break;
             }
+            found.walk.handed();
         }
         // A volume only its name or its links hold where it is, its headers
         // stating no number, as a RAR4 volume's do short of a numbered end
@@ -864,6 +939,439 @@ impl RarStore {
                     .header_password()
                     .map_or_else(Handed::default, Handed::new),
             });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+    use std::sync::Arc;
+
+    use unrar_rs::{KdfCache, RarArchive, RarVolumeFactsCursor};
+    use weaver_graph::Provenance;
+
+    use super::super::counts;
+    use super::super::image::SparseImage;
+    use super::super::tests::writer::{Item, Options, Version, write};
+    use super::*;
+    use crate::grid::crc32;
+    use crate::kept::Kept;
+    use crate::testing::payload;
+
+    // One step of a volume as the layout taking deltas was handed it: the
+    // members handed, the members the volume lists, and how many of them
+    // the layout held before.
+    #[derive(Debug)]
+    struct Handing {
+        handed: usize,
+        listed: usize,
+        held: usize,
+    }
+
+    // A set fed volume by volume in pieces of `piece` bytes, each piece
+    // stepping the walk and handing the volume to two layouts, one taking
+    // what changed and one the whole facts: after every step the two answer
+    // alike. The walk restarts from the signature before piece `restart.1`
+    // of volume `restart.0`.
+    fn fed(volumes: &[Vec<u8>], piece: u64, restart: Option<(usize, usize)>) -> Vec<Handing> {
+        let format = RarArchive::parse_volume_facts(Cursor::new(volumes[0].clone()), None)
+            .expect("the first volume")
+            .archive_format();
+        let kdf = Arc::new(KdfCache::new());
+        let mut by_delta = Laid::new(format);
+        let mut by_whole = Laid::new(format);
+        let mut handings = Vec::new();
+        for (index, bytes) in volumes.iter().enumerate() {
+            let length = bytes.len() as u64;
+            let mut kept = Kept::default();
+            kept.want(ByteRange::new(0, length));
+            let mut walk = Walk::default();
+            let pieces = length.div_ceil(piece) as usize;
+            for at in 0..pieces {
+                let range =
+                    ByteRange::new(at as u64 * piece, ((at as u64 + 1) * piece).min(length));
+                kept.absorb(
+                    range,
+                    &bytes[range.start as usize..range.end as usize],
+                    Provenance::Fresh,
+                );
+                if restart == Some((index, at)) {
+                    assert!(walk.cursor.resumes_at().is_some(), "a cursor to restart");
+                    walk.changed_from(0);
+                    assert_eq!(walk.cursor.resumes_at(), None);
+                }
+                walk.step(&mut kept, Some(length), None, &kdf, false);
+                let where_ = format!("volume {index}, piece {at}");
+                hand(
+                    &mut by_delta,
+                    &mut by_whole,
+                    index as u32,
+                    &mut walk,
+                    &mut handings,
+                );
+                assert_alike(&by_delta, &by_whole, volumes, &where_);
+            }
+            assert!(walk.ended, "volume {index} is read to its end");
+        }
+        assert_eq!(
+            laid(&by_delta),
+            volumes.len() as u32,
+            "every volume is laid"
+        );
+        handings
+    }
+
+    // Hand a volume to both layouts, as the store does once its headers
+    // are read past the main header.
+    fn hand(
+        by_delta: &mut Laid,
+        by_whole: &mut Laid,
+        index: u32,
+        walk: &mut Walk,
+        handings: &mut Vec<Handing>,
+    ) {
+        let Some(facts) = walk.facts.as_ref() else {
+            return;
+        };
+        if facts.members.is_empty() && !walk.ended {
+            return;
+        }
+        let listed = facts.members.len();
+        let held = by_delta
+            .added
+            .get(&index)
+            .map_or(0, |(_, members)| *members);
+        counts::take();
+        let taken = by_delta.add(index, walk);
+        let handed = counts::take().laid_members;
+        counts::set_whole(true);
+        let whole = by_whole.add(index, walk);
+        counts::set_whole(false);
+        assert_eq!(taken, whole, "volume {index}: both take it or neither");
+        if taken {
+            walk.handed();
+        }
+        handings.push(Handing {
+            handed,
+            listed,
+            held,
+        });
+    }
+
+    fn assert_alike(by_delta: &Laid, by_whole: &Laid, volumes: &[Vec<u8>], at: &str) {
+        assert_eq!(
+            by_delta.header_frontier(),
+            by_whole.header_frontier(),
+            "{at}"
+        );
+        assert_eq!(by_delta.members(), by_whole.members(), "{at}");
+        assert_eq!(by_delta.added, by_whole.added, "{at}");
+        assert_eq!(by_delta.tails, by_whole.tails, "{at}");
+        assert_eq!(by_delta.names, by_whole.names, "{at}");
+        assert_eq!(by_delta.grew, by_whole.grew, "{at}");
+        for (volume, bytes) in volumes.iter().enumerate() {
+            let volume = volume as u32;
+            assert_eq!(
+                by_delta.has_volume(volume),
+                by_whole.has_volume(volume),
+                "{at}: {volume}"
+            );
+            assert_eq!(
+                by_delta.split_evidence(volume),
+                by_whole.split_evidence(volume),
+                "{at}: {volume}"
+            );
+            assert_eq!(
+                by_delta.map_physical_range(volume, 0, bytes.len() as u64),
+                by_whole.map_physical_range(volume, 0, bytes.len() as u64),
+                "{at}: {volume}"
+            );
+        }
+    }
+
+    // Whether a cursor fed `bytes` in pieces ever states again members or
+    // services it reported before.
+    fn restates(bytes: &[u8], piece: u64) -> (bool, bool) {
+        let kdf = Arc::new(KdfCache::new());
+        let length = bytes.len() as u64;
+        let mut kept = Kept::default();
+        kept.want(ByteRange::new(0, length));
+        let mut cursor = RarVolumeFactsCursor::new();
+        let mut held: Option<RarVolumeFacts> = None;
+        let mut restated = (false, false);
+        for at in (0..length).step_by(piece as usize) {
+            let range = ByteRange::new(at, (at + piece).min(length));
+            kept.absorb(
+                range,
+                &bytes[range.start as usize..range.end as usize],
+                Provenance::Fresh,
+            );
+            let Ok(delta) =
+                cursor.step_delta(SparseImage::of(&kept, false), None, Arc::clone(&kdf))
+            else {
+                continue;
+            };
+            match held.as_mut() {
+                Some(facts) => {
+                    restated.0 |= delta.members_from < facts.members.len();
+                    restated.1 |= delta.services_from < facts.services.len();
+                    delta.apply_to(facts);
+                }
+                None => held = Some(delta.facts),
+            }
+        }
+        restated
+    }
+
+    // A RAR4 block: its CRC, type, flags and size, then `body`.
+    fn rar4_block(kind: u8, flags: u16, body: &[u8]) -> Vec<u8> {
+        let mut block = vec![0, 0, kind];
+        block.extend_from_slice(&flags.to_le_bytes());
+        block.extend_from_slice(&((7 + body.len()) as u16).to_le_bytes());
+        block.extend_from_slice(body);
+        let crc = (crc32(&block[2..]) as u16).to_le_bytes();
+        block[..2].copy_from_slice(&crc);
+        block
+    }
+
+    // A RAR4 service header named `name`, with `trailer` after its name and
+    // `payload` stored after it.
+    fn rar4_service(name: &[u8], payload: &[u8], trailer: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        body.push(3);
+        body.extend_from_slice(&crc32(payload).to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.push(29);
+        body.push(0x30);
+        body.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(name);
+        body.extend_from_slice(trailer);
+        let flags = match payload.is_empty() {
+            true => 0x4000,
+            false => 0x8000 | 0x4000,
+        };
+        let mut block = rar4_block(0x7A, flags, &body);
+        block.extend_from_slice(payload);
+        block
+    }
+
+    // A RAR4 volume of twelve stored files with records after their data:
+    // owners stated in a payload or in the header, comments, an old comment
+    // and an old-style service. Each owner names the file before it, which a
+    // walk reports before the owner arrives.
+    fn owned_rar4() -> Vec<u8> {
+        let items: Vec<Item> = (0..12)
+            .map(|at| {
+                let name: &'static str = Box::leak(format!("owned{at:02}.bin").into_boxed_str());
+                Item::File(name, payload(at, 40 + at as usize * 9))
+            })
+            .collect();
+        let mut volume = write(&items, &Options::new(Version::Rar4)).remove(0);
+        let facts =
+            RarArchive::parse_volume_facts(Cursor::new(volume.clone()), None).expect("the volume");
+        for (at, member) in facts.members.iter().enumerate().rev() {
+            let mut records = Vec::new();
+            match at % 4 {
+                1 => records.extend(rar4_service(
+                    b"UOW",
+                    format!("user{at}\0group{at}").as_bytes(),
+                    &[],
+                )),
+                2 => records.extend(rar4_service(b"UOW", &[], b"harbour\0crew")),
+                _ => {}
+            }
+            if at % 5 == 3 {
+                records.extend(rar4_service(b"CMT", b"a comment", &[]));
+            }
+            if at == 4 {
+                let mut body = 4u16.to_le_bytes().to_vec();
+                body.extend_from_slice(&[29, 0x30, 0xEF, 0xBE]);
+                body.extend_from_slice(b"note");
+                records.extend(rar4_block(0x75, 0, &body));
+            }
+            if at == 7 {
+                let mut body = 4u32.to_le_bytes().to_vec();
+                body.extend_from_slice(&0x104u16.to_le_bytes());
+                body.push(0);
+                body.extend_from_slice(&4u32.to_le_bytes());
+                body.extend_from_slice(&[20, 0x30]);
+                body.extend_from_slice(&0u32.to_le_bytes());
+                records.extend(rar4_block(0x77, 0x8000, &body));
+                records.extend_from_slice(b"acl!");
+            }
+            let end = (member.data_offset + member.data_size) as usize;
+            volume.splice(end..end, records);
+        }
+        volume
+    }
+
+    // A RAR4 set whose first file spans three volumes and is named
+    // otherwise in every part past its first, as some packers write it,
+    // with more files after it in the last volume.
+    fn renamed_rar4() -> Vec<Vec<u8>> {
+        let mut options = Options::new(Version::Rar4);
+        options.split = Some(5_000);
+        let mut items = vec![Item::File("track.flac", payload(9, 14_000))];
+        for at in 0..6 {
+            let name: &'static str = Box::leak(format!("after{at}.bin").into_boxed_str());
+            items.push(Item::File(name, payload(20 + at, 120)));
+        }
+        let mut set = write(&items, &options);
+        assert!(set.len() >= 3);
+        for volume in &mut set[1..] {
+            // The signature, then the main header, then the file header
+            // the volume opens on, its name last.
+            const AT: usize = 7 + 13;
+            assert_eq!(volume[AT + 2], 0x74, "a file header");
+            let size = u16::from_le_bytes([volume[AT + 5], volume[AT + 6]]) as usize;
+            let body = &mut volume[AT + 7..AT + size];
+            let name = body.len() - "track.flac".len();
+            assert_eq!(&body[name..], b"track.flac");
+            body[name..].copy_from_slice(b"TRACK.flac");
+            let crc = (crc32(&volume[AT + 2..AT + size]) as u16).to_le_bytes();
+            volume[AT..AT + 2].copy_from_slice(&crc);
+        }
+        set
+    }
+
+    // A stored RAR5 set of `count` files of `size` bytes, split at `split`.
+    fn rar5(count: usize, size: usize, split: Option<usize>) -> Vec<Vec<u8>> {
+        let items: Vec<Item> = (0..count)
+            .map(|at| {
+                let name: &'static str = Box::leak(format!("m{at:05}.bin").into_boxed_str());
+                Item::File(name, payload(at as u64, size))
+            })
+            .collect();
+        let mut options = Options::new(Version::Rar5);
+        options.split = split;
+        write(&items, &options)
+    }
+
+    // The piece of `piece` bytes that completes the header of a volume's
+    // member `member`: a walk restarted on it reads from the signature and
+    // lists that member anew in one step.
+    fn listing(volume: &[u8], member: usize, piece: u64) -> usize {
+        let facts =
+            RarArchive::parse_volume_facts(Cursor::new(volume.to_vec()), None).expect("the volume");
+        ((facts.members[member].data_offset - 1) / piece) as usize
+    }
+
+    // Whether some step handed the layout less than the whole facts.
+    fn handed_less(handings: &[Handing]) -> bool {
+        handings
+            .iter()
+            .any(|handing| handing.held > 0 && handing.handed < handing.listed)
+    }
+
+    // Volumes fed in pieces lay as they do handed whole each time: the same
+    // layout, the same refusals, after every step, in a RAR5 set, a RAR4
+    // set whose later parts name its first member otherwise, a RAR4 volume
+    // whose owners and comments arrive after the files they follow, and a
+    // walk restarted from the signature in the middle of a volume.
+    #[test]
+    fn a_layout_handed_what_changed_lays_as_one_handed_the_whole_facts() {
+        let spanning = rar5(30, 3_000, Some(7_000));
+        assert!(spanning.len() > 5);
+        let handings = fed(&spanning, 211, None);
+        assert!(handed_less(&handings), "RAR5 set: deltas were handed");
+
+        let renamed = renamed_rar4();
+        // The later volumes open on the part named otherwise, which the
+        // layout takes under the first part's name.
+        let tail = RarArchive::parse_volume_facts(Cursor::new(renamed[1].clone()), None)
+            .expect("the second volume");
+        assert_eq!(tail.members[0].name, "TRACK.flac");
+        let last =
+            RarArchive::parse_volume_facts(Cursor::new(renamed[renamed.len() - 1].clone()), None)
+                .expect("the last volume");
+        assert!(last.members.len() > 2, "files after the renamed part");
+        let handings = fed(&renamed, 97, None);
+        assert!(
+            handed_less(&handings),
+            "renamed RAR4 set: deltas were handed"
+        );
+        // Restarted in the last volume, the delta states the part it opens
+        // on again, and carries the layout's name for it.
+        let at = renamed.len() - 1;
+        let handings = fed(&renamed, 97, Some((at, listing(&renamed[at], 3, 97))));
+        assert!(
+            handings
+                .iter()
+                .any(|handing| handing.held > 0 && handing.handed == handing.listed),
+            "the restart hands the renamed part again: {handings:?}"
+        );
+
+        let owned = owned_rar4();
+        let whole =
+            RarArchive::parse_volume_facts(Cursor::new(owned.clone()), None).expect("the volume");
+        assert_eq!(whole.members.len(), 12);
+        assert!(whole.members.iter().any(|member| member.owner.is_some()));
+        // Fed in small pieces, an owner arriving after its file restates
+        // that file, and a service arriving restates the old comment and
+        // old-style service listed after every service.
+        assert_eq!(
+            restates(&owned, 23),
+            (true, true),
+            "the RAR4 volume restates"
+        );
+        let handings = fed(std::slice::from_ref(&owned), 23, None);
+        assert!(handed_less(&handings), "RAR4 volume: deltas were handed");
+
+        // A restart mid-volume: the walk reads from the signature again,
+        // and the layout is handed every member once more.
+        let one = rar5(40, 300, None);
+        let handings = fed(&one, 97, Some((0, listing(&one[0], 20, 97))));
+        assert!(
+            handings
+                .iter()
+                .any(|handing| handing.held > 0 && handing.handed == handing.listed),
+            "the restart hands every member again: {handings:?}"
+        );
+        assert!(handed_less(&handings));
+        let handings = fed(
+            std::slice::from_ref(&owned),
+            23,
+            Some((0, listing(&owned, 6, 23))),
+        );
+        assert!(handed_less(&handings));
+        assert!(
+            handings
+                .iter()
+                .any(|handing| handing.held > 0 && handing.handed == handing.listed),
+            "the restart hands every member again: {handings:?}"
+        );
+    }
+
+    // What a layout is handed for each step of a volume does not grow with
+    // the members it already holds: each member is handed once, in the step
+    // that lists it, however many the volume lists before it. Handed the
+    // whole facts, the same steps hand it about the square of them.
+    #[test]
+    fn a_step_hands_the_layout_only_the_members_it_added() {
+        for members in [100, 400] {
+            let volumes = rar5(members, 200, None);
+            let handings = fed(&volumes, 64, None);
+            for handing in &handings {
+                assert!(
+                    handing.handed <= handing.listed - handing.held,
+                    "M={members}: {handing:?}"
+                );
+            }
+            let handed: usize = handings.iter().map(|handing| handing.handed).sum();
+            assert_eq!(handed, members, "M={members}: each member handed once");
+            let whole: usize = handings
+                .iter()
+                .filter(|handing| handing.handed > 0 || handing.listed > handing.held)
+                .map(|handing| handing.listed)
+                .sum();
+            assert!(
+                whole > members * members / 4,
+                "M={members}: the whole facts hand {whole}"
+            );
         }
     }
 }
