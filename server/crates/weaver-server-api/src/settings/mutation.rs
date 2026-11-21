@@ -685,15 +685,15 @@ impl SettingsMutation {
         rule.transports
             .checked(global)
             .map_err(async_graphql::Error::new)?;
-        let rules = tokio::task::spawn_blocking(move || {
+        let (routed, rules) = tokio::task::spawn_blocking(move || {
+            let routed = routed_rules(&db.list_tracker_rules()?);
             let now = chrono::Utc::now().timestamp_millis();
-            db.save_tracker_rule(id, rule, keeps_ssl, keeps_passwords, now)
+            let rules = db.save_tracker_rule(id, rule, keeps_ssl, keeps_passwords, now)?;
+            Ok::<_, weaver_server_core::StateError>(rules.map(|rules| (routed, rules)))
         })
         .await??
         .map_err(async_graphql::Error::new)?;
-        // A tracker rule is a torrent route's consumer.
-        crate::proxies::refresh(ctx).await?;
-        crate::torrents::reload_tracker_rules(ctx).await?;
+        tracker_rules_saved(ctx, &routed, &rules).await?;
         Ok(rules.into_iter().map(Into::into).collect())
     }
 
@@ -707,14 +707,13 @@ impl SettingsMutation {
     ) -> Result<Vec<crate::settings::types::TrackerRule>> {
         let db = ctx.data::<Database>()?.clone();
         let _guard = SETTINGS_MUTATION_GUARD.lock().await;
-        let rules = tokio::task::spawn_blocking(move || {
+        let (routed, rules) = tokio::task::spawn_blocking(move || {
+            let routed = routed_rules(&db.list_tracker_rules()?);
             db.delete_tracker_rule(id)?;
-            db.list_tracker_rules()
+            Ok::<_, weaver_server_core::StateError>((routed, db.list_tracker_rules()?))
         })
         .await??;
-        // A tracker rule is a torrent route's consumer.
-        crate::proxies::refresh(ctx).await?;
-        crate::torrents::reload_tracker_rules(ctx).await?;
+        tracker_rules_saved(ctx, &routed, &rules).await?;
         Ok(rules.into_iter().map(Into::into).collect())
     }
 
@@ -771,15 +770,15 @@ impl SettingsMutation {
             if tracker_file::fingerprint(&bytes, rule) != fingerprint {
                 return Ok(Err("stale preview".to_owned()));
             }
+            let routed = routed_rules(&rules);
             let now = chrono::Utc::now().timestamp_millis();
             db.apply_tracker_file(&file, now)?;
-            db.list_tracker_rules().map(Ok)
+            Ok::<_, weaver_server_core::StateError>(Ok((routed, db.list_tracker_rules()?)))
         })
         .await??
         .map_err(async_graphql::Error::new)?;
-        // A tracker rule is a torrent route's consumer.
-        crate::proxies::refresh(ctx).await?;
-        crate::torrents::reload_tracker_rules(ctx).await?;
+        let (routed, rules) = rules;
+        tracker_rules_saved(ctx, &routed, &rules).await?;
         Ok(rules.into_iter().map(Into::into).collect())
     }
 
@@ -793,19 +792,47 @@ impl SettingsMutation {
     ) -> Result<Vec<crate::settings::types::TrackerRule>> {
         let db = ctx.data::<Database>()?.clone();
         let _guard = SETTINGS_MUTATION_GUARD.lock().await;
-        let rules = tokio::task::spawn_blocking(move || {
+        let (routed, rules) = tokio::task::spawn_blocking(move || {
+            let routed = routed_rules(&db.list_tracker_rules()?);
             let now = chrono::Utc::now().timestamp_millis();
             if !db.unbind_tracker_rule(id, now)? {
                 return Ok(Err(format!("no tracker rule {id}")));
             }
-            db.list_tracker_rules().map(Ok)
+            Ok::<_, weaver_server_core::StateError>(Ok((routed, db.list_tracker_rules()?)))
         })
         .await??
         .map_err(async_graphql::Error::new)?;
-        crate::proxies::refresh(ctx).await?;
-        crate::torrents::reload_tracker_rules(ctx).await?;
+        tracker_rules_saved(ctx, &routed, &rules).await?;
         Ok(rules.into_iter().map(Into::into).collect())
     }
+}
+
+// The tracker rules that route their torrents themselves: each is a route
+// consumer of its own (`torrent_route`), by id.
+fn routed_rules(rules: &[weaver_server_core::settings::model::TrackerRule]) -> Vec<u32> {
+    rules
+        .iter()
+        .filter(|rule| rule.torrent_route)
+        .map(|rule| rule.id)
+        .collect()
+}
+
+// After the tracker rules are saved: the routes reload only when the rules
+// that route their torrents themselves changed (`routed`, read before the
+// save), as no other rule field is read by the routes; then the torrents
+// take the rules as saved, whether or not the routes reloaded.
+async fn tracker_rules_saved(
+    ctx: &Context<'_>,
+    routed: &[u32],
+    rules: &[weaver_server_core::settings::model::TrackerRule],
+) -> Result<()> {
+    let routes = if routed_rules(rules) == routed {
+        Ok(())
+    } else {
+        crate::proxies::refresh(ctx).await
+    };
+    let reloaded = crate::torrents::reload_tracker_rules(ctx).await;
+    routes.and(reloaded)
 }
 
 // The bytes of an uploaded tracker file, refused past the largest a tracker

@@ -1167,6 +1167,55 @@ async fn a_tracker_rule_sets_the_goals_of_the_torrents_announcing_to_its_hosts()
     );
 }
 
+// After each save of a tracker rule the rules in force are the saved ones:
+// an edit that leaves the routes alone, one that gives the rule its own
+// route, and one that takes it away.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_rules_in_force_are_the_ones_each_save_leaves() {
+    let rig = rig().await;
+    let rig = &rig;
+    let read = |query: String| async move {
+        let response = rig.execute(&query).await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        response.data.into_json().unwrap()
+    };
+    let rule = |id: &str, ratio: u32, route: bool| {
+        format!(
+            r#"mutation {{ saveTrackerRule({id} input: {{
+                hostPattern: "*.tracker.test", torrentRoute: {route},
+                seeding: {{ ratioGoal: {{ state: SET, value: {ratio} }} }}
+            }}) {{ id }} }}"#
+        )
+    };
+    let rule_id = read(rule("", 3, false)).await["saveTrackerRule"][0]["id"]
+        .as_u64()
+        .unwrap();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(metainfo("ruled.mkv", 3000, false))
+        .unwrap();
+    let mut announcing = b"d".to_vec();
+    bstr(&mut announcing, b"announce");
+    bstr(&mut announcing, b"http://a.tracker.test/announce");
+    announcing.extend_from_slice(&bytes[1..]);
+    let announcing = base64::engine::general_purpose::STANDARD.encode(announcing);
+    let id = read(submit(&announcing, "")).await["submitTorrent"]["id"]
+        .as_u64()
+        .unwrap();
+    let ratio = || async move {
+        read(format!(
+            "{{ torrent(id: {id}) {{ seedingPolicy {{ ratioGoal }} }} }}"
+        ))
+        .await["torrent"]["seedingPolicy"]["ratioGoal"]
+            .clone()
+    };
+    assert_eq!(ratio().await, 3.0);
+    let edit = format!("id: {rule_id},");
+    for (goal, route) in [(5, false), (6, true), (7, true), (8, false)] {
+        read(rule(&edit, goal, route)).await;
+        assert_eq!(ratio().await, f64::from(goal), "route {route}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_torrents_peers_are_listed_and_a_ban_is_kept() {
     let rig = rig().await;
