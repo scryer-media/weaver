@@ -261,6 +261,20 @@ impl TorrentService {
         outcome
     }
 
+    // One write of `intent` for `job_ids`, off the runtime. The caller
+    // keeps the list held, so no other change of these torrents lands
+    // between it and theirs.
+    async fn write_intents(&self, intent: KeptIntent, job_ids: &[JobId]) -> Result<(), StateError> {
+        let db = self.inner.db.clone();
+        let job_ids = job_ids.to_vec();
+        tokio::task::spawn_blocking(move || {
+            db.update_torrent_intents(&[(intent, job_ids.as_slice())])
+        })
+        .await
+        .map_err(|error| StateError::Database(error.to_string()))
+        .and_then(|result| result)
+    }
+
     // `pause` for each torrent: one write of their intents, then one pass
     // of the queue and one publish.
     pub(super) async fn pause_many(&self, job_ids: &[JobId]) -> Outcome {
@@ -275,10 +289,10 @@ impl TorrentService {
             if present.is_empty() {
                 return outcome;
             }
-            if let Err(error) = self.inner.db.update_torrent_intents(&[(
-                KeptIntent::Intent(TorrentIntent::Paused),
-                present.as_slice(),
-            )]) {
+            if let Err(error) = self
+                .write_intents(KeptIntent::Intent(TorrentIntent::Paused), &present)
+                .await
+            {
                 return failed(outcome, &present, &error);
             }
             for &job_id in &present {
@@ -348,10 +362,10 @@ impl TorrentService {
                     self.inner.restore_wanted.store(true, Ordering::Release);
                 }
             }
-            if let Err(error) = self.inner.db.update_torrent_intents(&[(
-                KeptIntent::Intent(TorrentIntent::Resumed),
-                present.as_slice(),
-            )]) {
+            if let Err(error) = self
+                .write_intents(KeptIntent::Intent(TorrentIntent::Resumed), &present)
+                .await
+            {
                 return failed(outcome, &present, &error);
             }
             for &job_id in &present {

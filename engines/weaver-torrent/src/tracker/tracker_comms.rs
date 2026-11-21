@@ -361,8 +361,9 @@ pub fn redacted_tracker_text(text: &str) -> String {
     let mut rest = text;
     while let Some(at) = rest.find("://") {
         let start = rest[..at]
-            .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
-            .map_or(0, |before| before + 1);
+            .char_indices()
+            .rfind(|&(_, c)| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+            .map_or(0, |(before, c)| before + c.len_utf8());
         let end = rest[at..]
             .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>'))
             .map_or(rest.len(), |after| at + after);

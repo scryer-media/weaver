@@ -1457,11 +1457,12 @@ impl TorrentService {
             Some(torrent) => {
                 // A ban made while the session took the torrent holds in
                 // it too.
+                let had: std::collections::HashSet<&IpAddr> = saved.banned.iter().collect();
                 let since: Vec<IpAddr> = torrent
                     .resume
                     .banned
                     .iter()
-                    .filter(|ip| !saved.banned.contains(ip))
+                    .filter(|ip| !had.contains(ip))
                     .copied()
                     .collect();
                 if !since.is_empty() {

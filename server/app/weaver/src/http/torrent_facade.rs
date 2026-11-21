@@ -1447,9 +1447,16 @@ pub(super) fn state(view: &TorrentView) -> &'static str {
     }
 }
 
-fn category_dir(config: &Config, category: Option<&str>) -> PathBuf {
+// A category's folder, from the category in hand, with no search of the
+// others for its name.
+fn category_dir(config: &Config, category: &CategoryConfig) -> PathBuf {
     let complete = PathBuf::from(config.complete_dir());
-    completion_parent(&complete, &config.categories, category).unwrap_or(complete)
+    completion_parent(
+        &complete,
+        std::slice::from_ref(category),
+        Some(&category.name),
+    )
+    .unwrap_or(complete)
 }
 
 fn secs(ms: i64) -> i64 {
@@ -2951,7 +2958,7 @@ async fn add(ctx: &TorrentFacadeContext, params: Params, scope: CallerScope) -> 
             (Ok(upload), Ok(download)) => (upload, download),
             (Err(response), _) | (_, Err(response)) => return *response,
         };
-    let mut sources = Vec::with_capacity(params.files.len() + urls.len());
+    let mut sources = Vec::with_capacity(params.files.len());
     for (name, body) in &params.files {
         match AddSource::of(classify(body), body.clone()) {
             Ok(source) => sources.push(Ok(source)),
@@ -2980,21 +2987,6 @@ async fn add(ctx: &TorrentFacadeContext, params: Params, scope: CallerScope) -> 
             }
         }
     }
-    for line in urls {
-        let body = match classify(line.as_bytes()) {
-            Kind::Url(url) => match ctx.inner.handle.proxy_runtime() {
-                Some(runtime) => torrents
-                    .fetch_url(&runtime, category.as_deref(), &url, params.get("cookie"))
-                    .await
-                    .map_err(|error| error.to_string()),
-                None => Err("torrent request has no route".to_owned()),
-            },
-            _ => Ok(line.as_bytes().to_vec()),
-        };
-        sources.push(body.and_then(|body| {
-            AddSource::of(classify(&body), body).map_err(|_| format!("{line} is not a torrent"))
-        }));
-    }
     let stopped = params
         .flag("stopped")
         .or_else(|| params.flag("paused"))
@@ -3008,7 +3000,20 @@ async fn add(ctx: &TorrentFacadeContext, params: Params, scope: CallerScope) -> 
     let mut ids = Vec::new();
     let mut failed = 0usize;
     let mut refusal: Option<String> = None;
-    for source in sources {
+    // Each url is fetched once the source before it is added, so one
+    // fetched body at a time is held, whatever the number of urls.
+    let mut files = sources.into_iter();
+    let mut urls = urls.into_iter();
+    loop {
+        let source = match files.next() {
+            Some(source) => source,
+            None => match urls.next() {
+                Some(line) => {
+                    fetched_source(ctx, torrents, category.as_deref(), &params, line).await
+                }
+                None => break,
+            },
+        };
         let added = match source {
             Ok(source) => match torrents
                 .add_as(
@@ -3071,6 +3076,30 @@ async fn add(ctx: &TorrentFacadeContext, params: Params, scope: CallerScope) -> 
         return text(StatusCode::BAD_REQUEST, "no torrents or urls");
     }
     ctx.api().added(&ids, failed, refusal)
+}
+
+// One line of `torrents/add`'s urls as a source: a url fetched over the
+// torrent's route, else the line itself, as a magnet. A refusal names the
+// line as a caller below Admin may read it, without a key or passkey.
+async fn fetched_source(
+    ctx: &TorrentFacadeContext,
+    torrents: &TorrentService,
+    category: Option<&str>,
+    params: &Params,
+    line: &str,
+) -> Result<AddSource, String> {
+    let body = match classify(line.as_bytes()) {
+        Kind::Url(url) => match ctx.inner.handle.proxy_runtime() {
+            Some(runtime) => torrents
+                .fetch_url(&runtime, category, &url, params.get("cookie"))
+                .await
+                .map_err(|error| error.to_string()),
+            None => Err("torrent request has no route".to_owned()),
+        },
+        _ => Ok(line.as_bytes().to_vec()),
+    }?;
+    AddSource::of(classify(&body), body)
+        .map_err(|_| format!("{} is not a torrent", redacted_article_link(line)))
 }
 
 // Where an added torrent's files go, as qBittorrent `addAction` and
@@ -3811,16 +3840,23 @@ async fn set_preferences(ctx: &TorrentFacadeContext, params: &Params) -> Respons
             .map(|value| u64::try_from(value).ok().filter(|value| *value > 0))
     };
     let inner = &ctx.inner;
-    let current = inner.config.read().await.torrent.clone();
-    let torrent = match torrent_preferences(&current, &changes) {
-        Ok(torrent) => torrent,
-        Err(error) => return text(StatusCode::BAD_REQUEST, error),
-    };
+    // Refused before the rates are saved.
+    if let Err(error) = torrent_preferences(&inner.config.read().await.torrent, &changes) {
+        return text(StatusCode::BAD_REQUEST, error);
+    }
     let saved = save_rates(ctx, rate("dl_limit"), rate("up_limit")).await;
     if saved.status() != StatusCode::OK {
         return saved;
     }
-    if torrent != current {
+    // The changes apply to the settings as they stand, locked from read to
+    // save, as `ban_session_wide` locks them: two changes made at once each
+    // keep the other's.
+    let mut config = inner.config.write().await;
+    let torrent = match torrent_preferences(&config.torrent, &changes) {
+        Ok(torrent) => torrent,
+        Err(error) => return text(StatusCode::BAD_REQUEST, error),
+    };
+    if torrent != config.torrent {
         let db = inner.db.clone();
         let saved = torrent.clone();
         match tokio::task::spawn_blocking(move || db.save_torrent_config(&saved)).await {
@@ -3828,7 +3864,8 @@ async fn set_preferences(ctx: &TorrentFacadeContext, params: &Params) -> Respons
             Ok(Err(error)) => return internal(error),
             Err(error) => return internal(error),
         }
-        inner.config.write().await.torrent = torrent;
+        config.torrent = torrent;
+        drop(config);
         ctx.refresh_settings().await;
     }
     ok()
@@ -3898,7 +3935,7 @@ pub(super) fn categories(config: &Config) -> Value {
                 category.name.clone(),
                 json!({
                     "name": category.name,
-                    "savePath": category_dir(config, Some(&category.name)).to_string_lossy(),
+                    "savePath": category_dir(config, category).to_string_lossy(),
                     "download_path": Value::Null,
                     "ratio_limit": ratio,
                     "seeding_time_limit": minutes(seeding.seed_time_goal_minutes),
@@ -4897,7 +4934,10 @@ async fn rss(
                     .iter()
                     .any(|other| other.id != feed.id && other.url == url)
                 {
-                    return Err(format!("RSS feed with given URL already exists: {url}."));
+                    return Err(format!(
+                        "RSS feed with given URL already exists: {}.",
+                        redacted_tracker_url(&url)
+                    ));
                 }
                 feed.url = url;
                 Ok(())
@@ -4955,7 +4995,10 @@ fn refresh_secs(secs: i64) -> u32 {
 fn feed_url(url: &str) -> Result<(), String> {
     match reqwest::Url::parse(url) {
         Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => Ok(()),
-        _ => Err(format!("Invalid RSS feed URL: {url}.")),
+        _ => Err(format!(
+            "Invalid RSS feed URL: {}.",
+            redacted_tracker_url(url)
+        )),
     }
 }
 
@@ -5100,15 +5143,13 @@ where
     Ok(changed)
 }
 
-// qBittorrent `addFeedAction`: a feed named by its path, else its url.
+// qBittorrent `addFeedAction`: a feed named by its path, else by its url's
+// scheme, host and port, as a caller below Admin may read the name and the
+// url can carry the indexer's key. A second feed of that host takes its id.
 async fn add_feed(ctx: &TorrentFacadeContext, url: &str, path: &str, every: &str) -> Response {
     let url = url.trim().to_owned();
-    let name = if path.is_empty() {
-        url.clone()
-    } else {
-        path.to_owned()
-    };
-    if name.contains('\\') {
+    let path = path.to_owned();
+    if path.contains('\\') {
         return unavailable("RSS folders");
     }
     let every = refresh_secs(every.trim().parse::<i64>().unwrap_or(0).max(0));
@@ -5119,17 +5160,28 @@ async fn add_feed(ctx: &TorrentFacadeContext, url: &str, path: &str, every: &str
         let feeds = db.list_rss_feeds()?;
         if feeds.iter().any(|feed| feed.url == url) {
             return Ok(Err(format!(
-                "RSS feed with given URL already exists: {url}."
+                "RSS feed with given URL already exists: {}.",
+                redacted_tracker_url(&url)
             )));
         }
-        if feeds.iter().any(|feed| feed.name == name) {
-            return Ok(Err(format!(
-                "RSS item with given path already exists: {name}."
-            )));
-        }
+        let id = db.next_rss_feed_id()?;
+        let name = if path.is_empty() {
+            let shown = redacted_tracker_url(&url);
+            match feeds.iter().any(|feed| feed.name == shown) {
+                true => format!("{shown} ({id})"),
+                false => shown,
+            }
+        } else {
+            if feeds.iter().any(|feed| feed.name == path) {
+                return Ok(Err(format!(
+                    "RSS item with given path already exists: {path}."
+                )));
+            }
+            path
+        };
         let row = RssFeedRow {
             scripts: Vec::new(),
-            id: db.next_rss_feed_id()?,
+            id,
             name,
             url,
             enabled: true,

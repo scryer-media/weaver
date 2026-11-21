@@ -137,6 +137,16 @@ fn a_tracker_shows_only_its_scheme_host_and_port() {
     assert_eq!(super::redacted_tracker_url("not a url"), "…");
 }
 
+// A URL right after a multibyte character is cut at that character's end,
+// not inside it.
+#[test]
+fn tracker_text_redacts_a_url_after_a_multibyte_character() {
+    assert_eq!(
+        super::redacted_tracker_text("错误：https://tracker.example/announce?pk=s3cret gone"),
+        "错误：https://tracker.example:443/… gone"
+    );
+}
+
 // A tracker's scheme names the protocol it is spoken to over, and the
 // protocol's kind's text is the metric label its counts carry.
 #[tokio::test]

@@ -593,7 +593,10 @@ impl TorrentService {
         let mut changes = self.inner.db.subscribe_tag_changes();
         self.keep(tokio::spawn(async move {
             while changes.changed().await.is_ok() {
-                service.retag();
+                let service = service.clone();
+                if let Err(error) = tokio::task::spawn_blocking(move || service.retag()).await {
+                    tracing::warn!(%error, "could not follow the tags");
+                }
             }
         }));
     }
@@ -774,10 +777,20 @@ impl TorrentService {
         }
     }
 
-    // Each view's tags, from the tags as last read. A view whose tags cannot
-    // be read shows none.
-    fn tag(&self, views: &mut [&mut TorrentView]) {
-        match self.inner.db.tag_snapshot() {
+    // Each view's tags, from the tags as last read; a cold read runs off the
+    // async runtime. A view whose tags cannot be read shows none.
+    async fn tag(&self, views: &mut [&mut TorrentView]) {
+        let tags = match self.inner.db.cached_tag_snapshot() {
+            Some(tags) => Ok(tags),
+            None => {
+                let db = self.inner.db.clone();
+                tokio::task::spawn_blocking(move || db.tag_snapshot())
+                    .await
+                    .map_err(|error| crate::StateError::Database(error.to_string()))
+                    .and_then(|result| result)
+            }
+        };
+        match tags {
             Ok(tags) => {
                 for view in views {
                     view.tags = tags.of(view.job_id).to_vec();
@@ -819,7 +832,7 @@ impl TorrentService {
             self.track(&mut view, pinned, &listed, &announces, &mut HashMap::new());
         }
         if shown.tags {
-            self.tag(&mut [&mut view]);
+            self.tag(&mut [&mut view]).await;
         }
         Some(view)
     }
@@ -914,7 +927,7 @@ impl TorrentService {
             &announces,
             &mut HashMap::new(),
         );
-        self.tag(&mut [&mut support.view]);
+        self.tag(&mut [&mut support.view]).await;
         if let Some(handle) = handle {
             support.peer_kinds = PeerKinds::of(&handle.peers());
         }
@@ -1066,7 +1079,8 @@ impl TorrentService {
             }
         }
         if shown.tags {
-            self.tag(&mut views.iter_mut().map(|(view, ..)| view).collect::<Vec<_>>());
+            self.tag(&mut views.iter_mut().map(|(view, ..)| view).collect::<Vec<_>>())
+                .await;
         }
         let mut file_totals = file_totals.into_iter();
         views
@@ -1239,9 +1253,13 @@ fn with_routes_of(
     mut sessions: Vec<SessionSeries>,
     torrents: &[TorrentSeries],
 ) -> Vec<SessionSeries> {
+    let mut read: std::collections::HashSet<String> = sessions
+        .iter()
+        .map(|session| session.route.to_string())
+        .collect();
     for torrent in torrents {
         let route = torrent.route.as_str();
-        if !route.is_empty() && !sessions.iter().any(|session| session.route == route) {
+        if !route.is_empty() && read.insert(route.to_owned()) {
             sessions.push(SessionSeries::held(route));
         }
     }

@@ -290,7 +290,7 @@ impl RssQueries for Database {
                 sql.push_str(" WHERE feed_id = {}");
                 args.push(SqlArg::I64(i64::from(feed_id)));
             }
-            sql.push_str(" ORDER BY seen_at DESC");
+            sql.push_str(" ORDER BY seen_at DESC, item_id DESC");
             if let Some(limit) = limit {
                 sql.push_str(" LIMIT {}");
                 args.push(SqlArg::I64(i64::from(limit)));
@@ -306,37 +306,62 @@ impl RssQueries for Database {
         })
     }
 
-    /// The `limit` items each feed saw last, in one statement: feed by
-    /// feed, each feed's items in the order `list_rss_seen_items` gives
-    /// for that feed alone.
+    /// The `limit` items each feed saw last: feed by feed, each feed's items
+    /// in the order `list_rss_seen_items` gives for that feed alone. One
+    /// statement per bind-sized chunk of feeds, each feed's part read from
+    /// the newest of its items and stopped at `limit`, so the read grows
+    /// with the answer, not with the history kept.
     fn list_rss_seen_items_per_feed(&self, limit: u32) -> Result<Vec<RssSeenItemRow>, StateError> {
         let key = self.encryption_key().cloned();
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
-            let rows = SqlRuntime::fetch_all(
+            let feed_ids = SqlRuntime::fetch_all(
                 datastore.read_exec(),
-                "SELECT feed_id, item_id, item_title, published_at, size_bytes, decision,
-                    seen_at, job_id, item_url, error
-                   FROM (SELECT feed_id, item_id, item_title, published_at, size_bytes,
-                            decision, seen_at, job_id, item_url, error,
-                            ROW_NUMBER() OVER (
-                                PARTITION BY feed_id ORDER BY seen_at DESC
-                            ) AS feed_rank
-                           FROM rss_seen_items) ranked
-                  WHERE feed_rank <= {}
-                  ORDER BY feed_id, feed_rank",
-                &[SqlArg::I64(i64::from(limit))],
+                "SELECT id FROM rss_feeds ORDER BY id",
+                &[],
             )
-            .await?;
-            rows.into_iter()
-                .map(|row| {
+            .await?
+            .iter()
+            .map(|row| row.i64("id"))
+            .collect::<Result<Vec<_>, _>>()?;
+            // Two binds for each feed: its id and the limit.
+            let per_chunk = weaver_server_db::persistence::sql_runtime::max_rows_for_engine(
+                datastore.engine(),
+                2,
+            );
+            let mut items = Vec::new();
+            for chunk in feed_ids.chunks(per_chunk) {
+                let mut args = Vec::with_capacity(chunk.len() * 2);
+                for &feed_id in chunk {
+                    args.push(SqlArg::I64(feed_id));
+                    args.push(SqlArg::I64(i64::from(limit)));
+                }
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    &latest_per_feed_sql(chunk.len()),
+                    &args,
+                )
+                .await?;
+                for row in rows {
                     let mut item = map_seen_item_row(row)?;
                     item.item_url = super::persistence::open_seen_link(key.as_ref(), item.item_url);
-                    Ok(item)
-                })
-                .collect()
+                    items.push(item);
+                }
+            }
+            Ok(items)
         })
     }
+}
+
+// The newest `{}` items of each of `feeds` feeds, feed by feed, each part
+// served by `idx_rss_seen_feed_seen_at` and stopped at its limit.
+fn latest_per_feed_sql(feeds: usize) -> String {
+    let part = format!(
+        "SELECT * FROM ({RSS_SEEN_SELECT} WHERE feed_id = {{}} \
+         ORDER BY seen_at DESC, item_id DESC LIMIT {{}}) AS feed_part"
+    );
+    let parts = vec![part; feeds].join(" UNION ALL ");
+    format!("SELECT * FROM ({parts}) AS latest ORDER BY feed_id, seen_at DESC, item_id DESC")
 }
 
 pub trait RssInternalQueries {

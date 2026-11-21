@@ -1634,15 +1634,18 @@ async fn a_url_is_fetched_with_the_cookie_and_read_for_what_it_is() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0]["name"], "fetched.mkv");
 
-    // A body that is not a torrent is refused for what it is, and the cookie
-    // went with its request only.
+    // A body that is not a torrent is refused for what it is, without the
+    // url's key, and the cookie went with its request only.
     let (url, server) = serve(vec![b"<?xml version=\"1.0\"?><nzb/>".to_vec()]).await;
     let refused = rig
-        .post("/api/v2/torrents/add", &format!("urls={url}"))
+        .post(
+            "/api/v2/torrents/add",
+            &format!("urls={url}%3Fapikey%3Dadd5ecret"),
+        )
         .await;
     assert_eq!(refused.status, StatusCode::CONFLICT);
     assert!(
-        refused.body.ends_with("is not a torrent"),
+        refused.body.ends_with("is not a torrent") && !refused.body.contains("5ecret"),
         "{}",
         refused.body
     );
@@ -4717,7 +4720,7 @@ async fn rss_feeds_are_added_listed_renamed_and_removed() {
         (again.status, again.body.as_str()),
         (
             StatusCode::CONFLICT,
-            "RSS feed with given URL already exists: http://feeds.invalid/a.xml."
+            "RSS feed with given URL already exists: http://feeds.invalid:80/…."
         )
     );
     let nested = rig
@@ -4892,6 +4895,49 @@ async fn a_read_key_sees_no_feed_or_blocklist_passkey() {
     assert_eq!(
         read(PREFERENCES, READER).await.json()["ip_filter_path"],
         PATH
+    );
+}
+
+// A feed added without a path is named by its url's scheme, host and port,
+// a second of that host by its id too, and no refusal repeats a url's key.
+#[tokio::test]
+async fn a_feed_name_and_refusal_carry_no_url_key() {
+    const ONE: &str = "https://feeds.invalid/rss?apikey=one5ecret";
+    const TWO: &str = "https://feeds.invalid/rss?apikey=two5ecret";
+    let rig = rig().await;
+    let add = |url: &'static str| {
+        let rig = &rig;
+        async move {
+            rig.post(
+                "/api/v2/rss/addFeed",
+                &format!("url={}&path=", url_encode(url)),
+            )
+            .await
+        }
+    };
+    assert_eq!(add(ONE).await.status, StatusCode::OK);
+    assert_eq!(add(TWO).await.status, StatusCode::OK);
+    let names: Vec<String> = rig
+        .db
+        .list_rss_feeds()
+        .unwrap()
+        .into_iter()
+        .map(|feed| feed.name)
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "https://feeds.invalid:443/…",
+            "https://feeds.invalid:443/… (2)"
+        ]
+    );
+    let again = add(ONE).await;
+    assert_eq!(again.status, StatusCode::CONFLICT);
+    assert!(!again.body.contains("5ecret"), "{}", again.body);
+    let invalid = add("https://feeds.invalid:bad/rss?apikey=bad5ecret").await;
+    assert_eq!(
+        (invalid.status, invalid.body.as_str()),
+        (StatusCode::CONFLICT, "Invalid RSS feed URL: ….")
     );
 }
 
