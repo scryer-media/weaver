@@ -238,12 +238,7 @@ pub fn runs(turn: Turn, resumed: bool) -> bool {
 // short, and one held for that, paused or with its download held, is let go
 // once it has room.
 pub fn checks_start(run: bool, starting: bool, disk_held: Option<DiskHeld>) -> bool {
-    run
-        && (starting
-            || matches!(
-                disk_held,
-                Some(DiskHeld::Starting | DiskHeld::Fetching)
-            ))
+    run && (starting || matches!(disk_held, Some(DiskHeld::Starting | DiskHeld::Fetching)))
 }
 
 /// What a session is told of a torrent's run.

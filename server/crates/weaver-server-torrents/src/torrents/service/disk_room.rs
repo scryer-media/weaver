@@ -532,7 +532,10 @@ impl TorrentService {
             // A hold the judgement began or ended is a wait moved, heard as
             // one the start rule's wait began is.
             if moved {
-                service.inner.disk_waits_moved.send_modify(|moved| *moved += 1);
+                service
+                    .inner
+                    .disk_waits_moved
+                    .send_modify(|moved| *moved += 1);
             }
             service.publish_job(job_id).await;
         }));

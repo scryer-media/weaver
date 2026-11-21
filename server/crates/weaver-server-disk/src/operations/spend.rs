@@ -399,7 +399,11 @@ mod tests {
         spend.take_posted(65_536, &reader);
         for left in [49_152, 32_768, 16_384, 0] {
             assert!(spend.draw(16_384, &reader, 100));
-            assert_eq!(ledger.promised_total(), left + 16_384, "a draw books nothing");
+            assert_eq!(
+                ledger.promised_total(),
+                left + 16_384,
+                "a draw books nothing"
+            );
             ledger.landed(16_384, 0);
             assert_eq!(ledger.promised_total(), left);
         }

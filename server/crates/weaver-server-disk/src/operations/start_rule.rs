@@ -294,17 +294,18 @@ impl StartWait {
     // begins, or goes on, waking for the least any job kept short needs.
     pub fn kept(&mut self, capacity: &StorageCapacity, rule: StartRule, refused: StartRefused) {
         let held = self.held;
-        let mut need_min = if held {
-            self.need_min
-        } else {
-            [u64::MAX; 2]
-        };
+        let mut need_min = if held { self.need_min } else { [u64::MAX; 2] };
         let mut unread = held && self.unread;
         if let StartRefused::Short { need, room } = refused {
             need_min[0] = need_min[0].min(need);
             unread |= room.is_none();
         }
-        self.walked(capacity, rule, true, (need_min, unread, rule.most(capacity)));
+        self.walked(
+            capacity,
+            rule,
+            true,
+            (need_min, unread, rule.most(capacity)),
+        );
     }
 
     // How many times a promise was given back on the disks a start is
@@ -332,8 +333,8 @@ impl StartWait {
         }
         let check = rule.check();
         let output = rule.output_check();
-        let fresh = capacity.fresh(rule.working)
-            && (!self.waits_output || capacity.fresh(rule.output));
+        let fresh =
+            capacity.fresh(rule.working) && (!self.waits_output || capacity.fresh(rule.output));
         // Each disk's room against the least a job refused on that disk
         // needs there.
         let [working_need, output_need] = self.need_min;

@@ -191,7 +191,10 @@ impl Room {
         if spot.aim.as_ref().is_some_and(|aim| *aim != place.dir) {
             return false;
         }
-        let moved = spot.place.as_ref().is_some_and(|left| !same_disk(left, &place));
+        let moved = spot
+            .place
+            .as_ref()
+            .is_some_and(|left| !same_disk(left, &place));
         let left = spot.place.replace(place);
         self.give_in_hand(left.as_ref());
         if moved {

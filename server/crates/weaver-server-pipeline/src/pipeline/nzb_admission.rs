@@ -587,12 +587,8 @@ impl Pipeline {
         // The hold begins, or goes on, while a job was kept for the disk,
         // and ends once none was.
         let rule = self.start_rule();
-        self.admission_disk.walked(
-            &self.storage_capacity,
-            rule,
-            kept,
-            (need_min, unread, most),
-        );
+        self.admission_disk
+            .walked(&self.storage_capacity, rule, kept, (need_min, unread, most));
         let login_refusals = self.login_refusal_view();
         self.shared_state.queue.write(|inner| {
             let mut changed = false;
