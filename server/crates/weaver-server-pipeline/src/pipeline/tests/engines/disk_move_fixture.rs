@@ -267,6 +267,15 @@ pub fn complete_room_now(pipeline: &Pipeline) -> Option<u64> {
     )
 }
 
+// `bytes` more are promised on the complete folder's ledger, as a job
+// started with that folder on a disk of its own promises them.
+pub fn promise_on_complete(pipeline: &Pipeline, bytes: u64) {
+    pipeline
+        .storage_capacity
+        .ledger(StorageRoot::Complete)
+        .promise(bytes);
+}
+
 // What the complete folder's own ledger holds promised; on a disk of its
 // own, everything promised there.
 pub fn complete_promised(pipeline: &Pipeline) -> u64 {

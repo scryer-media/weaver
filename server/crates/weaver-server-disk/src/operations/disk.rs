@@ -3020,6 +3020,17 @@ impl StorageCapacity {
         slot.ledger.free_with(|| slot.capacity.read())
     }
 
+    // What `root`'s ledger takes off the figure its latest reading shows:
+    // what is promised on its filesystem and what landed since. A wait
+    // judged on the figure shown counts it to be judged as a booking is.
+    // Nothing without a reading.
+    pub fn taken_by_ledger(&self, root: StorageRoot) -> u64 {
+        self.look(root)
+            .shown
+            .zip(self.free(root))
+            .map_or(0, |(shown, free)| shown.saturating_sub(free.bytes))
+    }
+
     // The ledger every writer on `root`'s filesystem spends from.
     pub fn ledger(&self, root: StorageRoot) -> &DiskLedger {
         &self.slot(root).ledger
