@@ -92,7 +92,7 @@ const nextData: NextData = {
     totalCount: 0, isLoading: false, error: null, refresh: () => {},
   },
   categories: [], refreshCategories: () => {}, historyCount: 0, refreshHistoryCount: () => {},
-  providers: [], providersLoaded: true, holdoffs: [],
+  providers: [], providersLoaded: true, holdoffs: [], diskVolumes: [],
   connection: { status: "connected", isDisconnected: false, isPolling: false },
 };
 
