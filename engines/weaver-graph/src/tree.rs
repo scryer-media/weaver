@@ -38,6 +38,7 @@ mod bound_kinds;
 mod held;
 mod layers;
 mod lent;
+pub use lent::LentWaits;
 mod lift;
 mod nodes;
 mod pieces;
@@ -628,6 +629,9 @@ pub struct Tree {
     // Never recorded: a restart notes them again, and decides the same.
     unlayered: BTreeSet<(NodeId, MemberId)>,
     layers: BTreeMap<NodeId, layers::Packed>,
+    // How many bytes waited behind lent objects (`Tree::lent_waits`). Never
+    // recorded.
+    lent_waits: lent::LentWaits,
 }
 
 // The clean bytes a delivery is handing a member, at their offset in it: a
@@ -694,6 +698,7 @@ impl Tree {
             reading_on: BTreeMap::new(),
             unlayered: BTreeSet::new(),
             layers: BTreeMap::new(),
+            lent_waits: lent::LentWaits::default(),
         }
     }
 
@@ -2757,6 +2762,9 @@ impl Tree {
     // moved into its namespace is homed where it was posted again.
     fn remove_node(&mut self, node: NodeId, effects: &mut Vec<Effect>) -> Option<Node> {
         let removed = self.nodes.remove(&node)?;
+        if let Some(lent) = &removed.lent {
+            lent.count(&mut self.lent_waits);
+        }
         self.layers.remove(&node);
         self.held_lost.remove(&node);
         self.held_located.remove(&node);

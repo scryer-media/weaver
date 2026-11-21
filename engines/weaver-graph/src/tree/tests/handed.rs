@@ -481,3 +481,52 @@ fn a_whole_member_shorter_than_a_verdict_founds_its_store_after_a_loan() {
     assert_ne!(owner, child, "a store of its own");
     assert_eq!(volume, VolumeIndex(0));
 }
+
+// Bytes that reach a lent object wait behind it, and are counted as it comes
+// back: one loan, the most it held, and the sum. A loan that nothing reached
+// counts nothing.
+#[test]
+fn bytes_that_waited_behind_a_loan_are_counted_as_it_comes_back() {
+    let (mut tree, window, log) = reader_window();
+    let object = tree.lend_for_test(window).expect("the window lends");
+    tree.take_back(
+        window,
+        object,
+        &mut Reading(Arc::clone(&log)),
+        &mut Vec::new(),
+    );
+    assert_eq!(tree.lent_waits(), LentWaits::default());
+
+    let object = tree.lend_for_test(window).expect("the window lends");
+    for (offset, bytes) in [(2, b"first".as_slice()), (7, b"next".as_slice())] {
+        let arrived = Arrived {
+            volume: VolumeIndex(0),
+            offset,
+            bytes: Bytes::copy_from_slice(bytes).into(),
+            provenance: Provenance::Fresh,
+        };
+        tree.deliver_to_object(
+            window,
+            &arrived,
+            Some(31),
+            &mut Reading(Arc::clone(&log)),
+            &mut Vec::new(),
+        );
+    }
+    tree.take_back(
+        window,
+        object,
+        &mut Reading(Arc::clone(&log)),
+        &mut Vec::new(),
+    );
+    let counted = LentWaits {
+        loans_that_queued_bytes: 1,
+        peak_queued_bytes: 9,
+        total_queued_bytes: 9,
+    };
+    assert_eq!(tree.lent_waits(), counted);
+
+    let object = tree.lend_for_test(window).expect("the window lends");
+    tree.take_back(window, object, &mut Reading(log), &mut Vec::new());
+    assert_eq!(tree.lent_waits(), counted, "an empty loan counts nothing");
+}

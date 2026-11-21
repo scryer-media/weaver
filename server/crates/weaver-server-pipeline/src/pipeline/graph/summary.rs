@@ -271,6 +271,7 @@ impl Pipeline {
     // Ahead of the archive, which copies it from the active row: a job write
     // that the archive, queued after it, waits out.
     pub(in crate::pipeline) fn persist_download_summary_before_archive(&self, job_id: JobId) {
+        self.log_lent_waits(job_id);
         let Some(json) = self
             .download_summary(job_id)
             .and_then(|summary| summary.to_storage_json())
@@ -284,6 +285,28 @@ impl Pipeline {
                 })
         {
             tracing::error!(%error, job_id = job_id.0, "failed to queue the download summary before archive");
+        }
+    }
+
+    // How many bytes waited behind the job's lent objects, said once as it
+    // is archived, and only when any did.
+    fn log_lent_waits(&self, job_id: JobId) {
+        let Some(job) = self
+            .graph_jobs
+            .get(&job_id)
+            .or_else(|| self.retiring_graph_jobs.get(&job_id))
+        else {
+            return;
+        };
+        let waits = job.tree().lent_waits();
+        if waits.loans_that_queued_bytes > 0 {
+            tracing::info!(
+                job_id = job_id.0,
+                loans = waits.loans_that_queued_bytes,
+                peak_bytes = waits.peak_queued_bytes,
+                total_bytes = waits.total_queued_bytes,
+                "bytes waited behind lent objects"
+            );
         }
     }
 }

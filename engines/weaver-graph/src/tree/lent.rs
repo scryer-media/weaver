@@ -115,6 +115,41 @@ impl Lent {
     pub(super) fn wait(&mut self, waiting: Waiting) {
         self.waiting.push(waiting);
     }
+
+    // What waited for it is counted as it goes: taken back, or dropped with
+    // its node.
+    pub(super) fn count(&self, waits: &mut LentWaits) {
+        waits.count(&self.waiting);
+    }
+}
+
+// How many bytes ever waited behind lent objects in the tree: the loans that
+// ended with bytes queued, the most one loan's queue held as it ended, and
+// the sum over all of them. Kept in memory for the tree's life; never
+// recorded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LentWaits {
+    pub loans_that_queued_bytes: u64,
+    pub peak_queued_bytes: u64,
+    pub total_queued_bytes: u64,
+}
+
+impl LentWaits {
+    fn count(&mut self, waiting: &[Waiting]) {
+        let mut queued = 0;
+        let mut delivered = false;
+        for waiting in waiting {
+            if let Waiting::Delivered { arrived, .. } = waiting {
+                delivered = true;
+                queued += arrived.bytes.bytes().len() as u64;
+            }
+        }
+        if delivered {
+            self.loans_that_queued_bytes += 1;
+            self.peak_queued_bytes = self.peak_queued_bytes.max(queued);
+            self.total_queued_bytes += queued;
+        }
+    }
 }
 
 impl Tree {
@@ -222,6 +257,11 @@ impl Tree {
     #[cfg(any(test, feature = "test-support"))]
     pub fn lend_for_test(&mut self, node: NodeId) -> Option<Box<dyn Object>> {
         self.lend_out(node)
+    }
+
+    // How many bytes waited behind lent objects so far.
+    pub fn lent_waits(&self) -> LentWaits {
+        self.lent_waits
     }
 
     pub fn lent(&self, node: NodeId) -> bool {
@@ -354,6 +394,7 @@ impl Tree {
             .lent
             .take()
             .map_or_else(Default::default, |lent| (lent.waiting, lent.queued));
+        self.lent_waits.count(&waiting);
         if let Some(binding) = &found.binding {
             object.handed(&binding.handed);
         }
