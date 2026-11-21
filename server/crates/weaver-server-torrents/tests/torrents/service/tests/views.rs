@@ -296,7 +296,7 @@ async fn the_metrics_carry_what_the_tick_read() {
         )
         .await
         .unwrap();
-    rig.service.remove(gone, true, false).await.unwrap();
+    rig.service.remove(gone, true).await.unwrap();
     {
         let mut live = rig.service.inner.live.lock().await;
         let torrent = live.get_mut(&job_id).unwrap();

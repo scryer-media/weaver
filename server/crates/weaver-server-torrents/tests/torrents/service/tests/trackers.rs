@@ -1819,7 +1819,7 @@ async fn a_torrent_moved_off_a_spent_leg_sends_no_stopped_over_it() {
 
     // The one `stopped` the tracker hears is the new session's, at the
     // remove.
-    rig.service.remove(job_id, false, false).await.unwrap();
+    rig.service.remove(job_id, false).await.unwrap();
     let stopped = next_event(&mut announces).await;
     assert_eq!(stopped.event.as_deref(), Some("stopped"));
     assert_eq!(stopped.identity(), started.identity());
@@ -1871,7 +1871,7 @@ async fn a_torrent_moved_off_a_revoked_leg_sends_no_stopped_over_it() {
 
     // The one `stopped` the tracker hears is the new session's, at the
     // remove.
-    rig.service.remove(job_id, false, false).await.unwrap();
+    rig.service.remove(job_id, false).await.unwrap();
     let stopped = next_event(&mut announces).await;
     assert_eq!(stopped.event.as_deref(), Some("stopped"));
     assert_eq!(stopped.identity(), started.identity());
@@ -1904,7 +1904,7 @@ async fn a_torrent_removed_and_added_again_takes_a_new_identity() {
     let first = next_event(&mut announces).await;
     assert_eq!(first.event.as_deref(), Some("started"));
     started_accepted(&rig.service, job_id).await;
-    rig.service.remove(job_id, false, false).await.unwrap();
+    rig.service.remove(job_id, false).await.unwrap();
     let stopped = next_event(&mut announces).await;
     assert_eq!(stopped.event.as_deref(), Some("stopped"));
 

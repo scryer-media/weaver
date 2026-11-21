@@ -2149,6 +2149,7 @@ export const nextFr: LocaleDictionary = {
   "next.torrent.removeTitle": "Supprimer le torrent",
   "next.torrent.deleteFiles": "Supprimer aussi les fichiers",
   "next.torrent.unmetGoalTitle": "Objectif de partage non atteint",
+  "next.torrent.unmetGoalBody": "Son objectif de partage n'est pas encore atteint : {{left}}.",
   "next.torrent.removeAnyway": "Supprimer quand même",
   "next.torrent.seedingCell": "Ratio · envoi",
   "next.torrent.force": "Forcer",

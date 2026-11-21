@@ -421,15 +421,10 @@ impl TorrentService {
         }
     }
 
-    /// Remove a torrent. A private torrent whose seeding goal is not met
-    /// stays unless the removal says it knows.
-    pub async fn remove(
-        &self,
-        job_id: JobId,
-        delete_files: bool,
-        confirm_unmet_goal: bool,
-    ) -> Result<(), ActionError> {
-        self.remove_as(job_id, delete_files, confirm_unmet_goal, Ending::Asked)
+    /// Remove a torrent, as the operator asks: never refused for a seeding
+    /// goal still to meet. The web asks the operator first.
+    pub async fn remove(&self, job_id: JobId, delete_files: bool) -> Result<(), ActionError> {
+        self.remove_as(job_id, delete_files, true, Ending::Asked)
             .await
     }
 

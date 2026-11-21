@@ -119,7 +119,7 @@ async fn a_torrents_job_raises_each_queue_event_once_with_its_variables() {
     again.publish_to(queue());
     reopen(&again).await;
     again.resume(job_id).await.unwrap();
-    again.remove(job_id, false, true).await.unwrap();
+    again.remove(job_id, false).await.unwrap();
     rig.db.admitted_so_far().await;
     assert_eq!(
         rig.db.queued_script_events(QueueEvent::TorrentAdded).len(),
@@ -300,7 +300,7 @@ async fn a_torrent_removed_before_it_finished_raises_its_deletion() {
         .await
         .unwrap();
     let view = rig.service.torrent(job_id).await.unwrap();
-    rig.service.remove(job_id, false, true).await.unwrap();
+    rig.service.remove(job_id, false).await.unwrap();
     rig.db.admitted_so_far().await;
     let deleted = rig.db.queued_script_events(QueueEvent::TorrentDeleted);
     assert_eq!(deleted.len(), 1);
@@ -456,7 +456,7 @@ async fn a_torrent_raises_nothing_without_queue_scripts() {
         .add_opened(request(AddSource::Metainfo(plain("set", 1))))
         .await
         .unwrap();
-    rig.service.remove(job_id, false, true).await.unwrap();
+    rig.service.remove(job_id, false).await.unwrap();
     rig.db.admitted_so_far().await;
     assert_eq!(rig.db.queue_script_count().unwrap(), 0);
 }

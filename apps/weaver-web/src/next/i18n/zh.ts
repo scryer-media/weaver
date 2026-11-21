@@ -2149,6 +2149,7 @@ export const nextZh: LocaleDictionary = {
   "next.torrent.removeTitle": "移除种子",
   "next.torrent.deleteFiles": "同时删除文件",
   "next.torrent.unmetGoalTitle": "未达到做种目标",
+  "next.torrent.unmetGoalBody": "尚未达到做种目标：{{left}}。",
   "next.torrent.removeAnyway": "仍然移除",
   "next.torrent.seedingCell": "分享率 · 上传",
   "next.torrent.force": "强制",

@@ -11,13 +11,14 @@ import { CheckRow } from "@/next/features/networking/presentation";
 import { testIds, torrentIds } from "@/next/testids";
 
 /**
- * Removing a torrent: first whether its files go too, then, only when the
- * daemon answers that its seeding goal is not met yet, the daemon's reason
- * and a second confirm that sends the remove again with that confirmed.
+ * Removing a torrent: first whether its files go too, then, when the row
+ * says its seeding goal is not met yet, what is left of it and a second
+ * confirm. The daemon never refuses the remove itself.
  */
 export function TorrentRemoveDialog({
   id,
   name,
+  goalLeft = null,
   onRemoved,
   onFailed,
   onDismiss,
@@ -25,31 +26,33 @@ export function TorrentRemoveDialog({
   /** The torrent's job id; the dialog is open while it is set. */
   id: number | null;
   name?: string;
+  /** What is left of its seeding goal, as its row holds it; null once met or with none. */
+  goalLeft?: string | null;
   onRemoved: (id: number) => void;
   onFailed: (message: string) => void;
   onDismiss: () => void;
 }) {
   const t = useTranslate();
   const [deleteFiles, setDeleteFiles] = useState(false);
-  const [unmet, setUnmet] = useState<string | null>(null);
+  const [unmet, setUnmet] = useState(false);
   const [state, removeTorrent] = useMutation<{ removeTorrent: boolean }>(REMOVE_TORRENT_MUTATION);
 
   const close = () => {
     setDeleteFiles(false);
-    setUnmet(null);
+    setUnmet(false);
     onDismiss();
   };
 
-  const remove = async (confirmUnmetGoal: boolean) => {
+  const remove = async (goalConfirmed: boolean) => {
     if (id === null) return;
-    const result = await removeTorrent({ id, deleteFiles, confirmUnmetGoal });
-    const outcome = removeOutcome(result.error);
-    if (outcome.kind === "unmetGoal" && !confirmUnmetGoal) {
-      setUnmet(outcome.message);
+    if (goalLeft !== null && !goalConfirmed) {
+      setUnmet(true);
       return;
     }
+    const result = await removeTorrent({ id, deleteFiles });
+    const outcome = removeOutcome(result.error);
     setDeleteFiles(false);
-    setUnmet(null);
+    setUnmet(false);
     if (outcome.kind === "removed") {
       onRemoved(id);
     } else {
@@ -60,7 +63,7 @@ export function TorrentRemoveDialog({
   return (
     <>
       <ConfirmDialog
-        open={id !== null && unmet === null}
+        open={id !== null && !unmet}
         testId={testIds.dialog("torrent-remove")}
         title={t("next.torrent.removeTitle")}
         note={name}
@@ -78,12 +81,12 @@ export function TorrentRemoveDialog({
         onDismiss={close}
       />
       <ConfirmDialog
-        open={id !== null && unmet !== null}
+        open={id !== null && unmet}
         testId={testIds.dialog("torrent-unmet-goal")}
         title={t("next.torrent.unmetGoalTitle")}
         note={name}
         busy={state.fetching}
-        body={unmet}
+        body={t("next.torrent.unmetGoalBody", { left: goalLeft ?? "" })}
         confirmLabel={t("next.torrent.removeAnyway")}
         solid
         onConfirm={() => void remove(true)}

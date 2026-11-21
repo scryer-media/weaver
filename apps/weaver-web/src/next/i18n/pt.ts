@@ -2149,6 +2149,7 @@ export const nextPt: LocaleDictionary = {
   "next.torrent.removeTitle": "Remover torrent",
   "next.torrent.deleteFiles": "Excluir também os arquivos",
   "next.torrent.unmetGoalTitle": "Meta de semeadura não atingida",
+  "next.torrent.unmetGoalBody": "A meta de semeadura ainda não foi atingida: {{left}}.",
   "next.torrent.removeAnyway": "Remover mesmo assim",
   "next.torrent.seedingCell": "Proporção · envio",
   "next.torrent.force": "Forçar",

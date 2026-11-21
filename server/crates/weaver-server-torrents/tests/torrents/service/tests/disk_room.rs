@@ -1293,7 +1293,7 @@ async fn a_wait_for_room_ends_with_its_run() {
         // Nothing more comes, so no write finds the disk full again.
         disk.seeding.stop().await;
         match how {
-            "remove" => service.remove(job_id, false, true).await.unwrap(),
+            "remove" => service.remove(job_id, false).await.unwrap(),
             "pause" => service.pause(job_id).await.unwrap(),
             "recheck" => {
                 // The check ends a run, and once it ends the start rule

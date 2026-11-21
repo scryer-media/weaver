@@ -45,7 +45,7 @@ async fn the_queue_orders_torrents_and_jobs_by_when_they_were_added() {
 
     let mut changes = state.subscribe_job_changes();
     changes.borrow_and_update();
-    rig.service.remove(job_id, false, false).await.unwrap();
+    rig.service.remove(job_id, false).await.unwrap();
     let finished = loop {
         let jobs = state.list_jobs();
         if let Some(job) = jobs.iter().find(|job| job.job_id == job_id) {
@@ -942,7 +942,7 @@ async fn a_slot_freed_without_a_pass_goes_out_at_the_next_settle() {
         ]
     );
 
-    service.remove(a, false, true).await.unwrap();
+    service.remove(a, false).await.unwrap();
     service.settle().await;
     assert_eq!(
         one.turns(&[b, c, d]).await,
@@ -973,7 +973,7 @@ async fn a_removal_whose_mark_is_refused_keeps_its_slot() {
         [(false, Some(1)), (true, Some(2))]
     );
     crate::torrents::persistence::MARK_REFUSED.store(2, Ordering::Relaxed);
-    let removed = service.remove(a, false, true).await;
+    let removed = service.remove(a, false).await;
     crate::torrents::persistence::MARK_REFUSED.store(0, Ordering::Relaxed);
     removed.expect_err("the removal fails");
     service.settle().await;
@@ -989,7 +989,7 @@ async fn a_seed_whose_removals_mark_is_refused_still_announces() {
     let mut seeded = seeded().await;
     let service = seeded.rig.service.clone();
     crate::torrents::persistence::MARK_REFUSED.store(2, Ordering::Relaxed);
-    let removed = service.remove(seeded.job_id, false, true).await;
+    let removed = service.remove(seeded.job_id, false).await;
     crate::torrents::persistence::MARK_REFUSED.store(0, Ordering::Relaxed);
     removed.expect_err("the removal fails");
     assert_eq!(seeded.view().await.state, TorrentState::Seeding);

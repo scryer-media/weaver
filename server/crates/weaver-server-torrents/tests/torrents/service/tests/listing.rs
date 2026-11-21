@@ -345,8 +345,8 @@ async fn a_followed_set_is_given_its_rows() {
 
     // A torrent it does not follow goes unheard; one it follows goes as
     // gone. What a removal moves in the others is told of those it follows.
-    rig.service.remove(jobs[1], false, false).await.unwrap();
-    rig.service.remove(jobs[4], false, false).await.unwrap();
+    rig.service.remove(jobs[1], false).await.unwrap();
+    rig.service.remove(jobs[4], false).await.unwrap();
     loop {
         let next = some.next().await;
         assert!(!next.full_update);
@@ -772,7 +772,7 @@ async fn a_retiring_torrent_is_in_no_page_and_no_count() {
         .push_back(crate::StateError::OutOfSpace(
             "database or disk is full".into(),
         ));
-    rig.service.remove(jobs[1], false, true).await.unwrap();
+    rig.service.remove(jobs[1], false).await.unwrap();
     assert_eq!(heard.recv().await, Some(ArchiveNews::Kept(jobs[1])));
     assert_eq!(
         rig.db.torrent_rows().unwrap(),

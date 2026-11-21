@@ -584,7 +584,7 @@ async fn a_torrent_that_seeds_moves_its_page_and_its_row() {
         })
         .await
         .unwrap();
-    rig.service.remove(other, false, true).await.unwrap();
+    rig.service.remove(other, false).await.unwrap();
     loop {
         job_changes.borrow_and_update();
         // A removed torrent's job retires as cancelled: a page of paused
@@ -1923,7 +1923,7 @@ async fn a_removal_of_many_torrents_reads_what_they_made_at_once() {
         "{took} takes for {ADDED} torrents"
     );
     for &job_id in &ids {
-        alone.service.remove(job_id, true, true).await.unwrap();
+        alone.service.remove(job_id, true).await.unwrap();
     }
     // Every file and folder below the rig's folder, by its path there.
     let on_disk = |rig: &Rig| {
@@ -2077,7 +2077,7 @@ async fn removed_as_one_at_a_time(added: u64) {
     let writes = alone.db.torrent_history_writes();
     let mut alone_outcome = std::collections::BTreeMap::new();
     for &(job_id, delete_files) in &removals {
-        let removed = alone.service.remove(job_id, delete_files, true).await;
+        let removed = alone.service.remove(job_id, delete_files).await;
         alone_outcome.insert(job_id, removed);
     }
     let alone_writes = alone.db.torrent_history_writes() - writes;
@@ -2273,7 +2273,7 @@ async fn a_batch_history_transaction_refused_for_room_goes_on_row_by_row() {
     ARCHIVE_REFUSED.lock().unwrap().push_back(full());
     let mut alone_outcome = std::collections::BTreeMap::new();
     for &(job_id, delete_files) in &removals {
-        let removed = alone.service.remove(job_id, delete_files, true).await;
+        let removed = alone.service.remove(job_id, delete_files).await;
         alone_outcome.insert(job_id, removed);
     }
     assert_eq!(alone_heard.recv().await, Some(ArchiveNews::Kept(first)));

@@ -2149,6 +2149,7 @@ export const nextJa: LocaleDictionary = {
   "next.torrent.removeTitle": "トレントを削除",
   "next.torrent.deleteFiles": "ファイルも削除",
   "next.torrent.unmetGoalTitle": "シード目標未達成",
+  "next.torrent.unmetGoalBody": "シード目標はまだ達成されていません: {{left}}。",
   "next.torrent.removeAnyway": "それでも削除",
   "next.torrent.seedingCell": "比率 · アップロード",
   "next.torrent.force": "強制",

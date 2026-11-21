@@ -2149,6 +2149,7 @@ export const nextEs: LocaleDictionary = {
   "next.torrent.removeTitle": "Eliminar torrent",
   "next.torrent.deleteFiles": "Eliminar también los archivos",
   "next.torrent.unmetGoalTitle": "Objetivo de siembra no alcanzado",
+  "next.torrent.unmetGoalBody": "Su objetivo de siembra aún no se ha alcanzado: {{left}}.",
   "next.torrent.removeAnyway": "Eliminar de todos modos",
   "next.torrent.seedingCell": "Ratio · subida",
   "next.torrent.force": "Forzar",

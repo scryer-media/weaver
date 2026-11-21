@@ -420,7 +420,7 @@ async fn an_unwanted_extension_is_left_out_not_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn removing_a_private_torrent_short_of_its_goal_needs_confirmation() {
+async fn removing_a_private_torrent_short_of_its_goal_is_never_refused() {
     let rig = rig().await;
     let response = rig
         .execute(&submit(
@@ -432,14 +432,18 @@ async fn removing_a_private_torrent_short_of_its_goal_needs_confirmation() {
     let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
         .as_u64()
         .unwrap();
-    let refused = rig
-        .execute(&format!("mutation {{ removeTorrent(id: {id}) }}"))
+    // The page names what is left before it asks; the server takes the
+    // removal as asked.
+    let left = rig
+        .execute(&format!("{{ torrent(id: {id}) {{ seedingGoalLeft }} }}"))
         .await;
-    assert_eq!(code(&refused).as_deref(), Some("SEEDING_GOAL_UNMET"));
+    assert!(left.errors.is_empty(), "{:?}", left.errors);
+    assert_eq!(
+        left.data.into_json().unwrap()["torrent"]["seedingGoalLeft"],
+        "ratio 0.00 of 1.00"
+    );
     let removed = rig
-        .execute(&format!(
-            "mutation {{ removeTorrent(id: {id}, confirmUnmetGoal: true) }}"
-        ))
+        .execute(&format!("mutation {{ removeTorrent(id: {id}) }}"))
         .await;
     assert!(removed.errors.is_empty(), "{:?}", removed.errors);
     let history = rig.harness.db.get_job_history(id).unwrap().unwrap();
@@ -755,9 +759,7 @@ async fn torrent_updates_push_what_the_service_publishes() {
     }
 
     let removed = rig
-        .execute(&format!(
-            "mutation {{ removeTorrent(id: {id}, confirmUnmetGoal: true) }}"
-        ))
+        .execute(&format!("mutation {{ removeTorrent(id: {id}) }}"))
         .await;
     assert!(removed.errors.is_empty(), "{:?}", removed.errors);
     loop {

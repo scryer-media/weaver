@@ -2149,6 +2149,7 @@ export const nextKo: LocaleDictionary = {
   "next.torrent.removeTitle": "토렌트 제거",
   "next.torrent.deleteFiles": "파일도 삭제",
   "next.torrent.unmetGoalTitle": "시딩 목표 미달성",
+  "next.torrent.unmetGoalBody": "시딩 목표를 아직 달성하지 못했습니다: {{left}}.",
   "next.torrent.removeAnyway": "그래도 제거",
   "next.torrent.seedingCell": "비율 · 업로드",
   "next.torrent.force": "강제",

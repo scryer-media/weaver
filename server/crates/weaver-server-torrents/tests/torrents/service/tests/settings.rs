@@ -336,7 +336,7 @@ async fn stop_now_during_a_wind_down_stops_them_at_once() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn removing_the_last_torrent_ends_a_wind_down() {
     let (rig, job_id) = winding_down(WindDown::Finish).await;
-    rig.service.remove(job_id, false, true).await.unwrap();
+    rig.service.remove(job_id, false).await.unwrap();
     assert!(!rig.service.presence().running);
     let mut wind_downs = rig.service.wind_downs();
     rig.service.tick().await;
