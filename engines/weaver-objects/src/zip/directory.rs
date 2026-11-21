@@ -95,6 +95,9 @@ impl Zip {
         }
         // A directory the volumes bound cannot hold is not one this store
         // reads: prepended bytes, or a set whose last volume is misplaced.
+        // Nor is one the record after it does not follow at once: the
+        // records say a directory other than the one written there, and
+        // only the end records decide that, before the directory arrives.
         let start = self
             .last()
             .filter(|last| last.0 == end.this_disk)
@@ -102,7 +105,7 @@ impl Zip {
                 self.geometry
                     .global(VolumeIndex(end.directory_disk), end.offset)
             })
-            .filter(|start| start.checked_add(end.size).is_some_and(|end| end <= after));
+            .filter(|start| start.checked_add(end.size) == Some(after));
         let Some(start) = start else {
             return self.give_up(Emit::NeedsEngine(Why::Unsupported), out);
         };

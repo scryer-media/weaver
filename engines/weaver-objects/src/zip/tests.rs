@@ -450,6 +450,36 @@ fn a_walk_whose_headers_the_directory_contradicts_goes_to_an_engine() {
     assert!(has(&owner, &Emit::NeedsEngine(Why::Unsupported)));
 }
 
+// The archive with its end record saying a directory of one byte, which the
+// end record does not follow.
+fn one_byte_directory() -> Vec<u8> {
+    let mut bytes = archive();
+    let end = records::find_end(&bytes).unwrap().at as usize;
+    bytes[end + 12..end + 16].copy_from_slice(&1u32.to_le_bytes());
+    bytes
+}
+
+#[test]
+fn a_directory_the_end_record_does_not_follow_goes_to_an_engine_after_a_walk() {
+    let mut owner = Owner::single(Zip::new(), one_byte_directory());
+    owner.pull = Pull::Unseekable;
+    owner.frames(0, 4096);
+    owner.close(0);
+    // The walk said the members before the end record arrived.
+    assert_eq!(owner.members.len(), files().len());
+    assert_eq!(owner.said, vec![Emit::NeedsEngine(Why::Unsupported)]);
+    assert!(owner.object.gone);
+}
+
+#[test]
+fn a_directory_the_end_record_does_not_follow_goes_to_an_engine_before_any_member() {
+    let mut owner = Owner::single(Zip::new(), one_byte_directory());
+    owner.whole(4096);
+    assert_eq!(owner.said, vec![Emit::NeedsEngine(Why::Unsupported)]);
+    assert!(owner.members.is_empty());
+    assert!(owner.object.gone);
+}
+
 #[test]
 fn two_entries_of_one_name_are_rejected_before_any_member() {
     let mut bytes = archive();
