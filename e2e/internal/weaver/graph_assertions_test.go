@@ -651,7 +651,7 @@ func TestScenarioFileExpectations(t *testing.T) {
 		{slug: "par2-ignorable-deficit", outcome: outcomePartialDelivery},
 		{slug: "par2-multi-set-archives-insufficient", outcome: outcomePartialDelivery},
 		{slug: "obfuscated-split-7z", outcome: "extraction_failure", error: "never placed every member it named"},
-		{slug: "nested-obfuscated-split-7z", outcome: "extraction_failure", error: "never placed every member it named"},
+		{slug: "nested-obfuscated-split-7z", outcome: "success"},
 		{slug: "par3-obfuscated-names", outcome: "repair_then_success"},
 		{slug: "par3-obfuscated-plain-name", outcome: "repair_then_success"},
 	} {

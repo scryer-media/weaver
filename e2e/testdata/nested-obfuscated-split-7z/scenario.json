@@ -1,8 +1,13 @@
 {
   "slug": "nested-obfuscated-split-7z",
   "title": "E2E.Test.Nested.Obfuscated.Split.7z.2024.1080p.BluRay.x264-TESTGRP",
-  "description": "A 7z whose members are split 7z pieces numbered .10/.11/.12 opens, but the pieces inside are never joined, because the lowest number is above one, so the job fails with no usable file.",
+  "description": "A 7z whose members are split 7z pieces numbered .10/.11/.12 opens, and the three pieces are delivered whole as they were stored. Below the root only a release layer is opened, and these pieces are not one, so they are never joined and the job completes with the pieces as its files.",
   "category": "2000",
-  "expected_outcome": "extraction_failure",
-  "expectedErrorContains": "never placed every member it named"
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "51273aad56a8b904e96928935278a627.10": "6c0c9650d98cc4bb3c89a0aed159be924c8106bb72af08bc4b766f9bbb08238b",
+    "51273aad56a8b904e96928935278a627.11": "8508e2ea8a9f0322a20787e514129f714a4c8b28d5cb5299f7f85a5c87fe6ccc",
+    "51273aad56a8b904e96928935278a627.12": "74bd4c83a34a690f252e73a7a65ecd75dd6cfb2484df466507e95574513af490"
+  },
+  "exactOutputFiles": true
 }
