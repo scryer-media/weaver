@@ -743,12 +743,15 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> Described> Walk<'_, F, R> {
 
     // The member is a volume of an object that refused it and was bound
     // without its set's first volume: a set the release never carried the
-    // head of.
+    // head of. A zip bound as its closing `.zip` alone carried its head.
     fn headless(&self, node: NodeId, member: MemberId) -> bool {
         self.tree
             .refused_by(node, member)
             .and_then(|object| self.tree.volumes(object))
-            .is_some_and(|(_, volumes)| !volumes.contains_key(&VolumeIndex(0)))
+            .is_some_and(|(_, volumes)| {
+                !volumes.contains_key(&VolumeIndex(0))
+                    && volumes.keys().any(|volume| *volume != VolumeIndex::LAST)
+            })
     }
 
     // A leaf whose name and front say an object of some kind reads it: a

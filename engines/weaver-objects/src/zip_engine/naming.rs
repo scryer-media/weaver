@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use crate::engine::SetName;
 
 // The volume `name.zip` binds as in a spanned set: after every other.
-pub(crate) const LAST: u32 = u32::MAX;
+pub(crate) const LAST: u32 = weaver_graph::VolumeIndex::LAST.0;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VolumeName {

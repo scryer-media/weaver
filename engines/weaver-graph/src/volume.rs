@@ -14,6 +14,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct VolumeIndex(pub u32);
 
+impl VolumeIndex {
+    // The closing volume of a set that binds it after every numbered one: a
+    // zip's `name.zip`. A zip posted as that file alone binds only it, and
+    // it is the set's head as well.
+    pub const LAST: Self = Self(u32::MAX);
+}
+
 impl fmt::Display for VolumeIndex {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "volume {}", self.0)
