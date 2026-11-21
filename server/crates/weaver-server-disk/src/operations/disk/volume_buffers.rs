@@ -521,10 +521,14 @@ impl Sizing {
             .iter()
             .map(|written| written.rate.rate)
             .collect();
+        // What each holds against its limit: what it counts besides the
+        // bytes the queuing threads carry, as grants and room are judged
+        // (`Volume::uncarried_bytes`). Carried bytes, bounded by the hold
+        // limit, never stop a volume, so no limit is kept up for them.
         let held: Vec<u64> = self
             .volumes
             .iter()
-            .map(|written| written.volume.unwritten_bytes())
+            .map(|written| written.volume.uncarried_bytes())
             .collect();
         let (limits, holding) =
             volume_limits_holding(figure_bytes, memory_ceiling_bytes, &rates, &held);
@@ -583,11 +587,11 @@ mod tests {
         buffers
     }
 
-    // Whether writes to `volume` stop as it stands: what it counts has
-    // reached its hard limit less the share its writer keeps. One that
-    // counts nothing never stops.
+    // Whether writes to `volume` stop as it stands: what it counts besides
+    // carried bytes has reached its hard limit less the share its writer
+    // keeps. One that counts nothing besides them never stops.
     fn stopped(volume: &Volume) -> bool {
-        let counted = volume.unwritten_bytes();
+        let counted = volume.uncarried_bytes();
         let (_, hard) = volume.buffer_limits();
         counted != 0 && hard != u64::MAX && counted >= hard.saturating_sub(volume.write_piece())
     }
@@ -1095,6 +1099,29 @@ mod tests {
         assert!(!buffers.lock().holding);
         tick += 1;
         assert!(!buffers.follow_rates_at(start + TICK * tick));
+    }
+
+    // A volume whose count is all carried bytes holds nothing against its
+    // limit: when its share falls under them, its limit comes down to its
+    // share at once, the others keep theirs, and nothing is held.
+    #[test]
+    fn volume_buffers_keep_no_limit_up_for_carried_bytes() {
+        let (buffers, volumes, start) = three_joined();
+        let [nvme, sata, hdd] = &volumes;
+        let share = hard(sata);
+        sata.count_for_test(share - MIB);
+        sata.carry(share - MIB);
+        nvme.write_rate.store(HDD / 10, Ordering::Relaxed);
+        let mut tick = 1;
+        while !buffers.follow_rates_at(start + TICK * tick) {
+            tick += 1;
+        }
+        let target = volume_limits(FIGURE, ROOMY, &[HDD / 10, SATA, HDD]);
+        assert!(target[1].hard_bytes < share - MIB);
+        assert_eq!(hards(&[nvme, sata, hdd]), hard_bytes(&target));
+        assert!(!buffers.lock().holding);
+        assert!(!stopped(sata), "carried bytes do not stop it");
+        sata.uncarry(share - MIB);
     }
 
     // Across a long sequence of swinging and lasting rates, joins, leaves

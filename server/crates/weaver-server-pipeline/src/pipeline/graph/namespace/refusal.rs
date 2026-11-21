@@ -27,6 +27,7 @@ use weaver_graph::{
     Builder, ByteRange, Coverage, Digest, Effect, Evidence, Evidenced, MemberId, NodeId, Placement,
     Provenance, Segment, Tree, VolumeIndex,
 };
+use weaver_server_disk::operations::disk::volume::LoopSite;
 
 use super::{Arrival, BatchEnd, NamespaceWriter, READ_BACK, Segments, Write, WriteError};
 use crate::pipeline::graph::leaf::Leaf;
@@ -106,7 +107,7 @@ impl NamespaceWriter {
                 builder,
                 segments,
                 effect,
-                Write::Again,
+                Write::Again(LoopSite::GiveUp),
                 &mut batch.out,
             )?;
             self.apply_unnamed(tree, builder, segments, &mut batch.out)?;
@@ -346,7 +347,14 @@ impl NamespaceWriter {
                 {
                     record.coverage.erase(piece);
                 }
-                self.arrive(tree, builder, segments, Write::new(&arrival), arrival, out)?;
+                self.arrive(
+                    tree,
+                    builder,
+                    segments,
+                    Write::new(&arrival, LoopSite::Materialise),
+                    arrival,
+                    out,
+                )?;
             }
         }
         Ok(())
@@ -511,7 +519,7 @@ impl NamespaceWriter {
             .and_then(|namespace| namespace.get(member))
             .is_some_and(|record| record.closed && record.is_leaf());
         if closed_leaf {
-            self.close_leaf(tree, node, member)?;
+            self.close_leaf(tree, node, member, LoopSite::GiveUp)?;
         }
         Ok(())
     }
@@ -537,11 +545,12 @@ impl NamespaceWriter {
         else {
             return vec![(range, None)];
         };
-        let access = self.access(tree);
+        let access = self.access(tree, LoopSite::Materialise);
         let mut read = |placement: &Placement, into: &mut Vec<u8>| match placement {
             Placement::Member { member, range } => access.read_at(retired, *member, *range, into),
             Placement::Envelope { envelope, range } => {
-                self.envelopes.read(retired, *envelope, *range, into)
+                self.envelopes
+                    .read(LoopSite::Materialise, retired, *envelope, *range, into)
             }
             Placement::Held { .. } => false,
         };

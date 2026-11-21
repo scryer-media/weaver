@@ -200,8 +200,17 @@ pub struct GraphJob {
     // said it committed, and the run mail will say when it has.
     mail_owed: Option<u64>,
     // A thread is counting on the job's volumes what a release of held bytes
-    // stands for (`pay_release`), and will mail it (`Heard::ReleasePaid`).
-    releasing: bool,
+    // stands for (`pay_release`), and will mail it (`Heard::ReleasePaid`)
+    // under this number; mail under any other is not heard.
+    releasing: Option<u64>,
+    // A thread waits for the writes a read owed waits for
+    // (`NamespaceWriter::read_wait`), and will mail it
+    // (`Heard::ReadSettled`) under this number; mail under any other is not
+    // heard.
+    reading: Option<u64>,
+    // Whole volumes whose member's close waits behind a release: each says
+    // it landed once the close is made (`land_owed`).
+    landed_owed: Vec<VolumeIndex>,
     // A repair the stop ended while a volume's writer still held operations
     // of the job, kept until the stop has given that writer its time.
     stopped_repair: Option<Box<crate::pipeline::graph::namespace::Returned>>,
@@ -335,7 +344,9 @@ impl GraphJob {
             repair_ended_at: None,
             pending: Pending::default(),
             mail_owed: None,
-            releasing: false,
+            releasing: None,
+            reading: None,
+            landed_owed: Vec::new(),
             stopped_repair: None,
             #[cfg(any(test, feature = "pipeline-test-fixtures"))]
             stopped_repairs_taken_back: 0,
@@ -514,6 +525,16 @@ impl GraphJob {
         self.held_by_work() || self.loans.applying()
     }
 
+    // Whether no checkpoint may be taken now: an object is out for its
+    // work (`working`), or held bytes a release owes are not down, with the
+    // closes behind them, or a read is owed (`owed_stands`). A checkpoint then would record
+    // a member with every article in hand and its close not made, which a
+    // restore closes again without saying it landed. The checkpoint is owed
+    // (`owe_checkpoint`) and taken by the step that pays the release.
+    pub fn checkpoint_held(&self) -> bool {
+        self.working() || self.owed_stands()
+    }
+
     // Whether an object of the job is out for its work or a give-up has
     // volumes left: what the loop takes back before the next article. A
     // return being applied speaks through the mail as a repair does.
@@ -525,6 +546,15 @@ impl GraphJob {
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub fn give_up_in_one_turn(&mut self) {
         self.one_turn = true;
+    }
+
+    // A count for a release stands out, as `pay_release` sends one, under
+    // the number this returns; its mail is the test's to send.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn stand_release(&mut self) -> u64 {
+        let serial = self.loans.next_serial();
+        self.releasing = Some(serial);
+        serial
     }
 
     // Every work loan from here on stays in the test's hand.
@@ -577,8 +607,8 @@ impl GraphJob {
         }
     }
 
-    // A checkpoint found an object out for its work and took nothing: the
-    // work stays on the loop until one is recorded.
+    // A checkpoint found the job held (`checkpoint_held`) and took nothing:
+    // no work goes out until one is recorded.
     pub fn owe_checkpoint(&mut self) {
         self.works.owe_checkpoint();
     }
@@ -589,9 +619,14 @@ impl GraphJob {
     }
 
     // Whether something of the job is out on a thread and will speak
-    // through the run mail: a run, or a repair.
+    // through the run mail: a run, a repair, or the count of a release.
     pub fn awaits_mail(&self) -> bool {
-        self.runs.in_flight() || self.loans.out() || self.works.out() || self.mail_owed.is_some()
+        self.runs.in_flight()
+            || self.loans.out()
+            || self.works.out()
+            || self.mail_owed.is_some()
+            || self.releasing.is_some()
+            || self.reading.is_some()
     }
 
     // Whether a stopped job must be kept: mail of it is still to come, or a
@@ -786,9 +821,41 @@ impl GraphJob {
             || self.writer.rechecks_waiting()
             || self.verifications_due()
             || self.tree.work_due()
-            || self.releasing
+            || self.owed_stands()
+    }
+
+    // Whether the job owes the writer's answer to something it did: held
+    // bytes a release owes are not down yet (one stands for room, or a
+    // thread counts it), a read waits for writes still out (a thread waits
+    // for them), or a close waits behind either.
+    pub(crate) fn owed_stands(&self) -> bool {
+        self.releasing.is_some()
             || self.writer.release_owed().is_some()
+            || self.reading.is_some()
+            || self.writer.reads_owed()
             || self.writer.closes_owed()
+    }
+
+    // A read owed waits for writes still out (`NamespaceWriter::read_wait`):
+    // a thread waits for them, off the loop, and the reads are made as its
+    // mail is heard (`Heard::ReadSettled`). One at a time. Once the owner is
+    // stopping, or a wait of the loop was given up at a stop's end, none is
+    // sent: a wait aside would end at once with the writes still out, and
+    // its mail would send the next, round and round. The reads stay owed,
+    // as a release does then (`NamespaceWriter::release_paid`).
+    pub(crate) fn wait_reads(&mut self) {
+        if self.reading.is_some()
+            || self
+                .writer
+                .disk()
+                .is_some_and(|disk| disk.left_at_stop() || disk.stopping())
+        {
+            return;
+        }
+        let Some(waits) = self.writer.read_wait() else {
+            return;
+        };
+        self.reading = Some(self.loans.wait_read(waits));
     }
 
     // A release of held bytes stands for room on the job's volumes
@@ -797,15 +864,16 @@ impl GraphJob {
     // One at a time; while a return's tail is on, the tail is what goes on,
     // and what is owed is paid once it ends.
     pub(crate) fn pay_release(&mut self) {
-        if self.releasing || self.writer.tail_into().is_some() {
+        // A read owed is waited for wherever a release is paid.
+        self.wait_reads();
+        if self.releasing.is_some() || self.writer.tail_into().is_some() {
             return;
         }
         let (Some((bytes, _)), Some(disk)) = (self.writer.release_owed(), self.writer.disk())
         else {
             return;
         };
-        self.loans.pay_release(bytes, disk.clone());
-        self.releasing = true;
+        self.releasing = Some(self.loans.pay_release(bytes, disk.clone()));
     }
 
     // A checksum obligation something can still meet: one an ended
@@ -823,9 +891,41 @@ impl GraphJob {
         &self.tree
     }
 
+    // Lend the object at `node` out of the tree, as a run takes it: the
+    // caller holds it, and the node answers from the loan's record.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn lend_object_for_test(
+        &mut self,
+        node: NodeId,
+    ) -> Option<Box<dyn weaver_graph::object::Object>> {
+        self.tree.lend_for_test(node)
+    }
+
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub fn namespace_mut(&mut self, node: NodeId) -> Option<&mut Namespace> {
         self.tree.namespace_mut(node)
+    }
+
+    // Whether a thread waits aside for the writes an owed read meets.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn reads_aside(&self) -> bool {
+        self.reading.is_some()
+    }
+
+    // `bytes` written again over a root member at `offset`, as an article
+    // fetched twice is.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn write_again_for_test(&mut self, member: MemberId, offset: u64, bytes: Vec<u8>) {
+        let bytes = weaver_graph::Evidenced::new(bytes.into());
+        self.writer
+            .write_file(
+                &mut self.tree,
+                (NodeId::ROOT, member),
+                offset,
+                &bytes,
+                weaver_server_disk::operations::disk::volume::LoopSite::LeafWrite,
+            )
+            .unwrap();
     }
 
     pub fn writer(&self) -> &NamespaceWriter {
@@ -1563,7 +1663,7 @@ impl GraphJob {
                 self.tree.reached(NodeId::ROOT, member, end);
             }
             let mut out = Vec::new();
-            self.writer.close(
+            let shut = self.writer.close(
                 &mut self.tree,
                 &mut *self.builder,
                 &self.root,
@@ -1573,10 +1673,33 @@ impl GraphJob {
             )?;
             self.heard(out)?;
             if self.root.map.volume_whole(volume) {
-                self.notes.push(Note::Landed(volume));
+                if shut {
+                    self.notes.push(Note::Landed(volume));
+                } else if !self.landed_owed.contains(&volume) {
+                    // The close waits behind a release: the volume lands
+                    // once it is made (`land_owed`).
+                    self.landed_owed.push(volume);
+                }
             }
         }
         Ok(())
+    }
+
+    // The volumes whose close a release held back say they landed once
+    // their member is closed, each once.
+    fn land_owed(&mut self) {
+        if self.landed_owed.is_empty() {
+            return;
+        }
+        let mut owed = std::mem::take(&mut self.landed_owed);
+        owed.retain(|volume| {
+            let closed = self.closed(MemberId(volume.0));
+            if closed {
+                self.notes.push(Note::Landed(*volume));
+            }
+            !closed
+        });
+        self.landed_owed = owed;
     }
 
     fn closed(&self, member: MemberId) -> bool {
@@ -1758,6 +1881,7 @@ impl GraphJob {
             if !offered {
                 self.fetch_unkept();
                 self.pay_release();
+                self.land_owed();
                 return Ok(());
             }
             self.writer.apply_all(

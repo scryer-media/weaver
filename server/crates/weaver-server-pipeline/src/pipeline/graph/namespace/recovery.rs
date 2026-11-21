@@ -14,6 +14,7 @@
 use std::cmp::Reverse;
 use std::collections::binary_heap::{BinaryHeap, PeekMut};
 use std::collections::{BTreeSet, HashSet};
+use weaver_server_disk::operations::disk::volume::LoopSite;
 
 use bytes::Bytes;
 use weaver_graph::recovery::{Recovery, RepairOutcome, SetRuling, ShortSets, Unbound};
@@ -1038,7 +1039,7 @@ impl NamespaceWriter {
             bytes: bytes.into(),
             provenance: Provenance::Repaired,
         };
-        let write = Write::new(&arrival);
+        let write = Write::new(&arrival, LoopSite::Repair);
         if self.place_as(
             tree,
             builder,
@@ -1129,7 +1130,8 @@ impl NamespaceWriter {
             member: MemberId(0),
             provenance: Provenance::Refuted,
             parts: Default::default(),
-            paid: false,
+            paid: 0,
+            stood: 0,
             said: Vec::new(),
         });
         self.tail_on(tree, builder, segments, out)
@@ -1154,7 +1156,7 @@ impl NamespaceWriter {
             self.drop_tail();
             return Err(WriteError::LeftAtStop);
         }
-        tail.paid = true;
+        tail.paid = tail.stood;
         self.placing_return(true);
         self.tail_on(tree, builder, segments, out)
     }
@@ -1186,6 +1188,7 @@ impl NamespaceWriter {
             Ok(Some(bytes)) => {
                 // Bytes that arrive while it stands are fed as any others.
                 self.placing_return(false);
+                tail.stood = bytes;
                 tail.said.append(out);
                 self.tail = Some(tail);
                 Ok(Tailed::Standing(bytes))
@@ -1507,7 +1510,14 @@ impl NamespaceWriter {
             files.unrefuse(*volume);
         }
         self.prune(tree)?;
-        self.apply_each(tree, builder, segments, effects, Write::Again, out)
+        self.apply_each(
+            tree,
+            builder,
+            segments,
+            effects,
+            Write::Again(LoopSite::Reopen),
+            out,
+        )
     }
 
     // Deliver a range of a member again, read back from wherever it went,
@@ -1556,7 +1566,7 @@ impl NamespaceWriter {
                 piece.start,
                 piece.end.min(piece.start.saturating_add(READ_BACK)),
             );
-            let credit = if std::mem::take(&mut tail.paid) {
+            let credit = if std::mem::take(&mut tail.paid) > 0 {
                 None
             } else {
                 match self.disk.as_ref() {
@@ -1592,7 +1602,10 @@ impl NamespaceWriter {
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
         let mut bytes = Vec::new();
-        if !self.access(tree).read_at(node, member, chunk, &mut bytes) {
+        if !self
+            .access(tree, LoopSite::Tail)
+            .read_at(node, member, chunk, &mut bytes)
+        {
             if !arrived {
                 return Ok(());
             }
@@ -1612,8 +1625,14 @@ impl NamespaceWriter {
                 provenance,
             };
             let rereading = writer.rereading(true);
-            let delivered =
-                writer.arrive(tree, builder, segments, Write::new(&arrival), arrival, out);
+            let delivered = writer.arrive(
+                tree,
+                builder,
+                segments,
+                Write::new(&arrival, LoopSite::Tail),
+                arrival,
+                out,
+            );
             writer.rereading(rereading);
             delivered
         })
@@ -1924,12 +1943,19 @@ impl NamespaceWriter {
                     .get_mut(&node)
                     .and_then(|files| files.leaves.get_mut(member))
                 {
-                    leaf.close(length)?;
+                    leaf.close(LoopSite::BindSets, length)?;
                 }
             }
         }
         self.renamed = renamed;
-        self.apply_each(tree, builder, segments, claims, Write::Again, out)
+        self.apply_each(
+            tree,
+            builder,
+            segments,
+            claims,
+            Write::Again(LoopSite::BindSets),
+            out,
+        )
     }
 
     // An object found its own recovery data at a range of its volume. The
@@ -1965,7 +1991,7 @@ impl NamespaceWriter {
                     .collect()
             })
             .unwrap_or_default();
-        let access = self.access(tree);
+        let access = self.access(tree, LoopSite::RecoveryAt);
         let mut passed = Vec::new();
         for (piece, provenance) in runs {
             let mut bytes = Vec::new();
@@ -1982,7 +2008,14 @@ impl NamespaceWriter {
             &mut self.placing(builder),
             &mut effects,
         );
-        self.apply_each(tree, builder, segments, effects, Write::Again, out)?;
+        self.apply_each(
+            tree,
+            builder,
+            segments,
+            effects,
+            Write::Again(LoopSite::RecoveryAt),
+            out,
+        )?;
         if let Some(window) = window {
             // The window is the one set of its namespace not yet bound: the
             // others bound when its members last changed, and a window

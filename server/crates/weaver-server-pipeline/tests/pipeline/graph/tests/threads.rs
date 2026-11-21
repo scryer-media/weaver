@@ -18,6 +18,7 @@ use weaver_server_disk::operations::disk::volume::Volume;
 use weaver_server_disk::operations::disk::writer::Hold;
 
 mod landing;
+mod read_on;
 
 // The volume the job writes to and a hold on its thread.
 fn held(pipeline: &Pipeline, job_id: JobId) -> (Arc<Volume>, Hold) {
@@ -2738,78 +2739,245 @@ async fn a_repairs_tail_releasing_held_bytes_onto_a_full_output_volume_never_sto
 // never stands still for the volume: the release stands for room on a
 // thread of its own (`Heard::ReleasePaid`) and goes on as that thread
 // counts, and every byte lands.
-#[tokio::test]
-async fn a_delivery_releasing_held_bytes_onto_a_full_output_volume_never_stops_the_loop() {
-    let _threads = threads::real();
-    let temp_dir = tempfile::tempdir().unwrap();
-    let job_id = JobId(92_499);
+// The job of the test below, as the header's articles arrived onto its full
+// output volume: the release after them stands for room, and a thread
+// stands counting what it owes. Until `free` the volume stays full.
+struct StoodRelease {
+    job_id: JobId,
+    pipeline: Pipeline,
+    staging_dir: PathBuf,
+    inside: Vec<u8>,
+    output: Arc<Volume>,
+    disk: crate::pipeline::graph::disk::JobDisk,
+    full: Option<weaver_server_disk::operations::disk::writer::Credit>,
+    hard: u64,
+    // What the downloads waited, before the release.
+    downloaded: u64,
+    events: tokio::sync::broadcast::Receiver<weaver_server_base::events::model::PipelineEvent>,
+    // The posted file's FileComplete events the header's articles raised.
+    landed_as_it_stood: usize,
+    // The test's hold on the output volume's thread, open.
+    hold: Hold,
+    _threads: threads::Threads,
+}
+
+// `aside` bytes are counted on the output volume besides another
+// producer's whole limit, and handed back.
+async fn stood_release(
+    temp_dir: &tempfile::TempDir,
+    job_id: JobId,
+    aside: u64,
+) -> (
+    StoodRelease,
+    Option<weaver_server_disk::operations::disk::writer::Credit>,
+) {
+    use weaver_server_disk::operations::disk::writer::{Credit, Stand};
+    let real = threads::real();
     let inside = payload(8 * ARTICLE, 4);
     let archive = stored_7z(&inside);
     let footer = 32 + inside.len();
     let articles = archive.len().div_ceil(ARTICLE) as u32;
     let header_from = (footer / ARTICLE) as u32;
     let posts = vec![Post::plain("lantern.7z", archive.clone())];
-    let (mut pipeline, staging_dir) = delivered_apart(&temp_dir, job_id, &posts, Some(1)).await;
+    let (mut pipeline, staging_dir) = delivered_apart(temp_dir, job_id, &posts, Some(1)).await;
+    let mut events = pipeline.event_tx.subscribe();
     for ordinal in 0..header_from {
         decode(&mut pipeline, job_id, &posts, 0, ordinal, true).await;
     }
-    let held = |pipeline: &Pipeline| {
-        pipeline.graph_jobs[&job_id]
-            .writer()
-            .held_bytes(weaver_graph::NodeId::ROOT)
-    };
-    assert!(held(&pipeline) > 0, "the body is held behind the header");
+    assert!(
+        held_of(&pipeline, job_id) > 0,
+        "the body is held behind the header"
+    );
     let disk = pipeline.graph_jobs[&job_id].disk().unwrap().clone();
     let (_, output) = working_and_output(&pipeline, job_id, &staging_dir);
     // Every write so far is down. Another producer counts the volume's
-    // whole limit and the writer is said to hold bytes, until a thread
-    // stands for room; then both go.
+    // whole limit and the writer is said to hold bytes, until the test
+    // frees them.
     disk.barrier().wait_aside();
+    while events.try_recv().is_ok() {}
     let downloaded = budget_waits(&output);
     let submitter = Arc::clone(disk.under(&staging_dir));
-    let (_, hard) = output.buffer_limits();
+    let (soft, hard) = output.buffer_limits();
     assert!(hard < u64::MAX, "the volume is sized");
-    let full = weaver_server_disk::operations::disk::writer::Credit::reserve(
-        std::iter::once(&submitter),
-        hard,
-        weaver_server_disk::operations::disk::writer::Stand::UntilStop,
-    );
-    assert!(full.covers(hard));
-    output.buffered_bytes.fetch_add(hard, Ordering::SeqCst);
-    let (hold, filled) = (pipeline.volume_writers.hold(&output), Arc::clone(&output));
-    hold.open();
-    let watcher = std::thread::spawn(move || {
-        hold.wait_below_waiters(1);
-        filled.buffered_bytes.fetch_sub(hard, Ordering::SeqCst);
-        drop(full);
+    // Both credits are counted with the limit lifted, so the volume ends
+    // over its limit by `aside`: giving the aside back alone leaves it
+    // still full.
+    output.set_buffer_limits(u64::MAX, u64::MAX);
+    let set_aside = (aside > 0).then(|| {
+        let credit = Credit::reserve(std::iter::once(&submitter), aside, Stand::UntilStop);
+        assert!(credit.covers(aside));
+        credit
     });
+    let full = Credit::reserve(std::iter::once(&submitter), hard, Stand::UntilStop);
+    assert!(full.covers(hard));
+    output.set_buffer_limits(soft, hard);
+    output.buffered_bytes.fetch_add(hard, Ordering::SeqCst);
+    let hold = pipeline.volume_writers.hold(&output);
+    hold.open();
     for ordinal in header_from..articles {
         decode(&mut pipeline, job_id, &posts, 0, ordinal, true).await;
     }
-    assert!(held(&pipeline) > 0, "the release stood for room");
-    assert!(
-        pipeline.graph_jobs[&job_id].work_pending(),
-        "what the release owes keeps the job from ending"
-    );
-    let mut paid = 0u32;
-    while held(&pipeline) > 0 {
-        let said = pipeline.graph_runs.recv().await.unwrap();
-        if matches!(&said.heard, Heard::ReleasePaid(_)) {
-            paid += 1;
+    let landed_as_it_stood = landed_in(&mut events);
+    (
+        StoodRelease {
+            job_id,
+            pipeline,
+            staging_dir,
+            inside,
+            output,
+            disk,
+            full: Some(full),
+            hard,
+            downloaded,
+            events,
+            landed_as_it_stood,
+            hold,
+            _threads: real,
+        },
+        set_aside,
+    )
+}
+
+fn held_of(pipeline: &Pipeline, job_id: JobId) -> u64 {
+    pipeline.graph_jobs[&job_id]
+        .writer()
+        .held_bytes(weaver_graph::NodeId::ROOT)
+}
+
+// The FileComplete events of the posted file heard since the last look.
+fn landed_in(
+    events: &mut tokio::sync::broadcast::Receiver<weaver_server_base::events::model::PipelineEvent>,
+) -> usize {
+    let mut landed = 0;
+    while let Ok(event) = events.try_recv() {
+        if let weaver_server_base::events::model::PipelineEvent::FileComplete { filename, .. } =
+            event
+        {
+            assert_eq!(filename, "lantern.7z");
+            landed += 1;
         }
-        pipeline.graph_run_said(said);
     }
-    assert_eq!(
-        budget_waits(&output) - downloaded,
-        0,
-        "the loop stood still for the output volume"
-    );
+    landed
+}
+
+impl StoodRelease {
+    fn held(&self) -> u64 {
+        held_of(&self.pipeline, self.job_id)
+    }
+
+    // The release stands: its bytes are held, owed, and a thread stands
+    // counting them. Only then does the volume get its room back.
+    fn free(&mut self) {
+        let job = &self.pipeline.graph_jobs[&self.job_id];
+        assert!(self.held() > 0, "the release stood for room");
+        assert!(job.writer().release_owed().is_some(), "the release is owed");
+        assert!(
+            job.work_pending(),
+            "what the release owes keeps the job from ending"
+        );
+        self.hold.wait_below_waiters(1);
+        self.output
+            .buffered_bytes
+            .fetch_sub(self.hard, Ordering::SeqCst);
+        self.full = None;
+    }
+
+    // The mail is heard until nothing is held: how many paid releases it
+    // carried.
+    async fn hear_until_released(&mut self) -> u32 {
+        let mut paid = 0u32;
+        while self.held() > 0 {
+            let said = self.pipeline.graph_runs.recv().await.unwrap();
+            if matches!(&said.heard, Heard::ReleasePaid(_)) {
+                paid += 1;
+            }
+            self.pipeline.graph_run_said(said);
+        }
+        paid
+    }
+
+    async fn ends_whole(self) {
+        assert_eq!(
+            budget_waits(&self.output) - self.downloaded,
+            0,
+            "the loop stood still for the output volume"
+        );
+        assert_eq!(
+            self.pipeline.graph_jobs[&self.job_id]
+                .writer()
+                .release_owed(),
+            None
+        );
+        self.disk.barrier().wait_aside();
+        assert_eq!(read(&self.staging_dir.join("inside.bin")), self.inside);
+        retire_pipeline_database(self.pipeline).await;
+    }
+}
+
+#[tokio::test]
+async fn a_delivery_releasing_held_bytes_onto_a_full_output_volume_never_stops_the_loop() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut run, _) = stood_release(&temp_dir, JobId(92_499), 0).await;
+    run.free();
+    let paid = run.hear_until_released().await;
     assert!(paid > 0, "the release never stood for room");
-    assert_eq!(pipeline.graph_jobs[&job_id].writer().release_owed(), None);
-    watcher.join().unwrap();
-    disk.barrier().wait_aside();
-    assert_eq!(read(&staging_dir.join("inside.bin")), inside);
-    retire_pipeline_database(pipeline).await;
+    run.ends_whole().await;
+}
+
+// A paid release's mail under a number other than the count the job has
+// out is not heard: nothing it carried is applied, the bytes stay held and
+// owed, and the credit it carried goes back to the volume as it drops. The
+// count the job has out still pays the release.
+#[tokio::test]
+async fn a_release_paid_under_another_number_is_dropped_and_its_credit_goes_back() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_950);
+    let (mut run, stale) = stood_release(&temp_dir, job_id, 1).await;
+    let owed = run.pipeline.graph_jobs[&job_id].writer().release_owed();
+    let (bytes, _) = owed.expect("the release is owed");
+    assert!(bytes > 1, "the stale credit cannot pay what is owed");
+    let (held, counted) = (run.held(), run.output.unwritten_bytes());
+    run.pipeline
+        .graph_run_said(crate::pipeline::graph::engine::Said {
+            scope: job_id.0,
+            node: weaver_graph::NodeId::ROOT,
+            generation: u64::MAX,
+            heard: Heard::ReleasePaid(Box::new(stale.expect("set aside"))),
+        });
+    assert_eq!(run.held(), held, "nothing of the stale mail was applied");
+    assert_eq!(
+        run.pipeline.graph_jobs[&job_id].writer().release_owed(),
+        owed
+    );
+    assert_eq!(
+        run.output.unwritten_bytes(),
+        counted - 1,
+        "the stale credit went back to the volume"
+    );
+    run.free();
+    assert!(run.hear_until_released().await > 0);
+    run.ends_whole().await;
+}
+
+// The posted file's last article lands while the release of its held bytes
+// stands: its close is owed, and it is said to have landed once, as the
+// close is made after the release is paid, never before.
+#[tokio::test]
+async fn a_member_whose_close_was_owed_lands_once_after_the_release() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_951);
+    let (mut run, _) = stood_release(&temp_dir, job_id, 0).await;
+    assert!(run.pipeline.graph_jobs[&job_id].writer().closes_owed());
+    assert_eq!(run.landed_as_it_stood, 0, "landed while the close was owed");
+    run.free();
+    run.hear_until_released().await;
+    assert!(!run.pipeline.graph_jobs[&job_id].writer().closes_owed());
+    assert_eq!(
+        landed_in(&mut run.events),
+        1,
+        "landed once, after the release"
+    );
+    run.ends_whole().await;
 }
 
 // An article of a file outside the set arrives between two slices of a
@@ -3011,4 +3179,164 @@ async fn a_repair_whose_slice_cannot_be_read_back_fails_the_job() {
     settle_failed_releases(&mut pipeline).await;
     assert!(!pipeline.jobs.contains_key(&job_id));
     retire_pipeline_database(pipeline).await;
+}
+
+// The job's checkpoint as a fresh write would put it whole, and the
+// snapshot a restore reads of it.
+fn whole_checkpoint(
+    pipeline: &Pipeline,
+    job_id: JobId,
+) -> (
+    crate::jobs::graph_checkpoint::GraphCheckpoint,
+    crate::pipeline::graph::checkpoint::Snapshot,
+) {
+    use crate::pipeline::graph::checkpoint::{Pending, snapshot};
+    fn of<R: Clone, K>(changes: &std::collections::BTreeMap<K, Option<R>>) -> Vec<R> {
+        changes.values().flatten().cloned().collect()
+    }
+    // The job's writes are down, so the checkpoint goes as a write at once.
+    if let Some(disk) = pipeline.graph_jobs[&job_id].disk() {
+        disk.barrier().wait_aside();
+    }
+    let pending = Pending::default();
+    assert!(pending.put(&pipeline.graph_jobs[&job_id], Vec::new()));
+    let delta = pending.take().0.unwrap();
+    assert!(delta.whole);
+    let rows = crate::jobs::graph_checkpoint::GraphCheckpoint {
+        feed_verdict: delta.feed_verdict.clone(),
+        nodes: of(&delta.nodes),
+        members: of(&delta.members),
+        coverage: of(&delta.coverage),
+        envelopes: of(&delta.envelopes),
+        crypt: of(&delta.crypt),
+        parts: of(&delta.parts),
+        holds: of(&delta.holds),
+        held_parts: of(&delta.held_parts),
+    };
+    let read = snapshot(&rows).unwrap();
+    (rows, read)
+}
+
+// Whether the checkpoint records the posted file closed, and how many
+// times a job restored from it says the file landed.
+fn closed_and_landed_on_restore(pipeline: &Pipeline, job_id: JobId) -> (bool, usize) {
+    use crate::pipeline::graph::engine::RunMail;
+    use crate::pipeline::graph::job::{GraphJob, Note, RootFile, Storage};
+    use crate::pipeline::graph::limits::Caps;
+    use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
+    use weaver_server_disk::operations::disk::CapacityReader;
+    let (rows, read) = whole_checkpoint(pipeline, job_id);
+    let closed = rows
+        .members
+        .iter()
+        .find(|row| row.node == 0 && row.member == 0)
+        .expect("the posted file's row")
+        .closed;
+    let files: Vec<RootFile> = pipeline.jobs[&job_id]
+        .spec
+        .files
+        .iter()
+        .map(|file| RootFile {
+            name: file.filename.clone(),
+            articles: file
+                .segments
+                .iter()
+                .map(|segment| (segment.ordinal, segment.bytes))
+                .collect(),
+        })
+        .collect();
+    let mail = RunMail::default();
+    let mut restored = GraphJob::restore(
+        &read,
+        &files,
+        job_id.0,
+        Storage {
+            working_dir: pipeline.jobs[&job_id].working_dir.clone(),
+            output: None,
+            accountant: Arc::new(HoldsAccountant::new(HoldBudgets {
+                resident_limit: u64::MAX,
+                scratch_total: u64::MAX,
+                scratch_ceiling: u64::MAX,
+                disk_reserve: 0,
+            })),
+            decode: crate::pipeline::graph::engine::DecodePool::unbounded(),
+            free_disk: CapacityReader::unknown(),
+            slots: 1,
+            mail: mail.sender(),
+            passwords: Vec::new(),
+            caps: Caps::unbounded(),
+            nesting: u32::MAX,
+            hardware: Default::default(),
+            metrics: None,
+            data_dir: None,
+            window_ledger: Default::default(),
+            disk: None,
+        },
+        0,
+    )
+    .unwrap();
+    let landed = restored
+        .job
+        .take_notes()
+        .into_iter()
+        .filter(|note| matches!(note, Note::Landed(_)))
+        .count();
+    drop(restored);
+    drop(mail);
+    (closed, landed)
+}
+
+// A checkpoint asked for while a release of held bytes stands, with the
+// posted file's close behind it, takes nothing and is owed. Once the
+// release is paid and the close made, one is taken, and a job restored from
+// it has the file closed and says nothing more of it, as one restored from
+// a run with no pressure does.
+#[tokio::test]
+async fn no_checkpoint_is_taken_while_a_release_stands_and_one_is_after() {
+    use crate::pipeline::tests::window_fixture::checkpoint_job;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_952);
+    let (mut run, _) = stood_release(&temp_dir, job_id, 0).await;
+    assert!(run.pipeline.graph_jobs[&job_id].writer().closes_owed());
+    let stamp = run.pipeline.graph_jobs[&job_id].pending().stamp();
+    checkpoint_job(&mut run.pipeline, job_id);
+    let graph = &run.pipeline.graph_jobs[&job_id];
+    assert_eq!(
+        graph.pending().stamp(),
+        stamp,
+        "taken while the release stood"
+    );
+    assert!(graph.owes_checkpoint());
+    run.free();
+    run.hear_until_released().await;
+    assert!(!run.pipeline.graph_jobs[&job_id].writer().closes_owed());
+    checkpoint_job(&mut run.pipeline, job_id);
+    let graph = &run.pipeline.graph_jobs[&job_id];
+    assert_eq!(graph.pending().stamp(), stamp + 1, "one owed checkpoint");
+    assert!(!graph.owes_checkpoint());
+    let pressed = closed_and_landed_on_restore(&run.pipeline, job_id);
+    assert_eq!(landed_in(&mut run.events), 1);
+
+    let free_dir = tempfile::tempdir().unwrap();
+    let free_id = JobId(92_953);
+    let _threads = threads::real();
+    let inside = payload(8 * ARTICLE, 4);
+    let posts = vec![Post::plain("lantern.7z", stored_7z(&inside))];
+    let (mut pipeline, _) = delivered_apart(&free_dir, free_id, &posts, Some(1)).await;
+    for ordinal in 0..posts[0].articles(ARTICLE).count() as u32 {
+        decode(&mut pipeline, free_id, &posts, 0, ordinal, true).await;
+    }
+    // With room on the volume the release is paid on the mail's first turn.
+    while held_of(&pipeline, free_id) > 0 {
+        let said = pipeline.graph_runs.recv().await.unwrap();
+        pipeline.graph_run_said(said);
+    }
+    assert!(!pipeline.graph_jobs[&free_id].writer().closes_owed());
+    checkpoint_job(&mut pipeline, free_id);
+    assert!(!pipeline.graph_jobs[&free_id].owes_checkpoint());
+    let free = closed_and_landed_on_restore(&pipeline, free_id);
+    assert_eq!(pressed, free);
+    assert_eq!(pressed, (true, 0));
+    retire_pipeline_database(pipeline).await;
+    run.ends_whole().await;
 }

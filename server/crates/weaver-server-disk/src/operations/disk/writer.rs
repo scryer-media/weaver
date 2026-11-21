@@ -40,7 +40,7 @@ use bytes::Bytes;
 
 use crate::clock::{Clock, SystemClock};
 
-use super::volume::{LoopWait, OWNERS, Reservation, Volume, WriterCounts};
+use super::volume::{LoopSite, LoopWait, OWNERS, Reservation, Volume, WriterCounts};
 use super::volume_rate::RateSignal;
 
 mod credit;
@@ -1084,6 +1084,7 @@ impl Submitter {
     // of the write is not queued (`Submitter::gave_up`).
     pub fn write_from(
         &self,
+        site: LoopSite,
         from: &mut Reservation,
         file: u64,
         offset: u64,
@@ -1096,24 +1097,32 @@ impl Submitter {
         );
         let paid = (bytes.len() as u64).min(from.bytes());
         from.hand_over(paid);
-        self.queue_paid(file, offset, bytes, create, paid)
+        self.queue_paid(site, file, offset, bytes, create, paid)
     }
 
     // `write_from` for the queuing thread, paid out of what its owner
     // prepaid (`Owner::prepay`) instead of a reservation in hand: the one
     // thread that prepays and writes needs no reservation passed along.
-    pub fn write(&self, file: u64, offset: u64, bytes: Bytes, create: Option<Create>) -> u64 {
+    pub fn write(
+        &self,
+        site: LoopSite,
+        file: u64,
+        offset: u64,
+        bytes: Bytes,
+        create: Option<Create>,
+    ) -> u64 {
         let prepaid = &self.lane.state.volume.prepaid[self.key.owner.slot];
         let credit = prepaid.load(Ordering::Relaxed);
         let paid = (bytes.len() as u64).min(credit);
         prepaid.store(credit - paid, Ordering::Relaxed);
-        self.queue_paid(file, offset, bytes, create, paid)
+        self.queue_paid(site, file, offset, bytes, create, paid)
     }
 
     // Queue the write, `paid` of its bytes already counted on the volume.
     #[inline]
     fn queue_paid(
         &self,
+        site: LoopSite,
         file: u64,
         offset: u64,
         bytes: Bytes,
@@ -1134,13 +1143,14 @@ impl Submitter {
                 create: create.map(Box::new),
             });
         }
-        self.write_charged(file, offset, bytes, create, paid)
+        self.write_charged(site, file, offset, bytes, create, paid)
     }
 
     // A write past what was paid: `credit` of the bytes are paid.
     #[cold]
     fn write_charged(
         &self,
+        site: LoopSite,
         file: u64,
         mut offset: u64,
         mut bytes: Bytes,
@@ -1155,7 +1165,7 @@ impl Submitter {
             let charged = piece - credit.min(piece);
             credit -= credit.min(piece);
             if charged > 0 {
-                if !self.wait_room(charged) {
+                if !self.wait_room(site, charged) {
                     // The end of a stop passed with the volume still full:
                     // nothing more is queued, and the key says it gave up.
                     // What of the piece was prepaid is not queued either,
@@ -1299,7 +1309,7 @@ impl Submitter {
     // A producing thread's wait to count `bytes` it is about to hand the
     // queuing thread (`Credit::reserve`): it stands still here, on its own
     // thread, until they are counted below the volume's hard limit
-    // (`Reservation::reserve_ahead`), and the reservation goes with the
+    // (`Reservation::reserve`), and the reservation goes with the
     // bytes. Nothing is reserved once the key stopped, by a failure or by
     // being given up, or the volume has no writer thread: nothing more of
     // the key is written then. `stand` says what a stop does to the wait:
@@ -1308,17 +1318,12 @@ impl Submitter {
     // says it gave up when that end passed with the bytes still over. The
     // writer, and whoever gives counted bytes back, wake it; nothing is
     // polled. Counted with the waits made aside, never the queuing
-    // thread's. The grant is judged beside what the queuing thread carries
-    // for the key (`Key::carried`), never beside another key's.
+    // thread's. The grant is judged beside what the queuing threads carry
+    // on the volume (`Volume::grant`).
     fn reserve_ahead(&self, bytes: u64, stand: Stand) -> Reservation {
         let state = &self.lane.state;
         let held = std::cell::RefCell::new(Reservation::none(Arc::clone(&state.volume)));
-        let over = || {
-            !self.ends_reserve(stand)
-                && !held
-                    .borrow_mut()
-                    .reserve_ahead(bytes, self.key.carried.load(Ordering::SeqCst))
-        };
+        let over = || !self.ends_reserve(stand) && !held.borrow_mut().reserve(bytes, 0);
         if !over() {
             return held.into_inner();
         }
@@ -1366,9 +1371,7 @@ impl Submitter {
     // bytes now. Whatever ends a stand ends this too, with nothing counted.
     fn try_reserve_ahead(&self, bytes: u64, stand: Stand) -> Option<Reservation> {
         let mut held = Reservation::none(Arc::clone(&self.lane.state.volume));
-        (self.ends_reserve(stand)
-            || held.reserve_ahead(bytes, self.key.carried.load(Ordering::SeqCst)))
-        .then_some(held)
+        (self.ends_reserve(stand) || held.reserve(bytes, 0)).then_some(held)
     }
 
     // Whether a producing thread's wait for room under the key ends with
@@ -1405,7 +1408,7 @@ impl Submitter {
     // the key stopped, or the end of a stop passed with them still over,
     // which the key then says of itself. Whether the queuing thread may queue more:
     // false only at that end.
-    pub fn wait_room(&self, bytes: u64) -> bool {
+    pub fn wait_room(&self, site: LoopSite, bytes: u64) -> bool {
         let state = &self.lane.state;
         let over = || {
             !state.volume.fits(bytes)
@@ -1430,7 +1433,7 @@ impl Submitter {
         let (held, below) = state.wait_end.wait(&state.volume.below, held, over);
         state.volume.below_waiters.fetch_sub(1, Ordering::SeqCst);
         drop(held);
-        state.waited(LoopWait::Budget, began);
+        state.waited(LoopWait::Budget, site, began);
         if !below {
             self.key.gave_up.store(true, Ordering::SeqCst);
         }
@@ -1442,6 +1445,12 @@ impl Submitter {
     // did after it is borne out by nothing on disk.
     pub fn gave_up(&self) -> bool {
         self.key.gave_up.load(Ordering::SeqCst)
+    }
+
+    // Whether the owner is stopping (`VolumeWriters::stop_waits`): a wait
+    // aside on the volume ends at once from here, its operations still out.
+    pub fn stopping(&self) -> bool {
+        self.lane.state.stopped.load(Ordering::SeqCst)
     }
 
     // Read `len` bytes at `offset` of the file at `path`, after everything
@@ -1472,18 +1481,18 @@ impl Submitter {
         offset: u64,
         len: usize,
     ) -> io::Result<Vec<u8>> {
-        self.wait_for(seq)?;
+        self.wait_for(LoopSite::ReadOn, seq)?;
         read_at(&path, offset, len)
     }
 
     // The wait before such a read alone: the key's operations through `seq`
     // have returned once this does, and the caller reads the file itself,
     // through a handle it already holds when it has one.
-    pub fn wait_for(&self, seq: u64) -> io::Result<()> {
+    pub fn wait_for(&self, site: LoopSite, seq: u64) -> io::Result<()> {
         if !self.key.has_returned(seq) {
             let began = Instant::now();
             let returned = self.key.wait_to_end(seq, &self.lane.state.wait_end);
-            self.lane.state.waited(LoopWait::Read, began);
+            self.lane.state.waited(LoopWait::Read, site, began);
             if !returned {
                 return Err(io::Error::other(
                     "the owner is stopping and the file's writes are still out",
@@ -1637,13 +1646,13 @@ impl Barrier {
     // the owner is stopping the wait also ends at the end of the stop
     // (`VolumeWriters::end_waits_at`) with the operations still out:
     // the caller asks `unwritten`.
-    pub fn wait(&self) {
+    pub fn wait(&self, site: LoopSite) {
         if self.returned() {
             return;
         }
         let began = Instant::now();
         self.key.wait_to_end(self.seq, &self.lane.wait_end);
-        self.lane.waited(LoopWait::Settle, began);
+        self.lane.waited(LoopWait::Settle, site, began);
     }
 
     // What a caller asks after `wait` or `wait_aside`: the operations are
@@ -1789,10 +1798,10 @@ struct LaneState {
 impl LaneState {
     // The queuing thread stood still for the writer since `began`. Called
     // only from the waits the queuing thread itself makes.
-    fn waited(&self, kind: LoopWait, began: Instant) {
+    fn waited(&self, kind: LoopWait, site: LoopSite, began: Instant) {
         self.volume
             .writer
-            .loop_waited(kind, began.elapsed().as_nanos() as u64);
+            .loop_waited(kind, site, began.elapsed().as_nanos() as u64);
     }
 
     fn loop_read(&self, began: Instant) {

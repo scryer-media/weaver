@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use weaver_server_disk::operations::disk::volume::LoopSite;
 
 const REPAIRED_FRONT: &[u8] = &{
     let mut bytes = [0x71; FIRST_BYTES];
@@ -442,7 +443,7 @@ fn same_path_backing_changes_invalidate_replay_even_without_tree_edits() {
         .leaves
         .get_mut(&MemberId(0))
         .unwrap()
-        .write(11, &[0x29], None)
+        .write(LoopSite::LeafWrite, 11, &[0x29], None)
         .unwrap();
     expected[11] = 0x29;
     assert_eq!(job.tree.generation(), before);
@@ -654,7 +655,7 @@ fn a_hand_over_with_no_second_name_writes_every_byte() {
 // The file a test's leaf over `name` in `dir` is, as the file system tells.
 fn file_of(dir: &Path, name: &str) -> crate::pipeline::graph::leaf::FileId {
     Leaf::over(dir, name, true)
-        .file_id()
+        .file_id(LoopSite::LeafWrite)
         .expect("a unix file system")
 }
 
@@ -775,9 +776,9 @@ fn bytes_read_from_a_file_made_anew_after_the_hand_over_are_written() {
     std::fs::write(&from, b"abcdef").unwrap();
     let mut bytes = Vec::new();
     let member = Leaf::over(dir.path(), "archive.7z", true);
-    member.read(0, 6, &mut bytes).unwrap();
+    member.read(LoopSite::LeafWrite, 0, 6, &mut bytes).unwrap();
     let read = Some(InPlace {
-        file: member.file_id().unwrap(),
+        file: member.file_id(LoopSite::LeafWrite).unwrap(),
         offset: 0,
     });
     assert_ne!(read.map(|read| read.file), Some(shared));

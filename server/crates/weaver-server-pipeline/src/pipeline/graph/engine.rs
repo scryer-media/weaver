@@ -84,6 +84,9 @@ pub enum Heard {
     // release of held bytes goes on with, the loop having found no room for
     // it: addressed to the job's root, under no loan (`Loans::pay_release`).
     ReleasePaid(Box<Credit>),
+    // What a read owed waits for returned, waited for off the loop
+    // (`Loans::wait_read`): addressed to the job's root, under no loan.
+    ReadSettled,
     // The run returned: nothing more will be said under its generation.
     Ended,
     // A recovery set's repair, lent off the loop, came back: addressed to

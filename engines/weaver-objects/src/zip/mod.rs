@@ -555,6 +555,12 @@ impl Object for Zip {
         Kind::Zip
     }
 
+    // Stored entries take their bytes as they arrive, until a compressed or
+    // unmapped one gives the archive to an engine.
+    fn passes_on(&self) -> bool {
+        !self.gone
+    }
+
     // An entry whose stored bytes stream into its member, not enciphered.
     fn verbatim(&self, member: MemberId) -> bool {
         self.map

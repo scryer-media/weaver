@@ -9,6 +9,7 @@ use crate::pipeline::Pipeline;
 use crate::pipeline::tests::{pump_pipeline_runtime_queues, submit_decoded_segment_declaring};
 use weaver_graph::{ByteRange, MemberId, NodeId, VolumeIndex};
 use weaver_server_base::jobs::ids::{NzbFileId, SegmentId};
+use weaver_server_disk::operations::disk::volume::LoopSite;
 
 async fn turn(pipeline: &mut Pipeline) {
     pipeline.hear_graph_runs();
@@ -188,7 +189,7 @@ pub fn read_root_member(
     let graph = &pipeline.graph_jobs[&JOB];
     graph
         .writer()
-        .access(graph.tree())
+        .access(graph.tree(), LoopSite::ReadOn)
         .read_at(NodeId::ROOT, member, extent, bytes)
 }
 

@@ -1486,6 +1486,7 @@ fn sample_volumes() -> Vec<instr::VolumeSnapshot> {
             buffered_bytes: 65_536,
             arrived_bytes: 4_096,
             counted_bytes: 69_632,
+            carried_bytes: 32_768,
             peak_bytes: 900_000,
             buffer_soft_bytes: 700_000,
             buffer_limit_bytes: 1_000_000,
@@ -1497,6 +1498,22 @@ fn sample_volumes() -> Vec<instr::VolumeSnapshot> {
                 loop_wait_nanos: 1_500_000_000,
                 loop_waits_by_kind: [1, 2, 0],
                 loop_wait_nanos_by_kind: [250_000_000, 1_250_000_000, 0],
+                // The read at `leaf_write`; the settles at `leaf_release`
+                // and `tail` (`instr::LOOP_WAIT_SITES`).
+                loop_waits_by_site: {
+                    let mut by = [[0; 32]; 3];
+                    by[0][0] = 1;
+                    by[1][1] = 1;
+                    by[1][3] = 1;
+                    by
+                },
+                loop_wait_nanos_by_site: {
+                    let mut by = [[0; 32]; 3];
+                    by[0][0] = 250_000_000;
+                    by[1][1] = 500_000_000;
+                    by[1][3] = 750_000_000;
+                    by
+                },
                 loop_reads: 6,
                 loop_read_nanos: 750_000_000,
                 aside_waits: 4,
@@ -1537,6 +1554,7 @@ fn sample_volumes() -> Vec<instr::VolumeSnapshot> {
             buffered_bytes: 0,
             arrived_bytes: 0,
             counted_bytes: 0,
+            carried_bytes: 0,
             peak_bytes: 0,
             buffer_soft_bytes: 0,
             buffer_limit_bytes: 0,

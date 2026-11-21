@@ -727,6 +727,10 @@ impl Pipeline {
     // they waited, stay counted there: they move only where they fit, as
     // the loop hands them on (`Self::arm_or_park`), or are given back there.
     // Whether a wake was taken, when `take` says so, on the volume settled.
+    // A front waiting for room on this volume is looked at again: bytes
+    // settled here from a lease to arrived ones may leave the volume
+    // counting only bytes that wait to be handed on, beside which a step is
+    // taken (`room_for`), and no writer's wake says so.
     pub(in crate::pipeline) fn hold_volume_arrived(
         &mut self,
         job_id: JobId,
@@ -736,6 +740,9 @@ impl Pipeline {
     ) -> bool {
         let volume = Arc::clone(from.volume());
         let holds = self.volume_arrived_by_job.entry(job_id).or_default();
+        if bytes != 0 && self.parked_download_results.parked_on(&volume) {
+            self.parked_results_room = true;
+        }
         volume.arrived_bytes.fetch_add(bytes, Ordering::SeqCst);
         let of = from.bytes();
         from.settle(of, bytes);
@@ -840,8 +847,8 @@ impl Pipeline {
         let landing = self.article_landing(result.segment_id.file_id);
         let credit = match self.arm_or_park(job_id, landing, lead_bytes, may_park) {
             Armed::Credit(credit) => credit,
-            Armed::Park { volume, bytes } => {
-                self.park_download_front(result, volume, bytes);
+            Armed::Park { volume, bytes, own } => {
+                self.park_download_front(result, volume, (bytes, own));
                 return false;
             }
         };

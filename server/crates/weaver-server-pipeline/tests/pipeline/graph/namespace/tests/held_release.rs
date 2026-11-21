@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use weaver_server_disk::operations::disk::volume::LoopSite;
 
 struct Unsegmented;
 
@@ -205,6 +206,7 @@ fn placed_behind() -> PlacedBehind {
             crate::pipeline::graph::namespace::Write::New {
                 entered: NodeId::ROOT,
                 posting: member,
+                site: LoopSite::LeafWrite,
             },
             arrival(footer, &archive[footer..]),
             &mut Vec::new(),
@@ -226,7 +228,7 @@ fn placed_behind() -> PlacedBehind {
 }
 
 impl PlacedBehind {
-    fn release_paid(&mut self, paid: &mut bool, out: &mut Vec<Effect>) -> Option<(u64, NodeId)> {
+    fn release_paid(&mut self, paid: &mut u64, out: &mut Vec<Effect>) -> Option<(u64, NodeId)> {
         self.writer
             .release_held_paid(&mut self.tree, &mut self.objects, &Unsegmented, paid, out)
             .unwrap()
@@ -254,7 +256,7 @@ fn a_paid_release_with_no_room_stands_and_the_next_pass_asks_again() {
     let full = Credit::reserve(std::iter::once(&run.submitter), hard, Stand::UntilStop);
     assert!(full.covers(hard));
     let mut out = Vec::new();
-    let mut paid = false;
+    let mut paid = 0;
     assert_eq!(
         run.release_paid(&mut paid, &mut out),
         Some((READ_BACK, child))
@@ -308,7 +310,7 @@ fn a_release_with_room_releases_as_the_uncounted_one_did() {
     assert_eq!(unpaid.writer.release_owed(), None, "nothing is owed");
     let mut paid = placed_behind();
     let mut said_paid = Vec::new();
-    let mut prepaid = false;
+    let mut prepaid = 0;
     assert_eq!(paid.release_paid(&mut prepaid, &mut said_paid), None);
     for run in [&before, &unpaid, &paid] {
         assert_eq!(run.writer.held_bytes(NodeId::ROOT), 0);
@@ -483,4 +485,313 @@ fn a_close_while_a_release_is_owed_ends_as_the_job_with_room() {
         owed.inside() == bytes_room,
         "the owed job's member is the same"
     );
+}
+
+// One stored member of the given name, as `stored` makes "inside.bin".
+fn stored_as(name: &str, payload: &[u8]) -> Vec<u8> {
+    use sevenz_turbo::{ArchiveEntry, ArchiveWriter, EncoderConfiguration, EncoderMethod};
+    let mut archive = ArchiveWriter::new(std::io::Cursor::new(Vec::new())).unwrap();
+    archive.set_content_methods(vec![EncoderConfiguration::new(EncoderMethod::COPY)]);
+    let mut entry = ArchiveEntry::new_file(name);
+    entry.size = payload.len() as u64;
+    archive
+        .push_archive_entry(entry, Some(std::io::Cursor::new(payload.to_vec())))
+        .unwrap();
+    archive.finish().unwrap().into_inner()
+}
+
+// Two archives, A small and B larger, each with its body held behind its
+// end header, written through a volume's own writer thread. A's header has
+// been heard without a release after it, so A's body is placeable; B's
+// header has not come.
+struct TwoHeld {
+    dir: tempfile::TempDir,
+    writer: NamespaceWriter,
+    tree: Tree,
+    objects: weaver_objects::Objects,
+    a: MemberId,
+    b: MemberId,
+    b_archive: Vec<u8>,
+    a_payload: Vec<u8>,
+    b_payload: Vec<u8>,
+    _writers: weaver_server_disk::operations::disk::writer::VolumeWriters,
+    volume: Arc<weaver_server_disk::operations::disk::volume::Volume>,
+    submitter: Arc<weaver_server_disk::operations::disk::writer::Submitter>,
+}
+
+const DATA_AT: usize = 32;
+
+fn two_held() -> TwoHeld {
+    use crate::pipeline::graph::disk::JobDisk;
+    use weaver_server_disk::operations::disk::volume::Volume;
+    use weaver_server_disk::operations::disk::writer::VolumeWriters;
+    let bytes = |len: u64, seed: usize| -> Vec<u8> {
+        (0..len as usize)
+            .map(|n| ((n * 31 + n / 97 + seed) % 251) as u8)
+            .collect()
+    };
+    let a_payload = bytes(4096, 7);
+    let b_payload = bytes(5 * READ_BACK / 2, 13);
+    let a_archive = stored_as("a.bin", &a_payload);
+    let b_archive = stored_as("b.bin", &b_payload);
+    let dir = tempfile::tempdir().unwrap();
+    let writers = VolumeWriters::reporting(|_| {});
+    let volume = Arc::new(Volume::new(None, "test".to_owned()));
+    let submitter = writers.test_submitter(&volume, 1);
+    let mut writer = NamespaceWriter::new(
+        1,
+        dir.path().to_path_buf(),
+        Arc::new(HoldsAccountant::new(PLENTY)),
+        CapacityReader::unknown(),
+    );
+    writer.move_disk_for_test(JobDisk::new(Arc::clone(&submitter), None));
+    let mut tree = Tree::new();
+    let mut objects = weaver_objects::Objects::default();
+    let a = tree.announce_root("a.7z", Some(a_archive.len() as u64), &mut Vec::new());
+    let b = tree.announce_root("b.7z", Some(b_archive.len() as u64), &mut Vec::new());
+    for member in [a, b] {
+        writer
+            .announced(
+                &mut tree,
+                &mut objects,
+                &Unsegmented,
+                NodeId::ROOT,
+                member,
+                &mut Vec::new(),
+            )
+            .unwrap();
+    }
+    for (member, archive, payload) in [(a, &a_archive, &a_payload), (b, &b_archive, &b_payload)] {
+        let footer = DATA_AT + payload.len();
+        for (at, end) in [(0, DATA_AT), (DATA_AT, footer)] {
+            writer
+                .deliver(
+                    &mut tree,
+                    &mut objects,
+                    &Unsegmented,
+                    held_arrival(member, at, &archive[at..end]),
+                    &mut Vec::new(),
+                )
+                .unwrap();
+        }
+    }
+    let footer = DATA_AT + a_payload.len();
+    writer
+        .arrive(
+            &mut tree,
+            &mut objects,
+            &Unsegmented,
+            crate::pipeline::graph::namespace::Write::New {
+                entered: NodeId::ROOT,
+                posting: a,
+                site: LoopSite::LeafWrite,
+            },
+            held_arrival(a, footer, &a_archive[footer..]),
+            &mut Vec::new(),
+        )
+        .unwrap();
+    assert_eq!(
+        writer.held_bytes(NodeId::ROOT),
+        (a_payload.len() + b_payload.len()) as u64
+    );
+    TwoHeld {
+        dir,
+        writer,
+        tree,
+        objects,
+        a,
+        b,
+        b_archive,
+        a_payload,
+        b_payload,
+        _writers: writers,
+        volume,
+        submitter,
+    }
+}
+
+fn held_arrival(member: MemberId, offset: usize, bytes: &[u8]) -> Arrival {
+    Arrival {
+        node: NodeId::ROOT,
+        member,
+        offset: offset as u64,
+        bytes: Bytes::copy_from_slice(bytes).into(),
+        provenance: Provenance::Fresh,
+    }
+}
+
+impl TwoHeld {
+    fn release(&mut self, out: &mut Vec<Effect>) {
+        self.writer
+            .release_held(&mut self.tree, &mut self.objects, &Unsegmented, out)
+            .unwrap();
+    }
+
+    // B's end header, by the delivery path, which releases after it.
+    fn b_header(&mut self, out: &mut Vec<Effect>) {
+        let footer = DATA_AT + self.b_payload.len();
+        let arrival = held_arrival(self.b, footer, &self.b_archive[footer..]);
+        self.writer
+            .deliver(
+                &mut self.tree,
+                &mut self.objects,
+                &Unsegmented,
+                arrival,
+                out,
+            )
+            .unwrap();
+    }
+
+    // Each member's file once every write submitted returned.
+    fn files(&self) -> (Vec<u8>, Vec<u8>) {
+        self.writer.disk().unwrap().barrier().wait_aside();
+        let read = |name: &str| std::fs::read(self.dir.path().join(name)).unwrap_or_default();
+        (read("a.bin"), read("b.bin"))
+    }
+
+    fn loop_waits(&self) -> u64 {
+        self.volume
+            .writer
+            .loop_waits
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+// One release at a time. A release stands for A's small span on a full
+// volume; B's end header then makes a larger span placeable. That delivery
+// leaves every hold to the release that stands: it walks no held span and
+// the owed release is unchanged. Once room comes and the mail is heard,
+// the release goes on through both members, with no loop wait on the
+// volume, and both files end as the same sequence with room wrote them.
+#[test]
+fn a_delivery_while_a_release_is_owed_walks_no_holds_and_both_members_end_as_with_room() {
+    use weaver_server_disk::operations::disk::writer::{Credit, Stand};
+    let mut room = two_held();
+    let mut said_room = Vec::new();
+    room.release(&mut said_room);
+    room.b_header(&mut said_room);
+    assert_eq!(room.writer.release_owed(), None);
+    assert_eq!(room.writer.held_bytes(NodeId::ROOT), 0);
+    let mut owed = two_held();
+    let (child_a, _) = owed.tree.child_of(NodeId::ROOT, owed.a).expect("a 7z");
+    let hard = 4 * READ_BACK;
+    owed.volume.set_buffer_limits(hard, hard);
+    let full = Credit::reserve(std::iter::once(&owed.submitter), hard, Stand::UntilStop);
+    assert!(full.covers(hard));
+    let mut said_owed = Vec::new();
+    owed.release(&mut said_owed);
+    assert_eq!(owed.writer.release_owed(), Some((4096, child_a)));
+    RELEASE_ASKED.set(0);
+    RELEASE_LOCATED.set(0);
+    owed.b_header(&mut said_owed);
+    assert_eq!(RELEASE_ASKED.get(), 0, "no hold was asked");
+    assert_eq!(RELEASE_LOCATED.get(), 0, "no held span was walked");
+    assert_eq!(owed.writer.release_owed(), Some((4096, child_a)));
+    assert_eq!(
+        owed.writer.held_bytes(NodeId::ROOT),
+        (owed.a_payload.len() + owed.b_payload.len()) as u64,
+        "both members are still held"
+    );
+    drop(full);
+    owed.volume.set_buffer_limits(u64::MAX, u64::MAX);
+    while let Some((bytes, _)) = owed.writer.release_owed() {
+        let credit = Credit::reserve(std::iter::once(&owed.submitter), bytes, Stand::UntilStop);
+        assert!(credit.covers(bytes));
+        owed.writer
+            .release_paid(
+                &mut owed.tree,
+                &mut owed.objects,
+                &Unsegmented,
+                credit,
+                &mut said_owed,
+            )
+            .unwrap();
+    }
+    assert_eq!(owed.writer.held_bytes(NodeId::ROOT), 0);
+    let (a_room, b_room) = room.files();
+    assert!(a_room == room.a_payload, "A is whole with room");
+    assert!(b_room == room.b_payload, "B is whole with room");
+    let (a_owed, b_owed) = owed.files();
+    assert!(a_owed == a_room, "A ends as with room");
+    assert!(b_owed == b_room, "B ends as with room");
+    for run in [&room, &owed] {
+        assert_eq!(run.loop_waits(), 0, "the loop never waited on the volume");
+    }
+}
+
+// A credit short of the bytes the release stood for is the stop's case:
+// the bytes stay held, the release stays owed as it was, and nothing is
+// written on the loop from it.
+#[test]
+fn a_short_credit_leaves_the_release_owed_and_the_bytes_held() {
+    use weaver_server_disk::operations::disk::writer::{Credit, Stand};
+    let mut run = placed_behind();
+    let hard = 64 * 1024;
+    run.volume.set_buffer_limits(hard, hard);
+    let full = Credit::reserve(std::iter::once(&run.submitter), hard, Stand::UntilStop);
+    assert!(full.covers(hard));
+    let mut out = Vec::new();
+    run.writer
+        .release_held(&mut run.tree, &mut run.objects, &Unsegmented, &mut out)
+        .unwrap();
+    let owed = run.writer.release_owed().expect("the release is owed");
+    drop(full);
+    run.volume.set_buffer_limits(u64::MAX, u64::MAX);
+    let short = Credit::reserve(
+        std::iter::once(&run.submitter),
+        owed.0 - 1,
+        Stand::UntilStop,
+    );
+    assert!(!short.covers(owed.0));
+    let said = out.len();
+    let paid = run.writer.release_paid(
+        &mut run.tree,
+        &mut run.objects,
+        &Unsegmented,
+        short,
+        &mut out,
+    );
+    assert!(matches!(paid, Err(WriteError::LeftAtStop)), "{paid:?}");
+    assert_eq!(run.writer.release_owed(), Some(owed), "still owed");
+    assert_eq!(
+        run.writer.held_bytes(NodeId::ROOT),
+        run.payload.len() as u64,
+        "the bytes stay held"
+    );
+    assert_eq!(out.len(), said, "nothing was said");
+    assert!(run.inside().is_empty(), "nothing was written");
+}
+
+// A step settled inside another, as a held release's piece is inside the
+// step that hears a run's output, leaves the carried credit holding what
+// the members carry. The outer step then keeps only what is not carried
+// already: the loop carries what the members do, not twice that.
+#[test]
+fn a_step_settled_inside_another_leaves_the_credit_the_members_carry() {
+    use weaver_server_disk::operations::disk::writer::{Credit, Stand};
+    let mut run = placed_behind();
+    let held = run.payload.len() as u64;
+    let reserve = |bytes| {
+        let credit = Credit::reserve(std::iter::once(&run.submitter), bytes, Stand::UntilStop);
+        assert!(credit.covers(bytes));
+        credit
+    };
+    // A first step carries the member's held bytes.
+    let first = reserve(held);
+    run.writer
+        .carry_held_for_test(&run.tree, (NodeId::ROOT, run.member), held, first);
+    assert_eq!(run.writer.carried_on_for_test(&run.volume), (held, held));
+    // The next step takes it, with fresh credit of its own.
+    let outer = run.writer.begin_step_for_test(reserve(held));
+    // A step inside it is settled first and carries the member again.
+    let inner = run.writer.begin_step_for_test(reserve(held));
+    run.writer.settle_step_for_test(&run.tree, inner);
+    assert_eq!(run.writer.carried_on_for_test(&run.volume), (held, held));
+    run.writer.settle_step_for_test(&run.tree, outer);
+    assert_eq!(
+        run.writer.carried_on_for_test(&run.volume),
+        (held, held),
+        "the loop carries what the members carry"
+    );
+    assert_eq!(run.volume.carried_bytes(), held);
 }

@@ -605,7 +605,9 @@ impl Pipeline {
                 if buffered == 0 {
                     continue;
                 }
-                let line = volume.unwritten_bytes().saturating_sub(buffered);
+                // Wake lines are measured besides carried bytes
+                // (`Volume::uncarried_bytes`).
+                let line = volume.uncarried_bytes().saturating_sub(buffered);
                 waits |= submitter.wake_below(line);
             }
             // Nothing waits in memory any more: the job is dropped however

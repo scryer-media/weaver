@@ -19,6 +19,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bytes::Bytes;
@@ -560,6 +561,14 @@ pub struct HoldLedger {
     // kept as holds come and go, so asking after them costs the spans, not
     // the holds.
     spans: BTreeMap<VolumeIndex, HeldSpans>,
+    // Bytes each volume holds, wherever they live, kept as holds come and
+    // go, so asking costs one lookup.
+    held_in: BTreeMap<VolumeIndex, u64>,
+    // Of those, the bytes each volume holds in RAM, kept the same way.
+    resident_in: BTreeMap<VolumeIndex, u64>,
+    // A total this ledger's holds are counted in beside other ledgers'
+    // (`tally_into`), kept as holds come and go.
+    tally: Option<Arc<AtomicU64>>,
 }
 
 #[derive(Debug, Default)]
@@ -661,7 +670,37 @@ impl HoldLedger {
             spilled_in: BTreeMap::new(),
             off_file: BTreeMap::new(),
             spans: BTreeMap::new(),
+            held_in: BTreeMap::new(),
+            resident_in: BTreeMap::new(),
+            tally: None,
         }
+    }
+
+    // Count what this ledger holds in `tally` from here, beside whatever
+    // else counts there, until the ledger goes.
+    pub fn tally_into(&mut self, tally: Arc<AtomicU64>) {
+        tally.fetch_add(self.total_held(), Ordering::Relaxed);
+        if let Some(old) = self.tally.replace(tally) {
+            old.fetch_sub(self.total_held(), Ordering::Relaxed);
+        }
+    }
+
+    // The bytes `volume` holds, in RAM, on scratch or spilled.
+    // Whether this ledger tallies into `tally` already.
+    pub fn tallies_into(&self, tally: &Arc<AtomicU64>) -> bool {
+        self.tally
+            .as_ref()
+            .is_some_and(|own| Arc::ptr_eq(own, tally))
+    }
+
+    pub fn held_bytes(&self, volume: VolumeIndex) -> u64 {
+        self.held_in.get(&volume).copied().unwrap_or(0)
+    }
+
+    // The bytes `volume` holds in RAM: what its resident spans add up to,
+    // in one lookup.
+    pub fn resident_bytes_in(&self, volume: VolumeIndex) -> u64 {
+        self.resident_in.get(&volume).copied().unwrap_or(0)
     }
 
     pub fn namespace(&self) -> HoldsNamespace {
@@ -862,6 +901,11 @@ impl HoldLedger {
             .release_resident(self.namespace, self.resident);
         self.accountant
             .release_scratch(self.namespace, self.scratch);
+        if let Some(tally) = &self.tally {
+            tally.fetch_sub(self.total_held(), Ordering::Relaxed);
+        }
+        self.held_in.clear();
+        self.resident_in.clear();
         self.volumes.clear();
         self.resident_by_age.clear();
         self.resident = 0;
@@ -1141,12 +1185,17 @@ impl HoldLedger {
 
     fn place(&mut self, volume: VolumeIndex, hold: Hold) {
         let len = hold.range.len();
+        *self.held_in.entry(volume).or_default() += len;
+        if let Some(tally) = &self.tally {
+            tally.fetch_add(len, Ordering::Relaxed);
+        }
         let spans = self.spans.entry(volume).or_default();
         spans.all.add(hold.range);
         match hold.location {
             Location::Ram(_) => {
                 spans.resident.add(hold.range);
                 self.resident += len;
+                *self.resident_in.entry(volume).or_default() += len;
                 self.resident_by_age
                     .insert((hold.age, volume, hold.range.start));
             }
@@ -1172,6 +1221,15 @@ impl HoldLedger {
             self.volumes.remove(&volume);
         }
         let len = hold.range.len();
+        if let Some(held) = self.held_in.get_mut(&volume) {
+            *held -= len;
+            if *held == 0 {
+                self.held_in.remove(&volume);
+            }
+        }
+        if let Some(tally) = &self.tally {
+            tally.fetch_sub(len, Ordering::Relaxed);
+        }
         if let Some(spans) = self.spans.get_mut(&volume) {
             spans.all.remove(hold.range);
             if matches!(hold.location, Location::Ram(_)) {
@@ -1184,6 +1242,12 @@ impl HoldLedger {
         match hold.location {
             Location::Ram(_) => {
                 self.resident -= len;
+                if let Some(held) = self.resident_in.get_mut(&volume) {
+                    *held -= len;
+                    if *held == 0 {
+                        self.resident_in.remove(&volume);
+                    }
+                }
                 self.resident_by_age.remove(&(hold.age, volume, start));
             }
             Location::Scratch { .. } => self.scratch -= len,
@@ -1384,6 +1448,43 @@ mod tests {
         assert_eq!(ledger.held_volumes().count(), 0);
     }
 
+    // Each volume's held bytes and the shared tally follow every hold, cut,
+    // page-out, take and discard, wherever the bytes live.
+    #[test]
+    fn held_bytes_and_the_tally_follow_the_holds() {
+        let accountant = Arc::new(HoldsAccountant::new(HoldBudgets {
+            resident_limit: 8,
+            scratch_total: u64::MAX,
+            scratch_ceiling: u64::MAX,
+            disk_reserve: 0,
+        }));
+        let tally = Arc::new(AtomicU64::new(5));
+        let mut ledger = HoldLedger::new(NS, Arc::clone(&accountant));
+        let (volume, other) = (VolumeIndex(0), VolumeIndex(1));
+        ledger.hold(volume, 0, Bytes::from_static(b"abcd"), u64::MAX);
+        ledger.tally_into(Arc::clone(&tally));
+        assert_eq!(tally.load(Ordering::Relaxed), 9);
+        for offset in [4u64, 8] {
+            ledger.hold(volume, offset, Bytes::from_static(b"abcd"), u64::MAX);
+        }
+        ledger.hold(other, 0, Bytes::from_static(b"xy"), u64::MAX);
+        // Paged out or not, every byte counts, and an overlap is cut.
+        ledger.hold(volume, 2, Bytes::from_static(b"zz"), u64::MAX);
+        assert_eq!(ledger.held_bytes(volume), 12);
+        assert_eq!(ledger.held_bytes(other), 2);
+        assert_eq!(tally.load(Ordering::Relaxed), 5 + 14);
+        ledger.take(volume, ByteRange::new(2, 6));
+        assert_eq!(ledger.held_bytes(volume), 8);
+        assert_eq!(tally.load(Ordering::Relaxed), 5 + 10);
+        ledger.discard();
+        assert_eq!(ledger.held_bytes(volume), 0);
+        assert_eq!(tally.load(Ordering::Relaxed), 5);
+        ledger.hold(other, 0, Bytes::from_static(b"xy"), u64::MAX);
+        assert_eq!(tally.load(Ordering::Relaxed), 7);
+        drop(ledger);
+        assert_eq!(tally.load(Ordering::Relaxed), 5);
+    }
+
     const NS: HoldsNamespace = HoldsNamespace {
         scope: 1,
         node: NodeId(0),
@@ -1551,6 +1652,37 @@ mod tests {
             );
             assert_eq!(ledger.held_ranges(VolumeIndex(0)).len() as u64, pieces / 4);
         }
+    }
+
+    #[test]
+    fn resident_bytes_in_is_what_the_resident_spans_add_up_to() {
+        let accountant = Arc::new(HoldsAccountant::new(budgets(40)));
+        let mut ledger = HoldLedger::new(NS, Arc::clone(&accountant));
+        let agrees = |ledger: &HoldLedger| {
+            for volume in [VolumeIndex(0), VolumeIndex(1)] {
+                let spans: u64 = ledger.resident_spans(volume).map(|span| span.len()).sum();
+                assert_eq!(ledger.resident_bytes_in(volume), spans, "{volume:?}");
+            }
+        };
+        // Past the RAM budget the older holds page out to scratch.
+        for (volume, offset) in [(0, 0), (1, 0), (0, 10), (0, 20), (1, 30), (0, 40)] {
+            ledger.hold(VolumeIndex(volume), offset, bytes(1, 10), PLENTY);
+            agrees(&ledger);
+        }
+        // A hold replaced in part, and parts of holds taken.
+        ledger.hold(VolumeIndex(0), 15, bytes(2, 10), PLENTY);
+        agrees(&ledger);
+        ledger.take(VolumeIndex(0), ByteRange::new(5, 18));
+        agrees(&ledger);
+        ledger.take(VolumeIndex(1), ByteRange::new(32, 34));
+        agrees(&ledger);
+        ledger.page_out_all(PLENTY);
+        agrees(&ledger);
+        assert_eq!(ledger.resident_bytes_in(VolumeIndex(0)), 0);
+        ledger.hold(VolumeIndex(1), 50, bytes(3, 10), PLENTY);
+        agrees(&ledger);
+        ledger.discard();
+        agrees(&ledger);
     }
 
     #[test]

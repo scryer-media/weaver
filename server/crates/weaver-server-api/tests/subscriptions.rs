@@ -508,7 +508,8 @@ async fn a_disk_figure_reaches_the_metrics_and_not_the_queue_page() {
             .map(|item| item["diskWrite"].clone())
             .collect::<Vec<_>>()
     };
-    let nas = |slow: bool| serde_json::json!({ "volume": "/mnt/nas", "slow": slow, "draining": !slow });
+    let nas =
+        |slow: bool| serde_json::json!({ "volume": "/mnt/nas", "slow": slow, "draining": !slow });
 
     assert_eq!(
         volumes(metrics.next().await.unwrap()),
@@ -528,17 +529,14 @@ async fn a_disk_figure_reaches_the_metrics_and_not_the_queue_page() {
         serde_json::json!([{ "label": "/mnt/nas", "slow": true,
             "writeRateBytesPerSec": 9 << 20, "waitingBytes": 300 << 20 }])
     );
-    // Past the page's hold and its heartbeat, no page was sent for it.
-    tokio::time::advance(Duration::from_secs(3)).await;
-    tokio::task::yield_now().await;
-    assert!(pages.next().now_or_never().is_none());
-
-    // Which job waits on which disk moves: the page is sent.
+    // Which job waits on which disk moves: the page is sent, and it is the
+    // first page since the last, so none was sent for the figures alone.
     h.shared_state
         .mark_disk_for_test("/mnt/nas", 9 << 20, 300 << 20, false, &[], &[JobId(other)]);
     assert_eq!(
         disk_writes(pages.next().await.unwrap()),
-        [serde_json::Value::Null, nas(false)]
+        [serde_json::Value::Null, nas(false)],
+        "the first page after the figures moved is the one for the move"
     );
 }
 

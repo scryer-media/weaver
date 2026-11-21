@@ -28,6 +28,12 @@ pub(super) struct Carried {
     // volume they will be written to: unknown until the step that held them
     // is settled. Never more than the member holds in memory.
     members: BTreeMap<(NodeId, MemberId), Held>,
+    // What `members` carries for on each volume, kept as they change: the
+    // few volumes a job writes to, so asking costs those, not the members.
+    on: Vec<(Arc<Volume>, u64)>,
+    // The members first carried for in the step being heard, whose volume
+    // is not known yet: all the step's settling has to look at.
+    unplaced: Vec<(NodeId, MemberId)>,
     // While a step hears a run's output: the namespace it lands in. Only
     // bytes held there, then, are carried for.
     into: Option<NodeId>,
@@ -36,6 +42,48 @@ pub(super) struct Carried {
 struct Held {
     bytes: u64,
     volume: Option<Arc<Volume>>,
+}
+
+impl Carried {
+    // The member is carried for `bytes`, to be written to `volume`, in place
+    // of what it was: the totals on each volume follow, and a member carried
+    // for nothing goes.
+    fn set(&mut self, key: (NodeId, MemberId), bytes: u64, volume: Option<Arc<Volume>>) {
+        if let Some(old) = self.members.remove(&key) {
+            self.count(&old, false);
+        }
+        if bytes == 0 {
+            return;
+        }
+        let held = Held { bytes, volume };
+        self.count(&held, true);
+        self.members.insert(key, held);
+    }
+
+    fn count(&mut self, held: &Held, add: bool) {
+        let Some(volume) = &held.volume else {
+            return;
+        };
+        match self.on.iter().position(|(on, _)| Arc::ptr_eq(on, volume)) {
+            Some(at) if add => self.on[at].1 += held.bytes,
+            Some(at) => {
+                self.on[at].1 -= held.bytes;
+                if self.on[at].1 == 0 {
+                    self.on.swap_remove(at);
+                }
+            }
+            None if add && held.bytes > 0 => self.on.push((Arc::clone(volume), held.bytes)),
+            None => {}
+        }
+    }
+
+    // What the members carry for on `volume`.
+    fn on(&self, volume: &Volume) -> u64 {
+        self.on
+            .iter()
+            .find(|(on, _)| std::ptr::eq(on.as_ref(), volume))
+            .map_or(0, |(_, bytes)| *bytes)
+    }
 }
 
 // What a write of held bytes was prepaid with (`NamespaceWriter::pay_held`).
@@ -48,6 +96,45 @@ impl NamespaceWriter {
     // The credit the loop carries, taken to be prepaid with a step's own.
     pub(crate) fn take_credit(&mut self) -> Credit {
         std::mem::take(&mut self.carried.credit)
+    }
+
+    // What the loop carries on `volume`, and what the members carry for
+    // there.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn carried_on_for_test(&self, volume: &Volume) -> (u64, u64) {
+        (self.carried.credit.on(volume), self.carried.on(volume))
+    }
+
+    // A step heard with `credit`, in which `len` bytes the member holds in
+    // memory are a run's output held in `node`: the member is carried for
+    // them as the step settles.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn carry_held_for_test(
+        &mut self,
+        tree: &Tree,
+        (node, member): (NodeId, MemberId),
+        len: u64,
+        credit: Credit,
+    ) {
+        let paying = credit.prepay();
+        self.crediting(Some(node));
+        self.credit_held(node, member, len);
+        self.settle_credit(tree, paying);
+    }
+
+    // The carried credit taken into a step with `fresh`, prepaid, as a step
+    // that hears a run's output takes it (`GraphJob::run_said`).
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn begin_step_for_test(&mut self, fresh: Credit) -> Paying {
+        let mut credit = self.take_credit();
+        credit.join(fresh);
+        credit.prepay()
+    }
+
+    // The step prepaid with `paying` is settled.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn settle_step_for_test(&mut self, tree: &Tree, paying: Paying) {
+        self.settle_credit(tree, paying);
     }
 
     // Whether the loop carries nothing.
@@ -64,35 +151,31 @@ impl NamespaceWriter {
     // The step that `paying` was prepaid for is heard: carry on what it did
     // not write, on each volume, for what the run's output still holds in
     // memory to be written there, and give back the rest.
+    //
+    // Every other member already carries at most what it holds in memory,
+    // since each path that takes held bytes out of memory gives back what
+    // was carried past that, and already knows its volume: only the members
+    // first carried for in this step are looked at.
     pub(crate) fn settle_credit(&mut self, tree: &Tree, paying: Paying) {
         self.carried.into = None;
-        let keys: Vec<(NodeId, MemberId)> = self.carried.members.keys().copied().collect();
-        for (node, member) in keys {
-            let resident = self.member_resident(node, member);
-            let landing = self.held_landing(tree, node, member);
-            let Some(held) = self.carried.members.get_mut(&(node, member)) else {
+        for (node, member) in std::mem::take(&mut self.carried.unplaced) {
+            let Some(held) = self.carried.members.get(&(node, member)) else {
                 continue;
             };
-            held.bytes = held.bytes.min(resident);
-            if held.volume.is_none() {
-                held.volume = landing;
+            if held.volume.is_some() {
+                continue;
             }
-            if held.bytes == 0 || held.volume.is_none() {
-                self.carried.members.remove(&(node, member));
-            }
+            let bytes = held.bytes.min(self.member_resident(node, member));
+            let volume = self.held_landing(tree, node, member);
+            let bytes = if volume.is_some() { bytes } else { 0 };
+            self.carried.set((node, member), bytes, volume);
         }
-        let members = &self.carried.members;
-        let mut settled = paying.settle(|volume| {
-            members
-                .values()
-                .filter(|held| {
-                    held.volume
-                        .as_ref()
-                        .is_some_and(|on| std::ptr::eq(on.as_ref(), volume))
-                })
-                .map(|held| held.bytes)
-                .sum()
-        });
+        // What a held release's prepayment left during the step is carried
+        // already (`Self::paid_held`): the step keeps only the rest, so the
+        // two together carry what the members do.
+        let carried = &self.carried;
+        let mut settled =
+            paying.settle(|volume| carried.on(volume).saturating_sub(carried.credit.on(volume)));
         settled.join(std::mem::take(&mut self.carried.credit));
         settled.carry();
         self.carried.credit = settled;
@@ -101,16 +184,18 @@ impl NamespaceWriter {
     // `len` bytes of the member were held in memory: carried for when they
     // are the output of the run the step hears.
     pub(super) fn credit_held(&mut self, node: NodeId, member: MemberId, len: u64) {
-        if self.carried.into == Some(node) && len > 0 {
-            self.carried
-                .members
-                .entry((node, member))
-                .or_insert(Held {
-                    bytes: 0,
-                    volume: None,
-                })
-                .bytes += len;
+        if self.carried.into != Some(node) || len == 0 {
+            return;
         }
+        let (bytes, volume) = match self.carried.members.get(&(node, member)) {
+            Some(held) => (held.bytes, held.volume.clone()),
+            None => {
+                self.carried.unplaced.push((node, member));
+                (0, None)
+            }
+        };
+        self.carried
+            .set((node, member), bytes.saturating_add(len), volume);
     }
 
     // The member's holds fell: what is carried for more than it still holds
@@ -121,20 +206,18 @@ impl NamespaceWriter {
         }
         let resident = self.member_resident(node, member);
         let carried = &mut self.carried;
-        let Some(held) = carried.members.get_mut(&(node, member)) else {
+        let Some(held) = carried.members.get(&(node, member)) else {
             return;
         };
         if held.bytes <= resident {
             return;
         }
         let excess = held.bytes - resident;
-        held.bytes = resident;
-        if let Some(volume) = &held.volume {
+        let volume = held.volume.clone();
+        if let Some(volume) = &volume {
             carried.credit.give_back_on(volume, excess);
         }
-        if resident == 0 {
-            carried.members.remove(&(node, member));
-        }
+        carried.set((node, member), resident, volume);
     }
 
     // Every member of the namespace `node` held less, or the namespace is
@@ -143,12 +226,12 @@ impl NamespaceWriter {
         if self.carried.members.is_empty() {
             return;
         }
+        // Members are keyed node first, so the node's are one range.
         let members: Vec<MemberId> = self
             .carried
             .members
-            .keys()
-            .filter(|(at, _)| *at == node)
-            .map(|(_, member)| *member)
+            .range((node, MemberId(0))..=(node, MemberId(u32::MAX)))
+            .map(|((_, member), _)| *member)
             .collect();
         for member in members {
             self.uncredit_past_resident(node, member);
@@ -168,12 +251,15 @@ impl NamespaceWriter {
             return None;
         }
         let to = self.disk_under(self.root_for(tree, node, member))?;
-        let held = self.carried.members.get_mut(&(node, member))?;
+        let held = self.carried.members.get(&(node, member))?;
+        let bytes = held.bytes;
         let from = held
             .volume
-            .replace(Arc::clone(to.volume()))
+            .clone()
             .unwrap_or_else(|| Arc::clone(to.volume()));
-        let mut part = self.carried.credit.take_on(&from, held.bytes);
+        self.carried
+            .set((node, member), bytes, Some(Arc::clone(to.volume())));
+        let mut part = self.carried.credit.take_on(&from, bytes);
         if !Arc::ptr_eq(&from, to.volume()) {
             part = part.moved_to(&to);
         }
@@ -188,16 +274,14 @@ impl NamespaceWriter {
     // pay goes back to the carried credit for that, or is given back.
     pub(super) fn paid_held(&mut self, node: NodeId, member: MemberId, paid: Option<PaidHeld>) {
         let resident = self.member_resident(node, member);
-        let kept = match self.carried.members.get_mut(&(node, member)) {
+        let kept = match self.carried.members.get(&(node, member)) {
             Some(held) => {
-                held.bytes = held.bytes.min(resident);
-                held.bytes
+                let (kept, volume) = (held.bytes.min(resident), held.volume.clone());
+                self.carried.set((node, member), kept, volume);
+                kept
             }
             None => 0,
         };
-        if kept == 0 {
-            self.carried.members.remove(&(node, member));
-        }
         if let Some(PaidHeld { paying, volume }) = paid {
             let mut left = paying.settle(|on| {
                 if std::ptr::eq(on, volume.as_ref()) {
@@ -212,14 +296,26 @@ impl NamespaceWriter {
         }
     }
 
-    // The bytes the member holds in memory.
+    // The bytes the member holds, in memory or paged out, that no carried
+    // credit pays the write of: what a release of them to its file
+    // (`release_to_leaf`) writes unpaid. Two lookups.
+    pub(super) fn held_uncarried(&self, node: NodeId, member: MemberId) -> u64 {
+        let held = self
+            .files
+            .get(&node)
+            .map_or(0, |files| files.holds.held_bytes(held_volume(member)));
+        let carried = self
+            .carried
+            .members
+            .get(&(node, member))
+            .map_or(0, |held| held.bytes);
+        held.saturating_sub(carried)
+    }
+
+    // The bytes the member holds in memory. Two lookups.
     fn member_resident(&self, node: NodeId, member: MemberId) -> u64 {
         self.files.get(&node).map_or(0, |files| {
-            files
-                .holds
-                .resident_spans(held_volume(member))
-                .map(|span| span.len())
-                .sum()
+            files.holds.resident_bytes_in(held_volume(member))
         })
     }
 

@@ -5,6 +5,7 @@
 // when it rules, and what the namespace holds for an index still to come.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use weaver_server_disk::operations::disk::volume::LoopSite;
 
 use super::super::super::hardware::Shutdown;
 use super::*;
@@ -261,6 +262,7 @@ fn pending_map_job(budgets: HoldBudgets) -> (Job, MemberId) {
             crate::pipeline::graph::namespace::Write::New {
                 entered: NodeId::ROOT,
                 posting: member,
+                site: LoopSite::LeafWrite,
             },
             Arrival {
                 node: NodeId::ROOT,
@@ -285,7 +287,7 @@ fn a_new_map_reads_pending_custody_before_the_batch_releases_it() {
         });
         let mut build = job.build();
         let mut read = Vec::new();
-        assert!(job.writer.access(&job.tree).read_at(
+        assert!(job.writer.access(&job.tree, LoopSite::ReadOn).read_at(
             NodeId::ROOT,
             member,
             ByteRange::new(0, map_at().end),
@@ -297,7 +299,8 @@ fn a_new_map_reads_pending_custody_before_the_batch_releases_it() {
             !Access {
                 writer: &job.writer,
                 tree: &job.tree,
-                held: false
+                held: false,
+                site: LoopSite::ReadOn,
             }
             .read_at(NodeId::ROOT, member, body(), &mut durable,)
         );
@@ -312,6 +315,7 @@ fn a_new_map_reads_pending_custody_before_the_batch_releases_it() {
                 crate::pipeline::graph::namespace::Write::New {
                     entered: NodeId::ROOT,
                     posting: member,
+                    site: LoopSite::LeafWrite,
                 },
                 Arrival {
                     node: NodeId::ROOT,
@@ -325,7 +329,7 @@ fn a_new_map_reads_pending_custody_before_the_batch_releases_it() {
             .unwrap();
         assert_eq!(job.writer.held_bytes(NodeId::ROOT), body().len() - 1);
         let mut replaced = Vec::new();
-        assert!(job.writer.access(&job.tree).read_at(
+        assert!(job.writer.access(&job.tree, LoopSite::ReadOn).read_at(
             NodeId::ROOT,
             member,
             ByteRange::new(0, map_at().end),
@@ -337,11 +341,12 @@ fn a_new_map_reads_pending_custody_before_the_batch_releases_it() {
             .unwrap();
         assert_eq!(job.writer.held_bytes(NodeId::ROOT), 0);
         let mut released = Vec::new();
-        assert!(
-            job.writer
-                .access(&job.tree)
-                .read_at(NodeId::ROOT, member, body(), &mut released)
-        );
+        assert!(job.writer.access(&job.tree, LoopSite::ReadOn).read_at(
+            NodeId::ROOT,
+            member,
+            body(),
+            &mut released
+        ));
         assert_eq!(released, b"hallo");
     }
 }
@@ -375,11 +380,12 @@ fn a_lent_read_keeps_pending_custody_when_the_live_copy_changes() {
     );
     assert!(matches!(result, Err(WriteError::StaleRecovery { set: stale }) if stale == set));
     let mut current = Vec::new();
-    assert!(
-        job.writer
-            .access(&job.tree)
-            .read_at(NodeId::ROOT, member, body(), &mut current)
-    );
+    assert!(job.writer.access(&job.tree, LoopSite::ReadOn).read_at(
+        NodeId::ROOT,
+        member,
+        body(),
+        &mut current
+    ));
     assert_eq!(
         current, b"hallo",
         "stale proof must not overwrite the newer placed copy"
@@ -403,10 +409,10 @@ fn failed_pending_custody_cannot_fall_back_to_an_older_derived_copy() {
     job.writer
         .write_file(
             &mut job.tree,
-            child,
-            MemberId(0),
+            (child, MemberId(0)),
             0,
             &weaver_graph::Evidenced::from(&b"stale"[..]),
+            LoopSite::LeafWrite,
         )
         .unwrap();
     job.writer
@@ -416,21 +422,23 @@ fn failed_pending_custody_cannot_fall_back_to_an_older_derived_copy() {
         .scratch
         .as_mut()
         .unwrap()
-        .close(0)
+        .close(LoopSite::LeafWrite, 0)
         .unwrap();
     let mut read = b"prefix".to_vec();
-    assert!(
-        !job.writer
-            .access(&job.tree)
-            .read_at(NodeId::ROOT, member, body(), &mut read)
-    );
+    assert!(!job.writer.access(&job.tree, LoopSite::ReadOn).read_at(
+        NodeId::ROOT,
+        member,
+        body(),
+        &mut read
+    ));
     assert_eq!(read, b"prefix");
     let mut durable = Vec::new();
     assert!(
         Access {
             writer: &job.writer,
             tree: &job.tree,
-            held: false
+            held: false,
+            site: LoopSite::ReadOn,
         }
         .read_at(NodeId::ROOT, member, body(), &mut durable)
     );

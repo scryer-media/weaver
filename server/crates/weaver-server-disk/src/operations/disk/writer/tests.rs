@@ -58,8 +58,14 @@ fn a_barrier_passes_once_every_write_before_it_returned() {
     let volume = volume("one");
     let hold = writers.hold(&volume);
     let job = writers.test_submitter(&volume, 7);
-    job.write(1, 0, Bytes::from_static(b"lan"), create(&path));
-    job.write(1, 3, Bytes::from_static(b"tern"), None);
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"lan"),
+        create(&path),
+    );
+    job.write(LoopSite::LeafWrite, 1, 3, Bytes::from_static(b"tern"), None);
     assert_eq!(volume.buffered_bytes.load(Ordering::Relaxed), 7);
     let barrier = job.barrier();
     hold.wait_held();
@@ -70,7 +76,7 @@ fn a_barrier_passes_once_every_write_before_it_returned() {
     assert!(!barrier.passed(), "one write of two is still held");
     assert_eq!(std::fs::read(&path).unwrap(), b"lan");
     hold.open();
-    barrier.wait();
+    barrier.wait(LoopSite::LeafWrite);
     assert!(barrier.passed());
     assert_eq!(std::fs::read(&path).unwrap(), b"lantern");
     assert_eq!(volume.buffered_bytes.load(Ordering::Relaxed), 0);
@@ -91,8 +97,8 @@ fn a_written_buffer_is_let_go_on_the_writer() {
     let volume = volume("one");
     let job = writers.test_submitter(&volume, 7);
     let bytes = Bytes::from(b"lantern".to_vec());
-    job.write(1, 0, bytes.clone(), create(&path));
-    job.barrier().wait();
+    job.write(LoopSite::LeafWrite, 1, 0, bytes.clone(), create(&path));
+    job.barrier().wait(LoopSite::LeafWrite);
     assert_eq!(volume.buffered_bytes.load(Ordering::Relaxed), 0);
     assert!(bytes.is_unique(), "the writer holds no share once written");
     assert_eq!(std::fs::read(&path).unwrap(), b"lantern");
@@ -125,12 +131,24 @@ fn a_batch_counts_only_the_time_inside_its_write_calls() {
             within: None,
         })
     };
-    job.write(1, 0, Bytes::from_static(b"lan"), slow(&first));
-    job.write(1, 3, Bytes::from_static(b"tern"), None);
-    job.write(2, 0, Bytes::from_static(b"wick"), slow(&second));
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"lan"),
+        slow(&first),
+    );
+    job.write(LoopSite::LeafWrite, 1, 3, Bytes::from_static(b"tern"), None);
+    job.write(
+        LoopSite::LeafWrite,
+        2,
+        0,
+        Bytes::from_static(b"wick"),
+        slow(&second),
+    );
     let barrier = job.barrier();
     hold.open();
-    barrier.wait();
+    barrier.wait(LoopSite::LeafWrite);
     assert_eq!(std::fs::read(&first).unwrap(), b"lantern");
     assert_eq!(std::fs::read(&second).unwrap(), b"wick");
     assert_eq!(count(&volume.write_calls), 3);
@@ -161,12 +179,12 @@ fn a_callers_code_between_two_writes_is_not_write_time() {
         open: open_slowly,
         within: None,
     });
-    job.write(1, 0, Bytes::from_static(b"lan"), slow);
+    job.write(LoopSite::LeafWrite, 1, 0, Bytes::from_static(b"lan"), slow);
     job.barrier().then(|| step_clock(Duration::from_secs(1)));
-    job.write(1, 3, Bytes::from_static(b"tern"), None);
+    job.write(LoopSite::LeafWrite, 1, 3, Bytes::from_static(b"tern"), None);
     let barrier = job.barrier();
     hold.open();
-    barrier.wait();
+    barrier.wait(LoopSite::LeafWrite);
     // A batch is counted after its operations return.
     hold.wait_parked();
     assert_eq!(std::fs::read(&path).unwrap(), b"lantern");
@@ -197,13 +215,31 @@ fn a_batch_writes_each_file_by_offset_and_keeps_overlaps_in_order() {
     // One operation is taken and held; the rest queue behind it as a batch.
     job.run(None, dir.path().to_path_buf(), || Ok(()));
     hold.wait_held();
-    job.write(1, 0, Bytes::from_static(b"0"), create(&far));
-    job.write(1, 8, Bytes::from_static(b"8"), None);
-    job.write(2, 4, Bytes::from_static(b"4"), create(&near));
-    job.write(1, 4, Bytes::from_static(b"4"), None);
-    job.write(3, 0, Bytes::from_static(b"old"), create(&twice));
-    job.write(3, 1, Bytes::from_static(b"NEW"), None);
-    job.write(3, 0, Bytes::from_static(b"x"), None);
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"0"),
+        create(&far),
+    );
+    job.write(LoopSite::LeafWrite, 1, 8, Bytes::from_static(b"8"), None);
+    job.write(
+        LoopSite::LeafWrite,
+        2,
+        4,
+        Bytes::from_static(b"4"),
+        create(&near),
+    );
+    job.write(LoopSite::LeafWrite, 1, 4, Bytes::from_static(b"4"), None);
+    job.write(
+        LoopSite::LeafWrite,
+        3,
+        0,
+        Bytes::from_static(b"old"),
+        create(&twice),
+    );
+    job.write(LoopSite::LeafWrite, 3, 1, Bytes::from_static(b"NEW"), None);
+    job.write(LoopSite::LeafWrite, 3, 0, Bytes::from_static(b"x"), None);
     let barrier = job.barrier();
     // The held operation, then the first write of the batch that follows:
     // file 1 goes first, the write that opens it and then lowest offset
@@ -220,7 +256,7 @@ fn a_batch_writes_each_file_by_offset_and_keeps_overlaps_in_order() {
     assert_eq!(std::fs::metadata(&far).unwrap().len(), 9);
     assert!(!near.exists(), "one file at a time");
     hold.open();
-    barrier.wait();
+    barrier.wait(LoopSite::LeafWrite);
     assert_eq!(std::fs::read(&near).unwrap(), b"\0\0\0\x004");
     assert_eq!(std::fs::read(&twice).unwrap(), b"xNEW");
 }
@@ -235,7 +271,13 @@ fn a_close_and_a_move_follow_the_writes_before_them() {
     let job = writers.test_submitter(&volume, 1);
     job.run(None, dir.path().to_path_buf(), || Ok(()));
     hold.wait_held();
-    job.write(1, 4, Bytes::from_static(b"tail"), create(&from));
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        4,
+        Bytes::from_static(b"tail"),
+        create(&from),
+    );
     job.close(
         1,
         6,
@@ -250,10 +292,16 @@ fn a_close_and_a_move_follow_the_writes_before_them() {
     job.run(Some(1), from.clone(), move || {
         std::fs::rename(&moved_from, &moved_to)
     });
-    job.write(1, 0, Bytes::from_static(b"head"), create(&to));
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"head"),
+        create(&to),
+    );
     let barrier = job.barrier();
     hold.open();
-    barrier.wait();
+    barrier.wait(LoopSite::LeafWrite);
     assert!(!from.exists());
     assert_eq!(std::fs::read(&to).unwrap(), b"headta");
 }
@@ -274,7 +322,13 @@ fn a_reader_does_not_wait_behind_the_drop_of_a_closed_files_handle() {
     hold.hold_drops(true);
     hold.open();
     let job = writers.test_submitter(&volume, 1);
-    job.write(1, 0, Bytes::from_static(b"head"), create(&path));
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"head"),
+        create(&path),
+    );
     job.close(
         1,
         6,
@@ -307,7 +361,7 @@ fn a_reader_does_not_wait_behind_the_drop_of_a_closed_files_handle() {
         finished
     });
     assert!(finished, "the reader waited behind the drop of a handle");
-    barrier.wait();
+    barrier.wait(LoopSite::LeafWrite);
     assert!(barrier.passed());
     assert_eq!(count(&volume.writer.aside_waits), 0);
 }
@@ -328,7 +382,13 @@ fn a_closed_handle_is_dropped_once_the_batch_runs_nothing_more_of_its_key() {
     // The thread stands in a batch of its own before what follows comes.
     other.run(None, dir.path().to_path_buf(), || Ok(()));
     hold.wait_held();
-    closing.write(1, 0, Bytes::from_static(b"head"), create(&closed_path));
+    closing.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"head"),
+        create(&closed_path),
+    );
     closing.close(
         1,
         4,
@@ -340,8 +400,14 @@ fn a_closed_handle_is_dropped_once_the_batch_runs_nothing_more_of_its_key() {
         },
     );
     closing.release(1);
-    other.write(1, 0, Bytes::from_static(b"more"), create(&other_path));
-    other.write(1, 4, Bytes::from_static(b"tail"), None);
+    other.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"more"),
+        create(&other_path),
+    );
+    other.write(LoopSite::LeafWrite, 1, 4, Bytes::from_static(b"tail"), None);
     let state = &writers.lane(&volume).state;
     hold.release(1);
     hold.wait_held();
@@ -363,7 +429,7 @@ fn a_closed_handle_is_dropped_once_the_batch_runs_nothing_more_of_its_key() {
     );
     assert!(closing.barrier().key.held().letting_go.is_empty());
     hold.open();
-    other.barrier().wait();
+    other.barrier().wait(LoopSite::LeafWrite);
     assert_eq!(std::fs::read(&closed_path).unwrap(), b"head");
     assert_eq!(std::fs::read(&other_path).unwrap(), b"moretail");
 }
@@ -383,7 +449,13 @@ fn a_stopped_keys_code_is_dropped_after_the_handles_the_key_let_go() {
     let plug = writers.test_submitter(&volume, 2);
     plug.run(None, dir.path().to_path_buf(), || Ok(()));
     hold.wait_held();
-    job.write(1, 0, Bytes::from_static(b"head"), create(&closed_path));
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"head"),
+        create(&closed_path),
+    );
     job.close(
         1,
         4,
@@ -395,7 +467,13 @@ fn a_stopped_keys_code_is_dropped_after_the_handles_the_key_let_go() {
         },
     );
     job.release(1);
-    job.write(2, 0, Bytes::from_static(b"lost"), create(&failing_path));
+    job.write(
+        LoopSite::LeafWrite,
+        2,
+        0,
+        Bytes::from_static(b"lost"),
+        create(&failing_path),
+    );
     let ran = Arc::new(AtomicBool::new(false));
     let marked = Arc::clone(&ran);
     job.run(None, dir.path().to_path_buf(), move || {
@@ -423,7 +501,7 @@ fn a_stopped_keys_code_is_dropped_after_the_handles_the_key_let_go() {
     assert!(barrier.key.held().letting_go.is_empty());
     hold.hold_drops(false);
     hold.open();
-    plug.barrier().wait();
+    plug.barrier().wait(LoopSite::LeafWrite);
 }
 
 #[test]
@@ -439,14 +517,32 @@ fn a_failed_write_comes_back_with_its_batch_and_stops_its_key_only() {
     let hold = writers.hold(&volume);
     let failing = writers.test_submitter(&volume, 1);
     let healthy = writers.test_submitter(&volume, 2);
-    failing.write(1, 0, Bytes::from_static(b"lost"), create(&bad));
-    failing.write(2, 0, Bytes::from_static(b"never"), create(&good));
-    healthy.write(3, 0, Bytes::from_static(b"kept"), create(&other));
+    failing.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"lost"),
+        create(&bad),
+    );
+    failing.write(
+        LoopSite::LeafWrite,
+        2,
+        0,
+        Bytes::from_static(b"never"),
+        create(&good),
+    );
+    healthy.write(
+        LoopSite::LeafWrite,
+        3,
+        0,
+        Bytes::from_static(b"kept"),
+        create(&other),
+    );
     let (failed, kept) = (failing.barrier(), healthy.barrier());
     hold.wait_held();
     hold.fail_next(io::Error::other("no room"));
     hold.open();
-    kept.wait();
+    kept.wait(LoopSite::LeafWrite);
     let mut failures = Vec::new();
     while failures.is_empty() {
         failures.extend(reports.recv().unwrap().failures);
@@ -472,15 +568,21 @@ fn a_forced_failure_of_a_later_write_names_the_open_file() {
     let volume = volume("one");
     let hold = writers.hold(&volume);
     let job = writers.test_submitter(&volume, 4);
-    job.write(1, 0, Bytes::from_static(b"head"), create(&path));
-    job.write(1, 4, Bytes::from_static(b"tail"), None);
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"head"),
+        create(&path),
+    );
+    job.write(LoopSite::LeafWrite, 1, 4, Bytes::from_static(b"tail"), None);
     let barrier = job.barrier();
     hold.wait_held();
     hold.release(1);
     hold.wait_held();
     hold.fail_next(io::Error::other("no room"));
     hold.open();
-    barrier.wait();
+    barrier.wait(LoopSite::LeafWrite);
     let report = reports.recv().unwrap();
     assert_eq!(report.failures.len(), 1);
     assert_eq!(
@@ -499,8 +601,14 @@ fn nothing_of_an_abandoned_key_is_written_after() {
     let volume = volume("one");
     let hold = writers.hold(&volume);
     let job = writers.test_submitter(&volume, 1);
-    job.write(1, 0, Bytes::from_static(b"one"), create(&path));
-    job.write(1, 3, Bytes::from_static(b"two"), None);
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"one"),
+        create(&path),
+    );
+    job.write(LoopSite::LeafWrite, 1, 3, Bytes::from_static(b"two"), None);
     let (moved_from, moved_to) = (path.clone(), dir.path().join("b"));
     job.run(Some(1), path.clone(), move || {
         std::fs::rename(&moved_from, &moved_to)
@@ -510,7 +618,7 @@ fn nothing_of_an_abandoned_key_is_written_after() {
     hold.wait_held();
     let gone = job.abandon();
     hold.open();
-    gone.wait();
+    gone.wait(LoopSite::LeafWrite);
     assert_eq!(std::fs::read(&path).unwrap(), b"one");
     assert!(!dir.path().join("b").exists());
     assert_eq!(volume.buffered_bytes.load(Ordering::Relaxed), 0);
@@ -525,9 +633,21 @@ fn a_held_volume_does_not_hold_another() {
     let hold = writers.hold(&slow);
     let on_slow = writers.test_submitter(&slow, 1);
     let on_fast = writers.test_submitter(&fast, 1);
-    on_slow.write(1, 0, Bytes::from_static(b"stuck"), create(&stuck));
-    on_fast.write(2, 0, Bytes::from_static(b"free"), create(&free));
-    on_fast.barrier().wait();
+    on_slow.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"stuck"),
+        create(&stuck),
+    );
+    on_fast.write(
+        LoopSite::LeafWrite,
+        2,
+        0,
+        Bytes::from_static(b"free"),
+        create(&free),
+    );
+    on_fast.barrier().wait(LoopSite::LeafWrite);
     assert_eq!(std::fs::read(&free).unwrap(), b"free");
     hold.wait_held();
     assert!(!on_slow.barrier().passed());
@@ -545,7 +665,13 @@ fn a_read_follows_the_writes_submitted_before_it() {
     let (writers, _reports) = writers();
     let volume = volume("one");
     let job = writers.test_submitter(&volume, 1);
-    job.write(1, 0, Bytes::from_static(b"lantern"), create(&path));
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"lantern"),
+        create(&path),
+    );
     assert_eq!(job.read(path, 3, 4).unwrap(), b"tern");
 }
 
@@ -558,21 +684,33 @@ fn a_keys_barrier_and_read_pass_while_another_keys_operation_is_held() {
     let hold = writers.hold(&volume);
     let slow = writers.test_submitter(&volume, 1);
     let quick = writers.test_submitter(&volume, 2);
-    quick.write(0, 0, Bytes::from_static(b"lantern"), create(&free));
+    quick.write(
+        LoopSite::LeafWrite,
+        0,
+        0,
+        Bytes::from_static(b"lantern"),
+        create(&free),
+    );
     let passed = quick.barrier();
     hold.wait_held();
     hold.release(1);
-    slow.write(0, 0, Bytes::from_static(b"stuck"), create(&stuck));
+    slow.write(
+        LoopSite::LeafWrite,
+        0,
+        0,
+        Bytes::from_static(b"stuck"),
+        create(&stuck),
+    );
     let held = slow.barrier();
     // The thread stands before the other key's write and does not run it.
     hold.wait_held();
     assert!(passed.passed());
-    passed.wait();
+    passed.wait(LoopSite::LeafWrite);
     assert_eq!(quick.read(free, 3, 4).unwrap(), b"tern");
     assert!(!held.returned());
     assert!(!stuck.exists());
     hold.open();
-    held.wait();
+    held.wait(LoopSite::LeafWrite);
     assert_eq!(std::fs::read(&stuck).unwrap(), b"stuck");
 }
 
@@ -589,10 +727,22 @@ fn a_read_after_a_files_own_writes_passes_while_its_keys_write_of_another_file_i
     let volume = volume("one");
     let hold = writers.hold(&volume);
     let job = writers.test_submitter(&volume, 1);
-    let wrote = job.write(1, 0, Bytes::from_static(b"lantern"), create(&read));
+    let wrote = job.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"lantern"),
+        create(&read),
+    );
     hold.wait_held();
     hold.release(1);
-    job.write(2, 0, Bytes::from_static(b"stuck"), create(&stuck));
+    job.write(
+        LoopSite::LeafWrite,
+        2,
+        0,
+        Bytes::from_static(b"stuck"),
+        create(&stuck),
+    );
     // The thread stands before the key's write of the other file.
     hold.wait_held();
     assert_eq!(job.read_after(wrote, read.clone(), 3, 4).unwrap(), b"tern");
@@ -615,11 +765,29 @@ fn writes_queued_behind_a_held_volume_run_as_one_batch_by_offset() {
     hold.wait_held();
     // Each file is opened by its first four bytes; the rest are submitted
     // last part first, the two files turn and turn about.
-    job.write(1, 0, Bytes::from(vec![0; 4]), create(&first));
-    job.write(2, 0, Bytes::from(vec![0; 4]), create(&second));
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from(vec![0; 4]),
+        create(&first),
+    );
+    job.write(
+        LoopSite::LeafWrite,
+        2,
+        0,
+        Bytes::from(vec![0; 4]),
+        create(&second),
+    );
     for part in (1..32u8).rev() {
         for file in [1, 2] {
-            job.write(file, u64::from(part) * 4, Bytes::from(vec![part; 4]), None);
+            job.write(
+                LoopSite::LeafWrite,
+                file,
+                u64::from(part) * 4,
+                Bytes::from(vec![part; 4]),
+                None,
+            );
         }
     }
     drop(job);
@@ -649,9 +817,15 @@ fn a_wake_asked_for_comes_once_when_the_line_is_crossed() {
     let volume = volume("one");
     let hold = writers.hold(&volume);
     let job = writers.test_submitter(&volume, 1);
-    job.write(1, 0, Bytes::from_static(b"four"), create(&path));
-    job.write(1, 4, Bytes::from_static(b"more"), None);
-    job.write(1, 8, Bytes::from_static(b"last"), None);
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"four"),
+        create(&path),
+    );
+    job.write(LoopSite::LeafWrite, 1, 4, Bytes::from_static(b"more"), None);
+    job.write(LoopSite::LeafWrite, 1, 8, Bytes::from_static(b"last"), None);
     assert!(!job.wake_below(12), "already there: no wake");
     assert!(job.wake_below(4));
     assert!(job.wake_below(4), "asked twice, woken once");
@@ -704,7 +878,13 @@ fn a_volume_keeps_one_thread_until_it_ends_and_settle_waits_for_it() {
     let volume = volume("one");
     let hold = writers.hold(&volume);
     let gone = writers.test_submitter(&volume, 1);
-    gone.write(1, 0, Bytes::from_static(b"old"), create(&old));
+    gone.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"old"),
+        create(&old),
+    );
     drop(gone);
     hold.wait_held();
     // No caller holds the key, and its write is still seen: a settle that
@@ -724,7 +904,13 @@ fn a_volume_keeps_one_thread_until_it_ends_and_settle_waits_for_it() {
         }]
     );
     let next = writers.test_submitter(&volume, 2);
-    next.write(1, 0, Bytes::from_static(b"new"), create(&new));
+    next.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"new"),
+        create(&new),
+    );
     hold.open();
     writers.settle();
     assert_eq!(std::fs::read(&old).unwrap(), b"old");
@@ -734,8 +920,14 @@ fn a_volume_keeps_one_thread_until_it_ends_and_settle_waits_for_it() {
     assert_eq!(count(&volume.writer.threads), 1);
     // Only a volume whose thread has ended is given another.
     let after = writers.test_submitter(&volume, 3);
-    after.write(1, 0, Bytes::from_static(b"later"), create(&later));
-    after.barrier().wait();
+    after.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"later"),
+        create(&later),
+    );
+    after.barrier().wait(LoopSite::LeafWrite);
     assert_eq!(std::fs::read(&later).unwrap(), b"later");
     assert_eq!(count(&volume.writer.threads), 2);
 }
@@ -754,15 +946,27 @@ fn two_keys_number_their_files_apart() {
     six.run(None, dir.path().to_path_buf(), || Ok(()));
     hold.wait_held();
     // One batch holds both keys' file 0.
-    six.write(0, 0, Bytes::from_static(b"AA"), create(&a));
-    seven.write(0, 0, Bytes::from_static(b"BB"), create(&b));
-    six.write(0, 2, Bytes::from_static(b"AA"), None);
+    six.write(
+        LoopSite::LeafWrite,
+        0,
+        0,
+        Bytes::from_static(b"AA"),
+        create(&a),
+    );
+    seven.write(
+        LoopSite::LeafWrite,
+        0,
+        0,
+        Bytes::from_static(b"BB"),
+        create(&b),
+    );
+    six.write(LoopSite::LeafWrite, 0, 2, Bytes::from_static(b"AA"), None);
     hold.open();
-    six.barrier().wait();
-    seven.barrier().wait();
+    six.barrier().wait(LoopSite::LeafWrite);
+    seven.barrier().wait(LoopSite::LeafWrite);
     // And so do two batches.
-    seven.write(0, 2, Bytes::from_static(b"BB"), None);
-    seven.barrier().wait();
+    seven.write(LoopSite::LeafWrite, 0, 2, Bytes::from_static(b"BB"), None);
+    seven.barrier().wait(LoopSite::LeafWrite);
     assert_eq!(std::fs::read(&a).unwrap(), b"AAAA");
     assert_eq!(std::fs::read(&b).unwrap(), b"BBBB");
 }
@@ -777,12 +981,24 @@ fn a_panicking_operation_fails_its_key_and_the_thread_goes_on() {
     let broken = writers.test_submitter(&volume, 1);
     broken.run(None, dir.path().to_path_buf(), || Ok(()));
     hold.wait_held();
-    broken.write(1, 0, Bytes::from_static(b"first"), create(&lost));
+    broken.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"first"),
+        create(&lost),
+    );
     broken.run(None, lost.clone(), || panic!("an operation that panics"));
-    broken.write(1, 5, Bytes::from_static(b"never"), None);
+    broken.write(
+        LoopSite::LeafWrite,
+        1,
+        5,
+        Bytes::from_static(b"never"),
+        None,
+    );
     let failed = broken.barrier();
     hold.open();
-    failed.wait();
+    failed.wait(LoopSite::LeafWrite);
     assert!(failed.returned() && !failed.passed());
     assert!(broken.failed());
     assert_eq!(count(&volume.buffered_bytes), 0);
@@ -792,9 +1008,15 @@ fn a_panicking_operation_fails_its_key_and_the_thread_goes_on() {
     assert_eq!(report.failures[0].key, 1);
     assert_eq!(count(&volume.writer.failed_operations), 1);
     let healthy = writers.test_submitter(&volume, 2);
-    healthy.write(1, 0, Bytes::from_static(b"kept"), create(&kept));
+    healthy.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"kept"),
+        create(&kept),
+    );
     let kept_barrier = healthy.barrier();
-    kept_barrier.wait();
+    kept_barrier.wait(LoopSite::LeafWrite);
     assert!(kept_barrier.passed());
     assert_eq!(std::fs::read(&kept).unwrap(), b"kept");
     assert_eq!(count(&volume.writer.threads), 1);
@@ -808,7 +1030,13 @@ fn a_bounded_settle_gives_up_on_a_volume_that_holds_writes_at_its_end() {
     let volume = volume("one");
     let hold = writers.hold(&volume);
     let job = writers.test_submitter(&volume, 1);
-    job.write(1, 0, Bytes::from_static(b"stuck"), create(&path));
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"stuck"),
+        create(&path),
+    );
     hold.wait_held();
     let clock = ManualClock::default();
     let span = Duration::from_secs(30);
@@ -853,8 +1081,20 @@ fn settles_that_share_an_end_give_up_at_it_whatever_returned_meanwhile() {
     let volume = volume("one");
     let hold = writers.hold(&volume);
     let job = writers.test_submitter(&volume, 1);
-    job.write(1, 0, Bytes::from_static(b"first"), create(&a));
-    job.write(2, 0, Bytes::from_static(b"stuck"), create(&b));
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"first"),
+        create(&a),
+    );
+    job.write(
+        LoopSite::LeafWrite,
+        2,
+        0,
+        Bytes::from_static(b"stuck"),
+        create(&b),
+    );
     hold.wait_held();
     let clock = ManualClock::default();
     let end = Duration::from_secs(30);
@@ -901,15 +1141,33 @@ fn the_counters_hold_what_a_scripted_run_did() {
     hold.wait_held();
     hold.fail_next(io::Error::other("no room"));
     // Three writes that leave no gap once ordered.
-    ordered.write(1, 0, Bytes::from_static(b"aaaa"), create(&a));
-    ordered.write(1, 8, Bytes::from_static(b"cccc"), None);
-    ordered.write(1, 4, Bytes::from_static(b"bbbb"), None);
+    ordered.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"aaaa"),
+        create(&a),
+    );
+    ordered.write(LoopSite::LeafWrite, 1, 8, Bytes::from_static(b"cccc"), None);
+    ordered.write(LoopSite::LeafWrite, 1, 4, Bytes::from_static(b"bbbb"), None);
     // Two with a gap between them.
-    seeking.write(1, 0, Bytes::from_static(b"xx"), create(&x));
-    seeking.write(1, 10, Bytes::from_static(b"yy"), None);
+    seeking.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"xx"),
+        create(&x),
+    );
+    seeking.write(LoopSite::LeafWrite, 1, 10, Bytes::from_static(b"yy"), None);
     // Two that are given up before they run.
-    given_up.write(1, 0, Bytes::from_static(b"zz"), create(&z));
-    given_up.write(1, 2, Bytes::from_static(b"zz"), None);
+    given_up.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"zz"),
+        create(&z),
+    );
+    given_up.write(LoopSite::LeafWrite, 1, 2, Bytes::from_static(b"zz"), None);
     given_up.abandon();
     drop((failing, ordered, seeking, given_up));
     hold.open();
@@ -959,9 +1217,21 @@ fn a_volume_with_no_thread_is_asked_for_one_again_only_once_it_was_let_go() {
     let own = writers.test_volume_submitter(&volume);
     assert_eq!(starts(), 1, "one ask for the three of them");
 
-    first.write(1, 0, Bytes::from_static(b"lost"), create(&first_path));
-    first.write(1, 4, Bytes::from_static(b"too"), None);
-    second.write(1, 0, Bytes::from_static(b"lost"), create(&second_path));
+    first.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"lost"),
+        create(&first_path),
+    );
+    first.write(LoopSite::LeafWrite, 1, 4, Bytes::from_static(b"too"), None);
+    second.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"lost"),
+        create(&second_path),
+    );
     own.run(None, dir.path().to_path_buf(), || Ok(()));
     for job in [&first, &second, &own] {
         let barrier = job.barrier();
@@ -1021,9 +1291,15 @@ fn a_producer_waits_until_the_bytes_waiting_fall_to_its_line() {
     let volume = volume("one");
     let hold = writers.hold(&volume);
     let job = writers.test_submitter(&volume, 1);
-    job.write(1, 0, Bytes::from_static(b"four"), create(&path));
-    job.write(1, 4, Bytes::from_static(b"more"), None);
-    job.write(1, 8, Bytes::from_static(b"last"), None);
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"four"),
+        create(&path),
+    );
+    job.write(LoopSite::LeafWrite, 1, 4, Bytes::from_static(b"more"), None);
+    job.write(LoopSite::LeafWrite, 1, 8, Bytes::from_static(b"last"), None);
     // Twelve wait: a line of twelve or more is already met.
     job.wait_below(12);
     hold.wait_held();
@@ -1070,7 +1346,13 @@ fn a_wait_off_the_loop_is_not_counted_as_a_loop_wait() {
     let volume = volume("one");
     let hold = writers.hold(&volume);
     let job = writers.test_submitter(&volume, 1);
-    job.write(1, 0, Bytes::from_static(b"lantern"), create(&path));
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"lantern"),
+        create(&path),
+    );
     let barrier = job.barrier();
     hold.wait_held();
     std::thread::scope(|scope| {
@@ -1107,21 +1389,27 @@ fn the_loops_wait_and_read_are_each_counted_once() {
     let volume = volume("one");
     let hold = writers.hold(&volume);
     let job = writers.test_submitter(&volume, 1);
-    job.write(1, 0, Bytes::from_static(b"lantern"), create(&path));
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"lantern"),
+        create(&path),
+    );
     let barrier = job.barrier();
     hold.wait_held();
     std::thread::scope(|scope| {
-        let waits = scope.spawn(|| barrier.wait());
+        let waits = scope.spawn(|| barrier.wait(LoopSite::LeafWrite));
         key_waiters(&barrier, 1);
         hold.release(1);
         waits.join().unwrap();
     });
     assert_eq!(count(&volume.writer.loop_waits), 1);
     // A wait that finds everything returned is no wait.
-    barrier.wait();
+    barrier.wait(LoopSite::LeafWrite);
     assert_eq!(job.read(path.clone(), 3, 4).unwrap(), b"tern");
     assert_eq!(count(&volume.writer.loop_waits), 1);
-    job.write(1, 7, Bytes::from_static(b"s"), None);
+    job.write(LoopSite::LeafWrite, 1, 7, Bytes::from_static(b"s"), None);
     let after = job.barrier();
     hold.wait_held();
     std::thread::scope(|scope| {
@@ -1131,6 +1419,56 @@ fn the_loops_wait_and_read_are_each_counted_once() {
         assert_eq!(reads.join().unwrap(), b"lanterns");
     });
     assert_eq!(count(&volume.writer.loop_waits), 2);
+}
+
+// A wait is counted under the site its caller named: two waits of one kind
+// from two places are one each, at their own site, and none at any other.
+#[test]
+fn a_wait_from_each_of_two_sites_is_counted_under_its_own_site() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a");
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    let hold = writers.hold(&volume);
+    let job = writers.test_submitter(&volume, 1);
+    for (offset, bytes, site) in [
+        (0, &b"lamp"[..], LoopSite::LeafWrite),
+        (4, &b"wick"[..], LoopSite::LeafRelease),
+    ] {
+        let create = (offset == 0).then(|| create(&path)).flatten();
+        job.write(LoopSite::LeafWrite, 1, offset, Bytes::from(bytes), create);
+        let barrier = job.barrier();
+        hold.wait_held();
+        std::thread::scope(|scope| {
+            let waits = scope.spawn(|| barrier.wait(site));
+            key_waiters(&barrier, 1);
+            hold.release(1);
+            waits.join().unwrap();
+        });
+    }
+    let at = |site: LoopSite| {
+        count(&volume.writer.loop_waits_by_site[LoopWait::Settle as usize][site as usize])
+    };
+    assert_eq!(at(LoopSite::LeafWrite), 1);
+    assert_eq!(at(LoopSite::LeafRelease), 1);
+    let elsewhere: u64 = LoopWait::ALL
+        .iter()
+        .flat_map(|kind| LoopSite::ALL.iter().map(move |site| (*kind, *site)))
+        .filter(|&(kind, site)| {
+            !(kind == LoopWait::Settle
+                && matches!(site, LoopSite::LeafWrite | LoopSite::LeafRelease))
+        })
+        .map(|(kind, site)| count(&volume.writer.loop_waits_by_site[kind as usize][site as usize]))
+        .sum();
+    assert_eq!(elsewhere, 0);
+    assert_eq!(count(&volume.writer.loop_waits), 2);
+    let snapshot = crate::operations::disk::volume_rate::writer_counts(&volume);
+    assert_eq!(snapshot.loop_waits_by_site[1][0], 1);
+    assert_eq!(snapshot.loop_waits_by_site[1][1], 1);
+    assert_eq!(LoopSite::LeafRelease.label(), "leaf_release");
+    hold.open();
+    writers.settle();
+    assert_eq!(std::fs::read(&path).unwrap(), b"lampwick");
 }
 
 // The wait ends when the key stops, whatever still waits for the writer: by
@@ -1149,10 +1487,28 @@ fn a_producers_wait_ends_when_its_key_fails_or_is_given_up() {
     let failing = writers.test_submitter(&volume, 1);
     let given_up = writers.test_submitter(&volume, 2);
     let other = writers.test_submitter(&volume, 3);
-    failing.write(1, 0, Bytes::from_static(b"lost"), create(&failing_path));
+    failing.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"lost"),
+        create(&failing_path),
+    );
     hold.wait_held();
-    given_up.write(1, 0, Bytes::from_static(b"gone"), create(&given_path));
-    other.write(1, 0, Bytes::from_static(b"kept"), create(&other_path));
+    given_up.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"gone"),
+        create(&given_path),
+    );
+    other.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"kept"),
+        create(&other_path),
+    );
     std::thread::scope(|scope| {
         let after_failure = scope.spawn(|| failing.wait_below(0));
         let after_giving_up = scope.spawn(|| given_up.wait_below(0));
@@ -1188,7 +1544,13 @@ fn a_stop_ends_the_waits_of_producers_and_readers_on_a_volume_that_stands_still(
     let (volume, later) = (volume("one"), volume("two"));
     let hold = writers.hold(&volume);
     let job = writers.test_submitter(&volume, 1);
-    job.write(1, 0, Bytes::from_static(b"held"), create(&path));
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"held"),
+        create(&path),
+    );
     hold.wait_held();
     let barrier = job.barrier();
     std::thread::scope(|scope| {
@@ -1211,6 +1573,7 @@ fn a_stop_ends_the_waits_of_producers_and_readers_on_a_volume_that_stands_still(
     let later_hold = writers.hold(&later);
     let other = writers.test_submitter(&later, 2);
     other.write(
+        LoopSite::LeafWrite,
         1,
         0,
         Bytes::from_static(b"more"),
@@ -1240,7 +1603,13 @@ fn the_loops_wait_on_a_limit_outlasts_the_stop_and_ends_at_the_stops_end() {
     let volume = volume("one");
     let hold = writers.hold(&volume);
     let job = writers.test_submitter(&volume, 1);
-    job.write(1, 0, Bytes::from_static(b"held"), create(&path));
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"held"),
+        create(&path),
+    );
     hold.wait_held();
     // The four bytes held fill the volume: one more does not fit.
     volume.set_buffer_limits(4, 4);
@@ -1249,7 +1618,7 @@ fn the_loops_wait_on_a_limit_outlasts_the_stop_and_ends_at_the_stops_end() {
     writers.end_waits_at(Arc::clone(&clock) as Arc<dyn Clock>, clock.instant(end));
     std::thread::scope(|scope| {
         let producer = scope.spawn(|| job.wait_below(0));
-        let looped = scope.spawn(|| job.wait_room(1));
+        let looped = scope.spawn(|| job.wait_room(LoopSite::LeafWrite, 1));
         hold.wait_below_waiters(2);
         // The loop's wait read the clock once before it stood still.
         clock.wait_looks(1);
@@ -1266,12 +1635,12 @@ fn the_loops_wait_on_a_limit_outlasts_the_stop_and_ends_at_the_stops_end() {
     assert!(job.gave_up());
     assert_eq!(count(&volume.buffered_bytes), 4);
     // Past the end the loop does not stand still again, and queues nothing.
-    assert!(!job.wait_room(1));
+    assert!(!job.wait_room(LoopSite::LeafWrite, 1));
     hold.open();
     writers.settle();
     assert_eq!(std::fs::read(&path).unwrap(), b"held");
     // With room the loop's wait says so, whatever the clock reads.
-    assert!(job.wait_room(1));
+    assert!(job.wait_room(LoopSite::LeafWrite, 1));
 }
 
 // The loop's read of a file whose writes sit on a stuck volume does not
@@ -1288,7 +1657,13 @@ fn the_loops_read_of_a_stuck_volume_ends_at_the_stops_end() {
     let volume = volume("one");
     let hold = writers.hold(&volume);
     let job = writers.test_submitter(&volume, 1);
-    let wrote = job.write(1, 0, Bytes::from_static(b"held"), create(&path));
+    let wrote = job.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"held"),
+        create(&path),
+    );
     hold.wait_held();
     let barrier = job.barrier_at(wrote);
     let clock = Arc::new(ManualClock::default());
@@ -1319,7 +1694,7 @@ fn the_loops_read_of_a_stuck_volume_ends_at_the_stops_end() {
     assert!(job.gave_up());
     assert!(!barrier.failed(), "nothing of the key failed");
     // Past the end the loop does not stand again.
-    barrier.wait();
+    barrier.wait(LoopSite::LeafWrite);
     assert!(barrier.unwritten());
     assert!(job.read_after(wrote, path.clone(), 0, 4).is_err());
     hold.open();
@@ -1339,6 +1714,7 @@ fn a_producer_does_not_wait_on_a_volume_with_no_thread() {
     volume.buffered_bytes.store(64, Ordering::SeqCst);
     job.wait_below(0);
     job.write(
+        LoopSite::LeafWrite,
         1,
         0,
         Bytes::from_static(b"lost"),
@@ -1388,6 +1764,7 @@ fn a_refused_name_is_not_a_failed_barrier() {
     let volume = volume("one");
     let job = writers.test_submitter(&volume, 1);
     job.write(
+        LoopSite::LeafWrite,
         1,
         0,
         Bytes::from_static(b"name"),
@@ -1399,7 +1776,7 @@ fn a_refused_name_is_not_a_failed_barrier() {
         }),
     );
     // The later writes of the refused file are dropped without a word.
-    job.write(1, 4, Bytes::from_static(b"more"), None);
+    job.write(LoopSite::LeafWrite, 1, 4, Bytes::from_static(b"more"), None);
     let barrier = job.barrier();
     barrier.wait_aside();
     assert!(!barrier.failed() && !barrier.passed());
@@ -1420,11 +1797,23 @@ fn a_write_to_a_file_that_is_not_open_fails_its_key() {
     let (writers, reports) = writers();
     let volume = volume("one");
     let job = writers.test_submitter(&volume, 1);
-    job.write(1, 0, Bytes::from_static(b"head"), create(&path));
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"head"),
+        create(&path),
+    );
     job.release(1);
     // The handle is closed, and this write brings no way to open it again.
-    job.write(1, 4, Bytes::from_static(b"tail"), None);
-    job.write(2, 0, Bytes::from_static(b"never"), create(&after));
+    job.write(LoopSite::LeafWrite, 1, 4, Bytes::from_static(b"tail"), None);
+    job.write(
+        LoopSite::LeafWrite,
+        2,
+        0,
+        Bytes::from_static(b"never"),
+        create(&after),
+    );
     let barrier = job.barrier();
     barrier.wait_aside();
     assert!(barrier.failed());
@@ -1473,12 +1862,13 @@ fn a_batchs_failures_are_reported_before_a_settle_of_it_can_end() {
     let job = writers.test_submitter(&volume, 1);
     *lane.lock().unwrap() = Some(Arc::clone(&job.lane));
     job.write(
+        LoopSite::LeafWrite,
         1,
         0,
         Bytes::from_static(b"kept"),
         create(&dir.path().join("a")),
     );
-    job.write(1, 4, Bytes::from_static(b"lost"), None);
+    job.write(LoopSite::LeafWrite, 1, 4, Bytes::from_static(b"lost"), None);
     hold.wait_held();
     hold.release(1);
     hold.wait_held();
@@ -1502,6 +1892,7 @@ fn a_failure_on_a_volume_with_no_thread_is_reported_before_a_settle_can_end() {
     *lane.lock().unwrap() = Some(Arc::clone(&job.lane));
 
     job.write(
+        LoopSite::LeafWrite,
         1,
         0,
         Bytes::from_static(b"lost"),
@@ -1550,7 +1941,13 @@ fn the_volumes_own_work_runs_only_when_nothing_is_queued() {
         "not ahead of the job's first write"
     );
     // The job's write comes down first. Out of work, the writer runs it.
-    job.write(1, 0, Bytes::from_static(b"first"), create(&path));
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"first"),
+        create(&path),
+    );
     assert_eq!(begun.recv().unwrap().as_deref(), Some(&b"first"[..]));
     // A settle does not wait for it.
     writers.settle();
@@ -1567,9 +1964,15 @@ fn the_volumes_own_work_runs_only_when_nothing_is_queued() {
     job.release(1);
     watch.wait_parked();
     assert!(ran_again.try_recv().is_err(), "a handle closed is not work");
-    job.write(1, 5, Bytes::from_static(b"later"), create(&path));
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        5,
+        Bytes::from_static(b"later"),
+        create(&path),
+    );
     ran_again.recv().unwrap();
-    job.barrier().wait();
+    job.barrier().wait(LoopSite::LeafWrite);
     assert_eq!(std::fs::read(&path).unwrap(), b"firstlater");
 
     // On a volume no caller holds it runs at once.
@@ -1591,6 +1994,7 @@ fn the_volumes_own_work_is_dropped_at_a_stop() {
     let hold = writers.hold(&volume);
     let job = writers.test_submitter(&volume, 1);
     job.write(
+        LoopSite::LeafWrite,
         1,
         0,
         Bytes::from_static(b"kept"),
@@ -1605,7 +2009,7 @@ fn the_volumes_own_work_is_dropped_at_a_stop() {
         .when_idle(move || ran.send(()).unwrap());
     writers.stop_waits();
     hold.open();
-    job.barrier().wait();
+    job.barrier().wait(LoopSite::LeafWrite);
     assert_eq!(std::fs::read(dir.path().join("a")).unwrap(), b"kept");
     drop(job);
     drop(hold);
@@ -1626,8 +2030,14 @@ fn a_write_is_counted_as_its_call_returns_not_at_the_end_of_its_batch() {
     let job = writers.test_submitter(&volume, 1);
     job.run(None, dir.path().to_path_buf(), || Ok(()));
     hold.wait_held();
-    job.write(1, 0, Bytes::from_static(b"lan"), create(&path));
-    job.write(1, 3, Bytes::from_static(b"tern"), None);
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"lan"),
+        create(&path),
+    );
+    job.write(LoopSite::LeafWrite, 1, 3, Bytes::from_static(b"tern"), None);
     // The held operation, then the first write of the batch behind it.
     hold.release(2);
     hold.wait_held();
@@ -1635,7 +2045,7 @@ fn a_write_is_counted_as_its_call_returns_not_at_the_end_of_its_batch() {
     assert_eq!(count(&volume.write_calls), 1);
     assert_eq!(count(&volume.writer.batches), 1, "the batch has not ended");
     hold.open();
-    job.barrier().wait();
+    job.barrier().wait(LoopSite::LeafWrite);
     assert_eq!(count(&volume.written_bytes), 7);
     assert_eq!(count(&volume.write_calls), 2);
     assert_eq!(
@@ -1660,10 +2070,22 @@ fn a_batch_stops_taking_writes_at_its_byte_cap() {
     job.run(None, dir.path().to_path_buf(), || Ok(()));
     hold.wait_held();
     let big = BATCH_BYTES as usize;
-    job.write(1, 0, Bytes::from(vec![7u8; big]), create(&path));
-    job.write(1, big as u64, Bytes::from_static(b"end"), None);
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from(vec![7u8; big]),
+        create(&path),
+    );
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        big as u64,
+        Bytes::from_static(b"end"),
+        None,
+    );
     hold.open();
-    job.barrier().wait();
+    job.barrier().wait(LoopSite::LeafWrite);
     assert_eq!(std::fs::metadata(&path).unwrap().len(), big as u64 + 3);
     // A batch is counted after its operations return: wait for the thread
     // to stand with nothing queued.
@@ -1689,12 +2111,32 @@ fn a_write_on_a_full_volume_waits_for_room_and_never_counts_past_the_limit() {
     assert_eq!(volume.write_piece(), 100);
     let hold = writers.hold(&volume);
     let job = writers.test_submitter(&volume, 1);
-    job.write(1, 0, Bytes::from(vec![1u8; 1000]), create(&path));
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from(vec![1u8; 1000]),
+        create(&path),
+    );
     hold.wait_held();
-    job.write(1, 1000, Bytes::from(vec![2u8; 600]), None);
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        1000,
+        Bytes::from(vec![2u8; 600]),
+        None,
+    );
     assert_eq!(volume.unwritten_bytes(), 1600);
     std::thread::scope(|scope| {
-        let next = scope.spawn(|| job.write(1, 1600, Bytes::from(vec![3u8; 40]), None));
+        let next = scope.spawn(|| {
+            job.write(
+                LoopSite::LeafWrite,
+                1,
+                1600,
+                Bytes::from(vec![3u8; 40]),
+                None,
+            )
+        });
         hold.wait_below_waiters(1);
         assert_eq!(volume.unwritten_bytes(), 1600, "nothing more was queued");
         assert_eq!(count(&volume.buffered_bytes), 1600);
@@ -1732,14 +2174,20 @@ fn a_write_takes_what_was_prepaid_first_and_goes_in_pieces_past_it() {
     held.count(10);
     let prepaid = writers.test_owner().prepay(&mut held, 10);
     assert_eq!(held.bytes(), 0, "the reservation handed its bytes on");
-    job.write(1, 0, Bytes::from(vec![1u8; 10]), create(&path));
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from(vec![1u8; 10]),
+        create(&path),
+    );
     assert_eq!(volume.unwritten_bytes(), 10, "what was prepaid paid for it");
     assert_eq!(prepaid.settle(), 0, "the write took all of it");
     hold.wait_held();
     // Two prepaid, then eighteen past it: pieces of 6, 4, 4, 4 and 2.
     held.count(2);
     let prepaid = writers.test_owner().prepay(&mut held, 2);
-    job.write(1, 10, Bytes::from(vec![2u8; 20]), None);
+    job.write(LoopSite::LeafWrite, 1, 10, Bytes::from(vec![2u8; 20]), None);
     assert_eq!(prepaid.settle(), 0);
     assert_eq!(volume.unwritten_bytes(), 30);
     assert_eq!(count(&volume.writer.operations), 0);
@@ -1771,7 +2219,13 @@ fn a_write_given_up_at_the_stops_end_leaves_nothing_counted() {
     assert_eq!(volume.write_piece(), 4);
     let hold = writers.hold(&volume);
     let job = writers.test_submitter(&volume, 1);
-    job.write(1, 0, Bytes::from(vec![1u8; 60]), create(&path));
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from(vec![1u8; 60]),
+        create(&path),
+    );
     assert_eq!(volume.unwritten_bytes(), 60);
     hold.wait_held();
     let clock = Arc::new(ManualClock::default());
@@ -1784,7 +2238,7 @@ fn a_write_given_up_at_the_stops_end_leaves_nothing_counted() {
     let mut held = Reservation::none(Arc::clone(&volume));
     held.count(2);
     let prepaid = writers.test_owner().prepay(&mut held, 2);
-    job.write(1, 60, Bytes::from(vec![2u8; 10]), None);
+    job.write(LoopSite::LeafWrite, 1, 60, Bytes::from(vec![2u8; 10]), None);
     assert!(job.gave_up());
     assert_eq!(prepaid.settle(), 0, "the write took what was prepaid");
     assert_eq!(
@@ -1851,6 +2305,7 @@ fn a_close_sets_the_length_only_where_the_file_is_not_at_it() {
         let path = dir.path().join(name);
         let file = at as u64 + 1;
         job.write(
+            LoopSite::LeafWrite,
             file,
             0,
             Bytes::from_static(bytes),
@@ -1860,7 +2315,7 @@ fn a_close_sets_the_length_only_where_the_file_is_not_at_it() {
         job.release(file);
     }
     let barrier = job.barrier();
-    barrier.wait();
+    barrier.wait(LoopSite::LeafWrite);
     assert!(barrier.passed());
     for (name, _, _, bytes, length) in files {
         let read = std::fs::read(dir.path().join(name)).unwrap();
@@ -1917,6 +2372,7 @@ fn close_through_the_graphs_opener() -> (u64, u64) {
     let volume = volume("one");
     let job = writers.test_submitter(&volume, 1);
     job.write(
+        LoopSite::LeafWrite,
         1,
         0,
         Bytes::from_static(b"lanterns"),
@@ -1924,6 +2380,7 @@ fn close_through_the_graphs_opener() -> (u64, u64) {
     );
     job.close(1, 8, made_by(&whole, 8, graphs_opener));
     job.write(
+        LoopSite::LeafWrite,
         2,
         0,
         Bytes::from_static(b"embers"),
@@ -1931,7 +2388,7 @@ fn close_through_the_graphs_opener() -> (u64, u64) {
     );
     job.close(2, 5, made_by(&short, 5, graphs_opener));
     let barrier = job.barrier();
-    barrier.wait();
+    barrier.wait(LoopSite::LeafWrite);
     assert!(barrier.passed());
     assert_eq!(std::fs::read(&whole).unwrap(), b"lanterns");
     assert_eq!(std::fs::read(&short).unwrap(), b"ember");
@@ -1950,11 +2407,17 @@ fn a_truncated_file_is_known_to_be_empty() {
     let (writers, _reports) = writers();
     let volume = volume("one");
     let job = writers.test_submitter(&volume, 1);
-    job.write(1, 0, Bytes::from_static(b"lantern"), create(&path));
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"lantern"),
+        create(&path),
+    );
     job.truncate(1, made_by(&path, 0, open));
     job.close(1, 0, made_by(&path, 0, open));
     let barrier = job.barrier();
-    barrier.wait();
+    barrier.wait(LoopSite::LeafWrite);
     assert!(barrier.passed());
     assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
     assert_eq!(count(&volume.writer.length_sets), 1);
@@ -1975,6 +2438,7 @@ fn opens_length_sets_and_drops_are_timed() {
     job.run(None, dir.path().to_path_buf(), || Ok(()));
     hold.wait_held();
     job.write(
+        LoopSite::LeafWrite,
         1,
         0,
         Bytes::from_static(b"lan"),
@@ -1982,6 +2446,7 @@ fn opens_length_sets_and_drops_are_timed() {
     );
     job.close(1, 7, made_by(&first, 7, open_slowly));
     job.write(
+        LoopSite::LeafWrite,
         2,
         0,
         Bytes::from_static(b"wick"),
@@ -1992,7 +2457,7 @@ fn opens_length_sets_and_drops_are_timed() {
     job.release(2);
     let barrier = job.barrier();
     hold.open();
-    barrier.wait();
+    barrier.wait(LoopSite::LeafWrite);
     assert!(barrier.passed());
     let writer = &volume.writer;
     let second_ns = Duration::from_secs(1).as_nanos() as u64;
@@ -2025,8 +2490,20 @@ fn a_closed_file_is_placed_before_another_files_open() {
     // The thread stands in a batch of its own before what follows comes.
     other.run(None, dir.path().to_path_buf(), || Ok(()));
     hold.wait_held();
-    other.write(1, 0, Bytes::from_static(b"more"), create(&other_path));
-    closing.write(1, 0, Bytes::from_static(b"head"), create(&closed_path));
+    other.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"more"),
+        create(&other_path),
+    );
+    closing.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"head"),
+        create(&closed_path),
+    );
     closing.close(
         1,
         4,
@@ -2047,7 +2524,7 @@ fn a_closed_file_is_placed_before_another_files_open() {
     assert!(!other_path.exists(), "the other file is not opened yet");
     assert_eq!(std::fs::read(&closed_path).unwrap(), b"head");
     hold.open();
-    other.barrier().wait();
+    other.barrier().wait(LoopSite::LeafWrite);
     assert_eq!(std::fs::read(&other_path).unwrap(), b"more");
 }
 
@@ -2063,14 +2540,26 @@ fn an_open_files_write_is_placed_before_another_files_make() {
     let writing = writers.test_submitter(&volume, 1);
     let making = writers.test_submitter(&volume, 2);
     // The file is opened in a batch of its own.
-    writing.write(1, 0, Bytes::from_static(b"head"), create(&open_path));
+    writing.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"head"),
+        create(&open_path),
+    );
     hold.wait_held();
     hold.release(1);
     // The thread stands in a batch of its own before what follows comes.
     making.run(None, dir.path().to_path_buf(), || Ok(()));
     hold.wait_held();
-    making.write(1, 0, Bytes::from_static(b"more"), create(&made_path));
-    writing.write(1, 4, Bytes::from_static(b"tail"), None);
+    making.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"more"),
+        create(&made_path),
+    );
+    writing.write(LoopSite::LeafWrite, 1, 4, Bytes::from_static(b"tail"), None);
     hold.release(1);
     hold.wait_held();
     // One operation of the batch runs: the open file's write.
@@ -2080,8 +2569,8 @@ fn an_open_files_write_is_placed_before_another_files_make() {
     assert!(!written.unwritten(), "the open file's write is placed");
     assert!(!made_path.exists(), "the other file is not made yet");
     hold.open();
-    making.barrier().wait();
-    written.wait();
+    making.barrier().wait(LoopSite::LeafWrite);
+    written.wait(LoopSite::LeafWrite);
     assert_eq!(std::fs::read(&made_path).unwrap(), b"more");
     assert_eq!(std::fs::read(&open_path).unwrap(), b"headtail");
 }
@@ -2096,21 +2585,39 @@ fn a_closed_file_written_and_closed_again_is_opened_once() {
     let (writers, _reports) = writers();
     let volume = volume("one");
     let job = writers.test_submitter(&volume, 1);
-    job.write(1, 0, Bytes::from_static(b"head"), create(&path));
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"head"),
+        create(&path),
+    );
     job.close(1, 8, made_by(&path, 8, open));
     job.close(1, 8, made_by(&path, 8, open));
-    job.write(1, 4, Bytes::from_static(b"tail"), create(&path));
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        4,
+        Bytes::from_static(b"tail"),
+        create(&path),
+    );
     job.close(1, 8, made_by(&path, 8, open));
     job.truncate(1, made_by(&path, 0, open));
-    job.write(1, 0, Bytes::from_static(b"lanterns"), create(&path));
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"lanterns"),
+        create(&path),
+    );
     job.close(1, 8, made_by(&path, 8, open));
-    job.barrier().wait();
+    job.barrier().wait(LoopSite::LeafWrite);
     assert!(job.barrier().passed());
     assert_eq!(std::fs::read(&path).unwrap(), b"lanterns");
     assert_eq!(count(&volume.writer.opens), 1);
     assert_eq!(count(&volume.writer.closes), 0);
     job.release(1);
-    job.barrier().wait();
+    job.barrier().wait(LoopSite::LeafWrite);
     assert_eq!(count(&volume.writer.closes), 1);
     assert!(job.barrier().key.held().open.is_empty());
 }
@@ -2124,7 +2631,13 @@ fn a_move_and_a_removal_drop_a_closed_files_handle_before_they_run() {
     let (writers, _reports) = writers();
     let volume = volume("one");
     let job = writers.test_submitter(&volume, 1);
-    job.write(1, 0, Bytes::from_static(b"head"), create(&from));
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from_static(b"head"),
+        create(&from),
+    );
     job.close(1, 4, made_by(&from, 4, open));
     let (seen, moved_from, moved_to) = (Arc::clone(&volume), from.clone(), to.clone());
     let dropped = Arc::new(AtomicU64::new(u64::MAX));
@@ -2133,14 +2646,20 @@ fn a_move_and_a_removal_drop_a_closed_files_handle_before_they_run() {
         told.store(count(&seen.writer.closes), Ordering::SeqCst);
         std::fs::rename(&moved_from, &moved_to)
     });
-    job.barrier().wait();
+    job.barrier().wait(LoopSite::LeafWrite);
     assert!(job.barrier().passed());
     assert_eq!(
         dropped.load(Ordering::SeqCst),
         1,
         "the move ran on a held handle"
     );
-    job.write(1, 4, Bytes::from_static(b"tail"), create(&to));
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        4,
+        Bytes::from_static(b"tail"),
+        create(&to),
+    );
     job.close(1, 8, made_by(&to, 8, open));
     let (seen, removed) = (Arc::clone(&volume), to.clone());
     let told = Arc::clone(&dropped);
@@ -2148,7 +2667,7 @@ fn a_move_and_a_removal_drop_a_closed_files_handle_before_they_run() {
         told.store(count(&seen.writer.closes), Ordering::SeqCst);
         std::fs::remove_file(&removed)
     });
-    job.barrier().wait();
+    job.barrier().wait(LoopSite::LeafWrite);
     assert!(job.barrier().passed());
     assert_eq!(
         dropped.load(Ordering::SeqCst),
@@ -2168,10 +2687,16 @@ fn a_keys_end_drops_its_closed_files_handles() {
     let job = writers.test_submitter(&volume, 1);
     for file in 1..=3u64 {
         let path = dir.path().join(file.to_string());
-        job.write(file, 0, Bytes::from_static(b"head"), create(&path));
+        job.write(
+            LoopSite::LeafWrite,
+            file,
+            0,
+            Bytes::from_static(b"head"),
+            create(&path),
+        );
         job.close(file, 4, made_by(&path, 4, open));
     }
-    job.barrier().wait();
+    job.barrier().wait(LoopSite::LeafWrite);
     assert_eq!(count(&volume.writer.closes), 0);
     drop(job);
     writers.wait_ended(&volume);
@@ -2190,29 +2715,42 @@ fn a_key_keeps_a_bounded_number_of_closed_files_handles() {
     let kept = super::KEPT_CLOSED as u64;
     let path = |file: u64| dir.path().join(file.to_string());
     for file in 1..=kept + 1 {
-        job.write(file, 0, Bytes::from_static(b"head"), create(&path(file)));
+        job.write(
+            LoopSite::LeafWrite,
+            file,
+            0,
+            Bytes::from_static(b"head"),
+            create(&path(file)),
+        );
         job.close(file, 4, made_by(&path(file), 4, open));
     }
-    job.barrier().wait();
+    job.barrier().wait(LoopSite::LeafWrite);
     assert!(job.barrier().passed());
     assert_eq!(count(&volume.writer.opens), kept + 1);
     assert_eq!(count(&volume.writer.closes), 1);
     assert_eq!(job.barrier().key.held().open.len() as u64, kept);
     assert!(!job.barrier().key.held().open.contains_key(&1));
     job.write(
+        LoopSite::LeafWrite,
         kept + 1,
         4,
         Bytes::from_static(b"tail"),
         create(&path(kept + 1)),
     );
-    job.barrier().wait();
+    job.barrier().wait(LoopSite::LeafWrite);
     assert_eq!(
         count(&volume.writer.opens),
         kept + 1,
         "the newest stayed open"
     );
-    job.write(1, 4, Bytes::from_static(b"tail"), create(&path(1)));
-    job.barrier().wait();
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        4,
+        Bytes::from_static(b"tail"),
+        create(&path(1)),
+    );
+    job.barrier().wait(LoopSite::LeafWrite);
     assert_eq!(
         count(&volume.writer.opens),
         kept + 2,
@@ -2233,27 +2771,39 @@ fn a_closed_file_written_again_leaves_the_closed_files() {
     let kept = super::KEPT_CLOSED as u64;
     let path = |file: u64| dir.path().join(file.to_string());
     let close = |file: u64| {
-        job.write(file, 0, Bytes::from_static(b"head"), create(&path(file)));
+        job.write(
+            LoopSite::LeafWrite,
+            file,
+            0,
+            Bytes::from_static(b"head"),
+            create(&path(file)),
+        );
         job.close(file, 4, made_by(&path(file), 4, open));
     };
     // The closed files are full, and the oldest is written again.
     for file in 1..=kept {
         close(file);
     }
-    job.barrier().wait();
+    job.barrier().wait(LoopSite::LeafWrite);
     // The thread stands in a batch of its own before what follows comes,
     // so the write and the two closes after it are one batch, which runs
     // the closes first.
     let hold = writers.hold(&volume);
     job.run(None, dir.path().to_path_buf(), || Ok(()));
     hold.wait_held();
-    job.write(1, 4, Bytes::from_static(b"tail"), create(&path(1)));
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        4,
+        Bytes::from_static(b"tail"),
+        create(&path(1)),
+    );
     // Two more closed: the first fills the place the written file left,
     // the second passes the bound.
     close(kept + 1);
     close(kept + 2);
     hold.open();
-    job.barrier().wait();
+    job.barrier().wait(LoopSite::LeafWrite);
     assert!(job.barrier().passed());
     assert_eq!(
         count(&volume.writer.opens),
@@ -2270,7 +2820,7 @@ fn a_closed_file_written_again_leaves_the_closed_files() {
     drop(held);
     // Closed again, it goes in at the newest end.
     job.close(1, 8, made_by(&path(1), 8, open));
-    job.barrier().wait();
+    job.barrier().wait(LoopSite::LeafWrite);
     assert_eq!(count(&volume.writer.closes), 2);
     let barrier = job.barrier();
     let held = barrier.key.held();
@@ -2312,7 +2862,7 @@ fn write_pieces(
     let mut at = at;
     for _ in 0..pieces {
         let opens = (at == 0).then(|| create(path)).flatten();
-        job.write(file, at, piece.clone(), opens);
+        job.write(LoopSite::LeafWrite, file, at, piece.clone(), opens);
         at += piece.len() as u64;
     }
     at
@@ -2334,25 +2884,25 @@ fn a_share_starts_a_files_write_out_at_each_stride_of_its_writes() {
     // neither file at a stride.
     let mut a = write_pieces(&job, 1, &first, 0, 3, &piece);
     let mut b = write_pieces(&job, 2, &second, 0, 2, &piece);
-    job.barrier().wait();
+    job.barrier().wait(LoopSite::LeafWrite);
     assert!(seen.lock().unwrap().is_empty(), "no file reached a stride");
     // The fourth piece takes the first file to its stride.
     a = write_pieces(&job, 1, &first, a, 1, &piece);
-    job.barrier().wait();
+    job.barrier().wait(LoopSite::LeafWrite);
     assert_eq!(*seen.lock().unwrap(), vec![(first.clone(), 32 * MIB)]);
     // Two more take the second to its own.
     b = write_pieces(&job, 2, &second, b, 2, &piece);
-    job.barrier().wait();
+    job.barrier().wait(LoopSite::LeafWrite);
     assert_eq!(
         seen.lock().unwrap().last(),
         Some(&(second.clone(), 32 * MIB))
     );
     // The first file counts again from its last write-out.
     a = write_pieces(&job, 1, &first, a, 3, &piece);
-    job.barrier().wait();
+    job.barrier().wait(LoopSite::LeafWrite);
     assert_eq!(seen.lock().unwrap().len(), 2);
     write_pieces(&job, 1, &first, a, 1, &piece);
-    job.barrier().wait();
+    job.barrier().wait(LoopSite::LeafWrite);
     assert_eq!(
         *seen.lock().unwrap(),
         vec![
@@ -2381,12 +2931,12 @@ fn a_refused_write_out_stops_them_on_the_volume_and_fails_nothing() {
     let job = writers.test_submitter(&volume, 1);
     let piece = Bytes::from(vec![7u8; (8 * MIB) as usize]);
     let a = write_pieces(&job, 1, &first, 0, 4, &piece);
-    job.barrier().wait();
+    job.barrier().wait(LoopSite::LeafWrite);
     assert_eq!(*seen.lock().unwrap(), vec![(first.clone(), 32 * MIB)]);
     // Past another stride of the first file and a whole one of the second.
     let a = write_pieces(&job, 1, &first, a, 4, &piece);
     let b = write_pieces(&job, 2, &second, 0, 4, &piece);
-    job.barrier().wait();
+    job.barrier().wait(LoopSite::LeafWrite);
     assert_eq!(seen.lock().unwrap().len(), 1, "asked once, then never");
     assert_eq!(count(&volume.writer.write_outs), 1);
     let barrier = job.barrier();
@@ -2411,7 +2961,7 @@ fn a_local_volume_starts_no_write_out() {
     let job = writers.test_submitter(&volume, 1);
     let piece = Bytes::from(vec![7u8; (8 * MIB) as usize]);
     write_pieces(&job, 1, &path, 0, 8, &piece);
-    job.barrier().wait();
+    job.barrier().wait(LoopSite::LeafWrite);
     assert!(job.barrier().passed());
     assert_eq!(count(&volume.writer.write_outs), 0);
     assert_eq!(count(&volume.writer.write_out_nanos), 0);
@@ -2434,9 +2984,21 @@ fn a_write_paid_where_it_lands_never_stops_the_queuing_thread() {
     share.set_buffer_limits(1600, 1600);
     let hold = writers.hold(&share);
     let job = writers.test_submitter(&share, 1);
-    job.write(1, 0, Bytes::from(vec![1u8; 1000]), create(&path));
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from(vec![1u8; 1000]),
+        create(&path),
+    );
     hold.wait_held();
-    job.write(1, 1000, Bytes::from(vec![2u8; 600]), None);
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        1000,
+        Bytes::from(vec![2u8; 600]),
+        None,
+    );
     assert_eq!(share.unwritten_bytes(), 1600);
     let waits_before = budget_waits(&share);
     let credit = std::thread::scope(|scope| {
@@ -2452,7 +3014,7 @@ fn a_write_paid_where_it_lands_never_stops_the_queuing_thread() {
     let paying = credit.prepay();
     let article = Bytes::from(vec![3u8; 400]);
     let kept = article.clone();
-    job.write(1, 1600, article, None);
+    job.write(LoopSite::LeafWrite, 1, 1600, article, None);
     let credit = paying.settle(|_| 0);
     assert!(credit.is_empty(), "the write took all of the credit");
     assert_eq!(share.unwritten_bytes(), 1500, "counted once, ahead");
@@ -2490,7 +3052,13 @@ fn a_credit_is_freed_where_its_bytes_did_not_land_and_carried_while_held() {
     let credit = Credit::reserve([&first, &second], 100, Stand::UntilStop);
     assert_eq!((one.unwritten_bytes(), two.unwritten_bytes()), (100, 100));
     let paying = credit.prepay();
-    first.write(1, 0, Bytes::from(vec![1u8; 100]), create(&path));
+    first.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from(vec![1u8; 100]),
+        create(&path),
+    );
     let credit = paying.settle(|_| 100);
     assert!(credit.is_empty());
     assert_eq!(one.unwritten_bytes(), 100, "the write's own count");
@@ -2539,13 +3107,13 @@ fn a_credit_given_back_wakes_a_thread_that_stands_for_room() {
     hold.open();
 }
 
-// What the queuing thread carries for a job's output is judged as not
-// counted for that job's own producers only: the queuing thread may need
-// their next output to let go of what it holds, so the volume passes its
-// limit by at most what the job holds. Another job's producer counts the
-// carried bytes in full and stands until they go.
+// What the queuing thread carries for a job's output uses no budget: beside
+// carried bytes at the limit and a byte the writer can write, a producer is
+// granted what fits beside that byte, the job's or another job's, and one
+// that would pass the limit beside what else is counted stands until room
+// is made.
 #[test]
-fn carried_bytes_grant_room_to_their_own_job_only() {
+fn carried_bytes_use_no_budget_beside_a_byte_the_writer_can_write() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a");
     let (writers, _reports) = writers();
@@ -2567,23 +3135,31 @@ fn carried_bytes_grant_room_to_their_own_job_only() {
     );
     assert_eq!(volume.unwritten_bytes(), 74);
     drop(next);
-    // Beside the carried bytes and one byte the writer can write, neither
-    // the job's producer nor another job's is granted room past the limit:
-    // both stand until room is made.
-    job.write(1, 0, Bytes::from(vec![1u8; 1]), create(&path));
-    std::thread::scope(|scope| {
-        let mine = scope.spawn(|| Credit::reserve([&job], 10, Stand::UntilStop));
-        let theirs = scope.spawn(|| Credit::reserve([&other], 10, Stand::UntilStop));
-        hold.wait_below_waiters(2);
-        assert_eq!(
-            volume.unwritten_bytes(),
-            65,
-            "no producer is granted room beside a byte the writer can write"
-        );
-        drop(carried);
-        assert!(mine.join().unwrap().covers(10));
-        assert!(theirs.join().unwrap().covers(10));
+    // Beside the carried bytes and one byte the writer can write, the job's
+    // producer and another job's are granted what fits beside that byte.
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from(vec![1u8; 1]),
+        create(&path),
+    );
+    let mine = Credit::reserve([&job], 10, Stand::UntilStop);
+    assert!(mine.covers(10), "granted beside carried bytes and one byte");
+    let theirs = Credit::reserve([&other], 10, Stand::UntilStop);
+    assert!(theirs.covers(10), "another job's is granted too");
+    assert_eq!(volume.unwritten_bytes(), 85);
+    // 21 counted besides the carried bytes: 50 more would pass the limit,
+    // and stand until room is made.
+    let more = std::thread::scope(|scope| {
+        let more = scope.spawn(|| Credit::reserve([&other], 50, Stand::UntilStop));
+        hold.wait_below_waiters(1);
+        assert_eq!(volume.unwritten_bytes(), 85, "not granted past the limit");
+        drop(mine);
+        more.join().unwrap()
     });
+    assert!(more.covers(50));
+    drop((carried, theirs, more));
     hold.open();
     writers.settle();
     assert_eq!(volume.unwritten_bytes(), 0);
@@ -2608,7 +3184,13 @@ fn a_prepayment_inside_a_credits_step_settles_apart_from_it() {
     let prepaid = writers.test_owner().prepay(&mut held, 10);
     assert_eq!(volume.unwritten_bytes(), 16);
     // The writes take the latest prepayment first.
-    job.write(1, 0, Bytes::from(vec![1u8; 4]), create(&path));
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from(vec![1u8; 4]),
+        create(&path),
+    );
     assert_eq!(prepaid.settle(), 6, "the owner gives back only its own");
     assert_eq!(volume.unwritten_bytes(), 10);
     let left = paying.settle(|_| 0);
@@ -2731,7 +3313,13 @@ fn a_producers_wait_for_room_ends_at_the_stop_or_at_its_end_as_it_stands() {
     volume.set_buffer_limits(64, 64);
     let hold = writers.hold(&volume);
     let job = writers.test_submitter(&volume, 1);
-    job.write(1, 0, Bytes::from(vec![1u8; 60]), create(&path));
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from(vec![1u8; 60]),
+        create(&path),
+    );
     hold.wait_held();
     let clock = Arc::new(ManualClock::default());
     let end = Duration::from_secs(30);
@@ -2779,4 +3367,100 @@ fn a_credit_carried_whole_wakes_a_thread_that_stands_for_room() {
     drop((carried, next));
     assert_eq!(volume.unwritten_bytes(), 0);
     hold.open();
+}
+
+// Two jobs each carry credit on a volume, together at its limit, and each
+// owes a release beside it. Carried bytes use no budget: the first producer
+// is granted past the limit beside them, and the second, which would pass
+// the limit beside the first's bytes, stands until they go, then is
+// granted.
+#[test]
+fn two_jobs_carrying_at_the_limit_are_granted_one_then_the_other() {
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    volume.set_buffer_limits(64, 64);
+    let hold = writers.hold(&volume);
+    let (one, two) = (
+        writers.test_submitter(&volume, 1),
+        writers.test_submitter(&volume, 2),
+    );
+    let first = Credit::reserve([&one], 40, Stand::UntilStop)
+        .prepay()
+        .settle(|_| 40);
+    let second = Credit::reserve([&two], 24, Stand::UntilStop)
+        .prepay()
+        .settle(|_| 24);
+    assert_eq!(volume.carried_bytes(), 64);
+    assert_eq!(volume.unwritten_bytes(), 64);
+    let granted = Credit::reserve([&one], 10, Stand::UntilStop);
+    assert!(granted.covers(10), "granted beside what is all carried");
+    assert_eq!(volume.unwritten_bytes(), 74);
+    let theirs = std::thread::scope(|scope| {
+        let theirs = scope.spawn(|| Credit::reserve([&two], 60, Stand::UntilStop));
+        hold.wait_below_waiters(1);
+        assert_eq!(
+            volume.unwritten_bytes(),
+            74,
+            "not granted past the limit beside an uncarried request"
+        );
+        drop(granted);
+        theirs.join().unwrap()
+    });
+    assert!(theirs.covers(60));
+    assert_eq!(volume.unwritten_bytes(), 124);
+    drop((theirs, first, second));
+    assert_eq!(volume.unwritten_bytes(), 0);
+    hold.open();
+}
+
+// The queuing thread carries credit on a volume and leases fill its budget
+// beside it, with a byte the writer holds: a write past its credit that
+// fits below the limit beside what is counted besides the carried bytes is
+// queued at once, with no wait for room, as the leases were granted.
+#[test]
+fn a_write_past_its_credit_beside_carried_bytes_and_full_leases_does_not_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a");
+    let (writers, _reports) = writers();
+    let volume = volume("one");
+    volume.set_buffer_limits(64, 64);
+    let hold = writers.hold(&volume);
+    let job = writers.test_submitter(&volume, 1);
+    let carried = Credit::reserve([&job], 40, Stand::UntilStop)
+        .prepay()
+        .settle(|_| 40);
+    assert_eq!(volume.carried_bytes(), 40);
+    job.write(
+        LoopSite::LeafWrite,
+        1,
+        0,
+        Bytes::from(vec![1u8; 1]),
+        create(&path),
+    );
+    hold.wait_held();
+    let mut leases = Reservation::none(Arc::clone(&volume));
+    assert!(leases.reserve(53, volume.write_piece()), "the lease budget");
+    assert_eq!(volume.uncarried_bytes(), 54);
+    // A stop whose end has passed: a write that waited for room would give
+    // up at once and say so, rather than stand behind the hold for ever.
+    let clock = Arc::new(ManualClock::default());
+    let end = Duration::from_secs(30);
+    writers.end_waits_at(Arc::clone(&clock) as Arc<dyn Clock>, clock.instant(end));
+    writers.stop_waits();
+    clock.move_to(end);
+    let waits_before = budget_waits(&volume);
+    assert!(volume.fits(10), "54 besides carried bytes, and 10 more fit");
+    job.write(LoopSite::LeafWrite, 1, 1, Bytes::from(vec![2u8; 10]), None);
+    assert!(!job.gave_up(), "the write was queued, not given up");
+    assert_eq!(
+        budget_waits(&volume),
+        waits_before,
+        "the write never waited"
+    );
+    assert_eq!(volume.uncarried_bytes(), 64);
+    assert!(!volume.fits(1), "past the limit beside a byte to write");
+    drop((leases, carried));
+    hold.open();
+    writers.settle();
+    assert_eq!(volume.unwritten_bytes(), 0);
 }

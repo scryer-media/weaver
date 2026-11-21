@@ -780,6 +780,12 @@ impl Object for SevenZipStore {
         Kind::SevenZipStore
     }
 
+    // Stored members take their bytes as they arrive, until I give the
+    // container to an engine or up.
+    fn passes_on(&self) -> bool {
+        !self.gone
+    }
+
     // An entry of a folder that copies, not enciphered: the map takes no
     // other method.
     fn verbatim(&self, member: MemberId) -> bool {

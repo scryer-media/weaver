@@ -5,6 +5,7 @@ use crate::jobs::graph_checkpoint::JobsGraphCheckpointInternalQueries;
 use crate::jobs::persistence::JobsPersistenceQueries;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use weaver_server_disk::operations::disk::volume::LoopSite;
 
 use weaver_graph::{
     ByteRange, CoverageRecord, CryptRecord, Facts, Kind, MemberId, MemberRecord, NodeId,
@@ -1517,7 +1518,7 @@ async fn a_change_held_behind_a_queued_write_is_written_once_its_writes_return()
     .unwrap();
     waiting.await.unwrap();
     arrive(&mut job, 0);
-    disk.barrier().wait();
+    disk.barrier().wait(LoopSite::LeafWrite);
     pending.put(&job, Vec::new());
     pending.queue(&db, id, &mail, true);
     assert!(pending.slot().enqueued);
@@ -1545,7 +1546,7 @@ async fn a_change_held_behind_a_queued_write_is_written_once_its_writes_return()
     // The volume returns the held writes: the job hears, and its write goes.
     let barrier = disk.barrier();
     hold.open();
-    barrier.wait();
+    barrier.wait(LoopSite::LeafWrite);
     let said = heard.recv().await.unwrap();
     assert!(matches!(said.heard, super::Heard::DiskReturned));
     pending.queue_released(&db, id, &mail);

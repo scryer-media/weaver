@@ -1273,8 +1273,8 @@ impl Pipeline {
                 return;
             }
             // What the job counted downloaded is what this checkpoint holds.
-            // None is taken while an object is out for its work.
-            if !graph.working()
+            // None is taken while the job holds it back.
+            if !graph.checkpoint_held()
                 && let Some(state) = self.jobs.get_mut(&job_id)
             {
                 state.checkpointed_download_bytes = state.downloaded_bytes;
@@ -1358,9 +1358,11 @@ impl Pipeline {
 //
 // While an object is out for its work none is taken: its facts as it left
 // hold the work undone, which a restart cannot always do without the tree.
-// The steps stay unread and the checkpoint is owed, so nothing more goes
-// out until one is recorded, and the step that takes the object back takes
-// it. A forced one still queues at once what earlier checkpoints recorded.
+// Nor while a release of held bytes stands, with the closes behind it
+// (`GraphJob::checkpoint_held`). The steps stay unread and the checkpoint
+// is owed, so nothing more goes out until one is recorded, and the step
+// that takes the object back, or pays the release, takes it. A forced one
+// still queues at once what earlier checkpoints recorded.
 pub fn checkpoint_job(
     graph: &mut GraphJob,
     job_id: JobId,
@@ -1371,7 +1373,7 @@ pub fn checkpoint_job(
     force: bool,
 ) -> Result<bool, crate::pipeline::graph::namespace::WriteError> {
     let pending = graph.pending().clone();
-    if graph.working() {
+    if graph.checkpoint_held() {
         graph.owe_checkpoint();
         if force {
             pending.queue(db, job_id, mail, true);

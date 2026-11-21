@@ -20,6 +20,7 @@
 
 use bytes::Bytes;
 use weaver_graph::{Digest, Evidence};
+use weaver_server_disk::operations::disk::volume::LoopSite;
 
 use super::*;
 use crate::pipeline::graph::namespace::recovery::Coming;
@@ -119,7 +120,14 @@ impl NamespaceWriter {
             if open {
                 let mut effects = Vec::new();
                 tree.close(node, member, builder, &mut effects);
-                self.apply_each(tree, builder, segments, effects, Write::Again, out)?;
+                self.apply_each(
+                    tree,
+                    builder,
+                    segments,
+                    effects,
+                    Write::Again(LoopSite::Zeros),
+                    out,
+                )?;
             }
             filled = true;
         }
@@ -251,7 +259,14 @@ impl NamespaceWriter {
                 bytes: Evidenced::with(Bytes::from_static(&ZEROS[..len]), [evidence]),
                 provenance: Provenance::Repaired,
             };
-            self.place(tree, builder, segments, arrival, Write::Again, out)?;
+            self.place(
+                tree,
+                builder,
+                segments,
+                arrival,
+                Write::Again(LoopSite::Zeros),
+                out,
+            )?;
             offset += len as u64;
         }
         Ok(())

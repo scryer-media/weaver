@@ -373,6 +373,11 @@ impl Object for Tar {
         Kind::Tar
     }
 
+    // Entries take their bytes as they arrive, until I refuse the stream.
+    fn passes_on(&self) -> bool {
+        !self.gone
+    }
+
     fn deliver(
         &mut self,
         delivery: Delivery<'_>,

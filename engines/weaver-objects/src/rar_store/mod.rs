@@ -1036,6 +1036,12 @@ impl Object for RarStore {
         Kind::RarStore
     }
 
+    // Stored members take their bytes as they arrive, until I give the set
+    // to an engine or up.
+    fn passes_on(&self) -> bool {
+        !self.gone
+    }
+
     fn facts(&self) -> weaver_graph::Facts {
         facts::of(self)
     }

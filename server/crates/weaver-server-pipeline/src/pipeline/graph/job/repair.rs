@@ -451,12 +451,21 @@ impl GraphJob {
     // Whether the pipeline is to wake the job for the next volume of its
     // give-up: once per volume, and not once the pipeline is stopping,
     // when the give-up waits where it stands and the job keeps the
-    // checkpoint from before it.
+    // checkpoint from before it, nor while a release stands: its paid mail
+    // rings it again (`ring_give_up_again`).
     pub fn ring_give_up(&mut self) -> bool {
-        let stopping = self.works.stopping();
+        let held = self.works.stopping() || self.owed_stands();
         self.quieting
             .as_mut()
-            .is_some_and(|quieting| !stopping && !std::mem::replace(&mut quieting.rung, true))
+            .is_some_and(|quieting| !held && !std::mem::replace(&mut quieting.rung, true))
+    }
+
+    // A release the give-up stood behind was paid: the next turn may wake
+    // the give-up again.
+    pub(super) fn ring_give_up_again(&mut self) {
+        if let Some(quieting) = self.quieting.as_mut() {
+            quieting.rung = false;
+        }
     }
 
     // The next volume of the give-up, on a turn of its own. Once the last
@@ -506,6 +515,12 @@ impl GraphJob {
 
     fn quieten_on(&mut self) -> Result<Option<bool>, GraphError> {
         loop {
+            // A give-up does not go on over held bytes a release owes: it
+            // waits, not yet done, until that release is paid and down.
+            if self.quieting.is_some() && self.owed_stands() {
+                self.pay_release();
+                return Ok(None);
+            }
             if let Some(mut batch) = self.quieting.as_mut().and_then(|q| q.batch.take()) {
                 let done = self.writer.give_up_next(
                     &mut self.tree,
@@ -597,6 +612,9 @@ impl GraphJob {
             || self.tree.rewalks_owed()
             || self.tree.work_due()
             || self.writer.rechecks_waiting()
+            // Held bytes a release still owes, or a close waiting behind
+            // one, are not down yet: nothing is judged quiet over them.
+            || self.owed_stands()
         {
             return false;
         }

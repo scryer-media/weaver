@@ -93,8 +93,18 @@ impl GraphJob {
                 }
             }
             // What a release was counted goes back as it drops; its bytes
-            // stay held with the job.
-            Heard::ReleasePaid(_) => self.releasing = false,
+            // stay held with the job. Only the count the job has out ends it.
+            Heard::ReleasePaid(_) => {
+                if self.releasing == Some(said.generation) {
+                    self.releasing = None;
+                }
+            }
+            // The read owed goes with the job; only the wait out ends here.
+            Heard::ReadSettled => {
+                if self.reading == Some(said.generation) {
+                    self.reading = None;
+                }
+            }
             Heard::Emit(_)
             | Heard::Paid(..)
             | Heard::Ended
@@ -211,18 +221,44 @@ impl GraphJob {
             }
             // What a release of held bytes stood for was counted: the
             // release goes on with it, and what it makes placeable is heard.
-            // One this job did not send is dropped, and what it counted goes
-            // back as it drops.
+            // One this job did not send, or not under the number of the count
+            // it has out, is dropped, and what it counted goes back as it
+            // drops. A give-up that stood behind the release goes on at the
+            // job's next turn.
             Heard::ReleasePaid(credit) => {
-                if !std::mem::take(&mut self.releasing) {
+                if self.releasing != Some(said.generation) {
                     return Ok(());
                 }
+                self.releasing = None;
+                self.ring_give_up_again();
                 let mut out = Vec::new();
                 self.writer.release_paid(
                     &mut self.tree,
                     &mut *self.builder,
                     &self.root,
                     *credit,
+                    &mut out,
+                )?;
+                self.heard(out)?;
+                self.step_runs(Vec::new(), limit)?;
+                return self.lend(slots, limit);
+            }
+            // What a read owed waited for returned: the reads whose writes
+            // are back are made and what they let the objects say is heard.
+            // One not under the number of the wait the job has out is
+            // dropped. A give-up that stood behind the read goes on at the
+            // job's next turn.
+            Heard::ReadSettled => {
+                if self.reading != Some(said.generation) {
+                    return Ok(());
+                }
+                self.reading = None;
+                self.ring_give_up_again();
+                let mut out = Vec::new();
+                self.writer.reads_waited(
+                    &mut self.tree,
+                    &mut *self.builder,
+                    &self.root,
                     &mut out,
                 )?;
                 self.heard(out)?;

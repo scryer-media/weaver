@@ -20,6 +20,7 @@ use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
+use weaver_server_disk::operations::disk::volume::LoopSite;
 
 use weaver_graph::{ByteRange, Coverage, Marks, NodeId, Placement, Provenance, VolumeIndex};
 
@@ -420,10 +421,10 @@ impl Envelopes {
         shelf.update(|state| {
             let kept = shelf.kept(state, envelope)?;
             let mends = provenance.is_verified() && kept.coverage.damaged(range);
-            if from.is_some() && !writes_over() && kept.leaf.file_id() == from {
+            if from.is_some() && !writes_over() && kept.leaf.file_id(LoopSite::Capture) == from {
                 kept.leaf.wrote_in_place(offset, range.len());
             } else {
-                kept.leaf.write(offset, bytes, None)?;
+                kept.leaf.write(LoopSite::Capture, offset, bytes, None)?;
             }
             kept.coverage.write(range, provenance);
             if (provenance == Provenance::Repaired || mends) && range.start < kept.reached {
@@ -435,9 +436,17 @@ impl Envelopes {
 
     // Append the bytes of `range` of an envelope to `into`, or nothing and
     // `false` when any of them were never kept.
-    pub fn read(&self, node: NodeId, envelope: u32, range: ByteRange, into: &mut Vec<u8>) -> bool {
+    // `site` is where the read is made from.
+    pub fn read(
+        &self,
+        site: LoopSite,
+        node: NodeId,
+        envelope: u32,
+        range: ByteRange,
+        into: &mut Vec<u8>,
+    ) -> bool {
         match self.shelves.get(&node) {
-            Some(shelf) => shelf.read(envelope, range, into),
+            Some(shelf) => shelf.read(site, envelope, range, into),
             None => range.is_empty(),
         }
     }
@@ -754,16 +763,29 @@ impl Shelf {
 
     // Append the bytes of `range` of an envelope to `into`, or nothing and
     // `false` when any of them were never kept.
-    pub(crate) fn read(&self, envelope: u32, range: ByteRange, into: &mut Vec<u8>) -> bool {
-        self.read_on(envelope, range, into, false)
+    pub(crate) fn read(
+        &self,
+        site: LoopSite,
+        envelope: u32,
+        range: ByteRange,
+        into: &mut Vec<u8>,
+    ) -> bool {
+        self.read_on(envelope, range, into, Some(site))
     }
 
     // The same read for a thread the loop does not wait for.
     pub(crate) fn read_aside(&self, envelope: u32, range: ByteRange, into: &mut Vec<u8>) -> bool {
-        self.read_on(envelope, range, into, true)
+        self.read_on(envelope, range, into, None)
     }
 
-    fn read_on(&self, envelope: u32, range: ByteRange, into: &mut Vec<u8>, aside: bool) -> bool {
+    // The loop's read from `site`, or with none a thread's read aside.
+    fn read_on(
+        &self,
+        envelope: u32,
+        range: ByteRange,
+        into: &mut Vec<u8>,
+        on: Option<LoopSite>,
+    ) -> bool {
         let state = self.lock();
         let Some(kept) = state.kept.get(&envelope) else {
             return range.is_empty();
@@ -772,9 +794,9 @@ impl Shelf {
         #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         READ_MOST.set(READ_MOST.get().max(range.len()));
         kept.coverage.covered(range)
-            && match aside {
-                true => kept.leaf.read_aside(range.start, len, into),
-                false => kept.leaf.read(range.start, len, into),
+            && match on {
+                None => kept.leaf.read_aside(range.start, len, into),
+                Some(site) => kept.leaf.read(site, range.start, len, into),
             }
             .is_ok()
     }

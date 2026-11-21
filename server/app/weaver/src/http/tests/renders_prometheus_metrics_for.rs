@@ -962,6 +962,7 @@ fn renders_collected_instrumentation_snapshots() {
     assert!(rendered.contains("weaver_volume_buffered_bytes{volume=\"/mnt/nas\"} 65536"));
     assert!(rendered.contains("weaver_volume_arrived_bytes{volume=\"/mnt/nas\"} 4096"));
     assert!(rendered.contains("weaver_volume_counted_bytes{volume=\"/mnt/nas\"} 69632"));
+    assert!(rendered.contains("weaver_volume_carried_bytes{volume=\"/mnt/nas\"} 32768"));
     assert!(rendered.contains("weaver_volume_counted_peak_bytes{volume=\"/mnt/nas\"} 900000"));
     // A sized volume carries its limits; one not sized yet carries neither.
     assert!(rendered.contains("weaver_volume_buffer_limit_bytes{volume=\"/mnt/nas\"} 1000000"));
@@ -1007,25 +1008,24 @@ fn renders_collected_instrumentation_snapshots() {
         let line = format!("{row}{{volume=\"/mnt/nas\"}} {value}");
         assert!(rendered.contains(&line), "{line}");
     }
-    // The loop's waits on a volume, by what it waited for.
-    for (kind, waits, seconds) in [
-        ("read", "1", "0.25"),
-        ("settle", "2", "1.25"),
-        ("budget", "0", "0"),
+    // The loop's waits on a volume, by what it waited for and where the
+    // wait was made from: two settles from two sites are counted apart.
+    for (kind, site, waits, seconds) in [
+        ("read", "leaf_write", "1", "0.25"),
+        ("settle", "leaf_release", "1", "0.5"),
+        ("settle", "tail", "1", "0.75"),
     ] {
-        let line = format!(
-            "weaver_volume_loop_waits_total{{volume=\"/mnt/nas\",kind=\"{kind}\"}} {waits}"
-        );
+        let labels = format!("volume=\"/mnt/nas\",kind=\"{kind}\",site=\"{site}\"");
+        let line = format!("weaver_volume_loop_waits_total{{{labels}}} {waits}");
         assert!(rendered.contains(&line), "{line}");
-        let line = format!(
-            "weaver_volume_loop_wait_seconds_total{{volume=\"/mnt/nas\",kind=\"{kind}\"}} {seconds}"
-        );
+        let line = format!("weaver_volume_loop_wait_seconds_total{{{labels}}} {seconds}");
         assert!(rendered.contains(&line), "{line}");
     }
+    // A kind or site the loop never waited at has no series.
     assert!(
-        rendered
-            .contains("weaver_volume_loop_waits_total{volume=\"/mnt/scratch\",kind=\"settle\"} 0")
+        !rendered.contains("weaver_volume_loop_waits_total{volume=\"/mnt/nas\",kind=\"budget\"")
     );
+    assert!(!rendered.contains("weaver_volume_loop_waits_total{volume=\"/mnt/scratch\""));
     assert!(rendered.contains("weaver_volume_written_bytes_total{volume=\"/mnt/scratch\"} 0"));
     assert!(
         !rendered.contains("weaver_volume_write_rate_bytes_per_second{volume=\"/mnt/scratch\"}")

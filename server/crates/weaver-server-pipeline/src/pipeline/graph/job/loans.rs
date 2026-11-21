@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use weaver_server_disk::operations::disk::reader::TurnStop;
-use weaver_server_disk::operations::disk::writer::{Credit, Stand};
+use weaver_server_disk::operations::disk::writer::{Barrier, Credit, Stand};
 
 use tokio::sync::mpsc;
 use weaver_graph::NodeId;
@@ -216,9 +216,54 @@ impl Loans {
     // volumes for the next piece (`NamespaceWriter::release_owed`): a thread
     // counts `bytes` for it on each, as for a tail (`pay`), and mails what it
     // counted (`Heard::ReleasePaid`). It is no loan: the job keeps its own
-    // note that one is out (`GraphJob::releasing`).
-    pub(crate) fn pay_release(&self, bytes: u64, disk: JobDisk) {
-        self.reserve_ahead(NodeId::ROOT, 0, bytes, disk, Heard::ReleasePaid);
+    // note that one is out (`GraphJob::releasing`), with the number its mail
+    // goes under, the next of the loans', which this returns.
+    pub(crate) fn pay_release(&mut self, bytes: u64, disk: JobDisk) -> u64 {
+        let serial = self.next_serial();
+        self.reserve_ahead(NodeId::ROOT, serial, bytes, disk, Heard::ReleasePaid);
+        serial
+    }
+
+    // A read `Effect::ReadOn` asked waits for writes still out to the files
+    // it reads (`NamespaceWriter::read_wait`): a thread waits for them, the
+    // loop never does, and mails once they are placed and returned
+    // (`Heard::ReadSettled`). It holds nothing and counts nothing. It is no
+    // loan: the job keeps its own note that one is out (`GraphJob::reading`),
+    // with the number its mail goes under, which this returns. The wait ends
+    // as well once the job's owner is stopping (`VolumeWriters::stop_waits`),
+    // and what was let go (`Submitter::abandon`) returns at once.
+    pub(crate) fn wait_read(&mut self, waits: Barrier) -> u64 {
+        let serial = self.next_serial();
+        let (scope, mail) = (self.scope, self.mail.clone());
+        tokio::task::spawn_blocking(move || {
+            let _job =
+                weaver_server_base::runtime::panic_trap::JobScope::enter(crate::JobId(scope));
+            waits.wait_aside();
+            // Placed, and not yet returned while the writer lets go of the
+            // handles they used: the volume's thread says when it has.
+            if !waits.unwritten() && !waits.returned() {
+                let (said, heard) = std::sync::mpsc::sync_channel(1);
+                waits.then(move || {
+                    let _ = said.send(());
+                });
+                drop(waits);
+                let _ = heard.recv();
+            }
+            // A closed channel means the pipeline is gone.
+            let _ = mail.blocking_send(Said {
+                scope,
+                node: NodeId::ROOT,
+                generation: serial,
+                heard: Heard::ReadSettled,
+            });
+        });
+        serial
+    }
+
+    // The next of the loans' numbers, which no mail has gone under yet.
+    pub(crate) fn next_serial(&mut self) -> u64 {
+        self.serial += 1;
+        self.serial
     }
 
     // The thread `pay` and `pay_release` send: it counts `bytes` on the

@@ -305,8 +305,10 @@ pub fn probe_once(
             return Ok(());
         }
         // The probe gives way, between its chunks, to the first writes
-        // queued for the volume: they do not stand behind more of it.
-        let writes_wait = || volume.unwritten_bytes() > 0;
+        // queued for the volume: they do not stand behind more of it. Run
+        // output the queuing thread only carries in memory is not queued;
+        // once its write is, its bytes are no longer carried.
+        let writes_wait = || volume.uncarried_bytes() > 0;
         let Some(measured) = (store.measure)(&dir, &writes_wait) else {
             debug!(
                 volume = %volume.label,
@@ -604,6 +606,33 @@ mod tests {
         assert_eq!(rate_of(&after_restart), 900_000_000);
         let (stored, _) = store(data.path(), 1000, None);
         assert!(stored.apply_stored(&self::volume(Some(1), "/")));
+    }
+
+    // Bytes the queuing thread only carries are no writes waiting: the
+    // probe is not told to give way for them, and is once they are not
+    // carried.
+    #[test]
+    fn carried_bytes_are_no_writes_the_probe_gives_way_to() {
+        let data = tempfile::tempdir().unwrap();
+        let volume = volume(Some(1), "/");
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&told);
+        let carried = Arc::clone(&volume);
+        let probe = ProbeStore::open_with(
+            data.path(),
+            Box::new(|| UNIX_EPOCH + Duration::from_secs(1000)),
+            Box::new(move |_, writes_wait| {
+                let mut seen = seen.lock().unwrap();
+                seen.push(writes_wait());
+                carried.uncarry(MIB);
+                seen.push(writes_wait());
+                Some(whole(1_000_000_000))
+            }),
+        );
+        volume.count_for_test(MIB);
+        volume.carry(MIB);
+        probe_once(Arc::clone(&volume), data.path().to_path_buf(), probe)().unwrap();
+        assert_eq!(*told.lock().unwrap(), [false, true]);
     }
 
     // The scratch file is written in the probe's own directory, and it and

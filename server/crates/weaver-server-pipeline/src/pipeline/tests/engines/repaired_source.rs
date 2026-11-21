@@ -14,6 +14,7 @@ use crate::pipeline::{
 use crate::{JobSpec, JobStatus};
 use std::collections::BTreeMap;
 use weaver_graph::{ByteRange, MemberId, NodeId, recovery::RepairOutcome};
+use weaver_server_disk::operations::disk::volume::LoopSite;
 
 pub struct SourceSpan {
     pub range: ByteRange,
@@ -42,7 +43,7 @@ impl RepairObservation {
             .map(|run| {
                 let range = ByteRange::new(run.range.start, run.range.end.min(archive_len as u64));
                 let mut bytes = Vec::new();
-                let readable = job.writer().access(job.tree()).read_at(
+                let readable = job.writer().access(job.tree(), LoopSite::ReadOn).read_at(
                     NodeId::ROOT,
                     member,
                     range,

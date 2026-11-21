@@ -107,11 +107,12 @@ impl VolumeHolds {
 
 // Where an article's bytes land as the loop hands them on: the volume, and
 // for a member not yet decided, the other volume its deciding article may
-// land on as well (`NamespaceWriter::landing`).
+// land on as well, with what the member holds and would release there once
+// decided (`NamespaceWriter::landing`).
 #[derive(Clone)]
 pub(in crate::pipeline) struct Landing {
     pub(super) volume: Arc<Volume>,
-    pub(super) or: Option<Arc<Volume>>,
+    pub(super) or: Option<(Arc<Volume>, u64)>,
 }
 
 // What the loop prepaid for the writes of one step: on the volume the
@@ -125,7 +126,40 @@ pub(super) enum Armed {
     Credit(StepCredit),
     // `volume`, where the article's bytes would count, has no room for
     // `bytes` of them (`Volume::fits`), and a wake is asked for when it may.
-    Park { volume: Arc<Volume>, bytes: u64 },
+    // `own` of them are the step's own (`room_for`).
+    Park {
+        volume: Arc<Volume>,
+        bytes: u64,
+        own: u64,
+    },
+}
+
+// The jobs whose front waits for room on one volume, in the order they
+// parked, with the bytes each front needs there and how many of them are
+// its step's own (`room_for`).
+type ParkedFronts = VecDeque<(JobId, u64, u64)>;
+
+// Whether `bytes` fit on `volume` (`Volume::fits`), of which `own`, a
+// step's own, fit below its hard limit beside what it counts besides
+// carried bytes (`Volume::uncarried_bytes`), as it grants: only the held
+// bytes the step releases with them may take it past its limit, so past it
+// by no more than one step's held bytes beside the carried ones. A volume
+// that counts besides carried bytes only bytes that arrived and wait to be
+// handed on takes the step whatever its size, as it grants a request when
+// it counts nothing besides carried ones (`Volume::grant`): only handing
+// them on frees them, and that may wait on this very step, as when two
+// jobs each wait on the volume the other's arrived bytes fill.
+fn room_for(volume: &Volume, bytes: u64, own: u64) -> bool {
+    let (_, hard) = volume.buffer_limits();
+    let counted = volume.uncarried_bytes();
+    volume.fits(bytes)
+        && (counted <= volume.arrived_bytes.load(Ordering::SeqCst)
+            || counted.saturating_add(own) <= hard)
+}
+
+// A volume told apart by its address, while an `Arc` of it is held.
+fn volume_key(volume: &Arc<Volume>) -> usize {
+    Arc::as_ptr(volume).addr()
 }
 
 // Released results whose bytes land on a volume that had no room for them.
@@ -134,10 +168,6 @@ pub(super) enum Armed {
 // is looked at only for the fronts parked on it, in the order they parked,
 // up to the first that still does not fit; a result behind a front is not
 // looked at until the front is handed on.
-// The jobs whose front waits for room on one volume, in the order they
-// parked, with the bytes each front needs there.
-type ParkedFronts = VecDeque<(JobId, u64)>;
-
 #[derive(Default)]
 pub struct ParkedResults {
     // Each job's results waiting. The front is the one that parked, taken
@@ -147,6 +177,10 @@ pub struct ParkedResults {
     // For each volume a front parked on: those jobs, in the order they
     // parked, with the bytes each front needs there.
     fronts: Vec<(Arc<Volume>, ParkedFronts)>,
+    // The volumes in `fronts`, by address, so whether a front waits on a
+    // volume is one lookup (`Self::parked_on`). Each is held by its entry
+    // in `fronts` while it is here.
+    parked_on: HashSet<usize>,
     // Fronts their volume has room for, handed on before new results.
     retrying: VecDeque<DownloadResult>,
     // How many were tried again, for tests that count what a wake costs.
@@ -156,8 +190,14 @@ pub struct ParkedResults {
 
 impl ParkedResults {
     // `result` is its job's front, parked for room for `bytes` on `volume`,
-    // ahead of whatever of the job waits behind it.
-    fn park_front(&mut self, result: DownloadResult, volume: Arc<Volume>, bytes: u64) {
+    // `own` of them its step's own, ahead of whatever of the job waits
+    // behind it.
+    fn park_front(
+        &mut self,
+        result: DownloadResult,
+        volume: Arc<Volume>,
+        (bytes, own): (u64, u64),
+    ) {
         let job_id = result.job_id;
         self.by_job.entry(job_id).or_default().push_front(result);
         match self
@@ -165,16 +205,36 @@ impl ParkedResults {
             .iter_mut()
             .find(|(on, _)| Arc::ptr_eq(on, &volume))
         {
-            Some((_, jobs)) => jobs.push_back((job_id, bytes)),
-            None => self
-                .fronts
-                .push((volume, VecDeque::from([(job_id, bytes)]))),
+            Some((_, jobs)) => jobs.push_back((job_id, bytes, own)),
+            None => {
+                self.parked_on.insert(volume_key(&volume));
+                self.fronts
+                    .push((volume, VecDeque::from([(job_id, bytes, own)])));
+            }
         }
+    }
+
+    // Whether a front waits for room on `volume`.
+    pub(super) fn parked_on(&self, volume: &Arc<Volume>) -> bool {
+        self.parked_on.contains(&volume_key(volume))
+    }
+
+    // The volumes no front waits on any more leave `fronts`.
+    fn drop_empty_fronts(&mut self) {
+        let parked_on = &mut self.parked_on;
+        self.fronts.retain(|(volume, jobs)| {
+            let keep = !jobs.is_empty();
+            if !keep {
+                parked_on.remove(&volume_key(volume));
+            }
+            keep
+        });
     }
 
     // A volume may have room: each front that fits on its volume now, with
     // the fronts ahead of it there, is taken out to be tried again. A
-    // volume's first front that does not fit ends its look.
+    // volume's first front that does not fit ends its look, and stays first
+    // there (`Self::first_left`).
     fn take_fitting(&mut self) {
         let Self {
             by_job,
@@ -184,9 +244,9 @@ impl ParkedResults {
         } = self;
         for (volume, jobs) in fronts.iter_mut() {
             let mut fitting = 0u64;
-            while let Some(&(job_id, bytes)) = jobs.front() {
+            while let Some(&(job_id, bytes, own)) = jobs.front() {
                 let after = fitting.saturating_add(bytes);
-                if !volume.fits(after) {
+                if !room_for(volume, after, fitting.saturating_add(own)) {
                     break;
                 }
                 fitting = after;
@@ -196,7 +256,16 @@ impl ParkedResults {
                 }
             }
         }
-        fronts.retain(|(_, jobs)| !jobs.is_empty());
+        self.drop_empty_fronts();
+    }
+
+    // Each volume's first front, which a look left parked: the job, its
+    // volume, the bytes it needs there and how many are its step's own.
+    fn first_left(&self) -> impl Iterator<Item = (JobId, &Arc<Volume>, u64, u64)> {
+        self.fronts.iter().filter_map(|(volume, jobs)| {
+            jobs.front()
+                .map(|&(job_id, bytes, own)| (job_id, volume, bytes, own))
+        })
     }
 
     // The job's front tried again was handed on: the next one waiting
@@ -219,9 +288,9 @@ impl ParkedResults {
             return Vec::new();
         };
         for (_, jobs) in &mut self.fronts {
-            jobs.retain(|(parked, _)| *parked != job_id);
+            jobs.retain(|(parked, _, _)| *parked != job_id);
         }
-        self.fronts.retain(|(_, jobs)| !jobs.is_empty());
+        self.drop_empty_fronts();
         let mut taken: Vec<_> = Vec::with_capacity(waiting.len() + 1);
         if let Some(at) = self
             .retrying
@@ -237,6 +306,7 @@ impl ParkedResults {
     // Everything that waits, each job's results in order.
     fn take_all(&mut self) -> Vec<DownloadResult> {
         self.fronts.clear();
+        self.parked_on.clear();
         let mut taken: Vec<_> = std::mem::take(&mut self.retrying).into();
         // A job's front out for its retry is ahead of the rest of it.
         taken.extend(self.by_job.drain().flat_map(|(_, results)| results));
@@ -253,7 +323,7 @@ impl Pipeline {
             .landing(graph.tree(), MemberId(file.file_index))?;
         Some(Landing {
             volume: Arc::clone(volume),
-            or: or.map(Arc::clone),
+            or: or.map(|(volume, held)| (Arc::clone(volume), held)),
         })
     }
 
@@ -269,57 +339,79 @@ impl Pipeline {
     }
 
     // Ask for the room wake of `volume` for the test `bytes` failed
-    // (`Volume::fits`): at the line they fit below, or lower, at its resume
-    // line, so the loop is not woken per write; and no lower than what the
-    // volume counts besides its writer's buffer, so the wake comes once the
-    // writer has written what it holds, which fits as well. Counted is read
-    // before buffered: a write between the two only raises the line. Whether
-    // it was asked: false when the volume is there already.
-    fn ask_landing_wake(&self, job_id: JobId, volume: &Arc<Volume>, bytes: u64) -> bool {
-        let Some(submitter) = self
+    // (`room_for`), on the measure wakes are taken on
+    // (`Volume::uncarried_bytes`), which `Volume::fits` judges by too: at
+    // the line they fit below, or lower, at its
+    // resume line, so the loop is not woken per write; and no lower than
+    // what the volume counts besides its writer's buffer, so the wake comes
+    // once the writer has written what it holds, which fits as well; but
+    // never above the line `own`, the step's own bytes, fit below, unless
+    // the bytes that arrived and wait to be handed on are above it: the step
+    // fits once nothing else is counted (`room_for`), so the wake comes then.
+    // Counted is read before buffered: a write between the two only raises
+    // the line. Whether it was asked: false when the volume is there
+    // already, None when the job writes to no such volume.
+    fn ask_landing_wake(
+        &self,
+        job_id: JobId,
+        volume: &Arc<Volume>,
+        bytes: u64,
+        own: u64,
+    ) -> Option<bool> {
+        let submitter = self
             .graph_jobs
             .get(&job_id)
             .and_then(|graph| graph.disk())
             .and_then(|disk| {
                 disk.each()
                     .find(|submitter| Arc::ptr_eq(submitter.volume(), volume))
-            })
-        else {
-            return false;
-        };
+            })?;
         let (_, hard) = volume.buffer_limits();
-        let counted = volume.unwritten_bytes();
+        let counted = volume.uncarried_bytes();
         let buffered = volume.buffered_bytes.load(Ordering::SeqCst);
+        let arrived = volume.arrived_bytes.load(Ordering::SeqCst);
         let line = volume
             .resume_line()
             .min(hard.saturating_sub(bytes))
-            .max(counted.saturating_sub(buffered));
+            .max(counted.saturating_sub(buffered))
+            .min(hard.saturating_sub(own))
+            .max(arrived.min(counted.saturating_sub(1)));
         let asked = submitter.wake_below(line);
         if asked {
             self.volume_budget_held
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        asked
+        Some(asked)
     }
 
-    // Whether `bytes` may be counted on `volume` now, or, when `may_park`,
-    // whether the step parks for its room wake instead. A step that may not
-    // park does without.
+    // Whether `bytes`, of which `own` are the step's own (`room_for`),
+    // may be counted on `volume` now, or, when `may_park`, whether the step
+    // parks for its room wake instead. A step that may not park does
+    // without. A wake asked too late, the volume having fallen to its line
+    // meanwhile, is a look again: the step that may park goes on only where
+    // the bytes fit, and never without them.
     fn landing_room(
         &self,
         job_id: JobId,
         volume: &Arc<Volume>,
-        bytes: u64,
+        (bytes, own): (u64, u64),
         may_park: bool,
     ) -> Result<bool, ()> {
-        if bytes == 0 || volume.fits(bytes) {
-            return Ok(true);
+        loop {
+            if bytes == 0 || room_for(volume, bytes, own) {
+                return Ok(true);
+            }
+            if !may_park {
+                return Ok(false);
+            }
+            match self.ask_landing_wake(job_id, volume, bytes, own) {
+                Some(true) => return Err(()),
+                Some(false) => {}
+                // No writer of the job's says when it has room: nothing to
+                // park for.
+                None => return Ok(false),
+            }
         }
-        if may_park && self.ask_landing_wake(job_id, volume, bytes) {
-            return Err(());
-        }
-        // Asked too late: the volume fell to the line meanwhile.
-        Ok(volume.fits(bytes))
     }
 
     // The loop is about to hand on `bytes` of the job that arrived, landing
@@ -329,7 +421,12 @@ impl Pipeline {
     // or arrived while its member was undecided, move to the volume it
     // lands on only when they fit there (`Volume::fits`); a member still
     // undecided is prepaid on its other volume too, when they fit there,
-    // since the article may decide it. Where they do not fit, a step that
+    // since the article may decide it, and so is an archive's volume whose
+    // object passes its bytes on to its members on that volume in the step
+    // (`Object::passes_on`). On the other volume the step pays all it may
+    // write there: its bytes and the held bytes its member, or the members
+    // its object passes on to, would release once decided. Where they do
+    // not fit, a step that
     // may park parks for the volume's room wake, and nothing moved or was
     // counted; one that may not does without that credit. A job with no
     // bytes counted for it, or none that land through a writer, prepays
@@ -349,27 +446,32 @@ impl Pipeline {
         let here = holds.on(&volume);
         let elsewhere = holds.bytes() - here;
         let mut moving = bytes.saturating_sub(here).min(elsewhere);
-        match self.landing_room(job_id, &volume, moving, may_park) {
+        match self.landing_room(job_id, &volume, (moving, 0), may_park) {
             Ok(true) => {}
             Ok(false) => moving = 0,
             Err(()) => {
                 return Armed::Park {
                     volume,
                     bytes: moving,
+                    own: 0,
                 };
             }
         }
         let or = match or {
-            Some(other) => match self.landing_room(job_id, &other, bytes, may_park) {
-                Ok(true) => Some(other),
-                Ok(false) => None,
-                Err(()) => {
-                    return Armed::Park {
-                        volume: other,
-                        bytes,
-                    };
+            Some((other, held)) => {
+                let amount = bytes + held;
+                match self.landing_room(job_id, &other, (amount, bytes), may_park) {
+                    Ok(true) => Some((other, amount)),
+                    Ok(false) => None,
+                    Err(()) => {
+                        return Armed::Park {
+                            volume: other,
+                            bytes: amount,
+                            own: bytes,
+                        };
+                    }
                 }
-            },
+            }
             None => None,
         };
         let writers = &self.volume_writers;
@@ -399,12 +501,14 @@ impl Pipeline {
         volume.arrived_bytes.fetch_sub(paid, Ordering::SeqCst);
         let mut credit = StepCredit::default();
         credit.0[0] = Some(self.volume_writers.prepay(held, paid));
-        if let Some(other) = or {
+        if let Some((other, amount)) = or {
             // The article may decide its member here and land on the other
-            // volume: those writes find their bytes counted ahead as well.
+            // volume, or its object passes it on to members there: those
+            // writes, and the releases of what the members held, find their
+            // bytes counted ahead as well.
             let mut ahead = Reservation::none(other);
-            ahead.count(bytes);
-            credit.0[1] = Some(self.volume_writers.prepay(&mut ahead, bytes));
+            ahead.count(amount);
+            credit.0[1] = Some(self.volume_writers.prepay(&mut ahead, amount));
         }
         if woke {
             self.volume_room_taken();
@@ -448,13 +552,14 @@ impl Pipeline {
         self.volume_room_changed();
     }
 
-    // Keep `result`, its job's front, until `volume` has room for `bytes`
-    // (`ParkedResults`): only its job waits, in the order its results came.
+    // Keep `result`, its job's front, until `volume` has room for `bytes`,
+    // `own` of them its step's own (`ParkedResults`): only its job waits,
+    // in the order its results came.
     pub(super) fn park_download_front(
         &mut self,
         result: DownloadResult,
         volume: Arc<Volume>,
-        bytes: u64,
+        bytes: (u64, u64),
     ) {
         self.parked_download_results
             .park_front(result, volume, bytes);
@@ -482,11 +587,19 @@ impl Pipeline {
     // A volume may have room since results were parked: the fronts parked
     // on each volume that fit there now are taken out to be tried again,
     // ahead of new results (`Self::take_retried_download_result`). One
-    // that still finds no room parks again with a wake asked anew. Nothing
-    // is looked at until a volume may have room.
+    // that still finds no room parks again with a wake asked anew, and so
+    // does each volume's first front the look left parked: the wake that
+    // brought the look was taken. One that the volume has fallen to the
+    // line of meanwhile is a look again. Nothing is looked at until a
+    // volume may have room; then one ask for each volume fronts wait on.
     pub(in crate::pipeline) fn unpark_download_results(&mut self) {
-        if std::mem::take(&mut self.parked_results_room) {
+        while std::mem::take(&mut self.parked_results_room) {
             self.parked_download_results.take_fitting();
+            let mut again = false;
+            for (job_id, volume, bytes, own) in self.parked_download_results.first_left() {
+                again |= self.ask_landing_wake(job_id, volume, bytes, own) == Some(false);
+            }
+            self.parked_results_room = again;
         }
     }
 
@@ -576,6 +689,18 @@ impl Pipeline {
         self.article_landing(file).map(|landing| landing.volume)
     }
 
+    // The other volume a step for an article of `file` prepays on now.
+    pub fn landing_or_for_test(&self, file: NzbFileId) -> Option<Arc<Volume>> {
+        self.landing_or_held_for_test(file)
+            .map(|(volume, _)| volume)
+    }
+
+    // The other volume a step for an article of `file` prepays on now, and
+    // the held bytes it pays there besides the article's.
+    pub fn landing_or_held_for_test(&self, file: NzbFileId) -> Option<(Arc<Volume>, u64)> {
+        self.article_landing(file).and_then(|landing| landing.or)
+    }
+
     // Lease an article of `segment` of `bytes`, as dispatch reserves one:
     // false when its volume refuses it.
     pub fn lease_for_test(&mut self, segment: SegmentId, bytes: u32) -> bool {
@@ -603,6 +728,19 @@ impl Pipeline {
         self.note_released_download_result_pending(job_id, arrived);
     }
 
+    // The article `lease` reserved on its volume for the job arrived with
+    // `arrived` bytes, which wait for the loop counted there, as a lane's
+    // result is settled: whether a room wake was taken.
+    pub fn arrive_leased_for_test(
+        &mut self,
+        job_id: JobId,
+        lease: Reservation,
+        arrived: u64,
+    ) -> bool {
+        self.note_released_download_result_pending(job_id, arrived);
+        self.hold_volume_arrived(job_id, lease, arrived, true)
+    }
+
     // The loop hands on the waiting result `decoded` as it does in a turn:
     // false when it parked for its volume's room.
     pub async fn hand_on_for_test(&mut self, decoded: DecodeResult) -> bool {
@@ -622,6 +760,19 @@ impl Pipeline {
             release_connection_slot: false,
         })
         .await
+    }
+
+    // Whether a step of the job that may park, landing `bytes` on `volume`
+    // of which `own` are its own, finds its room now rather than parking
+    // for it (`Self::landing_room`).
+    pub fn takes_landing_room_for_test(
+        &self,
+        job_id: JobId,
+        volume: &Arc<Volume>,
+        bytes: u64,
+        own: u64,
+    ) -> bool {
+        self.landing_room(job_id, volume, (bytes, own), true) == Ok(true)
     }
 
     // A volume's writer said there is room, and the loop hears it as a

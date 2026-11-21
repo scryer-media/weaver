@@ -23,6 +23,7 @@ use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use weaver_server_disk::operations::disk::volume::LoopSite;
 
 use bytes::Bytes;
 use weaver_graph::holds::Location;
@@ -691,7 +692,7 @@ impl Repaired {
         let written = self
             .output
             .create_within()
-            .and_then(|()| self.output.write(at.start, bytes, None));
+            .and_then(|()| self.output.write(LoopSite::Repair, at.start, bytes, None));
         match written {
             Ok(()) => {
                 self.written = at.end;
@@ -764,7 +765,12 @@ impl Repaired {
                 let mut bytes = Vec::new();
                 let read = self
                     .output
-                    .read(at.start + from, index(to - from), &mut bytes)
+                    .read(
+                        LoopSite::Repair,
+                        at.start + from,
+                        index(to - from),
+                        &mut bytes,
+                    )
                     .map(|()| Bytes::from(bytes));
                 (*member, offset + from, read)
             })

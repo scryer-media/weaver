@@ -436,6 +436,11 @@ impl Object for SplitStore {
         Kind::Split
     }
 
+    // Each piece's bytes are my member's, as they arrive.
+    fn passes_on(&self) -> bool {
+        true
+    }
+
     // Bytes of a piece go where the piece starts in the member, as far as
     // its declared length; the rest is held until its place is known. A
     // piece whose own front refutes the set is placed as any is, so every

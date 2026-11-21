@@ -605,16 +605,18 @@ impl Pipeline {
             if volume.buffer_limits().1 == u64::MAX {
                 continue;
             }
+            // Measured as the volume grants, on what it counts besides
+            // carried bytes (`Volume::uncarried_bytes`).
             let line = volume
                 .resume_line()
                 .min(volume.lease_limit().saturating_sub(need));
-            let unwritten = volume.unwritten_bytes();
-            let holds = unwritten > line && submitter.wake_below(line);
+            let uncarried = volume.uncarried_bytes();
+            let holds = uncarried > line && submitter.wake_below(line);
             // The job's next article does not fit on this volume: it is
             // the one holding dispatch, and the disk vote hears so. It keeps
             // the article and marks each window it still does not fit, since
             // dispatch tries nothing more until a room wake.
-            if holds && unwritten.saturating_add(need) > volume.lease_limit() {
+            if holds && uncarried.saturating_add(need) > volume.lease_limit() {
                 let at = *now.get_or_insert_with(std::time::Instant::now);
                 self.disk_vote.note_held(volume, need, at);
             }

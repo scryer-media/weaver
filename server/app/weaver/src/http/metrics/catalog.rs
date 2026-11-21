@@ -1012,6 +1012,8 @@ metric_families! {
         "Bytes that arrived for the jobs writing to a volume and are not handed to its writer yet: being decoded.");
     VOLUME_COUNTED_BYTES = ("weaver_volume_counted_bytes", Gauge, ["volume"],
         "Bytes counted against a volume's buffer limit: articles leased to connections for the jobs writing to it and not arrived, at the size the post gives them, what arrived and is being decoded, and what waits for its writer. Never above `weaver_volume_buffer_limit_bytes`, but for one article granted alone to a volume that counted nothing.");
+    VOLUME_CARRIED_BYTES = ("weaver_volume_carried_bytes", Gauge, ["volume"],
+        "Of `weaver_volume_counted_bytes`, the bytes counted for jobs' output held in memory to be written to a volume: held bytes, which only more of that output frees. A volume whose whole count is held bytes still takes one article or one step's results at a time, so it passes its buffer limit by held bytes only.");
     VOLUME_COUNTED_PEAK_BYTES = ("weaver_volume_counted_peak_bytes", Gauge, ["volume"],
         "The most bytes `weaver_volume_counted_bytes` has been since start.");
     VOLUME_BUFFER_LIMIT_BYTES = ("weaver_volume_buffer_limit_bytes", Gauge, ["volume"],
@@ -1026,10 +1028,10 @@ metric_families! {
         "Operations a volume's writer ran that came back with an error.");
     VOLUME_WRITER_ABANDONED_OPERATIONS = ("weaver_volume_writer_abandoned_operations_total", Counter, ["volume"],
         "Operations queued for a volume's writer and never run: their job gave its files up, or an earlier operation of the same job failed.");
-    VOLUME_LOOP_WAITS = ("weaver_volume_loop_waits_total", Counter, ["volume", "kind"],
-        "Times the pipeline loop itself stood still until a volume's writer had caught up, by what it waited for: `read` (a file's bytes after its writes), `settle` (a file's operations to return, for its length or its delivery) or `budget` (the volume's limit, while the loop produced a repair's or a replay's output). Waits of other threads, and of a shutdown, are not counted.");
-    VOLUME_LOOP_WAIT_SECONDS = ("weaver_volume_loop_wait_seconds_total", Counter, ["volume", "kind"],
-        "Time the pipeline loop itself has stood still waiting for a volume's writer, by what it waited for (see `weaver_volume_loop_waits_total`). Waits of other threads, and of a shutdown, are not counted.");
+    VOLUME_LOOP_WAITS = ("weaver_volume_loop_waits_total", Counter, ["volume", "kind", "site"],
+        "Times the pipeline loop itself stood still until a volume's writer had caught up, by what it waited for: `read` (a file's bytes after its writes), `settle` (a file's operations to return, for its length or its delivery) or `budget` (the volume's limit, while the loop produced a repair's or a replay's output); and by `site`, the caller path that made the wait (for example `leaf_write` for an arriving article, `leaf_release` for held bytes released into their leaf, `object_release` for a replay, `tail` for a repair's delivery). Waits of other threads, and of a shutdown, are not counted. Conditional: a kind and site appear once the loop has waited there.");
+    VOLUME_LOOP_WAIT_SECONDS = ("weaver_volume_loop_wait_seconds_total", Counter, ["volume", "kind", "site"],
+        "Time the pipeline loop itself has stood still waiting for a volume's writer, by what it waited for and where the wait was made from (see `weaver_volume_loop_waits_total`). Waits of other threads, and of a shutdown, are not counted. Conditional: a kind and site appear once the loop has waited there.");
     VOLUME_LOOP_READS = ("weaver_volume_loop_reads_total", Counter, ["volume"],
         "Reads the pipeline loop made itself of a file a volume's writer writes, once the file's writes before them had returned.");
     VOLUME_LOOP_READ_SECONDS = ("weaver_volume_loop_read_seconds_total", Counter, ["volume"],

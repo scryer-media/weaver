@@ -26,6 +26,7 @@ use bytes::Bytes;
 use weaver_graph::{Algorithm, ByteRange, Digest, Evidenced};
 
 use crate::pipeline::graph::limits::Device;
+use weaver_server_disk::operations::disk::volume::LoopSite;
 use weaver_server_disk::operations::disk::writer::{Barrier, Create, Opened, Submitter};
 use weaver_server_disk::pipeline::graph::sparse::{
     PlatformMarker, create_sized, create_sized_known, create_sparse,
@@ -436,6 +437,15 @@ impl Leaf {
             .map(|queued| queued.to.barrier_at(queued.last))
     }
 
+    // The operations a read of `offset..end` waits for (`read`) while some
+    // of them are still out, asked without waiting: `None` when the read
+    // would not wait.
+    pub(crate) fn read_out(&self, offset: u64, end: u64) -> Option<Barrier> {
+        let queued = self.queued.as_ref().filter(|queued| queued.last > 0)?;
+        let barrier = queued.to.barrier_at(queued.read_after(offset, end));
+        (!barrier.returned()).then_some(barrier)
+    }
+
     // The volume the file's writer writes to, whose read turns a reader of
     // the file takes. `None` for a leaf that runs its own operations.
     pub(crate) fn volume(
@@ -567,9 +577,9 @@ impl Leaf {
     // a file is that file, and an empty file made where no second name
     // could be is another. `None` where there is no file or the file system
     // cannot say.
-    pub fn file_id(&self) -> Option<FileId> {
+    pub fn file_id(&self, site: LoopSite) -> Option<FileId> {
         if let Some(queued) = self.queued.as_ref().filter(|queued| queued.last > 0) {
-            queued.to.wait_for(queued.read_after(0, 0)).ok()?;
+            queued.to.wait_for(site, queued.read_after(0, 0)).ok()?;
             if let Some(file) = queued.reader.get().filter(|_| queued.open) {
                 return FileId::of(&file.metadata().ok()?);
             }
@@ -587,27 +597,31 @@ impl Leaf {
     // unwritten space. Close sets the final size either way.
     pub fn write(
         &mut self,
+        site: LoopSite,
         offset: u64,
         bytes: &[u8],
         length: Option<u64>,
     ) -> Result<(), LeafError> {
-        self.put(offset, bytes, None, length)
+        self.put(site, offset, bytes, None, length)
     }
 
     // Write `bytes` at `offset` and fold their `algorithm` digest, from the
     // evidence they came with: only bytes no level above proved are hashed.
     pub fn write_folding(
         &mut self,
+        site: LoopSite,
         offset: u64,
         bytes: &Evidenced,
         algorithm: Algorithm,
         length: Option<u64>,
     ) -> Result<(), LeafError> {
-        self.put(offset, bytes, Some((algorithm, bytes)), length)
+        self.put(site, offset, bytes, Some((algorithm, bytes)), length)
     }
 
+    // `site` is where the write was made from: what its waits count under.
     fn put(
         &mut self,
+        site: LoopSite,
         offset: u64,
         bytes: &[u8],
         fold: Option<(Algorithm, &Evidenced)>,
@@ -622,7 +636,7 @@ impl Leaf {
         for (from, to) in &overlapped {
             self.change(*from, *to);
         }
-        let replaced = self.replaced(&overlapped, fold.map(|(algorithm, _)| algorithm))?;
+        let replaced = self.replaced(site, &overlapped, fold.map(|(algorithm, _)| algorithm))?;
         if let Some(open) = self.queued.as_ref().map(|queued| queued.open) {
             // A test's full disk refuses the write as it is handed over, as
             // the disk would refuse it in place.
@@ -636,7 +650,9 @@ impl Leaf {
             let queued = self.queued.as_mut().expect("checked above");
             queued.open = true;
             let made = create.is_some();
-            let seq = queued.to.write(self.identity, offset, owned(bytes), create);
+            let seq = queued
+                .to
+                .write(site, self.identity, offset, owned(bytes), create);
             // A write that opens the file makes it, or opens it again at a
             // declared length: every read waits for it.
             if made {
@@ -673,6 +689,7 @@ impl Leaf {
     // write that folds nothing, reads nothing back.
     fn replaced(
         &self,
+        site: LoopSite,
         overlapped: &[(u64, u64)],
         fold: Option<Algorithm>,
     ) -> Result<Vec<Option<u64>>, LeafError> {
@@ -686,7 +703,7 @@ impl Leaf {
             let digest = match (fold, run.digest) {
                 (Some(algorithm), Some(digest)) if digest.algorithm == algorithm => {
                     let mut old = Vec::new();
-                    self.read_back(*from, index(to - from), &mut old)?;
+                    self.read_back(site, *from, index(to - from), &mut old)?;
                     Some(algorithm.hash(&old).value)
                 }
                 _ => None,
@@ -789,7 +806,7 @@ impl Leaf {
     // The file ends at `length`: the runs past it go, and a run it cuts
     // keeps the CRC of what stays, the bytes it loses undone from it, read
     // before they go.
-    fn cut(&mut self, length: u64) -> Result<(), LeafError> {
+    fn cut(&mut self, site: LoopSite, length: u64) -> Result<(), LeafError> {
         if let Some((_, last)) = self.written.iter().next_back()
             && last.end > length
         {
@@ -812,7 +829,7 @@ impl Leaf {
         let digest = match run.digest {
             Some(whole) => {
                 let mut lost = Vec::new();
-                self.read_back(length, index(run.end - length), &mut lost)?;
+                self.read_back(site, length, index(run.end - length), &mut lost)?;
                 let algorithm = whole.algorithm;
                 let lost = algorithm.hash(&lost).value;
                 algorithm
@@ -919,16 +936,9 @@ impl Leaf {
     }
 
     // How far the file reaches: every byte written to it lies below.
-    #[cfg_attr(
-        feature = "pipeline-test-fixtures",
-        expect(
-            clippy::len_without_is_empty,
-            reason = "exported only for the pipeline_graph tests; a leaf has no empty state to ask"
-        )
-    )]
-    pub fn len(&self) -> Result<u64, LeafError> {
+    pub fn len(&self, site: LoopSite) -> Result<u64, LeafError> {
         if let Some(settled) = self.settled() {
-            settled.wait();
+            settled.wait(site);
             // A write that failed, or one still out when a stop gave the
             // volume up, left the file short of what was sent to it: its
             // length is not the length of what the leaf holds.
@@ -967,7 +977,13 @@ impl Leaf {
 
     // Fill `into` with `len` bytes from `offset`. The caller only asks for
     // ranges its coverage says were written.
-    pub fn read(&self, offset: u64, len: usize, into: &mut Vec<u8>) -> Result<(), LeafError> {
+    pub fn read(
+        &self,
+        site: LoopSite,
+        offset: u64,
+        len: usize,
+        into: &mut Vec<u8>,
+    ) -> Result<(), LeafError> {
         // Through a writer, the read waits only for this file's operations
         // that put the bytes read there: the last that shaped the file, and
         // the writes still out that overlap them, whatever else its volume
@@ -979,7 +995,7 @@ impl Leaf {
             let end = offset.saturating_add(len as u64);
             queued
                 .to
-                .wait_for(queued.read_after(offset, end))
+                .wait_for(site, queued.read_after(offset, end))
                 .map_err(LeafError::on(&self.path, self.device))?;
             let began = Instant::now();
             let start = into.len();
@@ -1051,21 +1067,27 @@ impl Leaf {
     // read waits through the file's own last operation, as `read` does, and
     // not for everything else the job has queued on the volume: only this
     // file's operations put those bytes there.
-    fn read_back(&self, offset: u64, len: usize, into: &mut Vec<u8>) -> Result<(), LeafError> {
-        self.read(offset, len, into)
+    fn read_back(
+        &self,
+        site: LoopSite,
+        offset: u64,
+        len: usize,
+        into: &mut Vec<u8>,
+    ) -> Result<(), LeafError> {
+        self.read(site, offset, len, into)
     }
 
     // Every byte is in: the file takes its final length. The writer keeps
     // its handle for a repair's writes and later closes; a move, a removal,
     // a release at delivery or the job's end lets it go. A directory has no
     // bytes to take: it is made.
-    pub fn close(&mut self, length: u64) -> Result<(), LeafError> {
+    pub fn close(&mut self, site: LoopSite, length: u64) -> Result<(), LeafError> {
         if self.directory {
             return self.create_directory();
         }
         self.revision += 1;
         if self.queued.is_some() {
-            self.cut(length)?;
+            self.cut(site, length)?;
             let create = self.create(Some(length));
             let made = self.on_disk;
             let queued = self.queued.as_mut().expect("checked above");
@@ -1082,7 +1104,7 @@ impl Leaf {
             return Ok(());
         }
         self.open(Some(length))?;
-        self.cut(length)?;
+        self.cut(site, length)?;
         let file = self.file.as_ref().expect("opened above");
         file.set_len(length)
             .map_err(LeafError::on(&self.path, self.device))?;

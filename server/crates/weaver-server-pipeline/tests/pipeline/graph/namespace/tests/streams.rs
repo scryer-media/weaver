@@ -7,6 +7,7 @@
 // back.
 
 use super::*;
+use weaver_server_disk::operations::disk::volume::LoopSite;
 
 const XZ: &[u8] = &[0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00, 0x00, 0x04];
 
@@ -134,7 +135,7 @@ fn a_store_a_stream_feeds_reads_its_volume_back_through_its_envelope() {
     assert!(job.tree.child_of(node, MemberId(0)).is_some(), "a store");
     assert_eq!(job.file("inner.bin"), b"hello");
 
-    let access = job.writer.access(&job.tree);
+    let access = job.writer.access(&job.tree, LoopSite::ReadOn);
     let mut posted = Vec::new();
     assert!(access.read_at(node, MemberId(0), ByteRange::new(0, 12), &mut posted));
     assert_eq!(posted, [SIGNATURE, b"hello"].concat());

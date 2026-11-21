@@ -3,6 +3,7 @@
 
 use super::*;
 use weaver_graph::{ByteRange, Provenance};
+use weaver_server_disk::operations::disk::volume::LoopSite;
 
 const NODE: NodeId = NodeId(3);
 
@@ -37,7 +38,13 @@ fn a_missing_recorded_envelope_does_not_adopt_a_neighbor_or_advertise_bytes() {
         .keep(NODE, 0, 0, b"refetched-ok", Provenance::Fresh)
         .unwrap();
     let mut bytes = Vec::new();
-    assert!(envelopes.read(NODE, 0, ByteRange::new(0, 12), &mut bytes));
+    assert!(envelopes.read(
+        LoopSite::LeafWrite,
+        NODE,
+        0,
+        ByteRange::new(0, 12),
+        &mut bytes
+    ));
     assert_eq!(bytes, b"refetched-ok");
     assert_eq!(
         std::fs::read(dir.path().join(".weaver-chunks/graph-envelope-3-0-1")).unwrap(),
@@ -57,11 +64,23 @@ fn a_truncated_recorded_envelope_keeps_only_its_surviving_ranges() {
     assert_eq!(kept[0].runs[0].range, ByteRange::new(0, 5));
     assert!(envelopes.shelf(NODE).has_bytes());
     let mut bytes = Vec::new();
-    assert!(!envelopes.read(NODE, 0, ByteRange::new(0, 12), &mut bytes));
+    assert!(!envelopes.read(
+        LoopSite::LeafWrite,
+        NODE,
+        0,
+        ByteRange::new(0, 12),
+        &mut bytes
+    ));
     envelopes
         .keep(NODE, 0, 5, b"-suffix", Provenance::Fresh)
         .unwrap();
-    assert!(envelopes.read(NODE, 0, ByteRange::new(0, 12), &mut bytes));
+    assert!(envelopes.read(
+        LoopSite::LeafWrite,
+        NODE,
+        0,
+        ByteRange::new(0, 12),
+        &mut bytes
+    ));
     assert_eq!(bytes, b"first-suffix");
 }
 
@@ -75,7 +94,13 @@ fn a_recorded_envelope_at_another_name_preserves_its_owned_bytes() {
     let mut envelopes = Envelopes::new(dir.path().to_path_buf());
     envelopes.restore(&record(Some(file))).unwrap();
     let mut bytes = Vec::new();
-    assert!(envelopes.read(NODE, 0, ByteRange::new(0, 12), &mut bytes));
+    assert!(envelopes.read(
+        LoopSite::LeafWrite,
+        NODE,
+        0,
+        ByteRange::new(0, 12),
+        &mut bytes
+    ));
     assert_eq!(bytes, b"recorded-ok!");
     assert_eq!(envelopes.records(NODE), vec![record(Some(file))]);
 }

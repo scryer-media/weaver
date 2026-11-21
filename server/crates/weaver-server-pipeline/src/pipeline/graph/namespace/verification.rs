@@ -5,6 +5,7 @@
 // namespace until an answer for the same backing and bytes is accepted.
 
 use std::fs::File;
+use weaver_server_disk::operations::disk::volume::LoopSite;
 
 use super::*;
 use crate::pipeline::graph::hardware::Shutdown;
@@ -454,7 +455,14 @@ impl NamespaceWriter {
         if actual != check.stated {
             let mut effects = Vec::new();
             tree.checksum_failed(check.node, check.member, &mut effects);
-            self.apply_each(tree, builder, segments, effects, Write::Again, out)?;
+            self.apply_each(
+                tree,
+                builder,
+                segments,
+                effects,
+                Write::Again(LoopSite::Verified),
+                out,
+            )?;
         }
         Ok(())
     }

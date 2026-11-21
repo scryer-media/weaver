@@ -16,7 +16,7 @@ use weaver_server_core::bandwidth::schedule_metrics::{
 use weaver_server_core::jobs::handle::{DownloadBlockKind, DownloadBlockState};
 use weaver_server_core::operations::instrumentation::{
     DbRuntimeMetricsSnapshot, DiskSpaceSnapshot, HistogramSnapshot, HttpMetricsSnapshot,
-    JobLifecycleMetricsSnapshot, LOOP_WAIT_KINDS, PipelineHistogramsSnapshot,
+    JobLifecycleMetricsSnapshot, LOOP_WAIT_KINDS, LOOP_WAIT_SITES, PipelineHistogramsSnapshot,
     ProcessMetricsSnapshot, ServerMetricsSnapshot, VolumeSnapshot,
 };
 use weaver_server_core::operations::metrics_store::{JOB_STATUS_KEYS, JobStatusCounts};
@@ -1582,6 +1582,7 @@ fn render_volumes(out: &mut Encoder, volumes: &[VolumeSnapshot]) {
         out.sample(&f::VOLUME_BUFFERED_BYTES, labels, volume.buffered_bytes);
         out.sample(&f::VOLUME_ARRIVED_BYTES, labels, volume.arrived_bytes);
         out.sample(&f::VOLUME_COUNTED_BYTES, labels, volume.counted_bytes);
+        out.sample(&f::VOLUME_CARRIED_BYTES, labels, volume.carried_bytes);
         out.sample(&f::VOLUME_COUNTED_PEAK_BYTES, labels, volume.peak_bytes);
         // Zero is "not sized yet", which is told by the series being absent.
         if volume.buffer_limit_bytes > 0 {
@@ -1609,14 +1610,26 @@ fn render_volumes(out: &mut Encoder, volumes: &[VolumeSnapshot]) {
             labels,
             writer.abandoned_operations,
         );
+        // One series per kind and site the loop has waited at: a site it
+        // never waited at has none.
         for (at, kind) in LOOP_WAIT_KINDS.iter().enumerate() {
-            let labels: &[(&str, &str)] = &[("volume", volume.label.as_str()), ("kind", kind)];
-            out.sample(&f::VOLUME_LOOP_WAITS, labels, writer.loop_waits_by_kind[at]);
-            out.sample_f64(
-                &f::VOLUME_LOOP_WAIT_SECONDS,
-                labels,
-                writer.loop_wait_nanos_by_kind[at] as f64 / 1e9,
-            );
+            for (from, site) in LOOP_WAIT_SITES.iter().enumerate() {
+                let waits = writer.loop_waits_by_site[at][from];
+                if waits == 0 {
+                    continue;
+                }
+                let labels: &[(&str, &str)] = &[
+                    ("volume", volume.label.as_str()),
+                    ("kind", kind),
+                    ("site", site),
+                ];
+                out.sample(&f::VOLUME_LOOP_WAITS, labels, waits);
+                out.sample_f64(
+                    &f::VOLUME_LOOP_WAIT_SECONDS,
+                    labels,
+                    writer.loop_wait_nanos_by_site[at][from] as f64 / 1e9,
+                );
+            }
         }
         out.sample(&f::VOLUME_LOOP_READS, labels, writer.loop_reads);
         out.sample_f64(

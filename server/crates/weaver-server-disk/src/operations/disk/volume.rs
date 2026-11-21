@@ -135,6 +135,10 @@ pub struct WriterCounts {
     pub(crate) loop_wait_nanos: AtomicU64,
     pub loop_waits_by_kind: [AtomicU64; LoopWait::COUNT],
     pub(crate) loop_wait_nanos_by_kind: [AtomicU64; LoopWait::COUNT],
+    // The same, by kind and then by the place the wait was made from
+    // (`LoopSite`).
+    pub loop_waits_by_site: [[AtomicU64; LoopSite::COUNT]; LoopWait::COUNT],
+    pub(crate) loop_wait_nanos_by_site: [[AtomicU64; LoopSite::COUNT]; LoopWait::COUNT],
     // Reads the queuing thread made itself of a file the writer writes,
     // after its wait, and how long they took, the open included.
     pub loop_reads: AtomicU64,
@@ -200,13 +204,148 @@ impl LoopWait {
     pub(crate) const ALL: [LoopWait; Self::COUNT] = [Self::Read, Self::Settle, Self::Budget];
 }
 
+// Where the queuing thread made a wait from: the caller path that stood it
+// for the volume, passed down by that caller to the wait. Each is labelled
+// by `instrumentation::LOOP_WAIT_SITES` at its index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopSite {
+    // An arriving article written to its member's leaf.
+    LeafWrite,
+    // Held bytes released into the leaf they were held for.
+    LeafRelease,
+    // Held bytes an object did not pay for, placed again from where they
+    // went (the replay).
+    ObjectRelease,
+    // A repair's delivery said again over the members it rebuilt.
+    Tail,
+    // An arriving recovery volume written to its own file.
+    RecoveryVolume,
+    // Bytes an object keeps, captured into its envelope.
+    Capture,
+    // An envelope given back to the member it was taken from.
+    GivenBack,
+    // Held bytes spilled to their spill file, or a spill released.
+    Spill,
+    // A delivery refused after it was returned, applied again.
+    Refused,
+    // A namespace shut, and what that shut applies.
+    Shut,
+    // Effects applied together outside a delivery.
+    ApplyAll,
+    // A member handed over to an object, and what that applies.
+    HandOver,
+    // An object's ask for bytes again, answered.
+    AnswerAgain,
+    // Answers held while a replay ran, applied once it ended.
+    AgainStaged,
+    // A member's front settled at its close.
+    FrontSettle,
+    // A member that ended unnamed, and what that applies.
+    Unnamed,
+    // A member judged at its close.
+    Judge,
+    // A verification's verdict, and what it applies.
+    Verified,
+    // A repair's slices placed.
+    Repair,
+    // A set reopened.
+    Reopen,
+    // Recovery sets bound to their members.
+    BindSets,
+    // What a recovery set reaches, applied.
+    RecoveryAt,
+    // A refusal given up, and what giving it up applies.
+    GiveUp,
+    // Bytes an object kept, materialised into the members they belong to.
+    Materialise,
+    // Lost runs filled with zeros.
+    Zeros,
+    // Bytes an object asked to be read on, read for it.
+    ReadOn,
+    // A placement an object reads, read for it.
+    ObjectRead,
+    // Held bytes taken from the scratch or spill file they sit in.
+    TakeHeld,
+    // A claimed file replayed into the object that claimed it.
+    ReplayFile,
+    // A checkpoint written or a restart read back.
+    Durable,
+    // Bytes an envelope no longer keeps, read out of it.
+    Unkept,
+    // A torrent's piece queued for its files.
+    Torrent,
+}
+
+impl LoopSite {
+    pub(crate) const COUNT: usize = 32;
+    // In the order of `instrumentation::LOOP_WAIT_SITES`, which labels them.
+    pub(crate) const ALL: [LoopSite; Self::COUNT] = [
+        Self::LeafWrite,
+        Self::LeafRelease,
+        Self::ObjectRelease,
+        Self::Tail,
+        Self::RecoveryVolume,
+        Self::Capture,
+        Self::GivenBack,
+        Self::Spill,
+        Self::Refused,
+        Self::Shut,
+        Self::ApplyAll,
+        Self::HandOver,
+        Self::AnswerAgain,
+        Self::AgainStaged,
+        Self::FrontSettle,
+        Self::Unnamed,
+        Self::Judge,
+        Self::Verified,
+        Self::Repair,
+        Self::Reopen,
+        Self::BindSets,
+        Self::RecoveryAt,
+        Self::GiveUp,
+        Self::Materialise,
+        Self::Zeros,
+        Self::ReadOn,
+        Self::ObjectRead,
+        Self::TakeHeld,
+        Self::ReplayFile,
+        Self::Durable,
+        Self::Unkept,
+        Self::Torrent,
+    ];
+
+    // The site's label: a static string, nothing formatted.
+    pub fn label(self) -> &'static str {
+        crate::operations::instrumentation::LOOP_WAIT_SITES[self as usize]
+    }
+}
+
+const _: () = assert!(
+    LoopSite::COUNT == crate::operations::instrumentation::LOOP_WAIT_SITES.len()
+        && LoopSite::Torrent as usize + 1 == LoopSite::COUNT
+);
+
+// Every site sits at its own index of `ALL`, so a label read by index is
+// the label of that site.
+const _: () = {
+    let mut index = 0;
+    while index < LoopSite::COUNT {
+        assert!(LoopSite::ALL[index] as usize == index);
+        index += 1;
+    }
+};
+
 impl WriterCounts {
-    // The queuing thread stood still for `nanos` waiting for `kind`. Relaxed adds.
-    pub(crate) fn loop_waited(&self, kind: LoopWait, nanos: u64) {
+    // The queuing thread stood still for `nanos` waiting for `kind`, from
+    // `site`. Relaxed adds.
+    pub(crate) fn loop_waited(&self, kind: LoopWait, site: LoopSite, nanos: u64) {
         self.loop_waits.fetch_add(1, Ordering::Relaxed);
         self.loop_wait_nanos.fetch_add(nanos, Ordering::Relaxed);
         self.loop_waits_by_kind[kind as usize].fetch_add(1, Ordering::Relaxed);
         self.loop_wait_nanos_by_kind[kind as usize].fetch_add(nanos, Ordering::Relaxed);
+        self.loop_waits_by_site[kind as usize][site as usize].fetch_add(1, Ordering::Relaxed);
+        self.loop_wait_nanos_by_site[kind as usize][site as usize]
+            .fetch_add(nanos, Ordering::Relaxed);
     }
 
     // The queuing thread read a writer's file itself for `nanos`. Relaxed adds.
@@ -380,19 +519,22 @@ impl Volume {
         (hard / 16).clamp(1, WRITE_PIECE)
     }
 
-    // Count `bytes` if they fit below the hard limit less `keep`. A volume
-    // that counts nothing grants one request whatever its size, so a
-    // request larger than the limit is still granted, alone. A volume not
-    // sized grants everything. `own_carried` are bytes the requester's own
-    // queuing thread carries here for output it holds (`writer::Credit`):
-    // the request is judged as though they were not counted, since nothing
-    // its writer could write frees them, only more of the output they are
-    // held for, which this request is. Only when they are all the volume
-    // counts is the request granted on that account, alone, as on an empty
-    // volume: then nothing else can make room, and the volume passes its
-    // limit by that one requester's held bytes. Whenever anything else is
-    // counted, carried or not, the request waits for room as any other.
-    fn grant(&self, bytes: u64, keep: u64, own_carried: u64) -> bool {
+    // The bytes counted against the volume's lease budget: all it counts
+    // less what the queuing threads carry for output they hold
+    // (`carried_bytes`). Nothing the writer writes frees carried bytes, only
+    // more of the output they are held for, and the RAM hold limit bounds
+    // them; they use no budget. Every grant, intake and wake line is
+    // measured on this.
+    pub fn uncarried_bytes(&self) -> u64 {
+        self.unwritten_bytes().saturating_sub(self.carried_bytes())
+    }
+
+    // Count `bytes` if they fit, with what the volume counts besides carried
+    // bytes (`uncarried_bytes`), below the hard limit less `keep`. A volume
+    // counting nothing besides carried bytes grants one request whatever its
+    // size, so a request larger than the limit is still granted, alone. A
+    // volume not sized grants everything.
+    fn grant(&self, bytes: u64, keep: u64) -> bool {
         let (_, hard) = self.buffer_limits();
         let limit = if hard == u64::MAX {
             u64::MAX
@@ -402,7 +544,9 @@ impl Volume {
         let granted =
             self.counted_bytes
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |counted| {
-                    (counted <= own_carried || counted.saturating_add(bytes) <= limit)
+                    let uncarried =
+                        counted.saturating_sub(self.carried_bytes.load(Ordering::SeqCst));
+                    (uncarried == 0 || uncarried.saturating_add(bytes) <= limit)
                         .then(|| counted.saturating_add(bytes))
                 });
         match granted {
@@ -415,12 +559,15 @@ impl Volume {
         }
     }
 
-    // Whether `bytes` more may be queued: they fit below the hard limit, or
-    // the volume counts nothing, or its writer holds nothing it could write
-    // to make room.
+    // Whether `bytes` more may be queued: they fit below the hard limit
+    // beside what the volume counts besides carried bytes
+    // (`uncarried_bytes`), as grants are judged, or it counts nothing
+    // besides them, or its writer holds nothing it could write to make
+    // room. A carry that grows wakes whoever stands for this
+    // (`writer::Credit::carry`).
     pub fn fits(&self, bytes: u64) -> bool {
         let (_, hard) = self.buffer_limits();
-        let counted = self.unwritten_bytes();
+        let counted = self.uncarried_bytes();
         counted == 0
             || counted.saturating_add(bytes) <= hard
             || self.buffered_bytes.load(Ordering::SeqCst) == 0
@@ -537,17 +684,18 @@ impl Volume {
         hard.saturating_sub((hard / 8).max(1))
     }
 
-    // Take the wake someone asked for, when the unwritten bytes have fallen
-    // to their line: the bits of whoever asked, once for each ask, to
-    // whoever lowered the bytes there; zero when there is no wake to take.
-    // The caller lowers its count first and asks after. A line raised while
-    // it takes is looked at again, so a wake the count has reached is never
-    // missed. One load when no one asked.
+    // Take the wake someone asked for, when the bytes counted besides
+    // carried ones (`uncarried_bytes`) have fallen to their line: the bits
+    // of whoever asked, once for each ask, to whoever lowered the bytes
+    // there; zero when there is no wake to take. The caller lowers its count
+    // first and asks after. A line raised while it takes is looked at again,
+    // so a wake the count has reached is never missed. One load when no one
+    // asked. Carried bytes that grow lower the measure as a write does.
     pub(crate) fn take_wake(&self) -> u64 {
         let taken = self
             .wake_line
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |ask| {
-                (ask != 0 && self.unwritten_bytes() < ask).then_some(0)
+                (ask != 0 && self.uncarried_bytes() < ask).then_some(0)
             })
             .is_ok();
         if taken {
@@ -557,8 +705,8 @@ impl Volume {
         }
     }
 
-    // Ask to be woken, once, when the unwritten bytes are `bytes` or
-    // fewer. False when they already are: nothing was asked and no wake
+    // Ask to be woken, once, when the bytes counted besides carried ones
+    // (`uncarried_bytes`) are `bytes` or fewer. False when they already are: nothing was asked and no wake
     // comes. One line is kept, the highest asked, which wakes soonest:
     // whoever a wake finds still short of room asks again for its own
     // line, so a lower ask never holds back a higher one. `asker` is the asking owner's bit; an owner whose ask
@@ -569,7 +717,7 @@ impl Volume {
         self.wake_askers.fetch_or(asker, Ordering::SeqCst);
         let ask = bytes.saturating_add(1);
         let before = self.wake_line.fetch_max(ask, Ordering::SeqCst);
-        if before >= ask || self.unwritten_bytes() > bytes {
+        if before >= ask || self.uncarried_bytes() > bytes {
             // A line this high or higher is out: whoever brings the count
             // below it takes the wake.
             return true;
@@ -619,18 +767,7 @@ impl Reservation {
     // when the volume has room (`Submitter::wake_below`). A volume that
     // counts nothing grants one request of any size.
     pub fn reserve(&mut self, bytes: u64, keep: u64) -> bool {
-        let granted = self.volume.grant(bytes, keep, 0);
-        if granted {
-            self.bytes += bytes;
-        }
-        granted
-    }
-
-    // `reserve` for a thread that produces output its queuing thread may
-    // carry, keeping nothing, judged beside `own_carried`, what that queuing
-    // thread already carries here for the requester (`Volume::grant`).
-    pub(super) fn reserve_ahead(&mut self, bytes: u64, own_carried: u64) -> bool {
-        let granted = self.volume.grant(bytes, 0, own_carried);
+        let granted = self.volume.grant(bytes, keep);
         if granted {
             self.bytes += bytes;
         }
@@ -719,6 +856,19 @@ mod tests {
 
     fn reservation(volume: &Arc<Volume>) -> Reservation {
         Reservation::none(Arc::clone(volume))
+    }
+
+    // Every loop-wait site has a label of its own: none empty, no two alike,
+    // and each site reads the label at its index.
+    #[test]
+    fn every_loop_site_has_a_distinct_label() {
+        let labels = crate::operations::instrumentation::LOOP_WAIT_SITES;
+        let distinct: std::collections::HashSet<&str> = labels.iter().copied().collect();
+        assert_eq!(distinct.len(), labels.len(), "{labels:?}");
+        assert!(labels.iter().all(|label| !label.is_empty()), "{labels:?}");
+        for (index, site) in LoopSite::ALL.iter().enumerate() {
+            assert_eq!(site.label(), labels[index]);
+        }
     }
 
     // Reservations that keep a write piece stop below the hard limit less
@@ -855,6 +1005,70 @@ mod tests {
         assert_eq!(volume.take_wake(), 0b10, "only the owner that asked");
     }
 
+    // A line is measured besides carried bytes: it is reached once the count
+    // is only what the queuing thread carries, though it carries more since
+    // and the count never falls below the line.
+    #[test]
+    fn a_wake_comes_when_only_carried_bytes_are_counted() {
+        let volume = sized(1600);
+        volume.charge(1000);
+        volume.carry(200);
+        assert!(volume.ask_wake(300, 1));
+        // A step settles, carrying more, still short of the line.
+        volume.carry(300);
+        assert_eq!(volume.take_wake(), 0, "500 counted besides carried bytes");
+        // The writer writes all it holds.
+        volume.release(500);
+        assert_eq!(volume.take_wake(), 1, "the writer has nothing to write");
+        assert_eq!(volume.take_wake(), 0, "one wake for the line");
+        volume.uncarry(500);
+        volume.release(500);
+    }
+
+    // A wake asked while the queuing thread carries more and more comes
+    // when what the volume counts besides carried bytes crosses the line,
+    // with nothing written or given back.
+    #[test]
+    fn a_wake_comes_as_carried_bytes_grow_past_the_line() {
+        let volume = sized(1600);
+        volume.charge(1000);
+        assert!(volume.ask_wake(300, 1));
+        volume.carry(600);
+        assert_eq!(volume.take_wake(), 0, "400 counted besides carried bytes");
+        volume.carry(200);
+        assert_eq!(volume.take_wake(), 1, "200 counted besides carried bytes");
+        assert!(
+            !volume.ask_wake(300, 1),
+            "already below the line besides carried bytes"
+        );
+        volume.uncarry(800);
+        volume.release(1000);
+    }
+
+    // Carried bytes use no lease budget: a volume counting its whole limit
+    // and more, nearly all of it carried, grants as an empty one does up to
+    // its limit beside them, and refuses past it.
+    #[test]
+    fn carried_bytes_use_no_lease_budget() {
+        let volume = sized(1600);
+        let keep = volume.write_piece();
+        let limit = 1600 - keep;
+        volume.charge(1700);
+        volume.carry(1600);
+        assert!(volume.grant(limit - 100, keep), "the budget beside them");
+        assert!(!volume.grant(1, keep), "past the budget");
+        volume.uncarry(1600);
+        volume.release(1700 + limit - 100);
+        // Nothing counted besides carried bytes: one request whatever its
+        // size, alone.
+        volume.charge(500);
+        volume.carry(500);
+        assert!(volume.grant(4000, keep));
+        assert!(!volume.grant(1, keep));
+        volume.uncarry(500);
+        volume.release(4500);
+    }
+
     // A release past the count is a fault: in a test it is caught, and
     // outside one the count stops at zero rather than wrapping.
     #[test]
@@ -867,7 +1081,7 @@ mod tests {
         assert_eq!(released.is_err(), cfg!(debug_assertions));
         assert_eq!(volume.unwritten_bytes(), 0);
         assert!(
-            volume.grant(1500, volume.write_piece(), 0),
+            volume.grant(1500, volume.write_piece()),
             "the volume still grants reservations"
         );
     }

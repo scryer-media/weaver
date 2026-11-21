@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::pipeline::graph::status::Claim;
+use weaver_server_disk::operations::disk::volume::LoopSite;
 
 fn pending() -> (Job, MemberId, Vec<u8>) {
     let mut job = Job::new(PLENTY);
@@ -449,7 +450,7 @@ fn a_rewrite_discards_an_old_answer_before_installing_a_fold() {
         .leaves
         .get_mut(&member)
         .unwrap()
-        .write(9, &[0x42], None)
+        .write(LoopSite::LeafWrite, 9, &[0x42], None)
         .unwrap();
     apply(&mut job, verified).unwrap();
     assert!(job.writer.verifications_waiting());
@@ -520,7 +521,9 @@ fn a_stale_read_error_cannot_fail_replacement_backing() {
     std::fs::remove_file(job.dir.path().join("payload.bin")).unwrap();
     let verified = check.run(&Default::default());
     let mut replacement = Leaf::at(job.dir.path(), "payload.bin");
-    replacement.write(0, &bytes, None).unwrap();
+    replacement
+        .write(LoopSite::LeafWrite, 0, &bytes, None)
+        .unwrap();
     job.writer
         .files_mut(NodeId::ROOT)
         .leaves
