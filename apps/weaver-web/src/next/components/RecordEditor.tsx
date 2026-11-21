@@ -6,7 +6,7 @@ import { useTranslate } from "@/lib/context/translate-context";
 import { Dialog } from "./Dialog";
 import { DangerButton, PrimaryButton, SecondaryButton } from "./controls";
 import { SectionHeader } from "./chrome";
-import { FieldRows, type FieldSpec } from "@/next/pages/settings/framework";
+import { FieldRows, Fold, type FieldSpec } from "@/next/pages/settings/framework";
 import { testIds } from "@/next/testids";
 
 /**
@@ -25,6 +25,8 @@ export interface EditorSection {
   tag?: ReactNode;
   note?: ReactNode;
   fields: FieldSpec[];
+  /** Rows under `fields` that slide open as one while `open`, such as the rest of a form behind a first choice. */
+  folded?: { open: boolean; fields: FieldSpec[] };
   /** Anything that is not a field, drawn the section's full width under its fields. */
   body?: ReactNode;
 }
@@ -101,6 +103,11 @@ export function RecordEditor({
         <div key={section.id} data-testid={testIds.section(section.id)} className="flex flex-none flex-col">
           <SectionHeader label={section.title} tag={section.tag} note={section.note} sticky={false} />
           <FieldRows fields={section.fields} />
+          {section.folded ? (
+            <Fold open={section.folded.open}>
+              <FieldRows fields={section.folded.fields} />
+            </Fold>
+          ) : null}
           {section.body}
         </div>
       ))}

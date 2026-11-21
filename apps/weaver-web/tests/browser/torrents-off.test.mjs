@@ -24,7 +24,6 @@ async function open(screen, presence) {
   return { page, errors };
 }
 const sent = (page, name) => page.evaluate((name) => window.torrentsOffFixture.sent.filter((entry) => entry.name === name).map((entry) => entry.variables), name);
-const save = (page) => page.evaluate(() => window.torrentsOffFixture.actions.current.save());
 const sentCount = (page, name, count) =>
   page.waitForFunction(([name, count]) => window.torrentsOffFixture.sent.filter((entry) => entry.name === name).length >= count, [name, count]);
 
@@ -83,19 +82,48 @@ test("with the switch on, the Torrents panel shows every section", async () => {
   await page.close();
 });
 
-test("turning torrents off while some run asks how they end, and the choice rides on the save", async () => {
+// Each box left on lets that part finish; the choice saves at once, with no Save.
+for (const [cleared, mode] of [[[], "FINISH_ALL"], [["seeding"], "FINISH_DOWNLOADS"], [["downloads"], "FINISH_SEEDING"]]) {
+  test(`turning torrents off while some run asks how they end and saves ${mode} at once`, async () => {
+    const { page, errors } = await open("panel", "onRunning");
+    await page.getByTestId("section-connection").waitFor();
+    await page.getByTestId("field-enabled").click();
+    const dialog = page.getByTestId("dialog-torrents-off");
+    await dialog.waitFor();
+    for (const key of ["downloads", "seeding"]) {
+      assert.equal(await page.getByTestId(`torrents-off-option-${key}`).getAttribute("aria-checked"), "true");
+    }
+    for (const key of cleared) {
+      await page.getByTestId(`torrents-off-option-${key}`).click();
+    }
+    assert.equal((await sent(page, "UpdateTorrentSettings")).length, 0);
+    await page.getByTestId("confirm-accept").click();
+    await sentCount(page, "UpdateTorrentSettings", 1);
+    assert.deepEqual(await sent(page, "UpdateTorrentSettings"), [
+      { input: { torrent: { enabled: false, whenDisabled: mode } } },
+    ]);
+    assert.equal(errors.length, 0, errors.join("\n"));
+    await page.close();
+  });
+}
+
+test("clearing both boxes asks again, naming the hit and run, before every torrent stops now", async () => {
   const { page, errors } = await open("panel", "onRunning");
   await page.getByTestId("section-connection").waitFor();
   await page.getByTestId("field-enabled").click();
-  await page.getByTestId("section-connection").waitFor({ state: "detached" });
-  await save(page);
-  const dialog = page.getByTestId("dialog-torrents-off");
-  await dialog.waitFor();
+  await page.getByTestId("dialog-torrents-off").waitFor();
+  await page.getByTestId("torrents-off-option-downloads").click();
+  await page.getByTestId("torrents-off-option-seeding").click();
+  await page.getByTestId("confirm-accept").click();
+  const force = page.getByTestId("dialog-torrents-off-force");
+  await force
+    .getByText("This will forcibly cancel all torrents and may result in a hit and run on private trackers.", { exact: true })
+    .waitFor();
   assert.equal((await sent(page, "UpdateTorrentSettings")).length, 0);
-  await dialog.getByTestId("torrents-off-option-FINISH_DOWNLOADS").click();
+  await force.getByTestId("confirm-accept").click();
   await sentCount(page, "UpdateTorrentSettings", 1);
   assert.deepEqual(await sent(page, "UpdateTorrentSettings"), [
-    { input: { torrent: { enabled: false, whenDisabled: "FINISH_DOWNLOADS" } } },
+    { input: { torrent: { enabled: false, whenDisabled: "STOP_NOW" } } },
   ]);
   assert.equal(errors.length, 0, errors.join("\n"));
   await page.close();
@@ -105,7 +133,6 @@ test("cancelling the question leaves torrents on and sends nothing", async () =>
   const { page, errors } = await open("panel", "onRunning");
   await page.getByTestId("section-connection").waitFor();
   await page.getByTestId("field-enabled").click();
-  await save(page);
   const dialog = page.getByTestId("dialog-torrents-off");
   await dialog.waitFor();
   await page.getByTestId("confirm-dismiss").click();
@@ -131,13 +158,12 @@ test("a wind-down under way can be cut short: Stop now sends torrents off to sto
 
 const FORCED_LINE = "A forced torrent, or one with no seeding limit, seeds until Stop now.";
 
-test("the question says a forced or goal-less torrent seeds on when every torrent is let finish", async () => {
+test("the question says a forced or goal-less torrent seeds on while seeding is let finish", async () => {
   const { page, errors } = await open("panel", "onRunning");
   await page.getByTestId("section-connection").waitFor();
   await page.getByTestId("field-enabled").click();
-  await save(page);
-  await page.getByTestId("torrents-off-option-FINISH_ALL-note").getByText(FORCED_LINE, { exact: true }).waitFor();
-  assert.equal(await page.getByTestId("torrents-off-option-FINISH_DOWNLOADS-note").count(), 0);
+  await page.getByTestId("torrents-off-option-seeding-note").getByText(FORCED_LINE, { exact: true }).waitFor();
+  assert.equal(await page.getByTestId("torrents-off-option-downloads-note").getByText(FORCED_LINE).count(), 0);
   assert.equal(errors.length, 0, errors.join("\n"));
   await page.close();
 });
@@ -170,14 +196,30 @@ test("the switch waits to be turned off until the server says which torrents run
   await page.close();
 });
 
-test("turning torrents off with none running saves at once, without asking", async () => {
+test("turning torrents off with none running asks once, with no boxes, and saves at once", async () => {
   const { page, errors } = await open("panel", "onIdle");
   await page.getByTestId("section-connection").waitFor();
   await page.getByTestId("field-enabled").click();
-  await save(page);
+  await page.getByTestId("dialog-torrents-off").waitFor();
+  assert.equal(await page.getByTestId("torrents-off-option-downloads").count(), 0);
+  await page.getByTestId("confirm-accept").click();
   await sentCount(page, "UpdateTorrentSettings", 1);
   assert.deepEqual(await sent(page, "UpdateTorrentSettings"), [{ input: { torrent: { enabled: false } } }]);
-  assert.equal(await page.getByTestId("dialog-torrents-off").count(), 0);
   assert.equal(errors.length, 0, errors.join("\n"));
   await page.close();
 });
+
+for (const control of ["field-enableTorrents", "field-enabled"]) {
+  test(`with torrents off, ${control} asks about the beta and turns them on at once`, async () => {
+    const { page, errors } = await open("panel", "off");
+    await page.getByTestId(control).click();
+    const dialog = page.getByTestId("dialog-enable-torrents");
+    await dialog.getByText("Torrents are in early beta, use at your own risk.", { exact: true }).waitFor();
+    assert.equal((await sent(page, "UpdateTorrentSettings")).length, 0);
+    await dialog.getByTestId("confirm-accept").click();
+    await sentCount(page, "UpdateTorrentSettings", 1);
+    assert.deepEqual(await sent(page, "UpdateTorrentSettings"), [{ input: { torrent: { enabled: true } } }]);
+    assert.equal(errors.length, 0, errors.join("\n"));
+    await page.close();
+  });
+}

@@ -134,4 +134,4 @@ export function torrentSettingsDisclosed<T>(enabled: boolean, toggle: T, rest: r
 }
 
 /** How the torrents still running end when torrents are turned off. */
-export type TorrentDisableMode = "STOP_NOW" | "FINISH_DOWNLOADS" | "FINISH_ALL";
+export type TorrentDisableMode = "STOP_NOW" | "FINISH_DOWNLOADS" | "FINISH_SEEDING" | "FINISH_ALL";

@@ -45,8 +45,9 @@ pub struct Context<'a> {
     pub now: i64,
     // Reading: the peers are taken now, not once a minute.
     pub at_once: bool,
-    // Goals: torrents are off, winding down to the downloads alone.
-    pub downloads_only: bool,
+    // Goals: torrents are off and winding down, to the downloads or to the
+    // seeds alone. `Finish` lets every torrent run on.
+    pub wind_down: Option<WindDown>,
     // Checkpoint: the torrents whose checkpoints are behind.
     pub unsaved: &'a BTreeSet<JobId>,
     // Turn: each torrent's seat in the queue, as the pass worked it out.
@@ -158,7 +159,8 @@ impl Policy for Checkpoint {
 }
 
 /// A seeding torrent whose goal is met does what its policy says; winding
-/// down to the downloads alone, one done downloading stops.
+/// down to the downloads alone, one done downloading stops, and to the seeds
+/// alone, one still downloading stops.
 pub struct Goals;
 
 impl Policy for Goals {
@@ -170,11 +172,14 @@ impl Policy for Goals {
             .flatten();
         // Winding down to the downloads alone, a torrent done downloading,
         // forced or not, seeding or waiting to, stops: its goal is not met.
-        if met.is_none()
-            && cx.downloads_only
-            && torrent.resumed()
-            && (torrent.complete() || torrent.seeding())
-        {
+        // Winding down to the seeds alone, one not done downloading stops.
+        let done = torrent.complete() || torrent.seeding();
+        let stops = match cx.wind_down {
+            Some(WindDown::FinishDownloads) => done,
+            Some(WindDown::FinishSeeding) => !done,
+            Some(WindDown::Finish) | None => false,
+        };
+        if met.is_none() && stops && torrent.resumed() {
             out.push(Intent::WindDown);
             return;
         }
@@ -506,15 +511,15 @@ impl TorrentService {
             holds,
             now,
             at_once: false,
-            downloads_only: false,
+            wind_down: None,
             unsaved: &NO_JOBS,
             seats: &NO_SEATS,
         }
     }
 
-    // Winding down to the downloads alone.
-    fn downloads_only(&self, settings: &TorrentSettings) -> bool {
-        !settings.torrent.enabled && self.wind_down() == Some(WindDown::FinishDownloads)
+    // The wind-down under way: none while torrents are on.
+    fn winding_down(&self, settings: &TorrentSettings) -> Option<WindDown> {
+        self.wind_down().filter(|_| !settings.torrent.enabled)
     }
 
     /// The tick's pass: every torrent read, its checkpoint written when it
@@ -533,7 +538,7 @@ impl TorrentService {
         let holds = self.holds();
         let unsaved = self.inner.signal.take_unsaved();
         let cx = Context {
-            downloads_only: self.downloads_only(&settings),
+            wind_down: self.winding_down(&settings),
             unsaved: unsaved.jobs(),
             ..Self::context(&settings, &rules, &holds, now)
         };
@@ -1040,7 +1045,7 @@ impl TorrentService {
         let rules = self.rules();
         let holds = HoldSet::default();
         let cx = Context {
-            downloads_only: self.downloads_only(&settings),
+            wind_down: self.winding_down(&settings),
             ..Self::context(&settings, &rules, &holds, now)
         };
         let mut gathered = Gathered::default();

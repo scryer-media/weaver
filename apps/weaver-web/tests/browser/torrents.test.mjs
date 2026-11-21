@@ -193,7 +193,7 @@ test("a torrent's detail names where each seeding term comes from, and its swarm
     "GOALS MET", "AnyGlobal",
     "THEN", "StopGlobal",
     "SEED TIME COUNTS", "All seedingGlobal",
-    "UPLOAD CAP PER TORRENT", "—Global",
+    "UPLOAD SPEED LIMIT PER TORRENT", "—Global",
   ];
   const shown = async (source) => (await seeding(source).innerText()).split("\n");
   // The terms in force are the daemon's: the override's goal, then the category's.

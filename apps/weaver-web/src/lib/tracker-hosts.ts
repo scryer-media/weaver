@@ -107,6 +107,16 @@ const text = (value: Bencoded | undefined): string[] =>
  * order and its lone announce URL. Null when the bytes are not a torrent.
  */
 export function torrentAnnounces(bytes: Uint8Array): string[] | null {
+  return torrentTrackers(bytes)?.all ?? null;
+}
+
+/**
+ * A .torrent file's trackers: every announce URL as `torrentAnnounces` gives
+ * them, and its main one, the lone announce URL the site that made it
+ * names, or else the first of its announce list. Null when the bytes are not
+ * a torrent.
+ */
+export function torrentTrackers(bytes: Uint8Array): { main: string | null; all: string[] } | null {
   let root: Bencoded;
   try {
     root = decode(bytes, 0)[0];
@@ -118,5 +128,6 @@ export function torrentAnnounces(bytes: Uint8Array): string[] | null {
   }
   const tiers = root.get("announce-list");
   const listed = Array.isArray(tiers) ? tiers.flatMap((tier) => (Array.isArray(tier) ? tier.flatMap(text) : [])) : [];
-  return [...new Set([...listed, ...text(root.get("announce"))])];
+  const announce = text(root.get("announce"));
+  return { main: announce[0] ?? listed[0] ?? null, all: [...new Set([...listed, ...announce])] };
 }

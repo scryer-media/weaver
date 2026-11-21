@@ -1892,6 +1892,9 @@ pub enum TorrentDisableModeGql {
     StopNow,
     /// Downloads finish; seeding stops; then torrents are off.
     FinishDownloads,
+    /// Seeding finishes to its own limits; downloads stop; then torrents
+    /// are off.
+    FinishSeeding,
     /// Torrents download and seed to their own limits; then torrents are
     /// off.
     FinishAll,
@@ -1903,6 +1906,7 @@ impl TorrentDisableModeGql {
         match self {
             Self::StopNow => None,
             Self::FinishDownloads => Some(WindDown::FinishDownloads),
+            Self::FinishSeeding => Some(WindDown::FinishSeeding),
             Self::FinishAll => Some(WindDown::Finish),
         }
     }
@@ -1912,6 +1916,7 @@ impl TorrentDisableModeGql {
         use weaver_server_core::torrents::service::WindDown;
         match wind_down {
             WindDown::FinishDownloads => Self::FinishDownloads,
+            WindDown::FinishSeeding => Self::FinishSeeding,
             WindDown::Finish => Self::FinishAll,
         }
     }

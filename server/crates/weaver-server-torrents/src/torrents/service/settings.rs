@@ -349,6 +349,9 @@ pub enum WindDown {
     /// Every torrent downloads; a torrent seeding stops; then torrents are
     /// off.
     FinishDownloads,
+    /// Every torrent seeding seeds to its own limits; a torrent still
+    /// downloading stops; then torrents are off.
+    FinishSeeding,
 }
 
 impl WindDown {
@@ -356,6 +359,7 @@ impl WindDown {
         match self {
             Self::Finish => "finish",
             Self::FinishDownloads => "finish_downloads",
+            Self::FinishSeeding => "finish_seeding",
         }
     }
 
@@ -363,6 +367,7 @@ impl WindDown {
         match value {
             "finish" => Some(Self::Finish),
             "finish_downloads" => Some(Self::FinishDownloads),
+            "finish_seeding" => Some(Self::FinishSeeding),
             _ => None,
         }
     }
