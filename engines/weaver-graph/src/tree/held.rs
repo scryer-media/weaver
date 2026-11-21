@@ -6,6 +6,9 @@
 // offset, a range held later before one held earlier at the same offset;
 // runs of one volume and one origin that touch or overlap are one run. A
 // hold costs a lookup and the runs it merges, never a walk of the others.
+// Bytes that arrive after a loss was told are no loss: they come out of the
+// runs, at a lookup and the runs that start within the volume's longest run
+// before them.
 
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
@@ -22,6 +25,10 @@ type At = (VolumeIndex, u64, Reverse<u64>);
 pub(super) struct HeldLost {
     // Each run's end and origin, by where it sits.
     runs: BTreeMap<At, (u64, NodeId)>,
+    // The longest run each volume held since the list was last empty: no
+    // run of the volume that starts further than that before a range
+    // reaches into it.
+    reach: BTreeMap<VolumeIndex, u64>,
     // How many runs were held: the order of the next.
     held: u64,
     // Runs kept after others were taken out may touch across the gap
@@ -91,6 +98,12 @@ impl HeldLost {
             self.runs.remove(&next);
         }
         self.runs.insert(at, (end, origin));
+        self.reaches(volume, end - at.1);
+    }
+
+    fn reaches(&mut self, volume: VolumeIndex, len: u64) {
+        let reach = self.reach.entry(volume).or_default();
+        *reach = (*reach).max(len);
     }
 
     // Merge the runs that touch, over the whole list.
@@ -107,6 +120,9 @@ impl HeldLost {
                 }
                 _ => merged.push((at, (end, origin))),
             }
+        }
+        for &((volume, start, _), (end, _)) in &merged {
+            self.reaches(volume, end - start);
         }
         self.runs = merged.into_iter().collect();
         self.unmerged = false;
@@ -128,7 +144,53 @@ impl HeldLost {
             !place
         });
         self.unmerged |= !taken.is_empty();
+        if self.runs.is_empty() {
+            self.reach.clear();
+        }
         taken
+    }
+
+    // Bytes of the range arrived: they are no loss, whatever origin told
+    // it. Each run they cover goes, and one they cover in part keeps the
+    // part before them, at its place in the order, and the part after
+    // them. Only the runs that start within the volume's reach before the
+    // range are looked at.
+    pub(super) fn arrived(&mut self, volume: VolumeIndex, range: ByteRange) {
+        if range.is_empty() {
+            return;
+        }
+        let Some(&reach) = self.reach.get(&volume) else {
+            return;
+        };
+        // `Reverse(u64::MAX)` sorts first among runs that start together.
+        let from = (volume, range.start.saturating_sub(reach), Reverse(u64::MAX));
+        let to = (volume, range.end, Reverse(u64::MAX));
+        let reached: Vec<(At, (u64, NodeId))> = self
+            .runs
+            .range(from..to)
+            .filter(|&(&(_, start, _), &(end, _))| start < range.end && end > range.start)
+            .map(|(at, run)| (*at, *run))
+            .collect();
+        #[cfg(test)]
+        {
+            self.walked += self.runs.range(from..to).count() as u64;
+        }
+        for ((volume, start, order), (end, origin)) in reached {
+            self.runs.remove(&(volume, start, order));
+            if start < range.start {
+                self.runs
+                    .insert((volume, start, order), (range.start, origin));
+            }
+            if end > range.end {
+                self.runs.insert((volume, range.end, order), (end, origin));
+            }
+            // What is left may now sit beside a run of its origin it was
+            // apart from: the next hold merges them, as after a placing.
+            self.unmerged = true;
+        }
+        if self.runs.is_empty() {
+            self.reach.clear();
+        }
     }
 }
 
@@ -245,6 +307,108 @@ mod tests {
             reference.hold(VolumeIndex(0), range, NodeId(origin));
         }
         assert_eq!(held.iter().collect::<Vec<_>>(), reference.0);
+    }
+
+    fn runs(held: &HeldLost) -> Vec<(u32, u64, u64, u32)> {
+        held.iter()
+            .map(|(volume, range, origin)| (volume.0, range.start, range.end, origin.0))
+            .collect()
+    }
+
+    fn holding(runs: &[(u32, u64, u64, u32)]) -> HeldLost {
+        let mut held = HeldLost::default();
+        for &(volume, start, end, origin) in runs {
+            held.hold(
+                VolumeIndex(volume),
+                ByteRange::new(start, end),
+                NodeId(origin),
+            );
+        }
+        held
+    }
+
+    // Bytes that cover a run whole take it out; the runs beside it, and
+    // the other volume's, stay.
+    #[test]
+    fn arrived_bytes_over_a_whole_run_take_it_out() {
+        let mut held = holding(&[(0, 0, 100, 1), (0, 200, 300, 1), (1, 200, 300, 1)]);
+        held.arrived(VolumeIndex(0), ByteRange::new(150, 350));
+        assert_eq!(runs(&held), vec![(0, 0, 100, 1), (1, 200, 300, 1)]);
+        held.arrived(VolumeIndex(0), ByteRange::new(0, 100));
+        held.arrived(VolumeIndex(1), ByteRange::new(200, 300));
+        assert!(held.is_empty());
+    }
+
+    // Bytes over the front, the middle or the back of a run leave the rest
+    // of it held, of the same origin.
+    #[test]
+    fn arrived_bytes_over_part_of_a_run_leave_the_rest() {
+        let mut front = holding(&[(0, 100, 200, 1)]);
+        front.arrived(VolumeIndex(0), ByteRange::new(50, 150));
+        assert_eq!(runs(&front), vec![(0, 150, 200, 1)]);
+
+        let mut middle = holding(&[(0, 100, 200, 1)]);
+        middle.arrived(VolumeIndex(0), ByteRange::new(120, 180));
+        assert_eq!(runs(&middle), vec![(0, 100, 120, 1), (0, 180, 200, 1)]);
+
+        let mut back = holding(&[(0, 100, 200, 1)]);
+        back.arrived(VolumeIndex(0), ByteRange::new(150, 250));
+        assert_eq!(runs(&back), vec![(0, 100, 150, 1)]);
+
+        // The rest is held as any run is: a hold beside it merges in.
+        middle.hold(VolumeIndex(0), ByteRange::new(120, 180), NodeId(1));
+        assert_eq!(runs(&middle), vec![(0, 100, 200, 1)]);
+    }
+
+    // Two origins that lost one range both lose the bytes that came.
+    #[test]
+    fn arrived_bytes_leave_every_origin() {
+        let mut held = holding(&[(0, 0, 100, 1), (0, 0, 100, 2)]);
+        held.arrived(VolumeIndex(0), ByteRange::new(0, 60));
+        assert_eq!(runs(&held), vec![(0, 60, 100, 2), (0, 60, 100, 1)]);
+        held.arrived(VolumeIndex(0), ByteRange::new(60, 100));
+        assert!(held.is_empty());
+    }
+
+    // Nothing held, or nothing held where the bytes came, changes nothing.
+    #[test]
+    fn arrived_bytes_where_nothing_is_held_change_nothing() {
+        let mut empty = HeldLost::default();
+        empty.arrived(VolumeIndex(0), ByteRange::new(0, 100));
+        assert!(empty.is_empty());
+
+        let mut held = holding(&[(0, 100, 200, 1)]);
+        held.arrived(VolumeIndex(0), ByteRange::new(0, 100));
+        held.arrived(VolumeIndex(0), ByteRange::new(200, 300));
+        held.arrived(VolumeIndex(1), ByteRange::new(100, 200));
+        held.arrived(VolumeIndex(0), ByteRange::new(150, 150));
+        assert_eq!(runs(&held), vec![(0, 100, 200, 1)]);
+    }
+
+    // Bytes that come over 5,000 scattered runs, one each, look at the run
+    // they reach and no other.
+    #[test]
+    fn arrived_bytes_look_at_the_runs_within_reach() {
+        let starts: Vec<u64> = (0..5_000_u64)
+            .map(|index| (index.wrapping_mul(2_654_435_761) % (1 << 32)) << 16)
+            .collect();
+        let mut held = HeldLost::default();
+        for &start in &starts {
+            held.hold(
+                VolumeIndex(0),
+                ByteRange::new(start, start + 1_000),
+                NodeId(0),
+            );
+        }
+        held.walked = 0;
+        for &start in &starts {
+            held.arrived(VolumeIndex(0), ByteRange::new(start + 400, start + 600));
+        }
+        assert_eq!(
+            held.walked, 5_000,
+            "each arrival looks at the one run it reaches"
+        );
+        assert_eq!(held.iter().count(), 10_000);
     }
 
     // 5,000 losses scattered over one volume, none touching: the old list

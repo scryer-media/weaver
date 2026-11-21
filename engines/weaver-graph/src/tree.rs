@@ -4709,6 +4709,7 @@ impl Tree {
         if self.nodes.queue_lent_delivery(node, arrived, length) {
             return;
         }
+        self.arrived_over_held_lost(node, arrived);
         let delivery = arrived.delivery();
         let mut emits = std::mem::take(&mut self.emits);
         emits.clear();
@@ -4911,6 +4912,26 @@ impl Tree {
             .entry(node)
             .or_default()
             .hold(volume, range, origin);
+    }
+
+    // Bytes of `node`'s volume came to its object after a loss over them
+    // was told and held: they are no loss, so what the object places of
+    // them is marked as they came, not as lost. A loss told after them
+    // still marks them, as it does a member's bytes. A node with no held
+    // loss costs one lookup.
+    fn arrived_over_held_lost(&mut self, node: NodeId, arrived: &Arrived) {
+        if !arrived.provenance.arrived() {
+            return;
+        }
+        let Some(held) = self.held_lost.get_mut(&node) else {
+            return;
+        };
+        let range = ByteRange::at(arrived.offset, arrived.bytes.len() as u64);
+        held.arrived(arrived.volume, range);
+        if held.is_empty() {
+            self.held_lost.remove(&node);
+            self.held_located.remove(&node);
+        }
     }
 
     // Once the object at `node` placed something, each of its held losses
@@ -6512,6 +6533,7 @@ mod tests {
     mod again;
     mod candidates;
     mod handed;
+    mod held_arrival;
     mod lift;
     mod never_open;
     mod numbered;
