@@ -1412,6 +1412,18 @@ pub struct DiskSpaceSnapshot {
     pub available_bytes: u64,
 }
 
+// The usenet pipeline's held bytes in RAM against the hold limit, as its
+// holds accountant counts them, read under its one lock.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct HoldsMetricsSnapshot {
+    pub resident_bytes: u64,
+    pub resident_limit_bytes: u64,
+    // The most `resident_bytes` has been since the pipeline started.
+    pub resident_peak_bytes: u64,
+    // Bytes ever kept in RAM past the limit, summed.
+    pub resident_past_limit_bytes: u64,
+}
+
 // One volume's write figures, as its writer and the rate sampler left them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VolumeSnapshot {

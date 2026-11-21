@@ -82,6 +82,11 @@ impl NamespaceUsage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HoldsUsage {
     pub resident: u64,
+    // The most `resident` has been since the accountant was made.
+    pub resident_peak: u64,
+    // Bytes ever taken into RAM past the resident limit
+    // (`HoldsAccountant::reserve_resident_past_limit`), summed.
+    pub past_limit_total: u64,
     pub scratch: u64,
     // Namespaces with anything accounted. An idle namespace is forgotten, so
     // the map never outgrows the work in flight.
@@ -92,6 +97,8 @@ pub struct HoldsUsage {
 struct Accounts {
     budgets: HoldBudgets,
     resident: u64,
+    resident_peak: u64,
+    past_limit_total: u64,
     scratch: u64,
     namespaces: HashMap<HoldsNamespace, NamespaceUsage>,
 }
@@ -122,9 +129,14 @@ impl Accounts {
         }
         let mut usage = self.usage(namespace);
         usage.resident += len;
-        self.resident += len;
+        self.grow_resident(len);
         self.store(namespace, usage);
         Reserve::Granted
+    }
+
+    fn grow_resident(&mut self, len: u64) {
+        self.resident += len;
+        self.resident_peak = self.resident_peak.max(self.resident);
     }
 
     // The scratch checks shared by a page-out and a direct spill. The
@@ -219,6 +231,8 @@ impl HoldsAccountant {
             accounts: Mutex::new(Accounts {
                 budgets,
                 resident: 0,
+                resident_peak: 0,
+                past_limit_total: 0,
                 scratch: 0,
                 namespaces: HashMap::new(),
             }),
@@ -298,6 +312,8 @@ impl HoldsAccountant {
         let accounts = self.lock();
         HoldsUsage {
             resident: accounts.resident,
+            resident_peak: accounts.resident_peak,
+            past_limit_total: accounts.past_limit_total,
             scratch: accounts.scratch,
             namespaces: accounts.namespaces.len(),
         }
@@ -354,7 +370,8 @@ impl HoldsAccountant {
         let mut accounts = self.lock();
         let mut usage = accounts.usage(namespace);
         usage.resident += len;
-        accounts.resident += len;
+        accounts.grow_resident(len);
+        accounts.past_limit_total += len;
         accounts.store(namespace, usage);
     }
 
@@ -1574,15 +1591,38 @@ mod tests {
         assert_idle(&accountant);
     }
 
+    // Nothing held; the peak and the past-limit total stay, as they are
+    // since the accountant was made.
     fn assert_idle(accountant: &HoldsAccountant) {
+        let usage = accountant.usage();
+        assert_eq!((usage.resident, usage.scratch, usage.namespaces), (0, 0, 0));
+    }
+
+    // Bytes taken past the limit raise the past-limit total and the peak,
+    // and a release lowers what is resident but leaves both.
+    #[test]
+    fn a_reserve_past_the_limit_raises_the_total_and_the_peak_and_a_release_keeps_them() {
+        let accountant = HoldsAccountant::new(budgets(10));
+        assert_eq!(accountant.reserve_resident(OTHER, 8), Reserve::Granted);
+        let usage = accountant.usage();
+        assert_eq!((usage.resident_peak, usage.past_limit_total), (8, 0));
+        accountant.reserve_resident_past_limit(OTHER, 5);
+        let usage = accountant.usage();
+        assert_eq!(usage.resident, 13, "past the limit of 10");
+        assert_eq!((usage.resident_peak, usage.past_limit_total), (13, 5));
+        accountant.release_resident(OTHER, 13);
+        let usage = accountant.usage();
+        assert_eq!(usage.resident, 0);
+        assert_eq!((usage.resident_peak, usage.past_limit_total), (13, 5));
+        assert_eq!(accountant.reserve_resident(OTHER, 4), Reserve::Granted);
+        let usage = accountant.usage();
         assert_eq!(
-            accountant.usage(),
-            HoldsUsage {
-                resident: 0,
-                scratch: 0,
-                namespaces: 0
-            }
+            (usage.resident_peak, usage.past_limit_total),
+            (13, 5),
+            "a lower hold moves neither"
         );
+        accountant.release_resident(OTHER, 4);
+        assert_idle(&accountant);
     }
 
     // A take hands back what a peek of the same range shows, in the same

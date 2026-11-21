@@ -279,6 +279,8 @@ impl PrometheusMetricsExporter {
         let server_metrics = self.handle.server_metrics_snapshot();
         let job_lifecycle = self.handle.job_lifecycle_metrics_snapshot();
         let pipeline_histograms = self.handle.pipeline_histograms_snapshot();
+        // The holds accountant's counts, under its own lock.
+        let holds = self.handle.holds_metrics_snapshot();
         let db_runtime = self.db.runtime_metrics_snapshot();
         let wal_checkpoint = self.db.wal_checkpoint_metrics_snapshot();
         let process = weaver_server_core::runtime::process_metrics::sample();
@@ -325,6 +327,7 @@ impl PrometheusMetricsExporter {
         input.process = Some(&process);
         input.disk_space = &disk_space;
         input.volumes = &volumes;
+        input.holds = holds.as_ref();
         input.http_metrics = Some(&http_metrics);
         render::render_prometheus_metrics_input(&input)
     }

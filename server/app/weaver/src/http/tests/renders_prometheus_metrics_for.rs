@@ -964,6 +964,11 @@ fn renders_collected_instrumentation_snapshots() {
     assert!(rendered.contains("weaver_volume_counted_bytes{volume=\"/mnt/nas\"} 69632"));
     assert!(rendered.contains("weaver_volume_carried_bytes{volume=\"/mnt/nas\"} 32768"));
     assert!(rendered.contains("weaver_volume_counted_peak_bytes{volume=\"/mnt/nas\"} 900000"));
+    // Held bytes in RAM against the hold limit, process-wide.
+    assert!(rendered.contains("\nweaver_holds_resident_bytes 3000\n"));
+    assert!(rendered.contains("\nweaver_holds_resident_limit_bytes 4096\n"));
+    assert!(rendered.contains("\nweaver_holds_resident_peak_bytes 4500\n"));
+    assert!(rendered.contains("\nweaver_holds_resident_past_limit_bytes_total 404\n"));
     // A sized volume carries its limits; one not sized yet carries neither.
     assert!(rendered.contains("weaver_volume_buffer_limit_bytes{volume=\"/mnt/nas\"} 1000000"));
     assert!(rendered.contains("weaver_volume_buffer_soft_limit_bytes{volume=\"/mnt/nas\"} 700000"));

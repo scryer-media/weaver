@@ -1016,6 +1016,17 @@ metric_families! {
         "Of `weaver_volume_counted_bytes`, the bytes counted for jobs' output held in memory to be written to a volume: held bytes, which only more of that output frees. A volume whose whole count is held bytes still takes one article or one step's results at a time, so it passes its buffer limit by held bytes only.");
     VOLUME_COUNTED_PEAK_BYTES = ("weaver_volume_counted_peak_bytes", Gauge, ["volume"],
         "The most bytes `weaver_volume_counted_bytes` has been since start.");
+    // The usenet pipeline's held bytes in RAM against the hold limit, read
+    // under the holds accountant's lock at scrape time. Conditional: emitted
+    // only once the pipeline has started.
+    HOLDS_RESIDENT_BYTES = ("weaver_holds_resident_bytes", Gauge, [],
+        "Bytes of jobs' output held in RAM now, across every job. Conditional: emitted only once the pipeline has started.");
+    HOLDS_RESIDENT_LIMIT_BYTES = ("weaver_holds_resident_limit_bytes", Gauge, [],
+        "The RAM hold limit: the most bytes `weaver_holds_resident_bytes` takes before held bytes go to scratch, but for bytes no scratch file may take yet (`weaver_holds_resident_past_limit_bytes_total`). Conditional: emitted only once the pipeline has started.");
+    HOLDS_RESIDENT_PEAK_BYTES = ("weaver_holds_resident_peak_bytes", Gauge, [],
+        "The most bytes `weaver_holds_resident_bytes` has been since start. Conditional: emitted only once the pipeline has started.");
+    HOLDS_RESIDENT_PAST_LIMIT_BYTES = ("weaver_holds_resident_past_limit_bytes_total", Counter, [],
+        "Bytes kept in RAM past `weaver_holds_resident_limit_bytes` because no scratch file could take them yet. Conditional: emitted only once the pipeline has started.");
     VOLUME_BUFFER_LIMIT_BYTES = ("weaver_volume_buffer_limit_bytes", Gauge, ["volume"],
         "The most bytes a volume may count (`weaver_volume_counted_bytes`): nothing is leased or queued for it past this many. Conditional: emitted only once the volume has been given its limits.");
     VOLUME_BUFFER_SOFT_LIMIT_BYTES = ("weaver_volume_buffer_soft_limit_bytes", Gauge, ["volume"],

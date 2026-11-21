@@ -81,6 +81,10 @@ pub struct SharedPipelineState {
     // their cached readings and never look at the disk themselves. Held
     // weakly, so the samplers stop with the pipeline that owns them.
     storage_capacity: Arc<RwLock<std::sync::Weak<crate::operations::StorageCapacity>>>,
+    // The pipeline's holds accountant, set once it starts: a metrics scrape
+    // reads its counts under its own lock and never waits on the pipeline.
+    // Held weakly, as the samplers above are.
+    graph_holds: Arc<RwLock<std::sync::Weak<weaver_graph::holds::HoldsAccountant>>>,
 }
 
 // Bounded like the job-level broadcast; a lagging listener drops articles,
@@ -122,6 +126,7 @@ impl SharedPipelineState {
             segment_events,
             speed_test: Arc::new(std::sync::Mutex::new(None)),
             storage_capacity: Arc::default(),
+            graph_holds: Arc::default(),
         }
     }
 
@@ -799,6 +804,33 @@ impl SharedPipelineState {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .upgrade()
+    }
+
+    pub(crate) fn set_graph_holds(&self, holds: &Arc<weaver_graph::holds::HoldsAccountant>) {
+        *self
+            .graph_holds
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::downgrade(holds);
+    }
+
+    // Held bytes in RAM against the hold limit, once the pipeline started.
+    pub fn holds_metrics_snapshot(
+        &self,
+    ) -> Option<weaver_server_base::operations::instrumentation::HoldsMetricsSnapshot> {
+        let holds = self
+            .graph_holds
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .upgrade()?;
+        let usage = holds.usage();
+        Some(
+            weaver_server_base::operations::instrumentation::HoldsMetricsSnapshot {
+                resident_bytes: usage.resident,
+                resident_limit_bytes: holds.budgets().resident_limit,
+                resident_peak_bytes: usage.resident_peak,
+                resident_past_limit_bytes: usage.past_limit_total,
+            },
+        )
     }
 
     pub fn set_nntp_runtime_activation(&self, activation: NntpRuntimeActivation) {
@@ -1535,6 +1567,13 @@ impl SchedulerHandle {
         &self,
     ) -> weaver_server_base::operations::instrumentation::PipelineHistogramsSnapshot {
         self.state.metrics().pipeline_histograms.snapshot()
+    }
+
+    // The holds accountant's counts. Read on demand, under its one lock.
+    pub fn holds_metrics_snapshot(
+        &self,
+    ) -> Option<weaver_server_base::operations::instrumentation::HoldsMetricsSnapshot> {
+        self.state.holds_metrics_snapshot()
     }
 
     // Get a fresh atomics-based metrics snapshot without advancing the shared

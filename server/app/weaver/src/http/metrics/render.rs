@@ -15,9 +15,9 @@ use weaver_server_core::bandwidth::schedule_metrics::{
 };
 use weaver_server_core::jobs::handle::{DownloadBlockKind, DownloadBlockState};
 use weaver_server_core::operations::instrumentation::{
-    DbRuntimeMetricsSnapshot, DiskSpaceSnapshot, HistogramSnapshot, HttpMetricsSnapshot,
-    JobLifecycleMetricsSnapshot, LOOP_WAIT_KINDS, LOOP_WAIT_SITES, PipelineHistogramsSnapshot,
-    ProcessMetricsSnapshot, ServerMetricsSnapshot, VolumeSnapshot,
+    DbRuntimeMetricsSnapshot, DiskSpaceSnapshot, HistogramSnapshot, HoldsMetricsSnapshot,
+    HttpMetricsSnapshot, JobLifecycleMetricsSnapshot, LOOP_WAIT_KINDS, LOOP_WAIT_SITES,
+    PipelineHistogramsSnapshot, ProcessMetricsSnapshot, ServerMetricsSnapshot, VolumeSnapshot,
 };
 use weaver_server_core::operations::metrics_store::{JOB_STATUS_KEYS, JobStatusCounts};
 use weaver_server_core::persistence::WalCheckpointMetricsSnapshot;
@@ -111,6 +111,8 @@ pub(crate) struct PrometheusRenderInput<'a> {
     pub(crate) disk_space: &'a [DiskSpaceSnapshot],
     // One row per volume the download side writes to.
     pub(crate) volumes: &'a [VolumeSnapshot],
+    // The usenet pipeline's held bytes in RAM; absent until it has started.
+    pub(crate) holds: Option<&'a HoldsMetricsSnapshot>,
     pub(crate) http_metrics: Option<&'a HttpMetricsSnapshot>,
 }
 
@@ -161,6 +163,7 @@ impl<'a> PrometheusRenderInput<'a> {
             process: None,
             disk_space: &[],
             volumes: &[],
+            holds: None,
             http_metrics: None,
         }
     }
@@ -221,6 +224,7 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
         process,
         disk_space,
         volumes,
+        holds,
         http_metrics,
     } = *input;
 
@@ -303,6 +307,9 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
     render_disk_space(&mut out, disk_space);
     render_volumes(&mut out, volumes);
     render_volume_throughput(&mut out, volumes);
+    if let Some(holds) = holds {
+        render_holds(&mut out, holds);
+    }
     if let Some(http) = http_metrics {
         render_http(&mut out, http);
     }
@@ -1562,6 +1569,25 @@ fn render_disk_space(out: &mut Encoder, disk_space: &[DiskSpaceSnapshot]) {
         out.sample(&f::DISK_TOTAL_BYTES, labels, disk.total_bytes);
         out.sample(&f::DISK_AVAILABLE_BYTES, labels, disk.available_bytes);
     }
+}
+
+fn render_holds(out: &mut Encoder, holds: &HoldsMetricsSnapshot) {
+    out.sample(&f::HOLDS_RESIDENT_BYTES, &[], holds.resident_bytes);
+    out.sample(
+        &f::HOLDS_RESIDENT_LIMIT_BYTES,
+        &[],
+        holds.resident_limit_bytes,
+    );
+    out.sample(
+        &f::HOLDS_RESIDENT_PEAK_BYTES,
+        &[],
+        holds.resident_peak_bytes,
+    );
+    out.sample(
+        &f::HOLDS_RESIDENT_PAST_LIMIT_BYTES,
+        &[],
+        holds.resident_past_limit_bytes,
+    );
 }
 
 fn render_volumes(out: &mut Encoder, volumes: &[VolumeSnapshot]) {

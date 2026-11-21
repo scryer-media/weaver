@@ -313,6 +313,7 @@ impl Pipeline {
         let graph_holds = Arc::new(weaver_graph::holds::HoldsAccountant::new(
             hold_settings.budgets(),
         ));
+        shared_state.set_graph_holds(&graph_holds);
         let graph_decode = Arc::new(crate::pipeline::graph::engine::DecodePool::for_run(
             &graph_hardware.grant().run,
         ));

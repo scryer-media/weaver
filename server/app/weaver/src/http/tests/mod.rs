@@ -1596,6 +1596,7 @@ struct CollectionFixtures {
     process: instr::ProcessMetricsSnapshot,
     disk_space: Vec<instr::DiskSpaceSnapshot>,
     volumes: Vec<instr::VolumeSnapshot>,
+    holds: instr::HoldsMetricsSnapshot,
     http_metrics: instr::HttpMetricsSnapshot,
 }
 
@@ -1610,6 +1611,12 @@ impl CollectionFixtures {
             process: sample_process_metrics(),
             disk_space: sample_disk_space(),
             volumes: sample_volumes(),
+            holds: instr::HoldsMetricsSnapshot {
+                resident_bytes: 3_000,
+                resident_limit_bytes: 4_096,
+                resident_peak_bytes: 4_500,
+                resident_past_limit_bytes: 404,
+            },
             http_metrics: sample_http_metrics(),
         }
     }
@@ -1625,6 +1632,7 @@ impl CollectionFixtures {
         input.process = Some(&self.process);
         input.disk_space = &self.disk_space;
         input.volumes = &self.volumes;
+        input.holds = Some(&self.holds);
         input.http_metrics = Some(&self.http_metrics);
     }
 }
