@@ -2416,25 +2416,41 @@ fn staged_repair(working_dir: &std::path::Path) -> Option<PathBuf> {
 // An extraction whose output lands on a volume of its own that stands
 // still, sized below what the extraction writes: the run pays for each
 // output on its own thread, against the volume it lands on, and the loop
-// never stands still for it. The volume never counts more than its limit,
-// or than it held when the run first stood.
+// never stands still for it. The volume never counts more than its limit
+// and what the loop holds of the member, or than it held when the run
+// first stood.
+//
+// The loop holds the member in memory until its first bytes say what it
+// is, at most `VERDICT_BYTES`, before its first write, and the bytes it
+// carries for them take none of the limit: a body no larger than the
+// limit and that hold together could be produced whole before the first
+// write, the run never standing on the volume. This body is larger than
+// both together, so the run stands on the volume whatever the order of the
+// threads. The run starts only once every article is in: an article's
+// bytes count on each volume they may land on until they are written, and
+// would be in the count the run first stands on.
 #[tokio::test]
 async fn an_extraction_onto_a_still_output_volume_never_stops_the_loop() {
+    // The most the loop holds of a member before its first write.
+    const HOLD: u64 = weaver_graph::VERDICT_BYTES as u64;
     let _threads = threads::real();
     let temp_dir = tempfile::tempdir().unwrap();
     let job_id = JobId(92_490);
-    let body = payload(6 * ARTICLE + 5, 6);
+    let body = payload(9 * ARTICLE + 5, 6);
     let posts = vec![echo_volume(0, &body)];
     // Above the 160 bytes the loop holds of a member before its first
     // write: a limit below that can never be met by a thread that pays.
-    let (mut pipeline, staging_dir) =
-        delivered_apart(&temp_dir, job_id, &posts, Some(4 * ARTICLE as u64)).await;
+    let limit = 4 * ARTICLE as u64;
+    assert!(body.len() as u64 > limit + HOLD);
+    let (mut pipeline, staging_dir) = delivered_apart(&temp_dir, job_id, &posts, Some(limit)).await;
+    let gate = Arc::new(crate::pipeline::graph::engine::echo::RunGate::default());
     pipeline
         .graph_jobs
         .get_mut(&job_id)
         .unwrap()
         .set_builder(Box::new(Echoes {
             volumes: 1,
+            gate: Some(Arc::clone(&gate)),
             ..Echoes::default()
         }));
     let disk = pipeline.graph_jobs[&job_id].disk().unwrap().clone();
@@ -2453,6 +2469,7 @@ async fn an_extraction_onto_a_still_output_volume_never_stops_the_loop() {
         seen
     });
     decode_all(&mut pipeline, job_id, &posts, 0).await;
+    gate.release();
     drain_runs(&mut pipeline, job_id).await;
     let (buffered, counted) = watcher.join().unwrap();
     disk.barrier().wait_aside();
@@ -2462,7 +2479,10 @@ async fn an_extraction_onto_a_still_output_volume_never_stops_the_loop() {
         0,
         "the loop stood still for the volume"
     );
-    assert!(counted <= hard.max(buffered), "{counted} over {hard}");
+    assert!(
+        counted <= hard.max(buffered) + HOLD,
+        "{counted} over {hard} and the loop's hold"
+    );
     retire_pipeline_database(pipeline).await;
 }
 
