@@ -2080,6 +2080,7 @@ export const nextZh: LocaleDictionary = {
   "next.torrents.routeReason.SESSION_LIMIT": "已达会话上限",
   "next.torrents.routeReason.OPENING": "正在打开",
   "next.torrents.stated.DISK_SPACE": "磁盘空间不足",
+  "next.torrents.stated.DISK_TOO_SMALL": "磁盘太小",
   "next.torrents.stated.DISK_FULL": "磁盘已满：仅做种",
   "next.torrents.stated.GOAL_MET": "已达到做种目标",
   "next.torrents.stated.HELD_MANUAL": "因暂停而保留",

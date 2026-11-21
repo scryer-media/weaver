@@ -2080,6 +2080,7 @@ export const nextJa: LocaleDictionary = {
   "next.torrents.routeReason.SESSION_LIMIT": "セッション数の上限に到達",
   "next.torrents.routeReason.OPENING": "開いています",
   "next.torrents.stated.DISK_SPACE": "ディスク容量不足",
+  "next.torrents.stated.DISK_TOO_SMALL": "ディスクが小さすぎます",
   "next.torrents.stated.DISK_FULL": "ディスクがいっぱい: シードのみ",
   "next.torrents.stated.GOAL_MET": "シード目標を達成",
   "next.torrents.stated.HELD_MANUAL": "一時停止で保留中",

@@ -1856,24 +1856,7 @@ pub struct Pipeline {
     // the disk had no fresh reading: the disk's ledger is waited on, so its
     // readings and the promises given back ring, and one that may let a job
     // start brings the next walk.
-    pub(super) admission_disk_held: bool,
-    // The least any job kept waiting on a disk needs there, the working
-    // disk first, then the complete disk when it is another: a reading of a
-    // disk whose room reaches its figure brings a walk, a smaller one does
-    // not.
-    pub(super) admission_disk_need_min: [u64; 2],
-    // A job was kept waiting for want of a fresh reading: the first one
-    // brings a walk.
-    pub(super) admission_disk_unread: bool,
-    // How many promises the disk had given back when the hold last looked:
-    // one given back since brings a walk.
-    pub(super) admission_disk_releases: u64,
-    // The most the disks could hold for a start when the last walk looked:
-    // disks that grew since bring a walk.
-    pub(super) admission_disk_most: Option<nzb_admission::StartMost>,
-    // The hold waits on the complete disk's ledger too, it being another
-    // disk the jobs write to.
-    pub(super) admission_disk_waits_complete: bool,
+    pub(super) admission_disk: weaver_server_disk::operations::start_rule::StartWait,
     // The jobs the last walk would have started but for the disk, and why.
     pub(super) disk_unadmitted: std::collections::BTreeMap<JobId, nzb_admission::DiskUnadmitted>,
     // What each job holding a slot was promised on the disk when it

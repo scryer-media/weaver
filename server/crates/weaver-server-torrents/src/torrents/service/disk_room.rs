@@ -11,8 +11,9 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use weaver_server_disk::operations::disk::{CapacityReader, StorageCapacity, StorageRoot};
 use weaver_server_disk::operations::room_wait::{
-    Disk, LedgerWait, Promised, RoomWait, StartCheck, Waiter, Wants, ever_downloaded,
+    Disk, LedgerWait, Promised, RoomWait, Waiter, Wants, ever_downloaded,
 };
+use weaver_server_disk::operations::start_rule::{StartRefused, StartRule};
 
 // How a torrent waits for room on the disk its folder lies on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,10 +23,16 @@ pub enum DiskHeld {
     // resumes it.
     Writing,
     // It has bytes to fetch and its turn came while the disk had no room
-    // over the reserve: it stays paused, as a usenet job is kept from
-    // starting, until a reading shows room. `Inner::start_held` holds the
-    // check's latch.
+    // for them over the reserve, less every promise there: it stays
+    // paused, as a usenet job is kept from starting, until a start could
+    // succeed. `Inner::start_held` holds the start rule's wait.
     Starting,
+    // It ran, and the files it wants grew past the room the disk has for
+    // what it has left: its download is held, its session in upload mode,
+    // seeding what it has, not paused, until a start could succeed, when
+    // it is judged and promised as a start is. `Inner::start_held` holds
+    // the start rule's wait.
+    Fetching,
 }
 
 // What a torrent's write that found no room was refused by: the disk
@@ -91,8 +98,9 @@ impl DiskWait {
 pub(super) enum StartHold {
     // It may start.
     Free,
-    // Its disk has no room over the reserve: it waits for room, shown so.
-    Short,
+    // Its disk has no room for what it has to fetch: it waits for room,
+    // shown with the figures of why.
+    Short(StartRefused),
     // It has bytes to fetch and the disk of its folder is being looked
     // up: it starts once it is known, so no piece meets a disk unknown.
     Unplaced,
@@ -246,40 +254,55 @@ impl TorrentService {
         }));
     }
 
-    // A reading came: each root's start hold whose disk shows room, or no
-    // reading, ends. Whether one did.
+    // The start rule torrents on `root`'s disk start by: fetched and
+    // delivered there.
+    fn start_rule(&self, root: StorageRoot) -> StartRule {
+        StartRule {
+            working: root,
+            output: root,
+            reserve: self.inner.env.limits.min_free_bytes,
+        }
+    }
+
+    // A disk rang: each root's start wait that a start could now succeed
+    // on ends, by the start rule's wait. Whether one did.
     fn release_start_holds(&self, capacity: &StorageCapacity) -> bool {
-        let reserve = self.inner.env.limits.min_free_bytes;
         let mut held = locked(&self.inner.start_held);
-        if !held.iter().any(|held| *held) {
+        if !held.iter().any(|wait| wait.held()) {
             return false;
         }
         let mut released = false;
         for root in StorageRoot::ALL {
-            released |= StartCheck { root, reserve }.release(capacity, &mut held[root_index(root)]);
+            released |= held[root_index(root)].ring(capacity, self.start_rule(root));
         }
         released
     }
 
-    // Where `torrent`, whose turn lets it run, stands at the start check
-    // on the disk its folder lies on. One with bytes to fetch waits for
-    // that disk to be known, since its pieces book there. Then one that
-    // never downloaded is kept from starting while the disk has no room
-    // over the reserve, as a usenet job that never downloaded is; one that
-    // downloaded, or is complete, starts. "Never downloaded" is read from
-    // the bytes its ledger counts as downloaded, over every run. A disk off
-    // the roots' is not checked.
+    // Where `torrent`, whose turn lets it run, stands at the start rule on
+    // the disk its folder lies on. One with bytes to fetch waits for that
+    // disk to be known, since its pieces book there. Then it starts only
+    // when what it still has to fetch fits by a fresh reading, less every
+    // promise there, and is promised that much as it starts, as a usenet
+    // job is; its pieces draw on the promise as they land. One promised in
+    // this run already, or complete, starts. A disk off the roots' is not
+    // checked.
     pub(super) fn start_hold(&self, torrent: &Live) -> StartHold {
-        self.start_hold_in(torrent, None)
+        self.start_hold_in(torrent, None, false)
     }
 
-    // `start_hold`, a look it begins one of `batch`'s when it is one.
+    // `start_hold`, a look it begins one of `batch`'s when it is one. A
+    // torrent `restored` that downloaded before keeps its place across the
+    // restart: it is promised what it has left, unjudged, as a usenet job
+    // that held its slot across a restart is.
     pub(super) fn start_hold_in(
         &self,
         torrent: &Live,
         batch: Option<&Arc<PlaceBatch>>,
+        restored: bool,
     ) -> StartHold {
-        if torrent.seeding() {
+        // One whose download is held for files it wants again is judged by
+        // what it has left, whatever its session last said of its pieces.
+        if torrent.seeding() && torrent.disk_held != Some(DiskHeld::Fetching) {
             return StartHold::Free;
         }
         let (Some(capacity), Some(intake)) = (&self.inner.env.capacity, &torrent.intake) else {
@@ -291,39 +314,252 @@ impl TorrentService {
             self.look_for_place_in(torrent.record.job_id, intake, files_dir(torrent), batch);
             return StartHold::Unplaced;
         };
-        if ever_downloaded(torrent.counters.downloaded_bytes) {
+        let room = intake.room();
+        if room.started() {
             return StartHold::Free;
         }
         let Disk::Root(root) = place.disk else {
+            // Off the roots' disks nothing is judged: its start is settled.
+            room.take_start(0);
             return StartHold::Free;
         };
-        let check = StartCheck {
-            root,
-            reserve: self.inner.env.limits.min_free_bytes,
+        // A magnet before its metadata has nothing known to fetch: it is
+        // judged once its metadata comes, by `start_unjudged`.
+        if torrent.layout.is_none() {
+            return StartHold::Free;
+        }
+        let (wanted, have) = super::wanted(
+            torrent.layout.as_deref(),
+            &torrent.levels,
+            &torrent.file_have_now(),
+        );
+        let need = wanted.saturating_sub(have);
+        if need == 0 {
+            room.take_start(0);
+            return StartHold::Free;
+        }
+        let rule = self.start_rule(root);
+        if restored && ever_downloaded(torrent.counters.downloaded_bytes) {
+            let (promised, _) = rule.promise_unjudged(capacity, need, need);
+            room.take_start(promised);
+            return StartHold::Free;
+        }
+        let refused = match rule.book_on(capacity, root, need, need) {
+            Ok((promised, _)) => {
+                room.take_start(promised);
+                return StartHold::Free;
+            }
+            Err(answer) => StartRefused::of(answer, need),
+        };
+        let Some(refused) = refused else {
+            return StartHold::Free;
+        };
+        self.keep_from_start(torrent, root, refused);
+        StartHold::Short(refused)
+    }
+
+    // `torrent`'s start on `root`'s disk was refused: it waits on the start
+    // rule's wait there, which a reading or a promise given back rings.
+    fn keep_from_start(&self, torrent: &Live, root: StorageRoot, refused: StartRefused) {
+        let Some(capacity) = &self.inner.env.capacity else {
+            return;
         };
         let mut held = locked(&self.inner.start_held);
-        let latch = &mut held[root_index(root)];
-        let was = *latch;
-        let kept = check.hold(capacity, latch);
+        let wait = &mut held[root_index(root)];
+        let was = wait.held();
+        wait.kept(capacity, self.start_rule(root), refused);
         drop(held);
-        if kept && !was {
+        if !was {
             tracing::info!(
                 job_id = torrent.record.job_id.0,
-                "the disk has no room over its reserve; torrents with bytes to fetch wait to start"
+                "the disk has no room for a torrent's bytes to fetch; it waits to start"
             );
-            // The follower reads the latch at its next turn.
+            // The follower reads the wait at its next turn.
             self.inner.disk_waits_moved.send_modify(|moved| *moved += 1);
-        }
-        if kept {
-            StartHold::Short
-        } else {
-            StartHold::Free
         }
     }
 
-    // Whether `torrent`, whose turn lets it run, is kept from starting.
+    // Whether `torrent`, running, was never judged by the start rule in this
+    // run: a magnet whose metadata came after its start. It is judged then,
+    // as any start is, and held as one refused at start. No walk.
+    pub(super) fn start_unjudged(&self, torrent: &Live) -> bool {
+        self.inner.env.capacity.is_some()
+            && torrent.layout.is_some()
+            && !torrent.seeding()
+            && torrent
+                .intake
+                .as_ref()
+                .is_some_and(|intake| intake.room().place().is_some() && !intake.room().started())
+    }
+
+    // The files `torrent` wants changed while it runs, its start promised
+    // or it seeding: what was promised goes back, and what it now has left
+    // to fetch is judged and promised by the start rule, before its session
+    // hears the new levels. One that does not fit has its download held: its
+    // session enters upload mode, seeding what it has, not paused, and it
+    // waits on the start rule's wait, shown with the figures of why, until
+    // a start could succeed. A run not under way yet is judged as it starts.
+    pub(super) fn rejudge_start(&self, torrent: &mut Live) {
+        let Some(capacity) = &self.inner.env.capacity else {
+            return;
+        };
+        let running = self.runs_now(torrent);
+        let (wanted, have) = super::wanted(
+            torrent.layout.as_deref(),
+            &torrent.levels,
+            &torrent.file_have_now(),
+        );
+        let need = wanted.saturating_sub(have);
+        let Some(intake) = &torrent.intake else {
+            return;
+        };
+        let room = intake.room();
+        if !room.started() && !running {
+            return;
+        }
+        room.release_start();
+        let Some(place) = room.place() else {
+            return;
+        };
+        let Disk::Root(root) = place.disk else {
+            room.take_start(0);
+            return;
+        };
+        let refused = match self.start_rule(root).book_on(capacity, root, need, need) {
+            Ok((promised, _)) => {
+                room.take_start(promised);
+                None
+            }
+            Err(answer) => StartRefused::of(answer, need),
+        };
+        match refused {
+            // Promised now: a hold from before ends, and it fetches.
+            None => {
+                if !room.started() {
+                    room.take_start(0);
+                }
+                self.end_fetch_hold(torrent);
+            }
+            Some(refused) if running => {
+                self.keep_from_start(torrent, root, refused);
+                self.hold_download(torrent, refused);
+            }
+            // Not running: it is judged again as it starts.
+            Some(_) => {}
+        }
+    }
+
+    // A check of every piece of `job_id`'s run on `handle` began: once it
+    // ends, what it found is judged as a change of the files it wants is
+    // (`rejudge_start`), so a check that finds less than was believed is
+    // promised what it has left, or has its download held, seeding. A run
+    // ended or replaced by then is judged as it starts.
+    pub(super) fn rejudge_after_check(
+        &self,
+        job_id: JobId,
+        session: &Arc<weaver_torrent::Session>,
+        handle: &Arc<weaver_torrent::ManagedTorrent>,
+    ) {
+        if self.inner.env.capacity.is_none() {
+            return;
+        }
+        let service = self.clone();
+        let stopping = session.cancellation_token().clone().cancelled_owned();
+        let handle = Arc::clone(handle);
+        self.keep(tokio::spawn(async move {
+            tokio::select! {
+                checked = handle.wait_until_initialized() => {
+                    if checked.is_err() {
+                        return;
+                    }
+                }
+                () = stopping => return,
+            }
+            let mut live = service.inner.live.lock().await;
+            let Some(torrent) = live.get_mut(&job_id) else {
+                return;
+            };
+            let same = torrent
+                .attached
+                .as_ref()
+                .is_some_and(|attached| Arc::ptr_eq(&attached.handle, &handle));
+            if !same {
+                return;
+            }
+            service.rejudge_start(torrent);
+            drop(live);
+            service.publish_job(job_id).await;
+        }));
+    }
+
+    // Whether `torrent` has a run under way, unpaused.
+    fn runs_now(&self, torrent: &Live) -> bool {
+        torrent.attached.as_ref().is_some_and(|attached| {
+            !attached.handle.is_paused() && attached.handle.live().is_some()
+        })
+    }
+
+    // Whether `torrent` has a run under way, unpaused, and verified data to
+    // seed.
+    pub(super) fn seeding_run(&self, torrent: &Live) -> bool {
+        self.runs_now(torrent) && torrent.file_have_now().iter().any(|have| *have > 0)
+    }
+
+    // `torrent`, running, was refused its start, `refused`, and waits on
+    // the start rule's wait: its download is held, its session in upload
+    // mode, seeding, not paused and with no stop said to its trackers. A
+    // wait for room a piece began, and what a wake handed it, end: the
+    // start rule's wait holds it now.
+    pub(super) fn hold_download(&self, torrent: &mut Live, refused: StartRefused) {
+        if torrent.disk_held == Some(DiskHeld::Writing) {
+            self.end_disk_wait(torrent.record.job_id, Some(torrent));
+        }
+        if let Some(intake) = &torrent.intake {
+            intake.room().give_back();
+        }
+        self.end_room_promise(torrent.record.job_id);
+        if torrent.disk_held != Some(DiskHeld::Fetching) {
+            tracing::info!(
+                job_id = torrent.record.job_id.0,
+                "the disk has no room for what a torrent has left to fetch; it seeds and waits for room"
+            );
+        }
+        torrent.disk_held = Some(DiskHeld::Fetching);
+        torrent.start_refused = Some(refused);
+        if let Some(run) = torrent
+            .attached
+            .as_ref()
+            .and_then(|attached| attached.handle.live())
+        {
+            run.hold_download();
+        }
+    }
+
+    // A torrent whose download was held for the room its grown files need
+    // fetches again: promised its start, or no longer running.
+    pub(super) fn end_fetch_hold(&self, torrent: &mut Live) {
+        if torrent.disk_held != Some(DiskHeld::Fetching) {
+            return;
+        }
+        torrent.disk_held = None;
+        torrent.start_refused = None;
+        if let Some(run) = torrent
+            .attached
+            .as_ref()
+            .and_then(|attached| attached.handle.live())
+        {
+            tracing::info!(
+                job_id = torrent.record.job_id.0,
+                "room was made on the disk; the torrent fetches again"
+            );
+            run.leave_upload_mode();
+        }
+    }
+
+    // One restored that downloaded before is promised what it has left,
+    // unjudged.
     pub(super) fn kept_from_starting(&self, torrent: &Live) -> bool {
-        self.start_hold(torrent) != StartHold::Free
+        self.start_hold_in(torrent, None, true) != StartHold::Free
     }
 
     // The disk of `dir`, the folder the torrent's pieces go to, is looked
@@ -491,7 +727,11 @@ impl TorrentService {
             let Some(torrent) = live.get_mut(&job_id) else {
                 return;
             };
-            if torrent.disk_held == Some(DiskHeld::Starting) {
+            // Held by the start rule: its wait is the one that lets it go.
+            if matches!(
+                torrent.disk_held,
+                Some(DiskHeld::Starting | DiskHeld::Fetching)
+            ) {
                 return;
             }
             let Some(run) = torrent
@@ -646,6 +886,11 @@ impl TorrentService {
     // it, so a new run never inherits them.
     pub(super) fn end_disk_room(&self, torrent: &mut Live) {
         let job_id = torrent.record.job_id;
+        if torrent.disk_held == Some(DiskHeld::Fetching) {
+            // Its next run is judged as it starts.
+            torrent.disk_held = None;
+            torrent.start_refused = None;
+        }
         if torrent.disk_held == Some(DiskHeld::Writing) {
             self.end_disk_wait(job_id, Some(torrent));
         } else {

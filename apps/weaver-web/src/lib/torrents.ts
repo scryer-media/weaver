@@ -376,6 +376,7 @@ export function routeReasonText(t: Translate, reason: TorrentRouteReason): strin
 /** The reasons the server states a torrent's state with, by name. */
 export const TORRENT_STATED_REASONS = [
   "DISK_SPACE",
+  "DISK_TOO_SMALL",
   "DISK_FULL",
   "GOAL_MET",
   "HELD_MANUAL",

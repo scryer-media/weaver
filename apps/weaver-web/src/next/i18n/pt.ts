@@ -2080,6 +2080,7 @@ export const nextPt: LocaleDictionary = {
   "next.torrents.routeReason.SESSION_LIMIT": "Limite de sessões atingido",
   "next.torrents.routeReason.OPENING": "Abrindo",
   "next.torrents.stated.DISK_SPACE": "Pouco espaço em disco",
+  "next.torrents.stated.DISK_TOO_SMALL": "Disco pequeno demais",
   "next.torrents.stated.DISK_FULL": "Disco cheio: apenas semeando",
   "next.torrents.stated.GOAL_MET": "Meta de semeadura atingida",
   "next.torrents.stated.HELD_MANUAL": "Retido por uma pausa",
