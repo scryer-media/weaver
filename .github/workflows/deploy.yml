@@ -1090,7 +1090,9 @@ jobs:
 
   rust-package-linux-arm64-portable:
     name: rust-package-linux-arm64-portable
-    runs-on: ubuntu-24.04-arm
+    # Pull requests build the lighter rc profile on the hosted runner;
+    # releases build on the larger paid runner.
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04-arm' || 'linux_arm_release' }}
     timeout-minutes: 90
     needs: [changes, verify-release-tag, web-build]
     if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.web-build.result == 'success' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
@@ -1099,6 +1101,7 @@ jobs:
       AWS_LC_SYS_STATIC: "1"
       AWS_LC_SYS_SMALL: "0"
       AWS_LC_SYS_CMAKE_BUILDER: "0"
+      WEAVER_CARGO_PROFILE: ${{ github.event_name == 'pull_request' && 'rc' || 'release' }}
       # Ubuntu's aarch64 gcc defaults to -moutline-atomics, which drags
       # libgcc's lse-init.o into every link that touches an atomic. That object
       # calls __getauxval, which glibc has and musl does not, so the link fails
@@ -1160,10 +1163,10 @@ jobs:
           export JEMALLOC_SYS_WITH_LG_PAGE=16
           entropy_headers="$(bash .github/scripts/prepare-musl-entropy.sh "$RUNNER_TEMP")"
           export AWS_LC_SYS_CFLAGS="${CFLAGS_aarch64_unknown_linux_musl} -idirafter ${entropy_headers}"
-          mold -run cargo build -p weaver --release --locked --target aarch64-unknown-linux-musl
+          mold -run cargo build -p weaver --profile "${WEAVER_CARGO_PROFILE}" --locked --target aarch64-unknown-linux-musl
       - name: Verify native libraries are statically bundled
         run: |
-          BINARY="target/aarch64-unknown-linux-musl/release/weaver"
+          BINARY="target/aarch64-unknown-linux-musl/${WEAVER_CARGO_PROFILE}/weaver"
           readelf -d "$BINARY" | tee weaver-linux-arm64-portable-native-linkage.txt
           if grep -q '(NEEDED)' weaver-linux-arm64-portable-native-linkage.txt; then
             echo "release binary has dynamic native dependencies" >&2
@@ -1172,7 +1175,7 @@ jobs:
       - name: Package tarball
         run: |
           mkdir -p dist/package
-          cp target/aarch64-unknown-linux-musl/release/weaver dist/package/weaver
+          cp "target/aarch64-unknown-linux-musl/${WEAVER_CARGO_PROFILE}/weaver" dist/package/weaver
           # Name the binary rather than packing `.`: installed builds refuse the
           # `./` root entry that `.` adds, and the upgrade manifest step fails on it.
           tar -czf weaver-linux-arm64-portable.tar.gz -C dist/package weaver

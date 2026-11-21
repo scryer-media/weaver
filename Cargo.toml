@@ -258,6 +258,67 @@ debug = 0
 strip = false
 incremental = false
 
+# Pull-request builds on Linux arm64: lighter than a release, still quick
+# enough to run, with the codec, checksum, recovery and crypto kernels at full
+# optimisation.
+[profile.rc]
+inherits = "release"
+opt-level = 2
+lto = false
+codegen-units = 16
+strip = false
+
+[profile.rc.package.weaver-yenc]
+opt-level = 3
+
+[profile.rc.package.crc-turbo]
+opt-level = 3
+
+[profile.rc.package.reedsolomon-rs]
+opt-level = 3
+
+[profile.rc.package.par2-rs]
+opt-level = 3
+
+[profile.rc.package.par3-rs]
+opt-level = 3
+
+[profile.rc.package.blake3]
+opt-level = 3
+
+[profile.rc.package.ppmd-turbo]
+opt-level = 3
+
+[profile.rc.package.zlib-rs]
+opt-level = 3
+
+[profile.rc.package.lzma-turbo]
+opt-level = 3
+
+[profile.rc.package.unrar-rs]
+opt-level = 3
+
+[profile.rc.package.sevenz-turbo]
+opt-level = 3
+
+[profile.rc.package.sha2]
+opt-level = 3
+
+[profile.rc.package.argon2]
+opt-level = 3
+
+[profile.rc.package.aws-lc-rs]
+opt-level = 3
+
+[profile.rc.package.aws-lc-sys]
+opt-level = 3
+
+[profile.rc.package.zstd-sys]
+opt-level = 3
+
+[profile.rc.package.libsqlite3-sys]
+opt-level = 3
+
 # Tests run without debug assertions: the suite proves behaviour, and the
 # assertions cost build and run time on every nextest run, in CI and locally.
 [profile.test]
