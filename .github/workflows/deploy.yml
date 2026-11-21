@@ -558,7 +558,8 @@ jobs:
       # Windows builds use the rustls/aws-lc TLS backend; s2n-tls is a
       # cfg(not(windows)) dependency and is never compiled here.
       CC_x86_64_pc_windows_msvc: clang-cl
-      CXX_x86_64_pc_windows_msvc: clang-cl
+      # C++ builds with MSVC's cl.exe, cc's default: the hosted VS2026 STL
+      # headers refuse the runner's clang-cl, which is older than they need.
     steps:
       - name: Keep checked-out line endings as committed
         shell: bash
@@ -639,7 +640,8 @@ jobs:
       # Windows builds use the rustls/aws-lc TLS backend; s2n-tls is a
       # cfg(not(windows)) dependency and is never compiled here.
       CC_x86_64_pc_windows_msvc: clang-cl
-      CXX_x86_64_pc_windows_msvc: clang-cl
+      # C++ builds with MSVC's cl.exe, cc's default: the hosted VS2026 STL
+      # headers refuse the runner's clang-cl, which is older than they need.
     steps:
       - name: Keep checked-out line endings as committed
         shell: bash
@@ -1756,7 +1758,8 @@ jobs:
       # Windows builds use the rustls/aws-lc TLS backend; s2n-tls is a
       # cfg(not(windows)) dependency and is never compiled here.
       CC_x86_64_pc_windows_msvc: clang-cl
-      CXX_x86_64_pc_windows_msvc: clang-cl
+      # C++ builds with MSVC's cl.exe, cc's default: the hosted VS2026 STL
+      # headers refuse the runner's clang-cl, which is older than they need.
       # Pull requests only prove the tree compiles and links, so they build
       # the fast ci-throwaway profile, as Scryer does. Tags build release.
       WEAVER_CARGO_PROFILE: ${{ github.event_name == 'pull_request' && 'ci-throwaway' || 'release' }}
@@ -1847,7 +1850,6 @@ jobs:
           $ErrorActionPreference = "Stop"
           if ($env:WEAVER_SCCACHE_ENABLED -eq "true") {
             $env:CC_x86_64_pc_windows_msvc = "sccache clang-cl"
-            $env:CXX_x86_64_pc_windows_msvc = "sccache clang-cl"
           }
           cargo build -p weaver --bins --profile ${{ env.WEAVER_CARGO_PROFILE }} --locked --target x86_64-pc-windows-msvc 2>&1 | Tee-Object -FilePath weaver-windows-x86_64-build.log
           if ($LASTEXITCODE -ne 0) {
