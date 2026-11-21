@@ -35,7 +35,6 @@ fn setup(label: &str) -> InitialAuthenticatedSetup {
     InitialAuthenticatedSetup {
         username: format!("admin-{label}"),
         password_hash: format!("hash-{label}"),
-        jwt_secret: [7; 32],
         browser_session: session(label),
         completed_at: 100,
         bind_address: Some("127.0.0.1".into()),

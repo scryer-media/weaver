@@ -4040,7 +4040,10 @@ async fn resolve_scope_rejects_trusted_session_cookie_when_login_is_enabled() {
     auth_cache.replace(Some(CachedLoginAuth::new(
         "admin",
         password_hash,
-        jwt::generate_jwt_secret(),
+        &weaver_server_core::auth::SigningKeys::derive(
+            &weaver_server_core::persistence::encryption::EncryptionKey::generate(),
+        )
+        .unwrap(),
     )));
     let api_key_cache = ApiKeyCache::default();
     let mut headers = HeaderMap::new();
@@ -4191,7 +4194,14 @@ async fn resolve_scope_accepts_cached_jwt_without_db_lookup() {
     let password_hash = hash_password(&test_password()).unwrap();
     let auth_cache = LoginAuthCache::default();
     let api_key_cache = ApiKeyCache::default();
-    let auth = CachedLoginAuth::new("admin", password_hash, jwt::generate_jwt_secret());
+    let auth = CachedLoginAuth::new(
+        "admin",
+        password_hash,
+        &weaver_server_core::auth::SigningKeys::derive(
+            &weaver_server_core::persistence::encryption::EncryptionKey::generate(),
+        )
+        .unwrap(),
+    );
     let token = jwt::create_jwt("admin", &auth.jwt_secret, JWT_TTL_SECS);
     auth_cache.replace(Some(auth));
 
@@ -4257,7 +4267,7 @@ async fn login_handler_rejects_legacy_scrypt_hash() {
     db.set_auth_credentials("admin", &legacy_hash).unwrap();
     let auth_cache = LoginAuthCache::from_credentials(
         db.get_auth_credentials().unwrap(),
-        db.get_or_create_jwt_signing_secret().unwrap(),
+        &weaver_server_core::auth::SigningKeys::for_database(&db).unwrap(),
     );
     let app = auth_test_router(db.clone(), auth_cache.clone());
 
@@ -4287,7 +4297,7 @@ async fn login_handler_wrong_password_keeps_argon2_hash_and_cache() {
     db.set_auth_credentials("admin", &argon2_hash).unwrap();
     let auth_cache = LoginAuthCache::from_credentials(
         db.get_auth_credentials().unwrap(),
-        db.get_or_create_jwt_signing_secret().unwrap(),
+        &weaver_server_core::auth::SigningKeys::for_database(&db).unwrap(),
     );
     let original = auth_cache.snapshot().unwrap();
     let app = auth_test_router(db.clone(), auth_cache.clone());
@@ -4318,7 +4328,7 @@ async fn login_handler_wrong_username_with_valid_password_is_unauthorized() {
     db.set_auth_credentials("admin", &argon2_hash).unwrap();
     let auth_cache = LoginAuthCache::from_credentials(
         db.get_auth_credentials().unwrap(),
-        db.get_or_create_jwt_signing_secret().unwrap(),
+        &weaver_server_core::auth::SigningKeys::for_database(&db).unwrap(),
     );
     let original = auth_cache.snapshot().unwrap();
     let app = auth_test_router(db.clone(), auth_cache.clone());
@@ -4349,7 +4359,7 @@ async fn login_handler_rate_limits_repeated_failures() {
     db.set_auth_credentials("admin", &argon2_hash).unwrap();
     let auth_cache = LoginAuthCache::from_credentials(
         db.get_auth_credentials().unwrap(),
-        db.get_or_create_jwt_signing_secret().unwrap(),
+        &weaver_server_core::auth::SigningKeys::for_database(&db).unwrap(),
     );
     let app = auth_test_router(db, auth_cache);
 
@@ -4404,7 +4414,7 @@ async fn login_handler_malformed_hash_fails_cleanly() {
     db.set_auth_credentials("admin", "not-a-phc-hash").unwrap();
     let auth_cache = LoginAuthCache::from_credentials(
         db.get_auth_credentials().unwrap(),
-        db.get_or_create_jwt_signing_secret().unwrap(),
+        &weaver_server_core::auth::SigningKeys::for_database(&db).unwrap(),
     );
     let original = auth_cache.snapshot().unwrap();
     let app = auth_test_router(db.clone(), auth_cache.clone());
@@ -4432,7 +4442,14 @@ async fn auth_status_handler_uses_cached_auth_state() {
     let db = Database::open_in_memory().unwrap();
     let password_hash = hash_password(&test_password()).unwrap();
     let auth_cache = LoginAuthCache::default();
-    let auth = CachedLoginAuth::new("admin", password_hash, jwt::generate_jwt_secret());
+    let auth = CachedLoginAuth::new(
+        "admin",
+        password_hash,
+        &weaver_server_core::auth::SigningKeys::derive(
+            &weaver_server_core::persistence::encryption::EncryptionKey::generate(),
+        )
+        .unwrap(),
+    );
     let token = jwt::create_jwt("admin", &auth.jwt_secret, JWT_TTL_SECS);
     auth_cache.replace(Some(auth));
     let app = auth_test_router(db, auth_cache);
@@ -4477,7 +4494,10 @@ async fn a_trusted_network_is_not_signed_in_once_a_login_exists() {
     auth_cache.replace(Some(CachedLoginAuth::new(
         "admin",
         "not-a-phc-hash",
-        jwt::generate_jwt_secret(),
+        &weaver_server_core::auth::SigningKeys::derive(
+            &weaver_server_core::persistence::encryption::EncryptionKey::generate(),
+        )
+        .unwrap(),
     )));
     let after_login = auth_status_payload(auth_status_test_router_from_peer(
         Database::open_in_memory().unwrap(),
@@ -4530,7 +4550,10 @@ async fn auth_status_omits_the_setup_facts_once_setup_cannot_run() {
     auth_cache.replace(Some(CachedLoginAuth::new(
         "admin",
         hash_password(&test_password()).unwrap(),
-        jwt::generate_jwt_secret(),
+        &weaver_server_core::auth::SigningKeys::derive(
+            &weaver_server_core::persistence::encryption::EncryptionKey::generate(),
+        )
+        .unwrap(),
     )));
     let payload = auth_status_payload(auth_status_test_router(
         db,
@@ -5191,7 +5214,7 @@ async fn archive_server_with(spawn_history_delete_worker: bool) -> ArchiveServer
         server_transfer_policy,
         auth_cache: LoginAuthCache::from_credentials(
             None,
-            db.get_or_create_jwt_signing_secret().unwrap(),
+            &weaver_server_core::auth::SigningKeys::for_database(&db).unwrap(),
         ),
         api_key_cache: ApiKeyCache::default(),
         security: weaver_server_core::security::RuntimeSecurityConfig::default(),

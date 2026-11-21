@@ -85,6 +85,22 @@ impl EncryptionKey {
     pub fn to_base64(&self) -> String {
         STANDARD.encode(self.key_bytes)
     }
+
+    // A 32-byte key derived from this one for `info` alone: HKDF-SHA256 with
+    // the master key as input key material and an empty salt. The same key
+    // and label give the same bytes; another label gives an unrelated key,
+    // and none of them is the master key or tells anything of it.
+    pub fn derive_key(&self, info: &[u8]) -> Result<[u8; 32], String> {
+        use aws_lc_rs::hkdf;
+
+        let mut derived = [0u8; 32];
+        hkdf::Salt::new(hkdf::HKDF_SHA256, &[])
+            .extract(&self.key_bytes)
+            .expand(&[info], hkdf::HKDF_SHA256)
+            .and_then(|okm| okm.fill(&mut derived))
+            .map_err(|_| "key derivation failed".to_string())?;
+        Ok(derived)
+    }
 }
 
 // Encrypt a plaintext string. Returns `enc:v1:<base64(nonce || ciphertext || tag)>`.
