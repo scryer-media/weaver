@@ -222,6 +222,27 @@ export function diskPace(
   return byId.size === 0 && slowest === 0 ? NO_DISK_PACE : { byId, slowest };
 }
 
+const FETCHING_STATES = new Set(["DOWNLOADING", "FETCHING_REPAIR_DATA"]);
+
+/** Whether no job in the queue is fetching bytes, from the daemon's counts. */
+export function nothingDownloading(stateCounts: readonly QueueStateCount[]): boolean {
+  return !stateCounts.some(({ state, count }) => FETCHING_STATES.has(state) && count > 0);
+}
+
+/**
+ * The write rate the queue drains at while a slow disk holds bytes waiting:
+ * the slowest measured rate among such disks, 0 when there is none.
+ */
+export function slowDiskRate(
+  volumes: readonly { slow: boolean; writeRateBytesPerSec: number; waitingBytes: number }[],
+): number {
+  let slowest = 0;
+  for (const { slow, writeRateBytesPerSec: rate, waitingBytes } of volumes) {
+    if (slow && waitingBytes > 0 && rate > 0 && (slowest === 0 || rate < slowest)) slowest = rate;
+  }
+  return slowest;
+}
+
 /** A queue event, as far as the ticks care. */
 export interface QueueEventSummary {
   kind: string;

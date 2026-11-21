@@ -18,6 +18,14 @@ export interface EtaConditions {
   paused: boolean;
   /** The speed limit in force in bytes per second, 0 for none. */
   speedLimit: number;
+  /** No job is downloading: the last one finished, or what is left waits. Left out, one is. */
+  idle?: boolean;
+  /**
+   * The write rate of a slow disk that holds bytes waiting, in bytes per
+   * second, 0 or left out for none. The queue drains no slower than that
+   * disk writes, so the speed is not eased below it.
+   */
+  diskRate?: number;
 }
 
 const FREE_RUNNING: EtaConditions = { paused: false, speedLimit: 0 };
@@ -34,6 +42,8 @@ export interface EtaEstimatorState {
   smoothedSpeed: number;
   displayedSpeed: number;
   displayedAt: number;
+  /** The highest smoothed speed since the estimate last started again. */
+  peakSpeed: number;
 }
 
 const ACTIVE_ETA_STATUSES = new Set(["DOWNLOADING", "QUEUED"]);
@@ -101,6 +111,7 @@ export function createEtaEstimator(): EtaEstimatorState {
     smoothedSpeed: 0,
     displayedSpeed: 0,
     displayedAt: 0,
+    peakSpeed: 0,
   };
 }
 
@@ -109,6 +120,10 @@ function capped(speed: number, speedLimit: number): number {
   return speedLimit > 0 ? Math.min(speed, speedLimit) : speed;
 }
 
+// While a slow disk holds bytes waiting, downloads stand behind its writer
+// and the bytes come in bursts. The queue still drains at that disk's rate,
+// so the speed shown stays at or above it, and above no speed this run of
+// samples has reached: a disk faster than the wire lifts nothing.
 export function nextEtaSpeed(
   state: EtaEstimatorState,
   jobs: EtaJobInput[],
@@ -116,14 +131,36 @@ export function nextEtaSpeed(
   now: number,
   conditions: EtaConditions = FREE_RUNNING,
 ): number {
+  // A new limit, a pause or an idle queue starts the peak again with the samples.
+  if (conditions.speedLimit !== state.speedLimit) {
+    state.peakSpeed = 0;
+  }
+  const eased = easedEtaSpeed(state, jobs, instantaneousSpeed, now, conditions);
+  if (state.samples.length === 0) {
+    state.peakSpeed = 0;
+    return eased;
+  }
+  state.peakSpeed = Math.max(state.peakSpeed, state.smoothedSpeed);
+  const diskRate = conditions.diskRate ?? 0;
+  const floor = diskRate > 0 ? capped(Math.min(diskRate, state.peakSpeed), conditions.speedLimit) : 0;
+  return Math.max(eased, floor);
+}
+
+function easedEtaSpeed(
+  state: EtaEstimatorState,
+  jobs: EtaJobInput[],
+  instantaneousSpeed: number,
+  now: number,
+  conditions: EtaConditions,
+): number {
   // A new limit makes the bytes before it no guide to the speed after it,
   // so the estimate starts again from the next samples.
   const limitChanged = conditions.speedLimit !== state.speedLimit;
   state.speedLimit = conditions.speedLimit;
   const activeJobs = activeEtaJobs(jobs);
-  // Held, nothing moves: the speed is 0 now, not once the easing decays,
-  // and a resume starts from fresh samples.
-  if (conditions.paused || activeJobs.length === 0) {
+  // Held, or nothing downloading: the speed is 0 now, not once the easing
+  // decays, and a resume starts from fresh samples.
+  if (conditions.paused || conditions.idle || activeJobs.length === 0) {
     state.signature = "";
     state.samples = [];
     state.smoothedSpeed = 0;

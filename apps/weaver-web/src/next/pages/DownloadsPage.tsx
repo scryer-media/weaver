@@ -44,8 +44,10 @@ import {
   diskPace,
   etaById as etaByIdFrom,
   groupCounts as groupCountsFrom,
+  nothingDownloading,
   queuePageInput,
   queueSelection,
+  slowDiskRate,
   tabCounts as tabCountsFrom,
   withoutIds,
   type QueueBatchTarget,
@@ -373,7 +375,12 @@ export function DownloadsPage() {
         : [],
     [page.etaDownloadedBytes, page.etaTotalBytes],
   );
-  const etaConditions = useMemo(() => ({ paused: isPaused, speedLimit }), [isPaused, speedLimit]);
+  const idle = useMemo(() => nothingDownloading(page.stateCounts), [page.stateCounts]);
+  const diskRate = useMemo(() => slowDiskRate(diskVolumes), [diskVolumes]);
+  const etaConditions = useMemo(
+    () => ({ paused: isPaused, speedLimit, idle, diskRate }),
+    [isPaused, speedLimit, idle, diskRate],
+  );
   const etaSpeed = useStableEtaSpeed(etaSample, speed, etaConditions);
   // A row a slow disk holds back runs at that disk's rate, not the download speed.
   const pace = useMemo(() => diskPace(jobs, diskVolumes), [jobs, diskVolumes]);
