@@ -2,13 +2,13 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // The lost ranges of one node's volumes its object holds until it can place
-// them, each with the node the loss was told at. Sorted by volume and
-// offset, a range held later before one held earlier at the same offset;
-// runs of one volume and one origin that touch or overlap are one run. A
-// hold costs a lookup and the runs it merges, never a walk of the others.
-// Bytes that arrive after a loss was told are no loss: they come out of the
-// runs, at a lookup and the runs that start within the volume's longest run
-// before them.
+// them, each with the node the loss was told at. The runs of one volume and
+// one origin are kept apart from every other's, sorted by offset, and runs
+// that touch or overlap are one run: no two runs of a volume and an origin
+// share a byte. A hold costs a lookup and the runs it merges. Bytes that
+// arrive after a loss was told are no loss: they come out of the runs, at a
+// lookup for each origin that holds runs of the volume and the runs the
+// bytes cover, never a walk of the others.
 
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
@@ -17,25 +17,21 @@ use std::ops::Bound;
 use crate::NodeId;
 use crate::volume::{ByteRange, VolumeIndex};
 
-// Where a run sits: its volume, its start, and the order it was held in,
-// the later first among runs that start together.
+// One run: its end, and the order it was held in.
+type Run = (u64, u64);
+
+// Where a run sorts among all: its volume, its start, and the order it was
+// held in, the later first among runs that start together.
 type At = (VolumeIndex, u64, Reverse<u64>);
 
 #[derive(Debug, Default)]
 pub(super) struct HeldLost {
-    // Each run's end and origin, by where it sits.
-    runs: BTreeMap<At, (u64, NodeId)>,
-    // The longest run each volume held since the list was last empty: no
-    // run of the volume that starts further than that before a range
-    // reaches into it.
-    reach: BTreeMap<VolumeIndex, u64>,
+    // The runs of each volume and origin, by where each starts. A volume
+    // and origin with no run has no entry.
+    runs: BTreeMap<(VolumeIndex, NodeId), BTreeMap<u64, Run>>,
     // How many runs were held: the order of the next.
     held: u64,
-    // Runs kept after others were taken out may touch across the gap
-    // those left: the next hold merges them all, as a merge over the whole
-    // list does. Otherwise no run would merge with the one after it.
-    unmerged: bool,
-    // The runs holds have looked at, for the cost test.
+    // The runs holds and arrivals have looked at, for the cost tests.
     #[cfg(test)]
     walked: u64,
 }
@@ -45,49 +41,59 @@ impl HeldLost {
         self.runs.is_empty()
     }
 
-    // The runs in their order.
+    // Every run in its order: by volume and offset, a range held later
+    // before one held earlier at the same offset.
+    fn ordered(&self) -> Vec<(At, u64, NodeId)> {
+        let mut all: Vec<(At, u64, NodeId)> = self
+            .runs
+            .iter()
+            .flat_map(|(&(volume, origin), list)| {
+                list.iter().map(move |(&start, &(end, order))| {
+                    ((volume, start, Reverse(order)), end, origin)
+                })
+            })
+            .collect();
+        all.sort_unstable_by_key(|&(at, _, _)| at);
+        all
+    }
+
     #[cfg(test)]
     fn iter(&self) -> impl Iterator<Item = (VolumeIndex, ByteRange, NodeId)> + '_ {
-        self.runs
-            .iter()
-            .map(|(&(volume, start, _), &(end, origin))| {
-                (volume, ByteRange::new(start, end), origin)
-            })
+        self.ordered()
+            .into_iter()
+            .map(|((volume, start, _), end, origin)| (volume, ByteRange::new(start, end), origin))
     }
 
     // Hold a lost range, merged with the runs of its volume and origin it
-    // touches or overlaps.
+    // touches or overlaps. The run keeps the order of the one it starts
+    // with.
     pub(super) fn hold(&mut self, volume: VolumeIndex, range: ByteRange, origin: NodeId) {
         if range.is_empty() {
             return;
         }
-        let at = (volume, range.start, Reverse(self.held));
+        let mut order = self.held;
         self.held += 1;
-        if self.unmerged {
-            self.runs.insert(at, (range.end, origin));
-            self.merge_all();
-            return;
-        }
-        // The run before it takes it in, or it sits as a run of its own.
-        let joins = |(v, _, _): &At, (end, o): &(u64, NodeId)| {
-            *v == volume && *o == origin && range.start <= *end
-        };
+        let list = self.runs.entry((volume, origin)).or_default();
+        let (mut start, mut end) = (range.start, range.end);
         #[cfg(test)]
         {
             self.walked += 1;
         }
-        let (at, mut end) = match self.runs.range(..at).next_back() {
-            Some((before, run)) if joins(before, run) => (*before, run.0.max(range.end)),
-            _ => (at, range.end),
-        };
-        // It takes in each run after it that it now reaches; the first it
-        // does not reach was not reached before either.
+        // The run before it takes it in, or it sits as a run of its own.
+        if let Some((&before, &(before_end, before_order))) = list.range(..=start).next_back()
+            && before_end >= start
+        {
+            start = before;
+            end = end.max(before_end);
+            order = before_order;
+        }
+        // It takes in each run after it that it now reaches.
         loop {
-            let after = (Bound::Excluded(at), Bound::Unbounded);
-            let Some((&next, &(next_end, next_origin))) = self.runs.range(after).next() else {
+            let after = (Bound::Excluded(start), Bound::Unbounded);
+            let Some((&next, &(next_end, _))) = list.range(after).next() else {
                 break;
             };
-            if next.0 != volume || next_origin != origin || next.1 > end {
+            if next > end {
                 break;
             }
             #[cfg(test)]
@@ -95,101 +101,79 @@ impl HeldLost {
                 self.walked += 1;
             }
             end = end.max(next_end);
-            self.runs.remove(&next);
+            list.remove(&next);
         }
-        self.runs.insert(at, (end, origin));
-        self.reaches(volume, end - at.1);
-    }
-
-    fn reaches(&mut self, volume: VolumeIndex, len: u64) {
-        let reach = self.reach.entry(volume).or_default();
-        *reach = (*reach).max(len);
-    }
-
-    // Merge the runs that touch, over the whole list.
-    fn merge_all(&mut self) {
-        #[cfg(test)]
-        {
-            self.walked += self.runs.len() as u64;
-        }
-        let mut merged: Vec<(At, (u64, NodeId))> = Vec::with_capacity(self.runs.len());
-        for (at, (end, origin)) in std::mem::take(&mut self.runs) {
-            match merged.last_mut() {
-                Some(((v, _, _), (e, o))) if *v == at.0 && *o == origin && at.1 <= *e => {
-                    *e = (*e).max(end);
-                }
-                _ => merged.push((at, (end, origin))),
-            }
-        }
-        for &((volume, start, _), (end, _)) in &merged {
-            self.reaches(volume, end - start);
-        }
-        self.runs = merged.into_iter().collect();
-        self.unmerged = false;
+        list.insert(start, (end, order));
     }
 
     // The runs `placed` says now fall on a member, in their order, taken
-    // out; the rest stay held in theirs.
+    // out; the rest stay held.
     pub(super) fn take_placed(
         &mut self,
         mut placed: impl FnMut(VolumeIndex, ByteRange) -> bool,
     ) -> Vec<(VolumeIndex, ByteRange, NodeId)> {
         let mut taken = Vec::new();
-        self.runs.retain(|&(volume, start, _), &mut (end, origin)| {
+        for ((volume, start, _), end, origin) in self.ordered() {
             let range = ByteRange::new(start, end);
-            let place = placed(volume, range);
-            if place {
-                taken.push((volume, range, origin));
+            if !placed(volume, range) {
+                continue;
             }
-            !place
-        });
-        self.unmerged |= !taken.is_empty();
-        if self.runs.is_empty() {
-            self.reach.clear();
+            taken.push((volume, range, origin));
+            if let Some(list) = self.runs.get_mut(&(volume, origin)) {
+                list.remove(&start);
+                if list.is_empty() {
+                    self.runs.remove(&(volume, origin));
+                }
+            }
         }
         taken
     }
 
     // Bytes of the range arrived: they are no loss, whatever origin told
     // it. Each run they cover goes, and one they cover in part keeps the
-    // part before them, at its place in the order, and the part after
-    // them. Only the runs that start within the volume's reach before the
-    // range are looked at.
+    // part before them and the part after them, in its order. For each
+    // origin that holds runs of the volume, the run that reaches into the
+    // range and the runs that start in it are looked at, and no other.
     pub(super) fn arrived(&mut self, volume: VolumeIndex, range: ByteRange) {
         if range.is_empty() {
             return;
         }
-        let Some(&reach) = self.reach.get(&volume) else {
-            return;
-        };
-        // `Reverse(u64::MAX)` sorts first among runs that start together.
-        let from = (volume, range.start.saturating_sub(reach), Reverse(u64::MAX));
-        let to = (volume, range.end, Reverse(u64::MAX));
-        let reached: Vec<(At, (u64, NodeId))> = self
-            .runs
-            .range(from..to)
-            .filter(|&(&(_, start, _), &(end, _))| start < range.end && end > range.start)
-            .map(|(at, run)| (*at, *run))
-            .collect();
-        #[cfg(test)]
-        {
-            self.walked += self.runs.range(from..to).count() as u64;
-        }
-        for ((volume, start, order), (end, origin)) in reached {
-            self.runs.remove(&(volume, start, order));
-            if start < range.start {
-                self.runs
-                    .insert((volume, start, order), (range.start, origin));
+        let origins = (volume, NodeId(0))..=(volume, NodeId(u32::MAX));
+        let mut emptied = Vec::new();
+        let mut covered = Vec::new();
+        for (&of, list) in self.runs.range_mut(origins) {
+            covered.clear();
+            // The run that starts at or before the range and reaches into
+            // it, then each that starts inside it.
+            covered.extend(
+                list.range(..=range.start)
+                    .next_back()
+                    .filter(|&(_, &(end, _))| end > range.start)
+                    .map(|(&start, _)| start),
+            );
+            let inside = (Bound::Excluded(range.start), Bound::Excluded(range.end));
+            covered.extend(list.range(inside).map(|(&start, _)| start));
+            #[cfg(test)]
+            {
+                self.walked += covered.len() as u64;
             }
-            if end > range.end {
-                self.runs.insert((volume, range.end, order), (end, origin));
+            for &start in &covered {
+                let Some((end, order)) = list.remove(&start) else {
+                    continue;
+                };
+                if start < range.start {
+                    list.insert(start, (range.start, order));
+                }
+                if end > range.end {
+                    list.insert(range.end, (end, order));
+                }
             }
-            // What is left may now sit beside a run of its origin it was
-            // apart from: the next hold merges them, as after a placing.
-            self.unmerged = true;
+            if list.is_empty() {
+                emptied.push(of);
+            }
         }
-        if self.runs.is_empty() {
-            self.reach.clear();
+        for of in emptied {
+            self.runs.remove(&of);
         }
     }
 }
@@ -198,38 +182,89 @@ impl HeldLost {
 mod tests {
     use super::*;
 
-    type Run = (VolumeIndex, ByteRange, NodeId);
+    type Listed = (VolumeIndex, ByteRange, NodeId);
 
-    // The list as it was kept before: each hold inserted where it sorts,
-    // then the whole list merged again.
+    // One volume and origin's runs the plain way: start, end, order.
+    type Plain = Vec<(u64, u64, u64)>;
+
+    // The list kept the plain way: every run of a volume and an origin in
+    // one vector, sorted and merged over the whole of it after each hold,
+    // and walked whole for bytes that arrive.
     #[derive(Default)]
-    struct Reference(Vec<Run>);
+    struct Reference {
+        runs: BTreeMap<(VolumeIndex, NodeId), Plain>,
+        held: u64,
+    }
 
     impl Reference {
-        fn hold(&mut self, volume: VolumeIndex, range: ByteRange, origin: NodeId) -> u64 {
+        fn hold(&mut self, volume: VolumeIndex, range: ByteRange, origin: NodeId) {
             if range.is_empty() {
-                return 0;
+                return;
             }
-            let list = &mut self.0;
-            let at = list.partition_point(|(v, r, _)| (*v, r.start) < (volume, range.start));
-            let moved = (list.len() - at) as u64;
-            list.insert(at, (volume, range, origin));
-            let mut merged: Vec<Run> = Vec::with_capacity(list.len());
-            let len = list.len() as u64;
-            for (volume, range, origin) in list.drain(..) {
+            let list = self.runs.entry((volume, origin)).or_default();
+            list.push((range.start, range.end, self.held));
+            self.held += 1;
+            // Stable: of two runs that start together, the one held first
+            // stays first, and a merged run keeps the order of its first.
+            list.sort_by_key(|&(start, _, _)| start);
+            let mut merged: Vec<(u64, u64, u64)> = Vec::with_capacity(list.len());
+            for (start, end, order) in list.drain(..) {
                 match merged.last_mut() {
-                    Some((v, r, o)) if *v == volume && *o == origin && range.start <= r.end => {
-                        *r = ByteRange::new(r.start, r.end.max(range.end));
+                    Some((_, last_end, _)) if start <= *last_end => {
+                        *last_end = (*last_end).max(end);
                     }
-                    _ => merged.push((volume, range, origin)),
+                    _ => merged.push((start, end, order)),
                 }
             }
             *list = merged;
-            moved + len
         }
 
         fn take_placed(&mut self, mut placed: impl FnMut(VolumeIndex, ByteRange) -> bool) {
-            self.0.retain(|(volume, range, _)| !placed(*volume, *range));
+            for (&(volume, _), list) in &mut self.runs {
+                list.retain(|&(start, end, _)| !placed(volume, ByteRange::new(start, end)));
+            }
+            self.runs.retain(|_, list| !list.is_empty());
+        }
+
+        fn arrived(&mut self, volume: VolumeIndex, range: ByteRange) {
+            for (&(of, _), list) in &mut self.runs {
+                if of != volume {
+                    continue;
+                }
+                let mut kept = Vec::with_capacity(list.len() + 1);
+                for (start, end, order) in list.drain(..) {
+                    if end <= range.start || start >= range.end {
+                        kept.push((start, end, order));
+                        continue;
+                    }
+                    if start < range.start {
+                        kept.push((start, range.start, order));
+                    }
+                    if end > range.end {
+                        kept.push((range.end, end, order));
+                    }
+                }
+                *list = kept;
+            }
+            self.runs.retain(|_, list| !list.is_empty());
+        }
+
+        fn listed(&self) -> Vec<Listed> {
+            let mut all: Vec<(At, u64, NodeId)> = self
+                .runs
+                .iter()
+                .flat_map(|(&(volume, origin), list)| {
+                    list.iter().map(move |&(start, end, order)| {
+                        ((volume, start, Reverse(order)), end, origin)
+                    })
+                })
+                .collect();
+            all.sort_unstable_by_key(|&(at, _, _)| at);
+            all.into_iter()
+                .map(|((volume, start, _), end, origin)| {
+                    (volume, ByteRange::new(start, end), origin)
+                })
+                .collect()
         }
     }
 
@@ -250,10 +285,11 @@ mod tests {
     }
 
     // Losses scattered, adjacent, overlapping and out of order, over three
-    // volumes and two origins, with runs placed and taken out between
-    // them: after every step the list is the one the old merge kept.
+    // volumes and two origins, with runs placed and taken out and bytes
+    // arriving between them: after every step the list is the one the
+    // plain merge keeps, and what a placing takes is what it takes there.
     #[test]
-    fn holds_keep_the_list_the_whole_merge_kept() {
+    fn holds_keep_the_list_the_whole_merge_keeps() {
         for seed in 1..=64_u64 {
             let mut random = Seeded(0x9e37_79b9_7f4a_7c15 ^ seed);
             let mut held = HeldLost::default();
@@ -261,13 +297,13 @@ mod tests {
             for step in 0..400 {
                 let volume = VolumeIndex(random.below(3) as u32);
                 let origin = NodeId(random.below(2) as u32);
+                let listed = reference.listed();
                 let start = match random.below(4) {
                     // Scattered.
                     0 => random.below(1 << 20),
                     // Adjacent to or overlapping one already held.
-                    _ => reference
-                        .0
-                        .get(random.below(reference.0.len().max(1) as u64) as usize)
+                    _ => listed
+                        .get(random.below(listed.len().max(1) as u64) as usize)
                         .map_or(0, |(_, r, _)| match random.below(3) {
                             0 => r.end,
                             1 => r.start + (r.end - r.start) / 2,
@@ -276,37 +312,38 @@ mod tests {
                 };
                 let len = random.below(5_000);
                 let range = ByteRange::new(start, start + len);
-                held.hold(volume, range, origin);
-                reference.hold(volume, range, origin);
+                match random.below(5) {
+                    0 => {
+                        held.arrived(volume, range);
+                        reference.arrived(volume, range);
+                    }
+                    _ => {
+                        held.hold(volume, range, origin);
+                        reference.hold(volume, range, origin);
+                    }
+                }
                 if random.below(16) == 0 {
                     let pick = random.next();
                     let placed = |volume: VolumeIndex, range: ByteRange| {
                         (u64::from(volume.0) ^ range.start ^ pick).is_multiple_of(3)
                     };
-                    held.take_placed(placed);
+                    let before = reference.listed();
+                    let taken = held.take_placed(placed);
                     reference.take_placed(placed);
+                    let expected: Vec<Listed> = before
+                        .into_iter()
+                        .filter(|&(volume, range, _)| placed(volume, range))
+                        .collect();
+                    assert_eq!(taken, expected, "seed {seed} step {step}");
                 }
                 assert_eq!(
                     held.iter().collect::<Vec<_>>(),
-                    reference.0,
+                    reference.listed(),
                     "seed {seed} step {step}"
                 );
+                assert_eq!(held.is_empty(), reference.runs.is_empty());
             }
         }
-    }
-
-    // Runs of different origins at one offset keep the order they had: the
-    // later first.
-    #[test]
-    fn runs_at_one_offset_keep_their_order() {
-        let mut held = HeldLost::default();
-        let mut reference = Reference::default();
-        for (origin, end) in [(1, 10), (2, 20), (1, 5), (3, 30)] {
-            let range = ByteRange::new(0, end);
-            held.hold(VolumeIndex(0), range, NodeId(origin));
-            reference.hold(VolumeIndex(0), range, NodeId(origin));
-        }
-        assert_eq!(held.iter().collect::<Vec<_>>(), reference.0);
     }
 
     fn runs(held: &HeldLost) -> Vec<(u32, u64, u64, u32)> {
@@ -325,6 +362,20 @@ mod tests {
             );
         }
         held
+    }
+
+    // Runs of different origins at one offset keep the order they had, the
+    // later first, and a run of an origin merges with that origin's own
+    // whatever another origin holds between them.
+    #[test]
+    fn runs_at_one_offset_keep_their_order() {
+        let held = holding(&[(0, 0, 10, 1), (0, 0, 20, 2), (0, 0, 5, 1), (0, 0, 30, 3)]);
+        assert_eq!(
+            runs(&held),
+            vec![(0, 0, 30, 3), (0, 0, 20, 2), (0, 0, 10, 1)]
+        );
+        let apart = holding(&[(0, 0, 100, 1), (0, 50, 60, 2), (0, 70, 200, 1)]);
+        assert_eq!(runs(&apart), vec![(0, 0, 200, 1), (0, 50, 60, 2)]);
     }
 
     // Bytes that cover a run whole take it out; the runs beside it, and
@@ -385,14 +436,17 @@ mod tests {
         assert_eq!(runs(&held), vec![(0, 100, 200, 1)]);
     }
 
-    // Bytes that come over 5,000 scattered runs, one each, look at the run
-    // they reach and no other.
+    // One origin lost the whole volume once, and another holds 5,000
+    // scattered runs of it. Bytes that come over each scattered run look at
+    // the run they reach and the whole-volume run, never at the other
+    // 4,999: a long run does not widen what a later arrival walks.
     #[test]
-    fn arrived_bytes_look_at_the_runs_within_reach() {
+    fn arrived_bytes_look_only_at_the_runs_they_cover() {
         let starts: Vec<u64> = (0..5_000_u64)
             .map(|index| (index.wrapping_mul(2_654_435_761) % (1 << 32)) << 16)
             .collect();
         let mut held = HeldLost::default();
+        held.hold(VolumeIndex(0), ByteRange::new(0, u64::MAX), NodeId(1));
         for &start in &starts {
             held.hold(
                 VolumeIndex(0),
@@ -405,40 +459,29 @@ mod tests {
             held.arrived(VolumeIndex(0), ByteRange::new(start + 400, start + 600));
         }
         assert_eq!(
-            held.walked, 5_000,
-            "each arrival looks at the one run it reaches"
+            held.walked, 10_000,
+            "each arrival looks at the scattered run it reaches and the whole-volume run"
         );
-        assert_eq!(held.iter().count(), 10_000);
+        // Each scattered run is two, and the whole-volume run 5,001 pieces.
+        assert_eq!(held.iter().count(), 15_001);
     }
 
-    // 5,000 losses scattered over one volume, none touching: the old list
-    // moved every run after the new one and walked the whole list per hold;
-    // the map looks at the run before it. Prints both counts, and bounds
-    // the runs looked at.
+    // 5,000 losses scattered over one volume, none touching: each hold
+    // looks at the run before it and no other.
     #[test]
     fn scattered_holds_cost_a_lookup_each() {
         // An odd multiplier modulo 2^32 sends each index to its own block,
         // in an order that jumps about the volume.
-        let losses: Vec<ByteRange> = (0..5_000_u64)
-            .map(|index| {
-                let start = (index.wrapping_mul(2_654_435_761) % (1 << 32)) << 16;
-                ByteRange::new(start, start + 1_000)
-            })
-            .collect();
-        let mut reference = Reference::default();
-        let touched: u64 = losses
-            .iter()
-            .map(|range| reference.hold(VolumeIndex(0), *range, NodeId(0)))
-            .sum();
         let mut held = HeldLost::default();
-        for range in &losses {
-            held.hold(VolumeIndex(0), *range, NodeId(0));
+        for index in 0..5_000_u64 {
+            let start = (index.wrapping_mul(2_654_435_761) % (1 << 32)) << 16;
+            held.hold(
+                VolumeIndex(0),
+                ByteRange::new(start, start + 1_000),
+                NodeId(0),
+            );
         }
-        assert_eq!(held.iter().collect::<Vec<_>>(), reference.0);
-        eprintln!(
-            "5,000 scattered holds: old {touched} runs moved or walked; new {} runs walked",
-            held.walked
-        );
+        assert_eq!(held.iter().count(), 5_000);
         assert!(
             held.walked <= 5_000,
             "a scattered hold looks at the run before it and no other: {} runs for 5,000",
