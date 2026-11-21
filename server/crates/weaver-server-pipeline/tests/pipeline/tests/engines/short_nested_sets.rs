@@ -285,8 +285,8 @@ async fn a_set_at_the_root_short_of_a_volume_is_not_complete() {
 
 // Guard: a nested set that is all there and fails to unpack, enciphered
 // with a password the job was never given, under the proved outer RAR and
-// beside an `.nfo`: its volumes are withheld as they were, and the job is
-// not Complete.
+// beside an `.nfo`: its volumes are withheld as they were, and the whole
+// `.nfo` leaves the job delivered in part, not Complete.
 #[tokio::test]
 async fn a_nested_set_all_there_that_fails_to_unpack_is_not_complete() {
     let volumes = crate::pipeline::tests::direct_store::scenarios::encrypted_store_set(
@@ -298,7 +298,12 @@ async fn a_nested_set_all_there_that_fails_to_unpack_is_not_complete() {
         false,
     );
     let outcome = run(&in_outer_rar(&with_nfo(volumes), true)).await;
-    assert!(failed(&outcome), "{}", said(&outcome));
+    assert_eq!(
+        outcome.status,
+        Some(JobStatus::Partial),
+        "{}",
+        said(&outcome)
+    );
     assert!(
         outcome
             .graph()
