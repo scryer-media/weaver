@@ -295,6 +295,9 @@ struct ReturnTail {
     stood: u64,
     // What the tail said before it stood, heard once it is done.
     said: Vec<Effect>,
+    // The ranges taken up to deliver again so far, and their bytes: said
+    // once in the log when the tail has delivered them all.
+    redelivered: (u64, u64),
 }
 
 // Where a return's tail is: the ranges its set found delivered again, what
@@ -2500,6 +2503,7 @@ impl NamespaceWriter {
             },
         );
         self.gave_back(&staged);
+        self.staged_said(tree, node, ranges, &staged, false);
         let replayed = match staged.failed() {
             Some(error) => Err(WriteError::from(error)),
             None => self.again_staged(
@@ -2514,6 +2518,29 @@ impl NamespaceWriter {
         };
         let removed = staged.discard().map_err(WriteError::from);
         replayed.and(removed).inspect_err(|_| tree.again_done())
+    }
+
+    // What a replay read back and staged, said once per request in the log:
+    // the object, how much it asked for again, and how much the staging
+    // holds. `tail` for a cipher's tail (`read_tail`).
+    fn staged_said(
+        &self,
+        tree: &Tree,
+        node: NodeId,
+        ranges: &[(VolumeIndex, ByteRange)],
+        staged: &loan::Repaired,
+        tail: bool,
+    ) {
+        tracing::info!(
+            job_id = self.scope,
+            node = node.0,
+            kind = %tree.kind(node).map(|kind| kind.to_string()).unwrap_or_default(),
+            ranges = ranges.len(),
+            asked_bytes = ranges.iter().map(|(_, range)| range.len()).sum::<u64>(),
+            staged_bytes = staged.sizes().map(|(_, bytes)| bytes).sum::<u64>(),
+            tail,
+            "replay staged"
+        );
     }
 
     // Each staged piece of an `Effect::Again`, said again in the order it
@@ -2582,6 +2609,11 @@ impl NamespaceWriter {
             },
         );
         self.gave_back(&staged);
+        // Every unarrived article bound below the root reads its tail, and
+        // only a cipher's has one: said only when something was staged.
+        if staged.sizes().next().is_some() {
+            self.staged_said(tree, node, ranges, &staged, true);
+        }
         if let Some(error) = staged.failed() {
             tree.again_done();
             let _ = staged.discard();
