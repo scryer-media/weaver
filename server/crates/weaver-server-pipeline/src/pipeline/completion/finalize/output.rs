@@ -419,12 +419,21 @@ pub fn move_path_with_safe_rename_or_copy_fallback(
 // metadata change: a move that only a copy can make, across devices or on
 // a mount without links, comes back to the mover, which copies it on its
 // own thread, never the volume's.
+// A move that copies across filesystems carries the room it booked on the
+// destination's disk with it, and settles it as the copy lands.
 #[derive(Clone)]
-pub struct Renames(Arc<weaver_server_disk::operations::disk::writer::Submitter>);
+pub struct Renames {
+    to: Arc<weaver_server_disk::operations::disk::writer::Submitter>,
+    room: Option<Arc<CopyRoom>>,
+}
 
 impl Renames {
     pub fn through(to: Arc<weaver_server_disk::operations::disk::writer::Submitter>) -> Self {
-        Self(to)
+        Self { to, room: None }
+    }
+
+    fn copying_into(self, room: Option<Arc<CopyRoom>>) -> Self {
+        Self { room, ..self }
     }
 
     fn place(&self, src: &Path, dst: &Path, place: Place) -> std::io::Result<Placement> {
@@ -432,12 +441,230 @@ impl Renames {
         let (from, to) = (src.to_path_buf(), dst.to_path_buf());
         // The writer hears no failure: the mover judges the result, and a
         // volume with no thread is none either.
-        self.0.ask(src.to_path_buf(), move || {
+        self.to.ask(src.to_path_buf(), move || {
             let _ = answer.send(place(&from, &to));
         });
         // A volume with no thread drops the rename unrun: it is made here.
         answered.recv().unwrap_or_else(|_| place(src, dst))
     }
+}
+
+// How many copied bytes a move settles on its destination's ledger at once.
+const COPY_SLAB_BYTES: u64 = 64 * 1024 * 1024;
+
+// The room a final move's copy across filesystems takes on the disk of the
+// destination, a root's: booked on that root's ledger before the first
+// byte is written, judged as a start is, and settled as the copy lands.
+// What was booked and did not land goes back when the move ends, however
+// it ends. A rename across one filesystem takes no room and books nothing.
+struct CopyRoom {
+    capacity: Arc<crate::operations::StorageCapacity>,
+    root: crate::operations::StorageRoot,
+    reserve: u64,
+    job_id: JobId,
+    // Which sources copy: the working directory's entries when it lies on
+    // another filesystem, and the staging directory's when it does too.
+    working_copies: bool,
+    staging_copies: bool,
+    // Booked and not yet landed, and copied and not yet settled.
+    booked: std::sync::atomic::AtomicU64,
+    copied: std::sync::atomic::AtomicU64,
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    booked_hook: std::sync::Mutex<Option<MoveHook>>,
+}
+
+impl CopyRoom {
+    // The room a move from `working_dir` and `staging_dir` into a
+    // destination made in `landing` copies into: none when every source
+    // lies on the destination's filesystem, or one not known to differ, or
+    // when the destination lies on no root's disk, whose writes no ledger
+    // books. A working directory under the intermediate root is judged by
+    // that root's device, and a staging directory made under the
+    // destination's folder by that folder's, as the job's staging choice
+    // judged them: no look for either. Any other is looked at off the loop.
+    async fn of(
+        capacity: &Arc<crate::operations::StorageCapacity>,
+        (reserve, job_id): (u64, JobId),
+        (intermediate_dir, working_dir): (&Path, &Path),
+        staging_dir: Option<&Path>,
+        landing: &Path,
+    ) -> Option<Arc<Self>> {
+        let working = if working_dir.starts_with(intermediate_dir) {
+            intermediate_dir
+        } else {
+            working_dir
+        };
+        let working_copies = !capacity.same_filesystem(working, landing).await;
+        let staging_copies = match staging_dir {
+            Some(staging) if !staging.starts_with(landing) => {
+                !capacity.same_filesystem(staging, landing).await
+            }
+            _ => false,
+        };
+        if !working_copies && !staging_copies {
+            return None;
+        }
+        let Some(weaver_server_disk::operations::room_wait::Disk::Root(root)) =
+            weaver_server_disk::operations::room_wait::Disk::look_up(capacity, landing).await
+        else {
+            return None;
+        };
+        Some(Arc::new(Self {
+            capacity: Arc::clone(capacity),
+            root,
+            reserve,
+            job_id,
+            working_copies,
+            staging_copies,
+            booked: std::sync::atomic::AtomicU64::new(0),
+            copied: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+            booked_hook: std::sync::Mutex::new(None),
+        }))
+    }
+
+    // What of the delivery the copy writes: the entries of each source
+    // that copies.
+    fn bytes_to_copy(
+        &self,
+        validation: &DeliverySourceValidation,
+        working_dir: &Path,
+        staging_dir: Option<&Path>,
+    ) -> u64 {
+        let under = |root: &Path| {
+            validation
+                .root_entry_bytes
+                .iter()
+                .filter(|(path, _)| path.parent() == Some(root))
+                .fold(0u64, |sum, (_, bytes)| sum.saturating_add(*bytes))
+        };
+        let working = if self.working_copies {
+            under(working_dir)
+        } else {
+            0
+        };
+        let staging = match staging_dir {
+            Some(staging) if self.staging_copies => under(staging),
+            _ => 0,
+        };
+        working.saturating_add(staging)
+    }
+
+    // `bytes` are booked on the destination's ledger, judged by a fresh
+    // reading above the reserve, less the room promised beside the ledger
+    // there, as a start is. The room this job was let go on from a wait is
+    // its own: it is not held against it, and once booked it counts on the
+    // ledger only, so a start judged there counts it once. `Err` names what
+    // the move needs the disk to show free to go on, the reserve with it,
+    // when they do not fit. A disk with no fresh reading, or one too small
+    // ever to hold them above the reserve, has them promised unjudged and
+    // the move goes on, as it did before it booked.
+    fn book(&self, bytes: u64) -> Result<(), u64> {
+        use weaver_server_disk::operations::disk::{DiskLedger, StartBooking, StartPart};
+        use weaver_server_disk::operations::room_wait::{Disk, Waiter};
+        if bytes == 0 {
+            return Ok(());
+        }
+        let capacity = &*self.capacity;
+        let promises = capacity.promises();
+        let own = promises.remove(Waiter::Usenet, self.job_id);
+        if let Some(own) = own.clone() {
+            promises.insert_ledgered(Waiter::Usenet, self.job_id, own);
+        }
+        let disk = Disk::Root(self.root);
+        let held = promises.off_ledger(&disk, disk.device(capacity));
+        let ledger = capacity.ledger(self.root);
+        let reader = capacity.reader(self.root);
+        let part = StartPart {
+            judge: ledger,
+            reader: &reader,
+            fresh: capacity.fresh(self.root),
+            held,
+            promise: ledger,
+            need: bytes,
+        };
+        match DiskLedger::book_start_on(&[part], self.reserve) {
+            StartBooking::Booked => {}
+            StartBooking::Short { .. } => {
+                if let Some(own) = own {
+                    promises.insert(Waiter::Usenet, self.job_id, own);
+                }
+                return Err(bytes.saturating_add(self.reserve));
+            }
+            StartBooking::TooLarge { .. } | StartBooking::Unread => ledger.promise(bytes),
+        }
+        self.booked
+            .store(bytes, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    // `bytes` more of the copy landed: settled a slab at a time.
+    fn copied(&self, bytes: u64) {
+        let pending = self
+            .copied
+            .fetch_add(bytes, std::sync::atomic::Ordering::AcqRel)
+            .saturating_add(bytes);
+        if pending >= COPY_SLAB_BYTES {
+            self.settle(self.copied.swap(0, std::sync::atomic::Ordering::AcqRel));
+        }
+    }
+
+    // `bytes` copied land on the ledger: what was booked for them as
+    // promised, any past the booking as landed unpromised.
+    fn settle(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let before = self
+            .booked
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |left| Some(left.saturating_sub(bytes)),
+            )
+            .unwrap_or(0);
+        let promised = before.min(bytes);
+        self.capacity
+            .ledger(self.root)
+            .landed(promised, bytes - promised);
+    }
+
+    // The move ended: what it copied is settled and what it booked and did
+    // not write goes back.
+    fn finish(&self) {
+        self.settle(self.copied.swap(0, std::sync::atomic::Ordering::AcqRel));
+        self.capacity
+            .ledger(self.root)
+            .release(self.booked.swap(0, std::sync::atomic::Ordering::AcqRel));
+    }
+}
+
+// The booking a running move holds, finished as the move ends: returned,
+// failed, or dropped unfinished.
+struct CopyBooking(Arc<CopyRoom>);
+
+impl Drop for CopyBooking {
+    fn drop(&mut self) {
+        self.0.finish();
+    }
+}
+
+// A test's devices that differ are filesystems a rename cannot cross.
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+pub(crate) static COPY_ACROSS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+fn place_across_test_devices(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+) -> std::io::Result<Placement> {
+    if !weaver_server_disk::runtime::fs::same_device(src, dst) {
+        return Ok(Placement::Copy(std::io::Error::from(
+            std::io::ErrorKind::CrossesDevices,
+        )));
+    }
+    rename_path_for_publication(src, dst)
 }
 
 fn move_path_through(
@@ -447,14 +674,32 @@ fn move_path_through(
     source_bytes: u64,
     phase_counters: Arc<PhaseCounters>,
 ) -> Result<(), (std::io::Error, std::io::Error)> {
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    let place: Place = if COPY_ACROSS.load(Ordering::Acquire) {
+        place_across_test_devices
+    } else {
+        rename_path_for_publication
+    };
+    #[cfg(not(any(test, feature = "pipeline-test-fixtures")))]
+    let place: Place = rename_path_for_publication;
+    let room = renames.and_then(|renames| renames.room.as_deref());
     move_path_through_using(
         renames,
         src,
         dst,
         source_bytes,
         phase_counters,
-        rename_path_for_publication,
-        move_path_with_copy_fallback,
+        place,
+        |src, dst, counters| match room {
+            Some(room) => move_path_by_copy(src, dst, &mut |copied| {
+                counters
+                    .completed_bytes
+                    .fetch_add(copied, Ordering::Relaxed);
+                room.copied(copied);
+                Ok(())
+            }),
+            None => move_path_with_copy_fallback(src, dst, counters),
+        },
     )
 }
 
@@ -845,6 +1090,13 @@ pub(in crate::pipeline) static FIXTURE_MOVE_HOOKS: std::sync::LazyLock<
     std::sync::Mutex<HashMap<PathBuf, MoveHook>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
+// Runs once a move that copies across filesystems has booked its room on
+// the destination's disk, before any entry moves.
+#[cfg(any(test, feature = "pipeline-test-fixtures"))]
+pub(in crate::pipeline) static FIXTURE_BOOKED_HOOKS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<PathBuf, MoveHook>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
 // A destination that fills: how many more entries it has room for. Each
 // entry past that finds no room and leaves nothing of itself there, as the
 // copy does, which removes what it wrote.
@@ -1067,6 +1319,39 @@ async fn run_move_to_claimed_destination(
             dest.display()
         )));
     }
+
+    // A move that copies across filesystems books what it copies on the
+    // destination's disk before it writes a byte. With no room for it the
+    // job waits, as one whose copy found the disk full does, and nothing is
+    // written. A resumed move books only what its sources still hold.
+    let room = renames.as_ref().and_then(|renames| renames.room.clone());
+    let _booking = match room {
+        Some(room) => {
+            let bytes = room.bytes_to_copy(&validation, &working_dir, staging_dir.as_deref());
+            if let Err(needs) = room.book(bytes) {
+                return Err(MoveToCompleteFailure::OutOfSpace {
+                    message: format!(
+                        "the disk of {} has no room above its reserve for the {bytes} bytes the move copies",
+                        dest.display()
+                    ),
+                    path: dest,
+                    needs,
+                    again: again.iter().cloned().collect(),
+                    quota: false,
+                });
+            }
+            let booking = CopyBooking(Arc::clone(&room));
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+            {
+                let hook = room.booked_hook.lock().unwrap().take();
+                if let Some(hook) = hook {
+                    let _ = tokio::task::spawn_blocking(move || hook(job_id)).await;
+                }
+            }
+            Some(booking)
+        }
+        None => None,
+    };
 
     let mut moved = 0u32;
     let mut failures = Vec::new();
@@ -2124,6 +2409,8 @@ impl Pipeline {
             left_behind,
         } = final_move;
         let move_done_tx = self.move_done_tx.clone();
+        let reserve = self.extraction_limits.min_free_bytes;
+        let intermediate_dir = self.intermediate_dir.clone();
         let (writers, capacity) = (
             Arc::clone(&self.volume_writers),
             Arc::clone(&self.storage_capacity),
@@ -2175,13 +2462,29 @@ impl Pipeline {
                     // made in, one of a few, so the volumes remember no path
                     // per job.
                     let landing = dest.parent().unwrap_or(&dest).to_path_buf();
+                    // A move across filesystems copies, and books what it
+                    // copies on the destination's disk.
+                    let room = CopyRoom::of(
+                        &capacity,
+                        (reserve, job_id),
+                        (&intermediate_dir, &working_dir),
+                        staging_dir.as_deref(),
+                        &landing,
+                    )
+                    .await;
+                    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+                    if let Some(room) = &room {
+                        *room.booked_hook.lock().unwrap() =
+                            FIXTURE_BOOKED_HOOKS.lock().unwrap().remove(&fixture_root);
+                    }
                     let renames =
                         weaver_server_base::runtime::panic_trap::spawn_blocking(move || {
                             let volume = capacity.read_volume(&landing);
                             Renames::through(writers.submitter(&volume, job_id.0))
                         })
                         .await
-                        .ok();
+                        .ok()
+                        .map(|renames| renames.copying_into(room));
                     match into {
                         MoveInto::Claimed(dest) => {
                             run_move_to_complete(
