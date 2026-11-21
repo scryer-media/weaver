@@ -3351,6 +3351,10 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
     println!("   State: {}", state_dir.display());
     println!("   Data: {}", data_dir.display());
     println!("   Diagnostics enabled: {diagnostics_enabled}");
+    println!(
+        "   Torrents: WEAVER_TORRENTS={}",
+        std::env::var("WEAVER_TORRENTS").unwrap_or_else(|_| "1".into())
+    );
     let log = OpenOptions::new()
         .create(true)
         .append(true)
@@ -3371,6 +3375,10 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
     backend.env("WEAVER_ENCRYPTION_KEY", &encryption_key);
+    // Torrents are on for a dev server unless the shell says otherwise.
+    if std::env::var_os("WEAVER_TORRENTS").is_none() {
+        backend.env("WEAVER_TORRENTS", "1");
+    }
     if args.otp {
         backend.env("WEAVER_REQUIRE_SETUP_CODE", "1");
     }
