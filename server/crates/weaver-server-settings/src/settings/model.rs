@@ -141,6 +141,13 @@ impl SeedingPolicy {
         *self == Self::default()
     }
 
+    /// Whether it sets a ratio, seed-time or inactive goal of its own.
+    pub fn sets_a_goal(&self) -> bool {
+        self.ratio_goal.set().is_some()
+            || self.seed_time_goal_minutes.set().is_some()
+            || self.inactive_goal_minutes.set().is_some()
+    }
+
     /// The policy as a level keeps it: none when every leaf inherits.
     pub fn kept(policy: Option<Self>) -> Option<Self> {
         policy.filter(|policy| !policy.inherits())

@@ -169,6 +169,36 @@ impl<T: Clone> Levels<T> {
     }
 }
 
+impl<T: Copy + PartialOrd> Levels<T> {
+    /// A seeding goal in force, and the level it comes from, for a torrent
+    /// whose tracker rule sets a goal of its own when `rule_sets_goal`: the
+    /// rule takes from its category and the global settings only what is
+    /// stricter. A goal the torrent sets or turns off decides outright. A
+    /// goal the rule sets is never less than the one below it would give,
+    /// and one it leaves to inherit is taken from below only when every
+    /// goal must be met (`all`): under any one, it would be one more way to
+    /// stop early, so it is off. A rule that sets no goal inherits plainly.
+    pub fn goal(&self, rule_sets_goal: bool, all: bool) -> (Option<T>, Level) {
+        if !rule_sets_goal || !self.torrent.is_inherit() {
+            return (self.resolve(), self.level());
+        }
+        let below = Self {
+            torrent: Leaf::Inherit,
+            rule: Leaf::Inherit,
+            ..*self
+        };
+        match self.rule {
+            Leaf::Set(goal) => match below.resolve() {
+                Some(lower) if lower > goal => (Some(lower), below.level()),
+                _ => (Some(goal), Level::TrackerRule),
+            },
+            Leaf::Off => (None, Level::TrackerRule),
+            Leaf::Inherit if all => (below.resolve(), below.level()),
+            Leaf::Inherit => (None, Level::TrackerRule),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,6 +278,45 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    // A tracker rule that sets a goal takes only what is stricter from its
+    // category and the global settings.
+    #[test]
+    fn a_rule_that_sets_a_goal_inherits_only_what_is_stricter() {
+        use Leaf::{Inherit, Off, Set};
+        // (levels, the rule sets a goal, mode All, value, level)
+        let cases = [
+            // The torrent's own value or off decides outright, with no floor.
+            (levels(Set(1), Set(2), Set(3), Set(4)), true, false, Some(1), Level::Torrent),
+            (levels(Off, Set(2), Set(3), Set(4)), true, true, None, Level::Torrent),
+            // A goal the rule sets is the larger of its own and the one below.
+            (levels(Inherit, Set(2), Inherit, Set(1)), true, false, Some(2), Level::TrackerRule),
+            (levels(Inherit, Set(2), Set(3), Set(1)), true, false, Some(3), Level::Category),
+            (levels(Inherit, Set(2), Inherit, Set(4)), true, false, Some(4), Level::Global),
+            (levels(Inherit, Set(2), Off, Set(4)), true, false, Some(2), Level::TrackerRule),
+            (levels(Inherit, Set(2), Set(2), Off), true, true, Some(2), Level::TrackerRule),
+            // One it leaves to inherit adds a requirement under All only.
+            (levels(Inherit, Inherit, Set(3), Set(4)), true, true, Some(3), Level::Category),
+            (levels(Inherit, Inherit, Inherit, Set(4)), true, true, Some(4), Level::Global),
+            (levels(Inherit, Inherit, Set(3), Set(4)), true, false, None, Level::TrackerRule),
+            (levels(Inherit, Inherit, Inherit, Set(4)), true, false, None, Level::TrackerRule),
+            // One it turns off stays off.
+            (levels(Inherit, Off, Set(3), Set(4)), true, true, None, Level::TrackerRule),
+            (levels(Inherit, Off, Set(3), Set(4)), true, false, None, Level::TrackerRule),
+            // A rule that sets no goal inherits plainly.
+            (levels(Inherit, Inherit, Set(3), Set(4)), false, false, Some(3), Level::Category),
+            (levels(Inherit, Inherit, Inherit, Set(4)), false, false, Some(4), Level::Global),
+            (levels(Inherit, Off, Set(3), Set(4)), false, false, None, Level::TrackerRule),
+            (levels(Inherit, Inherit, Inherit, Off), false, true, None, Level::Global),
+        ];
+        for (levels, rule_sets_goal, all, value, level) in cases {
+            assert_eq!(
+                levels.goal(rule_sets_goal, all),
+                (value, level),
+                "{levels:?} rule sets a goal {rule_sets_goal} all {all}"
+            );
         }
     }
 

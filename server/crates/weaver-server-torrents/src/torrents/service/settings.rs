@@ -252,32 +252,42 @@ impl TorrentSettings {
     }
 
     /// The seeding terms `record` is held to under `rule`, each resolved
-    /// over its levels, and the level each comes from.
+    /// over its levels, and the level each comes from. A rule that sets a
+    /// goal takes only what is stricter from the levels below it
+    /// ([`Levels::goal`]); everything that shows or applies a torrent's
+    /// terms reads them here.
     pub fn seeding(
         &self,
         record: &TorrentRecord,
         rule: Option<&TrackerRule>,
     ) -> (Seeding, SeedingLevels) {
-        let ratio = self.of_torrent(&RATIO_GOAL, record, rule);
-        let seed_time = self.of_torrent(&SEED_TIME_GOAL, record, rule);
-        let inactive = self.of_torrent(&INACTIVE_GOAL, record, rule);
         let mode = self.of_torrent(&SEEDING_MODE, record, rule);
         let action = self.of_torrent(&SEEDING_ACTION, record, rule);
         let counting = self.of_torrent(&SEED_TIME_COUNTING, record, rule);
         let cap = self.of_torrent(&UPLOAD_CAP, record, rule);
+        let in_force = mode.resolve().unwrap_or_default();
+        let rule_sets_goal =
+            rule.is_some_and(|rule| rule.seeding.is_some_and(|policy| policy.sets_a_goal()));
+        let all = in_force == SeedingGoalMode::All;
+        let (ratio, ratio_level) =
+            self.of_torrent(&RATIO_GOAL, record, rule).goal(rule_sets_goal, all);
+        let (seed_time, seed_time_level) =
+            self.of_torrent(&SEED_TIME_GOAL, record, rule).goal(rule_sets_goal, all);
+        let (inactive, inactive_level) =
+            self.of_torrent(&INACTIVE_GOAL, record, rule).goal(rule_sets_goal, all);
         (
             Seeding {
-                ratio_goal: ratio.resolve(),
-                seed_time_goal_minutes: seed_time.resolve(),
-                inactive_goal_minutes: inactive.resolve(),
-                mode: mode.resolve().unwrap_or_default(),
+                ratio_goal: ratio,
+                seed_time_goal_minutes: seed_time,
+                inactive_goal_minutes: inactive,
+                mode: in_force,
                 action: action.resolve().unwrap_or_default(),
                 seed_time_counting: counting.resolve().unwrap_or_default(),
             },
             SeedingLevels {
-                ratio_goal: ratio.level(),
-                seed_time_goal_minutes: seed_time.level(),
-                inactive_goal_minutes: inactive.level(),
+                ratio_goal: ratio_level,
+                seed_time_goal_minutes: seed_time_level,
+                inactive_goal_minutes: inactive_level,
                 mode: mode.level(),
                 action: action.level(),
                 seed_time_counting: counting.level(),
