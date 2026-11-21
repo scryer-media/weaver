@@ -4,8 +4,8 @@
 // Furniture posted at the root, side files such as an `.nfo`: delivered
 // whole it is a file of the delivery, so a post of nothing but furniture
 // that delivers it ends Complete. Furniture that failed beside other files
-// decides nothing. A job is Partial only beside a usable file delivered
-// whole, and furniture is none.
+// decides nothing. A whole `.nfo` beside a file that is short leaves the
+// job Partial: furniture is a type people open.
 
 use super::harness::{ARTICLE, Outcome, Post, Scenario, payload, run};
 use crate::jobs::model::JobStatus;
@@ -122,18 +122,24 @@ async fn whole_furniture_beside_a_whole_file_is_delivered() {
     );
 }
 
-// Guard: a movie that lost an article, with nothing to rebuild it, beside
-// a whole `.nfo`: the `.nfo` is delivered, but it is no usable file, so the
-// job is not Partial. It fails.
+// A movie that lost an article, with nothing to rebuild it, beside a whole
+// `.nfo`: the `.nfo` is delivered, and the job is Partial.
 #[tokio::test]
-async fn whole_furniture_beside_a_short_file_does_not_make_a_job_partial() {
+async fn whole_furniture_beside_a_short_file_makes_a_job_partial() {
     let posts = vec![
         Post::plain("lantern.mkv", movie()),
         Post::plain("lantern.nfo", nfo(1)),
     ];
     let outcome = run(&Scenario::new(posts).lost(0, 1)).await;
-    assert!(
-        matches!(outcome.status, Some(JobStatus::Failed { .. })),
+    assert_eq!(
+        outcome.status,
+        Some(JobStatus::Partial),
+        "{}",
+        said(&outcome)
+    );
+    assert_eq!(
+        outcome.files.get(&format!("{FOLDER}/lantern.nfo")),
+        Some(&nfo(1)),
         "{}",
         said(&outcome)
     );

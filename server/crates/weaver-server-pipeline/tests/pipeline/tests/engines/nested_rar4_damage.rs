@@ -99,6 +99,11 @@ fn movie_not_whole(outcome: &Outcome, named: &str) {
             said(outcome)
         );
     }
+    movie_said_damaged(outcome, named);
+}
+
+// The movie is not reported whole, and `named` is reported damaged.
+fn movie_said_damaged(outcome: &Outcome, named: &str) {
     let delivery = &outcome.graph().delivery;
     assert!(
         !delivery.whole.iter().any(|name| name.ends_with(MOVIE)),
@@ -115,8 +120,11 @@ fn movie_not_whole(outcome: &Outcome, named: &str) {
 #[tokio::test]
 async fn a_nested_stored_rar4_with_a_flipped_byte_in_a_middle_volume_is_not_delivered_whole() {
     let outcome = run(&in_outer_rar(&with_nfo(flipped(6, 2)))).await;
-    movie_not_whole(&outcome, MOVIE);
-    assert_ne!(
+    // The whole `.nfo` beside it leaves the job delivered in part, and a
+    // job delivered in part hands the damaged movie over as it stands,
+    // said damaged.
+    movie_said_damaged(&outcome, MOVIE);
+    assert_eq!(
         outcome.status,
         Some(JobStatus::Partial),
         "{}",
@@ -127,8 +135,11 @@ async fn a_nested_stored_rar4_with_a_flipped_byte_in_a_middle_volume_is_not_deli
 #[tokio::test]
 async fn a_nested_stored_rar4_with_a_flipped_byte_in_its_last_volume_is_not_delivered_whole() {
     let outcome = run(&in_outer_rar(&with_nfo(flipped(6, 5)))).await;
-    movie_not_whole(&outcome, MOVIE);
-    assert_ne!(
+    // The whole `.nfo` beside it leaves the job delivered in part, and a
+    // job delivered in part hands the damaged movie over as it stands,
+    // said damaged.
+    movie_said_damaged(&outcome, MOVIE);
+    assert_eq!(
         outcome.status,
         Some(JobStatus::Partial),
         "{}",
@@ -139,8 +150,11 @@ async fn a_nested_stored_rar4_with_a_flipped_byte_in_its_last_volume_is_not_deli
 #[tokio::test]
 async fn a_nested_single_volume_stored_rar4_with_a_flipped_byte_is_not_delivered_whole() {
     let outcome = run(&in_outer_rar(&with_nfo(flipped(1, 0)))).await;
-    movie_not_whole(&outcome, MOVIE);
-    assert_ne!(
+    // The whole `.nfo` beside it leaves the job delivered in part, and a
+    // job delivered in part hands the damaged movie over as it stands,
+    // said damaged.
+    movie_said_damaged(&outcome, MOVIE);
+    assert_eq!(
         outcome.status,
         Some(JobStatus::Partial),
         "{}",

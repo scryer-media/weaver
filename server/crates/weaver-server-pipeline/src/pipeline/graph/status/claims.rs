@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use weaver_graph::{Member, MemberId, NodeId, Sniff, Tree, VolumeIndex, Why, usable_type};
+use weaver_graph::{Member, MemberId, NodeId, Sniff, Tree, VolumeIndex, Why, known_type};
 
 use crate::jobs::model::JobStatus;
 use crate::pipeline::graph::leaf::Leaf;
@@ -299,12 +299,13 @@ impl Delivery {
     // files alone it is a file the post lacks. The feed giving the post up
     // words a failure and rules nothing: a delivery with a whole usable
     // output and nothing short is complete. A short delivery is partial only
-    // when a whole file is of a type people open and no furniture beside the
-    // payload (`usable_type`), whatever depth it came from; a job whole
-    // files of no usable type alone stand for, an `.nfo` or a `file_id.diz`
-    // among them, fails, and as every failed job publishes nothing, they
-    // stay in its working directory. A file no set describes beside a set that vouched
-    // (`unchecked`) is never short: nothing checked it.
+    // when a whole file is of a type people open (`known_type`), furniture
+    // beside the payload such as an `.nfo` or a `file_id.diz` among them,
+    // whatever depth it came from; a job whole files of no known type alone
+    // stand for, archive volumes, split parts, recovery data or a bare
+    // `.bin`, fails, and as every failed job publishes nothing, they stay in
+    // its working directory. A file no set describes beside a set that
+    // vouched (`unchecked`) is never short: nothing checked it.
     pub fn status(&self, failure: Option<&Failure>) -> JobStatus {
         let short = !(self.damaged.is_empty()
             && self.unrepaired.is_empty()
@@ -314,7 +315,7 @@ impl Delivery {
         if !self.whole.is_empty() && !short && failure.is_none_or(|failure| failure.from_feed) {
             return JobStatus::Complete;
         }
-        if self.whole.iter().any(|name| usable_type(name)) {
+        if self.whole.iter().any(|name| known_type(name)) {
             return JobStatus::Partial;
         }
         let nothing = if self.whole.is_empty() {

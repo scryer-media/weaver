@@ -2,28 +2,19 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // The file types people open. A whole file whose name ends in one of these,
-// furniture beside the payload aside (`usable_type`), is a usable delivery;
-// any other whole file ships but is not one. Archive
-// volumes, split parts, recovery and check data, and bare `.bin` are not on
-// it: they exist to make something else, or say nothing of what they are.
+// furniture beside the payload among them, is a usable delivery; any other
+// whole file ships but is not one. Archive volumes, split parts, recovery
+// and check data, and bare `.bin` are not on it: they exist to make
+// something else, or say nothing of what they are.
 
 // A file name's extension, after its last dot, is a type people open.
+// Archives Weaver does not unpack, such as an `.apk` or an `.iso`, are.
 pub fn known_type(name: &str) -> bool {
     extension(name).is_some_and(|extension| {
         KNOWN_TYPES
             .iter()
             .any(|group| group.binary_search(&extension.as_str()).is_ok())
     })
-}
-
-// A whole file of this name can stand for a delivery made in part: a type
-// people open that is not furniture, text posted beside a payload
-// (`BESIDE`), wherever it came from. Archives Weaver does not unpack, such
-// as an `.apk` or an `.iso`, are files people open and stand.
-pub fn usable_type(name: &str) -> bool {
-    known_type(name)
-        && extension(name)
-            .is_none_or(|extension| BESIDE.binary_search(&extension.as_str()).is_err())
 }
 
 // Furniture a release posts beside its payload: text (`BESIDE`) or a sample,
@@ -855,7 +846,7 @@ const KNOWN_TYPES: &[&[&str]] = &[
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{BESIDE, KNOWN_TYPES, furniture, known_type, usable_type};
+    use super::{BESIDE, KNOWN_TYPES, furniture, known_type};
 
     #[test]
     fn furniture_is_text_beside_a_payload_or_a_sample() {
@@ -885,14 +876,13 @@ mod tests {
         }
     }
 
-    // Furniture is a known type, never a usable one; every other known type
-    // is usable, an archive Weaver does not unpack among them.
+    // Furniture is a known type, as is an archive Weaver does not unpack;
+    // volumes, recovery and check data and a bare `.bin` are not.
     #[test]
-    fn furniture_beside_a_payload_is_known_but_not_usable() {
+    fn furniture_beside_a_payload_is_a_known_type() {
         for extension in BESIDE {
             let name = format!("disc/ember.{}", extension.to_ascii_uppercase());
             assert!(known_type(&name), "{name}");
-            assert!(!usable_type(&name), "{name}");
         }
         assert!(BESIDE.windows(2).all(|pair| pair[0] < pair[1]));
         for name in [
@@ -903,10 +893,10 @@ mod tests {
             "ember.epub",
             "ember.txt",
         ] {
-            assert!(usable_type(name), "{name}");
+            assert!(known_type(name), "{name}");
         }
         for name in ["ember.bin", "ember.r03", "ember.par2", "ember.sfv", "ember"] {
-            assert!(!usable_type(name), "{name}");
+            assert!(!known_type(name), "{name}");
         }
     }
 

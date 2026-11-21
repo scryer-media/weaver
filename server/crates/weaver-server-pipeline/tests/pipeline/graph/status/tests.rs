@@ -653,9 +653,7 @@ fn a_short_delivery_is_partial_only_by_a_whole_file_of_a_known_type() {
     );
     assert_eq!(
         posted("ember.nfo").status(Some(&failed(error))),
-        JobStatus::Failed {
-            error: error.to_string()
-        }
+        JobStatus::Partial
     );
     assert_eq!(
         posted("ember.srt").status(Some(&failed(error))),
@@ -692,13 +690,13 @@ fn a_short_delivery_is_partial_only_by_a_whole_file_of_a_known_type() {
     assert_eq!(whole.status(None), JobStatus::Complete);
 }
 
-// Furniture beside a payload, an `.nfo` or a `file_id.diz`, never stands for
-// a delivery made in part, posted at the root, in a folder or unpacked:
-// beside volumes nothing could unpack the job fails. One usable file beside
-// it is partial, an archive Weaver does not unpack, such as an `.apk`,
-// among them. Nothing short, furniture alone completes as it did.
+// Furniture beside a payload, an `.nfo` or a `file_id.diz`, stands for a
+// delivery made in part, posted at the root, in a folder or unpacked: beside
+// volumes nothing could unpack the job is partial, as it is beside any other
+// whole file of a known type, an archive Weaver does not unpack, such as an
+// `.apk`, among them. Nothing short, furniture alone completes as it did.
 #[test]
-fn furniture_alone_never_makes_a_short_delivery_partial() {
+fn whole_furniture_makes_a_short_delivery_partial() {
     let short = |whole: &[&str]| Delivery {
         whole: whole.iter().map(ToString::to_string).collect(),
         unrepaired: ["ember.part1.rar", "ember.part2.rar", "ember.part3.rar"]
@@ -713,14 +711,10 @@ fn furniture_alone_never_makes_a_short_delivery_partial() {
         "Sample/ember.nfo",
         "ember.url",
     ];
-    assert_eq!(
-        short(&furniture).status(None),
-        JobStatus::Failed {
-            error: "no usable file was delivered whole; 3 short: ember.part1.rar, \
-                    ember.part2.rar, ember.part3.rar"
-                .to_string()
-        }
-    );
+    assert_eq!(short(&furniture).status(None), JobStatus::Partial);
+    for name in furniture {
+        assert_eq!(short(&[name]).status(None), JobStatus::Partial, "{name}");
+    }
     let mut usable = furniture.to_vec();
     usable.push("ember.mkv");
     assert_eq!(short(&usable).status(None), JobStatus::Partial);
