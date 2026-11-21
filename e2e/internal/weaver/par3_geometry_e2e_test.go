@@ -34,7 +34,7 @@ func TestPar3GeometryE2E(t *testing.T) {
 	t.Logf("preserved artifacts: %s", root)
 	nntp := startUnpackNNTP(t)
 	url, logPath := startUnpackWeaver(t, bin, root, nntp.listener.Addr().(*net.TCPAddr).Port,
-		"RUST_LOG=info,weaver_server_core::pipeline::repair::par3=trace")
+		"RUST_LOG=info,weaver_objects::par3=trace")
 	api := provisionUnpackAPI(t, root, url)
 	type geometry struct {
 		name    string

@@ -308,8 +308,8 @@ func TestApplyRuntimeFileIdentityRewriteTerminalCheckFailsWhenJobCompletesBefore
 func TestAssertLogLinesIgnoresDebugRingReplays(t *testing.T) {
 	maxCount := 1
 	raw := strings.Join([]string{
-		"2026-01-02T03:04:05.000001+00:00  INFO weaver_server_core::pipeline::stage: direct unpack armed job_id=7 set=a",
-		`2026-01-02T03:04:06.000001+00:00  WARN weaver_server_core::runtime::job_debug_ring: stall diagnostics line job_id=7 reason="dispatch stall: job not eligible" at=2026-01-02T03:04:05.000001+00:00 replayed_level=INFO replayed_target="weaver_server_core::pipeline::stage" replayed_message="direct unpack armed" replayed_fields="job_id=7 set=a"`,
+		"2026-01-02T03:04:05.000001+00:00  INFO weaver_server_pipeline::pipeline::activation: direct unpack armed job_id=7 set=a",
+		`2026-01-02T03:04:06.000001+00:00  WARN weaver_server_base::runtime::job_debug_ring: stall diagnostics line job_id=7 reason="dispatch stall: job not eligible" at=2026-01-02T03:04:05.000001+00:00 replayed_level=INFO replayed_target="weaver_server_pipeline::pipeline::activation" replayed_message="direct unpack armed" replayed_fields="job_id=7 set=a"`,
 	}, "\n")
 	err := assertLogLines(raw, 7, &ScenarioLogAssertion{Lines: []ScenarioLogLineAssertion{{
 		Message:  "direct unpack armed",

@@ -34,7 +34,7 @@ func TestPar3ConcurrentE2E(t *testing.T) {
 	nntp := startUnpackNNTP(t)
 	port := nntp.listener.Addr().(*net.TCPAddr).Port
 	url, logPath, _ := startManagedUnpackWeaver(t, bin, root, "weaver.log", port,
-		"RUST_LOG=info,weaver_server_core::pipeline::repair::par3=trace")
+		"RUST_LOG=info,weaver_objects::par3=trace")
 	api := provisionUnpackAPI(t, root, url)
 	gate := &unpackGate{released: make(chan struct{})}
 	release := sync.OnceFunc(func() { close(gate.released) })

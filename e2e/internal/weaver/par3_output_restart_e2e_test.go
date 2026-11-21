@@ -64,7 +64,7 @@ func TestPar3OutputRestartE2E(t *testing.T) {
 	nntp := startUnpackNNTP(t)
 	port := nntp.listener.Addr().(*net.TCPAddr).Port
 	url, firstLog, stop := startManagedUnpackWeaver(t, bin, root, "before.log", port,
-		"RUST_LOG=info,weaver_server_core::pipeline::repair::par3=trace")
+		"RUST_LOG=info,weaver_objects::par3=trace")
 	api := provisionUnpackAPI(t, root, url)
 	slug := "par3-output-restart"
 	nzb := nntp.publishUnpack(slug, "clean", posted, nil)
@@ -119,7 +119,7 @@ func TestPar3OutputRestartE2E(t *testing.T) {
 	}
 	release()
 	url, secondLog, _ := startManagedUnpackWeaver(t, bin, root, "after.log", port,
-		"RUST_LOG=info,weaver_server_core::pipeline::repair::par3=trace")
+		"RUST_LOG=info,weaver_objects::par3=trace")
 	api.url = url
 	status := ""
 	deadline = time.Now().Add(90 * time.Second)

@@ -71,7 +71,7 @@ priority = 0
 			cmd.Env = append(cmd.Env, entry)
 		}
 	}
-	cmd.Env = append(cmd.Env, "WEAVER_FORCE_KEY_FILE=1", "RUST_LOG=info,weaver_server_core::pipeline::completion=debug", "NO_COLOR=1")
+	cmd.Env = append(cmd.Env, "WEAVER_FORCE_KEY_FILE=1", "RUST_LOG=info,weaver_server_pipeline::pipeline::completion=debug", "NO_COLOR=1")
 	cmd.Env = append(cmd.Env, extraEnv...)
 	if databaseURL != "" {
 		cmd.Env = append(cmd.Env, "WEAVER_DATABASE_URL="+databaseURL)

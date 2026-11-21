@@ -58,7 +58,7 @@ func TestPar3InsideRestartE2E(t *testing.T) {
 			nntp := startUnpackNNTP(t)
 			port := nntp.listener.Addr().(*net.TCPAddr).Port
 			url, firstLog, stop := startManagedUnpackWeaver(t, bin, root, "before.log", port,
-				"RUST_LOG=info,weaver_server_core::pipeline::repair::par3=trace")
+				"RUST_LOG=info,weaver_objects::par3=trace")
 			api := provisionUnpackAPI(t, root, url)
 			slug := "par3-inside-restart-" + format
 			nzb := nntp.publishUnpack(slug, "clean", posted, nil)
@@ -120,7 +120,7 @@ func TestPar3InsideRestartE2E(t *testing.T) {
 			}
 			release()
 			url, secondLog, _ := startManagedUnpackWeaver(t, bin, root, "after.log", port,
-				"RUST_LOG=info,weaver_server_core::pipeline::repair::par3=trace")
+				"RUST_LOG=info,weaver_objects::par3=trace")
 			api.url = url
 			status := ""
 			deadline = time.Now().Add(90 * time.Second)
@@ -183,7 +183,7 @@ func TestPar3InsideStagingRestartE2E(t *testing.T) {
 			port := nntp.listener.Addr().(*net.TCPAddr).Port
 			const failpoint = "par3.inside.staged"
 			url, firstLog, stop := startManagedUnpackWeaver(t, bin, root, "before.log", port,
-				"WEAVER_E2E_FAILPOINT="+failpoint, "RUST_LOG=info,weaver_server_core::pipeline::repair::par3=trace")
+				"WEAVER_E2E_FAILPOINT="+failpoint, "RUST_LOG=info,weaver_objects::par3=trace")
 			api := provisionUnpackAPI(t, root, url)
 			slug := "par3-staging-restart-" + format
 			job, err := api.submit(nntp.publishUnpack(slug, "clean", posted, nil), slug)
@@ -214,7 +214,7 @@ func TestPar3InsideStagingRestartE2E(t *testing.T) {
 				t.Fatalf("staging changed the original carrier: %v", err)
 			}
 			url, secondLog, _ := startManagedUnpackWeaver(t, bin, root, "after.log", port,
-				"RUST_LOG=info,weaver_server_core::pipeline::repair::par3=trace")
+				"RUST_LOG=info,weaver_objects::par3=trace")
 			api.url = url
 			status := ""
 			deadline = time.Now().Add(90 * time.Second)

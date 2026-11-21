@@ -34,7 +34,7 @@ func TestPar3InsideE2E(t *testing.T) {
 	t.Logf("preserved artifacts: %s", root)
 	nntp := startUnpackNNTP(t)
 	url, logPath := startUnpackWeaver(t, bin, root, nntp.listener.Addr().(*net.TCPAddr).Port,
-		"RUST_LOG=info,weaver_server_core::pipeline::repair::par3=trace")
+		"RUST_LOG=info,weaver_objects::par3=trace")
 	api := provisionUnpackAPI(t, root, url)
 	for _, format := range []string{"zip", "zip64", "7z", "zip-large", "zip64-large", "7z-large"} {
 		t.Run(format, func(t *testing.T) {
