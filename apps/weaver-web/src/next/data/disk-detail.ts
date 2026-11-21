@@ -10,10 +10,13 @@ type DiskJob = Pick<JobData, "diskWrite" | "status" | "remainingBytes" | "totalB
 
 /** Statuses that show their own work: the disk is named only while it is slow. */
 const WORKING = new Set(["VERIFYING", "REPAIRING", "EXTRACTING"]);
+/** Statuses that fetch bytes: only these can be held back by a slow disk. */
+const FETCHING = new Set(["DOWNLOADING", "FETCHING_REPAIR_DATA"]);
 
 /**
  * The disk write a row is showing: a download a slow disk holds back while it
- * still fetches (not paused), or one done fetching whose bytes still wait for
+ * fetches (a job waiting its turn or paused writes nothing, whatever disk it
+ * is bound for), or one done fetching whose bytes still wait for
  * its disk, slow or not. A job verifying, repairing or unpacking shows its own
  * status, and the disk only while its own writes wait on a slow one, as the
  * server lists it. Null otherwise.
@@ -24,7 +27,7 @@ export function shownDiskWrite(job: DiskJob): { write: DiskWrite; fetched: boole
   if (WORKING.has(job.status)) return write.slow ? { write, fetched: false } : null;
   const fetched = (job.remainingBytes ?? job.totalBytes - job.downloadedBytes) <= 0;
   if (fetched) return write.draining ? { write, fetched } : null;
-  return write.slow && job.status !== "PAUSED" ? { write, fetched } : null;
+  return write.slow && FETCHING.has(job.status) ? { write, fetched } : null;
 }
 
 /** The figures of the disk `write` names, from the live disk list. */

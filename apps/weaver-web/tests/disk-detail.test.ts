@@ -54,6 +54,11 @@ test("only a row the daemon names, and not a paused one still fetching, shows it
   assert.equal(diskDetail(t, fetching, disks), null);
   assert.equal(diskDetail(t, { ...fetching, status: "PAUSED", diskWrite: slow }, disks), null);
   assert.equal(diskShort(t, { ...fetching, status: "PAUSED", diskWrite: slow }), null);
+  // A job waiting its turn has written nothing, though its disk is slow.
+  assert.equal(diskDetail(t, { ...fetching, status: "QUEUED", diskWrite: slow }, disks), null);
+  assert.equal(diskShort(t, { ...fetching, status: "QUEUED", diskWrite: slow }), null);
+  // Fetching repair data is fetching too.
+  assert.equal(diskShort(t, { ...fetching, status: "FETCHING_REPAIR_DATA", diskWrite: slow }), "Writing to disk");
   // A disk that is not slow says nothing while the row still fetches.
   assert.equal(diskDetail(t, { ...fetching, diskWrite: { ...slow, slow: false } }, disks), null);
 });
