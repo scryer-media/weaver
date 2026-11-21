@@ -61,6 +61,17 @@ async fn on_disks(
     save: Option<std::path::PathBuf>,
     before: impl FnOnce(&StorageCapacity),
 ) -> OnDisk {
+    on_disks_keeping(probe, roots, save, before, RESERVE).await
+}
+
+// `on_disks`, the jobs keeping `reserve` free.
+async fn on_disks_keeping(
+    probe: impl Fn(&Path) -> Result<DiskSpace, DiskProbeError> + Send + Sync + 'static,
+    roots: Option<[std::path::PathBuf; 3]>,
+    save: Option<std::path::PathBuf>,
+    before: impl FnOnce(&StorageCapacity),
+    reserve: u64,
+) -> OnDisk {
     use crate::torrents::net::{LegKind, LegSockets};
 
     let data: Vec<u8> = (0..65_536u32).map(|at| (at % 251) as u8).collect();
@@ -79,7 +90,7 @@ async fn on_disks(
         capacity.wait_for_probes(root, 1);
     }
     before(&capacity);
-    let rig = rig_with(set_clock(), disk_env(&capacity));
+    let rig = rig_with(set_clock(), disk_env_keeping(&capacity, reserve));
     let loopback = Arc::new(weaver_tunnel::pipe::Revocable::new(Arc::new(
         weaver_tunnel::pipe::Egress::new(
             4,
@@ -109,8 +120,13 @@ async fn on_disks(
 
 // The jobs' budget on `capacity`'s disks, with a reserve of `RESERVE`.
 fn disk_env(capacity: &Arc<StorageCapacity>) -> JobEnv {
+    disk_env_keeping(capacity, RESERVE)
+}
+
+// `disk_env`, keeping `reserve` free.
+fn disk_env_keeping(capacity: &Arc<StorageCapacity>, reserve: u64) -> JobEnv {
     let mut limits = ExtractionLimits::unbounded();
-    limits.min_free_bytes = RESERVE;
+    limits.min_free_bytes = reserve;
     JobEnv {
         free_disk: capacity.reader(StorageRoot::Complete),
         capacity: Some(Arc::clone(capacity)),
@@ -298,6 +314,266 @@ async fn a_short_disk_keeps_a_torrent_with_bytes_to_fetch_from_starting() {
     assert!(!disk.capacity.ledger(StorageRoot::Complete).waited_on());
     service.stop().await;
     disk.seeding.stop().await;
+}
+
+// With no reserve kept, a torrent's start past the disk's free bytes is
+// refused, as a usenet job's is: 1,000 bytes free leave no room for its
+// 65,536, and it stays paused, waiting for disk space with the figures of
+// why. Nothing is promised.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_no_reserve_a_start_past_the_free_bytes_is_refused() {
+    let disk = on_disks_keeping(
+        |_: &Path| {
+            Ok(DiskSpace {
+                total_bytes: 1 << 40,
+                available_bytes: 1_000,
+            })
+        },
+        None,
+        None,
+        |_| {},
+        0,
+    )
+    .await;
+    let service = &disk.rig.service;
+    let view = view_once(service, disk.job_id, |view| {
+        view.stated == Some(Stated::DiskSpace)
+    })
+    .await;
+    assert_eq!(view.state, TorrentState::Queued);
+    assert_eq!(
+        (view.disk_need_bytes, view.disk_free_bytes),
+        (Some(65_536), Some(1_000))
+    );
+    assert_eq!(view.downloaded_bytes, 0);
+    assert!(not_running(service, disk.job_id).await, "it does not start");
+    assert_eq!(
+        disk.capacity.ledger(StorageRoot::Complete).promised_total(),
+        0
+    );
+    service.stop().await;
+    disk.seeding.stop().await;
+}
+
+// A disk that never holds what a torrent has left to fetch keeps it from
+// starting and says the disk is too small, as a usenet job's row does, with
+// the most the disk holds above its reserve.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_disk_too_small_for_a_torrent_says_so() {
+    let disk = on_disks(
+        |_: &Path| {
+            Ok(DiskSpace {
+                total_bytes: RESERVE + 1_000,
+                available_bytes: RESERVE + 1_000,
+            })
+        },
+        None,
+        None,
+        |_| {},
+    )
+    .await;
+    let service = &disk.rig.service;
+    let view = view_once(service, disk.job_id, |view| {
+        view.stated == Some(Stated::DiskTooSmall)
+    })
+    .await;
+    assert_eq!(view.state, TorrentState::Queued);
+    assert_eq!(
+        (view.disk_need_bytes, view.disk_free_bytes),
+        (Some(65_536), Some(1_000))
+    );
+    assert!(not_running(service, disk.job_id).await, "it does not start");
+    service.publish_job(disk.job_id).await;
+    assert_eq!(
+        service.inner.queue.lock().unwrap().as_ref().map(|queue| {
+            queue
+                .state()
+                .get_job(disk.job_id)
+                .and_then(|job| job.download_wait_reason)
+        }),
+        Some(Some(
+            crate::jobs::handle::DISK_TOO_SMALL_WAIT_REASON.to_owned()
+        ))
+    );
+    service.stop().await;
+    disk.seeding.stop().await;
+}
+
+// The file named `name` in `dir`'s tree.
+fn file_named(dir: &Path, name: &str) -> std::path::PathBuf {
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.file_name() == Some(std::ffi::OsStr::new(name)) {
+                return path;
+            }
+        }
+    }
+    panic!("no {name} under {}", dir.display());
+}
+
+// A recheck that finds less than the torrent was believed to hold judges
+// it again once the check ends, as a change of the files it wants does:
+// with no room over the reserve for the piece it lost, its download is
+// held, its session in upload mode, seeding what it has, not paused, with
+// the figures of why, and nothing is promised for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recheck_that_finds_less_judges_the_start_again() {
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let disk = on_disk(&room).await;
+    let service = &disk.rig.service;
+    let ledger = disk.capacity.ledger(StorageRoot::Complete);
+    let torrent = handle_of(service, disk.job_id).await;
+    torrent.wait_until_completed().await.unwrap();
+    // Nobody is left to fetch the lost piece from.
+    disk.seeding.stop().await;
+    let dir = service
+        .torrent(disk.job_id)
+        .await
+        .unwrap()
+        .storage_dir
+        .unwrap();
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let file = file_named(Path::new(&dir), "a.bin");
+        let mut opened = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
+        opened.seek(SeekFrom::Start(2 * 16_384 + 100)).unwrap();
+        opened.write_all(&[0x5a; 16]).unwrap();
+    }
+    room.store(1, Ordering::Release);
+    let capacity = Arc::clone(&disk.capacity);
+    tokio::task::spawn_blocking(move || capacity.reread_roots())
+        .await
+        .unwrap();
+
+    let mut moved = service.inner.disk_waits_moved.subscribe();
+    service.recheck(disk.job_id).await.unwrap();
+    moved
+        .wait_for(|_| locked(&service.inner.start_held).iter().any(|wait| wait.held()))
+        .await
+        .unwrap();
+    assert_eq!(
+        disk_held(service, disk.job_id).await,
+        Some(DiskHeld::Fetching)
+    );
+    assert!(torrent.live().unwrap().upload_mode());
+    assert!(!torrent.is_paused(), "the run goes on, seeding");
+    let view = service.torrent(disk.job_id).await.unwrap();
+    assert_eq!(
+        (view.disk_need_bytes, view.disk_free_bytes),
+        (Some(16_384), Some(1))
+    );
+    assert_eq!(ledger.promised_total(), 0);
+    assert!(ledger.waited_on());
+    service.stop().await;
+}
+
+// A running torrent moved to another disk takes its promise with it: what
+// it was promised goes back on the old disk, and what it has left is judged
+// on the new one by the start rule. With no room there, its download is
+// held and it seeds, not paused, waiting on the new disk only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_moved_torrent_is_judged_on_its_new_disk() {
+    const PIECE: usize = 16_384;
+    let complete = tempfile::tempdir().unwrap();
+    let working = tempfile::tempdir().unwrap();
+    weaver_server_disk::runtime::fs::test_devices::assign(complete.path(), 71_101);
+    weaver_server_disk::runtime::fs::test_devices::assign(working.path(), 71_102);
+    let save = complete.path().join("saved");
+    let to = working.path().join("moved");
+    std::fs::create_dir_all(&save).unwrap();
+    std::fs::create_dir_all(&to).unwrap();
+    let room = Arc::new(AtomicU64::new(1));
+    let read = Arc::clone(&room);
+    let full = working.path().to_path_buf();
+    let probe = Arc::new(move |path: &Path| {
+        let over = if path.starts_with(&full) {
+            read.load(Ordering::Acquire)
+        } else {
+            PLENTY
+        };
+        Ok(DiskSpace {
+            total_bytes: 1 << 40,
+            available_bytes: RESERVE + over,
+        })
+    });
+    let roots = [
+        complete.path().to_path_buf(),
+        working.path().to_path_buf(),
+        complete.path().to_path_buf(),
+    ];
+    let capacity = Arc::new(StorageCapacity::with_probe(roots, NEVER, probe));
+    for root in StorageRoot::ALL {
+        capacity.wait_for_probes(root, 1);
+    }
+    let rig = rig_with(set_clock(), disk_env(&capacity));
+    on_loopback(&rig.routes);
+    rig.service.publish_to(queue());
+    rig.service.open().await.unwrap();
+    let service = &rig.service;
+
+    // A peer with only the first of its two files: the torrent gets that
+    // one and waits for the other.
+    let data: Vec<u8> = (0..4 * PIECE as u32).map(|at| (at % 251) as u8).collect();
+    let files = [
+        ("set/a.bin", &data[..2 * PIECE]),
+        ("set/b.bin", &data[2 * PIECE..]),
+    ];
+    let meta = metainfo("set", &files, PIECE, false);
+    let seeds = tempfile::tempdir().unwrap();
+    let (sharer, shared) = sharing(seeds.path(), &meta, &files[..1]).await;
+    shared.wait_until_initialized().await.unwrap();
+    let std::net::SocketAddr::V4(peer) = sharer.listen_addr().unwrap() else {
+        panic!("the sharer listens on IPv4 loopback");
+    };
+    let url = tracker(peer).await;
+    let mut add = request(AddSource::Metainfo(meta));
+    add.placement.save_path = Some(save.to_string_lossy().into_owned());
+    let job_id = service.add_opened(add).await.unwrap();
+    tracked(service, job_id, &url).await;
+    let store = service.inner.live.lock().await[&job_id]
+        .store
+        .clone()
+        .unwrap();
+    service
+        .inner
+        .settled
+        .subscribe()
+        .wait_for(|_| store.has_files(|file| file == 0))
+        .await
+        .unwrap();
+    sharer.stop().await;
+    let complete_ledger = capacity.ledger(StorageRoot::Complete);
+    let working_ledger = capacity.ledger(StorageRoot::Intermediate);
+    assert_eq!(complete_ledger.promised_total(), 2 * PIECE as u64);
+    assert_eq!(working_ledger.promised(), 0);
+
+    let mut moved = service.inner.disk_waits_moved.subscribe();
+    service
+        .set_location(job_id, to.to_string_lossy().into_owned())
+        .await
+        .unwrap();
+    moved
+        .wait_for(|_| locked(&service.inner.start_held).iter().any(|wait| wait.held()))
+        .await
+        .unwrap();
+    assert_eq!(disk_held(service, job_id).await, Some(DiskHeld::Fetching));
+    let torrent = handle_of(service, job_id).await;
+    assert!(torrent.live().unwrap().upload_mode());
+    assert!(!torrent.is_paused(), "the run goes on, seeding");
+    let view = service.torrent(job_id).await.unwrap();
+    assert_eq!(
+        (view.disk_need_bytes, view.disk_free_bytes),
+        (Some(2 * PIECE as u64), Some(1))
+    );
+    assert_eq!(complete_ledger.promised_total(), 0, "its promise went back");
+    assert!(!complete_ledger.waited_on());
+    assert_eq!(working_ledger.promised(), 0);
+    assert!(working_ledger.waited_on());
+    service.stop().await;
 }
 
 // A complete torrent starts and seeds on a disk with no room over the

@@ -768,6 +768,11 @@ impl Live {
             restore_held: self.restore_held.clone(),
             files_missing: self.files_missing,
             disk_space,
+            // Its start was refused by a disk that never holds it.
+            disk_too_small: disk_space
+                && self
+                    .start_refused
+                    .is_some_and(|refused| refused.too_small()),
         }
     }
 }

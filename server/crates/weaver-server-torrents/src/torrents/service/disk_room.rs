@@ -449,6 +449,49 @@ impl TorrentService {
         }
     }
 
+    // A check of every piece of `job_id`'s run on `handle` began: once it
+    // ends, what it found is judged as a change of the files it wants is
+    // (`rejudge_start`), so a check that finds less than was believed is
+    // promised what it has left, or has its download held, seeding. A run
+    // ended or replaced by then is judged as it starts.
+    pub(super) fn rejudge_after_check(
+        &self,
+        job_id: JobId,
+        session: &Arc<weaver_torrent::Session>,
+        handle: &Arc<weaver_torrent::ManagedTorrent>,
+    ) {
+        if self.inner.env.capacity.is_none() {
+            return;
+        }
+        let service = self.clone();
+        let stopping = session.cancellation_token().clone().cancelled_owned();
+        let handle = Arc::clone(handle);
+        self.keep(tokio::spawn(async move {
+            tokio::select! {
+                checked = handle.wait_until_initialized() => {
+                    if checked.is_err() {
+                        return;
+                    }
+                }
+                () = stopping => return,
+            }
+            let mut live = service.inner.live.lock().await;
+            let Some(torrent) = live.get_mut(&job_id) else {
+                return;
+            };
+            let same = torrent
+                .attached
+                .as_ref()
+                .is_some_and(|attached| Arc::ptr_eq(&attached.handle, &handle));
+            if !same {
+                return;
+            }
+            service.rejudge_start(torrent);
+            drop(live);
+            service.publish_job(job_id).await;
+        }));
+    }
+
     // Whether `torrent` has a run under way, unpaused.
     fn runs_now(&self, torrent: &Live) -> bool {
         torrent.attached.as_ref().is_some_and(|attached| {
