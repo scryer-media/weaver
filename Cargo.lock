@@ -3153,9 +3153,7 @@ dependencies = [
 
 [[package]]
 name = "lzma-turbo"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c0ad0959852261cd7449e6de6da34dc6cc310d0dc5fa459bb65f5bd81afa37e"
+version = "0.12.1"
 dependencies = [
  "aws-lc-rs",
  "crc-turbo",
@@ -3692,7 +3690,7 @@ dependencies = [
  "md-5",
  "memmap2",
  "rayon",
- "reedsolomon-rs",
+ "reedsolomon-rs 0.4.11",
  "thiserror 2.0.21",
  "tracing",
 ]
@@ -3708,7 +3706,7 @@ dependencies = [
  "crc-turbo",
  "libc",
  "rayon",
- "reedsolomon-rs",
+ "reedsolomon-rs 0.4.11",
  "thiserror 2.0.21",
  "tracing",
  "unicode-normalization",
@@ -4320,6 +4318,14 @@ name = "reedsolomon-rs"
 version = "0.4.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81f4afa0094e231cfcb6b23f9f6f568db67097fa7a2a9bae0992d339e7555fc3"
+dependencies = [
+ "memmap2",
+ "rayon",
+]
+
+[[package]]
+name = "reedsolomon-rs"
+version = "0.4.12"
 dependencies = [
  "memmap2",
  "rayon",
@@ -4992,9 +4998,9 @@ dependencies = [
 
 [[package]]
 name = "sevenz-turbo"
-version = "0.30.1"
+version = "0.30.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7737abec9967c66dde8305e31f7f9476d13977f41b82a593929e86f4928e9584"
+checksum = "784d55b4665741045e1ec4fbc3985225c720f5268d5d87de4445ea26b2b68594"
 dependencies = [
  "aws-lc-rs",
  "brotli",
@@ -6218,9 +6224,7 @@ dependencies = [
 
 [[package]]
 name = "unrar-rs"
-version = "0.16.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d1365e0b3826ea05fad47252964b45443471e33ab5a38fe10eacd9b008c1165"
+version = "0.16.8"
 dependencies = [
  "aws-lc-rs",
  "blake2s_simd",
@@ -6230,7 +6234,7 @@ dependencies = [
  "memchr",
  "ppmd-turbo",
  "rayon",
- "reedsolomon-rs",
+ "reedsolomon-rs 0.4.12",
  "rmp-serde",
  "serde",
  "sha2 0.11.1",
@@ -6671,7 +6675,7 @@ dependencies = [
  "par2-rs",
  "par3-rs",
  "rayon",
- "reedsolomon-rs",
+ "reedsolomon-rs 0.4.11",
  "serde",
  "serde_json",
  "tempfile",
@@ -6719,7 +6723,7 @@ dependencies = [
  "quick-xml",
  "rayon",
  "rcgen",
- "reedsolomon-rs",
+ "reedsolomon-rs 0.4.11",
  "regex",
  "reqwest",
  "rmp-serde",
@@ -7089,7 +7093,7 @@ dependencies = [
  "quick-xml",
  "rayon",
  "rcgen",
- "reedsolomon-rs",
+ "reedsolomon-rs 0.4.11",
  "regex",
  "reqwest",
  "rmp-serde",
