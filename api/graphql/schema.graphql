@@ -1628,7 +1628,6 @@ type HistoryItem {
 	name: String!
 	displayTitle: String!
 	originalTitle: String!
-	parsedRelease: ParsedRelease!
 	state: QueueItemState!
 	error: String
 	progressPercent: Float!
@@ -1877,7 +1876,6 @@ type Job {
 	name: String!
 	displayTitle: String!
 	originalTitle: String!
-	parsedRelease: ParsedRelease!
 	status: JobStatusGql!
 	error: String
 	progress: Float!
@@ -3253,46 +3251,6 @@ type P2pTestResult {
 	exposure: TorrentExposure
 }
 
-type ParsedEpisode {
-	season: Int
-	episodeNumbers: [Int!]!
-	absoluteEpisode: Int
-	raw: String
-}
-
-type ParsedRelease {
-	normalizedTitle: String!
-	releaseGroup: String
-	languagesAudio: [String!]!
-	languagesSubtitles: [String!]!
-	year: Int
-	quality: String
-	source: String
-	videoCodec: String
-	videoEncoding: String
-	audio: String
-	audioCodecs: [String!]!
-	audioChannels: String
-	isDualAudio: Boolean!
-	isAtmos: Boolean!
-	isDolbyVision: Boolean!
-	detectedHdr: Boolean!
-	isHdr10Plus: Boolean!
-	isHlg: Boolean!
-	fps: Float
-	isProperUpload: Boolean!
-	isRepack: Boolean!
-	isRemux: Boolean!
-	isBdDisk: Boolean!
-	isAiEnhanced: Boolean!
-	isHardcodedSubs: Boolean!
-	streamingService: String
-	edition: String
-	animeVersion: Int
-	episode: ParsedEpisode
-	parseConfidence: Float!
-}
-
 type PathOverride {
 	downLegs: [Int!]!
 	downRungs: [LegRung!]!
@@ -4155,7 +4113,6 @@ type QueueItem {
 	name: String!
 	displayTitle: String!
 	originalTitle: String!
-	parsedRelease: ParsedRelease!
 	state: QueueItemState!
 	downloadState: QueueDownloadState!
 	postState: QueuePostState!

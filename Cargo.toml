@@ -233,7 +233,6 @@ par3-rs = { version = "=0.8.2", default-features = false }
 # reads a RAR 3.0 recovery volume's name against its set's base name and
 # holds a caller's volume index to the volume limit.
 unrar-rs = { version = "0.16.8", default-features = false, features = ["crypto-aws-lc"] }
-scryer-release-parser = { git = "https://github.com/scryer-media/scryer", tag = "scryer-v0.18.21", default-features = false }
 
 [profile.release]
 lto = "fat"

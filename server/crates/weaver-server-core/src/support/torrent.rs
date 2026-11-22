@@ -385,10 +385,10 @@ impl SeedingOutcome {
             },
             action: policy.action.as_str(),
             seed_time_counting: policy.seed_time_counting.as_str(),
-            ratio_goal_milli: policy.ratio_goal.map(|goal| milli(f64::from(goal))),
+            ratio_goal_milli: policy.ratio_goal.map(milli),
             ratio_left_milli: policy
                 .ratio_goal
-                .map(|goal| milli(f64::from(goal)).saturating_sub(ratio_milli)),
+                .map(|goal| milli(goal).saturating_sub(ratio_milli)),
             seed_minutes_goal: policy.seed_time_goal_minutes,
             seed_minutes_left: policy
                 .seed_time_goal_minutes

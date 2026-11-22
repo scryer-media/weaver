@@ -18,7 +18,7 @@ use weaver_server_core::jobs::{
 use weaver_server_core::operations::metrics::MetricsSnapshot;
 use weaver_server_core::{is_public_history_attribute_key, split_history_metadata};
 
-use super::release_display::{ReleaseDisplayCache, ReleaseDisplayInput, release_display_info};
+use super::release_display::release_display_info;
 use crate::system::types::{DownloadBlock, Metrics};
 
 pub use weaver_server_core::CLIENT_REQUEST_ID_ATTRIBUTE_KEY;
@@ -306,7 +306,7 @@ impl From<weaver_server_core::JobPhaseProgress> for QueuePhaseProgress {
             phase: QueuePhase::from(value.phase),
             completed_bytes: value.completed_bytes as f64,
             total_bytes: value.total_bytes as f64,
-            progress_percent: value.progress_percent as f64,
+            progress_percent: value.progress_percent,
             rate_bps: value.rate_bps.map(|rate| rate as f64),
             estimated_remaining_ms: value.estimated_remaining_ms.map(|value| value as f64),
             started_at_epoch_ms: value.started_at_epoch_ms,
@@ -352,7 +352,6 @@ pub struct QueueItem {
     pub name: String,
     pub display_title: String,
     pub original_title: String,
-    pub parsed_release: ParsedRelease,
     pub state: QueueItemState,
     /// How the job ended, a partial delivery as its own value; null while
     /// it has not ended.
@@ -1341,48 +1340,6 @@ pub struct MetadataInput {
     pub value: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, SimpleObject)]
-pub struct ParsedEpisode {
-    pub season: Option<u32>,
-    pub episode_numbers: Vec<u32>,
-    pub absolute_episode: Option<u32>,
-    pub raw: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, SimpleObject)]
-pub struct ParsedRelease {
-    pub normalized_title: String,
-    pub release_group: Option<String>,
-    pub languages_audio: Vec<String>,
-    pub languages_subtitles: Vec<String>,
-    pub year: Option<u32>,
-    pub quality: Option<String>,
-    pub source: Option<String>,
-    pub video_codec: Option<String>,
-    pub video_encoding: Option<String>,
-    pub audio: Option<String>,
-    pub audio_codecs: Vec<String>,
-    pub audio_channels: Option<String>,
-    pub is_dual_audio: bool,
-    pub is_atmos: bool,
-    pub is_dolby_vision: bool,
-    pub detected_hdr: bool,
-    pub is_hdr10plus: bool,
-    pub is_hlg: bool,
-    pub fps: Option<f32>,
-    pub is_proper_upload: bool,
-    pub is_repack: bool,
-    pub is_remux: bool,
-    pub is_bd_disk: bool,
-    pub is_ai_enhanced: bool,
-    pub is_hardcoded_subs: bool,
-    pub streaming_service: Option<String>,
-    pub edition: Option<String>,
-    pub anime_version: Option<u32>,
-    pub episode: Option<ParsedEpisode>,
-    pub parse_confidence: f32,
-}
-
 #[derive(Debug, Clone, SimpleObject)]
 #[graphql(complex)]
 pub struct Job {
@@ -1390,7 +1347,6 @@ pub struct Job {
     pub name: String,
     pub display_title: String,
     pub original_title: String,
-    pub parsed_release: ParsedRelease,
     pub status: JobStatusGql,
     /// How the job ended, a partial delivery as its own value; null while
     /// it has not ended.
@@ -1439,19 +1395,13 @@ impl Job {
 
 impl From<&weaver_server_core::JobInfo> for Job {
     fn from(info: &weaver_server_core::JobInfo) -> Self {
-        let display = release_display_info(ReleaseDisplayInput {
-            job_name: &info.name,
-            metadata: &info.metadata,
-            category: info.category.as_deref(),
-            cache: ReleaseDisplayCache::Queue(info.job_id.0),
-        });
+        let display = release_display_info(&info.name, &info.metadata);
 
         Self {
             id: info.job_id.0,
             name: info.name.clone(),
             display_title: display.display_title,
             original_title: display.original_title,
-            parsed_release: display.parsed_release,
             status: JobStatusGql::from(&info.status),
             outcome: JobOutcome::of(&info.status),
             error: info.error.clone(),
@@ -1684,12 +1634,7 @@ pub fn submit_metadata(
 pub fn queue_item_from_job(info: &weaver_server_core::JobInfo) -> QueueItem {
     let (client_request_id, attributes) = split_attributes(&info.metadata);
     let state = queue_item_state_from_job_info(info);
-    let display = release_display_info(ReleaseDisplayInput {
-        job_name: &info.name,
-        metadata: &info.metadata,
-        category: info.category.as_deref(),
-        cache: ReleaseDisplayCache::Queue(info.job_id.0),
-    });
+    let display = release_display_info(&info.name, &info.metadata);
     queue_item_from_display(
         info,
         client_request_id,
@@ -1697,38 +1642,9 @@ pub fn queue_item_from_job(info: &weaver_server_core::JobInfo) -> QueueItem {
         state,
         display.original_title,
         display.display_title,
-        display.parsed_release,
     )
 }
 
-// Projects just the display data needed by queue tables. Full release parsing
-// stays on detail/snapshot paths, where callers actually render it.
-pub fn queue_table_item_from_job(info: &weaver_server_core::JobInfo) -> QueueItem {
-    let (client_request_id, attributes) = split_attributes(&info.metadata);
-    let state = queue_item_state_from_job_info(info);
-    let (original_title, display_title) = queue_display_titles_from_job(info);
-    queue_item_from_display(
-        info,
-        client_request_id,
-        attributes,
-        state,
-        original_title,
-        display_title,
-        ParsedRelease::default(),
-    )
-}
-
-pub(crate) fn queue_display_titles_from_job(
-    info: &weaver_server_core::JobInfo,
-) -> (String, String) {
-    let original_title =
-        weaver_server_core::ingest::original_release_title(&info.name, &info.metadata);
-    let display_title =
-        weaver_server_core::ingest::derive_release_name(Some(&original_title), Some(&info.name));
-    (original_title, display_title)
-}
-
-#[allow(clippy::too_many_arguments)]
 fn queue_item_from_display(
     info: &weaver_server_core::JobInfo,
     client_request_id: Option<String>,
@@ -1736,7 +1652,6 @@ fn queue_item_from_display(
     state: QueueItemState,
     original_title: String,
     display_title: String,
-    parsed_release: ParsedRelease,
 ) -> QueueItem {
     QueueItem {
         id: info.job_id.0,
@@ -1745,7 +1660,6 @@ fn queue_item_from_display(
         name: info.name.clone(),
         display_title,
         original_title,
-        parsed_release,
         state,
         outcome: JobOutcome::of(&info.status),
         download_state: QueueDownloadState::from(info.download_state),
@@ -1793,12 +1707,7 @@ pub fn queue_item_from_submission(
     submitted: &weaver_server_core::ingest::SubmittedJob,
 ) -> QueueItem {
     let (client_request_id, attributes) = split_attributes(&submitted.summary.metadata);
-    let display = release_display_info(ReleaseDisplayInput {
-        job_name: &submitted.summary.name,
-        metadata: &submitted.summary.metadata,
-        category: submitted.summary.category.as_deref(),
-        cache: ReleaseDisplayCache::Queue(submitted.job_id.0),
-    });
+    let display = release_display_info(&submitted.summary.name, &submitted.summary.metadata);
     QueueItem {
         id: submitted.job_id.0,
         protocol: ProtocolGql::Nzb,
@@ -1806,7 +1715,6 @@ pub fn queue_item_from_submission(
         name: submitted.summary.name.clone(),
         display_title: display.display_title,
         original_title: display.original_title,
-        parsed_release: display.parsed_release,
         state: if submitted.paused {
             QueueItemState::Paused
         } else {

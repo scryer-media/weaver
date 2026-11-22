@@ -27,7 +27,7 @@ use weaver_server_api::{
     QueueItemState, QueuePhase, QueuePhaseProgress, QueueStateFacts, SubmissionOptions,
     SubmitNzbError, fetch_nzb_from_url, history_item_from_row, normalize_priority_value,
     queue_item_from_job, queue_item_state, queue_item_state_for_download_accounting,
-    queue_table_item_from_job, submit_metadata, submit_nzb_bytes_with_options,
+    submit_metadata, submit_nzb_bytes_with_options,
 };
 use weaver_server_core::auth::{ApiKeyCache, CallerScope, LoginAuthCache};
 use weaver_server_core::history::{HistoryFailureKind, NzbgetMarkStatus};
@@ -62,7 +62,7 @@ pub(super) struct NzbgetFacadeContext {
     // Memoized PARSE of DB-row (immutable) history, keyed by job id ->
     // `(completed_at, HistoryItem)`. A history row's `completed_at` never
     // changes once written, so a cache hit reuses the parsed item instead of
-    // re-running `history_item_from_row` (metadata parse + release-name parse)
+    // re-running `history_item_from_row` (metadata parse + title derivation)
     // for up to 1000 rows every poll. Only the PARSE is cached — the final
     // NZBGet entry (which folds in per-poll stage-timing fields derived from
     // `job_events`, a separate mutable source) is rebuilt fresh each call, so
@@ -1726,7 +1726,7 @@ fn group_chunk(
     });
     jobs.iter()
         .filter_map(|job| {
-            let mut item = queue_table_item_from_job(job);
+            let mut item = queue_item_from_job(job);
             item.attributes
                 .extend(rss_link_parameters(ctx, scope, &item.rss_link));
             (!matches!(
@@ -2175,7 +2175,7 @@ async fn history(
         .chain(history_rows.iter())
         .map(|job| {
             (
-                queue_table_item_from_job(job),
+                queue_item_from_job(job),
                 reported_category(job.category.as_deref(), &job.metadata),
                 implied_failure_kind(job),
             )
@@ -2265,7 +2265,7 @@ async fn history(
     // DB-row-derived entries are the immutable-parse path: a history row's
     // `completed_at` never changes once written, so memoize the PARSED
     // `HistoryItem` by job id and reuse it on a hit instead of re-running
-    // `history_item_from_row` (metadata + release-name parse) for up to 1000
+    // `history_item_from_row` (metadata parse + title derivation) for up to 1000
     // rows every poll. The final entry still merges FRESH per-poll stage
     // timings (from `job_events`, which a reprocess can append to without
     // touching `completed_at`), so it is never served stale. The in-memory
@@ -3365,7 +3365,7 @@ fn queue_order(ctx: &NzbgetFacadeContext) -> Vec<(QueueItem, String, i64)> {
     jobs.iter()
         .map(|job| {
             (
-                queue_table_item_from_job(job),
+                queue_item_from_job(job),
                 reported_category(job.category.as_deref(), &job.metadata),
                 nzbget_priority(&job.metadata),
             )
@@ -3711,10 +3711,7 @@ async fn postqueue(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
             })
             .collect::<Vec<_>>()
     });
-    let items = jobs
-        .iter()
-        .map(queue_table_item_from_job)
-        .collect::<Vec<_>>();
+    let items = jobs.iter().map(queue_item_from_job).collect::<Vec<_>>();
     let post_started = post_started_at(ctx, items.iter().map(|item| item.id).collect()).await;
     let entries = items
         .into_iter()

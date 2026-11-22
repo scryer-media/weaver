@@ -122,7 +122,7 @@ impl PerJobSeries {
 #[serde(default)]
 pub struct SeedingPolicy {
     #[serde(skip_serializing_if = "Leaf::is_inherit")]
-    pub ratio_goal: Leaf<f32>,
+    pub ratio_goal: Leaf<f64>,
     #[serde(skip_serializing_if = "Leaf::is_inherit")]
     pub seed_time_goal_minutes: Leaf<u32>,
     #[serde(skip_serializing_if = "Leaf::is_inherit")]
@@ -213,7 +213,7 @@ impl SeedingPolicy {
 /// A goal that is `None` is not one.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Seeding {
-    pub ratio_goal: Option<f32>,
+    pub ratio_goal: Option<f64>,
     pub seed_time_goal_minutes: Option<u32>,
     pub inactive_goal_minutes: Option<u32>,
     pub mode: SeedingGoalMode,

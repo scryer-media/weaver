@@ -117,7 +117,7 @@ impl NzbFile {
     //
     // Use this over [`filename()`] when you need the confidence level
     // or PRiVATE format support.
-    pub fn extract_filename(&self) -> Option<(String, f32)> {
+    pub fn extract_filename(&self) -> Option<(String, f64)> {
         crate::deobfuscate::extract_filename(&self.subject)
     }
 

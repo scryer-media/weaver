@@ -47,7 +47,7 @@ pub fn goal_left(
     if let Some(goal) = policy.ratio_goal {
         let ratio = ratio(counters, held_bytes);
         goals.push((
-            ratio >= f64::from(goal),
+            ratio >= goal,
             format!("ratio {ratio:.2} of {goal:.2}"),
         ));
     }
@@ -303,7 +303,7 @@ mod tests {
         }
     }
 
-    fn policy(ratio: Option<f32>, seed: Option<u32>, mode: SeedingGoalMode) -> Seeding {
+    fn policy(ratio: Option<f64>, seed: Option<u32>, mode: SeedingGoalMode) -> Seeding {
         Seeding {
             seed_time_counting: Default::default(),
             ratio_goal: ratio,

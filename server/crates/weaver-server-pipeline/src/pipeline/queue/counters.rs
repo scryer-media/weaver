@@ -268,7 +268,7 @@ impl Queue {
                         progress_percent: if total.max(completed) == 0 {
                             0.0
                         } else {
-                            ((completed as f64 / total.max(completed) as f64) * 100.0) as f32
+                            (completed as f64 / total.max(completed) as f64) * 100.0
                         },
                         rate_bps,
                         estimated_remaining_ms: rate_bps

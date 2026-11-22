@@ -1838,7 +1838,7 @@ mod tests {
             .collect();
         let mut page: Vec<_> = rows[100..150]
             .iter()
-            .map(crate::jobs::types::queue_table_item_from_job)
+            .map(crate::jobs::types::queue_item_from_job)
             .collect();
         let mut cache = crate::jobs::query::DuplicateSummaryCache::default();
         cache.attach(db.clone(), 7, &mut page).await.unwrap();
@@ -1864,7 +1864,7 @@ mod tests {
         let state = SharedPipelineState::new(PipelineMetrics::new(), rows.clone());
         let mut page: Vec<_> = rows[..50]
             .iter()
-            .map(crate::jobs::types::queue_table_item_from_job)
+            .map(crate::jobs::types::queue_item_from_job)
             .collect();
         let held = [JobId(1)];
         state.mark_disk_for_test("/mnt/nas", 28 << 20, 240 << 20, true, &held, &[]);

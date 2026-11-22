@@ -136,7 +136,7 @@ impl From<SeedingLevels> for SeedingLevelsGql {
 #[derive(Clone, Copy, Debug, PartialEq, SimpleObject)]
 #[graphql(name = "SeedingTerms")]
 pub struct SeedingTermsGql {
-    pub ratio_goal: Option<f32>,
+    pub ratio_goal: Option<f64>,
     pub seed_time_goal_minutes: Option<u32>,
     pub inactive_goal_minutes: Option<u32>,
     pub mode: SeedingGoalModeGql,

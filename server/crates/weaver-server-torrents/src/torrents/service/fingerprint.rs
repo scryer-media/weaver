@@ -240,7 +240,7 @@ fn seeding_key(seeding: &Seeding) -> impl Hash {
         seed_time_counting,
     } = *seeding;
     (
-        ratio_goal.map(f32::to_bits),
+        ratio_goal.map(f64::to_bits),
         seed_time_goal_minutes,
         inactive_goal_minutes,
         mode,

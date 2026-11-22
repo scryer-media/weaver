@@ -325,12 +325,15 @@ mod tests {
         for (leaf, json) in [
             (Leaf::Inherit, "null"),
             (Leaf::Off, "\"off\""),
-            (Leaf::Set(2.5_f32), "2.5"),
+            (Leaf::Set(2.5_f64), "2.5"),
+            // A goal no 32-bit float holds exactly: what is kept is what was typed,
+            // and what an older build wrote reads back as the same number.
+            (Leaf::Set(1.2_f64), "1.2"),
         ] {
             assert_eq!(serde_json::to_string(&leaf).unwrap(), json);
-            assert_eq!(serde_json::from_str::<Leaf<f32>>(json).unwrap(), leaf);
+            assert_eq!(serde_json::from_str::<Leaf<f64>>(json).unwrap(), leaf);
         }
-        assert!(serde_json::from_str::<Leaf<f32>>("\"on\"").is_err());
+        assert!(serde_json::from_str::<Leaf<f64>>("\"on\"").is_err());
         assert_eq!(
             serde_json::from_str::<Leaf<String>>("\"any\"").unwrap(),
             Leaf::Set("any".to_owned())
@@ -342,7 +345,7 @@ mod tests {
     #[test]
     fn the_mode_in_force_is_that_of_the_most_specific_level_with_a_goal() {
         use crate::settings::model::{SeedingGoalMode::*, SeedingPolicy};
-        let policy = |ratio: Leaf<f32>, mode: Leaf<crate::settings::model::SeedingGoalMode>| {
+        let policy = |ratio: Leaf<f64>, mode: Leaf<crate::settings::model::SeedingGoalMode>| {
             Some(SeedingPolicy {
                 ratio_goal: ratio,
                 mode,

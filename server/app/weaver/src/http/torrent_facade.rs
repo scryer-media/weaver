@@ -1527,7 +1527,7 @@ fn share_limits(view: &TorrentView) -> [(&'static str, Value); 8] {
     let levels = &view.seeding_levels;
     let own = view.seeding_override.unwrap_or_default();
     let minutes = |value: Option<u32>| json!(value.map_or(-1, i64::from));
-    let ratio = |value: Option<f32>| value.map_or(json!(-1), |ratio| json!(ratio_number(ratio)));
+    let ratio = |value: Option<f64>| value.map_or(json!(-1), |ratio| json!(ratio));
     let limit = |leaf: Leaf<Value>, level: Level, in_force: Value| match leaf {
         Leaf::Inherit if level == Level::Global => json!(-2),
         Leaf::Inherit => in_force,
@@ -1574,12 +1574,6 @@ fn share_limits(view: &TorrentView) -> [(&'static str, Value); 8] {
             minutes(policy.inactive_goal_minutes),
         ),
     ]
-}
-
-// A ratio goal as the number it was given: Weaver keeps it as an `f32`, and
-// 1.1 widened straight to an `f64` would read 1.100000023841858.
-fn ratio_number(ratio: f32) -> f64 {
-    ratio.to_string().parse().unwrap_or(f64::from(ratio))
 }
 
 // qBittorrent's `ShareLimitsMode` and `ShareLimitAction` names
@@ -3266,7 +3260,7 @@ fn share_policy(
     let ratio = share_limit(
         params,
         "ratioLimit",
-        current.ratio_goal.map(f64::from),
+        current.ratio_goal,
         strict,
     )?;
     let seeding = share_limit(
@@ -3282,7 +3276,7 @@ fn share_policy(
         strict,
     )?;
     Ok(SeedingPolicy::kept(Some(SeedingPolicy {
-        ratio_goal: ratio.map(|ratio| ratio as f32),
+        ratio_goal: ratio,
         seed_time_goal_minutes: seeding.map(minutes),
         inactive_goal_minutes: inactive.map(minutes),
         mode,
@@ -3727,7 +3721,7 @@ pub(super) fn preferences(config: &Config, dht: bool) -> Value {
         "block_peers_on_privileged_ports": torrent.block_privileged_ports,
         "stop_tracker_timeout": torrent.stop_tracker_timeout_secs,
         "max_ratio_enabled": seeding.is_some_and(|policy| policy.ratio_goal.set().is_some()),
-        "max_ratio": seeding.and_then(|policy| policy.ratio_goal.set()).map_or(-1.0, ratio_number),
+        "max_ratio": seeding.and_then(|policy| policy.ratio_goal.set()).unwrap_or(-1.0),
         "max_seeding_time_enabled": seeding.is_some_and(|policy| policy.seed_time_goal_minutes.set().is_some()),
         "max_seeding_time": minutes(seeding.and_then(|policy| policy.seed_time_goal_minutes.set())),
         "max_inactive_seeding_time_enabled": seeding.is_some_and(|policy| policy.inactive_goal_minutes.set().is_some()),
@@ -3953,7 +3947,7 @@ pub(super) fn categories(config: &Config) -> Value {
                 Leaf::Off => json!(-1),
                 Leaf::Set(value) => value,
             };
-            let ratio = leaf(seeding.ratio_goal.map(|ratio| json!(ratio_number(ratio))));
+            let ratio = leaf(seeding.ratio_goal.map(|ratio| json!(ratio)));
             let minutes = |value: Leaf<u32>| leaf(value.map(|value| json!(i64::from(value))));
             (
                 category.name.clone(),

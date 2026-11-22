@@ -1593,7 +1593,7 @@ fn downloading(view: &TorrentView, now_ms: i64) -> Option<JobPhaseProgress> {
         phase: JobPhase::Downloading,
         completed_bytes: view.have_bytes,
         total_bytes: view.total_bytes,
-        progress_percent: (view.progress * 100.0) as f32,
+        progress_percent: view.progress * 100.0,
         rate_bps: Some(view.download_bps),
         estimated_remaining_ms: view.eta_seconds.map(|eta| eta.saturating_mul(1000)),
         started_at_epoch_ms: view.added_at_ms as f64,

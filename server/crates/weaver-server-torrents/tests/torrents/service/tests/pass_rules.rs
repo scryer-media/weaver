@@ -30,7 +30,7 @@ fn torrent(record: TorrentRecord) -> Live {
 }
 
 // A seed whose seeding goal is a ratio of `ratio`, then `action`.
-fn seed(ratio: f32, action: SeedingAction) -> Live {
+fn seed(ratio: f64, action: SeedingAction) -> Live {
     let (mut record, _, _) = chain();
     record.completed_at_ms = Some(EPOCH_MS);
     record.policy_override = Some(SeedingPolicy {
