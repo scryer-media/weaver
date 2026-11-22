@@ -146,6 +146,8 @@ export interface TorrentTrackerData {
 export interface TorrentPeerData {
   address: string;
   client: string;
+  /** The transport the connection runs over. */
+  connection: "TCP" | "UTP";
   /** The share of the torrent's pieces the peer has, from 0 to 1. */
   progress: number;
   downloadBps: number;

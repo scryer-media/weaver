@@ -2112,6 +2112,7 @@ export const TORRENT_PEERS_QUERY = gql`
     torrentPeers(id: $id) {
       address
       client
+      connection
       progress
       downloadBps
       uploadBps

@@ -7,7 +7,7 @@ import type { TorrentPeerData, TorrentState } from "@/lib/torrents";
 export const PEER_PAGE_SIZE = 25;
 
 /** A column the peers sort by. */
-export type PeerSortKey = "address" | "client" | "progress" | "downloadBps" | "uploadBps";
+export type PeerSortKey = "address" | "client" | "connection" | "progress" | "downloadBps" | "uploadBps";
 
 export interface PeerSort {
   key: PeerSortKey;
@@ -33,7 +33,7 @@ export function peerSortFor(torrent: { state: TorrentState; progress: number }):
  */
 export function nextPeerSort(sort: PeerSort, key: PeerSortKey): PeerSort {
   if (sort.key === key) return { key, descending: !sort.descending };
-  return { key, descending: key !== "address" && key !== "client" };
+  return { key, descending: key !== "address" && key !== "client" && key !== "connection" };
 }
 
 // Numbers inside the text count as numbers, so 5.79.x comes before 5.180.x.
@@ -48,6 +48,8 @@ export function sortPeers(peers: readonly TorrentPeerData[], sort: PeerSort): To
         return words.compare(a.address, b.address);
       case "client":
         return words.compare(a.client, b.client);
+      case "connection":
+        return words.compare(a.connection, b.connection);
       default:
         return a[sort.key] - b[sort.key];
     }
