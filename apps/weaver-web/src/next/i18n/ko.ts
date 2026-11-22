@@ -2249,6 +2249,7 @@ export const nextKo: LocaleDictionary = {
   "next.torrent.addTrackers": "트래커 추가",
   "next.torrent.editTracker": "트래커 편집",
   "next.torrent.trackerUrls": "트래커 URL 목록",
+  "next.torrent.privateTrackerWarning": "이 토렌트는 비공개입니다. 해당 트래커가 제공한 URL만 추가하세요.",
   "next.torrent.trackerUrl": "트래커 URL",
   "next.torrent.trackerSource": "출처",
   "next.torrent.trackerStatus": "상태",

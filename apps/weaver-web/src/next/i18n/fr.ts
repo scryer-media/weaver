@@ -2249,6 +2249,7 @@ export const nextFr: LocaleDictionary = {
   "next.torrent.addTrackers": "Ajouter des trackers",
   "next.torrent.editTracker": "Modifier le tracker",
   "next.torrent.trackerUrls": "URL des trackers",
+  "next.torrent.privateTrackerWarning": "Ce torrent est privé. N’ajoutez que des URL fournies par son tracker.",
   "next.torrent.trackerUrl": "URL du tracker",
   "next.torrent.trackerSource": "Source",
   "next.torrent.trackerStatus": "État",

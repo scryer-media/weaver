@@ -2249,6 +2249,7 @@ export const nextJa: LocaleDictionary = {
   "next.torrent.addTrackers": "トラッカーを追加",
   "next.torrent.editTracker": "トラッカーを編集",
   "next.torrent.trackerUrls": "トラッカーのURL",
+  "next.torrent.privateTrackerWarning": "このトレントは非公開です。そのトラッカーから提供された URL だけを追加してください。",
   "next.torrent.trackerUrl": "トラッカーURL",
   "next.torrent.trackerSource": "ソース",
   "next.torrent.trackerStatus": "状態",

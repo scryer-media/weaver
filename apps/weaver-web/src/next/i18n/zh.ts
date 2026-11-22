@@ -2249,6 +2249,7 @@ export const nextZh: LocaleDictionary = {
   "next.torrent.addTrackers": "添加 Tracker",
   "next.torrent.editTracker": "编辑 Tracker",
   "next.torrent.trackerUrls": "Tracker 网址列表",
+  "next.torrent.privateTrackerWarning": "此种子为私有种子。只添加其 Tracker 提供给你的 URL。",
   "next.torrent.trackerUrl": "Tracker 网址",
   "next.torrent.trackerSource": "来源",
   "next.torrent.trackerStatus": "状态",

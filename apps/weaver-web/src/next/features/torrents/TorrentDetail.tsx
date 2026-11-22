@@ -44,6 +44,7 @@ import { cn } from "@/lib/utils";
 import { EM_DASH, formatCount, formatRate, formatSize } from "@/next/data/format";
 import { useNextData } from "@/next/data/next-data";
 import { LimitControl } from "@/next/features/networking/limits";
+import { NoticeBand } from "@/next/features/networking/presentation";
 import { informationFields, transferFields, transferNote, type TorrentField } from "@/next/features/torrents/general";
 import {
   PEER_PAGE_SIZE,
@@ -621,6 +622,14 @@ function TrackersBlock({
                 {
                   id: "trackers",
                   title: t("next.torrent.trackers"),
+                  // A private torrent's trackers are the only place it is
+                  // announced: one added by mistake tells an outside tracker
+                  // its info hash and this address.
+                  body: torrent.private ? (
+                    <NoticeBand tone="warn" role="status">
+                      {t("next.torrent.privateTrackerWarning")}
+                    </NoticeBand>
+                  ) : undefined,
                   fields: [
                     editing.kind === "add"
                       ? {
