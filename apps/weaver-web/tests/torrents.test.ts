@@ -166,19 +166,19 @@ test("the information section names the pieces, the maker and where the torrent 
   const values = byLabel(informationFields(t, torrent()));
   assert.equal(values["Pieces"], `8/16 × ${formatSize(256 * 1024)}`);
   assert.equal(values["Created by"], "maker 1.0");
-  assert.equal(values["Created on"], EM_DASH);
-  assert.equal(values["Comment"], EM_DASH);
+  assert.equal(values["Created on"], undefined);
+  assert.equal(values["Comment"], undefined);
   assert.equal(values["Private"], "Yes");
   assert.equal(values["Info hash v1"], "ab".repeat(20));
-  assert.equal(values["Info hash v2"], EM_DASH);
+  assert.equal(values["Info hash v2"], undefined);
   assert.equal(values["Save path"], "/complete/set");
-  assert.equal(values["Route"], EM_DASH);
+  assert.equal(values["Route"], undefined);
   assert.equal(values["Unpack"], "On");
   const hybrid = byLabel(informationFields(t, torrent({ infohashV2: "cd".repeat(32) })));
   assert.equal(hybrid["Info hash v2"], "cd".repeat(32));
-  // A magnet without its metainfo has no pieces yet.
+  // A field the torrent has no value for is left out: a magnet without its metainfo has no pieces yet.
   const magnet = byLabel(informationFields(t, torrent({ pieceCount: null, pieceSize: null, piecesHave: null })));
-  assert.equal(magnet["Pieces"], EM_DASH);
+  assert.equal(magnet["Pieces"], undefined);
 });
 
 test("a tracker row says whether the torrent or the operator named it", () => {

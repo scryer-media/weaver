@@ -64,8 +64,12 @@ export function transferFields(t: Translate, torrent: TorrentData): TorrentField
   ];
 }
 
-/** The Information section, in qBittorrent's order, with the route and unpacking after it. */
+/** The Information section, in qBittorrent's order, with the route and unpacking after it; a field this torrent has no value for is left out. */
 export function informationFields(t: Translate, torrent: TorrentData): TorrentField[] {
+  return allInformationFields(t, torrent).filter((field) => field.value !== EM_DASH);
+}
+
+function allInformationFields(t: Translate, torrent: TorrentData): TorrentField[] {
   const pieces =
     torrent.pieceCount === null || torrent.pieceSize === null
       ? EM_DASH
