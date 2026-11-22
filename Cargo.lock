@@ -7375,6 +7375,7 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rustls-native-certs",
+ "smoltcp",
  "socket2",
  "thiserror 2.0.21",
  "tokio",
