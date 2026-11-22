@@ -1781,6 +1781,7 @@ async fn a_repair_of_an_article_that_passed_its_checksum_retracts_what_the_engin
     retire_pipeline_database(pipeline).await;
 }
 
+mod late_volume;
 mod refusals;
 mod threads;
 

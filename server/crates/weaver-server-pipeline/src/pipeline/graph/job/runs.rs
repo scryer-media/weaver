@@ -997,6 +997,16 @@ impl GraphJob {
             .update_shelf(node, |shelf, state| {
                 let mut changed = state.complete != complete || state.deciding != deciding;
                 if !state.volumes.iter().copied().eq(bound.clone()) {
+                    // A volume that joins a shelf its run was told no volume
+                    // can join, as one a store gives up at quiet joins its
+                    // set's engine, is one that run may have ended without:
+                    // it starts over, as it does for a moved length. One
+                    // that joins while more could still join is waited on
+                    // by the run reading.
+                    let joined = bound.clone().any(|volume| !state.volumes.contains(&volume));
+                    if state.complete && joined {
+                        state.generation += 1;
+                    }
                     state.volumes = bound.collect();
                     changed = true;
                 }
