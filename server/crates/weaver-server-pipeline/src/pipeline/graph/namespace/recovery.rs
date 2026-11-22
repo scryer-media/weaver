@@ -181,20 +181,32 @@ impl NamespaceWriter {
     // Every set of the namespace has ruled on something other than waiting:
     // nothing a set of it will rebuild is still to come. A set whose repair
     // is out has its ruling still to come, and so has one whose own volume
-    // still has an article coming.
+    // still has an article coming. A set taken back with its return still
+    // being applied, or with that return's tail still standing, has not
+    // ruled either: what it rebuilds is not down yet, and a run told its
+    // volumes are settled would read the bytes still to land as lost.
     pub fn ruled(&self, tree: &Tree, node: NodeId, coming: &Coming) -> bool {
         let sets = tree.recovery_nodes(node);
         let aside = Aside::of(tree, &sets);
         sets.iter().copied().all(|set| {
-            aside.yields(set)
-                || (!tree.lent(set)
-                    && !coming.sets.contains(&set)
-                    && tree.recovery(set).is_none_or(|recovery| {
-                        recovery
-                            .outcome()
-                            .is_some_and(|outcome| outcome != RepairOutcome::Waiting)
-                    }))
+            !self.returning(set)
+                && (aside.yields(set)
+                    || (!tree.lent(set)
+                        && !coming.sets.contains(&set)
+                        && tree.recovery(set).is_none_or(|recovery| {
+                            recovery
+                                .outcome()
+                                .is_some_and(|outcome| outcome != RepairOutcome::Waiting)
+                        })))
         })
+    }
+
+    // Whether the set's return is still being applied, or its tail stands.
+    fn returning(&self, set: NodeId) -> bool {
+        self.applying
+            .as_ref()
+            .is_some_and(|applying| applying.apply.set == set)
+            || self.tail.as_ref().is_some_and(|tail| tail.set == set)
     }
 
     // Nothing more will come for the namespace's members, not even a

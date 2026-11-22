@@ -3034,6 +3034,112 @@ async fn an_article_between_a_repairs_slices_lands_whole() {
     retire_pipeline_database(pipeline).await;
 }
 
+// A run reads a volume whose repair is being applied, its slices not yet
+// placed, and it speaks while they are out: what it says feeds its volumes
+// again. The set has not ruled until the last slice is down, so the run
+// waits on its shelf for the bytes still to land rather than read them as
+// lost and refuse the volume. Once they land it reads on, and the member
+// ends whole.
+#[tokio::test]
+async fn a_run_reading_a_volume_whose_repair_is_being_applied_waits_for_its_slices() {
+    let _threads = threads::real();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_480);
+    let body = payload(4 * ARTICLE - HEADER, 7);
+    let mut posts = vec![echo_volume(0, &body)];
+    let volume = posts[0].bytes.clone();
+    posts.extend(par2_set("lantern", &[("lantern.part1.rar", &volume)], 2));
+    let (mut pipeline, staging_dir) = delivered_apart(&temp_dir, job_id, &posts, None).await;
+    let gate = Arc::new(crate::pipeline::graph::engine::echo::RunGate::default());
+    pipeline
+        .graph_jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .set_builder(Box::new(Echoes {
+            volumes: 1,
+            gate: Some(Arc::clone(&gate)),
+            ..Echoes::default()
+        }));
+    // The volume's first article names it, so its run starts before the
+    // repair; its second and fourth are lost, for the set to rebuild.
+    for ordinal in [0, 2] {
+        decode(&mut pipeline, job_id, &posts, 0, ordinal, true).await;
+    }
+    for ordinal in [1, 3] {
+        pipeline.book_terminal_segment(
+            segment_id(job_id, 0, ordinal),
+            SegmentTerminalState::Missing,
+        );
+    }
+    for index in 1..posts.len() as u32 {
+        decode_all(&mut pipeline, job_id, &posts, index).await;
+    }
+    gate.started().await;
+    assert!(pipeline.graph_jobs[&job_id].repair_out());
+    let disk = pipeline.graph_jobs[&job_id].disk().unwrap().clone();
+    while !pipeline.graph_jobs[&job_id].applying_repair() {
+        let said = pipeline.graph_runs.recv().await.unwrap();
+        pipeline.graph_run_said(said);
+    }
+    // The return is being applied: what its reader sends is held, and the
+    // run goes on until it waits on its shelf, or ends.
+    let blocked = pipeline.graph_jobs[&job_id].blocked();
+    let (mut held, mut run, mut refused, mut ended) = (Vec::new(), None, false, false);
+    gate.release();
+    loop {
+        tokio::select! {
+            Some(said) = pipeline.graph_runs.recv() => {
+                match &said.heard {
+                    Heard::RepairSlice(_) | Heard::RepairRead(_) | Heard::TailPaid(_) => {
+                        held.push(said);
+                        continue;
+                    }
+                    Heard::Emit(emit) | Heard::Paid(emit, _) => {
+                        refused |= matches!(emit, weaver_graph::Emit::Refuse(_));
+                        if matches!(emit, weaver_graph::Emit::Member { .. }) {
+                            run = Some(said.node);
+                        }
+                    }
+                    Heard::Ended => ended = true,
+                    _ => {}
+                }
+                pipeline.graph_run_said(said);
+            }
+            _ = blocked.notified() => {}
+        }
+        if refused || ended {
+            break;
+        }
+        let graph = &pipeline.graph_jobs[&job_id];
+        if run
+            .and_then(|node| graph.writer().shelf_of(node))
+            .is_some_and(|shelf| shelf.blocked())
+        {
+            break;
+        }
+    }
+    assert!(!refused, "the run refused the volume its repair was landing on");
+    assert!(!ended, "the run ended before the repair landed");
+    assert!(pipeline.graph_jobs[&job_id].applying_repair());
+    for said in held {
+        pipeline.graph_run_said(said);
+    }
+    while pipeline.graph_jobs[&job_id].repair_out()
+        || pipeline.graph_jobs[&job_id].runs().live()
+    {
+        let said = pipeline.graph_runs.recv().await.unwrap();
+        pipeline.graph_run_said(said);
+    }
+    disk.barrier().wait_aside();
+    assert_eq!(read(&staging_dir.join("echo-0.mkv")), body);
+    assert_ne!(
+        job_status_for_assert(&pipeline, job_id)
+            .map(|status| matches!(status, JobStatus::Failed { .. })),
+        Some(true)
+    );
+    retire_pipeline_database(pipeline).await;
+}
+
 // An article of the member being repaired, one it had lost, arrives late
 // between two slices of the repair: it is the bytes the repair writes, and
 // the member ends whole.
