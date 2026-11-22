@@ -2,13 +2,14 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 import { useState, type ReactNode } from "react";
-import { Link } from "react-router";
-import { useMutation, useQuery } from "urql";
+import { Link, useNavigate } from "react-router";
+import { useClient, useMutation, useQuery } from "urql";
 import {
   CANCEL_JOB_MUTATION,
   CANCEL_JOB_POST_PROCESSING_MUTATION,
   JOB_OUTPUT_FILES_INSPECTOR_QUERY,
   PAUSE_JOB_MUTATION,
+  RECHECK_TORRENT_MUTATION,
   RESUME_JOB_MUTATION,
   SET_TORRENT_FORCED_MUTATION,
   UPDATE_JOBS_MUTATION,
@@ -26,6 +27,7 @@ import { LIST_PAGE_SIZE } from "@/next/data/list-pages";
 import { useNextData } from "@/next/data/next-data";
 import { statusDetail, useStatusLabel } from "@/next/data/status";
 import { SupportReportActions } from "@/next/features/SupportReportActions";
+import { FilesMissingDialog, isFilesMissing, stillFilesMissing } from "@/next/features/torrents/FilesMissingDialog";
 import { TorrentRemoveDialog } from "@/next/features/torrents/TorrentRemoveDialog";
 import { torrentIds } from "@/next/testids";
 
@@ -106,6 +108,10 @@ export function DownloadInspector({
   const [stopState, cancelPostProcessing] = useMutation(CANCEL_JOB_POST_PROCESSING_MUTATION);
   const [forceState, setTorrentForced] = useMutation(SET_TORRENT_FORCED_MUTATION);
   const [removingTorrent, setRemovingTorrent] = useState(false);
+  const [, recheckTorrent] = useMutation(RECHECK_TORRENT_MUTATION);
+  const [filesMissing, setFilesMissing] = useState(false);
+  const navigate = useNavigate();
+  const client = useClient();
   const { categories, queue, diskVolumes } = useNextData("categories", "queue", "diskVolumes");
   // What was just picked, shown until the queue carries it back; the daemon's
   // answer can take a refresh to arrive, and a select that snaps back to the
@@ -316,7 +322,11 @@ export function DownloadInspector({
             className="flex-auto justify-center"
             onClick={() => {
               setFailure(null);
-              void (isPaused ? resumeJob({ id: job.id }) : pauseJob({ id: job.id })).then(settle);
+              const wasMissing = isPaused && isFilesMissing(torrent?.state);
+              void (isPaused ? resumeJob({ id: job.id }) : pauseJob({ id: job.id })).then(async (result) => {
+                settle(result);
+                if (!result.error && wasMissing && (await stillFilesMissing(client, job.id))) setFilesMissing(true);
+              });
             }}
           >
             {isPaused ? t("action.resume") : t("action.pause")}
@@ -374,6 +384,17 @@ export function DownloadInspector({
           {t("next.inspector.removeDownload")}
         </DangerButton>
       </div>
+      <FilesMissingDialog
+        open={filesMissing}
+        note={job.displayTitle || job.name}
+        onDismiss={() => setFilesMissing(false)}
+        onRecheck={() => {
+          setFilesMissing(false);
+          setFailure(null);
+          void recheckTorrent({ id: job.id }).then(settle);
+        }}
+        other={{ label: t("next.inspector.openDetail"), onConfirm: () => void navigate(`/jobs/${job.id}`) }}
+      />
       <TorrentRemoveDialog
         id={removingTorrent ? job.id : null}
         name={job.displayTitle || job.name}

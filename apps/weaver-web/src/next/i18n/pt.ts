@@ -2189,6 +2189,7 @@ export const nextPt: LocaleDictionary = {
   "next.torrent.unforced": "Não mais forçado",
   "next.torrent.recheck": "Verificar novamente",
   "next.torrent.recheckBody": "Cada peça é lida do disco e verificada de novo.",
+  "next.torrent.filesMissingBody": "Os arquivos deste torrent não estão na pasta dele, por isso ele não pode ser retomado. Coloque os arquivos de volta ou mova o torrent para a pasta que os contém. Se o download precisar recomeçar, verifique-o de novo: o que está no disco é mantido e o restante é baixado novamente.",
   "next.torrent.rechecking": "Verificando novamente",
   "next.torrent.move": "Mover",
   "next.torrent.moved": "Movido",

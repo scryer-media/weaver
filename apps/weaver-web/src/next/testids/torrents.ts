@@ -55,6 +55,7 @@ export const torrentIds = {
   // A torrent job's header; each button carries the action it offers.
   jobPause: "torrent-job-pause",
   jobResume: "torrent-job-resume",
+  filesMissingDialog: "torrent-files-missing",
   jobForce: "torrent-job-force",
   jobUnforce: "torrent-job-unforce",
   jobRemove: "torrent-job-remove",

@@ -2189,6 +2189,7 @@ export const nextJa: LocaleDictionary = {
   "next.torrent.unforced": "強制を解除しました",
   "next.torrent.recheck": "再チェック",
   "next.torrent.recheckBody": "すべてのピースをディスクから読み直して再確認します。",
+  "next.torrent.filesMissingBody": "このトレントのファイルがフォルダーにないため、再開できません。ファイルを元に戻すか、ファイルのあるフォルダーへトレントを移動してください。ダウンロードをやり直す場合は再チェックしてください。ディスク上のデータは残り、残りが再度取得されます。",
   "next.torrent.rechecking": "再チェック中",
   "next.torrent.move": "移動",
   "next.torrent.moved": "移動しました",

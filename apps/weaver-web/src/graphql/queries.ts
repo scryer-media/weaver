@@ -2111,6 +2111,16 @@ export const TORRENT_UNPACKED_FILES_QUERY = gql`
 `;
 
 /** A torrent's live peer connections, by address. */
+/** A torrent's state alone, read once after an action that may change it. */
+export const TORRENT_STATE_QUERY = gql`
+  query TorrentState($id: Int!) {
+    torrent(id: $id) {
+      id
+      state
+    }
+  }
+`;
+
 export const TORRENT_PEERS_QUERY = gql`
   query TorrentPeers($id: Int!) {
     torrentPeers(id: $id) {

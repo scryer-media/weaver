@@ -2189,6 +2189,7 @@ export const nextKo: LocaleDictionary = {
   "next.torrent.unforced": "강제 해제됨",
   "next.torrent.recheck": "다시 검사",
   "next.torrent.recheckBody": "모든 조각을 디스크에서 다시 읽어 확인합니다.",
+  "next.torrent.filesMissingBody": "이 토렌트의 파일이 폴더에 없어 재개할 수 없습니다. 파일을 되돌려 놓거나 파일이 있는 폴더로 토렌트를 이동하세요. 다운로드를 다시 시작해야 한다면 재확인하세요. 디스크에 있는 데이터는 유지되고 나머지는 다시 받습니다.",
   "next.torrent.rechecking": "다시 검사 중",
   "next.torrent.move": "이동",
   "next.torrent.moved": "이동됨",

@@ -2189,6 +2189,7 @@ export const nextIt: LocaleDictionary = {
   "next.torrent.unforced": "Non più forzato",
   "next.torrent.recheck": "Ricontrolla",
   "next.torrent.recheckBody": "Ogni pezzo viene riletto dal disco e controllato di nuovo.",
+  "next.torrent.filesMissingBody": "I file di questo torrent non sono nella sua cartella, quindi non può riprendere. Rimetti i file al loro posto o sposta il torrent nella cartella che li contiene. Se il download deve ricominciare, ricontrollalo: ciò che è sul disco resta e il resto viene scaricato di nuovo.",
   "next.torrent.rechecking": "Ricontrollo in corso",
   "next.torrent.move": "Sposta",
   "next.torrent.moved": "Spostato",

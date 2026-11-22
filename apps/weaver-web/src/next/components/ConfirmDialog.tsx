@@ -40,7 +40,8 @@ export function ConfirmDialog({
   busy?: boolean;
   onConfirm: () => void;
   onDismiss: () => void;
-  alternative?: { label: string; onConfirm: () => void };
+  /** A second way out; red unless `plain`, for one that changes nothing it cannot undo. */
+  alternative?: { label: string; onConfirm: () => void; plain?: boolean };
   /** Fill a lone destructive confirm red, as it is when it sits beside an alternative. */
   solid?: boolean;
   testId?: string;
@@ -57,7 +58,11 @@ export function ConfirmDialog({
       footer={
         <>
           <SecondaryButton onClick={onDismiss} testId={testIds.confirmDismiss}>{dismissLabel ?? t("action.cancel")}</SecondaryButton>
-          {alternative === undefined ? null : (
+          {alternative === undefined ? null : alternative.plain ? (
+            <SecondaryButton onClick={alternative.onConfirm} disabled={busy} testId={testIds.confirmAlternative}>
+              {alternative.label}
+            </SecondaryButton>
+          ) : (
             <DangerButton onClick={alternative.onConfirm} disabled={busy} testId={testIds.confirmAlternative}>
               {alternative.label}
             </DangerButton>

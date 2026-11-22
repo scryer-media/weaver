@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent } from "react";
+import { useNavigate } from "react-router";
 import { useClient, useMutation, useQuery, useSubscription, type TypedDocumentNode } from "urql";
 import {
   CANCEL_JOB_MUTATION,
@@ -11,6 +12,7 @@ import {
   PAUSE_JOB_MUTATION,
   PAUSE_QUEUE_ITEMS_MUTATION,
   PAUSE_CLASS_MUTATION,
+  RECHECK_TORRENT_MUTATION,
   RESUME_ALL_MUTATION,
   RESUME_JOB_MUTATION,
   RESUME_QUEUE_ITEMS_MUTATION,
@@ -86,6 +88,7 @@ import {
 } from "../shell/rail-blocks";
 import { AddNzbDialog } from "../features/AddNzbDialog";
 import { ScheduleSeedingNote } from "../features/torrents/ScheduleSeedingNote";
+import { FilesMissingDialog, isFilesMissing, stillFilesMissing } from "../features/torrents/FilesMissingDialog";
 import { TorrentRemoveDialog } from "../features/torrents/TorrentRemoveDialog";
 import { useTorrentSummaries } from "../data/use-torrents";
 import { useTorrentAddsOffered, useTorrentsShown } from "../data/use-torrents-shown";
@@ -292,6 +295,10 @@ export function DownloadsPage() {
   const [confirmRowCancel, setConfirmRowCancel] = useState<number | null>(null);
   // The one torrent whose remove is waiting on confirmation.
   const [removeTorrentId, setRemoveTorrentId] = useState<number | null>(null);
+  // The torrent whose Resume found its files missing.
+  const [filesMissingId, setFilesMissingId] = useState<number | null>(null);
+  const [, recheckTorrent] = useMutation(RECHECK_TORRENT_MUTATION);
+  const navigate = useNavigate();
   // A selection batch the daemon refused because the queue moved since the
   // operator confirmed it: the count it matches now, and the batch to run again.
   const [reconfirm, setReconfirm] = useState<{ matched: number; run: () => void } | null>(null);
@@ -352,8 +359,10 @@ export function DownloadsPage() {
   const seedingColumn = torrentsOn && [...torrents.values()].some((torrent) => showsSeeding(torrent.state));
   // The row handlers read a job's protocol by id, so they keep their identity while the rows move.
   const jobsRef = useRef(jobs);
+  const torrentsRef = useRef(torrents);
   useLayoutEffect(() => {
     jobsRef.current = jobs;
+    torrentsRef.current = torrents;
   });
   const isTorrent = useCallback((id: number) => jobsRef.current.find((job) => job.id === id)?.protocol === "TORRENT", []);
 
@@ -648,12 +657,14 @@ export function DownloadsPage() {
 
   const pauseRow = useCallback(
     (id: number, paused: boolean) => {
-      void (paused ? pauseJob({ id }) : resumeJob({ id })).then((result) => {
+      const wasMissing = !paused && isFilesMissing(torrentsRef.current.get(id)?.state);
+      void (paused ? pauseJob({ id }) : resumeJob({ id })).then(async (result) => {
         if (result.error) setReport(torrentErrorText(result.error));
         refreshQueue();
+        if (!result.error && wasMissing && (await stillFilesMissing(client, id))) setFilesMissingId(id);
       });
     },
-    [pauseJob, refreshQueue, resumeJob],
+    [client, pauseJob, refreshQueue, resumeJob],
   );
   const askCancelRow = useCallback(
     (id: number) => (isTorrent(id) ? setRemoveTorrentId(id) : setConfirmRowCancel(id)),
@@ -1015,6 +1026,30 @@ export function DownloadsPage() {
         dismissLabel={t("next.downloads.keepDownloading")}
         onConfirm={() => void cancelRow()}
         onDismiss={() => setConfirmRowCancel(null)}
+      />
+
+      <FilesMissingDialog
+        open={filesMissingId !== null}
+        note={(() => {
+          const job = jobs.find((candidate) => candidate.id === filesMissingId);
+          return job ? formatJobReleaseName(job) : undefined;
+        })()}
+        onDismiss={() => setFilesMissingId(null)}
+        onRecheck={() => {
+          const id = filesMissingId;
+          setFilesMissingId(null);
+          if (id === null) return;
+          void recheckTorrent({ id }).then((result) => {
+            if (result.error) setReport(torrentErrorText(result.error));
+            refreshQueue();
+          });
+        }}
+        other={{
+          label: t("next.inspector.openDetail"),
+          onConfirm: () => {
+            if (filesMissingId !== null) void navigate(`/jobs/${filesMissingId}`);
+          },
+        }}
       />
 
       <TorrentRemoveDialog

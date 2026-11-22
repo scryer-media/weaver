@@ -2189,6 +2189,7 @@ export const nextZh: LocaleDictionary = {
   "next.torrent.unforced": "已取消强制",
   "next.torrent.recheck": "重新校验",
   "next.torrent.recheckBody": "从磁盘重新读取并校验每个分块。",
+  "next.torrent.filesMissingBody": "此种子的文件不在其文件夹中，因此无法继续。请将文件放回，或将种子移动到存放这些文件的文件夹。如需重新开始下载，请重新校验：磁盘上已有的数据会保留，其余部分会重新下载。",
   "next.torrent.rechecking": "正在重新校验",
   "next.torrent.move": "移动",
   "next.torrent.moved": "已移动",

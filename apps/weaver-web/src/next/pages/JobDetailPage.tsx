@@ -78,6 +78,7 @@ import { useArchiveHistory } from "../data/use-archive-history";
 import { extendKept, LIST_PAGE_SIZE, prependOlder, showsMore } from "../data/list-pages";
 import { jobIds, testIds, torrentIds } from "@/next/testids";
 import { SupportReportActions } from "../features/SupportReportActions";
+import { FilesMissingDialog, isFilesMissing, stillFilesMissing } from "../features/torrents/FilesMissingDialog";
 import { TorrentDetail, useTorrent } from "../features/torrents/TorrentDetail";
 import { TorrentRemoveDialog } from "../features/torrents/TorrentRemoveDialog";
 import { DownloadSummaryPanel } from "../components/DownloadSummary";
@@ -321,7 +322,7 @@ function JobDetailContent() {
   const [torrentEdit, setTorrentEdit] = useState<{ kind: "move" | "category"; value: string } | null>(null);
   const { categories } = useNextData("categories");
 
-  const [confirm, setConfirm] = useState<"delete" | "deleteAll" | "archive" | "cancel" | "forget" | "recheck" | null>(null);
+  const [confirm, setConfirm] = useState<"delete" | "deleteAll" | "archive" | "cancel" | "forget" | "recheck" | "filesMissing" | null>(null);
   const [report, setReport] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -675,10 +676,14 @@ function JobDetailContent() {
                   disabled={busy}
                   testId={token === "paused" ? torrentIds.jobResume : torrentIds.jobPause}
                   onClick={() => {
+                    const wasMissing = token === "paused" && isFilesMissing(torrent?.state);
                     void run(
                       token === "paused" ? t("next.job.report.resumed") : t("next.job.report.paused"),
                       () => (token === "paused" ? resumeJob({ id: job.id }) : pauseJob({ id: job.id })),
-                    ).then(refreshTorrent);
+                    ).then(async () => {
+                      refreshTorrent();
+                      if (wasMissing && (await stillFilesMissing(client, job.id))) setConfirm("filesMissing");
+                    });
                   }}
                 >
                   {token === "paused" ? t("action.resume") : t("action.pause")}
@@ -1357,6 +1362,23 @@ function JobDetailContent() {
             void refetchDuplicate({ requestPolicy: "network-only" });
             return result;
           });
+        }}
+      />
+      <FilesMissingDialog
+        open={confirm === "filesMissing"}
+        note={job.displayTitle || job.name}
+        busy={busy}
+        onDismiss={() => setConfirm(null)}
+        onRecheck={() => {
+          setConfirm(null);
+          void run(t("next.torrent.rechecking"), () => recheckTorrent({ id: job.id })).then(refreshTorrent);
+        }}
+        other={{
+          label: t("next.torrent.move"),
+          onConfirm: () => {
+            setConfirm(null);
+            setTorrentEdit({ kind: "move", value: torrent?.savePath ?? "" });
+          },
         }}
       />
       <ConfirmDialog
