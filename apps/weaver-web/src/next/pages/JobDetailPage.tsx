@@ -926,31 +926,34 @@ function JobDetailContent() {
                   : t("next.job.thisPhase")
             }
           />
-          <MetricCell
-            variant="stat"
-            eyebrow={job.optionalRecoveryDownloadedBytes > 0 ? t("next.job.recovery") : t("next.job.saved")}
-            value={
-              job.optionalRecoveryBytes === 0
-                ? EM_DASH
-                : job.optionalRecoveryDownloadedBytes > 0
-                  ? formatSize(job.optionalRecoveryDownloadedBytes)
-                  : formatSize(savedBytes)
-            }
-            valueClassName={
-              job.optionalRecoveryBytes === 0
-                ? "text-wv-muted"
-                : job.optionalRecoveryDownloadedBytes > 0
-                  ? undefined
-                  : "text-wv-accent"
-            }
-            note={
-              job.optionalRecoveryBytes === 0
-                ? t("next.job.noSetPosted")
-                : job.optionalRecoveryDownloadedBytes > 0
-                  ? t("next.job.ofFetched", { size: formatSize(job.optionalRecoveryBytes) })
-                  : t("next.job.setSkipped")
-            }
-          />
+          {/* A torrent has no recovery set to fetch or skip. */}
+          {isTorrent ? null : (
+            <MetricCell
+              variant="stat"
+              eyebrow={job.optionalRecoveryDownloadedBytes > 0 ? t("next.job.recovery") : t("next.job.saved")}
+              value={
+                job.optionalRecoveryBytes === 0
+                  ? EM_DASH
+                  : job.optionalRecoveryDownloadedBytes > 0
+                    ? formatSize(job.optionalRecoveryDownloadedBytes)
+                    : formatSize(savedBytes)
+              }
+              valueClassName={
+                job.optionalRecoveryBytes === 0
+                  ? "text-wv-muted"
+                  : job.optionalRecoveryDownloadedBytes > 0
+                    ? undefined
+                    : "text-wv-accent"
+              }
+              note={
+                job.optionalRecoveryBytes === 0
+                  ? t("next.job.noSetPosted")
+                  : job.optionalRecoveryDownloadedBytes > 0
+                    ? t("next.job.ofFetched", { size: formatSize(job.optionalRecoveryBytes) })
+                    : t("next.job.setSkipped")
+              }
+            />
+          )}
         </MetricStrip>
 
         {torrent ? (
@@ -1238,29 +1241,34 @@ function JobDetailContent() {
               percent={payload.total > 0 ? (payload.done / payload.total) * 100 : 0}
               color={color}
             />
-            <ShareRow
-              label={t("next.job.recoverySet")}
-              note={
-                job.optionalRecoveryBytes === 0
-                  ? t("next.job.nonePosted")
-                  : t("next.job.sizeOf", {
-                      done: formatSize(job.optionalRecoveryDownloadedBytes),
-                      total: formatSize(job.optionalRecoveryBytes),
-                    })
-              }
-              percent={
-                job.optionalRecoveryBytes > 0
-                  ? (job.optionalRecoveryDownloadedBytes / job.optionalRecoveryBytes) * 100
-                  : 0
-              }
-              color={WV.info}
-            />
-            <ShareRow
-              label={t("next.job.unrecovered")}
-              note={job.failedBytes > 0 ? formatSize(job.failedBytes) : t("next.job.none")}
-              percent={job.totalBytes > 0 ? (job.failedBytes / job.totalBytes) * 100 : 0}
-              color={WV.error}
-            />
+            {/* A torrent has no recovery set, and a piece that fails its hash is fetched again. */}
+            {isTorrent ? null : (
+              <>
+                <ShareRow
+                  label={t("next.job.recoverySet")}
+                  note={
+                    job.optionalRecoveryBytes === 0
+                      ? t("next.job.nonePosted")
+                      : t("next.job.sizeOf", {
+                          done: formatSize(job.optionalRecoveryDownloadedBytes),
+                          total: formatSize(job.optionalRecoveryBytes),
+                        })
+                  }
+                  percent={
+                    job.optionalRecoveryBytes > 0
+                      ? (job.optionalRecoveryDownloadedBytes / job.optionalRecoveryBytes) * 100
+                      : 0
+                  }
+                  color={WV.info}
+                />
+                <ShareRow
+                  label={t("next.job.unrecovered")}
+                  note={job.failedBytes > 0 ? formatSize(job.failedBytes) : t("next.job.none")}
+                  percent={job.totalBytes > 0 ? (job.failedBytes / job.totalBytes) * 100 : 0}
+                  color={WV.error}
+                />
+              </>
+            )}
           </DetailBlock>
         </PanelGrid>
       </div>

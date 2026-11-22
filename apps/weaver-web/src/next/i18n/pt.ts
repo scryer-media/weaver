@@ -2245,6 +2245,7 @@ export const nextPt: LocaleDictionary = {
   "next.torrent.peerCount.one": "{{count}} par",
   "next.torrent.peerCount.other": "{{count}} pares",
   "next.torrent.ban": "Banir",
+  "next.torrent.peerClient": "Cliente",
   "next.torrent.priority.IGNORED": "Ignorado",
   "next.torrent.priority.NORMAL": "Normal",
   "next.torrent.priority.HIGH": "Alta",

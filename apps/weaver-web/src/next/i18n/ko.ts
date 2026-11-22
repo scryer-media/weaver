@@ -2245,6 +2245,7 @@ export const nextKo: LocaleDictionary = {
   "next.torrent.peerCount.one": "피어 {{count}}개",
   "next.torrent.peerCount.other": "피어 {{count}}개",
   "next.torrent.ban": "차단",
+  "next.torrent.peerClient": "클라이언트",
   "next.torrent.priority.IGNORED": "무시",
   "next.torrent.priority.NORMAL": "보통",
   "next.torrent.priority.HIGH": "높음",

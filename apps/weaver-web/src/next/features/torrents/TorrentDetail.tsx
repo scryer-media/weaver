@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useSubscription } from "urql";
 import {
   ADD_TORRENT_TRACKERS_MUTATION,
@@ -40,10 +40,22 @@ import { BulkCluster, BulkMenu } from "@/next/components/BulkBar";
 import { CheckBox, SecondaryButton, Select, Toggle } from "@/next/components/controls";
 import { RecordEditor } from "@/next/components/RecordEditor";
 import { GridRow } from "@/next/components/rows";
-import { EM_DASH, formatRate, formatSize } from "@/next/data/format";
+import { cn } from "@/lib/utils";
+import { EM_DASH, formatCount, formatRate, formatSize } from "@/next/data/format";
 import { useNextData } from "@/next/data/next-data";
 import { LimitControl } from "@/next/features/networking/limits";
 import { informationFields, transferFields, transferNote, type TorrentField } from "@/next/features/torrents/general";
+import {
+  DEFAULT_PEER_SORT,
+  PEER_PAGE_SIZE,
+  nextPeerSort,
+  peerPage,
+  peerPageCount,
+  peersOfPage,
+  sortPeers,
+  type PeerSort,
+  type PeerSortKey,
+} from "@/next/features/torrents/peers";
 import { countLabel } from "@/next/i18n/labels";
 import { testIds, torrentIds } from "@/next/testids";
 import { durationText, seedingFields, seedingFrom, seedingInherits, seedingInput, type SeedingPolicy } from "@/next/pages/settings/seeding";
@@ -57,6 +69,7 @@ const FILE_COLUMNS = {
   sm: "14px minmax(0,1fr) 90px 72px 120px",
 };
 const LIMIT_COLUMNS = { base: "minmax(0,1fr) max-content" };
+const NO_PEERS: TorrentPeerData[] = [];
 const PEER_COLUMNS = {
   base: "minmax(0,1fr) 56px max-content",
   sm: "minmax(0,1fr) minmax(0,1fr) 56px 90px 90px max-content",
@@ -178,7 +191,8 @@ function GeneralGrid({ fields }: { fields: TorrentField[] }) {
 
 /**
  * A torrent's peer connections, read again each time the torrent pushes an
- * update, each with its ban.
+ * update, each with its ban. They are read whole and shown a page of 25 at a
+ * time, in the order of the column whose heading was last clicked.
  */
 function PeersBlock({ torrent, onReport }: { torrent: TorrentData; onReport: (message: string) => void }) {
   const t = useTranslate();
@@ -191,7 +205,21 @@ function PeersBlock({ torrent, onReport }: { torrent: TorrentData; onReport: (me
   useEffect(() => {
     reread({ requestPolicy: "network-only" });
   }, [torrent, reread]);
-  const peers = data?.torrentPeers ?? [];
+  const peers = data?.torrentPeers ?? NO_PEERS;
+  const [sort, setSort] = useState<PeerSort>(DEFAULT_PEER_SORT);
+  const [asked, setAsked] = useState(0);
+  const sorted = useMemo(() => sortPeers(peers, sort), [peers, sort]);
+  // Peers leaving can empty the page asked for: the last one there is shows.
+  const page = peerPage(asked, sorted.length);
+  const pageCount = peerPageCount(sorted.length);
+  const shown = peersOfPage(sorted, page);
+  const sortBy = (key: PeerSortKey) => {
+    setSort((was) => nextPeerSort(was, key));
+    setAsked(0);
+  };
+  const heading = (key: PeerSortKey, label: string, className?: string) => (
+    <PeerHeading sortKey={key} label={label} sort={sort} onSort={sortBy} className={className} />
+  );
 
   const ban = (address: string) => {
     void banPeer({ id: torrent.id, address }).then((result) => {
@@ -208,37 +236,107 @@ function PeersBlock({ torrent, onReport }: { torrent: TorrentData; onReport: (me
       {peers.length === 0 ? (
         <span className="text-[12.5px] text-wv-muted">{EM_DASH}</span>
       ) : (
-        peers.map((peer) => (
-          <GridRow
-            key={peer.address}
-            columns={PEER_COLUMNS}
-            gap={14}
-            className="h-[38px] border-t border-wv-hairline"
-            title={peer.address}
-          >
-            <span className="min-w-0 truncate font-wv-mono text-[12px] text-wv-fg">{peer.address}</span>
-            <span className="hidden min-w-0 truncate text-[12px] text-wv-tertiary sm:block" title={peer.client}>
-              {peer.client}
-            </span>
-            <span className="text-right font-wv-mono text-[12px] text-wv-muted">{`${(peer.progress * 100).toFixed(1)}%`}</span>
-            <span className="hidden text-right font-wv-mono text-[12px] text-wv-muted sm:block">
-              {`↓ ${formatRate(peer.downloadBps)}`}
-            </span>
-            <span className="hidden text-right font-wv-mono text-[12px] text-wv-muted sm:block">
-              {`↑ ${formatRate(peer.uploadBps)}`}
-            </span>
-            <button
-              type="button"
-              disabled={banState.fetching}
-              onClick={() => ban(peer.address)}
-              className="cursor-pointer text-right text-[12.5px] whitespace-nowrap text-wv-dim hover:text-wv-error disabled:cursor-default"
-            >
-              {t("next.torrent.ban")}
-            </button>
+        <>
+          <GridRow columns={PEER_COLUMNS} gap={14} className="h-[28px]" testId={torrentIds.peerHeadings}>
+            {heading("address", t("next.dns.address"))}
+            {heading("client", t("next.torrent.peerClient"), "hidden sm:flex")}
+            {heading("progress", t("next.networking.speed.progress"), "justify-end")}
+            {heading("downloadBps", t("next.quota.download"), "hidden justify-end sm:flex")}
+            {heading("uploadBps", t("next.quota.upload"), "hidden justify-end sm:flex")}
+            <span />
           </GridRow>
-        ))
+          {shown.map((peer) => (
+            <GridRow
+              key={peer.address}
+              columns={PEER_COLUMNS}
+              gap={14}
+              className="h-[38px] border-t border-wv-hairline"
+              title={peer.address}
+            >
+              <span className="min-w-0 truncate font-wv-mono text-[12px] text-wv-fg">{peer.address}</span>
+              <span className="hidden min-w-0 truncate text-[12px] text-wv-tertiary sm:block" title={peer.client}>
+                {peer.client}
+              </span>
+              <span className="text-right font-wv-mono text-[12px] text-wv-muted">{`${(peer.progress * 100).toFixed(1)}%`}</span>
+              <span className="hidden text-right font-wv-mono text-[12px] text-wv-muted sm:block">
+                {`↓ ${formatRate(peer.downloadBps)}`}
+              </span>
+              <span className="hidden text-right font-wv-mono text-[12px] text-wv-muted sm:block">
+                {`↑ ${formatRate(peer.uploadBps)}`}
+              </span>
+              <button
+                type="button"
+                disabled={banState.fetching}
+                onClick={() => ban(peer.address)}
+                className="cursor-pointer text-right text-[12.5px] whitespace-nowrap text-wv-dim hover:text-wv-error disabled:cursor-default"
+              >
+                {t("next.torrent.ban")}
+              </button>
+            </GridRow>
+          ))}
+          {pageCount > 1 ? (
+            <div className="flex items-center justify-end gap-3 border-t border-wv-hairline pt-3">
+              <span data-testid={torrentIds.peerRange} className="font-wv-mono text-[11.5px] whitespace-nowrap text-wv-muted">
+                {t("next.pagination.range", {
+                  from: formatCount(page * PEER_PAGE_SIZE + 1),
+                  to: formatCount(page * PEER_PAGE_SIZE + shown.length),
+                  total: formatCount(sorted.length),
+                })}
+              </span>
+              <SecondaryButton
+                size="compact"
+                testId={torrentIds.peerPrevious}
+                disabled={page === 0}
+                onClick={() => setAsked(page - 1)}
+              >
+                {t("action.previous")}
+              </SecondaryButton>
+              <SecondaryButton
+                size="compact"
+                testId={torrentIds.peerNext}
+                disabled={page + 1 >= pageCount}
+                onClick={() => setAsked(page + 1)}
+              >
+                {t("action.next")}
+              </SecondaryButton>
+            </div>
+          ) : null}
+        </>
       )}
     </DetailBlock>
+  );
+}
+
+/** A heading of the peers: a click sorts by its column, a second turns the order round. */
+function PeerHeading({
+  sortKey,
+  label,
+  sort,
+  onSort,
+  className,
+}: {
+  sortKey: PeerSortKey;
+  label: string;
+  sort: PeerSort;
+  onSort: (key: PeerSortKey) => void;
+  className?: string;
+}) {
+  const active = sort.key === sortKey;
+  return (
+    <button
+      type="button"
+      data-testid={torrentIds.peerSort(sortKey)}
+      aria-sort={active ? (sort.descending ? "descending" : "ascending") : undefined}
+      onClick={() => onSort(sortKey)}
+      className={cn(
+        "flex min-w-0 cursor-pointer items-center gap-1 font-wv-mono text-[11px] whitespace-nowrap hover:text-wv-fg",
+        active ? "text-wv-fg" : "text-wv-muted",
+        className,
+      )}
+    >
+      <span className="min-w-0 truncate">{label}</span>
+      <span aria-hidden className="w-[8px] flex-none">{active ? (sort.descending ? "↓" : "↑") : ""}</span>
+    </button>
   );
 }
 

@@ -2245,6 +2245,7 @@ export const nextZh: LocaleDictionary = {
   "next.torrent.peerCount.one": "{{count}} 个对等",
   "next.torrent.peerCount.other": "{{count}} 个对等",
   "next.torrent.ban": "封禁",
+  "next.torrent.peerClient": "客户端",
   "next.torrent.priority.IGNORED": "忽略",
   "next.torrent.priority.NORMAL": "普通",
   "next.torrent.priority.HIGH": "高",

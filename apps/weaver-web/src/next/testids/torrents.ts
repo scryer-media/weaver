@@ -22,6 +22,13 @@ export const torrentIds = {
   pauseTorrents: "torrents-pause",
   resumeTorrents: "torrents-resume",
 
+  // A torrent's peers: the headings that sort them, and the way between pages.
+  peerHeadings: "torrent-peer-headings",
+  peerSort: (column: string) => `torrent-peer-sort-${column}`,
+  peerRange: "torrent-peer-range",
+  peerPrevious: "torrent-peer-previous",
+  peerNext: "torrent-peer-next",
+
   // The Add dialog's drop zone, link box, paused switch and submit.
   addDrop: "add-drop",
   addLink: "add-link",

@@ -2245,6 +2245,7 @@ export const nextJa: LocaleDictionary = {
   "next.torrent.peerCount.one": "{{count}} 件のピア",
   "next.torrent.peerCount.other": "{{count}} 件のピア",
   "next.torrent.ban": "禁止",
+  "next.torrent.peerClient": "クライアント",
   "next.torrent.priority.IGNORED": "無視",
   "next.torrent.priority.NORMAL": "通常",
   "next.torrent.priority.HIGH": "高",
