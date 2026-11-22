@@ -1165,6 +1165,11 @@ jobs:
           export JEMALLOC_SYS_WITH_LG_PAGE=16
           entropy_headers="$(bash .github/scripts/prepare-musl-entropy.sh "$RUNNER_TEMP")"
           export AWS_LC_SYS_CFLAGS="${CFLAGS_aarch64_unknown_linux_musl} -idirafter ${entropy_headers}"
+          # LLVM schedules its machine outliner on every AArch64 build. It only
+          # outlines minsize functions, which these profiles never make, but it
+          # keeps every compiled function in memory until the end of the module,
+          # which roughly doubles the peak of a fat-LTO final compile.
+          export RUSTFLAGS="${RUSTFLAGS} -C llvm-args=-enable-machine-outliner=never"
           mold -run cargo build -p weaver --profile "${WEAVER_CARGO_PROFILE}" --locked --target aarch64-unknown-linux-musl
       - name: Verify native libraries are statically bundled
         run: |
