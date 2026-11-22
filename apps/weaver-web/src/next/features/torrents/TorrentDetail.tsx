@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useMutation, useQuery, useSubscription } from "urql";
 import {
   ADD_TORRENT_TRACKERS_MUTATION,
@@ -61,8 +61,10 @@ import { testIds, torrentIds } from "@/next/testids";
 import { durationText, seedingFields, seedingFrom, seedingInherits, seedingInput, type SeedingPolicy } from "@/next/pages/settings/seeding";
 
 const TRACKER_COLUMNS = {
-  base: "minmax(0,1fr) 80px 112px max-content",
-  sm: "minmax(0,1fr) 80px 112px 96px minmax(0,1fr) max-content",
+  // The actions column is max-content in every row; the heading row carries
+  // an invisible copy of the actions so it is as wide there.
+  base: "minmax(0,1fr) 88px max-content",
+  sm: "minmax(0,1.2fr) 150px 88px 56px 64px 56px minmax(0,1fr) max-content",
 };
 const FILE_COLUMNS = {
   base: "14px minmax(0,1fr) 72px 120px",
@@ -281,14 +283,9 @@ function PeersBlock({ torrent, onReport }: { torrent: TorrentData; onReport: (me
                 <span className="hidden text-center font-wv-mono text-[12px] text-wv-muted sm:block">
                   {`↑ ${formatRate(peer.uploadBps)}`}
                 </span>
-                <SecondaryButton
-                  size="compact"
-                  disabled={banState.fetching}
-                  onClick={() => ban(peer.address)}
-                  className="h-6 border-wv-error/40 px-2 text-[11.5px] text-wv-error hover:border-wv-error"
-                >
+                <SmallAction tone="danger" disabled={banState.fetching} onClick={() => ban(peer.address)}>
                   {t("next.torrent.ban")}
-                </SecondaryButton>
+                </SmallAction>
               </GridRow>
             ))}
           </div>
@@ -412,6 +409,55 @@ const count = (value: number | null) => (value === null ? EM_DASH : String(value
  * A torrent's trackers, each with how announcing to it went, and the
  * actions on them: add, edit, remove and reannounce.
  */
+/** The tone of a small row action: plain, one that adds or changes, or one that removes. */
+type ActionTone = "plain" | "accent" | "danger";
+
+const ACTION_TONE: Record<ActionTone, string> = {
+  plain: "",
+  accent: "!border-wv-accent/50 text-wv-accent hover:!border-wv-accent",
+  danger: "!border-wv-danger-border bg-wv-danger-bg text-wv-error-text hover:!border-wv-danger-border-hover hover:bg-wv-danger-bg-hover",
+};
+
+/** A small bordered action that fits a table row or a section heading. */
+function SmallAction({
+  tone = "plain",
+  disabled,
+  onClick,
+  testId,
+  children,
+}: {
+  tone?: ActionTone;
+  disabled?: boolean;
+  onClick: () => void;
+  testId?: string;
+  children: ReactNode;
+}) {
+  return (
+    <SecondaryButton
+      size="compact"
+      testId={testId}
+      disabled={disabled}
+      onClick={onClick}
+      className={cn("h-6 px-2 text-[11.5px]", disabled ? "" : ACTION_TONE[tone])}
+    >
+      {children}
+    </SecondaryButton>
+  );
+}
+
+/** Who named the tracker, and who resolves its name; whole on hover when the column cuts it. */
+function TrackerSource({ tracker }: { tracker: TorrentData["trackers"][number] }) {
+  const t = useTranslate();
+  const source = [t(trackerSourceKey(tracker.source)), tracker.resolvedBy && t(resolvedByKey(tracker.resolvedBy))]
+    .filter(Boolean)
+    .join(" · ");
+  return (
+    <span className="hidden min-w-0 truncate font-wv-mono text-[11.5px] text-wv-muted sm:block" title={source}>
+      {source}
+    </span>
+  );
+}
+
 function TrackersBlock({
   torrent,
   onChanged,
@@ -475,7 +521,21 @@ function TrackersBlock({
     void reannounce({ id: torrent.id, tracker }).then((result) => settle(result, onReport));
   };
 
-  const action = "cursor-pointer text-[12.5px] whitespace-nowrap text-wv-dim hover:text-wv-fg disabled:cursor-default";
+  // One set for each row; the heading row holds an invisible copy so the
+  // max-content column is as wide there as in the rows.
+  const rowActions = (tracker: TorrentData["trackers"][number]) => (
+    <>
+      <SmallAction disabled={busy} onClick={() => announce(tracker.url)}>
+        {t("next.torrent.reannounce")}
+      </SmallAction>
+      <SmallAction tone="accent" onClick={() => open({ kind: "edit", from: tracker, url: tracker.url })}>
+        {t("next.common.edit")}
+      </SmallAction>
+      <SmallAction tone="danger" disabled={busy} onClick={() => remove(tracker.url)}>
+        {t("next.common.remove")}
+      </SmallAction>
+    </>
+  );
 
   return (
     <DetailBlock
@@ -483,31 +543,42 @@ function TrackersBlock({
       title={t("next.torrent.trackers")}
       note={countLabel(t, "next.torrent.trackerCount", torrent.trackers.length)}
       right={
-        <span className="flex gap-3">
-          <button type="button" disabled={busy} onClick={() => announce(null)} className={action}>
+        <span className="flex gap-2">
+          <SmallAction disabled={busy} onClick={() => announce(null)}>
             {t("next.torrent.reannounce")}
-          </button>
+          </SmallAction>
           {/* A private torrent is never looked up on the DHT. */}
           {torrent.private ? null : (
-            <button
-              type="button"
+            <SmallAction
               disabled={busy}
               onClick={() => void dhtAnnounce({ id: torrent.id }).then((result) => settle(result, onReport))}
-              className={action}
             >
               {t("next.torrent.dhtAnnounce")}
-            </button>
+            </SmallAction>
           )}
-          <button type="button" onClick={() => open({ kind: "add", urls: "" })} className={action}>
+          <SmallAction tone="accent" onClick={() => open({ kind: "add", urls: "" })}>
             {t("next.torrent.addTrackers")}
-          </button>
+          </SmallAction>
         </span>
       }
     >
       {torrent.trackers.length === 0 ? (
         <span className="text-[12.5px] text-wv-muted">{EM_DASH}</span>
       ) : (
-        torrent.trackers.map((tracker) => (
+        <>
+        <GridRow columns={TRACKER_COLUMNS} gap={14} className="h-[28px] font-wv-mono text-[11px] text-wv-muted">
+          <span className="min-w-0 truncate">{t("next.torrent.trackerUrl")}</span>
+          <span className="hidden min-w-0 truncate sm:block">{t("next.torrent.trackerSource")}</span>
+          <span className="min-w-0 truncate">{t("next.torrent.trackerStatus")}</span>
+          <span className="hidden min-w-0 truncate text-center sm:block">{t("next.torrent.seeds")}</span>
+          <span className="hidden min-w-0 truncate text-center sm:block">{t("next.torrent.trackerLeeches")}</span>
+          <span className="hidden min-w-0 truncate text-center sm:block">{t("next.torrent.peers")}</span>
+          <span className="hidden min-w-0 truncate sm:block">{t("next.torrent.trackerMessage")}</span>
+          <span aria-hidden className="invisible flex gap-2">
+            {rowActions(torrent.trackers[0])}
+          </span>
+        </GridRow>
+        {torrent.trackers.map((tracker) => (
           <GridRow
             key={`${tracker.tier}-${tracker.url}`}
             testId={torrentIds.tracker(tracker.url)}
@@ -517,52 +588,23 @@ function TrackersBlock({
             title={tracker.url}
           >
             <span className="min-w-0 truncate font-wv-mono text-[12px] text-wv-fg">{tracker.url}</span>
-            <span className="truncate font-wv-mono text-[11.5px] text-wv-muted">
-              {[t(trackerSourceKey(tracker.source)), tracker.resolvedBy && t(resolvedByKey(tracker.resolvedBy))]
-                .filter(Boolean)
-                .join(" · ")}
-            </span>
+            <TrackerSource tracker={tracker} />
             <span
               data-testid={torrentIds.trackerStatus(tracker.updating ? "UPDATING" : tracker.status)}
               className="font-wv-mono text-[11.5px] text-wv-muted"
             >
               {t(tracker.updating ? "next.torrent.tracker.UPDATING" : `next.torrent.tracker.${tracker.status}`)}
             </span>
-            <span
-              className="hidden text-right font-wv-mono text-[12px] text-wv-muted sm:block"
-              title={t("next.torrent.trackerSwarmTitle")}
-            >
-              {t("next.torrent.trackerSwarm", {
-                seeds: count(tracker.seeders),
-                leeches: count(tracker.leechers),
-                peers: count(tracker.peers),
-              })}
-            </span>
+            <span className="hidden text-center font-wv-mono text-[12px] text-wv-muted sm:block">{count(tracker.seeders)}</span>
+            <span className="hidden text-center font-wv-mono text-[12px] text-wv-muted sm:block">{count(tracker.leechers)}</span>
+            <span className="hidden text-center font-wv-mono text-[12px] text-wv-muted sm:block">{count(tracker.peers)}</span>
             <span className="hidden min-w-0 truncate text-[12px] text-wv-tertiary sm:block" title={tracker.message ?? undefined}>
               {tracker.message ?? ""}
             </span>
-            <span className="flex justify-end gap-3">
-              <button type="button" disabled={busy} onClick={() => announce(tracker.url)} className={action}>
-                {t("next.torrent.reannounce")}
-              </button>
-              <button
-                type="button"
-                onClick={() => open({ kind: "edit", from: tracker, url: tracker.url })}
-                className={action}
-              >
-                {t("next.common.edit")}
-              </button>
-              <button
-                type="button"
-                disabled={busy}
-                onClick={() => remove(tracker.url)}
-                className="cursor-pointer text-[12.5px] whitespace-nowrap text-wv-dim hover:text-wv-error disabled:cursor-default"
-              >
-                {t("next.common.remove")}
-              </button>
-            </span>
+            <span className="flex justify-end gap-2">{rowActions(tracker)}</span>
           </GridRow>
-        ))
+        ))}
+        </>
       )}
       <RecordEditor
         open={editing !== null}
@@ -892,14 +934,13 @@ export function TorrentDetail({
         title={t("next.torrents.seeding")}
         note={torrent.seedingLeft ?? undefined}
         right={
-          <button
-            type="button"
-            data-testid={torrentIds.seedingOverride}
+          <SmallAction
+            tone="accent"
+            testId={torrentIds.seedingOverride}
             onClick={() => setEditing(seedingFrom(torrent.seedingOverride))}
-            className="cursor-pointer text-wv-dim hover:text-wv-fg"
           >
             {t("next.torrent.overrideSeeding")}
-          </button>
+          </SmallAction>
         }
       >
         <div className="grid gap-x-4 gap-y-[13px]" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))" }}>
