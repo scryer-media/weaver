@@ -2007,12 +2007,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
 
 [[package]]
-name = "fixedbitset"
-version = "0.5.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
-
-[[package]]
 name = "flagset"
 version = "0.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2530,12 +2524,6 @@ checksum = "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
 dependencies = [
  "digest 0.11.3",
 ]
-
-[[package]]
-name = "html-escape"
-version = "0.2.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c9356095b4b41197bba32173600e1582792cda618f65d12f68e2e77d273413c5"
 
 [[package]]
 name = "html-escape"
@@ -4781,20 +4769,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
-name = "scryer-release-parser"
-version = "0.18.21"
-source = "git+https://github.com/scryer-media/scryer?tag=scryer-v0.18.21#00c31f2a9655647b8ae5be96d1c8552bf3aed91a"
-dependencies = [
- "aho-corasick",
- "chrono",
- "fixedbitset",
- "html-escape 0.2.15",
- "serde",
- "smallvec",
- "unicode-normalization",
-]
-
-[[package]]
 name = "scrypt"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6572,7 +6546,7 @@ name = "weaver-nzb"
 version = "0.16.17"
 dependencies = [
  "blake3",
- "html-escape 0.3.0",
+ "html-escape",
  "quick-xml",
  "serde",
  "serde_json",
@@ -6622,7 +6596,6 @@ dependencies = [
  "rcgen",
  "regex",
  "reqwest",
- "scryer-release-parser",
  "serde",
  "serde_json",
  "sha2 0.11.1",

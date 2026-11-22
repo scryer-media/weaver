@@ -1288,22 +1288,20 @@ impl StandIns {
             }
 
             // The NZB title, the names duplicate detection keeps, and the
-            // title the API derives from each distinct name, parsed once.
+            // titles the API derives from each distinct name, derived once.
             let mut titles: Vec<String> = nzb.title.iter().cloned().collect();
             titles.extend(record.normalized_names.iter().cloned());
             titles.extend(record.keys.iter().cloned());
-            let mut parsed: Vec<&String> = Vec::new();
+            let mut seen: Vec<&String> = Vec::new();
             for name in names.iter().chain(nzb.title.as_ref()) {
-                if parsed.contains(&name) {
+                if seen.contains(&name) {
                     continue;
                 }
-                parsed.push(name);
-                let derived = weaver_server_api::release_display_names(
+                seen.push(name);
+                titles.extend(weaver_server_api::release_display_names(
                     name,
                     &record.metadata,
-                    record.category.as_deref(),
-                );
-                titles.extend(derived);
+                ));
             }
             let mut count = 0;
             for title in &titles {
@@ -2648,7 +2646,7 @@ mod tests {
             "got job-4, job-4. xOlaf.Show.S01E01"
         );
         // The title the API derives from the name is a name too.
-        let title = table.sanitize_str("title Olaf Show");
+        let title = table.sanitize_str("title Olaf Show — S01E01");
         assert!(title.starts_with("title job-4/title-"), "{title}");
     }
 

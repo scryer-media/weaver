@@ -9,7 +9,7 @@ use super::*;
 use crate::jobs::paging::{PageRead, PageWants, read_row};
 use crate::jobs::types::{
     DuplicateIdentitySnapshotInfo, DuplicateSummaryInfo, PreparedQueueFilter,
-    load_duplicate_summaries_chunked, queue_table_item_from_job,
+    load_duplicate_summaries_chunked, queue_item_from_job,
 };
 use crate::jobs::types::{
     JobOutputSource, OutputFilesCursor, decode_output_files_cursor, encode_output_files_cursor,
@@ -621,10 +621,7 @@ pub(crate) async fn build_queue_page(
     let summary = walk.summary(&metrics);
     let categories = walk.categories();
     drop(walk);
-    let mut items = rows
-        .iter()
-        .map(queue_table_item_from_job)
-        .collect::<Vec<_>>();
+    let mut items = rows.iter().map(queue_item_from_job).collect::<Vec<_>>();
     if wants.disk_write {
         crate::jobs::types::attach_disk_writes(state, &mut items);
     }

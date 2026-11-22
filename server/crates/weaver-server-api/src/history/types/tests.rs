@@ -51,7 +51,7 @@ fn history_item_roundtrips_attributes_and_client_request_id() {
 }
 
 #[test]
-fn history_item_builds_when_release_parse_is_not_media() {
+fn history_item_builds_for_a_name_that_is_not_media() {
     let row = JobHistoryRow {
         protocol: weaver_server_core::Protocol::Nzb,
         job_id: 78,
@@ -78,7 +78,6 @@ fn history_item_builds_when_release_parse_is_not_media() {
     let item = history_item_from_row(&row, None);
 
     assert_eq!(item.display_title, "ubuntu-24 04 2-live-server-amd64");
-    assert_eq!(item.parsed_release, ParsedRelease::default());
 }
 
 #[test]
@@ -238,11 +237,6 @@ async fn history_item_exposes_full_file_names_but_not_as_an_attribute() {
                 ]
             }
         })
-    );
-    let table_item = history_table_item_from_row(&row, None);
-    assert_eq!(
-        table_item.full_file_names_record,
-        item.full_file_names_record
     );
 }
 

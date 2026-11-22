@@ -12,7 +12,7 @@ use weaver_server_core::operations::async_ops::OperationsAsyncOpsQueries;
 use weaver_server_core::tags::TagsQueries;
 
 use super::*;
-use crate::history::types::{history_delete_row_state_from_core, history_table_item_from_row};
+use crate::history::types::history_delete_row_state_from_core;
 use crate::jobs::types::load_duplicate_summaries_chunked;
 
 enum HistoryQueryPlan {
@@ -728,7 +728,7 @@ fn build_history_page_sql(
     let rows = db.list_job_history(&items_filter)?;
     let items = rows
         .into_iter()
-        .map(|row| history_table_item_from_row(&row, None))
+        .map(|row| history_item_from_row(&row, None))
         .collect();
 
     Ok(HistoryPage {
@@ -912,7 +912,7 @@ fn build_history_page(rows: Vec<JobHistoryRow>, input: HistoryPageInput) -> Hist
                 row.completed_at >= since && !row.status.eq_ignore_ascii_case("paused")
             })
         })
-        .map(|row| history_table_item_from_row(&row, None))
+        .map(|row| history_item_from_row(&row, None))
         .filter(|item| {
             search
                 .as_deref()

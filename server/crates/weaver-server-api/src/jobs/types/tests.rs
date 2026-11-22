@@ -164,20 +164,19 @@ fn base_job(status: JobStatus) -> weaver_server_core::JobInfo {
 }
 
 #[test]
-fn propagation_hold_projects_through_table_and_detail_with_a_deadline() {
+fn propagation_hold_projects_into_the_queue_item_with_a_deadline() {
     let mut info = base_job(JobStatus::Downloading);
     info.download_state = weaver_server_core::DownloadState::Queued;
     info.download_wait_reason =
         Some(weaver_server_core::jobs::handle::PROPAGATION_WAIT_REASON.to_string());
     info.download_retry_at_epoch_ms = Some(1_800_000_000_000.0);
-    for item in [queue_item_from_job(&info), queue_table_item_from_job(&info)] {
-        assert_eq!(item.state, QueueItemState::Queued);
-        assert_eq!(item.download_wait_reason, info.download_wait_reason);
-        assert_eq!(
-            item.download_retry_at_epoch_ms,
-            info.download_retry_at_epoch_ms
-        );
-    }
+    let item = queue_item_from_job(&info);
+    assert_eq!(item.state, QueueItemState::Queued);
+    assert_eq!(item.download_wait_reason, info.download_wait_reason);
+    assert_eq!(
+        item.download_retry_at_epoch_ms,
+        info.download_retry_at_epoch_ms
+    );
 }
 
 #[test]
@@ -520,7 +519,7 @@ fn queue_item_surfaces_unhealthy_attention() {
 }
 
 #[test]
-fn queue_item_builds_when_release_parse_is_not_media() {
+fn queue_item_builds_for_a_name_that_is_not_media() {
     let mut job = base_job(JobStatus::Downloading);
     job.name = "ubuntu-24.04.2-live-server-amd64".to_string();
     job.category = None;
@@ -528,7 +527,6 @@ fn queue_item_builds_when_release_parse_is_not_media() {
     let item = queue_item_from_job(&job);
 
     assert_eq!(item.display_title, "ubuntu-24 04 2-live-server-amd64");
-    assert_eq!(item.parsed_release, ParsedRelease::default());
 }
 
 #[test]
@@ -553,38 +551,7 @@ fn persisted_queue_event_replays_pre_lane_payloads() {
             "name": "Facade.Test.Release",
             "display_title": "Facade Test Release",
             "original_title": "Facade.Test.Release",
-            "parsed_release": {
-                "normalized_title": "",
-                "release_group": null,
-                "languages_audio": [],
-                "languages_subtitles": [],
-                "year": null,
-                "quality": null,
-                "source": null,
-                "video_codec": null,
-                "video_encoding": null,
-                "audio": null,
-                "audio_codecs": [],
-                "audio_channels": null,
-                "is_dual_audio": false,
-                "is_atmos": false,
-                "is_dolby_vision": false,
-                "detected_hdr": false,
-                "is_hdr10plus": false,
-                "is_hlg": false,
-                "fps": null,
-                "is_proper_upload": false,
-                "is_repack": false,
-                "is_remux": false,
-                "is_bd_disk": false,
-                "is_ai_enhanced": false,
-                "is_hardcoded_subs": false,
-                "streaming_service": null,
-                "edition": null,
-                "anime_version": null,
-                "episode": null,
-                "parse_confidence": 0.0
-            },
+            "parsed_release": { "normalized_title": "" },
             "state": "Downloading",
             "wait_reason": null,
             "error": null,
@@ -609,6 +576,8 @@ fn persisted_queue_event_replays_pre_lane_payloads() {
         "global_state": null
     }"#;
 
+    // A payload written before 0.17 carries a `parsed_release` object; it is
+    // ignored.
     let event: PersistedQueueEvent =
         serde_json::from_str(payload).expect("old event payload should decode");
     let item = event.item.expect("item should decode");

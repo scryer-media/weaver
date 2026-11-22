@@ -14,13 +14,10 @@ use weaver_server_core::{
     split_history_metadata,
 };
 
-use crate::jobs::release_display::{
-    ReleaseDisplayCache, ReleaseDisplayInput, release_display_info,
-};
+use crate::jobs::release_display::release_display_info;
 use crate::jobs::types::{
-    Attribute, DuplicateSummaryInfo, JobOutcome, JobStatusGql, ParsedRelease, PreparedQueueFilter,
-    ProtocolGql, QueueAttention, QueueFilterInput, QueueItemState,
-    matches_attribute_filter_prepared,
+    Attribute, DuplicateSummaryInfo, JobOutcome, JobStatusGql, PreparedQueueFilter, ProtocolGql,
+    QueueAttention, QueueFilterInput, QueueItemState, matches_attribute_filter_prepared,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
@@ -33,7 +30,6 @@ pub struct HistoryItem {
     pub name: String,
     pub display_title: String,
     pub original_title: String,
-    pub parsed_release: ParsedRelease,
     pub state: QueueItemState,
     /// How the job ended, a partial delivery as its own value.
     #[serde(default)]
@@ -725,12 +721,7 @@ pub fn history_item_from_row(
     let metadata_pairs = parse_history_metadata(row.metadata.as_deref());
     let (client_request_id, attributes) = split_attributes(&metadata_pairs);
     let state = history_state_from_row(row);
-    let display = release_display_info(ReleaseDisplayInput {
-        job_name: &row.name,
-        metadata: &metadata_pairs,
-        category: row.category.as_deref(),
-        cache: ReleaseDisplayCache::History(row.job_id),
-    });
+    let display = release_display_info(&row.name, &metadata_pairs);
     history_item_from_display(
         row,
         &metadata_pairs,
@@ -740,38 +731,7 @@ pub fn history_item_from_row(
         state,
         display.original_title,
         display.display_title,
-        display.parsed_release,
     )
-}
-
-// Projects only the fields rendered by the paginated History table. Full
-// release parsing remains available to detail and compatibility facades.
-pub(crate) fn history_table_item_from_row(
-    row: &JobHistoryRow,
-    delete_operation: Option<HistoryDeleteRowState>,
-) -> HistoryItem {
-    let metadata_pairs = parse_history_metadata(row.metadata.as_deref());
-    let (client_request_id, attributes) = split_attributes(&metadata_pairs);
-    let state = history_state_from_row(row);
-    let (original_title, display_title) = history_display_titles(row, &metadata_pairs);
-    history_item_from_display(
-        row,
-        &metadata_pairs,
-        delete_operation,
-        client_request_id,
-        attributes,
-        state,
-        original_title,
-        display_title,
-        ParsedRelease::default(),
-    )
-}
-
-fn history_display_titles(row: &JobHistoryRow, metadata: &[(String, String)]) -> (String, String) {
-    let original_title = weaver_server_core::ingest::original_release_title(&row.name, metadata);
-    let display_title =
-        weaver_server_core::ingest::derive_release_name(Some(&original_title), Some(&row.name));
-    (original_title, display_title)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -784,7 +744,6 @@ fn history_item_from_display(
     state: QueueItemState,
     original_title: String,
     display_title: String,
-    parsed_release: ParsedRelease,
 ) -> HistoryItem {
     let progress_percent = if row.total_bytes == 0 {
         0.0
@@ -798,7 +757,6 @@ fn history_item_from_display(
         name: row.name.clone(),
         display_title,
         original_title,
-        parsed_release,
         state,
         outcome: JobOutcome::of_history(&row.status),
         error: row.error_message.clone(),

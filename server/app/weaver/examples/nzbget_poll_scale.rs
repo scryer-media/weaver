@@ -17,7 +17,7 @@ use std::time::Instant;
 use weaver_server_api::{
     QueueItemState, QueueStateFacts, queue_item_from_job, queue_item_state,
     queue_item_state_for_download_accounting,
-    queue_item_state_from_job_info_for_download_accounting, queue_table_item_from_job,
+    queue_item_state_from_job_info_for_download_accounting,
 };
 use weaver_server_core::operations::metrics::PipelineMetrics;
 use weaver_server_core::{
@@ -187,7 +187,7 @@ fn main() {
                     .collect::<Vec<_>>()
             });
             for job in &jobs {
-                let item = queue_table_item_from_job(job);
+                let item = queue_item_from_job(job);
                 serde_json::to_writer(&mut buf, &serde_json::to_value(&item).unwrap()).unwrap();
                 buf.push(b',');
             }
@@ -222,7 +222,7 @@ fn main() {
         finished
             .iter()
             .chain(history.iter())
-            .map(queue_table_item_from_job)
+            .map(queue_item_from_job)
             .filter(|item| terminal(item.state))
             .count()
     });
