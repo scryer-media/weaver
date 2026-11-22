@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import type { TorrentPeerData } from "@/lib/torrents";
+import type { TorrentPeerData, TorrentState } from "@/lib/torrents";
 
 /** How many peers a page of the list holds. */
 export const PEER_PAGE_SIZE = 25;
@@ -14,8 +14,18 @@ export interface PeerSort {
   descending: boolean;
 }
 
-/** Addresses in order, as the list starts. */
+/** Addresses in order. */
 export const DEFAULT_PEER_SORT: PeerSort = { key: "address", descending: false };
+
+/**
+ * The order the peers take until a heading is clicked: the fastest sender
+ * first while the torrent downloads, the fastest receiver first once it has
+ * all it wants and uploads.
+ */
+export function peerSortFor(torrent: { state: TorrentState; progress: number }): PeerSort {
+  const uploading = torrent.state === "SEEDING" || torrent.progress >= 1;
+  return { key: uploading ? "uploadBps" : "downloadBps", descending: true };
+}
 
 /**
  * The sort a click on `key`'s heading gives: the other way round on the

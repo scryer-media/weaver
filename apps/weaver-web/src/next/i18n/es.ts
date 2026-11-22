@@ -526,6 +526,7 @@ export const nextEs: LocaleDictionary = {
   "next.job.forgetIdentity": "Olvidar identidad",
   "next.job.jobId": "Id del trabajo",
   "next.job.originalTitle": "Título original del NZB",
+  "next.job.originalTorrentName": "Nombre original del torrent",
   "next.job.providersUsed": "Proveedores usados",
   "next.job.providersEmpty": "No registrado para este trabajo — o aún no ha llegado nada, o terminó antes de que weaver contara por proveedor.",
   "next.job.serverId": "Servidor {{id}}",

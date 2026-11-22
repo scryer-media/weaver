@@ -46,11 +46,11 @@ import { useNextData } from "@/next/data/next-data";
 import { LimitControl } from "@/next/features/networking/limits";
 import { informationFields, transferFields, transferNote, type TorrentField } from "@/next/features/torrents/general";
 import {
-  DEFAULT_PEER_SORT,
   PEER_PAGE_SIZE,
   nextPeerSort,
   peerPage,
   peerPageCount,
+  peerSortFor,
   peersOfPage,
   sortPeers,
   type PeerSort,
@@ -192,7 +192,8 @@ function GeneralGrid({ fields }: { fields: TorrentField[] }) {
 /**
  * A torrent's peer connections, read again each time the torrent pushes an
  * update, each with its ban. They are read whole and shown a page of 25 at a
- * time, in the order of the column whose heading was last clicked.
+ * time: by download speed while the torrent downloads and by upload speed
+ * while it uploads, until a heading is clicked, then by that column.
  */
 function PeersBlock({ torrent, onReport }: { torrent: TorrentData; onReport: (message: string) => void }) {
   const t = useTranslate();
@@ -206,7 +207,10 @@ function PeersBlock({ torrent, onReport }: { torrent: TorrentData; onReport: (me
     reread({ requestPolicy: "network-only" });
   }, [torrent, reread]);
   const peers = data?.torrentPeers ?? NO_PEERS;
-  const [sort, setSort] = useState<PeerSort>(DEFAULT_PEER_SORT);
+  // Null until a heading is clicked: the order then follows the torrent, so
+  // a download that finishes turns to its uploads by itself.
+  const [chosen, setChosen] = useState<PeerSort | null>(null);
+  const sort = chosen ?? peerSortFor(torrent);
   const [asked, setAsked] = useState(0);
   const sorted = useMemo(() => sortPeers(peers, sort), [peers, sort]);
   // Peers leaving can empty the page asked for: the last one there is shows.
@@ -214,7 +218,7 @@ function PeersBlock({ torrent, onReport }: { torrent: TorrentData; onReport: (me
   const pageCount = peerPageCount(sorted.length);
   const shown = peersOfPage(sorted, page);
   const sortBy = (key: PeerSortKey) => {
-    setSort((was) => nextPeerSort(was, key));
+    setChosen(nextPeerSort(sort, key));
     setAsked(0);
   };
   const heading = (key: PeerSortKey, label: string, className?: string) => (

@@ -526,6 +526,7 @@ export const nextZh: LocaleDictionary = {
   "next.job.forgetIdentity": "忘记身份",
   "next.job.jobId": "任务 id",
   "next.job.originalTitle": "原始 NZB 标题",
+  "next.job.originalTorrentName": "原始种子名称",
   "next.job.providersUsed": "使用的提供商",
   "next.job.providersEmpty": "该任务没有记录 — 要么尚未收到数据，要么在 weaver 开始按提供商统计前就已完成。",
   "next.job.serverId": "服务器 {{id}}",

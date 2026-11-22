@@ -1176,7 +1176,7 @@ function JobDetailContent() {
             <Field variant="stacked" label={t("next.job.jobId")} value={String(job.id)} />
             <Field
               variant="stacked"
-              label={t("next.job.originalTitle")}
+              label={isTorrent ? t("next.job.originalTorrentName") : t("next.job.originalTitle")}
               value={job.originalTitle || job.name}
             />
             <Field

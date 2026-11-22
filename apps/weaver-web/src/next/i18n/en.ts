@@ -533,6 +533,7 @@ export const nextEn: LocaleDictionary = {
   "next.job.forgetIdentity": "Forget identity",
   "next.job.jobId": "Job id",
   "next.job.originalTitle": "Original NZB title",
+  "next.job.originalTorrentName": "Original torrent name",
   "next.job.providersUsed": "Providers used",
   "next.job.providersEmpty": "Not recorded for this job — either nothing has landed yet, or it finished before weaver kept per-provider counts.",
   "next.job.serverId": "Server {{id}}",

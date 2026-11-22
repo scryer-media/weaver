@@ -9,6 +9,7 @@ import {
   nextPeerSort,
   peerPage,
   peerPageCount,
+  peerSortFor,
   peersOfPage,
   sortPeers,
 } from "../src/next/features/torrents/peers.ts";
@@ -71,4 +72,23 @@ test("peers show a page of 25 at a time, and a page emptied by peers leaving giv
   assert.equal(peerPage(3, 30), 1);
   assert.deepEqual(addresses(peersOfPage(peers.slice(0, 30), 3)), addresses(peers.slice(25, 30)));
   assert.deepEqual(peersOfPage([], 2), []);
+});
+
+test("until a heading is clicked, a download shows its fastest senders and a seed its fastest receivers", () => {
+  const down = { key: "downloadBps", descending: true };
+  const up = { key: "uploadBps", descending: true };
+  assert.deepEqual(peerSortFor({ state: "DOWNLOADING", progress: 0.4 }), down);
+  assert.deepEqual(peerSortFor({ state: "STALLED", progress: 0.4 }), down);
+  assert.deepEqual(peerSortFor({ state: "PAUSED", progress: 0.4 }), down);
+  assert.deepEqual(peerSortFor({ state: "SEEDING", progress: 0.7 }), up);
+  assert.deepEqual(peerSortFor({ state: "PAUSED", progress: 1 }), up);
+  const peers = [peer("1.1.1.1:1", "", 1, 900, 5), peer("2.2.2.2:2", "", 0, 10, 400)];
+  assert.deepEqual(addresses(sortPeers(peers, peerSortFor({ state: "DOWNLOADING", progress: 0.4 }))), [
+    "1.1.1.1:1",
+    "2.2.2.2:2",
+  ]);
+  assert.deepEqual(addresses(sortPeers(peers, peerSortFor({ state: "SEEDING", progress: 1 }))), [
+    "2.2.2.2:2",
+    "1.1.1.1:1",
+  ]);
 });

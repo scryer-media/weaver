@@ -526,6 +526,7 @@ export const nextJa: LocaleDictionary = {
   "next.job.forgetIdentity": "識別情報を削除",
   "next.job.jobId": "ジョブ ID",
   "next.job.originalTitle": "元の NZB タイトル",
+  "next.job.originalTorrentName": "元のトレント名",
   "next.job.providersUsed": "使用したプロバイダー",
   "next.job.providersEmpty": "このジョブでは記録されていません — まだ何も届いていないか、weaver がプロバイダー別に集計する前に完了しました。",
   "next.job.serverId": "サーバー {{id}}",

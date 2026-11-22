@@ -526,6 +526,7 @@ export const nextKo: LocaleDictionary = {
   "next.job.forgetIdentity": "식별 정보 지우기",
   "next.job.jobId": "작업 id",
   "next.job.originalTitle": "원래 NZB 제목",
+  "next.job.originalTorrentName": "원래 토렌트 이름",
   "next.job.providersUsed": "사용한 공급자",
   "next.job.providersEmpty": "이 작업에는 기록되지 않았습니다 — 아직 받은 것이 없거나, weaver가 공급자별로 집계하기 전에 끝났습니다.",
   "next.job.serverId": "서버 {{id}}",
