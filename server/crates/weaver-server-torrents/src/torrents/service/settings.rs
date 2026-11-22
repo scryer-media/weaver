@@ -133,7 +133,7 @@ macro_rules! seeding_field {
     };
 }
 
-pub const RATIO_GOAL: Field<f32> = seeding_field!(ratio_goal);
+pub const RATIO_GOAL: Field<f64> = seeding_field!(ratio_goal);
 pub const SEED_TIME_GOAL: Field<u32> = seeding_field!(seed_time_goal_minutes);
 pub const INACTIVE_GOAL: Field<u32> = seeding_field!(inactive_goal_minutes);
 pub const SEEDING_ACTION: Field<SeedingAction> = seeding_field!(action);

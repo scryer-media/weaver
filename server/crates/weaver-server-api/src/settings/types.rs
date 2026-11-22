@@ -1278,7 +1278,7 @@ pub enum LeafStateGql {
 
 /// One setting at one level.
 #[derive(Debug, Clone, Copy, PartialEq, SimpleObject)]
-#[graphql(concrete(name = "RatioLeaf", params(f32)))]
+#[graphql(concrete(name = "RatioLeaf", params(f64)))]
 #[graphql(concrete(name = "MinutesLeaf", params(u32)))]
 #[graphql(concrete(name = "BpsLeaf", params(u64)))]
 #[graphql(concrete(name = "GoalModeLeaf", params(SeedingGoalModeGql)))]
@@ -1311,7 +1311,7 @@ impl<T: OutputType> LeafGql<T> {
 
 /// One setting at one level; `value` is given with `SET` and only then.
 #[derive(Debug, Clone, Copy, InputObject)]
-#[graphql(concrete(name = "RatioLeafInput", params(f32)))]
+#[graphql(concrete(name = "RatioLeafInput", params(f64)))]
 #[graphql(concrete(name = "MinutesLeafInput", params(u32)))]
 #[graphql(concrete(name = "BpsLeafInput", params(u64)))]
 #[graphql(concrete(name = "GoalModeLeafInput", params(SeedingGoalModeGql)))]
@@ -1369,7 +1369,7 @@ impl From<Level> for SettingLevelGql {
 /// Seeding terms at one level: each one inherited, off or set.
 #[derive(Debug, Clone, Copy, PartialEq, SimpleObject)]
 pub struct SeedingPolicySettings {
-    pub ratio_goal: LeafGql<f32>,
+    pub ratio_goal: LeafGql<f64>,
     pub seed_time_goal_minutes: LeafGql<u32>,
     pub inactive_goal_minutes: LeafGql<u32>,
     pub mode: LeafGql<SeedingGoalModeGql>,
@@ -1393,7 +1393,7 @@ impl From<weaver_server_core::settings::SeedingPolicy> for SeedingPolicySettings
 /// Seeding terms at one level; a term left out inherits.
 #[derive(Debug, Clone, Copy, InputObject)]
 pub struct SeedingPolicyInput {
-    pub ratio_goal: Option<LeafInput<f32>>,
+    pub ratio_goal: Option<LeafInput<f64>>,
     pub seed_time_goal_minutes: Option<LeafInput<u32>>,
     pub inactive_goal_minutes: Option<LeafInput<u32>>,
     pub mode: Option<LeafInput<SeedingGoalModeGql>>,

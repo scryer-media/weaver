@@ -317,7 +317,7 @@ mod tests {
         }
     }
 
-    fn policy(ratio_goal: Option<f32>, seed_time_goal_minutes: Option<u32>) -> SeedingPolicy {
+    fn policy(ratio_goal: Option<f64>, seed_time_goal_minutes: Option<u32>) -> SeedingPolicy {
         SeedingPolicy {
             ratio_goal: Leaf::of(ratio_goal),
             seed_time_goal_minutes: Leaf::of(seed_time_goal_minutes),

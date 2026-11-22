@@ -106,7 +106,7 @@ pub struct Terms {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SeedingTerms {
-    pub ratio_goal: Leaf<f32>,
+    pub ratio_goal: Leaf<f64>,
     pub seed_time_goal_minutes: Leaf<u32>,
     pub inactive_goal_minutes: Leaf<u32>,
     pub mode: Leaf<SeedingGoalMode>,
@@ -482,7 +482,7 @@ impl TrackerFile {
                 old.seeding.unwrap_or_default(),
                 applied.seeding.unwrap_or_default(),
             );
-            let number = |value: f32| value.to_string();
+            let number = |value: f64| value.to_string();
             let minutes = |value: u32| value.to_string();
             let mode = |mode: SeedingGoalMode| mode.as_str().to_owned();
             let action = |action: SeedingAction| action.as_str().to_owned();
@@ -1203,10 +1203,10 @@ fn seeding(value: &toml::Value, path: &str) -> Result<SeedingTerms, String> {
                 toml::Value::Integer(ratio) => *ratio as f64,
                 _ => f64::NAN,
             };
-            if !ratio.is_finite() || ratio < 0.0 || ratio > f64::from(f32::MAX) {
+            if !ratio.is_finite() || ratio < 0.0 {
                 return Err(format!("{path}.ratio_goal must be a number, zero or more."));
             }
-            Some(ratio as f32)
+            Some(ratio)
         }
     };
     let word = |key: &str| -> Result<Option<&str>, String> {

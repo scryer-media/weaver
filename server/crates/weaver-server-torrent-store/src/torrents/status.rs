@@ -303,7 +303,7 @@ mod tests {
         }
     }
 
-    fn policy(ratio: Option<f32>, seed: Option<u32>, mode: SeedingGoalMode) -> Seeding {
+    fn policy(ratio: Option<f64>, seed: Option<u32>, mode: SeedingGoalMode) -> Seeding {
         Seeding {
             seed_time_counting: Default::default(),
             ratio_goal: ratio,
