@@ -67,6 +67,9 @@ impl Recovery for Proven {
     fn covers(&self, _: MemberId) -> bool {
         true
     }
+    fn covers_some(&self) -> bool {
+        true
+    }
     fn feed(&mut self, _: MemberId, _: &[Segment]) {}
     fn verdicts(&self, _: MemberId, _: &mut Vec<SliceVerdict>) {}
     fn wants(&self, _: &mut Vec<Seek>) {}
@@ -227,6 +230,9 @@ impl Recovery for RefusingSet {
         false
     }
     fn covers(&self, _: MemberId) -> bool {
+        true
+    }
+    fn covers_some(&self) -> bool {
         true
     }
     fn feed(&mut self, _: MemberId, _: &[Segment]) {}

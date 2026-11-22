@@ -237,6 +237,11 @@ pub trait Recovery {
     // Whether this object describes the member, by id, name or content.
     fn covers(&self, member: MemberId) -> bool;
 
+    // Whether this object describes any member at all: `covers` holds for
+    // some member. An object that describes nothing checked nothing, so
+    // its ruling vouches for no file.
+    fn covers_some(&self) -> bool;
+
     // Whether the object has yet to learn what some set of it describes:
     // its own volumes may still say, once something asks for them. The
     // owner asks it to rule once the namespace holds every other member,

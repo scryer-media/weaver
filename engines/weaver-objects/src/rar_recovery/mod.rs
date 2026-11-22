@@ -1140,6 +1140,10 @@ impl Recovery for RarRecovery {
         !self.refuted() && self.bound.values().any(|bound| *bound == member)
     }
 
+    fn covers_some(&self) -> bool {
+        !self.refuted() && !self.bound.is_empty()
+    }
+
     // A set that binds no data volume has yet to learn what it describes:
     // its name or its table ties it to none of the volumes in, so it rules
     // once every other member is, on nothing it covers.

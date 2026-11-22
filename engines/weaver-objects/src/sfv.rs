@@ -345,6 +345,10 @@ impl Recovery for Sfv {
         self.bound.contains_key(&member)
     }
 
+    fn covers_some(&self) -> bool {
+        !self.bound.is_empty()
+    }
+
     // A listing ships beside what it lists.
     fn released(&self) -> bool {
         true

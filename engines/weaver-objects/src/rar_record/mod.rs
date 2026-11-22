@@ -357,6 +357,10 @@ impl Recovery for RarRecord {
         self.member == Some(member) && self.said != Some(Said::Unread)
     }
 
+    fn covers_some(&self) -> bool {
+        self.member.is_some() && self.said != Some(Said::Unread)
+    }
+
     // The articles' checksums are of the bytes as posted, and the record's
     // are of a unit, not foldable from them: the ruling reads the volume.
     fn feed(&mut self, _member: MemberId, _segments: &[Segment]) {}

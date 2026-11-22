@@ -407,7 +407,11 @@ pub fn delivery_of(job: &GraphJob, posted: Posted<'_>) -> (Delivery, Option<Fail
         // unused, vouched where a set that vouched covers it, and unchecked
         // where a set of it vouched and none of its sets describes the
         // member (only what a set describes is checked once one verified). The one place a member
-        // is asked whether a set describes it.
+        // is asked whether a set describes it. A set that describes no
+        // member checked nothing, and vouches for nothing: an SFV whose
+        // entries name none of the job's files leaves them as they are.
+        let vouches =
+            |set: &SetSummary| set.vouched() && job.writer().covers_some(job.tree(), set.node);
         let described = |node: NodeId, member: MemberId| {
             let covers = |set: NodeId| job.writer().covers(job.tree(), set, member);
             if unruled(node)
@@ -418,9 +422,9 @@ pub fn delivery_of(job: &GraphJob, posted: Posted<'_>) -> (Delivery, Option<Fail
                 return Described::Unrepaired;
             }
             let mut sets = summary.sets.iter().filter(|set| set.namespace == node);
-            if sets.clone().any(|set| set.vouched() && covers(set.node)) {
+            if sets.clone().any(|set| vouches(set) && covers(set.node)) {
                 Described::Vouched
-            } else if sets.clone().any(SetSummary::vouched) && !sets.any(|set| covers(set.node)) {
+            } else if sets.clone().any(vouches) && !sets.any(|set| covers(set.node)) {
                 Described::Unchecked
             } else {
                 Described::Otherwise

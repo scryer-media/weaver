@@ -1208,6 +1208,10 @@ impl Recovery for Par3 {
         self.covered.contains(&member)
     }
 
+    fn covers_some(&self) -> bool {
+        !self.covered.is_empty()
+    }
+
     fn feed(&mut self, member: MemberId, segments: &[Segment]) {
         if self.covers(member) && !self.input.matches(member, segments) {
             self.last = None;
