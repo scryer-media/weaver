@@ -2240,6 +2240,15 @@ pub fn drain_job_events(
 }
 
 pub async fn pump_pipeline_runtime_queues(pipeline: &mut Pipeline) {
+    pump_pipeline_runtime_work(pipeline).await;
+    settle_failed_releases(pipeline).await;
+}
+
+// The runtime queues settle up to the failed jobs' releases: completion
+// checks, objects back from their work, and moves to the complete folder.
+// A job whose failure starts here may still wait for its mail in
+// [`settle_failed_releases`].
+pub async fn pump_pipeline_runtime_work(pipeline: &mut Pipeline) {
     pipeline.pump_decode_queue();
     while let Some(queued_job) = pipeline.pending_completion_checks.pop_front() {
         pipeline.check_job_completion(queued_job).await;
@@ -2257,7 +2266,6 @@ pub async fn pump_pipeline_runtime_queues(pipeline: &mut Pipeline) {
         pipeline.pump_decode_queue();
     }
     settle_inflight_moves(pipeline).await;
-    settle_failed_releases(pipeline).await;
 }
 
 // Hands the actor every failed job's working-directory release in flight,

@@ -23,6 +23,7 @@ mod pipeline {
             mod download_summary;
             mod embedded;
             mod encrypted_hex;
+            mod gap_hex;
             mod pairings;
             mod password;
             mod rar_rev;
