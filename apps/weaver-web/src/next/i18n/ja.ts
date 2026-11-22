@@ -2205,7 +2205,7 @@ export const nextJa: LocaleDictionary = {
   "next.torrent.reannounceIn": "次のアナウンスまで",
   "next.torrent.lastSeenComplete": "最後に完全な状態を確認",
   "next.torrent.pieces": "ピース",
-  "next.torrent.piecesValue": "{{count}} × {{size}} ({{have}} 取得済み)",
+  "next.torrent.piecesValue": "{{have}}/{{count}} × {{size}}",
   "next.torrent.createdBy": "作成者",
   "next.torrent.addedOn": "追加日時",
   "next.torrent.completedOn": "完了日時",

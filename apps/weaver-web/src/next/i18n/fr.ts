@@ -2205,7 +2205,7 @@ export const nextFr: LocaleDictionary = {
   "next.torrent.reannounceIn": "Réannonce dans",
   "next.torrent.lastSeenComplete": "Vu complet pour la dernière fois",
   "next.torrent.pieces": "Morceaux",
-  "next.torrent.piecesValue": "{{count}} × {{size}} ({{have}} reçus)",
+  "next.torrent.piecesValue": "{{have}}/{{count}} × {{size}}",
   "next.torrent.createdBy": "Créé par",
   "next.torrent.addedOn": "Ajouté le",
   "next.torrent.completedOn": "Terminé le",

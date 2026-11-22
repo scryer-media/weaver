@@ -2213,7 +2213,7 @@ export const nextEn: LocaleDictionary = {
   "next.torrent.reannounceIn": "Reannounce in",
   "next.torrent.lastSeenComplete": "Last seen complete",
   "next.torrent.pieces": "Pieces",
-  "next.torrent.piecesValue": "{{count}} × {{size}} (have {{have}})",
+  "next.torrent.piecesValue": "{{have}}/{{count}} × {{size}}",
   "next.torrent.createdBy": "Created by",
   "next.torrent.addedOn": "Added on",
   "next.torrent.completedOn": "Completed on",

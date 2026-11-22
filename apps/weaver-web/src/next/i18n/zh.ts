@@ -2205,7 +2205,7 @@ export const nextZh: LocaleDictionary = {
   "next.torrent.reannounceIn": "下次汇报",
   "next.torrent.lastSeenComplete": "最后完整可见",
   "next.torrent.pieces": "分块",
-  "next.torrent.piecesValue": "{{count}} × {{size}}（已有 {{have}}）",
+  "next.torrent.piecesValue": "{{have}}/{{count}} × {{size}}",
   "next.torrent.createdBy": "创建工具",
   "next.torrent.addedOn": "添加时间",
   "next.torrent.completedOn": "完成时间",

@@ -164,7 +164,7 @@ test("the transfer section reads as qBittorrent's, with the swarm's totals and a
 
 test("the information section names the pieces, the maker and where the torrent is", () => {
   const values = byLabel(informationFields(t, torrent()));
-  assert.equal(values["Pieces"], `16 × ${formatSize(256 * 1024)} (have 8)`);
+  assert.equal(values["Pieces"], `8/16 × ${formatSize(256 * 1024)}`);
   assert.equal(values["Created by"], "maker 1.0");
   assert.equal(values["Created on"], EM_DASH);
   assert.equal(values["Comment"], EM_DASH);

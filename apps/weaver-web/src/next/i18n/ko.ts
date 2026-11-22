@@ -2205,7 +2205,7 @@ export const nextKo: LocaleDictionary = {
   "next.torrent.reannounceIn": "다음 알림까지",
   "next.torrent.lastSeenComplete": "마지막 완전 확인",
   "next.torrent.pieces": "조각",
-  "next.torrent.piecesValue": "{{count}} × {{size}} ({{have}}개 보유)",
+  "next.torrent.piecesValue": "{{have}}/{{count}} × {{size}}",
   "next.torrent.createdBy": "만든 프로그램",
   "next.torrent.addedOn": "추가 시각",
   "next.torrent.completedOn": "완료 시각",
