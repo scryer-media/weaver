@@ -3,7 +3,7 @@
 
 import { useState, type ReactNode } from "react";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
-import { NumberField, Segmented, Toggle, UnitStrip } from "../../components/controls";
+import { CheckBox, NumberField, Segmented, Toggle, UnitStrip } from "../../components/controls";
 import { LimitControl } from "../../features/networking/limits";
 import { testIds } from "../../testids";
 import type { FieldSpec } from "./framework";
@@ -271,11 +271,6 @@ const MODES: { value: SeedingMode; label: string }[] = [
   { value: "ALL", label: "next.seeding.modeAll" },
 ];
 
-const COUNTINGS: { value: SeedTimeCounting; label: string }[] = [
-  { value: "CUMULATIVE", label: "next.seeding.countingCumulative" },
-  { value: "CONSECUTIVE", label: "next.seeding.countingConsecutive" },
-];
-
 const ACTIONS: { value: SeedingAction; label: string }[] = [
   { value: "STOP", label: "next.seeding.actionStop" },
   { value: "REMOVE", label: "next.seeding.actionRemove" },
@@ -384,9 +379,38 @@ const durationField = (label: string, fieldId: string) => (value: number, onValu
 );
 
 /**
+ * Whether the seed-time goal counts only the current unbroken run: checked is
+ * Consecutive. Unchecked is Cumulative once touched; a level that has not set
+ * the counting keeps inheriting it.
+ */
+function ContinuousBox({
+  counting,
+  onChange,
+  testId,
+}: {
+  counting: Leaf<SeedTimeCounting>;
+  onChange: (next: Leaf<SeedTimeCounting>) => void;
+  testId: string;
+}) {
+  const t = useTranslate();
+  const label = t("next.seeding.continuous");
+  return (
+    <label className="flex items-center gap-[6px] text-[12px] text-wv-muted">
+      <CheckBox
+        label={label}
+        testId={testId}
+        checked={leafValue(counting) === "CONSECUTIVE"}
+        onChange={(continuous) => onChange(leafSet(continuous ? "CONSECUTIVE" : "CUMULATIVE"))}
+      />
+      <span>{label}</span>
+    </label>
+  );
+}
+
+/**
  * The terms' fields: their three goals, whether any or all of them end
  * seeding, and what is done then. `inherits` is true below the global level,
- * where each term can inherit.
+ * where each term but the mode can inherit.
  */
 export function seedingFields(
   t: Translate,
@@ -413,6 +437,14 @@ export function seedingFields(
   const seedTimeLabel = t("next.seeding.seedTimeGoal");
   const inactiveLabel = t("next.seeding.inactiveGoal");
   const inherit = { value: INHERIT_CHOICE, label: t("next.seeding.leafInherit") };
+  // The counting rides on the seed-time goal, shown while this level sets it.
+  const continuous = (
+    <ContinuousBox
+      counting={policy.seedTimeCounting}
+      onChange={(seedTimeCounting) => patch({ seedTimeCounting })}
+      testId={testIds.field(`${prefix}-seedTimeCounting`)}
+    />
+  );
   const choice = <T extends string>(leaf: Leaf<T>, fallback: T) =>
     leaf.state === "SET" && leaf.value !== null ? leaf.value : options.inherits ? INHERIT_CHOICE : fallback;
   const fromChoice = <T extends string>(value: string): Leaf<T> => (value === INHERIT_CHOICE ? INHERIT : leafSet(value as T));
@@ -454,17 +486,25 @@ export function seedingFields(
           offLabel={noGoal}
           fallback={1440}
           onChange={(seedTimeGoalMinutes) => patch({ seedTimeGoalMinutes })}
-          input={durationField(seedTimeLabel, seedTimeId)}
+          input={(value, onValue) => (
+            <>
+              {durationField(seedTimeLabel, seedTimeId)(value, onValue)}
+              {continuous}
+            </>
+          )}
         />
       ) : (
-        <DurationGoalControl
-          label={seedTimeLabel}
-          fieldId={seedTimeId}
-          value={globalGoal(policy.seedTimeGoalMinutes)}
-          offLabel={noGoal}
-          onChange={(minutes) => patch({ seedTimeGoalMinutes: fromGlobal(minutes) })}
-          fallback={1440}
-        />
+        <div className="flex flex-wrap items-center gap-[10px]">
+          <DurationGoalControl
+            label={seedTimeLabel}
+            fieldId={seedTimeId}
+            value={globalGoal(policy.seedTimeGoalMinutes)}
+            offLabel={noGoal}
+            onChange={(minutes) => patch({ seedTimeGoalMinutes: fromGlobal(minutes) })}
+            fallback={1440}
+          />
+          {globalGoal(policy.seedTimeGoalMinutes) === null ? null : continuous}
+        </div>
       ),
     ),
     goal(
@@ -491,31 +531,16 @@ export function seedingFields(
         />
       ),
     ),
+    // The mode is never inherited: each level holds its own, Any unless set,
+    // and the most specific level that sets a goal decides with it.
     {
       id: `${prefix}-mode`,
       label: t("next.seeding.mode"),
       control: {
         kind: "segmented",
-        value: choice(policy.mode, "ANY"),
-        options: [
-          ...(options.inherits ? [inherit] : []),
-          ...MODES.map((option) => ({ ...option, label: t(option.label) })),
-        ],
-        onChange: (mode) => patch({ mode: fromChoice<SeedingMode>(mode) }),
-      },
-    },
-    {
-      id: `${prefix}-seedTimeCounting`,
-      label: t("next.seeding.seedTimeCounting"),
-      keywords: "seed seeding time run",
-      control: {
-        kind: "segmented",
-        value: choice(policy.seedTimeCounting, "CUMULATIVE"),
-        options: [
-          ...(options.inherits ? [inherit] : []),
-          ...COUNTINGS.map((option) => ({ ...option, label: t(option.label) })),
-        ],
-        onChange: (counting) => patch({ seedTimeCounting: fromChoice<SeedTimeCounting>(counting) }),
+        value: leafValue(policy.mode) ?? "ANY",
+        options: MODES.map((option) => ({ ...option, label: t(option.label) })),
+        onChange: (mode) => patch({ mode: leafSet(mode as SeedingMode) }),
       },
     },
     {
@@ -534,7 +559,7 @@ export function seedingFields(
   ];
 }
 
-// The mode or action choice that inherits.
+// The action choice that inherits.
 const INHERIT_CHOICE = "INHERIT";
 
 /** The rate a cap starts from when it is first set: 10 MB/s. */
@@ -590,7 +615,8 @@ export function globalUploadCapField(t: Translate, cap: number | null, onChange:
 /**
  * What each seeding field and the upload limit read at the global level, as
  * text by the field ids `seedingFields` and `uploadCapField` give under
- * `prefix`: what a level that inherits them falls back to.
+ * `prefix`: what a level that inherits them falls back to. The mode is never
+ * inherited, so it has no entry.
  */
 export function seedingEffectiveText(
   t: Translate,
@@ -610,8 +636,6 @@ export function seedingEffectiveText(
     [`${prefix}-ratioGoal`]: goal(policy.ratioGoal, (ratio) => ratio.toFixed(2)),
     [`${prefix}-seedTimeGoalMinutes`]: goal(policy.seedTimeGoalMinutes, (minutes) => durationText(t, minutes)),
     [`${prefix}-inactiveGoalMinutes`]: goal(policy.inactiveGoalMinutes, (minutes) => durationText(t, minutes)),
-    [`${prefix}-mode`]: pick(policy.mode, MODES),
-    [`${prefix}-seedTimeCounting`]: pick(policy.seedTimeCounting, COUNTINGS),
     [`${prefix}-action`]: pick(policy.action, ACTIONS),
     [`${capPrefix}-uploadCap`]:
       uploadCap === null ? t("next.networking.unlimited") : `${Math.round((uploadCap / (1024 * 1024)) * 10) / 10} MB/s`,

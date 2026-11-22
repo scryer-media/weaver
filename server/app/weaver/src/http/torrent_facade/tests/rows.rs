@@ -1097,7 +1097,7 @@ async fn edits_and_removals_of_many_torrents_are_one_unit_each() {
                         .set_location(job_id, "/weaver-nowhere".to_owned())
                         .await
                 }
-                _ => alone.remove(job_id, false, true).await,
+                _ => alone.remove(job_id, false).await,
             };
             match done {
                 Ok(()) | Err(ActionError::NotFound(_)) => {}

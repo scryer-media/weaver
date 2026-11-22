@@ -159,6 +159,8 @@ export interface TorrentSummaryData {
   forced: boolean;
   ratio: number;
   uploadBps: number;
+  /** What is left of its seeding goal; null once met or with no goal. */
+  seedingGoalLeft: string | null;
 }
 
 /**
@@ -285,23 +287,12 @@ export interface TorrentActionError {
   graphQLErrors: readonly { message: string; extensions?: Record<string, unknown> }[];
 }
 
-/**
- * How a remove went: done, refused because the torrent has a seeding goal
- * still to meet (asked again only once the operator confirms), or failed.
- * The message is the daemon's own.
- */
-export type RemoveOutcome =
-  | { kind: "removed" }
-  | { kind: "unmetGoal"; message: string }
-  | { kind: "failed"; message: string };
+/** How a remove went: done, or failed with the daemon's own message. */
+export type RemoveOutcome = { kind: "removed" } | { kind: "failed"; message: string };
 
 export function removeOutcome(error: TorrentActionError | undefined): RemoveOutcome {
   if (!error) return { kind: "removed" };
-  const refusal = error.graphQLErrors[0];
-  const message = refusal?.message ?? error.message;
-  return refusal?.extensions?.code === "SEEDING_GOAL_UNMET"
-    ? { kind: "unmetGoal", message }
-    : { kind: "failed", message };
+  return { kind: "failed", message: error.graphQLErrors[0]?.message ?? error.message };
 }
 
 /** The daemon's own text for a failed torrent action. */

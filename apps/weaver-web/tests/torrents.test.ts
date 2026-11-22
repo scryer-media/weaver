@@ -28,15 +28,11 @@ import { nextPt } from "../src/next/i18n/pt.ts";
 import { nextZh } from "../src/next/i18n/zh.ts";
 import { englishTranslate as t } from "./english-translate.ts";
 
-test("only a refusal over an unmet seeding goal asks for a second confirm", () => {
+test("a remove either removed or failed with the daemon's words", () => {
   assert.deepEqual(removeOutcome(undefined), { kind: "removed" });
   const refusal = (code: string, message: string) => ({
     message: `[GraphQL] ${message}`,
     graphQLErrors: [{ message, extensions: { code } }],
-  });
-  assert.deepEqual(removeOutcome(refusal("SEEDING_GOAL_UNMET", "ratio 0.40 of 1.00")), {
-    kind: "unmetGoal",
-    message: "ratio 0.40 of 1.00",
   });
   assert.deepEqual(removeOutcome(refusal("NOT_FOUND", "no such torrent")), {
     kind: "failed",
@@ -99,6 +95,7 @@ const torrent = (overrides: Partial<TorrentData> = {}): TorrentData => ({
   completedAtMs: null,
   savePath: "/complete/set",
   seedingLeft: null,
+  seedingGoalLeft: null,
   seedingOverride: null,
   seedingPolicy: {
     ratioGoal: null,

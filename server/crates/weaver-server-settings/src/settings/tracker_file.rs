@@ -226,34 +226,37 @@ impl TrackerFile {
                 .or(*value);
         }
         // Each seeding leaf the file recommends is taken while the rule's
-        // leaf is still what the last file recommended.
-        if let Some(seeding) = recommended.seeding {
-            let before = before.seeding.unwrap_or_default();
-            let mut policy = applied.seeding.unwrap_or_default();
-            recommend_leaf(
+        // leaf is still what the files recommended. A leaf this file leaves
+        // carries the last recommendation forward, so a revision that skips
+        // a goal does not make the goal look set by hand to the next one.
+        let before_seeding = before.seeding.unwrap_or_default();
+        let seeding = recommended.seeding.unwrap_or_default();
+        let mut policy = applied.seeding.unwrap_or_default();
+        let carried = SeedingTerms {
+            ratio_goal: recommend_leaf(
                 &mut policy.ratio_goal,
                 seeding.ratio_goal,
-                before.ratio_goal,
-            );
-            recommend_leaf(
+                before_seeding.ratio_goal,
+            ),
+            seed_time_goal_minutes: recommend_leaf(
                 &mut policy.seed_time_goal_minutes,
                 seeding.seed_time_goal_minutes,
-                before.seed_time_goal_minutes,
-            );
-            recommend_leaf(
+                before_seeding.seed_time_goal_minutes,
+            ),
+            inactive_goal_minutes: recommend_leaf(
                 &mut policy.inactive_goal_minutes,
                 seeding.inactive_goal_minutes,
-                before.inactive_goal_minutes,
-            );
-            recommend_leaf(&mut policy.mode, seeding.mode, before.mode);
-            recommend_leaf(&mut policy.action, seeding.action, before.action);
-            recommend_leaf(
+                before_seeding.inactive_goal_minutes,
+            ),
+            mode: recommend_leaf(&mut policy.mode, seeding.mode, before_seeding.mode),
+            action: recommend_leaf(&mut policy.action, seeding.action, before_seeding.action),
+            seed_time_counting: recommend_leaf(
                 &mut policy.seed_time_counting,
                 seeding.seed_time_counting,
-                before.seed_time_counting,
-            );
-            applied.seeding = SeedingPolicy::kept(Some(policy));
-        }
+                before_seeding.seed_time_counting,
+            ),
+        };
+        applied.seeding = SeedingPolicy::kept(Some(policy));
         if let Some(ssl) = &self.ssl {
             applied.ssl = Some(ssl.clone());
         }
@@ -271,7 +274,10 @@ impl TrackerFile {
             revision: self.revision.clone(),
             imported_at_ms: now_ms,
             locked,
-            recommended: *recommended,
+            recommended: Terms {
+                seeding: (carried != SeedingTerms::default()).then_some(carried),
+                ..*recommended
+            },
         });
         applied
     }
@@ -287,12 +293,24 @@ fn recommend<T: PartialEq + Copy>(
     recommended.filter(|_| current == before)
 }
 
-// A recommended leaf replaces `leaf` while `leaf` is still what the last file
-// recommended.
-fn recommend_leaf<T: PartialEq + Copy>(leaf: &mut Leaf<T>, recommended: Leaf<T>, before: Leaf<T>) {
-    if !recommended.is_inherit() && *leaf == before {
-        *leaf = recommended;
+// A recommended leaf replaces `leaf` while `leaf` is still what the files
+// recommended. Returns what the binding records as recommended for the leaf
+// now: this file's recommendation when taken, the last one when the file
+// leaves the leaf and the user did not change it, and nothing once the user
+// set it by hand.
+fn recommend_leaf<T: PartialEq + Copy>(
+    leaf: &mut Leaf<T>,
+    recommended: Leaf<T>,
+    before: Leaf<T>,
+) -> Leaf<T> {
+    if *leaf != before {
+        return Leaf::Inherit;
     }
+    if !recommended.is_inherit() {
+        *leaf = recommended;
+        return recommended;
+    }
+    before
 }
 
 // Refuses a change `changed` makes to a field the tracker file bound to

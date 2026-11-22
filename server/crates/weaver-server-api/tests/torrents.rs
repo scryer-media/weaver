@@ -420,7 +420,7 @@ async fn an_unwanted_extension_is_left_out_not_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn removing_a_private_torrent_short_of_its_goal_needs_confirmation() {
+async fn removing_a_private_torrent_short_of_its_goal_is_never_refused() {
     let rig = rig().await;
     let response = rig
         .execute(&submit(
@@ -432,14 +432,18 @@ async fn removing_a_private_torrent_short_of_its_goal_needs_confirmation() {
     let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
         .as_u64()
         .unwrap();
-    let refused = rig
-        .execute(&format!("mutation {{ removeTorrent(id: {id}) }}"))
+    // The page names what is left before it asks; the server takes the
+    // removal as asked.
+    let left = rig
+        .execute(&format!("{{ torrent(id: {id}) {{ seedingGoalLeft }} }}"))
         .await;
-    assert_eq!(code(&refused).as_deref(), Some("SEEDING_GOAL_UNMET"));
+    assert!(left.errors.is_empty(), "{:?}", left.errors);
+    assert_eq!(
+        left.data.into_json().unwrap()["torrent"]["seedingGoalLeft"],
+        "ratio 0.00 of 1.00"
+    );
     let removed = rig
-        .execute(&format!(
-            "mutation {{ removeTorrent(id: {id}, confirmUnmetGoal: true) }}"
-        ))
+        .execute(&format!("mutation {{ removeTorrent(id: {id}) }}"))
         .await;
     assert!(removed.errors.is_empty(), "{:?}", removed.errors);
     let history = rig.harness.db.get_job_history(id).unwrap().unwrap();
@@ -577,7 +581,9 @@ async fn a_torrent_reads_its_leechers_file_progress_and_seeding_policy() {
     );
     assert_eq!(torrent["seedingPolicy"]["ratioGoal"], 2.0);
     assert_eq!(torrent["seedingPolicy"]["levels"]["ratioGoal"], "TORRENT");
-    assert_eq!(torrent["seedingPolicy"]["levels"]["mode"], "GLOBAL");
+    // The mode is never inherited: the torrent sets a goal, so its own
+    // mode holds.
+    assert_eq!(torrent["seedingPolicy"]["levels"]["mode"], "TORRENT");
 
     // A goal switched off at the torrent drops the one its category sets.
     let off = id(&read(submit(
@@ -755,9 +761,7 @@ async fn torrent_updates_push_what_the_service_publishes() {
     }
 
     let removed = rig
-        .execute(&format!(
-            "mutation {{ removeTorrent(id: {id}, confirmUnmetGoal: true) }}"
-        ))
+        .execute(&format!("mutation {{ removeTorrent(id: {id}) }}"))
         .await;
     assert!(removed.errors.is_empty(), "{:?}", removed.errors);
     loop {
@@ -1161,6 +1165,55 @@ async fn a_tracker_rule_sets_the_goals_of_the_torrents_announcing_to_its_hosts()
         read("{ trackerRules { id } }".into()).await["trackerRules"],
         serde_json::json!([])
     );
+}
+
+// After each save of a tracker rule the rules in force are the saved ones:
+// an edit that leaves the routes alone, one that gives the rule its own
+// route, and one that takes it away.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_rules_in_force_are_the_ones_each_save_leaves() {
+    let rig = rig().await;
+    let rig = &rig;
+    let read = |query: String| async move {
+        let response = rig.execute(&query).await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        response.data.into_json().unwrap()
+    };
+    let rule = |id: &str, ratio: u32, route: bool| {
+        format!(
+            r#"mutation {{ saveTrackerRule({id} input: {{
+                hostPattern: "*.tracker.test", torrentRoute: {route},
+                seeding: {{ ratioGoal: {{ state: SET, value: {ratio} }} }}
+            }}) {{ id }} }}"#
+        )
+    };
+    let rule_id = read(rule("", 3, false)).await["saveTrackerRule"][0]["id"]
+        .as_u64()
+        .unwrap();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(metainfo("ruled.mkv", 3000, false))
+        .unwrap();
+    let mut announcing = b"d".to_vec();
+    bstr(&mut announcing, b"announce");
+    bstr(&mut announcing, b"http://a.tracker.test/announce");
+    announcing.extend_from_slice(&bytes[1..]);
+    let announcing = base64::engine::general_purpose::STANDARD.encode(announcing);
+    let id = read(submit(&announcing, "")).await["submitTorrent"]["id"]
+        .as_u64()
+        .unwrap();
+    let ratio = || async move {
+        read(format!(
+            "{{ torrent(id: {id}) {{ seedingPolicy {{ ratioGoal }} }} }}"
+        ))
+        .await["torrent"]["seedingPolicy"]["ratioGoal"]
+            .clone()
+    };
+    assert_eq!(ratio().await, 3.0);
+    let edit = format!("id: {rule_id},");
+    for (goal, route) in [(5, false), (6, true), (7, true), (8, false)] {
+        read(rule(&edit, goal, route)).await;
+        assert_eq!(ratio().await, f64::from(goal), "route {route}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

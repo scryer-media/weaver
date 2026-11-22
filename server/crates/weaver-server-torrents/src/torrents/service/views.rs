@@ -661,24 +661,27 @@ impl TorrentService {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let [active_ms, finished_ms, consecutive_ms] = reading.timed.parts();
         let clock_runs = matches!(reading.engine, Engine::Live { .. });
-        let (state, why) = status::project(&torrent.observed(reading.engine));
+        let counters = &reading.counters;
+        let record = &torrent.record;
+        let total = torrent.total;
+        let have = on_disk(torrent.layout.as_deref(), &reading.file_have);
+        let rules = self.rules();
+        let rule = torrent.rule(&rules);
+        let (policy, seeding_levels) = settings.seeding(record, rule);
+        let mut observed = torrent.observed(reading.engine.clone());
+        observed.goal_met =
+            status::stopped_goal_met(&policy, counters, have, now, record.wound_down());
+        let (state, why) = status::project(&observed);
         let status::WhyParts {
             detail,
             stated,
             route_reason,
         } = status::Why::split(why);
-        let counters = &reading.counters;
-        let record = &torrent.record;
-        let total = torrent.total;
-        let have = on_disk(torrent.layout.as_deref(), &reading.file_have);
         let (wanted, wanted_have) = wanted(
             torrent.layout.as_deref(),
             &torrent.levels,
             &reading.file_have,
         );
-        let rules = self.rules();
-        let rule = torrent.rule(&rules);
-        let (policy, seeding_levels) = settings.seeding(record, rule);
         let swarm = status::swarm(&torrent.announces(), now);
         // The time the torrent has run to this reading, the part of a
         // second included, and its averages over that same time.

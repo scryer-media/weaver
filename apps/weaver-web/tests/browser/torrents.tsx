@@ -4,7 +4,7 @@
 import { useState } from "react";
 import { createRoot } from "react-dom/client";
 import { MemoryRouter } from "react-router";
-import { Client, CombinedError, Provider, useSubscription } from "urql";
+import { Client, Provider, useSubscription } from "urql";
 import { empty, fromValue, make, mergeMap, pipe } from "wonka";
 import { TORRENT_UPDATES_SUBSCRIPTION } from "@/graphql/queries";
 import { TranslateContext } from "@/lib/context/translate-context";
@@ -29,10 +29,8 @@ const t = (key: string, values?: Record<string, unknown>) =>
   Object.entries(values ?? {}).reduce((text, [name, value]) => text.replaceAll(`{{${name}}}`, String(value)), dictionary[key] ?? key);
 const status = document.getElementById("status")!;
 
-// Every mutation the page sends, and the refusals the daemon gives: a duplicate magnet, a file it cannot read, and a remove whose goal is unmet.
+// Every mutation the page sends. A remove is never refused.
 const sent: { name: string; variables: Record<string, unknown> }[] = [];
-const refusal = (message: string, code: string) =>
-  new CombinedError({ graphQLErrors: [{ message, extensions: { code } }] });
 
 // The torrent the files screen follows. Each mutation changes what the daemon will hold; the change is read,
 // by a follower new or old, only once the test publishes it, so the page can show nothing but what it was sent.
@@ -76,13 +74,7 @@ const client = new Client({ url: "http://fixture.invalid/graphql", exchanges: [(
       return () => followers.delete(follower);
     });
   }
-  if (name === "RemoveTorrent") {
-    return fromValue(
-      variables.confirmUnmetGoal
-        ? { operation, data: { removeTorrent: true } }
-        : { operation, error: refusal("Ratio 0.40 of 1.00 goal.", "SEEDING_GOAL_UNMET") },
-    );
-  }
+  if (name === "RemoveTorrent") return fromValue({ operation, data: { removeTorrent: true } });
   const answer = name === "Categories" ? { categories: [{ id: 1, name: "movies", destDir: null, aliases: "", seeding: null, torrentRoute: false }] } : {};
   return fromValue({ operation, data: answer });
 }))] });
@@ -126,12 +118,14 @@ const job = (rest: Partial<JobData>): JobData => ({
   phaseProgress: [], failedBytes: 0, health: 1000, hasPassword: false, category: null, metadata: [], ...rest,
 });
 
-function Remove() {
+// A torrent short of its goal, with what is left as its row reads it, or one with none left.
+function Remove({ goalLeft }: { goalLeft: string | null }) {
   const [open, setOpen] = useState(true);
   return (
     <TorrentRemoveDialog
       id={open ? 5 : null}
       name="fixture torrent"
+      goalLeft={goalLeft}
       onRemoved={(id) => { setOpen(false); status.textContent = `removed ${id}`; }}
       onFailed={(message) => { setOpen(false); status.textContent = `failed ${message}`; }}
       onDismiss={() => { setOpen(false); status.textContent = "dismissed"; }}
@@ -192,7 +186,7 @@ const torrent = (id: number, level: SettingLevel, override: SeedingPolicyData | 
   peers: 9, seeds: 3, leechers: 6, maxPeers: 50, swarmSeeds: 12, swarmLeechers: 20, reannounceSeconds: null,
   activeSeconds: 0, seedingSeconds: 0, consecutiveSeedingSeconds: 0, downloadAvgBps: 0, uploadAvgBps: 0, wastedBytes: 0, lastSeenCompleteMs: null,
   pieceCount: null, pieceSize: null, piecesHave: null, createdBy: null, createdAtMs: null, comment: null,
-  addedAtMs: 0, completedAtMs: null, savePath: null, unpack: false, unpackOverride: null, seedingLeft: null, route: null,
+  addedAtMs: 0, completedAtMs: null, savePath: null, unpack: false, unpackOverride: null, seedingLeft: null, seedingGoalLeft: null, route: null,
   seedingOverride: override,
   seedingPolicy: {
     ratioGoal: override?.ratioGoal.value ?? (level === "CATEGORY" ? 1.5 : 1),
@@ -264,7 +258,8 @@ function Fixture() {
     ].map((entry) => statusDetail(t, entry, null));
     return <ul aria-label="details">{details.map((detail, index) => <li key={index}>{detail}</li>)}</ul>;
   }
-  if (screen === "remove") return <Remove />;
+  if (screen === "remove") return <Remove goalLeft="ratio 0.40 of 1.00" />;
+  if (screen === "removeMet") return <Remove goalLeft={null} />;
   if (screen === "queue") return <Queue />;
   if (screen === "seeding") return <Seeding />;
   if (screen === "trackers" || screen === "privateTrackers") {

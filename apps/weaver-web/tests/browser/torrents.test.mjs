@@ -103,21 +103,28 @@ test("a file the daemon cannot read shows its refusal on its row", async () => {
   await page.close();
 });
 
-test("removing a torrent short of its seeding goal asks again, and only then confirms", async () => {
+test("removing a torrent short of its seeding goal asks again, naming what is left, and only then sends", async () => {
   const { page, errors } = await open("remove");
   const first = page.getByRole("dialog", { name: "Remove torrent", exact: true });
   await first.waitFor();
   await first.getByRole("checkbox", { name: "Also delete files", exact: true }).click();
   await first.getByRole("button", { name: "Remove", exact: true }).click();
   const second = page.getByRole("dialog", { name: "Seeding goal not met", exact: true });
-  await second.getByText("Ratio 0.40 of 1.00 goal.", { exact: true }).waitFor();
-  assert.deepEqual((await sent(page)).map((entry) => entry.variables), [{ id: 5, deleteFiles: true, confirmUnmetGoal: false }]);
+  await second.getByText("Its seeding goal is not met yet: ratio 0.40 of 1.00.", { exact: true }).waitFor();
+  assert.deepEqual(await sent(page), []);
   await second.getByRole("button", { name: "Remove anyway", exact: true }).click();
   await page.locator("#status").filter({ hasText: /^removed 5$/ }).waitFor();
-  assert.deepEqual((await sent(page)).map((entry) => entry.variables), [
-    { id: 5, deleteFiles: true, confirmUnmetGoal: false },
-    { id: 5, deleteFiles: true, confirmUnmetGoal: true },
-  ]);
+  assert.deepEqual((await sent(page)).map((entry) => entry.variables), [{ id: 5, deleteFiles: true }]);
+  assert.equal(errors.length, 0, errors.join("\n"));
+  await page.close();
+});
+
+test("removing a torrent with no goal left asks once", async () => {
+  const { page, errors } = await open("removeMet");
+  const first = page.getByRole("dialog", { name: "Remove torrent", exact: true });
+  await first.getByRole("button", { name: "Remove", exact: true }).click();
+  await page.locator("#status").filter({ hasText: /^removed 5$/ }).waitFor();
+  assert.deepEqual((await sent(page)).map((entry) => entry.variables), [{ id: 5, deleteFiles: false }]);
   assert.equal(errors.length, 0, errors.join("\n"));
   await page.close();
 });
@@ -129,7 +136,7 @@ test("dismissing the second confirm sends nothing more", async () => {
   const second = page.getByRole("dialog", { name: "Seeding goal not met", exact: true });
   await second.getByRole("button", { name: "Cancel", exact: true }).click();
   await page.locator("#status").filter({ hasText: /^dismissed$/ }).waitFor();
-  assert.deepEqual((await sent(page)).map((entry) => entry.variables), [{ id: 5, deleteFiles: false, confirmUnmetGoal: false }]);
+  assert.deepEqual(await sent(page), []);
   assert.equal(errors.length, 0, errors.join("\n"));
   await page.close();
 });

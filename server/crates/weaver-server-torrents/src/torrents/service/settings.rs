@@ -93,7 +93,7 @@ impl std::ops::Deref for Categories {
 ///
 /// | setting                  | torrent | rule | category | global          |
 /// |--------------------------|---------|------|----------|-----------------|
-/// | seeding goals, mode, act | yes     | yes  | yes      | yes             |
+/// | seeding goals, act (3)   | yes     | yes  | yes      | yes             |
 /// | upload cap               | no (1)  | yes  | yes      | yes             |
 /// | unpack                   | yes     | yes  | yes      | yes             |
 /// | DHT, PEX, LSD            | no      | yes  | no       | the session's   |
@@ -107,6 +107,9 @@ impl std::ops::Deref for Categories {
 /// (2) Each of a rule's four transport fields over the global one, the four
 /// then locked as a global save locks them. They govern its torrents'
 /// outgoing dials; what a session listens on is the global setting's.
+///
+/// (3) Each level also holds its own goal mode, which is never inherited:
+/// see [`TorrentSettings::seeding`].
 ///
 /// A tracker rule alone names a client, an SSL identity, whether its
 /// torrents start forced, and whether the schedule may pause them; those
@@ -133,7 +136,6 @@ macro_rules! seeding_field {
 pub const RATIO_GOAL: Field<f32> = seeding_field!(ratio_goal);
 pub const SEED_TIME_GOAL: Field<u32> = seeding_field!(seed_time_goal_minutes);
 pub const INACTIVE_GOAL: Field<u32> = seeding_field!(inactive_goal_minutes);
-pub const SEEDING_MODE: Field<SeedingGoalMode> = seeding_field!(mode);
 pub const SEEDING_ACTION: Field<SeedingAction> = seeding_field!(action);
 pub const SEED_TIME_COUNTING: Field<SeedTimeCounting> = seeding_field!(seed_time_counting);
 
@@ -252,33 +254,53 @@ impl TorrentSettings {
     }
 
     /// The seeding terms `record` is held to under `rule`, each resolved
-    /// over its levels, and the level each comes from.
+    /// over its levels, and the level each comes from. A rule that sets a
+    /// goal takes only what is stricter from the levels below it
+    /// ([`Levels::goal`]), under the rule's own mode. The goal mode is
+    /// never inherited: it is the own mode of the most specific level that
+    /// sets a goal ([`SeedingPolicy::mode_in_force`]). Everything that
+    /// shows or applies a torrent's terms reads them here.
     pub fn seeding(
         &self,
         record: &TorrentRecord,
         rule: Option<&TrackerRule>,
     ) -> (Seeding, SeedingLevels) {
-        let ratio = self.of_torrent(&RATIO_GOAL, record, rule);
-        let seed_time = self.of_torrent(&SEED_TIME_GOAL, record, rule);
-        let inactive = self.of_torrent(&INACTIVE_GOAL, record, rule);
-        let mode = self.of_torrent(&SEEDING_MODE, record, rule);
         let action = self.of_torrent(&SEEDING_ACTION, record, rule);
         let counting = self.of_torrent(&SEED_TIME_COUNTING, record, rule);
         let cap = self.of_torrent(&UPLOAD_CAP, record, rule);
+        let ruled = rule.and_then(|rule| rule.seeding);
+        let (in_force, mode_level) = SeedingPolicy::mode_in_force([
+            (Level::Torrent, record.policy_override),
+            (Level::TrackerRule, ruled),
+            (
+                Level::Category,
+                self.category(record.category_id)
+                    .and_then(|category| category.seeding),
+            ),
+            (Level::Global, self.seeding),
+        ]);
+        let rule_sets_goal = ruled.is_some_and(|policy| policy.sets_a_goal());
+        let all = ruled.is_some_and(|policy| policy.own_mode() == SeedingGoalMode::All);
+        let (ratio, ratio_level) =
+            self.of_torrent(&RATIO_GOAL, record, rule).goal(rule_sets_goal, all);
+        let (seed_time, seed_time_level) =
+            self.of_torrent(&SEED_TIME_GOAL, record, rule).goal(rule_sets_goal, all);
+        let (inactive, inactive_level) =
+            self.of_torrent(&INACTIVE_GOAL, record, rule).goal(rule_sets_goal, all);
         (
             Seeding {
-                ratio_goal: ratio.resolve(),
-                seed_time_goal_minutes: seed_time.resolve(),
-                inactive_goal_minutes: inactive.resolve(),
-                mode: mode.resolve().unwrap_or_default(),
+                ratio_goal: ratio,
+                seed_time_goal_minutes: seed_time,
+                inactive_goal_minutes: inactive,
+                mode: in_force,
                 action: action.resolve().unwrap_or_default(),
                 seed_time_counting: counting.resolve().unwrap_or_default(),
             },
             SeedingLevels {
-                ratio_goal: ratio.level(),
-                seed_time_goal_minutes: seed_time.level(),
-                inactive_goal_minutes: inactive.level(),
-                mode: mode.level(),
+                ratio_goal: ratio_level,
+                seed_time_goal_minutes: seed_time_level,
+                inactive_goal_minutes: inactive_level,
+                mode: mode_level,
                 action: action.level(),
                 seed_time_counting: counting.level(),
                 upload_cap: cap.level(),

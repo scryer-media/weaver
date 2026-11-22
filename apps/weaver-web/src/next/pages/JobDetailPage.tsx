@@ -1422,6 +1422,7 @@ function JobDetailContent() {
       <TorrentRemoveDialog
         id={removingTorrent ? job.id : null}
         name={job.displayTitle || job.name}
+        goalLeft={torrent?.seedingGoalLeft ?? null}
         onRemoved={() => {
           setRemovingTorrent(false);
           navigate("/");

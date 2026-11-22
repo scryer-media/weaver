@@ -1055,7 +1055,7 @@ async fn a_removal_while_restoring_waits_for_the_restore() {
     again.tick().await;
     let removing = {
         let again = again.clone();
-        tokio::spawn(async move { again.remove(job_id, false, true).await })
+        tokio::spawn(async move { again.remove(job_id, false).await })
     };
     drop(held);
     removing.await.unwrap().unwrap();
@@ -2019,7 +2019,7 @@ async fn the_service_answers_while_its_stored_torrents_load() {
             .await,
         Err(AddError::Duplicate(two))
     );
-    again.remove(three, false, true).await.unwrap();
+    again.remove(three, false).await.unwrap();
     assert_eq!(rig.db.get_torrent(three).unwrap(), None);
     let four = again
         .add(request(AddSource::Metainfo(plain("four", 4))))
@@ -2101,7 +2101,7 @@ async fn a_torrent_removed_under_a_read_of_it_is_not_brought_back() {
     // The asker: its read begun, and the torrent's rows read.
     let (reader, _) = again.reader().unwrap();
     let page = again.read_page(vec![gone]).await.unwrap();
-    again.remove(gone, false, true).await.unwrap();
+    again.remove(gone, false).await.unwrap();
     assert_eq!(rig.db.get_torrent(gone).unwrap(), None);
     again.hold_load(false);
     again.loaded().await;

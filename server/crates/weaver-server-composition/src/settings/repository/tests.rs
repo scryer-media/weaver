@@ -1018,6 +1018,92 @@ seeding = { ratio_goal = 3.0, seed_time_goal_minutes = 200 }",
     assert_eq!(db.list_tracker_rules().unwrap().len(), 2);
 }
 
+// A seeding goal a file recommended stays the file's to replace across a
+// revision that recommends something else, or no seeding at all: the next
+// recommendation replaces it, and a goal set by hand is never replaced.
+#[test]
+fn a_recommended_goal_is_replaced_across_a_revision_that_skips_it() {
+    let db = Database::open_in_memory().unwrap();
+    let revision = |text: &str| tracker_file(text, None);
+    let rule = db
+        .apply_tracker_file(
+            &revision(
+                "revision = \"1\"
+[recommended]
+seeding = { ratio_goal = 2.0, inactive_goal_minutes = 30 }",
+            ),
+            1,
+        )
+        .unwrap();
+    let edited = crate::settings::model::TrackerRule {
+        seeding: Some(crate::settings::SeedingPolicy {
+            inactive_goal_minutes: Leaf::Set(45),
+            ..rule.seeding.unwrap()
+        }),
+        bound: None,
+        ..rule.clone()
+    };
+    db.save_tracker_rule(Some(rule.id), edited, true, true, 2)
+        .unwrap()
+        .unwrap();
+    db.apply_tracker_file(
+        &revision(
+            "revision = \"2\"
+[recommended]
+seeding = { seed_time_goal_minutes = 100 }",
+        ),
+        3,
+    )
+    .unwrap();
+    db.apply_tracker_file(&revision("revision = \"3\""), 4).unwrap();
+    let last = db
+        .apply_tracker_file(
+            &revision(
+                "revision = \"4\"
+[recommended]
+seeding = { ratio_goal = 3.0, seed_time_goal_minutes = 200, inactive_goal_minutes = 60 }",
+            ),
+            5,
+        )
+        .unwrap();
+    let seeding = last.seeding.unwrap();
+    assert_eq!(seeding.ratio_goal, Leaf::Set(3.0), "skipped twice");
+    assert_eq!(seeding.seed_time_goal_minutes, Leaf::Set(200), "skipped once");
+    assert_eq!(seeding.inactive_goal_minutes, Leaf::Set(45), "set by hand");
+}
+
+// A file for a rule the user made by hand fills each goal the user left to
+// inherit and keeps each one the user set.
+#[test]
+fn a_tracker_file_fills_only_the_goals_a_hand_made_rule_leaves() {
+    let db = Database::open_in_memory().unwrap();
+    let made = crate::settings::model::TrackerRule {
+        host_pattern: "*.tracker.example".into(),
+        seeding: Some(crate::settings::SeedingPolicy {
+            ratio_goal: Leaf::Set(5.0),
+            ..crate::settings::SeedingPolicy::default()
+        }),
+        ..crate::settings::model::TrackerRule::default()
+    };
+    let rule = db
+        .save_tracker_rule(None, made, true, true, 1)
+        .unwrap()
+        .unwrap()
+        .remove(0);
+    let file = tracker_file(
+        "revision = \"1\"
+[recommended]
+seeding = { ratio_goal = 2.0, seed_time_goal_minutes = 100 }",
+        None,
+    );
+    assert_eq!(file.host_pattern, rule.host_pattern);
+    let applied = db.apply_tracker_file(&file, 2).unwrap();
+    assert_eq!(applied.id, rule.id);
+    let seeding = applied.seeding.unwrap();
+    assert_eq!(seeding.ratio_goal, Leaf::Set(5.0));
+    assert_eq!(seeding.seed_time_goal_minutes, Leaf::Set(100));
+}
+
 // Unbinding keeps every value and the identity and lets the user change
 // them; deleting a rule takes its binding with it.
 #[test]

@@ -257,7 +257,7 @@ async fn a_finished_torrent_unpacking_refused_seeds_on_and_its_removal_is_comple
     assert_ne!(view.state, TorrentState::Stopped);
     assert_eq!(view.unpack_end, Some(end));
 
-    again.remove(job_id, false, false).await.unwrap();
+    again.remove(job_id, false).await.unwrap();
     let history = rig.db.get_job_history(job_id.0).unwrap().unwrap();
     assert_eq!(
         (history.status.as_str(), history.error_message),
@@ -377,7 +377,7 @@ async fn unpacked_files_that_cannot_be_placed_are_kept_and_said_on_the_unpacking
     let again = service_on(&rig.db, rig.dir.path(), &rig.routes, env, set_clock());
     again.open().await.unwrap();
     assert_eq!(std::fs::read(work.join("small.txt")).unwrap(), SMALL_TXT);
-    again.remove(job_id, true, false).await.unwrap();
+    again.remove(job_id, true).await.unwrap();
     assert!(!work.exists());
     assert!(!dir.join("sample.mkv").exists());
     let history = rig.db.get_job_history(job_id.0).unwrap().unwrap();

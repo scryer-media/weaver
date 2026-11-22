@@ -64,7 +64,7 @@ async fn a_torrent_keeps_the_attributes_it_was_added_with_into_history() {
     assert_eq!(infos.len(), 1);
     assert_eq!(infos[0].metadata, metadata);
 
-    rig.service.remove(job_id, false, false).await.unwrap();
+    rig.service.remove(job_id, false).await.unwrap();
     let history = rig.db.get_job_history(job_id.0).unwrap().unwrap();
     let kept: Vec<(String, String)> =
         serde_json::from_str(history.metadata.as_deref().unwrap()).unwrap();
@@ -72,7 +72,7 @@ async fn a_torrent_keeps_the_attributes_it_was_added_with_into_history() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_private_torrent_with_an_unmet_goal_stays_unless_the_removal_confirms() {
+async fn a_private_torrent_short_of_its_goal_is_removed_when_asked_and_kept_from_a_cancel() {
     let rig = rig(set_clock());
     rig.service.open().await.unwrap();
     let private = metainfo("p", &[("p/a.bin", &[7; 2000])], 1024, true);
@@ -91,11 +91,21 @@ async fn a_private_torrent_with_an_unmet_goal_stays_unless_the_removal_confirms(
         })
         .await
         .unwrap();
+    // The queue's own cancel still keeps it while its goal is unmet.
+    let cancelled = rig
+        .service
+        .act_many(vec![(
+            job_id,
+            crate::jobs::handle::QueueAction::Cancel(crate::jobs::handle::CancellationOrigin::User),
+        )])
+        .await;
     assert_eq!(
-        rig.service.remove(job_id, false, false).await,
-        Err(ActionError::UnmetGoal("ratio 0.00 of 1.00".into()))
+        cancelled.get(&job_id),
+        Some(&Err(ActionError::UnmetGoal("ratio 0.00 of 1.00".into())))
     );
-    rig.service.remove(job_id, false, true).await.unwrap();
+    assert!(rig.db.get_torrent(job_id).unwrap().is_some());
+    // The operator's remove is never refused for it.
+    rig.service.remove(job_id, false).await.unwrap();
     assert_eq!(rig.db.get_torrent(job_id).unwrap(), None);
     let history = rig.db.get_job_history(job_id.0).unwrap().unwrap();
     assert_eq!(history.status, "cancelled");
@@ -107,9 +117,9 @@ async fn a_private_torrent_with_an_unmet_goal_stays_unless_the_removal_confirms(
         .add_opened(request(AddSource::Metainfo(plain("q", 3))))
         .await
         .unwrap();
-    rig.service.remove(public, true, false).await.unwrap();
+    rig.service.remove(public, true).await.unwrap();
     assert_eq!(
-        rig.service.remove(public, false, false).await,
+        rig.service.remove(public, false).await,
         Err(ActionError::NotFound(public))
     );
 }

@@ -47,7 +47,7 @@ async fn a_torrent_history_row_the_disk_has_no_room_for_waits_and_is_written() {
         .push_back(crate::StateError::OutOfSpace(
             "database or disk is full".into(),
         ));
-    rig.service.remove(job_id, false, false).await.unwrap();
+    rig.service.remove(job_id, false).await.unwrap();
     assert_eq!(heard.recv().await, Some(ArchiveNews::Kept(job_id)));
     assert_eq!(rig.db.kept_archive_jobs(), [job_id]);
     assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
@@ -105,7 +105,7 @@ async fn a_removed_torrent_whose_history_waits_shows_the_disk_space_wait() {
         .push_back(crate::StateError::OutOfSpace(
             "database or disk is full".into(),
         ));
-    rig.service.remove(job_id, false, false).await.unwrap();
+    rig.service.remove(job_id, false).await.unwrap();
     assert_eq!(heard.recv().await, Some(ArchiveNews::Kept(job_id)));
     // The tick publishes the torrents as they stand, and the retiring one
     // with them.
@@ -163,7 +163,7 @@ async fn a_torrent_whose_history_still_waits_at_a_stop_is_archived_by_the_next_s
         .push_back(crate::StateError::OutOfSpace(
             "database or disk is full".into(),
         ));
-    rig.service.remove(job_id, false, false).await.unwrap();
+    rig.service.remove(job_id, false).await.unwrap();
     assert_eq!(heard.recv().await, Some(ArchiveNews::Kept(job_id)));
     rig.service.stop().await;
     assert!(rig.db.get_torrent(job_id).unwrap().is_some());
@@ -290,7 +290,7 @@ async fn an_archive_of_a_removed_torrent_takes_exactly_the_files_it_listed() {
     written.sort();
     let mine = dir.join("mine.txt");
     std::fs::write(&mine, b"not the torrent's").unwrap();
-    rig.service.remove(job_id, false, true).await.unwrap();
+    rig.service.remove(job_id, false).await.unwrap();
     rig.service.stop().await;
     assert!(rig.db.get_torrent(job_id).unwrap().is_none());
 
@@ -354,7 +354,7 @@ async fn a_history_delete_with_files_of_a_removed_torrent_takes_what_it_listed()
     let (job_id, dir) = with_every_piece(&rig).await;
     let mine = dir.join("mine.txt");
     std::fs::write(&mine, b"not the torrent's").unwrap();
-    rig.service.remove(job_id, false, true).await.unwrap();
+    rig.service.remove(job_id, false).await.unwrap();
     rig.service.stop().await;
 
     let (deleted, outcome) = crate::history::delete_files::delete_history_rows(
@@ -512,7 +512,7 @@ async fn the_entry_of_a_torrent_removed_with_its_files_takes_nothing_of_the_same
     let rig = rig(set_clock());
     rig.service.open().await.unwrap();
     let (old, dir) = with_every_piece(&rig).await;
-    rig.service.remove(old, true, true).await.unwrap();
+    rig.service.remove(old, true).await.unwrap();
     assert!(
         rig.db.job_history_files(&[old]).unwrap().is_empty(),
         "it lists nothing its removal took"
@@ -544,7 +544,7 @@ async fn retention_with_files_of_a_removed_torrents_entry_takes_nothing_of_the_o
     let rig = rig(set_clock());
     rig.service.open().await.unwrap();
     let (old, dir) = with_every_piece(&rig).await;
-    rig.service.remove(old, true, true).await.unwrap();
+    rig.service.remove(old, true).await.unwrap();
     let (_, again) = with_every_piece(&rig).await;
     assert_eq!(again, dir);
     let files = files_under(&dir);
@@ -581,7 +581,7 @@ async fn the_entry_of_a_torrent_removed_keeping_its_files_takes_nothing_of_one_a
     on_loopback(&rig.routes);
     rig.service.open().await.unwrap();
     let (old, dir) = with_every_piece(&rig).await;
-    rig.service.remove(old, false, true).await.unwrap();
+    rig.service.remove(old, false).await.unwrap();
     let save = dir.parent().unwrap().to_path_buf();
     let (new, view) = seeding_placed(
         &rig,
@@ -643,7 +643,7 @@ async fn an_archive_leaves_a_file_a_live_torrent_seeds_in_the_removed_ones_folde
             .storage_dir
             .unwrap(),
     );
-    rig.service.remove(first, false, true).await.unwrap();
+    rig.service.remove(first, false).await.unwrap();
     let inner = dir.join("set");
     assert!(inner.join("a.bin").exists() && inner.join("b.bin").exists());
 
@@ -753,7 +753,7 @@ async fn an_archive_of_a_torrent_in_a_shared_folder_takes_only_its_claimed_folde
     assert_ne!(claimed, save);
     assert!(claimed.is_dir());
     assert_eq!(std::fs::read(save.join("sub/a.bin")).unwrap(), data);
-    rig.service.remove(job_id, false, true).await.unwrap();
+    rig.service.remove(job_id, false).await.unwrap();
     assert!(
         rig.db.job_history_files(&[job_id]).unwrap()[&job_id]
             .iter()
@@ -824,7 +824,7 @@ async fn a_removed_torrents_kept_unpacking_folder_outlives_the_start_up_sweep() 
     let unpacking = unpacking_dir(&work, job_id);
     crate::jobs::working_dir::claim_named_working_dir(&work, &unpacking, job_id).unwrap();
     std::fs::write(unpacking.join("set.part1.rar"), b"kept").unwrap();
-    rig.service.remove(job_id, false, true).await.unwrap();
+    rig.service.remove(job_id, false).await.unwrap();
     rig.service.stop().await;
     assert!(
         rig.db.job_history_files(&[job_id]).unwrap()[&job_id]
@@ -883,7 +883,7 @@ async fn a_retiring_torrent_the_start_could_not_archive_is_shown_and_written_lat
             .push_back(crate::StateError::OutOfSpace(
                 "database or disk is full".into(),
             ));
-        rig.service.remove(job_id, false, false).await.unwrap();
+        rig.service.remove(job_id, false).await.unwrap();
         assert_eq!(heard.recv().await, Some(ArchiveNews::Kept(job_id)));
         kept.push(job_id);
     }
@@ -1015,7 +1015,7 @@ async fn an_archive_leaves_what_a_torrent_seeds_through(
             .storage_dir
             .unwrap(),
     );
-    rig.service.remove(first, false, true).await.unwrap();
+    rig.service.remove(first, false).await.unwrap();
     let inner = dir.join("set");
     let spelled = spell(&inner);
     assert_ne!(spelled, inner);
@@ -1163,7 +1163,7 @@ async fn a_removal_whose_mark_is_refused_removes_nothing() {
     let (job_id, dir) = with_every_piece(&rig).await;
     let files = files_under(&dir);
     crate::torrents::persistence::MARK_REFUSED.store(2, Ordering::Relaxed);
-    let removed = rig.service.remove(job_id, true, true).await;
+    let removed = rig.service.remove(job_id, true).await;
     crate::torrents::persistence::MARK_REFUSED.store(0, Ordering::Relaxed);
     let error = removed.expect_err("the removal fails");
     assert!(
@@ -1203,7 +1203,7 @@ async fn a_removal_whose_mark_finds_no_room_goes_on() {
             "database or disk is full".into(),
         ));
     crate::torrents::persistence::MARK_REFUSED.store(1, Ordering::Relaxed);
-    let removed = rig.service.remove(job_id, true, true).await;
+    let removed = rig.service.remove(job_id, true).await;
     crate::torrents::persistence::MARK_REFUSED.store(0, Ordering::Relaxed);
     removed.unwrap();
     assert_eq!(heard.recv().await, Some(ArchiveNews::Kept(job_id)));
@@ -1248,7 +1248,7 @@ async fn a_stop_after_a_removals_files_went_brings_it_back_retiring() {
         .push_back(crate::StateError::OutOfSpace(
             "database or disk is full".into(),
         ));
-    rig.service.remove(job_id, true, true).await.unwrap();
+    rig.service.remove(job_id, true).await.unwrap();
     assert_eq!(heard.recv().await, Some(ArchiveNews::Kept(job_id)));
     rig.service.stop().await;
     assert!(files_under(&dir).is_empty(), "its files went");
@@ -1301,7 +1301,7 @@ async fn a_start_that_cannot_read_the_retiring_torrents_keeps_their_unpacking_fo
         .push_back(crate::StateError::OutOfSpace(
             "database or disk is full".into(),
         ));
-    rig.service.remove(job_id, false, true).await.unwrap();
+    rig.service.remove(job_id, false).await.unwrap();
     assert_eq!(heard.recv().await, Some(ArchiveNews::Kept(job_id)));
     rig.service.stop().await;
 
@@ -1793,7 +1793,7 @@ async fn hold_the_mark(
     let (release, released) = tokio::sync::oneshot::channel();
     *locked(&MARK_HOLD) = Some((reached, released));
     let service = rig.service.clone();
-    let removing = tokio::spawn(async move { service.remove(job_id, delete_files, true).await });
+    let removing = tokio::spawn(async move { service.remove(job_id, delete_files).await });
     at.await.unwrap();
     (removing, release)
 }
@@ -1846,7 +1846,7 @@ async fn a_removal_asked_while_the_files_move_is_refused() {
             .unwrap()
             .moving = Some(moving);
 
-        let removed = rig.service.remove(job_id, true, true).await;
+        let removed = rig.service.remove(job_id, true).await;
         assert!(
             matches!(&removed, Err(ActionError::Invalid(why)) if why.contains("moving")),
             "{removed:?}"
@@ -1866,7 +1866,7 @@ async fn a_removal_asked_while_the_files_move_is_refused() {
         .get_mut(&job_id)
         .unwrap()
         .moving = None;
-    rig.service.remove(job_id, true, true).await.unwrap();
+    rig.service.remove(job_id, true).await.unwrap();
     assert!(files_under(&dir).is_empty());
     rig.service.stop().await;
 }
@@ -1969,7 +1969,7 @@ async fn an_add_of_a_torrent_still_being_removed_says_so() {
         .push_back(crate::StateError::OutOfSpace(
             "database or disk is full".into(),
         ));
-    rig.service.remove(job_id, true, true).await.unwrap();
+    rig.service.remove(job_id, true).await.unwrap();
     assert_eq!(heard.recv().await, Some(ArchiveNews::Kept(job_id)));
     assert!(
         rig.db.get_torrent(job_id).unwrap().is_some(),
@@ -2035,7 +2035,7 @@ async fn a_removal_whose_request_is_dropped_at_its_mark_still_ends() {
     let (reached, at) = tokio::sync::oneshot::channel();
     let (release, released) = tokio::sync::oneshot::channel();
     *locked(&MARK_HOLD) = Some((reached, released));
-    let mut asked = Box::pin(rig.service.remove(job_id, true, true));
+    let mut asked = Box::pin(rig.service.remove(job_id, true));
     tokio::select! {
         biased;
         _ = at => {}
@@ -2160,7 +2160,7 @@ async fn a_removal_with_what_was_there_unknown_keeps_every_file() {
     rig.db.forget_torrent_adopted(job_id).unwrap();
     assert_eq!(rig.db.torrent_adopted(job_id).unwrap(), None);
 
-    rig.service.remove(job_id, true, true).await.unwrap();
+    rig.service.remove(job_id, true).await.unwrap();
     assert!(rig.service.torrent(job_id).await.is_none(), "removed");
     assert_eq!(files_under(&dir), files, "not known: every file stays");
     rig.service.stop().await;
@@ -2229,7 +2229,7 @@ async fn an_unpacked_file_whose_name_is_taken_lands_under_a_numbered_name() {
     );
     assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
 
-    rig.service.remove(job_id, true, false).await.unwrap();
+    rig.service.remove(job_id, true).await.unwrap();
     assert!(!dir.join("small (1).txt").exists());
     assert!(!dir.join("set.rar").exists());
     assert_eq!(std::fs::read(dir.join("small.txt")).unwrap(), b"small.txt");
@@ -2331,7 +2331,7 @@ async fn two_torrents_unpacking_one_name_into_one_folder_each_own_their_file() {
     assert!(held_first.contains(&firsts) && !held_first.contains(&seconds));
     assert!(held_second.contains(&seconds) && !held_second.contains(&firsts));
 
-    rig.service.remove(second, true, false).await.unwrap();
+    rig.service.remove(second, true).await.unwrap();
     assert!(!seconds.exists(), "its own file goes");
     assert!(!save.join("second.rar").exists());
     assert_eq!(
@@ -2340,7 +2340,7 @@ async fn two_torrents_unpacking_one_name_into_one_folder_each_own_their_file() {
         "the other's stays"
     );
     assert!(save.join("first.rar").exists());
-    rig.service.remove(first, true, false).await.unwrap();
+    rig.service.remove(first, true).await.unwrap();
     assert!(!firsts.exists());
     rig.service.stop().await;
 }
@@ -2373,7 +2373,7 @@ async fn a_name_another_writer_takes_before_the_move_is_never_on_the_torrents_ro
     let held = held_by(&rig, job_id);
     assert!(held.contains(&base.join("small (1).txt")), "{held:?}");
     assert!(!held.contains(&base.join("small.txt")), "{held:?}");
-    rig.service.remove(job_id, true, false).await.unwrap();
+    rig.service.remove(job_id, true).await.unwrap();
     assert!(!dir.join("small (1).txt").exists());
     assert_eq!(std::fs::read(dir.join("small.txt")).unwrap(), b"another's");
     rig.service.stop().await;
@@ -2411,7 +2411,7 @@ async fn a_name_another_writer_took_is_not_the_torrents_after_a_failed_row_write
     assert!(!dir.join("small (1).txt").exists());
     let work = rig.service.unpacking_dir(job_id);
     assert_eq!(std::fs::read(work.join("small.txt")).unwrap(), SMALL_TXT);
-    rig.service.remove(job_id, true, false).await.unwrap();
+    rig.service.remove(job_id, true).await.unwrap();
     assert_eq!(std::fs::read(dir.join("small.txt")).unwrap(), b"another's");
     rig.service.stop().await;
 }
@@ -2431,7 +2431,7 @@ async fn a_placing_that_panicked_names_no_file_on_the_row() {
     assert!(!held.contains(&base.join("small.txt")), "{held:?}");
     assert!(!held.contains(&base.join("small (1).txt")), "{held:?}");
     assert_eq!(std::fs::read(dir.join("small (1).txt")).unwrap(), SMALL_TXT);
-    rig.service.remove(job_id, true, false).await.unwrap();
+    rig.service.remove(job_id, true).await.unwrap();
     assert_eq!(std::fs::read(dir.join("small.txt")).unwrap(), b"another's");
     assert_eq!(std::fs::read(dir.join("small (1).txt")).unwrap(), SMALL_TXT);
     rig.service.stop().await;
@@ -2526,7 +2526,7 @@ async fn a_moved_torrents_unpacked_file_never_takes_a_name_someone_else_holds() 
         "{held:?}"
     );
 
-    rig.service.remove(job_id, true, false).await.unwrap();
+    rig.service.remove(job_id, true).await.unwrap();
     assert!(!there.join("small (1).txt").exists(), "its own file goes");
     assert!(!there.join("first.rar").exists());
     assert_eq!(
@@ -2589,7 +2589,7 @@ async fn a_complete_torrents_move_never_puts_an_unpacked_file_over_another() {
     assert!(!incoming.join("small.txt").exists());
     assert_eq!(rig.db.torrent_outputs(job_id).unwrap(), ["small (1).txt"]);
 
-    rig.service.remove(job_id, true, false).await.unwrap();
+    rig.service.remove(job_id, true).await.unwrap();
     assert!(!done.join("small (1).txt").exists());
     assert_eq!(std::fs::read(done.join("small.txt")).unwrap(), b"theirs");
     rig.service.stop().await;
@@ -2687,7 +2687,7 @@ async fn a_failed_move_gives_up_the_names_someone_took_meanwhile() {
     handle.wait_until_initialized().await.unwrap();
     assert!(handle.stats().progress_bytes < whole);
 
-    rig.service.remove(job_id, true, false).await.unwrap();
+    rig.service.remove(job_id, true).await.unwrap();
     assert_eq!(std::fs::read(save.join("small.txt")).unwrap(), b"theirs");
     assert_eq!(
         std::fs::read(save.join("first.mkv")).unwrap(),
@@ -2720,7 +2720,7 @@ async fn a_failed_move_whose_row_stays_set_aside_deletes_no_file() {
     assert!(adopted.all_files);
     assert!(adopted.dirs.contains(&String::new()), "{:?}", adopted.dirs);
 
-    rig.service.remove(job_id, true, false).await.unwrap();
+    rig.service.remove(job_id, true).await.unwrap();
     assert_eq!(std::fs::read(save.join("small.txt")).unwrap(), SMALL_TXT);
     assert!(save.join("first.rar").exists());
     assert!(save.join("first.mkv").exists());
@@ -2796,7 +2796,7 @@ async fn a_move_cut_off_by_a_crash_deletes_nothing_and_is_set_right_by_a_new_loc
                 Vec::<String>::new()
             );
         }
-        again.remove(job_id, true, false).await.unwrap();
+        again.remove(job_id, true).await.unwrap();
         assert_eq!(at(&there), all, "a removal with its files deletes none");
         again.stop().await;
     }
@@ -2857,7 +2857,7 @@ async fn a_file_a_move_kept_is_deleted_with_the_torrents_files() {
     assert!(adopted.files.is_empty(), "{:?}", adopted.files);
 
     // It seeds with no goal met: the removal is confirmed.
-    rig.service.remove(job_id, true, true).await.unwrap();
+    rig.service.remove(job_id, true).await.unwrap();
     assert!(
         !taken.join("a.bin").exists(),
         "the kept file is the torrent's"
@@ -2896,7 +2896,7 @@ async fn a_start_without_torrents_leaves_a_retiring_torrent_as_it_is() {
         .push_back(crate::StateError::OutOfSpace(
             "database or disk is full".into(),
         ));
-    rig.service.remove(job_id, false, false).await.unwrap();
+    rig.service.remove(job_id, false).await.unwrap();
     assert_eq!(heard.recv().await, Some(ArchiveNews::Kept(job_id)));
     rig.service.stop().await;
 

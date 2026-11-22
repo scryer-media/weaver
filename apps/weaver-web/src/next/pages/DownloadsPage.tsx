@@ -1019,6 +1019,7 @@ export function DownloadsPage() {
 
       <TorrentRemoveDialog
         id={removeTorrentId}
+        goalLeft={removeTorrentId === null ? null : (torrents.get(removeTorrentId)?.seedingGoalLeft ?? null)}
         name={(() => {
           const job = jobs.find((candidate) => candidate.id === removeTorrentId);
           return job ? formatJobReleaseName(job) : undefined;

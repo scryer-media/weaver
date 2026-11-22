@@ -764,6 +764,16 @@ pub struct Torrent {
 
 #[ComplexObject]
 impl Torrent {
+    /// The seeding goal still to meet, as `seedingLeft` gives it; absent
+    /// once it is met and for a torrent with no goal.
+    async fn seeding_goal_left(&self) -> Option<&str> {
+        let terms = &self.seeding_policy;
+        let has_goal = terms.ratio_goal.is_some()
+            || terms.seed_time_goal_minutes.is_some()
+            || terms.inactive_goal_minutes.is_some();
+        self.seeding_left.as_deref().filter(|_| has_goal)
+    }
+
     /// How its unpacking came out, once over; absent while it runs, and for
     /// a torrent with nothing to unpack.
     async fn unpacking(&self) -> Option<TorrentUnpackingGql> {

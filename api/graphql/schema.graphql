@@ -2973,7 +2973,7 @@ type MutationRoot {
 	setLogFilter(directives: String!): LogFilter!
 	startApplicationUpgrade(input: StartApplicationUpgradeInput!): ApplicationUpgradeStartPayload!
 	submitTorrent(input: SubmitTorrentInput!): Torrent!
-	removeTorrent(id: Int!, deleteFiles: Boolean! = false, confirmUnmetGoal: Boolean! = false): Boolean!
+	removeTorrent(id: Int!, deleteFiles: Boolean! = false): Boolean!
 	pauseTorrent(id: Int!): Boolean!
 	resumeTorrent(id: Int!): Boolean!
 	setTorrentForced(id: Int!, forced: Boolean!): Boolean!

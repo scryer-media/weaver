@@ -514,7 +514,7 @@ async fn a_magnet_paused_or_removed_while_its_metainfo_is_fetched_stops_at_its_t
     rig.service.resume(job_id).await.unwrap();
     started_and_answered(&listener, &mut updates).await;
 
-    rig.service.remove(job_id, false, false).await.unwrap();
+    rig.service.remove(job_id, false).await.unwrap();
     let (stream, event) = heard_event(&listener).await;
     assert_eq!(event.as_deref(), Some("stopped"));
     answer_no_peers(stream).await;
@@ -545,7 +545,7 @@ async fn a_magnet_removed_before_its_metainfo_leaves_no_directory() {
     let (stream, event) = heard_event(&listener).await;
     assert_eq!(event.as_deref(), Some("stopped"));
     answer_no_peers(stream).await;
-    rig.service.remove(job_id, false, false).await.unwrap();
+    rig.service.remove(job_id, false).await.unwrap();
     assert!(rig.service.torrent(job_id).await.is_none());
     assert_eq!(left(), 0);
     rig.service.stop().await;
@@ -635,7 +635,7 @@ async fn a_magnet_added_paused_announces_only_once_resumed() {
 
     // The next announce the tracker hears is the remove's `stopped`: one
     // fetch, one presence.
-    rig.service.remove(job_id, false, false).await.unwrap();
+    rig.service.remove(job_id, false).await.unwrap();
     let (stream, event) = heard_event(&listener).await;
     assert_eq!(event.as_deref(), Some("stopped"));
     answer_no_peers(stream).await;

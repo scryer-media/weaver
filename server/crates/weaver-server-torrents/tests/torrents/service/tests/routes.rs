@@ -1396,7 +1396,7 @@ async fn a_torrent_removed_while_its_new_routes_session_opens_never_joins_it() {
     let service = rig.service.clone();
     let moving = tokio::spawn(async move { service.follow_routes().await });
     asked.wait_for(|asked| *asked > before).await.unwrap();
-    rig.service.remove(job_id, true, false).await.unwrap();
+    rig.service.remove(job_id, true).await.unwrap();
     rig.routes.unanswered.send_replace(false);
     moving.await.unwrap();
 
@@ -1419,7 +1419,7 @@ async fn a_torrent_removed_before_its_new_routes_session_opens_never_joins_it() 
     let (job_id, dir) = with_every_piece(&rig).await;
 
     rig.routes.route(TorrentScope::Default, 2);
-    rig.service.remove(job_id, true, false).await.unwrap();
+    rig.service.remove(job_id, true).await.unwrap();
     rig.service.follow_routes().await;
 
     assert_eq!(files_under(&dir), Vec::<PathBuf>::new());
@@ -1675,7 +1675,7 @@ async fn a_removed_torrent_leaves_its_leg_empty_at_the_next_snapshot() {
     rig.service.tick().await;
     rig.service.restored().await;
 
-    rig.service.remove(job_id, false, false).await.unwrap();
+    rig.service.remove(job_id, false).await.unwrap();
     assert_eq!(default_torrent_leg(&proxies.network), (false, 0, 0));
     rig.service.stop().await;
     sharer.stop().await;

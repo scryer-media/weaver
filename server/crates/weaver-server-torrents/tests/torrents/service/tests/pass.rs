@@ -314,7 +314,7 @@ view: state Stalled stated None detail None paused_by None forced false queue_po
 live: kept WoundDown seed_mode false seed_verified 0 queued false disk_held None levels [Normal]
 session: paused true seed_mode false sequential false first_last false levels [Normal] limits LimitsConfig { upload_bps: Unlimited, download_bps: Unlimited }
 row: intent Stopped wound_down true forced false seed_mode false queue_position 1 completed None sequential false first_last false upload_limit None seed_verified None
-view: state Stopped stated Some(GoalMet) detail None paused_by None forced false queue_position None
+view: state Stopped stated None detail None paused_by None forced false queue_position None
 == met
 live: kept Intent(Stopped) seed_mode false seed_verified 0 queued false disk_held None levels [Normal]
 session: paused true seed_mode false sequential false first_last false levels [Normal] limits LimitsConfig { upload_bps: Unlimited, download_bps: Unlimited }

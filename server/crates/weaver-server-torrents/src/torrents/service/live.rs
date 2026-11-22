@@ -773,6 +773,8 @@ impl Live {
                 && self
                     .start_refused
                     .is_some_and(|refused| refused.too_small()),
+            // Read by the view, which holds the torrent's terms.
+            goal_met: false,
         }
     }
 }
@@ -787,6 +789,11 @@ pub fn count_waste(counters: &mut TorrentCounters, then: &TorrentTotals, now: &T
         .redundant_bytes
         .saturating_add(now.redundant_bytes.saturating_sub(then.redundant_bytes));
 }
+
+// The longest time between two readings of a seeding torrent that its
+// seeding run spans. The tick reads every torrent every ten seconds, so a
+// longer gap is time the process did not run.
+pub const SEEDING_RUN_GAP_MS: i64 = 5 * 60 * 1000;
 
 // The instant a torrent's durations run to, and the milliseconds each ran
 // past the whole seconds its counter holds: a reading carries them over,
@@ -819,7 +826,10 @@ impl Timed {
     // `active`, and into the finished one and the current seeding run while
     // `seeding`; a reading that is not `seeding` ends the run, and it starts
     // again from zero. A clock stepped back credits nothing for that
-    // reading, and the next runs from `now`.
+    // reading, and the next runs from `now`. Readings further apart than
+    // `SEEDING_RUN_GAP_MS` (the machine slept, or the process stood still)
+    // end the run as a restart does: it starts again from zero at `now`,
+    // while the active and finished durations take the whole time.
     pub fn advanced(
         self,
         now: i64,
@@ -828,6 +838,7 @@ impl Timed {
         counters: &mut TorrentCounters,
     ) -> Self {
         let elapsed = u64::try_from(now - self.at_ms).unwrap_or(0);
+        let gap = now - self.at_ms > SEEDING_RUN_GAP_MS;
         let run = |part: u64, running: bool, seconds: &mut u64| {
             if !running {
                 return part;
@@ -840,7 +851,7 @@ impl Timed {
             at_ms: now,
             active_ms: run(self.active_ms, active, &mut counters.active_duration_s),
             finished_ms: run(self.finished_ms, seeding, &mut counters.finished_duration_s),
-            consecutive_ms: if seeding {
+            consecutive_ms: if seeding && !gap {
                 run(
                     self.consecutive_ms,
                     true,

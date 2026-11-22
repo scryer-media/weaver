@@ -667,7 +667,7 @@ async fn a_level_asked_while_a_copy_is_out_is_taken_after_it() {
     assert_eq!(stored, [High, Normal]);
     assert_eq!(std::fs::read(&b).unwrap(), bytes[1536..2048]);
     assert!(store.side_pieces().is_empty());
-    rig.service.remove(job_id, false, true).await.unwrap();
+    rig.service.remove(job_id, false).await.unwrap();
     assert!(!side.exists());
     rig.service.stop().await;
 }

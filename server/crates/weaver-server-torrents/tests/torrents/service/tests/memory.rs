@@ -93,7 +93,7 @@ async fn a_downloading_torrent_removed_gives_memory_back_once_and_once_idle() {
     rig.service.open().await.unwrap();
     let job_id = downloading(&rig, "set", 1).await;
     rig.service.publish().await;
-    rig.service.remove(job_id, false, false).await.unwrap();
+    rig.service.remove(job_id, false).await.unwrap();
     assert_eq!(releases(&rig).0, 1);
     rig.service.publish().await;
     rig.service.publish().await;

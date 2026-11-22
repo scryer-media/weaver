@@ -46,7 +46,7 @@ use weaver_server_core::rss::RssService;
 use weaver_server_core::security::RuntimeSecurityConfig;
 use weaver_server_core::settings::model::{Config, SharedConfig};
 use weaver_server_core::settings::{
-    BlocklistSource, Leaf, SeedTimeCounting, SeedingAction, SeedingGoalMode, SeedingPolicy,
+    BlocklistSource, Leaf, Level, SeedTimeCounting, SeedingAction, SeedingGoalMode, SeedingPolicy,
     TorrentConfig, TorrentEncryption, TorrentLimit,
 };
 use weaver_server_core::tags::split_tags;
@@ -1422,9 +1422,14 @@ pub(super) fn state(view: &TorrentView) -> &'static str {
     let side = |download: &'static str, upload: &'static str| {
         if complete { upload } else { download }
     };
+    // qBittorrent stops a torrent only when the user stops it or its share
+    // limit is met (an Arr removes a `stoppedUP` seed past its limit). Any
+    // hold of Weaver's own, the schedule's, a speed test's, a wind-down's
+    // or torrents being off, reads as queued.
     match view.state {
-        // The client has no hold on its queue: a held torrent is stopped.
-        TorrentState::Queued if view.paused_by.is_some() => side("stoppedDL", "stoppedUP"),
+        TorrentState::Queued if view.paused_by == Some(HoldOrigin::Manual) => {
+            side("stoppedDL", "stoppedUP")
+        }
         TorrentState::Queued => side("queuedDL", "queuedUP"),
         TorrentState::FetchingMetadata => "metaDL",
         // qBittorrent serialize_torrent.cpp:80-81.
@@ -1441,9 +1446,12 @@ pub(super) fn state(view: &TorrentView) -> &'static str {
         // qBittorrent serialize_torrent.cpp:50.
         TorrentState::FilesMissing => "missingFiles",
         // A stop with words of its own, an error, is a failure; a met goal is
-        // stated, with none.
-        TorrentState::Stopped if view.detail.is_none() => side("stoppedDL", "stoppedUP"),
-        TorrentState::Stopped => "error",
+        // stated, with none. A stop with neither is Weaver's own hold.
+        TorrentState::Stopped if view.detail.is_some() => "error",
+        TorrentState::Stopped if view.stated == Some(status::Stated::GoalMet) => {
+            side("stoppedDL", "stoppedUP")
+        }
+        TorrentState::Stopped => side("queuedDL", "queuedUP"),
     }
 }
 
@@ -1508,32 +1516,48 @@ fn eta(view: &TorrentView, clock: ClockFields, now: i64) -> u64 {
     eta.unwrap_or(ETA_UNKNOWN).min(ETA_UNKNOWN)
 }
 
-// The torrent's own share limits, each `-2` where it inherits, `-1` where
-// it has no goal of its own, else its goal; and the limits in force, `-1`
-// for no goal. Mode and action read `Default` while the torrent inherits
-// them.
+// The torrent's share limits: its own goal, `-1` where it has none of its
+// own; where it inherits, `-2` only while the global settings alone decide,
+// so `-2` and the global preference are always the limit in force, else
+// the limit a tracker rule or category puts in force (`-1` for none). Then
+// the limits in force, `-1` for no goal. Mode and action read `Default`
+// while the torrent inherits them.
 fn share_limits(view: &TorrentView) -> [(&'static str, Value); 8] {
     let policy = &view.seeding_policy;
+    let levels = &view.seeding_levels;
     let own = view.seeding_override.unwrap_or_default();
     let minutes = |value: Option<u32>| json!(value.map_or(-1, i64::from));
     let ratio = |value: Option<f32>| value.map_or(json!(-1), |ratio| json!(ratio_number(ratio)));
-    let leaf = |leaf: Leaf<Value>| match leaf {
-        Leaf::Inherit => json!(-2),
+    let limit = |leaf: Leaf<Value>, level: Level, in_force: Value| match leaf {
+        Leaf::Inherit if level == Level::Global => json!(-2),
+        Leaf::Inherit => in_force,
         Leaf::Off => json!(-1),
         Leaf::Set(value) => value,
     };
     [
         (
             "ratio_limit",
-            leaf(own.ratio_goal.map(|value| ratio(Some(value)))),
+            limit(
+                own.ratio_goal.map(|value| ratio(Some(value))),
+                levels.ratio_goal,
+                ratio(policy.ratio_goal),
+            ),
         ),
         (
             "seeding_time_limit",
-            leaf(own.seed_time_goal_minutes.map(|value| minutes(Some(value)))),
+            limit(
+                own.seed_time_goal_minutes.map(|value| minutes(Some(value))),
+                levels.seed_time_goal_minutes,
+                minutes(policy.seed_time_goal_minutes),
+            ),
         ),
         (
             "inactive_seeding_time_limit",
-            leaf(own.inactive_goal_minutes.map(|value| minutes(Some(value)))),
+            limit(
+                own.inactive_goal_minutes.map(|value| minutes(Some(value))),
+                levels.inactive_goal_minutes,
+                minutes(policy.inactive_goal_minutes),
+            ),
         ),
         (
             "share_limits_mode",

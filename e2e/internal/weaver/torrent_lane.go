@@ -471,11 +471,11 @@ func argDecl(variables map[string]any) string {
 		return ""
 	}
 	types := map[string]string{
-		"id": "Int!", "deleteFiles": "Boolean!", "confirmUnmetGoal": "Boolean!", "forced": "Boolean!",
+		"id": "Int!", "deleteFiles": "Boolean!", "forced": "Boolean!",
 		"category": "String", "seeding": "SeedingPolicyInput",
 	}
 	var parts []string
-	for _, key := range []string{"id", "deleteFiles", "confirmUnmetGoal", "forced", "category", "seeding"} {
+	for _, key := range []string{"id", "deleteFiles", "forced", "category", "seeding"} {
 		if _, ok := variables[key]; ok {
 			parts = append(parts, "$"+key+": "+types[key])
 		}
@@ -495,9 +495,9 @@ func (lane *torrentLane) setForced(id int, forced bool) error {
 	return lane.mutateBool("setTorrentForced", "(id: $id, forced: $forced)", map[string]any{"id": id, "forced": forced})
 }
 
-func (lane *torrentLane) remove(id int, deleteFiles, confirm bool) error {
-	return lane.mutateBool("removeTorrent", "(id: $id, deleteFiles: $deleteFiles, confirmUnmetGoal: $confirmUnmetGoal)",
-		map[string]any{"id": id, "deleteFiles": deleteFiles, "confirmUnmetGoal": confirm})
+func (lane *torrentLane) remove(id int, deleteFiles bool) error {
+	return lane.mutateBool("removeTorrent", "(id: $id, deleteFiles: $deleteFiles)",
+		map[string]any{"id": id, "deleteFiles": deleteFiles})
 }
 
 func (lane *torrentLane) updateTorrentSettings(torrent map[string]any) error {

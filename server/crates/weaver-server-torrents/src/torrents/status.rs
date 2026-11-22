@@ -276,6 +276,9 @@ pub struct Observed {
     pub disk_space: bool,
     /// The disk it waits on never holds what it has left to fetch.
     pub disk_too_small: bool,
+    /// Its seeding goal is met, as the goal check reads it now
+    /// ([`stopped_goal_met`]): only then is a stopped seed stopped by it.
+    pub goal_met: bool,
 }
 
 impl Observed {
@@ -291,6 +294,25 @@ impl Observed {
             Stated::DiskSpace
         }
     }
+}
+
+/// Whether a stopped torrent's seeding goal is met, as the goal check reads
+/// it now. A stop ends the unbroken run a consecutive seed-time goal
+/// counts, so for a torrent its goal stopped that goal reads every second
+/// seeded: the run it was met in is over, not undone. One a wind-down
+/// stopped (`wound_down`) is read as the wind-down's resume reads it.
+pub fn stopped_goal_met(
+    policy: &crate::settings::Seeding,
+    counters: &crate::torrents::TorrentCounters,
+    held_bytes: u64,
+    now_ms: i64,
+    wound_down: bool,
+) -> bool {
+    let mut policy = *policy;
+    if !wound_down {
+        policy.seed_time_counting = crate::settings::SeedTimeCounting::Cumulative;
+    }
+    goal_left(&policy, counters, held_bytes, now_ms).is_none()
 }
 
 /// The state and the reason behind it, when there is one to give.
@@ -326,7 +348,9 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<Why>) {
                 .restore_held
                 .clone()
                 .map(Why::Said)
-                .or_else(|| seen.seeding().then_some(Why::Stated(Stated::GoalMet)));
+                .or_else(|| {
+                    (seen.seeding() && seen.goal_met).then_some(Why::Stated(Stated::GoalMet))
+                });
             return (TorrentState::Stopped, why);
         }
         TorrentIntent::Resumed => {}
@@ -510,6 +534,7 @@ mod tests {
             files_missing: false,
             disk_space: false,
             disk_too_small: false,
+            goal_met: false,
         }
     }
 
@@ -824,6 +849,7 @@ mod tests {
             project(&Observed {
                 intent: TorrentIntent::Stopped,
                 complete: true,
+                goal_met: true,
                 ..seen(Engine::Checking)
             }),
             (TorrentState::Stopped, Some(Stated::GoalMet.into()))
@@ -966,9 +992,20 @@ mod tests {
             project(&Observed {
                 complete: true,
                 intent: TorrentIntent::Stopped,
+                goal_met: true,
                 ..seen(live.clone())
             }),
             (TorrentState::Stopped, Some(Stated::GoalMet.into()))
+        );
+        // A stopped seed whose goal the check does not find met, as one a
+        // wind-down stopped, says nothing of a goal.
+        assert_eq!(
+            project(&Observed {
+                complete: true,
+                intent: TorrentIntent::Stopped,
+                ..seen(live.clone())
+            }),
+            (TorrentState::Stopped, None)
         );
         // An engine error on a complete torrent is the error, never the goal.
         assert_eq!(
@@ -1011,15 +1048,23 @@ mod tests {
             project(&seen(live(false, 3))),
             (TorrentState::Downloading, None)
         );
-        // Stopped once seeding, it met its goal; stopped short of that, it
-        // did not.
+        // Stopped once seeding with its goal met, it says so; stopped short
+        // of seeding, or with the goal unmet, it does not.
         let stopped = |engine| Observed {
             intent: TorrentIntent::Stopped,
+            goal_met: true,
             ..seen(engine)
         };
         assert_eq!(
             project(&stopped(Engine::Paused { finished: true })),
             (TorrentState::Stopped, Some(Stated::GoalMet.into()))
+        );
+        assert_eq!(
+            project(&Observed {
+                goal_met: false,
+                ..stopped(Engine::Paused { finished: true })
+            }),
+            (TorrentState::Stopped, None)
         );
         assert_eq!(
             project(&stopped(Engine::Paused { finished: false })),

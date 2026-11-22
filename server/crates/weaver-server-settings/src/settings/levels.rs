@@ -169,6 +169,36 @@ impl<T: Clone> Levels<T> {
     }
 }
 
+impl<T: Copy + PartialOrd> Levels<T> {
+    /// A seeding goal in force, and the level it comes from, for a torrent
+    /// whose tracker rule sets a goal of its own when `rule_sets_goal`: the
+    /// rule takes from its category and the global settings only what is
+    /// stricter. A goal the torrent sets or turns off decides outright. A
+    /// goal the rule sets is never less than the one below it would give,
+    /// and one it leaves to inherit is taken from below only when every
+    /// goal must be met (`all`): under any one, it would be one more way to
+    /// stop early, so it is off. A rule that sets no goal inherits plainly.
+    pub fn goal(&self, rule_sets_goal: bool, all: bool) -> (Option<T>, Level) {
+        if !rule_sets_goal || !self.torrent.is_inherit() {
+            return (self.resolve(), self.level());
+        }
+        let below = Self {
+            torrent: Leaf::Inherit,
+            rule: Leaf::Inherit,
+            ..*self
+        };
+        match self.rule {
+            Leaf::Set(goal) => match below.resolve() {
+                Some(lower) if lower > goal => (Some(lower), below.level()),
+                _ => (Some(goal), Level::TrackerRule),
+            },
+            Leaf::Off => (None, Level::TrackerRule),
+            Leaf::Inherit if all => (below.resolve(), below.level()),
+            Leaf::Inherit => (None, Level::TrackerRule),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,6 +281,45 @@ mod tests {
         }
     }
 
+    // A tracker rule that sets a goal takes only what is stricter from its
+    // category and the global settings.
+    #[test]
+    fn a_rule_that_sets_a_goal_inherits_only_what_is_stricter() {
+        use Leaf::{Inherit, Off, Set};
+        // (levels, the rule sets a goal, mode All, value, level)
+        let cases = [
+            // The torrent's own value or off decides outright, with no floor.
+            (levels(Set(1), Set(2), Set(3), Set(4)), true, false, Some(1), Level::Torrent),
+            (levels(Off, Set(2), Set(3), Set(4)), true, true, None, Level::Torrent),
+            // A goal the rule sets is the larger of its own and the one below.
+            (levels(Inherit, Set(2), Inherit, Set(1)), true, false, Some(2), Level::TrackerRule),
+            (levels(Inherit, Set(2), Set(3), Set(1)), true, false, Some(3), Level::Category),
+            (levels(Inherit, Set(2), Inherit, Set(4)), true, false, Some(4), Level::Global),
+            (levels(Inherit, Set(2), Off, Set(4)), true, false, Some(2), Level::TrackerRule),
+            (levels(Inherit, Set(2), Set(2), Off), true, true, Some(2), Level::TrackerRule),
+            // One it leaves to inherit adds a requirement under All only.
+            (levels(Inherit, Inherit, Set(3), Set(4)), true, true, Some(3), Level::Category),
+            (levels(Inherit, Inherit, Inherit, Set(4)), true, true, Some(4), Level::Global),
+            (levels(Inherit, Inherit, Set(3), Set(4)), true, false, None, Level::TrackerRule),
+            (levels(Inherit, Inherit, Inherit, Set(4)), true, false, None, Level::TrackerRule),
+            // One it turns off stays off.
+            (levels(Inherit, Off, Set(3), Set(4)), true, true, None, Level::TrackerRule),
+            (levels(Inherit, Off, Set(3), Set(4)), true, false, None, Level::TrackerRule),
+            // A rule that sets no goal inherits plainly.
+            (levels(Inherit, Inherit, Set(3), Set(4)), false, false, Some(3), Level::Category),
+            (levels(Inherit, Inherit, Inherit, Set(4)), false, false, Some(4), Level::Global),
+            (levels(Inherit, Off, Set(3), Set(4)), false, false, None, Level::TrackerRule),
+            (levels(Inherit, Inherit, Inherit, Off), false, true, None, Level::Global),
+        ];
+        for (levels, rule_sets_goal, all, value, level) in cases {
+            assert_eq!(
+                levels.goal(rule_sets_goal, all),
+                (value, level),
+                "{levels:?} rule sets a goal {rule_sets_goal} all {all}"
+            );
+        }
+    }
+
     #[test]
     fn a_leaf_is_kept_as_null_off_or_its_value() {
         for (leaf, json) in [
@@ -266,5 +335,84 @@ mod tests {
             serde_json::from_str::<Leaf<String>>("\"any\"").unwrap(),
             Leaf::Set("any".to_owned())
         );
+    }
+
+    // The goal mode is never inherited: the most specific level that sets
+    // a goal value holds its own mode, an inherited one read as Any.
+    #[test]
+    fn the_mode_in_force_is_that_of_the_most_specific_level_with_a_goal() {
+        use crate::settings::model::{SeedingGoalMode::*, SeedingPolicy};
+        let policy = |ratio: Leaf<f32>, mode: Leaf<crate::settings::model::SeedingGoalMode>| {
+            Some(SeedingPolicy {
+                ratio_goal: ratio,
+                mode,
+                ..SeedingPolicy::default()
+            })
+        };
+        let at = |torrent, rule, category, global| {
+            [
+                (Level::Torrent, torrent),
+                (Level::TrackerRule, rule),
+                (Level::Category, category),
+                (Level::Global, global),
+            ]
+        };
+        use Leaf::{Inherit, Off, Set};
+        let cases = [
+            // No goal anywhere: Any, at the global level.
+            (at(None, None, None, None), (Any, Level::Global)),
+            (
+                at(None, policy(Inherit, Set(All)), None, policy(Inherit, Set(All))),
+                (Any, Level::Global),
+            ),
+            // The global level's own mode, set or kept as inherited.
+            (at(None, None, None, policy(Set(1.0), Set(All))), (All, Level::Global)),
+            (at(None, None, None, policy(Set(1.0), Inherit)), (Any, Level::Global)),
+            // A rule with a goal holds its own mode; the global All does
+            // not reach it.
+            (
+                at(None, policy(Set(2.0), Inherit), None, policy(Set(1.0), Set(All))),
+                (Any, Level::TrackerRule),
+            ),
+            (
+                at(None, policy(Set(2.0), Set(All)), None, policy(Set(1.0), Inherit)),
+                (All, Level::TrackerRule),
+            ),
+            // A rule with a mode and no goal gives no mode.
+            (
+                at(None, policy(Inherit, Set(All)), policy(Set(3.0), Inherit), None),
+                (Any, Level::Category),
+            ),
+            // A goal switched off is no goal value.
+            (
+                at(policy(Off, Set(All)), policy(Set(2.0), Inherit), None, None),
+                (Any, Level::TrackerRule),
+            ),
+            // The torrent's goal decides over every level below.
+            (
+                at(
+                    policy(Set(1.0), Set(All)),
+                    policy(Set(2.0), Inherit),
+                    policy(Set(3.0), Inherit),
+                    policy(Set(4.0), Inherit),
+                ),
+                (All, Level::Torrent),
+            ),
+            (
+                at(
+                    policy(Set(1.0), Inherit),
+                    policy(Set(2.0), Set(All)),
+                    None,
+                    policy(Set(4.0), Set(All)),
+                ),
+                (Any, Level::Torrent),
+            ),
+        ];
+        for (levels, expected) in cases {
+            assert_eq!(SeedingPolicy::mode_in_force(levels), expected, "{levels:?}");
+        }
+        // A policy kept with its mode as inherited reads as Any.
+        let kept: SeedingPolicy = serde_json::from_str(r#"{"ratio_goal":2.0}"#).unwrap();
+        assert_eq!(kept.own_mode(), Any);
     }
 }

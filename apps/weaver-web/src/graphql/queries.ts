@@ -1954,6 +1954,7 @@ export const TORRENT_SUMMARY_UPDATES_SUBSCRIPTION = gql`
         forced
         ratio
         uploadBps
+        seedingGoalLeft
       }
     }
   }
@@ -2012,6 +2013,7 @@ export const TORRENT_UPDATES_SUBSCRIPTION = gql`
         completedAtMs
         savePath
         seedingLeft
+        seedingGoalLeft
         seedingOverride {
           ...SeedingPolicyFields
         }
@@ -2070,8 +2072,8 @@ export const TORRENT_UPDATES_SUBSCRIPTION = gql`
 `;
 
 export const REMOVE_TORRENT_MUTATION = gql`
-  mutation RemoveTorrent($id: Int!, $deleteFiles: Boolean!, $confirmUnmetGoal: Boolean!) {
-    removeTorrent(id: $id, deleteFiles: $deleteFiles, confirmUnmetGoal: $confirmUnmetGoal)
+  mutation RemoveTorrent($id: Int!, $deleteFiles: Boolean!) {
+    removeTorrent(id: $id, deleteFiles: $deleteFiles)
   }
 `;
 
