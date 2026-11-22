@@ -249,35 +249,42 @@ function PeersBlock({ torrent, onReport }: { torrent: TorrentData; onReport: (me
             {heading("uploadBps", t("next.quota.upload"), "hidden justify-end sm:flex")}
             <span />
           </GridRow>
-          {shown.map((peer) => (
-            <GridRow
-              key={peer.address}
-              columns={PEER_COLUMNS}
-              gap={14}
-              className="h-[38px] border-t border-wv-hairline"
-              title={peer.address}
-            >
-              <span className="min-w-0 truncate font-wv-mono text-[12px] text-wv-fg">{peer.address}</span>
-              <span className="hidden min-w-0 truncate text-[12px] text-wv-tertiary sm:block" title={peer.client}>
-                {peer.client}
-              </span>
-              <span className="text-right font-wv-mono text-[12px] text-wv-muted">{`${(peer.progress * 100).toFixed(1)}%`}</span>
-              <span className="hidden text-right font-wv-mono text-[12px] text-wv-muted sm:block">
-                {`↓ ${formatRate(peer.downloadBps)}`}
-              </span>
-              <span className="hidden text-right font-wv-mono text-[12px] text-wv-muted sm:block">
-                {`↑ ${formatRate(peer.uploadBps)}`}
-              </span>
-              <button
-                type="button"
-                disabled={banState.fetching}
-                onClick={() => ban(peer.address)}
-                className="cursor-pointer text-right text-[12.5px] whitespace-nowrap text-wv-dim hover:text-wv-error disabled:cursor-default"
+          {/*
+            The rows reorder as the peers' speeds move. Left as candidates,
+            one of them becomes the browser's scroll anchor and the page
+            scrolls after it each time it moves, so none of them is one.
+          */}
+          <div className="flex min-w-0 flex-col [overflow-anchor:none]">
+            {shown.map((peer) => (
+              <GridRow
+                key={peer.address}
+                columns={PEER_COLUMNS}
+                gap={14}
+                className="h-[38px] border-t border-wv-hairline"
+                title={peer.address}
               >
-                {t("next.torrent.ban")}
-              </button>
-            </GridRow>
-          ))}
+                <span className="min-w-0 truncate font-wv-mono text-[12px] text-wv-fg">{peer.address}</span>
+                <span className="hidden min-w-0 truncate text-[12px] text-wv-tertiary sm:block" title={peer.client}>
+                  {peer.client}
+                </span>
+                <span className="text-right font-wv-mono text-[12px] text-wv-muted">{`${(peer.progress * 100).toFixed(1)}%`}</span>
+                <span className="hidden text-right font-wv-mono text-[12px] text-wv-muted sm:block">
+                  {`↓ ${formatRate(peer.downloadBps)}`}
+                </span>
+                <span className="hidden text-right font-wv-mono text-[12px] text-wv-muted sm:block">
+                  {`↑ ${formatRate(peer.uploadBps)}`}
+                </span>
+                <button
+                  type="button"
+                  disabled={banState.fetching}
+                  onClick={() => ban(peer.address)}
+                  className="cursor-pointer text-right text-[12.5px] whitespace-nowrap text-wv-dim hover:text-wv-error disabled:cursor-default"
+                >
+                  {t("next.torrent.ban")}
+                </button>
+              </GridRow>
+            ))}
+          </div>
           {pageCount > 1 ? (
             <div className="flex items-center justify-end gap-3 border-t border-wv-hairline pt-3">
               <span data-testid={torrentIds.peerRange} className="font-wv-mono text-[11.5px] whitespace-nowrap text-wv-muted">
