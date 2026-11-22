@@ -364,12 +364,20 @@ mod tests {
     }
 
     fn rule(id: u32, host_pattern: &str) -> TrackerRule {
+        rule_of(id, &[host_pattern])
+    }
+
+    fn rule_of(id: u32, host_patterns: &[&str]) -> TrackerRule {
         TrackerRule {
             transports: TransportRule::default(),
             archive_passwords: Default::default(),
             bound: None,
             id,
-            host_pattern: TrackerRule::pattern(host_pattern).unwrap(),
+            name: format!("rule {id}"),
+            host_patterns: host_patterns
+                .iter()
+                .map(|pattern| TrackerRule::pattern(pattern).unwrap())
+                .collect(),
             seeding: None,
             never_pause: false,
             unpack: None,
@@ -518,15 +526,13 @@ mod tests {
         ] {
             assert!(TrackerRule::pattern(bad).is_err(), "{bad}");
         }
-        let rules = [
+        let rules = TrackerRules::new(vec![
             rule(1, "*.example.org"),
             rule(2, "tracker.example.org"),
             rule(3, "*.tracker.example.org"),
             rule(4, "other.invalid"),
-        ];
-        let id = |trackers: &[&str]| {
-            tracker_rule_for(&rules, trackers.iter().copied()).map(|rule| rule.id)
-        };
+        ]);
+        let id = |trackers: &[&str]| rules.rule_for(trackers.iter().copied()).map(|rule| rule.id);
         assert_eq!(id(&["https://tracker.example.org/announce"]), Some(2));
         assert_eq!(id(&["udp://Tracker.Example.org.:1337"]), Some(2));
         assert_eq!(id(&["http://a.tracker.example.org/x"]), Some(3));
@@ -541,10 +547,149 @@ mod tests {
         );
         assert_eq!(id(&[]), None);
         // On a tie, the lower id.
-        let tied = [rule(9, "*.example.org"), rule(5, "*.example.org")];
+        let tied = TrackerRules::new(vec![rule(9, "*.example.org"), rule(5, "*.example.org")]);
         assert_eq!(
-            tracker_rule_for(&tied, ["http://a.example.org/"]).map(|rule| rule.id),
+            tied.rule_for(["http://a.example.org/"]).map(|rule| rule.id),
             Some(5)
+        );
+    }
+
+    // What a typed pattern is kept as, and what is refused: a pattern that
+    // would cover hosts of many owners, an address under `*.`, and IPv6.
+    #[test]
+    fn a_typed_pattern_is_kept_as_an_announce_reads_its_host() {
+        for (typed, kept) in [
+            ("tracker.example.org:2710", "tracker.example.org"),
+            ("*.Bücher.example", "*.xn--bcher-kva.example"),
+            ("10.0.0.7", "10.0.0.7"),
+            ("localhost", "localhost"),
+            ("*.example.co", "*.example.co"),
+            ("*.example.co.uk", "*.example.co.uk"),
+            ("*.tracker.github.io", "*.tracker.github.io"),
+            ("*.tracker.invalid", "*.tracker.invalid"),
+            ("co.uk", "co.uk"),
+        ] {
+            assert_eq!(TrackerRule::pattern(typed).as_deref(), Ok(kept), "{typed}");
+        }
+        for refused in [
+            "*.com",
+            "*.co.uk",
+            "*.CO.UK.",
+            "*.github.io",
+            "*.kawasaki.jp",
+            "*.localhost",
+            "*.10.0.0.7",
+            "[::1]",
+            "::1",
+            "*.example.org:http",
+        ] {
+            assert!(TrackerRule::pattern(refused).is_err(), "{refused}");
+        }
+        let long = format!("{}.example", "a.".repeat(130));
+        assert!(TrackerRule::pattern(&long).is_err());
+    }
+
+    // A rule keeps its patterns once each, needs one, and holds 64 at most;
+    // its name is trimmed, and a blank, long or control-character name is
+    // refused.
+    #[test]
+    fn a_rule_is_checked_for_its_name_and_patterns() {
+        let checked = TrackerRule {
+            name: "  IPT ".to_owned(),
+            host_patterns: vec![
+                "*.Example.org".to_owned(),
+                "*.example.org.".to_owned(),
+                "tracker.example.net".to_owned(),
+            ],
+            ..rule(1, "x.invalid")
+        }
+        .checked()
+        .unwrap();
+        assert_eq!(checked.name, "IPT");
+        assert_eq!(
+            checked.host_patterns,
+            ["*.example.org", "tracker.example.net"]
+        );
+        let with = |name: &str, patterns: Vec<String>| {
+            TrackerRule {
+                name: name.to_owned(),
+                host_patterns: patterns,
+                ..rule(1, "x.invalid")
+            }
+            .checked()
+        };
+        assert!(with("IPT", Vec::new()).is_err());
+        let many: Vec<String> = (0..65).map(|n| format!("h{n}.example")).collect();
+        assert!(with("IPT", many[..64].to_vec()).is_ok());
+        assert!(with("IPT", many).is_err());
+        for name in ["", "   ", "a\tb", &"n".repeat(65)] {
+            assert!(
+                with(name, vec!["x.invalid".to_owned()]).is_err(),
+                "{name:?}"
+            );
+        }
+        assert!(with(&"n".repeat(64), vec!["x.invalid".to_owned()]).is_ok());
+        assert_eq!(TrackerRule::name_key(" IpT "), TrackerRule::name_key("ipt"));
+    }
+
+    // The lookup picks the rule walking every rule's every pattern picks,
+    // over rules with many patterns, shared domains, ties and hosts no rule
+    // names.
+    #[test]
+    fn the_pattern_lookup_matches_the_linear_walk() {
+        let rules = vec![
+            rule_of(
+                7,
+                &["*.example.org", "tracker.example.net", "*.cdn.example.com"],
+            ),
+            rule_of(3, &["a.example.org", "*.b.example.org"]),
+            rule_of(5, &["*.example.net", "10.0.0.7"]),
+            rule_of(2, &["*.c.b.example.org", "example.com"]),
+            rule_of(9, &["*.tracker.example.net"]),
+        ];
+        let index = TrackerRules::new(rules.clone());
+        let hosts = [
+            "example.org",
+            "a.example.org",
+            "x.a.example.org",
+            "b.example.org",
+            "z.b.example.org",
+            "c.b.example.org",
+            "d.c.b.example.org",
+            "example.net",
+            "tracker.example.net",
+            "y.tracker.example.net",
+            "example.com",
+            "www.example.com",
+            "cdn.example.com",
+            "e.cdn.example.com",
+            "10.0.0.7",
+            "10.0.0.8",
+            "unrelated.invalid",
+        ];
+        let urls: Vec<String> = hosts
+            .iter()
+            .map(|host| format!("http://{host}/a"))
+            .collect();
+        let mut checked = 0;
+        for first in 0..urls.len() {
+            for second in first..urls.len() {
+                let trackers = [urls[first].as_str(), urls[second].as_str()];
+                let walked = linear_rule_for(&rules, trackers).map(|rule| rule.id);
+                let found = index.matched(trackers);
+                assert_eq!(found.map(|found| found.rule.id), walked, "{trackers:?}");
+                if let Some(found) = found {
+                    assert!(found.rule.host_patterns.iter().any(|p| p == found.pattern));
+                }
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 153);
+        assert_eq!(
+            index
+                .matched(["http://y.tracker.example.net/"])
+                .map(|found| (found.rule.id, found.pattern)),
+            Some((9, "*.tracker.example.net"))
         );
     }
 
@@ -567,19 +712,21 @@ mod tests {
             encryption: Some(TorrentEncryption::Require),
             ..rule(2, "*.public.test")
         };
-        let rules = [private, public];
-        let ruled = tracker_rule_for(&rules, [passkeyed]).unwrap();
-        assert_eq!(ruled.host_pattern, "private.example.org");
+        let rules = TrackerRules::new(vec![private, public]);
+        let ruled = rules.rule_for([passkeyed]).unwrap();
+        assert_eq!(ruled.host_patterns, ["private.example.org"]);
         assert_eq!(
             (ruled.encryption, ruled.transports.utp),
             (Some(TorrentEncryption::Disabled), Some(false))
         );
-        let open = tracker_rule_for(&rules, ["udp://tracker.public.test:1337/announce"]).unwrap();
+        let open = rules
+            .rule_for(["udp://tracker.public.test:1337/announce"])
+            .unwrap();
         assert_eq!(
             (open.encryption, open.transports),
             (Some(TorrentEncryption::Require), TransportRule::default())
         );
-        assert!(!format!("{rules:?}").contains("secret"));
+        assert!(!format!("{:?}", &*rules).contains("secret"));
     }
 
     fn transports(
@@ -939,7 +1086,10 @@ connections_limit = 0
         ));
         // A file URL is the platform's path it names.
         #[cfg(not(windows))]
-        let (file_url, file_path) = ("file:///var/lib/weaver/level1.p2p", "/var/lib/weaver/level1.p2p");
+        let (file_url, file_path) = (
+            "file:///var/lib/weaver/level1.p2p",
+            "/var/lib/weaver/level1.p2p",
+        );
         #[cfg(windows)]
         let (file_url, file_path) = ("file:///C:/lists/level1.p2p", r"C:\lists\level1.p2p");
         assert_eq!(source(file_url), BlocklistSource::File(file_path.into()));

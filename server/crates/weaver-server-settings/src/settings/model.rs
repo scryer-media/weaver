@@ -314,16 +314,18 @@ impl SeedingAction {
     }
 }
 
-// The seeding terms of every torrent that announces to a host a pattern
-// names: goals that sit between the torrent's own and its category's, and
-// whether the schedule's torrent pause may stop the torrent while they are
-// unmet.
+// The seeding terms of every torrent that announces to a host one of its
+// patterns names: goals that sit between the torrent's own and its
+// category's, and whether the schedule's torrent pause may stop the torrent
+// while they are unmet.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TrackerRule {
     pub id: u32,
-    // A host, or `*.` and a host, which names that host and every host
-    // under it.
-    pub host_pattern: String,
+    // What the operator calls the tracker; unique whatever its case.
+    pub name: String,
+    // The hosts it covers, each a host, or `*.` and a domain, which names
+    // that domain and every host under it. A pattern belongs to one rule.
+    pub host_patterns: Vec<String>,
     pub seeding: Option<SeedingPolicy>,
     pub never_pause: bool,
     // Whether the archives of a torrent under this rule are extracted;
@@ -512,10 +514,35 @@ impl Client {
 }
 
 impl TrackerRule {
-    // The rule as it is kept, its pattern as `pattern` keeps it; an error
-    // when the pattern names no host.
+    // The most patterns a rule holds, the longest a pattern is, and the
+    // longest a name is, in characters.
+    pub const MAX_PATTERNS: usize = 64;
+    pub const MAX_PATTERN_BYTES: usize = 253;
+    pub const MAX_NAME: usize = 64;
+
+    // The rule as it is kept: its name trimmed, its patterns as `pattern`
+    // keeps them, repeats dropped and the first kept. An error for a name
+    // that is blank, too long or holds a control character, for a pattern
+    // that names no host, and for none or too many patterns.
     pub fn checked(mut self) -> Result<Self, String> {
-        self.host_pattern = Self::pattern(&self.host_pattern)?;
+        self.name = Self::name(&self.name)?;
+        let mut patterns: Vec<String> = Vec::with_capacity(self.host_patterns.len());
+        for pattern in &self.host_patterns {
+            let pattern = Self::pattern(pattern)?;
+            if !patterns.contains(&pattern) {
+                patterns.push(pattern);
+            }
+        }
+        if patterns.is_empty() {
+            return Err("a tracker rule needs a host".to_owned());
+        }
+        if patterns.len() > Self::MAX_PATTERNS {
+            return Err(format!(
+                "a tracker rule names {} hosts at most",
+                Self::MAX_PATTERNS
+            ));
+        }
+        self.host_patterns = patterns;
         if let Some(ssl) = &self.ssl {
             ssl.identity()
                 .map_err(|error| format!("the SSL certificate is refused: {error}"))?;
@@ -523,37 +550,240 @@ impl TrackerRule {
         Ok(self)
     }
 
-    // The pattern as a rule keeps it: trimmed and lower case, without a
-    // trailing dot. An error when it names no host.
+    // The name as a rule keeps it: trimmed. An error when it is blank, longer
+    // than `MAX_NAME` characters or holds a control character.
+    pub fn name(name: &str) -> Result<String, String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("a tracker rule needs a name".to_owned());
+        }
+        if name.chars().count() > Self::MAX_NAME {
+            return Err(format!(
+                "a tracker rule's name is {} characters at most",
+                Self::MAX_NAME
+            ));
+        }
+        if name.chars().any(char::is_control) {
+            return Err("a tracker rule's name holds a control character".to_owned());
+        }
+        Ok(name.to_owned())
+    }
+
+    // The key two names collide under.
+    pub fn name_key(name: &str) -> String {
+        name.trim().to_lowercase()
+    }
+
+    // The pattern as a rule keeps it: trimmed, without a trailing dot or a
+    // port, and the host as an announce URL's reads (lower case, an
+    // international name in punycode). An error when it names no host, when
+    // it is an IPv6 address, or when it puts `*.` before an address, a
+    // single label or a public suffix, which would cover hosts of many
+    // owners.
     pub fn pattern(pattern: &str) -> Result<String, String> {
-        let pattern = pattern.trim().trim_end_matches('.').to_ascii_lowercase();
-        let host = pattern.strip_prefix("*.").unwrap_or(&pattern);
-        let named = !host.is_empty()
-            && host.split('.').all(|label| {
-                !label.is_empty()
-                    && label
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-            });
-        if named {
-            Ok(pattern)
-        } else {
-            Err(format!("{pattern} is not a host, nor *. and a host"))
+        let typed = pattern.trim();
+        let refused = || format!("{typed} is not a host, nor *. and a domain");
+        let (wildcard, host) = match typed.strip_prefix("*.") {
+            Some(host) => (true, host),
+            None => (false, typed),
+        };
+        if host.contains('[') || host.matches(':').count() > 1 {
+            return Err(format!(
+                "{typed} is an IPv6 address; name the tracker's host"
+            ));
+        }
+        let host = match host.rsplit_once(':') {
+            Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host,
+            Some(_) => return Err(refused()),
+            None => host,
+        };
+        let host = host.trim_end_matches('.');
+        if host.is_empty() || host.len() > Self::MAX_PATTERN_BYTES {
+            return Err(refused());
+        }
+        let host = match url::Host::parse(host).map_err(|_| refused())? {
+            url::Host::Domain(domain) => domain,
+            url::Host::Ipv4(address) if !wildcard => return Ok(address.to_string()),
+            url::Host::Ipv4(_) => {
+                return Err(format!(
+                    "{typed} puts *. before an address; name the address"
+                ));
+            }
+            url::Host::Ipv6(_) => {
+                return Err(format!(
+                    "{typed} is an IPv6 address; name the tracker's host"
+                ));
+            }
+        };
+        let named = host.split('.').all(|label| {
+            !label.is_empty()
+                && label
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        });
+        if !named || host.len() > Self::MAX_PATTERN_BYTES {
+            return Err(refused());
+        }
+        if wildcard && shared_suffix(&host) {
+            return Err(format!(
+                "{typed} covers every site under {host}; name the tracker's own domain"
+            ));
+        }
+        Ok(if wildcard { format!("*.{host}") } else { host })
+    }
+
+    // The tracker host the rule shows itself by: its first pattern, without
+    // `*.`.
+    pub fn first_host(&self) -> Option<&str> {
+        self.host_patterns
+            .first()
+            .map(|pattern| pattern.strip_prefix("*.").unwrap_or(pattern))
+    }
+}
+
+// Whether a domain is shared by sites of many owners, so `*.` before it
+// would cover them all: a single label (`com`, `localhost`) or a suffix on
+// the public suffix list, its ICANN and private parts alike (`co.uk`,
+// `github.io`), or one whose every child is (`kawasaki.jp`, under the list's
+// `*.kawasaki.jp`). `domain` is lower case and in punycode, as the list is.
+fn shared_suffix(domain: &str) -> bool {
+    let suffix = |name: &str| {
+        psl::suffix(name.as_bytes()).is_some_and(|suffix| suffix.as_bytes() == name.as_bytes())
+    };
+    !domain.contains('.') || suffix(domain) || suffix(&format!("wvr-probe.{domain}"))
+}
+
+// How closely `pattern` names `host`, or `None` when it does not: a host
+// closer than any wildcard, and a longer wildcard closer than a shorter one.
+// The linear reading `TrackerRules` answers by lookup.
+#[cfg(test)]
+pub(crate) fn closeness(pattern: &str, host: &str) -> Option<usize> {
+    match pattern.strip_prefix("*.") {
+        Some(domain) => (host == domain
+            || host
+                .strip_suffix(domain)
+                .is_some_and(|rest| rest.ends_with('.')))
+        .then_some(domain.len()),
+        None => (host == pattern).then_some(usize::MAX),
+    }
+}
+
+// The tracker rules, with each pattern looked up by the hosts it can name.
+#[derive(Debug, Clone, Default)]
+pub struct TrackerRules {
+    list: Vec<TrackerRule>,
+    at: std::collections::HashMap<u32, usize>,
+    by_pattern: std::collections::HashMap<String, usize>,
+}
+
+// The rule a torrent follows, and the pattern of it that named the
+// torrent's host most closely.
+#[derive(Debug, Clone, Copy)]
+pub struct RuleMatch<'r> {
+    pub rule: &'r TrackerRule,
+    pub pattern: &'r str,
+}
+
+impl TrackerRules {
+    pub fn new(list: Vec<TrackerRule>) -> Self {
+        let mut at = std::collections::HashMap::with_capacity(list.len());
+        let mut by_pattern = std::collections::HashMap::new();
+        for (place, rule) in list.iter().enumerate() {
+            at.entry(rule.id).or_insert(place);
+        }
+        for (place, rule) in list.iter().enumerate() {
+            for pattern in &rule.host_patterns {
+                by_pattern
+                    .entry(pattern.clone())
+                    .and_modify(|held: &mut usize| {
+                        if list[*held].id > rule.id {
+                            *held = place;
+                        }
+                    })
+                    .or_insert(place);
+            }
+        }
+        Self {
+            list,
+            at,
+            by_pattern,
         }
     }
 
-    // How closely the pattern names `host`, or `None` when it does not: a
-    // host closer than any wildcard, and a longer wildcard closer than a
-    // shorter one.
-    fn closeness(&self, host: &str) -> Option<usize> {
-        match self.host_pattern.strip_prefix("*.") {
-            Some(domain) => (host == domain
-                || host
-                    .strip_suffix(domain)
-                    .is_some_and(|rest| rest.ends_with('.')))
-            .then_some(domain.len()),
-            None => (host == self.host_pattern).then_some(usize::MAX),
+    /// The rule of id `id`, while it stands.
+    pub fn of(&self, id: Option<u32>) -> Option<&TrackerRule> {
+        self.list.get(*self.at.get(&id?)?)
+    }
+
+    // The rule a torrent announcing to `trackers` follows: the one with the
+    // pattern that names one of their hosts most closely, the lower id on a
+    // tie. Each host is looked up as itself and under each of its domains,
+    // so the cost is the hosts' labels, not the rules.
+    pub fn matched<'t>(
+        &self,
+        trackers: impl IntoIterator<Item = &'t str>,
+    ) -> Option<RuleMatch<'_>> {
+        // The closest pattern yet: its closeness, its rule's id and place.
+        type Best<'s> = Option<(usize, u32, usize, &'s str)>;
+        fn offer<'s>(
+            best: &mut Best<'s>,
+            closeness: usize,
+            id: u32,
+            place: usize,
+            pattern: &'s str,
+        ) {
+            let wins = best.is_none_or(|(held, held_id, _, _)| {
+                closeness > held || (closeness == held && id < held_id)
+            });
+            if wins {
+                *best = Some((closeness, id, place, pattern));
+            }
         }
+        let mut best: Best<'_> = None;
+        let mut wildcard = String::new();
+        for host in trackers.into_iter().filter_map(tracker_host) {
+            if let Some((pattern, &place)) = self.by_pattern.get_key_value(host.as_str()) {
+                offer(&mut best, usize::MAX, self.list[place].id, place, pattern);
+            }
+            let mut domain = host.as_str();
+            loop {
+                wildcard.clear();
+                wildcard.push_str("*.");
+                wildcard.push_str(domain);
+                if let Some((pattern, &place)) = self.by_pattern.get_key_value(wildcard.as_str()) {
+                    offer(&mut best, domain.len(), self.list[place].id, place, pattern);
+                }
+                match domain.split_once('.') {
+                    Some((_, rest)) => domain = rest,
+                    None => break,
+                }
+            }
+        }
+        best.map(|(_, _, place, pattern)| RuleMatch {
+            rule: &self.list[place],
+            pattern,
+        })
+    }
+
+    pub fn rule_for<'t>(
+        &self,
+        trackers: impl IntoIterator<Item = &'t str>,
+    ) -> Option<&TrackerRule> {
+        self.matched(trackers).map(|found| found.rule)
+    }
+}
+
+impl From<Vec<TrackerRule>> for TrackerRules {
+    fn from(list: Vec<TrackerRule>) -> Self {
+        Self::new(list)
+    }
+}
+
+impl std::ops::Deref for TrackerRules {
+    type Target = [TrackerRule];
+
+    fn deref(&self) -> &[TrackerRule] {
+        &self.list
     }
 }
 
@@ -568,9 +798,11 @@ pub fn tracker_host(url: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_owned())
 }
 
-// The rule a torrent announcing to `trackers` seeds under: the one whose
-// pattern names one of their hosts most closely, the lower id on a tie.
-pub fn tracker_rule_for<'r, 't>(
+// The rule a torrent announcing to `trackers` seeds under, read by walking
+// every rule's every pattern: the reference `TrackerRules::matched` is
+// tested against.
+#[cfg(test)]
+pub(crate) fn linear_rule_for<'r, 't>(
     rules: &'r [TrackerRule],
     trackers: impl IntoIterator<Item = &'t str>,
 ) -> Option<&'r TrackerRule> {
@@ -578,7 +810,14 @@ pub fn tracker_rule_for<'r, 't>(
     rules
         .iter()
         .filter_map(|rule| {
-            let closeness = hosts.iter().filter_map(|host| rule.closeness(host)).max()?;
+            let closeness = hosts
+                .iter()
+                .flat_map(|host| {
+                    rule.host_patterns
+                        .iter()
+                        .filter_map(|pattern| closeness(pattern, host))
+                })
+                .max()?;
             Some((rule, closeness))
         })
         .min_by_key(|(rule, closeness)| (std::cmp::Reverse(*closeness), rule.id))

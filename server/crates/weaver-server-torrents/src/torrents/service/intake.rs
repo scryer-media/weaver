@@ -15,7 +15,7 @@ use crate::pipeline::claim_complete_destination_path;
 use crate::post_processing::model::QueueEvent;
 use crate::post_processing::settings::PostProcessingSettingsQueries;
 use crate::proxies::TorrentScope;
-use crate::settings::model::{TrackerRule, tracker_rule_for};
+use crate::settings::model::TrackerRule;
 use crate::settings::persistence::SettingsPersistenceQueries;
 use crate::settings::{Client, SeedingPolicy, TorrentConfig};
 use crate::tags::TagsQueries;
@@ -533,8 +533,7 @@ impl TorrentService {
                     .filter_map(|(tier, url)| tracker(tier as u32, url.as_bytes()))
                     .collect();
                 let rules = self.rules();
-                let rule =
-                    tracker_rule_for(&rules, trackers.iter().map(|tracker| tracker.url.as_str()));
+                let rule = rules.rule_for(trackers.iter().map(|tracker| tracker.url.as_str()));
                 let scope = settings.scope(category.as_ref().map(|category| category.id), rule);
                 let plan = self.inner.sessions.routes().plan(scope);
                 let (plan, pin) = self.placed(&plan, None).await;
@@ -886,7 +885,7 @@ impl TorrentService {
         // the same list is written and held, so the two never differ.
         let trackers = &once_a_tier(trackers);
         let rules = self.rules();
-        let rule = tracker_rule_for(&rules, trackers.iter().map(|tracker| tracker.url.as_str()));
+        let rule = rules.rule_for(trackers.iter().map(|tracker| tracker.url.as_str()));
         record.forced |= rule.is_some_and(|rule| rule.forced);
         let rule_id = rule.map(|rule| rule.id);
         match self
@@ -1266,7 +1265,7 @@ impl TorrentService {
         cookie: Option<&str>,
     ) -> Result<Vec<u8>, String> {
         let rules = self.rules();
-        let rule = tracker_rule_for(&rules, [url.as_str()]);
+        let rule = rules.rule_for([url.as_str()]);
         let scope = self.scope_of(category, rule);
         let plan = self.inner.sessions.routes().plan(scope);
         if let Some(reason) = plan.down {

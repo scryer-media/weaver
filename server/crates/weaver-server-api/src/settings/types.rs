@@ -1416,13 +1416,16 @@ impl SeedingPolicyInput {
     }
 }
 
-/// Seeding goals for the torrents announcing to a host, and whether the
-/// schedule's pause leaves them seeding until their goal is met.
+/// Seeding goals for the torrents announcing to the hosts it covers, and
+/// whether the schedule's pause leaves them seeding until their goal is met.
 #[derive(Debug, Clone, PartialEq, SimpleObject)]
 pub struct TrackerRule {
     pub id: u32,
-    /// A host, or `*.` and a host for it and every host under it.
-    pub host_pattern: String,
+    /// What the tracker is called; unique whatever its case.
+    pub name: String,
+    /// The hosts it covers, each a host, or `*.` and a domain for it and
+    /// every host under it. A torrent is matched when added and at start-up.
+    pub host_patterns: Vec<String>,
     /// The goals this rule sets; absent leaves them to the category and the
     /// global policy.
     pub seeding: Option<SeedingPolicySettings>,
@@ -1483,6 +1486,8 @@ pub struct TrackerBinding {
     pub imported_at: i64,
     /// The fields the file locked: dht, pex, lsd, encryption, ssl.
     pub locked: Vec<String>,
+    /// The hosts the file covers, which the rule keeps while bound.
+    pub host_patterns: Vec<String>,
 }
 
 impl From<weaver_server_core::settings::tracker_file::Binding> for TrackerBinding {
@@ -1492,6 +1497,7 @@ impl From<weaver_server_core::settings::tracker_file::Binding> for TrackerBindin
             revision: bound.revision,
             imported_at: bound.imported_at_ms,
             locked: bound.locked,
+            host_patterns: bound.host_patterns,
         }
     }
 }
@@ -1501,8 +1507,9 @@ impl From<weaver_server_core::settings::tracker_file::Binding> for TrackerBindin
 pub struct TrackerFilePreview {
     pub name: String,
     pub revision: String,
-    pub host_pattern: String,
+    pub host_patterns: Vec<String>,
     /// The rule the file fills; absent makes a new rule.
+    pub rule_name: Option<String>,
     pub rule_id: Option<u32>,
     pub changes: Vec<TrackerFileChange>,
     pub has_ssl: bool,
@@ -1530,8 +1537,9 @@ impl From<weaver_server_core::settings::tracker_file::Preview> for TrackerFilePr
         Self {
             name: preview.name,
             revision: preview.revision,
-            host_pattern: preview.host_pattern,
+            host_patterns: preview.host_patterns,
             rule_id: preview.rule_id,
+            rule_name: preview.rule_name,
             changes: preview
                 .changes
                 .into_iter()
@@ -1574,7 +1582,8 @@ impl From<weaver_server_core::settings::model::TrackerRule> for TrackerRule {
         let summary = rule.ssl.as_ref().and_then(|ssl| ssl.summary());
         Self {
             id: rule.id,
-            host_pattern: rule.host_pattern,
+            name: rule.name,
+            host_patterns: rule.host_patterns,
             seeding: rule.seeding.map(Into::into),
             never_pause: rule.never_pause,
             unpack: rule.unpack,
@@ -1601,7 +1610,8 @@ impl From<weaver_server_core::settings::model::TrackerRule> for TrackerRule {
 
 #[derive(Debug, Clone, InputObject)]
 pub struct TrackerRuleInput {
-    pub host_pattern: String,
+    pub name: String,
+    pub host_patterns: Vec<String>,
     pub seeding: Option<SeedingPolicyInput>,
     #[graphql(default)]
     pub never_pause: bool,
@@ -1644,7 +1654,8 @@ impl TrackerRuleInput {
             archive_passwords: Default::default(),
             bound: None,
             id,
-            host_pattern: self.host_pattern,
+            name: self.name,
+            host_patterns: self.host_patterns,
             seeding: self
                 .seeding
                 .map(SeedingPolicyInput::into_policy)

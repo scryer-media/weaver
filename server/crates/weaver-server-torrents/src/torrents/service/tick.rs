@@ -993,12 +993,10 @@ impl TorrentService {
             .filter(|category| category.torrent_route)
             .map(|category| (TorrentScope::Category(category.id), Some(category.name)));
         let rules = self.rules();
-        let rules = rules.iter().filter(|rule| rule.torrent_route).map(|rule| {
-            (
-                TorrentScope::TrackerRule(rule.id),
-                Some(rule.host_pattern.clone()),
-            )
-        });
+        let rules = rules
+            .iter()
+            .filter(|rule| rule.torrent_route)
+            .map(|rule| (TorrentScope::TrackerRule(rule.id), Some(rule.name.clone())));
         std::iter::once((TorrentScope::Default, None))
             .chain(categories)
             .chain(rules)

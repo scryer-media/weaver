@@ -170,7 +170,8 @@ async fn a_torrent_url_is_asked_for_as_the_client_its_rule_names() {
             archive_passwords: Default::default(),
             bound: None,
             id: 0,
-            host_pattern: "127.0.0.1".into(),
+            name: "127.0.0.1".into(),
+            host_patterns: vec!["127.0.0.1".into()],
             seeding: None,
             never_pause: false,
             unpack: None,
@@ -533,12 +534,15 @@ async fn url_route(category: Option<&str>, matched: bool) {
                 archive_passwords: Default::default(),
                 bound: None,
                 id: 0,
-                host_pattern: if matched {
-                    "127.0.0.1"
-                } else {
-                    "unmatched.test"
-                }
-                .into(),
+                name: "Route".into(),
+                host_patterns: vec![
+                    if matched {
+                        "127.0.0.1"
+                    } else {
+                        "unmatched.test"
+                    }
+                    .into(),
+                ],
                 seeding: None,
                 never_pause: false,
                 unpack: None,
@@ -1716,7 +1720,8 @@ async fn a_tracker_rules_route_carries_its_torrents_ahead_of_their_categorys() {
                 archive_passwords: Default::default(),
                 bound: None,
                 id: 0,
-                host_pattern: "*.test".into(),
+                name: "*.test".into(),
+                host_patterns: vec!["*.test".into()],
                 seeding: None,
                 never_pause: false,
                 unpack: None,

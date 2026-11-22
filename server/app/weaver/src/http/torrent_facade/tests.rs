@@ -1152,7 +1152,10 @@ fn an_arr_removes_a_seed_only_once_the_limit_in_force_is_met() {
     assert_eq!(row(&held)["ratio_limit"], 2.0);
     assert!(!arr_removes(&row(&held), &preferences));
     // A seed Weaver stopped for a reason of its own reads as queued too.
-    assert!(!arr_removes(&row(&ruled(TorrentState::Stopped, 1.2)), &preferences));
+    assert!(!arr_removes(
+        &row(&ruled(TorrentState::Stopped, 1.2)),
+        &preferences
+    ));
     // One the user stopped short of the rule's goal is stopped, not removed.
     let paused = ruled(TorrentState::Paused, 1.2);
     assert_eq!(row(&paused)["state"], "stoppedUP");
@@ -1696,7 +1699,8 @@ async fn the_dht_row_follows_the_torrents_rule_before_its_category() {
                 bound: None,
                 archive_passwords: Default::default(),
                 id: 0,
-                host_pattern: "tracker.test".into(),
+                name: "tracker.test".into(),
+                host_patterns: vec!["tracker.test".into()],
                 seeding: None,
                 never_pause: false,
                 unpack: None,

@@ -357,7 +357,8 @@ impl Default for SeedingLevels {
 /// The torrents the schedule's pause leaves seeding under one tracker rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScheduleSeeding {
-    pub host_pattern: String,
+    pub rule_id: u32,
+    pub name: String,
     pub torrents: u32,
 }
 
@@ -428,8 +429,11 @@ impl Presence {
 }
 
 impl TorrentService {
-    /// Take the tracker rules as the database holds them now, match every
-    /// torrent's trackers against them again, and apply what that changes.
+    /// Take the tracker rules as the database holds them now, and apply
+    /// what that changes to the torrents under them. A torrent keeps the
+    /// rule it was matched to when added or at start-up: one whose rule was
+    /// deleted follows no rule, and a rule's new hosts take the torrents
+    /// added from now on and every torrent after a restart.
     pub async fn reload_tracker_rules(&self) -> Result<(), String> {
         self.load_rules()?;
         let rules = self.rules();
@@ -437,7 +441,11 @@ impl TorrentService {
             let mut live = self.inner.live.lock().await;
             for torrent in live.values_mut() {
                 let job_id = torrent.record.job_id;
-                torrent.rule_id = self.rule_id(torrent.trackers.iter());
+                // A torrent keeps the rule it matched; one whose rule was
+                // deleted falls under no rule.
+                if rules.of(torrent.rule_id).is_none() {
+                    torrent.rule_id = None;
+                }
                 // An SSL torrent takes its rule's certificate as it stands:
                 // its new connections and announces present it.
                 let ssl = certificate_of(torrent.rule(&rules));
@@ -490,7 +498,8 @@ impl TorrentService {
             .iter()
             .filter_map(|rule| {
                 counts.get(&rule.id).map(|&torrents| ScheduleSeeding {
-                    host_pattern: rule.host_pattern.clone(),
+                    rule_id: rule.id,
+                    name: rule.name.clone(),
                     torrents,
                 })
             })

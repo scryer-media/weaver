@@ -20,7 +20,15 @@ import {
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { UNPACK_CHOICES, routeExposureText, routeReasonText, type TorrentRouteReason, unpackChoice, unpackOf, type TorrentExposure } from "@/lib/torrents";
 import type { ResolvedBy } from "@/lib/test-via";
-import { announceHosts, hostPatterns, patternsOf, trackerHost, torrentTrackers } from "@/lib/tracker-hosts";
+import {
+  announceHosts,
+  domainPattern,
+  patternParts,
+  patternsOf,
+  torrentTrackers,
+  trackerHost,
+  typedPattern,
+} from "@/lib/tracker-hosts";
 import { cn, toBase64 } from "@/lib/utils";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { Dialog } from "../../../components/Dialog";
@@ -69,7 +77,10 @@ import {
 
 interface TrackerRule {
   id: number;
-  hostPattern: string;
+  /** What the operator calls the tracker. */
+  name: string;
+  /** The hosts it covers: a host, or `*.` and a domain for it and every host under it. */
+  hostPatterns: string[];
   /** Null while every term inherits from the category and the global settings. */
   seeding: SeedingPolicy | null;
   neverPause: boolean;
@@ -113,15 +124,18 @@ interface TrackerBinding {
    * prefer_downloading, prefer_seeding, ssl.
    */
   locked: string[];
+  /** The hosts the file covers, which the rule keeps while bound. */
+  hostPatterns: string[];
 }
 
 /** What importing a tracker file would do; it holds nothing secret. */
 interface TrackerFilePreview {
   name: string;
   revision: string;
-  hostPattern: string;
+  hostPatterns: string[];
   /** Null makes a new rule. */
   ruleId: number | null;
+  ruleName: string | null;
   changes: { field: string; locked: boolean; old: string | null; new: string | null }[];
   hasSsl: boolean;
   sslSubject: string | null;
@@ -139,7 +153,8 @@ const TORRENT_CLIENTS: readonly { value: TorrentClient; label: string }[] = [
 ];
 
 interface TrackerRuleForm {
-  hostPattern: string;
+  name: string;
+  hostPatterns: string[];
   seeding: SeedingPolicy;
   neverPause: boolean;
   unpack: boolean | null;
@@ -165,7 +180,8 @@ interface TrackerRuleForm {
 }
 
 const NEW_TRACKER_RULE: TrackerRuleForm = {
-  hostPattern: "",
+  name: "",
+  hostPatterns: [],
   seeding: seedingFrom(null),
   neverPause: false,
   unpack: null,
@@ -259,84 +275,138 @@ function sslInput(form: TrackerRuleForm) {
   return form.sslCleared ? { ssl: null } : {};
 }
 
-/** A rule's goals in one line, as its row shows them. */
-function goalsText(t: Translate, policy: SeedingPolicy | null): string {
-  if (!policy) {
-    return EM_DASH;
-  }
-  const goal = (leaf: Leaf<number>, label: string, text: (value: number) => string) =>
-    leaf.state === "OFF"
-      ? `${label} ${t("next.seeding.noGoal")}`
-      : leaf.state === "SET" && leaf.value !== null
-        ? `${label} ${text(leaf.value)}`
-        : null;
+/**
+ * A rule's goals in one line, as its row shows them: each goal in effect,
+ * the ones it inherits from the global settings dimmed.
+ */
+function goalsCell(t: Translate, policy: SeedingPolicy | null, global: SeedingPolicy): ReactNode {
   const minutes = (value: number) => durationText(t, value);
+  const goal = (own: Leaf<number> | undefined, from: Leaf<number>, label: string, text: (value: number) => string) => {
+    const inherited = own === undefined || own.state === "INHERIT";
+    const leaf = inherited ? from : own;
+    const value = leaf.state === "SET" && leaf.value !== null ? text(leaf.value) : t("next.seeding.noGoal");
+    return { text: `${label} ${value}`, inherited };
+  };
   const goals = [
-    goal(policy.ratioGoal, t("next.seeding.ratioGoal"), String),
-    goal(policy.seedTimeGoalMinutes, t("next.seeding.seedTimeGoal"), minutes),
-    goal(policy.inactiveGoalMinutes, t("next.seeding.inactiveGoal"), minutes),
-  ].filter((text): text is string => text !== null);
-  return goals.length > 0 ? goals.join(" · ") : EM_DASH;
+    goal(policy?.ratioGoal, global.ratioGoal, t("next.seeding.ratioGoal"), (value) => value.toFixed(2)),
+    goal(policy?.seedTimeGoalMinutes, global.seedTimeGoalMinutes, t("next.seeding.seedTimeGoal"), minutes),
+    goal(policy?.inactiveGoalMinutes, global.inactiveGoalMinutes, t("next.seeding.inactiveGoal"), minutes),
+  ];
+  return goals.map((entry, index) => (
+    <span key={entry.text}>
+      {index > 0 ? " · " : null}
+      <span
+        className={entry.inherited ? "text-wv-muted" : undefined}
+        title={entry.inherited ? t("next.torrents.trackerRuleGoalInherited") : undefined}
+      >
+        {entry.text}
+      </span>
+    </span>
+  ));
 }
 
 type HostSource = "known" | "custom" | "file";
 
 /**
- * A rule's host: one a torrent has announced to, typed, or one a .torrent
- * file's trackers name, read in the browser. Opens on the known hosts when
- * the pattern is one of them, or is still to be picked and some are known.
+ * A rule's hosts, each a row to tick: ones a torrent has announced to, typed,
+ * or the trackers a .torrent file names, read in the browser. A typed domain
+ * covers every host under it. A private file ticks every tracker it names;
+ * a public one ticks its main tracker only. The hosts a bound tracker file
+ * covers stay ticked.
  */
 function HostPicker({
   t,
   value,
   onChange,
   known,
+  locked,
+  lockedBy,
 }: {
   t: Translate;
-  value: string;
-  onChange: (pattern: string) => void;
+  value: readonly string[];
+  onChange: (patterns: string[]) => void;
   known: readonly string[];
+  locked: readonly string[];
+  lockedBy: string | null;
 }) {
-  const [chosen, setChosen] = useState<HostSource | null>(null);
-  // The file's patterns, its main tracker's first.
-  const [file, setFile] = useState<{ name: string; patterns: string[]; main: string[] } | null>(null);
+  const [source, setSource] = useState<HostSource>(known.length > 0 ? "known" : "custom");
+  // Rows offered but not ticked, kept so a host unticked can be ticked again.
+  const [offered, setOffered] = useState<string[]>([]);
+  const [typed, setTyped] = useState("");
+  const [file, setFile] = useState<{ name: string; private: boolean } | null>(null);
   const [fileError, setFileError] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
-  const source = chosen ?? ((value === "" ? known.length > 0 : known.includes(value)) ? "known" : "custom");
-  const label = t("next.torrents.trackerRuleHost");
+  const rows = [...new Set([...value, ...offered])];
 
-  // A list keeps the pattern only when it offers it; the text field keeps it to edit.
-  const pick = (next: HostSource) => {
-    const list = next === "known" ? known : next === "file" ? (file?.patterns ?? []) : null;
-    if (list && !list.includes(value)) {
-      onChange("");
-    }
-    setChosen(next);
+  const tick = (pattern: string, on: boolean) => {
+    onChange(on ? [...new Set([...value, pattern])] : value.filter((kept) => kept !== pattern));
+  };
+  const add = (patterns: readonly string[], ticked: readonly string[]) => {
+    setOffered((current) => [...new Set([...current, ...patterns])]);
+    onChange([...new Set([...value, ...ticked])]);
   };
 
   const read = async (picked: File) => {
     const trackers = torrentTrackers(new Uint8Array(await picked.arrayBuffer()));
-    const announces = trackers?.all ?? null;
     const mainHost = trackers?.main ? trackerHost(trackers.main) : null;
-    const main = mainHost ? hostPatterns(mainHost) : [];
-    const patterns = announces ? [...new Set([...main, ...patternsOf(announceHosts(announces))])] : [];
+    const main = mainHost ? domainPattern(mainHost) : null;
+    const patterns = trackers
+      ? [...new Set([...(main ? [main] : []), ...announceHosts(trackers.all).map(domainPattern)])]
+      : [];
     setFileError(
-      announces === null
+      trackers === null
         ? t("next.torrents.trackerRuleFileInvalid")
         : patterns.length === 0
           ? t("next.torrents.trackerRuleFileEmpty")
           : null,
     );
-    setFile({ name: picked.name, patterns, main });
-    onChange(patterns[0] ?? "");
+    setFile(trackers ? { name: picked.name, private: trackers.private } : null);
+    add(patterns, trackers?.private ? patterns : main ? [main] : []);
   };
 
+  const addTyped = () => {
+    const pattern = typedPattern(typed);
+    if (pattern !== "") {
+      add([pattern], [pattern]);
+      setTyped("");
+    }
+  };
+
+  const label = t("next.torrents.trackerRuleHosts");
   return (
     <div className="flex min-w-0 flex-col gap-2">
+      {rows.length > 0 ? (
+        <div className="flex min-w-0 flex-col border border-wv-control" data-testid="tracker-rule-hosts">
+          {rows.map((pattern) => {
+            const { host, under } = patternParts(pattern);
+            const fixed = locked.includes(pattern);
+            const ticked = value.includes(pattern);
+            return (
+              <div
+                key={pattern}
+                data-testid={`tracker-rule-host-${pattern}`}
+                onClick={() => (fixed ? undefined : tick(pattern, !ticked))}
+                className={cn(
+                  "flex min-w-0 items-center gap-3 border-b border-wv-hairline px-3 py-[7px] last:border-b-0",
+                  fixed ? "cursor-default" : "cursor-pointer hover:bg-wv-cell-hover",
+                )}
+              >
+                <CheckBox checked={ticked} disabled={fixed} label={host} onChange={(on) => tick(pattern, on)} />
+                <span className="min-w-0 truncate font-wv-mono text-[12px] text-wv-fg">{host}</span>
+                <span className="min-w-0 truncate text-[12px] text-wv-muted">
+                  {fixed && lockedBy
+                    ? t("next.torrents.trackerRuleHostLocked", { name: lockedBy })
+                    : t(under ? "next.torrents.trackerRuleHostUnder" : "next.torrents.trackerRuleHostOnly")}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      ) : null}
       <Segmented<HostSource>
         value={source}
         label={label}
-        onChange={pick}
+        onChange={setSource}
         className="self-start"
         options={[
           { value: "known", label: t("next.torrents.trackerRuleHostKnown"), disabled: known.length === 0 },
@@ -346,16 +416,33 @@ function HostPicker({
       />
       {source === "known" ? (
         <Select
-          value={value}
+          value=""
           label={label}
           placeholder={t("next.torrents.trackerRuleHostChoose")}
-          onChange={onChange}
+          onChange={(pattern) => add([pattern], [pattern])}
           className="font-wv-mono text-[12px]"
           menuClassName="max-h-[320px]"
-          options={known.map((pattern) => ({ value: pattern, label: pattern }))}
+          options={known.filter((pattern) => !value.includes(pattern)).map((pattern) => ({ value: pattern, label: pattern }))}
         />
       ) : source === "custom" ? (
-        <TextField value={value} label={label} placeholder="*.tracker.example" onChange={onChange} />
+        <div className="flex min-w-0 items-center gap-2">
+          <TextField
+            value={typed}
+            label={label}
+            placeholder="tracker.example"
+            onChange={setTyped}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                addTyped();
+              }
+            }}
+            className="min-w-0 flex-1"
+          />
+          <SecondaryButton onClick={addTyped} disabled={typedPattern(typed) === ""}>
+            {t("next.torrents.trackerRuleHostAdd")}
+          </SecondaryButton>
+        </div>
       ) : (
         <>
           <div className="flex h-[34px] min-w-0 items-center gap-3">
@@ -384,28 +471,24 @@ function HostPicker({
             ) : null}
           </div>
           {fileError ? <span className="text-[12px] text-wv-error-text">{fileError}</span> : null}
-          {file && file.patterns.length > 0 ? (
-            <Select
-              value={value}
-              label={label}
-              placeholder={t("next.torrents.trackerRuleHostChoose")}
-              onChange={onChange}
-              className="font-wv-mono text-[12px]"
-              options={file.patterns.map((pattern) => ({
-                value: pattern,
-                label: file.main.includes(pattern) ? t("next.torrents.trackerRuleFileMain", { pattern }) : pattern,
-              }))}
-            />
+          {file && !fileError ? (
+            <span className="text-[12px] leading-[1.45] text-pretty text-wv-muted">
+              {t(file.private ? "next.torrents.trackerRuleFilePrivate" : "next.torrents.trackerRuleFilePublic")}
+            </span>
           ) : null}
         </>
       )}
-      {value.trim() === "" ? null : (
-        <span className="text-[12px] leading-[1.45] text-pretty text-wv-muted">
-          {t("next.torrents.trackerRuleCovers", { pattern: value.trim() })}
-        </span>
-      )}
+      <span className="text-[12px] leading-[1.45] text-pretty text-wv-muted">
+        {t(value.length === 0 ? "next.torrents.trackerRuleHostsNone" : "next.torrents.trackerRuleCovers")}
+      </span>
     </div>
   );
+}
+
+/** A rule's hosts as its row shows them: the first, and how many more. */
+function hostsSummary(t: Translate, patterns: readonly string[]): string {
+  const first = patterns[0] ? patternParts(patterns[0]).host : EM_DASH;
+  return patterns.length > 1 ? t("next.torrents.trackerRuleHostsMore", { host: first, count: patterns.length - 1 }) : first;
 }
 
 /** A preview's field names, as the editor labels them. */
@@ -584,10 +667,12 @@ function TrackerFileImport({
           <span className="col-span-2 min-w-0 truncate font-wv-mono text-wv-fg">
             {summary.name} · {summary.revision}
           </span>
-          <span className="text-wv-secondary">{t("next.torrents.trackerRuleHost")}</span>
-          <span className="min-w-0 truncate font-wv-mono text-wv-fg">{summary.hostPattern}</span>
-          <span className="font-wv-mono text-wv-muted">
-            {summary.ruleId === null ? t("next.torrents.trackerFileNewRule") : `#${summary.ruleId}`}
+          <span className="text-wv-secondary">{t("next.torrents.trackerRuleHosts")}</span>
+          <span className="min-w-0 truncate font-wv-mono text-wv-fg" title={summary.hostPatterns.join(", ")}>
+            {hostsSummary(t, summary.hostPatterns)}
+          </span>
+          <span className="min-w-0 truncate text-wv-muted">
+            {summary.ruleName ?? t("next.torrents.trackerFileNewRule")}
           </span>
           {summary.changes.map((change) => (
             <div key={change.field} className="contents">
@@ -794,7 +879,8 @@ function useTrackerRules(
     setError(null);
     const start = rule
       ? {
-          hostPattern: rule.hostPattern,
+          name: rule.name,
+          hostPatterns: rule.hostPatterns,
           seeding: seedingFrom(rule.seeding),
           neverPause: rule.neverPause,
           unpack: rule.unpack,
@@ -828,7 +914,8 @@ function useTrackerRules(
     const result = await saveRule({
       id: editingId === "new" ? null : editingId,
       input: {
-        hostPattern: form.hostPattern.trim(),
+        name: form.name.trim(),
+        hostPatterns: form.hostPatterns,
         seeding: seedingInherits(form.seeding) ? null : seedingInput(form.seeding),
         neverPause: form.neverPause,
         unpack: form.unpack,
@@ -953,9 +1040,14 @@ function useTrackerRules(
     kind: "table",
     id: "trackerRules",
     title: t("next.torrents.trackerRules"),
-    columns: "minmax(0, 1fr) minmax(0, 1.6fr) minmax(0, 0.6fr)",
-    headers: [t("next.torrents.trackerRuleHost"), t("next.torrents.trackerRuleGoals"), t("next.torrents.trackerRuleNeverPause")],
-    centered: [2],
+    columns: "minmax(0, 0.8fr) minmax(0, 1fr) minmax(0, 1.6fr) minmax(0, 0.6fr)",
+    headers: [
+      t("next.torrents.trackerRuleName"),
+      t("next.torrents.trackerRuleHosts"),
+      t("next.torrents.trackerRuleGoals"),
+      t("next.torrents.trackerRuleNeverPause"),
+    ],
+    centered: [3],
     empty: t("next.torrents.trackerRulesEmpty"),
     add: { label: t("next.torrents.trackerRuleAdd"), onClick: () => open(null) },
     footer: (
@@ -977,13 +1069,14 @@ function useTrackerRules(
     },
     rows: rules.map((rule) => ({
       id: String(rule.id),
-      searchText: rule.hostPattern,
+      searchText: [rule.name, ...rule.hostPatterns].join(" "),
       cells: [
-        <Cell key="host" mono>
-          {rule.hostPattern}
+        <Cell key="name">{rule.name}</Cell>,
+        <Cell key="hosts" mono className="text-wv-secondary">
+          <span title={rule.hostPatterns.join(", ")}>{hostsSummary(t, rule.hostPatterns)}</span>
         </Cell>,
         <Cell key="goals" className="text-wv-secondary">
-          {goalsText(t, rule.seeding)}
+          {goalsCell(t, rule.seeding, globalSeeding)}
         </Cell>,
         <Cell key="neverPause" mono className="text-wv-muted">
           {t(rule.neverPause ? "next.common.on" : "next.common.off")}
@@ -996,7 +1089,7 @@ function useTrackerRules(
     <>
       <RecordEditor
         open={editingId !== null}
-        title={editingId === "new" ? t("next.torrents.trackerRuleAdd") : (editing?.hostPattern ?? t("next.torrents.trackerRule"))}
+        title={editingId === "new" ? t("next.torrents.trackerRuleAdd") : (editing?.name ?? t("next.torrents.trackerRule"))}
         note={editingId === "new" ? t("next.torrents.trackerRuleNewNote") : `#${editing?.id ?? ""}`}
         error={error}
         busy={busy}
@@ -1068,18 +1161,45 @@ function useTrackerRules(
                   ]
                 : ([] as FieldSpec[])),
               {
-                id: "hostPattern",
-                label: t("next.torrents.trackerRuleHost"),
-                keywords: "tracker host announce",
+                id: "name",
+                label: t("next.torrents.trackerRuleName"),
+                keywords: "tracker name label",
+                control: {
+                  kind: "custom",
+                  control: (
+                    <TextField
+                      value={form.name}
+                      label={t("next.torrents.trackerRuleName")}
+                      placeholder="IPT"
+                      mono={false}
+                      onChange={(name) => setForm((current) => ({ ...current, name }))}
+                    />
+                  ),
+                },
+              },
+              {
+                id: "hostPatterns",
+                label: t("next.torrents.trackerRuleHosts"),
+                help: t("next.torrents.trackerRuleHostsNote"),
+                keywords: "tracker host domain announce",
                 control: {
                   kind: "custom",
                   control: (
                     <HostPicker
                       key={opening}
                       t={t}
-                      value={form.hostPattern}
+                      value={form.hostPatterns}
                       known={known}
-                      onChange={(hostPattern) => setForm((current) => ({ ...current, hostPattern }))}
+                      locked={editing?.bound?.hostPatterns ?? []}
+                      lockedBy={editing?.bound?.name ?? null}
+                      onChange={(hostPatterns) =>
+                        setForm((current) => ({
+                          ...current,
+                          hostPatterns,
+                          // A new rule is named after its first host until a name is typed.
+                          name: current.name.trim() === "" && hostPatterns[0] ? patternParts(hostPatterns[0]).host : current.name,
+                        }))
+                      }
                     />
                   ),
                 },
@@ -1365,7 +1485,7 @@ function useTrackerRules(
       <ConfirmDialog
         open={confirmDelete !== null}
         title={t("next.rss.removeRule")}
-        note={confirmDelete?.hostPattern}
+        note={confirmDelete?.name}
         busy={busy}
         confirmLabel={t("next.rss.removeRule")}
         body={t("next.torrents.trackerRuleRemoveBody")}

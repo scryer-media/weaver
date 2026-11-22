@@ -734,9 +734,10 @@ impl SettingsMutation {
                 Err(refusal) => return Ok(Err(refusal)),
             };
             let rules = db.list_tracker_rules()?;
-            let rule = rules
-                .iter()
-                .find(|rule| rule.host_pattern == file.host_pattern);
+            let rule = match file.rule_in(&rules) {
+                Ok(rule) => rule,
+                Err(refusal) => return Ok(Err(refusal)),
+            };
             let fingerprint = tracker_file::fingerprint(&bytes, rule);
             Ok::<_, weaver_server_core::StateError>(Ok(file.preview(rule, fingerprint)))
         })
@@ -764,15 +765,19 @@ impl SettingsMutation {
                 Err(refusal) => return Ok(Err(refusal)),
             };
             let rules = db.list_tracker_rules()?;
-            let rule = rules
-                .iter()
-                .find(|rule| rule.host_pattern == file.host_pattern);
+            let rule = match file.rule_in(&rules) {
+                Ok(rule) => rule,
+                Err(refusal) => return Ok(Err(refusal)),
+            };
             if tracker_file::fingerprint(&bytes, rule) != fingerprint {
                 return Ok(Err("stale preview".to_owned()));
             }
             let routed = routed_rules(&rules);
             let now = chrono::Utc::now().timestamp_millis();
-            db.apply_tracker_file(&file, now)?;
+            match db.apply_tracker_file(&file, now) {
+                Err(weaver_server_core::StateError::Conflict(refusal)) => return Ok(Err(refusal)),
+                applied => applied?,
+            };
             Ok::<_, weaver_server_core::StateError>(Ok((routed, db.list_tracker_rules()?)))
         })
         .await??

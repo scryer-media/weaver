@@ -1005,7 +1005,8 @@ fn chain() -> (TorrentRecord, TrackerRule, TorrentSettings) {
     let rule = TrackerRule {
         transports: Default::default(),
         id: 1,
-        host_pattern: "tracker.test".into(),
+        name: "tracker.test".into(),
+        host_patterns: vec!["tracker.test".into()],
         seeding: None,
         never_pause: false,
         unpack: None,

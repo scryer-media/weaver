@@ -170,7 +170,8 @@ async fn a_tracker_rules_privacy_terms_reach_its_torrents() {
                 archive_passwords: Default::default(),
                 bound: None,
                 id: 0,
-                host_pattern: "*.example-tracker.test".into(),
+                name: "*.example-tracker.test".into(),
+                host_patterns: vec!["*.example-tracker.test".into()],
                 seeding: None,
                 never_pause: false,
                 unpack: None,
@@ -301,7 +302,8 @@ async fn a_tracker_rules_dht_pex_and_lsd_each_reach_its_torrents() {
         .db
         .insert_tracker_rule(
             &TrackerRule {
-                host_pattern: "*.example-tracker.test".into(),
+                name: "*.example-tracker.test".into(),
+                host_patterns: vec!["*.example-tracker.test".into()],
                 dht: Some(false),
                 pex: Some(false),
                 lsd: None,

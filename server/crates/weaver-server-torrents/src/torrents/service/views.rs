@@ -772,7 +772,7 @@ impl TorrentService {
             seeding_override: record.policy_override,
             seeding_policy: policy,
             seeding_levels,
-            tracker_rule: rule.map(|rule| rule.host_pattern.clone()),
+            tracker_rule: rule.map(|rule| rule.name.clone()),
             upload_cap: settings.upload_cap(record, rule),
             unpack: record
                 .unpack_in_force

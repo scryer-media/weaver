@@ -10,11 +10,11 @@ use weaver_server_db::persistence::connection::Database;
 use weaver_server_db::persistence::encryption::{
     EncryptionKey, decrypt_value, encrypt_value, is_encrypted,
 };
-use weaver_server_db::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime};
+use weaver_server_db::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime, SqlTx};
 
 use weaver_server_net::proxies::{Consumer, TorrentScope};
 
-const TRACKER_RULE_COLUMNS: &str = "id, host_pattern, seeding, never_pause, unpack, client, torrent_route, dht, pex, lsd, encryption, upload_cap, forced, ssl_certificate, ssl_private_key, bound, archive_passwords, peer_tcp, peer_utp, prefer_downloading, prefer_seeding";
+const TRACKER_RULE_COLUMNS: &str = "id, name, seeding, never_pause, unpack, client, torrent_route, dht, pex, lsd, encryption, upload_cap, forced, ssl_certificate, ssl_private_key, bound, archive_passwords, peer_tcp, peer_utp, prefer_downloading, prefer_seeding";
 
 fn prefer_of(row: &SqlRow, column: &str) -> Result<Option<PeerTransport>, StateError> {
     row.opt_text(column)?
@@ -42,7 +42,9 @@ fn tracker_rule_from_row(
     Ok(TrackerRule {
         id: u32::try_from(id)
             .map_err(|_| StateError::Database(format!("tracker rule id {id} is not valid")))?,
-        host_pattern: row.text("host_pattern")?,
+        name: row.text("name")?,
+        // Filled from `tracker_rule_hosts` by the caller.
+        host_patterns: Vec::new(),
         seeding: SeedingPolicy::kept(seeding),
         never_pause: row.bool("never_pause")?,
         unpack: row.opt_bool("unpack")?,
@@ -175,7 +177,7 @@ fn tracker_rule_args(
         .transpose()
         .map_err(|error| StateError::Database(error.to_string()))?;
     Ok(vec![
-        SqlArg::Text(rule.host_pattern.clone()),
+        SqlArg::Text(rule.name.clone()),
         SqlArg::OptText(seeding),
         SqlArg::Bool(rule.never_pause),
         SqlArg::OptBool(rule.unpack),
@@ -220,6 +222,51 @@ fn tracker_rule_args(
     ])
 }
 
+// Replace the hosts the rule `id` covers with `patterns`, in their order.
+async fn write_hosts(tx: &mut SqlTx<'_>, id: u32, patterns: &[String]) -> Result<(), StateError> {
+    tx.execute(
+        "DELETE FROM tracker_rule_hosts WHERE rule_id = {}",
+        &[SqlArg::I64(i64::from(id))],
+    )
+    .await?;
+    if patterns.is_empty() {
+        return Ok(());
+    }
+    let mut sql =
+        String::from("INSERT INTO tracker_rule_hosts (pattern, rule_id, position) VALUES ");
+    let mut args = Vec::with_capacity(patterns.len() * 3);
+    for (position, pattern) in patterns.iter().enumerate() {
+        if position > 0 {
+            sql.push_str(", ");
+        }
+        sql.push_str("({}, {}, {})");
+        args.extend([
+            SqlArg::Text(pattern.clone()),
+            SqlArg::I64(i64::from(id)),
+            SqlArg::I64(position as i64),
+        ]);
+    }
+    tx.execute(&sql, &args).await?;
+    Ok(())
+}
+
+// Why `rule` may not be saved beside `rules` as the rule `id` names (none
+// for a new rule): another rule has its name, whatever the case, or covers
+// one of its hosts.
+fn collision(rules: &[TrackerRule], id: Option<u32>, rule: &TrackerRule) -> Option<String> {
+    let others = || rules.iter().filter(move |other| Some(other.id) != id);
+    let key = TrackerRule::name_key(&rule.name);
+    if let Some(other) = others().find(|other| TrackerRule::name_key(&other.name) == key) {
+        return Some(format!("a rule named {} exists", other.name));
+    }
+    others().find_map(|other| {
+        rule.host_patterns
+            .iter()
+            .find(|pattern| other.host_patterns.contains(pattern))
+            .map(|pattern| format!("{pattern} is covered by {}", other.name))
+    })
+}
+
 pub trait SettingsRepositoryQueries {
     fn list_tracker_rules(&self) -> Result<Vec<TrackerRule>, StateError>;
     fn insert_tracker_rule(
@@ -257,9 +304,27 @@ impl<T: std::borrow::Borrow<Database> + ?Sized> SettingsRepositoryQueries for T 
                 &[],
             )
             .await?;
-            rows.iter()
+            let mut rules = rows
+                .iter()
                 .map(|row| tracker_rule_from_row(row, key.as_ref()))
-                .collect()
+                .collect::<Result<Vec<_>, _>>()?;
+            let hosts = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT rule_id, pattern FROM tracker_rule_hosts ORDER BY rule_id, position",
+                &[],
+            )
+            .await?;
+            let at: std::collections::HashMap<i64, usize> = rules
+                .iter()
+                .enumerate()
+                .map(|(place, rule)| (i64::from(rule.id), place))
+                .collect();
+            for host in hosts {
+                if let Some(&place) = at.get(&host.i64("rule_id")?) {
+                    rules[place].host_patterns.push(host.text("pattern")?);
+                }
+            }
+            Ok(rules)
         })
     }
 
@@ -299,6 +364,7 @@ impl<T: std::borrow::Borrow<Database> + ?Sized> SettingsRepositoryQueries for T 
                         &values,
                     )
                     .await?;
+                    write_hosts(tx, rule.id, &rule.host_patterns).await?;
                     Ok(rule)
                 })
             })
@@ -312,11 +378,15 @@ impl<T: std::borrow::Borrow<Database> + ?Sized> SettingsRepositoryQueries for T 
         let datastore = db.datastore();
         let mut args = tracker_rule_args(rule, db.encryption_key())?;
         args.extend([SqlArg::I64(now_ms), SqlArg::I64(i64::from(rule.id))]);
+        let (id, patterns) = (rule.id, rule.host_patterns.clone());
         db.run_sql_blocking(async move {
-            let changed = SqlRuntime::execute(
-                datastore.write_exec(),
+            SqlRuntime::run_in_transaction(&datastore, "update_tracker_rule", |tx| {
+                let args = args.clone();
+                let patterns = patterns.clone();
+                Box::pin(async move {
+            let changed = tx.execute(
                 "UPDATE tracker_rules
-                    SET host_pattern = {}, seeding = {}, never_pause = {}, unpack = {}, client = {}, torrent_route = {},
+                    SET name = {}, seeding = {}, never_pause = {}, unpack = {}, client = {}, torrent_route = {},
                         dht = {}, pex = {}, lsd = {}, encryption = {}, upload_cap = {}, forced = {},
                         ssl_certificate = {}, ssl_private_key = {}, bound = {}, archive_passwords = {},
                         peer_tcp = {}, peer_utp = {}, prefer_downloading = {}, prefer_seeding = {},
@@ -325,12 +395,18 @@ impl<T: std::borrow::Borrow<Database> + ?Sized> SettingsRepositoryQueries for T 
                 &args,
             )
             .await?;
+            if changed > 0 {
+                write_hosts(tx, id, &patterns).await?;
+            }
             Ok(changed > 0)
+                })
+            })
+            .await
         })
     }
 
-    // Returns whether the rule existed. A torrent it matched keeps no rule
-    // until its trackers are matched again. Its torrent route goes with it,
+    // Returns whether the rule existed; its hosts go with it. A torrent it
+    // matched keeps no rule until its trackers are matched again. Its torrent route goes with it,
     // so a rule given its id later starts on the default route.
     fn delete_tracker_rule(&self, id: u32) -> Result<bool, StateError> {
         let db = self.borrow();
@@ -362,7 +438,8 @@ impl<T: std::borrow::Borrow<Database> + ?Sized> SettingsRepositoryQueries for T 
     // rule `keeps_ssl` keeps its identity, and one `keeps_passwords` its
     // archive passwords. A rule a tracker file binds stays
     // bound, and a change to a field the file locked is refused, as is a
-    // second rule for one pattern; the refusal is the inner error.
+    // second rule of one name or for one pattern; the refusal is the inner
+    // error.
     fn save_tracker_rule(
         &self,
         id: Option<u32>,
@@ -387,11 +464,8 @@ impl<T: std::borrow::Borrow<Database> + ?Sized> SettingsRepositoryQueries for T 
         {
             return Ok(Err(refusal));
         }
-        if rules
-            .iter()
-            .any(|other| other.host_pattern == rule.host_pattern && Some(other.id) != id)
-        {
-            return Ok(Err(format!("a rule for {} exists", rule.host_pattern)));
+        if let Some(refusal) = collision(&rules, id, &rule) {
+            return Ok(Err(refusal));
         }
         match id {
             Some(_) if !self.update_tracker_rule(&rule, now_ms)? => {
@@ -405,18 +479,20 @@ impl<T: std::borrow::Borrow<Database> + ?Sized> SettingsRepositoryQueries for T 
         self.list_tracker_rules().map(Ok)
     }
 
-    // Fill the rule whose pattern is the file's, or a new one, from `file`,
-    // and return the rule.
+    // Fill the rule that holds one of the file's hosts, or a new one, from
+    // `file`, and return the rule. A file two rules' hosts cover, or one
+    // whose new rule's name another rule has, is refused as a conflict.
     fn apply_tracker_file(
         &self,
         file: &super::tracker_file::TrackerFile,
         now_ms: i64,
     ) -> Result<TrackerRule, StateError> {
         let rules = self.list_tracker_rules()?;
-        let existing = rules
-            .iter()
-            .find(|rule| rule.host_pattern == file.host_pattern);
+        let existing = file.rule_in(&rules).map_err(StateError::Conflict)?;
         let rule = file.apply(existing, now_ms);
+        if let Some(refusal) = collision(&rules, existing.map(|rule| rule.id), &rule) {
+            return Err(StateError::Conflict(refusal));
+        }
         match existing {
             Some(_) => {
                 self.update_tracker_rule(&rule, now_ms)?;

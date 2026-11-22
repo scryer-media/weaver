@@ -166,14 +166,17 @@ impl SeedingTermsGql {
 #[derive(Clone, Debug, SimpleObject)]
 #[graphql(name = "ScheduleSeeding")]
 pub struct ScheduleSeedingGql {
-    pub host_pattern: String,
+    pub rule_id: u32,
+    /// The rule's name.
+    pub name: String,
     pub torrents: u32,
 }
 
 impl From<ScheduleSeeding> for ScheduleSeedingGql {
     fn from(seeding: ScheduleSeeding) -> Self {
         Self {
-            host_pattern: seeding.host_pattern,
+            rule_id: seeding.rule_id,
+            name: seeding.name,
             torrents: seeding.torrents,
         }
     }

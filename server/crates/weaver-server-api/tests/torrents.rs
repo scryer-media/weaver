@@ -899,7 +899,7 @@ async fn a_tracker_rule_keeps_the_client_its_torrents_name_themselves_as() {
     let save = |id: &str, client: &str| {
         format!(
             r#"mutation {{ saveTrackerRule({id} input: {{
-                hostPattern: "tracker.test", client: {client}
+                name: "tracker.test", hostPatterns: ["tracker.test"], client: {client}
             }}) {{ id client }} }}"#
         )
     };
@@ -945,7 +945,7 @@ async fn a_tracker_rule_keeps_its_torrents_peer_terms() {
     let save = |id: &str, terms: &str| {
         format!(
             r#"mutation {{ saveTrackerRule({id} input: {{
-                hostPattern: "*.example-tracker.test", client: QBITTORRENT, {terms}
+                name: "*.example-tracker.test", hostPatterns: ["*.example-tracker.test"], client: QBITTORRENT, {terms}
             }}) {{ {fields} }} }}"#
         )
     };
@@ -1075,7 +1075,7 @@ async fn a_tracker_rule_keeps_its_ssl_certificate() {
     let save = |id: &str, ssl: &str| {
         format!(
             r#"mutation {{ saveTrackerRule({id} input: {{
-                hostPattern: "ssl-tracker.test", forced: true, {ssl}
+                name: "ssl-tracker.test", hostPatterns: ["ssl-tracker.test"], forced: true, {ssl}
             }}) {{ {fields} }} }}"#
         )
     };
@@ -1127,7 +1127,7 @@ async fn a_tracker_rule_keeps_whether_its_torrents_route_themselves() {
     let save = |id: &str, route: &str| {
         format!(
             r#"mutation {{ saveTrackerRule({id} input: {{
-                hostPattern: "tracker.test"{route}
+                name: "tracker.test", hostPatterns: ["tracker.test"]{route}
             }}) {{ id torrentRoute }} }}"#
         )
     };
@@ -1167,22 +1167,27 @@ async fn a_tracker_rule_sets_the_goals_of_the_torrents_announcing_to_its_hosts()
         assert!(response.errors.is_empty(), "{:?}", response.errors);
         response.data.into_json().unwrap()
     };
-    let rule = |id: &str, pattern: &str| {
+    let rule = |id: &str, name: &str, pattern: &str| {
         format!(
             r#"mutation {{ saveTrackerRule({id} input: {{
-                hostPattern: "{pattern}", neverPause: true,
+                name: "{name}", hostPatterns: ["{pattern}"], neverPause: true,
                 seeding: {{ ratioGoal: {{ state: SET, value: 3 }} }}
-            }}) {{ id hostPattern neverPause seeding {{ ratioGoal {{ value }} }} }} }}"#
+            }}) {{ id name hostPatterns neverPause seeding {{ ratioGoal {{ value }} }} }} }}"#
         )
     };
 
-    let saved = read(rule("", " *.Tracker.TEST. ")).await;
+    let saved = read(rule("", " Example ", " *.Tracker.TEST. ")).await;
     let saved = &saved["saveTrackerRule"][0];
-    assert_eq!(saved["hostPattern"], "*.tracker.test");
+    assert_eq!(saved["name"], "Example");
+    assert_eq!(saved["hostPatterns"], serde_json::json!(["*.tracker.test"]));
     assert_eq!(saved["neverPause"], true);
     assert_eq!(saved["seeding"]["ratioGoal"]["value"], 3.0);
     let rule_id = saved["id"].as_u64().unwrap();
-    for refused in [rule("", "*.tracker.test"), rule("", "not a host")] {
+    for refused in [
+        rule("", "Other", "*.tracker.test"),
+        rule("", "Other", "not a host"),
+        rule("", "EXAMPLE", "*.other.test"),
+    ] {
         assert!(!rig.execute(&refused).await.errors.is_empty());
     }
 
@@ -1210,11 +1215,11 @@ async fn a_tracker_rule_sets_the_goals_of_the_torrents_announcing_to_its_hosts()
         torrent["seedingPolicy"]["levels"]["ratioGoal"],
         "TRACKER_RULE"
     );
-    assert_eq!(torrent["trackerRule"], "*.tracker.test");
+    assert_eq!(torrent["trackerRule"], "Example");
     assert_eq!(torrent["seedingPolicy"]["ratioGoal"], 3.0);
     // No schedule pause is in force, so none is left seeding through one.
     assert_eq!(
-        read("{ scheduleSeeding { hostPattern torrents } }".into()).await["scheduleSeeding"],
+        read("{ scheduleSeeding { ruleId name torrents } }".into()).await["scheduleSeeding"],
         serde_json::json!([])
     );
 
@@ -1247,7 +1252,7 @@ async fn the_rules_in_force_are_the_ones_each_save_leaves() {
     let rule = |id: &str, ratio: u32, route: bool| {
         format!(
             r#"mutation {{ saveTrackerRule({id} input: {{
-                hostPattern: "*.tracker.test", torrentRoute: {route},
+                name: "*.tracker.test", hostPatterns: ["*.tracker.test"], torrentRoute: {route},
                 seeding: {{ ratioGoal: {{ state: SET, value: {ratio} }} }}
             }}) {{ id }} }}"#
         )
@@ -1643,7 +1648,7 @@ async fn the_torrent_routes_are_listed_with_their_scopes_and_reasons() {
     let response = rig
         .execute(
             r#"mutation { saveTrackerRule(input: {
-                hostPattern: "tracker.test", torrentRoute: true
+                name: "tracker.test", hostPatterns: ["tracker.test"], torrentRoute: true
             }) { id } }"#,
         )
         .await;
@@ -1964,7 +1969,7 @@ async fn the_routes_and_trackers_say_who_resolves_their_names() {
     let response = rig
         .execute(
             r#"mutation { saveTrackerRule(input: {
-                hostPattern: "tracker.test", torrentRoute: true
+                name: "tracker.test", hostPatterns: ["tracker.test"], torrentRoute: true
             }) { id } }"#,
         )
         .await;
@@ -2123,7 +2128,7 @@ fn tracker_file(revision: &str) -> (String, String) {
         "version = 1
 name = \"Example Tracker\"
 revision = \"{revision}\"
-host_pattern = \"*.tracker.test\"
+host_patterns = [\"*.tracker.test\"]
 [required]
 dht = false
 [recommended]
@@ -2164,7 +2169,7 @@ async fn a_tracker_file_is_previewed_then_applied_by_its_fingerprint() {
     let preview_query = |file: &str| {
         format!(
             r#"mutation {{ previewTrackerFile(file: "{file}", password: "upload-secret-word") {{
-                name revision hostPattern ruleId hasSsl sslSubject sslNotAfter
+                name revision hostPatterns ruleId ruleName hasSsl sslSubject sslNotAfter
                 archivePasswordCount fingerprint changes {{ field locked old new }}
             }} }}"#
         )
@@ -2173,7 +2178,7 @@ async fn a_tracker_file_is_previewed_then_applied_by_its_fingerprint() {
         format!(
             r#"mutation {{ applyTrackerFile(file: "{file}", password: "upload-secret-word",
                 fingerprint: "{fingerprint}") {{
-                id hostPattern dht pex seeding {{ ratioGoal {{ state value }} }} hasSsl sslSubject
+                id name hostPatterns dht pex seeding {{ ratioGoal {{ state value }} }} hasSsl sslSubject
                 bound {{ name revision locked }} archivePasswordCount
             }} }}"#
         )
@@ -2187,8 +2192,8 @@ async fn a_tracker_file_is_previewed_then_applied_by_its_fingerprint() {
     assert_eq!(
         preview,
         serde_json::json!({
-            "name": "Example Tracker", "revision": "1", "hostPattern": "*.tracker.test",
-            "ruleId": null, "hasSsl": true, "sslSubject": "CN=user-1",
+            "name": "Example Tracker", "revision": "1", "hostPatterns": ["*.tracker.test"],
+            "ruleId": null, "ruleName": null, "hasSsl": true, "sslSubject": "CN=user-1",
             "sslNotAfter": 1_924_992_000_000_i64, "archivePasswordCount": 1,
             "fingerprint": fingerprint,
             "changes": [
@@ -2221,7 +2226,7 @@ async fn a_tracker_file_is_previewed_then_applied_by_its_fingerprint() {
     assert_eq!(
         rules,
         serde_json::json!([{
-            "id": id, "hostPattern": "*.tracker.test", "dht": false, "pex": false,
+            "id": id, "name": "Example Tracker", "hostPatterns": ["*.tracker.test"], "dht": false, "pex": false,
             "seeding": { "ratioGoal": { "state": "SET", "value": 1.5 } }, "hasSsl": true, "sslSubject": "CN=user-1",
             "bound": { "name": "Example Tracker", "revision": "1", "locked": ["dht", "ssl"] },
             "archivePasswordCount": 1,
@@ -2242,7 +2247,7 @@ async fn a_tracker_file_is_previewed_then_applied_by_its_fingerprint() {
     let refused = rig
         .execute(&format!(
             r#"mutation {{ saveTrackerRule(id: {id}, input: {{
-                hostPattern: "*.tracker.test", dht: true, pex: false
+                name: "*.tracker.test", hostPatterns: ["*.tracker.test"], dht: true, pex: false
             }}) {{ id }} }}"#
         ))
         .await;
@@ -2289,7 +2294,7 @@ async fn a_tracker_file_is_previewed_then_applied_by_its_fingerprint() {
     let save = |clear: bool| {
         format!(
             r#"mutation {{ saveTrackerRule(id: {id}, input: {{
-                hostPattern: "*.tracker.test", dht: false, pex: false,
+                name: "*.tracker.test", hostPatterns: ["*.tracker.test"], dht: false, pex: false,
                 clearArchivePasswords: {clear}
             }}) {{ archivePasswordCount }} }}"#
         )
@@ -2333,7 +2338,7 @@ async fn a_tracker_file_that_cannot_be_read_is_refused_plainly() {
         )
     };
     let unknown = base64::engine::general_purpose::STANDARD.encode(
-        "version = 1\nname = \"T\"\nrevision = \"1\"\nhost_pattern = \"t.test\"\nclient = \"x\"\n",
+        "version = 1\nname = \"T\"\nrevision = \"1\"\nhost_patterns = [\"t.test\"]\nclient = \"x\"\n",
     );
     let huge = "A".repeat(2 << 20);
     for (file, refusal) in [

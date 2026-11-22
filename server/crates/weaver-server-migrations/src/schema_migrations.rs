@@ -632,7 +632,7 @@ pub async fn mirror_schema_version(
 
 use crate::{MIGRATION_21_BASE_SCHEMA_SQL, MIGRATION_22_SCHEMA_SQL};
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-pub const CURRENT_SCHEMA_VERSION: i64 = 136;
+pub const CURRENT_SCHEMA_VERSION: i64 = 137;
 
 #[expect(
     clippy::disallowed_methods,

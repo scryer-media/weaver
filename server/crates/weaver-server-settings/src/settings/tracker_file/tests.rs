@@ -14,7 +14,7 @@ const MINIMAL: &str = r#"
 version = 1
 name = "Example Tracker"
 revision = "2026-10-25"
-host_pattern = "*.Tracker.Example."
+host_patterns = ["*.Tracker.Example.", "announce.tracker.net", "*.tracker.example"]
 "#;
 
 fn with(extra: &str) -> String {
@@ -196,7 +196,10 @@ values = ["first", " inner space ", "first", "   ", ""]
     let file = read(text.as_bytes(), None).unwrap();
     assert_eq!(file.name, "Example Tracker");
     assert_eq!(file.revision, "2026-10-25");
-    assert_eq!(file.host_pattern, "*.tracker.example");
+    assert_eq!(
+        file.host_patterns,
+        ["*.tracker.example", "announce.tracker.net"]
+    );
     assert_eq!(
         file.required,
         Terms {
@@ -378,7 +381,25 @@ fn a_tracker_file_refuses_what_it_may_not_set() {
         (MINIMAL.replace("2026-10-25", &"r".repeat(65)), "64 bytes"),
         (
             MINIMAL.replace("*.Tracker.Example.", "tracker example"),
-            "host_pattern",
+            "host_patterns",
+        ),
+        (
+            MINIMAL.replace("*.Tracker.Example.", "*.com"),
+            "host_patterns",
+        ),
+        (
+            MINIMAL.replace(
+                r#"["*.Tracker.Example.", "announce.tracker.net", "*.tracker.example"]"#,
+                "[]",
+            ),
+            "names no host",
+        ),
+        (
+            MINIMAL.replace(
+                r#"["*.Tracker.Example.", "announce.tracker.net", "*.tracker.example"]"#,
+                r#""tracker.example""#,
+            ),
+            "list of hosts",
         ),
         ("not = [toml".to_owned(), "not TOML"),
     ] {
@@ -654,4 +675,69 @@ fn no_more_than_two_tracker_archives_decode_at_once() {
     read(MINIMAL.as_bytes(), None).unwrap();
     drop(held);
     read(&archive, None).unwrap();
+}
+
+// A new rule takes the file's name and hosts; a rule that exists keeps its
+// name and the hosts it adds, and while bound may add hosts but not drop
+// the file's. A file whose hosts two rules cover is refused.
+#[test]
+fn a_tracker_file_binds_its_hosts_and_leaves_the_name() {
+    let file = read(MINIMAL.as_bytes(), None).unwrap();
+    let made = file.apply(None, 1);
+    assert_eq!(made.name, "Example Tracker");
+    assert_eq!(made.host_patterns, file.host_patterns);
+
+    let own = TrackerRule {
+        id: 4,
+        name: "ET".to_owned(),
+        host_patterns: vec![
+            "mirror.example.net".to_owned(),
+            "*.tracker.example".to_owned(),
+        ],
+        ..TrackerRule::default()
+    };
+    let other = TrackerRule {
+        id: 5,
+        name: "Other".to_owned(),
+        host_patterns: vec!["announce.tracker.net".to_owned()],
+        ..TrackerRule::default()
+    };
+    assert_eq!(
+        file.rule_in(std::slice::from_ref(&own))
+            .unwrap()
+            .map(|rule| rule.id),
+        Some(4)
+    );
+    assert!(file.rule_in(&[]).unwrap().is_none());
+    let error = file.rule_in(&[own.clone(), other]).unwrap_err();
+    assert!(error.contains("ET and Other"), "{error}");
+
+    let bound = file.apply(Some(&own), 2);
+    assert_eq!(bound.name, "ET");
+    assert_eq!(
+        bound.host_patterns,
+        [
+            "mirror.example.net",
+            "*.tracker.example",
+            "announce.tracker.net"
+        ]
+    );
+    let mut added = bound.clone();
+    added.host_patterns.push("extra.example.org".to_owned());
+    added.name = "Renamed".to_owned();
+    assert_eq!(check_locks(&bound, &added), Ok(()));
+    let mut dropped_own = bound.clone();
+    dropped_own
+        .host_patterns
+        .retain(|pattern| pattern != "mirror.example.net");
+    assert_eq!(check_locks(&bound, &dropped_own), Ok(()));
+    let mut dropped_file = bound.clone();
+    dropped_file
+        .host_patterns
+        .retain(|pattern| pattern != "announce.tracker.net");
+    let error = check_locks(&bound, &dropped_file).unwrap_err();
+    assert!(
+        error.starts_with("announce.tracker.net is locked"),
+        "{error}"
+    );
 }

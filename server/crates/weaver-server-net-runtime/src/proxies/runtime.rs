@@ -313,7 +313,7 @@ impl ProxyRuntime {
                     .map(|rule| {
                         (
                             Consumer::Torrent(TorrentScope::TrackerRule(rule.id)),
-                            rule.host_pattern,
+                            rule.name,
                             1,
                         )
                     }),

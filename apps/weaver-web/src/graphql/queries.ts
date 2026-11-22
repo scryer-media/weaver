@@ -1788,7 +1788,8 @@ export const UPDATE_TORRENT_SETTINGS_MUTATION = gql`
 const TRACKER_RULE_FIELDS = `
   fragment TrackerRuleFields on TrackerRule {
     id
-    hostPattern
+    name
+    hostPatterns
     seeding {
       ...SeedingPolicyFields
     }
@@ -1818,6 +1819,7 @@ const TRACKER_RULE_FIELDS = `
       revision
       importedAt
       locked
+      hostPatterns
     }
   }
   ${SEEDING_POLICY_FIELDS}
@@ -1900,8 +1902,9 @@ export const PREVIEW_TRACKER_FILE_MUTATION = gql`
     previewTrackerFile(file: $file, password: $password) {
       name
       revision
-      hostPattern
+      hostPatterns
       ruleId
+      ruleName
       changes {
         field
         locked
@@ -1939,7 +1942,8 @@ export const UNBIND_TRACKER_RULE_MUTATION = gql`
 export const SCHEDULE_SEEDING_QUERY = gql`
   query ScheduleSeeding {
     scheduleSeeding {
-      hostPattern
+      ruleId
+      name
       torrents
     }
   }

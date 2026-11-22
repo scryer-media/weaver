@@ -1969,3 +1969,20 @@ kind = "sql"
 file = "migrations/0136_rss_seen_by_feed/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 137
+description = "name tracker rules and let one rule name many hosts"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0137_tracker_rule_names/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0137_tracker_rule_names/postgres.sql"
+engine = "postgres"
+scope = "all"

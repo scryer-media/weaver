@@ -716,7 +716,7 @@ async fn a_tracker_rule_with_its_own_route_is_listed_and_routed() {
     let h = harness().await;
     let save = |id: &str, route: bool| {
         format!(
-            r#"mutation {{ saveTrackerRule({id} input: {{ hostPattern: "tracker.test", torrentRoute: {route} }}) {{ id }} }}"#
+            r#"mutation {{ saveTrackerRule({id} input: {{ name: "tracker.test", hostPatterns: ["tracker.test"], torrentRoute: {route} }}) {{ id }} }}"#
         )
     };
     let response = h.execute(&save("", true)).await;

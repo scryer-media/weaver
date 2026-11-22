@@ -3,7 +3,17 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { announceHosts, hostPatterns, patternsOf, torrentAnnounces, trackerHost } from "../src/lib/tracker-hosts.ts";
+import {
+  announceHosts,
+  domainPattern,
+  hostPatterns,
+  patternParts,
+  patternsOf,
+  torrentAnnounces,
+  torrentTrackers,
+  trackerHost,
+  typedPattern,
+} from "../src/lib/tracker-hosts.ts";
 
 const bytes = (text: string) => new TextEncoder().encode(text);
 const str = (text: string) => `${bytes(text).length}:${text}`;
@@ -49,4 +59,26 @@ test("a torrent without trackers reads as none, and other bytes as no torrent", 
   assert.equal(torrentAnnounces(bytes("d8:announce")), null);
   assert.equal(torrentAnnounces(bytes("<html></html>")), null);
   assert.equal(torrentAnnounces(bytes(`d${str("announce")}${str("https://t.example.org")}e`)), null);
+});
+
+test("a typed domain covers the hosts under it; an address or one label stays as typed", () => {
+  assert.equal(typedPattern(" IPTorrents.com. "), "*.iptorrents.com");
+  assert.equal(typedPattern("*.iptorrents.com"), "*.iptorrents.com");
+  assert.equal(typedPattern("tracker.example.org"), "*.tracker.example.org");
+  assert.equal(typedPattern("10.0.0.2"), "10.0.0.2");
+  assert.equal(typedPattern("localhost"), "localhost");
+  assert.equal(domainPattern("tracker.example.org"), "*.example.org");
+  assert.equal(domainPattern("example.org"), "*.example.org");
+  assert.equal(domainPattern("10.0.0.2"), "10.0.0.2");
+  assert.deepEqual(patternParts("*.example.org"), { host: "example.org", under: true });
+  assert.deepEqual(patternParts("t.example.org"), { host: "t.example.org", under: false });
+});
+
+test("a torrent file says whether it is private", () => {
+  const info = (extra: string) => `d${str("name")}${str("a")}${extra}e`;
+  const file = (extra: string) => bytes(`d${str("announce")}${str("https://t.example.org/a")}${str("info")}${info(extra)}e`);
+  assert.equal(torrentTrackers(file(`${str("private")}i1e`))?.private, true);
+  assert.equal(torrentTrackers(file(`${str("private")}i0e`))?.private, false);
+  assert.equal(torrentTrackers(file(""))?.private, false);
+  assert.equal(torrentTrackers(file(""))?.main, "https://t.example.org/a");
 });

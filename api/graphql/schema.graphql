@@ -4821,7 +4821,11 @@ input SchedulePruneFilesInput {
 The torrents the schedule's pause leaves seeding under one tracker rule.
 """
 type ScheduleSeeding {
-	hostPattern: String!
+	ruleId: Int!
+	"""
+	The rule's name.
+	"""
+	name: String!
 	torrents: Int!
 }
 
@@ -7201,6 +7205,10 @@ type TrackerBinding {
 	The fields the file locked: dht, pex, lsd, encryption, ssl.
 	"""
 	locked: [String!]!
+	"""
+	The hosts the file covers, which the rule keeps while bound.
+	"""
+	hostPatterns: [String!]!
 }
 
 """
@@ -7228,10 +7236,11 @@ What importing a tracker file would do. It holds nothing secret.
 type TrackerFilePreview {
 	name: String!
 	revision: String!
-	hostPattern: String!
+	hostPatterns: [String!]!
 	"""
 	The rule the file fills; absent makes a new rule.
 	"""
+	ruleName: String
 	ruleId: Int
 	changes: [TrackerFileChange!]!
 	hasSsl: Boolean!
@@ -7251,15 +7260,20 @@ type TrackerFilePreview {
 }
 
 """
-Seeding goals for the torrents announcing to a host, and whether the
-schedule's pause leaves them seeding until their goal is met.
+Seeding goals for the torrents announcing to the hosts it covers, and
+whether the schedule's pause leaves them seeding until their goal is met.
 """
 type TrackerRule {
 	id: Int!
 	"""
-	A host, or `*.` and a host for it and every host under it.
+	What the tracker is called; unique whatever its case.
 	"""
-	hostPattern: String!
+	name: String!
+	"""
+	The hosts it covers, each a host, or `*.` and a domain for it and
+	every host under it. A torrent is matched when added and at start-up.
+	"""
+	hostPatterns: [String!]!
 	"""
 	The goals this rule sets; absent leaves them to the category and the
 	global policy.
@@ -7349,7 +7363,8 @@ type TrackerRule {
 }
 
 input TrackerRuleInput {
-	hostPattern: String!
+	name: String!
+	hostPatterns: [String!]!
 	seeding: SeedingPolicyInput
 	neverPause: Boolean! = false
 	unpack: Boolean

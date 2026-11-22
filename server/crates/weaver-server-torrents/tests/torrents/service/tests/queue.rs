@@ -483,7 +483,8 @@ async fn a_never_pause_rule_keeps_its_torrents_seeding_through_the_schedule() {
                 archive_passwords: Default::default(),
                 bound: None,
                 id: 0,
-                host_pattern: "*.test".into(),
+                name: "*.test".into(),
+                host_patterns: vec!["*.test".into()],
                 seeding: Some(SeedingPolicy {
                     ratio_goal: Leaf::Set(2.0),
                     ..SeedingPolicy::default()
@@ -572,7 +573,8 @@ async fn a_never_pause_rule_keeps_its_torrents_seeding_through_the_schedule() {
         assert_eq!(
             rig.service.schedule_seeding().await,
             [ScheduleSeeding {
-                host_pattern: "*.test".into(),
+                rule_id: rule.id,
+                name: "*.test".into(),
                 torrents: 1,
             }]
         );

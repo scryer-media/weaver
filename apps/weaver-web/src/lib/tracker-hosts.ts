@@ -42,6 +42,35 @@ export function hostPatterns(host: string): string[] {
   return [host, `*.${labels.length > 2 ? labels.slice(1).join(".") : host}`];
 }
 
+/**
+ * The pattern a rule keeps for `host` when it covers the host's site: the
+ * wildcard over its parent domain, or over the host when it is a domain of
+ * two labels; an address or a single label as itself.
+ */
+export function domainPattern(host: string): string {
+  const patterns = hostPatterns(host);
+  return patterns[patterns.length - 1];
+}
+
+/**
+ * The pattern a typed host or domain is kept as: a domain covers itself and
+ * every host under it, so `example.org` and `*.example.org` both keep
+ * `*.example.org`; an address or a single label is kept as typed. The daemon
+ * checks it on save.
+ */
+export function typedPattern(typed: string): string {
+  const text = typed.trim().toLowerCase().replace(/\.+$/, "");
+  if (text === "" || text.startsWith("*.") || IPV4.test(text) || !text.includes(".")) {
+    return text;
+  }
+  return `*.${text}`;
+}
+
+/** What a pattern names as the editor shows it: the domain or host, and whether hosts under it count. */
+export function patternParts(pattern: string): { host: string; under: boolean } {
+  return pattern.startsWith("*.") ? { host: pattern.slice(2), under: true } : { host: pattern, under: false };
+}
+
 /** The patterns that name `hosts`, each once, in the order the hosts come. */
 export function patternsOf(hosts: readonly string[]): string[] {
   return [...new Set(hosts.filter(nameable).flatMap(hostPatterns))];
@@ -112,11 +141,13 @@ export function torrentAnnounces(bytes: Uint8Array): string[] | null {
 
 /**
  * A .torrent file's trackers: every announce URL as `torrentAnnounces` gives
- * them, and its main one, the lone announce URL the site that made it
- * names, or else the first of its announce list. Null when the bytes are not
- * a torrent.
+ * them, its main one, the lone announce URL the site that made it names, or
+ * else the first of its announce list, and whether its info dictionary marks
+ * it private. Null when the bytes are not a torrent.
  */
-export function torrentTrackers(bytes: Uint8Array): { main: string | null; all: string[] } | null {
+export function torrentTrackers(
+  bytes: Uint8Array,
+): { main: string | null; all: string[]; private: boolean } | null {
   let root: Bencoded;
   try {
     root = decode(bytes, 0)[0];
@@ -129,5 +160,10 @@ export function torrentTrackers(bytes: Uint8Array): { main: string | null; all: 
   const tiers = root.get("announce-list");
   const listed = Array.isArray(tiers) ? tiers.flatMap((tier) => (Array.isArray(tier) ? tier.flatMap(text) : [])) : [];
   const announce = text(root.get("announce"));
-  return { main: announce[0] ?? listed[0] ?? null, all: [...new Set([...listed, ...announce])] };
+  const info = root.get("info") as Map<string, Bencoded>;
+  return {
+    main: announce[0] ?? listed[0] ?? null,
+    all: [...new Set([...listed, ...announce])],
+    private: info.get("private") === 1,
+  };
 }

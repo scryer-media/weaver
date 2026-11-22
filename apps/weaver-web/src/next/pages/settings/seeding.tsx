@@ -310,8 +310,10 @@ export function LeafControl<T>({
     { value: "SET", label: t("next.seeding.leafSet") },
   ];
   const value = leafValue(leaf);
+  // The value goes under the state, so a set goal stays as narrow as the
+  // state picker and the row keeps room for its label.
   return (
-    <div className="flex flex-wrap items-center gap-[10px]">
+    <div className="flex flex-col items-start gap-[8px] sm:items-end">
       <Segmented<LeafState>
         label={label}
         testId={fieldId === undefined ? undefined : testIds.field(fieldId)}
@@ -487,10 +489,10 @@ export function seedingFields(
           fallback={1440}
           onChange={(seedTimeGoalMinutes) => patch({ seedTimeGoalMinutes })}
           input={(value, onValue) => (
-            <>
+            <div className="flex flex-col items-start gap-[8px] sm:items-end">
               {durationField(seedTimeLabel, seedTimeId)(value, onValue)}
               {continuous}
-            </>
+            </div>
           )}
         />
       ) : (

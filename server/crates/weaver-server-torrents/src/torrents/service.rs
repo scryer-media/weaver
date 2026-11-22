@@ -30,7 +30,7 @@ use crate::persistence::Database;
 use crate::pipeline::ExtractionLimits;
 use crate::pipeline::graph::engine::{DecodePool, Outside, RunMail, Said};
 use crate::pipeline::graph::status::RepairSlots;
-use crate::settings::model::{TrackerCertificate, TrackerRule, tracker_rule_for};
+use crate::settings::model::{TrackerCertificate, TrackerRule};
 use crate::settings::{Config, TorrentEncryption, TransportRule};
 use crate::torrents::identity::TorrentIdentity;
 use crate::torrents::intake::Heard as IntakeHeard;
@@ -1184,12 +1184,9 @@ impl TorrentService {
 
     // The rule a torrent announcing to `trackers` follows.
     fn rule_id<'t>(&self, trackers: impl IntoIterator<Item = &'t TrackerEntry>) -> Option<u32> {
-        let rules = self.rules();
-        tracker_rule_for(
-            &rules,
-            trackers.into_iter().map(|tracker| tracker.url.as_str()),
-        )
-        .map(|rule| rule.id)
+        self.rules()
+            .rule_for(trackers.into_iter().map(|tracker| tracker.url.as_str()))
+            .map(|rule| rule.id)
     }
 
     // The holds the queue has in force.

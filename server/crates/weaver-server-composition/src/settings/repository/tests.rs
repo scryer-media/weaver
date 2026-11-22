@@ -487,7 +487,8 @@ fn tracker_rules_crud() {
                 archive_passwords: Default::default(),
                 bound: None,
                 id: 0,
-                host_pattern: "*.example.org".into(),
+                name: "*.example.org".into(),
+                host_patterns: vec!["*.example.org".into()],
                 seeding: Some(seeding),
                 never_pause: true,
                 unpack: Some(false),
@@ -511,7 +512,8 @@ fn tracker_rules_crud() {
                 archive_passwords: Default::default(),
                 bound: None,
                 id: 0,
-                host_pattern: "tracker.invalid".into(),
+                name: "tracker.invalid".into(),
+                host_patterns: vec!["tracker.invalid".into()],
                 seeding: None,
                 never_pause: false,
                 unpack: None,
@@ -586,7 +588,8 @@ fn a_kept_transmission_client_reads_as_weaver() {
                 archive_passwords: Default::default(),
                 bound: None,
                 id: 0,
-                host_pattern: "tracker.example".into(),
+                name: "tracker.example".into(),
+                host_patterns: vec!["tracker.example".into()],
                 seeding: None,
                 never_pause: false,
                 unpack: None,
@@ -646,7 +649,8 @@ fn a_tracker_rules_private_key_is_encrypted_at_rest() {
                 archive_passwords: Default::default(),
                 bound: None,
                 id: 0,
-                host_pattern: "tracker.example".into(),
+                name: "tracker.example".into(),
+                host_patterns: vec!["tracker.example".into()],
                 seeding: None,
                 never_pause: false,
                 unpack: None,
@@ -714,7 +718,7 @@ fn tracker_file(text: &str, subject: Option<&str>) -> crate::settings::tracker_f
         )
     });
     let text = format!(
-        "version = 1\nname = \"Example Tracker\"\nhost_pattern = \"*.tracker.example\"\n{text}\n{}",
+        "version = 1\nname = \"Example Tracker\"\nhost_patterns = [\"*.tracker.example\"]\n{text}\n{}",
         ssl.unwrap_or_default()
     );
     crate::settings::tracker_file::read(text.as_bytes(), None).unwrap()
@@ -912,15 +916,35 @@ fn a_tracker_file_fills_and_locks_a_rules_encryption_and_transports() {
     );
 }
 
-// A bound rule's pattern is what its file finds it by, so the ordinary save
-// refuses to move it while the binding stands; once unbound, it moves.
+// A bound rule's file hosts are what its file finds it by, so the ordinary
+// save refuses to drop them while the binding stands; once unbound, they
+// go. A host added beside them, and a new name, are the user's.
 #[test]
-fn a_bound_rule_refuses_a_change_to_its_host_pattern() {
+fn a_bound_rule_refuses_dropping_its_files_hosts() {
     let db = Database::open_in_memory().unwrap();
     let file = tracker_file("revision = \"1\"\n[recommended]\npex = false", None);
     let rule = db.apply_tracker_file(&file, 10).unwrap();
+    let added = crate::settings::model::TrackerRule {
+        name: "ET".to_owned(),
+        host_patterns: vec![
+            "*.tracker.example".to_owned(),
+            "*.elsewhere.example".to_owned(),
+        ],
+        ..rule.clone()
+    };
+    let saved = db
+        .save_tracker_rule(Some(rule.id), added, true, true, 11)
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved[0].name, "ET");
+    assert_eq!(
+        saved[0].host_patterns,
+        ["*.tracker.example", "*.elsewhere.example"]
+    );
+    assert!(saved[0].bound.is_some());
+    let rule = saved[0].clone();
     let moved = crate::settings::model::TrackerRule {
-        host_pattern: "*.elsewhere.example".to_owned(),
+        host_patterns: vec!["*.elsewhere.example".to_owned()],
         bound: None,
         ..rule.clone()
     };
@@ -930,7 +954,7 @@ fn a_bound_rule_refuses_a_change_to_its_host_pattern() {
         .unwrap_err();
     assert_eq!(
         refusal,
-        "host_pattern is locked by Example Tracker's tracker file; unbind the rule to change it."
+        "*.tracker.example is locked by Example Tracker's tracker file; unbind the rule to remove it."
     );
     assert_eq!(
         db.list_tracker_rules().unwrap(),
@@ -943,8 +967,116 @@ fn a_bound_rule_refuses_a_change_to_its_host_pattern() {
         .unwrap()
         .unwrap();
     assert_eq!(saved.len(), 1);
-    assert_eq!(saved[0].host_pattern, "*.elsewhere.example");
+    assert_eq!(saved[0].host_patterns, ["*.elsewhere.example"]);
     assert_eq!(saved[0].bound, None);
+}
+
+// One rule holds a name, whatever its case, and a pattern. A rule keeps its
+// patterns in the order saved, and deleting it frees them.
+#[test]
+fn a_rule_holds_its_name_and_patterns_alone() {
+    use crate::settings::model::TrackerRule;
+
+    let db = Database::open_in_memory().unwrap();
+    let made = |name: &str, patterns: &[&str]| TrackerRule {
+        transports: Default::default(),
+        archive_passwords: Default::default(),
+        bound: None,
+        id: 0,
+        name: name.to_owned(),
+        host_patterns: patterns.iter().map(|&p| p.to_owned()).collect(),
+        seeding: None,
+        never_pause: false,
+        unpack: None,
+        client: None,
+        torrent_route: false,
+        dht: None,
+        pex: None,
+        lsd: None,
+        encryption: None,
+        upload_cap: Leaf::Inherit,
+        forced: false,
+        ssl: None,
+    };
+    let ipt = db
+        .save_tracker_rule(
+            None,
+            made(
+                "IPT",
+                &[
+                    "*.iptorrents.com",
+                    "*.stackoverflow.tech",
+                    "ssl.empirehost.me",
+                ],
+            ),
+            true,
+            true,
+            1,
+        )
+        .unwrap()
+        .unwrap()
+        .remove(0);
+    assert_eq!(
+        ipt.host_patterns,
+        [
+            "*.iptorrents.com",
+            "*.stackoverflow.tech",
+            "ssl.empirehost.me"
+        ]
+    );
+
+    let refusal = db
+        .save_tracker_rule(None, made("ipt", &["*.other.example"]), true, true, 2)
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(refusal, "a rule named IPT exists");
+    let refusal = db
+        .save_tracker_rule(
+            None,
+            made("Other", &["*.other.example", "ssl.empirehost.me"]),
+            true,
+            true,
+            2,
+        )
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(refusal, "ssl.empirehost.me is covered by IPT");
+    assert_eq!(db.list_tracker_rules().unwrap(), std::slice::from_ref(&ipt));
+
+    // The rule's own name and patterns are no collision with itself.
+    let renamed = TrackerRule {
+        name: "iPT".to_owned(),
+        host_patterns: vec![
+            "ssl.empirehost.me".to_owned(),
+            "*.iptorrents.com".to_owned(),
+        ],
+        ..ipt.clone()
+    };
+    let saved = db
+        .save_tracker_rule(Some(ipt.id), renamed, true, true, 3)
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved[0].name, "iPT");
+    assert_eq!(
+        saved[0].host_patterns,
+        ["ssl.empirehost.me", "*.iptorrents.com"]
+    );
+
+    assert!(db.delete_tracker_rule(ipt.id).unwrap());
+    let other = db
+        .save_tracker_rule(
+            None,
+            made("IPT", &["*.stackoverflow.tech", "ssl.empirehost.me"]),
+            true,
+            true,
+            4,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        other[0].host_patterns,
+        ["*.stackoverflow.tech", "ssl.empirehost.me"]
+    );
 }
 
 // A file whose pattern a rule has fills that rule again: its required
@@ -1010,7 +1142,8 @@ seeding = { ratio_goal = 3.0, seed_time_goal_minutes = 200 }",
 
     let other = tracker_file("revision = \"1\"", None);
     let other = crate::settings::tracker_file::TrackerFile {
-        host_pattern: "other.example".into(),
+        name: "other.example".into(),
+        host_patterns: vec!["other.example".into()],
         ..other
     };
     let made = db.apply_tracker_file(&other, 4).unwrap();
@@ -1055,7 +1188,8 @@ seeding = { seed_time_goal_minutes = 100 }",
         3,
     )
     .unwrap();
-    db.apply_tracker_file(&revision("revision = \"3\""), 4).unwrap();
+    db.apply_tracker_file(&revision("revision = \"3\""), 4)
+        .unwrap();
     let last = db
         .apply_tracker_file(
             &revision(
@@ -1068,7 +1202,11 @@ seeding = { ratio_goal = 3.0, seed_time_goal_minutes = 200, inactive_goal_minute
         .unwrap();
     let seeding = last.seeding.unwrap();
     assert_eq!(seeding.ratio_goal, Leaf::Set(3.0), "skipped twice");
-    assert_eq!(seeding.seed_time_goal_minutes, Leaf::Set(200), "skipped once");
+    assert_eq!(
+        seeding.seed_time_goal_minutes,
+        Leaf::Set(200),
+        "skipped once"
+    );
     assert_eq!(seeding.inactive_goal_minutes, Leaf::Set(45), "set by hand");
 }
 
@@ -1078,7 +1216,8 @@ seeding = { ratio_goal = 3.0, seed_time_goal_minutes = 200, inactive_goal_minute
 fn a_tracker_file_fills_only_the_goals_a_hand_made_rule_leaves() {
     let db = Database::open_in_memory().unwrap();
     let made = crate::settings::model::TrackerRule {
-        host_pattern: "*.tracker.example".into(),
+        name: "*.tracker.example".into(),
+        host_patterns: vec!["*.tracker.example".into()],
         seeding: Some(crate::settings::SeedingPolicy {
             ratio_goal: Leaf::Set(5.0),
             ..crate::settings::SeedingPolicy::default()
@@ -1096,7 +1235,7 @@ fn a_tracker_file_fills_only_the_goals_a_hand_made_rule_leaves() {
 seeding = { ratio_goal = 2.0, seed_time_goal_minutes = 100 }",
         None,
     );
-    assert_eq!(file.host_pattern, rule.host_pattern);
+    assert_eq!(file.host_patterns, rule.host_patterns);
     let applied = db.apply_tracker_file(&file, 2).unwrap();
     assert_eq!(applied.id, rule.id);
     let seeding = applied.seeding.unwrap();
@@ -1304,7 +1443,8 @@ fn a_removed_route_owner_takes_its_route_row() {
                 archive_passwords: Default::default(),
                 bound: None,
                 id: 0,
-                host_pattern: "tracker.invalid".into(),
+                name: "tracker.invalid".into(),
+                host_patterns: vec!["tracker.invalid".into()],
                 seeding: None,
                 never_pause: false,
                 unpack: None,

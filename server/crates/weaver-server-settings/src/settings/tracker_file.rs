@@ -52,8 +52,8 @@ const MAX_REVISION_BYTES: usize = 64;
 pub struct TrackerFile {
     pub name: String,
     pub revision: String,
-    // As `TrackerRule::pattern` keeps it.
-    pub host_pattern: String,
+    // The hosts it covers, each as `TrackerRule::pattern` keeps it, once.
+    pub host_patterns: Vec<String>,
     // Values the rule takes and the user may not change while bound.
     pub required: Terms,
     // Values the rule takes until the user changes them.
@@ -70,7 +70,7 @@ impl std::fmt::Debug for TrackerFile {
         f.debug_struct("TrackerFile")
             .field("name", &self.name)
             .field("revision", &self.revision)
-            .field("host_pattern", &self.host_pattern)
+            .field("host_patterns", &self.host_patterns)
             .field("required", &self.required)
             .field("recommended", &self.recommended)
             .field(
@@ -157,6 +157,10 @@ pub struct Binding {
     pub locked: Vec<String>,
     #[serde(default)]
     pub recommended: Terms,
+    // The hosts the file covers: the rule keeps them while bound, and may
+    // cover more.
+    #[serde(default)]
+    pub host_patterns: Vec<String>,
 }
 
 impl Binding {
@@ -166,17 +170,25 @@ impl Binding {
 }
 
 impl TrackerFile {
-    // The rule this file makes of `rule`, or of no rule when there is none
-    // for its host pattern. A required value overwrites and is locked; a
+    // The rule this file makes of `rule`, or of no rule when none holds one
+    // of its hosts. A new rule takes the file's name, or its first host when
+    // the name is not one a rule may have; a rule that exists keeps its own,
+    // and keeps the hosts it covers besides the file's. A required value overwrites and is locked; a
     // recommended one overwrites only a value still as the last file
     // recommended it, so one the user changed stays. An identity in the
     // file replaces the rule's and is locked; a file without one leaves the
     // rule's as it is.
     pub fn apply(&self, rule: Option<&TrackerRule>, now_ms: i64) -> TrackerRule {
         let mut applied = rule.cloned().unwrap_or_else(|| TrackerRule {
-            host_pattern: self.host_pattern.clone(),
+            name: TrackerRule::name(&truncated(&self.name, TrackerRule::MAX_NAME))
+                .unwrap_or_else(|_| self.host_patterns.first().cloned().unwrap_or_default()),
             ..TrackerRule::default()
         });
+        for pattern in &self.host_patterns {
+            if !applied.host_patterns.contains(pattern) {
+                applied.host_patterns.push(pattern.clone());
+            }
+        }
         let before = rule
             .and_then(|rule| rule.bound.as_ref())
             .map(|bound| bound.recommended)
@@ -278,9 +290,36 @@ impl TrackerFile {
                 seeding: (carried != SeedingTerms::default()).then_some(carried),
                 ..*recommended
             },
+            host_patterns: self.host_patterns.clone(),
         });
         applied
     }
+
+    // The rule among `rules` this file fills: the one that holds one of its
+    // hosts, or none for a new rule. A file whose hosts two rules hold is
+    // refused, naming them.
+    pub fn rule_in<'r>(&self, rules: &'r [TrackerRule]) -> Result<Option<&'r TrackerRule>, String> {
+        let mut held = rules.iter().filter(|rule| {
+            rule.host_patterns
+                .iter()
+                .any(|pattern| self.host_patterns.contains(pattern))
+        });
+        let Some(one) = held.next() else {
+            return Ok(None);
+        };
+        match held.next() {
+            Some(other) => Err(format!(
+                "The tracker file's hosts are covered by two rules, {} and {}; remove the hosts from one of them first.",
+                one.name, other.name
+            )),
+            None => Ok(Some(one)),
+        }
+    }
+}
+
+// The first `max` characters of `text`.
+fn truncated(text: &str, max: usize) -> String {
+    text.trim().chars().take(max).collect()
 }
 
 // The recommendation, when the value is still what the last file recommended
@@ -319,11 +358,16 @@ pub fn check_locks(rule: &TrackerRule, changed: &TrackerRule) -> Result<(), Stri
     let Some(bound) = &rule.bound else {
         return Ok(());
     };
-    // The pattern is what the file binds to: a rule whose pattern moved
-    // would no longer be found by the file's next import.
-    if rule.host_pattern != changed.host_pattern {
+    // The file's hosts are what it binds to: a rule without them would no
+    // longer be found by the file's next import. Hosts the user added are
+    // the user's.
+    if let Some(pattern) = bound
+        .host_patterns
+        .iter()
+        .find(|pattern| !changed.host_patterns.contains(pattern))
+    {
         return Err(format!(
-            "host_pattern is locked by {}'s tracker file; unbind the rule to change it.",
+            "{pattern} is locked by {}'s tracker file; unbind the rule to remove it.",
             bound.name
         ));
     }
@@ -367,9 +411,10 @@ pub struct Change {
 pub struct Preview {
     pub name: String,
     pub revision: String,
-    pub host_pattern: String,
-    // The rule the file fills; `None` makes a new one.
+    pub host_patterns: Vec<String>,
+    // The rule the file fills, by its id and name; `None` makes a new one.
     pub rule_id: Option<u32>,
+    pub rule_name: Option<String>,
     pub changes: Vec<Change>,
     pub has_ssl: bool,
     pub ssl: Option<super::model::CertificateSummary>,
@@ -531,8 +576,9 @@ impl TrackerFile {
         Preview {
             name: self.name.clone(),
             revision: self.revision.clone(),
-            host_pattern: self.host_pattern.clone(),
+            host_patterns: self.host_patterns.clone(),
             rule_id: rule.map(|rule| rule.id),
+            rule_name: rule.map(|rule| rule.name.clone()),
             changes,
             has_ssl: self.ssl.is_some(),
             ssl: self.ssl.as_ref().and_then(TrackerCertificate::summary),
@@ -1023,7 +1069,7 @@ const TOP_KEYS: [&str; 8] = [
     "version",
     "name",
     "revision",
-    "host_pattern",
+    "host_patterns",
     "required",
     "recommended",
     "archive_passwords",
@@ -1052,12 +1098,7 @@ fn parse(text: &str, members: &Members) -> Result<TrackerFile, String> {
     }
     let name = text_field(&table, "name", MAX_NAME_BYTES)?;
     let revision = text_field(&table, "revision", MAX_REVISION_BYTES)?;
-    let host_pattern = match table.get("host_pattern") {
-        Some(toml::Value::String(pattern)) => TrackerRule::pattern(pattern)
-            .map_err(|error| format!("host_pattern is refused: {error}."))?,
-        Some(_) => return Err("host_pattern must be text.".to_owned()),
-        None => return Err("The tracker file has no host_pattern.".to_owned()),
-    };
+    let host_patterns = host_patterns(&table)?;
     let required = terms(&table, "required")?;
     let recommended = terms(&table, "recommended")?;
     if let Some(field) = required
@@ -1077,12 +1118,43 @@ fn parse(text: &str, members: &Members) -> Result<TrackerFile, String> {
     Ok(TrackerFile {
         name,
         revision,
-        host_pattern,
+        host_patterns,
         required,
         recommended,
         archive_passwords: archive_passwords(&table)?,
         ssl: ssl(&table, members)?,
     })
+}
+
+// The file's `host_patterns`: a list of hosts and `*.` domains, each kept as
+// a rule keeps it and once, between one and a rule's most.
+fn host_patterns(table: &toml::Table) -> Result<Vec<String>, String> {
+    let listed = match table.get("host_patterns") {
+        Some(toml::Value::Array(listed)) => listed,
+        Some(_) => return Err("host_patterns must be a list of hosts.".to_owned()),
+        None => return Err("The tracker file has no host_patterns.".to_owned()),
+    };
+    if listed.len() > TrackerRule::MAX_PATTERNS {
+        return Err(format!(
+            "host_patterns names {} hosts at most.",
+            TrackerRule::MAX_PATTERNS
+        ));
+    }
+    let mut patterns: Vec<String> = Vec::with_capacity(listed.len());
+    for value in listed {
+        let toml::Value::String(pattern) = value else {
+            return Err("host_patterns must be a list of hosts.".to_owned());
+        };
+        let pattern = TrackerRule::pattern(pattern)
+            .map_err(|error| format!("host_patterns is refused: {error}."))?;
+        if !patterns.contains(&pattern) {
+            patterns.push(pattern);
+        }
+    }
+    if patterns.is_empty() {
+        return Err("host_patterns names no host.".to_owned());
+    }
+    Ok(patterns)
 }
 
 fn not_allowed(key: &str) -> String {

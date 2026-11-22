@@ -258,6 +258,125 @@ mod tests {
         assert_eq!(CURRENT_SCHEMA_VERSION, catalog.max_version());
     }
 
+    // 0137 rebuilds tracker_rules without its pattern: each rule keeps every
+    // column, its pattern becomes its one host, and its name is the pattern
+    // without `*.` unless a rule holds that bare host. Deleting a rule
+    // deletes its hosts, and names collide whatever their case.
+    #[tokio::test]
+    async fn migration_137_names_tracker_rules_and_moves_their_hosts() {
+        let catalog = embedded_catalog().unwrap();
+        let payload = embedded_payload_bytes().unwrap();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&pool)
+            .await
+            .unwrap();
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(136), true)
+            .await
+            .unwrap();
+        for (id, pattern) in [
+            (1, "*.iptorrents.com"),
+            (2, "*.example.org"),
+            (3, "example.org"),
+        ] {
+            sqlx::query(
+                "INSERT INTO tracker_rules
+                    (id, host_pattern, seeding, never_pause, created_at_ms, updated_at_ms,
+                     client, torrent_route, dht, forced, peer_utp, prefer_seeding)
+                 VALUES (?, ?, '{}', 1, 5, 6, 'qbittorrent', 1, 0, 1, 0, 'tcp')",
+            )
+            .bind(id)
+            .bind(pattern)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        apply_version_range(
+            &pool,
+            &catalog,
+            &payload,
+            MigrationInstallKind::Upgrade,
+            137,
+            137,
+        )
+        .await
+        .unwrap();
+
+        let rows: Vec<(i64, String, String, i64)> = sqlx::query_as(
+            "SELECT r.id, r.name, h.pattern, h.position
+               FROM tracker_rules r JOIN tracker_rule_hosts h ON h.rule_id = r.id
+              ORDER BY r.id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    1,
+                    "iptorrents.com".to_owned(),
+                    "*.iptorrents.com".to_owned(),
+                    0
+                ),
+                (2, "*.example.org".to_owned(), "*.example.org".to_owned(), 0),
+                (3, "example.org".to_owned(), "example.org".to_owned(), 0),
+            ]
+        );
+        let kept: (String, i64, i64, i64, String, i64, i64, i64, i64, String) = sqlx::query_as(
+            "SELECT seeding, never_pause, created_at_ms, updated_at_ms, client,
+                    torrent_route, dht, forced, peer_utp, prefer_seeding
+               FROM tracker_rules WHERE id = 2",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            kept,
+            (
+                "{}".to_owned(),
+                1,
+                5,
+                6,
+                "qbittorrent".to_owned(),
+                1,
+                0,
+                1,
+                0,
+                "tcp".to_owned()
+            )
+        );
+
+        sqlx::query("DELETE FROM tracker_rules WHERE id = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let hosts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tracker_rule_hosts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(hosts, 2);
+        let clash = sqlx::query(
+            "INSERT INTO tracker_rules (id, name, created_at_ms, updated_at_ms)
+             VALUES (9, 'EXAMPLE.ORG', 1, 1)",
+        )
+        .execute(&pool)
+        .await;
+        assert!(clash.is_err());
+        let old: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'tracker_rules_v96'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(old, 0);
+    }
+
     #[tokio::test]
     async fn migration_135_deletes_the_stored_signing_secret() {
         let catalog = embedded_catalog().unwrap();
@@ -669,7 +788,7 @@ mod tests {
         run_embedded_migrations_on_path_blocking(&db_path).unwrap();
 
         let pool = open_test_pool(&db_path).await;
-        assert_eq!(CURRENT_SCHEMA_VERSION, 136);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 137);
         assert_eq!(
             max_recorded_migration_version(&pool).await.unwrap(),
             Some(CURRENT_SCHEMA_VERSION)

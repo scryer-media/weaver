@@ -26,42 +26,9 @@ use std::sync::atomic::Ordering;
 use weaver_torrent::{ResumePeers, TorrentTotals, TrackerAnnounce};
 
 /// The tracker rules in force, in their order, with each one's place by
-/// its id (the first of an id kept): a torrent's settings read its rule for
-/// each field, and a publish reads every torrent's.
-#[derive(Debug, Default)]
-pub struct Rules {
-    list: Vec<TrackerRule>,
-    at: std::collections::HashMap<u32, usize>,
-}
-
-impl Rules {
-    pub fn new(list: Vec<TrackerRule>) -> Self {
-        let mut at = std::collections::HashMap::with_capacity(list.len());
-        for (place, rule) in list.iter().enumerate() {
-            at.entry(rule.id).or_insert(place);
-        }
-        Self { list, at }
-    }
-
-    /// The rule of id `id`, while it stands.
-    pub fn of(&self, id: Option<u32>) -> Option<&TrackerRule> {
-        self.list.get(*self.at.get(&id?)?)
-    }
-}
-
-impl From<Vec<TrackerRule>> for Rules {
-    fn from(list: Vec<TrackerRule>) -> Self {
-        Self::new(list)
-    }
-}
-
-impl std::ops::Deref for Rules {
-    type Target = [TrackerRule];
-
-    fn deref(&self) -> &[TrackerRule] {
-        &self.list
-    }
-}
+/// its id and each pattern by the hosts it names: a torrent's settings read
+/// its rule for each field, and a publish reads every torrent's.
+pub use crate::settings::model::TrackerRules as Rules;
 
 /// How many torrents read as each route, shared by every torrent's
 /// `RouteSlot` and kept by it as its route changes and as it goes: placing

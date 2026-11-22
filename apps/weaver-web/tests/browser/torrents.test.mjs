@@ -196,7 +196,7 @@ test("a torrent's detail names where each seeding term comes from, and its swarm
     "SEEDING", "Override seeding",
     "RATIO GOAL", ratioGoal,
     "SEED TIME GOAL", "No goalGlobal",
-    "INACTIVE GOAL", "No goalGlobal",
+    "INACTIVE SEEDING LIMIT", "No goalGlobal",
     "GOALS MET", "AnyGlobal",
     "THEN", "StopGlobal",
     "SEED TIME COUNTS", "All seedingGlobal",

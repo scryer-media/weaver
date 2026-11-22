@@ -8,7 +8,8 @@ import { useTranslate } from "@/lib/context/translate-context";
 import type { TorrentSummaryData } from "@/lib/torrents";
 
 interface ScheduleSeeding {
-  hostPattern: string;
+  ruleId: number;
+  name: string;
   torrents: number;
 }
 
@@ -35,7 +36,7 @@ export function ScheduleSeedingNote({ torrents }: { torrents: ReadonlyMap<number
   return (
     <span className="font-wv-mono text-[11.5px] text-wv-muted">
       {seeding
-        .map((rule) => t("next.downloads.scheduleSeeding", { count: rule.torrents, rule: rule.hostPattern }))
+        .map((rule) => t("next.downloads.scheduleSeeding", { count: rule.torrents, rule: rule.name }))
         .join(" · ")}
     </span>
   );
