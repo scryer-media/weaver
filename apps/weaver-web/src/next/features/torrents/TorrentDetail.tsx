@@ -71,8 +71,11 @@ const FILE_COLUMNS = {
 const LIMIT_COLUMNS = { base: "minmax(0,1fr) max-content" };
 const NO_PEERS: TorrentPeerData[] = [];
 const PEER_COLUMNS = {
-  base: "minmax(0,1fr) 72px max-content",
-  sm: "minmax(0,1fr) minmax(0,1fr) 84px 72px 90px 90px max-content",
+  // Each row is its own grid, so every column but the shared 1fr ones has a
+  // fixed width: a max-content one sized by the Ban button would sit wider in
+  // the rows than in the headings and move every column after it.
+  base: "minmax(0,1fr) 72px 44px",
+  sm: "minmax(0,1fr) minmax(0,1fr) 84px 72px 90px 90px 44px",
 };
 
 /**
@@ -282,7 +285,7 @@ function PeersBlock({ torrent, onReport }: { torrent: TorrentData; onReport: (me
                   size="compact"
                   disabled={banState.fetching}
                   onClick={() => ban(peer.address)}
-                  className="h-6 px-2 text-[11.5px] hover:text-wv-error"
+                  className="h-6 border-wv-error/40 px-2 text-[11.5px] text-wv-error hover:border-wv-error"
                 >
                   {t("next.torrent.ban")}
                 </SecondaryButton>
@@ -344,13 +347,20 @@ function PeerHeading({
       aria-sort={active ? (sort.descending ? "descending" : "ascending") : undefined}
       onClick={() => onSort(sortKey)}
       className={cn(
-        "flex min-w-0 cursor-pointer items-center gap-1 font-wv-mono text-[11px] whitespace-nowrap hover:text-wv-fg",
+        "flex min-w-0 cursor-pointer items-center font-wv-mono text-[11px] whitespace-nowrap hover:text-wv-fg",
         active ? "text-wv-fg" : "text-wv-muted",
         className,
       )}
     >
-      <span className="min-w-0 truncate">{label}</span>
-      <span aria-hidden className="w-[8px] flex-none">{active ? (sort.descending ? "↓" : "↑") : ""}</span>
+      {/* The arrow hangs past the label, so a centered label sits over its column's figures. */}
+      <span className="relative min-w-0">
+        <span className="block truncate">{label}</span>
+        {active ? (
+          <span aria-hidden className="absolute top-0 left-full pl-1">
+            {sort.descending ? "↓" : "↑"}
+          </span>
+        ) : null}
+      </span>
     </button>
   );
 }
