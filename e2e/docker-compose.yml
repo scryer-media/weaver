@@ -134,7 +134,7 @@ services:
       timeout: 2s
       retries: 5
 
-  # rqbit peers built from the librqbit revision Weaver pins. The seeder holds
+  # rqbit peers built from the revision the harness pins. The seeder holds
   # every lane payload whole; the leecher starts empty and pulls from Weaver.
   torrent-seeder:
     image: ${E2E_TORRENT_PEER_IMAGE:-weaver-e2e-torrent-peer:local}
