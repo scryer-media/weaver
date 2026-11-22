@@ -6,9 +6,11 @@ RUN apk add --no-cache tzdata util-linux
 
 WORKDIR /app
 
-COPY ${TARGETARCH}/weaver /opt/weaver/weaver
-COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh /opt/weaver/weaver
+# The build context can arrive as an Actions artifact, which drops the
+# executable bit. Set the mode while copying: a later chmod would store the
+# binary a second time in its own layer.
+COPY --chmod=0755 ${TARGETARCH}/weaver /opt/weaver/weaver
+COPY --chmod=0755 entrypoint.sh /entrypoint.sh
 
 EXPOSE 9090
 
