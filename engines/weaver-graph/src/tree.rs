@@ -8357,6 +8357,62 @@ mod tests {
         assert!(tree.engines().is_empty());
     }
 
+    // A store that closed a member whole and then sends its volumes to an
+    // engine keeps nothing of it: the engine makes every member over, and
+    // one that refuses leaves none.
+    #[test]
+    fn a_member_closed_whole_does_not_stay_once_an_engine_takes_the_volumes_and_refuses() {
+        let (mut tree, first, child, _) = bound_tree();
+        let mut emits = vec![
+            Emit::Ends {
+                member: MemberId(0),
+                length: 5,
+            },
+            Emit::MemberClosed(MemberId(0)),
+        ];
+        tree.apply(child, &mut emits, &mut Build, &mut Vec::new());
+        assert!(
+            tree.namespace(child)
+                .unwrap()
+                .get(MemberId(0))
+                .unwrap()
+                .closed
+        );
+        tree.deliver(
+            NodeId::ROOT,
+            first,
+            Posted {
+                offset: 20,
+                bytes: Bytes::from_static(b"ENGINE").into(),
+                provenance: Provenance::Fresh,
+            },
+            &mut Build,
+            &mut Vec::new(),
+        );
+        let (engine, _) = tree.child_of(NodeId::ROOT, first).unwrap();
+        assert_ne!(engine, child);
+        tree.bury(NodeId::ROOT, first, &mut Vec::new());
+        assert!(tree.namespace(child).is_none(), "the closed member stayed");
+        let mut effects = Vec::new();
+        tree.emitted(
+            engine,
+            vec![Emit::NeedsEngine(Why::Unsupported)],
+            &mut Build,
+            &mut effects,
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::Refused {
+                node: NodeId::ROOT,
+                member: first,
+                why: Why::Unsupported,
+            }]
+        );
+        assert!(tree.child_of(NodeId::ROOT, first).is_none());
+        assert!(tree.namespace(child).is_none());
+        assert!(tree.engines().is_empty());
+    }
+
     #[test]
     fn a_retired_object_says_nothing_more() {
         let (mut tree, _, child, _) = bound_tree();

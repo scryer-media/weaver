@@ -564,6 +564,20 @@ var rustStepReverses = map[string]rustStepReverse{
 	// list or profile is a setting the rewind cannot write back onto the
 	// proxies, so a database holding one is refused.
 	"dns_profiles_from_proxies_v125": {Plan: func(schemaShape) []string { return nil }, Refuse: refuseDNSProfilesV125},
+	// Migration 126 fills the private column its own SQL step adds to
+	// torrents, a table made after the graph-engine migration that the
+	// rewind drops.
+	"fill_torrent_private_v126": {Plan: func(schemaShape) []string { return nil }},
+	// Migration 128's SQL deletes a torrent setting. Torrents came with
+	// migration 93, so a database from before it never held the key. The
+	// migration has no Rust step: this names the reverse of that statement.
+	"forget_peer_protocol_setting_v128": {Plan: func(schemaShape) []string { return nil }},
+	// Migration 135's SQL deletes the stored signing secret and every
+	// browser session. An older build makes the secret again when it finds
+	// none, and a login signs in once more, so there is nothing to put
+	// back. The migration has no Rust step: this names the reverse of those
+	// statements.
+	"forget_signing_secret_v135": {Plan: func(schemaShape) []string { return nil }},
 }
 
 // migrationStatement is one SQL statement of one migration, its whitespace
@@ -587,6 +601,10 @@ var sqlStepReverses = map[migrationStatement]string{
 	{94, "ALTER TABLE egress_interfaces DROP COLUMN download_quota_enabled"}:                                                                                                              "egress_bandwidth_columns_v94",
 	{94, "ALTER TABLE egress_interfaces DROP COLUMN download_quota_limit_bytes"}:                                                                                                          "egress_bandwidth_columns_v94",
 	{112, "DELETE FROM settings WHERE key = 'torrent.mapped_ports'"}:                                                                                                                      "forget_saved_mapped_ports_v112",
+	{128, "DELETE FROM settings WHERE key = 'torrent.peer_protocol'"}:                                                                                                                     "forget_peer_protocol_setting_v128",
+	{135, "DELETE FROM settings WHERE key = 'auth.jwt_signing_secret'"}:                                                                                                                   "forget_signing_secret_v135",
+	{135, "DELETE FROM browser_session_verifications"}:                                                                                                                                    "forget_signing_secret_v135",
+	{135, "DELETE FROM browser_sessions"}:                                                                                                                                                 "forget_signing_secret_v135",
 }
 
 // collapseSQL is a statement with each run of whitespace one space.
@@ -1097,7 +1115,7 @@ const graphEngineMigration = 74
 // weaverMigrationsDir is the migration folder of the weaver under test, the
 // one its manifest and SQL steps are read from.
 func weaverMigrationsDir() string {
-	return filepath.Join(weaverRepoPath(), "server", "crates", "weaver-server-core", "src", "db", "migrations")
+	return filepath.Join(weaverRepoPath(), "server", "crates", "weaver-server-migrations", "src", "db", "migrations")
 }
 
 // migrationStep is one step of a migration as the manifest lists it: its kind

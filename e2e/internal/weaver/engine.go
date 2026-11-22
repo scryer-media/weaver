@@ -11,7 +11,7 @@ import (
 // The graph's observability lines, one per fact, each carrying
 // `job_id` first and its fields as `key=value`.
 const (
-	graphLogTarget              = "weaver_server_core::pipeline::graph"
+	graphLogTarget              = "weaver_server_pipeline::pipeline::graph"
 	graphObjectBoundMessage     = "object bound"
 	graphObjectRefusedMessage   = "object refused"
 	graphRecoveryRuledMessage   = "recovery set ruled"

@@ -1038,7 +1038,7 @@ func assertDirectStoreEngagement(jobs []testJob) error {
 // under when it reports a stall. Each of those records replays an earlier
 // event of the same job — its message and its fields, `job_id` included — so a
 // scan for an event's message would count the replay as a second occurrence.
-const weaverDebugRingTarget = "weaver_server_core::runtime::job_debug_ring:"
+const weaverDebugRingTarget = "weaver_server_base::runtime::job_debug_ring:"
 
 // isWeaverDebugRingReplay reports whether a weaver log line is one of the
 // stall-diagnostics records the debug ring writes rather than an event in its

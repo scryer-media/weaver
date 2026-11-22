@@ -450,6 +450,36 @@ fn a_walk_whose_headers_the_directory_contradicts_goes_to_an_engine() {
     assert!(has(&owner, &Emit::NeedsEngine(Why::Unsupported)));
 }
 
+// The archive with its end record saying a directory of one byte.
+fn one_byte_directory() -> Vec<u8> {
+    let mut bytes = archive();
+    let end = records::find_end(&bytes).unwrap().at as usize;
+    bytes[end + 12..end + 16].copy_from_slice(&1u32.to_le_bytes());
+    bytes
+}
+
+// A directory size that lies is the store's to read, not an engine's: the
+// one byte it names does not parse, so it is said damaged, and the members
+// the walk said stand.
+#[test]
+fn a_directory_said_one_byte_long_is_damaged_and_the_walked_members_stand() {
+    let bytes = one_byte_directory();
+    let end = records::find_end(&bytes).unwrap();
+    let mut owner = Owner::single(Zip::new(), bytes);
+    owner.pull = Pull::Unseekable;
+    owner.frames(0, 4096);
+    owner.close(0);
+    assert_eq!(owner.members.len(), files().len());
+    assert_eq!(
+        owner.said,
+        vec![Emit::Damaged {
+            volume: VolumeIndex(0),
+            range: ByteRange::at(end.offset, 1)
+        }]
+    );
+    assert!(!owner.object.gone);
+}
+
 #[test]
 fn two_entries_of_one_name_are_rejected_before_any_member() {
     let mut bytes = archive();

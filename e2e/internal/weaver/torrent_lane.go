@@ -18,7 +18,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -91,34 +90,24 @@ func appendComposeOverride(path, addition string) error {
 	return errors.Join(writeErr, closeErr)
 }
 
-// torrentPeerImageRepository is the rqbit image built from the librqbit fork
-// revision Weaver's Cargo.lock pins.
+// torrentPeerImageRepository is the rqbit image the lane's seeder and leecher
+// run: a client that is not Weaver, built at one fixed revision.
 const torrentPeerImageRepository = "weaver-e2e-torrent-peer"
 
-var rqbitLockSource = regexp.MustCompile(`source = "git\+(https://[^"?]+/rqbit\.git)\?rev=([0-9a-f]{40})#[0-9a-f]{40}"`)
-
-// pinnedRqbitRevision reads the fork's repository and revision from Weaver's
-// Cargo.lock, so the peers are always the revision Weaver builds against.
-func pinnedRqbitRevision() (string, string, error) {
-	data, err := os.ReadFile(filepath.Join(weaverRepoPath(), "Cargo.lock"))
-	if err != nil {
-		return "", "", err
-	}
-	match := rqbitLockSource.FindSubmatch(data)
-	if match == nil {
-		return "", "", errors.New("Cargo.lock pins no rqbit git revision")
-	}
-	return string(match[1]), string(match[2]), nil
-}
+// The rqbit the peers are built from: the fork and revision Weaver's own
+// engine was imported from (THIRD_PARTY_NOTICES.md). Weaver no longer builds
+// against rqbit, so no lockfile names it; the pin lives here, and changing
+// the peers' client is one edit.
+const (
+	torrentPeerRqbitGit = "https://github.com/scryer-media/rqbit.git"
+	torrentPeerRqbitRev = "78baa6ebee97ca088a729da647aa42d166741460"
+)
 
 func ensureTorrentPeerImage() error {
 	if image := strings.TrimSpace(os.Getenv("E2E_TORRENT_PEER_IMAGE")); image != "" && dockerImageExists(image) {
 		return nil
 	}
-	repo, rev, err := pinnedRqbitRevision()
-	if err != nil {
-		return err
-	}
+	repo, rev := torrentPeerRqbitGit, torrentPeerRqbitRev
 	image := torrentPeerImageRepository + ":" + rev[:12]
 	setEnv("E2E_TORRENT_PEER_IMAGE", image)
 	if dockerImageExists(image) {

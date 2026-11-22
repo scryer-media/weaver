@@ -112,7 +112,7 @@ test("monitoring metrics and live logs expose real product state and controls", 
   const startupDirectives = await directives.inputValue();
   await chooseLogLevel(page, "download");
   await expect(directives).toHaveValue(
-    "info,weaver_server_core::pipeline::download=debug,weaver_nntp=debug",
+    "info,weaver_server_pipeline::pipeline::download=debug,weaver_nntp=debug",
   );
   await expect(levelShown("download")).toBeVisible();
   await chooseLogLevel(page, "default");

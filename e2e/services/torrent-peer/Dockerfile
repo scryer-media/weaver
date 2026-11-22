@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1.7
-# A BitTorrent peer for the torrent lane: the rqbit command-line client from
-# the same librqbit fork and revision Weaver's Cargo.lock pins, so the seeder
-# and the leecher speak exactly the wire protocol Weaver's engine does. The
-# harness passes the revision it reads from Cargo.lock and the toolchain from
-# rust-toolchain.toml; nothing here is a default to fall back on.
+# A BitTorrent peer for the torrent lane: the rqbit command-line client, a
+# client that is not Weaver, so the seeder and the leecher are an independent
+# reading of the wire protocol. The harness passes the fork and revision it
+# pins and the toolchain from rust-toolchain.toml; nothing here is a default
+# to fall back on.
 ARG BOOTSTRAP_IMAGE
 FROM ${BOOTSTRAP_IMAGE} AS builder
 ARG RQBIT_GIT
