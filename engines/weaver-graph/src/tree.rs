@@ -3200,13 +3200,15 @@ impl Tree {
     // (`Member::said`), so a front read back or fetched again later, or
     // after a restart, is asked the same and founds no object of it from
     // the name. A name that moved it refutes nothing: its new name says
-    // where it goes. Only the objects of the kind it is beside it are
-    // offered it, so the set it is takes it where that set places it, and
-    // nothing of another kind holding members by their names can take it
-    // instead. A member whose bytes have not said yet stays the leaf it was
-    // read back as: its file has its bytes, a front fetched again joins them
-    // there, and it is asked again once they are in it, as any leaf whose
-    // front comes is.
+    // where it goes. It is offered only to the objects beside it of the
+    // kind it is and to the engines of that kind (a RAR engine for a RAR
+    // volume), so its set takes it where that set places it, also once a
+    // store handed the set to its engine. Each answers by its own claim,
+    // which declines a volume of another set. Nothing of another kind
+    // holding members by their names can take it instead. A member whose
+    // bytes have not said yet stays the leaf it was read back as: its file
+    // has its bytes, a front fetched again joins them there, and it is
+    // asked again once they are in it, as any leaf whose front comes is.
     pub fn claim_again(
         &mut self,
         node: NodeId,
@@ -3236,8 +3238,9 @@ impl Tree {
     }
 
     // A member no object owns, claimed by what it says (`Member::said`):
-    // offered first to the objects of that kind beside it, else founding
-    // one; a member that says no kind stays the leaf it is.
+    // offered first to the objects beside it of that kind and of that kind's
+    // engine (`Kind::engine_for`), else founding one of that kind; a member
+    // that says no kind stays the leaf it is.
     fn claim_as_said(
         &mut self,
         node: NodeId,
@@ -3264,10 +3267,14 @@ impl Tree {
         let Sniff::Object(kind) = said else {
             return;
         };
+        let engine = kind.engine_for();
         let kin: Vec<NodeId> = self
             .bound_below(node)
             .into_iter()
-            .filter(|sibling| self.kind(*sibling) == Some(kind))
+            .filter(|sibling| {
+                let theirs = self.kind(*sibling);
+                theirs == Some(kind) || (engine.is_some() && theirs == engine)
+            })
             .collect();
         if self.offer(node, member, Clean::start(&front), &kin, None, effects) {
             return;
@@ -6534,6 +6541,7 @@ mod tests {
     mod candidates;
     mod handed;
     mod held_arrival;
+    mod kin;
     mod lift;
     mod never_open;
     mod numbered;
