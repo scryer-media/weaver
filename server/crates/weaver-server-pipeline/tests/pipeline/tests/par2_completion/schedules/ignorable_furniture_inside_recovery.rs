@@ -28,7 +28,9 @@ async fn mixed_damage_with_sufficient_blocks_repairs_the_furniture_too() {
 }
 
 // The payload damaged past what the set holds while the furniture beside it
-// arrives whole: furniture alone is no usable payload, so the job fails.
+// arrives whole: the whole furniture is a file people open, so it is
+// delivered and the job is partial. A Partial job's final move publishes
+// the unrepaired payload's bytes as they stand.
 #[tokio::test]
 async fn mixed_damage_with_short_blocks_delivers_only_the_whole_furniture() {
     let body = payload(6 * ARTICLE, 133);
@@ -38,13 +40,13 @@ async fn mixed_damage_with_short_blocks_delivers_only_the_whole_furniture() {
         &Scenario::new(covered(&files, 1, 1))
             .damaged(0, 1)
             .damaged(0, 4),
-        Expect::Failed(HistoryFailureKind::Repair),
+        Expect::Partial(&[("lantern.nfo", &notes)]),
         "payload short",
     )
     .await;
     assert!(
-        super::delivered(&outcome.files, "lantern.bin").is_none(),
-        "the damaged payload is not delivered"
+        super::delivered(&outcome.files, "lantern.bin").is_some_and(|bytes| *bytes != body),
+        "the unrepaired payload is delivered as it stands"
     );
 }
 

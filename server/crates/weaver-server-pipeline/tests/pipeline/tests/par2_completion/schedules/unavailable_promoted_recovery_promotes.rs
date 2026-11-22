@@ -145,10 +145,11 @@ async fn an_obfuscated_payload_reconciles_through_its_set() {
 }
 
 // A covered payload whole and an unprotected file damaged beside it: the
-// unprotected file is not whole and is not delivered, the payload is, and
-// the job is partial.
+// set vouched for the job and no set describes the file, so nothing checked
+// it. It is delivered as it stands, the payload whole, and the job is
+// complete.
 #[tokio::test]
-async fn an_unprotected_damaged_file_leaves_the_job_partial() {
+async fn an_unprotected_damaged_file_leaves_the_job_complete() {
     let body = payload(5 * ARTICLE, 179);
     let notes = payload(3 * ARTICLE, 180);
     let mut posts = covered(&[("lantern.mkv", &body)], 2, 1);
@@ -156,7 +157,7 @@ async fn an_unprotected_damaged_file_leaves_the_job_partial() {
     let at = posts.len() as u32 - 1;
     let outcome = row(
         &Scenario::new(posts).damaged(at, 1),
-        Expect::Partial(&[("lantern.mkv", &body)]),
+        Expect::Complete(&[("lantern.mkv", &body)]),
         "unprotected damaged",
     )
     .await;
@@ -164,18 +165,19 @@ async fn an_unprotected_damaged_file_leaves_the_job_partial() {
     assert!(super::delivered(&outcome.files, "notes.txt").is_some_and(|bytes| *bytes != notes));
 }
 
-// An unprotected file lost whole beside a covered payload: the payload is
-// delivered and the job is partial. No article of the file arrived, so no
-// file stands in for it.
+// An unprotected file lost whole beside a covered payload: the set vouched
+// for the job and no set describes the file, so nothing checked it and the
+// job is complete. No article of the file arrived, so no file stands in for
+// it.
 #[tokio::test]
-async fn a_missing_unprotected_file_leaves_the_job_partial() {
+async fn a_missing_unprotected_file_leaves_the_job_complete() {
     let body = payload(5 * ARTICLE, 181);
     let mut posts = covered(&[("lantern.mkv", &body)], 2, 1);
     posts.push(Post::plain("notes.txt", payload(3 * ARTICLE, 182)));
     let at = posts.len() as u32 - 1;
     let outcome = row(
         &lose_all(Scenario::new(posts), at),
-        Expect::Partial(&[("lantern.mkv", &body)]),
+        Expect::Complete(&[("lantern.mkv", &body)]),
         "unprotected missing",
     )
     .await;
