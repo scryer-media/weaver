@@ -533,6 +533,11 @@ impl Recovery for Par {
         self.volume.is_some_and(|own| own != member) && !self.others.contains(&member)
     }
 
+    // Bound, it describes every member but its own and the others.
+    fn covers_some(&self) -> bool {
+        self.volume.is_some()
+    }
+
     fn feed(&mut self, _: MemberId, segments: &[Segment]) {
         self.seen.lock().unwrap().fed.extend_from_slice(segments);
     }

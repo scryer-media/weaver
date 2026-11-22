@@ -155,6 +155,15 @@ impl NamespaceWriter {
         )
     }
 
+    // Whether the set covers any member at all. A set out on loan answers
+    // as it left.
+    pub(crate) fn covers_some(&self, tree: &Tree, set: NodeId) -> bool {
+        tree.recovery(set).map_or_else(
+            || tree.lent_covers_any(set),
+            |recovery| recovery.covers_some(),
+        )
+    }
+
     // The member is a set's own volume: recovery data, in its own file.
     pub fn carries_recovery(&self, tree: &Tree, node: NodeId, member: MemberId) -> bool {
         tree.child_of(node, member)

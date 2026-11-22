@@ -82,6 +82,9 @@ impl Recovery for Set {
     fn covers(&self, _: MemberId) -> bool {
         false
     }
+    fn covers_some(&self) -> bool {
+        false
+    }
     fn feed(&mut self, _: MemberId, _: &[Segment]) {}
     fn verdicts(&self, _: MemberId, _: &mut Vec<SliceVerdict>) {}
     fn wants(&self, _: &mut Vec<Seek>) {}

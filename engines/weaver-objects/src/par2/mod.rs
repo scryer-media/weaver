@@ -1362,6 +1362,10 @@ impl Recovery for Par2 {
         covered
     }
 
+    fn covers_some(&self) -> bool {
+        !self.covered.is_empty()
+    }
+
     fn feed(&mut self, member: MemberId, segments: &[Segment]) {
         let grids = self.list_grids();
         if !grids
