@@ -498,8 +498,12 @@ pub(in super::super) struct Turns {
 struct Catch {
     root: std::path::PathBuf,
     kept: tempfile::TempDir,
-    caught: Option<(Waiting, Vec<(u32, u32)>)>,
+    caught: Option<Caught>,
 }
+
+// An unrecorded move caught: the files that waited, what the job held only
+// in memory, and where the waiting files lay.
+type Caught = (Waiting, Vec<(u32, u32)>, Lying);
 
 impl Turns {
     pub(in super::super) fn new(answers: Answers) -> Self {
@@ -539,6 +543,7 @@ impl Turns {
         };
         pipeline.db.flush_write_queue().await.unwrap();
         let waiting = waiting_files(pipeline);
+        let lying = lying(pipeline);
         copy_database(&catch.root, catch.kept.path());
         let in_memory = pipeline
             .graph_jobs
@@ -546,23 +551,32 @@ impl Turns {
             .map(|job| job.in_memory())
             .unwrap_or_default();
         Box::pin(pipeline.check_job_completion(job)).await;
-        let still = waiting_files(pipeline);
-        if waiting.iter().all(|file| still.contains(file)) {
+        if !moved(pipeline, &lying) {
             return false;
         }
-        catch.caught = Some((waiting, in_memory));
+        catch.caught = Some((waiting, in_memory, lying));
         true
     }
 
     // Every completion check a step scheduled runs, and the runtime queues
-    // settle, unless the process dies at a check.
+    // settle, unless the process dies at a check. A job whose failure has
+    // started, in a check or in the queues, has no crash at a move still to
+    // come: the commits' word kept back is heard before its release waits
+    // for that word, and nothing is kept back from here on.
     async fn settle(&mut self, pipeline: &mut Pipeline) {
         while let Some(queued) = pipeline.pending_completion_checks.pop_front() {
             if Box::pin(self.check(pipeline, queued)).await {
                 return;
             }
         }
-        pump_pipeline_runtime_queues(pipeline).await;
+        crate::pipeline::tests::pump_pipeline_runtime_work(pipeline).await;
+        if pipeline.pending_graph_terminals.contains_key(&JOB) {
+            self.holds_written = false;
+            for said in std::mem::take(&mut self.written) {
+                pipeline.graph_run_said(said);
+            }
+        }
+        crate::pipeline::tests::settle_failed_releases(pipeline).await;
     }
 
     // A crash at a move comes back to the database as it stood before the
@@ -724,6 +738,50 @@ fn waiting_files(pipeline: &Pipeline) -> Waiting {
         .unwrap_or_default()
 }
 
+// Where the file of each member that waits to move lies.
+type Lying =
+    std::collections::HashMap<(weaver_graph::NodeId, weaver_graph::MemberId), std::path::PathBuf>;
+
+fn lying(pipeline: &Pipeline) -> Lying {
+    let Some(job) = pipeline.graph_jobs.get(&JOB) else {
+        return Lying::new();
+    };
+    let writer = job.writer();
+    let waiting: std::collections::HashSet<_> = writer
+        .waiting()
+        .into_iter()
+        .map(|(node, member, _)| (node, member))
+        .collect();
+    let nodes: std::collections::HashSet<_> = waiting.iter().map(|(node, _)| *node).collect();
+    let mut lying = Lying::new();
+    for node in nodes {
+        for (member, path) in writer.files(node) {
+            if waiting.contains(&(node, member)) {
+                lying.insert((node, member), path.to_path_buf());
+            }
+        }
+    }
+    lying
+}
+
+// Whether a file that waited to move has moved: its member still has a
+// file, and it lies elsewhere than where it waited. A member whose file went
+// did not move it, so a waiting move that ends that way is not this crash.
+fn moved(pipeline: &Pipeline, before: &Lying) -> bool {
+    let Some(job) = pipeline.graph_jobs.get(&JOB) else {
+        return false;
+    };
+    let writer = job.writer();
+    let nodes: std::collections::HashSet<_> = before.keys().map(|(node, _)| *node).collect();
+    nodes.into_iter().any(|node| {
+        writer.files(node).any(|(member, path)| {
+            before
+                .get(&(node, member))
+                .is_some_and(|was| was.as_path() != path)
+        })
+    })
+}
+
 // The database files under `from` replace those under `to`: the main file
 // and its write-ahead log. The shared-memory index goes, and the next open
 // builds it again from the log.
@@ -793,7 +851,7 @@ impl MoveCrash {
         root: &std::path::Path,
         kept: &std::path::Path,
         turns: &mut Turns,
-    ) -> Option<(Waiting, Vec<(u32, u32)>)> {
+    ) -> Option<Caught> {
         pipeline.db.flush_write_queue().await.unwrap();
         let mut unheard = std::mem::take(&mut turns.written);
         unheard.extend(pipeline.graph_runs.waiting());
@@ -801,6 +859,7 @@ impl MoveCrash {
             return None;
         }
         let waiting = waiting_files(pipeline);
+        let lying = lying(pipeline);
         copy_database(root, kept);
         let in_memory = pipeline
             .graph_jobs
@@ -815,8 +874,7 @@ impl MoveCrash {
                 pipeline.graph_run_said(said);
             }
         }
-        let still = waiting_files(pipeline);
-        if waiting.iter().all(|file| still.contains(file)) {
+        if !moved(pipeline, &lying) {
             turns.held.extend(held);
             return None;
         }
@@ -824,7 +882,7 @@ impl MoveCrash {
         for said in held {
             pipeline.graph_run_said(said);
         }
-        Some((waiting, in_memory))
+        Some((waiting, in_memory, lying))
     }
 
     // The process dies at a move in the schedule's state: the first time a
@@ -865,9 +923,10 @@ impl MoveCrash {
         turns.holds_written = false;
         pipeline.db.flush_write_queue().await.unwrap();
         let waiting = match &unrecorded {
-            Some((waiting, _)) => waiting.clone(),
+            Some((waiting, _, _)) => waiting.clone(),
             None => waiting_files(&pipeline),
         };
+        let mut lying = None;
         let back_to = match state {
             MoveState::Uncommitted => {
                 for article in self.since.drain(..) {
@@ -881,8 +940,11 @@ impl MoveCrash {
                 // was heard: what it held only in memory then is not on disk
                 // by that database's account, wherever the steps that ran
                 // since then write it.
-                for article in unrecorded.into_iter().flat_map(|(_, in_memory)| in_memory) {
-                    run.delivered.remove(&article);
+                if let Some((_, in_memory, before)) = unrecorded {
+                    for article in in_memory {
+                        run.delivered.remove(&article);
+                    }
+                    lying = Some(before);
                 }
                 for said in written {
                     pipeline.graph_run_said(said);
@@ -896,7 +958,7 @@ impl MoveCrash {
             root,
             spec,
             run,
-            (state, waiting, back_to),
+            (state, waiting, back_to, lying),
         ))
         .await
     }
@@ -917,21 +979,40 @@ impl MoveCrash {
         self.state = None;
         turns.holds_written = false;
         turns.written.clear();
-        let (waiting, in_memory) = catch.caught.unwrap();
+        let (waiting, in_memory, lying) = catch.caught.unwrap();
         for article in in_memory {
             run.delivered.remove(&article);
         }
-        let died = (MoveState::Unrecorded, waiting, Some(catch.kept.path()));
+        let died = (
+            MoveState::Unrecorded,
+            waiting,
+            Some(catch.kept.path()),
+            Some(lying),
+        );
         Box::pin(Self::die(pipeline, root, spec, run, died)).await
     }
 
+    // A crash at an unrecorded move dies only once a waiting file moved:
+    // `lying` is where the waiting files lay before it.
     async fn die(
         pipeline: Pipeline,
         root: &tempfile::TempDir,
         spec: &JobSpec,
         run: &mut Run<'_>,
-        (state, waiting, back_to): (MoveState, Waiting, Option<&std::path::Path>),
+        (state, waiting, back_to, lying): (
+            MoveState,
+            Waiting,
+            Option<&std::path::Path>,
+            Option<Lying>,
+        ),
     ) -> (Pipeline, Option<Option<JobStatus>>) {
+        if let Some(lying) = &lying {
+            assert!(
+                moved(&pipeline, lying),
+                "a crash at an unrecorded move comes after a waiting file moved: {lying:?} {:?}",
+                run.trace
+            );
+        }
         let status = job_status_for_assert(&pipeline, JOB);
         if let Some(job) = pipeline.graph_jobs.get(&JOB) {
             for article in job.in_memory() {
