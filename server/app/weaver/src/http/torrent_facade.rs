@@ -1490,7 +1490,7 @@ fn eta(view: &TorrentView, clock: ClockFields, now: i64) -> u64 {
     let mut etas = Vec::with_capacity(3);
     if let Some(goal) = policy.ratio_goal {
         let over = status::ratio_base(view.downloaded_bytes, view.have_bytes);
-        let to_upload = over as f64 * f64::from(goal) - view.uploaded_bytes as f64;
+        let to_upload = over as f64 * goal - view.uploaded_bytes as f64;
         etas.push(if to_upload <= 0.0 {
             0
         } else if view.upload_bps > 0 {
