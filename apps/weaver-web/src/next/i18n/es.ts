@@ -26,6 +26,9 @@ export const nextEs: LocaleDictionary = {
   "next.shell.noTraffic": "aún sin tráfico",
   "next.shell.limit": "límite {{value}} {{unit}}",
   "next.shell.scheduledLimit": "límite programado {{value}} {{unit}}",
+  "next.shell.usenetDown": "Bajada Usenet",
+  "next.shell.torrentDown": "Bajada torrent",
+  "next.shell.torrentUp": "Subida torrent",
   "next.title.paused": "En pausa - Weaver",
   "next.title.speed": "{{speed}} - Weaver",
 

@@ -458,6 +458,32 @@ pub struct SystemMetricsSnapshot {
     /// Whether torrents are on and whether there are torrents, so the web
     /// shows torrent controls while either holds.
     pub torrents: TorrentPresence,
+    /// What every torrent downloads and uploads right now, beside
+    /// `metrics.currentDownloadSpeed`, which counts Usenet alone.
+    pub torrent_rates: TorrentRates,
+}
+
+/// The rates of every torrent added up, in bytes per second.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
+pub struct TorrentRates {
+    pub download_bps: u64,
+    pub upload_bps: u64,
+}
+
+impl TorrentRates {
+    // The sums the torrent service keeps as its rows move: one read, no walk
+    // of the torrents. Zero on a server without torrents.
+    pub(crate) fn of(
+        torrents: Option<&weaver_server_core::torrents::service::TorrentService>,
+    ) -> Self {
+        let sums = torrents
+            .map(|torrents| torrents.snapshot().sums())
+            .unwrap_or_default();
+        Self {
+            download_bps: sums.download_bps,
+            upload_bps: sums.upload_bps,
+        }
+    }
 }
 
 /// Whether torrents are on, and the torrents there are.

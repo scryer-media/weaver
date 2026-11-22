@@ -713,6 +713,71 @@ async fn pausing_every_torrent_is_one_hold_apart_from_the_queues() {
     assert!(!response.errors.is_empty());
 }
 
+// The live metrics say what every torrent downloads and uploads, added up:
+// the read and the push give the service's own sums, and Usenet's speed
+// stays its own figure.
+#[tokio::test]
+async fn live_metrics_carry_what_every_torrent_downloads_and_uploads() {
+    use tokio_stream::StreamExt;
+    use weaver_server_core::torrents::service::views::TorrentView;
+
+    let rig = rig().await;
+    const RATES: &str = "{ torrentRates { downloadBps uploadBps } }";
+    let none = rig.execute(RATES).await;
+    assert!(none.errors.is_empty(), "{:?}", none.errors);
+    assert_eq!(
+        none.data.into_json().unwrap()["torrentRates"],
+        serde_json::json!({ "downloadBps": 0, "uploadBps": 0 })
+    );
+
+    let response = rig
+        .execute(&submit(&metainfo("rates.mkv", 3000, false), ""))
+        .await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
+        .as_u64()
+        .unwrap();
+
+    // No tick reads the torrents again, and the rates sit on two rows no
+    // torrent has, so no publish of the one added sets them back.
+    let _held = rig.torrents.hold_tick().await;
+    let snapshot = rig.torrents.snapshot();
+    let row = snapshot
+        .row(weaver_server_core::JobId(id))
+        .expect("the added torrent has a row");
+    let moving = |job: u64, download_bps: u64, upload_bps: u64| TorrentView {
+        job_id: weaver_server_core::JobId(job),
+        download_bps,
+        upload_bps,
+        ..row.view.clone()
+    };
+    for (job, down, up) in [(id + 1000, 3000, 700), (id + 1001, 500, 0)] {
+        snapshot.put_one(
+            weaver_server_core::JobId(job),
+            Some(&moving(job, down, up)),
+            snapshot.stamp(),
+        );
+    }
+    let sums = serde_json::json!({ "downloadBps": 3500, "uploadBps": 700 });
+
+    let read = rig.execute(RATES).await;
+    assert!(read.errors.is_empty(), "{:?}", read.errors);
+    assert_eq!(read.data.into_json().unwrap()["torrentRates"], sums);
+
+    let request = Request::new(
+        "subscription { systemMetricsUpdates { metrics { currentDownloadSpeed } torrentRates { downloadBps uploadBps } } }",
+    )
+    .data(CallerScope::Local)
+    .data(CallerIdentity::Local([7; 32]))
+    .data(rig.torrents.clone());
+    let mut updates = rig.harness.schema.execute_stream(request);
+    let first = updates.next().await.expect("the updates stay open");
+    assert!(first.errors.is_empty(), "{:?}", first.errors);
+    let pushed = first.data.into_json().unwrap()["systemMetricsUpdates"].clone();
+    assert_eq!(pushed["torrentRates"], sums);
+    assert_eq!(pushed["metrics"]["currentDownloadSpeed"], 0);
+}
+
 // A follower of the torrents gets them as they are, then each change the
 // service publishes: only the torrents that moved, and the ids of the gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

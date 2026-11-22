@@ -77,6 +77,8 @@ export const testIds = {
   shellFooter: "shell-footer",
   shellConnection: "shell-connection",
   shellStatus: "shell-status",
+  /** The rail's three rates, shown while torrent things show. */
+  shellThroughputRates: "shell-throughput-rates",
   /** The footer's connection dot, by the state it shows (connected, reconnecting, polling). */
   shellConnectionState: (state: "connected" | "reconnecting" | "polling") => `shell-connection-${state}`,
 

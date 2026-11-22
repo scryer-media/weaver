@@ -26,6 +26,9 @@ export const nextKo: LocaleDictionary = {
   "next.shell.noTraffic": "아직 트래픽 없음",
   "next.shell.limit": "제한 {{value}} {{unit}}",
   "next.shell.scheduledLimit": "일정 제한 {{value}} {{unit}}",
+  "next.shell.usenetDown": "Usenet 다운로드",
+  "next.shell.torrentDown": "토렌트 다운로드",
+  "next.shell.torrentUp": "토렌트 업로드",
   "next.title.paused": "일시정지 - Weaver",
   "next.title.speed": "{{speed}} - Weaver",
 

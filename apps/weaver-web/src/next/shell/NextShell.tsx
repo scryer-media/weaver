@@ -13,6 +13,7 @@ import { testIds } from "@/next/testids";
 import { upgradesInApp } from "@/next/features/updates/application-upgrade";
 import { useApplicationUpgradeStatus } from "@/next/features/updates/use-application-upgrade";
 import { useNextData, useNextDataSelector } from "../data/next-data";
+import { useTorrentsShown } from "../data/use-torrents-shown";
 import { splitSpeed } from "../data/format";
 import { Eyebrow } from "../components/chrome";
 import { Icon, type IconName } from "../components/icons";
@@ -462,20 +463,76 @@ const UpdateBlock = memo(function UpdateBlock({
 });
 
 /**
- * The download speed, with the speed limit a click away. A limit in force turns
- * the button amber and adds a line under the peak, so a slow queue that is only
+ * The speeds, with the speed limit a click away. A limit in force turns the
+ * button amber and adds a line under the figures, so a slow queue that is only
  * doing as it was told says so.
+ *
+ * Without torrent things it is the one download speed and its peak. While
+ * they show it is three rates, each its own: what Usenet downloads, and what
+ * the torrents download and upload.
  */
 const ThroughputBlock = memo(function ThroughputBlock() {
   const t = useTranslate();
-  const { speed, peakSpeed, isPaused } = useNextData("speed", "peakSpeed", "isPaused");
+  const { speed, peakSpeed, isPaused, torrentDownSpeed, torrentUpSpeed } = useNextData(
+    "speed",
+    "peakSpeed",
+    "isPaused",
+    "torrentDownSpeed",
+    "torrentUpSpeed",
+  );
+  const torrentsShown = useTorrentsShown();
   const { inForce, bySchedule } = useSpeedLimitInForce();
   const { openDialog, dialog } = useSpeedLimitDialog();
   // Held, nothing moves: 0 at once, not once the daemon's rate window drains.
-  const now = splitSpeed(isPaused ? 0 : speed);
+  const usenet = isPaused ? 0 : speed;
+  const now = splitSpeed(usenet);
   const peak = splitSpeed(peakSpeed);
   const limit = splitSpeed(inForce ?? 0);
   const title = bySchedule ? t("next.speedLimit.bySchedule") : t("next.speedLimit.buttonTitle");
+  const limitLine =
+    inForce !== null ? (
+      <div
+        className={cn("font-wv-mono text-[11px] text-wv-warn", torrentsShown ? null : "-mt-[4px]")}
+      >
+        {t(bySchedule ? "next.shell.scheduledLimit" : "next.shell.limit", {
+          value: limit.value,
+          unit: limit.unit,
+        })}
+      </div>
+    ) : null;
+  const button = (
+    <button
+      type="button"
+      onClick={openDialog}
+      title={title}
+      aria-label={title}
+      className={cn(
+        "flex size-9 flex-none cursor-pointer items-center justify-center border bg-wv-button hover:bg-wv-button-hover",
+        inForce !== null
+          ? "border-wv-warn/60 text-wv-warn hover:border-wv-warn"
+          : "border-wv-control text-wv-fg hover:border-wv-control-hover",
+      )}
+    >
+      <Icon name="bandwidth" size={16} />
+    </button>
+  );
+  if (torrentsShown) {
+    return (
+      <RailBlock>
+        <div className="flex items-center justify-between gap-3">
+          <Eyebrow tone="rail">{t("next.shell.throughput")}</Eyebrow>
+          {button}
+        </div>
+        <dl className="m-0 flex flex-col gap-[5px]" data-testid={testIds.shellThroughputRates}>
+          <RailRate label={t("next.shell.usenetDown")} rate={usenet} />
+          <RailRate label={t("next.shell.torrentDown")} rate={torrentDownSpeed} />
+          <RailRate label={t("next.shell.torrentUp")} rate={torrentUpSpeed} />
+        </dl>
+        {limitLine}
+        {dialog}
+      </RailBlock>
+    );
+  }
   return (
     <RailBlock>
       <div className="flex items-center justify-between gap-3">
@@ -490,34 +547,35 @@ const ThroughputBlock = memo(function ThroughputBlock() {
                 : t("next.shell.noTraffic")
             }
           />
-          {inForce !== null ? (
-            <div className="-mt-[4px] font-wv-mono text-[11px] text-wv-warn">
-              {t(bySchedule ? "next.shell.scheduledLimit" : "next.shell.limit", {
-                value: limit.value,
-                unit: limit.unit,
-              })}
-            </div>
-          ) : null}
+          {limitLine}
         </div>
-        <button
-          type="button"
-          onClick={openDialog}
-          title={title}
-          aria-label={title}
-          className={cn(
-            "flex size-9 flex-none cursor-pointer items-center justify-center border bg-wv-button hover:bg-wv-button-hover",
-            inForce !== null
-              ? "border-wv-warn/60 text-wv-warn hover:border-wv-warn"
-              : "border-wv-control text-wv-fg hover:border-wv-control-hover",
-          )}
-        >
-          <Icon name="bandwidth" size={16} />
-        </button>
+        {button}
       </div>
       {dialog}
     </RailBlock>
   );
 });
+
+/** One named rate of the throughput block: its name, then the figure and its unit. */
+function RailRate({ label, rate }: { label: string; rate: number }) {
+  const { value, unit } = splitSpeed(rate);
+  return (
+    <div className="flex items-baseline justify-between gap-2">
+      <dt className="min-w-0 truncate font-wv-mono text-[11px] text-wv-muted">{label}</dt>
+      <dd className="m-0 flex flex-none items-baseline gap-1">
+        <span
+          className={cn(
+            "text-[15px] font-semibold leading-none tracking-[-0.01em]",
+            rate > 0 ? "text-wv-fg" : "text-wv-muted",
+          )}
+        >
+          {value}
+        </span>
+        <span className="text-[11px] text-wv-muted">{unit}</span>
+      </dd>
+    </div>
+  );
+}
 
 /** The rail's last block: the sponsor link. */
 const SponsorBlock = memo(function SponsorBlock() {

@@ -168,6 +168,7 @@ async fn build_system_metrics_snapshot(
         job_download_rates,
         provider_connections,
         torrents: TorrentPresence::of(availability, torrents_enabled, torrents),
+        torrent_rates: crate::system::types::TorrentRates::of(torrents),
     }
 }
 

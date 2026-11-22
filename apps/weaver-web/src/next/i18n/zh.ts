@@ -26,6 +26,9 @@ export const nextZh: LocaleDictionary = {
   "next.shell.noTraffic": "暂无流量",
   "next.shell.limit": "限速 {{value}} {{unit}}",
   "next.shell.scheduledLimit": "计划限速 {{value}} {{unit}}",
+  "next.shell.usenetDown": "Usenet 下载",
+  "next.shell.torrentDown": "种子下载",
+  "next.shell.torrentUp": "种子上传",
   "next.title.paused": "已暂停 - Weaver",
   "next.title.speed": "{{speed}} - Weaver",
 

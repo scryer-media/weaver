@@ -119,6 +119,8 @@ interface LiveMetricsSnapshot {
   /** Per-job download rates on the same tick as the speed; only the push carries them. */
   jobDownloadRates?: JobDownloadRate[];
   torrents?: TorrentPresence;
+  /** What every torrent downloads and uploads, added up; `speed` is Usenet's alone. */
+  torrentRates?: { downloadBps: number; uploadBps: number };
 }
 
 /** A category as it is configured, not as the queue happens to use it. */
@@ -135,6 +137,10 @@ export interface NextData {
   speed: number;
   /** Highest speed seen since the tab opened; the rail and stat strip both note it. */
   peakSpeed: number;
+  /** What every torrent downloads, added up, in bytes a second. */
+  torrentDownSpeed: number;
+  /** What every torrent uploads, added up, in bytes a second. */
+  torrentUpSpeed: number;
   isPaused: boolean;
   /** The classes of job held paused as a whole, as `TORRENT`. */
   pausedClasses: readonly string[];
@@ -477,6 +483,8 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
   }, [pageVisible, torrentPresence, metricsQueryError, reexecuteMetrics]);
 
   const speed = snapshot?.metrics?.currentDownloadSpeed ?? 0;
+  const torrentDownSpeed = snapshot?.torrentRates?.downloadBps ?? 0;
+  const torrentUpSpeed = snapshot?.torrentRates?.uploadBps ?? 0;
   // Raised while rendering, so the published peak never trails the speed.
   const [peakSpeed, setPeakSpeed] = useState(0);
   if (speed > peakSpeed) {
@@ -543,6 +551,8 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
       update,
       speed,
       peakSpeed,
+      torrentDownSpeed,
+      torrentUpSpeed,
       isPaused,
       pausedClasses,
       torrents,
@@ -585,6 +595,8 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
       refreshHistoryCount,
       speed,
       speedLimit,
+      torrentDownSpeed,
+      torrentUpSpeed,
       torrents,
       torrentPresence,
       pausedClasses,

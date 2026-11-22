@@ -26,6 +26,9 @@ export const nextJa: LocaleDictionary = {
   "next.shell.noTraffic": "まだ通信はありません",
   "next.shell.limit": "制限 {{value}} {{unit}}",
   "next.shell.scheduledLimit": "スケジュール制限 {{value}} {{unit}}",
+  "next.shell.usenetDown": "Usenet 下り",
+  "next.shell.torrentDown": "トレント 下り",
+  "next.shell.torrentUp": "トレント 上り",
   "next.title.paused": "一時停止 - Weaver",
   "next.title.speed": "{{speed}} - Weaver",
 

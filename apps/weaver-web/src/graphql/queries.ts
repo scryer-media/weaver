@@ -1077,6 +1077,10 @@ export const LIVE_METRICS_QUERY = gql`
     torrents: torrentPresence {
       ...TorrentPresenceFields
     }
+    torrentRates {
+      downloadBps
+      uploadBps
+    }
   }
   ${DOWNLOAD_BLOCK_FIELDS}
   ${TORRENT_PRESENCE_FIELDS}
@@ -1471,6 +1475,10 @@ export const LIVE_METRICS_SUBSCRIPTION = gql`
       }
       torrents {
         ...TorrentPresenceFields
+      }
+      torrentRates {
+        downloadBps
+        uploadBps
       }
     }
   }
