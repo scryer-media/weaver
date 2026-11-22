@@ -29,10 +29,8 @@ use weaver_torrent::{
 };
 use weaver_tunnel::bridge::ConnectionOutcome;
 use weaver_tunnel::endpoint::{DatagramSocket as TunnelSocket, DatagramTransport};
-#[cfg(test)]
-use weaver_tunnel::pipe::PortForwarding;
 use weaver_tunnel::pipe::{
-    DialedStream, Dialer, InboundListener as Listening, Purpose, Resolution, Target,
+    DialedStream, Dialer, InboundListener as Listening, PortForwarding, Purpose, Resolution, Target,
 };
 
 use crate::proxies::PathBridge;
@@ -50,6 +48,45 @@ pub struct LegSockets {
     dialer: Arc<dyn Dialer>,
     source: Option<IpAddr>,
     tunnels: Arc<PeerTunnels>,
+    forwarded: Arc<Forwarded>,
+}
+
+// The port the provider at the leg's tunnel forwards, for the one uTP
+// socket peers reach through it.
+#[derive(Default)]
+struct Forwarded {
+    // The port the forwarded TCP listener took, once the leg has one: the
+    // uTP socket asked for that port is the listener's own.
+    listener: Mutex<Option<u16>>,
+    // Whether a uTP socket holds the forwarded port. One at a time does, so
+    // another listener's uTP socket never takes it too.
+    taken: std::sync::atomic::AtomicBool,
+    // The port the gateway forwards now, for one that forwards on request.
+    port: tokio::sync::watch::Sender<Option<u16>>,
+}
+
+// A uTP socket's hold on the forwarded port, given back when it goes.
+struct ForwardedHold(Arc<Forwarded>);
+
+impl Drop for ForwardedHold {
+    fn drop(&mut self) {
+        self.0.taken.store(false, Ordering::Release);
+    }
+}
+
+impl Forwarded {
+    // The hold for a uTP socket asked for `port`: the forwarded listener's
+    // partner, or the leg's first when it has no forwarded listener.
+    fn hold(self: &Arc<Self>, port: u16) -> Option<ForwardedHold> {
+        let listener = *self.listener.lock().unwrap_or_else(PoisonError::into_inner);
+        if listener.is_some_and(|listener| listener != port) {
+            return None;
+        }
+        self.taken
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            .then(|| ForwardedHold(Arc::clone(self)))
+    }
 }
 
 impl LegSockets {
@@ -58,6 +95,7 @@ impl LegSockets {
             dialer,
             source: kind.listen_ip(),
             tunnels: Arc::default(),
+            forwarded: Arc::default(),
         }
     }
 
@@ -90,12 +128,35 @@ impl LegSockets {
             });
         };
         let tunnels = self.tunnels();
+        let slot = forwarded.then(|| Arc::clone(&self.forwarded));
         shared(async move {
             let listener = inbound
                 .listen(addr.port(), forwarded)
                 .await
                 .map_err(io::Error::other)?;
-            Ok(Box::new(Arriving(listener, tunnels)) as Box<dyn StreamListener>)
+            // The forwarded listener publishes each port its gateway forwards
+            // for the leg's uTP socket, until it goes.
+            let publishing = slot.map(|slot| {
+                *slot.listener.lock().unwrap_or_else(PoisonError::into_inner) =
+                    Some(listener.local_addr().port());
+                let mapping = listener.mapping();
+                Abort(tokio::spawn(async move {
+                    let Some(mut mapping) = mapping else { return };
+                    while mapping.changed().await.is_ok() {
+                        let port = mapping.borrow_and_update().external_port;
+                        slot.port.send_if_modified(|now| {
+                            let changed = *now != port;
+                            *now = port;
+                            changed
+                        });
+                    }
+                }))
+            });
+            Ok(Box::new(Arriving {
+                listener,
+                tunnels,
+                _publishing: publishing,
+            }) as Box<dyn StreamListener>)
         })
     }
 
@@ -266,9 +327,33 @@ impl LegSockets {
                 Ok(Arc::new(NoDatagrams::new(addr)) as Arc<dyn DatagramSocket>)
             });
         };
+        // The uTP socket peers reach through the port the tunnel's provider
+        // forwards sits on that port, as the forwarded listener does: the
+        // fixed one from the start, else each one the gateway forwards.
+        let forwarding = utp
+            .and_then(|_| Arc::clone(&self.dialer).inbound())
+            .map(|inbound| inbound.forwarding())
+            .filter(|forwarding| *forwarding != PortForwarding::None);
+        let hold = forwarding.and_then(|_| self.forwarded.hold(addr.port()));
+        let addr = match (forwarding, &hold) {
+            (Some(PortForwarding::Fixed(port)), Some(_)) => SocketAddr::new(addr.ip(), port),
+            _ => addr,
+        };
+        let follows = matches!(
+            (forwarding, &hold),
+            (Some(PortForwarding::NatPmp { .. }), Some(_))
+        );
+        let slot = Arc::clone(&self.forwarded);
         shared(async move {
             let socket = carrier.bind(addr).await.map_err(io::Error::other)?;
-            Ok(Arc::new(Carried::new(socket, addr, utp.is_some())) as Arc<dyn DatagramSocket>)
+            let carried = Carried::new(socket, addr, utp.is_some());
+            Ok(Arc::new(match hold {
+                Some(hold) if follows => {
+                    carried.following(carrier, addr.ip(), slot.port.subscribe(), hold)
+                }
+                Some(hold) => carried.holding(hold),
+                None => carried,
+            }) as Arc<dyn DatagramSocket>)
         })
     }
 }
@@ -372,12 +457,21 @@ impl SocketFactory for LegSockets {
 
 // A socket in the leg's tunnel, as the session's datagram socket.
 struct Carried {
-    socket: Mutex<Option<Arc<dyn TunnelSocket>>>,
-    bind_addr: SocketAddr,
+    // The tunnel socket it sends and receives on now; None once stopped.
+    socket: Arc<CarriedSocket>,
+    // Where `socket` is bound.
+    bind_addr: Arc<Mutex<SocketAddr>>,
     link_mtu: Option<u16>,
     sends: Option<Arc<CarriedSends>>,
     worker: Mutex<CarriedWorker>,
+    // Moves `socket` to each port the leg's gateway forwards.
+    follower: Mutex<Option<Abort<()>>>,
+    // Whether `socket` moves: a receive then carries on on the new one.
+    moves: bool,
+    _forwarded: Option<ForwardedHold>,
 }
+
+type CarriedSocket = tokio::sync::watch::Sender<Option<Arc<dyn TunnelSocket>>>;
 
 struct CarriedWorker {
     task: Option<tokio::task::JoinHandle<()>>,
@@ -487,7 +581,13 @@ impl CarriedSends {
         }
     }
 
-    async fn run(self: Arc<Self>, socket: Arc<dyn TunnelSocket>) {
+    async fn run(
+        self: Arc<Self>,
+        mut placed: tokio::sync::watch::Receiver<Option<Arc<dyn TunnelSocket>>>,
+    ) {
+        let Some(mut socket) = placed.borrow_and_update().clone() else {
+            return;
+        };
         loop {
             let ready = self.ready.notified();
             tokio::pin!(ready);
@@ -500,9 +600,25 @@ impl CarriedSends {
                 pending.packets.pop_front()
             };
             let Some(mut packet) = packet else {
-                ready.await;
+                // An idle worker lets go of a socket that moved at once, so
+                // the old one is not held until the next send.
+                tokio::select! {
+                    () = ready => {}
+                    changed = placed.changed() => match changed.ok().and_then(|()| placed.borrow_and_update().clone()) {
+                        Some(moved) => socket = moved,
+                        None => return,
+                    },
+                }
                 continue;
             };
+            // A socket moved to another port sends every packet from there
+            // on. One stopped meanwhile has dropped the queue already.
+            if placed.has_changed().unwrap_or(false) {
+                match placed.borrow_and_update().clone() {
+                    Some(moved) => socket = moved,
+                    None => return,
+                }
+            }
             // Handed to the tunnel now: a data packet is timed from here,
             // as libtorrent stamps a packet as late as it can, just before
             // its send (utp_stream.cpp v2.0.15:1789-1793).
@@ -547,42 +663,100 @@ impl Carried {
                 terminal: tokio::sync::watch::channel(false).0,
             })
         });
+        let bind_addr = socket.local_addr().unwrap_or(requested);
+        let link_mtu = socket.link_mtu();
+        let socket = Arc::new(tokio::sync::watch::Sender::new(Some(socket)));
         let worker = sends
             .as_ref()
-            .map(|sends| tokio::spawn(Arc::clone(sends).run(Arc::clone(&socket))));
+            .map(|sends| tokio::spawn(Arc::clone(sends).run(socket.subscribe())));
         Self {
-            bind_addr: socket.local_addr().unwrap_or(requested),
-            link_mtu: socket.link_mtu(),
-            socket: Mutex::new(Some(socket)),
+            bind_addr: Arc::new(Mutex::new(bind_addr)),
+            link_mtu,
+            socket,
             sends,
             worker: Mutex::new(CarriedWorker {
                 task: worker,
                 completion: None,
             }),
+            follower: Mutex::new(None),
+            moves: false,
+            _forwarded: None,
         }
     }
 
+    // It keeps the leg's forwarded port, and stays on the port it is bound.
+    fn holding(mut self, hold: ForwardedHold) -> Self {
+        self._forwarded = Some(hold);
+        self
+    }
+
+    // It keeps the leg's forwarded port and moves to each port `forwarded`
+    // names, binding there at `ip` through `carrier`. A port that cannot be
+    // bound leaves it where it is until the next; none leaves it where it is.
+    fn following(
+        mut self,
+        carrier: Arc<dyn DatagramTransport>,
+        ip: IpAddr,
+        mut forwarded: tokio::sync::watch::Receiver<Option<u16>>,
+        hold: ForwardedHold,
+    ) -> Self {
+        let placed = Arc::clone(&self.socket);
+        let bind_addr = Arc::clone(&self.bind_addr);
+        let mut bound = self.bind_addr().port();
+        let follower = tokio::spawn(async move {
+            loop {
+                let wanted = *forwarded.borrow_and_update();
+                if let Some(port) = wanted.filter(|port| *port != bound) {
+                    match carrier.bind(SocketAddr::new(ip, port)).await {
+                        Ok(socket) => {
+                            let addr = socket.local_addr().unwrap_or(SocketAddr::new(ip, port));
+                            // One stopped meanwhile stays stopped. The new
+                            // address is set before the socket is handed out.
+                            let moved = placed.send_if_modified(|now| {
+                                let live = now.is_some();
+                                if live {
+                                    *bind_addr.lock().unwrap_or_else(PoisonError::into_inner) =
+                                        addr;
+                                    *now = Some(socket);
+                                }
+                                live
+                            });
+                            if !moved {
+                                return;
+                            }
+                            bound = port;
+                        }
+                        Err(error) => tracing::warn!(
+                            port,
+                            %error,
+                            "the uTP socket could not move to the forwarded port; it stays on its own"
+                        ),
+                    }
+                }
+                if forwarded.changed().await.is_err() {
+                    return;
+                }
+            }
+        });
+        self.follower = Mutex::new(Some(Abort(follower)));
+        self.moves = true;
+        self._forwarded = Some(hold);
+        self
+    }
+
     fn socket(&self) -> io::Result<Arc<dyn TunnelSocket>> {
-        self.socket
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "the tunnel datagram socket stopped",
-                )
-            })
+        self.socket.borrow().clone().ok_or_else(stopped_socket)
     }
 
     fn stop(&self) {
         if let Some(sends) = &self.sends {
             sends.stop(None);
         }
-        self.socket
+        self.follower
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
+        self.socket.send_replace(None);
         if let Some(worker) = self
             .worker
             .lock()
@@ -601,26 +775,62 @@ impl Drop for Carried {
     }
 }
 
+fn stopped_socket() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::BrokenPipe,
+        "the tunnel datagram socket stopped",
+    )
+}
+
+// Until the carried socket moves or stops; never, for one that stays.
+async fn moved_socket(
+    moved: &mut Option<tokio::sync::watch::Receiver<Option<Arc<dyn TunnelSocket>>>>,
+) {
+    let Some(moved) = moved else {
+        return std::future::pending().await;
+    };
+    if moved.changed().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
 impl DatagramSocket for Carried {
     fn bind_addr(&self) -> SocketAddr {
-        self.bind_addr
+        *self
+            .bind_addr
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
+    // A receive waiting when the socket moves carries on on the new one.
     fn recv_from<'a>(
         &'a self,
         buf: &'a mut [u8],
     ) -> BoxFuture<'a, io::Result<(usize, SocketAddr)>> {
         shared(async move {
-            let socket = self.socket()?;
             let Some(sends) = &self.sends else {
-                return socket.recv_from(buf).await;
+                return self.socket()?.recv_from(buf).await;
+            };
+            let mut moved = self.moves.then(|| self.socket.subscribe());
+            let mut socket = match moved.as_mut() {
+                Some(moved) => moved
+                    .borrow_and_update()
+                    .clone()
+                    .ok_or_else(stopped_socket)?,
+                None => self.socket()?,
             };
             let mut terminal = sends.terminal.subscribe();
             let stopped = *terminal.borrow_and_update();
             if !stopped {
-                tokio::select! {
-                    result = socket.recv_from(buf) => return result,
-                    _ = terminal.changed() => {}
+                loop {
+                    tokio::select! {
+                        result = socket.recv_from(buf) => return result,
+                        _ = terminal.changed() => break,
+                        () = moved_socket(&mut moved) => match self.socket.borrow().clone() {
+                            Some(now) => socket = now,
+                            None => break,
+                        },
+                    }
                 }
             }
             Err(CarriedSends::error(
@@ -932,32 +1142,43 @@ impl StreamListener for Listener {
 }
 
 // A listener inside the leg's tunnel. The leg counts the bytes each
-// connection it accepts reads, as it counts those of the ones it dials.
-struct Arriving(Box<dyn Listening>, Arc<PeerTunnels>);
+// connection it accepts reads, as it counts those of the ones it dials. The
+// forwarded one publishes its gateway's port for the leg's uTP socket.
+struct Arriving {
+    listener: Box<dyn Listening>,
+    tunnels: Arc<PeerTunnels>,
+    _publishing: Option<Abort<()>>,
+}
 
 impl StreamListener for Arriving {
     fn local_addr(&self) -> SocketAddr {
-        self.0.local_addr()
+        self.listener.local_addr()
     }
 
     // Each word of the leg's gateway on the port it forwards, as a NAT-PMP
-    // mapper's TCP report, until the listener goes.
+    // mapper's TCP report and then its UDP one, until the listener goes. The
+    // gateway forwards the port over both, and the uTP socket follows it.
     fn port_mappings(&self) -> Option<PortMapReceiver> {
-        let mut mapping = self.0.mapping()?;
+        let mut mapping = self.listener.mapping()?;
         let (reports, received) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
             while mapping.changed().await.is_ok() {
                 let now = mapping.borrow_and_update().clone();
-                let report = PortMapped {
+                let report = |protocol, error| PortMapped {
                     transport: PortmapTransport::NatPmp,
-                    protocol: PortmapProtocol::Tcp,
+                    protocol,
                     local_port: now.external_port.unwrap_or(0),
                     external_port: now.external_port,
                     external_ip: now.external_ip,
-                    error: now.error,
+                    error,
                 };
-                if reports.send(report).is_err() {
-                    return;
+                for report in [
+                    report(PortmapProtocol::Tcp, now.error.clone()),
+                    report(PortmapProtocol::Udp, now.error.clone()),
+                ] {
+                    if reports.send(report).is_err() {
+                        return;
+                    }
                 }
             }
         });
@@ -968,11 +1189,11 @@ impl StreamListener for Arriving {
         &'a self,
     ) -> BoxFuture<'a, io::Result<(SocketAddr, BoxAsyncReadVectored, BoxAsyncWrite)>> {
         shared(async move {
-            let accepted = self.0.accept().await.map_err(io::Error::other)?;
+            let accepted = self.listener.accept().await.map_err(io::Error::other)?;
             let peer = accepted
                 .peer
                 .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
-            let rides = self.1.hold(peer, &accepted.path);
+            let rides = self.tunnels.hold(peer, &accepted.path);
             let (read, write) = halves(accepted.stream);
             let read = Counted {
                 read,
@@ -2337,6 +2558,359 @@ mod tests {
             .unwrap();
         assert_ne!(other.local_addr().port(), MAPPED);
         assert!(other.port_mappings().is_none());
+    }
+
+    // The tunnel's address on the far side's network, in the fakes below.
+    const INSIDE: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(10, 2, 0, 2));
+
+    // A tunnel's datagrams held in memory: each socket bound on its port,
+    // and a datagram sent to a port reaches the socket bound there.
+    struct Inside {
+        ports: Mutex<HashMap<u16, Arrivals>>,
+        bound: tokio::sync::watch::Sender<Vec<SocketAddr>>,
+        sent: Sent,
+    }
+
+    type Arrivals = tokio::sync::mpsc::UnboundedSender<(Vec<u8>, SocketAddr)>;
+    // Each datagram sent, by the port it left from.
+    type Sent = Arc<tokio::sync::watch::Sender<Vec<(u16, Vec<u8>)>>>;
+
+    impl Default for Inside {
+        fn default() -> Self {
+            Self {
+                ports: Mutex::default(),
+                bound: tokio::sync::watch::Sender::new(Vec::new()),
+                sent: Arc::new(tokio::sync::watch::Sender::new(Vec::new())),
+            }
+        }
+    }
+
+    impl Inside {
+        // Once a socket is bound on `port`.
+        async fn bound_on(&self, port: u16) {
+            self.bound
+                .subscribe()
+                .wait_for(|bound| bound.iter().any(|addr| addr.port() == port))
+                .await
+                .unwrap();
+        }
+
+        // A datagram from `from` to the socket bound on `port`.
+        fn deliver(&self, port: u16, bytes: &[u8], from: SocketAddr) {
+            let ports = self.ports.lock().unwrap();
+            ports[&port].send((bytes.to_vec(), from)).unwrap();
+        }
+    }
+
+    struct InsideSocket {
+        addr: SocketAddr,
+        arriving: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)>>,
+        sent: Sent,
+    }
+
+    #[async_trait::async_trait]
+    impl TunnelSocket for InsideSocket {
+        async fn send_to(&self, bytes: &[u8], _: SocketAddr) -> io::Result<()> {
+            let port = self.addr.port();
+            self.sent
+                .send_modify(|sent| sent.push((port, bytes.to_vec())));
+            Ok(())
+        }
+        async fn recv_from(&self, buffer: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+            let (bytes, from) = self.arriving.lock().await.recv().await.unwrap();
+            buffer[..bytes.len()].copy_from_slice(&bytes);
+            Ok((bytes.len(), from))
+        }
+        fn local_addr(&self) -> Option<SocketAddr> {
+            Some(self.addr)
+        }
+        fn link_mtu(&self) -> Option<u16> {
+            Some(1280)
+        }
+        fn is_closed(&self) -> bool {
+            false
+        }
+        async fn closed(&self) {
+            std::future::pending().await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DatagramTransport for Inside {
+        async fn resolve(&self, _: &str) -> Result<Vec<IpAddr>, weaver_tunnel::TunnelError> {
+            Ok(Vec::new())
+        }
+        async fn bind(
+            &self,
+            local: SocketAddr,
+        ) -> Result<Arc<dyn TunnelSocket>, weaver_tunnel::TunnelError> {
+            let addr = SocketAddr::new(INSIDE, local.port());
+            let (arrive, arriving) = tokio::sync::mpsc::unbounded_channel();
+            self.ports.lock().unwrap().insert(addr.port(), arrive);
+            self.bound.send_modify(|bound| bound.push(addr));
+            Ok(Arc::new(InsideSocket {
+                addr,
+                arriving: tokio::sync::Mutex::new(arriving),
+                sent: self.sent.clone(),
+            }))
+        }
+    }
+
+    // A WireGuard hop's stand-in: datagrams through `inside`, and peers in
+    // through the port its provider forwards as `forwarding` says. Its
+    // gateway's word on the port it forwards is `mapping`'s.
+    struct Forwarding {
+        inside: Arc<Inside>,
+        forwarding: PortForwarding,
+        mapping: tokio::sync::watch::Sender<weaver_tunnel::pipe::PortMapping>,
+    }
+
+    impl Forwarding {
+        fn new(forwarding: PortForwarding) -> Arc<Self> {
+            Arc::new(Self {
+                inside: Arc::default(),
+                forwarding,
+                mapping: tokio::sync::watch::Sender::new(Default::default()),
+            })
+        }
+
+        // The gateway forwards `port`, over TCP and UDP.
+        fn forward(&self, port: u16) {
+            self.mapping.send_replace(weaver_tunnel::pipe::PortMapping {
+                external_port: Some(port),
+                external_ip: Some("203.0.113.9".parse().unwrap()),
+                error: None,
+            });
+        }
+    }
+
+    struct ForwardingInbound(Arc<Forwarding>);
+    struct ForwardingListener(
+        SocketAddr,
+        Option<tokio::sync::watch::Receiver<weaver_tunnel::pipe::PortMapping>>,
+    );
+
+    #[async_trait::async_trait]
+    impl weaver_tunnel::pipe::Inbound for ForwardingInbound {
+        async fn listen(
+            &self,
+            port: u16,
+            forwarded: bool,
+        ) -> Result<Box<dyn Listening>, weaver_tunnel::TunnelError> {
+            let forwarding = if forwarded {
+                self.0.forwarding
+            } else {
+                PortForwarding::None
+            };
+            let port = match forwarding {
+                PortForwarding::Fixed(forwarded) => forwarded,
+                _ => port,
+            };
+            let mapping = matches!(forwarding, PortForwarding::NatPmp { .. })
+                .then(|| self.0.mapping.subscribe());
+            Ok(Box::new(ForwardingListener(
+                SocketAddr::new(INSIDE, port),
+                mapping,
+            )))
+        }
+        fn forwarding(&self) -> PortForwarding {
+            self.0.forwarding
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Listening for ForwardingListener {
+        fn local_addr(&self) -> SocketAddr {
+            self.0
+        }
+        async fn accept(&self) -> Result<weaver_tunnel::pipe::Dialed, weaver_tunnel::TunnelError> {
+            std::future::pending().await
+        }
+        fn mapping(
+            &self,
+        ) -> Option<tokio::sync::watch::Receiver<weaver_tunnel::pipe::PortMapping>> {
+            self.1.clone()
+        }
+    }
+
+    // The stand-in as a leg's dialer, its stages being the hop alone.
+    struct ForwardingLeg(Arc<Forwarding>);
+
+    #[async_trait::async_trait]
+    impl Dialer for ForwardingLeg {
+        async fn dial(
+            &self,
+            _: &Target,
+        ) -> Result<weaver_tunnel::pipe::Dialed, weaver_tunnel::pipe::DialError> {
+            Err(weaver_tunnel::pipe::DialError::Skipped(
+                "listens only".into(),
+            ))
+        }
+        fn datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {
+            Some(self.0.inside.clone())
+        }
+        fn inbound(self: Arc<Self>) -> Option<Arc<dyn weaver_tunnel::pipe::Inbound>> {
+            Some(Arc::new(ForwardingInbound(self.0.clone())))
+        }
+        fn budget(&self) -> std::time::Duration {
+            std::time::Duration::from_secs(1)
+        }
+        fn describe(&self) -> String {
+            "forwarding".into()
+        }
+    }
+
+    // A session's peer listener and its uTP socket on a leg of `hop`, as the
+    // session binds them: the listener first, and uTP on the port it took.
+    async fn peers_on(
+        hop: &Arc<Forwarding>,
+        asked: u16,
+    ) -> (LegSockets, Box<dyn StreamListener>, Arc<dyn DatagramSocket>) {
+        let sockets = LegSockets::new(Arc::new(ForwardingLeg(hop.clone())), &LegKind::Ladder);
+        let listener = sockets
+            .listen_peers_tcp(SocketAddr::from(([0, 0, 0, 0], asked)))
+            .await
+            .unwrap();
+        let utp = sockets
+            .bind_utp(SocketAddr::new(INSIDE, listener.local_addr().port()), 1024)
+            .await
+            .unwrap();
+        (sockets, listener, utp)
+    }
+
+    // On a leg whose gateway forwards a port over NAT-PMP, the uTP socket
+    // moves to each port it forwards: a receive already waiting carries on
+    // there and gets what a peer sends to it, and the socket says it is
+    // bound there. A gateway that stops forwarding leaves it where it is.
+    #[tokio::test]
+    async fn a_natpmp_legs_utp_socket_follows_the_forwarded_port() {
+        const ASKED: u16 = 6881;
+        const MAPPED: u16 = 47002;
+        const MOVED: u16 = 47003;
+        let hop = Forwarding::new(PortForwarding::NatPmp {
+            gateway: std::net::Ipv4Addr::new(10, 2, 0, 1),
+        });
+        let (_sockets, _listener, utp) = peers_on(&hop, ASKED).await;
+        assert_eq!(utp.bind_addr(), SocketAddr::new(INSIDE, ASKED));
+
+        let peer = SocketAddr::from(([198, 51, 100, 4], 51413));
+        let mut buffer = [0u8; 16];
+        let (len, from) = {
+            let mut receiving = utp.recv_from(&mut buffer);
+            // The receive is waiting on the port asked for before the
+            // gateway forwards one.
+            let polled = std::future::poll_fn(|cx| Poll::Ready(receiving.as_mut().poll(cx))).await;
+            assert!(polled.is_pending());
+            hop.forward(MAPPED);
+            hop.inside.bound_on(MAPPED).await;
+            hop.inside.deliver(MAPPED, b"syn", peer);
+            receiving.await.unwrap()
+        };
+        assert_eq!((&buffer[..len], from), (&b"syn"[..], peer));
+        assert_eq!(utp.bind_addr(), SocketAddr::new(INSIDE, MAPPED));
+        // What the session sends from here on leaves from the new port.
+        let mut sender = utp.sender().unwrap();
+        std::future::poll_fn(|cx| sender.poll_send_to(cx, b"ack", peer))
+            .await
+            .unwrap();
+        hop.inside
+            .sent
+            .subscribe()
+            .wait_for(|sent| sent.contains(&(MAPPED, b"ack".to_vec())))
+            .await
+            .unwrap();
+
+        hop.forward(MOVED);
+        hop.inside.bound_on(MOVED).await;
+        hop.inside.deliver(MOVED, b"again", peer);
+        let (len, from) = utp.recv_from(&mut buffer).await.unwrap();
+        assert_eq!((&buffer[..len], from), (&b"again"[..], peer));
+        assert_eq!(utp.bind_addr().port(), MOVED);
+
+        // The gateway stops forwarding: the socket stays on the last port.
+        hop.mapping.send_replace(Default::default());
+        hop.inside.deliver(MOVED, b"still", peer);
+        let (len, _) = utp.recv_from(&mut buffer).await.unwrap();
+        assert_eq!(&buffer[..len], b"still");
+        assert_eq!(utp.bind_addr().port(), MOVED);
+        let bound: Vec<u16> = hop
+            .inside
+            .bound
+            .borrow()
+            .iter()
+            .map(|addr| addr.port())
+            .collect();
+        assert_eq!(bound, [ASKED, MAPPED, MOVED]);
+        utp.shutdown().await.unwrap();
+    }
+
+    // A fixed forwarded port is the uTP socket's from the start, as it is
+    // the listener's; a second listener's uTP socket, the SSL one's, stays
+    // on its own port.
+    #[tokio::test]
+    async fn a_fixed_legs_utp_socket_is_bound_on_the_forwarded_port() {
+        const FIXED: u16 = 47001;
+        let hop = Forwarding::new(PortForwarding::Fixed(FIXED));
+        let (sockets, listener, utp) = peers_on(&hop, 6881).await;
+        assert_eq!(listener.local_addr().port(), FIXED);
+        assert_eq!(utp.bind_addr(), SocketAddr::new(INSIDE, FIXED));
+
+        let ssl = sockets
+            .listen_tcp(SocketAddr::from(([0, 0, 0, 0], 6882)))
+            .await
+            .unwrap();
+        assert_eq!(ssl.local_addr().port(), 6882);
+        let ssl_utp = sockets
+            .bind_utp(SocketAddr::new(INSIDE, 6882), 1024)
+            .await
+            .unwrap();
+        assert_eq!(ssl_utp.bind_addr().port(), 6882);
+        let bound: Vec<u16> = hop
+            .inside
+            .bound
+            .borrow()
+            .iter()
+            .map(|addr| addr.port())
+            .collect();
+        assert_eq!(bound, [FIXED, 6882]);
+    }
+
+    // With no port forwarded, the uTP socket is bound where it was asked.
+    #[tokio::test]
+    async fn an_unforwarded_legs_utp_socket_stays_on_the_port_asked() {
+        let hop = Forwarding::new(PortForwarding::None);
+        let (_sockets, _listener, utp) = peers_on(&hop, 6881).await;
+        assert_eq!(utp.bind_addr(), SocketAddr::new(INSIDE, 6881));
+        hop.forward(47002);
+        let bound: Vec<u16> = hop
+            .inside
+            .bound
+            .borrow()
+            .iter()
+            .map(|addr| addr.port())
+            .collect();
+        assert_eq!(bound, [6881]);
+    }
+
+    // The forwarded listener reports each word of its gateway as a TCP
+    // mapping and then a UDP one of the same port, so the session tells
+    // peers the UDP port too.
+    #[tokio::test]
+    async fn a_natpmp_listener_reports_the_forwarded_port_over_tcp_and_udp() {
+        let hop = Forwarding::new(PortForwarding::NatPmp {
+            gateway: std::net::Ipv4Addr::new(10, 2, 0, 1),
+        });
+        let (_sockets, listener, _utp) = peers_on(&hop, 6881).await;
+        let mut reports = listener.port_mappings().unwrap();
+        hop.forward(47002);
+        for protocol in [PortmapProtocol::Tcp, PortmapProtocol::Udp] {
+            let report = reports.recv().await.unwrap();
+            assert_eq!(report.protocol, protocol);
+            assert_eq!(report.transport, PortmapTransport::NatPmp);
+            assert_eq!(report.external_port, Some(47002));
+            assert_eq!(report.local_port, 47002);
+            assert_eq!(report.error, None);
+        }
     }
 
     // A dialer whose naming rule answers one address, or hands names on.
