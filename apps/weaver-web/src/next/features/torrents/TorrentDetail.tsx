@@ -245,9 +245,9 @@ function PeersBlock({ torrent, onReport }: { torrent: TorrentData; onReport: (me
             {heading("address", t("next.dns.address"))}
             {heading("client", t("next.torrent.peerClient"), "hidden sm:flex")}
             {heading("connection", t("next.torrent.peerConnection"), "hidden justify-center sm:flex")}
-            {heading("progress", t("next.networking.speed.progress"), "justify-end")}
-            {heading("downloadBps", t("next.quota.download"), "hidden justify-end sm:flex")}
-            {heading("uploadBps", t("next.quota.upload"), "hidden justify-end sm:flex")}
+            {heading("progress", t("next.networking.speed.progress"), "justify-center")}
+            {heading("downloadBps", t("next.quota.download"), "hidden justify-center sm:flex")}
+            {heading("uploadBps", t("next.quota.upload"), "hidden justify-center sm:flex")}
             <span />
           </GridRow>
           {/*
@@ -271,21 +271,21 @@ function PeersBlock({ torrent, onReport }: { torrent: TorrentData; onReport: (me
                 <span className="hidden text-center font-wv-mono text-[12px] text-wv-muted sm:block">
                   {peer.connection === "UTP" ? "uTP" : "TCP"}
                 </span>
-                <span className="text-right font-wv-mono text-[12px] text-wv-muted">{`${(peer.progress * 100).toFixed(1)}%`}</span>
-                <span className="hidden text-right font-wv-mono text-[12px] text-wv-muted sm:block">
+                <span className="text-center font-wv-mono text-[12px] text-wv-muted">{`${(peer.progress * 100).toFixed(1)}%`}</span>
+                <span className="hidden text-center font-wv-mono text-[12px] text-wv-muted sm:block">
                   {`↓ ${formatRate(peer.downloadBps)}`}
                 </span>
-                <span className="hidden text-right font-wv-mono text-[12px] text-wv-muted sm:block">
+                <span className="hidden text-center font-wv-mono text-[12px] text-wv-muted sm:block">
                   {`↑ ${formatRate(peer.uploadBps)}`}
                 </span>
-                <button
-                  type="button"
+                <SecondaryButton
+                  size="compact"
                   disabled={banState.fetching}
                   onClick={() => ban(peer.address)}
-                  className="cursor-pointer text-right text-[12.5px] whitespace-nowrap text-wv-dim hover:text-wv-error disabled:cursor-default"
+                  className="h-6 px-2 text-[11.5px] hover:text-wv-error"
                 >
                   {t("next.torrent.ban")}
-                </button>
+                </SecondaryButton>
               </GridRow>
             ))}
           </div>
