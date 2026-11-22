@@ -333,7 +333,7 @@ async fn carried_utp_shutdown_is_joined_repeatable_and_releases_retained_socket_
     survivor.await.unwrap();
     carried.shutdown().await.unwrap();
     assert!(weak.upgrade().is_none());
-    assert!(carried.socket.lock().unwrap().is_none());
+    assert!(carried.socket.borrow().is_none());
     assert!(carried.worker.lock().unwrap().task.is_none());
 }
 
