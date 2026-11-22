@@ -2202,7 +2202,7 @@ export const nextJa: LocaleDictionary = {
   "next.torrent.transfer": "転送",
   "next.torrent.information": "情報",
   "next.torrent.timeActive": "アクティブ時間",
-  "next.torrent.timeActiveSeeded": "{active}（シード {seeded}、連続 {run}）",
+  "next.torrent.timeActiveSeeded": "{{active}}（シード {{seeded}}、連続 {{run}}）",
   "next.torrent.eta": "残り時間",
   "next.torrent.connections": "接続",
   "next.torrent.connectionsValue": "{{count}} (最大 {{max}})",

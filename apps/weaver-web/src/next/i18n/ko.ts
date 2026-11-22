@@ -2202,7 +2202,7 @@ export const nextKo: LocaleDictionary = {
   "next.torrent.transfer": "전송",
   "next.torrent.information": "정보",
   "next.torrent.timeActive": "활성 시간",
-  "next.torrent.timeActiveSeeded": "{active} (시딩 {seeded}, 연속 {run})",
+  "next.torrent.timeActiveSeeded": "{{active}} (시딩 {{seeded}}, 연속 {{run}})",
   "next.torrent.eta": "남은 시간",
   "next.torrent.connections": "연결",
   "next.torrent.connectionsValue": "{{count}} (최대 {{max}})",

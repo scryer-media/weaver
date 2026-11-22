@@ -2202,7 +2202,7 @@ export const nextZh: LocaleDictionary = {
   "next.torrent.transfer": "传输",
   "next.torrent.information": "信息",
   "next.torrent.timeActive": "活动时间",
-  "next.torrent.timeActiveSeeded": "{active}（做种 {seeded}，连续 {run}）",
+  "next.torrent.timeActiveSeeded": "{{active}}（做种 {{seeded}}，连续 {{run}}）",
   "next.torrent.eta": "剩余时间",
   "next.torrent.connections": "连接",
   "next.torrent.connectionsValue": "{{count}}（最多 {{max}}）",

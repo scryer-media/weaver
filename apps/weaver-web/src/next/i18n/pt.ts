@@ -2202,7 +2202,7 @@ export const nextPt: LocaleDictionary = {
   "next.torrent.transfer": "Transferência",
   "next.torrent.information": "Informações",
   "next.torrent.timeActive": "Tempo ativo",
-  "next.torrent.timeActiveSeeded": "{active} (semeado {seeded}, sequência {run})",
+  "next.torrent.timeActiveSeeded": "{{active}} (semeado {{seeded}}, sequência {{run}})",
   "next.torrent.eta": "Tempo restante",
   "next.torrent.connections": "Conexões",
   "next.torrent.connectionsValue": "{{count}} ({{max}} máx.)",

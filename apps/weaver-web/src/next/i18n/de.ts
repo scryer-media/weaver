@@ -2202,7 +2202,7 @@ export const nextDe: LocaleDictionary = {
   "next.torrent.transfer": "Übertragung",
   "next.torrent.information": "Informationen",
   "next.torrent.timeActive": "Aktive Zeit",
-  "next.torrent.timeActiveSeeded": "{active} (geseedet {seeded}, Lauf {run})",
+  "next.torrent.timeActiveSeeded": "{{active}} (geseedet {{seeded}}, Lauf {{run}})",
   "next.torrent.eta": "Restzeit",
   "next.torrent.connections": "Verbindungen",
   "next.torrent.connectionsValue": "{{count}} ({{max}} max.)",

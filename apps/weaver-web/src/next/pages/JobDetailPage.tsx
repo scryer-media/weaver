@@ -909,6 +909,19 @@ function JobDetailContent() {
                 : t("next.job.verifiesAfter")
             }
           />
+          {/* A torrent has no download phases: its own reading, the average
+              over its time active once it ends, its rate while it runs. */}
+          {isTorrent ? (
+            <MetricCell
+              variant="stat"
+              eyebrow={terminal ? t("next.job.averageDownloadSpeed") : t("next.job.currentRate")}
+              value={
+                torrent === null
+                  ? EM_DASH
+                  : formatRate(terminal ? torrent.downloadAvgBps : torrent.downloadBps)
+              }
+            />
+          ) : (
           <MetricCell
             variant="stat"
             eyebrow={terminal ? t("next.job.averageDownloadSpeed") : t("next.job.currentRate")}
@@ -931,6 +944,7 @@ function JobDetailContent() {
                   : t("next.job.thisPhase")
             }
           />
+          )}
           {/* A torrent has no recovery set to fetch or skip. */}
           {isTorrent ? null : (
             <MetricCell

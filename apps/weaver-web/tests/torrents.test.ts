@@ -160,6 +160,9 @@ test("the transfer section reads as qBittorrent's, with the swarm's totals and a
   // No session yet, no ETA, no announce due.
   const idle = byLabel(transferFields(t, torrent({ activeSeconds: 0, etaSeconds: null, reannounceSeconds: null })));
   assert.deepEqual([idle["Time active"], idle["ETA"], idle["Reannounce in"]], [EM_DASH, EM_DASH, EM_DASH]);
+  // A seeding torrent names its seeding time and its current run.
+  const seeding = byLabel(transferFields(t, torrent({ seedingSeconds: 1800, consecutiveSeedingSeconds: 600 })));
+  assert.equal(seeding["Time active"], "1h 0m (seeded for 30m, run 10m)");
 });
 
 test("the information section names the pieces, the maker and where the torrent is", () => {
