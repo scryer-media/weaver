@@ -244,7 +244,7 @@ function PeersBlock({ torrent, onReport }: { torrent: TorrentData; onReport: (me
           <GridRow columns={PEER_COLUMNS} gap={14} className="h-[28px]" testId={torrentIds.peerHeadings}>
             {heading("address", t("next.dns.address"))}
             {heading("client", t("next.torrent.peerClient"), "hidden sm:flex")}
-            {heading("connection", t("next.torrent.peerConnection"), "hidden sm:flex")}
+            {heading("connection", t("next.torrent.peerConnection"), "hidden justify-center sm:flex")}
             {heading("progress", t("next.networking.speed.progress"), "justify-end")}
             {heading("downloadBps", t("next.quota.download"), "hidden justify-end sm:flex")}
             {heading("uploadBps", t("next.quota.upload"), "hidden justify-end sm:flex")}
@@ -268,7 +268,7 @@ function PeersBlock({ torrent, onReport }: { torrent: TorrentData; onReport: (me
                 <span className="hidden min-w-0 truncate text-[12px] text-wv-tertiary sm:block" title={peer.client}>
                   {peer.client}
                 </span>
-                <span className="hidden font-wv-mono text-[12px] text-wv-muted sm:block">
+                <span className="hidden text-center font-wv-mono text-[12px] text-wv-muted sm:block">
                   {peer.connection === "UTP" ? "uTP" : "TCP"}
                 </span>
                 <span className="text-right font-wv-mono text-[12px] text-wv-muted">{`${(peer.progress * 100).toFixed(1)}%`}</span>
