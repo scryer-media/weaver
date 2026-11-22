@@ -615,7 +615,8 @@ export function globalUploadCapField(t: Translate, cap: number | null, onChange:
 /**
  * What each seeding field and the upload limit read at the global level, as
  * text by the field ids `seedingFields` and `uploadCapField` give under
- * `prefix`: what a level that inherits them falls back to.
+ * `prefix`: what a level that inherits them falls back to. The mode is never
+ * inherited, so it has no entry.
  */
 export function seedingEffectiveText(
   t: Translate,
@@ -635,8 +636,6 @@ export function seedingEffectiveText(
     [`${prefix}-ratioGoal`]: goal(policy.ratioGoal, (ratio) => ratio.toFixed(2)),
     [`${prefix}-seedTimeGoalMinutes`]: goal(policy.seedTimeGoalMinutes, (minutes) => durationText(t, minutes)),
     [`${prefix}-inactiveGoalMinutes`]: goal(policy.inactiveGoalMinutes, (minutes) => durationText(t, minutes)),
-    [`${prefix}-mode`]: pick(policy.mode, MODES),
-    [`${prefix}-seedTimeCounting`]: pick(policy.seedTimeCounting, COUNTINGS),
     [`${prefix}-action`]: pick(policy.action, ACTIONS),
     [`${capPrefix}-uploadCap`]:
       uploadCap === null ? t("next.networking.unlimited") : `${Math.round((uploadCap / (1024 * 1024)) * 10) / 10} MB/s`,

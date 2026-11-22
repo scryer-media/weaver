@@ -46,6 +46,7 @@ import {
   globalUploadCapField,
   leafFrom,
   leafInput,
+  leafValue,
   seedingAtGlobal,
   seedingFields,
   seedingFrom,
@@ -911,6 +912,10 @@ function useTrackerRules(
     const only = onlyTransport(form.peerTcp ?? global.peerTcp, form.peerUtp ?? global.peerUtp);
     const seedingText = seedingEffectiveText(t, globalSeeding, globalUploadCap, "trackerRuleSeeding", "trackerRule");
     const inherits = (leaf: Leaf<unknown>) => leaf.state === "INHERIT";
+    const setsGoal = [form.seeding.ratioGoal, form.seeding.seedTimeGoalMinutes, form.seeding.inactiveGoalMinutes].some(
+      (leaf) => leaf.state === "SET",
+    );
+    const ruleGoalsOnly = setsGoal && leafValue(form.seeding.mode) !== "ALL";
     const encryption = ENCRYPTIONS.find((option) => option.value === global.encryption);
     const entries: [string, boolean, string][] = [
       ["unpack", form.unpack === null, onOff(global.unpack)],
@@ -921,13 +926,16 @@ function useTrackerRules(
       ["preferDownloading", form.preferDownloading === null && only === null, transport(global.preferDownloading)],
       ["preferSeeding", form.preferSeeding === null && only === null, transport(global.preferSeeding)],
       ["trackerRule-uploadCap", inherits(form.uploadCap), seedingText["trackerRule-uploadCap"]],
-      ...(["ratioGoal", "seedTimeGoalMinutes", "inactiveGoalMinutes", "mode", "seedTimeCounting", "action"] as const).map(
+      // A goal left to inherit comes from below only under the rule's own
+      // All; under Any, once the rule sets a goal, it is off.
+      ...(["ratioGoal", "seedTimeGoalMinutes", "inactiveGoalMinutes"] as const).map(
         (key): [string, boolean, string] => [
           `trackerRuleSeeding-${key}`,
           inherits(form.seeding[key]),
-          seedingText[`trackerRuleSeeding-${key}`],
+          ruleGoalsOnly ? t("next.seeding.noGoal") : seedingText[`trackerRuleSeeding-${key}`],
         ],
       ),
+      ["trackerRuleSeeding-action", inherits(form.seeding.action), seedingText["trackerRuleSeeding-action"]],
     ];
     return new Map(
       entries
