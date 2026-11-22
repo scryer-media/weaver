@@ -358,7 +358,6 @@ impl SeedingSeries {
         let met = status::goal_left(policy, counters, held_bytes, now_ms).is_none();
         let mut goals = Vec::new();
         if let Some(goal) = policy.ratio_goal {
-            let goal = f64::from(goal);
             let ratio = status::ratio(counters, held_bytes);
             goals.push((SeedingGoal::Ratio, goal, (goal - ratio).max(0.0)));
         }

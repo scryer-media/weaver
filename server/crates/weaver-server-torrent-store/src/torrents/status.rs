@@ -47,7 +47,7 @@ pub fn goal_left(
     if let Some(goal) = policy.ratio_goal {
         let ratio = ratio(counters, held_bytes);
         goals.push((
-            ratio >= f64::from(goal),
+            ratio >= goal,
             format!("ratio {ratio:.2} of {goal:.2}"),
         ));
     }
