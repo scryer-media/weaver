@@ -485,7 +485,7 @@ impl GraphJob {
     }
 
     #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
-    pub(crate) fn blocked(&self) -> std::sync::Arc<tokio::sync::Notify> {
+    pub fn blocked(&self) -> std::sync::Arc<tokio::sync::Notify> {
         self.writer.blocked()
     }
 

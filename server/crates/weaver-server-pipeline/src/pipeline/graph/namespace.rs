@@ -2027,7 +2027,7 @@ impl NamespaceWriter {
         self.envelopes.shelf(node)
     }
 
-    pub(crate) fn shelf_of(&self, node: NodeId) -> Option<Arc<Shelf>> {
+    pub fn shelf_of(&self, node: NodeId) -> Option<Arc<Shelf>> {
         self.envelopes.shelf_of(node)
     }
 
