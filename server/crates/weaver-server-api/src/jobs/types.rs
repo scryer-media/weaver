@@ -306,7 +306,7 @@ impl From<weaver_server_core::JobPhaseProgress> for QueuePhaseProgress {
             phase: QueuePhase::from(value.phase),
             completed_bytes: value.completed_bytes as f64,
             total_bytes: value.total_bytes as f64,
-            progress_percent: value.progress_percent as f64,
+            progress_percent: value.progress_percent,
             rate_bps: value.rate_bps.map(|rate| rate as f64),
             estimated_remaining_ms: value.estimated_remaining_ms.map(|value| value as f64),
             started_at_epoch_ms: value.started_at_epoch_ms,
@@ -1369,7 +1369,7 @@ pub struct ParsedRelease {
     pub detected_hdr: bool,
     pub is_hdr10plus: bool,
     pub is_hlg: bool,
-    pub fps: Option<f32>,
+    pub fps: Option<f64>,
     pub is_proper_upload: bool,
     pub is_repack: bool,
     pub is_remux: bool,
@@ -1380,7 +1380,7 @@ pub struct ParsedRelease {
     pub edition: Option<String>,
     pub anime_version: Option<u32>,
     pub episode: Option<ParsedEpisode>,
-    pub parse_confidence: f32,
+    pub parse_confidence: f64,
 }
 
 #[derive(Debug, Clone, SimpleObject)]

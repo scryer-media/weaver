@@ -91,7 +91,7 @@ pub struct JobPhaseProgress {
     pub phase: JobPhase,
     pub completed_bytes: u64,
     pub total_bytes: u64,
-    pub progress_percent: f32,
+    pub progress_percent: f64,
     pub rate_bps: Option<u64>,
     pub estimated_remaining_ms: Option<u64>,
     pub started_at_epoch_ms: f64,

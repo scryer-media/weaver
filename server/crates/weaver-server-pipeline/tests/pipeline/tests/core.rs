@@ -838,7 +838,7 @@ async fn moving_progress_advances_without_another_pipeline_turn() {
             if phase[0].completed_bytes == completed {
                 assert_eq!(phase[0].phase, JobPhase::Moving);
                 assert_eq!(phase[0].total_bytes, 100);
-                assert_eq!(phase[0].progress_percent, completed as f32);
+                assert_eq!(phase[0].progress_percent, completed as f64);
                 break;
             }
             changes.changed().await.unwrap();

@@ -183,7 +183,7 @@ pub fn is_obfuscated(filename: &str) -> bool {
 // - 1.0: extracted from quoted string
 // - 0.8: extracted from PRiVATE format
 // - 0.5: heuristic fallback
-pub fn extract_filename(subject: &str) -> Option<(String, f32)> {
+pub fn extract_filename(subject: &str) -> Option<(String, f64)> {
     // Strategy 1: Quoted string — most common format
     // e.g. `[02/11] - "Some.Show.S01E18.mkv" yEnc(1/144)`
     if let Some(result) = extract_quoted(subject) {
@@ -696,7 +696,7 @@ mod tests {
     // A quote mark is never part of a posted name. Each row: the subject,
     // the name, and the confidence. The quoted rows read the first closed
     // pair, the rest the last word.
-    const QUOTE_SHAPES: &[(&str, &str, f32)] = &[
+    const QUOTE_SHAPES: &[(&str, &str, f64)] = &[
         (r#""name.ext" yEnc (1/5)"#, "name.ext", 1.0),
         (r#"[1/5] - "name.ext" yEnc (1/5)"#, "name.ext", 1.0),
         // The shape of job f586b14d13974344: the opening quote is missing.

@@ -14,7 +14,7 @@ use weaver_server_core::ingest::{derive_release_name, original_release_title};
 
 use super::types::{ParsedEpisode, ParsedRelease};
 
-const MIN_PARSE_CONFIDENCE_FOR_DISPLAY_NAME: f32 = 0.4;
+const MIN_PARSE_CONFIDENCE_FOR_DISPLAY_NAME: f64 = 0.4;
 // The most jobs each listing's cache holds: above the largest queue a
 // snapshot walks, so a pass over a 10,000-job queue parses each name once.
 const RELEASE_DISPLAY_CACHE_MAX_ENTRIES: usize = 16_384;
@@ -460,6 +460,17 @@ fn anime_absolute_episode(raw: &str) -> Option<u32> {
     None
 }
 
+// The release parser's numbers are `f32`; everything here is `f64`. Widening
+// one directly carries its rounding error (23.976 becomes
+// 23.975999832153320), so this takes the shortest decimal that names the
+// same `f32`, which is the number the parser read.
+fn parser_float(value: f32) -> f64 {
+    value
+        .to_string()
+        .parse()
+        .unwrap_or_else(|_| f64::from(value))
+}
+
 fn parsed_release_from_parser(value: ParsedReleaseMetadata) -> ParsedRelease {
     ParsedRelease {
         normalized_title: value.normalized_title,
@@ -484,7 +495,7 @@ fn parsed_release_from_parser(value: ParsedReleaseMetadata) -> ParsedRelease {
         detected_hdr: value.detected_hdr,
         is_hdr10plus: value.is_hdr10plus,
         is_hlg: value.is_hlg,
-        fps: value.fps,
+        fps: value.fps.map(parser_float),
         is_proper_upload: value.is_proper_upload,
         is_repack: value.is_repack,
         is_remux: value.is_remux,
@@ -497,7 +508,7 @@ fn parsed_release_from_parser(value: ParsedReleaseMetadata) -> ParsedRelease {
         edition: value.edition,
         anime_version: value.anime_version,
         episode: value.episode.map(parsed_episode_from_parser),
-        parse_confidence: value.parse_confidence.clamp(0.0, 1.0),
+        parse_confidence: parser_float(value.parse_confidence).clamp(0.0, 1.0),
     }
 }
 
@@ -559,14 +570,14 @@ fn append_episode_suffix(name: String, episode: Option<&ParsedEpisodeMetadata>) 
 
 fn is_confident_display_parse(parsed: &ParsedReleaseMetadata) -> bool {
     is_usable_parse(parsed)
-        && (parsed.parse_confidence >= MIN_PARSE_CONFIDENCE_FOR_DISPLAY_NAME
+        && (parser_float(parsed.parse_confidence) >= MIN_PARSE_CONFIDENCE_FOR_DISPLAY_NAME
             || parsed.episode.is_some())
 }
 
 fn is_usable_parse(parsed: &ParsedReleaseMetadata) -> bool {
     parsed.disposition != ParseDisposition::Unparseable
         && !parsed.normalized_title.trim().is_empty()
-        && (parsed.parse_confidence >= MIN_PARSE_CONFIDENCE_FOR_DISPLAY_NAME
+        && (parser_float(parsed.parse_confidence) >= MIN_PARSE_CONFIDENCE_FOR_DISPLAY_NAME
             || has_media_signal(parsed))
 }
 
@@ -818,6 +829,16 @@ mod tests {
             category,
             cache: ReleaseDisplayCache::None,
         })
+    }
+
+    #[test]
+    fn a_parser_number_keeps_its_decimal_value() {
+        // Widened directly, 23.976 is 23.975999832153320 and 0.4 is
+        // 0.4000000059604645.
+        assert_eq!(parser_float(23.976), 23.976);
+        assert_eq!(parser_float(0.4), 0.4);
+        assert_eq!(parser_float(1.0), 1.0);
+        assert!(parser_float(f32::NAN).is_nan());
     }
 
     #[test]
