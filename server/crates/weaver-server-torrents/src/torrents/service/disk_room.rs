@@ -324,7 +324,8 @@ impl TorrentService {
     // promise there, and is promised that much as it starts, as a usenet
     // job is; its pieces draw on the promise as they land. One promised in
     // this run already, or complete, starts. A disk off the roots' is not
-    // checked.
+    // checked. Only the old tick, kept for tests, asks with no batch.
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn start_hold(&self, torrent: &Live) -> StartHold {
         self.start_hold_in(torrent, None, false)
     }
