@@ -205,6 +205,8 @@ export const nextJa: LocaleDictionary = {
   "next.speedLimit.note": "再起動後も保持されます",
   "next.speedLimit.ceiling": "ダウンロード速度",
   "next.speedLimit.ceilingAria": "速度制限（メガバイト毎秒）",
+  "next.speedLimit.upload": "アップロード速度",
+  "next.speedLimit.uploadAria": "アップロード制限 (MB/秒)",
   "next.speedLimit.scheduleHolding": "現在、スケジュールによりダウンロードが {{rate}} に制限されています。",
   "next.addNzb.title": "追加",
   "next.addNzb.submitOne": "ダウンロードを追加",

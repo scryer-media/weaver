@@ -205,6 +205,8 @@ export const nextZh: LocaleDictionary = {
   "next.speedLimit.note": "重启后保留",
   "next.speedLimit.ceiling": "下载速度",
   "next.speedLimit.ceilingAria": "速度限制（兆字节每秒）",
+  "next.speedLimit.upload": "上传速度",
+  "next.speedLimit.uploadAria": "上传限速（MB/秒）",
   "next.speedLimit.scheduleHolding": "当前有计划将下载限制为 {{rate}}。",
   "next.addNzb.title": "添加",
   "next.addNzb.submitOne": "添加下载",

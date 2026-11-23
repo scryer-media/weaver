@@ -205,6 +205,8 @@ export const nextKo: LocaleDictionary = {
   "next.speedLimit.note": "재시작 후에도 유지됨",
   "next.speedLimit.ceiling": "다운로드 속도",
   "next.speedLimit.ceilingAria": "초당 메가바이트 단위 속도 제한",
+  "next.speedLimit.upload": "업로드 속도",
+  "next.speedLimit.uploadAria": "초당 메가바이트 단위 업로드 제한",
   "next.speedLimit.scheduleHolding": "지금 일정에 따라 다운로드가 {{rate}}(으)로 제한되고 있습니다.",
   "next.addNzb.title": "추가",
   "next.addNzb.submitOne": "다운로드 추가",

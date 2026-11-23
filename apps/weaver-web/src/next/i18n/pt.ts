@@ -205,6 +205,8 @@ export const nextPt: LocaleDictionary = {
   "next.speedLimit.note": "mantido após reinícios",
   "next.speedLimit.ceiling": "Velocidade de download",
   "next.speedLimit.ceilingAria": "Limite de velocidade em megabytes por segundo",
+  "next.speedLimit.upload": "Velocidade de envio",
+  "next.speedLimit.uploadAria": "Limite de envio em megabytes por segundo",
   "next.speedLimit.scheduleHolding": "Um agendamento está limitando os downloads a {{rate}} agora.",
   "next.addNzb.title": "Adicionar",
   "next.addNzb.submitOne": "Adicionar download",

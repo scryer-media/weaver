@@ -205,6 +205,8 @@ export const nextFr: LocaleDictionary = {
   "next.speedLimit.note": "conservée après redémarrage",
   "next.speedLimit.ceiling": "Vitesse de téléchargement",
   "next.speedLimit.ceilingAria": "Limite de vitesse en mégaoctets par seconde",
+  "next.speedLimit.upload": "Vitesse d'envoi",
+  "next.speedLimit.uploadAria": "Limite d'envoi en mégaoctets par seconde",
   "next.speedLimit.scheduleHolding": "Une planification limite en ce moment les téléchargements à {{rate}}.",
   "next.addNzb.title": "Ajouter",
   "next.addNzb.submitOne": "Ajouter le téléchargement",

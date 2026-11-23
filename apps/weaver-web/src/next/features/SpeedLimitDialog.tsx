@@ -5,25 +5,28 @@ import { useState } from "react";
 import { useMutation, useQuery } from "urql";
 import { BANDWIDTH_QUERY, SET_BANDWIDTH } from "@/graphql/networking";
 import { useTranslate } from "@/lib/context/translate-context";
-import type { Bandwidth } from "@/lib/networking";
+import type { Bandwidth, BandwidthSplit } from "@/lib/networking";
 import { PrimaryButton, SecondaryButton } from "@/next/components/controls";
 import { Dialog } from "@/next/components/Dialog";
 import { FormRow } from "@/next/components/rows";
 import { formatRate } from "@/next/data/format";
 import { useNextData } from "@/next/data/next-data";
-import { LimitControl } from "@/next/features/networking/limits";
+import { useTorrentsShown } from "@/next/data/use-torrents-shown";
+import { LimitControl, SplitControl } from "@/next/features/networking/limits";
 
 /**
- * The download ceiling dialog, opened from the queue header and the rail's
+ * The speed limit dialog, opened from the queue header and the rail's
  * Throughput gauge.
  *
- * It writes the same global download limit as Settings → Networking →
- * Egress, through `setBandwidth`, so the two never disagree and a limit set
- * here outlives a restart. `setBandwidth` replaces both directions, so the
- * upload limit is read when the dialog opens and sent back as it was. The
- * download limit it
- * starts from is the one the live metrics stream carries, so every opener sees
- * a change within a tick without refetching the settings.
+ * It writes the same global limits as Settings → Networking → Egress,
+ * through `setBandwidth`, so the two never disagree and a limit set here
+ * outlives a restart. While torrents are on it holds every limit that page
+ * does: download, the split of it between usenet and torrents, and upload.
+ * `setBandwidth` replaces both directions, so with torrents off the upload
+ * limit is read when the dialog opens and sent back as it was, and the split
+ * is left out, which keeps it. The download limit it starts from is the one
+ * the live metrics stream carries, so every opener sees a change within a
+ * tick without refetching the settings.
  */
 export function useSpeedLimitDialog() {
   const t = useTranslate();
@@ -31,28 +34,37 @@ export function useSpeedLimitDialog() {
   const [saveState, setBandwidth] = useMutation(SET_BANDWIDTH);
   const [open, setOpen] = useState(false);
   const [limit, setLimit] = useState<number | null>(null);
+  // Changes to what was read when the dialog opened; undefined is untouched.
+  const [uploadEdit, setUploadEdit] = useState<number | null | undefined>(undefined);
+  const [splitEdit, setSplitEdit] = useState<BandwidthSplit | null | undefined>(undefined);
+  const torrentsOn = useTorrentsShown();
   const [error, setError] = useState<string | null>(null);
   const [{ data: bandwidth }] = useQuery<{ networking: { bandwidth: Bandwidth } }>({
     query: BANDWIDTH_QUERY,
     requestPolicy: "network-only",
     pause: !open,
   });
-  const upload = bandwidth?.networking?.bandwidth;
+  const saved = bandwidth?.networking?.bandwidth;
+  const uploadBps = uploadEdit !== undefined ? uploadEdit : (saved?.uploadBps ?? null);
+  const split = splitEdit !== undefined ? splitEdit : (saved?.split ?? null);
 
   const scheduled = downloadBlock.scheduledSpeedLimit;
 
   const openDialog = () => {
     setLimit(ceiling);
+    setUploadEdit(undefined);
+    setSplitEdit(undefined);
     setError(null);
     setOpen(true);
   };
 
   const save = () => {
-    if (!upload) {
+    if (!saved) {
       return;
     }
     setError(null);
-    void setBandwidth({ input: { downloadBps: limit, uploadBps: upload.uploadBps ?? null } }).then((result) => {
+    const input = { downloadBps: limit, uploadBps, ...(torrentsOn ? { split } : {}) };
+    void setBandwidth({ input }).then((result) => {
       if (result.error || !result.data?.setBandwidth) {
         setError(result.error?.message ?? t("next.speedLimit.saveFailed"));
         return;
@@ -71,7 +83,7 @@ export function useSpeedLimitDialog() {
       footer={
         <>
           <SecondaryButton onClick={() => setOpen(false)}>{t("action.cancel")}</SecondaryButton>
-          <PrimaryButton disabled={saveState.fetching || !upload} onClick={save}>
+          <PrimaryButton disabled={saveState.fetching || !saved} onClick={save}>
             {saveState.fetching ? t("settings.saving") : t("action.apply")}
           </PrimaryButton>
         </>
@@ -86,6 +98,23 @@ export function useSpeedLimitDialog() {
           suffix="MB/s"
         />
       </FormRow>
+      {/* Only torrents upload, and the split shares the download limit with them: both show with torrents. */}
+      {torrentsOn && saved ? (
+        <>
+          <FormRow label={t("next.bandwidth.split")}>
+            <SplitControl value={split} needsDownloadLimit={limit === null} onChange={setSplitEdit} />
+          </FormRow>
+          <FormRow label={t("next.speedLimit.upload")}>
+            <LimitControl
+              key={String(open)}
+              label={t("next.speedLimit.uploadAria")}
+              value={uploadBps}
+              onChange={setUploadEdit}
+              suffix="MB/s"
+            />
+          </FormRow>
+        </>
+      ) : null}
       {scheduled !== null ? (
         <div className="border-b border-wv-hairline px-4 py-3 text-[12.5px] text-wv-warn sm:px-6">
           {t("next.speedLimit.scheduleHolding", { rate: formatRate(scheduled) })}
