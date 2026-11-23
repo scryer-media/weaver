@@ -20,6 +20,14 @@ import (
 const filesystemGateLabel = "org.scryer-media.weaver.fs-fixture-run"
 const filesystemGateState = "filesystem-resource"
 
+// The gate's cargo download cache and build folder outlive each run, so a run
+// rebuilds only what changed instead of every crate. Cargo locks both against
+// a concurrent run, and the fixture empties the build folder past its bound.
+const (
+	filesystemCargoHomeVolume   = "weaver-e2e-fs-cargo-home"
+	filesystemCargoTargetVolume = "weaver-e2e-fs-cargo-target"
+)
+
 type filesystemEngineRun func(context.Context, bool, ...string) (string, error)
 
 func runFilesystemEngine(ctx context.Context, capture bool, args ...string) (string, error) {
@@ -78,6 +86,8 @@ func runFilesystemGate(ctx context.Context, root, runDir string, run filesystemE
 		"--device", "/dev/fuse", "--cap-add", "SYS_ADMIN",
 		"--security-opt", "apparmor=unconfined", "--security-opt", "label=disable",
 		"--mount", "type=bind,source="+root+",target=/workspace,readonly",
+		"--mount", "type=volume,source="+filesystemCargoHomeVolume+",target=/cache/cargo-home",
+		"--mount", "type=volume,source="+filesystemCargoTargetVolume+",target=/cache/cargo-target",
 		"--entrypoint", "python3", image, "/fs-fixture/regressions.py"); err != nil {
 		return fmt.Errorf("create filesystem fixture: %w", err)
 	}

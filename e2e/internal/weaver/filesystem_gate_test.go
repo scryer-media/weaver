@@ -9,6 +9,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -122,6 +123,14 @@ func TestFilesystemGateResultAndCleanup(t *testing.T) {
 					}
 					if !strings.Contains(strings.Join(args, " "), "target=/workspace,readonly") {
 						t.Fatal("filesystem fixture must use a read-only checkout")
+					}
+					for _, mount := range []string{
+						"type=volume,source=" + filesystemCargoHomeVolume + ",target=/cache/cargo-home",
+						"type=volume,source=" + filesystemCargoTargetVolume + ",target=/cache/cargo-target",
+					} {
+						if !slices.Contains(args, mount) {
+							t.Fatalf("filesystem fixture must keep its cargo cache in a volume: missing %q", mount)
+						}
 					}
 				case "start":
 					if scenario == "start" {

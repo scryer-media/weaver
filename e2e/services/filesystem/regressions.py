@@ -5,8 +5,8 @@
 """Build current source, then exercise storage and delivery through real FUSE.
 
 Run in the fixture image built with WEAVER_IMAGE=rust:<repo toolchain>-bookworm,
-with the checkout mounted read-only at /workspace. Build/cache/fixture data
-stay in the disposable container. No archive schedule matrix is executed.
+with the checkout mounted read-only at /workspace and the cargo cache volumes
+at /cache. Fixture data stay in the disposable container. No archive schedule matrix is executed.
 """
 
 import json
@@ -99,9 +99,35 @@ def run_cases(root, binaries):
     return bool(failures)
 
 
+CARGO_HOME = Path("/cache/cargo-home")
+CARGO_TARGET = Path("/cache/cargo-target")
+# The build folder keeps artifacts of every dependency and toolchain version it
+# has seen. Past this size it starts over empty, so the volume stays bounded.
+CARGO_TARGET_LIMIT = 25 * 1024**3
+
+
+def folder_size(root):
+    return sum(os.lstat(os.path.join(folder, name)).st_size
+               for folder, _, names in os.walk(root) for name in names)
+
+
+def bound_build_folder():
+    if not CARGO_TARGET.exists():
+        return
+    size = folder_size(CARGO_TARGET)
+    if size > CARGO_TARGET_LIMIT:
+        print(f"filesystem-gate: build cache holds {size} bytes, over {CARGO_TARGET_LIMIT}; starting it over", flush=True)
+        for entry in CARGO_TARGET.iterdir():
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+
+
 def build_and_run():
-    env = dict(os.environ, CARGO_TARGET_DIR="/tmp/fs-target", CARGO_HOME="/tmp/fs-cargo",
-               CARGO_BUILD_JOBS="2", CARGO_PROFILE_TEST_DEBUG="line-tables-only")
+    bound_build_folder()
+    env = dict(os.environ, CARGO_TARGET_DIR=str(CARGO_TARGET), CARGO_HOME=str(CARGO_HOME),
+               CARGO_PROFILE_TEST_DEBUG="line-tables-only")
     artifacts = Path("/tmp/fs-build.jsonl")
     packages = {}
     for package, kind, target, _ in TARGETS:
