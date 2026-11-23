@@ -43,6 +43,21 @@ fn profile(id: u32, kind: ProxyKind) -> ProxyProfile {
     }
 }
 
+// A tunnel saved with no keepalive sends the default one, whoever saved
+// it; 0 switches it off, and any other value is sent as saved.
+#[test]
+fn a_tunnel_saved_with_no_keepalive_uses_the_default() {
+    let mut wireguard = profile(1, ProxyKind::WireGuard);
+    assert_eq!(
+        wireguard.keepalive(),
+        Some(weaver_tunnel::DEFAULT_WIREGUARD_KEEPALIVE)
+    );
+    wireguard.keepalive_seconds = Some(0);
+    assert_eq!(wireguard.keepalive(), None);
+    wireguard.keepalive_seconds = Some(40);
+    assert_eq!(wireguard.keepalive(), Some(40));
+}
+
 // A WireGuard proxy's provider forwards a port by NAT-PMP from the gateway
 // at host 1 of its first IPv4 tunnel network, or always the same port; any
 // other proxy, and NAT-PMP with no IPv4 tunnel address, forwards none.

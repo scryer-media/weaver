@@ -291,6 +291,15 @@ impl ProxyProfile {
             .filter(|port| *port != 0)
             .map_or(PortForwarding::None, PortForwarding::Fixed)
     }
+    // The tunnel's persistent keepalive, in seconds: the one saved, the
+    // tunnel's default when none is, and none when it is saved as 0.
+    pub fn keepalive(&self) -> Option<u16> {
+        Some(
+            self.keepalive_seconds
+                .unwrap_or(weaver_tunnel::DEFAULT_WIREGUARD_KEEPALIVE),
+        )
+        .filter(|seconds| *seconds != 0)
+    }
     // The tunnel this profile describes. Its sockets are held to its bytes
     // (`TunnelSockets::budget`), not to a count, so the library's own count
     // is set as high as it goes.
@@ -322,7 +331,7 @@ impl ProxyProfile {
                 _ => Vec::new(),
             },
             mtu: self.mtu,
-            persistent_keepalive: self.keepalive_seconds.filter(|v| *v != 0),
+            persistent_keepalive: self.keepalive(),
             request_timeout: self.timeout(),
             max_sockets: weaver_tunnel::wireguard::MAX_MAX_SOCKETS,
         })
