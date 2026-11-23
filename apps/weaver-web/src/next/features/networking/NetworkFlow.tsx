@@ -675,6 +675,7 @@ function DnsPill({
   locked = false,
   refused = false,
   width,
+  wire,
 }: {
   x: number;
   mid: number;
@@ -682,17 +683,29 @@ function DnsPill({
   locked?: boolean;
   refused?: boolean;
   width?: number;
+  /** An encrypted server's transport, locked at the pill's right end. */
+  wire?: string;
 }) {
   const color = refused ? stateColor("BLOCKED") : INK.dns;
   const shown = width ?? pillWidth(label, locked);
   const textX = x + 10 + (locked ? 12 : 0);
+  const wireX = x + shown - 10;
+  const wireStart = wire ? wireX - Math.ceil(wire.length * DNS_SIZE * 0.6) - 12 : x + shown - 8;
   return (
     <g>
       <rect x={x} y={mid - DNS_PILL / 2} width={shown} height={DNS_PILL} rx={DNS_PILL / 2} fill={INK.dnsFill} stroke={color} />
       {locked ? <Lock x={x + 15} y={mid} color={color} /> : null}
       <text x={textX} y={mid + 3.5} fill={INK.secondary} fontSize={DNS_SIZE}>
-        {fit(label, x + shown - 8 - textX, DNS_SIZE)}
+        {fit(label, wireStart - textX - (wire ? 6 : 0), DNS_SIZE)}
       </text>
+      {wire ? (
+        <>
+          <Lock x={wireStart + 4} y={mid} color={color} />
+          <text x={wireX} y={mid + 3.5} fill={color} fontSize={DNS_SIZE} textAnchor="end">
+            {wire}
+          </text>
+        </>
+      ) : null}
     </g>
   );
 }
@@ -1137,11 +1150,12 @@ export const NetworkFlow = memo(function NetworkFlow({
     height: number;
     title: string;
     note: string | null;
-    servers: string[];
+    servers: { label: string; wire: string | undefined }[];
     target: FlowTarget | null;
     lit: boolean;
   }[] = [];
   const answerByKey = new Map<string, (typeof answers)[number]>();
+  const wireWords = { TLS: "dnsWireTls", HTTPS: "dnsWireHttps", MIXED: "dnsWireMixed" } as const;
   let answerTop = (single ? layout.endpointY + ENDPOINT_BOX_HEIGHT : cardsBottom) + ENDPOINT_GAP + 18;
   for (const { lookup, legs } of origins) {
     const destination = lookup.destination;
@@ -1155,8 +1169,16 @@ export const NetworkFlow = memo(function NetworkFlow({
     }
     const list = destination.kind === "list" && destination.id !== null ? listById.get(destination.id) : undefined;
     const tunnel = destination.kind === "tunnel" ? profile(destination.proxyId) : undefined;
+    // A plain server says nothing of its transport; DoT and DoH are named on it. A tunnel's servers are asked plainly inside it.
     const servers =
-      destination.kind === "list" ? (list?.servers.map(serverPill) ?? []) : destination.kind === "tunnel" ? (tunnel?.dnsServers ?? []) : [];
+      destination.kind === "list"
+        ? (list?.servers.map((server) => ({
+            label: serverPill(server),
+            wire: server.wire === "PLAIN" ? undefined : t(`next.networking.flow.${wireWords[server.wire]}`),
+          })) ?? [])
+        : destination.kind === "tunnel"
+          ? (tunnel?.dnsServers ?? []).map((label) => ({ label, wire: undefined }))
+          : [];
     const title =
       destination.kind === "host"
         ? t("next.networking.flow.dnsHostCard")
@@ -1194,7 +1216,6 @@ export const NetworkFlow = memo(function NetworkFlow({
     answerTop += height + ENDPOINT_GAP;
   }
   const egressNames = new Map(egresses.map((egress) => [egress.id, egress.name]));
-  const wireWords = { TLS: "dnsWireTls", HTTPS: "dnsWireHttps", MIXED: "dnsWireMixed" } as const;
   // Where a lookup's line turns from the gap below its row toward its answer.
   const approach = endpoints.x - 56;
   const asks = origins.map(({ origin, lookup, profile: chosen, legs }, index) => {
@@ -1239,14 +1260,30 @@ export const NetworkFlow = memo(function NetworkFlow({
             ];
     const wire = lookup.destination?.kind === "list" ? listWire(list) : null;
     const turn = line?.at(-2);
-    // An egress asks for every leg leaving through it: a line from each leg's card says which.
+    // A line from each leg's card to the box that asks for it says which route the lookup is for: into the
+    // egress it leaves through, or on through that egress to the proxy carrying it.
+    const entry = origin.x - 14;
     const feeds =
-      lookup.at === "egress"
-        ? legs.flatMap((fed) => {
+      lookup.at === "leg"
+        ? []
+        : legs.flatMap((fed) => {
             const row = rowByKey.get(legKey(fed));
-            return row ? [{ key: legKey(fed), y: row.y + row.cardHeight - 14, lit: onRoute(fed) }] : [];
-          })
-        : [];
+            if (!row) return [];
+            const start: Point = [LEGS.end, row.y + row.cardHeight - 14];
+            const through = egressCardById.get(fed.egressId);
+            const points: Point[] =
+              lookup.at === "egress"
+                ? [start, [EGRESS.x, origin.mid]]
+                : through
+                  ? [
+                      start,
+                      [EGRESS.x, through.y + EGRESS_HEIGHT / 2 + 10],
+                      [EGRESS.end, through.y + EGRESS_HEIGHT / 2 + 10],
+                      [entry, origin.mid],
+                    ]
+                  : [start, [entry, origin.mid]];
+            return [{ key: legKey(fed), y: start[1], points, lit: onRoute(fed) }];
+          });
     return {
       key: `${index}:${legKey(leg)}:${chosen.id}`,
       ...origin,
@@ -1259,6 +1296,7 @@ export const NetworkFlow = memo(function NetworkFlow({
       width: Math.min(pillWidth(label, lookup.validates), origin.boxEnd - origin.x - 14),
       line,
       feeds,
+      entry,
       // DoT or DoH is written on the line, halfway along its last stretch.
       badge:
         wire && line && turn
@@ -1726,12 +1764,12 @@ export const NetworkFlow = memo(function NetworkFlow({
             );
           })}
 
-          {/* From each leg to the egress that looks its names up, under the egress card. */}
+          {/* From each leg to the box that looks its names up, under the cards it passes. */}
           {asks.flatMap((ask) =>
             ask.feeds.map((feed) => (
               <g key={`dns-feed:${ask.key}:${feed.key}`} opacity={feed.lit ? undefined : FADE}>
                 <circle cx={LEGS.end} cy={feed.y} r="2.5" fill={INK.dns} />
-                <path d={thread([[LEGS.end, feed.y], [EGRESS.x, ask.mid]])} fill="none" stroke={INK.dns} strokeWidth="1.25" />
+                <path d={thread(feed.points)} fill="none" stroke={INK.dns} strokeWidth="1.25" />
               </g>
             )),
           )}
@@ -1965,7 +2003,7 @@ export const NetworkFlow = memo(function NetworkFlow({
                 <path d={`M ${ask.x + ask.width} ${ask.mid} L ${ask.boxEnd} ${ask.mid}`} stroke={INK.dns} strokeWidth="1.5" />
               )}
               {ask.feeds.length ? (
-                <path d={`M ${EGRESS.x} ${ask.mid} L ${ask.x} ${ask.mid}`} stroke={INK.dns} strokeWidth="1.25" />
+                <path d={`M ${ask.entry} ${ask.mid} L ${ask.x} ${ask.mid}`} stroke={INK.dns} strokeWidth="1.25" />
               ) : null}
               {card(
                 ask.target,
@@ -2112,7 +2150,8 @@ export const NetworkFlow = memo(function NetworkFlow({
                   key={index}
                   x={endpoints.x + 10}
                   mid={answer.y + DNS_CARD_HEAD + (answer.note ? DNS_CARD_NOTE : 0) + index * DNS_SERVER_ROW + DNS_PILL / 2}
-                  label={server}
+                  label={server.label}
+                  wire={server.wire}
                   width={endpoints.width - 20}
                 />
               ))}
