@@ -473,9 +473,9 @@ const UpdateBlock = memo(function UpdateBlock({
  * button amber and adds a line under the figures, so a slow queue that is only
  * doing as it was told says so.
  *
- * Without torrent things it is the one download speed and its peak. While
- * they show it is three rates, each its own: what Usenet downloads, and what
- * the torrents download and upload.
+ * Without torrents it is the one download speed and its peak. While they are
+ * switched on it is a line for Usenet and one for torrents, each with what it
+ * downloads and what it uploads.
  */
 const ThroughputBlock = memo(function ThroughputBlock() {
   const t = useTranslate();
@@ -530,10 +530,19 @@ const ThroughputBlock = memo(function ThroughputBlock() {
           <Eyebrow tone="rail">{t("next.shell.throughput")}</Eyebrow>
           {button}
         </div>
-        <dl className="m-0 flex flex-col gap-[5px]" data-testid={testIds.shellThroughputRates}>
-          <RailRate label={t("next.shell.usenetDown")} rate={usenet} />
-          <RailRate label={t("next.shell.torrentDown")} rate={torrentDownSpeed} />
-          <RailRate label={t("next.shell.torrentUp")} rate={torrentUpSpeed} />
+        <dl
+          className="m-0 grid grid-cols-[minmax(0,1fr)_auto_auto] items-baseline gap-x-[6px] gap-y-[6px]"
+          data-testid={testIds.shellThroughputRates}
+        >
+          <RailRates
+            label={t("next.protocol.usenet")}
+            down={{ rate: usenet, title: t("next.shell.usenetDown") }}
+          />
+          <RailRates
+            label={t("next.protocol.torrent")}
+            down={{ rate: torrentDownSpeed, title: t("next.shell.torrentDown") }}
+            up={{ rate: torrentUpSpeed, title: t("next.shell.torrentUp") }}
+          />
         </dl>
         {limitLine}
         {dialog}
@@ -600,24 +609,66 @@ export const NetworkBlock = memo(function NetworkBlock() {
 });
 
 /** One named rate of the throughput block: its name, then the figure and its unit. */
-function RailRate({ label, rate }: { label: string; rate: number }) {
-  const { value, unit } = splitSpeed(rate);
+/**
+ * One class's rates on a line: what it downloads, then what it uploads. Each
+ * counter keeps one decimal and a fixed width, so the columns hold still as the
+ * figures change. Usenet uploads nothing, so its upload column is a dash.
+ */
+function RailRates({
+  label,
+  down,
+  up,
+}: {
+  label: string;
+  down: { rate: number; title: string };
+  up?: { rate: number; title: string };
+}) {
   return (
-    <div className="flex items-baseline justify-between gap-2">
-      <dt className="min-w-0 truncate font-wv-mono text-[11px] text-wv-muted">{label}</dt>
-      <dd className="m-0 flex flex-none items-baseline gap-1">
-        <span
-          className={cn(
-            "text-[15px] font-semibold leading-none tracking-[-0.01em]",
-            rate > 0 ? "text-wv-fg" : "text-wv-muted",
-          )}
-        >
-          {value}
-        </span>
-        <span className="text-[11px] text-wv-muted">{unit}</span>
-      </dd>
-    </div>
+    <>
+      <dt className="min-w-0 truncate font-wv-mono text-[10.5px] text-wv-muted">{label}</dt>
+      <RailCounter arrow="down" {...down} />
+      {up ? (
+        <RailCounter arrow="up" {...up} />
+      ) : (
+        <dd className="m-0 text-right font-wv-mono text-[11px] text-wv-faint" aria-hidden>
+          —
+        </dd>
+      )}
+    </>
   );
+}
+
+function RailCounter({ arrow, rate, title }: { arrow: "down" | "up"; rate: number; title: string }) {
+  const { value, unit } = fixedSpeed(rate);
+  return (
+    <dd className="m-0 flex items-baseline justify-end gap-[2px]" title={title} aria-label={title}>
+      <span aria-hidden className="text-[10px] text-wv-muted">
+        {arrow === "down" ? "↓" : "↑"}
+      </span>
+      <span
+        className={cn(
+          "inline-block w-[5ch] text-right font-wv-mono text-[12px] font-semibold tabular-nums leading-none",
+          rate > 0 ? "text-wv-fg" : "text-wv-muted",
+        )}
+      >
+        {value}
+      </span>
+      <span className="inline-block w-[4ch] font-wv-mono text-[9.5px] text-wv-muted">{unit}</span>
+    </dd>
+  );
+}
+
+/** A rate as `x.x` and its unit, one decimal at every scale. */
+function fixedSpeed(bytesPerSecond: number): { value: string; unit: string } {
+  const units = ["B/s", "KB/s", "MB/s", "GB/s"];
+  let scaled = Number.isFinite(bytesPerSecond) && bytesPerSecond > 0 ? bytesPerSecond : 0;
+  let index = 0;
+  // Past 999.9 the next unit, so the value never needs more than five places.
+  while (scaled >= 999.95 && index < units.length - 1) {
+    scaled /= 1024;
+    index += 1;
+  }
+  return { value: scaled.toFixed(1), unit: units[index] };
 }
 
 /** The rail's last block: the sponsor link. */
