@@ -45,6 +45,7 @@ use self::{
 };
 
 use super::smart_ban::{SentBlock, SmartBan};
+use crate::session_stats::incoming::{Already, Held};
 
 use super::peer::{
     IncomingConnectionResult, LivePeerState, Peer, PeerRx, PeerState, PeerTx, listen_address,
@@ -493,7 +494,7 @@ enum Admitted<R> {
     New(Arc<PeerCountersAtomic>),
     Refused,
     Banned,
-    Duplicate,
+    Duplicate(Already),
 }
 
 /// When the connect loop may next connect to someone.
@@ -530,7 +531,7 @@ pub(crate) enum PeerIdClaim {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum IncomingRefused {
-    AlreadyActive,
+    AlreadyActive(Already),
     ListFull,
     Banned,
 }
@@ -1017,8 +1018,13 @@ impl PeerStates {
             Displace::AnyIdle,
             Some(our_port),
             |peer| {
+                // The connection it has, read before the newcomer is tried.
+                let held = peer.held();
                 peer.incoming_connection(peer_id, tx.clone(), self, kind)
                     .map(|()| peer.stats.counters.clone())
+                    .map_err(|IncomingConnectionResult::AlreadyActive| {
+                        Already::new(held.unwrap_or(Held::Dialling), our_port, addr.port(), true)
+                    })
             },
             || {
                 Some(Peer::new_live_for_incoming_connection(
@@ -1031,8 +1037,8 @@ impl PeerStates {
         );
         match admitted {
             Admitted::Known(Ok(counters)) | Admitted::New(counters) => Ok(counters),
-            Admitted::Known(Err(IncomingConnectionResult::AlreadyActive)) | Admitted::Duplicate => {
-                Err(IncomingRefused::AlreadyActive)
+            Admitted::Known(Err(already)) | Admitted::Duplicate(already) => {
+                Err(IncomingRefused::AlreadyActive(already))
             }
             Admitted::Refused => Err(IncomingRefused::ListFull),
             Admitted::Banned => Err(IncomingRefused::Banned),
@@ -1060,9 +1066,9 @@ impl PeerStates {
         }
         let handle = PeerHandle::from(addr);
         if let Some(our_port) = our_port
-            && !self.keeps_incoming(addr, our_port)
+            && let Err(already) = self.keeps_incoming(addr, our_port)
         {
-            return Admitted::Duplicate;
+            return Admitted::Duplicate(already);
         }
         if let Some(r) = self.with_peer_mut(handle, "admit", known) {
             return Admitted::Known(r);
@@ -1090,12 +1096,14 @@ impl PeerStates {
     // one, both ends keep the connection made by the end with the lower
     // listen port, so both drop the same one; a tie is settled by chance.
     // The connection that loses is closed, which is no failure.
-    fn keeps_incoming(&self, addr: SocketAddr, our_port: u16) -> bool {
+    // An incoming connection that goes is returned as what it is counted
+    // under.
+    fn keeps_incoming(&self, addr: SocketAddr, our_port: u16) -> Result<(), Already> {
         if self
             .allow_multiple_connections_per_ip
             .load(Ordering::Relaxed)
         {
-            return true;
+            return Ok(());
         }
         let others = self
             .index
@@ -1105,13 +1113,13 @@ impl PeerStates {
             .copied()
             .filter(|other| *other != addr)
             .collect::<Vec<_>>();
-        let Some((other, outgoing)) = others
+        let Some((other, held)) = others
             .into_iter()
-            .find_map(|other| Some((other, self.with_peer(other.into(), Peer::connected_out)??)))
+            .find_map(|other| Some((other, self.with_peer(other.into(), Peer::held)??)))
         else {
-            return true;
+            return Ok(());
         };
-        let keep = outgoing
+        let keep = held != Held::Theirs
             && match our_port.cmp(&other.port()) {
                 std::cmp::Ordering::Less => false,
                 std::cmp::Ordering::Greater => true,
@@ -1119,8 +1127,10 @@ impl PeerStates {
             };
         if keep {
             self.with_peer(other.into(), Peer::disconnect);
+            Ok(())
+        } else {
+            Err(Already::new(held, our_port, other.port(), false))
         }
-        keep
     }
 
     // The addresses of the peers on the list with a connection, open or

@@ -875,6 +875,9 @@ metric_families! {
     TORRENT_INCOMING_CONNECTIONS = ("weaver_torrent_incoming_connections_total", Counter,
         ["route", "transport", "result"],
         "Connections peers opened to the session since it opened, by transport and how each ended its way in: accepted, or the reason it was turned away (session_limit, filtered, family, banned, privileged_port, tls, encryption, handshake, unknown_torrent, ourselves, not_allowed, not_live, already_connected, torrent_limit, not_wanted, error). One still in its handshake is not counted yet.");
+    TORRENT_INCOMING_ALREADY_CONNECTED = ("weaver_torrent_incoming_already_connected_total", Counter,
+        ["route", "transport", "held", "ports", "from"],
+        "The connections counted in weaver_torrent_incoming_connections_total as already_connected, by the connection we had with the peer (dialling: one we were still making; ours: one we made; theirs: one it made), our listen port against the peer's (ours_lower, ours_higher, equal) and whether the connection came from that peer's very address, port included (same) or another port at it (other). Where two ends connect to each other at once, libtorrent keeps the connection made by the end with the lower port; from=same is turned away whatever the ports.");
     TORRENT_UNCHOKE_SLOTS_HELD = ("weaver_torrent_session_unchoke_slots_held", Gauge,
         ["route"], "Upload slots the session's unchoked peers hold now, across every torrent.");
     TORRENT_WEB_SEED_REQUESTS = ("weaver_torrent_web_seed_requests_total", Counter,

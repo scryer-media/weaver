@@ -6,6 +6,7 @@
 // Weaver authors from 2026-10-20 onward.
 
 use super::*;
+use crate::session_stats::incoming::{FromAddress, PortOrder};
 
 // Each connection's PEX message from the one shared map is one the
 // map built afresh for it gives: over a seeded run of peers going live
@@ -1199,13 +1200,44 @@ fn a_connection_from_a_peer_we_dial_is_settled_by_listen_port() {
     let from = at_port(dialed, 50000);
     assert_eq!(
         incoming(&peers, from, 6000).unwrap_err(),
-        IncomingRefused::AlreadyActive
+        IncomingRefused::AlreadyActive(Already {
+            held: Held::Dialling,
+            ports: PortOrder::OursLower,
+            from: FromAddress::Other,
+        })
     );
     assert!(dialing.try_recv().is_err());
 
     // Theirs is the lower: their connection stays, ours is closed.
     assert!(incoming(&peers, from, 7000).is_ok());
     assert!(told_to_close(&mut dialing));
+}
+
+// A connection from the very address we are dialling is turned away
+// whatever the ports, where libtorrent settles it by them: it is counted
+// apart, with the ports, so how often that happens can be read.
+#[test]
+fn a_connection_from_the_address_we_dial_is_refused_and_says_what_stood() {
+    let peers = make_peer_states();
+    let dialed = peer_addr(1);
+    peers.add_peer(dialed, PeerSourceFlag::Tracker);
+    let (_, mut dialing, _) = peers.connect_next(Instant::now()).unwrap();
+
+    for (our_port, ports) in [
+        (dialed.port() - 1, PortOrder::OursLower),
+        (dialed.port() + 1, PortOrder::OursHigher),
+        (dialed.port(), PortOrder::Equal),
+    ] {
+        assert_eq!(
+            incoming(&peers, dialed, our_port).unwrap_err(),
+            IncomingRefused::AlreadyActive(Already {
+                held: Held::Dialling,
+                ports,
+                from: FromAddress::Same,
+            })
+        );
+    }
+    assert!(dialing.try_recv().is_err());
 }
 
 // libtorrent `peer_list::new_connection`: when a peer connected to us
@@ -1216,7 +1248,11 @@ fn a_second_connection_from_an_address_that_reached_us_is_refused() {
     let mut first = incoming(&peers, at_port(peer_addr(1), 50000), OUR_PORT).unwrap();
     assert_eq!(
         incoming(&peers, at_port(peer_addr(1), 50001), OUR_PORT).unwrap_err(),
-        IncomingRefused::AlreadyActive
+        IncomingRefused::AlreadyActive(Already {
+            held: Held::Theirs,
+            ports: PortOrder::OursLower,
+            from: FromAddress::Other,
+        })
     );
     assert!(first.try_recv().is_err());
     assert!(incoming(&peers, at_port(peer_addr(2), 50001), OUR_PORT).is_ok());

@@ -220,7 +220,7 @@ struct UploadMode {
 
 pub enum AddIncomingPeerResult {
     Added,
-    AlreadyActive,
+    AlreadyActive(crate::session_stats::incoming::Already),
     ConcurrencyLimitReached,
     // Finished, with its upload closed: the torrent wants no peers.
     NotWanted,

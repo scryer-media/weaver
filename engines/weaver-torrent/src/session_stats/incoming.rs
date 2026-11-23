@@ -58,7 +58,7 @@ impl IncomingEnd {
         use crate::torrent_state::live::AddIncomingPeerResult as R;
         match added {
             Ok(R::Added) => Self::Accepted,
-            Ok(R::AlreadyActive) => Self::AlreadyConnected,
+            Ok(R::AlreadyActive(_)) => Self::AlreadyConnected,
             Ok(R::ConcurrencyLimitReached | R::PeerListFull) => Self::TorrentLimit,
             Ok(R::NotWanted) => Self::NotWanted,
             Ok(R::Banned) => Self::Banned,
@@ -67,10 +67,76 @@ impl IncomingEnd {
     }
 }
 
+counted! {
+    /// The connection we had with a peer when another came from it.
+    Held {
+        /// One we were still making.
+        Dialling => "dialling",
+        /// One we made, open.
+        Ours => "ours",
+        /// One the peer made, open.
+        Theirs => "theirs",
+    }
+}
+
+counted! {
+    /// Our listen port against the port of the peer whose connection we had.
+    PortOrder {
+        OursLower => "ours_lower",
+        OursHigher => "ours_higher",
+        Equal => "equal",
+    }
+}
+
+counted! {
+    /// Whether the connection came from the very address, port included,
+    /// of the peer whose connection we had.
+    FromAddress {
+        Same => "same",
+        Other => "other",
+    }
+}
+
+/// What stood when a connection was turned away as
+/// [`IncomingEnd::AlreadyConnected`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Already {
+    pub held: Held,
+    pub ports: PortOrder,
+    pub from: FromAddress,
+}
+
+impl Already {
+    pub const COUNT: usize = Held::COUNT * PortOrder::COUNT * FromAddress::COUNT;
+
+    pub(crate) fn new(held: Held, our_port: u16, their_port: u16, same_address: bool) -> Self {
+        Self {
+            held,
+            ports: match our_port.cmp(&their_port) {
+                std::cmp::Ordering::Less => PortOrder::OursLower,
+                std::cmp::Ordering::Greater => PortOrder::OursHigher,
+                std::cmp::Ordering::Equal => PortOrder::Equal,
+            },
+            from: if same_address {
+                FromAddress::Same
+            } else {
+                FromAddress::Other
+            },
+        }
+    }
+
+    /// Where its count is in [`IncomingSnapshot::already`].
+    pub const fn index(self) -> usize {
+        (self.held as usize * PortOrder::COUNT + self.ports as usize) * FromAddress::COUNT
+            + self.from as usize
+    }
+}
+
 /// The incoming-connection counts of one session.
 #[derive(Debug, Default)]
 pub struct IncomingStats {
     ends: [Tally<{ IncomingEnd::COUNT }>; Transport::COUNT],
+    already: [Tally<{ Already::COUNT }>; Transport::COUNT],
 }
 
 impl IncomingStats {
@@ -79,9 +145,17 @@ impl IncomingStats {
         add(&self.ends[transport as usize], end as usize, 1);
     }
 
+    /// A connection counted as [`IncomingEnd::AlreadyConnected`]: what
+    /// stood when it was turned away.
+    #[inline]
+    pub fn already(&self, transport: Transport, already: Already) {
+        add(&self.already[transport as usize], already.index(), 1);
+    }
+
     pub fn snapshot(&self) -> IncomingSnapshot {
         IncomingSnapshot {
             ends: self.ends.each_ref().map(read),
+            already: self.already.each_ref().map(read),
         }
     }
 }
@@ -91,4 +165,6 @@ impl IncomingStats {
 pub struct IncomingSnapshot {
     /// By [`Transport`], then [`IncomingEnd`].
     pub ends: [[u64; IncomingEnd::COUNT]; Transport::COUNT],
+    /// By [`Transport`], then [`Already::index`].
+    pub already: [[u64; Already::COUNT]; Transport::COUNT],
 }
