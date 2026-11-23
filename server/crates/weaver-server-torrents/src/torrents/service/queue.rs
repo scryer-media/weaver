@@ -62,7 +62,7 @@ impl TorrentService {
     /// tick starts then, the torrents read so far run, and each tick reads
     /// that page again until the load ends.
     pub async fn start_seated(&self) -> Result<(), String> {
-        let through = self.begin()?;
+        let through = self.begin().await?;
         if let Some(queue) = self.queue() {
             queue.state().classes().seat(self.class());
         }
@@ -210,15 +210,15 @@ impl TorrentService {
     }
 
     pub async fn set_forced(&self, job_id: JobId, forced: bool) -> Result<(), ActionError> {
-        self.with_torrent(job_id, |torrent| {
-            self.inner
-                .db
-                .set_torrent_forced(job_id, forced)
+        {
+            self.ensure(&[job_id]).await;
+            let mut live = self.inner.live.lock().await;
+            let torrent = live.get_mut(&job_id).ok_or(ActionError::NotFound(job_id))?;
+            self.db(move |db| db.set_torrent_forced(job_id, forced))
+                .await
                 .map_err(|error| ActionError::State(state_error(error)))?;
             torrent.record.forced = forced;
-            Ok(())
-        })
-        .await?;
+        }
         self.apply_queue().await;
         self.publish().await;
         Ok(())

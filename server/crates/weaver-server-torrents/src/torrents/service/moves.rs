@@ -315,7 +315,10 @@ impl TorrentService {
         owed: &mut Owed,
     ) -> Result<(), ActionError> {
         let dir = to.to_string_lossy().into_owned();
-        self.with_torrent(job_id, |torrent| {
+        {
+            self.ensure(&[job_id]).await;
+            let mut live = self.inner.live.lock().await;
+            let torrent = live.get_mut(&job_id).ok_or(ActionError::NotFound(job_id))?;
             if torrent.moving.is_some() {
                 return Err(ActionError::Invalid(
                     "the torrent is already moving".to_owned(),
@@ -336,15 +339,13 @@ impl TorrentService {
                     "the torrent's files were found while it was moved; move it again".to_owned(),
                 ));
             }
-            self.inner
-                .db
-                .set_torrent_storage_dir(job_id, &dir)
+            let stored = dir.clone();
+            self.db(move |db| db.set_torrent_storage_dir(job_id, &stored))
+                .await
                 .map_err(|error| ActionError::State(state_error(error)))?;
             store.place(to.clone());
             torrent.record.storage_dir = Some(dir.clone());
-            Ok(())
-        })
-        .await?;
+        }
         self.sync_held(job_id).await;
         if self.look_again(job_id).await {
             self.owe_join(owed, job_id).await;
@@ -830,35 +831,40 @@ impl TorrentService {
                 // Kept on its row before the torrent shows it, under the
                 // same hold, so nothing that sees the new place finds the
                 // row behind.
-                let recorded = self
-                    .with_torrent(job_id, |torrent| {
-                        // A move of placed files wrote its row itself, with
-                        // the names its outputs moved to (`move_listed`).
-                        let recorded = if files {
-                            Ok(true)
-                        } else {
-                            self.inner.db.set_torrent_storage_dir(job_id, &to)
-                        };
-                        if files {
-                            torrent.record.files_dir = Some(to.clone());
-                            torrent.record.save_path = Some(to.clone());
-                        } else {
-                            torrent.record.storage_dir = Some(to.clone());
+                let recorded = 'recorded: {
+                    self.ensure(&[job_id]).await;
+                    let mut live = self.inner.live.lock().await;
+                    let Some(torrent) = live.get_mut(&job_id) else {
+                        break 'recorded Err(ActionError::NotFound(job_id));
+                    };
+                    // A move of placed files wrote its row itself, with
+                    // the names its outputs moved to (`move_listed`).
+                    let recorded = if files {
+                        Ok(true)
+                    } else {
+                        let to = to.clone();
+                        self.db(move |db| db.set_torrent_storage_dir(job_id, &to))
+                            .await
+                    };
+                    if files {
+                        torrent.record.files_dir = Some(to.clone());
+                        torrent.record.save_path = Some(to.clone());
+                    } else {
+                        torrent.record.storage_dir = Some(to.clone());
+                    }
+                    // Its pieces land on the disk of its new folder,
+                    // looked up now: none is let through until then.
+                    // A look out takes the new folder at its end; a
+                    // torrent listed to look again is looked up now.
+                    let dir = files_dir(torrent);
+                    let look = torrent.intake.clone().filter(|intake| {
+                        intake.room().aim(&dir) && {
+                            locked(&self.inner.relook).jobs.remove(&job_id);
+                            intake.room().begin_placing()
                         }
-                        // Its pieces land on the disk of its new folder,
-                        // looked up now: none is let through until then.
-                        // A look out takes the new folder at its end; a
-                        // torrent listed to look again is looked up now.
-                        let dir = files_dir(torrent);
-                        let look = torrent.intake.clone().filter(|intake| {
-                            intake.room().aim(&dir) && {
-                                locked(&self.inner.relook).jobs.remove(&job_id);
-                                intake.room().begin_placing()
-                            }
-                        });
-                        Ok((recorded, look.map(|intake| (intake, dir))))
-                    })
-                    .await;
+                    });
+                    Ok((recorded, look.map(|intake| (intake, dir))))
+                };
                 let recorded = recorded.map(|(recorded, look)| {
                     if let Some((intake, dir)) = look {
                         self.owe_place(owed, job_id, intake, dir);

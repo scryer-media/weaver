@@ -1464,6 +1464,18 @@ impl TorrentService {
         change(torrent)
     }
 
+    // Run `op` against the database off the runtime.
+    pub(super) async fn db<T: Send + 'static>(
+        &self,
+        op: impl FnOnce(&Database) -> Result<T, StateError> + Send + 'static,
+    ) -> Result<T, StateError> {
+        let db = self.inner.db.clone();
+        tokio::task::spawn_blocking(move || op(&db))
+            .await
+            .map_err(|error| StateError::Database(error.to_string()))
+            .and_then(|result| result)
+    }
+
     // What the operator asks of the torrent, written under its lock with
     // no other column, and the ledger and peers as they stand beside it.
     pub async fn set_intent(
@@ -1472,15 +1484,15 @@ impl TorrentService {
         intent: TorrentIntent,
     ) -> Result<(), ActionError> {
         let now = self.inner.clock.unix_ms();
-        let landing = self
-            .with_torrent(job_id, |torrent| {
-                self.inner
-                    .db
-                    .update_torrent_intent(job_id, intent)
-                    .map_err(|error| ActionError::State(state_error(error)))?;
-                Ok(self.intend(torrent, intent, now))
-            })
-            .await?;
+        let landing = {
+            self.ensure(&[job_id]).await;
+            let mut live = self.inner.live.lock().await;
+            let torrent = live.get_mut(&job_id).ok_or(ActionError::NotFound(job_id))?;
+            self.db(move |db| db.update_torrent_intent(job_id, intent))
+                .await
+                .map_err(|error| ActionError::State(state_error(error)))?;
+            self.intend(torrent, intent, now)
+        };
         let _ = self.landed(landing).await;
         Ok(())
     }
@@ -1499,14 +1511,13 @@ impl TorrentService {
 
     // Stop the torrent for good, as its goal or a refusal does: its intent
     // is written, and the ledger and peers as they stand, queued.
-    pub fn stop_torrent(&self, torrent: &mut Live, now: i64) -> Option<Landing> {
+    pub async fn stop_torrent(&self, torrent: &mut Live, now: i64) -> Option<Landing> {
         let job_id = torrent.record.job_id;
         torrent.settle(now);
         torrent.record.kept = KeptIntent::Intent(TorrentIntent::Stopped);
         if let Err(error) = self
-            .inner
-            .db
-            .update_torrent_intent(job_id, TorrentIntent::Stopped)
+            .db(move |db| db.update_torrent_intent(job_id, TorrentIntent::Stopped))
+            .await
         {
             tracing::warn!(job_id = job_id.0, error = %error, "could not keep a torrent's stop");
         }

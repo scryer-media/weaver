@@ -203,11 +203,7 @@ impl TorrentService {
             }
             // The write runs off the runtime; the list stays held, so no
             // other change of these torrents lands between it and theirs.
-            let db = self.inner.db.clone();
-            let written = tokio::task::spawn_blocking(move || db.set_torrent_settings(&rows))
-                .await
-                .map_err(|error| StateError::Database(error.to_string()))
-                .and_then(|result| result);
+            let written = self.db(move |db| db.set_torrent_settings(&rows)).await;
             if let Err(error) = written {
                 return failed(outcome, &ids_of(&checked), &error);
             }
@@ -265,14 +261,9 @@ impl TorrentService {
     // keeps the list held, so no other change of these torrents lands
     // between it and theirs.
     async fn write_intents(&self, intent: KeptIntent, job_ids: &[JobId]) -> Result<(), StateError> {
-        let db = self.inner.db.clone();
         let job_ids = job_ids.to_vec();
-        tokio::task::spawn_blocking(move || {
-            db.update_torrent_intents(&[(intent, job_ids.as_slice())])
-        })
-        .await
-        .map_err(|error| StateError::Database(error.to_string()))
-        .and_then(|result| result)
+        self.db(move |db| db.update_torrent_intents(&[(intent, job_ids.as_slice())]))
+            .await
     }
 
     // `pause` for each torrent: one write of their intents, then one pass
@@ -506,15 +497,15 @@ impl TorrentService {
                 .iter()
                 .filter_map(|&(job_id, _, forced)| forced.map(|forced| (job_id, forced)))
                 .collect();
+            let forcing = !forced.is_empty();
             if let Err(error) = self
-                .inner
-                .db
-                .set_torrent_categories_and_forced(&categories, &forced)
+                .db(move |db| db.set_torrent_categories_and_forced(&categories, &forced))
+                .await
             {
                 let ids: Vec<JobId> = asked.iter().map(|(job_id, _, _)| *job_id).collect();
                 return failed(outcome, &ids, &error);
             }
-            any_forced = !forced.is_empty();
+            any_forced = forcing;
             for (job_id, category, forced) in asked {
                 let Some(torrent) = live.get_mut(&job_id) else {
                     continue;
@@ -659,12 +650,8 @@ impl TorrentService {
         }
         // Their rows are marked retiring, as one removal's is, in one write.
         mark_hold().await;
-        let db = self.inner.db.clone();
         let marks = begun.clone();
-        let marked = tokio::task::spawn_blocking(move || db.mark_torrents_retiring(&marks))
-            .await
-            .map_err(|error| StateError::Database(error.to_string()))
-            .and_then(|result| result);
+        let marked = self.db(move |db| db.mark_torrents_retiring(&marks)).await;
         match marked {
             Ok(()) => {}
             Err(StateError::OutOfSpace(error)) => {
@@ -806,16 +793,22 @@ impl TorrentService {
             if moved.is_empty() {
                 return (outcome, false);
             }
-            if let Err(error) = self.inner.db.set_torrent_queue_positions(&moved) {
-                // Nothing of the moves was kept: the first that changed
-                // anything fails, and those after it never ran.
-                for (job_id, _) in &moves[first_change..] {
-                    outcome.remove(job_id);
+            let moved = match self
+                .db(move |db| db.set_torrent_queue_positions(&moved).map(|()| moved))
+                .await
+            {
+                Ok(moved) => moved,
+                Err(error) => {
+                    // Nothing of the moves was kept: the first that changed
+                    // anything fails, and those after it never ran.
+                    for (job_id, _) in &moves[first_change..] {
+                        outcome.remove(job_id);
+                    }
+                    let (job_id, _) = moves[first_change];
+                    outcome.insert(job_id, Err(ActionError::State(state_error(error))));
+                    return (outcome, false);
                 }
-                let (job_id, _) = moves[first_change];
-                outcome.insert(job_id, Err(ActionError::State(state_error(error))));
-                return (outcome, false);
-            }
+            };
             for (job_id, place) in moved {
                 if let Some(torrent) = live.get_mut(&job_id) {
                     torrent.record.queue_position = place;

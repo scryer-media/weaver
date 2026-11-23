@@ -510,10 +510,15 @@ async fn finishing_downloads_stops_many_seeds_in_one_pass_as_one_by_one_did() {
     let now = old.service.inner.clock.unix_ms();
     let landings: Vec<_> = {
         let mut live = old.service.inner.live.lock().await;
-        old_ids
-            .iter()
-            .filter_map(|job_id| old.service.stop_torrent(live.get_mut(job_id).unwrap(), now))
-            .collect()
+        let mut landings = Vec::new();
+        for job_id in &old_ids {
+            landings.extend(
+                old.service
+                    .stop_torrent(live.get_mut(job_id).unwrap(), now)
+                    .await,
+            );
+        }
+        landings
     };
     for landing in landings {
         let _ = old.service.landed(Some(landing)).await;
@@ -579,10 +584,15 @@ async fn seeds_meeting_their_goals_stop_in_one_pass_as_one_by_one_did() {
     let now = old.service.inner.clock.unix_ms();
     let landings: Vec<_> = {
         let mut live = old.service.inner.live.lock().await;
-        old_ids
-            .iter()
-            .filter_map(|job_id| old.service.stop_torrent(live.get_mut(job_id).unwrap(), now))
-            .collect()
+        let mut landings = Vec::new();
+        for job_id in &old_ids {
+            landings.extend(
+                old.service
+                    .stop_torrent(live.get_mut(job_id).unwrap(), now)
+                    .await,
+            );
+        }
+        landings
     };
     for landing in landings {
         let _ = old.service.landed(Some(landing)).await;

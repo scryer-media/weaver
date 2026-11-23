@@ -641,10 +641,8 @@ impl TorrentService {
     // A removal's mark on the torrent's row, written off the runtime.
     async fn mark_retiring(&self, job_id: JobId, delete_files: bool) -> Result<(), StateError> {
         mark_hold().await;
-        let db = self.inner.db.clone();
-        tokio::task::spawn_blocking(move || db.mark_torrent_retiring(job_id, delete_files))
+        self.db(move |db| db.mark_torrent_retiring(job_id, delete_files))
             .await
-            .map_err(|error| StateError::Database(error.to_string()))?
     }
 
     // What reading the torrent's written files takes, cloned under the

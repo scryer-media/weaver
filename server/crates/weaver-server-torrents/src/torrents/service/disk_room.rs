@@ -531,7 +531,9 @@ impl TorrentService {
             }
             let was = torrent.disk_held;
             if torrent.reopens(&torrent.levels) {
-                service.reopen_checked(torrent, service.inner.clock.unix_ms());
+                service
+                    .reopen_checked(torrent, service.inner.clock.unix_ms())
+                    .await;
             }
             service.rejudge_start(torrent);
             let moved = torrent.disk_held != was;
