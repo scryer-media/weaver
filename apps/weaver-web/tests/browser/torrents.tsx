@@ -156,7 +156,8 @@ function Queue() {
           <DownloadRow
             job={entry}
             selected={false}
-            onSelect={() => {}}
+            onSelect={(id) => { status.textContent = `selected ${id}`; }}
+            onOpen={(id) => { status.textContent = `opened ${id}`; }}
             picked={false}
             onPick={() => {}}
             statusLabel={statusLabel}

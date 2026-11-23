@@ -12,6 +12,7 @@ import {
   diskPace,
   etaById,
   groupCounts,
+  QUEUE_ITEM_STATES,
   queuePageInput,
   queueSelection,
   tabCounts,
@@ -19,17 +20,25 @@ import {
   withoutIds,
 } from "../src/next/data/queue-page.ts";
 
-test("a tab names the states of its section and all names none", () => {
-  assert.equal(tabStates("all"), undefined);
+test("a tab names the states under it and no tab names none", () => {
+  assert.equal(tabStates(null), undefined);
   assert.deepEqual(tabStates("paused"), ["PAUSED"]);
-  const active = tabStates("active")!;
-  assert.ok(active.includes("DOWNLOADING") && active.includes("EXTRACTING"));
-  assert.ok(!active.includes("QUEUED") && !active.includes("PAUSED"));
-  assert.ok(tabStates("queued")!.includes("QUEUED"));
+  assert.deepEqual(tabStates("seeding"), ["SEEDING"]);
+  assert.deepEqual(tabStates("queued"), ["QUEUED"]);
+  const downloading = tabStates("downloading")!;
+  for (const state of ["DOWNLOADING", "VERIFYING", "REPAIRING", "EXTRACTING", "POST_PROCESSING", "FETCHING_METADATA", "CHECKING_FILES", "STALLED"] as const) {
+    assert.ok(downloading.includes(state), state);
+  }
+  assert.ok(!downloading.includes("QUEUED") && !downloading.includes("PAUSED") && !downloading.includes("SEEDING"));
+});
+
+test("the four tabs between them hold every state, each once", () => {
+  const tabs = (["downloading", "seeding", "queued", "paused"] as const).flatMap((tab) => tabStates(tab)!);
+  assert.deepEqual([...tabs].sort(), [...QUEUE_ITEM_STATES].sort());
 });
 
 test("the selection carries only the filters set, uncategorised as the empty string", () => {
-  assert.deepEqual(queueSelection({ tab: "all", facets: new Set(), query: "  " }), {});
+  assert.deepEqual(queueSelection({ facets: new Set(), query: "  " }), {});
   assert.deepEqual(
     queueSelection({ tab: "paused", facets: new Set(["tv", UNCATEGORISED]), query: " show " }),
     { search: "show", states: ["PAUSED"], categories: ["tv", ""] },
@@ -37,9 +46,9 @@ test("the selection carries only the filters set, uncategorised as the empty str
 });
 
 test("a tag filter rides in the selection, no tag as the empty string, and is not the whole queue", () => {
-  const tagged = queueSelection({ tab: "all", facets: new Set(), query: "", tag: "hd" });
+  const tagged = queueSelection({ facets: new Set(), query: "", tag: "hd" });
   assert.deepEqual(tagged, { tag: "hd" });
-  const untagged = queueSelection({ tab: "all", facets: new Set(), query: "", tag: UNTAGGED });
+  const untagged = queueSelection({ facets: new Set(), query: "", tag: UNTAGGED });
   assert.deepEqual(untagged, { tag: "" });
   assert.deepEqual(batchTarget(true, new Set(), untagged, 3), { selection: { tag: "" }, expectedMatched: 3 });
 });
@@ -64,8 +73,10 @@ test("tab counts come from the daemon's state counts, not the page", () => {
       { state: "QUEUED", count: 9000 },
       { state: "PAUSED", count: 40 },
       { state: "FAILED", count: 3 },
+      { state: "SEEDING", count: 5 },
+      { state: "STALLED", count: 1 },
     ]),
-    { all: 9046, active: 3, queued: 9000, paused: 40 },
+    { all: 9052, downloading: 7, seeding: 5, queued: 9000, paused: 40 },
   );
 });
 

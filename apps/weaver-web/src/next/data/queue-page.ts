@@ -24,7 +24,21 @@ export function downloadGroup(status: string): DownloadGroup {
   return "queued";
 }
 
-export type QueueTab = "all" | "active" | "queued" | "paused";
+/**
+ * The list's state tabs. Downloading is every job underway that is not
+ * seeding, waiting or paused, so the four between them hold every job; the
+ * All tab beside them is no state filter.
+ */
+export type QueueTab = "downloading" | "seeding" | "queued" | "paused";
+
+/** The tab a job in `status` sits under. */
+export function queueTab(status: string): QueueTab {
+  if (status.toUpperCase() === "SEEDING") return "seeding";
+  const token = statusToken(status);
+  if (token === "paused") return "paused";
+  if (token === "queued" && !isActiveStatus(status)) return "queued";
+  return "downloading";
+}
 export type QueueSort = "priority" | "name" | "size" | "progress" | "eta";
 
 /** Every state a queued job can be in, as the daemon names it. */
@@ -51,12 +65,12 @@ export const QUEUE_ITEM_STATES = [
 
 export type QueueItemState = (typeof QUEUE_ITEM_STATES)[number];
 
-/** The states a tab shows; `undefined` is every state. */
-export function tabStates(tab: QueueTab): QueueItemState[] | undefined {
-  if (tab === "all") {
+/** The states a tab shows; no tab is every state. */
+export function tabStates(tab: QueueTab | null): QueueItemState[] | undefined {
+  if (tab === null) {
     return undefined;
   }
-  return QUEUE_ITEM_STATES.filter((state) => downloadGroup(state) === tab);
+  return QUEUE_ITEM_STATES.filter((state) => queueTab(state) === tab);
 }
 
 /** Which jobs the screen is looking at, whatever page of them it shows. */
@@ -70,13 +84,14 @@ export interface QueueSelection {
 }
 
 export function queueSelection({
-  tab,
+  tab = null,
   facets,
   query,
   protocol = null,
   tag = null,
 }: {
-  tab: QueueTab;
+  /** No tab is the whole queue. */
+  tab?: QueueTab | null;
   facets: ReadonlySet<string>;
   query: string;
   protocol?: JobProtocol | null;
@@ -137,15 +152,14 @@ export function groupCounts(stateCounts: readonly QueueStateCount[]): Record<Dow
   return counts;
 }
 
-/** Jobs per tab, from the daemon's counts taken before the tab applies. */
-export function tabCounts(stateCounts: readonly QueueStateCount[]): Record<QueueTab, number> {
-  const groups = groupCounts(stateCounts);
-  return {
-    all: groups.active + groups.paused + groups.queued + groups.attention,
-    active: groups.active,
-    queued: groups.queued,
-    paused: groups.paused,
-  };
+/** Jobs per tab, All included, from the daemon's counts taken before the tab applies. */
+export function tabCounts(stateCounts: readonly QueueStateCount[]): Record<QueueTab | "all", number> {
+  const counts: Record<QueueTab | "all", number> = { all: 0, downloading: 0, seeding: 0, queued: 0, paused: 0 };
+  for (const { state, count } of stateCounts) {
+    counts[queueTab(state)] += count;
+    counts.all += count;
+  }
+  return counts;
 }
 
 /**

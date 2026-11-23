@@ -97,7 +97,8 @@ import { DownloadInspector } from "./downloads/DownloadInspector";
 import { DownloadRow } from "./downloads/DownloadRow";
 import { QueueEtaContext } from "./downloads/queue-eta";
 
-type TabId = QueueTab;
+/** All, then the state tabs; All is no state filter. */
+type TabId = "all" | QueueTab;
 type SortId = QueueSort;
 
 /** Each sort and the key of its label. */
@@ -269,7 +270,9 @@ export function DownloadsPage() {
   // The protocol filter is torrent-only: while it is hidden it filters nothing.
   const protocol = torrentsOn ? pickedProtocol : null;
   const [tag, setTag] = useState<string | null>(null);
-  const [tab, setTab] = useState<TabId>("all");
+  const [pickedTab, setTab] = useState<TabId>("all");
+  // The Seeding tab is torrent-only: while it is hidden the list falls back to All.
+  const tab: TabId = !torrentsOn && pickedTab === "seeding" ? "all" : pickedTab;
   const [sort, setSort] = useState<SortId>("priority");
   const [query, setQuery] = useState("");
   const [pageIndex, setPageIndex] = useState(0);
@@ -299,6 +302,8 @@ export function DownloadsPage() {
   const [filesMissingId, setFilesMissingId] = useState<number | null>(null);
   const [, recheckTorrent] = useMutation(RECHECK_TORRENT_MUTATION);
   const navigate = useNavigate();
+  // A double-clicked row opens the job's own screen, where the inspector's detail link goes.
+  const openJob = useCallback((id: number) => void navigate(`/jobs/${id}`), [navigate]);
   // A selection batch the daemon refused because the queue moved since the
   // operator confirmed it: the count it matches now, and the batch to run again.
   const [reconfirm, setReconfirm] = useState<{ matched: number; run: () => void } | null>(null);
@@ -317,7 +322,7 @@ export function DownloadsPage() {
   }>({ query: SYSTEM_INFO_QUERY });
 
   const selection = useMemo(
-    () => queueSelection({ tab, facets, query, protocol, tag }),
+    () => queueSelection({ tab: tab === "all" ? null : tab, facets, query, protocol, tag }),
     [facets, protocol, query, tab, tag],
   );
   const input = useMemo(
@@ -811,13 +816,17 @@ export function DownloadsPage() {
 
           <Tabs
             tabs={[
-              { id: "all", label: t("history.filterAll"), count: tabCounts.all },
-              { id: "active", label: t("next.downloads.tabActive"), count: tabCounts.active },
-              { id: "queued", label: t("status.queued"), count: tabCounts.queued },
-              { id: "paused", label: t("status.paused"), count: tabCounts.paused },
+              { id: "all" as const, label: t("history.filterAll"), count: tabCounts.all },
+              { id: "downloading" as const, label: t("next.downloads.tabDownloading"), count: tabCounts.downloading },
+              ...(torrentsOn
+                ? [{ id: "seeding" as const, label: t("next.downloads.tabSeeding"), count: tabCounts.seeding }]
+                : []),
+              { id: "queued" as const, label: t("status.queued"), count: tabCounts.queued },
+              { id: "paused" as const, label: t("status.paused"), count: tabCounts.paused },
             ]}
             active={tab}
             onSelect={(next) => reset(() => setTab(next))}
+            testId="queue"
             center={
               pickedCount === 0 ? undefined : (
                 <BulkCluster count={pickedCount} onClear={clearPicked}>
@@ -957,6 +966,7 @@ export function DownloadsPage() {
                   picked={picked}
                   onToggleGroup={toggleGroup}
                   onSelect={setSelectedId}
+                  onOpen={openJob}
                   onPick={togglePicked}
                   statusLabel={statusLabel}
                   onPause={pauseRow}
@@ -1104,6 +1114,8 @@ interface QueueGroupProps {
   picked: ReadonlySet<number>;
   onToggleGroup: (group: DownloadGroup) => void;
   onSelect: (id: number) => void;
+  /** Open a job's own screen, the one the inspector's detail link goes to. */
+  onOpen: (id: number) => void;
   onPick: (id: number) => void;
   statusLabel: (status: string) => string;
   onPause: (id: number, paused: boolean) => void;
@@ -1131,6 +1143,7 @@ const QueueGroup = memo(function QueueGroup({
   picked,
   onToggleGroup,
   onSelect,
+  onOpen,
   onPick,
   statusLabel,
   onPause,
@@ -1169,6 +1182,7 @@ const QueueGroup = memo(function QueueGroup({
             job={job}
             selected={job.id === selectedId}
             onSelect={onSelect}
+            onOpen={onOpen}
             picked={picked.has(job.id)}
             onPick={onPick}
             statusLabel={statusLabel}

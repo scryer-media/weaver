@@ -36,7 +36,7 @@ import { useUsageHistory } from "./usage";
 
 // The tile needs the queue's totals, not its rows.
 const QUEUE_TOTALS_INPUT = queuePageInput(
-  queueSelection({ tab: "all", facets: NO_FACETS, query: "" }),
+  queueSelection({ facets: NO_FACETS, query: "" }),
   "priority",
   0,
   1,

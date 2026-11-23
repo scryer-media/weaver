@@ -29,6 +29,7 @@ export const DownloadRow = memo(function DownloadRow({
   job,
   selected,
   onSelect,
+  onOpen,
   picked,
   onPick,
   statusLabel,
@@ -43,6 +44,8 @@ export const DownloadRow = memo(function DownloadRow({
   job: JobData;
   selected: boolean;
   onSelect: (id: number) => void;
+  /** Open the job's own screen; a double click on the row does. */
+  onOpen: (id: number) => void;
   /** Ticked for a bulk action. */
   picked: boolean;
   onPick: (id: number) => void;
@@ -90,6 +93,7 @@ export const DownloadRow = memo(function DownloadRow({
       selected={selected}
       picked={picked}
       onClick={() => onSelect(job.id)}
+      onDoubleClick={() => onOpen(job.id)}
       title={name}
       testId={torrentIds.queueRow(job.id)}
       lead={lead}

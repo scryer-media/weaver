@@ -37,6 +37,14 @@ for (const [presence, title] of [
   await empty.getByText("Add an NZB, or drop one anywhere on this list.", { exact: true }).waitFor();
   assert.equal(await page.getByRole("button", { name: "Pause torrents", exact: true }).count(), 0);
   assert.equal(await page.getByRole("button", { name: /^Torrent/ }).count(), 0);
+  // The list opens on All, and Seeding is not among the tabs.
+  assert.equal(await page.getByTestId("queue-tab-all").getAttribute("aria-pressed"), "true");
+  for (const tab of ["downloading", "queued", "paused"]) await page.getByTestId(`queue-tab-${tab}`).waitFor();
+  assert.deepEqual(
+    await page.locator("[data-testid^='queue-tab-']").evaluateAll((nodes) => nodes.map((node) => node.dataset.testid)),
+    ["queue-tab-all", "queue-tab-downloading", "queue-tab-queued", "queue-tab-paused"],
+  );
+  assert.equal(await page.getByTestId("queue-tab-seeding").count(), 0);
   assert.equal(errors.length, 0, errors.join("\n"));
   await page.close();
 });
@@ -57,6 +65,13 @@ test("with torrents on, Downloads asks for an NZB or a torrent", async () => {
   const empty = page.getByTestId("queue-empty");
   await empty.waitFor();
   await empty.getByText("Add an NZB or torrent, or drop one anywhere on this list.", { exact: true }).waitFor();
+  // Seeding sits among the tabs while torrents are on, after Downloading.
+  await page.getByTestId("queue-tab-seeding").waitFor();
+  assert.deepEqual(
+    await page.locator("[data-testid^='queue-tab-']").evaluateAll((nodes) => nodes.map((node) => node.dataset.testid)),
+    ["queue-tab-all", "queue-tab-downloading", "queue-tab-seeding", "queue-tab-queued", "queue-tab-paused"],
+  );
+  assert.equal(await page.getByTestId("queue-tab-all").getAttribute("aria-pressed"), "true");
   assert.equal(errors.length, 0, errors.join("\n"));
   await page.close();
 });

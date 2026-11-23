@@ -153,6 +153,21 @@ test("each torrent state is labelled in the queue by the shared status renderer"
   await page.close();
 });
 
+test("a double click on a queue row opens the job; one on the row's controls does not", async () => {
+  const { page, errors } = await open("queue");
+  const older = page.getByLabel("older", { exact: true });
+  const status = page.locator("#status");
+  await older.getByText("older job", { exact: true }).click();
+  assert.equal(await status.textContent(), "selected 9");
+  await older.getByRole("checkbox").dblclick();
+  await older.getByRole("button", { name: "Pause", exact: true }).dblclick();
+  assert.equal(await status.textContent(), "selected 9");
+  await older.getByText("older job", { exact: true }).dblclick();
+  await page.waitForFunction(() => document.getElementById("status")?.textContent === "opened 9");
+  assert.equal(errors.length, 0, errors.join("\n"));
+  await page.close();
+});
+
 test("each queue row names its type, and a wide list draws the bars as a column of the row", async () => {
   const { page, errors } = await open("queue");
   const older = page.getByLabel("older", { exact: true });

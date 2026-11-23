@@ -20,6 +20,9 @@ import { Icon, type IconName } from "./icons";
  * cut short. A `FormRow` does not wrap; it is two real columns.
  */
 
+/** The controls inside a row that keep their own clicks. */
+const ROW_CONTROLS = "a, button, input, label, select, textarea, [role=button], [role=checkbox], [role=switch]";
+
 export function ListRow({
   left,
   right,
@@ -27,6 +30,7 @@ export function ListRow({
   selected = false,
   picked = false,
   onClick,
+  onDoubleClick,
   density = "comfortable",
   /** Draw the 3px leading rail that marks selection. Queue rows use it. */
   markSelection = false,
@@ -42,6 +46,8 @@ export function ListRow({
   /** Ticked for a bulk action, which is a different thing from being the row the inspector shows. */
   picked?: boolean;
   onClick?: () => void;
+  /** A double click on the row itself; one on a control inside it is that control's. */
+  onDoubleClick?: () => void;
   density?: "comfortable" | "compact";
   markSelection?: boolean;
   className?: string;
@@ -72,6 +78,15 @@ export function ListRow({
               },
             }
         : {})}
+      onDoubleClick={
+        onDoubleClick === undefined
+          ? undefined
+          : (event: React.MouseEvent) => {
+              const control = (event.target as Element).closest(ROW_CONTROLS);
+              if (control !== null && control !== event.currentTarget) return;
+              onDoubleClick();
+            }
+      }
       title={title}
       data-testid={testId}
       className={cn(
