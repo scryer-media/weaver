@@ -69,6 +69,19 @@ impl DatagramTransport for SessionDatagrams {
     }
 
     async fn bind(&self, peer: SocketAddr) -> Result<Arc<dyn DatagramSocket>, TunnelError> {
+        self.bind_on(0, Some(peer)).await
+    }
+}
+
+impl SessionDatagrams {
+    // A socket on `port` inside the session's tunnel; 0 takes a free port.
+    // `peer` is the one it is bound to reach, when it is bound for one. A
+    // port another socket of the tunnel holds is refused.
+    pub(super) async fn bind_on(
+        &self,
+        port: u16,
+        peer: Option<SocketAddr>,
+    ) -> Result<Arc<dyn DatagramSocket>, TunnelError> {
         let session = &self.0;
         let Some(provider) = session.resolver.as_ref() else {
             return Err(TunnelError::Engine(format!(
@@ -95,9 +108,11 @@ impl DatagramTransport for SessionDatagrams {
                 open: refused.open,
                 freed: refused.freed,
             })?;
-        match provider.0.bind(peer).await {
+        match provider.0.bind_datagrams(port).await {
             Ok(socket) => {
-                crate::resolution::record::bound(peer, true);
+                if let Some(peer) = peer {
+                    crate::resolution::record::bound(peer, true);
+                }
                 Ok(Arc::new(HeldSocket {
                     socket,
                     _activity: activity,

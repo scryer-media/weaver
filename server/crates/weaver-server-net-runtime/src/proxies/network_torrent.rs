@@ -400,6 +400,13 @@ impl Inbound for CarriedInbound {
     fn forwarding(&self) -> weaver_tunnel::pipe::PortForwarding {
         self.inbound.forwarding()
     }
+    // Datagrams pass the route's counts by, as the leg's other ones do.
+    async fn bind_datagrams(
+        &self,
+        port: u16,
+    ) -> Result<Arc<dyn weaver_tunnel::endpoint::DatagramSocket>, TunnelError> {
+        self.inbound.bind_datagrams(port).await
+    }
 }
 struct CarriedListener {
     listener: Box<dyn InboundListener>,

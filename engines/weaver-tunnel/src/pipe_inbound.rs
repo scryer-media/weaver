@@ -31,7 +31,7 @@ use super::{
     ConnectionOutcome, DialError, Dialed, DialedStream, Dialer, OutcomeStream, SessionHop,
     SocketClass, datagram::take_bytes, listener_bytes, stream_bytes,
 };
-use crate::{TunnelError, wireguard::WgTcpListener};
+use crate::{TunnelError, endpoint::DatagramSocket, wireguard::WgTcpListener};
 
 /// Connections a listener inside a WireGuard tunnel holds before it accepts
 /// them. The tunnel has no listen queue: a listener is a pool of this many
@@ -70,6 +70,10 @@ pub trait Inbound: Send + Sync {
     // the tunnel reach the listener only through such a port: with none,
     // nothing they send arrives.
     fn forwarding(&self) -> PortForwarding;
+    // A datagram socket on `port` inside the hop's tunnel, where peers reach
+    // it through the port the hop's provider forwards. A port another
+    // datagram socket of the tunnel holds is refused.
+    async fn bind_datagrams(&self, port: u16) -> Result<Arc<dyn DatagramSocket>, TunnelError>;
 }
 
 #[async_trait::async_trait]
@@ -226,6 +230,11 @@ impl Inbound for SessionInbound {
     }
     fn forwarding(&self) -> PortForwarding {
         self.0.forwarding
+    }
+    async fn bind_datagrams(&self, port: u16) -> Result<Arc<dyn DatagramSocket>, TunnelError> {
+        super::datagram::SessionDatagrams::new(self.0.clone(), SocketClass::TorrentSession)
+            .bind_on(port, None)
+            .await
     }
 }
 
