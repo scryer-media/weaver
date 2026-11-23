@@ -966,7 +966,7 @@ export const nextDe: LocaleDictionary = {
   "next.dns.tooMany": "Höchstens {{count}} DNS-Server angeben.",
   "next.dns.orderHelp": "Die Server werden in dieser Reihenfolge gefragt, von oben nach unten. Höchstens {{count}}.",
   "next.dns.badAddress": "DNS-Server {{number}} braucht eine IP-Adresse, mit Port nur, wenn er nicht der übliche ist.",
-  "next.dns.badUrl": "DNS-Server {{number}} braucht eine https://-Adresse mit IP und Pfad, etwa https://1.1.1.1/dns-query.",
+  "next.dns.badUrl": "DNS-Server {{number}} braucht eine https://-Adresse mit Host und Pfad, etwa https://cloudflare-dns.com/dns-query.",
   "next.dns.dohNeedsAddress": "DNS-Server {{number}}: Bitte die IP-Adresse angeben, unter der dieser Host erreichbar ist.",
   "next.dns.badTlsName": "DNS-Server {{number}} hat einen TLS-Namen, der kein gültiger Hostname ist.",
   "next.dns.title": "DNS",

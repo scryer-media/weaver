@@ -966,7 +966,7 @@ export const nextZh: LocaleDictionary = {
   "next.dns.tooMany": "最多保留 {{count}} 个 DNS 服务器。",
   "next.dns.orderHelp": "按此顺序从上到下询问服务器，最多 {{count}} 个。",
   "next.dns.badAddress": "DNS 服务器 {{number}} 需要一个 IP 地址，端口仅在不是默认端口时填写。",
-  "next.dns.badUrl": "DNS 服务器 {{number}} 需要包含 IP 和路径的 https:// 地址，例如 https://1.1.1.1/dns-query。",
+  "next.dns.badUrl": "DNS 服务器 {{number}} 需要包含主机和路径的 https:// 地址，例如 https://cloudflare-dns.com/dns-query。",
   "next.dns.dohNeedsAddress": "DNS 服务器 {{number}}：请填写访问此主机所用的 IP 地址。",
   "next.dns.badTlsName": "DNS 服务器 {{number}} 的 TLS 名称不是有效的主机名。",
   "next.dns.title": "DNS",

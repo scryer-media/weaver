@@ -966,7 +966,7 @@ export const nextJa: LocaleDictionary = {
   "next.dns.tooMany": "DNS サーバーは {{count}} 個までです。",
   "next.dns.orderHelp": "サーバーは上から順に問い合わせます。最大 {{count}} 個です。",
   "next.dns.badAddress": "DNS サーバー {{number}} には IP アドレスが必要です。ポートは通常と異なる場合だけ付けます。",
-  "next.dns.badUrl": "DNS サーバー {{number}} には IP とパスを含む https:// アドレスが必要です (例: https://1.1.1.1/dns-query)。",
+  "next.dns.badUrl": "DNS サーバー {{number}} にはホストとパスを含む https:// アドレスが必要です (例: https://cloudflare-dns.com/dns-query)。",
   "next.dns.dohNeedsAddress": "DNS サーバー {{number}}: このホストに接続する IP アドレスを入力してください。",
   "next.dns.badTlsName": "DNS サーバー {{number}} の TLS 名は有効なホスト名ではありません。",
   "next.dns.title": "DNS",

@@ -966,7 +966,7 @@ export const nextKo: LocaleDictionary = {
   "next.dns.tooMany": "DNS 서버는 최대 {{count}}개입니다.",
   "next.dns.orderHelp": "서버는 위에서부터 이 순서대로 질의합니다. 최대 {{count}}개입니다.",
   "next.dns.badAddress": "DNS 서버 {{number}}에는 IP 주소가 필요하며, 포트는 기본값이 아닐 때만 적습니다.",
-  "next.dns.badUrl": "DNS 서버 {{number}}에는 IP와 경로가 있는 https:// 주소가 필요합니다. 예: https://1.1.1.1/dns-query",
+  "next.dns.badUrl": "DNS 서버 {{number}}에는 호스트와 경로가 있는 https:// 주소가 필요합니다. 예: https://cloudflare-dns.com/dns-query",
   "next.dns.dohNeedsAddress": "DNS 서버 {{number}}: 이 호스트에 연결할 IP 주소를 입력하세요.",
   "next.dns.badTlsName": "DNS 서버 {{number}}의 TLS 이름이 올바른 호스트 이름이 아닙니다.",
   "next.dns.title": "DNS",
