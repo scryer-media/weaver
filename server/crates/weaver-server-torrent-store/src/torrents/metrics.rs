@@ -22,7 +22,7 @@ pub use weaver_torrent::session_stats::disk::{
 };
 pub use weaver_torrent::session_stats::incoming;
 pub use weaver_torrent::session_stats::network;
-pub use weaver_torrent::session_stats::snapshot::UtpStatsSnapshot;
+pub use weaver_torrent::session_stats::snapshot::{UtpCloseReason, UtpStatsSnapshot};
 pub use weaver_torrent::session_stats::swarm;
 pub use weaver_torrent::session_stats::tracker;
 pub use weaver_torrent::session_stats::web_seed;

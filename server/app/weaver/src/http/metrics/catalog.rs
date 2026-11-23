@@ -828,6 +828,8 @@ metric_families! {
         ["route"], "uTP packets, other than connection requests and resets, that named no stream and answered no connect, since the session opened.");
     TORRENT_UTP_UNKNOWN_STREAM_RESETS = ("weaver_torrent_utp_unknown_stream_resets_total", Counter,
         ["route"], "Resets sent for uTP packets that named no stream, since the session opened.");
+    TORRENT_UTP_REMOTE_CLOSE_REASONS = ("weaver_torrent_utp_remote_close_reasons_total", Counter,
+        ["route", "reason"], "uTP streams the peer closed saying why, since the session opened, by the reason it gave: each stream once. The reasons are libtorrent's; its protocol errors show as protocol_error and any other value as other. A peer that closes without a reason is not counted.");
     TORRENT_UTP_RESETS_RATE_LIMITED = ("weaver_torrent_utp_resets_rate_limited_total", Counter,
         ["route"], "uTP resets left unsent because the reset budget was spent, since the session opened.");
     TORRENT_UTP_INACTIVITY_TIMEOUTS = ("weaver_torrent_utp_inactivity_timeouts_total", Counter,

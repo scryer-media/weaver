@@ -3,6 +3,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::raw::ext_close_reason::LibTorrentCloseReason;
+
 // One socket's counters: relaxed atomics, bumped where the event happens.
 // Gauges (`accepting`, `connecting`, `live_virtual_sockets`) go up and down.
 #[derive(Debug, Default)]
@@ -118,6 +120,9 @@ pub struct UtpStats {
     pub datagrams_too_long: AtomicU64,
     /// Sends of datagrams for several addresses in one call that failed; the first then went alone.
     pub send_batch_errors: AtomicU64,
+    /// Streams the remote closed with a FIN that said why, by the group
+    /// of the reason it gave: each stream once.
+    pub remote_close_reasons: [AtomicU64; LibTorrentCloseReason::BUCKETS],
 }
 
 /// Relaxed counters for a socket, aggregated across its streams.
@@ -185,6 +190,9 @@ pub struct UtpStatsSnapshot {
     pub send_errors: u64,
     /// Streams open now: a gauge.
     pub live_virtual_sockets: u64,
+    /// Streams the remote closed saying why, by the group of its reason
+    /// (`LibTorrentCloseReason::BUCKET_LABELS`).
+    pub remote_close_reasons: [u64; LibTorrentCloseReason::BUCKETS],
 }
 
 impl UtpStats {
@@ -243,6 +251,9 @@ impl UtpStats {
             synack_retransmissions: self.synack_retransmissions.load(Ordering::Relaxed),
             send_errors: self.send_errors.load(Ordering::Relaxed),
             live_virtual_sockets: self.live_virtual_sockets.load(Ordering::Relaxed),
+            remote_close_reasons: std::array::from_fn(|bucket| {
+                self.remote_close_reasons[bucket].load(Ordering::Relaxed)
+            }),
         }
     }
 }
@@ -356,6 +367,13 @@ impl std::ops::AddAssign for UtpStatsSnapshot {
         self.live_virtual_sockets = self
             .live_virtual_sockets
             .saturating_add(other.live_virtual_sockets);
+        for (count, more) in self
+            .remote_close_reasons
+            .iter_mut()
+            .zip(other.remote_close_reasons)
+        {
+            *count = count.saturating_add(more);
+        }
     }
 }
 

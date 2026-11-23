@@ -9,11 +9,11 @@
 // value is one of a fixed few, taken from the engine's own enums, so a kind
 // added there is rendered here.
 
-use weaver_server_core::torrents::metrics::SessionSeries;
 use weaver_server_core::torrents::metrics::swarm::{
     BlockArrival, ByteKind, ClosePhase, CloseReason, Direction, Encryption, Ender, PeerHad,
     PeerSource, PieceCheck, PiecePick, RequestEvent, Transport, UploadTaken, Waste,
 };
+use weaver_server_core::torrents::metrics::{SessionSeries, UtpCloseReason};
 
 use super::catalog as f;
 use super::encode::{Encoder, MetricFamily};
@@ -245,6 +245,18 @@ pub(super) fn render(out: &mut Encoder, routes: &[SessionSeries]) {
             &[("route", session.route.as_str())],
             session.utp.unknown_stream_resets,
         );
+    }
+    for session in open() {
+        for (reason, streams) in UtpCloseReason::BUCKET_LABELS
+            .iter()
+            .zip(session.utp.remote_close_reasons)
+        {
+            out.sample(
+                &f::TORRENT_UTP_REMOTE_CLOSE_REASONS,
+                &[("route", session.route.as_str()), ("reason", reason)],
+                streams,
+            );
+        }
     }
     for session in open() {
         out.sample(

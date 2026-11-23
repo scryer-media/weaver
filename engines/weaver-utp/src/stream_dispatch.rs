@@ -285,6 +285,9 @@ struct VirtualSocket<T, Env> {
 
     last_sent_window: u32,
 
+    // The remote's FIN gave a close reason and it was counted.
+    remote_close_reason_counted: bool,
+
     // A DATA or FIN packet arrived that no packet sent since acknowledges.
     // Like libtorrent's deferred ACK (v2.0.15 utp_stream.cpp:1430-1438), it
     // goes out once the socket's receive loop drained what it read, or
@@ -2407,6 +2410,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             Fin => {
                 if let Some(close_reason) = msg.header.extensions.close_reason {
                     debug!("remote closed with {close_reason:?}");
+                    // A FIN is resent until it is acknowledged: the stream
+                    // counts under the first reason it was given.
+                    if !self.remote_close_reason_counted {
+                        self.remote_close_reason_counted = true;
+                        self.socket.stats.remote_close_reasons[close_reason.bucket()].increment(1);
+                    }
                 }
 
                 // libtorrent v2.0.15 utp_stream.cpp:2892.
@@ -3093,6 +3102,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             fin_sends: 0,
             idle_since: None,
             ack_deferred: false,
+            remote_close_reason_counted: false,
             ack_due: false,
             reordered_unacked: 0,
             ack_repeating: false,

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
+// Modified by the Weaver authors, 2026-11-23.
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct LibTorrentCloseReason(pub u16);
@@ -12,6 +13,44 @@ impl std::fmt::Debug for LibTorrentCloseReason {
 }
 
 impl LibTorrentCloseReason {
+    /// How many groups [`Self::bucket`] sorts reasons into.
+    pub const BUCKETS: usize = 19;
+
+    /// The name of each group, by its index.
+    pub const BUCKET_LABELS: [&'static str; Self::BUCKETS] = [
+        "none",
+        "duplicate_peer_id",
+        "torrent_removed",
+        "no_memory",
+        "port_blocked",
+        "blocked",
+        "upload_to_upload",
+        "not_interested_upload_only",
+        "timeout",
+        "timed_out_interest",
+        "timed_out_activity",
+        "timed_out_handshake",
+        "timed_out_request",
+        "protocol_blocked",
+        "peer_churn",
+        "too_many_connections",
+        "too_many_files",
+        "protocol_error",
+        "other",
+    ];
+
+    /// The group a reason is counted under: itself for libtorrent's plain
+    /// reasons (0 to 16), one group for its protocol errors (256 to 288),
+    /// and one for every other value, so the set stays fixed whatever a
+    /// peer sends.
+    pub fn bucket(&self) -> usize {
+        match self.0 {
+            plain @ 0..=16 => plain as usize,
+            256..=288 => 17,
+            _ => 18,
+        }
+    }
+
     pub fn parse(buf: [u8; 4]) -> Self {
         Self(u32::from_be_bytes(buf) as u16)
     }
@@ -73,6 +112,34 @@ impl LibTorrentCloseReason {
             287 => "pex_message_too_big",
             288 => "pex_too_frequent",
             _ => "unknown",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LibTorrentCloseReason;
+
+    #[test]
+    fn every_reason_falls_in_a_named_group() {
+        for plain in 0..=16u16 {
+            let reason = LibTorrentCloseReason(plain);
+            assert_eq!(
+                LibTorrentCloseReason::BUCKET_LABELS[reason.bucket()],
+                reason.description()
+            );
+        }
+        for error in [256u16, 257, 288] {
+            assert_eq!(
+                LibTorrentCloseReason::BUCKET_LABELS[LibTorrentCloseReason(error).bucket()],
+                "protocol_error"
+            );
+        }
+        for other in [17u16, 255, 289, u16::MAX] {
+            assert_eq!(
+                LibTorrentCloseReason::BUCKET_LABELS[LibTorrentCloseReason(other).bucket()],
+                "other"
+            );
         }
     }
 }

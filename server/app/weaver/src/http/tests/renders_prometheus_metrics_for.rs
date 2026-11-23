@@ -1523,6 +1523,15 @@ fn renders_prometheus_metrics_for_torrents_trackers_and_sessions() {
         format!("weaver_torrent_utp_streams_accepted_total{{{ROUTE}}} 104"),
         format!("weaver_torrent_utp_unmatched_packets_total{{{ROUTE}}} 105"),
         format!("weaver_torrent_utp_unknown_stream_resets_total{{{ROUTE}}} 106"),
+        format!(r#"weaver_torrent_utp_remote_close_reasons_total{{{ROUTE},reason="none"}} 0"#),
+        format!(r#"weaver_torrent_utp_remote_close_reasons_total{{{ROUTE},reason="timeout"}} 112"#),
+        format!(
+            r#"weaver_torrent_utp_remote_close_reasons_total{{{ROUTE},reason="too_many_connections"}} 113"#
+        ),
+        format!(
+            r#"weaver_torrent_utp_remote_close_reasons_total{{{ROUTE},reason="protocol_error"}} 114"#
+        ),
+        format!(r#"weaver_torrent_utp_remote_close_reasons_total{{{ROUTE},reason="other"}} 115"#),
         format!("weaver_torrent_utp_resets_rate_limited_total{{{ROUTE}}} 107"),
         format!("weaver_torrent_utp_inactivity_timeouts_total{{{ROUTE}}} 108"),
         format!("weaver_torrent_utp_synack_retransmissions_total{{{ROUTE}}} 109"),
