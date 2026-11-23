@@ -2644,6 +2644,53 @@ async fn a_wireguard_listener_takes_a_peer_connection_inside_its_tunnel() {
     );
 }
 
+// A datagram socket the session binds on a named port is on that port
+// inside the tunnel: what it sends leaves from it, the answer comes back to
+// it, and a second socket on the port is refused while the first lives.
+#[tokio::test]
+async fn a_wireguard_session_binds_a_datagram_socket_on_the_port_named() {
+    use crate::test_support::{
+        TEST_CLIENT_ADDRESS, TEST_PEER_ADDRESS, WireGuardTestPeer, WireGuardTestPeerOptions,
+    };
+    const FORWARDED: u16 = 47001;
+    const RELAY: u16 = 51413;
+    // A peer outside the tunnel, reached through the far side's relay.
+    let outside = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let near = WireGuardTestPeer::start_with(WireGuardTestPeerOptions {
+        udp_forward: Some((RELAY, outside.local_addr().unwrap())),
+        ..Default::default()
+    })
+    .await;
+    let session = listening_session(&near);
+    let inbound = Arc::clone(&session)
+        .inbound()
+        .expect("a WireGuard session takes connections");
+    let socket = inbound.bind_datagrams(FORWARDED).await.unwrap();
+    let local = SocketAddr::new(IpAddr::V4(TEST_CLIENT_ADDRESS), FORWARDED);
+    assert_eq!(socket.local_addr(), Some(local));
+    assert!(inbound.bind_datagrams(FORWARDED).await.is_err());
+
+    let relay = SocketAddr::new(IpAddr::V4(TEST_PEER_ADDRESS), RELAY);
+    socket.send_to(b"syn", relay).await.unwrap();
+    let mut heard = [0u8; 16];
+    let (len, from) = outside.recv_from(&mut heard).await.unwrap();
+    assert_eq!(&heard[..len], b"syn");
+    assert_eq!(
+        near.udp_forwarded().keys().copied().collect::<Vec<_>>(),
+        [local],
+        "it left from the port named"
+    );
+    outside.send_to(b"ack", from).await.unwrap();
+    let (len, from) = socket.recv_from(&mut heard).await.unwrap();
+    assert_eq!((&heard[..len], from), (&b"ack"[..], relay));
+
+    // The socket holds the session up, and gives the port back when dropped.
+    assert!(!session.retire_idle().await);
+    drop(socket);
+    let again = inbound.bind_datagrams(FORWARDED).await.unwrap();
+    assert_eq!(again.local_addr(), Some(local));
+}
+
 // The tunnel is replaced under a listener: its next accept listens again
 // on the same port inside the new tunnel, and a peer reaches it there.
 #[tokio::test]

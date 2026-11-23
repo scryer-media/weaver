@@ -21,7 +21,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d122413f284cf2d62fb1b7db97e02edb8cda96d769b16e443a4f6195e35662b0"
 dependencies = [
  "crypto-common 0.1.7",
- "generic-array 0.14.7",
+ "generic-array",
 ]
 
 [[package]]
@@ -157,7 +157,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -168,7 +168,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -826,7 +826,7 @@ version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
 dependencies = [
- "generic-array 0.14.7",
+ "generic-array",
 ]
 
 [[package]]
@@ -960,7 +960,7 @@ dependencies = [
  "cap-primitives",
  "cap-std",
  "io-lifetimes 3.0.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -977,7 +977,7 @@ dependencies = [
  "maybe-owned",
  "rustix",
  "rustix-linux-procfs",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
  "winx",
 ]
 
@@ -1442,7 +1442,7 @@ version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
 dependencies = [
- "generic-array 0.14.7",
+ "generic-array",
  "rand_core 0.6.4",
  "typenum",
 ]
@@ -1596,15 +1596,6 @@ name = "deflate64"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac6b926516df9c60bfa16e107b21086399f8285a44ca9711344b9e553c5146e2"
-
-[[package]]
-name = "defmt"
-version = "0.3.101"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4deef977660e373c458df605a913d4ab121db0ccd18d1ad6976dff7d37cddb53"
-dependencies = [
- "defmt 1.2.0",
-]
 
 [[package]]
 name = "defmt"
@@ -1918,7 +1909,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2207,17 +2198,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "generic-array"
-version = "1.4.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "337d46834ee672ab3e48caca2cb0c78cc174fb12b3a68d0d88f99a0519a5e36e"
-dependencies = [
- "generic-array 0.14.7",
- "rustversion",
- "typenum",
-]
-
-[[package]]
 name = "getrandom"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2295,9 +2275,9 @@ dependencies = [
 
 [[package]]
 name = "gotatun"
-version = "0.9.2"
+version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4578da6dc5281756ef0277a8ab92fd390b472b87b939c89252130be9ca28812b"
+checksum = "2d40029d208ab17a3280079618d4e7c4ef204e2cb3e137d4f7da570a7efe1c21"
 dependencies = [
  "aead 0.5.2",
  "aws-lc-rs",
@@ -2311,7 +2291,6 @@ dependencies = [
  "either",
  "eyre",
  "futures",
- "hex",
  "hmac 0.12.1",
  "ip_network",
  "ip_network_table",
@@ -2319,6 +2298,7 @@ dependencies = [
  "libc",
  "nix",
  "parking_lot",
+ "portable-atomic",
  "rand 0.9.5",
  "rand_chacha",
  "rand_core 0.6.4",
@@ -2328,7 +2308,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "typed-builder",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
  "x25519-dalek",
  "zerocopy",
 ]
@@ -2389,7 +2369,7 @@ dependencies = [
 [[package]]
 name = "h3"
 version = "0.0.8"
-source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.7.0#0769732cfb921d7eb8ea6557c7d89c2e617217b4"
+source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.8.1#ca59959d260b83b49b420bafe62dd2a66a91f317"
 dependencies = [
  "bytes",
  "fastrand",
@@ -2402,7 +2382,7 @@ dependencies = [
 [[package]]
 name = "h3-quinn"
 version = "0.0.10"
-source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.7.0#0769732cfb921d7eb8ea6557c7d89c2e617217b4"
+source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.8.1#ca59959d260b83b49b420bafe62dd2a66a91f317"
 dependencies = [
  "bytes",
  "futures",
@@ -2837,7 +2817,7 @@ version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
 dependencies = [
- "generic-array 0.14.7",
+ "generic-array",
 ]
 
 [[package]]
@@ -3387,7 +3367,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3650,8 +3630,8 @@ dependencies = [
 
 [[package]]
 name = "pageant"
-version = "0.2.3"
-source = "git+https://github.com/NZBMan/russh.git?tag=v0.63.3-algorithm-gates.1#04892999f5c95af1347b1074b3534e4aeba758f9"
+version = "0.2.5"
+source = "git+https://github.com/NZBMan/russh.git?tag=v0.65.3-algorithm-gates.1#e19ae4ba2e51a40e191ade549ff96e58358a3dd5"
 dependencies = [
  "base16ct",
  "byteorder",
@@ -4045,11 +4025,11 @@ dependencies = [
 
 [[package]]
 name = "proxy-tunnels"
-version = "0.7.0"
-source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.7.0#0769732cfb921d7eb8ea6557c7d89c2e617217b4"
+version = "0.8.1"
+source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.8.1#ca59959d260b83b49b420bafe62dd2a66a91f317"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "gotatun",
  "h3",
@@ -4172,7 +4152,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4461,8 +4441,8 @@ dependencies = [
 
 [[package]]
 name = "russh"
-version = "0.63.3"
-source = "git+https://github.com/NZBMan/russh.git?tag=v0.63.3-algorithm-gates.1#04892999f5c95af1347b1074b3534e4aeba758f9"
+version = "0.65.3"
+source = "git+https://github.com/NZBMan/russh.git?tag=v0.65.3-algorithm-gates.1#e19ae4ba2e51a40e191ade549ff96e58358a3dd5"
 dependencies = [
  "aes",
  "aws-lc-rs",
@@ -4481,7 +4461,6 @@ dependencies = [
  "ed25519-dalek",
  "enum_dispatch",
  "futures",
- "generic-array 1.4.5",
  "getrandom 0.4.3",
  "ghash",
  "hex-literal",
@@ -4516,7 +4495,7 @@ dependencies = [
 [[package]]
 name = "russh-cryptovec"
 version = "0.62.0"
-source = "git+https://github.com/NZBMan/russh.git?tag=v0.63.3-algorithm-gates.1#04892999f5c95af1347b1074b3534e4aeba758f9"
+source = "git+https://github.com/NZBMan/russh.git?tag=v0.65.3-algorithm-gates.1#e19ae4ba2e51a40e191ade549ff96e58358a3dd5"
 dependencies = [
  "log",
  "nix",
@@ -4527,12 +4506,12 @@ dependencies = [
 [[package]]
 name = "russh-util"
 version = "0.52.0"
-source = "git+https://github.com/NZBMan/russh.git?tag=v0.63.3-algorithm-gates.1#04892999f5c95af1347b1074b3534e4aeba758f9"
+source = "git+https://github.com/NZBMan/russh.git?tag=v0.65.3-algorithm-gates.1#e19ae4ba2e51a40e191ade549ff96e58358a3dd5"
 dependencies = [
- "chrono",
  "tokio",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "web-time",
 ]
 
 [[package]]
@@ -4604,7 +4583,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4672,7 +4651,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5129,14 +5108,14 @@ dependencies = [
 
 [[package]]
 name = "smoltcp"
-version = "0.13.1"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f73d40463bba65efc9adc6370b56df76d563cc46e2482bba58351b4afb7535e"
+checksum = "b6f8b28ad56c6e35524a37dd492af5d1a47e31e1a4d175cd12f89c075f01980f"
 dependencies = [
  "bitflags 1.3.2",
  "byteorder",
  "cfg-if",
- "defmt 0.3.101",
+ "defmt",
  "heapless",
  "managed",
 ]
@@ -5171,7 +5150,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5319,7 +5298,7 @@ dependencies = [
  "either",
  "futures-core",
  "futures-util",
- "generic-array 0.14.7",
+ "generic-array",
  "log",
  "percent-encoding",
  "serde",
@@ -5425,9 +5404,9 @@ dependencies = [
 
 [[package]]
 name = "ssh-key"
-version = "0.7.0-rc.11"
+version = "0.7.0-rc.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9a32fae177b74a22aa9c5b01bf7e68b33545be32d9e381e248058d2adc15ce3"
+checksum = "0701b552e6bd8f13a6e07bde25307c32d7daad80a79b65832d110c0416e7b638"
 dependencies = [
  "argon2",
  "bcrypt-pbkdf",
@@ -5461,7 +5440,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5594,7 +5573,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6149,7 +6128,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -7516,7 +7495,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7829,7 +7808,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d6f32a0ff4a9f6f01231eb2059cc85479330739333e0e58cadf03b6af2cca10"
 dependencies = [
  "cfg-if",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

@@ -12,12 +12,12 @@ test-support = ["proxy-tunnels/test-support", "dep:bytes", "dep:http", "dep:h3",
 
 [dependencies]
 # Shared protocols pinned to an immutable signed version tag.
-proxy-tunnels = { git = "https://github.com/scryer-media/proxy-tunnels.git", tag = "v0.7.0", features = ["http3"] }
+proxy-tunnels = { git = "https://github.com/scryer-media/proxy-tunnels.git", tag = "v0.8.1", features = ["http3"] }
 # The tunnel's TCP stack, named here only to switch on its congestion
 # control: without it a tunnelled connection sends as fast as the far side's
 # window allows, and an upload over a real link loses most of each burst.
 # Every TCP socket in a tunnel then starts slow and backs off on loss (CUBIC).
-smoltcp = { version = "0.13.1", default-features = false, features = ["socket-tcp-cubic"] }
+smoltcp = { version = "0.14.0", default-features = false, features = ["socket-tcp-cubic"] }
 base64 = { workspace = true }
 tokio = { workspace = true }
 async-trait = "0.1"
@@ -44,8 +44,8 @@ weaver-dnssec = { path = "../weaver-dnssec" }
 # Reuse the approved HTTP/3 stack for local fixtures; absent from product builds.
 bytes = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
-h3 = { git = "https://github.com/scryer-media/proxy-tunnels.git", tag = "v0.7.0", optional = true }
-h3-quinn = { git = "https://github.com/scryer-media/proxy-tunnels.git", tag = "v0.7.0", optional = true }
+h3 = { git = "https://github.com/scryer-media/proxy-tunnels.git", tag = "v0.8.1", optional = true }
+h3-quinn = { git = "https://github.com/scryer-media/proxy-tunnels.git", tag = "v0.8.1", optional = true }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"], optional = true }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "crypto", "pem"], optional = true }
 # Finished HTTP clients for consumers' tests.
@@ -55,7 +55,7 @@ reqwest = { workspace = true, optional = true }
 windows-sys = { workspace = true, features = ["Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
 
 [dev-dependencies]
-proxy-tunnels = { git = "https://github.com/scryer-media/proxy-tunnels.git", tag = "v0.7.0", features = ["http3", "test-support"] }
+proxy-tunnels = { git = "https://github.com/scryer-media/proxy-tunnels.git", tag = "v0.8.1", features = ["http3", "test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
 # The DNS over HTTPS fixture servers: HTTP/1.1 read by hand, HTTP/2 through

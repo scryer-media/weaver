@@ -327,11 +327,15 @@ impl LegSockets {
                 Ok(Arc::new(NoDatagrams::new(addr)) as Arc<dyn DatagramSocket>)
             });
         };
-        // The uTP socket peers reach through the port the tunnel's provider
-        // forwards sits on that port, as the forwarded listener does: the
-        // fixed one from the start, else each one the gateway forwards.
-        let forwarding = utp
-            .and_then(|_| Arc::clone(&self.dialer).inbound())
+        // A uTP socket in a tunnel is bound on its port by name, where the
+        // tunnel's listener is: the tunnel gives any other socket a port of
+        // its own choosing. The one peers reach through the port the
+        // tunnel's provider forwards sits on that port, as the forwarded
+        // listener does: the fixed one from the start, else each one the
+        // gateway forwards.
+        let inbound = utp.and_then(|_| Arc::clone(&self.dialer).inbound());
+        let forwarding = inbound
+            .as_ref()
             .map(|inbound| inbound.forwarding())
             .filter(|forwarding| *forwarding != PortForwarding::None);
         let hold = forwarding.and_then(|_| self.forwarded.hold(addr.port()));
@@ -345,14 +349,18 @@ impl LegSockets {
         );
         let slot = Arc::clone(&self.forwarded);
         shared(async move {
-            let socket = carrier.bind(addr).await.map_err(io::Error::other)?;
+            let socket = match &inbound {
+                Some(inbound) => inbound.bind_datagrams(addr.port()).await,
+                None => carrier.bind(addr).await,
+            }
+            .map_err(io::Error::other)?;
             let carried = Carried::new(socket, addr, utp.is_some());
-            Ok(Arc::new(match hold {
-                Some(hold) if follows => {
-                    carried.following(carrier, addr.ip(), slot.port.subscribe(), hold)
+            Ok(Arc::new(match (hold, inbound) {
+                (Some(hold), Some(inbound)) if follows => {
+                    carried.following(inbound, addr.ip(), slot.port.subscribe(), hold)
                 }
-                Some(hold) => carried.holding(hold),
-                None => carried,
+                (Some(hold), _) => carried.holding(hold),
+                (None, _) => carried,
             }) as Arc<dyn DatagramSocket>)
         })
     }
@@ -691,11 +699,11 @@ impl Carried {
     }
 
     // It keeps the leg's forwarded port and moves to each port `forwarded`
-    // names, binding there at `ip` through `carrier`. A port that cannot be
+    // names, binding there at `ip` through `inbound`. A port that cannot be
     // bound leaves it where it is until the next; none leaves it where it is.
     fn following(
         mut self,
-        carrier: Arc<dyn DatagramTransport>,
+        inbound: Arc<dyn weaver_tunnel::pipe::Inbound>,
         ip: IpAddr,
         mut forwarded: tokio::sync::watch::Receiver<Option<u16>>,
         hold: ForwardedHold,
@@ -707,7 +715,7 @@ impl Carried {
             loop {
                 let wanted = *forwarded.borrow_and_update();
                 if let Some(port) = wanted.filter(|port| *port != bound) {
-                    match carrier.bind(SocketAddr::new(ip, port)).await {
+                    match inbound.bind_datagrams(port).await {
                         Ok(socket) => {
                             let addr = socket.local_addr().unwrap_or(SocketAddr::new(ip, port));
                             // One stopped meanwhile stays stopped. The new
@@ -2243,6 +2251,14 @@ mod tests {
         fn forwarding(&self) -> weaver_tunnel::pipe::PortForwarding {
             weaver_tunnel::pipe::PortForwarding::Fixed(6881)
         }
+        async fn bind_datagrams(
+            &self,
+            _: u16,
+        ) -> Result<Arc<dyn TunnelSocket>, weaver_tunnel::TunnelError> {
+            Err(weaver_tunnel::TunnelError::Engine(
+                "it carries no datagrams".into(),
+            ))
+        }
     }
     #[async_trait::async_trait]
     impl Listening for LoopbackListener {
@@ -2640,13 +2656,36 @@ mod tests {
         async fn resolve(&self, _: &str) -> Result<Vec<IpAddr>, weaver_tunnel::TunnelError> {
             Ok(Vec::new())
         }
+        // As a tunnel does, it binds a port of its own choosing whatever
+        // address it is handed: that one is the peer's.
         async fn bind(
             &self,
-            local: SocketAddr,
+            _peer: SocketAddr,
         ) -> Result<Arc<dyn TunnelSocket>, weaver_tunnel::TunnelError> {
-            let addr = SocketAddr::new(INSIDE, local.port());
+            let free = (FREE..)
+                .find(|port| !self.ports.lock().unwrap().contains_key(port))
+                .unwrap();
+            self.bind_on(free)
+        }
+    }
+
+    // The first port the stand-in gives a socket that names none.
+    const FREE: u16 = 49152;
+
+    impl Inside {
+        // A socket on `port`; one a socket already holds is refused.
+        fn bind_on(&self, port: u16) -> Result<Arc<dyn TunnelSocket>, weaver_tunnel::TunnelError> {
+            let addr = SocketAddr::new(INSIDE, port);
             let (arrive, arriving) = tokio::sync::mpsc::unbounded_channel();
-            self.ports.lock().unwrap().insert(addr.port(), arrive);
+            {
+                let mut ports = self.ports.lock().unwrap();
+                if ports.get(&port).is_some_and(|held| !held.is_closed()) {
+                    return Err(weaver_tunnel::TunnelError::Engine(format!(
+                        "port {port} is in use"
+                    )));
+                }
+                ports.insert(port, arrive);
+            }
             self.bound.send_modify(|bound| bound.push(addr));
             Ok(Arc::new(InsideSocket {
                 addr,
@@ -2715,6 +2754,12 @@ mod tests {
         }
         fn forwarding(&self) -> PortForwarding {
             self.0.forwarding
+        }
+        async fn bind_datagrams(
+            &self,
+            port: u16,
+        ) -> Result<Arc<dyn TunnelSocket>, weaver_tunnel::TunnelError> {
+            self.0.inside.bind_on(port)
         }
     }
 
