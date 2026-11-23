@@ -15,6 +15,8 @@ use weaver_server_core::operations::{
     UsageConsumerSummary, UsageCounts, UsagePeriod, UsageStart, UsageSummary, period_bounds,
     summarize_usage, summary_read_from,
 };
+use weaver_server_core::settings::model::{TrackerRule, TrackerRules};
+use weaver_server_core::settings::repository::SettingsRepositoryQueries;
 use weaver_server_core::torrents::metrics::Published;
 use weaver_server_core::{Database, StateError};
 
@@ -494,9 +496,10 @@ pub struct TorrentHistory {
     /// Every torrent together: from peers in `bytes`, to peers in
     /// `bytesUploaded`, seeding time in `durationMs`.
     pub total: UsageConsumer,
-    /// Each tracker host, by the torrents that list it; the empty id is
-    /// the torrents that list none. A torrent counts under each host it
-    /// lists, so trackers are never added together.
+    /// Each tracker rule by name, and each host no rule covers, by the
+    /// torrents that list it; the empty id is the torrents that list none.
+    /// A torrent counts under its rule once, or under each host it lists,
+    /// so trackers are never added together.
     pub trackers: Vec<UsageConsumer>,
     /// Now, as the torrent client last published its torrents.
     pub peers: TorrentPeers,
@@ -511,12 +514,179 @@ pub fn load_torrent_history(
 ) -> Result<TorrentHistory, StateError> {
     let total = read_summary(db, today, period, Some(CoreKind::Torrent))?;
     let trackers = read_summary(db, today, period, Some(CoreKind::Tracker))?;
+    let rules = db.list_tracker_rules()?;
     Ok(TorrentHistory {
         today: day_text(total.today),
         range_start: day_text(total.range_start),
         range_end: day_text(total.range_end),
         total: total.total.into(),
-        trackers: trackers.consumers.into_iter().map(Into::into).collect(),
+        trackers: under_rules(rules, trackers.consumers)
+            .into_iter()
+            .map(Into::into)
+            .collect(),
         peers,
     })
+}
+
+/// The tracker rows with each host a tracker rule covers folded under that
+/// rule's name. A torrent counts under its rule once, but usage recorded
+/// before it had one counted it under every host it listed, so a rule's
+/// hosts take the largest of them, never their sum, beside what the rule
+/// itself holds. A host no rule covers keeps its own row.
+fn under_rules(
+    rules: Vec<TrackerRule>,
+    consumers: Vec<UsageConsumerSummary>,
+) -> Vec<UsageConsumerSummary> {
+    let names: std::collections::HashSet<String> =
+        rules.iter().map(|rule| rule.name.clone()).collect();
+    let rules = TrackerRules::new(rules);
+    // Each rule's own row, and the largest of its hosts', by rule name.
+    let mut folded: Vec<(
+        String,
+        Option<UsageConsumerSummary>,
+        Option<UsageConsumerSummary>,
+    )> = Vec::new();
+    let mut kept = Vec::new();
+    let mut slot = |name: &str, folded: &mut Vec<_>| match folded
+        .iter()
+        .position(|(held, _, _): &(String, _, _)| held == name)
+    {
+        Some(at) => at,
+        None => {
+            folded.push((name.to_owned(), None, None));
+            folded.len() - 1
+        }
+    };
+    for consumer in consumers {
+        let id = consumer.consumer_id.as_str();
+        if names.contains(id) {
+            let at = slot(id, &mut folded);
+            folded[at].1 = Some(consumer);
+            continue;
+        }
+        let rule = (!id.is_empty())
+            .then(|| rules.rule_for([format!("http://{id}/").as_str()]))
+            .flatten();
+        match rule {
+            Some(rule) => {
+                let at = slot(&rule.name, &mut folded);
+                let hosts = &mut folded[at].2;
+                *hosts = Some(match hosts.take() {
+                    Some(held) => combine(held, &consumer, max_counts),
+                    None => consumer,
+                });
+            }
+            None => kept.push(consumer),
+        }
+    }
+    for (name, own, hosts) in folded {
+        let mut row = match (own, hosts) {
+            (Some(own), Some(hosts)) => combine(own, &hosts, add_counts),
+            (Some(row), None) | (None, Some(row)) => row,
+            (None, None) => continue,
+        };
+        row.consumer_id = name;
+        kept.push(row);
+    }
+    kept
+}
+
+fn add_counts(held: &mut UsageCounts, other: &UsageCounts) {
+    held.add(other);
+}
+
+fn max_counts(held: &mut UsageCounts, other: &UsageCounts) {
+    held.bytes = held.bytes.max(other.bytes);
+    held.articles_tried = held.articles_tried.max(other.articles_tried);
+    held.articles_succeeded = held.articles_succeeded.max(other.articles_succeeded);
+    held.down_seconds = held.down_seconds.max(other.down_seconds);
+    held.bytes_uploaded = held.bytes_uploaded.max(other.bytes_uploaded);
+    held.events = held.events.max(other.events);
+    held.duration_ms = held.duration_ms.max(other.duration_ms);
+}
+
+// `held` with `other` taken in by `join`, span by span and day by day; both
+// cover the same range, so their days line up.
+fn combine(
+    mut held: UsageConsumerSummary,
+    other: &UsageConsumerSummary,
+    join: fn(&mut UsageCounts, &UsageCounts),
+) -> UsageConsumerSummary {
+    join(&mut held.today, &other.today);
+    join(&mut held.week, &other.week);
+    join(&mut held.month, &other.month);
+    join(&mut held.year, &other.year);
+    join(&mut held.all_time, &other.all_time);
+    join(&mut held.range, &other.range);
+    for ((_, counts), (_, more)) in held.days.iter_mut().zip(&other.days) {
+        join(counts, more);
+    }
+    held
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(id: &str, bytes: u64) -> UsageConsumerSummary {
+        let counts = UsageCounts {
+            bytes,
+            ..UsageCounts::default()
+        };
+        let day = NaiveDate::from_ymd_opt(2026, 11, 23).unwrap();
+        UsageConsumerSummary {
+            kind: CoreKind::Tracker.as_str().to_owned(),
+            consumer_id: id.to_owned(),
+            today: counts,
+            week: counts,
+            month: counts,
+            year: counts,
+            all_time: counts,
+            range: counts,
+            days: vec![(day, counts)],
+        }
+    }
+
+    // Three hosts of one tracker, each holding what a torrent listing all
+    // three counted under each, fold into the rule as one torrent's worth,
+    // beside what was counted under the rule's name; a host no rule covers,
+    // and the torrents with no tracker, keep their rows.
+    #[test]
+    fn hosts_a_rule_covers_fold_under_its_name() {
+        let rules = vec![TrackerRule {
+            id: 1,
+            name: "Example".into(),
+            host_patterns: vec!["*.example.org".into(), "other.example.net".into()],
+            ..TrackerRule::default()
+        }];
+        let rows = under_rules(
+            rules,
+            vec![
+                row("a.example.org", 130),
+                row("b.example.org", 130),
+                row("other.example.net", 120),
+                row("Example", 5),
+                row("torrent.ubuntu.com", 12),
+                row("", 3),
+            ],
+        );
+        let bytes: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.consumer_id.as_str(),
+                    row.month.bytes,
+                    row.days[0].1.bytes,
+                )
+            })
+            .collect();
+        assert_eq!(
+            bytes,
+            [
+                ("torrent.ubuntu.com", 12, 12),
+                ("", 3, 3),
+                ("Example", 135, 135)
+            ]
+        );
+    }
 }
