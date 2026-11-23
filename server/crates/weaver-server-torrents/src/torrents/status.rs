@@ -344,13 +344,9 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<Why>) {
             );
         }
         TorrentIntent::Stopped => {
-            let why = seen
-                .restore_held
-                .clone()
-                .map(Why::Said)
-                .or_else(|| {
-                    (seen.seeding() && seen.goal_met).then_some(Why::Stated(Stated::GoalMet))
-                });
+            let why = seen.restore_held.clone().map(Why::Said).or_else(|| {
+                (seen.seeding() && seen.goal_met).then_some(Why::Stated(Stated::GoalMet))
+            });
             return (TorrentState::Stopped, why);
         }
         TorrentIntent::Resumed => {}

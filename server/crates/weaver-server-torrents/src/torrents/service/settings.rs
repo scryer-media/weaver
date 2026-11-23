@@ -281,12 +281,15 @@ impl TorrentSettings {
         ]);
         let rule_sets_goal = ruled.is_some_and(|policy| policy.sets_a_goal());
         let all = ruled.is_some_and(|policy| policy.own_mode() == SeedingGoalMode::All);
-        let (ratio, ratio_level) =
-            self.of_torrent(&RATIO_GOAL, record, rule).goal(rule_sets_goal, all);
-        let (seed_time, seed_time_level) =
-            self.of_torrent(&SEED_TIME_GOAL, record, rule).goal(rule_sets_goal, all);
-        let (inactive, inactive_level) =
-            self.of_torrent(&INACTIVE_GOAL, record, rule).goal(rule_sets_goal, all);
+        let (ratio, ratio_level) = self
+            .of_torrent(&RATIO_GOAL, record, rule)
+            .goal(rule_sets_goal, all);
+        let (seed_time, seed_time_level) = self
+            .of_torrent(&SEED_TIME_GOAL, record, rule)
+            .goal(rule_sets_goal, all);
+        let (inactive, inactive_level) = self
+            .of_torrent(&INACTIVE_GOAL, record, rule)
+            .goal(rule_sets_goal, all);
         (
             Seeding {
                 ratio_goal: ratio,

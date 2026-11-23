@@ -7,8 +7,8 @@
 use super::*;
 use crate::jobs::handle::HoldSet;
 use crate::torrents::FilePriority;
-use crate::torrents::service::disk_room::DiskHeld;
 use crate::torrents::service::WindDown;
+use crate::torrents::service::disk_room::DiskHeld;
 use crate::torrents::service::live::{Live, Rules};
 use crate::torrents::service::policy::{
     self, Checkpoint, Context, Goals, Intent, Limits, Picking, Picks, Policy, QueueOrder, Reading,

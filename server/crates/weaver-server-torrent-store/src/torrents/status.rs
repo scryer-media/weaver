@@ -46,10 +46,7 @@ pub fn goal_left(
     let mut goals: Vec<(bool, String)> = Vec::new();
     if let Some(goal) = policy.ratio_goal {
         let ratio = ratio(counters, held_bytes);
-        goals.push((
-            ratio >= goal,
-            format!("ratio {ratio:.2} of {goal:.2}"),
-        ));
+        goals.push((ratio >= goal, format!("ratio {ratio:.2} of {goal:.2}")));
     }
     if let Some(minutes) = policy.seed_time_goal_minutes {
         let seeded = policy.seeded_seconds(counters) / 60;

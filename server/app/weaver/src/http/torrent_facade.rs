@@ -3257,12 +3257,7 @@ fn share_policy(
         current.action,
     );
     let minutes = |value: f64| value.round().min(f64::from(u32::MAX)) as u32;
-    let ratio = share_limit(
-        params,
-        "ratioLimit",
-        current.ratio_goal,
-        strict,
-    )?;
+    let ratio = share_limit(params, "ratioLimit", current.ratio_goal, strict)?;
     let seeding = share_limit(
         params,
         "seedingTimeLimit",

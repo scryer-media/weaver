@@ -1803,6 +1803,7 @@ fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMet
                 fails: 4,
             },
         ],
+        tracker_rule: None,
     };
     let magnet = TorrentSeries {
         job_id: JobId(8),
@@ -1830,6 +1831,7 @@ fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMet
         fetch: Some(FetchPhase::Discovery),
         seeding: SeedingSeries::default(),
         trackers: Vec::new(),
+        tracker_rule: None,
     };
     let open = SessionSeries {
         route: "00aa11bb22cc33dd".into(),

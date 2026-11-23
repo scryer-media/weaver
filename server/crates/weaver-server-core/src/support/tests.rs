@@ -813,6 +813,7 @@ fn published_metrics() -> crate::torrents::metrics::TorrentMetrics {
             completed: Some(9),
             fails: 2,
         }],
+        tracker_rule: None,
     };
     let mut other = series(32);
     other.state = TorrentState::Seeding;

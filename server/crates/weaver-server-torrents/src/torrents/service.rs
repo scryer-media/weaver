@@ -91,8 +91,8 @@ use queue::QueueEnd;
 pub(in crate::torrents) use retire::{delete_written, deletion, listed_files};
 pub use settings::{
     Categories, DHT, ENCRYPTION, Field, INACTIVE_GOAL, LSD, PEX, Presence, RATIO_GOAL, SCOPE,
-    SEED_TIME_COUNTING, SEED_TIME_GOAL, SEEDING_ACTION, ScheduleSeeding,
-    SeedingLevels, TorrentSettings, UNPACK, UPLOAD_CAP, WindDown,
+    SEED_TIME_COUNTING, SEED_TIME_GOAL, SEEDING_ACTION, ScheduleSeeding, SeedingLevels,
+    TorrentSettings, UNPACK, UPLOAD_CAP, WindDown,
 };
 pub use tick::TorrentRoute;
 pub use views::{

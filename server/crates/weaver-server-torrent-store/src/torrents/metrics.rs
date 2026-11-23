@@ -322,6 +322,8 @@ pub struct TorrentSeries {
     pub fetch: Option<FetchPhase>,
     pub seeding: SeedingSeries,
     pub trackers: Vec<TrackerSeries>,
+    /// The name of the tracker rule its trackers match, if one does.
+    pub tracker_rule: Option<String>,
 }
 
 /// A seeding goal of the policy in force.

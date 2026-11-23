@@ -2666,7 +2666,7 @@ export const nextEs: LocaleDictionary = {
   "next.torrentDash.peersNote": "Semillas: {{seeds}} · Torrents: {{torrents}}",
   "next.torrentDash.uploadedPerDay": "Subido por día",
   "next.torrentDash.trackers": "Trackers",
-  "next.torrentDash.trackersNote": "Un torrent cuenta en cada tracker que indica",
+  "next.torrentDash.trackersNote": "Un torrent cuenta en su regla de tracker o, sin una, en cada tracker que indica",
   "next.torrentDash.tracker": "Tracker",
   "next.torrentDash.downloaded": "Descargado",
   "next.torrentDash.uploaded": "Subido",

@@ -429,6 +429,7 @@ impl Unviewed {
             fetch: self.fetch,
             seeding: self.seeding,
             trackers: crate::torrents::metrics::trackers(&view.trackers, announces),
+            tracker_rule: view.tracker_rule.clone(),
         }
     }
 }

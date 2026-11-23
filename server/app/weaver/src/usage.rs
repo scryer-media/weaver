@@ -122,23 +122,33 @@ fn seconds_to_ms(seconds: f64) -> u64 {
     }
 }
 
-/// Each torrent's seeding ledger and tracker hosts, as last published.
+/// Each torrent's seeding ledger and where it counts, as last published: the
+/// tracker rule its trackers match, by name, or failing one each tracker host.
 fn torrent_readings(published: &Published) -> Vec<TorrentUsageReading> {
     published
         .torrents
         .iter()
         .map(|torrent| TorrentUsageReading {
             job_id: torrent.job_id.0,
-            trackers: torrent
-                .trackers
-                .iter()
-                .map(|tracker| tracker.host.clone())
-                .collect(),
+            trackers: usage_trackers(
+                torrent.tracker_rule.as_deref(),
+                torrent.trackers.iter().map(|tracker| tracker.host.as_str()),
+            ),
             downloaded_bytes: torrent.downloaded_bytes,
             uploaded_bytes: torrent.uploaded_bytes,
             seeding_seconds: torrent.seeding_seconds,
         })
         .collect()
+}
+
+/// What a torrent's usage counts under: its tracker rule's name once, so a
+/// tracker reached by several hosts is one row, or each host when no rule
+/// matches.
+fn usage_trackers<'a>(rule: Option<&str>, hosts: impl Iterator<Item = &'a str>) -> Vec<String> {
+    match rule {
+        Some(rule) => vec![rule.to_owned()],
+        None => hosts.map(str::to_owned).collect(),
+    }
 }
 
 fn server_entry(servers: &mut Vec<ServerUsageReading>, id: u32) -> &mut ServerUsageReading {
@@ -273,7 +283,7 @@ mod tests {
         UsageConsumerKind, UsageRecorder,
     };
 
-    use super::{job_reading, state_reading};
+    use super::{job_reading, state_reading, usage_trackers};
 
     // An idle instance whose kept rows came due writes their expiry once:
     // the batch that drops them reads that none are left, and the batches
@@ -423,6 +433,25 @@ mod tests {
                 resume_degraded: None,
             }),
             ("cooling_down", false)
+        );
+    }
+
+    // A torrent under a tracker rule counts once, under the rule's name,
+    // however many of the rule's hosts it lists; one under none counts under
+    // each host.
+    #[test]
+    fn a_torrent_counts_under_its_tracker_rule() {
+        let hosts = ["a.tracker.example", "b.tracker.example"];
+        assert_eq!(
+            usage_trackers(Some("Example"), hosts.into_iter()),
+            vec!["Example".to_owned()]
+        );
+        assert_eq!(
+            usage_trackers(None, hosts.into_iter()),
+            vec![
+                "a.tracker.example".to_owned(),
+                "b.tracker.example".to_owned()
+            ]
         );
     }
 }

@@ -2666,7 +2666,7 @@ export const nextKo: LocaleDictionary = {
   "next.torrentDash.peersNote": "시드: {{seeds}} · 토렌트: {{torrents}}",
   "next.torrentDash.uploadedPerDay": "일별 업로드",
   "next.torrentDash.trackers": "트래커",
-  "next.torrentDash.trackersNote": "토렌트는 나열된 각 트래커에 집계됩니다",
+  "next.torrentDash.trackersNote": "토렌트는 트래커 규칙에, 규칙이 없으면 나열된 각 트래커에 집계됩니다",
   "next.torrentDash.tracker": "트래커",
   "next.torrentDash.downloaded": "다운로드",
   "next.torrentDash.uploaded": "업로드",
