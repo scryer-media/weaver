@@ -2591,7 +2591,7 @@ export const nextZh: LocaleDictionary = {
   "next.monitoring.dash.providers": "提供商",
   "next.monitoring.dash.integrity": "完整性",
   "next.monitoring.dash.torrents": "种子",
-  "next.monitoring.dash.engine": "引擎",
+  "next.monitoring.dash.engine": "Usenet 流水线",
   "next.overview.speed": "速度",
   "next.overview.limit": "限速 {{rate}}",
   "next.overview.queue": "队列",

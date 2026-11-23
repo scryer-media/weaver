@@ -2591,7 +2591,7 @@ export const nextEs: LocaleDictionary = {
   "next.monitoring.dash.providers": "Proveedores",
   "next.monitoring.dash.integrity": "Integridad",
   "next.monitoring.dash.torrents": "Torrents",
-  "next.monitoring.dash.engine": "Motor",
+  "next.monitoring.dash.engine": "Pipeline de Usenet",
   "next.overview.speed": "Velocidad",
   "next.overview.limit": "límite {{rate}}",
   "next.overview.queue": "Cola",

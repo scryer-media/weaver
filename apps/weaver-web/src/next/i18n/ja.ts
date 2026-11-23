@@ -2591,7 +2591,7 @@ export const nextJa: LocaleDictionary = {
   "next.monitoring.dash.providers": "プロバイダー",
   "next.monitoring.dash.integrity": "整合性",
   "next.monitoring.dash.torrents": "トレント",
-  "next.monitoring.dash.engine": "エンジン",
+  "next.monitoring.dash.engine": "Usenet パイプライン",
   "next.overview.speed": "速度",
   "next.overview.limit": "上限 {{rate}}",
   "next.overview.queue": "キュー",

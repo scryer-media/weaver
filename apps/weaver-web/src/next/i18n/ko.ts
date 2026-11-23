@@ -2591,7 +2591,7 @@ export const nextKo: LocaleDictionary = {
   "next.monitoring.dash.providers": "공급자",
   "next.monitoring.dash.integrity": "무결성",
   "next.monitoring.dash.torrents": "토렌트",
-  "next.monitoring.dash.engine": "엔진",
+  "next.monitoring.dash.engine": "유즈넷 파이프라인",
   "next.overview.speed": "속도",
   "next.overview.limit": "제한 {{rate}}",
   "next.overview.queue": "대기열",
