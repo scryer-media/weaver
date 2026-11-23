@@ -26,6 +26,19 @@ use weaver_tunnel::{
 use super::*;
 use crate::database::NetDb;
 
+// A diagnostic switch for a development instance. With it set to a folder,
+// each WireGuard proxy writes the headers of the packets inside its tunnel to
+// `tunnel-<proxy id>.pcap` there, replacing the file each time the tunnel
+// comes up. The file holds no TCP payload, so no tracker passkey, and it does
+// hold the address of every peer and server the tunnel reaches. Nothing is
+// written unless the operator sets it.
+const TUNNEL_CAPTURE_DIR_ENV: &str = "WEAVER_DEV_TUNNEL_CAPTURE_DIR";
+
+fn tunnel_capture_path(dir: Option<&std::ffi::OsStr>, proxy: u32) -> Option<std::path::PathBuf> {
+    let dir = dir.filter(|dir| !dir.is_empty())?;
+    Some(std::path::Path::new(dir).join(format!("tunnel-{proxy}.pcap")))
+}
+
 #[path = "network_fetch.rs"]
 pub mod fetch;
 pub use fetch::FetchAttempt;
@@ -1243,6 +1256,13 @@ impl NetworkRuntime {
                         // resolving its endpoint through that carrier.
                         let spec = profile.wireguard_spec().map_err(|e| e.to_string())?;
                         let provider = WireGuardTunnelProvider::new(spec, observer);
+                        let provider = match tunnel_capture_path(
+                            std::env::var_os(TUNNEL_CAPTURE_DIR_ENV).as_deref(),
+                            id,
+                        ) {
+                            Some(path) => provider.with_packet_capture(path),
+                            None => provider,
+                        };
                         let provider = match prefix.last() {
                             None => provider
                                 .with_udp_factory(bottom.clone())
@@ -2100,5 +2120,22 @@ impl Dialer for Unavailable {
     }
     fn describe(&self) -> String {
         self.0.clone()
+    }
+}
+
+#[cfg(test)]
+mod tunnel_capture_tests {
+    use super::tunnel_capture_path;
+    use std::ffi::OsStr;
+    use std::path::PathBuf;
+
+    #[test]
+    fn a_tunnel_is_captured_only_when_the_folder_is_named() {
+        assert_eq!(tunnel_capture_path(None, 3), None);
+        assert_eq!(tunnel_capture_path(Some(OsStr::new("")), 3), None);
+        assert_eq!(
+            tunnel_capture_path(Some(OsStr::new("/captures")), 3),
+            Some(PathBuf::from("/captures/tunnel-3.pcap"))
+        );
     }
 }

@@ -48,6 +48,12 @@ impl WireGuardTunnelProvider {
     ) -> Self {
         Self(self.0.with_endpoint_resolver(resolver), self.1)
     }
+    // A diagnostic tap: the headers of every packet inside the tunnel, in
+    // both directions, go to a pcap file at `path`. No TCP payload is
+    // written; the addresses of both ends of every flow are.
+    pub fn with_packet_capture(self, path: std::path::PathBuf) -> Self {
+        Self(self.0.with_packet_capture(path), self.1)
+    }
     // A tunnel resolves an endpoint written as a name only through the
     // resolver it is given, or the tunnel beneath it carries the lookup.
     // Without either it refuses the name: nothing here falls back to the
