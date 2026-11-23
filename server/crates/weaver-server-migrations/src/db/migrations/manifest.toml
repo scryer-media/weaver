@@ -1986,3 +1986,20 @@ kind = "sql"
 file = "migrations/0137_tracker_rule_names/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 138
+description = "index history by class of job"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0138_history_protocol_index/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0138_history_protocol_index/postgres.sql"
+engine = "postgres"
+scope = "all"

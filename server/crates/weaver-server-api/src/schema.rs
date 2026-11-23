@@ -21,8 +21,8 @@ use crate::history::timeline::build_job_timeline;
 use crate::history::types::history_item_from_row;
 use crate::history::types::{
     HistoryCategoryCount, HistoryItem, HistoryPage, HistoryPageCounts, HistoryPageInput,
-    HistorySortDirection, HistorySortField, HistoryStatusFilter, JobDetailSnapshot, JobEvent,
-    JobTimeline,
+    HistoryProtocolCount, HistorySortDirection, HistorySortField, HistoryStatusFilter,
+    JobDetailSnapshot, JobEvent, JobTimeline,
 };
 use crate::jobs::types::{
     GlobalQueueState, Job, JobOutputFile, JobOutputResult, JobStatusGql, QueueEvent,

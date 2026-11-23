@@ -343,6 +343,8 @@ pub struct HistoryPageInput {
     /// Keep only rows whose job carries this tag; the empty string keeps rows
     /// whose job carries none.
     pub tag: Option<String>,
+    /// Keep only rows of jobs of this class; absent keeps both.
+    pub protocol: Option<crate::jobs::types::ProtocolGql>,
     pub sort_field: Option<HistorySortField>,
     pub sort_direction: Option<HistorySortDirection>,
     /// Keep only rows that finished at or after this epoch second.
@@ -365,6 +367,13 @@ pub struct HistoryCategoryCount {
     pub count: u32,
 }
 
+/// How many history rows one class of job holds.
+#[derive(Debug, Clone, PartialEq, Eq, SimpleObject)]
+pub struct HistoryProtocolCount {
+    pub protocol: crate::jobs::types::ProtocolGql,
+    pub count: u32,
+}
+
 #[derive(Debug, Clone, SimpleObject)]
 pub struct HistoryPage {
     pub items: Vec<HistoryItem>,
@@ -378,6 +387,10 @@ pub struct HistoryPage {
     /// caller that built its facet list out of `items` instead would watch the
     /// other categories vanish the moment one was picked.
     pub category_counts: Vec<HistoryCategoryCount>,
+    /// Every class of job present in history, with its row count: counted
+    /// under the search and the category filter, before the class and status
+    /// filters, as the categories are counted under the class.
+    pub protocol_counts: Vec<HistoryProtocolCount>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]

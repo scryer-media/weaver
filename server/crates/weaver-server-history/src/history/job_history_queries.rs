@@ -14,7 +14,8 @@ pub use super::queries::HistoryFileState;
 use super::queries::{
     HistoryIdSplit, append_history_from_clause, append_history_pagination,
     append_history_row_filter_predicates, archived_history_files_sql, count_history_rows,
-    count_history_rows_by_category, history_order_sql, split_history_ids,
+    count_history_rows_by_category, count_history_rows_by_protocol, history_order_sql,
+    split_history_ids,
 };
 
 pub use super::retention::HistoryInternalQueries;
@@ -79,6 +80,10 @@ pub trait HistoryQueries {
         &self,
         filter: &HistoryFilter,
     ) -> Result<Vec<(String, u32)>, StateError>;
+    fn count_job_history_by_protocol(
+        &self,
+        filter: &HistoryFilter,
+    ) -> Result<Vec<(weaver_server_jobs::jobs::model::Protocol, u32)>, StateError>;
     fn job_history_ids_among(&self, job_ids: &[u64]) -> Result<Vec<u64>, StateError>;
     fn job_history_edit_fields(&self, job_id: u64)
     -> Result<Option<HistoryEditFields>, StateError>;
@@ -373,6 +378,32 @@ impl<D: HistoryDatabase> HistoryQueries for D {
                 .into_iter()
                 .filter(|(_, count)| *count > 0)
                 .map(|(category, count)| (category, count as u32))
+                .collect())
+        })
+    }
+
+    // How many history rows each class of job holds, counted in SQL as the
+    // categories are. A stored key no class answers to is left out.
+    fn count_job_history_by_protocol(
+        &self,
+        filter: &HistoryFilter,
+    ) -> Result<Vec<(weaver_server_jobs::jobs::model::Protocol, u32)>, StateError> {
+        use weaver_server_jobs::jobs::model::Protocol;
+        let datastore = self.borrow().datastore();
+        let (base, ids) = split_history_ids(datastore.engine(), filter);
+        self.borrow().run_sql_blocking_read(async move {
+            let mut counts = std::collections::BTreeMap::<Protocol, i64>::new();
+            for (filter, sign) in ids.statements(&base) {
+                for (key, count) in count_history_rows_by_protocol(&datastore, &filter).await? {
+                    if let Some(protocol) = Protocol::parse(&key) {
+                        *counts.entry(protocol).or_default() += sign * count;
+                    }
+                }
+            }
+            Ok(counts
+                .into_iter()
+                .filter(|(_, count)| *count > 0)
+                .map(|(protocol, count)| (protocol, count as u32))
                 .collect())
         })
     }

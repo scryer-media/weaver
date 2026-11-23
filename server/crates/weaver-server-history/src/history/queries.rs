@@ -126,6 +126,10 @@ pub fn append_history_row_filter_predicates(
             categories.iter().cloned().map(SqlArg::Text).collect(),
         );
     }
+    if let Some(protocol) = filter.protocol {
+        sql.push_str(" AND h.protocol = {}");
+        args.push(SqlArg::Text(protocol.as_str().to_owned()));
+    }
     if let Some(needle) = &filter.name_contains {
         // The search, normalized as each row's `search_key` is, found in it
         // by LIKE: accents, case and separators aside, in any of the row's
@@ -343,18 +347,34 @@ pub async fn count_history_rows_by_category(
     datastore: &StoreDatastore,
     filter: &HistoryFilter,
 ) -> Result<Vec<(String, i64)>, StateError> {
-    let mut sql =
-        String::from("SELECT COALESCE(h.category, '') AS category, COUNT(*) AS count FROM ");
+    count_history_rows_grouped(datastore, filter, "COALESCE(h.category, '')").await
+}
+
+// How many history rows each class of job holds, as its stored key (`nzb`,
+// `torrent`) and count.
+pub async fn count_history_rows_by_protocol(
+    datastore: &StoreDatastore,
+    filter: &HistoryFilter,
+) -> Result<Vec<(String, i64)>, StateError> {
+    count_history_rows_grouped(datastore, filter, "h.protocol").await
+}
+
+async fn count_history_rows_grouped(
+    datastore: &StoreDatastore,
+    filter: &HistoryFilter,
+    key: &str,
+) -> Result<Vec<(String, i64)>, StateError> {
+    let mut sql = format!("SELECT {key} AS grouped, COUNT(*) AS count FROM ");
     let mut args = Vec::new();
 
     append_history_from_clause(&mut sql, &mut args, filter);
     append_history_row_filter_predicates(&mut sql, &mut args, filter, datastore.engine());
 
-    sql.push_str(" GROUP BY COALESCE(h.category, '')");
+    sql.push_str(&format!(" GROUP BY {key}"));
 
     let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await?;
     rows.into_iter()
-        .map(|row| Ok((row.text("category")?, row.i64("count")?)))
+        .map(|row| Ok((row.text("grouped")?, row.i64("count")?)))
         .collect()
 }
 

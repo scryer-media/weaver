@@ -788,7 +788,7 @@ mod tests {
         run_embedded_migrations_on_path_blocking(&db_path).unwrap();
 
         let pool = open_test_pool(&db_path).await;
-        assert_eq!(CURRENT_SCHEMA_VERSION, 137);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 138);
         assert_eq!(
             max_recorded_migration_version(&pool).await.unwrap(),
             Some(CURRENT_SCHEMA_VERSION)

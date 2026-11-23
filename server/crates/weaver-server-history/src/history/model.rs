@@ -58,6 +58,8 @@ pub struct HistoryFilter {
     // Keep rows whose category is one of these, a row with no category
     // counting as the empty string. An empty list keeps nothing.
     pub categories_any: Option<Vec<String>>,
+    // Keep rows of jobs of this class only.
+    pub protocol: Option<weaver_server_jobs::jobs::model::Protocol>,
     // Keep rows whose full release name contains this text, ASCII letters
     // folded to lower case on both sides and the rest compared byte for byte,
     // as the name sort compares.

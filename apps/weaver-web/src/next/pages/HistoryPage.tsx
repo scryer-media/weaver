@@ -44,7 +44,13 @@ import { countLabel } from "../i18n/labels";
 import { useStatusLabel } from "../data/status";
 import { jobIds, testIds } from "@/next/testids";
 import { NextShell, RailBlock } from "../shell/NextShell";
-import { CategoryListBlock, TagFilterBlock } from "../shell/rail-blocks";
+import {
+  CategoryListBlock,
+  ProtocolFilterBlock,
+  TagFilterBlock,
+  type ProtocolFacet,
+} from "../shell/rail-blocks";
+import { useTorrentsShown } from "../data/use-torrents-shown";
 import { TagChips } from "../components/Tags";
 import {
   categoryFacets,
@@ -155,6 +161,7 @@ interface HistoryPageResponse {
     totalCount: number;
     counts: { all: number; success: number; failure: number };
     categoryCounts: { category: string; count: number }[];
+    protocolCounts: { protocol: JobProtocol; count: number }[];
   };
 }
 
@@ -229,6 +236,10 @@ export function HistoryPage() {
   const [picked, setPicked] = useState<ReadonlySet<number>>(() => new Set());
   const [facets, setFacets] = useState<ReadonlySet<string>>(NO_FACETS);
   const [tag, setTag] = useState<string | null>(null);
+  const torrentsOn = useTorrentsShown();
+  const [pickedProtocol, setProtocol] = useState<ProtocolFacet>(null);
+  // The protocol filter is torrent-only: while it is hidden it filters nothing.
+  const protocol = torrentsOn ? pickedProtocol : null;
   // The entries a confirm dialog acts on: the picked ones, or one row's own.
   const [confirmDelete, setConfirmDelete] = useState<ConfirmTargets | null>(null);
   const [confirmArchive, setConfirmArchive] = useState<ConfirmTargets | null>(null);
@@ -272,8 +283,9 @@ export function HistoryPage() {
       sortDirection: sortOption.direction,
       completedSinceEpochSec: since ?? undefined,
       tag: tag ?? undefined,
+      protocol: protocol ?? undefined,
     }),
-    [categories, pageIndex, pageSize, search, since, sortOption.direction, sortOption.field, tab, tag],
+    [categories, pageIndex, pageSize, protocol, search, since, sortOption.direction, sortOption.field, tab, tag],
   );
 
   const [{ data, fetching }, reexecute] = useQuery<HistoryPageResponse>({
@@ -295,6 +307,7 @@ export function HistoryPage() {
         sortField: "COMPLETED_AT",
         sortDirection: "DESC",
         tag: tag ?? undefined,
+        protocol: protocol ?? undefined,
       },
     },
     context: TAG_CONTEXT,
@@ -385,6 +398,14 @@ export function HistoryPage() {
       }),
     [configured, page],
   );
+
+  const protocolCounts = useMemo(() => {
+    const count = (protocol: JobProtocol) =>
+      page?.protocolCounts.find((entry) => entry.protocol === protocol)?.count ?? 0;
+    const torrents = count("TORRENT");
+    const usenet = count("NZB");
+    return { ALL: torrents + usenet, TORRENT: torrents, NZB: usenet };
+  }, [page]);
 
   const volumes = systemInfo?.systemInfo?.configuredStorage ?? NO_VOLUMES;
   const mounts = storageMounts(volumes);
@@ -600,6 +621,13 @@ export function HistoryPage() {
       }
       railMiddle={
         <>
+          {torrentsOn ? (
+            <ProtocolFilterBlock
+              counts={protocolCounts}
+              selected={protocol}
+              onSelect={(facet) => reset(() => setProtocol(facet))}
+            />
+          ) : null}
           <CategoryListBlock
             items={facetItems}
             selected={facets}
