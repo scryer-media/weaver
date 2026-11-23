@@ -292,27 +292,57 @@ impl Pick<'_> {
         db: &crate::persistence::Database,
         window: Window,
     ) -> Result<Picked, crate::StateError> {
-        if self.hashes.is_none()
+        if self.every(&window) {
+            return Ok(Picked::Live);
+        }
+        page_of(db, &self.filter(settings), window)
+    }
+
+    // `picked`, its reads of the table run off the runtime.
+    pub(super) async fn picked_off(
+        &self,
+        settings: &TorrentSettings,
+        db: &crate::persistence::Database,
+        window: Window,
+    ) -> Result<Picked, crate::StateError> {
+        if self.every(&window) {
+            return Ok(Picked::Live);
+        }
+        let (db, filter) = (db.clone(), self.filter(settings));
+        tokio::task::spawn_blocking(move || page_of(&db, &filter, window))
+            .await
+            .map_err(|error| crate::StateError::Database(error.to_string()))
+            .and_then(|result| result)
+    }
+
+    // Whether it keeps every torrent at `window`: no table is read for it.
+    fn every(&self, window: &Window) -> bool {
+        self.hashes.is_none()
             && self.category.is_none()
             && self.private.is_none()
             && matches!(window, Window::Every)
-        {
-            return Ok(Picked::Live);
-        }
-        let filter = self.filter(settings);
-        let (offset, limit) = match window {
-            Window::Every => (0, None),
-            Window::Page { offset, first } => (offset, Some(first)),
-            counted @ Window::Counted(_) => {
-                let places = counted.places(db.count_torrent_list(&filter)?);
-                (places.start, Some(places.len()))
-            }
-        };
-        if limit == Some(0) {
-            return Ok(Picked::Page(Vec::new()));
-        }
-        Ok(Picked::Page(db.torrent_list_ids(&filter, offset, limit)?))
     }
+}
+
+// The page of `window` among the torrents `filter` keeps, read from the
+// table.
+fn page_of(
+    db: &crate::persistence::Database,
+    filter: &TorrentListFilter,
+    window: Window,
+) -> Result<Picked, crate::StateError> {
+    let (offset, limit) = match window {
+        Window::Every => (0, None),
+        Window::Page { offset, first } => (offset, Some(first)),
+        counted @ Window::Counted(_) => {
+            let places = counted.places(db.count_torrent_list(filter)?);
+            (places.start, Some(places.len()))
+        }
+    };
+    if limit == Some(0) {
+        return Ok(Picked::Page(Vec::new()));
+    }
+    Ok(Picked::Page(db.torrent_list_ids(filter, offset, limit)?))
 }
 
 /// What a pick keeps, read from the views a list's rows hold in place of
@@ -400,7 +430,7 @@ impl TorrentService {
     // its torrents by hash, or takes a page of `PAGE_WHILE_LOADING` at
     // most, is answered; any other needs every torrent here, and is told
     // they are not yet, before the table is read for it.
-    fn picked_ids(&self, pick: Pick<'_>, window: Window) -> Result<Picked, ListError> {
+    async fn picked_ids(&self, pick: Pick<'_>, window: Window) -> Result<Picked, ListError> {
         let named = pick.hashes.is_some();
         let paged = match &window {
             Window::Every => false,
@@ -410,7 +440,9 @@ impl TorrentService {
         if !named && !paged {
             self.whole()?;
         }
-        let picked = pick.picked(&self.settings(), &self.inner.db, window)?;
+        let picked = pick
+            .picked_off(&self.settings(), &self.inner.db, window)
+            .await?;
         // A counted window's size is known only now.
         if !named
             && let Picked::Page(page) = &picked
@@ -425,7 +457,7 @@ impl TorrentService {
     // start's load has not reached is read now, so a page lists what the
     // table holds however far the load is.
     async fn picked_here(&self, pick: Pick<'_>, window: Window) -> Result<Picked, ListError> {
-        let picked = self.picked_ids(pick, window)?;
+        let picked = self.picked_ids(pick, window).await?;
         if let Picked::Page(page) = &picked {
             self.ensure(page).await;
         }
@@ -504,7 +536,10 @@ impl TorrentService {
             hashes: Some(&hashes),
             ..Pick::default()
         };
-        let Picked::Page(found) = pick.picked(&self.settings(), &self.inner.db, page(0, 1))? else {
+        let picked = pick
+            .picked_off(&self.settings(), &self.inner.db, page(0, 1))
+            .await?;
+        let Picked::Page(found) = picked else {
             unreachable!("a pick of hashes reads its page from the table")
         };
         Ok(match found.first() {

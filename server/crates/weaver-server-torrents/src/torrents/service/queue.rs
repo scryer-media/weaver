@@ -313,10 +313,16 @@ impl TorrentService {
             if moved.is_empty() {
                 return Ok(false);
             }
-            self.inner
-                .db
-                .set_torrent_queue_positions(&moved)
-                .map_err(|error| ActionError::State(state_error(error)))?;
+            // The write runs off the runtime; the list stays held, so no
+            // other change of these torrents lands between it and theirs.
+            let db = self.inner.db.clone();
+            let moved = tokio::task::spawn_blocking(move || {
+                db.set_torrent_queue_positions(&moved).map(|()| moved)
+            })
+            .await
+            .map_err(|error| crate::StateError::Database(error.to_string()))
+            .and_then(|result| result)
+            .map_err(|error| ActionError::State(state_error(error)))?;
             for (job_id, place) in moved {
                 if let Some(torrent) = live.get_mut(&job_id) {
                     torrent.record.queue_position = place;
