@@ -188,10 +188,7 @@ impl SystemQuery {
     /// What every torrent downloads and uploads right now: the same reading
     /// `systemMetricsUpdates` carries as `torrentRates`.
     #[graphql(guard = "ReadGuard")]
-    async fn torrent_rates(
-        &self,
-        ctx: &Context<'_>,
-    ) -> Result<crate::system::types::TorrentRates> {
+    async fn torrent_rates(&self, ctx: &Context<'_>) -> Result<crate::system::types::TorrentRates> {
         Ok(crate::system::types::TorrentRates::of(
             ctx.data_opt::<weaver_server_core::torrents::service::TorrentService>(),
         ))

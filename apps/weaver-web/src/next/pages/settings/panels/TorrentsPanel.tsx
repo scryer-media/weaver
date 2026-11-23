@@ -310,9 +310,9 @@ type HostSource = "known" | "custom" | "file";
 /**
  * A rule's hosts, each a row to tick: ones a torrent has announced to, typed,
  * or the trackers a .torrent file names, read in the browser. A typed domain
- * covers every host under it. A private file ticks every tracker it names;
- * a public one ticks its main tracker only. The hosts a bound tracker file
- * covers stay ticked.
+ * covers every host under it. A file replaces the list with its trackers: a
+ * private one ticks every tracker it names, a public one its main tracker
+ * only. The hosts a bound tracker file covers stay ticked.
  */
 function HostPicker({
   t,
@@ -361,7 +361,10 @@ function HostPicker({
           : null,
     );
     setFile(trackers ? { name: picked.name, private: trackers.private } : null);
-    add(patterns, trackers?.private ? patterns : main ? [main] : []);
+    // A file chosen replaces the list with its trackers, so a second file
+    // never adds to the first; the hosts a bound tracker file locks stay.
+    setOffered(patterns);
+    onChange([...new Set([...locked, ...(trackers?.private ? patterns : main ? [main] : [])])]);
   };
 
   const addTyped = () => {
