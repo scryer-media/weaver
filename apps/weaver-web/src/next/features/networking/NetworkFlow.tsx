@@ -857,31 +857,32 @@ export const NetworkFlow = memo(function NetworkFlow({
     }
     return found;
   }, [dns, shownLegs, byKey, profiles]);
-  // The lookups asked from each egress, one pill for each profile asking there, with the legs it asks for.
-  const egressAsks = useMemo(() => {
-    const asks = new Map<number, { profile: FlowDnsProfile; lookup: LegLookup; legs: LegFlow[] }[]>();
+  // The DNS pills in each egress card, in the order of the legs that reach them, so the lines in never cross.
+  // A lookup asked at the egress or from the leg itself stands there, one pill for each profile asking, with
+  // the legs it asks for. A leg whose names a proxy looks up gets a pill of its own to pass through, so its
+  // line is never lost inside the card.
+  const egressSlots = useMemo(() => {
+    type Slot =
+      | { kind: "ask"; at: string; profile: FlowDnsProfile; lookup: LegLookup; legs: LegFlow[] }
+      | { kind: "pass"; key: string };
+    const slots = new Map<number, Slot[]>();
     for (const leg of order.legs) {
       const found = lookups.get(legKey(leg));
-      if (found?.lookup.at !== "egress") continue;
-      const here = asks.get(leg.egressId) ?? [];
-      const same = here.find((ask) => ask.profile.id === found.profile.id);
-      if (same) same.legs.push(leg);
-      else here.push({ ...found, legs: [leg] });
-      asks.set(leg.egressId, here);
+      if (!found) continue;
+      const here = slots.get(leg.egressId) ?? [];
+      if (found.lookup.at === "proxy") {
+        if (found.lookup.refused !== null) continue;
+        here.push({ kind: "pass", key: legKey(leg) });
+      } else {
+        const same = here.find(
+          (slot) => slot.kind === "ask" && slot.at === found.lookup.at && slot.profile.id === found.profile.id,
+        );
+        if (same?.kind === "ask") same.legs.push(leg);
+        else here.push({ kind: "ask", at: found.lookup.at, ...found, legs: [leg] });
+      }
+      slots.set(leg.egressId, here);
     }
-    return asks;
-  }, [order.legs, lookups]);
-  // The legs whose names a proxy looks up, each passing through the egress it leaves on: one pill there apiece,
-  // so the line from the leg is never lost inside the card.
-  const egressPasses = useMemo(() => {
-    const passes = new Map<number, string[]>();
-    for (const leg of order.legs) {
-      if (lookups.get(legKey(leg))?.lookup.at !== "proxy") continue;
-      const here = passes.get(leg.egressId) ?? [];
-      here.push(legKey(leg));
-      passes.set(leg.egressId, here);
-    }
-    return passes;
+    return slots;
   }, [order.legs, lookups]);
   // Each egress card in the lane, from the top; one with a speed limit is a row taller, and so is one for each DNS pill.
   const egressCards = useMemo(() => {
@@ -891,13 +892,13 @@ export const NetworkFlow = memo(function NetworkFlow({
       // Everything below the addresses moves down by the ones stacked after the first.
       const shift = Math.max(0, (egress.addresses?.length ?? 0) - 1) * ADDRESS_LINE;
       const base = EGRESS_HEIGHT + shift + heldTo(egress).length * EGRESS_LIMIT_ROW;
-      const pills = (egressAsks.get(egress.id)?.length ?? 0) + (egressPasses.get(egress.id)?.length ?? 0);
+      const pills = egressSlots.get(egress.id)?.length ?? 0;
       const card = { egress, y: top, shift, base, height: base + pills * DNS_ROW };
       placed.push(card);
       top += card.height + EGRESS_GAP;
     }
     return placed;
-  }, [order.egresses, egressAsks, egressPasses]);
+  }, [order.egresses, egressSlots]);
   const egressCardById = new Map(egressCards.map((placed) => [placed.egress.id, placed]));
   const egressBottom = egressCards.reduce((bottom, card) => Math.max(bottom, card.y + card.height), 38);
   const cards = useMemo(() => endpointCards(shown, flow.legs), [shown, flow.legs]);
@@ -1003,7 +1004,7 @@ export const NetworkFlow = memo(function NetworkFlow({
       const note = leg.reason ? wrap(leg.reason, LEGS.width - 28, 9.5, 2) : [];
       const lookup = lookups.get(legKey(leg))?.lookup ?? null;
       // The host's lookup, or one refused for want of a proxy, stands at the bottom of the leg's own card.
-      const cardHeight = LEG_HEIGHT + noteHeight(note.length) + (lookup?.at === "leg" ? DNS_ROW : 0);
+      const cardHeight = LEG_HEIGHT + noteHeight(note.length) + 0;
       const y = offset;
       const height = Math.max(cardHeight, closed ? BOX_HEIGHT : bypass == null ? bottom - 8 : bypass + 16);
       offset += height + 18;
@@ -1127,13 +1128,10 @@ export const NetworkFlow = memo(function NetworkFlow({
   type Origin = { x: number; mid: number; boxEnd: number; gapY: number | null };
   const origins: { origin: Origin; lookup: LegLookup; profile: FlowDnsProfile; legs: LegFlow[] }[] = [];
   for (const row of layout.rows) {
-    const { leg, y, height, cardHeight, blocks, lookup } = row;
+    const { leg, y, blocks, lookup } = row;
     const found = lookups.get(legKey(leg));
     if (!lookup || !found) continue;
-    if (lookup.at === "leg") {
-      const mid = y + cardHeight - DNS_ROW + 4 + DNS_PILL / 2;
-      origins.push({ origin: { x: LEGS.x + 14, mid, boxEnd: LEGS.end, gapY: y + height + 9 }, lookup, profile: found.profile, legs: [leg] });
-    } else if (lookup.at === "proxy") {
+    if (lookup.at === "proxy") {
       const block = blocks.find((candidate) => candidate.dnsTop !== null);
       if (!block) continue;
       const hops = block.rung.kind === "CHAIN" ? block.rung.chainIds.length : 1;
@@ -1143,7 +1141,8 @@ export const NetworkFlow = memo(function NetworkFlow({
     }
   }
   for (const { egress, y, base } of egressCards) {
-    for (const [index, ask] of (egressAsks.get(egress.id) ?? []).entries()) {
+    for (const [index, ask] of (egressSlots.get(egress.id) ?? []).entries()) {
+      if (ask.kind !== "ask") continue;
       const last = rowByKey.get(legKey(ask.legs.at(-1)!));
       const mid = y + base + index * DNS_ROW + 4 + DNS_PILL / 2;
       origins.push({
@@ -1154,6 +1153,9 @@ export const NetworkFlow = memo(function NetworkFlow({
       });
     }
   }
+  // Lines run to their answers in the order they leave, top first, and the answers stack in that order, so
+  // no line crosses another on its way down.
+  origins.sort((a, b) => (a.origin.gapY ?? a.origin.mid) - (b.origin.gapY ?? b.origin.mid));
   // What answers, in the order the lookups reach it, stacked below the endpoints.
   const answers: {
     key: string;
@@ -1228,8 +1230,10 @@ export const NetworkFlow = memo(function NetworkFlow({
     answerTop += height + ENDPOINT_GAP;
   }
   const egressNames = new Map(egresses.map((egress) => [egress.id, egress.name]));
-  // Where a lookup's line turns from the gap below its row toward its answer.
-  const approach = endpoints.x - 56;
+  // Where a lookup's line turns from the gap below its row toward its answer: the higher the gap, the
+  // further right it turns, so a line turning down passes in front of the gaps below it, not across them.
+  const gaps = [...new Set(origins.flatMap(({ origin }) => (origin.gapY === null ? [] : [origin.gapY])))].sort((a, b) => a - b);
+  const approachAt = (gapY: number) => endpoints.x - 28 - gaps.indexOf(gapY) * 10;
   const asks = origins.map(({ origin, lookup, profile: chosen, legs }, index) => {
     const leg = legs[0]!;
     // The pill says only that names are looked up here; who asks, and how, is in its tooltip.
@@ -1255,15 +1259,21 @@ export const NetworkFlow = memo(function NetworkFlow({
     ].join(" ");
     const answer = lookup.destination ? answerByKey.get(answerKey(lookup.destination)) : undefined;
     const destY = answer ? answer.y + 17 : undefined;
+    // Where a leg's line meets its own pill in the egress it leaves on, below that egress's own pills.
+    const passOf = (fed: LegFlow) => {
+      const through = egressCardById.get(fed.egressId);
+      const passIndex = egressSlots.get(fed.egressId)?.findIndex((slot) => slot.kind === "pass" && slot.key === legKey(fed)) ?? -1;
+      return through && passIndex >= 0 ? through.y + through.base + passIndex * DNS_ROW + 4 + DNS_PILL / 2 : null;
+    };
     // Out of its box, along the gap below its row where it has one, then to its answer.
     const line: Point[] | null =
       destY === undefined
         ? null
-        : origin.gapY !== null && approach - origin.boxEnd > 2 * DNS_TURN
+        : origin.gapY !== null && approachAt(origin.gapY) - origin.boxEnd > 2 * DNS_TURN
           ? [
               [origin.boxEnd, origin.mid],
               [origin.boxEnd + DNS_TURN, origin.gapY],
-              [approach, origin.gapY],
+              [approachAt(origin.gapY), origin.gapY],
               [endpoints.x, destY],
             ]
           : [
@@ -1273,22 +1283,13 @@ export const NetworkFlow = memo(function NetworkFlow({
     // A line from each leg's card to the box that asks for it says which route the lookup is for: into the
     // egress it leaves through, or on through that egress to the proxy carrying it.
     const entry = origin.x - 14;
-    const feeds =
-      lookup.at === "leg"
-        ? []
-        : legs.flatMap((fed) => {
+    const feeds = legs.flatMap((fed) => {
             const row = rowByKey.get(legKey(fed));
             if (!row) return [];
             const start: Point = [LEGS.end, row.y + row.cardHeight - 14];
-            const through = egressCardById.get(fed.egressId);
-            // On its way to a proxy, the line meets its own pill in the egress it leaves on, below that egress's own.
-            const passIndex = egressPasses.get(fed.egressId)?.indexOf(legKey(fed)) ?? -1;
-            const pass =
-              lookup.at === "proxy" && through && passIndex >= 0
-                ? through.y + through.base + ((egressAsks.get(fed.egressId)?.length ?? 0) + passIndex) * DNS_ROW + 4 + DNS_PILL / 2
-                : null;
+            const pass = lookup.at === "proxy" ? passOf(fed) : null;
             const paths: Point[][] =
-              lookup.at === "egress"
+              lookup.at !== "proxy"
                 ? [[start, [EGRESS.x, origin.mid]]]
                 : pass !== null
                   ? [
@@ -1311,6 +1312,8 @@ export const NetworkFlow = memo(function NetworkFlow({
       line,
       feeds,
       entry,
+      // A pill reached from a leg's card has its line come in at the box's edge.
+      enters: feeds.length > 0,
       target:
         chosen.id === SYSTEM_DNS_PROFILE_ID
           ? ({ kind: "route", consumer: leg.consumer } as const)
@@ -2013,7 +2016,7 @@ export const NetworkFlow = memo(function NetworkFlow({
               {ask.refused ? null : (
                 <path d={`M ${ask.x + ask.width} ${ask.mid} L ${ask.boxEnd} ${ask.mid}`} stroke={INK.dns} strokeWidth="1.5" />
               )}
-              {ask.feeds.length ? (
+              {ask.enters ? (
                 <path d={`M ${ask.entry} ${ask.mid} L ${ask.x} ${ask.mid}`} stroke={INK.dns} strokeWidth="1.25" />
               ) : null}
               {card(
