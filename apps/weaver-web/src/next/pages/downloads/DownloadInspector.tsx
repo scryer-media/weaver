@@ -68,16 +68,22 @@ function Field({
   value,
   title,
   tone = "text-wv-fg",
+  wrap = false,
 }: {
   label: string;
   value: string;
   title?: string;
   tone?: string;
+  /** Break a long value over lines instead of cutting it off. */
+  wrap?: boolean;
 }) {
   return (
     <div className="flex gap-3">
       <span className="w-[104px] flex-none text-[12.5px] text-wv-muted">{label}</span>
-      <span title={title ?? value} className={`min-w-0 flex-1 truncate text-[12.5px] ${tone}`}>
+      <span
+        title={title ?? value}
+        className={`min-w-0 flex-1 text-[12.5px] ${wrap ? "leading-[1.35] [overflow-wrap:anywhere]" : "truncate"} ${tone}`}
+      >
         {value}
       </span>
     </div>
@@ -376,7 +382,7 @@ export function DownloadInspector({
           ) : (
             <UsenetFields job={job} rate={rate} eta={eta} />
           )}
-          <Field label={t("next.inspector.destination")} value={data?.jobOutputFiles?.outputDir || EM_DASH} />
+          <Field label={t("next.inspector.destination")} value={data?.jobOutputFiles?.outputDir || EM_DASH} wrap />
         </div>
 
         <div className="flex flex-none flex-col gap-[13px] px-5 py-[18px]">
