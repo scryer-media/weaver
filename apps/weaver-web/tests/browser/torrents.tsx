@@ -186,7 +186,7 @@ const torrent = (id: number, level: SettingLevel, override: SeedingPolicyData | 
   peers: 9, seeds: 3, leechers: 6, maxPeers: 50, swarmSeeds: 12, swarmLeechers: 20, reannounceSeconds: null,
   activeSeconds: 0, seedingSeconds: 0, consecutiveSeedingSeconds: 0, downloadAvgBps: 0, uploadAvgBps: 0, wastedBytes: 0, lastSeenCompleteMs: null,
   pieceCount: null, pieceSize: null, piecesHave: null, createdBy: null, createdAtMs: null, comment: null,
-  addedAtMs: 0, completedAtMs: null, savePath: null, unpack: false, unpackOverride: null, seedingLeft: null, seedingGoalLeft: null, route: null,
+  addedAtMs: 0, completedAtMs: null, savePath: null, unpack: false, unpackOverride: null, seedingLeft: null, seedingGoalLeft: null, route: null, routeConsumer: "torrent:default",
   seedingOverride: override,
   seedingPolicy: {
     ratioGoal: override?.ratioGoal.value ?? (level === "CATEGORY" ? 1.5 : 1),

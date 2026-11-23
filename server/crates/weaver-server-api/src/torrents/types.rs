@@ -755,6 +755,9 @@ pub struct Torrent {
     /// The torrent's own unpack; absent inherits.
     pub unpack_override: Option<bool>,
     pub route: Option<String>,
+    /// The networking route the torrent takes, by its consumer key:
+    /// `torrent:default`, `torrent:category:<id>` or `torrent:tracker:<id>`.
+    pub route_consumer: String,
     pub files: Vec<TorrentFileGql>,
     /// Whether its pieces are fetched in order.
     pub sequential: bool,
@@ -894,6 +897,7 @@ impl Torrent {
             unpack: view.unpack,
             unpack_override: view.unpack_override,
             route: view.route,
+            route_consumer: weaver_server_core::proxies::Consumer::Torrent(view.scope).key(),
             files,
             sequential: view.sequential,
             first_last_piece_first: view.first_last_piece_first,

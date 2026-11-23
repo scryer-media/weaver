@@ -2055,6 +2055,7 @@ export const TORRENT_UPDATES_SUBSCRIPTION = gql`
           reason
         }
         route
+        routeConsumer
         files {
           index
           path

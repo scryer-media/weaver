@@ -117,6 +117,7 @@ const torrent = (overrides: Partial<TorrentData> = {}): TorrentData => ({
   unpack: true,
   unpackOverride: null,
   route: null,
+  routeConsumer: "torrent:default",
   files: [],
   trackers: [],
   ...overrides,

@@ -58,6 +58,7 @@ import {
   EM_DASH,
   formatClockSeconds,
   formatCount,
+  formatDate,
   formatDuration,
   formatRate,
   formatSize,
@@ -82,6 +83,8 @@ import { FilesMissingDialog, isFilesMissing, stillFilesMissing } from "../featur
 import { TorrentDetail, useTorrent } from "../features/torrents/TorrentDetail";
 import { TorrentRemoveDialog } from "../features/torrents/TorrentRemoveDialog";
 import { DownloadSummaryPanel } from "../components/DownloadSummary";
+import { JobRouteFlow } from "../features/networking/JobRouteFlow";
+import { ProxyEditorFor } from "./settings/panels/ProxiesPanel";
 import type { DownloadSummaryData } from "../data/download-summary";
 
 /**
@@ -298,9 +301,6 @@ function JobDetailContent() {
   const [moreFiles, setMoreFiles] = useState<MoreFiles | null>(null);
   const [pagedEvents, setPagedEvents] = useState<PagedEvents | null>(null);
   const [loadingMore, setLoadingMore] = useState<"files" | "events" | null>(null);
-  const [{ data: duplicateData }, refetchDuplicate] = useQuery<{
-    duplicateSnapshot: DuplicateSnapshot | null;
-  }>({ query: DUPLICATE_SNAPSHOT_QUERY, variables, pause: !Number.isFinite(jobId) });
 
   const [, redownloadJob] = useMutation(REDOWNLOAD_JOB_MUTATION);
   const [retryAction, setRetryAction] = useState<"redownload" | "reprocess" | "retryNoLimit" | null>(null);
@@ -334,7 +334,14 @@ function JobDetailContent() {
   const job = useMemo(() => (raw ? normalizeJobData(raw) : null), [raw]);
   const progress = useJobProgress(job ?? NO_JOB);
   const isTorrent = job?.protocol === "TORRENT";
+  // Posts, articles, providers, PAR2 recovery and NZB duplicate identity
+  // belong to a usenet job only; every other kind of job leaves them out.
+  const usenet = job !== null && (job.protocol ?? "NZB") === "NZB";
   const { torrent, refresh: refreshTorrent } = useTorrent(jobId, isTorrent);
+  // Asked for once the job is known to be usenet: nothing else has one.
+  const [{ data: duplicateData }, refetchDuplicate] = useQuery<{
+    duplicateSnapshot: DuplicateSnapshot | null;
+  }>({ query: DUPLICATE_SNAPSHOT_QUERY, variables, pause: !Number.isFinite(jobId) || !usenet });
   const stateKey = torrentStateLabelKey(torrent?.state);
   // The output folder fills in as the job moves through post-processing and
   // settles when it finishes, so the listing is re-read on each status change
@@ -484,7 +491,9 @@ function JobDetailContent() {
     : failed
     ? t("next.job.outcomeFailed")
     : done
-      ? repaired
+      ? isTorrent
+        ? t("next.job.outcomeTorrent")
+        : repaired
         ? t("next.job.outcomeRepaired")
         : t("next.job.outcomeVerified")
       : t("next.job.outcomeRunning", { status: statusLabel(progress.status), percent: Math.round(percent) });
@@ -499,6 +508,10 @@ function JobDetailContent() {
         time: formatClockSeconds(job.completedAt),
         reason: job.error || t("next.job.stoppedReason"),
       })
+    : done && isTorrent
+      ? // A torrent finishes when its last piece checks out and then seeds
+        // for days: its own completion date, with no pipeline after it.
+        t("next.job.finished", { time: formatDate(torrent?.completedAtMs ?? job.completedAt) })
     : done
       ? [
           t("next.job.finished", { time: formatClockSeconds(job.completedAt) }),
@@ -642,7 +655,7 @@ function JobDetailContent() {
             />
           </div>
           <div className="flex min-w-0 flex-wrap items-center gap-2">
-            {isTorrent ? null : (
+            {!usenet ? null : (
               <SecondaryButton
                 icon="downloadFile"
                 size="compact"
@@ -761,7 +774,7 @@ function JobDetailContent() {
               </>
             ) : (
               <>
-                {isTorrent ? null : (
+                {!usenet ? null : (
                 <SecondaryButton
                   icon="redownload"
                   size="compact"
@@ -785,7 +798,7 @@ function JobDetailContent() {
                 >
                   {t("next.completed.rerunScripts")}
                 </SecondaryButton>
-                {isTorrent ? null : (
+                {!usenet ? null : (
                 <SecondaryButton
                   icon="reprocess"
                   size="compact"
@@ -797,7 +810,7 @@ function JobDetailContent() {
                   {t("next.job.reprocess")}
                 </SecondaryButton>
                 )}
-                {job.failedForMemory ? (
+                {usenet && job.failedForMemory ? (
                   <SecondaryButton
                     icon="reprocess"
                     size="compact"
@@ -888,8 +901,11 @@ function JobDetailContent() {
             variant="stat"
             eyebrow={t("next.job.downloaded")}
             value={formatSize(job.downloadedBytes)}
-            note={t("next.job.ofPosted", { size: formatSize(job.totalBytes) })}
+            note={t(usenet ? "next.job.ofPosted" : "next.job.ofTotal", { size: formatSize(job.totalBytes) })}
           />
+          {/* PAR2 repair is a usenet job's; a torrent piece that fails its
+              hash is fetched again and counted as wasted. */}
+          {usenet ? (
           <MetricCell
             variant="stat"
             eyebrow={t("next.job.integrity")}
@@ -909,9 +925,11 @@ function JobDetailContent() {
                 : t("next.job.verifiesAfter")
             }
           />
+          ) : null}
           {/* A torrent has no download phases: its own reading, the average
               over its time active once it ends, its rate while it runs. */}
           {isTorrent ? (
+            <>
             <MetricCell
               variant="stat"
               eyebrow={terminal ? t("next.job.averageDownloadSpeed") : t("next.job.currentRate")}
@@ -921,6 +939,13 @@ function JobDetailContent() {
                   : formatRate(terminal ? torrent.downloadAvgBps : torrent.downloadBps)
               }
             />
+            {/* It uploads for as long as it is held, so the average reads at any point. */}
+            <MetricCell
+              variant="stat"
+              eyebrow={t("next.job.averageUploadSpeed")}
+              value={torrent === null ? EM_DASH : formatRate(torrent.uploadAvgBps)}
+            />
+            </>
           ) : (
           <MetricCell
             variant="stat"
@@ -945,8 +970,8 @@ function JobDetailContent() {
             }
           />
           )}
-          {/* A torrent has no recovery set to fetch or skip. */}
-          {isTorrent ? null : (
+          {/* Only a usenet job has a recovery set to fetch or skip. */}
+          {!usenet ? null : (
             <MetricCell
               variant="stat"
               eyebrow={job.optionalRecoveryDownloadedBytes > 0 ? t("next.job.recovery") : t("next.job.saved")}
@@ -983,6 +1008,9 @@ function JobDetailContent() {
           />
         ) : null}
 
+        {/* The stage waterfall and its wait for the first stage are the
+            usenet pipeline's; another job shows only stages it recorded. */}
+        {usenet || timeline ? (
         <DetailBlock id="pipeline" title={t("next.job.pipeline")} note={timeline?.note} bodyClassName="gap-0">
           {timeline ? (
             <Waterfall
@@ -998,6 +1026,7 @@ function JobDetailContent() {
             </span>
           )}
         </DetailBlock>
+        ) : null}
 
         <DetailBlock
           id="files"
@@ -1149,7 +1178,31 @@ function JobDetailContent() {
         <JobScriptResults key={`${job.id}-${job.status}`} jobId={job.id} />
 
         <PanelGrid>
-          <DownloadSummaryPanel inQueue={inQueue} summary={snapshot?.downloadSummary} />
+          {/* The routes the job leaves on, live: a torrent's own route, or
+              the servers that served a usenet job (every server's before
+              one has). Drawn once the torrent says which route it is on. */}
+          {usenet || torrent !== null ? (
+            <JobRouteFlow
+              routes={
+                torrent !== null
+                  ? [torrent.routeConsumer]
+                  : providers.map((provider) => `server:${provider.serverId}`)
+              }
+              title={job.displayTitle || job.name}
+              onReport={setReport}
+              proxyEditor={(proxyId, onClose, onChanged) => (
+                <ProxyEditorFor key={proxyId} id={proxyId} onClose={onClose} onChanged={onChanged} />
+              )}
+            />
+          ) : null}
+          {/* Posts, articles and newsgroups, and the NZB duplicate record:
+              a usenet job's only. The posts' summary is kept once the job
+              has one; until then the route above stands in its place. */}
+          {usenet ? (
+          <>
+          {snapshot?.downloadSummary ? (
+            <DownloadSummaryPanel inQueue={inQueue} summary={snapshot.downloadSummary} />
+          ) : null}
 
           <DetailBlock
             id="identity"
@@ -1190,6 +1243,8 @@ function JobDetailContent() {
               {t("next.job.forgetIdentity")}
             </DangerButton>
           </DetailBlock>
+          </>
+          ) : null}
 
           <DetailBlock id="metadata" title={t("next.job.metadata")} tone="panel" bodyClassName="gap-[11px]">
             <Field variant="stacked" label={t("next.job.jobId")} value={String(job.id)} />
@@ -1222,10 +1277,10 @@ function JobDetailContent() {
             The prototype's last panel. It lists only the providers that served
             something: the ledger omits a provider that contributed nothing
             rather than carrying it at zero, so "this backup went untouched" is
-            read from its absence here, not from a row. A torrent has no
+            read from its absence here, not from a row. Only a usenet job has
             providers.
           */}
-          {isTorrent ? null : (
+          {!usenet ? null : (
             <DetailBlock
               id="providers"
               title={t("next.job.providersUsed")}
@@ -1253,6 +1308,10 @@ function JobDetailContent() {
             </DetailBlock>
           )}
 
+          {/* Payload against recovery set and unrecovered bytes: a usenet
+              job's. Anything else would show the payload alone, which the
+              strip at the top already says. */}
+          {usenet ? (
           <DetailBlock id="recovery" title={t("next.job.bytes")} tone="panel" bodyClassName="gap-[11px]">
             <ShareRow
               label={t("next.job.payload")}
@@ -1260,8 +1319,6 @@ function JobDetailContent() {
               percent={payload.total > 0 ? (payload.done / payload.total) * 100 : 0}
               color={color}
             />
-            {/* A torrent has no recovery set, and a piece that fails its hash is fetched again. */}
-            {isTorrent ? null : (
               <>
                 <ShareRow
                   label={t("next.job.recoverySet")}
@@ -1287,8 +1344,8 @@ function JobDetailContent() {
                   color={WV.error}
                 />
               </>
-            )}
           </DetailBlock>
+          ) : null}
         </PanelGrid>
       </div>
 
