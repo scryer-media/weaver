@@ -193,6 +193,7 @@ export const nextZh: LocaleDictionary = {
   "next.inspector.filesShown": "{{shown}} / {{count}}",
   "next.inspector.totalSize": "总大小",
   "next.inspector.rate": "速度",
+  "next.inspector.seedingTime": "做种时间",
   "next.inspector.destination": "目标位置",
   "next.inspector.noFiles": "尚未写入任何内容 — 下载到达目标位置后会显示文件。",
   "next.inspector.topOfQueue": "移到队首",

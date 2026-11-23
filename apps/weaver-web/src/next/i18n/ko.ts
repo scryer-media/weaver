@@ -193,6 +193,7 @@ export const nextKo: LocaleDictionary = {
   "next.inspector.filesShown": "{{count}}개 중 {{shown}}개",
   "next.inspector.totalSize": "전체 크기",
   "next.inspector.rate": "속도",
+  "next.inspector.seedingTime": "시딩 시간",
   "next.inspector.destination": "저장 위치",
   "next.inspector.noFiles": "아직 기록된 파일이 없습니다 — 다운로드가 저장 위치에 도달하면 파일이 표시됩니다.",
   "next.inspector.topOfQueue": "대기열 맨 앞으로",

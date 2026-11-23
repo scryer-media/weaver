@@ -193,6 +193,7 @@ export const nextJa: LocaleDictionary = {
   "next.inspector.filesShown": "{{count}} 件中 {{shown}} 件",
   "next.inspector.totalSize": "合計サイズ",
   "next.inspector.rate": "速度",
+  "next.inspector.seedingTime": "シード時間",
   "next.inspector.destination": "保存先",
   "next.inspector.noFiles": "まだ何も書き込まれていません — ダウンロードが保存先に届くとファイルが表示されます。",
   "next.inspector.topOfQueue": "キューの先頭へ",

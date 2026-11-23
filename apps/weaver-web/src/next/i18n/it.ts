@@ -193,6 +193,7 @@ export const nextIt: LocaleDictionary = {
   "next.inspector.filesShown": "{{shown}} di {{count}}",
   "next.inspector.totalSize": "Dimensione totale",
   "next.inspector.rate": "Velocità",
+  "next.inspector.seedingTime": "Tempo di seeding",
   "next.inspector.destination": "Destinazione",
   "next.inspector.noFiles": "Ancora nulla di scritto — i file compaiono quando il download raggiunge la destinazione.",
   "next.inspector.topOfQueue": "In cima alla coda",

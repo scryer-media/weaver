@@ -15,6 +15,7 @@ import {
   UPDATE_JOBS_MUTATION,
 } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
+import { criticalHealthMilli, HEALTH_TONE_CLASS, healthTone } from "@/lib/health-tone";
 import type { JobData } from "@/lib/job-types";
 import { statusToken } from "@/lib/status-tokens";
 import { torrentErrorText, torrentStateLabelKey, type TorrentSummaryData } from "@/lib/torrents";
@@ -22,7 +23,7 @@ import { Eyebrow } from "@/next/components/chrome";
 import { DangerButton, SecondaryButton, Select, Toggle } from "@/next/components/controls";
 import { Icon } from "@/next/components/icons";
 import { PhaseBars, useJobProgress } from "@/next/components/PhaseBars";
-import { EM_DASH, formatCount, formatRate, formatSize } from "@/next/data/format";
+import { EM_DASH, formatCount, formatDuration, formatRate, formatSize } from "@/next/data/format";
 import { LIST_PAGE_SIZE } from "@/next/data/list-pages";
 import { useNextData } from "@/next/data/next-data";
 import { statusDetail, useStatusLabel } from "@/next/data/status";
@@ -62,14 +63,120 @@ function EditField({ label, children }: { label: string; children: ReactNode }) 
   );
 }
 
-function Field({ label, value, title }: { label: string; value: string; title?: string }) {
+function Field({
+  label,
+  value,
+  title,
+  tone = "text-wv-fg",
+}: {
+  label: string;
+  value: string;
+  title?: string;
+  tone?: string;
+}) {
   return (
     <div className="flex gap-3">
       <span className="w-[104px] flex-none text-[12.5px] text-wv-muted">{label}</span>
-      <span title={title ?? value} className="min-w-0 flex-1 truncate text-[12.5px] text-wv-fg">
+      <span title={title ?? value} className={`min-w-0 flex-1 truncate text-[12.5px] ${tone}`}>
         {value}
       </span>
     </div>
+  );
+}
+
+/** `value / goal`, or the value alone when there is no goal. */
+function againstGoal(value: string, goal: string | null): string {
+  return goal === null ? value : `${value} / ${goal}`;
+}
+
+/**
+ * A usenet job's own figures: what came of what was posted, and its
+ * integrity once its checks have read it.
+ */
+function UsenetFields({ job, rate, eta }: { job: JobData; rate: number; eta: string }) {
+  const t = useTranslate();
+  const token = statusToken(job.status);
+  // Damage is known once the job is past its download.
+  const checked = token !== "downloading" && token !== "queued" && token !== "paused";
+  const integrity = !checked
+    ? { value: t("next.job.verifiesAfter"), tone: "text-wv-muted" }
+    : {
+        value: `${(job.health / 10).toFixed(1)}% — ${
+          job.failedBytes > 0
+            ? t("next.job.neverRecovered", { size: formatSize(job.failedBytes) })
+            : t("next.job.noDamage")
+        }`,
+        tone: HEALTH_TONE_CLASS[
+          healthTone(job.health, criticalHealthMilli(job.totalBytes, job.optionalRecoveryBytes))
+        ],
+      };
+  return (
+    <>
+      <Field
+        label={t("next.job.downloaded")}
+        value={`${formatSize(job.downloadedBytes)} ${t("next.job.ofPosted", { size: formatSize(job.totalBytes) })}`}
+      />
+      <Field label={t("next.job.integrity")} value={integrity.value} tone={integrity.tone} />
+      <Field label={t("next.inspector.rate")} value={rate > 0 ? formatRate(rate) : EM_DASH} />
+      <Field label={t("next.common.timeLeft")} value={eta} />
+    </>
+  );
+}
+
+/**
+ * A torrent's own figures: both directions of its rate, and once it is
+ * whole, its ratio and seeding time against the goals it seeds to.
+ */
+function TorrentFields({
+  job,
+  torrent,
+  rate,
+  eta,
+}: {
+  job: JobData;
+  torrent: TorrentSummaryData | null;
+  rate: number;
+  eta: string;
+}) {
+  const t = useTranslate();
+  const whole = job.progress >= 1;
+  const upload = torrent?.uploadBps ?? 0;
+  const rates = [rate > 0 ? `↓ ${formatRate(rate)}` : null, upload > 0 ? `↑ ${formatRate(upload)}` : null].filter(
+    (part) => part !== null,
+  );
+  const policy = torrent?.seedingPolicy;
+  const seeded =
+    torrent === null
+      ? 0
+      : policy?.seedTimeCounting === "CONSECUTIVE"
+        ? torrent.consecutiveSeedingSeconds
+        : torrent.seedingSeconds;
+  return (
+    <>
+      {whole ? null : (
+        <Field
+          label={t("next.job.downloaded")}
+          value={`${formatSize(job.downloadedBytes)} ${t("next.job.ofTotal", { size: formatSize(job.totalBytes) })}`}
+        />
+      )}
+      <Field label={t("next.inspector.rate")} value={rates.length > 0 ? rates.join(" · ") : EM_DASH} />
+      {whole ? null : <Field label={t("next.common.timeLeft")} value={eta} />}
+      {torrent === null ? null : (
+        <Field
+          label={t("next.torrent.shareRatio")}
+          value={againstGoal(torrent.ratio.toFixed(2), policy?.ratioGoal == null ? null : policy.ratioGoal.toFixed(2))}
+        />
+      )}
+      {torrent === null || !whole ? null : (
+        <Field
+          label={t("next.inspector.seedingTime")}
+          value={againstGoal(
+            formatDuration(seeded),
+            policy?.seedTimeGoalMinutes == null ? null : formatDuration(policy.seedTimeGoalMinutes * 60),
+          )}
+        />
+      )}
+    </>
   );
 }
 
@@ -264,8 +371,11 @@ export function DownloadInspector({
             <div className="text-[12px] text-wv-error-text">{failure}</div>
           )}
           <Field label={t("next.inspector.totalSize")} value={formatSize(job.totalBytes)} />
-          <Field label={t("next.inspector.rate")} value={rate > 0 ? formatRate(rate) : EM_DASH} />
-          <Field label={t("next.common.timeLeft")} value={eta} />
+          {isTorrent ? (
+            <TorrentFields job={job} torrent={torrent} rate={rate} eta={eta} />
+          ) : (
+            <UsenetFields job={job} rate={rate} eta={eta} />
+          )}
           <Field label={t("next.inspector.destination")} value={data?.jobOutputFiles?.outputDir || EM_DASH} />
         </div>
 

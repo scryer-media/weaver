@@ -193,6 +193,7 @@ export const nextPt: LocaleDictionary = {
   "next.inspector.filesShown": "{{shown}} de {{count}}",
   "next.inspector.totalSize": "Tamanho total",
   "next.inspector.rate": "Velocidade",
+  "next.inspector.seedingTime": "Tempo semeando",
   "next.inspector.destination": "Destino",
   "next.inspector.noFiles": "Nada gravado ainda — os arquivos aparecem quando o download chega ao destino.",
   "next.inspector.topOfQueue": "Topo da fila",
