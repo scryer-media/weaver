@@ -2363,3 +2363,63 @@ async fn a_batch_history_transaction_refused_for_room_goes_on_row_by_row() {
     many.service.stop().await;
     alone.service.stop().await;
 }
+
+// The job events a torrent's queue raised so far that create `job_id`.
+fn creations(
+    events: &mut tokio::sync::broadcast::Receiver<weaver_server_base::events::model::PipelineEvent>,
+    job_id: JobId,
+) -> usize {
+    let mut created = 0;
+    loop {
+        match events.try_recv() {
+            Ok(weaver_server_base::events::model::PipelineEvent::JobCreated {
+                job_id: id, ..
+            }) if id == job_id => created += 1,
+            Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+            Err(_) => return created,
+        }
+    }
+}
+
+// A torrent's job is created by its add, once. A restart brings the job
+// back into the queue and says nothing of creating it: each start that did
+// left one more creation in the job's event log.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_does_not_create_a_torrents_job_again() {
+    let data: Vec<u8> = (0..16_384u32).map(|at| (at % 251) as u8).collect();
+    let files = [("set/a.bin", data.as_slice())];
+    let bytes = metainfo("set", &files, 16_384, false);
+
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    let handle = queue();
+    let mut events = handle.subscribe_events();
+    rig.service.publish_to(handle.clone());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(bytes)))
+        .await
+        .unwrap();
+    assert_eq!(creations(&mut events, job_id), 1, "the add creates the job");
+    rig.service.stop().await;
+    rig.db.prune_orphan_active_state(JobId(u64::MAX)).unwrap();
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    let handle = queue();
+    let mut events = handle.subscribe_events();
+    again.publish_to(handle.clone());
+    again.open().await.unwrap();
+    again.tick().await;
+    again.restored().await;
+    assert!(
+        handle.get_job(job_id).is_ok(),
+        "the restart publishes the job again"
+    );
+    assert_eq!(
+        creations(&mut events, job_id),
+        0,
+        "a restart creates nothing"
+    );
+    again.stop().await;
+}

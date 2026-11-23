@@ -123,11 +123,9 @@ fn load_parked_job(
     let (spec, summaries) = crate::operations::read_stored_files(db, job_id, &recovered, outline)
         .map_err(|error| error.to_string())?
         .map_err(|error| error.to_string())?;
-    let mut request = crate::operations::restore_request(job_id, recovered, spec, summaries);
-    if let Some(read) = request.restart.as_mut() {
-        read.reentry = true;
-    }
-    Ok(Some(request))
+    Ok(Some(crate::operations::restore_request(
+        job_id, recovered, spec, summaries,
+    )))
 }
 
 impl Pipeline {

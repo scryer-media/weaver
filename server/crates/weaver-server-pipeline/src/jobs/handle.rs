@@ -897,22 +897,16 @@ pub fn splice_job_order(
 }
 
 // The job events that take an owner's published jobs from `before` to
-// `after`: a job new to them is created, a job whose figures moved is paused,
-// resumed, or otherwise updated.
+// `after`: a job whose figures moved is paused, resumed, or otherwise
+// updated. A job new to them says nothing: every start publishes each of an
+// owner's jobs again, and only its add creates one (`created_owned_job`).
 fn owned_job_events(before: &[JobInfo], after: &[JobInfo]) -> Vec<PipelineEvent> {
     let before: HashMap<JobId, &JobInfo> = before.iter().map(|job| (job.job_id, job)).collect();
     after
         .iter()
         .filter_map(|job| {
             let job_id = job.job_id;
-            let Some(was) = before.get(&job_id) else {
-                return Some(PipelineEvent::JobCreated {
-                    job_id,
-                    name: job.name.clone(),
-                    total_files: job.total_files,
-                    total_bytes: job.total_bytes,
-                });
-            };
+            let was = before.get(&job_id)?;
             let paused = |job: &JobInfo| job.status == JobStatus::Paused;
             match (paused(was), paused(job)) {
                 _ if *was == job => None,
@@ -1233,6 +1227,17 @@ impl SchedulerHandle {
         for event in self.state.publish_class_job(protocol, job) {
             let _ = self.event_tx.send(event);
         }
+    }
+
+    // A job a class added is created, once, by its add. A restart that
+    // brings it back only publishes it.
+    pub fn created_owned_job(&self, job: &JobInfo) {
+        let _ = self.event_tx.send(PipelineEvent::JobCreated {
+            job_id: job.job_id,
+            name: job.name.clone(),
+            total_files: job.total_files,
+            total_bytes: job.total_bytes,
+        });
     }
 
     // A job another owner finished joins the finished jobs, once, and its

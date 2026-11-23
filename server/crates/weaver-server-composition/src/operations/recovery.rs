@@ -209,7 +209,6 @@ pub fn restore_request(
             runtime,
             summaries,
             created_at_epoch_ms: recovered.created_at as f64 * 1000.0,
-            reentry: false,
             outline_pending: false,
             on_disk: false,
         }),

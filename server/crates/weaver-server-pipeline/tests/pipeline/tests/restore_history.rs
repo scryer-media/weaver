@@ -2466,3 +2466,53 @@ async fn a_failed_job_whose_folder_release_outlasts_the_shutdown_bound_is_still_
         "the failure is recorded before the pipeline is down"
     );
 }
+
+// A restart puts the queue's jobs back without creating them again: the one
+// JobCreated a job raises is its add's. Each start that raised another left
+// one more in the job's event log, and closed its download finalization.
+#[tokio::test]
+async fn a_restart_does_not_create_its_restored_jobs_again() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    let id = JobId(30101);
+    let spec = segmented_job_spec("Restarted", "payload.bin", &[100]);
+    let nzb = nzb_zstd_for(&spec);
+    let added = handle(&pipeline);
+    let mut events = added.subscribe_events();
+    added
+        .add_job(id, spec, PathBuf::from("restarted.nzb"), nzb)
+        .await
+        .unwrap();
+    apply_intents(&mut pipeline).await;
+    assert!(
+        matches!(events.recv().await.unwrap(), PipelineEvent::JobCreated { job_id, .. } if job_id == id)
+    );
+    retire_pipeline_database(pipeline).await;
+
+    let (mut pipeline, intermediate, _) = new_direct_pipeline(&temp).await;
+    let restarted = handle(&pipeline);
+    let mut events = restarted.subscribe_events();
+    let recovered = weaver_server_composition::operations::recover_server_state(
+        database(&pipeline),
+        &temp.path().join("data"),
+        &intermediate,
+    )
+    .await
+    .unwrap();
+    assert!(recovered.to_restore.iter().any(|c| c.job_id == id));
+    for candidate in recovered.to_restore {
+        restarted.restore_job(candidate.request).await.unwrap();
+    }
+    weaver_server_pipeline::pipeline::tests::window_fixture::settle(&mut pipeline).await;
+    assert!(
+        installed_spec(&pipeline, id).is_some(),
+        "the job is installed again"
+    );
+    while let Ok(event) = events.try_recv() {
+        assert!(
+            !matches!(event, PipelineEvent::JobCreated { .. }),
+            "a restart raised {event:?}"
+        );
+    }
+    retire_pipeline_database(pipeline).await;
+}

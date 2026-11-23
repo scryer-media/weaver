@@ -517,7 +517,7 @@ impl TorrentService {
                     Err(error) => self.fail(job_id, error).await,
                 }
                 self.inner.counters.event(TorrentEvent::Added);
-                self.publish_job(job_id).await;
+                self.publish_added(job_id).await;
                 Ok(job_id)
             }
             AddSource::Magnet(uri) => {
@@ -581,7 +581,7 @@ impl TorrentService {
                 self.spawn_resolve(job_id, plan, uri, None, identity, terms)
                     .await;
                 self.inner.counters.event(TorrentEvent::Added);
-                self.publish_job(job_id).await;
+                self.publish_added(job_id).await;
                 Ok(job_id)
             }
         }

@@ -576,6 +576,17 @@ impl TorrentService {
     // state update for the torrents that changed). The exporter's reading
     // takes it at the next publish of every torrent.
     pub async fn publish_job(&self, job_id: JobId) {
+        self.publish_job_as(job_id, false).await;
+    }
+
+    // `publish_job` for the torrent an add just put in place: the add is
+    // what creates its job, once. A start publishes it again and says
+    // nothing of it.
+    pub(super) async fn publish_added(&self, job_id: JobId) {
+        self.publish_job_as(job_id, true).await;
+    }
+
+    async fn publish_job_as(&self, job_id: JobId, added: bool) {
         let now = self.inner.clock.unix_ms();
         let stamp = self.inner.snapshot.stamp();
         let view = self.torrent(job_id).await;
@@ -585,10 +596,14 @@ impl TorrentService {
         };
         if let Some(view) = view {
             let status = job_status(&view);
-            queue.publish_owned_job(
-                crate::jobs::Protocol::Torrent,
-                report(view, status, now).job_info(),
-            );
+            let job = report(view, status, now).job_info();
+            // Created once it is in the queue, so a reader of the event
+            // finds its row.
+            let created = added.then(|| job.clone());
+            queue.publish_owned_job(crate::jobs::Protocol::Torrent, job);
+            if let Some(job) = created {
+                queue.created_owned_job(&job);
+            }
         }
     }
 

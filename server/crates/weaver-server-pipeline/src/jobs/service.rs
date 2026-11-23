@@ -943,9 +943,7 @@ impl Pipeline {
             }
         };
         let original = request.clone();
-        let created = restart
-            .as_ref()
-            .map(|read| (read.created_at_epoch_ms, read.reentry));
+        let created = restart.as_ref().map(|read| read.created_at_epoch_ms);
         let stored = restart.map(|read| read.runtime);
         let blocked_with = (server_attribution.clone(), support_facts.clone());
         match self.restore_job_inner(
@@ -1164,9 +1162,8 @@ impl Pipeline {
         &mut self,
         request: RestoreJobRequest,
         restored: RestoredFacts,
-        // When the job was added, as its row stores it, and whether it is
-        // entering the queue window again rather than arriving.
-        created: Option<(f64, bool)>,
+        // When the job was added, as its row stores it.
+        created: Option<f64>,
         server_attribution: crate::jobs::server_attribution::JobServerAttribution,
         support_facts: crate::jobs::support_facts::JobSupportFacts,
     ) -> Result<(), crate::SchedulerError> {
@@ -1292,14 +1289,8 @@ impl Pipeline {
             .then_some(paused_resume_status)
             .flatten();
 
-        if !created.is_some_and(|(_, reentry)| reentry) {
-            self.emit_job_event(PipelineEvent::JobCreated {
-                job_id,
-                name: spec.name.clone(),
-                total_files: spec.files.len() as u32,
-                total_bytes: spec.total_bytes,
-            });
-        }
+        // A restored job was created once, when it was added; a restart or
+        // a return to the queue window says nothing of it again.
 
         // Resolve the category's shared decoded-byte counter once, here, so the
         // per-segment accounting site does a single `Relaxed` `fetch_add`
@@ -1385,8 +1376,7 @@ impl Pipeline {
             }),
             articles,
             created_at: std::time::Instant::now(),
-            created_at_epoch_ms: created
-                .map_or_else(crate::jobs::model::epoch_ms_now, |(at, _)| at),
+            created_at_epoch_ms: created.unwrap_or_else(crate::jobs::model::epoch_ms_now),
             queued_repair_at_epoch_ms,
             queued_extract_at_epoch_ms,
             paused_resume_status: paused_resume_status.clone(),

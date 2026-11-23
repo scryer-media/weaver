@@ -394,9 +394,6 @@ pub struct RestartRead {
     pub summaries: crate::jobs::model::FileSummaries,
     // When the job was added, as its row stores it.
     pub created_at_epoch_ms: f64,
-    // The job is entering the queue window again, not arriving: it raises
-    // no creation event.
-    pub reentry: bool,
     // The job has no stored NZB outline yet: it holds no file, and its
     // install reads its stored NZB once and stores the outline it reads. It
     // installs wherever it stands, so its row says what it holds; one out
