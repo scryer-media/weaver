@@ -103,26 +103,34 @@ export const test = base.extend<WeaverFixtures>({
       }
     });
     page.on("response", (response) => {
+      const request = response.request();
+      // The browser client asks for a session CSRF value on load; a server
+      // on the loginless access model answers 404 by contract, and the client
+      // falls back to its entry-page cookie.
+      const legacyCsrfProbe = response.status() === 404
+        && request.method() === "GET"
+        && new URL(response.url()).pathname.endsWith("/api/auth/csrf");
+      if (response.status() >= 400 && !legacyCsrfProbe) {
+        httpErrors.push({
+          method: request.method().toUpperCase(),
+          pathname: new URL(response.url()).pathname,
+          status: response.status(),
+          url: response.url(),
+        });
+      }
+    });
+    // A GraphQL body is read only once the request has finished, when the
+    // whole body is held. Read at its headers, a body that never completes
+    // (the page moved on, the request was cut) leaves the read pending, and
+    // teardown waits on it until the suite's deadline, hiding the test's
+    // own error. A request that never finishes fires requestfailed instead.
+    page.on("requestfinished", (request) => {
       responseInspections.push((async () => {
-        const request = response.request();
-        // The browser client asks for a session CSRF value on load; a server
-        // on the loginless access model answers 404 by contract, and the client
-        // falls back to its entry-page cookie.
-        const legacyCsrfProbe = response.status() === 404
-          && request.method() === "GET"
-          && new URL(response.url()).pathname.endsWith("/api/auth/csrf");
-        if (response.status() >= 400 && !legacyCsrfProbe) {
-          httpErrors.push({
-            method: request.method().toUpperCase(),
-            pathname: new URL(response.url()).pathname,
-            status: response.status(),
-            url: response.url(),
-          });
-        }
+        const response = await request.response();
         if (
-          response.status() >= 400
-          ||
-          request.method() !== "POST"
+          response === null
+          || response.status() >= 400
+          || request.method() !== "POST"
           || !response.url().includes("/graphql")
           || !/application\/(graphql-response\+)?json/.test(response.headers()["content-type"] ?? "")
         ) {
