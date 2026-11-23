@@ -35,7 +35,7 @@ export type DnsProfile = {
   usedByProxies: number;
 };
 /** A profile as a route's DNS select reads it: System and the route profiles, read by kind. */
-export type DnsProfileChoice = Pick<DnsProfile, "id" | "name" | "who" | "transit" | "trust" | "systemFallback">;
+export type DnsProfileChoice = Pick<DnsProfile, "id" | "name" | "who" | "trust" | "systemFallback">;
 /** A profile as a proxy's editor offers it: its name alone, System and the proxy name profiles, read by kind. */
 export type DnsProfileName = Pick<DnsProfile, "id" | "name">;
 /** What a profile's editor starts from. A proxy name profile has no transit and no system fallback. */
@@ -577,16 +577,43 @@ export function routeCaption(
     .join(", ");
 }
 
+/** A route profile as the network flow draws it: who asks, from where, how it is checked, and the list it asks. */
+export type FlowDnsProfile = Pick<DnsProfile, "id" | "name" | "who" | "transit" | "trust" | "serverListId" | "systemFallback">;
+/** A server list as the network flow draws it: its name and the servers on it. */
+export type FlowDnsList = Pick<DnsServerList, "id" | "name" | "servers">;
+
+/** Who answers the lookup the flow draws. */
+export type LookupAsker = "HOST" | "WEAVER" | "PROXY";
+/** Why a leg looks nothing up, so that its connections fail. */
+export type LookupRefusal = "NO_PROXY" | "NO_TUNNEL_DNS" | "ONLY_WIREGUARD_VALIDATES";
+/** Where a lookup is answered. */
+export type LookupDestination =
+  | { kind: "host" }
+  | { kind: "list"; id: number | null }
+  | { kind: "tunnel"; proxyId: number }
+  | { kind: "proxy"; proxyId: number | null; poolId: number | null };
+
 /**
- * Where a leg's names are looked up, as its route's DNS profile has it: from
- * the egress (the host's resolver, or Weaver asking its listed servers), at or
- * through the proxy carrying the leg now, or nowhere, for a profile that hands
- * names to a proxy on a leg with none and no fallback to the host.
+ * A leg's lookups as its route's DNS profile has them, the way the tunnel
+ * engine rules them for the route's own endpoint. `at` is the box the lookup
+ * leaves from: the leg itself for the host's resolver (or a lookup refused
+ * for want of a proxy), its egress for Weaver asking a list from there, and
+ * the proxy carrying the leg now for anything asked at or through it.
  */
-export type LegResolver =
-  | { at: "egress"; by: "HOST" | "SERVERS"; profile: string }
-  | { at: "proxy"; by: "PROXY" | "SERVERS"; profile: string; proxyId: number | null; poolId: number | null }
-  | { at: "none" };
+export type LegLookup = {
+  at: "leg" | "egress" | "proxy";
+  /** Null when the lookup is refused. */
+  asker: LookupAsker | null;
+  refused: LookupRefusal | null;
+  /** The host answers only because the leg has no proxy to hand the name to. */
+  fallback: boolean;
+  /** Weaver checks the answer's DNSSEC. */
+  validates: boolean;
+  /** The proxy the leg leaves through now, when the lookup is at it. */
+  exit: { proxyId: number | null; poolId: number | null } | null;
+  /** Null when the lookup is refused. */
+  destination: LookupDestination | null;
+};
 
 /** The proxy the leg leaves through now: the last hop of a chain, a pool's chosen member. Null when it goes direct. */
 function activeExit(leg: LegFlow): { proxyId: number | null; poolId: number | null } | null {
@@ -598,14 +625,64 @@ function activeExit(leg: LegFlow): { proxyId: number | null; poolId: number | nu
   return { proxyId: leg.selectedProxyId ?? null, poolId: rung.poolId };
 }
 
-export function legResolver(leg: LegFlow, profile: DnsProfileChoice): LegResolver {
+/**
+ * Where `leg`'s names are looked up under `profile`, given the proxies by id.
+ * A proxy whose kind is not known (a pool that has chosen no member yet) is
+ * taken as handed the name.
+ */
+export function legLookup(
+  leg: LegFlow,
+  profile: FlowDnsProfile,
+  proxies: readonly { id: number; kind: ProxyKind; dnsServers: string[] }[],
+): LegLookup {
   const exit = activeExit(leg);
-  if (profile.who === "SYSTEM") return { at: "egress", by: "HOST", profile: profile.name };
-  if (profile.who === "PROXY") {
-    if (exit) return { at: "proxy", by: "PROXY", profile: profile.name, ...exit };
-    return profile.systemFallback ? { at: "egress", by: "HOST", profile: profile.name } : { at: "none" };
+  const none = { refused: null, fallback: false, validates: false, exit: null };
+  if (profile.who === "SYSTEM") {
+    return { ...none, at: "leg", asker: "HOST", destination: { kind: "host" } };
   }
-  return exit && profile.transit === "PROXY"
-    ? { at: "proxy", by: "SERVERS", profile: profile.name, ...exit }
-    : { at: "egress", by: "SERVERS", profile: profile.name };
+  const validates = profile.trust === "VALIDATE";
+  if (profile.who === "WEAVER") {
+    const through = exit !== null && profile.transit === "PROXY";
+    return {
+      ...none,
+      at: through ? "proxy" : "egress",
+      asker: "WEAVER",
+      validates,
+      exit: through ? exit : null,
+      destination: { kind: "list", id: profile.serverListId },
+    };
+  }
+  if (!exit) {
+    return profile.systemFallback
+      ? { ...none, at: "leg", asker: "HOST", fallback: true, destination: { kind: "host" } }
+      : { ...none, at: "leg", asker: null, refused: "NO_PROXY", destination: null };
+  }
+  const proxy = proxies.find((candidate) => candidate.id === exit.proxyId);
+  if (proxy?.kind === "WIRE_GUARD") {
+    // Weaver asks the tunnel's own servers through it, checked as the profile says.
+    return proxy.dnsServers.length
+      ? { ...none, at: "proxy", asker: "WEAVER", validates, exit, destination: { kind: "tunnel", proxyId: proxy.id } }
+      : { ...none, at: "proxy", asker: null, refused: "NO_TUNNEL_DNS", exit, destination: null };
+  }
+  // A stream proxy resolves the name itself, out of Weaver's sight, so nothing can check it.
+  return proxy && validates
+    ? { ...none, at: "proxy", asker: null, refused: "ONLY_WIREGUARD_VALIDATES", exit, destination: null }
+    : { ...none, at: "proxy", asker: "PROXY", exit, destination: { kind: "proxy", ...exit } };
+}
+
+/**
+ * How a list's servers are asked, as the flow writes it on the line: DoT,
+ * DoH or both when every server is encrypted, and null when any is plain.
+ */
+export function listWire(list: Pick<DnsServerList, "servers"> | undefined): "TLS" | "HTTPS" | "MIXED" | null {
+  const wires = new Set(list?.servers.map((server) => server.wire) ?? []);
+  if (wires.size === 0 || wires.has("PLAIN")) return null;
+  return wires.size === 2 ? "MIXED" : wires.has("TLS") ? "TLS" : "HTTPS";
+}
+
+/** A server as the flow's pill names it: its address, or a DoH server's host and path. */
+export function serverPill(server: DnsServer): string {
+  if (server.wire !== "HTTPS") return server.address;
+  const url = server.url ?? "";
+  return url.replace(/^https:\/\//i, "").replace(/\/dns-query$/i, "");
 }

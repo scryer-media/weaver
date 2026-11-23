@@ -2,13 +2,15 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useQuery } from "urql";
+import { FLOW_DNS_QUERY } from "@/graphql/dns";
 import { useTranslate } from "@/lib/context/translate-context";
+import type { FlowDnsList, FlowDnsProfile } from "@/lib/dns";
 import type { NetworkFlow as Flow } from "@/lib/networking";
 import { DetailBlock } from "../../components/chrome";
 import { SecondaryButton } from "../../components/controls";
 import { Dialog } from "../../components/Dialog";
 import { useNetworkingWorkspace } from "./data";
-import { useRouteDnsProfiles } from "./dns-choices";
 import { FlowEditor } from "./FlowEditor";
 import { NetworkFlow, type FlowTarget } from "./NetworkFlow";
 
@@ -41,8 +43,16 @@ export function JobRouteFlow({
   const t = useTranslate();
   const workspace = useNetworkingWorkspace("overview");
   const { data, error, flow, consumers, egresses, profiles, pools, action, busy, message, retry } = workspace;
-  // Where each leg's names are looked up is drawn under it.
-  const dns = useRouteDnsProfiles();
+  // Where each leg's names are looked up, and what answers them.
+  const [dnsRead, readDns] = useQuery<{ dnsServerLists: FlowDnsList[]; dnsProfiles: FlowDnsProfile[] }>({
+    query: FLOW_DNS_QUERY,
+    // Read once the networking settings are, so a reader who may not see them asks for nothing.
+    pause: !data,
+  });
+  const dns = useMemo(
+    () => (dnsRead.data ? { profiles: dnsRead.data.dnsProfiles, lists: dnsRead.data.dnsServerLists } : undefined),
+    [dnsRead.data],
+  );
   const [enlarged, setEnlarged] = useState(false);
   const [editing, setEditing] = useState<FlowTarget | null>(null);
 
@@ -146,6 +156,7 @@ export function JobRouteFlow({
           action={action}
           busy={busy}
           proxyEditor={(id, onClose) => proxyEditor(id, onClose, retry)}
+          onDnsChanged={() => readDns({ requestPolicy: "network-only" })}
         />
       ) : null}
     </DetailBlock>

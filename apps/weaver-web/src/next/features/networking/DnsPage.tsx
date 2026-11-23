@@ -271,6 +271,63 @@ export function DnsPage() {
   );
 }
 
+/**
+ * A route DNS profile's or a server list's editor, opened from the network
+ * flow: the one the DNS page opens for it, saving the same way. The built-in
+ * profile is never edited, so it opens nothing. `onChanged` hears every
+ * change that landed.
+ */
+export function DnsFlowEditor({
+  target,
+  onClose,
+  onChanged,
+}: {
+  target: { kind: "dnsProfile" | "dnsList"; id: number };
+  onClose: () => void;
+  onChanged?: () => void;
+}) {
+  const t = useTranslate();
+  const client = useClient();
+  const [{ data }] = useQuery<DnsData>({ query: DNS_QUERY, requestPolicy: "cache-and-network" });
+  const [busy, setBusy] = useState(false);
+  const refusal = useNamedRefusal();
+  const action = useCallback<DnsAction>(
+    async (document, variables, onData) => {
+      setBusy(true);
+      try {
+        const result = await client.mutation(document, variables).toPromise();
+        const failure = result.error ? await refusal(result.error) : null;
+        if (failure === null) {
+          onData?.(result.data);
+          onChanged?.();
+        }
+        return failure;
+      } catch (caught) {
+        return caught instanceof Error ? caught.message : t("next.networking.requestFailed");
+      } finally {
+        setBusy(false);
+      }
+    },
+    [client, onChanged, refusal, t],
+  );
+  if (!data) return null;
+  if (target.kind === "dnsList") {
+    const list = data.dnsServerLists.find((candidate) => candidate.id === target.id);
+    return list ? <DnsListEditor list={list} action={action} busy={busy} onClose={onClose} /> : null;
+  }
+  const profile = data.routeProfiles.find((candidate) => candidate.id === target.id && !candidate.builtIn);
+  return profile ? (
+    <DnsProfileEditor
+      profile={{ ...profile, kind: "ROUTE" }}
+      kind="ROUTE"
+      lists={data.dnsServerLists}
+      action={action}
+      busy={busy}
+      onClose={onClose}
+    />
+  ) : null;
+}
+
 /** One server list in its editor, with a test of what each server supports. */
 function DnsListEditor({
   list,

@@ -6,7 +6,9 @@ import { test } from "node:test";
 import {
   MAX_DNS_SERVERS,
   capabilityTable,
-  legResolver,
+  legLookup,
+  listWire,
+  serverPill,
   dnsProfileName,
   dnsWhoKey,
   dnsRouteProblem,
@@ -66,7 +68,7 @@ test("each DNS read asks for one kind of profile, and only the fields its caller
     },
   });
   assert.deepEqual(profileReads(DNS_PROFILE_CHOICES_QUERY), {
-    dnsProfiles: { kind: "ROUTE", fields: ["id", "name", "who", "transit", "trust", "systemFallback"] },
+    dnsProfiles: { kind: "ROUTE", fields: ["id", "name", "who", "trust", "systemFallback"] },
   });
   assert.deepEqual(profileReads(DNS_PROFILE_NAMES_QUERY), { dnsProfiles: { kind: "PROXY_NAME", fields: ["id", "name"] } });
 });
@@ -427,23 +429,53 @@ test("a leg's names are looked up where its route's profile says, through the pr
     path: { kind: "LADDER", directFallback: true, rungs: [
       { kind: "CHAIN", proxyId: null, poolId: null, chainIds: [5, 6] },
       { kind: "POOL", proxyId: null, poolId: 9, chainIds: [] },
+      { kind: "PROXY", proxyId: 7, poolId: null, chainIds: [] },
     ] },
   };
   const direct: LegFlow = { ...base, path: { kind: "DIRECT", rungs: [], directFallback: false } };
-  const profile = (who: "SYSTEM" | "PROXY" | "WEAVER", transit: "EGRESS" | "PROXY" | null, systemFallback = false) =>
-    ({ id: 1, name: "P", who, transit, trust: "AS_SENT" as const, systemFallback });
+  const proxies = [
+    { id: 6, kind: "SOCKS5" as const, dnsServers: [] },
+    { id: 7, kind: "WIRE_GUARD" as const, dnsServers: [] },
+    { id: 11, kind: "WIRE_GUARD" as const, dnsServers: ["10.64.0.1"] },
+  ];
+  const profile = (who: "SYSTEM" | "PROXY" | "WEAVER", transit: "EGRESS" | "PROXY" | null, trust: "AS_SENT" | "VALIDATE" = "AS_SENT", systemFallback = false) =>
+    ({ id: 1, name: "P", who, transit, trust, serverListId: 4, systemFallback });
+  const none = { refused: null, fallback: false, validates: false, exit: null };
+  const pick = (leg: LegFlow, who: "SYSTEM" | "PROXY" | "WEAVER", transit: "EGRESS" | "PROXY" | null, trust?: "AS_SENT" | "VALIDATE", fallback?: boolean) =>
+    legLookup(leg, profile(who, transit, trust, fallback), proxies);
 
-  assert.deepEqual(legResolver(base, profile("SYSTEM", null)), { at: "egress", by: "HOST", profile: "P" });
-  // A chain hands the name to its last hop.
-  assert.deepEqual(legResolver(base, profile("PROXY", null)), { at: "proxy", by: "PROXY", profile: "P", proxyId: 6, poolId: null });
-  // A pool's chosen member, once the leg is on that rung.
-  assert.deepEqual(legResolver({ ...base, selectedRung: 1, selectedProxyId: 11 }, profile("WEAVER", "PROXY")), {
-    at: "proxy", by: "SERVERS", profile: "P", proxyId: 11, poolId: 9,
+  assert.deepEqual(pick(base, "SYSTEM", null), { ...none, at: "leg", asker: "HOST", destination: { kind: "host" } });
+  // Weaver's list, from the egress even on a proxied leg, or through the proxy carrying it now.
+  assert.deepEqual(pick(base, "WEAVER", "EGRESS", "VALIDATE"), {
+    ...none, at: "egress", asker: "WEAVER", validates: true, destination: { kind: "list", id: 4 },
   });
-  // Gone direct past the ladder, Weaver's servers are asked from the egress.
-  assert.deepEqual(legResolver({ ...base, selectedRung: 2 }, profile("WEAVER", "PROXY")), { at: "egress", by: "SERVERS", profile: "P" });
-  assert.deepEqual(legResolver(base, profile("WEAVER", "EGRESS")), { at: "egress", by: "SERVERS", profile: "P" });
+  assert.deepEqual(pick({ ...base, selectedRung: 1, selectedProxyId: 11 }, "WEAVER", "PROXY"), {
+    ...none, at: "proxy", asker: "WEAVER", exit: { proxyId: 11, poolId: 9 }, destination: { kind: "list", id: 4 },
+  });
+  // Gone direct past the ladder, the list is asked from the egress.
+  assert.equal(pick({ ...base, selectedRung: 3 }, "WEAVER", "PROXY").at, "egress");
+  // A chain's last hop is handed the name; nothing can check what a stream proxy answers.
+  assert.deepEqual(pick(base, "PROXY", null), {
+    ...none, at: "proxy", asker: "PROXY", exit: { proxyId: 6, poolId: null }, destination: { kind: "proxy", proxyId: 6, poolId: null },
+  });
+  assert.equal(pick(base, "PROXY", null, "VALIDATE").refused, "ONLY_WIREGUARD_VALIDATES");
+  // A tunnel's own servers answer through it, and can be checked; a tunnel that lists none answers nothing.
+  assert.deepEqual(pick({ ...base, selectedRung: 1, selectedProxyId: 11 }, "PROXY", null, "VALIDATE"), {
+    ...none, at: "proxy", asker: "WEAVER", validates: true, exit: { proxyId: 11, poolId: 9 }, destination: { kind: "tunnel", proxyId: 11 },
+  });
+  assert.equal(pick({ ...base, selectedRung: 2 }, "PROXY", null).refused, "NO_TUNNEL_DNS");
   // Handed to a proxy on a leg with none: the host only when the profile falls back to it.
-  assert.deepEqual(legResolver(direct, profile("PROXY", null, true)), { at: "egress", by: "HOST", profile: "P" });
-  assert.deepEqual(legResolver(direct, profile("PROXY", null)), { at: "none" });
+  assert.deepEqual(pick(direct, "PROXY", null, "AS_SENT", true), { ...none, at: "leg", asker: "HOST", fallback: true, destination: { kind: "host" } });
+  assert.deepEqual(pick(direct, "PROXY", null), { ...none, at: "leg", asker: null, refused: "NO_PROXY", destination: null });
+});
+
+test("a list's line says DoT or DoH only when every server on it is encrypted", () => {
+  const server = (wire: "PLAIN" | "TLS" | "HTTPS") => ({ wire, address: "1.1.1.1", tlsName: null, url: "https://dns.example/dns-query" });
+  assert.equal(listWire({ servers: [server("TLS"), server("TLS")] }), "TLS");
+  assert.equal(listWire({ servers: [server("HTTPS")] }), "HTTPS");
+  assert.equal(listWire({ servers: [server("TLS"), server("HTTPS")] }), "MIXED");
+  assert.equal(listWire({ servers: [server("TLS"), server("PLAIN")] }), null);
+  assert.equal(listWire(undefined), null);
+  assert.equal(serverPill(server("HTTPS")), "dns.example");
+  assert.equal(serverPill(server("TLS")), "1.1.1.1");
 });

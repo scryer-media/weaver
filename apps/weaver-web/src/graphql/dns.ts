@@ -20,7 +20,9 @@ export const DNS_QUERY = gql`
   }
 `;
 /** What a route's DNS select offers, and what its in-form check needs. */
-export const DNS_PROFILE_CHOICES_QUERY = gql`query DnsProfileChoices { dnsProfiles(kind: ROUTE) { id name who transit trust systemFallback } }`;
+export const DNS_PROFILE_CHOICES_QUERY = gql`query DnsProfileChoices { dnsProfiles(kind: ROUTE) { id name who trust systemFallback } }`;
+/** What the network flow draws of DNS: each route profile's lookups, and the servers on the lists they ask. */
+export const FLOW_DNS_QUERY = gql`query FlowDns { dnsServerLists { id name servers { ${SERVER_FIELDS} } } dnsProfiles(kind: ROUTE) { id name who transit trust serverListId systemFallback } }`;
 /** What a proxy's "Find this proxy with" select and its "Found with" line show. */
 export const DNS_PROFILE_NAMES_QUERY = gql`query DnsProfileNames { dnsProfiles(kind: PROXY_NAME) { id name } }`;
 export const SAVE_DNS_SERVER_LIST = gql`mutation SaveDnsServerList($input:DnsServerListInput!) { saveDnsServerList(input:$input) { id } }`;
