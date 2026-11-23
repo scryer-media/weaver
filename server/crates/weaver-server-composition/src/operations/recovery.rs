@@ -918,7 +918,8 @@ mod tests {
             recover_server_state(&db, temp.path(), &temp.path().join("intermediate"))
                 .await
                 .unwrap();
-            assert!(db.load_nzb_admissions().unwrap().contains(&JobId(1)));
+            // The finished row stays, but holds no download slot.
+            assert!(!db.load_nzb_admissions().unwrap().contains(&JobId(1)));
             assert!(db.load_active_jobs().unwrap().contains_key(&JobId(1)));
             assert!(db.get_job_history(1).unwrap().is_none());
             execute_sql(&db, "DROP TRIGGER reject_recovery_history", vec![]);

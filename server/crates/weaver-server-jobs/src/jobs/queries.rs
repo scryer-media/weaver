@@ -171,12 +171,16 @@ pub fn load_nzb_pause_releases(db: &Database) -> Result<HashSet<JobId>, StateErr
     })
 }
 
+// The jobs holding a download slot. A finished row still in the table (its
+// archive at start-up failed) holds none: it downloads nothing, and counting
+// it would keep the slot from every job behind it.
 pub fn load_nzb_admissions(db: &Database) -> Result<HashSet<JobId>, StateError> {
     let datastore = db.datastore();
     db.run_sql_blocking_read(async move {
         SqlRuntime::fetch_all(
             datastore.read_exec(),
-            "SELECT job_id FROM active_jobs WHERE nzb_admitted = 1",
+            "SELECT job_id FROM active_jobs WHERE nzb_admitted = 1 \
+             AND status NOT IN ('complete', 'partial', 'failed', 'cancelled')",
             &[],
         )
         .await?
