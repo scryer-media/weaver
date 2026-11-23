@@ -153,7 +153,7 @@ async fn test_require_downloader_from_prefer_seeder_is_encrypted() -> anyhow::Re
 // later, is shown in `session::incoming_tests` over a paused clock.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_prefer_downloader_tries_a_require_seeder_plain_first() -> anyhow::Result<()> {
-    use crate::session_stats::incoming::IncomingEnd;
+    use crate::session_stats::incoming::{EncryptionEnd, IncomingEnd};
     setup_test_logging();
     let t = TestTorrent::new("test_mse_prefer_vs_require", FILE_SIZE, PIECE_LENGTH).await?;
     let (seeder, seeder_addr) = seed(&t, EncryptionPolicy::Require).await?;
@@ -171,6 +171,25 @@ async fn test_prefer_downloader_tries_a_require_seeder_plain_first() -> anyhow::
     while refused() == 0 {
         tokio::task::yield_now().await;
     }
+    // Each is counted by its cause: a plaintext connection where encryption
+    // is required, and no other.
+    let incoming = seeder.stats.incoming.snapshot();
+    let by_cause = |cause: EncryptionEnd| -> u64 {
+        incoming
+            .encryption
+            .iter()
+            .map(|causes| causes[cause as usize])
+            .sum()
+    };
+    assert!(
+        by_cause(EncryptionEnd::PlaintextRefused) >= 1,
+        "{incoming:?}"
+    );
+    assert_eq!(
+        incoming.encryption.iter().flatten().sum::<u64>(),
+        by_cause(EncryptionEnd::PlaintextRefused),
+        "{incoming:?}"
+    );
     let stats = encryption_stats(&d.session);
     assert!(stats.plaintext >= 1, "{stats:?}");
     assert_eq!(stats.failures, 0, "{stats:?}");

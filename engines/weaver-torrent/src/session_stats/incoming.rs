@@ -132,10 +132,58 @@ impl Already {
     }
 }
 
+counted! {
+    /// Why a connection counted as [`IncomingEnd::Encryption`] ended.
+    EncryptionEnd {
+        /// The encrypted handshake named a torrent the session does not have.
+        UnknownTorrent => "unknown_torrent",
+        /// The peer closed the connection before the handshake was whole.
+        Closed => "closed",
+        /// The socket erred.
+        Io => "io",
+        /// The handshake did not come whole in time.
+        Timeout => "timeout",
+        /// Nothing in the padding window marked where the handshake goes on.
+        NoSync => "no_sync",
+        /// A plaintext connection, where encryption is required.
+        PlaintextRefused => "plaintext_refused",
+        /// The peer offered no method the session allows.
+        NoCommonMethod => "no_common_method",
+        /// The handshake was not a valid one: its key, its verification
+        /// constant or a length in it.
+        Malformed => "malformed",
+        /// The BitTorrent handshake greeted another torrent than the
+        /// encryption handshake named.
+        TorrentMismatch => "torrent_mismatch",
+    }
+}
+
+impl EncryptionEnd {
+    /// How an encryption handshake that failed is counted.
+    pub(crate) fn of(error: &crate::mse::MseError) -> Self {
+        use crate::mse::MseError as E;
+        match error {
+            E::UnknownInfoHash => Self::UnknownTorrent,
+            E::Closed { .. } => Self::Closed,
+            E::Io { .. } => Self::Io,
+            E::Timeout => Self::Timeout,
+            E::NotSynchronised { .. } => Self::NoSync,
+            E::PlaintextRefused => Self::PlaintextRefused,
+            E::NoCommonMethod { .. } => Self::NoCommonMethod,
+            E::InvalidPublicKey
+            | E::BadVerificationConstant
+            | E::PadTooLong(_)
+            | E::BadSelect { .. }
+            | E::PayloadTooLong(_) => Self::Malformed,
+        }
+    }
+}
+
 /// The incoming-connection counts of one session.
 #[derive(Debug, Default)]
 pub struct IncomingStats {
     ends: [Tally<{ IncomingEnd::COUNT }>; Transport::COUNT],
+    encryption: [Tally<{ EncryptionEnd::COUNT }>; Transport::COUNT],
     already: [Tally<{ Already::COUNT }>; Transport::COUNT],
 }
 
@@ -152,9 +200,16 @@ impl IncomingStats {
         add(&self.already[transport as usize], already.index(), 1);
     }
 
+    /// A connection counted as [`IncomingEnd::Encryption`]: why it ended.
+    #[inline]
+    pub fn encryption(&self, transport: Transport, end: EncryptionEnd) {
+        add(&self.encryption[transport as usize], end as usize, 1);
+    }
+
     pub fn snapshot(&self) -> IncomingSnapshot {
         IncomingSnapshot {
             ends: self.ends.each_ref().map(read),
+            encryption: self.encryption.each_ref().map(read),
             already: self.already.each_ref().map(read),
         }
     }
@@ -165,6 +220,8 @@ impl IncomingStats {
 pub struct IncomingSnapshot {
     /// By [`Transport`], then [`IncomingEnd`].
     pub ends: [[u64; IncomingEnd::COUNT]; Transport::COUNT],
+    /// By [`Transport`], then [`EncryptionEnd`].
+    pub encryption: [[u64; EncryptionEnd::COUNT]; Transport::COUNT],
     /// By [`Transport`], then [`Already::index`].
     pub already: [[u64; Already::COUNT]; Transport::COUNT],
 }

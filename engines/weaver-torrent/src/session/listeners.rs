@@ -16,7 +16,7 @@ use crate::tracker::Unreachable;
 use crate::{
     listen::PeerAcceptor,
     read_buf::ReadBuf,
-    session_stats::incoming::IncomingEnd,
+    session_stats::incoming::{EncryptionEnd, IncomingEnd},
     stream_connect::{ConnectionKind, Link},
     torrent_state::{AddIncomingPeerResult, TorrentStateLive},
     type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite},
@@ -133,7 +133,10 @@ impl Session {
                 },
             )
             .await
-            .inspect_err(|_| refused(IncomingEnd::Encryption))
+            .inspect_err(|e| {
+                refused(IncomingEnd::Encryption);
+                self.stats.incoming.encryption(kind, EncryptionEnd::of(e));
+            })
             .context("error in the encryption handshake")?;
             (encryption, writer, None, skey)
         };
@@ -161,6 +164,9 @@ impl Session {
             && !torrent.info_hashes().answers_to(skey)
         {
             refused(IncomingEnd::Encryption);
+            self.stats
+                .incoming
+                .encryption(kind, EncryptionEnd::TorrentMismatch);
             bail!(
                 "the encryption handshake named {skey:?} and the BitTorrent handshake greets torrent {id}"
             );
