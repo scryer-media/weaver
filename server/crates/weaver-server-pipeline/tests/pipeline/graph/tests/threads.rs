@@ -3118,15 +3118,16 @@ async fn a_run_reading_a_volume_whose_repair_is_being_applied_waits_for_its_slic
             break;
         }
     }
-    assert!(!refused, "the run refused the volume its repair was landing on");
+    assert!(
+        !refused,
+        "the run refused the volume its repair was landing on"
+    );
     assert!(!ended, "the run ended before the repair landed");
     assert!(pipeline.graph_jobs[&job_id].applying_repair());
     for said in held {
         pipeline.graph_run_said(said);
     }
-    while pipeline.graph_jobs[&job_id].repair_out()
-        || pipeline.graph_jobs[&job_id].runs().live()
-    {
+    while pipeline.graph_jobs[&job_id].repair_out() || pipeline.graph_jobs[&job_id].runs().live() {
         let said = pipeline.graph_runs.recv().await.unwrap();
         pipeline.graph_run_said(said);
     }
