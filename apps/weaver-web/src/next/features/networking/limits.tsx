@@ -62,33 +62,38 @@ export function LimitControl({
 
 /**
  * How the global download limit is shared: usenet's percentage, torrents the
- * rest, or no split. Without a download limit the split stays editable and
- * says what it needs; its shares take effect once a download limit is set.
+ * rest, or no split. Without a download limit the split stays editable; its
+ * shares take effect once a download limit is set. The row it sits in says so,
+ * under its label, so the controls keep to one line.
  */
 export function SplitControl({
   value,
   onChange,
-  needsDownloadLimit,
+  needsDownloadLimit = false,
 }: {
   value: BandwidthSplit | null;
   onChange: (next: BandwidthSplit | null) => void;
-  needsDownloadLimit: boolean;
+  /**
+   * No global download limit is set, so there is nothing to share: a split
+   * that is off cannot be turned on. One already saved may still be turned off.
+   */
+  needsDownloadLimit?: boolean;
 }) {
   const t = useTranslate();
   const [last, setLast] = useState(value?.usenetPct ?? 50);
   const label = t("next.bandwidth.split");
   return (
     <div className="flex flex-wrap items-center justify-end gap-[10px]">
-      {needsDownloadLimit ? (
-        <span className="font-wv-mono text-[11px] text-wv-muted">{t("next.bandwidth.needsDownloadLimit")}</span>
-      ) : null}
       {value !== null ? (
         <>
+          {/* The share typed is usenet's; torrents take the rest, said after it. */}
+          <span className="font-wv-mono text-[11.5px] text-wv-secondary">{t("next.bandwidth.splitUsenet")}</span>
           <NumberField
             label={t("next.bandwidth.splitUsenet")}
             value={value.usenetPct}
             min={1}
             max={99}
+            narrow
             suffix="%"
             onChange={(next) => {
               setLast(next);
@@ -103,6 +108,7 @@ export function SplitControl({
       <Toggle
         checked={value !== null}
         label={label}
+        disabled={needsDownloadLimit && value === null}
         onChange={(on) => onChange(on ? { usenetPct: last } : null)}
       />
     </div>

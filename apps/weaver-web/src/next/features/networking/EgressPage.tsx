@@ -169,7 +169,8 @@ function useGlobalBandwidth(busy: boolean, message: string | null, failed: boole
   const split: FieldSpec = {
     id: "split",
     label: t("next.bandwidth.split"),
-    help: rates,
+    // Without a download limit there is nothing to share yet, and the row says so.
+    help: values?.downloadBps === null ? t("next.bandwidth.needsDownloadLimit") : rates,
     keywords: "split share usenet torrents bandwidth",
     control: {
       kind: "custom",

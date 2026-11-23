@@ -92,7 +92,7 @@ test("the global limits sit above the egress table, one per direction, and save 
   await page.close();
 });
 
-test("the split shares the download limit and stays editable without one", async () => {
+test("the split shares the download limit, stays editable without one, and cannot be turned on without one", async () => {
   const { page, errors } = await open("egress");
   const status = page.locator("#status");
   const limits = page.getByRole("region", { name: "Limits", exact: true });
@@ -128,22 +128,22 @@ test("the split shares the download limit and stays editable without one", async
   await status.filter({ hasText: /^clean Saved$/ }).waitFor();
   await limits.getByText("Usenet ↓", { exact: false }).waitFor({ state: "detached" });
 
-  // The split can be lifted and restored without setting a download limit.
+  // The split can be lifted without a download limit, but not turned back on.
   await split.click();
   await usenet.waitFor({ state: "detached" });
   await status.filter({ hasText: /^dirty/ }).waitFor();
   await page.evaluate(() => window.egressQuotaFixture.actions.current.save());
   await status.filter({ hasText: /^clean Saved$/ }).waitFor();
+  assert.equal(await split.isDisabled(), true);
+  // A download limit makes it selectable again, with the last share.
+  await limits.getByRole("switch", { name: "Download limit", exact: true }).click();
+  assert.equal(await split.isDisabled(), false);
   await split.click();
   await limits.getByText("Torrents 30%", { exact: true }).waitFor();
-  await status.filter({ hasText: /^dirty/ }).waitFor();
-  await page.evaluate(() => window.egressQuotaFixture.actions.current.save());
-  await status.filter({ hasText: /^clean Saved$/ }).waitFor();
   assert.deepEqual((await sent(page)).filter((entry) => entry.name === "SetBandwidth").map((entry) => entry.variables), [
     { input: { downloadBps: 25 * MIB, uploadBps: null, split: { usenetPct: 80 } } },
     { input: { downloadBps: null, uploadBps: null, split: { usenetPct: 70 } } },
     { input: { downloadBps: null, uploadBps: null, split: null } },
-    { input: { downloadBps: null, uploadBps: null, split: { usenetPct: 70 } } },
   ]);
   if (shot("split-needs-limit")) await limits.screenshot({ path: shot("split-needs-limit") });
   assert.equal(errors.length, 0, errors.join("\n"));

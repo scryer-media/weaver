@@ -768,6 +768,7 @@ export function NumberField({
   disabled,
   precision = 0,
   testId,
+  narrow,
 }: {
   value: number;
   onChange: (next: number) => void;
@@ -781,6 +782,8 @@ export function NumberField({
   /** Decimal places the committed value keeps. */
   precision?: number;
   testId?: string;
+  /** Room for two digits only, for a value such as a percentage. */
+  narrow?: boolean;
 }) {
   const [draft, setDraft] = useState<string | null>(null);
 
@@ -827,12 +830,12 @@ export function NumberField({
         }}
         className={cn(
           "h-full min-w-0 bg-transparent pl-3 font-wv-mono text-[12px] text-wv-fg outline-none",
-          suffix === undefined ? "flex-1 pr-3" : "w-[86px] flex-none",
+          suffix === undefined ? "flex-1 pr-3" : narrow ? "w-[42px] flex-none" : "w-[86px] flex-none",
           disabled && "text-wv-disabled",
         )}
       />
       {suffix === undefined ? null : (
-        <span className="flex-none pr-3 pl-2 font-wv-mono text-[11.5px] text-wv-muted">
+        <span className={cn("flex-none pr-3 font-wv-mono text-[11.5px] text-wv-muted", narrow ? "pl-0.5" : "pl-2")}>
           {suffix}
         </span>
       )}

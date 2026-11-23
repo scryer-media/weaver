@@ -101,7 +101,7 @@ export function useSpeedLimitDialog() {
       {/* Only torrents upload, and the split shares the download limit with them: both show with torrents. */}
       {torrentsOn && saved ? (
         <>
-          <FormRow label={t("next.bandwidth.split")}>
+          <FormRow label={t("next.bandwidth.split")} help={limit === null ? t("next.bandwidth.needsDownloadLimit") : undefined}>
             <SplitControl value={split} needsDownloadLimit={limit === null} onChange={setSplitEdit} />
           </FormRow>
           <FormRow label={t("next.speedLimit.upload")}>
