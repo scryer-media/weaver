@@ -669,8 +669,8 @@ impl TorrentService {
             .save_levels(job_id, torrent.reopens(&held), &asked)
             .await
             .map_err(|error| ActionError::State(state_error(error)))?;
-        if let Some(store) = &torrent.store
-            && let Err(error) = store.relevel(&ignored)
+        if let Some(store) = torrent.store.clone()
+            && let Err(error) = relevel_off(store, ignored).await
         {
             // A place stored back out of reach of the database stays
             // stored there, so the counter does not hand it out again.
@@ -728,10 +728,7 @@ impl TorrentService {
                 .map(|(level, file)| level.held_by(file.padding))
                 .collect();
             let ignored = ignored_of(&held);
-            let copying = Arc::clone(&store);
-            let copied = tokio::task::spawn_blocking(move || copying.relevel(&ignored))
-                .await
-                .unwrap_or_else(|error| Err(std::io::Error::other(error)));
+            let copied = relevel_off(Arc::clone(&store), ignored).await;
             let now = self.inner.clock.unix_ms();
             let next = 'next: {
                 self.ensure(&[job_id]).await;
@@ -1168,6 +1165,17 @@ impl TorrentService {
     pub fn sweeps_held(&self) -> watch::Receiver<u64> {
         self.inner.sweeps_held.subscribe()
     }
+}
+
+// `TorrentStore::relevel` off the runtime: it waits on the torrent's reads
+// and writes under way, and copies bytes when there are some to copy.
+pub(super) async fn relevel_off(
+    store: Arc<TorrentStore>,
+    ignored: Vec<bool>,
+) -> std::io::Result<()> {
+    tokio::task::spawn_blocking(move || store.relevel(&ignored))
+        .await
+        .unwrap_or_else(|error| Err(std::io::Error::other(error)))
 }
 
 // Resolves once `reloads` rings after it was last seen; never when nothing

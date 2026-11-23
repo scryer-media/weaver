@@ -637,8 +637,24 @@ impl TorrentService {
         let Some(made) = self.making(torrent, &global) else {
             return Ok(false);
         };
-        let (store, notes) = self
-            .store::<std::convert::Infallible>(job_id, made, Err)
+        // Off the runtime, as a restore makes it: it reads the database and
+        // the files. One that panics fails the torrent.
+        let making = {
+            let service = self.clone();
+            tokio::task::spawn_blocking(move || {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    service.store::<std::convert::Infallible>(job_id, made, Err)
+                }))
+                .unwrap_or_else(|_| {
+                    Err(Unmade::Fails(
+                        "making the torrent's store panicked".to_string(),
+                    ))
+                })
+            })
+        };
+        let (store, notes) = making
+            .await
+            .map_err(|error| error.to_string())?
             .map_err(|unmade| match unmade {
                 Unmade::Fails(error) => error,
                 Unmade::Waits(never) => match never {},
@@ -962,7 +978,7 @@ impl TorrentService {
                 if whole {
                     self.inner.signal.look(job_id);
                 }
-                let copy = self.catch_up_levels(torrent);
+                let copy = self.catch_up_levels(torrent).await;
                 (torrent.held.is_none() && !missing, copy)
             }
             None => {
@@ -982,7 +998,7 @@ impl TorrentService {
     // those of now: a change asked while it was made has the files it sets
     // aside, and, when that has bytes to copy out of the side store, the
     // copy to start, as a change of levels starts it.
-    fn catch_up_levels(
+    async fn catch_up_levels(
         &self,
         torrent: &mut Live,
     ) -> Option<(Arc<TorrentStore>, Vec<FilePriority>)> {
@@ -1010,8 +1026,9 @@ impl TorrentService {
             return Some((Arc::clone(store), asked));
         }
         // Nothing to copy: only which files are set aside changes, in
-        // memory.
-        if let Err(error) = store.relevel(&ignored) {
+        // memory. It waits on the torrent's reads and writes under way, so
+        // it runs off the runtime.
+        if let Err(error) = super::tick::relevel_off(Arc::clone(store), ignored).await {
             tracing::warn!(job_id = torrent.record.job_id.0, error = %error, "could not set a torrent's files aside");
         }
         None

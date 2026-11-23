@@ -162,20 +162,13 @@ async fn admission_leaves_out_unwanted_files_even_all_of_them_and_refuses_execut
     rig.service.stop().await;
 }
 
-// The magnet of `job_id` once its fetch has ended and left it held: a fetch
-// publishes as it ends.
+// The magnet of `job_id`, the service's first, once its fetch has ended and
+// left it held. A fetch's end rings after the hold is set; the published
+// figures do not move for a torrent no publish of every torrent has placed.
 async fn magnet_held(service: &TorrentService, job_id: JobId) {
-    let mut published = service.inner.published.subscribe();
-    loop {
-        published.borrow_and_update();
-        {
-            let live = service.inner.live.lock().await;
-            if live[&job_id].held.is_some() && live[&job_id].resolving.is_none() {
-                return;
-            }
-        }
-        published.changed().await.unwrap();
-    }
+    service.fetches_ended(1).await;
+    let live = service.inner.live.lock().await;
+    assert!(live[&job_id].held.is_some() && live[&job_id].resolving.is_none());
 }
 
 // A magnet is added whatever its route's state (libtorrent
