@@ -807,7 +807,12 @@ impl From<TorrentChanges> for TorrentChangesGql {
     fn from(changes: TorrentChanges) -> Self {
         Self {
             full_update: changes.full_update,
-            torrents: changes.torrents.into_iter().map(Into::into).collect(),
+            torrents: changes
+                .torrents
+                .into_iter()
+                .zip(changes.one_file)
+                .map(|(view, one_file)| Torrent::of(view, one_file))
+                .collect(),
             removed_ids: changes.removed.into_iter().map(|job_id| job_id.0).collect(),
         }
     }
