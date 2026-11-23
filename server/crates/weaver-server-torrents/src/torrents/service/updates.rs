@@ -46,6 +46,9 @@ pub struct TorrentChanges {
     pub full_update: bool,
     /// The torrents that changed or came, in the service's order.
     pub torrents: Vec<TorrentView>,
+    /// For each of `torrents`, whether it is one file named as the torrent
+    /// is: a list's view comes without its files, which would say.
+    pub one_file: Vec<bool>,
     /// The torrents gone since the last push.
     pub removed: Vec<JobId>,
 }
@@ -148,7 +151,12 @@ pub fn changes_of_rows(
         .collect();
     let before = last.replace(now);
     let now = last.as_ref().expect("just kept");
-    told(before, now, rows.iter().map(|row| &row.view), Clone::clone)
+    told(
+        before,
+        now,
+        rows.iter().map(|row| (&row.view, row.totals.one_file)),
+        Clone::clone,
+    )
 }
 
 // What `views` moved from `last` in the fields `parts` covers, kept as the
@@ -164,6 +172,10 @@ pub fn changes(
         .collect();
     let before = last.replace(now);
     let now = last.as_ref().expect("just kept");
+    let views = views.into_iter().map(|view| {
+        let one_file = view.is_one_file();
+        (view, one_file)
+    });
     told(before, now, views, std::convert::identity)
 }
 
@@ -173,16 +185,21 @@ pub fn changes(
 fn told<V>(
     before: Option<HashMap<JobId, u64>>,
     now: &HashMap<JobId, u64>,
-    views: impl IntoIterator<Item = V>,
+    views: impl IntoIterator<Item = (V, bool)>,
     owned: impl Fn(V) -> TorrentView,
 ) -> Option<TorrentChanges>
 where
     V: std::borrow::Borrow<TorrentView>,
 {
     let Some(before) = before else {
+        let (torrents, one_file) = views
+            .into_iter()
+            .map(|(view, one_file)| (owned(view), one_file))
+            .unzip();
         return Some(TorrentChanges {
             full_update: true,
-            torrents: views.into_iter().map(owned).collect(),
+            torrents,
+            one_file,
             removed: Vec::new(),
         });
     };
@@ -192,17 +209,18 @@ where
         .copied()
         .collect();
     removed.sort_unstable_by_key(|job_id| job_id.0);
-    let torrents: Vec<TorrentView> = views
+    let (torrents, one_file): (Vec<TorrentView>, Vec<bool>) = views
         .into_iter()
-        .filter(|view| {
+        .filter(|(view, _)| {
             let job_id = view.borrow().job_id;
             before.get(&job_id) != now.get(&job_id)
         })
-        .map(owned)
-        .collect();
+        .map(|(view, one_file)| (owned(view), one_file))
+        .unzip();
     (!torrents.is_empty() || !removed.is_empty()).then_some(TorrentChanges {
         full_update: false,
         torrents,
+        one_file,
         removed,
     })
 }

@@ -44,7 +44,16 @@ async fn one_view() -> TorrentView {
 fn copy(view: &TorrentView, id: u64) -> TorrentView {
     TorrentView {
         job_id: JobId(id),
-        name: format!("t{id}"),
+        // Every third is one file named as the torrent is, which a row's
+        // totals alone say.
+        name: match view.files.first() {
+            Some(file) if id.is_multiple_of(3) => file.path.clone(),
+            _ => format!("t{id}"),
+        },
+        files: match id % 3 {
+            0 => view.files.iter().take(1).cloned().collect(),
+            _ => view.files.clone(),
+        },
         ratio: (id % 13) as f64,
         ..view.clone()
     }
@@ -146,10 +155,11 @@ async fn the_snapshot_tells_each_follower_what_its_own_reading_would() {
         .collect();
     assert!(followers.iter().all(|follower| follower.ids.len() <= 500));
     let mut moved_told = 0;
+    let mut one_file_told = 0;
     for (step, views) in steps.iter().enumerate() {
         let rows: Vec<(TorrentView, FileTotals)> = views
             .iter()
-            .map(|view| (view.clone(), FileTotals::default()))
+            .map(|view| (view.clone(), FileTotals::of(view)))
             .collect();
         snapshot.replace_every(&rows);
         for follower in &mut followers {
@@ -165,6 +175,8 @@ async fn the_snapshot_tells_each_follower_what_its_own_reading_would() {
             let new = updates::changes_of_rows(&mut follower.new, &snapshot.rows_of(&follower.ids));
             assert_eq!(new, old, "step {step}, every {}", follower.every);
             if let Some(changes) = &new {
+                one_file_told += changes.one_file.iter().filter(|one| **one).count();
+                assert!(changes.one_file.iter().any(|one| !one) || changes.torrents.is_empty());
                 follower.told += 1;
                 moved_told += usize::from(!changes.full_update);
             }
@@ -172,6 +184,7 @@ async fn the_snapshot_tells_each_follower_what_its_own_reading_would() {
     }
     assert!(followers.iter().all(|follower| follower.told > 1));
     assert!(moved_told > 10);
+    assert!(one_file_told > 10);
 }
 
 // Twenty followers of a few torrents hear one tag change, read from the

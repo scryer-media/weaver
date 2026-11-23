@@ -163,7 +163,7 @@ struct Joining {
 impl TorrentService {
     // Everything but the tick, every stored torrent read before it ends.
     pub async fn open(&self) -> Result<(), String> {
-        let through = self.begin()?;
+        let through = self.begin().await?;
         self.load(through).await?;
         self.after_load().await;
         Ok(())
@@ -173,7 +173,7 @@ impl TorrentService {
     // the jobs and the settings, the tracker rules, and the last job a
     // torrent row has, by the table's key, which is as far as the load
     // reads. From here the stored torrents are being read.
-    pub(super) fn begin(&self) -> Result<Option<JobId>, String> {
+    pub(super) async fn begin(&self) -> Result<Option<JobId>, String> {
         if let Some(task) = self.inner.env.hear_alone() {
             *locked(&self.inner.hearing) = Some(task);
         }
@@ -183,8 +183,11 @@ impl TorrentService {
         self.spawn_follow_tags();
         self.spawn_follow_egress_limits();
         self.spawn_follow_interfaces();
-        self.load_rules()?;
-        let through = self.inner.db.last_torrent_job().map_err(state_error)?;
+        self.load_rules().await?;
+        let through = self
+            .db(|db| db.last_torrent_job())
+            .await
+            .map_err(state_error)?;
         self.inner.snapshot.unready();
         self.inner.load.send_replace(Load::Running(through));
         Ok(through)
@@ -193,8 +196,11 @@ impl TorrentService {
     // The stored torrents read, with no task of a start begun.
     #[cfg(any(test, feature = "test-support"))]
     pub async fn restore(&self) -> Result<(), String> {
-        self.load_rules()?;
-        let through = self.inner.db.last_torrent_job().map_err(state_error)?;
+        self.load_rules().await?;
+        let through = self
+            .db(|db| db.last_torrent_job())
+            .await
+            .map_err(state_error)?;
         self.inner.snapshot.unready();
         self.inner.load.send_replace(Load::Running(through));
         self.load(through).await
@@ -222,10 +228,11 @@ impl TorrentService {
 
     // The archive passwords every torrent may try, as the settings give
     // them now.
-    pub fn global_passwords(&self) -> Arc<[ArchivePasswordCandidate]> {
-        self.inner
-            .db
-            .global_archive_password_candidates()
+    pub async fn global_passwords(&self) -> Arc<[ArchivePasswordCandidate]> {
+        self.db(|db| Ok(db.global_archive_password_candidates()))
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|read| read.map_err(|error| error.to_string()))
             .unwrap_or_else(|error| {
                 tracing::warn!(error = %error, "could not load global archive passwords");
                 Vec::new()
@@ -586,17 +593,20 @@ impl TorrentService {
     // caller has the next settle look at it once the torrent is where a
     // settle finds it (libtorrent `piece_picker::is_finished` with every
     // piece filtered).
-    pub(super) fn give_metainfo(
+    pub(super) async fn give_metainfo(
         &self,
         torrent: &mut Live,
         parsed: &Parsed,
         left_out: &[usize],
     ) -> Result<bool, String> {
         let job_id = torrent.record.job_id;
-        let mut stored = self.inner.db.torrent_file_priorities(job_id).unwrap_or_else(|error| {
-            tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's file levels");
-            Vec::new()
-        });
+        let mut stored = self
+            .db(move |db| db.torrent_file_priorities(job_id))
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's file levels");
+                Vec::new()
+            });
         if !left_out.is_empty() {
             let left_out: HashSet<usize> = left_out.iter().copied().collect();
             stored.resize(parsed.layout.file_count(), FilePriority::Normal);
@@ -611,17 +621,20 @@ impl TorrentService {
                     stored[index] = FilePriority::Ignored;
                 }
             }
-            self.inner
-                .db
-                .set_torrent_file_priorities(job_id, &stored)
+            let levels = stored.clone();
+            self.db(move |db| db.set_torrent_file_priorities(job_id, &levels))
+                .await
                 .map_err(state_error)?;
         }
         if let Some(unpack) = self.describe(torrent, parsed, stored)
-            && let Err(error) = self.inner.db.set_torrent_unpack_in_force(job_id, unpack)
+            && let Err(error) = self
+                .db(move |db| db.set_torrent_unpack_in_force(job_id, unpack))
+                .await
         {
             tracing::warn!(job_id = job_id.0, error = %error, "could not record whether a torrent unpacks");
         }
-        let Some(made) = self.making(torrent, &self.global_passwords()) else {
+        let global = self.global_passwords().await;
+        let Some(made) = self.making(torrent, &global) else {
             return Ok(false);
         };
         let (store, notes) = self
@@ -780,7 +793,7 @@ impl TorrentService {
         if waiting.is_empty() {
             return;
         }
-        let global = Some(self.global_passwords());
+        let global = Some(self.global_passwords().await);
         // The looks for their disks ask one pass between them.
         let looks = PlaceBatch::new(self);
         let mut restoring = tokio::task::JoinSet::new();
@@ -858,19 +871,26 @@ impl TorrentService {
         if self.park(job_id).await {
             return false;
         }
-        let waiting = {
+        let waiting = 'waiting: {
             let mut live = self.inner.live.lock().await;
-            live.get_mut(&job_id)
+            let Some(torrent) = live
+                .get_mut(&job_id)
                 .filter(|torrent| torrent.store.is_none())
-                .and_then(|torrent| {
-                    let global = global.unwrap_or_else(|| self.global_passwords());
-                    let made = self.making(torrent, &global)?;
-                    Some(Making {
-                        kept: torrent.kept_at_boot.take(),
-                        stamps: torrent.stamps_at_boot.take(),
-                        ..made
-                    })
-                })
+            else {
+                break 'waiting None;
+            };
+            let global = match global {
+                Some(global) => global,
+                None => self.global_passwords().await,
+            };
+            let Some(made) = self.making(torrent, &global) else {
+                break 'waiting None;
+            };
+            Some(Making {
+                kept: torrent.kept_at_boot.take(),
+                stamps: torrent.stamps_at_boot.take(),
+                ..made
+            })
         };
         let Some(made) = waiting else {
             return false;
@@ -1011,9 +1031,8 @@ impl TorrentService {
         };
         if torrent.record.intent() == TorrentIntent::Resumed {
             if let Err(error) = self
-                .inner
-                .db
-                .update_torrent_intent(job_id, TorrentIntent::Paused)
+                .db(move |db| db.update_torrent_intent(job_id, TorrentIntent::Paused))
+                .await
             {
                 tracing::warn!(job_id = job_id.0, error = %error, "could not keep a crashed torrent's pause");
             }
@@ -1406,7 +1425,10 @@ impl TorrentService {
         // again (libtorrent restores `verified_pieces` on a seed-mode add).
         // Lost, they are checked again as a peer asks for them.
         if seed_mode {
-            let verified = verified.map_or_else(|| self.inner.db.torrent_seed_verified(job_id), Ok);
+            let verified = match verified {
+                Some(verified) => Ok(verified),
+                None => self.db(move |db| db.torrent_seed_verified(job_id)).await,
+            };
             options.seed_verified = match verified {
                 Ok(verified) => {
                     verified.map(|bytes| BF::from_boxed_slice(bytes.into_boxed_slice()))
@@ -1594,7 +1616,7 @@ impl TorrentService {
                 .of(key)
                 .saturating_sub(usize::from(own == Some(key)))
         });
-        self.pin(torrent, pin);
+        self.pin(torrent, pin).await;
         if pin.is_some() {
             torrent
                 .route
@@ -1604,15 +1626,15 @@ impl TorrentService {
     }
 
     // `torrent` is pinned to pool member `pin` from here, or to none.
-    pub(super) fn pin(&self, torrent: &mut Live, pin: Option<u32>) {
+    pub(super) async fn pin(&self, torrent: &mut Live, pin: Option<u32>) {
         if torrent.record.pool_member == pin {
             return;
         }
         torrent.record.pool_member = pin;
+        let job_id = torrent.record.job_id;
         if let Err(error) = self
-            .inner
-            .db
-            .set_torrent_pool_member(torrent.record.job_id, pin)
+            .db(move |db| db.set_torrent_pool_member(job_id, pin))
+            .await
         {
             tracing::warn!(job_id = torrent.record.job_id.0, error = %error, "could not record the pool member a torrent is pinned to");
         }

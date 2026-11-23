@@ -460,10 +460,10 @@ impl TorrentService {
             AddSource::Metainfo(bytes) => {
                 let bytes = Bytes::from(bytes);
                 let parsed = parse_off(&bytes).await?;
-                let left_out = self.admit(&parsed.manifest)?;
-                self.duplicate(parsed.hashes)?;
+                let left_out = self.admit(&parsed.manifest).await?;
+                self.duplicate(parsed.hashes).await?;
                 let (settings, category) = self.made(settings, category).await?;
-                let job_id = self.reserve()?;
+                let job_id = self.reserve().await?;
                 let mut record = self.record(
                     job_id,
                     &request,
@@ -491,7 +491,9 @@ impl TorrentService {
                     held_tops(parsed.manifest.paths.iter().map(String::as_str)),
                 )
                 .await;
-                let mut torrent = match self.insert(record, &parsed.trackers, &adopted, Some(held))
+                let mut torrent = match self
+                    .insert(record, &parsed.trackers, &adopted, Some(held))
+                    .await
                 {
                     Ok(torrent) => torrent,
                     Err(error) => {
@@ -499,8 +501,8 @@ impl TorrentService {
                         return Err(error);
                     }
                 };
-                self.tag_added(job_id, &request.tags);
-                let made = self.give_metainfo(&mut torrent, &parsed, &left_out);
+                self.tag_added(job_id, &request.tags).await;
+                let made = self.give_metainfo(&mut torrent, &parsed, &left_out).await;
                 // Raised for an add, never for a restore (qBittorrent emits
                 // `torrentAdded` from `addTorrent_impl` alone).
                 self.raise_script_event(&torrent, QueueEvent::TorrentAdded, &[]);
@@ -524,7 +526,7 @@ impl TorrentService {
                 let magnet = Magnet::parse(&uri)
                     .map_err(|error| AddError::Invalid(format!("not a magnet: {error}")))?;
                 let hashes = magnet.info_hashes();
-                self.duplicate(hashes)?;
+                self.duplicate(hashes).await?;
                 let (settings, category) = self.made(settings, category).await?;
                 let trackers: Vec<TrackerEntry> = magnet
                     .trackers
@@ -550,7 +552,7 @@ impl TorrentService {
                 {
                     return Err(AddError::NoNetwork(NEEDS_DHT.into()));
                 }
-                let job_id = self.reserve()?;
+                let job_id = self.reserve().await?;
                 let name = magnet
                     .name
                     .clone()
@@ -569,8 +571,10 @@ impl TorrentService {
                 );
                 record.pool_member = pin;
                 // Nothing placed, nothing held, until its metainfo is.
-                let mut torrent = self.insert(record, &trackers, &Adopted::default(), None)?;
-                self.tag_added(job_id, &request.tags);
+                let mut torrent = self
+                    .insert(record, &trackers, &Adopted::default(), None)
+                    .await?;
+                self.tag_added(job_id, &request.tags).await;
                 let identity = identity_of(torrent.rule(&rules), &torrent.identity);
                 let terms = PeerTerms::of(&self.settings(), torrent.rule(&rules));
                 torrent
@@ -590,11 +594,11 @@ impl TorrentService {
     // A torrent just added takes the tags it was added with. It is in the
     // store already, so a tag that cannot be written leaves it untagged
     // rather than undoing the add.
-    fn tag_added(&self, job_id: JobId, tags: &[String]) {
+    async fn tag_added(&self, job_id: JobId, tags: &[String]) {
+        let tags = tags.to_vec();
         if let Err(error) = self
-            .inner
-            .db
-            .tag_new_job(job_id, tags.iter().map(String::as_str))
+            .db(move |db| db.tag_new_job(job_id, tags.iter().map(String::as_str)))
+            .await
         {
             tracing::warn!(job_id = job_id.0, error = %error, "could not tag a torrent");
         }
@@ -656,18 +660,18 @@ impl TorrentService {
     }
 
     // The files of `manifest.paths`, by index, that admission leaves out.
-    fn admit(&self, manifest: &Manifest) -> Result<Vec<usize>, AddError> {
+    async fn admit(&self, manifest: &Manifest) -> Result<Vec<usize>, AddError> {
         let policy = self
-            .inner
-            .db
-            .post_processing_settings()
+            .db(|db| db.post_processing_settings())
+            .await
             .map_err(|error| AddError::State(state_error(error)))?;
         Ok(admission::admit(&policy, manifest)?)
     }
 
-    fn duplicate(&self, hashes: InfoHashes) -> Result<(), AddError> {
-        match self.inner.db.get_torrent_by_infohash(&infohashes(hashes)) {
-            Ok(Some(existing)) => Err(self.already(existing.job_id)),
+    async fn duplicate(&self, hashes: InfoHashes) -> Result<(), AddError> {
+        let hashes = infohashes(hashes);
+        match self.db(move |db| db.get_torrent_by_infohash(&hashes)).await {
+            Ok(Some(existing)) => Err(self.already(existing.job_id).await),
             Ok(None) => Ok(()),
             Err(error) => Err(AddError::State(state_error(error))),
         }
@@ -676,18 +680,17 @@ impl TorrentService {
     // Why an add of a torrent that is already `job_id` is refused: still
     // being removed when a removal has marked it, a duplicate otherwise.
     // The add never waits on that removal.
-    fn already(&self, job_id: JobId) -> AddError {
-        match self.inner.db.torrent_is_retiring(job_id) {
+    async fn already(&self, job_id: JobId) -> AddError {
+        match self.db(move |db| db.torrent_is_retiring(job_id)).await {
             Ok(true) => AddError::Refused(Refusal::Removing(job_id)),
             Ok(false) => AddError::Duplicate(job_id),
             Err(error) => AddError::State(state_error(error)),
         }
     }
 
-    fn reserve(&self) -> Result<JobId, AddError> {
-        self.inner
-            .db
-            .reserve_next_job_id()
+    async fn reserve(&self) -> Result<JobId, AddError> {
+        self.db(|db| db.reserve_next_job_id())
+            .await
             .map_err(|error| AddError::State(state_error(error)))
     }
 
@@ -872,7 +875,7 @@ impl TorrentService {
     // Keep `record` with its trackers: a torrent new to the database, under
     // the rule its trackers match, and forced when that rule admits its
     // torrents so.
-    fn insert(
+    async fn insert(
         &self,
         mut record: TorrentRecord,
         trackers: &[TrackerEntry],
@@ -883,17 +886,20 @@ impl TorrentService {
     ) -> Result<Live, AddError> {
         // The table keeps a URL once in a tier, the first that names it:
         // the same list is written and held, so the two never differ.
-        let trackers = &once_a_tier(trackers);
+        let trackers = once_a_tier(trackers);
         let rules = self.rules();
         let rule = rules.rule_for(trackers.iter().map(|tracker| tracker.url.as_str()));
         record.forced |= rule.is_some_and(|rule| rule.forced);
         let rule_id = rule.map(|rule| rule.id);
-        match self
-            .inner
-            .db
-            .insert_placed_torrent(&record, trackers, adopted, held.as_deref())
-        {
-            Ok(TorrentInsert::Inserted) => {
+        let adopted = adopted.clone();
+        let inserted = self
+            .db(move |db| {
+                db.insert_placed_torrent(&record, &trackers, &adopted, held.as_deref())
+                    .map(|inserted| (inserted, record, trackers))
+            })
+            .await;
+        match inserted {
+            Ok((TorrentInsert::Inserted, record, trackers)) => {
                 let now = self.inner.clock.unix_ms();
                 let mut torrent = Live::new(
                     record,
@@ -905,7 +911,7 @@ impl TorrentService {
                 torrent.trackers = in_table_order(trackers.to_vec());
                 Ok(torrent)
             }
-            Ok(TorrentInsert::Duplicate(existing)) => Err(self.already(existing)),
+            Ok((TorrentInsert::Duplicate(existing), _, _)) => Err(self.already(existing).await),
             Err(error) => Err(AddError::State(state_error(error))),
         }
     }
@@ -1091,7 +1097,7 @@ impl TorrentService {
         fetched: Option<Fetched>,
     ) -> Result<(), AddError> {
         let parsed = parse_off(&bytes).await?;
-        let left_out = self.admit(&parsed.manifest)?;
+        let left_out = self.admit(&parsed.manifest).await?;
         let settings = self.settings();
         let Some(record) = self
             .inner
@@ -1109,7 +1115,8 @@ impl TorrentService {
         self.duplicate(InfoHashes {
             v1: parsed.hashes.v1.filter(|_| known.v1.is_none()),
             v2: parsed.hashes.v2.filter(|_| known.v2.is_none()),
-        })?;
+        })
+        .await?;
         let category = settings.category(record.category_id).cloned();
         let (dir, files_dir, adopted) = self
             .place(
@@ -1149,22 +1156,30 @@ impl TorrentService {
         let mut trackers = torrent.trackers.to_vec();
         trackers.extend(parsed.trackers.iter().cloned());
         let trackers = tidy_trackers(trackers);
-        self.inner
-            .db
-            .set_torrent_metainfo(
-                job_id,
-                torrent.record.infohash_v1,
-                torrent.record.infohash_v2,
-                &parsed.manifest.name,
-                &bytes,
-                parsed.private,
-                &dir,
-                files_dir.as_deref(),
-                &trackers,
-                &held,
-                &adopted,
-            )
-            .map_err(|error| AddError::State(state_error(error)))?;
+        let trackers = {
+            let (v1, v2) = (torrent.record.infohash_v1, torrent.record.infohash_v2);
+            let (name, bytes, private) =
+                (parsed.manifest.name.clone(), bytes.clone(), parsed.private);
+            let (dir, files_dir) = (dir.clone(), files_dir.clone());
+            self.db(move |db| {
+                db.set_torrent_metainfo(
+                    job_id,
+                    v1,
+                    v2,
+                    &name,
+                    &bytes,
+                    private,
+                    &dir,
+                    files_dir.as_deref(),
+                    &trackers,
+                    &held,
+                    &adopted,
+                )
+                .map(|_| trackers)
+            })
+            .await
+            .map_err(|error| AddError::State(state_error(error)))?
+        };
         // The table holds the merged list now, whatever the next write does.
         torrent.rule_id = self.rule_id(&trackers);
         torrent.trackers = in_table_order(trackers);
@@ -1182,12 +1197,12 @@ impl TorrentService {
             .map(|(padding, level)| if padding { FilePriority::Normal } else { level })
             .collect();
         if levels.iter().any(|level| *level != FilePriority::Normal) {
-            self.inner
-                .db
-                .set_torrent_file_priorities(job_id, &levels)
+            let stored = levels.clone();
+            self.db(move |db| db.set_torrent_file_priorities(job_id, &stored))
+                .await
                 .map_err(|error| AddError::State(state_error(error)))?;
         }
-        let made = self.give_metainfo(torrent, &parsed, &left_out);
+        let made = self.give_metainfo(torrent, &parsed, &left_out).await;
         drop(live);
         match made {
             Ok(true) => self.inner.signal.look(job_id),

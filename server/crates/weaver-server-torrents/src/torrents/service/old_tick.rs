@@ -78,7 +78,8 @@ impl TorrentService {
                     torrent.record.seed_mode = false;
                     torrent.seed_verified = 0;
                     self.inner.signal.want_pass();
-                    if let Err(error) = self.inner.db.clear_torrent_seed_mode(torrent.record.job_id)
+                    let job_id = torrent.record.job_id;
+                    if let Err(error) = self.db(move |db| db.clear_torrent_seed_mode(job_id)).await
                     {
                         tracing::warn!(job_id = torrent.record.job_id.0, error = %error, "could not record that a torrent left seed mode");
                     }
@@ -89,10 +90,11 @@ impl TorrentService {
                     && verified.count_ones() > torrent.seed_verified
                 {
                     let count = verified.count_ones();
+                    let (job_id, pieces) =
+                        (torrent.record.job_id, verified.as_raw_slice().to_vec());
                     match self
-                        .inner
-                        .db
-                        .set_torrent_seed_verified(torrent.record.job_id, verified.as_raw_slice())
+                        .db(move |db| db.set_torrent_seed_verified(job_id, &pieces))
+                        .await
                     {
                         Ok(_) => torrent.seed_verified = count,
                         Err(error) => {

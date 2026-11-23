@@ -465,7 +465,7 @@ async fn a_panic_in_a_torrents_restore_leaves_its_marker_and_parks_it() {
         assert!(torrent.store.is_none());
         (
             Arc::clone(torrent.layout.as_ref().unwrap()),
-            again.archive_passwords(torrent, &again.global_passwords()),
+            again.archive_passwords(torrent, &again.global_passwords().await),
         )
     };
     let plan = crate::torrents::tee::Plan::of(&layout).unwrap();

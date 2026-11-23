@@ -466,7 +466,7 @@ async fn a_hold_and_a_never_pause_rule_apply_as_before() {
                     EPOCH_MS,
                 )
                 .unwrap();
-            rig.service.load_rules().unwrap();
+            rig.service.load_rules().await.unwrap();
             let base = || request(AddSource::Metainfo(Vec::new()));
             let kept = add(rig, "kept", 1, base()).await;
             let held = add(rig, "held", 2, base()).await;

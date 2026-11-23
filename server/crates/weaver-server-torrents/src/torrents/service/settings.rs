@@ -438,7 +438,7 @@ impl TorrentService {
     /// deleted follows no rule, and a rule's new hosts take the torrents
     /// added from now on and every torrent after a restart.
     pub async fn reload_tracker_rules(&self) -> Result<(), String> {
-        self.load_rules()?;
+        self.load_rules().await?;
         let rules = self.rules();
         {
             let mut live = self.inner.live.lock().await;
@@ -471,8 +471,11 @@ impl TorrentService {
         Ok(())
     }
 
-    pub fn load_rules(&self) -> Result<(), String> {
-        let rules = self.inner.db.list_tracker_rules().map_err(state_error)?;
+    pub async fn load_rules(&self) -> Result<(), String> {
+        let rules = self
+            .db(|db| db.list_tracker_rules())
+            .await
+            .map_err(state_error)?;
         *self
             .inner
             .rules

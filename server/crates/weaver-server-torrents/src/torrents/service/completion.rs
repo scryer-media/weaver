@@ -519,9 +519,9 @@ impl TorrentService {
             let written = match refused {
                 Some(error) => Err(error),
                 None => {
-                    self.inner
-                        .db
-                        .set_torrent_completed(job_id, now, torrent.record.download_ends)
+                    let ends = torrent.record.download_ends;
+                    self.db(move |db| db.set_torrent_completed(job_id, now, ends))
+                        .await
                 }
             };
             if let Err(error) = written {
@@ -557,7 +557,7 @@ impl TorrentService {
         // path now, over any file of the same name there (qBittorrent
         // `TorrentImpl::handleTorrentFinished` and `adjustStorageLocation`).
         if let Some(to) = move_to {
-            if let Err(error) = self.inner.db.clear_torrent_move_to(job_id) {
+            if let Err(error) = self.db(move |db| db.clear_torrent_move_to(job_id)).await {
                 tracing::warn!(job_id = job_id.0, error = %error, "could not record a torrent's move");
             }
             if let Err(error) = self.move_storage(job_id, to, Existing::Replace).await {
