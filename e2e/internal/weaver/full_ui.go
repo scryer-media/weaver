@@ -70,26 +70,31 @@ type fullSuiteOptions struct {
 	includePhase   func(fullPhaseDefinition) bool
 }
 
+// fullPhaseDefinitions is also the order a full run starts its phases in:
+// the two functional phases first, then the rest. See runFullPipeline.
 var fullPhaseDefinitions = []fullPhaseDefinition{
 	// The functional corpus carries `direct-store-*` fixtures built to be read
 	// in place, and `assertDirectStoreEngagement` asserts from the graph's lines
 	// that those sets really were: stored output is byte-identical either way.
 	{name: "Functional SQLite", command: "test-all", slug: "functional-sqlite", seedProfile: "functional", datastore: weaverDatastoreSQLite, extraEnv: map[string]string{"WEAVER_E2E_DELAY": "direct_store.post_repair_verify=20000"}},
 	{name: "Functional Postgres", command: "test-all", slug: "functional-postgres", seedProfile: "functional", datastore: weaverDatastorePostgres, extraEnv: map[string]string{"WEAVER_E2E_DELAY": "direct_store.post_repair_verify=20000"}},
-	{name: "NNTP Chaos", command: "chaos-test", slug: "nntp-chaos", seedProfile: "chaos", datastore: weaverDatastoreSQLite},
+	// The rest start slowest first, by their usual wall time on a full run,
+	// so the long suites are not left to run alone at the end. The Product
+	// Behavior Gate has a slot of its own and starts at once wherever it sits.
+	{name: "Restart Postgres", command: "restart-all", slug: "restart-postgres", seedProfile: "restart", datastore: weaverDatastorePostgres},
+	{name: "Restart SQLite", command: "restart-all", slug: "restart-sqlite", seedProfile: "restart", datastore: weaverDatastoreSQLite},
+	{name: "Filesystem Gate", command: "filesystem", slug: "filesystem", skipSeed: true, datastore: weaverDatastoreSQLite},
 	{name: "TCP Chaos", command: "tcp-chaos", slug: "tcp-chaos", seedProfile: "tcp-chaos", datastore: weaverDatastoreSQLite},
-	// The TLS suite submits five canonical fixtures over the NNTP container's
-	// TLS listener, so it seeds the functional corpus they come from.
-	{name: "TLS NNTP", command: "tls-test", slug: "tls-nntp", seedProfile: "functional", datastore: weaverDatastoreSQLite},
+	{name: "NNTP Chaos", command: "chaos-test", slug: "nntp-chaos", seedProfile: "chaos", datastore: weaverDatastoreSQLite},
+	{name: "Adversarial Archives", command: "adversarial", slug: "adversarial", seedProfile: "adversarial", datastore: weaverDatastoreSQLite},
 	// Adaptive dispatch drives one large-segment fixture through injected
 	// latency; the TCP chaos profile is the smallest corpus that carries it.
 	{name: "Adaptive Dispatch", command: "adaptive-dispatch", slug: "adaptive-dispatch", seedProfile: "tcp-chaos", datastore: weaverDatastoreSQLite},
-	{name: "Adversarial Archives", command: "adversarial", slug: "adversarial", seedProfile: "adversarial", datastore: weaverDatastoreSQLite},
+	// The TLS suite submits five canonical fixtures over the NNTP container's
+	// TLS listener, so it seeds the functional corpus they come from.
+	{name: "TLS NNTP", command: "tls-test", slug: "tls-nntp", seedProfile: "functional", datastore: weaverDatastoreSQLite},
 	{name: "Container Restart", command: "container-restart", slug: "container-restart", skipSeed: true, datastore: weaverDatastoreSQLite},
-	{name: "Restart SQLite", command: "restart-all", slug: "restart-sqlite", seedProfile: "restart", datastore: weaverDatastoreSQLite},
-	{name: "Restart Postgres", command: "restart-all", slug: "restart-postgres", seedProfile: "restart", datastore: weaverDatastorePostgres},
 	{name: "Product Behavior Gate", command: "release-gate", slug: "product-behavior", skipSeed: true, datastore: weaverDatastoreSQLite},
-	{name: "Filesystem Gate", command: "filesystem", slug: "filesystem", skipSeed: true, datastore: weaverDatastoreSQLite},
 }
 
 // functionalFullPhase selects the fast iteration loop: the SQLite functional
@@ -1229,6 +1234,17 @@ func (s fullPhaseSlots) slotFor(phase *fullPhaseContext) chan struct{} {
 	return s.general
 }
 
+// queues splits phases by the slot pool each waits on, keeping their order
+// within each pool: the order the pool admits them in.
+func (s fullPhaseSlots) queues(phases []*fullPhaseContext) map[chan struct{}][]*fullPhaseContext {
+	queues := make(map[chan struct{}][]*fullPhaseContext, 2)
+	for _, phase := range phases {
+		slot := s.slotFor(phase)
+		queues[slot] = append(queues[slot], phase)
+	}
+	return queues
+}
+
 func runFullPipeline(
 	ctx context.Context,
 	phases []*fullPhaseContext,
@@ -1241,76 +1257,36 @@ func runFullPipeline(
 
 	// Every phase brings up its own stack and drives it hard, so phases share
 	// a fixed number of slots instead of all starting together. A phase holds
-	// its slot from seeding through its own cleanup.
+	// its slot from seeding through its own cleanup. Each pool of slots hands
+	// them out in the order `phases` lists, which is the order of
+	// fullPhaseDefinitions: a free slot goes to the earliest phase still
+	// waiting for that pool, never to whichever goroutine wins a race.
 	slots := newFullPhaseSlots(len(phases))
 
 	var wg sync.WaitGroup
-	for _, phase := range phases {
+	for slot, queue := range slots.queues(phases) {
 		wg.Add(1)
-		go func(phase *fullPhaseContext) {
+		go func(slot chan struct{}, queue []*fullPhaseContext) {
 			defer wg.Done()
-			slot := slots.slotFor(phase)
-			select {
-			case slot <- struct{}{}:
-				defer func() { <-slot }()
-			case <-ctx.Done():
-				canceledErr := fmt.Errorf("canceled before the phase started: %w", ctx.Err())
-				phaseResults <- recordPhaseSetupFailure(phase, phase.Command, time.Now(), canceledErr)
-				dashboard.markPhaseResult(phase.Name, "fail")
-				return
-			}
-			defer func() {
-				if !keepStacks {
-					if err := cleanupFullPhaseContext(phase); err != nil {
-						phase.LogTail.Add("cleanup error: " + err.Error())
+			for i, phase := range queue {
+				select {
+				case slot <- struct{}{}:
+				case <-ctx.Done():
+					canceledErr := fmt.Errorf("canceled before the phase started: %w", ctx.Err())
+					for _, waiting := range queue[i:] {
+						phaseResults <- recordPhaseSetupFailure(waiting, waiting.Command, time.Now(), canceledErr)
+						dashboard.markPhaseResult(waiting.Name, "fail")
 					}
-				}
-			}()
-
-			if !phase.SkipSeed {
-				seedResult := runSelfWithEnv(ctx, phase, "seed-all", func(event progressEvent) {
-					dashboard.updateSeed(phase.Name, event)
-				})
-				seedResults <- seedResult
-				if seedResult.Err != nil {
-					dashboard.markPhaseResult(phase.Name, "fail")
 					return
 				}
+				wg.Add(1)
+				go func(phase *fullPhaseContext) {
+					defer wg.Done()
+					defer func() { <-slot }()
+					runFullPhase(ctx, phase, dashboard, keepStacks, awaitWeaverImage, seedResults, phaseResults)
+				}(phase)
 			}
-
-			setupStarted := time.Now()
-			if phase.Command != "filesystem" {
-				weaverBin, err := ensureE2EWeaverBinary()
-				if err != nil {
-					setupErr := fmt.Errorf("prepare e2e weaver binary: %w", err)
-					phaseResults <- recordPhaseSetupFailure(phase, phase.Command, setupStarted, setupErr)
-					dashboard.markPhaseResult(phase.Name, "fail")
-					return
-				}
-				phase.WeaverBin = weaverBin
-			}
-			if fullPhaseNeedsLocalWeaverImage(phase) && awaitWeaverImage != nil {
-				setupStarted = time.Now()
-				dashboard.setPhaseDetail(phase.Name, "waiting for Weaver image")
-				if err := awaitWeaverImage(); err != nil {
-					setupErr := fmt.Errorf("prepare local Weaver image: %w", err)
-					phaseResults <- recordPhaseSetupFailure(phase, phase.Command, setupStarted, setupErr)
-					dashboard.markPhaseResult(phase.Name, "fail")
-					return
-				}
-			}
-
-			dashboard.setPhaseRunning(phase.Name, "booting")
-			phaseResult := runSelfWithEnv(ctx, phase, phase.Command, func(event progressEvent) {
-				dashboard.updatePhase(phase.Name, event)
-			})
-			phaseResults <- phaseResult
-			if phaseResult.Err != nil {
-				dashboard.markPhaseResult(phase.Name, "fail")
-			} else {
-				dashboard.markPhaseResult(phase.Name, "pass")
-			}
-		}(phase)
+		}(slot, queue)
 	}
 
 	wg.Wait()
@@ -1327,6 +1303,69 @@ func runFullPipeline(
 		phaseOut = append(phaseOut, result)
 	}
 	return seedOut, phaseOut
+}
+
+// runFullPhase runs one phase of a full run inside the slot it holds: its
+// seed, its setup, the phase itself and its cleanup.
+func runFullPhase(
+	ctx context.Context,
+	phase *fullPhaseContext,
+	dashboard *fullDashboard,
+	keepStacks bool,
+	awaitWeaverImage func() error,
+	seedResults, phaseResults chan<- childRunResult,
+) {
+	defer func() {
+		if !keepStacks {
+			if err := cleanupFullPhaseContext(phase); err != nil {
+				phase.LogTail.Add("cleanup error: " + err.Error())
+			}
+		}
+	}()
+
+	if !phase.SkipSeed {
+		seedResult := runSelfWithEnv(ctx, phase, "seed-all", func(event progressEvent) {
+			dashboard.updateSeed(phase.Name, event)
+		})
+		seedResults <- seedResult
+		if seedResult.Err != nil {
+			dashboard.markPhaseResult(phase.Name, "fail")
+			return
+		}
+	}
+
+	setupStarted := time.Now()
+	if phase.Command != "filesystem" {
+		weaverBin, err := ensureE2EWeaverBinary()
+		if err != nil {
+			setupErr := fmt.Errorf("prepare e2e weaver binary: %w", err)
+			phaseResults <- recordPhaseSetupFailure(phase, phase.Command, setupStarted, setupErr)
+			dashboard.markPhaseResult(phase.Name, "fail")
+			return
+		}
+		phase.WeaverBin = weaverBin
+	}
+	if fullPhaseNeedsLocalWeaverImage(phase) && awaitWeaverImage != nil {
+		setupStarted = time.Now()
+		dashboard.setPhaseDetail(phase.Name, "waiting for Weaver image")
+		if err := awaitWeaverImage(); err != nil {
+			setupErr := fmt.Errorf("prepare local Weaver image: %w", err)
+			phaseResults <- recordPhaseSetupFailure(phase, phase.Command, setupStarted, setupErr)
+			dashboard.markPhaseResult(phase.Name, "fail")
+			return
+		}
+	}
+
+	dashboard.setPhaseRunning(phase.Name, "booting")
+	phaseResult := runSelfWithEnv(ctx, phase, phase.Command, func(event progressEvent) {
+		dashboard.updatePhase(phase.Name, event)
+	})
+	phaseResults <- phaseResult
+	if phaseResult.Err != nil {
+		dashboard.markPhaseResult(phase.Name, "fail")
+	} else {
+		dashboard.markPhaseResult(phase.Name, "pass")
+	}
 }
 
 func recordPhaseSetupFailure(
