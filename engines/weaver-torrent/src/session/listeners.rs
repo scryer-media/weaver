@@ -302,6 +302,9 @@ impl Session {
                     let session = session.upgrade();
                     if let Some(session) = &session {
                         session.stats.incoming.ended(kind, IncomingEnd::of(&added));
+                        if let Ok(AddIncomingPeerResult::AlreadyActive(already)) = &added {
+                            session.stats.incoming.already(kind, *already);
+                        }
                     }
                     match added {
                         Ok(AddIncomingPeerResult::Added) => {

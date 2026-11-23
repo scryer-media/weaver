@@ -1702,12 +1702,20 @@ fn sample_trackers() -> weaver_server_core::torrents::metrics::tracker::TrackerS
 }
 
 fn sample_incoming() -> weaver_server_core::torrents::metrics::incoming::IncomingSnapshot {
-    use weaver_server_core::torrents::metrics::incoming::{IncomingEnd, IncomingSnapshot};
+    use weaver_server_core::torrents::metrics::incoming::{
+        Already, FromAddress, Held, IncomingEnd, IncomingSnapshot, PortOrder,
+    };
     use weaver_server_core::torrents::metrics::swarm::Transport;
 
     let mut incoming = IncomingSnapshot::default();
     incoming.ends[Transport::Tcp as usize][IncomingEnd::Accepted as usize] = 85;
     incoming.ends[Transport::Utp as usize][IncomingEnd::SessionLimit as usize] = 86;
+    let crossed = Already {
+        held: Held::Dialling,
+        ports: PortOrder::OursHigher,
+        from: FromAddress::Same,
+    };
+    incoming.already[Transport::Utp as usize][crossed.index()] = 87;
     incoming
 }
 

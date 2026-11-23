@@ -31,6 +31,7 @@ use crate::peer_connection::WriterRequest;
 use crate::peer_protocol::extended::ut_pex::{
     PEX_ENCRYPTION, PEX_HOLEPUNCH, PEX_SEED, PEX_UTP, PexPeerInfo,
 };
+use crate::session_stats::incoming::Held;
 use crate::stream_connect::{ConnectionKind, Transports};
 use crate::type_aliases::{BF, PeerHandle, PeerSourceFlag, PeerSources};
 
@@ -1080,6 +1081,17 @@ impl Peer {
             PeerState::Queued | PeerState::Dead | PeerState::NotNeeded => return,
         };
         let _ = tx.send(WriterRequest::Disconnect(Ok(())));
+    }
+
+    /// The connection the peer has, as an incoming one turned away for it
+    /// is counted; None when it has none.
+    pub(crate) fn held(&self) -> Option<Held> {
+        match &self.state {
+            PeerState::Connecting(_) => Some(Held::Dialling),
+            PeerState::Live(live) if live.outgoing => Some(Held::Ours),
+            PeerState::Live(_) => Some(Held::Theirs),
+            PeerState::Queued | PeerState::Dead | PeerState::NotNeeded => None,
+        }
     }
 
     /// Whether we made the peer's connection, open or opening; None when it

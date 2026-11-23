@@ -11,7 +11,9 @@
 // names a tracker, a peer or a torrent.
 
 use weaver_server_core::torrents::metrics::dht::{DhtIgnored, DhtQuery, DhtQueryEnd};
-use weaver_server_core::torrents::metrics::incoming::IncomingEnd;
+use weaver_server_core::torrents::metrics::incoming::{
+    Already, FromAddress, Held, IncomingEnd, PortOrder,
+};
 use weaver_server_core::torrents::metrics::network::{HolepunchEvent, PortMapResult, PortMapper};
 use weaver_server_core::torrents::metrics::swarm::Transport;
 use weaver_server_core::torrents::metrics::tracker::{AnnounceEvent, TrackerKind, TrackerResult};
@@ -197,6 +199,32 @@ fn incoming(out: &mut Encoder, routes: &[SessionSeries]) {
                     ],
                     session.incoming.ends[*transport as usize][*end as usize],
                 );
+            }
+        }
+    }
+    for session in open() {
+        for transport in Transport::ALL {
+            for held in Held::ALL {
+                for ports in PortOrder::ALL {
+                    for from in FromAddress::ALL {
+                        let already = Already {
+                            held: *held,
+                            ports: *ports,
+                            from: *from,
+                        };
+                        out.sample(
+                            &f::TORRENT_INCOMING_ALREADY_CONNECTED,
+                            &[
+                                ("route", session.route.as_str()),
+                                ("transport", transport.as_str()),
+                                ("held", held.as_str()),
+                                ("ports", ports.as_str()),
+                                ("from", from.as_str()),
+                            ],
+                            session.incoming.already[*transport as usize][already.index()],
+                        );
+                    }
+                }
             }
         }
     }

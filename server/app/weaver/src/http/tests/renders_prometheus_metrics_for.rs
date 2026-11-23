@@ -1575,6 +1575,12 @@ fn renders_prometheus_metrics_for_torrents_trackers_and_sessions() {
         format!(
             r#"weaver_torrent_incoming_connections_total{{{ROUTE},transport="utp",result="session_limit"}} 86"#
         ),
+        format!(
+            r#"weaver_torrent_incoming_already_connected_total{{{ROUTE},transport="utp",held="dialling",ports="ours_higher",from="same"}} 87"#
+        ),
+        format!(
+            r#"weaver_torrent_incoming_already_connected_total{{{ROUTE},transport="tcp",held="theirs",ports="equal",from="other"}} 0"#
+        ),
         format!("weaver_torrent_session_unchoke_slots_held{{{ROUTE}}} 87"),
         format!(r#"weaver_torrent_web_seed_requests_total{{{ROUTE},result="ok"}} 88"#),
         format!(r#"weaver_torrent_web_seed_requests_total{{{ROUTE},result="rejected"}} 89"#),

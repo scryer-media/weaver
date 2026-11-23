@@ -94,13 +94,13 @@ impl TorrentStateLive {
             our_port,
         ) {
             Ok(counters) => counters,
-            Err(IncomingRefused::AlreadyActive) => {
+            Err(IncomingRefused::AlreadyActive(already)) => {
                 debug!(
                     addr = %checked_peer.addr,
                     kind = %checked_peer.kind,
                     "peer already active, ignoring incoming connection"
                 );
-                return Ok(AddIncomingPeerResult::AlreadyActive);
+                return Ok(AddIncomingPeerResult::AlreadyActive(already));
             }
             Err(IncomingRefused::ListFull) => {
                 debug!(
