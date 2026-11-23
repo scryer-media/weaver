@@ -237,7 +237,7 @@ export async function startProxyFixture(options = {}) {
     const peer = client.remoteAddress;
     const publicTarget = publicTargets.find(target => target.port === port
       && (target.host === host.toLowerCase() || target.addresses.includes(host)));
-    const allowedHost = host === ip || addresses.includes(host) || /^[a-z0-9-]+\.proxy\.test$/.test(host);
+    const allowedHost = host === ip || addresses.includes(host) || /^[a-z0-9-]+\.proxy\.(test|example)$/.test(host);
     const fixtureTarget = !publicOnly && allowedHost && [ports.dns, ports.nntp, ports.http].includes(port);
     const fixtureDns = (host === ip || addresses.includes(host)) && port === ports.dns;
     const passed = !publicOnly && passthrough.some(target => target.port === port
@@ -359,7 +359,9 @@ export async function startProxyFixture(options = {}) {
     if (cursor + 5 > query.length) return;
     const name = labels.join(".").toLowerCase();
     const type = query.readUInt16BE(cursor + 1);
-    const fixture = name.endsWith(".proxy.test");
+    // proxy.example is the zone a validator is not told is private, so it must
+    // prove it from the root; nothing here is signed, so it cannot.
+    const fixture = name.endsWith(".proxy.test") || name.endsWith(".proxy.example");
     const local = hosts[name] ?? publicTargets.find(target => target.host === name)?.addresses
       ?? (served.includes(name) ? addresses : undefined);
     // Resolve only infrastructure names through the container's own resolvers.

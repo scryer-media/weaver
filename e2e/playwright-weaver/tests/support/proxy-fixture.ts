@@ -8,7 +8,8 @@ import { expect } from "../helpers";
  * Control of the proxy fixture (tests/support/proxy-fixture-server.mjs).
  * Routes: primary/tertiary CONNECT, secondary SOCKS5, `direct` (its NNTP
  * port), and pool members connect1..6 (CONNECT, 8101-8106) and socks1..4
- * (SOCKS5, 8201-8204). Every route answers only `*.proxy.test` names and the
+ * (SOCKS5, 8201-8204). Every route answers only `*.proxy.test` and
+ * `*.proxy.example` names and the
  * fixture's own addresses; anything else is refused and recorded.
  */
 const controlUrl = () => (process.env.PROXY_FIXTURE_URL || "http://proxy-fixture:8090").replace(/\/+$/, "");

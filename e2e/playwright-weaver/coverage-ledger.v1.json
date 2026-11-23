@@ -77,6 +77,11 @@
       "oracle": "browser"
     },
     {
+      "path": "/settings/networking/dns",
+      "owner": "advanced-networking-dns",
+      "oracle": "browser"
+    },
+    {
       "path": "/settings/networking/speed",
       "owner": "speed-test",
       "oracle": "browser"

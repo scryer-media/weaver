@@ -18,6 +18,10 @@ import { choose } from "./support/settings-locators";
 import { networkIds, settingsIds, testIds } from "./support/testids";
 
 const field = testIds.field;
+// A zone the fixture answers that is not on the validator's private list
+// (`.test` is), so validating a name in it asks the root for proof, and the
+// fixture signs nothing.
+const SIGNABLE_ZONE = "proxy.example";
 
 const SAVE_ROUTE = `mutation($kind: NetworkConsumerKind!, $id: Int!, $input: RouteInput!) {
   saveNetworkRoute(kind: $kind, id: $id, input: $input) { consumer }
@@ -152,7 +156,7 @@ test.describe("Networking -> DNS", () => {
     expect(route?.dnsProfileId, `route ${serverKey(server)} profile`).toBe(profileId);
 
     // Secondary evidence: no page shows a server route's lookups, so the lookup record is read from a test over the saved route.
-    const target = `${unique("d05-target")}.proxy.test`;
+    const target = `${unique("d05-target")}.${SIGNABLE_ZONE}`;
     const mark = await fixtureMark(request);
     const [path] = await testViaLookup(request, routeInputOf(route!), { host: target, port: http });
     expect(path?.resolution, "the target's lookup record").toMatchObject({
@@ -186,7 +190,7 @@ test.describe("Networking -> DNS", () => {
     const connection = live.find((event) => event.kind === "connected" && event.route === "connect1" && event.port === nntp)!.connection!;
 
     // Secondary evidence: the lookup record before the edit.
-    const before = await testViaLookup(request, route, { host: `${unique("d06-before")}.proxy.test`, port: http });
+    const before = await testViaLookup(request, route, { host: `${unique("d06-before")}.${SIGNABLE_ZONE}`, port: http });
     expect(before[0]?.resolution, "taken as sent").toMatchObject({ resolvedBy: "SERVERS", trust: "AS_SENT", error: null });
     expect(before[0]!.resolution!.answeredBy ?? "", "answered by the listed server").toContain(address);
 
@@ -197,7 +201,7 @@ test.describe("Networking -> DNS", () => {
     expect(await saveEditor(page, editor, "SaveDnsProfile", "saveDnsProfile"), "the edited profile").toBe(profile.id);
 
     // Secondary evidence: the next lookup on the same route validates, and the fixture signs nothing.
-    const after = await testViaLookup(request, route, { host: `${unique("d06-after")}.proxy.test`, port: http });
+    const after = await testViaLookup(request, route, { host: `${unique("d06-after")}.${SIGNABLE_ZONE}`, port: http });
     expect(after[0]?.resolution, "validated here after the edit").toMatchObject({ resolvedBy: "SERVERS", trust: "BOGUS", error: { code: "DNSSEC_UNAVAILABLE" } });
     expect(routeSaves(), "the route was not saved again").toBe(0);
     // Secondary evidence: the route still names the profile it named.
@@ -243,7 +247,8 @@ test.describe("Networking -> DNS", () => {
     const route = await world.withDns({ legs: [ladderLeg(a.id, [rung.proxy(proxy.id)], 100)] });
     // Secondary evidence: a test through the proxy connects.
     const [path] = await testViaLookup(request, route, { host: `${unique("d07-target")}.proxy.test`, port: http });
-    expect(path, `a path through proxy ${proxy.id}`).toMatchObject({ success: true, proxyId: proxy.id });
+    // Tested alone, the route names its proxy among the carriers, not as the proxy under test.
+    expect(path, `a path through proxy ${proxy.id}`).toMatchObject({ success: true, carrierIds: [proxy.id] });
     const events = await waitFixtureEvents(request, mark,
       (seen) => seen.some((event) => event.kind === "direct-dns" && event.name === proxyHost),
       `${proxyHost} looked up`);
