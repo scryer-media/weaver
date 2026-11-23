@@ -8,6 +8,7 @@ import { DetailBlock } from "../../components/chrome";
 import { SecondaryButton } from "../../components/controls";
 import { Dialog } from "../../components/Dialog";
 import { useNetworkingWorkspace } from "./data";
+import { useRouteDnsProfiles } from "./dns-choices";
 import { FlowEditor } from "./FlowEditor";
 import { NetworkFlow, type FlowTarget } from "./NetworkFlow";
 
@@ -40,6 +41,8 @@ export function JobRouteFlow({
   const t = useTranslate();
   const workspace = useNetworkingWorkspace("overview");
   const { data, error, flow, consumers, egresses, profiles, pools, action, busy, message, retry } = workspace;
+  // Where each leg's names are looked up is drawn under it.
+  const dns = useRouteDnsProfiles();
   const [enlarged, setEnlarged] = useState(false);
   const [editing, setEditing] = useState<FlowTarget | null>(null);
 
@@ -105,6 +108,7 @@ export function JobRouteFlow({
           consumers={shown}
           traffic
           fitWidth
+          dns={dns}
         />
       </div>
       <Dialog
@@ -128,6 +132,7 @@ export function JobRouteFlow({
           traffic
           trace
           fitWidth
+          dns={dns}
         />
       </Dialog>
       {editing ? (

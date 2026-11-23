@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 import type { Translate } from "@/lib/context/translate-context";
-import type { NetworkRoute, ProxyPool, Rung } from "./networking.ts";
+import type { LegFlow, NetworkRoute, ProxyPool, Rung } from "./networking.ts";
 import type { ProxyKind } from "./proxies.ts";
 
 /** Who answers the names a route dials: the host's resolver, the leg's proxy, or Weaver asking listed servers. */
@@ -35,7 +35,7 @@ export type DnsProfile = {
   usedByProxies: number;
 };
 /** A profile as a route's DNS select reads it: System and the route profiles, read by kind. */
-export type DnsProfileChoice = Pick<DnsProfile, "id" | "name" | "who" | "trust" | "systemFallback">;
+export type DnsProfileChoice = Pick<DnsProfile, "id" | "name" | "who" | "transit" | "trust" | "systemFallback">;
 /** A profile as a proxy's editor offers it: its name alone, System and the proxy name profiles, read by kind. */
 export type DnsProfileName = Pick<DnsProfile, "id" | "name">;
 /** What a profile's editor starts from. A proxy name profile has no transit and no system fallback. */
@@ -575,4 +575,37 @@ export function routeCaption(
       return [named(names.egresses, leg.egressId), ...hops].join(" → ");
     })
     .join(", ");
+}
+
+/**
+ * Where a leg's names are looked up, as its route's DNS profile has it: from
+ * the egress (the host's resolver, or Weaver asking its listed servers), at or
+ * through the proxy carrying the leg now, or nowhere, for a profile that hands
+ * names to a proxy on a leg with none and no fallback to the host.
+ */
+export type LegResolver =
+  | { at: "egress"; by: "HOST" | "SERVERS"; profile: string }
+  | { at: "proxy"; by: "PROXY" | "SERVERS"; profile: string; proxyId: number | null; poolId: number | null }
+  | { at: "none" };
+
+/** The proxy the leg leaves through now: the last hop of a chain, a pool's chosen member. Null when it goes direct. */
+function activeExit(leg: LegFlow): { proxyId: number | null; poolId: number | null } | null {
+  if (leg.path.kind === "DIRECT") return null;
+  const rung = leg.path.rungs[leg.selectedRung ?? 0];
+  if (!rung) return null;
+  if (rung.kind === "PROXY") return { proxyId: rung.proxyId, poolId: null };
+  if (rung.kind === "CHAIN") return { proxyId: rung.chainIds.at(-1) ?? null, poolId: null };
+  return { proxyId: leg.selectedProxyId ?? null, poolId: rung.poolId };
+}
+
+export function legResolver(leg: LegFlow, profile: DnsProfileChoice): LegResolver {
+  const exit = activeExit(leg);
+  if (profile.who === "SYSTEM") return { at: "egress", by: "HOST", profile: profile.name };
+  if (profile.who === "PROXY") {
+    if (exit) return { at: "proxy", by: "PROXY", profile: profile.name, ...exit };
+    return profile.systemFallback ? { at: "egress", by: "HOST", profile: profile.name } : { at: "none" };
+  }
+  return exit && profile.transit === "PROXY"
+    ? { at: "proxy", by: "SERVERS", profile: profile.name, ...exit }
+    : { at: "egress", by: "SERVERS", profile: profile.name };
 }

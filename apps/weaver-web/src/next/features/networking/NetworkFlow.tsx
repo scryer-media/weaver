@@ -18,6 +18,7 @@ import {
   type ProxyPool,
   type Rung,
 } from "@/lib/networking";
+import { legResolver, SYSTEM_DNS_PROFILE_ID, type DnsProfileChoice } from "@/lib/dns";
 import { proxyFaultSentence } from "@/lib/proxy-fault";
 import { proxyLabels, type ProxyProfile } from "@/lib/proxies";
 import { networkIds } from "@/next/testids";
@@ -99,6 +100,10 @@ const DIRECT_X = 14;
 const DIRECT_GAP = 6;
 /** The connections that fill the widest ribbon, unless a cap is larger: twenty is not many. */
 const RIBBON_FULL = 100;
+/** The strip a leg's row adds below it for its DNS chip, and the chip's own height. */
+const DNS_STRIP = 30;
+const DNS_CHIP = 20;
+const DNS_SIZE = 9.5;
 const EGRESS_PAGE = "/settings/networking/egress";
 const PROXIES_PAGE = "/settings/networking/proxies";
 const routePage = (consumer: string) => `/settings/networking/routes?consumer=${encodeURIComponent(consumer)}`;
@@ -145,6 +150,8 @@ type Row = {
   /** Where the line with no tunnel crosses, or null when the leg has none. */
   bypass: number | null;
   closed: boolean;
+  /** Where the leg's DNS chip stands, below the row's top; null when none is drawn. */
+  dnsTop: number | null;
 };
 
 /**
@@ -700,6 +707,7 @@ export const NetworkFlow = memo(function NetworkFlow({
   trace = false,
   toggles,
   fitWidth = false,
+  dns,
 }: {
   flow: Flow;
   egresses: Egress[];
@@ -721,6 +729,12 @@ export const NetworkFlow = memo(function NetworkFlow({
    * chosen by the caller, as a job's panel and its enlarged view show them.
    */
   fitWidth?: boolean;
+  /**
+   * The route DNS profiles. Given them, each leg gets a strip below its row
+   * with a chip in the lane its names are looked up from, and a dashed line
+   * back to it from where the leg arrives.
+   */
+  dns?: DnsProfileChoice[];
 }) {
   const t = useTranslate();
   const [hover, setHover] = useState<Focus | null>(null);
@@ -855,9 +869,12 @@ export const NetworkFlow = memo(function NetworkFlow({
       const note = leg.reason ? wrap(leg.reason, LEGS.width - 28, 9.5, 2) : [];
       const cardHeight = LEG_HEIGHT + noteHeight(note.length);
       const y = offset;
-      const height = Math.max(cardHeight, closed ? BOX_HEIGHT : bypass == null ? bottom - 8 : bypass + 16);
+      let height = Math.max(cardHeight, closed ? BOX_HEIGHT : bypass == null ? bottom - 8 : bypass + 16);
+      // A leg behind a kill switch dials nothing, so it looks nothing up.
+      const dnsTop = dns && !closed ? height + (DNS_STRIP - DNS_CHIP) / 2 : null;
+      if (dnsTop !== null) height += DNS_STRIP;
       offset += height + 18;
-      rows.push({ leg, y, height, cardHeight, note, blocks, bypass, closed });
+      rows.push({ leg, y, height, cardHeight, note, blocks, bypass, closed, dnsTop });
     }
     // The one endpoint stands level with the middle of everything that leads to it.
     const middle = (58 + Math.max(offset - 18, egressBottom)) / 2;
@@ -868,7 +885,7 @@ export const NetworkFlow = memo(function NetworkFlow({
       single ? endpointY + ENDPOINT_BOX_HEIGHT : cardsBottom,
     );
     return { rows, endpointY, height: single ? bottom + 12 : Math.max(bottom + 52, 260) };
-  }, [order.legs, flow.pools, pools, profiles, egressBottom, cardsBottom, single, toggleWidth, overrides, t]);
+  }, [order.legs, flow.pools, pools, profiles, egressBottom, cardsBottom, single, toggleWidth, overrides, t, dns]);
 
   // A flow no leg tunnels through has no proxy lane: the endpoints stand where it would start, and
   // a leg's line runs straight to its endpoint with nothing written on it.
@@ -1608,6 +1625,69 @@ export const NetworkFlow = memo(function NetworkFlow({
               </g>
             );
           })}
+
+          {dns
+            ? layout.rows.map(({ leg, y, dnsTop }) => {
+                const chosen = dns.find(
+                  (candidate) =>
+                    candidate.id ===
+                    (consumers.find((consumer) => consumer.key === leg.consumer)?.route?.dnsProfileId ??
+                      SYSTEM_DNS_PROFILE_ID),
+                );
+                if (dnsTop === null || !chosen) return null;
+                const where = legResolver(leg, chosen);
+                const egress = egresses.find((candidate) => candidate.id === leg.egressId)?.name ?? "";
+                let label: string;
+                let note: string;
+                if (where.at === "none") {
+                  label = t("next.networking.flow.dnsNone");
+                  note = t("next.networking.flow.dnsNoneNote", { profile: chosen.name });
+                } else if (where.at === "egress") {
+                  label = where.by === "HOST" ? t("next.networking.flow.dnsHost") : t("next.networking.flow.dnsServers", { profile: where.profile });
+                  note = t("next.networking.flow.dnsFrom", { profile: where.profile, egress });
+                } else {
+                  const exit = where.proxyId != null ? name(where.proxyId) : poolName(where.poolId);
+                  const tunnel = where.proxyId != null && profile(where.proxyId)?.kind === "WIRE_GUARD";
+                  label =
+                    where.by === "SERVERS"
+                      ? t("next.networking.flow.dnsServers", { profile: where.profile })
+                      : t(tunnel ? "next.networking.flow.dnsTunnel" : "next.networking.flow.dnsProxy", { proxy: exit });
+                  note = t(where.by === "SERVERS" ? "next.networking.flow.dnsThrough" : "next.networking.flow.dnsBy", {
+                    profile: where.profile,
+                    proxy: exit,
+                  });
+                }
+                // The chip stands in the lane the lookup leaves from: the leg's own for its egress, the proxy's for the proxy.
+                const chipLane = where.at === "proxy" ? PROXY : LEGS;
+                const top = y + dnsTop;
+                const mid = top + DNS_CHIP / 2;
+                const chipWidth = Math.min(chipLane.width, Math.ceil(label.length * DNS_SIZE * 0.6) + 32);
+                const end = chipLane.x + chipWidth;
+                const color = where.at === "none" ? stateColor("BLOCKED") : INK.warn;
+                const arrives = endpoint
+                  ? layout.endpointY + ENDPOINT_BOX_HEIGHT / 2
+                  : (cards.get(leg.consumer)?.anchor ?? 58 + ENDPOINT_HEIGHT / 2);
+                return (
+                  <g key={`dns:${legKey(leg)}`} opacity={onRoute(leg) ? undefined : FADE} {...point({ kind: "leg", key: legKey(leg) })}>
+                    <title>{note}</title>
+                    {/* From where the leg arrives back to where its names were answered. */}
+                    <path
+                      d={`M ${endpoints.x} ${arrives} L ${endpoints.x - 16} ${mid} L ${end + 4} ${mid}`}
+                      fill="none"
+                      stroke={color}
+                      strokeWidth="1.2"
+                      strokeDasharray="4 3"
+                    />
+                    <path d={`M ${end + 10} ${mid - 4} L ${end + 3} ${mid} L ${end + 10} ${mid + 4}`} fill="none" stroke={color} strokeWidth="1.2" />
+                    <rect x={chipLane.x} y={top} width={chipWidth} height={DNS_CHIP} rx={DNS_CHIP / 2} fill={INK.card} stroke={color} />
+                    <rect x={chipLane.x + 11} y={mid - 3.5} width="7" height="7" fill={color} />
+                    <text x={chipLane.x + 24} y={mid + 3.5} fill={INK.secondary} fontSize={DNS_SIZE}>
+                      {fit(label, chipWidth - 32, DNS_SIZE)}
+                    </text>
+                  </g>
+                );
+              })
+            : null}
 
           {endpoint ? (
             <g

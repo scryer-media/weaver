@@ -6,6 +6,7 @@ import { test } from "node:test";
 import {
   MAX_DNS_SERVERS,
   capabilityTable,
+  legResolver,
   dnsProfileName,
   dnsWhoKey,
   dnsRouteProblem,
@@ -35,7 +36,7 @@ import {
   type DnsServerRow,
   type DnsTestRun,
 } from "../src/lib/dns.ts";
-import type { NetworkRoute } from "../src/lib/networking.ts";
+import type { LegFlow, NetworkRoute } from "../src/lib/networking.ts";
 import { Kind, type DocumentNode, type FieldNode } from "graphql";
 import { DNS_PROFILE_CHOICES_QUERY, DNS_PROFILE_NAMES_QUERY, DNS_QUERY } from "../src/graphql/dns.ts";
 
@@ -65,7 +66,7 @@ test("each DNS read asks for one kind of profile, and only the fields its caller
     },
   });
   assert.deepEqual(profileReads(DNS_PROFILE_CHOICES_QUERY), {
-    dnsProfiles: { kind: "ROUTE", fields: ["id", "name", "who", "trust", "systemFallback"] },
+    dnsProfiles: { kind: "ROUTE", fields: ["id", "name", "who", "transit", "trust", "systemFallback"] },
   });
   assert.deepEqual(profileReads(DNS_PROFILE_NAMES_QUERY), { dnsProfiles: { kind: "PROXY_NAME", fields: ["id", "name"] } });
 });
@@ -418,4 +419,31 @@ test("the results caption names each leg's egress and the proxies it goes throug
   // A ladder's direct fallback comes last.
   const fallback: NetworkRoute = { ...route, legs: [{ ...route.legs[0]!, path: { ...route.legs[0]!.path, directFallback: true } }] };
   assert.equal(routeCaption(fallback, names, "Direct"), "System → Mullvad + Exit → Pool A → Direct");
+});
+
+test("a leg's names are looked up where its route's profile says, through the proxy carrying it now", () => {
+  const base: LegFlow = {
+    consumer: "server:1", position: 0, egressId: 2, weight: 100, target: 4, open: 0, opening: 0, state: "ACTIVE", reason: null, pinnedAddress: null,
+    path: { kind: "LADDER", directFallback: true, rungs: [
+      { kind: "CHAIN", proxyId: null, poolId: null, chainIds: [5, 6] },
+      { kind: "POOL", proxyId: null, poolId: 9, chainIds: [] },
+    ] },
+  };
+  const direct: LegFlow = { ...base, path: { kind: "DIRECT", rungs: [], directFallback: false } };
+  const profile = (who: "SYSTEM" | "PROXY" | "WEAVER", transit: "EGRESS" | "PROXY" | null, systemFallback = false) =>
+    ({ id: 1, name: "P", who, transit, trust: "AS_SENT" as const, systemFallback });
+
+  assert.deepEqual(legResolver(base, profile("SYSTEM", null)), { at: "egress", by: "HOST", profile: "P" });
+  // A chain hands the name to its last hop.
+  assert.deepEqual(legResolver(base, profile("PROXY", null)), { at: "proxy", by: "PROXY", profile: "P", proxyId: 6, poolId: null });
+  // A pool's chosen member, once the leg is on that rung.
+  assert.deepEqual(legResolver({ ...base, selectedRung: 1, selectedProxyId: 11 }, profile("WEAVER", "PROXY")), {
+    at: "proxy", by: "SERVERS", profile: "P", proxyId: 11, poolId: 9,
+  });
+  // Gone direct past the ladder, Weaver's servers are asked from the egress.
+  assert.deepEqual(legResolver({ ...base, selectedRung: 2 }, profile("WEAVER", "PROXY")), { at: "egress", by: "SERVERS", profile: "P" });
+  assert.deepEqual(legResolver(base, profile("WEAVER", "EGRESS")), { at: "egress", by: "SERVERS", profile: "P" });
+  // Handed to a proxy on a leg with none: the host only when the profile falls back to it.
+  assert.deepEqual(legResolver(direct, profile("PROXY", null, true)), { at: "egress", by: "HOST", profile: "P" });
+  assert.deepEqual(legResolver(direct, profile("PROXY", null)), { at: "none" });
 });
