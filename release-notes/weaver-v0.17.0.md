@@ -86,7 +86,8 @@ Weaver ships a new engine crate, `weaver-torrent`, and a new uTP crate,
 
 ## Torrents: rules, settings and the queue
 
-- **Tracker rules.** Match torrents by tracker. A rule sets the client
+- **Tracker rules.** A named rule covers one or more tracker hosts. A
+  rule sets the client
   name, discovery switches, encryption, transports and dial order, upload
   cap, seeding goals, unpack, forced start, route, SSL identity, and
   whether the schedule may pause its torrents.
@@ -94,8 +95,12 @@ Weaver ships a new engine crate, `weaver-torrent`, and a new uTP crate,
   take one override chain: torrent, then tracker rule, then category, then
   global.
 - **Seeding.** Ratio, seed time and inactivity goals, and a seeding
-  window on the schedule. When a goal is met the torrent pauses, stops or
-  is removed. A removal with an unmet goal asks first.
+  window on the schedule. Seed time counts every second seeded, or only
+  the current run when the goal is set to continuous. A tracker rule's
+  goals take only what is stricter from the levels below it. When a goal
+  is met the torrent pauses, stops or is removed. A removal with an unmet
+  goal asks first. The queue shows each seeding torrent's progress toward
+  its ratio and seed time goals.
 - **Queue.** Queue positions, forced start, sequential download,
   first-and-last-piece first, file priorities, per-torrent rate limits,
   set location and recheck.
@@ -106,8 +111,8 @@ Weaver ships a new engine crate, `weaver-torrent`, and a new uTP crate,
 - **Files missing.** A torrent whose files are gone is held stopped as
   files missing.
 - **Unpacking.** A torrent with archives is unpacked through the same
-  engine and status rules as an NZB job. It is on by default, and a
-  category, tracker rule or torrent may override it. The unpack has its
+  engine and status rules as an NZB job. It is off by default, and a
+  category, tracker rule or torrent may turn it on. The unpack has its
   own line and never touches the torrent's state, history or counters.
 - **Torrents off.** With torrents turned off, nothing offers a new
   torrent, and RSS torrent items wait and are retried later. Turning
@@ -158,7 +163,10 @@ Weaver ships a new engine crate, `weaver-torrent`, and a new uTP crate,
 - **Route health per hop.** A proxy's health follows each of its hops. A
   slow or failing destination no longer marks a live proxy down.
 - **WireGuard.** Tunnels batch their UDP and run on their own thread. One
-  live session per key pair. Routes fail over and reconnect at once.
+  live session per key pair. Routes fail over and reconnect at once. TCP
+  inside a tunnel now runs congestion control, so uploads no longer lose
+  most of each burst. A tunnel saved through the API with no keepalive
+  gets the default one, as the web form always gave.
 - **Legacy routes.** The old per-hop providers and consumer ladder are
   deleted.
 - **No leaks.** Only the routing layer resolves names. The host resolver
@@ -171,7 +179,8 @@ Weaver ships a new engine crate, `weaver-torrent`, and a new uTP crate,
 - **Transports.** Servers are asked over plain UDP and TCP, TLS or HTTPS.
   A server that fails its TLS check is skipped for the next one. It is
   never asked in plain text. Encrypted connections are kept between
-  lookups.
+  lookups. A DNS over HTTPS server may be named by its host and dialled
+  at the address given beside it, so the host is never looked up.
 - **DNSSEC.** A new crate, `weaver-dnssec`, checks answers from the root
   keys down and names the reason for each refusal. Private names read as
   unsigned. Ed448 signatures are not checked. It uses aws-lc-rs, with an
@@ -179,8 +188,6 @@ Weaver ships a new engine crate, `weaver-torrent`, and a new uTP crate,
 - **Server test.** A DNS page tests each server's plain, TCP, TLS, HTTPS
   and DNSSEC support through the chosen route, running the lookup's own
   code.
-- **Editor.** The DNSSEC field is an Off/On switch, and the DNS over TLS
-  name field is now called Certificate hostname.
 
 ## Bandwidth, quotas and usage
 
@@ -198,7 +205,9 @@ Weaver ships a new engine crate, `weaver-torrent`, and a new uTP crate,
 ## Usenet, archives and repair
 
 - **Partial means something usable.** A job is Partial only when a whole,
-  usable file that is not furniture was delivered. Clients that select
+  usable file was delivered. An `.nfo` or other furniture counts when it
+  is all that came whole. Archive volumes, split parts and recovery files
+  never count. Clients that select
   the new `outcome` field see `PARTIAL`. A Partial job's reason names
   what it lacks.
 - **Unwanted extensions.** The action is now a setting: fail the job, or
@@ -233,9 +242,29 @@ Weaver ships a new engine crate, `weaver-torrent`, and a new uTP crate,
 - **Health.** The health probe and the first-article gate count the
   recovery the graph bound, and ask only articles not known gone.
 - **Passwords.** A job given a password that opens nothing says so.
+- **Disk room.** A job starts only when what it has left to fetch fits on
+  its disk above the reserve, less what running jobs are promised. A job
+  that does not fit is passed over for smaller ones, and one larger than
+  the disk says so. A final move books room on the destination before it
+  writes. Torrents start by the same rule.
+- **Slow disks.** A download held by a slow destination disk shows as
+  writing to disk, not as stalled, and its time left holds steady.
+- **Stored members.** A zip, RAR or 7z member stored uncompressed whose
+  lost bytes nothing can bring back is checked against its CRC with zeros
+  in their place, and delivered when it passes.
+- **Zip.** A zip whose directory misstates sizes, or whose end record is
+  not where its directory says, still unpacks. A zip posted alone that
+  lost a member leaves the job short.
+- **Compressed sidecars.** Below the root, a subtitle, cue sheet or
+  release text under `.gz`, `.xz`, `.bz2` or `.zst` unpacks beside its
+  payload. Other compressed files stay packed.
+- **Start-up.** A finished job left active by a failed archive no longer
+  holds a download slot after a restart.
 
 ## History, facades and diagnostics
 
+- **Usenet or torrent.** The queue and history filter by kind of job and
+  count each kind.
 - **NZBGet facade.** `HistoryDelete` archives the job and keeps it in
   Weaver's own history. A stopped rate reads as paused.
 - **Completion.** A job shows finished only once its history is written.
@@ -255,6 +284,9 @@ Weaver ships a new engine crate, `weaver-torrent`, and a new uTP crate,
   - A Control key saves and moves only under the save folders.
 - **Encrypted at rest.** Tracker passkeys and RSS links are encrypted with
   the instance key.
+- **Signing keys.** The login, CSRF and script-run keys are derived from
+  the instance's master key, and the stored signing secret is deleted.
+  Changing the password changes the login key.
 - **Requests.** The facade takes a change only as a POST, and refuses
   internationalized host names.
 
@@ -293,6 +325,10 @@ Weaver ships a new engine crate, `weaver-torrent`, and a new uTP crate,
     queue items and history items. `state` and `status` still read a
     partial job as failed.
   - A `tag` filter on `jobs` and `jobCount`.
+  - `protocol` on queue and history items, a `protocol` filter on the
+    queue and history pages, and per-protocol counts on each.
+  - `diskVolumes` on the download block, and `diskWrite` on queue items,
+    for a disk that is slow or still being written.
   - A `torrent` argument on `testVia`.
 - **Deprecated:** `setSpeedLimit` and `setQueueSpeedLimit`. Use
   `setBandwidth`.
@@ -308,10 +344,13 @@ Weaver ships a new engine crate, `weaver-torrent`, and a new uTP crate,
     `upload` in place of `bytesPerSec`.
   - Nullable limits: `speedLimitBytesPerSec`, `scheduledSpeedLimit` and
     `speedLimitInForce` are now nullable. Null is no limit.
+  - Release parsing: `parsedRelease` is gone from jobs, queue items and
+    history items, with the `ParsedRelease` and `ParsedEpisode` types.
+    Display titles read as before.
 
 ## Upgrade notes
 
-- **Migrations.** Database migrations 93 to 133 run automatically on
+- **Migrations.** Database migrations 93 to 138 run automatically on
   SQLite and Postgres. A 0.16.17 database upgrades in place.
 - **Torrents stay off** until the server is started with
   `WEAVER_TORRENTS=1` and torrents are turned on in Settings.
@@ -322,18 +361,23 @@ Weaver ships a new engine crate, `weaver-torrent`, and a new uTP crate,
 - **Unwanted files are deleted by default.** Jobs holding a file on the
   unwanted extension list now end Partial instead of Failed. To keep the
   old behaviour, set the action to fail the job.
+- **Sign in again.** The upgrade ends every browser session. API keys are
+  not affected.
 - **Speed limit clients.** Clients that set `maxDownloadSpeed` must move
-  to `setBandwidth`.
+  to `setBandwidth`. Clients that read `parsedRelease` must stop.
 
 ## Dependencies
 
 - **New crates:** `weaver-torrent`, `weaver-utp`, `weaver-dnssec`
   (MIT OR Apache-2.0), and the `host_name_lookup` lint.
 - **Updated:**
-  - proxy-tunnels 0.5.3 to 0.7.0.
+  - proxy-tunnels 0.5.3 to 0.8.2.
   - par2-rs 0.12.0 to 0.13.0.
-  - unrar-rs 0.16.3 to 0.16.6. 0.16.5 unpacks the RAR4 solid PPMd set
+  - unrar-rs 0.16.3 to 0.16.8. 0.16.5 unpacks the RAR4 solid PPMd set
     that 0.16.3 refused.
+  - sevenz-turbo 0.30.1 to 0.30.4, lzma-turbo 0.12.0 to 0.12.1 and
+    reedsolomon-rs 0.4.11 to 0.4.12.
+- **Removed:** `scryer-release-parser`.
 - **New for DNS:** `rustls-native-certs`, so DNS over TLS trusts the
   host's roots, plus `rsa` and `ml-dsa` for DNSSEC.
 
