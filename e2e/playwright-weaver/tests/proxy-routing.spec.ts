@@ -301,10 +301,11 @@ test("a proxy Weaver resolves for is handed the address and carries a download",
   }
 });
 
-// A hop holds what its DNS servers answered for as long as the answer's TTL
-// says. A connection test borrows the hop a live server built, so it asks
-// the servers again while their answers are for no time at all, and not once
-// they are held.
+// A live server's hop holds what its DNS servers answered for as long as the
+// answer's TTL says. Each step cuts the server's connections, so its next
+// download dials again: it asks the servers again while their answers are for
+// no time at all, and not once they are held. A connection test is no witness
+// here: it asks its DNS itself and borrows nothing the live route holds.
 test("a proxy hop holds its DNS servers' answer for its TTL", async ({ request }) => {
   const events = async (after: number) => {
     const response = await request.get(`${controlUrl}/events?after=${after}`);
@@ -339,31 +340,33 @@ test("a proxy hop holds its DNS servers' answer for its TTL", async ({ request }
   const added = await graphql<{ addServer: { id: number } }>(request,
     `mutation($input: ServerInput!) { addServer(input: $input) { id } }`, { input: { ...input, active: true } });
   await setRouteDnsProfile(request, "SERVER", added.addServer.id, dns.profile.id);
-  const probe = async () => {
-    const result = (await graphql<{ testConfiguredServerConnection: { success: boolean; message: string } }>(request,
-      `mutation($id: Int!) { testConfiguredServerConnection(id: $id) { success message } }`, { id: added.addServer.id })).testConfiguredServerConnection;
-    expect(result).toMatchObject({ success: true });
+  // The events of one download made on fresh connections: the window opens
+  // before the cut, so the redial it forces is inside it.
+  const redialAndDownload = async (download: string) => {
+    const start = await mark();
+    await control({ route: "primary", cut: true });
+    const jobId = await startDownload(request, download);
+    await expect.poll(async () => await jobState(request, jobId), { timeout: 0 }).toBe("COMPLETED");
+    return (await events(start)).events;
   };
   const lookups = (seen: Event[]) => seen.filter(event => event.kind === "routed-dns" && event.name === name);
+  const dials = (seen: Event[]) => seen.filter(event => event.kind === "attempt" && event.route === "primary" && event.port === fixture.ports.nntp);
   try {
-    const jobId = await startDownload(request, "proxy-held-answers");
-    await expect.poll(async () => await jobState(request, jobId), { timeout: 0 }).toBe("COMPLETED");
+    let seen = await redialAndDownload("proxy-held-answers-first");
+    expect(lookups(seen).length, "the first dial asks the servers").toBeGreaterThan(0);
 
-    let start = await mark();
-    await probe();
-    expect(lookups((await events(start)).events).length, "an answer for no time at all is asked for again").toBeGreaterThan(0);
+    seen = await redialAndDownload("proxy-held-answers-no-ttl");
+    expect(dials(seen).length, "the cut connections are dialled again").toBeGreaterThan(0);
+    expect(lookups(seen).length, "an answer for no time at all is asked for again").toBeGreaterThan(0);
 
     await control({ dnsTtl: 3600 });
-    start = await mark();
-    await probe();
-    expect(lookups((await events(start)).events).length, "nothing was held, so the servers are asked").toBeGreaterThan(0);
+    seen = await redialAndDownload("proxy-held-answers-asked");
+    expect(lookups(seen).length, "nothing was held, so the servers are asked").toBeGreaterThan(0);
 
-    start = await mark();
-    await probe();
-    const seen = (await events(start)).events;
+    seen = await redialAndDownload("proxy-held-answers-held");
+    expect(dials(seen).length, "the cut connections are dialled again").toBeGreaterThan(0);
     expect(lookups(seen), "a held answer asks the servers nothing").toEqual([]);
     expect(seen.filter(event => event.kind === "attempt" && event.port === fixture.ports.dns), "no lookup is dialled through the proxy").toEqual([]);
-    expect(seen.filter(event => event.kind === "attempt" && event.route === "primary" && event.port === fixture.ports.nntp).length).toBeGreaterThan(0);
   } finally {
     await control({ dnsTtl: 0 });
     await graphql(request, `mutation($id: Int!, $input: ServerInput!) { updateServer(id: $id, input: $input) { id } }`,
