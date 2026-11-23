@@ -54,7 +54,7 @@ test("flow displays route evidence, opens editors, and edits weights without los
  const page=await browser.newPage({viewport:{width:1440,height:2700}});page.setDefaultTimeout(0);const errors=[];page.on("pageerror",error=>errors.push(error.message));
  await page.goto(`${baseUrl}/tests/browser/networking.html`);
  const diagram=page.locator("svg[aria-label^='Egress interfaces']").first();
- const lanes=["ROUTE LEGS","EGRESS INTERFACES","PROXIES","ENDPOINTS"];
+ const lanes=["ROUTES","EGRESS INTERFACES","PROXIES","ENDPOINTS"];
  for(const lane of lanes)await diagram.getByText(lane,{exact:true}).waitFor();
  const laneX=await Promise.all(lanes.map(async lane=>Number(await diagram.getByText(lane,{exact:true}).getAttribute("x"))));
  assert.deepEqual(laneX,[...laneX].sort((a,b)=>a-b));

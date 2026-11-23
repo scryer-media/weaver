@@ -79,16 +79,18 @@ const lane = (x: number, width: number): Lane => ({ x, width, end: x + width });
 /** The four lanes, left to right: each route's legs, the egress each leaves on, its proxies, its endpoint. Ribbons cross the gaps between them. */
 const LEGS = lane(16, 300);
 const EGRESS = lane(372, 214);
-const PROXY = lane(642, 440);
-const ENDPOINTS = lane(1138, 214);
-const WIDTH = 1368;
+/** The proxy lane is wide only when a chain lays its hops side by side across it. */
+const PROXY_WIDE = lane(642, 440);
+const PROXY_REGULAR = lane(642, 260);
+const ENDPOINTS_WIDE = lane(1138, 214);
+const WIDTH_WIDE = 1368;
 const HOP_GAP = 26;
 /** How wide each hop of a chain of `hops` is, side by side across the proxy lane. */
-const hopWidth = (hops: number) => (PROXY.width - (hops - 1) * HOP_GAP) / hops;
+const hopWidth = (proxy: Lane, hops: number) => (proxy.width - (hops - 1) * HOP_GAP) / hops;
 /** Where each gap between a chain's hops starts and ends across the proxy lane. */
-const chainGaps = (hops: number): [number, number][] =>
+const chainGaps = (proxy: Lane, hops: number): [number, number][] =>
   Array.from({ length: hops - 1 }, (_, gap) => {
-    const from = PROXY.x + (gap + 1) * hopWidth(hops) + gap * HOP_GAP;
+    const from = proxy.x + (gap + 1) * hopWidth(proxy, hops) + gap * HOP_GAP;
     return [from, from + HOP_GAP];
   });
 const ENDPOINT_BOX_HEIGHT = 76;
@@ -118,6 +120,8 @@ const RIBBON_FULL = 100;
 const DNS_ROW = 28;
 const DNS_PILL = 20;
 const DNS_SIZE = 9.5;
+/** The room the DNS mark takes at the start of every pill. */
+const DNS_MARK = 13;
 /** A DNS answer card: its title's line, then a row for each server or a line saying who it is. */
 const DNS_CARD_HEAD = 30;
 const DNS_SERVER_ROW = 26;
@@ -652,8 +656,9 @@ function UpDownSwitch({
   );
 }
 
-/** How wide a DNS pill is for its words, with room for a lock before them. */
-const pillWidth = (label: string, locked: boolean) => Math.ceil(label.length * DNS_SIZE * 0.6) + 20 + (locked ? 12 : 0);
+/** How wide a DNS pill is for its words, with room for the DNS mark and a lock before them. */
+const pillWidth = (label: string, locked: boolean) =>
+  Math.ceil(label.length * DNS_SIZE * 0.6) + 20 + DNS_MARK + (locked ? 12 : 0);
 
 /** A padlock, centred on `x`, `y`: DNSSEC on the one asking, DoT or DoH on the line. */
 function Lock({ x, y, color }: { x: number; y: number; color: string }) {
@@ -683,11 +688,14 @@ function DnsPill({
 }) {
   const color = refused ? stateColor("BLOCKED") : INK.dns;
   const shown = width ?? pillWidth(label, locked);
-  const textX = x + 10 + (locked ? 12 : 0);
+  const textX = x + 10 + DNS_MARK + (locked ? 12 : 0);
   return (
     <g>
       <rect x={x} y={mid - DNS_PILL / 2} width={shown} height={DNS_PILL} rx={DNS_PILL / 2} fill={INK.dnsFill} stroke={color} />
-      {locked ? <Lock x={x + 15} y={mid} color={color} /> : null}
+      <g transform={`translate(${x + 8} ${mid - 5})`} color={color}>
+        <Icon name="dns" size={10} />
+      </g>
+      {locked ? <Lock x={x + 15 + DNS_MARK} y={mid} color={color} /> : null}
       <text x={textX} y={mid + 3.5} fill={INK.secondary} fontSize={DNS_SIZE}>
         {fit(label, x + shown - 8 - textX, DNS_SIZE)}
       </text>
@@ -876,6 +884,13 @@ export const NetworkFlow = memo(function NetworkFlow({
   const cards = useMemo(() => endpointCards(shown, flow.legs), [shown, flow.legs]);
   const cardsBottom = [...cards.values()].reduce((bottom, card) => Math.max(bottom, card.y + card.height), 0);
 
+  // A chain draws its hops side by side and needs the wide lane; every other proxy box keeps a card's width.
+  const chained = order.legs.some(
+    (leg) => leg.path.kind !== "DIRECT" && leg.path.rungs.some((rung) => rung.kind === "CHAIN" && rung.chainIds.length > 1),
+  );
+  const PROXY = chained ? PROXY_WIDE : PROXY_REGULAR;
+  const ENDPOINTS = lane(ENDPOINTS_WIDE.x + PROXY.width - PROXY_WIDE.width, ENDPOINTS_WIDE.width);
+  const WIDTH = WIDTH_WIDE + PROXY.width - PROXY_WIDE.width;
   const layout = useMemo(() => {
     let offset = 58;
     const rows: Row[] = [];
@@ -918,7 +933,7 @@ export const NetworkFlow = memo(function NetworkFlow({
         // A failing hop says why inside its own box: the hop's in a chain, the member's row in a pool.
         const boxWidth =
           rung.kind === "CHAIN"
-            ? hopWidth(rung.chainIds.length)
+            ? hopWidth(PROXY, rung.chainIds.length)
             : PROXY.width;
         const note =
           failing && !members.some((member) => member.id === failing.proxyId)
@@ -984,7 +999,7 @@ export const NetworkFlow = memo(function NetworkFlow({
       single ? endpointY + ENDPOINT_BOX_HEIGHT : cardsBottom,
     );
     return { rows, endpointY, height: single ? bottom + 12 : Math.max(bottom + 52, 260) };
-  }, [order.legs, flow.pools, pools, profiles, egressBottom, cardsBottom, single, toggleWidth, overrides, t, lookups]);
+  }, [order.legs, flow.pools, pools, profiles, egressBottom, cardsBottom, single, toggleWidth, overrides, t, lookups, PROXY]);
 
   // A flow no leg tunnels through has no proxy lane: the endpoints stand where it would start, and
   // a leg's line runs straight to its endpoint with nothing written on it.
@@ -1103,7 +1118,7 @@ export const NetworkFlow = memo(function NetworkFlow({
       const block = blocks.find((candidate) => candidate.dnsTop !== null);
       if (!block) continue;
       const hops = block.rung.kind === "CHAIN" ? block.rung.chainIds.length : 1;
-      const x = PROXY.x + (hops - 1) * (hopWidth(hops) + HOP_GAP) + 14;
+      const x = PROXY.x + (hops - 1) * (hopWidth(PROXY, hops) + HOP_GAP) + 14;
       const mid = y + block.top + block.dnsTop! + 4 + DNS_PILL / 2;
       origins.push({ origin: { x, mid, boxEnd: PROXY.end, gapY: null }, lookup, profile: found.profile, legs: [leg] });
     }
@@ -1277,7 +1292,7 @@ export const NetworkFlow = memo(function NetworkFlow({
     const ground = <rect x={PROXY.x} y={y} width={PROXY.width} height={block.height} fill="transparent" />;
 
     if (rung.kind === "CHAIN") {
-      const boxWidth = hopWidth(rung.chainIds.length);
+      const boxWidth = hopWidth(PROXY, rung.chainIds.length);
       const failingAt = failing ? rung.chainIds.indexOf(failing.proxyId) : -1;
       return (
         <g key={rungIndex} role="group" aria-label={rung.chainIds.map(name).join(" > ")} {...way}>
@@ -1562,7 +1577,7 @@ export const NetworkFlow = memo(function NetworkFlow({
                   stop: PROXY.x + (carriers.length ? MEMBER_INSET : 0),
                   resume: PROXY.end - (carriers.length ? MEMBER_INSET : 0),
                   // A chain's line runs on through the gap between each hop and the next.
-                  gaps: block.rung.kind === "CHAIN" ? chainGaps(block.rung.chainIds.length) : [],
+                  gaps: block.rung.kind === "CHAIN" ? chainGaps(PROXY, block.rung.chainIds.length) : [],
                   status,
                 };
               }),
