@@ -6,6 +6,7 @@ import { useClient, useQuery, useSubscription, type Client } from "urql";
 import type { DocumentNode } from "graphql";
 import { NETWORK_FLOW_QUERY, NETWORK_FLOW_SUBSCRIPTION, NETWORKING_QUERY } from "@/graphql/networking";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
+import { usePageVisible } from "@/lib/page-visible";
 import {
   allocation,
   closedPath,
@@ -195,7 +196,9 @@ async function runNetworkingAction(
 /**
  * Everything the networking pages read, and the one way they write.
  *
- * The live flow is only subscribed to on the pages that draw it.
+ * The live flow is only subscribed to on the pages that draw it, and only
+ * while the tab is shown: a hidden tab follows nothing, and the stream's first
+ * frame on return is the flow as it stands.
  */
 export function useNetworkingWorkspace(page: string) {
   const t = useTranslate();
@@ -212,9 +215,10 @@ export function useNetworkingWorkspace(page: string) {
     requestPolicy: "cache-and-network",
     pause: !live,
   });
+  const visible = usePageVisible();
   const [subscription] = useSubscription<{ networkFlow: NetworkFlow }>({
     query: NETWORK_FLOW_SUBSCRIPTION,
-    pause: !live,
+    pause: !live || !visible,
   });
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);

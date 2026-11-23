@@ -5,12 +5,10 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useTranslate } from "@/lib/context/translate-context";
 import type { NetworkFlow as Flow } from "@/lib/networking";
 import { DetailBlock } from "../../components/chrome";
-import { SecondaryButton } from "../../components/controls";
-import { Dialog } from "../../components/Dialog";
 import { useNetworkingWorkspace } from "./data";
 import { useFlowDns } from "./dns-choices";
-import { FlowEditor } from "./FlowEditor";
-import { NetworkFlow, type FlowTarget } from "./NetworkFlow";
+import { type FlowTarget } from "./NetworkFlow";
+import { FlowPreview } from "./FlowPreview";
 
 /**
  * A job's own routes: the live connection flow cut down to the routes the job
@@ -40,11 +38,10 @@ export function JobRouteFlow({
 }) {
   const t = useTranslate();
   const workspace = useNetworkingWorkspace("overview");
-  const { data, error, flow, consumers, egresses, profiles, pools, action, busy, message, retry } = workspace;
+  const { data, error, flow, consumers, message } = workspace;
   // Where each leg's names are looked up, and what answers them. Read once the
   // networking settings are, so a reader who may not see them asks for nothing.
-  const { dns, refresh: refreshDns } = useFlowDns(!data);
-  const [enlarged, setEnlarged] = useState(false);
+  const flowDns = useFlowDns(!data);
   const [editing, setEditing] = useState<FlowTarget | null>(null);
 
   const routeKey = routes.join("\n");
@@ -87,69 +84,16 @@ export function JobRouteFlow({
         ) : undefined
       }
     >
-      <div
-        role="button"
-        tabIndex={0}
-        title={t("next.job.enlargeFlow")}
-        aria-label={t("next.job.enlargeFlow")}
-        className="min-w-0 cursor-zoom-in border border-wv-hairline hover:border-wv-control"
-        onClick={() => setEnlarged(true)}
-        onKeyDown={(event) => {
-          if (event.key === "Enter" || event.key === " ") {
-            event.preventDefault();
-            setEnlarged(true);
-          }
-        }}
-      >
-        <NetworkFlow
-          flow={shownFlow}
-          egresses={egresses}
-          profiles={profiles}
-          pools={pools}
-          consumers={shown}
-          traffic
-          fitWidth
-          dns={dns}
-        />
-      </div>
-      <Dialog
-        open={enlarged}
-        title={t("next.networking.overview.flow")}
+      <FlowPreview
+        workspace={{ ...workspace, data }}
+        dns={flowDns}
+        flow={shownFlow}
+        consumers={shown}
         note={title}
-        // As wide as the window allows: the drawing scales up to fill it.
-        width={2400}
-        onDismiss={() => setEnlarged(false)}
-        footer={
-          <SecondaryButton onClick={() => setEnlarged(false)}>{t("next.networking.close")}</SecondaryButton>
-        }
-      >
-        <NetworkFlow
-          flow={shownFlow}
-          egresses={egresses}
-          profiles={profiles}
-          pools={pools}
-          consumers={shown}
-          onEdit={setEditing}
-          traffic
-          trace
-          fitWidth
-          dns={dns}
-        />
-      </Dialog>
-      {editing ? (
-        <FlowEditor
-          target={editing}
-          onClose={() => setEditing(null)}
-          data={data}
-          egresses={egresses}
-          consumers={consumers}
-          flow={flow}
-          action={action}
-          busy={busy}
-          proxyEditor={(id, onClose) => proxyEditor(id, onClose, retry)}
-          onDnsChanged={refreshDns}
-        />
-      ) : null}
+        editing={editing}
+        onEdit={setEditing}
+        proxyEditor={proxyEditor}
+      />
     </DetailBlock>
   );
 }

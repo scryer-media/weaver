@@ -13,11 +13,16 @@ import { testIds } from "@/next/testids";
 import { upgradesInApp } from "@/next/features/updates/application-upgrade";
 import { useApplicationUpgradeStatus } from "@/next/features/updates/use-application-upgrade";
 import { useNextData, useNextDataSelector } from "../data/next-data";
-import { useTorrentsShown } from "../data/use-torrents-shown";
+import { useTorrentsEnabled } from "../data/use-torrents-shown";
 import { splitSpeed } from "../data/format";
 import { Eyebrow } from "../components/chrome";
 import { Icon, type IconName } from "../components/icons";
 import { useSpeedLimitDialog, useSpeedLimitInForce } from "../features/SpeedLimitDialog";
+import { useNetworkingWorkspace } from "../features/networking/data";
+import { useFlowDns } from "../features/networking/dns-choices";
+import { FlowPreview } from "../features/networking/FlowPreview";
+import type { FlowTarget } from "../features/networking/NetworkFlow";
+import { ProxyEditorFor } from "../pages/settings/panels/ProxiesPanel";
 
 /**
  * The chrome every Next screen shares: a 236px rail, a 56px top bar, the
@@ -143,6 +148,7 @@ export function NextShell({
           onNavigate={onDismiss}
         />
       )}
+      <NetworkBlock />
       <ThroughputBlock />
       <SponsorBlock />
     </>
@@ -480,7 +486,8 @@ const ThroughputBlock = memo(function ThroughputBlock() {
     "torrentDownSpeed",
     "torrentUpSpeed",
   );
-  const torrentsShown = useTorrentsShown();
+  // The torrent rates only while torrents are switched on, not for jobs left after.
+  const torrentsShown = useTorrentsEnabled();
   const { inForce, bySchedule } = useSpeedLimitInForce();
   const { openDialog, dialog } = useSpeedLimitDialog();
   // Held, nothing moves: 0 at once, not once the daemon's rate window drains.
@@ -553,6 +560,42 @@ const ThroughputBlock = memo(function ThroughputBlock() {
       </div>
       {dialog}
     </RailBlock>
+  );
+});
+
+/**
+ * The live connection flow of every route, drawn small above the speeds and
+ * full size once picked, as a job's network panel draws its own. A reader who
+ * may not see the networking settings gets no block.
+ */
+export const NetworkBlock = memo(function NetworkBlock() {
+  const workspace = useNetworkingWorkspace("overview");
+  const { data, error, flow, consumers, message, failed } = workspace;
+  const flowDns = useFlowDns(!data);
+  const [editing, setEditing] = useState<FlowTarget | null>(null);
+  if (error || !data || consumers.length === 0) {
+    return null;
+  }
+  return (
+    // No label and no padding: the drawing is the whole block.
+    <div className="flex flex-none flex-col border-t border-wv-line-strong">
+      <FlowPreview
+        workspace={{ ...workspace, data }}
+        dns={flowDns}
+        flow={flow}
+        consumers={consumers}
+        editing={editing}
+        onEdit={setEditing}
+        proxyEditor={(id, onClose, onChanged) => (
+          <ProxyEditorFor key={id} id={id} onClose={onClose} onChanged={onChanged} />
+        )}
+        className="min-w-0 cursor-zoom-in hover:bg-wv-cell-hover"
+      />
+      {/* An edit made from the drawing that the daemon refused; a saved one says nothing here. */}
+      {failed && message !== null ? (
+        <div className="px-5 pb-2 font-wv-mono text-[11px] text-wv-warn">{message}</div>
+      ) : null}
+    </div>
   );
 });
 

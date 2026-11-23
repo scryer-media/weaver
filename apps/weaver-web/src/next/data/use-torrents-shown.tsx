@@ -49,6 +49,15 @@ export function useTorrentAddsOffered(): boolean {
 }
 
 /**
+ * Whether the torrent switch is on, as the server says: not merely torrent
+ * jobs left over while it is off. What only means something while torrents
+ * run asks this, such as the rail's torrent rates.
+ */
+export function useTorrentsEnabled(): boolean {
+  return useNextDataSelector((data) => torrentAddsOffered(data.torrentPresence));
+}
+
+/**
  * Its children while torrent things show, `fallback` once they are known not
  * to, and `pending` until that is known. A torrent-only screen passes a
  * redirect as `fallback` and the route's loading state as `pending`, so a
