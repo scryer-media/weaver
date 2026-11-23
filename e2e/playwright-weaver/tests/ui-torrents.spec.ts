@@ -5,7 +5,8 @@ import { readFileSync } from "node:fs";
 import type { Locator, Page } from "@playwright/test";
 import { expect, test } from "./helpers";
 import { expectGraphqlErrors } from "./support/graphql-errors";
-import { byTestIdPrefix, saveSettings, tableRow } from "./support/settings-locators";
+import { operationResponse } from "./support/graphql-operations";
+import { byTestIdPrefix, tableRow } from "./support/settings-locators";
 import { jobIds, testIds, torrentIds } from "./support/testids";
 
 /**
@@ -56,6 +57,16 @@ async function setNumber(scope: Locator, fieldId: string, value: string) {
   await expect(field).toHaveValue(value);
 }
 
+/** Run `action` and wait for the torrent settings save it makes to land. */
+async function torrentsSaved(page: Page, action: () => Promise<void>) {
+  const saved = operationResponse(page, "UpdateTorrentSettings");
+  await action();
+  const response = await saved;
+  expect(response.ok()).toBeTruthy();
+  const payload = await response.json();
+  expect(payload.errors ?? [], JSON.stringify(payload.errors ?? [])).toEqual([]);
+}
+
 /** Open a torrent's own screen from its queue row and the inspector's link. */
 async function openJob(page: Page, torrent: Fixture) {
   await page.goto("/");
@@ -74,12 +85,12 @@ test("Settings → Torrents saves the connection and the global seeding policy",
   const seeding = page.getByTestId(testIds.section("seeding"));
   await expect(torrents.getByTestId(testIds.field("enabled"))).toHaveAttribute("aria-checked", "true");
 
-  await setNumber(bittorrent, testIds.field("maxActiveDownloads"), "4");
-  await setNumber(connection, testIds.field("maxPeersTotal"), "150");
-  await seeding.getByTestId(testIds.field("seeding-seedTimeGoalMinutes")).click();
+  // Each field saves as it is committed; there is no Save.
+  await torrentsSaved(page, () => setNumber(bittorrent, testIds.field("maxActiveDownloads"), "4"));
+  await torrentsSaved(page, () => setNumber(connection, testIds.field("maxPeersTotal"), "150"));
+  await torrentsSaved(page, () => seeding.getByTestId(testIds.field("seeding-seedTimeGoalMinutes")).click());
   // The goal starts in days, the unit its one-day fallback divides into: 2 days is 2880 minutes.
-  await setNumber(seeding, testIds.fieldValue("seeding-seedTimeGoalMinutes"), "2");
-  await saveSettings(page);
+  await torrentsSaved(page, () => setNumber(seeding, testIds.fieldValue("seeding-seedTimeGoalMinutes"), "2"));
 
   await page.reload();
   const reloadedTorrents = page.getByTestId(testIds.section("enabled"));

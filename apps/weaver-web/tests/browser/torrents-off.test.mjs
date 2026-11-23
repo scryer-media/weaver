@@ -238,3 +238,21 @@ for (const control of ["field-enableTorrents", "field-enabled"]) {
     await page.close();
   });
 }
+
+test("a torrent setting saves as it is committed, and a typed one only when it is left", async () => {
+  const { page, errors } = await open("panel", "onIdle");
+  const peers = page.getByTestId("field-maxPeersTotal");
+  await peers.fill("150");
+  await peers.press("Enter");
+  await sentCount(page, "UpdateTorrentSettings", 1);
+  assert.deepEqual((await sent(page, "UpdateTorrentSettings"))[0].input, { torrent: { maxPeersTotal: 150 } });
+  // Typing sends nothing; leaving the field sends the text as typed.
+  const nodes = page.getByTestId("field-dhtBootstrapNodes");
+  await nodes.fill("router.example:6881");
+  assert.equal((await sent(page, "UpdateTorrentSettings")).length, 1);
+  await nodes.blur();
+  await sentCount(page, "UpdateTorrentSettings", 2);
+  assert.deepEqual((await sent(page, "UpdateTorrentSettings"))[1].input.torrent.dhtBootstrapNodes, "router.example:6881");
+  assert.equal(errors.length, 0, errors.join("\n"));
+  await page.close();
+});

@@ -46,7 +46,7 @@ import { RecordEditor } from "../../../components/RecordEditor";
 import { Cell } from "../../../components/rows";
 import { EM_DASH } from "../../../data/format";
 import { useNextData } from "../../../data/next-data";
-import { SettingsBlocks, useDraft, usePanelState, type FieldSpec, type SettingsBlock } from "../framework";
+import { SettingsBlocks, useDraft, usePanelStatus, type FieldSpec, type SettingsBlock } from "../framework";
 import {
   GoalControl,
   INHERIT,
@@ -1640,7 +1640,6 @@ export function TorrentsPanel() {
   const [finish, setFinish] = useState({ downloads: true, seeding: true });
   // Neither finished: every torrent stops now, after a second ask.
   const [forcing, setForcing] = useState(false);
-  const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const savedConnection = useMemo<TorrentConnection>(
     () => ({ ...DEFAULT_CONNECTION, ...(data?.settings?.torrent ?? {}) }),
@@ -1661,72 +1660,74 @@ export function TorrentsPanel() {
       : null;
   }, [data?.settings]);
 
-  const draft = useDraft<TorrentForm>(source, () => {
-    setStatus(null);
-    setError(null);
-  });
+  const draft = useDraft<TorrentForm>(source, () => setError(null));
   const values = draft.value;
+  // Each change saves as it is made; a typed field when it is left or Enter
+  // is pressed. Saves run one at a time, each sending what differs from the
+  // last one stored, so a quick run of changes lands in order.
+  const queue = useRef<Promise<void>>(Promise.resolve());
+  const stored = useRef<TorrentForm | null>(null);
+  const latest = useRef<TorrentForm | null>(null);
+  const [saving, setSaving] = useState(0);
 
-  // Saves the form; `whenDisabled` says how running torrents end when the
-  // save turns torrents off.
-  const send = () => {
-    if (!values || !source) {
+  const save = (form: TorrentForm) => {
+    if (!validPort(form.torrent.basePort) || !validPort(form.torrent.announcePort) || !validPort(form.torrent.sslPort)) {
+      setError(t("next.torrents.portInvalid"));
       return;
     }
-    const seeding = seedingInput(values.seeding);
-    const seedingChanged = JSON.stringify(seeding) !== JSON.stringify(seedingInput(source.seeding));
-    const torrent = connectionChanges(values.torrent, source.torrent);
-    setError(null);
-    void updateSettings({
-      input: {
+    latest.current = form;
+    setSaving((count) => count + 1);
+    queue.current = queue.current.then(async () => {
+      const base = stored.current ?? source;
+      if (!base) {
+        setSaving((count) => count - 1);
+        return;
+      }
+      const seeding = seedingInput(form.seeding);
+      const seedingChanged = JSON.stringify(seeding) !== JSON.stringify(seedingInput(base.seeding));
+      const torrent = connectionChanges(form.torrent, base.torrent);
+      const input = {
         ...(seedingChanged ? { seeding } : {}),
-        ...(values.uploadCap !== source.uploadCap ? { uploadCap: values.uploadCap } : {}),
+        ...(form.uploadCap !== base.uploadCap ? { uploadCap: form.uploadCap } : {}),
         ...(Object.keys(torrent).length > 0 ? { torrent } : {}),
-      },
-    }).then((result) => {
-      if (result.error || !result.data?.updateSettings) {
+      };
+      const result = Object.keys(input).length > 0 ? await updateSettings({ input }) : null;
+      setSaving((count) => count - 1);
+      if (result && (result.error || !result.data?.updateSettings)) {
         setError(result.error?.message ?? t("next.torrents.saveFailed"));
         return;
       }
-      draft.markSaved();
-      setStatus(t("next.settings.saved"));
-      void reexecute({ requestPolicy: "network-only" });
+      stored.current = form;
+      setError(null);
+      // Nothing newer waits: the form shows the daemon's copy again.
+      if (latest.current === form) {
+        draft.markSaved();
+        stored.current = null;
+        if (result) {
+          void reexecute({ requestPolicy: "network-only" });
+        }
+      }
     });
   };
 
-  usePanelState({
-    dirty: draft.dirty,
-    busy: updateState.fetching,
-    status: error ?? status,
-    failed: error !== null,
-    revert: () => {
-      setError(null);
-      draft.revert();
-    },
-    save: () => {
-      if (!values || !source) {
-        return;
-      }
-      if (
-        !validPort(values.torrent.basePort) ||
-        !validPort(values.torrent.announcePort) ||
-        !validPort(values.torrent.sslPort)
-      ) {
-        setError(t("next.torrents.portInvalid"));
-        return;
-      }
-      send();
-    },
-  });
+  usePanelStatus(error ?? (saving > 0 ? t("settings.saving") : null), error !== null);
 
-  const patchTorrent = (next: Partial<TorrentConnection>) =>
-    values && draft.set({ torrent: { ...values.torrent, ...next } });
+  /** A change saved at once. */
+  const change = (patch: Partial<TorrentForm>) => {
+    if (!values) {
+      return;
+    }
+    draft.set(patch);
+    save({ ...values, ...patch });
+  };
+  const patchTorrent = (next: Partial<TorrentConnection>) => values && change({ torrent: { ...values.torrent, ...next } });
+  // A typed field: shown as typed, saved when it is left.
+  const typeTorrent = (next: Partial<TorrentConnection>) => values && draft.set({ torrent: { ...values.torrent, ...next } });
+  const commitTyped = () => values && save(values);
 
-  // Turning torrents on or off saves at once, after a confirm; no Save.
-  // Other edits still waiting stay waiting.
+  // Turning torrents on or off saves at once, after a confirm.
   const [confirmEnable, setConfirmEnable] = useState(false);
   const saveEnabled = (enabled: boolean, whenDisabled?: TorrentDisableMode) => {
-    const pending = draft.dirty;
     setError(null);
     void updateSettings({
       input: { torrent: whenDisabled === undefined ? { enabled } : { enabled, whenDisabled } },
@@ -1738,11 +1739,12 @@ export function TorrentsPanel() {
         setError(result.error?.message ?? t("next.torrents.saveFailed"));
         return;
       }
-      patchTorrent({ enabled });
-      if (!pending) {
+      if (values) {
+        draft.set({ torrent: { ...values.torrent, enabled } });
+      }
+      if (saving === 0) {
         draft.markSaved();
       }
-      setStatus(t("next.settings.saved"));
       void reexecute({ requestPolicy: "network-only" });
     });
   };
@@ -1829,8 +1831,8 @@ export function TorrentsPanel() {
           id: "seeding",
           title: t("next.torrents.seeding"),
           fields: [
-            ...seedingFields(t, values.seeding, (seeding) => draft.set({ seeding }), { inherits: false }),
-            globalUploadCapField(t, values.uploadCap, (uploadCap) => draft.set({ uploadCap })),
+            ...seedingFields(t, values.seeding, (seeding) => change({ seeding }), { inherits: false }),
+            globalUploadCapField(t, values.uploadCap, (uploadCap) => change({ uploadCap })),
           ],
         },
         trackerRules.block,
@@ -2001,7 +2003,8 @@ export function TorrentsPanel() {
                 kind: "text",
                 mono: true,
                 value: values.torrent.blocklist ?? "",
-                onChange: (next) => patchTorrent({ blocklist: next.trim() === "" ? null : next }),
+                onChange: (next) => typeTorrent({ blocklist: next.trim() === "" ? null : next }),
+                onCommit: commitTyped,
               },
             },
             {
@@ -2022,7 +2025,8 @@ export function TorrentsPanel() {
                 kind: "textarea",
                 rows: 4,
                 value: values.torrent.bannedIps.join("\n"),
-                onChange: (next) => patchTorrent({ bannedIps: next.split("\n") }),
+                onChange: (next) => typeTorrent({ bannedIps: next.split("\n") }),
+                onCommit: commitTyped,
               },
             },
           ],
@@ -2117,7 +2121,8 @@ export function TorrentsPanel() {
                 kind: "text",
                 mono: true,
                 value: values.torrent.dhtBootstrapNodes,
-                onChange: (dhtBootstrapNodes) => patchTorrent({ dhtBootstrapNodes }),
+                onChange: (dhtBootstrapNodes) => typeTorrent({ dhtBootstrapNodes }),
+                onCommit: commitTyped,
               },
             },
           ],

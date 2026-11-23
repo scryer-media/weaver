@@ -134,6 +134,8 @@ export type FieldControl =
       placeholder?: string;
       /** Keep password managers out, for key material. */
       secret?: boolean;
+      /** The text, when the field is left. */
+      onCommit?: (value: string) => void;
     }
   | { kind: "time"; value: string; onChange: (next: string) => void }
   | {
@@ -276,6 +278,7 @@ export function FieldControlView({ spec }: { spec: FieldSpec }) {
         <TextArea
           value={control.value}
           onChange={control.onChange}
+          onBlur={control.onCommit ? () => control.onCommit?.(control.value) : undefined}
           label={spec.label}
           rows={control.rows}
           placeholder={control.placeholder}
