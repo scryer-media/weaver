@@ -816,6 +816,40 @@ metric_families! {
         ["route"], "Incoming uTP connection requests dropped because too many were waiting, since the session opened.");
     TORRENT_UTP_SYN_RESETS = ("weaver_torrent_utp_syn_resets_total", Counter,
         ["route"], "Incoming uTP connection requests answered with a reset, since the session opened.");
+    TORRENT_UTP_SYNS_RECEIVED = ("weaver_torrent_utp_syns_received_total", Counter,
+        ["route"], "Incoming uTP connection requests that named no open stream, since the session opened; a repeat of one counts again.");
+    TORRENT_UTP_SYNS_REPEATED = ("weaver_torrent_utp_syns_repeated_total", Counter,
+        ["route"], "Incoming uTP connection requests dropped as a repeat of one already taken or waiting, or as clashing with a stream or connect to the same address, since the session opened.");
+    TORRENT_UTP_SYNS_QUEUED = ("weaver_torrent_utp_syns_queued_total", Counter,
+        ["route"], "Incoming uTP connection requests that had to wait because the session was not ready to take one, since the session opened.");
+    TORRENT_UTP_STREAMS_ACCEPTED = ("weaver_torrent_utp_streams_accepted_total", Counter,
+        ["route"], "Incoming uTP streams handed to the session, since the session opened. Each then shows in weaver_torrent_incoming_connections_total under how its handshake ended.");
+    TORRENT_UTP_UNMATCHED_PACKETS = ("weaver_torrent_utp_unmatched_packets_total", Counter,
+        ["route"], "uTP packets, other than connection requests and resets, that named no stream and answered no connect, since the session opened.");
+    TORRENT_UTP_UNKNOWN_STREAM_RESETS = ("weaver_torrent_utp_unknown_stream_resets_total", Counter,
+        ["route"], "Resets sent for uTP packets that named no stream, since the session opened.");
+    TORRENT_UTP_RESETS_RATE_LIMITED = ("weaver_torrent_utp_resets_rate_limited_total", Counter,
+        ["route"], "uTP resets left unsent because the reset budget was spent, since the session opened.");
+    TORRENT_UTP_INACTIVITY_TIMEOUTS = ("weaver_torrent_utp_inactivity_timeouts_total", Counter,
+        ["route"], "uTP streams ended because the remote went silent, since the session opened.");
+    TORRENT_UTP_SYNACK_RETRANSMISSIONS = ("weaver_torrent_utp_synack_retransmissions_total", Counter,
+        ["route"], "Answers to an incoming uTP connection request sent again because the remote did not go on, since the session opened. Many of these against few accepted handshakes means our answers do not reach the peers.");
+    TORRENT_UTP_SEND_ERRORS = ("weaver_torrent_utp_send_errors_total", Counter,
+        ["route"], "uTP datagram sends that failed, since the session opened.");
+    TORRENT_UTP_STREAMS_OPEN = ("weaver_torrent_utp_streams_open", Gauge,
+        ["route"], "uTP streams open now, incoming and outgoing.");
+    TORRENT_PEER_LIVE_ENDS = ("weaver_torrent_peer_live_ends_total", Counter,
+        ["route", "direction", "peer", "reason"],
+        "Connections that ended after their handshake, since the session opened, by who opened them (in: the peer), what the peer held as far as it said (seed, partial, or nothing: no piece or it never said) and why they ended. A seed session that mostly meets seeds shows here as peer=seed.");
+    TORRENT_PEER_LIVE_SECONDS = ("weaver_torrent_peer_live_seconds_total", Counter,
+        ["route", "direction", "peer"],
+        "Time the connections of weaver_torrent_peer_live_ends_total were live in all; divided by their count it gives how long such a connection lasts.");
+    TORRENT_PEER_UPLOAD_ENDS = ("weaver_torrent_peer_upload_ends_total", Counter,
+        ["route", "took", "ended_by"],
+        "Connections that ended after their handshake, since the session opened, by what the peer took from us on that connection (not_interested, interested_unserved, or the blocks sent: 1 to 2, 3 to 16, 17 to 256, more) and which side ended it: us, peer, or fault (a timeout or an error).");
+    TORRENT_PEER_UPLOAD_BUSY_SECONDS = ("weaver_torrent_peer_upload_busy_seconds_total", Counter,
+        ["route"],
+        "Time peers' send buffers held blocks of ours, from the first handed to a connection's writer to the last written, summed over connections, since the session opened. Payload bytes sent divided by this is the upload rate while there was something to send.");
     TORRENT_TRACKER_ANNOUNCES = ("weaver_torrent_session_tracker_announces_total", Counter,
         ["route", "kind", "event", "result"],
         "Announces to a tracker that ended since the session opened, by how the tracker is spoken to, the event carried and how it ended: ok, timeout, refused (the tracker's own failure), bad_reply (an answer that does not parse), skipped (no address of a family the session connects over, nothing sent) or error (anything else). An announce over both address families counts once. Every combination is emitted, so the series pre-exist at zero.");

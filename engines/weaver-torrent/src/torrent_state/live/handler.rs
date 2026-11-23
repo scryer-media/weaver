@@ -400,9 +400,14 @@ impl PeerConnectionHandler for &'_ PeerHandler {
     // The send buffer fell below its watermark: the peer's next blocks wait
     // their turn.
     fn uploads_done(&self, chunks: &[ChunkInfo]) {
-        if let Some(upload) = self.upload_ledger()
-            && upload.done(chunks)
-        {
+        let Some(upload) = self.upload_ledger() else {
+            return;
+        };
+        let (turn, busy) = upload.done(chunks);
+        if let Some(busy) = busy {
+            self.swarm().upload_busy(busy);
+        }
+        if turn {
             self.state.upload_turn(self.addr);
         }
     }

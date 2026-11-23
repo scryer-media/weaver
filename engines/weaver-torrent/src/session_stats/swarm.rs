@@ -359,6 +359,77 @@ impl PeerSource {
     }
 }
 
+counted! {
+    /// What a peer held when its connection ended, as far as it said.
+    PeerHad {
+        /// Every piece.
+        Seed => "seed",
+        /// Some pieces, not all.
+        Partial => "partial",
+        /// No piece, or it never said.
+        Nothing => "nothing",
+    }
+}
+
+counted! {
+    /// What a peer took from us over one connection.
+    UploadTaken {
+        /// It never said it was interested.
+        NotInterested => "not_interested",
+        /// It was interested and was sent no block.
+        Unserved => "interested_unserved",
+        Blocks1To2 => "blocks_1_2",
+        Blocks3To16 => "blocks_3_16",
+        Blocks17To256 => "blocks_17_256",
+        BlocksMore => "blocks_more",
+    }
+}
+
+impl UploadTaken {
+    /// A connection that sent `uploaded` payload bytes to a peer that was
+    /// `interested` at some time on it.
+    pub fn of(interested: bool, uploaded: u64) -> Self {
+        match uploaded.div_ceil(16384) {
+            0 if interested => Self::Unserved,
+            0 => Self::NotInterested,
+            1..=2 => Self::Blocks1To2,
+            3..=16 => Self::Blocks3To16,
+            17..=256 => Self::Blocks17To256,
+            _ => Self::BlocksMore,
+        }
+    }
+}
+
+counted! {
+    /// Which side ended a connection.
+    Ender {
+        Us => "us",
+        Peer => "peer",
+        /// Neither chose to: a timeout or a fault.
+        Fault => "fault",
+    }
+}
+
+impl Ender {
+    pub fn of(reason: CloseReason) -> Self {
+        match reason {
+            CloseReason::Closed | CloseReason::NotAllowed => Self::Us,
+            CloseReason::PeerClosed => Self::Peer,
+            _ => Self::Fault,
+        }
+    }
+}
+
+/// A live connection as it ended, for the session's counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveEnd {
+    pub direction: Direction,
+    pub had: PeerHad,
+    pub took: UploadTaken,
+    /// How long it was live.
+    pub lived: std::time::Duration,
+}
+
 pub(super) type Tally<const N: usize> = [AtomicU64; N];
 
 #[inline]
@@ -388,9 +459,36 @@ pub struct SwarmStats {
     wasted_bytes: Tally<{ Waste::COUNT }>,
     peers_named: Tally<{ PeerSource::COUNT }>,
     pex_encrypted_skipped: AtomicU64,
+    // By direction, what the peer had, then reason.
+    live_ends: [[Tally<{ CloseReason::COUNT }>; PeerHad::COUNT]; Direction::COUNT],
+    // By direction, then what the peer had: milliseconds live.
+    live_millis: [Tally<{ PeerHad::COUNT }>; Direction::COUNT],
+    // By what the peer took, then who ended it.
+    upload_ends: [Tally<{ Ender::COUNT }>; UploadTaken::COUNT],
+    upload_busy_micros: AtomicU64,
 }
 
 impl SwarmStats {
+    /// A live connection ended for `reason`.
+    pub fn live_ended(&self, end: LiveEnd, reason: CloseReason) {
+        let (direction, had) = (end.direction as usize, end.had as usize);
+        add(&self.live_ends[direction][had], reason as usize, 1);
+        let millis = u64::try_from(end.lived.as_millis()).unwrap_or(u64::MAX);
+        add(&self.live_millis[direction], had, millis);
+        add(
+            &self.upload_ends[end.took as usize],
+            Ender::of(reason) as usize,
+            1,
+        );
+    }
+
+    /// A peer's send buffer held blocks of ours for `span`, from the first
+    /// handed to the writer to the last written.
+    pub fn upload_busy(&self, span: std::time::Duration) {
+        let micros = u64::try_from(span.as_micros()).unwrap_or(u64::MAX);
+        self.upload_busy_micros.fetch_add(micros, Ordering::Relaxed);
+    }
+
     /// `count` messages of `kind` crossed a connection.
     #[inline]
     pub fn messages(&self, direction: Direction, kind: MessageKind, count: u64) {
@@ -471,6 +569,10 @@ impl SwarmStats {
             wasted_bytes: read(&self.wasted_bytes),
             peers_named: read(&self.peers_named),
             pex_encrypted_skipped: self.pex_encrypted_skipped.load(Ordering::Relaxed),
+            live_ends: self.live_ends.each_ref().map(|by| by.each_ref().map(read)),
+            live_millis: self.live_millis.each_ref().map(read),
+            upload_ends: self.upload_ends.each_ref().map(read),
+            upload_busy_micros: self.upload_busy_micros.load(Ordering::Relaxed),
         }
     }
 }
@@ -495,6 +597,16 @@ pub struct SwarmSnapshot {
     pub peers_named: [u64; PeerSource::COUNT],
     /// See [`SwarmStats::pex_encrypted_skipped`].
     pub pex_encrypted_skipped: u64,
+    /// Live connections ended, by [`Direction`] (in: the peer opened it),
+    /// [`PeerHad`], then [`CloseReason`].
+    pub live_ends: [[[u64; CloseReason::COUNT]; PeerHad::COUNT]; Direction::COUNT],
+    /// Milliseconds those connections were live, by [`Direction`], then
+    /// [`PeerHad`].
+    pub live_millis: [[u64; PeerHad::COUNT]; Direction::COUNT],
+    /// Live connections ended, by [`UploadTaken`], then [`Ender`].
+    pub upload_ends: [[u64; Ender::COUNT]; UploadTaken::COUNT],
+    /// See [`SwarmStats::upload_busy`].
+    pub upload_busy_micros: u64,
 }
 
 impl SwarmSnapshot {
@@ -773,6 +885,57 @@ mod tests {
 
     // A connection's end is counted under what ended it: nothing, or the
     // error it ended with.
+    // A live connection that ends is counted once under who opened it,
+    // what the peer held and why, with its time live, and once under what
+    // the peer took and which side ended it.
+    #[test]
+    fn a_live_end_is_counted_by_what_the_peer_held_and_took() {
+        use super::{CloseReason, Ender, LiveEnd, PeerHad, UploadTaken};
+        use std::time::Duration;
+
+        assert_eq!(UploadTaken::of(false, 0), UploadTaken::NotInterested);
+        assert_eq!(UploadTaken::of(true, 0), UploadTaken::Unserved);
+        assert_eq!(UploadTaken::of(false, 1), UploadTaken::Blocks1To2);
+        assert_eq!(UploadTaken::of(true, 2 * 16384), UploadTaken::Blocks1To2);
+        assert_eq!(
+            UploadTaken::of(true, 2 * 16384 + 1),
+            UploadTaken::Blocks3To16
+        );
+        assert_eq!(UploadTaken::of(true, 16 * 16384), UploadTaken::Blocks3To16);
+        assert_eq!(
+            UploadTaken::of(true, 256 * 16384),
+            UploadTaken::Blocks17To256
+        );
+        assert_eq!(UploadTaken::of(true, 257 * 16384), UploadTaken::BlocksMore);
+        assert_eq!(Ender::of(CloseReason::Closed), Ender::Us);
+        assert_eq!(Ender::of(CloseReason::PeerClosed), Ender::Peer);
+        assert_eq!(Ender::of(CloseReason::Timeout), Ender::Fault);
+
+        let stats = SwarmStats::default();
+        let end = LiveEnd {
+            direction: Direction::In,
+            had: PeerHad::Seed,
+            took: UploadTaken::NotInterested,
+            lived: Duration::from_millis(1500),
+        };
+        stats.live_ended(end, CloseReason::PeerClosed);
+        stats.live_ended(end, CloseReason::PeerClosed);
+        stats.upload_busy(Duration::from_micros(250));
+        let read = stats.snapshot();
+        let (dir, had) = (Direction::In as usize, PeerHad::Seed as usize);
+        assert_eq!(
+            read.live_ends[dir][had][CloseReason::PeerClosed as usize],
+            2
+        );
+        assert_eq!(read.live_millis[dir][had], 3000);
+        assert_eq!(
+            read.upload_ends[UploadTaken::NotInterested as usize][Ender::Peer as usize],
+            2
+        );
+        assert_eq!(read.upload_busy_micros, 250);
+        assert_eq!(read.live_ends.iter().flatten().flatten().sum::<u64>(), 2);
+    }
+
     #[test]
     fn a_close_is_named_for_what_ended_the_connection() {
         use super::CloseReason;

@@ -1517,6 +1517,27 @@ fn renders_prometheus_metrics_for_torrents_trackers_and_sessions() {
         ),
         format!("weaver_torrent_utp_syn_flood_dropped_total{{{ROUTE}}} 33"),
         format!("weaver_torrent_utp_syn_resets_total{{{ROUTE}}} 34"),
+        format!("weaver_torrent_utp_syns_received_total{{{ROUTE}}} 101"),
+        format!("weaver_torrent_utp_syns_repeated_total{{{ROUTE}}} 102"),
+        format!("weaver_torrent_utp_syns_queued_total{{{ROUTE}}} 103"),
+        format!("weaver_torrent_utp_streams_accepted_total{{{ROUTE}}} 104"),
+        format!("weaver_torrent_utp_unmatched_packets_total{{{ROUTE}}} 105"),
+        format!("weaver_torrent_utp_unknown_stream_resets_total{{{ROUTE}}} 106"),
+        format!("weaver_torrent_utp_resets_rate_limited_total{{{ROUTE}}} 107"),
+        format!("weaver_torrent_utp_inactivity_timeouts_total{{{ROUTE}}} 108"),
+        format!("weaver_torrent_utp_synack_retransmissions_total{{{ROUTE}}} 109"),
+        format!("weaver_torrent_utp_send_errors_total{{{ROUTE}}} 110"),
+        format!("weaver_torrent_utp_streams_open{{{ROUTE}}} 111"),
+        format!(
+            r#"weaver_torrent_peer_live_ends_total{{{ROUTE},direction="in",peer="seed",reason="peer_closed"}} 120"#
+        ),
+        format!(
+            r#"weaver_torrent_peer_live_seconds_total{{{ROUTE},direction="in",peer="seed"}} 121.5"#
+        ),
+        format!(
+            r#"weaver_torrent_peer_upload_ends_total{{{ROUTE},took="blocks_1_2",ended_by="peer"}} 122"#
+        ),
+        format!("weaver_torrent_peer_upload_busy_seconds_total{{{ROUTE}}} 123.25"),
         format!(
             r#"weaver_torrent_session_tracker_announces_total{{{ROUTE},kind="http",event="started",result="ok"}} 70"#
         ),
