@@ -4,9 +4,9 @@
 import { memo, useContext, useMemo, useRef } from "react";
 import { useTranslate } from "@/lib/context/translate-context";
 import { formatJobReleaseName, type JobData } from "@/lib/job-types";
-import type { TorrentSummaryData } from "@/lib/torrents";
+import { seedingGoalProgress, type TorrentSummaryData } from "@/lib/torrents";
 import { isActiveStatus, statusToken } from "@/lib/status-tokens";
-import { Square } from "@/next/components/chrome";
+import { Bar, Square } from "@/next/components/chrome";
 import { CheckBox } from "@/next/components/controls";
 import { PhaseBars, useJobProgress } from "@/next/components/PhaseBars";
 import { RateCounter } from "@/next/components/RateCounter";
@@ -110,17 +110,21 @@ export const DownloadRow = memo(function DownloadRow({
             {name}
           </span>
           <TagChips tags={job.tags} />
-          <PhaseBars
-            job={job}
-            view={progress}
-            height={10}
-            // 49 whole cells of the 7px period a 10px bar takes, or 28 in a
-            // column that is not yet as wide as that; a cap off that multiple
-            // leaves dead track before the percentage.
-            barClassName="max-w-[343px] min-w-[56px] flex-1"
-            percentClassName="w-[34px] text-[11.5px] text-wv-muted"
-            className="basis-full @6xl:flex-[0_0_242px] @min-[100rem]:flex-[0_0_389px]"
-          />
+          {seeding === null ? (
+            <PhaseBars
+              job={job}
+              view={progress}
+              height={10}
+              // 49 whole cells of the 7px period a 10px bar takes, or 28 in a
+              // column that is not yet as wide as that; a cap off that multiple
+              // leaves dead track before the percentage.
+              barClassName={ROW_BAR}
+              percentClassName={ROW_PERCENT}
+              className={ROW_BARS}
+            />
+          ) : (
+            <SeedingBars torrent={seeding} />
+          )}
         </div>
       }
       right={
@@ -181,6 +185,64 @@ export const DownloadRow = memo(function DownloadRow({
         </>
       }
     />
+  );
+});
+
+const ROW_BAR = "max-w-[343px] min-w-[56px] flex-1";
+const ROW_PERCENT = "w-[34px] text-[11.5px] text-wv-muted";
+const ROW_BARS = "basis-full @6xl:flex-[0_0_242px] @min-[100rem]:flex-[0_0_389px]";
+
+/**
+ * A seeding torrent's bars, in place of its download's. The download is done,
+ * so its bar turns gray, and the ratio goal fills over it in blue. A seed-time
+ * goal gets a bar of its own below, counting the seconds its terms count.
+ * The percentage is how far toward each goal; with no ratio goal the gray bar
+ * stays whole.
+ */
+const SeedingBars = memo(function SeedingBars({ torrent }: { torrent: TorrentSummaryData }) {
+  const t = useTranslate();
+  const goals = seedingGoalProgress(torrent);
+  const lines = [
+    { key: "ratio", percent: goals.ratio, name: t("next.torrentDash.ratio"), label: t("next.seeding.ratioGoal") },
+    ...(goals.seedTime === null
+      ? []
+      : [{ key: "seedTime", percent: goals.seedTime, name: t("next.torrentDash.seedTime"), label: t("next.seeding.seedTimeGoal") }]),
+  ];
+  const labelled = lines.length > 1;
+  const nameWidth = Math.max(...lines.map((line) => [...line.name].length));
+  return (
+    <div data-testid={torrentIds.queueRowSeedingBars} className={`flex min-w-0 flex-col gap-[7px] ${ROW_BARS}`}>
+      {lines.map((line) => (
+        <div key={line.key} className="flex min-w-0 items-center gap-3">
+          <div className={`relative ${ROW_BAR}`}>
+            {line.key === "ratio" ? <Bar percent={100} color={WV.inert} height={10} /> : null}
+            {line.percent === null ? null : (
+              <Bar
+                percent={line.percent}
+                color={WV.info}
+                height={10}
+                label={line.label}
+                className={line.key === "ratio" ? "absolute inset-0" : undefined}
+                // Over the gray bar, only the goal's cells draw; the track is the gray bar's.
+                style={line.key === "ratio" ? { backgroundImage: "none" } : undefined}
+              />
+            )}
+          </div>
+          <span aria-hidden="true" className={`flex-none font-wv-mono ${ROW_PERCENT}`}>
+            {Math.floor(line.percent ?? 100)}%
+          </span>
+          {labelled ? (
+            <span
+              aria-hidden="true"
+              className="min-w-0 truncate font-wv-mono text-[11px] text-wv-faint"
+              style={{ flexBasis: `${nameWidth}ch` }}
+            >
+              {line.name}
+            </span>
+          ) : null}
+        </div>
+      ))}
+    </div>
   );
 });
 

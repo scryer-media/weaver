@@ -17,7 +17,7 @@ import { AddNzbDialog } from "@/next/features/AddNzbDialog";
 import { TorrentDetail } from "@/next/features/torrents/TorrentDetail";
 import { TorrentRemoveDialog } from "@/next/features/torrents/TorrentRemoveDialog";
 import { DownloadRow } from "@/next/pages/downloads/DownloadRow";
-import type { SeedingPolicyData, SettingLevel, TorrentChangesData, TorrentData, TorrentFileData, TorrentTrackerData } from "@/lib/torrents";
+import type { SeedingPolicyData, SettingLevel, TorrentChangesData, TorrentData, TorrentFileData, TorrentSummaryData, TorrentTrackerData } from "@/lib/torrents";
 import { nextEn } from "@/next/i18n/en";
 import "@/next/fonts.css";
 import "@/next/theme.css";
@@ -241,6 +241,46 @@ function Files() {
   ) : null;
 }
 
+/**
+ * Seeding rows: one with a ratio goal a quarter met, one that also has a seed
+ * time goal half met, and one with no goal at all.
+ */
+function SeedingRows() {
+  const statusLabel = useStatusLabel();
+  const summary = (id: number, policy: TorrentSummaryData["seedingPolicy"]): TorrentSummaryData => ({
+    id, state: "SEEDING", forced: false, ratio: 0.5, uploadBps: 419_000, seedingGoalLeft: null,
+    seedingSeconds: 7200, consecutiveSeedingSeconds: 60, seedingPolicy: policy,
+  });
+  const rows: [string, TorrentSummaryData][] = [
+    ["ratio only", summary(1, { ratioGoal: 2, seedTimeGoalMinutes: null, seedTimeCounting: "CUMULATIVE" })],
+    ["ratio and time", summary(2, { ratioGoal: 2, seedTimeGoalMinutes: 240, seedTimeCounting: "CUMULATIVE" })],
+    ["no goal", summary(3, { ratioGoal: null, seedTimeGoalMinutes: null, seedTimeCounting: "CUMULATIVE" })],
+  ];
+  return (
+    <ul className="@container">
+      {rows.map(([label, seeding]) => (
+        <li key={label} aria-label={label}>
+          <DownloadRow
+            job={job({ id: seeding.id, status: "SEEDING", protocol: "TORRENT", progress: 1 })}
+            selected={false}
+            onSelect={() => {}}
+            onOpen={() => {}}
+            picked={false}
+            onPick={() => {}}
+            statusLabel={statusLabel}
+            held={null}
+            hold={null}
+            onPause={() => {}}
+            onCancel={() => {}}
+            seeding={seeding}
+            seedingColumn
+          />
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 function Fixture() {
   if (screen === "tag") {
     return (
@@ -263,6 +303,7 @@ function Fixture() {
   if (screen === "removeMet") return <Remove goalLeft={null} />;
   if (screen === "queue") return <Queue />;
   if (screen === "seeding") return <Seeding />;
+  if (screen === "seedingRows") return <SeedingRows />;
   if (screen === "trackers" || screen === "privateTrackers") {
     const tracker = (url: string, source: TorrentTrackerData["source"]): TorrentTrackerData => ({
       tier: 0, url, source, resolvedBy: null, status: "WORKING", updating: false, message: null, seeders: 1, leechers: 0, peers: 1,

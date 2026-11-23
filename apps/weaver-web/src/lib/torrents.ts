@@ -163,6 +163,33 @@ export interface TorrentSummaryData {
   uploadBps: number;
   /** What is left of its seeding goal; null once met or with no goal. */
   seedingGoalLeft: string | null;
+  /** Seconds spent complete and seeding, in all. */
+  seedingSeconds: number;
+  /** Seconds of the current unbroken seeding run. */
+  consecutiveSeedingSeconds: number;
+  /** The goals in effect, and which seconds the seed-time goal counts. */
+  seedingPolicy: Pick<SeedingTermsData, "ratioGoal" | "seedTimeGoalMinutes" | "seedTimeCounting">;
+}
+
+/** How far a seeding torrent is toward each goal it has, in percent; null for a goal it does not have. */
+export interface SeedingGoalProgress {
+  ratio: number | null;
+  seedTime: number | null;
+}
+
+/**
+ * How far a torrent is toward its ratio and seed-time goals. The seed time
+ * counts the seconds its terms count: every second seeded, or those of the
+ * current run. A goal of zero is met at once.
+ */
+export function seedingGoalProgress(torrent: TorrentSummaryData): SeedingGoalProgress {
+  const { ratioGoal, seedTimeGoalMinutes, seedTimeCounting } = torrent.seedingPolicy;
+  const toward = (have: number, goal: number) => (goal <= 0 ? 100 : Math.max(0, Math.min(100, (have / goal) * 100)));
+  const seeded = seedTimeCounting === "CONSECUTIVE" ? torrent.consecutiveSeedingSeconds : torrent.seedingSeconds;
+  return {
+    ratio: ratioGoal === null ? null : toward(torrent.ratio, ratioGoal),
+    seedTime: seedTimeGoalMinutes === null ? null : toward(seeded, seedTimeGoalMinutes * 60),
+  };
 }
 
 /**

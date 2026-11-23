@@ -8,12 +8,14 @@ import {
   removeOutcome,
   routeExposureText,
   routeReasonText,
+  seedingGoalProgress,
   TORRENT_ROUTE_REASONS,
   TORRENT_STATED_REASONS,
   showsSeeding,
   torrentStateLabelKey,
   trackerSourceKey,
   type TorrentData,
+  type TorrentSummaryData,
 } from "../src/lib/torrents.ts";
 import { EM_DASH, formatRate, formatSize } from "../src/next/data/format.ts";
 import { informationFields, transferFields, transferNote } from "../src/next/features/torrents/general.ts";
@@ -292,4 +294,20 @@ test("a torrent starting from what was saved, one needing a certificate and one 
     assert.ok(dictionary["next.torrent.checkingResumeData"], locale);
     assert.ok(dictionary["next.torrent.filesMissing"], locale);
   }
+});
+
+test("a seeding torrent's goals read as how far it has come, by the seconds its terms count", () => {
+  const torrent = (over: Partial<TorrentSummaryData>, policy: Partial<TorrentSummaryData["seedingPolicy"]>): TorrentSummaryData => ({
+    id: 1, state: "SEEDING", forced: false, ratio: 0.5, uploadBps: 0, seedingGoalLeft: null,
+    seedingSeconds: 7200, consecutiveSeedingSeconds: 1800,
+    seedingPolicy: { ratioGoal: 2, seedTimeGoalMinutes: 240, seedTimeCounting: "CUMULATIVE", ...policy },
+    ...over,
+  });
+  assert.deepEqual(seedingGoalProgress(torrent({}, {})), { ratio: 25, seedTime: 50 });
+  // Consecutive counting reads the current run, not every second seeded.
+  assert.equal(seedingGoalProgress(torrent({}, { seedTimeCounting: "CONSECUTIVE" })).seedTime, 12.5);
+  // No goal is no bar; a goal of zero is met at once; past the goal stays full.
+  assert.deepEqual(seedingGoalProgress(torrent({}, { ratioGoal: null, seedTimeGoalMinutes: null })), { ratio: null, seedTime: null });
+  assert.equal(seedingGoalProgress(torrent({}, { ratioGoal: 0 })).ratio, 100);
+  assert.equal(seedingGoalProgress(torrent({ ratio: 3 }, {})).ratio, 100);
 });

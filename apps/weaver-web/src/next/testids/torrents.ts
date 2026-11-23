@@ -45,6 +45,8 @@ export const torrentIds = {
   queueRowProtocol: (protocol: string) => `queue-entry-protocol-${protocol}`,
   queueRowStatus: (status: string) => `queue-entry-status-${status}`,
   queueRowSeeding: "queue-entry-seeding",
+  // A seeding row's bars: the ratio goal over the finished download, and the seed-time goal.
+  queueRowSeedingBars: "queue-entry-seeding-bars",
   queueRowPause: "queue-entry-pause",
   queueRowResume: "queue-entry-resume",
 

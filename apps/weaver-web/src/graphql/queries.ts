@@ -2000,6 +2000,13 @@ export const TORRENT_SUMMARY_UPDATES_SUBSCRIPTION = gql`
         ratio
         uploadBps
         seedingGoalLeft
+        seedingSeconds
+        consecutiveSeedingSeconds
+        seedingPolicy {
+          ratioGoal
+          seedTimeGoalMinutes
+          seedTimeCounting
+        }
       }
     }
   }

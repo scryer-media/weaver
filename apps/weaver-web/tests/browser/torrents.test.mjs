@@ -36,6 +36,21 @@ test("only a torrent carries a protocol chip", async () => {
   await page.close();
 });
 
+test("a seeding row fills its ratio goal over the finished download, and a seed time goal gets a bar below", async () => {
+  const { page, errors } = await open("seedingRows");
+  const row = (label) => page.getByLabel(label, { exact: true });
+  await row("ratio only").getByTestId("queue-entry-seeding-bars").waitFor();
+  const goals = async (label) =>
+    row(label).getByRole("progressbar").evaluateAll((bars) => bars.map((bar) => [bar.getAttribute("aria-label"), bar.getAttribute("aria-valuenow")]));
+  assert.deepEqual(await goals("ratio only"), [["Ratio goal", "25"]]);
+  assert.deepEqual(await goals("ratio and time"), [["Ratio goal", "25"], ["Seed time goal", "50"]]);
+  // No goal: the finished download alone, whole and gray, with nothing to fill toward.
+  assert.deepEqual(await goals("no goal"), []);
+  assert.equal(await row("no goal").getByTestId("queue-entry-seeding-bars").innerText(), "100%");
+  assert.equal(errors.length, 0, errors.join("\n"));
+  await page.close();
+});
+
 test("a wait reason that is a sentence is shown as the daemon wrote it", async () => {
   const { page, errors } = await open("detail");
   const items = page.getByRole("list", { name: "details", exact: true }).getByRole("listitem");
