@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { JobScriptResults } from "@/next/components/JobScriptResults";
 import { Link, useNavigate, useParams } from "react-router";
 import { useClient, useMutation, useQuery, useSubscription } from "urql";
@@ -103,9 +103,17 @@ import type { DownloadSummaryData } from "../data/download-summary";
 // The relative-size bar is the one cell here carrying no value of its own, so
 // it is the one that goes when a phone cannot hold four tracks.
 const FILE_COLUMNS = {
-  base: "minmax(0, 1fr) 62px 74px 46px",
-  sm: "minmax(0, 1fr) 68px 82px 54px",
+  base: "minmax(0, 1fr) 62px 34px 34px",
+  sm: "minmax(0, 1fr) 68px 112px 78px",
 };
+
+// A file's actions fill their columns: an icon alone on a phone, the icon
+// and its label from `sm` up.
+const FILE_ACTION = "w-full px-0 sm:px-3 [&>svg]:mr-0 sm:[&>svg]:mr-[7px] [&>svg]:ml-0 sm:[&>svg]:-ml-[2px]";
+
+function FileActionLabel({ children }: { children: ReactNode }) {
+  return <span className="sr-only sm:not-sr-only">{children}</span>;
+}
 
 // A log needs its clock and its message; the machine-readable kind is what a
 // narrow screen can do without, so its tone moves onto the message instead.
@@ -1067,21 +1075,23 @@ function JobDetailContent() {
                     {t("next.job.fileRemoved")}
                   </span>
                 ) : (
-                  <button
-                    type="button"
+                  <SecondaryButton
+                    icon="downloadFile"
+                    size="compact"
                     title={t("next.job.downloadFileTitle", { name: file.name })}
                     onClick={() => downloadOutputFile(file)}
-                    className="cursor-pointer text-right text-[12.5px] whitespace-nowrap text-wv-dim hover:text-wv-fg"
+                    className={FILE_ACTION}
                   >
-                    {t("next.job.download")}
-                  </button>
+                    <FileActionLabel>{t("next.job.download")}</FileActionLabel>
+                  </SecondaryButton>
                 )}
                 {/* Nor a path to copy: nothing is there any more. */}
                 {entryArchived ? (
                   <span aria-hidden="true" />
                 ) : (
-                  <button
-                    type="button"
+                  <SecondaryButton
+                    icon="copy"
+                    size="compact"
                     title={t("next.job.copyPathTitle")}
                     onClick={() => {
                       void copyText(file.path).then((taken) =>
@@ -1090,10 +1100,10 @@ function JobDetailContent() {
                         ),
                       );
                     }}
-                    className="cursor-pointer text-right text-[12.5px] whitespace-nowrap text-wv-dim hover:text-wv-fg"
+                    className={FILE_ACTION}
                   >
-                    {t("next.job.copy")}
-                  </button>
+                    <FileActionLabel>{t("next.job.copy")}</FileActionLabel>
+                  </SecondaryButton>
                 )}
               </GridRow>
             ))}
