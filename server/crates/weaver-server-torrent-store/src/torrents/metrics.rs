@@ -269,18 +269,28 @@ pub struct JobSeries<'a> {
 impl Published {
     /// Each torrent with its route's session, in the order published.
     pub fn jobs(&self) -> impl Iterator<Item = JobSeries<'_>> {
-        self.torrents.iter().map(|torrent| JobSeries {
+        self.torrents
+            .iter()
+            .map(|torrent| self.with_session(torrent))
+    }
+
+    /// `job_id`'s torrent with its route's session, when it is a torrent:
+    /// only its own session is looked for.
+    pub fn job(&self, job_id: JobId) -> Option<JobSeries<'_>> {
+        self.torrents
+            .iter()
+            .find(|torrent| torrent.job_id == job_id)
+            .map(|torrent| self.with_session(torrent))
+    }
+
+    fn with_session<'a>(&'a self, torrent: &'a TorrentSeries) -> JobSeries<'a> {
+        JobSeries {
             torrent,
             session: self
                 .sessions
                 .iter()
                 .find(|session| !torrent.route.is_empty() && session.route == torrent.route),
-        })
-    }
-
-    /// `job_id`'s torrent with its route's session, when it is a torrent.
-    pub fn job(&self, job_id: JobId) -> Option<JobSeries<'_>> {
-        self.jobs().find(|job| job.torrent.job_id == job_id)
+        }
     }
 }
 

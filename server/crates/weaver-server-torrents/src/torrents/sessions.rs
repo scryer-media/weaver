@@ -2308,8 +2308,9 @@ pub fn port_slot(db: &Database, key: &RouteKey) -> Result<u16, StateError> {
     if let Some(slot) = slots.get(key.as_str()) {
         return Ok(*slot);
     }
+    let taken: std::collections::HashSet<u16> = slots.values().copied().collect();
     let slot = (0u16..)
-        .find(|slot| !slots.values().any(|taken| taken == slot))
+        .find(|slot| !taken.contains(slot))
         .expect("fewer slots than ports");
     slots.insert(key.as_str().to_owned(), slot);
     save_slots(db, &slots)?;
