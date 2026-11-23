@@ -90,19 +90,22 @@ export function MenuItem({
   children,
   className,
   testId,
+  action = false,
 }: {
   selected?: boolean;
   onSelect: () => void;
   children: ReactNode;
   className?: string;
   testId?: string;
+  /** A command rather than a choice: a plain `menuitem` that is never checked. */
+  action?: boolean;
 }) {
   return (
     <button
       type="button"
-      role="menuitemradio"
+      role={action ? "menuitem" : "menuitemradio"}
       data-testid={testId}
-      aria-checked={selected}
+      aria-checked={action ? undefined : selected}
       onClick={onSelect}
       className={cn(
         "flex cursor-pointer items-baseline gap-5 px-3 py-[9px] text-left text-[12.5px] hover:bg-wv-menu-hover",

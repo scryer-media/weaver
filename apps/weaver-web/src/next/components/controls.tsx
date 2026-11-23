@@ -70,6 +70,7 @@ export function SecondaryButton({
   title,
   size = "default",
   testId,
+  menuOpen,
 }: {
   children: ReactNode;
   /** A leading icon, named by the action. */
@@ -81,11 +82,17 @@ export function SecondaryButton({
   /** `compact` is the 32px action a detail header carries four of. */
   size?: "default" | "compact";
   testId?: string;
+  /** Set when the button opens a `Menu`: whether that menu is open. */
+  menuOpen?: boolean;
 }) {
+  const triggersMenu = menuOpen !== undefined;
   return (
     <button
       type="button"
       data-testid={testId}
+      data-wv-menu-trigger={triggersMenu ? "" : undefined}
+      aria-haspopup={triggersMenu ? "menu" : undefined}
+      aria-expanded={menuOpen}
       title={title}
       onClick={onClick}
       disabled={disabled}
