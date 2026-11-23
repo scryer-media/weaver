@@ -120,8 +120,6 @@ const RIBBON_FULL = 100;
 const DNS_ROW = 28;
 const DNS_PILL = 20;
 const DNS_SIZE = 9.5;
-/** The room the DNS mark takes at the start of every pill. */
-const DNS_MARK = 13;
 /** A DNS answer card: its title's line, then a row for each server or a line saying who it is. */
 const DNS_CARD_HEAD = 30;
 const DNS_SERVER_ROW = 26;
@@ -656,9 +654,8 @@ function UpDownSwitch({
   );
 }
 
-/** How wide a DNS pill is for its words, with room for the DNS mark and a lock before them. */
-const pillWidth = (label: string, locked: boolean) =>
-  Math.ceil(label.length * DNS_SIZE * 0.6) + 20 + DNS_MARK + (locked ? 12 : 0);
+/** How wide a DNS pill is for its words, with room for a lock before them. */
+const pillWidth = (label: string, locked: boolean) => Math.ceil(label.length * DNS_SIZE * 0.6) + 20 + (locked ? 12 : 0);
 
 /** A padlock, centred on `x`, `y`: DNSSEC on the one asking, DoT or DoH on the line. */
 function Lock({ x, y, color }: { x: number; y: number; color: string }) {
@@ -688,14 +685,11 @@ function DnsPill({
 }) {
   const color = refused ? stateColor("BLOCKED") : INK.dns;
   const shown = width ?? pillWidth(label, locked);
-  const textX = x + 10 + DNS_MARK + (locked ? 12 : 0);
+  const textX = x + 10 + (locked ? 12 : 0);
   return (
     <g>
       <rect x={x} y={mid - DNS_PILL / 2} width={shown} height={DNS_PILL} rx={DNS_PILL / 2} fill={INK.dnsFill} stroke={color} />
-      <g transform={`translate(${x + 8} ${mid - 5})`} color={color}>
-        <Icon name="dns" size={10} />
-      </g>
-      {locked ? <Lock x={x + 15 + DNS_MARK} y={mid} color={color} /> : null}
+      {locked ? <Lock x={x + 15} y={mid} color={color} /> : null}
       <text x={textX} y={mid + 3.5} fill={INK.secondary} fontSize={DNS_SIZE}>
         {fit(label, x + shown - 8 - textX, DNS_SIZE)}
       </text>
@@ -1205,16 +1199,8 @@ export const NetworkFlow = memo(function NetworkFlow({
   const approach = endpoints.x - 56;
   const asks = origins.map(({ origin, lookup, profile: chosen, legs }, index) => {
     const leg = legs[0]!;
-    const label =
-      lookup.asker === null
-        ? t("next.networking.flow.dnsRefused")
-        : lookup.asker === "HOST"
-          ? t(lookup.fallback ? "next.networking.flow.dnsAskFallback" : "next.networking.flow.dnsAskHost")
-          : lookup.asker === "PROXY"
-            ? t("next.networking.flow.dnsAskProxy")
-            : lookup.destination?.kind === "tunnel"
-              ? t("next.networking.flow.dnsAskTunnel")
-              : t("next.networking.flow.dnsAskWeaver");
+    // The pill says only that names are looked up here; who asks, and how, is in its tooltip.
+    const label = t(lookup.asker === null ? "next.networking.flow.dnsRefused" : "next.networking.flow.dnsAsk");
     const list = lookup.destination?.kind === "list" && lookup.destination.id !== null ? listById.get(lookup.destination.id) : undefined;
     const egressName = egressNames.get(leg.egressId) ?? "";
     const values = { profile: chosen.name, proxy: exitName(lookup.exit), list: list?.name ?? chosen.name, from: egressName };
@@ -1253,6 +1239,14 @@ export const NetworkFlow = memo(function NetworkFlow({
             ];
     const wire = lookup.destination?.kind === "list" ? listWire(list) : null;
     const turn = line?.at(-2);
+    // An egress asks for every leg leaving through it: a line from each leg's card says which.
+    const feeds =
+      lookup.at === "egress"
+        ? legs.flatMap((fed) => {
+            const row = rowByKey.get(legKey(fed));
+            return row ? [{ key: legKey(fed), y: row.y + row.cardHeight - 14, lit: onRoute(fed) }] : [];
+          })
+        : [];
     return {
       key: `${index}:${legKey(leg)}:${chosen.id}`,
       ...origin,
@@ -1264,6 +1258,7 @@ export const NetworkFlow = memo(function NetworkFlow({
       refused: lookup.refused !== null,
       width: Math.min(pillWidth(label, lookup.validates), origin.boxEnd - origin.x - 14),
       line,
+      feeds,
       // DoT or DoH is written on the line, halfway along its last stretch.
       badge:
         wire && line && turn
@@ -1731,6 +1726,16 @@ export const NetworkFlow = memo(function NetworkFlow({
             );
           })}
 
+          {/* From each leg to the egress that looks its names up, under the egress card. */}
+          {asks.flatMap((ask) =>
+            ask.feeds.map((feed) => (
+              <g key={`dns-feed:${ask.key}:${feed.key}`} opacity={feed.lit ? undefined : FADE}>
+                <circle cx={LEGS.end} cy={feed.y} r="2.5" fill={INK.dns} />
+                <path d={thread([[LEGS.end, feed.y], [EGRESS.x, ask.mid]])} fill="none" stroke={INK.dns} strokeWidth="1.25" />
+              </g>
+            )),
+          )}
+
           {/* Each lookup's line, laid under the boxes it passes, out to what answers it. */}
           {asks.map((ask) =>
             ask.line ? (
@@ -1959,6 +1964,9 @@ export const NetworkFlow = memo(function NetworkFlow({
               {ask.refused ? null : (
                 <path d={`M ${ask.x + ask.width} ${ask.mid} L ${ask.boxEnd} ${ask.mid}`} stroke={INK.dns} strokeWidth="1.5" />
               )}
+              {ask.feeds.length ? (
+                <path d={`M ${EGRESS.x} ${ask.mid} L ${ask.x} ${ask.mid}`} stroke={INK.dns} strokeWidth="1.25" />
+              ) : null}
               {card(
                 ask.target,
                 ask.target?.kind === "route" ? routePage(ask.legs[0]!.consumer) : DNS_PAGE,
