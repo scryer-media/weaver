@@ -172,6 +172,10 @@ pub struct Live {
     // made: it is in no session, its pieces kept, until a start, a recheck
     // or a move looks again. Found again at each load, never kept.
     pub(super) files_missing: bool,
+    // A recheck let go of every piece while it was in no session: the end
+    // of the check the session it joins makes is judged as a recheck's is
+    // (`rejudge_after_check`). Taken by that join.
+    pub(super) check_owed: bool,
     // Waits for room on its disk, and how: the service's wait for it is in
     // `Inner::disk_waits`.
     pub disk_held: Option<DiskHeld>,
@@ -296,6 +300,7 @@ impl Live {
             restore_held: None,
             sealed: None,
             files_missing: false,
+            check_owed: false,
             disk_held: None,
             start_refused: None,
             queued: false,

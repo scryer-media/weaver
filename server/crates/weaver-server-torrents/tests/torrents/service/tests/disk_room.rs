@@ -491,6 +491,187 @@ async fn a_recheck_that_finds_less_judges_the_start_again() {
     service.stop().await;
 }
 
+// The judgements of check ends made so far: a test waits past it for the
+// one its own recheck makes.
+fn checks_judged(service: &TorrentService) -> (tokio::sync::watch::Receiver<u64>, u64) {
+    let mut judged = service.inner.checks_judged.subscribe();
+    let at = *judged.borrow_and_update();
+    (judged, at)
+}
+
+// Until a check end past `at` was judged.
+async fn judged_past(judged: &mut tokio::sync::watch::Receiver<u64>, at: u64) {
+    judged.wait_for(|judged| *judged > at).await.unwrap();
+}
+
+// A complete torrent whose folder is gone at a restart is held for its
+// files. A recheck lets go of every piece, and once the check of the
+// session it joins finds none of the files it wants, it is short of
+// complete again: it shows downloading, not seeding, its disk is looked up,
+// and its start is promised every byte it has left, all before any block
+// arrives (no peer has one to send).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recheck_that_finds_a_complete_torrent_gone_downloads_it_again() {
+    let disks = tempfile::tempdir().unwrap();
+    let probe = |_: &Path| {
+        Ok(DiskSpace {
+            total_bytes: 1 << 40,
+            available_bytes: RESERVE + PLENTY,
+        })
+    };
+    let roots = [0, 1, 2].map(|_| disks.path().to_path_buf());
+    let capacity = Arc::new(StorageCapacity::with_probe(roots, NEVER, Arc::new(probe)));
+    for root in StorageRoot::ALL {
+        capacity.wait_for_probes(root, 1);
+    }
+    let ledger = capacity.ledger(StorageRoot::Complete);
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let (job_id, dir) = with_every_piece(&rig).await;
+    view_once(&rig.service, job_id, |view| view.completed_at_ms.is_some()).await;
+    rig.service.stop().await;
+    rig.db.prune_orphan_active_state(JobId(u64::MAX)).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    let again = service_on(
+        &rig.db,
+        rig.dir.path(),
+        &rig.routes,
+        disk_env(&capacity),
+        set_clock(),
+    );
+    again.publish_to(queue());
+    reopen(&again).await;
+    let view = again.torrent(job_id).await.unwrap();
+    assert_eq!(view.state, TorrentState::FilesMissing);
+    assert!(view.completed_at_ms.is_some());
+    assert_eq!(ledger.promised_total(), 0);
+
+    let (mut judged, at) = checks_judged(&again);
+    again.recheck(job_id).await.unwrap();
+    judged_past(&mut judged, at).await;
+    let view = again.torrent(job_id).await.unwrap();
+    assert_eq!(view.completed_at_ms, None, "short of complete again");
+    assert!(
+        matches!(
+            view.state,
+            TorrentState::Downloading | TorrentState::Stalled
+        ),
+        "it shows downloading, not {:?}",
+        view.state
+    );
+    assert_eq!(
+        rig.db.get_torrent(job_id).unwrap().unwrap().completed_at_ms,
+        None,
+        "stored short of complete"
+    );
+    placed(&again, job_id).await;
+    promised(ledger, 3_000).await;
+    assert_eq!(job_have(&again, job_id).await, 0, "no block came");
+    let handle = handle_of(&again, job_id).await;
+    assert!(!handle.is_paused());
+    assert!(!handle.live().unwrap().upload_mode(), "it fetches");
+    again.stop().await;
+}
+
+// A recheck of a complete torrent in its session that finds every byte of
+// its file gone judges the check's end the same way: it is short of
+// complete again, shows downloading, and is promised what it has left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recheck_in_its_session_that_finds_the_files_gone_downloads_again() {
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let disk = on_disk(&room).await;
+    let service = &disk.rig.service;
+    let ledger = disk.capacity.ledger(StorageRoot::Complete);
+    let torrent = handle_of(service, disk.job_id).await;
+    torrent.wait_until_completed().await.unwrap();
+    // Nobody is left to fetch the lost bytes from.
+    disk.seeding.stop().await;
+    view_once(service, disk.job_id, |view| {
+        view.completed_at_ms.is_some() && view.state == TorrentState::Seeding
+    })
+    .await;
+    promised(ledger, 0).await;
+    let dir = service
+        .torrent(disk.job_id)
+        .await
+        .unwrap()
+        .storage_dir
+        .unwrap();
+    // Emptied in place, so a handle the store keeps open reads it so too.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(file_named(Path::new(&dir), "a.bin"))
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+
+    let (mut judged, at) = checks_judged(service);
+    service.recheck(disk.job_id).await.unwrap();
+    judged_past(&mut judged, at).await;
+    let view = service.torrent(disk.job_id).await.unwrap();
+    assert_eq!(view.completed_at_ms, None, "short of complete again");
+    assert!(
+        matches!(
+            view.state,
+            TorrentState::Downloading | TorrentState::Stalled
+        ),
+        "it shows downloading, not {:?}",
+        view.state
+    );
+    promised(ledger, 65_536).await;
+    assert_eq!(disk_held(service, disk.job_id).await, None);
+    assert!(!torrent.is_paused());
+    service.stop().await;
+}
+
+// A recheck that finds every file a complete torrent wants changes
+// nothing: it stays complete, where it was in the queue, seeding, and
+// nothing is promised for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recheck_that_finds_everything_leaves_the_torrent_complete() {
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let disk = on_disk(&room).await;
+    let service = &disk.rig.service;
+    let ledger = disk.capacity.ledger(StorageRoot::Complete);
+    let torrent = handle_of(service, disk.job_id).await;
+    torrent.wait_until_completed().await.unwrap();
+    disk.seeding.stop().await;
+    let before = view_once(service, disk.job_id, |view| {
+        view.completed_at_ms.is_some() && view.state == TorrentState::Seeding
+    })
+    .await;
+    promised(ledger, 0).await;
+    let place = service.inner.live.lock().await[&disk.job_id]
+        .record
+        .queue_position;
+
+    let (mut judged, at) = checks_judged(service);
+    service.recheck(disk.job_id).await.unwrap();
+    judged_past(&mut judged, at).await;
+    let view = service.torrent(disk.job_id).await.unwrap();
+    assert_eq!(view.completed_at_ms, before.completed_at_ms);
+    assert_eq!(view.state, TorrentState::Seeding);
+    assert_eq!(
+        service.inner.live.lock().await[&disk.job_id]
+            .record
+            .queue_position,
+        place
+    );
+    assert_eq!(
+        disk.rig
+            .db
+            .get_torrent(disk.job_id)
+            .unwrap()
+            .unwrap()
+            .completed_at_ms,
+        before.completed_at_ms
+    );
+    assert_eq!(ledger.promised_total(), 0);
+    assert_eq!(disk_held(service, disk.job_id).await, None);
+    service.stop().await;
+}
+
 // A running torrent moved to another disk takes its promise with it: what
 // it was promised goes back on the old disk, and what it has left is judged
 // on the new one by the start rule. With no room there, its download is

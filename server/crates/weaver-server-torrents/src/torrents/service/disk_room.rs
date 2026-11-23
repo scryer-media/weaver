@@ -459,6 +459,9 @@ impl TorrentService {
         }
         room.release_start();
         let Some(place) = room.place() else {
+            // Its disk is looked up first: the pass that follows the look
+            // judges it and promises its start, as one starting is.
+            self.look_for_place(torrent.record.job_id, intake, files_dir(torrent));
             return;
         };
         let Disk::Root(root) = place.disk else {
@@ -490,19 +493,19 @@ impl TorrentService {
     }
 
     // A check of every piece of `job_id`'s run on `handle` began: once it
-    // ends, what it found is judged as a change of the files it wants is
-    // (`rejudge_start`), so a check that finds less than was believed is
-    // promised what it has left, or has its download held, seeding. A run
-    // ended or replaced by then is judged as it starts.
+    // ends, what it found is judged as a change of the files it wants is.
+    // A complete torrent it found short of a file it wants is short of
+    // complete again (`Live::reopens`), and downloads; one it found whole
+    // is left as it was. Then its start is judged (`rejudge_start`), so a
+    // check that finds less than was believed is promised what it has left,
+    // or has its download held, seeding. A run ended or replaced by then is
+    // judged as it starts.
     pub(super) fn rejudge_after_check(
         &self,
         job_id: JobId,
         session: &Arc<weaver_torrent::Session>,
         handle: &Arc<weaver_torrent::ManagedTorrent>,
     ) {
-        if self.inner.env.capacity.is_none() {
-            return;
-        }
         let service = self.clone();
         let stopping = session.cancellation_token().clone().cancelled_owned();
         let handle = Arc::clone(handle);
@@ -527,6 +530,9 @@ impl TorrentService {
                 return;
             }
             let was = torrent.disk_held;
+            if torrent.reopens(&torrent.levels) {
+                service.reopen_checked(torrent, service.inner.clock.unix_ms());
+            }
             service.rejudge_start(torrent);
             let moved = torrent.disk_held != was;
             drop(live);
@@ -539,6 +545,11 @@ impl TorrentService {
                     .send_modify(|moved| *moved += 1);
             }
             service.publish_job(job_id).await;
+            #[cfg(any(test, feature = "test-support"))]
+            service
+                .inner
+                .checks_judged
+                .send_modify(|judged| *judged += 1);
         }));
     }
 

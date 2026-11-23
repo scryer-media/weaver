@@ -844,6 +844,19 @@ impl TorrentService {
             self.inner.db.set_torrent_file_priorities(job_id, asked)?;
             return Ok(None);
         }
+        self.store_reopened(job_id, asked).map(Some)
+    }
+
+    // Store a complete torrent short of complete again, with `asked` as its
+    // levels, at the end of the download queue and its unpacking over, in
+    // one write: the place it is to take, returned. A write that fails
+    // stores nothing, and gives its place back unless another torrent took
+    // the next one since.
+    fn store_reopened(
+        &self,
+        job_id: JobId,
+        asked: &[FilePriority],
+    ) -> Result<i64, crate::StateError> {
         let place = self
             .inner
             .next_queue_position
@@ -863,7 +876,7 @@ impl TorrentService {
         if self.loading() {
             marks.asked.push(super::Asked::Added(job_id));
         }
-        Ok(Some(place))
+        Ok(place)
     }
 
     // Give back a place taken at the end of the download queue for a change
@@ -877,9 +890,7 @@ impl TorrentService {
     }
 
     // Take `held`, stored by `save_levels`, in memory. One it stored short
-    // of complete again is settled first, so the time up to `now` counts as
-    // what the torrent was doing then, seeding, and none after; it then
-    // downloads, shows so and takes a download slot and rank again.
+    // of complete again is reopened at the place it stored.
     fn take_levels(
         &self,
         torrent: &mut super::live::Live,
@@ -888,11 +899,7 @@ impl TorrentService {
         now: i64,
     ) {
         if let Some(place) = reopened {
-            torrent.settle(now);
-            torrent.record.completed_at_ms = None;
-            torrent.record.queue_position = place;
-            torrent.record.unpack_over = true;
-            self.inner.signal.want_pass();
+            self.reopen(torrent, place, now);
         }
         torrent.levels = held;
         // What it wants changed: so does what its start is promised.
@@ -908,24 +915,43 @@ impl TorrentService {
         }
     }
 
+    // A complete torrent stored short of complete again at `place` takes it
+    // in memory: settled first, so the time up to `now` counts as what it
+    // was doing then, seeding, and none after; it then downloads, shows so
+    // and takes a download slot and rank again.
+    fn reopen(&self, torrent: &mut super::live::Live, place: i64, now: i64) {
+        torrent.settle(now);
+        torrent.record.completed_at_ms = None;
+        torrent.record.queue_position = place;
+        torrent.record.unpack_over = true;
+        self.inner.signal.want_pass();
+    }
+
+    // A complete torrent whose check found a file it wants short
+    // (`Live::reopens`) is stored short of complete again with the levels
+    // it holds, and reopened as a change of its levels reopens it. One that
+    // cannot be stored so is still reopened in memory: its completion is
+    // stored again at its next, and a restart before that reopens it from
+    // its stored pieces.
+    pub(super) fn reopen_checked(&self, torrent: &mut super::live::Live, now: i64) {
+        let job_id = torrent.record.job_id;
+        let place = match self.store_reopened(job_id, &stored_levels(torrent)) {
+            Ok(place) => place,
+            Err(error) => {
+                tracing::warn!(job_id = job_id.0, error = %error, "could not store a torrent short of complete again");
+                torrent.record.queue_position
+            }
+        };
+        self.reopen(torrent, place, now);
+    }
+
     // Store again what memory holds of a torrent whose change of levels,
     // stored before its copy, did not land: its levels, and, when that
     // change stored it short of complete, when it completed and its place.
     // Whether it was stored.
     fn store_back(&self, torrent: &super::live::Live, reopened: bool) -> bool {
         let job_id = torrent.record.job_id;
-        let asked: Vec<FilePriority> = torrent
-            .levels
-            .iter()
-            .zip(torrent.layout.iter().flat_map(|layout| layout.files()))
-            .map(|(level, file)| {
-                if file.padding {
-                    FilePriority::Normal
-                } else {
-                    *level
-                }
-            })
-            .collect();
+        let asked = stored_levels(torrent);
         let stored = if reopened {
             self.inner.db.set_torrent_levels_and_completion(
                 job_id,
@@ -1124,6 +1150,23 @@ async fn reloaded(reloads: &mut Option<watch::Receiver<u64>>) {
     }
     *reloads = None;
     std::future::pending().await
+}
+
+// The levels a torrent holds, as stored: a padding file's at the level it
+// is stored with, not the one it is held by.
+fn stored_levels(torrent: &super::live::Live) -> Vec<FilePriority> {
+    torrent
+        .levels
+        .iter()
+        .zip(torrent.layout.iter().flat_map(|layout| layout.files()))
+        .map(|(level, file)| {
+            if file.padding {
+                FilePriority::Normal
+            } else {
+                *level
+            }
+        })
+        .collect()
 }
 
 // A change of a torrent's files' levels under way: the job that copies
