@@ -1793,12 +1793,7 @@ export const NetworkFlow = memo(function NetworkFlow({
             ask.line ? (
               <g key={`dns-line:${ask.key}`} opacity={ask.lit ? undefined : FADE}>
                 <path d={thread(ask.line)} fill="none" stroke={INK.dns} strokeWidth="1.5" />
-                <path
-                  d={`M ${endpoints.x - 7} ${ask.line.at(-1)![1] - 4} L ${endpoints.x} ${ask.line.at(-1)![1]} L ${endpoints.x - 7} ${ask.line.at(-1)![1] + 4}`}
-                  fill="none"
-                  stroke={INK.dns}
-                  strokeWidth="1.5"
-                />
+                <circle cx={endpoints.x} cy={ask.line.at(-1)![1]} r="2.5" fill={INK.dns} />
               </g>
             ) : null,
           )}
