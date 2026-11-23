@@ -3,7 +3,7 @@
 
 import { createRoot } from "react-dom/client";
 import { MemoryRouter } from "react-router";
-import { Client, Provider, type OperationResult } from "urql";
+import { Client, CombinedError, Provider, type OperationResult } from "urql";
 import { fromValue, make, mergeMap, pipe } from "wonka";
 import { TranslateContext } from "@/lib/context/translate-context";
 import en from "@/lib/i18n/locales/en";
@@ -67,6 +67,11 @@ const client = new Client({ url: "http://fixture.invalid/graphql", exchanges: [(
       return fromValue({ operation, data: { updateSettings: settings }, stale: false, hasNext: false });
     }
     return fromValue({ operation, data: {}, stale: false, hasNext: false });
+  }
+  // The rail's connection flow is for readers who may see the networking
+  // settings; this reader may not, so the rail draws no flow.
+  if (name === "Networking" || name === "NetworkFlow") {
+    return fromValue({ operation, error: new CombinedError({ graphQLErrors: [{ message: "forbidden" }] }) } as OperationResult);
   }
   const data = name === "TorrentSettings" ? { settings }
     : name === "TrackerRules" ? { trackerRules: [] }

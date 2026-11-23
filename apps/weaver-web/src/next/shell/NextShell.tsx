@@ -641,10 +641,7 @@ function RailRates({
 function RailCounter({ arrow, rate, title }: { arrow: "down" | "up"; rate: number; title: string }) {
   const { value, unit } = fixedSpeed(rate);
   return (
-    <dd className="m-0 flex items-baseline justify-end gap-[2px]" title={title} aria-label={title}>
-      <span aria-hidden className="text-[10px] text-wv-muted">
-        {arrow === "down" ? "↓" : "↑"}
-      </span>
+    <dd className="m-0 flex items-baseline justify-end" title={title} aria-label={title}>
       <span
         className={cn(
           "inline-block w-[5ch] text-right font-wv-mono text-[12px] font-semibold tabular-nums leading-none",
@@ -653,15 +650,21 @@ function RailCounter({ arrow, rate, title }: { arrow: "down" | "up"; rate: numbe
       >
         {value}
       </span>
-      <span className="inline-block w-[4ch] font-wv-mono text-[9.5px] text-wv-muted">{unit}</span>
+      <span className="ml-[2px] font-wv-mono text-[9.5px] text-wv-muted">{unit}</span>
+      <span aria-hidden className="text-[10px] text-wv-muted">
+        {arrow === "down" ? "↓" : "↑"}
+      </span>
     </dd>
   );
 }
 
-/** A rate as `x.x` and its unit, one decimal at every scale. */
+/**
+ * A rate as `x.x` and its unit, one decimal at every scale. The scale starts
+ * at KB/s, so every unit is four letters wide and nothing shifts as it climbs.
+ */
 function fixedSpeed(bytesPerSecond: number): { value: string; unit: string } {
-  const units = ["B/s", "KB/s", "MB/s", "GB/s"];
-  let scaled = Number.isFinite(bytesPerSecond) && bytesPerSecond > 0 ? bytesPerSecond : 0;
+  const units = ["KB/s", "MB/s", "GB/s", "TB/s"];
+  let scaled = Number.isFinite(bytesPerSecond) && bytesPerSecond > 0 ? bytesPerSecond / 1024 : 0;
   let index = 0;
   // Past 999.9 the next unit, so the value never needs more than five places.
   while (scaled >= 999.95 && index < units.length - 1) {
