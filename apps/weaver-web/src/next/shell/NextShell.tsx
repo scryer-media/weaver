@@ -531,7 +531,7 @@ const ThroughputBlock = memo(function ThroughputBlock() {
           {button}
         </div>
         <dl
-          className="m-0 grid grid-cols-[minmax(0,1fr)_auto_auto] items-baseline gap-x-[6px] gap-y-[6px]"
+          className="m-0 grid grid-cols-[auto_1fr_auto] items-baseline gap-x-[4px] gap-y-[6px]"
           data-testid={testIds.shellThroughputRates}
         >
           <RailRates
@@ -625,7 +625,7 @@ function RailRates({
 }) {
   return (
     <>
-      <dt className="min-w-0 truncate font-wv-mono text-[10.5px] text-wv-muted">{label}</dt>
+      <dt className="whitespace-nowrap font-wv-mono text-[10.5px] text-wv-muted">{label}</dt>
       <RailCounter arrow="down" {...down} />
       {up ? (
         <RailCounter arrow="up" {...up} />
@@ -651,7 +651,7 @@ function RailCounter({ arrow, rate, title }: { arrow: "down" | "up"; rate: numbe
         {value}
       </span>
       <span className="ml-[2px] font-wv-mono text-[9.5px] text-wv-muted">{unit}</span>
-      <span aria-hidden className="text-[10px] text-wv-muted">
+      <span aria-hidden className="ml-[4px] font-wv-mono text-[12px] font-semibold leading-none text-wv-fg">
         {arrow === "down" ? "↓" : "↑"}
       </span>
     </dd>
