@@ -5,6 +5,7 @@ import { useState } from "react";
 import { useTranslate } from "@/lib/context/translate-context";
 import type { BandwidthSplit } from "@/lib/networking";
 import { NumberField, Toggle } from "../../components/controls";
+import { testIds } from "../../testids";
 import { MIB } from "./presentation";
 
 /**
@@ -19,10 +20,13 @@ export function LimitControl({
   onChange,
   unit = MIB,
   suffix = "MiB/s",
+  fieldId,
 }: {
   label: string;
   value: number | null;
   onChange: (next: number | null) => void;
+  /** The settings field this control draws: its switch is `field-<id>`, its rate `field-<id>-value`. */
+  fieldId?: string;
   /** Bytes in one step of the rate as it is typed. */
   unit?: number;
   suffix?: string;
@@ -38,6 +42,7 @@ export function LimitControl({
           step={0.1}
           precision={1}
           suffix={suffix}
+          testId={fieldId === undefined ? undefined : testIds.fieldValue(fieldId)}
           onChange={(next) => {
             const bytes = Math.round(Math.max(0, next) * unit);
             setLast(bytes);
@@ -45,7 +50,12 @@ export function LimitControl({
           }}
         />
       ) : null}
-      <Toggle checked={value !== null} label={label} onChange={(on) => onChange(on ? last : null)} />
+      <Toggle
+        checked={value !== null}
+        label={label}
+        onChange={(on) => onChange(on ? last : null)}
+        testId={fieldId === undefined ? undefined : testIds.field(fieldId)}
+      />
     </div>
   );
 }

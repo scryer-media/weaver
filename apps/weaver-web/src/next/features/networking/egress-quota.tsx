@@ -7,6 +7,7 @@ import type { Translate } from "@/lib/context/translate-context";
 import type { Egress, EgressQuota, QuotaDirectionUsage, QuotaPeriod, QuotaState, Weekday } from "@/lib/networking";
 import { Pie } from "../../components/chrome";
 import { Toggle } from "../../components/controls";
+import { testIds } from "../../testids";
 import { Cell } from "../../components/rows";
 import { formatDayClock, formatSize } from "../../data/format";
 import { WV } from "../../data/palette";
@@ -248,13 +249,24 @@ export function egressQuotaChanged(draft: EgressQuotaDraft, saved: EgressQuota |
 }
 
 /** A cap's switch, and the allowance beside it while it is on. */
-function CapControl({ label, cap, onChange }: { label: string; cap: CapDraft; onChange: (next: CapDraft) => void }) {
+function CapControl({
+  label,
+  cap,
+  onChange,
+  fieldId,
+}: {
+  label: string;
+  cap: CapDraft;
+  onChange: (next: CapDraft) => void;
+  /** The settings field this control draws: its switch is `field-<id>`. */
+  fieldId: string;
+}) {
   return (
     <div className="flex items-center gap-[10px]">
       {cap.on ? (
         <AllowanceControl label={label} limit={cap.limit} unit={cap.unit} onChange={(next) => onChange({ ...cap, ...next })} />
       ) : null}
-      <Toggle checked={cap.on} label={label} onChange={(on) => onChange({ ...cap, on })} />
+      <Toggle checked={cap.on} label={label} onChange={(on) => onChange({ ...cap, on })} testId={testIds.field(fieldId)} />
     </div>
   );
 }
@@ -280,7 +292,9 @@ export function egressQuotaFields(
     keywords: "quota allowance metered cap",
     control: {
       kind: "custom",
-      control: <CapControl label={label} cap={draft[id]} onChange={(next) => patch({ [id]: next })} />,
+      control: (
+        <CapControl label={label} fieldId={`quota-${id}`} cap={draft[id]} onChange={(next) => patch({ [id]: next })} />
+      ),
     },
   });
   const anyCap = draft.download.on || draft.uploadSoft.on || draft.uploadHard.on;

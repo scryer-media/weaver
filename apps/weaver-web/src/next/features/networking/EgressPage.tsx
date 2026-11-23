@@ -151,6 +151,7 @@ function useGlobalBandwidth(busy: boolean, message: string | null, failed: boole
       control: values ? (
         <LimitControl
           label={label}
+          fieldId={id}
           value={values[id]}
           suffix="MB/s"
           onChange={(next) => draft.set({ ...values, [id]: next })}
@@ -505,6 +506,7 @@ export function EgressEditor({
         control: (
           <LimitControl
             label={t("next.networking.egress.downloadLimit")}
+            fieldId="downloadLimit"
             value={editing.downloadBps}
             onChange={(downloadBps) => patch({ downloadBps })}
           />
@@ -522,6 +524,7 @@ export function EgressEditor({
               control: (
                 <LimitControl
                   label={t("next.networking.egress.uploadLimit")}
+                  fieldId="uploadLimit"
                   value={editing.uploadBps}
                   onChange={(uploadBps) => patch({ uploadBps })}
                 />

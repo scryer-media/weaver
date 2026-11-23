@@ -56,9 +56,10 @@ test("general SRRDB lookup, bandwidth ceiling and an egress download quota persi
   if (afterRestart) {
     await expect(srrdbLookup).toBeChecked();
     await page.goto("/settings/networking/egress");
-    await expect(page.getByTestId(field("maxDownloadSpeed"))).toHaveValue("8");
+    await expect(page.getByTestId(field("downloadBps"))).toBeChecked();
+    await expect(page.getByTestId(testIds.fieldValue("downloadBps"))).toHaveValue("8");
     const editor = await openSystemEgress(page);
-    await expect(editor.getByTestId(field("quotaEnabled"))).toBeChecked();
+    await expect(editor.getByTestId(field("quota-download"))).toBeChecked();
     await expect(editor.getByTestId(field("quotaMonthDay"))).toHaveValue("17");
     await editor.getByTestId(testIds.editorCancel).click();
     await expect(editor).toBeHidden();
@@ -73,7 +74,11 @@ test("general SRRDB lookup, bandwidth ceiling and an egress download quota persi
   await expect(srrdbLookup).toBeChecked();
 
   await page.goto("/settings/networking/egress");
-  const ceiling = page.getByTestId(field("maxDownloadSpeed"));
+  // The download limit is off until its switch turns it on; then its rate shows.
+  const ceilingSwitch = page.getByTestId(field("downloadBps"));
+  await expect(ceilingSwitch).not.toBeChecked();
+  await ceilingSwitch.click();
+  const ceiling = page.getByTestId(testIds.fieldValue("downloadBps"));
   await ceiling.fill("8");
   await ceiling.press("Tab");
   await saveSettings(page);
@@ -82,7 +87,7 @@ test("general SRRDB lookup, bandwidth ceiling and an egress download quota persi
 
   // The data cap is a download quota on an egress.
   let editor = await openSystemEgress(page);
-  await editor.getByTestId(field("quotaEnabled")).click();
+  await editor.getByTestId(field("quota-download")).click();
   await choose(page, editor, field("quotaPeriod"), "MONTHLY");
   await editor.getByTestId(field("quotaLimit")).fill("500");
   const monthlyDay = editor.getByTestId(field("quotaMonthDay"));
@@ -96,7 +101,7 @@ test("general SRRDB lookup, bandwidth ceiling and an egress download quota persi
   await expect(editor).toBeHidden();
   await page.reload();
   editor = await openSystemEgress(page);
-  await expect(editor.getByTestId(field("quotaEnabled"))).toBeChecked();
+  await expect(editor.getByTestId(field("quota-download"))).toBeChecked();
   await expect(editor.getByTestId(field("quotaMonthDay"))).toHaveValue("17");
   await editor.getByTestId(testIds.editorCancel).click();
   await expect(editor).toBeHidden();

@@ -610,7 +610,7 @@ export function globalUploadCapField(t: Translate, cap: number | null, onChange:
     id: "seeding-uploadCap",
     label,
     keywords: "upload speed limit rate",
-    control: { kind: "custom", control: <LimitControl label={label} value={cap} suffix="MB/s" onChange={onChange} /> },
+    control: { kind: "custom", control: <LimitControl label={label} fieldId="seeding-uploadCap" value={cap} suffix="MB/s" onChange={onChange} /> },
   };
 }
 

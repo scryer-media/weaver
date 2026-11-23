@@ -270,7 +270,11 @@ async function createSourceMarkersThroughUI(
   matrix: BackupMatrixState,
 ) {
   await page.goto("/settings/networking/egress");
-  const ceiling = page.getByTestId(field("maxDownloadSpeed"));
+  // The download limit is off until its switch turns it on; then its rate shows.
+  const ceilingSwitch = page.getByTestId(field("downloadBps"));
+  await expect(ceilingSwitch).not.toBeChecked();
+  await ceilingSwitch.click();
+  const ceiling = page.getByTestId(testIds.fieldValue("downloadBps"));
   await ceiling.fill(downloadCeiling(matrix));
   await ceiling.press("Tab");
   await saveSettings(page);
@@ -406,12 +410,14 @@ async function expectProductMarkers(
   present: boolean,
 ) {
   await page.goto("/settings/networking/egress");
-  const ceiling = page.getByTestId(field("maxDownloadSpeed"));
-  await expect(ceiling).toBeVisible();
+  const ceilingSwitch = page.getByTestId(field("downloadBps"));
+  await expect(ceilingSwitch).toBeVisible();
   if (present) {
-    await expect(ceiling).toHaveValue(downloadCeiling(matrix));
+    await expect(ceilingSwitch).toBeChecked();
+    await expect(page.getByTestId(testIds.fieldValue("downloadBps"))).toHaveValue(downloadCeiling(matrix));
   } else {
-    await expect(ceiling).not.toHaveValue(downloadCeiling(matrix));
+    // An instance without the marker has no download limit, so the rate is not shown.
+    await expect(ceilingSwitch).not.toBeChecked();
   }
 
   await page.goto("/settings/categories");
