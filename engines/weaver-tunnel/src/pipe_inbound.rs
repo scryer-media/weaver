@@ -88,6 +88,54 @@ pub trait InboundListener: Send + Sync {
     }
 }
 
+// A ladder's rung's inbound connections, each numbered as that rung's as
+// the ladder numbers the rung's dialled ones, so a leg reads one rung
+// whichever way its last connection came.
+pub(super) struct RungInbound {
+    pub(super) inbound: Arc<dyn Inbound>,
+    pub(super) rung: usize,
+}
+
+#[async_trait::async_trait]
+impl Inbound for RungInbound {
+    async fn listen(
+        &self,
+        port: u16,
+        forwarded: bool,
+    ) -> Result<Box<dyn InboundListener>, TunnelError> {
+        Ok(Box::new(RungListener {
+            listener: self.inbound.listen(port, forwarded).await?,
+            rung: self.rung,
+        }))
+    }
+    fn forwarding(&self) -> PortForwarding {
+        self.inbound.forwarding()
+    }
+    async fn bind_datagrams(&self, port: u16) -> Result<Arc<dyn DatagramSocket>, TunnelError> {
+        self.inbound.bind_datagrams(port).await
+    }
+}
+
+struct RungListener {
+    listener: Box<dyn InboundListener>,
+    rung: usize,
+}
+
+#[async_trait::async_trait]
+impl InboundListener for RungListener {
+    fn local_addr(&self) -> SocketAddr {
+        self.listener.local_addr()
+    }
+    async fn accept(&self) -> Result<Dialed, TunnelError> {
+        let mut accepted = self.listener.accept().await?;
+        accepted.path.rung = Some(self.rung);
+        Ok(accepted)
+    }
+    fn mapping(&self) -> Option<watch::Receiver<PortMapping>> {
+        self.listener.mapping()
+    }
+}
+
 pub(super) struct SessionInbound(Arc<SessionHop>);
 
 impl SessionInbound {

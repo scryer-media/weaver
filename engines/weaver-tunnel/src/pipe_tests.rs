@@ -4516,3 +4516,79 @@ async fn a_direct_usenet_dial_is_not_sized_by_the_profile() {
     };
     assert_eq!(sizes(&usenet), sizes(&plain));
 }
+
+// A rung whose inbound connections arrive through proxy 9, as a forwarded
+// port's peers arrive through a WireGuard session, unnumbered.
+struct Listening(SocketAddr);
+#[async_trait::async_trait]
+impl Dialer for Listening {
+    async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
+        let mut dialed = bottom().dial(target).await?;
+        dialed.path.proxies = vec![9];
+        Ok(dialed)
+    }
+    fn inbound(self: Arc<Self>) -> Option<Arc<dyn Inbound>> {
+        Some(self)
+    }
+    fn budget(&self) -> Duration {
+        Duration::from_secs(1)
+    }
+    fn describe(&self) -> String {
+        "listening".into()
+    }
+}
+#[async_trait::async_trait]
+impl Inbound for Listening {
+    async fn listen(&self, _: u16, _: bool) -> Result<Box<dyn InboundListener>, TunnelError> {
+        Ok(Box::new(Listening(self.0)))
+    }
+    fn forwarding(&self) -> PortForwarding {
+        PortForwarding::None
+    }
+    async fn bind_datagrams(
+        &self,
+        _: u16,
+    ) -> Result<Arc<dyn crate::endpoint::DatagramSocket>, TunnelError> {
+        Err(TunnelError::Engine("no datagrams".into()))
+    }
+}
+#[async_trait::async_trait]
+impl InboundListener for Listening {
+    fn local_addr(&self) -> SocketAddr {
+        self.0
+    }
+    async fn accept(&self) -> Result<Dialed, TunnelError> {
+        let mut accepted = bottom()
+            .dial(&target(self.0))
+            .await
+            .map_err(|error| TunnelError::Engine(error.to_string()))?;
+        accepted.path.proxies = vec![9];
+        Ok(accepted)
+    }
+}
+
+// A peer that connects in through a ladder's rung is that rung's, as one
+// the ladder dials out through it is: a leg that holds both reads one rung
+// whichever came last.
+#[tokio::test]
+async fn an_inbound_peer_rides_the_rung_it_arrived_on() {
+    let peer = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let at = peer.local_addr().unwrap();
+    let ladder = Arc::new(Fallback::new(vec![Arc::new(Listening(at))]));
+    let dialed = ladder.dial(&target(at)).await.unwrap();
+    assert_eq!(
+        (dialed.path.proxies.clone(), dialed.path.rung),
+        (vec![9], Some(0))
+    );
+    let listener = Arc::clone(&ladder)
+        .inbound()
+        .expect("the rung takes inbound connections")
+        .listen(0, true)
+        .await
+        .unwrap();
+    let accepted = listener.accept().await.unwrap();
+    assert_eq!(
+        (accepted.path.proxies.clone(), accepted.path.rung),
+        (vec![9], Some(0))
+    );
+}

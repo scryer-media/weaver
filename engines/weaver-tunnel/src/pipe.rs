@@ -2471,10 +2471,15 @@ impl Dialer for Fallback {
         let index = (0..self.rungs.len()).find(|index| self.allows_rung(*index, false))?;
         Arc::clone(&self.rungs[index]).datagrams()
     }
-    // The inbound connections of the first rung a dial would try.
+    // The inbound connections of the first rung a dial would try, each
+    // numbered as that rung's, as its dialled ones are.
     fn inbound(self: Arc<Self>) -> Option<Arc<dyn Inbound>> {
         let index = (0..self.rungs.len()).find(|index| self.allows_rung(*index, false))?;
-        Arc::clone(&self.rungs[index]).inbound()
+        let inbound = Arc::clone(&self.rungs[index]).inbound()?;
+        Some(Arc::new(inbound::RungInbound {
+            inbound,
+            rung: index,
+        }))
     }
     // The failing hop of the first rung a dial would try, else of the first
     // rung that has one.
