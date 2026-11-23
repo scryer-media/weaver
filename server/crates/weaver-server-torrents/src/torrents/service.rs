@@ -1023,6 +1023,10 @@ pub struct Inner {
     // know every fetch a start began has said its end.
     #[cfg(any(test, feature = "test-support"))]
     fetches_ended: watch::Sender<u64>,
+    // How many ends of a check were judged (`rejudge_after_check`): what a
+    // test waits on to know the judgement a check's end makes was made.
+    #[cfg(any(test, feature = "test-support"))]
+    pub checks_judged: watch::Sender<u64>,
     // A test's hold on the sweep of idle sessions, once it has read the
     // routes the torrents use and before it reads the sessions, and how
     // many sweeps reached that hold.
@@ -1111,6 +1115,8 @@ impl TorrentService {
                 settling: AtomicBool::new(false),
                 #[cfg(any(test, feature = "test-support"))]
                 fetches_ended: watch::channel(0).0,
+                #[cfg(any(test, feature = "test-support"))]
+                checks_judged: watch::channel(0).0,
                 #[cfg(any(test, feature = "test-support"))]
                 sweep_held: watch::channel(false).0,
                 #[cfg(any(test, feature = "test-support"))]

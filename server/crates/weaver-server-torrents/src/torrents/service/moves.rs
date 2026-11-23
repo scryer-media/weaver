@@ -688,13 +688,15 @@ impl TorrentService {
         // Its check is its job's: a job still waiting for the tick is
         // restored first, as a removal restores it. In no session yet, it
         // lets go of every piece and the session it joins checks them all,
-        // as one held for its files does below.
+        // as one held for its files does below. What that check finds is
+        // judged once it ends, as an attached one's is.
         if self.restore_job(job_id).await {
             self.with_torrent(job_id, |torrent| {
                 if let Some(store) = &torrent.store {
                     Pieces::checking(&**store)
                         .map_err(|error| ActionError::State(format!("{error:#}")))?;
                     torrent.hold(store.file_have());
+                    torrent.check_owed = true;
                 }
                 Ok(())
             })
@@ -719,6 +721,7 @@ impl TorrentService {
                     Pieces::checking(&**store)
                         .map_err(|error| ActionError::State(format!("{error:#}")))?;
                     torrent.hold(store.file_have());
+                    torrent.check_owed = true;
                 }
                 torrent.files_missing = false;
                 Ok(true)
