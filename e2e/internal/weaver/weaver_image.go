@@ -323,11 +323,13 @@ RUN --mount=type=cache,id=weaver-e2e-npm,target=/root/.npm,sharing=locked \
 # A debug build for the builder's own glibc target. The container phases test
 # behaviour, not throughput, so an optimized musl link is wasted time; the
 # runtime stage below is the same Debian release, so the glibc build runs there.
+# e2e-local-trackers lets a torrent's tracker be asked at the compose network's
+# private address; a release build refuses the feature, so it is on only here.
 RUN --mount=type=cache,id=weaver-e2e-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=weaver-e2e-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=%s,target=/app/target,sharing=locked \
     CARGO_PROFILE_DEV_DEBUG=line-tables-only \
-    cargo build --locked -p weaver && \
+    cargo build --locked -p weaver --features e2e-local-trackers && \
     cp target/debug/weaver /tmp/weaver-debug
 
 FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
