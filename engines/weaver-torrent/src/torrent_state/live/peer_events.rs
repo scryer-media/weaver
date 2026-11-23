@@ -271,6 +271,12 @@ impl PeerHandler {
             peers,
         );
         let prev = pe.value_mut().take_state(peers);
+        if let PeerState::Live(live) = &prev {
+            self.swarm().live_ended(
+                live.ending(&pe.value().stats.counters),
+                swarm::CloseReason::of(error.as_ref()),
+            );
+        }
         self.swarm().closed(
             match prev {
                 PeerState::Live(_) => swarm::ClosePhase::Live,

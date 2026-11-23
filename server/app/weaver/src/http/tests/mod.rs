@@ -1657,8 +1657,9 @@ fn sample_speed_tests() -> weaver_server_core::speed_test::SpeedTestMetricsSnaps
 /// A session's connection counts with a figure of its own in each family.
 fn sample_swarm() -> weaver_server_core::torrents::metrics::swarm::SwarmSnapshot {
     use weaver_server_core::torrents::metrics::swarm::{
-        BlockArrival, ByteKind, ClosePhase, CloseReason, Direction, Encryption, MessageKind,
-        PeerSource, PieceCheck, PiecePick, RequestEvent, SwarmSnapshot, Transport, Waste,
+        BlockArrival, ByteKind, ClosePhase, CloseReason, Direction, Encryption, Ender, MessageKind,
+        PeerHad, PeerSource, PieceCheck, PiecePick, RequestEvent, SwarmSnapshot, Transport,
+        UploadTaken, Waste,
     };
     let mut swarm = SwarmSnapshot::default();
     swarm.messages[Direction::In as usize][MessageKind::Have as usize] = 410;
@@ -1678,6 +1679,11 @@ fn sample_swarm() -> weaver_server_core::torrents::metrics::swarm::SwarmSnapshot
     swarm.wasted_bytes[Waste::CutShort as usize] = 60;
     swarm.peers_named[PeerSource::Dht as usize] = 61;
     swarm.pex_encrypted_skipped = 62;
+    swarm.live_ends[Direction::In as usize][PeerHad::Seed as usize]
+        [CloseReason::PeerClosed as usize] = 120;
+    swarm.live_millis[Direction::In as usize][PeerHad::Seed as usize] = 121_500;
+    swarm.upload_ends[UploadTaken::Blocks1To2 as usize][Ender::Peer as usize] = 122;
+    swarm.upload_busy_micros = 123_250_000;
     swarm
 }
 
@@ -1878,6 +1884,17 @@ fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMet
             send_batches: 45,
             send_batch_datagrams: 46,
             datagrams_too_long: 47,
+            syns_received: 101,
+            syns_repeated: 102,
+            syns_queued: 103,
+            accepts: 104,
+            unmatched_packets: 105,
+            unknown_stream_resets: 106,
+            resets_rate_limited: 107,
+            inactivity_timeouts: 108,
+            synack_retransmissions: 109,
+            send_errors: 110,
+            live_virtual_sockets: 111,
             send_batch_errors: 48,
         },
         peers: vec![

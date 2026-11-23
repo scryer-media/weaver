@@ -11,8 +11,8 @@
 
 use weaver_server_core::torrents::metrics::SessionSeries;
 use weaver_server_core::torrents::metrics::swarm::{
-    BlockArrival, ByteKind, ClosePhase, CloseReason, Direction, Encryption, PeerSource, PieceCheck,
-    PiecePick, RequestEvent, Transport, Waste,
+    BlockArrival, ByteKind, ClosePhase, CloseReason, Direction, Encryption, Ender, PeerHad,
+    PeerSource, PieceCheck, PiecePick, RequestEvent, Transport, UploadTaken, Waste,
 };
 
 use super::catalog as f;
@@ -202,6 +202,139 @@ pub(super) fn render(out: &mut Encoder, routes: &[SessionSeries]) {
             &f::TORRENT_UTP_SYN_RESETS,
             &[("route", session.route.as_str())],
             session.utp.syn_rst,
+        );
+    }
+    for session in open() {
+        out.sample(
+            &f::TORRENT_UTP_SYNS_RECEIVED,
+            &[("route", session.route.as_str())],
+            session.utp.syns_received,
+        );
+    }
+    for session in open() {
+        out.sample(
+            &f::TORRENT_UTP_SYNS_REPEATED,
+            &[("route", session.route.as_str())],
+            session.utp.syns_repeated,
+        );
+    }
+    for session in open() {
+        out.sample(
+            &f::TORRENT_UTP_SYNS_QUEUED,
+            &[("route", session.route.as_str())],
+            session.utp.syns_queued,
+        );
+    }
+    for session in open() {
+        out.sample(
+            &f::TORRENT_UTP_STREAMS_ACCEPTED,
+            &[("route", session.route.as_str())],
+            session.utp.accepts,
+        );
+    }
+    for session in open() {
+        out.sample(
+            &f::TORRENT_UTP_UNMATCHED_PACKETS,
+            &[("route", session.route.as_str())],
+            session.utp.unmatched_packets,
+        );
+    }
+    for session in open() {
+        out.sample(
+            &f::TORRENT_UTP_UNKNOWN_STREAM_RESETS,
+            &[("route", session.route.as_str())],
+            session.utp.unknown_stream_resets,
+        );
+    }
+    for session in open() {
+        out.sample(
+            &f::TORRENT_UTP_RESETS_RATE_LIMITED,
+            &[("route", session.route.as_str())],
+            session.utp.resets_rate_limited,
+        );
+    }
+    for session in open() {
+        out.sample(
+            &f::TORRENT_UTP_INACTIVITY_TIMEOUTS,
+            &[("route", session.route.as_str())],
+            session.utp.inactivity_timeouts,
+        );
+    }
+    for session in open() {
+        out.sample(
+            &f::TORRENT_UTP_SYNACK_RETRANSMISSIONS,
+            &[("route", session.route.as_str())],
+            session.utp.synack_retransmissions,
+        );
+    }
+    for session in open() {
+        out.sample(
+            &f::TORRENT_UTP_SEND_ERRORS,
+            &[("route", session.route.as_str())],
+            session.utp.send_errors,
+        );
+    }
+    for session in open() {
+        out.sample(
+            &f::TORRENT_UTP_STREAMS_OPEN,
+            &[("route", session.route.as_str())],
+            session.utp.live_virtual_sockets,
+        );
+    }
+    for session in open() {
+        for direction in Direction::ALL {
+            for had in PeerHad::ALL {
+                for reason in CloseReason::ALL {
+                    out.sample(
+                        &f::TORRENT_PEER_LIVE_ENDS,
+                        &[
+                            ("route", session.route.as_str()),
+                            ("direction", direction.as_str()),
+                            ("peer", had.as_str()),
+                            ("reason", reason.as_str()),
+                        ],
+                        session.swarm.live_ends[*direction as usize][*had as usize]
+                            [*reason as usize],
+                    );
+                }
+            }
+        }
+    }
+    for session in open() {
+        for direction in Direction::ALL {
+            for had in PeerHad::ALL {
+                out.sample_f64(
+                    &f::TORRENT_PEER_LIVE_SECONDS,
+                    &[
+                        ("route", session.route.as_str()),
+                        ("direction", direction.as_str()),
+                        ("peer", had.as_str()),
+                    ],
+                    session.swarm.live_millis[*direction as usize][*had as usize] as f64 / 1e3,
+                );
+            }
+        }
+    }
+    for session in open() {
+        for took in UploadTaken::ALL {
+            for ender in Ender::ALL {
+                out.sample(
+                    &f::TORRENT_PEER_UPLOAD_ENDS,
+                    &[
+                        ("route", session.route.as_str()),
+                        ("took", took.as_str()),
+                        ("ended_by", ender.as_str()),
+                    ],
+                    session.swarm.upload_ends[*took as usize][*ender as usize],
+                );
+            }
+        }
+    }
+    for session in open() {
+        out.sample_f64(
+            &f::TORRENT_PEER_UPLOAD_BUSY_SECONDS,
+            &[("route", session.route.as_str())],
+            session.swarm.upload_busy_micros as f64 / 1e6,
         );
     }
 }

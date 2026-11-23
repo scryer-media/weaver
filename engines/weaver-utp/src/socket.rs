@@ -1642,9 +1642,11 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     }
 
     async fn on_syn(&mut self, remote: SocketAddr, msg: UtpMessage) -> crate::Result<()> {
+        self.socket.stats.syns_received.increment(1);
         let future_key = (remote, (msg.header.connection_id + 1).0);
         if self.key_reserved(future_key) {
             self.socket.stats.invalid_packets.increment(1);
+            self.socket.stats.syns_repeated.increment(1);
             return Ok(());
         }
         let pending = self
@@ -1681,7 +1683,10 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             }
         }
         match self.accept_queue.try_cache_syn(syn) {
-            None => Ok(()),
+            None => {
+                self.socket.stats.syns_queued.increment(1);
+                Ok(())
+            }
             Some(syn) => {
                 debug!("dropping SYN, no more space to cache them and no acceptors available");
                 self.socket.stats.syn_rst.increment(1);
@@ -1787,6 +1792,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             Type::State => header.seq_nr - 1,
             Type::Data | Type::Fin => header.seq_nr,
         };
+        self.socket.stats.unmatched_packets.increment(1);
         let key = (remote, header.connection_id.0);
         let send_id = match self.tombstones.send_id(&key) {
             Some(send_id) => send_id,
@@ -2908,6 +2914,11 @@ mod tests {
             3,
             "a retransmission is one pending SYN"
         );
+        let stats = socket.stats().snapshot();
+        assert_eq!(stats.syns_received, 4, "every SYN is counted, a repeat too");
+        assert_eq!(stats.syns_repeated, 1);
+        assert_eq!(stats.syns_queued, 3, "no accept call waited for them");
+        assert_eq!(stats.accepts, 0);
 
         socket.set_connections_limit(1);
         dispatcher.on_recv(ADDR_2, syn(3)).await.unwrap();

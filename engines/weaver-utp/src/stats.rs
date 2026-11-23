@@ -30,6 +30,16 @@ pub struct UtpStats {
     pub redundant_packets: AtomicU64,
     pub syn_flood_dropped: AtomicU64,
     pub syn_rst: AtomicU64,
+    /// ST_SYNs that named no stream this socket holds, each repeat counted.
+    pub syns_received: AtomicU64,
+    /// ST_SYNs dropped as repeats of one already taken or waiting, or as
+    /// clashing with a stream or connect to the same address.
+    pub syns_repeated: AtomicU64,
+    /// ST_SYNs kept to wait because no accept call was waiting for one.
+    pub syns_queued: AtomicU64,
+    /// Packets other than a SYN or reset that named no stream and answered
+    /// no connect of this socket.
+    pub unmatched_packets: AtomicU64,
     /// ST_RESETs sent for packets that name no stream this socket holds.
     pub unknown_stream_resets: AtomicU64,
     /// ST_RESETs left unsent because the socket's reset budget was spent.
@@ -153,6 +163,28 @@ pub struct UtpStatsSnapshot {
     pub send_batch_datagrams: u64,
     pub datagrams_too_long: u64,
     pub send_batch_errors: u64,
+    /// Incoming connection requests that named no open stream, repeats included.
+    pub syns_received: u64,
+    /// Incoming connection requests dropped as repeats or clashes.
+    pub syns_repeated: u64,
+    /// Incoming connection requests that waited for an accept call.
+    pub syns_queued: u64,
+    /// Packets, other than connection requests and resets, for no stream or connect.
+    pub unmatched_packets: u64,
+    /// Incoming streams handed to an accept call.
+    pub accepts: u64,
+    /// Resets sent for packets that named no stream.
+    pub unknown_stream_resets: u64,
+    /// Resets left unsent because the reset budget was spent.
+    pub resets_rate_limited: u64,
+    /// Streams ended because the remote went silent.
+    pub inactivity_timeouts: u64,
+    /// Answers to a connection request sent again because the remote did not go on.
+    pub synack_retransmissions: u64,
+    /// Datagram sends that failed.
+    pub send_errors: u64,
+    /// Streams open now: a gauge.
+    pub live_virtual_sockets: u64,
 }
 
 impl UtpStats {
@@ -200,6 +232,17 @@ impl UtpStats {
             send_batch_datagrams: self.send_batch_datagrams.load(Ordering::Relaxed),
             datagrams_too_long: self.datagrams_too_long.load(Ordering::Relaxed),
             send_batch_errors: self.send_batch_errors.load(Ordering::Relaxed),
+            syns_received: self.syns_received.load(Ordering::Relaxed),
+            syns_repeated: self.syns_repeated.load(Ordering::Relaxed),
+            syns_queued: self.syns_queued.load(Ordering::Relaxed),
+            unmatched_packets: self.unmatched_packets.load(Ordering::Relaxed),
+            accepts: self.accepts.load(Ordering::Relaxed),
+            unknown_stream_resets: self.unknown_stream_resets.load(Ordering::Relaxed),
+            resets_rate_limited: self.resets_rate_limited.load(Ordering::Relaxed),
+            inactivity_timeouts: self.inactivity_timeouts.load(Ordering::Relaxed),
+            synack_retransmissions: self.synack_retransmissions.load(Ordering::Relaxed),
+            send_errors: self.send_errors.load(Ordering::Relaxed),
+            live_virtual_sockets: self.live_virtual_sockets.load(Ordering::Relaxed),
         }
     }
 }
@@ -290,6 +333,29 @@ impl std::ops::AddAssign for UtpStatsSnapshot {
         self.send_batch_errors = self
             .send_batch_errors
             .saturating_add(other.send_batch_errors);
+        self.syns_received = self.syns_received.saturating_add(other.syns_received);
+        self.syns_repeated = self.syns_repeated.saturating_add(other.syns_repeated);
+        self.syns_queued = self.syns_queued.saturating_add(other.syns_queued);
+        self.unmatched_packets = self
+            .unmatched_packets
+            .saturating_add(other.unmatched_packets);
+        self.accepts = self.accepts.saturating_add(other.accepts);
+        self.unknown_stream_resets = self
+            .unknown_stream_resets
+            .saturating_add(other.unknown_stream_resets);
+        self.resets_rate_limited = self
+            .resets_rate_limited
+            .saturating_add(other.resets_rate_limited);
+        self.inactivity_timeouts = self
+            .inactivity_timeouts
+            .saturating_add(other.inactivity_timeouts);
+        self.synack_retransmissions = self
+            .synack_retransmissions
+            .saturating_add(other.synack_retransmissions);
+        self.send_errors = self.send_errors.saturating_add(other.send_errors);
+        self.live_virtual_sockets = self
+            .live_virtual_sockets
+            .saturating_add(other.live_virtual_sockets);
     }
 }
 

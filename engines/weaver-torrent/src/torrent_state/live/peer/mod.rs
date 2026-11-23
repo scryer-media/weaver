@@ -158,6 +158,9 @@ struct Ledger {
     turn_due: bool,
     // When the writer last took a block to send.
     last_taken: Option<Instant>,
+    // When the send buffer last went from empty to holding a block, while
+    // it holds one: for the session's count of time spent sending.
+    busy_since: Option<Instant>,
 }
 
 impl Default for UploadLedger {
@@ -169,6 +172,7 @@ impl Default for UploadLedger {
             queued: 0,
             turn_due: false,
             last_taken: None,
+            busy_since: None,
         }))
     }
 }
@@ -202,13 +206,19 @@ impl UploadLedger {
 
     /// The handed `chunks` are off the writer's hands, sent or not served:
     /// their room is free (libtorrent `peer_connection::on_send_data`).
-    /// Whether the peer wants a turn.
-    pub(crate) fn done(&self, chunks: &[ChunkInfo]) -> bool {
+    /// Whether the peer wants a turn, and how long the send buffer held
+    /// blocks when these were its last.
+    pub(crate) fn done(&self, chunks: &[ChunkInfo]) -> (bool, Option<Duration>) {
         let mut ledger = self.0.lock();
         for chunk in chunks {
             ledger.done(chunk);
         }
-        ledger.wants_turn()
+        let busy = if ledger.unsent == 0 {
+            ledger.busy_since.take().map(|since| since.elapsed())
+        } else {
+            None
+        };
+        (ledger.wants_turn(), busy)
     }
 }
 
@@ -1280,6 +1290,9 @@ pub(crate) struct LivePeerState {
     // start of its `total_payload_download` and `total_payload_upload`).
     live_since: Instant,
     at_live: Transfer,
+    // Whether the peer said it was interested at any time on this
+    // connection.
+    ever_interested: bool,
     // Whether we made the connection (libtorrent
     // `peer_connection::is_outgoing`).
     outgoing: bool,
@@ -1482,6 +1495,7 @@ impl LivePeerState {
             round_start: transfer,
             live_since: now,
             at_live: transfer,
+            ever_interested: false,
             outgoing,
             bitfield: BF::default(),
             seeder: false,
@@ -1707,6 +1721,34 @@ impl LivePeerState {
     /// Whether we asked the peer for `chunk` and wait for it still.
     pub fn has_inflight_request(&self, chunk: &ChunkInfo) -> bool {
         self.inflight_requests.contains(chunk)
+    }
+
+    /// The connection as it ends, for the session's counts.
+    pub(crate) fn ending(
+        &self,
+        counters: &PeerCountersAtomic,
+    ) -> crate::session_stats::swarm::LiveEnd {
+        use crate::session_stats::swarm::{Direction, LiveEnd, PeerHad, UploadTaken};
+        LiveEnd {
+            // Named for who opened it: `in` is a connection the peer made.
+            direction: if self.outgoing {
+                Direction::Out
+            } else {
+                Direction::In
+            },
+            had: if self.seeder {
+                PeerHad::Seed
+            } else if self.bitfield.any() {
+                PeerHad::Partial
+            } else {
+                PeerHad::Nothing
+            },
+            took: UploadTaken::of(
+                self.ever_interested,
+                self.this_connection(counters).uploaded,
+            ),
+            lived: self.live_since.elapsed(),
+        }
     }
 
     /// What moved over this connection, given the peer's `counters` over
@@ -2054,6 +2096,7 @@ impl LivePeerState {
         let mut ledger = self.upload.0.lock();
         ledger.turn_due = false;
         ledger.watermark = watermark;
+        let was_empty = ledger.unsent == 0;
         let mut handed = 0;
         while ledger.unsent < watermark {
             let Some(chunk) = self.upload_queue.pop_front() else {
@@ -2063,6 +2106,11 @@ impl LivePeerState {
             ledger.handed.push_back(chunk);
             let _ = self.tx.send(WriterRequest::ReadChunkRequest(chunk));
             handed += 1;
+        }
+        // A span a Cancel or a Choke emptied is not counted: this one
+        // starts over it.
+        if was_empty && handed > 0 {
+            ledger.busy_since = Some(Instant::now());
         }
         ledger.queued = self.upload_queue.len();
         handed
@@ -2285,6 +2333,7 @@ impl LivePeerState {
             self.became_uninterested = now;
         }
         self.peer_interested = interested;
+        self.ever_interested |= interested;
     }
 
     /// We want to download from the peer, or no longer do, at `now`. True
@@ -2674,6 +2723,64 @@ mod tests {
         live.upload_done(&chunk(0));
         assert!(!live.wants_turn());
         assert_eq!(live.hand_upload(), 32 - low);
+    }
+
+    // The session's counts read a connection as it ends: who opened it,
+    // what the peer held, what it took and how long it was live. The time
+    // the send buffer held blocks is told when its last block is written.
+    #[tokio::test(start_paused = true)]
+    async fn an_ending_connection_tells_what_the_peer_held_and_took() {
+        use crate::session_stats::swarm::{Direction, PeerHad, UploadTaken};
+        use std::sync::atomic::Ordering;
+        let secs = Duration::from_secs;
+
+        let lengths = Lengths::new(64 * 16384, 64 * 16384).unwrap();
+        let piece = lengths.validate_piece_index(0).unwrap();
+        let chunk = |n: u32| {
+            lengths
+                .chunk_info_from_received_data(piece, n * 16384, 16384)
+                .unwrap()
+        };
+        let (tx, _rx) = unbounded_channel();
+        let counters = stats::atomic::PeerStats::default().counters;
+        // The peer was sent a block on an earlier connection: not this one's.
+        counters.uploaded_bytes.store(16384, Ordering::Relaxed);
+        let mut live =
+            LivePeerState::new(Id20::default(), tx, ConnectionKind::Tcp, &counters, false);
+
+        let end = live.ending(&counters);
+        assert_eq!(end.direction, Direction::In);
+        assert_eq!(end.had, PeerHad::Nothing);
+        assert_eq!(end.took, UploadTaken::NotInterested);
+
+        live.bitfield = super::empty_bitfield(1);
+        live.peer_interest(true, Instant::now());
+        live.peer_interest(false, Instant::now());
+        assert_eq!(live.ending(&counters).took, UploadTaken::Unserved);
+        assert_eq!(live.ending(&counters).had, PeerHad::Nothing);
+
+        live.unchoke(Instant::now(), 0);
+        for n in 0..2 {
+            live.queue_upload(chunk(n), 64).ok().unwrap();
+        }
+        assert_eq!(live.hand_upload(), 2);
+        tokio::time::advance(secs(3)).await;
+        let upload = live.upload_ledger();
+        assert!(upload.claim(&chunk(0)).0);
+        assert_eq!(upload.done(&[chunk(0)]).1, None, "a block is still held");
+        tokio::time::advance(secs(2)).await;
+        assert!(upload.claim(&chunk(1)).0);
+        assert_eq!(upload.done(&[chunk(1)]).1, Some(secs(5)));
+        counters
+            .uploaded_bytes
+            .fetch_add(2 * 16384, Ordering::Relaxed);
+
+        live.bitfield.set(0, true);
+        live.seeder = true;
+        let end = live.ending(&counters);
+        assert_eq!(end.had, PeerHad::Seed);
+        assert_eq!(end.took, UploadTaken::Blocks1To2);
+        assert_eq!(end.lived, secs(5));
     }
 
     #[tokio::test(start_paused = true)]
