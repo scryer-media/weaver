@@ -1928,7 +1928,6 @@ export const nextKo: LocaleDictionary = {
   "next.networking.flow.dnsRefused": "조회 없음",
   "next.networking.flow.dnsWireTls": "DoT",
   "next.networking.flow.dnsWireHttps": "DoH",
-  "next.networking.flow.dnsWireMixed": "DoT · DoH",
   "next.networking.flow.dnsHostCard": "호스트 리졸버",
   "next.networking.flow.dnsHostNote": "서버를 알 수 없음",
   "next.networking.flow.dnsTunnelCard": "{{proxy}} · 터널 DNS",

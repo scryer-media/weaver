@@ -1928,7 +1928,6 @@ export const nextFr: LocaleDictionary = {
   "next.networking.flow.dnsRefused": "Aucune résolution",
   "next.networking.flow.dnsWireTls": "DoT",
   "next.networking.flow.dnsWireHttps": "DoH",
-  "next.networking.flow.dnsWireMixed": "DoT · DoH",
   "next.networking.flow.dnsHostCard": "Résolveur de l'hôte",
   "next.networking.flow.dnsHostNote": "Ses serveurs sont inconnus",
   "next.networking.flow.dnsTunnelCard": "{{proxy}} · DNS du tunnel",

@@ -20,7 +20,6 @@ import {
 } from "@/lib/networking";
 import {
   legLookup,
-  listWire,
   serverPill,
   SYSTEM_DNS_PROFILE_ID,
   type FlowDnsList,
@@ -872,6 +871,18 @@ export const NetworkFlow = memo(function NetworkFlow({
     }
     return asks;
   }, [order.legs, lookups]);
+  // The legs whose names a proxy looks up, each passing through the egress it leaves on: one pill there apiece,
+  // so the line from the leg is never lost inside the card.
+  const egressPasses = useMemo(() => {
+    const passes = new Map<number, string[]>();
+    for (const leg of order.legs) {
+      if (lookups.get(legKey(leg))?.lookup.at !== "proxy") continue;
+      const here = passes.get(leg.egressId) ?? [];
+      here.push(legKey(leg));
+      passes.set(leg.egressId, here);
+    }
+    return passes;
+  }, [order.legs, lookups]);
   // Each egress card in the lane, from the top; one with a speed limit is a row taller, and so is one for each DNS pill.
   const egressCards = useMemo(() => {
     const placed: { egress: Egress; y: number; shift: number; base: number; height: number }[] = [];
@@ -880,12 +891,13 @@ export const NetworkFlow = memo(function NetworkFlow({
       // Everything below the addresses moves down by the ones stacked after the first.
       const shift = Math.max(0, (egress.addresses?.length ?? 0) - 1) * ADDRESS_LINE;
       const base = EGRESS_HEIGHT + shift + heldTo(egress).length * EGRESS_LIMIT_ROW;
-      const card = { egress, y: top, shift, base, height: base + (egressAsks.get(egress.id)?.length ?? 0) * DNS_ROW };
+      const pills = (egressAsks.get(egress.id)?.length ?? 0) + (egressPasses.get(egress.id)?.length ?? 0);
+      const card = { egress, y: top, shift, base, height: base + pills * DNS_ROW };
       placed.push(card);
       top += card.height + EGRESS_GAP;
     }
     return placed;
-  }, [order.egresses, egressAsks]);
+  }, [order.egresses, egressAsks, egressPasses]);
   const egressCardById = new Map(egressCards.map((placed) => [placed.egress.id, placed]));
   const egressBottom = egressCards.reduce((bottom, card) => Math.max(bottom, card.y + card.height), 38);
   const cards = useMemo(() => endpointCards(shown, flow.legs), [shown, flow.legs]);
@@ -1155,7 +1167,7 @@ export const NetworkFlow = memo(function NetworkFlow({
     lit: boolean;
   }[] = [];
   const answerByKey = new Map<string, (typeof answers)[number]>();
-  const wireWords = { TLS: "dnsWireTls", HTTPS: "dnsWireHttps", MIXED: "dnsWireMixed" } as const;
+  const wireWords = { TLS: "dnsWireTls", HTTPS: "dnsWireHttps" } as const;
   let answerTop = (single ? layout.endpointY + ENDPOINT_BOX_HEIGHT : cardsBottom) + ENDPOINT_GAP + 18;
   for (const { lookup, legs } of origins) {
     const destination = lookup.destination;
@@ -1258,8 +1270,6 @@ export const NetworkFlow = memo(function NetworkFlow({
               [origin.boxEnd, origin.mid],
               [endpoints.x, destY],
             ];
-    const wire = lookup.destination?.kind === "list" ? listWire(list) : null;
-    const turn = line?.at(-2);
     // A line from each leg's card to the box that asks for it says which route the lookup is for: into the
     // egress it leaves through, or on through that egress to the proxy carrying it.
     const entry = origin.x - 14;
@@ -1271,18 +1281,22 @@ export const NetworkFlow = memo(function NetworkFlow({
             if (!row) return [];
             const start: Point = [LEGS.end, row.y + row.cardHeight - 14];
             const through = egressCardById.get(fed.egressId);
-            const points: Point[] =
+            // On its way to a proxy, the line meets its own pill in the egress it leaves on, below that egress's own.
+            const passIndex = egressPasses.get(fed.egressId)?.indexOf(legKey(fed)) ?? -1;
+            const pass =
+              lookup.at === "proxy" && through && passIndex >= 0
+                ? through.y + through.base + ((egressAsks.get(fed.egressId)?.length ?? 0) + passIndex) * DNS_ROW + 4 + DNS_PILL / 2
+                : null;
+            const paths: Point[][] =
               lookup.at === "egress"
-                ? [start, [EGRESS.x, origin.mid]]
-                : through
+                ? [[start, [EGRESS.x, origin.mid]]]
+                : pass !== null
                   ? [
-                      start,
-                      [EGRESS.x, through.y + EGRESS_HEIGHT / 2 + 10],
-                      [EGRESS.end, through.y + EGRESS_HEIGHT / 2 + 10],
-                      [entry, origin.mid],
+                      [start, [EGRESS.x, pass]],
+                      [[EGRESS.end, pass], [entry, origin.mid]],
                     ]
-                  : [start, [entry, origin.mid]];
-            return [{ key: legKey(fed), y: start[1], points, lit: onRoute(fed) }];
+                  : [[start, [entry, origin.mid]]];
+            return [{ key: legKey(fed), y: start[1], paths, pass, lit: onRoute(fed) }];
           });
     return {
       key: `${index}:${legKey(leg)}:${chosen.id}`,
@@ -1297,11 +1311,6 @@ export const NetworkFlow = memo(function NetworkFlow({
       line,
       feeds,
       entry,
-      // DoT or DoH is written on the line, halfway along its last stretch.
-      badge:
-        wire && line && turn
-          ? { label: t(`next.networking.flow.${wireWords[wire]}`), x: (turn[0] + endpoints.x) / 2, y: (turn[1] + line.at(-1)![1]) / 2 }
-          : null,
       target:
         chosen.id === SYSTEM_DNS_PROFILE_ID
           ? ({ kind: "route", consumer: leg.consumer } as const)
@@ -1769,7 +1778,9 @@ export const NetworkFlow = memo(function NetworkFlow({
             ask.feeds.map((feed) => (
               <g key={`dns-feed:${ask.key}:${feed.key}`} opacity={feed.lit ? undefined : FADE}>
                 <circle cx={LEGS.end} cy={feed.y} r="2.5" fill={INK.dns} />
-                <path d={thread(feed.points)} fill="none" stroke={INK.dns} strokeWidth="1.25" />
+                {feed.paths.map((points, part) => (
+                  <path key={part} d={thread(points)} fill="none" stroke={INK.dns} strokeWidth="1.25" />
+                ))}
               </g>
             )),
           )}
@@ -2015,14 +2026,18 @@ export const NetworkFlow = memo(function NetworkFlow({
                   profile: ask.profile.name,
                 }),
               )}
-              {ask.badge ? (
-                <DnsPill
-                  x={ask.badge.x - pillWidth(ask.badge.label, true) / 2}
-                  mid={ask.badge.y}
-                  label={ask.badge.label}
-                  locked
-                />
-              ) : null}
+              {ask.feeds.map((feed) =>
+                feed.pass === null ? null : (
+                  <g key={`dns-pass:${feed.key}`}>
+                    <path
+                      d={`M ${EGRESS.x} ${feed.pass} L ${EGRESS.x + 14} ${feed.pass} M ${EGRESS.x + 14 + ask.width} ${feed.pass} L ${EGRESS.end} ${feed.pass}`}
+                      stroke={INK.dns}
+                      strokeWidth="1.25"
+                    />
+                    <DnsPill x={EGRESS.x + 14} mid={feed.pass} label={ask.label} locked={ask.locked} refused={ask.refused} width={ask.width} />
+                  </g>
+                ),
+              )}
             </g>
           ))}
 

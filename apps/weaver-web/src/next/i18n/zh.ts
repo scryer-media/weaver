@@ -1928,7 +1928,6 @@ export const nextZh: LocaleDictionary = {
   "next.networking.flow.dnsRefused": "不进行解析",
   "next.networking.flow.dnsWireTls": "DoT",
   "next.networking.flow.dnsWireHttps": "DoH",
-  "next.networking.flow.dnsWireMixed": "DoT · DoH",
   "next.networking.flow.dnsHostCard": "主机解析器",
   "next.networking.flow.dnsHostNote": "其服务器未知",
   "next.networking.flow.dnsTunnelCard": "{{proxy}} · 隧道 DNS",

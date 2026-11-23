@@ -670,16 +670,6 @@ export function legLookup(
     : { ...none, at: "proxy", asker: "PROXY", exit, destination: { kind: "proxy", ...exit } };
 }
 
-/**
- * How a list's servers are asked, as the flow writes it on the line: DoT,
- * DoH or both when every server is encrypted, and null when any is plain.
- */
-export function listWire(list: Pick<DnsServerList, "servers"> | undefined): "TLS" | "HTTPS" | "MIXED" | null {
-  const wires = new Set(list?.servers.map((server) => server.wire) ?? []);
-  if (wires.size === 0 || wires.has("PLAIN")) return null;
-  return wires.size === 2 ? "MIXED" : wires.has("TLS") ? "TLS" : "HTTPS";
-}
-
 /** A server as the flow's pill names it: its address, or a DoH server's host and path. */
 export function serverPill(server: DnsServer): string {
   if (server.wire !== "HTTPS") return server.address;

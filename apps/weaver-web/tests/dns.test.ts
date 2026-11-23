@@ -7,7 +7,6 @@ import {
   MAX_DNS_SERVERS,
   capabilityTable,
   legLookup,
-  listWire,
   serverPill,
   dnsProfileName,
   dnsWhoKey,
@@ -469,13 +468,8 @@ test("a leg's names are looked up where its route's profile says, through the pr
   assert.deepEqual(pick(direct, "PROXY", null), { ...none, at: "leg", asker: null, refused: "NO_PROXY", destination: null });
 });
 
-test("a list's line says DoT or DoH only when every server on it is encrypted", () => {
+test("a server's pill names its address, or a DoH server's host", () => {
   const server = (wire: "PLAIN" | "TLS" | "HTTPS") => ({ wire, address: "1.1.1.1", tlsName: null, url: "https://dns.example/dns-query" });
-  assert.equal(listWire({ servers: [server("TLS"), server("TLS")] }), "TLS");
-  assert.equal(listWire({ servers: [server("HTTPS")] }), "HTTPS");
-  assert.equal(listWire({ servers: [server("TLS"), server("HTTPS")] }), "MIXED");
-  assert.equal(listWire({ servers: [server("TLS"), server("PLAIN")] }), null);
-  assert.equal(listWire(undefined), null);
   assert.equal(serverPill(server("HTTPS")), "dns.example");
   assert.equal(serverPill(server("TLS")), "1.1.1.1");
 });

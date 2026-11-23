@@ -1936,7 +1936,6 @@ export const nextEn: LocaleDictionary = {
   "next.networking.flow.dnsRefused": "No lookup",
   "next.networking.flow.dnsWireTls": "DoT",
   "next.networking.flow.dnsWireHttps": "DoH",
-  "next.networking.flow.dnsWireMixed": "DoT · DoH",
   "next.networking.flow.dnsHostCard": "Host resolver",
   "next.networking.flow.dnsHostNote": "Its servers not known",
   "next.networking.flow.dnsTunnelCard": "{{proxy}} · tunnel DNS",

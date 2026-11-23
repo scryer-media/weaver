@@ -1928,7 +1928,6 @@ export const nextJa: LocaleDictionary = {
   "next.networking.flow.dnsRefused": "名前解決なし",
   "next.networking.flow.dnsWireTls": "DoT",
   "next.networking.flow.dnsWireHttps": "DoH",
-  "next.networking.flow.dnsWireMixed": "DoT · DoH",
   "next.networking.flow.dnsHostCard": "ホストのリゾルバー",
   "next.networking.flow.dnsHostNote": "サーバーは不明",
   "next.networking.flow.dnsTunnelCard": "{{proxy}} · トンネル DNS",
