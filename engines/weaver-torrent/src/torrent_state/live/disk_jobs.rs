@@ -198,10 +198,13 @@ impl DiskJob for HashJob {
         // A block of the piece its storage took and then failed to write,
         // as when a piece given back went to its files, is a disk's error,
         // not a sender's: the piece is not checked, and goes the way of one
-        // the storage refused, its senders neither credited nor blamed.
+        // the storage refused, its senders neither credited nor blamed. Those
+        // writes were made when the piece was given back, so the refusal is
+        // read against the upload mode count of then: one made before upload
+        // mode was last left enters nothing, as any refused write is read.
+        let given_back = state.take_given_back(self.chunk.piece_index.get());
         if let Err(e) = state.files.piece_written(self.chunk.piece_index) {
-            let epoch = state.upload_epoch();
-            self.stored(Err(e), epoch);
+            self.stored(Err(e), given_back);
             stats.hash_thread_worked(since);
             return;
         }

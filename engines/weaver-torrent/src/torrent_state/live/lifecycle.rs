@@ -121,7 +121,8 @@ impl TorrentStateLive {
             told_upload_only: AtomicBool::new(finished_at_start && !super_seeding),
             last_seen_complete: Mutex::new(None),
             upload_mode: watch::Sender::new(None),
-            upload_epoch: AtomicU64::new(0),
+            upload_epoch: AtomicU64::new(super::upload::FIRST_UPLOAD_EPOCH),
+            given_back: Mutex::new(HashMap::new()),
             #[cfg(test)]
             retry_declined: watch::Sender::new(0),
             web_layout: web_seed::Layout::new(&paused.metadata, paused.shared.info_hash),

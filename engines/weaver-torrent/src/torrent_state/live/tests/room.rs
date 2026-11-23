@@ -33,9 +33,11 @@ struct Budget {
     asked: usize,
     room: Option<Arc<Notify>>,
     // A piece whose blocks fail to reach its files once it is given back,
-    // and whether they did.
+    // and whether they did; `lose_room` when they found no room on the disk,
+    // else the disk failed them.
     lose: Option<u32>,
     lost: bool,
+    lose_room: bool,
     // Pieces given back whose room is not back yet: the storage gives it
     // back aside, later, as a real one does once their blocks are written.
     defer_spills: bool,
@@ -283,6 +285,9 @@ impl TorrentStorage for BudgetStorage {
     fn piece_written(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
         let budget = self.budget.lock();
         if budget.lost && budget.lose == Some(piece.get()) {
+            if budget.lose_room {
+                anyhow::bail!(std::io::Error::from(std::io::ErrorKind::StorageFull));
+            }
             anyhow::bail!(std::io::Error::other("the disk failed a write"));
         }
         Ok(())
@@ -695,6 +700,53 @@ async fn a_given_back_piece_whose_writes_fail_is_refused_not_failed() {
     assert_eq!(checks[PieceCheck::Failed as usize], 0);
     assert_eq!(storage.used(), 0);
     assert_eq!(storage.room_of(0), None);
+}
+
+// A piece given back whose blocks found no room is refused when it is
+// checked, but the refusal was made when it was given back: once upload
+// mode was left after that, it enters nothing, so a wake that came between
+// the two is not undone. The piece is fetched again, its senders untouched.
+#[tokio::test]
+async fn a_given_back_piece_refused_room_before_a_leave_enters_nothing() {
+    let (h, storage) = budgeted("room_spill_refused_before_leave", 1).await;
+    {
+        let mut budget = storage.budget.lock();
+        budget.lose = Some(0);
+        budget.lose_room = true;
+    }
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+    h.take_every(&peer);
+    for chunk in 0..CHUNKS_PER_PIECE {
+        h.ask(&peer, 0, chunk);
+        h.ask(&peer, 1, chunk);
+    }
+    h.answer(&peer, 0, 0).await;
+    h.answer(&peer, 1, 0).await;
+    assert_eq!(
+        storage.room_of(0),
+        Some(Room::Block),
+        "piece 0 was given back"
+    );
+    // The refusal put the torrent in upload mode, and its owner then found
+    // room and left it.
+    h.hold_download();
+    assert!(h.upload_mode());
+    h.leave_upload_mode();
+    assert!(!h.upload_mode());
+    for chunk in 1..CHUNKS_PER_PIECE {
+        h.ask(&peer, 0, chunk);
+        h.answer(&peer, 0, chunk).await;
+    }
+    h.drained().await;
+    assert!(
+        !h.upload_mode(),
+        "a refusal made before the leave entered upload mode"
+    );
+    assert!(!h.have(0));
+    assert_eq!(h.missing_chunks(0), vec![0, 1, 2, 3]);
+    let checks = h.session_stats.swarm.snapshot().piece_checks;
+    assert_eq!(checks[PieceCheck::StorageRefused as usize], 1);
+    assert_eq!(checks[PieceCheck::Failed as usize], 0);
 }
 
 // A piece given back after a corrupt block, finished block by block by

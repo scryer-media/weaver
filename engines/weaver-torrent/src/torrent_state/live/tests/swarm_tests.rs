@@ -5,8 +5,8 @@
 
 use super::*;
 use crate::session_stats::swarm::{
-    BlockArrival, ByteKind, ClosePhase, CloseReason, Direction, Encryption, PeerSource, PieceCheck,
-    PiecePick, RequestEvent, Transport,
+    BlockArrival, ByteKind, ClosePhase, CloseReason, Direction, Encryption, Ender, PeerHad,
+    PeerSource, PieceCheck, PiecePick, RequestEvent, Transport, UploadTaken,
 };
 
 // One connection, from its handshake to its end: each thing it does adds
@@ -87,6 +87,12 @@ async fn what_a_connection_does_is_counted_under_what_it_was() {
 
     peer.on_peer_died(Some(Error::PeerDisconnected)).unwrap();
     expected.closes[ClosePhase::Live as usize][CloseReason::PeerClosed as usize] = 1;
+    // A live connection's end is also counted under what the peer held and
+    // under what it took: it sent us a whole piece map, and took 100 bytes.
+    expected.live_ends[inward][PeerHad::Seed as usize][CloseReason::PeerClosed as usize] = 1;
+    expected.upload_ends[UploadTaken::Blocks1To2 as usize][Ender::Peer as usize] = 1;
+    // How long it was live is time that passed, not a count: taken as read.
+    expected.live_millis = counted().live_millis;
     assert_eq!(counted(), expected);
 
     // Two sources name a peer, one of them twice. Only the namings are

@@ -16,6 +16,14 @@ use crate::type_aliases::PeerHandle;
 
 use super::{TorrentStateLive, UploadMode, UploadWatch};
 
+/// The upload mode count of a write made before this run began: never the
+/// count of the run, which starts at [`FIRST_UPLOAD_EPOCH`], so such a write
+/// enters nothing in it.
+pub(super) const BEFORE_RUN: u64 = 0;
+
+/// The upload mode count a run begins at.
+pub(super) const FIRST_UPLOAD_EPOCH: u64 = BEFORE_RUN + 1;
+
 impl UploadWatch {
     /// The block bytes sent this run.
     pub fn uploaded(&self) -> u64 {
@@ -147,6 +155,18 @@ impl TorrentStateLive {
     /// what that write's refusal is read against.
     pub(crate) fn upload_epoch(&self) -> u64 {
         self.upload_epoch.load(Ordering::Acquire)
+    }
+
+    /// The count `piece` was given back to its storage at, its note taken:
+    /// what a failed write of the blocks it held then is read against. A
+    /// piece given back in no earlier part of this run, as by a pause that
+    /// ended the run before, was given back before it began.
+    pub(super) fn take_given_back(&self, piece: u32) -> u64 {
+        let mut given_back = self.given_back.lock();
+        if given_back.is_empty() {
+            return BEFORE_RUN;
+        }
+        given_back.remove(&piece).unwrap_or(BEFORE_RUN)
     }
 
     /// Enters upload mode for a write made at `epoch`, to end by itself

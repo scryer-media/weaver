@@ -280,13 +280,13 @@ impl Room {
     // wake handed it first, else checked and promised on the ledger in one
     // step. A disk off the roots', or one never read, is never refused; a
     // disk not known yet refuses every piece. The booking goes back unless
-    // it is landed.
-    fn admits(&self, bytes: u64) -> Option<Booked> {
+    // it is landed. Refused, why.
+    fn admits(&self, bytes: u64) -> Result<Booked, Unbooked> {
         let mut spot = self.locked();
         let spot = &mut *spot;
-        let place = spot.place.as_ref()?;
+        let place = spot.place.as_ref().ok_or(Unbooked::Unplaced)?;
         let Some(reader) = place.reader() else {
-            return Some(Booked::none());
+            return Ok(Booked::none());
         };
         let ledger = Arc::clone(reader.ledger());
         let spent = self
@@ -298,14 +298,22 @@ impl Room {
         // Drawn from what the start promised, then booked on the ledger a
         // slab at a time, as every job class's writes are.
         if !spent && !spot.start.draw(bytes, reader, self.limits.min_free_bytes) {
-            return None;
+            return Err(Unbooked::Reserve);
         }
-        Some(Booked {
+        Ok(Booked {
             ledger: Some(ledger),
             bytes,
             landed: false,
         })
     }
+}
+
+// Why a piece's bytes were not booked: the disk its folder lies on is not
+// known yet, or the ledger there had no room for them over the reserve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unbooked {
+    Unplaced,
+    Reserve,
 }
 
 impl Drop for Room {
@@ -428,14 +436,21 @@ impl Intake {
 }
 
 impl Intake {
-    // Book a piece of `bytes` on the disk's ledger: refused when it would eat
-    // into the reserve, which the torrent hears.
+    // Book a piece of `bytes` on the disk's ledger: refused while the disk
+    // is not known yet, or when it would eat into the reserve, which the
+    // torrent hears, and the error says which.
     fn book(&self, bytes: u64) -> anyhow::Result<Booked> {
-        self.room.admits(bytes).ok_or_else(|| {
+        self.room.admits(bytes).map_err(|unbooked| {
             (self.hear)(Heard::NotBooked(bytes));
-            anyhow::Error::from(io::Error::from(io::ErrorKind::StorageFull)).context(format!(
-                "{bytes} bytes more would eat into the disk reserve"
-            ))
+            let why = match unbooked {
+                Unbooked::Unplaced => {
+                    format!(
+                        "{bytes} bytes wait: the disk the torrent's folder is on is not known yet"
+                    )
+                }
+                Unbooked::Reserve => format!("{bytes} bytes more would eat into the disk reserve"),
+            };
+            anyhow::Error::from(io::Error::from(io::ErrorKind::StorageFull)).context(why)
         })
     }
 
@@ -854,7 +869,7 @@ mod tests {
         // left are its slab.
         let six = first.admits(6).unwrap();
         assert_eq!(reader.ledger().promised(), 10);
-        assert!(second.admits(4).is_none());
+        assert_eq!(second.admits(4).err(), Some(Unbooked::Reserve));
         let four = first.admits(4).unwrap();
         assert_eq!(reader.ledger().promised(), 10);
         // A write that failed gives its room back for the other.
@@ -867,8 +882,8 @@ mod tests {
         // the reading it followed.
         six.landed();
         assert_eq!(reader.ledger().promised(), 0);
-        assert!(second.admits(5).is_none());
-        assert!(second.admits(4).is_some());
+        assert_eq!(second.admits(5).err(), Some(Unbooked::Reserve));
+        assert!(second.admits(4).is_ok());
     }
 
     // A piece the store could not write gives back what it was promised;
@@ -1011,9 +1026,13 @@ mod tests {
             ),
             hear,
         );
-        assert!(write_refused(
-            &intake.verified(0, &piece(b"aaaa")).unwrap_err()
-        ));
+        let refused = intake.verified(0, &piece(b"aaaa")).unwrap_err();
+        assert!(write_refused(&refused));
+        // Said as a disk not known yet, not as a reserve it would eat into.
+        assert_eq!(
+            format!("{refused:#}"),
+            "4 bytes wait: the disk the torrent's folder is on is not known yet: no storage space"
+        );
         assert!(disk.took.lock().unwrap().is_empty());
         assert_eq!(*said.lock().unwrap(), [Heard::NotBooked(4)]);
         let off = |dir: &str| {
