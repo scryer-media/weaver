@@ -754,7 +754,12 @@ impl TorrentService {
             active_seconds,
             seeding_seconds: counters.finished_duration_s,
             consecutive_seeding_seconds: counters.consecutive_seeding_s,
-            download_avg_bps: status::average_bps(counters.downloaded_bytes, active_seconds),
+            // Over the time spent downloading, as qBittorrent's properties
+            // read it, so seeding does not wear the average down.
+            download_avg_bps: status::average_bps(
+                counters.downloaded_bytes,
+                active_seconds.saturating_sub(counters.finished_duration_s),
+            ),
             upload_avg_bps: status::average_bps(counters.uploaded_bytes, active_seconds),
             wasted_bytes: counters.wasted_bytes(),
             last_seen_complete_ms: counters.last_seen_complete_ms,

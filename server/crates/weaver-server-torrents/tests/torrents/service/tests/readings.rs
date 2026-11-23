@@ -735,9 +735,18 @@ async fn a_complete_torrent_seeds_after_a_restart_without_fetching_again() {
     seeding.stop().await;
 }
 
+// The download average a view reads: its bytes over the seconds active and
+// not seeding, as qBittorrent's properties read it; 0 with none.
+fn download_average(view: &TorrentView) -> u64 {
+    view.downloaded_bytes
+        .checked_div(view.active_seconds.saturating_sub(view.seeding_seconds))
+        .unwrap_or(0)
+}
+
 // A torrent's averages run over the seconds it reads as active, a second
 // begun counting whole: its first second reads its bytes as its rate, not
-// 0, and past it the bytes over the seconds is the average.
+// 0, and past it the bytes over the seconds is the average. The download
+// average leaves out the seconds spent seeding.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_torrents_first_second_reads_a_rate() {
     let seeded = seeded().await;
@@ -745,14 +754,22 @@ async fn a_torrents_first_second_reads_a_rate() {
     let view = seeded.view().await;
     assert!(view.downloaded_bytes > 0);
     assert_eq!(
-        (view.active_seconds, view.download_avg_bps),
-        (1, view.downloaded_bytes)
+        (
+            view.active_seconds,
+            view.download_avg_bps,
+            view.upload_avg_bps
+        ),
+        (1, view.downloaded_bytes, view.uploaded_bytes)
     );
     seeded.advance(3_443);
     let view = seeded.view().await;
     assert_eq!(
-        (view.active_seconds, view.download_avg_bps),
-        (4, view.downloaded_bytes / 4)
+        (
+            view.active_seconds,
+            view.download_avg_bps,
+            view.upload_avg_bps
+        ),
+        (4, download_average(&view), view.uploaded_bytes / 4)
     );
     seeded.stop().await;
 }
@@ -789,7 +806,7 @@ async fn a_torrents_active_time_reads_as_of_now_between_ticks() {
     assert_eq!(
         (later.download_avg_bps, later.upload_avg_bps),
         (
-            later.downloaded_bytes / later.active_seconds,
+            download_average(&later),
             later.uploaded_bytes / later.active_seconds,
         )
     );
