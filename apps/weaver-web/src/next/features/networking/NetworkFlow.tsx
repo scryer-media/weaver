@@ -1140,19 +1140,34 @@ export const NetworkFlow = memo(function NetworkFlow({
       origins.push({ origin: { x, mid, boxEnd: PROXY.end, gapY: null }, lookup, profile: found.profile, legs: [leg] });
     }
   }
+  // A line out of an egress runs along the first gap between rows at or below its pill, so it never jogs up;
+  // below every row, nothing stands in its way and it runs straight to its answer. Lines sharing a gap
+  // run a few pixels apart in it, in the order their pills stand.
+  const rowGaps = layout.rows.map((row) => row.y + row.height + 9);
+  const egressOrigins: (typeof origins)[number][] = [];
   for (const { egress, y, base } of egressCards) {
     for (const [index, ask] of (egressSlots.get(egress.id) ?? []).entries()) {
       if (ask.kind !== "ask") continue;
-      const last = rowByKey.get(legKey(ask.legs.at(-1)!));
       const mid = y + base + index * DNS_ROW + 4 + DNS_PILL / 2;
-      origins.push({
-        origin: { x: EGRESS.x + 14, mid, boxEnd: EGRESS.end, gapY: last ? last.y + last.height + 9 : null },
+      egressOrigins.push({
+        origin: { x: EGRESS.x + 14, mid, boxEnd: EGRESS.end, gapY: rowGaps.find((gap) => gap >= mid - 2) ?? null },
         lookup: ask.lookup,
         profile: ask.profile,
         legs: ask.legs,
       });
     }
   }
+  const sharing = new Map<number, typeof egressOrigins>();
+  for (const found of egressOrigins) {
+    if (found.origin.gapY !== null) sharing.set(found.origin.gapY, [...(sharing.get(found.origin.gapY) ?? []), found]);
+  }
+  for (const [gap, sharers] of sharing) {
+    sharers.sort((a, b) => a.origin.mid - b.origin.mid);
+    for (const [index, { origin }] of sharers.entries()) {
+      origin.gapY = gap + Math.max(-7, Math.min(7, (index - (sharers.length - 1) / 2) * 5));
+    }
+  }
+  origins.push(...egressOrigins);
   // Lines run to their answers in the order they leave, top first, and the answers stack in that order, so
   // no line crosses another on its way down.
   origins.sort((a, b) => (a.origin.gapY ?? a.origin.mid) - (b.origin.gapY ?? b.origin.mid));
