@@ -212,8 +212,11 @@ fn service_over(
         }]
         .into(),
         seeding: None,
+        // Unpacking is off by default; the rig turns it on for the tests
+        // that exercise it.
         torrent: TorrentConfig {
             enabled: true,
+            unpack: true,
             ..TorrentConfig::default()
         },
     };

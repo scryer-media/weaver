@@ -989,7 +989,7 @@ impl Default for TorrentConfig {
             max_active_downloads: 3,
             max_peers_total: 100,
             session_dir: None,
-            unpack: true,
+            unpack: false,
             connections_limit: TorrentLimit::Count(NonZeroU32::new(200).unwrap()),
             unchoke_slots_limit: TorrentLimit::Count(NonZeroU32::new(8).unwrap()),
             connection_speed: NonZeroU32::new(30).unwrap(),

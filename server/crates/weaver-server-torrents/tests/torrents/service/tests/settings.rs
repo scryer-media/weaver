@@ -881,15 +881,15 @@ fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_defaul
         torrent: TorrentConfig::default(),
     };
 
-    assert!(settings.unpack(&record, rules.first()));
-    settings.torrent.unpack = false;
     assert!(!settings.unpack(&record, rules.first()));
-    settings.categories.edit(|list| list[0].unpack = Some(true));
+    settings.torrent.unpack = true;
     assert!(settings.unpack(&record, rules.first()));
-    rules[0].unpack = Some(false);
+    settings.categories.edit(|list| list[0].unpack = Some(false));
     assert!(!settings.unpack(&record, rules.first()));
-    record.unpack = Some(true);
+    rules[0].unpack = Some(true);
     assert!(settings.unpack(&record, rules.first()));
+    record.unpack = Some(false);
+    assert!(!settings.unpack(&record, rules.first()));
 }
 
 // Each seeding term resolves on its own over the levels. A torrent's terms

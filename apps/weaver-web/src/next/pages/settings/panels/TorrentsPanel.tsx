@@ -1550,7 +1550,7 @@ const DEFAULT_CONNECTION: TorrentConnection = {
   encryption: "PREFER",
   maxActiveDownloads: 3,
   maxPeersTotal: 100,
-  unpack: true,
+  unpack: false,
   connectionsLimit: 200,
   unchokeSlotsLimit: 8,
   connectionSpeed: 30,
