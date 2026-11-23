@@ -43,7 +43,7 @@ Torrent files, magnets, trackers, peers, DHT nodes and web seeds are attacker in
   - A redirect from a public address to a local one is refused. Trust granted to an operator-added tracker does not carry across a redirect.
   - Internationalised host names are refused where libtorrent refuses them.
   - TLS certificates are always verified.
-  - A cookie is sent only to the origin it was saved for and does not follow a redirect to another origin.
+  - A cookie is sent only to the host it was saved for, on any port, as a browser scopes a cookie. It does not follow a redirect to another host, and is not sent over http once the fetch began over https.
 - **Credentials stay with their scope.**
   - A tracker URL with its passkey, and an exported `.torrent` that carries one, are shown to an Admin or a Control key, as qBittorrent shows them to any signed-in user. A Read key gets the redacted form, on the API and on the compatibility facades.
   - Web seed, RSS and proxy URL secrets are shown only to an Admin key. Read and Control keys get the redacted form.
