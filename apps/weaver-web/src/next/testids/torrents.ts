@@ -47,6 +47,7 @@ export const torrentIds = {
   queueRowSeeding: "queue-entry-seeding",
   // A seeding row's bars: the ratio goal over the finished download, and the seed-time goal.
   queueRowSeedingBars: "queue-entry-seeding-bars",
+  queueRowSeedingGoal: "queue-entry-seeding-goal",
   queueRowPause: "queue-entry-pause",
   queueRowResume: "queue-entry-resume",
 

@@ -196,8 +196,8 @@ const ROW_BARS = "basis-full @6xl:flex-[0_0_242px] @min-[100rem]:flex-[0_0_389px
  * A seeding torrent's bars, in place of its download's. The download is done,
  * so its bar turns gray, and the ratio goal fills over it in blue. A seed-time
  * goal gets a bar of its own below, counting the seconds its terms count.
- * The percentage is how far toward each goal; with no ratio goal the gray bar
- * stays whole.
+ * The percentage is how far toward each goal, and each goal bar is named;
+ * with no ratio goal the gray bar stays whole and unnamed.
  */
 const SeedingBars = memo(function SeedingBars({ torrent }: { torrent: TorrentSummaryData }) {
   const t = useTranslate();
@@ -208,8 +208,12 @@ const SeedingBars = memo(function SeedingBars({ torrent }: { torrent: TorrentSum
       ? []
       : [{ key: "seedTime", percent: goals.seedTime, name: t("next.torrentDash.seedTime"), label: t("next.seeding.seedTimeGoal") }]),
   ];
-  const labelled = lines.length > 1;
-  const nameWidth = Math.max(...lines.map((line) => [...line.name].length));
+  // Every goal bar is named, and the name column is as wide as the longest
+  // name either goal has, so bars end together from row to row.
+  const nameWidth = Math.max(
+    [...t("next.torrentDash.ratio")].length,
+    [...t("next.torrentDash.seedTime")].length,
+  );
   return (
     <div data-testid={torrentIds.queueRowSeedingBars} className={`flex min-w-0 flex-col gap-[7px] ${ROW_BARS}`}>
       {lines.map((line) => (
@@ -231,15 +235,15 @@ const SeedingBars = memo(function SeedingBars({ torrent }: { torrent: TorrentSum
           <span aria-hidden="true" className={`flex-none font-wv-mono ${ROW_PERCENT}`}>
             {Math.floor(line.percent ?? 100)}%
           </span>
-          {labelled ? (
-            <span
-              aria-hidden="true"
-              className="min-w-0 truncate font-wv-mono text-[11px] text-wv-faint"
-              style={{ flexBasis: `${nameWidth}ch` }}
-            >
-              {line.name}
-            </span>
-          ) : null}
+          <span
+            aria-hidden="true"
+            data-testid={torrentIds.queueRowSeedingGoal}
+            className="min-w-0 flex-none truncate font-wv-mono text-[11px] text-wv-faint"
+            style={{ width: `${nameWidth}ch` }}
+          >
+            {/* The gray bar with no ratio goal over it is the download, not a goal. */}
+            {line.percent === null ? "" : line.name}
+          </span>
         </div>
       ))}
     </div>

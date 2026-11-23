@@ -42,11 +42,14 @@ test("a seeding row fills its ratio goal over the finished download, and a seed 
   await row("ratio only").getByTestId("queue-entry-seeding-bars").waitFor();
   const goals = async (label) =>
     row(label).getByRole("progressbar").evaluateAll((bars) => bars.map((bar) => [bar.getAttribute("aria-label"), bar.getAttribute("aria-valuenow")]));
+  const names = (label) => row(label).getByTestId("queue-entry-seeding-goal").allInnerTexts();
   assert.deepEqual(await goals("ratio only"), [["Ratio goal", "25"]]);
+  assert.deepEqual(await names("ratio only"), ["Ratio"]);
   assert.deepEqual(await goals("ratio and time"), [["Ratio goal", "25"], ["Seed time goal", "50"]]);
-  // No goal: the finished download alone, whole and gray, with nothing to fill toward.
+  assert.deepEqual(await names("ratio and time"), ["Ratio", "Seed time"]);
+  // No goal: the finished download alone, whole, gray and unnamed, with nothing to fill toward.
   assert.deepEqual(await goals("no goal"), []);
-  assert.equal(await row("no goal").getByTestId("queue-entry-seeding-bars").innerText(), "100%");
+  assert.deepEqual(await names("no goal"), [""]);
   assert.equal(errors.length, 0, errors.join("\n"));
   await page.close();
 });
