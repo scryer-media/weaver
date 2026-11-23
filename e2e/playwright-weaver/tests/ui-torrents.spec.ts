@@ -67,10 +67,12 @@ async function openJob(page: Page, torrent: Fixture) {
 
 test("Settings → Torrents saves the connection and the global seeding policy", async ({ cleanPage: page }) => {
   await page.goto("/settings/torrents");
+  // The on/off switch has its own section at the top of the page.
+  const torrents = page.getByTestId(testIds.section("enabled"));
   const connection = page.getByTestId(testIds.section("connection"));
   const bittorrent = page.getByTestId(testIds.section("bittorrent"));
   const seeding = page.getByTestId(testIds.section("seeding"));
-  await expect(connection.getByTestId(testIds.field("enabled"))).toHaveAttribute("aria-checked", "true");
+  await expect(torrents.getByTestId(testIds.field("enabled"))).toHaveAttribute("aria-checked", "true");
 
   await setNumber(bittorrent, testIds.field("maxActiveDownloads"), "4");
   await setNumber(connection, testIds.field("maxPeersTotal"), "150");
@@ -80,12 +82,13 @@ test("Settings → Torrents saves the connection and the global seeding policy",
   await saveSettings(page);
 
   await page.reload();
+  const reloadedTorrents = page.getByTestId(testIds.section("enabled"));
   const reloadedConnection = page.getByTestId(testIds.section("connection"));
   const reloadedBittorrent = page.getByTestId(testIds.section("bittorrent"));
   const reloadedSeeding = page.getByTestId(testIds.section("seeding"));
   await expect(reloadedBittorrent.getByTestId(testIds.field("maxActiveDownloads"))).toHaveValue("4");
   await expect(reloadedConnection.getByTestId(testIds.field("maxPeersTotal"))).toHaveValue("150");
-  await expect(reloadedConnection.getByTestId(testIds.field("enabled"))).toHaveAttribute("aria-checked", "true");
+  await expect(reloadedTorrents.getByTestId(testIds.field("enabled"))).toHaveAttribute("aria-checked", "true");
   await expect(reloadedSeeding.getByTestId(testIds.field("seeding-seedTimeGoalMinutes"))).toHaveAttribute("aria-checked", "true");
   await expect(reloadedSeeding.getByTestId(testIds.fieldValue("seeding-seedTimeGoalMinutes"))).toHaveValue("2");
   await expect(reloadedSeeding.getByTestId(testIds.field("seeding-ratioGoal"))).toHaveAttribute("aria-checked", "false");

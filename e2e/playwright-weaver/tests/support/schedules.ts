@@ -68,7 +68,8 @@ export const clockWhileStoppedPending = () => fs.existsSync(`${clockFile()}.whil
 // ---------------------------------------------------------------------------
 // Rules
 
-export type SpeedLimitRow = { kind: "GLOBAL" | "EGRESS" | "SERVER"; id: number | null; bytesPerSec: number };
+/** One target of a speed rule. `download` null lifts the limit at that level; 0 lets nothing through. */
+export type SpeedLimitRow = { kind: "GLOBAL" | "EGRESS" | "SERVER"; id: number | null; download: number | null };
 export type ScheduleRow = {
   id: string; label: string; enabled: boolean; days: string[]; time: string; times: string[];
   everyHourAtMinute: number | null; actionType: string; track: string;
@@ -83,7 +84,7 @@ export type RuleInput = Record<string, unknown> & { actionType: string; time: st
 export const SCHEDULE_FIELDS = `id label enabled days time times everyHourAtMinute actionType track serverId serverActive
   speedLimitBytes hardwareProfile quotaMeteringEnabled quotaEgressId
   pruneFailed { deleteFiles } pruneCompleted { deleteFiles } pruneCancelled { deleteFiles }
-  speedLimits { kind id bytesPerSec }`;
+  speedLimits { kind id download }`;
 
 export async function schedules(request: APIRequestContext): Promise<ScheduleRow[]> {
   return (await graphql<{ schedules: ScheduleRow[] }>(request, `query { schedules { ${SCHEDULE_FIELDS} } }`)).schedules;
@@ -209,10 +210,10 @@ export async function witnessTick(request: APIRequestContext, via: "speed" | "wa
       const rule = await rules.create({ actionType: "speed_limit", time, speedLimitBytes: marker });
       await expect.poll(async () => (await queueState(request)).downloadBlock.scheduledSpeedLimit,
         { message: `witness ${marker} in force`, timeout: 0 }).toBe(marker);
-      // A global limit of 0 takes the scheduled limit away again.
-      await rules.update(rule.id, { actionType: "speed_limit", time: rule.time, label: rule.label, speedLimits: [{ kind: "GLOBAL", id: null, bytesPerSec: 0 }] });
+      // A null global limit takes the scheduled limit away again.
+      await rules.update(rule.id, { actionType: "speed_limit", time: rule.time, label: rule.label, speedLimits: [{ kind: "GLOBAL", id: null, download: null }] });
       await expect.poll(async () => (await queueState(request)).downloadBlock.scheduledSpeedLimit,
-        { message: `witness ${marker} lifted`, timeout: 0 }).toBe(0);
+        { message: `witness ${marker} lifted`, timeout: 0 }).toBe(null);
       return;
     }
     expect(await watchFolderPaused(request), "the watch witness starts with scanning running").toBe(false);
@@ -230,8 +231,10 @@ export async function witnessTick(request: APIRequestContext, via: "speed" | "wa
 
 export type QueueState = {
   isPaused: boolean;
-  speedLimitBytesPerSec: number;
-  downloadBlock: { kind: string; usedBytes: number; scheduledSpeedLimit: number; scheduleHoldReason: string | null };
+  /** Null is no limit. */
+  speedLimitBytesPerSec: number | null;
+  /** `scheduledSpeedLimit` null is no scheduled limit. */
+  downloadBlock: { kind: string; usedBytes: number; scheduledSpeedLimit: number | null; scheduleHoldReason: string | null };
 };
 
 export async function queueState(request: APIRequestContext): Promise<QueueState> {
@@ -257,13 +260,13 @@ export type WatchFolder = {
   categoryFromSubfolders: boolean; scanningPaused: boolean;
 };
 
-export async function generalSettings(request: APIRequestContext): Promise<{ maxDownloadSpeed: number; watchFolder: WatchFolder }> {
-  return (await graphql<{ settings: { maxDownloadSpeed: number; watchFolder: WatchFolder } }>(request,
-    "query { settings { maxDownloadSpeed watchFolder { mode path pollIntervalSecs stabilitySecs categoryFromSubfolders scanningPaused } } }")).settings;
+export async function generalSettings(request: APIRequestContext): Promise<{ watchFolder: WatchFolder }> {
+  return (await graphql<{ settings: { watchFolder: WatchFolder } }>(request,
+    "query { settings { watchFolder { mode path pollIntervalSecs stabilitySecs categoryFromSubfolders scanningPaused } } }")).settings;
 }
 
 export async function updateSettings(request: APIRequestContext, input: Record<string, unknown>): Promise<void> {
-  await graphql(request, "mutation($input: GeneralSettingsInput!) { updateSettings(input: $input) { maxDownloadSpeed } }", { input });
+  await graphql(request, "mutation($input: GeneralSettingsInput!) { updateSettings(input: $input) { watchFolder { mode } } }", { input });
 }
 
 export async function watchFolderPaused(request: APIRequestContext): Promise<boolean> {
@@ -408,9 +411,10 @@ export async function restoreServer(request: APIRequestContext, host: "nntp" | "
   });
 }
 
-export async function egressSpeed(request: APIRequestContext, id: number): Promise<number | undefined> {
-  return (await graphql<{ egressInterfaces: Array<{ id: number; maxDownloadSpeed: number }> }>(request,
-    "query { egressInterfaces { id maxDownloadSpeed } }")).egressInterfaces.find(egress => egress.id === id)?.maxDownloadSpeed;
+/** An egress's download limit: null is no limit, undefined is no such egress. */
+export async function egressSpeed(request: APIRequestContext, id: number): Promise<number | null | undefined> {
+  return (await graphql<{ egressInterfaces: Array<{ id: number; downloadBps: number | null }> }>(request,
+    "query { egressInterfaces { id downloadBps } }")).egressInterfaces.find(egress => egress.id === id)?.downloadBps;
 }
 
 /** Whether post-processing is paused, as the NZBGet facade's status reports it. */

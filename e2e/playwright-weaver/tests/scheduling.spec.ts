@@ -10,11 +10,11 @@ import {
 import { setting, waitRows } from "./support/datastore";
 import { jobState, startDownload, waitTerminal } from "./support/downloads";
 import { readClock, setClock } from "./support/e2e-clock";
-import { graphqlErrors, setSystemEgressQuota, stage, systemEgressQuotaUsage } from "./support/network-flow";
+import { bandwidth, graphqlErrors, setSystemEgressQuota, stage, systemEgressQuotaUsage } from "./support/network-flow";
 import { loadStageState, nzbgetRpc, saveStageState, withControlKey } from "./support/script-settings";
 import {
   Rules, SCHEDULE_FIELDS, type QueueItem, type ScheduleRow, armWatchFolder, at, bodyCount, cancelledJob, completedJob,
-  disarmWatchFolder, dropValidNzb, failedJob, freshDay, generalSettings, historyItem, hhmm, localOutput, note,
+  disarmWatchFolder, dropValidNzb, failedJob, freshDay, historyItem, hhmm, localOutput, note,
   profileState, queueItem, queueState, resumeAll, schedules, serverActive, token, updateSettings, waitPaused,
   waitProfile, waitQueue, watchDir, watchFolderPaused, withRules, witnessTick,
 } from "./support/schedules";
@@ -192,11 +192,11 @@ test("T06 a scheduled speed limit binds for its window, then the configured limi
   initialOnly();
   note("observed", "The rate is the provider's BODY byte count over the job's wall time; per-leg samples are not exposed.");
   const limit = 1024 * 1024;
-  const configured = (await generalSettings(request)).maxDownloadSpeed;
+  const configured = (await bandwidth(request)).downloadBps;
   const day = freshDay();
   setClock(at(day, 9, 59));
   await withRules(request, "t06", async rules => {
-    await rules.create({ actionType: "speed_limit", time: "10:30", speedLimits: [{ kind: "GLOBAL", id: null, bytesPerSec: 0 }] });
+    await rules.create({ actionType: "speed_limit", time: "10:30", speedLimits: [{ kind: "GLOBAL", id: null, download: null }] });
     const speed = await rules.create({ actionType: "speed_limit", time: "10:00", speedLimitBytes: limit });
     expect(speed.track).toBe("SPEED");
 
@@ -220,7 +220,7 @@ test("T06 a scheduled speed limit binds for its window, then the configured limi
     expect(served / elapsedSeconds).toBeLessThan(limit * 1.8);
 
     setClock(at(day, 10, 30));
-    const lifted = await waitQueue(request, state => state.downloadBlock.scheduledSpeedLimit === 0, "T06 configured limit at 10:30");
+    const lifted = await waitQueue(request, state => state.downloadBlock.scheduledSpeedLimit === null, "T06 configured limit at 10:30");
     expect(lifted.speedLimitBytesPerSec).toBe(configured);
   });
 });
@@ -292,11 +292,11 @@ test("T08 a server is out of rotation for its scheduled window", async ({ reques
 });
 
 async function setSystemQuota(request: APIRequestContext, enabled: boolean): Promise<void> {
-  await setSystemEgressQuota(request, { enabled, period: "DAILY", limitBytes: 2_000_000_000 });
+  await setSystemEgressQuota(request, { downloadBytes: enabled ? 2_000_000_000 : null, period: "DAILY" });
 }
 
 async function systemQuotaUsed(request: APIRequestContext): Promise<number> {
-  return (await systemEgressQuotaUsage(request)).usedBytes;
+  return (await systemEgressQuotaUsage(request)).down.usedBytes;
 }
 
 test("T09 quota metering pauses and resumes on schedule", async ({ request }) => {

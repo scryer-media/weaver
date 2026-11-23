@@ -142,7 +142,7 @@ test("E08 an egress speed limit caps every leg sample", async ({ request }, info
   test.info().annotations.push({ type: "gap", description: "Weaver exposes no egress-throttling metrics counter, so only the 1 Hz leg samples are asserted." });
   const limit = 1024 * 1024;
   const iface = await interfaceForAddress(request, egressAddress("a"));
-  const egress = await createEgress(request, { name: "e08", bindingKind: "INTERFACE", interfaceName: iface.name, maxDownloadSpeed: limit });
+  const egress = await createEgress(request, { name: "e08", bindingKind: "INTERFACE", interfaceName: iface.name, downloadBps: limit });
   world.track("egress", egress.id);
   const server = await world.server({ route: { legs: [directLeg(egress.id, 100)] } });
   const subscription = await FlowSubscription.open();

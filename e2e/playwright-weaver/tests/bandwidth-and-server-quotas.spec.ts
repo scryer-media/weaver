@@ -14,8 +14,10 @@ import {
   updateConfiguredServer,
 } from "./helpers";
 import {
+  EGRESS_QUOTA_USAGE,
   SYSTEM_EGRESS_ID,
   SYSTEM_EGRESS_NAME,
+  type EgressQuotaUsage,
   egressQuota,
   setSystemEgressQuota,
   systemEgressQuotaUsage,
@@ -25,17 +27,6 @@ type QuotaSnapshot = {
   enabled: boolean;
   period: string;
   limitBytes: number;
-  lifetimeBytes: number;
-  usedBytes: number;
-  reservedBytes: number;
-  remainingBytes: number;
-  blocked: boolean;
-  windowStartsAtEpochMs: number | null;
-  windowEndsAtEpochMs: number | null;
-  timezoneName: string;
-};
-
-type EgressQuotaUsage = {
   lifetimeBytes: number;
   usedBytes: number;
   reservedBytes: number;
@@ -56,7 +47,8 @@ type DownloadBlockSnapshot = {
   windowStartsAtEpochMs: number | null;
   windowEndsAtEpochMs: number | null;
   timezoneName: string;
-  scheduledSpeedLimit: number;
+  /** Null is no scheduled limit. */
+  scheduledSpeedLimit: number | null;
 };
 
 type QuotaInput = {
@@ -71,6 +63,8 @@ type QuotaInput = {
 const stage = process.env.E2E_WEAVER_QUOTA_STAGE ?? "initial";
 const egressLimit = 256 * 1024;
 const egressLabel = { egress_id: String(SYSTEM_EGRESS_ID) };
+// The egress's reserved bytes are read from its metric: its quota usage reports used and remaining only.
+const egressReservedMetric = "weaver_egress_download_quota_reserved_bytes";
 const dailyServerLimit = 768 * 1024;
 const initialProbeArticleBytes = 64 * 1024;
 const initialProbeArticleCount = egressLimit / initialProbeArticleBytes;
@@ -137,14 +131,12 @@ async function exerciseInitialAccounting(request: APIRequestContext): Promise<vo
   let body = "";
   await expect
     .poll(async () => {
-      const [serverQuota, egressUsage, metricBody] = await Promise.all([
+      const [serverQuota, metricBody] = await Promise.all([
         readServerQuota(request, primary.id),
-        systemEgressQuotaUsage(request),
         metrics(request),
       ]);
       body = metricBody;
       return serverQuota.reservedBytes > 0
-        && egressUsage.reservedBytes > 0
         && (metricValue(body, "weaver_server_download_quota_reserved_bytes", {
           server_id: String(primary.id),
         }) ?? 0) > 0
@@ -163,14 +155,14 @@ async function exerciseInitialAccounting(request: APIRequestContext): Promise<vo
 
   await expect
     .poll(async () => {
-      const [serverQuota, block, egressUsage] = await Promise.all([
+      const [serverQuota, block, metricBody] = await Promise.all([
         readServerQuota(request, primary.id),
         readDownloadBlock(request),
-        systemEgressQuotaUsage(request),
+        metrics(request),
       ]);
       return block.kind === "EGRESS_QUOTA"
         && block.usedBytes > 0
-        && egressUsage.reservedBytes === 0
+        && metricValue(metricBody, egressReservedMetric, egressLabel) === 0
         && serverQuota.usedBytes > 0
         && serverQuota.reservedBytes === 0;
     }, { timeout: 30_000, intervals: [250, 500, 1_000] })
@@ -197,13 +189,13 @@ async function exerciseInitialAccounting(request: APIRequestContext): Promise<vo
   expect(block.usedBytes).toBeLessThanOrEqual(egressLimit);
   expect(block.remainingBytes).toBe(egressLimit - block.usedBytes);
   expect(block.remainingBytes).toBeLessThan(initialProbeArticleBytes);
-  expect(egress.downloadQuotaUsage).toMatchObject({
+  expect(egress.quotaUsage?.down).toMatchObject({
     usedBytes: block.usedBytes,
-    reservedBytes: 0,
     remainingBytes: block.remainingBytes,
   });
 
   body = await metrics(request);
+  expect(metricValue(body, egressReservedMetric, egressLabel)).toBe(0);
   expect(
     metricValue(body, "weaver_server_download_quota_used_bytes", {
       server_id: String(primary.id),
@@ -247,10 +239,9 @@ async function verifyRestartPersistenceAndDailyReset(
       }
     }`,
   );
-  expect((await egressQuota(request, SYSTEM_EGRESS_ID)).downloadQuota).toEqual({
-    enabled: true,
+  expect((await egressQuota(request, SYSTEM_EGRESS_ID)).quota).toEqual({
+    downloadBytes: egressLimit,
     period: "DAILY",
-    limitBytes: egressLimit,
   });
   const primary = data.servers.find(({ host }) => host === "nntp");
   expect(primary).toBeTruthy();
@@ -279,7 +270,7 @@ async function verifyRestartPersistenceAndDailyReset(
     egressName: SYSTEM_EGRESS_NAME,
     limitBytes: egressLimit,
   });
-  expect((await systemEgressQuotaUsage(request)).reservedBytes).toBe(0);
+  expect(metricValue(await metrics(request), egressReservedMetric, egressLabel)).toBe(0);
   expect(persistedBlock.usedBytes).toBeGreaterThan(0);
   expect(persistedBlock.usedBytes).toBeLessThanOrEqual(egressLimit);
   expect(persistedBlock.remainingBytes).toBeLessThan(initialProbeArticleBytes);
@@ -307,19 +298,20 @@ async function verifyRestartPersistenceAndDailyReset(
   setClock("2032-01-02T00:00:05Z");
   await expect
     .poll(async () => {
-      const [quotaState, egressUsage, block] = await Promise.all([
+      const [quotaState, egressUsage, block, metricBody] = await Promise.all([
         readServerQuota(request, primary!.id),
         systemEgressQuotaUsage(request),
         readDownloadBlock(request),
+        metrics(request),
       ]);
       return {
         serverUsed: quotaState.usedBytes,
         serverReserved: quotaState.reservedBytes,
         serverRemaining: quotaState.remainingBytes,
-        egressUsed: egressUsage.usedBytes,
-        egressReserved: egressUsage.reservedBytes,
-        egressRemaining: egressUsage.remainingBytes,
-        egressBlocked: egressUsage.blocked,
+        egressUsed: egressUsage.down.usedBytes,
+        egressReserved: metricValue(metricBody, egressReservedMetric, egressLabel),
+        egressRemaining: egressUsage.down.remainingBytes,
+        egressBlocked: egressUsage.down.state === "STOPPED",
         kind: block.kind,
       };
     }, { timeout: 15_000, intervals: [100, 250, 500] })
@@ -340,7 +332,7 @@ async function verifyRestartPersistenceAndDailyReset(
   expect(resetQuota.windowStartsAtEpochMs).toBeGreaterThanOrEqual(
     persistedServerWindowEnd!,
   );
-  expect(resetEgressUsage.windowStartsAtEpochMs).toBeGreaterThanOrEqual(persistedWindowEnd!);
+  expect(resetEgressUsage.periodStartEpochMs).toBeGreaterThanOrEqual(persistedWindowEnd!);
 
   body = await metrics(request);
   expect(metricValue(body, "weaver_egress_download_quota_used_bytes", egressLabel)).toBe(0);
@@ -372,7 +364,7 @@ async function exerciseManualResetAndPeriodWindows(
       intervals: [100, 250, 500],
     })
     .toBeGreaterThan(0);
-  const egressUsedBeforeReset = (await systemEgressQuotaUsage(request)).usedBytes;
+  const egressUsedBeforeReset = (await systemEgressQuotaUsage(request)).down.usedBytes;
   expect(egressUsedBeforeReset).toBeGreaterThan(0);
   const lifetimeBeforeReset = (await readServerQuota(request, primary.id)).lifetimeBytes;
   const reset = await resetServerQuota(request, primary.id);
@@ -383,14 +375,16 @@ async function exerciseManualResetAndPeriodWindows(
     blocked: false,
   });
   expect(reset.lifetimeBytes).toBe(lifetimeBeforeReset);
-  expect((await systemEgressQuotaUsage(request)).usedBytes).toBe(egressUsedBeforeReset);
-  // The egress allowance has its own reset, which likewise keeps lifetime.
-  const egressLifetimeBeforeReset = (await systemEgressQuotaUsage(request)).lifetimeBytes;
+  expect((await systemEgressQuotaUsage(request)).down.usedBytes).toBe(egressUsedBeforeReset);
+  // The egress allowance has its own reset. An egress's lifetime bytes are not
+  // reported any more, so that the reset keeps them is not asserted.
   const egressReset = await resetEgressQuota(request, SYSTEM_EGRESS_ID);
-  expect(egressReset).toMatchObject({ usedBytes: 0, blocked: false });
-  expect(egressReset.lifetimeBytes).toBe(egressLifetimeBeforeReset);
-  expect(egressReset.remainingBytes).toBe(egressLimit - egressReset.reservedBytes);
+  expect(egressReset.down).toMatchObject({ usedBytes: 0 });
+  expect(egressReset.down.state).not.toBe("STOPPED");
   let body = await metrics(request);
+  expect(egressReset.down.remainingBytes).toBe(
+    egressLimit - (metricValue(body, egressReservedMetric, egressLabel) ?? 0),
+  );
   expect(metricValue(body, "weaver_egress_download_quota_used_bytes", egressLabel)).toBe(0);
   expect(
     metricValue(body, "weaver_server_download_quota_used_bytes", {
@@ -771,7 +765,7 @@ async function configureSystemEgressQuota(
   enabled: boolean,
   limitBytes: number,
 ): Promise<void> {
-  await setSystemEgressQuota(request, { enabled, period: "DAILY", limitBytes });
+  await setSystemEgressQuota(request, { downloadBytes: enabled ? limitBytes : null, period: "DAILY" });
 }
 
 async function configureServerQuota(
@@ -851,20 +845,19 @@ async function resetEgressQuota(
   id: number,
 ): Promise<EgressQuotaUsage> {
   const data = await graphql<{
-    resetEgressDownloadQuotaUsage: { downloadQuotaUsage: EgressQuotaUsage };
+    resetEgressDownloadQuotaUsage: { quotaUsage: EgressQuotaUsage | null };
   }>(
     request,
     `mutation WeaverE2EResetEgressQuota($id: Int!) {
       resetEgressDownloadQuotaUsage(id: $id) {
-        downloadQuotaUsage {
-          lifetimeBytes usedBytes reservedBytes remainingBytes blocked
-          windowStartsAtEpochMs windowEndsAtEpochMs timezoneName
-        }
+        quotaUsage { ${EGRESS_QUOTA_USAGE} }
       }
     }`,
     { id },
   );
-  return data.resetEgressDownloadQuotaUsage.downloadQuotaUsage;
+  const usage = data.resetEgressDownloadQuotaUsage.quotaUsage;
+  expect(usage, `egress ${id} reports its quota usage after the reset`).not.toBeNull();
+  return usage!;
 }
 
 async function runProbe(

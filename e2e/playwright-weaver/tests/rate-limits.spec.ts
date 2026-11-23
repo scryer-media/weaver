@@ -4,7 +4,6 @@
 import fs from "node:fs";
 import {
   expect,
-  expectSetting,
   graphql,
   metricValue,
   requiredMetricValue,
@@ -16,6 +15,7 @@ import {
   test,
   updateConfiguredServer,
 } from "./helpers";
+import { bandwidth, setDownloadLimit } from "./support/network-flow";
 
 const globalLimit = 512 * 1024;
 const serverLimit = 256 * 1024;
@@ -37,12 +37,8 @@ test(`global, scheduled, and per-server limits: ${stage}`, async ({ request }) =
   }
   expect(stage).toBe("initial");
 
-  await graphql(
-    request,
-    "mutation WeaverE2EGlobalRate($input: GeneralSettingsInput!) { updateSettings(input: $input) { maxDownloadSpeed } }",
-    { input: { maxDownloadSpeed: globalLimit } },
-  );
-  await expectSetting(request, "maxDownloadSpeed", globalLimit);
+  await setDownloadLimit(request, globalLimit);
+  expect((await bandwidth(request)).downloadBps).toBe(globalLimit);
   const scheduleId = await createSchedule(request);
   const server = await setServerLimit(request, serverLimit);
   await expectScheduledLimit(request, scheduledLimit);
@@ -58,12 +54,8 @@ test(`global, scheduled, and per-server limits: ${stage}`, async ({ request }) =
   // Deleting a rule leaves its limit in force; the operator's own edit of the
   // global limit is what takes a scheduled limit away.
   await deleteSchedule(request, scheduleId);
-  await graphql(
-    request,
-    "mutation WeaverE2EGlobalRateAgain($input: GeneralSettingsInput!) { updateSettings(input: $input) { maxDownloadSpeed } }",
-    { input: { maxDownloadSpeed: globalLimit } },
-  );
-  await expectScheduledLimit(request, 0);
+  await setDownloadLimit(request, globalLimit);
+  await expectScheduledLimit(request, null);
 
   const perServerRate = await runRateProbe(request, "per-server");
   await setServerLimit(request, 0);
@@ -178,7 +170,7 @@ async function runRateProbe(
 async function verifyPersistedLimits(
   request: Parameters<typeof submitProbeNzb>[0],
 ): Promise<void> {
-  await expectSetting(request, "maxDownloadSpeed", globalLimit);
+  expect((await bandwidth(request)).downloadBps).toBe(globalLimit);
   const data = await graphql<{
     servers: Array<{ host: string; maxDownloadSpeed: number }>;
     schedules: Array<{ id: string; label: string; speedLimitBytes: number }>;
@@ -253,12 +245,13 @@ async function deleteSchedule(
 
 async function expectScheduledLimit(
   request: Parameters<typeof submitProbeNzb>[0],
-  expected: number,
+  /** Null is no scheduled limit. */
+  expected: number | null,
 ): Promise<void> {
   await expect
     .poll(async () => {
       const data = await graphql<{
-        globalQueueState: { downloadBlock: { scheduledSpeedLimit: number } };
+        globalQueueState: { downloadBlock: { scheduledSpeedLimit: number | null } };
       }>(
         request,
         `query WeaverE2EScheduledRateState {
@@ -281,13 +274,9 @@ async function restoreUnlimited(
     await deleteSchedule(request, schedule.id);
   }
   await setServerLimit(request, 0);
-  await graphql(
-    request,
-    "mutation WeaverE2ERestoreUnlimited($input: GeneralSettingsInput!) { updateSettings(input: $input) { maxDownloadSpeed } }",
-    { input: { maxDownloadSpeed: 0 } },
-  );
-  await expectSetting(request, "maxDownloadSpeed", 0);
-  await expectScheduledLimit(request, 0);
+  await setDownloadLimit(request, null);
+  expect((await bandwidth(request)).downloadBps).toBeNull();
+  await expectScheduledLimit(request, null);
   const body = await metrics(request);
   const server = await graphql<{ servers: Array<{ id: number; host: string }> }>(
     request,
