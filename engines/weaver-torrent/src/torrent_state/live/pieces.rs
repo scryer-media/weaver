@@ -179,12 +179,24 @@ impl TorrentStateLive {
 
     /// The storage is told of every piece queued again since it was last
     /// told: a piece that took room gives it back, and its blocks are
-    /// written block by block from then on.
+    /// written block by block from then on. Each is noted with the upload
+    /// mode count it was given back at, before its storage writes the blocks
+    /// it held, so a failure of those writes is read against that count.
     pub(super) fn spill_requeued(&self) {
         let requeued = match self.lock_write("requeued").get_pieces_mut() {
             Ok(pieces) => pieces.take_requeued(),
             Err(_) => return,
         };
+        if requeued.is_empty() {
+            return;
+        }
+        let epoch = self.upload_epoch();
+        {
+            let mut given_back = self.given_back.lock();
+            for piece in &requeued {
+                given_back.insert(piece.get(), epoch);
+            }
+        }
         for piece in requeued {
             self.files.on_piece_requeued(piece);
         }
@@ -193,6 +205,9 @@ impl TorrentStateLive {
     /// The piece did not pass its hash check, or the storage refused it: it
     /// is downloaded again.
     pub(super) fn requeue_piece(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
+        // What it was given back at is over: fetched again, it is given back
+        // anew, if at all.
+        self.take_given_back(piece.get());
         // Before it is queued again, so the storage has let go of the failed
         // bytes by the time another peer is handed the piece.
         if let Err(e) = self.files.on_piece_hash_failed(piece) {

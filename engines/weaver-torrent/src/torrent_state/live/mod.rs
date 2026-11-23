@@ -357,8 +357,16 @@ pub struct TorrentStateLive {
     // How many times upload mode was left. A refused write is read against
     // the count taken before it was made: one made before a leave enters
     // nothing after it, so a refusal that lands late cannot undo a wake.
-    // Moved and checked only under the upload mode's own lock.
+    // Moved and checked only under the upload mode's own lock. It starts
+    // at `FIRST_UPLOAD_EPOCH`: `BEFORE_RUN` is the count of a write made
+    // before this run began, which enters nothing in it.
     upload_epoch: AtomicU64,
+    // The count each piece given back to its storage was given back at:
+    // its blocks went to its files then, so a write of them the storage
+    // later says failed was made at that count. Held from the give-back to
+    // the piece's check, or until it is queued again; at most one per piece,
+    // and gone with the run.
+    given_back: Mutex<HashMap<u32, u64>>,
     // How many times the retry task saw an upload mode that waits for its
     // owner and left it be: what a test waits on to know it ran.
     #[cfg(test)]
