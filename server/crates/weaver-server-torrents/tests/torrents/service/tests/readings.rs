@@ -47,7 +47,7 @@ fn copy(view: &TorrentView, id: u64) -> TorrentView {
         // Every third is one file named as the torrent is, which a row's
         // totals alone say.
         name: match view.files.first() {
-            Some(file) if id % 3 == 0 => file.path.clone(),
+            Some(file) if id.is_multiple_of(3) => file.path.clone(),
             _ => format!("t{id}"),
         },
         files: match id % 3 {
