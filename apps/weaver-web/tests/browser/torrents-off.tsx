@@ -78,7 +78,7 @@ const client = new Client({ url: "http://fixture.invalid/graphql", exchanges: [(
     : name === "TrackerHosts" ? { trackerHosts: [] }
     : name === "TorrentRoutes" ? { torrentRoutes: [] }
     : name === "QueuePage" ? { queuePage: emptyPage }
-    : name === "SystemInfo" ? { systemInfo: { configuredStorage: [] } }
+    : name === "StorageVolumes" ? { systemInfo: { configuredStorage: [] } }
     : {};
   return fromValue({ operation, data, stale: false, hasNext: false });
 }))] });

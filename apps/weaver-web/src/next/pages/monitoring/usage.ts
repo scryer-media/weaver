@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { useEffect } from "react";
 import { useQuery } from "urql";
-import { INTEGRITY_HISTORY_QUERY, TORRENT_HISTORY_QUERY, USAGE_HISTORY_QUERY } from "@/graphql/queries";
+import type { DocumentNode } from "graphql";
+import { INTEGRITY_HISTORY_QUERY, TORRENT_HISTORY_QUERY } from "@/graphql/queries";
+import { useVisibleInterval } from "../../data/timers";
 import type { IntegrityHistory, TorrentHistory, UsageHistory, UsagePeriod } from "../../data/dashboards";
 
 /** How often an open dashboard reads the ledger again; it is written every five seconds. */
@@ -15,20 +16,18 @@ export interface UsageRangeInput {
   toDay?: string;
 }
 
-/** Read again while the dashboard is open. */
+/** Read again while the dashboard is open and shown; a hidden tab reads once on its return. */
 function useRefreshed(reexecute: (opts: { requestPolicy: "network-only" }) => void) {
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      reexecute({ requestPolicy: "network-only" });
-    }, USAGE_REFRESH_MS);
-    return () => window.clearInterval(timer);
-  }, [reexecute]);
+  useVisibleInterval(() => reexecute({ requestPolicy: "network-only" }), USAGE_REFRESH_MS);
 }
 
-/** The data-used ledger over `range`, read again while the dashboard is open. */
-export function useUsageHistory(range: UsageRangeInput | null, kind?: "SERVER" | "CATEGORY") {
+/**
+ * The data-used ledger over `range`, read again while the dashboard is open.
+ * `query` selects the parts the dashboard draws.
+ */
+export function useUsageHistory(query: DocumentNode, range: UsageRangeInput | null, kind?: "SERVER" | "CATEGORY") {
   const [{ data, fetching, error }, reexecute] = useQuery<{ usageHistory: UsageHistory }>({
-    query: USAGE_HISTORY_QUERY,
+    query,
     variables: { range, kind },
     pause: range === null,
   });

@@ -8,7 +8,7 @@ import {
   REDOWNLOAD_JOB_MUTATION,
   REPROCESS_JOB_MUTATION,
   RERUN_POST_PROCESSING_MUTATION,
-  SYSTEM_INFO_QUERY,
+  STORAGE_VOLUMES_QUERY,
 } from "@/graphql/queries";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { formatJobReleaseName, normalizeGraphqlTimestamp, type JobProtocol } from "@/lib/job-types";
@@ -314,7 +314,7 @@ export function HistoryPage() {
   });
   const [{ data: systemInfo }] = useQuery<{
     systemInfo: { configuredStorage: StorageVolume[] };
-  }>({ query: SYSTEM_INFO_QUERY });
+  }>({ query: STORAGE_VOLUMES_QUERY });
 
   const [, redownloadJob] = useMutation(REDOWNLOAD_JOB_MUTATION);
   const [, reprocessJob] = useMutation(REPROCESS_JOB_MUTATION);

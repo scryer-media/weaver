@@ -4,7 +4,7 @@
 import { useMemo } from "react";
 import { Link } from "react-router";
 import { useQuery } from "urql";
-import { SYSTEM_INFO_QUERY } from "@/graphql/queries";
+import { OVERVIEW_USAGE_QUERY, STORAGE_VOLUMES_QUERY } from "@/graphql/queries";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { formatEtaFromRemainingBytes, useStableEtaSpeed } from "@/lib/hooks/use-stable-queue-eta";
 import { MetricCell, SectionHeader, Square } from "../../components/chrome";
@@ -28,10 +28,8 @@ import { WV } from "../../data/palette";
 import { nothingDownloading, queuePageInput, queueSelection, slowDiskRate } from "../../data/queue-page";
 import { useQueuePage } from "../../data/use-live-queue";
 import { countLabel } from "../../i18n/labels";
-import { NextShell } from "../../shell/NextShell";
-import { AttentionBlock, UptimeBlock } from "../../shell/rail-blocks";
 import { DailyBars } from "./DailyBars";
-import { DashboardNav } from "./dashboards";
+import { DashboardSlot } from "./shell-slots";
 import { useUsageHistory } from "./usage";
 
 // The tile needs the queue's totals, not its rows.
@@ -70,11 +68,11 @@ export function OverviewDashboard() {
   );
   const midnight = useStartOfToday();
   const range = useMemo(() => ({ period: "CUSTOM" as const, ...lastDays(midnight, 30) }), [midnight]);
-  const { usage, error } = useUsageHistory(range, "SERVER");
+  const { usage, error } = useUsageHistory(OVERVIEW_USAGE_QUERY, range, "SERVER");
   const page = useQueuePage(QUEUE_TOTALS_INPUT);
   const [{ data: systemInfo }] = useQuery<{
     systemInfo: { configuredStorage: StorageVolume[] };
-  }>({ query: SYSTEM_INFO_QUERY });
+  }>({ query: STORAGE_VOLUMES_QUERY });
   const counting = providers.some((provider) => provider.activityUntilEpochMs != null);
   const now = useNow(1000, counting);
 
@@ -116,13 +114,8 @@ export function OverviewDashboard() {
   const last30 = sumDays(days);
 
   return (
-    <NextShell
-      title={t("next.nav.monitoring")}
-      railMiddle={<AttentionBlock />}
-      railFooter={<UptimeBlock />}
-      beforeContent={<DashboardNav active="overview" />}
-      statusRight={error ?? undefined}
-    >
+    <>
+      {error ? <DashboardSlot slot="status">{error}</DashboardSlot> : null}
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
         <div
           className="wv-cols grid flex-none border-b border-wv-hairline bg-wv-app"
@@ -237,6 +230,6 @@ export function OverviewDashboard() {
           />
         </section>
       </div>
-    </NextShell>
+    </>
   );
 }

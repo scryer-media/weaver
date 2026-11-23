@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 import { useMemo } from "react";
+import { PROVIDERS_USAGE_QUERY } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
 import { SectionHeader, Square } from "../../components/chrome";
 import { Chart, type ChartSeries } from "../../components/Chart";
@@ -27,9 +28,7 @@ import {
 import { useNextData } from "../../data/next-data";
 import { WV } from "../../data/palette";
 import { providerStateLabel } from "../../i18n/labels";
-import { NextShell } from "../../shell/NextShell";
-import { AttentionBlock, UptimeBlock } from "../../shell/rail-blocks";
-import { DashboardNav } from "./dashboards";
+import { DashboardSlot } from "./shell-slots";
 import { UsageRangeBar, useUsageRange } from "./RangeBar";
 import { useUsageHistory } from "./usage";
 
@@ -47,7 +46,7 @@ export function ProvidersDashboard() {
   const now = useNow(60_000);
   const today = dayKey(now);
   const rangeState = useUsageRange(now);
-  const { usage, isLoading, error } = useUsageHistory(rangeState.range, "SERVER");
+  const { usage, isLoading, error } = useUsageHistory(PROVIDERS_USAGE_QUERY, rangeState.range, "SERVER");
 
   const rows = useMemo(
     () => providerRows(providers, usage?.consumers ?? []),
@@ -77,13 +76,8 @@ export function ProvidersDashboard() {
   ];
 
   return (
-    <NextShell
-      title={t("next.nav.monitoring")}
-      railMiddle={<AttentionBlock />}
-      railFooter={<UptimeBlock />}
-      beforeContent={<DashboardNav active="providers" />}
-      statusRight={error ?? undefined}
-    >
+    <>
+      {error ? <DashboardSlot slot="status">{error}</DashboardSlot> : null}
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
         <UsageRangeBar state={rangeState} rangeStart={usage?.rangeStart} rangeEnd={usage?.rangeEnd} />
 
@@ -176,6 +170,6 @@ export function ProvidersDashboard() {
           />
         </section>
       </div>
-    </NextShell>
+    </>
   );
 }

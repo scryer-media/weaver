@@ -8,10 +8,8 @@ import { useNow } from "../../data/clock";
 import { averageSeconds, dailyRepairShare, percentOf, stagesInOrder, STAGE_ORDER } from "../../data/dashboards";
 import { EM_DASH, formatCount, formatDuration, formatSize } from "../../data/format";
 import { WV } from "../../data/palette";
-import { NextShell } from "../../shell/NextShell";
-import { AttentionBlock, UptimeBlock } from "../../shell/rail-blocks";
 import { DailyBars } from "./DailyBars";
-import { DashboardNav } from "./dashboards";
+import { DashboardSlot } from "./shell-slots";
 import { UsageRangeBar, useUsageRange } from "./RangeBar";
 import { useIntegrityHistory } from "./usage";
 
@@ -49,13 +47,8 @@ export function IntegrityDashboard() {
   const shares = dailyRepairShare(days, integrity?.repaired.days ?? []);
 
   return (
-    <NextShell
-      title={t("next.nav.monitoring")}
-      railMiddle={<AttentionBlock />}
-      railFooter={<UptimeBlock />}
-      beforeContent={<DashboardNav active="integrity" />}
-      statusRight={error ?? undefined}
-    >
+    <>
+      {error ? <DashboardSlot slot="status">{error}</DashboardSlot> : null}
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
         <UsageRangeBar state={rangeState} rangeStart={integrity?.rangeStart} rangeEnd={integrity?.rangeEnd} />
 
@@ -166,6 +159,6 @@ export function IntegrityDashboard() {
           )}
         </section>
       </div>
-    </NextShell>
+    </>
   );
 }

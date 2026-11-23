@@ -19,7 +19,7 @@ import {
   RESUME_CLASS_MUTATION,
   SET_QUEUE_ITEMS_CATEGORY_MUTATION,
   SET_QUEUE_ITEMS_PRIORITY_MUTATION,
-  SYSTEM_INFO_QUERY,
+  STORAGE_VOLUMES_QUERY,
 } from "@/graphql/queries";
 import { formatJobReleaseName, type JobData, type JobProtocol } from "@/lib/job-types";
 import { cn } from "@/lib/utils";
@@ -319,7 +319,7 @@ export function DownloadsPage() {
   const [, cancelJob] = useMutation<{ cancelJob: boolean }>(CANCEL_JOB_MUTATION);
   const [{ data: systemInfo }] = useQuery<{
     systemInfo: { configuredStorage: StorageVolume[] };
-  }>({ query: SYSTEM_INFO_QUERY });
+  }>({ query: STORAGE_VOLUMES_QUERY });
 
   const selection = useMemo(
     () => queueSelection({ tab: tab === "all" ? null : tab, facets, query, protocol, tag }),

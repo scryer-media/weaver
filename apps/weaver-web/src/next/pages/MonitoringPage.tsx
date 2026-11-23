@@ -4,7 +4,7 @@
 import { createContext, memo, useContext, useMemo, useState } from "react";
 import { Link } from "react-router";
 import { useQuery } from "urql";
-import { SYSTEM_INFO_QUERY } from "@/graphql/queries";
+import { MONITORING_COMPUTE_QUERY } from "@/graphql/queries";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import type { MetricsHistoryRange } from "@/lib/metrics";
 import { Bar, Eyebrow, MetricCell, SectionHeader, Square } from "../components/chrome";
@@ -35,9 +35,8 @@ import {
 } from "../data/use-metrics-series";
 import { WV, WV_FILL } from "../data/palette";
 import { aroundSlot, countLabel } from "../i18n/labels";
-import { NextShell } from "../shell/NextShell";
-import { DashboardNav } from "./monitoring/dashboards";
-import { AttentionBlock, UptimeBlock, providerLoadPercent } from "../shell/rail-blocks";
+import { providerLoadPercent } from "../shell/rail-blocks";
+import { DashboardSlot } from "./monitoring/shell-slots";
 import {
   cappedDirections,
   directionCap,
@@ -107,7 +106,7 @@ export function MonitoringPage() {
 
   const series = useMetricsSeries(range);
   const metrics = useMetricsSnapshot();
-  const [{ data: systemInfo }] = useQuery<SystemInfoResponse>({ query: SYSTEM_INFO_QUERY });
+  const [{ data: systemInfo }] = useQuery<SystemInfoResponse>({ query: MONITORING_COMPUTE_QUERY });
 
   const compute = systemInfo?.systemInfo?.compute ?? null;
   const failureTotals = useSettled<FailureTotals | null>(
@@ -154,10 +153,9 @@ const MonitoringScreen = memo(function MonitoringScreen({
   const { throughput, segments, depths } = useMemo(() => chartSeries(t, series), [t, series]);
 
   return (
-    <NextShell
-      title={t("next.nav.monitoring")}
-      note={t("next.monitoring.note")}
-      controls={
+    <>
+      <DashboardSlot slot="note">{t("next.monitoring.note")}</DashboardSlot>
+      <DashboardSlot slot="controls">
         <Segmented
           label={t("next.monitoring.range")}
           value={rangeId}
@@ -165,23 +163,17 @@ const MonitoringScreen = memo(function MonitoringScreen({
           options={RANGES}
           className="font-wv-mono text-[11.5px]"
         />
-      }
-      railMiddle={<AttentionBlock />}
-      railFooter={<UptimeBlock />}
-      beforeContent={
-        <>
-          <DashboardNav active="engine" />
-          <MonitoringStrip compute={compute} />
-        </>
-      }
-      statusRight={
-        series.error
+      </DashboardSlot>
+      <DashboardSlot slot="strip">
+        <MonitoringStrip compute={compute} />
+      </DashboardSlot>
+      <DashboardSlot slot="status">
+        {series.error
           ? series.error
           : t("next.monitoring.sampled", {
               window: RANGES.find((entry) => entry.value === rangeId)!.label,
-            })
-      }
-    >
+            })}
+      </DashboardSlot>
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
         <Chart
           title={t("next.shell.throughput")}
@@ -215,7 +207,7 @@ const MonitoringScreen = memo(function MonitoringScreen({
 
         <FailuresSection series={series} />
       </div>
-    </NextShell>
+    </>
   );
 });
 

@@ -1142,6 +1142,36 @@ export const SYSTEM_INFO_QUERY = gql`
   }
 `;
 
+/** The volumes Weaver writes to and how full each is, and nothing else of the system. */
+export const STORAGE_VOLUMES_QUERY = gql`
+  query StorageVolumes {
+    systemInfo {
+      configuredStorage {
+        labels
+        path
+        error
+        capacity {
+          totalBytes
+          usedBytes
+          freeBytes
+        }
+      }
+    }
+  }
+`;
+
+/** The decoder tier and worker count Monitoring's engine strip shows. */
+export const MONITORING_COMPUTE_QUERY = gql`
+  query MonitoringCompute {
+    systemInfo {
+      compute {
+        logicalCores
+        decoderTier
+      }
+    }
+  }
+`;
+
 export const PATH_STORAGE_QUERY = gql`
   query PathStorage($path: String!) {
     pathStorage(path: $path) {
@@ -1202,12 +1232,14 @@ const USAGE_TOTALS_FIELDS = `
   durationMs
 `;
 
-export const USAGE_HISTORY_QUERY = gql`
-  query UsageHistory($range: UsageRange!, $kind: UsageConsumerKind) {
+// Each dashboard selects the periods it draws, and of each day the figures
+// its chart plots; the ledger answers every one.
+
+/** Overview: the servers' total today, this week, month and ever, and by day. */
+export const OVERVIEW_USAGE_QUERY = gql`
+  query OverviewUsage($range: UsageRange!, $kind: UsageConsumerKind) {
     usageHistory(range: $range, kind: $kind) {
       today
-      rangeStart
-      rangeEnd
       todayStartEpochSec
       total {
         kind
@@ -1215,39 +1247,34 @@ export const USAGE_HISTORY_QUERY = gql`
         today { ${USAGE_TOTALS_FIELDS} }
         week { ${USAGE_TOTALS_FIELDS} }
         month { ${USAGE_TOTALS_FIELDS} }
-        year { ${USAGE_TOTALS_FIELDS} }
         allTime { ${USAGE_TOTALS_FIELDS} }
-        range { ${USAGE_TOTALS_FIELDS} }
         days { day ${USAGE_TOTALS_FIELDS} }
       }
+      finishedToday { complete partial failed }
+    }
+  }
+`;
+
+/** Providers: each server's periods, the range, and its days. */
+export const PROVIDERS_USAGE_QUERY = gql`
+  query ProvidersUsage($range: UsageRange!, $kind: UsageConsumerKind) {
+    usageHistory(range: $range, kind: $kind) {
+      today
+      rangeStart
+      rangeEnd
       consumers {
         kind
         id
         today { ${USAGE_TOTALS_FIELDS} }
         week { ${USAGE_TOTALS_FIELDS} }
         month { ${USAGE_TOTALS_FIELDS} }
-        year { ${USAGE_TOTALS_FIELDS} }
         allTime { ${USAGE_TOTALS_FIELDS} }
         range { ${USAGE_TOTALS_FIELDS} }
-        days { day ${USAGE_TOTALS_FIELDS} }
+        days { day bytes }
         removedHost
       }
-      finishedToday { complete partial failed }
-      finishedInRange { complete partial failed }
     }
   }
-`;
-
-const USAGE_CONSUMER_FIELDS = `
-  kind
-  id
-  today { ${USAGE_TOTALS_FIELDS} }
-  week { ${USAGE_TOTALS_FIELDS} }
-  month { ${USAGE_TOTALS_FIELDS} }
-  year { ${USAGE_TOTALS_FIELDS} }
-  allTime { ${USAGE_TOTALS_FIELDS} }
-  range { ${USAGE_TOTALS_FIELDS} }
-  days { day ${USAGE_TOTALS_FIELDS} }
 `;
 
 export const INTEGRITY_HISTORY_QUERY = gql`
@@ -1256,9 +1283,9 @@ export const INTEGRITY_HISTORY_QUERY = gql`
       today
       rangeStart
       rangeEnd
-      finished { ${USAGE_CONSUMER_FIELDS} }
-      repaired { ${USAGE_CONSUMER_FIELDS} }
-      stages { ${USAGE_CONSUMER_FIELDS} }
+      finished { kind id range { ${USAGE_TOTALS_FIELDS} } days { day events } }
+      repaired { kind id range { ${USAGE_TOTALS_FIELDS} } days { day events } }
+      stages { kind id range { ${USAGE_TOTALS_FIELDS} } }
       recovery { availableBytes fetchedBytes }
       failures { cause count }
     }
@@ -1271,8 +1298,14 @@ export const TORRENT_HISTORY_QUERY = gql`
       today
       rangeStart
       rangeEnd
-      total { ${USAGE_CONSUMER_FIELDS} }
-      trackers { ${USAGE_CONSUMER_FIELDS} }
+      total {
+        kind
+        id
+        allTime { ${USAGE_TOTALS_FIELDS} }
+        range { ${USAGE_TOTALS_FIELDS} }
+        days { day bytes bytesUploaded }
+      }
+      trackers { kind id range { ${USAGE_TOTALS_FIELDS} } }
       peers { torrents connected seeds }
     }
   }

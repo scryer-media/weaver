@@ -8,10 +8,8 @@ import { useNow } from "../../data/clock";
 import { noTorrents, shareRatio, trackersInOrder, type UsageTotals } from "../../data/dashboards";
 import { EM_DASH, formatCount, formatDuration, formatSize } from "../../data/format";
 import { WV } from "../../data/palette";
-import { NextShell } from "../../shell/NextShell";
-import { AttentionBlock, UptimeBlock } from "../../shell/rail-blocks";
 import { DailyBars } from "./DailyBars";
-import { DashboardNav } from "./dashboards";
+import { DashboardSlot } from "./shell-slots";
 import { UsageRangeBar, useUsageRange } from "./RangeBar";
 import { useTorrentHistory } from "./usage";
 
@@ -37,13 +35,8 @@ export function TorrentsDashboard() {
   const empty = torrents !== null && noTorrents(torrents);
 
   return (
-    <NextShell
-      title={t("next.nav.monitoring")}
-      railMiddle={<AttentionBlock />}
-      railFooter={<UptimeBlock />}
-      beforeContent={<DashboardNav active="torrents" />}
-      statusRight={error ?? undefined}
-    >
+    <>
+      {error ? <DashboardSlot slot="status">{error}</DashboardSlot> : null}
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
         <UsageRangeBar state={rangeState} rangeStart={torrents?.rangeStart} rangeEnd={torrents?.rangeEnd} />
 
@@ -146,6 +139,6 @@ export function TorrentsDashboard() {
           </>
         )}
       </div>
-    </NextShell>
+    </>
   );
 }
