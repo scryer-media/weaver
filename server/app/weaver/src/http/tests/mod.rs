@@ -1703,7 +1703,7 @@ fn sample_trackers() -> weaver_server_core::torrents::metrics::tracker::TrackerS
 
 fn sample_incoming() -> weaver_server_core::torrents::metrics::incoming::IncomingSnapshot {
     use weaver_server_core::torrents::metrics::incoming::{
-        Already, FromAddress, Held, IncomingEnd, IncomingSnapshot, PortOrder,
+        Already, EncryptionEnd, FromAddress, Held, IncomingEnd, IncomingSnapshot, PortOrder,
     };
     use weaver_server_core::torrents::metrics::swarm::Transport;
 
@@ -1716,6 +1716,7 @@ fn sample_incoming() -> weaver_server_core::torrents::metrics::incoming::Incomin
         from: FromAddress::Same,
     };
     incoming.already[Transport::Utp as usize][crossed.index()] = 87;
+    incoming.encryption[Transport::Tcp as usize][EncryptionEnd::UnknownTorrent as usize] = 88;
     incoming
 }
 

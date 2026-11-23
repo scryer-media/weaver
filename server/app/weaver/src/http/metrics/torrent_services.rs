@@ -12,7 +12,7 @@
 
 use weaver_server_core::torrents::metrics::dht::{DhtIgnored, DhtQuery, DhtQueryEnd};
 use weaver_server_core::torrents::metrics::incoming::{
-    Already, FromAddress, Held, IncomingEnd, PortOrder,
+    Already, EncryptionEnd, FromAddress, Held, IncomingEnd, PortOrder,
 };
 use weaver_server_core::torrents::metrics::network::{HolepunchEvent, PortMapResult, PortMapper};
 use weaver_server_core::torrents::metrics::swarm::Transport;
@@ -198,6 +198,21 @@ fn incoming(out: &mut Encoder, routes: &[SessionSeries]) {
                         ("result", end.as_str()),
                     ],
                     session.incoming.ends[*transport as usize][*end as usize],
+                );
+            }
+        }
+    }
+    for session in open() {
+        for transport in Transport::ALL {
+            for cause in EncryptionEnd::ALL {
+                out.sample(
+                    &f::TORRENT_INCOMING_ENCRYPTION_FAILURES,
+                    &[
+                        ("route", session.route.as_str()),
+                        ("transport", transport.as_str()),
+                        ("cause", cause.as_str()),
+                    ],
+                    session.incoming.encryption[*transport as usize][*cause as usize],
                 );
             }
         }
