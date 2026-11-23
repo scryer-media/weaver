@@ -397,7 +397,7 @@ export function DownloadInspector({
                 <div key={file.path} className="flex items-baseline gap-3">
                   <span
                     title={file.path}
-                    className="min-w-0 flex-1 truncate text-[12.5px] text-wv-secondary"
+                    className="min-w-0 flex-1 text-[12.5px] leading-[1.35] text-wv-secondary [overflow-wrap:anywhere]"
                   >
                     {file.name}
                   </span>
