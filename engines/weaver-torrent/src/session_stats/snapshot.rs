@@ -7,6 +7,7 @@
 
 use serde::Serialize;
 pub use weaver_utp::UtpStatsSnapshot;
+pub use weaver_utp::raw::ext_close_reason::LibTorrentCloseReason as UtpCloseReason;
 
 use crate::{
     session_stats::SessionCountersSnapshot,
@@ -117,4 +118,5 @@ struct SerializedUtpStatsSnapshot {
     synack_retransmissions: u64,
     send_errors: u64,
     live_virtual_sockets: u64,
+    remote_close_reasons: [u64; UtpCloseReason::BUCKETS],
 }

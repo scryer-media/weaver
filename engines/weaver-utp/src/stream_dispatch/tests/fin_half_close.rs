@@ -16,7 +16,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use super::{calc_mtu_for_mss, make_test_vsock};
 use crate::{
     SocketOpts,
-    raw::{Type, UtpHeader},
+    raw::{Extensions, Type, UtpHeader, ext_close_reason::LibTorrentCloseReason},
     stream_dispatch::VirtualSocketState,
 };
 
@@ -428,4 +428,40 @@ async fn a_fin_with_payload_is_taken_as_a_fin_and_its_payload_ignored() {
     reader.read_to_end(&mut received).await.unwrap();
     assert!(received.is_empty());
     writer.write_all(b"x").await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_reason_a_remote_gives_for_closing_is_counted_once_a_stream() {
+    let mut test = make_test_vsock(Default::default(), false);
+    let _stream = test.stream.take().unwrap();
+    test.poll_once_assert_pending().await;
+    test.take_sent();
+    let too_many_connections = LibTorrentCloseReason(15);
+    let timeout = LibTorrentCloseReason(8);
+    let reasons = |test: &super::TestVsock| test._socket.stats().snapshot().remote_close_reasons;
+    assert_eq!(reasons(&test), [0; LibTorrentCloseReason::BUCKETS]);
+
+    // The FIN, then the same FIN resent with another reason: the stream
+    // counts once, under the reason it heard first.
+    for close_reason in [too_many_connections, timeout] {
+        test.send_msg(
+            UtpHeader {
+                htype: Type::Fin,
+                seq_nr: 1.into(),
+                ack_nr: 100.into(),
+                wnd_size: 1024,
+                extensions: Extensions {
+                    close_reason: Some(close_reason),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            "",
+        );
+        test.poll_once_assert_pending().await;
+    }
+
+    let mut expected = [0; LibTorrentCloseReason::BUCKETS];
+    expected[too_many_connections.bucket()] = 1;
+    assert_eq!(reasons(&test), expected);
 }

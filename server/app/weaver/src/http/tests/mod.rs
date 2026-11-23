@@ -1739,7 +1739,7 @@ fn sample_dht_counts() -> weaver_server_core::torrents::metrics::dht::DhtSnapsho
 fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMetrics {
     use weaver_server_core::torrents::metrics::{
         FetchOutcome, Published, SeedingGoal, SeedingSeries, SessionSeries, TorrentEvent,
-        TorrentMetrics, TorrentSeries, TrackerSeries, UtpStatsSnapshot,
+        TorrentMetrics, TorrentSeries, TrackerSeries, UtpCloseReason, UtpStatsSnapshot,
     };
     use weaver_server_core::torrents::service::TorrentPieces;
     use weaver_server_core::torrents::{FetchPhase, TorrentState, TrackerStatus};
@@ -1897,6 +1897,14 @@ fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMet
             synack_retransmissions: 109,
             send_errors: 110,
             live_virtual_sockets: 111,
+            remote_close_reasons: {
+                let mut reasons = [0; UtpCloseReason::BUCKETS];
+                reasons[8] = 112;
+                reasons[15] = 113;
+                reasons[17] = 114;
+                reasons[18] = 115;
+                reasons
+            },
             send_batch_errors: 48,
         },
         peers: vec![
