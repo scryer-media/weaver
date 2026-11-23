@@ -50,8 +50,6 @@ async function editingList(page, id, name) {
   await editor.waitFor();
   return editor;
 }
-const VALIDATE_NOTE = "Weaver checks the DNSSEC signatures itself. Unsigned names still resolve; names that fail the check do not.";
-const PROXY_VALIDATE_NOTE = "Weaver checks the DNSSEC signatures itself. Only a WireGuard proxy's tunnel servers can be checked.";
 
 test("the DNS page lists profiles, System built in and first, and the server lists they use", async () => {
   const { page, errors } = await open();
@@ -60,9 +58,9 @@ test("the DNS page lists profiles, System built in and first, and the server lis
   // copy-is-claim: the built-in profile is named and marked as such.
   await system.getByText("Built in", { exact: true }).waitFor();
   // copy-is-claim: each profile reads in one line, a list by its name and wires.
-  await page.getByTestId("row-dnsProfiles-3").getByText("Weaver · Mixed Plain TLS · Via the proxy · Validate here", { exact: true }).waitFor();
-  await page.getByTestId("row-dnsProfiles-2").getByText("The proxy · As sent", { exact: true }).waitFor();
-  await page.getByTestId("row-dnsProfiles-4").getByText("The proxy · As sent · System where no proxy is used", { exact: true }).waitFor();
+  await page.getByTestId("row-dnsProfiles-3").getByText("Weaver · Mixed Plain TLS · Via the proxy · DNSSEC on", { exact: true }).waitFor();
+  await page.getByTestId("row-dnsProfiles-2").getByText("The proxy · DNSSEC off", { exact: true }).waitFor();
+  await page.getByTestId("row-dnsProfiles-4").getByText("The proxy · DNSSEC off · System where no proxy is used", { exact: true }).waitFor();
   await system.getByText("3 routes", { exact: true }).waitFor();
   await page.getByTestId("row-dnsLists-1").getByText("2 servers", { exact: true }).waitFor();
   await page.getByTestId("row-dnsLists-1").getByText("Checked", { exact: true }).waitFor();
@@ -84,36 +82,34 @@ test("a profile's editor shows who answers first and only what that who allows",
   // Asking the system on a leg with no proxy is a choice for the proxy alone.
   const fallback = editor.getByTestId("field-dnsSystemFallback");
   assert.equal(await fallback.count(), 0);
-  // Weaver's answers are taken as sent or validated here, and nothing else.
+  // Weaver's answers are taken as sent or validated here: DNSSEC is a switch, with no help beneath it.
   const trust = editor.getByTestId("field-dnsTrust");
-  assert.deepEqual(await trust.getByRole("radio").allTextContents(), ["As sent", "Validate here"]);
-  assert.equal(await option(editor, "Validate here").getAttribute("aria-checked"), "true");
-  // copy-is-claim: validating here says unsigned names still resolve and failing ones do not.
-  assert.equal(await editor.getByTestId("help-dnsTrust").textContent(), VALIDATE_NOTE);
-  await option(editor, "As sent").click();
-  await editor.getByTestId("help-dnsTrust").waitFor({ state: "detached" });
+  assert.equal(await trust.getAttribute("aria-checked"), "true");
+  assert.equal(await editor.getByTestId("help-dnsTrust").count(), 0);
+  await trust.click();
+  assert.equal(await trust.getAttribute("aria-checked"), "false");
   await choose(page, editor, "field-dnsList", "Encrypted");
   // The proxy answering takes no list and no transit, and the same two trusts.
   await option(editor, "The proxy").click();
   assert.equal(await editor.getByTestId("field-dnsList").count(), 0);
   assert.equal(await editor.getByTestId("field-dnsTransit").count(), 0);
-  assert.deepEqual(await trust.getByRole("radio").allTextContents(), ["As sent", "Validate here"]);
-  assert.equal(await option(editor, "As sent").getAttribute("aria-checked"), "true");
+  assert.equal(await trust.getAttribute("aria-checked"), "false");
   await fallback.waitFor();
   assert.equal(await fallback.getAttribute("aria-checked"), "false");
   // copy-is-claim: off, a route with a direct leg or fallback cannot take the profile.
   assert.equal(await editor.getByTestId("help-dnsSystemFallback").textContent(), "Off: a route with a direct leg or a direct fallback cannot use this profile.");
   await fallback.click();
   assert.equal(await fallback.getAttribute("aria-checked"), "true");
-  await option(editor, "Validate here").click();
-  // copy-is-claim: validating a proxy's answers needs a WireGuard tunnel's own servers.
-  assert.equal(await editor.getByTestId("help-dnsTrust").textContent(), PROXY_VALIDATE_NOTE);
+  await trust.click();
+  assert.equal(await trust.getAttribute("aria-checked"), "true");
   // The system takes answers as sent: there is no trust to choose.
   await option(editor, "The system").click();
   assert.equal(await editor.getByTestId("field-dnsTrust").count(), 0);
   assert.equal(await fallback.count(), 0);
   await option(editor, "The proxy").click();
-  await option(editor, "Validate here").click();
+  // Back at the proxy, answers are taken as sent until DNSSEC is switched on again.
+  assert.equal(await trust.getAttribute("aria-checked"), "false");
+  await trust.click();
   await action(editor, "Save profile").click();
   await editor.waitFor({ state: "detached" });
   const [save] = await sent(page, "SaveDnsProfile");
@@ -165,7 +161,7 @@ test("the DNS page has server lists, then proxy name profiles, then route profil
   assert.equal(await routes.locator("[data-testid^='row-dnsProfiles-']").first().getAttribute("data-testid"), "row-dnsProfiles-0");
   // copy-is-claim: a proxy name profile counts the proxies it finds, and its line names no transit.
   await names.getByTestId("row-dnsNameProfiles-6").getByText("1 proxy", { exact: true }).waitFor();
-  await names.getByTestId("row-dnsNameProfiles-6").getByText("Weaver · Mixed Plain TLS · As sent", { exact: true }).waitFor();
+  await names.getByTestId("row-dnsNameProfiles-6").getByText("Weaver · Mixed Plain TLS · DNSSEC off", { exact: true }).waitFor();
   // copy-is-claim: the built-in profile is the host where a proxy is found, and the system for a route.
   // The name cell also holds the Built in mark, so the name is read from its title.
   await names.getByTestId("row-dnsNameProfiles-0").getByTitle("Host", { exact: true }).waitFor();
@@ -191,7 +187,7 @@ test("a proxy name profile has no proxy answer, no transit and no fallback, and 
   await page.getByTestId("add-dnsNameProfiles").click();
   const editor = dialog(page, "Add proxy name profile");
   await editor.getByTestId("field-dnsProfileName").fill("Names checked");
-  await option(editor, "Validate here").click();
+  await editor.getByTestId("field-dnsTrust").click();
   await editor.getByTestId("field-dnsListNew").click();
   const list = dialog(page, "Add server list");
   await list.getByTestId("field-dnsListName").fill("Names");
@@ -199,7 +195,7 @@ test("a proxy name profile has no proxy answer, no transit and no fallback, and 
   await action(list, "Save list").click();
   await list.waitFor({ state: "detached" });
   assert.equal(await editor.getByTestId("field-dnsProfileName").inputValue(), "Names checked");
-  assert.equal(await option(editor, "Validate here").getAttribute("aria-checked"), "true");
+  assert.equal(await editor.getByTestId("field-dnsTrust").getAttribute("aria-checked"), "true");
   await editor.getByTestId("field-dnsList").getByText("Names", { exact: true }).waitFor();
   assert.equal(await editor.getByTestId("field-dnsTransit").count(), 0);
   await action(editor, "Save profile").click();
