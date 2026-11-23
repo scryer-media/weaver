@@ -154,10 +154,14 @@ export const DownloadRow = memo(function DownloadRow({
             </span>
           </div>
           {seedingColumn ? (
-            <ValueCell width={112}>
+            // Fixed in width, ratio and rate each in its own right-aligned slot,
+            // so the columns after it hold still as the numbers change.
+            <ValueCell width={0} className="w-[20ch] flex-none tabular-nums">
               {seeding === null ? null : (
                 <span data-testid={torrentIds.queueRowSeeding} title={t("next.torrent.seedingCell")}>
-                  {`${seeding.ratio.toFixed(2)} · ↑ ${formatRate(seeding.uploadBps)}`}
+                  <span className="inline-block w-[6ch] text-right">{seeding.ratio.toFixed(2)}</span>
+                  {" · ↑ "}
+                  <span className="inline-block w-[9ch] text-right">{formatRate(seeding.uploadBps)}</span>
                 </span>
               )}
             </ValueCell>
