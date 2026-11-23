@@ -531,7 +531,7 @@ const ThroughputBlock = memo(function ThroughputBlock() {
           {button}
         </div>
         <dl
-          className="m-0 grid grid-cols-[auto_1fr_auto] items-baseline gap-x-[4px] gap-y-[6px]"
+          className="m-0 grid grid-cols-[auto_1fr_auto] items-baseline gap-x-[10px] gap-y-[6px]"
           data-testid={testIds.shellThroughputRates}
         >
           <RailRates
@@ -611,7 +611,7 @@ export const NetworkBlock = memo(function NetworkBlock() {
 /** One named rate of the throughput block: its name, then the figure and its unit. */
 /**
  * One class's rates on a line: what it downloads, then what it uploads. Each
- * counter keeps one decimal and a fixed width, so the columns hold still as the
+ * counter keeps three places and a fixed width, so the columns hold still as the
  * figures change. Usenet uploads nothing, so its upload column is a dash.
  */
 function RailRates({
@@ -644,7 +644,7 @@ function RailCounter({ arrow, rate, title }: { arrow: "down" | "up"; rate: numbe
     <dd className="m-0 flex items-baseline justify-end" title={title} aria-label={title}>
       <span
         className={cn(
-          "inline-block w-[5ch] text-right font-wv-mono text-[12px] font-semibold tabular-nums leading-none",
+          "inline-block w-[3ch] text-right font-wv-mono text-[12px] font-semibold tabular-nums leading-none",
           rate > 0 ? "text-wv-fg" : "text-wv-muted",
         )}
       >
@@ -659,19 +659,20 @@ function RailCounter({ arrow, rate, title }: { arrow: "down" | "up"; rate: numbe
 }
 
 /**
- * A rate as `x.x` and its unit, one decimal at every scale. The scale starts
- * at KB/s, so every unit is four letters wide and nothing shifts as it climbs.
+ * A rate in three places and its unit: one decimal below ten (`6.7`), whole
+ * above (`58`, `999`). The scale starts at KB/s, so every unit is four letters
+ * wide and nothing shifts as it climbs.
  */
 function fixedSpeed(bytesPerSecond: number): { value: string; unit: string } {
   const units = ["KB/s", "MB/s", "GB/s", "TB/s"];
   let scaled = Number.isFinite(bytesPerSecond) && bytesPerSecond > 0 ? bytesPerSecond / 1024 : 0;
   let index = 0;
-  // Past 999.9 the next unit, so the value never needs more than five places.
-  while (scaled >= 999.95 && index < units.length - 1) {
+  // Past what rounds to 999, the next unit, so the value never needs a fourth place.
+  while (scaled >= 999.5 && index < units.length - 1) {
     scaled /= 1024;
     index += 1;
   }
-  return { value: scaled.toFixed(1), unit: units[index] };
+  return { value: scaled < 9.95 ? scaled.toFixed(1) : Math.round(scaled).toFixed(0), unit: units[index] };
 }
 
 /** The rail's last block: the sponsor link. */
