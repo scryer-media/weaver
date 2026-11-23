@@ -2664,7 +2664,7 @@ export const nextJa: LocaleDictionary = {
   "next.torrentDash.allTime": "累計 {{time}}",
   "next.torrentDash.peers": "現在のピア",
   "next.torrentDash.peersNote": "シード: {{seeds}} · トレント: {{torrents}}",
-  "next.torrentDash.uploadedPerDay": "1日あたりのアップロード",
+  "next.torrentDash.perDay": "1日ごと",
   "next.torrentDash.trackers": "トラッカー",
   "next.torrentDash.trackersNote": "トレントはトラッカールールに、ルールがなければ記載された各トラッカーに数えられます",
   "next.torrentDash.tracker": "トラッカー",

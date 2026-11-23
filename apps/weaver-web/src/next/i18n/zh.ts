@@ -2664,7 +2664,7 @@ export const nextZh: LocaleDictionary = {
   "next.torrentDash.allTime": "累计 {{time}}",
   "next.torrentDash.peers": "当前对等方",
   "next.torrentDash.peersNote": "种子: {{seeds}} · 任务: {{torrents}}",
-  "next.torrentDash.uploadedPerDay": "每日上传",
+  "next.torrentDash.perDay": "每日",
   "next.torrentDash.trackers": "Tracker",
   "next.torrentDash.trackersNote": "种子计入其 Tracker 规则；没有规则时计入其列出的每个 Tracker",
   "next.torrentDash.tracker": "Tracker",

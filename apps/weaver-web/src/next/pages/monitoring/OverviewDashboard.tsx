@@ -224,7 +224,7 @@ export function OverviewDashboard() {
           <SectionHeader label={t("next.overview.last30")} note={formatSize(last30.bytes)} sticky={false} />
           <DailyBars
             days={days.map((day) => day.day)}
-            values={days.map((day) => day.bytes)}
+            series={[{ label: t("next.overview.last30"), color: WV.accent, values: days.map((day) => day.bytes) }]}
             format={formatSize}
             label={t("next.overview.last30")}
           />

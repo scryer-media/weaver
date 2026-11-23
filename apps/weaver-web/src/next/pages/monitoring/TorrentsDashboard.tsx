@@ -7,6 +7,7 @@ import { columnStyle } from "../../components/columns";
 import { useNow } from "../../data/clock";
 import { noTorrents, shareRatio, trackersInOrder, type UsageTotals } from "../../data/dashboards";
 import { EM_DASH, formatCount, formatDuration, formatSize } from "../../data/format";
+import { WV } from "../../data/palette";
 import { NextShell } from "../../shell/NextShell";
 import { AttentionBlock, UptimeBlock } from "../../shell/rail-blocks";
 import { DailyBars } from "./DailyBars";
@@ -87,12 +88,23 @@ export function TorrentsDashboard() {
             </div>
 
             <section className="flex flex-none flex-col">
-              <SectionHeader label={t("next.torrentDash.uploadedPerDay")} sticky={false} />
+              <SectionHeader label={t("next.torrentDash.perDay")} sticky={false} />
               <DailyBars
                 days={days.map((day) => day.day)}
-                values={days.map((day) => day.bytesUploaded)}
+                series={[
+                  {
+                    label: t("next.torrentDash.downloaded"),
+                    color: WV.accent,
+                    values: days.map((day) => day.bytes),
+                  },
+                  {
+                    label: t("next.torrentDash.uploaded"),
+                    color: WV.info,
+                    values: days.map((day) => day.bytesUploaded),
+                  },
+                ]}
                 format={formatSize}
-                label={t("next.torrentDash.uploadedPerDay")}
+                label={t("next.torrentDash.perDay")}
               />
             </section>
 

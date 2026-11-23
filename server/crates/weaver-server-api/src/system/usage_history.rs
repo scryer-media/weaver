@@ -547,7 +547,7 @@ fn under_rules(
         Option<UsageConsumerSummary>,
     )> = Vec::new();
     let mut kept = Vec::new();
-    let mut slot = |name: &str, folded: &mut Vec<_>| match folded
+    let slot = |name: &str, folded: &mut Vec<_>| match folded
         .iter()
         .position(|(held, _, _): &(String, _, _)| held == name)
     {

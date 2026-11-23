@@ -7,6 +7,7 @@ import { columnStyle } from "../../components/columns";
 import { useNow } from "../../data/clock";
 import { averageSeconds, dailyRepairShare, percentOf, stagesInOrder, STAGE_ORDER } from "../../data/dashboards";
 import { EM_DASH, formatCount, formatDuration, formatSize } from "../../data/format";
+import { WV } from "../../data/palette";
 import { NextShell } from "../../shell/NextShell";
 import { AttentionBlock, UptimeBlock } from "../../shell/rail-blocks";
 import { DailyBars } from "./DailyBars";
@@ -96,7 +97,7 @@ export function IntegrityDashboard() {
           ) : (
             <DailyBars
               days={days.map((day) => day.day)}
-              values={shares}
+              series={[{ label: t("next.integrity.repairsPerDay"), color: WV.accent, values: shares }]}
               format={(value) => `${value.toFixed(1)}%`}
               label={t("next.integrity.repairsPerDay")}
             />
