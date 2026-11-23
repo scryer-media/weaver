@@ -1182,6 +1182,7 @@ function useTrackerRules(
                 label: t("next.torrents.trackerRuleHosts"),
                 help: t("next.torrents.trackerRuleHostsNote"),
                 keywords: "tracker host domain announce",
+                stacked: true,
                 control: {
                   kind: "custom",
                   control: (

@@ -163,6 +163,8 @@ export interface FieldSpec {
   collapsed?: boolean;
   /** The control alone, centered across the row, with no label beside it; the label still names it for search. */
   wide?: boolean;
+  /** The control under the label and help at full width, for one too wide to sit beside them. */
+  stacked?: boolean;
   /** A short line under the control, such as what an inherited value gives. */
   under?: string;
 }
@@ -332,7 +334,7 @@ const FieldRow = memo(function FieldRow({ field }: { field: FieldSpec }) {
       <FieldControlView spec={field} />
     </div>
   ) : (
-    <FormRow label={field.label} help={field.help} helpTestId={testIds.fieldHelp(field.id)}>
+    <FormRow label={field.label} help={field.help} helpTestId={testIds.fieldHelp(field.id)} stacked={field.stacked}>
       {field.under === undefined ? (
         <FieldControlView spec={field} />
       ) : (

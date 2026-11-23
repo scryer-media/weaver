@@ -144,15 +144,23 @@ export function FormRow({
   children,
   htmlFor,
   helpTestId,
+  stacked = false,
 }: {
   label: ReactNode;
   help?: ReactNode;
   children: ReactNode;
   htmlFor?: string;
   helpTestId?: string;
+  /** The control under the label at full width, for one too wide to sit beside it. */
+  stacked?: boolean;
 }) {
   return (
-    <div className="grid grid-cols-1 items-center gap-x-6 gap-y-3 border-b border-wv-hairline px-4 py-[14px] hover:bg-wv-cell-hover sm:grid-cols-[minmax(0,1fr)_minmax(268px,max-content)] sm:px-6">
+    <div
+      className={cn(
+        "grid grid-cols-1 items-center gap-x-6 gap-y-3 border-b border-wv-hairline px-4 py-[14px] hover:bg-wv-cell-hover sm:px-6",
+        !stacked && "sm:grid-cols-[minmax(0,1fr)_minmax(268px,max-content)]",
+      )}
+    >
       <div className="flex min-w-0 flex-col gap-1">
         <label
           htmlFor={htmlFor}
@@ -164,7 +172,7 @@ export function FormRow({
           <div data-testid={helpTestId} className="text-[12px] leading-[1.45] text-pretty text-wv-muted">{help}</div>
         )}
       </div>
-      <div className="flex min-w-0 items-center gap-3 sm:justify-end">
+      <div className={cn("flex min-w-0 items-center gap-3", !stacked && "sm:justify-end")}>
         {children}
       </div>
     </div>
