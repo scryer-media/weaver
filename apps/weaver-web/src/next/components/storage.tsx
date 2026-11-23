@@ -37,6 +37,7 @@ export function StorageUsage({
   capacity,
   error,
   size = 46,
+  wrap = false,
   className,
 }: {
   label: string;
@@ -45,6 +46,8 @@ export function StorageUsage({
   capacity: StorageVolume["capacity"];
   error: string | null;
   size?: number;
+  /** Wrap a long label rather than cut it off, for a grid cell with room below. */
+  wrap?: boolean;
   className?: string;
 }) {
   const t = useTranslate();
@@ -53,7 +56,10 @@ export function StorageUsage({
     <div className={cn("flex min-w-0 items-center gap-2.5", className)}>
       <Pie percent={percent} color={capacity ? usageColor(percent) : WV.inert} size={size} />
       <div className="min-w-0">
-        <div className="truncate font-wv-mono text-[11px] text-wv-tertiary" title={title}>
+        <div
+          className={cn("font-wv-mono text-[11px] text-wv-tertiary", wrap ? "[overflow-wrap:anywhere]" : "truncate")}
+          title={title}
+        >
           {label}
         </div>
         <div className="truncate text-[11px] text-wv-muted" title={capacity ? undefined : (error ?? undefined)}>
@@ -97,7 +103,9 @@ export function StorageMounts({
       <div
         className={cn(
           "min-w-0",
-          stacked ? "flex flex-col gap-3" : "mt-2 flex flex-wrap items-center gap-x-7 gap-y-3",
+          stacked
+            ? "flex flex-col gap-3"
+            : "mt-2 grid grid-cols-[repeat(auto-fill,minmax(min(100%,22rem),1fr))] items-center gap-x-7 gap-y-3",
         )}
       >
         {mounts.map((mount) => (
@@ -108,6 +116,7 @@ export function StorageMounts({
             capacity={mount.capacity}
             error={mount.error}
             size={stacked ? 34 : 46}
+            wrap={!stacked}
           />
         ))}
       </div>

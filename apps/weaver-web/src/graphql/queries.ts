@@ -1132,6 +1132,7 @@ export const SYSTEM_INFO_QUERY = gql`
         labels
         path
         error
+        drive
         capacity {
           totalBytes
           usedBytes
@@ -1150,6 +1151,7 @@ export const STORAGE_VOLUMES_QUERY = gql`
         labels
         path
         error
+        drive
         capacity {
           totalBytes
           usedBytes
@@ -1178,6 +1180,7 @@ export const PATH_STORAGE_QUERY = gql`
       labels
       path
       error
+      drive
       capacity {
         totalBytes
         usedBytes

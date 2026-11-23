@@ -344,8 +344,9 @@ impl SystemQuery {
         let storage = ctx
             .data_opt::<weaver_server_core::SharedPipelineState>()
             .and_then(|state| state.storage_capacity());
+        let drive = drive(storage.as_deref(), &requested);
         let space = StorageCapacity::path_space(storage.as_deref(), requested).await;
-        storage_row(Vec::new(), label, space)
+        storage_row(Vec::new(), label, space, drive)
     }
     /// Return recent log records from the in-memory ring buffer.
     #[graphql(guard = "AdminGuard")]
@@ -529,19 +530,34 @@ async fn configured_storage(
                     path,
                     capacity: None,
                     error: Some(error),
+                    drive: None,
                 },
                 None => storage_row(
                     input.labels,
                     path,
                     spaces.next().expect("one answer per ask"),
+                    drive(storage, &input.path),
                 ),
             }
         })
         .collect()
 }
 
+// The drive the disk owner holds `path` on, from its memory alone: a path
+// it has not read yet is queued to be read off this thread and answers
+// null until then.
+fn drive(storage: Option<&StorageCapacity>, path: &std::path::Path) -> Option<String> {
+    let volume = storage?.volume(path);
+    volume.device.is_some().then(|| volume.label.clone())
+}
+
 // A row from the disk owner's answer.
-fn storage_row(labels: Vec<String>, path: String, space: OnDemandSpace) -> ConfiguredStorage {
+fn storage_row(
+    labels: Vec<String>,
+    path: String,
+    space: OnDemandSpace,
+    drive: Option<String>,
+) -> ConfiguredStorage {
     let (capacity, error) = match space {
         OnDemandSpace::Read(space) => (Some(disk_capacity(space)), None),
         OnDemandSpace::Failed(error) => (None, Some(unavailable(&error))),
@@ -553,6 +569,7 @@ fn storage_row(labels: Vec<String>, path: String, space: OnDemandSpace) -> Confi
         path,
         capacity,
         error,
+        drive,
     }
 }
 

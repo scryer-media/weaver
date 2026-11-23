@@ -1386,6 +1386,9 @@ pub struct ConfiguredStorage {
     pub path: String,
     pub capacity: Option<DiskCapacity>,
     pub error: Option<String>,
+    /// The mount path or drive root the folder lies on, so folders on one
+    /// drive can be shown as one; null until the disk owner has read it.
+    pub drive: Option<String>,
 }
 
 /// One volume as the operating system presents it: what it takes and what

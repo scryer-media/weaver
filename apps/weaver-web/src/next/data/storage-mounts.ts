@@ -21,6 +21,8 @@ export interface StorageVolume {
   path: string;
   error: string | null;
   capacity: { totalBytes: number; usedBytes: number; freeBytes: number } | null;
+  /** The mount path or drive root the path lies on, when the daemon has read it. */
+  drive?: string | null;
 }
 
 export interface StorageMount {
@@ -43,6 +45,10 @@ const MIB = 1024 * 1024;
  * paths on one filesystem are handed the same numbers by the same `statvfs`.
  * Used bytes are compared to the mebibyte so a sampling skew between two reads
  * of a busy disk does not split it in half; total bytes have to match exactly.
+ *
+ * When the daemon names the drive a path lies on, that settles it: every path
+ * on one drive is one disk, nested or not. The fingerprint below is for paths
+ * whose drive is not known yet.
  *
  * A fingerprint alone cannot tell two identical, equally full disks apart, so
  * it only merges paths that are nested: a path joins a disk when it sits under,
@@ -77,19 +83,22 @@ export function storageMounts(volumes: readonly StorageVolume[]): StorageMount[]
       unprobed.push(volume);
       continue;
     }
-    const fingerprint = `fs:${volume.capacity.totalBytes}:${Math.round(volume.capacity.usedBytes / MIB)}`;
-    const existing = [...mounts.values()].find(
-      (mount) =>
-        mount.key.startsWith(`${fingerprint}#`) &&
-        mount.paths.some((path) => contains(path, volume.path) || contains(volume.path, path)),
-    );
+    const print = fingerprint(volume.capacity);
+    const existing = volume.drive
+      ? mounts.get(`drive:${volume.drive}`)
+      : [...mounts.values()].find(
+          (mount) =>
+            mount.capacity !== null &&
+            fingerprint(mount.capacity) === print &&
+            mount.paths.some((path) => contains(path, volume.path) || contains(volume.path, path)),
+        );
     if (existing) {
       probed.push({ path: volume.path, key: existing.key });
       existing.paths.push(volume.path);
       existing.label = sharedPath(existing.paths);
       continue;
     }
-    const key = `${fingerprint}#${volume.path}`;
+    const key = volume.drive ? `drive:${volume.drive}` : `${print}#${volume.path}`;
     probed.push({ path: volume.path, key });
     mounts.set(key, {
       key,
@@ -126,6 +135,11 @@ export function storageMounts(volumes: readonly StorageVolume[]): StorageMount[]
   const first = (mount: StorageMount) =>
     Math.min(...mount.paths.map((path) => order.get(path) ?? Number.MAX_SAFE_INTEGER));
   return [...mounts.values()].sort((left, right) => first(left) - first(right));
+}
+
+/** Two readings of one filesystem match on this, to the mebibyte of used bytes. */
+function fingerprint(capacity: NonNullable<StorageVolume["capacity"]>): string {
+  return `fs:${capacity.totalBytes}:${Math.round(capacity.usedBytes / MIB)}`;
 }
 
 /** Whether `child` sits under `parent`, comparing whole path segments. */

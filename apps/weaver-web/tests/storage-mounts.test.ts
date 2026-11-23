@@ -129,3 +129,18 @@ test("windows paths fold on their own separator", () => {
 
   assert.equal(mounts.length, 1);
 });
+
+test("paths the daemon puts on one drive are one disk, even with drifting figures", () => {
+  // A busy disk reads differently between two looks; the drive settles it.
+  const mounts = storageMounts([
+    { ...volume("/data/weaver", { totalBytes: 4_000 * 1024 ** 2, usedBytes: 1_000 * 1024 ** 2 }), drive: "/data" },
+    { ...volume("/data/weaver/intermediate", { totalBytes: 4_000 * 1024 ** 2, usedBytes: 1_090 * 1024 ** 2 }), drive: "/data" },
+    { ...volume("/data/library/complete", { totalBytes: 4_000 * 1024 ** 2, usedBytes: 1_100 * 1024 ** 2 }), drive: "/data" },
+    { ...volume("/mnt/media", { totalBytes: 9_000, usedBytes: 1_000 }), drive: "/mnt/media" },
+  ]);
+
+  assert.equal(mounts.length, 2);
+  assert.equal(mounts[0].label, "/data");
+  assert.deepEqual([...mounts[0].paths].sort(), ["/data/library/complete", "/data/weaver", "/data/weaver/intermediate"]);
+  assert.equal(mounts[1].label, "/mnt/media");
+});
