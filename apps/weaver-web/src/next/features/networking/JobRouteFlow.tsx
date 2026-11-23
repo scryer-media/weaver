@@ -104,14 +104,15 @@ export function JobRouteFlow({
           pools={pools}
           consumers={shown}
           traffic
-          thumbnail
+          fitWidth
         />
       </div>
       <Dialog
         open={enlarged}
         title={t("next.networking.overview.flow")}
         note={title}
-        width={1240}
+        // As wide as the window allows: the drawing scales up to fill it.
+        width={2400}
         onDismiss={() => setEnlarged(false)}
         footer={
           <SecondaryButton onClick={() => setEnlarged(false)}>{t("next.networking.close")}</SecondaryButton>
@@ -126,6 +127,7 @@ export function JobRouteFlow({
           onEdit={setEditing}
           traffic
           trace
+          fitWidth
         />
       </Dialog>
       {editing ? (

@@ -699,7 +699,7 @@ export const NetworkFlow = memo(function NetworkFlow({
   traffic = false,
   trace = false,
   toggles,
-  thumbnail = false,
+  fitWidth = false,
 }: {
   flow: Flow;
   egresses: Egress[];
@@ -717,10 +717,10 @@ export const NetworkFlow = memo(function NetworkFlow({
    */
   toggles?: { overrides: PathOverride; onToggle?: (target: DownTarget) => void };
   /**
-   * Drawn scaled to the width it is given, with no route picker: a thumbnail
-   * of routes chosen by the caller, as a job's own panel shows them.
+   * Drawn scaled to the width it is given, with no route picker: routes
+   * chosen by the caller, as a job's panel and its enlarged view show them.
    */
-  thumbnail?: boolean;
+  fitWidth?: boolean;
 }) {
   const t = useTranslate();
   const [hover, setHover] = useState<Focus | null>(null);
@@ -1149,7 +1149,7 @@ export const NetworkFlow = memo(function NetworkFlow({
 
   return (
     <div className="flex min-w-0 flex-col">
-      {single || thumbnail ? null : (
+      {single || fitWidth ? null : (
         <div className="flex flex-wrap items-center gap-[10px] border-b border-wv-hairline px-4 py-3 sm:px-6">
           <Select
             label={t("next.networking.flow.consumer")}
@@ -1190,7 +1190,7 @@ export const NetworkFlow = memo(function NetworkFlow({
           data-testid={networkIds.flowDiagram}
           className="block"
           style={
-            thumbnail
+            fitWidth
               ? { background: INK.ground, fontFamily: FONT, width: "100%" }
               : { background: INK.ground, fontFamily: FONT, width: `${(100 * span) / WIDTH}%`, minWidth: (1160 * span) / WIDTH }
           }
