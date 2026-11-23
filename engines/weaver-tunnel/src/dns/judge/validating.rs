@@ -453,9 +453,11 @@ mod tests {
             }),
             at(Wire::Https {
                 path: "/dns-query".into(),
+                name: None,
             }),
             at(Wire::Https {
                 path: "/other".into(),
+                name: None,
             }),
         ];
         let sources: Vec<u64> = servers.iter().map(source).collect();

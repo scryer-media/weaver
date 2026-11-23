@@ -2345,6 +2345,7 @@ mod logical_reader_tests {
                     wire: if n % 2 == 0 {
                         ListedWire::Https {
                             path: "/dns-query".into(),
+                            name: (n % 4 == 0).then(|| format!("doh{n}.example")),
                         }
                     } else {
                         ListedWire::Tls {

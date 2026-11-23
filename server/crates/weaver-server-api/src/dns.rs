@@ -143,7 +143,8 @@ impl From<DnsTrust> for core::DnsTrust {
 #[derive(Clone, Debug, PartialEq, SimpleObject)]
 pub struct DnsServer {
     pub wire: DnsWire,
-    /// The server's IP, with its port when that is not the wire's own.
+    /// The server's IP, with its port when that is not the wire's own. For
+    /// HTTPS whose URL names a host, the IP dialled, with no port.
     pub address: String,
     /// TLS: the name its certificate is checked against.
     pub tls_name: Option<String>,
@@ -152,15 +153,21 @@ pub struct DnsServer {
 }
 impl From<&core::ListedServer> for DnsServer {
     fn from(server: &core::ListedServer) -> Self {
-        let address = server.engine().to_string();
+        let mut address = server.engine().to_string();
         let (wire, tls_name, url) = match &server.wire {
             core::ListedWire::Plain => (DnsWire::Plain, None, None),
             core::ListedWire::Tls { name } => (DnsWire::Tls, name.clone(), None),
-            core::ListedWire::Https { path } => {
-                let host = match server.address.ip() {
+            core::ListedWire::Https { path, name } => {
+                let ip = match server.address.ip() {
                     std::net::IpAddr::V4(ip) => ip.to_string(),
                     std::net::IpAddr::V6(ip) => format!("[{ip}]"),
                 };
+                let host = name.clone().unwrap_or_else(|| ip.clone());
+                // A server named by its host is dialled at the IP given
+                // beside its URL, and reads back with it.
+                if name.is_some() {
+                    address = ip;
+                }
                 let port = server.address.port();
                 let port = if port == core::WireKind::Https.default_port() {
                     String::new()
@@ -188,13 +195,18 @@ impl From<&core::ListedServer> for DnsServer {
 pub struct DnsServerInput {
     pub wire: DnsWire,
     /// PLAIN and TLS: the server's IP, with a port when it is not the
-    /// wire's own (`192.0.2.53:5353`, `[2001:db8::53]:853`). HTTPS: unused.
+    /// wire's own (`192.0.2.53:5353`, `[2001:db8::53]:853`). HTTPS: the IP
+    /// dialled when the URL names a host (`192.0.2.53`, `[2001:db8::53]`),
+    /// with no port, which the URL gives; unused when the URL's host is an
+    /// IP. The host name is never looked up.
     #[graphql(default)]
     pub address: String,
     /// TLS: the name the certificate is checked against; absent checks it
     /// against the address.
     pub tls_name: Option<String>,
-    /// HTTPS: the URL queries are posted to, `https://` and an IP.
+    /// HTTPS: the URL queries are posted to, `https://` and an IP or a host
+    /// name. A host name is the name the certificate is checked against and
+    /// the request's host; the server is dialled at `address`.
     pub url: Option<String>,
 }
 impl DnsServerInput {
@@ -208,10 +220,19 @@ impl DnsServerInput {
                     .filter(|name| !name.is_empty()),
             },
             DnsWire::Https => {
-                let (address, path) = doh_url(self.url.as_deref().unwrap_or("").trim())?;
+                let (host, port, path) = doh_url(self.url.as_deref().unwrap_or("").trim())?;
+                let (ip, name) = match host {
+                    DohHost::Ip(ip) => (ip, None),
+                    // A name is never looked up: the IP to dial is given
+                    // beside it, with no port of its own.
+                    DohHost::Name(name) => (
+                        bare_ip(self.address.trim()).ok_or(NetworkRefusal::ProxyDnsUrlHostname)?,
+                        Some(name),
+                    ),
+                };
                 return Ok(core::ListedServer {
-                    address,
-                    wire: core::ListedWire::Https { path },
+                    address: std::net::SocketAddr::new(ip, port),
+                    wire: core::ListedWire::Https { path, name },
                 });
             }
         };
@@ -225,6 +246,19 @@ impl DnsServerInput {
                 .ok_or(NetworkRefusal::ProxyDnsServerInvalid)?,
             wire,
         })
+    }
+}
+
+// An IP alone, with no port: a v6 one bare or in brackets, and with no
+// zone.
+fn bare_ip(text: &str) -> Option<std::net::IpAddr> {
+    match text.strip_prefix('[') {
+        Some(bracketed) => bracketed
+            .strip_suffix(']')?
+            .parse::<std::net::Ipv6Addr>()
+            .ok()
+            .map(std::net::IpAddr::V6),
+        None => text.parse().ok(),
     }
 }
 
@@ -256,13 +290,22 @@ fn server_address(text: &str, default_port: u16) -> Option<std::net::SocketAddr>
     Some(SocketAddr::new(ip, port))
 }
 
-// A DNS over HTTPS URL as the server's address and the path queries are
-// posted to: `https://`, an IP literal host (a v6 one in brackets), an
-// optional port, and a path from '/', its query string kept. Nothing else:
-// no user, no fragment, and no host name. The host is read as written, not
-// as a browser reads it, so `1.2.3` or `0x7f.1` is no address.
-fn doh_url(url: &str) -> std::result::Result<(std::net::SocketAddr, String), NetworkRefusal> {
-    use NetworkRefusal::{ProxyDnsUrlHostname, ProxyDnsUrlInvalid};
+// The host of a DNS over HTTPS URL: an IP literal, or a name that follows
+// the TLS name rules.
+#[derive(Debug, PartialEq)]
+enum DohHost {
+    Ip(std::net::IpAddr),
+    Name(String),
+}
+
+// A DNS over HTTPS URL as the server's host, port and the path queries are
+// posted to: `https://`, an IP literal host (a v6 one in brackets) or a
+// host name, an optional port, and a path from '/', its query string kept.
+// Nothing else: no user and no fragment. The host is read as written, not
+// as a browser reads it, so `1.2.3` is no address, and `0x7f.1`, which
+// holds a letter, is read as a name.
+fn doh_url(url: &str) -> std::result::Result<(DohHost, u16, String), NetworkRefusal> {
+    use NetworkRefusal::ProxyDnsUrlInvalid;
     let scheme = url.get(..8).ok_or(ProxyDnsUrlInvalid)?;
     if !scheme.eq_ignore_ascii_case("https://") || url.contains('#') {
         return Err(ProxyDnsUrlInvalid);
@@ -277,22 +320,24 @@ fn doh_url(url: &str) -> std::result::Result<(std::net::SocketAddr, String), Net
         Some(bracketed) => {
             let (host, after) = bracketed.split_once(']').ok_or(ProxyDnsUrlInvalid)?;
             let ip: std::net::Ipv6Addr = host.parse().map_err(|_| ProxyDnsUrlInvalid)?;
-            (std::net::IpAddr::V6(ip), after)
+            (DohHost::Ip(std::net::IpAddr::V6(ip)), after)
         }
         None => {
             let (host, port) = match authority.split_once(':') {
                 Some((host, _)) => (host, &authority[host.len()..]),
                 None => (authority, ""),
             };
-            let ip: std::net::Ipv4Addr = match host.parse() {
-                Ok(ip) => ip,
+            let host = match host.parse::<std::net::Ipv4Addr>() {
+                Ok(ip) => DohHost::Ip(std::net::IpAddr::V4(ip)),
                 // A name, as against something in no address form at all.
-                Err(_) if host.bytes().any(|b| b.is_ascii_alphabetic()) => {
-                    return Err(ProxyDnsUrlHostname);
+                Err(_)
+                    if host.bytes().any(|b| b.is_ascii_alphabetic()) && core::is_tls_name(host) =>
+                {
+                    DohHost::Name(host.to_owned())
                 }
                 Err(_) => return Err(ProxyDnsUrlInvalid),
             };
-            (std::net::IpAddr::V4(ip), port)
+            (host, port)
         }
     };
     let port = match port {
@@ -304,7 +349,7 @@ fn doh_url(url: &str) -> std::result::Result<(std::net::SocketAddr, String), Net
             .filter(|port| *port != 0)
             .ok_or(ProxyDnsUrlInvalid)?,
     };
-    Ok((std::net::SocketAddr::new(host, port), path.to_owned()))
+    Ok((host, port, path.to_owned()))
 }
 
 // The profiles that use each list, loaded once for every list one request
@@ -744,15 +789,116 @@ mod tests {
         assert_eq!(DnsServer::from(&plain).address, "192.0.2.53:5353");
     }
 
+    fn doh(url: &str, address: &str) -> std::result::Result<core::ListedServer, NetworkRefusal> {
+        DnsServerInput {
+            wire: DnsWire::Https,
+            address: address.into(),
+            tls_name: None,
+            url: Some(url.into()),
+        }
+        .server()
+    }
+
     #[test]
-    fn a_doh_url_with_a_host_name_is_refused_as_such() {
+    fn a_doh_url_with_a_host_name_needs_the_ip_beside_it() {
         assert_eq!(
             doh_url("https://dns.example/dns-query"),
-            Err(NetworkRefusal::ProxyDnsUrlHostname)
+            Ok((
+                DohHost::Name("dns.example".into()),
+                443,
+                "/dns-query".into()
+            ))
         );
         assert_eq!(
             doh_url("https://192.0.2.53"),
             Err(NetworkRefusal::ProxyDnsUrlInvalid)
         );
+        for bad in [
+            "https://dns..example/q",
+            "https://-dns.example/q",
+            "https://dns_ex ample/q",
+        ] {
+            assert_eq!(
+                doh_url(bad),
+                Err(NetworkRefusal::ProxyDnsUrlInvalid),
+                "{bad}"
+            );
+        }
+        // No address, or one that is not a bare IP, is refused as such.
+        for address in [
+            "",
+            " ",
+            "dns.example",
+            "192.0.2.53:443",
+            "[2001:db8::53]:443",
+            "1.2.3",
+            "fe80::1%en0",
+        ] {
+            assert_eq!(
+                doh("https://dns.example/dns-query", address),
+                Err(NetworkRefusal::ProxyDnsUrlHostname),
+                "{address:?}"
+            );
+        }
+        // The IP is dialled at the URL's port, and the name kept.
+        assert_eq!(
+            doh("https://dns.example:8443/dns-query", "[2001:db8::53]"),
+            Ok(core::ListedServer {
+                address: "[2001:db8::53]:8443".parse().unwrap(),
+                wire: core::ListedWire::Https {
+                    path: "/dns-query".into(),
+                    name: Some("dns.example".into()),
+                },
+            })
+        );
+        assert_eq!(
+            doh("https://dns.example/dns-query", " 2001:db8::53 ")
+                .unwrap()
+                .address,
+            "[2001:db8::53]:443".parse().unwrap()
+        );
+        // An IP host needs no address, and one sent beside it is unused.
+        assert_eq!(
+            doh("https://192.0.2.53/dns-query", "198.51.100.1"),
+            Ok(core::ListedServer {
+                address: "192.0.2.53:443".parse().unwrap(),
+                wire: core::ListedWire::Https {
+                    path: "/dns-query".into(),
+                    name: None,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn a_doh_server_named_by_its_host_reads_back_as_it_was_written() {
+        for (url, address, read) in [
+            ("https://dns.example/dns-query", "192.0.2.53", "192.0.2.53"),
+            (
+                "https://dns.example:8443/q?x=1",
+                "[2001:db8::53]",
+                "[2001:db8::53]",
+            ),
+            (
+                "https://dns.example/dns-query",
+                "2001:db8::53",
+                "[2001:db8::53]",
+            ),
+        ] {
+            let server = doh(url, address).unwrap();
+            let shown = DnsServer::from(&server);
+            assert_eq!(shown.url.as_deref(), Some(url));
+            assert_eq!(shown.address, read);
+            assert_eq!(shown.wire, DnsWire::Https);
+            // What reads back saves back the same.
+            assert_eq!(doh(&shown.url.unwrap(), &shown.address), Ok(server));
+        }
+        // An IP host reads back as before.
+        let shown = DnsServer::from(&doh("https://192.0.2.53:8443/dns-query", "").unwrap());
+        assert_eq!(
+            shown.url.as_deref(),
+            Some("https://192.0.2.53:8443/dns-query")
+        );
+        assert_eq!(shown.address, "192.0.2.53:8443");
     }
 }

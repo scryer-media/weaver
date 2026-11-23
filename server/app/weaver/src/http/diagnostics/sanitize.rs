@@ -1006,9 +1006,9 @@ impl Table {
         self.insert(value, stand_in, Scope::Identity)
     }
 
-    // A DNS server's TLS name is a host name, and a DNS over HTTPS path can
-    // name the operator's account at the service, so each is held as close
-    // as a proxy's host.
+    // A DNS server's TLS name, and a DNS over HTTPS server's name, is a host
+    // name, and a DNS over HTTPS path can name the operator's account at the
+    // service, so each is held as close as a proxy's host.
     fn dns_servers(&mut self, servers: &[ListedServer], stand_in: &str) {
         for (index, server) in servers.iter().enumerate() {
             match &server.wire {
@@ -1018,7 +1018,10 @@ impl Table {
                         self.identity(name, &format!("{stand_in}/dns-{}", index + 1));
                     }
                 }
-                ListedWire::Https { path } => {
+                ListedWire::Https { path, name } => {
+                    if let Some(name) = name {
+                        self.identity(name, &format!("{stand_in}/dns-{}", index + 1));
+                    }
                     let bare = path.split('?').next().unwrap_or(path);
                     for spelling in [path.as_str(), bare] {
                         if spelling != "/" {
@@ -3326,8 +3329,9 @@ mod json_log_spellings {
         );
     }
 
-    // A listed DNS server can be named by a TLS name and reached at a DNS
-    // over HTTPS path that names an account. Neither reaches the package,
+    // A listed DNS server can be named by a TLS name or a DNS over HTTPS
+    // host name, and reached at a DNS over HTTPS path that names an
+    // account. None reaches the package,
     // in a URL or on its own, and nor do the list's and profile's names.
     #[test]
     fn a_dns_servers_tls_name_and_path_are_held_like_a_proxys_host() {
@@ -3345,6 +3349,14 @@ mod json_log_spellings {
                     address: "192.0.2.54:443".parse().unwrap(),
                     wire: ListedWire::Https {
                         path: "/acct-7f3k9/dns-query?key=4q8z".into(),
+                        name: None,
+                    },
+                },
+                ListedServer {
+                    address: "192.0.2.55:443".parse().unwrap(),
+                    wire: ListedWire::Https {
+                        path: "/dns-query".into(),
+                        name: Some("doh.private.example".into()),
                     },
                 },
             ],
@@ -3371,11 +3383,13 @@ mod json_log_spellings {
             "WARN routed DNS failed url=https://192.0.2.54/acct-7f3k9/dns-query?key=4q8z",
             "WARN routed DNS failed path=/acct-7f3k9/dns-query?key=4q8z",
             "WARN routed DNS failed path=/acct-7f3k9/dns-query",
+            "WARN routed DNS failed url=https://doh.private.example/dns-query",
             "INFO saved list Quad home for profile Family resolver",
         ] {
             let text = table.sanitize_str(line);
             for value in [
                 "dns.private.example",
+                "doh.private.example",
                 "acct-7f3k9",
                 "4q8z",
                 "Quad home",
@@ -3388,6 +3402,11 @@ mod json_log_spellings {
             table
                 .sanitize_str("tls name dns.private.example")
                 .contains("dns-list-3/dns-1")
+        );
+        assert!(
+            table
+                .sanitize_str("doh name doh.private.example")
+                .contains("dns-list-3/dns-3")
         );
         assert_eq!(
             table.sanitize_str("WARN routed DNS failed path=/acct-7f3k9/dns-query"),

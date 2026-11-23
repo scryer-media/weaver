@@ -11,7 +11,7 @@
 // stream until the next lookup takes it, and the connection goes when the
 // naming closes it. Every part of a reply is read under a fixed cap.
 use crate::dns::{
-    DnsServer, Exchanged,
+    DnsServer, Exchanged, Wire,
     exchange::{REPLY_CAP, Tls},
 };
 use hyper::{
@@ -139,7 +139,7 @@ impl Connection {
         packet: &[u8],
     ) -> Result<(Vec<u8>, bool), Exchanged> {
         let two = matches!(self.http, Http::Two { .. });
-        let mut request = request(server.address, path, packet, two)?;
+        let mut request = request(server, path, packet, two)?;
         let interim = Arc::new(AtomicUsize::new(0));
         let counted = interim.clone();
         hyper::ext::on_informational(&mut request, move |_| {
@@ -247,7 +247,7 @@ impl Connection {
         let Http::Two { send, streams, .. } = &mut self.http else {
             unreachable!("only an HTTP/2 connection carries queries together")
         };
-        let request = request(server.address, path, packet, true)?;
+        let request = request(server, path, packet, true)?;
         if streams.calls.is_empty() {
             streams.since = self.read.load(Ordering::Relaxed);
             streams.bound = 0;
@@ -513,12 +513,19 @@ fn length_of(value: &str) -> Option<usize> {
     value.parse().ok().filter(|length| *length <= REPLY_CAP)
 }
 
-// The server's address as an HTTP authority: an IPv6 address in brackets,
-// and the port only when it is not 443.
-fn authority(address: SocketAddr) -> String {
-    let host = match address {
-        SocketAddr::V4(address) => address.ip().to_string(),
-        SocketAddr::V6(address) => format!("[{}]", address.ip()),
+// The server as an HTTP authority: the name it was given, else its address
+// (an IPv6 address in brackets), and the port only when it is not 443.
+fn authority(server: &DnsServer) -> String {
+    let address = server.address;
+    let host = match (&server.wire, address) {
+        (
+            Wire::Https {
+                name: Some(name), ..
+            },
+            _,
+        ) => name.clone(),
+        (_, SocketAddr::V4(address)) => address.ip().to_string(),
+        (_, SocketAddr::V6(address)) => format!("[{}]", address.ip()),
     };
     match address.port() {
         443 => host,
@@ -539,13 +546,13 @@ fn target(path: &str) -> Result<Uri, Exchanged> {
 // The request for one query: these four headers and the query, nothing
 // else. HTTP/2 carries the host as the request's authority instead.
 fn request(
-    address: SocketAddr,
+    server: &DnsServer,
     path: &str,
     packet: &[u8],
     two: bool,
 ) -> Result<Request<Query>, Exchanged> {
     let path = target(path)?;
-    let host = authority(address);
+    let host = authority(server);
     let builder = if two {
         let uri = Uri::builder()
             .scheme("https")
@@ -666,6 +673,16 @@ impl<S: AsyncWrite + Unpin> hyper::rt::Write for Io<S> {
 mod tests {
     use super::*;
 
+    fn at(address: &str, name: Option<&str>) -> DnsServer {
+        DnsServer {
+            address: address.parse().unwrap(),
+            wire: Wire::Https {
+                path: "/dns-query".into(),
+                name: name.map(str::to_owned),
+            },
+        }
+    }
+
     #[test]
     fn a_path_with_a_space_a_line_break_or_other_than_ascii_is_refused() {
         assert!(target("/dns-query").is_ok());
@@ -682,7 +699,7 @@ mod tests {
             assert!(matches!(target(path), Err(Exchanged::Invalid)), "{path:?}");
             for two in [false, true] {
                 assert!(
-                    request("192.0.2.53:443".parse().unwrap(), path, &[0; 12], two).is_err(),
+                    request(&at("192.0.2.53:443", None), path, &[0; 12], two).is_err(),
                     "{path:?}"
                 );
             }
@@ -691,11 +708,31 @@ mod tests {
 
     #[test]
     fn an_http_2_request_names_the_server_as_its_authority() {
-        let Ok(request) = request("192.0.2.53:8443".parse().unwrap(), "/q?a=b", &[0; 12], true)
-        else {
+        let Ok(request) = request(&at("192.0.2.53:8443", None), "/q?a=b", &[0; 12], true) else {
             panic!("a request");
         };
         assert_eq!(request.uri(), "https://192.0.2.53:8443/q?a=b");
         assert!(request.headers().get(HOST).is_none());
+    }
+
+    #[test]
+    fn a_named_server_is_its_requests_host_and_its_address_is_not() {
+        for (server, host) in [
+            (at("192.0.2.53:443", Some("dns.example")), "dns.example"),
+            (
+                at("192.0.2.53:8443", Some("dns.example")),
+                "dns.example:8443",
+            ),
+            (at("[2001:db8::53]:443", None), "[2001:db8::53]"),
+        ] {
+            let Ok(one) = request(&server, "/dns-query", &[0; 12], false) else {
+                panic!("a request");
+            };
+            assert_eq!(one.headers().get(HOST).unwrap(), host);
+            let Ok(two) = request(&server, "/dns-query", &[0; 12], true) else {
+                panic!("a request");
+            };
+            assert_eq!(two.uri(), &*format!("https://{host}/dns-query"));
+        }
     }
 }

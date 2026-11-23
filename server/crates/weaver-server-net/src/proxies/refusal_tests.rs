@@ -320,7 +320,7 @@ fn table() -> Vec<(R, &'static str, &'static str)> {
         (
             R::ProxyDnsUrlHostname,
             "PROXY_DNS_URL_HOSTNAME",
-            "a DNS over HTTPS server is named by its IP address, not a host name",
+            "a DNS over HTTPS server named by a host name also needs its IP address",
         ),
         (
             R::ProxyDnsPlainAfterEncrypted,

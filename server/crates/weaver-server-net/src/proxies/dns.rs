@@ -36,12 +36,21 @@ pub struct ListedServer {
 }
 
 // How a server is asked: in the clear, over TLS (its certificate checked
-// against `name`, or its address without one), or over HTTPS at `path`.
+// against `name`, or its address without one), or over HTTPS at `path`
+// (its certificate checked against `name`, sent as the request's host, or
+// its address without one). A name is never looked up: the address is
+// dialled. Lists saved before HTTPS took a name load without one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ListedWire {
     Plain,
-    Tls { name: Option<String> },
-    Https { path: String },
+    Tls {
+        name: Option<String>,
+    },
+    Https {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -275,7 +284,8 @@ pub fn validate_servers(servers: &[ListedServer]) -> Result<(), Refusal> {
         return Err(Refusal::ProxyDnsPlainAfterEncrypted);
     }
     servers.iter().try_for_each(ListedServer::validate)?;
-    // The same address, port and wire, with the same TLS name or HTTPS path,
+    // The same address, port and wire, with the same TLS name or HTTPS path
+    // and name,
     // is one server; asking it twice only repeats a failure. The list holds
     // at most ten, so comparing every pair costs nothing.
     if servers
@@ -295,12 +305,15 @@ impl ListedServer {
             wire: match &self.wire {
                 ListedWire::Plain => Wire::Plain,
                 ListedWire::Tls { name } => Wire::Tls { name: name.clone() },
-                ListedWire::Https { path } => Wire::Https { path: path.clone() },
+                ListedWire::Https { path, name } => Wire::Https {
+                    path: path.clone(),
+                    name: name.clone(),
+                },
             },
         }
     }
     // What one server checks of itself: a port, and a TLS name or HTTPS
-    // path that is well formed.
+    // path and name that are well formed.
     pub fn validate(&self) -> Result<(), Refusal> {
         if self.address.port() == 0 {
             return Err(Refusal::ProxyDnsServerInvalid);
@@ -309,7 +322,11 @@ impl ListedServer {
             ListedWire::Plain | ListedWire::Tls { name: None } => Ok(()),
             ListedWire::Tls { name: Some(name) } if is_tls_name(name) => Ok(()),
             ListedWire::Tls { .. } => Err(Refusal::ProxyDnsTlsNameInvalid),
-            ListedWire::Https { path } if is_https_path(path) => Ok(()),
+            ListedWire::Https { path, name }
+                if is_https_path(path) && name.as_deref().is_none_or(is_tls_name) =>
+            {
+                Ok(())
+            }
             ListedWire::Https { .. } => Err(Refusal::ProxyDnsUrlInvalid),
         }
     }

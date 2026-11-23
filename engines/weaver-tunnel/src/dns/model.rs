@@ -30,8 +30,11 @@ pub enum Wire {
     // given.
     Tls { name: Option<String> },
     // DNS over HTTPS (RFC 8484), POST to `path` (starts with '/') at the
-    // server's address. Port 443 by default.
-    Https { path: String },
+    // server's address. Port 443 by default. With a `name`, the certificate
+    // is checked against it and it is sent as the request's host, as the
+    // URL named it; the name is never looked up, the address is dialled.
+    // Without one, the address is both.
+    Https { path: String, name: Option<String> },
 }
 
 // Which wire a server is asked over, without its settings.

@@ -983,6 +983,7 @@ fn doh(address: &str) -> DnsServer {
         address: address.parse().unwrap(),
         wire: Wire::Https {
             path: "/dns-query".into(),
+            name: None,
         },
     }
 }
@@ -1567,6 +1568,99 @@ async fn doh_posts_the_query_with_id_zero_to_the_path_at_the_servers_address() {
     }
     // HTTP/1.1 asks each family on a connection of its own.
     assert_eq!(servers.dials().len(), 4);
+}
+
+fn doh_named(address: &str, name: &str) -> DnsServer {
+    DnsServer {
+        address: address.parse().unwrap(),
+        wire: Wire::Https {
+            path: "/dns-query".into(),
+            name: Some(name.to_owned()),
+        },
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn doh_with_a_name_verifies_against_it_sends_it_as_the_host_and_dials_the_address() {
+    // The certificate names only the name, not the address dialled.
+    let authority = Authority::new();
+    let servers = Servers::new(doh_fixture(plain_reply, false), answers)
+        .at("192.0.2.53", authority.server(&["dns.test"], b"http/1.1"));
+    let wires = authority.wires();
+    for (server, host, dialled) in [
+        (
+            doh_named("192.0.2.53:443", "dns.test"),
+            "dns.test",
+            "192.0.2.53:443",
+        ),
+        (
+            doh_named("192.0.2.53:8443", "dns.test"),
+            "dns.test:8443",
+            "192.0.2.53:8443",
+        ),
+    ] {
+        let before = servers.dials().len();
+        let lookup = resolve(&servers, &wires, &[server], Trust::AsSent, "fixture.test")
+            .await
+            .unwrap();
+        assert_eq!(lookup.addresses, seven());
+        let requests = std::mem::take(&mut servers.log.lock().unwrap().requests);
+        assert_eq!(requests.len(), 2);
+        for seen in requests {
+            assert_eq!(seen.target, "/dns-query");
+            assert_eq!(seen.headers[0], ("host".to_owned(), host.to_owned()));
+        }
+        let dials = servers.dials().split_off(before);
+        assert!(!dials.is_empty());
+        assert!(
+            dials.iter().all(|at| *at == dialled.parse().unwrap()),
+            "{dials:?}"
+        );
+    }
+    // The name rides in the ClientHello as SNI.
+    let sent = servers.log.lock().unwrap().sent[0].lock().unwrap().clone();
+    assert!(sent.windows(8).any(|bytes| bytes == b"dns.test"));
+
+    // Without the name, the same certificate does not name the server.
+    let resolution = recorded(
+        &servers,
+        &wires,
+        &[doh("192.0.2.53:443")],
+        Trust::AsSent,
+        "fixture.test",
+    )
+    .await;
+    assert_eq!(
+        resolution.error,
+        tls_failed("192.0.2.53", "certificate not valid for this server")
+    );
+
+    // Over HTTP/2 the name is the request's authority.
+    let authority = Authority::new();
+    let speaks = Speaks::H2 {
+        respond: Arc::new(h2_message),
+        goaway_after: None,
+        misstep: H2Misstep::None,
+    };
+    let servers =
+        Servers::new(speaks, answers).at("192.0.2.53", authority.server(&["dns.test"], b"h2"));
+    let lookup = resolve(
+        &servers,
+        &authority.wires(),
+        &[doh_named("192.0.2.53:443", "dns.test")],
+        Trust::AsSent,
+        "fixture.test",
+    )
+    .await
+    .unwrap();
+    assert_eq!(lookup.addresses, seven());
+    let requests = servers.log.lock().unwrap().requests.clone();
+    assert!(!requests.is_empty());
+    for seen in requests {
+        assert_eq!(seen.target, "https://dns.test/dns-query");
+        assert!(seen.headers.iter().all(|(name, _)| name != "host"));
+    }
+    assert_eq!(servers.dials(), ["192.0.2.53:443".parse().unwrap()]);
 }
 
 fn doh_servers(

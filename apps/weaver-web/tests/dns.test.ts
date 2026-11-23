@@ -72,7 +72,7 @@ test("each DNS read asks for one kind of profile, and only the fields its caller
   assert.deepEqual(profileReads(DNS_PROFILE_NAMES_QUERY), { dnsProfiles: { kind: "PROXY_NAME", fields: ["id", "name"] } });
 });
 
-const rows = (...list: Partial<DnsServerRow>[]): DnsServerRow[] => list.map((row) => ({ wire: "PLAIN", address: "", tlsName: "", ...row }));
+const rows = (...list: Partial<DnsServerRow>[]): DnsServerRow[] => list.map((row) => ({ wire: "PLAIN", address: "", tlsName: "", dohAddress: "", ...row }));
 const t = (key: string) => key;
 
 test("a plain or TLS address is an IP, with a port only in its own form", () => {
@@ -114,7 +114,15 @@ test("a list's first fault is named by the server's place in it", () => {
   assert.deepEqual(serversProblem(rows({ address: " " })), { key: "next.dns.needsServer" });
   assert.deepEqual(serversProblem(rows({ address: "dns.example" })), { key: "next.dns.badAddress", values: { number: 1 } });
   assert.deepEqual(serversProblem(rows({ address: "192.0.2.53" }, { address: "192.0.2.256" })), { key: "next.dns.badAddress", values: { number: 2 } });
-  assert.deepEqual(serversProblem(rows({ wire: "HTTPS", address: "https://dns.example/dns-query" })), { key: "next.dns.urlHostname", values: { number: 1 } });
+  // A DoH URL that names a host is reached at the IP given beside it, and needs one.
+  assert.deepEqual(serversProblem(rows({ wire: "HTTPS", address: "https://dns.example/dns-query" })), { key: "next.dns.dohNeedsAddress", values: { number: 1 } });
+  for (const dohAddress of ["dns.example", "192.0.2.53:443", "[2001:db8::53]:443", "192.0.2.256"]) {
+    assert.deepEqual(serversProblem(rows({ wire: "HTTPS", address: "https://dns.example/dns-query", dohAddress })), { key: "next.dns.dohNeedsAddress", values: { number: 1 } }, dohAddress);
+  }
+  for (const dohAddress of ["192.0.2.53", " 2001:db8::53 ", "[2001:db8::53]"]) {
+    assert.equal(serversProblem(rows({ wire: "HTTPS", address: "https://dns.example:8443/dns-query", dohAddress })), null, dohAddress);
+  }
+  assert.deepEqual(serversProblem(rows({ wire: "HTTPS", address: "https://dns..example/dns-query", dohAddress: "192.0.2.53" })), { key: "next.dns.badUrl", values: { number: 1 } });
   assert.deepEqual(serversProblem(rows({ wire: "HTTPS", address: "192.0.2.53" })), { key: "next.dns.badUrl", values: { number: 1 } });
   assert.deepEqual(serversProblem(rows({ wire: "TLS", address: "192.0.2.53", tlsName: "not a name" })), { key: "next.dns.badTlsName", values: { number: 1 } });
   // A TLS name is left out, or written on a TLS row only.
@@ -147,6 +155,10 @@ test("a server is listed once, however its address is spelled, and another wire 
     [{ address: "2001:db8::1" }, { address: "[2001:0db8:0:0::1]:53" }],
     [{ wire: "TLS", address: "192.0.2.53", tlsName: "dns.example" }, { wire: "TLS", address: "192.0.2.53:853", tlsName: "dns.example " }],
     [{ wire: "HTTPS", address: "https://192.0.2.53/dns-query" }, { wire: "HTTPS", address: "https://192.0.2.53:443/dns-query" }],
+    [
+      { wire: "HTTPS", address: "https://dns.example/dns-query", dohAddress: "2001:db8::53" },
+      { wire: "HTTPS", address: "https://dns.example:443/dns-query", dohAddress: "[2001:0db8::0:53]" },
+    ],
   ];
   for (const list of repeated) assert.deepEqual(serversProblem(rows(...list)), duplicate, JSON.stringify(list));
   const distinct: Partial<DnsServerRow>[][] = [
@@ -154,6 +166,13 @@ test("a server is listed once, however its address is spelled, and another wire 
     [{ address: "192.0.2.53" }, { address: "192.0.2.53:5353" }],
     [{ wire: "TLS", address: "192.0.2.53", tlsName: "a.example" }, { wire: "TLS", address: "192.0.2.53", tlsName: "b.example" }],
     [{ wire: "HTTPS", address: "https://192.0.2.53/dns-query" }, { wire: "HTTPS", address: "https://192.0.2.53/other" }],
+    [
+      { wire: "HTTPS", address: "https://192.0.2.53/dns-query" },
+      { wire: "HTTPS", address: "https://a.example/dns-query", dohAddress: "192.0.2.53" },
+      { wire: "HTTPS", address: "https://b.example/dns-query", dohAddress: "192.0.2.53" },
+      { wire: "HTTPS", address: "https://a.example:8443/dns-query", dohAddress: "192.0.2.53" },
+      { wire: "HTTPS", address: "https://a.example/dns-query", dohAddress: "192.0.2.54" },
+    ],
     [{ address: "192.0.2.53" }, { address: "" }, { address: " " }],
   ];
   for (const list of distinct) assert.equal(serversProblem(rows(...list)), null, JSON.stringify(list));
@@ -168,17 +187,24 @@ test("a list round trips through its form, in order, with blank rows dropped", (
       { wire: "PLAIN" as const, address: "192.0.2.53", tlsName: null, url: null },
       { wire: "TLS" as const, address: "192.0.2.54", tlsName: "dns.example", url: null },
       { wire: "HTTPS" as const, address: "", tlsName: null, url: "https://192.0.2.55/dns-query" },
+      { wire: "HTTPS" as const, address: "[2001:db8::56]", tlsName: null, url: "https://dns.example:8443/dns-query" },
     ],
   };
   const form = listForm(stored);
   assert.deepEqual(listInput(form), { id: 4, name: "Quad9", servers: stored.servers });
-  assert.deepEqual(listInput({ ...form, id: null, servers: [...form.servers, { wire: "PLAIN", address: " ", tlsName: "" }] }), {
+  assert.deepEqual(listInput({ ...form, id: null, servers: [...form.servers, { wire: "PLAIN", address: " ", tlsName: "", dohAddress: "" }] }), {
     name: "Quad9",
     servers: stored.servers,
   });
+  // The IP beside a DoH URL goes only with a URL that names a host.
+  const sent = probeRequest(rows(
+    { wire: "HTTPS", address: "https://192.0.2.55/dns-query", dohAddress: "192.0.2.9" },
+    { wire: "HTTPS", address: " https://dns.example/dns-query ", dohAddress: " 192.0.2.9 " },
+  )).servers.map((server) => [server.address, server.url]);
+  assert.deepEqual(sent, [["", "https://192.0.2.55/dns-query"], ["192.0.2.9", "https://dns.example/dns-query"]]);
   // A new list starts with one row to type in, and needs a name before its servers are judged.
-  assert.deepEqual(listForm(null), { id: null, name: "", servers: [{ wire: "PLAIN", address: "", tlsName: "" }] });
-  assert.deepEqual(serverRows([]), [{ wire: "PLAIN", address: "", tlsName: "" }]);
+  assert.deepEqual(listForm(null), { id: null, name: "", servers: [{ wire: "PLAIN", address: "", tlsName: "", dohAddress: "" }] });
+  assert.deepEqual(serverRows([]), [{ wire: "PLAIN", address: "", tlsName: "", dohAddress: "" }]);
   assert.deepEqual(listProblem(listForm(null)), { key: "next.dns.lists.nameRequired" });
   assert.deepEqual(listProblem({ ...listForm(null), name: "x" }), { key: "next.dns.needsServer" });
 });
@@ -381,7 +407,7 @@ test("any change to the rows clears the results", () => {
   assert.notEqual(capabilityTable(run, form), null);
   assert.equal(capabilityTable(run, rows({ address: "192.0.2.53" }, { address: "192.0.2.55" })), null);
   assert.equal(capabilityTable(run, [...form].reverse()), null);
-  assert.equal(capabilityTable(run, [...form, { wire: "PLAIN", address: "", tlsName: "" }]), null);
+  assert.equal(capabilityTable(run, [...form, { wire: "PLAIN", address: "", tlsName: "", dohAddress: "" }]), null);
   assert.equal(capabilityTable(run, [{ ...form[0]!, wire: "TLS" }, form[1]!]), null);
   assert.equal(capabilityTable(null, form), null);
 });
@@ -399,7 +425,7 @@ test("a refused test names the form row of the server sent, and is dropped once 
   assert.equal(testRefusalRow(sent, 0, [form[0]!, form[2]!, form[1]!]), null);
   assert.equal(testRefusalRow(sent, 0, form.slice(0, 2)), null);
   // A refusal that names no server, such as one of the route, stands whatever the rows became.
-  assert.deepEqual(testRefusalRow(sent, undefined, [...form, { wire: "PLAIN", address: "", tlsName: "" }]), { row: null });
+  assert.deepEqual(testRefusalRow(sent, undefined, [...form, { wire: "PLAIN", address: "", tlsName: "", dohAddress: "" }]), { row: null });
   assert.deepEqual(testRefusalRow(sent, undefined, [form[0]!, form[2]!, form[1]!]), { row: null });
 });
 

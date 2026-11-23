@@ -776,7 +776,8 @@ One server of a list.
 type DnsServer {
 	wire: DnsWire!
 	"""
-	The server's IP, with its port when that is not the wire's own.
+	The server's IP, with its port when that is not the wire's own. For
+	HTTPS whose URL names a host, the IP dialled, with no port.
 	"""
 	address: String!
 	"""
@@ -831,7 +832,10 @@ input DnsServerInput {
 	wire: DnsWire!
 	"""
 	PLAIN and TLS: the server's IP, with a port when it is not the
-	wire's own (`192.0.2.53:5353`, `[2001:db8::53]:853`). HTTPS: unused.
+	wire's own (`192.0.2.53:5353`, `[2001:db8::53]:853`). HTTPS: the IP
+	dialled when the URL names a host (`192.0.2.53`, `[2001:db8::53]`),
+	with no port, which the URL gives; unused when the URL's host is an
+	IP. The host name is never looked up.
 	"""
 	address: String! = ""
 	"""
@@ -840,7 +844,9 @@ input DnsServerInput {
 	"""
 	tlsName: String
 	"""
-	HTTPS: the URL queries are posted to, `https://` and an IP.
+	HTTPS: the URL queries are posted to, `https://` and an IP or a host
+	name. A host name is the name the certificate is checked against and
+	the request's host; the server is dialled at `address`.
 	"""
 	url: String
 }

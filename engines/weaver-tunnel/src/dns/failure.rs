@@ -571,6 +571,7 @@ mod tests {
                     "192.0.2.53:443",
                     Wire::Https {
                         path: "/dns-query".into(),
+                        name: None,
                     },
                 ),
                 "192.0.2.53",
@@ -580,6 +581,7 @@ mod tests {
                     "192.0.2.53:8443",
                     Wire::Https {
                         path: "/other".into(),
+                        name: None,
                     },
                 ),
                 "192.0.2.53:8443",

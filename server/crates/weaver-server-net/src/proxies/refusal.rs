@@ -555,7 +555,7 @@ impl std::fmt::Display for NetworkRefusal {
                 "a DNS over HTTPS server needs an https URL with an IP address and a path"
             }
             Self::ProxyDnsUrlHostname => {
-                "a DNS over HTTPS server is named by its IP address, not a host name"
+                "a DNS over HTTPS server named by a host name also needs its IP address"
             }
             Self::ProxyDnsPlainAfterEncrypted => {
                 "a plain DNS server cannot follow an encrypted one"

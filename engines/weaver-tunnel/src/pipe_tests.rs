@@ -4166,6 +4166,7 @@ fn a_tunnel_resolver_serves_only_plain_servers_on_port_53_taken_as_sent() {
         address: SocketAddr::new(ip, 443),
         wire: crate::dns::Wire::Https {
             path: "/dns-query".into(),
+            name: None,
         },
     };
     assert!(!tunnel_resolver_serves(&[https], Trust::AsSent));

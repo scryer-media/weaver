@@ -259,7 +259,7 @@ impl<'a> Doh<'a> {
             return None;
         }
         let server = queue.session.server;
-        let Wire::Https { path } = &server.wire else {
+        let Wire::Https { path, .. } = &server.wire else {
             unreachable!("an HTTPS link is made only for an HTTPS server")
         };
         if let Some(connection) = self.two.as_mut()
@@ -509,7 +509,7 @@ async fn one_call(
     mut taken: Option<(Box<Connection>, bool)>,
     packet: Vec<u8>,
 ) -> Result<(Option<Box<Connection>>, Reply), Exchanged> {
-    let Wire::Https { path } = &server.wire else {
+    let Wire::Https { path, .. } = &server.wire else {
         unreachable!("an HTTPS query goes only to an HTTPS server")
     };
     loop {

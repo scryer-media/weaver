@@ -185,6 +185,38 @@ async fn dns_servers_come_back_as_they_were_given() {
     assert_eq!(dns["servers"][1]["address"], "192.0.2.2");
     assert_eq!(dns["servers"][1]["tlsName"], serde_json::Value::Null);
 
+    // A DNS over HTTPS URL that names a host is dialled at the IP given
+    // beside it, at the URL's port, and comes back with both. Without the
+    // IP it is refused.
+    let named = r#"
+        { wire: HTTPS, address: " 2001:db8::3 ", url: "https://dns.example:8443/dns-query" }
+    "#;
+    let (_, dns) = saved_dns(&h.execute(&save_dns(Some(id), named)).await);
+    assert_eq!(
+        dns["servers"][0]["url"],
+        "https://dns.example:8443/dns-query"
+    );
+    assert_eq!(dns["servers"][0]["address"], "[2001:db8::3]");
+    let stored = h.db.list_dns_server_lists().unwrap();
+    let stored = stored.iter().find(|list| u64::from(list.id) == id).unwrap();
+    assert_eq!(
+        serde_json::to_value(&stored.servers).unwrap()[0],
+        serde_json::json!({
+            "address": "[2001:db8::3]:8443",
+            "wire": { "Https": { "path": "/dns-query", "name": "dns.example" } }
+        })
+    );
+    let refused = h
+        .execute(&save_dns(
+            Some(id),
+            r#"{ wire: HTTPS, address: "", url: "https://dns.example/dns-query" }"#,
+        ))
+        .await;
+    assert_eq!(
+        serde_json::to_value(&refused.errors[0]).unwrap()["extensions"]["code"],
+        "PROXY_DNS_URL_HOSTNAME"
+    );
+
     // A port is read as a number, leading zeros and all; a bare or bracketed
     // v6 address keeps the wire's port.
     let spellings = r#"

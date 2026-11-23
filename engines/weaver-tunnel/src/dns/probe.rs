@@ -384,6 +384,7 @@ fn on(server: &DnsServer, kind: WireKind) -> DnsServer {
         WireKind::Tls => Wire::Tls { name: None },
         WireKind::Https => Wire::Https {
             path: "/dns-query".into(),
+            name: None,
         },
     };
     DnsServer {

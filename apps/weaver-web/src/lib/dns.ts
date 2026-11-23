@@ -82,10 +82,13 @@ export function trustChoices(who: DnsWho): readonly DnsTrust[] {
 
 // Server rows.
 
-/** One server row as the form holds it. For HTTPS, `address` holds the URL. */
-export type DnsServerRow = { wire: DnsWire; address: string; tlsName: string };
+/**
+ * One server row as the form holds it. For HTTPS, `address` holds the URL,
+ * and `dohAddress` the IP a URL that names a host is reached at.
+ */
+export type DnsServerRow = { wire: DnsWire; address: string; tlsName: string; dohAddress: string };
 
-export const blankServer = (): DnsServerRow => ({ wire: "PLAIN", address: "", tlsName: "" });
+export const blankServer = (): DnsServerRow => ({ wire: "PLAIN", address: "", tlsName: "", dohAddress: "" });
 
 /** Stored servers as form rows. The list always has a row to type in. */
 export function serverRows(servers: readonly DnsServer[]): DnsServerRow[] {
@@ -93,6 +96,7 @@ export function serverRows(servers: readonly DnsServer[]): DnsServerRow[] {
     wire: server.wire,
     address: server.wire === "HTTPS" ? (server.url ?? "") : server.address,
     tlsName: server.wire === "TLS" ? (server.tlsName ?? "") : "",
+    dohAddress: server.wire === "HTTPS" && dohProblem(server.url ?? "") === "hostname" ? server.address : "",
   }));
   return rows.length ? rows : [blankServer()];
 }
@@ -106,7 +110,8 @@ function serverInput(row: DnsServerRow): DnsServer {
   const value = row.address.trim();
   switch (row.wire) {
     case "HTTPS":
-      return { wire: row.wire, address: "", tlsName: null, url: value };
+      // The IP beside the URL is sent only for a URL that names a host.
+      return { wire: row.wire, address: dohProblem(value) === "hostname" ? row.dohAddress.trim() : "", tlsName: null, url: value };
     case "TLS":
       return { wire: row.wire, address: value, tlsName: row.tlsName.trim() || null, url: null };
     case "PLAIN":
@@ -163,27 +168,39 @@ export function isIpAddress(value: string): boolean {
   return rest.length === 0 && isIpv4(host!) && (port === undefined || isPort(port));
 }
 
+/** An IP alone, with no port: `192.0.2.53`, `2001:db8::1` or `[2001:db8::1]`. */
+export function isBareIp(value: string): boolean {
+  const bracketed = /^\[([^\]]+)\]$/.exec(value);
+  return bracketed ? isIpv6(bracketed[1]!) : isIpv4(value) || isIpv6(value);
+}
+
+/** What a DNS over HTTPS URL lacks: a valid URL (`url`), or, for one that names a host, the IP beside it (`hostname`). */
 export type DohProblem = "url" | "hostname";
 
 /**
  * What is wrong with a DNS over HTTPS address: an https URL whose host is an
- * IP, with a path. The path, its query included, holds only the characters a
- * URI path and query may carry unescaped (letters, digits and
- * `-._~!$&'()*+,;=:@/%?`), at most 2048 of them.
+ * IP or a host name, with a path. The path, its query included, holds only
+ * the characters a URI path and query may carry unescaped (letters, digits
+ * and `-._~!$&'()*+,;=:@/%?`), at most 2048 of them. A URL that names a host
+ * is otherwise valid, and answers `hostname`: it is reached at an IP given
+ * beside it, as the host name is never looked up.
  */
 export function dohProblem(value: string): DohProblem | null {
   const match = /^https:\/\/(\[[^\]\s]*\]|[^/:?#\s[\]@]+)(?::([^/]*))?(\/[^\s#]*)?$/i.exec(value);
   if (!match) return "url";
   const host = match[1]!;
   if (match[2] !== undefined && !isPort(match[2])) return "url";
+  let named = false;
   if (host.startsWith("[")) {
     if (!isIpv6(host.slice(1, -1))) return "url";
   } else if (!isIpv4(host)) {
     // A name, as against something in no address form at all.
-    return /[A-Za-z]/.test(host) ? "hostname" : "url";
+    if (!/[A-Za-z]/.test(host) || !isTlsName(host)) return "url";
+    named = true;
   }
   const path = match[3];
-  return path === undefined || path.length > MAX_DOH_PATH || !/^\/[A-Za-z0-9\-._~!$&'()*+,;=:@/%?]*$/.test(path) ? "url" : null;
+  if (path === undefined || path.length > MAX_DOH_PATH || !/^\/[A-Za-z0-9\-._~!$&'()*+,;=:@/%?]*$/.test(path)) return "url";
+  return named ? "hostname" : null;
 }
 
 /** A name a certificate could be issued for: labels of letters, digits and hyphens. */
@@ -216,12 +233,17 @@ function socketKey(host: string, port: string | undefined, defaultPort: number):
 /**
  * Which server a valid row names: its address and port, its wire, and its TLS
  * name or HTTPS path. Two rows with one key are one server, as the daemon
- * judges it; the same address over another wire is another server.
+ * judges it; the same address over another wire is another server. A DNS
+ * over HTTPS URL that names a host is the IP beside it, at the URL's port,
+ * with its path and the name.
  */
 function serverKey(row: DnsServerRow): string {
   const value = row.address.trim();
   if (row.wire === "HTTPS") {
     const match = /^https:\/\/(\[[^\]]*\]|[^/:]+)(?::(\d+))?(\/.*)$/i.exec(value)!;
+    if (dohProblem(value) === "hostname") {
+      return `HTTPS ${socketKey(row.dohAddress.trim(), match[2], 443)} ${match[3]} ${match[1]}`;
+    }
     return `HTTPS ${socketKey(match[1]!, match[2], 443)} ${match[3]}`;
   }
   const bracketed = /^\[([^\]]+)\](?::(\d+))?$/.exec(value);
@@ -251,8 +273,8 @@ export function serversProblem(servers: readonly DnsServerRow[]): DnsProblem | n
     const value = row.address.trim();
     if (row.wire === "HTTPS") {
       const problem = dohProblem(value);
-      if (problem === "hostname") return { key: "next.dns.urlHostname", values: { number } };
       if (problem === "url") return { key: "next.dns.badUrl", values: { number } };
+      if (problem === "hostname" && !isBareIp(row.dohAddress.trim())) return { key: "next.dns.dohNeedsAddress", values: { number } };
       continue;
     }
     if (!isIpAddress(value)) return { key: "next.dns.badAddress", values: { number } };

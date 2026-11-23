@@ -195,7 +195,7 @@ async fn handshake(
 ) -> Result<Tls, Exchanged> {
     let (config, name) = match &server.wire {
         Wire::Tls { name } => (&wires.dot, name.as_deref()),
-        Wire::Https { .. } => (&wires.doh, None),
+        Wire::Https { name, .. } => (&wires.doh, name.as_deref()),
         Wire::Plain => unreachable!("plain DNS keeps no connection"),
     };
     // The certificate must name the server's address, or the name given.

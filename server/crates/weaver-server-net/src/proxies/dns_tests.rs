@@ -32,6 +32,7 @@ fn tls() -> ListedWire {
 fn https() -> ListedWire {
     ListedWire::Https {
         path: "/dns-query".into(),
+        name: None,
     }
 }
 
@@ -111,7 +112,10 @@ fn a_server_list_holds_one_to_ten_well_formed_servers() {
         Err(R::ProxyDnsTlsNameInvalid)
     );
 
-    let path = |path: &str| ListedWire::Https { path: path.into() };
+    let path = |path: &str| ListedWire::Https {
+        path: path.into(),
+        name: None,
+    };
     assert_eq!(checked(vec![path("/dns-query?ct=1")]), Ok(()));
     assert_eq!(
         checked(vec![path(&format!("/{}", "a".repeat(2047)))]),
@@ -128,6 +132,27 @@ fn a_server_list_holds_one_to_ten_well_formed_servers() {
     ] {
         assert_eq!(
             checked(vec![path(&bad)]),
+            Err(R::ProxyDnsUrlInvalid),
+            "{bad:?}"
+        );
+    }
+
+    // A DoH server's name follows the TLS name rules, and a bad one is a
+    // bad URL.
+    let named = |name: &str| ListedWire::Https {
+        path: "/dns-query".into(),
+        name: Some(name.into()),
+    };
+    assert_eq!(checked(vec![named("dns.example")]), Ok(()));
+    for bad in [
+        "",
+        "-dns.example",
+        "dns example",
+        "dns..example",
+        "dns/example",
+    ] {
+        assert_eq!(
+            checked(vec![named(bad)]),
             Err(R::ProxyDnsUrlInvalid),
             "{bad:?}"
         );
@@ -159,7 +184,10 @@ fn a_server_is_listed_once_and_another_wire_is_another_server() {
     let name = |name: &str| ListedWire::Tls {
         name: Some(name.into()),
     };
-    let path = |path: &str| ListedWire::Https { path: path.into() };
+    let path = |path: &str| ListedWire::Https {
+        path: path.into(),
+        name: None,
+    };
     let checked = |servers: Vec<ListedServer>| {
         DnsServerList {
             servers,
@@ -167,7 +195,15 @@ fn a_server_is_listed_once_and_another_wire_is_another_server() {
         }
         .validate()
     };
+    let doh_named = |name: &str| ListedWire::Https {
+        path: "/dns-query".into(),
+        name: Some(name.into()),
+    };
     let repeated = [
+        vec![
+            at(443, doh_named("a.example")),
+            at(443, doh_named("a.example")),
+        ],
         vec![at(53, plain()), at(53, plain())],
         vec![at(53, plain()), at(853, tls()), at(853, tls())],
         vec![at(853, tls()), at(443, https()), at(853, tls())],
@@ -185,6 +221,11 @@ fn a_server_is_listed_once_and_another_wire_is_another_server() {
             at(853, name("a.example")),
         ],
         vec![at(443, path("/dns-query")), at(443, path("/other"))],
+        vec![
+            at(443, path("/dns-query")),
+            at(443, doh_named("a.example")),
+            at(443, doh_named("b.example")),
+        ],
     ];
     for servers in distinct {
         assert_eq!(checked(servers), Ok(()));
@@ -308,7 +349,8 @@ fn a_profile_reaches_the_engine_with_its_list() {
     assert_eq!(
         servers[2].wire,
         Wire::Https {
-            path: "/dns-query".into()
+            path: "/dns-query".into(),
+            name: None,
         }
     );
     // A list that is gone answers nothing, and never falls back to the host.
@@ -422,4 +464,40 @@ fn stored_servers_read_back_and_refuse_what_they_cannot_hold() {
     // The trust an unreleased build could store, and this one cannot.
     assert_eq!(trust_of("require_ad"), None);
     assert_eq!(who_of("host"), None);
+}
+
+// A DoH server saved before it could carry a name loads without one, and a
+// named one keeps its name through a save and into the engine.
+#[test]
+fn a_doh_server_saved_without_a_name_loads_and_a_named_one_keeps_it() {
+    let old: ListedServer = serde_json::from_str(
+        r#"{"address":"192.0.2.53:443","wire":{"Https":{"path":"/dns-query"}}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        old.wire,
+        ListedWire::Https {
+            path: "/dns-query".into(),
+            name: None,
+        }
+    );
+    let named = ListedServer {
+        address: "192.0.2.53:8443".parse().unwrap(),
+        wire: ListedWire::Https {
+            path: "/dns-query".into(),
+            name: Some("dns.example".into()),
+        },
+    };
+    let saved = serde_json::to_string(&named).unwrap();
+    assert_eq!(serde_json::from_str::<ListedServer>(&saved).unwrap(), named);
+    assert_eq!(
+        named.engine(),
+        DnsServer {
+            address: "192.0.2.53:8443".parse().unwrap(),
+            wire: Wire::Https {
+                path: "/dns-query".into(),
+                name: Some("dns.example".into()),
+            },
+        }
+    );
 }

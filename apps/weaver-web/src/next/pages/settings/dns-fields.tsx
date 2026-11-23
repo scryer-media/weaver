@@ -227,6 +227,16 @@ export function dnsServerFields(
               testId={testIds.field(`dnsServer-${index}-address`)}
               onChange={(address) => patchServer(index, { address })}
             />
+            {row.wire === "HTTPS" ? (
+              <TextField
+                label={t("next.dns.serverIp")}
+                value={row.dohAddress}
+                placeholder={t("next.dns.serverIpHint")}
+                className="w-full"
+                testId={testIds.field(`dnsServer-${index}-dohAddress`)}
+                onChange={(dohAddress) => patchServer(index, { dohAddress })}
+              />
+            ) : null}
             {row.wire === "TLS" ? (
               <TextField
                 label={t("next.dns.tlsName")}
