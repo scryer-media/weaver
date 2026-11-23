@@ -9,9 +9,10 @@ import { isActiveStatus, statusToken } from "@/lib/status-tokens";
 import { Square } from "@/next/components/chrome";
 import { CheckBox } from "@/next/components/controls";
 import { PhaseBars, useJobProgress } from "@/next/components/PhaseBars";
+import { RateCounter } from "@/next/components/RateCounter";
 import { ListRow, RowIconButton, ValueCell } from "@/next/components/rows";
 import { TagChips } from "@/next/components/Tags";
-import { EM_DASH, formatRate, formatSize } from "@/next/data/format";
+import { EM_DASH, formatSize } from "@/next/data/format";
 
 import { statusColor, WV } from "@/next/data/palette";
 import { useDownloadRate } from "@/next/data/use-download-rate";
@@ -147,21 +148,27 @@ export const DownloadRow = memo(function DownloadRow({
                   {hold}
                 </span>
               ) : rate > 0 ? (
-                <span className="truncate font-wv-mono text-[10px] tabular-nums text-wv-muted">
-                  {formatRate(rate)}
-                </span>
+                <RateCounter arrow="down" rate={rate} title={t("next.torrent.downloadSpeed")} className="justify-start" />
               ) : null}
             </span>
           </div>
           {seedingColumn ? (
             // Fixed in width, ratio and rate each in its own right-aligned slot,
             // so the columns after it hold still as the numbers change.
-            <ValueCell width={0} className="w-[20ch] flex-none tabular-nums">
+            <ValueCell width={0} className="w-[18ch] flex-none tabular-nums">
               {seeding === null ? null : (
-                <span data-testid={torrentIds.queueRowSeeding} title={t("next.torrent.seedingCell")}>
+                <span
+                  data-testid={torrentIds.queueRowSeeding}
+                  title={t("next.torrent.seedingCell")}
+                  className="inline-flex items-baseline"
+                >
                   <span className="inline-block w-[6ch] text-right">{seeding.ratio.toFixed(2)}</span>
-                  {" · ↑ "}
-                  <span className="inline-block w-[9ch] text-right">{formatRate(seeding.uploadBps)}</span>
+                  <RateCounter
+                    arrow="up"
+                    rate={seeding.uploadBps}
+                    title={t("next.torrent.uploadSpeed")}
+                    className="ml-[2ch]"
+                  />
                 </span>
               )}
             </ValueCell>

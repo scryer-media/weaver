@@ -17,6 +17,7 @@ import { useTorrentsEnabled } from "../data/use-torrents-shown";
 import { splitSpeed } from "../data/format";
 import { Eyebrow } from "../components/chrome";
 import { Icon, type IconName } from "../components/icons";
+import { RateCounter } from "../components/RateCounter";
 import { useSpeedLimitDialog, useSpeedLimitInForce } from "../features/SpeedLimitDialog";
 import { useNetworkingWorkspace } from "../features/networking/data";
 import { useFlowDns } from "../features/networking/dns-choices";
@@ -608,7 +609,6 @@ export const NetworkBlock = memo(function NetworkBlock() {
   );
 });
 
-/** One named rate of the throughput block: its name, then the figure and its unit. */
 /**
  * One class's rates on a line: what it downloads, then what it uploads. Each
  * counter keeps three places and a fixed width, so the columns hold still as the
@@ -626,9 +626,9 @@ function RailRates({
   return (
     <>
       <dt className="whitespace-nowrap font-wv-mono text-[10.5px] text-wv-muted">{label}</dt>
-      <RailCounter arrow="down" {...down} />
+      <RateCounter as="dd" arrow="down" {...down} />
       {up ? (
-        <RailCounter arrow="up" {...up} />
+        <RateCounter as="dd" arrow="up" {...up} />
       ) : (
         <dd className="m-0 text-right font-wv-mono text-[11px] text-wv-faint" aria-hidden>
           —
@@ -636,43 +636,6 @@ function RailRates({
       )}
     </>
   );
-}
-
-function RailCounter({ arrow, rate, title }: { arrow: "down" | "up"; rate: number; title: string }) {
-  const { value, unit } = fixedSpeed(rate);
-  return (
-    <dd className="m-0 flex items-baseline justify-end" title={title} aria-label={title}>
-      <span
-        className={cn(
-          "inline-block w-[3ch] text-right font-wv-mono text-[12px] font-semibold tabular-nums leading-none",
-          rate > 0 ? "text-wv-fg" : "text-wv-muted",
-        )}
-      >
-        {value}
-      </span>
-      <span className="ml-[2px] font-wv-mono text-[9.5px] text-wv-muted">{unit}</span>
-      <span aria-hidden className="ml-[4px] font-wv-mono text-[12px] font-semibold leading-none text-wv-fg">
-        {arrow === "down" ? "↓" : "↑"}
-      </span>
-    </dd>
-  );
-}
-
-/**
- * A rate in three places and its unit: one decimal below ten (`6.7`), whole
- * above (`58`, `999`). The scale starts at KB/s, so every unit is four letters
- * wide and nothing shifts as it climbs.
- */
-function fixedSpeed(bytesPerSecond: number): { value: string; unit: string } {
-  const units = ["KB/s", "MB/s", "GB/s", "TB/s"];
-  let scaled = Number.isFinite(bytesPerSecond) && bytesPerSecond > 0 ? bytesPerSecond / 1024 : 0;
-  let index = 0;
-  // Past what rounds to 999, the next unit, so the value never needs a fourth place.
-  while (scaled >= 999.5 && index < units.length - 1) {
-    scaled /= 1024;
-    index += 1;
-  }
-  return { value: scaled < 9.95 ? scaled.toFixed(1) : Math.round(scaled).toFixed(0), unit: units[index] };
 }
 
 /** The rail's last block: the sponsor link. */

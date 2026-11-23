@@ -140,7 +140,7 @@ test("the Add dialog takes a magnet and a .torrent, and the queue tags and seeds
     const row = queueRow(page, name);
     await expect(row.getByTestId(torrentIds.queueRowProtocol("TORRENT"))).toBeVisible();
     // Seeding shows once the download is whole: the ratio and the upload rate.
-    await expect(row.getByTestId(torrentIds.queueRowSeeding)).toHaveText(/^\d+\.\d{2} · ↑ /);
+    await expect(row.getByTestId(torrentIds.queueRowSeeding)).toHaveText(/^\d+\.\d{2}\d+(\.\d)?[KMGT]B\/s↑$/);
   }
 });
 
