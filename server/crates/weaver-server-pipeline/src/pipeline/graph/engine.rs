@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use weaver_graph::slots::{Admissions, Asked, AskerId, Slots, Ticket};
-use weaver_graph::{Emit, Extraction, Marks, NodeId, Why};
+use weaver_graph::{Emit, Extraction, Marks, MemberId, NodeId, Why};
 use weaver_server_disk::operations::disk::writer::{Credit, Stand};
 
 pub use self::pool::DecodePool;
@@ -377,9 +377,23 @@ enum Life {
     Stopped { generation: Option<u64> },
 }
 
+// What a run makes, as its object said when the run started, kept on the
+// run for its life: through its end, until it is forgotten or starts again.
+// Every decision about what the run made reads this, never the object as it
+// stands then, so none changes meaning while the object is out on loan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Made {
+    // Every member: an engine, which places nothing itself.
+    Every,
+    // Only these: an object that places the rest itself.
+    Only(BTreeSet<MemberId>),
+}
+
 #[derive(Debug)]
 struct Run {
     life: Life,
+    // What the run makes, from its start (`Runs::record`).
+    made: Option<Made>,
     ticket: Option<Ticket>,
     // The reader the run is out with, through which its owner stops it.
     volumes: Option<Arc<RunVolumes>>,
@@ -421,6 +435,7 @@ impl Run {
     fn queued() -> Self {
         Self {
             life: Life::Queued,
+            made: None,
             ticket: None,
             volumes: None,
             reserved: 0,
@@ -689,6 +704,31 @@ impl Runs {
             .iter()
             .filter(|(_, run)| matches!(run.life, Life::Running { .. }))
             .map(|(node, _)| *node)
+    }
+
+    // What the node's run makes, as its object said as it started.
+    pub fn record(&mut self, node: NodeId, made: Made) {
+        if let Some(run) = self.runs.get_mut(&node) {
+            run.made = Some(made);
+        }
+    }
+
+    // What the node's run makes, from its start; `None` before one started.
+    pub fn made(&self, node: NodeId) -> Option<&Made> {
+        self.runs.get(&node)?.made.as_ref()
+    }
+
+    // The node's object is out on loan, as the run is to start: a run that
+    // has not started gives back its slot and its memory and goes, to be
+    // asked again once the object is back, which marks the node
+    // (`Tree::take_back_worked`). A run that started stands. Returns the
+    // nodes that may start now.
+    pub fn defer(&mut self, node: NodeId, limit: usize) -> Vec<NodeId> {
+        let waits = self
+            .runs
+            .get(&node)
+            .is_some_and(|run| matches!(run.life, Life::Queued | Life::Starved { .. }));
+        self.forget(if waits { vec![node] } else { Vec::new() }, limit)
     }
 
     // The generation the node's run started under, once it started.

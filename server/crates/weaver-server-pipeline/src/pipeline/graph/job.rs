@@ -901,6 +901,19 @@ impl GraphJob {
         self.tree.lend_for_test(node)
     }
 
+    // The object lent by `lend_object_for_test` comes back, as one back
+    // from its work with nothing said: what waited is heard and the runs
+    // are stepped.
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    pub fn take_back_for_test(
+        &mut self,
+        node: NodeId,
+        object: Box<dyn weaver_graph::object::Object>,
+        limit: usize,
+    ) -> Result<(), GraphError> {
+        self.took_back_worked(node, object, Vec::new(), limit)
+    }
+
     #[cfg(any(test, feature = "pipeline-test-fixtures"))]
     pub fn namespace_mut(&mut self, node: NodeId) -> Option<&mut Namespace> {
         self.tree.namespace_mut(node)

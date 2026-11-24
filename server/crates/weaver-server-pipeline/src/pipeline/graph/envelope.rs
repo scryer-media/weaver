@@ -321,6 +321,15 @@ impl Envelopes {
         &self.given
     }
 
+    // The run reading the node's shelf starts over over the same bytes, and
+    // the node is marked as changed. A node with no shelf has no run.
+    pub fn restart(&mut self, node: NodeId) {
+        if let Some(shelf) = self.shelves.get(&node) {
+            shelf.restart();
+            self.marks.mark(node);
+        }
+    }
+
     // The node's shelf, made empty the first time it is asked for.
     pub fn shelf(&mut self, node: NodeId) -> Arc<Shelf> {
         let dir = &self.working_dir;

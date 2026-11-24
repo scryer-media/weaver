@@ -108,6 +108,7 @@ pub(crate) mod pipeline {
 
                 mod tests;
             }
+            mod hybrid_loan_tests;
             mod loan_tests;
             mod verification_tests;
         }
