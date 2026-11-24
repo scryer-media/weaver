@@ -16,7 +16,7 @@ use weaver_graph::{Budget, Emit, MemberId, Object, VolumeIndex, Volumes, Why};
 use super::super::claim;
 use super::owner::Owner;
 use super::writer::{Codec, Item, Options, Version, write};
-use super::{fixture, store, unrar};
+use super::{PASSWORD, fixture, store, unrar};
 use crate::engine::Format;
 use crate::rar_engine::{Rar, member_window};
 use crate::testing::payload;
@@ -48,22 +48,27 @@ impl Volumes for Whole {
 }
 
 pub(super) fn facts(bytes: &[u8]) -> RarVolumeFacts {
-    claim::headers(bytes, None, Arc::new(KdfCache::new())).expect("a RAR volume")
+    opened(bytes, None)
 }
 
-// The data bytes of the set's stored file parts: what the store streams
-// and so never shelves.
-fn stored_data(volumes: &[Vec<u8>]) -> u64 {
+fn opened(bytes: &[u8], password: Option<&str>) -> RarVolumeFacts {
+    claim::headers(bytes, password, Arc::new(KdfCache::new())).expect("a RAR volume")
+}
+
+// The bytes of the set's stored files: what the store streams and so never
+// shelves. An enciphered one's parts carry its cipher padding past its
+// size, which the store keeps on the shelf with the headers.
+fn stored_data(volumes: &[Vec<u8>], password: Option<&str>) -> u64 {
     volumes
         .iter()
         .map(|bytes| {
-            let facts = facts(bytes);
+            let facts = opened(bytes, password);
             assert!(facts.services.iter().all(|service| service.data_size == 0));
             facts
                 .members
                 .iter()
-                .filter(|member| member.compression_method == 0)
-                .map(|member| member.data_size)
+                .filter(|member| member.compression_method == 0 && !member.split_before)
+                .map(|member| member.unpacked_size.expect("a stated size"))
                 .sum::<u64>()
         })
         .sum()
@@ -158,10 +163,10 @@ pub(super) fn trouble(owner: &Owner) -> Vec<&Emit> {
 
 // The set's members in archive order, a part that carries one on joined to
 // it: each one's name and whether it is compressed.
-fn members(volumes: &[Vec<u8>]) -> Vec<(String, bool)> {
+fn members(volumes: &[Vec<u8>], password: Option<&str>) -> Vec<(String, bool)> {
     let mut out: Vec<(String, bool)> = Vec::new();
     for bytes in volumes {
-        let facts = facts(bytes);
+        let facts = opened(bytes, password);
         let mut parts: Vec<_> = facts.members.iter().collect();
         parts.sort_by_key(|part| part.order);
         for part in parts {
@@ -230,11 +235,11 @@ pub(super) fn mixed_items(version: Version) -> Vec<Item> {
 // holds, which is the set less its stored file data. Every member then
 // stands as unrar extracts it, and each made member as the RAR engine says
 // it, bytes, checksum and close alike.
-fn check(label: &str, volumes: Vec<Vec<u8>>, password: Option<&str>) -> Owner {
-    let listed = members(&volumes);
+pub(super) fn check(label: &str, volumes: Vec<Vec<u8>>, password: Option<&str>) -> Owner {
+    let listed = members(&volumes, password);
     let extracted = unrar(&volumes, password);
     let total: u64 = volumes.iter().map(|v| v.len() as u64).sum();
-    let stored = stored_data(&volumes);
+    let stored = stored_data(&volumes, password);
     let mut owner = Owner::named(store(), volumes.clone());
     if let Some(password) = password {
         owner.offer(password);
@@ -315,7 +320,7 @@ fn a_real_mixed_set_runs_its_compressed_member_from_the_shelf() {
         "extraction_profiles/rar4_multifile_lz.rar",
     ] {
         let bytes = fixture(name);
-        let listed = members(std::slice::from_ref(&bytes));
+        let listed = members(std::slice::from_ref(&bytes), None);
         assert!(!listed[0].1, "{name}: a stored member first");
         assert!(listed.iter().any(|(_, compressed)| *compressed), "{name}");
         check(name, vec![bytes], None);
@@ -360,7 +365,10 @@ fn a_mixed_set_faces_as_the_engine_would_for_its_compressed_members() {
             })
             .collect();
         assert_eq!(windows.len(), 1, "{version:?}");
-        assert_eq!(face.reserve(), crate::engine::reserve::<Rar>(windows.clone()));
+        assert_eq!(
+            face.reserve(),
+            crate::engine::reserve::<Rar>(windows.clone())
+        );
         assert_eq!(face.reserve(), Some(Rar::reserve().max(windows[0])));
         assert!(face.lends());
         assert_eq!(face.lends(), Rar::lends());
@@ -448,4 +456,85 @@ fn a_scoped_run_announces_nothing() {
         written.iter().all(|member| *member == MemberId(1)),
         "{written:?}"
     );
+}
+
+// Files enciphered under a password: a compressed one AES keys is made, as
+// a compressed one in the clear is, beside stored files in the clear or
+// enciphered, and with the headers enciphered too. The run decodes it
+// under the password the job offered, as the engine does.
+#[test]
+fn an_enciphered_compressed_member_is_made_and_decodes_under_the_password() {
+    for version in [Version::Rar5, Version::Rar4] {
+        for (label, clear, headers) in [
+            ("beside stored files in the clear", vec![0, 2, 3], false),
+            ("beside enciphered stored files", vec![], false),
+            ("headers enciphered", vec![], true),
+        ] {
+            for split in [None, Some(6_000)] {
+                let mut options = Options::new(version);
+                options.split = split;
+                options.password = Some(PASSWORD);
+                options.encrypt_headers = headers;
+                options.clear = clear.clone();
+                let volumes = write(&mixed_items(version), &options);
+                check(
+                    &format!("{version:?} {label} {split:?}"),
+                    volumes,
+                    Some(PASSWORD),
+                );
+            }
+        }
+    }
+}
+
+// A wrong password the job offered first: the run asks for another, as
+// the engine's does, and the right one, offered next, decodes the member.
+// The stored files in the clear never wait on it.
+#[test]
+fn an_enciphered_compressed_member_asks_again_after_a_wrong_password() {
+    for version in [Version::Rar5, Version::Rar4] {
+        let mut options = Options::new(version);
+        options.password = Some(PASSWORD);
+        options.clear = vec![0, 2, 3];
+        let volumes = write(&mixed_items(version), &options);
+        let (_, engine_said) = engine_run(&volumes, Some("not-the-password"));
+        assert_eq!(
+            engine_said.last(),
+            Some(&Emit::NeedsPassword),
+            "{version:?}"
+        );
+
+        let mut owner = Owner::named(store(), volumes.clone());
+        owner.offer("not-the-password");
+        owner.whole(4096);
+        assert!(
+            trouble(&owner).is_empty(),
+            "{version:?}: {:?}",
+            trouble(&owner)
+        );
+        for name in ["alpha.mkv", "beta.mkv", "gamma.srt"] {
+            assert!(owner.member(name).closed, "{version:?} {name}");
+        }
+        let before = owner.said.len();
+        assert!(owner.run().is_empty());
+        // What the engine says of the member, under the store's id.
+        assert_eq!(owner.said[before..], engine_said[..], "{version:?}");
+        assert!(!owner.member("notes.nfo").closed, "{version:?}");
+
+        owner.said.clear();
+        owner.offer(PASSWORD);
+        assert!(owner.run().is_empty());
+        assert!(
+            trouble(&owner).is_empty(),
+            "{version:?}: {:?}",
+            trouble(&owner)
+        );
+        let (engine, _) = engine_run(&volumes, Some(PASSWORD));
+        assert_eq!(
+            run_said(&owner, "notes.nfo"),
+            engine["notes.nfo"],
+            "{version:?}"
+        );
+        assert!(owner.member("notes.nfo").closed);
+    }
 }

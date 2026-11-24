@@ -73,6 +73,8 @@ pub(crate) struct Options {
     // The item written with a compression method instead of store.
     pub(crate) compressed: Option<usize>,
     pub(crate) recovery: bool,
+    // The items written in the clear in a set whose files are enciphered.
+    pub(crate) clear: Vec<usize>,
     // How many recovery headers each volume carries when it has a record.
     pub(crate) recovery_headers: usize,
     // RAR5: a password check value, and checksums keyed by the hash key.
@@ -93,6 +95,7 @@ impl Options {
             solid: false,
             compressed: None,
             recovery: false,
+            clear: Vec::new(),
             recovery_headers: 1,
             check: true,
             hash_key: false,
@@ -143,6 +146,8 @@ struct Part<'a> {
     before: bool,
     after: bool,
     codec: Option<Codec>,
+    // Written without the password in a set whose files have one.
+    clear: bool,
 }
 
 struct Keys5 {
@@ -161,8 +166,8 @@ trait Layout {
     // header for RAR4, after the signature for RAR5.
     fn crypt_header(&self) -> Vec<u8>;
     fn seal_header(&self, header: Vec<u8>, index: usize) -> Vec<u8>;
-    fn cipher(&self, plain: &[u8]) -> Vec<u8>;
-    fn keyed(&self, crc: u32) -> u32;
+    fn cipher(&self, plain: &[u8], clear: bool) -> Vec<u8>;
+    fn keyed(&self, crc: u32, clear: bool) -> u32;
 }
 
 struct Rar5<'a> {
@@ -224,7 +229,7 @@ impl Rar5<'_> {
         body.extend(vint(part.name.len() as u64));
         body.extend_from_slice(part.name.as_bytes());
         let mut extra = Vec::new();
-        if self.keys.is_some() && kind == 2 && !part.dir {
+        if self.keys.is_some() && kind == 2 && !part.dir && !part.clear {
             let mut flags = 0;
             if self.options.check {
                 flags |= 0x1;
@@ -297,6 +302,7 @@ impl Layout for Rar5<'_> {
                 before: false,
                 after: false,
                 codec: None,
+                clear: false,
             },
         )
     }
@@ -326,16 +332,16 @@ impl Layout for Rar5<'_> {
         out
     }
 
-    fn cipher(&self, plain: &[u8]) -> Vec<u8> {
+    fn cipher(&self, plain: &[u8], clear: bool) -> Vec<u8> {
         match &self.keys {
-            Some(keys) => encipher(&keys.key, IV5, plain),
-            None => plain.to_vec(),
+            Some(keys) if !clear => encipher(&keys.key, IV5, plain),
+            _ => plain.to_vec(),
         }
     }
 
-    fn keyed(&self, crc: u32) -> u32 {
+    fn keyed(&self, crc: u32, clear: bool) -> u32 {
         match (&self.keys, self.options.hash_key) {
-            (Some(keys), true) => unrar_rs::convert_crc32_to_mac(crc, &keys.hash_key),
+            (Some(keys), true) if !clear => unrar_rs::convert_crc32_to_mac(crc, &keys.hash_key),
             _ => crc,
         }
     }
@@ -368,7 +374,8 @@ impl Rar4<'_> {
         if part.dir {
             flags |= 0xe0;
         }
-        let encrypted = self.options.password.is_some() && kind == 0x74 && !part.dir;
+        let encrypted =
+            self.options.password.is_some() && kind == 0x74 && !part.dir && !part.clear;
         if encrypted {
             flags |= 0x4 | 0x400;
         }
@@ -438,6 +445,7 @@ impl Layout for Rar4<'_> {
                 before: false,
                 after: false,
                 codec: None,
+                clear: false,
             },
         )
     }
@@ -460,17 +468,17 @@ impl Layout for Rar4<'_> {
         out
     }
 
-    fn cipher(&self, plain: &[u8]) -> Vec<u8> {
+    fn cipher(&self, plain: &[u8], clear: bool) -> Vec<u8> {
         match self.options.password {
-            Some(_) => {
+            Some(_) if !clear => {
                 let (key, iv) = self.keys(&SALT4);
                 encipher(&key, iv, plain)
             }
-            None => plain.to_vec(),
+            _ => plain.to_vec(),
         }
     }
 
-    fn keyed(&self, crc: u32) -> u32 {
+    fn keyed(&self, crc: u32, _clear: bool) -> u32 {
         crc
     }
 }
@@ -590,8 +598,9 @@ pub(crate) fn write(items: &[Item], options: &Options) -> Vec<Vec<u8>> {
         let codec = packed
             .map(|(_, codec)| codec)
             .or((options.compressed == Some(index)).then_some(Codec::MARKED));
-        let stream = layout.cipher(packed.map_or(plain, |(packed, _)| packed));
-        let whole = layout.keyed(crc32(plain));
+        let clear = options.clear.contains(&index);
+        let stream = layout.cipher(packed.map_or(plain, |(packed, _)| packed), clear);
+        let whole = layout.keyed(crc32(plain), clear);
         let mut offset = 0;
         loop {
             if volumes.room() == 0 && offset < stream.len() {
@@ -609,11 +618,12 @@ pub(crate) fn write(items: &[Item], options: &Options) -> Vec<Vec<u8>> {
                 crc: if last {
                     whole
                 } else {
-                    layout.keyed(crc32(data))
+                    layout.keyed(crc32(data), clear)
                 },
                 before: offset > 0,
                 after: !last,
                 codec,
+                clear,
             };
             let header = layout.file(&part);
             volumes.header(header, data);

@@ -653,6 +653,22 @@ impl Owner {
         let engine = self.object.engine_mut().expect("a mixed set runs");
         let view: Arc<dyn Volumes> = shelved.clone();
         engine.start().run(view, &mut sink, Budget::default());
+        // A run's retract starts its member over, as the tree does: the
+        // member stays the store's, with nothing written.
+        let (retracts, emits): (Vec<Emit>, Vec<Emit>) = emits
+            .into_iter()
+            .partition(|emit| matches!(emit, Emit::Retract(_)));
+        for emit in retracts {
+            if let Emit::Retract(member) = emit
+                && let Some(got) = self.members.get_mut(&member.0)
+            {
+                got.bytes.clear();
+                got.coverage = Coverage::default();
+                got.closed = false;
+            }
+            self.log.push(emit.clone());
+            self.said.push(emit);
+        }
         self.apply(emits);
         shelved.strays.lock().unwrap().clone()
     }
