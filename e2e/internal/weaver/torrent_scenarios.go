@@ -193,7 +193,7 @@ func torrentScenarios() []torrentScenario {
 		{
 			Name: "pause-all-torrents",
 			Asserts: []string{
-				"pauseTorrents holds every torrent PAUSED and reads torrentsPaused, with the usenet queue not paused",
+				"pauseTorrents holds the other torrent QUEUED, stated HELD_MANUAL, keeps the one paused on its own PAUSED, and reads torrentsPaused, with the usenet queue not paused",
 				"resumeTorrents lifts the hold: the torrent paused on its own stays PAUSED, the other seeds again",
 				"the client facade's torrents/stop hashes=all is the same hold: every torrent reads stoppedUP and torrentsPaused is true",
 				"torrents/start hashes=all lifts it: the other seeds again and the torrent paused on its own still reads stoppedUP",
@@ -806,6 +806,10 @@ func (lane *torrentLane) proxiedScenario(slug, route string, options submitOptio
 	for _, event := range announces {
 		if event.IP != lane.proxyIP {
 			return done, fmt.Errorf("the tracker heard %s from %s, not the proxy %s", event.Event, event.IP, lane.proxyIP)
+		}
+		// A proxy route takes no connections, so it announces port 0.
+		if event.Port != 0 {
+			return done, fmt.Errorf("the tracker heard %s on port %d through a route that does not listen, want 0", event.Event, event.Port)
 		}
 	}
 	events, _, err := lane.proxyEvents(proxyMark)
@@ -1642,6 +1646,12 @@ func (lane *torrentLane) waitTorrentsHold(describe string, want bool) error {
 
 func paused(view *torrentView) bool { return view != nil && view.State == "PAUSED" }
 
+// heldManual reads a torrent the operator's torrents hold keeps in the
+// queue: QUEUED, stated HELD_MANUAL. Its own pause is not touched.
+func heldManual(view *torrentView) bool {
+	return view != nil && view.State == "QUEUED" && view.Stated != nil && *view.Stated == "HELD_MANUAL"
+}
+
 func scenarioPauseAllTorrents(lane *torrentLane, evidence map[string]any) error {
 	own, err := lane.downloadOnly("hold-own", submitOptions{})
 	if err != nil {
@@ -1668,7 +1678,7 @@ func scenarioPauseAllTorrents(lane *torrentLane, evidence map[string]any) error 
 	if err := lane.mutateBool("pauseTorrents", "", nil); err != nil {
 		return fmt.Errorf("pauseTorrents: %w", err)
 	}
-	held, err := lane.waitTorrent(only.ID, "the hold pauses hold-only", paused)
+	held, err := lane.waitTorrent(only.ID, "the hold queues hold-only, held by the operator", heldManual)
 	evidence["held"] = held
 	if err != nil {
 		return err

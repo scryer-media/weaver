@@ -212,9 +212,11 @@ test("Pause torrents on the Downloads page holds every torrent and leaves the qu
 
   await page.getByTestId(torrentIds.pauseTorrents).click();
   await expect(page.getByTestId(torrentIds.resumeTorrents)).toBeVisible();
+  // The hold keeps each torrent in the queue, not paused on its own: QUEUED,
+  // with its own Pause button.
   for (const row of rows) {
-    await expect(row.getByTestId(torrentIds.queueRowStatus("PAUSED"))).toBeVisible();
-    await expect(row.getByTestId(torrentIds.queueRowResume)).toBeVisible();
+    await expect(row.getByTestId(torrentIds.queueRowStatus("QUEUED"))).toBeVisible();
+    await expect(row.getByTestId(torrentIds.queueRowPause)).toBeVisible();
   }
   // The torrents' hold is its own: the queue's pause still reads unpaused.
   await expect(page.getByTestId(testIds.queuePauseAll)).toBeVisible();
