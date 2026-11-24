@@ -538,3 +538,124 @@ fn an_enciphered_compressed_member_asks_again_after_a_wrong_password() {
         assert!(owner.member("notes.nfo").closed);
     }
 }
+
+// A nameless RAR4 set whose end records state no number: its middle
+// volumes are held where their links put them, on trust. Once the run can
+// start, every volume it reads holds a part of a member, stored or made,
+// and a volume the layout placed a part in is never given back or moved,
+// so nothing the run read moves under it. A volume held past the set's
+// end, which holds none, still goes back, and the run is untouched.
+#[test]
+fn a_nameless_rar4_volume_the_run_reads_stays_where_it_was_laid() {
+    let mut options = Options::new(Version::Rar4);
+    options.split = Some(6_000);
+    let volumes = write(&mixed_items(Version::Rar4), &options);
+    assert!(volumes.len() >= 10);
+    let named: Vec<(String, Vec<u8>)> = volumes
+        .iter()
+        .enumerate()
+        .map(|(index, bytes)| (format!("{:x}3c9e1f", index * 7 + 11), bytes.clone()))
+        .collect();
+    let mut owner = Owner::new(store(), named);
+    owner.whole(4096);
+    assert!(trouble(&owner).is_empty(), "{:?}", trouble(&owner));
+    assert!(owner.object.engine().is_some());
+    let on_trust: Vec<VolumeIndex> = owner
+        .object
+        .volumes
+        .iter()
+        .filter(|(_, found)| super::super::layout::on_trust(found))
+        .map(|(index, _)| *index)
+        .collect();
+    assert!(on_trust.len() >= 8, "{on_trust:?}");
+    let mut out = Vec::new();
+    owner
+        .object
+        .give_back_held(owner.object.volumes.keys().copied().collect(), &mut out);
+    assert!(out.is_empty(), "{out:?}");
+    assert!(owner.run().is_empty());
+    for (name, bytes) in unrar(&volumes, None) {
+        let got = owner.member(&name);
+        assert!(got.closed && got.bytes == bytes, "{name}");
+    }
+}
+
+// A repaired header that names the compressed member otherwise than the
+// bytes first posted did: the store retracts it and what follows it, never
+// the stored member before it, and announces it again as made; the run
+// then makes it under its repaired name. Plain and enciphered headers.
+#[test]
+fn a_repaired_header_of_a_made_member_retracts_it_and_the_run_makes_it_again() {
+    for version in [Version::Rar5, Version::Rar4] {
+        for headers in [false, true] {
+            let mut options = Options::new(version);
+            if headers {
+                options.password = Some(PASSWORD);
+                options.encrypt_headers = true;
+            }
+            let label = format!("{version:?} headers enciphered {headers}");
+            let real = write(&mixed_items(version), &options).remove(0);
+            let mut other = mixed_items(version);
+            let Item::Packed { name, .. } = &mut other[1] else {
+                unreachable!()
+            };
+            *name = "notez.nfo";
+            let wrong = write(&other, &options).remove(0);
+            assert_eq!(real.len(), wrong.len());
+            let length = real.len() as u64;
+            let mut owner = Owner::named(store(), vec![real.clone()]);
+            if headers {
+                owner.offer(PASSWORD);
+            }
+            owner.deliver_as(
+                0,
+                weaver_graph::ByteRange::new(0, length),
+                weaver_graph::Provenance::Damaged,
+                Some(&wrong),
+            );
+            owner.close(0);
+            // RAR4 headers enciphered in bytes that came damaged lay no
+            // member until they are repaired, so no run starts before.
+            let ran = !(headers && version == Version::Rar4);
+            assert_eq!(owner.object.engine().is_some(), ran, "{label}");
+            if ran {
+                assert!(owner.run().is_empty(), "{label}");
+                assert!(owner.member("notez.nfo").closed, "{label}");
+                let made = owner.object.engine().expect("a mixed set runs");
+                assert!(made.makes(MemberId(1)), "{label}");
+            }
+
+            // The header comes again repaired, and the rest after it.
+            let first = real.iter().zip(&wrong).position(|(a, b)| a != b).unwrap() as u64;
+            let header = weaver_graph::ByteRange::new(first.saturating_sub(64), first + 64);
+            owner.said.clear();
+            owner.deliver_as(0, header, weaver_graph::Provenance::Repaired, None);
+            owner.deliver_as(
+                0,
+                weaver_graph::ByteRange::new(0, length),
+                weaver_graph::Provenance::Repaired,
+                None,
+            );
+            owner.close(0);
+            assert_eq!(
+                owner.said.contains(&Emit::Retract(MemberId(1))),
+                ran,
+                "{label}: {:?}",
+                owner.said
+            );
+            assert!(!owner.said.contains(&Emit::Retract(MemberId(0))), "{label}");
+            assert!(
+                owner
+                    .object
+                    .engine()
+                    .expect("still mixed")
+                    .makes(MemberId(1))
+            );
+            assert!(owner.run().is_empty(), "{label}");
+            for (name, bytes) in unrar(&[real.clone()], options.password) {
+                let got = owner.member(&name);
+                assert!(got.closed && got.bytes == bytes, "{label}: {name}");
+            }
+        }
+    }
+}
