@@ -434,3 +434,357 @@ async fn a_mixed_7z_whose_end_header_is_repaired_by_par2_delivers_every_member()
     assert_members(&graph, &files);
     assert_fetched_once(&graph);
 }
+
+// A mixed 7z below another object, and archives below a mixed 7z. Below the
+// root only release layers open, and a container whose name says an archive
+// is one: what it holds lands in the folder it sat in, here the job's.
+mod nested {
+    use std::collections::BTreeMap;
+    use std::io::Write;
+
+    use ::zip::ZipWriter;
+    use ::zip::write::SimpleFileOptions;
+    use weaver_graph::NodeId;
+
+    use super::*;
+
+    // What every run said, by the node it ran for.
+    type Heard = Arc<Mutex<Vec<(NodeId, u64, String)>>>;
+
+    fn heard(scenario: Scenario) -> (Scenario, Heard) {
+        let heard = Heard::default();
+        let kept = Arc::clone(&heard);
+        let scenario = scenario.on_run_message(move |node, generation, message| {
+            kept.lock().unwrap().push((node, generation, message));
+        });
+        (scenario, heard)
+    }
+
+    // The generations each node's runs emitted under, by node.
+    fn generations(heard: &Heard) -> BTreeMap<NodeId, BTreeSet<u64>> {
+        let mut by_node: BTreeMap<NodeId, BTreeSet<u64>> = BTreeMap::new();
+        for (node, generation, message) in heard.lock().unwrap().iter() {
+            if message.starts_with("Emit(") || message.starts_with("Paid(") {
+                by_node.entry(*node).or_default().insert(*generation);
+            }
+        }
+        by_node
+    }
+
+    fn zip_of(options: SimpleFileOptions, entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, bytes) in entries {
+            writer.start_file(*name, options).unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn stored_zip() -> SimpleFileOptions {
+        SimpleFileOptions::default().compression_method(::zip::CompressionMethod::Stored)
+    }
+
+    fn deflated_zip() -> SimpleFileOptions {
+        SimpleFileOptions::default().compression_method(::zip::CompressionMethod::Deflated)
+    }
+
+    // One folder of a 7z: its methods and the entries it holds.
+    type Folder<'a> = (Vec<EncoderConfiguration>, Vec<(&'a str, Vec<u8>)>);
+
+    // A 7z of `folders`.
+    fn sevenz(folders: &[Folder<'_>]) -> Vec<u8> {
+        let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+        for (methods, entries) in folders {
+            writer.set_content_methods(methods.clone());
+            writer
+                .push_archive_entries(
+                    entries
+                        .iter()
+                        .map(|(name, _)| ArchiveEntry::new_file(name))
+                        .collect(),
+                    entries
+                        .iter()
+                        .map(|(_, bytes)| SourceReader::new(Cursor::new(bytes.clone())))
+                        .collect(),
+                )
+                .unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    // Every file, every byte as written, and nothing else.
+    fn assert_delivers(graph_files: &BTreeMap<String, Vec<u8>>, files: &[(&str, Vec<u8>)]) {
+        let mut names: Vec<String> = files.iter().map(|(name, _)| delivered(name)).collect();
+        names.sort();
+        assert_eq!(
+            graph_files.keys().cloned().collect::<Vec<_>>(),
+            names,
+            "delivered names"
+        );
+        for (name, bytes) in files {
+            assert!(graph_files[&delivered(name)] == *bytes, "{name} bytes");
+        }
+    }
+
+    // A1: the mixed 7z a stored member of a zip. The zip streams it; the
+    // 7z store below streams its stored members and keeps only the coded
+    // pack and headers on its shelf, as at the root.
+    #[tokio::test]
+    async fn a_mixed_7z_inside_a_stored_zip_streams_as_at_the_root() {
+        let files = vec![
+            ("ember.mkv", payload(40 * ARTICLE + 11, 71)),
+            ("cinder.nfo", payload(2 * ARTICLE + 5, 72)),
+        ];
+        let archive = sevenz(&[
+            (copy(), vec![files[0].clone()]),
+            (lzma2(), vec![files[1].clone()]),
+        ]);
+        // What the zip keeps of itself, beside a member that is no archive.
+        let bare = run(&Scenario::new(vec![Post::plain(
+            "Ember.zip",
+            zip_of(stored_zip(), &[("lantern.bin", archive.clone())]),
+        )]))
+        .await;
+        assert!(bare.completed(), "{:?}", bare.failure);
+        let outer = zip_of(stored_zip(), &[("lantern.7z", archive.clone())]);
+        let (scenario, heard) = heard(Scenario::new(vec![Post::plain("Ember.zip", outer)]));
+        let graph = run(&scenario).await;
+        assert!(graph.completed(), "{:?}", graph.failure);
+        assert_delivers(&graph.files, &files);
+        assert_fetched_once(&graph);
+        assert!(
+            kinds(&graph).contains(&"sevenz_store"),
+            "{:?}",
+            kinds(&graph)
+        );
+        assert!(
+            !kinds(&graph).contains(&"sevenz_engine"),
+            "{:?}",
+            kinds(&graph)
+        );
+        // Only the coded folder's run made anything.
+        let ran = generations(&heard);
+        assert_eq!(ran.len(), 1, "{ran:?}");
+        // The 7z's shelf keeps its headers and the coded pack, no stored byte.
+        // The shelf is read at its peak over the job, so the zip's own keep
+        // and the 7z's cannot be told apart byte for byte; a 7z that kept
+        // its stored member would add the whole member to it.
+        assert!(
+            graph.graph().shelved < bare.graph().shelved + files[0].1.len() as u64 / 2,
+            "{} kept beside {} for the zip alone",
+            graph.graph().shelved,
+            bare.graph().shelved
+        );
+    }
+
+    // A3: the mixed 7z cut into numbered parts. The split store joins them,
+    // and the 7z store below reads the join as one file.
+    #[tokio::test]
+    async fn a_mixed_7z_in_numbered_parts_streams_as_one_file() {
+        let (archive, files) = mixed(MKV, lzma2());
+        let cut = (archive.len() / 2).next_multiple_of(ARTICLE);
+        let graph = run(&Scenario::new(vec![
+            Post::plain("lantern.7z.001", archive[..cut].to_vec()),
+            Post::plain("lantern.7z.002", archive[cut..].to_vec()),
+        ]))
+        .await;
+        assert!(graph.completed(), "{:?}", graph.failure);
+        assert_delivers(&graph.files, &files);
+        assert_fetched_once(&graph);
+        assert!(
+            !kinds(&graph).contains(&"sevenz_engine"),
+            "{:?}",
+            kinds(&graph)
+        );
+        assert_eq!(
+            graph.graph().shelved,
+            archive.len() as u64 - stored_bytes(&files),
+        );
+    }
+
+    // A2: the mixed 7z a deflated member of a zip, which the zip's run
+    // makes. A byte of the deflate stream is wrong as posted; the zip's run
+    // reads it and fails, the PAR2 set over the zip rebuilds it, and the
+    // zip's run starts over: it retracts the 7z and writes it again, and
+    // the 7z store and its run below start over on the new bytes.
+    #[tokio::test]
+    async fn a_mixed_7z_a_zip_run_makes_again_after_a_repair_starts_over_below() {
+        let (archive, files) = mixed(MKV, delta());
+        let outer = zip_of(deflated_zip(), &[("lantern.7z", archive)]);
+        let mut posted = outer.clone();
+        posted[outer.len() / 3] ^= 0x5a;
+        let mut posts = vec![Post::plain("Ember.zip", posted)];
+        posts.extend(par2_set("Ember", &[("Ember.zip", &outer)], 4));
+        let (scenario, heard) = heard(Scenario::new(posts));
+        let held = run_holding(&scenario, 2).await;
+        assert_eq!(held.status, Some(JobStatus::Complete));
+        assert_delivers(&held.files, &files);
+        // The zip's run read the wrong byte, retracted the 7z and gave up;
+        // once repaired, the zip opens again on a new node whose run makes
+        // the 7z again, and the 7z below makes its coded members once, from
+        // the bytes the new run made.
+        let made = |name: &str| {
+            heard
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, _, message)| {
+                    message.starts_with("Emit(Member")
+                        && message.contains(&format!("name: {name:?}"))
+                })
+                .map(|(node, generation, _)| (*node, *generation))
+                .collect::<Vec<_>>()
+        };
+        let zips = made("lantern.7z");
+        assert_eq!(zips.len(), 2, "{zips:?}");
+        assert_ne!(zips[0].0, zips[1].0, "{zips:?}");
+        for (name, _) in &files {
+            assert!(made(name).len() <= 1, "{name}: {:?}", made(name));
+        }
+    }
+
+    fn inner_files() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("spark.mkv", payload(4 * ARTICLE + 3, 61)),
+            ("flint.nfo", payload(ARTICLE / 2, 62)),
+        ]
+    }
+
+    fn inner_zip() -> Vec<u8> {
+        zip_of(stored_zip(), &inner_files())
+    }
+
+    // What the 7z holds: a stored mkv, the zip, and an nfo.
+    fn outer_entries() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("ember.mkv", payload(5 * ARTICLE + 11, 41)),
+            ("inner.zip", inner_zip()),
+            ("cinder.nfo", payload(2 * ARTICLE + 5, 43)),
+        ]
+    }
+
+    // What a job of any of them delivers: the 7z's files beside the zip,
+    // and what the zip holds, in the job's folder.
+    fn delivery() -> Vec<(&'static str, Vec<u8>)> {
+        let entries = outer_entries();
+        let mut files = vec![entries[0].clone(), entries[2].clone()];
+        files.extend(inner_files());
+        files
+    }
+
+    fn with_par2_of(posted: Vec<u8>, source: &[u8]) -> Vec<Post> {
+        let mut posts = vec![Post::plain("lantern.7z", posted)];
+        posts.extend(par2_set("lantern", &[("lantern.7z", source)], 4));
+        posts
+    }
+
+    // B1: a zip a stored member of the mixed 7z, a byte of it wrong as
+    // posted. The zip below reads it as the store streams it and finds the
+    // damage; the damage is lifted to the 7z's bytes, the PAR2 set rebuilds
+    // them, and the store replays the member to the zip.
+    #[tokio::test]
+    async fn a_zip_stored_in_a_mixed_7z_is_repaired_through_the_store() {
+        let entries = outer_entries();
+        let archive = sevenz(&[
+            (copy(), vec![entries[0].clone()]),
+            (copy(), vec![entries[1].clone()]),
+            (delta(), vec![entries[2].clone()]),
+        ]);
+        let mut posted = archive.clone();
+        // Inside spark.mkv's bytes, in the zip, in the 7z's second folder.
+        let at = 32 + entries[0].1.len() + 100 + ARTICLE;
+        posted[at] ^= 0x5a;
+        let (scenario, heard) = heard(Scenario::new(with_par2_of(posted, &archive)));
+        let graph = run(&scenario).await;
+        assert!(graph.completed(), "{:?}", graph.failure);
+        assert_delivers(&graph.files, &delivery());
+        assert_fetched_once(&graph);
+        // The coded folder's run made only the nfo, once.
+        let ran = generations(&heard);
+        assert_eq!(ran.len(), 1, "{ran:?}");
+        assert!(ran.values().all(|ran| ran.len() == 1), "{ran:?}");
+    }
+
+    // B2: the zip a coded member of the mixed 7z, a byte of the coded pack
+    // wrong as posted. The run reads it and refuses; the PAR2 set rebuilds
+    // the pack, and the run starts over: it retracts the zip it made, and
+    // the zip below starts over on the bytes the new run makes.
+    #[tokio::test]
+    async fn a_zip_coded_in_a_mixed_7z_starts_over_when_the_run_does() {
+        let entries = outer_entries();
+        let archive = sevenz(&[
+            (copy(), vec![entries[0].clone()]),
+            (delta(), vec![entries[1].clone(), entries[2].clone()]),
+        ]);
+        let mut posted = archive.clone();
+        let at = 32 + entries[0].1.len() + 100 + ARTICLE;
+        posted[at] ^= 0x5a;
+        let (scenario, heard) = heard(Scenario::new(with_par2_of(posted, &archive)));
+        let held = run_holding(&scenario, 2).await;
+        assert_eq!(held.status, Some(JobStatus::Complete));
+        assert_delivers(&held.files, &delivery());
+        let ran = generations(&heard);
+        assert_eq!(ran.len(), 1, "only the 7z runs: {ran:?}");
+        assert!(
+            ran.values().all(|ran| ran.len() >= 2),
+            "the run ran again once repaired: {ran:?}"
+        );
+    }
+
+    // B3: the same coded pack beyond repair: the run refuses, the zip it
+    // was making never closes, and the stored mkv beside it is a usable
+    // file, so the job is Partial.
+    #[tokio::test]
+    async fn a_zip_coded_in_a_mixed_7z_beyond_repair_leaves_the_stored_files_partial() {
+        let entries = outer_entries();
+        let archive = sevenz(&[
+            (copy(), vec![entries[0].clone()]),
+            (delta(), vec![entries[1].clone(), entries[2].clone()]),
+        ]);
+        let lost = article_in(32 + entries[0].1.len()..archive.len() - 200);
+        let graph =
+            run(&Scenario::new(vec![Post::plain("lantern.7z", archive)]).damaged(0, lost)).await;
+        assert_eq!(
+            graph.status,
+            Some(JobStatus::Partial),
+            "{:?} {:?}",
+            graph.failure,
+            graph.graph().delivery
+        );
+        assert!(graph.files.get(&delivered("ember.mkv")) == Some(&entries[0].1));
+        for name in ["spark.mkv", "flint.nfo", "cinder.nfo"] {
+            assert!(!graph.files.contains_key(&delivered(name)), "{name}");
+        }
+    }
+
+    // C: the same nested content packed all stored, mixed and all coded
+    // delivers the same files, and the zip opens in each as a layer.
+    #[tokio::test]
+    async fn the_same_nested_content_stored_mixed_or_coded_delivers_alike() {
+        let entries = outer_entries();
+        let cases = [
+            (
+                "stored",
+                sevenz(&[
+                    (copy(), vec![entries[0].clone()]),
+                    (copy(), vec![entries[1].clone()]),
+                    (copy(), vec![entries[2].clone()]),
+                ]),
+            ),
+            (
+                "mixed",
+                sevenz(&[
+                    (copy(), vec![entries[0].clone()]),
+                    (lzma2(), vec![entries[1].clone(), entries[2].clone()]),
+                ]),
+            ),
+            ("coded", sevenz(&[(lzma2(), entries.clone())])),
+        ];
+        for (case, archive) in cases {
+            let graph = run(&Scenario::new(vec![Post::plain("lantern.7z", archive)])).await;
+            assert_eq!(graph.status, Some(JobStatus::Complete), "{case}");
+            assert_delivers(&graph.files, &delivery());
+            assert_fetched_once(&graph);
+        }
+    }
+}
