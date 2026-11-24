@@ -221,12 +221,11 @@ pub(crate) async fn started_port_at(
 async fn test_announced_port_is_the_one_the_session_listens_on() -> anyhow::Result<()> {
     setup_test_logging();
 
-    // No listener: port 0, the engine's "unreachable", never port 1 or any
-    // other made-up one.
+    // No listener: port 1, as libtorrent announces it, never port 0, which
+    // a tracker may refuse.
     let (port, listening) = started_port(tracker_session_opts()?).await?;
     assert_eq!(listening, None);
-    assert_eq!(port, "0");
-    assert_ne!(port, "1");
+    assert_eq!(port, "1");
 
     // A listener: its port.
     let (port, listening) = started_port(SessionOptions {

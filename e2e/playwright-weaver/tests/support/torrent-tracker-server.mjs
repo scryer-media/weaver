@@ -78,9 +78,7 @@ export async function startTracker(options = {}) {
     const list = [];
     for (const [key, peer] of peers) {
       if (peer.left === 0) complete++; else incomplete++;
-      // Port 0 is a peer that takes no connections (its route does not
-      // listen): counted in the swarm, never handed out.
-      if (key === peerKey || peer.port === 0 || !ipv4Of(peer.ip)) continue;
+      if (key === peerKey || !ipv4Of(peer.ip)) continue;
       list.push(peer);
     }
     list.sort((a, b) => (a.ip === b.ip ? a.port - b.port : a.ip < b.ip ? -1 : 1));
@@ -106,14 +104,11 @@ export async function startTracker(options = {}) {
     const search = (request.url ?? "").split("?")[1] ?? "";
     const infohash = rawQueryBytes(search, "info_hash");
     const peerId = rawQueryBytes(search, "peer_id");
-    // Port 0 is the announce of a route that does not listen; a missing or
-    // empty port is still refused (Number("") and Number(null) are 0).
-    const portText = url.searchParams.get("port") ?? "";
-    const port = portText === "" ? NaN : Number(portText);
+    const port = Number(url.searchParams.get("port"));
     const fail = reason => { response.setHeader("content-type", "text/plain"); response.end(bencode({ "failure reason": reason })); };
     if (!infohash || infohash.length !== 20) { fail("invalid info_hash"); return; }
     if (!peerId || peerId.length !== 20) { fail("invalid peer_id"); return; }
-    if (!Number.isInteger(port) || port < 0 || port > 65535) { fail("invalid port"); return; }
+    if (!Number.isInteger(port) || port < 1 || port > 65535) { fail("invalid port"); return; }
     const ip = ipv4Of(request.socket.remoteAddress) ?? String(request.socket.remoteAddress);
     const result = announce({
       transport: "http", infohash, peerId, ip, port,

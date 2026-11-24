@@ -2051,13 +2051,13 @@ async fn udp_tracker_to_socket_addrs(
     Ok(res)
 }
 
-/// The `port` of an announce: the port peers reach this session on, or
-/// `shape`'s port for a session that accepts no connections. Weaver's is 0,
-/// the engine's one form for "unreachable": a peer at port 0 is never
-/// dialled and a DHT node at port 0 is never used, so a session without a
-/// listener names no port anyone could answer on.
-fn announced_port(listen_port: Option<u16>, shape: &AnnounceShape) -> u16 {
-    listen_port.unwrap_or(shape.no_listener_port)
+/// The `port` of an announce: the port peers reach this session on, or 1
+/// for a session that accepts no connections, as libtorrent announces it
+/// (`src/session_impl.cpp`, `make_announce_port`: "announce port=1 instead
+/// of port=0, when there is no listen port", 1.2.5). A tracker may refuse
+/// port 0, and an announce it refuses brings no peers.
+fn announced_port(listen_port: Option<u16>) -> u16 {
+    listen_port.unwrap_or(1)
 }
 
 /// How many peers an announce asks for: none with `stopped`, since the run
@@ -2707,7 +2707,7 @@ impl HttpTracker {
         let ports = *ask.ports.borrow();
         let mut queries = Vec::with_capacity(legs.len());
         for (family, leg, event) in &legs {
-            request.port = announced_port(ports.of(*family == Some(Family::V6)), identity.shape);
+            request.port = announced_port(ports.of(*family == Some(Family::V6)));
             request.event = *event;
             request.numwant = numwant(*event);
             (request.corrupt, request.redundant) = ask.since_started(*leg, *event);
@@ -2892,7 +2892,7 @@ impl UdpTracker {
             event: udp_event(event),
             key: identity.tracker_key,
             num_want: numwant(event),
-            port: announced_port(ask.ports.borrow().to(addr.ip()), identity.shape),
+            port: announced_port(ask.ports.borrow().to(addr.ip())),
             url_data: url_data(&ask.tracker.url),
         };
 

@@ -748,17 +748,12 @@ fn as_qbittorrent_a_finished_torrent_says_paused_before_started() {
     );
 }
 
-// A session with no listener announces port 0 as Weaver and port 1 as
-// qBittorrent; one with a listener announces its port either way.
+// A session with no listener announces port 1, as libtorrent does, and
+// never 0; one with a listener announces its port.
 #[test]
-fn the_port_announced_without_a_listener_is_the_shapes() {
-    let weaver = &crate::tracker::AnnounceShape::WEAVER;
-    let qbittorrent = &crate::tracker::qbittorrent::SHAPE;
-    assert_eq!(super::announced_port(None, weaver), 0);
-    assert_eq!(super::announced_port(None, qbittorrent), 1);
-    for shape in [weaver, qbittorrent] {
-        assert_eq!(super::announced_port(Some(6881), shape), 6881);
-    }
+fn the_port_announced_without_a_listener_is_one() {
+    assert_eq!(super::announced_port(None), 1);
+    assert_eq!(super::announced_port(Some(6881)), 6881);
 }
 
 #[test]
