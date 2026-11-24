@@ -742,6 +742,74 @@ jobs:
           test "$CRATES" = success
           test "$TESTS" = success
 
+  # A release whose tests failed waits here. Approving the
+  # release-test-override environment releases anyway; rejecting it, or
+  # leaving it, releases nothing. It covers the test jobs only: formatting,
+  # clippy, the audit and the packages still have to pass.
+  release-test-override:
+    name: release-test-override
+    if: ${{ !cancelled() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') && needs.verify-release-tag.result == 'success' && (needs.rust-test.result != 'success' || needs.rust-test-windows.result != 'success' || needs.rust-test-arm.result != 'success' || needs.rust-test-sde.result != 'success') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    needs: [verify-release-tag, rust-test, rust-test-windows, rust-test-arm, rust-test-sde]
+    environment: release-test-override
+    permissions:
+      actions: read
+    steps:
+      # GitHub creates an environment that does not exist, with no reviewers,
+      # and such a job starts unasked. Refuse to override through one.
+      - name: Require an environment with reviewers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          reviewers="$(gh api "repos/$REPO/environments/release-test-override" \
+            --jq '[.protection_rules[]? | select(.type == "required_reviewers")] | length')"
+          echo "required reviewer rules: $reviewers"
+          test "$reviewers" -gt 0
+      - name: Record the override
+        env:
+          TESTS: ${{ needs.rust-test.result }}
+          WINDOWS: ${{ needs.rust-test-windows.result }}
+          ARM: ${{ needs.rust-test-arm.result }}
+          SDE: ${{ needs.rust-test-sde.result }}
+          ACTOR: ${{ github.triggering_actor }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Released with failed tests"
+            echo "Approved for a run started by $ACTOR."
+            echo "rust-test=$TESTS rust-test-windows=$WINDOWS rust-test-arm=$ARM rust-test-sde=$SDE"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # What the release jobs wait on for tests: every test job passed, or the
+  # override above was approved.
+  release-tests:
+    name: release-tests
+    if: ${{ !cancelled() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    needs: [rust-test, rust-test-windows, rust-test-arm, rust-test-sde, release-test-override]
+    steps:
+      - name: Require passing tests or an approved override
+        env:
+          TESTS: ${{ needs.rust-test.result }}
+          WINDOWS: ${{ needs.rust-test-windows.result }}
+          ARM: ${{ needs.rust-test-arm.result }}
+          SDE: ${{ needs.rust-test-sde.result }}
+          OVERRIDE: ${{ needs.release-test-override.result }}
+        run: |
+          set -euo pipefail
+          echo "rust-test=$TESTS rust-test-windows=$WINDOWS rust-test-arm=$ARM rust-test-sde=$SDE override=$OVERRIDE"
+          if [ "$OVERRIDE" = success ]; then
+            exit 0
+          fi
+          test "$TESTS" = success
+          test "$WINDOWS" = success
+          test "$ARM" = success
+          test "$SDE" = success
+
   rust-test-arm:
     name: rust-test-arm-yenc
     needs: [changes, verify-release-tag]
@@ -1092,10 +1160,10 @@ jobs:
 
   rust-package-linux-arm64-portable:
     name: rust-package-linux-arm64-portable
-    # Pull requests build the lighter rc profile on the hosted runner;
-    # releases build on the larger paid runner.
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04-arm' || 'linux_arm_release' }}
-    timeout-minutes: 90
+    # The standard hosted arm64 runner, for pull requests (the lighter rc
+    # profile) and for releases.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
     needs: [changes, verify-release-tag, web-build]
     if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.web-build.result == 'success' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
     env:
@@ -2550,7 +2618,10 @@ jobs:
 
   docker-publish:
     name: docker-publish
-    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
+    # A test override leaves failed test jobs above this one, and a plain
+    # condition skips a job with any failed job above it. So this runs on
+    # what it needs directly, and every one of those must have succeeded.
+    if: ${{ !cancelled() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') && !contains(needs.*.result, 'skipped') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     needs:
@@ -2558,9 +2629,7 @@ jobs:
       - rust-fmt
       - rust-clippy
       - rust-audit
-      - rust-test
-      - rust-test-arm
-      - rust-test-sde
+      - release-tests
       - rust-yenc-simd-targets
       - rust-package-linux-x86_64-portable
       - rust-package-linux-arm64-portable
@@ -2644,7 +2713,10 @@ jobs:
 
   generate-container-provenance:
     name: generate-container-provenance
-    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
+    # A test override leaves failed test jobs above this one, and a plain
+    # condition skips a job with any failed job above it. So this runs on
+    # what it needs directly, and every one of those must have succeeded.
+    if: ${{ !cancelled() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') && !contains(needs.*.result, 'skipped') }}
     needs: [verify-release-tag, docker-publish]
     permissions:
       actions: read
@@ -2663,7 +2735,10 @@ jobs:
 
   verify-container-release:
     name: verify-container-release
-    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
+    # A test override leaves failed test jobs above this one, and a plain
+    # condition skips a job with any failed job above it. So this runs on
+    # what it needs directly, and every one of those must have succeeded.
+    if: ${{ !cancelled() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') && !contains(needs.*.result, 'skipped') }}
     runs-on: ubuntu-24.04
     needs: [verify-release-tag, docker-publish, generate-container-provenance]
     permissions:
@@ -2713,7 +2788,10 @@ jobs:
 
   github-release:
     name: github-release
-    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
+    # A test override leaves failed test jobs above this one, and a plain
+    # condition skips a job with any failed job above it. So this runs on
+    # what it needs directly, and every one of those must have succeeded.
+    if: ${{ !cancelled() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') && !contains(needs.*.result, 'skipped') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     needs:
@@ -2722,10 +2800,7 @@ jobs:
       - rust-clippy
       - rust-clippy-windows
       - rust-audit
-      - rust-test
-      - rust-test-arm
-      - rust-test-sde
-      - rust-test-windows
+      - release-tests
       - rust-yenc-simd-targets
       - rust-package-linux-x86_64-portable
       - rust-package-linux-arm64-portable
@@ -3116,7 +3191,10 @@ jobs:
 
   marketing-site-rebuild:
     name: marketing-site-rebuild
-    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
+    # A test override leaves failed test jobs above this one, and a plain
+    # condition skips a job with any failed job above it. So this runs on
+    # what it needs directly, and every one of those must have succeeded.
+    if: ${{ !cancelled() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') && !contains(needs.*.result, 'skipped') }}
     needs: [verify-release-tag, github-release]
     runs-on: ubuntu-24.04
     continue-on-error: true
@@ -3137,7 +3215,10 @@ jobs:
 
   winget-published-install:
     name: winget-published-install
-    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
+    # A test override leaves failed test jobs above this one, and a plain
+    # condition skips a job with any failed job above it. So this runs on
+    # what it needs directly, and every one of those must have succeeded.
+    if: ${{ !cancelled() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') && !contains(needs.*.result, 'skipped') }}
     needs: [verify-release-tag, github-release]
     runs-on: windows-2025-vs2026
     timeout-minutes: 20
@@ -3169,7 +3250,10 @@ jobs:
     # Unlike scryer, weaver's winget-pkgs submission is approved and armed:
     # the org-level WINGET_TOKEN secret authenticates the PR, so this job
     # runs on every release tag rather than being gated behind a variable.
-    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
+    # A test override leaves failed test jobs above this one, and a plain
+    # condition skips a job with any failed job above it. So this runs on
+    # what it needs directly, and every one of those must have succeeded.
+    if: ${{ !cancelled() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') && !contains(needs.*.result, 'skipped') }}
     needs: [verify-release-tag, github-release, winget-published-install]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
