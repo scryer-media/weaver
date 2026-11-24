@@ -253,11 +253,7 @@ impl Stood<'_> {
     // as every member is any other object's.
     fn own(&self) -> impl Fn(MemberId) -> bool + '_ {
         let engine = self.tree.engine(self.node);
-        let places_own = engine.is_some_and(|engine| {
-            self.tree
-                .namespace(self.node)
-                .is_some_and(|namespace| namespace.members().any(|member| !engine.makes(member.id)))
-        });
+        let places_own = self.tree.places_own(self.node);
         move |member| !places_own || engine.is_none_or(|engine| !engine.makes(member))
     }
 }

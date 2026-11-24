@@ -1424,6 +1424,17 @@ impl Tree {
         self.object(node)?.engine()
     }
 
+    // Whether the object at `node` places members itself beside those its
+    // run makes, as a 7z store that codes some folders does: it has an
+    // engine face, and some member of its namespace is not its run's.
+    pub fn places_own(&self, node: NodeId) -> bool {
+        let Some(engine) = self.engine(node) else {
+            return false;
+        };
+        self.namespace(node)
+            .is_some_and(|namespace| namespace.members().any(|member| !engine.makes(member.id)))
+    }
+
     // A run of the engine at `node`, from its object's present state. A
     // question an earlier run asked, and a claim it made, are the new run's
     // to make again.
