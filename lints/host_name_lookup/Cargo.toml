@@ -10,10 +10,10 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-dylint_linting = "=6.3.2"
+dylint_linting = "=6.4.0"
 
 [dev-dependencies]
-dylint_testing = "=6.3.2"
+dylint_testing = "=6.4.0"
 
 # Its own workspace: it builds on the nightly it pins, apart from Weaver.
 [workspace]

@@ -266,14 +266,14 @@ jobs:
           path: |
             ~/.cargo/bin/cargo-dylint
             ~/.cargo/bin/dylint-link
-          key: dylint-tools-v1-6.3.2-${{ runner.os }}
+          key: dylint-tools-v1-6.4.0-${{ runner.os }}
       - name: Install the host name lookup lint's nightly
-        run: rustup toolchain install nightly-2026-08-20 --profile minimal --component llvm-tools-preview,rustc-dev
+        run: rustup toolchain install nightly-2026-11-23 --profile minimal --component llvm-tools-preview,rustc-dev
       - name: Install the dylint tools
         if: ${{ steps.dylint-tools.outputs.cache-hit != 'true' }}
         run: |
-          cargo install --locked cargo-dylint --version 6.3.2
-          cargo install --locked dylint-link --version 6.3.2
+          cargo +nightly-2026-11-23 install --locked cargo-dylint --version 6.4.0
+          cargo +nightly-2026-11-23 install --locked dylint-link --version 6.4.0
       - name: Run the host name lookup lint
         env:
           RUSTC_WRAPPER: ""

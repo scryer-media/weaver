@@ -1145,7 +1145,8 @@ async fn one_connect_proxy() -> (u16, tokio::task::JoinHandle<()>) {
             header.push(stream.read_u8().await.unwrap());
         }
         let header = String::from_utf8(header).unwrap();
-        let destination = header.split(' ').nth(1).unwrap().to_owned();
+        // An address, never a name: the test dials loopback through it.
+        let destination: std::net::SocketAddr = header.split(' ').nth(1).unwrap().parse().unwrap();
         let mut upstream = tokio::net::TcpStream::connect(destination).await.unwrap();
         stream
             .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")

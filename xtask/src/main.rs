@@ -1663,19 +1663,12 @@ fn run_clippy_ci(ctx: &TaskContext) -> Result<()> {
 }
 
 const HOST_NAME_LOOKUP_LINT: &str = "lints/host_name_lookup";
-const DYLINT_VERSION: &str = "6.3.2";
+const DYLINT_VERSION: &str = "6.4.0";
 
-// The dylint tools at the version CI pins, and the nightly the lint's own
-// rust-toolchain.toml names, each installed only when missing.
+// The nightly the lint's own rust-toolchain.toml names, and the dylint tools
+// at the version CI pins, each installed only when missing. The tools are
+// built with that nightly: they need a newer compiler than Weaver's own.
 fn install_host_name_lookup_lint(ctx: &TaskContext) -> Result<()> {
-    for tool in ["cargo-dylint", "dylint-link"] {
-        if !command_available(tool)? {
-            warn(format!("{tool} not installed — installing"));
-            let mut install = ctx.command_in("cargo", &ctx.repo_root);
-            install.args(["install", "--locked", tool, "--version", DYLINT_VERSION]);
-            run_checked(&mut install)?;
-        }
-    }
     let path = ctx
         .repo_root
         .join(HOST_NAME_LOOKUP_LINT)
@@ -1704,6 +1697,15 @@ fn install_host_name_lookup_lint(ctx: &TaskContext) -> Result<()> {
             install.args(["--component", &components.join(",")]);
         }
         run_checked(&mut install)?;
+    }
+    for tool in ["cargo-dylint", "dylint-link"] {
+        if !command_available(tool)? {
+            warn(format!("{tool} not installed — installing"));
+            let mut install = ctx.command_in("cargo", &ctx.repo_root);
+            install.arg(format!("+{channel}"));
+            install.args(["install", "--locked", tool, "--version", DYLINT_VERSION]);
+            run_checked(&mut install)?;
+        }
     }
     Ok(())
 }
