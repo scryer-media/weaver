@@ -740,6 +740,12 @@ impl TorrentStateLive {
     /// The torrent may want pieces again: the peers let go for being of no
     /// use come back, and the web seeds are looked at again.
     pub(crate) fn reconnect_all_not_needed_peers(&self) {
+        // The list is told first whether we are finished. A peer let go is a
+        // candidate again by what the list last heard, and the connect loop
+        // tells it only once a candidate is due: with every peer let go none
+        // ever is, and the peers would stay let go.
+        self.peers
+            .set_finished(self.is_finished_and_no_active_streams());
         self.peers.requeue_not_needed();
         self.wanting_notify.notify_waiters();
     }
