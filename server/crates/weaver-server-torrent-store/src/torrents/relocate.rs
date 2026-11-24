@@ -912,6 +912,7 @@ mod tests {
         assert!(contents(&to).is_empty());
     }
 
+    #[cfg(unix)]
     fn leads_outside(error: &MoveError) -> bool {
         error.source.kind() == io::ErrorKind::InvalidInput
             && error.source.to_string().contains("leads outside")

@@ -6,7 +6,7 @@
 pub use weaver_server_jobs::jobs::working_dir::*;
 pub use weaver_server_settings::settings::working_dir_rename::*;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use cap_fs_ext::MetadataExt;
 #[cfg(test)]
 use std::path::{Path, PathBuf};

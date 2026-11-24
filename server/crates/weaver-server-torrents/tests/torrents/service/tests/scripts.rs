@@ -10,8 +10,11 @@ use super::*;
 use crate::post_processing::events::EventContext;
 use crate::post_processing::events::PostProcessingEventsCancelEventScriptsQueries;
 use crate::post_processing::events::PostProcessingEventsInvalidateQueueScriptAdmissionInternalQueries;
-use crate::post_processing::model::{QueueEvent, ScriptEventLabel, vars};
+#[cfg(unix)]
+use crate::post_processing::model::ScriptEventLabel;
+use crate::post_processing::model::{QueueEvent, vars};
 use crate::post_processing::settings::PostProcessingSettingsQueries;
+#[cfg(unix)]
 use crate::tags::TagsQueries;
 use crate::torrents::queries::TorrentsQueries;
 

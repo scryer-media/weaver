@@ -201,6 +201,7 @@ fn torrents_on_one_volume_share_its_read_turns() {
 
 // A piece's bytes written to `name` under the save folder `save`, and what
 // the write came to.
+#[cfg(unix)]
 fn write_under(writes: &Writes, save: &Path, name: &str) -> anyhow::Result<()> {
     let (done, heard) = told();
     let place = Place {

@@ -8,6 +8,7 @@ use crate::post_processing::instances::ScriptInstanceDraft;
 use crate::post_processing::model::ScriptName;
 use crate::post_processing::output::PostProcessingOutputQueries;
 use crate::post_processing::settings::PostProcessingSettingsQueries;
+#[cfg(unix)]
 use crate::tags::TagsQueries;
 
 // Re-executed as the real supervisor by `tag_reporting_queue_script_for_test`.

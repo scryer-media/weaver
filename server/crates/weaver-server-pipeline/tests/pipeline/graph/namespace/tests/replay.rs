@@ -653,6 +653,7 @@ fn a_hand_over_with_no_second_name_writes_every_byte() {
 }
 
 // The file a test's leaf over `name` in `dir` is, as the file system tells.
+#[cfg(unix)]
 fn file_of(dir: &Path, name: &str) -> crate::pipeline::graph::leaf::FileId {
     Leaf::over(dir, name, true)
         .file_id(LoopSite::LeafWrite)
