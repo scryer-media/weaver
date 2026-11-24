@@ -2,6 +2,8 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 #![feature(rustc_private)]
+// The compiler's lint declaration fills the rest of its fields by default.
+#![feature(default_field_values)]
 
 extern crate rustc_ast;
 extern crate rustc_errors;
@@ -16,7 +18,7 @@ use rustc_errors::{Diag, DiagDecorator};
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::{Expr, ExprKind, Node};
 use rustc_lint::{LateContext, LateLintPass, LintContext};
-use rustc_middle::ty::{self, GenericArgsRef, Ty, TyCtxt};
+use rustc_middle::ty::{self, CallerBoundsIterator, GenericArgs, Ty, TyCtxt};
 use rustc_span::def_id::DefId;
 
 dylint_linting::declare_late_lint! {
@@ -105,7 +107,7 @@ impl<'tcx> LateLintPass<'tcx> for HostNameLookup {
 fn check_arguments<'tcx>(
     cx: &LateContext<'tcx>,
     callee: DefId,
-    generics: GenericArgsRef<'tcx>,
+    generics: GenericArgs<'tcx>,
     arguments: Vec<&'tcx Expr<'tcx>>,
 ) {
     for index in refused_parameters(cx.tcx, callee, generics) {
@@ -122,7 +124,7 @@ fn check_arguments<'tcx>(
 fn refused_parameters<'tcx>(
     tcx: TyCtxt<'tcx>,
     callee: DefId,
-    generics: GenericArgsRef<'tcx>,
+    generics: GenericArgs<'tcx>,
 ) -> impl Iterator<Item = usize> + 'tcx {
     let signature = tcx.fn_sig(callee).instantiate_identity().skip_binder();
     signature
@@ -150,7 +152,7 @@ fn report(cx: &LateContext<'_>, expr: &Expr<'_>) {
     cx.emit_span_lint(
         HOST_NAME_LOOKUP,
         expr.span.source_callsite(),
-        DiagDecorator(|diag: &mut Diag<'_, ()>| {
+        DiagDecorator(|diag: &mut Diag<'_>| {
             diag.primary_message(MESSAGE);
         }),
     );
@@ -168,6 +170,7 @@ fn peel_references(mut ty: Ty<'_>) -> Ty<'_> {
 fn resolves_names<'tcx>(tcx: TyCtxt<'tcx>, callee: DefId, parameter: ty::ParamTy) -> bool {
     tcx.param_env(callee)
         .caller_bounds()
+        .all_clauses_interned(tcx)
         .iter()
         .filter_map(|clause| clause.as_trait_clause())
         .any(|bound| {
