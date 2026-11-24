@@ -1480,19 +1480,24 @@ async fn a_wait_for_room_ends_with_its_run() {
                 // The check ends a run, and once it ends the start rule
                 // judges the torrent again: with no room over the reserve
                 // for what it has left, its download is held from starting.
-                // The recheck lets go of the run's hold before it answers.
-                let mut moved = service.inner.disk_waits_moved.subscribe();
+                // The recheck lets go of the run's hold before it answers;
+                // what the check's end is judged to is read once that
+                // judgement is made, whatever it made of the hold.
+                let (mut judged, at) = checks_judged(service);
                 service.recheck(job_id).await.unwrap();
-                while disk_held(service, job_id).await != Some(DiskHeld::Fetching) {
-                    moved.changed().await.unwrap();
-                }
+                judged_past(&mut judged, at).await;
             }
             _ => {
+                // The move is answered before the torrent joins the new
+                // route's session; the run it begins there is judged as a
+                // start at the next pass, made once it has joined.
                 disk.rig.routes.route(TorrentScope::Category(1), 9);
                 service
                     .set_category(job_id, Some("tv".into()))
                     .await
                     .unwrap();
+                service.opened(job_id).await;
+                service.apply_queue().await;
             }
         }
         // A settle after the run ended takes whatever its intake said
@@ -1512,9 +1517,14 @@ async fn a_wait_for_room_ends_with_its_run() {
         let ledger = disk.capacity.ledger(StorageRoot::Complete);
         assert_eq!(ledger.promised(), 0, "{how}");
         if let Some(torrent) = service.inner.live.lock().await.get(&job_id) {
-            // Held again only from starting, by the start rule, after a
-            // check; never the wait of the run that ended.
-            let start_held = (how == "recheck").then_some(DiskHeld::Fetching);
+            // Held again only from starting, by the start rule: its download
+            // held after a check, kept from starting in the run a move
+            // begins; never the wait of the run that ended.
+            let start_held = match how {
+                "recheck" => Some(DiskHeld::Fetching),
+                "route move" => Some(DiskHeld::Starting),
+                _ => None,
+            };
             assert_eq!(torrent.disk_held, start_held, "{how}");
             assert_ne!(torrent.disk_held, Some(DiskHeld::Writing), "{how}");
             let room = torrent.intake.as_ref().unwrap().room();
