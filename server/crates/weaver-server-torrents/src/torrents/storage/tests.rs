@@ -949,6 +949,14 @@ fn deleting_a_torrents_files_never_follows_a_link_outside() {
     );
 }
 
+// A path under a folder, its parts joined by `/` on every platform.
+fn slashed(path: &Path) -> String {
+    path.components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 // Every path under the directory, relative to it.
 fn walkdir(dir: &Path) -> Vec<String> {
     let mut found = Vec::new();
@@ -956,12 +964,7 @@ fn walkdir(dir: &Path) -> Vec<String> {
     while let Some(at) = stack.pop() {
         for entry in std::fs::read_dir(&at).unwrap() {
             let path = entry.unwrap().path();
-            found.push(
-                path.strip_prefix(dir)
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned(),
-            );
+            found.push(slashed(path.strip_prefix(dir).unwrap()));
             if path.is_dir() {
                 stack.push(path);
             }
@@ -1130,7 +1133,12 @@ fn an_unpacked_file_where_a_listed_file_goes_moves_out_of_its_way() {
 
             let went = move_with(&shim.store, &to, &[output], existing, |_| Ok(())).unwrap();
             assert!(went.kept.is_empty(), "{existing:?} {output}");
-            assert_eq!(went.outputs, [output], "{existing:?} {output}");
+            let outputs: Vec<String> = went
+                .outputs
+                .iter()
+                .map(|name| slashed(Path::new(name)))
+                .collect();
+            assert_eq!(outputs, [output], "{existing:?} {output}");
             assert_eq!(std::fs::read(to.join("x.bin")).unwrap(), torrent);
             assert_eq!(std::fs::read(to.join(output)).unwrap(), b"unpacked");
             assert!(!placed.join("x.bin").exists());

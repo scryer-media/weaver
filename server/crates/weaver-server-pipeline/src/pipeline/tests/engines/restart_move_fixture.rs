@@ -477,9 +477,11 @@ async fn go_down(
 // The run that went down at `stop` delivers what the run that never went
 // down delivers, and fetches nothing it had on disk.
 pub async fn stopped_row(scenario: Scenario, stop: Stop) -> (MoveCheckpoint, Restarted) {
-    let whole = run(&scenario).await;
+    // Boxed: each run's future is large, and two of them in one frame are
+    // past a thread's stack where it is smallest.
+    let whole = Box::pin(run(&scenario)).await;
     assert!(whole.completed(), "{:?} {:?}", whole.status, whole.failure);
-    let (restarted, rows) = run_stopping(&scenario, stop).await;
+    let (restarted, rows) = Box::pin(run_stopping(&scenario, stop)).await;
     assert_restarted(&restarted, &whole);
     (rows, restarted)
 }

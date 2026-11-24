@@ -73,6 +73,14 @@ mod views;
 
 const EPOCH_MS: i64 = 1_700_000_000_000;
 
+// `text` with the folder `dir` named `<dir>`, plain or with its backslashes
+// doubled, as JSON and `{:?}` write a Windows path.
+fn without_dir(text: &str, dir: &Path) -> String {
+    let dir = dir.to_string_lossy();
+    text.replace(&dir.replace('\\', "\\\\"), "<dir>")
+        .replace(&*dir, "<dir>")
+}
+
 fn job_env() -> JobEnv {
     JobEnv::unbounded()
 }

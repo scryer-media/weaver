@@ -588,7 +588,9 @@ fn whole_hand_over(how: HandOver) -> (HandedOver, Vec<u8>, String, u64) {
 
 // The archive hears every run of the file with the provenance it arrived
 // with, as before, and keeps the same record; only the write of each byte
-// over itself is gone.
+// over itself is gone. Only where a file's number can be read: elsewhere no
+// two files are said to be one, and every byte is written.
+#[cfg(unix)]
 #[test]
 fn a_leaf_handed_to_a_whole_volume_archive_is_not_written_over_itself() {
     let (written_over, volume, effects_over, rewrote) = whole_hand_over(HandOver {

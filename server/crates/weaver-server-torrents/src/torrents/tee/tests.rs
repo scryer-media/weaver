@@ -750,10 +750,23 @@ mod numbered_outputs {
         )
     }
 
-    fn names(placed: &Placed) -> Vec<&str> {
-        let mut names: Vec<&str> = placed.names.iter().map(String::as_str).collect();
+    // The names placed, in order, the parts of each joined by `/` on every
+    // platform: the row spells a name as the filesystem does.
+    fn names(placed: &Placed) -> Vec<String> {
+        let mut names: Vec<String> = placed
+            .names
+            .iter()
+            .map(|name| slashed(Path::new(name)))
+            .collect();
         names.sort_unstable();
         names
+    }
+
+    fn slashed(path: &Path) -> String {
+        path.components()
+            .map(|part| part.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/")
     }
 
     fn folders() -> (tempfile::TempDir, PathBuf, PathBuf) {
@@ -768,10 +781,7 @@ mod numbered_outputs {
     fn on_disk(dir: &Path) -> Vec<String> {
         let mut found = Vec::new();
         walk(dir, Path::new(""), &mut found);
-        let mut found: Vec<String> = found
-            .into_iter()
-            .map(|path| path.to_string_lossy().into_owned())
-            .collect();
+        let mut found: Vec<String> = found.into_iter().map(|path| slashed(&path)).collect();
         found.sort_unstable();
         found
     }
@@ -1124,7 +1134,7 @@ mod numbered_outputs {
         }
         let placed = place(&work, &dir, &[]);
         assert!(placed.failed.is_none());
-        let mut expected: Vec<String> = placed.names.clone();
+        let mut expected = names(&placed);
         expected.extend(["Extras".to_owned(), "movie.mkv".to_owned()]);
         expected.sort_unstable();
         assert_eq!(on_disk(&dir), expected);
@@ -1149,7 +1159,11 @@ mod numbered_outputs {
     }
 
     // A name at the filesystem's length limit that needs a number gives up
-    // the end of its stem for it, and is placed.
+    // the end of its stem for it, and is placed. Not on Windows: a name of
+    // that length under the temp folder passes 260 characters, which the
+    // never-replacing move takes only from a program with the long-path
+    // manifest, as Weaver's own has and a test binary has not.
+    #[cfg(not(windows))]
     #[test]
     fn a_name_at_the_length_limit_is_shortened_for_its_number() {
         let (_root, work, dir) = folders();
