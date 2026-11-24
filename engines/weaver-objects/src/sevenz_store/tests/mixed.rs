@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 use sevenz_turbo::encoder_options::DeltaOptions;
 use sevenz_turbo::{ArchiveEntry, ArchiveWriter, EncoderConfiguration, SourceReader};
 use weaver_graph::{
-    Budget, ByteRange, Emit, Engine, Extent, Located, MemberId, Object, Placement, VolumeIndex,
-    Volumes,
+    Budget, ByteRange, Emit, Engine, Extent, Located, MemberId, Object, Placement, Provenance,
+    VolumeIndex, Volumes,
 };
 
 use super::owner::Owner;
@@ -28,10 +28,19 @@ fn mixed_with(
     coded: Vec<EncoderConfiguration>,
     header: Option<Vec<EncoderConfiguration>>,
 ) -> (Vec<u8>, Files) {
+    mixed_naming("gamma.srt", coded, header)
+}
+
+// The same, gamma named `gamma`.
+fn mixed_naming(
+    gamma: &'static str,
+    coded: Vec<EncoderConfiguration>,
+    header: Option<Vec<EncoderConfiguration>>,
+) -> (Vec<u8>, Files) {
     let files = vec![
         ("alpha.mkv", payload(1, 70_000)),
         ("beta.nfo", payload(2, 3_000)),
-        ("gamma.srt", payload(3, 9_000)),
+        (gamma, payload(3, 9_000)),
         ("delta.mkv", payload(4, 50_000)),
     ];
     let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
@@ -378,4 +387,57 @@ fn a_coded_folder_that_fails_its_crc_says_what_the_engine_says() {
     assert_eq!(coded, engine_said);
     assert!(coded.contains(&Emit::Retract(MemberId(1))));
     assert_eq!(files.len(), 4);
+}
+
+// A header repaired into one that names a coded member otherwise, over a
+// set the store mapped and streamed: the store retracts that member alone,
+// for its run to make again, and asks for no byte again, since a coded
+// member's bytes are its run's and the store routed none of them. Its
+// engine face, and the run it starts, are the new map's at once.
+#[test]
+fn a_repaired_header_that_moves_a_coded_member_retracts_it_alone() {
+    let (before, _) = mixed_naming("gamma.srt", lzma2(), None);
+    let (after, files) = mixed_naming("gamme.srt", lzma2(), None);
+    assert_eq!(before.len(), after.len());
+    let first = (32..before.len())
+        .find(|at| before[*at] != after[*at])
+        .unwrap();
+    let header = ByteRange::new(first as u64, before.len() as u64);
+    let mut owner = Owner::single(store(), before.clone());
+    owner.whole(4096);
+    no_trouble(&owner);
+    let said = owner.said.len();
+    owner.deliver_as(
+        0,
+        ByteRange::new(0, 32),
+        Provenance::Repaired,
+        Some(&after[..32]),
+    );
+    owner.deliver_as(
+        0,
+        header,
+        Provenance::Repaired,
+        Some(&after[header.start as usize..]),
+    );
+    let since = &owner.said[said..];
+    let retracted: Vec<&Emit> = since
+        .iter()
+        .filter(|emit| matches!(emit, Emit::Retract(_)))
+        .collect();
+    assert_eq!(retracted, vec![&Emit::Retract(MemberId(2))], "{since:?}");
+    assert!(
+        !since.iter().any(|emit| matches!(emit, Emit::Again { .. })),
+        "{since:?}"
+    );
+    assert_eq!(owner.member("gamme.srt").name, "gamme.srt");
+    let kept = envelope(&owner, &after);
+    let engine = owner.object.engine_mut().expect("still mixed");
+    assert!(engine.makes(MemberId(1)) && engine.makes(MemberId(2)));
+    assert!(!engine.makes(MemberId(0)) && !engine.makes(MemberId(3)));
+    let emits = run(engine, kept);
+    let (out, closed) = written(&emits, files.len());
+    assert_eq!(closed, vec![MemberId(1), MemberId(2)]);
+    for id in [1, 2] {
+        assert_eq!(out[id], files[id].1, "{}", files[id].0);
+    }
 }
