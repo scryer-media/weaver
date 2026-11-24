@@ -1024,11 +1024,25 @@ impl Tree {
     // against everything bound beside it, so this costs what is bound, not
     // its square.
     fn bound_below(&self, node: NodeId) -> Vec<NodeId> {
+        self.bound_below_where(node, |_| true)
+    }
+
+    // As `bound_below`, through the members `keep` keeps only.
+    fn bound_below_where(&self, node: NodeId, keep: impl Fn(MemberId) -> bool) -> Vec<NodeId> {
         let mut found = Vec::new();
         if let Some(parent) = self.nodes.get(&node) {
             let mut seen = BTreeSet::new();
-            let owners = parent.children.values().map(|(child, _)| child);
-            for child in owners.chain(parent.windows.values().flatten()) {
+            let owners = parent
+                .children
+                .iter()
+                .filter(|(member, _)| keep(**member))
+                .map(|(_, (child, _))| child);
+            let windows = parent
+                .windows
+                .iter()
+                .filter(|(member, _)| keep(**member))
+                .flat_map(|(_, windows)| windows);
+            for child in owners.chain(windows) {
                 if seen.insert(*child) {
                     found.push(*child);
                 }
@@ -5626,12 +5640,16 @@ impl Tree {
             let Some(object) = found.object.as_ref() else {
                 continue;
             };
-            if object.engine().is_some() {
-                continue;
-            }
-            pending.extend(self.bound_below(node));
+            // What a run makes restarts with the run; what the object
+            // places itself replays, and so does what is bound below it.
+            let engine = object.engine();
+            let made = |member: MemberId| engine.is_some_and(|engine| engine.makes(member));
+            pending.extend(self.bound_below_where(node, |member| !made(member)));
             let mut extents = Vec::new();
             for member in found.namespace.members() {
+                if made(member.id) {
+                    continue;
+                }
                 let Some(length) = member.length.filter(|_| member.crc32.is_some()) else {
                     continue;
                 };
@@ -6543,6 +6561,7 @@ mod tests {
     mod held_arrival;
     mod kin;
     mod lift;
+    mod made;
     mod never_open;
     mod numbered;
     mod pieces;
