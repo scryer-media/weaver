@@ -1328,9 +1328,9 @@ checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
 
 [[package]]
 name = "crc-turbo"
-version = "1.11.0"
+version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe9845f8267cd17ae1edacec5cd2bc0f8b891d1946db64d929209170fcf7e9b8"
+checksum = "ea95cf4ea91d9dd741a57556eb2e4e23aca661e068bf8b10fa59ee7191549790"
 dependencies = [
  "digest 0.10.7",
  "spin 0.10.1",
