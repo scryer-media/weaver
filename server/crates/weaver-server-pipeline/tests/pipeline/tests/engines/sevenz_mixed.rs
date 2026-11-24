@@ -631,9 +631,9 @@ mod nested {
     use super::*;
 
     // What every run said, by the node it ran for.
-    type Heard = Arc<Mutex<Vec<(NodeId, u64, String)>>>;
+    pub(super) type Heard = Arc<Mutex<Vec<(NodeId, u64, String)>>>;
 
-    fn heard(scenario: Scenario) -> (Scenario, Heard) {
+    pub(super) fn heard(scenario: Scenario) -> (Scenario, Heard) {
         let heard = Heard::default();
         let kept = Arc::clone(&heard);
         let scenario = scenario.on_run_message(move |node, generation, message| {
@@ -643,7 +643,7 @@ mod nested {
     }
 
     // The generations each node's runs emitted under, by node.
-    fn generations(heard: &Heard) -> BTreeMap<NodeId, BTreeSet<u64>> {
+    pub(super) fn generations(heard: &Heard) -> BTreeMap<NodeId, BTreeSet<u64>> {
         let mut by_node: BTreeMap<NodeId, BTreeSet<u64>> = BTreeMap::new();
         for (node, generation, message) in heard.lock().unwrap().iter() {
             if message.starts_with("Emit(") || message.starts_with("Paid(") {
@@ -671,10 +671,10 @@ mod nested {
     }
 
     // One folder of a 7z: its methods and the entries it holds.
-    type Folder<'a> = (Vec<EncoderConfiguration>, Vec<(&'a str, Vec<u8>)>);
+    pub(super) type Folder<'a> = (Vec<EncoderConfiguration>, Vec<(&'a str, Vec<u8>)>);
 
     // A 7z of `folders`.
-    fn sevenz(folders: &[Folder<'_>]) -> Vec<u8> {
+    pub(super) fn sevenz(folders: &[Folder<'_>]) -> Vec<u8> {
         let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
         for (methods, entries) in folders {
             writer.set_content_methods(methods.clone());
@@ -695,7 +695,10 @@ mod nested {
     }
 
     // Every file, every byte as written, and nothing else.
-    fn assert_delivers(graph_files: &BTreeMap<String, Vec<u8>>, files: &[(&str, Vec<u8>)]) {
+    pub(super) fn assert_delivers(
+        graph_files: &BTreeMap<String, Vec<u8>>,
+        files: &[(&str, Vec<u8>)],
+    ) {
         let mut names: Vec<String> = files.iter().map(|(name, _)| delivered(name)).collect();
         names.sort();
         assert_eq!(
@@ -822,19 +825,19 @@ mod nested {
         }
     }
 
-    fn inner_files() -> Vec<(&'static str, Vec<u8>)> {
+    pub(super) fn inner_files() -> Vec<(&'static str, Vec<u8>)> {
         vec![
             ("spark.mkv", payload(4 * ARTICLE + 3, 61)),
             ("flint.nfo", payload(ARTICLE / 2, 62)),
         ]
     }
 
-    fn inner_zip() -> Vec<u8> {
+    pub(super) fn inner_zip() -> Vec<u8> {
         zip_of(stored_zip(), &inner_files())
     }
 
     // What the 7z holds: a stored mkv, the zip, and an nfo.
-    fn outer_entries() -> Vec<(&'static str, Vec<u8>)> {
+    pub(super) fn outer_entries() -> Vec<(&'static str, Vec<u8>)> {
         vec![
             ("ember.mkv", payload(5 * ARTICLE + 11, 41)),
             ("inner.zip", inner_zip()),
@@ -844,7 +847,7 @@ mod nested {
 
     // What a job of any of them delivers: the 7z's files beside the zip,
     // and what the zip holds, in the job's folder.
-    fn delivery() -> Vec<(&'static str, Vec<u8>)> {
+    pub(super) fn delivery() -> Vec<(&'static str, Vec<u8>)> {
         let entries = outer_entries();
         let mut files = vec![entries[0].clone(), entries[2].clone()];
         files.extend(inner_files());
@@ -1322,5 +1325,523 @@ mod aes_coded {
         }
         assert_runs_made_only_coded(&spoken);
         assert!(closing(&spoken).len() >= 2, "{:?}", spoken.lock().unwrap());
+    }
+}
+
+// A mixed 7z posted in numbered parts, `lantern.7z.001` onward. The split
+// store places each part in its one member where the lengths before it end,
+// and the 7z store below reads that member as it reads a 7z posted whole: it
+// streams the stored members, shelves the headers and the coded pack, and
+// its run decodes the coded folder. Every case runs with the coded folder
+// plain, and under AES with the job's password.
+mod split {
+    use std::ops::Range;
+
+    use weaver_server_pipeline::pipeline::tests::engines::stall_fixtures::waiting_on_held_articles;
+
+    use super::nested::{assert_delivers, delivery, generations, heard, outer_entries, sevenz};
+    use super::*;
+
+    const AES: [bool; 2] = [false, true];
+
+    fn sealed(aes: bool) -> (Vec<u8>, Files) {
+        match aes {
+            false => mixed(MKV, delta()),
+            true => mixed_under(MKV, copy(), under_aes(delta()), false),
+        }
+    }
+
+    fn job(posts: Vec<Post>, aes: bool) -> Scenario {
+        let scenario = Scenario::new(posts);
+        match aes {
+            false => scenario,
+            true => scenario.global_password(SECRET),
+        }
+    }
+
+    // Where the coded pack, the stored member after it and the end header
+    // lie in the archive.
+    struct Layout {
+        pack: Range<usize>,
+        lumen: Range<usize>,
+        end: Range<usize>,
+    }
+
+    fn layout(archive: &[u8], files: &Files) -> Layout {
+        let lumen = files[3].1.as_slice();
+        let at = archive
+            .windows(lumen.len())
+            .position(|window| window == lumen)
+            .unwrap();
+        Layout {
+            pack: 32 + files[0].1.len()..at,
+            lumen: at..at + lumen.len(),
+            end: at + lumen.len()..archive.len(),
+        }
+    }
+
+    // The archive cut at `cuts`, posted as `lantern.7z.001` onward.
+    fn parts(archive: &[u8], cuts: &[usize]) -> Vec<Post> {
+        let mut bounds = vec![0];
+        bounds.extend_from_slice(cuts);
+        bounds.push(archive.len());
+        bounds
+            .windows(2)
+            .zip(1..)
+            .map(|(span, number)| {
+                Post::plain(
+                    &format!("lantern.7z.{number:03}"),
+                    archive[span[0]..span[1]].to_vec(),
+                )
+            })
+            .collect()
+    }
+
+    // Three parts: the coded pack across the first boundary, the stored
+    // member after it across the second.
+    fn three(archive: &[u8], files: &Files) -> Vec<Post> {
+        let at = layout(archive, files);
+        parts(archive, &[at.pack.start + 100, at.lumen.start + 30])
+    }
+
+    fn recovery(parts: &[Post], blocks: u32) -> Vec<Post> {
+        let files: Vec<(&str, &[u8])> = parts
+            .iter()
+            .map(|post| (post.name.as_str(), post.bytes.as_slice()))
+            .collect();
+        par2_set("lantern", &files, blocks)
+    }
+
+    // The part holding byte `at` of the archive, and its article there.
+    fn article_at(parts: &[Post], at: usize) -> (u32, u32) {
+        let mut start = 0;
+        for (index, part) in parts.iter().enumerate() {
+            if at < start + part.bytes.len() {
+                return (index as u32, ((at - start) / ARTICLE) as u32);
+            }
+            start += part.bytes.len();
+        }
+        panic!("{at} past the parts")
+    }
+
+    // Every article of part `part` lost.
+    fn lose_part(scenario: Scenario, parts: &[Post], part: u32) -> Scenario {
+        let articles = parts[part as usize].bytes.len().div_ceil(ARTICLE) as u32;
+        (0..articles).fold(scenario, |scenario, article| scenario.lost(part, article))
+    }
+
+    fn reordered(posts: &[Post], order: &[usize]) -> Vec<Post> {
+        order
+            .iter()
+            .map(|&index| Post::plain(&posts[index].name, posts[index].bytes.clone()))
+            .collect()
+    }
+
+    // The generations whose run closed a coded member.
+    fn closing(spoken: &Spoken) -> BTreeSet<u64> {
+        spoken
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, message)| message.contains("MemberClosed"))
+            .map(|(generation, _)| *generation)
+            .collect()
+    }
+
+    fn refused(spoken: &Spoken) -> bool {
+        spoken
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, message)| message.contains("Refuse"))
+    }
+
+    // Only the 7z store keeps a shelf, and it keeps the headers and the
+    // coded pack exactly: no stored byte, and nothing of the split store's.
+    fn assert_shelf(graph: &Outcome, archive: &[u8], files: &Files) {
+        let kept: Vec<(String, u64)> = graph
+            .graph()
+            .shelved_by
+            .values()
+            .filter(|(_, kept)| *kept > 0)
+            .cloned()
+            .collect();
+        assert_eq!(
+            kept,
+            vec![(
+                "sevenz_store".to_owned(),
+                archive.len() as u64 - stored_bytes(files)
+            )]
+        );
+        assert_shelf_gone(graph);
+    }
+
+    // Every member whole, the stored ones written once by the store, the
+    // coded ones made by one run that nothing refused, and the shelf exact.
+    async fn delivers(scenario: Scenario, archive: &[u8], files: &Files) -> Outcome {
+        let (scenario, spoken) = hearing(scenario);
+        let graph = run(&scenario).await;
+        assert_members(&graph, files);
+        assert_fetched_once(&graph);
+        assert!(kinds(&graph).contains(&"split"), "{:?}", kinds(&graph));
+        assert_runs_made_only_coded(&spoken);
+        assert_eq!(closing(&spoken).len(), 1, "{:?}", spoken.lock().unwrap());
+        assert!(!refused(&spoken), "{:?}", spoken.lock().unwrap());
+        assert_shelf(&graph, archive, files);
+        graph
+    }
+
+    // Held until nothing moves, then repaired: every member whole, and no
+    // run named a stored member.
+    async fn repaired_holding(scenario: Scenario, held: u32, files: &Files) -> Spoken {
+        let (scenario, spoken) = hearing(scenario);
+        let held = run_holding(&scenario, held).await;
+        assert_eq!(
+            held.status,
+            Some(JobStatus::Complete),
+            "{:?} {:?}",
+            held.files.keys(),
+            spoken.lock().unwrap()
+        );
+        let mut names: Vec<String> = files.iter().map(|(name, _)| delivered(name)).collect();
+        names.sort();
+        assert_eq!(held.files.keys().cloned().collect::<Vec<_>>(), names);
+        for (name, bytes) in files {
+            assert!(held.files[&delivered(name)] == *bytes, "{name} bytes");
+        }
+        assert_runs_made_only_coded(&spoken);
+        spoken
+    }
+
+    async fn repaired(scenario: Scenario, files: &Files) {
+        let (scenario, spoken) = hearing(scenario);
+        let graph = run(&scenario).await;
+        assert_members(&graph, files);
+        assert_fetched_once(&graph);
+        assert_runs_made_only_coded(&spoken);
+    }
+
+    // 1. A boundary anywhere: through the coded pack, through a stored
+    // member, through the end header with its last bytes alone in the last
+    // part, through the start header, and twelve small parts.
+    #[tokio::test]
+    async fn a_mixed_7z_cut_anywhere_delivers_every_member() {
+        for aes in AES {
+            let (archive, files) = sealed(aes);
+            let at = layout(&archive, &files);
+            let cases = [
+                ("pack", vec![at.pack.start + 100]),
+                ("stored", vec![32 + 100, at.lumen.start + 30]),
+                (
+                    "end header",
+                    vec![at.pack.start + 50, at.end.start + at.end.len() / 2],
+                ),
+                ("start header", vec![10]),
+                ("twelve", {
+                    let chunk = archive.len().div_ceil(12);
+                    (1..12).map(|part| part * chunk).collect()
+                }),
+            ];
+            for (case, cuts) in cases {
+                println!("{case}, aes {aes}");
+                delivers(job(parts(&archive, &cuts), aes), &archive, &files).await;
+            }
+        }
+    }
+
+    // 2. The last part posted first, or a middle part last: the store
+    // places each where it lies and delivers as in order.
+    #[tokio::test]
+    async fn parts_out_of_order_deliver_every_member() {
+        for aes in AES {
+            let (archive, files) = sealed(aes);
+            let posted = three(&archive, &files);
+            for order in [[2, 1, 0], [0, 2, 1]] {
+                println!("{order:?}, aes {aes}");
+                delivers(job(reordered(&posted, &order), aes), &archive, &files).await;
+            }
+        }
+    }
+
+    // 2. The part holding the middle of the coded pack out with the server
+    // but for its first article, which declares its length and so places
+    // every part after it: the store maps, and the run reads and waits on
+    // its shelf for the bytes still out, asks nothing and fails nothing,
+    // then decodes once they come. (A part none of whose articles came
+    // places nothing after it: the split store holds those bytes until one
+    // declares the part's length, so the 7z store sees no end header.)
+    #[tokio::test]
+    async fn a_run_waits_on_a_part_still_out() {
+        for aes in AES {
+            let (archive, files) = sealed(aes);
+            let at = layout(&archive, &files);
+            let posts = parts(&archive, &[at.pack.start + 20, at.pack.end - 20]);
+            let (scenario, spoken) = hearing(job(posts, aes));
+            let held =
+                waiting_on_held_articles(&scenario, |(part, article)| part == 1 && article > 0)
+                    .await;
+            assert_eq!(held.status, Some(JobStatus::Complete), "aes {aes}");
+            for (name, bytes) in &files {
+                assert!(held.files[&delivered(name)] == *bytes, "{name} bytes");
+            }
+            assert_runs_made_only_coded(&spoken);
+            assert_eq!(closing(&spoken).len(), 1);
+            assert!(!refused(&spoken), "{:?}", spoken.lock().unwrap());
+        }
+    }
+
+    // 3. A byte of the coded pack wrong as posted in the second part,
+    // under a PAR2 set over the parts held until nothing moves: the run
+    // reads the damage and ends, the set rebuilds the part, and the run
+    // starts over and makes the coded members; no run names a stored one.
+    #[tokio::test]
+    async fn a_coded_pack_damaged_in_one_part_is_repaired_after_its_run_read_it() {
+        for aes in AES {
+            let (archive, files) = sealed(aes);
+            let at = layout(&archive, &files);
+            let written = three(&archive, &files);
+            let (part, _) = article_at(&written, at.pack.start + 150);
+            assert_eq!(part, 1);
+            let mut posts = reordered(&written, &[0, 1, 2]);
+            posts[1].bytes[50] ^= 0x5a;
+            posts.extend(recovery(&written, 4));
+            let spoken = repaired_holding(job(posts, aes), 4, &files).await;
+            assert_eq!(closing(&spoken).len(), 1, "aes {aes}");
+        }
+    }
+
+    // 3. Damage the set repairs as the parts come: an article of a stored
+    // member, of the end header, the articles either side of a boundary in
+    // the coded pack, and a whole part.
+    #[tokio::test]
+    async fn damage_in_any_part_is_repaired() {
+        for aes in AES {
+            let (archive, files) = sealed(aes);
+            let at = layout(&archive, &files);
+            let written = three(&archive, &files);
+            let mut posts = reordered(&written, &[0, 1, 2]);
+            posts.extend(recovery(&written, 8));
+            let boundary = written[0].bytes.len();
+            assert!(at.pack.contains(&(boundary - ARTICLE)) && at.pack.contains(&(boundary + 1)));
+            let stored = article_at(&written, 32 + 100);
+            let header = article_at(&written, at.end.start + 1);
+            let before = article_at(&written, boundary - 1);
+            let after = article_at(&written, boundary);
+            let base = || {
+                job(
+                    reordered(&posts, &(0..posts.len()).collect::<Vec<_>>()),
+                    aes,
+                )
+            };
+            println!("stored, aes {aes}");
+            repaired(base().damaged(stored.0, stored.1), &files).await;
+            println!("end header, aes {aes}");
+            repaired(base().damaged(header.0, header.1), &files).await;
+            println!("boundary, aes {aes}");
+            repaired(
+                base().damaged(before.0, before.1).damaged(after.0, after.1),
+                &files,
+            )
+            .await;
+            println!("whole part, aes {aes}");
+            repaired(lose_part(base(), &written, 1), &files).await;
+        }
+    }
+
+    // 4. A whole part lost with no recovery: the set is not a file, as for a
+    // split 7z that stores everything. The part holding only the coded pack,
+    // and the part holding only the end header: each ends as the same cut of
+    // an all-stored 7z of the same files does.
+    #[tokio::test]
+    async fn a_part_lost_beyond_repair_ends_as_an_all_stored_split_does() {
+        for aes in AES {
+            let (mixed, files) = sealed(aes);
+            // The reference stores every folder plain: a folder of two
+            // members under AES and a copy is not the store's, so an
+            // all-stored set under AES goes to an engine.
+            let (stored, _) = mixed_under(MKV, copy(), copy(), false);
+            for (case, part) in [("pack", 1), ("end header", 2)] {
+                let mut ended = Vec::new();
+                for (archive, aes) in [(&mixed, aes), (&stored, false)] {
+                    let at = layout(archive, &files);
+                    let cuts = match case {
+                        "pack" => vec![at.pack.start + 10, at.pack.end - 10],
+                        _ => vec![at.pack.start + 10, at.end.start],
+                    };
+                    let posts = parts(archive, &cuts);
+                    let graph =
+                        run(&lose_part(job(parts(archive, &cuts), aes), &posts, part)).await;
+                    // Failed for the share lost or for the set: the share
+                    // differs with the archive's length, so the kind is
+                    // compared, with what was delivered.
+                    let kind = match graph.status {
+                        Some(JobStatus::Failed { .. }) => "failed",
+                        Some(JobStatus::Partial) => "partial",
+                        Some(JobStatus::Complete) => "complete",
+                        _ => "other",
+                    };
+                    ended.push((kind, graph.files.keys().cloned().collect::<Vec<_>>()));
+                }
+                println!("{case}, aes {aes}: {ended:?}");
+                assert_eq!(ended[0], ended[1], "{case}, aes {aes}");
+            }
+        }
+    }
+
+    // 5. Parts posted under names that number nothing, the PAR2 set last:
+    // the set names each part, and the store places it.
+    #[tokio::test]
+    async fn obfuscated_parts_named_by_the_set_deliver_every_member() {
+        for aes in AES {
+            let (archive, files) = sealed(aes);
+            let written = three(&archive, &files);
+            let mut posts: Vec<Post> = written
+                .iter()
+                .zip(0u32..)
+                .map(|(post, index)| {
+                    Post::plain(&format!("{:032x}", 0x5eed_0000 + index), post.bytes.clone())
+                })
+                .collect();
+            posts.swap(0, 1);
+            posts.extend(recovery(&written, 4));
+            repaired(job(posts, aes), &files).await;
+        }
+    }
+
+    // 5. The second and third parts posted under each other's numbers, the
+    // PAR2 set naming each: the set names them again and the store places
+    // them where they lie.
+    #[tokio::test]
+    async fn misnumbered_parts_named_by_the_set_deliver_every_member() {
+        for aes in AES {
+            let (archive, files) = sealed(aes);
+            let written = three(&archive, &files);
+            let mut posts = reordered(&written, &[0, 1, 2]);
+            posts[1].name = written[2].name.clone();
+            posts[2].name = written[1].name.clone();
+            posts.extend(recovery(&written, 4));
+            repaired(job(posts, aes), &files).await;
+        }
+    }
+
+    // 5. Two parts of one length inside the first stored member posted
+    // under each other's numbers, the PAR2 index that names them held until
+    // nothing moves: the store maps and the run makes the coded members
+    // first, and then the index names the parts again and they move.
+    #[tokio::test]
+    async fn parts_named_again_after_the_run_started_deliver_every_member() {
+        for aes in AES {
+            let (archive, files) = sealed(aes);
+            let written = parts(
+                &archive,
+                &[32 + ARTICLE, 32 + 2 * ARTICLE, 32 + 3 * ARTICLE],
+            );
+            let mut posts = reordered(&written, &[0, 1, 2, 3]);
+            posts[1].name = written[2].name.clone();
+            posts[2].name = written[1].name.clone();
+            posts.push(recovery(&written, 1).swap_remove(0));
+            let (scenario, spoken) = hearing(job(posts, aes));
+            let held = run_holding(&scenario, 4).await;
+            assert_eq!(
+                held.status,
+                Some(JobStatus::Complete),
+                "aes {aes}: {:?} {:?}",
+                held.files.keys(),
+                spoken.lock().unwrap()
+            );
+            for (name, bytes) in &files {
+                assert!(held.files[&delivered(name)] == *bytes, "{name} bytes");
+            }
+            assert!(!closing(&spoken).is_empty(), "{:?}", spoken.lock().unwrap());
+        }
+    }
+
+    // 6. Taken down and restored after every article.
+    #[tokio::test]
+    async fn restarted_after_every_article_delivers_every_member() {
+        for aes in AES {
+            let (archive, files) = sealed(aes);
+            let whole = restart_row(job(three(&archive, &files), aes)).await;
+            assert_members(&whole, &files);
+        }
+    }
+
+    // 7. A zip a coded member of a split mixed 7z, a byte of the coded pack
+    // wrong as posted in the second part: the run reads it and ends, the
+    // PAR2 set over the parts rebuilds it, and the run starts over, the zip
+    // below starting over on what it makes.
+    #[tokio::test]
+    async fn a_zip_coded_in_a_split_mixed_7z_starts_over_when_the_run_does() {
+        for aes in AES {
+            let entries = outer_entries();
+            let coded = match aes {
+                false => delta(),
+                true => under_aes(delta()),
+            };
+            let archive = sevenz(&[
+                (copy(), vec![entries[0].clone()]),
+                (coded, vec![entries[1].clone(), entries[2].clone()]),
+            ]);
+            let at = 32 + entries[0].1.len() + 100 + ARTICLE;
+            let written = parts(
+                &archive,
+                &[32 + entries[0].1.len() + 50, archive.len() - 100],
+            );
+            let (part, _) = article_at(&written, at);
+            assert_eq!(part, 1);
+            let mut posts = reordered(&written, &[0, 1, 2]);
+            posts[1].bytes[at - written[0].bytes.len()] ^= 0x5a;
+            posts.extend(recovery(&written, 4));
+            let (scenario, heard) = heard(job(posts, aes));
+            let held = run_holding(&scenario, 4).await;
+            assert_eq!(held.status, Some(JobStatus::Complete), "aes {aes}");
+            assert_delivers(&held.files, &delivery());
+            let ran = generations(&heard);
+            assert_eq!(ran.len(), 1, "only the 7z runs: {ran:?}");
+            assert!(
+                ran.values().all(|ran| ran.len() >= 2),
+                "the run ran again once repaired: {ran:?}"
+            );
+        }
+    }
+
+    // 8. The same files posted whole or in parts, and in parts stored,
+    // mixed or coded, deliver alike.
+    #[tokio::test]
+    async fn whole_or_split_stored_mixed_or_coded_deliver_alike() {
+        for aes in AES {
+            let (mixed, files) = sealed(aes);
+            let (seal, coded) = match aes {
+                false => (copy(), lzma2()),
+                true => (aes_copy(), under_aes(lzma2())),
+            };
+            let stored = sevenz(&[
+                (seal.clone(), vec![(files[0].0, files[0].1.clone())]),
+                (seal.clone(), vec![(files[1].0, files[1].1.clone())]),
+                (seal.clone(), vec![(files[2].0, files[2].1.clone())]),
+                (seal, vec![(files[3].0, files[3].1.clone())]),
+            ]);
+            let all: Vec<(&str, Vec<u8>)> = files.iter().map(|(n, b)| (*n, b.clone())).collect();
+            let compressed = sevenz(&[(coded, all)]);
+            let whole = run(&job(vec![Post::plain("lantern.7z", mixed.clone())], aes)).await;
+            assert_members(&whole, &files);
+            for (case, archive) in [
+                ("stored", stored),
+                ("mixed", mixed.clone()),
+                ("coded", compressed),
+            ] {
+                let graph = run(&job(sevenz_fixtures_split(&archive), aes)).await;
+                assert_eq!(
+                    graph.status, whole.status,
+                    "{case}, aes {aes}: {:?}",
+                    graph.failure
+                );
+                assert_eq!(graph.files, whole.files, "{case}, aes {aes}");
+            }
+        }
+    }
+
+    fn sevenz_fixtures_split(archive: &[u8]) -> Vec<Post> {
+        super::super::sevenz_fixtures::split(archive, 3)
     }
 }
