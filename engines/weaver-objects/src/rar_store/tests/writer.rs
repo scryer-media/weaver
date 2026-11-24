@@ -4,7 +4,8 @@
 // A small RAR writer for the tests: stored files and directories, split
 // across volumes at a data budget, AES through the formats' own key
 // derivations, enciphered headers, a recovery record, and the shapes the
-// store must hand to an engine (solid, compressed). Nothing here compresses.
+// store must hand to an engine (solid, compressed). Nothing here compresses:
+// a packed item carries data a real RAR coded.
 
 use aws_lc_rs::cipher::{AES_128, AES_256, EncryptingKey, EncryptionContext, UnboundCipherKey};
 use aws_lc_rs::iv::FixedLength;
@@ -21,6 +22,44 @@ pub(crate) enum Version {
 pub(crate) enum Item {
     File(&'static str, Vec<u8>),
     Dir(&'static str),
+    // A file whose data is `packed`, coded as `codec` says: packed bytes a
+    // real RAR wrote, lifted from a fixture, so a decoder makes `plain`.
+    Packed {
+        name: &'static str,
+        plain: Vec<u8>,
+        packed: Vec<u8>,
+        codec: Codec,
+    },
+}
+
+// How a file's data is coded: a RAR method (1 to 5), the RAR5 algorithm
+// version, and the dictionary its header names, a power of two from the
+// format's least (128 KiB for RAR5, 64 KiB for RAR4).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Codec {
+    pub(crate) method: u8,
+    pub(crate) version: u8,
+    pub(crate) dict: u64,
+}
+
+impl Codec {
+    // What `options.compressed` names: method 3 at the least dictionary.
+    const MARKED: Codec = Codec {
+        method: 3,
+        version: 0,
+        dict: 0,
+    };
+
+    // The dictionary's bits above `least`.
+    fn dict_bits(&self, least: u64) -> u64 {
+        match self.dict {
+            0 => 0,
+            dict => {
+                assert!(dict.is_power_of_two() && dict >= least, "{dict}");
+                u64::from((dict / least).trailing_zeros())
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -103,7 +142,7 @@ struct Part<'a> {
     crc: u32,
     before: bool,
     after: bool,
-    compressed: bool,
+    codec: Option<Codec>,
 }
 
 struct Keys5 {
@@ -174,9 +213,13 @@ impl Rar5<'_> {
         body.extend(vint(part.length));
         body.extend(vint(0));
         body.extend(part.crc.to_le_bytes());
-        let method = if part.compressed { 3 } else { 0 };
+        let info = part.codec.map_or(0, |codec| {
+            u64::from(codec.version)
+                | u64::from(codec.method) << 7
+                | codec.dict_bits(128 << 10) << 10
+        });
         let solid = if self.options.solid { 0x40 } else { 0 };
-        body.extend(vint(method << 7 | solid));
+        body.extend(vint(info | solid));
         body.extend(vint(1));
         body.extend(vint(part.name.len() as u64));
         body.extend_from_slice(part.name.as_bytes());
@@ -253,7 +296,7 @@ impl Layout for Rar5<'_> {
                 crc: crc32(data),
                 before: false,
                 after: false,
-                compressed: false,
+                codec: None,
             },
         )
     }
@@ -332,13 +375,16 @@ impl Rar4<'_> {
         if self.options.solid {
             flags |= 0x10;
         }
+        if let Some(codec) = part.codec {
+            flags |= (codec.dict_bits(64 << 10) as u16) << 5;
+        }
         let mut body = (part.data.len() as u32).to_le_bytes().to_vec();
         body.extend((part.length as u32).to_le_bytes());
         body.push(3);
         body.extend(part.crc.to_le_bytes());
         body.extend(0x5a21_0000u32.to_le_bytes());
         body.push(29);
-        body.push(if part.compressed { 0x33 } else { 0x30 });
+        body.push(0x30 + part.codec.map_or(0, |codec| codec.method));
         body.extend((part.name.len() as u16).to_le_bytes());
         body.extend(0u32.to_le_bytes());
         body.extend_from_slice(part.name.as_bytes());
@@ -391,7 +437,7 @@ impl Layout for Rar4<'_> {
                 crc: crc32(data),
                 before: false,
                 after: false,
-                compressed: false,
+                codec: None,
             },
         )
     }
@@ -526,11 +572,25 @@ pub(crate) fn write(items: &[Item], options: &Options) -> Vec<Vec<u8>> {
     };
     volumes.start();
     for (index, item) in items.iter().enumerate() {
-        let (name, dir, plain) = match item {
-            Item::File(name, bytes) => (*name, false, bytes.as_slice()),
-            Item::Dir(name) => (*name, true, &[][..]),
+        let (name, dir, plain, packed) = match item {
+            Item::File(name, bytes) => (*name, false, bytes.as_slice(), None),
+            Item::Dir(name) => (*name, true, &[][..], None),
+            Item::Packed {
+                name,
+                plain,
+                packed,
+                codec,
+            } => (
+                *name,
+                false,
+                plain.as_slice(),
+                Some((packed.as_slice(), *codec)),
+            ),
         };
-        let stream = layout.cipher(plain);
+        let codec = packed
+            .map(|(_, codec)| codec)
+            .or((options.compressed == Some(index)).then_some(Codec::MARKED));
+        let stream = layout.cipher(packed.map_or(plain, |(packed, _)| packed));
         let whole = layout.keyed(crc32(plain));
         let mut offset = 0;
         loop {
@@ -553,7 +613,7 @@ pub(crate) fn write(items: &[Item], options: &Options) -> Vec<Vec<u8>> {
                 },
                 before: offset > 0,
                 after: !last,
-                compressed: options.compressed == Some(index),
+                codec,
             };
             let header = layout.file(&part);
             volumes.header(header, data);

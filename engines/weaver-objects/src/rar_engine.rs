@@ -109,6 +109,15 @@ impl Format for Rar {
 
 pub type RarEngine = EngineObject<Rar>;
 
+// Spike: a run that decodes only the members at the archive indexes given.
+#[cfg(test)]
+pub(crate) fn run_only(
+    password: Option<String>,
+    members: std::collections::BTreeSet<usize>,
+) -> Box<dyn Extraction> {
+    Box::new(run::Run::only(password, members))
+}
+
 // The most a RAR4 end record takes: its seven bytes, the CRC32 of the
 // volume before it, its number and the seven it reserves after (UnRAR
 // `arcread.cpp`, `HEAD_ENDARC`).

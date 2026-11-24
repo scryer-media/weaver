@@ -15,7 +15,7 @@
 // come, the walk reads on the headers of the volumes already in and the
 // files there decode beside it, said once it closes.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -48,11 +48,27 @@ pub(super) const EMIT_BYTES: usize = 1 << 20;
 
 pub(super) struct Run {
     password: Option<String>,
+    // Spike: the members, by archive index, a run decodes; the rest it
+    // passes over without reading their data. None decodes every member.
+    only: Option<BTreeSet<usize>>,
 }
 
 impl Run {
     pub(super) fn new(password: Option<String>) -> Self {
-        Self { password }
+        Self {
+            password,
+            only: None,
+        }
+    }
+
+    // Spike: a run that decodes only `members`, by archive index, one at a
+    // time on the run's thread.
+    #[cfg(test)]
+    pub(super) fn only(password: Option<String>, members: BTreeSet<usize>) -> Self {
+        Self {
+            password,
+            only: Some(members),
+        }
     }
 }
 
@@ -77,6 +93,7 @@ impl Extraction for Run {
             next: 0,
             open: None,
             reading: 0,
+            only: self.only,
         };
         let Err(Stop::Say(last)) = walk.archive(self.password.as_deref()) else {
             return;
@@ -122,6 +139,7 @@ struct Walk<'s, 'a> {
     open: Option<Open>,
     // The volume whose headers are being read.
     reading: usize,
+    only: Option<BTreeSet<usize>>,
 }
 
 impl Walk<'_, '_> {
@@ -201,7 +219,7 @@ impl Walk<'_, '_> {
     // Whether members may decode beside each other: those of a set that is
     // not solid, on more than the run's own thread.
     fn spreads(&self, archive: &RarArchive) -> bool {
-        self.budget.threads() > 1 && !archive.is_solid()
+        self.budget.threads() > 1 && !archive.is_solid() && self.only.is_none()
     }
 
     // How many members from `index` on may decode side by side.
@@ -369,6 +387,16 @@ impl Walk<'_, '_> {
         // A link is not a file body, so it is no member and the files around
         // it stand.
         if link(archive, index, &info) {
+            return Ok(1);
+        }
+        // Spike: a member the run was not asked for keeps its id and is
+        // passed over unread.
+        if self
+            .only
+            .as_ref()
+            .is_some_and(|only| !only.contains(&index))
+        {
+            self.next += 1;
             return Ok(1);
         }
         // A directory is a member with nothing in it, named with a trailing

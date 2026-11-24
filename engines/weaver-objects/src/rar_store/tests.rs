@@ -4,6 +4,7 @@
 mod contested;
 mod contradicted;
 mod facts;
+mod mixed;
 mod owner;
 mod placement;
 mod recovery_contracts;
