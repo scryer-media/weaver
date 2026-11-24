@@ -4594,3 +4594,156 @@ async fn an_inbound_peer_rides_the_rung_it_arrived_on() {
         (vec![9], Some(0))
     );
 }
+
+// An HTTP proxy hop that names through two servers asked through itself,
+// as a route's listed servers are, reached through `stage`, with a
+// three-second timeout and a watched failure record.
+fn naming_through_itself(stage: Arc<dyn Dialer>, turns: Arc<Turns>) -> Arc<TransportHop> {
+    Arc::new(TransportHop::new(
+        7,
+        TransportProxy {
+            kind: crate::transport::TransportKind::HttpConnect,
+            host: "192.0.2.1".into(),
+            port: 8080,
+            username: None,
+            password: None,
+        },
+        stage,
+        Duration::from_secs(3),
+        Naming::proxy_servers(
+            vec![
+                DnsServer::plain("192.0.2.53".parse().unwrap()),
+                DnsServer::plain("192.0.2.54".parse().unwrap()),
+            ],
+            Trust::AsSent,
+        ),
+        std::sync::Arc::new(crate::pipe::NamesSlot::new(crate::pipe::Names::new(
+            crate::pipe::DnsChoice::System,
+            None,
+        ))),
+        HopFailure::watched(turns),
+    ))
+}
+
+fn named_usenet() -> Target {
+    Target {
+        host: "news.invalid".into(),
+        port: 119,
+        purpose: Purpose::Nntp {
+            server: 1,
+            leg: 0,
+            probing: false,
+        },
+        addresses: Vec::new(),
+    }
+}
+
+// A proxy that answered once and then keeps quiet for every CONNECT, the
+// lookups' among them. While it answered within `LIVE_WINDOW`, a lookup
+// through it that runs out its window is the name's, as a quiet CONNECT is
+// the destination's: nothing cools and nothing is recorded. Past the window
+// it is the hop's own timeout, which cools the rung and records the hop
+// failing, told once however many of the lookup's dials ran out.
+#[tokio::test(start_paused = true)]
+async fn a_lookup_through_a_proxy_gone_quiet_is_the_hops_once_it_is_not_known_alive() {
+    let stage = Arc::new(Answered {
+        reply: Mutex::new(b"HTTP/1.1 200 Connection established\r\n\r\n"),
+        far: Default::default(),
+    });
+    let turns = Arc::new(Turns::default());
+    let http = naming_through_itself(stage.clone(), turns.clone());
+    let ladder = Fallback::new(vec![http.clone()]);
+    assert!(http.dial(&target("192.0.2.9:119".parse().unwrap())).await.is_ok());
+    assert_eq!(turns.taken(), vec![None]);
+    *stage.reply.lock().unwrap() = b"";
+
+    let error = ladder.dial(&named_usenet()).await.err().expect("no answer");
+    assert!(ResolveTimedOut::is(&error), "{error:?}");
+    assert_eq!(
+        error.to_string(),
+        "destination connection failed: name resolution timed out: news.invalid"
+    );
+    assert!(!error.is_path_evidence());
+    assert!(ladder.allows_rung(0, false));
+    assert_eq!(http.failing_hop(), None);
+    assert_eq!(turns.taken(), Vec::new());
+
+    tokio::time::advance(LIVE_WINDOW).await;
+    let error = ladder.dial(&named_usenet()).await.err().expect("no answer");
+    match &error {
+        DialError::Timeout { stage } => assert_eq!(stage, &http.describe()),
+        other => panic!("expected the hop's timeout, got {other:?}"),
+    }
+    assert!(error.is_path_evidence());
+    assert!(!ladder.allows_rung(0, false));
+    assert_eq!(http.failing_hop().map(|hop| hop.proxy), Some(7));
+    let told = turns.taken();
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert!(told[0].is_some());
+}
+
+// A proxy quiet from its first CONNECT never answered, so the first lookup
+// through it that runs out its window is already the hop's own timeout.
+#[tokio::test(start_paused = true)]
+async fn a_lookup_through_a_proxy_quiet_from_the_start_is_the_hops() {
+    let stage = Arc::new(Answered {
+        reply: Mutex::new(b""),
+        far: Default::default(),
+    });
+    let turns = Arc::new(Turns::default());
+    let http = naming_through_itself(stage, turns.clone());
+    let ladder = Fallback::new(vec![http.clone()]);
+    let error = ladder.dial(&named_usenet()).await.err().expect("no answer");
+    assert!(
+        matches!(&error, DialError::Timeout { stage } if stage == &http.describe()),
+        "{error:?}"
+    );
+    assert!(!ladder.allows_rung(0, false));
+    assert_eq!(http.failing_hop().map(|hop| hop.proxy), Some(7));
+    let told = turns.taken();
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert!(told[0].is_some());
+}
+
+// A stage that never connects.
+struct Unanswering;
+#[async_trait::async_trait]
+impl Dialer for Unanswering {
+    async fn dial(&self, _: &Target) -> Result<Dialed, DialError> {
+        std::future::pending().await
+    }
+    fn budget(&self) -> Duration {
+        Duration::from_secs(1)
+    }
+    fn describe(&self) -> String {
+        "unanswering".into()
+    }
+}
+
+// A naming whose servers are asked from an egress, not through the hop,
+// says nothing of the proxy when its lookup runs out its window, even for
+// a proxy that never answered: the error stays the name's.
+#[tokio::test(start_paused = true)]
+async fn a_lookup_asked_past_the_hop_that_runs_out_stays_the_names() {
+    let turns = Arc::new(Turns::default());
+    let http = naming_through_itself(
+        Arc::new(Answered {
+            reply: Mutex::new(b""),
+            far: Default::default(),
+        }),
+        turns.clone(),
+    );
+    let mut http = Arc::into_inner(http).expect("one owner");
+    http.naming = Naming::servers(
+        vec![DnsServer::plain("192.0.2.53".parse().unwrap())],
+        Trust::AsSent,
+        Arc::new(Unanswering),
+    );
+    let http = Arc::new(http);
+    let ladder = Fallback::new(vec![http.clone()]);
+    let error = ladder.dial(&named_usenet()).await.err().expect("no answer");
+    assert!(ResolveTimedOut::is(&error), "{error:?}");
+    assert!(ladder.allows_rung(0, false));
+    assert_eq!(http.failing_hop(), None);
+    assert_eq!(turns.taken(), Vec::new());
+}
