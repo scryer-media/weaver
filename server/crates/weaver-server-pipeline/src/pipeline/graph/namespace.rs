@@ -1167,6 +1167,23 @@ impl NamespaceWriter {
             .map(|kept| kept.path().to_path_buf())
     }
 
+    // The bytes every object keeps in its envelopes, over every volume.
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
+    pub(crate) fn kept_bytes(&self) -> u64 {
+        self.envelopes
+            .nodes()
+            .filter_map(|node| self.envelopes.shelf_of(node))
+            .map(|shelf| {
+                let state = shelf.lock();
+                state
+                    .kept
+                    .values()
+                    .map(|kept| kept.coverage.bytes_covered())
+                    .sum::<u64>()
+            })
+            .sum()
+    }
+
     // Why the member is a leaf, when an object or the holds budgets refused
     // to own it.
     pub fn refused(&self, node: NodeId, member: MemberId) -> Option<Why> {

@@ -17,6 +17,7 @@ mod pipeline {
             };
             mod rar;
             mod sevenz;
+            mod sevenz_mixed;
         }
     }
 }

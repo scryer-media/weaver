@@ -1129,6 +1129,9 @@ pub struct GraphView {
     // members, with the name ledger for the parts of its paths, at any
     // look, summed from the tree.
     pub resident: u64,
+    // The most every object's envelopes kept at any look, over every
+    // volume: the bytes the job wrote for its runs to read.
+    pub shelved: u64,
     // The time the looks themselves took, which a run's time is not.
     pub observed: std::time::Duration,
     // What the job's report showed at each look, its status and whether it
@@ -2054,6 +2057,7 @@ pub(in crate::pipeline::tests) fn observe(
     );
     view.offered = job.passwords_offered();
     view.scratch = view.scratch.max(tree_bytes(&state.working_dir));
+    view.shelved = view.shelved.max(job.writer().kept_bytes());
     view.checkpoints = job.pending().tally();
     view.delivery = pipeline.graph_delivery(JOB).unwrap_or_default();
     view.health = pipeline.graph_failure_is_health(JOB);
