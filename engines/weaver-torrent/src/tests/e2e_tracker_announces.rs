@@ -2672,9 +2672,13 @@ async fn test_a_moved_torrent_announces_on_from_where_it_stood() -> anyhow::Resu
     let (conn, query) = read_announce_query(&tracker).await?;
     assert_eq!(param(&query, "event"), Some("started"));
     assert_eq!(param(&query, "downloaded"), Some("0"));
-    handle.set_file_priorities(&[(1, FilePriority::Normal)])?;
     let (_second_seeder, second_addr) = t.seed().await?;
     respond_bytes(conn, &answer_with_peer(second_addr)?).await?;
+    // The second file is wanted once `started` is answered: a run that
+    // becomes a seed while its `started` is out owes `completed` at the
+    // interval that answer sets, not at once.
+    announce_ended(&handle, |l| l.result.is_ok()).await?;
+    handle.set_file_priorities(&[(1, FilePriority::Normal)])?;
     let (conn, query) = read_announce_query(&tracker).await?;
     assert_eq!(param(&query, "event"), Some("completed"));
     assert_eq!(param(&query, "downloaded"), Some(file.as_str()));
