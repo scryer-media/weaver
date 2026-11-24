@@ -13,6 +13,7 @@
 // The object is pure: no I/O, no threads, no files. Bytes it cannot place yet
 // are held by its owner, who hands them back once the map places them.
 
+mod coded;
 mod header;
 mod map;
 mod open;
@@ -267,6 +268,10 @@ pub struct SevenZipStore {
     // coders state it, once it is given up to the engine.
     #[serde(default)]
     window: Option<u64>,
+    // Spike: a coded folder is kept in the envelope for a run instead of
+    // giving the whole container up.
+    #[serde(default)]
+    mixed: bool,
     // Candidates whose folder keys the cache has no answer for: derived
     // away from the loop while the store is lent out, and the folders open
     // once it is back. Neither is kept: a restart offers the password
@@ -376,10 +381,17 @@ impl SevenZipStore {
             stale: true,
             gone: false,
             window: None,
+            mixed: false,
             derive_due: BTreeSet::new(),
             derived: BTreeMap::new(),
             placed: Placed::default(),
         }
+    }
+
+    // Spike: streams the stored folders of a set that also codes some.
+    pub fn mixed(mut self) -> Self {
+        self.mixed = true;
+        self
     }
 
     // Held to what `budget` grants.
@@ -553,7 +565,7 @@ impl SevenZipStore {
     }
 
     fn build(&mut self, archive: &sevenz_turbo::Archive, read: &[ByteRange], out: &mut Vec<Emit>) {
-        let map = match map::build(archive) {
+        let map = match map::build_with(archive, self.mixed) {
             Ok(map) => map,
             Err(why) => {
                 self.window = window(archive);
@@ -794,7 +806,7 @@ impl Object for SevenZipStore {
                 .get(member.0 as usize)
                 .and_then(|entry| entry.folder)
                 .and_then(|folder| map.folders.get(folder))
-                .is_some_and(|folder| folder.aes.is_none())
+                .is_some_and(|folder| folder.aes.is_none() && !folder.coded)
         })
     }
 

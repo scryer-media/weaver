@@ -3,6 +3,7 @@
 
 mod facts;
 mod map;
+mod mixed;
 mod owner;
 
 use std::io::Cursor;

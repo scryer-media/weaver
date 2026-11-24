@@ -25,6 +25,10 @@ pub(super) struct Folder {
     pub(super) aes: Option<AesProperties>,
     // Its streamed entries, by index, in offset order.
     pub(super) entries: Vec<usize>,
+    // Compressed: its packs are the envelope's, kept for a run that decodes
+    // the coded folders alone, and its entries take no bytes from here.
+    #[serde(default)]
+    pub(super) coded: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -125,6 +129,14 @@ fn align(len: u64) -> Result<u64, Why> {
 // and several entries share one, so a container with anything but stored
 // folders goes to an engine whole, with its bytes still in hand.
 pub(super) fn build(archive: &Archive) -> Result<Map, Why> {
+    build_with(archive, false)
+}
+
+// As `build`, and with `mixed` a folder that codes its bytes is flagged
+// rather than refused: its packs go to the envelope for a run to decode,
+// and the stored folders beside it stream as ever. AES among a coded
+// folder's coders still refuses, and so does a set with no stored folder.
+pub(super) fn build_with(archive: &Archive, mixed: bool) -> Result<Map, Why> {
     let firsts = archive.stream_map.block_first_pack_stream_index();
     let offsets = archive.stream_map.pack_stream_offsets();
     let sizes = archive.pack_sizes();
@@ -142,17 +154,23 @@ pub(super) fn build(archive: &Archive) -> Result<Map, Why> {
     }
     let mut folders = Vec::with_capacity(archive.blocks.len());
     for (index, block) in archive.blocks.iter().enumerate() {
-        if block
-            .coders
-            .iter()
-            .any(|coder| coder.num_input_streams() != 1 || coder.num_output_streams() != 1)
-        {
-            return Err(coder_refusal(block));
-        }
         let methods: Vec<_> = block
             .ordered_coder_iter()
             .map(|(_, coder)| coder.encoder_method_id())
             .collect();
+        let simple = block
+            .coders
+            .iter()
+            .all(|coder| coder.num_input_streams() == 1 && coder.num_output_streams() == 1);
+        let streams =
+            simple && (methods == [COPY] || methods == [AES, COPY] || methods == [COPY, AES]);
+        if !streams {
+            if mixed && coder_refusal(block) == Why::Compressed {
+                folders.push(coded(archive, index, block)?);
+                continue;
+            }
+            return Err(coder_refusal(block));
+        }
         let aes = if methods == [COPY] {
             None
         } else if methods == [AES, COPY] || methods == [COPY, AES] {
@@ -213,6 +231,7 @@ pub(super) fn build(archive: &Archive) -> Result<Map, Why> {
             plain_len,
             aes,
             entries: Vec::new(),
+            coded: false,
         });
     }
     // Each folder's running cursor: the entries sharing one are laid out end
@@ -285,6 +304,10 @@ pub(super) fn build(archive: &Archive) -> Result<Map, Why> {
     if entries.iter().all(|entry| entry.folder.is_none()) {
         return Err(Why::Unsupported);
     }
+    // Nothing stored: an engine reads the whole set better.
+    if folders.iter().all(|folder| folder.coded) {
+        return Err(Why::Compressed);
+    }
     // Lookups by container offset walk the packs in order: they must follow
     // one another without overlap.
     if folders
@@ -296,7 +319,37 @@ pub(super) fn build(archive: &Archive) -> Result<Map, Why> {
     Ok(Map { folders, entries })
 }
 
+// A coded folder: its pack streams, end to end, are one range of the
+// container, and its size is what its coders say it unpacks to.
+fn coded(archive: &Archive, index: usize, block: &Block) -> Result<Folder, Why> {
+    let streams = archive.block_pack_streams(index);
+    let first = streams.first().ok_or(Why::Unsupported)?;
+    let mut end = first.offset;
+    for stream in &streams {
+        if stream.offset != end {
+            return Err(Why::Unsupported);
+        }
+        end = end.checked_add(stream.size).ok_or(Why::Unsupported)?;
+    }
+    Ok(Folder {
+        pack: ByteRange::new(first.offset, end),
+        plain_len: block.get_unpack_size(),
+        aes: None,
+        entries: Vec::new(),
+        coded: true,
+    })
+}
+
 impl Map {
+    // The coded folders, by index, in order.
+    pub(super) fn coded(&self) -> impl Iterator<Item = usize> + '_ {
+        self.folders
+            .iter()
+            .enumerate()
+            .filter(|(_, folder)| folder.coded)
+            .map(|(index, _)| index)
+    }
+
     pub(super) fn entry(&self, member: MemberId) -> Option<&Entry> {
         self.entries.get(member.0 as usize)
     }
@@ -337,7 +390,7 @@ impl Map {
         range: ByteRange,
     ) -> Option<(usize, ByteRange)> {
         let entry = self.entry(member)?;
-        let folder = entry.folder?;
+        let folder = entry.folder.filter(|folder| !self.folders[*folder].coded)?;
         let range = range.intersect(ByteRange::new(0, entry.length))?;
         let start = self.folders[folder].pack.start + entry.offset;
         Some((folder, range.shift(start as i64)))
