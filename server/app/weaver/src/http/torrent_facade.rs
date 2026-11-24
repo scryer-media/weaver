@@ -2001,7 +2001,7 @@ type InfoPage<'r> = Vec<(&'r TorrentRow, Map<String, Value>)>;
 // but its files and trackers: the rows `pick` and `ask` keep, in the order
 // the torrents were added or `ask` sorts them, of those the page `ask`
 // takes. Clock fields are run on to `now_ms` from the reading each row came
-// from. Only the rows a sort reads, or the page, are written out.
+// from. A sort reads each row's one column; only the page is written out.
 fn info_rows<'r>(
     rows: &'r [Arc<TorrentRow>],
     pick: &RowPick<'_>,
@@ -2019,41 +2019,62 @@ fn info_rows<'r>(
         let page = info_page(ask.limit, ask.offset, kept.len()).unwrap_or(0..kept.len());
         return Ok(kept[page].iter().map(|row| written(row)).collect());
     };
-    let mut list: Vec<_> = kept.into_iter().map(written).collect();
+    let mut list = kept;
     // The files and trackers a row lists are columns too: every row's are
     // lists, which order none before another.
     let listed = match column {
         "files" => list
             .first()
-            .is_some_and(|(row, _)| ask.with_files && row.view.pieces.is_some()),
+            .is_some_and(|row| ask.with_files && row.view.pieces.is_some()),
         "trackers" => ask.with_trackers,
         _ => false,
     };
     if !listed {
-        if list
-            .first()
-            .is_some_and(|(_, fields)| !fields.contains_key(column))
-        {
+        let mut sorted: Vec<(&'r TorrentRow, Option<Value>)> = list
+            .into_iter()
+            .map(|row| (row, info_field(row, scope, now_ms, column)))
+            .collect();
+        if sorted.first().is_some_and(|(_, value)| value.is_none()) {
             return Err(Box::new(text(
                 StatusCode::BAD_REQUEST,
                 "'sort' parameter is invalid",
             )));
         }
-        list.sort_by(|(_, left), (_, right)| {
-            let field =
-                |fields: &'_ Map<String, Value>| fields.get(column).unwrap_or(&Value::Null).clone();
-            info_order(&field(left), &field(right), ask.reverse)
+        sorted.sort_by(|(_, left), (_, right)| {
+            info_order(
+                left.as_ref().unwrap_or(&Value::Null),
+                right.as_ref().unwrap_or(&Value::Null),
+                ask.reverse,
+            )
         });
+        list = sorted.into_iter().map(|(row, _)| row).collect();
     }
-    if let Some(page) = info_page(ask.limit, ask.offset, list.len()) {
-        list = list.drain(page).collect();
-    }
-    Ok(list)
+    let page = info_page(ask.limit, ask.offset, list.len()).unwrap_or(0..list.len());
+    Ok(list[page].iter().map(|row| written(row)).collect())
 }
 
 // A published row's `torrents/info` fields, its files and trackers aside,
 // its clock fields run on to `now_ms`.
 fn info_fields(row: &TorrentRow, scope: CallerScope, now_ms: i64) -> Map<String, Value> {
+    info_field_list(row, scope, now_ms)
+        .map(|(name, value)| (name.to_owned(), value))
+        .collect()
+}
+
+// One of `info_fields`, its value as they give it: the last of that name.
+fn info_field(row: &TorrentRow, scope: CallerScope, now_ms: i64, column: &str) -> Option<Value> {
+    info_field_list(row, scope, now_ms)
+        .filter(|(name, _)| *name == column)
+        .last()
+        .map(|(_, value)| value)
+}
+
+// `info_fields` as named values, in order.
+fn info_field_list(
+    row: &TorrentRow,
+    scope: CallerScope,
+    now_ms: i64,
+) -> impl Iterator<Item = (&'static str, Value)> {
     let view = &row.view;
     steady_row(view, row.totals, &row.trackers, scope)
         .into_iter()
@@ -2062,8 +2083,6 @@ fn info_fields(row: &TorrentRow, scope: CallerScope, now_ms: i64) -> Map<String,
             view.clock_at(now_ms),
             now_ms.div_euclid(1000),
         ))
-        .map(|(name, value)| (name.to_owned(), value))
-        .collect()
 }
 
 // A row's files and trackers, as `ask` lists them: a torrent's files only

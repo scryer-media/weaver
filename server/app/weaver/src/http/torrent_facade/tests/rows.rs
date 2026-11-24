@@ -1251,3 +1251,126 @@ async fn torrents_info_polls_build_no_view_and_read_nothing() {
     assert!(rounds.windows(2).all(|pair| pair[0] == pair[1]));
     torrents.stop().await;
 }
+
+// `info_rows` as it was before a sort read one column: every kept row's
+// fields written out, sorted by the column's value in them, then paged.
+// The reference the test below compares with.
+fn info_rows_written_whole<'r>(
+    rows: &'r [Arc<TorrentRow>],
+    pick: &RowPick<'_>,
+    ask: &InfoAsk<'_>,
+    scope: CallerScope,
+    now_ms: i64,
+) -> Result<InfoPage<'r>, Box<Response>> {
+    let kept: Vec<&TorrentRow> = rows
+        .iter()
+        .map(Arc::as_ref)
+        .filter(|row| pick.keeps(&row.view) && ask.passes(&row.view))
+        .collect();
+    let written = |row: &'r TorrentRow| (row, info_fields(row, scope, now_ms));
+    let Some(column) = ask.sort else {
+        let page = info_page(ask.limit, ask.offset, kept.len()).unwrap_or(0..kept.len());
+        return Ok(kept[page].iter().map(|row| written(row)).collect());
+    };
+    let mut list: Vec<_> = kept.into_iter().map(written).collect();
+    let listed = match column {
+        "files" => list
+            .first()
+            .is_some_and(|(row, _)| ask.with_files && row.view.pieces.is_some()),
+        "trackers" => ask.with_trackers,
+        _ => false,
+    };
+    if !listed {
+        if list
+            .first()
+            .is_some_and(|(_, fields)| !fields.contains_key(column))
+        {
+            return Err(Box::new(text(
+                StatusCode::BAD_REQUEST,
+                "'sort' parameter is invalid",
+            )));
+        }
+        list.sort_by(|(_, left), (_, right)| {
+            let field =
+                |fields: &'_ Map<String, Value>| fields.get(column).unwrap_or(&Value::Null).clone();
+            info_order(&field(left), &field(right), ask.reverse)
+        });
+    }
+    if let Some(page) = info_page(ask.limit, ask.offset, list.len()) {
+        list = list.drain(page).collect();
+    }
+    Ok(list)
+}
+
+// A sort that reads only its column of each row, and writes out the page
+// alone, answers as writing out every row did: the same rows, order,
+// fields and refusals, for every column `torrents/info` lists, the files
+// and trackers lists and an unknown column, both ways, over pages and
+// filters, across torrents of mixed states that tie on many columns.
+#[tokio::test]
+async fn a_sort_by_one_column_answers_as_every_row_written_out() {
+    let views: Vec<TorrentView> = info_views().into_iter().take(600).collect();
+    let snapshot = Snapshot::default();
+    snapshot.replace_every(&rows_of(&views));
+    let (_, rows) = snapshot.every();
+    let mut columns: Vec<String> = rows
+        .iter()
+        .flat_map(|row| info_fields(row, CallerScope::Admin, AT * 1000).into_iter())
+        .map(|(name, _)| name)
+        .collect();
+    columns.sort();
+    columns.dedup();
+    assert!(columns.len() > 50, "{columns:?}");
+    columns.extend(["files", "trackers", "no_such_column"].map(str::to_owned));
+    let pages: &[&[(&str, &str)]] = &[
+        &[],
+        &[("limit", "40")],
+        &[("offset", "35"), ("limit", "25")],
+        &[("offset", "-30")],
+        &[("filter", "downloading"), ("limit", "20"), ("offset", "3")],
+        &[
+            ("includeFiles", "true"),
+            ("includeTrackers", "true"),
+            ("limit", "15"),
+        ],
+    ];
+    let mut compared = 0;
+    for column in &columns {
+        for reverse in ["false", "true"] {
+            for page in pages {
+                for scope in [CallerScope::Admin, CallerScope::Read] {
+                    let mut pairs = vec![("sort", column.as_str()), ("reverse", reverse)];
+                    pairs.extend_from_slice(page);
+                    let params = params(&pairs);
+                    let ask = InfoAsk::of(&params);
+                    let hashes = info_hashes(&params);
+                    let pick = info_pick(&params, &hashes);
+                    let answer = |page: Result<InfoPage<'_>, Box<Response>>| match page {
+                        Err(refused) => *refused,
+                        Ok(page) => info_answer(page),
+                    };
+                    let old = body(answer(info_rows_written_whole(
+                        &rows,
+                        &pick.of_rows(),
+                        &ask,
+                        scope,
+                        AT * 1000,
+                    )))
+                    .await;
+                    let new = body(answer(info_rows(
+                        &rows,
+                        &pick.of_rows(),
+                        &ask,
+                        scope,
+                        AT * 1000,
+                    )))
+                    .await;
+                    assert_eq!(old.0, new.0, "{pairs:?} {scope:?}");
+                    assert!(old.1 == new.1, "{pairs:?} {scope:?}");
+                    compared += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(compared, columns.len() * 2 * pages.len() * 2);
+}
