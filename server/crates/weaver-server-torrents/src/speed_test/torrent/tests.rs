@@ -88,7 +88,8 @@ fn the_listing_names_the_netinst_torrent() {
 
 // Fetched, announced, dialled and one piece verified; a leg whose listener
 // announces no port takes no peer in, and says what it showed. The tracker
-// then hears `stopped`, and never heard a port the session cannot answer.
+// then hears `stopped`, and heard port 1, the port of a session that takes
+// no connections.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_rung_passes_against_a_loopback_tracker_and_seeder() {
     let fixture = TorrentFixture::start(true).await;
@@ -146,7 +147,8 @@ async fn every_rung_passes_against_a_loopback_tracker_and_seeder() {
         .unwrap()
         .clone();
     assert_eq!(announces[0].event.as_deref(), Some("started"));
-    assert_eq!(announces[0].port, 0);
+    // As libtorrent announces it: a tracker may refuse port 0.
+    assert_eq!(announces[0].port, 1);
     fixture.stop().await;
 }
 
