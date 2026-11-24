@@ -13,13 +13,13 @@ use aws_lc_rs::iv::FixedLength;
 use crate::grid::crc32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Version {
+pub enum Version {
     Rar4,
     Rar5,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum Item {
+pub enum Item {
     File(&'static str, Vec<u8>),
     Dir(&'static str),
     // A file whose data is `packed`, coded as `codec` says: packed bytes a
@@ -36,10 +36,10 @@ pub(crate) enum Item {
 // version, and the dictionary its header names, a power of two from the
 // format's least (128 KiB for RAR5, 64 KiB for RAR4).
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Codec {
-    pub(crate) method: u8,
-    pub(crate) version: u8,
-    pub(crate) dict: u64,
+pub struct Codec {
+    pub method: u8,
+    pub version: u8,
+    pub dict: u64,
 }
 
 impl Codec {
@@ -63,30 +63,30 @@ impl Codec {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct Options {
-    pub(crate) version: Version,
+pub struct Options {
+    pub version: Version,
     // File data bytes per volume; `None` for one volume.
-    pub(crate) split: Option<usize>,
-    pub(crate) password: Option<&'static str>,
-    pub(crate) encrypt_headers: bool,
-    pub(crate) solid: bool,
+    pub split: Option<usize>,
+    pub password: Option<&'static str>,
+    pub encrypt_headers: bool,
+    pub solid: bool,
     // The item written with a compression method instead of store.
-    pub(crate) compressed: Option<usize>,
-    pub(crate) recovery: bool,
+    pub compressed: Option<usize>,
+    pub recovery: bool,
     // The items written in the clear in a set whose files are enciphered.
-    pub(crate) clear: Vec<usize>,
+    pub clear: Vec<usize>,
     // How many recovery headers each volume carries when it has a record.
-    pub(crate) recovery_headers: usize,
+    pub recovery_headers: usize,
     // RAR5: a password check value, and checksums keyed by the hash key.
-    pub(crate) check: bool,
-    pub(crate) hash_key: bool,
+    pub check: bool,
+    pub hash_key: bool,
     // RAR4: each volume's end record states its number, as rar writes a
     // set's volumes; without it a RAR4 volume states no number anywhere.
-    pub(crate) numbered: bool,
+    pub numbered: bool,
 }
 
 impl Options {
-    pub(crate) fn new(version: Version) -> Self {
+    pub fn new(version: Version) -> Self {
         Self {
             version,
             split: None,
@@ -105,9 +105,9 @@ impl Options {
 }
 
 // A cheap RAR5 derivation, so a test derives in microseconds.
-pub(crate) const COUNT: u8 = 4;
-pub(crate) const SALT5: [u8; 16] = *b"salt-for-a-test!";
-pub(crate) const SALT4: [u8; 8] = *b"rar4salt";
+pub const COUNT: u8 = 4;
+pub const SALT5: [u8; 16] = *b"salt-for-a-test!";
+pub const SALT4: [u8; 8] = *b"rar4salt";
 const IV5: [u8; 16] = *b"iv-for-each-file";
 
 fn encipher(key: &[u8], iv: [u8; 16], plain: &[u8]) -> Vec<u8> {
@@ -546,7 +546,7 @@ impl Volumes<'_> {
     }
 }
 
-pub(crate) fn write(items: &[Item], options: &Options) -> Vec<Vec<u8>> {
+pub fn write(items: &[Item], options: &Options) -> Vec<Vec<u8>> {
     let rar5;
     let rar4;
     let layout: &dyn Layout = match options.version {

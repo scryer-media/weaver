@@ -652,7 +652,7 @@ fn a_repaired_header_of_a_made_member_retracts_it_and_the_run_makes_it_again() {
                     .makes(MemberId(1))
             );
             assert!(owner.run().is_empty(), "{label}");
-            for (name, bytes) in unrar(&[real.clone()], options.password) {
+            for (name, bytes) in unrar(std::slice::from_ref(&real), options.password) {
                 let got = owner.member(&name);
                 assert!(got.closed && got.bytes == bytes, "{label}: {name}");
             }

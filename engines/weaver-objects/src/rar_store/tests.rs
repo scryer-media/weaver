@@ -10,7 +10,6 @@ mod placement;
 mod recovery_contracts;
 mod settle;
 mod stray;
-pub(crate) mod writer;
 
 use std::io::Cursor;
 use std::num::NonZeroUsize;
@@ -22,6 +21,7 @@ use weaver_graph::{
     VolumeIndex, Weight, Why,
 };
 
+pub(crate) use super::writer;
 use super::{RarStore, walk};
 use crate::keys::{CAPACITY, Keys};
 use crate::testing::payload;

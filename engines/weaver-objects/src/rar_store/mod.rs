@@ -26,6 +26,11 @@ mod walk;
 
 #[cfg(test)]
 pub(crate) mod tests;
+// A small RAR writer, for this crate's tests and other crates' (never in a
+// product build).
+#[cfg(any(test, feature = "test-support"))]
+#[path = "tests/writer.rs"]
+pub mod writer;
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, btree_map};
 use std::ops::Bound;
