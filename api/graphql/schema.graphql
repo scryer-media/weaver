@@ -535,6 +535,11 @@ type ConfiguredStorage {
 	path: String!
 	capacity: DiskCapacity
 	error: String
+	"""
+	The mount path or drive root the folder lies on, so folders on one
+	drive can be shown as one; null until the disk owner has read it.
+	"""
+	drive: String
 }
 
 type ConnectionResult {
@@ -1635,6 +1640,10 @@ type HistoryItem {
 	displayTitle: String!
 	originalTitle: String!
 	state: QueueItemState!
+	"""
+	How the job ended, a partial delivery as its own value.
+	"""
+	outcome: JobOutcome
 	error: String
 	progressPercent: Float!
 	totalBytes: Int!
@@ -1706,6 +1715,12 @@ type HistoryPage {
 	other categories vanish the moment one was picked.
 	"""
 	categoryCounts: [HistoryCategoryCount!]!
+	"""
+	Every class of job present in history, with its row count: counted
+	under the search and the category filter, before the class and status
+	filters, as the categories are counted under the class.
+	"""
+	protocolCounts: [HistoryProtocolCount!]!
 }
 
 type HistoryPageCounts {
@@ -1734,12 +1749,24 @@ input HistoryPageInput {
 	whose job carries none.
 	"""
 	tag: String
+	"""
+	Keep only rows of jobs of this class; absent keeps both.
+	"""
+	protocol: Protocol
 	sortField: HistorySortField
 	sortDirection: HistorySortDirection
 	"""
 	Keep only rows that finished at or after this epoch second.
 	"""
 	completedSinceEpochSec: Int
+}
+
+"""
+How many history rows one class of job holds.
+"""
+type HistoryProtocolCount {
+	protocol: Protocol!
+	count: Int!
 }
 
 enum HistorySortDirection {
@@ -1883,6 +1910,11 @@ type Job {
 	displayTitle: String!
 	originalTitle: String!
 	status: JobStatusGql!
+	"""
+	How the job ended, a partial delivery as its own value; null while
+	it has not ended.
+	"""
+	outcome: JobOutcome
 	error: String
 	progress: Float!
 	totalBytes: Int!
@@ -1957,6 +1989,18 @@ type JobEvent {
 	Pass as `jobEvents(before:)` to read the events older than this one.
 	"""
 	cursor: String
+}
+
+"""
+How a finished job ended. `state` and `status` show a job that delivered
+in part as failed, for the clients that do not model it; a client that
+does selects `outcome`, where it is `PARTIAL`. Null while the job has not
+ended.
+"""
+enum JobOutcome {
+	COMPLETE
+	PARTIAL
+	FAILED
 }
 
 type JobOutputFile {
@@ -2817,6 +2861,11 @@ type MutationRoot {
 	"""
 	setUnacceptableExtensions(extensions: [String!]!): [String!]!
 	"""
+	Choose what a download holding a file with an unwanted extension
+	comes to, and nothing else. Returns the choice as saved.
+	"""
+	setUnwantedExtensionAction(action: UnwantedExtensionAction!): UnwantedExtensionAction!
+	"""
 	Select the sole live source of scripts. Changing it turns every
 	script job off, because a name in the new directory is not the script
 	that was wired up. What was saved in them is kept, and script files
@@ -3398,6 +3447,10 @@ type PostProcessingSettingsGql {
 	goInterpreter: String
 	unacceptableExtensions: [String!]!
 	"""
+	What a download holding a file with one of those extensions comes to.
+	"""
+	unwantedExtensionAction: UnwantedExtensionAction!
+	"""
 	True when `WEAVER_STRICT_SECURITY` refuses script execution outright.
 	"""
 	strictSecurityRefusesExecution: Boolean!
@@ -3889,6 +3942,11 @@ type QueryRoot {
 	"""
 	torrentPresence: TorrentPresence!
 	"""
+	What every torrent downloads and uploads right now: the same reading
+	`systemMetricsUpdates` carries as `torrentRates`.
+	"""
+	torrentRates: TorrentRates!
+	"""
 	System metrics facade for integrations.
 	"""
 	systemMetrics: Metrics!
@@ -4120,11 +4178,27 @@ type QueueItem {
 	displayTitle: String!
 	originalTitle: String!
 	state: QueueItemState!
+	"""
+	How the job ended, a partial delivery as its own value; null while
+	it has not ended.
+	"""
+	outcome: JobOutcome
 	downloadState: QueueDownloadState!
 	postState: QueuePostState!
 	waitReason: QueueWaitReason
 	downloadWaitReason: String
 	downloadRetryAtEpochMs: Float
+	"""
+	While the job waits to start for its disk (`DISK_SPACE` or
+	`DISK_TOO_SMALL`): the bytes it still has to fetch.
+	"""
+	diskNeedBytes: Int
+	"""
+	With `DISK_SPACE`, the room its disk leaves for them, null without
+	a fresh reading; with `DISK_TOO_SMALL`, the most the disk ever holds
+	above its reserve.
+	"""
+	diskFreeBytes: Int
 	error: String
 	progressPercent: Float!
 	totalBytes: Int!
@@ -4403,6 +4477,7 @@ enum QueueWaitReason {
 	EXTRACTION_CAPACITY
 	POST_PROCESSING_CAPACITY
 	DISK_SPACE
+	DISK_TOO_SMALL
 }
 
 type QuotaDirectionUsage {
@@ -6234,13 +6309,18 @@ type SubscriptionRoot {
 	"""
 	systemMetricsUpdates: SystemMetricsSnapshot!
 	"""
-	The torrents as they move: the one `id` names, the ones `ids` names
-	(at most 500), or every torrent. The first push is the torrents as
-	they are, with `fullUpdate`; each later one comes when one of them
-	changes, a tracker's answer as soon as it lands, and carries only the
-	torrents that changed or came and the ids of the ones gone. Every
-	torrent is followed only once the stored torrents are all read at
-	start: asked before, it is an error with code `TORRENTS_LOADING`.
+	The torrents as they move: the one `id` names, whole, or the ones
+	`ids` names (at most 500), as a list shows them. Give one of the two.
+	The first push is the torrents as they are, with `fullUpdate`; each
+	later one comes when one of them changes and carries only the
+	torrents that changed or came and the ids of the ones gone.
+
+	`ids` reads each torrent's row as the service last published it: no
+	files and no trackers, and a change in the fields that move with the
+	clock alone is told with the next other change. Those torrents are
+	followed only once the stored torrents are all read at start: asked
+	before, it is an error with code `TORRENTS_LOADING`. `id` reads its
+	torrent whole, files and trackers with it, each time it moves.
 	"""
 	torrentUpdates(id: Int, ids: [Int!]): TorrentChanges!
 }
@@ -6323,6 +6403,11 @@ type SystemMetricsSnapshot {
 	shows torrent controls while either holds.
 	"""
 	torrents: TorrentPresence!
+	"""
+	What every torrent downloads and uploads right now, beside
+	`metrics.currentDownloadSpeed`, which counts Usenet alone.
+	"""
+	torrentRates: TorrentRates!
 }
 
 type SystemStatus {
@@ -6545,6 +6630,11 @@ type Torrent {
 	"""
 	unpackOverride: Boolean
 	route: String
+	"""
+	The networking route the torrent takes, by its consumer key:
+	`torrent:default`, `torrent:category:<id>` or `torrent:tracker:<id>`.
+	"""
+	routeConsumer: String!
 	files: [TorrentFile!]!
 	"""
 	Whether its pieces are fetched in order.
@@ -6555,6 +6645,16 @@ type Torrent {
 	"""
 	firstLastPieceFirst: Boolean!
 	trackers: [TorrentTracker!]!
+	"""
+	The seeding goal still to meet, as `seedingLeft` gives it; absent
+	once it is met and for a torrent with no goal.
+	"""
+	seedingGoalLeft: String
+	"""
+	How its unpacking came out, once over; absent while it runs, and for
+	a torrent with nothing to unpack.
+	"""
+	unpacking: TorrentUnpacking
 }
 
 """
@@ -6683,9 +6783,10 @@ type TorrentHistory {
 	"""
 	total: UsageConsumer!
 	"""
-	Each tracker host, by the torrents that list it; the empty id is
-	the torrents that list none. A torrent counts under each host it
-	lists, so trackers are never added together.
+	Each tracker rule by name, and each host no rule covers, by the
+	torrents that list it; the empty id is the torrents that list none.
+	A torrent counts under its rule once, or under each host it lists,
+	so trackers are never added together.
 	"""
 	trackers: [UsageConsumer!]!
 	"""
@@ -6827,6 +6928,14 @@ type TorrentPresence {
 	otherwise.
 	"""
 	windDown: TorrentDisableMode
+}
+
+"""
+The rates of every torrent added up, in bytes per second.
+"""
+type TorrentRates {
+	downloadBps: Int!
+	uploadBps: Int!
 }
 
 """
@@ -7053,6 +7162,11 @@ enum TorrentStatedReason {
 	"""
 	DISK_SPACE
 	"""
+	Kept from starting by a disk that never holds what it has left to
+	fetch, as a usenet job is.
+	"""
+	DISK_TOO_SMALL
+	"""
 	A write found no room: it fetches nothing and keeps seeding.
 	"""
 	DISK_FULL
@@ -7140,6 +7254,55 @@ A tracker in a torrent's list, by tier.
 input TorrentTrackerInput {
 	tier: Int!
 	url: String!
+}
+
+"""
+How a torrent's unpacking came out.
+"""
+enum TorrentUnpackResult {
+	"""
+	Everything it would deliver is beside the torrent's files.
+	"""
+	WHOLE
+	"""
+	Some of it is; the reason says what is short.
+	"""
+	PART
+	"""
+	Nothing usable was delivered.
+	"""
+	FAILED
+	"""
+	The unpacking refused the torrent's files.
+	"""
+	REFUSED
+}
+
+"""
+A file a torrent's unpacking placed beside the torrent's own: no piece
+of the torrent, so it has no index, level or progress of its own.
+"""
+type TorrentUnpackedFile {
+	path: String!
+	length: Int!
+}
+
+"""
+A torrent's unpacking, once over. It is the unpacking's own: the
+torrent's state, history and counters never read it.
+"""
+type TorrentUnpacking {
+	result: TorrentUnpackResult!
+	"""
+	Why it is short of whole.
+	"""
+	reason: String
+	"""
+	The files it placed beside the torrent's own, which the torrent's
+	file list shows after them: read from the torrent's row and disk
+	only when asked for.
+	"""
+	files: [TorrentUnpackedFile!]!
 }
 
 """
@@ -7385,6 +7548,22 @@ enum TrackerStatus {
 	TRACKER_ERROR
 	UNREACHABLE
 	DISABLED
+}
+
+"""
+What a download comes to when a file it would deliver has an unwanted
+extension. Either way no such file is opened as an archive.
+"""
+enum UnwantedExtensionAction {
+	"""
+	The download fails.
+	"""
+	FAIL_JOB
+	"""
+	Only those files are deleted; the download ends partial, or failed
+	when no usable file is left.
+	"""
+	DELETE_FILES
 }
 
 """
