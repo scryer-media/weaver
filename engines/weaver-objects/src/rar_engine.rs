@@ -7,13 +7,13 @@
 // is the shared engine object.
 
 pub mod naming;
-mod run;
+pub(crate) mod run;
 
 use std::sync::Arc;
 #[cfg(test)]
 use weaver_graph::{Emit, Engine, Object, Placement};
 
-use unrar_rs::{ArchiveFormat, KdfCache, RarVolumeFacts};
+use unrar_rs::{ArchiveFormat, KdfCache, RarVolumeFacts, RarVolumeMemberFacts};
 use weaver_graph::{ByteRange, Extraction, Kind, VolumeIndex};
 
 use crate::engine::{EngineObject, Format, Holdings};
@@ -109,13 +109,10 @@ impl Format for Rar {
 
 pub type RarEngine = EngineObject<Rar>;
 
-// Spike: a run that decodes only the members at the archive indexes given.
-#[cfg(test)]
-pub(crate) fn run_only(
-    password: Option<String>,
-    members: std::collections::BTreeSet<usize>,
-) -> Box<dyn Extraction> {
-    Box::new(run::Run::only(password, members))
+// A run over these members of a set alone, made as the store's members,
+// for a store that streams the rest (`crate::rar_store`).
+pub(crate) fn run_of(password: Option<String>, scope: run::Scope) -> Box<dyn Extraction> {
+    Box::new(run::Run::of(password, scope))
 }
 
 // The most a RAR4 end record takes: its seven bytes, the CRC32 of the
@@ -158,18 +155,24 @@ pub(crate) fn window(facts: &RarVolumeFacts) -> Option<u64> {
     facts
         .members
         .iter()
-        .filter(|member| !member.is_directory && member.compression_method != 0)
-        .filter(|member| member.dict_size != 0)
-        .map(|member| {
-            if facts.is_solid || member.compression_solid {
-                member.dict_size
-            } else {
-                member
-                    .unpacked_size
-                    .map_or(member.dict_size, |size| size.min(member.dict_size))
-            }
-        })
+        .filter_map(|member| member_window(facts.is_solid, member))
         .max()
+}
+
+// The window a decode of one member holds, by the rule `window` reads a
+// front by: none for a directory or stored bytes, or a header that names no
+// dictionary.
+pub(crate) fn member_window(solid: bool, member: &RarVolumeMemberFacts) -> Option<u64> {
+    if member.is_directory || member.compression_method == 0 || member.dict_size == 0 {
+        return None;
+    }
+    Some(if solid || member.compression_solid {
+        member.dict_size
+    } else {
+        member
+            .unpacked_size
+            .map_or(member.dict_size, |size| size.min(member.dict_size))
+    })
 }
 
 // The engine's volumes, as they place the next, read by index: a volume

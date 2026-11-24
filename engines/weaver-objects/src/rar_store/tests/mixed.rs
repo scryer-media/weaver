@@ -1,122 +1,159 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// Spike: a set that is not solid, with stored files around a compressed one.
-// A run asked for the compressed members alone decodes them reading only the
-// bytes a store would keep in its envelope: every header block and the
-// packed data of compressed members, never a byte of a stored member's data.
+// A set that is not solid, with stored files around a compressed one: the
+// store streams the stored files, keeps the compressed one's packed data on
+// the shelf beside the headers, and its run decodes that member from the
+// shelf alone, as the RAR engine decodes it from the whole set.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::io;
-use std::ops::Range;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use unrar_rs::{KdfCache, RarVolumeFacts};
-use weaver_graph::{Emit, VolumeIndex, Volumes};
+use weaver_graph::{Budget, Emit, MemberId, Object, VolumeIndex, Volumes, Why};
 
 use super::super::claim;
+use super::owner::Owner;
 use super::writer::{Codec, Item, Options, Version, write};
-use super::{fixture, unrar};
+use super::{fixture, store, unrar};
+use crate::engine::Format;
+use crate::rar_engine::{Rar, member_window};
 use crate::testing::payload;
 
-// The volumes, answering only reads that lie wholly in the kept ranges and
-// recording every other: volume, offset, length asked.
-struct Kept {
-    volumes: Vec<Vec<u8>>,
-    kept: Vec<Vec<Range<u64>>>,
-    outside: Mutex<Vec<(u32, u64, usize)>>,
-}
+// A set's volumes whole, as the RAR engine reads them.
+struct Whole(Vec<Vec<u8>>);
 
-impl Kept {
-    fn holds(&self, volume: usize, range: Range<u64>) -> bool {
-        range.is_empty()
-            || self.kept[volume]
-                .iter()
-                .any(|kept| kept.start <= range.start && range.end <= kept.end)
-    }
-}
-
-impl Volumes for Kept {
+impl Volumes for Whole {
     fn next(&self, after: Option<VolumeIndex>) -> io::Result<Option<VolumeIndex>> {
         let next = after.map_or(0, |after| after.0 + 1);
-        Ok(((next as usize) < self.volumes.len()).then_some(VolumeIndex(next)))
+        Ok(((next as usize) < self.0.len()).then_some(VolumeIndex(next)))
     }
 
     fn len(&self, volume: VolumeIndex) -> Option<u64> {
-        self.volumes.get(volume.0 as usize).map(|v| v.len() as u64)
+        self.0.get(volume.0 as usize).map(|v| v.len() as u64)
     }
 
     fn settled(&self, volume: VolumeIndex) -> bool {
-        (volume.0 as usize) < self.volumes.len()
+        (volume.0 as usize) < self.0.len()
     }
 
     fn read_at(&self, volume: VolumeIndex, offset: u64, into: &mut [u8]) -> io::Result<usize> {
-        let bytes = &self.volumes[volume.0 as usize];
-        let end = (offset + into.len() as u64).min(bytes.len() as u64);
-        let start = offset.min(end);
-        if !self.holds(volume.0 as usize, start..end) {
-            self.outside
-                .lock()
-                .unwrap()
-                .push((volume.0, offset, into.len()));
-            return Err(io::Error::other("a byte the envelope never kept"));
-        }
-        let taken = (end - start) as usize;
-        into[..taken].copy_from_slice(&bytes[start as usize..end as usize]);
-        Ok(taken)
+        let bytes = &self.0[volume.0 as usize];
+        let start = (offset as usize).min(bytes.len());
+        let end = (start + into.len()).min(bytes.len());
+        into[..end - start].copy_from_slice(&bytes[start..end]);
+        Ok(end - start)
     }
 }
 
-fn facts(bytes: &[u8]) -> RarVolumeFacts {
+pub(super) fn facts(bytes: &[u8]) -> RarVolumeFacts {
     claim::headers(bytes, None, Arc::new(KdfCache::new())).expect("a RAR volume")
 }
 
-// One volume's kept ranges, from the headers the store walks: everything
-// but the data areas the headers name, and the data areas of compressed
-// parts. Says the stored and service data bytes left out.
-fn kept_of(bytes: &[u8]) -> (Vec<Range<u64>>, u64, u64) {
-    let facts = facts(bytes);
-    let mut areas: Vec<(Range<u64>, bool)> = facts
+// The data bytes of the set's stored file parts: what the store streams
+// and so never shelves.
+fn stored_data(volumes: &[Vec<u8>]) -> u64 {
+    volumes
+        .iter()
+        .map(|bytes| {
+            let facts = facts(bytes);
+            assert!(facts.services.iter().all(|service| service.data_size == 0));
+            facts
+                .members
+                .iter()
+                .filter(|member| member.compression_method == 0)
+                .map(|member| member.data_size)
+                .sum::<u64>()
+        })
+        .sum()
+}
+
+// What a whole-engine run says of each member, by name: the bytes it
+// wrote, the CRC32 it stated, whether it closed, and what else it said.
+#[derive(Debug, Default, PartialEq)]
+pub(super) struct Said {
+    pub bytes: Vec<u8>,
+    pub crc32: Option<u32>,
+    pub closed: bool,
+}
+
+pub(super) fn engine_run(
+    volumes: &[Vec<u8>],
+    password: Option<&str>,
+) -> (BTreeMap<String, Said>, Vec<Emit>) {
+    let mut emits = Vec::new();
+    let mut sink = |emit| {
+        emits.push(emit);
+        true
+    };
+    let view: Arc<dyn Volumes> = Arc::new(Whole(volumes.to_vec()));
+    Rar::run(password.map(str::to_owned)).run(view, &mut sink, Budget::default());
+    let mut names = BTreeMap::new();
+    let mut said: BTreeMap<String, Said> = BTreeMap::new();
+    let mut trouble = Vec::new();
+    for emit in emits {
+        match emit {
+            Emit::Member { member, name, .. } => {
+                names.insert(member.0, name.clone());
+                said.insert(name, Said::default());
+            }
+            Emit::Bytes {
+                member,
+                offset,
+                bytes,
+                ..
+            } => {
+                let got = &mut said.get_mut(&names[&member.0]).unwrap().bytes;
+                assert_eq!(offset, got.len() as u64);
+                got.extend_from_slice(&bytes);
+            }
+            Emit::Checksum { member, crc32 } => {
+                said.get_mut(&names[&member.0]).unwrap().crc32 = Some(crc32);
+            }
+            Emit::MemberClosed(member) => {
+                said.get_mut(&names[&member.0]).unwrap().closed = true;
+            }
+            other => trouble.push(other),
+        }
+    }
+    (said, trouble)
+}
+
+// What the store's run said of one member, as the engine's is read.
+pub(super) fn run_said(owner: &Owner, name: &str) -> Said {
+    let (id, got) = owner
         .members
         .iter()
-        .map(|member| {
-            (
-                member.data_offset..member.data_offset + member.data_size,
-                member.compression_method != 0,
+        .find(|(_, got)| got.name == name)
+        .unwrap_or_else(|| panic!("no member {name}"));
+    Said {
+        bytes: got.bytes.clone(),
+        crc32: owner.said.iter().find_map(|emit| match emit {
+            Emit::Checksum { member, crc32 } if member.0 == *id => Some(*crc32),
+            _ => None,
+        }),
+        closed: got.closed,
+    }
+}
+
+// The trouble a store or its run said.
+pub(super) fn trouble(owner: &Owner) -> Vec<&Emit> {
+    owner
+        .said
+        .iter()
+        .filter(|emit| {
+            matches!(
+                emit,
+                Emit::Damaged { .. }
+                    | Emit::Gap { .. }
+                    | Emit::NeedsEngine(_)
+                    | Emit::Refuse(_)
+                    | Emit::Retract(_)
+                    | Emit::NeedsPassword
             )
         })
-        .chain(facts.services.iter().map(|service| {
-            (
-                service.data_offset..service.data_offset + service.data_size,
-                false,
-            )
-        }))
-        .filter(|(range, _)| !range.is_empty())
-        .collect();
-    areas.sort_by_key(|(range, _)| range.start);
-    let stored = facts
-        .members
-        .iter()
-        .filter(|member| member.compression_method == 0)
-        .map(|member| member.data_size)
-        .sum();
-    let service = facts.services.iter().map(|service| service.data_size).sum();
-    let mut kept = Vec::new();
-    let mut at = 0;
-    for (range, compressed) in areas {
-        assert!(range.start >= at, "areas overlap");
-        if compressed {
-            continue;
-        }
-        if range.start > at {
-            kept.push(at..range.start);
-        }
-        at = range.end;
-    }
-    if (bytes.len() as u64) > at {
-        kept.push(at..bytes.len() as u64);
-    }
-    (kept, stored, service)
+        .collect()
 }
 
 // The set's members in archive order, a part that carries one on joined to
@@ -140,89 +177,9 @@ fn members(volumes: &[Vec<u8>]) -> Vec<(String, bool)> {
     out
 }
 
-struct Ran {
-    // Decoded members by name, and whether each closed.
-    decoded: BTreeMap<String, (Vec<u8>, bool)>,
-    trouble: Vec<Emit>,
-    outside: Vec<(u32, u64, usize)>,
-    total: u64,
-    kept: u64,
-    stored: u64,
-    service: u64,
-}
-
-// A run of the compressed members, or of every member when `all`.
-fn run_compressed(volumes: &[Vec<u8>], all: bool) -> Ran {
-    let listed = members(volumes);
-    let only: BTreeSet<usize> = listed
-        .iter()
-        .enumerate()
-        .filter(|(_, (_, compressed))| *compressed || all)
-        .map(|(at, _)| at)
-        .collect();
-    assert!(!only.is_empty());
-    let (mut kept, mut stored, mut service) = (Vec::new(), 0, 0);
-    for bytes in volumes {
-        let (ranges, s, v) = kept_of(bytes);
-        kept.push(ranges);
-        stored += s;
-        service += v;
-    }
-    let total: u64 = volumes.iter().map(|v| v.len() as u64).sum();
-    let kept_bytes = kept.iter().flatten().map(|r| r.end - r.start).sum();
-    let double = Arc::new(Kept {
-        volumes: volumes.to_vec(),
-        kept,
-        outside: Mutex::default(),
-    });
-    let mut emits = Vec::new();
-    let mut sink = |emit| {
-        emits.push(emit);
-        true
-    };
-    let view: Arc<dyn Volumes> = double.clone();
-    crate::rar_engine::run_only(None, only).run(view, &mut sink, weaver_graph::Budget::default());
-    let mut names = BTreeMap::new();
-    let mut decoded: BTreeMap<String, (Vec<u8>, bool)> = BTreeMap::new();
-    let mut trouble = Vec::new();
-    for emit in emits {
-        match emit {
-            Emit::Member { member, name, .. } => {
-                names.insert(member.0, name.clone());
-                decoded.insert(name, (Vec::new(), false));
-            }
-            Emit::Bytes {
-                member,
-                offset,
-                bytes,
-                ..
-            } => {
-                let got = &mut decoded.get_mut(&names[&member.0]).unwrap().0;
-                assert_eq!(offset, got.len() as u64);
-                got.extend_from_slice(&bytes);
-            }
-            Emit::MemberClosed(member) => {
-                decoded.get_mut(&names[&member.0]).unwrap().1 = true;
-            }
-            Emit::Checksum { .. } => {}
-            other => trouble.push(other),
-        }
-    }
-    let outside = double.outside.lock().unwrap().clone();
-    Ran {
-        decoded,
-        trouble,
-        outside,
-        total,
-        kept: kept_bytes,
-        stored,
-        service,
-    }
-}
-
-// The compressed file RAR itself wrote in a fixture: its name, plain bytes,
+// The compressed file RAR itself wrote in a fixture: its plain bytes,
 // packed bytes and how they are coded.
-fn lifted(name: &str) -> (Vec<u8>, Vec<u8>, Codec) {
+pub(super) fn lifted(name: &str) -> (Vec<u8>, Vec<u8>, Codec) {
     let bytes = fixture(name);
     let plain = unrar(std::slice::from_ref(&bytes), None);
     assert_eq!(plain.len(), 1);
@@ -240,59 +197,96 @@ fn lifted(name: &str) -> (Vec<u8>, Vec<u8>, Codec) {
     (plain[0].1.clone(), packed, codec)
 }
 
-fn mixed_items(version: Version) -> (Vec<Item>, Vec<(&'static str, Vec<u8>)>) {
+pub(super) fn packed(version: Version, name: &'static str) -> (Item, Vec<u8>) {
     let source = match version {
         Version::Rar5 => "extraction_profiles/rar5_lz.rar",
         Version::Rar4 => "extraction_profiles/rar4_lz.rar",
     };
     let (plain, packed, codec) = lifted(source);
-    let items = vec![
-        Item::File("alpha.mkv", payload(1, 10_000)),
+    (
         Item::Packed {
-            name: "notes.nfo",
+            name,
             plain: plain.clone(),
             packed,
             codec,
         },
-        Item::File("beta.mkv", payload(2, 5_003)),
-        Item::File("gamma.srt", payload(3, 300)),
-    ];
-    (items, vec![("notes.nfo", plain)])
+        plain,
+    )
 }
 
-fn check(label: &str, volumes: &[Vec<u8>], expected: &[(&str, Vec<u8>)]) {
-    let ran = run_compressed(volumes, false);
-    eprintln!(
-        "{label}: volumes {} total {} kept {} stored data {} service data {} outside reads {:?}",
-        volumes.len(),
-        ran.total,
-        ran.kept,
-        ran.stored,
-        ran.service,
-        ran.outside
-    );
-    assert!(ran.trouble.is_empty(), "{label}: {:?}", ran.trouble);
-    assert!(ran.outside.is_empty(), "{label}: {:?}", ran.outside);
-    assert_eq!(ran.decoded.len(), expected.len(), "{label}");
-    for (name, bytes) in expected {
-        let (got, closed) = &ran.decoded[*name];
-        assert!(*closed, "{label}: {name} closed");
-        assert!(got == bytes, "{label}: {name} decoded");
+pub(super) fn mixed_items(version: Version) -> Vec<Item> {
+    let (notes, _) = packed(version, "notes.nfo");
+    vec![
+        Item::File("alpha.mkv", payload(1, 10_000)),
+        notes,
+        Item::File("beta.mkv", payload(2, 5_003)),
+        Item::File("gamma.srt", payload(3, 300)),
+    ]
+}
+
+// The set delivered whole to the store in frames: nothing handed to an
+// engine, every stored member streamed and closed, every compressed one
+// announced and left to the run, the run reading only what the shelf
+// holds, which is the set less its stored file data. Every member then
+// stands as unrar extracts it, and each made member as the RAR engine says
+// it, bytes, checksum and close alike.
+fn check(label: &str, volumes: Vec<Vec<u8>>, password: Option<&str>) -> Owner {
+    let listed = members(&volumes);
+    let extracted = unrar(&volumes, password);
+    let total: u64 = volumes.iter().map(|v| v.len() as u64).sum();
+    let stored = stored_data(&volumes);
+    let mut owner = Owner::named(store(), volumes.clone());
+    if let Some(password) = password {
+        owner.offer(password);
     }
-    assert_eq!(ran.service, 0, "{label}");
-    assert_eq!(ran.kept, ran.total - ran.stored, "{label}");
-    // The double has teeth: a run of every member reads a stored file's
-    // data, which the envelope never kept, and the run ends there, as a run
-    // whose read failed ends silently.
-    let whole = run_compressed(volumes, true);
-    assert!(!whole.outside.is_empty(), "{label}");
-    assert!(whole.decoded.values().any(|(_, closed)| !closed), "{label}");
+    owner.whole(4096);
+    assert!(trouble(&owner).is_empty(), "{label}: {:?}", trouble(&owner));
+    for (name, compressed) in &listed {
+        let got = owner.member(name);
+        assert_eq!(got.closed, !compressed, "{label}: {name}");
+        if *compressed {
+            assert!(got.bytes.is_empty(), "{label}: {name}");
+        }
+    }
+    let face = owner.object.engine().expect("a mixed set runs");
+    for (id, (name, compressed)) in listed.iter().enumerate() {
+        assert_eq!(
+            face.makes(MemberId(id as u32)),
+            *compressed,
+            "{label}: {name}"
+        );
+    }
+    assert_eq!(owner.shelf_bytes(), total - stored, "{label}");
+
+    let strays = owner.run();
+    assert!(strays.is_empty(), "{label}: {strays:?}");
+    assert!(trouble(&owner).is_empty(), "{label}: {:?}", trouble(&owner));
+    assert_eq!(owner.members.len(), extracted.len(), "{label}");
+    for (name, bytes) in &extracted {
+        let got = owner.member(name);
+        assert!(got.closed, "{label}: {name} closed");
+        assert!(got.bytes == *bytes, "{label}: {name}");
+    }
+    let (engine, engine_trouble) = engine_run(&volumes, password);
+    assert!(engine_trouble.is_empty(), "{label}: {engine_trouble:?}");
+    for (name, _) in listed.iter().filter(|(_, compressed)| *compressed) {
+        assert_eq!(run_said(&owner, name), engine[name], "{label}: {name}");
+    }
+
+    // The shelf has teeth: a run of every member reads a stored file's
+    // data, which it never held.
+    let mut sink = |_| true;
+    let shelved = owner.shelved();
+    let view: Arc<dyn Volumes> = shelved.clone();
+    Rar::run(password.map(str::to_owned)).run(view, &mut sink, Budget::default());
+    assert!(!shelved.strays.lock().unwrap().is_empty(), "{label}");
+    owner
 }
 
 #[test]
-fn a_run_of_the_compressed_members_reads_only_headers_and_packed_data() {
+fn a_mixed_set_streams_its_stored_members_and_runs_its_compressed_ones_from_the_shelf() {
     for version in [Version::Rar5, Version::Rar4] {
-        let (items, expected) = mixed_items(version);
+        let items = mixed_items(version);
         for (label, split) in [
             ("one volume", None),
             // The packed data runs from the first volume into the second.
@@ -303,34 +297,155 @@ fn a_run_of_the_compressed_members_reads_only_headers_and_packed_data() {
             let mut options = Options::new(version);
             options.split = split;
             let volumes = write(&items, &options);
-            if split.is_some() {
-                assert!(volumes.len() > 1);
+            match split {
+                Some(6_000) => assert!(volumes.len() >= 10, "{}", volumes.len()),
+                Some(_) => assert!(volumes.len() > 1),
+                None => {}
             }
-            check(&format!("{version:?} {label}"), &volumes, &expected);
+            check(&format!("{version:?} {label}"), volumes, None);
         }
     }
 }
 
 // Sets RAR itself wrote: two stored files, then a compressed one.
 #[test]
-fn a_real_mixed_set_decodes_its_compressed_member_from_headers_and_packed_data() {
+fn a_real_mixed_set_runs_its_compressed_member_from_the_shelf() {
     for name in [
         "extraction_profiles/rar5_multifile_lz.rar",
         "extraction_profiles/rar4_multifile_lz.rar",
     ] {
         let bytes = fixture(name);
-        let all = unrar(std::slice::from_ref(&bytes), None);
         let listed = members(std::slice::from_ref(&bytes));
-        let expected: Vec<(&str, Vec<u8>)> = all
-            .iter()
-            .filter(|(member, _)| {
-                listed
-                    .iter()
-                    .any(|(listed, compressed)| listed == member && *compressed)
-            })
-            .map(|(member, plain)| (member.as_str(), plain.clone()))
-            .collect();
-        assert!(listed.iter().any(|(_, compressed)| !compressed), "{name}");
-        check(name, std::slice::from_ref(&bytes), &expected);
+        assert!(!listed[0].1, "{name}: a stored member first");
+        assert!(listed.iter().any(|(_, compressed)| *compressed), "{name}");
+        check(name, vec![bytes], None);
     }
+}
+
+// The face a mixed set shows is the RAR engine's for the members it makes:
+// the window it reserves is the widest of theirs, it lends as the engine
+// does, and it makes those members and no other.
+#[test]
+fn a_mixed_set_faces_as_the_engine_would_for_its_compressed_members() {
+    for version in [Version::Rar5, Version::Rar4] {
+        let mut options = Options::new(version);
+        options.split = Some(6_000);
+        let volumes = write(&mixed_items(version), &options);
+        let mut owner = Owner::named(store(), volumes.clone());
+        assert!(
+            owner.object.engine().is_none(),
+            "{version:?}: no run before a header"
+        );
+        // Not before the set's last volume is read: a header still to come
+        // could add a member the run makes.
+        for volume in 0..volumes.len() - 1 {
+            owner.frames(volume, 4096);
+        }
+        assert!(
+            owner.object.engine().is_none(),
+            "{version:?}: no run before the end"
+        );
+        owner.whole(4096);
+        let face = owner.object.engine().expect("a mixed set runs");
+        let windows: Vec<u64> = volumes
+            .iter()
+            .flat_map(|bytes| {
+                let facts = facts(bytes);
+                facts
+                    .members
+                    .iter()
+                    .filter(|member| !member.split_before)
+                    .filter_map(|member| member_window(facts.is_solid, member))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(windows.len(), 1, "{version:?}");
+        assert_eq!(face.reserve(), crate::engine::reserve::<Rar>(windows.clone()));
+        assert_eq!(face.reserve(), Some(Rar::reserve().max(windows[0])));
+        assert!(face.lends());
+        assert_eq!(face.lends(), Rar::lends());
+        assert_eq!(face.widest(), None);
+        for volume in 0..volumes.len() {
+            assert!(
+                face.placed(VolumeIndex(volume as u32)),
+                "{version:?} {volume}"
+            );
+        }
+        // The made member's bytes are the run's, so the store places none.
+        let notes = owner
+            .members
+            .iter()
+            .find(|(_, got)| got.name == "notes.nfo")
+            .map(|(id, _)| MemberId(*id))
+            .unwrap();
+        let mut out = Vec::new();
+        assert_eq!(
+            owner
+                .object
+                .extent(notes, weaver_graph::ByteRange::new(0, 1), &mut out),
+            weaver_graph::Located::Never
+        );
+    }
+}
+
+// What stays with the engine whole: a solid set, a set of compressed files
+// alone, and one whose first file is compressed, which nothing up front
+// says is followed by a stored one.
+#[test]
+fn sets_the_store_cannot_stream_part_of_still_go_to_the_engine() {
+    for version in [Version::Rar5, Version::Rar4] {
+        let (first, _) = packed(version, "first.nfo");
+        let (second, _) = packed(version, "second.nfo");
+        for (label, items, solid) in [
+            ("compressed only", vec![first.clone(), second], false),
+            (
+                "compressed first",
+                vec![first, Item::File("alpha.mkv", payload(1, 10_000))],
+                false,
+            ),
+            ("solid", mixed_items(version), true),
+        ] {
+            let mut options = Options::new(version);
+            options.solid = solid;
+            let volumes = write(&items, &options);
+            let mut owner = Owner::named(store(), volumes);
+            owner.whole(4096);
+            assert!(
+                owner.said.contains(&Emit::NeedsEngine(Why::Compressed)),
+                "{version:?} {label}: {:?}",
+                owner.said
+            );
+            assert!(owner.object.engine().is_none(), "{version:?} {label}");
+        }
+    }
+}
+
+// A store's run is the engine's loop scoped to the members it makes: a
+// stored member it is not given is passed, never announced or written.
+#[test]
+fn a_scoped_run_announces_nothing() {
+    let volumes = write(&mixed_items(Version::Rar5), &Options::new(Version::Rar5));
+    let mut owner = Owner::named(store(), volumes);
+    owner.whole(4096);
+    let before = owner.log.len();
+    assert!(owner.run().is_empty());
+    assert!(
+        !owner.log[before..]
+            .iter()
+            .any(|emit| matches!(emit, Emit::Member { .. })),
+        "{:?}",
+        &owner.log[before..]
+    );
+    let written: Vec<MemberId> = owner.log[before..]
+        .iter()
+        .filter_map(|emit| match emit {
+            Emit::Bytes { member, .. } | Emit::MemberClosed(member) => Some(*member),
+            _ => None,
+        })
+        .collect();
+    assert!(!written.is_empty());
+    assert!(
+        written.iter().all(|member| *member == MemberId(1)),
+        "{written:?}"
+    );
 }

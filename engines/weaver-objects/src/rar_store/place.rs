@@ -423,7 +423,8 @@ impl RarStore {
             .into_iter()
             .flatten()
             .filter_map(|&(id, at)| {
-                let piece = self.entries.get(id)?.pieces.get(at)?;
+                let entry = self.entries.get(id).filter(|entry| !entry.made)?;
+                let piece = entry.pieces.get(at)?;
                 let part = piece.data.intersect(range)?;
                 let stream = ByteRange::at(piece.at + (part.start - piece.data.start), part.len());
                 Some((part.start, id, at, part, stream))
@@ -450,6 +451,7 @@ impl RarStore {
             .entries
             .iter()
             .enumerate()
+            .filter(|(_, entry)| !entry.made)
             .flat_map(|(id, entry)| {
                 entry
                     .pieces
@@ -530,7 +532,12 @@ impl RarStore {
         range: ByteRange,
         out: &mut Vec<Extent>,
     ) -> Located {
-        let Some(entry) = self.entries.get(member.0 as usize) else {
+        // A made member's bytes are the run's to place, not the store's.
+        let Some(entry) = self
+            .entries
+            .get(member.0 as usize)
+            .filter(|entry| !entry.made)
+        else {
             return Located::Never;
         };
         // A cipher block reads with the one before it as its seed. The

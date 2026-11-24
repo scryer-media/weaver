@@ -18,6 +18,7 @@ mod gaps;
 mod image;
 mod layout;
 mod lock;
+mod made;
 mod order;
 mod place;
 mod record;
@@ -364,6 +365,10 @@ struct Entry {
     // runs, by piece, for its own.
     plain_runs: CrcRuns,
     parts: BTreeMap<usize, CrcRuns>,
+    // A member the store's run makes, compressed in a set that is not
+    // solid beside members the store streams: its data is the envelope's,
+    // and its bytes, checksum and close are the run's (`made`).
+    made: bool,
 }
 
 impl Entry {
@@ -403,10 +408,13 @@ impl Entry {
 
     // Whether the member's parts, all in, carry fewer bytes than the size
     // its header states: it ends where they do only once its CRC proves it.
+    // A made member's parts are packed, and say nothing of its size.
     fn short(&self) -> bool {
-        self.length
-            .zip(self.plain_len())
-            .is_some_and(|(stated, carried)| carried < stated)
+        !self.made
+            && self
+                .length
+                .zip(self.plain_len())
+                .is_some_and(|(stated, carried)| carried < stated)
     }
 
     // Whether the store is the one to judge the member's whole checksum: a
@@ -453,6 +461,11 @@ pub struct RarStore {
     // the ones that can travel to another owner. Filed where a volume comes
     // or goes and where pieces do, so no question about one scans pieces.
     unmapped: BTreeSet<VolumeIndex>,
+    // The entries the store's run makes, filed as entries come and go, and
+    // the first file entry the store streams itself, filed as the layout's
+    // members are looked at (`sync`): neither question scans the entries.
+    made: BTreeSet<usize>,
+    first_stored: Option<usize>,
     // The volumes held that are bound and not yet closed: more of them is
     // still to come. Filed where a volume is named, closes, comes or goes,
     // so asking whether everything bound has closed scans no volume.
@@ -557,6 +570,8 @@ impl RarStore {
             volumes: BTreeMap::new(),
             giving: BTreeMap::new(),
             unmapped: BTreeSet::new(),
+            made: BTreeSet::new(),
+            first_stored: None,
             open: BTreeSet::new(),
             pieces_in: BTreeMap::new(),
             locked: BTreeSet::new(),
@@ -681,7 +696,11 @@ impl RarStore {
         counts::bump(|counts| counts.remaps += 1);
         self.pieces_in.clear();
         self.locked.clear();
+        self.made.clear();
         for (id, entry) in self.entries.iter().enumerate() {
+            if entry.made {
+                self.made.insert(id);
+            }
             if matches!(entry.lock, Lock::Locked | Lock::Sealed(_)) {
                 self.locked.insert(id);
             }
@@ -1369,6 +1388,15 @@ impl Object for RarStore {
             length: held.length,
             window: held.stated().and_then(crate::rar_engine::window),
         }))
+    }
+
+    // A mixed set's run, once the set's members are known (`made.rs`).
+    fn engine(&self) -> Option<&dyn weaver_graph::Engine> {
+        self.runs().then_some(self as &dyn weaver_graph::Engine)
+    }
+
+    fn engine_mut(&mut self) -> Option<&mut dyn weaver_graph::Engine> {
+        self.runs().then_some(self as &mut dyn weaver_graph::Engine)
     }
 
     // The place the volume's headers or name give it, held or not: whether

@@ -155,6 +155,10 @@ pub(super) struct EntryFacts {
     // in facts written before they were kept.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     runs: Option<EntryRuns>,
+    // Whether the store's run makes the member; false in facts written
+    // before a set could be mixed, when no member was.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    made: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -325,6 +329,7 @@ pub(super) fn of(store: &RarStore) -> Facts {
                     .map(|(piece, runs)| (*piece, runs.kept()))
                     .collect(),
             }),
+            made: entry.made,
         })
         .collect();
     let facts = StoreFacts {
@@ -434,6 +439,7 @@ pub(super) fn restored(facts: &Facts) -> Result<RarStore, RestoreError> {
 
 fn entry(facts: EntryFacts) -> Entry {
     Entry {
+        made: facts.made,
         name: facts.name,
         length: facts.length,
         crc: facts.crc,

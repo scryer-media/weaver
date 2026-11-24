@@ -8,10 +8,12 @@
 // answers seeks, and writes members the way a namespace does.
 
 use std::collections::BTreeMap;
+use std::io;
+use std::sync::{Arc, Mutex};
 
 use weaver_graph::{
-    ByteRange, Coverage, Delivery, Digest, Emit, Evidence, Evidenced, Object, Placement,
-    Provenance, Pull, Seek, Standing, VolumeIndex,
+    Budget, ByteRange, Coverage, Delivery, Digest, Emit, Evidence, Evidenced, Object, Placement,
+    Provenance, Pull, Seek, Standing, VolumeIndex, Volumes,
 };
 
 use super::super::RarStore;
@@ -28,10 +30,55 @@ pub(super) struct Got {
     pub closed: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Shelf {
     bytes: Vec<u8>,
     coverage: Coverage,
+}
+
+// The set's volumes as a run reads them off the shelf: each envelope's
+// bytes where they were kept, at their volume offsets, and an error for
+// any other, recorded as volume, offset and length asked.
+pub(super) struct Shelved {
+    lengths: Vec<u64>,
+    shelves: BTreeMap<u32, Shelf>,
+    pub strays: Mutex<Vec<(u32, u64, usize)>>,
+}
+
+impl Volumes for Shelved {
+    fn next(&self, after: Option<VolumeIndex>) -> io::Result<Option<VolumeIndex>> {
+        let next = after.map_or(0, |after| after.0 + 1);
+        Ok(((next as usize) < self.lengths.len()).then_some(VolumeIndex(next)))
+    }
+
+    fn len(&self, volume: VolumeIndex) -> Option<u64> {
+        self.lengths.get(volume.0 as usize).copied()
+    }
+
+    fn settled(&self, volume: VolumeIndex) -> bool {
+        (volume.0 as usize) < self.lengths.len()
+    }
+
+    fn read_at(&self, volume: VolumeIndex, offset: u64, into: &mut [u8]) -> io::Result<usize> {
+        let length = self.lengths[volume.0 as usize];
+        let end = (offset + into.len() as u64).min(length);
+        let range = ByteRange::new(offset.min(end), end);
+        let kept = self
+            .shelves
+            .get(&volume.0)
+            .is_some_and(|shelf| shelf.coverage.covered(range));
+        if !range.is_empty() && !kept {
+            self.strays
+                .lock()
+                .unwrap()
+                .push((volume.0, offset, into.len()));
+            return Err(io::Error::from(io::ErrorKind::NotFound));
+        }
+        let shelf = &self.shelves[&volume.0];
+        let taken = range.len() as usize;
+        into[..taken].copy_from_slice(&shelf.bytes[range.start as usize..range.end as usize]);
+        Ok(taken)
+    }
 }
 
 pub(super) struct Owner {
@@ -565,6 +612,49 @@ impl Owner {
         for (piece, provenance, bytes) in read_back {
             self.push(volume, piece, provenance, Some(&bytes));
         }
+    }
+
+    // The set's volumes as they stand on the shelf.
+    pub fn shelved(&self) -> Arc<Shelved> {
+        Arc::new(Shelved {
+            lengths: self
+                .volumes
+                .iter()
+                .map(|(_, bytes)| bytes.len() as u64)
+                .collect(),
+            shelves: self.shelves.clone(),
+            strays: Mutex::default(),
+        })
+    }
+
+    // The bytes the shelf holds, every envelope together.
+    pub fn shelf_bytes(&self) -> u64 {
+        self.shelves
+            .values()
+            .map(|shelf| {
+                shelf
+                    .coverage
+                    .overlapping(ByteRange::new(0, shelf.bytes.len() as u64))
+                    .map(|run| run.range.len())
+                    .sum::<u64>()
+            })
+            .sum()
+    }
+
+    // The store's run, over the shelf as it stands, its emits applied as
+    // the tree applies a run's: what it reads that the shelf never kept.
+    pub fn run(&mut self) -> Vec<(u32, u64, usize)> {
+        let shelved = self.shelved();
+        let mut emits = Vec::new();
+        let mut sink = |emit| {
+            emits.push(emit);
+            true
+        };
+        let engine = self.object.engine_mut().expect("a mixed set runs");
+        let view: Arc<dyn Volumes> = shelved.clone();
+        engine.start().run(view, &mut sink, Budget::default());
+        self.apply(emits);
+        shelved.strays.lock().unwrap().clone()
     }
 
     // A member by name.

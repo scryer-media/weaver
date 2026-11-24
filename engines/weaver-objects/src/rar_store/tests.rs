@@ -715,26 +715,29 @@ fn a_solid_set_asks_for_an_engine_before_any_member() {
     }
 }
 
+// A file compressed after a stored one: the store streams the stored
+// files and leaves the compressed one to its run, handing nothing to an
+// engine and taking nothing back.
 #[test]
-fn a_compressed_file_among_stored_ones_asks_for_an_engine() {
+fn a_compressed_file_after_a_stored_one_is_left_to_the_run() {
     for version in [Version::Rar5, Version::Rar4] {
         let mut options = Options::new(version);
         options.compressed = Some(1);
         let volumes = write(&items(), &options);
         let mut owner = Owner::named(store(), volumes);
         owner.whole(4096);
-        assert!(owner.said.contains(&Emit::NeedsEngine(Why::Compressed)));
-        // What came before stays announced for the engine's stand-in, with
-        // the bytes routed before the store gave the set up.
-        assert_eq!(owner.members.len(), 1);
-        let alpha = &owner.member("alpha.bin").bytes;
-        assert!(files()[0].1.starts_with(alpha));
-        assert!(
-            !owner
-                .said
-                .iter()
-                .any(|emit| matches!(emit, Emit::Retract(_)))
-        );
+        no_trouble(&owner);
+        assert_eq!(owner.members.len(), 3, "{version:?}");
+        for (name, bytes) in files() {
+            let got = owner.member(name);
+            match name {
+                "beta.bin" => assert!(!got.closed && got.bytes.is_empty(), "{version:?}"),
+                _ => assert!(got.closed && got.bytes == bytes, "{version:?} {name}"),
+            }
+        }
+        let face = owner.object.engine().expect("a mixed set runs");
+        assert!(face.makes(member_id(&owner, "beta.bin")));
+        assert!(!face.makes(member_id(&owner, "alpha.bin")));
     }
 }
 

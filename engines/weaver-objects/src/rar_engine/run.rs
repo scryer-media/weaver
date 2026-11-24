@@ -15,7 +15,7 @@
 // come, the walk reads on the headers of the volumes already in and the
 // files there decode beside it, said once it closes.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -46,29 +46,38 @@ struct Decoded {
 // bookkeeping behind both, so smaller writes gather into one first.
 pub(super) const EMIT_BYTES: usize = 1 << 20;
 
-pub(super) struct Run {
+pub(crate) struct Run {
     password: Option<String>,
-    // Spike: the members, by archive index, a run decodes; the rest it
-    // passes over without reading their data. None decodes every member.
-    only: Option<BTreeSet<usize>>,
+    scope: Scope,
+}
+
+// What a run decodes, and which members it makes.
+pub(crate) enum Scope {
+    // Every member: each file body and directory is announced, numbered in
+    // archive order.
+    Whole,
+    // These members alone, by archive index, each made as the store's
+    // member it names, under the name the store's headers spell it; every
+    // other member is passed over unread and is no member of the run's.
+    // Nothing is announced: the namespace is the store's, and the run only
+    // fills it.
+    Members(BTreeMap<usize, Made>),
+}
+
+// A member a scoped run makes: the store's id for it, and its name as the
+// headers spell it, which the member at that archive index must carry.
+pub(crate) struct Made {
+    pub(crate) id: MemberId,
+    pub(crate) name: String,
 }
 
 impl Run {
     pub(super) fn new(password: Option<String>) -> Self {
-        Self {
-            password,
-            only: None,
-        }
+        Self::of(password, Scope::Whole)
     }
 
-    // Spike: a run that decodes only `members`, by archive index, one at a
-    // time on the run's thread.
-    #[cfg(test)]
-    pub(super) fn only(password: Option<String>, members: BTreeSet<usize>) -> Self {
-        Self {
-            password,
-            only: Some(members),
-        }
+    pub(crate) fn of(password: Option<String>, scope: Scope) -> Self {
+        Self { password, scope }
     }
 }
 
@@ -93,7 +102,7 @@ impl Extraction for Run {
             next: 0,
             open: None,
             reading: 0,
-            only: self.only,
+            scope: self.scope,
         };
         let Err(Stop::Say(last)) = walk.archive(self.password.as_deref()) else {
             return;
@@ -139,7 +148,7 @@ struct Walk<'s, 'a> {
     open: Option<Open>,
     // The volume whose headers are being read.
     reading: usize,
-    only: Option<BTreeSet<usize>>,
+    scope: Scope,
 }
 
 impl Walk<'_, '_> {
@@ -219,7 +228,16 @@ impl Walk<'_, '_> {
     // Whether members may decode beside each other: those of a set that is
     // not solid, on more than the run's own thread.
     fn spreads(&self, archive: &RarArchive) -> bool {
-        self.budget.threads() > 1 && !archive.is_solid() && self.only.is_none()
+        self.budget.threads() > 1 && !archive.is_solid()
+    }
+
+    // Whether the run makes member `at`: every member of a whole run, and
+    // of a scoped one those its scope names.
+    fn makes(&self, at: usize) -> bool {
+        match &self.scope {
+            Scope::Whole => true,
+            Scope::Members(made) => made.contains_key(&at),
+        }
     }
 
     // How many members from `index` on may decode side by side.
@@ -227,27 +245,35 @@ impl Walk<'_, '_> {
         let mut held = 0;
         (index..archive.len())
             .map_while(|at| {
-                held = may_start(archive, &self.input, &self.budget, at, held, has_password)?;
+                // A member the run does not make is passed over unread.
+                if self.makes(at) {
+                    held = may_start(archive, &self.input, &self.budget, at, held, has_password)?;
+                }
                 Some(())
             })
             .count()
     }
 
-    // Decode the members of `batch` on as many of the lent pool's threads
-    // as the budget grants, each member over an archive of its own holding
-    // that member alone, and say them in archive order once each is whole.
+    // Decode the members of `batch` the run makes on as many of the lent
+    // pool's threads as the budget grants, each member over an archive of
+    // its own holding that member alone, and say them in archive order once
+    // each is whole.
     fn side_by_side(
         &mut self,
         archive: &RarArchive,
         batch: std::ops::Range<usize>,
     ) -> Result<(), Stop> {
-        let slots: Vec<Mutex<Option<Decoded>>> = batch.clone().map(|_| Mutex::new(None)).collect();
+        let batch: Vec<usize> = batch.filter(|at| self.makes(*at)).collect();
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let slots: Vec<Mutex<Option<Decoded>>> = batch.iter().map(|_| Mutex::new(None)).collect();
         let workers = self.budget.threads().min(slots.len());
         let decode_limits = limits(&self.budget);
         // Each member's own archive, made on the walk's thread.
         let owns: Vec<Mutex<Option<RarArchive>>> = batch
-            .clone()
-            .map(|at| Mutex::new(Some(copy(archive, at, &decode_limits))))
+            .iter()
+            .map(|at| Mutex::new(Some(copy(archive, *at, &decode_limits))))
             .collect();
         let taken = AtomicUsize::new(0);
         let halted = AtomicBool::new(false);
@@ -273,7 +299,7 @@ impl Walk<'_, '_> {
             }
         };
         self.budget.pool().spread(workers, &work);
-        for (at, slot) in batch.zip(slots) {
+        for (at, slot) in batch.into_iter().zip(slots) {
             match slot.into_inner().unwrap_or_else(PoisonError::into_inner) {
                 Some(decoded) => self.say_decoded(archive, at, decoded)?,
                 None => unreachable!("a member not taken follows one that failed"),
@@ -297,7 +323,7 @@ impl Walk<'_, '_> {
                 len: archive.len(),
             }));
         };
-        let member = self.announce(&info)?;
+        let member = self.announce(at, &info)?;
         self.deliver(member, decoded.bytes)?;
         if let Some((error, read_failed)) = decoded.ended {
             // Decoding alone, the walk would have read what failed itself.
@@ -314,14 +340,28 @@ impl Walk<'_, '_> {
     // A file member's announcement, leaving it open. It states no checksum:
     // until the member's final part's header has been read, the archive
     // knows none for it. `checksum_of` states it once the member is decoded.
-    fn announce(&mut self, info: &unrar_rs::MemberInfo) -> Result<MemberId, Stop> {
-        let member = MemberId(self.next);
-        self.next += 1;
-        self.say(Emit::Member {
-            member,
-            name: unrar_rs::sanitize_path(&info.raw_name),
-            length: info.unpacked_size,
-        })?;
+    // A scoped run announces nothing: the member at archive index `at` is
+    // the store's, which must name the member the run reads there.
+    fn announce(&mut self, at: usize, info: &unrar_rs::MemberInfo) -> Result<MemberId, Stop> {
+        let member = match &self.scope {
+            Scope::Whole => {
+                let member = MemberId(self.next);
+                self.next += 1;
+                self.say(Emit::Member {
+                    member,
+                    name: unrar_rs::sanitize_path(&info.raw_name),
+                    length: info.unpacked_size,
+                })?;
+                member
+            }
+            Scope::Members(made) => match made.get(&at) {
+                Some(made) if made.name == info.raw_name => made.id,
+                // The store's headers and the run's disagree on what the
+                // member is: nothing the run would make there is the
+                // store's member.
+                _ => return Err(Stop::Say(vec![Emit::Refuse(Why::Unsupported)])),
+            },
+        };
         self.open = Some(Open {
             member,
             encrypted: info.is_encrypted,
@@ -389,14 +429,8 @@ impl Walk<'_, '_> {
         if link(archive, index, &info) {
             return Ok(1);
         }
-        // Spike: a member the run was not asked for keeps its id and is
-        // passed over unread.
-        if self
-            .only
-            .as_ref()
-            .is_some_and(|only| !only.contains(&index))
-        {
-            self.next += 1;
+        // A member the run does not make is passed over unread.
+        if !self.makes(index) {
             return Ok(1);
         }
         // A directory is a member with nothing in it, named with a trailing
@@ -421,7 +455,7 @@ impl Walk<'_, '_> {
         if self.spreads(archive) {
             return self.alongside(archive, index, &info, cursor, password);
         }
-        let member = self.announce(&info)?;
+        let member = self.announce(index, &info)?;
         let mut out = Out {
             sink: &mut *self.sink,
             member,
@@ -465,7 +499,7 @@ impl Walk<'_, '_> {
         cursor: &mut Cursor,
         password: Option<&str>,
     ) -> Result<usize, Stop> {
-        let member = self.announce(info)?;
+        let member = self.announce(index, info)?;
         let decode_limits = limits(&self.budget);
         let mut own = copy(archive, index, &decode_limits);
         let beside = Beside::default();
@@ -478,9 +512,14 @@ impl Walk<'_, '_> {
                 input,
                 sink,
                 budget,
+                scope,
                 ..
             } = &mut *self;
             let (input, budget) = (&*input, &*budget);
+            let makes = |at: usize| match &*scope {
+                Scope::Whole => true,
+                Scope::Members(made) => made.contains_key(&at),
+            };
             let lend = budget.threads() - 1;
             let work = || {
                 beside.work(&input.volumes);
@@ -497,6 +536,12 @@ impl Walk<'_, '_> {
                         ahead = None;
                     }
                     while beside.running.load(Ordering::Acquire) < lend {
+                        // A member the run does not make is passed over
+                        // unread; it is said by no one here.
+                        if next < archive.len() && !makes(next) {
+                            next += 1;
+                            continue;
+                        }
                         let Some(total) =
                             may_start(archive, input, budget, next, held, password.is_some())
                         else {
@@ -547,6 +592,9 @@ impl Walk<'_, '_> {
             .into_inner()
             .unwrap_or_else(PoisonError::into_inner);
         for at in index + 1..next {
+            if !self.makes(at) {
+                continue;
+            }
             match decoded.remove(&at) {
                 Some(decoded) => self.say_decoded(archive, at, decoded)?,
                 None => unreachable!("a member a halt dropped follows one that failed"),

@@ -94,6 +94,13 @@ fn verdict(member: &StoredMember, in_clear: impl FnOnce() -> bool) -> Option<Emi
     })
 }
 
+fn is_directory(member: &StoredMember) -> bool {
+    matches!(
+        member.eligibility,
+        MemberEligibility::Ineligible(IneligibilityReason::Directory)
+    )
+}
+
 // Whether a member's first part is stored in the clear, as the headers of
 // the volume it starts in state it.
 fn in_clear(volumes: &BTreeMap<VolumeIndex, Volume>, member: &StoredMember) -> bool {
@@ -667,10 +674,11 @@ impl RarStore {
         #[cfg(test)]
         for (entry, member) in self.entries.iter().zip(members).take(start) {
             // What the old look found of each member passed over: the same
-            // member, no verdict, and nothing to extend.
+            // member, no verdict but the run's to make it, and nothing to
+            // extend.
             assert!(same(entry, member), "{}", member.name);
             assert!(
-                verdict(member, || in_clear(&self.volumes, member)).is_none(),
+                entry.made || verdict(member, || in_clear(&self.volumes, member)).is_none(),
                 "{}",
                 member.name
             );
@@ -709,6 +717,9 @@ impl RarStore {
         }
         if keep < self.entries.len() {
             self.entries.truncate(keep);
+            if self.first_stored.is_some_and(|first| first >= keep) {
+                self.first_stored = None;
+            }
             self.remap();
         }
         for (id, member) in members.iter().enumerate().skip(start) {
@@ -717,12 +728,16 @@ impl RarStore {
             }
             #[cfg(test)]
             super::counts::bump(|counts| counts.visited += 1);
-            if let Some(emit) = verdict(member, || in_clear(&self.volumes, member)) {
+            let made = self.made_by_run(id, member, format);
+            if !made && let Some(emit) = verdict(member, || in_clear(&self.volumes, member)) {
                 refusal = Some(emit);
                 break;
             }
+            if !made && !is_directory(member) {
+                self.first_stored.get_or_insert(id);
+            }
             if id == self.entries.len() {
-                self.announce(member, out);
+                self.announce(member, made, out);
             }
             self.extend(id, member, out);
         }
@@ -752,18 +767,24 @@ impl RarStore {
         }
     }
 
-    fn announce(&mut self, member: &StoredMember, out: &mut Vec<Emit>) {
-        let dir = matches!(
-            member.eligibility,
-            MemberEligibility::Ineligible(IneligibilityReason::Directory)
-        );
+    fn announce(&mut self, member: &StoredMember, made: bool, out: &mut Vec<Emit>) {
+        let dir = is_directory(member);
         let length = if dir { Some(0) } else { member.unpacked_size };
         let id = MemberId(self.entries.len() as u32);
+        // A member the run makes is named as the RAR engine names it, so a
+        // mixed set delivers it where the engine would (`made`).
+        let name = match made {
+            true => super::made::name(&member.name),
+            false => member_name(&member.name, dir),
+        };
         out.push(Emit::Member {
             member: id,
-            name: member_name(&member.name, dir),
+            name,
             length,
         });
+        if made {
+            self.made.insert(id.0 as usize);
+        }
         let store = member.eligibility.encrypted_store();
         if store.is_some() {
             self.locked.insert(id.0 as usize);
@@ -786,6 +807,7 @@ impl RarStore {
             out: Arc::default(),
             plain_runs: CrcRuns::default(),
             parts: Default::default(),
+            made,
         });
         if dir {
             Arc::make_mut(&mut self.entries[id.0 as usize].out).closed = true;
@@ -822,6 +844,11 @@ impl RarStore {
         entry.complete = true;
         entry.crc = member.data_crc32;
         entry.uses_mac = member.data_hash_uses_mac;
+        // A member the run makes is the run's to check and close, as the
+        // engine checks and closes it, once each run decodes it.
+        if entry.made {
+            return;
+        }
         // A keyed checksum is not the member's own CRC32.
         if !entry.judges_its_checksum()
             && let Some(crc32) = entry.crc
