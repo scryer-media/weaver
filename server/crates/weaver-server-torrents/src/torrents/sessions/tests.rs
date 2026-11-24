@@ -235,6 +235,52 @@ fn port_slots_are_kept_and_reused_once_free() {
     assert_eq!(port_slot(&db, &second).unwrap(), 1);
 }
 
+// Freeing the slots of the routes gone, looked up in a set, frees the slots
+// that looking each saved slot up in the routes kept freed, and keeps the
+// rest at their slots, over seeded slot tables and kept routes, some kept
+// routes holding no slot.
+#[test]
+fn slots_freed_by_a_set_of_kept_routes_match_a_walk_of_them() {
+    let mut rng = 0x6a09_e667_f3bc_c908u64;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let keys: Vec<RouteKey> = (0..300)
+        .map(|hop| RouteKey::of(0, &EgressBinding::System, &ladder(hop)))
+        .collect();
+    for run in 0..20 {
+        let (walked, by_set) = (
+            Database::open_in_memory().unwrap(),
+            Database::open_in_memory().unwrap(),
+        );
+        for key in keys.iter().filter(|_| next() % 3 != 0) {
+            port_slot(&walked, key).unwrap();
+            port_slot(&by_set, key).unwrap();
+        }
+        let existing: BTreeSet<RouteKey> =
+            keys.iter().filter(|_| next() % 2 == 0).cloned().collect();
+        release_slots(&walked, |key: &str| {
+            !existing.iter().any(|kept| kept.as_str() == key)
+        })
+        .unwrap();
+        release_slots(&by_set, gone_routes(&existing)).unwrap();
+        assert_eq!(
+            load_slots(&walked).unwrap(),
+            load_slots(&by_set).unwrap(),
+            "run {run}"
+        );
+        // A route that opens next takes the same lowest free slot.
+        let fresh = RouteKey::of(1, &EgressBinding::System, &ladder(run));
+        assert_eq!(
+            port_slot(&walked, &fresh).unwrap(),
+            port_slot(&by_set, &fresh).unwrap()
+        );
+    }
+}
+
 // A route keeps its port while it exists, its session dropped or not, and
 // gives it back once it is gone.
 #[tokio::test(flavor = "multi_thread")]

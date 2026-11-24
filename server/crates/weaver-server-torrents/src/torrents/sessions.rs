@@ -1149,8 +1149,7 @@ impl Sessions {
         let (db, table) = (self.db.clone(), Arc::clone(&self.port_slots));
         let released = tokio::task::spawn_blocking(move || {
             let _table = table.lock().unwrap_or_else(PoisonError::into_inner);
-            let gone = |key: &str| !existing.iter().any(|kept| kept.as_str() == key);
-            release_slots(&db, gone)
+            release_slots(&db, gone_routes(&existing))
         })
         .await;
         match released {
@@ -2331,6 +2330,13 @@ pub fn chosen_ssl_port(db: &Database) -> Result<u16, StateError> {
     let port = random_port(SSL_PORTS)?;
     db.set_setting(CHOSEN_SSL_PORT_KEY, &port.to_string())?;
     Ok(port)
+}
+
+// Whether a saved slot's route is gone: not one of `existing`, looked up
+// in a set built once.
+fn gone_routes(existing: &BTreeSet<RouteKey>) -> impl Fn(&str) -> bool + '_ {
+    let kept: std::collections::HashSet<&str> = existing.iter().map(RouteKey::as_str).collect();
+    move |key| !kept.contains(key)
 }
 
 // Free the slots of the routes `gone` names.
