@@ -514,13 +514,17 @@ async fn background_due_sync_skips_when_manual_sync_is_active() {
     .unwrap();
 
     let service = build_service(temp.path(), db);
-    let running = {
+    let mut running = {
         let service = service.clone();
         tokio::spawn(async move { service.run_all_sync().await.unwrap() })
     };
     // The feed request only goes out under the sync lock, and the held
-    // response keeps that sync running until the probe below has run.
-    hold.arrived.notified().await;
+    // response keeps that sync running until the probe below has run. A sync
+    // that ends before its request arrives would leave nothing to wait for.
+    tokio::select! {
+        () = hold.arrived.notified() => {}
+        ended = &mut running => panic!("the sync ended before its feed request arrived: {ended:?}"),
+    }
     assert!(matches!(
         service.try_run_due_sync().await.unwrap(),
         DueSyncOutcome::SkippedActiveSync

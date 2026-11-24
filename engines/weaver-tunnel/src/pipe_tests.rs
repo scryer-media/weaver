@@ -10,6 +10,18 @@ fn bottom() -> Arc<Egress> {
         Duration::from_secs(30),
     ))
 }
+// One connection from both ends: the accept and the dial that answers it.
+// Either side failing ends the wait, since the other then waits for nothing.
+async fn connected<A, B, EA: std::fmt::Debug, EB: std::fmt::Debug>(
+    accept: impl std::future::Future<Output = Result<A, EA>>,
+    dial: impl std::future::Future<Output = Result<B, EB>>,
+) -> (A, B) {
+    tokio::try_join!(
+        async { accept.await.map_err(|error| format!("accept: {error:?}")) },
+        async { dial.await.map_err(|error| format!("dial: {error:?}")) },
+    )
+    .unwrap()
+}
 fn target(address: SocketAddr) -> Target {
     Target {
         host: address.ip().to_string(),
@@ -2602,9 +2614,8 @@ async fn a_wireguard_listener_takes_a_peer_connection_inside_its_tunnel() {
     assert_eq!(local.ip(), IpAddr::V4(TEST_CLIENT_ADDRESS));
     assert_ne!(local.port(), 0);
 
-    let (accepted, peer) = tokio::join!(listener.accept(), near.dial_client(local.port()));
-    let mut accepted = accepted.unwrap();
-    let mut peer = peer.unwrap();
+    let (mut accepted, mut peer) =
+        connected(listener.accept(), near.dial_client(local.port())).await;
     assert_eq!(accepted.path.proxies, vec![1]);
     assert_eq!(accepted.path.egress, 4);
     assert_eq!(accepted.source, Some(local));
@@ -2715,14 +2726,13 @@ async fn a_wireguard_listener_listens_again_inside_a_replaced_tunnel() {
     // The accept finds its tunnel stopped and listens in the new one; the
     // peer dials once the new tunnel listens on the port.
     let provider = session.resolver.as_ref().unwrap();
-    let (accepted, peer) = tokio::join!(listener.accept(), async {
+    let (mut accepted, mut peer) = connected(listener.accept(), async {
         while !provider.listens_on(port).await {
             tokio::task::yield_now().await;
         }
         near.dial_client(port).await
-    });
-    let mut accepted = accepted.unwrap();
-    let mut peer = peer.unwrap();
+    })
+    .await;
     assert_eq!(listener.local_addr().port(), port);
     assert_eq!(accepted.source.map(|source| source.port()), Some(port));
     peer.write_all(b"again").await.unwrap();
@@ -2893,14 +2903,13 @@ async fn accept_from(
     port: u16,
 ) -> Dialed {
     let provider = hop.resolver.as_ref().expect("a WireGuard hop");
-    let (accepted, dialed) = tokio::join!(listener.accept(), async {
+    let (mut accepted, mut dialed) = connected(listener.accept(), async {
         while listener.local_addr().port() != port || !provider.listens_on(port).await {
             tokio::task::yield_now().await;
         }
         peer.dial_client(port).await
-    });
-    let mut accepted = accepted.unwrap();
-    let mut dialed = dialed.unwrap();
+    })
+    .await;
     dialed.write_all(b"handshake").await.unwrap();
     let mut heard = [0u8; 9];
     accepted.stream.read_exact(&mut heard).await.unwrap();
@@ -3390,8 +3399,7 @@ async fn kept_from_far(
 ) -> (crate::WgTcpStream, KeptRegistration, FarLink) {
     let mut listener = provider.listen(0, 1).await.unwrap();
     let port = listener.local_addr().port();
-    let (accepted, far) = tokio::join!(listener.accept(), near.dial_client(port));
-    let (stream, far) = (accepted.unwrap(), far.unwrap());
+    let (stream, far) = connected(listener.accept(), near.dial_client(port)).await;
     let permit = sockets
         .take(SocketClass::Reserve, super::dns_stream_bytes())
         .expect("room")
@@ -3492,8 +3500,7 @@ async fn only_a_stream_a_kept_connection_may_ride_can_be_reset() {
     let sockets = super::reserve_of(1);
     let mut listener = provider.listen(0, 1).await.unwrap();
     let port = listener.local_addr().port();
-    let (accepted, far) = tokio::join!(listener.accept(), near.dial_client(port));
-    let stream = accepted.unwrap();
+    let (stream, far) = connected(listener.accept(), near.dial_client(port)).await;
     let mut socket = StreamSocket::new(Some(
         sockets
             .take(SocketClass::Reserve, super::dns_stream_bytes())
@@ -3786,9 +3793,7 @@ async fn an_accepted_streams_bytes_come_back_when_the_tunnel_frees_its_socket() 
         listener_bytes()
     );
     let port = listener.local_addr().port();
-    let (accepted, far) = tokio::join!(listener.accept(), near.dial_client(port));
-    let accepted = accepted.unwrap();
-    let far = far.unwrap();
+    let (accepted, far) = connected(listener.accept(), near.dial_client(port)).await;
     assert_eq!(session.sockets.held(SocketClass::Torrent), stream);
 
     drop(accepted);
