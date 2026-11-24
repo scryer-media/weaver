@@ -2041,12 +2041,8 @@ async fn removal_left(
     state: &crate::jobs::SharedPipelineState,
     ids: &[JobId],
 ) -> Vec<String> {
-    let dir = rig.dir.path().to_string_lossy().into_owned();
-    let real = std::fs::canonicalize(rig.dir.path())
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
-    let plain = |text: String| text.replace(&real, "<dir>").replace(&dir, "<dir>");
+    let real = std::fs::canonicalize(rig.dir.path()).unwrap();
+    let plain = |text: String| without_dir(&without_dir(&text, &real), rig.dir.path());
     rig.db.admitted_so_far().await;
     let mut left = Vec::new();
     for job_id in ids {

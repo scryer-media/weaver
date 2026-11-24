@@ -225,11 +225,23 @@ impl Scene {
     // announce that brings answered.
     async fn track(&self, jobs: &[(&str, JobId)]) {
         for (name, job_id) in jobs {
-            if self.rig.service.inner.live.lock().await[job_id]
+            let paused = self.rig.service.inner.live.lock().await[job_id]
                 .attached
-                .is_some()
-            {
-                tracked(&self.rig.service, *job_id, &self.heard.url(name).await).await;
+                .as_ref()
+                .map(|attached| attached.handle.is_paused());
+            let Some(paused) = paused else { continue };
+            let from = self.heard.log.borrow().len();
+            tracked(&self.rig.service, *job_id, &self.heard.url(name).await).await;
+            // A running torrent whose run has not begun yet (a restart
+            // still checks it) has no announces to wait on until it does:
+            // its tracker hearing it is what says the run began.
+            if !paused {
+                self.heard
+                    .log
+                    .clone()
+                    .wait_for(|log| log[from..].iter().any(|(heard, _)| heard == name))
+                    .await
+                    .unwrap();
             }
         }
         quiet(&self.rig.service, jobs).await;

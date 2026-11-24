@@ -63,7 +63,12 @@ fn outputs_are_placed_as_the_scans_found_them() {
     assert_eq!(placed.names, expected);
     let wanted: HashSet<String> = (0..3_000)
         .filter(|index| index % 5 > 2)
-        .map(|index| format!("set/part{index:04}.bin"))
+        .map(|index| {
+            Path::new("set")
+                .join(format!("part{index:04}.bin"))
+                .to_string_lossy()
+                .into_owned()
+        })
         .collect();
     assert_eq!(placed.names.iter().cloned().collect::<HashSet<_>>(), wanted);
     let mut there = Vec::new();

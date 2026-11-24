@@ -59,7 +59,14 @@ async fn a_metainfo_becomes_a_job_and_its_duplicate_is_refused() {
     assert_eq!(stored.source, TorrentSource::Metainfo);
     assert_eq!(
         stored.storage_dir.as_deref(),
-        Some(rig.dir.path().join("complete/set").to_str().unwrap())
+        Some(
+            rig.dir
+                .path()
+                .join("complete")
+                .join("set")
+                .to_str()
+                .unwrap()
+        )
     );
     let view = rig.service.torrent(job_id).await.unwrap();
     assert_eq!(view.total_bytes, 3000);
@@ -393,7 +400,12 @@ async fn torrents_with_one_name_get_their_own_directories() {
     }
     assert_eq!(
         dirs[0],
-        rig.dir.path().join("complete/set").to_str().unwrap()
+        rig.dir
+            .path()
+            .join("complete")
+            .join("set")
+            .to_str()
+            .unwrap()
     );
     assert_ne!(dirs[0], dirs[1]);
 }
@@ -1128,7 +1140,15 @@ async fn an_add_in_a_category_there_is_none_of_makes_it() {
             .unwrap()
             .storage_dir
             .as_deref(),
-        Some(rig.dir.path().join("complete/films/set").to_str().unwrap())
+        Some(
+            rig.dir
+                .path()
+                .join("complete")
+                .join("films")
+                .join("set")
+                .to_str()
+                .unwrap()
+        )
     );
     rig.service.stop().await;
 }

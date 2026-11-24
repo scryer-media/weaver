@@ -904,7 +904,9 @@ fn a_one_file_torrent_reads_as_its_file_and_a_folder_as_its_folder() {
         ..view(TorrentState::Seeding)
     };
     let info_one = info(&one, CallerScope::Admin);
-    assert_eq!(info_one["content_path"], "/complete/tv/a/a.mkv");
+    // The file's name joined to its folder as the platform joins them.
+    let joined = Path::new("/complete/tv/a").join("a.mkv");
+    assert_eq!(info_one["content_path"], joined.to_string_lossy().as_ref());
     assert_eq!(info_one["save_path"], "/complete/tv/a");
 
     // A folder that holds one file is still a folder.
@@ -5245,15 +5247,22 @@ async fn rss_rule_reads_carry_no_link() {
 #[tokio::test]
 async fn a_categorys_options_are_set_and_read_back() {
     let rig = rig().await;
+    // A whole path as the platform writes one: with no drive, Windows reads
+    // it against the drive of the complete folder.
+    let (sent, saved) = if cfg!(windows) {
+        ("C%3A%2Fmedia%2Ftv", "C:/media/tv")
+    } else {
+        ("%2Fmedia%2Ftv", "/media/tv")
+    };
     let created = rig
         .post(
             "/api/v2/torrents/createCategory",
-            "category=tv&savePath=%2Fmedia%2Ftv&ratioLimit=2&shareLimitAction=Stop",
+            &format!("category=tv&savePath={sent}&ratioLimit=2&shareLimitAction=Stop"),
         )
         .await;
     assert_eq!(created.status, StatusCode::OK);
     let tv = &rig.get("/api/v2/torrents/categories").await.json()["tv"];
-    assert_eq!(tv["savePath"], "/media/tv");
+    assert_eq!(tv["savePath"], saved);
     assert_eq!(tv["ratio_limit"], 2.0);
     assert_eq!(tv["seeding_time_limit"], -2);
     assert_eq!(tv["share_limit_action"], "Stop");
@@ -5264,7 +5273,7 @@ async fn a_categorys_options_are_set_and_read_back() {
     assert_eq!(edited.status, StatusCode::OK);
     let tv = &rig.get("/api/v2/torrents/categories").await.json()["tv"];
     assert_eq!(tv["ratio_limit"], -2);
-    assert_eq!(tv["savePath"], "/media/tv");
+    assert_eq!(tv["savePath"], saved);
 
     let missing = rig
         .post("/api/v2/torrents/editCategory", "category=film")

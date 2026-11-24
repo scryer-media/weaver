@@ -2846,14 +2846,17 @@ impl SocketFactory for Counted {
 // the engine opens no socket of its own.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_own_socket_legs_session_opens_its_sockets_through_the_leg() {
-    use crate::torrents::net::{LOOPBACK_DEVICE, system_dialer};
+    use crate::torrents::net::{loopback_device_leg, system_dialer};
 
     let torrent = TorrentConfig {
         upnp: false,
         dht_bootstrap_nodes: String::new(),
         ..TorrentConfig::default()
     };
-    for kind in [LegKind::System, LegKind::Interface(LOOPBACK_DEVICE.into())] {
+    for kind in [Some(LegKind::System), loopback_device_leg()]
+        .into_iter()
+        .flatten()
+    {
         let dir = tempfile::tempdir().unwrap();
         let mut leg = OpenLeg::on(kind.clone(), system_dialer(), None, None).unwrap();
         let counted = Arc::new(Counted {

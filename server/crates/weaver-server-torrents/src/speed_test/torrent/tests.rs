@@ -437,11 +437,14 @@ async fn the_probe_opens_with_a_routes_options_on_every_kind_of_leg() {
         ..quiet()
     };
     for kind in [
-        LegKind::System,
-        LegKind::Interface(crate::torrents::net::LOOPBACK_DEVICE.into()),
-        source_address(),
-        LegKind::Ladder,
-    ] {
+        Some(LegKind::System),
+        crate::torrents::net::loopback_device_leg(),
+        Some(source_address()),
+        Some(LegKind::Ladder),
+    ]
+    .into_iter()
+    .flatten()
+    {
         let path = P2pPath::open(P2pLeg {
             torrent: settings.clone(),
             ip_filter: sessions.ip_filter(&settings).await,

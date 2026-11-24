@@ -122,8 +122,13 @@ pub(super) async fn written(
             ));
         }
     }
-    let dir = rig.dir.path().to_string_lossy().into_owned();
-    out.replace(&dir, "<dir>")
+    let out = without_dir(&out, rig.dir.path());
+    // Under it the platform's own separator, which `{:?}` wrote doubled.
+    if cfg!(windows) {
+        out.replace("\\\\", "/")
+    } else {
+        out
+    }
 }
 
 // A torrent added and in its session.
