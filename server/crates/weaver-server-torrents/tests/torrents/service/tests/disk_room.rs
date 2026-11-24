@@ -1535,6 +1535,51 @@ async fn a_wait_for_room_ends_with_its_run() {
     }
 }
 
+// A recheck of a torrent with no room for what it has left keeps its run:
+// a queue pass made while the check runs holds only its download, as the
+// judgement of the check's end does, and never pauses it as a start. Once
+// the check ends it runs, seeding, its download held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_queue_pass_during_a_recheck_holds_only_its_download() {
+    let room = Arc::new(AtomicU64::new(1));
+    let disk = on_disk(&room).await;
+    let service = &disk.rig.service;
+    let job_id = disk.job_id;
+    let handle = held(&disk).await;
+    // Nothing more comes, so no write finds the disk full again.
+    disk.seeding.stop().await;
+    let session = {
+        let live = service.inner.live.lock().await;
+        Arc::clone(&live[&job_id].attached.as_ref().unwrap().session)
+    };
+    let (mut judged, at) = checks_judged(service);
+    // The recheck's halves, with a queue pass between them: its pieces are
+    // forgotten and its hold ends, as a recheck's do, and the pass comes
+    // before the check of its files begins.
+    session.forget_for_recheck(&handle).await.unwrap();
+    {
+        let mut live = service.inner.live.lock().await;
+        let torrent = live.get_mut(&job_id).unwrap();
+        service.end_disk_room(torrent);
+        service.rejudge_after_check(torrent, &session, &handle);
+    }
+    service.apply_queue().await;
+    assert_eq!(
+        disk_held(service, job_id).await,
+        Some(DiskHeld::Fetching),
+        "the pass holds only its download"
+    );
+    assert!(!handle.is_paused(), "the pass does not pause it as a start");
+
+    session.start_check(&handle).unwrap();
+    judged_past(&mut judged, at).await;
+    assert_eq!(disk_held(service, job_id).await, Some(DiskHeld::Fetching));
+    assert!(!handle.is_paused(), "it runs, seeding");
+    assert!(!not_running(service, job_id).await);
+    assert!(handle.live().unwrap().upload_mode());
+    service.stop().await;
+}
+
 // A torrent that joins its session again, after a pause, keeps the disk
 // found for its folder: what it has left is judged there with no new look,
 // and with nothing of it to seed it is kept from starting there. A piece

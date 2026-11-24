@@ -499,29 +499,39 @@ impl TorrentService {
     // is left as it was. Then its start is judged (`rejudge_start`), so a
     // check that finds less than was believed is promised what it has left,
     // or has its download held, seeding. A run ended or replaced by then is
-    // judged as it starts.
-    pub(super) fn rejudge_after_check(
+    // judged as it starts. Until the judgement, the run is one that goes on
+    // (`seeding_run`): a pass made meanwhile holds only its download, as
+    // the judgement does, and never pauses it as a start.
+    pub fn rejudge_after_check(
         &self,
-        job_id: JobId,
+        torrent: &mut Live,
         session: &Arc<weaver_torrent::Session>,
         handle: &Arc<weaver_torrent::ManagedTorrent>,
     ) {
+        let job_id = torrent.record.job_id;
+        torrent.rechecked = Some(Arc::clone(handle));
         let service = self.clone();
         let stopping = session.cancellation_token().clone().cancelled_owned();
         let handle = Arc::clone(handle);
         self.keep(tokio::spawn(async move {
-            tokio::select! {
-                checked = handle.wait_until_initialized() => {
-                    if checked.is_err() {
-                        return;
-                    }
-                }
-                () = stopping => return,
-            }
+            let checked = tokio::select! {
+                checked = handle.wait_until_initialized() => checked.is_ok(),
+                () = stopping => false,
+            };
             let mut live = service.inner.live.lock().await;
             let Some(torrent) = live.get_mut(&job_id) else {
                 return;
             };
+            if torrent
+                .rechecked
+                .as_ref()
+                .is_some_and(|rechecked| Arc::ptr_eq(rechecked, &handle))
+            {
+                torrent.rechecked = None;
+            }
+            if !checked {
+                return;
+            }
             let same = torrent
                 .attached
                 .as_ref()
@@ -562,10 +572,18 @@ impl TorrentService {
         })
     }
 
-    // Whether `torrent` has a run under way, unpaused, and verified data to
-    // seed.
+    // Whether `torrent` has a run that goes on through a refused start, its
+    // download held: one under way, unpaused, with verified data to seed,
+    // or one a recheck checks, unpaused, whose check's end is not judged
+    // yet, which that judgement holds so (`rejudge_after_check`).
     pub(super) fn seeding_run(&self, torrent: &Live) -> bool {
-        self.runs_now(torrent) && torrent.file_have_now().iter().any(|have| *have > 0)
+        let rechecked = torrent.rechecked.as_ref().is_some_and(|rechecked| {
+            torrent.attached.as_ref().is_some_and(|attached| {
+                Arc::ptr_eq(&attached.handle, rechecked) && !attached.handle.is_paused()
+            })
+        });
+        rechecked
+            || (self.runs_now(torrent) && torrent.file_have_now().iter().any(|have| *have > 0))
     }
 
     // `torrent`, running, was refused its start, `refused`, and waits on
@@ -947,7 +965,7 @@ impl TorrentService {
     // The torrent's run ended or was replaced: its wait for room, what a
     // wake handed it, and any promise beside the other waiters' end with
     // it, so a new run never inherits them.
-    pub(super) fn end_disk_room(&self, torrent: &mut Live) {
+    pub fn end_disk_room(&self, torrent: &mut Live) {
         let job_id = torrent.record.job_id;
         if torrent.disk_held == Some(DiskHeld::Fetching) {
             // Its next run is judged as it starts.

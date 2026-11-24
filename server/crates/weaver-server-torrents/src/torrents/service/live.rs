@@ -176,6 +176,11 @@ pub struct Live {
     // of the check the session it joins makes is judged as a recheck's is
     // (`rejudge_after_check`). Taken by that join.
     pub(super) check_owed: bool,
+    // The run whose check of every piece a recheck began, from then until
+    // the check's end is judged (`rejudge_after_check`): a run that goes
+    // on, whose refused start holds only its download, as that judgement
+    // holds it.
+    pub(super) rechecked: Option<Arc<weaver_torrent::ManagedTorrent>>,
     // Waits for room on its disk, and how: the service's wait for it is in
     // `Inner::disk_waits`.
     pub disk_held: Option<DiskHeld>,
@@ -301,6 +306,7 @@ impl Live {
             sealed: None,
             files_missing: false,
             check_owed: false,
+            rechecked: None,
             disk_held: None,
             start_refused: None,
             queued: false,

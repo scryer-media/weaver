@@ -752,7 +752,7 @@ impl TorrentService {
             // it ends, and a write it refuses holds it anew. What it finds
             // is judged once it ends.
             self.end_disk_room(torrent);
-            self.rejudge_after_check(job_id, &session, &handle);
+            self.rejudge_after_check(torrent, &session, &handle);
         }
         Ok(false)
     }
@@ -991,9 +991,9 @@ impl TorrentService {
                 // it finds is judged once it ends.
                 if let Some(torrent) = self.inner.live.lock().await.get_mut(&job_id) {
                     self.end_disk_room(torrent);
-                }
-                if checked.is_ok() {
-                    self.rejudge_after_check(job_id, &session, &handle);
+                    if checked.is_ok() {
+                        self.rejudge_after_check(torrent, &session, &handle);
+                    }
                 }
                 checked
             }

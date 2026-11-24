@@ -1559,7 +1559,7 @@ impl TorrentService {
                 // A recheck made while it was in no session is judged once
                 // this session's check of its files ends.
                 if std::mem::take(&mut torrent.check_owed) {
-                    self.rejudge_after_check(job_id, &session, &handle);
+                    self.rejudge_after_check(torrent, &session, &handle);
                 }
                 torrent.attached = Some(Attached {
                     session,
