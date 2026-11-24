@@ -1836,6 +1836,37 @@ async fn serve_from(
         );
         return;
     }
+    let decoded = article_decoded(pipeline, job, scenario, (file, ordinal), server, leased);
+    pipeline
+        .handle_decode_success(
+            decoded,
+            SegmentSource {
+                servers: crate::pipeline::PoolServers::stamped(
+                    pipeline.pool_generation,
+                    Some(server),
+                    exclude,
+                ),
+            },
+        )
+        .await;
+}
+
+// The decode of the job's article `(file, ordinal)` as `server` answers it.
+pub(in crate::pipeline::tests) fn article_decoded(
+    pipeline: &Pipeline,
+    job: JobId,
+    scenario: &Scenario,
+    (file, ordinal): (u32, u32),
+    server: usize,
+    leased: Option<&weaver_yenc::CheckpointPlan>,
+) -> DecodeResult {
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id: job,
+            file_index: file,
+        },
+        segment_number: ordinal,
+    };
     let intact = !scenario.spoils(server, (file, ordinal));
     let post = &scenario.posts[file as usize];
     // The article's part in the post, which its header declares.
@@ -1872,43 +1903,31 @@ async fn serve_from(
             damaged: !intact,
             ended,
         });
-        pipeline
-            .handle_decode_success(
-                DecodeResult {
-                    segment_id,
-                    raw_size: body.len() as u64,
-                    encoding,
-                    yenc_layout: YencLayoutAssertions {
-                        file_size: 0,
-                        part: None,
-                        total: None,
-                        begin: None,
-                        end: None,
-                    },
-                    crc_valid: true,
-                    part_crc_verified: false,
-                    part_crc: 0,
-                    truncation_suspected: false,
-                    expected_file_crc: None,
-                    data: DecodedChunk::from(body),
-                    yenc_name: if ordinal == 0 {
-                        scenario.header_of(file, ordinal).to_string()
-                    } else {
-                        String::new()
-                    },
-                    checkpoint_plan: weaver_yenc::CheckpointPlan::None,
-                    segments: Vec::new(),
-                },
-                SegmentSource {
-                    servers: crate::pipeline::PoolServers::stamped(
-                        pipeline.pool_generation,
-                        Some(server),
-                        exclude,
-                    ),
-                },
-            )
-            .await;
-        return;
+        return DecodeResult {
+            segment_id,
+            raw_size: body.len() as u64,
+            encoding,
+            yenc_layout: YencLayoutAssertions {
+                file_size: 0,
+                part: None,
+                total: None,
+                begin: None,
+                end: None,
+            },
+            crc_valid: true,
+            part_crc_verified: false,
+            part_crc: 0,
+            truncation_suspected: false,
+            expected_file_crc: None,
+            data: DecodedChunk::from(body),
+            yenc_name: if ordinal == 0 {
+                scenario.header_of(file, ordinal).to_string()
+            } else {
+                String::new()
+            },
+            checkpoint_plan: weaver_yenc::CheckpointPlan::None,
+            segments: Vec::new(),
+        };
     }
     // The part end the header declares is the posted one, whatever of it
     // decoded.
@@ -1932,51 +1951,40 @@ async fn serve_from(
     let mut checksums = weaver_yenc::SegmentedCrc32::new(offset as u64, checkpoint_plan.clone());
     checksums.update(&body);
     let (_, segments) = checksums.finish_article();
-    pipeline
-        .handle_decode_success(
-            DecodeResult {
-                segment_id,
-                raw_size: len,
-                encoding: SegmentEncoding::Yenc,
-                yenc_layout: YencLayoutAssertions {
-                    file_size: match foreign {
-                        true => FOREIGN_SIZE,
-                        false => scenario
-                            .declares
-                            .iter()
-                            .find(|(at, _)| *at == file)
-                            .map_or(post.bytes.len() as u64, |(_, size)| *size),
-                    },
-                    part: Some(part + 1 + u32::from(foreign) * FOREIGN_PART),
-                    total: Some(match foreign {
-                        true => FOREIGN_TOTAL,
-                        false => post.articles(scenario.article).count() as u32,
-                    }),
-                    begin: Some(offset as u64 + 1),
-                    end: Some(offset as u64 + declared),
-                },
-                crc_valid: intact,
-                part_crc_verified: intact,
-                part_crc: crc,
-                truncation_suspected: truncated,
-                expected_file_crc: None,
-                data: DecodedChunk::from(body),
-                yenc_name: match foreign {
-                    true => FOREIGN_NAME.to_string(),
-                    false => scenario.header_of(file, ordinal).to_string(),
-                },
-                checkpoint_plan,
-                segments,
+    DecodeResult {
+        segment_id,
+        raw_size: len,
+        encoding: SegmentEncoding::Yenc,
+        yenc_layout: YencLayoutAssertions {
+            file_size: match foreign {
+                true => FOREIGN_SIZE,
+                false => scenario
+                    .declares
+                    .iter()
+                    .find(|(at, _)| *at == file)
+                    .map_or(post.bytes.len() as u64, |(_, size)| *size),
             },
-            SegmentSource {
-                servers: crate::pipeline::PoolServers::stamped(
-                    pipeline.pool_generation,
-                    Some(server),
-                    exclude,
-                ),
-            },
-        )
-        .await;
+            part: Some(part + 1 + u32::from(foreign) * FOREIGN_PART),
+            total: Some(match foreign {
+                true => FOREIGN_TOTAL,
+                false => post.articles(scenario.article).count() as u32,
+            }),
+            begin: Some(offset as u64 + 1),
+            end: Some(offset as u64 + declared),
+        },
+        crc_valid: intact,
+        part_crc_verified: intact,
+        part_crc: crc,
+        truncation_suspected: truncated,
+        expected_file_crc: None,
+        data: DecodedChunk::from(body),
+        yenc_name: match foreign {
+            true => FOREIGN_NAME.to_string(),
+            false => scenario.header_of(file, ordinal).to_string(),
+        },
+        checkpoint_plan,
+        segments,
+    }
 }
 
 // What a gate round can change: when none of it moved, nothing will.

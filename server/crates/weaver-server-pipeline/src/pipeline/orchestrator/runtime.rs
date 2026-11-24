@@ -1760,8 +1760,34 @@ impl Pipeline {
             }
         }
 
+        self.hand_on_taken_results_at_stop(pending_download_results)
+            .await;
         self.drain().await;
         info!("pipeline stopped");
+    }
+
+    // The results a turn took and had not handed on when the loop saw the
+    // stop. Each is out of the in-flight count, so the drain does not wait
+    // for it: unless it is put down here, its bytes are in no checkpoint and
+    // fetched again after the restart. They are handed on in the order
+    // taken, before the drain settles the volumes and takes the last
+    // checkpoint. At the stop nothing parks, and a wait for a volume ends
+    // with the stop's span, as the drain's own hand-on does.
+    pub(in crate::pipeline) async fn hand_on_taken_results_at_stop(
+        &mut self,
+        mut taken: VecDeque<DownloadResult>,
+    ) {
+        if taken.is_empty() {
+            return;
+        }
+        self.volume_writers.end_waits_at(
+            Arc::clone(&self.shutdown_settle.clock),
+            self.shutdown_settle.end(),
+        );
+        while let Some(result) = taken.pop_front() {
+            self.process_released_download_done_with(result, false, false)
+                .await;
+        }
     }
 
     pub(crate) async fn process_download_result_turn(
@@ -1937,6 +1963,17 @@ impl Pipeline {
             self.report_job_soon(job_id);
         }
         count
+    }
+
+    // The results ready now, taken into a list of their own as a turn's
+    // start takes them (`drain_ready_download_results`).
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
+    pub(in crate::pipeline) fn take_ready_download_results_for_test(
+        &mut self,
+    ) -> VecDeque<DownloadResult> {
+        let mut pending = VecDeque::new();
+        self.drain_ready_download_results(&mut pending);
+        pending
     }
 
     fn drain_ready_download_results(&mut self, pending: &mut VecDeque<DownloadResult>) {

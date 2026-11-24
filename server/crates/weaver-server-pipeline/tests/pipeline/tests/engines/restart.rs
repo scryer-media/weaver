@@ -22,9 +22,9 @@ use crate::pipeline::tests::direct_store::{
 };
 use sevenz_turbo::EncoderMethod;
 use weaver_server_pipeline::pipeline::tests::engines::restart_fixtures::{
-    CheckpointView, SECRET, member_check_bytes, repairs_and_end, run_restarted_once_done,
-    run_restarted_while_repairing, run_restarting_with_checkpoints, run_shut_down_while_repairing,
-    with_par2, with_par3,
+    CheckpointView, LateAtStop, SECRET, member_check_bytes, repairs_and_end, run_frozen_after_lend,
+    run_restarted_once_done, run_restarted_while_repairing, run_restarting_with_checkpoints,
+    run_shut_down_while_repairing, with_par2, with_par3,
 };
 pub(super) use weaver_server_pipeline::pipeline::tests::engines::restart_fixtures::{
     Down, assert_restarted, restart_row, run_restarting, run_restarting_at,
@@ -965,6 +965,39 @@ async fn a_compressed_rar5_volume_stopped_while_its_repair_is_out_fetches_nothin
         BTreeSet::new(),
         "fetched again after the restart"
     );
+}
+
+// The e2e restart case 15 (`par2-small-repair`) as it runs: the set is lent
+// while the head article of its recovery volume is out on a lane, the loop
+// is frozen until the repair has ended, and the head's result comes back
+// before the stop. Wherever the result is then, the last checkpoint covers
+// the whole volume, so the restored job fetches nothing again.
+#[tokio::test]
+async fn a_recovery_volume_head_heard_in_the_drain_is_not_fetched_again() {
+    recovery_volume_head_at_stop(LateAtStop::OnItsChannel).await;
+}
+
+#[tokio::test]
+async fn a_recovery_volume_head_the_last_turn_took_is_not_fetched_again() {
+    recovery_volume_head_at_stop(LateAtStop::TakenByLastTurn).await;
+}
+
+async fn recovery_volume_head_at_stop(at_stop: LateAtStop) {
+    let body = payload(9 * ARTICLE + 21, 71);
+    let posts = with_par2(vec![Post::plain("ember.bin", body.clone())], 2);
+    let volume = posts[2].bytes.len() as u64;
+    assert!(
+        volume > 2 * ARTICLE as u64,
+        "the volume spans three articles"
+    );
+    let done = run_frozen_after_lend(&Scenario::new(posts).damaged(0, 3), (2, 0), at_stop).await;
+    assert_eq!(
+        (done.late_length, done.late_covered, done.shut.refetched),
+        (Some(volume as i64), volume, BTreeSet::new()),
+        "the volume's length and coverage at the stop, and what was fetched again"
+    );
+    assert_eq!(done.shut.status, Some(JobStatus::Complete));
+    assert!(done.shut.files["lantern beacon/ember.bin"] == body);
 }
 
 // The checksum a store said for its member is in every checkpoint taken
