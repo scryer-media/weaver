@@ -99,7 +99,30 @@ fn mixed_under(
             Some(Cursor::new(files[3].1.clone())),
         )
         .unwrap();
+    // The end header is enciphered by the last methods set: AES with the
+    // job's secret, whatever the last folder was.
+    if encrypt_header {
+        writer.set_content_methods(aes_copy());
+    }
     (writer.finish().unwrap().into_inner(), files)
+}
+
+// A copy under AES, with the job's secret.
+fn aes_copy() -> Vec<EncoderConfiguration> {
+    use sevenz_turbo::Password;
+    use sevenz_turbo::encoder_options::AesEncoderOptions;
+    vec![
+        AesEncoderOptions::new(Password::new(SECRET)).into(),
+        EncoderConfiguration::new(EncoderMethod::COPY),
+    ]
+}
+
+// `coded` under AES with the job's secret: AES first, then `coded`.
+fn under_aes(coded: Vec<EncoderConfiguration>) -> Vec<EncoderConfiguration> {
+    let mut methods = aes_copy();
+    methods.truncate(1);
+    methods.extend(coded);
+    methods
 }
 
 // The bytes of the stored members, which no file of the job's holds twice.
@@ -520,13 +543,7 @@ async fn a_coded_folder_no_decode_pool_holds_with_no_usable_stored_member_fails_
 // The stored folders under AES, the coded folder plain, the end header
 // enciphered or not.
 fn sealed_stored(encrypt_header: bool) -> (Vec<u8>, Files) {
-    use sevenz_turbo::Password;
-    use sevenz_turbo::encoder_options::AesEncoderOptions;
-    let stored = vec![
-        AesEncoderOptions::new(Password::new(SECRET)).into(),
-        EncoderConfiguration::new(EncoderMethod::COPY),
-    ];
-    mixed_under(MKV, stored, lzma2(), encrypt_header)
+    mixed_under(MKV, aes_copy(), lzma2(), encrypt_header)
 }
 
 const SECRET: &str = "lumen-quill-secret";
@@ -893,6 +910,36 @@ mod nested {
         );
     }
 
+    // B2 under AES: the zip a member of a folder compressed under AES. The
+    // run deciphers it under the job's password, reads the damage and
+    // fails; the PAR2 set rebuilds the pack, and the run starts over under
+    // the same password: the zip below starts over on what it makes.
+    #[tokio::test]
+    async fn a_zip_coded_under_aes_in_a_mixed_7z_starts_over_when_the_run_does() {
+        let entries = outer_entries();
+        let archive = sevenz(&[
+            (copy(), vec![entries[0].clone()]),
+            (
+                under_aes(delta()),
+                vec![entries[1].clone(), entries[2].clone()],
+            ),
+        ]);
+        let mut posted = archive.clone();
+        let at = 32 + entries[0].1.len() + 100 + ARTICLE;
+        posted[at] ^= 0x5a;
+        let (scenario, heard) =
+            heard(Scenario::new(with_par2_of(posted, &archive)).global_password(SECRET));
+        let held = run_holding(&scenario, 2).await;
+        assert_eq!(held.status, Some(JobStatus::Complete));
+        assert_delivers(&held.files, &delivery());
+        let ran = generations(&heard);
+        assert_eq!(ran.len(), 1, "only the 7z runs: {ran:?}");
+        assert!(
+            ran.values().all(|ran| ran.len() >= 2),
+            "the run ran again once repaired: {ran:?}"
+        );
+    }
+
     // B3: the same coded pack beyond repair: the run refuses, the zip it
     // was making never closes, and the stored mkv beside it is a usable
     // file, so the job is Partial.
@@ -948,5 +995,332 @@ mod nested {
             assert_delivers(&graph.files, &delivery());
             assert_fetched_once(&graph);
         }
+    }
+}
+
+// A mixed 7z whose coded folder is compressed under AES, the stored folders
+// plain unless said. The store streams the stored members with no password,
+// and its run deciphers the coded folder under the password the job offers
+// it: the run's ask is the node asking, and each candidate offered starts
+// the run again.
+mod aes_coded {
+    use weaver_graph::Why;
+
+    use super::*;
+    use crate::history::HistoryFailureKind;
+
+    fn sealed(coded: Vec<EncoderConfiguration>, encrypt_header: bool) -> (Vec<u8>, Files) {
+        mixed_under(MKV, copy(), under_aes(coded), encrypt_header)
+    }
+
+    // How many candidates each node was offered.
+    fn offered(graph: &Outcome) -> Vec<usize> {
+        graph.graph().offered.values().copied().collect()
+    }
+
+    // The generations whose run closed a coded member.
+    fn closing(spoken: &Spoken) -> BTreeSet<u64> {
+        spoken
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, message)| message.contains("MemberClosed"))
+            .map(|(generation, _)| *generation)
+            .collect()
+    }
+
+    // Every member delivered whole, with the stored ones written once and
+    // only the coded ones made by runs.
+    async fn delivers(scenario: Scenario, files: &Files) -> Outcome {
+        let (scenario, spoken) = hearing(scenario);
+        let graph = run(&scenario).await;
+        assert_members(&graph, files);
+        assert_fetched_once(&graph);
+        assert_runs_made_only_coded(&spoken);
+        assert_eq!(
+            graph.graph().shelved,
+            graph
+                .graph()
+                .shelved_by
+                .values()
+                .map(|(_, kept)| *kept)
+                .sum::<u64>()
+        );
+        graph
+    }
+
+    // (i) The right password a candidate.
+    #[tokio::test]
+    async fn the_right_candidate_delivers_every_member() {
+        let (archive, files) = sealed(lzma2(), false);
+        let graph = delivers(
+            Scenario::new(vec![Post::plain("lantern.7z", archive.clone())]).global_password(SECRET),
+            &files,
+        )
+        .await;
+        assert_eq!(offered(&graph), [1]);
+        assert_eq!(
+            graph.graph().shelved,
+            archive.len() as u64 - stored_bytes(&files),
+            "the shelf keeps the headers and the coded pack, no stored byte"
+        );
+        assert_shelf_gone(&graph);
+    }
+
+    // (ii) A wrong candidate first: the run fails under it and asks again,
+    // and the next candidate makes the coded members.
+    #[tokio::test]
+    async fn a_wrong_candidate_then_the_right_one_delivers_every_member() {
+        let (archive, files) = sealed(lzma2(), false);
+        let graph = delivers(
+            Scenario::new(vec![Post::plain("lantern.7z", archive)])
+                .global_password("ember-wrong-guess")
+                .global_password(SECRET),
+            &files,
+        )
+        .await;
+        assert_eq!(offered(&graph), [2]);
+    }
+
+    // (iii) No password: the stored members are delivered, the run's ask
+    // costs the coded members only, and the job is Partial for the password.
+    #[tokio::test]
+    async fn no_password_delivers_the_stored_members_partial_for_the_password() {
+        let (archive, files) = sealed(lzma2(), false);
+        let graph = run(&Scenario::new(vec![Post::plain("lantern.7z", archive)])).await;
+        assert_eq!(
+            graph.status,
+            Some(JobStatus::Partial),
+            "{:?}",
+            graph.failure
+        );
+        assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Password));
+        assert_eq!(
+            graph.graph().delivery.withheld,
+            vec![("lantern.7z".to_owned(), Why::EncryptedHeader)]
+        );
+        for (name, bytes) in [&files[0], &files[3]] {
+            assert!(graph.files.get(&delivered(name)) == Some(bytes), "{name}");
+        }
+        for (name, _) in [&files[1], &files[2]] {
+            assert!(!graph.files.contains_key(&delivered(name)), "{name}");
+        }
+        assert_demoted(&graph, "encrypted_header");
+        assert_shelf_gone(&graph);
+    }
+
+    // (iv) The end header enciphered too: the store opens it with the
+    // password, and the run decodes under the one that opened it.
+    #[tokio::test]
+    async fn an_encrypted_header_with_the_password_delivers_every_member() {
+        let (archive, files) = sealed(lzma2(), true);
+        let graph = delivers(
+            Scenario::new(vec![Post::plain("lantern.7z", archive)]).password(SECRET),
+            &files,
+        )
+        .await;
+        assert_eq!(offered(&graph), [1]);
+    }
+
+    // (vi) Taken down and restored after every article.
+    #[tokio::test]
+    async fn restarted_after_every_article_delivers_every_member() {
+        let (archive, files) = sealed(lzma2(), false);
+        let whole = restart_row(
+            Scenario::new(vec![Post::plain("lantern.7z", archive)]).global_password(SECRET),
+        )
+        .await;
+        assert_members(&whole, &files);
+    }
+
+    // A byte of the coded pack wrong as posted, under a PAR2 set over the
+    // archive as written, with `candidates` in order. The recovery volume is
+    // held until nothing moves, so every run has read the damage first.
+    fn damaged_pack(candidates: &[&str]) -> (Scenario, Files) {
+        let (archive, files) = sealed(delta(), false);
+        let mut posted = archive.clone();
+        posted[coded_pack(&files).start + 7] ^= 0x5a;
+        let mut posts = with_par2(&archive);
+        posts[0].bytes = posted;
+        let scenario = candidates
+            .iter()
+            .fold(Scenario::new(posts), |scenario, candidate| {
+                scenario.global_password(candidate)
+            });
+        (scenario, files)
+    }
+
+    async fn repaired_after_the_run_read_it(candidates: &[&str]) {
+        let (scenario, files) = damaged_pack(candidates);
+        let (scenario, spoken) = hearing(scenario);
+        let held = run_holding(&scenario, 2).await;
+        assert_eq!(
+            held.status,
+            Some(JobStatus::Complete),
+            "{candidates:?} {:?} {:?}",
+            held.files.keys(),
+            spoken.lock().unwrap()
+        );
+        let mut names: Vec<String> = files.iter().map(|(name, _)| delivered(name)).collect();
+        names.sort();
+        assert_eq!(held.files.keys().cloned().collect::<Vec<_>>(), names);
+        for (name, bytes) in &files {
+            assert!(held.files[&delivered(name)] == *bytes, "{name} bytes");
+        }
+        assert_runs_made_only_coded(&spoken);
+        assert_eq!(closing(&spoken).len(), 1, "{candidates:?}");
+    }
+
+    // (v) The right password, the coded pack repaired after its run read it:
+    // the run starts again under the same password.
+    #[tokio::test]
+    async fn a_damaged_coded_pack_repaired_after_its_run_read_it_delivers_every_member() {
+        repaired_after_the_run_read_it(&[SECRET]).await;
+    }
+
+    // The right password not first.
+    #[tokio::test]
+    async fn a_damaged_coded_pack_with_the_right_password_second_delivers_every_member() {
+        repaired_after_the_run_read_it(&["ember-wrong-guess", SECRET]).await;
+    }
+
+    // Restarted after every article, the damage repaired.
+    #[tokio::test]
+    async fn a_damaged_coded_pack_restarted_after_every_article_delivers_every_member() {
+        let (scenario, files) = damaged_pack(&[SECRET]);
+        let whole = restart_row(scenario).await;
+        assert_members(&whole, &files);
+    }
+
+    // No password and the pack damaged: the repair runs once, and the job
+    // ends Partial for the password.
+    #[tokio::test]
+    async fn a_damaged_coded_pack_with_no_password_ends_partial_for_the_password() {
+        let (scenario, files) = damaged_pack(&[]);
+        let graph = run(&scenario).await;
+        assert_eq!(
+            graph.status,
+            Some(JobStatus::Partial),
+            "{:?}",
+            graph.failure
+        );
+        assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Password));
+        for (name, bytes) in [&files[0], &files[3]] {
+            assert!(graph.files.get(&delivered(name)) == Some(bytes), "{name}");
+        }
+    }
+
+    // An article of the coded pack lost with no PAR2, under the right
+    // password: the stored members are delivered, and the job is Partial
+    // for the damage, not for a password.
+    #[tokio::test]
+    async fn a_coded_pack_beyond_repair_is_partial_for_the_damage() {
+        let (archive, files) = sealed(delta(), false);
+        let lost = article_in(coded_pack(&files));
+        let graph = run(&Scenario::new(vec![Post::plain("lantern.7z", archive)])
+            .damaged(0, lost)
+            .global_password(SECRET))
+        .await;
+        assert_eq!(
+            graph.status,
+            Some(JobStatus::Partial),
+            "{:?}",
+            graph.failure
+        );
+        assert_ne!(graph.failure_kind, Some(HistoryFailureKind::Password));
+        for (name, bytes) in [&files[0], &files[3]] {
+            assert!(graph.files.get(&delivered(name)) == Some(bytes), "{name}");
+        }
+        assert_demoted(&graph, "unrepairable");
+    }
+
+    // An article of a stored member lost, under a PAR2 set: the repair
+    // rebuilds it and the store replays it, the stored folder plain or under
+    // AES. The coded members are made by one run.
+    #[tokio::test]
+    async fn a_damaged_stored_member_beside_an_aes_coded_folder_is_repaired_and_replayed() {
+        for stored in [copy(), aes_copy()] {
+            let (archive, files) = mixed_under(MKV, stored, under_aes(delta()), false);
+            let damaged = article_in(32..32 + files[0].1.len());
+            let (scenario, spoken) = hearing(
+                Scenario::new(with_par2(&archive))
+                    .damaged(0, damaged)
+                    .global_password(SECRET),
+            );
+            let graph = run(&scenario).await;
+            assert_members(&graph, &files);
+            assert_fetched_once(&graph);
+            assert_runs_made_only_coded(&spoken);
+            assert_eq!(closing(&spoken).len(), 1);
+        }
+    }
+
+    // The start header's article, or the end header's, lost under a PAR2
+    // set, the end header plain or enciphered: the store maps nothing until
+    // the repair brings it, then streams and runs.
+    #[tokio::test]
+    async fn a_lost_header_repaired_by_par2_delivers_every_member() {
+        for encrypt_header in [false, true] {
+            let (archive, files) = sealed(delta(), encrypt_header);
+            let tail = ((archive.len() - 1) / ARTICLE) as u32;
+            for lost in [0, tail] {
+                let graph = run(&Scenario::new(with_par2(&archive))
+                    .damaged(0, lost)
+                    .global_password(SECRET))
+                .await;
+                assert_members(&graph, &files);
+                assert_fetched_once(&graph);
+            }
+        }
+    }
+
+    // A header posted naming a stored and a coded member otherwise, repaired
+    // after the store mapped it and the run made the coded members under it:
+    // the new map moves both, and a run under the new map, and the same
+    // password, makes the coded ones again.
+    #[tokio::test]
+    async fn a_repaired_header_moving_members_restarts_the_run_under_the_same_password() {
+        // The header is compressed and carries each archive's own salt and
+        // IV, so its length can differ by a byte: draw again until the two
+        // archives line up.
+        let (before, after, files) = (0..64)
+            .map(|_| {
+                let (before, _) = mixed_under(
+                    ["ember.mkv", "quill.mkv", "cinder.nfo", "lumen.mkv"],
+                    copy(),
+                    under_aes(delta()),
+                    false,
+                );
+                let (after, files) = mixed_under(
+                    ["embex.mkv", "quill.mkv", "cindex.nfo", "lumen.mkv"],
+                    copy(),
+                    under_aes(delta()),
+                    false,
+                );
+                (before, after, files)
+            })
+            .find(|(before, after, _)| before.len() == after.len())
+            .expect("two archives of one length");
+        // Each archive draws its own AES salt and IV, so the coded pack
+        // differs as well as the header: enough recovery for both.
+        let mut posts = vec![Post::plain("lantern.7z", before)];
+        posts.extend(par2_set("lantern", &[("lantern.7z", &after)], 16));
+        let (scenario, spoken) = hearing(Scenario::new(posts).global_password(SECRET));
+        let held = run_holding(&scenario, 2).await;
+        assert_eq!(
+            held.status,
+            Some(JobStatus::Complete),
+            "{:?} {:?}",
+            held.files.keys(),
+            spoken.lock().unwrap()
+        );
+        let mut names: Vec<String> = files.iter().map(|(name, _)| delivered(name)).collect();
+        names.sort();
+        assert_eq!(held.files.keys().cloned().collect::<Vec<_>>(), names);
+        for (name, bytes) in &files {
+            assert!(held.files[&delivered(name)] == *bytes, "{name} bytes");
+        }
+        assert_runs_made_only_coded(&spoken);
+        assert!(closing(&spoken).len() >= 2, "{:?}", spoken.lock().unwrap());
     }
 }
