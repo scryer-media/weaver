@@ -1203,9 +1203,32 @@ async fn torrents_info_polls_build_no_view_and_read_nothing() {
     // The facade's first request of any kind takes the database once, an
     // `app/version` as much as a list: that one is not a poll's. It is the
     // key's last-used touch, made on a blocking thread after the answer, so
-    // the count is read only once that take has landed.
+    // the count is read only once that take has landed. The touch is
+    // throttled per key id across the process, so the polls are made with a
+    // key whose id no other test uses: its first request always touches it.
+    const POLLER: &str = "facade-poller-key";
+    rig.keys.upsert(ApiKeyAuthRow {
+        key_hash: hash_api_key(POLLER),
+        id: 1_186,
+        scope: "admin".to_owned(),
+    });
+    let get = |path: String| {
+        let rig = &rig;
+        async move {
+            rig.send(
+                Request::get(path)
+                    .header("x-api-key", POLLER)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+        }
+    };
     let untouched = rig.db.datastore_takes();
-    assert_eq!(rig.get("/api/v2/app/version").await.status, StatusCode::OK);
+    assert_eq!(
+        get("/api/v2/app/version".to_owned()).await.status,
+        StatusCode::OK
+    );
     while rig.db.datastore_takes() == untouched {
         tokio::task::yield_now().await;
     }
@@ -1227,7 +1250,7 @@ async fn torrents_info_polls_build_no_view_and_read_nothing() {
             "/api/v2/torrents/uploadLimit?hashes=all".to_owned(),
             format!("/api/v2/torrents/downloadLimit?hashes={named}"),
         ] {
-            let reply = rig.get(&path).await;
+            let reply = get(path.clone()).await;
             assert_eq!(reply.status, StatusCode::OK, "{path}: {}", reply.body);
             answered.push((path, reply.json()));
         }
