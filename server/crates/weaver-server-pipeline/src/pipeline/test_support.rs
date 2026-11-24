@@ -115,6 +115,12 @@ pub async fn seed_job(pipeline: &mut Pipeline, job: crate::JobInfo) {
             state.paused_resume_post_state = Some(crate::PostState::Idle);
         }
     }
+    // A job seeded past the queue has started, so it holds its slot as a
+    // started job does: the start walk never keeps it waiting for the disk,
+    // which would restate its row as queued.
+    if !matches!(job.status, JobStatus::Queued | JobStatus::Paused) {
+        pipeline.nzb_admitted.insert(job.job_id);
+    }
     // The row carries what the dispatcher would report for it, so a dispatch
     // pass finds nothing stale and never replaces the seeded job with the
     // pipeline's own report: no lane holds it, and its queued fixture segment
