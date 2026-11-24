@@ -27,4 +27,7 @@ first release of the 0.17 line, so read the 0.17.0 notes with these.
 - **Tracker announce comparison.** The test that compares the old and new
   policy pass waits for a running torrent's tracker to hear it before it
   counts announces.
+- **qBittorrent list polls.** The test that counts database statements
+  across list polls waits for the API key's last-used write before it
+  starts counting.
 - **CI.** The clippy job has 45 minutes.
