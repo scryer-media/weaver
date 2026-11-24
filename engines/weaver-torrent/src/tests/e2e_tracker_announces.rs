@@ -2570,11 +2570,16 @@ async fn test_a_resumed_run_announces_from_its_own_start() -> anyhow::Result<()>
     assert_eq!(param(&query, "uploaded"), Some("0"));
     assert_eq!(param(&query, "corrupt"), Some("0"));
     assert_eq!(param(&query, "left"), Some(file.as_str()));
-    // It wants the second file now, from a seeder it has not met: the first
-    // one it may have let go as a peer it wanted nothing of.
-    handle.set_file_priorities(&[(1, FilePriority::Normal)])?;
+    // The tracker's answer is taken in before the second file is wanted. The
+    // first seeder is dialled again the moment it is, and a torrent that
+    // becomes a seed while its `started` waits for an answer sends
+    // `completed` at the interval that answer sets, as libtorrent does
+    // (`announce_infohash::can_announce` holds an announce to
+    // `next_announce`, seed or not).
     let (_second_seeder, second_addr) = t.seed().await?;
     respond_bytes(conn, &answer_with_peer(second_addr)?).await?;
+    announce_ended(&handle, |l| l.result.is_ok()).await?;
+    handle.set_file_priorities(&[(1, FilePriority::Normal)])?;
 
     // Its second file is all it reports fetching.
     let (conn, query) = read_announce_query(&tracker).await?;
