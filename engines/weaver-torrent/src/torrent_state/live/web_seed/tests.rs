@@ -2034,3 +2034,119 @@ fn slices_found_by_search_are_those_a_pass_finds() {
         }
     }
 }
+
+// `WebSeeds::due` as it was when it removed each seed whose URL can never
+// be fetched at once, from the middle of the list: the reference the test
+// below compares with.
+fn due_removing_each_at_once(
+    seeds: &WebSeeds,
+    now: Instant,
+    interesting: impl Fn(&Lacks) -> bool,
+    allow_idna: bool,
+) -> Vec<(u32, Option<SocketAddr>)> {
+    let mut g = seeds.inner.lock();
+    let mut limit = MAX_WEB_SEED_CONNECTIONS;
+    let mut due = Vec::new();
+    let mut at = 0;
+    while at < g.seeds.len() && limit > 0 {
+        let entry = &mut g.seeds[at];
+        if entry.disabled || entry.retry.is_some_and(|r| r > now) || !interesting(&entry.lacks) {
+            at += 1;
+            continue;
+        }
+        limit -= 1;
+        if entry.connection.is_some() {
+            at += 1;
+            continue;
+        }
+        match check_url(&entry.seed.url, entry.banned, allow_idna) {
+            Ok(endpoint) => {
+                due.push((entry.id, endpoint));
+                at += 1;
+            }
+            Err(Refused::Disabled(_)) => {
+                entry.disabled = true;
+                at += 1;
+            }
+            Err(Refused::Removed(_)) => remove_at(&mut g, at),
+        }
+    }
+    due
+}
+
+// The seeds that are left, in order, with whether each is disabled, and
+// what `known` holds.
+type Left = (Vec<(u32, bool)>, HashSet<(String, WebSeedKind)>);
+
+fn left(seeds: &WebSeeds) -> Left {
+    let g = seeds.inner.lock();
+    let known = g.known.clone();
+    (g.seeds.iter().map(|e| (e.id, e.disabled)).collect(), known)
+}
+
+// Seeds removed in one pass leave the seeds, their order, what is known of
+// them and what is due as removing each at once left them: over many seeds
+// whose URLs never parse, have no host or port 0, among ones that are fine,
+// disabled, connected or waiting, round after round.
+#[test]
+fn seeds_removed_in_one_pass_leave_what_removing_each_left() {
+    let mut rng = 0xbb67_ae85_84ca_a73bu64;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let now = Instant::now();
+    let interesting = |_: &Lacks| true;
+    let mut removed = 0;
+    for run in 0..20 {
+        let urls: Vec<String> = (0..400)
+            .map(|i| match next() % 6 {
+                0 => format!("not a url {i}"),
+                1 => format!("file:///seed/{i}"),
+                2 => format!("http://127.0.0.1:0/seed/{i}"),
+                3 => format!("http://xn--nxasmq6b-{i}.invalid/"),
+                _ => format!("http://127.0.0.1:{}/seed/", 1000 + i),
+            })
+            .collect();
+        let seeds = || {
+            let seeds = Arc::new(WebSeeds::default());
+            for url in &urls {
+                seeds.add(WebSeed {
+                    url: url.clone(),
+                    kind: WebSeedKind::Url,
+                    named_by: NamedBy::Operator,
+                });
+            }
+            seeds
+        };
+        let (one_pass, each) = (seeds(), seeds());
+        let mut links = Vec::new();
+        for id in (0..400).filter(|_| next() % 40 == 0) {
+            for seeds in [&one_pass, &each] {
+                links.extend(seeds.link(id));
+            }
+        }
+        for round in 0..200 {
+            let got: Vec<(u32, Option<SocketAddr>)> = one_pass
+                .due(now, interesting, false)
+                .into_iter()
+                .map(|due| (due.id, due.endpoint))
+                .collect();
+            let want = due_removing_each_at_once(&each, now, interesting, false);
+            assert_eq!(got, want, "run {run} round {round}");
+            assert_eq!(left(&one_pass), left(&each), "run {run} round {round}");
+            // The seeds found due wait to retry, so the next round reaches
+            // on.
+            for (id, _) in got {
+                for seeds in [&one_pass, &each] {
+                    seeds.with_entry(id, |e| e.retry = Some(now + Duration::from_secs(60)));
+                }
+            }
+        }
+        removed += urls.len() - one_pass.list().len();
+    }
+    // Many seeds were removed: what the test compares.
+    assert!(removed > 1000, "{removed}");
+}
