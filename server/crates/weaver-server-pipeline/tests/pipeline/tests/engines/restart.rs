@@ -23,7 +23,8 @@ use crate::pipeline::tests::direct_store::{
 use sevenz_turbo::EncoderMethod;
 use weaver_server_pipeline::pipeline::tests::engines::restart_fixtures::{
     CheckpointView, SECRET, member_check_bytes, repairs_and_end, run_restarted_once_done,
-    run_restarted_while_repairing, run_restarting_with_checkpoints, with_par2, with_par3,
+    run_restarted_while_repairing, run_restarting_with_checkpoints, run_shut_down_while_repairing,
+    with_par2, with_par3,
 };
 pub(super) use weaver_server_pipeline::pipeline::tests::engines::restart_fixtures::{
     Down, assert_restarted, restart_row, run_restarting, run_restarting_at,
@@ -919,6 +920,50 @@ async fn a_job_restarted_while_its_repair_is_out_lends_the_stopped_repair_again_
     assert_eq!(
         repairs_and_end(&restarted.events),
         ["RepairComplete 1", "JobCompleted"]
+    );
+}
+
+// The pipeline is stopped while a repair is out, as a stop during
+// verification stops it. The stop pages out what the job holds and its last
+// checkpoint records every article that arrived, so the restored job
+// fetches none of them again.
+#[tokio::test]
+async fn a_job_stopped_while_its_repair_is_out_fetches_nothing_again() {
+    let body = payload(9 * ARTICLE + 21, 71);
+    let posts = with_par2(vec![Post::plain("ember.bin", body.clone())], 2);
+    let done = run_shut_down_while_repairing(&Scenario::new(posts).damaged(0, 3)).await;
+    assert_eq!(done.status, Some(JobStatus::Complete));
+    assert!(done.files["lantern beacon/ember.bin"] == body);
+    assert_eq!(
+        done.in_memory_after_drain,
+        Vec::new(),
+        "held in memory only after the drain"
+    );
+    assert_eq!(
+        done.refetched,
+        BTreeSet::new(),
+        "fetched again after the restart"
+    );
+}
+
+// As above, for a compressed RAR5 volume under PAR2, as the e2e restart
+// case posts it: the engine reads the volume's front while the repair is out.
+#[tokio::test]
+async fn a_compressed_rar5_volume_stopped_while_its_repair_is_out_fetches_nothing_again() {
+    let bytes =
+        weaver_server_pipeline::pipeline::tests::rar5_fixture_bytes("rar5_multifile_lz.rar");
+    let posts = with_par2(vec![Post::plain("mixed.rar", bytes)], 8);
+    let done = run_shut_down_while_repairing(&Scenario::new(posts).framed(64).damaged(0, 2)).await;
+    assert_eq!(done.status, Some(JobStatus::Complete));
+    assert_eq!(
+        done.in_memory_after_drain,
+        Vec::new(),
+        "held in memory only after the drain"
+    );
+    assert_eq!(
+        done.refetched,
+        BTreeSet::new(),
+        "fetched again after the restart"
     );
 }
 

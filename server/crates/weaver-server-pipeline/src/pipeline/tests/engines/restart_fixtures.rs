@@ -716,6 +716,109 @@ pub async fn run_restarted_while_repairing(scenario: &Scenario) -> (RestartedDon
     (done, lent_again)
 }
 
+// What a job stopped while its repair was out came to.
+pub struct ShutWhileRepairing {
+    pub status: Option<JobStatus>,
+    pub files: BTreeMap<String, Vec<u8>>,
+    // The articles the job held in memory only when the drain ended.
+    pub in_memory_after_drain: Vec<(u32, u32)>,
+    // Every article the restored job asked for again.
+    pub refetched: BTreeSet<(u32, u32)>,
+}
+
+// The job served as `run` serves it, and the pipeline stopped as a stop
+// does (the drain) the first time a repair of the job is out on its thread,
+// then restored and run to its end.
+pub async fn run_shut_down_while_repairing(scenario: &Scenario) -> ShutWhileRepairing {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) =
+        new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
+    scenario.prepare(&mut pipeline);
+    insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
+    let mut in_memory = BTreeSet::new();
+    let mut in_memory_after_drain = Vec::new();
+    let mut asked_before = BTreeSet::new();
+    let mut refetched = BTreeSet::new();
+    let mut restarted = false;
+    let mut quiet = 0;
+    let mut asked = 0usize;
+    loop {
+        while let Some(work) = next_work(&mut pipeline, scenario) {
+            let article = (
+                work.segment_id.file_id.file_index,
+                work.segment_id.segment_number,
+            );
+            asked += 1;
+            if restarted {
+                if asked_before.contains(&article) {
+                    refetched.insert(article);
+                }
+            } else {
+                asked_before.insert(article);
+            }
+            serve_work(&mut pipeline, scenario, &work).await;
+        }
+        if finished(&pipeline) {
+            break;
+        }
+        let before = asked;
+        if pipeline.jobs.contains_key(&JOB) {
+            pipeline.check_job_completion(JOB).await;
+        }
+        pump_pipeline_runtime_queues(&mut pipeline).await;
+        if finished(&pipeline) {
+            break;
+        }
+        let (awaits_mail, repair_out) = pipeline
+            .graph_jobs
+            .get(&JOB)
+            .map_or((false, false), |job| (job.awaits_mail(), job.repair_out()));
+        if repair_out && !restarted {
+            pipeline.drain().await;
+            assert!(
+                !pipeline.graph_jobs[&JOB].awaits_mail(),
+                "the drain left the job's repair out on its thread"
+            );
+            in_memory_after_drain = pipeline.graph_jobs[&JOB].in_memory();
+            (pipeline, _) =
+                restart_heard(&temp_dir, pipeline, scenario, &mut in_memory, &mut |_| {}).await;
+            crate::pipeline::tests::hear_rewalks(&mut pipeline, JOB).await;
+            restarted = true;
+            continue;
+        }
+        if awaits_mail {
+            let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
+            pipeline.graph_run_said(said);
+            continue;
+        }
+        if take_retry(&mut pipeline).await {
+            continue;
+        }
+        if asked == before {
+            quiet += 1;
+            assert!(
+                quiet < 3,
+                "job stalled at {:?} (restarted {restarted})",
+                job_status_for_assert(&pipeline, JOB)
+            );
+        } else {
+            quiet = 0;
+        }
+    }
+    assert!(restarted, "a repair went out before the job finished");
+    let status = job_status_for_assert(&pipeline, JOB);
+    pipeline.db.flush_write_queue().await.unwrap();
+    let mut files = BTreeMap::new();
+    collect(&complete_dir, &complete_dir, &mut files);
+    retire_pipeline_database(pipeline).await;
+    ShutWhileRepairing {
+        status,
+        files,
+        in_memory_after_drain,
+        refetched,
+    }
+}
+
 // What the job announced of its repair and its end, in order.
 pub fn repairs_and_end(events: &[PipelineEvent]) -> Vec<String> {
     events

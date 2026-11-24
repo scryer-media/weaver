@@ -2655,7 +2655,9 @@ async fn a_wireguard_session_binds_a_datagram_socket_on_the_port_named() {
     const FORWARDED: u16 = 47001;
     const RELAY: u16 = 51413;
     // A peer outside the tunnel, reached through the far side's relay.
-    let outside = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let outside = crate::test_support::loopback::bind_udp(([127, 0, 0, 1], 0))
+        .await
+        .unwrap();
     let near = WireGuardTestPeer::start_with(WireGuardTestPeerOptions {
         udp_forward: Some((RELAY, outside.local_addr().unwrap())),
         ..Default::default()
