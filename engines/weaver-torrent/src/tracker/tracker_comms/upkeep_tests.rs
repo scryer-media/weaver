@@ -19,7 +19,7 @@ use super::{
     AnnounceErrorKind, ReannounceDelay, StoppedAnnounces, SupportedTracker, ToldPorts,
     TrackerAnnounce, TrackerCommsStats, TrackerList, TrackerTask,
 };
-use super::{Entry, unique};
+use super::{Entry, RowIndex, unique, write_answered, write_rows};
 
 // The list's upkeep as it walked the list for each tracker, before it
 // built a set per pass: the reference the test below compares with.
@@ -40,6 +40,7 @@ fn listed_new(tiers: &[Vec<SupportedTracker>], now: Instant) -> TrackerList {
         announcing: true,
         handed_over: false,
         shape: &crate::tracker::AnnounceShape::WEAVER,
+        unpublished: false,
     }
 }
 
@@ -594,5 +595,158 @@ fn a_tier_added_while_announcing_comes_due_at_once_and_after_its_interval() {
     assert_eq!(
         due(&mut list, t1 + s(1800), ToldPorts::default(), &stats),
         [(http("b"), None)]
+    );
+}
+
+// The table as replacing its trackers built it when it looked each one up
+// in the old rows: the reference the tests below compare with.
+fn rows_replaced(rows: &[TrackerAnnounce], trackers: &[SupportedTracker]) -> Vec<TrackerAnnounce> {
+    trackers
+        .iter()
+        .map(|t| {
+            let url = t.url().as_str();
+            rows.iter()
+                .find(|a| a.url == url)
+                .cloned()
+                .unwrap_or_else(|| TrackerAnnounce {
+                    url: url.to_owned(),
+                    ..Default::default()
+                })
+        })
+        .collect()
+}
+
+// A run's rows written after each answer by its tracker's row alone, when
+// the others already show its list, hold what writing every row after
+// each answer held, and change when it did: over seeded runs of one or two
+// hashes (a hybrid) with many trackers in separate tiers, answers,
+// failures, announces in flight, forces, completion, replaces and stops.
+#[test]
+fn rows_written_per_answer_match_every_row_rewritten() {
+    let mut rng = 0x9b05_688c_2b3e_6c1fu64;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    const NAMES: u64 = 60;
+    let names: Vec<String> = (0..NAMES).map(|i| format!("t{i}")).collect();
+    let tiers = |next: &mut dyn FnMut() -> u64| -> Vec<Vec<SupportedTracker>> {
+        (0..8 + next() % 30)
+            .map(|_| {
+                (0..1 + next() % 3)
+                    .map(|_| http(&names[(next() % NAMES) as usize]))
+                    .collect()
+            })
+            .collect()
+    };
+    let stats = live(0, 90, false);
+    let base = Instant::now();
+    let base_at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    let mut publishes = 0;
+    let mut one_row = 0;
+    for run in 0..20 {
+        let mut now = base;
+        let first = tiers(&mut next);
+        let hashes = 1 + (run % 2) as usize;
+        let mut lists: Vec<TrackerList> = (0..hashes)
+            .map(|_| {
+                TrackerList::new(
+                    &first,
+                    now,
+                    &crate::tracker::AnnounceShape::WEAVER,
+                    short_of_a_seed(),
+                )
+            })
+            .collect();
+        let start: Vec<TrackerAnnounce> = rows_replaced(&[], &unique(first.iter().flatten()));
+        let mut fast = start.clone();
+        let mut full = start;
+        let mut index = RowIndex::of(&fast);
+        for step in 0..400 {
+            let r = next();
+            let k = (r >> 40) as usize % hashes;
+            let tracker = http(&names[((r >> 8) % NAMES) as usize]);
+            let at = base_at + now.duration_since(base);
+            // The list `k` publishes, after `answered` ended or not.
+            let mut publish =
+                |lists: &mut Vec<TrackerList>,
+                 fast: &mut Vec<TrackerAnnounce>,
+                 full: &mut Vec<TrackerAnnounce>,
+                 index: &mut RowIndex,
+                 k: usize,
+                 answered: Option<(&SupportedTracker, usize)>| {
+                    let id = k as u64 + 1;
+                    let one = answered.is_some() && index.writer == id && !lists[k].unpublished;
+                    let changed = write_answered(fast, index, id, &mut lists[k], answered, now, at);
+                    let list = &lists[k];
+                    let reference = write_rows(
+                        full,
+                        &list.entries,
+                        |e| e.tracker.url().as_str(),
+                        |e| list.row_value(e, now, at),
+                    );
+                    assert_eq!(changed, reference, "run {run} step {step}");
+                    assert_eq!(fast, full, "run {run} step {step}");
+                    publishes += 1;
+                    one_row += usize::from(one);
+                };
+            match r % 9 {
+                0 | 1 => {
+                    let i = lists[k].on_success(&tracker, answered(STARTED), now, &ANSWERED);
+                    publish(
+                        &mut lists,
+                        &mut fast,
+                        &mut full,
+                        &mut index,
+                        k,
+                        i.map(|i| (&tracker, i)),
+                    );
+                }
+                2 => {
+                    let i = lists[k].on_failure(&tracker, now, Duration::from_secs(5));
+                    publish(
+                        &mut lists,
+                        &mut fast,
+                        &mut full,
+                        &mut index,
+                        k,
+                        i.map(|i| (&tracker, i)),
+                    );
+                }
+                3 => {
+                    lists[k].start_due(now, ToldPorts::default(), &stats);
+                }
+                4 => {
+                    lists[k].force(now, (r & 0x100 != 0).then_some(&tracker), r & 0x200 != 0);
+                    publish(&mut lists, &mut fast, &mut full, &mut index, k, None);
+                }
+                5 if r & 0x400 != 0 => {
+                    lists[k].completed(now);
+                }
+                5 => {
+                    lists[k].stop();
+                    publish(&mut lists, &mut fast, &mut full, &mut index, k, None);
+                }
+                6 if r & 0x400 != 0 => {
+                    let to = tiers(&mut next);
+                    let trackers = unique(to.iter().flatten());
+                    fast = rows_replaced(&fast, &trackers);
+                    full = rows_replaced(&full, &trackers);
+                    index = RowIndex::of(&fast);
+                    for k in 0..hashes {
+                        lists[k].replace(&to, now);
+                        publish(&mut lists, &mut fast, &mut full, &mut index, k, None);
+                    }
+                }
+                _ => now += Duration::from_secs(next() % 900),
+            }
+        }
+    }
+    // The single-row path is taken often enough to be what the test checks.
+    assert!(
+        one_row * 8 > publishes,
+        "{one_row} of {publishes} wrote one row"
     );
 }
