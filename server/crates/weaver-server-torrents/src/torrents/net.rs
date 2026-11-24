@@ -1306,13 +1306,22 @@ fn plain_builder(kind: &LegKind) -> reqwest::ClientBuilder {
     }
 }
 
-// The host's loopback interface, for a leg bound to it.
+// The host's loopback interface, for a leg bound to it: none where a socket
+// binds to a source address only, as on Windows.
 #[cfg(test)]
-pub(crate) const LOOPBACK_DEVICE: &str = if cfg!(target_os = "linux") {
-    "lo"
+pub(crate) const LOOPBACK_DEVICE: Option<&str> = if cfg!(target_os = "linux") {
+    Some("lo")
+} else if cfg!(target_os = "macos") {
+    Some("lo0")
 } else {
-    "lo0"
+    None
 };
+
+// A leg bound to the host's loopback interface, where the host has such legs.
+#[cfg(test)]
+pub(crate) fn loopback_device_leg() -> Option<LegKind> {
+    LOOPBACK_DEVICE.map(|device| LegKind::Interface(device.into()))
+}
 
 // A leg on the host's own sockets.
 #[cfg(any(test, feature = "test-support"))]
@@ -1789,19 +1798,22 @@ mod tests {
             )))
         };
         let loopback: IpAddr = "127.0.0.1".parse().unwrap();
-        vec![
+        let mut legs = vec![
             (LegKind::System, system_dialer()),
-            (
-                LegKind::Interface(LOOPBACK_DEVICE.into()),
-                held(weaver_tunnel::egress::SocketEgress::Interface(
-                    LOOPBACK_DEVICE.into(),
-                )),
-            ),
             (
                 LegKind::SourceAddress(loopback),
                 held(weaver_tunnel::egress::SocketEgress::SourceAddress(loopback)),
             ),
-        ]
+        ];
+        if let Some(device) = LOOPBACK_DEVICE {
+            legs.push((
+                LegKind::Interface(device.into()),
+                held(weaver_tunnel::egress::SocketEgress::Interface(
+                    device.into(),
+                )),
+            ));
+        }
+        legs
     }
 
     // A session's port mapper asks the gateway through its leg's clients:

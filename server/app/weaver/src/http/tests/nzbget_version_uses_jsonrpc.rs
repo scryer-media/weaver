@@ -5166,7 +5166,10 @@ async fn archive_server_with(spawn_history_delete_worker: bool) -> ArchiveServer
     db.set_encryption_key(weaver_server_core::persistence::encryption::EncryptionKey::generate());
     let config = test_config();
     config.write().await.data_dir = root.path().to_string_lossy().into_owned();
-    let intermediate = std::path::PathBuf::from(config.read().await.intermediate_dir());
+    // Named whole, so the folder is spelled here as the pipeline spells it:
+    // a working folder's marker is bound to its path as written.
+    let intermediate = root.path().join("intermediate");
+    config.write().await.intermediate_dir = Some(intermediate.to_string_lossy().into_owned());
     let complete = root.path().join("complete");
     std::fs::create_dir_all(&intermediate).unwrap();
     std::fs::create_dir_all(complete.join("tv")).unwrap();

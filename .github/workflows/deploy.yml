@@ -215,7 +215,7 @@ jobs:
     name: rust-clippy
     if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.web-build.result == 'success' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 45
     needs: [changes, verify-release-tag, web-build]
     env:
       RUSTC_WRAPPER: sccache

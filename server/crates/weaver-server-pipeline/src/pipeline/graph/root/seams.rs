@@ -470,8 +470,21 @@ impl Pipeline {
                 | Heard::Worked(_)
         ) || matches!(&said.heard, Heard::Rewalked(rewalked) if rewalked.piece.is_none());
         let moving = graph.moves_waiting();
-        let result = graph.run_said(said, &mut self.graph_status.repairs, limit);
+        // A recovery object back from reading its volumes again has not yet
+        // been asked what it wants, and nothing of what it deferred before
+        // the restart was kept. It is asked before it is lent again: the
+        // end of its reading is heard as by a job that may not run, the
+        // round the step brings asks it, and the job goes on from there. A
+        // set lent to be checked first would leave its recovery volumes
+        // undeferred while it is out, and they would be fetched unasked.
+        let reread = matches!(&said.heard, Heard::Rewalked(rewalked) if rewalked.piece.is_none());
+        let heard_under = if reread { 0 } else { limit };
+        let result = graph.run_said(said, &mut self.graph_status.repairs, heard_under);
         self.after_graph_result(job_id, result);
+        if reread {
+            self.resume_graph_work(job_id);
+            self.lend_graph_repairs(job_id);
+        }
         // The last file to move is where the delivery takes it from now.
         let moved = moving
             && !self

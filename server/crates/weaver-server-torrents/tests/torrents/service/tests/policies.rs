@@ -1041,19 +1041,21 @@ async fn completes_again(service: &TorrentService, db: &Database, job_id: JobId,
     service.inner.signal.look(job_id);
     // The settle that wrote the completion is over, with what it raises
     // after the write: the row is written mid-settle, and the wait looks at
-    // it at once as well as at each settle's end.
+    // it at once as well as at each settle's end. The row is read first: a
+    // settle that began after a look at `settling` could write the row
+    // before the row was read, and the wait would end ahead of what that
+    // settle raises.
     settles
         .wait_for(|_| {
-            !service
-                .inner
-                .settling
-                .load(std::sync::atomic::Ordering::SeqCst)
-                && db
-                    .get_torrent(job_id)
-                    .unwrap()
-                    .unwrap()
-                    .completed_at_ms
-                    .is_some()
+            db.get_torrent(job_id)
+                .unwrap()
+                .unwrap()
+                .completed_at_ms
+                .is_some()
+                && !service
+                    .inner
+                    .settling
+                    .load(std::sync::atomic::Ordering::SeqCst)
         })
         .await
         .unwrap();

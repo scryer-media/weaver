@@ -971,7 +971,15 @@ async fn a_complete_torrent_without_its_folder_moves_from_its_download_path() {
 // default download path, and an absolute one stands.
 #[test]
 fn relative_paths_resolve_under_the_default_save_path() {
-    let default = Path::new("/complete/tv");
+    // An absolute path as the platform spells one.
+    let abs = |path: &str| {
+        if cfg!(windows) {
+            format!("C:{}", path.replace('/', "\\"))
+        } else {
+            path.to_owned()
+        }
+    };
+    let default = PathBuf::from(abs("/complete/tv"));
     let placed = |save: Option<&str>, download: Option<&str>| {
         let placement = absolute_placement(
             &Placement {
@@ -980,12 +988,12 @@ fn relative_paths_resolve_under_the_default_save_path() {
                 layout: Some(ContentLayout::NoSubfolder),
                 seed_mode: false,
             },
-            default,
+            &default,
         );
         assert_eq!(placement.layout, Some(ContentLayout::NoSubfolder));
         (placement.save_path, placement.download_path)
     };
-    let some = |path: &str| Some(path.to_owned());
+    let some = |path: &str| Some(abs(path));
     assert_eq!(
         placed(Some("shows"), Some("incoming")),
         (
@@ -998,16 +1006,16 @@ fn relative_paths_resolve_under_the_default_save_path() {
         (some("/complete/tv"), some("/complete/tv/incoming"))
     );
     assert_eq!(
-        placed(None, Some("/scratch")),
+        placed(None, Some(&abs("/scratch"))),
         (some("/complete/tv"), some("/scratch"))
     );
     assert_eq!(placed(None, None), (None, None));
     assert_eq!(
-        placed(Some("/data/shows"), Some("incoming")),
+        placed(Some(&abs("/data/shows")), Some("incoming")),
         (some("/data/shows"), some("/data/shows/incoming"))
     );
     assert_eq!(
-        placed(Some("shows"), Some("/scratch")),
+        placed(Some("shows"), Some(&abs("/scratch"))),
         (some("/complete/tv/shows"), some("/scratch"))
     );
 }

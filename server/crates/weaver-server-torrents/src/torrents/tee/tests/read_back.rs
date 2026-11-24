@@ -293,7 +293,9 @@ fn a_read_back_torrents_shares_are_cut_into_articles_of_one_layout() {
 // holds until it let go of the last byte of it: the archive unpacks whole,
 // no lease is left, scratch never held more than one piece, and the read-
 // backs took no resident room, nor did the pieces, which hold none of their
-// own while they arrive.
+// own while they arrive. Only where the platform lends scratch: elsewhere
+// every read-back is the smaller reads of the test after this one.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
 async fn an_oversized_archive_piece_reads_back_through_scratch_and_unpacks() {
     let mut rig = rig(false);
@@ -327,6 +329,7 @@ async fn an_oversized_archive_piece_reads_back_in_smaller_reads_when_scratch_is_
     assert_eq!(rig.unpacked().await, rig.member);
     assert_eq!(rig.fallbacks(), u64::from(rig.layout.piece_count()));
     assert_eq!(rig.scratch_peak(), 0);
+    assert_eq!(rig.scratch.live(), (0, 0));
     assert!(rig.resident_peak() <= BUDGET);
     assert!(storage.resident_peak() <= BUDGET);
     assert_eq!(
@@ -345,7 +348,12 @@ async fn an_oversized_archive_piece_reads_back_in_smaller_reads_when_scratch_is_
 // archive unpacks whole.
 #[tokio::test]
 async fn a_restart_reads_a_lacking_piece_back_by_the_same_rule() {
+    // Where the platform lends no scratch, only the smaller reads are there.
+    let lends_scratch = cfg!(any(target_os = "linux", target_os = "macos"));
     for refused in [false, true] {
+        if !refused && !lends_scratch {
+            continue;
+        }
         let mut rig = rig(refused);
         let lacked = rig.layout.piece_count() - 1;
         // Its bytes are in the files, put there before the restart.
