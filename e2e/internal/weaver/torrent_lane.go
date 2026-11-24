@@ -306,7 +306,7 @@ func (lane *torrentLane) gql(query string, variables map[string]any, out any) er
 	return nil
 }
 
-const torrentFields = `id name infohash state detail category private forced progress totalBytes haveBytes
+const torrentFields = `id name infohash state stated detail category private forced progress totalBytes haveBytes
 uploadedBytes downloadedBytes ratio downloadBps uploadBps peers seeds leechers completedAtMs storageDir
 seedingLeft route seedingPolicy { ratioGoal seedTimeGoalMinutes inactiveGoalMinutes mode action uploadCap levels { ratioGoal } }
 seedingOverride { ratioGoal { state value } action { state value } }
@@ -318,6 +318,7 @@ type torrentView struct {
 	Name            string  `json:"name"`
 	Infohash        string  `json:"infohash"`
 	State           string  `json:"state"`
+	Stated          *string `json:"stated"` // HELD_MANUAL under the torrents' hold
 	Detail          *string `json:"detail"`
 	Category        *string `json:"category"`
 	Private         bool    `json:"private"`
@@ -374,7 +375,11 @@ func (view *torrentView) summary() string {
 	if view == nil {
 		return "absent"
 	}
-	return fmt.Sprintf("%s %q have=%d/%d up=%d peers=%d", view.State, view.detail(), view.HaveBytes, view.TotalBytes, view.UploadedBytes, view.Peers)
+	stated := ""
+	if view.Stated != nil {
+		stated = " " + *view.Stated
+	}
+	return fmt.Sprintf("%s%s %q have=%d/%d up=%d peers=%d", view.State, stated, view.detail(), view.HaveBytes, view.TotalBytes, view.UploadedBytes, view.Peers)
 }
 
 type submitOptions struct {
