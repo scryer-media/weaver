@@ -1201,8 +1201,14 @@ async fn torrents_info_polls_build_no_view_and_read_nothing() {
         zeros = "0".repeat(22)
     );
     // The facade's first request of any kind takes the database once, an
-    // `app/version` as much as a list: that one is not a poll's.
+    // `app/version` as much as a list: that one is not a poll's. It is the
+    // key's last-used touch, made on a blocking thread after the answer, so
+    // the count is read only once that take has landed.
+    let untouched = rig.db.datastore_takes();
     assert_eq!(rig.get("/api/v2/app/version").await.status, StatusCode::OK);
+    while rig.db.datastore_takes() == untouched {
+        tokio::task::yield_now().await;
+    }
     // The service's tick runs on its own interval and may write a
     // checkpoint; held, it cannot land among the polls on a slow runner.
     let _tick = torrents.hold_tick().await;
