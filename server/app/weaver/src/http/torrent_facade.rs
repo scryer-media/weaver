@@ -4752,7 +4752,10 @@ async fn export(ctx: &TorrentFacadeContext, params: &Params, scope: CallerScope)
     let metainfo = if scope.is_admin() {
         metainfo
     } else {
-        match without_web_seed_secrets(&metainfo) {
+        // A metainfo may be large: it is read off the async threads. A task
+        // that did not finish answers as a metainfo that does not parse.
+        let read = tokio::task::spawn_blocking(move || without_web_seed_secrets(&metainfo));
+        match read.await.ok().flatten() {
             Some(metainfo) => bytes::Bytes::from(metainfo),
             None => {
                 return text(
