@@ -53,6 +53,17 @@ fn delta() -> Vec<EncoderConfiguration> {
 // `names[0]` stored, `names[1]` and `names[2]` in one folder coded by
 // `coded`, `names[3]` stored.
 fn mixed(names: [&'static str; 4], coded: Vec<EncoderConfiguration>) -> (Vec<u8>, Files) {
+    mixed_under(names, copy(), coded, false)
+}
+
+// The same, each stored folder through `stored`: a copy, or a copy under
+// AES.
+fn mixed_under(
+    names: [&'static str; 4],
+    stored: Vec<EncoderConfiguration>,
+    coded: Vec<EncoderConfiguration>,
+    encrypt_header: bool,
+) -> (Vec<u8>, Files) {
     let files: Files = vec![
         (names[0], payload(5 * ARTICLE + 11, 41)),
         (names[1], payload(3 * ARTICLE - 3, 42)),
@@ -60,7 +71,8 @@ fn mixed(names: [&'static str; 4], coded: Vec<EncoderConfiguration>) -> (Vec<u8>
         (names[3], payload(4 * ARTICLE, 44)),
     ];
     let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
-    writer.set_content_methods(copy());
+    writer.set_encrypt_header(encrypt_header);
+    writer.set_content_methods(stored.clone());
     writer
         .push_archive_entry(
             ArchiveEntry::new_file(files[0].0),
@@ -80,7 +92,7 @@ fn mixed(names: [&'static str; 4], coded: Vec<EncoderConfiguration>) -> (Vec<u8>
             ],
         )
         .unwrap();
-    writer.set_content_methods(copy());
+    writer.set_content_methods(stored.clone());
     writer
         .push_archive_entry(
             ArchiveEntry::new_file(files[3].0),
@@ -250,8 +262,13 @@ async fn a_damaged_stored_member_is_repaired_and_replayed_beside_the_coded_ones(
 async fn coded_pack_lost(names: [&'static str; 4]) -> (Outcome, Files) {
     let (archive, files) = mixed(names, delta());
     let lost = article_in(coded_pack(&files));
-    let scenario = Scenario::new(vec![Post::plain("lantern.7z", archive)]).damaged(0, lost);
+    let (scenario, spoken) =
+        hearing(Scenario::new(vec![Post::plain("lantern.7z", archive)]).damaged(0, lost));
     let graph = run(&scenario).await;
+    // The run that read the lost bytes is the only one: its refusal ends
+    // it under its shelf's generation, and nothing asks it again.
+    let (_, generations) = named(&spoken);
+    assert_eq!(generations.len(), 1, "{generations:?}");
     for (name, bytes) in [&files[0], &files[3]] {
         assert!(
             graph.files.get(&delivered(name)) == Some(bytes)
@@ -302,4 +319,118 @@ async fn a_mixed_7z_restarted_after_every_article_delivers_its_members() {
     let (archive, files) = mixed(MKV, lzma2());
     let whole = restart_row(Scenario::new(vec![Post::plain("lantern.7z", archive)])).await;
     assert_members(&whole, &files);
+}
+
+// No decode pool can hold the coded folder's run: its reservation is
+// refused before it starts. The run ends where it stands and is not asked
+// again, the stored members are delivered, and the job ends Partial.
+#[tokio::test]
+async fn a_coded_folder_no_decode_pool_holds_ends_partial_beside_the_stored_members() {
+    use weaver_server_pipeline::pipeline::graph::engine::{DecodePool, RUN_OVERHEAD};
+    let (archive, files) = mixed(MKV, lzma2());
+    let (scenario, spoken) = hearing(
+        Scenario::new(vec![Post::plain("lantern.7z", archive)])
+            .setup(|pipeline| pipeline.graph_decode = Arc::new(DecodePool::new(RUN_OVERHEAD - 1))),
+    );
+    let graph = run(&scenario).await;
+    assert_eq!(
+        graph.status,
+        Some(JobStatus::Partial),
+        "{:?} {:?}",
+        graph.failure,
+        graph.graph().delivery
+    );
+    for (name, bytes) in [&files[0], &files[3]] {
+        assert!(graph.files.get(&delivered(name)) == Some(bytes), "{name}");
+    }
+    // No run emitted: its reservation was refused before it started, and
+    // it was not asked again.
+    assert_eq!(named(&spoken), Default::default(), "no run emitted");
+    // The coded members are not delivered, and the job ends.
+    for (name, _) in [&files[1], &files[2]] {
+        assert!(!graph.files.contains_key(&delivered(name)), "{name}");
+    }
+}
+
+// The stored folders under AES, the coded folder plain, the end header
+// enciphered or not.
+fn sealed_stored(encrypt_header: bool) -> (Vec<u8>, Files) {
+    use sevenz_turbo::Password;
+    use sevenz_turbo::encoder_options::AesEncoderOptions;
+    let stored = vec![
+        AesEncoderOptions::new(Password::new(SECRET)).into(),
+        EncoderConfiguration::new(EncoderMethod::COPY),
+    ];
+    mixed_under(MKV, stored, lzma2(), encrypt_header)
+}
+
+const SECRET: &str = "lumen-quill-secret";
+
+// No password ever offered: the store cannot decipher its stored members,
+// and the password is what the job reports. With the end header plain, the
+// run still decodes the coded folder, whose usable file makes the job
+// Partial; with it enciphered nothing is mapped, and the job fails for the
+// password.
+#[tokio::test]
+async fn a_mixed_7z_whose_stored_folders_need_a_password_never_given_reports_the_password() {
+    use weaver_graph::Why;
+    for encrypt_header in [false, true] {
+        let (archive, files) = sealed_stored(encrypt_header);
+        let graph = run(&Scenario::new(vec![Post::plain("lantern.7z", archive)])).await;
+        let delivery = &graph.graph().delivery;
+        assert_eq!(
+            graph.failure_kind,
+            Some(crate::history::HistoryFailureKind::Password),
+            "{encrypt_header}: {:?}",
+            graph.failure
+        );
+        assert_eq!(
+            delivery.withheld,
+            vec![("lantern.7z".to_owned(), Why::EncryptedHeader)],
+            "{encrypt_header}"
+        );
+        for (name, _) in [&files[0], &files[3]] {
+            assert!(!graph.files.contains_key(&delivered(name)), "{name}");
+        }
+        if encrypt_header {
+            assert!(
+                matches!(&graph.status, Some(JobStatus::Failed { error }) if error.contains("needs a password")),
+                "{:?}",
+                graph.status
+            );
+        } else {
+            assert_eq!(graph.status, Some(JobStatus::Partial));
+            for (name, bytes) in [&files[1], &files[2]] {
+                assert!(graph.files.get(&delivered(name)) == Some(bytes), "{name}");
+            }
+        }
+    }
+}
+
+// The password offered: the store deciphers the stored members, and the
+// run decodes the coded ones. With the end header enciphered too, the store
+// is lent out for its deciphering while the run reads, and the run stands.
+#[tokio::test]
+async fn a_mixed_7z_whose_stored_folders_need_the_job_password_delivers_every_member() {
+    for encrypt_header in [false, true] {
+        let (archive, files) = sealed_stored(encrypt_header);
+        let (scenario, spoken) =
+            hearing(Scenario::new(vec![Post::plain("lantern.7z", archive)]).password(SECRET));
+        let graph = run(&scenario).await;
+        assert_members(&graph, &files);
+        assert_fetched_once(&graph);
+        assert_runs_made_only_coded(&spoken);
+    }
+}
+
+// The end header's article lost under PAR2: the store maps nothing until
+// the repair brings it, then streams the stored members and runs for the
+// coded ones.
+#[tokio::test]
+async fn a_mixed_7z_whose_end_header_is_repaired_by_par2_delivers_every_member() {
+    let (archive, files) = mixed(MKV, delta());
+    let tail = (archive.len() - 1) / ARTICLE;
+    let graph = run(&Scenario::new(with_par2(&archive)).damaged(0, tail as u32)).await;
+    assert_members(&graph, &files);
+    assert_fetched_once(&graph);
 }

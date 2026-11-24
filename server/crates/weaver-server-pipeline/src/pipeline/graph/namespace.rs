@@ -4425,6 +4425,35 @@ impl NamespaceWriter {
     // The member is a leaf because something gave it back or never took
     // it. Said once, when the reason is new. When `given_up`, the archive it
     // belonged to is noted for the job's events, once per archive.
+    // The run of an object that places members itself was refused, or
+    // refused to go on: the members it makes and did not close are refused
+    // for that reason, as an object's members are, so what is delivered says
+    // why they are not there. The object and what it placed stand.
+    pub(crate) fn refuse_made(&mut self, tree: &Tree, node: NodeId, why: Why) {
+        for member in Self::made_open(tree, node) {
+            self.refuse(tree, node, member, why, false);
+        }
+    }
+
+    // A new run makes them again: why the last one did not is forgotten.
+    pub(crate) fn unrefuse_made(&mut self, tree: &Tree, node: NodeId) {
+        for member in Self::made_open(tree, node) {
+            self.files_mut(node).unrefuse(member);
+        }
+    }
+
+    // The members of the node's run left open.
+    fn made_open(tree: &Tree, node: NodeId) -> Vec<MemberId> {
+        let (Some(engine), Some(namespace)) = (tree.engine(node), tree.namespace(node)) else {
+            return Vec::new();
+        };
+        namespace
+            .members()
+            .filter(|member| engine.makes(member.id) && !member.closed && !member.is_complete())
+            .map(|member| member.id)
+            .collect()
+    }
+
     fn refuse(&mut self, tree: &Tree, node: NodeId, member: MemberId, why: Why, given_up: bool) {
         // Said before: an engine handed the member gives it back for the
         // reason it was handed over for.

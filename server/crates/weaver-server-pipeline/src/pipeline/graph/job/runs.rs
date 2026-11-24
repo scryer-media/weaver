@@ -436,10 +436,11 @@ impl GraphJob {
             // object, and what it placed, stand. A window the job waits for
             // room for is waited for as below.
             Heard::Emit(Emit::Refuse(why))
-                if self.places_own(node)
+                if self.tree.places_own(node)
                     && !(matches!(why, Why::TooLarge { .. })
                         && self.runs.window_needs(node).is_some()) =>
             {
+                self.writer.refuse_made(&self.tree, node, why);
                 Vec::new()
             }
             Heard::Emit(emit) => {
@@ -464,9 +465,6 @@ impl GraphJob {
                     }),
                     emit => emit,
                 };
-                // A run of an object that places members of its own fails
-                // only the members the run makes: they stay as it left
-                // them, and the object, and what it placed, stand.
                 // The tree is told the run is asking, as it is told how far
                 // the run read: the object rules on it when the job is quiet.
                 if emit == Emit::NeedsPassword {
@@ -723,7 +721,7 @@ impl GraphJob {
                 return Ok(());
             }
             for node in std::mem::take(&mut admitted) {
-                admitted.extend(self.start_run(node)?);
+                admitted.extend(self.start_run(node, limit)?);
             }
         }
     }
@@ -738,7 +736,7 @@ impl GraphJob {
     // Start the node's run once its memory is reserved. A run whose memory
     // can never fit is refused to the tree as a run's own refusal is; one
     // that does not fit now hands back the nodes its slot admitted.
-    fn start_run(&mut self, node: NodeId) -> Result<Vec<NodeId>, GraphError> {
+    fn start_run(&mut self, node: NodeId, limit: usize) -> Result<Vec<NodeId>, GraphError> {
         let Some(engine) = self.tree.engine(node) else {
             return Ok(Vec::new());
         };
@@ -758,9 +756,13 @@ impl GraphJob {
             Reservation::Beyond { needed, memory } => Some(Why::OverMachine { needed, memory }),
         };
         if let Some(why) = refused {
-            // As a run's own refusal: only what the run makes fails.
-            if self.places_own(node) {
-                return Ok(Vec::new());
+            // As a run's own refusal: only what the run makes fails, and
+            // the run ends where it stands, under the shelf's generation,
+            // so it is not asked again until a repair or an offer moves it.
+            if self.tree.places_own(node) {
+                self.writer.refuse_made(&self.tree, node, why);
+                let generation = self.writer.shelf(node).generation();
+                return Ok(self.runs.ended(node, generation, limit));
             }
             let mut effects = Vec::new();
             self.tree.emitted(
@@ -771,6 +773,9 @@ impl GraphJob {
             );
             self.settle(effects)?;
             return Ok(Vec::new());
+        }
+        if self.tree.places_own(node) {
+            self.writer.unrefuse_made(&self.tree, node);
         }
         if let Some(extraction) = self.tree.start(node) {
             let shelf = self.writer.shelf(node);
@@ -794,9 +799,10 @@ impl GraphJob {
 
     // Everything the run built was built on bytes a repair replaced, at a
     // window too narrow, or while the job waits for room. The members it
-    // made start over; the envelope keeps the repaired bytes in place. The run runs
-    // again from the start in every case, and writes them again: while the
-    // job waits for room, it wakes only once its disk has room for them.
+    // made start over; the envelope keeps the repaired bytes in place. The
+    // run runs again from the start in every case, and writes them again:
+    // while the job waits for room, it wakes only once its disk has room
+    // for them.
     fn retract_run(&mut self, node: NodeId) -> Result<(), GraphError> {
         let retracts = self.members(node).into_iter().map(Emit::Retract).collect();
         let mut effects = Vec::new();
@@ -810,17 +816,6 @@ impl GraphJob {
         let settled = self.settle(effects);
         self.writer.rewriting(false);
         settled
-    }
-
-    // Whether the object at `node` places members itself beside those its
-    // run makes, as a 7z store that codes some folders does.
-    fn places_own(&self, node: NodeId) -> bool {
-        let Some(engine) = self.tree.engine(node) else {
-            return false;
-        };
-        self.tree
-            .namespace(node)
-            .is_some_and(|namespace| namespace.members().any(|member| !engine.makes(member.id)))
     }
 
     // The members the node's run makes: every member of an engine, and of
@@ -890,7 +885,10 @@ impl GraphJob {
         let mut gone = Vec::new();
         for node in touched {
             let Some((parent, _)) = self.tree.volumes(node).filter(|_| self.is_engine(node)) else {
-                if self.runs.has(node) {
+                // An object out on loan for its work answers nothing while
+                // it is out, its engine face too: its run is not gone, and
+                // stands until the object is back.
+                if self.runs.has(node) && !self.tree.lent(node) {
                     gone.push(node);
                 }
                 continue;
