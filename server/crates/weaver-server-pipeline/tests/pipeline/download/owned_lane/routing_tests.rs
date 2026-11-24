@@ -848,6 +848,9 @@ fn lanes_behind_a_full_route_wait_for_a_freed_socket_and_one_dials_per_socket() 
     let (refill_tx, _refill_rx) = mpsc::channel(4);
     let (parked_tx, _parked_rx) = mpsc::channel(4);
     let mut waiting = nntp.pool().route_line_waiting(weaver_nntp::ServerId(0));
+    // One lane at a time, each in line before the next starts: lanes dialling
+    // at once contend for the pool's health lock, and one that loses its
+    // tries gives its work back instead of joining the line.
     let lanes: Vec<_> = (0..LANES)
         .map(|segment| {
             let run = OwnedLaneRun {
@@ -863,14 +866,17 @@ fn lanes_behind_a_full_route_wait_for_a_freed_socket_and_one_dials_per_socket() 
                     vec![tail_work(u32::try_from(segment).unwrap(), 0)],
                 ),
             };
-            std::thread::spawn(move || run_owned_blocking_download_lane(&mut None, run))
+            let lane = std::thread::spawn(move || run_owned_blocking_download_lane(&mut None, run));
+            runtime.block_on(async {
+                waiting
+                    .wait_for(|waiting| *waiting == segment + 1)
+                    .await
+                    .unwrap();
+            });
+            lane
         })
         .collect();
     drop(event_tx);
-
-    runtime.block_on(async {
-        waiting.wait_for(|waiting| *waiting == LANES).await.unwrap();
-    });
     assert_eq!(route.dials.load(SeqCst), LANES, "each lane dialled once");
 
     route.room.store(1, SeqCst);
