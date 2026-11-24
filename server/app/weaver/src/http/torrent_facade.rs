@@ -4783,7 +4783,9 @@ async fn export(ctx: &TorrentFacadeContext, params: &Params, scope: CallerScope)
 // The metainfo with its web seeds' (BEP 19 `url-list`, BEP 17
 // `httpseeds`) user names, passwords, queries and fragments taken out, and
 // a URL that does not parse left out. Every other byte is as added, so its
-// info hash is the torrent's. None when the metainfo does not parse.
+// info hash is the torrent's, and bytes after the root dictionary, which
+// the add ignored, follow it unchanged. None when the root dictionary does
+// not parse.
 //
 // The web seed's path stays in this export for every caller, on purpose:
 // the operator ruled on 2026-11-17 that user name, password, query and
@@ -4809,7 +4811,8 @@ fn without_web_seed_secrets(metainfo: &[u8]) -> Option<Vec<u8>> {
         at = value_end;
     }
     out.push(b'e');
-    (at + 1 == metainfo.len()).then_some(out)
+    out.extend_from_slice(&metainfo[at + 1..]);
+    Some(out)
 }
 
 // A web seed value as `without_web_seed_secrets` gives it: one URL stays

@@ -4623,6 +4623,48 @@ async fn only_an_admin_exports_the_web_seeds_secrets() {
     assert_eq!(admin.body.as_bytes(), added);
 }
 
+// Bytes after the root dictionary, which the add ignored, do not stop a key
+// that controls from exporting the metainfo: they follow the redacted
+// dictionary unchanged, and the export adds again as the same torrent.
+#[tokio::test]
+async fn a_metainfo_with_bytes_after_it_exports_them_unchanged() {
+    let first = rig().await;
+    with_control_key(&first);
+    let plain = metainfo("one.mkv", 3000, false);
+    let info = &plain[1..plain.len() - 1];
+    let torrent = |url: &[u8]| {
+        let mut torrent = b"d".to_vec();
+        torrent.extend_from_slice(info);
+        bstr(&mut torrent, b"url-list");
+        bstr(&mut torrent, url);
+        torrent.push(b'e');
+        torrent
+    };
+    let mut added = torrent(b"https://seed.invalid/files/?token=list5ecret");
+    added.push(b'\n');
+    let mut redacted = torrent(b"https://seed.invalid/files/");
+    redacted.push(b'\n');
+    assert_eq!(first.add_file(&added, &[]).await.status, StatusCode::OK);
+    let hash = first.torrents().await[0]["hash"].as_str().unwrap().to_owned();
+    let exported = first
+        .send(
+            Request::get(format!("/api/v2/torrents/export?hash={hash}"))
+                .header("x-api-key", CONTROLLER)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(exported.status, StatusCode::OK);
+    assert_eq!(exported.body.as_bytes(), redacted);
+
+    let again = rig().await;
+    assert_eq!(
+        again.add_file(exported.body.as_bytes(), &[]).await.status,
+        StatusCode::OK
+    );
+    assert_eq!(again.torrents().await[0]["hash"].as_str(), Some(&*hash));
+}
+
 // A request with the login cookie that changes anything must come from a
 // page of this listener, whatever its method; one that only reads, or one
 // carrying its key, need not.
