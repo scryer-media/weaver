@@ -1544,7 +1544,7 @@ jobs:
   rust-package-darwin-arm64-portable:
     name: rust-package-darwin-arm64-portable
     runs-on: macos-26
-    timeout-minutes: 120
+    timeout-minutes: 240
     needs: [changes, verify-release-tag, web-build]
     if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.web-build.result == 'success' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
     env:
