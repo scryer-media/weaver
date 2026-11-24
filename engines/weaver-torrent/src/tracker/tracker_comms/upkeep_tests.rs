@@ -19,7 +19,7 @@ use super::{
     AnnounceErrorKind, ReannounceDelay, StoppedAnnounces, SupportedTracker, ToldPorts,
     TrackerAnnounce, TrackerCommsStats, TrackerList, TrackerTask,
 };
-use super::{Entry, RowIndex, unique, write_answered, write_rows};
+use super::{Entry, RowIndex, replaced_rows, unique, write_answered, write_rows};
 
 // The list's upkeep as it walked the list for each tracker, before it
 // built a set per pass: the reference the test below compares with.
@@ -749,4 +749,54 @@ fn rows_written_per_answer_match_every_row_rewritten() {
         one_row * 8 > publishes,
         "{one_row} of {publishes} wrote one row"
     );
+}
+
+// Replacing the trackers keeps the rows it kept when it looked each tracker
+// up in the old rows: the same rows, in the same order, the first of a
+// repeated URL kept, over seeded tables with rows answered, failed and in
+// flight and many trackers kept, added and dropped.
+#[test]
+fn rows_replaced_by_index_match_rows_looked_up_per_tracker() {
+    let mut rng = 0x1f83_d9ab_fb41_bd6bu64;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    const NAMES: u64 = 300;
+    let names: Vec<String> = (0..NAMES).map(|i| format!("t{i}")).collect();
+    let at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    for run in 0..50 {
+        // Old rows, a URL now and then repeated, in states of every kind.
+        let rows: Vec<TrackerAnnounce> = (0..next() % 200)
+            .map(|i| {
+                let r = next();
+                TrackerAnnounce {
+                    url: http(&names[(r % NAMES) as usize]).url().to_string(),
+                    in_flight: r & 0x100 != 0,
+                    last: (r & 0x200 != 0).then(|| super::LastAnnounce {
+                        at,
+                        result: Err(super::AnnounceError {
+                            kind: AnnounceErrorKind::Failed,
+                            message: format!("row {i}"),
+                        }),
+                    }),
+                    fails: [0, 1, 2, 3, 4][(r >> 16) as usize % 5],
+                    next_announce: (r & 0x400 != 0).then_some(at + Duration::from_secs(i)),
+                }
+            })
+            .collect();
+        let trackers = unique(
+            (0..next() % 250)
+                .map(|_| http(&names[(next() % NAMES) as usize]))
+                .collect::<Vec<_>>()
+                .iter(),
+        );
+        assert_eq!(
+            replaced_rows(&rows, &trackers),
+            rows_replaced(&rows, &trackers),
+            "run {run}"
+        );
+    }
 }

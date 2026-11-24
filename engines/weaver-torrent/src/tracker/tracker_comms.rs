@@ -1408,6 +1408,26 @@ fn unique<'a>(trackers: impl IntoIterator<Item = &'a SupportedTracker>) -> Vec<S
         .collect()
 }
 
+/// The table's rows for `trackers`, in their order: a tracker that has a
+/// row in `rows` keeps the first of them, and one that has none gets a new
+/// row. The rows are looked up in an index built once.
+fn replaced_rows(rows: &[TrackerAnnounce], trackers: &[SupportedTracker]) -> Vec<TrackerAnnounce> {
+    let index = RowIndex::of(rows);
+    trackers
+        .iter()
+        .map(|t| {
+            let url = t.url().as_str();
+            match index.at.get(url) {
+                Some(&i) => rows[i].clone(),
+                None => TrackerAnnounce {
+                    url: url.to_owned(),
+                    ..Default::default()
+                },
+            }
+        })
+        .collect()
+}
+
 /// `instant` on the wall clock.
 fn wall(instant: Instant, now: Instant, at: SystemTime) -> SystemTime {
     match instant.checked_duration_since(now) {
@@ -1535,20 +1555,7 @@ impl TrackerStatus {
     ) -> Vec<(Arc<TrackerComms>, StartedTrackers)> {
         let trackers = unique(tiers.iter().flatten());
         self.0.announces.send_modify(|announces| {
-            *announces = trackers
-                .iter()
-                .map(|t| {
-                    let url = t.url().as_str();
-                    announces
-                        .iter()
-                        .find(|a| a.url == url)
-                        .cloned()
-                        .unwrap_or_else(|| TrackerAnnounce {
-                            url: url.to_owned(),
-                            ..Default::default()
-                        })
-                })
-                .collect();
+            *announces = replaced_rows(announces, &trackers);
             *self.0.rows.lock() = RowIndex::of(announces);
         });
         self.runs()
