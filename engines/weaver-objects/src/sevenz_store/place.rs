@@ -236,10 +236,24 @@ impl SevenZipStore {
         range: ByteRange,
         out: &mut Vec<Extent>,
     ) -> Located {
-        match &self.map {
-            Some(map) => self.extent_in(map, member, range, out),
-            None => Located::NotYet,
+        let Some(map) = &self.map else {
+            return Located::NotYet;
+        };
+        // A coded member's bytes are its folder's decode: every byte of the
+        // folder's packs is behind each of them.
+        let coded = map
+            .entry(member)
+            .and_then(|entry| entry.folder)
+            .map(|folder| &map.folders[folder])
+            .filter(|folder| folder.coded);
+        if let Some(folder) = coded {
+            out.push(Extent {
+                volume: FILE,
+                range: folder.pack,
+            });
+            return Located::Whole;
         }
+        self.extent_in(map, member, range, out)
     }
 
     // On a map in hand, for a caller that has taken it out to route by it.

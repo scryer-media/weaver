@@ -269,8 +269,10 @@ fn a_compressed_folder_goes_to_an_engine_before_any_member() {
     assert!(owner.members.is_empty());
 }
 
+// A compressed folder beside a stored one is coded: the stored member
+// streams, and the coded one waits for the store's run.
 #[test]
-fn one_compressed_folder_sends_the_whole_container_to_an_engine() {
+fn one_compressed_folder_beside_a_stored_one_is_coded_and_the_stored_one_streams() {
     let alpha = payload(5, 2_000);
     let beta = payload(6, 2_000);
     let bytes = write(
@@ -283,8 +285,63 @@ fn one_compressed_folder_sends_the_whole_container_to_an_engine() {
     );
     let mut owner = Owner::single(store(), bytes);
     owner.whole(4096);
-    assert!(has(&owner, &Emit::NeedsEngine(Why::Compressed)));
+    no_trouble(&owner);
+    assert_eq!(owner.member("alpha.bin").bytes, alpha);
+    assert!(owner.member("alpha.bin").closed);
+    assert!(!owner.member("beta.bin").closed);
+    assert!(owner.object.engine().is_some());
+}
+
+// A folder that compresses under AES is not coded: the whole set goes to
+// an engine, which has the password, as it did before a set could be mixed.
+#[test]
+fn a_compressed_folder_under_aes_beside_a_stored_one_sends_the_whole_container_to_an_engine() {
+    let alpha = payload(5, 2_000);
+    let beta = payload(6, 2_000);
+    let mut sealed = aes();
+    sealed.truncate(1);
+    sealed.extend(lzma2());
+    let bytes = write(
+        copy(),
+        false,
+        &[
+            (None, Entry::File("alpha.bin", &alpha)),
+            (Some(sealed), Entry::File("beta.bin", &beta)),
+        ],
+    );
+    let mut owner = Owner::single(store(), bytes);
+    owner.whole(4096);
+    assert!(has(&owner, &Emit::NeedsEngine(Why::Encrypted)));
     assert!(owner.members.is_empty());
+}
+
+// A folder stored under AES beside a compressed one: the store deciphers
+// and streams the stored member once the password proves, and the coded
+// one waits for the store's run.
+#[test]
+fn an_aes_stored_folder_beside_a_compressed_one_is_deciphered_and_streams() {
+    let alpha = payload(5, 2_000);
+    let beta = payload(6, 2_000);
+    let bytes = write(
+        aes(),
+        false,
+        &[
+            (None, Entry::File("alpha.bin", &alpha)),
+            (Some(lzma2()), Entry::File("beta.bin", &beta)),
+        ],
+    );
+    let mut owner = Owner::single(store(), bytes);
+    owner.whole(4096);
+    assert!(has(&owner, &Emit::NeedsPassword));
+    owner.offer(PASSWORD);
+    owner.close(0);
+    no_trouble(&owner);
+    assert_eq!(owner.member("alpha.bin").bytes, alpha);
+    assert!(owner.member("alpha.bin").closed);
+    assert!(!owner.member("beta.bin").closed);
+    let engine = owner.object.engine().expect("the coded folder runs");
+    assert!(!engine.makes(MemberId(0)));
+    assert!(engine.makes(MemberId(1)));
 }
 
 #[test]

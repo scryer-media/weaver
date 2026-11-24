@@ -30,19 +30,21 @@ use std::sync::atomic::AtomicBool;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sevenz_turbo::Password;
 use weaver_graph::{
-    Budget, ByteRange, Claim, Coverage, Delivery, Durable, Emit, Extent, Facts, Give, Handed, Kind,
-    Located, MemberId, Object, Placement, Posting, Pull, Seek, Standing, Take, VolumeIndex, Weight,
-    Why,
+    Budget, ByteRange, Claim, Coverage, Delivery, Durable, Emit, Engine, Extent, Extraction, Facts,
+    Give, Handed, Kind, Located, MemberId, Object, Placement, Posting, Pull, Seek, Standing, Take,
+    VolumeIndex, Weight, Why,
 };
 use zeroize::Zeroizing;
 
 use crate::RECOVERY;
 use crate::crypt::{Cbc, Chain, Padding};
+use crate::engine::Format;
 use crate::grid::{Grid, crc32};
 use crate::kept::Kept;
 use crate::keys::Keys;
 use crate::lost::minus;
 use crate::placed::Placed;
+use crate::sevenz_engine::SevenZip;
 use header::{SIGNATURE, Signature, Start};
 use map::Map;
 
@@ -268,10 +270,6 @@ pub struct SevenZipStore {
     // coders state it, once it is given up to the engine.
     #[serde(default)]
     window: Option<u64>,
-    // Spike: a coded folder is kept in the envelope for a run instead of
-    // giving the whole container up.
-    #[serde(default)]
-    mixed: bool,
     // Candidates whose folder keys the cache has no answer for: derived
     // away from the loop while the store is lent out, and the folders open
     // once it is back. Neither is kept: a restart offers the password
@@ -381,17 +379,10 @@ impl SevenZipStore {
             stale: true,
             gone: false,
             window: None,
-            mixed: false,
             derive_due: BTreeSet::new(),
             derived: BTreeMap::new(),
             placed: Placed::default(),
         }
-    }
-
-    // Spike: streams the stored folders of a set that also codes some.
-    pub fn mixed(mut self) -> Self {
-        self.mixed = true;
-        self
     }
 
     // Held to what `budget` grants.
@@ -565,13 +556,19 @@ impl SevenZipStore {
     }
 
     fn build(&mut self, archive: &sevenz_turbo::Archive, read: &[ByteRange], out: &mut Vec<Emit>) {
-        let map = match map::build_with(archive, self.mixed) {
+        // What a run holds is the widest folder's decode, whether the run
+        // is an engine's over the whole set or the store's over its coded
+        // folders.
+        let map = match map::build(archive) {
             Ok(map) => map,
             Err(why) => {
                 self.window = window(archive);
                 return self.give_up(Emit::NeedsEngine(why), out);
             }
         };
+        if map.coded().next().is_some() {
+            self.window = window(archive);
+        }
         self.basis = read
             .iter()
             .filter_map(|range| self.kept.read(*range).map(|bytes| (*range, crc32(bytes))))
@@ -1034,6 +1031,16 @@ impl Object for SevenZipStore {
         self.gone = true;
     }
 
+    // A set that codes some folders runs for them: the run is the store's
+    // engine face, once the map that says which folders they are is in.
+    fn engine(&self) -> Option<&dyn Engine> {
+        self.runs().then_some(self as &dyn Engine)
+    }
+
+    fn engine_mut(&mut self) -> Option<&mut dyn Engine> {
+        self.runs().then_some(self as &mut dyn Engine)
+    }
+
     // A 7z is one file: no name or length makes another member a volume of
     // it. A front whose signature states the container this file's stated
     // is this file posted again, offered its place for the tree to weigh
@@ -1070,5 +1077,47 @@ impl Object for SevenZipStore {
         if self.derive_due(stop) {
             self.settle(out);
         }
+    }
+}
+
+// The run over a mixed set's coded folders: the 7z engine's run, reading the
+// store's envelope as the container. It reserves and borrows as the 7z
+// engine does for the same set, from the same window the store hands an
+// engine; nothing is bid, since the envelope holds what the run reads, and
+// every place is the store's own and settled.
+impl Engine for SevenZipStore {
+    fn start(&mut self) -> Box<dyn Extraction> {
+        coded::run(self.map.as_deref(), self.password())
+    }
+
+    fn reserve(&self) -> Option<u64> {
+        crate::engine::reserve::<SevenZip>(self.window)
+    }
+
+    fn lends(&self) -> bool {
+        SevenZip::lends()
+    }
+
+    // Only the coded folders' members are the run's.
+    fn makes(&self, member: MemberId) -> bool {
+        self.map.as_ref().is_some_and(|map| map.is_coded(member))
+    }
+}
+
+impl SevenZipStore {
+    // Whether the map in hand codes any folder.
+    fn runs(&self) -> bool {
+        self.map
+            .as_ref()
+            .is_some_and(|map| map.coded().next().is_some())
+    }
+
+    // The password the run decodes under: the one that opened the store,
+    // or the latest the job offered, which answers what a run asked.
+    fn password(&self) -> Option<String> {
+        self.opened
+            .and_then(|index| self.candidates.get(index))
+            .or_else(|| self.candidates.last())
+            .map(|candidate| candidate.secret.as_str().to_owned())
     }
 }

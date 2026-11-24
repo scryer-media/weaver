@@ -13,28 +13,55 @@
 // folder finishes first: numbered and announced from the end header, and a
 // member closed only once every member before it is, so a run that fails
 // partway closes what an entry-by-entry walk would have closed and no more.
+//
+// The same run decodes the coded folders of a set the 7z store streams the
+// rest of: only those folders, one after another, and only the store's
+// members in them, numbered as the store numbers them. Everything else, the
+// limits, the lender, the threads, the checks and what a failure says, is
+// this one run's.
 
 use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use sevenz_turbo::{
-    Archive, ArchiveEntry, ArchiveReader, Error, Password, ReadAt, ReadAtCursor, UnorderedEntry,
+    Archive, ArchiveEntry, ArchiveReader, EntryRead, Error, Password, ReadAt, ReadAtCursor,
+    UnorderedEntry,
 };
 use weaver_graph::{Budget, Emit, Extraction, MemberId, Provenance, Sink, Volumes, Why};
 
 use crate::engine::Joined;
 use crate::verdict;
 
-pub(super) struct Run {
+pub(crate) struct Run {
     password: Option<String>,
+    scope: Scope,
+}
+
+// What a run decodes, and which members it makes.
+pub(crate) enum Scope {
+    // Every folder; every file body and directory is a member, numbered in
+    // archive order.
+    Whole,
+    // These folders alone, in this order; the members are these entries,
+    // each numbered by its place in the end header, as the store numbers
+    // them. Any other entry of the folders is decoded past and no member.
+    Folders {
+        folders: Vec<usize>,
+        members: HashSet<usize>,
+    },
 }
 
 impl Run {
-    pub(super) fn new(password: Option<String>) -> Self {
-        Self { password }
+    pub(crate) fn new(password: Option<String>) -> Self {
+        Self::of(password, Scope::Whole)
+    }
+
+    pub(crate) fn of(password: Option<String>, scope: Scope) -> Self {
+        Self { password, scope }
     }
 }
 
@@ -49,6 +76,7 @@ impl Extraction for Run {
         let mut walk = Walk {
             sink,
             ids: Vec::new(),
+            first: Vec::new(),
             members: Vec::new(),
             announced: 0,
             ended: Vec::new(),
@@ -58,8 +86,11 @@ impl Extraction for Run {
         let mut in_ram = None;
         let walked = open(&input, password, &budget, &mut in_ram).and_then(|mut reader| {
             reader.set_verify_checksums(true);
-            walk.number(&reader);
-            reader.for_each_entries_unordered(|event| walk.event(event))
+            walk.number(&reader, &self.scope);
+            match &self.scope {
+                Scope::Whole => reader.for_each_entries_unordered(|event| walk.event(event)),
+                Scope::Folders { folders, .. } => walk.folders(&mut reader, folders),
+            }
         });
         let Err(error) = walked else {
             return;
@@ -71,7 +102,8 @@ impl Extraction for Run {
         // A member announced and not closed was built on bytes the run
         // cannot vouch for, or on none yet.
         for open in walk.closed..walk.announced {
-            if !(walk.sink)(Emit::Retract(MemberId(open))) {
+            let member = walk.members[open as usize].id;
+            if !(walk.sink)(Emit::Retract(member)) {
                 return;
             }
         }
@@ -106,6 +138,7 @@ fn said_of(error: &sevenz_turbo::Error) -> String {
 
 // A member as the end header names it.
 struct Named {
+    id: MemberId,
     name: String,
     length: u64,
     crc32: Option<u32>,
@@ -143,10 +176,13 @@ fn open(
 
 struct Walk<'s, 'a> {
     sink: &'s mut Sink<'a>,
-    // Each entry's member, by the entry's place in the end header; none for
-    // an entry that is no member. Members are numbered in archive order, so
-    // every run of the same set numbers them alike.
+    // Each entry's place among the run's members, by the entry's place in
+    // the end header; none for an entry that is no member. Members are
+    // ordered as the walk ends them, in archive order, and numbered as the
+    // scope says, so every run of the same set numbers them alike.
     ids: Vec<Option<u32>>,
+    // Each folder's first entry in the end header, for a walk by folder.
+    first: Vec<usize>,
     members: Vec<Named>,
     // Members below this are announced.
     announced: u32,
@@ -160,11 +196,34 @@ struct Walk<'s, 'a> {
 impl Walk<'_, '_> {
     // A directory is a member with nothing in it, named with a trailing
     // slash as the store names it. Links and devices are not file bodies, so
-    // none is a member and the files around them stand.
-    fn number<R: io::Read + io::Seek>(&mut self, reader: &ArchiveReader<R>) {
+    // none is a member and the files around them stand. A walk by folder
+    // makes only the entries its scope names, in the folders' order.
+    fn number<R: io::Read + io::Seek>(&mut self, reader: &ArchiveReader<R>, scope: &Scope) {
         let files = &reader.archive().files;
         self.ids = vec![None; files.len()];
-        for index in reader.entry_order() {
+        let order = match scope {
+            Scope::Whole => reader.entry_order(),
+            Scope::Folders { folders, members } => {
+                let blocks = &reader.archive().stream_map.file_block_index;
+                self.first = reader.archive().stream_map.block_first_file_index.clone();
+                let rank: HashMap<usize, usize> = folders
+                    .iter()
+                    .enumerate()
+                    .map(|(rank, folder)| (*folder, rank))
+                    .collect();
+                let mut order: Vec<(usize, usize)> = members
+                    .iter()
+                    .filter(|index| **index < files.len())
+                    .filter_map(|index| {
+                        let folder = blocks.get(*index).copied().flatten()?;
+                        Some((*rank.get(&folder)?, *index))
+                    })
+                    .collect();
+                order.sort_unstable();
+                order.into_iter().map(|(_, index)| index).collect()
+            }
+        };
+        for index in order {
             let entry = &files[index];
             let mut name = entry.name().to_owned();
             let length = if is_directory(entry) {
@@ -178,14 +237,66 @@ impl Walk<'_, '_> {
                 continue;
             };
             let crc32 = (length > 0 && entry.has_crc).then_some(entry.crc as u32);
+            let id = match scope {
+                Scope::Whole => MemberId(self.members.len() as u32),
+                Scope::Folders { .. } => MemberId(index as u32),
+            };
             self.ids[index] = Some(self.members.len() as u32);
             self.members.push(Named {
+                id,
                 name,
                 length,
                 crc32,
             });
         }
         self.ended = vec![false; self.members.len()];
+    }
+
+    // The folders, one after another, each walked entry by entry as the
+    // whole set's ordered walk walks a folder it decodes alone.
+    fn folders<R: io::Read + io::Seek>(
+        &mut self,
+        reader: &mut ArchiveReader<R>,
+        folders: &[usize],
+    ) -> Result<(), Error> {
+        for &folder in folders {
+            let mut next = *self.first.get(folder).ok_or(Error::Other(Cow::Borrowed(
+                "a folder the archive does not map",
+            )))?;
+            reader
+                .block_decoder(folder)?
+                .for_each_entries_direct(&mut |entry, read| {
+                    let file_index = next;
+                    next += 1;
+                    self.entry(file_index, entry, read)?;
+                    Ok(true)
+                })?;
+        }
+        Ok(())
+    }
+
+    // One entry of a folder walked alone: begun, its bytes handed over in
+    // the pieces the decoder made, and ended.
+    fn entry(
+        &mut self,
+        file_index: usize,
+        entry: &ArchiveEntry,
+        read: &mut dyn EntryRead,
+    ) -> Result<(), Error> {
+        self.event(UnorderedEntry::Begin { file_index, entry })?;
+        let mut out = Pieces {
+            walk: self,
+            file_index,
+            offset: 0,
+            error: None,
+        };
+        let written = read.write_rest(&mut out);
+        if let Some(error) = out.error.take() {
+            return Err(error);
+        }
+        written?;
+        self.event(UnorderedEntry::End { file_index })?;
+        Ok(())
     }
 
     fn event(&mut self, event: UnorderedEntry<'_>) -> Result<bool, Error> {
@@ -205,7 +316,7 @@ impl Walk<'_, '_> {
                     && !bytes.is_empty()
                 {
                     self.say(Emit::Bytes {
-                        member: MemberId(id),
+                        member: self.members[id as usize].id,
                         offset,
                         bytes: Bytes::copy_from_slice(bytes).into(),
                         provenance: Provenance::Fresh,
@@ -216,7 +327,7 @@ impl Walk<'_, '_> {
                 if let Some(id) = self.id(file_index) {
                     self.ended[id as usize] = true;
                     while self.closed < self.announced && self.ended[self.closed as usize] {
-                        let member = MemberId(self.closed);
+                        let member = self.members[self.closed as usize].id;
                         self.closed += 1;
                         self.say(Emit::MemberClosed(member))?;
                     }
@@ -235,8 +346,8 @@ impl Walk<'_, '_> {
     // with the checksum its header gives.
     fn announce_through(&mut self, id: u32) -> Result<(), Error> {
         while self.announced <= id {
-            let member = MemberId(self.announced);
             let named = &self.members[self.announced as usize];
+            let member = named.id;
             let (name, length, crc32) = (named.name.clone(), named.length, named.crc32);
             self.announced += 1;
             self.say(Emit::Member {
@@ -258,6 +369,35 @@ impl Walk<'_, '_> {
             self.stopped = true;
             Err(stopped())
         }
+    }
+}
+
+// An entry's bytes as the decoder writes them on, each piece handed to the
+// walk as the unordered walk hands it.
+struct Pieces<'w, 's, 'a> {
+    walk: &'w mut Walk<'s, 'a>,
+    file_index: usize,
+    offset: u64,
+    error: Option<Error>,
+}
+
+impl io::Write for Pieces<'_, '_, '_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let event = UnorderedEntry::Data {
+            file_index: self.file_index,
+            offset: self.offset,
+            bytes,
+        };
+        if let Err(error) = self.walk.event(event) {
+            self.error = Some(error);
+            return Err(io::Error::other("the walk stopped"));
+        }
+        self.offset += bytes.len() as u64;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 

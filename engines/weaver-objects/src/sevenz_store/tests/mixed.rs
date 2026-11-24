@@ -1,24 +1,33 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// Spike: a set with stored and coded folders. The store streams the stored
-// members and keeps the coded packs in its envelope; a run over that
-// envelope alone decodes the coded members, and never reads a stored byte.
+// A set with stored and coded folders. The store streams the stored members
+// and keeps the coded packs in its envelope; its run, over that envelope
+// alone, decodes the coded members and never reads a stored byte.
 
 use std::io::{self, Cursor};
 use std::sync::{Arc, Mutex};
 
-use sevenz_turbo::{ArchiveEntry, ArchiveWriter, SourceReader};
+use sevenz_turbo::encoder_options::DeltaOptions;
+use sevenz_turbo::{ArchiveEntry, ArchiveWriter, EncoderConfiguration, SourceReader};
 use weaver_graph::{
-    ByteRange, Emit, Extraction, MemberId, Object, Placement, VolumeIndex, Volumes,
+    Budget, ByteRange, Emit, Engine, Extent, Located, MemberId, Object, Placement, VolumeIndex,
+    Volumes,
 };
 
-use super::super::coded::CodedRun;
 use super::owner::Owner;
-use super::{copy, lzma2, no_trouble, store};
+use super::{PASSWORD, aes, copy, has, lzma2, no_trouble, store};
+use crate::sevenz_engine::SevenZipEngine;
 use crate::testing::payload;
 
-fn mixed() -> (Vec<u8>, Vec<(&'static str, Vec<u8>)>) {
+type Files = Vec<(&'static str, Vec<u8>)>;
+
+// alpha stored, beta and gamma in one coded folder, delta stored. With
+// `header`, the end header is enciphered by those methods.
+fn mixed_with(
+    coded: Vec<EncoderConfiguration>,
+    header: Option<Vec<EncoderConfiguration>>,
+) -> (Vec<u8>, Files) {
     let files = vec![
         ("alpha.mkv", payload(1, 70_000)),
         ("beta.nfo", payload(2, 3_000)),
@@ -33,7 +42,7 @@ fn mixed() -> (Vec<u8>, Vec<(&'static str, Vec<u8>)>) {
             Some(Cursor::new(files[0].1.clone())),
         )
         .unwrap();
-    writer.set_content_methods(lzma2());
+    writer.set_content_methods(coded);
     writer
         .push_archive_entries(
             vec![
@@ -53,7 +62,21 @@ fn mixed() -> (Vec<u8>, Vec<(&'static str, Vec<u8>)>) {
             Some(Cursor::new(files[3].1.clone())),
         )
         .unwrap();
+    if let Some(header) = header {
+        writer.set_content_methods(header);
+        writer.set_encrypt_header(true);
+    }
     (writer.finish().unwrap().into_inner(), files)
+}
+
+fn mixed() -> (Vec<u8>, Files) {
+    mixed_with(lzma2(), None)
+}
+
+// A filter that codes each byte alone, so a byte changed in its pack is one
+// byte changed in its output, which its CRC catches.
+fn delta() -> Vec<EncoderConfiguration> {
+    vec![DeltaOptions::from_distance(1).into()]
 }
 
 // The envelope as a run reads it: the container's bytes where the store
@@ -96,10 +119,70 @@ impl Volumes for Envelope {
     }
 }
 
+// What the store keeps in its envelope, at its container offsets, from the
+// container's bytes as they were delivered.
+fn envelope(owner: &Owner, archive: &[u8]) -> Arc<Envelope> {
+    let whole = ByteRange::new(0, archive.len() as u64);
+    let mut placements = Vec::new();
+    owner.object.locate(VolumeIndex(0), whole, &mut placements);
+    let kept: Vec<ByteRange> = placements
+        .iter()
+        .filter_map(|placement| match placement {
+            Placement::Envelope { envelope: 0, range } => Some(*range),
+            _ => None,
+        })
+        .collect();
+    let mut bytes = vec![0u8; archive.len()];
+    for range in &kept {
+        bytes[range.start as usize..range.end as usize]
+            .copy_from_slice(&archive[range.start as usize..range.end as usize]);
+    }
+    Arc::new(Envelope {
+        bytes,
+        kept,
+        strays: Mutex::default(),
+    })
+}
+
+fn run(engine: &mut dyn Engine, volumes: Arc<dyn Volumes>) -> Vec<Emit> {
+    let mut emits = Vec::new();
+    let mut sink = |emit| {
+        emits.push(emit);
+        true
+    };
+    engine.start().run(volumes, &mut sink, Budget::default());
+    emits
+}
+
+// Each member's bytes as a run wrote them, in order, and the members it
+// closed.
+fn written(emits: &[Emit], members: usize) -> (Vec<Vec<u8>>, Vec<MemberId>) {
+    let mut out: Vec<Vec<u8>> = vec![Vec::new(); members];
+    let mut closed = Vec::new();
+    for emit in emits {
+        match emit {
+            Emit::Bytes {
+                member,
+                offset,
+                bytes,
+                ..
+            } => {
+                let into = &mut out[member.0 as usize];
+                assert_eq!(*offset, into.len() as u64);
+                into.extend_from_slice(bytes);
+            }
+            Emit::MemberClosed(member) => closed.push(*member),
+            Emit::Member { .. } | Emit::Checksum { .. } => {}
+            other => panic!("the run said {other:?}"),
+        }
+    }
+    (out, closed)
+}
+
 #[test]
 fn the_store_streams_stored_folders_and_a_run_decodes_the_coded_one_from_the_envelope() {
     let (archive, files) = mixed();
-    let mut owner = Owner::single(store().mixed(), archive.clone());
+    let mut owner = Owner::single(store(), archive.clone());
     owner.whole(4096);
     no_trouble(&owner);
 
@@ -122,23 +205,8 @@ fn the_store_streams_stored_folders_and_a_run_decodes_the_coded_one_from_the_env
         }
     }
 
-    // What the store keeps in its envelope, in container coordinates.
-    let whole = ByteRange::new(0, archive.len() as u64);
-    let mut placements = Vec::new();
-    owner.object.locate(VolumeIndex(0), whole, &mut placements);
-    let kept: Vec<ByteRange> = placements
-        .iter()
-        .filter_map(|placement| match placement {
-            Placement::Envelope { envelope: 0, range } => Some(*range),
-            _ => None,
-        })
-        .collect();
-    let mut bytes = vec![0u8; archive.len()];
-    for range in &kept {
-        bytes[range.start as usize..range.end as usize]
-            .copy_from_slice(&archive[range.start as usize..range.end as usize]);
-    }
-    let envelope_bytes: u64 = kept.iter().map(ByteRange::len).sum();
+    let envelope = envelope(&owner, &archive);
+    let envelope_bytes: u64 = envelope.kept.iter().map(ByteRange::len).sum();
     let stored_bytes = (files[0].1.len() + files[3].1.len()) as u64;
     assert_eq!(
         envelope_bytes + stored_bytes,
@@ -146,45 +214,168 @@ fn the_store_streams_stored_folders_and_a_run_decodes_the_coded_one_from_the_env
         "every byte is a member's or the envelope's"
     );
 
-    let map = owner.object.map.clone().expect("mapped");
-    let envelope = Arc::new(Envelope {
-        bytes,
-        kept,
-        strays: Mutex::default(),
-    });
-    let mut emits = Vec::new();
-    let mut sink = |emit| {
-        emits.push(emit);
-        true
-    };
-    let run: Box<dyn Extraction> = Box::new(CodedRun::new(&map, None));
-    run.run(envelope.clone(), &mut sink, weaver_graph::Budget::default());
+    let engine = owner.object.engine_mut().expect("a mixed set runs");
+    let emits = run(engine, envelope.clone());
     assert!(
         envelope.strays.lock().unwrap().is_empty(),
         "read outside the envelope: {:?}",
         envelope.strays
     );
-
-    let mut out: Vec<Vec<u8>> = vec![Vec::new(); files.len()];
-    let mut closed = Vec::new();
-    for emit in &emits {
-        match emit {
-            Emit::Bytes {
+    // The run names its members as the store did, and only those.
+    let named: Vec<_> = emits
+        .iter()
+        .filter_map(|emit| match emit {
+            Emit::Member {
                 member,
-                offset,
-                bytes,
-                ..
-            } => {
-                let into = &mut out[member.0 as usize];
-                assert_eq!(*offset, into.len() as u64);
-                into.extend_from_slice(bytes);
-            }
-            Emit::MemberClosed(member) => closed.push(*member),
-            other => panic!("the run said {other:?}"),
-        }
-    }
+                name,
+                length,
+            } => Some((*member, name.clone(), *length)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        named,
+        vec![
+            (MemberId(1), "beta.nfo".to_owned(), Some(3_000)),
+            (MemberId(2), "gamma.srt".to_owned(), Some(9_000)),
+        ]
+    );
+    let (out, closed) = written(&emits, files.len());
     assert_eq!(closed, vec![MemberId(1), MemberId(2)]);
     assert_eq!(out[1], files[1].1);
     assert_eq!(out[2], files[2].1);
     assert!(out[0].is_empty() && out[3].is_empty());
+}
+
+// The store faces as an engine only once its map codes a folder, makes only
+// the coded members, places each at its folder's whole pack, and reserves
+// and borrows as the 7z engine the set would otherwise go to.
+#[test]
+fn a_mixed_set_faces_as_the_engine_the_set_would_go_to() {
+    let (archive, _) = mixed();
+    let mut owner = Owner::single(store(), archive.clone());
+    assert!(owner.object.engine().is_none(), "no run before the map");
+    owner.whole(4096);
+    let map = owner.object.map.clone().expect("mapped");
+    let face = owner.object.engine().expect("a mixed set runs");
+    assert_eq!(
+        (0..4)
+            .map(|id| face.makes(MemberId(id)))
+            .collect::<Vec<_>>(),
+        vec![false, true, true, false]
+    );
+
+    let carried = owner
+        .object
+        .engine_volume(VolumeIndex(0))
+        .expect("the store hands its file on");
+    let mut engine = SevenZipEngine::new();
+    engine.adopt(
+        VolumeIndex(0),
+        "alpha.7z",
+        &archive[..32],
+        Some(archive.len() as u64),
+        carried,
+    );
+    let window = owner.object.window.expect("the coded folder's window");
+    assert!(window > 0);
+    assert_eq!(face.reserve(), Some(window));
+    assert_eq!(face.reserve(), Engine::reserve(&engine));
+    assert_eq!(face.lends(), Engine::lends(&engine));
+    assert_eq!(face.widest(), Engine::widest(&engine));
+
+    let pack = map.folders[1].pack;
+    for id in [1, 2] {
+        let mut out = Vec::new();
+        let located = owner
+            .object
+            .extent(MemberId(id), ByteRange::new(0, 1), &mut out);
+        assert_eq!(located, Located::Whole);
+        assert_eq!(
+            out,
+            vec![Extent {
+                volume: VolumeIndex(0),
+                range: pack
+            }]
+        );
+    }
+
+    // A set with nothing coded has no run.
+    let mut stored = Owner::single(store(), super::archive(copy(), false));
+    stored.whole(4096);
+    assert!(stored.object.engine().is_none());
+}
+
+// The end header enciphered: the store opens it with the password, and the
+// run reads it again under the same one.
+#[test]
+fn an_encrypted_header_mixed_set_runs_under_the_password_that_opened_it() {
+    let (archive, files) = mixed_with(lzma2(), Some(aes()));
+    let mut owner = Owner::single(store(), archive.clone());
+    owner.frames(0, 4096);
+    assert!(has(&owner, &Emit::NeedsPassword));
+    assert!(owner.object.engine().is_none());
+    owner.offer(PASSWORD);
+    owner.close(0);
+    no_trouble(&owner);
+    for id in [0, 3] {
+        assert_eq!(owner.members[&id].bytes, files[id as usize].1);
+    }
+
+    let envelope = envelope(&owner, &archive);
+    let engine = owner.object.engine_mut().expect("a mixed set runs");
+    let emits = run(engine, envelope.clone());
+    assert!(envelope.strays.lock().unwrap().is_empty());
+    let (out, closed) = written(&emits, files.len());
+    assert_eq!(closed, vec![MemberId(1), MemberId(2)]);
+    assert_eq!(out[1], files[1].1);
+    assert_eq!(out[2], files[2].1);
+}
+
+// A coded folder whose bytes fail their CRC: the run says what the 7z
+// engine says of the same damage, for the same members.
+#[test]
+fn a_coded_folder_that_fails_its_crc_says_what_the_engine_says() {
+    let (mut archive, files) = mixed_with(delta(), None);
+    let (clean, _) = mixed_with(delta(), None);
+    let mut owner = Owner::single(store(), clean);
+    owner.whole(4096);
+    let pack = owner.object.map.clone().expect("mapped").folders[1].pack;
+    archive[(pack.start + 100) as usize] ^= 0x5a;
+
+    let envelope = envelope(&owner, &archive);
+    let coded = run(
+        owner.object.engine_mut().expect("a mixed set runs"),
+        envelope.clone(),
+    );
+    assert!(envelope.strays.lock().unwrap().is_empty());
+    assert!(
+        matches!(coded.last(), Some(Emit::Refuse(_))),
+        "the run refused: {coded:?}"
+    );
+
+    // The engine over the whole damaged set, its members numbered alike.
+    let mut engine = SevenZipEngine::new();
+    let whole = Arc::new(Envelope {
+        kept: vec![ByteRange::new(0, archive.len() as u64)],
+        bytes: archive,
+        strays: Mutex::default(),
+    });
+    let said = run(&mut engine, whole);
+    let coded_member = |member: &MemberId| (1..=2).contains(&member.0);
+    let engine_said: Vec<Emit> = said
+        .into_iter()
+        .filter(|emit| match emit {
+            Emit::Member { member, .. }
+            | Emit::Checksum { member, .. }
+            | Emit::Bytes { member, .. }
+            | Emit::Retract(member)
+            | Emit::MemberClosed(member) => coded_member(member),
+            Emit::Failed(_) | Emit::Refuse(_) => true,
+            _ => false,
+        })
+        .collect();
+    assert_eq!(coded, engine_said);
+    assert!(coded.contains(&Emit::Retract(MemberId(1))));
+    assert_eq!(files.len(), 4);
 }

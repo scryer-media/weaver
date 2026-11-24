@@ -926,6 +926,14 @@ impl<F: Format + 'static> Object for EngineObject<F> {
     }
 }
 
+// What a run of format `F` reserves: the widest decode its volumes state,
+// and the format's least. A store that runs a format's decode over part of
+// a set reserves by the same rule.
+pub(crate) fn reserve<F: Format>(windows: impl IntoIterator<Item = u64>) -> Option<u64> {
+    let widest = windows.into_iter().max().unwrap_or(0);
+    Some(F::reserve().max(widest))
+}
+
 impl<F: Format + 'static> Engine for EngineObject<F> {
     fn start(&mut self) -> Box<dyn Extraction> {
         F::run(self.password.clone())
@@ -935,8 +943,7 @@ impl<F: Format + 'static> Engine for EngineObject<F> {
     // A volume whose front states nothing adds nothing: what its members
     // hold cannot be known before the run reads their headers.
     fn reserve(&self) -> Option<u64> {
-        let widest = self.windows.values().copied().max().unwrap_or(0);
-        Some(F::reserve().max(widest))
+        reserve::<F>(self.windows.values().copied())
     }
 
     fn lends(&self) -> bool {

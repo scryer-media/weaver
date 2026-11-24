@@ -125,18 +125,19 @@ fn align(len: u64) -> Result<u64, Why> {
     len.checked_next_multiple_of(BLOCK).ok_or(Why::Unsupported)
 }
 
-// The whole decision is taken over the set: folders are the unit of coding
-// and several entries share one, so a container with anything but stored
-// folders goes to an engine whole, with its bytes still in hand.
+// Folders are the unit of coding and several entries share one. A folder
+// that codes its bytes without AES is kept whole in the envelope for a run
+// that decodes the coded folders alone, and the stored folders beside it
+// stream as ever. AES among a folder's coders refuses the set, as does a set
+// with no stored folder: an engine reads the whole set better. Once a folder
+// is coded, any refusal after it is the coded folder's, as it was before a
+// set could be mixed, so what cannot be mapped goes to an engine whole.
 pub(super) fn build(archive: &Archive) -> Result<Map, Why> {
-    build_with(archive, false)
+    let mut coded = false;
+    mixed(archive, &mut coded).map_err(|why| if coded { Why::Compressed } else { why })
 }
 
-// As `build`, and with `mixed` a folder that codes its bytes is flagged
-// rather than refused: its packs go to the envelope for a run to decode,
-// and the stored folders beside it stream as ever. AES among a coded
-// folder's coders still refuses, and so does a set with no stored folder.
-pub(super) fn build_with(archive: &Archive, mixed: bool) -> Result<Map, Why> {
+fn mixed(archive: &Archive, seen_coded: &mut bool) -> Result<Map, Why> {
     let firsts = archive.stream_map.block_first_pack_stream_index();
     let offsets = archive.stream_map.pack_stream_offsets();
     let sizes = archive.pack_sizes();
@@ -165,7 +166,8 @@ pub(super) fn build_with(archive: &Archive, mixed: bool) -> Result<Map, Why> {
         let streams =
             simple && (methods == [COPY] || methods == [AES, COPY] || methods == [COPY, AES]);
         if !streams {
-            if mixed && coder_refusal(block) == Why::Compressed {
+            if coder_refusal(block) == Why::Compressed {
+                *seen_coded = true;
                 folders.push(coded(archive, index, block)?);
                 continue;
             }
@@ -348,6 +350,14 @@ impl Map {
             .enumerate()
             .filter(|(_, folder)| folder.coded)
             .map(|(index, _)| index)
+    }
+
+    // Whether a member's bytes are a coded folder's, a run's to make.
+    pub(super) fn is_coded(&self, member: MemberId) -> bool {
+        self.entry(member)
+            .and_then(|entry| entry.folder)
+            .and_then(|folder| self.folders.get(folder))
+            .is_some_and(|folder| folder.coded)
     }
 
     pub(super) fn entry(&self, member: MemberId) -> Option<&Entry> {
