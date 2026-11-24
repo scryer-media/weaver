@@ -11,8 +11,8 @@ use super::harness::serve;
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::harness::{
-    GraphView, JOB, Outcome, Post, Scenario, collect, finished, observe, par2_set, par3_set, run,
-    serve_work, take_retry,
+    GraphView, JOB, Outcome, Post, Scenario, article_decoded, collect, finished, observe, par2_set,
+    par3_set, run, serve_work, take_retry,
 };
 use crate::jobs::graph_checkpoint::JobsGraphCheckpointInternalQueries;
 use crate::jobs::model::JobStatus;
@@ -816,6 +816,201 @@ pub async fn run_shut_down_while_repairing(scenario: &Scenario) -> ShutWhileRepa
         files,
         in_memory_after_drain,
         refetched,
+    }
+}
+
+// What a job stopped with its loop frozen behind a repair came to.
+pub struct FrozenAfterLend {
+    pub shut: ShutWhileRepairing,
+    // The bytes of `late`'s member the last checkpoint before the restart
+    // covers, and the member's length.
+    pub late_covered: u64,
+    pub late_length: Option<i64>,
+}
+
+// Where `late`'s result is when the pipeline stops.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LateAtStop {
+    // Still on its channel, for the drain to hear.
+    OnItsChannel,
+    // Taken by the loop's last turn before it saw the stop.
+    TakenByLastTurn,
+}
+
+// As `run_shut_down_while_repairing`, with the loop frozen right after the
+// lend as a hook held at `status.enter_verifying` freezes it: `late` is out
+// on a lane when the repair goes out, the repair runs to its end with none
+// of its mail heard, `late`'s result comes back, and only then is the mail
+// put back and the pipeline drained.
+pub async fn run_frozen_after_lend(
+    scenario: &Scenario,
+    late: (u32, u32),
+    at_stop: LateAtStop,
+) -> FrozenAfterLend {
+    use crate::pipeline::graph::engine::Heard;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) =
+        new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
+    scenario.prepare(&mut pipeline);
+    insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
+    let late_name = scenario.posts[late.0 as usize].name.clone();
+    let mut in_memory = BTreeSet::new();
+    let mut in_memory_after_drain = Vec::new();
+    let mut asked_before = BTreeSet::new();
+    let mut refetched = BTreeSet::new();
+    let mut restarted = false;
+    let mut held: Option<DownloadWork> = None;
+    let (mut late_covered, mut late_length) = (0u64, None);
+    let mut quiet = 0;
+    let mut asked = 0usize;
+    loop {
+        while let Some(work) = next_work(&mut pipeline, scenario) {
+            let article = (
+                work.segment_id.file_id.file_index,
+                work.segment_id.segment_number,
+            );
+            asked += 1;
+            if restarted {
+                if asked_before.contains(&article) {
+                    refetched.insert(article);
+                }
+            } else {
+                asked_before.insert(article);
+                if article == late && held.is_none() {
+                    held = Some(work);
+                    continue;
+                }
+            }
+            serve_work(&mut pipeline, scenario, &work).await;
+        }
+        if finished(&pipeline) {
+            break;
+        }
+        let before = asked;
+        if pipeline.jobs.contains_key(&JOB) {
+            pipeline.check_job_completion(JOB).await;
+        }
+        pump_pipeline_runtime_queues(&mut pipeline).await;
+        if finished(&pipeline) {
+            break;
+        }
+        let (awaits_mail, repair_out) = pipeline
+            .graph_jobs
+            .get(&JOB)
+            .map_or((false, false), |job| (job.awaits_mail(), job.repair_out()));
+        if repair_out && !restarted {
+            let late_work = held
+                .take()
+                .expect("the repair went out before the late article came");
+            // `late` is out on a lane, as a lease books it.
+            pipeline.hold_test_lane_works(vec![late_work.clone()], false);
+            // Frozen: the repair runs to its end and nothing it says is heard.
+            let mut kept = Vec::new();
+            loop {
+                let said = pipeline.graph_runs.recv().await.expect("the repair speaks");
+                let repaired = matches!(said.heard, Heard::Repaired(_));
+                kept.push(said);
+                if repaired {
+                    break;
+                }
+            }
+            // Meanwhile the lane's result for `late` came back.
+            let server = (0..)
+                .find(|server| !late_work.exclude_servers.contains(*server))
+                .unwrap();
+            let decoded = article_decoded(&pipeline, JOB, scenario, late, server, None);
+            pipeline
+                .download_done_tx
+                .send(crate::pipeline::DownloadResult {
+                    lane_id: 0,
+                    job_id: JOB,
+                    runtime_generation: pipeline.pool_generation,
+                    segment_id: late_work.segment_id,
+                    data: Ok(crate::pipeline::DownloadPayload::Decoded(decoded)),
+                    attempts: Vec::new(),
+                    lane_observation: None,
+                    source_server_idx: Some(server),
+                    origin: crate::pipeline::DownloadResultOrigin::NormalPrimary,
+                    retry_count: 0,
+                    exclude_servers: late_work.exclude_servers,
+                    release_connection_slot: false,
+                })
+                .await
+                .expect("the result channel is open");
+            if at_stop == LateAtStop::TakenByLastTurn {
+                // The last turn took it into its own list, then saw the stop
+                // and ended: the list is handed on as the loop's end hands
+                // it on.
+                let taken = pipeline.take_ready_download_results_for_test();
+                assert_eq!(taken.len(), 1, "the last turn took the late result");
+                pipeline.hand_on_taken_results_at_stop(taken).await;
+            }
+            let written = pipeline.graph_runs.written();
+            for said in kept {
+                written.send(said).expect("the mail is open");
+            }
+            pipeline.drain().await;
+            assert!(
+                !pipeline.graph_jobs[&JOB].awaits_mail(),
+                "the drain left the job's repair out on its thread"
+            );
+            in_memory_after_drain = pipeline.graph_jobs[&JOB].in_memory();
+            (pipeline, _) =
+                restart_heard(&temp_dir, pipeline, scenario, &mut in_memory, &mut |rows| {
+                    if let Some(member) = rows
+                        .members
+                        .iter()
+                        .find(|row| row.node == 0 && row.name == late_name)
+                    {
+                        late_length = member.length;
+                        late_covered = rows
+                            .coverage
+                            .iter()
+                            .filter(|row| row.node == member.node && row.member == member.member)
+                            .map(|row| (row.end - row.start) as u64)
+                            .sum();
+                    }
+                })
+                .await;
+            crate::pipeline::tests::hear_rewalks(&mut pipeline, JOB).await;
+            restarted = true;
+            continue;
+        }
+        if awaits_mail {
+            let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
+            pipeline.graph_run_said(said);
+            continue;
+        }
+        if take_retry(&mut pipeline).await {
+            continue;
+        }
+        if asked == before {
+            quiet += 1;
+            assert!(
+                quiet < 3,
+                "job stalled at {:?} (restarted {restarted}, late held {})",
+                job_status_for_assert(&pipeline, JOB),
+                held.is_some()
+            );
+        } else {
+            quiet = 0;
+        }
+    }
+    assert!(restarted, "a repair went out before the job finished");
+    let status = job_status_for_assert(&pipeline, JOB);
+    pipeline.db.flush_write_queue().await.unwrap();
+    let mut files = BTreeMap::new();
+    collect(&complete_dir, &complete_dir, &mut files);
+    retire_pipeline_database(pipeline).await;
+    FrozenAfterLend {
+        shut: ShutWhileRepairing {
+            status,
+            files,
+            in_memory_after_drain,
+            refetched,
+        },
+        late_covered,
+        late_length,
     }
 }
 
