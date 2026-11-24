@@ -244,11 +244,13 @@ impl Naming {
         let resolved = match tokio::time::timeout(timeout, resolving).await {
             Ok(resolved) => resolved.inspect_err(|error| record::failed_saying(host, error))?,
             Err(_) => {
-                let said = format!("{RESOLVE_TIMED_OUT}: {host}");
-                record::failed(host, LookupFailure::TimedOut, || said.clone());
+                let timed_out = ResolveTimedOut {
+                    host: host.to_owned(),
+                };
+                record::failed(host, LookupFailure::TimedOut, || timed_out.to_string());
                 return Err(DialError::Destination(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    said,
+                    timed_out,
                 )));
             }
         };
@@ -550,6 +552,23 @@ impl Dialed {
 #[derive(Debug, thiserror::Error)]
 #[error("{}", NO_ADDRESS_RESOLVED)]
 pub struct ResolutionFailed;
+
+// A lookup that ran out the window `Naming::resolve` gave it. It says what
+// that error always said; the type lets a hop the lookup went through tell
+// it from every other failure without reading the text.
+#[derive(Debug, thiserror::Error)]
+#[error("{RESOLVE_TIMED_OUT}: {host}")]
+pub struct ResolveTimedOut {
+    host: String,
+}
+
+impl ResolveTimedOut {
+    // Whether `error` is a lookup that ran out its window.
+    fn is(error: &DialError) -> bool {
+        matches!(error, DialError::Destination(source)
+            if source.get_ref().is_some_and(|inner| inner.is::<Self>()))
+    }
+}
 
 // A route with no room for a dial: the signals that fire when room may have
 // freed, and the demands its refusals left. A side presses for as long as
@@ -1448,10 +1467,27 @@ impl Dialer for TransportHop {
         }
         Err(error)
     }
+    // A lookup asked through this proxy that ran out its window is judged as
+    // a dial's quiet CONNECT is: the destination's while the proxy answered
+    // within `LIVE_WINDOW`, else this hop's own timeout. A naming whose
+    // servers are asked elsewhere says nothing of this proxy.
     async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {
-        self.naming_now()
-            .resolve(self, self.id, host, self.timeout)
-            .await
+        let naming = self.naming_now();
+        let resolved = naming.resolve(self, self.id, host, self.timeout).await;
+        match resolved {
+            Err(error)
+                if matches!(naming, Naming::ProxyServers { .. })
+                    && ResolveTimedOut::is(&error)
+                    && !self.failure.alive() =>
+            {
+                let error = DialError::Timeout {
+                    stage: self.describe(),
+                };
+                self.failure.note(&error, self.timeout);
+                Err(error)
+            }
+            resolved => resolved,
+        }
     }
     // Each connection through the proxy opens one endpoint connection in
     // the share of the tunnel beneath.
