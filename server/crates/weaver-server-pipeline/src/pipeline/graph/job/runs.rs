@@ -753,6 +753,21 @@ impl GraphJob {
         }
     }
 
+    // The job is quiet and the node's run still asks for a password no
+    // candidate answered. An engine's object refuses its whole set for it
+    // as it hears quiet; a run of an object that places members of its own
+    // fails only the members it makes, for the password, as a run's own
+    // refusal does, and the object and what it placed stand.
+    pub(super) fn refuse_unanswered(&mut self, node: NodeId) {
+        if !self.tree.run_asking(node) {
+            return;
+        }
+        if let Some(Made::Only(made)) = self.runs.made(node) {
+            self.writer
+                .refuse_made(&self.tree, node, made, Why::EncryptedHeader);
+        }
+    }
+
     // The slots the job's runs may hold under the pipeline's `limit`: none
     // while the job waits for room on a disk, since every run writes what
     // it builds.

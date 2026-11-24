@@ -771,10 +771,13 @@ fn moved(old: &Map, new: &Map) -> Vec<usize> {
         .collect()
 }
 
-// One folder in both maps: the same pack, plaintext and cipher.
+// One folder in both maps: the same pack, plaintext and cipher, coded or
+// stored alike, and a coded one by the same coders.
 fn same_folder(a: &map::Folder, b: &map::Folder) -> bool {
     a.pack == b.pack
         && a.plain_len == b.plain_len
+        && a.coded == b.coded
+        && a.coders == b.coders
         && match (&a.aes, &b.aes) {
             (None, None) => true,
             (Some(a), Some(b)) => {

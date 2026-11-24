@@ -555,6 +555,9 @@ impl GraphJob {
             };
             let mut effects = Vec::new();
             let placed = self.tree.placement(node);
+            if quiet {
+                self.refuse_unanswered(node);
+            }
             let mut placing = self.writer.placing(&mut *self.builder);
             if quiet {
                 self.tree.quiet(node, &mut placing, &mut effects);
@@ -567,7 +570,9 @@ impl GraphJob {
             if effects.is_empty() && self.tree.placement(node) == placed {
                 continue;
             }
-            quieting.changed = true;
+            if let Some(quieting) = self.quieting.as_mut() {
+                quieting.changed = true;
+            }
             let mut out = Vec::new();
             let batch = self.writer.apply_quiet(
                 &mut self.tree,

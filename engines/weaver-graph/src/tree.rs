@@ -1469,6 +1469,12 @@ impl Tree {
         }
     }
 
+    // Whether the engine's run at `node` asked for a password that no
+    // offer, nor a run started since, has answered.
+    pub fn run_asking(&self, node: NodeId) -> bool {
+        self.nodes.progress(node).asking
+    }
+
     // Every live node, the root first. A node is numbered after the node
     // it was bound in, so every parent comes before its children.
     pub fn live(&self) -> Vec<NodeId> {

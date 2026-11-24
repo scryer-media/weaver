@@ -389,6 +389,72 @@ fn a_coded_folder_that_fails_its_crc_says_what_the_engine_says() {
     assert_eq!(files.len(), 4);
 }
 
+// A coded folder compressed under AES, the end header plain. The store
+// asks nothing: no folder it streams is enciphered. Its run deciphers the
+// coded folder under the password the store was offered last, and says
+// what the 7z engine says of the whole set under the same password, for
+// the same members: with none, and with a wrong one, it asks for one, and
+// with the right one it makes them.
+#[test]
+fn a_coded_folder_under_aes_runs_as_the_engine_does_under_the_same_password() {
+    let (archive, files) = mixed_with(super::aes_lzma2(), None);
+    for password in [None, Some("not-the-passphrase"), Some(PASSWORD)] {
+        let mut owner = Owner::single(store(), archive.clone());
+        owner.whole(4096);
+        no_trouble(&owner);
+        assert!(!has(&owner, &Emit::NeedsPassword), "{password:?}");
+        for id in [0, 3] {
+            assert_eq!(owner.members[&id].bytes, files[id as usize].1);
+        }
+        let mut engine = SevenZipEngine::new();
+        if let Some(password) = password {
+            owner.offer(password);
+            Object::offer_password(&mut engine, password, &mut Vec::new());
+        }
+        let kept = envelope(&owner, &archive);
+        let coded = run(
+            owner.object.engine_mut().expect("a mixed set runs"),
+            kept.clone(),
+        );
+        assert!(kept.strays.lock().unwrap().is_empty(), "{password:?}");
+
+        let whole = Arc::new(Envelope {
+            kept: vec![ByteRange::new(0, archive.len() as u64)],
+            bytes: archive.clone(),
+            strays: Mutex::default(),
+        });
+        let said = run(&mut engine, whole);
+        let coded_member = |member: &MemberId| (1..=2).contains(&member.0);
+        let engine_said: Vec<Emit> = said
+            .into_iter()
+            .filter(|emit| match emit {
+                Emit::Member { member, .. }
+                | Emit::Checksum { member, .. }
+                | Emit::Bytes { member, .. }
+                | Emit::Retract(member)
+                | Emit::MemberClosed(member) => coded_member(member),
+                Emit::Failed(_) | Emit::Refuse(_) | Emit::NeedsPassword => true,
+                _ => false,
+            })
+            .collect();
+        assert_eq!(coded, engine_said, "{password:?}");
+        if password == Some(PASSWORD) {
+            let (out, closed) = written(&coded, files.len());
+            assert_eq!(closed, vec![MemberId(1), MemberId(2)]);
+            assert_eq!(out[1], files[1].1);
+            assert_eq!(out[2], files[2].1);
+        } else {
+            assert_eq!(coded.last(), Some(&Emit::NeedsPassword), "{password:?}");
+            assert!(
+                !coded
+                    .iter()
+                    .any(|emit| matches!(emit, Emit::MemberClosed(_))),
+                "{password:?}: {coded:?}"
+            );
+        }
+    }
+}
+
 // A header repaired into one that names a coded member otherwise, over a
 // set the store mapped and streamed: the store retracts that member alone,
 // for its run to make again, and asks for no byte again, since a coded
@@ -440,4 +506,25 @@ fn a_repaired_header_that_moves_a_coded_member_retracts_it_alone() {
     for id in [1, 2] {
         assert_eq!(out[id], files[id].1, "{}", files[id].0);
     }
+}
+
+// Two headers that differ only in a coded folder's coder: the same pack,
+// the same plaintext length, the same names, a delta filter of another
+// distance. The folder decodes otherwise, so both its members move, and
+// the stored members do not.
+#[test]
+fn a_header_that_changes_only_a_coded_folders_coder_moves_its_members() {
+    let map_of = |distance: u32| {
+        let (bytes, _) = mixed_with(vec![DeltaOptions::from_distance(distance).into()], None);
+        let archive =
+            sevenz_turbo::Archive::read(&mut Cursor::new(&bytes), &sevenz_turbo::Password::empty())
+                .unwrap();
+        super::super::map::build(&archive).expect("mapped")
+    };
+    let (before, after) = (map_of(1), map_of(2));
+    assert_eq!(before.folders[1].pack, after.folders[1].pack);
+    assert_eq!(before.folders[1].plain_len, after.folders[1].plain_len);
+    assert_ne!(before.folders[1].coders, after.folders[1].coders);
+    assert_eq!(super::super::moved(&before, &after), vec![1, 2]);
+    assert!(super::super::moved(&before, &map_of(1)).is_empty());
 }
