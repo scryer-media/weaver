@@ -6,7 +6,10 @@
 // piece is checked the first time a peer asks for it. A piece that fails
 // ends seed mode and the torrent checks every piece again; once every piece
 // passed, seed mode ends with nothing more to check (libtorrent
-// `torrent::leave_seed_mode`).
+// `torrent::leave_seed_mode`). Seed mode left on a failure serves nothing
+// until that check of every piece ends the run: libtorrent forgets every
+// piece and lets every peer go at once (`set_have_all(false)`,
+// `force_recheck`, `disconnect_all`), and here the check comes after.
 
 use std::collections::{HashMap, hash_map::Entry};
 use std::sync::Arc;
@@ -20,7 +23,7 @@ use crate::type_aliases::BF;
 
 #[derive(Debug, Default)]
 pub(crate) struct SeedMode {
-    unchecked: Mutex<Option<Unchecked>>,
+    unchecked: Mutex<Phase>,
     // The pieces a check is reading now, and where each check tells what
     // it found (libtorrent `peer_connection::fill_send_buffer` skips a
     // piece that is `verifying_piece`, peer_connection.cpp:5316, v2.0.15,
@@ -29,6 +32,28 @@ pub(crate) struct SeedMode {
 }
 
 type Verdicts = HashMap<u32, broadcast::Sender<bool>>;
+
+// Where seed mode stands.
+#[derive(Debug, Default)]
+enum Phase {
+    // Not in seed mode: every piece had is served.
+    #[default]
+    Off,
+    On(Unchecked),
+    // Left because a piece failed its check: no piece is served until the
+    // check of every piece takes the torrent over.
+    Failed,
+}
+
+// What a peer asking for a piece is answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Ask {
+    Served,
+    // In seed mode and not yet checked: it is checked first.
+    Unchecked,
+    // Seed mode was left on a failure: not served.
+    Refused,
+}
 
 // The pieces no peer's request has checked yet, while in seed mode, and
 // how many they are.
@@ -124,7 +149,11 @@ impl SeedMode {
         }
         let left = bits.count_ones();
         Self {
-            unchecked: Mutex::new((left > 0).then_some(Unchecked { bits, left })),
+            unchecked: Mutex::new(if left > 0 {
+                Phase::On(Unchecked { bits, left })
+            } else {
+                Phase::Off
+            }),
             checking: Arc::default(),
         }
     }
@@ -132,7 +161,9 @@ impl SeedMode {
     // The pieces that passed their check, while seed mode lasts.
     pub(crate) fn verified(&self) -> Option<BF> {
         let unchecked = self.unchecked.lock();
-        let unchecked = &unchecked.as_ref()?.bits;
+        let Phase::On(Unchecked { bits: unchecked, .. }) = &*unchecked else {
+            return None;
+        };
         let mut verified =
             BF::from_boxed_slice(vec![0u8; unchecked.len().div_ceil(8)].into_boxed_slice());
         for piece in unchecked.iter_zeros() {
@@ -142,17 +173,29 @@ impl SeedMode {
     }
 
     pub(crate) fn on(&self) -> bool {
-        self.unchecked.lock().is_some()
+        matches!(*self.unchecked.lock(), Phase::On(_))
+    }
+
+    // What a peer asking for `piece` is answered: served, checked first,
+    // or refused once seed mode was left on a failure.
+    pub(crate) fn ask(&self, piece: ValidPieceIndex) -> Ask {
+        match &*self.unchecked.lock() {
+            Phase::Off => Ask::Served,
+            Phase::On(Unchecked { bits, .. }) => {
+                if bits.get(piece.get() as usize).is_some_and(|bit| *bit) {
+                    Ask::Unchecked
+                } else {
+                    Ask::Served
+                }
+            }
+            Phase::Failed => Ask::Refused,
+        }
     }
 
     // Whether a peer asking for `piece` must wait for its check.
+    #[cfg(test)]
     pub(crate) fn unchecked(&self, piece: ValidPieceIndex) -> bool {
-        self.unchecked.lock().as_ref().is_some_and(|unchecked| {
-            unchecked
-                .bits
-                .get(piece.get() as usize)
-                .is_some_and(|bit| *bit)
-        })
+        self.ask(piece) == Ask::Unchecked
     }
 
     // The check of `piece` falls to the caller when none runs, and is
@@ -192,7 +235,7 @@ impl SeedMode {
     // ended with it.
     pub(crate) fn checked(&self, piece: ValidPieceIndex) -> bool {
         let mut unchecked = self.unchecked.lock();
-        let Some(Unchecked { bits, left }) = unchecked.as_mut() else {
+        let Phase::On(Unchecked { bits, left }) = &mut *unchecked else {
             return false;
         };
         if bits.replace(piece.get() as usize, false) {
@@ -201,20 +244,38 @@ impl SeedMode {
         if *left > 0 {
             return false;
         }
-        *unchecked = None;
+        *unchecked = Phase::Off;
         true
     }
 
-    // Seed mode ends. True when it was on.
+    // Seed mode ends, or the failure it was left on: the check of every
+    // piece takes the torrent over. True when seed mode was on.
     pub(crate) fn leave(&self) -> bool {
-        self.unchecked.lock().take().is_some()
+        matches!(
+            std::mem::take(&mut *self.unchecked.lock()),
+            Phase::On(_)
+        )
+    }
+
+    // A piece failed its check: seed mode is left, and no piece is served
+    // until [`Self::leave`]. True when seed mode was on, for the one that
+    // asks for the check of every piece.
+    pub(crate) fn fail(&self) -> bool {
+        let mut unchecked = self.unchecked.lock();
+        match *unchecked {
+            Phase::On(_) => {
+                *unchecked = Phase::Failed;
+                true
+            }
+            Phase::Off | Phase::Failed => false,
+        }
     }
 
     // `f` while seed mode lasts, which it lasts through; None once it
     // ended. Every request of a peer waits on `f`, so it does no disk work.
     pub(crate) fn while_on<T>(&self, f: impl FnOnce() -> T) -> Option<T> {
         let unchecked = self.unchecked.lock();
-        unchecked.is_some().then(f)
+        matches!(*unchecked, Phase::On(_)).then(f)
     }
 }
 
@@ -281,6 +342,36 @@ mod tests {
         assert!(seed.checked(piece(*last)));
         assert!(!seed.on());
         assert!(!seed.checked(piece(*last)));
+    }
+
+    // Seed mode left on a failure refuses every piece, checked or not, and
+    // is no longer seed mode; the check of every piece that takes the
+    // torrent over ends the refusal. Left without a failure, every piece is
+    // served.
+    #[test]
+    fn seed_mode_left_on_a_failure_refuses_every_piece_until_left() {
+        let lengths = Lengths::new(8 * 1024, 1024).unwrap();
+        let piece = |index| lengths.validate_piece_index(index).unwrap();
+        let seed = SeedMode::over(8, Some(&bits(8, &[0])));
+        assert_eq!(seed.ask(piece(0)), Ask::Served);
+        assert_eq!(seed.ask(piece(1)), Ask::Unchecked);
+        assert!(seed.fail());
+        assert!(!seed.fail(), "one failure asks for the check of every piece");
+        assert!(!seed.on());
+        assert_eq!(seed.verified(), None);
+        assert_eq!(seed.while_on(|| ()), None);
+        for index in 0..8 {
+            assert_eq!(seed.ask(piece(index)), Ask::Refused, "{index}");
+        }
+        assert!(!seed.checked(piece(2)));
+        assert_eq!(seed.ask(piece(2)), Ask::Refused);
+        assert!(!seed.leave());
+        assert_eq!(seed.ask(piece(1)), Ask::Served);
+
+        let left = SeedMode::over(8, None);
+        assert!(left.leave());
+        assert!(!left.fail());
+        assert_eq!(left.ask(piece(1)), Ask::Served);
     }
 
     // One check of a piece runs at a time: who asks meanwhile waits and

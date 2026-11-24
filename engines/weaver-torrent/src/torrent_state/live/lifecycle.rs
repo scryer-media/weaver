@@ -299,11 +299,13 @@ impl TorrentStateLive {
     // peer_connection.cpp:5316, v2.0.15). The wait here blocks its thread,
     // for a permit as for another's check: called off the async runtime.
     pub(crate) fn check_seeded(&self, piece: ValidPieceIndex) -> anyhow::Result<bool> {
-        use crate::torrent_state::seed_mode::Claim;
+        use crate::torrent_state::seed_mode::{Ask, Claim};
         let seed = &self.shared.options.seed;
         loop {
-            if !seed.unchecked(piece) {
-                return Ok(true);
+            match seed.ask(piece) {
+                Ask::Served => return Ok(true),
+                Ask::Refused => return Ok(false),
+                Ask::Unchecked => {}
             }
             match seed.claim(piece) {
                 Claim::Check(checking) => {
@@ -344,11 +346,13 @@ impl TorrentStateLive {
         self: &Arc<Self>,
         piece: ValidPieceIndex,
     ) -> anyhow::Result<bool> {
-        use crate::torrent_state::seed_mode::Claim;
+        use crate::torrent_state::seed_mode::{Ask, Claim};
         let seed = &self.shared.options.seed;
         loop {
-            if !seed.unchecked(piece) {
-                return Ok(true);
+            match seed.ask(piece) {
+                Ask::Served => return Ok(true),
+                Ask::Refused => return Ok(false),
+                Ask::Unchecked => {}
             }
             match seed.claim(piece) {
                 Claim::Check(checking) => {
@@ -395,10 +399,18 @@ impl TorrentStateLive {
     // on its claim nothing (libtorrent's stop job fences every disk job of
     // the storage, the seed-mode hash job among them,
     // `mmap_disk_io::async_stop_torrent`, mmap_disk_io.cpp:980, v2.0.15).
+    //
+    // A piece that fails leaves seed mode on a failure: from then on the
+    // run serves no piece, one that passes meanwhile included, until the
+    // check of every piece ends it (libtorrent lets every peer go at once,
+    // `torrent::force_recheck` from `torrent::leave_seed_mode`).
     fn check_unchecked(&self, piece: ValidPieceIndex) -> anyhow::Result<bool> {
+        use crate::torrent_state::seed_mode::Ask;
         let seed = &self.shared.options.seed;
-        if !seed.unchecked(piece) {
-            return Ok(true);
+        match seed.ask(piece) {
+            Ask::Served => return Ok(true),
+            Ask::Refused => return Ok(false),
+            Ask::Unchecked => {}
         }
         let Some(_turn) = self.storage_turn() else {
             anyhow::bail!("the run ended before the seed-mode check of piece {piece} began");
@@ -413,9 +425,9 @@ impl TorrentStateLive {
             if seed.checked(piece) {
                 debug!("every piece passed its check: seed mode ends");
             }
-            return Ok(true);
+            return Ok(seed.ask(piece) != Ask::Refused);
         }
-        if seed.leave() {
+        if seed.fail() {
             warn!(%piece, "a piece failed its check in seed mode: checking every piece");
             self.recheck_detached();
         }
