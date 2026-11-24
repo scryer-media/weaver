@@ -1202,18 +1202,28 @@ impl NamespaceWriter {
     // The bytes every object keeps in its envelopes, over every volume.
     #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
     pub(crate) fn kept_bytes(&self) -> u64 {
-        self.envelopes
-            .nodes()
-            .filter_map(|node| self.envelopes.shelf_of(node))
-            .map(|shelf| {
-                let state = shelf.lock();
-                state
-                    .kept
-                    .values()
-                    .map(|kept| kept.coverage.bytes_covered())
-                    .sum::<u64>()
-            })
-            .sum()
+        self.kept_by_node().map(|(_, kept, _)| kept).sum()
+    }
+
+    // The bytes each object keeps in its envelopes, over every volume, and
+    // the files they lie in, by node.
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
+    pub(crate) fn kept_by_node(&self) -> impl Iterator<Item = (NodeId, u64, Vec<PathBuf>)> + '_ {
+        self.envelopes.nodes().filter_map(|node| {
+            let shelf = self.envelopes.shelf_of(node)?;
+            let state = shelf.lock();
+            let kept = state
+                .kept
+                .values()
+                .map(|kept| kept.coverage.bytes_covered())
+                .sum::<u64>();
+            let files = state
+                .kept
+                .values()
+                .map(|kept| kept.path().to_path_buf())
+                .collect();
+            Some((node, kept, files))
+        })
     }
 
     // Why the member is a leaf, when an object or the holds budgets refused

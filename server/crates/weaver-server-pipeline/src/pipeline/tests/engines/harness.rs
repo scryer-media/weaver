@@ -1132,6 +1132,11 @@ pub struct GraphView {
     // The most every object's envelopes kept at any look, over every
     // volume: the bytes the job wrote for its runs to read.
     pub shelved: u64,
+    // The most each object's envelopes kept at any look, by node, with the
+    // kind of object it was.
+    pub shelved_by: BTreeMap<weaver_graph::NodeId, (String, u64)>,
+    // Every file each object's envelopes lay in at any look, by node.
+    pub shelf_files: BTreeMap<weaver_graph::NodeId, BTreeSet<std::path::PathBuf>>,
     // The time the looks themselves took, which a run's time is not.
     pub observed: std::time::Duration,
     // What the job's report showed at each look, its status and whether it
@@ -2058,6 +2063,15 @@ pub(in crate::pipeline::tests) fn observe(
     view.offered = job.passwords_offered();
     view.scratch = view.scratch.max(tree_bytes(&state.working_dir));
     view.shelved = view.shelved.max(job.writer().kept_bytes());
+    for (node, kept, files) in job.writer().kept_by_node() {
+        let kind = tree
+            .kind(node)
+            .map(|kind| kind.to_string())
+            .unwrap_or_default();
+        let entry = view.shelved_by.entry(node).or_insert((kind, 0));
+        entry.1 = entry.1.max(kept);
+        view.shelf_files.entry(node).or_default().extend(files);
+    }
     view.checkpoints = job.pending().tally();
     view.delivery = pipeline.graph_delivery(JOB).unwrap_or_default();
     view.health = pipeline.graph_failure_is_health(JOB);

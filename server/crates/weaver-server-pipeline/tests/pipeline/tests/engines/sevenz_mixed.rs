@@ -186,6 +186,42 @@ fn assert_runs_made_only_coded(spoken: &Spoken) -> BTreeSet<u64> {
     generations
 }
 
+// The 7z store kept a shelf on disk during the job, and no file of it is
+// left once the job ended: neither among what it delivered nor among what
+// a failed job keeps in its folder.
+fn assert_shelf_gone(graph: &Outcome) {
+    let shelves: Vec<String> = graph
+        .graph()
+        .shelf_files
+        .iter()
+        .filter(|(node, _)| {
+            graph
+                .graph()
+                .shelved_by
+                .get(node)
+                .is_some_and(|(kind, _)| kind == "sevenz_store")
+        })
+        .flat_map(|(_, files)| files)
+        .map(|path| {
+            let name = path.file_name().unwrap().to_string_lossy();
+            format!("{}/{name}", weaver_graph::names::INTERNAL_DIR)
+        })
+        .collect();
+    assert!(!shelves.is_empty(), "the store kept a shelf");
+    for shelf in &shelves {
+        assert!(
+            !graph
+                .files
+                .keys()
+                .chain(graph.retained_files.keys())
+                .any(|name| name.ends_with(shelf.as_str())),
+            "{shelf} left: {:?} {:?}",
+            graph.files.keys(),
+            graph.retained_files.keys()
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_mixed_7z_streams_its_stored_members_and_shelves_only_the_rest() {
     let (archive, files) = mixed(MKV, lzma2());
@@ -202,6 +238,7 @@ async fn a_mixed_7z_streams_its_stored_members_and_shelves_only_the_rest() {
         archive.len() as u64 - stored_bytes(&files),
         "the shelf keeps the headers and the coded pack, no stored byte"
     );
+    assert_shelf_gone(&graph);
 }
 
 // A byte of the coded pack wrong in the post itself, under a PAR2 set over
@@ -405,6 +442,7 @@ async fn a_coded_pack_beyond_repair_with_no_usable_stored_member_fails() {
         graph.files.keys()
     );
     assert_demoted(&graph, "unrepairable");
+    assert_shelf_gone(&graph);
 }
 
 // Taken down and restored after every article: the map, the shelf and the
@@ -476,6 +514,7 @@ async fn a_coded_folder_no_decode_pool_holds_with_no_usable_stored_member_fails_
         error.starts_with("lantern.7z needs ") && error.contains(" of decode memory, "),
         "{error}"
     );
+    assert_shelf_gone(&graph);
 }
 
 // The stored folders under AES, the coded folder plain, the end header
@@ -665,13 +704,6 @@ mod nested {
             (copy(), vec![files[0].clone()]),
             (lzma2(), vec![files[1].clone()]),
         ]);
-        // What the zip keeps of itself, beside a member that is no archive.
-        let bare = run(&Scenario::new(vec![Post::plain(
-            "Ember.zip",
-            zip_of(stored_zip(), &[("lantern.bin", archive.clone())]),
-        )]))
-        .await;
-        assert!(bare.completed(), "{:?}", bare.failure);
         let outer = zip_of(stored_zip(), &[("lantern.7z", archive.clone())]);
         let (scenario, heard) = heard(Scenario::new(vec![Post::plain("Ember.zip", outer)]));
         let graph = run(&scenario).await;
@@ -692,14 +724,18 @@ mod nested {
         let ran = generations(&heard);
         assert_eq!(ran.len(), 1, "{ran:?}");
         // The 7z's shelf keeps its headers and the coded pack, no stored byte.
-        // The shelf is read at its peak over the job, so the zip's own keep
-        // and the 7z's cannot be told apart byte for byte; a 7z that kept
-        // its stored member would add the whole member to it.
-        assert!(
-            graph.graph().shelved < bare.graph().shelved + files[0].1.len() as u64 / 2,
-            "{} kept beside {} for the zip alone",
-            graph.graph().shelved,
-            bare.graph().shelved
+        let sevenz: Vec<u64> = graph
+            .graph()
+            .shelved_by
+            .values()
+            .filter(|(kind, _)| kind == "sevenz_store")
+            .map(|(_, kept)| *kept)
+            .collect();
+        assert_eq!(
+            sevenz,
+            vec![archive.len() as u64 - files[0].1.len() as u64],
+            "{:?}",
+            graph.graph().shelved_by
         );
     }
 
