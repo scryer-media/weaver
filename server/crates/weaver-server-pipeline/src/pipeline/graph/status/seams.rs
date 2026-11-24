@@ -9,7 +9,7 @@ use crate::jobs::queries::JobsQueries;
 use tracing::{debug, info, warn};
 use weaver_graph::recovery::{RepairOutcome, SetRuling};
 use weaver_graph::slots::AskerId;
-use weaver_graph::{MemberId, NodeId};
+use weaver_graph::{MemberId, NodeId, Why};
 
 use super::claims::{self, Claim, ClaimedMember, Described};
 use super::{
@@ -465,7 +465,21 @@ pub fn delivery_of(job: &GraphJob, posted: Posted<'_>) -> (Delivery, Option<Fail
             payload,
             |name| par2_damage_ignorable(name, ignore),
             described,
-            |node, member| job.writer().refused(node, member),
+            // A container withheld as never placing every member it named,
+            // whose object's run refused to make the members it makes, is
+            // withheld for what the run said.
+            |node, member| {
+                let refused = job.writer().refused(node, member);
+                match refused.or_else(|| job.tree().withholds(node, member)) {
+                    None | Some(Why::Unmapped) => job
+                        .tree()
+                        .refused_by(node, member)
+                        .and_then(|object| job.writer().run_refused(object))
+                        .filter(|why| why.withholds())
+                        .or(refused),
+                    _ => refused,
+                }
+            },
             // Read by the name the member is delivered under, so a file a
             // recovery set renamed to what it is counts as that. A piece is
             // no usable file at any depth: a joined split or an archive an

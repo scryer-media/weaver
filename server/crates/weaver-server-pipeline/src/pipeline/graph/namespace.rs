@@ -496,6 +496,11 @@ pub struct NamespaceWriter {
     // back (true), or the namespace whose members nothing held (false). One
     // archive is one event however many volumes it had.
     given_up: BTreeSet<(NodeId, bool)>,
+    // Why the run of each object that places members itself last refused
+    // to make the members it makes, until a run of it starts again: what
+    // its container is withheld for (`run_refused`). One reason per such
+    // object of the job, kept as long as the job.
+    run_refusals: BTreeMap<NodeId, Why>,
     // What a repair or a staging that failed gave back to the disk as it
     // failed, until the job asks: the room it needs to run again.
     gave_back: Option<u64>,
@@ -652,6 +657,7 @@ impl NamespaceWriter {
             retracted: Vec::new(),
             unkept: Vec::new(),
             given_up: BTreeSet::new(),
+            run_refusals: BTreeMap::new(),
             gave_back: None,
             left_to_write: None,
             spills_said: BTreeSet::new(),
@@ -1214,6 +1220,13 @@ impl NamespaceWriter {
     // to own it.
     pub fn refused(&self, node: NodeId, member: MemberId) -> Option<Why> {
         self.files.get(&node)?.refused.get(&member).copied()
+    }
+
+    // Why the run of the object at `node`, which places members itself,
+    // refused to make the members it makes, while no run of it started
+    // since.
+    pub fn run_refused(&self, node: NodeId) -> Option<Why> {
+        self.run_refusals.get(&node).copied()
     }
 
     // Whether the file system refused the member's name, so no file of it
@@ -4454,13 +4467,12 @@ impl NamespaceWriter {
         );
     }
 
-    // The member is a leaf because something gave it back or never took
-    // it. Said once, when the reason is new. When `given_up`, the archive it
-    // belonged to is noted for the job's events, once per archive.
     // The run of an object that places members itself was refused, or
     // refused to go on: the members it makes and did not close are refused
     // for that reason, as an object's members are, so what is delivered says
-    // why they are not there. The object and what it placed stand.
+    // why they are not there. The archive is noted for the job's events with
+    // that reason, once per archive, as one given up is; the object and what
+    // it placed stand.
     pub(crate) fn refuse_made(
         &mut self,
         tree: &Tree,
@@ -4468,13 +4480,26 @@ impl NamespaceWriter {
         made: &BTreeSet<MemberId>,
         why: Why,
     ) {
-        for member in Self::made_open(tree, node, made) {
+        let open = Self::made_open(tree, node, made);
+        for &member in &open {
             self.refuse(tree, node, member, why, false);
+        }
+        self.run_refusals.insert(node, why);
+        if !open.is_empty() && why.gives_back() && self.given_up.insert((node, true)) {
+            self.given_back.push(GivenBack {
+                member: archive_name(tree, node),
+                container: tree
+                    .kind(node)
+                    .map(|kind| kind.to_string())
+                    .unwrap_or_default(),
+                why,
+            });
         }
     }
 
     // A new run makes them again: why the last one did not is forgotten.
     pub(crate) fn unrefuse_made(&mut self, tree: &Tree, node: NodeId, made: &BTreeSet<MemberId>) {
+        self.run_refusals.remove(&node);
         for member in Self::made_open(tree, node, made) {
             self.files_mut(node).unrefuse(member);
         }
@@ -4492,6 +4517,9 @@ impl NamespaceWriter {
             .collect()
     }
 
+    // The member is a leaf because something gave it back or never took
+    // it. Said once, when the reason is new. When `given_up`, the archive it
+    // belonged to is noted for the job's events, once per archive.
     fn refuse(&mut self, tree: &Tree, node: NodeId, member: MemberId, why: Why, given_up: bool) {
         // Said before: an engine handed the member gives it back for the
         // reason it was handed over for.
@@ -5217,6 +5245,17 @@ pub const ALL: ByteRange = ByteRange {
 pub const READ_BACK: u64 = 1 << 20;
 
 // The name a member of the namespace carries now.
+// The archive the object at `node` reads, as the namespace it is bound in
+// names its first volume.
+pub(crate) fn archive_name(tree: &Tree, node: NodeId) -> String {
+    tree.volumes(node)
+        .and_then(|(parent, volumes)| {
+            let member = volumes.values().next()?;
+            Some(tree.namespace(parent)?.get(*member)?.name.clone())
+        })
+        .unwrap_or_default()
+}
+
 fn member_name(tree: &Tree, node: NodeId, member: MemberId) -> String {
     tree.namespace(node)
         .and_then(|namespace| namespace.get(member))

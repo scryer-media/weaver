@@ -14,7 +14,7 @@ use weaver_graph::{Emit, Engine, MemberId, NodeId, VolumeIndex, Why};
 
 use super::{GraphError, GraphJob};
 use crate::pipeline::graph::engine::{Heard, Made, Reservation, Said};
-use crate::pipeline::graph::namespace::{Coming, Returned, Tailed, WriteError};
+use crate::pipeline::graph::namespace::{Coming, Returned, Tailed, WriteError, archive_name};
 use crate::pipeline::graph::status::RepairSlots;
 
 // Words for a job no one is left to hear: the staged output a repair, a
@@ -425,7 +425,7 @@ impl GraphJob {
                     job_id = self.runs.scope(),
                     node = node.0,
                     kind = %self.tree.kind(node).map(|kind| kind.to_string()).unwrap_or_default(),
-                    archive = %self.archive_name(node),
+                    archive = %archive_name(&self.tree, node),
                     error = %error,
                     "extraction failed"
                 );
@@ -813,19 +813,6 @@ impl GraphJob {
             self.runs.start(node, extraction, shelf);
         }
         Ok(Vec::new())
-    }
-
-    // The archive the object at `node` reads, as the namespace it is bound
-    // in names its first volume.
-    fn archive_name(&self, node: NodeId) -> String {
-        self.tree
-            .volumes(node)
-            .and_then(|(parent, volumes)| {
-                let member = volumes.values().next()?;
-                let namespace = self.tree.namespace(parent)?;
-                Some(namespace.get(*member)?.name.clone())
-            })
-            .unwrap_or_default()
     }
 
     // Everything the run built was built on bytes a repair replaced, at a

@@ -243,6 +243,66 @@ async fn a_coded_pack_repaired_by_par2_after_its_run_read_it_restarts_the_run_al
     );
 }
 
+// A header posted naming a stored and a coded member otherwise, under a
+// PAR2 set over the archive as it should be: the store maps and streams
+// under the posted header, and its run decodes the coded folder under it.
+// The recovery volume is held until nothing moves, so that run ends first.
+// The repair rewrites the header; the new map moves both members together.
+// Every file ends byte-equal under the repaired names, and the run that
+// made the coded members started after the new map was installed.
+#[tokio::test]
+async fn a_repaired_header_moving_stored_and_coded_members_together_delivers_every_file() {
+    let (before, _) = mixed(
+        ["ember.mkv", "quill.mkv", "cinder.nfo", "lumen.mkv"],
+        delta(),
+    );
+    let (after, files) = mixed(
+        ["embex.mkv", "quill.mkv", "cindex.nfo", "lumen.mkv"],
+        delta(),
+    );
+    assert_eq!(
+        before.len(),
+        after.len(),
+        "the names change, not the layout"
+    );
+    let mut posts = with_par2(&after);
+    posts[0].bytes = before;
+    let (scenario, spoken) = hearing(Scenario::new(posts));
+    let held = run_holding(&scenario, 2).await;
+    assert_eq!(held.status, Some(JobStatus::Complete));
+    let mut names: Vec<String> = files.iter().map(|(name, _)| delivered(name)).collect();
+    names.sort();
+    assert_eq!(held.files.keys().cloned().collect::<Vec<_>>(), names);
+    for (name, bytes) in &files {
+        assert!(held.files[&delivered(name)] == *bytes, "{name} bytes");
+    }
+    // The run under the posted header named the coded members as it
+    // decoded them; the one under the repaired header made them again.
+    let generations = assert_runs_made_only_coded(&spoken);
+    assert!(
+        generations.len() >= 2,
+        "a run started after the repaired map: {generations:?}"
+    );
+    let last = *generations.last().unwrap();
+    let closed: BTreeSet<u32> = spoken
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(generation, message)| *generation == last && message.contains("Close"))
+        .flat_map(|(_, message)| {
+            CODED
+                .into_iter()
+                .filter(move |id| message.contains(&format!("MemberId({id})")))
+        })
+        .collect();
+    assert_eq!(
+        closed,
+        BTreeSet::from(CODED),
+        "the last run closed the coded members: {:?}",
+        spoken.lock().unwrap()
+    );
+}
+
 // An article of the stored member lost, under a PAR2 set: the repair
 // rebuilds it and the store replays it through its map. The coded members
 // come out of their run whole.
@@ -287,6 +347,39 @@ async fn coded_pack_lost(names: [&'static str; 4]) -> (Outcome, Files) {
     (graph, files)
 }
 
+// The archives the job's events said were given up on, each with why.
+fn demoted(graph: &Outcome) -> Vec<(String, String, String)> {
+    use weaver_server_base::events::model::PipelineEvent;
+    graph
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            PipelineEvent::ArchiveDemoted {
+                member,
+                container,
+                reason,
+                ..
+            } => Some((member.clone(), container.clone(), reason.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+// The run's refusal names the archive once, with why its coded members
+// could not be made; the container stands as it did.
+fn assert_demoted(graph: &Outcome, reason: &str) {
+    assert_eq!(
+        demoted(graph),
+        vec![(
+            "lantern.7z".to_owned(),
+            "sevenz_store".to_owned(),
+            reason.to_owned()
+        )],
+        "{:?}",
+        graph.events
+    );
+}
+
 #[tokio::test]
 async fn a_coded_pack_beyond_repair_delivers_the_stored_members_partial() {
     let (graph, _) = coded_pack_lost(MKV).await;
@@ -297,6 +390,7 @@ async fn a_coded_pack_beyond_repair_delivers_the_stored_members_partial() {
         graph.failure,
         graph.files.keys()
     );
+    assert_demoted(&graph, "unrepairable");
 }
 
 // The same with nothing usable stored: whole `.bin` files alone are no
@@ -310,6 +404,7 @@ async fn a_coded_pack_beyond_repair_with_no_usable_stored_member_fails() {
         graph.status,
         graph.files.keys()
     );
+    assert_demoted(&graph, "unrepairable");
 }
 
 // Taken down and restored after every article: the map, the shelf and the
@@ -323,16 +418,40 @@ async fn a_mixed_7z_restarted_after_every_article_delivers_its_members() {
 
 // No decode pool can hold the coded folder's run: its reservation is
 // refused before it starts. The run ends where it stands and is not asked
-// again, the stored members are delivered, and the job ends Partial.
-#[tokio::test]
-async fn a_coded_folder_no_decode_pool_holds_ends_partial_beside_the_stored_members() {
+// again, and the stored members are delivered. The archive is withheld for
+// what the run's reservation said, not as a set that never placed what it
+// named, and the job's events say so.
+async fn no_decode_pool(names: [&'static str; 4]) -> (Outcome, Files) {
+    use weaver_graph::Why;
     use weaver_server_pipeline::pipeline::graph::engine::{DecodePool, RUN_OVERHEAD};
-    let (archive, files) = mixed(MKV, lzma2());
+    let (archive, files) = mixed(names, lzma2());
     let (scenario, spoken) = hearing(
         Scenario::new(vec![Post::plain("lantern.7z", archive)])
             .setup(|pipeline| pipeline.graph_decode = Arc::new(DecodePool::new(RUN_OVERHEAD - 1))),
     );
     let graph = run(&scenario).await;
+    // No run emitted: its reservation was refused before it started, and
+    // it was not asked again.
+    assert_eq!(named(&spoken), Default::default(), "no run emitted");
+    // The coded members are not delivered, and the job ends.
+    for (name, _) in [&files[1], &files[2]] {
+        assert!(!graph.files.contains_key(&delivered(name)), "{name}");
+    }
+    let withheld = &graph.graph().delivery.withheld;
+    assert!(
+        matches!(
+            withheld.as_slice(),
+            [(name, Why::TooLarge { needed: Some(_), allowed: Some(_) })] if name == "lantern.7z"
+        ),
+        "{withheld:?}"
+    );
+    assert_demoted(&graph, "too_large");
+    (graph, files)
+}
+
+#[tokio::test]
+async fn a_coded_folder_no_decode_pool_holds_ends_partial_beside_the_stored_members() {
+    let (graph, files) = no_decode_pool(MKV).await;
     assert_eq!(
         graph.status,
         Some(JobStatus::Partial),
@@ -343,13 +462,20 @@ async fn a_coded_folder_no_decode_pool_holds_ends_partial_beside_the_stored_memb
     for (name, bytes) in [&files[0], &files[3]] {
         assert!(graph.files.get(&delivered(name)) == Some(bytes), "{name}");
     }
-    // No run emitted: its reservation was refused before it started, and
-    // it was not asked again.
-    assert_eq!(named(&spoken), Default::default(), "no run emitted");
-    // The coded members are not delivered, and the job ends.
-    for (name, _) in [&files[1], &files[2]] {
-        assert!(!graph.files.contains_key(&delivered(name)), "{name}");
-    }
+}
+
+// The same with nothing usable stored: the job fails, and its reason names
+// the archive and the decode memory its run needed.
+#[tokio::test]
+async fn a_coded_folder_no_decode_pool_holds_with_no_usable_stored_member_fails_for_its_memory() {
+    let (graph, _) = no_decode_pool(BIN).await;
+    let Some(JobStatus::Failed { error }) = &graph.status else {
+        panic!("{:?}", graph.status);
+    };
+    assert!(
+        error.starts_with("lantern.7z needs ") && error.contains(" of decode memory, "),
+        "{error}"
+    );
 }
 
 // The stored folders under AES, the coded folder plain, the end header
