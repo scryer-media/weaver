@@ -652,13 +652,14 @@ impl TorrentService {
                 })
             })
         };
-        let (store, notes) = making
-            .await
-            .map_err(|error| error.to_string())?
-            .map_err(|unmade| match unmade {
-                Unmade::Fails(error) => error,
-                Unmade::Waits(never) => match never {},
-            })?;
+        let (store, notes) =
+            making
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|unmade| match unmade {
+                    Unmade::Fails(error) => error,
+                    Unmade::Waits(never) => match never {},
+                })?;
         for note in &notes {
             note.say(job_id);
         }

@@ -4653,7 +4653,11 @@ async fn a_lookup_through_a_proxy_gone_quiet_is_the_hops_once_it_is_not_known_al
     let turns = Arc::new(Turns::default());
     let http = naming_through_itself(stage.clone(), turns.clone());
     let ladder = Fallback::new(vec![http.clone()]);
-    assert!(http.dial(&target("192.0.2.9:119".parse().unwrap())).await.is_ok());
+    assert!(
+        http.dial(&target("192.0.2.9:119".parse().unwrap()))
+            .await
+            .is_ok()
+    );
     assert_eq!(turns.taken(), vec![None]);
     *stage.reply.lock().unwrap() = b"";
 

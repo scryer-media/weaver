@@ -289,27 +289,129 @@ mod tests {
         // (levels, the rule sets a goal, mode All, value, level)
         let cases = [
             // The torrent's own value or off decides outright, with no floor.
-            (levels(Set(1), Set(2), Set(3), Set(4)), true, false, Some(1), Level::Torrent),
-            (levels(Off, Set(2), Set(3), Set(4)), true, true, None, Level::Torrent),
+            (
+                levels(Set(1), Set(2), Set(3), Set(4)),
+                true,
+                false,
+                Some(1),
+                Level::Torrent,
+            ),
+            (
+                levels(Off, Set(2), Set(3), Set(4)),
+                true,
+                true,
+                None,
+                Level::Torrent,
+            ),
             // A goal the rule sets is the larger of its own and the one below.
-            (levels(Inherit, Set(2), Inherit, Set(1)), true, false, Some(2), Level::TrackerRule),
-            (levels(Inherit, Set(2), Set(3), Set(1)), true, false, Some(3), Level::Category),
-            (levels(Inherit, Set(2), Inherit, Set(4)), true, false, Some(4), Level::Global),
-            (levels(Inherit, Set(2), Off, Set(4)), true, false, Some(2), Level::TrackerRule),
-            (levels(Inherit, Set(2), Set(2), Off), true, true, Some(2), Level::TrackerRule),
+            (
+                levels(Inherit, Set(2), Inherit, Set(1)),
+                true,
+                false,
+                Some(2),
+                Level::TrackerRule,
+            ),
+            (
+                levels(Inherit, Set(2), Set(3), Set(1)),
+                true,
+                false,
+                Some(3),
+                Level::Category,
+            ),
+            (
+                levels(Inherit, Set(2), Inherit, Set(4)),
+                true,
+                false,
+                Some(4),
+                Level::Global,
+            ),
+            (
+                levels(Inherit, Set(2), Off, Set(4)),
+                true,
+                false,
+                Some(2),
+                Level::TrackerRule,
+            ),
+            (
+                levels(Inherit, Set(2), Set(2), Off),
+                true,
+                true,
+                Some(2),
+                Level::TrackerRule,
+            ),
             // One it leaves to inherit adds a requirement under All only.
-            (levels(Inherit, Inherit, Set(3), Set(4)), true, true, Some(3), Level::Category),
-            (levels(Inherit, Inherit, Inherit, Set(4)), true, true, Some(4), Level::Global),
-            (levels(Inherit, Inherit, Set(3), Set(4)), true, false, None, Level::TrackerRule),
-            (levels(Inherit, Inherit, Inherit, Set(4)), true, false, None, Level::TrackerRule),
+            (
+                levels(Inherit, Inherit, Set(3), Set(4)),
+                true,
+                true,
+                Some(3),
+                Level::Category,
+            ),
+            (
+                levels(Inherit, Inherit, Inherit, Set(4)),
+                true,
+                true,
+                Some(4),
+                Level::Global,
+            ),
+            (
+                levels(Inherit, Inherit, Set(3), Set(4)),
+                true,
+                false,
+                None,
+                Level::TrackerRule,
+            ),
+            (
+                levels(Inherit, Inherit, Inherit, Set(4)),
+                true,
+                false,
+                None,
+                Level::TrackerRule,
+            ),
             // One it turns off stays off.
-            (levels(Inherit, Off, Set(3), Set(4)), true, true, None, Level::TrackerRule),
-            (levels(Inherit, Off, Set(3), Set(4)), true, false, None, Level::TrackerRule),
+            (
+                levels(Inherit, Off, Set(3), Set(4)),
+                true,
+                true,
+                None,
+                Level::TrackerRule,
+            ),
+            (
+                levels(Inherit, Off, Set(3), Set(4)),
+                true,
+                false,
+                None,
+                Level::TrackerRule,
+            ),
             // A rule that sets no goal inherits plainly.
-            (levels(Inherit, Inherit, Set(3), Set(4)), false, false, Some(3), Level::Category),
-            (levels(Inherit, Inherit, Inherit, Set(4)), false, false, Some(4), Level::Global),
-            (levels(Inherit, Off, Set(3), Set(4)), false, false, None, Level::TrackerRule),
-            (levels(Inherit, Inherit, Inherit, Off), false, true, None, Level::Global),
+            (
+                levels(Inherit, Inherit, Set(3), Set(4)),
+                false,
+                false,
+                Some(3),
+                Level::Category,
+            ),
+            (
+                levels(Inherit, Inherit, Inherit, Set(4)),
+                false,
+                false,
+                Some(4),
+                Level::Global,
+            ),
+            (
+                levels(Inherit, Off, Set(3), Set(4)),
+                false,
+                false,
+                None,
+                Level::TrackerRule,
+            ),
+            (
+                levels(Inherit, Inherit, Inherit, Off),
+                false,
+                true,
+                None,
+                Level::Global,
+            ),
         ];
         for (levels, rule_sets_goal, all, value, level) in cases {
             assert_eq!(
@@ -365,25 +467,51 @@ mod tests {
             // No goal anywhere: Any, at the global level.
             (at(None, None, None, None), (Any, Level::Global)),
             (
-                at(None, policy(Inherit, Set(All)), None, policy(Inherit, Set(All))),
+                at(
+                    None,
+                    policy(Inherit, Set(All)),
+                    None,
+                    policy(Inherit, Set(All)),
+                ),
                 (Any, Level::Global),
             ),
             // The global level's own mode, set or kept as inherited.
-            (at(None, None, None, policy(Set(1.0), Set(All))), (All, Level::Global)),
-            (at(None, None, None, policy(Set(1.0), Inherit)), (Any, Level::Global)),
+            (
+                at(None, None, None, policy(Set(1.0), Set(All))),
+                (All, Level::Global),
+            ),
+            (
+                at(None, None, None, policy(Set(1.0), Inherit)),
+                (Any, Level::Global),
+            ),
             // A rule with a goal holds its own mode; the global All does
             // not reach it.
             (
-                at(None, policy(Set(2.0), Inherit), None, policy(Set(1.0), Set(All))),
+                at(
+                    None,
+                    policy(Set(2.0), Inherit),
+                    None,
+                    policy(Set(1.0), Set(All)),
+                ),
                 (Any, Level::TrackerRule),
             ),
             (
-                at(None, policy(Set(2.0), Set(All)), None, policy(Set(1.0), Inherit)),
+                at(
+                    None,
+                    policy(Set(2.0), Set(All)),
+                    None,
+                    policy(Set(1.0), Inherit),
+                ),
                 (All, Level::TrackerRule),
             ),
             // A rule with a mode and no goal gives no mode.
             (
-                at(None, policy(Inherit, Set(All)), policy(Set(3.0), Inherit), None),
+                at(
+                    None,
+                    policy(Inherit, Set(All)),
+                    policy(Set(3.0), Inherit),
+                    None,
+                ),
                 (Any, Level::Category),
             ),
             // A goal switched off is no goal value.

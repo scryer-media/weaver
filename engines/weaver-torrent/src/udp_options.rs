@@ -599,14 +599,7 @@ mod sys {
         let value = value.to_ne_bytes();
         // SAFETY: the socket is open for as long as `socket` is borrowed, and
         // the option takes an int, which `value` holds.
-        let done = unsafe {
-            setsockopt(
-                handle(socket)?,
-                level,
-                name,
-                Some(&value),
-            )
-        };
+        let done = unsafe { setsockopt(handle(socket)?, level, name, Some(&value)) };
         if done == 0 { Ok(()) } else { Err(last_error()) }
     }
 
