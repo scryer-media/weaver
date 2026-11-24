@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use weaver_server_core::proxies::ProxiesDnsPersistenceQueries;
+use weaver_server_core::proxies::ProxiesNetworkPersistenceQueries;
+use weaver_server_core::proxies::ProxiesPersistenceQueries;
+use weaver_server_core::rss::RssQueries;
 mod common;
 use common::{TestHarness, assert_has_errors, assert_no_errors, response_data};
 use weaver_server_api::auth::CallerScope;
@@ -147,7 +151,7 @@ fn refusal(response: &async_graphql::Response) -> (String, String, serde_json::V
 
 // A feed to route, and a proxy to route it through.
 async fn feed_and_proxy(h: &TestHarness) -> (u64, u64) {
-    let result = h.execute(r#"mutation{saveProxyProfile(input:{name:"Gateway",kind:SOCKS5,resolver:PROXY,enabled:false,host:"127.0.0.1",port:1080,dnsServers:["192.0.2.53"]}){id}}"#).await;
+    let result = h.execute(r#"mutation{saveProxyProfile(input:{name:"Gateway",kind:SOCKS5,enabled:false,host:"127.0.0.1",port:1080}){id}}"#).await;
     assert_no_errors(&result);
     let proxy = response_data(&result)["saveProxyProfile"]["id"]
         .as_u64()
@@ -240,9 +244,12 @@ async fn egress_and_pool_refusals_carry_their_codes() {
             "EGRESS_SOURCE_ADDRESS_REQUIRED",
         ),
         (
-            r#"createEgressInterface(input:{name:"Quota",bindingKind:SOURCE_ADDRESS,sourceAddress:"127.0.0.1",downloadQuota:{enabled:true,limitBytes:0,period:ONE_TIME}}){id}"#
-                .to_owned(),
-            "EGRESS_QUOTA_LIMIT_REQUIRED",
+            r#"setEgressQuota(id:0,input:{uploadSoftBytes:2,uploadHardBytes:1}){id}"#.to_owned(),
+            "EGRESS_QUOTA_SOFT_ABOVE_HARD",
+        ),
+        (
+            r#"setEgressQuota(id:999,input:{}){id}"#.to_owned(),
+            "EGRESS_NOT_FOUND",
         ),
         (
             "resetEgressDownloadQuotaUsage(id:999){id}".to_owned(),
@@ -274,7 +281,7 @@ async fn egress_and_pool_refusals_carry_their_codes() {
         .await;
     let (message, code, _) = refusal(&response);
     assert_eq!(code, "PROXY_IN_USE");
-    assert_eq!(message, "proxy is referenced by a server or RSS feed");
+    assert_eq!(message, format!("proxy is used by RSS feed {feed}"));
     // A pool saves empty, but no route can name it until it has a member.
     let response = h
         .execute(r#"mutation{createProxyPool(input:{name:"Empty",kind:SOCKS5,memberIds:[]}){id}}"#)
@@ -358,7 +365,7 @@ async fn route_input_union_and_system_invariants_are_enforced() {
     }
     assert_has_errors(&h.execute("mutation{deleteEgressInterface(id:0)}").await);
     assert_has_errors(&h.execute(r#"mutation{updateEgressInterface(id:0,input:{name:"Renamed",bindingKind:SYSTEM}){id}}"#).await);
-    assert_no_errors(&h.execute(r#"mutation{updateEgressInterface(id:0,input:{name:"System",bindingKind:SYSTEM,maxDownloadSpeed:1024}){id maxDownloadSpeed}}"#).await);
+    assert_no_errors(&h.execute(r#"mutation{updateEgressInterface(id:0,input:{name:"System",bindingKind:SYSTEM,downloadBps:1024}){id downloadBps}}"#).await);
     assert!(h.db.list_rss_feeds().unwrap().is_empty());
     h.handle.proxy_runtime().unwrap().stop_all().await;
 }
@@ -368,7 +375,7 @@ async fn pool_route_keeps_member_projection_and_prevents_pool_deletion() {
     let h = harness().await;
     let mut ids = Vec::new();
     for name in ["Primary", "Secondary"] {
-        let result=h.execute(&format!(r#"mutation{{saveProxyProfile(input:{{name:"{name}",kind:SOCKS5,resolver:PROXY,enabled:false,host:"127.0.0.1",port:1080,dnsServers:["192.0.2.53"]}}){{id}}}}"#)).await;
+        let result=h.execute(&format!(r#"mutation{{saveProxyProfile(input:{{name:"{name}",kind:SOCKS5,enabled:false,host:"127.0.0.1",port:1080}}){{id}}}}"#)).await;
         assert_no_errors(&result);
         ids.push(
             response_data(&result)["saveProxyProfile"]["id"]
@@ -572,6 +579,214 @@ async fn route_save_rejects_missing_consumers_without_persisting() {
     h.handle.proxy_runtime().unwrap().stop_all().await;
 }
 
+// The default torrent route's first leg in the flow, as (open, opening,
+// state, bytes per second).
+async fn default_torrent_leg(h: &TestHarness) -> (u64, u64, String, u64) {
+    let response = h
+        .execute("{ networkFlow { legs { consumer position open opening state bytesPerSecond } } }")
+        .await;
+    assert_no_errors(&response);
+    let legs = response_data(&response)["networkFlow"]["legs"].clone();
+    let leg = legs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|leg| leg["consumer"] == "torrent:default" && leg["position"] == 0)
+        .unwrap_or_else(|| panic!("no default torrent leg in {legs}"))
+        .clone();
+    (
+        leg["open"].as_u64().unwrap(),
+        leg["opening"].as_u64().unwrap(),
+        leg["state"].as_str().unwrap().to_owned(),
+        leg["bytesPerSecond"].as_u64().unwrap(),
+    )
+}
+
+// A torrent session on its leg's own sockets dials nothing through the
+// route, which has no live counterpart; the leg still shows the session's
+// established peers as open, its handshakes as opening, and its bytes, and
+// is up while it holds them.
+#[tokio::test]
+async fn a_torrent_leg_on_its_own_sockets_shows_the_sessions_peers_in_the_flow() {
+    use weaver_server_core::proxies::{Consumer, LegTenant, SessionTraffic, TorrentScope};
+    struct Holds(SessionTraffic);
+    impl LegTenant for Holds {
+        fn traffic(&self) -> SessionTraffic {
+            self.0
+        }
+    }
+    let h = harness().await;
+    let runtime = h.handle.proxy_runtime().unwrap();
+    let consumer = Consumer::Torrent(TorrentScope::Default);
+    assert_eq!(consumer.key(), "torrent:default");
+    assert_eq!(default_torrent_leg(&h).await, (0, 0, "IDLE".into(), 0));
+
+    let tenancy = runtime.network.tenant_torrent(
+        consumer,
+        0,
+        Holds(SessionTraffic {
+            open: 3,
+            opening: 2,
+            bytes_per_second: 4_000_000,
+            ..SessionTraffic::default()
+        }),
+    );
+    assert_eq!(
+        default_torrent_leg(&h).await,
+        (3, 2, "UP".into(), 4_000_000)
+    );
+
+    // The session lets the leg go: it is idle again.
+    drop(tenancy);
+    assert_eq!(default_torrent_leg(&h).await, (0, 0, "IDLE".into(), 0));
+    runtime.stop_all().await;
+}
+
+// A leg a torrent session is being built on reads as opening, as the
+// session's route and its torrents do, until the build lets it go.
+#[tokio::test]
+async fn a_torrent_leg_a_session_is_being_built_on_reads_as_opening() {
+    use weaver_server_core::proxies::{Consumer, SessionOpening, TorrentScope};
+    let h = harness().await;
+    let runtime = h.handle.proxy_runtime().unwrap();
+    let consumer = Consumer::Torrent(TorrentScope::Default);
+    assert_eq!(default_torrent_leg(&h).await, (0, 0, "IDLE".into(), 0));
+
+    let building = runtime.network.tenant_torrent(consumer, 0, SessionOpening);
+    assert_eq!(default_torrent_leg(&h).await, (0, 0, "OPENING".into(), 0));
+
+    drop(building);
+    assert_eq!(default_torrent_leg(&h).await, (0, 0, "IDLE".into(), 0));
+    runtime.stop_all().await;
+}
+
+// A leg through a proxy that is disabled has nothing it can carry: it reads
+// down with the reason its route reads, not idle, and idle again once the
+// proxy is turned back on.
+#[tokio::test]
+async fn a_leg_through_a_disabled_proxy_reads_down_with_why() {
+    let h = harness().await;
+    let save = |id: &str, enabled: bool| {
+        format!(
+            r#"mutation{{saveProxyProfile({id}input:{{name:"Gateway",kind:SOCKS5,enabled:{enabled},host:"127.0.0.1",port:1080}}){{id}}}}"#
+        )
+    };
+    let response = h.execute(&save("", true)).await;
+    assert_no_errors(&response);
+    let proxy = response_data(&response)["saveProxyProfile"]["id"]
+        .as_u64()
+        .unwrap();
+    assert_no_errors(&h.execute(&format!("mutation{{saveNetworkRoute(kind:TORRENT_DEFAULT,id:0,input:{{legs:[{{egressId:0,weight:100,path:{{ladder:{{rungs:[{{proxy:{proxy}}}],directFallback:false}}}}}}]}}){{consumer}}}}")).await);
+    let leg = || async {
+        let response = h
+            .execute("{ networkFlow { legs { consumer position state reason } } }")
+            .await;
+        assert_no_errors(&response);
+        let legs = response_data(&response)["networkFlow"]["legs"].clone();
+        let leg = legs
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|leg| leg["consumer"] == "torrent:default" && leg["position"] == 0)
+            .unwrap_or_else(|| panic!("no default torrent leg in {legs}"))
+            .clone();
+        (leg["state"].clone(), leg["reason"].clone())
+    };
+    assert_eq!(leg().await.0, "IDLE");
+
+    assert_no_errors(&h.execute(&save(&format!("id:{proxy},"), false)).await);
+    assert_eq!(
+        leg().await,
+        (
+            serde_json::json!("DOWN"),
+            serde_json::json!(format!("proxy {proxy} is disabled"))
+        )
+    );
+
+    assert_no_errors(&h.execute(&save(&format!("id:{proxy},"), true)).await);
+    assert_eq!(leg().await.0, "IDLE");
+    h.handle.proxy_runtime().unwrap().stop_all().await;
+}
+
+// A tracker rule that routes its torrents itself is listed by its host
+// pattern and takes a route of one leg, never two; turned off, it is no
+// consumer, and a rule that is gone takes no route.
+#[tokio::test]
+async fn a_tracker_rule_with_its_own_route_is_listed_and_routed() {
+    let h = harness().await;
+    let save = |id: &str, route: bool| {
+        format!(
+            r#"mutation {{ saveTrackerRule({id} input: {{ name: "tracker.test", hostPatterns: ["tracker.test"], torrentRoute: {route} }}) {{ id }} }}"#
+        )
+    };
+    let response = h.execute(&save("", true)).await;
+    assert_no_errors(&response);
+    let id = response_data(&response)["saveTrackerRule"][0]["id"]
+        .as_u64()
+        .unwrap();
+    let listed = || async {
+        let response = h
+            .execute("{networkFlow{consumers{key id name kind cap}}}")
+            .await;
+        assert_no_errors(&response);
+        response_data(&response)["networkFlow"]["consumers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|consumer| consumer["kind"] == "TORRENT_TRACKER")
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        listed().await,
+        [serde_json::json!({
+            "key": format!("torrent:tracker:{id}"),
+            "id": id,
+            "name": "tracker.test",
+            "kind": "TORRENT_TRACKER",
+            "cap": 1,
+        })]
+    );
+
+    let route = |legs: &str| {
+        format!(
+            "mutation{{saveNetworkRoute(kind:TORRENT_TRACKER,id:{id},input:{{legs:[{legs}]}}){{consumer legs{{weight}}}}}}"
+        )
+    };
+    let response = h
+        .execute(&route(
+            "{egressId:0,weight:50,path:{direct:true}},{egressId:0,weight:50,path:{direct:true}}",
+        ))
+        .await;
+    let (_, code, _) = refusal(&response);
+    assert_eq!(code, "TORRENT_ROUTE_LEGS");
+    let response = h
+        .execute(&route("{egressId:0,weight:100,path:{direct:true}}"))
+        .await;
+    assert_no_errors(&response);
+    assert_eq!(
+        response_data(&response)["saveNetworkRoute"],
+        serde_json::json!({
+            "consumer": format!("torrent:tracker:{id}"),
+            "legs": [{"weight": 100}],
+        })
+    );
+
+    let response = h.execute(&save(&format!("id: {id},"), false)).await;
+    assert_no_errors(&response);
+    assert!(listed().await.is_empty());
+
+    let response = h
+        .execute(&format!(
+            "mutation{{saveNetworkRoute(kind:TORRENT_TRACKER,id:{},input:{{legs:[{{egressId:0,weight:100,path:{{direct:true}}}}]}}){{consumer}}}}",
+            id + 1
+        ))
+        .await;
+    let (_, code, _) = refusal(&response);
+    assert_eq!(code, "ROUTE_CONSUMER_NOT_FOUND");
+    h.handle.proxy_runtime().unwrap().stop_all().await;
+}
+
 // A server or a feed made behind a kill switch is kept switched off behind a
 // route nothing can take, and a route saved for it under Networking opens it.
 #[tokio::test]
@@ -687,75 +902,124 @@ async fn quota_harness() -> TestHarness {
     h
 }
 
-const EGRESS_QUOTA_SHAPE: &str = "id health reason downloadQuota{enabled limitBytes period resetTimeMinutesLocal weeklyResetWeekday monthlyResetDay usedBytes} downloadQuotaUsage{usedBytes remainingBytes blocked}";
+const EGRESS_QUOTA_SHAPE: &str = "id health reason downloadBps uploadBps quota{downloadBytes uploadSoftBytes uploadTrickleBps uploadHardBytes period resetTimeMinutesLocal weeklyResetWeekday monthlyResetDay} quotaUsage{down{usedBytes remainingBytes state} up{usedBytes remainingBytes state} state}";
 
 #[tokio::test]
-async fn egress_download_quota_is_saved_on_create_and_kept_when_an_update_omits_it() {
+async fn egress_rates_and_quota_round_trip_and_an_update_keeps_the_quota() {
     let h = quota_harness().await;
     let response = h
         .execute(&format!(
-            r#"mutation {{createEgressInterface(input:{{name:"Metered link",bindingKind:SOURCE_ADDRESS,sourceAddress:"127.0.0.1",downloadQuota:{{enabled:true,limitBytes:5000000000,period:MONTHLY,monthlyResetDay:15,resetTimeMinutesLocal:120}}}}){{{EGRESS_QUOTA_SHAPE}}}}}"#
+            r#"mutation {{createEgressInterface(input:{{name:"Metered link",bindingKind:SOURCE_ADDRESS,sourceAddress:"127.0.0.1",downloadBps:0,uploadBps:4096}}){{{EGRESS_QUOTA_SHAPE}}}}}"#
         ))
         .await;
     assert_no_errors(&response);
     let created = response_data(&response)["createEgressInterface"].clone();
     let id = created["id"].as_u64().unwrap();
+    assert_eq!(created["downloadBps"], 0);
+    assert_eq!(created["uploadBps"], 4096);
     assert_eq!(
-        created["downloadQuota"],
+        created["quota"],
         serde_json::json!({
-            "enabled": true,
-            "limitBytes": 5_000_000_000u64,
+            "downloadBytes": null,
+            "uploadSoftBytes": null,
+            "uploadTrickleBps": 2048,
+            "uploadHardBytes": null,
+            "period": "ONE_TIME",
+            "resetTimeMinutesLocal": 0,
+            "weeklyResetWeekday": "MON",
+            "monthlyResetDay": 1,
+        })
+    );
+
+    let response = h
+        .execute(&format!(
+            r#"mutation {{setEgressQuota(id:{id},input:{{downloadBytes:5000000000,uploadSoftBytes:1000,uploadTrickleBps:512,uploadHardBytes:2000,period:MONTHLY,monthlyResetDay:15,resetTimeMinutesLocal:120}}){{{EGRESS_QUOTA_SHAPE}}}}}"#
+        ))
+        .await;
+    assert_no_errors(&response);
+    let quota = response_data(&response)["setEgressQuota"].clone();
+    assert_eq!(
+        quota["quota"],
+        serde_json::json!({
+            "downloadBytes": 5_000_000_000u64,
+            "uploadSoftBytes": 1000,
+            "uploadTrickleBps": 512,
+            "uploadHardBytes": 2000,
             "period": "MONTHLY",
             "resetTimeMinutesLocal": 120,
             "weeklyResetWeekday": "MON",
             "monthlyResetDay": 15,
-            "usedBytes": 0,
         })
     );
-    assert_eq!(created["downloadQuotaUsage"]["usedBytes"], 0);
     assert_eq!(
-        created["downloadQuotaUsage"]["remainingBytes"],
-        5_000_000_000u64
+        quota["quotaUsage"],
+        serde_json::json!({
+            "down": { "usedBytes": 0, "remainingBytes": 5_000_000_000u64, "state": "NORMAL" },
+            "up": { "usedBytes": 0, "remainingBytes": 2000, "state": "NORMAL" },
+            "state": "NORMAL",
+        })
     );
 
-    // An update that leaves the quota out keeps the saved one.
+    // An update to the egress keeps the saved quota.
     let response = h
         .execute(&format!(
-            r#"mutation {{updateEgressInterface(id:{id},input:{{name:"Metered link renamed",bindingKind:SOURCE_ADDRESS,sourceAddress:"127.0.0.1",maxDownloadSpeed:2048}}){{name maxDownloadSpeed {EGRESS_QUOTA_SHAPE}}}}}"#
+            r#"mutation {{updateEgressInterface(id:{id},input:{{name:"Metered link renamed",bindingKind:SOURCE_ADDRESS,sourceAddress:"127.0.0.1",downloadBps:2048}}){{name {EGRESS_QUOTA_SHAPE}}}}}"#
         ))
         .await;
     assert_no_errors(&response);
     let updated = response_data(&response)["updateEgressInterface"].clone();
     assert_eq!(updated["name"], "Metered link renamed");
-    assert_eq!(updated["maxDownloadSpeed"], 2048);
-    assert_eq!(updated["downloadQuota"], created["downloadQuota"]);
+    assert_eq!(updated["downloadBps"], 2048);
+    assert_eq!(updated["uploadBps"], serde_json::Value::Null);
+    assert_eq!(updated["quota"], quota["quota"]);
     let saved =
         h.db.list_egress_interfaces()
             .unwrap()
             .into_iter()
             .find(|egress| u64::from(egress.id) == id)
             .unwrap();
-    assert!(saved.download_quota.enabled);
-    assert_eq!(saved.download_quota.limit_bytes, 5_000_000_000);
+    assert_eq!(saved.download_bps, Some(2048));
+    assert_eq!(saved.quota.download_bytes, Some(5_000_000_000));
+    assert_eq!(saved.quota.upload_hard_bytes, Some(2000));
 
-    // An update that carries a quota replaces it.
+    // Upload past the soft cap trickles; past the hard cap it stops.
+    let policy = &h.server_transfer_policy;
+    let id = id as u32;
+    assert_eq!(
+        policy.record_egress_upload(id, 1_000),
+        Some(weaver_server_core::bandwidth::QuotaState::Trickle)
+    );
+    let response = h
+        .execute(&format!("{{egressInterfaces{{{EGRESS_QUOTA_SHAPE}}}}}"))
+        .await;
+    assert_no_errors(&response);
+    let egress = response_data(&response)["egressInterfaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|egress| egress["id"] == id)
+        .unwrap()
+        .clone();
+    assert_eq!(
+        egress["quotaUsage"]["up"],
+        serde_json::json!({ "usedBytes": 1000, "remainingBytes": 1000, "state": "TRICKLE" })
+    );
+    assert_eq!(egress["quotaUsage"]["state"], "TRICKLE");
+    assert_eq!(
+        policy.record_egress_upload(id, 1_000),
+        Some(weaver_server_core::bandwidth::QuotaState::Stopped)
+    );
+
+    // A cleared quota has no caps left.
     let response = h
         .execute(&format!(
-            r#"mutation {{updateEgressInterface(id:{id},input:{{name:"Metered link renamed",bindingKind:SOURCE_ADDRESS,sourceAddress:"127.0.0.1",downloadQuota:{{enabled:false}}}}){{{EGRESS_QUOTA_SHAPE}}}}}"#
+            r#"mutation {{setEgressQuota(id:{id},input:{{}}){{quota{{downloadBytes uploadHardBytes}}}}}}"#
         ))
         .await;
     assert_no_errors(&response);
     assert_eq!(
-        response_data(&response)["updateEgressInterface"]["downloadQuota"]["enabled"],
-        false
-    );
-
-    // A quota the server quota would refuse is refused here too.
-    assert_has_errors(
-        &h.execute(&format!(
-            r#"mutation {{updateEgressInterface(id:{id},input:{{name:"Metered link renamed",bindingKind:SOURCE_ADDRESS,sourceAddress:"127.0.0.1",downloadQuota:{{enabled:true,limitBytes:0}}}}){{id}}}}"#
-        ))
-        .await,
+        response_data(&response)["setEgressQuota"]["quota"],
+        serde_json::json!({ "downloadBytes": null, "uploadHardBytes": null })
     );
     h.handle.proxy_runtime().unwrap().stop_all().await;
 }
@@ -764,12 +1028,18 @@ async fn egress_download_quota_is_saved_on_create_and_kept_when_an_update_omits_
 async fn egress_quota_usage_reports_recorded_bytes_and_a_used_up_quota_takes_the_egress_down() {
     let h = quota_harness().await;
     let response = h
-        .execute(r#"mutation {createEgressInterface(input:{name:"Small allowance",bindingKind:SOURCE_ADDRESS,sourceAddress:"127.0.0.1",downloadQuota:{enabled:true,limitBytes:1048576,period:ONE_TIME}}){id}}"#)
+        .execute(r#"mutation {createEgressInterface(input:{name:"Small allowance",bindingKind:SOURCE_ADDRESS,sourceAddress:"127.0.0.1"}){id}}"#)
         .await;
     assert_no_errors(&response);
     let id = response_data(&response)["createEgressInterface"]["id"]
         .as_u64()
         .unwrap() as u32;
+    assert_no_errors(
+        &h.execute(&format!(
+            r#"mutation {{setEgressQuota(id:{id},input:{{downloadBytes:1048576,period:ONE_TIME}}){{id}}}}"#
+        ))
+        .await,
+    );
     let control = h
         .server_transfer_policy
         .egress_transfer_registry()
@@ -788,10 +1058,9 @@ async fn egress_quota_usage_reports_recorded_bytes_and_a_used_up_quota_takes_the
         .find(|egress| egress["id"] == id)
         .unwrap()
         .clone();
-    assert_eq!(egress["downloadQuota"]["usedBytes"], 700_000);
-    assert_eq!(egress["downloadQuotaUsage"]["usedBytes"], 700_000);
-    assert_eq!(egress["downloadQuotaUsage"]["remainingBytes"], 348_576);
-    assert_eq!(egress["downloadQuotaUsage"]["blocked"], false);
+    assert_eq!(egress["quotaUsage"]["down"]["usedBytes"], 700_000);
+    assert_eq!(egress["quotaUsage"]["down"]["remainingBytes"], 348_576);
+    assert_eq!(egress["quotaUsage"]["down"]["state"], "NORMAL");
     assert_ne!(egress["reason"], "Quota reached");
 
     // A body that no longer fits is turned away, and the egress reads Down.
@@ -805,7 +1074,6 @@ async fn egress_quota_usage_reports_recorded_bytes_and_a_used_up_quota_takes_the
         .find(|egress| egress["id"] == id)
         .unwrap()
         .clone();
-    assert_eq!(egress["downloadQuotaUsage"]["blocked"], true);
     assert_eq!(egress["health"], "DOWN");
     assert_eq!(egress["reason"], "Quota reached");
     h.handle.proxy_runtime().unwrap().stop_all().await;
@@ -849,5 +1117,101 @@ async fn download_block_names_the_egress_whose_quota_holds_downloads() {
     let block = &response_data(&response)["downloadBlock"];
     assert_eq!(block["kind"], "SERVER_QUOTA");
     assert_eq!(block["egressId"], serde_json::Value::Null);
+    h.handle.proxy_runtime().unwrap().stop_all().await;
+}
+
+fn dns_list(count: usize) -> String {
+    (1..=count)
+        .map(|n| match n {
+            1 => r#"{wire:PLAIN,address:"192.0.2.1"}"#.to_owned(),
+            n if n % 2 == 0 => {
+                format!(r#"{{wire:TLS,address:"192.0.2.{n}",tlsName:"dns{n}.example"}}"#)
+            }
+            n => format!(r#"{{wire:HTTPS,address:"",url:"https://192.0.2.{n}/dns-query"}}"#),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+const DNS_LIST_SHAPE: &str = "id name servers{wire address tlsName url}";
+
+#[tokio::test]
+async fn a_dns_server_list_is_saved_read_in_order_and_refused_without_storing() {
+    let h = harness().await;
+    // Only the built-in System profile exists until one is saved.
+    let response = h
+        .execute("{dnsServerLists{id} dnsProfiles{id builtIn who}}")
+        .await;
+    assert_no_errors(&response);
+    assert_eq!(
+        response_data(&response)["dnsServerLists"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        response_data(&response)["dnsProfiles"],
+        serde_json::json!([{"id": 0, "builtIn": true, "who": "SYSTEM"}])
+    );
+
+    // Ten servers, the most one list holds, in the order they are asked.
+    let save = |id: Option<u64>, servers: String| {
+        let id = id.map(|id| format!("id:{id},")).unwrap_or_default();
+        format!(
+            r#"mutation{{saveDnsServerList(input:{{{id}name:"Resolvers",servers:[{servers}]}}){{{DNS_LIST_SHAPE}}}}}"#
+        )
+    };
+    let response = h.execute(&save(None, dns_list(10))).await;
+    assert_no_errors(&response);
+    let saved = response_data(&response)["saveDnsServerList"].clone();
+    let id = saved["id"].as_u64().unwrap();
+    let servers = saved["servers"].as_array().unwrap();
+    assert_eq!(servers.len(), 10);
+    assert_eq!(
+        servers[0],
+        serde_json::json!({"wire": "PLAIN", "address": "192.0.2.1", "tlsName": null, "url": null})
+    );
+    assert_eq!(servers[1]["tlsName"], "dns2.example");
+    assert_eq!(servers[2]["url"], "https://192.0.2.3/dns-query");
+    let response = h
+        .execute(&format!("{{dnsServerLists{{{DNS_LIST_SHAPE}}}}}"))
+        .await;
+    assert_no_errors(&response);
+    assert_eq!(
+        response_data(&response)["dnsServerLists"],
+        serde_json::json!([saved.clone()])
+    );
+
+    // Refused by code, and the stored list is left as it was.
+    for (servers, code) in [
+        (dns_list(11), "PROXY_DNS_SERVER_COUNT"),
+        (String::new(), "PROXY_DNS_SERVERS_REQUIRED"),
+        (
+            r#"{wire:TLS,address:"192.0.2.2"},{wire:PLAIN,address:"192.0.2.1"}"#.to_owned(),
+            "PROXY_DNS_PLAIN_AFTER_ENCRYPTED",
+        ),
+        (
+            r#"{wire:PLAIN,address:"192.0.2.1"},{wire:PLAIN,address:"192.0.2.1:53"}"#.to_owned(),
+            "PROXY_DNS_SERVER_DUPLICATE",
+        ),
+        (
+            r#"{wire:PLAIN,address:"dns.example"}"#.to_owned(),
+            "PROXY_DNS_SERVER_INVALID",
+        ),
+    ] {
+        let response = h.execute(&save(Some(id), servers.clone())).await;
+        assert_eq!(refusal(&response).1, code, "{servers}");
+        let [stored] = h.db.list_dns_server_lists().unwrap().try_into().unwrap();
+        assert_eq!(stored.servers.len(), 10, "{servers}");
+    }
+
+    // An update replaces the servers it lists.
+    let response = h.execute(&save(Some(id), dns_list(3))).await;
+    assert_no_errors(&response);
+    assert_eq!(
+        response_data(&response)["saveDnsServerList"]["servers"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
     h.handle.proxy_runtime().unwrap().stop_all().await;
 }

@@ -282,7 +282,7 @@ func TestWeaverReleasePhasesHaveIndependentOwnership(t *testing.T) {
 		t.Fatalf("create Weaver release phases: %v", err)
 	}
 
-	const wantPhaseCount = 59
+	const wantPhaseCount = 65
 	if len(phases) != wantPhaseCount {
 		t.Fatalf("release phase count = %d, want %d", len(phases), wantPhaseCount)
 	}
@@ -554,6 +554,19 @@ func TestWeaverComposeAllowsPrivateRSSByDefault(t *testing.T) {
 	const mapping = `WEAVER_RSS_ALLOW_PRIVATE_NETWORK: "${WEAVER_RSS_ALLOW_PRIVATE_NETWORK:-true}"`
 	if !strings.Contains(string(body), mapping) {
 		t.Fatalf("Weaver Compose RSS private-network mapping is missing default %q", mapping)
+	}
+}
+
+// Torrents are off unless the server is started with WEAVER_TORRENTS; the
+// torrent lanes run on this Compose service, so it gives the variable.
+func TestWeaverComposeMakesTorrentsAvailable(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join(weaverE2ETestRoot(t), "docker-compose.yml"))
+	if err != nil {
+		t.Fatalf("read docker compose file: %v", err)
+	}
+	const mapping = `WEAVER_TORRENTS: "${E2E_WEAVER_TORRENTS:-1}"`
+	if !strings.Contains(string(body), mapping) {
+		t.Fatalf("Weaver Compose torrent opt-in is missing %q", mapping)
 	}
 }
 

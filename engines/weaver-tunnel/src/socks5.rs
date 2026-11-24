@@ -219,11 +219,31 @@ impl Socks5Front {
             .remove(&stream.peer_addr()?)
             .and_then(|value| value.upgrade())
             .unwrap_or_default();
+        // How long the tunnel took to reach the target, so a caller's own
+        // timeout can be split into the tunnel's dial and what followed it.
+        let began = tokio::time::Instant::now();
         let dialled = tokio::select! {
             biased;
-            result = Self::read_until_closed(&mut stream, &mut pending) => return result,
+            result = Self::read_until_closed(&mut stream, &mut pending) => {
+                tracing::debug!(
+                    proxy_config_id = self.proxy_config_id.as_str(),
+                    host = host.as_str(),
+                    port,
+                    elapsed_ms = began.elapsed().as_millis(),
+                    "the caller left before the tunnel reached its target"
+                );
+                return result;
+            }
             result = tokio::time::timeout(self.timeout, self.provider.dial_observed(&host, port, outcome)) => result,
         };
+        tracing::debug!(
+            proxy_config_id = self.proxy_config_id.as_str(),
+            host = host.as_str(),
+            port,
+            reached = matches!(dialled, Ok(Ok(_))),
+            elapsed_ms = began.elapsed().as_millis(),
+            "tunnel SOCKS5 dial finished"
+        );
         let mut upstream = match dialled {
             Ok(Ok(upstream)) => upstream,
             Ok(Err(error)) => {
@@ -551,7 +571,9 @@ mod tests {
         )
         .await;
 
-        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        let mut stream = crate::test_support::loopback::connect(addr)
+            .await
+            .expect("connect");
         assert_eq!(greet(&mut stream).await, [SOCKS5_VERSION, METHOD_NO_AUTH]);
 
         let name = b"indexer.internal";
@@ -596,7 +618,9 @@ mod tests {
         )
         .await;
 
-        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        let mut stream = crate::test_support::loopback::connect(addr)
+            .await
+            .expect("connect");
         greet(&mut stream).await;
         let mut request = vec![SOCKS5_VERSION, CMD_CONNECT, 0x00, ATYP_IPV4];
         request.extend_from_slice(&[10, 1, 2, 3]);
@@ -615,7 +639,9 @@ mod tests {
         )
         .await;
 
-        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        let mut stream = crate::test_support::loopback::connect(addr)
+            .await
+            .expect("connect");
         greet(&mut stream).await;
         let mut request = vec![SOCKS5_VERSION, CMD_CONNECT, 0x00, ATYP_IPV6];
         request.extend_from_slice(&Ipv6Addr::LOCALHOST.octets());
@@ -634,7 +660,9 @@ mod tests {
         )
         .await;
 
-        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        let mut stream = crate::test_support::loopback::connect(addr)
+            .await
+            .expect("connect");
         greet(&mut stream).await;
         let mut request = vec![SOCKS5_VERSION, 0x02, 0x00, ATYP_IPV4];
         request.extend_from_slice(&[127, 0, 0, 1]);
@@ -656,7 +684,9 @@ mod tests {
         )
         .await;
 
-        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        let mut stream = crate::test_support::loopback::connect(addr)
+            .await
+            .expect("connect");
         stream.write_all(&[0x04, 0x01]).await.expect("greeting");
         let mut answer = [0u8; 1];
         // The front closes without answering a version it does not speak.
@@ -673,7 +703,9 @@ mod tests {
         )
         .await;
 
-        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        let mut stream = crate::test_support::loopback::connect(addr)
+            .await
+            .expect("connect");
         // Username/password only.
         stream
             .write_all(&[SOCKS5_VERSION, 1, 0x02])
@@ -699,7 +731,9 @@ mod tests {
         )
         .await;
 
-        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        let mut stream = crate::test_support::loopback::connect(addr)
+            .await
+            .expect("connect");
         greet(&mut stream).await;
         let name = b"indexer.internal";
         let mut request = vec![

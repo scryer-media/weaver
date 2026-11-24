@@ -2,12 +2,14 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use std::path::PathBuf;
+use weaver_server_core::history::queries::HistoryQueries;
+use weaver_server_core::jobs::duplicate_persistence::JobsDuplicatePersistenceAdmitDuplicateSubmissionQueries;
 
 use super::*;
 use crate::jobs::paging::{PageRead, PageWants, read_row};
 use crate::jobs::types::{
     DuplicateIdentitySnapshotInfo, DuplicateSummaryInfo, PreparedQueueFilter,
-    load_duplicate_summaries_chunked, queue_table_item_from_job,
+    load_duplicate_summaries_chunked, queue_item_from_job,
 };
 use crate::jobs::types::{
     JobOutputSource, OutputFilesCursor, decode_output_files_cursor, encode_output_files_cursor,
@@ -60,6 +62,12 @@ impl JobsQuery {
         .iter()
         .map(queue_item_from_job)
         .collect();
+        if ctx.look_ahead().field("diskWrite").exists() {
+            crate::jobs::types::attach_disk_writes(
+                ctx.data::<weaver_server_core::SharedPipelineState>()?,
+                &mut items,
+            );
+        }
         if ctx.look_ahead().field("duplicateSummary").exists() {
             attach_duplicate_summaries(ctx.data::<Database>()?.clone(), &mut items).await?;
         }
@@ -122,6 +130,12 @@ impl JobsQuery {
         .iter()
         .map(queue_item_from_job)
         .collect();
+        if ctx.look_ahead().field("items").field("diskWrite").exists() {
+            crate::jobs::types::attach_disk_writes(
+                ctx.data::<weaver_server_core::SharedPipelineState>()?,
+                &mut items,
+            );
+        }
         if ctx
             .look_ahead()
             .field("items")
@@ -135,7 +149,7 @@ impl JobsQuery {
         let max_download_speed = with_timed_config_read(
             config,
             "jobs.query.queue_snapshot.max_download_speed",
-            |cfg| cfg.max_download_speed.unwrap_or(0),
+            |cfg| cfg.bandwidth.download_bps,
         )
         .await;
 
@@ -143,7 +157,7 @@ impl JobsQuery {
             summary: queue_summary(&items, &metrics),
             metrics: metrics_from_snapshot(&metrics),
             global_state: global_queue_state(
-                handle.is_globally_paused(),
+                &handle.state().holds(),
                 &handle.get_download_block(),
                 max_download_speed,
             ),
@@ -160,11 +174,11 @@ impl JobsQuery {
         let max_download_speed = with_timed_config_read(
             config,
             "jobs.query.global_queue_state.max_download_speed",
-            |cfg| cfg.max_download_speed.unwrap_or(0),
+            |cfg| cfg.bandwidth.download_bps,
         )
         .await;
         Ok(global_queue_state(
-            handle.is_globally_paused(),
+            &handle.state().holds(),
             &handle.get_download_block(),
             max_download_speed,
         ))
@@ -177,12 +191,15 @@ impl JobsQuery {
     }
     /// List jobs, optionally filtered by status, category, or metadata key.
     /// Supports pagination via `limit` and `offset`.
+    // Each GraphQL argument is a resolver parameter.
+    #[allow(clippy::too_many_arguments)]
     async fn jobs(
         &self,
         ctx: &Context<'_>,
         status: Option<Vec<JobStatusGql>>,
         category: Option<String>,
         has_metadata_key: Option<String>,
+        tag: Option<String>,
         limit: Option<u32>,
         offset: Option<u32>,
     ) -> Result<Vec<Job>> {
@@ -191,6 +208,7 @@ impl JobsQuery {
             status,
             category,
             has_metadata_key,
+            tag: JobFilter::tag(ctx, tag).await?,
         };
         let offset = offset.unwrap_or(0) as usize;
         let limit = limit.map_or(usize::MAX, |limit| {
@@ -231,12 +249,14 @@ impl JobsQuery {
         status: Option<Vec<JobStatusGql>>,
         category: Option<String>,
         has_metadata_key: Option<String>,
+        tag: Option<String>,
     ) -> Result<u32> {
         let state = ctx.data::<weaver_server_core::SharedPipelineState>()?;
         let filter = JobFilter {
             status,
             category,
             has_metadata_key,
+            tag: JobFilter::tag(ctx, tag).await?,
         };
         let history = state.history_rows();
         let count = state.read_queue(|inner| {
@@ -509,6 +529,7 @@ pub(crate) fn page_wants(ctx: &Context<'_>) -> PageWants {
     let fields = ctx.look_ahead();
     PageWants {
         rows: fields.field("items").exists() || fields.field("etaThrough").exists(),
+        disk_write: fields.field("items").field("diskWrite").exists(),
     }
 }
 
@@ -588,15 +609,22 @@ pub(crate) async fn build_queue_page(
         plan,
         rows,
         revision,
-    } = PageRead::read(state, input, wants);
+    } = PageRead::read(
+        state,
+        input,
+        wants,
+        crate::tags::tags_for(&db, input.tag.as_deref())
+            .await?
+            .as_deref(),
+    );
     let metrics = handle.get_metrics();
     let summary = walk.summary(&metrics);
     let categories = walk.categories();
     drop(walk);
-    let mut items = rows
-        .iter()
-        .map(queue_table_item_from_job)
-        .collect::<Vec<_>>();
+    let mut items = rows.iter().map(queue_item_from_job).collect::<Vec<_>>();
+    if wants.disk_write {
+        crate::jobs::types::attach_disk_writes(state, &mut items);
+    }
     duplicates.attach(db, revision, &mut items).await?;
 
     Ok(QueuePage {
@@ -605,6 +633,7 @@ pub(crate) async fn build_queue_page(
         summary,
         categories,
         category_counts: plan.category_counts,
+        protocol_counts: plan.protocol_counts,
         state_counts: plan.state_counts,
         remaining_bytes: plan.remaining_bytes,
         eta_total_bytes: plan.eta_total_bytes,
@@ -637,9 +666,28 @@ struct JobFilter {
     status: Option<Vec<JobStatusGql>>,
     category: Option<String>,
     has_metadata_key: Option<String>,
+    // A tag the job carries, the empty one naming jobs with none, with the
+    // tags as read for the query.
+    tag: Option<(
+        String,
+        std::sync::Arc<weaver_server_core::tags::TagSnapshot>,
+    )>,
 }
 
 impl JobFilter {
+    async fn tag(
+        ctx: &Context<'_>,
+        tag: Option<String>,
+    ) -> Result<
+        Option<(
+            String,
+            std::sync::Arc<weaver_server_core::tags::TagSnapshot>,
+        )>,
+    > {
+        let tags = crate::tags::tags_for(ctx.data::<Database>()?, tag.as_deref()).await?;
+        Ok(tag.zip(tags))
+    }
+
     // `status` is the job's status as published; `job` carries the rest.
     fn matches(
         &self,
@@ -658,6 +706,11 @@ impl JobFilter {
         }
         if let Some(key) = &self.has_metadata_key
             && !job.metadata.iter().any(|(k, _)| k == key)
+        {
+            return false;
+        }
+        if let Some((tag, tags)) = &self.tag
+            && !tags.passes(job.job_id, tag)
         {
             return false;
         }

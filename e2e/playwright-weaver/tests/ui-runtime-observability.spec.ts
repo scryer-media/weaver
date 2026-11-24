@@ -9,6 +9,7 @@ import { isOperation, operationResponse } from "./support/graphql-operations";
 import { introspectPublicMutationNames } from "./support/runtime-introspection";
 import { byTestIdPrefix, choose } from "./support/settings-locators";
 import { seedRuntimeHistory } from "./support/setup/runtime-history";
+import { withTorrentsOn } from "./support/setup/torrent-switch";
 import { runtimeIds, settingsIds, testIds } from "./support/testids";
 
 type CoverageEntry = {
@@ -86,7 +87,8 @@ test("visible navigation routes are assigned to the Weaver coverage ledger", asy
 });
 
 test("monitoring metrics and live logs expose real product state and controls", async ({ cleanPage: page }) => {
-  await page.goto(weaverRoute("/monitoring"));
+  // The engine dashboard has its own route; /monitoring opens the overview.
+  await page.goto(weaverRoute("/monitoring/engine"));
   await expect(page.getByTestId(runtimeIds.monitoringPipeline)).toBeVisible();
   await expect(page.getByTestId(runtimeIds.monitoringConnections)).toBeVisible();
   await expect(page.getByTestId(runtimeIds.monitoringDepths)).toBeVisible();
@@ -112,7 +114,7 @@ test("monitoring metrics and live logs expose real product state and controls", 
   const startupDirectives = await directives.inputValue();
   await chooseLogLevel(page, "download");
   await expect(directives).toHaveValue(
-    "info,weaver_server_core::pipeline::download=debug,weaver_nntp=debug",
+    "info,weaver_server_pipeline::pipeline::download=debug,weaver_nntp=debug",
   );
   await expect(levelShown("download")).toBeVisible();
   await chooseLogLevel(page, "default");
@@ -203,7 +205,13 @@ test("subscription loss polls and reconnects without losing the visible applicat
   await expect(page.getByRole("main")).toBeVisible();
 });
 
-test("the NZB analyzer renders and downloads a redacted report without queueing", async ({ cleanPage: page }) => {
+test("the analyzer renders and downloads a redacted report without queueing", async ({ cleanPage: page, request }) => {
+  // The magnet field shows only while torrents are on.
+  await withTorrentsOn(request, () => analyzeWithoutQueueing(page));
+});
+
+async function analyzeWithoutQueueing(page: Page) {
+  // The NZB-only path still opens the analyzer.
   await page.goto(weaverRoute("/tools/nzb-analyzer"));
   const sentinel = "e2e-analyzer-private";
   const nzb = `<?xml version="1.0" encoding="UTF-8"?>
@@ -232,9 +240,18 @@ test("the NZB analyzer renders and downloads a redacted report without queueing"
   const parsed = JSON.parse(json);
   expect(parsed.nzb.shape.file_count).toBe(1);
   expect(parsed.job).toBeNull();
+
+  const infohash = "0123456789abcdef0123456789abcdef01234567";
+  const magnet = page.getByTestId(runtimeIds.analyzerMagnet);
+  await expect(magnet, "the analyzer offers a magnet while torrents are on").toBeVisible();
+  await magnet.fill(`magnet:?xt=urn:btih:${infohash}&dn=${sentinel}`);
+  await page.getByTestId(runtimeIds.analyzerAnalyze).click();
+  await expect(report).toContainText("source magnet");
+  await expect(report).not.toContainText(sentinel);
+  await expect(report).not.toContainText(infohash);
   await page.goto(weaverRoute("/"));
   await expect(page.getByTestId(testIds.queueEmpty)).toBeVisible();
-});
+}
 
 test("stored backup storage, download and deletion are browser-owned", async ({ cleanPage: page }) => {
   await page.goto(weaverRoute("/settings/backup"));

@@ -145,6 +145,16 @@ test("a status label follows the pipeline only once the new status has held", ()
   assert.equal(clock.shown, "MOVING");
 });
 
+test("a torrent that loses its peers for a moment never shows a stall", () => {
+  const downloading = settleStatus(null, "DOWNLOADING", 0).clock;
+  const stalled = settleStatus(downloading, "STALLED", 1_000);
+  assert.equal(stalled.clock.shown, "DOWNLOADING");
+  assert.equal(settleStatus(stalled.clock, "DOWNLOADING", 2_000).clock.pending, null);
+
+  const held = settleStatus(stalled.clock, "STALLED", 3_000).clock;
+  assert.equal(held.shown, "STALLED");
+});
+
 test("a pause, a queue slot or an outcome changes the label at once", () => {
   const downloading = settleStatus(null, "DOWNLOADING", 0).clock;
   assert.equal(settleStatus(downloading, "PAUSED", 10).clock.shown, "PAUSED");

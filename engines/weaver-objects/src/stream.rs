@@ -125,6 +125,9 @@ pub struct Stream<D> {
     // What a run of it is granted, which sizes its window.
     #[serde(skip)]
     budget: Budget,
+    // Its placement number, which never moves (`Object::placement`).
+    #[serde(skip)]
+    placed: crate::placed::Placed,
 }
 
 impl<D: Decoder> Default for Stream<D> {
@@ -136,6 +139,7 @@ impl<D: Decoder> Default for Stream<D> {
             closed: false,
             length: None,
             budget: Budget::default(),
+            placed: crate::placed::Placed::default(),
         }
     }
 }
@@ -218,7 +222,7 @@ impl<D: Decoder> Object for Stream<D> {
     fn quiet(&mut self, standing: &dyn Standing, out: &mut Vec<Emit>) {
         out.extend(
             crate::quiet::damaged(standing)
-                .or_else(|| crate::quiet::unplaced(standing))
+                .or_else(|| crate::quiet::unplaced(standing, None))
                 .map(Emit::Refuse),
         );
     }
@@ -231,6 +235,12 @@ impl<D: Decoder> Object for Stream<D> {
     // The front it copies out is in its facts, which a restart keeps, and its
     // run reads the volumes themselves: it says nothing of the posted bytes.
     fn unposted(&mut self, _volume: VolumeIndex, _range: ByteRange) {}
+
+    // Every range is its envelope, whatever arrived: `locate` reads
+    // nothing, so its number never moves.
+    fn placement(&self) -> Option<u64> {
+        Some(self.placed.number())
+    }
 
     fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
         out.push(Placement::Envelope {
@@ -262,7 +272,12 @@ impl<D: Decoder> Object for Stream<D> {
     }
 
     // A stream is its one volume: it claims no other.
-    fn claim(&mut self, _name: &str, _first: &[u8], _length: Option<u64>) -> Claim {
+    fn claim(
+        &mut self,
+        _name: &str,
+        _first: weaver_graph::Clean<'_>,
+        _length: Option<u64>,
+    ) -> Claim {
         Claim::default()
     }
 
@@ -318,31 +333,6 @@ impl<D: Decoder> Engine for Stream<D> {
     }
 }
 
-// A compression extension and what it leaves behind: `.tgz` held a `.tar`.
-const EXTENSIONS: [(&str, &str); 11] = [
-    (".gz", ""),
-    (".tgz", ".tar"),
-    (".xz", ""),
-    (".txz", ".tar"),
-    (".bz2", ""),
-    (".tbz2", ".tar"),
-    (".tbz", ".tar"),
-    (".zst", ""),
-    (".tzst", ".tar"),
-    (".br", ""),
-    (".deflate", ""),
-];
-
-// The name the one member is announced under: the volume's name with its
-// compression extension taken off, or the name as it is when it carries no
-// extension, which the namespace numbers if it collides.
-pub fn member_name(volume: &str) -> String {
-    let lower = volume.to_ascii_lowercase();
-    EXTENSIONS
-        .iter()
-        .find(|(extension, _)| lower.len() > extension.len() && lower.ends_with(extension))
-        .map_or_else(
-            || volume.to_owned(),
-            |(extension, left)| format!("{}{left}", &volume[..volume.len() - extension.len()]),
-        )
-}
+// The name the one member is announced under: the sniffer owns the
+// compression extensions, which the layer rule reads too.
+pub use weaver_graph::sniff::stream_member_name as member_name;

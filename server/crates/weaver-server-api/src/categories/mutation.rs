@@ -2,20 +2,16 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use async_graphql::{Context, Object, Result};
-use std::sync::LazyLock;
 use tracing::info;
+use weaver_server_core::categories::persistence::CategoriesPersistenceQueries;
 
 use crate::auth::{AdminGuard, graphql_error};
 use crate::categories::types::{Category, CategoryInput};
-use crate::observability::{
-    persist_then_update_config, spawn_blocking_db, with_timed_config_read, with_timed_config_write,
-};
+use crate::observability::{spawn_blocking_db, with_timed_config_read, with_timed_config_write};
 use weaver_server_core::Database;
+use weaver_server_core::categories::{CategoryConfig, Made, category_writes, make_category};
 use weaver_server_core::settings::SharedConfig;
 use weaver_server_core::watch_folder::WatchFolderService;
-
-static CATEGORY_MUTATION_GUARD: LazyLock<tokio::sync::Mutex<()>> =
-    LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 #[derive(Default)]
 pub(crate) struct CategoriesMutation;
@@ -35,77 +31,47 @@ impl CategoriesMutation {
     async fn add_category(&self, ctx: &Context<'_>, input: CategoryInput) -> Result<Category> {
         let config = ctx.data::<SharedConfig>()?;
         let db = ctx.data::<Database>()?;
-        let _mutation_guard = CATEGORY_MUTATION_GUARD.lock().await;
+        let held = category_writes().await;
 
         let name = input.name.trim().to_string();
         if name.is_empty() {
             return Err(async_graphql::Error::new("category name must not be empty"));
         }
-        let dest_dir = input.dest_dir.filter(|value| !value.is_empty());
+        let dest_dir = input.dest_dir.clone().filter(|value| !value.is_empty());
         validate_category_name(&name, dest_dir.as_deref())?;
+        let fields = input.torrent_fields(None)?;
 
-        with_timed_config_read(config, "categories.mutation.add_category.validate", |cfg| {
-            if cfg
-                .categories
-                .iter()
-                .any(|category| category.name.eq_ignore_ascii_case(&name))
-            {
-                Err(async_graphql::Error::new(format!(
-                    "category '{name}' already exists"
-                )))
-            } else {
-                Ok(())
-            }
-        })
-        .await?;
-
-        let id = {
-            let db = db.clone();
-            spawn_blocking_db("categories.mutation.add_category.next_id", move || {
-                db.next_category_id()
-            })
-            .await?
-        };
-
-        let cat = weaver_server_core::categories::CategoryConfig {
-            id,
-            name: name.clone(),
+        // Made by the one owner of making a category, which a torrent add
+        // that names a new one makes it through too.
+        let category = CategoryConfig {
             dest_dir,
             aliases: input.aliases,
+            seeding: fields.seeding,
+            torrent_route: fields.torrent_route,
+            unpack: fields.unpack,
+            upload_cap: fields.upload_cap,
+            ..CategoryConfig::named(name.clone())
         };
-
-        let added = {
-            let persisted_category = cat.clone();
-            let db = db.clone();
-            let persist = async move {
-                spawn_blocking_db("categories.mutation.add_category.persist", move || {
-                    db.insert_category(&persisted_category)
-                })
-                .await
-            };
-            persist_then_update_config(
-                config,
-                "categories.mutation.add_category.apply",
-                persist,
-                move |cfg| {
-                    if let Some(existing) = cfg
-                        .categories
-                        .iter_mut()
-                        .find(|category| category.id == cat.id)
-                    {
-                        *existing = cat.clone();
-                        Category::from(&*existing)
-                    } else {
-                        cfg.categories.push(cat.clone());
-                        Category::from(&cat)
-                    }
-                },
-            )
-            .await?
+        let added = match make_category(&held, config, db, category)
+            .await
+            .map_err(|error| async_graphql::Error::new(error.to_string()))?
+        {
+            Made::New(category) => category,
+            Made::There(_) => {
+                return Err(async_graphql::Error::new(format!(
+                    "category '{name}' already exists"
+                )));
+            }
         };
+        drop(held);
+        let id = added.id;
+        let added = Category::from(&added);
 
         info!(id, name = %name, "category added");
         reconcile_watch_folder(ctx).await?;
+        // A category is a torrent route's consumer.
+        crate::proxies::refresh(ctx).await?;
+        crate::torrents::reconcile(ctx).await?;
         Ok(added)
     }
     /// Update a category by ID.
@@ -118,13 +84,13 @@ impl CategoriesMutation {
     ) -> Result<Category> {
         let config = ctx.data::<SharedConfig>()?;
         let db = ctx.data::<Database>()?;
-        let _mutation_guard = CATEGORY_MUTATION_GUARD.lock().await;
+        let _held = category_writes().await;
 
         let name = input.name.trim().to_string();
         if name.is_empty() {
             return Err(async_graphql::Error::new("category name must not be empty"));
         }
-        let dest_dir = input.dest_dir.filter(|value| !value.is_empty());
+        let dest_dir = input.dest_dir.clone().filter(|value| !value.is_empty());
         validate_category_name(&name, dest_dir.as_deref())?;
 
         let updated = with_timed_config_read(
@@ -148,11 +114,16 @@ impl CategoriesMutation {
                     )));
                 }
 
+                let fields = input.torrent_fields(Some(current))?;
                 Ok(weaver_server_core::categories::CategoryConfig {
                     id,
                     name: name.clone(),
                     dest_dir: dest_dir.clone(),
                     aliases: input.aliases.clone(),
+                    seeding: fields.seeding,
+                    torrent_route: fields.torrent_route,
+                    unpack: fields.unpack,
+                    upload_cap: fields.upload_cap,
                 })
             },
         )
@@ -185,6 +156,9 @@ impl CategoriesMutation {
 
         info!(id, "category updated");
         reconcile_watch_folder(ctx).await?;
+        // A category is a torrent route's consumer.
+        crate::proxies::refresh(ctx).await?;
+        crate::torrents::reconcile(ctx).await?;
         Ok(updated_category)
     }
     /// Remove a category by ID.
@@ -192,7 +166,7 @@ impl CategoriesMutation {
     async fn remove_category(&self, ctx: &Context<'_>, id: u32) -> Result<Vec<Category>> {
         let config = ctx.data::<SharedConfig>()?;
         let db = ctx.data::<Database>()?;
-        let _mutation_guard = CATEGORY_MUTATION_GUARD.lock().await;
+        let _held = category_writes().await;
 
         with_timed_config_read(
             config,
@@ -235,6 +209,9 @@ impl CategoriesMutation {
 
         info!(id, "category removed");
         reconcile_watch_folder(ctx).await?;
+        // A category is a torrent route's consumer.
+        crate::proxies::refresh(ctx).await?;
+        crate::torrents::reconcile(ctx).await?;
         Ok(remaining)
     }
 }
@@ -258,6 +235,9 @@ mod tests {
 
     fn test_config() -> SharedConfig {
         Arc::new(RwLock::new(weaver_server_core::settings::Config {
+            seeding: None,
+            upload_cap: None,
+            torrent: Default::default(),
             data_dir: "/tmp/weaver".to_string(),
             hardware_profile: None,
             intermediate_dir: None,
@@ -265,7 +245,7 @@ mod tests {
             servers: vec![],
             categories: vec![],
             retry: None,
-            max_download_speed: None,
+            bandwidth: Default::default(),
             cleanup_after_extract: None,
             delete_failed_job_files: None,
             history_retention_days: None,
@@ -298,6 +278,10 @@ mod tests {
                     |cfg| {
                         cfg.categories
                             .push(weaver_server_core::categories::CategoryConfig {
+                                seeding: None,
+                                upload_cap: Default::default(),
+                                torrent_route: false,
+                                unpack: None,
                                 id: 1,
                                 name: "tv".to_string(),
                                 dest_dir: None,

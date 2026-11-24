@@ -89,7 +89,18 @@ impl Extraction for Run {
             }),
             said => said,
         };
-        (walk.sink)(said);
+        if (walk.sink)(Emit::Failed(verdict::failed(&said_of(&error)))) {
+            (walk.sink)(said);
+        }
+    }
+}
+
+// The error as the job's log may show it: a file it could not open names
+// the file, so only the failure's kind is told.
+fn said_of(error: &sevenz_turbo::Error) -> String {
+    match error {
+        sevenz_turbo::Error::FileOpen(error, _) => format!("file open failed: {}", error.kind()),
+        error => error.to_string(),
     }
 }
 

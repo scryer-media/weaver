@@ -1395,14 +1395,44 @@ async fn inspect_certificate_inner(
 
 // Detect destination TLS errors without treating them as proxy establishment failures.
 pub fn is_tls_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    rustls_error(error).is_some()
+}
+
+// Whether the TLS peer's certificate or name was refused: the same whichever
+// path reached the peer. Any other TLS failure, such as a record that does
+// not decrypt or an alert, can be a path's doing.
+pub fn is_certificate_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    use tokio_rustls::rustls::Error;
+    matches!(
+        rustls_error(error),
+        Some(
+            Error::InvalidCertificate(_)
+                | Error::NoCertificatesPresented
+                | Error::UnsupportedNameType
+        )
+    )
+}
+
+// The rustls error in `error`'s source chain, if there is one.
+fn rustls_error<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a tokio_rustls::rustls::Error> {
     let mut source = Some(error);
     while let Some(error) = source {
-        if error.is::<tokio_rustls::rustls::Error>() {
-            return true;
+        if let Some(found) = error.downcast_ref::<tokio_rustls::rustls::Error>() {
+            return Some(found);
         }
-        source = error.source();
+        // tokio-rustls hands the rustls error over inside an io::Error, whose
+        // `source` is the wrapped error's source, skipping the error itself.
+        source = match error
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+        {
+            Some(inner) => Some(inner as &(dyn std::error::Error + 'static)),
+            None => error.source(),
+        };
     }
-    false
+    None
 }
 
 // Upgrade an existing plain TCP connection to TLS (STARTTLS).
@@ -1566,7 +1596,7 @@ mod tests {
     #[cfg(not(windows))]
     use tokio::io::AsyncWriteExt;
     #[cfg(not(windows))]
-    use tokio::net::{TcpListener, TcpStream};
+    use tokio::net::TcpListener;
     #[cfg(not(windows))]
     use tokio::sync::oneshot;
     #[cfg(not(windows))]
@@ -1972,7 +2002,9 @@ mod tests {
     async fn s2n_tls_drain_probe() {
         let (server_config, ca_path) = s2n_probe_tls_config();
         let (addr, flushed_rx) = spawn_tls_drain_server(server_config).await;
-        let tcp = TcpStream::connect(addr).await.unwrap();
+        let tcp = weaver_tunnel::test_support::loopback::connect(addr)
+            .await
+            .unwrap();
         let tls_config = build_s2n_tls_config(Some(&ca_path)).expect("s2n TLS config");
         let s2n_tls = connect_s2n_tls(tcp, tls_config, "localhost")
             .await

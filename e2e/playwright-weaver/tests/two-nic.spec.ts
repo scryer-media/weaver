@@ -60,7 +60,7 @@ test.afterEach(async ({ request }, info) => {
   if (failures.length) await info.attach("two-nic-cleanup-failures", { body: failures.join("\n"), contentType: "text/plain" });
 });
 
-async function egress(request: APIRequestContext, name: string, extra: { maxDownloadSpeed?: number } = {}): Promise<Egress> {
+async function egress(request: APIRequestContext, name: string, extra: { downloadBps?: number } = {}): Promise<Egress> {
   const spec = laneEgress(name);
   const made = await createEgress(request, {
     name: `${name}-${Date.now()}`,
@@ -209,7 +209,7 @@ test.describe("lane M", () => {
   test("M06 a Wi-Fi speed cap holds while the LAN leg runs past it", async ({ request }, info) => {
     test.setTimeout(0);
     const cap = 2 * 1024 * 1024;
-    const wifi = await egress(request, "wifi", { maxDownloadSpeed: cap });
+    const wifi = await egress(request, "wifi", { downloadBps: cap });
     const lan = await egress(request, "lan");
     const id = await server(request, { legs: [directLeg(wifi.id, 50), directLeg(lan.id, 50)] });
     const articles = await postProbeFile("m06-cap", { count: 3200, partBytes: 64 * 1024, nntpHost: stack() });
@@ -233,7 +233,7 @@ test.describe("lane M", () => {
     test.setTimeout(0);
     const wifi = await egress(request, "wifi");
     const lan = await egress(request, "lan");
-    const connect1 = await saveProxyProfile(request, { name: `m07-connect1-${Date.now()}`, kind: "HTTP_CONNECT", enabled: true, host: stack(), port: 8101, username: "fixture", password: "fixture", dnsServers: [], timeoutSeconds: 5 });
+    const connect1 = await saveProxyProfile(request, { name: `m07-connect1-${Date.now()}`, kind: "HTTP_CONNECT", enabled: true, host: stack(), port: 8101, username: "fixture", password: "fixture", timeoutSeconds: 5 });
     created.profiles.push(connect1.id);
     const id = await server(request, { legs: [ladderLeg(wifi.id, [rung.proxy(connect1.id)], 50), directLeg(lan.id, 50)] });
     await startCapture(request, "m07");

@@ -3,6 +3,8 @@
 
 use super::manifest::{BACKUP_FORMAT_VERSION, io_err};
 use super::{BackupArtifact, BackupService, BackupServiceError};
+use crate::settings::persistence::SettingsPersistenceQueries;
+use crate::settings::queries::SettingsQueries;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -52,7 +54,7 @@ pub(super) fn new_backup_info(
     source_engine: &str,
     version: &str,
 ) -> Result<BackupInfo, BackupServiceError> {
-    let now = crate::e2e_clock::utc_now();
+    let now = weaver_server_base::e2e_clock::utc_now();
     let mut suffix = [0u8; 8];
     getrandom::fill(&mut suffix).map_err(io_err)?;
     let suffix = suffix
@@ -309,7 +311,7 @@ pub(super) fn complete_backup(
 }
 
 pub(super) fn prune_retained_backups(dir: &Path, current_version: &str) {
-    match list_backups(dir, crate::e2e_clock::utc_now()) {
+    match list_backups(dir, weaver_server_base::e2e_clock::utc_now()) {
         Ok(backups) => {
             for info in retention_victims(&backups, current_version) {
                 if let Err(error) = delete_artifact(dir, info) {
@@ -436,9 +438,11 @@ impl BackupService {
 
     pub async fn backups(&self) -> Result<Vec<BackupInfo>, BackupServiceError> {
         let dir = PathBuf::from(self.backup_settings().await?.backup_path);
-        tokio::task::spawn_blocking(move || list_backups(&dir, crate::e2e_clock::utc_now()))
-            .await
-            .map_err(io_err)?
+        tokio::task::spawn_blocking(move || {
+            list_backups(&dir, weaver_server_base::e2e_clock::utc_now())
+        })
+        .await
+        .map_err(io_err)?
     }
 
     pub async fn backup_artifact(
@@ -453,7 +457,7 @@ impl BackupService {
         let dir = PathBuf::from(self.backup_settings().await?.backup_path);
         let list_dir = dir.clone();
         let info = tokio::task::spawn_blocking(move || {
-            list_backups(&list_dir, crate::e2e_clock::utc_now())
+            list_backups(&list_dir, weaver_server_base::e2e_clock::utc_now())
         })
         .await
         .map_err(io_err)??
@@ -651,7 +655,7 @@ mod tests {
     #[test]
     fn metadata_recovers_missing_and_stale_artifacts_without_invalidating_old_versions() {
         let dir = tempfile::tempdir().unwrap();
-        let now = crate::e2e_clock::utc_now();
+        let now = weaver_server_base::e2e_clock::utc_now();
         let mut missing = new_backup_info(BackupTrigger::Manual, "sqlite", "0.1.0").unwrap();
         missing.status = BackupArtifactStatus::Ready;
         write_metadata(dir.path(), &missing).unwrap();
@@ -699,7 +703,7 @@ mod tests {
 
     #[test]
     fn retention_keeps_three_current_one_previous_and_all_non_ready_or_manual() {
-        let now = crate::e2e_clock::utc_now();
+        let now = weaver_server_base::e2e_clock::utc_now();
         let mut rows = Vec::new();
         for (index, version) in [
             "1.0.0", "1.0.0", "1.0.0", "1.0.0", "0.9.0", "0.9.0", "0.8.0",
@@ -730,7 +734,7 @@ mod tests {
 
     #[test]
     fn retention_selects_the_highest_older_version_after_a_downgrade() {
-        let now = crate::e2e_clock::utc_now();
+        let now = weaver_server_base::e2e_clock::utc_now();
         let rows: Vec<_> = ["2.0.0", "0.8.0", "0.9.0", "0.9.0", "1.0.0"]
             .into_iter()
             .enumerate()
@@ -750,7 +754,7 @@ mod tests {
 
     #[test]
     fn retention_keeps_the_newest_failure_and_all_newer_version_backups() {
-        let now = crate::e2e_clock::utc_now();
+        let now = weaver_server_base::e2e_clock::utc_now();
         let rows: Vec<_> = ["1.0.0", "1.0.0", "2.0.0", "2.0.0"]
             .into_iter()
             .enumerate()

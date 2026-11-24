@@ -1,0 +1,22 @@
+[package]
+name = "weaver-server-speedtest"
+description = "Speed test connection allocation and failure classification"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[features]
+test-support = []
+
+[dependencies]
+chrono = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+weaver-server-base = { path = "../weaver-server-base" }
+url = "2"
+http = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

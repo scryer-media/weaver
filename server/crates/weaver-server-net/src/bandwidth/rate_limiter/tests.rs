@@ -1,0 +1,194 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+use super::*;
+
+// Forward-date the last refill so the next refill adds no tokens, whatever
+// time the runner lets pass between two calls. That refill stamps the real
+// `now` again, so the tests call this before every balance-touching step and
+// the balance only moves by what the test consumes, refunds or backdates.
+fn freeze_refill(bucket: &mut TokenBucket) {
+    bucket.last_refill = Instant::now() + Duration::from_secs(3600);
+}
+
+#[test]
+fn unlimited_never_waits() {
+    let mut bucket = TokenBucket::new(None);
+    bucket.consume(1_000_000_000);
+    assert!(!bucket.should_wait());
+    assert_eq!(bucket.time_until_ready(), Duration::ZERO);
+}
+
+#[test]
+fn limited_waits_after_exhaustion() {
+    let mut bucket = TokenBucket::new(Some(1_000));
+    // Consume more than capacity to guarantee negative balance.
+    freeze_refill(&mut bucket);
+    bucket.consume(1_500);
+    freeze_refill(&mut bucket);
+    assert!(bucket.should_wait());
+}
+
+#[test]
+fn refill_over_time() {
+    let mut bucket = TokenBucket::new(Some(10_000));
+    // Consume 1000 more than the 2500 capacity to go clearly negative.
+    freeze_refill(&mut bucket);
+    bucket.consume(3_500);
+    freeze_refill(&mut bucket);
+    assert!(bucket.should_wait());
+
+    // Backdate the last refill by 150 ms: at least 1500 tokens (10_000 * 0.15)
+    // come back, recovering the ~1000 token deficit.
+    bucket.last_refill = bucket
+        .last_refill
+        .checked_sub(Duration::from_millis(150))
+        .expect("instant 150 ms in the past");
+
+    // After refill, deficit should be recovered.
+    assert!(!bucket.should_wait());
+}
+
+#[test]
+fn time_until_ready() {
+    let mut bucket = TokenBucket::new(Some(1_000));
+    // The bucket holds a quarter second, 250; consume 750 to create
+    // exactly a 500 token deficit.
+    freeze_refill(&mut bucket);
+    bucket.consume(750);
+    freeze_refill(&mut bucket);
+    let wait = bucket.time_until_ready();
+    // Deficit is 500 tokens at 1000/sec = 0.5s
+    assert_eq!(wait, Duration::from_millis(500));
+}
+
+#[test]
+fn set_rate_changes_limit() {
+    let mut bucket = TokenBucket::new(None);
+    assert!(!bucket.is_limited());
+
+    freeze_refill(&mut bucket);
+    bucket.set_rate(Some(1_000));
+    assert!(bucket.is_limited());
+
+    freeze_refill(&mut bucket);
+    bucket.consume(1_000);
+    freeze_refill(&mut bucket);
+    assert!(bucket.should_wait());
+}
+
+#[test]
+fn set_rate_to_none_unlimited() {
+    let mut bucket = TokenBucket::new(Some(1_000));
+    freeze_refill(&mut bucket);
+    bucket.consume(1_500);
+    freeze_refill(&mut bucket);
+    assert!(bucket.should_wait());
+
+    freeze_refill(&mut bucket);
+    bucket.set_rate(None);
+    assert!(!bucket.is_limited());
+    freeze_refill(&mut bucket);
+    assert!(!bucket.should_wait());
+}
+
+#[test]
+fn negative_balance_recovery() {
+    let mut bucket = TokenBucket::new(Some(1_000));
+    // Consume 250 over capacity and 1000 more — deficit of 1000 tokens.
+    freeze_refill(&mut bucket);
+    bucket.consume(1_250);
+
+    freeze_refill(&mut bucket);
+    let wait = bucket.time_until_ready();
+    // 1000 token deficit at 1000 tokens/sec = 1s
+    assert_eq!(wait, Duration::from_secs(1));
+}
+
+#[test]
+fn refund_reduces_wait_without_exceeding_capacity() {
+    let mut bucket = TokenBucket::new(Some(1_000));
+    freeze_refill(&mut bucket);
+    bucket.consume(750);
+    freeze_refill(&mut bucket);
+    assert!(bucket.should_wait());
+
+    freeze_refill(&mut bucket);
+    bucket.refund(600);
+    freeze_refill(&mut bucket);
+    assert!(!bucket.should_wait());
+
+    freeze_refill(&mut bucket);
+    bucket.refund(10_000);
+    freeze_refill(&mut bucket);
+    bucket.consume(251);
+    freeze_refill(&mut bucket);
+    assert!(bucket.should_wait());
+}
+
+// Dispatch charges every BODY's estimate here before any egress or provider
+// paces its read, and holds the next dispatch while the balance is short. So
+// the global limit holds downloads to its rate whatever the egress and
+// provider limits would allow, and raising those changes nothing: this
+// bucket never sees them.
+#[test]
+fn a_global_speed_limit_holds_downloads_an_egress_or_provider_would_let_through() {
+    let mut global = TokenBucket::new(Some(1_000));
+    // Two bodies that a 4000 B/s provider behind an 8000 B/s egress would
+    // read in half a second, against the quarter second the bucket holds.
+    for _ in 0..2 {
+        freeze_refill(&mut global);
+        global.consume(625);
+    }
+    freeze_refill(&mut global);
+    assert!(global.should_wait());
+    freeze_refill(&mut global);
+    assert_eq!(global.time_until_ready(), Duration::from_secs(1));
+}
+
+#[test]
+fn reconcile_adjusts_estimate_to_actual_bytes() {
+    let mut bucket = TokenBucket::new(Some(1_000));
+    freeze_refill(&mut bucket);
+    bucket.consume(500);
+    freeze_refill(&mut bucket);
+    bucket.reconcile(500, 1_200);
+    freeze_refill(&mut bucket);
+    assert!(bucket.should_wait());
+
+    freeze_refill(&mut bucket);
+    bucket.reconcile(1_200, 100);
+    freeze_refill(&mut bucket);
+    assert!(!bucket.should_wait());
+}
+
+#[test]
+fn a_zero_rate_lets_nothing_through() {
+    let mut bucket = TokenBucket::new(Some(0));
+    assert!(bucket.is_limited());
+    assert!(bucket.should_wait());
+    assert!(bucket.time_until_ready() > Duration::ZERO);
+    bucket.refund(1_000_000);
+    assert!(bucket.should_wait());
+
+    freeze_refill(&mut bucket);
+    bucket.set_rate(Some(1_000));
+    freeze_refill(&mut bucket);
+    assert!(!bucket.should_wait());
+    bucket.set_rate(Some(0));
+    assert!(bucket.should_wait());
+}
+
+// A bucket holds a quarter second of its rate however long it idles, and a
+// cut clamps what it holds to a quarter second of the new rate at once.
+#[test]
+fn a_bucket_holds_a_quarter_second_of_its_rate() {
+    let mut bucket = TokenBucket::new(Some(4_000));
+    bucket.last_refill = Instant::now()
+        .checked_sub(Duration::from_secs(60))
+        .expect("instant a minute in the past");
+    assert!(!bucket.should_wait());
+    assert_eq!(bucket.tokens, 1_000.0);
+    bucket.set_rate(Some(1_000));
+    assert_eq!(bucket.tokens, 250.0);
+}

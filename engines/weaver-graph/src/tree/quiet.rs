@@ -5,13 +5,14 @@
 // will come. Each data object hears the lost ranges of its volumes that
 // nothing vouched for, then that the job is quiet, and rules for itself on
 // what the tree records of it. The tree tells and reads; it chooses no
-// reason. A recovery object heard its losses when they were marked, and
-// the root came out of no object, so neither is told.
+// reason. A recovery object heard its losses when they were marked, so it
+// hears only that the job is quiet, once its ruling is in; the root came
+// out of no object, and is told neither.
 
 use super::{Builder, Effect, NodeId, Tree};
 use crate::member::MemberId;
 use crate::object::{Beside, Standing};
-use crate::recovery::RepairOutcome;
+use crate::recovery::{RepairOutcome, SliceVerdict};
 use crate::volume::{ByteRange, VolumeIndex};
 
 impl Tree {
@@ -45,7 +46,7 @@ impl Tree {
     // records of it, and rules: what it says is applied as if it said it in
     // `deliver`.
     pub fn quiet(&mut self, node: NodeId, builder: &mut dyn Builder, effects: &mut Vec<Effect>) {
-        if !self.told_when_quiet(node) {
+        if !self.live_bound(node) {
             return;
         }
         let Some(mut object) = self.take_object(node) else {
@@ -59,13 +60,48 @@ impl Tree {
         self.emits = emits;
     }
 
+    // The order live nodes hear that the job is quiet, deepest first, in
+    // two tiers: first the nodes whose ruling may still change the
+    // namespace above them (a data object alone of its kind in a namespace
+    // below the root, which a volume may be lifted out of:
+    // `Standing::liftable`), then the rest. The second tier is told only on
+    // a pass the first changed nothing on, as what rises from below must
+    // stand in a namespace before the objects of that namespace rule. One
+    // lookup per live node.
+    pub fn quiet_order(&self) -> (Vec<NodeId>, Vec<NodeId>) {
+        self.live()
+            .into_iter()
+            .rev()
+            .partition(|node| self.told_when_quiet(*node) && self.may_lift(*node))
+    }
+
+    // Whether the object at `node` is alone of its kind in a namespace below
+    // the root that came out of a container, so a volume of its set may lie
+    // one namespace up. Read from the namespace's count of what is bound in
+    // it, by the kind each object was bound as.
+    fn may_lift(&self, node: NodeId) -> bool {
+        let Some((parent, _)) = self.volumes(node) else {
+            return false;
+        };
+        parent != NodeId::ROOT
+            && self.volumes(parent).is_some()
+            && self
+                .nodes
+                .get(&parent)
+                .is_some_and(|found| found.bound.alone(node))
+    }
+
     // A live data object: bound in a namespace, standing, and no recovery
     // object.
     fn told_when_quiet(&self, node: NodeId) -> bool {
+        self.live_bound(node) && !self.recovers(node)
+    }
+
+    // A live object: bound in a namespace and standing.
+    fn live_bound(&self, node: NodeId) -> bool {
         self.nodes
             .get(&node)
             .is_some_and(|found| !found.retired && found.binding.is_some())
-            && !self.recovers(node)
     }
 
     // The ranges of the node's volumes held as damage, an article that never
@@ -92,7 +128,7 @@ impl Tree {
     // Every member the namespace came out of, at some depth, holds no
     // damage a recovery object did not prove, and one of them was found
     // whole or made so.
-    fn vouched_above(&self, node: NodeId) -> bool {
+    pub fn vouched_above(&self, node: NodeId) -> bool {
         let mut at = node;
         while let Some((parent, volumes)) = self.volumes(at) {
             let proven = |member: &MemberId| {
@@ -113,6 +149,45 @@ impl Tree {
             at = parent;
         }
         false
+    }
+
+    // A checking set below the root whose every disagreement is with an
+    // archive volume whose object delivered every member whole against the
+    // CRC its own headers state: the archive's checks answered the claim,
+    // and the set makes none. A set that disagrees with an end file, with a
+    // volume of an object that delivered any member short or unchecked, or
+    // with nothing it can name keeps its claim.
+    pub fn answered_below(&self, node: NodeId, set: NodeId) -> bool {
+        if node == NodeId::ROOT {
+            return false;
+        }
+        let (Some(namespace), Some(recovery)) = (self.namespace(node), self.recovery(set)) else {
+            return false;
+        };
+        let mut verdicts = Vec::new();
+        let mut disputed = namespace.members().filter(|member| {
+            if !recovery.covers(member.id) {
+                return false;
+            }
+            verdicts.clear();
+            recovery.verdicts(member.id, &mut verdicts);
+            verdicts.contains(&SliceVerdict::Damaged)
+        });
+        let extracted_whole = |member: MemberId| {
+            self.child_of(node, member)
+                .and_then(|(child, _)| self.namespace(child))
+                .is_some_and(|below| {
+                    !below.is_empty()
+                        && below
+                            .members()
+                            .all(|member| member.is_whole() && member.crc32.is_some())
+                })
+        };
+        let mut any = false;
+        disputed.all(|member| {
+            any = true;
+            extracted_whole(member.id)
+        }) && any
     }
 
     // The member's damaged ranges past what every recovery object that
@@ -220,6 +295,10 @@ impl Standing for Stood<'_> {
         self.tree.nodes.progress(self.node).asking
     }
 
+    fn refuted(&self) -> bool {
+        self.tree.nodes.progress(self.node).refuted
+    }
+
     fn beside(&self) -> Vec<Beside<'_>> {
         let tree = self.tree;
         let Some((parent, _)) = tree.volumes(self.node) else {
@@ -238,6 +317,10 @@ impl Standing for Stood<'_> {
                 carried: tree.given.get(&(parent, member.id)),
             })
             .collect()
+    }
+
+    fn liftable(&self) -> bool {
+        self.tree.may_lift(self.node)
     }
 }
 

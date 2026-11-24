@@ -42,31 +42,31 @@ const BANNED: &[&str] = &[
 // file, runs alone at startup or on Postgres, or is outside the gate by ruling.
 const LIFTED: &[(&str, usize)] = &[
     (
-        "server/crates/weaver-server-core/src/history/persistence.rs",
+        "server/crates/weaver-server-history/src/history/persistence.rs",
         2,
     ),
     (
-        "server/crates/weaver-server-core/src/history/timeline.rs",
+        "server/crates/weaver-server-history/src/history/timeline.rs",
         1,
     ),
     (
-        "server/crates/weaver-server-core/src/jobs/diagnostic_names.rs",
+        "server/crates/weaver-server-history/src/history/async_ops.rs",
         1,
     ),
     (
-        "server/crates/weaver-server-core/src/jobs/persistence.rs",
+        "server/crates/weaver-server-settings/src/diagnostic_names.rs",
+        1,
+    ),
+    (
+        "server/crates/weaver-server-jobs/src/jobs/persistence.rs",
         3,
     ),
     (
-        "server/crates/weaver-server-core/src/operations/async_ops.rs",
-        1,
-    ),
-    (
-        "server/crates/weaver-server-core/src/operations/backup.rs",
+        "server/crates/weaver-server-composition/src/operations/backup.rs",
         10,
     ),
     (
-        "server/crates/weaver-server-core/src/operations/backup/logical.rs",
+        "server/crates/weaver-server-composition/src/operations/backup/logical.rs",
         10,
     ),
     (
@@ -78,27 +78,31 @@ const LIFTED: &[(&str, usize)] = &[
         1,
     ),
     (
-        "server/crates/weaver-server-core/src/persistence/connection.rs",
+        "server/crates/weaver-server-db/src/persistence/connection.rs",
         1,
     ),
     (
-        "server/crates/weaver-server-core/src/persistence/postgres_migrations.rs",
-        8,
-    ),
-    (
-        "server/crates/weaver-server-core/src/persistence/sql_runtime.rs",
+        "server/crates/weaver-server-migrations/src/postgres_migrations.rs",
         7,
     ),
     (
-        "server/crates/weaver-server-core/src/persistence/sql_services.rs",
+        "server/crates/weaver-server-composition/src/persistence/postgres_migrations.rs",
         1,
     ),
     (
-        "server/crates/weaver-server-core/src/schema_migrations.rs",
+        "server/crates/weaver-server-db/src/persistence/sql_runtime.rs",
+        7,
+    ),
+    (
+        "server/crates/weaver-server-db/src/persistence/sql_services.rs",
+        1,
+    ),
+    (
+        "server/crates/weaver-server-migrations/src/schema_migrations.rs",
         12,
     ),
     (
-        "server/crates/weaver-server-core/src/schema_migrations/nzb_tables_v85.rs",
+        "server/crates/weaver-server-migrations/src/schema_migrations/nzb_tables_v85.rs",
         1,
     ),
     (

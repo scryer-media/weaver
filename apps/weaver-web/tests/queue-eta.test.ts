@@ -156,3 +156,73 @@ test("a queue total that moves leaves the speed as it was", () => {
   assert.notEqual(moved, 30 * MB);
   assert.ok(moved < 12 * MB, `${moved}`);
 });
+
+test("a queue with nothing downloading reads 0 on the next tick", () => {
+  const clock = new Clock();
+  assert.ok(clock.run(60, 10 * MB, FREE) > 9 * MB);
+
+  // The last download finished with bytes still counted; the daemon's rate trails.
+  assert.equal(clock.tick(0, { paused: false, speedLimit: 0, idle: true }, 8 * MB), 0);
+  // A slow disk still writing does not hold the speed up once nothing downloads.
+  assert.equal(clock.tick(0, { paused: false, speedLimit: 0, idle: true, diskRate: 5 * MB }, 3 * MB), 0);
+
+  // A download starts again: the first tick reads its rate.
+  assert.equal(clock.tick(4 * MB, FREE), 4 * MB);
+});
+
+test("a stall behind a slow disk holds the speed at the disk's rate", () => {
+  const clock = new Clock();
+  clock.run(120, 10 * MB, FREE);
+
+  const behind: EtaConditions = { paused: false, speedLimit: 0, diskRate: 4 * MB };
+  // Ten minutes with no byte in: without the disk's rate this eases to 0.
+  const held = clock.run(600, 0, behind);
+  assert.equal(held, 4 * MB);
+
+  // Bytes come again above the disk's rate: the speed follows them up.
+  assert.ok(clock.run(120, 10 * MB, behind) > 9 * MB);
+});
+
+test("a job leaving the queue during a stall behind a slow disk keeps the speed", () => {
+  const clock = new Clock();
+  clock.run(120, 10 * MB, FREE);
+
+  const behind: EtaConditions = { paused: false, speedLimit: 0, diskRate: 4 * MB };
+  // A finished job's bytes leave the totals while nothing comes in.
+  clock.downloaded -= 500 * MB;
+  assert.equal(clock.tick(0, behind), 4 * MB);
+  assert.equal(clock.run(30, 0, behind), 4 * MB);
+});
+
+test("a wait with nothing downloading keeps the disk's rate for the stall after it", () => {
+  const clock = new Clock();
+  clock.run(120, 10 * MB, FREE);
+
+  const behind: EtaConditions = { paused: false, speedLimit: 0, diskRate: 4 * MB };
+  // The jobs left only wait for a while: no speed is shown.
+  assert.equal(clock.tick(0, { ...behind, idle: true }), 0);
+  // They go on at a trickle behind the same disk: the speed is the disk's
+  // rate at once, not the trickle's.
+  assert.equal(clock.tick(0.5 * MB, behind), 4 * MB);
+  assert.equal(clock.run(60, 0.5 * MB, behind), 4 * MB);
+
+  // A pause starts again from nothing: the trickle is all that is known.
+  clock.tick(0, { ...behind, paused: true });
+  assert.ok(clock.run(60, 0.5 * MB, behind) <= 0.6 * MB);
+});
+
+test("a disk faster than the downloads lifts nothing", () => {
+  const clock = new Clock();
+  const fast: EtaConditions = { paused: false, speedLimit: 0, diskRate: 50 * MB };
+  const shown = clock.run(120, 2 * MB, fast);
+  assert.ok(shown <= 2.1 * MB, `${shown}`);
+  assert.ok(clock.run(600, 0, fast) <= 2.1 * MB);
+});
+
+test("a speed limit caps the disk's rate too", () => {
+  const clock = new Clock();
+  clock.run(120, 10 * MB, FREE);
+  const limited: EtaConditions = { paused: false, speedLimit: 2 * MB, diskRate: 4 * MB };
+  clock.run(60, 2 * MB, limited);
+  assert.ok(clock.run(600, 0, limited) <= 2 * MB);
+});

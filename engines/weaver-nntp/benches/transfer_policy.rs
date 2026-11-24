@@ -28,6 +28,7 @@ fn bench_transfer_policy(c: &mut Criterion) {
     let rate_registry = ServerTransferRegistry::new();
     let rate_control = rate_registry.configure(StableServerId(2), ServerTransferConfig::default());
     let rate_config = ServerTransferConfig {
+        closed: false,
         rate_bytes_per_sec: 1_000_000_000,
         quota: None,
     };
@@ -58,6 +59,7 @@ fn bench_transfer_policy(c: &mut Criterion) {
                 let generation = quota_generation.get().wrapping_add(1);
                 quota_generation.set(generation);
                 quota_control.update_config(ServerTransferConfig {
+                    closed: false,
                     rate_bytes_per_sec: 0,
                     quota: Some(QuotaRuntimeConfig {
                         limit_bytes: 1024 * 1024,
@@ -94,6 +96,7 @@ fn bench_transfer_policy(c: &mut Criterion) {
                 mixed_generation.set(generation);
                 mixed_control.update_config(ServerTransferConfig::default());
                 mixed_control.update_config(ServerTransferConfig {
+                    closed: false,
                     rate_bytes_per_sec: 1_000_000_000,
                     quota: Some(QuotaRuntimeConfig {
                         limit_bytes: 1024 * 1024,

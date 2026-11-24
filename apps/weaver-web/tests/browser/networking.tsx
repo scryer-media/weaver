@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { MemoryRouter } from "react-router";
 import { Client, Provider } from "urql";
@@ -9,6 +9,7 @@ import { fromValue, mergeMap, pipe } from "wonka";
 import { TranslateContext } from "@/lib/context/translate-context";
 import { translateDictionary } from "@/lib/i18n";
 import en from "@/lib/i18n/locales/en";
+import { NextDataContext, useDnsProfileReads, type NextData } from "@/next/data/next-data";
 import { plannedFlow, type Consumer, type NetworkingAction, type NetworkingData } from "@/next/features/networking/data";
 import { FlowEditor } from "@/next/features/networking/FlowEditor";
 import { NetworkFlow, type FlowTarget } from "@/next/features/networking/NetworkFlow";
@@ -18,10 +19,10 @@ import { directLeg, type Egress, type NetworkFlow as Flow, type NetworkRoute } f
 import type { ProxyKind, ProxyProfile } from "@/lib/proxies";
 import "@/next/fonts.css";
 import "@/next/theme.css";
-const quota=(limitBytes:number)=>({enabled:true,period:"MONTHLY" as const,limitBytes,resetTimeMinutesLocal:0,weeklyResetWeekday:"MON" as const,monthlyResetDay:1});
-const usage=(usedBytes:number,blocked:boolean)=>({usedBytes,reservedBytes:0,remainingBytes:null,blocked,windowStartsAtEpochMs:null,windowEndsAtEpochMs:null,timezoneName:"UTC"});
-const egresses:Egress[]=[{id:0,name:"System",addresses:["192.0.2.21","2001:db8::21"],bindingKind:"SYSTEM",interfaceName:null,sourceAddress:null,enabled:true,maxDownloadSpeed:0,health:"UP",reason:null},{id:1,name:"WAN Fiber",bindingKind:"SOURCE_ADDRESS",interfaceName:null,sourceAddress:"192.0.2.10",enabled:true,maxDownloadSpeed:52_428_800,downloadQuota:quota(536_870_912_000),downloadQuotaUsage:usage(128_849_018_880,false),health:"UP",reason:null},{id:2,name:"LTE standby",bindingKind:"SOURCE_ADDRESS",interfaceName:null,sourceAddress:"198.51.100.10",enabled:true,maxDownloadSpeed:0,downloadQuota:quota(21_474_836_480),downloadQuotaUsage:usage(21_474_836_480,true),health:"DOWN",reason:"Interface is down"},{id:3,name:"Spare uplink",bindingKind:"SOURCE_ADDRESS",interfaceName:null,sourceAddress:"203.0.113.10",enabled:true,maxDownloadSpeed:0,health:"UP",reason:null}];
-const profile=(id:number,name:string,kind:ProxyKind,enabled=true):ProxyProfile=>({id,name,kind,enabled,host:`${name.toLowerCase().replaceAll(" ","-")}.fixture.invalid`,port:kind==="WIRE_GUARD"?51820:1080,resolver:kind==="WIRE_GUARD"?"WEAVER":"PROXY",dnsServers:[],tunnelAddresses:kind==="WIRE_GUARD"?[`10.0.0.${id}/32`]:[],peerPublicKey:null,tunnelPublicKey:null,mtu:1420,keepaliveSeconds:null,timeoutSeconds:10,hostKeyFingerprint:null,hasUsername:false,hasPassword:false,hasPrivateKey:kind==="WIRE_GUARD",hasPassphrase:false,hasPresharedKey:false});
+const quota=(downloadBytes:number)=>({downloadBytes,uploadSoftBytes:null,uploadTrickleBps:2048,uploadHardBytes:null,period:"MONTHLY" as const,resetTimeMinutesLocal:0,weeklyResetWeekday:"MON" as const,monthlyResetDay:1});
+const usage=(usedBytes:number,stopped:boolean)=>({down:{usedBytes,remainingBytes:null,state:stopped?"STOPPED" as const:"NORMAL" as const},up:{usedBytes:0,remainingBytes:null,state:"NORMAL" as const},state:stopped?"STOPPED" as const:"NORMAL" as const,periodStartEpochMs:null,periodEndEpochMs:null,timezoneName:"UTC"});
+const egresses:Egress[]=[{id:0,name:"System",addresses:["192.0.2.21","2001:db8::21"],bindingKind:"SYSTEM",interfaceName:null,sourceAddress:null,enabled:true,downloadBps:null,uploadBps:null,health:"UP",reason:null},{id:1,name:"WAN Fiber",bindingKind:"SOURCE_ADDRESS",interfaceName:null,sourceAddress:"192.0.2.10",enabled:true,downloadBps:52_428_800,uploadBps:null,quota:quota(536_870_912_000),quotaUsage:usage(128_849_018_880,false),health:"UP",reason:null},{id:2,name:"LTE standby",bindingKind:"SOURCE_ADDRESS",interfaceName:null,sourceAddress:"198.51.100.10",enabled:true,downloadBps:null,uploadBps:null,quota:quota(21_474_836_480),quotaUsage:usage(21_474_836_480,true),health:"DOWN",reason:"Interface is down"},{id:3,name:"Spare uplink",bindingKind:"SOURCE_ADDRESS",interfaceName:null,sourceAddress:"203.0.113.10",enabled:true,downloadBps:null,uploadBps:null,health:"UP",reason:null}];
+const profile=(id:number,name:string,kind:ProxyKind,enabled=true):ProxyProfile=>({id,name,kind,enabled,host:`${name.toLowerCase().replaceAll(" ","-")}.fixture.invalid`,port:kind==="WIRE_GUARD"?51820:1080,dnsServers:[],tunnelAddresses:kind==="WIRE_GUARD"?[`10.0.0.${id}/32`]:[],peerPublicKey:null,tunnelPublicKey:null,mtu:1420,keepaliveSeconds:null,timeoutSeconds:10,hostKeyFingerprint:null,natpmp:false,forwardedPort:null,hasUsername:false,hasPassword:false,hasPrivateKey:kind==="WIRE_GUARD",hasPassphrase:false,hasPresharedKey:false});
 const profiles=[profile(1,"Amsterdam","WIRE_GUARD"),profile(2,"Frankfurt","WIRE_GUARD"),profile(3,"Lisbon","WIRE_GUARD",false),profile(4,"Relay one","SOCKS5"),profile(5,"Relay two","SOCKS5"),profile(6,"Exit","HTTP_CONNECT")];
 // A pool can be saved before it has a member; no route may use it until it does.
 const pools=[{id:1,name:"Europe",kind:"WIRE_GUARD" as const,memberIds:[2,3,1],enabled:true},{id:2,name:"Relays",kind:"SOCKS5" as const,memberIds:[4],enabled:true},{id:3,name:"Empty",kind:"SOCKS5" as const,memberIds:[],enabled:true}];
@@ -44,7 +45,7 @@ const split=new URLSearchParams(location.search).has("split");
 const flowFor=(route:NetworkRoute,down:boolean):Flow=>({sampledAt:1790640000,legs:[...route.legs.map((leg,position)=>({...leg,consumer:"server:1",position,target:position===2||down?0:[30,15][position]??0,open:position===2||down?0:[24,12][position]??0,opening:0,state:position===2||down?"DOWN":"UP",reason:position===2?"Interface is down":null,pinnedAddress:null,sourceAddress:position===0?"192.0.2.10:45123":"127.0.0.1:45124",bytesPerSecond:position===0?24_000_000:0,selectedRung:position===0?0:null,selectedProxyId:position===0?1:null})),backupLeg,heldLeg,feedLeg,outboundLeg],pools:[{poolId:1,egressId:1,pinnedMember:1,members:[{id:1,open:split?18:24,opening:0,warmed:true,blocked:null,connectMs:20,bytesPerSecond:1_000_000,liveBytesPerSecond:split?18_000_000:24_000_000,samples:40,failures:0},{id:2,open:split?6:0,opening:0,warmed:true,blocked:null,connectMs:25,bytesPerSecond:800_000,liveBytesPerSecond:split?6_000_000:0,samples:20,failures:0},{id:3,state:"DISABLED",open:0,opening:0,warmed:false,blocked:null,connectMs:null,bytesPerSecond:null,liveBytesPerSecond:0,samples:0,failures:0}]}]});
 const data:NetworkingData={egressInterfaces:egresses,proxyProfiles:profiles,proxyPools:pools,discoverNetworkInterfaces:[],platformNetworking:{platform:"fixture",egressBindingKinds:["SYSTEM","INTERFACE","SOURCE_ADDRESS"],sourceAddressHint:null,container:false,bridgeNetworkSuspected:false,maxWireguardInstances:4,notes:[]},servers:[],rssFeeds:[]};
 // A test through a drafted route, as the daemon runs one: every path once, with each proxy under test on top. A disabled proxy fails where it stands.
-type TestVariables={route:{legs:{egressId:number;path:{direct?:boolean;ladder?:{directFallback:boolean;rungs:{proxy?:number;pool?:number;chain?:number[]}[]}}}[]};subject:{proxy?:number;pool?:number}|null;target:{host:string;port:number}|null};
+type TestVariables={route:{legs:{egressId:number;path:{direct?:boolean;ladder?:{directFallback:boolean;rungs:{proxy?:number;pool?:number;chain?:number[]}[]}}}[]};subject:{proxy?:number;pool?:number}|null;target:{host:string;port:number}|null;torrent:boolean};
 const tests:TestVariables[]=[];
 Object.assign(window,{networkingFixture:{tests}});
 const members=(pool:number)=>pools.find(candidate=>candidate.id===pool)?.memberIds??[];
@@ -70,7 +71,7 @@ const client=new Client({url:"http://fixture.invalid/graphql",exchanges:[()=>ope
  const definition=operation.query.definitions.find(entry=>entry.kind==="OperationDefinition");
  const name=definition?.kind==="OperationDefinition"?definition.name?.value??"":"";
  const flow={...flowFor(initial,false),consumers:consumersFor(initial),proxies:profiles,proxyPools:pools,egresses};
- return fromValue({operation,data:name==="ProxyProfiles"?{proxyProfiles:profiles}:name==="Networking"?data:name==="NetworkFlow"||name==="NetworkFlowUpdates"?{networkFlow:flow}:name==="TestVia"?{testVia:testVia(operation.variables as TestVariables)}:{}});
+ return fromValue({operation,data:name==="ProxyProfiles"?{proxyProfiles:profiles}:(name==="Networking"||name==="DraftRoute")?data:name==="NetworkFlow"||name==="NetworkFlowUpdates"?{networkFlow:flow}:name==="TestVia"?{testVia:testVia(operation.variables as TestVariables)}:{},stale:false,hasNext:false});
 }))]});
 const action:NetworkingAction=async()=>null;
 const width=Number(new URLSearchParams(location.search).get("width")??1400);
@@ -80,4 +81,11 @@ function Fixture(){
  return <MemoryRouter><main className="bg-wv-bg text-wv-primary" style={{padding:16,maxWidth:width,margin:"auto",display:"grid",gap:16}}><button onClick={()=>setDown(!down)}>Toggle all down</button><NetworkFlow flow={flow} egresses={egresses} profiles={profiles} pools={pools} consumers={consumers} onEdit={setEditing} traffic trace/><FlowEditor target={editing} onClose={()=>setEditing(null)} data={data} egresses={egresses} consumers={consumers} flow={flow} action={action} busy={false} proxyEditor={(id,onClose)=><ProxyEditorFor key={id} id={id} onClose={onClose} onChanged={()=>{}}/>}/>
  <RouteEditor value={route} onChange={setRoute} egresses={egresses} profiles={profiles} pools={pools} cap={50} status={flow.legs.filter(leg=>leg.consumer==="server:1")}/><output aria-label="Route weights">{route.legs.map(l=>l.weight).join(",")}</output></main></MemoryRouter>;
 }
-createRoot(document.getElementById("root")!).render(<TranslateContext.Provider value={{t:(key,values)=>translateDictionary(en,key,values),uiLanguage:"eng",selectedLanguage:{code:"eng",label:"English"},setLanguagePreference:()=>{}}}><Provider value={client}><Fixture/></Provider></TranslateContext.Provider>);
+// Torrents on: the editors show their torrent parts, as they did before those parts asked.
+const torrentsOn={torrents:"on",torrentPresence:{available:true,enabled:true,jobs:false,running:false,windingDown:false,windDown:null}} as NextData;
+createRoot(document.getElementById("root")!).render(<TranslateContext.Provider value={{t:(key,values)=>translateDictionary(en,key,values),uiLanguage:"eng",selectedLanguage:{code:"eng",label:"English"},setLanguagePreference:()=>{}}}><Provider value={client}><DnsReads><Fixture/></DnsReads></Provider></TranslateContext.Provider>);
+
+/* Holds the DNS profile reads as NextDataProvider does, for the editors that offer them, with torrents on. */
+function DnsReads({ children }: { children: ReactNode }) {
+  return <NextDataContext.Provider value={{...torrentsOn,...useDnsProfileReads()} as NextData}>{children}</NextDataContext.Provider>;
+}

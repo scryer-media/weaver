@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use weaver_server_core::history::timeline::HistoryTimelineQueries;
 mod common;
 
 use common::{TestHarness, assert_no_errors, response_data};
@@ -153,6 +154,7 @@ async fn job_detail_snapshot_names_the_servers_that_served_an_archived_job() {
     let stale_server_id = server_id + 1_000;
     let job_id = 8_150_u64;
     h.insert_history_row(&JobHistoryRow {
+        protocol: weaver_server_core::Protocol::Nzb,
         job_id,
         job_hash: None,
         name: "attributed-job".to_string(),
@@ -416,6 +418,7 @@ async fn job_detail_snapshot_carries_the_newest_100_events_and_the_count() {
         completed_at: 2_000,
         metadata: None,
         server_attribution: None,
+        protocol: weaver_server_core::Protocol::Nzb,
         archived_at: None,
     };
     h.insert_history_row(&row);

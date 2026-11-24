@@ -1,0 +1,2529 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+use weaver_server_db::persistence::{
+    StateError,
+    sql_runtime::{SqlArg, SqlRuntime, SqlTx},
+};
+use weaver_server_settings::settings::model::tracker_host;
+
+use super::model::{
+    FilePriority, KeptIntent, TorrentCounters, TorrentInsert, TorrentIntent, TorrentRecord,
+    TrackerEntry, UnpackEnd, file_priorities_str, named_by_str,
+};
+use super::pieces::Kept;
+use super::queries::{
+    TORRENT_COLUMNS, TorrentDatabase, TorrentsInternalQueries, count, counters_from_row,
+    torrent_by_infohash_tx,
+};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use weaver_server_base::jobs::ids::JobId;
+use weaver_server_settings::settings::SeedingPolicy;
+use weaver_torrent::ResumePeers;
+
+// A tracker row holds where the tracker sits in the announce list and who
+// named it; how announcing to it goes is read from the session. Its URL is
+// sealed, so its ciphertext differs each time it is written: the URL's keyed
+// digest, `url_key`, is what says two rows of a tier are the same tracker,
+// and the second is not kept.
+const TRACKER_INSERT: &str =
+    "INSERT INTO torrent_trackers (job_id, tier, url, url_key, named_by) VALUES ";
+const TRACKER_ROW: &str = "({}, {}, {}, {}, {})";
+const TRACKER_CONFLICT: &str = " ON CONFLICT (job_id, tier, url_key) DO NOTHING";
+// Every host a torrent has announced to stays known after the torrent is
+// gone, so a tracker rule can be picked from them. The URL is not kept: a
+// private tracker's carries the operator's passkey.
+const TRACKER_HOST_INSERT: &str = "INSERT INTO tracker_hosts (host) VALUES ";
+const TRACKER_HOST_ROW: &str = "({})";
+const TRACKER_HOST_CONFLICT: &str = " ON CONFLICT (host) DO NOTHING";
+
+// A torrent's tracker rows (`insert_tracker_rows`).
+pub async fn insert_trackers(
+    tx: &mut SqlTx<'_>,
+    job_id: i64,
+    trackers: &[TrackerEntry],
+    key: Option<&weaver_server_db::persistence::encryption::EncryptionKey>,
+) -> Result<(), StateError> {
+    let rows: Vec<(i64, &TrackerEntry)> =
+        trackers.iter().map(|tracker| (job_id, tracker)).collect();
+    insert_tracker_rows(tx, &rows, key).await
+}
+
+// The one place tracker rows are written, of one torrent or of many, each
+// row its torrent's id and the tracker: each row, and the host of each,
+// recorded as `tracker_host` spells it.
+pub async fn insert_tracker_rows(
+    tx: &mut SqlTx<'_>,
+    rows: &[(i64, &TrackerEntry)],
+    key: Option<&weaver_server_db::persistence::encryption::EncryptionKey>,
+) -> Result<(), StateError> {
+    // As many rows a statement as its binds allow.
+    for chunk in rows.chunks(weaver_server_db::persistence::sql_runtime::max_rows_for_tx(
+        tx, 5,
+    )) {
+        let sql = format!(
+            "{TRACKER_INSERT}{}{TRACKER_CONFLICT}",
+            vec![TRACKER_ROW; chunk.len()].join(", ")
+        );
+        let mut args = Vec::with_capacity(chunk.len() * 5);
+        for &(job_id, tracker) in chunk {
+            args.extend([
+                SqlArg::I64(job_id),
+                SqlArg::I64(i64::from(tracker.tier)),
+                // Sealed: a private tracker's URL carries the passkey.
+                SqlArg::Text(super::sealed::seal_url(key, &tracker.url)?),
+                SqlArg::Bytes(super::sealed::url_key(key, &tracker.url)?),
+                SqlArg::Text(named_by_str(tracker.named_by).to_owned()),
+            ]);
+        }
+        tx.execute(&sql, &args).await?;
+    }
+    let hosts: Vec<String> = rows
+        .iter()
+        .filter_map(|(_, tracker)| tracker_host(&tracker.url))
+        .collect::<std::collections::BTreeSet<String>>()
+        .into_iter()
+        .collect();
+    for chunk in hosts.chunks(weaver_server_db::persistence::sql_runtime::max_rows_for_tx(
+        tx, 1,
+    )) {
+        let sql = format!(
+            "{TRACKER_HOST_INSERT}{}{TRACKER_HOST_CONFLICT}",
+            vec![TRACKER_HOST_ROW; chunk.len()].join(", ")
+        );
+        let args: Vec<SqlArg> = chunk.iter().cloned().map(SqlArg::Text).collect();
+        tx.execute(&sql, &args).await?;
+    }
+    Ok(())
+}
+
+// One column of each torrent `rows` names, each row its id and the value,
+// as `UPDATE ... CASE` statements of as many rows as their binds allow.
+// A torrent named twice takes the value named last, as one statement per
+// row in turn left it.
+pub async fn update_column_tx(
+    tx: &mut SqlTx<'_>,
+    column: &str,
+    rows: &[(i64, SqlArg)],
+) -> Result<(), StateError> {
+    let mut seen = std::collections::HashSet::with_capacity(rows.len());
+    let mut last: Vec<&(i64, SqlArg)> = rows
+        .iter()
+        .rev()
+        .filter(|(id, _)| seen.insert(*id))
+        .collect();
+    last.reverse();
+    // Three binds a row: the CASE arm's id and value, and the id in the
+    // list.
+    for chunk in last.chunks(weaver_server_db::persistence::sql_runtime::max_rows_for_tx(
+        tx, 3,
+    )) {
+        let sql = format!(
+            "UPDATE torrents SET {column} = CASE job_id {}END WHERE job_id IN ({})",
+            "WHEN {} THEN {} ".repeat(chunk.len()),
+            vec!["{}"; chunk.len()].join(", ")
+        );
+        let mut args = Vec::with_capacity(chunk.len() * 3);
+        for (id, value) in chunk {
+            args.push(SqlArg::I64(*id));
+            args.push(value.clone());
+        }
+        args.extend(chunk.iter().map(|(id, _)| SqlArg::I64(*id)));
+        tx.execute(&sql, &args).await?;
+    }
+    Ok(())
+}
+
+// The mark a removal leaves on a torrent's row: its files kept, or asked
+// to go with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetiringMark {
+    Kept,
+    Deleted,
+}
+
+impl RetiringMark {
+    pub const ALL: [Self; 2] = [Self::Kept, Self::Deleted];
+
+    pub const fn of(delete_files: bool) -> Self {
+        if delete_files {
+            Self::Deleted
+        } else {
+            Self::Kept
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Kept => "kept",
+            Self::Deleted => "deleted",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mark| mark.as_str() == value)
+    }
+}
+
+/// One torrent's `torrent_adopted` and `torrent_outputs`, as
+/// [`TorrentsPersistenceInsertPlacedTorrentInternalQueries::torrents_made`] reads them for many.
+pub type MadeRead = (
+    Result<Option<super::model::Adopted>, StateError>,
+    Result<Vec<String>, StateError>,
+);
+
+/// Seed mode as a pass over the torrents found it, written together by
+/// [`TorrentsPersistenceInsertPlacedTorrentInternalQueries::write_torrent_seed_modes`].
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct TorrentSeedWrites {
+    /// Left seed mode: no check passed in it is kept.
+    pub left: Vec<JobId>,
+    /// The pieces each still in it has checked, a bitfield as the wire's.
+    pub verified: Vec<(JobId, Vec<u8>)>,
+}
+
+impl TorrentSeedWrites {
+    pub fn is_empty(&self) -> bool {
+        self.left.is_empty() && self.verified.is_empty()
+    }
+}
+
+// The statement that writes a torrent's ledger and the peers and bans it
+// begins with, each only when given; none when neither is.
+fn resume_update(
+    job_id: JobId,
+    counters: Option<&TorrentCounters>,
+    peers: Option<&ResumePeers>,
+) -> Result<Option<(String, Vec<SqlArg>)>, StateError> {
+    let mut sets = Vec::new();
+    let mut args = Vec::new();
+    if let Some(counters) = counters {
+        sets.push(
+            "uploaded_bytes = {}, downloaded_bytes = {}, active_duration_s = {}, \
+             last_seen_complete_ms = {}, finished_duration_s = {}, last_activity_ms = {}, \
+             consecutive_seeding_s = {}, failed_bytes = {}, redundant_bytes = {}",
+        );
+        args.extend([
+            SqlArg::I64(stored(counters.uploaded_bytes)?),
+            SqlArg::I64(stored(counters.downloaded_bytes)?),
+            SqlArg::I64(stored(counters.active_duration_s)?),
+            SqlArg::OptI64(counters.last_seen_complete_ms),
+            SqlArg::I64(stored(counters.finished_duration_s)?),
+            SqlArg::OptI64(counters.last_activity_ms),
+            SqlArg::I64(stored(counters.consecutive_seeding_s)?),
+            SqlArg::I64(stored(counters.failed_bytes)?),
+            SqlArg::I64(stored(counters.redundant_bytes)?),
+        ]);
+    }
+    if let Some(peers) = peers {
+        sets.push("peers = {}, banned_peers = {}, found_peers = {}");
+        args.extend([
+            SqlArg::OptText(stored_list(&peers.peers)?),
+            SqlArg::OptText(stored_list(&peers.banned)?),
+            SqlArg::OptText(stored_list(&peers.found)?),
+        ]);
+    }
+    if sets.is_empty() {
+        return Ok(None);
+    }
+    args.push(SqlArg::I64(stored(job_id.0)?));
+    let sql = format!(
+        "UPDATE torrent_counters SET {} WHERE job_id = {{}}",
+        sets.join(", ")
+    );
+    Ok(Some((sql, args)))
+}
+
+/// A batch of torrents' own settings, by column: each column is written
+/// for the torrents it lists and no other (`Database::set_torrent_settings`).
+#[derive(Debug, Default)]
+pub struct TorrentSettingRows {
+    pub forced: Vec<(JobId, bool)>,
+    pub sequential: Vec<(JobId, bool)>,
+    pub first_last_piece_first: Vec<(JobId, bool)>,
+    pub upload_limit: Vec<(JobId, Option<u64>)>,
+    pub download_limit: Vec<(JobId, Option<u64>)>,
+    pub policy_override: Vec<(JobId, Option<SeedingPolicy>)>,
+}
+
+pub trait TorrentsPersistenceLiveHeldPathsInternalQueries {
+    fn live_held_paths(
+        &self,
+        keys: &[PathBuf],
+    ) -> Result<std::collections::BTreeSet<PathBuf>, StateError>;
+    fn set_torrents_held(&self, torrents: &[(JobId, Vec<String>)]) -> Result<(), StateError>;
+    fn add_torrent_held(&self, job_id: JobId, held: &[String]) -> Result<(), StateError>;
+    fn held_rows(&self, jobs: &[JobId]) -> Result<Vec<(JobId, String)>, StateError>;
+    fn respell_held(&self, rows: &[(JobId, String, String)]) -> Result<(), StateError>;
+    fn set_torrent_held(&self, job_id: JobId, held: Vec<String>) -> Result<(), StateError>;
+}
+
+impl<T: TorrentDatabase> TorrentsPersistenceLiveHeldPathsInternalQueries for T {
+    // The paths live torrents hold (`torrent_held_paths`), never one a
+    // removal left retiring, that are one of `keys`, lie under one, or are
+    // above one, each key spelled as the filesystem spells it. Served by
+    // the path index: one statement for the paths under each bind-sized
+    // chunk of `keys`, and one for each chunk of the folders above them.
+    // What comes back is bounded by what live torrents hold there, never by
+    // how many share a folder above it.
+    fn live_held_paths(
+        &self,
+        keys: &[PathBuf],
+    ) -> Result<std::collections::BTreeSet<PathBuf>, StateError> {
+        use weaver_server_db::persistence::sql_runtime::SqlEngine;
+        if keys.is_empty() {
+            return Ok(Default::default());
+        }
+        let separator = std::path::MAIN_SEPARATOR;
+        let after = char::from_u32(u32::from(separator) + 1).unwrap_or(separator);
+        let under: Vec<(String, String, String)> = keys
+            .iter()
+            .map(|key| {
+                let key = key.to_string_lossy().trim_end_matches(separator).to_owned();
+                (
+                    key.clone(),
+                    format!("{key}{separator}"),
+                    format!("{key}{after}"),
+                )
+            })
+            .collect();
+        let above: Vec<String> = keys
+            .iter()
+            .flat_map(|key| key.ancestors().skip(1))
+            .map(|key| key.to_string_lossy().into_owned())
+            .filter(|key| !key.is_empty())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let datastore = self.borrow().datastore();
+        self.borrow().run_sql_blocking_read(async move {
+            // Ordered by bytes on both engines, so a range over a folder's
+            // path is the paths under it.
+            let path = match datastore.engine() {
+                SqlEngine::Sqlite => "h.path".to_owned(),
+                SqlEngine::Postgres => "h.path COLLATE \"C\"".to_owned(),
+            };
+            let select = "SELECT DISTINCT h.path FROM torrent_held_paths h \
+                          JOIN torrents t ON t.job_id = h.job_id \
+                          WHERE t.retiring IS NULL AND";
+            let mut found = std::collections::BTreeSet::new();
+            let rows_per = weaver_server_db::persistence::sql_runtime::max_rows_for_engine(
+                datastore.engine(),
+                3,
+            );
+            for chunk in under.chunks(rows_per) {
+                let filters = vec![
+                    format!("{path} = {{}} OR ({path} >= {{}} AND {path} < {{}})");
+                    chunk.len()
+                ]
+                .join(" OR ");
+                let args = chunk
+                    .iter()
+                    .flat_map(|(key, from, to)| {
+                        [
+                            SqlArg::Text(key.clone()),
+                            SqlArg::Text(from.clone()),
+                            SqlArg::Text(to.clone()),
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    &format!("{select} ({filters})"),
+                    &args,
+                )
+                .await?;
+                for row in rows {
+                    found.insert(PathBuf::from(row.text("path")?));
+                }
+            }
+            let rows_per = weaver_server_db::persistence::sql_runtime::max_rows_for_engine(
+                datastore.engine(),
+                1,
+            );
+            for chunk in above.chunks(rows_per) {
+                let placeholders = vec!["{}"; chunk.len()].join(", ");
+                let args: Vec<SqlArg> = chunk.iter().cloned().map(SqlArg::Text).collect();
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    &format!("{select} {path} IN ({placeholders})"),
+                    &args,
+                )
+                .await?;
+                for row in rows {
+                    found.insert(PathBuf::from(row.text("path")?));
+                }
+            }
+            Ok(found)
+        })
+    }
+
+    // What each of `torrents` holds, in place of what it held, in one
+    // transaction: its rows are its own from now on. A torrent named twice
+    // holds what its last entry names. A DELETE and an UPDATE per
+    // bind-sized chunk of torrents and a multi-row INSERT per chunk of
+    // rows, whatever the number of torrents.
+    fn set_torrents_held(&self, torrents: &[(JobId, Vec<String>)]) -> Result<(), StateError> {
+        if torrents.is_empty() {
+            return Ok(());
+        }
+        let mut last = std::collections::BTreeMap::new();
+        for (job_id, held) in torrents {
+            last.insert(stored(job_id.0)?, held);
+        }
+        let ids: Vec<i64> = last.keys().copied().collect();
+        let rows: Vec<(i64, String)> = last
+            .iter()
+            .flat_map(|(id, held)| {
+                held.iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .map(|path| (*id, path.clone()))
+            })
+            .collect();
+        let datastore = self.borrow().datastore();
+        self.borrow().run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "set_torrents_held", |tx| {
+                let (ids, rows) = (ids.clone(), rows.clone());
+                Box::pin(async move {
+                    // One bind is the flag, the rest the chunk's ids.
+                    let ids_per =
+                        weaver_server_db::persistence::sql_runtime::max_rows_for_tx(tx, 1).max(2)
+                            - 1;
+                    for chunk in ids.chunks(ids_per) {
+                        let placeholders = vec!["{}"; chunk.len()].join(", ");
+                        let args: Vec<SqlArg> = chunk.iter().copied().map(SqlArg::I64).collect();
+                        tx.execute(
+                            &format!(
+                                "DELETE FROM torrent_held_paths WHERE job_id IN ({placeholders})"
+                            ),
+                            &args,
+                        )
+                        .await?;
+                        let mut args = args;
+                        args.insert(0, SqlArg::Bool(true));
+                        tx.execute(
+                            &format!(
+                                "UPDATE torrents SET held_set = {{}} \
+                                 WHERE job_id IN ({placeholders})"
+                            ),
+                            &args,
+                        )
+                        .await?;
+                    }
+                    let rows_per =
+                        weaver_server_db::persistence::sql_runtime::max_rows_for_tx(tx, 2);
+                    for chunk in rows.chunks(rows_per) {
+                        let values = vec!["({}, {})"; chunk.len()].join(", ");
+                        let args = chunk
+                            .iter()
+                            .flat_map(|(id, path)| [SqlArg::I64(*id), SqlArg::Text(path.clone())])
+                            .collect::<Vec<_>>();
+                        tx.execute(
+                            &format!(
+                                "INSERT INTO torrent_held_paths (job_id, path) VALUES {values} \
+                                 ON CONFLICT (job_id, path) DO NOTHING"
+                            ),
+                            &args,
+                        )
+                        .await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+        })
+    }
+
+    // `held` added to what the torrent holds, before its files move there,
+    // and what it holds marked to be written again, in one transaction: a
+    // file that reaches the new folder is held from the moment it does, and
+    // a move that never ends leaves the next start to write what it holds.
+    fn add_torrent_held(&self, job_id: JobId, held: &[String]) -> Result<(), StateError> {
+        let id = stored(job_id.0)?;
+        let held = held.to_vec();
+        let datastore = self.borrow().datastore();
+        self.borrow().run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "add_torrent_held", |tx| {
+                let held = held.clone();
+                Box::pin(async move {
+                    insert_held_tx(tx, id, &held).await?;
+                    tx.execute(
+                        "UPDATE torrents SET held_set = {} WHERE job_id = {}",
+                        &[SqlArg::Bool(false), SqlArg::I64(id)],
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+        })
+    }
+
+    // What the torrents of `jobs` not leaving hold, each row as written:
+    // one statement per bind-sized chunk, each by the table's key.
+    fn held_rows(&self, jobs: &[JobId]) -> Result<Vec<(JobId, String)>, StateError> {
+        if jobs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let jobs = jobs
+            .iter()
+            .map(|job_id| stored(job_id.0))
+            .collect::<Result<Vec<_>, _>>()?;
+        let datastore = self.borrow().datastore();
+        self.borrow().run_sql_blocking_read(async move {
+            let per = weaver_server_db::persistence::sql_runtime::max_rows_for_engine(
+                datastore.engine(),
+                1,
+            );
+            let mut held = Vec::new();
+            for chunk in jobs.chunks(per) {
+                let args: Vec<SqlArg> = chunk.iter().copied().map(SqlArg::I64).collect();
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    &format!(
+                        "SELECT h.job_id, h.path FROM torrent_held_paths h \
+                           JOIN torrents t ON t.job_id = h.job_id \
+                          WHERE t.retiring IS NULL AND h.job_id IN ({})",
+                        vec!["{}"; chunk.len()].join(", ")
+                    ),
+                    &args,
+                )
+                .await?;
+                for row in rows {
+                    let id = u64::try_from(row.i64("job_id")?)
+                        .map_err(|error| StateError::Database(error.to_string()))?;
+                    held.push((JobId(id), row.text("path")?));
+                }
+            }
+            Ok(held)
+        })
+    }
+
+    // Each `(job, was, now)` row of what a torrent holds spelled `now` in
+    // place of `was`, in one transaction: a row that is gone by then, as a
+    // move or a removal took it, stays gone. Two statements per chunk,
+    // whatever the number of torrents.
+    fn respell_held(&self, rows: &[(JobId, String, String)]) -> Result<(), StateError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let rows = rows
+            .iter()
+            .map(|(job_id, was, now)| Ok((stored(job_id.0)?, was.clone(), now.clone())))
+            .collect::<Result<Vec<_>, StateError>>()?;
+        let datastore = self.borrow().datastore();
+        let rows_per =
+            weaver_server_db::persistence::sql_runtime::max_rows_for_engine(datastore.engine(), 3);
+        self.borrow().run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "respell_held", |tx| {
+                let rows = rows.clone();
+                Box::pin(async move {
+                    for chunk in rows.chunks(rows_per) {
+                        let values = vec!["({}, {}, {})"; chunk.len()].join(", ");
+                        let args = chunk
+                            .iter()
+                            .flat_map(|(id, was, now)| {
+                                [
+                                    SqlArg::I64(*id),
+                                    SqlArg::Text(was.clone()),
+                                    SqlArg::Text(now.clone()),
+                                ]
+                            })
+                            .collect::<Vec<_>>();
+                        tx.execute(
+                            &format!(
+                                "WITH v (job_id, was, now) AS (VALUES {values}) \
+                                 INSERT INTO torrent_held_paths (job_id, path) \
+                                 SELECT v.job_id, v.now FROM v WHERE EXISTS \
+                                 (SELECT 1 FROM torrent_held_paths h \
+                                   WHERE h.job_id = v.job_id AND h.path = v.was) \
+                                 ON CONFLICT (job_id, path) DO NOTHING"
+                            ),
+                            &args,
+                        )
+                        .await?;
+                        let filters = vec!["(job_id = {} AND path = {})"; chunk.len()].join(" OR ");
+                        let args = chunk
+                            .iter()
+                            .flat_map(|(id, was, _)| [SqlArg::I64(*id), SqlArg::Text(was.clone())])
+                            .collect::<Vec<_>>();
+                        tx.execute(
+                            &format!("DELETE FROM torrent_held_paths WHERE {filters}"),
+                            &args,
+                        )
+                        .await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+        })
+    }
+
+    // One torrent's [`Self::set_torrents_held`].
+    fn set_torrent_held(&self, job_id: JobId, held: Vec<String>) -> Result<(), StateError> {
+        self.set_torrents_held(&[(job_id, held)])
+    }
+}
+
+// `held` added to what torrent `id` holds, in `tx`, a bind-sized chunk per
+// statement; a path it holds already stays one row.
+async fn insert_held_tx(tx: &mut SqlTx<'_>, id: i64, held: &[String]) -> Result<(), StateError> {
+    let held: Vec<&String> = held
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let engine = match tx {
+        SqlTx::Sqlite(_) => weaver_server_db::persistence::sql_runtime::SqlEngine::Sqlite,
+        SqlTx::Postgres(_) => weaver_server_db::persistence::sql_runtime::SqlEngine::Postgres,
+    };
+    let rows_per = weaver_server_db::persistence::sql_runtime::max_rows_for_engine(engine, 2);
+    for chunk in held.chunks(rows_per) {
+        let values = vec!["({}, {})"; chunk.len()].join(", ");
+        let args = chunk
+            .iter()
+            .flat_map(|path| [SqlArg::I64(id), SqlArg::Text((*path).clone())])
+            .collect::<Vec<_>>();
+        tx.execute(
+            &format!(
+                "INSERT INTO torrent_held_paths (job_id, path) VALUES {values} \
+                 ON CONFLICT (job_id, path) DO NOTHING"
+            ),
+            &args,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+// A checkpoint's file times, in the transaction that writes its pieces:
+// `timed` (file, time) written over what was there, a row for each file of
+// `untimed` removed. Chunked under the bind limit, a statement per chunk,
+// never per file. A torrent gone meanwhile takes no row.
+async fn save_file_stamps(
+    tx: &mut SqlTx<'_>,
+    id: i64,
+    timed: &[(i64, i64)],
+    untimed: &[i64],
+) -> Result<(), StateError> {
+    // The torrent's id takes one bind of each statement.
+    let rows = weaver_server_db::persistence::sql_runtime::max_rows_for_tx(tx, 2)
+        .saturating_sub(1)
+        .max(1);
+    for chunk in timed.chunks(rows) {
+        let values = vec!["({}, {})"; chunk.len()].join(", ");
+        let mut args = Vec::with_capacity(chunk.len() * 2 + 1);
+        for (file, time) in chunk {
+            args.extend([SqlArg::I64(*file), SqlArg::I64(*time)]);
+        }
+        args.push(SqlArg::I64(id));
+        tx.execute(
+            &format!(
+                "WITH v (file, modified_ns) AS (VALUES {values}) \
+                 INSERT INTO torrent_file_stamps (job_id, file, modified_ns) \
+                 SELECT t.job_id, v.file, v.modified_ns FROM v, torrents t \
+                 WHERE t.job_id = {{}} \
+                 ON CONFLICT (job_id, file) DO UPDATE SET modified_ns = excluded.modified_ns"
+            ),
+            &args,
+        )
+        .await?;
+    }
+    let rows = weaver_server_db::persistence::sql_runtime::max_rows_for_tx(tx, 1)
+        .saturating_sub(1)
+        .max(1);
+    for chunk in untimed.chunks(rows) {
+        let placeholders = vec!["{}"; chunk.len()].join(", ");
+        let mut args = vec![SqlArg::I64(id)];
+        args.extend(chunk.iter().copied().map(SqlArg::I64));
+        tx.execute(
+            &format!(
+                "DELETE FROM torrent_file_stamps WHERE job_id = {{}} AND file IN ({placeholders})"
+            ),
+            &args,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+pub fn stored(value: u64) -> Result<i64, StateError> {
+    i64::try_from(value)
+        .map_err(|_| StateError::Database(format!("{value} exceeds the database range")))
+}
+
+// What was on disk before a torrent's files, as JSON; NULL when nothing.
+// Removes the torrent with its files, trackers, ledger and checkpoint, in
+// `tx`. Returns whether it was there.
+pub async fn delete_torrent_tx(tx: &mut SqlTx<'_>, id: i64) -> Result<bool, StateError> {
+    let changed = tx
+        .execute("DELETE FROM torrents WHERE job_id = {}", &[SqlArg::I64(id)])
+        .await?;
+    tx.execute(
+        "DELETE FROM torrent_held_paths WHERE job_id = {}",
+        &[SqlArg::I64(id)],
+    )
+    .await?;
+    for table in weaver_server_base::jobs::graph_checkpoint::TABLES {
+        tx.execute(
+            &format!("DELETE FROM {table} WHERE job_id = {{}}"),
+            &[SqlArg::I64(id)],
+        )
+        .await?;
+    }
+    Ok(changed > 0)
+}
+
+// `delete_torrent_tx` of each of `ids`, in `tx`: one statement per table
+// and bind-sized chunk. Returns how many torrents were there.
+pub async fn delete_torrents_tx(tx: &mut SqlTx<'_>, ids: &[i64]) -> Result<u64, StateError> {
+    use weaver_server_history::history::persistence::delete_by_job_tx;
+    let changed = delete_by_job_tx(tx, "torrents", ids).await?;
+    delete_by_job_tx(tx, "torrent_held_paths", ids).await?;
+    for table in weaver_server_base::jobs::graph_checkpoint::TABLES {
+        delete_by_job_tx(tx, table, ids).await?;
+    }
+    Ok(changed)
+}
+
+// What was there before, written even when nothing was: a row whose
+// `adopted` was never written (a row from before it was kept) reads as not
+// known, never as nothing there (`retiring_row`).
+fn adopted_text(adopted: &super::model::Adopted) -> Result<Option<String>, StateError> {
+    Some(serde_json::to_string(adopted))
+        .transpose()
+        .map_err(|error| StateError::Database(error.to_string()))
+}
+
+// A list as a JSON array of its strings; NULL when empty.
+fn stored_list<T: serde::Serialize>(items: &[T]) -> Result<Option<String>, StateError> {
+    (!items.is_empty())
+        .then(|| serde_json::to_string(items))
+        .transpose()
+        .map_err(|error| StateError::Database(error.to_string()))
+}
+
+fn listed<T: serde::de::DeserializeOwned>(
+    column: &str,
+    json: Option<String>,
+) -> Result<Vec<T>, StateError> {
+    json.map(|json| {
+        serde_json::from_str(&json).map_err(|error| {
+            StateError::Database(format!("stored torrent {column} is not valid: {error}"))
+        })
+    })
+    .transpose()
+    .map(Option::unwrap_or_default)
+}
+
+// Which saved peers were found elsewhere than the torrent's trackers and
+// the operator. The marks never cost the peers or bans they sit beside: a
+// value that does not read is no marks.
+fn found_marks(
+    job_id: JobId,
+    json: Result<Option<String>, StateError>,
+) -> Vec<std::net::SocketAddr> {
+    json.and_then(|json| listed("found_peers", json))
+        .unwrap_or_else(|error| {
+            tracing::warn!(job_id = job_id.0, error = %error, "a torrent's saved peer marks did not read; its peers restore unmarked");
+            Vec::new()
+        })
+}
+
+fn torrent_args(
+    torrent: &TorrentRecord,
+    key: Option<&weaver_server_db::persistence::encryption::EncryptionKey>,
+) -> Result<Vec<SqlArg>, StateError> {
+    let policy_override = SeedingPolicy::kept(torrent.policy_override)
+        .map(|policy| serde_json::to_string(&policy))
+        .transpose()
+        .map_err(|error| StateError::Database(error.to_string()))?;
+    let metadata = (!torrent.metadata.is_empty())
+        .then(|| serde_json::to_string(&torrent.metadata))
+        .transpose()
+        .map_err(|error| StateError::Database(error.to_string()))?;
+    Ok(vec![
+        SqlArg::I64(stored(torrent.job_id.0)?),
+        SqlArg::OptBytes(torrent.infohash_v1.map(|hash| hash.to_vec())),
+        SqlArg::OptBytes(torrent.infohash_v2.map(|hash| hash.to_vec())),
+        SqlArg::Text(torrent.name.clone()),
+        SqlArg::Text(torrent.source.as_str().to_string()),
+        // Sealed: its announce list carries a private tracker's passkey.
+        SqlArg::OptBytes(
+            torrent
+                .metainfo
+                .as_deref()
+                .map(|metainfo| super::sealed::seal_metainfo(key, metainfo))
+                .transpose()?,
+        ),
+        SqlArg::OptI64(torrent.category_id.map(i64::from)),
+        SqlArg::I64(torrent.added_at_ms),
+        SqlArg::Text(torrent.kept.as_str().to_string()),
+        SqlArg::Bool(torrent.forced),
+        SqlArg::OptI64(torrent.completed_at_ms),
+        SqlArg::OptText(torrent.storage_dir.clone()),
+        SqlArg::OptText(policy_override),
+        SqlArg::OptBool(torrent.unpack),
+        SqlArg::OptBool(torrent.unpack_in_force),
+        SqlArg::OptText(metadata),
+        SqlArg::OptI64(torrent.upload_limit.map(stored).transpose()?),
+        SqlArg::OptI64(torrent.download_limit.map(stored).transpose()?),
+        SqlArg::Bool(torrent.sequential),
+        SqlArg::Bool(torrent.first_last_piece_first),
+        SqlArg::OptText(torrent.save_path.clone()),
+        SqlArg::OptText(
+            torrent
+                .content_layout
+                .map(|layout| layout.as_str().to_owned()),
+        ),
+        SqlArg::OptText(torrent.files_dir.clone()),
+        SqlArg::Bool(torrent.seed_mode),
+        SqlArg::OptText(torrent.move_to.clone()),
+        SqlArg::I64(torrent.queue_position),
+        SqlArg::OptI64(torrent.pool_member.map(i64::from)),
+        SqlArg::Bool(torrent.private),
+        SqlArg::Bool(torrent.unpack_over),
+        SqlArg::I64(stored(torrent.download_ends)?),
+        SqlArg::OptText(
+            torrent
+                .unpack_end
+                .as_ref()
+                .map(|end| end.result.as_str().to_owned()),
+        ),
+        SqlArg::OptText(torrent.unpack_end.as_ref().and_then(|end| end.why.clone())),
+    ])
+}
+
+// The values that mark a torrent's unpacking over as `end`: whether it is
+// over, how it came out and why, in that order.
+fn unpack_end_args(end: &UnpackEnd) -> Vec<SqlArg> {
+    vec![
+        SqlArg::Bool(true),
+        SqlArg::Text(end.result.as_str().to_owned()),
+        SqlArg::OptText(end.why.clone()),
+    ]
+}
+
+// The write a checkpoint owes a torrent whose unpacking is over: its mark,
+// with how it came out when that is known.
+fn unpack_over_update(end: Option<&UnpackEnd>, id: i64) -> (&'static str, Vec<SqlArg>) {
+    match end {
+        Some(end) => {
+            let mut args = unpack_end_args(end);
+            args.push(SqlArg::I64(id));
+            (
+                "UPDATE torrents SET unpack_over = {}, unpack_end = {}, unpack_why = {} \
+                 WHERE job_id = {}",
+                args,
+            )
+        }
+        None => (
+            "UPDATE torrents SET unpack_over = {} WHERE job_id = {}",
+            vec![SqlArg::Bool(true), SqlArg::I64(id)],
+        ),
+    }
+}
+
+pub trait TorrentsPersistenceInsertTorrentQueries {
+    fn insert_torrent(
+        &self,
+        torrent: &TorrentRecord,
+        trackers: &[TrackerEntry],
+    ) -> Result<TorrentInsert, StateError>;
+    fn update_torrent_intent(
+        &self,
+        job_id: JobId,
+        intent: TorrentIntent,
+    ) -> Result<bool, StateError>;
+    fn set_torrent_completed(
+        &self,
+        job_id: JobId,
+        at_ms: i64,
+        download_ends: u64,
+    ) -> Result<bool, StateError>;
+    fn set_torrent_unpack_end(&self, job_id: JobId, end: &UnpackEnd) -> Result<bool, StateError>;
+    fn set_torrent_levels_and_completion(
+        &self,
+        job_id: JobId,
+        levels: &[FilePriority],
+        completed_at_ms: Option<i64>,
+        queue_position: i64,
+        unpack_over: bool,
+    ) -> Result<bool, StateError>;
+    fn update_torrent_counters(
+        &self,
+        job_id: JobId,
+        counters: &TorrentCounters,
+    ) -> Result<bool, StateError>;
+    fn save_torrent_peers(&self, job_id: JobId, peers: &ResumePeers) -> Result<bool, StateError>;
+    fn save_torrent_resume(
+        &self,
+        job_id: JobId,
+        counters: Option<&TorrentCounters>,
+        peers: Option<&ResumePeers>,
+    ) -> Result<bool, StateError>;
+    fn delete_torrent(&self, job_id: JobId) -> Result<bool, StateError>;
+    fn set_torrent_category(
+        &self,
+        job_id: JobId,
+        category_id: Option<u32>,
+    ) -> Result<bool, StateError>;
+    fn set_torrent_forced(&self, job_id: JobId, forced: bool) -> Result<bool, StateError>;
+    fn set_torrent_policy_override(
+        &self,
+        job_id: JobId,
+        policy_override: Option<SeedingPolicy>,
+    ) -> Result<bool, StateError>;
+    fn set_torrent_trackers(
+        &self,
+        job_id: JobId,
+        trackers: &[TrackerEntry],
+    ) -> Result<bool, StateError>;
+    fn set_torrent_unpack_in_force(&self, job_id: JobId, unpack: bool) -> Result<bool, StateError>;
+    #[allow(clippy::too_many_arguments)]
+    fn set_torrent_metainfo(
+        &self,
+        job_id: JobId,
+        infohash_v1: Option<[u8; 20]>,
+        infohash_v2: Option<[u8; 32]>,
+        name: &str,
+        metainfo: &[u8],
+        private: bool,
+        storage_dir: &str,
+        files_dir: Option<&str>,
+        trackers: &[TrackerEntry],
+        held: &[String],
+        adopted: &super::model::Adopted,
+    ) -> Result<bool, StateError>;
+    fn set_torrent_storage_dir(&self, job_id: JobId, dir: &str) -> Result<bool, StateError>;
+    fn set_torrent_rate_limits(
+        &self,
+        job_id: JobId,
+        upload: Option<Option<u64>>,
+        download: Option<Option<u64>>,
+    ) -> Result<bool, StateError>;
+    fn set_torrent_file_priorities(
+        &self,
+        job_id: JobId,
+        levels: &[FilePriority],
+    ) -> Result<bool, StateError>;
+    fn set_torrent_sequential(&self, job_id: JobId, on: bool) -> Result<bool, StateError>;
+    fn set_torrent_first_last_piece_first(
+        &self,
+        job_id: JobId,
+        on: bool,
+    ) -> Result<bool, StateError>;
+    fn set_torrent_files_dir(&self, job_id: JobId, dir: Option<&str>) -> Result<bool, StateError>;
+    fn set_torrent_save_path(&self, job_id: JobId, dir: Option<&str>) -> Result<bool, StateError>;
+    fn clear_torrent_seed_mode(&self, job_id: JobId) -> Result<bool, StateError>;
+    fn set_torrent_seed_verified(&self, job_id: JobId, pieces: &[u8]) -> Result<bool, StateError>;
+    fn torrent_seed_verified(&self, job_id: JobId) -> Result<Option<Vec<u8>>, StateError>;
+    fn set_torrent_pool_member(
+        &self,
+        job_id: JobId,
+        member: Option<u32>,
+    ) -> Result<bool, StateError>;
+    fn clear_torrent_move_to(&self, job_id: JobId) -> Result<bool, StateError>;
+    fn set_torrent_queue_positions(&self, positions: &[(JobId, i64)]) -> Result<(), StateError>;
+    fn torrent_peers(&self, job_id: JobId) -> Result<ResumePeers, StateError>;
+}
+
+impl<T: TorrentDatabase> TorrentsPersistenceInsertTorrentQueries for T {
+    // Add a torrent with its trackers and an empty seeding ledger,
+    // unless a torrent with the same infohash is already a job.
+    fn insert_torrent(
+        &self,
+        torrent: &TorrentRecord,
+        trackers: &[TrackerEntry],
+    ) -> Result<TorrentInsert, StateError> {
+        self.insert_placed_torrent(torrent, trackers, &super::model::Adopted::default(), None)
+    }
+
+    // What the operator asked of the torrent, and no other column: its
+    // completion is written apart, so a pause racing a completion keeps
+    // both. Returns whether the torrent exists.
+    fn update_torrent_intent(
+        &self,
+        job_id: JobId,
+        intent: TorrentIntent,
+    ) -> Result<bool, StateError> {
+        let args = vec![
+            SqlArg::Text(intent.as_str().to_string()),
+            SqlArg::I64(stored(job_id.0)?),
+        ];
+        self.set_torrent_column("state", args)
+    }
+
+    // When the torrent completed, and how many times its download has
+    // ended, in one write. Returns whether the torrent exists.
+    fn set_torrent_completed(
+        &self,
+        job_id: JobId,
+        at_ms: i64,
+        download_ends: u64,
+    ) -> Result<bool, StateError> {
+        let args = vec![
+            SqlArg::I64(at_ms),
+            SqlArg::I64(stored(download_ends)?),
+            SqlArg::I64(stored(job_id.0)?),
+        ];
+        let datastore = self.borrow().datastore();
+        self.borrow().run_sql_blocking(async move {
+            let changed = SqlRuntime::execute(
+                datastore.write_exec(),
+                "UPDATE torrents SET completed_at_ms = {}, download_ends = {} WHERE job_id = {}",
+                &args,
+            )
+            .await?;
+            Ok(changed > 0)
+        })
+    }
+
+    // The torrent's unpacking is over, as `end` says it came out: the mark
+    // an unpacking that ended with no placing written keeps. Returns
+    // whether the torrent exists.
+    fn set_torrent_unpack_end(&self, job_id: JobId, end: &UnpackEnd) -> Result<bool, StateError> {
+        let mut args = unpack_end_args(end);
+        args.push(SqlArg::I64(stored(job_id.0)?));
+        let datastore = self.borrow().datastore();
+        self.borrow().run_sql_blocking(async move {
+            let changed = SqlRuntime::execute(
+                datastore.write_exec(),
+                "UPDATE torrents SET unpack_over = {}, unpack_end = {}, unpack_why = {} \
+                 WHERE job_id = {}",
+                &args,
+            )
+            .await?;
+            Ok(changed > 0)
+        })
+    }
+
+    // The torrent's files' levels, when it completed, its place in the
+    // download queue and whether its unpacking is over, in one write: a
+    // complete torrent that now wants a file it lacks downloads again, short
+    // of complete at the end of the queue, with its unpacking over, and one
+    // whose change of levels did not land is put back as it was. Returns
+    // whether the torrent exists.
+    fn set_torrent_levels_and_completion(
+        &self,
+        job_id: JobId,
+        levels: &[FilePriority],
+        completed_at_ms: Option<i64>,
+        queue_position: i64,
+        unpack_over: bool,
+    ) -> Result<bool, StateError> {
+        let args = vec![
+            SqlArg::OptText(file_priorities_str(levels)),
+            SqlArg::OptI64(completed_at_ms),
+            SqlArg::I64(queue_position),
+            SqlArg::Bool(unpack_over),
+            SqlArg::I64(stored(job_id.0)?),
+        ];
+        let datastore = self.borrow().datastore();
+        self.borrow().run_sql_blocking(async move {
+            let changed = SqlRuntime::execute(
+                datastore.write_exec(),
+                "UPDATE torrents SET file_priorities = {}, completed_at_ms = {}, \
+                 queue_position = {}, unpack_over = {} WHERE job_id = {}",
+                &args,
+            )
+            .await?;
+            Ok(changed > 0)
+        })
+    }
+
+    // The torrent's ledger. Returns whether the torrent exists.
+    fn update_torrent_counters(
+        &self,
+        job_id: JobId,
+        counters: &TorrentCounters,
+    ) -> Result<bool, StateError> {
+        self.save_torrent_resume(job_id, Some(counters), None)
+    }
+
+    // The peers and bans a torrent begins its next start with. Returns
+    // whether the torrent exists.
+    fn save_torrent_peers(&self, job_id: JobId, peers: &ResumePeers) -> Result<bool, StateError> {
+        self.save_torrent_resume(job_id, None, Some(peers))
+    }
+
+    // The row a torrent's next start reads as it ran: its ledger, and the
+    // peers and bans it begins with, each written only when given, in one
+    // statement. The row is apart from the one that holds the metainfo, so
+    // writing it as the torrent runs never writes the metainfo again.
+    // Returns whether the torrent exists.
+    fn save_torrent_resume(
+        &self,
+        job_id: JobId,
+        counters: Option<&TorrentCounters>,
+        peers: Option<&ResumePeers>,
+    ) -> Result<bool, StateError> {
+        let Some((sql, args)) = resume_update(job_id, counters, peers)? else {
+            return Ok(false);
+        };
+        let datastore = self.borrow().datastore();
+        self.borrow().run_sql_blocking(async move {
+            let changed = SqlRuntime::execute(datastore.write_exec(), &sql, &args).await?;
+            Ok(changed > 0)
+        })
+    }
+
+    // Removes the torrent with its files, trackers, ledger and checkpoint.
+    fn delete_torrent(&self, job_id: JobId) -> Result<bool, StateError> {
+        let id = stored(job_id.0)?;
+        let datastore = self.borrow().datastore();
+        self.borrow().run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "delete_torrent", |tx| {
+                Box::pin(async move { delete_torrent_tx(tx, id).await })
+            })
+            .await
+        })
+    }
+
+    // The torrent's category. Returns whether the torrent exists.
+    fn set_torrent_category(
+        &self,
+        job_id: JobId,
+        category_id: Option<u32>,
+    ) -> Result<bool, StateError> {
+        let args = vec![
+            SqlArg::OptI64(category_id.map(i64::from)),
+            SqlArg::I64(stored(job_id.0)?),
+        ];
+        self.set_torrent_column("category_id", args)
+    }
+
+    // Whether the torrent runs past the download queue. Returns whether the
+    // torrent exists.
+    fn set_torrent_forced(&self, job_id: JobId, forced: bool) -> Result<bool, StateError> {
+        let args = vec![SqlArg::Bool(forced), SqlArg::I64(stored(job_id.0)?)];
+        self.set_torrent_column("forced", args)
+    }
+
+    // The torrent's own seeding policy; one whose every leaf inherits is
+    // kept as none. Returns whether the torrent exists.
+    fn set_torrent_policy_override(
+        &self,
+        job_id: JobId,
+        policy_override: Option<SeedingPolicy>,
+    ) -> Result<bool, StateError> {
+        let policy_override = SeedingPolicy::kept(policy_override)
+            .map(|policy| serde_json::to_string(&policy))
+            .transpose()
+            .map_err(|error| StateError::Database(error.to_string()))?;
+        let args = vec![
+            SqlArg::OptText(policy_override),
+            SqlArg::I64(stored(job_id.0)?),
+        ];
+        self.set_torrent_column("policy_override", args)
+    }
+
+    // The torrent's trackers, as edited (libtorrent `write_resume_data`
+    // keeps them as its `trackers` and `tiers`). Returns whether the torrent
+    // exists.
+    fn set_torrent_trackers(
+        &self,
+        job_id: JobId,
+        trackers: &[TrackerEntry],
+    ) -> Result<bool, StateError> {
+        let id = stored(job_id.0)?;
+        let trackers = trackers.to_vec();
+        let key = self.borrow().encryption_key().cloned();
+        let datastore = self.borrow().datastore();
+        self.borrow().run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "set_torrent_trackers", |tx| {
+                let trackers = trackers.clone();
+                let key = key.clone();
+                Box::pin(async move {
+                    let known = tx
+                        .fetch_optional(
+                            "SELECT job_id FROM torrents WHERE job_id = {}",
+                            &[SqlArg::I64(id)],
+                        )
+                        .await?;
+                    if known.is_none() {
+                        return Ok(false);
+                    }
+                    tx.execute(
+                        "DELETE FROM torrent_trackers WHERE job_id = {}",
+                        &[SqlArg::I64(id)],
+                    )
+                    .await?;
+                    insert_trackers(tx, id, &trackers, key.as_ref()).await?;
+                    Ok(true)
+                })
+            })
+            .await
+        })
+    }
+
+    // Whether the torrent's archives are extracted, fixed when its job is
+    // built. Returns whether the torrent exists.
+    fn set_torrent_unpack_in_force(&self, job_id: JobId, unpack: bool) -> Result<bool, StateError> {
+        let args = vec![SqlArg::Bool(unpack), SqlArg::I64(stored(job_id.0)?)];
+        let datastore = self.borrow().datastore();
+        self.borrow().run_sql_blocking(async move {
+            let changed = SqlRuntime::execute(
+                datastore.write_exec(),
+                "UPDATE torrents SET unpack_in_force = {} WHERE job_id = {}",
+                &args,
+            )
+            .await?;
+            Ok(changed > 0)
+        })
+    }
+
+    // A magnet's metainfo once its peers sent it: the hashes and name it
+    // carries, the file and whether it marks the torrent private, the
+    // directory its files go to and the folder they
+    // sit in when that is not it, the files and trackers it lists, and what
+    // it holds there (`torrent_held_paths`), all in one transaction: a crash
+    // leaves the torrent holding its whole folder as a magnet does, or what
+    // its files are, never a row with the files known and the paths not.
+    // Returns whether the torrent exists.
+    fn set_torrent_metainfo(
+        &self,
+        job_id: JobId,
+        infohash_v1: Option<[u8; 20]>,
+        infohash_v2: Option<[u8; 32]>,
+        name: &str,
+        metainfo: &[u8],
+        private: bool,
+        storage_dir: &str,
+        files_dir: Option<&str>,
+        trackers: &[TrackerEntry],
+        held: &[String],
+        adopted: &super::model::Adopted,
+    ) -> Result<bool, StateError> {
+        let id = stored(job_id.0)?;
+        let adopted = adopted_text(adopted)?;
+        let key = self.borrow().encryption_key().cloned();
+        let head = vec![
+            SqlArg::OptBytes(infohash_v1.map(|hash| hash.to_vec())),
+            SqlArg::OptBytes(infohash_v2.map(|hash| hash.to_vec())),
+            SqlArg::Text(name.to_owned()),
+            SqlArg::Bytes(super::sealed::seal_metainfo(key.as_ref(), metainfo)?),
+            SqlArg::Bool(private),
+            SqlArg::Text(storage_dir.to_owned()),
+            SqlArg::OptText(files_dir.map(str::to_owned)),
+            SqlArg::Bool(true),
+            SqlArg::OptText(adopted),
+            SqlArg::I64(id),
+        ];
+        let trackers = trackers.to_vec();
+        let held = held.to_vec();
+        let datastore = self.borrow().datastore();
+        self.borrow().run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "set_torrent_metainfo", |tx| {
+                let head = head.clone();
+                let trackers = trackers.clone();
+                let held = held.clone();
+                let key = key.clone();
+                Box::pin(async move {
+                    let changed = tx
+                        .execute(
+                            "UPDATE torrents SET infohash_v1 = {}, infohash_v2 = {}, name = {}, metainfo = {},
+                                     private = {}, storage_dir = {}, files_dir = {}, held_set = {}, adopted = {}
+                              WHERE job_id = {}",
+                            &head,
+                        )
+                        .await?;
+                    if changed == 0 {
+                        return Ok(false);
+                    }
+                    tx.execute(
+                        "DELETE FROM torrent_trackers WHERE job_id = {}",
+                        &[SqlArg::I64(id)],
+                    )
+                    .await?;
+                    insert_trackers(tx, id, &trackers, key.as_ref()).await?;
+                    tx.execute(
+                        "DELETE FROM torrent_held_paths WHERE job_id = {}",
+                        &[SqlArg::I64(id)],
+                    )
+                    .await?;
+                    insert_held_tx(tx, id, &held).await?;
+                    Ok(true)
+                })
+            })
+            .await
+        })
+    }
+
+    // The directory a torrent's files now live under. What it holds is
+    // marked to be written again in the same statement, so a crash before
+    // that write leaves the next start to write it (`held_set`). Returns
+    // whether the torrent exists.
+    fn set_torrent_storage_dir(&self, job_id: JobId, dir: &str) -> Result<bool, StateError> {
+        let args = vec![SqlArg::Text(dir.to_owned()), SqlArg::I64(stored(job_id.0)?)];
+        let datastore = self.borrow().datastore();
+        self.borrow().run_sql_blocking(async move {
+            let changed = SqlRuntime::execute(
+                datastore.write_exec(),
+                "UPDATE torrents SET storage_dir = {}, held_set = FALSE WHERE job_id = {}",
+                &args,
+            )
+            .await?;
+            Ok(changed > 0)
+        })
+    }
+
+    // The torrent's own upload and download limits in bytes per second:
+    // `None` keeps a limit as it is, `Some(None)` is unlimited and zero
+    // closed. Returns whether the torrent exists.
+    fn set_torrent_rate_limits(
+        &self,
+        job_id: JobId,
+        upload: Option<Option<u64>>,
+        download: Option<Option<u64>>,
+    ) -> Result<bool, StateError> {
+        let mut args = Vec::new();
+        for limit in [upload, download] {
+            args.push(SqlArg::I64(i64::from(limit.is_some())));
+            args.push(SqlArg::OptI64(limit.flatten().map(stored).transpose()?));
+        }
+        args.push(SqlArg::I64(stored(job_id.0)?));
+        let datastore = self.borrow().datastore();
+        self.borrow().run_sql_blocking(async move {
+            let changed = SqlRuntime::execute(
+                datastore.write_exec(),
+                "UPDATE torrents SET \
+                 upload_limit = CASE WHEN {} = 1 THEN {} ELSE upload_limit END, \
+                 download_limit = CASE WHEN {} = 1 THEN {} ELSE download_limit END \
+                 WHERE job_id = {}",
+                &args,
+            )
+            .await?;
+            Ok(changed > 0)
+        })
+    }
+
+    // The operator's level for every file of a torrent, in the metainfo's
+    // order, written whole. Returns whether the torrent exists.
+    fn set_torrent_file_priorities(
+        &self,
+        job_id: JobId,
+        levels: &[FilePriority],
+    ) -> Result<bool, StateError> {
+        let args = vec![
+            SqlArg::OptText(file_priorities_str(levels)),
+            SqlArg::I64(stored(job_id.0)?),
+        ];
+        self.set_torrent_column("file_priorities", args)
+    }
+
+    // Whether the torrent fetches its pieces in order. Returns whether the
+    // torrent exists.
+    fn set_torrent_sequential(&self, job_id: JobId, on: bool) -> Result<bool, StateError> {
+        let args = vec![SqlArg::Bool(on), SqlArg::I64(stored(job_id.0)?)];
+        self.set_torrent_column("sequential", args)
+    }
+
+    // Whether each of the torrent's files has its first and last pieces
+    // fetched first. Returns whether the torrent exists.
+    fn set_torrent_first_last_piece_first(
+        &self,
+        job_id: JobId,
+        on: bool,
+    ) -> Result<bool, StateError> {
+        let args = vec![SqlArg::Bool(on), SqlArg::I64(stored(job_id.0)?)];
+        self.set_torrent_column("first_last_piece_first", args)
+    }
+
+    // Where the torrent's files sit when not in its storage directory,
+    // what it holds marked to be written again as `set_torrent_storage_dir`
+    // marks it.
+    fn set_torrent_files_dir(&self, job_id: JobId, dir: Option<&str>) -> Result<bool, StateError> {
+        let args = vec![
+            SqlArg::OptText(dir.map(str::to_owned)),
+            SqlArg::I64(stored(job_id.0)?),
+        ];
+        let datastore = self.borrow().datastore();
+        self.borrow().run_sql_blocking(async move {
+            let changed = SqlRuntime::execute(
+                datastore.write_exec(),
+                "UPDATE torrents SET files_dir = {}, held_set = FALSE WHERE job_id = {}",
+                &args,
+            )
+            .await?;
+            Ok(changed > 0)
+        })
+    }
+
+    // The directory the torrent's files go under, as asked or as it moved.
+    fn set_torrent_save_path(&self, job_id: JobId, dir: Option<&str>) -> Result<bool, StateError> {
+        let args = vec![
+            SqlArg::OptText(dir.map(str::to_owned)),
+            SqlArg::I64(stored(job_id.0)?),
+        ];
+        self.set_torrent_column("save_path", args)
+    }
+
+    // The torrent's session left seed mode: from here its pieces are what
+    // its job has, and none needs the check it passed in seed mode kept.
+    fn clear_torrent_seed_mode(&self, job_id: JobId) -> Result<bool, StateError> {
+        let args = vec![SqlArg::Bool(false), SqlArg::I64(stored(job_id.0)?)];
+        let datastore = self.borrow().datastore();
+        self.borrow().run_sql_blocking(async move {
+            let changed = SqlRuntime::execute(
+                datastore.write_exec(),
+                "UPDATE torrents SET seed_mode = {}, seed_verified = NULL WHERE job_id = {}",
+                &args,
+            )
+            .await?;
+            Ok(changed > 0)
+        })
+    }
+
+    // The pieces that passed their check in seed mode, a bitfield as the
+    // wire's: the first piece the high bit of the first byte (libtorrent's
+    // `verified_pieces` in resume data).
+    fn set_torrent_seed_verified(&self, job_id: JobId, pieces: &[u8]) -> Result<bool, StateError> {
+        let args = vec![
+            SqlArg::OptBytes(Some(pieces.to_vec())),
+            SqlArg::I64(stored(job_id.0)?),
+        ];
+        self.set_torrent_column("seed_verified", args)
+    }
+
+    // The pieces [`Self::set_torrent_seed_verified`] last kept; None when it
+    // kept none.
+    fn torrent_seed_verified(&self, job_id: JobId) -> Result<Option<Vec<u8>>, StateError> {
+        self.torrent_read();
+        let id = stored(job_id.0)?;
+        let datastore = self.borrow().datastore();
+        self.borrow().run_sql_blocking_read(async move {
+            let row = SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT seed_verified FROM torrents WHERE job_id = {}",
+                &[SqlArg::I64(id)],
+            )
+            .await?;
+            Ok(row
+                .map(|row| row.opt_bytes("seed_verified"))
+                .transpose()?
+                .flatten())
+        })
+    }
+
+    // The pool member the torrent is pinned to, or none.
+    fn set_torrent_pool_member(
+        &self,
+        job_id: JobId,
+        member: Option<u32>,
+    ) -> Result<bool, StateError> {
+        let args = vec![
+            SqlArg::OptI64(member.map(i64::from)),
+            SqlArg::I64(stored(job_id.0)?),
+        ];
+        self.set_torrent_column("pool_member", args)
+    }
+
+    // The torrent moved where it was to move once complete, or will not.
+    fn clear_torrent_move_to(&self, job_id: JobId) -> Result<bool, StateError> {
+        let args = vec![SqlArg::OptText(None), SqlArg::I64(stored(job_id.0)?)];
+        self.set_torrent_column("move_to", args)
+    }
+
+    // Where each torrent stands in the download queue, in one transaction.
+    fn set_torrent_queue_positions(&self, positions: &[(JobId, i64)]) -> Result<(), StateError> {
+        if positions.is_empty() {
+            return Ok(());
+        }
+        let rows = positions
+            .iter()
+            .map(|&(job_id, position)| Ok((stored(job_id.0)?, SqlArg::I64(position))))
+            .collect::<Result<Vec<_>, StateError>>()?;
+        let rows = std::sync::Arc::new(rows);
+        let datastore = self.borrow().datastore();
+        self.borrow().run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "set_torrent_queue_positions", |tx| {
+                let rows = std::sync::Arc::clone(&rows);
+                Box::pin(async move { update_column_tx(tx, "queue_position", &rows).await })
+            })
+            .await
+        })
+    }
+
+    // The peers and bans a torrent last saved; none when it saved none or
+    // is not a torrent.
+    fn torrent_peers(&self, job_id: JobId) -> Result<ResumePeers, StateError> {
+        self.torrent_read();
+        let id = stored(job_id.0)?;
+        let datastore = self.borrow().datastore();
+        let row = self.borrow().run_sql_blocking_read(async move {
+            SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT peers, banned_peers, found_peers FROM torrent_counters WHERE job_id = {}",
+                &[SqlArg::I64(id)],
+            )
+            .await
+        })?;
+        let Some(row) = row else {
+            return Ok(ResumePeers::default());
+        };
+        Ok(ResumePeers {
+            peers: listed("peers", row.opt_text("peers")?)?,
+            banned: listed("banned_peers", row.opt_text("banned_peers")?)?,
+            found: found_marks(job_id, row.opt_text("found_peers")),
+        })
+    }
+}
+
+pub trait TorrentsPersistenceInsertPlacedTorrentInternalQueries {
+    fn insert_placed_torrent(
+        &self,
+        torrent: &TorrentRecord,
+        trackers: &[TrackerEntry],
+        adopted: &super::model::Adopted,
+        held: Option<&[String]>,
+    ) -> Result<TorrentInsert, StateError>;
+    fn write_torrent_seed_modes(&self, writes: TorrentSeedWrites) -> Result<(), StateError>;
+    fn update_torrent_intents(&self, groups: &[(KeptIntent, &[JobId])]) -> Result<(), StateError>;
+    fn save_torrent_checkpoint(
+        &self,
+        job_id: JobId,
+        pieces: Option<&Kept>,
+        stamps: &[(u32, Option<i64>)],
+        counters: Option<&TorrentCounters>,
+        peers: Option<&ResumePeers>,
+        row: Option<(u64, bool, Option<UnpackEnd>)>,
+    ) -> Result<(), StateError>;
+    fn torrent_file_stamps(&self, job_id: JobId) -> Result<HashMap<u32, i64>, StateError>;
+    fn torrent_pieces(&self, job_id: JobId) -> Result<Option<Kept>, StateError>;
+    fn finish_torrent_unpack(
+        &self,
+        job_id: JobId,
+        outputs: &[String],
+        dropped: &[String],
+        held: &[String],
+        end: &UnpackEnd,
+    ) -> Result<(), StateError>;
+    fn set_torrent_made(
+        &self,
+        job_id: JobId,
+        outputs: &[String],
+        adopted: Option<&super::model::Adopted>,
+        checking: bool,
+    ) -> Result<bool, StateError>;
+    fn record_torrent_files_move(
+        &self,
+        job_id: JobId,
+        to: &str,
+        outputs: &[String],
+        adopted: Option<&super::model::Adopted>,
+        held: &[String],
+        checking: bool,
+    ) -> Result<(), StateError>;
+    fn torrent_outputs(&self, job_id: JobId) -> Result<Vec<String>, StateError>;
+    #[cfg(any(test, feature = "test-support"))]
+    fn set_torrent_adopted(
+        &self,
+        job_id: JobId,
+        adopted: &super::model::Adopted,
+    ) -> Result<bool, StateError>;
+    #[cfg(any(test, feature = "test-support"))]
+    fn forget_torrent_adopted(&self, job_id: JobId) -> Result<bool, StateError>;
+    fn torrent_adopted(&self, job_id: JobId) -> Result<Option<super::model::Adopted>, StateError>;
+    fn torrents_made(&self, job_ids: &[JobId]) -> HashMap<JobId, MadeRead>;
+    fn set_torrents_trackers(
+        &self,
+        edits: &[(JobId, Vec<TrackerEntry>)],
+    ) -> Result<std::collections::HashSet<JobId>, StateError>;
+    fn set_torrents_unpack_in_force(&self, unpacks: &[(JobId, bool)]) -> Result<(), StateError>;
+    fn clear_torrents_completed(&self, job_ids: &[JobId]) -> Result<(), StateError>;
+    fn set_torrent_categories_and_forced(
+        &self,
+        categories: &[(JobId, Option<u32>)],
+        forced: &[(JobId, bool)],
+    ) -> Result<(), StateError>;
+    fn set_torrent_settings(&self, rows: &TorrentSettingRows) -> Result<(), StateError>;
+}
+
+impl<T: TorrentDatabase> TorrentsPersistenceInsertPlacedTorrentInternalQueries for T {
+    // [`Self::insert_torrent`], with what was already on disk where its
+    // files go, in the same transaction.
+    fn insert_placed_torrent(
+        &self,
+        torrent: &TorrentRecord,
+        trackers: &[TrackerEntry],
+        adopted: &super::model::Adopted,
+        held: Option<&[String]>,
+    ) -> Result<TorrentInsert, StateError> {
+        let adopted = adopted_text(adopted)?;
+        // What it holds, or, not known, its whole folder as spelled, until
+        // its rows are written.
+        let held_set = held.is_some();
+        let held: Vec<String> = match held {
+            Some(held) => held.to_vec(),
+            None => torrent
+                .files_dir
+                .clone()
+                .or_else(|| torrent.storage_dir.clone())
+                .into_iter()
+                .collect(),
+        };
+        let infohashes = torrent.infohashes();
+        if infohashes.is_empty() {
+            return Err(StateError::Database(
+                "a torrent needs a v1 or a v2 infohash".to_string(),
+            ));
+        }
+        let job_id = torrent.job_id;
+        let key = self.borrow().encryption_key().cloned();
+        let torrent_args = torrent_args(torrent, key.as_ref())?;
+        let id = stored(job_id.0)?;
+        let trackers = trackers.to_vec();
+        let datastore = self.borrow().datastore();
+        self.borrow().run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "insert_torrent", |tx| {
+                let infohashes = infohashes.clone();
+                let torrent_args = torrent_args.clone();
+                let trackers = trackers.clone();
+                let adopted = adopted.clone();
+                let held = held.clone();
+                let key = key.clone();
+                Box::pin(async move {
+                    if let Some(existing) = torrent_by_infohash_tx(tx, &infohashes).await? {
+                        return Ok(TorrentInsert::Duplicate(existing));
+                    }
+                    // One placeholder per value: the column list and the
+                    // values are both TORRENT_COLUMNS' order.
+                    let values = vec!["{}"; torrent_args.len()].join(", ");
+                    tx.execute(
+                        &format!("INSERT INTO torrents ({TORRENT_COLUMNS}) VALUES ({values})"),
+                        &torrent_args,
+                    )
+                    .await?;
+                    insert_trackers(tx, id, &trackers, key.as_ref()).await?;
+                    insert_held_tx(tx, id, &held).await?;
+                    if held_set {
+                        tx.execute(
+                            "UPDATE torrents SET held_set = {} WHERE job_id = {}",
+                            &[SqlArg::Bool(true), SqlArg::I64(id)],
+                        )
+                        .await?;
+                    }
+                    if let Some(adopted) = adopted.clone() {
+                        tx.execute(
+                            "UPDATE torrents SET adopted = {} WHERE job_id = {}",
+                            &[SqlArg::Text(adopted), SqlArg::I64(id)],
+                        )
+                        .await?;
+                    }
+                    tx.execute(
+                        "INSERT INTO torrent_counters (job_id) VALUES ({})",
+                        &[SqlArg::I64(job_id.0 as i64)],
+                    )
+                    .await?;
+                    Ok(TorrentInsert::Inserted)
+                })
+            })
+            .await
+        })
+    }
+
+    // Seed mode as a pass found it, in one transaction: the torrents that
+    // left it, as `clear_torrent_seed_mode` writes one, and the pieces each
+    // still in it checked, as `set_torrent_seed_verified` writes one. Each
+    // list goes in bind-limit chunks, one statement a chunk. The statements
+    // are built once, the bitfields moved into them: a retry of the
+    // transaction copies none.
+    fn write_torrent_seed_modes(&self, writes: TorrentSeedWrites) -> Result<(), StateError> {
+        use weaver_server_db::persistence::sql_runtime::max_rows_for_engine;
+
+        if writes.is_empty() {
+            return Ok(());
+        }
+        let datastore = self.borrow().datastore();
+        let engine = datastore.engine();
+        let mut statements: Vec<(String, Vec<SqlArg>)> = Vec::new();
+        // One bind for the seed mode, then the ids.
+        let rows = max_rows_for_engine(engine, 1).saturating_sub(1).max(1);
+        for chunk in writes.left.chunks(rows) {
+            let placeholders = vec!["{}"; chunk.len()].join(", ");
+            let mut args = Vec::with_capacity(chunk.len() + 1);
+            args.push(SqlArg::Bool(false));
+            for job_id in chunk {
+                args.push(SqlArg::I64(stored(job_id.0)?));
+            }
+            statements.push((
+                format!(
+                    "UPDATE torrents SET seed_mode = {{}}, seed_verified = NULL WHERE job_id IN ({placeholders})"
+                ),
+                args,
+            ));
+        }
+        // Each row binds its id and bitfield in the CASE and its id in the
+        // list.
+        let rows = max_rows_for_engine(engine, 3);
+        let mut verified = writes.verified.into_iter().peekable();
+        while verified.peek().is_some() {
+            let chunk: Vec<(i64, Vec<u8>)> = verified
+                .by_ref()
+                .take(rows)
+                .map(|(job_id, pieces)| Ok((stored(job_id.0)?, pieces)))
+                .collect::<Result<_, StateError>>()?;
+            let ids: Vec<i64> = chunk.iter().map(|(id, _)| *id).collect();
+            let mut args = Vec::with_capacity(chunk.len() * 3);
+            for (id, pieces) in chunk {
+                args.push(SqlArg::I64(id));
+                args.push(SqlArg::OptBytes(Some(pieces)));
+            }
+            args.extend(ids.iter().copied().map(SqlArg::I64));
+            let cases = vec!["WHEN {} THEN {}"; ids.len()].join(" ");
+            let placeholders = vec!["{}"; ids.len()].join(", ");
+            statements.push((
+                format!(
+                    "UPDATE torrents SET seed_verified = CASE job_id {cases} END WHERE job_id IN ({placeholders})"
+                ),
+                args,
+            ));
+        }
+        let statements = std::sync::Arc::new(statements);
+        self.borrow().run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "write_torrent_seed_modes", |tx| {
+                let statements = std::sync::Arc::clone(&statements);
+                Box::pin(async move {
+                    for (sql, args) in statements.iter() {
+                        tx.execute(sql, args).await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+        })
+    }
+
+    // Each group's kept intent for every torrent of its ids, and no other
+    // column, in one transaction: one statement per bind-limit chunk of
+    // each group's ids.
+    fn update_torrent_intents(&self, groups: &[(KeptIntent, &[JobId])]) -> Result<(), StateError> {
+        let groups = groups
+            .iter()
+            .filter(|(_, job_ids)| !job_ids.is_empty())
+            .map(|(kept, job_ids)| {
+                let ids = job_ids
+                    .iter()
+                    .map(|job_id| stored(job_id.0))
+                    .collect::<Result<Vec<_>, StateError>>()?;
+                Ok((kept.as_str(), ids))
+            })
+            .collect::<Result<Vec<_>, StateError>>()?;
+        if groups.is_empty() {
+            return Ok(());
+        }
+        let datastore = self.borrow().datastore();
+        self.borrow().run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "update_torrent_intents", |tx| {
+                let groups = groups.clone();
+                Box::pin(async move {
+                    // The intent takes one bind of each statement.
+                    let rows = weaver_server_db::persistence::sql_runtime::max_rows_for_tx(tx, 1)
+                        .saturating_sub(1)
+                        .max(1);
+                    for (state, ids) in &groups {
+                        for chunk in ids.chunks(rows) {
+                            let placeholders = vec!["{}"; chunk.len()].join(", ");
+                            let mut args = vec![SqlArg::Text((*state).to_owned())];
+                            args.extend(chunk.iter().copied().map(SqlArg::I64));
+                            tx.execute(
+                                &format!(
+                                    "UPDATE torrents SET state = {{}} WHERE job_id IN ({placeholders})"
+                                ),
+                                &args,
+                            )
+                            .await?;
+                        }
+                    }
+                    Ok(())
+                })
+            })
+            .await
+        })
+    }
+
+    // The pieces the torrent has in its files, the times of the files
+    // `stamps` names as taken with them, and its ledger and the peers and
+    // bans it begins with as they stood with them, each written only when
+    // given, in one transaction: a crash recovers the pieces, the times and
+    // the counters of one moment. A file with no usable time has its row
+    // removed, so the next start judges it by its size alone. `row`, when
+    // given, is how many times its download ended and whether its
+    // unpacking is over, as their own writes failed to keep them: both only
+    // go up, so neither takes the row back below what it holds.
+    fn save_torrent_checkpoint(
+        &self,
+        job_id: JobId,
+        pieces: Option<&Kept>,
+        stamps: &[(u32, Option<i64>)],
+        counters: Option<&TorrentCounters>,
+        peers: Option<&ResumePeers>,
+        row: Option<(u64, bool, Option<UnpackEnd>)>,
+    ) -> Result<(), StateError> {
+        let id = stored(job_id.0)?;
+        let row = row
+            .map(|(ends, over, end)| {
+                let over = over.then(|| unpack_over_update(end.as_ref(), id));
+                Ok::<_, StateError>((stored(ends)?, over))
+            })
+            .transpose()?;
+        let resume = resume_update(job_id, counters, peers)?;
+        let pieces = pieces.map(|kept| {
+            vec![
+                SqlArg::OptBytes(Some(kept.bits.clone())),
+                SqlArg::Bool(kept.checking),
+                SqlArg::I64(id),
+            ]
+        });
+        let timed: Vec<(i64, i64)> = stamps
+            .iter()
+            .filter_map(|(file, time)| Some((i64::from(*file), (*time)?)))
+            .collect();
+        let untimed: Vec<i64> = stamps
+            .iter()
+            .filter(|(_, time)| time.is_none())
+            .map(|(file, _)| i64::from(*file))
+            .collect();
+        if pieces.is_none() && resume.is_none() && stamps.is_empty() && row.is_none() {
+            return Ok(());
+        }
+        let datastore = self.borrow().datastore();
+        self.borrow().run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "save_torrent_checkpoint", |tx| {
+                let pieces = pieces.clone();
+                let resume = resume.clone();
+                let row = row.clone();
+                let (timed, untimed) = (timed.clone(), untimed.clone());
+                Box::pin(async move {
+                    if let Some(args) = &pieces {
+                        tx.execute(
+                            "UPDATE torrent_counters SET pieces = {}, pieces_checking = {} \
+                             WHERE job_id = {}",
+                            args,
+                        )
+                        .await?;
+                    }
+                    save_file_stamps(tx, id, &timed, &untimed).await?;
+                    if let Some((sql, args)) = &resume {
+                        tx.execute(sql, args).await?;
+                    }
+                    if let Some((ends, over)) = &row {
+                        let ends = *ends;
+                        tx.execute(
+                            "UPDATE torrents SET download_ends = CASE WHEN download_ends < {} \
+                             THEN {} ELSE download_ends END WHERE job_id = {}",
+                            &[SqlArg::I64(ends), SqlArg::I64(ends), SqlArg::I64(id)],
+                        )
+                        .await?;
+                        if let Some((sql, args)) = over {
+                            tx.execute(sql, args).await?;
+                        }
+                    }
+                    Ok(())
+                })
+            })
+            .await
+        })
+    }
+
+    // Each file's time as [`Self::save_torrent_checkpoint`] last took it,
+    // by file, in one read by the table's key. A torrent's restore reads it
+    // only when it kept pieces; it holds a row per file at most.
+    fn torrent_file_stamps(&self, job_id: JobId) -> Result<HashMap<u32, i64>, StateError> {
+        self.torrent_read();
+        let id = stored(job_id.0)?;
+        let datastore = self.borrow().datastore();
+        self.borrow().run_sql_blocking_read(async move {
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT file, modified_ns FROM torrent_file_stamps WHERE job_id = {}",
+                &[SqlArg::I64(id)],
+            )
+            .await?;
+            let mut stamps = HashMap::with_capacity(rows.len());
+            for row in &rows {
+                // A row this build cannot place is no record: that file is
+                // judged by its size.
+                if let Ok(file) = u32::try_from(row.i64("file")?) {
+                    stamps.insert(file, row.i64("modified_ns")?);
+                }
+            }
+            Ok(stamps)
+        })
+    }
+
+    // The pieces [`Self::save_torrent_checkpoint`] last kept; None when it
+    // kept none.
+    fn torrent_pieces(&self, job_id: JobId) -> Result<Option<Kept>, StateError> {
+        self.torrent_read();
+        let id = stored(job_id.0)?;
+        let datastore = self.borrow().datastore();
+        self.borrow().run_sql_blocking_read(async move {
+            let row = SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT pieces, pieces_checking FROM torrent_counters WHERE job_id = {}",
+                &[SqlArg::I64(id)],
+            )
+            .await?;
+            let Some(row) = row else { return Ok(None) };
+            let Some(bits) = row.opt_bytes("pieces")? else {
+                return Ok(None);
+            };
+            Ok(Some(Kept {
+                bits,
+                checking: row.bool("pieces_checking")?,
+            }))
+        })
+    }
+
+    // Unpacking is over, and its outputs are where they stay: the files it
+    // placed beside the torrent's own are kept on its row, with those an
+    // earlier unpacking kept there; `dropped`, the names kept that hold no
+    // file, go from it; `held` joins what the torrent holds, so a history
+    // archive leaves them; and its job's checkpoint goes. One transaction:
+    // a restart finds the placing recorded whole or not at all. Run on the
+    // torrent's own lane, so no write of the job's checkpoint queued before
+    // it lands after.
+    fn finish_torrent_unpack(
+        &self,
+        job_id: JobId,
+        outputs: &[String],
+        dropped: &[String],
+        held: &[String],
+        end: &UnpackEnd,
+    ) -> Result<(), StateError> {
+        let id = stored(job_id.0)?;
+        let outputs = self.outputs_with(job_id, outputs, dropped)?;
+        let held = held.to_vec();
+        let mut args = vec![SqlArg::OptText(outputs)];
+        args.extend(unpack_end_args(end));
+        args.push(SqlArg::I64(id));
+        let datastore = self.borrow().datastore();
+        self.borrow().run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "finish_torrent_unpack", |tx| {
+                let (args, held) = (args.clone(), held.clone());
+                Box::pin(async move {
+                    tx.execute(
+                        "UPDATE torrents SET outputs = {}, unpack_over = {}, unpack_end = {}, \
+                         unpack_why = {} WHERE job_id = {}",
+                        &args,
+                    )
+                    .await?;
+                    insert_held_tx(tx, id, &held).await?;
+                    for table in weaver_server_base::jobs::graph_checkpoint::TABLES {
+                        tx.execute(
+                            &format!("DELETE FROM {table} WHERE job_id = {{}}"),
+                            &[SqlArg::I64(id)],
+                        )
+                        .await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+        })
+    }
+
+    // What a torrent's row says the torrent made, written whole in one
+    // statement: `outputs`, the files unpacking placed, and `adopted`, what
+    // was there before the torrent (None for not known). A move of its
+    // placed files writes it before any file moves, to no output and every
+    // file adopted, so a move that stops midway leaves a row that names no
+    // file as the torrent's to delete; and again when a move fails, with
+    // what the move left as it was. False when the torrent has no row.
+    //
+    // `checking` is written with it, in the same transaction, as the mark
+    // the saved pieces carry (`Kept::checking`): while it is set the next
+    // start trusts none of them and checks every piece. The write before a
+    // move sets it, so a run that ends mid-move never vouches, at its next
+    // start, for a file the move left at one of the torrent's names; the
+    // write after a failed move says what the store vouches for then.
+    fn set_torrent_made(
+        &self,
+        job_id: JobId,
+        outputs: &[String],
+        adopted: Option<&super::model::Adopted>,
+        checking: bool,
+    ) -> Result<bool, StateError> {
+        let id = stored(job_id.0)?;
+        let outputs = stored_list(outputs)?;
+        let adopted = adopted.map(adopted_text).transpose()?.flatten();
+        let datastore = self.borrow().datastore();
+        self.borrow().run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "set_torrent_made", |tx| {
+                let (outputs, adopted) = (outputs.clone(), adopted.clone());
+                Box::pin(async move {
+                    let changed = tx
+                        .execute(
+                            "UPDATE torrents SET outputs = {}, adopted = {} WHERE job_id = {}",
+                            &[
+                                SqlArg::OptText(outputs),
+                                SqlArg::OptText(adopted),
+                                SqlArg::I64(id),
+                            ],
+                        )
+                        .await?;
+                    tx.execute(
+                        "UPDATE torrent_counters SET pieces_checking = {} WHERE job_id = {}",
+                        &[SqlArg::Bool(checking), SqlArg::I64(id)],
+                    )
+                    .await?;
+                    Ok(changed > 0)
+                })
+            })
+            .await
+        })
+    }
+
+    // A move of a torrent's placed files, recorded whole: the folder its
+    // files are in and its save path are `to`; `outputs` are the files
+    // unpacking placed, under the names the move left them at; `adopted`
+    // is what was there before the torrent with the files the move found
+    // at `to` and kept, None when it is not known; and `held` is what the
+    // torrent holds from now on, in place of what it held. One transaction,
+    // so a restart never finds the new folder beside the names of the old
+    // one. `checking` is the mark the saved pieces carry from then
+    // (`set_torrent_made`): set when the move kept a file at `to`, so a
+    // start that comes before those pieces are forgotten checks them all.
+    fn record_torrent_files_move(
+        &self,
+        job_id: JobId,
+        to: &str,
+        outputs: &[String],
+        adopted: Option<&super::model::Adopted>,
+        held: &[String],
+        checking: bool,
+    ) -> Result<(), StateError> {
+        let id = stored(job_id.0)?;
+        let to = to.to_owned();
+        let outputs = stored_list(outputs)?;
+        let adopted = adopted.map(adopted_text).transpose()?.flatten();
+        let held = held.to_vec();
+        let datastore = self.borrow().datastore();
+        self.borrow().run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "record_torrent_files_move", |tx| {
+                let (to, outputs, adopted, held) =
+                    (to.clone(), outputs.clone(), adopted.clone(), held.clone());
+                Box::pin(async move {
+                    let changed = tx
+                        .execute(
+                            "UPDATE torrents SET files_dir = {}, save_path = {}, outputs = {}, \
+                             adopted = {}, held_set = {} WHERE job_id = {}",
+                            &[
+                                SqlArg::OptText(Some(to.clone())),
+                                SqlArg::OptText(Some(to)),
+                                SqlArg::OptText(outputs),
+                                SqlArg::OptText(adopted),
+                                SqlArg::Bool(true),
+                                SqlArg::I64(id),
+                            ],
+                        )
+                        .await?;
+                    if changed == 0 {
+                        return Err(StateError::Database(
+                            "the torrent has no row to record its move on".to_owned(),
+                        ));
+                    }
+                    tx.execute(
+                        "UPDATE torrent_counters SET pieces_checking = {} WHERE job_id = {}",
+                        &[SqlArg::Bool(checking), SqlArg::I64(id)],
+                    )
+                    .await?;
+                    tx.execute(
+                        "DELETE FROM torrent_held_paths WHERE job_id = {}",
+                        &[SqlArg::I64(id)],
+                    )
+                    .await?;
+                    insert_held_tx(tx, id, &held).await?;
+                    Ok(())
+                })
+            })
+            .await
+        })
+    }
+
+    // The files [`Self::finish_torrent_unpack`] kept, relative to the
+    // directory the torrent's files are in.
+    fn torrent_outputs(&self, job_id: JobId) -> Result<Vec<String>, StateError> {
+        let id = stored(job_id.0)?;
+        let datastore = self.borrow().datastore();
+        self.borrow().run_sql_blocking_read(async move {
+            let row = SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT outputs FROM torrents WHERE job_id = {}",
+                &[SqlArg::I64(id)],
+            )
+            .await?;
+            let Some(text) = row
+                .map(|row| row.opt_text("outputs"))
+                .transpose()?
+                .flatten()
+            else {
+                return Ok(Vec::new());
+            };
+            serde_json::from_str(&text).map_err(|error| StateError::Database(error.to_string()))
+        })
+    }
+
+    // What was on disk where the torrent's files go before Weaver wrote
+    // them; nothing kept is nothing adopted.
+    #[cfg(any(test, feature = "test-support"))]
+    fn set_torrent_adopted(
+        &self,
+        job_id: JobId,
+        adopted: &super::model::Adopted,
+    ) -> Result<bool, StateError> {
+        let args = vec![
+            SqlArg::OptText(adopted_text(adopted)?),
+            SqlArg::I64(stored(job_id.0)?),
+        ];
+        self.set_torrent_column("adopted", args)
+    }
+
+    // A row from before what was there was kept: `adopted` never written.
+    #[cfg(any(test, feature = "test-support"))]
+    fn forget_torrent_adopted(&self, job_id: JobId) -> Result<bool, StateError> {
+        let args = vec![SqlArg::OptText(None), SqlArg::I64(stored(job_id.0)?)];
+        self.set_torrent_column("adopted", args)
+    }
+
+    // What was on disk where the torrent's files go before Weaver wrote
+    // them; None when that was never written (a row from before it was
+    // kept), which is not known and takes no file.
+    fn torrent_adopted(&self, job_id: JobId) -> Result<Option<super::model::Adopted>, StateError> {
+        let id = stored(job_id.0)?;
+        let datastore = self.borrow().datastore();
+        self.borrow().run_sql_blocking_read(async move {
+            let row = SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT adopted FROM torrents WHERE job_id = {}",
+                &[SqlArg::I64(id)],
+            )
+            .await?;
+            let Some(text) = row
+                .map(|row| row.opt_text("adopted"))
+                .transpose()?
+                .flatten()
+            else {
+                return Ok(None);
+            };
+            serde_json::from_str(&text)
+                .map(Some)
+                .map_err(|error| StateError::Database(error.to_string()))
+        })
+    }
+
+    // `torrent_adopted` and `torrent_outputs` of each of `job_ids`, read in
+    // as few statements as the bind limit allows, each torrent's answer as
+    // those two give it: a torrent with no row has nothing adopted known and
+    // no outputs, a value that does not decode is that torrent's error, and
+    // a read that fails is the error of every torrent it read.
+    fn torrents_made(&self, job_ids: &[JobId]) -> HashMap<JobId, MadeRead> {
+        let mut made = HashMap::with_capacity(job_ids.len());
+        let mut ids = Vec::with_capacity(job_ids.len());
+        for &job_id in job_ids {
+            match stored(job_id.0) {
+                Ok(id) => ids.push((job_id, id)),
+                Err(error) => {
+                    let again = StateError::Database(error.to_string());
+                    made.insert(job_id, (Err(error), Err(again)));
+                }
+            }
+        }
+        let datastore = self.borrow().datastore();
+        let chunk =
+            weaver_server_db::persistence::sql_runtime::max_rows_for_engine(datastore.engine(), 1);
+        for ids in ids.chunks(chunk.max(1)) {
+            let list = vec!["{}"; ids.len()].join(", ");
+            let args: Vec<SqlArg> = ids.iter().map(|(_, id)| SqlArg::I64(*id)).collect();
+            let datastore = self.borrow().datastore();
+            let rows = self.borrow().run_sql_blocking_read(async move {
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    &format!(
+                        "SELECT job_id, adopted, outputs FROM torrents WHERE job_id IN ({list})"
+                    ),
+                    &args,
+                )
+                .await?;
+                rows.into_iter()
+                    .map(|row| {
+                        Ok((
+                            row.i64("job_id")?,
+                            row.opt_text("adopted"),
+                            row.opt_text("outputs"),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, StateError>>()
+            });
+            let rows = match rows {
+                Ok(rows) => rows,
+                Err(error) => {
+                    for (job_id, _) in ids {
+                        made.insert(
+                            *job_id,
+                            (
+                                Err(StateError::Database(error.to_string())),
+                                Err(StateError::Database(error.to_string())),
+                            ),
+                        );
+                    }
+                    continue;
+                }
+            };
+            let mut found: HashMap<i64, _> = rows
+                .into_iter()
+                .map(|(id, adopted, outputs)| (id, (adopted, outputs)))
+                .collect();
+            for (job_id, id) in ids {
+                let (adopted, outputs) = found.remove(id).unwrap_or((Ok(None), Ok(None)));
+                let adopted = adopted.and_then(|text| {
+                    text.map(|text| {
+                        serde_json::from_str(&text)
+                            .map_err(|error| StateError::Database(error.to_string()))
+                    })
+                    .transpose()
+                });
+                let outputs = outputs.and_then(|text| {
+                    text.map_or(Ok(Vec::new()), |text| {
+                        serde_json::from_str(&text)
+                            .map_err(|error| StateError::Database(error.to_string()))
+                    })
+                });
+                made.insert(*job_id, (adopted, outputs));
+            }
+        }
+        made
+    }
+
+    // The trackers of each torrent `edits` names, as `set_torrent_trackers`
+    // writes one torrent's, in one transaction of few statements. Returns
+    // the torrents that exist, which alone are written.
+    fn set_torrents_trackers(
+        &self,
+        edits: &[(JobId, Vec<TrackerEntry>)],
+    ) -> Result<std::collections::HashSet<JobId>, StateError> {
+        if edits.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let ids: Vec<(JobId, i64)> = edits
+            .iter()
+            .map(|(job_id, _)| Ok((*job_id, stored(job_id.0)?)))
+            .collect::<Result<_, StateError>>()?;
+        let edits: Vec<(i64, Vec<TrackerEntry>)> = ids
+            .iter()
+            .zip(edits)
+            .map(|((_, id), (_, trackers))| (*id, trackers.clone()))
+            .collect();
+        let edits = std::sync::Arc::new(edits);
+        let key = self.borrow().encryption_key().cloned();
+        let datastore = self.borrow().datastore();
+        let known = self.borrow().run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "set_torrents_trackers", |tx| {
+                let edits = std::sync::Arc::clone(&edits);
+                let key = key.clone();
+                Box::pin(async move {
+                    let ids: Vec<i64> = edits.iter().map(|(id, _)| *id).collect();
+                    let mut known = std::collections::HashSet::with_capacity(ids.len());
+                    for chunk in ids.chunks(
+                        weaver_server_db::persistence::sql_runtime::max_rows_for_tx(tx, 1),
+                    ) {
+                        let list = vec!["{}"; chunk.len()].join(", ");
+                        let args: Vec<SqlArg> = chunk.iter().map(|id| SqlArg::I64(*id)).collect();
+                        let rows = tx
+                            .fetch_all(
+                                &format!("SELECT job_id FROM torrents WHERE job_id IN ({list})"),
+                                &args,
+                            )
+                            .await?;
+                        for row in rows {
+                            known.insert(row.i64("job_id")?);
+                        }
+                        tx.execute(
+                            &format!("DELETE FROM torrent_trackers WHERE job_id IN ({list})"),
+                            &args,
+                        )
+                        .await?;
+                    }
+                    let rows: Vec<(i64, &TrackerEntry)> = edits
+                        .iter()
+                        .filter(|(id, _)| known.contains(id))
+                        .flat_map(|(id, trackers)| {
+                            trackers.iter().map(move |tracker| (*id, tracker))
+                        })
+                        .collect();
+                    insert_tracker_rows(tx, &rows, key.as_ref()).await?;
+                    Ok(known)
+                })
+            })
+            .await
+        })?;
+        Ok(ids
+            .into_iter()
+            .filter(|(_, id)| known.contains(id))
+            .map(|(job_id, _)| job_id)
+            .collect())
+    }
+
+    // Whether each of a batch of torrents unpacks, that column alone, in
+    // one transaction of few statements: what a page of a start's load
+    // fixes for the torrents kept before the column was.
+    fn set_torrents_unpack_in_force(&self, unpacks: &[(JobId, bool)]) -> Result<(), StateError> {
+        if unpacks.is_empty() {
+            return Ok(());
+        }
+        let rows = unpacks
+            .iter()
+            .map(|&(job_id, unpack)| Ok((stored(job_id.0)?, SqlArg::Bool(unpack))))
+            .collect::<Result<Vec<_>, StateError>>()?;
+        let rows = std::sync::Arc::new(rows);
+        let datastore = self.borrow().datastore();
+        self.borrow().run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "set_torrents_unpack_in_force", |tx| {
+                let rows = std::sync::Arc::clone(&rows);
+                Box::pin(async move { update_column_tx(tx, "unpack_in_force", &rows).await })
+            })
+            .await
+        })
+    }
+
+    // A batch of torrents short of complete again, that column alone, in one
+    // transaction of few statements: what a page of a start's load writes
+    // for the torrents stored complete that want a file they lack.
+    fn clear_torrents_completed(&self, job_ids: &[JobId]) -> Result<(), StateError> {
+        if job_ids.is_empty() {
+            return Ok(());
+        }
+        let rows = job_ids
+            .iter()
+            .map(|job_id| Ok((stored(job_id.0)?, SqlArg::OptI64(None))))
+            .collect::<Result<Vec<_>, StateError>>()?;
+        let rows = std::sync::Arc::new(rows);
+        let datastore = self.borrow().datastore();
+        self.borrow().run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "clear_torrents_completed", |tx| {
+                let rows = std::sync::Arc::clone(&rows);
+                Box::pin(async move { update_column_tx(tx, "completed_at_ms", &rows).await })
+            })
+            .await
+        })
+    }
+
+    // The categories and the forced flags of a batch of torrents, each its
+    // one column and no other, in one transaction of few statements.
+    fn set_torrent_categories_and_forced(
+        &self,
+        categories: &[(JobId, Option<u32>)],
+        forced: &[(JobId, bool)],
+    ) -> Result<(), StateError> {
+        if categories.is_empty() && forced.is_empty() {
+            return Ok(());
+        }
+        let categories = categories
+            .iter()
+            .map(|&(job_id, category_id)| {
+                Ok((
+                    stored(job_id.0)?,
+                    SqlArg::OptI64(category_id.map(i64::from)),
+                ))
+            })
+            .collect::<Result<Vec<_>, StateError>>()?;
+        let forced = forced
+            .iter()
+            .map(|&(job_id, forced)| Ok((stored(job_id.0)?, SqlArg::Bool(forced))))
+            .collect::<Result<Vec<_>, StateError>>()?;
+        let columns = std::sync::Arc::new((categories, forced));
+        let datastore = self.borrow().datastore();
+        self.borrow().run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "set_torrent_categories_and_forced", |tx| {
+                let columns = std::sync::Arc::clone(&columns);
+                Box::pin(async move {
+                    update_column_tx(tx, "category_id", &columns.0).await?;
+                    update_column_tx(tx, "forced", &columns.1).await
+                })
+            })
+            .await
+        })
+    }
+
+    // A batch of torrents' own settings, each column for the torrents it
+    // names and no other, in one transaction of few statements: what
+    // `set_torrent_forced` and the other setters write one torrent at a
+    // time.
+    fn set_torrent_settings(&self, rows: &TorrentSettingRows) -> Result<(), StateError> {
+        fn column<T>(
+            rows: &[(JobId, T)],
+            arg: impl Fn(&T) -> Result<SqlArg, StateError>,
+        ) -> Result<Vec<(i64, SqlArg)>, StateError> {
+            rows.iter()
+                .map(|(job_id, value)| Ok((stored(job_id.0)?, arg(value)?)))
+                .collect()
+        }
+        let limit = |limit: &Option<u64>| Ok(SqlArg::OptI64(limit.map(stored).transpose()?));
+        let columns: Vec<(&'static str, Vec<(i64, SqlArg)>)> = vec![
+            ("forced", column(&rows.forced, |on| Ok(SqlArg::Bool(*on)))?),
+            (
+                "sequential",
+                column(&rows.sequential, |on| Ok(SqlArg::Bool(*on)))?,
+            ),
+            (
+                "first_last_piece_first",
+                column(&rows.first_last_piece_first, |on| Ok(SqlArg::Bool(*on)))?,
+            ),
+            ("upload_limit", column(&rows.upload_limit, limit)?),
+            ("download_limit", column(&rows.download_limit, limit)?),
+            (
+                "policy_override",
+                column(&rows.policy_override, |policy| {
+                    SeedingPolicy::kept(*policy)
+                        .map(|policy| serde_json::to_string(&policy))
+                        .transpose()
+                        .map(SqlArg::OptText)
+                        .map_err(|error| StateError::Database(error.to_string()))
+                })?,
+            ),
+        ];
+        let columns: Vec<_> = columns
+            .into_iter()
+            .filter(|(_, rows)| !rows.is_empty())
+            .collect();
+        if columns.is_empty() {
+            return Ok(());
+        }
+        let columns = std::sync::Arc::new(columns);
+        let datastore = self.borrow().datastore();
+        self.borrow().run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "set_torrent_settings", |tx| {
+                let columns = std::sync::Arc::clone(&columns);
+                Box::pin(async move {
+                    for (name, rows) in columns.iter() {
+                        update_column_tx(tx, name, rows).await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+        })
+    }
+}
+
+trait TorrentsPersistenceOutputsWithLocalQueries {
+    fn outputs_with(
+        &self,
+        job_id: JobId,
+        outputs: &[String],
+        unplaced: &[String],
+    ) -> Result<Option<String>, StateError>;
+    fn set_torrent_column(&self, column: &str, args: Vec<SqlArg>) -> Result<bool, StateError>;
+}
+
+impl<T: TorrentDatabase> TorrentsPersistenceOutputsWithLocalQueries for T {
+    // The row's outputs with `outputs` added and `unplaced` taken out, as
+    // the row keeps them.
+    fn outputs_with(
+        &self,
+        job_id: JobId,
+        outputs: &[String],
+        unplaced: &[String],
+    ) -> Result<Option<String>, StateError> {
+        let unplaced: std::collections::HashSet<&String> = unplaced.iter().collect();
+        let mut kept = self.torrent_outputs(job_id)?;
+        kept.retain(|output| !unplaced.contains(output));
+        let mut seen: std::collections::HashSet<String> = kept.iter().cloned().collect();
+        for output in outputs {
+            if seen.insert(output.clone()) {
+                kept.push(output.clone());
+            }
+        }
+        (!kept.is_empty())
+            .then(|| serde_json::to_string(&kept))
+            .transpose()
+            .map_err(|error| StateError::Database(error.to_string()))
+    }
+
+    // Write one column of a torrent and no other, so the writers of
+    // different columns never undo each other.
+    fn set_torrent_column(&self, column: &str, args: Vec<SqlArg>) -> Result<bool, StateError> {
+        let sql = format!("UPDATE torrents SET {column} = {{}} WHERE job_id = {{}}");
+        let datastore = self.borrow().datastore();
+        self.borrow().run_sql_blocking(async move {
+            let changed = SqlRuntime::execute(datastore.write_exec(), &sql, &args).await?;
+            Ok(changed > 0)
+        })
+    }
+}
+
+// The ledger, saved peers and kept pieces of the torrents `among`'s binds
+// `args` name, by torrent, in one read by the table's key: what
+// [`Database::get_torrent_counters`], [`Database::torrent_peers`] and
+// [`Database::torrent_pieces`] give a torrent's restore. Each part reads on
+// its own, so one that does not read is that part of that torrent's alone.
+pub async fn counters_among(
+    datastore: &weaver_server_db::persistence::sql_runtime::StoreDatastore,
+    among: &str,
+    args: &[SqlArg],
+) -> Result<Vec<(JobId, CountersRow)>, StateError> {
+    let rows = SqlRuntime::fetch_all(
+        datastore.read_exec(),
+        &format!(
+            "SELECT job_id, uploaded_bytes, downloaded_bytes, active_duration_s,
+                    last_seen_complete_ms, finished_duration_s, last_activity_ms,
+                    consecutive_seeding_s, failed_bytes, redundant_bytes, pieces,
+                    pieces_checking, peers, banned_peers, found_peers
+               FROM torrent_counters WHERE job_id IN ({among})"
+        ),
+        args,
+    )
+    .await?;
+    rows.iter()
+        .map(|row| {
+            let job_id = JobId(count(row, "job_id")?);
+            let kept = row.opt_bytes("pieces").and_then(|bits| {
+                bits.map(|bits| {
+                    Ok(Kept {
+                        bits,
+                        checking: row.bool("pieces_checking")?,
+                    })
+                })
+                .transpose()
+            });
+            let peers = row
+                .opt_text("peers")
+                .and_then(|peers| listed("peers", peers))
+                .and_then(|peers| {
+                    let banned = row
+                        .opt_text("banned_peers")
+                        .and_then(|banned| listed("banned_peers", banned))?;
+                    let found = found_marks(job_id, row.opt_text("found_peers"));
+                    Ok(ResumePeers {
+                        peers,
+                        banned,
+                        found,
+                    })
+                });
+            Ok((
+                job_id,
+                CountersRow {
+                    counters: counters_from_row(row),
+                    peers,
+                    kept,
+                    stamps: Vec::new(),
+                },
+            ))
+        })
+        .collect()
+}
+
+// One torrent's counters row as a boot reads it.
+pub struct CountersRow {
+    pub counters: Result<TorrentCounters, StateError>,
+    pub peers: Result<ResumePeers, StateError>,
+    pub kept: Result<Option<Kept>, StateError>,
+    // Each file's time as taken with the pieces, read apart from the row
+    // (`torrent_file_stamps`); none read, or none kept.
+    pub stamps: Vec<(u32, i64)>,
+}

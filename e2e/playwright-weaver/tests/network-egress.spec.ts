@@ -92,7 +92,7 @@ test("E06 a referenced egress cannot be deleted; moving the route frees it and t
   const b = await world.egress("b");
   const server = await world.server({ route: { legs: [directLeg(b.id, 100)] } });
   const refused = await graphqlErrors(request, "mutation($id: Int!) { deleteEgressInterface(id: $id) }", { id: b.id });
-  expect(refused.join("\n")).toContain("egress is referenced by a server or RSS feed");
+  expect(refused.join("\n")).toContain(`egress is used by server ${server}`);
   await world.route("SERVER", server, { legs: [directLeg(a.id, 100)] });
   expect((await graphql<{ deleteEgressInterface: boolean }>(request, "mutation($id: Int!) { deleteEgressInterface(id: $id) }", { id: b.id })).deleteEgressInterface).toBe(true);
   world.egresses.splice(world.egresses.indexOf(b.id), 1);
@@ -142,7 +142,7 @@ test("E08 an egress speed limit caps every leg sample", async ({ request }, info
   test.info().annotations.push({ type: "gap", description: "Weaver exposes no egress-throttling metrics counter, so only the 1 Hz leg samples are asserted." });
   const limit = 1024 * 1024;
   const iface = await interfaceForAddress(request, egressAddress("a"));
-  const egress = await createEgress(request, { name: "e08", bindingKind: "INTERFACE", interfaceName: iface.name, maxDownloadSpeed: limit });
+  const egress = await createEgress(request, { name: "e08", bindingKind: "INTERFACE", interfaceName: iface.name, downloadBps: limit });
   world.track("egress", egress.id);
   const server = await world.server({ route: { legs: [directLeg(egress.id, 100)] } });
   const subscription = await FlowSubscription.open();
@@ -164,8 +164,8 @@ test("E09 egress tests report the source address, go through a proxy, and fail w
   const fixture = await fixtureState(request);
   const primary = await world.profile({
     name: "e09-primary", kind: "HTTP_CONNECT", enabled: true, host: hostAddress("proxy-fixture", "a"), port: fixture.ports.primary!,
-    username: "fixture", password: "fixture", dnsServers: [hostAddress("proxy-fixture", "a")], timeoutSeconds: 5,
-  });
+    username: "fixture", password: "fixture", timeoutSeconds: 5,
+  }, "fixture");
   const direct = await testEgress(request, egress.id, DIRECT_HOST, 119);
   expect(direct).toMatchObject({ success: true, proxyId: null });
   expect(direct.sourceAddress?.replace(/:\d+$/, "")).toBe(egressAddress("a"));

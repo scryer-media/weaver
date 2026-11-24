@@ -12,27 +12,48 @@ use std::{
     sync::Arc,
 };
 
-use tokio::sync::{OwnedRwLockReadGuard, OwnedSemaphorePermit};
+use tokio::sync::OwnedRwLockReadGuard;
 
-use super::{DialError, Dialer, Resolution, SessionHop};
+use super::{
+    DialError, Dialer, Resolution, SessionHop, SessionSockets, SocketClass, SocketPermit,
+    datagram_bytes,
+};
 use crate::{
     TunnelError,
     endpoint::{DatagramSocket, DatagramTransport},
 };
 
-pub(super) struct SessionDatagrams(Arc<SessionHop>);
+// The class names whose bytes each socket holds: a torrent session's
+// datagram sockets are the torrents', the socket a tunnel stacked on this one
+// rides is the reserve's.
+pub(super) struct SessionDatagrams(Arc<SessionHop>, SocketClass);
 
 impl SessionDatagrams {
-    pub(super) fn new(session: Arc<SessionHop>) -> Self {
-        Self(session)
+    pub(super) fn new(session: Arc<SessionHop>, class: SocketClass) -> Self {
+        Self(session, class)
     }
 }
 
-fn tunnel_error(error: DialError) -> TunnelError {
+pub(super) fn tunnel_error(error: DialError) -> TunnelError {
     match error {
         DialError::Fatal(error) => error,
         error => TunnelError::Engine(error.to_string()),
     }
+}
+
+// `bytes` of `class` in `sockets`, or the tunnel at capacity with the slot
+// that rings when bytes come back.
+pub(super) fn take_bytes(
+    sockets: &SessionSockets,
+    class: SocketClass,
+    bytes: u64,
+) -> Result<Option<SocketPermit>, TunnelError> {
+    sockets
+        .take(class, bytes)
+        .map_err(|refused| TunnelError::AtCapacity {
+            open: refused.open,
+            freed: refused.freed,
+        })
 }
 
 #[async_trait::async_trait]
@@ -48,6 +69,19 @@ impl DatagramTransport for SessionDatagrams {
     }
 
     async fn bind(&self, peer: SocketAddr) -> Result<Arc<dyn DatagramSocket>, TunnelError> {
+        self.bind_on(0, Some(peer)).await
+    }
+}
+
+impl SessionDatagrams {
+    // A socket on `port` inside the session's tunnel; 0 takes a free port.
+    // `peer` is the one it is bound to reach, when it is bound for one. A
+    // port another socket of the tunnel holds is refused.
+    pub(super) async fn bind_on(
+        &self,
+        port: u16,
+        peer: Option<SocketAddr>,
+    ) -> Result<Arc<dyn DatagramSocket>, TunnelError> {
         let session = &self.0;
         let Some(provider) = session.resolver.as_ref() else {
             return Err(TunnelError::Engine(format!(
@@ -55,18 +89,42 @@ impl DatagramTransport for SessionDatagrams {
                 session.id
             )));
         };
-        let activity = session.activity.clone().read_owned().await;
-        let capacity = session.capacity.acquire().map_err(tunnel_error)?;
-        match provider.0.bind(peer).await {
+        let (provider, activity, capacity, sockets) = match super::identity::claim(session).await {
+            Some(lent) => (lent.resolver, lent.activity, None, lent.sockets),
+            None => (
+                provider.clone(),
+                session.activity.clone().read_owned().await,
+                session.capacity.acquire().map_err(tunnel_error)?,
+                session.sockets.clone(),
+            ),
+        };
+        // Every datagram socket the tunnel hands out is sized as a carrier,
+        // and is freed the moment it is dropped.
+        let mtu = sockets.budget().map_or(0, |budget| budget.mtu);
+        // Kept connections are closed to make room first.
+        let share = sockets
+            .take(self.1, datagram_bytes(mtu))
+            .map_err(|refused| TunnelError::AtCapacity {
+                open: refused.open,
+                freed: refused.freed,
+            })?;
+        match provider.0.bind_datagrams(port).await {
             Ok(socket) => {
-                crate::resolution::record::bound(peer, true);
+                if let Some(peer) = peer {
+                    crate::resolution::record::bound(peer, true);
+                }
                 Ok(Arc::new(HeldSocket {
                     socket,
                     _activity: activity,
                     _capacity: capacity,
+                    _share: share,
                 }))
             }
+            // A tunnel that could not come up to carry datagrams is the
+            // hop's fault, as one that could not come up to dial is.
             Err(error) => {
+                session.failure.blame(&error, session.timeout);
+                drop(share);
                 drop(capacity);
                 drop(activity);
                 session.retire_idle().await;
@@ -80,7 +138,8 @@ impl DatagramTransport for SessionDatagrams {
 struct HeldSocket {
     socket: Arc<dyn DatagramSocket>,
     _activity: OwnedRwLockReadGuard<()>,
-    _capacity: Option<Arc<OwnedSemaphorePermit>>,
+    _capacity: Option<Arc<super::SessionPermit>>,
+    _share: Option<SocketPermit>,
 }
 
 #[async_trait::async_trait]
@@ -168,6 +227,7 @@ mod tests {
             socket: inner.clone(),
             _activity: Arc::new(tokio::sync::RwLock::new(())).read_owned().await,
             _capacity: None,
+            _share: None,
         };
         let target: SocketAddr = "10.0.0.2:51820".parse().unwrap();
         let datagrams: [&[u8]; 3] = [b"one", b"two", b"three"];

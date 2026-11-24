@@ -235,10 +235,10 @@ mod tests {
         );
         // A state error raised outside a db task is worded the same way.
         assert_eq!(
-            json(state_error(NetworkRefusal::PoolInUse.into())),
+            json(state_error(NetworkRefusal::PoolGone.into())),
             serde_json::json!({
-                "message": "pool is referenced by a server or RSS feed",
-                "extensions": { "code": "POOL_IN_USE" },
+                "message": "proxy pool no longer exists",
+                "extensions": { "code": "POOL_NOT_FOUND" },
             })
         );
         assert_eq!(

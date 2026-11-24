@@ -28,6 +28,8 @@ export const testIds = {
   sectionNote: (blockId: string) => `note-${blockId}`,
   /** A settings field's help line, by the field id. */
   fieldHelp: (fieldId: string) => `help-${fieldId}`,
+  /** The number of a settings field whose control is a value beside its switch or its state, by the field id. */
+  fieldValue: (fieldId: string) => `field-${fieldId}-value`,
   /** A history row, keyed by the job's id. */
   historyRow: (jobId: string | number) => `history-row-${jobId}`,
   historyRowPrefix: "history-row-",
@@ -43,6 +45,8 @@ export const testIds = {
   // A control's own parts, keyed by the control's ID.
   menu: (ownerId: string) => `${ownerId}-menu`,
   option: (ownerId: string, value: string) => `${ownerId}-option-${value}`,
+  /** A further line said of an option. */
+  optionNote: (ownerId: string, value: string) => `${ownerId}-option-${value}-note`,
   /** A Select's trigger showing `value` as the current choice. */
   selected: (ownerId: string, value: string) => `${ownerId}-selected-${value}`,
   browse: (ownerId: string) => `${ownerId}-browse`,
@@ -73,6 +77,8 @@ export const testIds = {
   shellFooter: "shell-footer",
   shellConnection: "shell-connection",
   shellStatus: "shell-status",
+  /** The rail's three rates, shown while torrent things show. */
+  shellThroughputRates: "shell-throughput-rates",
   /** The footer's connection dot, by the state it shows (connected, reconnecting, polling). */
   shellConnectionState: (state: "connected" | "reconnecting" | "polling") => `shell-connection-${state}`,
 
@@ -124,6 +130,8 @@ export const settingsIds = {
   watchQueued: "watch-scan-queued",
   /** One problem line of the last scan, by its tone (error, warn, muted). */
   watchProblem: (tone: string) => `watch-scan-problem-${tone}`,
+  /** A proxy row's line naming the profile that finds its address, shown only when it is not System. */
+  proxyDnsProfile: (proxyId: number) => `proxy-dns-profile-${proxyId}`,
   // RSS: a feed row's poll button and state cell, a rule's action cell, the seen list's clear button.
   rssFeedPoll: "rss-feed-poll",
   rssFeedState: "rss-feed-state",
@@ -198,6 +206,8 @@ export const runtimeIds = {
   /** The tail's state note (following, paused, disconnected). */
   logsTail: (state: "following" | "paused" | "disconnected") => `logs-tail-${state}`,
   analyzerDrop: "analyzer-drop",
+  analyzerMagnet: "analyzer-magnet",
+  analyzerAnalyze: "analyzer-analyze",
   analyzerReport: "analyzer-report",
   analyzerCopyReport: "analyzer-copy-report",
   analyzerDownloadJson: "analyzer-download-json",

@@ -1,0 +1,326 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+use hmac::{Hmac, Mac, digest::KeyInit};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+type HmacSha256 = Hmac<Sha256>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Claims {
+    pub sub: String,
+    pub iat: u64,
+    pub exp: u64,
+}
+
+// What a token handed to a running script says about that run.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScriptRunClaims {
+    pub run_id: String,
+    pub instance_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<u64>,
+    pub exp: u64,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum JwtError {
+    #[error("malformed token")]
+    Malformed,
+    #[error("invalid signature")]
+    InvalidSignature,
+    #[error("token expired")]
+    Expired,
+    #[error("invalid claims: {0}")]
+    InvalidClaims(String),
+}
+
+// Share a small CPU/memory budget across browser password operations.
+// Move the permit into the blocking closure so cancellation cannot free it early.
+pub fn password_work_permit() -> Result<tokio::sync::OwnedSemaphorePermit, &'static str> {
+    static WORK: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    WORK.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(2)))
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| "password verification is busy; try again shortly")
+}
+
+pub fn generate_api_key() -> String {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("getrandom failed");
+    format!("wvr_{}", hex::encode(bytes))
+}
+
+// Generate an opaque browser credential. It deliberately has no API-key
+// prefix, so browser cookies can never be mistaken for programmatic keys.
+pub fn generate_browser_session_secret() -> String {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).expect("getrandom failed");
+    hex::encode(bytes)
+}
+
+// Characters a first-run setup code is drawn from: capitals and digits, less
+// the ones that read alike (0/O, 1/I/L), so the code survives being copied
+// by eye from a terminal.
+pub const SETUP_CODE_ALPHABET: &[u8; 31] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+
+// Characters a first-run setup code carries, not counting its hyphen. Every
+// place that reads, parses or asks for a code takes its length from here.
+// Eight characters is about 40 bits (31^8 codes). The setup endpoint lets in
+// at most 1,024 client addresses with five wrong guesses each a minute, so
+// guessing the code takes about 160 years on average, however many addresses
+// a guesser holds.
+pub const SETUP_CODE_LENGTH: usize = 8;
+
+// The code is shown as two groups of four joined by a hyphen (`K7PM-2XQR`),
+// so it is easy to read back and easy to spot in a log.
+const SETUP_CODE_GROUP: usize = SETUP_CODE_LENGTH / 2;
+
+// The text that introduces a setup code wherever Weaver prints one. Launchers
+// find the code by looking for it, so it must stay stable.
+pub const SETUP_CODE_MARKER: &str = "Weaver one-time setup code: ";
+
+// A short first-run setup code, uniform over `SETUP_CODE_ALPHABET`, in its
+// hyphenated display form.
+pub fn generate_setup_code() -> String {
+    // Rejection sampling: 248 is the largest multiple of 31 in a byte, so
+    // every accepted byte maps to a character with equal probability.
+    let limit = (256 / SETUP_CODE_ALPHABET.len() * SETUP_CODE_ALPHABET.len()) as u8;
+    let mut characters = Vec::with_capacity(SETUP_CODE_LENGTH);
+    let mut bytes = [0u8; 16];
+    while characters.len() < SETUP_CODE_LENGTH {
+        getrandom::fill(&mut bytes).expect("getrandom failed");
+        for byte in bytes {
+            if byte < limit && characters.len() < SETUP_CODE_LENGTH {
+                characters.push(SETUP_CODE_ALPHABET[usize::from(byte) % SETUP_CODE_ALPHABET.len()]);
+            }
+        }
+    }
+    let mut code = String::with_capacity(SETUP_CODE_LENGTH + 1);
+    for (index, character) in characters.into_iter().enumerate() {
+        if index == SETUP_CODE_GROUP {
+            code.push('-');
+        }
+        code.push(char::from(character));
+    }
+    code
+}
+
+// Whether `code` has the hyphenated shape `generate_setup_code` produces.
+pub fn is_setup_code(code: &str) -> bool {
+    let bytes = code.as_bytes();
+    bytes.len() == SETUP_CODE_LENGTH + 1
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            if index == SETUP_CODE_GROUP {
+                *byte == b'-'
+            } else {
+                SETUP_CODE_ALPHABET.contains(byte)
+            }
+        })
+}
+
+// The form a setup code is compared in: capitals, with the hyphen and any
+// spacing dropped, so `k7pm-2xqr`, `K7PM2XQR` and `K7PM 2XQR` are the same
+// code.
+pub fn normalize_setup_code(input: &str) -> String {
+    input
+        .chars()
+        .filter(|character| *character != '-' && !character.is_whitespace())
+        .map(|character| character.to_ascii_uppercase())
+        .collect()
+}
+
+// The setup code a line announces, wherever in the line the announcement
+// sits: a console banner row, or the message of a JSON record.
+pub fn find_setup_code(line: &str) -> Option<&str> {
+    let (_, rest) = line.split_once(SETUP_CODE_MARKER)?;
+    let code = rest.get(..SETUP_CODE_LENGTH + 1)?;
+    let whole = !rest[code.len()..]
+        .chars()
+        .next()
+        .is_some_and(|next| next.is_ascii_alphanumeric() || next == '-');
+    (is_setup_code(code) && whole).then_some(code)
+}
+
+// Stable per-session CSRF value. Only a verifier is persisted; this value is
+// regenerated from the login signing key after a browser reload or process
+// restart.
+pub fn derive_browser_csrf_token(session_token: &str, server_secret: &[u8; 32]) -> String {
+    hex::encode(sign_hs256(
+        server_secret,
+        format!("browser-csrf-v1:{session_token}").as_bytes(),
+    ))
+}
+
+pub fn hash_api_key(raw_key: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(raw_key.as_bytes());
+    hasher.finalize().into()
+}
+
+pub fn create_jwt(username: &str, secret: &[u8], ttl_secs: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    sign_claims(
+        &Claims {
+            sub: username.to_string(),
+            iat: now,
+            exp: now + ttl_secs,
+        },
+        secret,
+    )
+}
+
+pub fn verify_jwt(token: &str, secret: &[u8]) -> Result<Claims, JwtError> {
+    let claims: Claims = verified_claims(token, secret)?;
+    unexpired(claims.exp)?;
+    Ok(claims)
+}
+
+// A token for one script run, signed with a domain-separated key so login
+// tokens and run tokens cannot be substituted even if their claims overlap.
+pub fn create_script_run_jwt(claims: &ScriptRunClaims, secret: &[u8]) -> String {
+    sign_claims(claims, &sign_hs256(secret, b"weaver-script-run-v1"))
+}
+
+pub fn verify_script_run_jwt(token: &str, secret: &[u8]) -> Result<ScriptRunClaims, JwtError> {
+    let claims: ScriptRunClaims =
+        verified_claims(token, &sign_hs256(secret, b"weaver-script-run-v1"))?;
+    unexpired(claims.exp)?;
+    Ok(claims)
+}
+
+// Whether `token` has the shape of a token this server signs. Cheap enough
+// to ask of every credential before anything is read to verify it.
+pub fn is_signed_token_shape(token: &str) -> bool {
+    let mut parts = token.split('.');
+    parts.next() == Some(TOKEN_HEADER)
+        && parts.next().is_some_and(|payload| !payload.is_empty())
+        && parts.next().is_some_and(|signature| !signature.is_empty())
+        && parts.next().is_none()
+}
+
+// Whether `token` could be a script run's token: signed as this server signs
+// and with the claims of a run, read without checking the signature. A login
+// token fails this, so nothing is read from the database to turn it away.
+pub fn is_script_run_token_shape(token: &str) -> bool {
+    if !is_signed_token_shape(token) {
+        return false;
+    }
+    let Some(payload) = token.split('.').nth(1) else {
+        return false;
+    };
+    let Ok(bytes) = base64url_decode(payload) else {
+        return false;
+    };
+    let Ok(serde_json::Value::Object(claims)) = serde_json::from_slice(&bytes) else {
+        return false;
+    };
+    claims
+        .get("run_id")
+        .is_some_and(serde_json::Value::is_string)
+        && claims.contains_key("instance_id")
+}
+
+// `{"alg":"HS256","typ":"JWT"}`, encoded.
+const TOKEN_HEADER: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";
+
+fn sign_claims(claims: &impl Serialize, secret: &[u8]) -> String {
+    let payload = base64url_encode(&serde_json::to_vec(claims).expect("claims serialization"));
+    let signing_input = format!("{TOKEN_HEADER}.{payload}");
+    let signature = sign_hs256(secret, signing_input.as_bytes());
+    let sig_b64 = base64url_encode(&signature);
+
+    format!("{signing_input}.{sig_b64}")
+}
+
+// The claims of `token`, once its signature has been checked.
+fn verified_claims<T: serde::de::DeserializeOwned>(
+    token: &str,
+    secret: &[u8],
+) -> Result<T, JwtError> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 || parts[0] != TOKEN_HEADER {
+        return Err(JwtError::Malformed);
+    }
+
+    let signing_input = format!("{}.{}", parts[0], parts[1]);
+    let expected_sig = sign_hs256(secret, signing_input.as_bytes());
+    let actual_sig = base64url_decode(parts[2]).map_err(|_| JwtError::Malformed)?;
+
+    if !constant_time_eq(&expected_sig, &actual_sig) {
+        return Err(JwtError::InvalidSignature);
+    }
+
+    let payload_bytes = base64url_decode(parts[1]).map_err(|_| JwtError::Malformed)?;
+    serde_json::from_slice(&payload_bytes)
+        .map_err(|error| JwtError::InvalidClaims(error.to_string()))
+}
+
+fn unexpired(exp: u64) -> Result<(), JwtError> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if exp < now {
+        return Err(JwtError::Expired);
+    }
+    Ok(())
+}
+
+pub(crate) fn sign_hs256(secret: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(secret)
+        .expect("HMAC-SHA256 accepts any key length");
+    mac.update(data);
+    mac.finalize().into_bytes().to_vec()
+}
+
+fn base64url_encode(data: &[u8]) -> String {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    URL_SAFE_NO_PAD.encode(data)
+}
+
+fn base64url_decode(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    URL_SAFE_NO_PAD.decode(s)
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
+// Compare a browser CSRF verifier using the existing MAC implementation's
+// constant-time tag verification, without exposing a prefix comparison.
+pub fn verify_browser_csrf_token(token: &str, verifier: &str) -> bool {
+    let Ok(expected): Result<[u8; 32], _> = hex::decode(verifier).and_then(|bytes| {
+        bytes
+            .try_into()
+            .map_err(|_| hex::FromHexError::InvalidStringLength)
+    }) else {
+        return false;
+    };
+    let domain = b"weaver-browser-csrf-verifier-v1";
+    let expected_tag = sign_hs256(domain, &expected);
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(domain)
+        .expect("HMAC-SHA256 accepts any key length");
+    mac.update(&hash_api_key(token));
+    mac.verify_slice(&expected_tag).is_ok()
+}
+
+pub const JWT_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+
+#[cfg(test)]
+mod tests;

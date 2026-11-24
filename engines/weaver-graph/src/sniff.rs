@@ -11,8 +11,13 @@
 // deflate, brotli and SFV, which have no signature, by theirs alone, but
 // for one: a small text member whose lines are all `name CRC32` entries is
 // an SFV under any name, when no member beside it is named a listing or
-// recovery data (`sniff_among`). The one
-// name that outranks a signature is a numbered piece's, `name.001` onward,
+// recovery data (`sniff_among`). An end file, a disk image, an app package,
+// a document or a comic book (`END_FILES`), is built on a container format:
+// when its name and the signature its bytes open agree, it is delivered
+// whole, never opened. A name whose bytes open any other signature is lying,
+// and the bytes decide. The one name that outranks a signature is a
+// numbered piece's, `name.001` onward, or `name.01` onward of a set posted
+// beside it (`split_piece_among`),
 // whichever piece it is and whatever its bytes open: it founds the split
 // store first, whose pieces join into one file, and that file's own front
 // says what it is. The claim is the name's only until a piece other than
@@ -51,32 +56,45 @@ pub enum Sniff {
     Pending,
 }
 
+// What a member is by its name and its front alone, with no member beside
+// it: a two-digit piece is no piece by itself (`split_piece_among`).
 pub fn sniff(name: &str, first_bytes: &[u8], length: Option<u64>) -> Sniff {
+    judged(name, first_bytes, length, numbered_piece(name))
+}
+
+// `piece` says whether the name numbers a piece of a split set.
+fn judged(name: &str, first_bytes: &[u8], length: Option<u64>, piece: bool) -> Sniff {
     // A name never outvotes bytes that might still turn out to be a signature.
-    // A numbered piece's name outvotes any they open, as the first claim:
-    // the piece is a slice of a file, and what that file is, its own front
-    // says once joined, unless a later piece's own front refutes the set.
+    // An end file's name and the signature its format is built on, together,
+    // say the member is that end file. A numbered piece's name outvotes any
+    // signature, as the first claim: the piece is a slice of a file, and what
+    // that file is, its own front says once joined, unless a later piece's
+    // own front refutes the set.
     match signed(first_bytes, length) {
-        Sniff::Object(_) if numbered_piece(trimmed(name)) => Sniff::Object(Kind::Split),
-        Sniff::Leaf => named(name)
+        Sniff::Object(kind) if end_file_built_on(trimmed(name), kind) => Sniff::Leaf,
+        Sniff::Object(_) if piece => Sniff::Object(Kind::Split),
+        Sniff::Leaf => named(name, piece)
             .or_else(|| sevenz_by_name(name, first_bytes))
             .map_or(Sniff::Leaf, Sniff::Object),
         verdict => verdict,
     }
 }
 
-// What a member is among the members beside it: what `sniff` says, and an
-// SFV for a member it leaves a leaf whose front reads as a listing, when no
-// member beside it is named a listing or recovery data. A listing named as
-// one is the job's listing, and a recovery set outranks any listing, so a
-// nameless one is looked for only when neither is posted.
+// What a member is among the members beside it: what `sniff` says, with a
+// two-digit piece a piece when the names beside it make it one of a set
+// (`split_piece_among`), and an SFV for a member it leaves a leaf whose
+// front reads as a listing, when no member beside it is named a listing or
+// recovery data. A listing named as one is the job's listing, and a
+// recovery set outranks any listing, so a nameless one is looked for only
+// when neither is posted.
 pub fn sniff_among<'a>(
     name: &str,
     first_bytes: &[u8],
     length: Option<u64>,
-    mut beside: impl Iterator<Item = &'a str>,
+    mut beside: impl Iterator<Item = &'a str> + Clone,
 ) -> Sniff {
-    match sniff(name, first_bytes, length) {
+    let piece = split_piece_among(name, beside.clone());
+    match judged(name, first_bytes, length, piece) {
         Sniff::Leaf
             if listing_by_content(first_bytes, length)
                 && !beside.any(names_listing_or_recovery) =>
@@ -458,18 +476,217 @@ pub fn par2_index(first_bytes: &[u8]) -> bool {
     critical
 }
 
-// Kinds by the extensions their files are posted under, for members whose
-// bytes open no signature. A compound name such as `.tar.gz` is the signature's to decide; its
-// object announces the `.tar` inside.
-const NAMED: &[(Kind, &[&str])] = &[
-    (Kind::Tar, &[".tar"]),
-    (Kind::Bzip2, &[".bz2", ".tbz", ".tbz2", ".tar.bzip2"]),
-    (Kind::Deflate, &[".deflate"]),
-    (Kind::Brotli, &[".br"]),
-    (Kind::Sfv, &[".sfv"]),
-    (Kind::Zip, &[".zip"]),
-    (Kind::RarRecovery, &[".rev"]),
+// Kinds by the extensions their files are posted under. A compound name
+// such as `.tar.gz` ends in its outer kind's extension, whose object
+// announces the `.tar` inside. The name claims a member whose bytes open no
+// signature only for a kind marked `claims`: gzip, xz and zstd always open on
+// theirs, so bytes that open none under their names are a file of their own,
+// and those names only tell a listing's containers from its plain files.
+const NAMED: &[(Kind, Claims, &[&str])] = &[
+    (Kind::Tar, Claims::ByName, &[".tar"]),
+    (
+        Kind::Bzip2,
+        Claims::ByName,
+        &[".bz2", ".tbz", ".tbz2", ".tar.bzip2"],
+    ),
+    (Kind::Deflate, Claims::ByName, &[".deflate"]),
+    (Kind::Brotli, Claims::ByName, &[".br"]),
+    (Kind::Sfv, Claims::ByName, &[".sfv"]),
+    (Kind::Zip, Claims::ByName, &[".zip"]),
+    (Kind::RarRecovery, Claims::ByName, &[".rev"]),
+    (Kind::Gzip, Claims::BySignature, &[".gz", ".tgz"]),
+    (Kind::Xz, Claims::BySignature, &[".xz", ".txz"]),
+    (Kind::Zstd, Claims::BySignature, &[".zst", ".tzst"]),
 ];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Claims {
+    ByName,
+    BySignature,
+}
+
+// The kind a name's extension says, whether or not that name claims a
+// member by itself.
+fn kind_named(name: &str) -> Option<(Kind, Claims)> {
+    NAMED
+        .iter()
+        .find(|(_, _, extensions)| {
+            extensions
+                .iter()
+                .any(|extension| has_extension(name, extension))
+        })
+        .map(|(kind, claims, _)| (*kind, *claims))
+}
+
+// End files: formats built on a container, delivered as they are, each
+// with the signatures it is built on. A member under one of these names
+// whose bytes open one of its signatures is that end file, and a leaf:
+// unpacking it destroys the file the post is. Bytes that open any other
+// signature make the name a lie (usenet is full of them), and they decide.
+// Archives are unpacked by name only (`.rar`, `.rNN`, `.sNN`… and numbered
+// volumes, `.zip`, `.7z`, `.7z.NNN`, `.tar`, `.NNN` pieces, `.NN.ts`), and
+// every other name is delivered as it is. The one table: a format joins it here
+// and nowhere else.
+//
+//   .dmg   an Apple disk image; a bzip2 one (UDBZ) opens on a bzip2 stream.
+//          zlib (UDZO) and plain images open on no signature the sniffer
+//          knows, and are leaves by their bytes already
+//   .apk .aab .apks .xapk   Android packages and bundles: zips
+//   .ipa   an iOS app: a zip
+//   .jar .war .ear   Java archives: zips
+//   .xpi   a Firefox extension: a zip
+//   .epub  an e-book: a zip
+//   .docx .xlsx .pptx .docm .xlsm .pptm .odt .ods .odp .odg   office
+//          documents, macro-enabled ones too: zips
+//   .msix .msixbundle .appx .appxbundle   Windows app packages and bundles:
+//          zips
+//   .whl .nupkg .vsix   Python, NuGet and VS Code packages: zips
+//   .pima  an Adobe package: a zip
+//   .cbz .cbr .cb7 .cbt   comic books, which readers open whole: a zip, a
+//          RAR, a 7z, a tar of pages
+//   .box .supercab .thu .riglib   application data files built on a zip,
+//          which their programs read whole
+//
+// Not here, because no signature the sniffer knows opens them, so their
+// bytes already make them leaves and any archive signature under their
+// name is a lie: `.iso` and `.img` (a system area or partition table),
+// `.crx` (`Cr24`, then a zip), `.msi` (an OLE compound file), `.deb` (an
+// `ar` archive), `.rpm` (its lead, then cpio).
+const ZIP: &[Kind] = &[Kind::Zip];
+const END_FILES: &[(&str, &[Kind])] = &[
+    (".dmg", &[Kind::Bzip2]),
+    (".apk", ZIP),
+    (".aab", ZIP),
+    (".apks", ZIP),
+    (".xapk", ZIP),
+    (".ipa", ZIP),
+    (".jar", ZIP),
+    (".war", ZIP),
+    (".ear", ZIP),
+    (".xpi", ZIP),
+    (".epub", ZIP),
+    (".docx", ZIP),
+    (".xlsx", ZIP),
+    (".pptx", ZIP),
+    (".odt", ZIP),
+    (".ods", ZIP),
+    (".odp", ZIP),
+    (".docm", ZIP),
+    (".xlsm", ZIP),
+    (".pptm", ZIP),
+    (".odg", ZIP),
+    (".msix", ZIP),
+    (".msixbundle", ZIP),
+    (".appx", ZIP),
+    (".appxbundle", ZIP),
+    (".whl", ZIP),
+    (".nupkg", ZIP),
+    (".vsix", ZIP),
+    (".pima", ZIP),
+    (".cbz", ZIP),
+    (".cbr", &[Kind::RarStore]),
+    (".cb7", &[Kind::SevenZipStore]),
+    (".cbt", &[Kind::Tar]),
+    (".box", ZIP),
+    (".supercab", ZIP),
+    (".thu", ZIP),
+    (".riglib", ZIP),
+];
+
+// Whether a name is an end file's that is built on this kind.
+fn end_file_built_on(name: &str, kind: Kind) -> bool {
+    END_FILES
+        .iter()
+        .any(|(extension, kinds)| kinds.contains(&kind) && has_extension(name, extension))
+}
+
+// Sidecars: small files a person or a player reads beside a payload, by
+// the last extension of their name. Below the root, a single-stream
+// compressor whose name, the compression taken off, is a sidecar's opens
+// as a layer by that name alone (`names_a_sidecar`). The list grows as real
+// posts show new names.
+//
+//   nfo diz   release text
+//   txt   plain text a person reads
+//   srt ass ssa sub idx vtt smi sami sup usf ttml dfxp sbv mks   subtitles
+//          and captions
+//   cue m3u m3u8 pls lrc ffp   audio: cue sheets, playlists, lyrics and
+//          FLAC fingerprints
+//   gdi ccd mds sbi toc   disc images' descriptors
+//   opf xmp   a book's metadata, a photo's
+//   nzb   a usenet post
+//
+// Not here, and so kept compressed: names a program loads in compressed
+// form by that exact name (`json`, `xml`, `csv`, `sql`, `html`, `js`,
+// `css`, `svg`, `dat`, `log`, man pages), a `tar`, whose opening leads to
+// an archive that multiplies the file count, and checksum or recovery
+// listings (`sfv`, `md5`, `sha*`, `par2`), whose opening would change what
+// is verified.
+const SIDECARS: &[&str] = &[
+    "ass", "ccd", "cue", "dfxp", "diz", "ffp", "gdi", "idx", "lrc", "m3u", "m3u8", "mds", "mks",
+    "nfo", "nzb", "opf", "pls", "sami", "sbi", "sbv", "smi", "srt", "ssa", "sub", "sup", "toc",
+    "ttml", "txt", "usf", "vtt", "xmp",
+];
+
+// A single-stream compressor's extension and what it leaves behind: `.tgz`
+// held a `.tar`.
+const STREAM_EXTENSIONS: [(&str, &str); 11] = [
+    (".gz", ""),
+    (".tgz", ".tar"),
+    (".xz", ""),
+    (".txz", ".tar"),
+    (".bz2", ""),
+    (".tbz2", ".tar"),
+    (".tbz", ".tar"),
+    (".zst", ""),
+    (".tzst", ".tar"),
+    (".br", ""),
+    (".deflate", ""),
+];
+
+// A stream's volume name with its compression extension taken off, or
+// `None` when it carries none.
+fn uncompressed(volume: &str) -> Option<String> {
+    let lower = volume.to_ascii_lowercase();
+    STREAM_EXTENSIONS
+        .iter()
+        .find(|(extension, _)| lower.len() > extension.len() && lower.ends_with(extension))
+        .map(|(extension, left)| format!("{}{left}", &volume[..volume.len() - extension.len()]))
+}
+
+// The name a stream's one member is announced under: the volume's name with
+// its compression extension taken off, or the name as it is when it carries
+// no extension, which the namespace numbers if it collides.
+pub fn stream_member_name(volume: &str) -> String {
+    uncompressed(volume).unwrap_or_else(|| volume.to_owned())
+}
+
+// Whether a member that founds a single-stream compressor is a sidecar by
+// its own name: its compression extension taken off, what is left ends in
+// a sidecar's extension (`SIDECARS`), with a stem before it in the file's
+// own name. A bare `.xz`, a name with no compression extension, or one
+// left with no extension of its own, names no sidecar.
+pub fn names_a_sidecar(name: &str) -> bool {
+    let Some(inner) = uncompressed(trimmed(name)) else {
+        return false;
+    };
+    let file = inner.rsplit(['/', '\\']).next().unwrap_or_default();
+    file.rsplit_once('.')
+        .filter(|(stem, _)| !stem.is_empty())
+        .is_some_and(|(_, extension)| {
+            SIDECARS
+                .iter()
+                .any(|sidecar| sidecar.eq_ignore_ascii_case(extension))
+        })
+}
+
+// Whether a name is a container's an object opens: an archive, a tar, or a
+// compressed stream, by the extensions the sniffer knows them by. Recovery
+// data and SFVs are not containers.
+fn names_container(name: &str) -> bool {
+    kind_named(trimmed(name))
+        .is_some_and(|(kind, _)| !matches!(kind, Kind::Sfv | Kind::RarRecovery))
+}
 
 // A 7z posted under its own name whose start header fails its CRC is still
 // the store's: its signature header is whole and opens with the magic, and
@@ -488,28 +705,63 @@ fn trimmed(name: &str) -> &str {
     })
 }
 
-fn named(name: &str) -> Option<Kind> {
+fn named(name: &str, piece: bool) -> Option<Kind> {
     let name = trimmed(name);
-    NAMED
-        .iter()
-        .find(|(_, extensions)| {
-            extensions
-                .iter()
-                .any(|extension| has_extension(name, extension))
-        })
-        .map(|(kind, _)| *kind)
-        .or_else(|| numbered_piece(name).then_some(Kind::Split))
+    kind_named(name)
+        .filter(|(_, claims)| *claims == Claims::ByName)
+        .map(|(kind, _)| kind)
+        .or_else(|| piece.then_some(Kind::Split))
 }
 
-// Whether a member's first bytes may still open a PAR2 or PAR3 volume:
-// none yet may, and any that differ from both magics cannot, however many
-// more come.
-pub fn may_open_par(first_bytes: &[u8]) -> bool {
-    [PAR2_MAGIC, PAR3_MAGIC].iter().any(|magic| {
-        let seen = first_bytes.len().min(magic.len());
-        first_bytes[..seen] == magic[..seen]
-    })
+// A PAR1 file's head, an index's or a volume's alike: its magic and the
+// one file version PAR1 has, 0x00010000, as par2cmdline reads them. No
+// object reads PAR1; its files are recovery data all the same.
+const PAR1_HEAD: &[u8; 12] = b"PAR\0\0\0\0\0\0\0\x01\0";
+
+// What a member's front says of whether it is recovery data, whatever its
+// name: `Some(true)` when it opens a recovery format (a PAR2 or PAR3
+// packet, a RAR5 recovery volume, or a PAR1 file), `Some(false)` when it
+// rules every one out, and `None` while it says nothing yet: no front, or
+// one too short to decide. A RAR3 recovery volume opens on parity, which
+// signs nothing, so under RAR's own `.rev` a front that signs nothing
+// rules nothing out, and the name says. The bytes are the ones the sniffer
+// already holds: nothing is read to answer.
+pub fn recovery_by_front(name: &str, front: &[u8], length: Option<u64>) -> Option<bool> {
+    if front.is_empty() {
+        return None;
+    }
+    let seen = front.len().min(PAR1_HEAD.len());
+    if front[..seen] == PAR1_HEAD[..seen] {
+        if seen == PAR1_HEAD.len() {
+            return Some(true);
+        }
+        if length.is_none_or(|length| length >= PAR1_HEAD.len() as u64) {
+            return None;
+        }
+    }
+    match signed(front, length) {
+        Sniff::Object(kind) => Some(matches!(kind, Kind::Par2 | Kind::Par3 | Kind::RarRecovery)),
+        // Other signatures may still be waiting on bytes further in; the
+        // recovery ones all stand at the head, so a front that rules those
+        // out has said, however short it is.
+        Sniff::Pending if may_open_recovery(front, length) => None,
+        Sniff::Pending | Sniff::Leaf => (!has_extension(trimmed(name), ".rev")).then_some(false),
+    }
 }
+
+// Whether a front may still open a recovery format a signature tells.
+fn may_open_recovery(front: &[u8], length: Option<u64>) -> bool {
+    SIGNATURES
+        .iter()
+        .filter(|signature| matches!(signature.kind, Kind::Par2 | Kind::Par3 | Kind::RarRecovery))
+        .any(|signature| !matches!(signature.test(front, length), Test::No))
+}
+
+// The kinds whose objects judge a member by the clean bytes past the hole
+// where its front stopped, so that one with none beside a member is built
+// to judge it: a PAR2 packet carries its set's id and a hash over its
+// body, so one whose hash passes founds its set wherever it lies.
+pub(crate) const PAST_HOLE: &[Kind] = &[Kind::Par2];
 
 // Whether a posted name is a recovery volume's, as PAR creators spell them:
 // `.par2` and `.par3`, indexes and `.vol<start>+<count>` volumes alike, and
@@ -536,22 +788,315 @@ pub fn names_recovery(name: &str) -> bool {
 // blocks, as RAR's `.rev` does. A PAR2 or PAR3 volume names no set it can
 // found: its index does.
 pub fn recovery_by_name(name: &str) -> Option<Kind> {
-    names_recovery(name).then(|| named(name)).flatten()
+    names_recovery(name)
+        .then(|| named(name, numbered_piece(name)))
+        .flatten()
 }
 
 // Whether an object may claim a member by its posted name before its bytes
 // say what it is, its first article lost or not yet come: a recovery
-// volume's name, or a numbered piece's.
+// volume's name, or a numbered piece's, two digits or more. Which set a
+// piece is of, and whether it is one, the split store a set founded says by
+// its claim.
 pub fn names_claimable(name: &str) -> bool {
-    names_recovery(name) || numbered_piece(trimmed(name))
+    names_recovery(name) || split_piece(name).is_some()
 }
 
-// A piece of a file split into numbered pieces, `name.001`, `name.002`, …:
-// its last extension is all digits. Which piece it is, the object says.
-fn numbered_piece(name: &str) -> bool {
-    name.rsplit_once('.').is_some_and(|(stem, digits)| {
-        !stem.is_empty() && !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+// Whether a posted name says nothing of what its member is: no kind an
+// object is founded for by name, no recovery volume or piece, no type
+// people open. An obfuscated name, a hash, says nothing.
+pub(crate) fn names_nothing(name: &str) -> bool {
+    named(name, numbered_piece(name)).is_none()
+        && !names_claimable(name)
+        && !crate::known::known_type(name)
+}
+
+// What a file of a listing is, by the names beside it: a container volume
+// founds or joins a set, recovery data and SFVs go with one, and anything
+// else is a plain file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Listed {
+    Container,
+    Recovery,
+    Plain,
+}
+
+// Each name of a listing, told by name alone: a RAR volume, `.rar` and the
+// old `.r00` … `.y99` numbering of a set whose `.rar` is listed; a 7z or a
+// zip, and zip's `.z01` parts of a listed `.zip`; a tar or a compressed
+// stream, `.tar`, `.gz`, `.tgz`, `.bz2`, `.xz`, `.zst` and the rest of
+// `NAMED`; a numbered piece of a split file; a recovery file (an old `.p01` of a listed `.par` or `.par2`)
+// or an SFV. A short name with a letter and digits for an extension, a
+// `.s16` or a `.p12`, is a plain file when no set of its stem is listed.
+pub fn listed(names: &[&str]) -> Vec<Listed> {
+    let listing = Listing::new(names.iter().copied());
+    names.iter().map(|name| listing.told(name)).collect()
+}
+
+// The names of a listing, trimmed and lower case, each with how many times
+// it is listed: what telling one of them asks of the names beside it is a
+// lookup, so telling every name of a listing is linear in its length. A
+// namespace keeps one of its members' names as they come, change and go.
+#[derive(Debug, Default)]
+pub(crate) struct Listing {
+    names: std::collections::BTreeMap<String, usize>,
+}
+
+// A name's last extension, split into its first letter and the rest, and
+// whether the rest is a number.
+fn numbering(extension: &str) -> (&str, &str, bool) {
+    let (letter, digits) = extension.split_at(extension.chars().next().map_or(0, char::len_utf8));
+    let numbered = !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit());
+    (letter, digits, numbered)
+}
+
+// The old RAR numbering of the volumes after a set's `.rar`: `.r00` …
+// `.r99`, then `.s00` onward, to `.y99`.
+fn rar_numbered(letter: &str, digits: &str, numbered: bool) -> bool {
+    numbered && digits.len() == 2 && matches!(letter, "r" | "s" | "t" | "u" | "v" | "w" | "x" | "y")
+}
+
+// A split zip's parts before its `.zip`: `.z01` onward.
+fn zip_numbered(letter: &str, digits: &str, numbered: bool) -> bool {
+    numbered && (2..=3).contains(&digits.len()) && letter == "z"
+}
+
+// The extensions that are an archive's whatever is beside them.
+fn archive_extension(extension: &str) -> bool {
+    matches!(extension, "rar" | "7z")
+}
+
+impl Listing {
+    pub(crate) fn new<'a>(names: impl Iterator<Item = &'a str>) -> Self {
+        let mut listing = Self::default();
+        for name in names {
+            listing.add(name);
+        }
+        listing
+    }
+
+    pub(crate) fn add(&mut self, name: &str) {
+        *self
+            .names
+            .entry(trimmed(name).to_ascii_lowercase())
+            .or_default() += 1;
+    }
+
+    pub(crate) fn forget(&mut self, name: &str) {
+        let name = trimmed(name).to_ascii_lowercase();
+        if let Some(count) = self.names.get_mut(&name) {
+            *count -= 1;
+            if *count == 0 {
+                self.names.remove(&name);
+            }
+        }
+    }
+
+    fn has(&self, stem: &str, extension: &str) -> bool {
+        self.names.contains_key(&format!("{stem}.{extension}"))
+    }
+
+    // Whether a name of the listing is a recovery volume's by the names
+    // beside it: a `.par2` or `.par3`, index or volume, and RAR's `.rev`, by
+    // their names alone; the older numbered `.p<N>` and `.par<N>` only beside
+    // a `.par` or `.par2` of their stem. A short name with a letter and
+    // digits for an extension, a `.p12`, is a plain file when no set of its
+    // stem is listed. The rule a listing tells recovery data by, and a
+    // member no object holds while its front has not said
+    // (`Namespace::recovery_data`).
+    pub(crate) fn recovery(&self, name: &str) -> bool {
+        let name = trimmed(name).to_ascii_lowercase();
+        let Some((stem, extension)) = name.rsplit_once('.') else {
+            return false;
+        };
+        names_recovery(&name)
+            && (matches!(extension, "rev" | "par2" | "par3")
+                || self.has(stem, "par")
+                || self.has(stem, "par2"))
+    }
+
+    // `split_piece_among`, of a trimmed lower-case name, asked of the
+    // listing.
+    fn piece(&self, name: &str) -> bool {
+        let Some((stem, digits)) = split_piece(name) else {
+            return false;
+        };
+        if digits.len() >= PIECE_DIGITS {
+            return true;
+        }
+        let [zero, one, two] = ["00", "01", "02"].map(|number| self.has(stem, number));
+        (zero && one) || (one && two)
+    }
+
+    // What `listed` tells of one name of the listing.
+    pub(crate) fn told(&self, name: &str) -> Listed {
+        let name = trimmed(name).to_ascii_lowercase();
+        let Some((stem, extension)) = name.rsplit_once('.').filter(|(stem, _)| !stem.is_empty())
+        else {
+            return Listed::Plain;
+        };
+        let (letter, digits, numbered) = numbering(extension);
+        let container = archive_extension(extension)
+            || names_container(&name)
+            || self.piece(&name)
+            || (rar_numbered(letter, digits, numbered) && self.has(stem, "rar"))
+            || (zip_numbered(letter, digits, numbered) && self.has(stem, "zip"));
+        if container {
+            return Listed::Container;
+        }
+        if extension == "sfv" || self.recovery(&name) {
+            Listed::Recovery
+        } else {
+            Listed::Plain
+        }
+    }
+}
+
+// Whether a member that founds an object of `kind` is an archive by its own
+// name: a RAR volume (`.rar`, `.partN.rar`, and
+// the old `.r00` … `.y99` numbering, on a volume whose bytes are a RAR's), a
+// 7z, a zip and its `.z01` parts (on bytes that are a zip's), a tar, or a
+// numbered piece of a split file (`.001` onward, `.7z.001` among them, and a
+// two-digit one founding read as a piece of the set beside it). A
+// single-stream compressor's name (`.gz`, `.bz2`, `.xz`, `.zst`, `.br`,
+// `.deflate`) names a compressed file, not an archive, and so does no name
+// of an end file (`END_FILES`), whose member is a leaf before this is asked.
+// A compressed sidecar is a layer by its name too (`names_a_sidecar`).
+pub fn names_an_archive(name: &str, kind: Kind) -> bool {
+    let name = trimmed(name);
+    let lower = name.to_ascii_lowercase();
+    let Some((_, extension)) = lower.rsplit_once('.').filter(|(stem, _)| !stem.is_empty()) else {
+        return false;
+    };
+    let (letter, digits, numbered) = numbering(extension);
+    archive_extension(extension)
+        || matches!(kind_named(name), Some((Kind::Zip | Kind::Tar, _)))
+        || numbered_piece(name)
+        || kind == Kind::Split
+        || (kind == Kind::RarStore && rar_numbered(letter, digits, numbered))
+        || (kind == Kind::Zip && zip_numbered(letter, digits, numbered))
+}
+
+// What a member of a namespace below the root is to the layer test
+// (`Tree::layers`): a piece of an archive set, by its name among the names
+// beside it or by the container its bytes open; furniture, recovery data or
+// a listing, text posted beside a payload (`known::furniture`) or a sample;
+// or a file of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Layered {
+    Piece,
+    Furniture,
+    Own,
+}
+
+impl Listing {
+    pub(crate) fn layered(&self, name: &str, front: &[u8], length: Option<u64>) -> Layered {
+        let opens = match signed(front, length) {
+            Sniff::Object(kind) => Some(kind),
+            Sniff::Leaf | Sniff::Pending => None,
+        };
+        if let Some(kind) = opens
+            && matches!(
+                kind,
+                Kind::Par2 | Kind::Par3 | Kind::Sfv | Kind::RarRecovery | Kind::RarRecord
+            )
+        {
+            return Layered::Furniture;
+        }
+        if let Some(kind) = opens
+            && end_file_built_on(trimmed(name), kind)
+        {
+            return Layered::Own;
+        }
+        // A name that says recovery data is a file of its own once its front
+        // says it is none (`recovery_by_front`).
+        match self.told(name) {
+            Listed::Container => return Layered::Piece,
+            Listed::Recovery
+                if !self.recovery(name)
+                    || recovery_by_front(name, front, length) != Some(false) =>
+            {
+                return Layered::Furniture;
+            }
+            Listed::Recovery | Listed::Plain => {}
+        }
+        if opens.is_some() {
+            return Layered::Piece;
+        }
+        if crate::known::furniture(name) {
+            Layered::Furniture
+        } else {
+            Layered::Own
+        }
+    }
+}
+
+// The digits a piece's number has at the least: two, as 7-Zip numbers a set
+// it is told to open at `.01`.
+const SET_DIGITS: usize = 2;
+
+// The digits a piece's number has to be a piece by its name alone: `.001`,
+// as 7-Zip and HJSplit number pieces. A name ending in `.4`
+// or `.0` is a version, never a piece, and one ending in `.10` or `.99` is a
+// version or a repost unless its set stands beside it (`split_piece_among`).
+const PIECE_DIGITS: usize = 3;
+
+// The name of a piece of a file split into numbered pieces, `name.001`,
+// `name.002`, …, or `name.01`, `name.02`, …: its last extension is two or
+// more digits, once the quotes, underscores or dots a posted name trails are
+// off (`trimmed`). It gives the name of the file the pieces were cut from,
+// as it was spelled, and the piece's number. The split store numbers its
+// pieces and names their file by it; whether a name founds the store is
+// `split_piece_among`. Which piece it is, the object says.
+pub fn split_piece(name: &str) -> Option<(&str, &str)> {
+    trimmed(name).rsplit_once('.').filter(|(stem, digits)| {
+        !stem.is_empty()
+            && digits.len() >= SET_DIGITS
+            && digits.bytes().all(|byte| byte.is_ascii_digit())
     })
+}
+
+// Whether a name numbers a piece of a split set, among the names `beside`
+// it, its own among them: the one owner of what founds the split store, and
+// what the census reads as a split part (`FileRole::of_post` keeps the same
+// rule). Three digits or more are a piece by the name alone. Two digits are
+// a piece only of a set that stands beside it: the set's first piece, as
+// 7-Zip opens one (`SplitHandler.cpp`: an extension that ends in `00` or
+// `01`, every digit before it `0`), and the piece after that first, of the
+// same stem. So a lone `notes.10`, a `file.99`, a version `Release.1.4.10`
+// and a first piece `.01` with nothing after it are plain files, whatever
+// their bytes; a gap further on is the store's to rule.
+pub fn split_piece_among<'a>(name: &str, beside: impl IntoIterator<Item = &'a str>) -> bool {
+    let Some((stem, digits)) = split_piece(name) else {
+        return false;
+    };
+    if digits.len() >= PIECE_DIGITS {
+        return true;
+    }
+    // Which of `.00`, `.01` and `.02` of the stem stand beside it.
+    let mut held = [false; 3];
+    for other in beside {
+        let Some((other_stem, number)) = split_piece(other) else {
+            continue;
+        };
+        if number.len() != SET_DIGITS || !other_stem.eq_ignore_ascii_case(stem) {
+            continue;
+        }
+        if let Some(slot) = held.get_mut(usize::from(number.as_bytes()[1] - b'0'))
+            && number.as_bytes()[0] == b'0'
+        {
+            *slot = true;
+        }
+        if (held[0] && held[1]) || (held[1] && held[2]) {
+            return true;
+        }
+    }
+    false
+}
+
+// A piece by its name alone.
+fn numbered_piece(name: &str) -> bool {
+    split_piece(name).is_some_and(|(_, digits)| digits.len() >= PIECE_DIGITS)
 }
 
 fn has_extension(name: &str, extension: &str) -> bool {
@@ -978,6 +1523,347 @@ mod tests {
         assert_eq!(sniff("9f3a7c1e", b"BZh9", None), object(Kind::Bzip2));
     }
 
+    // Each end file's own front, as its format writes it, and the kind its
+    // bytes alone found.
+    fn end_file_fronts() -> Vec<(&'static str, Vec<u8>, Kind)> {
+        let zip = b"PK\x03\x04\x14\x00\x08\x00".to_vec();
+        let zipped = |extension| (extension, zip.clone(), Kind::Zip);
+        let mut cbt = ustar(0);
+        cbt[..8].copy_from_slice(b"page.jpg");
+        vec![
+            (".dmg", b"BZh91AY&SY".to_vec(), Kind::Bzip2),
+            zipped(".apk"),
+            zipped(".aab"),
+            zipped(".apks"),
+            zipped(".xapk"),
+            zipped(".ipa"),
+            zipped(".jar"),
+            zipped(".war"),
+            zipped(".ear"),
+            zipped(".xpi"),
+            zipped(".epub"),
+            zipped(".docx"),
+            zipped(".xlsx"),
+            zipped(".pptx"),
+            zipped(".odt"),
+            zipped(".ods"),
+            zipped(".odp"),
+            zipped(".docm"),
+            zipped(".xlsm"),
+            zipped(".pptm"),
+            zipped(".odg"),
+            zipped(".msix"),
+            zipped(".msixbundle"),
+            zipped(".appx"),
+            zipped(".appxbundle"),
+            zipped(".whl"),
+            zipped(".nupkg"),
+            zipped(".vsix"),
+            zipped(".pima"),
+            zipped(".cbz"),
+            (".cbr", RAR5.to_vec(), Kind::RarStore),
+            (".cb7", seven_z(), Kind::SevenZipStore),
+            (".cbt", cbt, Kind::Tar),
+            zipped(".box"),
+            zipped(".supercab"),
+            zipped(".thu"),
+            zipped(".riglib"),
+        ]
+    }
+
+    // Every front the sniffer founds an object on, with the kind it founds.
+    fn every_signature() -> Vec<(Vec<u8>, Kind)> {
+        vec![
+            (RAR5.to_vec(), Kind::RarStore),
+            (RAR4.to_vec(), Kind::RarStore),
+            (seven_z(), Kind::SevenZipStore),
+            (b"PK\x03\x04".to_vec(), Kind::Zip),
+            (XZ.to_vec(), Kind::Xz),
+            (GZIP.to_vec(), Kind::Gzip),
+            (vec![0x28, 0xb5, 0x2f, 0xfd], Kind::Zstd),
+            (b"BZh91AY&SY".to_vec(), Kind::Bzip2),
+            (ustar(0), Kind::Tar),
+        ]
+    }
+
+    // A container's own name says an archive for the RAR family, 7z, zip,
+    // tar and numbered pieces; a compressor's or any other name does not.
+    #[test]
+    fn a_name_says_an_archive_only_for_an_archive_kind() {
+        for (name, kind) in [
+            ("ember.rar", Kind::RarStore),
+            ("ember.part02.RAR", Kind::RarStore),
+            ("ember.r00", Kind::RarStore),
+            ("ember.s12", Kind::RarStore),
+            ("ember.7z", Kind::SevenZipStore),
+            ("ember.7z.001", Kind::Split),
+            ("ember.zip", Kind::Zip),
+            ("ember.z01", Kind::Zip),
+            ("ember.tar", Kind::Tar),
+            ("ember.001", Kind::Split),
+            ("ember.01", Kind::Split),
+            ("CD1/ember.rar\"", Kind::RarStore),
+        ] {
+            assert!(names_an_archive(name, kind), "{name}");
+        }
+        for (name, kind) in [
+            ("ember.gz", Kind::Gzip),
+            ("ember.tar.gz", Kind::Gzip),
+            ("ember.tgz", Kind::Gzip),
+            ("ember.bz2", Kind::Bzip2),
+            ("ember.xz", Kind::Xz),
+            ("ember.zst", Kind::Zstd),
+            ("ember.br", Kind::Brotli),
+            ("ember.deflate", Kind::Deflate),
+            ("libde265.dat", Kind::Zip),
+            ("ember.r00", Kind::Zip),
+            ("ember.z01", Kind::RarStore),
+            ("a9f3c1e0", Kind::RarStore),
+            (".rar", Kind::RarStore),
+        ] {
+            assert!(!names_an_archive(name, kind), "{name}");
+        }
+    }
+
+    // A compressed file is a sidecar by its name with the compression off:
+    // text a person reads beside a payload, subtitles, cue sheets and
+    // playlists, disc descriptors, a book's or a photo's metadata, an NZB.
+    // A name a program loads compressed, a tar, a checksum listing, or a
+    // name with no stem before its extension is none.
+    #[test]
+    fn a_compressed_name_says_a_sidecar_only_for_a_sidecar_extension() {
+        for name in [
+            "a.srt.xz",
+            "Subs/movie.en.ass.gz",
+            "release.nfo.zst",
+            "disc.cue.bz2",
+            "x.nzb.gz",
+            "MOVIE.SRT.XZ",
+            "README.txt.gz",
+            "file_id.diz.br",
+            "Subs\\movie.vtt.deflate",
+            "album.m3u8.gz",
+            "game.gdi.xz",
+            "book.opf.gz",
+            "photo.xmp.zst",
+            "a.srt.xz\"",
+        ] {
+            assert!(names_a_sidecar(name), "{name}");
+        }
+        for name in [
+            "foo.1.gz",
+            "man/foo.1.gz",
+            "index.json.gz",
+            "data/index.json.gz",
+            "app.js.gz",
+            "logo.svg.gz",
+            "lib.tar.xz",
+            "lib.tgz",
+            "debug.log.gz",
+            "set.sfv.gz",
+            "set.md5.gz",
+            "set.par2.gz",
+            "x.xz",
+            ".xz",
+            "srt.xz",
+            "Subs/.srt.gz",
+            "a.srt",
+            "a.srt.rar",
+        ] {
+            assert!(!names_a_sidecar(name), "{name}");
+        }
+    }
+
+    // The sidecar list is lower case and sorted, each name once.
+    #[test]
+    fn the_sidecar_list_is_sorted_lower_case_and_once() {
+        assert!(SIDECARS.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(
+            SIDECARS
+                .iter()
+                .all(|name| !name.is_empty() && name.bytes().all(|byte| !byte.is_ascii_uppercase()))
+        );
+    }
+
+    // A `.par2`, `.par3` or `.rev` is recovery data by its name; an older
+    // numbered `.p<N>` or `.par<N>` only beside a `.par` or `.par2` of its
+    // stem, and a plain file otherwise.
+    #[test]
+    fn a_listing_tells_old_numbered_volumes_by_the_set_beside_them() {
+        let names = [
+            "notes.p12",
+            "notes.par01",
+            "x.p01",
+            "x.par2",
+            "y.par01",
+            "y.par",
+            "a.part2.rev",
+            "b.vol00+01.par2",
+            "c.par3",
+            "x.mkv",
+        ];
+        let listing = Listing::new(names.iter().copied());
+        for (name, recovery) in [
+            ("notes.p12", false),
+            ("notes.par01", false),
+            ("x.p01", true),
+            ("X.P01", true),
+            ("x.par2", true),
+            ("y.par01", true),
+            ("y.par", false),
+            ("a.part2.rev", true),
+            ("b.vol00+01.par2", true),
+            ("c.par3", true),
+            ("x.mkv", false),
+        ] {
+            assert_eq!(listing.recovery(name), recovery, "{name}");
+            let told = listing.told(name) == Listed::Recovery;
+            assert_eq!(told, recovery, "{name}");
+        }
+    }
+
+    // Each member of a namespace below the root is told a piece, furniture
+    // or a file of its own, by its name among the names beside it and by
+    // its front.
+    #[test]
+    fn a_listing_tells_pieces_furniture_and_files_of_their_own() {
+        let zip = b"PK\x03\x04\x14\x00\x08\x00";
+        let names = ["CD1/ember.r00", "CD1/ember.rar", "ember.nfo", "x.par2"];
+        let listing = Listing::new(names.iter().copied());
+        for (name, front, layered) in [
+            ("CD1/ember.r00", &b""[..], Layered::Piece),
+            ("CD1/ember.rar", b"", Layered::Piece),
+            ("a9f3c1e0", RAR5, Layered::Piece),
+            ("table.gz", b"", Layered::Piece),
+            ("ember.nfo", b"", Layered::Furniture),
+            ("x.par2", b"", Layered::Furniture),
+            ("ember.sfv", b"", Layered::Furniture),
+            ("Sample/ember.mkv", b"", Layered::Furniture),
+            ("ember.mkv", b"", Layered::Own),
+            ("a.box", zip, Layered::Own),
+            ("ember.epub", zip, Layered::Own),
+        ] {
+            assert_eq!(listing.layered(name, front, None), layered, "{name}");
+        }
+    }
+
+    // `listed` told by lookups answers as the scan it replaced: two-digit
+    // pieces only beside their set, old RAR numbering only beside its `.rar`.
+    #[test]
+    fn a_listing_tells_two_digit_pieces_and_old_numbering_by_what_is_beside() {
+        assert_eq!(
+            listed(&["e.01", "e.02", "f.01", "g.r00", "g.rar", "h.r00", "i.z01"]),
+            [
+                Listed::Container,
+                Listed::Container,
+                Listed::Plain,
+                Listed::Container,
+                Listed::Container,
+                Listed::Plain,
+                Listed::Plain,
+            ]
+        );
+    }
+
+    // An end file's name and the signature it is built on make a leaf; the
+    // same name over any other signature is a lie, and the bytes decide.
+    #[test]
+    fn an_end_file_is_a_leaf_only_over_its_own_signature() {
+        let table = end_file_fronts();
+        assert_eq!(
+            table
+                .iter()
+                .map(|(extension, _, kind)| (*extension, vec![*kind]))
+                .collect::<Vec<_>>(),
+            END_FILES
+                .iter()
+                .map(|(extension, kinds)| (*extension, kinds.to_vec()))
+                .collect::<Vec<_>>(),
+            "every end file has its front here"
+        );
+        for (extension, own, kind) in &table {
+            // Under a name that says nothing, the bytes found their object,
+            // so the pairing is what makes the leaf.
+            assert_eq!(sniff("9f3a7c1e", own, None), object(*kind), "{extension}");
+            for stem in ["Release.v1.0", "RELEASE", "\"quoted"] {
+                let name = format!("{stem}{extension}");
+                let upper = name.to_ascii_uppercase();
+                let trailed = format!("{name}_.");
+                for name in [&name, &upper, &trailed] {
+                    assert_eq!(sniff(name, own, None), Sniff::Leaf, "{name}");
+                    for (front, opens) in every_signature() {
+                        let expected = if opens == *kind {
+                            Sniff::Leaf
+                        } else {
+                            object(opens)
+                        };
+                        assert_eq!(sniff(name, &front, None), expected, "{name} {opens:?}");
+                    }
+                }
+            }
+            // Until the bytes decide, the name waits with them.
+            assert_eq!(sniff(&format!("a{extension}"), b"", None), Sniff::Pending);
+        }
+        // A lying name over an archive's bytes: the archive.
+        assert_eq!(sniff("Sporcle.apk", RAR5, None), object(Kind::RarStore));
+        assert_eq!(
+            sniff("Sporcle.apk", &seven_z(), None),
+            object(Kind::SevenZipStore)
+        );
+        assert_eq!(sniff("Installer.dmg", RAR5, None), object(Kind::RarStore));
+        // A disk image on no signature is a leaf by its bytes.
+        assert_eq!(
+            sniff("Installer.dmg", &[0x78, 0xDA, 0, 0], Some(4)),
+            Sniff::Leaf
+        );
+        // Their numbered pieces are a split file's, whose join is named
+        // the end file again.
+        assert_eq!(
+            sniff("Installer.dmg.001", b"BZh91AY&SY", None),
+            object(Kind::Split)
+        );
+        // An extension only ends a name; a stem that holds one does not count.
+        assert_eq!(
+            sniff("Installer.dmg.bin", b"BZh9", None),
+            object(Kind::Bzip2)
+        );
+        assert_eq!(sniff("app.apk.zip", b"PK\x03\x04", None), object(Kind::Zip));
+    }
+
+    // Formats left out of the table open on no signature the sniffer
+    // knows: their bytes make them leaves, and an archive's bytes under
+    // their names decide.
+    #[test]
+    fn an_image_or_installer_goes_by_its_bytes() {
+        let padded = |front: &[u8]| {
+            let mut bytes = front.to_vec();
+            bytes.resize(1024, 0);
+            bytes
+        };
+        let mut iso = vec![0u8; 32 * 1024];
+        iso.extend_from_slice(b"\x01CD001\x01");
+        let mut mbr = vec![0u8; 512];
+        mbr[510..].copy_from_slice(&[0x55, 0xAA]);
+        for (name, front) in [
+            ("Disc.iso", iso),
+            ("Disk.img", mbr),
+            ("Ext.crx", padded(b"Cr24\x03\x00\x00\x00")),
+            (
+                "Setup.msi",
+                padded(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]),
+            ),
+            ("tool.deb", padded(b"!<arch>\ndebian-binary   ")),
+            ("tool.rpm", padded(&[0xED, 0xAB, 0xEE, 0xDB, 3, 0, 0, 0])),
+        ] {
+            let length = Some(front.len() as u64);
+            assert_eq!(sniff(name, &front, length), Sniff::Leaf, "{name}");
+            assert_eq!(sniff("9f3a7c1e", &front, length), Sniff::Leaf, "{name}");
+            for (front, opens) in every_signature() {
+                assert_eq!(sniff(name, &front, None), object(opens), "{name} {opens:?}");
+            }
+        }
+    }
+
     #[test]
     fn bytes_win_over_names() {
         assert_eq!(sniff("a.bz2", &ustar(0), None), object(Kind::Tar));
@@ -1181,6 +2067,159 @@ mod tests {
         assert_eq!(sniff(".001", &bytes, None), Sniff::Leaf);
     }
 
+    // A ReScene `.srr` opens on its own header block, `69 69 69`, and holds
+    // copies of a RAR set's headers further in: no signature opens it, so it
+    // is a leaf, never a RAR volume.
+    #[test]
+    fn a_rescene_file_is_a_leaf() {
+        let mut srr = vec![0x69, 0x69, 0x69, 0x00, 0x00, 0x07, 0x00];
+        srr.extend_from_slice(&[0x71, 0x71, 0x71, 0x00, 0x00, 0x0c, 0x00, 0x03, 0x00]);
+        srr.extend_from_slice(b"a.r");
+        srr.extend_from_slice(RAR5);
+        srr.extend_from_slice(&plain(300));
+        let length = Some(srr.len() as u64);
+        assert_eq!(sniff("a.srr", &srr, length), Sniff::Leaf);
+        assert_eq!(sniff("9f3a7c1e", &srr, length), Sniff::Leaf);
+    }
+
+    // A piece's number has three digits or more, as 7-Zip and HJSplit
+    // number pieces: a version's or a repost's short digit tail is
+    // no piece, whatever its bytes open. A posted name's trailed quote or
+    // underscore is no part of the number.
+    #[test]
+    fn a_short_digit_tail_is_no_piece() {
+        let bytes = plain(600);
+        for name in [
+            "Microsoft.WindowsAppRuntime.Release%211.4.0",
+            "Microsoft.WindowsAppRuntime.Release%211.4",
+            "silver.mkv.1",
+            "c0ffee.10",
+            "c0ffee.99",
+        ] {
+            assert_eq!(sniff(name, &bytes, Some(43)), Sniff::Leaf, "{name}");
+            assert_eq!(
+                sniff(name, b"PK\x03\x04", None),
+                object(Kind::Zip),
+                "{name}"
+            );
+            assert!(!split_piece_among(name, [name]), "{name}");
+        }
+        for name in [
+            "Microsoft.WindowsAppRuntime.Release%211.4.0",
+            "silver.mkv.1",
+        ] {
+            assert_eq!(split_piece(name), None, "{name}");
+            assert!(!names_claimable(name), "{name}");
+        }
+        for (name, whole, number) in [
+            ("a.001", "a", "001"),
+            ("a.mkv.001", "a.mkv", "001"),
+            ("a.7z.001", "a.7z", "001"),
+            ("a.zip.001", "a.zip", "001"),
+            ("a.mkv.1000", "a.mkv", "1000"),
+            ("[71ECB6A7].mkv.001_", "[71ECB6A7].mkv", "001"),
+            ("a.mkv.002\"", "a.mkv", "002"),
+        ] {
+            assert_eq!(split_piece(name), Some((whole, number)), "{name}");
+            assert_eq!(sniff(name, &bytes, None), object(Kind::Split), "{name}");
+        }
+    }
+
+    // The names a split piece is told by. The same table pins
+    // `FileRole::SplitFile` in `shared/crates/weaver-model/tests/files.rs`
+    // (`parse_split_file`), which census, the watch folder and ingest read
+    // roles by; the two rules must agree, and a change to one changes both
+    // tables.
+    const SPLIT_PIECE_NAMES: &[(&str, bool)] = &[
+        ("a.001", true),
+        ("a.mkv.001", true),
+        ("a.mkv.002", true),
+        ("a.mkv.0001", true),
+        ("a.mkv.00001", true),
+        ("a.mkv.1000", true),
+        ("[71ECB6A7].mkv.001_", true),
+        ("a.mkv.002\"", true),
+        ("a.mkv.003.", true),
+        ("a.mkv.004 ", true),
+        ("a.mkv.01", false),
+        ("a.mkv.1", false),
+        ("c0ffee.99", false),
+        ("Release%211.4.0", false),
+        (".001", false),
+        ("a.mkv.00a", false),
+        ("a.001.mkv", false),
+        ("a.mkv", false),
+    ];
+
+    // The posts whose two-digit names are pieces of a set, name by name. The
+    // same table pins `FileRole::of_post` in
+    // `shared/crates/weaver-model/tests/files.rs`.
+    const SHORT_SET_POSTS: &[&[(&str, bool)]] = &[
+        &[("a.mkv.01", true), ("a.mkv.02", true), ("a.mkv.03", true)],
+        &[("a.mkv.00", true), ("a.mkv.01", true)],
+        &[("A.MKV.01", true), ("a.mkv.02_", true), ("a.mkv.07", true)],
+        &[("a.mkv.01", true), ("a.mkv.02", true), ("b.mkv.03", false)],
+        &[("a.mkv.01", false)],
+        &[("notes.10", false)],
+        &[("file.99", false)],
+        &[("Release.1.4.10", false)],
+        &[("notes.10", false), ("notes.11", false)],
+        &[("a.mkv.02", false), ("a.mkv.03", false)],
+        &[("a.mkv.01", false), ("b.mkv.02", false)],
+        &[
+            ("a.mkv.01", false),
+            ("a.mkv.002", true),
+            ("a.mkv.003", true),
+        ],
+        &[("notes.4.0", false), ("notes.4.1", false)],
+    ];
+
+    #[test]
+    fn split_pieces_follow_the_model_rule() {
+        for &(name, piece) in SPLIT_PIECE_NAMES {
+            assert_eq!(split_piece_among(name, [name]), piece, "{name}");
+            assert_eq!(numbered_piece(name), piece, "{name}");
+        }
+        for post in SHORT_SET_POSTS {
+            for &(name, piece) in *post {
+                let beside = post.iter().map(|(name, _)| *name);
+                assert_eq!(split_piece_among(name, beside), piece, "{name} in {post:?}");
+            }
+        }
+    }
+
+    // A two-digit piece founds the split store among its set, whatever its
+    // bytes open, as a `.001` does alone; with no set beside it, its bytes
+    // say what it is.
+    #[test]
+    fn a_two_digit_piece_founds_the_split_store_among_its_set() {
+        let set = ["a.mkv.01", "a.mkv.02", "a.mkv.03"];
+        for name in set {
+            let beside = set.iter().copied();
+            assert_eq!(
+                sniff_among(name, &plain(600), None, beside.clone()),
+                object(Kind::Split),
+                "{name}"
+            );
+            assert_eq!(
+                sniff_among(name, b"PK\x03\x04", None, beside),
+                object(Kind::Split),
+                "{name}"
+            );
+            assert_eq!(sniff(name, &plain(600), None), Sniff::Leaf, "{name}");
+            assert!(names_claimable(name), "{name}");
+        }
+        let alone = ["notes.10"];
+        assert_eq!(
+            sniff_among("notes.10", &plain(600), Some(43), alone.iter().copied()),
+            Sniff::Leaf
+        );
+        assert_eq!(
+            listed(&["a.mkv.01", "a.mkv.02", "notes.10"]),
+            vec![Listed::Container, Listed::Container, Listed::Plain]
+        );
+    }
+
     #[test]
     fn split_volume_names_are_just_their_format() {
         assert_eq!(sniff("a.r00", RAR4, None), object(Kind::RarStore));
@@ -1211,5 +2250,165 @@ mod tests {
                 }
             }
         }
+    }
+
+    // A listing's names are told apart by name alone, and by the names
+    // beside them: container volumes in every numbering, recovery files and
+    // SFVs; a look-alike extension with no set of its stem is plain.
+    #[test]
+    fn a_listings_archive_names_are_told_apart_from_plain_files() {
+        let names = [
+            "a.rar",
+            "a.r00",
+            "a.s01",
+            "a.y99",
+            "b.part02.RAR",
+            "c.7z",
+            "c.7z.001",
+            "d.zip",
+            "d.z01",
+            "e.mkv.003",
+            "f.par2",
+            "f.vol00+01.PAR2",
+            "f.p01",
+            "g.par",
+            "g.p07",
+            "h.rev",
+            "h.sfv",
+            "plain.mkv",
+            "plain.nfo",
+            "plain.r",
+            "plain.rar.txt",
+            "rar",
+            "x.s16",
+            "x.r64",
+            "x.z80",
+            "x.z01",
+            "x.p12",
+            "x.p7",
+            "a.r100",
+            "a.z00x",
+            "plain.tar",
+            "plain.tar.gz",
+            "plain.xz",
+        ];
+        let listed = listed(&names);
+        let of = |name: &str| listed[names.iter().position(|named| *named == name).unwrap()];
+        for name in [
+            "a.rar",
+            "a.r00",
+            "a.s01",
+            "a.y99",
+            "b.part02.RAR",
+            "c.7z",
+            "c.7z.001",
+            "d.zip",
+            "d.z01",
+            "e.mkv.003",
+            "plain.tar",
+            "plain.tar.gz",
+            "plain.xz",
+        ] {
+            assert_eq!(of(name), Listed::Container, "{name}");
+        }
+        for name in [
+            "f.par2",
+            "f.vol00+01.PAR2",
+            "f.p01",
+            "g.p07",
+            "h.rev",
+            "h.sfv",
+        ] {
+            assert_eq!(of(name), Listed::Recovery, "{name}");
+        }
+        for name in [
+            "g.par",
+            "plain.mkv",
+            "plain.nfo",
+            "plain.r",
+            "plain.rar.txt",
+            "rar",
+            "x.s16",
+            "x.r64",
+            "x.z80",
+            "x.z01",
+            "x.p12",
+            "x.p7",
+            "a.r100",
+            "a.z00x",
+        ] {
+            assert_eq!(of(name), Listed::Plain, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_tar_or_compressed_stream_is_a_container_by_its_name() {
+        let containers = [
+            "a.tar",
+            "a.tar.gz",
+            "a.tgz",
+            "a.gz",
+            "a.tar.bz2",
+            "a.tbz",
+            "a.tbz2",
+            "a.bz2",
+            "a.tar.bzip2",
+            "a.tar.xz",
+            "a.txz",
+            "a.xz",
+            "a.tar.zst",
+            "a.tzst",
+            "a.zst",
+            "a.br",
+            "a.deflate",
+            "a.zip",
+            "A.TAR.GZ",
+            "a.tar.gz\"",
+            "a.tar.gz.001",
+            "a.tar.zst.002",
+        ];
+        for name in containers {
+            assert!(
+                names_container(name) || numbered_piece(trimmed(name)),
+                "{name}"
+            );
+        }
+        assert!(
+            listed(&containers)
+                .iter()
+                .all(|listed| *listed == Listed::Container)
+        );
+        let plain = [
+            "episode.mkv",
+            "a.g",
+            "a.z",
+            "a.xzz",
+            "file.tar.txt",
+            "a.tgzip",
+            "a.gzip",
+            "a.zstd",
+            "a.gz.txt",
+            "gz",
+            "a.sfv.mkv",
+        ];
+        for name in plain {
+            assert!(!names_container(name), "{name}");
+        }
+        assert!(listed(&plain).iter().all(|listed| *listed == Listed::Plain));
+        assert!(!names_container("a.sfv"));
+        assert!(!names_container("a.rev"));
+    }
+
+    #[test]
+    fn a_signed_kinds_name_never_claims_bytes_that_open_no_signature() {
+        for name in [
+            "a.gz", "a.tar.gz", "a.tgz", "a.xz", "a.txz", "a.zst", "a.tzst",
+        ] {
+            assert_eq!(sniff(name, &plain(512), Some(512)), Sniff::Leaf, "{name}");
+        }
+        assert_eq!(
+            sniff("a.tar.bz2", &plain(512), Some(512)),
+            object(Kind::Bzip2)
+        );
     }
 }

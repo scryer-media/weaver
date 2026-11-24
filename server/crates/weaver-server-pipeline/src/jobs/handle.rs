@@ -1,0 +1,2146 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+use crate::proxies::ProxiesNetworkPersistenceQueries;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+use tokio::sync::broadcast;
+
+use crate::jobs::class::{ByProtocol, JobClasses, PipelineClass};
+use weaver_server_base::events::model::PipelineEvent;
+use weaver_server_base::jobs::ids::JobId;
+
+use crate::jobs::error::SchedulerError;
+use crate::jobs::model::{HeldClass, JobSpec, JobStatus, JobUpdate, Protocol};
+use crate::pipeline::queue::{Change, Queue};
+use weaver_server_base::operations::metrics::{MetricsSnapshot, PipelineMetrics};
+
+pub use weaver_server_composition::jobs::control::*;
+
+#[derive(Clone)]
+pub struct SharedPipelineState {
+    pub queue: Arc<Queue>,
+    // The class of each protocol, each seated once: the pipeline at start,
+    // every other class when it starts.
+    classes: JobClasses,
+    // The holds in force, as the queue records them, for every owner of
+    // queue items to follow.
+    holds: tokio::sync::watch::Sender<HoldSet>,
+    // How many starts of every item the operator or the schedule has asked
+    // for, held or not, for every owner of queue items to look again at what
+    // it keeps from running.
+    starts: tokio::sync::watch::Sender<u64>,
+    // Moves when which job waits on which disk changes, and only then: the
+    // disk figures move without it (`set_disk_limits`).
+    disk_rows: tokio::sync::watch::Sender<u64>,
+    // How the global download limit is shared out, as last put in force.
+    bandwidth_split: Arc<RwLock<crate::bandwidth::SplitState>>,
+    metrics: Arc<PipelineMetrics>,
+    download_block: Arc<RwLock<DownloadBlockState>>,
+    server_quota_blocked: Arc<AtomicBool>,
+    // Set once shutdown is asked for, with the queue's own signal, for work
+    // off the actor that must not take the queue's lock to read it.
+    shutdown_started: Arc<AtomicBool>,
+    // The egress whose download quota holds work back, while one does.
+    egress_quota_block: Arc<RwLock<Option<EgressQuotaBlock>>>,
+    // Whether `egress_quota_block` holds one, written with it under its
+    // write lock: clearing a block that is not there, which the pipeline
+    // asks on every article, takes no lock.
+    egress_quota_blocked: Arc<AtomicBool>,
+    #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+    egress_quota_block_locks: Arc<AtomicU64>,
+    proxy_runtime: Arc<RwLock<Option<Arc<crate::proxies::ProxyRuntime>>>>,
+    server_transfer_policy:
+        Arc<RwLock<Option<Arc<crate::servers::transfer_policy::ServerTransferPolicyRegistry>>>>,
+    nntp_pool: Arc<RwLock<Option<Arc<weaver_nntp::pool::NntpPool>>>>,
+    // Per-server BODY transport state from the download lanes, indexed by
+    // pool server index. Published on the tuning tick, not per response.
+    download_transport: Arc<RwLock<Vec<ServerTransportHealth>>>,
+    // First-byte latency the last connection test measured, keyed by saved
+    // server id. The download lanes read it once, to pick a starting depth
+    // for a server they have never fetched from; every later depth decision
+    // comes from their own measurements.
+    server_probe_latency: Arc<RwLock<HashMap<u32, Duration>>>,
+    // Memory one conventional 7z extraction may hold, as the hardware
+    // profile in force decides it. Read when an extraction is admitted, so a
+    // profile put in force now reaches the next extraction. `u64::MAX` means no profile cap, and
+    // the extraction ceiling alone bounds the decoder.
+    sevenz_decode_memory_bytes: Arc<AtomicU64>,
+    // The per-article stream (`ArticleDownloaded`, `SegmentDecoded`, ...),
+    // kept off the job-level broadcast: a download emits several of these
+    // per article, and every always-on job-level subscriber (event
+    // persistence, the queue replay producer) was woken for each one only to
+    // discard it. Nothing is even built here unless someone is listening.
+    segment_events: broadcast::Sender<PipelineEvent>,
+    // The speed test service, held weakly: the service holds this handle.
+    speed_test: Arc<std::sync::Mutex<Option<std::sync::Weak<dyn HeldSpeedTest>>>>,
+    // The pipeline's free-space samplers, set once it starts: requests read
+    // their cached readings and never look at the disk themselves. Held
+    // weakly, so the samplers stop with the pipeline that owns them.
+    storage_capacity: Arc<RwLock<std::sync::Weak<crate::operations::StorageCapacity>>>,
+    // The pipeline's holds accountant, set once it starts: a metrics scrape
+    // reads its counts under its own lock and never waits on the pipeline.
+    // Held weakly, as the samplers above are.
+    graph_holds: Arc<RwLock<std::sync::Weak<weaver_graph::holds::HoldsAccountant>>>,
+}
+
+// Bounded like the job-level broadcast; a lagging listener drops articles,
+// never the pipeline.
+const SEGMENT_EVENT_CAPACITY: usize = 1024;
+
+impl SharedPipelineState {
+    pub fn new(metrics: Arc<PipelineMetrics>, initial_jobs: Vec<JobInfo>) -> Self {
+        let metrics_snapshot = metrics.raw_snapshot();
+        let queue = Arc::new(Queue::new(initial_jobs));
+        queue.write(|inner| {
+            inner.metrics = Some(metrics_snapshot);
+            Change::unchanged(())
+        });
+        let (segment_events, _) = broadcast::channel(SEGMENT_EVENT_CAPACITY);
+        let classes = JobClasses::default();
+        classes.seat(Arc::new(PipelineClass(queue.clone())));
+        Self {
+            queue,
+            classes,
+            holds: tokio::sync::watch::channel(HoldSet::default()).0,
+            starts: tokio::sync::watch::channel(0).0,
+            disk_rows: tokio::sync::watch::channel(0).0,
+            bandwidth_split: Arc::new(RwLock::new(crate::bandwidth::SplitState::default())),
+            metrics,
+            download_block: Arc::new(RwLock::new(DownloadBlockState::default())),
+            server_quota_blocked: Arc::new(AtomicBool::new(false)),
+            shutdown_started: Arc::new(AtomicBool::new(false)),
+            egress_quota_block: Arc::new(RwLock::new(None)),
+            egress_quota_blocked: Arc::new(AtomicBool::new(false)),
+            #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+            egress_quota_block_locks: Arc::new(AtomicU64::new(0)),
+            proxy_runtime: Arc::new(RwLock::new(None)),
+            server_transfer_policy: Arc::new(RwLock::new(None)),
+            nntp_pool: Arc::new(RwLock::new(None)),
+            download_transport: Arc::new(RwLock::new(Vec::new())),
+            server_probe_latency: Arc::new(RwLock::new(HashMap::new())),
+            sevenz_decode_memory_bytes: Arc::new(AtomicU64::new(u64::MAX)),
+            segment_events,
+            speed_test: Arc::new(std::sync::Mutex::new(None)),
+            storage_capacity: Arc::default(),
+            graph_holds: Arc::default(),
+        }
+    }
+
+    // Subscribe to the per-article event stream. Job-level events stay on
+    // [`SchedulerHandle::subscribe_events`].
+    pub fn subscribe_segment_events(&self) -> broadcast::Receiver<PipelineEvent> {
+        self.segment_events.subscribe()
+    }
+
+    // Publish one per-article event, building it only if a listener exists.
+    pub fn publish_segment_event(&self, event: impl FnOnce() -> PipelineEvent) {
+        if self.segment_events.receiver_count() > 0 {
+            let _ = self.segment_events.send(event());
+        }
+    }
+
+    // --- Reader methods (called by API handlers) ---
+
+    // The queue in one order: by when each job was added, each owner's own
+    // order kept among its jobs, then the finished jobs.
+    pub fn list_jobs(&self) -> Vec<JobInfo> {
+        self.queue.read(|inner| {
+            let mut live = inner.visible_jobs().peekable();
+            let mut owned = inner.owned_rows().map(|(_, _, job)| job.clone()).peekable();
+            std::iter::from_fn(|| match (live.peek(), owned.peek()) {
+                (Some(job), Some(other)) if other.created_at_epoch_ms < job.created_at_epoch_ms => {
+                    owned.next()
+                }
+                (Some(_), _) => live.next(),
+                (None, _) => owned.next(),
+            })
+            .chain(self.queue.history().iter().cloned())
+            .collect()
+        })
+    }
+
+    // The queue's own rows, whatever their status: a job retiring into
+    // history stays here until its archive commits, and history hides it
+    // until then.
+    pub fn queue_jobs(&self) -> Vec<JobInfo> {
+        self.queue.read(|inner| inner.visible_jobs().collect())
+    }
+
+    // How many published jobs are in each status, counted under the read
+    // lock without copying a job.
+    pub fn job_status_counts(&self) -> crate::operations::metrics_store::JobStatusCounts {
+        self.queue.read(|inner| {
+            inner.history_summary.with_statuses(
+                inner.jobs.iter().map(|row| &row.report.job.status).chain(
+                    Protocol::ALL
+                        .iter()
+                        .flat_map(|protocol| inner.owned(*protocol))
+                        .map(|job| &job.status),
+                ),
+            )
+        })
+    }
+
+    // The jobs that get their own `weaver_job_*` series under `mode`,
+    // copied under the read lock; nothing else in the queue is copied.
+    // `Active` is the jobs the pipeline is working on: those holding an NZB
+    // slot and those past their download, until they finish. A job waiting
+    // its turn moves no value a series would show, and at ten thousand
+    // queued jobs its series were most of the scrape.
+    pub fn metrics_jobs(&self, mode: crate::settings::PerJobSeries) -> Vec<JobInfo> {
+        use crate::settings::PerJobSeries;
+        self.queue.read(|inner| match mode {
+            PerJobSeries::Off => Vec::new(),
+            PerJobSeries::All => inner
+                .visible_jobs()
+                .chain(self.queue.history().iter().cloned())
+                .collect(),
+            PerJobSeries::Active => inner
+                .jobs
+                .iter()
+                .filter(|row| row.report.nzb_admitted || row.report.job.status.past_download())
+                .map(|row| row.info(&inner.globals))
+                .filter(|job| !job.status.finished())
+                .collect(),
+        })
+    }
+
+    // The names every queued job is known by in memory, by job id, for the
+    // stand-in table of the diagnostics package: its name, category,
+    // metadata, output directory and hash, copied under the read lock and
+    // nothing else. A row with an edit the pipeline has not applied yet
+    // reads as the queue shows it.
+    pub fn diagnostic_queue_names(
+        &self,
+    ) -> Vec<(u64, crate::jobs::diagnostic_names::JobNameRecord)> {
+        self.queue.read(|inner| {
+            inner
+                .jobs
+                .iter()
+                .map(|row| {
+                    let view = row.view(&inner.globals);
+                    let job = view.job();
+                    (
+                        job.job_id.0,
+                        crate::jobs::diagnostic_names::JobNameRecord::of_info(job),
+                    )
+                })
+                .collect()
+        })
+    }
+
+    // The queued jobs the diagnostics package reports on: those Weaver has
+    // started work on, post-processing first, then failed, then downloading,
+    // each group in queue order, at most `limit` of them. Every row is
+    // classified under the read lock without copying it; only the chosen
+    // rows are copied. A cancelled job, and one with a pause the pipeline has
+    // not applied yet, reads as the queue shows it and does not qualify.
+    pub fn active_report_jobs(&self, limit: usize) -> crate::support::ActiveReportJobs {
+        use crate::support::{ActiveReportGroup, ActiveReportJobs};
+        self.queue.read(|inner| {
+            let mut chosen: Vec<(ActiveReportGroup, usize)> = inner
+                .jobs
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.intents.cancelled.is_none())
+                .filter(|(_, row)| {
+                    !(row.intents.pause_seq > row.report.seen_intent_seq
+                        && row.intents.paused == Some(true))
+                })
+                .filter_map(|(position, row)| {
+                    ActiveReportGroup::of(&row.report.job.status).map(|group| (group, position))
+                })
+                .collect();
+            let qualified = chosen.len();
+            chosen.sort_unstable();
+            chosen.truncate(limit);
+            ActiveReportJobs {
+                qualified,
+                jobs: chosen
+                    .into_iter()
+                    .map(|(group, position)| (group, inner.jobs[position].info(&inner.globals)))
+                    .collect(),
+            }
+        })
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn has_runtime_paths(&self) -> bool {
+        self.queue
+            .read(|inner| inner.globals.runtime_paths.is_some())
+    }
+
+    // The revision of the published job list; it moves on every publish.
+    pub fn job_revision(&self) -> u64 {
+        self.queue.revision()
+    }
+
+    // Live download rate of every transferring job, read off the published
+    // job list in place.
+    //
+    // Off the pipeline entirely: it takes the read side of the lock the
+    // orchestrator already writes on its 100 ms tick and copies nothing but
+    // `(job id, rate)` pairs, so a metrics subscriber sampling it every
+    // 250 ms costs less than the job-list clone the queue readers make.
+    pub fn job_download_rates(&self) -> Vec<(JobId, u64)> {
+        self.queue.read(|inner| {
+            let mut rates: Vec<_> = inner
+                .jobs
+                .iter()
+                .filter(|row| row.intents.cancelled.is_none())
+                .filter_map(|row| {
+                    let phases = if row.phases.is_empty() {
+                        &row.report.job.phase_progress
+                    } else {
+                        &row.sampled_phases
+                    };
+                    phases
+                        .iter()
+                        .find(|phase| {
+                            phase.phase == crate::jobs::phase_progress::JobPhase::Downloading
+                        })
+                        .and_then(|phase| phase.rate_bps)
+                        .map(|rate| (row.id, rate))
+                })
+                .collect();
+            for protocol in Protocol::ALL {
+                rates.extend(job_download_rates(inner.owned(*protocol)));
+            }
+            rates
+        })
+    }
+
+    pub fn get_job(&self, job_id: JobId) -> Option<JobInfo> {
+        self.queue.read(|inner| {
+            inner
+                .job(job_id)
+                .map(|row| row.info(&inner.globals))
+                .or_else(|| inner.owned_job(job_id).cloned())
+                .or_else(|| {
+                    self.queue
+                        .history()
+                        .iter()
+                        .find(|job| job.job_id == job_id)
+                        .cloned()
+                })
+        })
+    }
+
+    // Includes hidden cancellations and terminal rows awaiting durable retirement.
+    pub fn queued_job_ids(&self) -> HashSet<JobId> {
+        self.queue
+            .read(|inner| inner.jobs.iter().map(|row| row.id).collect())
+    }
+
+    // Whether the queue as a whole is held.
+    pub fn is_paused(&self) -> bool {
+        self.holds.borrow().stops(HoldOwner::All, false)
+    }
+
+    pub fn holds(&self) -> HoldSet {
+        self.holds.borrow().clone()
+    }
+
+    // Wakes on each change of the holds.
+    pub fn subscribe_holds(&self) -> tokio::sync::watch::Receiver<HoldSet> {
+        self.holds.subscribe()
+    }
+
+    // Wakes on each start of every item, whether it lifted a hold or not.
+    pub fn subscribe_starts(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.starts.subscribe()
+    }
+
+    // A start of every item was asked for: after its release of the holds,
+    // so an owner that wakes on it sees them lifted.
+    fn started(&self) {
+        self.starts
+            .send_modify(|starts| *starts = starts.wrapping_add(1));
+    }
+
+    pub fn schedule_replay_paused(&self) -> bool {
+        self.queue
+            .read(|inner| inner.globals.schedule_replay_paused)
+    }
+
+    pub fn is_post_processing_paused(&self) -> bool {
+        self.queue
+            .read(|inner| inner.globals.post_processing_paused)
+    }
+
+    pub fn set_post_processing_paused(&self, paused: bool) {
+        self.queue.write_intent(|inner| {
+            inner.globals.post_processing_paused = paused;
+            Change::changed(())
+        });
+    }
+
+    pub fn metrics_snapshot(&self) -> MetricsSnapshot {
+        self.queue
+            .read(|inner| inner.metrics.clone())
+            .unwrap_or_else(|| self.metrics.raw_snapshot())
+    }
+
+    pub fn raw_metrics_snapshot(&self) -> MetricsSnapshot {
+        self.metrics.raw_snapshot()
+    }
+
+    pub fn metrics(&self) -> &Arc<PipelineMetrics> {
+        &self.metrics
+    }
+
+    pub fn download_block(&self) -> DownloadBlockState {
+        let mut state = self.download_block.read().unwrap().clone();
+        let disk_limits;
+        (state.schedule_hold_reason, disk_limits) = self.queue.read(|inner| {
+            (
+                inner.globals.schedule_hold_reason.clone(),
+                Arc::clone(&inner.globals.disk_limits),
+            )
+        });
+        if state.schedule_hold_reason.is_some() && state.kind == DownloadBlockKind::None {
+            state.kind = DownloadBlockKind::Scheduled;
+        }
+        state.disk_volumes = disk_limits.volume_states();
+        state
+    }
+
+    // What the disk vote and the job disks last said: the slow volumes,
+    // and the jobs held on one or still writing with nothing left to
+    // fetch, with the volumes' figures as published. One read of the
+    // queue's shared state; a request reads it once and shares it.
+    pub fn disk_limits(&self) -> Arc<crate::pipeline::disk_vote::DiskLimits> {
+        self.queue
+            .read(|inner| Arc::clone(&inner.globals.disk_limits))
+    }
+
+    // Publish what the disk vote and the job disks say. The pipeline calls
+    // this only when it changed. It does not move the queue's revision, so
+    // no queue reader is woken for a figure: the figures reach clients
+    // through the metrics snapshot. When `rows` (which job waits on which
+    // disk) changed too, the disk rows signal moves.
+    pub(crate) fn set_disk_limits(
+        &self,
+        limits: Arc<crate::pipeline::disk_vote::DiskLimits>,
+        rows: bool,
+    ) {
+        self.queue.write(|inner| {
+            inner.globals.disk_limits = limits;
+            Change::unchanged(())
+        });
+        if rows {
+            self.disk_rows
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
+        }
+    }
+
+    // The revision of which job waits on which disk.
+    pub fn disk_rows_revision(&self) -> u64 {
+        *self.disk_rows.borrow()
+    }
+
+    // Wakes when which job waits on which disk changes.
+    pub fn subscribe_disk_rows(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.disk_rows.subscribe()
+    }
+
+    // Publish one volume as the pipeline would, with `held` jobs waiting
+    // on it while it is slow and `draining` jobs that have nothing left to
+    // fetch and writes still out: for the API's tests, which have no
+    // pipeline.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn mark_disk_for_test(
+        &self,
+        label: &str,
+        write_rate_bytes_per_sec: u64,
+        waiting_bytes: u64,
+        slow: bool,
+        held: &[JobId],
+        draining: &[JobId],
+    ) {
+        use crate::pipeline::disk_vote::{JobDiskView, disk_limits};
+        use weaver_server_disk::operations::disk::volume::Volume;
+        let volume = Arc::new(Volume::new(Some(1), label.into()));
+        volume
+            .write_rate
+            .store(write_rate_bytes_per_sec, Ordering::Relaxed);
+        volume.count_for_test(waiting_bytes);
+        volume.buffered_bytes.store(waiting_bytes, Ordering::SeqCst);
+        let slow_volumes = if slow {
+            vec![Arc::clone(&volume)]
+        } else {
+            Vec::new()
+        };
+        let views = held
+            .iter()
+            .map(|job_id| (*job_id, false))
+            .chain(draining.iter().map(|job_id| (*job_id, true)))
+            .map(|(job_id, fetched)| JobDiskView {
+                job_id,
+                volumes: vec![&volume],
+                out: vec![&volume],
+                fetched,
+                working: false,
+            });
+        let next = disk_limits(&slow_volumes, views);
+        let rows = !next.same_rows(&self.disk_limits());
+        self.set_disk_limits(Arc::new(next), rows);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn publish_jobs(&self, jobs: Vec<JobInfo>) {
+        self.queue.write(|inner| {
+            inner.jobs = jobs
+                .into_iter()
+                .map(crate::pipeline::queue::JobRow::new)
+                .collect();
+            inner.reindex_jobs();
+            self.queue.replace_history(inner, Arc::from(Vec::new()));
+            crate::pipeline::queue::Change::changed(())
+        });
+    }
+
+    pub fn load_history(&self, history: Vec<JobInfo>) {
+        self.queue.write(|inner| {
+            self.queue.replace_history(inner, history.into());
+            Change::changed(())
+        });
+    }
+
+    // Publish the jobs of `protocol`'s class, kept beside whatever the
+    // pipeline publishes, and say what the publish changed as the pipeline
+    // says it of its own jobs. The class publishes through its handle, which
+    // carries the events.
+    pub fn publish_class_jobs(&self, protocol: Protocol, jobs: Vec<JobInfo>) -> Vec<PipelineEvent> {
+        self.queue.write(|inner| {
+            // The same jobs as they stand: nothing changed, and nothing is
+            // said, so an idle publish wakes no reader.
+            if inner.owned(protocol) == jobs.as_slice() {
+                return Change::unchanged(Vec::new());
+            }
+            let events = owned_job_events(inner.owned(protocol), &jobs);
+            inner.owned_mut(protocol).replace(jobs);
+            Change::changed(events)
+        })
+    }
+
+    // One job of a class's, the rest left as published: a job new to the
+    // queue takes its place in the class's order, by when it was added.
+    fn publish_class_job(&self, protocol: Protocol, job: JobInfo) -> Vec<PipelineEvent> {
+        self.queue.write(|inner| {
+            let job_id = job.job_id;
+            let owned = inner.owned_mut(protocol);
+            // Only a job already published is looked for among the others.
+            let at = owned.position(job_id);
+            if at.is_some_and(|at| owned.rows()[at] == job) {
+                return Change::unchanged(Vec::new());
+            }
+            let before = at.map_or(&[][..], |at| std::slice::from_ref(&owned.rows()[at]));
+            let events = owned_job_events(before, std::slice::from_ref(&job));
+            match at {
+                Some(at) => owned.set(at, job),
+                None => owned.insert(job),
+            }
+            Change::changed(events)
+        })
+    }
+
+    // The class of each protocol in force.
+    pub fn classes(&self) -> &JobClasses {
+        &self.classes
+    }
+
+    pub fn subscribe_job_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.queue.subscribe()
+    }
+
+    // Advance the rate windows and publish the metrics snapshot. Returns
+    // whether any published rate is still above zero, so the caller keeps
+    // sampling quickly until the gauges have settled.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn refresh_metrics_snapshot(&self, now: std::time::Instant) -> bool {
+        // The gauge integrates the transfer total, the counter the queue tick
+        // hands it, so a test tick and a live tick feed one series.
+        let snapshot = self
+            .metrics
+            .sample_totals(now, self.queue.counters.bandwidth.total(), 0, 0);
+        let rates_moving = snapshot.current_download_speed > 0
+            || snapshot.articles_per_sec > 0.0
+            || snapshot.decode_rate_mbps > 0.0;
+        self.queue.write(|inner| {
+            inner.metrics = Some(snapshot);
+            Change::unchanged(())
+        });
+        rates_moving
+    }
+
+    // Book wire bytes the way a lane and its completion do: the transfer total
+    // the download gauge integrates, and the lifetime downloaded counter.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn record_wire_bytes(&self, bytes: u64) {
+        self.queue.counters.bandwidth.record(bytes);
+        self.metrics
+            .bytes_downloaded
+            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // Put a hold in force, as one change of the holds.
+    pub fn hold(&self, hold: Hold) {
+        self.change_holds(|holds| holds.hold(hold));
+    }
+
+    // Lift what `origin` holds over `owner`, as one change of the holds.
+    pub fn release(&self, origin: HoldOrigin, owner: HoldOwner) {
+        self.change_holds(|holds| holds.release(origin, owner));
+    }
+
+    // Put back the holds kept across a restart.
+    pub fn restore_holds(&self, kept: HoldSet) {
+        self.change_holds(|holds| *holds = kept);
+    }
+
+    // The queue records the holds, and the pipeline puts them in force at
+    // its next turn. The watch moves under the same lock, so every owner
+    // that follows it sees the holds in the order the queue took them.
+    fn change_holds(&self, change: impl FnOnce(&mut HoldSet)) {
+        self.queue.write_intent(|inner| {
+            let before = inner.globals.holds.clone();
+            change(&mut inner.globals.holds);
+            if inner.globals.holds == before {
+                return Change::unchanged(());
+            }
+            self.holds.send_replace(inner.globals.holds.clone());
+            Change::changed(())
+        });
+    }
+
+    pub fn set_bandwidth_split(&self, state: crate::bandwidth::SplitState) {
+        *self.bandwidth_split.write().unwrap() = state;
+    }
+
+    pub fn bandwidth_split(&self) -> crate::bandwidth::SplitState {
+        *self.bandwidth_split.read().unwrap()
+    }
+
+    pub fn set_download_block(&self, mut state: DownloadBlockState) {
+        let mut current = self.download_block.write().unwrap();
+        self.apply_quota_blocks(&mut state);
+        *current = state;
+    }
+
+    // Lay the quota blocks over a pause-derived block state. A manual or
+    // scheduled pause outranks both; an egress quota outranks a server quota,
+    // since no server can be reached past it.
+    fn apply_quota_blocks(&self, state: &mut DownloadBlockState) {
+        let egress = self.egress_quota_block.read().unwrap().clone();
+        let quota_kind = matches!(
+            state.kind,
+            DownloadBlockKind::EgressQuota | DownloadBlockKind::ServerQuota
+        );
+        if quota_kind {
+            state.kind = if state.scheduled_speed_limit.is_some() {
+                DownloadBlockKind::Scheduled
+            } else {
+                DownloadBlockKind::None
+            };
+        }
+        let overridable = matches!(
+            state.kind,
+            DownloadBlockKind::None | DownloadBlockKind::Scheduled
+        );
+        state.egress_id = None;
+        state.egress_name = None;
+        state.used_bytes = 0;
+        state.limit_bytes = 0;
+        state.remaining_bytes = 0;
+        state.window_starts_at_epoch_ms = None;
+        state.window_ends_at_epoch_ms = None;
+        if let Some(block) = egress {
+            state.egress_id = Some(block.egress_id);
+            state.egress_name = Some(block.egress_name);
+            state.used_bytes = block.used_bytes;
+            state.limit_bytes = block.limit_bytes;
+            state.remaining_bytes = block.remaining_bytes;
+            state.window_starts_at_epoch_ms = block.window_starts_at_epoch_ms;
+            state.window_ends_at_epoch_ms = block.window_ends_at_epoch_ms;
+            state.timezone_name = block.timezone_name;
+            if overridable {
+                state.kind = DownloadBlockKind::EgressQuota;
+            }
+        } else if overridable && self.server_quota_blocked.load(Ordering::Relaxed) {
+            state.kind = DownloadBlockKind::ServerQuota;
+        }
+    }
+
+    pub fn egress_quota_block(&self) -> Option<EgressQuotaBlock> {
+        self.egress_quota_block.read().unwrap().clone()
+    }
+
+    // Record which egress quota, if any, holds work back, and re-lay the
+    // published block state over it.
+    pub fn set_egress_quota_block(&self, block: Option<EgressQuotaBlock>) {
+        if block.is_none() && !self.egress_quota_blocked.load(Ordering::Acquire) {
+            return;
+        }
+        #[cfg(any(test, feature = "pipeline-test-fixtures"))]
+        self.egress_quota_block_locks
+            .fetch_add(1, Ordering::Relaxed);
+        if *self.egress_quota_block.read().unwrap() == block {
+            return;
+        }
+        let mut state = self.download_block.write().unwrap();
+        {
+            let mut current = self.egress_quota_block.write().unwrap();
+            if *current == block {
+                return;
+            }
+            self.egress_quota_blocked
+                .store(block.is_some(), Ordering::Release);
+            *current = block;
+        }
+        self.apply_quota_blocks(&mut state);
+    }
+
+    // How many times setting the egress block took its lock.
+    #[cfg(all(feature = "pipeline-test-fixtures", not(test)))]
+    pub(crate) fn egress_quota_block_lock_count(&self) -> u64 {
+        self.egress_quota_block_locks.load(Ordering::Relaxed)
+    }
+
+    // Memory one conventional 7z extraction may hold. `u64::MAX` when no
+    // profile has capped it.
+    pub fn sevenz_decode_memory_bytes(&self) -> u64 {
+        self.sevenz_decode_memory_bytes.load(Ordering::Relaxed)
+    }
+
+    // Apply the chosen profile's 7z decoder allowance. Extractions already
+    // running keep the allowance they were admitted with.
+    pub fn set_sevenz_decode_memory_bytes(&self, bytes: u64) {
+        self.sevenz_decode_memory_bytes
+            .store(bytes.max(1), Ordering::Relaxed);
+    }
+
+    // The hardware profile in force, or `None` before a pipeline has
+    // resolved one.
+    pub fn hardware_profile_in_force(&self) -> Option<HardwareProfileInForce> {
+        self.queue
+            .read(|inner| inner.globals.hardware_profile_in_force)
+    }
+
+    // Publish the hardware profile the pipeline has put in force.
+    pub fn set_hardware_profile_in_force(&self, in_force: HardwareProfileInForce) {
+        self.queue.write(|inner| {
+            if inner.globals.hardware_profile_in_force == Some(in_force) {
+                return Change::unchanged(());
+            }
+            inner.globals.hardware_profile_in_force = Some(in_force);
+            Change::changed(())
+        });
+    }
+
+    // The shutdown signal as an atomic, for work off the actor.
+    pub(crate) fn shutdown_started(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.shutdown_started)
+    }
+
+    pub fn server_quota_blocked(&self) -> bool {
+        self.server_quota_blocked.load(Ordering::Relaxed)
+    }
+
+    // The block is laid again only when the value changed: the pipeline
+    // derives it on every queue change.
+    pub fn set_server_quota_blocked(&self, blocked: bool) {
+        if self.server_quota_blocked.load(Ordering::Relaxed) == blocked {
+            return;
+        }
+        let mut state = self.download_block.write().unwrap();
+        self.server_quota_blocked.store(blocked, Ordering::Relaxed);
+        self.apply_quota_blocks(&mut state);
+    }
+
+    pub fn set_server_transfer_policy(
+        &self,
+        registry: Arc<crate::servers::transfer_policy::ServerTransferPolicyRegistry>,
+    ) {
+        *self.server_transfer_policy.write().unwrap() = Some(registry);
+    }
+
+    pub fn server_transfer_policy(
+        &self,
+    ) -> Option<Arc<crate::servers::transfer_policy::ServerTransferPolicyRegistry>> {
+        self.server_transfer_policy.read().unwrap().clone()
+    }
+
+    pub fn proxy_runtime(&self) -> Option<Arc<crate::proxies::ProxyRuntime>> {
+        self.proxy_runtime.read().expect("proxy runtime").clone()
+    }
+
+    pub fn set_nntp_pool(&self, pool: Arc<weaver_nntp::pool::NntpPool>) {
+        *self.nntp_pool.write().unwrap() = Some(pool);
+    }
+
+    pub fn nntp_pool(&self) -> Option<Arc<weaver_nntp::pool::NntpPool>> {
+        self.nntp_pool.read().unwrap().clone()
+    }
+
+    // The samplers of the pipeline that runs over this state. The disk owner
+    // is in use from here on, so its volumes' write rates are kept from here.
+    pub(crate) fn set_storage_capacity(&self, storage: &Arc<crate::operations::StorageCapacity>) {
+        storage.watch_volume_rates();
+        *self
+            .storage_capacity
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::downgrade(storage);
+    }
+
+    // The pipeline's free-space samplers, once it has started. Reading their
+    // cache looks at no disk.
+    pub fn storage_capacity(&self) -> Option<Arc<crate::operations::StorageCapacity>> {
+        self.storage_capacity
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .upgrade()
+    }
+
+    pub(crate) fn set_graph_holds(&self, holds: &Arc<weaver_graph::holds::HoldsAccountant>) {
+        *self
+            .graph_holds
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::downgrade(holds);
+    }
+
+    // Held bytes in RAM against the hold limit, once the pipeline started.
+    pub fn holds_metrics_snapshot(
+        &self,
+    ) -> Option<weaver_server_base::operations::instrumentation::HoldsMetricsSnapshot> {
+        let holds = self
+            .graph_holds
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .upgrade()?;
+        let usage = holds.usage();
+        Some(
+            weaver_server_base::operations::instrumentation::HoldsMetricsSnapshot {
+                resident_bytes: usage.resident,
+                resident_limit_bytes: holds.budgets().resident_limit,
+                resident_peak_bytes: usage.resident_peak,
+                resident_past_limit_bytes: usage.past_limit_total,
+            },
+        )
+    }
+
+    pub fn set_nntp_runtime_activation(&self, activation: NntpRuntimeActivation) {
+        self.queue.write(|inner| {
+            inner.globals.nntp_active = Some(activation);
+            Change::changed(())
+        });
+    }
+
+    pub fn nntp_runtime_activation(&self) -> Option<NntpRuntimeActivation> {
+        self.queue.read(|inner| inner.globals.nntp_active)
+    }
+
+    pub fn set_download_transport_health(&self, health: Vec<ServerTransportHealth>) {
+        *self.download_transport.write().unwrap() = health;
+    }
+
+    pub fn download_transport_health(&self) -> Vec<ServerTransportHealth> {
+        self.download_transport.read().unwrap().clone()
+    }
+
+    // Record what a connection test measured, so a server the lanes have
+    // never fetched from can start at a sensible pipelining depth.
+    pub fn note_server_probe_latency(&self, server_id: u32, latency: Duration) {
+        self.server_probe_latency
+            .write()
+            .unwrap()
+            .insert(server_id, latency);
+    }
+
+    pub fn server_probe_latency(&self, server_id: u32) -> Option<Duration> {
+        self.server_probe_latency
+            .read()
+            .unwrap()
+            .get(&server_id)
+            .copied()
+    }
+}
+
+// Splice `job_id` to its new position in the manual queue order. Pure so the
+// clamp/splice arithmetic is unit-testable apart from pipeline state.
+pub fn splice_job_order(
+    order: &mut Vec<JobId>,
+    job_id: JobId,
+    target: QueueMoveTarget,
+) -> Result<bool, SchedulerError> {
+    let Some(current) = order.iter().position(|id| *id == job_id) else {
+        return Err(SchedulerError::JobNotFound(job_id));
+    };
+    let last = order.len() - 1;
+    let new_index = match target {
+        QueueMoveTarget::Top => 0,
+        QueueMoveTarget::Bottom => last,
+        QueueMoveTarget::Offset(delta) => {
+            (current as i64).saturating_add(delta).clamp(0, last as i64) as usize
+        }
+    };
+    if new_index == current {
+        return Ok(false);
+    }
+    let id = order.remove(current);
+    order.insert(new_index, id);
+    Ok(true)
+}
+
+// The job events that take an owner's published jobs from `before` to
+// `after`: a job whose figures moved is paused, resumed, or otherwise
+// updated. A job new to them says nothing: every start publishes each of an
+// owner's jobs again, and only its add creates one (`created_owned_job`).
+fn owned_job_events(before: &[JobInfo], after: &[JobInfo]) -> Vec<PipelineEvent> {
+    let before: HashMap<JobId, &JobInfo> = before.iter().map(|job| (job.job_id, job)).collect();
+    after
+        .iter()
+        .filter_map(|job| {
+            let job_id = job.job_id;
+            let was = before.get(&job_id)?;
+            let paused = |job: &JobInfo| job.status == JobStatus::Paused;
+            match (paused(was), paused(job)) {
+                _ if *was == job => None,
+                (false, true) => Some(PipelineEvent::JobPaused { job_id }),
+                (true, false) => Some(PipelineEvent::JobResumed { job_id }),
+                _ => Some(PipelineEvent::PhaseProgressUpdated { job_id }),
+            }
+        })
+        .collect()
+}
+
+// Handle for sending commands to the scheduler.
+// Cloneable, can be shared across tasks.
+#[derive(Clone)]
+pub struct SchedulerHandle {
+    event_tx: broadcast::Sender<PipelineEvent>,
+    pub state: SharedPipelineState,
+}
+
+impl SchedulerHandle {
+    // Attach the control-plane handle and its independent metrics ticker.
+    pub fn new(event_tx: broadcast::Sender<PipelineEvent>, state: SharedPipelineState) -> Self {
+        state
+            .queue
+            .start_ticker(state.metrics.clone(), event_tx.clone());
+        Self { event_tx, state }
+    }
+
+    // Submit a new download job.
+    pub async fn add_job(
+        &self,
+        job_id: JobId,
+        spec: JobSpec,
+        nzb_path: PathBuf,
+        nzb_zstd: Vec<u8>,
+    ) -> Result<(), SchedulerError> {
+        self.add_job_with_options(job_id, spec, nzb_path, nzb_zstd, AddJobOptions::default())
+            .await
+    }
+
+    // Submit a new download job with explicit scheduler options.
+    pub async fn add_job_with_options(
+        &self,
+        job_id: JobId,
+        spec: JobSpec,
+        nzb_path: PathBuf,
+        nzb_zstd: Vec<u8>,
+        options: AddJobOptions,
+    ) -> Result<(), SchedulerError> {
+        self.state
+            .queue
+            .clone()
+            .add(
+                job_id,
+                spec,
+                nzb_path,
+                nzb_zstd,
+                options,
+                self.event_tx.clone(),
+            )
+            .await
+    }
+
+    // Restore a job from crash-recovery journal.
+    pub async fn restore_job(&self, request: RestoreJobRequest) -> Result<(), SchedulerError> {
+        self.state.queue.restore(request)
+    }
+
+    // Every queue action on one job comes through here, and the job's class
+    // answers it.
+    async fn act(&self, job_id: JobId, action: QueueAction) -> Result<(), SchedulerError> {
+        self.act_all(vec![(job_id, action)])
+            .await
+            .remove(&job_id)
+            .unwrap_or(Err(SchedulerError::JobNotFound(job_id)))
+    }
+
+    // The actions of one request, each job's under its class, in the
+    // protocol table's order: one read of the queue finds every job's class.
+    fn by_class(
+        &self,
+        actions: Vec<(JobId, QueueAction)>,
+    ) -> ByProtocol<Vec<(JobId, QueueAction)>> {
+        let mut grouped: ByProtocol<Vec<_>> = ByProtocol::default();
+        self.state.queue.read(|inner| {
+            for (job_id, action) in actions {
+                grouped[inner.class_of(job_id)].push((job_id, action));
+            }
+        });
+        grouped
+    }
+
+    // One class's actions, as one call to it. A job whose class is not
+    // seated is not found.
+    async fn act_class(
+        &self,
+        protocol: Protocol,
+        actions: Vec<(JobId, QueueAction)>,
+    ) -> BTreeMap<JobId, Result<(), SchedulerError>> {
+        match self.state.classes.get(protocol) {
+            Some(class) => class.act(actions).await,
+            None => actions
+                .into_iter()
+                .map(|(job_id, _)| (job_id, Err(SchedulerError::JobNotFound(job_id))))
+                .collect(),
+        }
+    }
+
+    // Every action of one request, each class called once with its own
+    // jobs, each job answered on its own.
+    async fn act_all(
+        &self,
+        actions: Vec<(JobId, QueueAction)>,
+    ) -> BTreeMap<JobId, Result<(), SchedulerError>> {
+        let mut outcome = BTreeMap::new();
+        for (protocol, actions) in self.by_class(actions).into_iter() {
+            if !actions.is_empty() {
+                outcome.extend(self.act_class(protocol, actions).await);
+            }
+        }
+        outcome
+    }
+
+    // Pause a job.
+    pub async fn pause_job(&self, job_id: JobId) -> Result<(), SchedulerError> {
+        self.act(job_id, QueueAction::Pause).await
+    }
+
+    // Resume a paused job.
+    pub async fn resume_job(&self, job_id: JobId) -> Result<(), SchedulerError> {
+        self.act(job_id, QueueAction::Resume).await
+    }
+
+    // Pause or resume every job named: each class's as one call, the
+    // pipeline's as one queue change with one revision, each job answered on
+    // its own.
+    pub async fn set_jobs_paused(
+        &self,
+        job_ids: impl IntoIterator<Item = JobId>,
+        paused: bool,
+    ) -> BTreeMap<JobId, Result<(), SchedulerError>> {
+        let action = || match paused {
+            true => QueueAction::Pause,
+            false => QueueAction::Resume,
+        };
+        self.act_all(
+            job_ids
+                .into_iter()
+                .map(|job_id| (job_id, action()))
+                .collect(),
+        )
+        .await
+    }
+
+    // Apply every job update named: each class's as one call, the
+    // pipeline's as one queue change with one revision, each job answered on
+    // its own.
+    pub async fn update_jobs(
+        &self,
+        updates: impl IntoIterator<Item = (JobId, JobUpdate)>,
+    ) -> BTreeMap<JobId, Result<(), SchedulerError>> {
+        self.act_all(
+            updates
+                .into_iter()
+                .map(|(job_id, update)| (job_id, QueueAction::Update(update)))
+                .collect(),
+        )
+        .await
+    }
+
+    // Cancel a job.
+    pub async fn cancel_job(&self, job_id: JobId) -> Result<(), SchedulerError> {
+        self.cancel_job_with_origin(job_id, CancellationOrigin::User)
+            .await
+    }
+
+    pub async fn cancel_duplicate_job(&self, job_id: JobId) -> Result<(), SchedulerError> {
+        self.cancel_job_with_origin(job_id, CancellationOrigin::UserDuplicate)
+            .await
+    }
+
+    pub async fn cancel_job_and_delete_history(&self, job_id: JobId) -> Result<(), SchedulerError> {
+        self.state
+            .queue
+            .cancel_jobs_with_history_policy(
+                BTreeSet::from([job_id]),
+                CancellationOrigin::User,
+                true,
+            )
+            .remove(&job_id)
+            .unwrap_or(Err(SchedulerError::JobNotFound(job_id)))
+    }
+
+    // Cancel a job and keep whatever it has written so far.
+    pub async fn cancel_job_keeping_files(&self, job_id: JobId) -> Result<(), SchedulerError> {
+        self.cancel_job_with_origin(job_id, CancellationOrigin::UserKeepingFiles)
+            .await
+    }
+
+    pub async fn cancel_semantic_bad(&self, job_id: JobId) -> Result<(), SchedulerError> {
+        self.cancel_job_with_origin(job_id, CancellationOrigin::SemanticBad)
+            .await
+    }
+
+    pub async fn cancel_semantic_superseded(&self, job_id: JobId) -> Result<(), SchedulerError> {
+        self.cancel_job_with_origin(job_id, CancellationOrigin::SemanticSuperseded)
+            .await
+    }
+
+    async fn cancel_job_with_origin(
+        &self,
+        job_id: JobId,
+        origin: CancellationOrigin,
+    ) -> Result<(), SchedulerError> {
+        self.cancel_jobs(BTreeSet::from([job_id]), origin)
+            .await?
+            .remove(&job_id)
+            .unwrap_or(Err(SchedulerError::JobNotFound(job_id)))
+    }
+
+    // Record cancellation and hide accepted rows immediately. Teardown and
+    // durable history follow at the pipeline's next boundary. Each class's
+    // jobs go to it as one call.
+    pub async fn cancel_jobs(
+        &self,
+        job_ids: BTreeSet<JobId>,
+        origin: CancellationOrigin,
+    ) -> Result<CancelJobsOutcome, SchedulerError> {
+        Ok(self
+            .act_all(
+                job_ids
+                    .into_iter()
+                    .map(|job_id| (job_id, QueueAction::Cancel(origin)))
+                    .collect(),
+            )
+            .await)
+    }
+
+    // Update a job's category and/or metadata.
+    pub async fn update_job(&self, job_id: JobId, update: JobUpdate) -> Result<(), SchedulerError> {
+        self.act(job_id, QueueAction::Update(update)).await
+    }
+
+    // Update a finished job's history row. The password field is ignored.
+    pub async fn update_history(
+        &self,
+        job_id: JobId,
+        update: JobUpdate,
+    ) -> Result<(), SchedulerError> {
+        self.state
+            .queue
+            .clone()
+            .update_history(job_id, update)
+            .await
+    }
+
+    // Move a job within the manual queue order. Durable and reflected in
+    // queue listings; breaks ties within a dispatch priority band rather than
+    // overriding HIGH/NORMAL/LOW.
+    pub async fn reorder_job(
+        &self,
+        job_id: JobId,
+        target: QueueMoveTarget,
+    ) -> Result<(), SchedulerError> {
+        self.act(job_id, QueueAction::Move(target)).await
+    }
+
+    // Move multiple jobs within the manual queue order in a single round
+    // trip. All moves are applied atomically: if any job id is unknown, no
+    // move is applied and `Err(SchedulerError::JobNotFound)` is returned.
+    // The resulting order is persisted and the job snapshot is published
+    // once for the whole batch, rather than once per move.
+    pub async fn reorder_jobs(
+        &self,
+        moves: Vec<(JobId, QueueMoveTarget)>,
+    ) -> Result<(), SchedulerError> {
+        // No move at all is still the pipeline's one, empty, change.
+        if moves.is_empty() {
+            return self.state.queue.reorder_jobs(moves);
+        }
+        // Each class's moves go as one call, in the protocol table's order;
+        // the first class to fail ends the request, so the pipeline's moves,
+        // applied whole or not at all, go before any other class's.
+        let actions = moves
+            .into_iter()
+            .map(|(job_id, target)| (job_id, QueueAction::Move(target)))
+            .collect();
+        for (protocol, actions) in self.by_class(actions).into_iter() {
+            if actions.is_empty() {
+                continue;
+            }
+            for (_, outcome) in self.act_class(protocol, actions).await {
+                outcome?;
+            }
+        }
+        Ok(())
+    }
+
+    // Whether the pipeline has work to drive, as it last said: while it
+    // does, it gives memory back itself as it settles.
+    pub fn pipeline_driving(&self) -> bool {
+        self.state.queue.driving()
+    }
+
+    // Publish the jobs `protocol`'s class keeps beside the pipeline's. What
+    // the publish changed goes out on the job events, as the pipeline's own
+    // changes do: a job that appears is created, one that changes says so.
+    // A job that leaves is retired, which says how it ended.
+    pub fn publish_owned_jobs(&self, protocol: Protocol, jobs: Vec<JobInfo>) {
+        for event in self.state.publish_class_jobs(protocol, jobs) {
+            let _ = self.event_tx.send(event);
+        }
+    }
+
+    // Publish one job `protocol`'s class keeps, the others as they stand,
+    // with what that changed on the job events.
+    pub fn publish_owned_job(&self, protocol: Protocol, job: JobInfo) {
+        for event in self.state.publish_class_job(protocol, job) {
+            let _ = self.event_tx.send(event);
+        }
+    }
+
+    // A job a class added is created, once, by its add. A restart that
+    // brings it back only publishes it.
+    pub fn created_owned_job(&self, job: &JobInfo) {
+        let _ = self.event_tx.send(PipelineEvent::JobCreated {
+            job_id: job.job_id,
+            name: job.name.clone(),
+            total_files: job.total_files,
+            total_bytes: job.total_bytes,
+        });
+    }
+
+    // A job another owner finished joins the finished jobs, once, and its
+    // ending goes out with the history that holds it.
+    pub async fn retire_job(&self, info: JobInfo) -> Result<(), SchedulerError> {
+        let queue = &self.state.queue;
+        queue.write(|inner| {
+            let ended = info.ended_event();
+            let job_id = info.job_id;
+            let protocol = inner.class_of(job_id);
+            inner.owned_mut(protocol).remove(job_id);
+            let mut history: Vec<_> = queue
+                .history()
+                .iter()
+                .filter(|job| job.job_id != job_id)
+                .cloned()
+                .collect();
+            history.insert(0, info);
+            history.truncate(FINISHED_JOBS_RUNTIME_CAP);
+            queue.replace_history(inner, history.into());
+            if let Some(event) = ended {
+                let _ = self.event_tx.send(event);
+            }
+            Change::changed(())
+        });
+        Ok(())
+    }
+
+    pub fn state(&self) -> &SharedPipelineState {
+        &self.state
+    }
+
+    // Reprocess a completed or failed job (re-run post-download stages without re-downloading).
+    pub async fn reprocess_job(&self, job_id: JobId) -> Result<(), SchedulerError> {
+        self.reprocess_job_with_password(job_id, None).await
+    }
+
+    pub async fn reprocess_job_with_password(
+        &self,
+        job_id: JobId,
+        password: Option<String>,
+    ) -> Result<(), SchedulerError> {
+        self.reprocess_job_with_options(job_id, password, false)
+            .await
+    }
+
+    // Reprocess with `no_memory_limit`: the job's decode windows over the
+    // profile's ceiling are lent from scratch, then RAM, whatever the
+    // profile says. Other jobs keep their limits.
+    pub async fn reprocess_job_with_options(
+        &self,
+        job_id: JobId,
+        password: Option<String>,
+        no_memory_limit: bool,
+    ) -> Result<(), SchedulerError> {
+        self.state
+            .queue
+            .clone()
+            .restart(
+                job_id,
+                password,
+                true,
+                no_memory_limit,
+                self.event_tx.clone(),
+            )
+            .await
+    }
+
+    // Re-download a completed or failed job from its persisted NZB under the same job ID.
+    pub async fn redownload_job(&self, job_id: JobId) -> Result<(), SchedulerError> {
+        self.redownload_job_with_password(job_id, None).await
+    }
+
+    pub async fn redownload_job_with_password(
+        &self,
+        job_id: JobId,
+        password: Option<String>,
+    ) -> Result<(), SchedulerError> {
+        self.state
+            .queue
+            .clone()
+            .restart(job_id, password, false, false, self.event_tx.clone())
+            .await
+    }
+
+    // Delete a completed/failed/cancelled job from history.
+    //
+    // An `Err` does not say the record survived: a cleanup that failed after
+    // the record was deleted is returned as its error too. A caller that must
+    // know whether the record is gone reads `delete_history_batch`.
+    pub async fn delete_history(
+        &self,
+        job_id: JobId,
+        delete_files: bool,
+    ) -> Result<HistoryDeleteOutcome, SchedulerError> {
+        let mut outcome = self
+            .delete_history_batch(BTreeSet::from([job_id]), delete_files)
+            .await?;
+        if let Some(error) = outcome.refused.remove(&job_id) {
+            return Err(error);
+        }
+        outcome
+            .deleted
+            .remove(&job_id)
+            .unwrap_or(Ok(Default::default()))
+    }
+
+    // Delete a batch of completed/failed/cancelled jobs from history in one
+    // pipeline command. Callers holding more than `HISTORY_DELETE_BATCH_SIZE`
+    // ids send them in batches of that size.
+    pub async fn delete_history_batch(
+        &self,
+        job_ids: BTreeSet<JobId>,
+        delete_files: bool,
+    ) -> Result<HistoryDeleteBatchOutcome, SchedulerError> {
+        self.state
+            .queue
+            .clone()
+            .delete_history(job_ids, delete_files)
+            .await
+    }
+
+    // Archive a batch of history entries for the queued archive
+    // `operation_id`: remove their files and keep the entries. `now` is the
+    // stamp, in epoch seconds, written on every entry whose files are gone. Each id's
+    // target is settled with its outcome before the hold on the entries is
+    // released, so the queue revision that release rings finds the result
+    // written. Callers holding more than `HISTORY_DELETE_BATCH_SIZE` ids send
+    // them in batches of that size.
+    pub async fn archive_history_for_operation(
+        &self,
+        operation_id: u64,
+        job_ids: BTreeSet<JobId>,
+        now: i64,
+    ) -> Result<BTreeMap<JobId, ArchiveHistoryResult>, SchedulerError> {
+        self.state
+            .queue
+            .clone()
+            .archive_history_settling(
+                job_ids,
+                now,
+                crate::history::output_files::ARCHIVED_HISTORY_FILES_KEPT,
+                Some(operation_id),
+            )
+            .await
+    }
+
+    // Housekeeping for what jobs left on disk. With `failed_finished_by`, in
+    // epoch seconds, the files of every failed job that finished by then go
+    // and their records stay; a marked working directory of a job with no
+    // row goes once its marker is older than `marked_before`.
+    pub async fn sweep_job_files(
+        &self,
+        failed_finished_by: Option<i64>,
+        marked_before: std::time::SystemTime,
+    ) {
+        self.state
+            .queue
+            .clone()
+            .sweep_job_files(failed_finished_by, marked_before)
+            .await
+    }
+
+    // Get info about a specific job (reads from shared state, no channel round-trip).
+    pub fn get_job(&self, job_id: JobId) -> Result<JobInfo, SchedulerError> {
+        self.state
+            .get_job(job_id)
+            .ok_or(SchedulerError::JobNotFound(job_id))
+    }
+
+    // List all jobs (reads from shared state, no channel round-trip).
+    pub fn list_jobs(&self) -> Vec<JobInfo> {
+        self.state.list_jobs()
+    }
+
+    // The queue's jobs, a job retiring into history included.
+    pub fn queue_jobs(&self) -> Vec<JobInfo> {
+        self.state.queue_jobs()
+    }
+
+    // History excludes every row still owned by the queue, even after it is hidden.
+    pub fn queued_job_ids(&self) -> HashSet<JobId> {
+        self.state.queued_job_ids()
+    }
+
+    // How many jobs are in each status (reads from shared state, copies no
+    // job).
+    pub fn job_status_counts(&self) -> crate::operations::metrics_store::JobStatusCounts {
+        self.state.job_status_counts()
+    }
+
+    // The jobs that get their own `weaver_job_*` series under `mode`. See
+    // [`SharedPipelineState::metrics_jobs`].
+    pub fn metrics_jobs(&self, mode: crate::settings::PerJobSeries) -> Vec<JobInfo> {
+        self.state.metrics_jobs(mode)
+    }
+
+    // The names every queued job is known by in memory (reads from shared
+    // state, no channel round-trip). See
+    // [`SharedPipelineState::diagnostic_queue_names`].
+    pub fn diagnostic_queue_names(
+        &self,
+    ) -> Vec<(u64, crate::jobs::diagnostic_names::JobNameRecord)> {
+        self.state.diagnostic_queue_names()
+    }
+
+    // The finished jobs the queue publishes, shared rather than copied.
+    pub fn diagnostic_history_rows(&self) -> std::sync::Arc<[JobInfo]> {
+        self.state.history_rows()
+    }
+
+    // The queued jobs the diagnostics package reports on (reads from shared
+    // state, no channel round-trip). See
+    // [`SharedPipelineState::active_report_jobs`].
+    pub fn active_report_jobs(&self, limit: usize) -> crate::support::ActiveReportJobs {
+        self.state.active_report_jobs(limit)
+    }
+
+    // The revision of the published job list; it moves on every publish.
+    pub fn job_revision(&self) -> u64 {
+        self.state.job_revision()
+    }
+
+    // Wakes when the published job list changes.
+    pub fn subscribe_job_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.state.subscribe_job_changes()
+    }
+
+    // The revision of which job waits on which disk; the disk figures move
+    // without it.
+    pub fn disk_rows_revision(&self) -> u64 {
+        self.state.disk_rows_revision()
+    }
+
+    // Wakes when which job waits on which disk changes.
+    pub fn subscribe_disk_rows(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.state.subscribe_disk_rows()
+    }
+
+    // Download rate of every transferring job (reads from shared state, no
+    // channel round-trip). See [`SharedPipelineState::job_download_rates`].
+    pub fn job_download_rates(&self) -> Vec<(JobId, u64)> {
+        self.state.job_download_rates()
+    }
+
+    // The hardware profile in force and the scheduled one overriding the
+    // operator's choice (reads from shared state, no channel round-trip).
+    pub fn hardware_profile_in_force(&self) -> Option<HardwareProfileInForce> {
+        self.state.hardware_profile_in_force()
+    }
+
+    // Get current metrics (reads from shared state, no channel round-trip).
+    pub fn get_metrics(&self) -> MetricsSnapshot {
+        self.state.metrics_snapshot()
+    }
+
+    // The live pipeline counters the download workers book into.
+    pub fn pipeline_metrics(&self) -> Arc<PipelineMetrics> {
+        Arc::clone(self.state.metrics())
+    }
+
+    // How long this process has spent downloading.
+    pub fn download_time(&self) -> std::time::Duration {
+        self.state.metrics().download_time()
+    }
+
+    pub fn get_extraction_rejections(&self) -> [u64; 9] {
+        self.state.metrics().extraction_rejections()
+    }
+
+    // Whether the pipeline task is gone.
+    //
+    // The runtime guard closes the queue when the pipeline task exits.
+    pub fn is_closed(&self) -> bool {
+        self.state.queue.closed.load(Ordering::Acquire)
+    }
+
+    // Count one job accepted into the pipeline, labelled by where it came
+    // from and which category it landed in.
+    //
+    // Called from the submission path, which is the only place that knows the
+    // origin. Low-frequency by construction (one call per submitted job), so
+    // the label map behind it is never contended.
+    pub fn note_job_submitted(
+        &self,
+        origin: crate::jobs::SubmissionOrigin,
+        category: Option<&str>,
+    ) {
+        self.state
+            .metrics()
+            .job_lifecycle
+            .note_submitted(origin.as_str(), category.unwrap_or(""));
+    }
+
+    // Per-server article attempt counters and latency for the servers of the
+    // currently active NNTP generation.
+    //
+    // Read on demand rather than folded into [`MetricsSnapshot`]: the 100 ms
+    // snapshot tick must stay a fixed-size struct copy with no `Vec` in it.
+    // This reads through a `RwLock` that is only ever write-locked when a new
+    // NNTP runtime generation is activated, so it never contends with the
+    // per-article path that increments the counters.
+    pub fn server_metrics_snapshot(
+        &self,
+    ) -> Vec<weaver_server_base::operations::instrumentation::ServerMetricsSnapshot> {
+        self.state.metrics().server_metrics.snapshot()
+    }
+
+    // What each server of the active generation answered to article
+    // requests: found and not found. Read on demand, like the snapshot above.
+    pub fn server_article_outcomes(
+        &self,
+        stable_server_id: u32,
+    ) -> Option<weaver_server_base::operations::instrumentation::ServerArticleOutcomes> {
+        self.state
+            .metrics()
+            .server_metrics
+            .article_outcomes(stable_server_id)
+    }
+
+    // Job lifecycle counters and duration histograms. Read on demand; see
+    // [`Self::server_metrics_snapshot`] for why this is not in the tick.
+    pub fn job_lifecycle_metrics_snapshot(
+        &self,
+    ) -> weaver_server_base::operations::instrumentation::JobLifecycleMetricsSnapshot {
+        self.state.metrics().job_lifecycle.snapshot()
+    }
+
+    // Pipeline stage duration histograms. Read on demand; see
+    // [`Self::server_metrics_snapshot`] for why this is not in the tick.
+    pub fn pipeline_histograms_snapshot(
+        &self,
+    ) -> weaver_server_base::operations::instrumentation::PipelineHistogramsSnapshot {
+        self.state.metrics().pipeline_histograms.snapshot()
+    }
+
+    // The holds accountant's counts. Read on demand, under its one lock.
+    pub fn holds_metrics_snapshot(
+        &self,
+    ) -> Option<weaver_server_base::operations::instrumentation::HoldsMetricsSnapshot> {
+        self.state.holds_metrics_snapshot()
+    }
+
+    // Get a fresh atomics-based metrics snapshot without advancing the shared
+    // speed tracker.
+    pub fn get_live_metrics(&self) -> MetricsSnapshot {
+        self.state.raw_metrics_snapshot()
+    }
+
+    pub fn get_download_block(&self) -> DownloadBlockState {
+        self.state.download_block()
+    }
+
+    // Per-server BODY transport state as last published by the download lanes.
+    pub fn download_transport_health(&self) -> Vec<ServerTransportHealth> {
+        self.state.download_transport_health()
+    }
+
+    // Record a connection test's first-byte latency for the download lanes.
+    pub fn note_server_probe_latency(&self, server_id: u32, latency: Duration) {
+        self.state.note_server_probe_latency(server_id, latency);
+    }
+
+    // Read-only pipeline internals for the diagnostics package. The pipeline
+    // builds the snapshot at the top of its next turn after the request is
+    // recorded; only this endpoint pays for it.
+    pub async fn pipeline_diagnostics(
+        &self,
+    ) -> Result<crate::pipeline::diagnostics::PipelineDiagnostics, SchedulerError> {
+        let queue = &self.state.queue;
+        let mut changes = queue.subscribe();
+        let wanted = queue.write_intent(|inner| {
+            inner.diagnostics_requested += 1;
+            Change::unchanged(inner.diagnostics_requested)
+        });
+        loop {
+            let answer = queue.read(|inner| {
+                inner
+                    .diagnostics
+                    .as_ref()
+                    .filter(|(answered, _)| *answered >= wanted)
+                    .map(|(_, diagnostics)| diagnostics.clone())
+            });
+            if let Some(diagnostics) = answer {
+                return Ok(diagnostics);
+            }
+            if queue.closed.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(SchedulerError::ChannelClosed);
+            }
+            changes
+                .changed()
+                .await
+                .map_err(|_| SchedulerError::ChannelClosed)?;
+        }
+    }
+
+    // Put a hold in force. Every pause, whoever asks for it, comes through
+    // here: the queue records it at once, and the pipeline puts it in force
+    // at its next turn.
+    pub async fn pause(&self, hold: Hold) -> Result<(), SchedulerError> {
+        self.state.hold(hold);
+        Ok(())
+    }
+
+    // Lift what `origin` holds over `owner`. Every resume comes through
+    // here.
+    pub async fn resume(&self, origin: HoldOrigin, owner: HoldOwner) -> Result<(), SchedulerError> {
+        self.state.release(origin, owner);
+        Ok(())
+    }
+
+    // The operator's pause of the whole queue.
+    pub async fn pause_all(&self) -> Result<(), SchedulerError> {
+        self.pause(Hold::manual(HoldOwner::All)).await
+    }
+
+    // The operator's start of the whole queue, which also looks again at
+    // what each owner keeps from running.
+    pub async fn resume_all(&self) -> Result<(), SchedulerError> {
+        self.resume(HoldOrigin::Manual, HoldOwner::All).await?;
+        self.state.started();
+        Ok(())
+    }
+
+    // The operator's pause of every job of one class, as one hold.
+    pub async fn pause_class(&self, class: HeldClass) -> Result<(), SchedulerError> {
+        self.pause(Hold::manual(HoldOwner::Class(class))).await
+    }
+
+    // The operator's start of every job of one class, as `resume_all` starts
+    // them.
+    pub async fn resume_class(&self, class: HeldClass) -> Result<(), SchedulerError> {
+        self.resume(HoldOrigin::Manual, HoldOwner::Class(class))
+            .await?;
+        self.state.started();
+        Ok(())
+    }
+
+    pub async fn pause_post_processing(&self) -> Result<(), SchedulerError> {
+        self.state.set_post_processing_paused(true);
+        Ok(())
+    }
+
+    pub async fn resume_post_processing(&self) -> Result<(), SchedulerError> {
+        self.state.set_post_processing_paused(false);
+        Ok(())
+    }
+
+    pub async fn cancel_post_processing(&self, job_id: JobId) -> Result<(), SchedulerError> {
+        self.state.queue.write_intent(|inner| {
+            let Some(row) = inner
+                .jobs
+                .iter_mut()
+                .find(|row| row.id == job_id && row.report.post_processing_cancellable)
+            else {
+                return Change::unchanged(Err(SchedulerError::Conflict(format!(
+                    "job {} has no queued or active post-processing attempt",
+                    job_id.0
+                ))));
+            };
+            row.intents.cancel_post_processing = true;
+            row.intents.seq += 1;
+            Change::changed(Ok(()))
+        })
+    }
+
+    // Check whether the pipeline is globally paused (reads from shared state).
+    pub fn is_globally_paused(&self) -> bool {
+        self.state.is_paused()
+    }
+
+    // Hold or release download admission for the schedule evaluator. The
+    // reason is published with the download block so the hold is visible.
+    pub fn set_schedule_admission_hold(&self, reason: Option<String>) {
+        let held = reason.is_some();
+        self.state.queue.write_intent(|inner| {
+            inner.globals.schedule_hold_reason = reason;
+            inner.globals.schedule_replay_paused = held;
+            Change::changed(())
+        });
+    }
+
+    pub fn is_post_processing_paused(&self) -> bool {
+        self.state.is_post_processing_paused()
+    }
+
+    // Set the global bandwidth limits as the operator's edit. They are in
+    // force at once, and a scheduled limit gives way until the next
+    // scheduled speed rule fires.
+    pub async fn set_bandwidth(
+        &self,
+        bandwidth: crate::proxies::Bandwidth,
+    ) -> Result<(), SchedulerError> {
+        self.send_bandwidth(bandwidth, true).await
+    }
+
+    // Save the global bandwidth limits as the operator's edit: the store,
+    // then the shared configuration, then the limiter.
+    pub async fn save_bandwidth(
+        &self,
+        db: &crate::Database,
+        config: &crate::settings::SharedConfig,
+        bandwidth: crate::proxies::Bandwidth,
+    ) -> Result<(), SchedulerError> {
+        let store = db.clone();
+        tokio::task::spawn_blocking(move || store.set_network_bandwidth(&bandwidth))
+            .await
+            .map_err(|error| SchedulerError::Io(std::io::Error::other(error)))??;
+        config.write().await.bandwidth = bandwidth;
+        self.set_bandwidth(bandwidth).await
+    }
+
+    // Save the global download limit, keeping the upload limit as it is.
+    pub async fn save_download_limit(
+        &self,
+        db: &crate::Database,
+        config: &crate::settings::SharedConfig,
+        download_bps: Option<u64>,
+    ) -> Result<crate::proxies::Bandwidth, SchedulerError> {
+        let bandwidth = crate::proxies::Bandwidth {
+            download_bps,
+            ..config.read().await.bandwidth
+        };
+        self.save_bandwidth(db, config, bandwidth).await?;
+        Ok(bandwidth)
+    }
+
+    // Load the saved global bandwidth limits, as a configuration reload
+    // does. A scheduled limit in force still applies under them.
+    pub async fn restore_bandwidth(
+        &self,
+        bandwidth: crate::proxies::Bandwidth,
+    ) -> Result<(), SchedulerError> {
+        self.send_bandwidth(bandwidth, false).await
+    }
+
+    async fn send_bandwidth(
+        &self,
+        bandwidth: crate::proxies::Bandwidth,
+        replaces_schedule: bool,
+    ) -> Result<(), SchedulerError> {
+        self.state.queue.write_intent(|inner| {
+            let split_changed = inner.globals.bandwidth.split != bandwidth.split;
+            inner.globals.bandwidth = bandwidth;
+            // An operator's edit is in force at once: the schedule's rate
+            // gives way until its next rule fires. A split the operator sets
+            // gives way to no scheduled one until the next split rule fires;
+            // editing the limits alone leaves a scheduled split in force.
+            if replaces_schedule {
+                inner.globals.scheduled_bandwidth = None;
+                if split_changed {
+                    inner.globals.scheduled_split = None;
+                }
+            }
+            Change::changed(())
+        });
+        Ok(())
+    }
+
+    pub async fn set_max_concurrent_nzbs(
+        &self,
+        limit: std::num::NonZeroU32,
+    ) -> Result<(), SchedulerError> {
+        self.state.queue.write_intent(|inner| {
+            inner.globals.max_concurrent_nzbs = Some(limit);
+            crate::pipeline::queue::Change::changed(())
+        });
+        Ok(())
+    }
+
+    pub async fn set_propagation_delay(&self, seconds: u32) -> Result<(), SchedulerError> {
+        self.state.queue.write_intent(|inner| {
+            inner.globals.propagation_delay = Duration::from_secs(u64::from(seconds));
+            Change::changed(())
+        });
+        Ok(())
+    }
+
+    // Apply a scheduled action (called by the schedule evaluator).
+    pub async fn apply_schedule_action(
+        &self,
+        action: crate::bandwidth::ScheduleAction,
+    ) -> Result<(), SchedulerError> {
+        use crate::bandwidth::ScheduleAction;
+        match &action {
+            // Pause stops downloading and leaves what is complete seeding;
+            // pause all stops seeding too.
+            // A class's pause stops what the operator's pause of it does.
+            ScheduleAction::Pause
+            | ScheduleAction::PauseAll
+            | ScheduleAction::PauseClass { .. } => {
+                let (scope, owner) = match action {
+                    ScheduleAction::Pause => (HoldScope::Downloads, HoldOwner::All),
+                    ScheduleAction::PauseClass { class } => {
+                        let owner = HoldOwner::Class(class);
+                        (Hold::manual(owner).scope, owner)
+                    }
+                    _ => (HoldScope::Everything, HoldOwner::All),
+                };
+                let hold = Hold {
+                    origin: HoldOrigin::Scheduled,
+                    scope,
+                    owner,
+                };
+                self.state.hold(hold);
+                tracing::info!(?hold, "schedule: paused");
+                return Ok(());
+            }
+            ScheduleAction::Resume | ScheduleAction::ResumeClass { .. } => {
+                let owner = match action {
+                    ScheduleAction::ResumeClass { class } => HoldOwner::Class(class),
+                    _ => HoldOwner::All,
+                };
+                self.state.release(HoldOrigin::Scheduled, owner);
+                self.state.started();
+                tracing::info!(?owner, "schedule: resumed");
+                return Ok(());
+            }
+            ScheduleAction::PausePostProcessing => return self.pause_post_processing().await,
+            ScheduleAction::ResumePostProcessing => return self.resume_post_processing().await,
+            ScheduleAction::HardwareProfile { profile } => {
+                return self.set_scheduled_hardware_profile(Some(*profile)).await;
+            }
+            ScheduleAction::SpeedLimit { limits } => {
+                // Only the global limit lives here; an egress or provider
+                // limit is that holder's own rate.
+                match limits
+                    .iter()
+                    .rev()
+                    .find(|limit| limit.target == crate::bandwidth::SpeedTarget::Global)
+                {
+                    Some(limit) => {
+                        let scheduled = crate::proxies::Bandwidth {
+                            download_bps: limit.bytes_per_sec,
+                            upload_bps: limit.upload_bytes_per_sec,
+                            split: None,
+                        };
+                        self.state.queue.write_intent(|inner| {
+                            inner.globals.scheduled_bandwidth = Some(scheduled);
+                            Change::changed(())
+                        });
+                        tracing::info!(?scheduled, "schedule: set speed limit");
+                    }
+                    None => tracing::warn!(
+                        ?limits,
+                        "an egress or provider speed limit reached download pipeline"
+                    ),
+                }
+                return Ok(());
+            }
+            ScheduleAction::BandwidthSplit { usenet_pct } => {
+                let split = match usenet_pct.map(crate::bandwidth::BandwidthSplit::new) {
+                    None => None,
+                    Some(Ok(split)) => Some(split),
+                    Some(Err(error)) => {
+                        tracing::warn!(?usenet_pct, %error, "schedule: bandwidth split refused");
+                        return Ok(());
+                    }
+                };
+                self.state.queue.write_intent(|inner| {
+                    inner.globals.scheduled_split = split;
+                    Change::changed(())
+                });
+                tracing::info!(?usenet_pct, "schedule: set bandwidth split");
+                return Ok(());
+            }
+            ScheduleAction::SetQuotaMetering { enabled, target } => match target {
+                crate::bandwidth::QuotaTarget::AllEgresses => {
+                    if let Some(policy) = self.state.server_transfer_policy() {
+                        policy.set_egress_quota_metering(*enabled);
+                    }
+                    self.state.queue.write_intent(|_| {
+                        self.state
+                            .queue
+                            .counters
+                            .bandwidth
+                            .set_metering_enabled(*enabled);
+                        Change::changed(())
+                    });
+                }
+                crate::bandwidth::QuotaTarget::Egress(id) => {
+                    if let Some(policy) = self.state.server_transfer_policy() {
+                        policy.set_one_egress_quota_metering(*id, *enabled);
+                    }
+                }
+            },
+            _ => tracing::warn!(?action, "service schedule action reached download pipeline"),
+        }
+        Ok(())
+    }
+
+    // Record the operator's hardware profile for the next dispatch boundary;
+    // work already running keeps the limits it started with.
+    pub async fn set_hardware_profile(
+        &self,
+        profile: crate::runtime::HardwareProfile,
+    ) -> Result<(), SchedulerError> {
+        self.state.queue.write_intent(|inner| {
+            inner.globals.hardware_profile = Some(profile);
+            Change::changed(())
+        });
+        Ok(())
+    }
+
+    // Put the schedule's hardware profile in force, or with `None` return to
+    // the operator's choice (called by the schedule evaluator).
+    pub async fn set_scheduled_hardware_profile(
+        &self,
+        profile: Option<crate::runtime::HardwareProfile>,
+    ) -> Result<(), SchedulerError> {
+        self.state.queue.write_intent(|inner| {
+            inner.globals.scheduled_hardware_profile = profile;
+            Change::changed(())
+        });
+        Ok(())
+    }
+
+    pub fn set_server_transfer_policy(
+        &self,
+        registry: Arc<crate::servers::transfer_policy::ServerTransferPolicyRegistry>,
+    ) {
+        self.state.set_server_transfer_policy(registry);
+    }
+
+    pub fn server_transfer_policy(
+        &self,
+    ) -> Option<Arc<crate::servers::transfer_policy::ServerTransferPolicyRegistry>> {
+        self.state.server_transfer_policy()
+    }
+
+    // The speed test service while something holds it.
+    pub fn speed_test_service(&self) -> Option<Arc<dyn HeldSpeedTest>> {
+        self.state
+            .speed_test
+            .lock()
+            .expect("speed test slot")
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+    }
+
+    // The speed test service, created by `init` when none is held.
+    pub fn speed_test_service_or_init<S: HeldSpeedTest>(
+        &self,
+        init: impl FnOnce() -> Arc<S>,
+    ) -> Arc<S> {
+        let mut slot = self.state.speed_test.lock().expect("speed test slot");
+        if let Some(inner) = slot.as_ref().and_then(std::sync::Weak::upgrade) {
+            let inner: Arc<dyn std::any::Any + Send + Sync> = inner;
+            return inner.downcast::<S>().expect("the held speed test service");
+        }
+        let service = init();
+        *slot = Some(Arc::downgrade(&service) as std::sync::Weak<dyn HeldSpeedTest>);
+        service
+    }
+
+    pub fn set_proxy_runtime(&self, runtime: Arc<crate::proxies::ProxyRuntime>) {
+        // The classes answer the WireGuard tunnels' asks to give bytes back.
+        runtime
+            .network
+            .attach_classes(std::sync::Arc::new(self.state.classes().clone()));
+        *self.state.proxy_runtime.write().expect("proxy runtime") = Some(runtime);
+    }
+
+    pub fn proxy_runtime(&self) -> Option<Arc<crate::proxies::ProxyRuntime>> {
+        self.state.proxy_runtime()
+    }
+
+    pub fn set_nntp_pool(&self, pool: Arc<weaver_nntp::pool::NntpPool>) {
+        self.state.set_nntp_pool(pool);
+    }
+
+    pub fn nntp_pool(&self) -> Option<Arc<weaver_nntp::pool::NntpPool>> {
+        self.state.nntp_pool()
+    }
+
+    pub fn nntp_runtime_activation(&self) -> Option<NntpRuntimeActivation> {
+        self.state.nntp_runtime_activation()
+    }
+
+    // Replace the NNTP client at runtime (e.g. after server config changes).
+    pub async fn rebuild_nntp<T: Send + 'static>(
+        &self,
+        client: T,
+        total_connections: usize,
+    ) -> Result<NntpRuntimeActivation, SchedulerError> {
+        let client: Box<dyn std::any::Any + Send> = Box::new(client);
+        let client = client
+            .downcast::<weaver_nntp::client::NntpClient>()
+            .map_err(|_| {
+                SchedulerError::Internal(
+                    "invalid NNTP runtime client supplied for activation".into(),
+                )
+            })?;
+        // A rebuild the pipeline has not taken yet is superseded; its client
+        // leaves the lock with the write and is dropped after it.
+        let (activation, _superseded) = self.state.queue.write_intent(|inner| {
+            inner.globals.nntp_generation += 1;
+            let generation = inner.globals.nntp_generation;
+            let superseded = inner.nntp.replace((generation, *client, total_connections));
+            Change::changed((
+                NntpRuntimeActivation {
+                    generation,
+                    configured_connections: total_connections,
+                },
+                superseded,
+            ))
+        });
+        Ok(activation)
+    }
+
+    // Update disk tuning after the background startup measurement completes.
+    pub async fn update_random_read_iops(
+        &self,
+        random_read_iops: f64,
+    ) -> Result<(), SchedulerError> {
+        self.state.queue.write_intent(|inner| {
+            inner.globals.random_read_iops = Some(random_read_iops);
+            Change::changed(())
+        });
+        Ok(())
+    }
+
+    // Apply the working directory's storage class and filesystem, once
+    // known when start-up could not learn them in time.
+    pub fn update_storage_classification(
+        &self,
+        storage_class: weaver_server_base::runtime::system_profile::StorageClass,
+        filesystem: weaver_server_base::runtime::system_profile::FilesystemType,
+    ) {
+        self.state.queue.write_intent(|inner| {
+            inner.globals.storage_classification = Some((storage_class, filesystem));
+            Change::changed(())
+        });
+    }
+
+    // Update the pipeline's runtime directories for future jobs.
+    pub async fn update_runtime_paths(
+        &self,
+        data_dir: PathBuf,
+        intermediate_dir: PathBuf,
+        complete_dir: PathBuf,
+    ) -> Result<(), SchedulerError> {
+        tokio::fs::create_dir_all(&data_dir).await?;
+        tokio::fs::create_dir_all(&intermediate_dir).await?;
+        tokio::fs::create_dir_all(&complete_dir).await?;
+        self.state.queue.write_intent(|inner| {
+            inner.globals.runtime_paths = Some(crate::pipeline::queue::RuntimePaths {
+                data: data_dir,
+                intermediate: intermediate_dir,
+                complete: complete_dir,
+            });
+            Change::changed(())
+        });
+        Ok(())
+    }
+
+    // Subscribe to job-level pipeline events.
+    pub fn subscribe_events(&self) -> broadcast::Receiver<PipelineEvent> {
+        self.event_tx.subscribe()
+    }
+
+    // Subscribe to the per-article event stream, which the job-level
+    // broadcast does not carry.
+    pub fn subscribe_segment_events(&self) -> broadcast::Receiver<PipelineEvent> {
+        self.state.subscribe_segment_events()
+    }
+
+    // Signal shutdown.
+    pub async fn shutdown(&self) -> Result<(), SchedulerError> {
+        self.state.queue.write_intent(|inner| {
+            inner.globals.shutting_down = true;
+            Change::changed(())
+        });
+        self.state.shutdown_started.store(true, Ordering::Release);
+        // An e2e hook held until shutdown is released by the same signal
+        // the pipeline reads.
+        weaver_server_base::e2e_failpoint::release_shutdown_holds();
+        Ok(())
+    }
+
+    // What the diagnostics package can say about the pipeline when it does
+    // not answer: the queue's shared rows and the pipeline's turn stamp,
+    // read as of `now`. Nothing here waits on the pipeline.
+    pub fn pipeline_unanswered_state(
+        &self,
+        now: std::time::Instant,
+    ) -> (
+        crate::pipeline::diagnostics::QueueStateCounts,
+        weaver_server_base::operations::instrumentation::PipelineTurnReading,
+    ) {
+        let queue = self
+            .state
+            .queue
+            .read(crate::pipeline::diagnostics::QueueStateCounts::read);
+        (queue, self.state.metrics().pipeline_turn.read(now))
+    }
+
+    // The pipeline's turn stamp alone, as of `now`: atomic loads, no lock,
+    // so a sampler may read it as often as it likes.
+    pub fn pipeline_turn(
+        &self,
+        now: std::time::Instant,
+    ) -> weaver_server_base::operations::instrumentation::PipelineTurnReading {
+        self.state.metrics().pipeline_turn.read(now)
+    }
+}

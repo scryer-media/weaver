@@ -14,6 +14,7 @@
 // caches, the DNS client, and the tunnel engines' callbacks. A lookup made
 // in another task does not reach it; the paths a test dials make theirs in
 // the task that dials.
+use crate::dns::{DnsServer, Trust, WireKind};
 use std::{
     collections::HashMap,
     future::Future,
@@ -30,7 +31,7 @@ tokio::task_local! {
 }
 
 // Who resolved a name.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ResolvedBy {
     // The name is an address; nothing was asked.
     Literal,
@@ -54,6 +55,12 @@ pub enum LookupFailure {
     ServerFailure,
     // No server answered at all.
     NoReply,
+    // The answer failed DNSSEC validation.
+    Bogus,
+    // The server returns no DNSSEC records, so nothing can be validated.
+    DnssecUnavailable,
+    // The TLS handshake or certificate check with the server failed.
+    TlsFailed,
     Other,
 }
 
@@ -65,6 +72,9 @@ impl LookupFailure {
             Self::TimedOut => "TIMED_OUT",
             Self::ServerFailure => "SERVER_FAILURE",
             Self::NoReply => "NO_REPLY",
+            Self::Bogus => "BOGUS",
+            Self::DnssecUnavailable => "DNSSEC_UNAVAILABLE",
+            Self::TlsFailed => "TLS_FAILED",
             Self::Other => "OTHER",
         }
     }
@@ -77,6 +87,32 @@ pub struct LookupError {
     pub detail: String,
 }
 
+// How the answer from listed servers was judged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TrustOutcome {
+    // Taken as the server sent it.
+    AsSent,
+    // Weaver checked its DNSSEC signatures and they held.
+    Validated,
+    // The zone is not signed, so there was nothing to check.
+    Unsigned,
+    // Refused, as its DNSSEC signatures failed Weaver's check.
+    Bogus,
+}
+
+impl TrustOutcome {
+    pub const ALL: [Self; 4] = [Self::AsSent, Self::Validated, Self::Unsigned, Self::Bogus];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AsSent => "as_sent",
+            Self::Validated => "validated",
+            Self::Unsigned => "unsigned",
+            Self::Bogus => "bogus",
+        }
+    }
+}
+
 // How the name a dial ended at was resolved.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostResolution {
@@ -87,6 +123,16 @@ pub struct HostResolution {
     pub proxy: Option<u32>,
     // The DNS servers asked.
     pub servers: Vec<IpAddr>,
+    // The wire of the server that answered, or when that is not known the
+    // first listed server's. None when no servers were asked.
+    pub wire: Option<WireKind>,
+    // The listed server whose answer was used. None when no server
+    // answered, or none was asked. When every server said the name has no
+    // address, the first is named.
+    pub answered_by: Option<IpAddr>,
+    // How the servers' answer was judged. None when no servers were asked,
+    // or when no answer came to judge, whatever the naming's trust.
+    pub trust: Option<TrustOutcome>,
     // What the name resolved to; none when a proxy resolved it.
     pub addresses: Vec<IpAddr>,
     // Whether the answer was one Weaver held from an earlier lookup.
@@ -96,42 +142,54 @@ pub struct HostResolution {
     pub error: Option<LookupError>,
 }
 
+// The listed server an answer came from, and the wire it was asked over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Answerer {
+    pub(crate) address: IpAddr,
+    pub(crate) wire: WireKind,
+}
+
+impl Answerer {
+    pub(crate) fn of(server: &DnsServer) -> Self {
+        Self {
+            address: server.address.ip(),
+            wire: server.wire.kind(),
+        }
+    }
+}
+
 // Who a name is asked of.
 #[derive(Clone, Debug)]
 pub(crate) struct Asker {
     by: ResolvedBy,
     proxy: Option<u32>,
     servers: Vec<IpAddr>,
+    wire: Option<WireKind>,
+    // None when no servers are asked.
+    trust: Option<Trust>,
 }
 
 impl Asker {
-    pub(crate) fn host() -> Self {
+    fn asking(by: ResolvedBy, proxy: Option<u32>, servers: &[DnsServer], trust: Trust) -> Self {
         Self {
-            by: ResolvedBy::Host,
-            proxy: None,
-            servers: Vec::new(),
+            by,
+            proxy,
+            servers: servers.iter().map(|server| server.address.ip()).collect(),
+            wire: servers.first().map(|server| server.wire.kind()),
+            trust: servers.first().map(|_| trust),
         }
     }
-    pub(crate) fn servers(servers: &[IpAddr]) -> Self {
-        Self {
-            by: ResolvedBy::Servers,
-            proxy: None,
-            servers: servers.to_vec(),
-        }
+    pub(crate) fn host() -> Self {
+        Self::asking(ResolvedBy::Host, None, &[], Trust::AsSent)
+    }
+    pub(crate) fn servers(servers: &[DnsServer], trust: Trust) -> Self {
+        Self::asking(ResolvedBy::Servers, None, servers, trust)
     }
     pub(crate) fn proxy(proxy: u32) -> Self {
-        Self {
-            by: ResolvedBy::Proxy,
-            proxy: Some(proxy),
-            servers: Vec::new(),
-        }
+        Self::asking(ResolvedBy::Proxy, Some(proxy), &[], Trust::AsSent)
     }
-    pub(crate) fn proxy_servers(proxy: u32, servers: &[IpAddr]) -> Self {
-        Self {
-            by: ResolvedBy::ProxyServers,
-            proxy: Some(proxy),
-            servers: servers.to_vec(),
-        }
+    pub(crate) fn proxy_servers(proxy: u32, servers: &[DnsServer], trust: Trust) -> Self {
+        Self::asking(ResolvedBy::ProxyServers, Some(proxy), servers, trust)
     }
 }
 
@@ -143,6 +201,10 @@ struct Entry {
     cached: Option<bool>,
     answer: Option<Result<Vec<IpAddr>, LookupError>>,
     connected: Option<IpAddr>,
+    // The server whose answer was used.
+    from: Option<Answerer>,
+    // How the servers' answer was judged, by the lookup that asked them.
+    judged: Option<TrustOutcome>,
 }
 
 // A datagram socket a tunnel engine bound to reach its peer.
@@ -191,6 +253,8 @@ impl Recording {
                 entry.answer = note.answer;
             }
             entry.connected = entry.connected.or(note.connected);
+            entry.from = entry.from.or(note.from);
+            entry.judged = entry.judged.or(note.judged);
         }
         let taken = std::mem::take(&mut *other.bound.lock().expect("resolution recording"));
         self.bound
@@ -222,6 +286,9 @@ impl Recording {
                 by: ResolvedBy::Literal,
                 proxy: None,
                 servers: Vec::new(),
+                wire: None,
+                answered_by: None,
+                trust: None,
                 addresses: vec![ip],
                 cached: false,
                 connected,
@@ -255,6 +322,9 @@ impl Recording {
                 by: asker.by,
                 proxy: asker.proxy,
                 servers: asker.servers.clone(),
+                wire: entry.from.map(|from| from.wire).or(asker.wire),
+                answered_by: entry.from.map(|from| from.address),
+                trust: asker.trust.and(entry.judged),
                 addresses,
                 cached: entry.cached.unwrap_or(false),
                 connected,
@@ -274,6 +344,9 @@ impl Recording {
                 by: ResolvedBy::Host,
                 proxy: None,
                 servers: Vec::new(),
+                wire: None,
+                answered_by: None,
+                trust: None,
                 addresses: vec![bound.peer.ip()],
                 cached: false,
                 connected: Some(bound.peer.ip()),
@@ -286,6 +359,9 @@ impl Recording {
             by: ResolvedBy::Host,
             proxy: None,
             servers: Vec::new(),
+            wire: None,
+            answered_by: None,
+            trust: None,
             addresses: Vec::new(),
             cached: false,
             connected: None,
@@ -314,10 +390,9 @@ fn endpoint_failure(text: &str) -> Option<LookupError> {
 // The phrases each failure is said with: this machine's resolver on each
 // system, Weaver's own lookups, and the tunnel engines'. Matched without
 // regard to case, in this order.
-const NO_SUCH_NAME: [&str; 6] = [
+const NO_SUCH_NAME: [&str; 5] = [
     "not known",
     "no such host",
-    "does not know this name",
     "does not resolve",
     "nxdomain",
     "(os error 11001)",
@@ -388,6 +463,15 @@ pub(crate) fn cached(host: &str, held: bool) {
     });
 }
 
+// The servers asked for `host` came to an answer judged `trust`, from
+// `from` when a server answered.
+pub(crate) fn answered(host: &str, from: Option<Answerer>, trust: TrustOutcome) {
+    note(host, |entry| {
+        entry.from = entry.from.or(from);
+        entry.judged.get_or_insert(trust);
+    });
+}
+
 pub(crate) fn found(host: &str, addresses: &[IpAddr]) {
     note(host, |entry| {
         entry.answer.get_or_insert_with(|| Ok(addresses.to_vec()));
@@ -403,6 +487,25 @@ pub(crate) fn failed(host: &str, failure: LookupFailure, detail: impl FnOnce() -
             })
         });
     });
+}
+
+// What a WireGuard tunnel's own resolver says for every answer without an
+// address: the name does not exist, the server failed or refused, the name
+// has no address of the families asked, or no server replied in time.
+const TUNNEL_NO_ADDRESS: &str = "does not know this name";
+pub(crate) const TUNNEL_NO_ADDRESS_SAID: &str = "the tunnel's DNS servers gave no address; \
+     the tunnel does not say whether the name does not exist, a server failed, or none replied";
+
+// `host`'s lookup through a WireGuard tunnel's own resolver failed, saying
+// `detail`.
+pub(crate) fn tunnel_failed(host: &str, detail: &str) {
+    if detail.to_ascii_lowercase().contains(TUNNEL_NO_ADDRESS) {
+        failed(host, LookupFailure::Other, || {
+            TUNNEL_NO_ADDRESS_SAID.to_owned()
+        });
+    } else {
+        failed_saying(host, &detail);
+    }
 }
 
 // `host`'s lookup failed, saying `error`.

@@ -5,11 +5,15 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
+use weaver_server_core::history::queries::HistoryQueries;
+use weaver_server_core::history::timeline::HistoryTimelineQueries;
+use weaver_server_core::operations::async_ops::OperationsAsyncOpsQueries;
+#[cfg(test)]
+use weaver_server_core::tags::TagsQueries;
 
 use super::*;
-use crate::history::types::{history_delete_row_state_from_core, history_table_item_from_row};
+use crate::history::types::history_delete_row_state_from_core;
 use crate::jobs::types::load_duplicate_summaries_chunked;
-use weaver_server_core::HistoryRows;
 
 enum HistoryQueryPlan {
     Empty,
@@ -72,7 +76,7 @@ impl HistoryQuery {
                 ids.sort_unstable();
                 history_filter.item_ids_not_in = Some(ids);
             }
-            let rows = db.list_job_history(&history_filter, HistoryRows::Shown)?;
+            let rows = db.list_job_history(&history_filter)?;
             let delete_states = if want_delete_states {
                 load_history_delete_states(&db, rows.iter().map(|row| row.job_id))?
             } else {
@@ -172,7 +176,7 @@ impl HistoryQuery {
         // The count answers for the same rows the list returns, so the rows the
         // list excludes as still-live are taken off it too.
         let count = tokio::task::spawn_blocking(move || {
-            let counted = db.count_job_history(&history_filter, HistoryRows::Shown)?;
+            let counted = db.count_job_history(&history_filter)?;
             let live = count_live_rows_matching(&db, &history_filter, &live_jobs)?;
             Ok::<_, weaver_server_core::StateError>(counted.saturating_sub(live))
         })
@@ -445,6 +449,7 @@ struct HistoryPageFields {
     total_count: bool,
     counts: bool,
     category_counts: bool,
+    protocol_counts: bool,
     delete_operation: bool,
     duplicate_summary: bool,
 }
@@ -455,6 +460,7 @@ impl HistoryPageFields {
         total_count: true,
         counts: true,
         category_counts: true,
+        protocol_counts: true,
         delete_operation: true,
         duplicate_summary: true,
     };
@@ -466,6 +472,7 @@ impl HistoryPageFields {
             total_count: page.field("totalCount").exists(),
             counts: page.field("counts").exists(),
             category_counts: page.field("categoryCounts").exists(),
+            protocol_counts: page.field("protocolCounts").exists(),
             delete_operation: items.field("deleteOperation").exists(),
             duplicate_summary: items.field("duplicateSummary").exists(),
         }
@@ -496,6 +503,26 @@ async fn load_history_page(
     .await
     .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
     .map_err(|error| graphql_error("INTERNAL", error.to_string()))
+}
+
+// The page built in Rust over every history row, for a request the
+// SQL plan does not take. A tag filter is applied here from the tags in
+// memory, before the counts.
+#[cfg(test)]
+fn build_history_page_rust(
+    db: &Database,
+    live_in_history: &HashSet<u64>,
+    input: HistoryPageInput,
+) -> Result<HistoryPage, weaver_server_core::StateError> {
+    let mut rows = db.list_job_history(&weaver_server_core::HistoryFilter::default())?;
+    if let Some(tag) = input.tag.as_deref() {
+        let tags = db.tag_snapshot()?;
+        rows.retain(|row| tags.passes(weaver_server_core::jobs::ids::JobId(row.job_id), tag));
+    }
+    Ok(build_history_page(
+        exclude_live_rows(rows, live_in_history),
+        input,
+    ))
 }
 
 // Attach the per-row delete-operation and duplicate badges to a built page.
@@ -543,8 +570,15 @@ struct HistoryPageSqlPlan {
     // Text the full release name contains, ASCII letters folded.
     search: Option<String>,
     status: HistoryStatusFilter,
+    // The tag filter, if any: like the rows left out for being live, it
+    // narrows the counts as well as the page.
+    tag: Option<String>,
     categories: Option<Vec<String>>,
+    protocol: Option<weaver_server_core::Protocol>,
     order: weaver_server_core::HistoryOrder,
+    // A finish-time floor: rows completed at or after it, paused rows left
+    // out, as the Overview's finished count counts.
+    completed_since: Option<i64>,
     page_index: usize,
     page_size: usize,
 }
@@ -562,10 +596,13 @@ impl HistoryPageSqlPlan {
             // it.
             search: normalize_history_search(input.search.clone()),
             status: input.status.unwrap_or(HistoryStatusFilter::All),
+            tag: input.tag.clone(),
             // A category is the row's own column, compared exactly, with a row
             // that has none matching the empty string.
             categories: normalize_history_categories(input.categories.clone()),
+            protocol: input.protocol.map(Into::into),
             order: weaver_server_core::HistoryOrder { key, descending },
+            completed_since: input.completed_since_epoch_sec,
             page_index: input.page_index as usize,
             page_size: sanitize_page_size(input.page_size),
         }
@@ -623,9 +660,12 @@ fn build_history_page_sql(
     fields: HistoryPageFields,
 ) -> Result<HistoryPage, weaver_server_core::StateError> {
     // Every count and the page itself keep only the rows the search matches,
-    // and leave out rows of jobs still live.
+    // the tag filter passes and the finish-time floor keeps, and leave out
+    // rows of jobs still live.
     let searched = |mut filter: weaver_server_core::HistoryFilter| {
         filter.name_contains = plan.search.clone();
+        filter.tag = plan.tag.clone();
+        filter.completed_since = plan.completed_since;
         if !live_in_history.is_empty() {
             let mut ids: Vec<u64> = live_in_history.iter().copied().collect();
             ids.sort_unstable();
@@ -634,10 +674,19 @@ fn build_history_page_sql(
         filter
     };
     // The bucket counts, the total and the page keep only the selected
-    // categories.
-    let in_categories = |mut filter: weaver_server_core::HistoryFilter| {
+    // categories and class of job. Each facet is counted under the other, as
+    // the queue counts them.
+    let in_protocol = |mut filter: weaver_server_core::HistoryFilter| {
+        filter.protocol = plan.protocol;
+        searched(filter)
+    };
+    let in_categories_only = |mut filter: weaver_server_core::HistoryFilter| {
         filter.categories_any = plan.categories.clone();
         searched(filter)
+    };
+    let in_categories = |mut filter: weaver_server_core::HistoryFilter| {
+        filter.categories_any = plan.categories.clone();
+        in_protocol(filter)
     };
 
     // Counts are computed over the category-filtered set before the status
@@ -652,7 +701,7 @@ fn build_history_page_sql(
             HistoryStatusFilter::Success => success_history_filter(),
             HistoryStatusFilter::Failure => failure_history_filter(),
         };
-        db.count_job_history(&in_categories(filter), HistoryRows::Shown)
+        db.count_job_history(&in_categories(filter))
     };
     let counts = HistoryPageCounts {
         all: bucket(HistoryStatusFilter::All)?,
@@ -678,8 +727,7 @@ fn build_history_page_sql(
     // being selected.
     let mut category_counts: Vec<HistoryCategoryCount> = if fields.category_counts {
         db.count_job_history_by_category(
-            &searched(weaver_server_core::HistoryFilter::default()),
-            HistoryRows::Shown,
+            &in_protocol(weaver_server_core::HistoryFilter::default()),
         )?
         .into_iter()
         .map(|(category, count)| HistoryCategoryCount { category, count })
@@ -688,15 +736,28 @@ fn build_history_page_sql(
         Vec::new()
     };
     category_counts.sort_by(|left, right| left.category.cmp(&right.category));
+    let protocol_counts: Vec<HistoryProtocolCount> = if fields.protocol_counts {
+        db.count_job_history_by_protocol(&in_categories_only(
+            weaver_server_core::HistoryFilter::default(),
+        ))?
+        .into_iter()
+        .map(|(protocol, count)| HistoryProtocolCount {
+            protocol: protocol.into(),
+            count,
+        })
+        .collect()
+    } else {
+        Vec::new()
+    };
 
     items_filter.order = plan.order;
     items_filter.limit = Some(plan.page_size as u32);
     items_filter.offset =
         Some(u32::try_from(plan.page_index.saturating_mul(plan.page_size)).unwrap_or(u32::MAX));
-    let rows = db.list_job_history(&items_filter, HistoryRows::Shown)?;
+    let rows = db.list_job_history(&items_filter)?;
     let items = rows
         .into_iter()
-        .map(|row| history_table_item_from_row(&row, None))
+        .map(|row| history_item_from_row(&row, None))
         .collect();
 
     Ok(HistoryPage {
@@ -704,6 +765,7 @@ fn build_history_page_sql(
         total_count,
         counts,
         category_counts,
+        protocol_counts,
     })
 }
 
@@ -779,8 +841,7 @@ fn count_live_rows_matching(
         offset: None,
         ..filter.clone()
     };
-    // Taken off a count of shown rows, so it counts shown rows too.
-    db.count_job_history(&filter, HistoryRows::Shown)
+    db.count_job_history(&filter)
 }
 
 fn load_history_delete_states(
@@ -833,7 +894,11 @@ fn history_query_plan(
                 | QueueItemState::Repairing
                 | QueueItemState::Extracting
                 | QueueItemState::Finalizing
-                | QueueItemState::PostProcessing => {}
+                | QueueItemState::PostProcessing
+                | QueueItemState::FetchingMetadata
+                | QueueItemState::CheckingFiles
+                | QueueItemState::Seeding
+                | QueueItemState::Stalled => {}
             }
         }
         if statuses.is_empty() {
@@ -867,9 +932,18 @@ fn build_history_page(rows: Vec<JobHistoryRow>, input: HistoryPageInput) -> Hist
     let status = input.status.unwrap_or(HistoryStatusFilter::All);
     let sort_field = input.sort_field.unwrap_or(HistorySortField::CompletedAt);
     let sort_direction = input.sort_direction.unwrap_or(HistorySortDirection::Desc);
+    let completed_since = input.completed_since_epoch_sec;
+    let protocol = input.protocol;
     let matched_search: Vec<HistoryItem> = rows
         .into_iter()
-        .map(|row| history_table_item_from_row(&row, None))
+        // "Finished since" lists what the Overview's finished count counts: a
+        // paused row has not finished.
+        .filter(|row| {
+            completed_since.is_none_or(|since| {
+                row.completed_at >= since && !row.status.eq_ignore_ascii_case("paused")
+            })
+        })
+        .map(|row| history_item_from_row(&row, None))
         .filter(|item| {
             search
                 .as_deref()
@@ -877,12 +951,27 @@ fn build_history_page(rows: Vec<JobHistoryRow>, input: HistoryPageInput) -> Hist
         })
         .collect();
 
-    let category_counts =
-        count_history_categories(matched_search.iter().map(|item| item.category.as_deref()));
+    let in_protocol =
+        |item: &HistoryItem| protocol.is_none_or(|protocol| item.protocol == protocol);
+    let in_categories = |item: &HistoryItem| {
+        history_category_selected(item.category.as_deref(), categories.as_deref())
+    };
+    let category_counts = count_history_categories(
+        matched_search
+            .iter()
+            .filter(|item| in_protocol(item))
+            .map(|item| item.category.as_deref()),
+    );
+    let protocol_counts = count_history_protocols(
+        matched_search
+            .iter()
+            .filter(|item| in_categories(item))
+            .map(|item| item.protocol),
+    );
 
     let filtered_by_search: Vec<HistoryItem> = matched_search
         .into_iter()
-        .filter(|item| history_category_selected(item.category.as_deref(), categories.as_deref()))
+        .filter(|item| in_protocol(item) && in_categories(item))
         .collect();
 
     let counts = HistoryPageCounts {
@@ -916,7 +1005,28 @@ fn build_history_page(rows: Vec<JobHistoryRow>, input: HistoryPageInput) -> Hist
         total_count,
         counts,
         category_counts,
+        protocol_counts,
     }
+}
+
+// Tally the rows per class of job, in the classes' own order.
+#[cfg(test)]
+fn count_history_protocols(
+    protocols: impl Iterator<Item = crate::jobs::types::ProtocolGql>,
+) -> Vec<HistoryProtocolCount> {
+    let mut counts = [0u32; weaver_server_core::Protocol::COUNT];
+    for protocol in protocols {
+        counts[weaver_server_core::Protocol::from(protocol).index()] += 1;
+    }
+    weaver_server_core::Protocol::ALL
+        .iter()
+        .zip(counts)
+        .filter(|(_, count)| *count > 0)
+        .map(|(protocol, count)| HistoryProtocolCount {
+            protocol: (*protocol).into(),
+            count,
+        })
+        .collect()
 }
 
 // Tally the rows per category, ordered by category so the response does not
@@ -1083,6 +1193,10 @@ fn history_state_key(state: QueueItemState) -> &'static str {
         QueueItemState::Extracting => "extracting",
         QueueItemState::Finalizing => "finalizing",
         QueueItemState::PostProcessing => "post_processing",
+        QueueItemState::FetchingMetadata => "fetching_metadata",
+        QueueItemState::CheckingFiles => "checking_files",
+        QueueItemState::Seeding => "seeding",
+        QueueItemState::Stalled => "stalled",
     }
 }
 
@@ -1107,6 +1221,7 @@ pub(crate) fn job_info_from_history_row(row: &JobHistoryRow) -> JobInfo {
 
     JobInfo {
         job_id: JobId(row.job_id),
+        protocol: row.protocol,
         job_hash: row.job_hash.as_ref().and_then(|value| {
             (value.len() == 32).then(|| {
                 let mut hash = [0u8; 32];
@@ -1144,6 +1259,8 @@ pub(crate) fn job_info_from_history_row(row: &JobHistoryRow) -> JobInfo {
         error,
         download_wait_reason: None,
         download_retry_at_epoch_ms: None,
+        disk_need_bytes: None,
+        disk_free_bytes: None,
         created_at_epoch_ms: row.created_at as f64 * 1000.0,
         server_attribution:
             weaver_server_core::jobs::server_attribution::contributions_from_storage(
@@ -1156,9 +1273,13 @@ pub(crate) fn job_info_from_history_row(row: &JobHistoryRow) -> JobInfo {
 mod tests {
     use super::*;
     use weaver_server_core::JobHistoryRow;
+    use weaver_server_core::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
+    use weaver_server_core::history::queries::HistoryQueries;
+    use weaver_server_core::tags::TagsQueries;
 
     fn history_row(job_id: u64, status: &str, completed_at: i64) -> JobHistoryRow {
         JobHistoryRow {
+            protocol: weaver_server_core::Protocol::Nzb,
             job_id,
             job_hash: None,
             name: format!("Release.{job_id}.1080p.WEB"),
@@ -1210,19 +1331,16 @@ mod tests {
             search: None,
             status,
             categories: None,
+            tag: None,
+            protocol: None,
             sort_field: None,
             sort_direction: None,
+            completed_since_epoch_sec: None,
         }
     }
 
     fn rust_page(db: &Database, input: HistoryPageInput, live: &HashSet<u64>) -> HistoryPage {
-        let rows = db
-            .list_job_history(
-                &weaver_server_core::HistoryFilter::default(),
-                HistoryRows::Shown,
-            )
-            .unwrap();
-        build_history_page(exclude_live_rows(rows, live), input)
+        build_history_page_rust(db, live, input).unwrap()
     }
 
     fn assert_parity(db: &Database, input: HistoryPageInput) {
@@ -1252,12 +1370,45 @@ mod tests {
             sql.category_counts, rust.category_counts,
             "category counts mismatch"
         );
+        assert_eq!(
+            sql.protocol_counts, rust.protocol_counts,
+            "protocol counts mismatch"
+        );
         let sql_ids: Vec<u64> = sql.items.iter().map(|item| item.id).collect();
         let rust_ids: Vec<u64> = rust.items.iter().map(|item| item.id).collect();
         assert_eq!(sql_ids, rust_ids, "page item ids/order mismatch");
         // Items are produced by the same `history_item_from_row`, so equal ids in
         // equal order means byte-identical items for identical data.
         assert_eq!(sql.items, rust.items, "page items mismatch");
+    }
+
+    #[test]
+    fn a_finish_time_floor_keeps_only_rows_finished_since() {
+        let db = Database::open_in_memory().unwrap();
+        for row in [
+            history_row(1, "complete", 1_000),
+            history_row(2, "failed", 1_100),
+            history_row(3, "complete", 1_200),
+            history_row(4, "paused", 1_300),
+        ] {
+            db.insert_job_history(&row).unwrap();
+        }
+        let mut input = page_input(0, 25, None);
+        input.completed_since_epoch_sec = Some(1_100);
+        let sql = build_history_page_sql(
+            &db,
+            HistoryPageSqlPlan::for_input(&input),
+            &HashSet::new(),
+            HistoryPageFields::ALL,
+        )
+        .unwrap();
+        let page = rust_page(&db, input, &HashSet::new());
+        for page in [&page, &sql] {
+            let mut ids: Vec<u64> = page.items.iter().map(|item| item.id).collect();
+            ids.sort_unstable();
+            assert_eq!(ids, vec![2, 3]);
+            assert_eq!(page.counts.all, 2);
+        }
     }
 
     // The bug this guards: a facet list built from the rows a filtered page
@@ -1302,6 +1453,89 @@ mod tests {
                 },
             ]
         );
+    }
+
+    // The class of job filters the page and the category counts, and its own
+    // counts follow the category filter, as on the queue. The SQL path, with
+    // its index, gives what the reference path gives.
+    #[test]
+    fn protocol_filter_and_counts_match_the_reference_path() {
+        let db = Database::open_in_memory().unwrap();
+        let mut rows = [
+            history_row(1, "complete", 1_000),
+            history_row(2, "failed", 1_100),
+            history_row(3, "complete", 1_200),
+            history_row(4, "complete", 1_300),
+            history_row(5, "failed", 1_400),
+        ];
+        rows[1].protocol = weaver_server_core::Protocol::Torrent;
+        rows[3].protocol = weaver_server_core::Protocol::Torrent;
+        rows[0].category = Some("tv".to_string());
+        rows[1].category = Some("tv".to_string());
+        rows[3].category = Some("movie".to_string());
+        for row in &rows {
+            db.insert_job_history(row).unwrap();
+        }
+
+        let mut input = page_input(0, 25, None);
+        input.protocol = Some(crate::jobs::types::ProtocolGql::Torrent);
+        let plan = HistoryPageSqlPlan::for_input(&input);
+        let page =
+            build_history_page_sql(&db, plan, &HashSet::new(), HistoryPageFields::ALL).unwrap();
+        assert_eq!(
+            page.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![4, 2]
+        );
+        assert_eq!(page.total_count, 2);
+        assert_eq!(
+            page.protocol_counts,
+            vec![
+                HistoryProtocolCount {
+                    protocol: crate::jobs::types::ProtocolGql::Nzb,
+                    count: 3
+                },
+                HistoryProtocolCount {
+                    protocol: crate::jobs::types::ProtocolGql::Torrent,
+                    count: 2
+                },
+            ]
+        );
+        assert_eq!(
+            page.category_counts,
+            vec![
+                HistoryCategoryCount {
+                    category: "movie".to_string(),
+                    count: 1
+                },
+                HistoryCategoryCount {
+                    category: "tv".to_string(),
+                    count: 1
+                },
+            ]
+        );
+
+        for protocol in [
+            None,
+            Some(crate::jobs::types::ProtocolGql::Nzb),
+            Some(crate::jobs::types::ProtocolGql::Torrent),
+        ] {
+            for categories in [
+                None,
+                Some(vec!["tv".to_string()]),
+                Some(vec![String::new()]),
+            ] {
+                for status in [
+                    None,
+                    Some(HistoryStatusFilter::Success),
+                    Some(HistoryStatusFilter::Failure),
+                ] {
+                    let mut input = page_input(0, 25, status);
+                    input.protocol = protocol;
+                    input.categories = categories.clone();
+                    assert_parity(&db, input);
+                }
+            }
+        }
     }
 
     // A search is the one filter the counts do follow: it changes which rows
@@ -1363,6 +1597,7 @@ mod tests {
             total_count: false,
             counts: false,
             category_counts: false,
+            protocol_counts: false,
             delete_operation: false,
             duplicate_summary: false,
         };
@@ -1442,6 +1677,72 @@ mod tests {
         let page = build_history_page_sql(&db, plan, &live, HistoryPageFields::ALL).unwrap();
         assert_eq!(page.total_count, 5);
         assert!(page.items.iter().all(|item| !live.contains(&item.id)));
+    }
+
+    // A tag filter stays on the SQL path: the page, its total and every
+    // count are those of the jobs that carry the tag, and the empty tag keeps
+    // the jobs that carry none. Each matches the Rust path over the same rows.
+    #[test]
+    fn sql_path_filters_by_tag_and_matches_rust_path() {
+        use weaver_server_core::jobs::ids::JobId;
+        let db = Database::open_in_memory().unwrap();
+        seed(&db);
+        db.tag_new_job(JobId(1), ["tv"]).unwrap();
+        db.tag_new_job(JobId(3), ["tv", "hd"]).unwrap();
+        db.tag_new_job(JobId(4), ["hd"]).unwrap();
+        db.tag_new_job(JobId(6), ["tv"]).unwrap();
+        let tagged = |tag: &str, page_index, page_size, status| HistoryPageInput {
+            tag: Some(tag.to_string()),
+            ..page_input(page_index, page_size, status)
+        };
+        let live: HashSet<u64> = [3, 7].into_iter().collect();
+        for tag in ["tv", "", "hd", " tv ", "TV", "none"] {
+            for status in [
+                None,
+                Some(HistoryStatusFilter::Success),
+                Some(HistoryStatusFilter::Failure),
+            ] {
+                for (page_index, page_size) in [(0, 25), (0, 2), (1, 2), (3, 2)] {
+                    assert_parity(&db, tagged(tag, page_index, page_size, status));
+                    assert_parity_excluding(&db, tagged(tag, page_index, page_size, status), &live);
+                }
+            }
+        }
+
+        let page = |input: HistoryPageInput| {
+            build_history_page_sql(
+                &db,
+                HistoryPageSqlPlan::for_input(&input),
+                &HashSet::new(),
+                HistoryPageFields::ALL,
+            )
+            .unwrap()
+        };
+        let ids = |page: &HistoryPage| page.items.iter().map(|item| item.id).collect::<Vec<_>>();
+
+        let tv = page(tagged("tv", 0, 2, None));
+        assert_eq!(ids(&tv), [6, 3]);
+        assert_eq!(tv.total_count, 3);
+        assert_eq!(
+            (tv.counts.all, tv.counts.success, tv.counts.failure),
+            (3, 3, 0)
+        );
+        assert_eq!(ids(&page(tagged("tv", 1, 2, None))), [1]);
+
+        let untagged = page(tagged("", 0, 25, None));
+        assert_eq!(ids(&untagged), [7, 5, 2]);
+        assert_eq!(untagged.total_count, 3);
+        assert_eq!(
+            (
+                untagged.counts.all,
+                untagged.counts.success,
+                untagged.counts.failure
+            ),
+            (3, 0, 2)
+        );
+        let failed = page(tagged("", 0, 25, Some(HistoryStatusFilter::Failure)));
+        assert_eq!(ids(&failed), [7, 2]);
+        assert_eq!(failed.total_count, 2);
     }
 
     #[test]
@@ -1733,11 +2034,8 @@ mod tests {
         let mut matched = 0;
         for live in &lives {
             let rows = exclude_live_rows(
-                db.list_job_history(
-                    &weaver_server_core::HistoryFilter::default(),
-                    HistoryRows::Shown,
-                )
-                .unwrap(),
+                db.list_job_history(&weaver_server_core::HistoryFilter::default())
+                    .unwrap(),
                 live,
             );
             for search in searches {
@@ -1754,6 +2052,9 @@ mod tests {
                                         categories: categories.clone(),
                                         sort_field: Some(field),
                                         sort_direction: Some(direction),
+                                        tag: None,
+                                        protocol: None,
+                                        completed_since_epoch_sec: None,
                                     };
                                     let label = format!("{input:?} live={live:?}");
                                     let whole = build_history_page(rows.clone(), input.clone());
@@ -1832,10 +2133,7 @@ mod tests {
 
         // The list surfaces share the exclusion, so they agree with the page.
         let rows = db
-            .list_job_history(
-                &weaver_server_core::HistoryFilter::default(),
-                HistoryRows::Shown,
-            )
+            .list_job_history(&weaver_server_core::HistoryFilter::default())
             .unwrap();
         let list_ids: Vec<u64> = exclude_live_rows(rows, &live)
             .iter()
@@ -1847,7 +2145,7 @@ mod tests {
         let all = weaver_server_core::HistoryFilter::default();
         assert_eq!(count_live_rows_matching(&db, &all, &live).unwrap(), 1);
         assert_eq!(
-            db.count_job_history(&all, HistoryRows::Shown).unwrap()
+            db.count_job_history(&all).unwrap()
                 - count_live_rows_matching(&db, &all, &live).unwrap(),
             6
         );
@@ -1953,7 +2251,7 @@ mod tests {
                 panic!("an unfiltered plan reads");
             };
             filter.item_ids_not_in = Some(live_in_history.iter().copied().collect());
-            db.list_job_history(&filter, HistoryRows::Shown)
+            db.list_job_history(&filter)
                 .unwrap()
                 .into_iter()
                 .map(|row| row.job_id)

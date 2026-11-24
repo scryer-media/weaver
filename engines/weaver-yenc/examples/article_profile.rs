@@ -13,7 +13,7 @@
 //   cargo run --release --example article_profile -- kernels
 //
 // With `WEAVER_RAPIDYENC_SRC` set, a rapidyenc lane times the same article
-// driven the way sabctools drives rapidyenc, as a comparison point.
+// driven in chunks with its state carried, as a comparison point.
 
 use std::hint::black_box;
 use std::time::Instant;
@@ -259,9 +259,9 @@ fn per_stage() {
         let art = art.clone();
         let mut o = out.clone();
         stages.push((
-            "rapidyenc article (SAB shape)",
+            "rapidyenc article (chunked)",
             Box::new(move || {
-                black_box(rapidyenc_article(black_box(&art), &mut o, SAB_CHUNK));
+                black_box(rapidyenc_article(black_box(&art), &mut o, STREAM_CHUNK));
             }),
             vec![],
         ));
@@ -315,11 +315,11 @@ unsafe extern "C" {
     ) -> i32;
 }
 
-// Input bytes per decoder call in the SAB-shape lane.
+// Input bytes per decoder call in the chunked lane.
 #[cfg(rapidyenc_linked)]
-const SAB_CHUNK: usize = 64 * 1024;
+const STREAM_CHUNK: usize = 64 * 1024;
 
-// One article the way sabctools drives rapidyenc: header lines parsed one at
+// One article through rapidyenc in chunks: header lines parsed one at
 // a time by substring search until the body starts, the body decoded in
 // `chunk`-byte pieces by the end-detecting decoder, its state carried from
 // one call to the next, with the CRC folded per piece, then the `=yend` line
@@ -509,7 +509,7 @@ fn kernels() {
     }
 }
 
-// The `mt` lanes: weaver's `decode_nntp`, rapidyenc in the SAB shape, and
+// The `mt` lanes: weaver's `decode_nntp`, rapidyenc in chunks, and
 // rapidyenc fed the whole body in one call with the CRC after it.
 #[derive(Clone, Copy, PartialEq)]
 enum Lane {
@@ -535,7 +535,7 @@ fn multi_thread(threads: usize, iters: usize, lane: Lane) {
     {
         let mut out = vec![0u8; max_decoded_len(art.len())];
         let ours = decode_nntp(&art, &mut out).unwrap();
-        for chunk in [SAB_CHUNK, usize::MAX] {
+        for chunk in [STREAM_CHUNK, usize::MAX] {
             let (written, crc, expected) = rapidyenc_article(&art, &mut out, chunk);
             assert_eq!((written, crc), (ours.bytes_written, ours.part_crc));
             assert_eq!(crc, expected);
@@ -558,7 +558,7 @@ fn multi_thread(threads: usize, iters: usize, lane: Lane) {
                     #[cfg(rapidyenc_linked)]
                     if lane != Lane::Weaver {
                         let chunk = if lane == Lane::Rapidyenc {
-                            SAB_CHUNK
+                            STREAM_CHUNK
                         } else {
                             usize::MAX
                         };

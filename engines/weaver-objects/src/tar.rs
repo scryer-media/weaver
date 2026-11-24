@@ -102,6 +102,10 @@ pub struct Tar {
     reached: u64,
     lost: Lost,
     gone: bool,
+    // Moves whenever the walk changes what `locate` reads: the records, the
+    // cursor, what it waits on, the end and the length.
+    #[serde(skip)]
+    placed: crate::placed::Placed,
 }
 
 impl Durable for Tar {
@@ -148,6 +152,7 @@ impl Tar {
                     return self.wait(ByteRange::new(self.cursor, block.end), out);
                 }
                 Read::End(range) => {
+                    self.placed.moved();
                     self.ahead = None;
                     self.end = Some(End {
                         range,
@@ -164,6 +169,9 @@ impl Tar {
     fn wait(&mut self, range: ByteRange, out: &mut Vec<Emit>) {
         if self.lost.meets(range) {
             return self.give_up(Why::Unrepairable, out);
+        }
+        if self.ahead != Some(range) {
+            self.placed.moved();
         }
         self.ahead = Some(range);
         self.kept.want(range);
@@ -197,6 +205,7 @@ impl Tar {
         });
         self.cursor = end;
         self.ahead = None;
+        self.placed.moved();
     }
 
     fn announce(&mut self, entry: header::Entry, data: ByteRange, out: &mut Vec<Emit>) -> MemberId {
@@ -254,6 +263,7 @@ impl Tar {
             && self.crc_of(end.range) != end.crc
         {
             self.end = None;
+            self.placed.moved();
         }
     }
 
@@ -274,6 +284,7 @@ impl Tar {
         self.members.truncate(kept);
         self.end = None;
         self.ahead = None;
+        self.placed.moved();
     }
 
     // Data bytes to the members they belong to, as they arrive.
@@ -362,6 +373,11 @@ impl Object for Tar {
         Kind::Tar
     }
 
+    // Entries take their bytes as they arrive, until I refuse the stream.
+    fn passes_on(&self) -> bool {
+        !self.gone
+    }
+
     fn deliver(
         &mut self,
         delivery: Delivery<'_>,
@@ -416,7 +432,7 @@ impl Object for Tar {
     fn quiet(&mut self, standing: &dyn Standing, out: &mut Vec<Emit>) {
         if let Some(why) = crate::quiet::damaged(standing)
             .or_else(|| self.short())
-            .or_else(|| crate::quiet::unplaced(standing))
+            .or_else(|| crate::quiet::unplaced(standing, None))
         {
             self.give_up(why, out);
         }
@@ -435,6 +451,10 @@ impl Object for Tar {
         crate::said::unposted(&placements, &mut self.members, |out| {
             (&mut out.coverage, &mut out.closed)
         });
+    }
+
+    fn placement(&self) -> Option<u64> {
+        Some(self.placed.number())
     }
 
     fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
@@ -511,6 +531,7 @@ impl Object for Tar {
             return;
         }
         self.length = Some(length);
+        self.placed.moved();
         self.want_tail();
     }
 

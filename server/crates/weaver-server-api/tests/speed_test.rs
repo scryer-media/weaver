@@ -8,15 +8,26 @@ use std::sync::atomic::Ordering;
 use weaver_server_api::auth::{CallerIdentity, CallerScope};
 use weaver_server_core::proxies::ProxyRuntime;
 use weaver_server_core::speed_test::fixture::{
-    FixtureArticle, HttpFixture, NntpFixture, loopback_tls, nzb,
+    FixtureArticle, HttpFixture, NntpFixture, librespeed_list, loopback_tls, nzb,
 };
-use weaver_server_core::speed_test::{SpeedTestService, SpeedTestStatus};
+use weaver_server_core::speed_test::{HandClock, SpeedTestService, SpeedTestStatus};
 
 async fn harness() -> TestHarness {
     let h = TestHarness::new().await;
     h.handle.set_proxy_runtime(
         ProxyRuntime::new(h.db.clone(), tokio::runtime::Handle::current()).unwrap(),
     );
+    // Sessions that reach no host beyond the fixtures: no DHT bootstrap node
+    // and no port mapping.
+    {
+        let mut config = h.config.write().await;
+        config.torrent.dht_bootstrap_nodes = String::new();
+        config.torrent.upnp = false;
+    }
+    // A clock no one moves: no run ends on its maximum duration or a wait's
+    // time, only on what the test checks.
+    SpeedTestService::for_handle(&h.handle, h.config.clone(), h.db.clone(), true)
+        .run_clock_for_tests(HandClock::new().clock());
     h
 }
 
@@ -152,7 +163,14 @@ async fn providers_are_listed_with_their_hosts() {
         .collect();
     assert_eq!(
         ids,
-        ["cloudflare", "sabnzbd", "ovh", "hetzner", "librespeed"]
+        [
+            "cloudflare",
+            "sabnzbd",
+            "ovh",
+            "hetzner",
+            "librespeed",
+            "fast"
+        ]
     );
     let hosts: serde_json::Value = providers
         .as_array()
@@ -167,11 +185,13 @@ async fn providers_are_listed_with_their_hosts() {
             "sabnzbd.org",
             "proof.ovh.net",
             "nbg1-speed.hetzner.com",
-            null
+            null,
+            "fast.com"
         ])
     );
     assert_eq!(providers[4]["needsServer"], true);
     assert_eq!(providers[0]["needsServer"], false);
+    assert_eq!(providers[5]["needsServer"], false);
 }
 
 #[tokio::test]
@@ -224,11 +244,12 @@ async fn the_removed_size_stream_and_duration_fields_are_refused_by_the_schema()
 }
 
 #[tokio::test]
-async fn a_run_takes_exactly_one_of_bandwidth_and_usenet() {
+async fn a_run_takes_exactly_one_of_bandwidth_usenet_and_torrent() {
     let h = harness().await;
     for body in [
         "",
         r#"bandwidth:{customUrl:"https://127.0.0.1/blob"},usenet:{sabSize:MB_100}"#,
+        "usenet:{sabSize:MB_100},torrent:{}",
     ] {
         let response = h
             .execute(&format!(
@@ -239,7 +260,7 @@ async fn a_run_takes_exactly_one_of_bandwidth_and_usenet() {
         let (message, _) = refusal(&response);
         assert_eq!(
             message,
-            "a speed test takes exactly one of bandwidth and usenet"
+            "a speed test takes exactly one of bandwidth, usenet and torrent"
         );
     }
 }
@@ -553,6 +574,7 @@ fn egress_quota(h: &TestHarness, limit: u64) {
         .configure(
             StableServerId(0),
             ServerTransferConfig {
+                closed: false,
                 rate_bytes_per_sec: 0,
                 quota: Some(QuotaRuntimeConfig {
                     limit_bytes: limit,
@@ -700,7 +722,7 @@ async fn a_cancel_mid_run_ends_cancelled_with_the_bytes_moved_so_far() {
 #[tokio::test]
 async fn a_downed_rung_is_absent_from_every_connection_path() {
     let h = harness().await;
-    let response = h.execute(r#"mutation{saveProxyProfile(input:{name:"Gateway",kind:SOCKS5,resolver:PROXY,enabled:false,host:"127.0.0.1",port:1080}){id}}"#).await;
+    let response = h.execute(r#"mutation{saveProxyProfile(input:{name:"Gateway",kind:SOCKS5,enabled:false,host:"127.0.0.1",port:1080}){id}}"#).await;
     assert_no_errors(&response);
     let proxy = response_data(&response)["saveProxyProfile"]["id"]
         .as_u64()
@@ -744,4 +766,256 @@ async fn a_downed_rung_is_absent_from_every_connection_path() {
             .iter()
             .any(|n| n["kind"] == "proxy" && n["name"] == "Gateway")
     );
+}
+
+// Each GET of a provider of known size holds a 16 MiB slice of the quota
+// first, so a run ends once a little past one slice is used.
+const UPLOAD_RUN_QUOTA: u64 = 16 * 1024 * 1024 + 300_000;
+
+// Start a bandwidth run of `bandwidth`, an input naming its provider, on an
+// HTTPS fixture that serves `/blob`, and return the finished run's upload.
+async fn upload_run(
+    h: &TestHarness,
+    bandwidth: impl FnOnce(&HttpFixture) -> String,
+    shape: &str,
+) -> (serde_json::Value, serde_json::Value, HttpFixture) {
+    let (acceptor, cert_der, _) = loopback_tls();
+    let http = HttpFixture::start(String::new(), 200_000, Some(acceptor.clone())).await;
+    let list = HttpFixture::serve(
+        vec![("/servers.php", librespeed_list(&[("1", http.addr, None)]))],
+        0,
+        Some(acceptor),
+    )
+    .await;
+    let service = SpeedTestService::for_handle(&h.handle, h.config.clone(), h.db.clone(), true);
+    service.trust_roots_for_tests(vec![cert_der]);
+    service.server_list_url_for_tests(
+        format!("https://127.0.0.1:{}/servers.php", list.addr.port())
+            .parse()
+            .unwrap(),
+    );
+    service.measure_until_stopped_for_tests();
+    egress_quota(h, UPLOAD_RUN_QUOTA);
+
+    let response = h
+        .execute(&format!(
+            r#"mutation{{startSpeedTest(input:{{kind:RSS,id:1,route:{DIRECT},bandwidth:{}}}){{id request{{bandwidth{{providerId server customUrl uploadMib}}}}}}}}"#,
+            bandwidth(&http)
+        ))
+        .await;
+    assert_no_errors(&response);
+    let started = response_data(&response)["startSpeedTest"].clone();
+    let id = started["id"].as_u64().unwrap();
+    wait_until(h, id, |run| run.status != SpeedTestStatus::Running).await;
+    let response = h
+        .execute(&format!("{{speedTestRun(id:{id}){{{shape}}}}}"))
+        .await;
+    assert_no_errors(&response);
+    (
+        started,
+        response_data(&response)["speedTestRun"].clone(),
+        http,
+    )
+}
+
+#[tokio::test]
+async fn a_bandwidth_run_posts_to_its_provider_and_reports_the_upload() {
+    let h = harness().await;
+    let (started, done, http) = upload_run(
+        &h,
+        |_| r#"{providerId:"librespeed",server:"1",uploadMib:1}"#.into(),
+        "status result{upload{http{outcome provider url bytes elapsedMs bps failure{code}} peers{outcome}}}",
+    )
+    .await;
+
+    assert_eq!(
+        started["request"]["bandwidth"],
+        serde_json::json!({"providerId": "librespeed", "server": "1", "customUrl": null, "uploadMib": 1})
+    );
+    assert_eq!(done["status"], "COMPLETED", "{done}");
+    let posted = &done["result"]["upload"]["http"];
+    assert_eq!(posted["outcome"], "MEASURED", "{done}");
+    assert_eq!(posted["provider"], serde_json::Value::Null);
+    assert_eq!(
+        posted["url"],
+        format!("https://127.0.0.1:{}/upload", http.addr.port())
+    );
+    assert_eq!(posted["bytes"], 1_048_576.0);
+    assert!(posted["bps"].as_f64().unwrap() > 0.0, "{done}");
+    assert_eq!(posted["failure"], serde_json::Value::Null);
+    assert_eq!(done["result"]["upload"]["peers"], serde_json::Value::Null);
+    assert_eq!(*http.uploaded().borrow(), 1_048_576);
+}
+
+#[tokio::test]
+async fn a_provider_without_an_upload_path_reports_it_has_none() {
+    let h = harness().await;
+    let (_, done, http) = upload_run(
+        &h,
+        |http| {
+            format!(
+                r#"{{customUrl:"https://127.0.0.1:{}/blob"}}"#,
+                http.addr.port()
+            )
+        },
+        "status result{upload{http{outcome provider url bytes}}}",
+    )
+    .await;
+
+    assert_eq!(done["status"], "COMPLETED", "{done}");
+    assert_eq!(
+        done["result"]["upload"]["http"],
+        serde_json::json!({"outcome": "UNAVAILABLE", "provider": "127.0.0.1", "url": null, "bytes": 0.0})
+    );
+    assert_eq!(*http.uploaded().borrow(), 0);
+}
+
+#[tokio::test]
+async fn an_upload_must_send_at_least_one_mib() {
+    let h = harness().await;
+    let response = h
+        .execute(&format!(
+            r#"mutation{{startSpeedTest(input:{{kind:RSS,id:1,route:{DIRECT},bandwidth:{{customUrl:"https://127.0.0.1:1/blob",uploadMib:0}}}}){{id}}}}"#
+        ))
+        .await;
+    let (message, _) = refusal(&response);
+    assert_eq!(message, "an upload sends 1 to 134217728 bytes");
+}
+
+// A torrent route's Test via runs the test torrent over its path and
+// reports each rung.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_via_a_torrent_route_reports_the_test_torrent_rungs() {
+    use weaver_server_core::speed_test::torrent_fixture::{Answer, TorrentFixture};
+
+    let h = harness().await;
+    let fixture = TorrentFixture::start(true).await;
+    fixture.answer(Answer {
+        peers: vec![fixture.seeder()],
+        seeders: 1,
+        leechers: 0,
+        failure: None,
+        connect_in: true,
+    });
+    let request = common::local_request(format!(
+        "mutation{{testVia(route:{DIRECT},torrent:true){{success p2p{{rungs{{step outcome message}} mappedPort}}}}}}"
+    ))
+    .data(fixture.source.clone());
+    let response = h.schema.execute(request).await;
+    assert_no_errors(&response);
+    let tests = response_data(&response)["testVia"].clone();
+
+    assert_eq!(tests.as_array().unwrap().len(), 1, "{tests}");
+    assert_eq!(tests[0]["success"], true, "{tests}");
+    let p2p = &tests[0]["p2p"];
+    let steps: Vec<_> = p2p["rungs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|rung| (rung["step"].clone(), rung["outcome"].clone()))
+        .collect();
+    assert_eq!(
+        steps,
+        ["TORRENT", "ANNOUNCE", "HANDSHAKE", "PIECE", "INBOUND"]
+            .map(|step| (serde_json::json!(step), serde_json::json!("PASSED")))
+            .to_vec(),
+        "{p2p}"
+    );
+    assert_eq!(p2p["mappedPort"], serde_json::Value::Null);
+    fixture.stop().await;
+}
+
+// A torrent speed test on a torrent route pulls the test torrent from the
+// swarm and serves what it held to the peers that ask.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_torrent_run_pulls_and_serves_on_a_torrent_route() {
+    use weaver_server_core::speed_test::torrent_fixture::{
+        Answer, CONTENT_LEN, PIECE_LEN, TorrentFixture,
+    };
+
+    let h = harness().await;
+    let fixture = TorrentFixture::start(true).await;
+    fixture.answer(Answer {
+        peers: vec![fixture.seeder(), fixture.leecher()],
+        seeders: 1,
+        leechers: 1,
+        ..Answer::default()
+    });
+    let service = SpeedTestService::for_handle(&h.handle, h.config.clone(), h.db.clone(), true);
+    service.test_torrent_source_for_tests(fixture.source.clone());
+    service.peer_upload_budget_for_tests(u64::from(PIECE_LEN));
+    h.config.write().await.torrent.enabled = true;
+
+    let response = h
+        .execute(&format!(
+            "mutation{{startSpeedTest(input:{{kind:TORRENT_DEFAULT,id:0,route:{DIRECT},torrent:{{maxDurationSeconds:20}}}}){{id kind request{{torrent{{maxDurationSeconds}}}} tested{{legs{{target}}}}}}}}"
+        ))
+        .await;
+    assert_no_errors(&response);
+    let started = response_data(&response)["startSpeedTest"].clone();
+    assert_eq!(started["kind"], "TORRENT");
+    assert_eq!(
+        started["request"]["torrent"],
+        serde_json::json!({"maxDurationSeconds": 20})
+    );
+    assert_eq!(started["tested"]["legs"][0]["target"], 1);
+    let id = started["id"].as_u64().unwrap();
+    wait_until(&h, id, |run| run.status != SpeedTestStatus::Running).await;
+    let response = h
+        .execute(&format!(
+            "{{speedTestRun(id:{id}){{status result{{bytes legs{{bytes}} upload{{http{{outcome}} peers{{outcome bytes}}}}}}}}}}"
+        ))
+        .await;
+    assert_no_errors(&response);
+    let done = response_data(&response)["speedTestRun"].clone();
+
+    assert_eq!(done["status"], "COMPLETED", "{done}");
+    let result = &done["result"];
+    assert_eq!(result["bytes"], CONTENT_LEN as f64, "{done}");
+    assert_eq!(result["legs"][0]["bytes"], CONTENT_LEN as f64, "{done}");
+    assert_eq!(result["upload"]["http"], serde_json::Value::Null);
+    assert_eq!(
+        result["upload"]["peers"],
+        serde_json::json!({"outcome": "MEASURED", "bytes": f64::from(PIECE_LEN)})
+    );
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn a_torrent_run_on_a_feed_or_with_torrents_off_is_refused_by_code() {
+    let h = harness().await;
+    let response = h
+        .execute(&format!(
+            "mutation{{startSpeedTest(input:{{kind:RSS,id:1,route:{DIRECT},torrent:{{}}}}){{id}}}}"
+        ))
+        .await;
+    assert_eq!(
+        refusal(&response).1,
+        "SPEED_TEST_TORRENT_NEEDS_TORRENT_ROUTE"
+    );
+    let response = h
+        .execute(&format!(
+            "mutation{{startSpeedTest(input:{{kind:TORRENT_DEFAULT,id:0,route:{DIRECT},torrent:{{}}}}){{id}}}}"
+        ))
+        .await;
+    assert_eq!(refusal(&response).1, "SPEED_TEST_TORRENTS_OFF");
+}
+
+// A path test of a torrent on a server without torrents is refused as a
+// torrent speed test is, before anything is fetched: the source it would
+// read is never asked.
+#[tokio::test]
+async fn a_torrent_path_test_is_refused_on_a_server_without_torrents() {
+    use weaver_server_core::speed_test::torrent_fixture::TorrentFixture;
+    let h = harness().await;
+    let fixture = TorrentFixture::start(true).await;
+    let request = common::local_request(format!(
+        "mutation{{testVia(route:{DIRECT},torrent:true){{success}}}}"
+    ))
+    .data(fixture.source.clone())
+    .data(weaver_server_core::torrents::TorrentAvailability::UNAVAILABLE);
+    let response = h.schema.execute(request).await;
+    assert_eq!(refusal(&response).1, "SPEED_TEST_TORRENTS_OFF");
+    assert!(fixture.announces().borrow().is_empty());
+    fixture.stop().await;
 }

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use weaver_server_core::auth::repository::AuthRepositoryQueries;
+use weaver_server_core::history::queries::HistoryQueries;
 mod common;
 
 use async_graphql::Value;
@@ -10,6 +12,7 @@ use weaver_server_core::JobHistoryRow;
 
 fn sample_history_row(job_id: u64, name: &str) -> JobHistoryRow {
     JobHistoryRow {
+        protocol: weaver_server_core::Protocol::Nzb,
         job_id,
         job_hash: None,
         name: name.to_string(),
@@ -290,6 +293,11 @@ async fn change_password_correct() {
     assert_no_errors(&resp);
     let old_hash = h.db.get_auth_credentials().unwrap().unwrap().password_hash;
     let old_jwt_secret = h.auth_cache.snapshot().unwrap().jwt_secret;
+    // A login token and a browser's CSRF token issued before the change.
+    use weaver_server_core::auth::service as jwt;
+    let old_login = jwt::create_jwt("admin", &old_jwt_secret, 3_600);
+    let old_csrf = jwt::derive_browser_csrf_token("a-browser-session", &old_jwt_secret);
+    assert!(jwt::verify_jwt(&old_login, &old_jwt_secret).is_ok());
 
     // Change password.
     let resp = h
@@ -304,6 +312,20 @@ async fn change_password_correct() {
     let cached = h.auth_cache.snapshot().unwrap();
     assert_eq!(cached.password_hash, creds.password_hash);
     assert_ne!(cached.jwt_secret, old_jwt_secret);
+    // The key comes from the new hash, as a restart would derive it.
+    let derived = weaver_server_core::auth::SigningKeys::for_database(&h.db)
+        .unwrap()
+        .login_key(&creds.password_hash);
+    assert_eq!(cached.jwt_secret, derived);
+    // Neither token from before the change is taken after it.
+    assert!(matches!(
+        jwt::verify_jwt(&old_login, &cached.jwt_secret),
+        Err(jwt::JwtError::InvalidSignature)
+    ));
+    assert_ne!(
+        jwt::derive_browser_csrf_token("a-browser-session", &cached.jwt_secret),
+        old_csrf
+    );
 }
 
 #[tokio::test]

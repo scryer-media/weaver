@@ -66,6 +66,16 @@ input AnalyzeNzbInput {
 	nzbBase64: String
 }
 
+"""
+A torrent to analyze without adding it: a .torrent file, uploaded or
+as base64, or a magnet link. Exactly one source is required.
+"""
+input AnalyzeTorrentInput {
+	torrentUpload: Upload
+	torrentBase64: String
+	magnet: String
+}
+
 type ApiKey {
 	id: Int!
 	name: String!
@@ -367,6 +377,28 @@ enum BackupTrigger {
 	AUTO
 }
 
+"""
+Bytes per second in each direction; null is no limit.
+"""
+type Bandwidth {
+	downloadBps: Int
+	uploadBps: Int
+	"""
+	How the download limit is shared between usenet and torrents; null
+	is no split.
+	"""
+	split: BandwidthSplit
+}
+
+input BandwidthInput {
+	downloadBps: Int
+	uploadBps: Int
+	"""
+	Left out keeps the split; null clears it.
+	"""
+	split: BandwidthSplitInput
+}
+
 type BandwidthProvider {
 	id: String!
 	name: String!
@@ -388,16 +420,74 @@ type BandwidthResult {
 	connections: Int!
 }
 
+"""
+Usenet's percentage of the global download limit; torrents get the rest.
+"""
+type BandwidthSplit {
+	usenetPct: Int!
+}
+
+input BandwidthSplitInput {
+	usenetPct: Int!
+}
+
+"""
+The usenet/torrent split as it stands.
+"""
+type BandwidthSplitState {
+	"""
+	The operator's split.
+	"""
+	stored: BandwidthSplit
+	"""
+	The split in force: a scheduled one over the operator's.
+	"""
+	inForce: BandwidthSplit
+	"""
+	No global download limit is in force, so the split does nothing.
+	"""
+	needsDownloadLimit: Boolean!
+	"""
+	The download limit usenet is held to this tick; null is no limit.
+	"""
+	usenetBps: Int
+	"""
+	The download limit torrents are held to this tick; null is no limit.
+	"""
+	torrentBps: Int
+}
+
 input BandwidthTestInput {
 	providerId: String
 	server: String
 	customUrl: String
+	uploadMib: Int
 }
 
 type BandwidthTestRequest {
 	providerId: String
 	server: String
 	customUrl: String
+	uploadMib: Int
+}
+
+"""
+One setting at one level.
+"""
+type BpsLeaf {
+	state: LeafState!
+	"""
+	The value while `state` is `SET`.
+	"""
+	value: Int
+}
+
+"""
+One setting at one level; `value` is given with `SET` and only then.
+"""
+input BpsLeafInput {
+	state: LeafState!
+	value: Int
 }
 
 """
@@ -418,12 +508,26 @@ type Category {
 	name: String!
 	destDir: String
 	aliases: String!
+	seeding: SeedingPolicySettings
+	torrentRoute: Boolean!
+	unpack: Boolean
+	"""
+	The upload cap its torrents take in place of the global one.
+	"""
+	uploadCap: BpsLeaf!
 }
 
 input CategoryInput {
 	name: String!
 	destDir: String
 	aliases: String! = ""
+	seeding: SeedingPolicyInput
+	torrentRoute: Boolean
+	unpack: Boolean
+	"""
+	Left out keeps the category's cap.
+	"""
+	uploadCap: BpsLeafInput
 }
 
 type ConfiguredStorage {
@@ -431,6 +535,11 @@ type ConfiguredStorage {
 	path: String!
 	capacity: DiskCapacity
 	error: String
+	"""
+	The mount path or drive root the folder lies on, so folders on one
+	drive can be shown as one; null until the disk owner has read it.
+	"""
+	drive: String
 }
 
 type ConnectionResult {
@@ -545,6 +654,285 @@ type DiskUsage {
 	freeBytes: Int!
 }
 
+"""
+A destination disk a download is writing to or held by. Its figures move
+at most once a second, rounded as a screen shows them.
+"""
+type DiskVolume {
+	"""
+	The mount path or drive root, as the storage page shows it.
+	"""
+	label: String!
+	"""
+	Whether the disk cannot keep up with the downloads.
+	"""
+	slow: Boolean!
+	"""
+	What the disk takes, in bytes per second; 0 until measured.
+	"""
+	writeRateBytesPerSec: Int!
+	"""
+	Bytes in memory waiting for this disk's writer, from every download.
+	"""
+	waitingBytes: Int!
+}
+
+"""
+What one probe of a server came to.
+"""
+type DnsProbe {
+	supported: Boolean!
+	"""
+	How long the probe took.
+	"""
+	millis: Int!
+	"""
+	Why it failed, in the codes a lookup fails with.
+	"""
+	error: LookupError
+}
+
+"""
+Who answers the names a route on this profile dials, and how.
+"""
+type DnsProfile {
+	id: Int!
+	name: String!
+	"""
+	What the profile answers for. System is ROUTE, and proxies may
+	select it too.
+	"""
+	kind: DnsProfileKind!
+	"""
+	The built-in System profile, which cannot be changed or deleted.
+	"""
+	builtIn: Boolean!
+	who: DnsWho!
+	"""
+	WEAVER only.
+	"""
+	transit: DnsTransit
+	trust: DnsTrust!
+	"""
+	WEAVER only.
+	"""
+	serverListId: Int
+	"""
+	PROXY only: a leg or rung with no proxy is answered by the system
+	resolver when set, and fails its lookups when not.
+	"""
+	systemFallback: Boolean!
+	"""
+	How many routes select this profile. Routes never saved use System.
+	"""
+	usedByRoutes: Int!
+	"""
+	How many proxies find their own address with this profile.
+	"""
+	usedByProxies: Int!
+}
+
+input DnsProfileInput {
+	"""
+	Absent creates a profile.
+	"""
+	id: Int
+	name: String!
+	"""
+	Required on create. On update absent keeps the saved kind, and a
+	different one is refused (DNS_PROFILE_KIND_IMMUTABLE).
+	"""
+	kind: DnsProfileKind
+	who: DnsWho!
+	"""
+	WEAVER only; absent asks from the egress.
+	"""
+	transit: DnsTransit
+	trust: DnsTrust!
+	"""
+	WEAVER only.
+	"""
+	serverListId: Int
+	"""
+	PROXY only. Absent is false on create and keeps the saved value on
+	update.
+	"""
+	systemFallback: Boolean
+}
+
+"""
+What a profile answers for, set when it is created.
+"""
+enum DnsProfileKind {
+	"""
+	The names a route dials. Routes select it.
+	"""
+	ROUTE
+	"""
+	A proxy's own address. Proxies select it; it is answered by the
+	system or by listed servers asked from the egress.
+	"""
+	PROXY_NAME
+}
+
+"""
+One server of a list.
+"""
+type DnsServer {
+	wire: DnsWire!
+	"""
+	The server's IP, with its port when that is not the wire's own. For
+	HTTPS whose URL names a host, the IP dialled, with no port.
+	"""
+	address: String!
+	"""
+	TLS: the name its certificate is checked against.
+	"""
+	tlsName: String
+	"""
+	HTTPS: the URL queries are posted to.
+	"""
+	url: String
+}
+
+"""
+What one server of a test supports.
+"""
+type DnsServerCapability {
+	"""
+	The server's position in the test's `servers`, from 0.
+	"""
+	index: Int!
+	"""
+	The server's IP, with its port when that is not its wire's own.
+	"""
+	address: String!
+	"""
+	Plain DNS on port 53, or on the server's own port when it is listed
+	plain.
+	"""
+	plain: DnsProbe!
+	"""
+	DNS over TLS on port 853, or the server's own port and TLS name when
+	it is listed on TLS. Without a name the certificate is checked
+	against the address.
+	"""
+	tls: DnsProbe!
+	"""
+	DNS over HTTPS on port 443 at /dns-query, or the server's own URL
+	when it is listed on HTTPS.
+	"""
+	https: DnsProbe!
+	"""
+	The root's SOA, asked on the server's own wire and checked from the
+	built-in root anchors: the server returns what a DNSSEC check needs.
+	"""
+	dnssec: DnsProbe!
+}
+
+"""
+One server as a save or a test sends it.
+"""
+input DnsServerInput {
+	wire: DnsWire!
+	"""
+	PLAIN and TLS: the server's IP, with a port when it is not the
+	wire's own (`192.0.2.53:5353`, `[2001:db8::53]:853`). HTTPS: the IP
+	dialled when the URL names a host (`192.0.2.53`, `[2001:db8::53]`),
+	with no port, which the URL gives; unused when the URL's host is an
+	IP. The host name is never looked up.
+	"""
+	address: String! = ""
+	"""
+	TLS: the name the certificate is checked against; absent checks it
+	against the address.
+	"""
+	tlsName: String
+	"""
+	HTTPS: the URL queries are posted to, `https://` and an IP or a host
+	name. A host name is the name the certificate is checked against and
+	the request's host; the server is dialled at `address`.
+	"""
+	url: String
+}
+
+"""
+A saved list of servers, asked in order.
+"""
+type DnsServerList {
+	id: Int!
+	name: String!
+	servers: [DnsServer!]!
+	"""
+	The names of the profiles that use this list, in name order.
+	"""
+	usedByProfiles: [String!]!
+}
+
+input DnsServerListInput {
+	"""
+	Absent creates a list.
+	"""
+	id: Int
+	name: String!
+	servers: [DnsServerInput!]!
+}
+
+"""
+Where Weaver asks its listed servers from.
+"""
+enum DnsTransit {
+	"""
+	The leg's egress.
+	"""
+	EGRESS
+	"""
+	The last hop of the leg's active proxy. A leg with no proxy asks from
+	its egress.
+	"""
+	PROXY
+}
+
+"""
+How answers are judged.
+"""
+enum DnsTrust {
+	AS_SENT
+	"""
+	Weaver checks the DNSSEC signatures itself: an unsigned name
+	resolves, one that fails the check does not.
+	"""
+	VALIDATE
+}
+
+"""
+Who answers the names a route dials.
+"""
+enum DnsWho {
+	"""
+	The host's own resolver.
+	"""
+	SYSTEM
+	"""
+	The leg's active proxy: handed the name, or for WireGuard the
+	tunnel's own DNS servers asked through it.
+	"""
+	PROXY
+	"""
+	The profile's listed servers, asked by Weaver.
+	"""
+	WEAVER
+}
+
+"""
+How a query travels to one server.
+"""
+enum DnsWire {
+	PLAIN
+	TLS
+	HTTPS
+}
+
 type DownloadBlock {
 	kind: DownloadBlockKindGql!
 	"""
@@ -561,12 +949,13 @@ type DownloadBlock {
 	windowStartsAtEpochMs: Float
 	windowEndsAtEpochMs: Float
 	timezoneName: String!
-	scheduledSpeedLimit: Int!
+	scheduledSpeedLimit: Int
 	"""
-	Speed limit the downloads run under now: the schedule's while one
-	holds, even one set to unlimited, else the configured one. 0 is none.
+	Download limit the downloads run under now: the tighter of the
+	configured one and the schedule's. Absent is unlimited; zero lets
+	nothing through.
 	"""
-	speedLimitInForce: Int!
+	speedLimitInForce: Int
 	"""
 	Whether a schedule window sets the limit in force, even to unlimited.
 	"""
@@ -575,11 +964,24 @@ type DownloadBlock {
 	Why a schedule rule is holding new downloads, while one is.
 	"""
 	scheduleHoldReason: String
+	"""
+	Every destination disk a download is writing to or held by: whether it
+	is slow, what it takes and what waits for it. A disk is slow when its
+	write buffer held new articles back in most of the last 20 seconds.
+	Empty while no download waits on a disk.
+	"""
+	diskVolumes: [DiskVolume!]!
+	"""
+	When a timed pause lifts by itself, in epoch milliseconds. Absent for
+	a pause that waits to be resumed by hand.
+	"""
+	resumeAtEpochMs: Float
 }
 
 enum DownloadBlockKindGql {
 	NONE
 	MANUAL_PAUSE
+	SPEED_TEST
 	SCHEDULED
 	EGRESS_QUOTA
 	SERVER_QUOTA
@@ -652,23 +1054,6 @@ enum DownloadPressureStateGql {
 	CLEAR
 	SOFT
 	HARD
-}
-
-"""
-The live usage of a download allowance in its current window.
-"""
-type DownloadQuotaUsage {
-	lifetimeBytes: Int!
-	usedBytes: Int!
-	reservedBytes: Int!
-	"""
-	What is left in this window, or null when there is no allowance.
-	"""
-	remainingBytes: Int
-	blocked: Boolean!
-	windowStartsAtEpochMs: Float
-	windowEndsAtEpochMs: Float
-	timezoneName: String!
 }
 
 type DownloadRecovery {
@@ -814,16 +1199,13 @@ type EgressInterface {
 	sourceAddress: String
 	addresses: [String!]!
 	enabled: Boolean!
-	maxDownloadSpeed: Int!
+	downloadBps: Int
+	uploadBps: Int
+	quota: EgressQuota!
 	"""
-	The download allowance and its live usage.
+	Null while this Weaver is not tracking usage.
 	"""
-	downloadQuota: ServerDownloadQuota!
-	"""
-	The live usage of the download allowance, or null while this Weaver
-	is not tracking it.
-	"""
-	downloadQuotaUsage: DownloadQuotaUsage
+	quotaUsage: EgressQuotaUsageGql
 	health: String!
 	reason: String
 }
@@ -834,12 +1216,51 @@ input EgressInterfaceInput {
 	interfaceName: String
 	sourceAddress: String
 	enabled: Boolean! = true
-	maxDownloadSpeed: Int! = 0
 	"""
-	The download allowance on this egress. Omitted on an update, the
-	saved quota stays as it is; omitted on a create, there is none.
+	Bytes per second; null is no limit.
 	"""
-	downloadQuota: ServerDownloadQuotaInput
+	downloadBps: Int
+	"""
+	Bytes per second; null is no limit.
+	"""
+	uploadBps: Int
+}
+
+"""
+Caps per period; null is no cap, 0 a budget of nothing.
+"""
+type EgressQuota {
+	downloadBytes: Int
+	uploadSoftBytes: Int
+	uploadTrickleBps: Int!
+	uploadHardBytes: Int
+	period: ServerDownloadQuotaPeriodGql!
+	resetTimeMinutesLocal: Int!
+	weeklyResetWeekday: ServerDownloadQuotaWeekdayGql!
+	monthlyResetDay: Int!
+}
+
+input EgressQuotaInput {
+	downloadBytes: Int
+	uploadSoftBytes: Int
+	uploadTrickleBps: Int! = 2048
+	uploadHardBytes: Int
+	period: ServerDownloadQuotaPeriodGql! = ONE_TIME
+	resetTimeMinutesLocal: Int! = 0
+	weeklyResetWeekday: ServerDownloadQuotaWeekdayGql! = MON
+	monthlyResetDay: Int! = 1
+}
+
+type EgressQuotaUsageGql {
+	down: QuotaDirectionUsage!
+	up: QuotaDirectionUsage!
+	"""
+	The tighter of the two directions.
+	"""
+	state: QuotaStateGql!
+	periodStartEpochMs: Float
+	periodEndEpochMs: Float
+	timezoneName: String!
 }
 
 type EgressTestResult {
@@ -886,6 +1307,7 @@ enum EventKind {
 	EXTRACTION_COMPLETE
 	EXTRACTION_FAILED
 	ARCHIVE_DEMOTED
+	RECOVERY_SET_UNUSED
 	MOVE_TO_COMPLETE_STARTED
 	MOVE_TO_COMPLETE_FINISHED
 	SEGMENT_RETRY_SCHEDULED
@@ -935,6 +1357,21 @@ type ExtractionTimelineGroup {
 	members: [ExtractionMemberTimeline!]!
 }
 
+type FailureCount {
+	"""
+	`repair`, `password`, `disk_full`, `unpack`, `move`, `health` or
+	`duplicate`; empty when the job's row keeps no cause.
+	"""
+	cause: String!
+	count: Int!
+}
+
+type FinishedJobs {
+	complete: Int!
+	partial: Int!
+	failed: Int!
+}
+
 type FirstRunSetup {
 	"""
 	Whether the browser should walk the operator through first-run setup.
@@ -971,13 +1408,18 @@ type GeneralSettings {
 	forever.
 	"""
 	historyRetentionDays: Int!
-	maxDownloadSpeed: Int!
 	maxRetries: Int!
 	propagationDelaySecs: Int!
 	maxConcurrentNzbs: Int!
 	enableSrrdbLookup: Boolean!
 	watchFolder: WatchFolderSettings!
 	duplicatePolicy: DuplicatePolicySettings!
+	seeding: SeedingPolicySettings
+	"""
+	The global upload cap in bytes per second; absent is none.
+	"""
+	uploadCap: Int
+	torrent: TorrentSettings!
 }
 
 input GeneralSettingsInput {
@@ -989,18 +1431,28 @@ input GeneralSettingsInput {
 	Days a history entry is kept, from 0 (forever) to 36500.
 	"""
 	historyRetentionDays: Int
-	maxDownloadSpeed: Int
 	maxRetries: Int
 	propagationDelaySecs: Int
 	maxConcurrentNzbs: Int
 	enableSrrdbLookup: Boolean
 	watchFolder: WatchFolderSettingsInput
 	duplicatePolicy: DuplicatePolicySettingsInput
+	seeding: SeedingPolicyInput
+	"""
+	The global upload cap in bytes per second; null removes it.
+	"""
+	uploadCap: Int
+	torrent: TorrentSettingsInput
 }
 
 type GlobalQueueState {
 	isPaused: Boolean!
-	speedLimitBytesPerSec: Int!
+	"""
+	The classes of job the operator's or the schedule's pause of the
+	whole class holds.
+	"""
+	pausedClasses: [Protocol!]!
+	speedLimitBytesPerSec: Int
 	downloadBlock: DownloadBlock!
 	"""
 	When a timed pause resumes downloads on its own, in epoch milliseconds.
@@ -1021,6 +1473,25 @@ enum GlobalScriptsRun {
 	Only for a download whose category has no script jobs of its own.
 	"""
 	ONLY_WITHOUT_CATEGORY_SCRIPTS
+}
+
+"""
+One setting at one level.
+"""
+type GoalModeLeaf {
+	state: LeafState!
+	"""
+	The value while `state` is `SET`.
+	"""
+	value: SeedingGoalMode
+}
+
+"""
+One setting at one level; `value` is given with `SET` and only then.
+"""
+input GoalModeLeafInput {
+	state: LeafState!
+	value: SeedingGoalMode
 }
 
 """
@@ -1163,12 +1634,16 @@ enum HistoryDeleteRowStateKind {
 
 type HistoryItem {
 	id: Int!
+	protocol: Protocol!
 	jobHash: String
 	name: String!
 	displayTitle: String!
 	originalTitle: String!
-	parsedRelease: ParsedRelease!
 	state: QueueItemState!
+	"""
+	How the job ended, a partial delivery as its own value.
+	"""
+	outcome: JobOutcome
 	error: String
 	progressPercent: Float!
 	totalBytes: Int!
@@ -1179,7 +1654,6 @@ type HistoryItem {
 	health: Int!
 	hasPassword: Boolean!
 	category: String
-	attributes: [Attribute!]!
 	clientRequestId: String
 	outputDir: String
 	createdAt: DateTime!
@@ -1192,6 +1666,15 @@ type HistoryItem {
 	Null while it is not archived.
 	"""
 	archivedAt: DateTime
+	"""
+	The job's attributes. An RSS job's item link and id are among them
+	for an admin only.
+	"""
+	attributes: [Attribute!]!
+	"""
+	The job's tags, in tag order.
+	"""
+	tags: [String!]!
 	"""
 	The files Weaver gave a name other than their full one, each with its
 	full name. Empty when every file carries its full name.
@@ -1232,6 +1715,12 @@ type HistoryPage {
 	other categories vanish the moment one was picked.
 	"""
 	categoryCounts: [HistoryCategoryCount!]!
+	"""
+	Every class of job present in history, with its row count: counted
+	under the search and the category filter, before the class and status
+	filters, as the categories are counted under the class.
+	"""
+	protocolCounts: [HistoryProtocolCount!]!
 }
 
 type HistoryPageCounts {
@@ -1255,8 +1744,29 @@ input HistoryPageInput {
 	without a second field.
 	"""
 	categories: [String!]
+	"""
+	Keep only rows whose job carries this tag; the empty string keeps rows
+	whose job carries none.
+	"""
+	tag: String
+	"""
+	Keep only rows of jobs of this class; absent keeps both.
+	"""
+	protocol: Protocol
 	sortField: HistorySortField
 	sortDirection: HistorySortDirection
+	"""
+	Keep only rows that finished at or after this epoch second.
+	"""
+	completedSinceEpochSec: Int
+}
+
+"""
+How many history rows one class of job holds.
+"""
+type HistoryProtocolCount {
+	protocol: Protocol!
+	count: Int!
 }
 
 enum HistorySortDirection {
@@ -1284,6 +1794,9 @@ type HostResolution {
 	resolvedBy: ResolvedBy!
 	proxyId: Int
 	dnsServers: [String!]!
+	wire: DnsWire
+	answeredBy: String
+	trust: LookupTrust
 	addresses: [String!]!
 	cached: Boolean!
 	connectedAddress: String
@@ -1347,6 +1860,45 @@ type HttpBindAddressStatus {
 	bindFallback: String
 }
 
+type HttpUploadResult {
+	outcome: UploadOutcome!
+	provider: String
+	url: String
+	bytes: Float!
+	elapsedMs: Int!
+	bps: Float!
+	failure: SpeedTestFailure
+}
+
+type IntegrityHistory {
+	"""
+	This host's local date, `YYYY-MM-DD`.
+	"""
+	today: String!
+	rangeStart: String!
+	rangeEnd: String!
+	"""
+	NZB jobs finished, counted in `events`, under the id `finished`.
+	"""
+	finished: UsageConsumer!
+	"""
+	Of those, the ones a repair was applied to, under the id `repaired`.
+	"""
+	repaired: UsageConsumer!
+	"""
+	Each job stage timed: its runs in `events`, its time in `durationMs`.
+	"""
+	stages: [UsageConsumer!]!
+	"""
+	From the history rows of the NZB jobs that finished in the range.
+	"""
+	recovery: RecoveryTotals!
+	"""
+	From the history rows of the NZB jobs that failed in the range.
+	"""
+	failures: [FailureCount!]!
+}
+
 """
 A scalar that can represent any JSON value.
 """
@@ -1357,8 +1909,12 @@ type Job {
 	name: String!
 	displayTitle: String!
 	originalTitle: String!
-	parsedRelease: ParsedRelease!
 	status: JobStatusGql!
+	"""
+	How the job ended, a partial delivery as its own value; null while
+	it has not ended.
+	"""
+	outcome: JobOutcome
 	error: String
 	progress: Float!
 	totalBytes: Int!
@@ -1369,9 +1925,17 @@ type Job {
 	health: Int!
 	hasPassword: Boolean!
 	category: String
-	metadata: [MetadataEntry!]!
 	outputDir: String
 	createdAt: Float
+	"""
+	The job's metadata. An RSS job's item link and id are in it for an
+	admin only.
+	"""
+	metadata: [MetadataEntry!]!
+	"""
+	The job's tags, in tag order.
+	"""
+	tags: [String!]!
 }
 
 type JobDetailSnapshot {
@@ -1425,6 +1989,18 @@ type JobEvent {
 	Pass as `jobEvents(before:)` to read the events older than this one.
 	"""
 	cursor: String
+}
+
+"""
+How a finished job ended. `state` and `status` show a job that delivered
+in part as failed, for the clients that do not model it; a client that
+does selects `outcome`, where it is `PARTIAL`. Null while the job has not
+ended.
+"""
+enum JobOutcome {
+	COMPLETE
+	PARTIAL
+	FAILED
 }
 
 type JobOutputFile {
@@ -1497,6 +2073,18 @@ enum JobStatusGql {
 	COMPLETE
 	FAILED
 	PAUSED
+	FETCHING_METADATA
+	CHECKING_FILES
+	SEEDING
+	STALLED
+}
+
+"""
+A tag, with how many jobs carry it, queued or in history.
+"""
+type JobTag {
+	name: String!
+	count: Int!
 }
 
 type JobTimeline {
@@ -1558,6 +2146,24 @@ type KernelSelectionInfo {
 	alone would have picked, when one did.
 	"""
 	pinnedBy: String
+}
+
+"""
+How a level holds one setting.
+"""
+enum LeafState {
+	"""
+	Taken from the level above.
+	"""
+	INHERIT
+	"""
+	Switched off here: no goal, no cap.
+	"""
+	OFF
+	"""
+	Set here, to `value`.
+	"""
+	SET
 }
 
 type LegConnectionTest {
@@ -1663,7 +2269,17 @@ enum LookupErrorCode {
 	TIMED_OUT
 	SERVER_FAILURE
 	NO_REPLY
+	BOGUS
+	DNSSEC_UNAVAILABLE
+	TLS_FAILED
 	OTHER
+}
+
+enum LookupTrust {
+	AS_SENT
+	VALIDATED
+	UNSIGNED
+	BOGUS
 }
 
 type MetadataEntry {
@@ -1832,19 +2448,69 @@ type MetricsHistoryResult {
 	series: [MetricSeries!]!
 }
 
+"""
+One setting at one level.
+"""
+type MinutesLeaf {
+	state: LeafState!
+	"""
+	The value while `state` is `SET`.
+	"""
+	value: Int
+}
+
+"""
+One setting at one level; `value` is given with `SET` and only then.
+"""
+input MinutesLeafInput {
+	state: LeafState!
+	value: Int
+}
+
 type MutationRoot {
+	"""
+	Save a server list: a new one without an id. Every route using it
+	takes the change; no connection is dropped and saved answers are
+	forgotten.
+	"""
+	saveDnsServerList(input: DnsServerListInput!): DnsServerList!
+	"""
+	Delete a server list, refused while a profile uses it.
+	"""
+	deleteDnsServerList(id: Int!): Boolean!
+	"""
+	Save a profile: a new one without an id. Every route using it takes
+	the change; no connection is dropped and saved answers are
+	forgotten.
+	"""
+	saveDnsProfile(input: DnsProfileInput!): DnsProfile!
+	"""
+	Delete a profile, refused for System and while a route or a proxy
+	uses it.
+	"""
+	deleteDnsProfile(id: Int!): Boolean!
+	"""
+	What each server supports, probed through the drafted `route` from
+	where its DNS profile would ask listed servers: the first path's
+	egress, or its proxies when the profile asks through the proxy. One
+	to ten servers, each well formed; nothing is saved. Every probe runs
+	in a runtime of the test's own, with nothing a route holds.
+	"""
+	testDnsServers(route: RouteInput!, servers: [DnsServerInput!]!): [DnsServerCapability!]!
 	"""
 	Reset an egress quota baseline without clearing lifetime usage.
 	"""
 	resetEgressDownloadQuotaUsage(id: Int!): EgressInterface!
 	createEgressInterface(input: EgressInterfaceInput!): EgressInterface!
 	updateEgressInterface(id: Int!, input: EgressInterfaceInput!): EgressInterface!
+	setEgressQuota(id: Int!, input: EgressQuotaInput!): EgressInterface!
+	setBandwidth(input: BandwidthInput!): Bandwidth!
 	deleteEgressInterface(id: Int!): Boolean!
 	createProxyPool(input: ProxyPoolInput!): ProxyPool!
 	updateProxyPool(id: Int!, input: ProxyPoolInput!): ProxyPool!
 	deleteProxyPool(id: Int!): Boolean!
 	saveNetworkRoute(kind: NetworkConsumerKind!, id: Int!, input: RouteInput!): NetworkRoute!
-	testVia(route: RouteInput!, subject: TestSubjectInput, target: TestTargetInput): [PathTestResult!]!
+	testVia(route: RouteInput!, subject: TestSubjectInput, target: TestTargetInput, torrent: Boolean! = false): [PathTestResult!]!
 	testEgressInterface(id: Int!, proxyId: Int, host: String!, port: Int!): EgressTestResult! @deprecated(reason: "Use testVia with a direct route on the egress.")
 	testProxyPool(id: Int!, egressId: Int!, host: String, port: Int): [EgressTestResult!]! @deprecated(reason: "Use testVia with a direct route on the egress.")
 	saveProxyProfile(id: Int, input: ProxyProfileInput!): ProxyProfile!
@@ -1959,6 +2625,29 @@ type MutationRoot {
 	Test connectivity to an NNTP server without saving it.
 	"""
 	testConnection(input: ServerInput!): TestConnectionResult!
+	"""
+	Make tags no job carries yet. Answers every tag.
+	"""
+	createTags(tags: [String!]!): [JobTag!]!
+	"""
+	Delete tags, taking them off every job. Answers every tag left.
+	"""
+	deleteTags(tags: [String!]!): [JobTag!]!
+	"""
+	Put tags on jobs, queued or in history, making any tag not made yet.
+	An id of no job is passed over. Answers every tag.
+	"""
+	addJobTags(ids: [Int!]!, tags: [String!]!): [JobTag!]!
+	"""
+	Take tags off jobs; with no tags, take every tag off them. The tags
+	stay made. Answers every tag.
+	"""
+	removeJobTags(ids: [Int!]!, tags: [String!]! = []): [JobTag!]!
+	"""
+	Give jobs exactly these tags, making any not made yet. Answers every
+	tag.
+	"""
+	setJobTags(ids: [Int!]!, tags: [String!]!): [JobTag!]!
 	updateBackupSettings(customBackupPath: String): BackupSettings!
 	updateAutoBackupSettings(input: AutoBackupSettingsInput!): AutoBackupSettings!
 	deleteBackup(filename: String!): Boolean!
@@ -1982,9 +2671,20 @@ type MutationRoot {
 	"""
 	analyzeNzb(input: AnalyzeNzbInput!): SupportReport!
 	"""
+	Analyze a torrent without adding it: a .torrent file or a magnet
+	link. Reads nothing and changes nothing, as `analyzeNzb`.
+	"""
+	analyzeTorrent(input: AnalyzeTorrentInput!): SupportReport!
+	"""
 	Submit an NZB for download through the public integration facade.
 	"""
 	submitNzb(input: SubmitNzbInput!): SubmissionResult!
+	"""
+	Add an NZB or a torrent, told apart by what it holds. Text is an NZB
+	or torrent URL, a magnet link or an infohash; an upload is an NZB,
+	torrent or magnet file.
+	"""
+	submit(input: SubmitInput!): SubmissionResult!
 	stageNzbUpload(input: StageNzbUploadInput!): StagedNzbUploadResult!
 	submitStagedNzbs(input: SubmitStagedNzbsInput!): SubmitStagedNzbsResult!
 	discardStagedNzbs(ids: [String!]!): Boolean!
@@ -2096,6 +2796,16 @@ type MutationRoot {
 	"""
 	reorderQueueItem(id: Int!, kind: QueueMoveKind!, offset: Int): Boolean!
 	"""
+	Pause every job of a class, as one hold, its jobs' own pauses and
+	resumes standing under it. A class with no hold of its own is
+	refused.
+	"""
+	pauseClass(class: Protocol!): Boolean!
+	"""
+	Lift the operator's pause of every job of a class.
+	"""
+	resumeClass(class: Protocol!): Boolean!
+	"""
 	Pause all download dispatch globally. With `resumeAfterSecs`, downloads
 	resume on their own after that many seconds (1 to 30 days).
 	"""
@@ -2107,7 +2817,7 @@ type MutationRoot {
 	"""
 	Set the global download speed limit in bytes/sec. 0 means unlimited.
 	"""
-	setSpeedLimit(bytesPerSec: Int!): Boolean!
+	setSpeedLimit(bytesPerSec: Int!): Boolean! @deprecated(reason: "Use setBandwidth.")
 	"""
 	Pause one queue item and return its updated facade state.
 	"""
@@ -2143,13 +2853,18 @@ type MutationRoot {
 	"""
 	Set the queue speed limit in bytes/sec. 0 means unlimited.
 	"""
-	setQueueSpeedLimit(bytesPerSec: Int!): QueueCommandResult!
+	setQueueSpeedLimit(bytesPerSec: Int!): QueueCommandResult! @deprecated(reason: "Use setBandwidth.")
 	setPostProcessingSettings(input: PostProcessingSettingsInput!): PostProcessingSettingsGql!
 	"""
 	Replace the unwanted extension list and nothing else. An empty list
 	turns the check off. Returns the list as saved, normalized.
 	"""
 	setUnacceptableExtensions(extensions: [String!]!): [String!]!
+	"""
+	Choose what a download holding a file with an unwanted extension
+	comes to, and nothing else. Returns the choice as saved.
+	"""
+	setUnwantedExtensionAction(action: UnwantedExtensionAction!): UnwantedExtensionAction!
 	"""
 	Select the sole live source of scripts. Changing it turns every
 	script job off, because a name in the new directory is not the script
@@ -2265,6 +2980,30 @@ type MutationRoot {
 	updateSchedule(id: String!, input: ScheduleInput!): [Schedule!]!
 	deleteSchedule(id: String!): [Schedule!]!
 	toggleSchedule(id: String!, enabled: Boolean!): [Schedule!]!
+	"""
+	Add a tracker rule, or replace the one `id` names. Every torrent's
+	trackers are matched against the rules again.
+	"""
+	saveTrackerRule(id: Int, input: TrackerRuleInput!): [TrackerRule!]!
+	"""
+	Delete a tracker rule. The torrents it matched follow the rule their
+	trackers match next, or none.
+	"""
+	deleteTrackerRule(id: Int!): [TrackerRule!]!
+	"""
+	What importing a tracker file, base64, would do. Nothing is kept.
+	"""
+	previewTrackerFile(file: String!, password: String): TrackerFilePreview!
+	"""
+	Import a tracker file, base64, as its preview showed it, and return
+	every rule. A file or rule changed since the preview is refused.
+	"""
+	applyTrackerFile(file: String!, password: String, fingerprint: String!): [TrackerRule!]!
+	"""
+	Release a rule from the tracker file that filled it, keeping every
+	value it holds, and return every rule.
+	"""
+	unbindTrackerRule(id: Int!): [TrackerRule!]!
 	createDirectory(path: String!, name: String!): DirectoryBrowseResult!
 	"""
 	Check for a new release now instead of waiting for the next scheduled
@@ -2286,6 +3025,62 @@ type MutationRoot {
 	"""
 	setLogFilter(directives: String!): LogFilter!
 	startApplicationUpgrade(input: StartApplicationUpgradeInput!): ApplicationUpgradeStartPayload!
+	submitTorrent(input: SubmitTorrentInput!): Torrent!
+	removeTorrent(id: Int!, deleteFiles: Boolean! = false): Boolean!
+	pauseTorrent(id: Int!): Boolean!
+	resumeTorrent(id: Int!): Boolean!
+	setTorrentForced(id: Int!, forced: Boolean!): Boolean!
+	"""
+	Move the torrent's directory under `path`; it goes on from there.
+	A key that only controls may name only a path under the default
+	save folder or a category's folder.
+	"""
+	setTorrentLocation(id: Int!, path: String!): Boolean!
+	"""
+	Set each named file's level; the others keep theirs.
+	"""
+	setTorrentFilePriorities(id: Int!, priorities: [TorrentFilePriorityInput!]!): Boolean!
+	"""
+	Check every piece of the torrent again, trusting nothing saved.
+	"""
+	recheckTorrent(id: Int!): Boolean!
+	setTorrentSequential(id: Int!, sequential: Boolean!): Boolean!
+	setTorrentFirstLastPieceFirst(id: Int!, firstLastPieceFirst: Boolean!): Boolean!
+	setTorrentCategory(id: Int!, category: String): Boolean!
+	"""
+	Ban a peer's address from the torrent: an IP, or an IP and port
+	whose port is ignored.
+	"""
+	banTorrentPeer(id: Int!, address: String!): Boolean!
+	"""
+	The torrent's own upload and download limits in bytes per second,
+	in force on its peers at once; null is unlimited and 0 closes that
+	direction. A limit left out is kept.
+	"""
+	setTorrentRateLimits(id: Int!, upload: Int, download: Int): Boolean!
+	"""
+	Add `urls` as one tier after the torrent's last; the ones it lists
+	already are left out.
+	"""
+	addTorrentTrackers(id: Int!, urls: [String!]!): Boolean!
+	"""
+	List `trackers` in place of the torrent's own.
+	"""
+	replaceTorrentTrackers(id: Int!, trackers: [TorrentTrackerInput!]!): Boolean!
+	removeTorrentTrackers(id: Int!, urls: [String!]!): Boolean!
+	"""
+	Announce now, to every tracker or to `tracker` alone.
+	"""
+	reannounceTorrent(id: Int!, tracker: String): Boolean!
+	"""
+	Look the torrent up on the DHT now.
+	"""
+	dhtAnnounceTorrent(id: Int!): Boolean!
+	"""
+	The torrent's own seeding policy; null returns it to its category's
+	and the global one.
+	"""
+	setTorrentSeeding(id: Int!, seeding: SeedingPolicyInput): Boolean!
 }
 
 type NamedId {
@@ -2392,6 +3187,9 @@ enum NetworkConsumerKind {
 	SERVER
 	RSS
 	OUTBOUND
+	TORRENT_DEFAULT
+	TORRENT_CATEGORY
+	TORRENT_TRACKER
 }
 
 """
@@ -2463,6 +3261,16 @@ type NetworkRoute {
 	consumer: String!
 	legs: [RouteLeg!]!
 	failover: RouteFailover!
+	"""
+	The DNS profile the route's names follow; 0 is the built-in System
+	profile.
+	"""
+	dnsProfileId: Int!
+}
+
+type Networking {
+	bandwidth: Bandwidth!
+	bandwidthSplit: BandwidthSplitState!
 }
 
 enum OperatingSystemGql {
@@ -2472,44 +3280,30 @@ enum OperatingSystemGql {
 	UNKNOWN
 }
 
-type ParsedEpisode {
-	season: Int
-	episodeNumbers: [Int!]!
-	absoluteEpisode: Int
-	raw: String
+type P2pRung {
+	step: P2pStep!
+	outcome: P2pRungOutcome!
+	message: String
 }
 
-type ParsedRelease {
-	normalizedTitle: String!
-	releaseGroup: String
-	languagesAudio: [String!]!
-	languagesSubtitles: [String!]!
-	year: Int
-	quality: String
-	source: String
-	videoCodec: String
-	videoEncoding: String
-	audio: String
-	audioCodecs: [String!]!
-	audioChannels: String
-	isDualAudio: Boolean!
-	isAtmos: Boolean!
-	isDolbyVision: Boolean!
-	detectedHdr: Boolean!
-	isHdr10Plus: Boolean!
-	isHlg: Boolean!
-	fps: Float
-	isProperUpload: Boolean!
-	isRepack: Boolean!
-	isRemux: Boolean!
-	isBdDisk: Boolean!
-	isAiEnhanced: Boolean!
-	isHardcodedSubs: Boolean!
-	streamingService: String
-	edition: String
-	animeVersion: Int
-	episode: ParsedEpisode
-	parseConfidence: Float!
+enum P2pRungOutcome {
+	PASSED
+	FAILED
+	NOT_REACHED
+}
+
+enum P2pStep {
+	TORRENT
+	ANNOUNCE
+	HANDSHAKE
+	PIECE
+	INBOUND
+}
+
+type P2pTestResult {
+	rungs: [P2pRung!]!
+	mappedPort: Int
+	exposure: TorrentExposure
 }
 
 type PathOverride {
@@ -2540,6 +3334,64 @@ type PathTestResult {
 	sourceAddress: String
 	connectMillis: Float!
 	resolution: HostResolution
+	p2p: P2pTestResult
+}
+
+"""
+The transport a peer connection runs over.
+"""
+enum PeerConnection {
+	TCP
+	UTP
+}
+
+"""
+What of a peer connection is encrypted.
+"""
+enum PeerEncryption {
+	NONE
+	"""
+	The handshake only.
+	"""
+	HEADER_ONLY
+	"""
+	All of it.
+	"""
+	RC4
+}
+
+"""
+A source that named a peer.
+"""
+enum PeerSource {
+	TRACKER
+	DHT
+	PEX
+	LSD
+	"""
+	The torrent's own list.
+	"""
+	RESUME_DATA
+	"""
+	The peer connected to us.
+	"""
+	INCOMING
+}
+
+"""
+A transport peers are reached and taken on.
+"""
+enum PeerTransport {
+	TCP
+	UTP
+}
+
+type PeerUploadResult {
+	outcome: UploadOutcome!
+	bytes: Float!
+	elapsedMs: Int!
+	bps: Float!
+	error: String
 }
 
 type PipelineEventGql {
@@ -2557,6 +3409,20 @@ type PlatformNetworking {
 	bridgeNetworkSuspected: Boolean!
 	maxWireguardInstances: Int!
 	notes: [String!]!
+}
+
+enum PortMapProtocol {
+	TCP
+	UDP
+}
+
+enum PortMapper {
+	UPNP
+	NAT_PMP
+	"""
+	PCP from a global IPv6 address.
+	"""
+	PCP_IPV_6
 }
 
 type PostProcessingSettingsGql {
@@ -2580,6 +3446,10 @@ type PostProcessingSettingsGql {
 	batchInterpreter: String
 	goInterpreter: String
 	unacceptableExtensions: [String!]!
+	"""
+	What a download holding a file with one of those extensions comes to.
+	"""
+	unwantedExtensionAction: UnwantedExtensionAction!
 	"""
 	True when `WEAVER_STRICT_SECURITY` refuses script execution outright.
 	"""
@@ -2619,6 +3489,11 @@ input PostProcessingSettingsInput {
 	Omission keeps the present choice.
 	"""
 	globalScriptsRun: GlobalScriptsRun
+}
+
+enum Protocol {
+	NZB
+	TORRENT
 }
 
 """
@@ -2691,7 +3566,10 @@ type ProxyProfile {
 	enabled: Boolean!
 	host: String!
 	port: Int!
-	resolver: ProxyResolver!
+	"""
+	WireGuard: the tunnel's own DNS servers, asked in plain through the
+	tunnel when a route's DNS profile has the proxy answer.
+	"""
 	dnsServers: [String!]!
 	tunnelAddresses: [String!]!
 	peerPublicKey: String
@@ -2700,11 +3578,24 @@ type ProxyProfile {
 	keepaliveSeconds: Int
 	timeoutSeconds: Int!
 	hostKeyFingerprint: String
+	"""
+	WireGuard: the gateway forwards a port over NAT-PMP.
+	"""
+	natpmp: Boolean!
+	"""
+	WireGuard: the port the provider forwards, always the same one.
+	"""
+	forwardedPort: Int
 	hasUsername: Boolean!
 	hasPassword: Boolean!
 	hasPrivateKey: Boolean!
 	hasPassphrase: Boolean!
 	hasPresharedKey: Boolean!
+	"""
+	The DNS profile that finds this proxy's own address when it is a
+	name: 0, the built-in System profile, or a PROXY_NAME profile.
+	"""
+	dnsProfileId: Int!
 }
 
 input ProxyProfileInput {
@@ -2713,23 +3604,29 @@ input ProxyProfileInput {
 	enabled: Boolean!
 	host: String!
 	port: Int!
-	resolver: ProxyResolver
-	dnsServers: [String!]! = []
+	"""
+	WireGuard only: the tunnel's own DNS servers, as IPs. Omitted keeps
+	the saved list; a new proxy starts with none.
+	"""
+	dnsServers: [String!]
 	tunnelAddresses: [String!]! = []
 	peerPublicKey: String
 	mtu: Int! = 1280
 	keepaliveSeconds: Int
 	timeoutSeconds: Int! = 30
+	natpmp: Boolean! = false
+	forwardedPort: Int
 	username: String
 	password: String
 	privateKey: String
 	passphrase: String
 	presharedKey: String
-}
-
-enum ProxyResolver {
-	WEAVER
-	PROXY
+	"""
+	The DNS profile that finds the proxy's own address: 0, System, or a
+	PROXY_NAME profile. Absent is 0 on create and keeps the saved one on
+	update.
+	"""
+	dnsProfileId: Int
 }
 
 type ProxyTestResult {
@@ -2743,6 +3640,17 @@ type QueryRoot {
 	backups: [BackupInfo!]!
 	backupSettings: BackupSettings!
 	autoBackupSettings: AutoBackupSettings!
+	"""
+	Every saved server list, in id order.
+	"""
+	dnsServerLists: [DnsServerList!]!
+	"""
+	Every profile, the built-in System profile first, then by id. With
+	`kind`, the profiles something of that kind may select: System, then
+	the saved profiles of that kind.
+	"""
+	dnsProfiles(kind: DnsProfileKind): [DnsProfile!]!
+	networking: Networking!
 	egressInterfaces: [EgressInterface!]!
 	discoverNetworkInterfaces: [DiscoveredNetworkInterface!]!
 	platformNetworking: PlatformNetworking!
@@ -2876,11 +3784,11 @@ type QueryRoot {
 	List jobs, optionally filtered by status, category, or metadata key.
 	Supports pagination via `limit` and `offset`.
 	"""
-	jobs(status: [JobStatusGql!], category: String, hasMetadataKey: String, limit: Int, offset: Int): [Job!]!
+	jobs(status: [JobStatusGql!], category: String, hasMetadataKey: String, tag: String, limit: Int, offset: Int): [Job!]!
 	"""
 	Count jobs matching the given filters (same filters as `jobs`).
 	"""
-	jobCount(status: [JobStatusGql!], category: String, hasMetadataKey: String): Int!
+	jobCount(status: [JobStatusGql!], category: String, hasMetadataKey: String, tag: String): Int!
 	"""
 	Get a specific job by ID.
 	"""
@@ -2992,6 +3900,12 @@ type QueryRoot {
 	access model, and what it needs to say where.
 	"""
 	securityUpgradeNotice: SecurityUpgradeNotice!
+	trackerRules: [TrackerRule!]!
+	"""
+	Every host a torrent has announced to, which a tracker rule's host is
+	picked from.
+	"""
+	trackerHosts: [String!]!
 	schedules: [Schedule!]!
 	"""
 	The running weaver binary version.
@@ -3023,6 +3937,16 @@ type QueryRoot {
 	"""
 	systemStatus: SystemStatus!
 	"""
+	Whether torrents are on and whether there are torrents: the same
+	reading `systemMetricsUpdates` carries as `torrents`.
+	"""
+	torrentPresence: TorrentPresence!
+	"""
+	What every torrent downloads and uploads right now: the same reading
+	`systemMetricsUpdates` carries as `torrentRates`.
+	"""
+	torrentRates: TorrentRates!
+	"""
 	System metrics facade for integrations.
 	"""
 	systemMetrics: Metrics!
@@ -3030,6 +3954,24 @@ type QueryRoot {
 	Tiered local metrics history for the built-in monitoring UI.
 	"""
 	metricsHistory(range: MetricsHistoryRangeGql!): MetricsHistoryResult!
+	"""
+	Data used per day by each server or category: today, this week (from
+	Monday), this month, this year, all time and the asked range, each
+	date in the range, and the jobs finished today and in the range. All
+	dates are this host's local dates.
+	"""
+	usageHistory(range: UsageRange!, kind: UsageConsumerKind): UsageHistory!
+	"""
+	NZB jobs finished and repaired per day, each stage's runs and time,
+	and, from the history of the jobs that finished in the range, the
+	recovery they posted and fetched and why the failed ones failed.
+	"""
+	integrityHistory(range: UsageRange!): IntegrityHistory!
+	"""
+	Torrent data per day, all together and by tracker: from peers, to
+	peers and seeding time; and the peers connected now.
+	"""
+	torrentHistory(range: UsageRange!): TorrentHistory!
 	browseDirectories(path: String, includeFiles: Boolean): DirectoryBrowseResult!
 	"""
 	How full the disk under a folder is, for a folder that is not saved yet.
@@ -3067,6 +4009,35 @@ type QueryRoot {
 	Filesystem capacity for the configured storage directories (data / intermediate / complete).
 	"""
 	diskUsage: [DiskUsage!]!
+	torrent(id: Int!): Torrent
+	"""
+	The torrent's live peer connections, by address.
+	"""
+	torrentPeers(id: Int!): [TorrentPeer!]!
+	"""
+	The torrent's trackers, each with how announcing to it went.
+	"""
+	torrentTrackers(id: Int!): [TorrentTracker!]!
+	"""
+	The torrents the schedule's pause leaves seeding, by the tracker rule
+	that keeps them; empty while no such pause is in force.
+	"""
+	scheduleSeeding: [ScheduleSeeding!]!
+	"""
+	Every torrent route, by the scopes that run on it, with whether
+	peers can reach its session.
+	"""
+	torrentRoutes: [TorrentRoute!]!
+	"""
+	Every torrent, or a category's, in the order they were added: the
+	`first` after the offset cursor `after`, as `queueItems` pages.
+	`first` is 100 when not given, and at most 500.
+	"""
+	torrents(category: String, first: Int, after: String): [Torrent!]!
+	"""
+	Every tag made, in tag order, with how many jobs carry it.
+	"""
+	jobTags: [JobTag!]!
 }
 
 type QueueAttention {
@@ -3109,8 +4080,9 @@ input QueueBatchTarget {
 }
 
 """
-Jobs matching the search and priorities, counted by category before the
-category and state filters apply. The empty string is no category.
+Jobs matching the search, priorities and protocol, counted by category
+before the category and state filters apply. The empty string is no
+category.
 """
 type QueueCategoryCount {
 	category: String!
@@ -3122,6 +4094,28 @@ type QueueCommandResult {
 	message: String
 	item: QueueItem
 	globalState: GlobalQueueState
+}
+
+"""
+A job's write to its destination disk, while the disk is slow or the
+job has nothing left to fetch and bytes still waiting in memory to be
+written. The disk's figures are on `downloadBlock.diskVolumes`, under the
+same label, so a figure change moves no queue row.
+"""
+type QueueDiskWrite {
+	"""
+	The disk, by the label `downloadBlock.diskVolumes` gives it.
+	"""
+	volume: String!
+	"""
+	Whether the disk cannot keep up: downloads keep waiting on it.
+	"""
+	slow: Boolean!
+	"""
+	Whether the job has nothing left to fetch and bytes still waiting in
+	memory for the disk.
+	"""
+	draining: Boolean!
 }
 
 enum QueueDownloadState {
@@ -3178,17 +4172,33 @@ input QueueFilterInput {
 
 type QueueItem {
 	id: Int!
+	protocol: Protocol!
 	jobHash: String
 	name: String!
 	displayTitle: String!
 	originalTitle: String!
-	parsedRelease: ParsedRelease!
 	state: QueueItemState!
+	"""
+	How the job ended, a partial delivery as its own value; null while
+	it has not ended.
+	"""
+	outcome: JobOutcome
 	downloadState: QueueDownloadState!
 	postState: QueuePostState!
 	waitReason: QueueWaitReason
 	downloadWaitReason: String
 	downloadRetryAtEpochMs: Float
+	"""
+	While the job waits to start for its disk (`DISK_SPACE` or
+	`DISK_TOO_SMALL`): the bytes it still has to fetch.
+	"""
+	diskNeedBytes: Int
+	"""
+	With `DISK_SPACE`, the room its disk leaves for them, null without
+	a fresh reading; with `DISK_TOO_SMALL`, the most the disk ever holds
+	above its reserve.
+	"""
+	diskFreeBytes: Int
 	error: String
 	progressPercent: Float!
 	totalBytes: Int!
@@ -3224,7 +4234,6 @@ type QueueItem {
 	remainingParCount: Int!
 	hasPassword: Boolean!
 	category: String
-	attributes: [Attribute!]!
 	clientRequestId: String
 	outputDir: String
 	createdAt: DateTime!
@@ -3234,6 +4243,22 @@ type QueueItem {
 	NZB material and credentials, which remain unavailable to GraphQL.
 	"""
 	duplicateSummary: DuplicateSummaryInfo
+	"""
+	The job's attributes. An RSS job's item link and id are among them
+	for an admin only.
+	"""
+	attributes: [Attribute!]!
+	"""
+	The job's tags, in tag order.
+	"""
+	tags: [String!]!
+	"""
+	The job's write to its destination disk while the disk is slow,
+	or while the job has nothing left to fetch and bytes still waiting
+	to be written; null otherwise. A list reads the disk state once for
+	all its rows.
+	"""
+	diskWrite: QueueDiskWrite
 }
 
 """
@@ -3256,6 +4281,10 @@ enum QueueItemState {
 	COMPLETED
 	FAILED
 	PAUSED
+	FETCHING_METADATA
+	CHECKING_FILES
+	SEEDING
+	STALLED
 }
 
 """
@@ -3274,6 +4303,10 @@ type QueuePage {
 	summary: QueueSummary!
 	categories: [String!]!
 	categoryCounts: [QueueCategoryCount!]!
+	"""
+	Jobs per protocol, counted under every filter but the protocol one.
+	"""
+	protocolCounts: [QueueProtocolCount!]!
 	stateCounts: [QueueStateCount!]!
 	"""
 	Bytes still to fetch across queued and downloading jobs.
@@ -3295,12 +4328,20 @@ input QueuePageInput {
 	pageIndex: Int!
 	pageSize: Int!
 	search: String
+	"""
+	Torrents or Usenet jobs only; omit for both.
+	"""
+	protocol: Protocol
 	states: [QueueItemState!]
 	priorities: [QueuePriority!]
 	"""
 	The empty string names jobs with no category.
 	"""
 	categories: [String!]
+	"""
+	Jobs carrying this tag; the empty string names jobs with none.
+	"""
+	tag: String
 	"""
 	Omit both fields to retain the scheduler's hot-download order.
 	"""
@@ -3350,18 +4391,35 @@ enum QueuePriority {
 }
 
 """
+Jobs matching the search, priorities and categories, counted by protocol
+before the protocol and state filters apply.
+"""
+type QueueProtocolCount {
+	protocol: Protocol!
+	count: Int!
+}
+
+"""
 Which queued jobs a batch acts on: every job matching all the given
 fields. A selection with no filter names the whole queue only when it says
 so with `all: true`; otherwise it is refused.
 """
 input QueueSelectionInput {
 	search: String
+	"""
+	Torrents or Usenet jobs only; omit for both.
+	"""
+	protocol: Protocol
 	states: [QueueItemState!]
 	priorities: [QueuePriority!]
 	"""
 	The empty string names jobs with no category.
 	"""
 	categories: [String!]
+	"""
+	Jobs carrying this tag; the empty string names jobs with none.
+	"""
+	tag: String
 	"""
 	The whole queue, stated outright. Required when no filter is given.
 	"""
@@ -3419,6 +4477,52 @@ enum QueueWaitReason {
 	EXTRACTION_CAPACITY
 	POST_PROCESSING_CAPACITY
 	DISK_SPACE
+	DISK_TOO_SMALL
+}
+
+type QuotaDirectionUsage {
+	usedBytes: Int!
+	"""
+	Null when the direction has no cap.
+	"""
+	remainingBytes: Int
+	state: QuotaStateGql!
+}
+
+enum QuotaStateGql {
+	NORMAL
+	TRICKLE
+	STOPPED
+}
+
+"""
+One setting at one level.
+"""
+type RatioLeaf {
+	state: LeafState!
+	"""
+	The value while `state` is `SET`.
+	"""
+	value: Float
+}
+
+"""
+One setting at one level; `value` is given with `SET` and only then.
+"""
+input RatioLeafInput {
+	state: LeafState!
+	value: Float
+}
+
+type RecoveryTotals {
+	"""
+	Recovery the jobs posted.
+	"""
+	availableBytes: Int!
+	"""
+	Of that, what they fetched.
+	"""
+	fetchedBytes: Int!
 }
 
 enum ResolvedBy {
@@ -3432,6 +4536,11 @@ enum ResolvedBy {
 type Route {
 	legs: [RouteLeg!]!
 	failover: RouteFailover!
+	"""
+	The DNS profile the route's names follow; 0 is the built-in System
+	profile.
+	"""
+	dnsProfileId: Int!
 }
 
 enum RouteFailover {
@@ -3442,6 +4551,12 @@ enum RouteFailover {
 input RouteInput {
 	legs: [RouteLegInput!]!
 	failover: RouteFailover! = REDISTRIBUTE
+	"""
+	The DNS profile the route's names follow. Null or absent keeps a
+	saved route's profile, and is the built-in System profile, 0, for a
+	new one.
+	"""
+	dnsProfileId: Int
 }
 
 input RouteLadderInput {
@@ -3655,6 +4770,11 @@ type Schedule {
 	pruneCancelled: SchedulePruneFiles
 	actionType: String!
 	"""
+	The class of job a `pause_class` or `resume_class` rule holds; null
+	for every other action.
+	"""
+	class: Protocol
+	"""
 	Rules on this track hold independently of every other track. A rule
 	touching several tracks reports the first.
 	"""
@@ -3673,6 +4793,12 @@ type Schedule {
 	other action.
 	"""
 	hardwareProfile: HardwareProfileGql
+	"""
+	Usenet's percentage of the download limit a `bandwidth_split` rule
+	puts in force; null lifts back to the operator's split, and is null
+	for every other action.
+	"""
+	splitUsenetPct: Int
 }
 
 input ScheduleInput {
@@ -3695,19 +4821,30 @@ input ScheduleInput {
 	pruneCancelled: SchedulePruneFilesInput
 	actionType: String!
 	"""
+	The class of job a `pause_class` or `resume_class` rule holds, one
+	with a hold of its own; refused for every other action.
+	"""
+	class: Protocol
+	"""
 	A global rate for a `speed_limit` rule, read only when `speedLimits`
-	is omitted.
+	is omitted. 0 is no limit.
 	"""
 	speedLimitBytes: Int @deprecated(reason: "Use speedLimits.")
 	"""
 	Every target a `speed_limit` rule sets. A target left out is left as
-	it is; 0 removes the limit at that level.
+	it is.
 	"""
 	speedLimits: [ScheduleSpeedLimitInput!]
 	"""
 	Required when the action is `hardware_profile`, ignored otherwise.
 	"""
 	hardwareProfile: HardwareProfileGql
+	"""
+	Usenet's percentage of the download limit for a `bandwidth_split`
+	rule, 1 to 99; omit to lift back to the operator's split. Ignored
+	for every other action.
+	"""
+	splitUsenetPct: Int
 }
 
 type SchedulePruneFiles {
@@ -3719,8 +4856,20 @@ input SchedulePruneFilesInput {
 }
 
 """
-One target of a `speed_limit` rule and the rate it sets. 0 removes the
-limit at that level.
+The torrents the schedule's pause leaves seeding under one tracker rule.
+"""
+type ScheduleSeeding {
+	ruleId: Int!
+	"""
+	The rule's name.
+	"""
+	name: String!
+	torrents: Int!
+}
+
+"""
+One target of a `speed_limit` rule and the rates it sets, in bytes per
+second. Null is no limit; 0 lets nothing through.
 """
 type ScheduleSpeedLimit {
 	kind: ScheduleTargetKind!
@@ -3728,12 +4877,16 @@ type ScheduleSpeedLimit {
 	The egress or provider id; null for the global limit.
 	"""
 	id: Int
-	bytesPerSec: Int!
+	download: Int
+	"""
+	Global limit only.
+	"""
+	upload: Int
 }
 
 """
-One target of a `speed_limit` rule and the rate it sets. 0 removes the
-limit at that level.
+One target of a `speed_limit` rule and the rates it sets, in bytes per
+second. Null is no limit; 0 lets nothing through.
 """
 input ScheduleSpeedLimitInput {
 	kind: ScheduleTargetKind!
@@ -3741,7 +4894,11 @@ input ScheduleSpeedLimitInput {
 	The egress or provider id; null for the global limit.
 	"""
 	id: Int
-	bytesPerSec: Int!
+	download: Int
+	"""
+	Global limit only.
+	"""
+	upload: Int
 }
 
 """
@@ -3755,10 +4912,12 @@ enum ScheduleTargetKind {
 
 enum ScheduleTrack {
 	DOWNLOADS
+	TORRENTS
 	POST_PROCESSING
 	WATCH_FOLDER
 	RSS
 	SPEED
+	SPLIT
 	PROFILE
 	QUOTA
 	SERVER
@@ -4055,6 +5214,20 @@ enum ScriptQueueEvent {
 	NZB_NAMED
 	NZB_DOWNLOADED
 	NZB_DELETED
+	SEEDING_FINISHED
+	SEEDING_STOPPED
+	QUOTA_NORMAL
+	QUOTA_TRICKLE
+	QUOTA_STOPPED
+	ROUTE_DOWN
+	TORRENT_MARKED
+	TORRENT_ADDED
+	TORRENT_DOWNLOADED
+	TORRENT_DELETED
+	JOB_ADDED
+	JOB_DOWNLOADED
+	JOB_DELETED
+	ROUTE_UP
 }
 
 type ScriptResultGql {
@@ -4306,6 +5479,123 @@ type SecurityUpgradeNotice {
 	Whether a login exists. Without one, moving opens setup to create it.
 	"""
 	loginEnabled: Boolean!
+}
+
+"""
+Which seconds a seed-time goal counts.
+"""
+enum SeedTimeCounting {
+	"""
+	Every second the torrent has seeded.
+	"""
+	CUMULATIVE
+	"""
+	The seconds since it last stopped seeding.
+	"""
+	CONSECUTIVE
+}
+
+"""
+One setting at one level.
+"""
+type SeedTimeCountingLeaf {
+	state: LeafState!
+	"""
+	The value while `state` is `SET`.
+	"""
+	value: SeedTimeCounting
+}
+
+"""
+One setting at one level; `value` is given with `SET` and only then.
+"""
+input SeedTimeCountingLeafInput {
+	state: LeafState!
+	value: SeedTimeCounting
+}
+
+enum SeedingAction {
+	STOP
+	REMOVE
+	REMOVE_WITH_DATA
+}
+
+"""
+One setting at one level.
+"""
+type SeedingActionLeaf {
+	state: LeafState!
+	"""
+	The value while `state` is `SET`.
+	"""
+	value: SeedingAction
+}
+
+"""
+One setting at one level; `value` is given with `SET` and only then.
+"""
+input SeedingActionLeafInput {
+	state: LeafState!
+	value: SeedingAction
+}
+
+enum SeedingGoalMode {
+	ANY
+	ALL
+}
+
+"""
+The level each of a torrent's seeding terms comes from.
+"""
+type SeedingLevels {
+	ratioGoal: SettingLevel!
+	seedTimeGoalMinutes: SettingLevel!
+	inactiveGoalMinutes: SettingLevel!
+	mode: SettingLevel!
+	action: SettingLevel!
+	seedTimeCounting: SettingLevel!
+	uploadCap: SettingLevel!
+}
+
+"""
+Seeding terms at one level; a term left out inherits.
+"""
+input SeedingPolicyInput {
+	ratioGoal: RatioLeafInput
+	seedTimeGoalMinutes: MinutesLeafInput
+	inactiveGoalMinutes: MinutesLeafInput
+	mode: GoalModeLeafInput
+	action: SeedingActionLeafInput
+	seedTimeCounting: SeedTimeCountingLeafInput
+}
+
+"""
+Seeding terms at one level: each one inherited, off or set.
+"""
+type SeedingPolicySettings {
+	ratioGoal: RatioLeaf!
+	seedTimeGoalMinutes: MinutesLeaf!
+	inactiveGoalMinutes: MinutesLeaf!
+	mode: GoalModeLeaf!
+	action: SeedingActionLeaf!
+	seedTimeCounting: SeedTimeCountingLeaf!
+}
+
+"""
+The seeding terms a torrent is held to, each resolved over its levels.
+"""
+type SeedingTerms {
+	ratioGoal: Float
+	seedTimeGoalMinutes: Int
+	inactiveGoalMinutes: Int
+	mode: SeedingGoalMode!
+	action: SeedingAction!
+	seedTimeCounting: SeedTimeCounting!
+	"""
+	The upload cap in bytes per second; absent is none.
+	"""
+	uploadCap: Int
+	levels: SeedingLevels!
 }
 
 type SemanticCandidateSnapshotInfo {
@@ -4577,6 +5867,21 @@ type ServerHealth {
 	"""
 	prematureDeaths: Int!
 	"""
+	Out of use: switched off by a fault, or in a transport cooldown still
+	running. A capacity hold is not down. The data-used ledger counts time
+	down by the same rule.
+	"""
+	down: Boolean!
+	"""
+	The server's saved id, which the data-used ledger counts it under.
+	"""
+	serverId: Int
+	"""
+	When this server was first seen in its current state, in epoch
+	milliseconds. Absent until the data-used ledger has read it once.
+	"""
+	stateSinceEpochMs: Int
+	"""
 	Article requests this server answered with the article, counted
 	since Weaver last started. The count starts again at every start.
 	"""
@@ -4664,6 +5969,16 @@ type ServiceLogsPayload {
 	lines: [String!]!
 }
 
+"""
+A level a torrent takes a setting from.
+"""
+enum SettingLevel {
+	TORRENT
+	TRACKER_RULE
+	CATEGORY
+	GLOBAL
+}
+
 type SpeedTestFailure {
 	code: SpeedTestFailureCode!
 	message: String!
@@ -4693,16 +6008,19 @@ input SpeedTestInput {
 	overrides: PathOverrideInput
 	bandwidth: BandwidthTestInput
 	usenet: UsenetTestInput
+	torrent: TorrentTestInput
 }
 
 enum SpeedTestKind {
 	BANDWIDTH
 	USENET
+	TORRENT
 }
 
 type SpeedTestRequest {
 	bandwidth: BandwidthTestRequest
 	usenet: UsenetTestRequest
+	torrent: TorrentTestRequest
 }
 
 type SpeedTestResult {
@@ -4714,6 +6032,7 @@ type SpeedTestResult {
 	connections: [ConnectionResult!]!
 	usenet: UsenetResult
 	bandwidth: BandwidthResult
+	upload: UploadResult
 	samples: [Sample!]!
 }
 
@@ -4755,6 +6074,7 @@ type StagedNzbSubmissionResult {
 }
 
 type StagedNzbUploadResult {
+	kind: SubmissionKind!
 	accepted: Boolean!
 	stagedUploadId: String
 	filename: String
@@ -4811,6 +6131,14 @@ type StorageVolumeWriteRate {
 	bufferLimitBytes: Int
 }
 
+"""
+What a submission became, read from its bytes.
+"""
+enum SubmissionKind {
+	NZB
+	TORRENT
+}
+
 type SubmissionResult {
 	accepted: Boolean!
 	status: SubmissionStatus!
@@ -4834,6 +6162,27 @@ enum SubmissionStatus {
 	FORCE_ACCEPTED
 }
 
+"""
+One thing to add: text that is an NZB or torrent URL, a magnet link or
+an infohash, or an uploaded NZB, torrent or magnet file.
+"""
+input SubmitInput {
+	text: String
+	upload: Upload
+	category: String
+	paused: Boolean! = false
+	password: String
+	"""
+	Whether a torrent's archives are extracted; absent inherits. An NZB
+	ignores it.
+	"""
+	unpack: Boolean
+	"""
+	The tags the job is added with.
+	"""
+	tags: [String!]! = []
+}
+
 input SubmitNzbInput {
 	url: String
 	nzbBase64: String
@@ -4849,6 +6198,10 @@ input SubmitNzbInput {
 	dupeKey: String
 	dupeScore: Int
 	dupeMode: DuplicateMode
+	"""
+	The tags the job is added with.
+	"""
+	tags: [String!]! = []
 }
 
 input SubmitStagedNzbsInput {
@@ -4862,12 +6215,37 @@ input SubmitStagedNzbsInput {
 	dupeKey: String
 	dupeScore: Int
 	dupeMode: DuplicateMode
+	paused: Boolean! = false
+	"""
+	The tags each job is added with.
+	"""
+	tags: [String!]! = []
 }
 
 type SubmitStagedNzbsResult {
 	acceptedCount: Int!
 	clientRequestId: String
 	results: [StagedNzbSubmissionResult!]!
+}
+
+"""
+A torrent to add: its metainfo file, base64, or a magnet link.
+"""
+input SubmitTorrentInput {
+	metainfoBase64: String
+	magnet: String
+	category: String
+	paused: Boolean! = false
+	forced: Boolean! = false
+	seeding: SeedingPolicyInput
+	"""
+	Whether its archives are extracted; absent inherits.
+	"""
+	unpack: Boolean
+	"""
+	The tags its job is added with.
+	"""
+	tags: [String!]! = []
 }
 
 type SubscriptionRoot {
@@ -4930,6 +6308,21 @@ type SubscriptionRoot {
 	Subscribe to cadence-driven system metrics and global queue state.
 	"""
 	systemMetricsUpdates: SystemMetricsSnapshot!
+	"""
+	The torrents as they move: the one `id` names, whole, or the ones
+	`ids` names (at most 500), as a list shows them. Give one of the two.
+	The first push is the torrents as they are, with `fullUpdate`; each
+	later one comes when one of them changes and carries only the
+	torrents that changed or came and the ids of the ones gone.
+
+	`ids` reads each torrent's row as the service last published it: no
+	files and no trackers, and a change in the fields that move with the
+	clock alone is told with the next other change. Those torrents are
+	followed only once the stored torrents are all read at start: asked
+	before, it is an error with code `TORRENTS_LOADING`. `id` reads its
+	torrent whole, files and trackers with it, each time it moves.
+	"""
+	torrentUpdates(id: Int, ids: [Int!]): TorrentChanges!
 }
 
 """
@@ -5005,6 +6398,16 @@ type SystemMetricsSnapshot {
 	`serverHealth` read.
 	"""
 	providerConnections: [ProviderConnections!]!
+	"""
+	Whether torrents are on and whether there are torrents, so the web
+	shows torrent controls while either holds.
+	"""
+	torrents: TorrentPresence!
+	"""
+	What every torrent downloads and uploads right now, beside
+	`metrics.currentDownloadSpeed`, which counts Usenet alone.
+	"""
+	torrentRates: TorrentRates!
 }
 
 type SystemStatus {
@@ -5092,6 +6495,1077 @@ enum TimelineStage {
 	FINAL_MOVE
 }
 
+type Torrent {
+	id: Int!
+	name: String!
+	"""
+	Its v1 hash; empty when it has none.
+	"""
+	infohash: String!
+	infohashV2: String
+	"""
+	Which hashes verify its pieces, once its metainfo is in hand.
+	"""
+	version: TorrentVersion
+	state: TorrentState!
+	"""
+	Why the torrent is in its state, when the server states the reason
+	itself.
+	"""
+	stated: TorrentStatedReason
+	"""
+	Why the torrent is in its state, in free words (an error, an
+	unpacking refusal), when that is the reason. While its route holds
+	it, the cause behind `routeReason`, when one is known.
+	"""
+	detail: String
+	"""
+	Why its route holds it, while its state comes from that hold.
+	"""
+	routeReason: TorrentRouteReason
+	category: String
+	"""
+	Its job's tags, in tag order.
+	"""
+	tags: [String!]!
+	private: Boolean!
+	forced: Boolean!
+	progress: Float!
+	totalBytes: Int!
+	haveBytes: Int!
+	uploadedBytes: Int!
+	downloadedBytes: Int!
+	ratio: Float!
+	downloadBps: Int!
+	uploadBps: Int!
+	"""
+	The torrent's own upload limit in bytes per second; null is
+	unlimited and 0 closed.
+	"""
+	uploadLimit: Int
+	"""
+	The torrent's own download limit in bytes per second; null is
+	unlimited and 0 closed.
+	"""
+	downloadLimit: Int
+	etaSeconds: Int
+	peers: Int!
+	seeds: Int!
+	leechers: Int!
+	"""
+	The most peers a torrent connects to.
+	"""
+	maxPeers: Int!
+	"""
+	The swarm's seeds and leechers as its trackers last counted them.
+	"""
+	swarmSeeds: Int
+	swarmLeechers: Int
+	"""
+	Seconds until the next tracker announce.
+	"""
+	reannounceSeconds: Int
+	"""
+	Seconds spent running in a session.
+	"""
+	activeSeconds: Int!
+	"""
+	Seconds spent complete and seeding, in all.
+	"""
+	seedingSeconds: Int!
+	"""
+	Seconds of the current unbroken seeding run.
+	"""
+	consecutiveSeedingSeconds: Int!
+	downloadAvgBps: Int!
+	uploadAvgBps: Int!
+	"""
+	Bytes received and thrown away this run: pieces that failed their
+	check, and blocks that arrived when already in hand. Counts from zero
+	each time the torrent starts.
+	"""
+	wastedBytes: Int!
+	"""
+	The last time a complete copy was in reach.
+	"""
+	lastSeenCompleteMs: Int
+	pieceCount: Int
+	pieceSize: Int
+	"""
+	The pieces in hand, verified.
+	"""
+	piecesHave: Int
+	createdBy: String
+	createdAtMs: Int
+	comment: String
+	addedAtMs: Int!
+	completedAtMs: Int
+	storageDir: String
+	"""
+	The folder that holds the torrent's output.
+	"""
+	savePath: String
+	"""
+	The seeding goal still to meet; absent once it is met.
+	"""
+	seedingLeft: String
+	"""
+	The torrent's own seeding terms; absent when it inherits every one.
+	"""
+	seedingOverride: SeedingPolicySettings
+	"""
+	The seeding terms in effect.
+	"""
+	seedingPolicy: SeedingTerms!
+	"""
+	The host pattern of the tracker rule the torrent is under, when it is.
+	"""
+	trackerRule: String
+	"""
+	Whether its archives are extracted.
+	"""
+	unpack: Boolean!
+	"""
+	The torrent's own unpack; absent inherits.
+	"""
+	unpackOverride: Boolean
+	route: String
+	"""
+	The networking route the torrent takes, by its consumer key:
+	`torrent:default`, `torrent:category:<id>` or `torrent:tracker:<id>`.
+	"""
+	routeConsumer: String!
+	files: [TorrentFile!]!
+	"""
+	Whether its pieces are fetched in order.
+	"""
+	sequential: Boolean!
+	"""
+	Whether each file's first and last pieces are fetched first.
+	"""
+	firstLastPieceFirst: Boolean!
+	trackers: [TorrentTracker!]!
+	"""
+	The seeding goal still to meet, as `seedingLeft` gives it; absent
+	once it is met and for a torrent with no goal.
+	"""
+	seedingGoalLeft: String
+	"""
+	How its unpacking came out, once over; absent while it runs, and for
+	a torrent with nothing to unpack.
+	"""
+	unpacking: TorrentUnpacking
+}
+
+"""
+What a `torrentUpdates` push carries.
+"""
+type TorrentChanges {
+	"""
+	The first push: `torrents` is every followed torrent.
+	"""
+	fullUpdate: Boolean!
+	"""
+	The torrents that changed or came.
+	"""
+	torrents: [Torrent!]!
+	"""
+	The ids of the torrents gone since the last push.
+	"""
+	removedIds: [Int!]!
+}
+
+"""
+A client a torrent may name itself as to its peers and trackers.
+"""
+enum TorrentClient {
+	WEAVER
+	QBITTORRENT
+}
+
+"""
+How the torrents still running end when torrents are turned off. No new
+torrent is taken in any of them.
+"""
+enum TorrentDisableMode {
+	"""
+	Every torrent stops now.
+	"""
+	STOP_NOW
+	"""
+	Downloads finish; seeding stops; then torrents are off.
+	"""
+	FINISH_DOWNLOADS
+	"""
+	Seeding finishes to its own limits; downloads stop; then torrents
+	are off.
+	"""
+	FINISH_SEEDING
+	"""
+	Torrents download and seed to their own limits; then torrents are
+	off.
+	"""
+	FINISH_ALL
+}
+
+enum TorrentEncryption {
+	PREFER
+	REQUIRE
+	DISABLED
+}
+
+"""
+What a torrent session shows the trackers and peers it reaches.
+"""
+type TorrentExposure {
+	"""
+	Who resolves the names the session looks up.
+	"""
+	resolvedBy: ResolvedBy
+	"""
+	The address a tracker sees; none until one is known.
+	"""
+	address: String
+	"""
+	The port announced; 0 when none is.
+	"""
+	announcedPort: Int!
+	inbound: Boolean!
+	udpTrackers: Boolean!
+	dht: Boolean!
+	utp: Boolean!
+}
+
+type TorrentFile {
+	index: Int!
+	path: String!
+	length: Int!
+	"""
+	Whether the file is fetched at all: its level is above ignored.
+	"""
+	selected: Boolean!
+	priority: TorrentFilePriority!
+	"""
+	The share of the file in hand, from 0 to 1.
+	"""
+	progress: Float!
+}
+
+"""
+How eagerly a torrent file is fetched: qBittorrent's four levels. An
+ignored file is not fetched; padding is always ignored.
+"""
+enum TorrentFilePriority {
+	IGNORED
+	NORMAL
+	HIGH
+	MAXIMUM
+}
+
+"""
+A file's level, by its index in the torrent.
+"""
+input TorrentFilePriorityInput {
+	index: Int!
+	priority: TorrentFilePriority!
+}
+
+type TorrentHistory {
+	"""
+	This host's local date, `YYYY-MM-DD`.
+	"""
+	today: String!
+	rangeStart: String!
+	rangeEnd: String!
+	"""
+	Every torrent together: from peers in `bytes`, to peers in
+	`bytesUploaded`, seeding time in `durationMs`.
+	"""
+	total: UsageConsumer!
+	"""
+	Each tracker rule by name, and each host no rule covers, by the
+	torrents that list it; the empty id is the torrents that list none.
+	A torrent counts under its rule once, or under each host it lists,
+	so trackers are never added together.
+	"""
+	trackers: [UsageConsumer!]!
+	"""
+	Now, as the torrent client last published its torrents.
+	"""
+	peers: TorrentPeers!
+}
+
+"""
+One connection to a peer of a torrent.
+"""
+type TorrentPeer {
+	"""
+	The peer's address and port.
+	"""
+	address: String!
+	client: String!
+	"""
+	The peer id, hex.
+	"""
+	peerId: String!
+	connection: PeerConnection!
+	"""
+	We made the connection.
+	"""
+	outgoing: Boolean!
+	encryption: PeerEncryption!
+	flags: TorrentPeerFlags!
+	"""
+	Every source that named the peer.
+	"""
+	sources: [PeerSource!]!
+	"""
+	How many of the torrent's pieces the peer has.
+	"""
+	pieces: Int!
+	progress: Float!
+	downloadBps: Int!
+	uploadBps: Int!
+	"""
+	Bytes over this connection.
+	"""
+	downloadedBytes: Int!
+	uploadedBytes: Int!
+}
+
+"""
+What a connection shows of a peer and of us.
+"""
+type TorrentPeerFlags {
+	"""
+	We want pieces the peer has.
+	"""
+	interesting: Boolean!
+	"""
+	We choke the peer.
+	"""
+	choked: Boolean!
+	"""
+	The peer wants pieces we have.
+	"""
+	remoteInterested: Boolean!
+	"""
+	The peer chokes us.
+	"""
+	remoteChoked: Boolean!
+	snubbed: Boolean!
+	optimisticUnchoke: Boolean!
+	seed: Boolean!
+	uploadOnly: Boolean!
+	onParole: Boolean!
+	holepunched: Boolean!
+}
+
+type TorrentPeers {
+	"""
+	Torrents the client holds now.
+	"""
+	torrents: Int!
+	"""
+	Peers connected now, across every torrent.
+	"""
+	connected: Int!
+	"""
+	Of those, the ones that have every piece.
+	"""
+	seeds: Int!
+}
+
+"""
+A gateway's last word on one port mapping.
+"""
+type TorrentPortMapping {
+	mapper: PortMapper!
+	protocol: PortMapProtocol!
+	localPort: Int!
+	"""
+	The port the gateway forwards; none once the mapping failed or was
+	removed.
+	"""
+	externalPort: Int
+	"""
+	The gateway's external address, when it told it.
+	"""
+	gatewayAddress: String
+	error: String
+}
+
+"""
+Whether torrents are on, and the torrents there are.
+"""
+type TorrentPresence {
+	"""
+	This run of the server has torrents at all: it was started with the
+	environment variable `WEAVER_TORRENTS` set to `1` or `true`. While
+	false no torrent runs, none is listed, turning torrents on is
+	refused, and every other field here is false or null whatever the
+	settings say.
+	"""
+	available: Boolean!
+	"""
+	Torrents are available and the settings turn them on.
+	"""
+	enabled: Boolean!
+	"""
+	There is a torrent job, in any state.
+	"""
+	jobs: Boolean!
+	"""
+	A torrent job is not paused or stopped.
+	"""
+	running: Boolean!
+	"""
+	Torrents are off and the torrents still running are let finish.
+	"""
+	windingDown: Boolean!
+	"""
+	While winding down, how the torrents still running end; null
+	otherwise.
+	"""
+	windDown: TorrentDisableMode
+}
+
+"""
+The rates of every torrent added up, in bytes per second.
+"""
+type TorrentRates {
+	downloadBps: Int!
+	uploadBps: Int!
+}
+
+"""
+A torrent route and whether peers can reach its session.
+"""
+type TorrentRoute {
+	key: String!
+	scopes: [TorrentRouteUse!]!
+	"""
+	Whether its session is open.
+	"""
+	open: Boolean!
+	"""
+	The address its session listens on, TCP's, and uTP's when `utp`.
+	"""
+	listenAddress: String
+	utp: Boolean!
+	mappings: [TorrentPortMapping!]!
+	"""
+	Its address as the internet sees it.
+	"""
+	externalAddresses: [String!]!
+	"""
+	Why its session is closed: held closed, its leg down, or not opened
+	as nothing has asked it to open. None while open.
+	"""
+	reason: TorrentRouteReason
+	"""
+	The cause behind `reason`, as the server logged it, when there is one.
+	"""
+	detail: String
+	"""
+	Who resolves the names its sessions look up.
+	"""
+	resolvedBy: ResolvedBy
+	"""
+	What its session shows trackers and peers, while open.
+	"""
+	exposure: TorrentExposure
+}
+
+"""
+Why a torrent route's session is unavailable.
+"""
+enum TorrentRouteReason {
+	NOT_ASKED_TO_OPEN
+	LEG_DOWN
+	LEG_MISSING
+	LEG_REVOKED
+	QUOTA_SILENCED
+	TORRENTS_DISABLED
+	TORRENT_ROUTE_LEGS
+	TORRENT_ROUTE_DIRECT_FALLBACK
+	TORRENT_ROUTE_RUNGS
+	LEG_OPEN_FAILED
+	STATE_DIRECTORY_FAILED
+	LISTEN_PORT_UNAVAILABLE
+	LISTEN_PORT_BIND_FAILED
+	SESSION_STATE_UNREADABLE
+	SESSION_BUILD_FAILED
+	UTP_UNAVAILABLE
+	BLOCKLIST_FAILED
+	SESSION_LIMIT
+	OPENING
+}
+
+"""
+What runs on a torrent route.
+"""
+enum TorrentRouteScope {
+	DEFAULT
+	CATEGORY
+	TRACKER_RULE
+}
+
+"""
+A scope that runs on a torrent route: the default, or a category or
+tracker rule by its id and name.
+"""
+type TorrentRouteUse {
+	scope: TorrentRouteScope!
+	id: Int
+	name: String
+}
+
+type TorrentSettings {
+	enabled: Boolean!
+	basePort: Int!
+	announcePort: Int
+	upnp: Boolean!
+	encryption: TorrentEncryption!
+	maxActiveDownloads: Int!
+	maxPeersTotal: Int!
+	sessionDir: String
+	unpack: Boolean!
+	"""
+	Null for no limit.
+	"""
+	connectionsLimit: Int
+	"""
+	Null for no limit.
+	"""
+	unchokeSlotsLimit: Int
+	connectionSpeed: Int!
+	allowMultipleConnectionsPerIp: Boolean!
+	"""
+	Whether peers are reached and taken over TCP: listened on and
+	dialed.
+	"""
+	peerTcp: Boolean!
+	"""
+	Whether peers are reached and taken over uTP.
+	"""
+	peerUtp: Boolean!
+	"""
+	The transport a dial tries first while its torrent downloads, as
+	set; while one transport is off, the one left on is used.
+	"""
+	preferDownloading: PeerTransport!
+	"""
+	The transport a dial tries first once its torrent holds every piece
+	it wants, as set; while one transport is off, the one left on is
+	used.
+	"""
+	preferSeeding: PeerTransport!
+	dhtBootstrapNodes: String!
+	blocklistEnabled: Boolean!
+	"""
+	An http, https or file URL, or a path.
+	"""
+	blocklist: String
+	stopTrackerTimeoutSecs: Int!
+	"""
+	Each one address or `first - last`.
+	"""
+	bannedIps: [String!]!
+	blockPrivilegedPorts: Boolean!
+	filterTrackers: Boolean!
+	"""
+	Whether SSL torrents' peers are taken, on a port of their own.
+	"""
+	sslEnabled: Boolean!
+	"""
+	The first route's SSL port; each further route takes the next.
+	Absent, one is chosen at random and kept.
+	"""
+	sslPort: Int
+}
+
+input TorrentSettingsInput {
+	enabled: Boolean
+	basePort: Int
+	announcePort: Int
+	upnp: Boolean
+	encryption: TorrentEncryption
+	maxActiveDownloads: Int
+	maxPeersTotal: Int
+	sessionDir: String
+	unpack: Boolean
+	"""
+	Null for no limit.
+	"""
+	connectionsLimit: Int
+	"""
+	Null for no limit.
+	"""
+	unchokeSlotsLimit: Int
+	connectionSpeed: Int
+	allowMultipleConnectionsPerIp: Boolean
+	"""
+	TCP and uTP may not both be off. The preferences are kept as set
+	either way.
+	"""
+	peerTcp: Boolean
+	peerUtp: Boolean
+	preferDownloading: PeerTransport
+	preferSeeding: PeerTransport
+	dhtBootstrapNodes: String
+	blocklistEnabled: Boolean
+	"""
+	An http, https or file URL, or a path.
+	"""
+	blocklist: String
+	stopTrackerTimeoutSecs: Int
+	"""
+	Each an address, `first - last` or a subnet; the whole list.
+	"""
+	bannedIps: [String!]
+	blockPrivilegedPorts: Boolean
+	filterTrackers: Boolean
+	sslEnabled: Boolean
+	"""
+	Null leaves the port to be chosen at random and kept.
+	"""
+	sslPort: Int
+	"""
+	With `enabled: false`: how the torrents still running end. Left
+	out, they stop at once.
+	"""
+	whenDisabled: TorrentDisableMode
+}
+
+enum TorrentState {
+	QUEUED
+	FETCHING_METADATA
+	CHECKING_FILES
+	DOWNLOADING
+	STALLED
+	SEEDING
+	PAUSED
+	STOPPED
+	MOVING
+	NEEDS_CERTIFICATE
+	CHECKING_RESUME_DATA
+	FILES_MISSING
+}
+
+"""
+Why a torrent is in its state, as the server states it.
+"""
+enum TorrentStatedReason {
+	"""
+	Kept from starting for room on its disk, as a usenet job waits.
+	"""
+	DISK_SPACE
+	"""
+	Kept from starting by a disk that never holds what it has left to
+	fetch, as a usenet job is.
+	"""
+	DISK_TOO_SMALL
+	"""
+	A write found no room: it fetches nothing and keeps seeding.
+	"""
+	DISK_FULL
+	"""
+	Stopped once its seeding goal was met.
+	"""
+	GOAL_MET
+	"""
+	Held in the queue by the operator's pause.
+	"""
+	HELD_MANUAL
+	"""
+	Held in the queue by the schedule.
+	"""
+	HELD_SCHEDULED
+	"""
+	Held in the queue while a speed test runs.
+	"""
+	HELD_SPEED_TEST
+	"""
+	Fetching its metadata from its trackers.
+	"""
+	FETCH_TRACKERS
+	"""
+	Fetching its metadata from its trackers, the DHT and local discovery.
+	"""
+	FETCH_DISCOVERY
+	"""
+	Fetching its metadata, with no peers named that may serve it.
+	"""
+	FETCH_WAITING
+}
+
+input TorrentTestInput {
+	maxDurationSeconds: Int
+}
+
+type TorrentTestRequest {
+	maxDurationSeconds: Int!
+}
+
+type TorrentTracker {
+	tier: Int!
+	source: TrackerSource!
+	status: TrackerStatus!
+	"""
+	An announce to it is in flight.
+	"""
+	updating: Boolean!
+	message: String
+	seeders: Int
+	leechers: Int
+	"""
+	The completed downloads it last counted.
+	"""
+	downloaded: Int
+	"""
+	The peers its last answer named.
+	"""
+	peers: Int
+	"""
+	Announces to it that failed in a row.
+	"""
+	fails: Int!
+	lastAnnounceMs: Int
+	nextAnnounceMs: Int
+	"""
+	The earliest the tracker takes the next announce.
+	"""
+	minAnnounceMs: Int
+	"""
+	Who resolves its host; none for an address.
+	"""
+	resolvedBy: ResolvedBy
+	"""
+	The tracker's whole URL to a caller that may change trackers;
+	its scheme, host and port to one that only reads.
+	"""
+	url: String!
+}
+
+"""
+A tracker in a torrent's list, by tier.
+"""
+input TorrentTrackerInput {
+	tier: Int!
+	url: String!
+}
+
+"""
+How a torrent's unpacking came out.
+"""
+enum TorrentUnpackResult {
+	"""
+	Everything it would deliver is beside the torrent's files.
+	"""
+	WHOLE
+	"""
+	Some of it is; the reason says what is short.
+	"""
+	PART
+	"""
+	Nothing usable was delivered.
+	"""
+	FAILED
+	"""
+	The unpacking refused the torrent's files.
+	"""
+	REFUSED
+}
+
+"""
+A file a torrent's unpacking placed beside the torrent's own: no piece
+of the torrent, so it has no index, level or progress of its own.
+"""
+type TorrentUnpackedFile {
+	path: String!
+	length: Int!
+}
+
+"""
+A torrent's unpacking, once over. It is the unpacking's own: the
+torrent's state, history and counters never read it.
+"""
+type TorrentUnpacking {
+	result: TorrentUnpackResult!
+	"""
+	Why it is short of whole.
+	"""
+	reason: String
+	"""
+	The files it placed beside the torrent's own, which the torrent's
+	file list shows after them: read from the torrent's row and disk
+	only when asked for.
+	"""
+	files: [TorrentUnpackedFile!]!
+}
+
+"""
+Which hashes verify a torrent's pieces.
+"""
+enum TorrentVersion {
+	V1
+	V2
+	HYBRID
+}
+
+"""
+The tracker file a rule was filled from.
+"""
+type TrackerBinding {
+	"""
+	The tracker's name, as its file states it.
+	"""
+	name: String!
+	revision: String!
+	"""
+	When it was imported, in milliseconds since the epoch.
+	"""
+	importedAt: Int!
+	"""
+	The fields the file locked: dht, pex, lsd, encryption, ssl.
+	"""
+	locked: [String!]!
+	"""
+	The hosts the file covers, which the rule keeps while bound.
+	"""
+	hostPatterns: [String!]!
+}
+
+"""
+The certificate and private key a tracker issued, each PEM.
+"""
+input TrackerCertificateInput {
+	certificatePem: String!
+	privateKeyPem: String!
+}
+
+"""
+One value a tracker file sets: as the rule holds it and as the import
+leaves it, absent when not set.
+"""
+type TrackerFileChange {
+	field: String!
+	locked: Boolean!
+	old: String
+	new: String
+}
+
+"""
+What importing a tracker file would do. It holds nothing secret.
+"""
+type TrackerFilePreview {
+	name: String!
+	revision: String!
+	hostPatterns: [String!]!
+	"""
+	The rule the file fills; absent makes a new rule.
+	"""
+	ruleName: String
+	ruleId: Int
+	changes: [TrackerFileChange!]!
+	hasSsl: Boolean!
+	sslSubject: String
+	"""
+	When the certificate expires, in milliseconds since the epoch.
+	"""
+	sslNotAfter: Int
+	"""
+	How many archive passwords it carries; absent when it names none.
+	"""
+	archivePasswordCount: Int
+	"""
+	Pass back to `applyTrackerFile`.
+	"""
+	fingerprint: String!
+}
+
+"""
+Seeding goals for the torrents announcing to the hosts it covers, and
+whether the schedule's pause leaves them seeding until their goal is met.
+"""
+type TrackerRule {
+	id: Int!
+	"""
+	What the tracker is called; unique whatever its case.
+	"""
+	name: String!
+	"""
+	The hosts it covers, each a host, or `*.` and a domain for it and
+	every host under it. A torrent is matched when added and at start-up.
+	"""
+	hostPatterns: [String!]!
+	"""
+	The goals this rule sets; absent leaves them to the category and the
+	global policy.
+	"""
+	seeding: SeedingPolicySettings
+	neverPause: Boolean!
+	"""
+	Whether its torrents' archives are extracted; absent inherits.
+	"""
+	unpack: Boolean
+	"""
+	The client its torrents name themselves as; absent is Weaver.
+	"""
+	client: TorrentClient
+	"""
+	Whether its torrents route through their own consumer.
+	"""
+	torrentRoute: Boolean!
+	"""
+	Whether its torrents look for peers on the DHT; absent inherits. A
+	private torrent does not, whatever this says.
+	"""
+	dht: Boolean
+	"""
+	Whether its torrents exchange peers with their peers (PEX); absent
+	inherits. A private torrent does not, whatever this says.
+	"""
+	pex: Boolean
+	"""
+	Whether its torrents look for peers on the local network (LSD);
+	absent inherits. A private torrent does not, whatever this says.
+	"""
+	lsd: Boolean
+	"""
+	The encryption its torrents' connections are made under; absent
+	inherits.
+	"""
+	encryption: TorrentEncryption
+	"""
+	Whether its torrents dial peers over TCP; absent inherits. The
+	session listens as the global setting says.
+	"""
+	peerTcp: Boolean
+	"""
+	Whether its torrents dial peers over uTP; absent inherits.
+	"""
+	peerUtp: Boolean
+	"""
+	The transport its torrents try first while downloading; absent
+	inherits.
+	"""
+	preferDownloading: PeerTransport
+	"""
+	The transport its torrents try first while seeding; absent inherits.
+	"""
+	preferSeeding: PeerTransport
+	"""
+	The upload cap its torrents take in place of their category's and
+	the global one.
+	"""
+	uploadCap: BpsLeaf!
+	"""
+	Whether a torrent admitted under it starts forced.
+	"""
+	forced: Boolean!
+	"""
+	Whether it holds a certificate for its SSL torrents.
+	"""
+	hasSsl: Boolean!
+	"""
+	The certificate's subject.
+	"""
+	sslSubject: String
+	"""
+	When the certificate expires, in milliseconds since the epoch.
+	"""
+	sslNotAfter: Int
+	"""
+	The tracker file that filled it; absent when none binds it.
+	"""
+	bound: TrackerBinding
+	"""
+	How many archive passwords it holds for its torrents. The values are
+	never returned.
+	"""
+	archivePasswordCount: Int!
+}
+
+input TrackerRuleInput {
+	name: String!
+	hostPatterns: [String!]!
+	seeding: SeedingPolicyInput
+	neverPause: Boolean! = false
+	unpack: Boolean
+	client: TorrentClient
+	torrentRoute: Boolean! = false
+	dht: Boolean
+	pex: Boolean
+	lsd: Boolean
+	encryption: TorrentEncryption
+	"""
+	Left out inherits. TCP and uTP may not both be off once resolved
+	over the global setting. A preference is kept as set; while its
+	transport is off, the one left on is used.
+	"""
+	peerTcp: Boolean
+	"""
+	Left out inherits.
+	"""
+	peerUtp: Boolean
+	"""
+	Left out inherits.
+	"""
+	preferDownloading: PeerTransport
+	"""
+	Left out inherits.
+	"""
+	preferSeeding: PeerTransport
+	"""
+	Left out inherits.
+	"""
+	uploadCap: BpsLeafInput
+	forced: Boolean! = false
+	"""
+	Absent keeps the rule's certificate; null clears it.
+	"""
+	ssl: TrackerCertificateInput
+	"""
+	True clears the rule's archive passwords; false keeps them.
+	"""
+	clearArchivePasswords: Boolean! = false
+}
+
+"""
+Who named a tracker.
+"""
+enum TrackerSource {
+	TORRENT
+	OPERATOR
+}
+
+enum TrackerStatus {
+	NOT_CONTACTED
+	WORKING
+	NOT_WORKING
+	TRACKER_ERROR
+	UNREACHABLE
+	DISABLED
+}
+
+"""
+What a download comes to when a file it would deliver has an unwanted
+extension. Either way no such file is opened as an archive.
+"""
+enum UnwantedExtensionAction {
+	"""
+	The download fails.
+	"""
+	FAIL_JOB
+	"""
+	Only those files are deleted; the download ends partial, or failed
+	when no usable file is left.
+	"""
+	DELETE_FILES
+}
+
 """
 Latest stable release observed by the background release checker.
 """
@@ -5111,6 +7585,151 @@ type UpdateStatus {
 A multipart file upload
 """
 scalar Upload
+
+enum UploadOutcome {
+	UNAVAILABLE
+	MEASURED
+	FAILED
+	NO_DEMAND
+}
+
+type UploadResult {
+	http: HttpUploadResult
+	peers: PeerUploadResult
+}
+
+type UsageConsumer {
+	kind: String!
+	"""
+	A server's saved id, or a category's name; empty for no category and
+	for the queue-wide total.
+	"""
+	id: String!
+	today: UsageTotals!
+	week: UsageTotals!
+	month: UsageTotals!
+	year: UsageTotals!
+	allTime: UsageTotals!
+	range: UsageTotals!
+	"""
+	Every date of the range in order, days with nothing at zero.
+	"""
+	days: [UsageDay!]!
+	"""
+	For a removed server whose rows are kept until its quota resets: the
+	server's name when it was removed. Absent for every other consumer.
+	"""
+	removedHost: String
+}
+
+enum UsageConsumerKind {
+	SERVER
+	CATEGORY
+	"""
+	NZB jobs finished and repaired.
+	"""
+	JOB
+	"""
+	Job stages, by name.
+	"""
+	STAGE
+	"""
+	Every torrent together.
+	"""
+	TORRENT
+	"""
+	Torrents by the tracker hosts they list.
+	"""
+	TRACKER
+}
+
+type UsageDay {
+	"""
+	`YYYY-MM-DD`.
+	"""
+	day: String!
+	bytes: Int!
+	articlesTried: Int!
+	articlesSucceeded: Int!
+	downSeconds: Int!
+	bytesUploaded: Int!
+	events: Int!
+	durationMs: Int!
+}
+
+type UsageHistory {
+	"""
+	This host's local date, `YYYY-MM-DD`.
+	"""
+	today: String!
+	rangeStart: String!
+	rangeEnd: String!
+	"""
+	The start of today on this host, in epoch seconds.
+	"""
+	todayStartEpochSec: Int!
+	"""
+	The sum over every consumer of the asked kind, servers when none is
+	asked. Servers and categories count the same bytes, so the two are
+	never added together.
+	"""
+	total: UsageConsumer!
+	consumers: [UsageConsumer!]!
+	"""
+	Jobs that finished today, by how they ended.
+	"""
+	finishedToday: FinishedJobs!
+	"""
+	Jobs that finished inside the range, by how they ended.
+	"""
+	finishedInRange: FinishedJobs!
+}
+
+enum UsagePeriod {
+	TODAY
+	"""
+	Monday to today.
+	"""
+	WEEK
+	MONTH
+	YEAR
+	ALL
+	"""
+	`fromDay` to `toDay`, both included.
+	"""
+	CUSTOM
+}
+
+input UsageRange {
+	period: UsagePeriod!
+	"""
+	`YYYY-MM-DD`, for a custom range.
+	"""
+	fromDay: String
+	"""
+	`YYYY-MM-DD`, for a custom range.
+	"""
+	toDay: String
+}
+
+type UsageTotals {
+	bytes: Int!
+	articlesTried: Int!
+	articlesSucceeded: Int!
+	downSeconds: Int!
+	"""
+	Sent to peers, for a torrent or tracker.
+	"""
+	bytesUploaded: Int!
+	"""
+	Jobs for a job row, timed runs for a stage.
+	"""
+	events: Int!
+	"""
+	Stage time, or seeding time, in milliseconds.
+	"""
+	durationMs: Int!
+}
 
 type UsenetResult {
 	articlesRequested: Int!

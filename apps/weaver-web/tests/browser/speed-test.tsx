@@ -15,6 +15,7 @@ import { RoutesPage } from "@/next/features/networking/RoutesPage";
 import { SpeedPage } from "@/next/features/networking/SpeedPage";
 import { nextEn } from "@/next/i18n/en";
 import { SettingsShellProvider } from "@/next/pages/settings/framework";
+import { SearchRegistry } from "@/next/pages/settings/search";
 import "@/next/fonts.css";
 import "@/next/theme.css";
 
@@ -25,13 +26,13 @@ const t: Translate = (key, values) =>
   Object.entries(values ?? {}).reduce((text, [name, value]) => text.replaceAll(`{{${name}}}`, String(value)), dictionary[key] ?? key);
 
 const egresses: Egress[] = [
-  { id: 0, name: "System", bindingKind: "SYSTEM", interfaceName: null, sourceAddress: null, enabled: true, maxDownloadSpeed: 0, health: "UP", reason: null },
-  { id: 1, name: "WAN Fiber", bindingKind: "SOURCE_ADDRESS", interfaceName: null, sourceAddress: "192.0.2.10", enabled: true, maxDownloadSpeed: 0, health: "UP", reason: null },
+  { id: 0, name: "System", bindingKind: "SYSTEM", interfaceName: null, sourceAddress: null, enabled: true, downloadBps: null, uploadBps: null, health: "UP", reason: null },
+  { id: 1, name: "WAN Fiber", bindingKind: "SOURCE_ADDRESS", interfaceName: null, sourceAddress: "192.0.2.10", enabled: true, downloadBps: null, uploadBps: null, health: "UP", reason: null },
 ];
 const profile = (id: number, name: string, kind: ProxyKind): ProxyProfile => ({
-  id, name, kind, enabled: true, host: `${name.toLowerCase()}.fixture.invalid`, port: 51820, resolver: "WEAVER", dnsServers: [],
+  id, name, kind, enabled: true, host: `${name.toLowerCase()}.fixture.invalid`, port: 51820, dnsServers: [],
   tunnelAddresses: [`10.0.0.${id}/32`], peerPublicKey: null, tunnelPublicKey: null, mtu: 1420, keepaliveSeconds: null,
-  timeoutSeconds: 10, hostKeyFingerprint: null, hasUsername: false, hasPassword: false, hasPrivateKey: true,
+  timeoutSeconds: 10, hostKeyFingerprint: null, natpmp: false, forwardedPort: null, hasUsername: false, hasPassword: false, hasPrivateKey: true,
   hasPassphrase: false, hasPresharedKey: false,
 });
 const profiles = [profile(1, "Amsterdam", "WIRE_GUARD"), profile(2, "Frankfurt", "WIRE_GUARD")];
@@ -71,13 +72,13 @@ const MIB = 1024 * 1024;
 const runs: SpeedTestRun[] = [
   {
     id: 1, consumer: "server:1", consumerName: "news.fixture.invalid", kind: "BANDWIDTH",
-    request: { bandwidth: { providerId: "cloudflare", server: null, customUrl: null }, usenet: null },
+    request: { bandwidth: { providerId: "cloudflare", server: null, customUrl: null, uploadMib: null }, usenet: null, torrent: null },
     status: "COMPLETED", phase: null, startedAt: 1790640000000, finishedAt: 1790640010000, failure: null,
-    tested: { legs: [{ position: 0, egressId: 0, weight: 100, down: false, downReason: null, path: { kind: "DIRECT" }, target: 4 }], failover: "REDISTRIBUTE", overrides: noOverrides(), names: [{ kind: "egress", id: 0, name: "System" }] },
+    tested: { legs: [{ position: 0, egressId: 0, weight: 100, down: false, downReason: null, path: { kind: "DIRECT", rungs: [], directFallback: false }, target: 4 }], failover: "REDISTRIBUTE", overrides: noOverrides(), names: [{ kind: "egress", id: 0, name: "System" }] },
     result: {
       bytes: 100 * MIB, elapsedMs: 10000, averageBps: 10 * MIB, peakBps: 12 * MIB,
       legs: [{ position: 0, bytes: 100 * MIB, averageBps: 10 * MIB, peakBps: 12 * MIB, connections: 4, sourceAddresses: ["192.0.2.10"] }],
-      connections: [], usenet: null, bandwidth: { providerId: "cloudflare", server: null, url: "https://speed.fixture.invalid/__down", connections: 4 },
+      connections: [], usenet: null, bandwidth: { providerId: "cloudflare", server: null, url: "https://speed.fixture.invalid/__down", connections: 4 }, upload: null,
       samples: [{ atMs: 1000, leg: 0, bytes: 10 * MIB, decodedBytes: 0 }],
     },
   },
@@ -105,6 +106,7 @@ function report(run: SpeedTestRun): SpeedTestRun {
       connections: live.map((leg) => ({ leg: leg.position, connectMs: 18, path: { egressId: leg.egressId, rung: null, poolId: null, memberId: null, proxyIds: [] }, sourceAddress: "192.0.2.10:45123", bytes: 240 * MIB / live.length, bytesPerSecond: 0, error: null })),
       usenet: usenet ? { articlesRequested: 320, delivered: 318, missing: 2, failed: 0, declaredBytes: 100_000_000, decodedBytes: 230 * MIB, pipelining: true, tls: true, tlsCipherSuite: "TLS13_AES_256_GCM_SHA384" } : null,
       bandwidth: usenet ? null : { providerId: "cloudflare", server: null, url: "https://speed.fixture.invalid/__down", connections: 4 },
+      upload: null,
       samples: live.flatMap((leg) => [1000, 2000].map((atMs) => ({ atMs, leg: leg.position, bytes: 10 * MIB, decodedBytes: usenet ? 9 * MIB : 0 }))),
     },
   });
@@ -126,10 +128,10 @@ function reported(route: NonNullable<SpeedTestInput["route"]>): NetworkRoute {
               directFallback: leg.path.ladder.directFallback,
               rungs: leg.path.ladder.rungs.map((rung) =>
                 "proxy" in rung
-                  ? { kind: "PROXY", proxyId: rung.proxy, poolId: null, chainIds: [] }
+                  ? { kind: "PROXY", proxyId: rung.proxy ?? null, poolId: null, chainIds: [] }
                   : "pool" in rung
-                    ? { kind: "POOL", poolId: rung.pool, proxyId: null, chainIds: [] }
-                    : { kind: "CHAIN", chainIds: rung.chain, proxyId: null, poolId: null },
+                    ? { kind: "POOL", poolId: rung.pool ?? null, proxyId: null, chainIds: [] }
+                    : { kind: "CHAIN", chainIds: rung.chain ?? [], proxyId: null, poolId: null },
               ),
             },
     })),
@@ -158,6 +160,7 @@ function measure(id: number, seconds = 1) {
       }),
       usenet: run.kind === "USENET" ? { articlesRequested: 320, delivered: 120, missing: 0, failed: 0, declaredBytes: 100_000_000, decodedBytes: Math.round(total * live.length * 0.97), pipelining: true, tls: true, tlsCipherSuite: "TLS13_AES_256_GCM_SHA384" } : null,
       bandwidth: null,
+      upload: null,
       samples: Array.from({ length: seconds }, (_, index) => index + 1).flatMap((second) => live.map((leg) => ({
         atMs: second * 1000, leg: leg.position, bytes: binBytes(second),
         decodedBytes: run.kind === "USENET" ? Math.round(binBytes(second) * (0.9 + 0.08 * Math.cos(second))) : 0,
@@ -189,16 +192,17 @@ function graphql(name: string, variables: Record<string, unknown>) {
     const overrides = input.overrides ?? noOverrides();
     const run: SpeedTestRun = {
       id: runs.reduce((top, entry) => Math.max(top, entry.id), 0) + 1,
-      consumer: owner.key, consumerName: owner.name, kind: input.usenet ? "USENET" : "BANDWIDTH",
+      consumer: owner.key, consumerName: owner.name, kind: input.usenet ? "USENET" : input.torrent ? "TORRENT" : "BANDWIDTH",
       // Kept as the daemon keeps it: every field present, absent ones null.
       request: {
-        bandwidth: input.bandwidth ? { providerId: input.bandwidth.providerId ?? null, server: input.bandwidth.server ?? null, customUrl: input.bandwidth.customUrl ?? null } : null,
+        bandwidth: input.bandwidth ? { providerId: input.bandwidth.providerId ?? null, server: input.bandwidth.server ?? null, customUrl: input.bandwidth.customUrl ?? null, uploadMib: input.bandwidth.uploadMib ?? null } : null,
         usenet: usenet
           ? {
               sabSize: usenet.sabSize ?? null, nzbUrl: usenet.nzbUrl ?? null, nzbFilename: uploaded?.upload ?? held,
               nzbRunId: usenet.nzbRunId ?? null, connections: usenet.connections ?? null, maxDurationSeconds: usenet.maxDurationSeconds,
             }
           : null,
+        torrent: input.torrent ? { maxDurationSeconds: input.torrent.maxDurationSeconds ?? 20 } : null,
       }, status: "RUNNING", phase: "draining 3",
       startedAt: 1790640100000, finishedAt: null, failure: null,
       tested: {
@@ -206,7 +210,7 @@ function graphql(name: string, variables: Record<string, unknown>) {
         failover: tested.failover, overrides, names: [],
       },
       // Nothing is sampled before the run measures.
-      result: { bytes: 0, elapsedMs: 0, averageBps: 0, peakBps: 0, legs: [], connections: [], usenet: null, bandwidth: null, samples: [] },
+      result: { bytes: 0, elapsedMs: 0, averageBps: 0, peakBps: 0, legs: [], connections: [], usenet: null, bandwidth: null, upload: null, samples: [] },
     };
     runs.unshift(run);
     return { data: { startSpeedTest: run } };
@@ -269,10 +273,25 @@ const screen = query.has("routes")
  * With `?downloading` a job is downloading, so a run asks before it pauses downloads; otherwise the queue is idle.
  * With `?gauge` the header gauge reads a rate, as it can just after a Usenet run.
  */
+const activeJobs = Number(query.has("downloading"));
+const queue: NextData["queue"] = {
+  summary: { totalItems: activeJobs, queuedItems: 0, activeItems: activeJobs, pausedItems: 0 },
+  stateCounts: activeJobs ? [{ state: "DOWNLOADING", count: activeJobs }] : [],
+  categories: [],
+  totalCount: activeJobs,
+  isLoading: false,
+  error: null,
+  refresh: () => {},
+};
 const live = {
   isPaused: false,
   speed: query.has("gauge") ? 12 * 1024 * 1024 : 0,
-  queue: { stateCounts: query.has("downloading") ? [{ state: "DOWNLOADING", count: 1 }] : [] } as NextData["queue"],
+  queue,
+  // The routes table offers no saved DNS profiles here.
+  dnsRouteProfiles: undefined,
+  wantDnsProfiles: () => {},
+  torrents: "on",
+  torrentPresence: { available: true, enabled: true, jobs: false, running: false, windingDown: false, windDown: null },
 } as NextData;
-const shell = { search: "", actionsRef: { current: null }, setFlags: () => {}, controlsHost: document.getElementById("controls") };
+const shell = { search: "", actionsRef: { current: null }, setFlags: () => {}, controlsHost: document.getElementById("controls"), registry: new SearchRegistry() };
 createRoot(document.getElementById("root")!).render(<StrictMode><Provider value={client}><TranslateContext.Provider value={{ t, uiLanguage: "eng", selectedLanguage: { code: "eng", label: "English" }, setLanguagePreference: () => {} }}><MemoryRouter initialEntries={[query.has("routes") ? "/settings/networking/routes" : "/settings/networking/speed?consumer=server:1"]}><SettingsShellProvider {...shell}><NextDataContext.Provider value={live}><main className="mx-auto flex max-w-[1400px] flex-col p-8">{screen}</main></NextDataContext.Provider></SettingsShellProvider></MemoryRouter></TranslateContext.Provider></Provider></StrictMode>);

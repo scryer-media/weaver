@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+import { useState } from "react";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { SecondaryButton } from "../components/controls";
+import { Icon } from "../components/icons";
+import { Menu, MenuItem } from "../components/Menu";
 import {
   copySupportReport,
   downloadSupportReportJson,
@@ -31,7 +34,8 @@ async function downloadReport(t: Translate, fetchReport: () => Promise<SupportRe
 }
 
 /**
- * "Copy support report" and "Download JSON" for one job, in any state.
+ * One "Support report" button for one job, in any state, whose menu copies
+ * the report or downloads it as JSON.
  *
  * The outcome is reported through `onReport` so each surface shows it where
  * it already shows the result of its other actions.
@@ -49,6 +53,7 @@ export function SupportReportActions({
 }) {
   const t = useTranslate();
   const { busy, fetchReport } = useJobSupportReport(jobId);
+  const [open, setOpen] = useState(false);
 
   const copy = async () => {
     onReport(await copyReport(t, fetchReport));
@@ -59,29 +64,43 @@ export function SupportReportActions({
   };
 
   return (
-    <>
+    <div className="relative flex">
       <SecondaryButton
-        icon="copy"
+        icon="logs"
         size={size}
         className={className}
         disabled={busy}
-        onClick={() => {
-          void copy();
-        }}
+        menuOpen={open}
+        onClick={() => setOpen((previous) => !previous)}
       >
-        {t("next.support.copyReport")}
+        {t("next.support.report")}
+        <Icon name="dropdown" size={12} className="-mr-[2px] ml-[6px] flex-none text-wv-muted" />
       </SecondaryButton>
-      <SecondaryButton
-        icon="downloadFile"
-        size={size}
-        className={className}
-        disabled={busy}
-        onClick={() => {
-          void download();
-        }}
+      <Menu
+        open={open}
+        onDismiss={() => setOpen(false)}
+        label={t("next.support.report")}
+        className="top-[calc(100%+4px)] left-0 w-max min-w-full"
       >
-        {t("next.support.downloadJson")}
-      </SecondaryButton>
-    </>
+        <MenuItem
+          action
+          onSelect={() => {
+            setOpen(false);
+            void copy();
+          }}
+        >
+          {t("next.support.copy")}
+        </MenuItem>
+        <MenuItem
+          action
+          onSelect={() => {
+            setOpen(false);
+            void download();
+          }}
+        >
+          {t("next.support.downloadJson")}
+        </MenuItem>
+      </Menu>
+    </div>
   );
 }

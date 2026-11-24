@@ -222,6 +222,8 @@ fn said(emits: &[Emit]) -> Vec<Said> {
             Emit::Refuse(why) => out.push(Said::Refuse(*why)),
             // Said beside the walk; `checksums` reads them.
             Emit::Checksum { .. } => {}
+            // Text for the log, which changes nothing.
+            Emit::Failed(_) => {}
             other => panic!("an engine run does not say {other:?}"),
         }
     }
@@ -681,6 +683,8 @@ fn a_run_asks_for_a_password_before_its_volumes_close() {
     );
 }
 
+// The walk goes on past the failed member, and the run ends refused once
+// every member is ruled on.
 #[test]
 fn a_member_whose_checksum_fails_is_retracted_and_refused() {
     let mut archive = plain();
@@ -690,11 +694,14 @@ fn a_member_whose_checksum_fails_is_retracted_and_refused() {
         .unwrap();
     archive[at + 3] ^= 0x20;
     let said = run(&mut ZipEngine::new(), vec![archive]);
+    let retracted = said.iter().position(|said| *said == Said::Retract(1));
+    assert!(retracted.is_some(), "{said:?}");
     assert_eq!(
         said[said.len() - 2..],
-        [Said::Retract(1), Said::Refuse(Why::Unrepairable)]
+        [Said::Closed(2), Said::Refuse(Why::Unrepairable)]
     );
     assert!(!said.contains(&Said::Closed(1)));
+    assert!(said.contains(&Said::Bytes(2, second())));
 }
 
 #[test]
@@ -756,44 +763,50 @@ fn zip64_places_past_the_end_of_the_bytes_are_refused_as_unsupported() {
 #[test]
 fn claim_names_the_volumes_of_its_own_set_with_the_last_after_them() {
     let mut engine = named(&["Set.Z01"]);
-    assert_eq!(engine.claim("set.z02", b"", None), vec![VolumeIndex(1)]);
-    assert_eq!(engine.claim("set.z100", b"", None), vec![VolumeIndex(99)]);
     assert_eq!(
-        engine.claim("set.zip", b"", None),
+        engine.claim("set.z02", (b"").into(), None),
+        vec![VolumeIndex(1)]
+    );
+    assert_eq!(
+        engine.claim("set.z100", (b"").into(), None),
+        vec![VolumeIndex(99)]
+    );
+    assert_eq!(
+        engine.claim("set.zip", (b"").into(), None),
         vec![VolumeIndex(u32::MAX)],
         "the last is after every numbered volume, whatever their count"
     );
     assert_eq!(
-        engine.claim("set.z01", b"", None),
+        engine.claim("set.z01", (b"").into(), None),
         vec![VolumeIndex(0)],
         "a volume posted again is that volume"
     );
     assert_eq!(
-        engine.claim("set.z00", b"", None),
+        engine.claim("set.z00", (b"").into(), None),
         Vec::<VolumeIndex>::new()
     );
     assert_eq!(
-        engine.claim("other.z02", b"", None),
+        engine.claim("other.z02", (b"").into(), None),
         Vec::<VolumeIndex>::new()
     );
     assert_eq!(
-        engine.claim("set.7z.002", b"", None),
+        engine.claim("set.7z.002", (b"").into(), None),
         Vec::<VolumeIndex>::new()
     );
     engine.bound(VolumeIndex(u32::MAX), "set.zip", &[], None);
     assert_eq!(
-        engine.claim("set.zip", b"", None),
+        engine.claim("set.zip", (b"").into(), None),
         vec![VolumeIndex(u32::MAX)]
     );
     assert_eq!(
-        engine.claim("set.z02", b"", None),
+        engine.claim("set.z02", (b"").into(), None),
         vec![VolumeIndex(1)],
         "a numbered volume posted after the last still takes its number"
     );
 
     let mut lone = named(&["set.zip"]);
     assert_eq!(
-        lone.claim("set.z01", b"", None),
+        lone.claim("set.z01", (b"").into(), None),
         Vec::<VolumeIndex>::new(),
         "a lone zip has no siblings"
     );
@@ -1148,9 +1161,11 @@ fn a_stale_local_size_does_not_hide_corrupt_plaintext() {
         .unwrap();
     bytes[body + 3] ^= 0x20;
     let said = run(&mut ZipEngine::new(), vec![bytes]);
+    // The walk goes on past the failed member to the next.
+    assert!(said.contains(&Said::Retract(1)), "{said:?}");
     assert_eq!(
         said[said.len() - 2..],
-        [Said::Retract(1), Said::Refuse(Why::Unrepairable)]
+        [Said::Closed(2), Said::Refuse(Why::Unrepairable)]
     );
     assert!(!said.contains(&Said::Closed(1)));
 }
@@ -1286,4 +1301,97 @@ fn a_deflated_member_is_said_in_quarter_megabyte_pieces() {
             Said::Closed(0),
         ]
     );
+}
+
+// One whole volume whose bytes at `lost` nothing will bring, read as the
+// run's volumes read them: a read ends short where the lost span starts,
+// and one that starts in it fails with the span.
+struct Losing {
+    bytes: Vec<u8>,
+    lost: std::ops::Range<usize>,
+}
+
+impl Volumes for Losing {
+    fn next(&self, after: Option<VolumeIndex>) -> io::Result<Option<VolumeIndex>> {
+        Ok(after.is_none().then_some(VolumeIndex(0)))
+    }
+
+    fn len(&self, _: VolumeIndex) -> Option<u64> {
+        Some(self.bytes.len() as u64)
+    }
+
+    fn read_at(&self, volume: VolumeIndex, offset: u64, into: &mut [u8]) -> io::Result<usize> {
+        let offset = (offset as usize).min(self.bytes.len());
+        if self.lost.contains(&offset) {
+            let range = ByteRange::new(offset as u64, self.lost.end as u64);
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                weaver_graph::Lost { volume, range },
+            ));
+        }
+        let end = match offset < self.lost.start {
+            true => self.lost.start,
+            false => self.bytes.len(),
+        };
+        let read = into.len().min(end - offset);
+        into[..read].copy_from_slice(&self.bytes[offset..offset + read]);
+        Ok(read)
+    }
+}
+
+// Two members, the first written under `options`, its data's `lost` bytes,
+// counted from its start, lost; and the run over them.
+fn lost_in_first(
+    first: &[u8],
+    options: SimpleFileOptions,
+    lost: std::ops::Range<usize>,
+    password: Option<&str>,
+) -> Vec<Said> {
+    let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    writer.start_file("first.bin", options).unwrap();
+    writer.write_all(first).unwrap();
+    writer.start_file("notes.txt", stored).unwrap();
+    writer.write_all(NOTES).unwrap();
+    let archive = writer.finish().unwrap().into_inner();
+    // The first member's data starts past its local header, 30 bytes, its
+    // name and its extra field.
+    let start = 30
+        + u16::from_le_bytes([archive[26], archive[27]]) as usize
+        + u16::from_le_bytes([archive[28], archive[29]]) as usize;
+    let losing = Arc::new(Losing {
+        bytes: archive,
+        lost: start + lost.start..start + lost.end,
+    });
+    let mut engine = ZipEngine::new();
+    if let Some(password) = password {
+        engine.offer_password(password, &mut Vec::new());
+    }
+    run_over(&mut engine, losing)
+}
+
+// A member that lost bytes cross fails whatever its method, and the next
+// closes: the run reads no lost byte as anything, and says nothing of the
+// archive, whose owner knows its bytes were lost.
+#[test]
+fn a_member_across_lost_bytes_fails_and_the_next_closes() {
+    let mut first = payload(13, 2_000);
+    first.resize(6_000, 0);
+    let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    let aes = stored.with_aes_encryption(AesMode::Aes256, PASSWORD);
+    for (kind, options, lost) in [
+        ("stored", stored, 3_000..4_000),
+        ("deflated", deflated, 100..300),
+        ("aes", aes, 3_000..4_000),
+    ] {
+        let said = lost_in_first(&first, options, lost, Some(PASSWORD));
+        assert!(!said.contains(&Said::Closed(0)), "{kind}: {said:?}");
+        assert!(said.contains(&Said::Retract(0)), "{kind}: {said:?}");
+        assert_eq!(
+            said[said.len() - 2..],
+            [Said::Bytes(1, NOTES.to_vec()), Said::Closed(1)],
+            "{kind}"
+        );
+    }
 }

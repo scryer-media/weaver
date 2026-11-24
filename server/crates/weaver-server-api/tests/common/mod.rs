@@ -7,6 +7,7 @@
 use std::sync::{
     Arc, Condvar, Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock, RwLock as StdRwLock,
 };
+use weaver_server_core::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
 
 use async_graphql::{Request, Response, Variables};
 use serde_json::Value;
@@ -46,6 +47,9 @@ pub struct TestHarness {
     pub security: weaver_server_core::security::RuntimeSecurityConfig,
     pub update_check: weaver_server_core::update_check::UpdateCheckService,
     pub log_buffer: weaver_server_core::runtime::log_buffer::LogRingBuffer,
+    // The data used recorder the schema holds, when the harness was built
+    // with one.
+    pub usage_recorder: Option<Arc<weaver_server_core::operations::UsageRecorder>>,
     _scheduler_task: JoinHandle<()>,
     _tempdir: tempfile::TempDir,
 }
@@ -92,7 +96,20 @@ impl TestHarness {
     pub async fn new_with_security(
         security: weaver_server_core::security::RuntimeSecurityConfig,
     ) -> Self {
-        Self::new_with_options_and_security(true, security).await
+        Self::new_with_options_and_security(true, security, None).await
+    }
+
+    // Like [`TestHarness::new`] but with a data used recorder in the schema,
+    // as production has, for tests of what a server removal hands it.
+    pub async fn new_with_usage_recorder() -> Self {
+        Self::new_with_options_and_security(
+            true,
+            weaver_server_core::security::RuntimeSecurityConfig::default(),
+            Some(Arc::new(
+                weaver_server_core::operations::UsageRecorder::new(),
+            )),
+        )
+        .await
     }
 
     async fn new_with_options(spawn_history_delete_worker: bool) -> Self {
@@ -100,6 +117,7 @@ impl TestHarness {
             spawn_history_delete_worker,
             // Loopback, no environment override: the shape a fresh install has.
             weaver_server_core::security::RuntimeSecurityConfig::default(),
+            None,
         )
         .await
     }
@@ -107,6 +125,7 @@ impl TestHarness {
     async fn new_with_options_and_security(
         spawn_history_delete_worker: bool,
         security: weaver_server_core::security::RuntimeSecurityConfig,
+        usage_recorder: Option<Arc<weaver_server_core::operations::UsageRecorder>>,
     ) -> Self {
         let tempdir = tempfile::TempDir::new().expect("failed to create tempdir");
         let mut db = Database::open_in_memory().expect("failed to open in-memory DB");
@@ -115,13 +134,16 @@ impl TestHarness {
         );
 
         let config = Config {
+            upload_cap: None,
+            seeding: None,
+            torrent: Default::default(),
             data_dir: tempdir.path().to_string_lossy().to_string(),
             intermediate_dir: None,
             complete_dir: None,
             servers: vec![],
             categories: vec![],
             retry: None,
-            max_download_speed: None,
+            bandwidth: Default::default(),
             cleanup_after_extract: None,
             delete_failed_job_files: None,
             history_retention_days: None,
@@ -153,8 +175,10 @@ impl TestHarness {
             handle.clone(),
             shared_config.clone(),
         );
-        let auth_cache =
-            LoginAuthCache::from_credentials(None, db.get_or_create_jwt_signing_secret().unwrap());
+        let auth_cache = LoginAuthCache::from_credentials(
+            None,
+            &weaver_server_core::auth::SigningKeys::for_database(&db).unwrap(),
+        );
         let api_key_cache = ApiKeyCache::from_rows(vec![]);
         let shared_schedules: weaver_server_core::bandwidth::schedule::SharedSchedules =
             Arc::new(RwLock::new(vec![]));
@@ -242,6 +266,9 @@ impl TestHarness {
             nntp_pool: None,
             spawn_history_delete_worker,
             post_processing_executor: None,
+            torrents: None,
+            torrent_availability: weaver_server_core::torrents::TorrentAvailability::AVAILABLE,
+            usage_recorder: usage_recorder.clone(),
         });
 
         Self {
@@ -257,6 +284,7 @@ impl TestHarness {
             security,
             update_check,
             log_buffer,
+            usage_recorder,
             _scheduler_task: scheduler_task,
             _tempdir: tempdir,
         }

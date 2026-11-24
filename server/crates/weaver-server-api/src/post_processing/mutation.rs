@@ -2,6 +2,13 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use std::path::PathBuf;
+use weaver_server_core::history::queries::HistoryQueries;
+use weaver_server_core::post_processing::events::PostProcessingEventsCancelEventScriptsQueries;
+use weaver_server_core::post_processing::instances::PostProcessingInstancesQueries;
+use weaver_server_core::post_processing::preset::PostProcessingPresetQueries;
+use weaver_server_core::post_processing::secrets::PostProcessingSecretsQueries;
+use weaver_server_core::post_processing::settings::PostProcessingSettingsQueries;
+use weaver_server_core::post_processing::test_run::PostProcessingTestRunQueries;
 
 use super::*;
 use crate::auth::{AdminGuard, FreshAdminGuard, graphql_error};
@@ -136,6 +143,9 @@ impl PostProcessingMutation {
                 batch_interpreter,
                 go_interpreter,
                 unacceptable_extensions,
+                // Saved on its own (`set_unwanted_extension_action`); the
+                // save keeps the stored one.
+                unwanted_extension_action: current.unwanted_extension_action,
                 global_scripts_run: global_scripts_run
                     .map(Into::into)
                     .unwrap_or(current.global_scripts_run),
@@ -174,6 +184,23 @@ impl PostProcessingMutation {
                 .map_err(|error| async_graphql::Error::new(error.to_string()))?
                 .map_err(|error| async_graphql::Error::new(error.to_string()))?;
         Ok(settings.unacceptable_extensions)
+    }
+
+    /// Choose what a download holding a file with an unwanted extension
+    /// comes to, and nothing else. Returns the choice as saved.
+    #[graphql(guard = "AdminGuard")]
+    async fn set_unwanted_extension_action(
+        &self,
+        ctx: &Context<'_>,
+        action: UnwantedExtensionActionGql,
+    ) -> Result<UnwantedExtensionActionGql> {
+        let db = ctx.data::<Database>()?.clone();
+        let settings =
+            tokio::task::spawn_blocking(move || db.save_unwanted_extension_action(action.into()))
+                .await
+                .map_err(|error| async_graphql::Error::new(error.to_string()))?
+                .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+        Ok(settings.unwanted_extension_action.into())
     }
 
     /// Select the sole live source of scripts. Changing it turns every
@@ -548,6 +575,7 @@ impl PostProcessingMutation {
                     .ok()
                     .and_then(|path| path.parent().map(PathBuf::from)),
                 previous_script_status: Default::default(),
+                tags: Vec::new(),
                 parameters: metadata,
                 marked_bad: false,
                 final_directory_override: None,

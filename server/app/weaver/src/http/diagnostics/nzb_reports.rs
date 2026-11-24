@@ -85,6 +85,8 @@ fn entry_error(error: &SupportReportError) -> EntryError {
         SupportReportError::NotFound(_) => "the job left the queue and history before its report",
         SupportReportError::NzbUnavailable(_) => "the job's NZB is no longer stored",
         SupportReportError::Parse(_) => "the job's stored NZB could not be read as an NZB",
+        SupportReportError::TorrentParse(_) => "the job's torrent could not be read",
+        SupportReportError::TorrentUnavailable(_) => "the job's torrent is no longer held",
         SupportReportError::State(_) => "the database could not be read for the job's report",
         SupportReportError::Task(_) => "the report task stopped before it finished",
     };
@@ -136,7 +138,7 @@ pub(super) async fn collect_nzb_reports_within(
         let task = tokio::task::spawn_blocking(move || {
             // The NZB is read, parsed and dropped inside this call; only the
             // report leaves it.
-            build_job_support_report(&db, Some(info), job_id, &environment, now_epoch_secs)
+            build_job_support_report(&db, Some(info), None, job_id, &environment, now_epoch_secs)
                 .and_then(|report| {
                     serde_json::from_str::<serde_json::Value>(&report.json)
                         .map_err(|error| SupportReportError::Task(error.to_string()))

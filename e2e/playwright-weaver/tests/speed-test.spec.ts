@@ -4,7 +4,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { APIRequestContext, Locator, Page } from "@playwright/test";
-import { expect, graphql, submitProbeNzb, test, weaverRoute } from "./helpers";
+import { expect, expectGraphqlErrors, graphql, submitProbeNzb, test, weaverRoute } from "./helpers";
 import { postProbeFile, waitTerminal } from "./support/downloads";
 import { advanceClock, clockFile } from "./support/e2e-clock";
 import { directLeg, ladderLeg, rung } from "./support/network-flow";
@@ -549,6 +549,7 @@ test("ST05 a two-leg route splits the connections, a leg taken down gives them a
   // Both legs down: the start is refused and nothing runs.
   const runsBefore = (await speedTestRuns(request)).length;
   await speed.takeLegDown(1);
+  expectGraphqlErrors(page, /leave at least one leg up/);
   await speed.runRefused("Leave at least one leg up."); // copy-is-claim: the refusal sentence is what the page answers a refused start with
   expect((await speedTestRuns(request)).length).toBe(runsBefore);
   expect((await queueState(request)).isPaused).toBe(false);
@@ -711,6 +712,7 @@ test("ST09 a run books against the server's download quota, stops at it, and is 
   await world.updateServer(server, { downloadQuota: serverQuota(quota.usedBytes) });
   await expect.poll(async () => (await serverQuotaUsed(request, server)).blocked, { timeout: 0, message: "quota blocked" }).toBe(true);
   const runsBefore = (await speedTestRuns(request)).length;
+  expectGraphqlErrors(page, /has used its download quota/);
   await speed.runRefused(`${PROXIED_HOST} has used its download quota.`); // copy-is-claim: the refusal sentence is what the page answers a blocked start with
   expect((await speedTestRuns(request)).length).toBe(runsBefore);
   expect(await startRefusal(request, server, nzb.url)).toMatchObject({ code: "SPEED_TEST_QUOTA_BLOCKED" });

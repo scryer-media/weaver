@@ -134,8 +134,10 @@ pub(crate) struct Objects;
 
 impl Builder for Objects {
     fn build(&mut self, kind: Kind, _: ObjectId) -> Option<Box<dyn Object>> {
+        // The member inside the root's archive has a name that says an
+        // archive, so it opens as its bytes come (`Tree::opens_as_layer`).
         let inner = match kind {
-            Kind::Xz => "inner.gz",
+            Kind::Xz => "inner.tar",
             Kind::Gzip => "leaf.bin",
             _ => return None,
         };
@@ -193,6 +195,8 @@ fn a_rebuilt_tree_has_the_records_it_was_exported_from() {
     assert_eq!(kinds, vec![None, Some(Kind::Xz), Some(Kind::Gzip)]);
 
     let rebuilt = Tree::rebuild(&record, &Objects).expect("rebuilds");
+    tree.bound_kinds_recounted().unwrap();
+    rebuilt.bound_kinds_recounted().unwrap();
     let again = rebuilt.records();
     for (before, after) in record.nodes.iter().zip(&again.nodes) {
         assert_eq!(before, after, "node {:?}", before.node);
@@ -282,6 +286,7 @@ fn a_retired_node_comes_back_retired_with_what_it_gave_up() {
     record.nodes[1].state = NodeState::Retired;
     record.nodes[0].members[1].given_up = Some((NodeId(1), VolumeIndex(0)));
     let rebuilt = Tree::rebuild(&record, &Objects).expect("rebuilds");
+    rebuilt.bound_kinds_recounted().unwrap();
     assert_eq!(
         rebuilt.retired(NodeId::ROOT, archive),
         Some((NodeId(1), VolumeIndex(0)))

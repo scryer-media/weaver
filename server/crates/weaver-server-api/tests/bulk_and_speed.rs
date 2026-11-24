@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use weaver_server_core::proxies::ProxiesNetworkPersistenceQueries;
 mod common;
 
 use async_graphql::Value;
@@ -18,24 +19,84 @@ async fn set_speed_limit() {
 }
 
 #[tokio::test]
-async fn set_speed_limit_becomes_the_configured_limit() {
+async fn set_speed_limit_becomes_the_global_download_limit() {
     let h = TestHarness::new().await;
+    let bandwidth = r#"{ networking { bandwidth { downloadBps uploadBps } } }"#;
+    assert_no_errors(
+        &h.execute(r#"mutation { setBandwidth(input: { uploadBps: 4096 }) { uploadBps } }"#)
+            .await,
+    );
     let resp = h
         .execute(r#"mutation { setSpeedLimit(bytesPerSec: 2097161) }"#)
         .await;
     assert_no_errors(&resp);
-    let resp = h.execute(r#"{ settings { maxDownloadSpeed } }"#).await;
+    let resp = h.execute(bandwidth).await;
     assert_no_errors(&resp);
     assert_eq!(
-        response_data(&resp)["settings"]["maxDownloadSpeed"],
-        2097161
+        response_data(&resp)["networking"]["bandwidth"],
+        serde_json::json!({ "downloadBps": 2097161, "uploadBps": 4096 })
     );
+    assert_eq!(
+        h.db.network_bandwidth().unwrap().download_bps,
+        Some(2097161)
+    );
+    // The old call's 0 is no limit.
     let resp = h
-        .execute(r#"mutation { setSpeedLimit(bytesPerSec: 0) }"#)
+        .execute(r#"mutation { setQueueSpeedLimit(bytesPerSec: 0) { globalState { speedLimitBytesPerSec } } }"#)
         .await;
     assert_no_errors(&resp);
-    let resp = h.execute(r#"{ settings { maxDownloadSpeed } }"#).await;
-    assert_eq!(response_data(&resp)["settings"]["maxDownloadSpeed"], 0);
+    assert_eq!(
+        response_data(&resp)["setQueueSpeedLimit"]["globalState"]["speedLimitBytesPerSec"],
+        serde_json::Value::Null
+    );
+    let resp = h.execute(bandwidth).await;
+    assert_eq!(
+        response_data(&resp)["networking"]["bandwidth"],
+        serde_json::json!({ "downloadBps": null, "uploadBps": 4096 })
+    );
+}
+
+#[tokio::test]
+async fn set_bandwidth_round_trips_and_keeps_a_true_zero() {
+    let h = TestHarness::new().await;
+    let resp = h
+        .execute(r#"mutation { setBandwidth(input: { downloadBps: 0, uploadBps: 1024 }) { downloadBps uploadBps } }"#)
+        .await;
+    assert_no_errors(&resp);
+    assert_eq!(
+        response_data(&resp)["setBandwidth"],
+        serde_json::json!({ "downloadBps": 0, "uploadBps": 1024 })
+    );
+    let resp = h
+        .execute(r#"{ networking { bandwidth { downloadBps uploadBps } } globalQueueState { speedLimitBytesPerSec } }"#)
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    assert_eq!(
+        data["networking"]["bandwidth"],
+        serde_json::json!({ "downloadBps": 0, "uploadBps": 1024 })
+    );
+    assert_eq!(data["globalQueueState"]["speedLimitBytesPerSec"], 0);
+    assert_eq!(
+        h.db.network_bandwidth().unwrap(),
+        weaver_server_core::proxies::Bandwidth {
+            download_bps: Some(0),
+            upload_bps: Some(1024),
+            split: None,
+        }
+    );
+    let resp = h
+        .execute(r#"mutation { setBandwidth(input: {}) { downloadBps uploadBps } }"#)
+        .await;
+    assert_no_errors(&resp);
+    assert_eq!(
+        h.db.network_bandwidth().unwrap(),
+        weaver_server_core::proxies::Bandwidth::default()
+    );
+    assert_has_errors(
+        &h.execute(r#"mutation { setBandwidth(input: { downloadBps: 9223372036854775808 }) { downloadBps } }"#)
+            .await,
+    );
 }
 
 #[tokio::test]
@@ -221,6 +282,107 @@ async fn update_jobs_nonexistent() {
         .execute(r#"mutation { updateJobs(ids: [999999], category: "x") }"#)
         .await;
     assert_has_errors(&resp);
+}
+
+#[tokio::test]
+async fn set_bandwidth_keeps_a_split_left_out_and_clears_one_set_to_null() {
+    let h = TestHarness::new().await;
+    let bandwidth = r#"{ networking { bandwidth { downloadBps split { usenetPct } } } }"#;
+    let resp = h
+        .execute(r#"mutation { setBandwidth(input: { downloadBps: 1000, split: { usenetPct: 80 } }) { downloadBps split { usenetPct } } }"#)
+        .await;
+    assert_no_errors(&resp);
+    assert_eq!(
+        response_data(&resp)["setBandwidth"],
+        serde_json::json!({ "downloadBps": 1000, "split": { "usenetPct": 80 } })
+    );
+    assert_eq!(
+        h.db.network_bandwidth().unwrap().split,
+        Some(weaver_server_core::bandwidth::BandwidthSplit { usenet_pct: 80 })
+    );
+
+    // A client that does not know the split leaves it as it is.
+    assert_no_errors(
+        &h.execute(r#"mutation { setBandwidth(input: { downloadBps: 2000 }) { downloadBps } }"#)
+            .await,
+    );
+    let resp = h.execute(bandwidth).await;
+    assert_eq!(
+        response_data(&resp)["networking"]["bandwidth"],
+        serde_json::json!({ "downloadBps": 2000, "split": { "usenetPct": 80 } })
+    );
+
+    // The split is kept without a download limit.
+    assert_no_errors(
+        &h.execute(r#"mutation { setBandwidth(input: { downloadBps: null }) { downloadBps } }"#)
+            .await,
+    );
+    let resp = h.execute(bandwidth).await;
+    assert_eq!(
+        response_data(&resp)["networking"]["bandwidth"],
+        serde_json::json!({ "downloadBps": null, "split": { "usenetPct": 80 } })
+    );
+
+    assert_no_errors(
+        &h.execute(r#"mutation { setBandwidth(input: { downloadBps: 2000, split: null }) { downloadBps } }"#)
+            .await,
+    );
+    assert_eq!(h.db.network_bandwidth().unwrap().split, None);
+
+    for usenet_pct in [0, 100] {
+        let resp = h
+            .execute(&format!(
+                r#"mutation {{ setBandwidth(input: {{ downloadBps: 2000, split: {{ usenetPct: {usenet_pct} }} }}) {{ downloadBps }} }}"#
+            ))
+            .await;
+        assert_has_errors(&resp);
+        assert_eq!(
+            resp.errors[0]
+                .extensions
+                .as_ref()
+                .and_then(|e| e.get("code")),
+            Some(&Value::from("BANDWIDTH_SPLIT_RANGE"))
+        );
+    }
+    assert_eq!(h.db.network_bandwidth().unwrap().split, None);
+}
+
+#[tokio::test]
+async fn the_split_in_force_and_its_rates_are_shown() {
+    use weaver_server_core::bandwidth::{BandwidthSplit, SplitRates, SplitState};
+
+    let h = TestHarness::new().await;
+    let query = r#"{ networking { bandwidthSplit {
+        stored { usenetPct } inForce { usenetPct } needsDownloadLimit usenetBps torrentBps
+    } } }"#;
+    let resp = h.execute(query).await;
+    assert_no_errors(&resp);
+    assert_eq!(
+        response_data(&resp)["networking"]["bandwidthSplit"],
+        serde_json::json!({
+            "stored": null, "inForce": null, "needsDownloadLimit": true,
+            "usenetBps": null, "torrentBps": null
+        })
+    );
+
+    h.shared_state.set_bandwidth_split(SplitState {
+        stored: Some(BandwidthSplit { usenet_pct: 80 }),
+        in_force: Some(BandwidthSplit { usenet_pct: 50 }),
+        cap: Some(1000),
+        rates: SplitRates {
+            usenet: Some(500),
+            torrent: Some(500),
+        },
+    });
+    let resp = h.execute(query).await;
+    assert_no_errors(&resp);
+    assert_eq!(
+        response_data(&resp)["networking"]["bandwidthSplit"],
+        serde_json::json!({
+            "stored": { "usenetPct": 80 }, "inForce": { "usenetPct": 50 },
+            "needsDownloadLimit": false, "usenetBps": 500, "torrentBps": 500
+        })
+    );
 }
 
 #[tokio::test]

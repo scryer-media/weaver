@@ -88,6 +88,11 @@ pub enum ProxyFault {
 }
 
 impl ProxyFault {
+    // Whether the fault is the egress's own: no route leaves by it, or it
+    // cannot be used at all, so the proxy beyond it was never tried.
+    pub fn is_egress_own(&self) -> bool {
+        matches!(self, Self::NoRouteVia { .. } | Self::EgressUnusable { .. })
+    }
     pub fn code(&self) -> &'static str {
         match self {
             Self::NameNotResolved => "NAME_NOT_RESOLVED",
@@ -413,12 +418,12 @@ pub fn classify(error: &TunnelError, wait: Duration) -> ProxyFault {
         TunnelError::Http3Tls { .. } => ProxyFault::Http3Tls,
         TunnelError::Http3ProxyStatus { status: 407 } => ProxyFault::CredentialsRejected,
         TunnelError::Http3ProxyStatus { status } => ProxyFault::ConnectRefused { status: *status },
-        TunnelError::Engine(text) => from_text(text, wait).unwrap_or_else(|| ProxyFault::Other {
-            detail: text.clone(),
-        }),
         TunnelError::AtCapacity { .. } => ProxyFault::Other {
             detail: error.to_string(),
         },
+        TunnelError::Engine(text) => from_text(text, wait).unwrap_or_else(|| ProxyFault::Other {
+            detail: text.clone(),
+        }),
     }
 }
 
@@ -446,7 +451,7 @@ impl DialError {
             Self::Skipped(reason) => ProxyFault::Other {
                 detail: reason.clone(),
             },
-            Self::AtCapacity(_) => ProxyFault::Other {
+            Self::AtCapacity(_) | Self::SessionBudget => ProxyFault::Other {
                 detail: self.to_string(),
             },
             Self::Bind(error) => ProxyFault::EgressUnusable {
@@ -624,6 +629,13 @@ fn wireguard(detail: &str, wait: Duration) -> ProxyFault {
     from_text(said, wait).unwrap_or_else(|| ProxyFault::WireGuardFailed {
         detail: detail.into(),
     })
+}
+
+// Whether `error` is the HTTP/3 engine's deadline for a whole dial, which
+// runs out the same way on a proxy that never answers and on a destination
+// the proxy is still waiting for.
+pub(crate) fn is_http3_dial_deadline(error: &TunnelError) -> bool {
+    matches!(error, TunnelError::Http3Connect { detail, .. } if detail == HTTP3_DEADLINE[0])
 }
 
 fn http3(detail: &str, wait: Duration) -> ProxyFault {

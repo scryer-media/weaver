@@ -8,7 +8,7 @@ use std::hint::black_box;
 use tokio::time::Instant;
 
 #[allow(dead_code, unused_imports)]
-#[path = "../src/pipeline/infrastructure_retry.rs"]
+#[path = "../../weaver-server-pipeline/src/pipeline/infrastructure_retry.rs"]
 mod infrastructure_retry;
 
 use infrastructure_retry::InfrastructureRetryQueue;

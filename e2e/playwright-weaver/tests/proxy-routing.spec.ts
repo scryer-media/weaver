@@ -5,6 +5,10 @@ import fs from "node:fs";
 import path from "node:path";
 import type { APIRequestContext } from "@playwright/test";
 import { expect, graphql, postMultipartProbeArticle, submitProbeNzb, test, updateConfiguredServer } from "./helpers";
+import {
+  type ConsumerKind, SYSTEM_DNS_PROFILE_ID, deleteDnsProfile, deleteDnsServerList, listedServersProfile, networkRoutes, serverKey,
+  setRouteDnsProfile,
+} from "./support/network-flow";
 
 type Event = { sequence: number; at: number; kind: string; route?: string; host?: string; port?: number; path?: string; name?: string };
 type Evidence = { ip: string; ports: Record<string, number>; events: Event[]; active: Record<string, number> };
@@ -34,14 +38,23 @@ test("proxy ladder: ordered recovery, host fallback, fail closed and active revo
     checkpoints.push({ name, sequence: await mark() });
     await test.step(name, action);
   };
+  // Routes that resolve with this test's DNS profile, put back on System before it is deleted.
+  const routed = new Map<string, [ConsumerKind, number]>();
+  let dns: Awaited<ReturnType<typeof listedServersProfile>> | undefined;
+  const resolveThroughProxy = async (kind: ConsumerKind, id: number) => {
+    routed.set(`${kind}:${id}`, [kind, id]);
+    await setRouteDnsProfile(request, kind, id, dns!.profile.id);
+  };
   try {
     const fixture = await evidence();
     await updateConfiguredServer(request, "nntp", { active: false });
     await updateConfiguredServer(request, "nntp2", { active: false });
+    // The fixture's DNS server, asked through each leg's proxy.
+    dns = await listedServersProfile(request, `e2e-ladder-dns-${Date.now()}`, [fixture.ip], "PROXY");
     const profiles = names.map((name, index) => ({
-      name: `e2e-${name}`, kind: index === 1 ? "SOCKS5" : "HTTP_CONNECT", resolver: "PROXY",
+      name: `e2e-${name}`, kind: index === 1 ? "SOCKS5" : "HTTP_CONNECT",
       enabled: true, host: fixture.ip, port: fixture.ports[name],
-      username: "fixture", password: "fixture", dnsServers: [fixture.ip], timeoutSeconds: 2,
+      username: "fixture", password: "fixture", timeoutSeconds: 2,
     }));
     const ids: number[] = [];
     for (const input of profiles) {
@@ -57,9 +70,12 @@ test("proxy ladder: ordered recovery, host fallback, fail closed and active revo
     const added = await graphql<{ addServer: { id: number } }>(request,
       `mutation($input: ServerInput!) { addServer(input: $input) { id } }`, { input: { ...input, routing: initial } });
     const serverId = added.addServer.id;
+    await resolveThroughProxy("SERVER", serverId);
     const configure = async (routing: Policy, overrides: Record<string, unknown> = {}) => {
       await graphql(request, `mutation($id: Int!, $input: ServerInput!) { updateServer(id: $id, input: $input) { id routing { proxyIds allowDirect } } }`,
         { id: serverId, input: { ...input, ...overrides, routing } });
+      // A policy with no proxies has no hop to ask through.
+      if (routing.proxyIds.length > 0) await resolveThroughProxy("SERVER", serverId);
     };
     const probe = async () => (await graphql<{ testConfiguredServerConnection: { success: boolean; message: string } }>(request,
       `mutation($id: Int!) { testConfiguredServerConnection(id: $id) { success message } }`, { id: serverId })).testConfiguredServerConnection;
@@ -154,11 +170,15 @@ test("proxy ladder: ordered recovery, host fallback, fail closed and active revo
       const added = await graphql<{ addRssFeed: { id: number } }>(request,
         `mutation($input: RssFeedInput!) { addRssFeed(input: $input) { id } }`, { input: feedInput });
       const feedId = added.addRssFeed.id;
+      await resolveThroughProxy("RSS", feedId);
       await graphql(request, `mutation($id: Int!) { addRssRule(feedId: $id, input: { sortOrder: 0, action: ACCEPT }) { id } }`, { id: feedId });
       const sync = async () => (await graphql<{ runRssSync: { itemsSubmitted: number; errors: string[] } }>(request,
         `mutation($id: Int!) { runRssSync(feedId: $id) { itemsSubmitted errors } }`, { id: feedId })).runRssSync;
-      const update = async (routing: Policy, url = feedInput.url) => { await graphql(request,
-        `mutation($id: Int!, $input: RssFeedInput!) { updateRssFeed(id: $id, input: $input) { id } }`, { id: feedId, input: { ...feedInput, url, routing } }); };
+      const update = async (routing: Policy, url = feedInput.url) => {
+        await graphql(request,
+          `mutation($id: Int!, $input: RssFeedInput!) { updateRssFeed(id: $id, input: $input) { id } }`, { id: feedId, input: { ...feedInput, url, routing } });
+        await resolveThroughProxy("RSS", feedId);
+      };
       const start = await mark();
       expect(await sync()).toMatchObject({ itemsSubmitted: 1, errors: [] });
       await control({ route: "primary", up: true });
@@ -194,6 +214,7 @@ test("proxy ladder: ordered recovery, host fallback, fail closed and active revo
       expect((await sync()).errors.length).toBeGreaterThan(0);
       await noDirect(revoked);
       await graphql(request, `mutation($id: Int!) { deleteRssFeed(id: $id) }`, { id: feedId });
+      routed.delete(`RSS:${feedId}`);
     });
 
     await step("disabling host fallback revokes an active direct download", async () => {
@@ -223,6 +244,11 @@ test("proxy ladder: ordered recovery, host fallback, fail closed and active revo
     fs.mkdirSync(root, { recursive: true });
     fs.writeFileSync(path.join(root, "proxy-routing-evidence.json"), body);
     await info.attach("proxy-routing-evidence", { body, contentType: "application/json" });
+    if (dns) {
+      for (const [kind, id] of routed.values()) await setRouteDnsProfile(request, kind, id, SYSTEM_DNS_PROFILE_ID);
+      await deleteDnsProfile(request, dns.profile.id);
+      await deleteDnsServerList(request, dns.list.id);
+    }
   }
 });
 
@@ -241,13 +267,12 @@ test("a proxy Weaver resolves for is handed the address and carries a download",
   expect(control.ok(), await control.text()).toBeTruthy();
   await updateConfiguredServer(request, "nntp", { active: false });
   await updateConfiguredServer(request, "nntp2", { active: false });
-  const saved = await graphql<{ saveProxyProfile: { id: number; resolver: string; dnsServers: string[] } }>(request,
-    `mutation($input: ProxyProfileInput!) { saveProxyProfile(input: $input) { id resolver dnsServers } }`,
+  const saved = await graphql<{ saveProxyProfile: { id: number } }>(request,
+    `mutation($input: ProxyProfileInput!) { saveProxyProfile(input: $input) { id } }`,
     { input: {
-      name: "e2e-weaver-resolves", kind: "HTTP_CONNECT", resolver: "WEAVER", enabled: true,
-      host: fixture.ip, port: fixture.ports.primary, username: "fixture", password: "fixture", dnsServers: [], timeoutSeconds: 2,
+      name: "e2e-weaver-resolves", kind: "HTTP_CONNECT", enabled: true,
+      host: fixture.ip, port: fixture.ports.primary, username: "fixture", password: "fixture", timeoutSeconds: 2,
     } });
-  expect(saved.saveProxyProfile).toMatchObject({ resolver: "WEAVER", dnsServers: [] });
   const name = "weaver-resolves.proxy.test";
   const input = {
     host: name, port: fixture.ports.nntp, tls: false, username: "e2e-user", password: "e2e-pass", connections: 1,
@@ -257,6 +282,9 @@ test("a proxy Weaver resolves for is handed the address and carries a download",
   const added = await graphql<{ addServer: { id: number } }>(request,
     `mutation($input: ServerInput!) { addServer(input: $input) { id } }`, { input: { ...input, active: true } });
   try {
+    // Secondary evidence: a new route resolves with System, the host's resolver.
+    expect((await networkRoutes(request)).find(entry => entry.consumer === serverKey(added.addServer.id))?.dnsProfileId,
+      `server ${added.addServer.id} resolves with System`).toBe(SYSTEM_DNS_PROFILE_ID);
     const jobId = await startDownload(request, "proxy-weaver-resolves");
     await expect.poll(async () => await jobState(request, jobId), { timeout: 0 }).toBe("COMPLETED");
     const seen = (await events(start)).events;
@@ -273,10 +301,11 @@ test("a proxy Weaver resolves for is handed the address and carries a download",
   }
 });
 
-// A hop holds what its DNS servers answered for as long as the answer's TTL
-// says. A connection test borrows the hop a live server built, so it asks
-// the servers again while their answers are for no time at all, and not once
-// they are held.
+// A live server's hop holds what its DNS servers answered for as long as the
+// answer's TTL says. Each step cuts the server's connections, so its next
+// download dials again: it asks the servers again while their answers are for
+// no time at all, and not once they are held. A connection test is no witness
+// here: it asks its DNS itself and borrows nothing the live route holds.
 test("a proxy hop holds its DNS servers' answer for its TTL", async ({ request }) => {
   const events = async (after: number) => {
     const response = await request.get(`${controlUrl}/events?after=${after}`);
@@ -298,9 +327,11 @@ test("a proxy hop holds its DNS servers' answer for its TTL", async ({ request }
   const saved = await graphql<{ saveProxyProfile: { id: number } }>(request,
     `mutation($input: ProxyProfileInput!) { saveProxyProfile(input: $input) { id } }`,
     { input: {
-      name: "e2e-held-answers", kind: "HTTP_CONNECT", resolver: "PROXY", enabled: true,
-      host: fixture.ip, port: fixture.ports.primary, username: "fixture", password: "fixture", dnsServers: [fixture.ip], timeoutSeconds: 2,
+      name: "e2e-held-answers", kind: "HTTP_CONNECT", enabled: true,
+      host: fixture.ip, port: fixture.ports.primary, username: "fixture", password: "fixture", timeoutSeconds: 2,
     } });
+  // The fixture's DNS server, asked through the proxy.
+  const dns = await listedServersProfile(request, `e2e-held-answers-${Date.now()}`, [fixture.ip], "PROXY");
   const name = "held-answers.proxy.test";
   const input = {
     host: name, port: fixture.ports.nntp, tls: false, username: "e2e-user", password: "e2e-pass", connections: 1,
@@ -308,35 +339,41 @@ test("a proxy hop holds its DNS servers' answer for its TTL", async ({ request }
   };
   const added = await graphql<{ addServer: { id: number } }>(request,
     `mutation($input: ServerInput!) { addServer(input: $input) { id } }`, { input: { ...input, active: true } });
-  const probe = async () => {
-    const result = (await graphql<{ testConfiguredServerConnection: { success: boolean; message: string } }>(request,
-      `mutation($id: Int!) { testConfiguredServerConnection(id: $id) { success message } }`, { id: added.addServer.id })).testConfiguredServerConnection;
-    expect(result).toMatchObject({ success: true });
+  await setRouteDnsProfile(request, "SERVER", added.addServer.id, dns.profile.id);
+  // The events of one download made on fresh connections: the window opens
+  // before the cut, so the redial it forces is inside it.
+  const redialAndDownload = async (download: string) => {
+    const start = await mark();
+    await control({ route: "primary", cut: true });
+    const jobId = await startDownload(request, download);
+    await expect.poll(async () => await jobState(request, jobId), { timeout: 0 }).toBe("COMPLETED");
+    return (await events(start)).events;
   };
   const lookups = (seen: Event[]) => seen.filter(event => event.kind === "routed-dns" && event.name === name);
+  const dials = (seen: Event[]) => seen.filter(event => event.kind === "attempt" && event.route === "primary" && event.port === fixture.ports.nntp);
   try {
-    const jobId = await startDownload(request, "proxy-held-answers");
-    await expect.poll(async () => await jobState(request, jobId), { timeout: 0 }).toBe("COMPLETED");
+    let seen = await redialAndDownload("proxy-held-answers-first");
+    expect(lookups(seen).length, "the first dial asks the servers").toBeGreaterThan(0);
 
-    let start = await mark();
-    await probe();
-    expect(lookups((await events(start)).events).length, "an answer for no time at all is asked for again").toBeGreaterThan(0);
+    seen = await redialAndDownload("proxy-held-answers-no-ttl");
+    expect(dials(seen).length, "the cut connections are dialled again").toBeGreaterThan(0);
+    expect(lookups(seen).length, "an answer for no time at all is asked for again").toBeGreaterThan(0);
 
     await control({ dnsTtl: 3600 });
-    start = await mark();
-    await probe();
-    expect(lookups((await events(start)).events).length, "nothing was held, so the servers are asked").toBeGreaterThan(0);
+    seen = await redialAndDownload("proxy-held-answers-asked");
+    expect(lookups(seen).length, "nothing was held, so the servers are asked").toBeGreaterThan(0);
 
-    start = await mark();
-    await probe();
-    const seen = (await events(start)).events;
+    seen = await redialAndDownload("proxy-held-answers-held");
+    expect(dials(seen).length, "the cut connections are dialled again").toBeGreaterThan(0);
     expect(lookups(seen), "a held answer asks the servers nothing").toEqual([]);
     expect(seen.filter(event => event.kind === "attempt" && event.port === fixture.ports.dns), "no lookup is dialled through the proxy").toEqual([]);
-    expect(seen.filter(event => event.kind === "attempt" && event.route === "primary" && event.port === fixture.ports.nntp).length).toBeGreaterThan(0);
   } finally {
     await control({ dnsTtl: 0 });
     await graphql(request, `mutation($id: Int!, $input: ServerInput!) { updateServer(id: $id, input: $input) { id } }`,
       { id: added.addServer.id, input: { ...input, active: false } });
+    await setRouteDnsProfile(request, "SERVER", added.addServer.id, SYSTEM_DNS_PROFILE_ID);
+    await deleteDnsProfile(request, dns.profile.id);
+    await deleteDnsServerList(request, dns.list.id);
   }
 });
 

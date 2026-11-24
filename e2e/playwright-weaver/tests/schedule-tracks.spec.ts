@@ -6,12 +6,12 @@ import { expect, graphql, nntpBodyMetrics, postProbeArticle, resetNntpMetrics, s
 import { setting } from "./support/datastore";
 import { readClock, setClock } from "./support/e2e-clock";
 import {
-  SYSTEM_EGRESS_ID, graphqlErrors, setSystemEgressQuota, stage, systemEgressQuotaUsage,
+  SYSTEM_EGRESS_ID, bandwidth, graphqlErrors, setDownloadLimit, setSystemEgressQuota, stage, systemEgressQuotaUsage,
 } from "./support/network-flow";
 import { loadStageState, nzbgetRpc, saveStageState, withControlKey } from "./support/script-settings";
 import {
   DAY_MS, Rules, SCHEDULE_FIELDS, type RuleInput, type ScheduleRow, addCountedFeed, at, cancelledJob, clockWhileStoppedPending,
-  completedJob, deleteFeed, egressSpeed, feedCount, freshDay, generalSettings, historyItem, hhmm, note, postPaused,
+  completedJob, deleteFeed, egressSpeed, feedCount, freshDay, historyItem, hhmm, note, postPaused,
   profileState, queueState, restoreServer, resumeAll, schedules, serverRow, setClockWhileStopped, token, updateSettings,
   releaseLast, waitFeedRead, waitPaused, waitProfile, waitQueue, watchFolderPaused, withRules, witnessTick,
 } from "./support/schedules";
@@ -58,8 +58,9 @@ type Probe = {
 };
 
 const PROBE_SPEED = 3 * MiB + 17;
-const speedRule = (kind: "GLOBAL" | "EGRESS" | "SERVER", id: number | null, bytesPerSec: number) =>
-  ({ actionType: "speed_limit", speedLimits: [{ kind, id, bytesPerSec }] });
+// A null download lifts the limit at that level.
+const speedRule = (kind: "GLOBAL" | "EGRESS" | "SERVER", id: number | null, download: number | null) =>
+  ({ actionType: "speed_limit", speedLimits: [{ kind, id, download }] });
 
 async function probeFor(request: APIRequestContext, name: ProbeName, key: string): Promise<Probe | null> {
   switch (name) {
@@ -93,20 +94,20 @@ async function probeFor(request: APIRequestContext, name: ProbeName, key: string
     }
     case "speed-global":
       return {
-        track: "SPEED", on: speedRule("GLOBAL", null, PROBE_SPEED), off: speedRule("GLOBAL", null, 0),
+        track: "SPEED", on: speedRule("GLOBAL", null, PROBE_SPEED), off: speedRule("GLOBAL", null, null),
         witness: "watch", multipleTimes: false,
         isOn: async () => (await queueState(request)).downloadBlock.scheduledSpeedLimit === PROBE_SPEED,
       };
     case "speed-egress":
       return {
-        track: "SPEED", on: speedRule("EGRESS", SYSTEM_EGRESS_ID, PROBE_SPEED), off: speedRule("EGRESS", SYSTEM_EGRESS_ID, 0),
+        track: "SPEED", on: speedRule("EGRESS", SYSTEM_EGRESS_ID, PROBE_SPEED), off: speedRule("EGRESS", SYSTEM_EGRESS_ID, null),
         witness: "watch", multipleTimes: false,
         isOn: async () => (await egressSpeed(request, SYSTEM_EGRESS_ID)) === PROBE_SPEED,
       };
     case "speed-server": {
       const primary = await serverRow(request, "nntp");
       return {
-        track: "SPEED", on: speedRule("SERVER", primary.id, PROBE_SPEED), off: speedRule("SERVER", primary.id, 0),
+        track: "SPEED", on: speedRule("SERVER", primary.id, PROBE_SPEED), off: speedRule("SERVER", primary.id, null),
         witness: "watch", multipleTimes: false,
         isOn: async () => (await serverRow(request, "nntp")).maxDownloadSpeed === PROBE_SPEED,
       };
@@ -197,13 +198,13 @@ test("S01 every action saves in the UI's input shape with its track and fields",
     { input: { actionType: "resume_rss" }, expected: { track: "RSS" } },
     {
       input: { actionType: "speed_limit", speedLimits: [
-        { kind: "GLOBAL", id: null, bytesPerSec: 1 * MiB }, { kind: "EGRESS", id: SYSTEM_EGRESS_ID, bytesPerSec: 2 * MiB },
-        { kind: "SERVER", id: nntp.id, bytesPerSec: 3 * MiB }, { kind: "GLOBAL", id: null, bytesPerSec: 4 * MiB },
+        { kind: "GLOBAL", id: null, download: 1 * MiB }, { kind: "EGRESS", id: SYSTEM_EGRESS_ID, download: 2 * MiB },
+        { kind: "SERVER", id: nntp.id, download: 3 * MiB }, { kind: "GLOBAL", id: null, download: 4 * MiB },
       ] },
       // The last value given for a target wins.
       expected: { track: "SPEED", speedLimits: [
-        { kind: "GLOBAL", id: null, bytesPerSec: 4 * MiB }, { kind: "EGRESS", id: SYSTEM_EGRESS_ID, bytesPerSec: 2 * MiB },
-        { kind: "SERVER", id: nntp.id, bytesPerSec: 3 * MiB },
+        { kind: "GLOBAL", id: null, download: 4 * MiB }, { kind: "EGRESS", id: SYSTEM_EGRESS_ID, download: 2 * MiB },
+        { kind: "SERVER", id: nntp.id, download: 3 * MiB },
       ] },
     },
     { input: { actionType: "speed_limit", speedLimitBytes: 5 * MiB }, expected: { track: "SPEED", speedLimitBytes: 5 * MiB } },
@@ -278,8 +279,8 @@ test("S02 malformed rules are refused and leave the schedules unchanged", async 
     [{ actionType: "prune_history" }, "prune_history requires at least one status"],
     [{ actionType: "hardware_profile" }, "a hardware_profile schedule needs a hardwareProfile"],
     [{ actionType: "set_server_active", serverId: missingServer, serverActive: true }, `server ${missingServer} not found`],
-    [{ actionType: "speed_limit", speedLimits: [{ kind: "SERVER", id: missingServer, bytesPerSec: MiB }] }, `server ${missingServer} not found`],
-    [{ actionType: "speed_limit", speedLimits: [{ kind: "EGRESS", id: missingEgress, bytesPerSec: MiB }] }, `egress ${missingEgress} not found`],
+    [{ actionType: "speed_limit", speedLimits: [{ kind: "SERVER", id: missingServer, download: MiB }] }, `server ${missingServer} not found`],
+    [{ actionType: "speed_limit", speedLimits: [{ kind: "EGRESS", id: missingEgress, download: MiB }] }, `egress ${missingEgress} not found`],
     [{ actionType: "set_quota_metering", quotaMeteringEnabled: true, quotaEgressId: missingEgress }, `egress ${missingEgress} not found`],
   ];
   const before = await schedules(request);
@@ -328,7 +329,7 @@ test("C01 a downloads rule leaves post-processing, watch intake, speed, servers 
         await rules.create({ actionType: "pause", time: "10:00" });
         await rules.create({ actionType: "pause_post_processing", time: "09:00" });
         await rules.create({ actionType: "pause_watch_folder_scanning", time: "09:00" });
-        await rules.create({ actionType: "speed_limit", time: "09:00", speedLimits: [{ kind: "GLOBAL", id: null, bytesPerSec: speed }] });
+        await rules.create({ actionType: "speed_limit", time: "09:00", speedLimits: [{ kind: "GLOBAL", id: null, download: speed }] });
         await rules.create({ actionType: "set_server_active", time: "09:00", serverId: backup.id, serverActive: false });
         if (other !== undefined) await rules.create({ actionType: "hardware_profile", time: "09:00", hardwareProfile: other });
 
@@ -354,12 +355,12 @@ test("C01 a downloads rule leaves post-processing, watch intake, speed, servers 
         // The other way round: releasing every other track leaves downloads paused.
         await rules.create({ actionType: "resume_post_processing", time: "10:31" });
         await rules.create({ actionType: "resume_watch_folder_scanning", time: "10:31" });
-        await rules.create({ actionType: "speed_limit", time: "10:31", speedLimits: [{ kind: "GLOBAL", id: null, bytesPerSec: 0 }] });
+        await rules.create({ actionType: "speed_limit", time: "10:31", speedLimits: [{ kind: "GLOBAL", id: null, download: null }] });
         await rules.create({ actionType: "set_server_active", time: "10:31", serverId: backup.id, serverActive: true });
         if (other !== undefined) await rules.create({ actionType: "hardware_profile", time: "10:31", hardwareProfile: home });
         setClock(at(day, 10, 31));
         await expect.poll(async () => !(await postPaused(request, key)) && !(await watchFolderPaused(request))
-          && (await queueState(request)).downloadBlock.scheduledSpeedLimit === 0 && (await serverRow(request, "nntp2")).active
+          && (await queueState(request)).downloadBlock.scheduledSpeedLimit === null && (await serverRow(request, "nntp2")).active
           && (other === undefined || (await profileState(request)).scheduled === home),
         { message: "C01 the 10:31 rules released every other track", timeout: 0 }).toBe(true);
         // Downloads come first in every tick, so the tick that released the
@@ -531,25 +532,26 @@ test("C03 each speed target is its own track", async ({ request }) => {
   await withRules(request, "c03", async rules => {
     try {
       await rules.create({ actionType: "speed_limit", time: "09:00", speedLimits: [
-        { kind: "GLOBAL", id: null, bytesPerSec: 0 }, { kind: "EGRESS", id: SYSTEM_EGRESS_ID, bytesPerSec: 0 },
-        { kind: "SERVER", id: nntp.id, bytesPerSec: 0 },
+        { kind: "GLOBAL", id: null, download: null }, { kind: "EGRESS", id: SYSTEM_EGRESS_ID, download: null },
+        { kind: "SERVER", id: nntp.id, download: null },
       ] });
-      await waitSpeeds({ global: 0, egress: 0, server: 0 }, "C03 no limits before 10:00");
+      // No limit: null on the global and egress targets, 0 on a provider's own field.
+      await waitSpeeds({ global: null, egress: null, server: 0 }, "C03 no limits before 10:00");
       const all = await rules.create({ actionType: "speed_limit", time: "10:00", speedLimits: [
-        { kind: "GLOBAL", id: null, bytesPerSec: 7 * MiB }, { kind: "EGRESS", id: SYSTEM_EGRESS_ID, bytesPerSec: 8 * MiB },
-        { kind: "SERVER", id: nntp.id, bytesPerSec: 9 * MiB },
+        { kind: "GLOBAL", id: null, download: 7 * MiB }, { kind: "EGRESS", id: SYSTEM_EGRESS_ID, download: 8 * MiB },
+        { kind: "SERVER", id: nntp.id, download: 9 * MiB },
       ] });
       expect(all.track).toBe("SPEED");
       const egressOnly = await rules.create({ actionType: "speed_limit", time: "10:30", speedLimits: [
-        { kind: "EGRESS", id: SYSTEM_EGRESS_ID, bytesPerSec: 5 * MiB },
+        { kind: "EGRESS", id: SYSTEM_EGRESS_ID, download: 5 * MiB },
       ] });
       const serverOnly = await rules.create({ actionType: "speed_limit", time: "10:45", speedLimits: [
-        { kind: "SERVER", id: nntp.id, bytesPerSec: 4 * MiB },
+        { kind: "SERVER", id: nntp.id, download: 4 * MiB },
       ] });
       expect([egressOnly.track, serverOnly.track]).toEqual(["SPEED", "SPEED"]);
       // The 09:00 rule is still the latest on every target until 10:00.
       await witnessTick(request, "watch");
-      expect(await read()).toEqual({ global: 0, egress: 0, server: 0 });
+      expect(await read()).toEqual({ global: null, egress: null, server: 0 });
 
       setClock(at(day, 10, 0));
       await waitSpeeds({ global: 7 * MiB, egress: 8 * MiB, server: 9 * MiB }, "C03 one rule sets three targets at 10:00");
@@ -561,10 +563,10 @@ test("C03 each speed target is its own track", async ({ request }) => {
       expect(await read(), "nothing else moved").toEqual({ global: 7 * MiB, egress: 5 * MiB, server: 4 * MiB });
     } finally {
       await rules.create({ actionType: "speed_limit", time: hhmm(readClock()), speedLimits: [
-        { kind: "GLOBAL", id: null, bytesPerSec: 0 }, { kind: "EGRESS", id: SYSTEM_EGRESS_ID, bytesPerSec: 0 },
-        { kind: "SERVER", id: nntp.id, bytesPerSec: 0 },
+        { kind: "GLOBAL", id: null, download: null }, { kind: "EGRESS", id: SYSTEM_EGRESS_ID, download: null },
+        { kind: "SERVER", id: nntp.id, download: null },
       ] });
-      await waitSpeeds({ global: 0, egress: 0, server: 0 }, "C03 cleanup");
+      await waitSpeeds({ global: null, egress: null, server: 0 }, "C03 cleanup");
     }
   });
 });
@@ -572,12 +574,12 @@ test("C03 each speed target is its own track", async ({ request }) => {
 test("C04 quota tracks apply in order: one egress's rule after the rule for every egress", async ({ request }) => {
   initialOnly();
   note("gap", "Metering state has no API field; it is read from whether a download adds to the System egress's usage.");
-  const used = async () => (await systemEgressQuotaUsage(request)).usedBytes;
+  const used = async () => (await systemEgressQuotaUsage(request)).down.usedBytes;
   const day = freshDay();
   setClock(at(day, 9, 59));
   await withRules(request, "c04", async rules => {
     try {
-      await setSystemEgressQuota(request, { enabled: true, period: "DAILY", limitBytes: 2_000_000_000 });
+      await setSystemEgressQuota(request, { downloadBytes: 2_000_000_000, period: "DAILY" });
       // The single-egress rule comes first in the list; it still wins because
       // its track is applied after the rule for every egress.
       const single = await rules.create({ actionType: "set_quota_metering", time: "10:00", quotaMeteringEnabled: false, quotaEgressId: SYSTEM_EGRESS_ID });
@@ -598,7 +600,7 @@ test("C04 quota tracks apply in order: one egress's rule after the rule for ever
       await expect.poll(async () => (await used()) > before,
         { message: "C04 metered again under the rule for every egress", timeout: 0 }).toBe(true);
     } finally {
-      await setSystemEgressQuota(request, { enabled: false, period: "DAILY", limitBytes: 2_000_000_000 });
+      await setSystemEgressQuota(request, { downloadBytes: null, period: "DAILY" });
     }
   });
 });
@@ -629,18 +631,19 @@ test("C05 the effective rate is the lowest of the global, egress and provider li
   const loose = 4 * MiB;
   await withRules(request, "c05", async rules => {
     const time = hhmm(readClock());
-    const set = async (global: number, egress: number, server: number) => {
+    // Null lifts a limit; a provider's own field reads 0 for none.
+    const set = async (global: number | null, egress: number | null, server: number | null) => {
       // Editing the action of the occurrence in force applies it again.
       await rules.update(rule.id, { actionType: "speed_limit", time, label: rule.label, speedLimits: [
-        { kind: "GLOBAL", id: null, bytesPerSec: global }, { kind: "EGRESS", id: SYSTEM_EGRESS_ID, bytesPerSec: egress },
-        { kind: "SERVER", id: nntp.id, bytesPerSec: server },
+        { kind: "GLOBAL", id: null, download: global }, { kind: "EGRESS", id: SYSTEM_EGRESS_ID, download: egress },
+        { kind: "SERVER", id: nntp.id, download: server },
       ] });
       await expect.poll(async () => [
         (await queueState(request)).downloadBlock.scheduledSpeedLimit, await egressSpeed(request, SYSTEM_EGRESS_ID),
         (await serverRow(request, "nntp")).maxDownloadSpeed,
-      ], { message: `C05 limits ${global}/${egress}/${server}`, timeout: 0 }).toEqual([global, egress, server]);
+      ], { message: `C05 limits ${global}/${egress}/${server}`, timeout: 0 }).toEqual([global, egress, server ?? 0]);
     };
-    const rule = await rules.create({ actionType: "speed_limit", time, speedLimits: [{ kind: "GLOBAL", id: null, bytesPerSec: 0 }] });
+    const rule = await rules.create({ actionType: "speed_limit", time, speedLimits: [{ kind: "GLOBAL", id: null, download: null }] });
     try {
       for (const [label, limits] of [
         ["global", [tight, loose, loose]], ["egress", [loose, tight, loose]], ["provider", [loose, loose, tight]],
@@ -649,7 +652,7 @@ test("C05 the effective rate is the lowest of the global, egress and provider li
         expect(await rateProbe(request, label), `the ${label} limit governs`).toBeLessThan(tight * 1.8);
       }
     } finally {
-      await set(0, 0, 0);
+      await set(null, null, null);
     }
   });
 });
@@ -709,30 +712,30 @@ test("O02 an operator resume sticks until the rule's next occurrence", async ({ 
 
 test("O03 an operator speed limit replaces the scheduled one until the next speed rule", async ({ request }) => {
   initialOnly();
-  const configured = (await generalSettings(request)).maxDownloadSpeed;
+  const configured = (await bandwidth(request)).downloadBps;
   const operator = 2 * MiB + 9;
   const day = freshDay();
   setClock(at(day, 9, 59));
   await withRules(request, "o03", async rules => {
     try {
-      await rules.create({ actionType: "speed_limit", time: "10:00", speedLimits: [{ kind: "GLOBAL", id: null, bytesPerSec: 3 * MiB }] });
-      await rules.create({ actionType: "speed_limit", time: "10:30", speedLimits: [{ kind: "GLOBAL", id: null, bytesPerSec: 5 * MiB }] });
+      await rules.create({ actionType: "speed_limit", time: "10:00", speedLimits: [{ kind: "GLOBAL", id: null, download: 3 * MiB }] });
+      await rules.create({ actionType: "speed_limit", time: "10:30", speedLimits: [{ kind: "GLOBAL", id: null, download: 5 * MiB }] });
       setClock(at(day, 10, 0));
       // Yesterday's replay can also report 3 MiB. Witness evaluation at the
       // new clock before overriding today's occurrence.
       await witnessTick(request, "watch");
       await waitQueue(request, state => state.downloadBlock.scheduledSpeedLimit === 3 * MiB, "O03 scheduled limit at 10:00");
-      await graphql(request, "mutation($bytes: Int!) { setSpeedLimit(bytesPerSec: $bytes) }", { bytes: operator });
-      const replaced = await waitQueue(request, state => state.downloadBlock.scheduledSpeedLimit === 0, "O03 the operator's limit replaces the scheduled one");
+      await setDownloadLimit(request, operator);
+      const replaced = await waitQueue(request, state => state.downloadBlock.scheduledSpeedLimit === null, "O03 the operator's limit replaces the scheduled one");
       expect(replaced.speedLimitBytesPerSec).toBe(operator);
       await witnessTick(request, "watch");
-      expect((await queueState(request)).downloadBlock.scheduledSpeedLimit, "the 10:00 rule does not reapply").toBe(0);
+      expect((await queueState(request)).downloadBlock.scheduledSpeedLimit, "the 10:00 rule does not reapply").toBe(null);
       setClock(at(day, 10, 30));
       await waitQueue(request, state => state.downloadBlock.scheduledSpeedLimit === 5 * MiB, "O03 the next speed rule takes over");
     } finally {
-      await updateSettings(request, { maxDownloadSpeed: configured });
+      await setDownloadLimit(request, configured);
       await expect.poll(async () => (await queueState(request)).downloadBlock.scheduledSpeedLimit,
-        { message: "O03 cleanup", timeout: 0 }).toBe(0);
+        { message: "O03 cleanup", timeout: 0 }).toBe(null);
     }
   });
 });
@@ -1043,9 +1046,9 @@ test("H01 a restart catches up the latest missed occurrence of each hold and eac
     await keep({ actionType: "resume_post_processing", time: "10:30" });
     await keep({ actionType: "pause_post_processing", time: "10:00" });
     // Two missed speed occurrences: only the later one is caught up.
-    await keep({ actionType: "speed_limit", time: "10:30", speedLimits: [{ kind: "GLOBAL", id: null, bytesPerSec: 0 }] });
-    await keep({ actionType: "speed_limit", time: "10:00", speedLimits: [{ kind: "GLOBAL", id: null, bytesPerSec: speed }] });
-    await keep({ actionType: "speed_limit", time: "10:10", speedLimits: [{ kind: "GLOBAL", id: null, bytesPerSec: late }] });
+    await keep({ actionType: "speed_limit", time: "10:30", speedLimits: [{ kind: "GLOBAL", id: null, download: null }] });
+    await keep({ actionType: "speed_limit", time: "10:00", speedLimits: [{ kind: "GLOBAL", id: null, download: speed }] });
+    await keep({ actionType: "speed_limit", time: "10:10", speedLimits: [{ kind: "GLOBAL", id: null, download: late }] });
     await keep({ actionType: "pause_watch_folder_scanning", time: "10:05", enabled: false });
     const cancelled = await cancelledJob(request, "h01");
     await keep({ ...pruneCancelled, time: "10:05" });
@@ -1053,7 +1056,7 @@ test("H01 a restart catches up the latest missed occurrence of each hold and eac
       await witnessTick(request, "watch");
       const state = await queueState(request);
       expect([state.isPaused, state.downloadBlock.scheduledSpeedLimit, await postPaused(request, key)],
-        "the previous day's 10:30 rules are in force at 09:50").toEqual([false, 0, false]);
+        "the previous day's 10:30 rules are in force at 09:50").toEqual([false, null, false]);
     });
     expect(await present(request, cancelled)).toBe(true);
     saveStageState("h01", { day: day.toISOString(), ids, cancelled, speed, late } satisfies RestartState);
@@ -1082,7 +1085,7 @@ test("H01 a restart catches up the latest missed occurrence of each hold and eac
       setClock(at(day, 10, 30));
       await waitPaused(request, false, "H01 the 10:30 resume");
       await expect.poll(() => postPaused(request, key), { message: "H01 the 10:30 post-processing resume", timeout: 0 }).toBe(false);
-      await waitQueue(request, state => state.downloadBlock.scheduledSpeedLimit === 0, "H01 the 10:30 speed rule");
+      await waitQueue(request, state => state.downloadBlock.scheduledSpeedLimit === null, "H01 the 10:30 speed rule");
 
       await step(request, at(day, 24 + 10, 0), "watch");
       setClock(at(day, 24 + 10, 6));
@@ -1093,6 +1096,6 @@ test("H01 a restart catches up the latest missed occurrence of each hold and eac
     await resumeAll(request);
     await withControlKey(request, key => nzbgetRpc(request, key, "resumepost", []));
     // Deleting the rules leaves the last scheduled limit; the operator's own limit replaces it.
-    await updateSettings(request, { maxDownloadSpeed: (await generalSettings(request)).maxDownloadSpeed });
+    await setDownloadLimit(request, (await bandwidth(request)).downloadBps);
   }
 });

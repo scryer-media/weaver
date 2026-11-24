@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use weaver_server_core::categories::queries::CategoriesQueries;
 mod common;
 
 use async_graphql::Value;
@@ -388,4 +389,57 @@ async fn categories_query_stays_responsive_during_update_category_persist() {
             .unwrap(),
         "television"
     );
+}
+
+#[tokio::test]
+async fn a_category_keeps_its_seeding_policy_and_torrent_route_until_told_otherwise() {
+    let h = TestHarness::new().await;
+    let added = h
+        .execute(
+            r#"mutation {
+                addCategory(input: { name: "linux", seeding: { ratioGoal: { state: SET, value: 3.0 }, action: { state: SET, value: REMOVE } }, torrentRoute: true, uploadCap: { state: OFF } }) {
+                    id seeding { ratioGoal { value } mode { state } action { value } } torrentRoute uploadCap { state value }
+                }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&added);
+    let data = response_data(&added);
+    let id = data["addCategory"]["id"].as_u64().unwrap();
+    assert_eq!(data["addCategory"]["seeding"]["ratioGoal"]["value"], 3.0);
+    assert_eq!(data["addCategory"]["seeding"]["mode"]["state"], "INHERIT");
+    assert_eq!(data["addCategory"]["seeding"]["action"]["value"], "REMOVE");
+    assert_eq!(data["addCategory"]["uploadCap"]["state"], "OFF");
+    assert_eq!(data["addCategory"]["torrentRoute"], true);
+
+    // An update that names neither field keeps both.
+    let renamed = h
+        .execute(&format!(
+            r#"mutation {{ updateCategory(id: {id}, input: {{ name: "distros" }}) {{
+                seeding {{ ratioGoal {{ value }} }} torrentRoute uploadCap {{ state }}
+            }} }}"#
+        ))
+        .await;
+    assert_no_errors(&renamed);
+    let data = response_data(&renamed);
+    assert_eq!(data["updateCategory"]["seeding"]["ratioGoal"]["value"], 3.0);
+    assert_eq!(data["updateCategory"]["torrentRoute"], true);
+    assert_eq!(data["updateCategory"]["uploadCap"]["state"], "OFF");
+
+    let cleared = h
+        .execute(&format!(
+            r#"mutation {{ updateCategory(id: {id}, input: {{ name: "distros", seeding: null, torrentRoute: false }}) {{
+                seeding {{ ratioGoal {{ value }} }} torrentRoute
+            }} }}"#
+        ))
+        .await;
+    assert_no_errors(&cleared);
+    let data = response_data(&cleared);
+    assert!(data["updateCategory"]["seeding"].is_null());
+    assert_eq!(data["updateCategory"]["torrentRoute"], false);
+
+    let stored = h.db.list_categories().unwrap();
+    assert_eq!(stored[0].name, "distros");
+    assert_eq!(stored[0].seeding, None);
+    assert!(!stored[0].torrent_route);
 }

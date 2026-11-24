@@ -6,7 +6,7 @@ import { useTranslate } from "@/lib/context/translate-context";
 import { Dialog } from "./Dialog";
 import { DangerButton, PrimaryButton, SecondaryButton } from "./controls";
 import { SectionHeader } from "./chrome";
-import { FieldRows, type FieldSpec } from "@/next/pages/settings/framework";
+import { FieldRows, Fold, type FieldSpec } from "@/next/pages/settings/framework";
 import { testIds } from "@/next/testids";
 
 /**
@@ -25,6 +25,8 @@ export interface EditorSection {
   tag?: ReactNode;
   note?: ReactNode;
   fields: FieldSpec[];
+  /** Rows under `fields` that slide open as one while `open`, such as the rest of a form behind a first choice. */
+  folded?: { open: boolean; fields: FieldSpec[] };
   /** Anything that is not a field, drawn the section's full width under its fields. */
   body?: ReactNode;
 }
@@ -35,6 +37,7 @@ export function RecordEditor({
   note,
   sections,
   error,
+  errorCode,
   busy = false,
   saveLabel,
   saveDisabled = false,
@@ -53,6 +56,8 @@ export function RecordEditor({
   note?: ReactNode;
   sections: readonly EditorSection[];
   error?: string | null;
+  /** The code of the problem the error line shows, when the editor found it itself. */
+  errorCode?: string | null;
   busy?: boolean;
   saveLabel?: string;
   saveDisabled?: boolean;
@@ -98,12 +103,17 @@ export function RecordEditor({
         <div key={section.id} data-testid={testIds.section(section.id)} className="flex flex-none flex-col">
           <SectionHeader label={section.title} tag={section.tag} note={section.note} sticky={false} />
           <FieldRows fields={section.fields} />
+          {section.folded ? (
+            <Fold open={section.folded.open}>
+              <FieldRows fields={section.folded.fields} />
+            </Fold>
+          ) : null}
           {section.body}
         </div>
       ))}
       {children}
       {error ? (
-        <div data-testid={testIds.editorError} className="flex-none border-t border-wv-hairline px-4 sm:px-6 py-4 text-[12.5px] leading-[1.5] text-wv-error-text">
+        <div data-testid={testIds.editorError} data-problem={errorCode ?? undefined} className="flex-none border-t border-wv-hairline px-4 sm:px-6 py-4 text-[12.5px] leading-[1.5] text-wv-error-text">
           {error}
         </div>
       ) : null}

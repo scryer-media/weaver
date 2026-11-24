@@ -159,7 +159,8 @@ impl Tree {
     }
 
     // The last piece came, or the reading ended short: each volume whose
-    // member is closed hears its close, held from it while it read.
+    // member is closed hears its close, held from it while it read, and the
+    // object has heard its volumes again (`heard_again`).
     pub fn rewalk_done(
         &mut self,
         node: NodeId,
@@ -174,5 +175,19 @@ impl Tree {
             .map(|(_, volumes)| volumes.values().copied().collect())
             .unwrap_or_default();
         self.closed_again(node, members, builder, effects);
+        self.heard_again(node, effects);
+    }
+
+    // The object at `node`, restored or rebuilt from its facts, has heard
+    // what arrived of its volumes again. What it answered for the members
+    // beside them before that, it answered without its volumes: each that
+    // no object owns is offered to it again, as a new member is.
+    pub fn heard_again(&mut self, node: NodeId, effects: &mut Vec<Effect>) {
+        if !self.is_live(node) {
+            return;
+        }
+        if let Some((parent, _)) = self.volumes(node) {
+            self.offer_unowned(parent, node, effects);
+        }
     }
 }

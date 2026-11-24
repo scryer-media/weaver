@@ -2,28 +2,35 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 import { useState, type ReactNode } from "react";
-import { Link } from "react-router";
-import { useMutation, useQuery } from "urql";
+import { Link, useNavigate } from "react-router";
+import { useClient, useMutation, useQuery } from "urql";
 import {
   CANCEL_JOB_MUTATION,
   CANCEL_JOB_POST_PROCESSING_MUTATION,
   JOB_OUTPUT_FILES_INSPECTOR_QUERY,
   PAUSE_JOB_MUTATION,
+  RECHECK_TORRENT_MUTATION,
   RESUME_JOB_MUTATION,
+  SET_TORRENT_FORCED_MUTATION,
   UPDATE_JOBS_MUTATION,
 } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
+import { criticalHealthMilli, HEALTH_TONE_CLASS, healthTone } from "@/lib/health-tone";
 import type { JobData } from "@/lib/job-types";
 import { statusToken } from "@/lib/status-tokens";
+import { torrentErrorText, torrentStateLabelKey, type TorrentSummaryData } from "@/lib/torrents";
 import { Eyebrow } from "@/next/components/chrome";
-import { DangerButton, SecondaryButton, Select } from "@/next/components/controls";
+import { DangerButton, SecondaryButton, Select, Toggle } from "@/next/components/controls";
 import { Icon } from "@/next/components/icons";
 import { PhaseBars, useJobProgress } from "@/next/components/PhaseBars";
-import { EM_DASH, formatCount, formatRate, formatSize } from "@/next/data/format";
+import { EM_DASH, formatCount, formatDuration, formatRate, formatSize } from "@/next/data/format";
 import { LIST_PAGE_SIZE } from "@/next/data/list-pages";
 import { useNextData } from "@/next/data/next-data";
 import { statusDetail, useStatusLabel } from "@/next/data/status";
 import { SupportReportActions } from "@/next/features/SupportReportActions";
+import { FilesMissingDialog, isFilesMissing, stillFilesMissing } from "@/next/features/torrents/FilesMissingDialog";
+import { TorrentRemoveDialog } from "@/next/features/torrents/TorrentRemoveDialog";
+import { torrentIds } from "@/next/testids";
 
 interface OutputFile {
   name: string;
@@ -56,14 +63,126 @@ function EditField({ label, children }: { label: string; children: ReactNode }) 
   );
 }
 
-function Field({ label, value, title }: { label: string; value: string; title?: string }) {
+function Field({
+  label,
+  value,
+  title,
+  tone = "text-wv-fg",
+  wrap = false,
+}: {
+  label: string;
+  value: string;
+  title?: string;
+  tone?: string;
+  /** Break a long value over lines instead of cutting it off. */
+  wrap?: boolean;
+}) {
   return (
     <div className="flex gap-3">
       <span className="w-[104px] flex-none text-[12.5px] text-wv-muted">{label}</span>
-      <span title={title ?? value} className="min-w-0 flex-1 truncate text-[12.5px] text-wv-fg">
+      <span
+        title={title ?? value}
+        className={`min-w-0 flex-1 text-[12.5px] ${wrap ? "leading-[1.35] [overflow-wrap:anywhere]" : "truncate"} ${tone}`}
+      >
         {value}
       </span>
     </div>
+  );
+}
+
+/** `value / goal`, or the value alone when there is no goal. */
+function againstGoal(value: string, goal: string | null): string {
+  return goal === null ? value : `${value} / ${goal}`;
+}
+
+/**
+ * A usenet job's own figures: what came of what was posted, and its
+ * integrity once its checks have read it.
+ */
+function UsenetFields({ job, rate, eta }: { job: JobData; rate: number; eta: string }) {
+  const t = useTranslate();
+  const token = statusToken(job.status);
+  // Damage is known once the job is past its download.
+  const checked = token !== "downloading" && token !== "queued" && token !== "paused";
+  const integrity = !checked
+    ? { value: t("next.job.verifiesAfter"), tone: "text-wv-muted" }
+    : {
+        value: `${(job.health / 10).toFixed(1)}% — ${
+          job.failedBytes > 0
+            ? t("next.job.neverRecovered", { size: formatSize(job.failedBytes) })
+            : t("next.job.noDamage")
+        }`,
+        tone: HEALTH_TONE_CLASS[
+          healthTone(job.health, criticalHealthMilli(job.totalBytes, job.optionalRecoveryBytes))
+        ],
+      };
+  return (
+    <>
+      <Field
+        label={t("next.job.downloaded")}
+        value={`${formatSize(job.downloadedBytes)} ${t("next.job.ofPosted", { size: formatSize(job.totalBytes) })}`}
+      />
+      <Field label={t("next.job.integrity")} value={integrity.value} tone={integrity.tone} />
+      <Field label={t("next.inspector.rate")} value={rate > 0 ? formatRate(rate) : EM_DASH} />
+      <Field label={t("next.common.timeLeft")} value={eta} />
+    </>
+  );
+}
+
+/**
+ * A torrent's own figures: both directions of its rate, and once it is
+ * whole, its ratio and seeding time against the goals it seeds to.
+ */
+function TorrentFields({
+  job,
+  torrent,
+  rate,
+  eta,
+}: {
+  job: JobData;
+  torrent: TorrentSummaryData | null;
+  rate: number;
+  eta: string;
+}) {
+  const t = useTranslate();
+  const whole = job.progress >= 1;
+  const upload = torrent?.uploadBps ?? 0;
+  const rates = [rate > 0 ? `↓ ${formatRate(rate)}` : null, upload > 0 ? `↑ ${formatRate(upload)}` : null].filter(
+    (part) => part !== null,
+  );
+  const policy = torrent?.seedingPolicy;
+  const seeded =
+    torrent === null
+      ? 0
+      : policy?.seedTimeCounting === "CONSECUTIVE"
+        ? torrent.consecutiveSeedingSeconds
+        : torrent.seedingSeconds;
+  return (
+    <>
+      {whole ? null : (
+        <Field
+          label={t("next.job.downloaded")}
+          value={`${formatSize(job.downloadedBytes)} ${t("next.job.ofTotal", { size: formatSize(job.totalBytes) })}`}
+        />
+      )}
+      <Field label={t("next.inspector.rate")} value={rates.length > 0 ? rates.join(" · ") : EM_DASH} />
+      {whole ? null : <Field label={t("next.common.timeLeft")} value={eta} />}
+      {torrent === null ? null : (
+        <Field
+          label={t("next.torrent.shareRatio")}
+          value={againstGoal(torrent.ratio.toFixed(2), policy?.ratioGoal == null ? null : policy.ratioGoal.toFixed(2))}
+        />
+      )}
+      {torrent === null || !whole ? null : (
+        <Field
+          label={t("next.inspector.seedingTime")}
+          value={againstGoal(
+            formatDuration(seeded),
+            policy?.seedTimeGoalMinutes == null ? null : formatDuration(policy.seedTimeGoalMinutes * 60),
+          )}
+        />
+      )}
+    </>
   );
 }
 
@@ -77,13 +196,17 @@ export function DownloadInspector({
   job,
   eta,
   rate,
+  torrent = null,
   onRemoved,
 }: {
   job: JobData;
   eta: string;
   rate: number;
+  /** The torrent behind a torrent job, once it has been read. */
+  torrent?: TorrentSummaryData | null;
   onRemoved: (id: number) => void;
 }) {
+  const isTorrent = job.protocol === "TORRENT";
   const t = useTranslate();
   const statusLabel = useStatusLabel();
   // One page: the job's own screen pages through the rest.
@@ -96,7 +219,13 @@ export function DownloadInspector({
   const [cancelState, cancelJob] = useMutation(CANCEL_JOB_MUTATION);
   const [, updateJobs] = useMutation(UPDATE_JOBS_MUTATION);
   const [stopState, cancelPostProcessing] = useMutation(CANCEL_JOB_POST_PROCESSING_MUTATION);
-  const { categories, queue } = useNextData("categories", "queue");
+  const [forceState, setTorrentForced] = useMutation(SET_TORRENT_FORCED_MUTATION);
+  const [removingTorrent, setRemovingTorrent] = useState(false);
+  const [, recheckTorrent] = useMutation(RECHECK_TORRENT_MUTATION);
+  const [filesMissing, setFilesMissing] = useState(false);
+  const navigate = useNavigate();
+  const client = useClient();
+  const { categories, queue, diskVolumes } = useNextData("categories", "queue", "diskVolumes");
   // What was just picked, shown until the queue carries it back; the daemon's
   // answer can take a refresh to arrive, and a select that snaps back to the
   // old value in the meantime reads as a refusal.
@@ -125,11 +254,20 @@ export function DownloadInspector({
           }
           return next;
         });
-        setFailure(result.error.message);
+        setFailure(torrentErrorText(result.error));
         return;
       }
       queue.refresh();
     });
+  };
+
+  /** An action's answer: the daemon's refusal, or a fresh queue. */
+  const settle = (result: { error?: Parameters<typeof torrentErrorText>[0] }) => {
+    if (result.error) {
+      setFailure(torrentErrorText(result.error));
+      return;
+    }
+    queue.refresh();
   };
 
   const priorityOptions: { value: Priority; label: string }[] = [
@@ -157,8 +295,10 @@ export function DownloadInspector({
     job,
     progress.bars.find((bar) => bar.phase === progress.status) ?? progress.bars.at(-1) ?? null,
     progress.status,
+    diskVolumes,
   );
   const isPaused = token === "paused";
+  const stateKey = torrentStateLabelKey(torrent?.state);
 
   return (
     <aside className="flex max-h-[46vh] min-h-0 w-full flex-none flex-col border-t border-wv-line-strong bg-wv-input xl:max-h-none xl:w-[344px] xl:border-t-0 xl:border-l">
@@ -182,6 +322,7 @@ export function DownloadInspector({
           {/* The inspector is a summary; the whole story lives on the job's own screen. */}
           <Link
             to={`/jobs/${job.id}`}
+            data-testid={torrentIds.inspectorOpenDetail}
             className="flex items-center gap-[3px] font-wv-mono text-[11.5px] text-wv-accent hover:text-wv-accent-hover"
           >
             {t("next.inspector.openDetail")}
@@ -192,9 +333,13 @@ export function DownloadInspector({
         <div className="flex flex-none flex-col gap-[9px] border-b border-wv-hairline px-5 py-[18px]">
           <Field
             label={t("table.status")}
-            value={
-              detail ? `${statusLabel(progress.status)} — ${detail}` : statusLabel(progress.status)
-            }
+            value={[
+              statusLabel(progress.status),
+              stateKey ? t(stateKey) : null,
+              detail,
+            ]
+              .filter((part) => part)
+              .join(" — ")}
           />
           <EditField label={t("table.category")}>
             <Select
@@ -205,22 +350,39 @@ export function DownloadInspector({
               className="h-[30px] w-full min-w-0 text-[12.5px]"
             />
           </EditField>
-          <EditField label={t("table.priority")}>
-            <Select
-              label={t("table.priority")}
-              value={priority}
-              options={priorityOptions}
-              onChange={(next) => edit({ priority: next })}
-              className="h-[30px] w-full min-w-0 text-[12.5px]"
-            />
-          </EditField>
+          {isTorrent ? (
+            <EditField label={t("next.torrent.force")}>
+              <Toggle
+                label={t("next.torrent.force")}
+                checked={torrent?.forced ?? false}
+                disabled={torrent === null || forceState.fetching}
+                onChange={(forced) => {
+                  setFailure(null);
+                  void setTorrentForced({ id: job.id, forced }).then(settle);
+                }}
+              />
+            </EditField>
+          ) : (
+            <EditField label={t("table.priority")}>
+              <Select
+                label={t("table.priority")}
+                value={priority}
+                options={priorityOptions}
+                onChange={(next) => edit({ priority: next })}
+                className="h-[30px] w-full min-w-0 text-[12.5px]"
+              />
+            </EditField>
+          )}
           {failure === null ? null : (
             <div className="text-[12px] text-wv-error-text">{failure}</div>
           )}
           <Field label={t("next.inspector.totalSize")} value={formatSize(job.totalBytes)} />
-          <Field label={t("next.inspector.rate")} value={rate > 0 ? formatRate(rate) : EM_DASH} />
-          <Field label={t("next.common.timeLeft")} value={eta} />
-          <Field label={t("next.inspector.destination")} value={data?.jobOutputFiles?.outputDir || EM_DASH} />
+          {isTorrent ? (
+            <TorrentFields job={job} torrent={torrent} rate={rate} eta={eta} />
+          ) : (
+            <UsenetFields job={job} rate={rate} eta={eta} />
+          )}
+          <Field label={t("next.inspector.destination")} value={data?.jobOutputFiles?.outputDir || EM_DASH} wrap />
         </div>
 
         <div className="flex flex-none flex-col gap-[13px] px-5 py-[18px]">
@@ -235,7 +397,7 @@ export function DownloadInspector({
                 <div key={file.path} className="flex items-baseline gap-3">
                   <span
                     title={file.path}
-                    className="min-w-0 flex-1 truncate text-[12.5px] text-wv-secondary"
+                    className="min-w-0 flex-1 text-[12.5px] leading-[1.35] text-wv-secondary [overflow-wrap:anywhere]"
                   >
                     {file.name}
                   </span>
@@ -270,21 +432,27 @@ export function DownloadInspector({
           />
         </div>
         {notice === null ? null : <div className="text-[12px] text-wv-muted">{notice}</div>}
-        <div className="flex gap-[10px]">
+        <div className="flex flex-wrap gap-[10px]">
           <SecondaryButton
             icon={isPaused ? "resume" : "pause"}
-            className="flex-1 justify-center"
+            className="flex-auto justify-center"
             onClick={() => {
-              void (isPaused ? resumeJob({ id: job.id }) : pauseJob({ id: job.id }));
+              setFailure(null);
+              const wasMissing = isPaused && isFilesMissing(torrent?.state);
+              void (isPaused ? resumeJob({ id: job.id }) : pauseJob({ id: job.id })).then(async (result) => {
+                settle(result);
+                if (!result.error && wasMissing && (await stillFilesMissing(client, job.id))) setFilesMissing(true);
+              });
             }}
           >
             {isPaused ? t("action.resume") : t("action.pause")}
           </SecondaryButton>
           <SecondaryButton
             icon="topOfQueue"
-            className="flex-1 justify-center"
+            className="flex-auto justify-center"
             onClick={() => {
-              void updateJobs({ ids: [job.id], priority: "HIGH" });
+              setFailure(null);
+              void updateJobs({ ids: [job.id], priority: "HIGH" }).then(settle);
             }}
           >
             {t("next.inspector.topOfQueue")}
@@ -312,8 +480,13 @@ export function DownloadInspector({
           icon="cancelDownload"
           className="w-full justify-center"
           disabled={cancelState.fetching}
+          testId={torrentIds.inspectorRemove}
           onClick={() => {
             setFailure(null);
+            if (isTorrent) {
+              setRemovingTorrent(true);
+              return;
+            }
             // The row leaves the queue only once the daemon has accepted the removal.
             void cancelJob({ id: job.id }).then((result) => {
               if (result.error || result.data?.cancelJob !== true) {
@@ -327,6 +500,32 @@ export function DownloadInspector({
           {t("next.inspector.removeDownload")}
         </DangerButton>
       </div>
+      <FilesMissingDialog
+        open={filesMissing}
+        note={job.displayTitle || job.name}
+        onDismiss={() => setFilesMissing(false)}
+        onRecheck={() => {
+          setFilesMissing(false);
+          setFailure(null);
+          void recheckTorrent({ id: job.id }).then(settle);
+        }}
+        other={{ label: t("next.inspector.openDetail"), onConfirm: () => void navigate(`/jobs/${job.id}`) }}
+      />
+      <TorrentRemoveDialog
+        id={removingTorrent ? job.id : null}
+        name={job.displayTitle || job.name}
+        goalLeft={torrent?.seedingGoalLeft ?? null}
+        onRemoved={(id) => {
+          setRemovingTorrent(false);
+          onRemoved(id);
+          queue.refresh();
+        }}
+        onFailed={(message) => {
+          setRemovingTorrent(false);
+          setFailure(message);
+        }}
+        onDismiss={() => setRemovingTorrent(false)}
+      />
     </aside>
   );
 }

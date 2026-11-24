@@ -5,6 +5,14 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use weaver_server_core::history::nzbget_state::HistoryNzbgetStateQueries;
+use weaver_server_core::history::queries::HistoryQueries;
+use weaver_server_core::history::timeline::HistoryTimelineQueries;
+use weaver_server_core::jobs::queries::JobsQueries;
+use weaver_server_core::post_processing::events::PostProcessingEventsCancelEventScriptsQueries;
+use weaver_server_core::post_processing::settings::PostProcessingSettingsQueries;
+use weaver_server_core::rss::RssQueries;
+use weaver_server_core::servers::repository::ServersRepositoryQueries;
 
 use axum::body::Bytes;
 use axum::extract::Extension;
@@ -19,7 +27,7 @@ use weaver_server_api::{
     QueueItemState, QueuePhase, QueuePhaseProgress, QueueStateFacts, SubmissionOptions,
     SubmitNzbError, fetch_nzb_from_url, history_item_from_row, normalize_priority_value,
     queue_item_from_job, queue_item_state, queue_item_state_for_download_accounting,
-    queue_table_item_from_job, submit_metadata, submit_nzb_bytes_with_options,
+    submit_metadata, submit_nzb_bytes_with_options,
 };
 use weaver_server_core::auth::{ApiKeyCache, CallerScope, LoginAuthCache};
 use weaver_server_core::history::{HistoryFailureKind, NzbgetMarkStatus};
@@ -27,8 +35,8 @@ use weaver_server_core::post_processing::hooks::UrlStatus;
 use weaver_server_core::security::RuntimeSecurityConfig;
 use weaver_server_core::settings::model::SharedConfig;
 use weaver_server_core::{
-    Database, FieldUpdate, HistoryFilter, HistoryRows, JobId, JobStatus, JobUpdate, SchedulerError,
-    SchedulerHandle,
+    Database, FieldUpdate, HistoryFilter, JobId, JobStatus, JobUpdate, RssSeenDecision,
+    SchedulerError, SchedulerHandle,
 };
 
 #[derive(Clone)]
@@ -54,7 +62,7 @@ pub(super) struct NzbgetFacadeContext {
     // Memoized PARSE of DB-row (immutable) history, keyed by job id ->
     // `(completed_at, HistoryItem)`. A history row's `completed_at` never
     // changes once written, so a cache hit reuses the parsed item instead of
-    // re-running `history_item_from_row` (metadata parse + release-name parse)
+    // re-running `history_item_from_row` (metadata parse + title derivation)
     // for up to 1000 rows every poll. Only the PARSE is cached — the final
     // NZBGet entry (which folds in per-poll stage-timing fields derived from
     // `job_events`, a separate mutable source) is rebuilt fresh each call, so
@@ -231,9 +239,9 @@ async fn run_jsonrpc(
     }
 
     if method == "listgroups" {
-        return listgroups_response(ctx, id).await;
+        return listgroups_response(ctx, id, scope).await;
     }
-    match dispatch_method(ctx, &method, params).await {
+    match dispatch_method(ctx, scope, &method, params).await {
         Ok(result) => rpc_success_response(id, result),
         Err(error) => rpc_error_response(StatusCode::OK, id, error),
     }
@@ -376,6 +384,7 @@ fn facade_method_allowed(scope: CallerScope, method: &str, required: RequiredSco
 
 async fn dispatch_method(
     ctx: &NzbgetFacadeContext,
+    scope: CallerScope,
     method: &str,
     params: Option<Value>,
 ) -> Result<Value, RpcError> {
@@ -386,9 +395,9 @@ async fn dispatch_method(
         "append" => append(ctx, params).await,
         "appendurl" => append_url(ctx, params).await,
         "status" => status(ctx).await,
-        "listgroups" => listgroups(ctx).await,
+        "listgroups" => listgroups(ctx, scope).await,
         "listfiles" => listfiles(ctx, params).await,
-        "history" => history(ctx, params).await,
+        "history" => history(ctx, params, scope).await,
         // NZBGet distinguishes current values (`config`) from on-disk values
         // (`loadconfig`); weaver has a single live config. nzb360 reads its
         // category list from `loadconfig`.
@@ -559,7 +568,7 @@ pub(super) async fn xmlrpc_handler(
     } else {
         Some(Value::Array(call.params))
     };
-    match dispatch_method(&ctx, &method, params).await {
+    match dispatch_method(&ctx, scope, &method, params).await {
         Ok(result) => xmlrpc_success_response(&result),
         Err(error) => xmlrpc_fault_response(StatusCode::OK, error),
     }
@@ -1549,15 +1558,22 @@ async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
     let session_downloaded = metrics.bytes_downloaded;
     let average_rate = session_downloaded / uptime_secs.max(1);
     let arr_average_rate = average_rate.min(i32::MAX as u64);
-    let download_paused = ctx.handle.is_globally_paused();
     let download_block = ctx.handle.get_download_block();
+    let config = ctx.config.read().await;
+    // Weaver's limit of 0 lets nothing through; NZBGet's 0 is no limit and it
+    // has no stopped rate, so a stop, saved or scheduled, reads as paused.
+    let download_stopped =
+        config.bandwidth.download_bps == Some(0) || download_block.speed_limit_in_force == Some(0);
+    // NZBGet has no word for a speed test, so a speed test's hold reads as
+    // DownloadPaused, the same as a manual pause.
+    let download_paused = ctx.handle.is_globally_paused() || download_stopped;
     let quota_reached = matches!(
         download_block.kind,
         weaver_server_core::DownloadBlockKind::EgressQuota
             | weaver_server_core::DownloadBlockKind::ServerQuota
     );
-    let config = ctx.config.read().await;
-    let download_limit = config.max_download_speed.unwrap_or(0);
+    // NZBGet reports no limit as 0; a stop is no limit beyond the pause.
+    let download_limit = config.bandwidth.download_bps.unwrap_or(0);
     let arr_download_limit = download_limit.min(i32::MAX as u64);
     let scan_paused = config.watch_folder.scanning_paused;
     let news_servers = config
@@ -1625,7 +1641,8 @@ async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
         "ServerPaused": download_paused,
         "DownloadPaused": download_paused,
         "Download2Paused": download_paused,
-        "ServerStandBy": !any_active,
+        // A stopped instance moves nothing, as a paused NZBGet stands by.
+        "ServerStandBy": !any_active || download_stopped,
         "PostPaused": ctx.handle.is_post_processing_paused(),
         "ScanPaused": scan_paused,
         "QuotaReached": quota_reached,
@@ -1699,6 +1716,7 @@ fn group_chunk(
     ctx: &NzbgetFacadeContext,
     ids: &[JobId],
     post_started: &HashMap<u64, i64>,
+    scope: CallerScope,
 ) -> Vec<Value> {
     let jobs = ctx.queue.read_queue(|inner| {
         ids.iter()
@@ -1708,7 +1726,9 @@ fn group_chunk(
     });
     jobs.iter()
         .filter_map(|job| {
-            let item = queue_table_item_from_job(job);
+            let mut item = queue_item_from_job(job);
+            item.attributes
+                .extend(rss_link_parameters(ctx, scope, &item.rss_link));
             (!matches!(
                 item.state,
                 QueueItemState::Completed | QueueItemState::Failed
@@ -1725,21 +1745,39 @@ fn group_chunk(
         .collect()
 }
 
-async fn listgroups(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
+async fn listgroups(ctx: &NzbgetFacadeContext, scope: CallerScope) -> Result<Value, RpcError> {
     let listing = group_listing(ctx).await;
     Ok(Value::Array(
         listing
             .ids
             .chunks(GROUP_CHUNK)
-            .flat_map(|ids| group_chunk(ctx, ids, &listing.post_started))
+            .flat_map(|ids| group_chunk(ctx, ids, &listing.post_started, scope))
             .collect(),
     ))
+}
+
+// The Parameters an RSS job's item link and id add for this caller: the
+// opened values for an admin, none for anyone else. The core owner
+// decides; a job with neither costs nothing.
+fn rss_link_parameters(
+    ctx: &NzbgetFacadeContext,
+    scope: CallerScope,
+    link: &[(String, String)],
+) -> Vec<Attribute> {
+    if link.is_empty() {
+        return Vec::new();
+    }
+    ctx.db
+        .rss_link_attributes(link, scope)
+        .into_iter()
+        .map(|(key, value)| Attribute { key, value })
+        .collect()
 }
 
 // `listgroups` over JSON-RPC: NZBGet has no paging for it, so the answer is
 // every group, written a chunk at a time as the client reads it. No chunk
 // holds the queue lock while it is serialised or sent.
-async fn listgroups_response(ctx: &NzbgetFacadeContext, id: Value) -> Response {
+async fn listgroups_response(ctx: &NzbgetFacadeContext, id: Value, scope: CallerScope) -> Response {
     use tokio::io::AsyncWriteExt as _;
 
     let listing = group_listing(ctx).await;
@@ -1752,7 +1790,7 @@ async fn listgroups_response(ctx: &NzbgetFacadeContext, id: Value) -> Response {
         buf.extend_from_slice(br#","result":["#);
         let mut first = true;
         for ids in listing.ids.chunks(GROUP_CHUNK) {
-            for group in group_chunk(&ctx, ids, &listing.post_started) {
+            for group in group_chunk(&ctx, ids, &listing.post_started, scope) {
                 if !first {
                     buf.push(b',');
                 }
@@ -2106,7 +2144,11 @@ fn attribute_value(attributes: &[Attribute], key: &str) -> Option<String> {
         .map(|attribute| attribute.value.clone())
 }
 
-async fn history(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Value, RpcError> {
+async fn history(
+    ctx: &NzbgetFacadeContext,
+    params: Option<Value>,
+    scope: CallerScope,
+) -> Result<Value, RpcError> {
     // history(Hidden): rows a client removed with HistoryDelete are listed
     // only when the first parameter is true.
     let include_hidden = optional_bool_param(&positional_params(params)?, 0)?.unwrap_or(false);
@@ -2133,7 +2175,7 @@ async fn history(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Val
         .chain(history_rows.iter())
         .map(|job| {
             (
-                queue_table_item_from_job(job),
+                queue_item_from_job(job),
                 reported_category(job.category.as_deref(), &job.metadata),
                 implied_failure_kind(job),
             )
@@ -2151,17 +2193,13 @@ async fn history(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Val
         .collect::<Vec<_>>();
     let db = ctx.db.clone();
     let (rows, facade_states) = tokio::task::spawn_blocking(move || {
-        let rows = db.list_job_history(
-            &HistoryFilter {
-                limit: Some(1000),
-                ..HistoryFilter::default()
-            },
-            if include_hidden {
-                HistoryRows::All
-            } else {
-                HistoryRows::Shown
-            },
-        )?;
+        // A row a HistoryDelete hid leaves this listing only; Weaver's own
+        // history still shows it.
+        let rows = db.list_job_history(&HistoryFilter {
+            limit: Some(1000),
+            nzbget_shown_only: !include_hidden,
+            ..HistoryFilter::default()
+        })?;
         let ids = rows
             .iter()
             .map(|row| row.job_id)
@@ -2205,6 +2243,16 @@ async fn history(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Val
             !persisted_ids.contains(&item.id) && seen_terminal_ids.insert(item.id)
         })
         .map(|(item, category, kept)| {
+            let link = rss_link_parameters(ctx, scope, &item.rss_link);
+            let shown;
+            let item = if link.is_empty() {
+                item
+            } else {
+                let mut with_link = item.clone();
+                with_link.attributes.extend(link);
+                shown = with_link;
+                &shown
+            };
             nzbget_history_queue_item(
                 item,
                 category,
@@ -2217,7 +2265,7 @@ async fn history(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Val
     // DB-row-derived entries are the immutable-parse path: a history row's
     // `completed_at` never changes once written, so memoize the PARSED
     // `HistoryItem` by job id and reuse it on a hit instead of re-running
-    // `history_item_from_row` (metadata + release-name parse) for up to 1000
+    // `history_item_from_row` (metadata parse + title derivation) for up to 1000
     // rows every poll. The final entry still merges FRESH per-poll stage
     // timings (from `job_events`, which a reprocess can append to without
     // touching `completed_at`), so it is never served stale. The in-memory
@@ -2236,11 +2284,15 @@ async fn history(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Val
                 .get(&row.job_id)
                 .filter(|(completed_at, _)| *completed_at == row.completed_at)
                 .map(|(_, item)| item.clone());
-            let item = cached.unwrap_or_else(|| {
+            let mut item = cached.unwrap_or_else(|| {
                 let item = history_item_from_row(row, None);
                 cache.insert(row.job_id, (row.completed_at, item.clone()));
                 item
             });
+            // The cache keeps the link sealed; this caller's view is added
+            // to this answer alone.
+            item.attributes
+                .extend(rss_link_parameters(ctx, scope, &item.rss_link));
             let category = reported_category(
                 row.category.as_deref(),
                 &weaver_server_core::history::parse_history_metadata(row.metadata.as_deref()),
@@ -2883,6 +2935,7 @@ async fn editqueue(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
         "groupsetname" | "historysetname" if request.param.trim().is_empty() => {
             return Ok(json!(false));
         }
+        "historydelete" => return archive_history(ctx, &request).await,
         _ => {}
     }
 
@@ -2932,7 +2985,6 @@ async fn editqueue(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
             "groupsetdupemode" => {
                 set_job_parameter(ctx, job_id, "nzbget.dupe_mode", &request.param).await
             }
-            "historydelete" => hide_history(ctx, job_id).await,
             "historyfinaldelete" => ctx.handle.delete_history(job_id, false).await.map(|_| ()),
             "historyreturn" | "historyredownload" => ctx.handle.redownload_job(job_id).await,
             "historyprocess" => ctx.handle.reprocess_job(job_id).await,
@@ -2986,20 +3038,38 @@ async fn editqueue(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
     Ok(json!(applied > 0))
 }
 
-// HistoryDelete hides the row from the client's default history listing but
-// keeps it, so duplicate checks still see the release. HistoryFinalDelete
-// erases it.
-async fn hide_history(ctx: &NzbgetFacadeContext, job_id: JobId) -> Result<(), SchedulerError> {
+// HistoryDelete archives the rows: each is hidden from the client's default
+// history listing but kept, so duplicate checks and Weaver's own history
+// still see the release, and the files Weaver manages for it are removed by
+// the archive worker. One write hides every row of the request, and one
+// archive operation takes them all. HistoryFinalDelete erases a row.
+//
+// Nothing here waits on the pipeline: both writes are the database's, and the
+// worker removes the files on its own turn.
+async fn archive_history(
+    ctx: &NzbgetFacadeContext,
+    request: &EditQueueRequest,
+) -> Result<Value, RpcError> {
+    let ids: Vec<u64> = request.ids.iter().map(|id| id.0).collect();
     let db = ctx.db.clone();
-    let found = tokio::task::spawn_blocking(move || db.set_nzbget_history_hidden(job_id.0, true))
+    // Only an entry whose archive was taken leaves the client's history; a
+    // busy one stays listed for the client's next remove.
+    let hidden = tokio::task::spawn_blocking(move || db.archive_nzbget_history(&ids))
         .await
-        .map_err(|error| SchedulerError::InvalidInput(error.to_string()))?
-        .map_err(SchedulerError::from)?;
-    if found {
-        Ok(())
-    } else {
-        Err(SchedulerError::JobNotFound(job_id))
+        .map_err(|error| {
+            RpcError::invalid_parameter(format!("{} failed: {error}", request.command))
+        })?
+        .map_err(|error| {
+            RpcError::invalid_parameter(format!("{} failed: {error}", request.command))
+        })?;
+    if hidden < request.ids.len() as u64 {
+        tracing::debug!(
+            command = %request.command,
+            applied = hidden,
+            "editqueue named ids with no history row, or that are busy"
+        );
     }
+    Ok(json!(hidden > 0))
 }
 
 async fn group_final_delete(
@@ -3295,7 +3365,7 @@ fn queue_order(ctx: &NzbgetFacadeContext) -> Vec<(QueueItem, String, i64)> {
     jobs.iter()
         .map(|job| {
             (
-                queue_table_item_from_job(job),
+                queue_item_from_job(job),
                 reported_category(job.category.as_deref(), &job.metadata),
                 nzbget_priority(&job.metadata),
             )
@@ -3641,10 +3711,7 @@ async fn postqueue(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
             })
             .collect::<Vec<_>>()
     });
-    let items = jobs
-        .iter()
-        .map(queue_table_item_from_job)
-        .collect::<Vec<_>>();
+    let items = jobs.iter().map(queue_item_from_job).collect::<Vec<_>>();
     let post_started = post_started_at(ctx, items.iter().map(|item| item.id).collect()).await;
     let entries = items
         .into_iter()
@@ -3735,11 +3802,14 @@ async fn viewfeed(
         .map(|(index, item)| {
             let size = item.size_bytes.unwrap_or(0);
             let (size_lo, size_hi) = size_parts(size);
-            let fetched = item.decision == "submitted" && item.job_id.is_some();
-            let match_status = match item.decision.as_str() {
-                "submitted" | "accepted" => "ACCEPTED",
-                "rejected" => "REJECTED",
-                _ => "IGNORED",
+            let fetched = item.decision == RssSeenDecision::Submitted && item.job_id.is_some();
+            let match_status = match item.decision {
+                RssSeenDecision::Submitted | RssSeenDecision::Accepted => "ACCEPTED",
+                RssSeenDecision::Rejected => "REJECTED",
+                RssSeenDecision::Ignored
+                | RssSeenDecision::Error
+                | RssSeenDecision::Waiting
+                | RssSeenDecision::Other(_) => "IGNORED",
             };
             json!({
                 "ID": index as u64 + 1,
@@ -4134,21 +4204,14 @@ async fn rate(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Value,
         .unwrap_or(0)
         .saturating_mul(1024);
 
-    // Mirror the settings mutation: persist, update shared config, then apply
-    // to the live limiter, so `status` and the weaver UI agree with the value.
-    let db = ctx.db.clone();
-    tokio::task::spawn_blocking(move || {
-        db.set_setting("max_download_speed", &bytes_per_sec.to_string())
-    })
-    .await
-    .map_err(|error| RpcError::invalid_parameter(format!("rate failed: {error}")))?
-    .map_err(|error| RpcError::invalid_parameter(format!("rate failed: {error}")))?;
-    {
-        let mut config = ctx.config.write().await;
-        config.max_download_speed = Some(bytes_per_sec);
-    }
+    // NZBGet's 0 is no limit. The limit is the global download row, so
+    // `status` and the weaver UI agree with it.
     ctx.handle
-        .set_speed_limit(bytes_per_sec)
+        .save_download_limit(
+            &ctx.db,
+            &ctx.config,
+            (bytes_per_sec != 0).then_some(bytes_per_sec),
+        )
         .await
         .map_err(|error| scheduler_rpc_error("rate", error))?;
     Ok(json!(true))
@@ -4407,14 +4470,18 @@ fn nzbget_queue_status(state: QueueItemState) -> &'static str {
         QueueItemState::Queued => "QUEUED",
         QueueItemState::Downloading
         | QueueItemState::FetchingRepairData
-        | QueueItemState::FinalizingDownload => "DOWNLOADING",
-        QueueItemState::Checking | QueueItemState::Verifying => "VERIFYING_SOURCES",
+        | QueueItemState::FinalizingDownload
+        | QueueItemState::FetchingMetadata
+        | QueueItemState::Stalled => "DOWNLOADING",
+        QueueItemState::Checking | QueueItemState::Verifying | QueueItemState::CheckingFiles => {
+            "VERIFYING_SOURCES"
+        }
         QueueItemState::Repairing => "REPAIRING",
         QueueItemState::Extracting => "UNPACKING",
         QueueItemState::Finalizing => "MOVING",
         QueueItemState::PostProcessing => "EXECUTING_SCRIPT",
         QueueItemState::Paused => "PAUSED",
-        QueueItemState::Completed => "SUCCESS",
+        QueueItemState::Completed | QueueItemState::Seeding => "SUCCESS",
         QueueItemState::Failed => "FAILURE",
     }
 }

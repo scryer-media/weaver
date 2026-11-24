@@ -10,7 +10,7 @@ import (
 	"testing"
 )
 
-const checkpointTarget = "weaver_server_core::pipeline::completion::finalize::check::completion"
+const checkpointTarget = "weaver_server_pipeline::pipeline::completion::finalize::check"
 
 func checkpointLine(ts, level, jobID, payload string) string {
 	// Weaver writes its log with colour; the assertion has to read through it.
@@ -75,8 +75,8 @@ func TestLogAssertionCountsWithinTheJobAndLevel(t *testing.T) {
 }
 
 func TestWeaverJSONRecordReadsAsItsTextLine(t *testing.T) {
-	record := `{"timestamp":"2026-11-03T08:10:00.123456-07:00","level":"INFO","target":"weaver_server_core::pipeline::graph","fields":{"message":"member delivered","job_id":7,"member":"My Show.mkv","bytes":18446744073709551615,"ok":true}}`
-	want := `2026-11-03T08:10:00.123456-07:00  INFO weaver_server_core::pipeline::graph: member delivered job_id=7 member="My Show.mkv" bytes=18446744073709551615 ok=true`
+	record := `{"timestamp":"2026-11-03T08:10:00.123456-07:00","level":"INFO","target":"weaver_server_pipeline::pipeline::graph","fields":{"message":"member delivered","job_id":7,"member":"My Show.mkv","bytes":18446744073709551615,"ok":true}}`
+	want := `2026-11-03T08:10:00.123456-07:00  INFO weaver_server_pipeline::pipeline::graph: member delivered job_id=7 member="My Show.mkv" bytes=18446744073709551615 ok=true`
 	if got := cleanWeaverLogLine(record); got != want {
 		t.Fatalf("record read as\n%s\nwant\n%s", got, want)
 	}
@@ -124,7 +124,7 @@ func TestWeaverJSONRecordsFeedTheGraphAndLineAssertions(t *testing.T) {
 }
 
 func TestDelayHookFoundInAJSONRecord(t *testing.T) {
-	raw := `{"timestamp":"2026-11-03T13:27:38.145719-07:00","level":"WARN","target":"weaver_server_core::e2e_failpoint","fields":{"message":"tripping e2e delay hook","delay_ms":20000,"hook":"direct_store.post_repair_verify"}}`
+	raw := `{"timestamp":"2026-11-03T13:27:38.145719-07:00","level":"WARN","target":"weaver_server_base::e2e_failpoint","fields":{"message":"tripping e2e delay hook","delay_ms":20000,"hook":"direct_store.post_repair_verify"}}`
 	clean := cleanWeaverLog(raw)
 	if !weaverLogHasField(clean, "hook", "direct_store.post_repair_verify") {
 		t.Fatalf("the delay hook in a JSON record must be found: %q", clean)
@@ -135,7 +135,7 @@ func TestDelayHookFoundInAJSONRecord(t *testing.T) {
 }
 
 func TestDelayHookFoundInATextLine(t *testing.T) {
-	raw := "2026-11-03T13:27:38.145719-07:00  \x1b[33mWARN\x1b[0m weaver_server_core::e2e_failpoint: tripping e2e delay hook delay_ms=20000 hook=\"direct_store.post_repair_verify\""
+	raw := "2026-11-03T13:27:38.145719-07:00  \x1b[33mWARN\x1b[0m weaver_server_base::e2e_failpoint: tripping e2e delay hook delay_ms=20000 hook=\"direct_store.post_repair_verify\""
 	clean := cleanWeaverLog(raw)
 	if !weaverLogHasField(clean, "hook", "direct_store.post_repair_verify") {
 		t.Fatalf("the delay hook in a text line must be found: %q", clean)
@@ -147,8 +147,8 @@ func TestDelayHookFoundInATextLine(t *testing.T) {
 
 func TestDelayHookFoundInALogFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "weaver.log")
-	log := `{"timestamp":"2026-11-03T13:27:38.100000-07:00","level":"INFO","target":"weaver_server_core::jobs","fields":{"message":"job submitted","job_id":10000}}` + "\n" +
-		`{"timestamp":"2026-11-03T13:27:38.145719-07:00","level":"WARN","target":"weaver_server_core::e2e_failpoint","fields":{"message":"tripping e2e delay hook","delay_ms":20000,"hook":"direct_store.post_repair_verify"}}` + "\n"
+	log := `{"timestamp":"2026-11-03T13:27:38.100000-07:00","level":"INFO","target":"weaver_server_pipeline::jobs::service","fields":{"message":"job submitted","job_id":10000}}` + "\n" +
+		`{"timestamp":"2026-11-03T13:27:38.145719-07:00","level":"WARN","target":"weaver_server_base::e2e_failpoint","fields":{"message":"tripping e2e delay hook","delay_ms":20000,"hook":"direct_store.post_repair_verify"}}` + "\n"
 	if err := os.WriteFile(path, []byte(log), 0o644); err != nil {
 		t.Fatal(err)
 	}

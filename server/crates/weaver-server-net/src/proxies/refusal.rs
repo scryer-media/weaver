@@ -1,0 +1,827 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+use super::{Consumer, EgressQuotaFault, TorrentScope};
+use weaver_server_db::persistence::error::Refusal;
+
+// Why a networking edit was refused. Each variant is one sentence; `code`
+// names the condition and is part of the API, so a client words the refusal
+// itself by matching the code. Two variants share a code where the same
+// condition is found at two places that word it differently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkRefusal {
+    // Egress interfaces.
+    EgressNameLength,
+    EgressSystemImmutable,
+    EgressSystemBindingReserved,
+    EgressInterfaceNameInvalid,
+    EgressInterfaceNameRequired,
+    EgressInterfaceBindingUnsupported,
+    EgressSourceAddressRequired,
+    EgressSourceAddressInvalid,
+    EgressSourceAddressNotUnicast,
+    EgressSpeedLimitTooLarge,
+    EgressQuota(EgressQuotaFault),
+    BandwidthLimitTooLarge,
+    BandwidthSplitRange,
+    EgressGone,
+    EgressNotFound,
+    EgressSystemUndeletable,
+    // Each in-use refusal names the route that holds the item.
+    EgressInUse(Consumer),
+
+    // Proxy pools.
+    PoolNameLength,
+    PoolMemberCount,
+    PoolProxyRepeated,
+    PoolProxyMissing,
+    PoolMemberKindMismatch,
+    PoolGone,
+    PoolInUse(Consumer),
+    PoolEditRepeatsProxy,
+    PoolInUseEmpty(Consumer),
+
+    // Routes.
+    RouteLegCount,
+    RouteLegWeightRange,
+    RouteLegWeightSum,
+    RouteLadderRungCount,
+    RouteChainLength,
+    RouteDirectPathFalse,
+    RouteAndRoutingBoth,
+    RouteEgressMissing,
+    RouteEgressDisabled,
+    RoutePoolMissing,
+    RoutePoolEmpty,
+    RouteProxyMissing,
+    RoutingProxyMissing,
+    RouteProxyRepeated,
+    RoutingProxyRepeated,
+    RoutingProxyCount,
+    RouteChainTransport,
+    RouteHasAdvancedLegs,
+    RouteConsumerGone,
+    TorrentRouteExit(TorrentRouteFault),
+
+    // WireGuard sessions across every route.
+    WireGuardPathConflict {
+        proxy: u32,
+        egress: u32,
+        paths: Vec<Vec<u32>>,
+    },
+    WireGuardInstanceLimit {
+        required: usize,
+        limit: usize,
+    },
+
+    // Proxy profiles.
+    ProxyNameLength,
+    ProxyEndpointInvalid,
+    ProxyTimeoutRange,
+    // More tunnel addresses than a WireGuard proxy takes.
+    ProxyAddressCount,
+    // More servers than a DNS setting lists.
+    ProxyDnsServerCount,
+    ProxyDnsServerInvalid,
+    ProxyDnsServersRequired,
+    ProxyDnsTlsNameInvalid,
+    ProxyDnsUrlInvalid,
+    ProxyDnsUrlHostname,
+    ProxyDnsPlainAfterEncrypted,
+    ProxyDnsServerDuplicate,
+    ProxyCredentialTooLarge,
+    ProxySshUsernameRequired,
+    ProxySshKeyRequired,
+    ProxySshPasswordUnsupported,
+    ProxySocks5PasswordNeedsUsername,
+    ProxySocks5CredentialLength,
+    ProxyHttpUsernameColon,
+    ProxyHttp3PasswordNeedsUsername,
+    // What the tunnel engine found wrong with a profile, in its own words:
+    // an unusable key, tunnel address, or HTTP/3 authority.
+    ProxyTunnel(String),
+    ProxyKindImmutable,
+    ProxyKindLockedByPool,
+    ProxyLimitReached,
+    ProxyRevisionChanged,
+    ProxyGone,
+    ProxyNotFound,
+    ProxyInPool {
+        pool: u32,
+    },
+    ProxyInUse(Consumer),
+    ProxyHostKeyNotSsh,
+
+    // DNS server lists and DNS profiles. Each in-use refusal names what
+    // holds the list or profile.
+    DnsListNameLength,
+    DnsListNotFound,
+    DnsListLimitReached,
+    DnsListInUse {
+        profiles: Vec<String>,
+    },
+    DnsProfileNameLength,
+    DnsProfileNotFound,
+    DnsProfileLimitReached,
+    DnsProfileBuiltIn,
+    // The stored route keys as they are, a key that cannot be read included,
+    // and the proxies whose address it names.
+    DnsProfileInUse {
+        routes: Vec<String>,
+        proxies: Vec<u32>,
+    },
+    // A route selected a profile that is not a route profile, or a proxy one
+    // that is not a proxy name profile; System is either.
+    DnsProfileKind {
+        expected: super::DnsProfileKind,
+    },
+    // A proxy name profile has the proxy answer, or its servers asked
+    // through a proxy.
+    DnsProfileProxyNameInvalid,
+    // A save changes what a profile answers for.
+    DnsProfileKindImmutable,
+    // A new profile names no kind.
+    DnsProfileKindRequired,
+    DnsProfileListRequired,
+    DnsProfileTrustInvalid,
+    // The proxy answers, and a leg or rung of these routes has no proxy.
+    DnsProfileNeedsProxy {
+        routes: Vec<Consumer>,
+    },
+    // Weaver validates what the proxy answers, which only a WireGuard
+    // tunnel's own servers allow, and these routes reach another kind.
+    DnsProfileNeedsWireGuard {
+        routes: Vec<Consumer>,
+    },
+    // The proxy answers, and these WireGuard proxies at the end of a rung of
+    // these routes list no DNS servers of the tunnel's own.
+    DnsProfileNeedsTunnelDns {
+        proxies: Vec<u32>,
+        routes: Vec<Consumer>,
+    },
+
+    // Speed tests.
+    SpeedTestAlreadyRunning {
+        run: u32,
+    },
+    SpeedTestQueueBusy,
+    SpeedTestUsenetNeedsServer,
+    SpeedTestTorrentNeedsTorrentRoute,
+    SpeedTestTorrentsOff,
+    SpeedTestLegDownAll,
+    SpeedTestQuotaBlocked {
+        holder: SpeedTestQuotaHolder,
+        id: u32,
+        name: String,
+    },
+    SpeedTestLeaseRefused {
+        server: u32,
+        name: String,
+        reason: String,
+    },
+
+    // Tests through a drafted route.
+    TestNeedsRoute,
+    TestTargetRequired,
+    TestSubjectInRoute,
+    TestPathCount {
+        limit: usize,
+    },
+}
+
+// What gives a torrent route more than one exit: a second leg, a fall back
+// to the host's own address, or a second rung that would be another exit. A
+// pool rung is one exit per torrent: each torrent stays on one member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TorrentRouteFault {
+    Legs,
+    DirectFallback,
+    Rungs,
+}
+
+impl TorrentRouteFault {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Legs => "TORRENT_ROUTE_LEGS",
+            Self::DirectFallback => "TORRENT_ROUTE_DIRECT_FALLBACK",
+            Self::Rungs => "TORRENT_ROUTE_RUNGS",
+        }
+    }
+
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::Legs => "a torrent route has one leg",
+            Self::DirectFallback => "a torrent route has no direct fallback",
+            Self::Rungs => "a torrent route has one rung",
+        }
+    }
+
+    pub fn validate(route: &super::Route) -> Result<(), Self> {
+        use super::LegPath;
+        let [leg] = route.legs.as_slice() else {
+            return Err(Self::Legs);
+        };
+        let LegPath::Ladder {
+            rungs,
+            direct_fallback,
+        } = &leg.path
+        else {
+            return Ok(());
+        };
+        if *direct_fallback {
+            return Err(Self::DirectFallback);
+        }
+        if rungs.len() > 1 {
+            return Err(Self::Rungs);
+        }
+        Ok(())
+    }
+}
+
+// Whose download quota keeps a speed test from starting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeedTestQuotaHolder {
+    Server,
+    Egress,
+}
+
+impl NetworkRefusal {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::EgressNameLength => "EGRESS_NAME_LENGTH",
+            Self::EgressSystemImmutable => "EGRESS_SYSTEM_IMMUTABLE",
+            Self::EgressSystemBindingReserved => "EGRESS_SYSTEM_BINDING_RESERVED",
+            Self::EgressInterfaceNameInvalid => "EGRESS_INTERFACE_NAME_INVALID",
+            Self::EgressInterfaceNameRequired => "EGRESS_INTERFACE_NAME_REQUIRED",
+            Self::EgressInterfaceBindingUnsupported => "EGRESS_INTERFACE_BINDING_UNSUPPORTED",
+            Self::EgressSourceAddressRequired => "EGRESS_SOURCE_ADDRESS_REQUIRED",
+            Self::EgressSourceAddressInvalid => "EGRESS_SOURCE_ADDRESS_INVALID",
+            Self::EgressSourceAddressNotUnicast => "EGRESS_SOURCE_ADDRESS_NOT_UNICAST",
+            Self::EgressSpeedLimitTooLarge => "EGRESS_SPEED_LIMIT_TOO_LARGE",
+            Self::EgressQuota(EgressQuotaFault::LimitTooLarge) => "EGRESS_QUOTA_LIMIT_TOO_LARGE",
+            Self::EgressQuota(EgressQuotaFault::ResetTimeRange) => "EGRESS_QUOTA_RESET_TIME_RANGE",
+            Self::EgressQuota(EgressQuotaFault::MonthlyResetDayRange) => {
+                "EGRESS_QUOTA_RESET_DAY_RANGE"
+            }
+            Self::EgressQuota(EgressQuotaFault::SoftAboveHard) => "EGRESS_QUOTA_SOFT_ABOVE_HARD",
+            Self::BandwidthLimitTooLarge => "BANDWIDTH_LIMIT_TOO_LARGE",
+            Self::BandwidthSplitRange => "BANDWIDTH_SPLIT_RANGE",
+            Self::EgressGone | Self::EgressNotFound => "EGRESS_NOT_FOUND",
+            Self::EgressSystemUndeletable => "EGRESS_SYSTEM_UNDELETABLE",
+            Self::EgressInUse(_) => "EGRESS_IN_USE",
+
+            Self::PoolNameLength => "POOL_NAME_LENGTH",
+            Self::PoolMemberCount => "POOL_MEMBER_COUNT",
+            Self::PoolProxyRepeated => "POOL_PROXY_REPEATED",
+            Self::PoolProxyMissing => "POOL_PROXY_MISSING",
+            Self::PoolMemberKindMismatch => "POOL_MEMBER_KIND_MISMATCH",
+            Self::PoolGone => "POOL_NOT_FOUND",
+            Self::PoolInUse(_) => "POOL_IN_USE",
+            Self::PoolEditRepeatsProxy => "POOL_EDIT_REPEATS_PROXY",
+            Self::PoolInUseEmpty(_) => "POOL_IN_USE_EMPTY",
+
+            Self::RouteLegCount => "ROUTE_LEG_COUNT",
+            Self::RouteLegWeightRange => "ROUTE_LEG_WEIGHT_RANGE",
+            Self::RouteLegWeightSum => "ROUTE_LEG_WEIGHT_SUM",
+            Self::RouteLadderRungCount => "ROUTE_LADDER_RUNG_COUNT",
+            Self::RouteChainLength => "ROUTE_CHAIN_LENGTH",
+            Self::RouteDirectPathFalse => "ROUTE_DIRECT_PATH_FALSE",
+            Self::RouteAndRoutingBoth => "ROUTE_AND_ROUTING_BOTH",
+            Self::RouteEgressMissing => "ROUTE_EGRESS_MISSING",
+            Self::RouteEgressDisabled => "ROUTE_EGRESS_DISABLED",
+            Self::RoutePoolMissing => "ROUTE_POOL_MISSING",
+            Self::RoutePoolEmpty => "ROUTE_POOL_EMPTY",
+            Self::RouteProxyMissing | Self::RoutingProxyMissing => "ROUTE_PROXY_MISSING",
+            Self::RouteProxyRepeated | Self::RoutingProxyRepeated => "ROUTE_PROXY_REPEATED",
+            Self::RoutingProxyCount => "ROUTE_PROXY_COUNT",
+            Self::RouteChainTransport => "ROUTE_CHAIN_TRANSPORT",
+            Self::RouteHasAdvancedLegs => "ROUTE_HAS_ADVANCED_LEGS",
+            Self::RouteConsumerGone => "ROUTE_CONSUMER_NOT_FOUND",
+            Self::TorrentRouteExit(fault) => fault.code(),
+
+            Self::WireGuardPathConflict { .. } => "WIREGUARD_PROXY_PATH_CONFLICT",
+            Self::WireGuardInstanceLimit { .. } => "WIREGUARD_INSTANCE_LIMIT",
+
+            Self::ProxyNameLength => "PROXY_NAME_LENGTH",
+            Self::ProxyEndpointInvalid => "PROXY_ENDPOINT_INVALID",
+            Self::ProxyTimeoutRange => "PROXY_TIMEOUT_RANGE",
+            Self::ProxyAddressCount => "PROXY_ADDRESS_COUNT",
+            Self::ProxyDnsServerCount => "PROXY_DNS_SERVER_COUNT",
+            Self::ProxyDnsServerInvalid => "PROXY_DNS_SERVER_INVALID",
+            Self::ProxyDnsServersRequired => "PROXY_DNS_SERVERS_REQUIRED",
+            Self::ProxyDnsTlsNameInvalid => "PROXY_DNS_TLS_NAME_INVALID",
+            Self::ProxyDnsUrlInvalid => "PROXY_DNS_URL_INVALID",
+            Self::ProxyDnsUrlHostname => "PROXY_DNS_URL_HOSTNAME",
+            Self::ProxyDnsPlainAfterEncrypted => "PROXY_DNS_PLAIN_AFTER_ENCRYPTED",
+            Self::ProxyDnsServerDuplicate => "PROXY_DNS_SERVER_DUPLICATE",
+            Self::ProxyCredentialTooLarge => "PROXY_CREDENTIAL_TOO_LARGE",
+            Self::ProxySshUsernameRequired => "PROXY_SSH_USERNAME_REQUIRED",
+            Self::ProxySshKeyRequired => "PROXY_SSH_KEY_REQUIRED",
+            Self::ProxySshPasswordUnsupported => "PROXY_SSH_PASSWORD_UNSUPPORTED",
+            Self::ProxySocks5PasswordNeedsUsername => "PROXY_SOCKS5_PASSWORD_NEEDS_USERNAME",
+            Self::ProxySocks5CredentialLength => "PROXY_SOCKS5_CREDENTIAL_LENGTH",
+            Self::ProxyHttpUsernameColon => "PROXY_HTTP_USERNAME_COLON",
+            Self::ProxyHttp3PasswordNeedsUsername => "PROXY_HTTP3_PASSWORD_NEEDS_USERNAME",
+            Self::ProxyTunnel(_) => "PROXY_TUNNEL_CONFIGURATION",
+            Self::ProxyKindImmutable => "PROXY_KIND_IMMUTABLE",
+            Self::ProxyKindLockedByPool => "PROXY_KIND_LOCKED_BY_POOL",
+            Self::ProxyLimitReached => "PROXY_LIMIT_REACHED",
+            Self::ProxyRevisionChanged => "PROXY_REVISION_CHANGED",
+            Self::ProxyGone | Self::ProxyNotFound => "PROXY_NOT_FOUND",
+            Self::ProxyInPool { .. } => "PROXY_IN_POOL",
+            Self::ProxyInUse(_) => "PROXY_IN_USE",
+            Self::ProxyHostKeyNotSsh => "PROXY_HOST_KEY_NOT_SSH",
+
+            Self::DnsListNameLength => "DNS_LIST_NAME_LENGTH",
+            Self::DnsListNotFound => "DNS_LIST_NOT_FOUND",
+            Self::DnsListLimitReached => "DNS_LIST_LIMIT_REACHED",
+            Self::DnsListInUse { .. } => "DNS_LIST_IN_USE",
+            Self::DnsProfileNameLength => "DNS_PROFILE_NAME_LENGTH",
+            Self::DnsProfileNotFound => "DNS_PROFILE_NOT_FOUND",
+            Self::DnsProfileLimitReached => "DNS_PROFILE_LIMIT_REACHED",
+            Self::DnsProfileBuiltIn => "DNS_PROFILE_BUILT_IN",
+            Self::DnsProfileInUse { .. } => "DNS_PROFILE_IN_USE",
+            Self::DnsProfileListRequired => "DNS_PROFILE_LIST_REQUIRED",
+            Self::DnsProfileTrustInvalid => "DNS_PROFILE_TRUST_INVALID",
+            Self::DnsProfileNeedsProxy { .. } => "DNS_PROFILE_NEEDS_PROXY",
+            Self::DnsProfileNeedsWireGuard { .. } => "DNS_PROFILE_NEEDS_WIREGUARD",
+            Self::DnsProfileNeedsTunnelDns { .. } => "DNS_PROFILE_NEEDS_TUNNEL_DNS",
+            Self::DnsProfileKind { .. } => "DNS_PROFILE_KIND",
+            Self::DnsProfileProxyNameInvalid => "DNS_PROFILE_PROXY_NAME_INVALID",
+            Self::DnsProfileKindImmutable => "DNS_PROFILE_KIND_IMMUTABLE",
+            Self::DnsProfileKindRequired => "DNS_PROFILE_KIND_REQUIRED",
+
+            Self::SpeedTestAlreadyRunning { .. } => "SPEED_TEST_ALREADY_RUNNING",
+            Self::SpeedTestQueueBusy => "SPEED_TEST_QUEUE_BUSY",
+            Self::SpeedTestUsenetNeedsServer => "SPEED_TEST_USENET_NEEDS_SERVER",
+            Self::SpeedTestTorrentNeedsTorrentRoute => "SPEED_TEST_TORRENT_NEEDS_TORRENT_ROUTE",
+            Self::SpeedTestTorrentsOff => "SPEED_TEST_TORRENTS_OFF",
+            Self::SpeedTestLegDownAll => "SPEED_TEST_LEG_DOWN_ALL",
+            Self::SpeedTestQuotaBlocked { .. } => "SPEED_TEST_QUOTA_BLOCKED",
+            Self::SpeedTestLeaseRefused { .. } => "SPEED_TEST_LEASE_REFUSED",
+            Self::TestNeedsRoute => "TEST_NEEDS_ROUTE",
+            Self::TestTargetRequired => "TEST_TARGET_REQUIRED",
+            Self::TestSubjectInRoute => "TEST_SUBJECT_IN_ROUTE",
+            Self::TestPathCount { .. } => "TEST_PATH_COUNT",
+        }
+    }
+
+    // The values a sentence names, for a client that words the refusal itself.
+    pub fn params(&self) -> serde_json::Map<String, serde_json::Value> {
+        let value = match self {
+            Self::WireGuardPathConflict {
+                proxy,
+                egress,
+                paths,
+            } => serde_json::json!({ "proxyId": proxy, "egressId": egress, "paths": paths }),
+            Self::WireGuardInstanceLimit { required, limit } => serde_json::json!({
+                "required": required,
+                "limit": limit,
+                "instanceMib": super::WIREGUARD_INSTANCE_BYTES / (1024 * 1024),
+            }),
+            Self::SpeedTestAlreadyRunning { run } => serde_json::json!({ "runId": run }),
+            Self::SpeedTestQuotaBlocked { holder, id, name } => serde_json::json!({
+                "scope": match holder {
+                    SpeedTestQuotaHolder::Server => "server",
+                    SpeedTestQuotaHolder::Egress => "egress",
+                },
+                "id": id,
+                "name": name,
+            }),
+            Self::SpeedTestLeaseRefused {
+                server,
+                name,
+                reason,
+            } => serde_json::json!({ "serverId": server, "name": name, "reason": reason }),
+            Self::TestPathCount { limit } => serde_json::json!({ "limit": limit }),
+            Self::ProxyAddressCount => serde_json::json!({ "limit": super::MAX_TUNNEL_ADDRESSES }),
+            Self::ProxyDnsServerCount => serde_json::json!({ "limit": super::MAX_DNS_SERVERS }),
+            Self::EgressInUse(holder)
+            | Self::PoolInUse(holder)
+            | Self::PoolInUseEmpty(holder)
+            | Self::ProxyInUse(holder) => serde_json::json!({ "consumer": holder.key() }),
+            Self::ProxyInPool { pool } => serde_json::json!({ "poolId": pool }),
+            Self::DnsListInUse { profiles } => serde_json::json!({ "profiles": profiles }),
+            Self::DnsProfileInUse { routes, proxies } => {
+                serde_json::json!({ "routes": routes, "proxies": proxies })
+            }
+            Self::DnsProfileKind { expected } => serde_json::json!({
+                "expected": match expected {
+                    super::DnsProfileKind::Route => "ROUTE",
+                    super::DnsProfileKind::ProxyName => "PROXY_NAME",
+                },
+            }),
+            Self::DnsProfileNeedsProxy { routes } | Self::DnsProfileNeedsWireGuard { routes } => {
+                serde_json::json!({
+                    "routes": routes.iter().map(|route| route.key()).collect::<Vec<_>>(),
+                })
+            }
+            Self::DnsProfileNeedsTunnelDns { proxies, routes } => serde_json::json!({
+                "proxies": proxies,
+                "routes": routes.iter().map(|route| route.key()).collect::<Vec<_>>(),
+            }),
+            _ => return serde_json::Map::new(),
+        };
+        match value {
+            serde_json::Value::Object(params) => params,
+            _ => serde_json::Map::new(),
+        }
+    }
+}
+
+impl std::fmt::Display for NetworkRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let sentence = match self {
+            Self::EgressNameLength => "egress name must contain 1–128 characters",
+            Self::EgressSystemImmutable => {
+                "the System egress cannot be renamed, rebound, or disabled"
+            }
+            Self::EgressSystemBindingReserved => "only egress 0 may use the System binding",
+            Self::EgressInterfaceNameInvalid => {
+                "interface name must be nonempty and contain no NUL"
+            }
+            Self::EgressInterfaceNameRequired => "interface name is required",
+            Self::EgressInterfaceBindingUnsupported => {
+                "Interface binding is not supported on Windows; use a source address"
+            }
+            Self::EgressSourceAddressRequired => "source address is required",
+            Self::EgressSourceAddressInvalid => "invalid source address",
+            Self::EgressSourceAddressNotUnicast => "source address must be a unicast host address",
+            Self::EgressSpeedLimitTooLarge => "egress speed limit is too large",
+            Self::EgressQuota(fault) => fault.message(),
+            Self::BandwidthLimitTooLarge => "bandwidth limit is too large",
+            Self::BandwidthSplitRange => "a bandwidth split gives usenet 1% to 99%",
+            Self::EgressGone => "egress no longer exists",
+            Self::EgressNotFound => "egress not found",
+            Self::EgressSystemUndeletable => "the System egress cannot be deleted",
+            Self::EgressInUse(holder) => {
+                return write!(f, "egress is used by {}", RouteHolder(*holder));
+            }
+
+            Self::PoolNameLength => "pool name must contain 1–128 characters",
+            Self::PoolMemberCount => "a pool takes at most sixteen members",
+            Self::PoolProxyRepeated => "a proxy cannot appear twice in a pool",
+            Self::PoolProxyMissing => "pool references a missing proxy",
+            Self::PoolMemberKindMismatch => "all pool members must have the pool's proxy kind",
+            Self::PoolGone => "proxy pool no longer exists",
+            Self::PoolInUse(holder) => {
+                return write!(f, "pool is used by {}", RouteHolder(*holder));
+            }
+            Self::PoolEditRepeatsProxy => "pool edit would repeat a proxy in an existing ladder",
+            Self::PoolInUseEmpty(holder) => {
+                return write!(
+                    f,
+                    "pool is used by {} and needs at least one member",
+                    RouteHolder(*holder)
+                );
+            }
+
+            Self::RouteLegCount => "a route requires between one and eight legs",
+            Self::RouteLegWeightRange => "leg weights must be between 1 and 100",
+            Self::RouteLegWeightSum => "leg weights must sum to exactly 100",
+            Self::RouteLadderRungCount => "a ladder requires between one and eight rungs",
+            Self::RouteChainLength => "a chain requires two or three proxies",
+            Self::RouteDirectPathFalse => "a direct path must be true",
+            Self::RouteAndRoutingBoth => "specify route or routing, not both",
+            Self::RouteEgressMissing => "route references a missing egress",
+            Self::RouteEgressDisabled => "route references a disabled egress",
+            Self::RoutePoolMissing => "route references a missing pool",
+            Self::RoutePoolEmpty => "route references a pool with no members",
+            Self::RouteProxyMissing => "route references a missing proxy",
+            Self::RoutingProxyMissing => "routing policy references a missing proxy",
+            Self::RouteProxyRepeated => {
+                "a proxy cannot appear twice in a ladder, including pools and chains"
+            }
+            Self::RoutingProxyRepeated => "a proxy cannot appear twice in a ladder",
+            Self::RoutingProxyCount => "a route supports at most eight proxies",
+            Self::RouteChainTransport => {
+                "WireGuard and HTTP/3 must be the first proxy in a chain, directly above the egress; WireGuard may also sit directly on another WireGuard proxy"
+            }
+            Self::RouteHasAdvancedLegs => {
+                "this route has advanced legs; edit it in Networking instead of replacing its legacy projection"
+            }
+            Self::RouteConsumerGone => "routing consumer no longer exists",
+            Self::TorrentRouteExit(fault) => fault.message(),
+
+            Self::WireGuardPathConflict {
+                proxy,
+                egress,
+                paths,
+            } => {
+                let paths = paths
+                    .iter()
+                    .map(|path| {
+                        path.iter()
+                            .map(|id| format!("proxy {id}"))
+                            .collect::<Vec<_>>()
+                            .join(" → ")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" and ");
+                return write!(
+                    f,
+                    "WireGuard proxy {proxy} is used on egress {egress} by two different paths ({paths}); a WireGuard server accepts one connection per key, so a WireGuard proxy may reach the egress by only one path"
+                );
+            }
+            Self::WireGuardInstanceLimit { required, limit } => {
+                return write!(
+                    f,
+                    "routes require {required} WireGuard instances × 516 MiB = {} MiB; this host permits {limit} instances (available memory / 4 / 516 MiB, clamped to 1–8). Pool members count individually.",
+                    required * 516
+                );
+            }
+
+            Self::ProxyNameLength => "proxy name must contain 1–128 characters",
+            Self::ProxyEndpointInvalid => "proxy endpoint must have a valid host and port",
+            Self::ProxyTimeoutRange => "proxy timeout must be between 1 and 300 seconds",
+            Self::ProxyAddressCount => {
+                return write!(
+                    f,
+                    "a WireGuard proxy takes at most {} tunnel addresses",
+                    super::MAX_TUNNEL_ADDRESSES
+                );
+            }
+            Self::ProxyDnsServerCount => {
+                return write!(
+                    f,
+                    "a DNS server list holds at most {} servers",
+                    super::MAX_DNS_SERVERS
+                );
+            }
+            Self::ProxyDnsServerInvalid => "DNS servers must be IP addresses",
+            Self::ProxyDnsServersRequired => "a DNS server list needs at least one server",
+            Self::ProxyDnsTlsNameInvalid => "a DNS server's TLS name must be a valid host name",
+            Self::ProxyDnsUrlInvalid => {
+                "a DNS over HTTPS server needs an https URL with an IP address and a path"
+            }
+            Self::ProxyDnsUrlHostname => {
+                "a DNS over HTTPS server named by a host name also needs its IP address"
+            }
+            Self::ProxyDnsPlainAfterEncrypted => {
+                "a plain DNS server cannot follow an encrypted one"
+            }
+            Self::ProxyDnsServerDuplicate => "a DNS server is listed only once",
+            Self::ProxyCredentialTooLarge => "proxy credential is too large",
+            Self::ProxySshUsernameRequired => "SSH requires a username",
+            Self::ProxySshKeyRequired => "SSH requires an Ed25519 private key",
+            Self::ProxySshPasswordUnsupported => {
+                "SSH requires an Ed25519 private key and takes no password"
+            }
+            Self::ProxySocks5PasswordNeedsUsername => "SOCKS5 proxy password requires a username",
+            Self::ProxySocks5CredentialLength => "SOCKS5 credentials must fit in 255 bytes",
+            Self::ProxyHttpUsernameColon => "HTTP proxy username cannot contain a colon",
+            Self::ProxyHttp3PasswordNeedsUsername => "HTTP/3 proxy password requires a username",
+            Self::ProxyTunnel(detail) => detail,
+            Self::ProxyKindImmutable => "create a new profile to change proxy type",
+            Self::ProxyKindLockedByPool => {
+                "proxy kind cannot change while the proxy belongs to a pool"
+            }
+            Self::ProxyLimitReached => "at most 128 proxy profiles are supported",
+            Self::ProxyRevisionChanged => "proxy revision changed",
+            Self::ProxyGone => "proxy no longer exists",
+            Self::ProxyNotFound => "proxy not found",
+            Self::ProxyInPool { pool } => {
+                return write!(
+                    f,
+                    "proxy belongs to pool {pool}; remove it from the pool first"
+                );
+            }
+            Self::ProxyInUse(holder) => {
+                return write!(f, "proxy is used by {}", RouteHolder(*holder));
+            }
+            Self::ProxyHostKeyNotSsh => "only SSH profiles have host-key trust",
+
+            Self::DnsListNameLength => "DNS server list name must contain 1–128 characters",
+            Self::DnsListNotFound => "DNS server list not found",
+            Self::DnsListLimitReached => {
+                return write!(
+                    f,
+                    "at most {} DNS server lists are supported",
+                    super::MAX_DNS_LISTS
+                );
+            }
+            Self::DnsListInUse { profiles } => {
+                return write!(
+                    f,
+                    "DNS server list is used by {}",
+                    profiles
+                        .iter()
+                        .map(|name| format!("DNS profile {name}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            Self::DnsProfileNameLength => "DNS profile name must contain 1–128 characters",
+            Self::DnsProfileNotFound => "DNS profile not found",
+            Self::DnsProfileLimitReached => {
+                return write!(
+                    f,
+                    "at most {} DNS profiles are supported",
+                    super::MAX_DNS_PROFILES
+                );
+            }
+            Self::DnsProfileBuiltIn => "the System DNS profile cannot be changed or deleted",
+            Self::DnsProfileInUse { routes, proxies } => {
+                let mut users: Vec<String> = Vec::new();
+                if !routes.is_empty() {
+                    users.push(StoredRouteHolders(routes).to_string());
+                }
+                users.extend(proxies.iter().map(|id| format!("proxy {id}")));
+                return write!(f, "DNS profile is used by {}", users.join(", "));
+            }
+            Self::DnsProfileKind {
+                expected: super::DnsProfileKind::Route,
+            } => "a route selects a route DNS profile or System",
+            Self::DnsProfileKind {
+                expected: super::DnsProfileKind::ProxyName,
+            } => "a proxy selects a proxy name DNS profile or System",
+            Self::DnsProfileProxyNameInvalid => {
+                "a proxy name DNS profile is answered by the system or by listed servers asked from the egress"
+            }
+            Self::DnsProfileKindImmutable => {
+                "what a DNS profile answers for cannot be changed after it is created"
+            }
+            Self::DnsProfileKindRequired => {
+                "a new DNS profile says whether routes or proxies select it"
+            }
+            Self::DnsProfileListRequired => {
+                "a DNS profile where Weaver answers needs a server list"
+            }
+            Self::DnsProfileTrustInvalid => {
+                "the system takes answers as sent, and the proxy's answers are taken as sent or validated here"
+            }
+            Self::DnsProfileNeedsProxy { routes } => {
+                return write!(
+                    f,
+                    "the proxy cannot answer for {}, which has a leg or rung with no proxy",
+                    RouteHolders(routes)
+                );
+            }
+            Self::DnsProfileNeedsWireGuard { routes } => {
+                return write!(
+                    f,
+                    "only a WireGuard proxy's answers can be validated here, and {} reaches another kind",
+                    RouteHolders(routes)
+                );
+            }
+            Self::DnsProfileNeedsTunnelDns { proxies, routes } => {
+                let proxies: Vec<String> = proxies.iter().map(|id| format!("proxy {id}")).collect();
+                let lists = if proxies.len() == 1 { "lists" } else { "list" };
+                return write!(
+                    f,
+                    "{} {lists} no DNS servers of its tunnel, and {} needs them to answer names",
+                    proxies.join(", "),
+                    RouteHolders(routes)
+                );
+            }
+
+            Self::SpeedTestAlreadyRunning { run } => {
+                return write!(
+                    f,
+                    "speed test {run} is still running; cancel it or wait for it to finish"
+                );
+            }
+            Self::SpeedTestQueueBusy => {
+                "the previous speed test is still giving the queue back; start again once it has"
+            }
+            Self::SpeedTestUsenetNeedsServer => {
+                "a Usenet speed test runs on a server; a feed can run a bandwidth test only"
+            }
+            Self::SpeedTestTorrentNeedsTorrentRoute => {
+                "a torrent speed test runs on a torrent route"
+            }
+            Self::SpeedTestTorrentsOff => {
+                "torrents are off; turn them on to run a torrent speed test"
+            }
+            Self::SpeedTestLegDownAll => {
+                "every leg of the route would be down; leave at least one leg up"
+            }
+            Self::SpeedTestQuotaBlocked { holder, name, .. } => {
+                let holder = match holder {
+                    SpeedTestQuotaHolder::Server => "server",
+                    SpeedTestQuotaHolder::Egress => "egress",
+                };
+                return write!(
+                    f,
+                    "{holder} {name} has used its download quota, and a speed test books its bytes against it"
+                );
+            }
+            Self::SpeedTestLeaseRefused { name, reason, .. } => {
+                return write!(f, "server {name} cannot lend its connections: {reason}");
+            }
+
+            Self::TestNeedsRoute => "a test goes through a route drafted for it",
+            Self::TestTargetRequired => "a test of the route alone needs a host and port to reach",
+            Self::TestSubjectInRoute => {
+                "the route a proxy is tested through cannot carry that proxy"
+            }
+            Self::TestPathCount { limit } => {
+                return write!(
+                    f,
+                    "a test tries every path through the route, and at most {limit}; draft a smaller route"
+                );
+            }
+        };
+        f.write_str(sentence)
+    }
+}
+
+impl std::error::Error for NetworkRefusal {}
+
+// The owner of a route, as a refusal names it.
+struct RouteHolder(Consumer);
+
+impl std::fmt::Display for RouteHolder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Consumer::Server(id) => write!(f, "server {id}"),
+            Consumer::Rss(id) => write!(f, "RSS feed {id}"),
+            Consumer::Outbound => f.write_str("the default outbound route"),
+            Consumer::Torrent(TorrentScope::Default) => f.write_str("the default torrent route"),
+            Consumer::Torrent(TorrentScope::Category(id)) => {
+                write!(f, "the torrent route of category {id}")
+            }
+            Consumer::Torrent(TorrentScope::TrackerRule(id)) => {
+                write!(f, "the torrent route of tracker rule {id}")
+            }
+        }
+    }
+}
+
+// The owners of several routes, as a refusal names them; a drafted route,
+// which has no owner yet, as the route.
+struct RouteHolders<'a>(&'a [Consumer]);
+
+impl std::fmt::Display for RouteHolders<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.is_empty() {
+            return f.write_str("the route");
+        }
+        for (index, holder) in self.0.iter().enumerate() {
+            if index > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{}", RouteHolder(*holder))?;
+        }
+        Ok(())
+    }
+}
+
+// Stored route keys, each named as its owner when the key can be read, and
+// as stored when it cannot.
+struct StoredRouteHolders<'a>(&'a [String]);
+
+impl std::fmt::Display for StoredRouteHolders<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, key) in self.0.iter().enumerate() {
+            if index > 0 {
+                f.write_str(", ")?;
+            }
+            match Consumer::from_key(key) {
+                Some(holder) => write!(f, "{}", RouteHolder(holder))?,
+                None => write!(f, "route {key}")?,
+            }
+        }
+        Ok(())
+    }
+}
+
+// Callers that report a plain string keep `?` working.
+impl From<NetworkRefusal> for String {
+    fn from(refusal: NetworkRefusal) -> Self {
+        refusal.to_string()
+    }
+}
+
+impl From<&NetworkRefusal> for Refusal {
+    fn from(refusal: &NetworkRefusal) -> Self {
+        Self {
+            code: refusal.code(),
+            message: refusal.to_string(),
+            params: refusal.params(),
+        }
+    }
+}
+
+impl From<NetworkRefusal> for Refusal {
+    fn from(refusal: NetworkRefusal) -> Self {
+        Self::from(&refusal)
+    }
+}
+
+impl From<NetworkRefusal> for weaver_server_db::persistence::StateError {
+    fn from(refusal: NetworkRefusal) -> Self {
+        Self::Refused(refusal.into())
+    }
+}
+
+// A profile the tunnel engine cannot use is refused in the engine's words.
+impl From<weaver_tunnel::TunnelError> for NetworkRefusal {
+    fn from(error: weaver_tunnel::TunnelError) -> Self {
+        Self::ProxyTunnel(error.to_string())
+    }
+}
+
+#[cfg(test)]
+#[path = "refusal_tests.rs"]
+mod tests;

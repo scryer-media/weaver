@@ -80,6 +80,21 @@ export function parsePublicTargets(text) {
   });
 }
 
+// Compose-network destinations the fixture forwards as asked, by name or, for
+// host "*", any IPv4 literal on that port. The torrent lane routes its tracker
+// and peers through the SOCKS route this way.
+export function parsePassthrough(text) {
+  const targets = text ? JSON.parse(text) : [];
+  if (!Array.isArray(targets)) throw new Error("passthrough must be an array");
+  return targets.map(target => {
+    if (typeof target.host !== "string" || !/^(\*|[a-zA-Z0-9.-]+)$/.test(target.host)
+      || !Number.isInteger(target.port) || target.port < 1 || target.port > 65535) {
+      throw new Error("invalid passthrough target");
+    }
+    return { host: target.host.toLowerCase(), port: target.port };
+  });
+}
+
 // Comma list of public HTTPS names the fixture answers for and serves itself,
 // so a flow measures against a target it owns instead of the real service.
 export function parseServedHosts(text) {
@@ -129,11 +144,12 @@ export async function startProxyFixture(options = {}) {
   // Public hosts the fixture forwards to and answers for, beside the fixture
   // destinations; the relay runs with publicOnly and forwards nothing else.
   const publicTargets = parsePublicTargets(options.publicTargets ? JSON.stringify(options.publicTargets) : process.env.PROXY_FIXTURE_PUBLIC_TARGETS);
+  const passthrough = parsePassthrough(options.passthrough ? JSON.stringify(options.passthrough) : process.env.PROXY_FIXTURE_PASSTHROUGH);
   const publicOnly = Boolean(options.publicOnly);
   const served = options.served ?? parseServedHosts(process.env.PROXY_FIXTURE_SERVED_HOSTS);
   const tls = options.tls ?? servedTls(served);
   const ports = {
-    primary: 8081, secondary: 8082, tertiary: 8083, dns: 53, nntp: 119, http: 8089, https: 443, control: 8090,
+    primary: 8081, secondary: 8082, tertiary: 8083, dns: 53, dnsAlt: 5354, nntp: 119, http: 8089, https: 443, control: 8090,
     ...Object.fromEntries(extraRoutes.map(name => [name, EXTRA_ROUTES[name].port])),
     ...options.ports,
   };
@@ -144,6 +160,9 @@ export async function startProxyFixture(options = {}) {
   const servers = [];
   const held = new Set();
   let sequence = 0;
+  // Each forwarded connection's number, carried on its connected event, and the ones still open.
+  let connections = 0;
+  const open = new Set();
   let feedToken = "initial";
   let nzb = "";
   // The TTL on every address answered locally. 0 unless a flow sets it, so
@@ -218,20 +237,26 @@ export async function startProxyFixture(options = {}) {
     const peer = client.remoteAddress;
     const publicTarget = publicTargets.find(target => target.port === port
       && (target.host === host.toLowerCase() || target.addresses.includes(host)));
-    const allowedHost = host === ip || addresses.includes(host) || /^[a-z0-9-]+\.proxy\.test$/.test(host);
+    const allowedHost = host === ip || addresses.includes(host) || /^[a-z0-9-]+\.proxy\.(test|example)$/.test(host);
     const fixtureTarget = !publicOnly && allowedHost && [ports.dns, ports.nntp, ports.http].includes(port);
     const fixtureDns = (host === ip || addresses.includes(host)) && port === ports.dns;
+    const passed = !publicOnly && passthrough.some(target => target.port === port
+      && (target.host === host.toLowerCase() || (target.host === "*" && net.isIPv4(host))));
     // A served host, asked for by name or by the address the fixture answered.
     const servedTarget = served.length > 0 && port === ports.https
       && (served.includes(host.toLowerCase()) || host === ip || addresses.includes(host));
-    if ((!publicTarget && !fixtureTarget && !fixtureDns && !servedTarget) || !routes[route].up) {
+    if ((!publicTarget && !fixtureTarget && !fixtureDns && !passed && !servedTarget) || !routes[route].up) {
       reply(false); client.end(); return;
     }
-    record("connected", { route, host, port, client: peer });
+    const connection = ++connections;
+    open.add(connection);
+    client.once("close", () => open.delete(connection));
+    record("connected", { route, host, port, client: peer, connection });
     reply(true);
     const targetHost = publicTarget ? publicTarget.addresses[0]
+      : passed ? host
       : port === ports.nntp ? (options.nntpHost ?? "nntp") : "127.0.0.1";
-    const targetPort = publicTarget ? publicTarget.port : port === ports.nntp ? (options.nntpPort ?? 119)
+    const targetPort = publicTarget ? publicTarget.port : passed ? port : port === ports.nntp ? (options.nntpPort ?? 119)
       : servedTarget ? ports.https : port;
     pipe(client, targetHost, targetPort, route);
     client.resume();
@@ -320,7 +345,9 @@ export async function startProxyFixture(options = {}) {
     record("direct-nntp");
     pipe(client, options.nntpHost ?? "nntp", options.nntpPort ?? 119, "direct");
   }), "nntp");
-  async function dnsResponse(query, direct) {
+  // `listener` is the port the query came in on: the usual DNS port, or the
+  // second one a listed server can name to be told apart from the host resolver.
+  async function dnsResponse(query, direct, listener) {
     if (query.length < 17) return;
     let cursor = 12;
     const labels = [];
@@ -332,7 +359,9 @@ export async function startProxyFixture(options = {}) {
     if (cursor + 5 > query.length) return;
     const name = labels.join(".").toLowerCase();
     const type = query.readUInt16BE(cursor + 1);
-    const fixture = name.endsWith(".proxy.test");
+    // proxy.example is the zone a validator is not told is private, so it must
+    // prove it from the root; nothing here is signed, so it cannot.
+    const fixture = name.endsWith(".proxy.test") || name.endsWith(".proxy.example");
     const local = hosts[name] ?? publicTargets.find(target => target.host === name)?.addresses
       ?? (served.includes(name) ? addresses : undefined);
     // Resolve only infrastructure names through the container's own resolvers.
@@ -365,11 +394,13 @@ export async function startProxyFixture(options = {}) {
         }
       });
     }
-    if (fixture) record(direct ? "direct-dns" : "routed-dns", { name, type });
+    if (fixture) record(direct ? "direct-dns" : "routed-dns", { name, type, port: listener });
     const question = query.subarray(12, cursor + 5);
     const header = Buffer.alloc(12);
     query.copy(header, 0, 0, 2);
-    const known = fixture || Boolean(local);
+    // The root is answered with no records, so a probe that asks for it reads a
+    // working plain server; nothing here is signed.
+    const known = fixture || Boolean(local) || name === "";
     header.writeUInt16BE(known ? 0x8180 : 0x8183, 2);
     header.writeUInt16BE(1, 4);
     if (known && type === 1) {
@@ -380,28 +411,34 @@ export async function startProxyFixture(options = {}) {
     }
     return Buffer.concat([header, question]);
   }
-  const udp = dgram.createSocket("udp4");
-  udp.on("message", async (query, remote) => {
-    const response = await dnsResponse(query, true);
-    if (response) udp.send(response, remote.port, remote.address);
-  });
-  await new Promise((resolve, reject) => { udp.once("error", reject); udp.bind(ports.dns, "0.0.0.0", resolve); });
-  // Port zero in unit tests allocates TCP and UDP independently: an available
-  // UDP ephemeral port can already be occupied by an unrelated TCP listener.
-  // The container flow binds both protocols to the configured port 53.
-  ports.dnsUdp = udp.address().port;
-  await listen(net.createServer(client => {
-    if (!own(client)) return;
-    const input = reader(client);
-    input.stage(buffer => {
-      if (buffer.length < 2 || buffer.length < buffer.readUInt16BE(0) + 2) return;
-      const end = buffer.readUInt16BE(0) + 2;
-      void dnsResponse(buffer.subarray(2, end), client.remoteAddress !== "127.0.0.1").then(response => {
-        if (response && !client.destroyed) { const size = Buffer.alloc(2); size.writeUInt16BE(response.length); client.write(Buffer.concat([size, response])); }
-      });
-      return end;
+  const udps = [];
+  async function serveDns(key) {
+    const udp = dgram.createSocket("udp4");
+    udps.push(udp);
+    udp.on("message", async (query, remote) => {
+      const response = await dnsResponse(query, true, ports[key]);
+      if (response) udp.send(response, remote.port, remote.address);
     });
-  }), "dns");
+    await new Promise((resolve, reject) => { udp.once("error", reject); udp.bind(ports[key], "0.0.0.0", resolve); });
+    // Port zero in unit tests allocates TCP and UDP independently: an available
+    // UDP ephemeral port can already be occupied by an unrelated TCP listener.
+    // The container flow binds both protocols to the configured port.
+    ports[`${key}Udp`] = udp.address().port;
+    await listen(net.createServer(client => {
+      if (!own(client)) return;
+      const input = reader(client);
+      input.stage(buffer => {
+        if (buffer.length < 2 || buffer.length < buffer.readUInt16BE(0) + 2) return;
+        const end = buffer.readUInt16BE(0) + 2;
+        void dnsResponse(buffer.subarray(2, end), client.remoteAddress !== "127.0.0.1", ports[key]).then(response => {
+          if (response && !client.destroyed) { const size = Buffer.alloc(2); size.writeUInt16BE(response.length); client.write(Buffer.concat([size, response])); }
+        });
+        return end;
+      });
+    }), key);
+  }
+  await serveDns("dns");
+  if (!publicOnly) await serveDns("dnsAlt");
   await listen(http.createServer((request, response) => {
     record(request.socket.remoteAddress === "127.0.0.1" ? "routed-http" : "direct-http", { path: request.url, host: request.headers.host });
     const origin = `http://download.proxy.test:${ports.http}`;
@@ -437,6 +474,7 @@ export async function startProxyFixture(options = {}) {
       }
       response.end(JSON.stringify({
         ip, addresses, ports, sequence, events,
+        open: [...open],
         active: Object.fromEntries(Object.entries(routes).map(([name, route]) => [name, route.sockets.size])),
         // Each route's service as the control last set it, so a caller can wait
         // on the fixture's own word that a route is back.
@@ -482,7 +520,7 @@ export async function startProxyFixture(options = {}) {
       response.end("{}");
     } catch (error) { response.writeHead(400).end(JSON.stringify({ error: String(error) })); }
   }), "control");
-  return { ports, events, async close() { udp.close(); for (const resolver of resolvers) resolver.close(); resolvers.clear(); for (const socket of sockets) socket.destroy(); await Promise.all(servers.map(server => new Promise(resolve => { server.closeAllConnections?.(); server.close(resolve); }))); } };
+  return { ports, events, async close() { for (const udp of udps) udp.close(); for (const resolver of resolvers) resolver.close(); resolvers.clear(); for (const socket of sockets) socket.destroy(); await Promise.all(servers.map(server => new Promise(resolve => { server.closeAllConnections?.(); server.close(resolve); }))); } };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use async_graphql::{Data, Executor, futures_util::StreamExt};
-use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
+use async_graphql_axum::GraphQLResponse;
 use axum::extract::{
     ConnectInfo, Extension, WebSocketUpgrade,
     ws::{CloseFrame, Message, WebSocket},
@@ -17,6 +17,157 @@ use weaver_server_api::WeaverSchema;
 use weaver_server_core::auth::CallerScope;
 
 const WEBSOCKET_AUTH_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The most subscriptions one GraphQL socket may hold live at once. A
+/// subscribe past it is refused for that operation alone, with an `error`
+/// message for its id; the socket and its other subscriptions stay up. A
+/// subscription frees its place when its stream ends, when the client stops
+/// it, or when the socket closes.
+const MAX_LIVE_SUBSCRIPTIONS_PER_SOCKET: usize = 32;
+
+/// The most GraphQL sockets one caller may hold open at once, counted per
+/// credential: one API key, one login or browser session, or the one local
+/// session every trusted-network browser shares when login is off. A socket
+/// past it is closed with 4429 after `connection_init`, which is where its
+/// credential becomes known.
+const MAX_SOCKETS_PER_CALLER: usize = 8;
+
+// Close code for a socket refused by a count limit.
+const CLOSE_TOO_MANY: u16 = 4429;
+
+fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+// Open GraphQL sockets per caller. An entry is removed when its count reaches
+// zero, so the map holds only callers with a socket open.
+static OPEN_SOCKETS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<weaver_server_api::auth::CallerIdentity, usize>>,
+> = std::sync::LazyLock::new(Default::default);
+
+// One open socket's place in its caller's count, given back when dropped.
+struct SocketPlace {
+    identity: weaver_server_api::auth::CallerIdentity,
+}
+
+impl SocketPlace {
+    fn claim(identity: &weaver_server_api::auth::CallerIdentity) -> Option<Self> {
+        let mut open = lock(&OPEN_SOCKETS);
+        let count = open.entry(identity.clone()).or_default();
+        if *count >= MAX_SOCKETS_PER_CALLER {
+            return None;
+        }
+        *count += 1;
+        Some(Self {
+            identity: identity.clone(),
+        })
+    }
+}
+
+impl Drop for SocketPlace {
+    fn drop(&mut self) {
+        let mut open = lock(&OPEN_SOCKETS);
+        if let Some(count) = open.get_mut(&self.identity) {
+            *count -= 1;
+            if *count == 0 {
+                open.remove(&self.identity);
+            }
+        }
+    }
+}
+
+// The live subscriptions of one socket, by operation id. Each start of an id
+// gets a new generation, so a stream replaced under a reused id cannot free
+// the place of the one that replaced it.
+#[derive(Default)]
+struct LiveSubscriptions {
+    ids: std::collections::HashMap<String, u64>,
+    next_generation: u64,
+}
+
+// A live subscription's place on its socket. It travels in the request's
+// data, which the subscription's stream holds for as long as it runs, so the
+// place is given back whenever the stream is dropped: it ended by itself, it
+// failed, the client stopped it, or the socket went away.
+struct SubscriptionPlace {
+    live: std::sync::Arc<std::sync::Mutex<LiveSubscriptions>>,
+    id: String,
+    generation: u64,
+}
+
+impl Drop for SubscriptionPlace {
+    fn drop(&mut self) {
+        let mut live = lock(&self.live);
+        if live.ids.get(&self.id) == Some(&self.generation) {
+            live.ids.remove(&self.id);
+        }
+    }
+}
+
+// Whether `request` runs a subscription. A request that does not parse, or
+// does not name one operation, is left to the schema to refuse.
+fn starts_subscription(request: &mut async_graphql::Request) -> bool {
+    let name = request.operation_name.clone();
+    let Ok(document) = request.parsed_query() else {
+        return false;
+    };
+    let mut operations = document.operations.iter();
+    let operation = match name.as_deref() {
+        Some(name) => operations
+            .find(|(candidate, _)| candidate.is_some_and(|candidate| candidate.as_str() == name)),
+        None => match (operations.next(), operations.next()) {
+            (Some(only), None) => Some(only),
+            _ => None,
+        },
+    };
+    operation.is_some_and(|(_, operation)| {
+        operation.node.ty == async_graphql::parser::types::OperationType::Subscription
+    })
+}
+
+// Counts a subscribe against the socket's live subscriptions. `false` when the
+// socket is full and the operation must be refused.
+fn admit_operation(
+    live: &std::sync::Arc<std::sync::Mutex<LiveSubscriptions>>,
+    id: &str,
+    request: &mut async_graphql::Request,
+) -> bool {
+    let subscription = starts_subscription(request);
+    let mut state = lock(live);
+    if !subscription {
+        // A query under a live id replaces that subscription's stream.
+        state.ids.remove(id);
+        return true;
+    }
+    if !state.ids.contains_key(id) && state.ids.len() >= MAX_LIVE_SUBSCRIPTIONS_PER_SOCKET {
+        return false;
+    }
+    state.next_generation += 1;
+    let generation = state.next_generation;
+    state.ids.insert(id.to_owned(), generation);
+    request.data.insert(SubscriptionPlace {
+        live: live.clone(),
+        id: id.to_owned(),
+        generation,
+    });
+    true
+}
+
+// The protocol's `error` message refusing operation `id`.
+fn too_many_subscriptions(protocol: async_graphql::http::WebSocketProtocols, id: &str) -> String {
+    let error = serde_json::json!({
+        "message": format!(
+            "Too many live subscriptions on this connection (limit {MAX_LIVE_SUBSCRIPTIONS_PER_SOCKET})"
+        ),
+    });
+    let payload = match protocol {
+        async_graphql::http::WebSocketProtocols::GraphQLWS => serde_json::json!([error]),
+        async_graphql::http::WebSocketProtocols::SubscriptionsTransportWS => error,
+    };
+    serde_json::json!({ "type": "error", "id": id, "payload": payload }).to_string()
+}
 
 #[derive(Clone)]
 enum WebSocketCredential {
@@ -182,12 +333,16 @@ pub(super) mod refusal {
     // 403: a browser session came with the request but failed its origin or
     // CSRF binding.
     pub(in crate::http) const BROWSER_VERIFICATION_REQUIRED: &str = "BROWSER_VERIFICATION_REQUIRED";
+    // 413: an authenticated request's body is larger than the endpoint takes,
+    // by its declared length or by the bytes that arrived.
+    pub(in crate::http) const REQUEST_TOO_LARGE: &str = "REQUEST_TOO_LARGE";
 
     #[cfg(test)]
     pub(in crate::http) const ALL: &[&str] = &[
         INVALID_API_KEY,
         AUTHENTICATION_REQUIRED,
         BROWSER_VERIFICATION_REQUIRED,
+        REQUEST_TOO_LARGE,
     ];
 }
 
@@ -215,14 +370,97 @@ fn auth_refusal_response(status: StatusCode, headers: &HeaderMap) -> axum::respo
     }
 }
 
+// Room in a request body for the JSON or multipart framing around its largest
+// value.
+const BODY_FRAMING_BYTES: u64 = 1024 * 1024;
+
+// The largest request body the endpoint reads. An NZB at the upload limit has
+// to fit either way it can arrive: as base64 text inside the JSON (four
+// characters for every three bytes), or as a multipart file next to the
+// operation.
+pub(super) fn body_limit(security: &weaver_server_core::security::RuntimeSecurityConfig) -> u64 {
+    security
+        .nzb_upload_limit_bytes
+        .div_ceil(3)
+        .saturating_mul(4)
+        .saturating_add(BODY_FRAMING_BYTES)
+}
+
+// The GraphQL request in `body`, read up to `limit` bytes. A declared length
+// over the limit is refused before any of the body is read; a body that
+// passes the limit as it arrives is cut off there.
+async fn read_request(
+    headers: &HeaderMap,
+    body: axum::body::Body,
+    limit: u64,
+) -> Result<async_graphql::Request, axum::response::Response> {
+    use async_graphql::futures_util::TryStreamExt;
+
+    let too_large = || {
+        super::coded_error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            refusal::REQUEST_TOO_LARGE,
+            &format!("request body exceeds {limit} bytes"),
+        )
+    };
+    let declared = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if declared.is_some_and(|declared| declared > limit) {
+        return Err(too_large());
+    }
+    let overflowed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut read = 0u64;
+    let flag = overflowed.clone();
+    let reader = body
+        .into_data_stream()
+        .map_err(std::io::Error::other)
+        .and_then(move |chunk| {
+            read = read.saturating_add(chunk.len() as u64);
+            let past = read > limit;
+            if past {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            async move {
+                if past {
+                    Err(std::io::Error::other("request body too large"))
+                } else {
+                    Ok(chunk)
+                }
+            }
+        })
+        .into_async_read();
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    // Uploaded files are held in memory, so the body limit is also the
+    // bound on what one request's files can hold.
+    let parsed = async_graphql::http::receive_batch_body(
+        content_type,
+        reader,
+        async_graphql::http::MultipartOptions::default(),
+    )
+    .await
+    .and_then(async_graphql::BatchRequest::into_single);
+    match parsed {
+        Ok(request) => Ok(request),
+        Err(_) if overflowed.load(std::sync::atomic::Ordering::Relaxed) => Err(too_large()),
+        Err(error) => Err(async_graphql_axum::rejection::GraphQLRejection(error).into_response()),
+    }
+}
+
+// The caller is resolved from the request's headers before any of its body
+// is read, so a request that does not authenticate costs no body read.
 pub(super) async fn graphql_handler(
     Extension(schema): Extension<WeaverSchema>,
     Extension(request_auth): Extension<super::RequestAuthContext>,
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
-    headers: HeaderMap,
-    req: GraphQLRequest,
+    req: axum::extract::Request,
 ) -> Result<GraphQLResponse, axum::response::Response> {
     let peer = peer.map(|Extension(ConnectInfo(peer))| peer);
+    let (parts, body) = req.into_parts();
+    let headers = parts.headers;
     let resolved = match super::auth::resolve_script_run(&request_auth.db, &headers).await {
         Some(resolved) => resolved,
         None => super::auth::resolve_caller(
@@ -246,7 +484,7 @@ pub(super) async fn graphql_handler(
             .await
             .map_err(|status| auth_refusal_response(status, &headers))?;
     }
-    let mut request = req.into_inner();
+    let mut request = read_request(&headers, body, body_limit(&request_auth.security)).await?;
     request = request
         .data(resolved.scope)
         .data(resolved.identity)
@@ -378,7 +616,7 @@ async fn serve_authenticated_websocket<E: Executor>(
 ) {
     let initial = match tokio::time::timeout(
         Duration::from_secs(10),
-        receive_graphql_message(&mut socket),
+        receive_graphql_message(&mut socket, &mut None),
     )
     .await
     {
@@ -428,6 +666,22 @@ async fn serve_authenticated_websocket<E: Executor>(
             return;
         }
     };
+    // Held while the socket is served; every way out of this function gives
+    // the place back.
+    let Some(place) = SocketPlace::claim(&authorization.identity) else {
+        let _ = socket
+            .send(Message::Close(Some(CloseFrame {
+                code: CLOSE_TOO_MANY,
+                reason: format!(
+                    "Too many open connections for this credential (limit {MAX_SOCKETS_PER_CALLER})"
+                )
+                .into(),
+            })))
+            .await;
+        return;
+    };
+    let mut place = Some(place);
+    let live = std::sync::Arc::new(std::sync::Mutex::new(LiveSubscriptions::default()));
 
     let (input_sender, input_receiver) = tokio::sync::mpsc::channel(32);
     let input = async_graphql::futures_util::stream::unfold(input_receiver, |mut receiver| async {
@@ -460,13 +714,31 @@ async fn serve_authenticated_websocket<E: Executor>(
                     return;
                 }
             }
-            message = receive_graphql_message(&mut socket) => {
-                let Some(message) = message else {
+            message = receive_graphql_message(&mut socket, &mut place) => {
+                let Some(mut message) = message else {
                     return;
                 };
                 if !authorization.remains_active(&request_auth, peer).await {
                     close_unauthorized(&mut socket).await;
                     return;
+                }
+                match &mut message {
+                    Ok(async_graphql::http::ClientMessage::Start { id, payload }) => {
+                        if !admit_operation(&live, id, payload) {
+                            let refusal = too_many_subscriptions(protocol, id);
+                            if socket.send(Message::Text(refusal.into())).await.is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+                    }
+                    // The place is free from the moment the client stops
+                    // the subscription, not when the protocol handler next
+                    // runs, so a stop followed by a subscribe always fits.
+                    Ok(async_graphql::http::ClientMessage::Stop { id }) => {
+                        lock(&live).ids.remove(id.as_str());
+                    }
+                    _ => {}
                 }
                 if input_sender.try_send(message).is_err() {
                     let _ = socket.send(Message::Close(Some(CloseFrame {
@@ -502,8 +774,11 @@ async fn serve_authenticated_websocket<E: Executor>(
     }
 }
 
+// `place` is given back before a client's close is answered, so a client that
+// has seen its socket closed can open the next one at once.
 async fn receive_graphql_message(
     socket: &mut WebSocket,
+    place: &mut Option<SocketPlace>,
 ) -> Option<serde_json::Result<async_graphql::http::ClientMessage>> {
     loop {
         let message = socket.recv().await?.ok()?;
@@ -515,6 +790,7 @@ async fn receive_graphql_message(
             }
             Message::Pong(_) => {}
             Message::Close(frame) => {
+                drop(place.take());
                 let _ = socket.send(Message::Close(frame)).await;
                 return None;
             }
@@ -536,6 +812,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use weaver_server_core::Database;
+    use weaver_server_core::auth::repository::AuthRepositoryQueries;
     use weaver_server_core::auth::{ApiKeyCache, BrowserSession, LoginAuthCache, hash_api_key};
     use weaver_server_core::security::RuntimeSecurityConfig;
 

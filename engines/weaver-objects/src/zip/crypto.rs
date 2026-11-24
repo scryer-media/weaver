@@ -568,7 +568,18 @@ impl super::Zip {
         };
         let mut again = Vec::new();
         let mut locked = false;
-        for entry in &mut map.entries {
+        // Only an entry with a cipher has keys to open; every other one was
+        // passed over, so the pass looks at those alone, in the same order.
+        map.file_sealed();
+        #[cfg(test)]
+        assert!(
+            map.sealed_lists_every_cipher(),
+            "an entry was given a cipher after it was made"
+        );
+        #[cfg(test)]
+        super::looked::opened(map.sealed.len(), map.entries.len());
+        for &index in &map.sealed {
+            let entry = &mut map.entries[index];
             let (Some(cipher), Some(data), Some(member)) =
                 (&mut entry.cipher, entry.data, entry.member)
             else {

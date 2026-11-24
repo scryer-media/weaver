@@ -25,8 +25,22 @@ export interface LiveConnectionState {
   isPolling: boolean;
 }
 
+/**
+ * A destination volume a download waits on or still writes to. A slow one is
+ * one dispatch keeps waiting on for its write buffer.
+ */
+export interface DiskVolume {
+  label: string;
+  /** Downloads keep waiting on it. */
+  slow: boolean;
+  /** Measured write rate; 0 until one is measured. */
+  writeRateBytesPerSec: number;
+  /** Bytes in memory waiting for its writer, from every download. */
+  waitingBytes: number;
+}
+
 export interface DownloadBlockState {
-  kind: "NONE" | "MANUAL_PAUSE" | "SCHEDULED" | "EGRESS_QUOTA" | "SERVER_QUOTA";
+  kind: "NONE" | "MANUAL_PAUSE" | "SPEED_TEST" | "SCHEDULED" | "EGRESS_QUOTA" | "SERVER_QUOTA";
   /** The egress whose download quota is holding downloads, while one is. */
   egressId?: number | null;
   egressName?: string | null;
@@ -36,12 +50,16 @@ export interface DownloadBlockState {
   windowStartsAtEpochMs?: number | null;
   windowEndsAtEpochMs?: number | null;
   timezoneName: string;
-  scheduledSpeedLimit: number;
-  speedLimitInForce: number;
+  /** The rate a schedule rule holds downloads to, while one does; null is no limit. */
+  scheduledSpeedLimit: number | null;
+  /** The download limit in force: the tighter of the configured and scheduled ones; null is no limit. */
+  speedLimitInForce: number | null;
   /** Whether a schedule window sets the limit in force, even to unlimited. */
   speedLimitBySchedule: boolean;
   /** Why a schedule rule is holding new downloads, while one is. */
   scheduleHoldReason?: string | null;
+  /** When a timed pause lifts by itself; null for a pause held until resumed. */
+  resumeAtEpochMs?: number | null;
 }
 
 export interface LiveData {
@@ -69,8 +87,8 @@ const DEFAULT_DOWNLOAD_BLOCK: DownloadBlockState = {
   windowStartsAtEpochMs: null,
   windowEndsAtEpochMs: null,
   timezoneName: "",
-  scheduledSpeedLimit: 0,
-  speedLimitInForce: 0,
+  scheduledSpeedLimit: null,
+  speedLimitInForce: null,
   speedLimitBySchedule: false,
 };
 const DEFAULT_CONNECTION: LiveConnectionState = {

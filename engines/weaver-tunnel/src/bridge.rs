@@ -20,12 +20,17 @@ type ReadCallback = Arc<dyn Fn(usize) + Send + Sync>;
 pub struct ConnectionOutcome {
     callbacks: Mutex<OutcomeCallbacks>,
     reads: OnceLock<Arc<[ReadCallback]>>,
+    // The bytes the connection's sockets reserved, in each session's share
+    // they are in.
+    reserved: Mutex<Vec<crate::pipe::Reservation>>,
 }
 #[derive(Default)]
 struct OutcomeCallbacks {
     failed: bool,
     closed: bool,
     retiring: bool,
+    connected: bool,
+    connect: Vec<Box<dyn Fn() + Send + Sync>>,
     failure: Vec<Box<dyn Fn() + Send + Sync>>,
     close: Vec<Box<dyn Fn() + Send + Sync>>,
     retire: Vec<Box<dyn Fn() + Send + Sync>>,
@@ -39,6 +44,17 @@ impl std::fmt::Debug for ConnectionOutcome {
     }
 }
 impl ConnectionOutcome {
+    // The connection's socket reserved these bytes in a session's share.
+    pub(crate) fn reserved(&self, reservation: crate::pipe::Reservation) {
+        self.reserved
+            .lock()
+            .expect("connection outcome")
+            .push(reservation);
+    }
+    // The bytes the connection's sockets reserved, by share.
+    pub(crate) fn reservations(&self) -> Vec<crate::pipe::Reservation> {
+        self.reserved.lock().expect("connection outcome").clone()
+    }
     // Recall an idle socket now, or a busy socket at its next article boundary.
     pub fn on_retire(&self, callback: impl Fn() + Send + Sync + 'static) {
         let mut callbacks = self.callbacks.lock().expect("connection outcome");
@@ -122,6 +138,31 @@ impl ConnectionOutcome {
             callback(bytes, wire);
         }
     }
+    // Run once the socket's owner counts it connected, not still dialling:
+    // the tunnel then reads the owner's holdings as moved.
+    pub fn on_connected(&self, callback: impl Fn() + Send + Sync + 'static) {
+        let mut callbacks = self.callbacks.lock().expect("connection outcome");
+        if callbacks.connected {
+            drop(callbacks);
+            callback();
+        } else if !callbacks.closed {
+            callbacks.connect.push(Box::new(callback));
+        }
+    }
+    // The socket's owner counts it connected. Once; nothing after closure.
+    pub fn connected(&self) {
+        let callbacks = {
+            let mut callbacks = self.callbacks.lock().expect("connection outcome");
+            if callbacks.connected || callbacks.closed {
+                return;
+            }
+            callbacks.connected = true;
+            std::mem::take(&mut callbacks.connect)
+        };
+        for callback in callbacks {
+            callback();
+        }
+    }
     pub fn on_failure(&self, callback: impl Fn() + Send + Sync + 'static) {
         let mut callbacks = self.callbacks.lock().expect("connection outcome");
         if callbacks.failed {
@@ -162,6 +203,7 @@ impl ConnectionOutcome {
             }
             callbacks.closed = true;
             callbacks.failure.clear();
+            callbacks.connect.clear();
             std::mem::take(&mut callbacks.close)
         };
         for callback in callbacks {

@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// Support reports: an NZB analysis plus what Weaver did with the job.
+// Support reports: an NZB or torrent analysis plus what Weaver did with the
+// job.
 //
-// The NZB half is [`weaver_nzb::analysis`]. This half appends the job's
-// outcome from state Weaver already keeps, under the same rule: nothing in
-// a report names the job, a file, a path, a server host or a password.
-// Every string is a constant from a fixed list or a generated token.
+// The analysis half is [`weaver_nzb::analysis`] or
+// [`weaver_torrent::analysis`]. This half appends the job's outcome from
+// state Weaver already keeps, under the same rule: nothing in a report
+// names the job, a file, a path, a server host or a password. Every string
+// is a constant from a fixed list or a generated token; a torrent's
+// trackers appear by scheme and host only.
 
+use crate::history::queries::HistoryQueries;
+use crate::history::timeline::HistoryTimelineQueries;
+use crate::jobs::JobsSupportFactsPersistenceQueries;
+use crate::jobs::queries::JobsQueries;
 #[cfg(test)]
 mod tests;
+mod torrent;
+
+pub use torrent::TorrentJobSection;
+use weaver_server_composition::support::human_bytes;
+pub use weaver_server_composition::support::{ActiveReportGroup, ActiveReportJobs};
 
 use std::fmt::Write as _;
 
@@ -18,10 +30,12 @@ use weaver_nzb::analysis::{NzbReport, analyze};
 
 use crate::history::JobEvent;
 use crate::ingest::decode_persisted_nzb_bytes;
+use crate::jobs::Protocol;
 use crate::jobs::model::TerminalDiscardKind;
 use crate::jobs::server_attribution::{JobServerContribution, contributions_from_storage};
 use crate::jobs::support_facts::JobSupportFacts;
 use crate::persistence::Database;
+use crate::torrents::service::{TorrentService, TorrentSupport};
 use crate::{JobHistoryRow, JobId, JobInfo, SchedulerHandle, StateError};
 
 // A report in both forms: text to paste, JSON to attach.
@@ -39,6 +53,10 @@ pub enum SupportReportError {
     NzbUnavailable(u64),
     #[error("the NZB could not be read: {0}")]
     Parse(String),
+    #[error("the torrent could not be read: {0}")]
+    TorrentParse(String),
+    #[error("the torrent for job {0} is no longer held")]
+    TorrentUnavailable(u64),
     #[error(transparent)]
     State(#[from] StateError),
     #[error("support report task failed: {0}")]
@@ -53,57 +71,12 @@ impl SupportReportError {
             Self::NotFound(_) => "job_not_found",
             Self::NzbUnavailable(_) => "nzb_unavailable",
             Self::Parse(_) => "nzb_unreadable",
+            Self::TorrentParse(_) => "torrent_unreadable",
+            Self::TorrentUnavailable(_) => "torrent_unavailable",
             Self::State(_) => "state_read_failed",
             Self::Task(_) => "report_task_failed",
         }
     }
-}
-
-// Where a queued job stands for the reports the diagnostics package carries.
-// Only jobs Weaver has started work on qualify: a job that is merely queued,
-// waiting on its queue scripts, or paused does not, and neither does one that
-// finished well and is on its way to history.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ActiveReportGroup {
-    // Verifying, repairing, extracting, moving or post-processing, or
-    // waiting in line for one of them. Listed first.
-    PostProcessing,
-    // Failed and still in the queue.
-    Failed,
-    // Downloading, or checking article availability before it does.
-    Downloading,
-}
-
-impl ActiveReportGroup {
-    pub fn of(status: &crate::JobStatus) -> Option<Self> {
-        use crate::JobStatus;
-        if status.past_download() {
-            Some(Self::PostProcessing)
-        } else {
-            match status {
-                JobStatus::Failed { .. } => Some(Self::Failed),
-                JobStatus::Downloading | JobStatus::Checking => Some(Self::Downloading),
-                _ => None,
-            }
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::PostProcessing => "post_processing",
-            Self::Failed => "failed",
-            Self::Downloading => "downloading",
-        }
-    }
-}
-
-// The jobs chosen for reports, in report order, and how many qualified
-// before the cap.
-#[derive(Debug, Clone)]
-pub struct ActiveReportJobs {
-    pub qualified: usize,
-    pub jobs: Vec<(ActiveReportGroup, JobInfo)>,
 }
 
 // Where the report was made. Every field is a fixed name.
@@ -140,24 +113,81 @@ pub fn analyze_nzb_bytes(
     Ok(render(&nzb, None, environment))
 }
 
-// The support report for one job, live or finished.
+// Analyze a .torrent file that nobody submitted.
+pub fn analyze_torrent_bytes(
+    bytes: &[u8],
+    environment: &ReportEnvironment,
+    now_epoch_secs: u64,
+) -> Result<SupportReport, SupportReportError> {
+    let report = weaver_torrent::analysis::analyze_metainfo(bytes, now_epoch_secs)
+        .map_err(torrent::analysis_error)?
+        .with_weaver_version(environment.weaver_version);
+    Ok(torrent::render(&report, None, environment))
+}
+
+// Analyze a magnet link that nobody submitted: what it carries.
+pub fn analyze_magnet(
+    link: &str,
+    environment: &ReportEnvironment,
+    now_epoch_secs: u64,
+) -> Result<SupportReport, SupportReportError> {
+    let report = weaver_torrent::analysis::analyze_magnet_link(link, now_epoch_secs)
+        .map_err(torrent::analysis_error)?
+        .with_weaver_version(environment.weaver_version);
+    Ok(torrent::render(&report, None, environment))
+}
+
+// The support report for one job, live or finished. A torrent's held state
+// is read from `torrents` when the service runs.
 pub async fn job_support_report(
     db: &Database,
     handle: &SchedulerHandle,
+    torrents: Option<&TorrentService>,
     job_id: u64,
 ) -> Result<SupportReport, SupportReportError> {
     let environment = ReportEnvironment::current(db, handle);
     let live = handle.get_job(JobId(job_id)).ok();
+    let held = match torrents {
+        Some(torrents) => torrents.support(JobId(job_id)).await,
+        None => None,
+    };
     let db = db.clone();
     tokio::task::spawn_blocking(move || {
-        build_job_support_report(&db, live, job_id, &environment, now_epoch_secs())
+        build_job_support_report(&db, live, held, job_id, &environment, now_epoch_secs())
     })
     .await
     .map_err(|error| SupportReportError::Task(error.to_string()))?
 }
 
 // The blocking body of [`job_support_report`], with every input explicit.
+// The job's kind is decided here, once, from where the job is: the torrent
+// service holds it, the queue lists it, or history keeps it.
 pub fn build_job_support_report(
+    db: &Database,
+    live: Option<JobInfo>,
+    held: Option<TorrentSupport>,
+    job_id: u64,
+    environment: &ReportEnvironment,
+    now_epoch_secs: u64,
+) -> Result<SupportReport, SupportReportError> {
+    let protocol = match (&held, &live) {
+        (Some(_), _) => Protocol::Torrent,
+        (None, Some(info)) => info.protocol,
+        (None, None) => {
+            db.get_job_history(job_id)?
+                .ok_or(SupportReportError::NotFound(job_id))?
+                .protocol
+        }
+    };
+    match protocol {
+        Protocol::Nzb => build_nzb_job_report(db, live, job_id, environment, now_epoch_secs),
+        Protocol::Torrent => {
+            torrent::build_job_report(db, live, held, job_id, environment, now_epoch_secs)
+        }
+    }
+}
+
+fn build_nzb_job_report(
     db: &Database,
     live: Option<JobInfo>,
     job_id: u64,
@@ -237,6 +267,11 @@ fn render(
     if let Some(job) = job {
         job.render(&mut text);
     }
+    write_environment(&mut text, environment);
+    SupportReport { text, json }
+}
+
+fn write_environment(text: &mut String, environment: &ReportEnvironment) {
     let _ = writeln!(
         text,
         "env weaver {}  db {}  os {}/{}  profile {}",
@@ -246,7 +281,6 @@ fn render(
         environment.arch,
         environment.hardware_profile.unwrap_or("-"),
     );
-    SupportReport { text, json }
 }
 
 // Where the job stands now, from the queue or from history.
@@ -271,6 +305,14 @@ pub enum FailureVerdict {
     Checksum,
     MissingArticles,
     Duplicate,
+    // A torrent's causes: its metadata never arrived, its trackers refused
+    // it, its route or session would not carry it, or it has no
+    // certificate to present.
+    Metadata,
+    Tracker,
+    Route,
+    Session,
+    Certificate,
     Other,
 }
 
@@ -294,6 +336,16 @@ impl FailureVerdict {
             Self::Script
         } else if any(&["crc", "checksum", "hash mismatch"]) {
             Self::Checksum
+        } else if any(&["certificate", "ssl"]) {
+            Self::Certificate
+        } else if any(&["metadata", "magnet"]) {
+            Self::Metadata
+        } else if any(&["tracker", "announce"]) {
+            Self::Tracker
+        } else if any(&["route", "egress", "proxy", "tunnel"]) {
+            Self::Route
+        } else if any(&["session", "listen port"]) {
+            Self::Session
         } else if any(&[
             "missing",
             "not found",
@@ -322,6 +374,11 @@ impl FailureVerdict {
             Self::Checksum => "checksum",
             Self::MissingArticles => "missing_articles",
             Self::Duplicate => "duplicate",
+            Self::Metadata => "metadata",
+            Self::Tracker => "tracker",
+            Self::Route => "route",
+            Self::Session => "session",
+            Self::Certificate => "certificate",
             Self::Other => "other",
         }
     }
@@ -584,6 +641,10 @@ const KNOWN_STATUSES: &[&str] = &[
     "failed",
     "paused",
     "cancelled",
+    "fetching_metadata",
+    "checking_files",
+    "seeding",
+    "stalled",
 ];
 
 fn known_status(status: &str) -> &'static str {
@@ -914,20 +975,6 @@ fn clip(line: &str) -> String {
 
 fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
-}
-
-pub(crate) fn human_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    if bytes < 1024 {
-        return format!("{bytes} B");
-    }
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    format!("{value:.1} {}", UNITS[unit])
 }
 
 fn human_age(secs: u64) -> String {

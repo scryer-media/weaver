@@ -5,14 +5,32 @@ import type { ProxyKind } from "./proxies";
 
 export type Rung = { kind: "PROXY" | "POOL" | "CHAIN"; proxyId: number | null; poolId: number | null; chainIds: number[] };
 export type Leg = { egressId: number; weight: number; path: { kind: "DIRECT" | "LADDER"; rungs: Rung[]; directFallback: boolean } };
-export type NetworkRoute = { legs: Leg[]; failover: "REDISTRIBUTE" | "HOLD" };
-export type Egress = { addresses?:string[]; id: number; name: string; bindingKind: "SYSTEM" | "INTERFACE" | "SOURCE_ADDRESS"; interfaceName: string | null; sourceAddress: string | null; enabled: boolean; maxDownloadSpeed: number; downloadQuota?: DownloadQuota; downloadQuotaUsage?: DownloadQuotaUsage | null; health: string; reason: string | null };
+/** `dnsProfileId` is the DNS profile the route's names follow; 0 is System. A route read without it keeps the saved one. */
+export type NetworkRoute = { legs: Leg[]; failover: "REDISTRIBUTE" | "HOLD"; dnsProfileId?: number };
+export type Egress = { addresses?:string[]; id: number; name: string; bindingKind: "SYSTEM" | "INTERFACE" | "SOURCE_ADDRESS"; interfaceName: string | null; sourceAddress: string | null; enabled: boolean; downloadBps: number | null; uploadBps: number | null; quota?: EgressQuota; quotaUsage?: EgressQuotaUsage | null; health: string; reason: string | null };
 export type QuotaPeriod = "ONE_TIME" | "DAILY" | "WEEKLY" | "MONTHLY";
 export type Weekday = "MON" | "TUE" | "WED" | "THU" | "FRI" | "SAT" | "SUN";
-/** A download allowance as it is configured, on a server or an egress. */
+/** A server's download allowance as it is configured. */
 export type DownloadQuota = { enabled: boolean; period: QuotaPeriod; limitBytes: number; resetTimeMinutesLocal: number; weeklyResetWeekday: Weekday; monthlyResetDay: number };
-/** How much of an egress's allowance is spent; null `remainingBytes` means it has none. */
-export type DownloadQuotaUsage = { usedBytes: number; reservedBytes: number; remainingBytes: number | null; blocked: boolean; windowStartsAtEpochMs: number | null; windowEndsAtEpochMs: number | null; timezoneName: string };
+/** An egress's caps per period, in bytes; null is no cap, and 0 a budget of nothing. */
+export type EgressQuota = { downloadBytes: number | null; uploadSoftBytes: number | null; uploadTrickleBps: number; uploadHardBytes: number | null; period: QuotaPeriod; resetTimeMinutesLocal: number; weeklyResetWeekday: Weekday; monthlyResetDay: number };
+/** Where a direction stands against its caps: open, slowed to the trickle, or stopped. */
+export type QuotaState = "NORMAL" | "TRICKLE" | "STOPPED";
+/** One direction's spend this period; null `remainingBytes` means it has no cap. */
+export type QuotaDirectionUsage = { usedBytes: number; remainingBytes: number | null; state: QuotaState };
+/** An egress's spend this period in each direction; `state` is the tighter of the two. */
+export type EgressQuotaUsage = { down: QuotaDirectionUsage; up: QuotaDirectionUsage; state: QuotaState; periodStartEpochMs: number | null; periodEndEpochMs: number | null; timezoneName: string };
+/** Bytes per second in each direction over every egress together; null is no limit. */
+/** Usenet's percentage of the global download limit; torrents get the rest. */
+export type BandwidthSplit = { usenetPct: number };
+export type Bandwidth = { downloadBps: number | null; uploadBps: number | null; split: BandwidthSplit | null };
+/** The split in force and the download limit each side holds to; null is no limit. */
+export type BandwidthSplitState = {
+  inForce: BandwidthSplit | null;
+  needsDownloadLimit: boolean;
+  usenetBps: number | null;
+  torrentBps: number | null;
+};
 export type ProxyPool = { id: number; name: string; kind: ProxyKind; memberIds: number[]; enabled: boolean };
 export type LegFlow = Leg & { rungStates?:string[]; consumer: string; position: number; target: number; open: number; opening: number; state: string; reason: string | null; pinnedAddress: string | null; sourceAddress?:string|null;bytesPerSecond?:number;selectedRung?:number|null;selectedProxyId?:number|null;failingHops?:FailingHop[] };
 /**
@@ -24,28 +42,57 @@ export type PoolMemberFlow = { state?:string; id: number; open: number; opening:
 export type NetworkFlow = { consumers?:{key:string;id:number;name:string;kind:ConsumerKind;cap:number;route:NetworkRoute}[]; proxies?:import("./proxies").ProxyProfile[]; proxyPools?:ProxyPool[]; egresses?:Egress[]; sampledAt?:number;legs: LegFlow[]; pools: PoolFlow[] };
 /** A pool on one egress as it runs: `liveBytesPerSecond` on a member is what it carries now, `bytesPerSecond` what the pool judges it by. */
 export type PoolFlow = { poolId: number; egressId: number; pinnedMember: number | null; members: PoolMemberFlow[] };
-/** What owns a route: a server, a feed, or Default outbound, which carries every other fetch. */
-export type ConsumerKind = "SERVER" | "RSS" | "OUTBOUND";
+/**
+ * What owns a route: a server, a feed, Default outbound, which carries every
+ * other fetch, or torrent traffic: the default route, or one category's or
+ * one tracker rule's own.
+ */
+export type ConsumerKind = "SERVER" | "RSS" | "OUTBOUND" | "TORRENT_DEFAULT" | "TORRENT_CATEGORY" | "TORRENT_TRACKER";
+export type TorrentConsumerKind = Extract<ConsumerKind, "TORRENT_DEFAULT" | "TORRENT_CATEGORY" | "TORRENT_TRACKER">;
+/** Whether a consumer carries torrent traffic, whose route is one leg with one exit. */
+export const isTorrentConsumer = (kind: ConsumerKind): kind is TorrentConsumerKind =>
+  kind === "TORRENT_DEFAULT" || kind === "TORRENT_CATEGORY" || kind === "TORRENT_TRACKER";
 /** Default outbound's key: there is one, and it is never made or removed. */
 export const OUTBOUND_CONSUMER = "outbound";
+/** The default torrent route's key: there is one, like Default outbound. */
+export const TORRENT_DEFAULT_CONSUMER = "torrent:default";
 export const directLeg = (): Leg => ({ egressId: 0, weight: 100, path: { kind: "DIRECT", rungs: [], directFallback: false } });
 /** A path nothing can take: a ladder with no rung on it and no going direct. It is how a kill switch is stored. */
 export const closedPath = (path: Leg["path"]) => path.kind === "LADDER" && !path.rungs.length && !path.directFallback;
 export function routeInput(route: NetworkRoute) {
-  return { failover: route.failover, legs: route.legs.map(leg => ({ egressId: leg.egressId, weight: leg.weight,
+  return { failover: route.failover, ...(route.dnsProfileId === undefined ? {} : { dnsProfileId: route.dnsProfileId }), legs: route.legs.map(leg => ({ egressId: leg.egressId, weight: leg.weight,
     path: leg.path.kind === "DIRECT" ? { direct: true } : { ladder: { directFallback: leg.path.directFallback, rungs: leg.path.rungs.map(r => r.kind === "PROXY" ? { proxy: r.proxyId } : r.kind === "POOL" ? { pool: r.poolId } : { chain: r.chainIds }) } },
   })) };
 }
+/** What keeps a route off torrent traffic, by the daemon's own refusal code. */
+export type TorrentRouteFault = "TORRENT_ROUTE_LEGS" | "TORRENT_ROUTE_DIRECT_FALLBACK" | "TORRENT_ROUTE_RUNGS";
+/**
+ * Why a torrent may not run on a route, the daemon's rule and order: a
+ * torrent's peers and trackers see one address, so its route is one leg with
+ * one exit. A direct leg is its egress; a ladder is one rung, a proxy, a
+ * chain ending at one proxy or a pool whose torrents each stay on one member,
+ * never falling back direct.
+ */
+export function torrentRouteFault(route: NetworkRoute): TorrentRouteFault | null {
+  if (route.legs.length !== 1) return "TORRENT_ROUTE_LEGS";
+  const path = route.legs[0]!.path;
+  if (path.kind === "DIRECT") return null;
+  if (path.directFallback) return "TORRENT_ROUTE_DIRECT_FALLBACK";
+  if (path.rungs.length > 1) return "TORRENT_ROUTE_RUNGS";
+  return null;
+}
 /** Why a route cannot be saved, as a code the interface words for itself. */
-export type RouteProblem = "legCount" | "weights" | "rungCount" | "rungTarget" | "chain" | "egressDisabled" | "proxyRepeated";
+export type RouteProblem = "legCount" | "weights" | "rungCount" | "rungTarget" | "chain" | "egressDisabled" | "proxyRepeated" | TorrentRouteFault;
 /** The proxies a rung uses, a pool's members included. */
 export function rungProxyIds(rung: Rung, pools: ProxyPool[]): number[] {
   if (rung.kind === "PROXY") return rung.proxyId === null ? [] : [rung.proxyId];
   if (rung.kind === "POOL") return pools.find(pool => pool.id === rung.poolId)?.memberIds ?? [];
   return rung.chainIds;
 }
-export function routeProblem(route: NetworkRoute, known: { egresses?: Egress[]; pools?: ProxyPool[] } = {}): RouteProblem | null {
+export function routeProblem(route: NetworkRoute, known: { egresses?: Pick<Egress, "id" | "enabled">[]; pools?: ProxyPool[]; kind?: ConsumerKind } = {}): RouteProblem | null {
   if (!route.legs.length || route.legs.length > 8) return "legCount";
+  const fault = known.kind !== undefined && isTorrentConsumer(known.kind) ? torrentRouteFault(route) : null;
+  if (fault) return fault;
   if (route.legs.some(l => !Number.isInteger(l.weight) || l.weight < 1 || l.weight > 100) || route.legs.reduce((sum,l) => sum+l.weight,0) !== 100) return "weights";
   for (const leg of route.legs) {
     if (leg.path.kind === "DIRECT") continue;
@@ -140,7 +187,7 @@ export function testedPlan(route: NetworkRoute, overrides: PathOverride, pools: 
     (leg.path.kind === "LADDER" && !leg.path.directFallback && rungDown[position]!.every(Boolean)));
   return { legDown, rungDown };
 }
-export type SpeedTestKind = "BANDWIDTH" | "USENET";
+export type SpeedTestKind = "BANDWIDTH" | "USENET" | "TORRENT";
 export type SpeedTestStatus = "RUNNING" | "COMPLETED" | "CANCELLED" | "FAILED";
 export type SabTestSize = "MB_100" | "GB_1" | "GB_10";
 /** `host` is where a run downloads from; null for a provider whose servers each carry their own. */
@@ -149,15 +196,17 @@ export type BandwidthProviderServer = { id: string; name: string; location: stri
 /**
  * A bandwidth run picks its own connections and ends itself once its rate holds steady.
  * A Usenet run takes exactly one NZB source: a SAB size, a URL, an uploaded file, or a
- * held run's uploaded file again.
+ * held run's uploaded file again. A torrent run pulls the test torrent for its duration
+ * and runs only on a torrent route.
  */
 export type SpeedTestInput = {
   kind: ConsumerKind; id: number; route?: ReturnType<typeof routeInput> | null; overrides?: PathOverride | null;
-  bandwidth?: { providerId?: string | null; server?: string | null; customUrl?: string | null } | null;
+  bandwidth?: { providerId?: string | null; server?: string | null; customUrl?: string | null; uploadMib?: number | null } | null;
   usenet?: {
     sabSize?: SabTestSize | null; nzbUrl?: string | null; nzbUpload?: File | null; nzbRunId?: number | null;
     connections?: number | null; maxDurationSeconds: number;
   } | null;
+  torrent?: { maxDurationSeconds?: number | null } | null;
 };
 export type TestedLeg = { position: number; egressId: number; weight: number; down: boolean; downReason: string | null; path: Leg["path"]; target: number };
 export type SpeedTestResult = {
@@ -167,19 +216,33 @@ export type SpeedTestResult = {
   usenet: { articlesRequested: number; delivered: number; missing: number; failed: number; declaredBytes: number; decodedBytes: number; pipelining: boolean; tls: boolean; tlsCipherSuite: string | null } | null;
   /** `connections` is how many the run had open when it ended. */
   bandwidth: { providerId: string | null; server: string | null; url: string; connections: number } | null;
+  /** A bandwidth or torrent run's upload, once it has sent. */
+  upload: SpeedTestUpload | null;
   /** One per leg each second; `decodedBytes` is 0 for a bandwidth run. */
   samples: { atMs: number; leg: number; bytes: number; decodedBytes: number }[];
 };
 /**
- * What a run was asked for, as the daemon kept it: exactly one of bandwidth and usenet.
+ * What a run was asked for, as the daemon kept it: exactly one of bandwidth, usenet and torrent.
  * An uploaded NZB is named by `nzbFilename`; `nzbRunId` is set when it came from an earlier run.
  */
 export type SpeedTestRequest = {
-  bandwidth: { providerId: string | null; server: string | null; customUrl: string | null } | null;
+  bandwidth: { providerId: string | null; server: string | null; customUrl: string | null; uploadMib: number | null } | null;
   usenet: {
     sabSize: SabTestSize | null; nzbUrl: string | null; nzbFilename: string | null; nzbRunId: number | null;
     connections: number | null; maxDurationSeconds: number;
   } | null;
+  torrent: { maxDurationSeconds: number } | null;
+};
+export type UploadOutcome = "UNAVAILABLE" | "MEASURED" | "FAILED" | "NO_DEMAND";
+/**
+ * What a run sent: a bandwidth run's post to its provider, and the test torrent's
+ * pieces to leechers while torrents are on. `peers` counts only what peers asked
+ * for, so its rate is a floor. A torrent run posts nothing, so `http` is null.
+ * `provider` names a provider that takes no upload.
+ */
+export type SpeedTestUpload = {
+  http: { outcome: UploadOutcome; provider: string | null; url: string | null; bytes: number | null; elapsedMs: number | null; bps: number | null; failure: SpeedTestFailure | null } | null;
+  peers: { outcome: UploadOutcome; bytes: number | null; elapsedMs: number | null; bps: number | null; error: string | null } | null;
 };
 /** Why a run failed: the web words each code; OTHER, or a code it does not know, shows `message`. */
 export type SpeedTestFailureCode =

@@ -102,7 +102,7 @@ test("R05 routes, pools and ladders survive a restart; a vanished egress is repo
     const doomed = await interfaceEgress(request, `r05-doomed-${Date.now()}`, "b");
     const profiles = [];
     for (const port of [8101, 8102, 8103]) {
-      profiles.push((await saveProxyProfile(request, { name: `r05-connect-${port}-${Date.now()}`, kind: "HTTP_CONNECT", enabled: true, host: PROXIED_HOST, port, username: "fixture", password: "fixture", dnsServers: [] })).id);
+      profiles.push((await saveProxyProfile(request, { name: `r05-connect-${port}-${Date.now()}`, kind: "HTTP_CONNECT", enabled: true, host: PROXIED_HOST, port, username: "fixture", password: "fixture" })).id);
     }
     const pool = (await createPool(request, { name: `r05-pool-${Date.now()}`, kind: "HTTP_CONNECT", memberIds: profiles.slice(0, 2) })).id;
     const server = (await graphql<{ addServer: { id: number } }>(request, "mutation($input: ServerInput!) { addServer(input: $input) { id } }", {

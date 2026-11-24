@@ -70,6 +70,15 @@ test("translations keep every placeholder and are never empty", () => {
   }
 });
 
+// The translator fills `{{name}}` only; `{name}` would show as typed.
+test("no text writes a placeholder in single braces", () => {
+  for (const [code, dictionary] of Object.entries({ en: nextEn, ...LOCALES })) {
+    for (const [key, text] of Object.entries(dictionary)) {
+      assert.doesNotMatch(text.replace(/\{\{\w+\}\}/g, ""), /\{\w+\}/, `${code} ${key}`);
+    }
+  }
+});
+
 test("every key the Next screens name exists", () => {
   const known = new Set([...Object.keys(nextEn), ...baseKeys()]);
   const missing: string[] = [];

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -416,16 +417,16 @@ func TestFullPhaseContextsIncludeContainerAndManagedRestarts(t *testing.T) {
 	want := []phaseKey{
 		{name: "Functional SQLite", command: "test-all", datastore: "sqlite"},
 		{name: "Functional Postgres", command: "test-all", datastore: "postgres"},
-		{name: "NNTP Chaos", command: "chaos-test", datastore: "sqlite"},
-		{name: "TCP Chaos", command: "tcp-chaos", datastore: "sqlite"},
-		{name: "TLS NNTP", command: "tls-test", datastore: "sqlite"},
-		{name: "Adaptive Dispatch", command: "adaptive-dispatch", datastore: "sqlite"},
-		{name: "Adversarial Archives", command: "adversarial", datastore: "sqlite"},
-		{name: "Container Restart", command: "container-restart", datastore: "sqlite", skipSeed: true},
-		{name: "Restart SQLite", command: "restart-all", datastore: "sqlite"},
 		{name: "Restart Postgres", command: "restart-all", datastore: "postgres"},
-		{name: "Product Behavior Gate", command: "release-gate", datastore: "sqlite", skipSeed: true},
+		{name: "Restart SQLite", command: "restart-all", datastore: "sqlite"},
 		{name: "Filesystem Gate", command: "filesystem", datastore: "sqlite", skipSeed: true},
+		{name: "TCP Chaos", command: "tcp-chaos", datastore: "sqlite"},
+		{name: "NNTP Chaos", command: "chaos-test", datastore: "sqlite"},
+		{name: "Adversarial Archives", command: "adversarial", datastore: "sqlite"},
+		{name: "Adaptive Dispatch", command: "adaptive-dispatch", datastore: "sqlite"},
+		{name: "TLS NNTP", command: "tls-test", datastore: "sqlite"},
+		{name: "Container Restart", command: "container-restart", datastore: "sqlite", skipSeed: true},
+		{name: "Product Behavior Gate", command: "release-gate", datastore: "sqlite", skipSeed: true},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("expected %d phases, got %d: %#v", len(want), len(got), got)
@@ -1074,6 +1075,64 @@ func TestFullPhaseSlotsRunTheGateBesideThreeSuites(t *testing.T) {
 	<-slots.slotFor(first)
 	if !tryTake(fourth) {
 		t.Fatal("the fourth suite did not start after a general slot came free")
+	}
+}
+
+func TestFullPhasesStartFunctionalFirstThenSlowestFirst(t *testing.T) {
+	want := []string{
+		"Functional SQLite",
+		"Functional Postgres",
+		"Restart Postgres",
+		"Restart SQLite",
+		"Filesystem Gate",
+		"TCP Chaos",
+		"NNTP Chaos",
+		"Adversarial Archives",
+		"Adaptive Dispatch",
+		"TLS NNTP",
+		"Container Restart",
+		"Product Behavior Gate",
+	}
+	got := make([]string, 0, len(fullPhaseDefinitions))
+	for _, def := range fullPhaseDefinitions {
+		got = append(got, def.name)
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("full phase order = %q, want %q", got, want)
+	}
+}
+
+func TestFullPhaseQueuesKeepTheListedOrderPerPool(t *testing.T) {
+	t.Setenv("E2E_FULL_PHASE_JOBS", "")
+	slots := newFullPhaseSlots(len(fullPhaseDefinitions))
+	phases := make([]*fullPhaseContext, 0, len(fullPhaseDefinitions))
+	for _, def := range fullPhaseDefinitions {
+		phases = append(phases, &fullPhaseContext{Name: def.name, Command: def.command})
+	}
+
+	queues := slots.queues(phases)
+	if len(queues) != 2 {
+		t.Fatalf("queues = %d pools, want the general pool and the gate's", len(queues))
+	}
+	names := func(queue []*fullPhaseContext) []string {
+		out := make([]string, 0, len(queue))
+		for _, phase := range queue {
+			out = append(out, phase.Name)
+		}
+		return out
+	}
+	if got := names(queues[slots.gate]); !slices.Equal(got, []string{"Product Behavior Gate"}) {
+		t.Fatalf("gate queue = %q, want only the Product Behavior Gate", got)
+	}
+	general := names(queues[slots.general])
+	var want []string
+	for _, phase := range phases {
+		if phase.Command != "release-gate" {
+			want = append(want, phase.Name)
+		}
+	}
+	if !slices.Equal(general, want) {
+		t.Fatalf("general queue = %q, want the listed order %q", general, want)
 	}
 }
 

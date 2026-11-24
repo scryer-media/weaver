@@ -27,7 +27,7 @@
       "oracle": "browser"
     },
     {
-      "path": "/tools/nzb-analyzer",
+      "path": "/tools/analyzer",
       "owner": "ui-runtime-observability",
       "oracle": "browser"
     },
@@ -74,6 +74,11 @@
     {
       "path": "/settings/networking/routes",
       "owner": "ui-runtime-observability",
+      "oracle": "browser"
+    },
+    {
+      "path": "/settings/networking/dns",
+      "owner": "advanced-networking-dns",
       "oracle": "browser"
     },
     {
@@ -125,11 +130,21 @@
       "path": "/settings/servers",
       "owner": "ui-settings-crud",
       "oracle": "browser"
+    },
+    {
+      "path": "/settings/torrents",
+      "owner": "ui-torrents",
+      "oracle": "browser"
     }
   ],
   "mutations": [
     {
       "name": "analyzeNzb",
+      "owner": "ui-runtime-observability",
+      "oracle": "browser"
+    },
+    {
+      "name": "analyzeTorrent",
       "owner": "ui-runtime-observability",
       "oracle": "browser"
     },
@@ -302,6 +317,36 @@
       "owner": "duplicate-and-queue-policy",
       "oracle": "unit-only",
       "rationale": "The release flow asserts individual queue controls; the server API tests cover this batch by ids and by selection, and no release spec calls it."
+    },
+    {
+      "name": "createTags",
+      "owner": "duplicate-and-queue-policy",
+      "oracle": "unit-only",
+      "rationale": "Tags are labels only; the server API tests cover this tag mutation on queued and history jobs, and no release spec calls it."
+    },
+    {
+      "name": "deleteTags",
+      "owner": "duplicate-and-queue-policy",
+      "oracle": "unit-only",
+      "rationale": "Tags are labels only; the server API tests cover this tag mutation on queued and history jobs, and no release spec calls it."
+    },
+    {
+      "name": "addJobTags",
+      "owner": "duplicate-and-queue-policy",
+      "oracle": "unit-only",
+      "rationale": "Tags are labels only; the server API tests cover this tag mutation on queued and history jobs, and no release spec calls it."
+    },
+    {
+      "name": "removeJobTags",
+      "owner": "duplicate-and-queue-policy",
+      "oracle": "unit-only",
+      "rationale": "Tags are labels only; the server API tests cover this tag mutation on queued and history jobs, and no release spec calls it."
+    },
+    {
+      "name": "setJobTags",
+      "owner": "duplicate-and-queue-policy",
+      "oracle": "unit-only",
+      "rationale": "Tags are labels only; the server API tests cover this tag mutation on queued and history jobs, and no release spec calls it."
     },
     {
       "name": "testConfiguredServerConnection",
@@ -751,6 +796,51 @@
       "name": "cancelSpeedTest",
       "owner": "speed-test",
       "oracle": "browser"
+    },
+    {
+      "name": "submitTorrent",
+      "owner": "ui-torrents",
+      "oracle": "browser"
+    },
+    {
+      "name": "removeTorrent",
+      "owner": "ui-torrents",
+      "oracle": "browser"
+    },
+    {
+      "name": "setTorrentForced",
+      "owner": "ui-torrents",
+      "oracle": "browser"
+    },
+    {
+      "name": "setTorrentSeeding",
+      "owner": "ui-torrents",
+      "oracle": "browser"
+    },
+    {
+      "name": "pauseTorrents",
+      "owner": "ui-torrents",
+      "oracle": "browser"
+    },
+    {
+      "name": "resumeTorrents",
+      "owner": "ui-torrents",
+      "oracle": "browser"
+    },
+    {
+      "name": "pauseTorrent",
+      "owner": "torrents",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "resumeTorrent",
+      "owner": "torrents",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "setTorrentCategory",
+      "owner": "torrents",
+      "oracle": "api-metrics"
     }
   ],
   "behaviors": [
@@ -937,6 +1027,86 @@
     {
       "name": "nzbget-facade-script-status",
       "owner": "post-processing-scripts",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "torrent-add-by-metainfo-and-magnet-to-verified-output",
+      "owner": "torrents",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "torrent-unpack-layout-store-and-compressed-rar-while-seeding",
+      "owner": "torrents",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "torrent-seed-to-ratio-goal-then-stopped-announce",
+      "owner": "torrents",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "torrent-pause-resume-forced",
+      "owner": "torrents",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "torrent-remove-keep-delete-and-private-unmet-goal",
+      "owner": "torrents",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "torrent-refusals-never-announce",
+      "owner": "torrents",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "torrent-duplicate-add",
+      "owner": "torrents",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "torrent-disabled-refusal",
+      "owner": "torrents",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "torrent-category-route-and-seeding-policy",
+      "owner": "torrents",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "torrent-restart-resumes-seeding",
+      "owner": "torrents",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "torrent-socks-egress-hides-weaver",
+      "owner": "torrents",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "torrent-global-download-cap-lower-bound",
+      "owner": "torrents",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "torrent-bandwidth-split-lower-bound",
+      "owner": "torrents",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "torrent-global-upload-cap-lower-bound",
+      "owner": "torrents",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "torrent-pause-all-hold-keeps-own-pause",
+      "owner": "torrents",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "torrent-client-compatibility-facade",
+      "owner": "torrents",
       "oracle": "api-metrics"
     }
   ]

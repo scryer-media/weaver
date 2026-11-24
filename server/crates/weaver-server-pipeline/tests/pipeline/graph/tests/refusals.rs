@@ -1,0 +1,783 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+// A member its object gave up becomes a leaf, or a volume of the engine bound
+// in the object's place, with every byte it already received; and a password
+// is offered one candidate at a time until one opens or none is left.
+
+mod fakes;
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+use bytes::Bytes;
+use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
+use weaver_graph::{MemberId, NodeId, VolumeIndex, Why};
+
+use self::fakes::{Fakes, Mode, OPENS};
+use crate::pipeline::graph::engine::echo::{HEADER, SIGNATURE};
+use crate::pipeline::graph::engine::{Heard, RunMail, Runs, Said};
+use crate::pipeline::graph::job::{GraphJob, RootFile};
+use crate::pipeline::graph::namespace::NamespaceWriter;
+use crate::pipeline::graph::root::intake::Decoded;
+use crate::pipeline::graph::root::phase::RootPhase;
+use crate::pipeline::graph::status::Delivery;
+use crate::pipeline::graph::status::RepairSlots;
+use crate::pipeline::graph::status::Unarrived;
+use weaver_server_disk::operations::disk::CapacityReader;
+
+const CANDIDATES: [&str; 4] = ["lantern-one", "lantern-two", OPENS, "lantern-four"];
+const WRONG: [&str; 4] = ["lantern-one", "lantern-two", "lantern-four", "lantern-five"];
+
+struct Refusing {
+    job: GraphJob,
+    mail: RunMail,
+    volumes: Vec<Vec<u8>>,
+    offers: Arc<Mutex<Vec<String>>>,
+    starts: Arc<AtomicUsize>,
+    dir: tempfile::TempDir,
+}
+
+// The body of volume `index`: bytes no format sniffs as its own.
+fn body(index: u32) -> Vec<u8> {
+    (0..40u8)
+        .map(|byte| byte.wrapping_mul(7).wrapping_add(index as u8) | 0x80)
+        .collect()
+}
+
+fn refusing(mode: Mode, count: u32, candidates: &[&str]) -> Refusing {
+    let volumes: Vec<Vec<u8>> = (0..count)
+        .map(|index| {
+            let mut volume = if index == 0 {
+                SIGNATURE.to_vec()
+            } else {
+                vec![0x80; HEADER]
+            };
+            volume.extend(body(index));
+            volume
+        })
+        .collect();
+    let files: Vec<RootFile> = volumes
+        .iter()
+        .enumerate()
+        .map(|(index, volume)| RootFile {
+            name: format!("lantern.part{}.rar", index + 1),
+            articles: vec![(0, volume.len() as u32)],
+        })
+        .collect();
+    let fakes = Fakes {
+        mode,
+        volumes: count,
+        offers: Arc::default(),
+        starts: Arc::default(),
+    };
+    let (offers, starts) = (Arc::clone(&fakes.offers), Arc::clone(&fakes.starts));
+    let dir = tempfile::tempdir().unwrap();
+    let accountant = Arc::new(HoldsAccountant::new(HoldBudgets {
+        resident_limit: u64::MAX,
+        scratch_total: u64::MAX,
+        scratch_ceiling: u64::MAX,
+        disk_reserve: 0,
+    }));
+    let writer = NamespaceWriter::new(
+        1,
+        dir.path().to_path_buf(),
+        accountant,
+        CapacityReader::unknown(),
+    );
+    let mail = RunMail::default();
+    let runs = Runs::new(
+        1,
+        1,
+        mail.sender(),
+        crate::pipeline::graph::engine::DecodePool::unbounded(),
+    );
+    let job = GraphJob::new(&files, Box::new(fakes), writer, runs, u32::MAX).offering(
+        candidates
+            .iter()
+            .map(|candidate| candidate.to_string())
+            .collect(),
+    );
+    Refusing {
+        job,
+        mail,
+        volumes,
+        offers,
+        starts,
+        dir,
+    }
+}
+
+impl Refusing {
+    // Volume `volume` arrives, and the job is given the turns the loop
+    // gives it until a give-up it started has read back every volume.
+    fn deliver(&mut self, volume: u32) {
+        self.deliver_only(volume);
+        while self.job.giving_up() {
+            self.give_up_turn();
+        }
+    }
+
+    // One turn of the loop for the job's give-up, as the wake it rings is
+    // heard.
+    fn give_up_turn(&mut self) {
+        self.job
+            .run_said(
+                Said {
+                    scope: 1,
+                    node: NodeId::ROOT,
+                    generation: 0,
+                    heard: Heard::GivingUp,
+                },
+                &mut RepairSlots::default(),
+                1,
+            )
+            .unwrap();
+    }
+
+    // The root members the job has given back so far.
+    fn refused_count(&self) -> usize {
+        (0..self.volumes.len() as u32)
+            .filter(|member| self.refused(*member).is_some())
+            .count()
+    }
+
+    // Volume `volume` arrives, and nothing more: a give-up it starts reads
+    // back its first volume on this turn and waits for the next.
+    fn deliver_only(&mut self, volume: u32) {
+        let bytes = &self.volumes[volume as usize];
+        self.job
+            .intake(
+                Decoded {
+                    volume: VolumeIndex(volume),
+                    ordinal: 0,
+                    offset: 0,
+                    bytes: Bytes::copy_from_slice(bytes),
+                    intact: true,
+                    positioned: true,
+                    length: Some(bytes.len() as u64),
+                    declared_end: None,
+                    segments: Vec::new(),
+                },
+                &mut RepairSlots::default(),
+                1,
+            )
+            .unwrap();
+    }
+
+    fn deliver_all(&mut self) {
+        for volume in 0..self.volumes.len() as u32 {
+            self.deliver(volume);
+        }
+    }
+
+    // Hear what the runs say until the current one returned.
+    async fn until_ended(&mut self) {
+        loop {
+            let said = self.mail.recv().await.unwrap();
+            let ended = matches!(said.heard, Heard::Ended)
+                && self.job.runs().current(said.node, said.generation);
+            self.job
+                .run_said(said, &mut RepairSlots::default(), 1)
+                .unwrap();
+            if ended {
+                return;
+            }
+        }
+    }
+
+    // Hear what the runs say until the root member is a refused leaf.
+    async fn until_refused(&mut self, member: u32) {
+        while self.refused(member).is_none() {
+            let said = self.mail.recv().await.unwrap();
+            self.job
+                .run_said(said, &mut RepairSlots::default(), 1)
+                .unwrap();
+        }
+    }
+
+    // The job is ready to deliver and the checkpoint `stamp`, taken of the
+    // job as it stands, has committed: a file waiting for it moves to its
+    // name.
+    fn checkpoint(&mut self, stamp: u64) {
+        self.job.deliver_names();
+        self.job.recorded(stamp);
+        self.job.committed(stamp).unwrap();
+    }
+
+    fn refused(&self, member: u32) -> Option<Why> {
+        self.job.writer().refused(NodeId::ROOT, MemberId(member))
+    }
+
+    fn file(&self, name: &str) -> Vec<u8> {
+        std::fs::read(self.dir.path().join(name)).unwrap()
+    }
+
+    fn exists(&self, name: &str) -> bool {
+        self.dir.path().join(name).exists()
+    }
+
+    // The files under the directory finalize never delivers.
+    fn internal(&self) -> Vec<String> {
+        let Ok(entries) =
+            std::fs::read_dir(self.dir.path().join(weaver_graph::names::INTERNAL_DIR))
+        else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    // A root member is a leaf: nothing is bound over it.
+    fn is_leaf(&self, member: u32) -> bool {
+        self.job
+            .tree()
+            .child_of(NodeId::ROOT, MemberId(member))
+            .is_none()
+    }
+
+    fn offers(&self) -> Vec<String> {
+        self.offers.lock().unwrap().clone()
+    }
+
+    // Everything status, health and completion read of the job, as text.
+    fn status(&self) -> String {
+        format!(
+            "{:?} {:?} {:?} {:?} {:?}",
+            self.job.phase(),
+            self.job.namespace(),
+            self.job.recovery_summary(),
+            self.job.member_files(),
+            (0..self.volumes.len() as u32)
+                .map(|member| self.refused(member))
+                .collect::<Vec<_>>(),
+        )
+    }
+}
+
+#[test]
+fn a_store_that_refuses_hands_back_its_volumes_as_leaves_with_their_bytes() {
+    let mut refusing = refusing(Mode::Refuse, 2, &[]);
+    refusing.deliver(0);
+    assert!(
+        refusing.exists("inner-0.bin"),
+        "the store streamed its member"
+    );
+    refusing.deliver(1);
+    for member in 0..2 {
+        assert!(refusing.is_leaf(member));
+        assert_eq!(refusing.refused(member), Some(Why::Unsupported));
+        assert_eq!(
+            refusing.file(&format!("lantern.part{}.rar", member + 1)),
+            refusing.volumes[member as usize]
+        );
+        // The store closed each member itself before it gave up, so it
+        // vouched for it: what an object closed whole stays delivered
+        // (the partial-extraction ruling of 2026-10-18).
+        assert_eq!(refusing.file(&format!("inner-{member}.bin")), body(member));
+    }
+    assert_eq!(refusing.job.phase(), RootPhase::Done);
+    assert!(refusing.status().contains("Unsupported"));
+}
+
+// The store closed each of its members whole before it gave up: buried, it
+// keeps them, and the delivery lists them whole. The volumes it handed back
+// are delivered as posted, never whole: the store refused them.
+#[test]
+fn what_a_refused_store_closed_whole_is_delivered_whole() {
+    let mut refusing = refusing(Mode::Refuse, 2, &[]);
+    refusing.deliver_all();
+    let delivery = Delivery::read(
+        refusing.job.tree(),
+        |_| true,
+        |_| false,
+        |_, _| crate::pipeline::graph::status::Described::Otherwise,
+        |_, _| None,
+        |_, _| false,
+        |_| Unarrived::Short,
+    );
+    assert_eq!(
+        delivery,
+        Delivery {
+            whole: vec!["inner-0.bin".to_string(), "inner-1.bin".to_string()],
+            damaged: vec![
+                "lantern.part1.rar".to_string(),
+                "lantern.part2.rar".to_string(),
+            ],
+            files: vec![
+                super::delivered("lantern.part1.rar", 0, false),
+                super::delivered("inner-0.bin", 1, true),
+                super::delivered("inner-1.bin", 1, true),
+                super::delivered("lantern.part2.rar", 0, false),
+            ],
+            ..Delivery::default()
+        }
+    );
+    for member in 0..2 {
+        assert!(refusing.is_leaf(member));
+        assert_eq!(refusing.file(&format!("inner-{member}.bin")), body(member));
+    }
+}
+
+// The store took the last bytes of each body and placed them in its member's
+// map, but never wrote them to the member, as a cipher keeps a block short of
+// its end. Refused, it gives them back itself: the volumes come back whole
+// and no byte of them is said to be damaged.
+#[test]
+fn a_refused_store_gives_back_bytes_it_took_and_never_placed() {
+    let mut refusing = refusing(Mode::Staging, 2, &[]);
+    refusing.deliver_all();
+    for member in 0..2 {
+        assert!(refusing.is_leaf(member));
+        assert_eq!(refusing.refused(member), Some(Why::Unsupported));
+        assert_eq!(
+            refusing.file(&format!("lantern.part{}.rar", member + 1)),
+            refusing.volumes[member as usize]
+        );
+    }
+    let damaged: Vec<_> = refusing
+        .job
+        .tree()
+        .namespace(NodeId::ROOT)
+        .unwrap()
+        .damaged_ranges()
+        .collect();
+    assert_eq!(damaged, Vec::new());
+    assert_eq!(refusing.job.phase(), RootPhase::Done);
+}
+
+#[tokio::test]
+async fn a_store_that_needs_an_engine_hands_its_volumes_to_one() {
+    let mut refusing = refusing(Mode::NeedsEngine, 2, &[]);
+    refusing.deliver_all();
+    // The store's files go once the checkpoint that says so commits.
+    for member in 0..2 {
+        assert_eq!(refusing.refused(member), Some(Why::Compressed));
+        assert!(refusing.exists(&format!("inner-{member}.bin")));
+    }
+    refusing.checkpoint(1);
+    for member in 0..2 {
+        assert!(!refusing.exists(&format!("inner-{member}.bin")));
+    }
+    assert_eq!(
+        refusing.job.tree().engines().len(),
+        1,
+        "one engine over both"
+    );
+    refusing.until_ended().await;
+    // Publication waits for the delivery and the checkpoints that record
+    // the final names.
+    refusing.job.deliver_names();
+    let mut stamp = 1;
+    while refusing.job.moves_waiting() {
+        refusing.job.recorded(stamp);
+        refusing.job.committed(stamp).unwrap();
+        stamp += 1;
+    }
+    // The engine read the volumes back from what the store had placed, its
+    // header envelopes and its members' files, and wrote what it found.
+    for member in 0..2 {
+        assert_eq!(refusing.file(&format!("echo-{member}.mkv")), body(member));
+    }
+    assert_eq!(refusing.job.phase(), RootPhase::Done);
+    // The engine extracted the archive, so it was never given up on.
+    let given = given_back(&mut refusing);
+    assert!(given.is_empty(), "{given:#?}");
+}
+
+#[test]
+fn a_store_that_refuses_before_placing_anything_gets_every_held_byte_back() {
+    let mut refusing = refusing(Mode::Hold, 2, &[]);
+    refusing.deliver(0);
+    assert!(
+        !refusing.exists("lantern.part1.rar"),
+        "the bytes were held, not written"
+    );
+    refusing.deliver(1);
+    for member in 0..2 {
+        assert!(refusing.is_leaf(member));
+        assert_eq!(refusing.refused(member), Some(Why::Unsupported));
+        assert_eq!(
+            refusing.file(&format!("lantern.part{}.rar", member + 1)),
+            refusing.volumes[member as usize]
+        );
+    }
+    assert_eq!(refusing.job.writer().held_bytes(NodeId::ROOT), 0);
+    assert_eq!(refusing.job.phase(), RootPhase::Done);
+}
+
+#[test]
+fn the_candidates_are_offered_in_order_until_one_opens() {
+    let mut refusing = refusing(Mode::Locked, 1, &CANDIDATES);
+    refusing.deliver(0);
+    assert_eq!(refusing.offers(), CANDIDATES[..3].to_vec());
+    assert_eq!(refusing.file("opened.bin"), body(0));
+    assert!(!refusing.is_leaf(0));
+    assert_eq!(refusing.refused(0), None);
+    assert_eq!(refusing.job.phase(), RootPhase::Done);
+}
+
+#[test]
+fn a_store_no_candidate_opens_refuses_after_the_last() {
+    let mut refusing = refusing(Mode::Locked, 1, &WRONG);
+    refusing.deliver(0);
+    assert_eq!(refusing.offers(), WRONG.to_vec());
+    assert!(refusing.is_leaf(0));
+    assert_eq!(refusing.refused(0), Some(Why::EncryptedHeader));
+    refusing.checkpoint(1);
+    assert_eq!(refusing.file("lantern.part1.rar"), refusing.volumes[0]);
+    assert_eq!(refusing.job.phase(), RootPhase::Done);
+}
+
+// A store that kept every byte as envelope and then refused gave them all
+// back to its leaf in the envelope's own file: the posted bytes are on disk
+// once, and the file moves to the leaf's name once the checkpoint that
+// records it as the leaf's has committed, leaving nothing behind.
+#[test]
+fn a_store_that_refuses_after_keeping_everything_as_envelope_leaves_none_behind() {
+    let mut refusing = refusing(Mode::Locked, 1, &WRONG);
+    refusing.deliver(0);
+    assert_eq!(refusing.refused(0), Some(Why::EncryptedHeader));
+    assert!(
+        !refusing.exists("lantern.part1.rar"),
+        "no checkpoint has recorded the leaf"
+    );
+    assert_eq!(
+        refusing.internal().len(),
+        1,
+        "one file holds the posted bytes"
+    );
+    assert!(refusing.job.moves_waiting());
+    refusing.checkpoint(1);
+    assert_eq!(refusing.file("lantern.part1.rar"), refusing.volumes[0]);
+    assert_eq!(refusing.internal(), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn an_engine_given_a_password_restarts_its_run_once() {
+    let mut refusing = refusing(Mode::LockedEngine, 1, &[OPENS, "lantern-four"]);
+    refusing.deliver(0);
+    refusing.until_ended().await;
+    assert_eq!(refusing.starts.load(Ordering::SeqCst), 2);
+    assert_eq!(refusing.offers(), vec![OPENS.to_string()]);
+    assert_eq!(refusing.file("unlocked.bin"), body(0));
+    assert_eq!(refusing.job.phase(), RootPhase::Done);
+}
+
+#[tokio::test]
+async fn an_engine_that_refuses_leaves_a_leaf_nothing_is_bound_over() {
+    let mut refusing = refusing(Mode::RefusingEngine, 1, &[]);
+    refusing.deliver(0);
+    refusing.until_refused(0).await;
+    assert_eq!(refusing.refused(0), Some(Why::Unsupported));
+    assert!(refusing.is_leaf(0));
+    assert!(refusing.job.tree().engines().is_empty());
+    refusing.checkpoint(1);
+    assert_eq!(refusing.file("lantern.part1.rar"), refusing.volumes[0]);
+    assert_eq!(refusing.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(refusing.job.phase(), RootPhase::Done);
+}
+
+#[test]
+fn no_candidate_reaches_a_log_or_the_status() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let _capture = tracing::subscriber::set_default(Captured(Arc::clone(&events)));
+    let mut opened = refusing(Mode::Locked, 1, &CANDIDATES);
+    opened.deliver(0);
+    let mut exhausted = refusing(Mode::Locked, 1, &WRONG);
+    exhausted.deliver(0);
+    tracing::info!(status = %opened.status(), "opened");
+    let snapshots = [opened.status(), exhausted.status()];
+    let events = events.lock().unwrap();
+    assert!(!events.is_empty(), "the capture hears events");
+    for candidate in CANDIDATES.iter().chain(&WRONG) {
+        for text in events.iter().chain(&snapshots) {
+            assert!(!text.contains(candidate), "{candidate} in {text}");
+        }
+    }
+}
+
+// Every event's message and fields, as one line each, at every level.
+struct Captured(Arc<Mutex<Vec<String>>>);
+
+impl tracing::Subscriber for Captured {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Fields(String);
+        impl tracing::field::Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write;
+                let _ = write!(self.0, " {field}={value:?}");
+            }
+        }
+        let mut fields = Fields(String::new());
+        event.record(&mut fields);
+        self.0.lock().unwrap().push(fields.0);
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+// One archive given up on is one demotion. The
+// job's event history should say so once, not once per volume; and an
+// archive handed to an engine that then reads it was not given up on.
+fn given_back(refusing: &mut Refusing) -> Vec<String> {
+    refusing
+        .job
+        .take_notes()
+        .into_iter()
+        .filter_map(|note| match note {
+            crate::pipeline::graph::job::Note::GivenBack(given) => Some(format!("{given:?}")),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_refused_five_volume_store_is_one_demotion_event() {
+    let mut refusing = refusing(Mode::Refuse, 5, &[]);
+    refusing.deliver_all();
+    let given = given_back(&mut refusing);
+    assert_eq!(given.len(), 1, "{given:#?}");
+}
+
+#[tokio::test]
+async fn a_store_handed_to_an_engine_is_not_given_up() {
+    let mut refusing = refusing(Mode::NeedsEngine, 2, &[]);
+    refusing.deliver_all();
+    let given = given_back(&mut refusing);
+    assert!(given.is_empty(), "{given:#?}");
+}
+
+// An archive handed to an engine whose run then gives it up, for the same
+// reason the store handed it over, was given up: one event.
+#[tokio::test]
+async fn an_engine_that_gives_up_a_handed_over_archive_is_one_event() {
+    let mut refusing = refusing(Mode::HandoffRefused, 3, &[]);
+    refusing.deliver_all();
+    assert!(
+        given_back(&mut refusing).is_empty(),
+        "the handoff itself is no event"
+    );
+    // The hand-off already holds the reason, so wait for the engine that
+    // took the archive to give it back and leave.
+    assert_eq!(refusing.job.tree().engines().len(), 1);
+    while !refusing.job.tree().engines().is_empty() {
+        let said = refusing.mail.recv().await.unwrap();
+        refusing
+            .job
+            .run_said(said, &mut RepairSlots::default(), 1)
+            .unwrap();
+    }
+    assert_eq!(refusing.refused(0), Some(Why::Unsupported));
+    let given = given_back(&mut refusing);
+    assert_eq!(given.len(), 1, "{given:#?}");
+}
+
+// One event per archive across the other ways a
+// multi-volume store gives its volumes back.
+#[test]
+fn each_refusing_store_shape_is_one_event() {
+    for mode in [Mode::Refuse, Mode::Hold, Mode::Staging] {
+        let mut refusing = refusing(mode, 4, &[]);
+        refusing.deliver_all();
+        let given = given_back(&mut refusing);
+        assert_eq!(given.len(), 1, "{mode:?}: {given:#?}");
+    }
+}
+
+#[test]
+fn a_locked_store_no_candidate_opens_is_one_event() {
+    let mut refusing = refusing(Mode::Locked, 3, &WRONG);
+    refusing.deliver_all();
+    let given = given_back(&mut refusing);
+    assert_eq!(given.len(), 1, "{given:#?}");
+}
+
+#[tokio::test]
+async fn a_refusing_engine_over_three_volumes_is_one_event() {
+    let mut refusing = refusing(Mode::RefusingEngine, 3, &[]);
+    refusing.deliver_all();
+    refusing.until_refused(0).await;
+    let given = given_back(&mut refusing);
+    assert_eq!(given.len(), 1, "{given:#?}");
+}
+
+// A locked store of `count` volumes no candidate opens, every volume
+// arrived: the job went quiet and gave the store up.
+fn given_up(count: u32, one_turn: bool) -> Refusing {
+    let mut refusing = refusing(Mode::Locked, count, &WRONG);
+    if one_turn {
+        refusing.job.give_up_in_one_turn();
+    }
+    for volume in 0..count {
+        refusing.deliver_only(volume);
+    }
+    refusing
+}
+
+// What the job's status and events say, with its directory left out, and
+// the write stamps too: they are drawn from one sequence every namespace in
+// the process shares, so two rigs never draw the same ones.
+fn said(refusing: &mut Refusing) -> (String, String) {
+    // Paths are spelled plain and in their debug form, which doubles each
+    // Windows separator.
+    let dir = refusing.dir.path().display().to_string();
+    let quoted = format!("{:?}", refusing.dir.path());
+    let debug_dir = quoted.trim_matches('"').to_string();
+    let unpath = |text: String| text.replace(&debug_dir, "<dir>").replace(&dir, "<dir>");
+    let notes = format!("{:?}", refusing.job.take_notes());
+    let status = unpath(refusing.status());
+    let mut parts = status.split("stamp: ");
+    let mut unstamped = parts.next().unwrap_or_default().to_string();
+    for part in parts {
+        unstamped.push_str("stamp: _");
+        unstamped.push_str(part.trim_start_matches(|c: char| c.is_ascii_digit()));
+    }
+    (unstamped, unpath(notes))
+}
+
+// A store given up as the job goes quiet reads back one volume a turn, so
+// the loop turns between them; what it ends with is what the one-turn give-up
+// ends with, byte for byte and event for event.
+#[test]
+fn a_store_given_up_at_quiet_reads_back_one_volume_a_turn() {
+    let mut turns = given_up(3, false);
+    let mut whole = given_up(3, true);
+    assert!(!whole.job.giving_up());
+    assert_eq!(whole.refused_count(), 3);
+
+    assert!(turns.job.giving_up());
+    assert!(turns.job.working(), "the checkpoint is owed while it waits");
+    assert_eq!(turns.refused_count(), 1, "one volume on the quiet's turn");
+    turns.give_up_turn();
+    assert!(turns.job.giving_up());
+    assert_eq!(turns.refused_count(), 2, "one volume on the next turn");
+    turns.give_up_turn();
+    assert!(!turns.job.giving_up());
+    assert!(!turns.job.working());
+    assert_eq!(turns.refused_count(), 3);
+    // A wake heard after the give-up ended does nothing.
+    let before = said(&mut turns);
+    turns.give_up_turn();
+    let after = said(&mut turns);
+    assert_eq!(after.0, before.0);
+    assert_eq!(after.1, "[]");
+
+    let mut turns = given_up(3, false);
+    while turns.job.giving_up() {
+        turns.give_up_turn();
+    }
+    assert_eq!(said(&mut turns), said(&mut whole));
+    assert_eq!(turns.internal(), whole.internal());
+    turns.checkpoint(1);
+    whole.checkpoint(1);
+    for volume in 0..3 {
+        let name = format!("lantern.part{}.rar", volume + 1);
+        assert_eq!(turns.file(&name), whole.file(&name));
+        assert_eq!(turns.file(&name), turns.volumes[volume]);
+    }
+    assert_eq!(turns.internal(), whole.internal());
+    assert_eq!(said(&mut turns), said(&mut whole));
+    assert_eq!(turns.job.phase(), RootPhase::Done);
+}
+
+// A cancel posted after the first volume is read back is applied before the
+// second is copied: the give-up is dropped, and a later wake copies nothing.
+#[test]
+fn a_cancel_between_volumes_of_a_give_up_drops_the_rest() {
+    let mut refusing = given_up(3, false);
+    assert_eq!(refusing.refused_count(), 1);
+    refusing.job.request_stop();
+    assert!(!refusing.job.giving_up());
+    assert!(!refusing.job.work_pending());
+    let internal = refusing.internal();
+    refusing.give_up_turn();
+    assert_eq!(refusing.refused_count(), 1, "nothing more is copied");
+    assert_eq!(refusing.internal(), internal);
+}
+
+// A job failed between volumes of a give-up, its graph kept unstopped, ends
+// the give-up as a cancel does: nothing holds the loop for it, and a wake
+// already rung copies nothing.
+#[test]
+fn a_failure_between_volumes_of_a_give_up_ends_it() {
+    let mut refusing = given_up(3, false);
+    assert_eq!(refusing.refused_count(), 1);
+    assert!(refusing.job.held_by_work(), "the give-up holds the loop");
+    refusing.job.end_give_up();
+    assert!(!refusing.job.giving_up());
+    assert!(!refusing.job.held_by_work());
+    assert!(!refusing.job.ring_give_up(), "nothing is left to wake");
+    let internal = refusing.internal();
+    refusing.give_up_turn();
+    assert_eq!(refusing.refused_count(), 1, "nothing more is copied");
+    assert_eq!(refusing.internal(), internal);
+}
+
+// A give-up does not go on over a release that stands: its turns take no
+// step and it is not rung, and mail under another number changes nothing.
+// Once the release's mail is heard the give-up is rung again and goes on,
+// and it ends with the same statuses, events and files as the give-up no
+// release stood in front of.
+#[test]
+fn a_give_up_behind_a_standing_release_ends_as_with_room() {
+    use weaver_server_disk::operations::disk::writer::Credit;
+    let paid = |refusing: &mut Refusing, generation: u64| {
+        refusing
+            .job
+            .run_said(
+                Said {
+                    scope: 1,
+                    node: NodeId::ROOT,
+                    generation,
+                    heard: Heard::ReleasePaid(Box::new(Credit::none())),
+                },
+                &mut RepairSlots::default(),
+                1,
+            )
+            .unwrap();
+    };
+    let mut whole = given_up(3, true);
+    let mut stood = given_up(3, false);
+    assert_eq!(stood.refused_count(), 1, "one volume on the quiet's turn");
+    let serial = stood.job.stand_release();
+    assert!(
+        !stood.job.ring_give_up(),
+        "not rung while the release stands"
+    );
+    stood.give_up_turn();
+    stood.give_up_turn();
+    assert!(stood.job.giving_up());
+    assert_eq!(stood.refused_count(), 1, "no step over the release");
+    paid(&mut stood, serial + 1);
+    assert!(!stood.job.ring_give_up(), "other mail does not ring it");
+    stood.give_up_turn();
+    assert_eq!(stood.refused_count(), 1, "still no step");
+    paid(&mut stood, serial);
+    assert!(stood.job.ring_give_up(), "the paid release rings it again");
+    while stood.job.giving_up() {
+        stood.give_up_turn();
+    }
+    assert_eq!(stood.refused_count(), 3);
+    assert_eq!(said(&mut stood), said(&mut whole));
+    assert_eq!(stood.internal(), whole.internal());
+    stood.checkpoint(1);
+    whole.checkpoint(1);
+    for volume in 0..3 {
+        let name = format!("lantern.part{}.rar", volume + 1);
+        assert_eq!(stood.file(&name), whole.file(&name));
+    }
+    assert_eq!(said(&mut stood), said(&mut whole));
+    assert_eq!(stood.job.phase(), RootPhase::Done);
+}

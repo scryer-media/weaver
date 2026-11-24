@@ -17,7 +17,7 @@ use std::time::Instant;
 use weaver_server_api::{
     QueueItemState, QueueStateFacts, queue_item_from_job, queue_item_state,
     queue_item_state_for_download_accounting,
-    queue_item_state_from_job_info_for_download_accounting, queue_table_item_from_job,
+    queue_item_state_from_job_info_for_download_accounting,
 };
 use weaver_server_core::operations::metrics::PipelineMetrics;
 use weaver_server_core::{
@@ -55,6 +55,7 @@ fn job(id: u64) -> JobInfo {
     };
     JobInfo {
         job_id: JobId(id),
+        protocol: Default::default(),
         job_hash: None,
         name: format!("Silver.Horizon.S05E{id:05}.1080p.BluRay.DD5.1.x264-WVR"),
         error: None,
@@ -95,6 +96,8 @@ fn job(id: u64) -> JobInfo {
             ("nzbget.dupe_key".to_string(), format!("tvdb-{id}")),
         ],
         output_dir: Some(format!("/data/complete/tv/Silver.Horizon.S05E{id:05}")),
+        disk_need_bytes: None,
+        disk_free_bytes: None,
         created_at_epoch_ms: 1_900_000_000_000.0,
         server_attribution: Vec::new(),
     }
@@ -184,7 +187,7 @@ fn main() {
                     .collect::<Vec<_>>()
             });
             for job in &jobs {
-                let item = queue_table_item_from_job(job);
+                let item = queue_item_from_job(job);
                 serde_json::to_writer(&mut buf, &serde_json::to_value(&item).unwrap()).unwrap();
                 buf.push(b',');
             }
@@ -219,7 +222,7 @@ fn main() {
         finished
             .iter()
             .chain(history.iter())
-            .map(queue_table_item_from_job)
+            .map(queue_item_from_job)
             .filter(|item| terminal(item.state))
             .count()
     });

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use crate::history::delete_queue::HistoryDeleteQueueQueries;
 use std::collections::HashSet;
 use std::fs;
 use std::io;
@@ -9,10 +10,10 @@ use std::time::{Duration, SystemTime};
 
 use crate::Database;
 use crate::SchedulerHandle;
-use crate::persistence::maintenance::DbMaintenanceOptions;
 use crate::persistence::sql_runtime::SqlEngine;
 use crate::runtime::StartupDiskGate;
 use crate::settings::SharedConfig;
+use weaver_server_db::persistence::maintenance::DbMaintenanceOptions;
 
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const STALE_STAGING_TTL: Duration = Duration::from_secs(24 * 60 * 60);

@@ -4,6 +4,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
+use weaver_server_core::history::delete_queue::HistoryDeleteQueueQueries;
+use weaver_server_core::operations::async_ops::OperationsAsyncOpsQueries;
 
 use async_graphql::Result;
 use tokio::sync::Notify;
@@ -435,10 +437,16 @@ fn map_insert_error(error: HistoryDeleteOperationInsertError) -> async_graphql::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use weaver_server_core::history::delete_queue::HistoryDeleteQueueQueries;
+    use weaver_server_core::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
+    use weaver_server_core::history::queries::HistoryQueries;
+    use weaver_server_core::operations::async_ops::OperationsAsyncOpsQueries;
+    use weaver_server_core::settings::service::SettingsServiceQueries;
     use weaver_server_core::{JobHistoryRow, JobId};
 
     fn history(job_id: u64) -> JobHistoryRow {
         JobHistoryRow {
+            protocol: weaver_server_core::Protocol::Nzb,
             job_id,
             job_hash: None,
             name: format!("job-{job_id}"),

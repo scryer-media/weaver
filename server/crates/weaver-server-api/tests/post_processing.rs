@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use weaver_server_core::auth::repository::AuthRepositoryQueries;
+use weaver_server_core::jobs::queries::JobsQueries;
+use weaver_server_core::post_processing::output::PostProcessingOutputQueries;
+use weaver_server_core::post_processing::secrets::PostProcessingSecretsQueries;
+use weaver_server_core::post_processing::settings::PostProcessingSettingsQueries;
 mod common;
 
 use common::{TestHarness, assert_has_errors, assert_no_errors, response_data};
@@ -135,6 +140,60 @@ async fn the_extension_list_saves_on_its_own_and_leaves_the_script_settings_alon
         response_data(&response)["postProcessingSettings"]["unacceptableExtensions"],
         json!(["exe", "iso"])
     );
+}
+
+#[tokio::test]
+async fn the_unwanted_extension_action_round_trips_and_is_kept_by_the_other_saves() {
+    let harness = TestHarness::new().await;
+    let read = "{ postProcessingSettings { unwantedExtensionAction } }";
+    let action = |response: &async_graphql::Response| {
+        response_data(response)["postProcessingSettings"]["unwantedExtensionAction"].clone()
+    };
+
+    // Never stored: delete only the unwanted files.
+    let response = harness.execute(read).await;
+    assert_no_errors(&response);
+    assert_eq!(action(&response), json!("DELETE_FILES"));
+
+    let denied = harness
+        .execute_as(
+            "mutation { setUnwantedExtensionAction(action: FAIL_JOB) }",
+            CallerScope::Read,
+        )
+        .await;
+    assert_has_errors(&denied);
+    assert_eq!(action(&harness.execute(read).await), json!("DELETE_FILES"));
+
+    let response = harness
+        .execute("mutation { setUnwantedExtensionAction(action: FAIL_JOB) }")
+        .await;
+    assert_no_errors(&response);
+    assert_eq!(
+        response_data(&response)["setUnwantedExtensionAction"],
+        json!("FAIL_JOB")
+    );
+    assert_eq!(action(&harness.execute(read).await), json!("FAIL_JOB"));
+
+    // Saving the script settings or the list leaves the action as it is.
+    assert_no_errors(
+        &harness
+            .execute(
+                "mutation { setPostProcessingSettings(input: { executionEnabled: false, concurrency: 3, terminationGraceSeconds: 20 }) { unwantedExtensionAction } }",
+            )
+            .await,
+    );
+    assert_no_errors(
+        &harness
+            .execute(r#"mutation { setUnacceptableExtensions(extensions: ["iso"]) }"#)
+            .await,
+    );
+    assert_eq!(action(&harness.execute(read).await), json!("FAIL_JOB"));
+
+    let response = harness
+        .execute("mutation { setUnwantedExtensionAction(action: DELETE_FILES) }")
+        .await;
+    assert_no_errors(&response);
+    assert_eq!(action(&harness.execute(read).await), json!("DELETE_FILES"));
 }
 
 #[tokio::test]

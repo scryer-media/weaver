@@ -143,7 +143,7 @@ impl Zip {
                 self.check_walk(&centrals, start, out);
             }
             false => {
-                self.basis = basis.collect();
+                self.basis.replace(basis);
                 self.build(&centrals, start, out);
             }
         }
@@ -329,21 +329,33 @@ impl Zip {
 
     // Each entry's local header, once it is in whole: it must say what the
     // directory says, and a stored entry's says where its data starts.
+    // Only an entry with a byte of its header's fixed part in hand is looked
+    // at: one with none reads nothing and waits, as it did when every
+    // waiting entry was looked at in turn.
     pub(super) fn read_locals(&mut self, out: &mut Vec<Emit>) {
-        let Some(map) = &self.map else {
+        let Some(map) = &mut self.map else {
             return;
         };
-        let waiting: Vec<usize> = map
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| entry.expected.is_some())
-            .map(|(index, _)| index)
-            .collect();
-        for index in waiting {
-            let Some(map) = &self.map else {
+        map.file_waiting();
+        #[cfg(test)]
+        super::looked::locals(
+            0,
+            map.entries
+                .iter()
+                .filter(|entry| entry.expected.is_some())
+                .count(),
+        );
+        let mut from = 0;
+        loop {
+            let Some(map) = &mut self.map else {
                 return;
             };
+            let Some(index) = waiting_in_hand(map, &self.kept, from) else {
+                break;
+            };
+            #[cfg(test)]
+            super::looked::locals(1, 0);
+            from = index + 1;
             let (range, crc, data) = match local(&mut self.kept, map, index) {
                 Local::Waiting => continue,
                 Local::Damaged(range) => {
@@ -360,6 +372,7 @@ impl Zip {
                 return;
             };
             let stretch_end = map.stretch_end(index);
+            map.waiting.remove(&index);
             let entry = &mut map.entries[index];
             entry.expected = None;
             let Some(data) = data else {
@@ -540,6 +553,55 @@ enum Local {
     },
 }
 
+// The fixed part of an entry's local header, cut at its stretch's end.
+// Entries are in header order, and each stretch ends at the next header,
+// so these ends never fall from one entry to the next.
+fn fixed(map: &Map, index: usize) -> ByteRange {
+    let header = map.entries[index].header;
+    ByteRange::new(header, (header + LOCAL_LEN).min(map.stretch_end(index)))
+}
+
+// The first entry at or after position `from` still waiting for its local
+// header with a byte of its fixed part in hand. An entry with none of it
+// in hand cannot read it, so it waits; past an entry whose fixed part has
+// no byte in hand, the next byte in hand is found once and every entry
+// whose fixed part ends at or before it is passed over by a binary search
+// on those ends.
+fn waiting_in_hand(map: &mut Map, kept: &Kept, from: usize) -> Option<usize> {
+    let mut from = from;
+    loop {
+        let index = *map.waiting.range(from..).next()?;
+        if map.entries[index].expected.is_none() {
+            map.waiting.remove(&index);
+            continue;
+        }
+        let at = fixed(map, index);
+        let next = kept.next_in_hand(at.start)?;
+        if next < at.end {
+            return Some(index);
+        }
+        let (mut low, mut high) = (index + 1, map.entries.len());
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if fixed(map, middle).end <= next {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        // Each entry passed over reads nothing, as the look at every
+        // waiting entry found.
+        #[cfg(test)]
+        for (passed, entry) in map.entries.iter().enumerate().take(low).skip(index) {
+            assert!(
+                entry.expected.is_none() || kept.read(fixed(map, passed)).is_none(),
+                "an entry passed over could read its local header"
+            );
+        }
+        from = low;
+    }
+}
+
 fn local(kept: &mut Kept, map: &Map, index: usize) -> Local {
     let entry = &map.entries[index];
     let Some(expected) = &entry.expected else {
@@ -552,7 +614,7 @@ fn local(kept: &mut Kept, map: &Map, index: usize) -> Local {
     };
     let streams = entry.streams.then_some(entry.length + prefix);
     let (header, stretch_end) = (entry.header, map.stretch_end(index));
-    let fixed = ByteRange::new(header, (header + LOCAL_LEN).min(stretch_end));
+    let fixed = fixed(map, index);
     let Some(bytes) = kept.read(fixed) else {
         return Local::Waiting;
     };

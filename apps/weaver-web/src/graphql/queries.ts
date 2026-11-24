@@ -7,6 +7,7 @@ const FACADE_QUEUE_ITEM_FIELDS = `
   fragment FacadeQueueItemFields on QueueItem {
     id
     name
+    protocol
     displayTitle
     originalTitle
     status: state
@@ -33,6 +34,7 @@ const FACADE_QUEUE_ITEM_FIELDS = `
     health
     hasPassword
     category
+    tags
     metadata: attributes {
       key
       value
@@ -44,11 +46,19 @@ const QUEUE_TABLE_ITEM_FIELDS = `
   fragment QueueTableItemFields on QueueItem {
     id
     name
+    protocol
     displayTitle
     originalTitle
     status: state
     downloadWaitReason
     downloadRetryAtEpochMs
+    diskNeedBytes
+    diskFreeBytes
+    diskWrite {
+      volume
+      slow
+      draining
+    }
     progressPercent
     totalBytes
     downloadedBytes
@@ -70,6 +80,7 @@ const QUEUE_TABLE_ITEM_FIELDS = `
     health
     hasPassword
     category
+    tags
     metadata: attributes {
       key
       value
@@ -81,6 +92,7 @@ export const FACADE_HISTORY_ITEM_FIELDS = `
   fragment FacadeHistoryItemFields on HistoryItem {
     id
     name
+    protocol
     displayTitle
     originalTitle
     status: state
@@ -93,6 +105,7 @@ export const FACADE_HISTORY_ITEM_FIELDS = `
     health
     hasPassword
     category
+    tags
     outputDir
     createdAt
     completedAt
@@ -114,6 +127,7 @@ export const HISTORY_TABLE_ITEM_FIELDS = `
   fragment HistoryTableItemFields on HistoryItem {
     id
     name
+    protocol
     displayTitle
     originalTitle
     status: state
@@ -248,13 +262,52 @@ const SERVER_DETAILS_FIELDS = `
   }
 `;
 
+export const SEEDING_POLICY_FIELDS = `
+  fragment SeedingPolicyFields on SeedingPolicySettings {
+    ratioGoal {
+      state
+      value
+    }
+    seedTimeGoalMinutes {
+      state
+      value
+    }
+    inactiveGoalMinutes {
+      state
+      value
+    }
+    mode {
+      state
+      value
+    }
+    action {
+      state
+      value
+    }
+    seedTimeCounting {
+      state
+      value
+    }
+  }
+`;
+
 const CATEGORY_FIELDS = `
   fragment CategoryFields on Category {
     id
     name
     destDir
     aliases
+    seeding {
+      ...SeedingPolicyFields
+    }
+    torrentRoute
+    unpack
+    uploadCap {
+      state
+      value
+    }
   }
+  ${SEEDING_POLICY_FIELDS}
 `;
 
 export const VERSION_QUERY = gql`
@@ -494,7 +547,6 @@ const GENERAL_SETTINGS_FIELDS = `
     cleanupAfterExtract
     deleteFailedJobFiles
     historyRetentionDays
-    maxDownloadSpeed
     maxRetries
     propagationDelaySecs
     maxConcurrentNzbs
@@ -533,6 +585,7 @@ const DOWNLOAD_BLOCK_FIELDS = `
     speedLimitInForce
     speedLimitBySchedule
     scheduleHoldReason
+    resumeAtEpochMs
   }
 `;
 
@@ -698,6 +751,10 @@ const QUEUE_PAGE_FIELDS = `
       category
       count
     }
+    protocolCounts {
+      protocol
+      count
+    }
     stateCounts {
       state
       count
@@ -815,12 +872,14 @@ export const JOB_QUERY = gql`
     jobDetailSnapshot(jobId: $id) {
       queueItem {
         ...FacadeQueueItemFields
+        outcome
         error
         outputDir
         createdAt
       }
       historyItem {
         ...FacadeHistoryItemFields
+        outcome
         error
         failedForMemory
         archivedAt
@@ -913,12 +972,14 @@ export const JOB_DETAIL_UPDATES_SUBSCRIPTION = gql`
     jobDetailUpdates(jobId: $id) {
       queueItem {
         ...FacadeQueueItemFields
+        outcome
         error
         outputDir
         createdAt
       }
       historyItem {
         ...FacadeHistoryItemFields
+        outcome
         error
         failedForMemory
         archivedAt
@@ -981,6 +1042,18 @@ export const METRICS_PAGE_QUERY = gql`
   ${DOWNLOAD_BLOCK_FIELDS}
 `;
 
+/** Whether torrents are on and whether there are torrents: what torrent things show by. */
+const TORRENT_PRESENCE_FIELDS = `
+  fragment TorrentPresenceFields on TorrentPresence {
+    available
+    enabled
+    jobs
+    running
+    windingDown
+    windDown
+  }
+`;
+
 export const LIVE_METRICS_QUERY = gql`
   query LiveMetrics {
     metrics: systemMetrics {
@@ -988,14 +1061,29 @@ export const LIVE_METRICS_QUERY = gql`
     }
     globalState: globalQueueState {
       isPaused
+      pausedClasses
       speedLimitBytesPerSec
       resumeAtEpochMs
       downloadBlock {
         ...DownloadBlockFields
+        diskVolumes {
+          label
+          slow
+          writeRateBytesPerSec
+          waitingBytes
+        }
       }
+    }
+    torrents: torrentPresence {
+      ...TorrentPresenceFields
+    }
+    torrentRates {
+      downloadBps
+      uploadBps
     }
   }
   ${DOWNLOAD_BLOCK_FIELDS}
+  ${TORRENT_PRESENCE_FIELDS}
 `;
 
 export const SYSTEM_INFO_QUERY = gql`
@@ -1044,11 +1132,43 @@ export const SYSTEM_INFO_QUERY = gql`
         labels
         path
         error
+        drive
         capacity {
           totalBytes
           usedBytes
           freeBytes
         }
+      }
+    }
+  }
+`;
+
+/** The volumes Weaver writes to and how full each is, and nothing else of the system. */
+export const STORAGE_VOLUMES_QUERY = gql`
+  query StorageVolumes {
+    systemInfo {
+      configuredStorage {
+        labels
+        path
+        error
+        drive
+        capacity {
+          totalBytes
+          usedBytes
+          freeBytes
+        }
+      }
+    }
+  }
+`;
+
+/** The decoder tier and worker count Monitoring's engine strip shows. */
+export const MONITORING_COMPUTE_QUERY = gql`
+  query MonitoringCompute {
+    systemInfo {
+      compute {
+        logicalCores
+        decoderTier
       }
     }
   }
@@ -1060,6 +1180,7 @@ export const PATH_STORAGE_QUERY = gql`
       labels
       path
       error
+      drive
       capacity {
         totalBytes
         usedBytes
@@ -1097,6 +1218,98 @@ export const SERVER_HEALTH_QUERY = gql`
       consecutiveFailures
       prematureDeaths
       pinnedAddress
+      down
+      serverId
+      stateSinceEpochMs
+    }
+  }
+`;
+
+const USAGE_TOTALS_FIELDS = `
+  bytes
+  articlesTried
+  articlesSucceeded
+  downSeconds
+  bytesUploaded
+  events
+  durationMs
+`;
+
+// Each dashboard selects the periods it draws, and of each day the figures
+// its chart plots; the ledger answers every one.
+
+/** Overview: the servers' total today, this week, month and ever, and by day. */
+export const OVERVIEW_USAGE_QUERY = gql`
+  query OverviewUsage($range: UsageRange!, $kind: UsageConsumerKind) {
+    usageHistory(range: $range, kind: $kind) {
+      today
+      todayStartEpochSec
+      total {
+        kind
+        id
+        today { ${USAGE_TOTALS_FIELDS} }
+        week { ${USAGE_TOTALS_FIELDS} }
+        month { ${USAGE_TOTALS_FIELDS} }
+        allTime { ${USAGE_TOTALS_FIELDS} }
+        days { day ${USAGE_TOTALS_FIELDS} }
+      }
+      finishedToday { complete partial failed }
+    }
+  }
+`;
+
+/** Providers: each server's periods, the range, and its days. */
+export const PROVIDERS_USAGE_QUERY = gql`
+  query ProvidersUsage($range: UsageRange!, $kind: UsageConsumerKind) {
+    usageHistory(range: $range, kind: $kind) {
+      today
+      rangeStart
+      rangeEnd
+      consumers {
+        kind
+        id
+        today { ${USAGE_TOTALS_FIELDS} }
+        week { ${USAGE_TOTALS_FIELDS} }
+        month { ${USAGE_TOTALS_FIELDS} }
+        allTime { ${USAGE_TOTALS_FIELDS} }
+        range { ${USAGE_TOTALS_FIELDS} }
+        days { day bytes }
+        removedHost
+      }
+    }
+  }
+`;
+
+export const INTEGRITY_HISTORY_QUERY = gql`
+  query IntegrityHistory($range: UsageRange!) {
+    integrityHistory(range: $range) {
+      today
+      rangeStart
+      rangeEnd
+      finished { kind id range { ${USAGE_TOTALS_FIELDS} } days { day events } }
+      repaired { kind id range { ${USAGE_TOTALS_FIELDS} } days { day events } }
+      stages { kind id range { ${USAGE_TOTALS_FIELDS} } }
+      recovery { availableBytes fetchedBytes }
+      failures { cause count }
+    }
+  }
+`;
+
+export const TORRENT_HISTORY_QUERY = gql`
+  query TorrentHistory($range: UsageRange!) {
+    torrentHistory(range: $range) {
+      today
+      rangeStart
+      rangeEnd
+      total {
+        kind
+        id
+        allTime { ${USAGE_TOTALS_FIELDS} }
+        range { ${USAGE_TOTALS_FIELDS} }
+        days { day bytes bytesUploaded }
+      }
+      trackers { kind id range { ${USAGE_TOTALS_FIELDS} } }
+      peers { torrents connected seeds }
     }
   }
 `;
@@ -1208,9 +1421,15 @@ export const RESUME_ALL_MUTATION = gql`
   }
 `;
 
-export const SET_SPEED_LIMIT_MUTATION = gql`
-  mutation SetSpeedLimit($bytesPerSec: Int!) {
-    setSpeedLimit(bytesPerSec: $bytesPerSec)
+export const PAUSE_CLASS_MUTATION = gql`
+  mutation PauseClass($class: Protocol!) {
+    pauseClass(class: $class)
+  }
+`;
+
+export const RESUME_CLASS_MUTATION = gql`
+  mutation ResumeClass($class: Protocol!) {
+    resumeClass(class: $class)
   }
 `;
 
@@ -1262,10 +1481,17 @@ export const LIVE_METRICS_SUBSCRIPTION = gql`
       }
       globalState {
         isPaused
+        pausedClasses
         speedLimitBytesPerSec
         resumeAtEpochMs
         downloadBlock {
           ...DownloadBlockFields
+          diskVolumes {
+            label
+            slow
+            writeRateBytesPerSec
+            waitingBytes
+          }
         }
       }
       providerHoldoffs {
@@ -1283,9 +1509,17 @@ export const LIVE_METRICS_SUBSCRIPTION = gql`
         busy
         max
       }
+      torrents {
+        ...TorrentPresenceFields
+      }
+      torrentRates {
+        downloadBps
+        uploadBps
+      }
     }
   }
   ${DOWNLOAD_BLOCK_FIELDS}
+  ${TORRENT_PRESENCE_FIELDS}
 `;
 
 export const METRICS_PAGE_SUBSCRIPTION = gql`
@@ -1530,6 +1764,517 @@ export const UPDATE_SETTINGS_MUTATION = gql`
     }
   }
   ${GENERAL_SETTINGS_FIELDS}
+`;
+
+const TORRENT_SETTINGS_FIELDS = `
+  fragment TorrentSettingsFields on GeneralSettings {
+    seeding {
+      ...SeedingPolicyFields
+    }
+    uploadCap
+    torrent {
+      enabled
+      basePort
+      announcePort
+      upnp
+      encryption
+      maxActiveDownloads
+      maxPeersTotal
+      unpack
+      connectionsLimit
+      unchokeSlotsLimit
+      connectionSpeed
+      allowMultipleConnectionsPerIp
+      peerTcp
+      peerUtp
+      preferDownloading
+      preferSeeding
+      dhtBootstrapNodes
+      blocklistEnabled
+      blocklist
+      stopTrackerTimeoutSecs
+      bannedIps
+      blockPrivilegedPorts
+      filterTrackers
+      sslEnabled
+      sslPort
+    }
+  }
+  ${SEEDING_POLICY_FIELDS}
+`;
+
+export const TORRENT_SETTINGS_QUERY = gql`
+  query TorrentSettings {
+    settings {
+      ...TorrentSettingsFields
+    }
+  }
+  ${TORRENT_SETTINGS_FIELDS}
+`;
+
+export const UPDATE_TORRENT_SETTINGS_MUTATION = gql`
+  mutation UpdateTorrentSettings($input: GeneralSettingsInput!) {
+    updateSettings(input: $input) {
+      ...TorrentSettingsFields
+    }
+  }
+  ${TORRENT_SETTINGS_FIELDS}
+`;
+
+const TRACKER_RULE_FIELDS = `
+  fragment TrackerRuleFields on TrackerRule {
+    id
+    name
+    hostPatterns
+    seeding {
+      ...SeedingPolicyFields
+    }
+    neverPause
+    unpack
+    client
+    torrentRoute
+    dht
+    pex
+    lsd
+    encryption
+    peerTcp
+    peerUtp
+    preferDownloading
+    preferSeeding
+    uploadCap {
+      state
+      value
+    }
+    forced
+    hasSsl
+    sslSubject
+    sslNotAfter
+    archivePasswordCount
+    bound {
+      name
+      revision
+      importedAt
+      locked
+      hostPatterns
+    }
+  }
+  ${SEEDING_POLICY_FIELDS}
+`;
+
+export const TRACKER_RULES_QUERY = gql`
+  query TrackerRules {
+    trackerRules {
+      ...TrackerRuleFields
+    }
+  }
+  ${TRACKER_RULE_FIELDS}
+`;
+
+/** Every host a torrent has announced to. */
+export const TRACKER_HOSTS_QUERY = gql`
+  query TrackerHosts {
+    trackerHosts
+  }
+`;
+
+/** Every torrent route, and whether peers can reach its session. */
+export const TORRENT_ROUTES_QUERY = gql`
+  query TorrentRoutes {
+    torrentRoutes {
+      key
+      scopes {
+        scope
+        id
+        name
+      }
+      open
+      listenAddress
+      utp
+      mappings {
+        mapper
+        protocol
+        localPort
+        externalPort
+        gatewayAddress
+        error
+      }
+      externalAddresses
+      reason
+      resolvedBy
+      exposure {
+        resolvedBy
+        address
+        announcedPort
+        inbound
+        udpTrackers
+        dht
+        utp
+      }
+    }
+  }
+`;
+
+export const SAVE_TRACKER_RULE_MUTATION = gql`
+  mutation SaveTrackerRule($id: Int, $input: TrackerRuleInput!) {
+    saveTrackerRule(id: $id, input: $input) {
+      ...TrackerRuleFields
+    }
+  }
+  ${TRACKER_RULE_FIELDS}
+`;
+
+export const DELETE_TRACKER_RULE_MUTATION = gql`
+  mutation DeleteTrackerRule($id: Int!) {
+    deleteTrackerRule(id: $id) {
+      ...TrackerRuleFields
+    }
+  }
+  ${TRACKER_RULE_FIELDS}
+`;
+
+/** What importing a tracker file would do; nothing is kept. */
+export const PREVIEW_TRACKER_FILE_MUTATION = gql`
+  mutation PreviewTrackerFile($file: String!, $password: String) {
+    previewTrackerFile(file: $file, password: $password) {
+      name
+      revision
+      hostPatterns
+      ruleId
+      ruleName
+      changes {
+        field
+        locked
+        old
+        new
+      }
+      hasSsl
+      sslSubject
+      sslNotAfter
+      archivePasswordCount
+      fingerprint
+    }
+  }
+`;
+
+export const APPLY_TRACKER_FILE_MUTATION = gql`
+  mutation ApplyTrackerFile($file: String!, $password: String, $fingerprint: String!) {
+    applyTrackerFile(file: $file, password: $password, fingerprint: $fingerprint) {
+      ...TrackerRuleFields
+    }
+  }
+  ${TRACKER_RULE_FIELDS}
+`;
+
+export const UNBIND_TRACKER_RULE_MUTATION = gql`
+  mutation UnbindTrackerRule($id: Int!) {
+    unbindTrackerRule(id: $id) {
+      ...TrackerRuleFields
+    }
+  }
+  ${TRACKER_RULE_FIELDS}
+`;
+
+/** The torrents the schedule's pause leaves seeding, by tracker rule. */
+export const SCHEDULE_SEEDING_QUERY = gql`
+  query ScheduleSeeding {
+    scheduleSeeding {
+      ruleId
+      name
+      torrents
+    }
+  }
+`;
+
+// --- Torrents ---
+
+/**
+ * What the queue reads of each torrent beside its job, pushed as it moves:
+ * every torrent first, then the changed ones and the ids of the gone.
+ */
+export const TORRENT_SUMMARY_UPDATES_SUBSCRIPTION = gql`
+  subscription TorrentSummaryUpdates($ids: [Int!]!) {
+    torrentUpdates(ids: $ids) {
+      fullUpdate
+      removedIds
+      torrents {
+        id
+        state
+        forced
+        ratio
+        uploadBps
+        seedingGoalLeft
+        seedingSeconds
+        consecutiveSeedingSeconds
+        seedingPolicy {
+          ratioGoal
+          seedTimeGoalMinutes
+          seedTimeCounting
+        }
+      }
+    }
+  }
+`;
+
+/** A torrent, pushed as it moves; its id under `removedIds` once it is gone. */
+export const TORRENT_UPDATES_SUBSCRIPTION = gql`
+  subscription TorrentUpdates($id: Int!) {
+    torrentUpdates(id: $id) {
+      fullUpdate
+      removedIds
+      torrents {
+        id
+        name
+        infohash
+        infohashV2
+        state
+        stated
+        detail
+        routeReason
+        category
+        private
+        forced
+        progress
+        totalBytes
+        haveBytes
+        uploadedBytes
+        downloadedBytes
+        ratio
+        downloadBps
+        uploadBps
+        uploadLimit
+        downloadLimit
+        etaSeconds
+        peers
+        seeds
+        leechers
+        maxPeers
+        swarmSeeds
+        swarmLeechers
+        reannounceSeconds
+        activeSeconds
+        seedingSeconds
+        consecutiveSeedingSeconds
+        downloadAvgBps
+        uploadAvgBps
+        wastedBytes
+        lastSeenCompleteMs
+        pieceCount
+        pieceSize
+        piecesHave
+        createdBy
+        createdAtMs
+        comment
+        addedAtMs
+        completedAtMs
+        savePath
+        seedingLeft
+        seedingGoalLeft
+        seedingOverride {
+          ...SeedingPolicyFields
+        }
+        seedingPolicy {
+          ratioGoal
+          seedTimeGoalMinutes
+          inactiveGoalMinutes
+          mode
+          action
+          seedTimeCounting
+          uploadCap
+          levels {
+            ratioGoal
+            seedTimeGoalMinutes
+            inactiveGoalMinutes
+            mode
+            action
+            seedTimeCounting
+            uploadCap
+          }
+        }
+        trackerRule
+        unpack
+        unpackOverride
+        unpacking {
+          result
+          reason
+        }
+        route
+        routeConsumer
+        files {
+          index
+          path
+          length
+          selected
+          priority
+          progress
+        }
+        sequential
+        firstLastPieceFirst
+        trackers {
+          tier
+          url
+          source
+          resolvedBy
+          status
+          updating
+          message
+          seeders
+          leechers
+          peers
+        }
+      }
+    }
+  }
+  ${SEEDING_POLICY_FIELDS}
+`;
+
+export const REMOVE_TORRENT_MUTATION = gql`
+  mutation RemoveTorrent($id: Int!, $deleteFiles: Boolean!) {
+    removeTorrent(id: $id, deleteFiles: $deleteFiles)
+  }
+`;
+
+export const SET_TORRENT_FORCED_MUTATION = gql`
+  mutation SetTorrentForced($id: Int!, $forced: Boolean!) {
+    setTorrentForced(id: $id, forced: $forced)
+  }
+`;
+
+/** The files a torrent's unpacking placed beside its own, read once its unpacking is over. */
+export const TORRENT_UNPACKED_FILES_QUERY = gql`
+  query TorrentUnpackedFiles($id: Int!) {
+    torrent(id: $id) {
+      id
+      unpacking {
+        files {
+          path
+          length
+        }
+      }
+    }
+  }
+`;
+
+/** A torrent's live peer connections, by address. */
+/** A torrent's state alone, read once after an action that may change it. */
+export const TORRENT_STATE_QUERY = gql`
+  query TorrentState($id: Int!) {
+    torrent(id: $id) {
+      id
+      state
+    }
+  }
+`;
+
+export const TORRENT_PEERS_QUERY = gql`
+  query TorrentPeers($id: Int!) {
+    torrentPeers(id: $id) {
+      address
+      client
+      connection
+      progress
+      downloadBps
+      uploadBps
+    }
+  }
+`;
+
+export const BAN_TORRENT_PEER_MUTATION = gql`
+  mutation BanTorrentPeer($id: Int!, $address: String!) {
+    banTorrentPeer(id: $id, address: $address)
+  }
+`;
+
+/** A torrent's own upload limit in bytes per second; null is unlimited. Its download limit is kept. */
+export const SET_TORRENT_UPLOAD_LIMIT_MUTATION = gql`
+  mutation SetTorrentUploadLimit($id: Int!, $upload: Int) {
+    setTorrentRateLimits(id: $id, upload: $upload)
+  }
+`;
+
+/** A torrent's own download limit in bytes per second; null is unlimited. Its upload limit is kept. */
+export const SET_TORRENT_DOWNLOAD_LIMIT_MUTATION = gql`
+  mutation SetTorrentDownloadLimit($id: Int!, $download: Int) {
+    setTorrentRateLimits(id: $id, download: $download)
+  }
+`;
+
+/** Add trackers as one tier after the torrent's last. */
+export const ADD_TORRENT_TRACKERS_MUTATION = gql`
+  mutation AddTorrentTrackers($id: Int!, $urls: [String!]!) {
+    addTorrentTrackers(id: $id, urls: $urls)
+  }
+`;
+
+export const REPLACE_TORRENT_TRACKERS_MUTATION = gql`
+  mutation ReplaceTorrentTrackers($id: Int!, $trackers: [TorrentTrackerInput!]!) {
+    replaceTorrentTrackers(id: $id, trackers: $trackers)
+  }
+`;
+
+export const REMOVE_TORRENT_TRACKERS_MUTATION = gql`
+  mutation RemoveTorrentTrackers($id: Int!, $urls: [String!]!) {
+    removeTorrentTrackers(id: $id, urls: $urls)
+  }
+`;
+
+/** Announce now, to every tracker or to the one named. */
+export const REANNOUNCE_TORRENT_MUTATION = gql`
+  mutation ReannounceTorrent($id: Int!, $tracker: String) {
+    reannounceTorrent(id: $id, tracker: $tracker)
+  }
+`;
+
+export const SET_TORRENT_SEEDING_MUTATION = gql`
+  mutation SetTorrentSeeding($id: Int!, $seeding: SeedingPolicyInput) {
+    setTorrentSeeding(id: $id, seeding: $seeding)
+  }
+`;
+
+/** Set each named file's level; the torrent's other files keep theirs. */
+export const SET_TORRENT_FILE_PRIORITIES_MUTATION = gql`
+  mutation SetTorrentFilePriorities($id: Int!, $priorities: [TorrentFilePriorityInput!]!) {
+    setTorrentFilePriorities(id: $id, priorities: $priorities)
+  }
+`;
+
+export const SET_TORRENT_SEQUENTIAL_MUTATION = gql`
+  mutation SetTorrentSequential($id: Int!, $sequential: Boolean!) {
+    setTorrentSequential(id: $id, sequential: $sequential)
+  }
+`;
+
+export const SET_TORRENT_FIRST_LAST_PIECE_FIRST_MUTATION = gql`
+  mutation SetTorrentFirstLastPieceFirst($id: Int!, $firstLastPieceFirst: Boolean!) {
+    setTorrentFirstLastPieceFirst(id: $id, firstLastPieceFirst: $firstLastPieceFirst)
+  }
+`;
+
+/** Check every piece of the torrent again. */
+export const RECHECK_TORRENT_MUTATION = gql`
+  mutation RecheckTorrent($id: Int!) {
+    recheckTorrent(id: $id)
+  }
+`;
+
+/** Move the torrent's directory under `path`. */
+export const SET_TORRENT_LOCATION_MUTATION = gql`
+  mutation SetTorrentLocation($id: Int!, $path: String!) {
+    setTorrentLocation(id: $id, path: $path)
+  }
+`;
+
+/** Put the torrent in a category; null takes it out of its own. */
+export const SET_TORRENT_CATEGORY_MUTATION = gql`
+  mutation SetTorrentCategory($id: Int!, $category: String) {
+    setTorrentCategory(id: $id, category: $category)
+  }
+`;
+
+/** Look the torrent up on the DHT now. */
+export const DHT_ANNOUNCE_TORRENT_MUTATION = gql`
+  mutation DhtAnnounceTorrent($id: Int!) {
+    dhtAnnounceTorrent(id: $id)
+  }
 `;
 
 // --- Hardware profile ---
@@ -1972,6 +2717,7 @@ export const SCHEDULES_QUERY = gql`
       days
       time
       actionType
+      class
       track
       times
       everyHourAtMinute
@@ -1982,8 +2728,9 @@ export const SCHEDULES_QUERY = gql`
       pruneFailed { deleteFiles }
       pruneCompleted { deleteFiles }
       pruneCancelled { deleteFiles }
-      speedLimits { kind id bytesPerSec }
+      speedLimits { kind id download upload }
       hardwareProfile
+      splitUsenetPct
     }
   }
 `;
@@ -1997,6 +2744,7 @@ export const CREATE_SCHEDULE_MUTATION = gql`
       days
       time
       actionType
+      class
       track
       times
       everyHourAtMinute
@@ -2007,8 +2755,9 @@ export const CREATE_SCHEDULE_MUTATION = gql`
       pruneFailed { deleteFiles }
       pruneCompleted { deleteFiles }
       pruneCancelled { deleteFiles }
-      speedLimits { kind id bytesPerSec }
+      speedLimits { kind id download upload }
       hardwareProfile
+      splitUsenetPct
     }
   }
 `;
@@ -2022,6 +2771,7 @@ export const UPDATE_SCHEDULE_MUTATION = gql`
       days
       time
       actionType
+      class
       track
       times
       everyHourAtMinute
@@ -2032,8 +2782,9 @@ export const UPDATE_SCHEDULE_MUTATION = gql`
       pruneFailed { deleteFiles }
       pruneCompleted { deleteFiles }
       pruneCancelled { deleteFiles }
-      speedLimits { kind id bytesPerSec }
+      speedLimits { kind id download upload }
       hardwareProfile
+      splitUsenetPct
     }
   }
 `;
@@ -2047,6 +2798,7 @@ export const DELETE_SCHEDULE_MUTATION = gql`
       days
       time
       actionType
+      class
       track
       times
       everyHourAtMinute
@@ -2057,8 +2809,9 @@ export const DELETE_SCHEDULE_MUTATION = gql`
       pruneFailed { deleteFiles }
       pruneCompleted { deleteFiles }
       pruneCancelled { deleteFiles }
-      speedLimits { kind id bytesPerSec }
+      speedLimits { kind id download upload }
       hardwareProfile
+      splitUsenetPct
     }
   }
 `;
@@ -2072,6 +2825,7 @@ export const TOGGLE_SCHEDULE_MUTATION = gql`
       days
       time
       actionType
+      class
       track
       times
       everyHourAtMinute
@@ -2082,8 +2836,9 @@ export const TOGGLE_SCHEDULE_MUTATION = gql`
       pruneFailed { deleteFiles }
       pruneCompleted { deleteFiles }
       pruneCancelled { deleteFiles }
-      speedLimits { kind id bytesPerSec }
+      speedLimits { kind id download upload }
       hardwareProfile
+      splitUsenetPct
     }
   }
 `;
@@ -2485,6 +3240,15 @@ export const ANALYZE_NZB_MUTATION = gql`
   }
 `;
 
+export const ANALYZE_TORRENT_MUTATION = gql`
+  mutation AnalyzeTorrent($input: AnalyzeTorrentInput!) {
+    analyzeTorrent(input: $input) {
+      text
+      json
+    }
+  }
+`;
+
 export const ARCHIVE_PASSWORD_SETTINGS_QUERY = gql`
   query ArchivePasswordSettings {
     archivePasswordSettings {
@@ -2514,11 +3278,15 @@ export const UPDATE_ARCHIVE_PASSWORD_SETTINGS_MUTATION = gql`
   }
 `;
 
-/** The unwanted extension list, which General edits apart from the script settings it is stored with. */
+/**
+ * The unwanted extension list and what a download holding one comes to,
+ * which General edits apart from the script settings they are stored with.
+ */
 export const UNACCEPTABLE_EXTENSIONS_QUERY = gql`
   query UnacceptableExtensions {
     postProcessingSettings {
       unacceptableExtensions
+      unwantedExtensionAction
     }
   }
 `;
@@ -2529,3 +3297,42 @@ export const SET_UNACCEPTABLE_EXTENSIONS_MUTATION = gql`
   }
 `;
 
+export const SET_UNWANTED_EXTENSION_ACTION_MUTATION = gql`
+  mutation SetUnwantedExtensionAction($action: UnwantedExtensionAction!) {
+    setUnwantedExtensionAction(action: $action)
+  }
+`;
+
+export const VALIDATED_ARCHIVE_PASSWORD_QUERY = gql`
+  query ValidatedArchivePassword($id: Int!) {
+    validatedArchivePassword(id: $id)
+  }
+`;
+
+/** Every tag made, with how many jobs carry each, queued or in history. */
+export const JOB_TAGS_QUERY = gql`
+  query JobTags {
+    jobTags {
+      name
+      count
+    }
+  }
+`;
+
+export const ADD_JOB_TAGS_MUTATION = gql`
+  mutation AddJobTags($ids: [Int!]!, $tags: [String!]!) {
+    addJobTags(ids: $ids, tags: $tags) {
+      name
+      count
+    }
+  }
+`;
+
+export const REMOVE_JOB_TAGS_MUTATION = gql`
+  mutation RemoveJobTags($ids: [Int!]!, $tags: [String!]!) {
+    removeJobTags(ids: $ids, tags: $tags) {
+      name
+      count
+    }
+  }
+`;

@@ -2,7 +2,6 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // The test dials its own loopback fixtures.
-#![allow(clippy::disallowed_methods)]
 
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
@@ -36,7 +35,7 @@ impl TunnelProvider for LoopbackProxy {
         host: &str,
         port: u16,
     ) -> Result<Box<dyn TunnelStream>, weaver_tunnel::TunnelError> {
-        let mut stream = tokio::net::TcpStream::connect(self.at)
+        let mut stream = weaver_tunnel::test_support::loopback::connect(self.at)
             .await
             .map_err(|error| weaver_tunnel::TunnelError::Engine(error.to_string()))?;
         self.proxy.negotiate(&mut stream, host, port).await?;
@@ -494,7 +493,9 @@ async fn local_route_throughput() {
         let registry = weaver_nntp::revocation::SocketRegistry::default();
         let mut rates = Vec::new();
         for _ in 0..3 {
-            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut stream = weaver_tunnel::test_support::loopback::connect(addr)
+                .await
+                .unwrap();
             let _registration =
                 registered.then(|| registry.track(socket2::SockRef::from(&stream)).unwrap());
             rates.push(consume(&mut stream).await);
@@ -516,7 +517,7 @@ async fn local_route_throughput() {
         .unwrap();
         let mut rates = Vec::new();
         for _ in 0..3 {
-            let mut stream = tokio::net::TcpStream::connect(bridge.addr().unwrap())
+            let mut stream = weaver_tunnel::test_support::loopback::connect(bridge.addr().unwrap())
                 .await
                 .unwrap();
             weaver_tunnel::transport::socks_connect(

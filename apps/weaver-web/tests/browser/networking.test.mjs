@@ -54,7 +54,7 @@ test("flow displays route evidence, opens editors, and edits weights without los
  const page=await browser.newPage({viewport:{width:1440,height:2700}});page.setDefaultTimeout(0);const errors=[];page.on("pageerror",error=>errors.push(error.message));
  await page.goto(`${baseUrl}/tests/browser/networking.html`);
  const diagram=page.locator("svg[aria-label^='Egress interfaces']").first();
- const lanes=["EGRESS INTERFACES","ROUTE LEGS","PROXIES","ENDPOINTS"];
+ const lanes=["ROUTES","EGRESS INTERFACES","PROXIES","ENDPOINTS"];
  for(const lane of lanes)await diagram.getByText(lane,{exact:true}).waitFor();
  const laneX=await Promise.all(lanes.map(async lane=>Number(await diagram.getByText(lane,{exact:true}).getAttribute("x"))));
  assert.deepEqual(laneX,[...laneX].sort((a,b)=>a-b));
@@ -90,23 +90,23 @@ test("flow displays route evidence, opens editors, and edits weights without los
  // Every box wears its state down its left edge: egresses, legs, endpoints, chain hops, lone proxies, the pool's heading and card, and the kill switch.
  assert.equal(await diagram.locator("rect[width='3']").count(),3+7+5+3+2+2+1);
  const legCards=diagram.locator("a[aria-label^='Edit the route for']");
- assert.deepEqual(await legCards.filter({hasText:"leg 3"}).locator("text").allTextContents(),["News primary · leg 3 · 10%","Down · 0/0 open · 0.00 MiB/s","parked · hold","Interface is down"]);
+ assert.deepEqual(await legCards.filter({hasText:"leg 3"}).locator("text").allTextContents(),["News primary · leg 3","10%","Down · 0/0 open · 0.00 MiB/s","parked · hold","Interface is down"]);
  // An egress says each limit it is held to under its load, speed then quota, a row each on a card that grows to fit.
  const fiber=diagram.locator("a[href='/settings/networking/egress']").filter({hasText:"WAN Fiber"});
- assert.deepEqual(await fiber.locator("text").allTextContents(),["WAN Fiber","Up","192.0.2.10","24 open · 22.89 MiB/s","50.00 MiB/s","120 GB / 500 GB"]);
+ assert.deepEqual(await fiber.locator("text").allTextContents(),["WAN Fiber","Up","192.0.2.10","24 open · 22.89 MiB/s","↓ 50.00 MiB/s","↓ 120 GB / 500 GB"]);
  assert.deepEqual(await fiber.locator("g:has(> title) svg").evaluateAll(icons=>icons.map(icon=>icon.getAttribute("class").split(" ").find(name=>name!=="lucide"))),["lucide-gauge","lucide-chart-pie"]);
- assert.deepEqual(await fiber.locator("g:has(> title) > title").allTextContents(),["Download limit","Download quota"]);
+ assert.deepEqual(await fiber.locator("g:has(> title) > title").allTextContents(),["Limit","Quota"]);
  // An egress leaving from more than one address stacks them, one to a line, and its card grows to hold them.
  const system=diagram.locator("a[href='/settings/networking/egress']").filter({hasText:"System"});
  const systemTexts=await system.locator("text").evaluateAll(texts=>texts.map(text=>[text.textContent,Number(text.getAttribute("y"))]));
  assert.deepEqual(systemTexts.map(([text])=>text).slice(0,4),["System","Up","192.0.2.21","2001:db8::21"]);
  assert.deepEqual(systemTexts.slice(2,5).map(([,y],index,all)=>index?y-all[index-1][1]:0),[0,14,20]);
- assert.deepEqual(await diagram.locator("a[href='/settings/networking/egress'] > rect:first-child").evaluateAll(rects=>rects.map(rect=>rect.getAttribute("height"))),["122","148","128"]);
+ assert.deepEqual(await diagram.locator("a[href='/settings/networking/egress'] > rect:first-child").evaluateAll(rects=>rects.map(rect=>rect.getAttribute("height"))),["148","128","122"]);
  const lte=diagram.locator("a[href='/settings/networking/egress']").filter({hasText:"LTE standby"});
- assert.deepEqual(await lte.locator("text").allTextContents(),["LTE standby","Down","198.51.100.10","Interface is down","20.0 GB / 20.0 GB · Blocked"]);
+ assert.deepEqual(await lte.locator("text").allTextContents(),["LTE standby","Down","198.51.100.10","Interface is down","↓ 20.0 GB / 20.0 GB · Stopped"]);
  assert.notEqual(await lte.locator("g:has(> title) > text").getAttribute("fill"),await fiber.locator("g:has(> title) > text").last().getAttribute("fill"));
  // The daemon knows only that its egress is up; the leg is blocked all the same.
- assert.deepEqual(await legCards.filter({hasText:"News archive"}).locator("text").allTextContents(),["News archive · leg 1 · 100%","Blocked · 0/0 open · 0.00 MiB/s","0 planned"]);
+ assert.deepEqual(await legCards.filter({hasText:"News archive"}).locator("text").allTextContents(),["News archive","Blocked · 0/0 open · 0.00 MiB/s","0 planned"]);
  // A feed or Default outbound opens a connection only for a moment, over its one leg: the leg is its name, its state, and where it leaves from while open.
  assert.deepEqual(await legCards.filter({hasText:"Default outbound"}).locator("text").allTextContents(),["Default outbound","Up"]);
  assert.deepEqual(await legCards.filter({hasText:"Feed mirror"}).locator("text").allTextContents(),["Feed mirror","Up","127.0.0.1:45130"]);
@@ -148,7 +148,7 @@ test("flow displays route evidence, opens editors, and edits weights without los
  assert.ok(snakePaths.some(d=>Math.abs(d[2]-carrierMiddle)<0.01),"a snake starts at the carrying member");
  await chain.hover();
  await fadedEndpoints.filter({hasText:"News primary"}).waitFor({state:"attached"});
- assert.deepEqual(await fadedLegs.evaluateAll(legs=>legs.map(leg=>leg.getAttribute("aria-label"))),["Edit the route for Default outbound, leg 1","Edit the route for News primary, leg 2","Edit the route for News backup, leg 1","Edit the route for News archive, leg 1","Edit the route for News primary, leg 1","Edit the route for News primary, leg 3"]);
+ assert.deepEqual(await fadedLegs.evaluateAll(legs=>legs.map(leg=>leg.getAttribute("aria-label"))),["Edit the route for Default outbound, leg 1","Edit the route for News primary, leg 1","Edit the route for News primary, leg 2","Edit the route for News primary, leg 3","Edit the route for News backup, leg 1","Edit the route for News archive, leg 1"]);
  assert.equal(await chain.getAttribute("opacity"),null);
  assert.equal(await fadedSnakes.count(),0);
  assert.ok(await snakes.count()>0);
@@ -164,7 +164,7 @@ test("flow displays route evidence, opens editors, and edits weights without los
  if(process.env.NETWORKING_SCREENSHOT)await page.screenshot({path:process.env.NETWORKING_SCREENSHOT.replace(/\.png$/,"-focus-chain.png"),fullPage:true});
  await diagram.locator("a[href='/settings/networking/egress']").filter({hasText:"WAN Fiber"}).hover();
  await fadedEndpoints.filter({hasText:"Feed mirror"}).waitFor({state:"attached"});
- assert.deepEqual(await fadedLegs.evaluateAll(legs=>legs.map(leg=>leg.getAttribute("aria-label"))),["Edit the route for Default outbound, leg 1","Edit the route for Feed mirror, leg 1","Edit the route for News primary, leg 2","Edit the route for News backup, leg 1","Edit the route for News archive, leg 1","Edit the route for News primary, leg 3"]);
+ assert.deepEqual(await fadedLegs.evaluateAll(legs=>legs.map(leg=>leg.getAttribute("aria-label"))),["Edit the route for Default outbound, leg 1","Edit the route for News primary, leg 2","Edit the route for News primary, leg 3","Edit the route for News backup, leg 1","Edit the route for News archive, leg 1","Edit the route for Feed mirror, leg 1"]);
  assert.ok(await snakes.count()>0);
  assert.equal(await fadedSnakes.count(),0);
  assert.equal(await ribbons.count(),await snakes.count());
@@ -336,7 +336,7 @@ test("an egress is tested alone and a pool member by member, each through a rout
  assert.deepEqual(await paths(1),[["WAN Fiber",[]]]);
  await rows.first().getByText("8.4 ms · source 192.0.2.10:40000",{exact:true}).waitFor();
  await rows.first().getByText("Connected.",{exact:true}).waitFor();
- assert.deepEqual((await tests()).at(-1),{route:{failover:"REDISTRIBUTE",legs:[{egressId:1,weight:100,path:{direct:true}}]},subject:null,target:{host:"news.fixture.invalid",port:563}});
+ assert.deepEqual((await tests()).at(-1),{route:{failover:"REDISTRIBUTE",legs:[{egressId:1,weight:100,path:{direct:true}}]},subject:null,target:{host:"news.fixture.invalid",port:563},torrent:false});
  if(process.env.NETWORKING_SCREENSHOT)await page.screenshot({path:process.env.NETWORKING_SCREENSHOT.replace(/\.png$/,"-test-egress.png")});
  await button(dialog,"Close").click();
  await dialog.waitFor({state:"detached"});

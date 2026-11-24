@@ -5,3 +5,4 @@
 export * from "./settings";
 export * from "./networking";
 export * from "./jobs";
+export * from "./torrents";

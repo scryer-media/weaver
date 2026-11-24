@@ -1635,6 +1635,19 @@ fn run_clippy_ci(ctx: &TaskContext) -> Result<()> {
     command.args(["--", "-D", "warnings"]);
     run_checked(&mut command)?;
 
+    install_host_name_lookup_lint(ctx)?;
+    println!("Running the host name lookup lint");
+    let mut command = ctx.command_in("cargo", &ctx.repo_root);
+    command.args([
+        "dylint",
+        "--path",
+        HOST_NAME_LOOKUP_LINT,
+        "--workspace",
+        "--",
+    ]);
+    command.args(CI_CLIPPY_ARGS.iter().filter(|arg| **arg != "--workspace"));
+    run_checked(&mut command)?;
+
     if !command_available("cargo-xwin")? {
         warn("cargo-xwin not installed — installing");
         let mut install = ctx.command_in("cargo", &ctx.repo_root);
@@ -1647,6 +1660,54 @@ fn run_clippy_ci(ctx: &TaskContext) -> Result<()> {
     command.args(CI_CLIPPY_ARGS);
     command.args(["--", "-D", "warnings"]);
     run_checked(&mut command)
+}
+
+const HOST_NAME_LOOKUP_LINT: &str = "lints/host_name_lookup";
+const DYLINT_VERSION: &str = "6.4.0";
+
+// The nightly the lint's own rust-toolchain.toml names, and the dylint tools
+// at the version CI pins, each installed only when missing. The tools are
+// built with that nightly: they need a newer compiler than Weaver's own.
+fn install_host_name_lookup_lint(ctx: &TaskContext) -> Result<()> {
+    let path = ctx
+        .repo_root
+        .join(HOST_NAME_LOOKUP_LINT)
+        .join("rust-toolchain.toml");
+    let toolchain = fs::read_to_string(&path)?
+        .parse::<DocumentMut>()
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    let channel = toolchain["toolchain"]["channel"]
+        .as_str()
+        .with_context(|| format!("{} names no channel", path.display()))?;
+    let components: Vec<&str> = toolchain["toolchain"]["components"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|component| component.as_str())
+        .collect();
+    let installed = run_capture(Command::new("rustup").args(["toolchain", "list"]))?;
+    if !installed
+        .lines()
+        .any(|line| line.starts_with(&format!("{channel}-")))
+    {
+        warn(format!("{channel} not installed — installing"));
+        let mut install = Command::new("rustup");
+        install.args(["toolchain", "install", channel, "--profile", "minimal"]);
+        if !components.is_empty() {
+            install.args(["--component", &components.join(",")]);
+        }
+        run_checked(&mut install)?;
+    }
+    for tool in ["cargo-dylint", "dylint-link"] {
+        if !command_available(tool)? {
+            warn(format!("{tool} not installed — installing"));
+            let mut install = ctx.command_in("cargo", &ctx.repo_root);
+            install.arg(format!("+{channel}"));
+            install.args(["install", "--locked", tool, "--version", DYLINT_VERSION]);
+            run_checked(&mut install)?;
+        }
+    }
+    Ok(())
 }
 
 fn run_ci_winget(ctx: &TaskContext, args: WingetArgs) -> Result<()> {
@@ -3292,6 +3353,10 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
     println!("   State: {}", state_dir.display());
     println!("   Data: {}", data_dir.display());
     println!("   Diagnostics enabled: {diagnostics_enabled}");
+    println!(
+        "   Torrents: WEAVER_TORRENTS={}",
+        std::env::var("WEAVER_TORRENTS").unwrap_or_else(|_| "1".into())
+    );
     let log = OpenOptions::new()
         .create(true)
         .append(true)
@@ -3312,6 +3377,10 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
     backend.env("WEAVER_ENCRYPTION_KEY", &encryption_key);
+    // Torrents are on for a dev server unless the shell says otherwise.
+    if std::env::var_os("WEAVER_TORRENTS").is_none() {
+        backend.env("WEAVER_TORRENTS", "1");
+    }
     if args.otp {
         backend.env("WEAVER_REQUIRE_SETUP_CODE", "1");
     }

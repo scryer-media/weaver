@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// A file posted in numbered pieces, `name.001`, `name.002`, …: a store whose
+// A file posted in numbered pieces, `name.001`, `name.002`, …, or a set
+// numbered `name.01`, `name.02`, … (`split_piece_among`): a store whose
 // one member is the file the pieces were cut from. Each piece's bytes are
 // placed in that member where the piece starts, which is the sum of the
 // lengths of the pieces before it, so a clean set is written once and never
@@ -426,12 +427,18 @@ impl Durable for SplitStore {
     // 9: that length gone again: a piece's length is the one it holds; and
     // what each piece holds unplaced, where it kept how far it was handed.
     // 10: how far each piece reached gone: its close says so.
-    const VERSION: u16 = 10;
+    // 11: whether the set is numbered in two digits.
+    const VERSION: u16 = 11;
 }
 
 impl Object for SplitStore {
     fn kind(&self) -> Kind {
         Kind::Split
+    }
+
+    // Each piece's bytes are my member's, as they arrive.
+    fn passes_on(&self) -> bool {
+        true
     }
 
     // Bytes of a piece go where the piece starts in the member, as far as
@@ -525,15 +532,24 @@ impl Object for SplitStore {
     fn volume_lost(&mut self, _volume: VolumeIndex, _range: ByteRange, _out: &mut Vec<Emit>) {}
 
     // A set missing a number, or its first piece, is no file of its own:
-    // what was placed of it is forgotten and its pieces go back. A member
+    // what was placed of it is forgotten and its pieces go back. Below the
+    // root, with no other split set beside it, the missing pieces may lie in
+    // the namespace above, and so may the others of a piece alone: its
+    // pieces go back to be lifted there (`Why::Scattered`). A member
     // never placed whole goes back as any store's does.
     fn quiet(&mut self, standing: &dyn Standing, out: &mut Vec<Emit>) {
-        if !self.contiguous() {
-            out.push(Emit::Retract(MEMBER));
-            out.push(Emit::Refuse(Why::Unrepairable));
+        let scattered = standing.liftable();
+        if self.contiguous() && !(scattered && self.pieces.len() == 1) {
+            out.extend(crate::quiet::unplaced(standing, None).map(Emit::Refuse));
             return;
         }
-        out.extend(crate::quiet::unplaced(standing).map(Emit::Refuse));
+        // A lifted piece is read back through the set, which still holds
+        // what it placed of it: the member is not retracted first, or the
+        // first piece would read back as nothing.
+        match scattered {
+            true => out.push(Emit::Refuse(Why::Scattered)),
+            false => out.extend([Emit::Retract(MEMBER), Emit::Refuse(Why::Unrepairable)]),
+        }
     }
 
     // One article of each piece that has not declared its length: any
@@ -677,7 +693,12 @@ impl Object for SplitStore {
     // A piece of my set by its name, wherever its number places it: what
     // the first piece's bytes open is the joined file's to say, and a later
     // piece's front refutes the set when it reaches me (`refutes`).
-    fn claim(&mut self, name: &str, _first_bytes: &[u8], _length: Option<u64>) -> Claim {
+    fn claim(
+        &mut self,
+        name: &str,
+        _first_bytes: weaver_graph::Clean<'_>,
+        _length: Option<u64>,
+    ) -> Claim {
         self.place(name).into_iter().collect()
     }
 

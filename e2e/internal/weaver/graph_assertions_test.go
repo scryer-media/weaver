@@ -12,7 +12,7 @@ import (
 
 // graphLine renders one contract line the way the graph's tracing writer does.
 func graphLine(message, fields string) string {
-	return "2026-10-18T10:00:00.000001Z  INFO weaver_server_core::pipeline::graph::status: " + message + " " + fields
+	return "2026-10-18T10:00:00.000001Z  INFO weaver_server_pipeline::pipeline::graph::status: " + message + " " + fields
 }
 
 func graphLog(lines ...string) string {
@@ -33,10 +33,10 @@ func TestGraphLogEventsReadsContractFields(t *testing.T) {
 	raw := graphLog(
 		graphLine("member delivered", `job_id=7 name=CERTIFICATE/backup/id (1).bdmv from=CERTIFICATE/backup/id.bdmv depth=1 whole=true`),
 		graphLine("member delivered", `job_id=7 name="quoted \"name\".bin" from="quoted \"name\".bin" depth=0 whole=false`),
-		"\x1b[2m2026-10-18T10:00:00Z\x1b[0m \x1b[32m INFO\x1b[0m \x1b[2mweaver_server_core::pipeline::graph::namespace\x1b[0m\x1b[2m:\x1b[0m member delivered \x1b[3mjob_id\x1b[0m\x1b[2m=\x1b[0m7 \x1b[3mname\x1b[0m\x1b[2m=\x1b[0mcoloured.bin \x1b[3mfrom\x1b[0m\x1b[2m=\x1b[0mcoloured.bin \x1b[3mdepth\x1b[0m\x1b[2m=\x1b[0m0 \x1b[3mwhole\x1b[0m\x1b[2m=\x1b[0mtrue",
+		"\x1b[2m2026-10-18T10:00:00Z\x1b[0m \x1b[32m INFO\x1b[0m \x1b[2mweaver_server_pipeline::pipeline::graph::namespace\x1b[0m\x1b[2m:\x1b[0m member delivered \x1b[3mjob_id\x1b[0m\x1b[2m=\x1b[0m7 \x1b[3mname\x1b[0m\x1b[2m=\x1b[0mcoloured.bin \x1b[3mfrom\x1b[0m\x1b[2m=\x1b[0mcoloured.bin \x1b[3mdepth\x1b[0m\x1b[2m=\x1b[0m0 \x1b[3mwhole\x1b[0m\x1b[2m=\x1b[0mtrue",
 		graphLine("member delivered", `job_id=70 name=other-job.bin from=other-job.bin depth=0 whole=true`),
-		`2026-10-18T10:00:00Z  INFO weaver_server_core::pipeline::completion: member delivered job_id=7 name=elsewhere.bin`,
-		`2026-10-18T10:00:01Z  WARN weaver_server_core::runtime::job_debug_ring: stall diagnostics line job_id=7 line=INFO weaver_server_core::pipeline::graph::status: member delivered job_id=7 name=replayed.bin`,
+		`2026-10-18T10:00:00Z  INFO weaver_server_pipeline::pipeline::completion: member delivered job_id=7 name=elsewhere.bin`,
+		`2026-10-18T10:00:01Z  WARN weaver_server_base::runtime::job_debug_ring: stall diagnostics line job_id=7 line=INFO weaver_server_pipeline::pipeline::graph::status: member delivered job_id=7 name=replayed.bin`,
 	)
 	refusals := graphLogEvents(graphLine("object refused", `job_id=7 node=0 kind= member=notes.bin why=holds_breached`), 7, graphObjectRefusedMessage)
 	if len(refusals) != 1 || refusals[0]["kind"] != "" || refusals[0]["member"] != "notes.bin" || refusals[0]["why"] != "holds_breached" {
@@ -651,7 +651,7 @@ func TestScenarioFileExpectations(t *testing.T) {
 		{slug: "par2-ignorable-deficit", outcome: outcomePartialDelivery},
 		{slug: "par2-multi-set-archives-insufficient", outcome: outcomePartialDelivery},
 		{slug: "obfuscated-split-7z", outcome: "extraction_failure", error: "never placed every member it named"},
-		{slug: "nested-obfuscated-split-7z", outcome: "extraction_failure", error: "never placed every member it named"},
+		{slug: "nested-obfuscated-split-7z", outcome: "success"},
 		{slug: "par3-obfuscated-names", outcome: "repair_then_success"},
 		{slug: "par3-obfuscated-plain-name", outcome: "repair_then_success"},
 	} {
@@ -721,7 +721,7 @@ func TestGraphDirectStoreEngagementVerdict(t *testing.T) {
 		{name: "a store object of a job outside the phase", lines: []string{bound("90", "rar_store")}, jobIDs: []int{81, 82}, wantErr: "no job of the phase bound a store object"},
 		{
 			name:    "a replayed store line",
-			lines:   []string{`2026-10-18T10:00:01Z  WARN weaver_server_core::runtime::job_debug_ring: stall diagnostics line job_id=81 line=INFO weaver_server_core::pipeline::graph::status: object bound job_id=81 node=2 kind=rar_store over=a.rar depth=0`},
+			lines:   []string{`2026-10-18T10:00:01Z  WARN weaver_server_base::runtime::job_debug_ring: stall diagnostics line job_id=81 line=INFO weaver_server_pipeline::pipeline::graph::status: object bound job_id=81 node=2 kind=rar_store over=a.rar depth=0`},
 			jobIDs:  []int{81},
 			wantErr: "no job of the phase bound a store object",
 		},

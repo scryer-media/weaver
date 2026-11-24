@@ -31,6 +31,10 @@ pub(super) struct Component {
     // the operator, the OS or the database. A component without one is left
     // out with the rest.
     pub(super) without_table: Option<Result<Vec<u8>, String>>,
+    // What a file that shipped is short of, when it is short of anything:
+    // the manifest lists it beside the file, so a reader can tell a short
+    // file from a whole one.
+    pub(super) partial: Option<String>,
 }
 
 // How a component's bytes are read, which is how the sanitizer reaches the
@@ -70,6 +74,7 @@ impl Component {
             outcome: Ok(data),
             reason: None,
             without_table: None,
+            partial: None,
         }
     }
 
@@ -84,6 +89,7 @@ impl Component {
             outcome: Err(error.to_string()),
             reason: None,
             without_table: None,
+            partial: None,
         }
     }
 
@@ -149,12 +155,56 @@ pub(super) struct ManifestSanitized {
     // most recent. `None` when the history could not be read.
     pub(super) history_jobs_total: Option<u64>,
     pub(super) note: String,
+    // How complete the stand-in table was, step by step.
+    #[serde(default)]
+    pub(super) table: ManifestTable,
+}
+
+// What the stand-in table read, and what covered the rest.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(super) struct ManifestTable {
+    // Every step read all it set out to.
+    pub(super) complete: bool,
+    pub(super) steps: Vec<ManifestStep>,
+    // Stand-ins of names the table read, and stand-ins the field rule gave
+    // names it did not hold.
+    pub(super) names_from_table: u64,
+    pub(super) names_from_fallback: u64,
+    // Jobs named from the queue in memory because the read did not reach
+    // them, and jobs whose names were not all read.
+    pub(super) jobs_from_memory: u64,
+    pub(super) jobs_not_fully_read: u64,
+    // How long the read ran, in milliseconds.
+    pub(super) read_ms: u64,
+    // What covered the names the table did not read, when it did not read
+    // them all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) fallback: Option<String>,
+}
+
+// One step of the stand-in read.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct ManifestStep {
+    pub(super) step: String,
+    // `complete`, `partial`, `failed` or `not_reached`.
+    pub(super) state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) read: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) of: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct ManifestFile {
     pub(super) name: String,
     pub(super) bytes: u64,
+    // What the file is short of; absent for a whole file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) partial: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -195,6 +245,7 @@ pub(super) fn build_archive(
                 files.push(ManifestFile {
                     name: component.name.clone(),
                     bytes: data.len() as u64,
+                    partial: component.partial.clone(),
                 });
                 payloads.push((component.name, data));
             }
@@ -221,6 +272,7 @@ pub(super) fn build_archive(
     manifest.files.push(ManifestFile {
         name: MANIFEST_NAME.to_string(),
         bytes: 0,
+        partial: None,
     });
     let mut manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| {
         std::io::Error::other(format!("manifest serialization failed: {error}"))
@@ -297,6 +349,7 @@ mod tests {
                 stand_ins: 7,
                 history_jobs_total: Some(2001),
                 note: "test".to_string(),
+                table: ManifestTable::default(),
             },
         )
         .expect("archive builds");

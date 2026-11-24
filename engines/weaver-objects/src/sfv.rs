@@ -292,6 +292,19 @@ impl Object for Sfv {
 }
 
 impl Recovery for Sfv {
+    // A listing checks what it lists and rebuilds none of it.
+    fn rebuilds(&self) -> bool {
+        false
+    }
+
+    fn carried_inside(&self) -> bool {
+        false
+    }
+
+    fn outgrows_recovery(&self) -> bool {
+        false
+    }
+
     // By lower-cased basename. Two members whose names differ only by case
     // cannot be told apart by a listing that records neither reliably, so
     // neither binds.
@@ -330,6 +343,10 @@ impl Recovery for Sfv {
 
     fn covers(&self, member: MemberId) -> bool {
         self.bound.contains_key(&member)
+    }
+
+    fn covers_some(&self) -> bool {
+        !self.bound.is_empty()
     }
 
     // A listing ships beside what it lists.

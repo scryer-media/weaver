@@ -403,6 +403,13 @@ pub(super) fn restored(facts: &Facts) -> Result<RarStore, RestoreError> {
         store.gaps_said.say(volume.0, volume.0.saturating_add(1));
     }
     store.gone = kept.gone;
+    // A member laid whole short of its stated size was laid with the
+    // volumes held on trust standing where they are held: they stand there
+    // again, so the walk lays the set as it was laid.
+    store.trusting = store
+        .entries
+        .iter()
+        .any(|entry| entry.complete && entry.short());
     // The walk reads the kept headers again; what it says now was said
     // before the checkpoint, so it goes nowhere.
     store.settle(None, &mut Vec::new());
@@ -734,10 +741,24 @@ mod cache_tests {
                 &offered.parts[0].bytes
             ));
             assert!(restore(&offered).is_ok());
+            // The header check is the store's work, done on its loan after
+            // the offer and after the delivery.
+            while store.work_due() {
+                store.work(&mut Vec::new());
+            }
             deliver(&mut store, 0, &bytes, Provenance::Fresh);
+            while store.work_due() {
+                store.work(&mut Vec::new());
+            }
+            // The bytes the tree held while the check was due come back once
+            // the headers open and their placement moves.
+            deliver(&mut store, 0, &bytes, Provenance::Fresh);
+            while store.work_due() {
+                store.work(&mut Vec::new());
+            }
             let opened = store.facts();
             let decoded: StoreFacts = opened.read(Kind::RarStore).unwrap();
-            assert!(decoded.volumes[0].get().locked.is_none());
+            assert!(decoded.volumes[0].get().locked.is_none(), "{version:?}");
             assert_eq!(decoded.entries[0].name, "payload.bin");
             assert_eq!(decoded.entries[0].length, Some(128));
             assert!(restore(&opened).is_ok());

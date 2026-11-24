@@ -3,11 +3,14 @@
 
 use async_graphql::{Context, Object, Result};
 use tracing::info;
+use weaver_server_core::auth::api_keys::AuthApiKeysQueries;
+use weaver_server_core::auth::repository::AuthRepositoryQueries;
+use weaver_server_core::settings::persistence::SettingsPersistenceQueries;
 
 use crate::auth::types::{ApiKey, ApiKeyScope, CreateApiKeyResult};
 use crate::auth::{FreshAdminGuard, generate_api_key, hash_api_key};
 use weaver_server_core::Database;
-use weaver_server_core::auth::{ApiKeyAuthRow, ApiKeyCache};
+use weaver_server_core::auth::{ApiKeyAuthRow, ApiKeyCache, SigningKeys};
 
 #[derive(Default)]
 pub(crate) struct AuthMutation;
@@ -399,17 +402,21 @@ impl AuthMutation {
         .map_err(async_graphql::Error::new)?;
         let db = ctx.data::<Database>()?.clone();
         let auth_cache = ctx.data::<crate::auth::LoginAuthCache>()?.clone();
+        // The new hash is a new signing key: nothing is stored for it.
+        let signing_keys = SigningKeys::for_database(&db)
+            .map_err(|error| async_graphql::Error::new(error.to_string()))?;
         let username_for_db = username.clone();
         let hash_for_db = hash.clone();
-        let jwt_secret = tokio::task::spawn_blocking(move || {
-            db.set_auth_credentials(&username_for_db, &hash_for_db)?;
-            db.rotate_jwt_signing_secret()
+        tokio::task::spawn_blocking(move || {
+            db.set_auth_credentials(&username_for_db, &hash_for_db)
         })
         .await
         .map_err(|e| async_graphql::Error::new(e.to_string()))?
         .map_err(|e| async_graphql::Error::new(e.to_string()))?;
         auth_cache.replace(Some(crate::auth::CachedLoginAuth::new(
-            username, hash, jwt_secret,
+            username,
+            hash,
+            &signing_keys,
         )));
         info!("login protection enabled");
         Ok(true)
@@ -427,14 +434,10 @@ impl AuthMutation {
         }
         let db = ctx.data::<Database>()?.clone();
         let auth_cache = ctx.data::<crate::auth::LoginAuthCache>()?.clone();
-        tokio::task::spawn_blocking(move || {
-            db.clear_auth_credentials()?;
-            db.rotate_jwt_signing_secret()?;
-            Ok::<_, weaver_server_core::StateError>(())
-        })
-        .await
-        .map_err(|e| async_graphql::Error::new(e.to_string()))?
-        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        tokio::task::spawn_blocking(move || db.clear_auth_credentials())
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
         auth_cache.clear();
         info!("login protection disabled");
         Ok(true)
@@ -468,15 +471,18 @@ impl AuthMutation {
         .await
         .map_err(|e| async_graphql::Error::new(e.to_string()))?
         .map_err(async_graphql::Error::new)?;
+        // The new hash is a new signing key, so every token signed under the
+        // old password stops verifying once the cache holds it.
+        let signing_keys = SigningKeys::for_database(&db)
+            .map_err(|error| async_graphql::Error::new(error.to_string()))?;
         let username = creds.username.clone();
         let new_hash_for_db = new_hash.clone();
-        let jwt_secret = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs() as i64;
-            db2.change_auth_credentials_and_revoke_sessions(&username, &new_hash_for_db, now)?;
-            db2.rotate_jwt_signing_secret()
+            db2.change_auth_credentials_and_revoke_sessions(&username, &new_hash_for_db, now)
         })
         .await
         .map_err(|e| async_graphql::Error::new(e.to_string()))?
@@ -484,7 +490,7 @@ impl AuthMutation {
         auth_cache.replace(Some(crate::auth::CachedLoginAuth::new(
             creds.username,
             new_hash,
-            jwt_secret,
+            &signing_keys,
         )));
         info!("login password changed");
         Ok(true)

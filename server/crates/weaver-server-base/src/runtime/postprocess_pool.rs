@@ -1,0 +1,52 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static BUILT: AtomicU64 = AtomicU64::new(0);
+
+// How many post-processing pools this process has built, for a repair's
+// timing to say whether its pool is the one earlier work ran on.
+pub fn pools_built() -> u64 {
+    BUILT.load(Ordering::Relaxed)
+}
+
+// Build a dedicated rayon thread pool for post-processing work
+// (extraction, PAR2 verify/repair). Threads are niced on Unix
+// so the OS scheduler prefers download/decode threads when CPU
+// is contended.
+pub fn build_postprocess_pool(thread_count: usize) -> Arc<rayon::ThreadPool> {
+    BUILT.fetch_add(1, Ordering::Relaxed);
+    let _affinity = super::affinity::PostprocessAffinity::enter();
+    Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(thread_count)
+            .thread_name(|i| format!("weaver-pp-{i}"))
+            .start_handler(|_| {
+                #[cfg(unix)]
+                {
+                    // SAFETY: setpriority with PRIO_PROCESS and tid 0 (current thread)
+                    // is a well-defined POSIX call. nice(10) = lower priority.
+                    unsafe {
+                        libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+                    }
+                }
+                #[cfg(windows)]
+                {
+                    use windows_sys::Win32::System::Threading::{
+                        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+                    };
+                    // Mirrors the unix nice(10): download/decode threads win
+                    // when CPU is contended.
+                    // SAFETY: the pseudo-handle is always valid for the
+                    // current thread.
+                    unsafe {
+                        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                    }
+                }
+            })
+            .build()
+            .expect("failed to build post-processing thread pool"),
+    )
+}

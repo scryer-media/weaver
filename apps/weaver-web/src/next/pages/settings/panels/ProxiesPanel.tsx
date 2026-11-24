@@ -10,10 +10,13 @@ import {
   SAVE_PROXY_MUTATION,
 } from "@/graphql/proxies";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
-import { proxyLabels, type ProxyKind, type ProxyProfile, type ProxyResolver } from "@/lib/proxies";
+import { proxyLabels, type ProxyKind, type ProxyProfile } from "@/lib/proxies";
+import { MAX_DNS_SERVERS, SYSTEM_DNS_PROFILE_ID, dnsProfileName, isIpv4, isIpv6 } from "@/lib/dns";
+import { settingsIds, testIds } from "@/next/testids";
 import { cn } from "@/lib/utils";
-import { refusalMessage } from "@/lib/refusal";
+import { useNamedRefusal } from "../../../features/networking/refusal-names";
 import { TestViaDialog } from "../../../features/networking/TestViaDialog";
+import { useProxyNameProfiles } from "../../../features/networking/dns-choices";
 import {
   WIREGUARD_KEY,
   parseWireguardConfig,
@@ -55,14 +58,16 @@ interface ProxyForm {
   enabled: boolean;
   host: string;
   port: number;
-  resolver: ProxyResolver;
-  /** The resolver's host resolves, or the servers in `dns`, in order. */
-  dnsSource: DnsSource;
-  dns: string;
+  /** WireGuard: the tunnel's own DNS servers, one per line. */
+  dnsServers: string;
+  /** The proxy name profile that finds this proxy's address when it is a name; 0 is System. */
+  dnsProfileId: number;
   addresses: string;
   peerPublicKey: string;
   mtu: string;
   keepaliveSeconds: string;
+  natpmp: boolean;
+  forwardedPort: string;
   timeoutSeconds: number;
   /** A string replaces the stored secret, `null` clears it, absent keeps it. */
   secrets: Partial<Record<SecretKey, string | null>>;
@@ -86,7 +91,6 @@ const TIMEOUT_MAX = 300;
 const KEEPALIVE_DEFAULT = 25;
 /** The largest configuration read: no real one comes near it. */
 const CONFIG_MAX = 65536;
-type DnsSource = "host" | "servers";
 /** Where a WireGuard profile's details come from. */
 type WireguardStart = "upload" | "paste" | "manual";
 const CONFIG_KEYS = {
@@ -105,13 +109,14 @@ const NEW_PROXY: ProxyForm = {
   enabled: true,
   host: "",
   port: DEFAULT_PORTS.WIRE_GUARD,
-  resolver: "WEAVER",
-  dnsSource: "host",
-  dns: "",
+  dnsServers: "",
+  dnsProfileId: SYSTEM_DNS_PROFILE_ID,
   addresses: "",
   peerPublicKey: "",
   mtu: "",
   keepaliveSeconds: "",
+  natpmp: false,
+  forwardedPort: "",
   timeoutSeconds: 30,
   secrets: {},
 };
@@ -144,13 +149,14 @@ function formFor(profile: ProxyProfile): ProxyForm {
     enabled: profile.enabled,
     host: profile.host,
     port: profile.port,
-    resolver: profile.resolver,
-    dnsSource: profile.dnsServers.length ? "servers" : "host",
-    dns: profile.dnsServers.join("\n"),
+    dnsServers: profile.dnsServers.join("\n"),
+    dnsProfileId: profile.dnsProfileId ?? SYSTEM_DNS_PROFILE_ID,
     addresses: profile.tunnelAddresses.join("\n"),
     peerPublicKey: profile.peerPublicKey ?? "",
     mtu: profile.mtu ? String(profile.mtu) : "",
     keepaliveSeconds: profile.keepaliveSeconds == null ? "" : String(profile.keepaliveSeconds),
+    natpmp: profile.natpmp,
+    forwardedPort: profile.forwardedPort == null ? "" : String(profile.forwardedPort),
     timeoutSeconds: profile.timeoutSeconds,
     secrets: {},
   };
@@ -203,12 +209,14 @@ function wireguardProblem(t: Translate, form: ProxyForm, profile: ProxyProfile |
   if (splitList(form.addresses).length === 0) {
     return t("next.proxies.needsAddress");
   }
+  const dnsServers = splitList(form.dnsServers);
+  if (dnsServers.length > MAX_DNS_SERVERS) {
+    return t("next.dns.tooMany", { count: MAX_DNS_SERVERS });
+  }
+  if (dnsServers.some((server) => !isIpv4(server) && !isIpv6(server))) {
+    return t("next.proxies.tunnelDnsBad");
+  }
   return null;
-}
-
-/** WireGuard carries no name to its peer, so a WireGuard proxy resolves only with servers. */
-function dnsSource(form: ProxyForm): DnsSource {
-  return form.kind === "WIRE_GUARD" && form.resolver === "PROXY" ? "servers" : form.dnsSource;
 }
 
 function proxyInput(form: ProxyForm) {
@@ -223,12 +231,17 @@ function proxyInput(form: ProxyForm) {
     enabled: form.enabled,
     host: form.host.trim(),
     port: form.port,
-    resolver: form.resolver,
-    dnsServers: dnsSource(form) === "servers" ? splitList(form.dns) : [],
+    dnsServers: form.kind === "WIRE_GUARD" ? splitList(form.dnsServers) : [],
+    dnsProfileId: form.dnsProfileId,
     tunnelAddresses: splitList(form.addresses),
     peerPublicKey: form.peerPublicKey || null,
     mtu: Number(form.mtu || MTU_DEFAULT),
     keepaliveSeconds: Number(form.keepaliveSeconds || KEEPALIVE_DEFAULT),
+    natpmp: form.kind === "WIRE_GUARD" && form.natpmp,
+    forwardedPort:
+      form.kind === "WIRE_GUARD" && !form.natpmp && form.forwardedPort
+        ? Number(form.forwardedPort)
+        : null,
     timeoutSeconds: form.timeoutSeconds,
     ...secrets,
   };
@@ -244,10 +257,15 @@ export function ProxiesPanel({ onChanged }: { onChanged?: () => void }) {
   const [removing, setRemoving] = useState<ProxyProfile | null>(null);
   const [removeError, setRemoveError] = useState<string | null>(null);
   const [{ fetching: removeBusy }, deleteProxy] = useMutation(DELETE_PROXY_MUTATION);
+  const namedRefusal = useNamedRefusal();
   // Each proxy's last test in this session, in one sentence.
   const [health, setHealth] = useState<Record<number, string>>({});
 
   const profiles = data?.proxyProfiles ?? [];
+  // Profile names are read only when a proxy follows one other than System.
+  const dnsNames = useProxyNameProfiles(profiles.some((profile) => profile.dnsProfileId !== SYSTEM_DNS_PROFILE_ID));
+  const foundWithName = (id: number) =>
+    dnsNames?.find((choice) => choice.id === id)?.name ?? t("next.proxies.dnsProfileNumber", { id });
   const editing = typeof editingId === "number"
     ? (profiles.find((profile) => profile.id === editingId) ?? null)
     : null;
@@ -286,6 +304,11 @@ export function ProxiesPanel({ onChanged }: { onChanged?: () => void }) {
           </Cell>,
           <Cell key="host" mono className="text-wv-muted">
             {profile.host}:{profile.port}
+            {profile.dnsProfileId === SYSTEM_DNS_PROFILE_ID ? null : (
+              <span className="block truncate text-[11px]" data-testid={settingsIds.proxyDnsProfile(profile.id)}>
+                {t("next.proxies.dnsProfileDetail", { name: foundWithName(profile.dnsProfileId) })}
+              </span>
+            )}
           </Cell>,
           <Cell key="health" mono className="text-wv-muted" title={health[profile.id]}>
             {health[profile.id] ?? "—"}
@@ -354,9 +377,9 @@ export function ProxiesPanel({ onChanged }: { onChanged?: () => void }) {
         }
         onConfirm={() => {
           if (removing) {
-            void deleteProxy({ id: removing.id }).then((result) => {
+            void deleteProxy({ id: removing.id }).then(async (result) => {
               if (result.error) {
-                setRemoveError(refusalMessage(t, result.error));
+                setRemoveError(await namedRefusal(result.error));
                 return;
               }
               setRemoving(null);
@@ -423,8 +446,10 @@ export function ProxyEditor({
 }) {
   const t = useTranslate();
   const [, saveProxy] = useMutation(SAVE_PROXY_MUTATION);
+  const namedRefusal = useNamedRefusal();
   const [, deleteProxy] = useMutation(DELETE_PROXY_MUTATION);
   const [, resetTrust] = useMutation(RESET_PROXY_TRUST_MUTATION);
+  const dnsChoices = useProxyNameProfiles();
 
   const [form, setForm] = useState<ProxyForm>(() => (editing ? formFor(editing) : NEW_PROXY));
   // A stored profile opens on its details; a new one on the file most people have them in.
@@ -547,10 +572,8 @@ export function ProxyEditor({
       host: endpoint?.host || current.host,
       port: endpoint?.port ?? current.port,
       addresses: parsed.tunnelAddresses || current.addresses,
-      // The tunnel's DNS servers answer inside it, so the proxy resolves.
-      ...(parsed.tunnelDnsServers
-        ? { resolver: "PROXY" as const, dnsSource: "servers" as const, dns: parsed.tunnelDnsServers }
-        : {}),
+      // The tunnel's DNS servers answer inside it, so they are asked through it.
+      ...(parsed.tunnelDnsServers ? { dnsServers: splitList(parsed.tunnelDnsServers).join("\n") } : {}),
       peerPublicKey: parsed.peerPublicKey || current.peerPublicKey,
       mtu: digits(parsed.tunnelMtu, CONFIG_KEYS.mtu) || current.mtu,
       keepaliveSeconds: digits(keepalive, CONFIG_KEYS.keepalive) || current.keepaliveSeconds,
@@ -617,20 +640,18 @@ export function ProxyEditor({
         return;
       }
     }
-    if (dnsSource(clean) === "servers" && splitList(clean.dns).length === 0) {
-      setError(t("next.proxies.needsDns"));
-      return;
-    }
     setBusy(true);
     const result = await saveProxy({
       id: editingId === "new" ? null : editingId,
       input: proxyInput(clean),
     });
-    setBusy(false);
     if (result.error) {
-      setError(refusalMessage(t, result.error));
+      const sentence = await namedRefusal(result.error);
+      setBusy(false);
+      setError(sentence);
       return;
     }
+    setBusy(false);
     onClose();
     onChanged();
   };
@@ -656,6 +677,20 @@ export function ProxyEditor({
         min: 1,
         max: 65535,
         onChange: (next) => patch({ port: next }),
+      },
+    },
+    {
+      id: "proxyDnsProfile",
+      label: t("next.proxies.dnsProfile"),
+      help: t("next.proxies.dnsProfileHelp"),
+      control: {
+        kind: "select",
+        value: String(form.dnsProfileId),
+        // Until the profiles are read, the saved choice is the only one shown.
+        options: dnsChoices
+          ? dnsChoices.map((choice) => ({ value: String(choice.id), label: dnsProfileName(t, choice, "PROXY_NAME") }))
+          : [{ value: String(form.dnsProfileId), label: "…" }],
+        onChange: (next) => patch({ dnsProfileId: Number(next) }),
       },
     },
   ];
@@ -756,6 +791,17 @@ export function ProxyEditor({
           },
         },
         {
+          id: "dnsServers",
+          label: t("next.proxies.tunnelDns"),
+          help: t("next.proxies.tunnelDnsHelp"),
+          control: {
+            kind: "textarea",
+            value: form.dnsServers,
+            rows: 2,
+            onChange: (next) => patch({ dnsServers: next }),
+          },
+        },
+        {
           id: "mtu",
           label: "MTU",
           help: t("next.proxies.mtuHelp", { value: MTU_DEFAULT }),
@@ -777,6 +823,27 @@ export function ProxyEditor({
             onChange: (next) => patch({ keepaliveSeconds: next }),
           },
         },
+        {
+          id: "natpmp",
+          label: t("next.proxies.natpmp"),
+          control: { kind: "toggle", value: form.natpmp, onChange: (next) => patch({ natpmp: next }) },
+        },
+        // The gateway picks the port under NAT-PMP: there is none to give.
+        ...(form.natpmp
+          ? []
+          : [
+              {
+                id: "forwardedPort",
+                label: t("next.proxies.forwardedPort"),
+                control: {
+                  kind: "text" as const,
+                  value: form.forwardedPort,
+                  className: "w-[110px]",
+                  onChange: (next: string) =>
+                    patch({ forwardedPort: digits(next, []).slice(0, 5) }),
+                },
+              },
+            ]),
       ]
     : [
         {
@@ -846,55 +913,6 @@ export function ProxyEditor({
             ]
           : []),
       ];
-
-  const source = dnsSource(form);
-  const resolutionFields: FieldSpec[] = [
-    {
-      id: "resolver",
-      label: t("next.proxies.resolvedBy"),
-      control: {
-        kind: "segmented",
-        value: form.resolver,
-        options: [
-          { value: "WEAVER", label: t("next.proxies.resolverWeaver") },
-          { value: "PROXY", label: t("next.proxies.resolverProxy") },
-        ],
-        onChange: (next) => patch({ resolver: next as ProxyResolver }),
-      },
-    },
-    ...(isWireguard && form.resolver === "PROXY"
-      ? []
-      : [
-          {
-            id: "dnsSource",
-            label: t("next.proxies.using"),
-            control: {
-              kind: "segmented" as const,
-              value: form.dnsSource,
-              options: [
-                { value: "host", label: t("next.proxies.dnsHost") },
-                { value: "servers", label: t("next.proxies.dns") },
-              ],
-              onChange: (next: string) => patch({ dnsSource: next as DnsSource }),
-            },
-          },
-        ]),
-    ...(source === "servers"
-      ? [
-          {
-            id: "dns",
-            label: t("next.proxies.dns"),
-            help: t("next.proxies.dnsHelp"),
-            control: {
-              kind: "textarea" as const,
-              value: form.dns,
-              rows: 3,
-              onChange: (next: string) => patch({ dns: next }),
-            },
-          },
-        ]
-      : []),
-  ];
 
   const problemList = (problems: readonly string[]) =>
     problems.length === 0 ? null : (
@@ -1009,7 +1027,6 @@ export function ProxyEditor({
             note: t("next.proxies.secretsNote"),
             fields: credentialFields,
           },
-          { id: "resolution", title: t("next.proxies.resolution"), fields: resolutionFields },
         ]
       : []),
   ];
@@ -1020,6 +1037,7 @@ export function ProxyEditor({
         open
         title={editingId === "new" ? t("next.proxies.add") : (editing?.name ?? t("next.proxies.proxy"))}
         note={editingId === "new" ? undefined : proxyLabels[form.kind]}
+        testId={testIds.dialog("proxy")}
         width={620}
         sections={sections}
         error={error}

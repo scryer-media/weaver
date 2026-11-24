@@ -13,6 +13,7 @@ use crate::system::types::{
 use std::path::PathBuf;
 use std::sync::Arc;
 use weaver_nntp::pool::NntpPool;
+use weaver_server_core::operations::metrics_store::OperationsMetricsStoreQueries;
 use weaver_server_core::operations::{OnDemandSpace, Reach, StorageCapacity};
 
 #[derive(Default)]
@@ -156,11 +157,11 @@ impl SystemQuery {
         let max_download_speed = with_timed_config_read(
             config,
             "system.query.system_status.max_download_speed",
-            |cfg| cfg.max_download_speed.unwrap_or(0),
+            |cfg| cfg.bandwidth.download_bps,
         )
         .await;
         let global_state = global_queue_state(
-            handle.is_globally_paused(),
+            &handle.state().holds(),
             &handle.get_download_block(),
             max_download_speed,
         );
@@ -169,6 +170,28 @@ impl SystemQuery {
             global_state,
             summary: crate::jobs::paging::summary(state, &metrics),
         })
+    }
+    /// Whether torrents are on and whether there are torrents: the same
+    /// reading `systemMetricsUpdates` carries as `torrents`.
+    #[graphql(guard = "ReadGuard")]
+    async fn torrent_presence(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<crate::system::types::TorrentPresence> {
+        let enabled = ctx.data::<SharedConfig>()?.read().await.torrent.enabled;
+        Ok(crate::system::types::TorrentPresence::of(
+            *ctx.data::<weaver_server_core::torrents::TorrentAvailability>()?,
+            enabled,
+            ctx.data_opt::<weaver_server_core::torrents::service::TorrentService>(),
+        ))
+    }
+    /// What every torrent downloads and uploads right now: the same reading
+    /// `systemMetricsUpdates` carries as `torrentRates`.
+    #[graphql(guard = "ReadGuard")]
+    async fn torrent_rates(&self, ctx: &Context<'_>) -> Result<crate::system::types::TorrentRates> {
+        Ok(crate::system::types::TorrentRates::of(
+            ctx.data_opt::<weaver_server_core::torrents::service::TorrentService>(),
+        ))
     }
     /// System metrics facade for integrations.
     #[graphql(guard = "ReadGuard")]
@@ -200,6 +223,69 @@ impl SystemQuery {
         .await
         .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
         .map_err(|error| graphql_error("INTERNAL", error))
+    }
+    /// Data used per day by each server or category: today, this week (from
+    /// Monday), this month, this year, all time and the asked range, each
+    /// date in the range, and the jobs finished today and in the range. All
+    /// dates are this host's local dates.
+    #[graphql(guard = "ReadGuard")]
+    async fn usage_history(
+        &self,
+        ctx: &Context<'_>,
+        range: crate::system::usage_history::UsageRange,
+        kind: Option<crate::system::usage_history::UsageConsumerKindGql>,
+    ) -> Result<crate::system::usage_history::UsageHistory> {
+        use crate::system::usage_history::{load_usage_history, local_today, usage_period};
+        let period = usage_period(&range)
+            .map_err(|error| graphql_error("INVALID_INPUT", error.to_string()))?;
+        let db = ctx.data::<Database>()?.clone();
+        tokio::task::spawn_blocking(move || {
+            load_usage_history(&db, local_today(), period, kind.map(Into::into))
+        })
+        .await
+        .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
+        .map_err(|error| graphql_error("INTERNAL", error.to_string()))
+    }
+    /// NZB jobs finished and repaired per day, each stage's runs and time,
+    /// and, from the history of the jobs that finished in the range, the
+    /// recovery they posted and fetched and why the failed ones failed.
+    #[graphql(guard = "ReadGuard")]
+    async fn integrity_history(
+        &self,
+        ctx: &Context<'_>,
+        range: crate::system::usage_history::UsageRange,
+    ) -> Result<crate::system::usage_history::IntegrityHistory> {
+        use crate::system::usage_history::{load_integrity_history, local_today, usage_period};
+        let period = usage_period(&range)
+            .map_err(|error| graphql_error("INVALID_INPUT", error.to_string()))?;
+        let db = ctx.data::<Database>()?.clone();
+        tokio::task::spawn_blocking(move || load_integrity_history(&db, local_today(), period))
+            .await
+            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
+            .map_err(|error| graphql_error("INTERNAL", error.to_string()))
+    }
+    /// Torrent data per day, all together and by tracker: from peers, to
+    /// peers and seeding time; and the peers connected now.
+    #[graphql(guard = "ReadGuard")]
+    async fn torrent_history(
+        &self,
+        ctx: &Context<'_>,
+        range: crate::system::usage_history::UsageRange,
+    ) -> Result<crate::system::usage_history::TorrentHistory> {
+        use crate::system::usage_history::{
+            TorrentPeers, load_torrent_history, local_today, usage_period,
+        };
+        let period = usage_period(&range)
+            .map_err(|error| graphql_error("INVALID_INPUT", error.to_string()))?;
+        let peers = ctx
+            .data_opt::<weaver_server_core::torrents::service::TorrentService>()
+            .map(|torrents| TorrentPeers::of(&torrents.metrics().published))
+            .unwrap_or_default();
+        let db = ctx.data::<Database>()?.clone();
+        tokio::task::spawn_blocking(move || load_torrent_history(&db, local_today(), period, peers))
+            .await
+            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
+            .map_err(|error| graphql_error("INTERNAL", error.to_string()))
     }
     #[graphql(guard = "AdminGuard")]
     async fn browse_directories(
@@ -258,8 +344,9 @@ impl SystemQuery {
         let storage = ctx
             .data_opt::<weaver_server_core::SharedPipelineState>()
             .and_then(|state| state.storage_capacity());
+        let drive = drive(storage.as_deref(), &requested);
         let space = StorageCapacity::path_space(storage.as_deref(), requested).await;
-        storage_row(Vec::new(), label, space)
+        storage_row(Vec::new(), label, space, drive)
     }
     /// Return recent log records from the in-memory ring buffer.
     #[graphql(guard = "AdminGuard")]
@@ -443,19 +530,34 @@ async fn configured_storage(
                     path,
                     capacity: None,
                     error: Some(error),
+                    drive: None,
                 },
                 None => storage_row(
                     input.labels,
                     path,
                     spaces.next().expect("one answer per ask"),
+                    drive(storage, &input.path),
                 ),
             }
         })
         .collect()
 }
 
+// The drive the disk owner holds `path` on, from its memory alone: a path
+// it has not read yet is queued to be read off this thread and answers
+// null until then.
+fn drive(storage: Option<&StorageCapacity>, path: &std::path::Path) -> Option<String> {
+    let volume = storage?.volume(path);
+    volume.device.is_some().then(|| volume.label.clone())
+}
+
 // A row from the disk owner's answer.
-fn storage_row(labels: Vec<String>, path: String, space: OnDemandSpace) -> ConfiguredStorage {
+fn storage_row(
+    labels: Vec<String>,
+    path: String,
+    space: OnDemandSpace,
+    drive: Option<String>,
+) -> ConfiguredStorage {
     let (capacity, error) = match space {
         OnDemandSpace::Read(space) => (Some(disk_capacity(space)), None),
         OnDemandSpace::Failed(error) => (None, Some(unavailable(&error))),
@@ -467,6 +569,7 @@ fn storage_row(labels: Vec<String>, path: String, space: OnDemandSpace) -> Confi
         path,
         capacity,
         error,
+        drive,
     }
 }
 
@@ -653,6 +756,7 @@ async fn collect_server_health(
         penalty_until: Option<u64>,
         open: u32,
         busy: u32,
+        server_id: Option<u32>,
     }
 
     let configs = pool.server_configs();
@@ -679,6 +783,9 @@ async fn collect_server_health(
                 penalty_until,
                 open,
                 busy,
+                server_id: pool
+                    .stable_server_id(weaver_nntp::ServerId(idx))
+                    .map(|id| id.0),
             }
         })
         .collect();
@@ -695,6 +802,7 @@ async fn collect_server_health(
     }
 
     let health = pool.health().lock().await;
+    let now = std::time::Instant::now();
     pre.into_iter()
         .enumerate()
         .map(|(idx, snapshot)| {
@@ -762,6 +870,8 @@ async fn collect_server_health(
                 failure_count: srv.failure_count,
                 consecutive_failures: srv.consecutive_failures,
                 premature_deaths: health.recent_premature_deaths(idx) as u32,
+                down: srv.state().is_down(now),
+                server_id: snapshot.server_id,
                 pool_index: idx,
                 stable_server_id: pool
                     .stable_server_id(weaver_nntp::ServerId(idx))

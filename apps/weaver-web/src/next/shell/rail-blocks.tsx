@@ -4,8 +4,9 @@
 import { Fragment, memo, type ReactNode } from "react";
 import { Link, NavLink, useLocation } from "react-router";
 import { useQuery } from "urql";
-import { SERVERS_QUERY, SYSTEM_INFO_QUERY } from "@/graphql/queries";
+import { JOB_TAGS_QUERY, SERVERS_QUERY, SYSTEM_INFO_QUERY } from "@/graphql/queries";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
+import type { JobProtocol } from "@/lib/job-types";
 import { cn } from "@/lib/utils";
 import { RailBlock, RailMetric } from "./NextShell";
 import { Bar, Square } from "../components/chrome";
@@ -19,8 +20,10 @@ import {
 } from "../data/next-data";
 import { sameItems } from "../data/settled";
 import { categoryColor, UNCATEGORISED_COLOR, WV } from "../data/palette";
+import { UNTAGGED } from "../data/tags";
+import { jobIds } from "../testids";
 import { useNow } from "../data/clock";
-import { formatClock, formatDayClock, formatLatency, splitUptime } from "../data/format";
+import { formatClock, formatDayClock, formatLatency, formatRate, splitUptime } from "../data/format";
 import { providerActivityLabel, type ProviderActivity } from "../data/provider-activity";
 import { countLabel, providerStateLabel } from "../i18n/labels";
 
@@ -192,7 +195,7 @@ export function useAttentionItems(): AttentionItem[] {
 }
 
 function attentionItems(
-  { providers, holdoffs, downloadBlock, isPaused }: NextData,
+  { providers, holdoffs, downloadBlock, diskVolumes, isPaused }: NextData,
   t: Translate,
   now: number,
 ): AttentionItem[] {
@@ -257,6 +260,20 @@ function attentionItems(
                 : formatClock(downloadBlock.windowEndsAtEpochMs),
           })
         : t("next.monitoring.egressLink"),
+      color: WV.warn,
+    });
+  }
+
+  // One row per volume the daemon finds slow; each goes when its vote clears.
+  for (const volume of diskVolumes) {
+    if (!volume.slow) continue;
+    items.push({
+      id: `slow-disk:${volume.label}`,
+      text:
+        volume.writeRateBytesPerSec > 0
+          ? t("next.attention.slowDisk", { rate: formatRate(volume.writeRateBytesPerSec) })
+          : t("next.attention.slowDiskUnmeasured"),
+      meta: volume.label,
       color: WV.warn,
     });
   }
@@ -339,38 +356,144 @@ export function CategoryListBlock({
             ? UNCATEGORISED_COLOR
             : categoryColor(item.key);
         return (
-          <button
+          <FacetButton
             key={item.key ?? "*"}
-            type="button"
+            active={isActive}
+            color={color}
+            count={item.count}
             onClick={() => (item.key === null ? onClear() : onToggle(item.key))}
-            aria-pressed={isActive}
-            className={cn(
-              "flex items-center gap-[9px] text-left text-[12.5px]",
-              isActive ? "font-medium text-wv-strong" : "text-wv-fg hover:text-wv-secondary",
-            )}
           >
-            {/*
-              The swatch doubles as the checkbox: solid once the facet is on,
-              a ring of the same colour while it is off. One glyph, so a rail
-              of eight categories does not grow a column of empty boxes.
-            */}
-            <Square color={color} hollow={!isActive} />
-            <span className="min-w-0 truncate">
-              {item.key === null
-                ? t("next.categories.all")
-                : item.key === UNCATEGORISED
-                  ? t("next.categories.uncategorised")
-                  : item.label}
-            </span>
-            {item.count === undefined ? null : (
-              <span className="ml-auto flex-none font-wv-mono text-[11px] text-wv-faint">
-                {item.count}
-              </span>
-            )}
-          </button>
+            {item.key === null
+              ? t("next.categories.all")
+              : item.key === UNCATEGORISED
+                ? t("next.categories.uncategorised")
+                : item.label}
+          </FacetButton>
         );
       })}
     </RailBlock>
+  );
+}
+
+/** Which kind of download the list shows; null shows both. */
+export type ProtocolFacet = JobProtocol | null;
+
+/**
+ * The rail's other facet block on Downloads: torrents, Usenet, or both.
+ *
+ * One pick at a time, since picking both is what All already means. A count is
+ * the rows that pick would show under the other filters.
+ */
+export function ProtocolFilterBlock({
+  counts,
+  selected,
+  onSelect,
+}: {
+  counts: Readonly<Record<JobProtocol | "ALL", number>>;
+  selected: ProtocolFacet;
+  onSelect: (facet: ProtocolFacet) => void;
+}) {
+  const t = useTranslate();
+  const items: { facet: ProtocolFacet; label: string; count: number }[] = [
+    { facet: null, label: t("history.filterAll"), count: counts.ALL },
+    { facet: "TORRENT", label: t("next.protocol.torrent"), count: counts.TORRENT },
+    { facet: "NZB", label: t("next.protocol.usenet"), count: counts.NZB },
+  ];
+  return (
+    <RailBlock eyebrow={t("next.protocol.type")} position="middle" className="gap-[9px]">
+      {items.map((item) => (
+        <FacetButton
+          key={item.facet ?? "*"}
+          active={item.facet === selected}
+          color={UNCATEGORISED_COLOR}
+          count={item.count}
+          onClick={() => onSelect(item.facet)}
+        >
+          {item.label}
+        </FacetButton>
+      ))}
+    </RailBlock>
+  );
+}
+
+/**
+ * The rail's tag filter: one tag, jobs with none, or every job. Shown once a
+ * tag is made.
+ */
+export function TagFilterBlock({
+  selected,
+  onSelect,
+}: {
+  selected: string | null;
+  onSelect: (tag: string | null) => void;
+}) {
+  const t = useTranslate();
+  const [{ data }] = useQuery<{ jobTags: { name: string; count: number }[] }>({
+    query: JOB_TAGS_QUERY,
+  });
+  const tags = data?.jobTags ?? [];
+  if (tags.length === 0 && selected === null) return null;
+  const items: { tag: string | null; label: string }[] = [
+    { tag: null, label: t("next.tags.all") },
+    ...tags.map(({ name }) => ({ tag: name, label: name })),
+    { tag: UNTAGGED, label: t("next.tags.none") },
+  ];
+  return (
+    <RailBlock eyebrow={t("next.tags.title")} position="middle" className="gap-[9px]">
+      {items.map((item) => (
+        <FacetButton
+          key={item.tag ?? "*"}
+          active={item.tag === selected}
+          color={UNCATEGORISED_COLOR}
+          count={undefined}
+          onClick={() => onSelect(item.tag)}
+          testId={item.tag === null ? undefined : jobIds.tagFilter(item.tag)}
+        >
+          {item.label}
+        </FacetButton>
+      ))}
+    </RailBlock>
+  );
+}
+
+/** One facet in a rail block: its swatch, its name, its count. */
+function FacetButton({
+  active,
+  color,
+  count,
+  onClick,
+  children,
+  testId,
+}: {
+  active: boolean;
+  color: string;
+  count: number | undefined;
+  onClick: () => void;
+  children: ReactNode;
+  testId?: string;
+}) {
+  return (
+    <button
+      type="button"
+      data-testid={testId}
+      onClick={onClick}
+      aria-pressed={active}
+      className={cn(
+        "flex items-center gap-[9px] text-left text-[12.5px]",
+        active ? "font-medium text-wv-strong" : "text-wv-fg hover:text-wv-secondary",
+      )}
+    >
+      {/*
+        The swatch doubles as the checkbox: solid once the facet is on,
+        a ring of the same colour while it is off. One glyph, so a rail
+        of eight categories does not grow a column of empty boxes.
+      */}
+      <Square color={color} hollow={!active} />
+      <span className="min-w-0 truncate">{children}</span>
+      {count === undefined ? null : (
+        <span className="ml-auto flex-none font-wv-mono text-[11px] text-wv-faint">{count}</span>
+      )}
+    </button>
   );
 }
 

@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent } from "react";
+import { useNavigate } from "react-router";
 import { useClient, useMutation, useQuery, useSubscription, type TypedDocumentNode } from "urql";
 import {
   CANCEL_JOB_MUTATION,
@@ -10,18 +11,22 @@ import {
   PAUSE_ALL_MUTATION,
   PAUSE_JOB_MUTATION,
   PAUSE_QUEUE_ITEMS_MUTATION,
+  PAUSE_CLASS_MUTATION,
+  RECHECK_TORRENT_MUTATION,
   RESUME_ALL_MUTATION,
   RESUME_JOB_MUTATION,
   RESUME_QUEUE_ITEMS_MUTATION,
+  RESUME_CLASS_MUTATION,
   SET_QUEUE_ITEMS_CATEGORY_MUTATION,
   SET_QUEUE_ITEMS_PRIORITY_MUTATION,
-  SYSTEM_INFO_QUERY,
+  STORAGE_VOLUMES_QUERY,
 } from "@/graphql/queries";
-import { formatJobReleaseName, type JobData } from "@/lib/job-types";
+import { formatJobReleaseName, type JobData, type JobProtocol } from "@/lib/job-types";
 import { cn } from "@/lib/utils";
 import { formatEtaFromRemainingBytes, useStableEtaSpeed } from "@/lib/hooks/use-stable-queue-eta";
 import { useTranslate } from "@/lib/context/translate-context";
 import { statusToken } from "@/lib/status-tokens";
+import { showsSeeding, torrentErrorText, torrentStateLabelKey, type TorrentSummaryData } from "@/lib/torrents";
 import { BulkBar, BulkButton, BulkCluster, BulkMenu } from "../components/BulkBar";
 import { EmptyState, MetricCell, SectionHeader } from "../components/chrome";
 import { ConfirmDialog } from "../components/ConfirmDialog";
@@ -32,16 +37,19 @@ import { Pagination } from "../components/Pagination";
 import { StorageMounts, type StorageVolume } from "../components/storage";
 import { Tabs } from "../components/Tabs";
 import { useNextData } from "../data/next-data";
-import { testIds } from "../testids";
+import { testIds, torrentIds as torrentTestIds } from "../testids";
 import { sameElements, sameEntries, sameItems, shallowEqual, useSettled } from "../data/settled";
 import {
   batchTarget,
   conflictCount,
   departedId,
+  diskPace,
   etaById as etaByIdFrom,
   groupCounts as groupCountsFrom,
+  nothingDownloading,
   queuePageInput,
   queueSelection,
+  slowDiskRate,
   tabCounts as tabCountsFrom,
   withoutIds,
   type QueueBatchTarget,
@@ -63,20 +71,34 @@ import {
   DOWNLOAD_GROUP_LABEL,
   DOWNLOAD_GROUP_NOTE,
   DOWNLOAD_GROUP_ORDER,
+  diskDetail,
   downloadGroup,
   useStatusLabel,
   type DownloadGroup,
 } from "../data/status";
 import { countLabel } from "../i18n/labels";
 import { NextShell } from "../shell/NextShell";
-import { AttentionBlock, CategoryListBlock, ProvidersBlock } from "../shell/rail-blocks";
+import {
+  AttentionBlock,
+  CategoryListBlock,
+  ProtocolFilterBlock,
+  TagFilterBlock,
+  ProvidersBlock,
+  type ProtocolFacet,
+} from "../shell/rail-blocks";
 import { AddNzbDialog } from "../features/AddNzbDialog";
+import { ScheduleSeedingNote } from "../features/torrents/ScheduleSeedingNote";
+import { FilesMissingDialog, isFilesMissing, stillFilesMissing } from "../features/torrents/FilesMissingDialog";
+import { TorrentRemoveDialog } from "../features/torrents/TorrentRemoveDialog";
+import { useTorrentSummaries } from "../data/use-torrents";
+import { useTorrentAddsOffered, useTorrentsShown } from "../data/use-torrents-shown";
 import { SpeedLimitControl, useSpeedLimitInForce } from "../features/SpeedLimitDialog";
 import { DownloadInspector } from "./downloads/DownloadInspector";
 import { DownloadRow } from "./downloads/DownloadRow";
 import { QueueEtaContext } from "./downloads/queue-eta";
 
-type TabId = QueueTab;
+/** All, then the state tabs; All is no state filter. */
+type TabId = "all" | QueueTab;
 type SortId = QueueSort;
 
 /** Each sort and the key of its label. */
@@ -233,13 +255,24 @@ function TimedResumeButton({ resumeAt, onResume }: { resumeAt: number; onResume:
 }
 
 export function DownloadsPage() {
-  const { queue, categories: configured, speed, isPaused, resumeAt, downloadBlock } = useNextData();
-  const { inForce: speedLimit } = useSpeedLimitInForce();
+  const { queue, categories: configured, speed, isPaused, pausedClasses, resumeAt, downloadBlock, diskVolumes } =
+    useNextData();
+  // The ETA's cap; 0 is none.
+  const speedLimit = useSpeedLimitInForce().inForce ?? 0;
   const statusLabel = useStatusLabel();
   const t = useTranslate();
+  const torrentsOn = useTorrentsShown();
+  // The empty text and the drop hint ask for torrents only while torrents are on.
+  const torrentAdds = useTorrentAddsOffered();
 
   const [facets, setFacets] = useState<ReadonlySet<string>>(NO_FACETS);
-  const [tab, setTab] = useState<TabId>("all");
+  const [pickedProtocol, setProtocol] = useState<ProtocolFacet>(null);
+  // The protocol filter is torrent-only: while it is hidden it filters nothing.
+  const protocol = torrentsOn ? pickedProtocol : null;
+  const [tag, setTag] = useState<string | null>(null);
+  const [pickedTab, setTab] = useState<TabId>("all");
+  // The Seeding tab is torrent-only: while it is hidden the list falls back to All.
+  const tab: TabId = !torrentsOn && pickedTab === "seeding" ? "all" : pickedTab;
   const [sort, setSort] = useState<SortId>("priority");
   const [query, setQuery] = useState("");
   const [pageIndex, setPageIndex] = useState(0);
@@ -263,6 +296,14 @@ export function DownloadsPage() {
   const [confirmCancel, setConfirmCancel] = useState(false);
   // The one row whose cancel button is waiting on confirmation.
   const [confirmRowCancel, setConfirmRowCancel] = useState<number | null>(null);
+  // The one torrent whose remove is waiting on confirmation.
+  const [removeTorrentId, setRemoveTorrentId] = useState<number | null>(null);
+  // The torrent whose Resume found its files missing.
+  const [filesMissingId, setFilesMissingId] = useState<number | null>(null);
+  const [, recheckTorrent] = useMutation(RECHECK_TORRENT_MUTATION);
+  const navigate = useNavigate();
+  // A double-clicked row opens the job's own screen, where the inspector's detail link goes.
+  const openJob = useCallback((id: number) => void navigate(`/jobs/${id}`), [navigate]);
   // A selection batch the daemon refused because the queue moved since the
   // operator confirmed it: the count it matches now, and the batch to run again.
   const [reconfirm, setReconfirm] = useState<{ matched: number; run: () => void } | null>(null);
@@ -270,14 +311,20 @@ export function DownloadsPage() {
 
   const client = useClient();
 
+  const [, pauseClass] = useMutation(PAUSE_CLASS_MUTATION);
+  const [, resumeClass] = useMutation(RESUME_CLASS_MUTATION);
+  const torrentsPaused = pausedClasses.includes("TORRENT");
   const [, pauseJob] = useMutation(PAUSE_JOB_MUTATION);
   const [, resumeJob] = useMutation(RESUME_JOB_MUTATION);
   const [, cancelJob] = useMutation<{ cancelJob: boolean }>(CANCEL_JOB_MUTATION);
   const [{ data: systemInfo }] = useQuery<{
     systemInfo: { configuredStorage: StorageVolume[] };
-  }>({ query: SYSTEM_INFO_QUERY });
+  }>({ query: STORAGE_VOLUMES_QUERY });
 
-  const selection = useMemo(() => queueSelection({ tab, facets, query }), [facets, query, tab]);
+  const selection = useMemo(
+    () => queueSelection({ tab: tab === "all" ? null : tab, facets, query, protocol, tag }),
+    [facets, protocol, query, tab, tag],
+  );
   const input = useMemo(
     () => queuePageInput(selection, sort, pageIndex, pageSize),
     [pageIndex, pageSize, selection, sort],
@@ -308,6 +355,23 @@ export function DownloadsPage() {
     [page.jobs, removedIds],
   );
 
+  // Only the torrents on the page are followed.
+  const torrentIds = useMemo(
+    () => jobs.filter((job) => job.protocol === "TORRENT").map((job) => job.id),
+    [jobs],
+  );
+  const torrents = useTorrentSummaries(torrentIds);
+  const seedingColumn = torrentsOn && [...torrents.values()].some((torrent) => showsSeeding(torrent.state));
+  // The row handlers read a job's protocol by id, so they keep their identity while the rows move.
+  const jobsRef = useRef(jobs);
+  const torrentsRef = useRef(torrents);
+  useLayoutEffect(() => {
+    jobsRef.current = jobs;
+    torrentsRef.current = torrents;
+  });
+  const isTorrent = useCallback((id: number) => jobsRef.current.find((job) => job.id === id)?.protocol === "TORRENT", []);
+
+
   // The time-left speed samples the bytes the estimate counts across the whole
   // queue, which the daemon totals; the page holds only its own rows.
   const etaSample = useMemo(
@@ -325,11 +389,18 @@ export function DownloadsPage() {
         : [],
     [page.etaDownloadedBytes, page.etaTotalBytes],
   );
-  const etaConditions = useMemo(() => ({ paused: isPaused, speedLimit }), [isPaused, speedLimit]);
+  const idle = useMemo(() => nothingDownloading(page.stateCounts), [page.stateCounts]);
+  const diskRate = useMemo(() => slowDiskRate(diskVolumes), [diskVolumes]);
+  const etaConditions = useMemo(
+    () => ({ paused: isPaused, speedLimit, idle, diskRate }),
+    [isPaused, speedLimit, idle, diskRate],
+  );
   const etaSpeed = useStableEtaSpeed(etaSample, speed, etaConditions);
+  // A row a slow disk holds back runs at that disk's rate, not the download speed.
+  const pace = useMemo(() => diskPace(jobs, diskVolumes), [jobs, diskVolumes]);
   const estimates = useMemo(
-    () => etaByIdFrom(page.etaThrough, etaSpeed, formatEtaFromRemainingBytes),
-    [etaSpeed, page.etaThrough],
+    () => etaByIdFrom(page.etaThrough, etaSpeed, formatEtaFromRemainingBytes, pace),
+    [etaSpeed, page.etaThrough, pace],
   );
   // Kept while every estimate reads the same, so the rows' time-left text is
   // drawn again only when some of it changes.
@@ -346,6 +417,17 @@ export function DownloadsPage() {
       [configured, page.categoryCounts, queue.categories],
     ),
     sameItems,
+  );
+
+  const protocolCounts = useSettled(
+    useMemo(() => {
+      const count = (protocol: JobProtocol) =>
+        page.protocolCounts.find((entry) => entry.protocol === protocol)?.count ?? 0;
+      const torrents = count("TORRENT");
+      const usenet = count("NZB");
+      return { ALL: torrents + usenet, TORRENT: torrents, NZB: usenet };
+    }, [page.protocolCounts]),
+    shallowEqual,
   );
 
   const grouped = useMemo(() => {
@@ -580,9 +662,18 @@ export function DownloadsPage() {
 
   const pauseRow = useCallback(
     (id: number, paused: boolean) => {
-      void (paused ? pauseJob({ id }) : resumeJob({ id }));
+      const wasMissing = !paused && isFilesMissing(torrentsRef.current.get(id)?.state);
+      void (paused ? pauseJob({ id }) : resumeJob({ id })).then(async (result) => {
+        if (result.error) setReport(torrentErrorText(result.error));
+        refreshQueue();
+        if (!result.error && wasMissing && (await stillFilesMissing(client, id))) setFilesMissingId(id);
+      });
     },
-    [pauseJob, resumeJob],
+    [client, pauseJob, refreshQueue, resumeJob],
+  );
+  const askCancelRow = useCallback(
+    (id: number) => (isTorrent(id) ? setRemoveTorrentId(id) : setConfirmRowCancel(id)),
+    [isTorrent],
   );
 
   // Like the bulk cancel: the row leaves the moment the cancel is sent and
@@ -618,21 +709,32 @@ export function DownloadsPage() {
   const blockLabel =
     downloadBlock.kind === "SERVER_QUOTA" ? t("jobs.serverQuotaBadge") : t("jobs.egressQuotaBadge");
 
+  // A speed test holds the queue on its own, apart from a pause.
+  const heldBy =
+    downloadBlock.kind === "SPEED_TEST" ? t("jobs.speedTestBadge") : t("next.downloads.waitPaused");
+
   /** What stands in for time left while a download is held; null when it is not. */
   const heldValue = useCallback(
     (job: JobData): string | null => {
       if (statusToken(job.status) === "paused") return t("next.downloads.waitPaused");
       if (HELD_BACK_STATUSES.has(job.status)) {
         if (blocked) return blockEta;
-        if (isPaused) return t("next.downloads.waitPaused");
+        if (isPaused) return heldBy;
+        // The torrents' own hold reads on its rows as the queue's pause does.
+        if (torrentsPaused && job.protocol === "TORRENT") return t("next.downloads.waitPaused");
       }
       return null;
     },
-    [blockEta, blocked, isPaused, t],
+    [blockEta, blocked, heldBy, isPaused, t, torrentsPaused],
   );
   const holdValue = useCallback(
     (job: JobData): string | null => (blocked && HELD_BACK_STATUSES.has(job.status) ? blockLabel : null),
     [blockLabel, blocked],
+  );
+  /** What the download is doing with its disk, in full; null when the row shows nothing of it. */
+  const diskValue = useCallback(
+    (job: JobData): string | null => diskDetail(t, job, diskVolumes),
+    [t, diskVolumes],
   );
 
   return (
@@ -649,8 +751,22 @@ export function DownloadsPage() {
             className="w-[132px] sm:w-[224px]"
           />
           <PauseAllControl paused={isPaused} resumeAt={resumeAt} />
+          {torrentsOn ? (
+            <>
+              <ScheduleSeedingNote torrents={torrents} />
+              <SecondaryButton
+                icon={torrentsPaused ? "resume" : "pause"}
+                testId={torrentsPaused ? torrentTestIds.resumeTorrents : torrentTestIds.pauseTorrents}
+                onClick={() => {
+                  void (torrentsPaused ? resumeClass({ class: "TORRENT" }) : pauseClass({ class: "TORRENT" }));
+                }}
+              >
+                {torrentsPaused ? t("next.downloads.resumeTorrents") : t("next.downloads.pauseTorrents")}
+              </SecondaryButton>
+            </>
+          ) : null}
           <SpeedLimitControl />
-          <PrimaryButton icon="add" onClick={() => setUploadOpen(true)}>{t("next.addNzb.title")}</PrimaryButton>
+          <PrimaryButton icon="add" onClick={() => setUploadOpen(true)} testId={torrentTestIds.addOpen}>{t("next.addNzb.title")}</PrimaryButton>
         </>
       }
       railMiddle={
@@ -659,12 +775,20 @@ export function DownloadsPage() {
               looks stalled, so Downloads says so rather than leaving it to the
               diagnostic screens. The block draws nothing when all is well. */}
           <AttentionBlock />
+          {torrentsOn ? (
+            <ProtocolFilterBlock
+              counts={protocolCounts}
+              selected={protocol}
+              onSelect={(facet) => reset(() => setProtocol(facet))}
+            />
+          ) : null}
           <CategoryListBlock
             items={categories}
             selected={facets}
             onToggle={(key) => reset(() => setFacets((current) => toggleFacet(current, key)))}
             onClear={() => reset(() => setFacets(NO_FACETS))}
           />
+          <TagFilterBlock selected={tag} onSelect={(next) => reset(() => setTag(next))} />
         </>
       }
       railFooter={<ProvidersBlock />}
@@ -694,13 +818,17 @@ export function DownloadsPage() {
 
           <Tabs
             tabs={[
-              { id: "all", label: t("history.filterAll"), count: tabCounts.all },
-              { id: "active", label: t("next.downloads.tabActive"), count: tabCounts.active },
-              { id: "queued", label: t("status.queued"), count: tabCounts.queued },
-              { id: "paused", label: t("status.paused"), count: tabCounts.paused },
+              { id: "all" as const, label: t("history.filterAll"), count: tabCounts.all },
+              { id: "downloading" as const, label: t("next.downloads.tabDownloading"), count: tabCounts.downloading },
+              ...(torrentsOn
+                ? [{ id: "seeding" as const, label: t("next.downloads.tabSeeding"), count: tabCounts.seeding }]
+                : []),
+              { id: "queued" as const, label: t("status.queued"), count: tabCounts.queued },
+              { id: "paused" as const, label: t("status.paused"), count: tabCounts.paused },
             ]}
             active={tab}
             onSelect={(next) => reset(() => setTab(next))}
+            testId="queue"
             center={
               pickedCount === 0 ? undefined : (
                 <BulkCluster count={pickedCount} onClear={clearPicked}>
@@ -806,9 +934,10 @@ export function DownloadsPage() {
           setUploadOpen(true);
         }}
       >
+        {/* The rows lay out by the list's own width, which the inspector beside it takes from. */}
         <div
           aria-busy={showingStale}
-          className={`flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list${showingStale ? " opacity-60" : ""}`}
+          className={`@container flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list${showingStale ? " opacity-60" : ""}`}
         >
           {page.isLoading ? (
             <EmptyState loading title={t("next.common.loading")} body={t("next.downloads.loadingBody")} />
@@ -817,7 +946,7 @@ export function DownloadsPage() {
               centered
               testId={testIds.queueEmpty}
               title={t("next.downloads.emptyTitle")}
-              body={t("next.downloads.emptyBody")}
+              body={t(torrentAdds ? "next.downloads.emptyBody" : "next.downloads.emptyBodyNzb")}
               action={<PrimaryButton icon="add" onClick={() => setUploadOpen(true)}>{t("next.addNzb.title")}</PrimaryButton>}
             />
           ) : jobs.length === 0 ? (
@@ -839,12 +968,16 @@ export function DownloadsPage() {
                   picked={picked}
                   onToggleGroup={toggleGroup}
                   onSelect={setSelectedId}
+                  onOpen={openJob}
                   onPick={togglePicked}
                   statusLabel={statusLabel}
                   onPause={pauseRow}
-                  onCancel={setConfirmRowCancel}
+                  onCancel={askCancelRow}
+                  torrents={torrents}
+                  seedingColumn={seedingColumn}
                   heldOf={heldValue}
                   holdOf={holdValue}
+                  diskOf={diskValue}
                 />
               ))}
             </QueueEtaContext>
@@ -852,7 +985,7 @@ export function DownloadsPage() {
         </div>
         {dropping ? (
           <div className="pointer-events-none absolute inset-0 flex items-center justify-center border border-dashed border-wv-accent bg-wv-selected">
-            <span className="text-[13px] font-medium text-wv-strong">{t("next.downloads.dropHint")}</span>
+            <span className="text-[13px] font-medium text-wv-strong">{t(torrentAdds ? "next.downloads.dropHint" : "next.downloads.dropHintNzb")}</span>
           </div>
         ) : null}
       </div>
@@ -863,6 +996,7 @@ export function DownloadsPage() {
           job={selected}
           eta={heldValue(selected) ?? etaById.get(selected.id) ?? EM_DASH}
           rate={ratePhase(selected.phaseProgress)?.rateBps ?? 0}
+          torrent={torrents.get(selected.id) ?? null}
           onRemoved={handleRemoved}
         />
       )}
@@ -906,6 +1040,49 @@ export function DownloadsPage() {
         onDismiss={() => setConfirmRowCancel(null)}
       />
 
+      <FilesMissingDialog
+        open={filesMissingId !== null}
+        note={(() => {
+          const job = jobs.find((candidate) => candidate.id === filesMissingId);
+          return job ? formatJobReleaseName(job) : undefined;
+        })()}
+        onDismiss={() => setFilesMissingId(null)}
+        onRecheck={() => {
+          const id = filesMissingId;
+          setFilesMissingId(null);
+          if (id === null) return;
+          void recheckTorrent({ id }).then((result) => {
+            if (result.error) setReport(torrentErrorText(result.error));
+            refreshQueue();
+          });
+        }}
+        other={{
+          label: t("next.inspector.openDetail"),
+          onConfirm: () => {
+            if (filesMissingId !== null) void navigate(`/jobs/${filesMissingId}`);
+          },
+        }}
+      />
+
+      <TorrentRemoveDialog
+        id={removeTorrentId}
+        goalLeft={removeTorrentId === null ? null : (torrents.get(removeTorrentId)?.seedingGoalLeft ?? null)}
+        name={(() => {
+          const job = jobs.find((candidate) => candidate.id === removeTorrentId);
+          return job ? formatJobReleaseName(job) : undefined;
+        })()}
+        onRemoved={(id) => {
+          setRemoveTorrentId(null);
+          handleRemoved(id);
+          refreshQueue();
+        }}
+        onFailed={(message) => {
+          setRemoveTorrentId(null);
+          setReport(message);
+        }}
+        onDismiss={() => setRemoveTorrentId(null)}
+      />
+
       <AddNzbDialog
         open={uploadOpen}
         initialFiles={droppedFiles}
@@ -939,12 +1116,18 @@ interface QueueGroupProps {
   picked: ReadonlySet<number>;
   onToggleGroup: (group: DownloadGroup) => void;
   onSelect: (id: number) => void;
+  /** Open a job's own screen, the one the inspector's detail link goes to. */
+  onOpen: (id: number) => void;
   onPick: (id: number) => void;
   statusLabel: (status: string) => string;
   onPause: (id: number, paused: boolean) => void;
   onCancel: (id: number) => void;
   heldOf: (job: JobData) => string | null;
   holdOf: (job: JobData) => string | null;
+  /** What the download is doing with its disk, in full, while the row shows it. */
+  diskOf: (job: JobData) => string | null;
+  torrents: ReadonlyMap<number, TorrentSummaryData>;
+  seedingColumn: boolean;
 }
 
 /**
@@ -962,15 +1145,23 @@ const QueueGroup = memo(function QueueGroup({
   picked,
   onToggleGroup,
   onSelect,
+  onOpen,
   onPick,
   statusLabel,
   onPause,
   onCancel,
   heldOf,
   holdOf,
+  diskOf,
+  torrents,
+  seedingColumn,
 }: QueueGroupProps) {
   const t = useTranslate();
   const sorted = sortJobs(rows, sort, etaById);
+  const stateLabel = (torrent: TorrentSummaryData | undefined) => {
+    const key = torrentStateLabelKey(torrent?.state);
+    return key ? t(key) : null;
+  };
   return (
     <section className="flex flex-none flex-col">
       <SectionHeader
@@ -985,31 +1176,42 @@ const QueueGroup = memo(function QueueGroup({
         count={count}
         note={DOWNLOAD_GROUP_NOTE[group] === null ? undefined : t(DOWNLOAD_GROUP_NOTE[group])}
       />
-      {sorted.map((job) => (
-        <DownloadRow
-          key={job.id}
-          job={job}
-          selected={job.id === selectedId}
-          onSelect={onSelect}
-          picked={picked.has(job.id)}
-          onPick={onPick}
-          statusLabel={statusLabel}
-          onPause={onPause}
-          onCancel={onCancel}
-          held={heldOf(job)}
-          hold={holdOf(job)}
-          statusTitle={
-            job.status === "PROPAGATING" && job.downloadRetryAtEpochMs != null
-              ? t("next.status.propagationUntil", {
-                  time: new Date(job.downloadRetryAtEpochMs).toLocaleString(),
-                })
-              : undefined
-          }
-        />
-      ))}
+      {sorted.map((job) => {
+        const disk = diskOf(job);
+        return (
+          <DownloadRow
+            key={job.id}
+            job={job}
+            selected={job.id === selectedId}
+            onSelect={onSelect}
+            onOpen={onOpen}
+            picked={picked.has(job.id)}
+            onPick={onPick}
+            statusLabel={statusLabel}
+            onPause={onPause}
+            onCancel={onCancel}
+            held={heldOf(job)}
+            hold={stateLabel(torrents.get(job.id)) ?? holdOf(job) ?? (disk ? t("next.status.diskShort") : null)}
+            seeding={seedingOf(torrents.get(job.id))}
+            seedingColumn={seedingColumn}
+            statusTitle={
+              job.status === "PROPAGATING" && job.downloadRetryAtEpochMs != null
+                ? t("next.status.propagationUntil", {
+                    time: new Date(job.downloadRetryAtEpochMs).toLocaleString(),
+                  })
+                : (disk ?? undefined)
+            }
+          />
+        );
+      })}
     </section>
   );
 }, sameGroupProps);
+
+/** A torrent's figures for the seeding column, while it seeds or has stopped. */
+function seedingOf(torrent: TorrentSummaryData | undefined): TorrentSummaryData | null {
+  return torrent && showsSeeding(torrent.state) ? torrent : null;
+}
 
 /** Whether a drag is carrying files from the desktop, not text or a link from the page. */
 function carriesFiles(event: DragEvent): boolean {

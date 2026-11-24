@@ -17,7 +17,7 @@ use crate::persistence::database_target::DatabaseTarget;
 // Settings key holding the version that last started against this database.
 // It is written as soon as the database opens, before first-run configuration
 // is imported, so it does not make the database hold settings of its own.
-pub(crate) const LAST_VERSION: &str = "last_started_version";
+use weaver_server_composition::operations::backup::LAST_VERSION;
 const PENDING_VERSION: &str = "pending_auto_backup_version";
 
 // Record the version after the database has opened and restore recovery has completed.
@@ -31,7 +31,8 @@ fn record_started_version_for(
     db: &crate::Database,
     version: &str,
 ) -> Result<(), BackupServiceError> {
-    db.set_setting(LAST_VERSION, version).map_err(io_err)
+    weaver_server_composition::operations::backup::record_started_version_for(db, version)
+        .map_err(io_err)
 }
 
 // Explicit operator recovery from an unavailable pre-upgrade backup target.
@@ -326,7 +327,12 @@ mod tests {
     use super::super::automatic::StoredAutoSettings;
     use super::super::stored::{BackupArtifactStatus, list_backups};
     use super::*;
+    use crate::operations::recovery::credentials::StoredCredentialQueries;
     use crate::persistence::encryption::{EncryptionKey, encrypt_value};
+    use crate::servers::persistence::ServersPersistenceQueries;
+    use crate::settings::persistence::SettingsPersistenceQueries;
+    use crate::settings::queries::SettingsQueries;
+    use crate::settings::service::SettingsServiceQueries;
 
     #[tokio::test]
     async fn successful_open_keeps_retry_pending_and_labels_retry_with_running_version() {
@@ -358,7 +364,11 @@ mod tests {
         prepare_upgrade_backup_for_target(&target, root.path(), "0.14.2", |_| Ok(key))
             .await
             .unwrap();
-        let rows = list_backups(&root.path().join("backups"), crate::e2e_clock::utc_now()).unwrap();
+        let rows = list_backups(
+            &root.path().join("backups"),
+            weaver_server_base::e2e_clock::utc_now(),
+        )
+        .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].source_weaver_version, "0.14.2");
         assert_eq!(
@@ -473,12 +483,27 @@ mod tests {
         )
         .unwrap();
         db.close().unwrap();
-        let options = sqlx::sqlite::SqliteConnectOptions::new().filename(&path);
-        let mut conn = sqlx::SqliteConnection::connect_with(&options)
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&path))
             .await
             .unwrap();
-        sqlx::raw_sql("DROP TABLE bandwidth_usage_minute_buckets; CREATE TABLE bandwidth_usage_minute_buckets (bucket_epoch_minute INTEGER PRIMARY KEY, payload_bytes INTEGER NOT NULL); INSERT INTO bandwidth_usage_minute_buckets VALUES (42, 123); UPDATE schema_version SET version = 50;").execute(&mut conn).await.unwrap();
-        conn.close().await.unwrap();
+        let store = super::super::artifact_datastore(&pool);
+        for statement in [
+            "DROP TABLE bandwidth_usage_minute_buckets;",
+            "CREATE TABLE bandwidth_usage_minute_buckets (bucket_epoch_minute INTEGER PRIMARY KEY, payload_bytes INTEGER NOT NULL);",
+            "INSERT INTO bandwidth_usage_minute_buckets VALUES (42, 123);",
+            "UPDATE schema_version SET version = 50;",
+        ] {
+            crate::persistence::sql_runtime::SqlRuntime::execute(
+                store.write_exec(),
+                statement,
+                &[],
+            )
+            .await
+            .unwrap();
+        }
+        pool.close().await;
         let target = DatabaseTarget::SqlitePath(path.clone());
         // A key read failure must preserve the source version and leave a retry marker.
         assert!(
@@ -494,7 +519,11 @@ mod tests {
         prepare_upgrade_backup_for_target(&target, root.path(), "0.14.2", |_| Ok(key.clone()))
             .await
             .unwrap();
-        let rows = list_backups(&root.path().join("backups"), crate::e2e_clock::utc_now()).unwrap();
+        let rows = list_backups(
+            &root.path().join("backups"),
+            weaver_server_base::e2e_clock::utc_now(),
+        )
+        .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, BackupArtifactStatus::Ready);
         assert_eq!(rows[0].source_weaver_version, "0.14.1");
@@ -530,9 +559,12 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            list_backups(&root.path().join("backups"), crate::e2e_clock::utc_now())
-                .unwrap()
-                .len(),
+            list_backups(
+                &root.path().join("backups"),
+                weaver_server_base::e2e_clock::utc_now()
+            )
+            .unwrap()
+            .len(),
             1
         );
     }
@@ -560,7 +592,11 @@ mod tests {
         prepare_upgrade_backup_for_target(&target, root.path(), "0.14.2", |_| Ok(key))
             .await
             .unwrap();
-        let rows = list_backups(&root.path().join("backups"), crate::e2e_clock::utc_now()).unwrap();
+        let rows = list_backups(
+            &root.path().join("backups"),
+            weaver_server_base::e2e_clock::utc_now(),
+        )
+        .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, BackupArtifactStatus::Ready);
         assert_eq!(rows[0].source_weaver_version, "unknown");

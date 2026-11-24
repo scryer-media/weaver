@@ -20,6 +20,9 @@ import { Icon, type IconName } from "./icons";
  * cut short. A `FormRow` does not wrap; it is two real columns.
  */
 
+/** The controls inside a row that keep their own clicks. */
+const ROW_CONTROLS = "a, button, input, label, select, textarea, [role=button], [role=checkbox], [role=switch]";
+
 export function ListRow({
   left,
   right,
@@ -27,11 +30,13 @@ export function ListRow({
   selected = false,
   picked = false,
   onClick,
+  onDoubleClick,
   density = "comfortable",
   /** Draw the 3px leading rail that marks selection. Queue rows use it. */
   markSelection = false,
   className,
   title,
+  testId,
 }: {
   left: ReactNode;
   right?: ReactNode;
@@ -41,10 +46,13 @@ export function ListRow({
   /** Ticked for a bulk action, which is a different thing from being the row the inspector shows. */
   picked?: boolean;
   onClick?: () => void;
+  /** A double click on the row itself; one on a control inside it is that control's. */
+  onDoubleClick?: () => void;
   density?: "comfortable" | "compact";
   markSelection?: boolean;
   className?: string;
   title?: string;
+  testId?: string;
 }) {
   const interactive = typeof onClick === "function";
   // A button cannot hold another control, so a row with a lead is a div that
@@ -70,7 +78,17 @@ export function ListRow({
               },
             }
         : {})}
+      onDoubleClick={
+        onDoubleClick === undefined
+          ? undefined
+          : (event: React.MouseEvent) => {
+              const control = (event.target as Element).closest(ROW_CONTROLS);
+              if (control !== null && control !== event.currentTarget) return;
+              onDoubleClick();
+            }
+      }
       title={title}
+      data-testid={testId}
       className={cn(
         "flex w-full flex-wrap items-center gap-x-5 gap-y-[10px] border-b border-wv-hairline text-left",
         markSelection
@@ -141,15 +159,23 @@ export function FormRow({
   children,
   htmlFor,
   helpTestId,
+  stacked = false,
 }: {
   label: ReactNode;
   help?: ReactNode;
   children: ReactNode;
   htmlFor?: string;
   helpTestId?: string;
+  /** The control under the label at full width, for one too wide to sit beside it. */
+  stacked?: boolean;
 }) {
   return (
-    <div className="grid grid-cols-1 items-center gap-x-6 gap-y-3 border-b border-wv-hairline px-4 py-[14px] hover:bg-wv-cell-hover sm:grid-cols-[minmax(0,1fr)_minmax(268px,max-content)] sm:px-6">
+    <div
+      className={cn(
+        "grid grid-cols-1 items-center gap-x-6 gap-y-3 border-b border-wv-hairline px-4 py-[14px] hover:bg-wv-cell-hover sm:px-6",
+        !stacked && "sm:grid-cols-[minmax(0,1fr)_minmax(268px,max-content)]",
+      )}
+    >
       <div className="flex min-w-0 flex-col gap-1">
         <label
           htmlFor={htmlFor}
@@ -161,7 +187,7 @@ export function FormRow({
           <div data-testid={helpTestId} className="text-[12px] leading-[1.45] text-pretty text-wv-muted">{help}</div>
         )}
       </div>
-      <div className="flex min-w-0 items-center gap-3 sm:justify-end">
+      <div className={cn("flex min-w-0 items-center gap-3", !stacked && "sm:justify-end")}>
         {children}
       </div>
     </div>

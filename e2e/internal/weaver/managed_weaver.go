@@ -199,13 +199,13 @@ func startStandardManagedWeaver(preserveState bool) error {
 
 	cmd := exec.Command(weaverBin, "--config", localWeaverConfigPath(), "serve", "--port", localWeaverPort())
 	// `weaver::pipeline` matches nothing — the pipeline lives in the
-	// `weaver_server_core` crate, so every `debug!` on this path has been
+	// `weaver_server_pipeline` crate, so every `debug!` on this path has been
 	// silently dropped for as long as the filter has existed. That is why three
 	// separate diagnoses of the PAR2 repair guards had to be inferred from info
 	// lines. Scoped to `completion` rather than the whole pipeline on purpose:
 	// the full pipeline at debug is a firehose that perturbs the timing of the
 	// very starvation behaviour these runs are trying to measure.
-	cmd.Env = managedWeaverEnv(os.Environ(), localRunDir(), "info,weaver::pipeline=debug,weaver_server_core::pipeline::completion=debug")
+	cmd.Env = managedWeaverEnv(os.Environ(), localRunDir(), "info,weaver::pipeline=debug,weaver_server_pipeline::pipeline::completion=debug")
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	if err := cmd.Start(); err != nil {

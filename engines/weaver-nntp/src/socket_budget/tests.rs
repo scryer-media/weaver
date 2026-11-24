@@ -317,3 +317,211 @@ async fn a_loan_recalls_idle_sockets_and_gives_them_back_when_dropped() {
     assert_eq!(budget.snapshot().limit, 4);
     assert!(budget.try_acquire().is_some());
 }
+
+// Bytes a tunnel asks back are given back by connections dialled over it,
+// up to the number asked: idle ones close now, and for the rest busy ones
+// close once their article is done, never during it. One over another path
+// stays, and so does the server's last one on the tunnel.
+#[test]
+fn a_give_back_retires_connections_on_the_tunnel_idle_first() {
+    let budget = SocketBudget::new(6);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let busy = path_slot(&budget, &on_tunnel(), None);
+    let idle: Vec<_> = (0..3)
+        .map(|_| path_slot(&budget, &on_tunnel(), Some(&tx)))
+        .collect();
+    let other = path_slot(&budget, &elsewhere(), Some(&tx));
+    let last = path_slot(&budget, &on_tunnel(), None);
+    let stands = standing(true);
+
+    assert_eq!(budget.recall_idle_on(2, &on, &stands), 2);
+    let recalled: Vec<u64> = rx.try_iter().collect();
+    assert_eq!(recalled.len(), 2);
+    assert!(recalled.iter().all(|id| idle.iter().any(|s| s.id() == *id)));
+    assert!(busy.claim_reuse(), "idle connections covered the ask");
+
+    // Asked for more than is idle: the idle one left closes now, the busy
+    // one is marked and keeps its article.
+    assert_eq!(budget.recall_idle_on(5, &on, &stands), 2);
+    assert_eq!(rx.try_iter().count(), 1);
+    assert_eq!(budget.recall_idle_on(5, &on, &stands), 0, "asked twice");
+    // Its article done, it takes no other, and closes as it goes idle.
+    assert!(!busy.claim_reuse());
+    let (busy_tx, busy_rx) = std::sync::mpsc::channel();
+    busy.idle(
+        SocketPhase::OwnedIdle,
+        Arc::new(move |id| busy_tx.send(id).unwrap()),
+    );
+    assert_eq!(busy_rx.try_recv(), Ok(busy.id()));
+    assert!(other.claim_reuse(), "a connection over another path stays");
+    assert!(last.claim_reuse(), "the server's last connection was given");
+}
+
+// A busy connection marked for an ask that is withdrawn before its article
+// ends, as when torrents stop pressing, stays open: it takes its next
+// article, and going idle does not close it.
+#[test]
+fn a_withdrawn_give_back_leaves_its_busy_connections_open() {
+    let budget = SocketBudget::new(2);
+    let busy = path_slot(&budget, &on_tunnel(), None);
+    let _last = path_slot(&budget, &on_tunnel(), None);
+    let held = Arc::new(AtomicBool::new(true));
+    let stands: GiveBackStands = {
+        let held = Arc::clone(&held);
+        Arc::new(move || held.load(Ordering::Acquire))
+    };
+    assert_eq!(budget.recall_idle_on(1, &on, &stands), 1);
+    held.store(false, Ordering::Release);
+    assert!(busy.claim_reuse(), "the ask stands no more");
+
+    // Marked again and withdrawn while it is busy, going idle keeps it.
+    held.store(true, Ordering::Release);
+    assert_eq!(budget.recall_idle_on(1, &on, &stands), 1);
+    held.store(false, Ordering::Release);
+    let (tx, rx) = std::sync::mpsc::channel();
+    busy.idle(
+        SocketPhase::OwnedIdle,
+        Arc::new(move |id| tx.send(id).unwrap()),
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "an idle connection nobody asked for"
+    );
+    assert_eq!(budget.snapshot().owned_idle, 1);
+}
+
+// An ask withdrawn before usenet acts on it, as when the waiter it was made
+// for is served elsewhere first, closes nothing: no idle connection closes
+// and no busy one is marked.
+#[test]
+fn a_give_back_withdrawn_before_usenet_acts_closes_nothing() {
+    let budget = SocketBudget::new(3);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let busy = path_slot(&budget, &on_tunnel(), None);
+    let _idle = path_slot(&budget, &on_tunnel(), Some(&tx));
+    assert_eq!(budget.recall_idle_on(2, &on, &standing(false)), 0);
+    assert!(rx.try_recv().is_err(), "an idle connection closed");
+    assert!(busy.claim_reuse(), "a busy connection was marked");
+    assert_eq!(budget.snapshot().physical, 2);
+}
+
+// A lowered limit and a give-back can both mark one busy connection, and
+// neither clears the other: withdrawing the ask leaves the lend's retire in
+// force, and taking the loan back leaves a standing ask in force.
+#[test]
+fn a_give_back_and_a_lowered_limit_do_not_clear_each_other() {
+    // Withdrawn ask, lend still in force: the connection still closes.
+    let budget = SocketBudget::new(1);
+    let busy = path_slot(&budget, &on_tunnel(), None);
+    let held = Arc::new(AtomicBool::new(true));
+    let stands: GiveBackStands = {
+        let held = Arc::clone(&held);
+        Arc::new(move || held.load(Ordering::Acquire))
+    };
+    budget.lend(1);
+    assert!(busy.retiring());
+    assert_eq!(
+        budget.recall_idle_on(1, &on, &stands),
+        0,
+        "a retiring connection is not asked twice"
+    );
+    held.store(false, Ordering::Release);
+    assert!(!busy.claim_reuse(), "the lend's retire stands");
+    drop(busy);
+
+    // Standing ask, a loan lent and taken back meanwhile: the connection
+    // still closes, for the ask.
+    let budget = SocketBudget::new(3);
+    let busy = path_slot(&budget, &on_tunnel(), None);
+    let _last = path_slot(&budget, &on_tunnel(), None);
+    let _other = path_slot(&budget, &elsewhere(), None);
+    assert_eq!(budget.recall_idle_on(1, &on, &standing(true)), 1);
+    budget.lend(1);
+    budget.lend(0);
+    assert!(!busy.retiring(), "the loan retired the other connection");
+    assert!(!busy.claim_reuse(), "the give-back stands");
+}
+
+// A server whose one connection on the tunnel is all it holds there keeps
+// it, idle or busy: a give-back never takes a server's last one.
+#[test]
+fn a_give_back_leaves_a_server_its_last_connection_on_the_tunnel() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let idle_budget = SocketBudget::new(2);
+    let idle = path_slot(&idle_budget, &on_tunnel(), Some(&tx));
+    assert_eq!(idle_budget.recall_idle_on(1, &on, &standing(true)), 0);
+    assert!(rx.try_recv().is_err(), "the last idle connection closed");
+    let busy_budget = SocketBudget::new(2);
+    let busy = path_slot(&busy_budget, &on_tunnel(), None);
+    assert_eq!(busy_budget.recall_idle_on(1, &on, &standing(true)), 0);
+    assert!(busy.claim_reuse(), "the last busy connection was marked");
+    drop(idle);
+}
+
+// A dial still under way is not a connection the server holds: one
+// connected socket beside it is the server's last on the tunnel and is kept,
+// so a dial that then fails leaves the server one, not none.
+#[test]
+fn a_dialing_socket_does_not_count_toward_a_servers_last_connection() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let budget = SocketBudget::new(2);
+    let connected = path_slot(&budget, &on_tunnel(), Some(&tx));
+    let dialing = budget.try_acquire().unwrap();
+    dialing.set_path(Some(&on_tunnel()));
+    assert_eq!(
+        budget.givable_on(&on),
+        1,
+        "only the connected socket is held"
+    );
+    assert_eq!(budget.recall_idle_on(1, &on, &standing(true)), 0);
+    assert!(
+        rx.try_recv().is_err(),
+        "the server's last connection closed"
+    );
+    drop(dialing);
+    assert_eq!(budget.givable_on(&on), 1);
+    drop(connected);
+}
+
+fn on_tunnel() -> weaver_tunnel::pipe::DialPath {
+    weaver_tunnel::pipe::DialPath {
+        egress: 1,
+        proxies: vec![3],
+        ..Default::default()
+    }
+}
+
+fn elsewhere() -> weaver_tunnel::pipe::DialPath {
+    weaver_tunnel::pipe::DialPath {
+        egress: 1,
+        proxies: vec![4],
+        ..Default::default()
+    }
+}
+
+fn on(path: &weaver_tunnel::pipe::DialPath) -> bool {
+    path.egress == 1 && path.proxies == [3]
+}
+
+fn standing(stands: bool) -> GiveBackStands {
+    Arc::new(move || stands)
+}
+
+// A connection over `path`, busy, or idle with a recall that reports to `tx`.
+fn path_slot(
+    budget: &Arc<SocketBudget>,
+    path: &weaver_tunnel::pipe::DialPath,
+    tx: Option<&std::sync::mpsc::Sender<u64>>,
+) -> SocketSlot {
+    let slot = budget.try_acquire().unwrap();
+    slot.set_path(Some(path));
+    slot.active();
+    if let Some(tx) = tx {
+        let tx = tx.clone();
+        slot.idle(
+            SocketPhase::OwnedIdle,
+            Arc::new(move |id| tx.send(id).unwrap()),
+        );
+    }
+    slot
+}

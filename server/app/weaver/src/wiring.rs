@@ -146,14 +146,44 @@ pub(crate) fn spawn_event_persistence_task(
     })
 }
 
+// The timeline row a job's event is recorded as, at `now` unless the event
+// says when what it reports happened: a repair failure is said as the job
+// ends, and is recorded when its repair stopped running.
+pub(crate) fn job_event_row(
+    event: &PipelineEvent,
+    now: i64,
+) -> Option<weaver_server_core::JobEvent> {
+    let gql = weaver_server_api::PipelineEventGql::from(event);
+    let job_id = gql.job_id?;
+    let timestamp = match event {
+        PipelineEvent::RepairFailed {
+            ended_at_ms: Some(ended_at),
+            ..
+        } => *ended_at,
+        _ => now,
+    };
+    Some(weaver_server_core::JobEvent {
+        job_id,
+        timestamp,
+        kind: format!("{:?}", gql.kind),
+        message: gql.message,
+        file_id: gql.file_id,
+    })
+}
+
 async fn persist_events(
     mut rx: broadcast::Receiver<PipelineEvent>,
     db: Database,
     shutdown: Arc<tokio::sync::Notify>,
 ) {
-    use weaver_server_api::PipelineEventGql;
-
     let mut batch: Vec<weaver_server_core::JobEvent> = Vec::new();
+    // Jobs whose terminal row was written before their terminal event was
+    // sent; that event, when it comes, is not written again. An entry leaves
+    // when its event arrives.
+    let mut settled: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    // A job's terminal event waits here until every row sent before it, and
+    // its own, have committed.
+    let mut settles = db.keep_job_event_rows();
     let flush_interval = tokio::time::Duration::from_secs(1);
     let mut flush_tick = tokio::time::interval(flush_interval);
     flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -162,6 +192,40 @@ async fn persist_events(
     loop {
         let recv = tokio::select! {
             result = rx.recv() => result,
+            Some(first) = settles.recv() => {
+                let mut waiting = vec![first];
+                while let Ok(next) = settles.try_recv() {
+                    waiting.push(next);
+                }
+                // Every event sent before a waiting terminal event is already
+                // in the channel, since it was sent before the job's archive
+                // was queued: take them all before the terminal rows.
+                loop {
+                    match rx.try_recv() {
+                        Ok(event) => {
+                            record_job_event(&event, &mut batch, &mut settled);
+                        }
+                        Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                            tracing::debug!(skipped = n, "event persistence lagged");
+                        }
+                        Err(_) => break,
+                    }
+                }
+                for waiting in &waiting {
+                    if let Some(row) = kept_job_event_row(&waiting.terminal) {
+                        settled.insert(row.job_id);
+                        batch.push(row);
+                    }
+                }
+                flush_job_event_batch(&db, &mut batch).await;
+                if let Err(error) = db.flush_write_queue().await {
+                    tracing::warn!(%error, "failed to flush job event rows before a terminal event");
+                }
+                for waiting in waiting {
+                    let _ = waiting.written.send(());
+                }
+                continue;
+            }
             _ = flush_tick.tick(), if !batch.is_empty() => {
                 flush_job_event_batch(&db, &mut batch).await;
                 continue;
@@ -171,31 +235,7 @@ async fn persist_events(
 
         match recv {
             Ok(event) => {
-                let barrier = matches!(
-                    event,
-                    PipelineEvent::RepairComplete { .. }
-                        | PipelineEvent::EmbeddedProtectionReplaced { .. }
-                        | PipelineEvent::JobCompleted { .. }
-                        | PipelineEvent::JobFailed { .. }
-                        | PipelineEvent::JobCancelled { .. }
-                );
-                if should_record_job_event(&event) {
-                    let gql = PipelineEventGql::from(&event);
-                    if let Some(job_id) = gql.job_id {
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as i64;
-                        batch.push(weaver_server_core::JobEvent {
-                            job_id,
-                            timestamp: now,
-                            kind: format!("{:?}", gql.kind),
-                            message: gql.message,
-                            file_id: gql.file_id,
-                        });
-                    }
-                }
-
+                let barrier = record_job_event(&event, &mut batch, &mut settled);
                 if batch.len() >= 50 || barrier {
                     flush_job_event_batch(&db, &mut batch).await;
                 }
@@ -218,6 +258,45 @@ async fn persist_events(
     }
 }
 
+// Add the event's row to the batch. True when the event is a boundary the
+// rows written so far must commit at. A terminal event whose row was written
+// before it was sent adds nothing and is no boundary.
+fn record_job_event(
+    event: &PipelineEvent,
+    batch: &mut Vec<weaver_server_core::JobEvent>,
+    settled: &mut std::collections::HashSet<u64>,
+) -> bool {
+    if let PipelineEvent::JobCompleted { job_id } | PipelineEvent::JobFailed { job_id, .. } = event
+        && settled.remove(&job_id.0)
+    {
+        return false;
+    }
+    let barrier = matches!(
+        event,
+        PipelineEvent::RepairComplete { .. }
+            | PipelineEvent::EmbeddedProtectionReplaced { .. }
+            | PipelineEvent::JobCompleted { .. }
+            | PipelineEvent::JobFailed { .. }
+            | PipelineEvent::JobCancelled { .. }
+    );
+    if let Some(row) = kept_job_event_row(event) {
+        batch.push(row);
+    }
+    barrier
+}
+
+// The job event row an event is kept as, if it is kept.
+fn kept_job_event_row(event: &PipelineEvent) -> Option<weaver_server_core::JobEvent> {
+    if !should_record_job_event(event) {
+        return None;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    job_event_row(event, now)
+}
+
 async fn flush_job_event_batch(db: &Database, batch: &mut Vec<weaver_server_core::JobEvent>) {
     if batch.is_empty() {
         return;
@@ -231,6 +310,12 @@ async fn flush_job_event_batch(db: &Database, batch: &mut Vec<weaver_server_core
 #[cfg(test)]
 mod tests {
     use super::*;
+    use weaver_server_core::history::queries::HistoryQueries;
+    use weaver_server_core::history::timeline::HistoryTimelineQueries;
+    use weaver_server_core::proxies::ProxiesNetworkPersistenceQueries;
+    use weaver_server_core::proxies::ProxiesPersistenceQueries;
+    use weaver_server_core::servers::persistence::ServersPersistenceQueries;
+    use weaver_server_core::settings::service::SettingsServiceQueries;
 
     use weaver_server_core::jobs::ids::JobId;
 
@@ -310,8 +395,9 @@ mod tests {
                     name: "weaver-absent0".into(),
                 },
                 enabled: true,
-                max_download_speed: 0,
-                download_quota: Default::default(),
+                download_bps: None,
+                upload_bps: None,
+                quota: Default::default(),
             })
             .unwrap();
         db.save_proxy_routing_policy(
@@ -522,5 +608,131 @@ mod tests {
         }
         shutdown.notify_one();
         task.await.unwrap();
+    }
+
+    // A job's terminal event, sent as the pipeline sends it once the job's
+    // archive has committed: after the rows keeper has answered.
+    fn send_terminal_after_its_rows(
+        db: &Database,
+        tx: &broadcast::Sender<PipelineEvent>,
+        terminal: PipelineEvent,
+    ) -> tokio::task::JoinHandle<()> {
+        let db = db.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            if let Some(keeper) = db.job_event_rows_keeper()
+                && let Some(written) = keeper.settle(terminal.clone()).await
+            {
+                let _ = written.await;
+            }
+            tx.send(terminal).unwrap();
+        })
+    }
+
+    // Once a job's terminal event is heard, its event list is final: every
+    // row of an event sent before it, held in the subscriber's batch, and the
+    // terminal row are committed, and no row of the job is written after.
+    async fn the_event_list_is_final_when_the_terminal_event_is_heard(db: Database) {
+        let (tx, rx) = broadcast::channel(64);
+        let mut client = tx.subscribe();
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let task = tokio::spawn(persist_events(rx, db.clone(), shutdown.clone()));
+        // The subscriber holds the rows from its first answer on.
+        tokio::task::yield_now().await;
+        while db.job_event_rows_keeper().is_none() {
+            tokio::task::yield_now().await;
+        }
+
+        // Events that commit at no boundary of their own: without the wait
+        // they sit in the batch for up to the periodic flush.
+        tx.send(PipelineEvent::JobPaused { job_id: JobId(7) })
+            .unwrap();
+        tx.send(PipelineEvent::JobResumed { job_id: JobId(7) })
+            .unwrap();
+        tx.send(PipelineEvent::DownloadStarted { job_id: JobId(7) })
+            .unwrap();
+        let sent = send_terminal_after_its_rows(
+            &db,
+            &tx,
+            PipelineEvent::JobFailed {
+                job_id: JobId(7),
+                error: "no file was delivered whole".to_string(),
+            },
+        );
+
+        loop {
+            let event = client.recv().await.unwrap();
+            if matches!(event, PipelineEvent::JobFailed { job_id, .. } if job_id == JobId(7)) {
+                break;
+            }
+        }
+        let kinds = |db: &Database| -> Vec<String> {
+            db.get_job_events(7)
+                .unwrap()
+                .into_iter()
+                .map(|event| event.kind)
+                .collect()
+        };
+        let heard = kinds(&db);
+        assert_eq!(
+            heard,
+            ["JobPaused", "JobResumed", "DownloadStarted", "JobFailed"],
+            "the job's event list when its terminal event is heard"
+        );
+        sent.await.unwrap();
+
+        // A later boundary of another job: the subscriber has taken the
+        // terminal event off the channel by the time it commits.
+        tx.send(PipelineEvent::RepairComplete {
+            job_id: JobId(8),
+            slices_repaired: 1,
+        })
+        .unwrap();
+        while db.get_job_events(8).unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            kinds(&db),
+            heard,
+            "a row of the job was written after its terminal event"
+        );
+
+        shutdown.notify_one();
+        task.await.unwrap();
+        db.flush_write_queue().await.unwrap();
+        assert_eq!(kinds(&db), heard);
+    }
+
+    #[tokio::test]
+    async fn the_event_list_is_final_when_the_terminal_event_is_heard_in_memory() {
+        the_event_list_is_final_when_the_terminal_event_is_heard(
+            Database::open_in_memory().unwrap(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn the_event_list_is_final_when_the_terminal_event_is_heard_on_disk() {
+        let root = tempfile::tempdir().unwrap();
+        the_event_list_is_final_when_the_terminal_event_is_heard(
+            Database::open(&root.path().join("events.db")).unwrap(),
+        )
+        .await;
+    }
+
+    // With no subscriber keeping the rows, a terminal event is not held.
+    #[tokio::test]
+    async fn a_terminal_event_is_not_held_without_a_rows_keeper() {
+        let db = Database::open_in_memory().unwrap();
+        assert!(db.job_event_rows_keeper().is_none());
+        let settles = db.keep_job_event_rows();
+        drop(settles);
+        let keeper = db.job_event_rows_keeper().expect("the keeper was taken");
+        assert!(
+            keeper
+                .settle(PipelineEvent::JobCompleted { job_id: JobId(7) })
+                .await
+                .is_none()
+        );
     }
 }

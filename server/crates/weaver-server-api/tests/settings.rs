@@ -1,9 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use weaver_server_core::post_processing::settings::PostProcessingSettingsQueries;
+use weaver_server_core::settings::SettingsSchedulesQueries;
+use weaver_server_core::settings::queries::SettingsQueries;
+use weaver_server_core::settings::service::SettingsServiceQueries;
 mod common;
 
-use common::{BlockingDbOperation, TestHarness, assert_no_errors, local_request, response_data};
+use common::{
+    BlockingDbOperation, TestHarness, assert_has_errors, assert_no_errors, local_request,
+    response_data,
+};
 use weaver_server_core::auth::CallerScope;
 
 #[tokio::test]
@@ -195,7 +202,7 @@ async fn get_settings_defaults() {
     let h = TestHarness::new().await;
     let resp = h
         .execute(
-            r#"{ settings { dataDir intermediateDir completeDir cleanupAfterExtract maxDownloadSpeed maxRetries propagationDelaySecs enableSrrdbLookup } }"#,
+            r#"{ settings { dataDir intermediateDir completeDir cleanupAfterExtract maxRetries propagationDelaySecs enableSrrdbLookup } }"#,
         )
         .await;
     assert_no_errors(&resp);
@@ -208,8 +215,6 @@ async fn get_settings_defaults() {
     assert!(!s["completeDir"].as_str().unwrap().is_empty());
     // cleanupAfterExtract defaults to true.
     assert!(s["cleanupAfterExtract"].as_bool().unwrap());
-    // maxDownloadSpeed defaults to 0 (unlimited).
-    assert_eq!(s["maxDownloadSpeed"].as_u64().unwrap(), 0);
     // maxRetries defaults to 3.
     assert_eq!(s["maxRetries"].as_u64().unwrap(), 3);
     assert_eq!(s["propagationDelaySecs"].as_u64().unwrap(), 0);
@@ -318,22 +323,20 @@ async fn update_max_retries() {
 }
 
 #[tokio::test]
-async fn update_max_download_speed() {
+async fn the_old_speed_setting_is_gone_from_general_settings() {
     let h = TestHarness::new().await;
+    assert_has_errors(&h.execute(r#"{ settings { maxDownloadSpeed } }"#).await);
+    assert_has_errors(
+        &h.execute(r#"mutation { updateSettings(input: { maxDownloadSpeed: 1 }) { maxRetries } }"#)
+            .await,
+    );
     let resp = h
-        .execute(
-            r#"mutation {
-                updateSettings(input: { maxDownloadSpeed: 5242880 }) {
-                    maxDownloadSpeed
-                }
-            }"#,
-        )
+        .execute(r#"{ networking { bandwidth { downloadBps uploadBps } } }"#)
         .await;
     assert_no_errors(&resp);
-    let data = response_data(&resp);
     assert_eq!(
-        data["updateSettings"]["maxDownloadSpeed"].as_u64().unwrap(),
-        5242880
+        response_data(&resp)["networking"]["bandwidth"],
+        serde_json::json!({ "downloadBps": null, "uploadBps": null })
     );
 }
 
@@ -515,9 +518,7 @@ async fn partial_settings_update() {
 
     // Get defaults first.
     let resp = h
-        .execute(
-            r#"{ settings { intermediateDir cleanupAfterExtract maxRetries maxDownloadSpeed } }"#,
-        )
+        .execute(r#"{ settings { intermediateDir cleanupAfterExtract maxRetries } }"#)
         .await;
     assert_no_errors(&resp);
     let before = response_data(&resp);
@@ -527,14 +528,13 @@ async fn partial_settings_update() {
         .to_string();
     let before_cleanup = before["settings"]["cleanupAfterExtract"].as_bool().unwrap();
     let before_retries = before["settings"]["maxRetries"].as_u64().unwrap();
-    let before_speed = before["settings"]["maxDownloadSpeed"].as_u64().unwrap();
 
     // Update only completeDir.
     let resp = h
         .execute(
             r#"mutation {
                 updateSettings(input: { completeDir: "/tmp/partial" }) {
-                    completeDir intermediateDir cleanupAfterExtract maxRetries maxDownloadSpeed
+                    completeDir intermediateDir cleanupAfterExtract maxRetries
                 }
             }"#,
         )
@@ -549,7 +549,6 @@ async fn partial_settings_update() {
     assert_eq!(s["intermediateDir"].as_str().unwrap(), before_intermediate);
     assert_eq!(s["cleanupAfterExtract"].as_bool().unwrap(), before_cleanup);
     assert_eq!(s["maxRetries"].as_u64().unwrap(), before_retries);
-    assert_eq!(s["maxDownloadSpeed"].as_u64().unwrap(), before_speed);
 }
 
 #[tokio::test]
@@ -896,4 +895,439 @@ async fn the_profile_in_force_is_reported_beside_the_choice() {
     let profile = &response_data(&resp)["hardwareProfile"];
     assert_eq!(profile["active"], "EFFICIENT");
     assert!(profile["scheduled"].is_null());
+}
+
+#[tokio::test]
+async fn seeding_and_torrent_settings_default_then_persist_and_clear() {
+    let h = TestHarness::new().await;
+    let defaults = h
+        .execute(
+            "{ settings { seeding { ratioGoal { value } } uploadCap torrent { enabled basePort announcePort upnp encryption maxActiveDownloads maxPeersTotal sessionDir } } }",
+        )
+        .await;
+    assert_no_errors(&defaults);
+    let data = response_data(&defaults);
+    assert!(data["settings"]["seeding"].is_null());
+    assert_eq!(data["settings"]["torrent"]["enabled"], false);
+    assert_eq!(data["settings"]["torrent"]["basePort"], 6881);
+    assert_eq!(data["settings"]["torrent"]["encryption"], "PREFER");
+
+    let saved = h
+        .execute(
+            r#"mutation { updateSettings(input: {
+                seeding: {
+                    ratioGoal: { state: SET, value: 2.0 }
+                    seedTimeGoalMinutes: { state: SET, value: 90 }
+                    mode: { state: SET, value: ALL }
+                    action: { state: SET, value: REMOVE_WITH_DATA }
+                }
+                uploadCap: 65536
+                torrent: { enabled: true, basePort: 51413, announcePort: 40000, encryption: REQUIRE, sessionDir: "/data/session" }
+            }) {
+                seeding {
+                    ratioGoal { value } seedTimeGoalMinutes { value }
+                    inactiveGoalMinutes { state value } mode { value } action { value }
+                }
+                uploadCap
+                torrent { enabled basePort announcePort upnp encryption sessionDir }
+            } }"#,
+        )
+        .await;
+    assert_no_errors(&saved);
+    let data = response_data(&saved);
+    let seeding = &data["updateSettings"]["seeding"];
+    assert_eq!(seeding["ratioGoal"]["value"], 2.0);
+    assert_eq!(seeding["seedTimeGoalMinutes"]["value"], 90);
+    // At the global level a goal left out is off: nothing is above it.
+    assert_eq!(seeding["inactiveGoalMinutes"]["state"], "OFF");
+    assert!(seeding["inactiveGoalMinutes"]["value"].is_null());
+    assert_eq!(seeding["mode"]["value"], "ALL");
+    assert_eq!(seeding["action"]["value"], "REMOVE_WITH_DATA");
+    assert_eq!(data["updateSettings"]["uploadCap"], 65536);
+    let torrent = &data["updateSettings"]["torrent"];
+    assert_eq!(torrent["enabled"], true);
+    assert_eq!(torrent["basePort"], 51413);
+    assert_eq!(torrent["announcePort"], 40000);
+    assert_eq!(torrent["upnp"], true);
+    assert_eq!(torrent["encryption"], "REQUIRE");
+    assert_eq!(torrent["sessionDir"], "/data/session");
+
+    let stored = h.db.load_config().unwrap();
+    assert_eq!(stored.seeding, h.config.read().await.seeding);
+    assert_eq!(stored.upload_cap, Some(65_536));
+    assert_eq!(stored.upload_cap, h.config.read().await.upload_cap);
+    assert_eq!(stored.torrent, h.config.read().await.torrent);
+    assert_eq!(stored.torrent.base_port, 51413);
+
+    // Leaving a field out keeps it; null clears it.
+    let cleared = h
+        .execute(
+            r#"mutation { updateSettings(input: { seeding: null, uploadCap: null, torrent: { announcePort: null } }) {
+                seeding { ratioGoal { value } } uploadCap torrent { enabled announcePort }
+            } }"#,
+        )
+        .await;
+    assert_no_errors(&cleared);
+    let data = response_data(&cleared);
+    assert!(data["updateSettings"]["seeding"].is_null());
+    assert_eq!(data["updateSettings"]["torrent"]["enabled"], true);
+    assert!(data["updateSettings"]["torrent"]["announcePort"].is_null());
+    let stored = h.db.load_config().unwrap();
+    assert_eq!(stored.seeding, None);
+    assert_eq!(stored.upload_cap, None);
+    assert_eq!(stored.torrent.announce_port, None);
+
+    let refused = h
+        .execute(r#"mutation { updateSettings(input: { seeding: { ratioGoal: { state: SET, value: -1.0 } } }) { seeding { ratioGoal { value } } } }"#)
+        .await;
+    assert!(!refused.errors.is_empty());
+    assert_eq!(h.db.load_config().unwrap().seeding, None);
+}
+
+#[tokio::test]
+async fn torrent_session_settings_default_to_libtorrents_then_persist_and_refuse_out_of_range() {
+    let h = TestHarness::new().await;
+    const FIELDS: &str = "connectionsLimit unchokeSlotsLimit connectionSpeed allowMultipleConnectionsPerIp peerTcp peerUtp preferDownloading preferSeeding dhtBootstrapNodes blocklistEnabled blocklist stopTrackerTimeoutSecs";
+    let defaults = h
+        .execute(&format!("{{ settings {{ torrent {{ {FIELDS} }} }} }}"))
+        .await;
+    assert_no_errors(&defaults);
+    let torrent = &response_data(&defaults)["settings"]["torrent"];
+    assert_eq!(torrent["connectionsLimit"], 200);
+    assert_eq!(torrent["unchokeSlotsLimit"], 8);
+    assert_eq!(torrent["connectionSpeed"], 30);
+    assert_eq!(torrent["allowMultipleConnectionsPerIp"], false);
+    assert_eq!(torrent["peerTcp"], true);
+    assert_eq!(torrent["peerUtp"], true);
+    assert_eq!(torrent["preferDownloading"], "TCP");
+    assert_eq!(torrent["preferSeeding"], "UTP");
+    assert_eq!(
+        torrent["dhtBootstrapNodes"],
+        "dht.transmissionbt.com:6881,dht.libtorrent.org:25401"
+    );
+    assert_eq!(torrent["blocklistEnabled"], false);
+    assert!(torrent["blocklist"].is_null());
+    assert_eq!(torrent["stopTrackerTimeoutSecs"], 5);
+
+    let saved = h
+        .execute(&format!(
+            r#"mutation {{ updateSettings(input: {{ torrent: {{
+                connectionsLimit: null, unchokeSlotsLimit: 16, connectionSpeed: 60,
+                allowMultipleConnectionsPerIp: true, preferDownloading: UTP,
+                dhtBootstrapNodes: " router.example:6881 ,, 192.0.2.9:25401", blocklistEnabled: true,
+                blocklist: " C:\\lists\\level1.p2p ", stopTrackerTimeoutSecs: 0
+            }} }}) {{ torrent {{ {FIELDS} }} }} }}"#
+        ))
+        .await;
+    assert_no_errors(&saved);
+    let torrent = &response_data(&saved)["updateSettings"]["torrent"];
+    assert!(torrent["connectionsLimit"].is_null(), "no limit");
+    assert_eq!(torrent["unchokeSlotsLimit"], 16);
+    assert_eq!(torrent["connectionSpeed"], 60);
+    assert_eq!(torrent["allowMultipleConnectionsPerIp"], true);
+    assert_eq!(torrent["preferDownloading"], "UTP");
+    assert_eq!(torrent["preferSeeding"], "UTP");
+    assert_eq!(
+        torrent["dhtBootstrapNodes"],
+        "router.example:6881,192.0.2.9:25401"
+    );
+    assert_eq!(torrent["blocklistEnabled"], true);
+    assert_eq!(torrent["blocklist"], r"C:\lists\level1.p2p");
+    assert_eq!(torrent["stopTrackerTimeoutSecs"], 0);
+    let stored = h.db.load_config().unwrap();
+    assert_eq!(stored.torrent, h.config.read().await.torrent);
+    assert_eq!(
+        stored.torrent.transports.dial_orders(),
+        weaver_server_core::settings::PeerTransports {
+            prefer_downloading: weaver_server_core::settings::PeerTransport::Utp,
+            ..Default::default()
+        }
+        .dial_orders()
+    );
+    assert_eq!(
+        stored.torrent.connections_limit,
+        weaver_server_core::settings::TorrentLimit::Unlimited
+    );
+
+    for input in [
+        "connectionsLimit: 0",
+        "unchokeSlotsLimit: 0",
+        "connectionSpeed: 0",
+        r#"dhtBootstrapNodes: "router.example""#,
+        // TCP and uTP cannot both be off.
+        "peerTcp: false, peerUtp: false",
+    ] {
+        let refused = h
+            .execute(&format!(
+                "mutation {{ updateSettings(input: {{ torrent: {{ {input} }} }}) {{ torrent {{ connectionsLimit }} }} }}"
+            ))
+            .await;
+        assert!(!refused.errors.is_empty(), "{input}");
+        assert_eq!(
+            h.db.load_config().unwrap().torrent,
+            stored.torrent,
+            "{input}"
+        );
+        assert_eq!(h.config.read().await.torrent, stored.torrent, "{input}");
+    }
+
+    // With one transport off, the preferences are kept as set and the
+    // dials use the one left on; turned on again, the kept ones are used.
+    use weaver_server_core::settings::{PeerTransport, PeerTransports};
+    // The orders of TCP alone, and of uTP first in both states.
+    let tcp_only = PeerTransports {
+        utp: false,
+        ..PeerTransports::default()
+    }
+    .dial_orders();
+    let utp_first = PeerTransports {
+        prefer_downloading: PeerTransport::Utp,
+        ..PeerTransports::default()
+    }
+    .dial_orders();
+    let off = h
+        .execute(&format!(
+            r#"mutation {{ updateSettings(input: {{ torrent: {{
+                peerUtp: false, preferDownloading: UTP, preferSeeding: UTP
+            }} }}) {{ torrent {{ {FIELDS} }} }} }}"#
+        ))
+        .await;
+    assert_no_errors(&off);
+    let torrent = &response_data(&off)["updateSettings"]["torrent"];
+    assert_eq!(torrent["peerTcp"], true);
+    assert_eq!(torrent["peerUtp"], false);
+    assert_eq!(torrent["preferDownloading"], "UTP");
+    assert_eq!(torrent["preferSeeding"], "UTP");
+    let kept = h.db.load_config().unwrap().torrent.transports;
+    assert_eq!(
+        (kept.prefer_downloading, kept.prefer_seeding),
+        (PeerTransport::Utp, PeerTransport::Utp)
+    );
+    assert_eq!(kept.dial_orders(), tcp_only);
+    let on = h
+        .execute(&format!(
+            r#"mutation {{ updateSettings(input: {{ torrent: {{ peerUtp: true }} }}) {{ torrent {{ {FIELDS} }} }} }}"#
+        ))
+        .await;
+    assert_no_errors(&on);
+    let torrent = &response_data(&on)["updateSettings"]["torrent"];
+    assert_eq!(torrent["preferDownloading"], "UTP");
+    assert_eq!(torrent["preferSeeding"], "UTP");
+    assert_eq!(
+        h.db.load_config().unwrap().torrent.transports.dial_orders(),
+        utp_first
+    );
+
+    // An empty blocklist clears it, and the switch stays as it was.
+    let cleared = h
+        .execute(r#"mutation { updateSettings(input: { torrent: { blocklist: "" } }) { torrent { blocklistEnabled blocklist } } }"#)
+        .await;
+    assert_no_errors(&cleared);
+    let torrent = &response_data(&cleared)["updateSettings"]["torrent"];
+    assert!(torrent["blocklist"].is_null());
+    assert_eq!(torrent["blocklistEnabled"], true);
+    assert_eq!(h.db.load_config().unwrap().torrent.blocklist, None);
+}
+
+// qBittorrent's defaults (`BannedIPs` empty, `BlockPeersOnPrivilegedPorts`
+// and `IPFilterTrackers` off); banned entries are kept in one form, sorted
+// and once, and an entry that names no address is refused whole.
+#[tokio::test]
+async fn banned_addresses_and_filter_switches_default_off_then_persist() {
+    let h = TestHarness::new().await;
+    const FIELDS: &str = "bannedIps blockPrivilegedPorts filterTrackers";
+    let defaults = h
+        .execute(&format!("{{ settings {{ torrent {{ {FIELDS} }} }} }}"))
+        .await;
+    assert_no_errors(&defaults);
+    let torrent = &response_data(&defaults)["settings"]["torrent"];
+    assert_eq!(torrent["bannedIps"], serde_json::json!([]));
+    assert_eq!(torrent["blockPrivilegedPorts"], false);
+    assert_eq!(torrent["filterTrackers"], false);
+
+    let saved = h
+        .execute(&format!(
+            r#"mutation {{ updateSettings(input: {{ torrent: {{
+                bannedIps: [" 192.0.2.7 ", "10.0.0.0/24", "192.0.2.7", ""],
+                blockPrivilegedPorts: true, filterTrackers: true
+            }} }}) {{ torrent {{ {FIELDS} }} }} }}"#
+        ))
+        .await;
+    assert_no_errors(&saved);
+    let torrent = &response_data(&saved)["updateSettings"]["torrent"];
+    assert_eq!(
+        torrent["bannedIps"],
+        serde_json::json!(["10.0.0.0 - 10.0.0.255", "192.0.2.7"])
+    );
+    assert_eq!(torrent["blockPrivilegedPorts"], true);
+    assert_eq!(torrent["filterTrackers"], true);
+    let stored = h.db.load_config().unwrap();
+    assert_eq!(stored.torrent, h.config.read().await.torrent);
+    assert_eq!(
+        stored.torrent.banned_ips,
+        ["10.0.0.0 - 10.0.0.255", "192.0.2.7"]
+    );
+
+    let refused = h
+        .execute(r#"mutation { updateSettings(input: { torrent: { bannedIps: ["192.0.2.8", "lists.example"] } }) { torrent { bannedIps } } }"#)
+        .await;
+    assert!(!refused.errors.is_empty());
+    assert_eq!(h.db.load_config().unwrap().torrent, stored.torrent);
+
+    let cleared = h
+        .execute(r#"mutation { updateSettings(input: { torrent: { bannedIps: [] } }) { torrent { bannedIps } } }"#)
+        .await;
+    assert_no_errors(&cleared);
+    assert!(h.db.load_config().unwrap().torrent.banned_ips.is_empty());
+}
+
+// SSL torrents' listener is off until turned on and names no port until
+// one is given; a port given is kept, and null leaves the choice to the
+// sessions again.
+#[tokio::test]
+async fn the_ssl_listener_keeps_its_port() {
+    let h = TestHarness::new().await;
+    const FIELDS: &str = "sslEnabled sslPort";
+    let defaults = h
+        .execute(&format!("{{ settings {{ torrent {{ {FIELDS} }} }} }}"))
+        .await;
+    assert_no_errors(&defaults);
+    assert_eq!(
+        response_data(&defaults)["settings"]["torrent"],
+        serde_json::json!({ "sslEnabled": false, "sslPort": null })
+    );
+
+    let saved = h
+        .execute(&format!(
+            r#"mutation {{ updateSettings(input: {{ torrent: {{
+                sslEnabled: true, sslPort: 44330
+            }} }}) {{ torrent {{ {FIELDS} }} }} }}"#
+        ))
+        .await;
+    assert_no_errors(&saved);
+    assert_eq!(
+        response_data(&saved)["updateSettings"]["torrent"],
+        serde_json::json!({ "sslEnabled": true, "sslPort": 44330 })
+    );
+    let stored = h.db.load_config().unwrap().torrent;
+    assert!(stored.ssl_enabled);
+    assert_eq!(stored.ssl_port, Some(44_330));
+    assert_eq!(stored, h.config.read().await.torrent);
+
+    let cleared = h
+        .execute(&format!(
+            r#"mutation {{ updateSettings(input: {{ torrent: {{ sslPort: null }} }}) {{ torrent {{ {FIELDS} }} }} }}"#
+        ))
+        .await;
+    assert_no_errors(&cleared);
+    assert_eq!(h.db.load_config().unwrap().torrent.ssl_port, None);
+}
+
+// A request on a server started without `WEAVER_TORRENTS`.
+fn without_torrents(query: &str) -> async_graphql::Request {
+    local_request(query).data(weaver_server_core::torrents::TorrentAvailability::UNAVAILABLE)
+}
+
+fn error_code(response: &async_graphql::Response) -> Option<String> {
+    let error = response.errors.first()?;
+    serde_json::to_value(&error.extensions)
+        .ok()?
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+const PRESENCE: &str =
+    "{ torrentPresence { available enabled jobs running windingDown windDown } }";
+
+#[tokio::test]
+async fn a_server_without_torrents_refuses_turning_them_on_and_names_the_variable() {
+    let h = TestHarness::new().await;
+    let before = h.config.read().await.clone();
+    let refused = h
+        .schema
+        .execute(without_torrents(
+            "mutation { updateSettings(input: { uploadCap: 4096, torrent: { enabled: true, basePort: 51413 } }) { torrent { enabled } } }",
+        ))
+        .await;
+    assert_eq!(
+        error_code(&refused).as_deref(),
+        Some("TORRENTS_UNAVAILABLE")
+    );
+    assert!(
+        refused.errors[0].message.contains("WEAVER_TORRENTS"),
+        "{}",
+        refused.errors[0].message
+    );
+    // Nothing of the refused save was kept, in memory or stored.
+    let stored = h.db.load_config().unwrap();
+    assert!(!stored.torrent.enabled);
+    assert_ne!(stored.torrent.base_port, 51413);
+    assert_eq!(stored.upload_cap, None);
+    let live = h.config.read().await.clone();
+    assert_eq!(live.torrent, before.torrent);
+    assert_eq!(live.upload_cap, before.upload_cap);
+
+    // The settings still read, and every other torrent setting still saves.
+    let read = h
+        .schema
+        .execute(without_torrents(
+            "{ settings { torrent { enabled basePort } } }",
+        ))
+        .await;
+    assert_no_errors(&read);
+    assert_eq!(
+        response_data(&read)["settings"]["torrent"]["enabled"],
+        false
+    );
+    let saved = h
+        .schema
+        .execute(without_torrents(
+            "mutation { updateSettings(input: { torrent: { enabled: false, basePort: 51413 } }) { torrent { enabled basePort } } }",
+        ))
+        .await;
+    assert_no_errors(&saved);
+    assert_eq!(
+        response_data(&saved)["updateSettings"]["torrent"]["basePort"],
+        51413
+    );
+    assert!(!h.db.load_config().unwrap().torrent.enabled);
+}
+
+#[tokio::test]
+async fn a_server_without_torrents_says_so_whatever_is_saved() {
+    let h = TestHarness::new().await;
+    // Saved on while the server had torrents.
+    let on = h
+        .execute("mutation { updateSettings(input: { torrent: { enabled: true } }) { torrent { enabled } } }")
+        .await;
+    assert_no_errors(&on);
+    let with = h.execute(PRESENCE).await;
+    assert_no_errors(&with);
+    let presence = &response_data(&with)["torrentPresence"];
+    assert_eq!(presence["available"], true);
+    assert_eq!(presence["enabled"], true);
+
+    let without = h.schema.execute(without_torrents(PRESENCE)).await;
+    assert_no_errors(&without);
+    assert_eq!(
+        response_data(&without)["torrentPresence"],
+        serde_json::json!({
+            "available": false, "enabled": false, "jobs": false,
+            "running": false, "windingDown": false, "windDown": null
+        })
+    );
+    // The saved setting is as it was: read, and stored.
+    let read = h
+        .schema
+        .execute(without_torrents("{ settings { torrent { enabled } } }"))
+        .await;
+    assert_eq!(response_data(&read)["settings"]["torrent"]["enabled"], true);
+    assert!(h.db.load_config().unwrap().torrent.enabled);
+    // Every torrent query answers as it does while torrents are off.
+    let listed = h
+        .schema
+        .execute(without_torrents("{ torrents { id } }"))
+        .await;
+    assert_eq!(error_code(&listed).as_deref(), Some("TORRENTS_DISABLED"));
 }

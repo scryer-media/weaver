@@ -35,45 +35,189 @@ const BANNED: &[&str] = &[
     "quinn::Endpoint::client",
     "tokio::net::lookup_host",
     "std::net::ToSocketAddrs::to_socket_addrs",
+    "url::Url::socket_addrs",
     "weaver_tunnel::resolution::host_lookup",
     "weaver_tunnel::resolution::host_lookup_blocking",
     "weaver_tunnel::egress::SocketEgress::connect",
     "weaver_tunnel::egress::SocketEgress::connect_blocking",
     "weaver_tunnel::egress::SocketEgress::bind_udp",
+    "weaver_tunnel::egress::SocketEgress::bind_udp_reusing",
+    "weaver_tunnel::egress::SocketEgress::listen_tcp",
+    "weaver_tunnel::egress::SocketEgress::join_multicast",
     "weaver_nntp::route_dialer::AddressPlanned::new",
     "weaver_tunnel::pipe::Egress::new",
 ];
 
 // Every file that lifts the ban, and how many times. Each lift names why the
-// call there is the route itself, or reaches only this machine; crate roots
-// lift it for their own tests' loopback fixtures.
+// call there is the route itself, or reaches only this machine; tests open
+// their sockets through the shared loopback fixtures.
 const LIFTED: &[(&str, usize)] = &[
     ("engines/weaver-nntp/benches/body_server_availability.rs", 1),
-    ("engines/weaver-nntp/src/address_plan.rs", 2),
-    ("engines/weaver-nntp/src/lib.rs", 1),
+    ("engines/weaver-nntp/src/address_plan.rs", 1),
     ("engines/weaver-nntp/src/route_dialer.rs", 1),
     ("engines/weaver-nntp/tests/demand_throughput.rs", 1),
-    ("engines/weaver-nntp/tests/proxy_routing.rs", 1),
     ("engines/weaver-nntp/tests/socket_budget.rs", 1),
-    ("engines/weaver-nntp/tests/wireguard_throughput.rs", 1),
-    ("engines/weaver-tunnel/src/egress.rs", 2),
-    ("engines/weaver-tunnel/src/lib.rs", 2),
-    ("engines/weaver-tunnel/src/pipe.rs", 5),
-    ("engines/weaver-tunnel/src/resolution.rs", 3),
+    // The LSD's groups, on the local network alone.
+    ("engines/weaver-torrent/src/lsd.rs", 1),
+    // The kernel route's own dial, datagram bind and listener, from its
+    // device or the host's.
+    ("engines/weaver-torrent/src/network.rs", 3),
+    ("engines/weaver-torrent/src/tests/e2e_session_stop.rs", 1),
+    ("engines/weaver-tunnel/src/egress.rs", 6),
+    ("engines/weaver-tunnel/src/egress/multicast.rs", 1),
+    ("engines/weaver-tunnel/src/pipe.rs", 4),
+    // A test that builds egresses only to classify their errors.
+    ("engines/weaver-tunnel/src/pipe_tests.rs", 1),
+    ("engines/weaver-tunnel/src/resolution.rs", 2),
+    ("engines/weaver-tunnel/src/test_support/http_client.rs", 2),
+    // The loopback fixtures every crate's tests open their own sockets with.
+    ("engines/weaver-tunnel/src/test_support/loopback.rs", 8),
     ("server/app/weaver/src/commands/nzb.rs", 1),
-    ("server/app/weaver/src/main.rs", 1),
-    ("server/app/weaver/src/tray/shared.rs", 1),
-    ("server/crates/weaver-server-core/src/lib.rs", 1),
+    // The GraphQL socket tests dial their own server on loopback.
     (
-        "server/crates/weaver-server-core/src/proxies/network_runtime.rs",
+        "server/app/weaver/src/http/tests/graphql_socket_tests.rs",
+        1,
+    ),
+    ("server/app/weaver/src/tray/shared.rs", 1),
+    ("server/crates/weaver-server-composition/src/lib.rs", 1),
+    ("server/crates/weaver-server-core/src/lib.rs", 1),
+    ("server/crates/weaver-server-net-runtime/src/lib.rs", 1),
+    (
+        "server/crates/weaver-server-net-runtime/src/proxies/network_runtime.rs",
         3,
     ),
     (
-        "server/crates/weaver-server-core/src/proxies/routed_http.rs",
+        "server/crates/weaver-server-net-runtime/src/proxies/routed_http.rs",
         2,
     ),
-    ("server/crates/weaver-server-core/src/speed_test/http.rs", 1),
+    (
+        "server/crates/weaver-server-net-runtime/src/speed_test/http.rs",
+        1,
+    ),
+    ("server/crates/weaver-server-torrents/src/lib.rs", 1),
+    // A leg's clients, one built for each target and shape and kept for
+    // the leg; and the session fakes' leg on the host's own sockets, which
+    // only tests build.
+    (
+        "server/crates/weaver-server-torrents/src/torrents/net.rs",
+        2,
+    ),
+    // The torrent service's tests, moved out of the crate's own test build
+    // with the crate's test lift.
+    (
+        "server/crates/weaver-server-torrents/tests/torrents_service.rs",
+        1,
+    ),
     ("xtask/src/main.rs", 1),
+];
+
+// The lifts of the route ban that cover a whole crate, file or module
+// rather than one item: an inner attribute (`#![...]`), an `allow` (which,
+// unlike `expect`, stays silent when nothing under it trips the ban), a lift
+// with no reason, or one on a `mod`. Every other lift is an `expect` with
+// its reason on the one fixture or call it covers. Each file here, and how
+// many such lifts it holds.
+const BLANKET_LIFTED: &[(&str, usize)] = &[
+    // One lint carries the route ban and the writer gate, and the crate's
+    // tests write their own rows: see the lift's own comment.
+    ("server/crates/weaver-server-composition/src/lib.rs", 1),
+    ("server/crates/weaver-server-core/src/lib.rs", 1),
+    ("server/crates/weaver-server-net-runtime/src/lib.rs", 1),
+    ("server/crates/weaver-server-torrents/src/lib.rs", 1),
+    (
+        "server/crates/weaver-server-torrents/tests/torrents_service.rs",
+        1,
+    ),
+];
+
+// Built here so this file never counts as a lift of the host name lookup
+// lint itself.
+const DYLINT_LIFT: &str = concat!("allow(", "host_name", "_lookup)");
+
+// The lint library that refuses a name handed to the host resolver through
+// `ToSocketAddrs`, and the one CI step that runs it.
+const DYLINT_LIBRARY: &str = "lints/host_name_lookup";
+
+// Every file that lifts the host name lookup lint, and how many times: only
+// the host resolver every Host-resolved leg shares.
+const DYLINT_LIFTED: &[(&str, usize)] = &[("engines/weaver-tunnel/src/resolution.rs", 2)];
+
+// The host resolver's two forms, built here so this file never counts as a
+// caller of either.
+const HOST_RESOLVER: [&str; 2] = [
+    concat!("host", "_lookup"),
+    concat!("host", "_lookup", "_blocking"),
+];
+
+// Every call of the host resolver, by form and file. There is one path for
+// a lookup, a leg's naming, and the host's own DNS is asked only from inside
+// it, where the naming is Host: one caller of each form, in the pipe's
+// private `host_dns`. A second caller is a lookup that skips the naming.
+const HOST_RESOLVER_CALLERS: &[(&str, &str, usize)] = &[
+    (HOST_RESOLVER[0], "engines/weaver-tunnel/src/pipe.rs", 1),
+    (HOST_RESOLVER[1], "engines/weaver-tunnel/src/pipe.rs", 1),
+];
+
+// How a PostgreSQL connection is opened: sqlx resolves the database host
+// with the host's own DNS. Built here so this file never counts as one.
+const DATABASE_CONNECTS: [&str; 3] = [
+    concat!("PgPool", "Options::new()"),
+    concat!("PgConnection", "::connect"),
+    concat!("PgPool", "::connect"),
+];
+
+// Every file that opens a PostgreSQL connection, and how many times. The
+// database host is outside every route by nature, so its name goes to the
+// host's own DNS; a new connect anywhere is one more such name.
+const KNOWN_HOST_DNS: &[(&str, usize)] = &[
+    (
+        "server/crates/weaver-server-core/src/operations/backup.rs",
+        1,
+    ),
+    (
+        "server/crates/weaver-server-composition/src/operations/backup/logical.rs",
+        1,
+    ),
+    (
+        "server/crates/weaver-server-core/src/operations/backup/upgrade.rs",
+        2,
+    ),
+    (
+        "server/crates/weaver-server-core/src/operations/usage_history/tests.rs",
+        1,
+    ),
+    (
+        "server/crates/weaver-server-composition/src/persistence/connection/tests.rs",
+        2,
+    ),
+    (
+        "server/crates/weaver-server-composition/src/persistence/connection/test_schema.rs",
+        1,
+    ),
+    (
+        "server/crates/weaver-server-composition/src/persistence/postgres_migrations.rs",
+        2,
+    ),
+    (
+        "server/crates/weaver-server-composition/src/persistence/setup.rs",
+        1,
+    ),
+    (
+        "server/crates/weaver-server-db/src/persistence/sql_services.rs",
+        1,
+    ),
+    (
+        "server/crates/weaver-server-core/tests/browser_session_contract.rs",
+        1,
+    ),
+    (
+        "server/crates/weaver-server-core/tests/initial_setup_contract.rs",
+        1,
+    ),
+    (
+        "server/crates/weaver-server-core/tests/network_access_transaction_contract.rs",
+        1,
+    ),
 ];
 
 // The crates that open connections of their own, and every crate allowed to
@@ -86,10 +230,38 @@ const CLIENT_CRATES: &[(&str, &[&str])] = &[
             "artifact-trust",
             "weaver",
             "weaver-server-api",
+            // The routed client and the speed test, moved down from the
+            // pipeline with their files.
+            "weaver-server-composition",
             "weaver-server-core",
+            // The routed client and the speed test legs, moved down from
+            // composition with their files.
+            "weaver-server-net-runtime",
+            // The RSS service and poller and the NZB fetch of a submission,
+            // moved up from the pipeline with their files.
+            "weaver-server-orchestration",
+            "weaver-server-pipeline",
+            "weaver-server-torrents",
+            // The torrent session builds no client: it takes every one,
+            // the port mappers' too, from `torrents::net`, built on the route.
+            "weaver-torrent",
+            // Only under `test-support`: a finished client on the host's
+            // egress for consumers' tests, never in a product build.
+            "weaver-tunnel",
         ],
     ),
-    ("hyper", &["axum", "hyper-rustls", "hyper-util", "reqwest"]),
+    (
+        "hyper",
+        &[
+            "axum",
+            "hyper-rustls",
+            "hyper-util",
+            "reqwest",
+            // DNS over HTTPS, on the TLS stream the hop's own dialer opened:
+            // no pooled client, no connector, no resolver.
+            "weaver-tunnel",
+        ],
+    ),
     ("hyper-util", &["axum", "hyper-rustls", "reqwest"]),
     (
         "quinn",
@@ -110,7 +282,6 @@ const FORBIDDEN_CRATES: &[&str] = &[
     "isahc",
     "minreq",
     "surf",
-    "tokio-socks",
     "trust-dns-resolver",
     "ureq",
 ];
@@ -134,7 +305,7 @@ fn every_lift_of_the_route_ban_is_pinned() {
     let root = workspace();
     let mut found = BTreeMap::new();
     for dir in ["engines", "server", "shared", "xtask"] {
-        count_lifts(&root, &root.join(dir), &mut found);
+        count_in(&root, &root.join(dir), &route_lifts, &mut found);
     }
     let pinned: BTreeMap<String, usize> = LIFTED
         .iter()
@@ -147,7 +318,92 @@ fn every_lift_of_the_route_ban_is_pinned() {
     );
 }
 
-fn count_lifts(root: &Path, dir: &Path, found: &mut BTreeMap<String, usize>) {
+// Lifts of the route ban in `text`. A lift of the write ban is pinned by the
+// write guard instead.
+fn route_lifts(text: &str) -> usize {
+    text.match_indices(LIFT)
+        .filter(|(at, _)| !writer_gate_lift(&text[at + LIFT.len()..]))
+        .count()
+}
+
+// Lifts of the route ban in `text` that cover more than one item: see
+// `BLANKET_LIFTED`.
+fn blanket_route_lifts(text: &str) -> usize {
+    text.match_indices(LIFT)
+        .filter(|(at, _)| !writer_gate_lift(&text[at + LIFT.len()..]))
+        .filter(|(at, _)| {
+            let before = &text[..*at];
+            let Some(start) = before.rfind("#[").max(before.rfind("#![")) else {
+                return true;
+            };
+            let opening = &before[start..];
+            let rest = &text[at + LIFT.len()..];
+            let Some(close) = rest.find(")]") else {
+                return true;
+            };
+            let item = rest[close + 2..].trim_start();
+            // Any further attributes on the same item come before it.
+            let item = item
+                .lines()
+                .map(str::trim_start)
+                .find(|line| !line.is_empty() && !line.starts_with("#[") && !line.starts_with("//"))
+                .unwrap_or_default();
+            opening.starts_with("#![")
+                || opening.contains("allow(")
+                || !rest[..close].contains("reason")
+                || item.starts_with("mod ")
+                || item.starts_with("pub mod ")
+                || item.starts_with("pub(crate) mod ")
+        })
+        .count()
+}
+
+#[test]
+fn no_lift_of_the_route_ban_covers_a_whole_crate_or_file() {
+    let root = workspace();
+    let mut found = BTreeMap::new();
+    for dir in ["engines", "server", "shared", "xtask"] {
+        count_in(&root, &root.join(dir), &blanket_route_lifts, &mut found);
+    }
+    let pinned: BTreeMap<String, usize> = BLANKET_LIFTED
+        .iter()
+        .map(|(path, count)| ((*path).to_owned(), *count))
+        .collect();
+    assert_eq!(
+        found, pinned,
+        "the route ban is lifted for a whole crate, file or module: lift it with \
+         an `expect` with its reason on the one shared fixture \
+         or call that needs it instead"
+    );
+}
+
+#[test]
+fn a_blanket_lift_is_told_from_a_scoped_one() {
+    let lift = |attribute: &str| format!("{attribute}\nfn fixture() {{}}\n");
+    for blanket in [
+        format!("#![cfg_attr(test, allow({LIFT}))]\n"),
+        format!("#![allow({LIFT})]\n"),
+        format!("#![expect({LIFT}, reason = \"tests\")]\n"),
+        lift(&format!("#[allow({LIFT})]")),
+        lift(&format!("#[expect({LIFT})]")),
+        format!("#[expect({LIFT}, reason = \"fixtures\")]\n#[cfg(test)]\nmod fixtures;\n"),
+    ] {
+        assert_eq!(blanket_route_lifts(&blanket), 1, "{blanket}");
+    }
+    let scoped = format!(
+        "#[expect(\n    {LIFT},\n    reason = \"a loopback fixture\"\n)]\npub fn connect() {{}}\n"
+    );
+    assert_eq!(blanket_route_lifts(&scoped), 0);
+    assert_eq!(route_lifts(&scoped), 1);
+}
+
+// `count` of every Rust file under `dir`, for the files where it is not zero.
+fn count_in(
+    root: &Path,
+    dir: &Path,
+    count: &dyn Fn(&str) -> usize,
+    found: &mut BTreeMap<String, usize>,
+) {
     for entry in std::fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
         if path.is_dir() {
@@ -155,21 +411,140 @@ fn count_lifts(root: &Path, dir: &Path, found: &mut BTreeMap<String, usize>) {
                 .file_name()
                 .is_some_and(|name| name == "target" || name == "node_modules")
             {
-                count_lifts(root, &path, found);
+                count_in(root, &path, count, found);
             }
         } else if path.extension().is_some_and(|extension| extension == "rs") {
-            // A lift of the write ban is pinned by the write guard instead.
-            let text = std::fs::read_to_string(&path).unwrap();
-            let count = text
-                .match_indices(LIFT)
-                .filter(|(at, _)| !writer_gate_lift(&text[at + LIFT.len()..]))
-                .count();
+            let count = count(&std::fs::read_to_string(&path).unwrap());
             if count > 0 {
                 let relative = path.strip_prefix(root).unwrap();
                 found.insert(relative.to_string_lossy().replace('\\', "/"), count);
             }
         }
     }
+}
+
+#[test]
+fn every_lift_of_the_host_name_lookup_lint_is_pinned() {
+    let root = workspace();
+    let mut found = BTreeMap::new();
+    for dir in ["engines", "server", "shared", "xtask"] {
+        count_in(
+            &root,
+            &root.join(dir),
+            &|text| text.matches(DYLINT_LIFT).count(),
+            &mut found,
+        );
+    }
+    let pinned: BTreeMap<String, usize> = DYLINT_LIFTED
+        .iter()
+        .map(|(path, count)| ((*path).to_owned(), *count))
+        .collect();
+    assert_eq!(
+        found, pinned,
+        "the host name lookup lint is lifted somewhere new: resolve through the leg's naming \
+         and dial the address instead, or pin the lift here once its reason is reviewed"
+    );
+}
+
+// Calls of the function `name` in `text`: each `name(` that is not part of
+// a longer name and is not its definition.
+fn calls_of(text: &str, name: &str) -> usize {
+    let call = format!("{name}(");
+    text.match_indices(&call)
+        .filter(|(at, _)| {
+            let before = &text[..*at];
+            !before
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                && !before.ends_with("fn ")
+        })
+        .count()
+}
+
+#[test]
+fn the_host_resolver_has_one_caller_of_each_form() {
+    let root = workspace();
+    let mut found = BTreeSet::new();
+    for name in HOST_RESOLVER {
+        let mut files = BTreeMap::new();
+        for dir in ["engines", "server", "shared", "xtask"] {
+            count_in(
+                &root,
+                &root.join(dir),
+                &|text| calls_of(text, name),
+                &mut files,
+            );
+        }
+        found.extend(
+            files
+                .into_iter()
+                .map(|(file, count)| (name.to_owned(), file, count)),
+        );
+    }
+    let pinned: BTreeSet<(String, String, usize)> = HOST_RESOLVER_CALLERS
+        .iter()
+        .map(|(name, file, count)| ((*name).to_owned(), (*file).to_owned(), *count))
+        .collect();
+    assert_eq!(
+        found, pinned,
+        "the host resolver is called somewhere new: resolve through the leg's naming, \
+         `Dialer::resolve`, which asks the host's DNS only where the naming is Host"
+    );
+}
+
+#[test]
+fn every_database_connect_is_pinned() {
+    let root = workspace();
+    let mut found = BTreeMap::new();
+    for dir in ["engines", "server", "shared", "xtask"] {
+        count_in(
+            &root,
+            &root.join(dir),
+            &|text| {
+                DATABASE_CONNECTS
+                    .iter()
+                    .map(|connect| text.matches(connect).count())
+                    .sum()
+            },
+            &mut found,
+        );
+    }
+    let pinned: BTreeMap<String, usize> = KNOWN_HOST_DNS
+        .iter()
+        .map(|(path, count)| ((*path).to_owned(), *count))
+        .collect();
+    assert_eq!(
+        found, pinned,
+        "a PostgreSQL connection opens somewhere new or moved: its host resolves with the \
+         host's own DNS, so pin it here once that is reviewed"
+    );
+}
+
+#[test]
+fn the_host_name_lookup_lint_is_a_dylint_library() {
+    let manifest = manifest_at(&workspace().join(DYLINT_LIBRARY).join("Cargo.toml"));
+    assert_eq!(
+        manifest["package"]["name"].as_str(),
+        Some("host_name_lookup")
+    );
+    assert_eq!(
+        manifest["lib"]["crate-type"].as_array().unwrap(),
+        &[toml::Value::from("cdylib")]
+    );
+    // Its own workspace, so the root build never compiles it.
+    assert!(manifest.contains_key("workspace"));
+}
+
+#[test]
+fn ci_runs_the_host_name_lookup_lint() {
+    let workflow =
+        std::fs::read_to_string(workspace().join(".github/workflows/deploy.yml")).unwrap();
+    let step = format!("cargo dylint --path {DYLINT_LIBRARY} --workspace -- --locked");
+    assert!(
+        workflow.contains(&step),
+        "deploy.yml no longer runs the host name lookup lint"
+    );
 }
 
 #[test]
@@ -199,6 +574,196 @@ fn only_pinned_crates_carry_a_network_client() {
     }
 }
 
+// The lockfile cannot tell a product edge from a test one, so weaver-tunnel's
+// pin above holds only while its manifest keeps reqwest optional, turned on
+// by its test-support feature alone.
+#[test]
+fn the_tunnels_client_is_for_tests_alone() {
+    let path = workspace().join("engines/weaver-tunnel/Cargo.toml");
+    let manifest: toml::Table = std::fs::read_to_string(path).unwrap().parse().unwrap();
+    let reqwest = manifest
+        .get("dependencies")
+        .and_then(|dependencies| dependencies.get("reqwest"));
+    assert_eq!(
+        reqwest
+            .and_then(|reqwest| reqwest.get("optional"))
+            .and_then(toml::Value::as_bool),
+        Some(true),
+        "weaver-tunnel's reqwest must stay an optional dependency"
+    );
+    let elsewhere: Vec<String> = ["build-dependencies", "target"]
+        .into_iter()
+        .filter(|table| {
+            manifest
+                .get(*table)
+                .is_some_and(|value| value.to_string().contains("reqwest"))
+        })
+        .map(str::to_owned)
+        .collect();
+    let turned_on_by: Vec<&str> = manifest["features"]
+        .as_table()
+        .unwrap()
+        .iter()
+        .filter(|(_, enables)| {
+            enables.as_array().unwrap().iter().any(|feature| {
+                let feature = feature.as_str().unwrap();
+                feature.trim_start_matches("dep:").split(['/', '?']).next() == Some("reqwest")
+            })
+        })
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert_eq!(turned_on_by, ["test-support"]);
+    assert!(
+        elsewhere.is_empty(),
+        "weaver-tunnel names reqwest in {elsewhere:?}"
+    );
+}
+
+// weaver-tunnel's test-support feature, which carries its client, is on
+// only where a crate's tests turn it on: never by default, and never through
+// a dependency a product build takes.
+#[test]
+fn the_tunnels_test_support_is_never_built_into_a_product() {
+    let root = workspace();
+    let workspace_manifest = manifest_at(&root.join("Cargo.toml"));
+    let members: Vec<String> = workspace_manifest["workspace"]["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|member| member.as_str().unwrap().to_owned())
+        .collect();
+    let manifests: Vec<(String, toml::Table)> = members
+        .iter()
+        .map(|member| {
+            let manifest = manifest_at(&root.join(member).join("Cargo.toml"));
+            let name = manifest["package"]["name"].as_str().unwrap().to_owned();
+            (name, manifest)
+        })
+        .collect();
+
+    // Every feature of every member that turns the tunnel's test support on.
+    let mut turning_on = BTreeSet::from([("weaver-tunnel".to_owned(), "test-support".to_owned())]);
+    loop {
+        let before = turning_on.len();
+        for (name, manifest) in &manifests {
+            let Some(features) = manifest.get("features").and_then(toml::Value::as_table) else {
+                continue;
+            };
+            for (feature, enables) in features {
+                let turns_on = enables.as_array().unwrap().iter().any(|enabled| {
+                    let enabled = enabled.as_str().unwrap();
+                    let (crate_name, enabled) = match enabled.split_once('/') {
+                        Some((dependency, enabled)) => (
+                            package_of(manifest, dependency.trim_end_matches('?')),
+                            enabled,
+                        ),
+                        None => (name.clone(), enabled),
+                    };
+                    turning_on.contains(&(crate_name, enabled.to_owned()))
+                });
+                if turns_on {
+                    turning_on.insert((name.clone(), feature.clone()));
+                }
+            }
+        }
+        if turning_on.len() == before {
+            break;
+        }
+    }
+    // A member built by default, a product binary among them, never builds
+    // it.
+    let by_default: Vec<&String> = turning_on
+        .iter()
+        .filter(|(_, feature)| feature == "default")
+        .map(|(name, _)| name)
+        .collect();
+    assert!(
+        by_default.is_empty(),
+        "default features turn on the tunnel's test support: {by_default:?}"
+    );
+
+    let mut product_edges = Vec::new();
+    let workspace_dependencies = workspace_manifest["workspace"]
+        .get("dependencies")
+        .and_then(toml::Value::as_table);
+    if let Some(dependencies) = workspace_dependencies {
+        product_edges.extend(turning_on_through(
+            "the workspace",
+            dependencies,
+            &turning_on,
+        ));
+    }
+    for (name, manifest) in &manifests {
+        let mut tables = Vec::new();
+        for kind in ["dependencies", "build-dependencies"] {
+            tables.extend(manifest.get(kind).and_then(toml::Value::as_table));
+            for target in manifest
+                .get("target")
+                .and_then(toml::Value::as_table)
+                .into_iter()
+                .flat_map(|targets| targets.values())
+            {
+                tables.extend(target.get(kind).and_then(toml::Value::as_table));
+            }
+        }
+        for dependencies in tables {
+            product_edges.extend(turning_on_through(name, dependencies, &turning_on));
+        }
+    }
+    assert!(
+        product_edges.is_empty(),
+        "a product dependency turns weaver-tunnel's test support on: {product_edges:?}"
+    );
+}
+
+fn manifest_at(path: &Path) -> toml::Table {
+    std::fs::read_to_string(path).unwrap().parse().unwrap()
+}
+
+// The package a manifest's dependency `key` names.
+fn package_of(manifest: &toml::Table, key: &str) -> String {
+    ["dependencies", "dev-dependencies", "build-dependencies"]
+        .into_iter()
+        .filter_map(|kind| manifest.get(kind)?.get(key)?.get("package")?.as_str())
+        .next()
+        .unwrap_or(key)
+        .to_owned()
+}
+
+// Each dependency in `dependencies` whose features, its default ones among
+// them, include one of `turning_on`.
+fn turning_on_through(
+    owner: &str,
+    dependencies: &toml::Table,
+    turning_on: &BTreeSet<(String, String)>,
+) -> Vec<String> {
+    dependencies
+        .iter()
+        .filter(|(key, dependency)| {
+            let package = dependency
+                .get("package")
+                .and_then(toml::Value::as_str)
+                .unwrap_or(key);
+            let defaults = dependency
+                .get("default-features")
+                .and_then(toml::Value::as_bool)
+                .unwrap_or(true);
+            let features = dependency
+                .get("features")
+                .and_then(toml::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(toml::Value::as_str);
+            defaults
+                .then_some("default")
+                .into_iter()
+                .chain(features)
+                .any(|feature| turning_on.contains(&(package.to_owned(), feature.to_owned())))
+        })
+        .map(|(key, _)| format!("{owner} -> {key}"))
+        .collect()
+}
+
 // Each package in a lockfile, with the names of the packages it depends on.
 fn lock_packages(lock: &str) -> Vec<(String, Vec<String>)> {
     lock.split("[[package]]")
@@ -223,4 +788,34 @@ fn lock_packages(lock: &str) -> Vec<(String, Vec<String>)> {
             (name, dependencies)
         })
         .collect()
+}
+
+// The torrent engine looks no name up by itself: every name a session asks
+// for goes through the resolver its embedder gives it, which for Weaver is
+// the leg's, on the resolution record.
+#[test]
+fn the_torrent_engine_looks_no_name_up_itself() {
+    let mut found = Vec::new();
+    lookups_in(&workspace().join("engines/weaver-torrent/src"), &mut found);
+    assert!(
+        found.is_empty(),
+        "the torrent engine resolves on its own in {found:?}"
+    );
+}
+
+fn lookups_in(dir: &Path, found: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            lookups_in(&path, found);
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            let source = std::fs::read_to_string(&path).unwrap();
+            if ["lookup_host", "ToSocketAddrs", ".to_socket_addrs("]
+                .iter()
+                .any(|call| source.contains(call))
+            {
+                found.push(path);
+            }
+        }
+    }
 }

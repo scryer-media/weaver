@@ -17,7 +17,7 @@ import {
 } from "@/graphql/queries";
 import { useGraphqlConnectionState } from "@/graphql/client";
 import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
-import { normalizeJobData, type GraphqlJobData, type JobData } from "@/lib/job-types";
+import { normalizeJobData, type GraphqlJobData, type JobData, type JobProtocol } from "@/lib/job-types";
 import type { QueuePageInput, QueueStateCount } from "./queue-page";
 
 /**
@@ -46,6 +46,7 @@ const EMPTY_STATE_COUNTS: QueueStateCount[] = [];
 const EMPTY_CATEGORIES: string[] = [];
 const EMPTY_JOBS: JobData[] = [];
 const EMPTY_CATEGORY_COUNTS: { category: string; count: number }[] = [];
+const EMPTY_PROTOCOL_COUNTS: { protocol: JobProtocol; count: number }[] = [];
 const EMPTY_ETA_THROUGH: { id: number; bytesThrough: number }[] = [];
 
 interface QueueTotals {
@@ -152,6 +153,7 @@ interface QueuePageData {
   items: GraphqlJobData[];
   totalCount: number;
   categoryCounts: { category: string; count: number }[];
+  protocolCounts: { protocol: JobProtocol; count: number }[];
   stateCounts: QueueStateCount[];
   remainingBytes: number;
   etaTotalBytes: number;
@@ -165,6 +167,7 @@ export interface LiveQueuePage {
   /** Jobs the page's filters match, across every page. */
   totalCount: number;
   categoryCounts: { category: string; count: number }[];
+  protocolCounts: { protocol: JobProtocol; count: number }[];
   stateCounts: QueueStateCount[];
   remainingBytes: number;
   etaTotalBytes: number;
@@ -225,6 +228,7 @@ export function useQueuePage(input: QueuePageInput): LiveQueuePage {
     jobs,
     totalCount: page?.totalCount ?? 0,
     categoryCounts: page?.categoryCounts ?? EMPTY_CATEGORY_COUNTS,
+    protocolCounts: page?.protocolCounts ?? EMPTY_PROTOCOL_COUNTS,
     stateCounts: page?.stateCounts ?? EMPTY_STATE_COUNTS,
     remainingBytes: page?.remainingBytes ?? 0,
     etaTotalBytes: page?.etaTotalBytes ?? 0,

@@ -1,0 +1,37 @@
+[package]
+name = "weaver-server-disk"
+description = "Disk operations and storage probes for the Weaver server"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[features]
+# Test hooks that other crates' tests use. Never enabled outside
+# dev-dependencies.
+test-support = ["weaver-server-base/test-support"]
+
+[dependencies]
+weaver-server-base = { path = "../weaver-server-base" }
+weaver-graph = { path = "../../../engines/weaver-graph" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true }
+libc = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+cap-std = { workspace = true }
+tempfile = { workspace = true }
+getrandom = { workspace = true, default-features = false }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_JobObjects", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+
+[dev-dependencies]
+sevenz-turbo = { workspace = true }
+weaver-server-base = { path = "../weaver-server-base", features = ["test-support"] }
+# `test-util` for the paused clock.
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = { workspace = true }
+serde_json = { workspace = true }

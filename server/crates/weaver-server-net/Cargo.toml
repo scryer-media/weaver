@@ -1,0 +1,33 @@
+[package]
+name = "weaver-server-net"
+description = "Server network routing, bandwidth and NNTP server records"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[features]
+test-support = []
+
+[dependencies]
+if-addrs = "0.15.0"
+serde_json = { workspace = true }
+hex = { workspace = true }
+sha1 = { workspace = true }
+weaver-server-disk = { path = "../weaver-server-disk" }
+async-trait = "0.1"
+chrono = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+weaver-nntp = { path = "../../../engines/weaver-nntp", default-features = false }
+weaver-server-base = { path = "../weaver-server-base" }
+weaver-server-db = { path = "../weaver-server-db" }
+weaver-server-jobs = { path = "../weaver-server-jobs" }
+weaver-torrent = { workspace = true }
+weaver-tunnel = { path = "../../../engines/weaver-tunnel" }
+
+[dev-dependencies]
+weaver-server-base = { path = "../weaver-server-base", features = ["test-support"] }
+http = { workspace = true }
+base64 = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

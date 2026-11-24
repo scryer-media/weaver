@@ -292,7 +292,12 @@ impl Object for RarRecord {
         None
     }
 
-    fn claim(&mut self, _name: &str, _first_bytes: &[u8], _length: Option<u64>) -> Claim {
+    fn claim(
+        &mut self,
+        _name: &str,
+        _first_bytes: weaver_graph::Clean<'_>,
+        _length: Option<u64>,
+    ) -> Claim {
         Claim::default()
     }
 
@@ -318,6 +323,19 @@ impl Object for RarRecord {
 }
 
 impl Recovery for RarRecord {
+    fn rebuilds(&self) -> bool {
+        true
+    }
+
+    // It sits inside the volume it protects, and protects that volume only.
+    fn carried_inside(&self) -> bool {
+        true
+    }
+
+    fn outgrows_recovery(&self) -> bool {
+        false
+    }
+
     // The volume the record sits in, by the name it was bound under; once
     // found it stays the member while the namespace holds it, whatever it
     // is called since.
@@ -337,6 +355,10 @@ impl Recovery for RarRecord {
     // The volume it sits in, unless it could not read itself there.
     fn covers(&self, member: MemberId) -> bool {
         self.member == Some(member) && self.said != Some(Said::Unread)
+    }
+
+    fn covers_some(&self) -> bool {
+        self.member.is_some() && self.said != Some(Said::Unread)
     }
 
     // The articles' checksums are of the bytes as posted, and the record's

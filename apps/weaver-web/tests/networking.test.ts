@@ -3,7 +3,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { allocation, directLeg, routeInput, routeProblem, routeTargets, adjustWeight, appendLeg, removeLeg } from "../src/lib/networking.ts";
+import { allocation, directLeg, routeInput, routeProblem, routeTargets, adjustWeight, appendLeg, removeLeg, torrentRouteFault, type NetworkRoute, type Rung } from "../src/lib/networking.ts";
 import { blockedRouting, policyAsRoute, routeFields } from "../src/lib/proxies.ts";
 
 test("apportionment uses largest remainders with stable positional ties",()=>{
@@ -61,8 +61,30 @@ test("a ladder that repeats a proxy, or a leg on a disabled egress, cannot be sa
   assert.equal(routeProblem(viaPool,{pools}),"proxyRepeated");
   assert.equal(routeProblem(ladder([{kind:"PROXY",proxyId:3,poolId:null,chainIds:[]},{kind:"CHAIN",proxyId:null,poolId:null,chainIds:[4,3]}])),"proxyRepeated");
   assert.equal(routeProblem(ladder([{kind:"PROXY",proxyId:3,poolId:null,chainIds:[]},{kind:"POOL",proxyId:null,poolId:5,chainIds:[]}]),{pools}),null);
-  const egress=(enabled:boolean)=>[{id:7,name:"e",bindingKind:"INTERFACE" as const,interfaceName:"e0",sourceAddress:null,enabled,maxDownloadSpeed:0,health:"UP",reason:null}];
+  const egress=(enabled:boolean)=>[{id:7,name:"e",bindingKind:"INTERFACE" as const,interfaceName:"e0",sourceAddress:null,enabled,downloadBps:null,uploadBps:null,health:"UP",reason:null}];
   const direct={failover:"HOLD" as const,legs:[{...directLeg(),egressId:7}]};
   assert.equal(routeProblem(direct,{egresses:egress(false)}),"egressDisabled");
   assert.equal(routeProblem(direct,{egresses:egress(true)}),null);
+});
+
+test("a torrent route is one leg with one exit",()=>{
+  const pools=[{id:5,name:"pool",kind:"SOCKS5" as const,memberIds:[1,2],enabled:true}];
+  const proxy=(proxyId:number)=>({kind:"PROXY" as const,proxyId,poolId:null,chainIds:[]});
+  const ladder=(rungs:Rung[],directFallback=false):NetworkRoute=>({failover:"HOLD",legs:[{egressId:0,weight:100,path:{kind:"LADDER",directFallback,rungs}}]});
+  const direct:NetworkRoute={failover:"HOLD",legs:[directLeg()]};
+  const accepted=[direct,ladder([proxy(3)]),ladder([{kind:"CHAIN",proxyId:null,poolId:null,chainIds:[3,4]}]),ladder([{kind:"POOL",proxyId:null,poolId:5,chainIds:[]}])];
+  const refused:[NetworkRoute,string][]=[
+    [{failover:"HOLD",legs:[{...directLeg(),weight:50},{...directLeg(),weight:50}]},"TORRENT_ROUTE_LEGS"],
+    [ladder([proxy(3)],true),"TORRENT_ROUTE_DIRECT_FALLBACK"],
+    [ladder([proxy(3),proxy(4)]),"TORRENT_ROUTE_RUNGS"],
+  ];
+  for(const route of accepted)assert.equal(torrentRouteFault(route),null);
+  for(const [route,fault] of refused)assert.equal(torrentRouteFault(route),fault);
+  // A ladder with no rung that never goes direct, the kill switch, has no second exit either.
+  assert.equal(torrentRouteFault(ladder([])),null);
+  for(const kind of ["TORRENT_DEFAULT","TORRENT_CATEGORY","TORRENT_TRACKER"] as const){
+    for(const route of accepted)assert.equal(routeProblem(route,{pools,kind}),null);
+    for(const [route,fault] of refused)assert.equal(routeProblem(route,{pools,kind}),fault);
+  }
+  for(const [route] of refused)assert.equal(routeProblem(route,{pools,kind:"SERVER"}),null);
 });

@@ -144,18 +144,30 @@ async fn configured_storage_merges_equal_paths_and_keeps_unavailable_paths() {
         config.intermediate_dir = Some(intermediate_dir.display().to_string());
         config.categories = vec![
             CategoryConfig {
+                upload_cap: Default::default(),
+                seeding: None,
+                torrent_route: false,
+                unpack: None,
                 id: 1,
                 name: "Movies".to_string(),
                 dest_dir: Some(complete_dir.display().to_string()),
                 aliases: String::new(),
             },
             CategoryConfig {
+                upload_cap: Default::default(),
+                seeding: None,
+                torrent_route: false,
+                unpack: None,
                 id: 2,
                 name: "TV".to_string(),
                 dest_dir: None,
                 aliases: String::new(),
             },
             CategoryConfig {
+                upload_cap: Default::default(),
+                seeding: None,
+                torrent_route: false,
+                unpack: None,
                 id: 3,
                 name: "Unavailable".to_string(),
                 dest_dir: Some(missing_dir.display().to_string()),
@@ -258,6 +270,10 @@ async fn storage_queries_answer_configured_folders_from_the_cache() {
             name: "TV".to_string(),
             dest_dir: None,
             aliases: String::new(),
+            upload_cap: Default::default(),
+            seeding: None,
+            torrent_route: false,
+            unpack: None,
         }];
         (
             data_dir,
@@ -377,6 +393,10 @@ async fn a_configured_folder_not_made_yet_answers_as_before() {
             name: "Later".to_string(),
             dest_dir: Some(missing.display().to_string()),
             aliases: String::new(),
+            upload_cap: Default::default(),
+            seeding: None,
+            torrent_route: false,
+            unpack: None,
         }];
         (
             data_dir,

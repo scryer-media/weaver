@@ -1,0 +1,453 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+//! The classes of job the queue routes by: one object per protocol, which
+//! alone answers for its jobs. The queue, the job layer and the intakes ask
+//! the registry for a job's class and hand the class the work; none of them
+//! names a class. A new class is one `Protocol` variant, its row in the
+//! protocol table, one `JobClass` and one call to `JobClasses::seat`.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, OnceLock};
+
+use crate::ingest::Kind;
+use crate::jobs::error::SchedulerError;
+use crate::jobs::handle::JobInfo;
+use crate::jobs::handle::{CancellationOrigin, QueueAction};
+use crate::jobs::model::Protocol;
+use crate::pipeline::queue::Queue;
+use crate::settings::SeedingPolicy;
+use weaver_server_base::jobs::ids::JobId;
+
+/// One `T` for each protocol, indexed by protocol: a protocol added to the
+/// table adds its entry here with no site of its own.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct ByProtocol<T>([T; Protocol::COUNT]);
+
+impl<T> ByProtocol<T> {
+    /// The entries in the table's order, one per protocol.
+    pub const fn new(entries: [T; Protocol::COUNT]) -> Self {
+        Self(entries)
+    }
+
+    /// Each protocol with its entry, in the table's order.
+    pub fn iter(&self) -> impl Iterator<Item = (Protocol, &T)> {
+        Protocol::ALL.iter().copied().zip(&self.0)
+    }
+}
+
+/// Each protocol with its entry, in the table's order, taken.
+impl<T> IntoIterator for ByProtocol<T> {
+    type Item = (Protocol, T);
+    type IntoIter = std::iter::Zip<
+        std::iter::Copied<std::slice::Iter<'static, Protocol>>,
+        std::array::IntoIter<T, { Protocol::COUNT }>,
+    >;
+
+    fn into_iter(self) -> Self::IntoIter {
+        Protocol::ALL.iter().copied().zip(self.0)
+    }
+}
+
+impl<T> std::ops::Index<Protocol> for ByProtocol<T> {
+    type Output = T;
+
+    fn index(&self, protocol: Protocol) -> &T {
+        &self.0[protocol.index()]
+    }
+}
+
+impl<T> std::ops::IndexMut<Protocol> for ByProtocol<T> {
+    fn index_mut(&mut self, protocol: Protocol) -> &mut T {
+        &mut self.0[protocol.index()]
+    }
+}
+
+/// The class whose jobs are the pipeline's own rows: every job no other
+/// class published.
+pub const PIPELINE: Protocol = Protocol::Nzb;
+
+pub use weaver_server_net::bandwidth::limits::ClassRates;
+pub use weaver_server_net::proxies::give_back::{Owed, TunnelGiveBack};
+
+/// A class's side of the global limits.
+pub trait ClassRate: Send + Sync {
+    /// Measure the class: what it received at since it was last measured,
+    /// in bytes per second. Its own shares follow it.
+    fn sample(&self) -> u64;
+    /// Put the class's download and upload rates in force.
+    fn set_rates(&self, rates: ClassRates);
+}
+
+/// What an intake hands a class to add: the payload as classified and what
+/// the intake asks of the job. NZB intake stays on each intake's own path.
+#[derive(Debug, Clone)]
+pub struct Submission {
+    pub kind: Kind,
+    pub bytes: Vec<u8>,
+    pub category: Option<String>,
+    pub metadata: Vec<(String, String)>,
+    pub tags: Vec<String>,
+    pub paused: bool,
+    pub forced: bool,
+    // Whether its archives are extracted; `None` inherits.
+    pub unpack: Option<bool>,
+    pub policy_override: Option<SeedingPolicy>,
+}
+
+impl Submission {
+    /// A submission of `kind`, holding `bytes`, with nothing else asked.
+    pub fn of(kind: Kind, bytes: Vec<u8>) -> Self {
+        Self {
+            kind,
+            bytes,
+            category: None,
+            metadata: Vec::new(),
+            tags: Vec::new(),
+            paused: false,
+            forced: false,
+            unpack: None,
+            policy_override: None,
+        }
+    }
+}
+
+/// Why a class refused an add, as its callers tell refusals apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalReason {
+    /// No class is running for the payload's protocol.
+    NotRunning,
+    /// The class runs and takes no new jobs now; one may be added later.
+    Off,
+    /// This run of the server has no such class at all, and gains none
+    /// until it is started anew with it. Held as `Off` is: nothing about
+    /// the payload is wrong.
+    Unavailable,
+    /// The payload cannot be read as the class's.
+    Invalid,
+    /// The class's admission refused it.
+    Refused,
+    /// The same job is still being removed; it may be added again once
+    /// that ends.
+    Removing,
+    /// The job is already in the queue, as this id.
+    Duplicate(JobId),
+    /// Nothing can carry it now.
+    NoNetwork,
+    /// The class could not record it.
+    State,
+    /// The class runs and takes no jobs from the intakes at all.
+    NoIntake,
+}
+
+/// A class's refusal of an add, in the class's own words.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{text}")]
+pub struct AddRefusal {
+    pub reason: RefusalReason,
+    pub text: String,
+}
+
+impl AddRefusal {
+    /// The refusal of an add to `protocol` while no class runs for it.
+    pub fn not_running(protocol: Protocol) -> Self {
+        Self {
+            reason: RefusalReason::NotRunning,
+            text: format!("the {} is not running", protocol.names().runner),
+        }
+    }
+
+    /// The refusal of an add to `protocol` whose class runs and takes no
+    /// jobs from the intakes.
+    pub fn no_intake(protocol: Protocol) -> Self {
+        Self {
+            reason: RefusalReason::NoIntake,
+            text: format!(
+                "the {} takes no new jobs from here",
+                protocol.names().runner
+            ),
+        }
+    }
+
+    /// Whether the same add may be taken later, as it stands.
+    pub const fn transient(&self) -> bool {
+        match self.reason {
+            RefusalReason::NotRunning
+            | RefusalReason::Off
+            | RefusalReason::Unavailable
+            | RefusalReason::NoNetwork
+            | RefusalReason::State => true,
+            RefusalReason::Invalid
+            | RefusalReason::Refused
+            | RefusalReason::Removing
+            | RefusalReason::Duplicate(_)
+            | RefusalReason::NoIntake => false,
+        }
+    }
+}
+
+/// How a class takes new jobs from the intakes.
+#[async_trait::async_trait]
+pub trait ClassIntake: Send + Sync {
+    /// Whether the class takes new jobs now, and its refusal when it does
+    /// not.
+    fn takes_new(&self) -> Result<(), AddRefusal>;
+    /// Add the job `submission` asks for.
+    async fn add(&self, submission: Submission) -> Result<JobId, AddRefusal>;
+}
+
+/// One class of job. Each job id has one class: the one that published it,
+/// or else the pipeline.
+#[async_trait::async_trait]
+pub trait JobClass: Send + Sync {
+    fn protocol(&self) -> Protocol;
+
+    /// Every queue action of one request on this class's jobs, as one call:
+    /// each job answered on its own.
+    async fn act(
+        &self,
+        actions: Vec<(JobId, QueueAction)>,
+    ) -> BTreeMap<JobId, Result<(), SchedulerError>>;
+
+    /// The class's side of the global limits, when it is measured this way.
+    fn rate(&self) -> Option<&dyn ClassRate> {
+        None
+    }
+
+    /// How the class takes new jobs from the intakes, when it takes them
+    /// through the registry.
+    fn intake(&self) -> Option<&dyn ClassIntake> {
+        None
+    }
+
+    /// A WireGuard tunnel wakes the class to give back what it owes there,
+    /// as another class presses for bytes this one holds past its share.
+    /// Answered without waiting: on its own turn the class reads what it
+    /// owes then, `ask.owed`, and closes what it can of that less what it
+    /// has already marked to close, never a busy connection; the rest comes
+    /// back as its sockets close by themselves. An answer that finds nothing
+    /// it can give says so, through `ask.owed`.
+    fn give_back(&self, ask: TunnelGiveBack) {
+        let _ = ask;
+    }
+}
+
+/// Where an intake hands a payload.
+pub enum Route<'a> {
+    /// The pipeline's own path: an NZB, or a URL not fetched yet.
+    Pipeline,
+    /// The intake of the class the payload belongs to.
+    Class(&'a dyn ClassIntake),
+}
+
+/// The classes in force, one per protocol, each seated once at start and
+/// never replaced.
+#[derive(Clone, Default)]
+pub struct JobClasses(Arc<ByProtocol<OnceLock<Arc<dyn JobClass>>>>);
+
+impl JobClasses {
+    /// Seat `class` for its protocol. A protocol keeps the first class
+    /// seated for it.
+    pub fn seat(&self, class: Arc<dyn JobClass>) {
+        let protocol = class.protocol();
+        if self.0[protocol].set(class).is_err() {
+            tracing::warn!(
+                protocol = protocol.as_str(),
+                "a class is already seated for this protocol"
+            );
+        }
+    }
+
+    pub fn get(&self, protocol: Protocol) -> Option<&Arc<dyn JobClass>> {
+        self.0[protocol].get()
+    }
+
+    /// Every class seated, in the protocol table's order.
+    pub fn iter(&self) -> impl Iterator<Item = &Arc<dyn JobClass>> {
+        self.0.iter().filter_map(|(_, class)| class.get())
+    }
+
+    /// Where an intake hands a payload of `kind`: the pipeline's own path,
+    /// or the intake of the class it belongs to, or that class's refusal
+    /// while it is not running or takes no jobs from the intakes. The one
+    /// place an intake's payload is told apart from the pipeline's.
+    pub fn route(&self, kind: &Kind) -> Result<Route<'_>, AddRefusal> {
+        self.route_to(kind.protocol())
+    }
+
+    /// Where an intake hands a payload of `protocol`, before its bytes are
+    /// read: what [`Self::route`] answers for a payload of it.
+    pub fn route_to(&self, protocol: Option<Protocol>) -> Result<Route<'_>, AddRefusal> {
+        let protocol = match protocol {
+            Some(protocol) if protocol != PIPELINE => protocol,
+            // A URL is fetched on the pipeline's path before it is a payload.
+            Some(_) | None => return Ok(Route::Pipeline),
+        };
+        let class = self
+            .get(protocol)
+            .ok_or_else(|| AddRefusal::not_running(protocol))?;
+        class
+            .intake()
+            .map(Route::Class)
+            .ok_or_else(|| AddRefusal::no_intake(protocol))
+    }
+}
+
+/// The pipeline as a class: its jobs are the queue's own rows, and every
+/// action on them is a queue intent, grouped by kind.
+pub struct PipelineClass(pub Arc<Queue>);
+
+#[async_trait::async_trait]
+impl JobClass for PipelineClass {
+    fn protocol(&self) -> Protocol {
+        PIPELINE
+    }
+
+    async fn act(
+        &self,
+        actions: Vec<(JobId, QueueAction)>,
+    ) -> BTreeMap<JobId, Result<(), SchedulerError>> {
+        let queue = &self.0;
+        let mut paused = Vec::new();
+        let mut resumed = Vec::new();
+        let mut cancels: Vec<(CancellationOrigin, BTreeSet<JobId>)> = Vec::new();
+        let mut updates = Vec::new();
+        let mut moves = Vec::new();
+        for (job_id, action) in actions {
+            match action {
+                QueueAction::Pause => paused.push(job_id),
+                QueueAction::Resume => resumed.push(job_id),
+                QueueAction::Cancel(origin) => {
+                    match cancels.iter_mut().find(|(was, _)| *was == origin) {
+                        Some((_, job_ids)) => {
+                            job_ids.insert(job_id);
+                        }
+                        None => cancels.push((origin, BTreeSet::from([job_id]))),
+                    }
+                }
+                QueueAction::Update(update) => updates.push((job_id, update)),
+                QueueAction::Move(target) => moves.push((job_id, target)),
+            }
+        }
+        let mut outcome = BTreeMap::new();
+        if !paused.is_empty() {
+            outcome.extend(queue.set_jobs_paused(paused, true));
+        }
+        if !resumed.is_empty() {
+            outcome.extend(queue.set_jobs_paused(resumed, false));
+        }
+        for (origin, job_ids) in cancels {
+            outcome.extend(queue.cancel_jobs(job_ids, origin));
+        }
+        if !updates.is_empty() {
+            outcome.extend(queue.update_jobs(updates));
+        }
+        if let Some(&(first, _)) = moves.first() {
+            // The moves are one change, applied whole or not at all: a
+            // failure is the answer of the job it names, or of the first.
+            let job_ids: Vec<JobId> = moves.iter().map(|(job_id, _)| *job_id).collect();
+            match queue.reorder_jobs(moves) {
+                Ok(()) => outcome.extend(job_ids.into_iter().map(|job_id| (job_id, Ok(())))),
+                Err(error) => {
+                    let named = match &error {
+                        SchedulerError::JobNotFound(job_id) if job_ids.contains(job_id) => *job_id,
+                        _ => first,
+                    };
+                    outcome.insert(named, Err(error));
+                }
+            }
+        }
+        outcome
+    }
+
+    // The pipeline answers on its own turn: the ask waits in the queue for
+    // it, and the turn retires idle connections on the tunnel.
+    fn give_back(&self, ask: TunnelGiveBack) {
+        self.0.write_intent(|inner| {
+            inner.socket_give_backs.push(ask);
+            crate::pipeline::queue::Change::unchanged(())
+        });
+    }
+}
+
+/// The rows a class publishes beside the pipeline's, in the class's order,
+/// with each one's position, so asking whose a job is, or reading one,
+/// costs no walk of them. Changed only through its own methods, which keep
+/// the positions in step.
+#[derive(Debug, Default)]
+pub struct OwnedRows {
+    rows: Vec<JobInfo>,
+    positions: std::collections::HashMap<JobId, usize>,
+}
+
+impl OwnedRows {
+    pub fn rows(&self) -> &[JobInfo] {
+        &self.rows
+    }
+
+    /// Replaces the rows whole, and the position of each.
+    pub fn replace(&mut self, rows: Vec<JobInfo>) {
+        self.rows = rows;
+        self.positions = self
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(position, job)| (job.job_id, position))
+            .collect();
+    }
+
+    /// Puts `job`, new among the rows, at its place in their order, by when
+    /// it was added; only the positions after it move.
+    pub fn insert(&mut self, job: JobInfo) {
+        let key = (job.created_at_epoch_ms, job.job_id);
+        let at = self
+            .rows
+            .partition_point(|was| (was.created_at_epoch_ms, was.job_id) <= key);
+        self.positions.insert(job.job_id, at);
+        self.rows.insert(at, job);
+        for (position, later) in self.rows.iter().enumerate().skip(at + 1) {
+            self.positions.insert(later.job_id, position);
+        }
+    }
+
+    /// Puts `job` in place of the row at `at`, which has its id.
+    pub fn set(&mut self, at: usize, job: JobInfo) {
+        debug_assert_eq!(self.rows[at].job_id, job.job_id);
+        self.rows[at] = job;
+    }
+
+    /// Takes the row `job_id` out, if it is one; only the positions after
+    /// it move.
+    pub fn remove(&mut self, job_id: JobId) -> Option<JobInfo> {
+        let at = self.positions.remove(&job_id)?;
+        let job = self.rows.remove(at);
+        for (position, later) in self.rows.iter().enumerate().skip(at) {
+            self.positions.insert(later.job_id, position);
+        }
+        Some(job)
+    }
+
+    /// Where `job_id` sits among the rows, if it is one.
+    pub fn position(&self, job_id: JobId) -> Option<usize> {
+        self.positions.get(&job_id).copied()
+    }
+
+    /// The row `job_id`, if it is one: one probe.
+    pub fn get(&self, job_id: JobId) -> Option<&JobInfo> {
+        self.position(job_id).map(|at| &self.rows[at])
+    }
+}
+
+// The tunnels' give-backs reach the classes through this: the network
+// runtime sits below the job classes and names none of them.
+impl weaver_server_net::proxies::give_back::GiveBackClasses for JobClasses {
+    fn seated(&self, side: usize) -> bool {
+        self.get(Protocol::ALL[side]).is_some()
+    }
+
+    fn give_back(&self, side: usize, ask: TunnelGiveBack) {
+        if let Some(class) = self.get(Protocol::ALL[side]) {
+            class.give_back(ask);
+        }
+    }
+}

@@ -1,7 +1,7 @@
 {
   "slug": "yenc-lie-end-below-begin",
   "title": "Lantern.Reach.S01E03.EndBelowBegin.2026.1080p.WEB-DL.H264-TESTGRP",
-  "description": "The field payload in 28 articles, the 14th of which states an =ypart end= one below its begin=. SABnzbd drops a range like that and writes the body after the part before it, which is where it belongs, so the file must come out byte-equal.",
+  "description": "The field payload in 28 articles, the 14th of which states an =ypart end= one below its begin=. Such a range is dropped and the body written after the part before it, which is where it belongs, so the file must come out byte-equal.",
   "category": "2000",
   "expected_outcome": "success",
   "segment_size": 768000,

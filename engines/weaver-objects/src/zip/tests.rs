@@ -278,7 +278,7 @@ fn a_spanned_set_streams_with_its_volumes_out_of_order() {
     }
     // The `.zip` said it is disk 2: nothing numbered follows it.
     assert_eq!(
-        weaver_graph::Object::claim(&mut owner.object, "alpha.z03", b"", None),
+        weaver_graph::Object::claim(&mut owner.object, "alpha.z03", b"".into(), None),
         Vec::<VolumeIndex>::new()
     );
     no_trouble(&owner);
@@ -297,21 +297,27 @@ fn the_last_volume_follows_every_numbered_one_and_takes_nothing_of_another_set()
     let mut zip = Zip::new();
     zip.bound(VolumeIndex(0), "Alpha.Z01", &[], None);
     use weaver_graph::Object;
-    assert_eq!(zip.claim("alpha.z02", b"", None), vec![VolumeIndex(1)]);
+    assert_eq!(
+        zip.claim("alpha.z02", (b"").into(), None),
+        vec![VolumeIndex(1)]
+    );
     zip.bound(VolumeIndex(1), "alpha.z02", &[], None);
     assert_eq!(
-        zip.claim("alpha.zip", b"", None),
+        zip.claim("alpha.zip", (b"").into(), None),
         vec![VolumeIndex(u32::MAX)]
     );
     zip.bound(VolumeIndex(u32::MAX), "alpha.zip", &[], None);
     assert_eq!(
-        zip.claim("alpha.z03", b"", None),
+        zip.claim("alpha.z03", (b"").into(), None),
         vec![VolumeIndex(2)],
         "a numbered volume takes its number until the last says its disk"
     );
-    assert_eq!(zip.claim("beta.z03", b"", None), Vec::<VolumeIndex>::new());
     assert_eq!(
-        zip.claim("alpha.z02", b"", None),
+        zip.claim("beta.z03", (b"").into(), None),
+        Vec::<VolumeIndex>::new()
+    );
+    assert_eq!(
+        zip.claim("alpha.z02", (b"").into(), None),
         vec![VolumeIndex(1)],
         "a volume posted again is that volume"
     );
@@ -319,7 +325,7 @@ fn the_last_volume_follows_every_numbered_one_and_takes_nothing_of_another_set()
     let mut lone = Zip::new();
     lone.bound(VolumeIndex(0), "alpha.zip", &[], None);
     assert_eq!(
-        lone.claim("alpha.z01", b"", None),
+        lone.claim("alpha.z01", (b"").into(), None),
         Vec::<VolumeIndex>::new(),
         "a lone zip has no siblings"
     );
@@ -442,6 +448,36 @@ fn a_walk_whose_headers_the_directory_contradicts_goes_to_an_engine() {
     owner.frames(0, 4096);
     owner.close(0);
     assert!(has(&owner, &Emit::NeedsEngine(Why::Unsupported)));
+}
+
+// The archive with its end record saying a directory of one byte.
+fn one_byte_directory() -> Vec<u8> {
+    let mut bytes = archive();
+    let end = records::find_end(&bytes).unwrap().at as usize;
+    bytes[end + 12..end + 16].copy_from_slice(&1u32.to_le_bytes());
+    bytes
+}
+
+// A directory size that lies is the store's to read, not an engine's: the
+// one byte it names does not parse, so it is said damaged, and the members
+// the walk said stand.
+#[test]
+fn a_directory_said_one_byte_long_is_damaged_and_the_walked_members_stand() {
+    let bytes = one_byte_directory();
+    let end = records::find_end(&bytes).unwrap();
+    let mut owner = Owner::single(Zip::new(), bytes);
+    owner.pull = Pull::Unseekable;
+    owner.frames(0, 4096);
+    owner.close(0);
+    assert_eq!(owner.members.len(), files().len());
+    assert_eq!(
+        owner.said,
+        vec![Emit::Damaged {
+            volume: VolumeIndex(0),
+            range: ByteRange::at(end.offset, 1)
+        }]
+    );
+    assert!(!owner.object.gone);
 }
 
 #[test]
@@ -783,4 +819,44 @@ fn a_repaired_zip_directory_remaps_routed_payload_without_an_engine() {
     assert_eq!(owner.held(), 0);
     assert!(owner.refetched.is_empty(), "{:?}", owner.refetched);
     assert_eq!(owner.posted(0).as_deref(), Some(after.as_slice()));
+}
+
+// The 13,000-entry shape: stored entries, the directory read first, the
+// body in 64 KiB deliveries. The pass over local headers looks only at the
+// entries with a byte of their header in hand, and the pass over keys at
+// none, where the passes over every entry looked at each waiting entry,
+// and at every entry, on each delivery. Every member still streams whole.
+#[test]
+fn a_delivery_looks_at_the_local_headers_it_brings_not_every_waiting_one() {
+    const ENTRIES: usize = 13_000;
+    let files: Vec<(String, Vec<u8>)> = (0..ENTRIES)
+        .map(|index| (format!("f{index:05}"), payload(index as u64, 64)))
+        .collect();
+    let entries: Vec<_> = files
+        .iter()
+        .map(|(name, bytes)| Entry::File(name, bytes, stored()))
+        .collect();
+    let archive = write(&entries);
+    let before = super::looked::counts();
+    let began = std::time::Instant::now();
+    let mut owner = Owner::single(Zip::new(), archive);
+    owner.whole(64 * 1024);
+    let took = began.elapsed();
+    let ((locals, every_waiting), (opened, every_entry)) = super::looked::counts();
+    let (locals, every_waiting) = (locals - before.0.0, every_waiting - before.0.1);
+    let (opened, every_entry) = (opened - before.1.0, every_entry - before.1.1);
+    no_trouble(&owner);
+    assert_eq!(owner.members.len(), ENTRIES);
+    for (name, bytes) in &files {
+        let got = owner.member(name);
+        assert!(got.closed, "{name} closed");
+        assert_eq!(&got.bytes, bytes, "{name}");
+    }
+    assert_eq!(opened, 0);
+    assert!(locals < 3 * ENTRIES as u64, "{locals}");
+    eprintln!(
+        "{ENTRIES} entries: local headers looked at {locals}, the look at every waiting entry \
+         {every_waiting}; keys looked at {opened}, the look at every entry {every_entry}; \
+         {took:?} in a test build, which also runs the old looks to check the new"
+    );
 }

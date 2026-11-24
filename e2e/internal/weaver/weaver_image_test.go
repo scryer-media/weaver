@@ -179,8 +179,8 @@ func TestWeaverImagePlanDockerfilePublishedShape(t *testing.T) {
 	if !found || !strings.Contains(builder, "make pkg-config") || strings.Contains(runtime, "make pkg-config") {
 		t.Fatalf("jemalloc requires make in the builder only:\n%s", dockerfile)
 	}
-	if !strings.Contains(dockerfile, "cargo build --locked -p weaver") {
-		t.Fatalf("published dockerfile must restore --locked:\n%s", dockerfile)
+	if !strings.Contains(dockerfile, "cargo build --locked -p weaver --features e2e-local-trackers") {
+		t.Fatalf("published dockerfile must restore --locked and let torrents announce to the compose tracker:\n%s", dockerfile)
 	}
 	if strings.Contains(dockerfile, "--release") || strings.Contains(dockerfile, "unknown-linux-musl") {
 		t.Fatalf("the e2e image must stay a glibc debug build:\n%s", dockerfile)

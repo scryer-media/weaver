@@ -1,0 +1,18 @@
+[package]
+name = "weaver-server-rss"
+description = "RSS feed records, seen-item keys and schedule queries"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[features]
+test-support = []
+
+[dependencies]
+blake3 = { workspace = true }
+hex = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+weaver-server-db = { path = "../weaver-server-db" }

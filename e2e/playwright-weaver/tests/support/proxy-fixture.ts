@@ -8,7 +8,8 @@ import { expect } from "../helpers";
  * Control of the proxy fixture (tests/support/proxy-fixture-server.mjs).
  * Routes: primary/tertiary CONNECT, secondary SOCKS5, `direct` (its NNTP
  * port), and pool members connect1..6 (CONNECT, 8101-8106) and socks1..4
- * (SOCKS5, 8201-8204). Every route answers only `*.proxy.test` names and the
+ * (SOCKS5, 8201-8204). Every route answers only `*.proxy.test` and
+ * `*.proxy.example` names and the
  * fixture's own addresses; anything else is refused and recorded.
  */
 const controlUrl = () => (process.env.PROXY_FIXTURE_URL || "http://proxy-fixture:8090").replace(/\/+$/, "");
@@ -16,12 +17,18 @@ const controlUrl = () => (process.env.PROXY_FIXTURE_URL || "http://proxy-fixture
 export type FixtureEvent = {
   sequence: number; at: number; kind: string; route?: string; host?: string; port?: number;
   client?: string; status?: number; socksReply?: number; path?: string; name?: string; bytes?: number;
+  /** A DNS query's record type. */
+  type?: number;
+  /** A connected event's connection number, listed in the state's `open` while it stays up. */
+  connection?: number;
 };
 /** A route's service as the control last set it. */
 export type RouteService = { up: boolean; hold: boolean; holdConnect: boolean; connectStatus: number | null; socksReply: number | null };
 export type FixtureState = {
   ip: string; addresses: string[]; ports: Record<string, number>; sequence: number;
   events: FixtureEvent[]; active: Record<string, number>; routes: Record<string, RouteService>;
+  /** The numbers of the forwarded connections still open. */
+  open: number[];
 };
 
 export async function fixtureState(request: APIRequestContext): Promise<FixtureState> {

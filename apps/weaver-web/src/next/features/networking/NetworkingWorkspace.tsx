@@ -4,6 +4,7 @@
 import { createContext, memo, useContext, useMemo, useState, type ReactNode } from "react";
 import { Navigate, useLocation } from "react-router";
 import { useTranslate } from "@/lib/context/translate-context";
+import type { FlowDnsList, FlowDnsProfile } from "@/lib/dns";
 import type { Egress, NetworkFlow as Flow, ProxyPool } from "@/lib/networking";
 import type { ProxyProfile } from "@/lib/proxies";
 import { EmptyState } from "../../components/chrome";
@@ -22,6 +23,8 @@ import {
   type Consumer,
   type NetworkingPage,
 } from "./data";
+import { useFlowDns } from "./dns-choices";
+import { DnsPage } from "./DnsPage";
 import { EgressPage } from "./EgressPage";
 import { FlowEditor } from "./FlowEditor";
 import { NetworkFlow, type FlowTarget } from "./NetworkFlow";
@@ -47,12 +50,14 @@ const OverviewFlow = memo(function OverviewFlow({
   profiles,
   pools,
   consumers,
+  dns,
   onEdit,
 }: {
   egresses: Egress[];
   profiles: ProxyProfile[];
   pools: ProxyPool[];
   consumers: Consumer[];
+  dns: { profiles: FlowDnsProfile[]; lists: FlowDnsList[] } | undefined;
   onEdit: (target: FlowTarget) => void;
 }) {
   const flow = useContext(LiveFlowContext);
@@ -66,6 +71,7 @@ const OverviewFlow = memo(function OverviewFlow({
       onEdit={onEdit}
       traffic
       trace
+      dns={dns}
     />
   );
 });
@@ -98,8 +104,10 @@ export function NetworkingWorkspace({
   const workspace = useNetworkingWorkspace(page);
   const [editing, setEditing] = useState<FlowTarget | null>(null);
   const { data, error, fetching, flow, consumers, egresses, profiles, pools, action, busy, message, failed } = workspace;
-  // The pages draw their blocks only once the data is here.
-  useSearchReport(0, !data && fetching);
+  // Where the flow's legs look names up. Only the overview draws it, once the settings are read.
+  const { dns, refresh: refreshDns } = useFlowDns(page !== "overview" || !data);
+  // The pages draw their blocks only once the data is here. The DNS page reads and reports its own.
+  useSearchReport(0, page !== "dns" && !data && fetching);
   // Held while what it names is the same: the diagram reads each sample itself.
   const overviewBlocks = useMemo<SettingsBlock[]>(
     () => [
@@ -109,15 +117,25 @@ export function NetworkingWorkspace({
         title: t("next.networking.overview.flow"),
         searchText: [...consumers.map((consumer) => consumer.name), ...egresses.map((egress) => egress.name)].join(" "),
         body: (
-          <OverviewFlow egresses={egresses} profiles={profiles} pools={pools} consumers={consumers} onEdit={setEditing} />
+          <OverviewFlow
+            egresses={egresses}
+            profiles={profiles}
+            pools={pools}
+            consumers={consumers}
+            dns={dns}
+            onEdit={setEditing}
+          />
         ),
       },
     ],
-    [consumers, egresses, pools, profiles, t],
+    [consumers, dns, egresses, pools, profiles, t],
   );
 
   if (!NETWORKING_PAGES.includes(page as NetworkingPage)) {
     return <Navigate to="/settings/networking/overview" replace />;
+  }
+  if (page === "dns") {
+    return <DnsPage />;
   }
 
   return (
@@ -167,6 +185,7 @@ export function NetworkingWorkspace({
                   action={action}
                   busy={busy}
                   proxyEditor={(id, onClose) => proxyEditor(id, onClose, workspace.retry)}
+                  onDnsChanged={refreshDns}
                 />
               ) : null}
             </>

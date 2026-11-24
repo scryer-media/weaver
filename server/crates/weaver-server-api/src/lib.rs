@@ -5,6 +5,7 @@ pub mod auth;
 pub mod backup;
 pub mod categories;
 pub mod context;
+pub mod dns;
 pub mod history;
 pub mod jobs;
 pub mod networking;
@@ -18,6 +19,8 @@ pub mod servers;
 pub mod settings;
 pub mod speed_test;
 pub mod system;
+pub mod tags;
+pub mod torrents;
 
 // Allocation counter for the tests that assert a page push allocates by its
 // page, not by the queue. Test builds only; it counts per thread, so tests
@@ -84,7 +87,7 @@ pub use rss::types::*;
 pub use schema::{MutationRoot, QueryRoot, SubscriptionRoot};
 pub use servers::types::*;
 pub use settings::types::*;
-pub use system::runtime::load_global_pause_from_db;
+pub use system::runtime::load_holds_from_db;
 pub use system::types::*;
 pub use weaver_server_core::ingest::{
     SubmissionOptions, SubmitNzbError, SubmittedJob, fetch_nzb_from_url, init_job_counter,

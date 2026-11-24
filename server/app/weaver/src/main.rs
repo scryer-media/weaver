@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// Tests dial their own loopback fixtures.
-#![cfg_attr(test, allow(clippy::disallowed_methods))]
-
 // Windows and everything else get different allocators, so the module that
 // `allocator` names differs by target; both define the same three items.
+use weaver_server_core::post_processing::settings::PostProcessingSettingsQueries;
+use weaver_server_core::settings::persistence::SettingsPersistenceQueries;
+use weaver_server_core::settings::service::SettingsServiceQueries;
 #[cfg(target_os = "windows")]
 #[path = "allocator_mimalloc.rs"]
 mod allocator;
@@ -35,6 +35,7 @@ mod restart;
 mod shutdown;
 #[cfg(windows)]
 mod tray_ipc;
+mod usage;
 // The startup registration the tray owns and the upgrade helper restores; the
 // helper runs from a copy of this binary, so this binary carries it too.
 #[cfg(windows)]
@@ -173,6 +174,9 @@ async fn async_main() {
     // Ahead of logging, so stdout carries the report alone and can be piped.
     if let Command::Nzb { command } = command {
         std::process::exit(commands::nzb::run(command).await);
+    }
+    if let Command::Torrent { command } = command {
+        std::process::exit(commands::torrent::run(command));
     }
 
     let log_ring_buffer =
@@ -548,6 +552,7 @@ async fn async_main() {
         }
         Command::Par2 { .. } => unreachable!("par2 command handled before config startup"),
         Command::Nzb { .. } => unreachable!("nzb command handled before logging starts"),
+        Command::Torrent { .. } => unreachable!("torrent command handled before logging starts"),
     }
 }
 

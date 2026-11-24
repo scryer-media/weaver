@@ -89,6 +89,7 @@ impl From<weaver_server_core::runtime::log_filter::LogFilterState> for LogFilter
 pub enum DownloadBlockKindGql {
     None,
     ManualPause,
+    SpeedTest,
     Scheduled,
     EgressQuota,
     ServerQuota,
@@ -99,6 +100,7 @@ impl From<DownloadBlockKind> for DownloadBlockKindGql {
         match value {
             DownloadBlockKind::None => Self::None,
             DownloadBlockKind::ManualPause => Self::ManualPause,
+            DownloadBlockKind::SpeedTest => Self::SpeedTest,
             DownloadBlockKind::Scheduled => Self::Scheduled,
             DownloadBlockKind::EgressQuota => Self::EgressQuota,
             DownloadBlockKind::ServerQuota => Self::ServerQuota,
@@ -107,6 +109,7 @@ impl From<DownloadBlockKind> for DownloadBlockKindGql {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SimpleObject)]
+#[graphql(complex)]
 pub struct DownloadBlock {
     pub kind: DownloadBlockKindGql,
     /// The egress whose download quota is holding downloads, while one is.
@@ -119,14 +122,57 @@ pub struct DownloadBlock {
     pub window_starts_at_epoch_ms: Option<f64>,
     pub window_ends_at_epoch_ms: Option<f64>,
     pub timezone_name: String,
-    pub scheduled_speed_limit: u64,
-    /// Speed limit the downloads run under now: the schedule's while one
-    /// holds, even one set to unlimited, else the configured one. 0 is none.
-    pub speed_limit_in_force: u64,
+    pub scheduled_speed_limit: Option<u64>,
+    /// Download limit the downloads run under now: the tighter of the
+    /// configured one and the schedule's. Absent is unlimited; zero lets
+    /// nothing through.
+    pub speed_limit_in_force: Option<u64>,
     /// Whether a schedule window sets the limit in force, even to unlimited.
     pub speed_limit_by_schedule: bool,
     /// Why a schedule rule is holding new downloads, while one is.
     pub schedule_hold_reason: Option<String>,
+    /// Every destination disk a download is writing to or held by: whether it
+    /// is slow, what it takes and what waits for it. A disk is slow when its
+    /// write buffer held new articles back in most of the last 20 seconds.
+    /// Empty while no download waits on a disk.
+    #[serde(default)]
+    pub disk_volumes: Vec<DiskVolume>,
+}
+
+/// A destination disk a download is writing to or held by. Its figures move
+/// at most once a second, rounded as a screen shows them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SimpleObject)]
+pub struct DiskVolume {
+    /// The mount path or drive root, as the storage page shows it.
+    pub label: String,
+    /// Whether the disk cannot keep up with the downloads.
+    pub slow: bool,
+    /// What the disk takes, in bytes per second; 0 until measured.
+    pub write_rate_bytes_per_sec: u64,
+    /// Bytes in memory waiting for this disk's writer, from every download.
+    pub waiting_bytes: u64,
+}
+
+impl From<&weaver_server_core::jobs::handle::DiskVolumeState> for DiskVolume {
+    fn from(value: &weaver_server_core::jobs::handle::DiskVolumeState) -> Self {
+        Self {
+            label: value.label.clone(),
+            slow: value.slow,
+            write_rate_bytes_per_sec: value.write_rate_bytes_per_sec,
+            waiting_bytes: value.waiting_bytes,
+        }
+    }
+}
+
+#[ComplexObject]
+impl DownloadBlock {
+    /// When a timed pause lifts by itself, in epoch milliseconds. Absent for
+    /// a pause that waits to be resumed by hand.
+    async fn resume_at_epoch_ms(&self, ctx: &Context<'_>) -> Option<f64> {
+        let scheduled = ctx.data_opt::<crate::ScheduledResumeCoordinator>()?;
+        let at = scheduled.resume_at().await;
+        (at > 0).then_some(at as f64 * 1000.0)
+    }
 }
 
 impl From<&DownloadBlockState> for DownloadBlock {
@@ -145,6 +191,7 @@ impl From<&DownloadBlockState> for DownloadBlock {
             speed_limit_in_force: value.speed_limit_in_force,
             speed_limit_by_schedule: value.speed_limit_by_schedule,
             schedule_hold_reason: value.schedule_hold_reason.clone(),
+            disk_volumes: value.disk_volumes.iter().map(DiskVolume::from).collect(),
         }
     }
 }
@@ -408,6 +455,83 @@ pub struct SystemMetricsSnapshot {
     /// connection meter can follow the pool instead of waiting for the next
     /// `serverHealth` read.
     pub provider_connections: Vec<ProviderConnections>,
+    /// Whether torrents are on and whether there are torrents, so the web
+    /// shows torrent controls while either holds.
+    pub torrents: TorrentPresence,
+    /// What every torrent downloads and uploads right now, beside
+    /// `metrics.currentDownloadSpeed`, which counts Usenet alone.
+    pub torrent_rates: TorrentRates,
+}
+
+/// The rates of every torrent added up, in bytes per second.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
+pub struct TorrentRates {
+    pub download_bps: u64,
+    pub upload_bps: u64,
+}
+
+impl TorrentRates {
+    // The sums the torrent service keeps as its rows move: one read, no walk
+    // of the torrents. Zero on a server without torrents.
+    pub(crate) fn of(
+        torrents: Option<&weaver_server_core::torrents::service::TorrentService>,
+    ) -> Self {
+        let sums = torrents
+            .map(|torrents| torrents.snapshot().sums())
+            .unwrap_or_default();
+        Self {
+            download_bps: sums.download_bps,
+            upload_bps: sums.upload_bps,
+        }
+    }
+}
+
+/// Whether torrents are on, and the torrents there are.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
+pub struct TorrentPresence {
+    /// This run of the server has torrents at all: it was started with the
+    /// environment variable `WEAVER_TORRENTS` set to `1` or `true`. While
+    /// false no torrent runs, none is listed, turning torrents on is
+    /// refused, and every other field here is false or null whatever the
+    /// settings say.
+    pub available: bool,
+    /// Torrents are available and the settings turn them on.
+    pub enabled: bool,
+    /// There is a torrent job, in any state.
+    pub jobs: bool,
+    /// A torrent job is not paused or stopped.
+    pub running: bool,
+    /// Torrents are off and the torrents still running are let finish.
+    pub winding_down: bool,
+    /// While winding down, how the torrents still running end; null
+    /// otherwise.
+    pub wind_down: Option<crate::settings::types::TorrentDisableModeGql>,
+}
+
+impl TorrentPresence {
+    pub(crate) fn of(
+        availability: weaver_server_core::torrents::TorrentAvailability,
+        enabled: bool,
+        torrents: Option<&weaver_server_core::torrents::service::TorrentService>,
+    ) -> Self {
+        let enabled = availability.on(enabled);
+        let presence = torrents
+            .map(|torrents| torrents.presence())
+            .unwrap_or_default();
+        // A wind-down taken for a save still on its way is not one yet.
+        let wind_down = torrents
+            .and_then(|torrents| torrents.wind_down())
+            .filter(|_| !enabled)
+            .map(crate::settings::types::TorrentDisableModeGql::of_wind_down);
+        Self {
+            available: availability.available(),
+            enabled,
+            jobs: presence.jobs,
+            running: presence.running,
+            winding_down: wind_down.is_some(),
+            wind_down,
+        }
+    }
 }
 
 /// How many of a server's connections are in use at one instant.
@@ -714,7 +838,7 @@ impl From<&weaver_server_core::events::model::PipelineEvent> for PipelineEventGq
                     "{blocks_repaired} blocks repaired. Embedded PAR3 protection replaced after verified repair. Available authenticated packets were preserved; the original carrier could not be restored byte for byte."
                 ),
             },
-            PipelineEvent::RepairFailed { job_id, error } => Self {
+            PipelineEvent::RepairFailed { job_id, error, .. } => Self {
                 kind: EventKind::RepairFailed,
                 job_id: Some(job_id.0),
                 file_id: None,
@@ -832,6 +956,18 @@ impl From<&weaver_server_core::events::model::PipelineEvent> for PipelineEventGq
                 job_id: Some(job_id.0),
                 file_id: None,
                 message: archive_demoted_message(member, container, reason),
+            },
+            PipelineEvent::RecoverySetUnused {
+                job_id,
+                set,
+                reason,
+            } => Self {
+                kind: EventKind::RecoverySetUnused,
+                job_id: Some(job_id.0),
+                file_id: None,
+                message: weaver_server_core::events::model::recovery_set_unused_message(
+                    set, reason,
+                ),
             },
             PipelineEvent::MoveToCompleteStarted { job_id } => Self {
                 kind: EventKind::MoveToCompleteStarted,
@@ -1250,6 +1386,9 @@ pub struct ConfiguredStorage {
     pub path: String,
     pub capacity: Option<DiskCapacity>,
     pub error: Option<String>,
+    /// The mount path or drive root the folder lies on, so folders on one
+    /// drive can be shown as one; null until the disk owner has read it.
+    pub drive: Option<String>,
 }
 
 /// One volume as the operating system presents it: what it takes and what
@@ -1424,6 +1563,12 @@ pub struct ServerHealth {
     pub consecutive_failures: u32,
     /// Connections that died before reaching a healthy age, recently.
     pub premature_deaths: u32,
+    /// Out of use: switched off by a fault, or in a transport cooldown still
+    /// running. A capacity hold is not down. The data-used ledger counts time
+    /// down by the same rule.
+    pub down: bool,
+    /// The server's saved id, which the data-used ledger counts it under.
+    pub server_id: Option<u32>,
     /// This server's position in the connection pool, which is its
     /// `ServerId`. Two configured servers may share a host and port, so the
     /// pool position, not the address, says which server this is.
@@ -1450,6 +1595,20 @@ impl ServerHealth {
 
 #[ComplexObject]
 impl ServerHealth {
+    /// When this server was first seen in its current state, in epoch
+    /// milliseconds. Absent until the data-used ledger has read it once.
+    async fn state_since_epoch_ms(&self, ctx: &Context<'_>) -> Option<u64> {
+        let recorder = ctx
+            .data_opt::<Option<std::sync::Arc<weaver_server_core::operations::UsageRecorder>>>()?
+            .as_ref()?;
+        let (state, since) = recorder.server_state_since(self.server_id?)?;
+        if state != self.state {
+            return None;
+        }
+        u64::try_from(since)
+            .ok()
+            .map(|sec| sec.saturating_mul(1000))
+    }
     /// Article requests this server answered with the article, counted
     /// since Weaver last started. The count starts again at every start.
     async fn articles_found(&self, ctx: &Context<'_>) -> u64 {

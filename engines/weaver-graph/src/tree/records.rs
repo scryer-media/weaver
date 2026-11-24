@@ -9,11 +9,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::{Binding, Mark, Node, NodeId, Nodes, Tree};
+use super::{Binding, Lift, Mark, Node, NodeId, Nodes, Tree};
 use crate::deliver::Handed;
 use crate::facts::{Restore, RestoreError};
 use crate::member::{Coverage, Member, MemberId};
-use crate::records::{CoverageRecord, MemberRecord, NodeRecord, NodeState, TreeRecord};
+use crate::names::Position;
+use crate::records::{CoverageRecord, LiftRecord, MemberRecord, NodeRecord, NodeState, TreeRecord};
 use crate::volume::{ByteRange, VolumeIndex};
 
 impl Tree {
@@ -142,6 +143,11 @@ impl Tree {
             copy_of: found.namespace.copy_of(member.id),
             fronted: member.fronted,
             refuted: member.refuted,
+            lifted: self.lift_of(node, member.id).map(|lift| LiftRecord {
+                node: lift.from.0,
+                member: lift.from.1,
+                position: lift.position.0.clone(),
+            }),
         }
     }
 
@@ -205,7 +211,11 @@ impl Tree {
             && let Some(member) = binding.volumes.get(&VolumeIndex(0))
             && let Some(parent) = self.nodes.get_mut(&binding.parent)
         {
-            parent.windows.entry(*member).or_default().push(record.node);
+            parent.open_window(
+                *member,
+                record.node,
+                object.as_ref().map(|object| object.kind()),
+            );
         }
         let mut node = Node::new(object, binding);
         node.retired = record.state == NodeState::Retired;
@@ -329,6 +339,7 @@ impl Tree {
         };
         for member in &record.members {
             if let Some((child, volume)) = member.owner {
+                let kind = self.kind(child);
                 let binds = self
                     .nodes
                     .get(&child)
@@ -342,7 +353,7 @@ impl Tree {
                     return Err(refuse("a member's owner does not bind it"));
                 }
                 if let Some(found) = self.nodes.get_mut(&record.node) {
-                    found.own(member.member, (child, volume));
+                    found.own(member.member, (child, volume), kind);
                 }
             }
             if member.buried && member.given_up.is_some() {
@@ -358,8 +369,44 @@ impl Tree {
             if member.buried {
                 self.nodes.retire((record.node, member.member), None);
             }
+            if let Some(lift) = &member.lifted {
+                // It came from below, and holds no owner's place there. Its
+                // position is where it first stood, deeper than the
+                // namespace it came from for one lifted more than once.
+                if !self.below(lift.node, record.node)
+                    || lift.position.is_empty()
+                    || member.copy_of.is_some()
+                {
+                    return Err(refuse("a lifted member came from no namespace below"));
+                }
+                self.restore_lift(
+                    (record.node, member.member),
+                    Lift {
+                        from: (lift.node, lift.member),
+                        position: Position(lift.position.clone()),
+                    },
+                );
+            }
         }
         Ok(())
+    }
+}
+
+impl Tree {
+    // Whether `node` lies in a namespace below `above`: some binding on the
+    // way up from it is to `above`. A record read back is not trusted to
+    // hold no loop, so the walk takes at most one step per node.
+    fn below(&self, mut node: NodeId, above: NodeId) -> bool {
+        for _ in 0..self.nodes.len() {
+            let Some((parent, _)) = self.volumes(node) else {
+                return false;
+            };
+            if parent == above {
+                return true;
+            }
+            node = parent;
+        }
+        false
     }
 }
 

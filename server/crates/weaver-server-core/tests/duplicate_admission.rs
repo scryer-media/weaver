@@ -3,6 +3,13 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
+use weaver_server_core::history::nzbget_state::HistoryNzbgetStateQueries;
+use weaver_server_core::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
+use weaver_server_core::history::queries::HistoryQueries;
+use weaver_server_core::jobs::duplicate_persistence::JobsDuplicatePersistenceAdmitDuplicateSubmissionQueries;
+use weaver_server_core::jobs::duplicate_persistence::JobsDuplicatePersistenceApplySemanticTerminalCauseQueries;
+use weaver_server_core::jobs::persistence::JobsPersistenceQueries;
+use weaver_server_core::operations::recovery::credentials::StoredCredentialQueries;
 
 use weaver_model::files::FileRole;
 use weaver_server_core::ingest::{
@@ -93,6 +100,7 @@ fn accepted(admission: DuplicateAdmission) -> (weaver_server_core::JobId, Duplic
 
 fn history(job_id: u64, status: &str) -> JobHistoryRow {
     JobHistoryRow {
+        protocol: weaver_server_core::Protocol::Nzb,
         job_id,
         job_hash: None,
         name: "The.Release-Name".to_string(),

@@ -16,6 +16,13 @@ export const jobIds = {
   scriptRun: "script-run",
   scriptRunStatus: (status: string) => `script-run-status-${status}`,
 
+  // A job's tags: its chips, the editor that adds and takes them off, and
+  // the rail filter, keyed by the tag ("" is jobs with none).
+  jobTags: "job-tags",
+  tagEditor: "tag-editor",
+  tagInput: "tag-input",
+  tagFilter: (tag: string) => `tag-filter-${tag}`,
+
   // Archiving a history entry: the action, and the mark on an archived entry.
   historyArchive: "history-archive",
   historyArchived: (jobId: string | number) => `history-archived-${jobId}`,
@@ -24,6 +31,10 @@ export const jobIds = {
   historyRowArchive: (jobId: string | number) => `history-entry-archive-${jobId}`,
   historyRowDelete: (jobId: string | number) => `history-entry-delete-${jobId}`,
   jobArchive: "job-archive",
+  // The whole job's percentage on its own screen, one per bar, keyed by the
+  // bar's phase ("job" for the lone bar of a job in no phase).
+  jobProgress: (bar: string) => `job-progress-${bar}`,
+  jobProgressPrefix: "job-progress-",
   jobArchived: "job-archived",
 
   // A job page's lists past one page: the control that loads the next, and a file kept only as a record.

@@ -3,6 +3,8 @@
 
 // Contract coverage for the additive combined network-access query surface.
 
+use weaver_server_core::auth::repository::AuthRepositoryQueries;
+use weaver_server_core::settings::queries::SettingsQueries;
 mod common;
 
 use async_graphql::Request;

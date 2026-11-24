@@ -34,7 +34,8 @@ use crate::grid::{self, Folded};
 // How much is read at once, so a volume never sits in memory whole.
 const CHUNK: u64 = 1 << 20;
 
-const RAR4_SIGN: &[u8] = b"Rar!\x1a\x07\x00";
+pub(super) const RAR4_SIGN: &[u8] = b"Rar!\x1a\x07\x00";
+pub(super) const RAR5_SIGN: &[u8] = b"Rar!\x1a\x07\x01\x00";
 const HEADER_MIN: u64 = 7;
 const MAIN: u8 = 0x73;
 const FILE: u8 = 0x74;
@@ -135,6 +136,18 @@ impl<'a> Volume<'a> {
     // headers are enciphered shows nothing past its main header and stands
     // on that, as unRAR takes it. `None` when the volume is no such one.
     pub(super) fn sound_rar4(&mut self) -> Option<bool> {
+        self.walk_rar4(false)
+    }
+
+    // [`Self::sound_rar4`] as proof the volume is the one its set's RAR3
+    // recovery volume rebuilt: only the end-of-archive header's CRC32 of
+    // the bytes before it proves them, so a volume that states none, or
+    // whose headers are enciphered, proves nothing.
+    pub(super) fn proves_rar4(&mut self) -> Option<bool> {
+        self.walk_rar4(true)
+    }
+
+    fn walk_rar4(&mut self, proof: bool) -> Option<bool> {
         if !self.read(0, RAR4_SIGN.len() as u64) || self.buffer.as_slice() != RAR4_SIGN {
             return None;
         }
@@ -159,13 +172,13 @@ impl<'a> Volume<'a> {
                     break false;
                 }
                 if flags & SEALED != 0 {
-                    break true;
+                    break !proof;
                 }
                 first = false;
             }
             if kind == END {
                 if flags & END_CRC == 0 {
-                    break true;
+                    break !proof;
                 }
                 let Some(stated) = header.get(7..11).map(le_u32) else {
                     break false;

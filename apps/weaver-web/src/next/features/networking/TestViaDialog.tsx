@@ -3,18 +3,21 @@
 
 import { Fragment, useEffect, useRef, useState } from "react";
 import { useMutation, useQuery } from "urql";
-import { NETWORKING_QUERY, TEST_VIA } from "@/graphql/networking";
+import { DRAFT_ROUTE_QUERY, TEST_VIA } from "@/graphql/networking";
 import { useTranslate } from "@/lib/context/translate-context";
-import { routeInput, routeProblem, type NetworkRoute } from "@/lib/networking";
+import { SYSTEM_DNS_PROFILE_ID, dnsRouteProblem, type DnsProfileChoice } from "@/lib/dns";
+import { routeInput, routeProblem, type ConsumerKind, type NetworkRoute, type TorrentConsumerKind } from "@/lib/networking";
 import { proxyLabels } from "@/lib/proxies";
 import { proxyTestSentence } from "@/lib/proxy-fault";
 import { refusalMessage } from "@/lib/refusal";
+import { exposureValues } from "@/lib/torrents";
 import { cn } from "@/lib/utils";
 import {
   draftRoute,
   resolutionParts,
   routeChoices,
   testSummary,
+  type P2pTestResult,
   type PathTestResult,
   type ResolutionParts,
   type TestSubject,
@@ -25,10 +28,84 @@ import { PrimaryButton, SecondaryButton } from "../../components/controls";
 import { Icon } from "../../components/icons";
 import { FieldRows } from "../../pages/settings/framework";
 import type { NetworkingData } from "./data";
-import { RouteEditor } from "./RouteEditor";
+import { useRouteDnsProfiles } from "./dns-choices";
+import { RouteEditor, type RouteEgress, type RouteProxy } from "./RouteEditor";
 import { StatusMark } from "./presentation";
 
 const DEFAULT_PORT = 443;
+
+/** What a drafted route may use, as the route editor reads it. */
+type DraftRouteData = { egressInterfaces: RouteEgress[]; proxyProfiles: RouteProxy[]; proxyPools: NetworkingData["proxyPools"] };
+
+/**
+ * A route drafted for a test, never saved: it starts on `initial`, else on
+ * the default route from `egressId` or the first enabled egress. What the
+ * draft may use leaves out the subject's own proxies.
+ */
+export function useDraftRoute({
+  subject,
+  egressId,
+  initial,
+  kind,
+}: {
+  subject: TestSubject;
+  egressId?: number;
+  initial?: NetworkRoute | null;
+  kind: ConsumerKind;
+}) {
+  const [{ data, error: loadError }] = useQuery<DraftRouteData>({ query: DRAFT_ROUTE_QUERY });
+  // Null until the draft is first changed: it starts on the default route.
+  const [edited, setEdited] = useState<NetworkRoute | null>(null);
+  const route = edited ?? initial ?? (data ? draftRoute(data.egressInterfaces, egressId) : null);
+  const problem = data && route ? routeProblem(route, { egresses: data.egressInterfaces, pools: data.proxyPools, kind }) : null;
+  const choices = data ? routeChoices(data.proxyProfiles, data.proxyPools, subject) : null;
+  return { data, loadError, route, setRoute: setEdited, problem, choices, kind };
+}
+
+export type DraftRoute = ReturnType<typeof useDraftRoute>;
+
+/** The drafted route's editor, under its heading, once what it offers has loaded. */
+export function DraftRouteEditor({
+  draft,
+  dnsProfiles,
+}: {
+  draft: DraftRoute;
+  /** Offered when the test resolves names along the route. */
+  dnsProfiles?: readonly DnsProfileChoice[];
+}) {
+  const t = useTranslate();
+  const { data, loadError, route, choices } = draft;
+  return (
+    <>
+      {loadError && !data ? (
+        <p role="alert" className="px-4 py-4 text-[12.5px] text-wv-error-text sm:px-6">
+          {refusalMessage(t, loadError)}
+        </p>
+      ) : null}
+      {!data && !loadError ? (
+        <p role="status" className="px-4 py-4 text-[12.5px] text-wv-muted sm:px-6">
+          {t("next.common.loading")}
+        </p>
+      ) : null}
+      {data && route && choices ? (
+        <>
+          <SectionHeader label={t("next.networking.testVia.route")} sticky={false} />
+          <div className="flex-none px-4 py-5 sm:px-6">
+            <RouteEditor
+              value={route}
+              onChange={draft.setRoute}
+              egresses={data.egressInterfaces}
+              profiles={choices.profiles}
+              pools={choices.pools}
+              kind={draft.kind}
+              dnsProfiles={dnsProfiles}
+            />
+          </div>
+        </>
+      ) : null}
+    </>
+  );
+}
 
 /** A connect time to the precision it is worth: tenths under ten milliseconds. */
 const millis = (value: number) => `${value < 10 ? value.toFixed(1) : Math.round(value)} ms`;
@@ -40,10 +117,15 @@ const millis = (value: number) => `${value < 10 ? value.toFixed(1) : Math.round(
  * and the draft is never saved. The daemon tries every path through it, with
  * the proxy or the pool on top; a pool names the member it picked. A proxy
  * cannot carry itself, so the draft is not offered the subject's proxies.
+ *
+ * A torrent route's test also runs the test torrent over each path that
+ * reached its target, the torrent's own host when no host is given.
  */
 export function TestViaDialog({
   subject,
   egressId,
+  route: initial,
+  torrent,
   onTested,
   onClose,
 }: {
@@ -51,18 +133,28 @@ export function TestViaDialog({
   subject: TestSubject;
   /** The egress the draft starts on, else the first enabled one. */
   egressId?: number;
+  /** The route the draft starts as, in place of one on `egressId`. */
+  route?: NetworkRoute | null;
+  /** The torrent consumer whose route is tested, running the test torrent too. */
+  torrent?: TorrentConsumerKind;
   /** Hears each run in one sentence: its refusal, or what its paths came to. */
   onTested?: (summary: string) => void;
   onClose: () => void;
 }) {
   const t = useTranslate();
-  const [{ data, error: loadError }] = useQuery<NetworkingData>({
-    query: NETWORKING_QUERY,
-    requestPolicy: "cache-and-network",
-  });
+  const kind: ConsumerKind = torrent ?? "OUTBOUND";
+  const draft = useDraftRoute({ subject, egressId, initial, kind });
+  const { data, route, problem } = draft;
+  const dnsProfiles = useRouteDnsProfiles();
+  const dnsProblem =
+    data && route
+      ? dnsRouteProblem(
+          route,
+          dnsProfiles?.find((choice) => choice.id === (route.dnsProfileId ?? SYSTEM_DNS_PROFILE_ID)),
+          { proxies: data.proxyProfiles, pools: data.proxyPools },
+        )
+      : null;
   const [{ fetching: running }, testVia] = useMutation<{ testVia: PathTestResult[] }>(TEST_VIA);
-  // Null until the draft is first changed: it starts on the default route.
-  const [edited, setEdited] = useState<NetworkRoute | null>(null);
   const [host, setHost] = useState("");
   const [port, setPort] = useState(DEFAULT_PORT);
   const [destinationOpen, setDestinationOpen] = useState(false);
@@ -77,11 +169,8 @@ export function TestViaDialog({
     }
   }, [results, refusal]);
 
-  const route = edited ?? (data ? draftRoute(data.egressInterfaces, egressId) : null);
-  const problem = data && route ? routeProblem(route, { egresses: data.egressInterfaces, pools: data.proxyPools }) : null;
-  const choices = data ? routeChoices(data.proxyProfiles, data.proxyPools, subject) : null;
   // A destination folded away is not tested, whatever was typed into it.
-  const target = (subject === null || destinationOpen) && host.trim() ? { host: host.trim(), port } : null;
+  const target = ((subject === null && !torrent) || destinationOpen) && host.trim() ? { host: host.trim(), port } : null;
 
   const egressName = (id: number) => data?.egressInterfaces.find((egress) => egress.id === id)?.name ?? String(id);
   const proxyName = (id: number) =>
@@ -105,7 +194,7 @@ export function TestViaDialog({
     }
     setResults(null);
     setRefusal(null);
-    const result = await testVia({ route: routeInput(route), subject, target });
+    const result = await testVia({ route: routeInput(route), subject, target, torrent: torrent !== undefined });
     if (result.error) {
       const sentence = refusalMessage(t, result.error);
       setRefusal(sentence);
@@ -132,7 +221,7 @@ export function TestViaDialog({
           <SecondaryButton onClick={onClose}>{t("next.networking.close")}</SecondaryButton>
           <PrimaryButton
             icon="test"
-            disabled={!route || running || problem !== null || (subject === null && target === null)}
+            disabled={!route || running || problem !== null || dnsProblem !== null || (subject === null && target === null && !torrent)}
             onClick={() => void run()}
           >
             {running ? t("next.networking.testVia.running") : t("next.networking.testVia.run")}
@@ -140,31 +229,11 @@ export function TestViaDialog({
         </>
       }
     >
-      {loadError && !data ? (
-        <p role="alert" className="px-4 py-4 text-[12.5px] text-wv-error-text sm:px-6">
-          {refusalMessage(t, loadError)}
-        </p>
-      ) : null}
-      {!data && !loadError ? (
-        <p role="status" className="px-4 py-4 text-[12.5px] text-wv-muted sm:px-6">
-          {t("next.common.loading")}
-        </p>
-      ) : null}
-      {data && route && choices ? (
+      <DraftRouteEditor draft={draft} dnsProfiles={dnsProfiles} />
+      {data && route ? (
         <>
-          <SectionHeader label={t("next.networking.testVia.route")} sticky={false} />
-          <div className="flex-none px-4 py-5 sm:px-6">
-            <RouteEditor
-              value={route}
-              onChange={setEdited}
-              egresses={data.egressInterfaces}
-              profiles={choices.profiles}
-              pools={choices.pools}
-              kind="OUTBOUND"
-            />
-          </div>
           {/* A route alone needs somewhere to connect; a proxy or pool is tested without one. */}
-          {subject === null ? (
+          {subject === null && !torrent ? (
             <SectionHeader label={t("next.networking.testVia.destination")} sticky={false} />
           ) : (
             <button
@@ -177,7 +246,7 @@ export function TestViaDialog({
               {t("next.networking.testVia.optional")}
             </button>
           )}
-          {subject === null || destinationOpen ? (
+          {(subject === null && !torrent) || destinationOpen ? (
             <FieldRows
               fields={[
                 {
@@ -293,7 +362,45 @@ function PathRow({
           parts={resolutionParts(t, result.resolution, { egress: egressName(result.egressId), proxy: proxyName })}
         />
       ) : null}
+      {result.p2p ? <P2pRungs p2p={result.p2p} /> : null}
     </li>
+  );
+}
+
+/** The test torrent's steps over one path, each with what passed or stopped it. */
+function P2pRungs({ p2p }: { p2p: P2pTestResult }) {
+  const t = useTranslate();
+  return (
+    <ul aria-label={t("next.networking.testVia.torrent")} className="flex flex-col gap-[2px]">
+      {p2p.rungs.map((rung) => (
+        <li key={rung.step} className="flex min-w-0 flex-wrap items-baseline gap-x-2 font-wv-mono text-[11px] leading-[1.5]">
+          <span
+            className={cn(
+              "w-[72px] flex-none",
+              rung.outcome === "PASSED" ? "text-wv-fg" : rung.outcome === "FAILED" ? "text-wv-error-text" : "text-wv-muted",
+            )}
+          >
+            {t(`next.networking.testVia.step.${rung.step}`)}
+          </span>
+          <span className="min-w-0 break-words text-wv-muted">
+            {rung.outcome === "NOT_REACHED" ? t("next.networking.testVia.notReached") : rung.message}
+          </span>
+        </li>
+      ))}
+      {p2p.mappedPort === null ? null : (
+        <li className="font-wv-mono text-[11px] leading-[1.5] text-wv-fg">
+          {t("next.networking.testVia.mappedPort", { port: p2p.mappedPort })}
+        </li>
+      )}
+      {p2p.exposure === null
+        ? null
+        : exposureValues(t, p2p.exposure).map(({ label, value }) => (
+            <li key={label} className="flex min-w-0 flex-wrap items-baseline gap-x-2 font-wv-mono text-[11px] leading-[1.5]">
+              <span className="w-[72px] flex-none text-wv-muted">{label}</span>
+              <span className="min-w-0 break-words text-wv-fg">{value}</span>
+            </li>
+          ))}
+    </ul>
   );
 }
 

@@ -2,6 +2,19 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::history::persistence::HistoryPersistenceInsertJobHistoryQueries;
+use crate::history::queries::HistoryQueries;
+use crate::history::timeline::HistoryTimelineQueries;
+use crate::jobs::queries::JobsQueries;
+use crate::operations::backup::OperationsBackupLogicalInternalQueries;
+use crate::operations::recovery::credentials::StoredCredentialQueries;
+use crate::servers::persistence::ServersPersistenceInternalQueries;
+use crate::servers::queries::ServersQueries;
+use crate::servers::repository::ServersRepositoryQueries;
+use crate::settings::persistence::SettingsPersistenceQueries;
+use crate::settings::queries::SettingsQueries;
+use crate::settings::service::SettingsServiceQueries;
+use crate::tags::TagsQueries;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc as StdArc;
@@ -9,7 +22,7 @@ use std::sync::Arc as StdArc;
 use crate::JobHistoryRow;
 use crate::categories::CategoryConfig;
 use crate::operations::backup::manifest::BackupInstanceSecrets;
-use crate::persistence::sql_runtime::StoreDatastore;
+use crate::persistence::sql_runtime::{SqlConn, SqlRuntime};
 use crate::settings::Config;
 use crate::{PipelineMetrics, SharedPipelineState};
 use tokio::sync::{RwLock, broadcast};
@@ -32,39 +45,32 @@ fn open_temp_db() -> Database {
 }
 
 fn execute_sql(db: &Database, statements: Vec<&'static str>) {
-    let StoreDatastore::Sqlite { pool, .. } = db.datastore() else {
-        panic!("test database is SQLite");
-    };
+    let store = db.datastore();
     db.run_sql_blocking_local(move || async move {
-        let mut connection = pool
-            .acquire()
-            .await
-            .map_err(|error| crate::StateError::Database(error.to_string()))?;
-        for statement in statements {
-            sqlx::query(statement)
-                .execute(&mut *connection)
-                .await
-                .map_err(|error| crate::StateError::Database(error.to_string()))?;
-        }
-        Ok(())
+        SqlRuntime::run_serialized_sqlite_connection(
+            &store,
+            "backup test setup",
+            |mut connection| async move {
+                let mut conn = SqlConn::Sqlite(&mut connection);
+                for statement in statements {
+                    conn.execute(statement, &[]).await?;
+                }
+                Ok(())
+            },
+        )
+        .await
     })
     .unwrap();
 }
 
 fn query_count(db: &Database, table: &'static str) -> i64 {
-    let StoreDatastore::Sqlite { pool, .. } = db.datastore() else {
-        panic!("test database is SQLite");
-    };
+    let store = db.datastore();
     db.run_sql_blocking_local(move || async move {
-        let mut connection = pool
-            .acquire()
-            .await
-            .map_err(|error| crate::StateError::Database(error.to_string()))?;
         let query = format!("SELECT COUNT(*) FROM {table}");
-        sqlx::query_scalar(sqlx::AssertSqlSafe(query.as_str()))
-            .fetch_one(&mut *connection)
-            .await
-            .map_err(|error| crate::StateError::Database(error.to_string()))
+        SqlRuntime::fetch_optional(store.read_exec(), &query, &[])
+            .await?
+            .expect("count row")
+            .i64_at(0)
     })
     .unwrap()
 }
@@ -140,6 +146,9 @@ fn sample_server(id: u32) -> crate::servers::ServerConfig {
 
 fn sample_config() -> Config {
     Config {
+        upload_cap: None,
+        seeding: None,
+        torrent: Default::default(),
         data_dir: "/old/data".into(),
         hardware_profile: None,
         intermediate_dir: Some("/old/data/intermediate".into()),
@@ -147,12 +156,20 @@ fn sample_config() -> Config {
         servers: vec![],
         categories: vec![
             CategoryConfig {
+                upload_cap: Default::default(),
+                seeding: None,
+                torrent_route: false,
+                unpack: None,
                 id: 1,
                 name: "tv".into(),
                 dest_dir: Some("/old/data/complete/tv".into()),
                 aliases: String::new(),
             },
             CategoryConfig {
+                upload_cap: Default::default(),
+                seeding: None,
+                torrent_route: false,
+                unpack: None,
                 id: 2,
                 name: "movies".into(),
                 dest_dir: Some("/mnt/media/movies".into()),
@@ -160,7 +177,11 @@ fn sample_config() -> Config {
             },
         ],
         retry: None,
-        max_download_speed: Some(1234),
+        bandwidth: crate::proxies::Bandwidth {
+            download_bps: Some(1234),
+            upload_bps: None,
+            split: None,
+        },
         propagation_delay_secs: None,
         max_concurrent_nzbs: None,
         cleanup_after_extract: Some(true),
@@ -178,6 +199,7 @@ fn sample_config() -> Config {
 fn populate_source_db(db: &Database) {
     db.save_config(&sample_config()).unwrap();
     db.insert_job_history(&JobHistoryRow {
+        protocol: crate::jobs::Protocol::Nzb,
         job_id: 41,
         job_hash: None,
         name: "Backup Fixture".into(),
@@ -681,6 +703,7 @@ async fn sqlite_export_snapshot_stays_closed_while_history_grows_concurrently() 
             let job_id = 50_000 + inserted;
             writer_db
                 .insert_job_history(&JobHistoryRow {
+                    protocol: crate::jobs::Protocol::Nzb,
                     job_id,
                     job_hash: None,
                     name: format!("Concurrent Fixture {job_id}"),
@@ -1177,6 +1200,9 @@ async fn restore_requires_category_remap_for_external_paths() {
     let target_db = open_temp_db();
     target_db
         .save_config(&Config {
+            upload_cap: None,
+            seeding: None,
+            torrent: Default::default(),
             data_dir: "/bootstrap".into(),
             hardware_profile: None,
             intermediate_dir: None,
@@ -1184,7 +1210,7 @@ async fn restore_requires_category_remap_for_external_paths() {
             servers: vec![],
             categories: vec![],
             retry: None,
-            max_download_speed: None,
+            bandwidth: Default::default(),
             propagation_delay_secs: None,
             max_concurrent_nzbs: None,
             cleanup_after_extract: Some(true),
@@ -1202,6 +1228,9 @@ async fn restore_requires_category_remap_for_external_paths() {
     let (target_service, _, _) = build_service(
         target_db.clone(),
         Config {
+            upload_cap: None,
+            seeding: None,
+            torrent: Default::default(),
             data_dir: "/bootstrap".into(),
             hardware_profile: None,
             intermediate_dir: None,
@@ -1209,7 +1238,7 @@ async fn restore_requires_category_remap_for_external_paths() {
             servers: vec![],
             categories: vec![],
             retry: None,
-            max_download_speed: None,
+            bandwidth: Default::default(),
             propagation_delay_secs: None,
             max_concurrent_nzbs: None,
             cleanup_after_extract: Some(true),
@@ -1247,7 +1276,7 @@ async fn restore_requires_category_remap_for_external_paths() {
     assert_eq!(target_db.load_config().unwrap().data_dir, "/bootstrap");
     assert!(
         target_db
-            .list_job_history(&HistoryFilter::default(), crate::HistoryRows::All)
+            .list_job_history(&HistoryFilter::default())
             .unwrap()
             .is_empty()
     );
@@ -1313,6 +1342,69 @@ async fn logical_restore_persists_selected_paths_when_source_used_defaults() {
 }
 
 #[tokio::test]
+async fn a_restore_brings_back_history_tags_and_every_tag_made() {
+    let source_db = open_temp_db();
+    populate_source_db(&source_db);
+    let history = crate::jobs::JobId(41);
+    source_db.add_job_tags(&[history], ["kept"]).unwrap();
+    // A queued job does not come back, so neither do its tags.
+    source_db
+        .tag_new_job(crate::jobs::JobId(500), ["queued"])
+        .unwrap();
+    source_db.create_tags(["spare"]).unwrap();
+    let (source_service, _, _) = build_service(source_db, sample_config());
+    let artifact = source_service
+        .create_backup(Some("tag-secret".into()))
+        .await
+        .unwrap();
+
+    let target_root = tempfile::tempdir().unwrap();
+    let target_db = open_temp_db();
+    let mut target_config = sample_config();
+    target_config.data_dir = target_root.path().to_string_lossy().into_owned();
+    let (target_service, _, _) = build_service(target_db.clone(), target_config);
+    target_service
+        .restore_backup(
+            &artifact.path,
+            Some("tag-secret".into()),
+            RestoreOptions {
+                data_dir: target_root
+                    .path()
+                    .join("restored")
+                    .to_string_lossy()
+                    .into_owned(),
+                intermediate_dir: None,
+                complete_dir: None,
+                category_remaps: vec![CategoryRemapInput {
+                    category_name: "movies".into(),
+                    new_dest_dir: target_root
+                        .path()
+                        .join("movies")
+                        .to_string_lossy()
+                        .into_owned(),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+    drop(target_service);
+
+    let (restored_db, outcome) = apply_pending_restore(target_db, target_root.path()).unwrap();
+    assert!(outcome.is_some());
+    assert_eq!(restored_db.job_tags(history).unwrap(), ["kept"]);
+    assert!(
+        restored_db
+            .job_tags(crate::jobs::JobId(500))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        restored_db.tag_snapshot().unwrap().made(),
+        ["kept", "queued", "spare"]
+    );
+}
+
+#[tokio::test]
 async fn staged_restore_rewrites_paths_without_mutating_the_live_runtime() {
     let source_db = open_temp_db();
     populate_source_db(&source_db);
@@ -1349,7 +1441,7 @@ async fn staged_restore_rewrites_paths_without_mutating_the_live_runtime() {
     bootstrap.complete_dir = None;
     bootstrap.servers = vec![sample_server(7)];
     bootstrap.categories.clear();
-    bootstrap.max_download_speed = None;
+    bootstrap.bandwidth = Default::default();
     let mut target_db = open_temp_db();
     target_db.save_config(&bootstrap).unwrap();
 
@@ -1390,13 +1482,8 @@ async fn staged_restore_rewrites_paths_without_mutating_the_live_runtime() {
         target_db.load_config().unwrap().data_dir,
         target_root.path().to_string_lossy()
     );
-    assert!(
-        capture
-            .state
-            .queue
-            .read(|inner| inner.globals.runtime_paths.is_none())
-    );
-    assert_eq!(capture.state.queue.revision(), 0);
+    assert!(!capture.state.has_runtime_paths());
+    assert_eq!(capture.state.job_revision(), 0);
     assert_eq!(target_policy.snapshot(7).unwrap().lifetime_bytes, 50_000);
 
     let (restored_target_db, outcome) =
@@ -1432,7 +1519,7 @@ async fn staged_restore_rewrites_paths_without_mutating_the_live_runtime() {
     );
     assert_eq!(
         target_db
-            .list_job_history(&HistoryFilter::default(), crate::HistoryRows::All)
+            .list_job_history(&HistoryFilter::default())
             .unwrap()
             .len(),
         1
@@ -1457,25 +1544,15 @@ async fn staged_restore_rewrites_paths_without_mutating_the_live_runtime() {
 
 #[tokio::test]
 async fn backup_catalog_rejects_an_unclassified_application_table() {
-    use sqlx::Connection as _;
-
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("catalog.db");
     let db = Database::open(&path).unwrap();
     db.validate_backup_catalog().unwrap();
 
-    let mut connection = sqlx::sqlite::SqliteConnection::connect_with(
-        &sqlx::sqlite::SqliteConnectOptions::new()
-            .filename(&path)
-            .create_if_missing(false),
-    )
-    .await
-    .unwrap();
-    sqlx::query("CREATE TABLE unclassified_test_table (id INTEGER PRIMARY KEY)")
-        .execute(&mut connection)
-        .await
-        .unwrap();
-    connection.close().await.unwrap();
+    execute_sql(
+        &db,
+        vec!["CREATE TABLE unclassified_test_table (id INTEGER PRIMARY KEY)"],
+    );
 
     let error = db.validate_backup_catalog().unwrap_err();
     assert!(error.to_string().contains("unclassified_test_table"));
@@ -1572,7 +1649,7 @@ async fn sqlite_restore_resumes_after_every_promotion_phase() {
         );
         assert_eq!(
             restored
-                .list_job_history(&HistoryFilter::default(), crate::HistoryRows::All)
+                .list_job_history(&HistoryFilter::default())
                 .unwrap()
                 .len(),
             1,
@@ -1663,7 +1740,7 @@ async fn postgres_restore_resumes_after_every_promotion_phase() {
         assert!(outcome.is_some());
         assert_eq!(
             restored
-                .list_job_history(&HistoryFilter::default(), crate::HistoryRows::All)
+                .list_job_history(&HistoryFilter::default())
                 .unwrap()
                 .len(),
             1,
@@ -2254,6 +2331,7 @@ fn finished_job(job_id: u64) -> JobHistoryRow {
         metadata: None,
         server_attribution: None,
         archived_at: None,
+        protocol: crate::jobs::Protocol::Nzb,
     }
 }
 

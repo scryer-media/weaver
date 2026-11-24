@@ -65,8 +65,12 @@ enum WhyMirror {
     HoldsBreached,
     Unsupported,
     Unmapped,
+    Unfound {
+        volume: u32,
+    },
     TooDeep,
     InvalidArchive,
+    Scattered,
     TooLarge {
         needed: Option<u64>,
         allowed: Option<u64>,
@@ -75,6 +79,7 @@ enum WhyMirror {
         needed: u64,
         memory: u64,
     },
+    Packed,
 }
 through!(Why, WhyMirror);
 

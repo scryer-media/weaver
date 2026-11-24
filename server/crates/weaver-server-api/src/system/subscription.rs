@@ -2,7 +2,10 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
-use crate::system::types::{JobDownloadRate, ProviderConnections, ProviderHoldoff};
+use crate::system::types::{
+    JobDownloadRate, ProviderConnections, ProviderHoldoff, TorrentPresence,
+};
+use weaver_server_core::torrents::service::TorrentService;
 
 #[derive(Default)]
 pub(crate) struct SystemSubscription;
@@ -91,10 +94,15 @@ impl SystemSubscription {
     ) -> Result<impl Stream<Item = SystemMetricsSnapshot>> {
         let handle = ctx.data::<SchedulerHandle>()?.clone();
         let config = ctx.data::<SharedConfig>()?.clone();
+        let torrents = ctx.data_opt::<TorrentService>().cloned();
+        let availability = *ctx.data::<weaver_server_core::torrents::TorrentAvailability>()?;
         let initial_metrics = handle.get_metrics();
 
         Ok(async_stream::stream! {
-            let mut last = build_system_metrics_snapshot(&handle, &config, initial_metrics).await;
+            let torrents = torrents.as_ref();
+            let mut last =
+                build_system_metrics_snapshot(&handle, &config, torrents, availability, initial_metrics)
+                    .await;
             yield last.clone();
 
             let mut interval = tokio::time::interval(METRICS_UPDATE_INTERVAL);
@@ -103,7 +111,9 @@ impl SystemSubscription {
             loop {
                 interval.tick().await;
                 let metrics = handle.get_metrics();
-                let snapshot = build_system_metrics_snapshot(&handle, &config, metrics).await;
+                let snapshot =
+                    build_system_metrics_snapshot(&handle, &config, torrents, availability, metrics)
+                        .await;
                 // An idle server's gauges sit still; a tick that would send
                 // the client exactly what it already has sends nothing.
                 if snapshot == last {
@@ -119,12 +129,16 @@ impl SystemSubscription {
 async fn build_system_metrics_snapshot(
     handle: &SchedulerHandle,
     config: &SharedConfig,
+    torrents: Option<&TorrentService>,
+    availability: weaver_server_core::torrents::TorrentAvailability,
     metrics: weaver_server_core::MetricsSnapshot,
 ) -> SystemMetricsSnapshot {
     let metrics = Metrics::from(&metrics);
     let download_block = handle.get_download_block();
-    let is_paused = handle.is_globally_paused();
-    let speed_limit_bytes_per_sec = config.read().await.max_download_speed.unwrap_or(0);
+    let (speed_limit_bytes_per_sec, torrents_enabled) = {
+        let config = config.read().await;
+        (config.bandwidth.download_bps, config.torrent.enabled)
+    };
     let pool = handle.nntp_pool();
     let provider_holdoffs = pool.as_deref().map(provider_holdoffs).unwrap_or_default();
     let provider_connections = pool
@@ -145,10 +159,16 @@ async fn build_system_metrics_snapshot(
 
     SystemMetricsSnapshot {
         metrics,
-        global_state: global_queue_state(is_paused, &download_block, speed_limit_bytes_per_sec),
+        global_state: global_queue_state(
+            &handle.state().holds(),
+            &download_block,
+            speed_limit_bytes_per_sec,
+        ),
         provider_holdoffs,
         job_download_rates,
         provider_connections,
+        torrents: TorrentPresence::of(availability, torrents_enabled, torrents),
+        torrent_rates: crate::system::types::TorrentRates::of(torrents),
     }
 }
 

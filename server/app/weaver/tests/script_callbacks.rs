@@ -14,6 +14,13 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use weaver_server_core::jobs::persistence::JobsPersistenceQueries;
+use weaver_server_core::post_processing::callbacks::PostProcessingCallbacksQueries;
+use weaver_server_core::post_processing::effects::PostProcessingEffectsQueries;
+use weaver_server_core::post_processing::instances::PostProcessingInstancesQueries;
+use weaver_server_core::post_processing::secrets::PostProcessingSecretsQueries;
+use weaver_server_core::post_processing::settings::PostProcessingSettingsQueries;
+use weaver_server_core::post_processing::test_run::PostProcessingTestRunQueries;
 
 use tokio::sync::RwLock;
 use weaver_server_core::jobs::record::ActiveJob;
@@ -153,13 +160,16 @@ fn executor(db: &Database) -> PostProcessingExecutor {
 
 fn config(data: &Path) -> SharedConfig {
     Arc::new(RwLock::new(Config {
+        upload_cap: None,
+        seeding: None,
+        torrent: Default::default(),
         data_dir: data.to_string_lossy().into_owned(),
         intermediate_dir: None,
         complete_dir: None,
         servers: vec![],
         categories: vec![],
         retry: None,
-        max_download_speed: None,
+        bandwidth: Default::default(),
         cleanup_after_extract: None,
         delete_failed_job_files: None,
         history_retention_days: None,

@@ -46,7 +46,7 @@ test("cleanup drains a pause already queued between rule deletions before the op
   const pending = [];
   let serial = 0;
   let paused = false;
-  let speed = 0;
+  let speed = null;
   let replayed = false;
   const { Rules, resumeAll } = await fixtures({
     graphql: async (_request, query, variables) => {
@@ -68,7 +68,7 @@ test("cleanup drains a pause already queued between rule deletions before the op
       }
       if (query.includes("updateSchedule")) {
         Object.assign(rows.get(variables.id), variables.input);
-        pending.push(() => { speed = variables.input.speedLimits[0].bytesPerSec; });
+        pending.push(() => { speed = variables.input.speedLimits[0].download; });
         return { updateSchedule: [...rows.values()] };
       }
       if (query.includes("globalQueueState")) {
@@ -88,7 +88,7 @@ test("cleanup drains a pause already queued between rule deletions before the op
   await resumeAll({});
   for (const apply of pending.splice(0)) apply();
   assert.equal(paused, false);
-  assert.equal(speed, 0);
+  assert.equal(speed, null);
   assert.equal(rows.size, 0);
 });
 

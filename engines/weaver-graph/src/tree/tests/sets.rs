@@ -14,9 +14,12 @@ use crate::facts::{Durable, Facts, Restore, RestoreError};
 use crate::recovery::{MemberAccess, RepairOutcome};
 use crate::{Segment, SliceVerdict};
 
-// A pretend recovery object that covers nothing and keeps its facts.
+// A pretend recovery object that covers nothing and keeps its facts. It
+// stands for a PAR2 set, which rebuilds, or for a listing, which only checks.
 #[derive(Serialize, Deserialize)]
-struct Set;
+struct Set {
+    rebuilds: bool,
+}
 
 impl Durable for Set {
     const VERSION: u16 = 1;
@@ -27,7 +30,7 @@ impl Object for Set {
     fn unposted(&mut self, _: crate::VolumeIndex, _: crate::ByteRange) {}
 
     fn kind(&self) -> Kind {
-        Kind::Par2
+        if self.rebuilds { Kind::Par2 } else { Kind::Sfv }
     }
     fn deliver(
         &mut self,
@@ -59,12 +62,27 @@ impl Object for Set {
         Some(self)
     }
     fn facts(&self) -> Facts {
-        Facts::of(Kind::Par2, self)
+        Facts::of(self.kind(), self)
     }
 }
 
 impl Recovery for Set {
+    fn rebuilds(&self) -> bool {
+        self.rebuilds
+    }
+
+    fn carried_inside(&self) -> bool {
+        false
+    }
+
+    fn outgrows_recovery(&self) -> bool {
+        false
+    }
+
     fn covers(&self, _: MemberId) -> bool {
+        false
+    }
+    fn covers_some(&self) -> bool {
         false
     }
     fn feed(&mut self, _: MemberId, _: &[Segment]) {}
@@ -84,7 +102,8 @@ struct Sets;
 impl Builder for Sets {
     fn build(&mut self, kind: Kind, id: ObjectId) -> Option<Box<dyn Object>> {
         match kind {
-            Kind::Par2 => Some(Box::new(Set)),
+            Kind::Par2 => Some(Box::new(Set { rebuilds: true })),
+            Kind::Sfv => Some(Box::new(Set { rebuilds: false })),
             _ => Build.build(kind, id),
         }
     }
@@ -278,4 +297,31 @@ fn a_set_is_marked_where_it_changes_not_where_it_is_asked() {
         after.contains(&Mark::Members(NodeId::ROOT)),
         "and its home: {after:?}"
     );
+}
+
+// Whether a set rebuilds is the set's own answer, which the tree passes on
+// in its node and keeps while it is out for a repair. A listing only checks.
+#[test]
+fn the_tree_passes_on_whether_a_set_rebuilds_while_it_is_in_and_out() {
+    let mut tree = Tree::new();
+    let parity = posted(&mut tree, "show.par2");
+    let listing = tree.announce_root("show.sfv", Some(18), &mut Vec::new());
+    deliver(&mut tree, listing, 0, b"show.bin 0badf00d\n");
+    let listing = tree
+        .child_of(NodeId::ROOT, listing)
+        .expect("a listing is bound")
+        .0;
+    assert_eq!(tree.kind(listing), Some(Kind::Sfv));
+    assert!(tree.recovers(parity) && tree.recovers(listing));
+    assert!(tree.rebuilds(parity));
+    assert!(!tree.rebuilds(listing));
+
+    let lent_parity = tree.lend(parity).expect("the set is lent");
+    let lent_listing = tree.lend(listing).expect("the listing is lent");
+    assert!(tree.rebuilds(parity));
+    assert!(!tree.rebuilds(listing));
+    tree.take_back(parity, lent_parity, &mut Sets, &mut Vec::new());
+    tree.take_back(listing, lent_listing, &mut Sets, &mut Vec::new());
+    assert!(tree.rebuilds(parity));
+    assert!(!tree.rebuilds(listing));
 }

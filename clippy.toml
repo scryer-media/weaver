@@ -23,12 +23,16 @@ disallowed-methods = [
     { path = "quinn::Endpoint::client", reason = "connect through the proxy runtime, so the connection takes its route" },
     { path = "tokio::net::lookup_host", reason = "resolve through the route's path, so the name never reaches the host resolver" },
     { path = "std::net::ToSocketAddrs::to_socket_addrs", reason = "resolve through the route's path, so the name never reaches the host resolver" },
+    { path = "url::Url::socket_addrs", reason = "resolve through the route's path, so the name never reaches the host resolver" },
     # The routing layer's own direct primitives.
     { path = "weaver_tunnel::resolution::host_lookup", reason = "resolve through the route's path, so the name never reaches the host resolver" },
     { path = "weaver_tunnel::resolution::host_lookup_blocking", reason = "resolve through the route's path, so the name never reaches the host resolver" },
     { path = "weaver_tunnel::egress::SocketEgress::connect", reason = "dial through the proxy runtime, so the connection takes its route" },
     { path = "weaver_tunnel::egress::SocketEgress::connect_blocking", reason = "dial through the proxy runtime, so the connection takes its route" },
     { path = "weaver_tunnel::egress::SocketEgress::bind_udp", reason = "send through the proxy runtime, so the datagrams take their route" },
+    { path = "weaver_tunnel::egress::SocketEgress::bind_udp_reusing", reason = "send through the proxy runtime, so the datagrams take their route" },
+    { path = "weaver_tunnel::egress::SocketEgress::listen_tcp", reason = "listen through the proxy runtime, so the listener sits on its route" },
+    { path = "weaver_tunnel::egress::SocketEgress::join_multicast", reason = "join through the proxy runtime, so the groups sit on their route" },
     { path = "weaver_nntp::route_dialer::AddressPlanned::new", reason = "take the server's dialer from its route in the proxy runtime" },
     { path = "weaver_tunnel::pipe::Egress::new", reason = "take the egress from the route in the proxy runtime" },
     # Every SQLite write takes the writer gate. Only the persistence runtime

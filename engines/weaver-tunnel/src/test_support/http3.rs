@@ -13,7 +13,6 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
     task::{JoinHandle, JoinSet},
 };
 use tokio_rustls::rustls;
@@ -90,7 +89,7 @@ impl Http3ServerDouble {
                                                     stream.finish().await?;
                                                     return Ok(());
                                                 };
-                                                let upstream = TcpStream::connect(destination).await?;
+                                                let upstream = super::loopback::connect(*destination).await?;
                                                 stream.send_response(http::Response::builder().status(200).body(())?).await?;
                                                 let (mut send, mut recv) = stream.split();
                                                 let (mut read, mut write) = upstream.into_split();

@@ -29,7 +29,6 @@ regex = { workspace = true }
 tokio-stream = { version = "0.1", default-features = false, features = ["sync", "time"] }
 async-stream = { version = "0.3", default-features = false }
 axum = { workspace = true }
-scryer-release-parser = { workspace = true, default-features = false }
 
 [dev-dependencies]
 axum = { workspace = true, features = ["ws"] }
@@ -39,5 +38,7 @@ async-graphql = { workspace = true }
 base64 = { workspace = true }
 tempfile = { workspace = true }
 lzma-turbo = { workspace = true, features = ["enc"] }
+# A tracker rule's certificate and key, made in-test.
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
 # The loopback NNTP and HTTP sources the speed test tests run against.
 weaver-server-core = { path = "../weaver-server-core", default-features = false, features = ["test-support"] }

@@ -780,6 +780,24 @@ impl Object for SevenZipStore {
         Kind::SevenZipStore
     }
 
+    // Stored members take their bytes as they arrive, until I give the
+    // container to an engine or up.
+    fn passes_on(&self) -> bool {
+        !self.gone
+    }
+
+    // An entry of a folder that copies, not enciphered: the map takes no
+    // other method.
+    fn verbatim(&self, member: MemberId) -> bool {
+        self.map.as_ref().is_some_and(|map| {
+            map.entries
+                .get(member.0 as usize)
+                .and_then(|entry| entry.folder)
+                .and_then(|folder| map.folders.get(folder))
+                .is_some_and(|folder| folder.aes.is_none())
+        })
+    }
+
     fn deliver(
         &mut self,
         delivery: Delivery<'_>,
@@ -848,7 +866,7 @@ impl Object for SevenZipStore {
         self.install(out);
         let why = crate::quiet::damaged(standing)
             .or_else(|| self.shut())
-            .or_else(|| crate::quiet::unplaced(standing));
+            .or_else(|| crate::quiet::unplaced(standing, None));
         if let Some(why) = why {
             self.give_up(Emit::Refuse(why), out);
         }
@@ -1008,7 +1026,13 @@ impl Object for SevenZipStore {
     // it. A front whose signature states the container this file's stated
     // is this file posted again, offered its place for the tree to weigh
     // against what holds it, by their fronts.
-    fn claim(&mut self, _name: &str, first_bytes: &[u8], _length: Option<u64>) -> Claim {
+    fn claim(
+        &mut self,
+        _name: &str,
+        clean: weaver_graph::Clean<'_>,
+        _length: Option<u64>,
+    ) -> Claim {
+        let first_bytes = clean.front();
         match measured(first_bytes) {
             Some(total) if Some(total) == self.measured => vec![FILE].into(),
             _ => Claim::default(),

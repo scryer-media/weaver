@@ -553,7 +553,7 @@ func awaitAdversarialDiskWait(jobID int, logOffset int64) error {
 // The lines Weaver logs once per cancelled job, after its archive committed,
 // when the removal of its folders has ended: they went, or one stayed.
 const (
-	cancelCleanupLogTarget    = "weaver_server_core::pipeline::orchestrator"
+	cancelCleanupLogTarget    = "weaver_server_pipeline::pipeline::orchestrator"
 	cancelFoldersReleasedLine = "cancelled job folders released"
 	cancelFoldersRetainedLine = "cancelled job folders retained"
 )
