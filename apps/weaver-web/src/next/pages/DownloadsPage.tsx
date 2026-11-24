@@ -720,10 +720,12 @@ export function DownloadsPage() {
       if (HELD_BACK_STATUSES.has(job.status)) {
         if (blocked) return blockEta;
         if (isPaused) return heldBy;
+        // The torrents' own hold reads on its rows as the queue's pause does.
+        if (torrentsPaused && job.protocol === "TORRENT") return t("next.downloads.waitPaused");
       }
       return null;
     },
-    [blockEta, blocked, heldBy, isPaused, t],
+    [blockEta, blocked, heldBy, isPaused, t, torrentsPaused],
   );
   const holdValue = useCallback(
     (job: JobData): string | null => (blocked && HELD_BACK_STATUSES.has(job.status) ? blockLabel : null),

@@ -27,8 +27,6 @@ pub struct AnnounceShape {
     pub(crate) headers: &'static [Header],
     /// Whether header names go out with each word capitalised.
     pub(crate) title_case: bool,
-    /// The `port` announced by a session that accepts no connections.
-    pub(crate) no_listener_port: u16,
     /// Whether a torrent that has every piece it wants and is not a seed
     /// says `paused` to a tracker not yet told `started`, in place of it.
     pub(crate) paused_first: bool,
@@ -143,7 +141,6 @@ impl AnnounceShape {
         own_query: OwnQuery::Last,
         headers: &[Header::UserAgent],
         title_case: false,
-        no_listener_port: 0,
         paused_first: false,
     };
 

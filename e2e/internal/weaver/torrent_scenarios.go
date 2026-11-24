@@ -807,9 +807,9 @@ func (lane *torrentLane) proxiedScenario(slug, route string, options submitOptio
 		if event.IP != lane.proxyIP {
 			return done, fmt.Errorf("the tracker heard %s from %s, not the proxy %s", event.Event, event.IP, lane.proxyIP)
 		}
-		// A proxy route takes no connections, so it announces port 0.
-		if event.Port != 0 {
-			return done, fmt.Errorf("the tracker heard %s on port %d through a route that does not listen, want 0", event.Event, event.Port)
+		// A proxy route takes no connections, so it announces port 1.
+		if event.Port != 1 {
+			return done, fmt.Errorf("the tracker heard %s on port %d through a route that does not listen, want 1", event.Event, event.Port)
 		}
 	}
 	events, _, err := lane.proxyEvents(proxyMark)
