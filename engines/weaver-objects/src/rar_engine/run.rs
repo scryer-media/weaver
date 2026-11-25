@@ -56,19 +56,31 @@ pub(crate) enum Scope {
     // Every member: each file body and directory is announced, numbered in
     // archive order.
     Whole,
-    // These members alone, by archive index, each made as the store's
-    // member it names, under the name the store's headers spell it; every
-    // other member is passed over unread and is no member of the run's.
-    // Nothing is announced: the namespace is the store's, and the run only
-    // fills it.
-    Members(BTreeMap<usize, Made>),
+    // The members the store's rule gives the run, as the run reads their
+    // headers (`rar_store::made::by_run`), each made as the store's member
+    // at the same archive index; every other member is passed over unread
+    // and is no member of the run's. The names are those of the members the
+    // store had laid when the run started, as the store's headers spell
+    // them: the member the run reads at each of those indexes must carry
+    // it. Nothing is announced: the namespace is the store's, and the run
+    // only fills it.
+    Members(BTreeMap<usize, String>),
 }
 
-// A member a scoped run makes: the store's id for it, and its name as the
-// headers spell it, which the member at that archive index must carry.
-pub(crate) struct Made {
-    pub(crate) id: MemberId,
-    pub(crate) name: String,
+impl Scope {
+    // Whether a run of this scope makes member `at` of `archive`.
+    fn makes(&self, archive: &RarArchive, at: usize) -> bool {
+        match self {
+            Scope::Whole => true,
+            Scope::Members(_) => archive.member_info(at).is_some_and(|info| {
+                let link = link(archive, at, &info);
+                crate::rar_store::made::by_run(
+                    archive.is_solid(),
+                    crate::rar_store::made::Traits::of_info(&info, link),
+                )
+            }),
+        }
+    }
 }
 
 impl Run {
@@ -97,6 +109,7 @@ impl Extraction for Run {
                 failed: Arc::new(AtomicBool::new(false)),
                 reached: Mutex::default(),
             },
+            password: self.password.as_deref(),
             sink,
             budget,
             next: 0,
@@ -104,7 +117,7 @@ impl Extraction for Run {
             reading: 0,
             scope: self.scope,
         };
-        let Err(Stop::Say(last)) = walk.archive(self.password.as_deref()) else {
+        let Err(Stop::Say(last)) = walk.archive() else {
             return;
         };
         // A member left open was built on bytes the run cannot vouch for.
@@ -131,15 +144,31 @@ enum Stop {
 struct Open {
     member: MemberId,
     encrypted: bool,
+    // Where an encrypted RAR5 member's header can be read again, to learn
+    // whether it checks the password: RAR4 states no check.
+    keyed: Option<Keyed>,
     // The volumes the member's data spans: from the one its header is in to
     // the furthest its decode opened, which is as far as the decode found
     // it, whatever headers the walk had read when it began.
     first: usize,
     last: usize,
+    // Where a member a scoped run makes has its packed data, as far as the
+    // archive has read its headers: all a failure of its decode can say is
+    // damaged.
+    data: Vec<(VolumeIndex, ByteRange)>,
+}
+
+// An encrypted RAR5 member's header: in volume `volume`, before its data
+// at `data`, named `name`.
+struct Keyed {
+    volume: usize,
+    data: u64,
+    name: String,
 }
 
 struct Walk<'s, 'a> {
     input: Input,
+    password: Option<&'s str>,
     sink: &'s mut Sink<'a>,
     budget: Budget,
     // The id the next member announced gets: members are numbered in
@@ -152,7 +181,8 @@ struct Walk<'s, 'a> {
 }
 
 impl Walk<'_, '_> {
-    fn archive(&mut self, password: Option<&str>) -> Result<(), Stop> {
+    fn archive(&mut self) -> Result<(), Stop> {
+        let password = self.password;
         let first = self.input.index(0).map_err(|_| Stop::Silent)?;
         let Some(first) = first else {
             return Ok(());
@@ -233,11 +263,8 @@ impl Walk<'_, '_> {
 
     // Whether the run makes member `at`: every member of a whole run, and
     // of a scoped one those its scope names.
-    fn makes(&self, at: usize) -> bool {
-        match &self.scope {
-            Scope::Whole => true,
-            Scope::Members(made) => made.contains_key(&at),
-        }
+    fn makes(&self, archive: &RarArchive, at: usize) -> bool {
+        self.scope.makes(archive, at)
     }
 
     // How many members from `index` on may decode side by side.
@@ -246,7 +273,7 @@ impl Walk<'_, '_> {
         (index..archive.len())
             .map_while(|at| {
                 // A member the run does not make is passed over unread.
-                if self.makes(at) {
+                if self.makes(archive, at) {
                     held = may_start(archive, &self.input, &self.budget, at, held, has_password)?;
                 }
                 Some(())
@@ -263,7 +290,7 @@ impl Walk<'_, '_> {
         archive: &RarArchive,
         batch: std::ops::Range<usize>,
     ) -> Result<(), Stop> {
-        let batch: Vec<usize> = batch.filter(|at| self.makes(*at)).collect();
+        let batch: Vec<usize> = batch.filter(|at| self.makes(archive, *at)).collect();
         if batch.is_empty() {
             return Ok(());
         }
@@ -323,9 +350,10 @@ impl Walk<'_, '_> {
                 len: archive.len(),
             }));
         };
-        let member = self.announce(at, &info)?;
+        let member = self.announce(archive, at, &info)?;
         self.deliver(member, decoded.bytes)?;
         if let Some((error, read_failed)) = decoded.ended {
+            self.data_of(archive, at);
             // Decoding alone, the walk would have read what failed itself.
             if read_failed {
                 self.input.failed.store(true, Ordering::Release);
@@ -342,7 +370,12 @@ impl Walk<'_, '_> {
     // knows none for it. `checksum_of` states it once the member is decoded.
     // A scoped run announces nothing: the member at archive index `at` is
     // the store's, which must name the member the run reads there.
-    fn announce(&mut self, at: usize, info: &unrar_rs::MemberInfo) -> Result<MemberId, Stop> {
+    fn announce(
+        &mut self,
+        archive: &RarArchive,
+        at: usize,
+        info: &unrar_rs::MemberInfo,
+    ) -> Result<MemberId, Stop> {
         let member = match &self.scope {
             Scope::Whole => {
                 let member = MemberId(self.next);
@@ -354,21 +387,54 @@ impl Walk<'_, '_> {
                 })?;
                 member
             }
-            Scope::Members(made) => match made.get(&at) {
-                Some(made) if made.name == info.raw_name => made.id,
+            Scope::Members(named) => match named.get(&at) {
                 // The store's headers and the run's disagree on what the
                 // member is: nothing the run would make there is the
                 // store's member.
-                _ => return Err(Stop::Say(vec![Emit::Refuse(Why::Unsupported)])),
+                Some(name) if *name != info.raw_name => {
+                    return Err(Stop::Say(vec![Emit::Refuse(Why::Unsupported)]));
+                }
+                _ => MemberId(at as u32),
             },
         };
+        let keyed = (info.is_encrypted && archive.format() == ArchiveFormat::Rar5)
+            .then(|| archive.member_segments(at)?.first())
+            .flatten()
+            .map(|segment| Keyed {
+                volume: segment.volume_index,
+                data: segment.data_offset,
+                name: info.raw_name.clone(),
+            });
         self.open = Some(Open {
             member,
             encrypted: info.is_encrypted,
+            keyed,
             first: info.volumes.first_volume,
             last: info.volumes.first_volume,
+            data: Vec::new(),
         });
+        self.data_of(archive, at);
         Ok(member)
+    }
+
+    // Where the open member's packed data lies, as far as `archive` read
+    // its headers, for a member a scoped run makes.
+    fn data_of(&mut self, archive: &RarArchive, at: usize) {
+        if matches!(self.scope, Scope::Whole) {
+            return;
+        }
+        let (Some(open), Some(segments)) = (&mut self.open, archive.member_segments(at)) else {
+            return;
+        };
+        open.data = segments
+            .iter()
+            .filter_map(|segment| {
+                Some((
+                    VolumeIndex(u32::try_from(segment.volume_index).ok()?),
+                    ByteRange::at(segment.data_offset, segment.data_size),
+                ))
+            })
+            .collect();
     }
 
     // The CRC32 a file member's final part's header states for it, said
@@ -430,7 +496,7 @@ impl Walk<'_, '_> {
             return Ok(1);
         }
         // A member the run does not make is passed over unread.
-        if !self.makes(index) {
+        if !self.makes(archive, index) {
             return Ok(1);
         }
         // A directory is a member with nothing in it, named with a trailing
@@ -455,7 +521,7 @@ impl Walk<'_, '_> {
         if self.spreads(archive) {
             return self.alongside(archive, index, &info, cursor, password);
         }
-        let member = self.announce(index, &info)?;
+        let member = self.announce(archive, index, &info)?;
         let mut out = Out {
             sink: &mut *self.sink,
             member,
@@ -479,7 +545,10 @@ impl Walk<'_, '_> {
                 self.say(Emit::MemberClosed(member)).map(|()| 1)
             }
             Err(_) if out.stopped => Err(Stop::Silent),
-            Err(error) => Err(self.failed_through(last, error)),
+            Err(error) => {
+                self.data_of(archive, index);
+                Err(self.failed_through(last, error))
+            }
         }
     }
 
@@ -499,7 +568,7 @@ impl Walk<'_, '_> {
         cursor: &mut Cursor,
         password: Option<&str>,
     ) -> Result<usize, Stop> {
-        let member = self.announce(index, info)?;
+        let member = self.announce(archive, index, info)?;
         let decode_limits = limits(&self.budget);
         let mut own = copy(archive, index, &decode_limits);
         let beside = Beside::default();
@@ -516,10 +585,6 @@ impl Walk<'_, '_> {
                 ..
             } = &mut *self;
             let (input, budget) = (&*input, &*budget);
-            let makes = |at: usize| match &*scope {
-                Scope::Whole => true,
-                Scope::Members(made) => made.contains_key(&at),
-            };
             let lend = budget.threads() - 1;
             let work = || {
                 beside.work(&input.volumes);
@@ -538,7 +603,7 @@ impl Walk<'_, '_> {
                     while beside.running.load(Ordering::Acquire) < lend {
                         // A member the run does not make is passed over
                         // unread; it is said by no one here.
-                        if next < archive.len() && !makes(next) {
+                        if next < archive.len() && !scope.makes(archive, next) {
                             next += 1;
                             continue;
                         }
@@ -581,7 +646,10 @@ impl Walk<'_, '_> {
         match inline {
             Some(Ok(_)) => {}
             Some(Err(_)) if stopped => return Err(Stop::Silent),
-            Some(Err(error)) => return Err(self.failed_through(last, error)),
+            Some(Err(error)) => {
+                self.data_of(&own, 0);
+                return Err(self.failed_through(last, error));
+            }
             None => unreachable!("a pool runs its caller"),
         }
         self.open = None;
@@ -592,7 +660,7 @@ impl Walk<'_, '_> {
             .into_inner()
             .unwrap_or_else(PoisonError::into_inner);
         for at in index + 1..next {
-            if !self.makes(at) {
+            if !self.makes(archive, at) {
                 continue;
             }
             match decoded.remove(&at) {
@@ -624,14 +692,65 @@ impl Walk<'_, '_> {
         if self.input.failed.load(Ordering::Acquire) {
             return Stop::Silent;
         }
-        let encrypted = self.open.as_ref().is_some_and(|open| open.encrypted);
+        // A failure on an encrypted member asks for another password only
+        // while the password is unproven.
+        let unproven = self
+            .open
+            .as_ref()
+            .is_some_and(|open| open.encrypted && !self.proven(open));
         let (first, last) = self
             .open
             .as_ref()
             .map_or((self.reading, self.reading), |open| (open.first, open.last));
+        // A member a scoped run makes is damaged in its own packed data,
+        // not in the volumes around it, which hold the store's members.
+        let data = match (&self.scope, &self.open) {
+            (Scope::Members(_), Some(open)) => Some(open.data.as_slice()),
+            _ => None,
+        };
         let mut said = vec![Emit::Failed(crate::verdict::failed(&said_of(&error)))];
-        said.extend(verdict(&error, encrypted, first..=last, &self.input));
+        said.extend(verdict(&error, unproven, first..=last, data, &self.input));
         Stop::Say(said)
+    }
+
+    // Whether the run's password is the one the open member was enciphered
+    // under: its RAR5 header carries a password check value, and the
+    // password reproduces it. A failure after that is the bytes', not the
+    // password's. RAR4, and a RAR5 header with no check value, prove
+    // nothing. The header is read again from the bytes before the member's
+    // data, which the run has read already, so nothing waits on bytes still
+    // to come.
+    fn proven(&self, open: &Open) -> bool {
+        let (Some(keyed), Some(password)) = (&open.keyed, self.password) else {
+            return false;
+        };
+        let Ok(Some(volume)) = self.input.index(keyed.volume) else {
+            return false;
+        };
+        let headers = Headers {
+            reader: self.input.reader(volume),
+            end: keyed.data,
+        };
+        let Ok(walk) = RarArchive::parse_volume_facts_walk(headers, Some(password)) else {
+            return false;
+        };
+        let Some(encryption) = walk
+            .facts
+            .members
+            .iter()
+            .rev()
+            .find(|member| !member.split_before && member.name == keyed.name)
+            .and_then(|member| member.encryption.as_ref())
+        else {
+            return false;
+        };
+        unrar_rs::check_member_password(
+            &unrar_rs::KdfCache::new(),
+            password,
+            &encryption.salt,
+            encryption.kdf_count_lg2,
+            encryption.psw_check.as_ref(),
+        ) == unrar_rs::PasswordCheck::Verified
     }
 }
 
@@ -917,22 +1036,25 @@ impl Beside {
 // volumes the failing member spans, or the one whose headers failed, so a
 // repair can bring their bytes back. A run reads verified bytes only, and a
 // read that failed ends it silently, so a failure that gets here is on bytes
-// as they were posted: on an encrypted member, a wrong key decrypts to bytes
-// the decoder or the checksum rejects, and the failure asks for another
-// password before it is called damage.
+// as they were posted: on an encrypted member whose password is unproven, a
+// wrong key decrypts to bytes the decoder or the checksum rejects, and the
+// failure asks for another password before it is called damage. A member
+// whose header checks the password and passed it fails on its bytes.
 fn verdict(
     error: &RarError,
-    encrypted: bool,
+    unproven: bool,
     spans: std::ops::RangeInclusive<usize>,
+    data: Option<&[(VolumeIndex, ByteRange)]>,
     input: &Input,
 ) -> Vec<Emit> {
     match rar_error_class(error) {
         Class::PasswordRequired => vec![Emit::NeedsPassword],
-        Class::Recoverable if encrypted => vec![Emit::NeedsPassword],
+        Class::Recoverable if unproven => vec![Emit::NeedsPassword],
         Class::Recoverable => {
             // A closed volume is damaged whole; a growing one as far as the
             // run read it, for that is all the run can say of it. A volume
-            // the run never read says nothing.
+            // the run never read says nothing. A member a scoped run makes
+            // is damaged only in its own packed data, as far as that.
             spans
                 .filter_map(|position| {
                     let volume = input.index(position).ok()??;
@@ -940,14 +1062,26 @@ fn verdict(
                         .volumes
                         .len(volume)
                         .unwrap_or_else(|| input.reached(volume));
-                    (known_end > 0).then(|| Emit::Damaged {
-                        volume,
-                        range: ByteRange::new(0, known_end),
-                    })
+                    (known_end > 0).then_some((volume, known_end))
+                })
+                .flat_map(|(volume, known_end)| {
+                    let whole = [ByteRange::new(0, known_end)];
+                    let ranges: Vec<ByteRange> = match data {
+                        None => whole.to_vec(),
+                        Some(data) => data
+                            .iter()
+                            .filter(|(at, _)| *at == volume)
+                            .map(|(_, range)| ByteRange::new(range.start, range.end.min(known_end)))
+                            .filter(|range| !range.is_empty())
+                            .collect(),
+                    };
+                    ranges
+                        .into_iter()
+                        .map(move |range| Emit::Damaged { volume, range })
                 })
                 .collect()
         }
-        Class::Terminal => vec![terminal(error, encrypted)],
+        Class::Terminal => vec![terminal(error, unproven)],
     }
 }
 
@@ -960,13 +1094,13 @@ fn link(archive: &RarArchive, index: usize, info: &unrar_rs::MemberInfo) -> bool
         || matches!(archive.member_redirection(index), Ok(Some(_)))
 }
 
-fn terminal(error: &RarError, encrypted: bool) -> Emit {
+fn terminal(error: &RarError, unproven: bool) -> Emit {
     match error {
         // A wrong key's bytes, as the decoder rejects them.
         RarError::Blake2Mismatch { .. }
         | RarError::CorruptArchive { .. }
         | RarError::InvalidHuffmanTable
-            if encrypted =>
+            if unproven =>
         {
             Emit::NeedsPassword
         }
@@ -1222,6 +1356,36 @@ impl Seek for Reader {
         };
         self.position = position.ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
         Ok(self.position)
+    }
+}
+
+// A volume as far as a member's data: the headers before it. The walk
+// over it seeks past the data of the members before, so it reads headers
+// only, which are all in once the member's own header was read.
+struct Headers {
+    reader: Reader,
+    end: u64,
+}
+
+impl Read for Headers {
+    fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
+        let left = self.end.saturating_sub(self.reader.position);
+        let take = into.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+        self.reader.read(&mut into[..take])
+    }
+}
+
+impl Seek for Headers {
+    fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+        let from = match from {
+            SeekFrom::End(by) => SeekFrom::Start(
+                self.end
+                    .checked_add_signed(by)
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?,
+            ),
+            from => from,
+        };
+        self.reader.seek(from)
     }
 }
 
