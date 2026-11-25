@@ -48,6 +48,9 @@ pub(super) const EMIT_BYTES: usize = 1 << 20;
 
 pub(crate) struct Run {
     password: Option<String>,
+    // The store proved `password` before the run began: a failure under it
+    // is the bytes', whatever the member's header checks.
+    proven: bool,
     scope: Scope,
 }
 
@@ -85,11 +88,15 @@ impl Scope {
 
 impl Run {
     pub(super) fn new(password: Option<String>) -> Self {
-        Self::of(password, Scope::Whole)
+        Self::of(password, false, Scope::Whole)
     }
 
-    pub(crate) fn of(password: Option<String>, scope: Scope) -> Self {
-        Self { password, scope }
+    pub(crate) fn of(password: Option<String>, proven: bool, scope: Scope) -> Self {
+        Self {
+            password,
+            proven,
+            scope,
+        }
     }
 }
 
@@ -110,6 +117,7 @@ impl Extraction for Run {
                 reached: Mutex::default(),
             },
             password: self.password.as_deref(),
+            proven: self.proven,
             sink,
             budget,
             next: 0,
@@ -169,6 +177,7 @@ struct Keyed {
 struct Walk<'s, 'a> {
     input: Input,
     password: Option<&'s str>,
+    proven: bool,
     sink: &'s mut Sink<'a>,
     budget: Budget,
     // The id the next member announced gets: members are numbered in
@@ -714,13 +723,18 @@ impl Walk<'_, '_> {
     }
 
     // Whether the run's password is the one the open member was enciphered
-    // under: its RAR5 header carries a password check value, and the
-    // password reproduces it. A failure after that is the bytes', not the
-    // password's. RAR4, and a RAR5 header with no check value, prove
-    // nothing. The header is read again from the bytes before the member's
+    // under: the store proved it before the run began, or the member's RAR5
+    // header carries a password check value and the password reproduces it.
+    // A failure after that is the bytes', not the password's. Otherwise
+    // nothing proved it: a RAR4 header, and a RAR5 header with no check
+    // value, prove nothing of their own, as the store keys such a file on
+    // trial. The header is read again from the bytes before the member's
     // data, which the run has read already, so nothing waits on bytes still
     // to come.
     fn proven(&self, open: &Open) -> bool {
+        if self.proven {
+            return true;
+        }
         let (Some(keyed), Some(password)) = (&open.keyed, self.password) else {
             return false;
         };
@@ -1009,15 +1023,19 @@ impl Beside {
     // Decode the next member handed over, through a failure view of its
     // own. Says whether there was one.
     fn work(&self, volumes: &Arc<dyn Volumes>) -> bool {
-        let taken = self
-            .handed
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .pop_front();
-        let Some((at, mut own)) = taken else {
+        // Whether the work is halted is read as the member is taken, under
+        // the one lock: a member taken before a halt decodes, so a member
+        // taken after it, in archive order, is the only kind a halt drops.
+        let taken = {
+            let mut handed = self.handed.lock().unwrap_or_else(PoisonError::into_inner);
+            handed
+                .pop_front()
+                .map(|taken| (taken, self.halted.load(Ordering::Acquire)))
+        };
+        let Some(((at, mut own), halted)) = taken else {
             return false;
         };
-        if !self.halted.load(Ordering::Acquire) {
+        if !halted {
             let decoded = decode(&mut own, &Input::beside(volumes));
             if decoded.ended.is_some() {
                 self.halted.store(true, Ordering::Release);

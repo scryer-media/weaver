@@ -110,9 +110,14 @@ impl Format for Rar {
 pub type RarEngine = EngineObject<Rar>;
 
 // A run over these members of a set alone, made as the store's members,
-// for a store that streams the rest (`crate::rar_store`).
-pub(crate) fn run_of(password: Option<String>, scope: run::Scope) -> Box<dyn Extraction> {
-    Box::new(run::Run::of(password, scope))
+// for a store that streams the rest (`crate::rar_store`). `proven` when the
+// store proved `password`.
+pub(crate) fn run_of(
+    password: Option<String>,
+    proven: bool,
+    scope: run::Scope,
+) -> Box<dyn Extraction> {
+    Box::new(run::Run::of(password, proven, scope))
 }
 
 // The most a RAR4 end record takes: its seven bytes, the CRC32 of the

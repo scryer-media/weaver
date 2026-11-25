@@ -65,6 +65,12 @@ fn cached(keys: &Keys, password: &str, keying: &MemberKeying) -> Option<Derived>
     })
 }
 
+// Whether a file's key carries a check of its own: a RAR5 header's password
+// check value, which `derive` refutes a wrong candidate by.
+fn checked(keying: &MemberKeying) -> bool {
+    matches!(keying, MemberKeying::Rar5(facts) if facts.psw_check.is_some())
+}
+
 // The derivation for one candidate, once per tuple in the process: the key
 // cache holds the key, or the finding that the check refutes the password.
 // A RAR5 entry is the key then the hash key; a RAR4 one the key then the IV.
@@ -154,9 +160,38 @@ impl RarStore {
                 secret: Zeroizing::new(secret.to_owned()),
                 headers_wrong: false,
                 files_wrong: false,
+                proven: false,
             });
             self.candidates.len() - 1
         })
+    }
+
+    // Whether something verified under candidate `index`: it opened the
+    // headers, a key it derived passed its header's check value, or a file's
+    // checksum passed under a key it keyed on trial. The one answer a file's
+    // key is put on trial by (`open_files`) and the run is handed its
+    // password as proved by (`Engine::start`), as the 7z store's `proven`.
+    pub(super) fn proven(&self, index: usize) -> bool {
+        self.headers_open == Some(index)
+            || self
+                .candidates
+                .get(index)
+                .is_some_and(|candidate| candidate.proven)
+    }
+
+    // A file's checksum passed under a key candidate `index` keyed on
+    // trial: the candidate is proved, and the trial ends for every file it
+    // keyed, so a checksum one of them fails on verified bytes after this is
+    // damage, not a wrong key.
+    pub(super) fn prove(&mut self, index: usize) {
+        if let Some(candidate) = self.candidates.get_mut(index) {
+            candidate.proven = true;
+        }
+        for entry in &mut self.entries {
+            if entry.trial == Some(index) {
+                entry.trial = None;
+            }
+        }
     }
 
     // The password the archive's check proved, for every header walk.
@@ -433,11 +468,15 @@ impl RarStore {
                 };
                 match derived {
                     Derived::Key(key) => {
-                        // A RAR4 file key has no check of its own: unless
-                        // the candidate proved itself on the headers, it is
-                        // on trial.
-                        let unproven = matches!(keying, MemberKeying::Rar4 { .. })
-                            && self.headers_open != Some(*candidate);
+                        // A key that carries a check value passed it, for a
+                        // wrong one derives as `Wrong`: that proves the
+                        // candidate. A key is on trial whenever nothing
+                        // proved its candidate (`proven`), as no RAR4 key
+                        // and no RAR5 key without a check value can itself.
+                        if checked(&keying) {
+                            self.candidates[*candidate].proven = true;
+                        }
+                        let unproven = !self.proven(*candidate);
                         opened = Some((key, unproven.then_some(*candidate)));
                         break;
                     }

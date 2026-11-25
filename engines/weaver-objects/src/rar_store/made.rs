@@ -66,7 +66,7 @@ impl Traits {
     pub(crate) fn of_part(part: &RarVolumeMemberFacts, format: ArchiveFormat) -> Self {
         Self {
             directory: part.is_directory,
-            link: part.redirection_type.is_some(),
+            link: part.redirection_type.is_some() || rar4_unix_symlink(part, format),
             compressed: part.compression_method != 0,
             solid: part.compression_solid,
             encrypted: part.is_encrypted,
@@ -89,6 +89,17 @@ impl Traits {
             keyed: keyed(format, info.is_encrypted, info.compression.version),
         }
     }
+}
+
+// A RAR4 header has no redirection record: a symlink is a Unix host's
+// header whose attributes give the link file type, as unrar-rs marks the
+// member it reads (`is_rar4_unix_symlink`, the run's `MemberInfo.is_symlink`).
+fn rar4_unix_symlink(part: &RarVolumeMemberFacts, format: ArchiveFormat) -> bool {
+    format != ArchiveFormat::Rar5
+        && part.host_os == Some(unrar_rs::RarVolumeHostOs::Unix)
+        && part
+            .attributes
+            .is_some_and(|attributes| attributes & 0xF000 == 0xA000)
 }
 
 fn keyed(format: ArchiveFormat, record: bool, version: u8) -> bool {
@@ -172,17 +183,16 @@ impl RarStore {
         !self.gone && !self.made.is_empty()
     }
 
-    // The password the run decodes under: the one that opened the headers,
-    // or the latest the job offered, which answers what a run asked, as the
-    // engine's run takes it. An offer of a candidate offered before, as a
-    // job trying its candidates again from the first after a repair, is
-    // the latest.
-    fn password(&self) -> Option<String> {
+    // The candidate whose password the run decodes under: the one that
+    // opened the headers, or the latest the job offered, which answers what
+    // a run asked, as the engine's run takes it. An offer of a candidate
+    // offered before, as a job trying its candidates again from the first
+    // after a repair, is the latest.
+    fn password(&self) -> Option<usize> {
         self.headers_open
             .or(self.offered)
-            .and_then(|index| self.candidates.get(index))
-            .or_else(|| self.candidates.last())
-            .map(|candidate| candidate.secret.as_str().to_owned())
+            .filter(|&index| index < self.candidates.len())
+            .or_else(|| self.candidates.len().checked_sub(1))
     }
 
     // The windows of the made entries from `from` on, worked out again
@@ -255,7 +265,13 @@ impl Engine for RarStore {
             .iter()
             .filter_map(|&id| Some((id, self.entries.get(id)?.name.clone())))
             .collect();
-        crate::rar_engine::run_of(self.password(), Scope::Members(named))
+        // The password is handed as proved by the one answer a file's key
+        // is put on trial by (`proven`). The run's own decode proves nothing
+        // here: the store does not hear how a member it makes closes.
+        let password = self.password();
+        let proven = password.is_some_and(|index| self.proven(index));
+        let password = password.map(|index| self.candidates[index].secret.as_str().to_owned());
+        crate::rar_engine::run_of(password, proven, Scope::Members(named))
     }
 
     fn placed(&self, volume: VolumeIndex) -> bool {

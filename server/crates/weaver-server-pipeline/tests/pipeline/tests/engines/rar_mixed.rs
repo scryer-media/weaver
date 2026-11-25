@@ -1032,6 +1032,71 @@ async fn a_rar4_set_whose_made_only_volumes_par2_moves_writes_the_stored_file_af
     );
 }
 
+// A RAR4 set, a stored file, a compressed one and a stored file, with the
+// compressed member's header marked a Unix symlink by its attributes, as
+// `rar` writes a link on a Unix host: RAR4 has no redirection record. The
+// store and the run read "is a link" by one rule, so the store does not
+// make it: the compressed link is the engine's, and the job ends as the
+// engine ends the set read whole, the link passed over as no file and the
+// stored files around it delivered.
+#[tokio::test]
+async fn a_compressed_rar4_unix_symlink_is_no_member_of_the_run() {
+    let linked = |solid: bool| {
+        let mut options = options(Version::Rar4);
+        options.solid = solid;
+        let mut set = mixed(Version::Rar4, Size::Small, MKV, &options);
+        let bytes = &mut set.volumes[0].1;
+        let name = MKV[1].as_bytes();
+        let at = bytes
+            .windows(name.len())
+            .position(|window| window == name)
+            .expect("the compressed member's header");
+        let header = at - 32;
+        assert_eq!(bytes[header + 2], 0x74, "a file header");
+        assert_eq!(bytes[header + 15], 3, "written on a Unix host");
+        assert_ne!(bytes[header + 25], 0x30, "compressed");
+        bytes[header + 28..header + 32].copy_from_slice(&0o120_777u32.to_le_bytes());
+        let size = u16::from_le_bytes([bytes[header + 5], bytes[header + 6]]) as usize;
+        let crc = (par2_rs::checksum::crc32(&bytes[header + 2..header + size]) & 0xffff) as u16;
+        bytes[header..header + 2].copy_from_slice(&crc.to_le_bytes());
+        set
+    };
+    // What a job's end is judged on: its status, what it delivered, and
+    // what its delivery holds back.
+    let end = |graph: &Outcome| {
+        let delivery = &graph.graph().delivery;
+        format!(
+            "{:?} {:?} {:?} {:?} {:?}",
+            graph.status, graph.failure_kind, graph.files, delivery.withheld, delivery.unmade
+        )
+    };
+    let set = linked(false);
+    let graph = run(&Scenario::new(set.posts())).await;
+    assert!(
+        graph.completed(),
+        "{:?} {:?} {:?}",
+        graph.status,
+        graph.failure,
+        graph.files.keys()
+    );
+    assert!(
+        kinds(&graph).contains(&"rar_engine"),
+        "the engine read the set: {:?}",
+        kinds(&graph)
+    );
+    assert_files(
+        "mixed",
+        &graph.files,
+        &[set.files[0].clone(), set.files[2].clone()],
+    );
+    assert!(graph.graph().delivery.withheld.is_empty());
+    assert!(graph.graph().delivery.unmade.is_empty());
+    // The base behaviour: the same set written solid, which the store never
+    // keeps, so the engine reads it whole from the start.
+    let whole = run(&Scenario::new(linked(true).posts())).await;
+    assert_eq!(end(&graph), end(&whole), "as the engine reads it whole");
+}
+
 // A recovery record in every volume is the set's own: the store leaves it,
 // and the compressed member is made as without one.
 #[tokio::test]
@@ -2665,6 +2730,221 @@ mod chase {
             let graph = run(&scenario).await;
             assert_members(&label, &graph, &set.files);
             assert_fetched_once(&graph);
+        }
+    }
+}
+
+// RAR5 files enciphered with no password check value, as `rar` writes them
+// with `-p` and no check: nothing proves a candidate's key before the files'
+// checksums judge it, so each key is on trial, as every RAR4 key is. A set
+// that stores a file in the clear, then one it compresses and one it stores,
+// both enciphered; and a set that stores all three. Each test keys its sets
+// under passwords no other test offers: the process's key cache is keyed by
+// password, salt and count, the writer's salt is fixed, and a key derived
+// with no check must not answer a test whose header checks one.
+mod unchecked {
+    use super::*;
+
+    fn sets(password: &'static str) -> [(&'static str, Set); 2] {
+        let mut options = sealed(Version::Rar5);
+        options.password = Some(password);
+        options.check = false;
+        let files: Files = vec![
+            (MKV[0], payload(5 * ARTICLE + 11, 41)),
+            (MKV[1], payload(3 * ARTICLE + 5, 42)),
+            (MKV[2], payload(4 * ARTICLE, 44)),
+        ];
+        let items: Vec<Item> = files
+            .iter()
+            .map(|(name, bytes)| Item::File(name, bytes.clone()))
+            .collect();
+        [
+            ("mixed", mixed(Version::Rar5, Size::Small, MKV, &options)),
+            (
+                "stored",
+                Set {
+                    volumes: named_volumes(write(&items, &options)),
+                    files,
+                },
+            ),
+        ]
+    }
+
+    fn assert_complete(label: &str, graph: &Outcome, set: &Set, password: &str) {
+        assert_eq!(
+            graph.status,
+            Some(JobStatus::Complete),
+            "{label}: {:?} {:?}",
+            graph.failure,
+            graph.files.keys()
+        );
+        assert_files(label, &graph.files, &set.files);
+        assert_eq!(
+            graph.validated_password.as_deref(),
+            Some(password),
+            "{label}"
+        );
+    }
+
+    // A wrong password, with PAR2 and without: the key it derives is on
+    // trial, the first enciphered file's checksum condemns it, and the job
+    // ends for the password. The file in the clear is delivered; no file
+    // read under the wrong key is, and no password is validated.
+    #[tokio::test]
+    async fn a_wrong_password_is_the_password_verdict() {
+        for (shape, set) in sets("tidewater-unchecked-right") {
+            for (recovery, posts) in [("PAR2", set.with_par2()), ("no PAR2", set.posts())] {
+                let label = format!("{shape}, {recovery}");
+                let graph = run(&Scenario::new(posts).password("tidewater-unchecked-wrong")).await;
+                assert_eq!(
+                    graph.status,
+                    Some(JobStatus::Partial),
+                    "{label}: {:?}",
+                    graph.failure
+                );
+                assert_eq!(
+                    graph.failure_kind,
+                    Some(HistoryFailureKind::Password),
+                    "{label}: {:?}",
+                    graph.history_error
+                );
+                assert!(
+                    graph.files.get(&delivered(MKV[0])) == Some(&set.files[0].1),
+                    "{label}"
+                );
+                for name in [MKV[1], MKV[2]] {
+                    assert!(
+                        !graph.files.contains_key(&delivered(name)),
+                        "{label}: {name} delivered under the wrong key"
+                    );
+                }
+                assert_eq!(graph.validated_password, None, "{label}");
+            }
+        }
+    }
+
+    // A RAR4 set with its headers enciphered too, `-hp`: RAR4 file keys
+    // carry no check, but the password that unseals the headers proves
+    // itself there, so the store keys no file on trial and hands the run the
+    // password as proved. A byte of the compressed member's packed data
+    // wrong as posted with no PAR2 is damage, never a sign of another
+    // password. (A RAR5 `-hp` set with no check value is not the store's:
+    // nothing proves its headers, and the engine reads it whole.)
+    #[tokio::test]
+    async fn packed_data_wrong_under_the_password_that_opened_the_headers_is_damage() {
+        let password = "saltmarsh-unchecked-right";
+        for version in [Version::Rar4] {
+            let label = format!("{version:?}");
+            let mut options = sealed_headers(version);
+            options.password = Some(password);
+            let set = mixed(version, Size::Large, MKV, &options);
+            let (_, at) = set.data_of(MKV[1], Some(password)).remove(0);
+            let mut posts = set.posts();
+            posts[0].bytes[at.start + at.len() / 2] ^= 0x5a;
+            let graph = run(&Scenario::new(posts).password(password)).await;
+            assert_eq!(
+                graph.status,
+                Some(JobStatus::Partial),
+                "{label}: {:?}",
+                graph.failure
+            );
+            assert_ne!(
+                graph.failure_kind,
+                Some(HistoryFailureKind::Password),
+                "{label}: {:?}",
+                graph.history_error
+            );
+            assert!(!graph.files.contains_key(&delivered(MKV[1])), "{label}");
+            for (name, bytes) in [&set.files[0], &set.files[2]] {
+                assert!(
+                    graph.files.get(&delivered(name)) == Some(bytes),
+                    "{label}: {name}"
+                );
+            }
+        }
+    }
+
+    // The right password over a set whose one enciphered file, stored, has
+    // a byte wrong as posted, and no PAR2: nothing verifies under the key on
+    // trial, so its failure cannot be told from a wrong key's, and the job
+    // ends for the password. The file in the clear is delivered.
+    #[tokio::test]
+    async fn a_set_whose_only_enciphered_file_is_damaged_ends_for_the_password() {
+        let password = "mudflat-unchecked-right";
+        let mut options = sealed(Version::Rar5);
+        options.password = Some(password);
+        options.check = false;
+        let files: Files = vec![
+            (MKV[0], payload(5 * ARTICLE + 11, 41)),
+            (MKV[2], payload(4 * ARTICLE, 44)),
+        ];
+        let items: Vec<Item> = files
+            .iter()
+            .map(|(name, bytes)| Item::File(name, bytes.clone()))
+            .collect();
+        let set = Set {
+            volumes: named_volumes(write(&items, &options)),
+            files,
+        };
+        let (_, at) = set.data_of(MKV[2], Some(password)).remove(0);
+        let mut posts = set.posts();
+        posts[0].bytes[at.start + at.len() / 2] ^= 0x5a;
+        let graph = run(&Scenario::new(posts).password(password)).await;
+        assert_eq!(
+            graph.status,
+            Some(JobStatus::Partial),
+            "{:?}",
+            graph.failure
+        );
+        assert_eq!(
+            graph.failure_kind,
+            Some(HistoryFailureKind::Password),
+            "{:?}",
+            graph.history_error
+        );
+        assert!(graph.files.get(&delivered(MKV[0])) == Some(&set.files[0].1));
+        assert!(!graph.files.contains_key(&delivered(MKV[2])));
+    }
+
+    // A wrong password, then the right one: the first is condemned on its
+    // trial, the files it keyed are read again under the second, and the
+    // job ends Complete under it.
+    #[tokio::test]
+    async fn a_wrong_password_then_the_right_one_is_complete() {
+        for (shape, set) in sets("harrow-unchecked-right") {
+            let graph = run(&Scenario::new(set.posts())
+                .global_password("harrow-unchecked-wrong")
+                .global_password("harrow-unchecked-right"))
+            .await;
+            assert_complete(shape, &graph, &set, "harrow-unchecked-right");
+        }
+    }
+
+    // The right password over a byte wrong as posted under PAR2, in a
+    // stored enciphered file and, in the mixed set, in the compressed one's
+    // packed data: the repair rebuilds it, and the job ends Complete.
+    #[tokio::test]
+    async fn damage_under_the_right_password_with_par2_is_complete() {
+        let password = "brackwater-unchecked-right";
+        for (shape, set) in sets(password) {
+            let damaged: &[&str] = match shape {
+                "mixed" => &[MKV[2], MKV[1]],
+                _ => &[MKV[2]],
+            };
+            for name in damaged {
+                let label = format!("{shape}, {name}");
+                let (_, at) = set.data_of(name, Some(password)).remove(0);
+                let mut posts = set.with_par2();
+                posts[0].bytes[at.start + at.len() / 2] ^= 0x5a;
+                let graph = run(&Scenario::new(posts).password(password)).await;
+                assert_eq!(
+                    graph.status,
+                    Some(JobStatus::Complete),
+                    "{label}: {:?}",
+                    graph.failure
+                );
+                assert_files(&label, &graph.files, &set.files);
+            }
         }
     }
 }

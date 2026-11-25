@@ -442,6 +442,36 @@ fn a_set_of_compressed_files_alone_stays_with_the_store() {
     }
 }
 
+// The store passes bytes on to its members in a step only while it may
+// stream one: before any member is laid, and while one laid is stored. A set
+// whose members its run makes alone keeps its bytes for that run; a restored
+// store answers as it did.
+#[test]
+fn a_store_passes_bytes_on_only_while_it_streams_a_member() {
+    assert!(store().passes_on());
+    for version in [Version::Rar5, Version::Rar4] {
+        let (first, _) = packed(version, "first.nfo");
+        let (second, _) = packed(version, "second.nfo");
+        for (label, items, streams) in [
+            ("compressed alone", vec![first, second], false),
+            ("mixed", mixed_items(version), true),
+            ("compressed first", compressed_first(version), true),
+        ] {
+            let volumes = write(&items, &Options::new(version));
+            let mut owner = Owner::named(store(), volumes);
+            owner.whole(4096);
+            assert_eq!(owner.object.passes_on(), streams, "{version:?} {label}");
+            let restored =
+                crate::rar_store::facts::restored(&owner.object.facts()).expect("restores");
+            assert_eq!(
+                restored.passes_on(),
+                streams,
+                "{version:?} {label} restored"
+            );
+        }
+    }
+}
+
 // A set whose first file is compressed and is followed by a stored one: the
 // stored one is streamed and the compressed one made.
 #[test]
@@ -580,7 +610,9 @@ fn an_enciphered_compressed_member_asks_again_after_a_wrong_password() {
 // whole engine's run and the store's scoped run alike say damage and never
 // ask for another password. Without a check value, or in RAR4, which has
 // none, the password is unproven and the same failure asks for another, as
-// a wrong key's bytes would.
+// a wrong key's bytes would; but a RAR4 password that unsealed the store's
+// headers is proved there, and the store's run, handed it as proved, says
+// damage. The whole engine's run has no such proof.
 #[test]
 fn damage_under_a_proven_password_is_damage_and_under_an_unproven_one_asks_again() {
     for (version, check, proven) in [
@@ -630,6 +662,7 @@ fn damage_under_a_proven_password_is_damage_and_under_an_unproven_one_asks_again
             let strays = owner.run();
             assert!(strays.is_empty(), "{label}: {strays:?} {:?}", owner.said);
             let said = trouble(&owner);
+            let proven = proven || (headers && version == Version::Rar4);
             assert!(!owner.member("notes.nfo").closed, "{label}");
             assert_eq!(asks(&said), !proven, "{label}: {said:?}");
             assert_eq!(damage(&said), proven, "{label}: {said:?}");
