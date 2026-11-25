@@ -812,6 +812,7 @@ impl RarStore {
             }
             self.extend(id, member, out);
         }
+        self.file_windows(start);
         // Recovery records are said for the volumes the layout newly holds
         // or that changed, every one it holds when it was laid afresh.
         let recovery: BTreeSet<VolumeIndex> = match afresh {

@@ -159,14 +159,7 @@ impl RarStore {
     // `volume`, as the walk read it: found by where it lies, not by the
     // name a header not yet repaired may still give it.
     fn part_facts(&self, volume: u32, data: u64) -> Option<&RarVolumeMemberFacts> {
-        self.volumes
-            .get(&VolumeIndex(volume))?
-            .walk
-            .facts
-            .as_ref()?
-            .members
-            .iter()
-            .find(|part| part.data_offset == data)
+        self.volumes.get(&VolumeIndex(volume))?.walk.part_at(data)
     }
 
     // Whether the store runs: it makes a member. The run chases the layout
@@ -188,8 +181,48 @@ impl RarStore {
             .map(|candidate| candidate.secret.as_str().to_owned())
     }
 
-    // The window each made member's decode holds, by the engine's rule.
-    fn made_windows(&self) -> impl Iterator<Item = u64> + '_ {
+    // The windows of the made entries from `from` on, worked out again
+    // from the headers of their first pieces. A look files them from the
+    // first entry it looked at: no entry before it changed, nor the headers
+    // it was laid on.
+    pub(super) fn file_windows(&mut self, from: usize) {
+        let stale: Vec<(usize, u64)> = self
+            .windows
+            .range(from..)
+            .map(|(&id, &window)| (id, window))
+            .collect();
+        for (id, window) in stale {
+            self.windows.remove(&id);
+            if let Some(count) = self.widest.get_mut(&window) {
+                *count -= 1;
+                if *count == 0 {
+                    self.widest.remove(&window);
+                }
+            }
+        }
+        let filed: Vec<(usize, u64)> = self
+            .made
+            .range(from..)
+            .filter_map(|&id| Some((id, self.window_of(id)?)))
+            .collect();
+        for (id, window) in filed {
+            #[cfg(test)]
+            super::counts::bump(|counts| counts.windows_filed += 1);
+            self.windows.insert(id, window);
+            *self.widest.entry(window).or_default() += 1;
+        }
+    }
+
+    // The window a made entry's decode holds, by the engine's rule.
+    fn window_of(&self, id: usize) -> Option<u64> {
+        let first = self.entries.get(id)?.pieces.first()?;
+        member_window(false, self.part_facts(first.volume.0, first.data.start)?)
+    }
+
+    // The window each made member's decode holds, by the engine's rule,
+    // worked out from every made entry: what the windows filed answer.
+    #[cfg(test)]
+    pub(super) fn made_windows(&self) -> impl Iterator<Item = u64> + '_ {
         self.made.iter().filter_map(|&id| {
             let entry = self.entries.get(id)?;
             let first = entry.pieces.first()?;
@@ -227,8 +260,17 @@ impl Engine for RarStore {
             .is_none_or(|found| found.closed || claim::settled(volume, found))
     }
 
+    // The widest window filed, as the engine's rule takes the widest of
+    // every made member's.
     fn reserve(&self) -> Option<u64> {
-        crate::engine::reserve::<Rar>(self.made_windows())
+        let widest = self.widest.last_key_value().map(|(&window, _)| window);
+        #[cfg(test)]
+        assert_eq!(
+            widest,
+            self.made_windows().max(),
+            "the windows filed are the made members' windows"
+        );
+        crate::engine::reserve::<Rar>(widest)
     }
 
     fn lends(&self) -> bool {

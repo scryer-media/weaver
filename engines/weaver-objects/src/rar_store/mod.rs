@@ -271,6 +271,10 @@ mod counts {
         pub(crate) read_members: usize,
         pub(crate) laid_members: usize,
         pub(crate) recovery_looked: usize,
+        // Headers looked at to find a part by where its data starts, and
+        // made entries whose window was worked out.
+        pub(crate) parts_compared: usize,
+        pub(crate) windows_filed: usize,
     }
 
     thread_local! {
@@ -471,6 +475,11 @@ pub struct RarStore {
     // The entries the store's run makes, filed as entries come and go, so
     // the question scans no entry.
     made: BTreeSet<usize>,
+    // The window each made entry's decode holds, by entry, and how many
+    // hold each window: filed where the made entries are, so the run's
+    // reserve reads the widest without a scan.
+    windows: BTreeMap<usize, u64>,
+    widest: BTreeMap<u64, usize>,
     // The volumes held that are bound and not yet closed: more of them is
     // still to come. Filed where a volume is named, closes, comes or goes,
     // so asking whether everything bound has closed scans no volume.
@@ -582,6 +591,8 @@ impl RarStore {
             giving: BTreeMap::new(),
             unmapped: BTreeSet::new(),
             made: BTreeSet::new(),
+            windows: BTreeMap::new(),
+            widest: BTreeMap::new(),
             open: BTreeSet::new(),
             pieces_in: BTreeMap::new(),
             locked: BTreeSet::new(),
@@ -736,6 +747,7 @@ impl RarStore {
             .filter(|volume| !mapped.contains(volume))
             .copied()
             .collect();
+        self.file_windows(0);
     }
 
     // The volumes held say others exist that the store was never given: the

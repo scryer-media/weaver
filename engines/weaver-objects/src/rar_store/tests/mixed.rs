@@ -13,9 +13,9 @@ use std::sync::Arc;
 use unrar_rs::{KdfCache, RarVolumeFacts};
 use weaver_graph::{Budget, Emit, MemberId, Object, VolumeIndex, Volumes, Why};
 
-use super::super::claim;
+use super::super::{claim, counts};
 use super::owner::Owner;
-use super::writer::{Codec, Item, Options, Version, write};
+use super::writer::{Codec, Item, Options, Version, literal, write};
 use super::{PASSWORD, fixture, store, unrar};
 use crate::engine::Format;
 use crate::keys::{CAPACITY, Keys};
@@ -1051,5 +1051,76 @@ fn a_repaired_header_turning_a_made_member_stored_gives_back_its_data() {
     for (name, bytes) in unrar(std::slice::from_ref(&real), None) {
         let got = owner.member(&name);
         assert!(got.closed && got.bytes == bytes, "{name}");
+    }
+}
+
+// A part found by where its packed data starts, through the index the walk
+// files with the headers, is the one a scan of the headers from the front
+// finds, over one volume of many members, stored and made alike, and at
+// offsets no part starts at. Each lookup looks at one header where the scan
+// looks at every one before it. The run's reserve reads the windows the
+// looks filed, and works none out.
+#[test]
+fn a_part_found_by_where_its_data_starts_is_the_one_a_scan_finds() {
+    for version in [Version::Rar5, Version::Rar4] {
+        let items: Vec<Item> = (0..400)
+            .map(|at| {
+                let name: &'static str = Box::leak(format!("m{at:04}.bin").into_boxed_str());
+                match at % 2 {
+                    0 => Item::File(name, payload(at as u64, 64)),
+                    _ => literal(version, name, &payload(at as u64, 64)),
+                }
+            })
+            .collect();
+        let volumes = write(&items, &Options::new(version));
+        assert_eq!(volumes.len(), 1, "{version:?}");
+        let mut owner = Owner::named(store(), volumes);
+        owner.whole(4096);
+        assert!(owner.object.engine().is_some(), "{version:?}");
+        let walk = &owner.object.volumes[&VolumeIndex(0)].walk;
+        let members = &walk.facts.as_ref().expect("walked").members;
+        assert!(members.len() >= 400, "{version:?}");
+        let probes: Vec<u64> = members
+            .iter()
+            .flat_map(|member| [member.data_offset, member.data_offset + 1])
+            .collect();
+        let found = |walk: &super::super::walk::Walk| -> Vec<String> {
+            probes
+                .iter()
+                .map(|&at| format!("{:?}", walk.part_at(at)))
+                .collect()
+        };
+        counts::take();
+        let indexed = found(walk);
+        let indexed_looks = counts::take().parts_compared;
+        counts::set_old(true);
+        let scanned = found(walk);
+        let scanned_looks = counts::take().parts_compared;
+        counts::set_old(false);
+        assert_eq!(indexed, scanned, "{version:?}");
+        assert!(
+            indexed.iter().step_by(2).all(|part| part != "None"),
+            "{version:?}"
+        );
+        assert_eq!(indexed_looks, probes.len(), "{version:?}");
+        let n = members.len();
+        assert!(scanned_looks >= n * n, "{version:?}: {scanned_looks}");
+        eprintln!(
+            "{version:?}: {n} members, {} lookups: indexed {indexed_looks}, scanned {scanned_looks}",
+            probes.len()
+        );
+
+        let engine = owner.object.engine().expect("a mixed set runs");
+        let reserved = engine.reserve();
+        assert_eq!(
+            reserved,
+            crate::engine::reserve::<Rar>(owner.object.made_windows()),
+            "{version:?}"
+        );
+        counts::take();
+        for _ in 0..100 {
+            assert_eq!(engine.reserve(), reserved, "{version:?}");
+        }
+        assert_eq!(counts::take().windows_filed, 0, "{version:?}");
     }
 }

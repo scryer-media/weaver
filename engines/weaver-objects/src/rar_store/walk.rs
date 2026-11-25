@@ -9,6 +9,7 @@
 // only warns and a damaged name would be read as a real one. Where the set
 // ends is never read from them at all: the store gives volumes back on it.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use unrar_rs::{
@@ -51,6 +52,10 @@ pub(super) enum Step {
 #[derive(Debug, Default)]
 pub(super) struct Walk {
     pub(super) facts: Option<RarVolumeFacts>,
+    // Where each member's header lies in `facts`, by where its packed data
+    // starts: the first header there, as a scan from the front finds it.
+    // Filed wherever the facts are taken, so no look scans the headers.
+    parts: HashMap<u64, usize>,
     // What the end record says of a volume after this one, once the walk
     // read an end record that arrived whole.
     more: Option<bool>,
@@ -393,8 +398,37 @@ impl Walk {
     // Facts read before, as a checkpoint kept them.
     pub(super) fn restore(&mut self, facts: Option<RarVolumeFacts>) {
         self.facts = facts;
+        self.file_parts();
         self.stamp = next_stamp();
         self.handed = Handed::default();
+    }
+
+    // The header of the part whose packed data starts at `data`, as the
+    // walk read it.
+    pub(super) fn part_at(&self, data: u64) -> Option<&unrar_rs::RarVolumeMemberFacts> {
+        let members = &self.facts.as_ref()?.members;
+        #[cfg(test)]
+        if super::counts::old() {
+            return members.iter().find(|part| {
+                super::counts::bump(|counts| counts.parts_compared += 1);
+                part.data_offset == data
+            });
+        }
+        #[cfg(test)]
+        super::counts::bump(|counts| counts.parts_compared += 1);
+        let part = members.get(*self.parts.get(&data)?)?;
+        (part.data_offset == data).then_some(part)
+    }
+
+    fn file_parts(&mut self) {
+        self.parts.clear();
+        for (at, part) in self
+            .facts
+            .iter()
+            .flat_map(|facts| facts.members.iter().enumerate())
+        {
+            self.parts.entry(part.data_offset).or_insert(at);
+        }
     }
 
     // A layout took the volume on the facts it holds now.
@@ -704,6 +738,7 @@ impl Walk {
             self.stamp = next_stamp();
         }
         self.facts = Some(facts);
+        self.file_parts();
         self.more = more;
         self.ended = ended;
         match damaged {
