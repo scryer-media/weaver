@@ -73,7 +73,7 @@ pub use sniff::{
     signs_a_head, sniff,
 };
 pub use tree::{
-    AGAIN_PIECE, Builder, Disclaim, Effect, LentWaits, NeverOpen, NodeId, Rewalk, Tree,
+    AGAIN_PIECE, Builder, Disclaim, Effect, LentWaits, NeverOpen, NodeId, Rewalk, Took, Tree,
 };
 pub use volume::{ByteRange, VolumeIndex};
 pub use window::{WindowLender, WindowMemory};

@@ -35,7 +35,7 @@ use weaver_graph::holds::{
 use weaver_graph::member::FIRST_BYTES;
 use weaver_graph::{
     Algorithm, Builder, ByteRange, Coverage, Effect, Emit, Evidenced, Kind, Marked, MemberId,
-    NodeId, Object, ObjectId, Placement, Provenance, Segment, Tree, VolumeIndex, Why,
+    NodeId, Object, ObjectId, Placement, Provenance, Segment, Took, Tree, VolumeIndex, Why,
 };
 
 use super::checkpoint::why_name;
@@ -1971,22 +1971,31 @@ impl NamespaceWriter {
 
     // The bytes a bound member's object kept for no member of its own: its
     // envelopes, and what it could not place yet, which the namespace holds
-    // for the member as it holds any bytes whose place is not known.
+    // for the member as it holds any bytes whose place is not known. Both
+    // are as the object placed the bytes when it took them (`took`): a
+    // later delivery of the same step may have given it its map since, and
+    // bytes it took while it had none are still to be handed to it.
     fn capture(
         &mut self,
         tree: &Tree,
         (child, volume): (NodeId, VolumeIndex),
         arrival: &Arrival,
+        took: &Took,
     ) -> Result<(), WriteError> {
         let mut placements = std::mem::take(&mut self.placements);
         placements.clear();
+        let mut placed = 0;
+        let mut moved = false;
         if tree.child_of(arrival.node, arrival.member) == Some((child, volume)) {
-            tree.locate(child, volume, arrival.range(), &mut placements);
+            // Pieces all into members come as their length alone; only
+            // pieces that are not walk the bytes below.
+            placements.extend_from_slice(&took.pieces);
+            placed = took.covered;
+            moved = tree.placement(child) != took.number;
         }
         // An object that gave the volume back in this delivery places none
         // of it. What no piece covers is held for the member, as any bytes
         // whose place is not known, and goes to its own file with the rest.
-        let placed: u64 = placements.iter().map(Placement::len).sum();
         if placed < arrival.range().len() {
             placements.push(Placement::Held {
                 range: ByteRange::new(arrival.offset + placed, arrival.range().end),
@@ -2037,6 +2046,12 @@ impl NamespaceWriter {
             .collect();
         self.placements = placements;
         kept?;
+        // Held under a map the object has moved on from since: no pass has
+        // asked the new map where these go.
+        if moved && !held.is_empty() {
+            self.asked
+                .remove(&(arrival.node, held_volume(arrival.member)));
+        }
         self.hold_for((arrival.node, arrival.member), held)
     }
 
@@ -2243,6 +2258,7 @@ impl NamespaceWriter {
                 offset,
                 bytes,
                 provenance,
+                took,
             } => {
                 let arrival = Arrival {
                     node: *node,
@@ -2264,7 +2280,7 @@ impl NamespaceWriter {
                         LoopSite::RecoveryVolume,
                     );
                 }
-                return self.capture(tree, (*child, *volume), &arrival);
+                return self.capture(tree, (*child, *volume), &arrival, took);
             }
             Effect::Announced { node, member } => {
                 self.announce(tree, builder, segments, *node, *member, out)?;

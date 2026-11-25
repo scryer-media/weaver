@@ -1956,4 +1956,120 @@ mod split {
     fn sevenz_fixtures_split(archive: &[u8]) -> Vec<Post> {
         super::super::sevenz_fixtures::split(archive, 3)
     }
+
+    // The parts stored in one zip, posted as one file: the zip names its
+    // members only when its central directory, its last article, arrives,
+    // and then hands every part down in that one step. The 7z store below
+    // reads its map from the last part; what it took of the earlier parts
+    // before that was held for it, and is handed to it again under the map.
+    mod in_zip {
+        use std::io::Write;
+
+        use super::*;
+
+        fn zipped(parts: &[Post]) -> Vec<Post> {
+            let mut writer = ::zip::ZipWriter::new(Cursor::new(Vec::new()));
+            let stored = ::zip::write::SimpleFileOptions::default()
+                .compression_method(::zip::CompressionMethod::Stored);
+            for part in parts {
+                writer.start_file(part.name.as_str(), stored).unwrap();
+                writer.write_all(&part.bytes).unwrap();
+            }
+            vec![Post::plain(
+                "Ember.zip",
+                writer.finish().unwrap().into_inner(),
+            )]
+        }
+
+        // A 7z that stores every member in one folder, in 2, 3 and 12
+        // parts: the store places every member, and no engine reads it.
+        #[tokio::test]
+        async fn an_all_stored_7z_in_parts_inside_a_stored_zip_delivers_every_member() {
+            let files = mixed(MKV, delta()).1;
+            let archive = sevenz(&[(copy(), files.clone())]);
+            for count in [2, 3, 12] {
+                let parts = super::super::super::sevenz_fixtures::split(&archive, count);
+                let graph = run(&Scenario::new(zipped(&parts))).await;
+                assert_members(&graph, &files);
+                assert_fetched_once(&graph);
+                for kind in ["zip", "split", "sevenz_store"] {
+                    assert!(
+                        kinds(&graph).contains(&kind),
+                        "{count} parts: {:?}",
+                        kinds(&graph)
+                    );
+                }
+            }
+        }
+
+        // The mixed 7z, plain or AES-coded, in three parts cut through its
+        // coded pack and its stored member: every member, the stored ones
+        // written once by the store, the coded ones by one run that nothing
+        // refused. The shelves are exact: the zip's keeps the whole post
+        // until its central directory names the parts, the 7z store's its
+        // headers and coded pack, and the split keeps none.
+        #[tokio::test]
+        async fn a_mixed_7z_in_parts_inside_a_stored_zip_delivers_every_member() {
+            for aes in AES {
+                let (archive, files) = sealed(aes);
+                let posts = zipped(&three(&archive, &files));
+                let zip = posts[0].bytes.len() as u64;
+                let (scenario, spoken) = hearing(job(posts, aes));
+                let graph = run(&scenario).await;
+                assert_members(&graph, &files);
+                assert_fetched_once(&graph);
+                assert!(kinds(&graph).contains(&"split"), "{:?}", kinds(&graph));
+                assert_runs_made_only_coded(&spoken);
+                assert_eq!(closing(&spoken).len(), 1, "{:?}", spoken.lock().unwrap());
+                assert!(!refused(&spoken), "{:?}", spoken.lock().unwrap());
+                let kept: Vec<(String, u64)> = graph
+                    .graph()
+                    .shelved_by
+                    .values()
+                    .filter(|(_, kept)| *kept > 0)
+                    .cloned()
+                    .collect();
+                assert_eq!(
+                    kept,
+                    vec![
+                        ("zip".to_owned(), zip),
+                        (
+                            "sevenz_store".to_owned(),
+                            archive.len() as u64 - stored_bytes(&files)
+                        ),
+                    ],
+                    "aes {aes}"
+                );
+                assert_shelf_gone(&graph);
+            }
+        }
+
+        // A RAR's later volume stored in the zip before its first: the RAR
+        // store takes it before the first volume's headers say where its
+        // bytes go, in the same step, and every file is still delivered.
+        #[tokio::test]
+        async fn a_rar_whose_later_volume_reaches_it_first_delivers_every_file() {
+            let files = mixed(MKV, delta()).1;
+            let volumes = crate::pipeline::tests::direct_store::multi_member_store_set(&files, 3);
+            let parts: Vec<Post> = volumes
+                .iter()
+                .rev()
+                .map(|(name, bytes)| Post::plain(name, bytes.clone()))
+                .collect();
+            let graph = run(&Scenario::new(zipped(&parts))).await;
+            assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+            assert_eq!(graph.files.len(), files.len(), "{:?}", graph.files.keys());
+            for (name, bytes) in &files {
+                assert!(
+                    graph
+                        .files
+                        .iter()
+                        .any(|(delivered, made)| delivered.ends_with(name) && made == bytes),
+                    "{name}: {:?}",
+                    graph.files.keys()
+                );
+            }
+            assert_fetched_once(&graph);
+        }
+    }
 }
