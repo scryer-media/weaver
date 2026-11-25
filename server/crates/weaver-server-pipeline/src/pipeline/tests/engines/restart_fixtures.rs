@@ -43,6 +43,9 @@ pub struct Restarted {
     pub order: Vec<(u32, u32)>,
     // The graph job as last seen before it finished, across every restart.
     pub graph: GraphView,
+    // Every event the pipeline that finished the job sent, from its start
+    // on, in order.
+    pub events: Vec<PipelineEvent>,
 }
 
 // Called with each checkpoint as it stood when the pipeline went down.
@@ -92,6 +95,7 @@ pub(in crate::pipeline::tests) async fn run_restarting_at_inspecting(
         new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
     scenario.prepare(&mut pipeline);
     insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
+    let mut sent = pipeline.event_tx.subscribe();
 
     let mut requests = BTreeMap::new();
     let mut order = Vec::new();
@@ -118,6 +122,7 @@ pub(in crate::pipeline::tests) async fn run_restarting_at_inspecting(
         {
             lifting = false;
             pipeline = restart(&temp_dir, pipeline, scenario, &mut owed, &mut *inspect).await;
+            sent = pipeline.event_tx.subscribe();
             crate::pipeline::tests::hear_rewalks(&mut pipeline, JOB).await;
             in_memory.extend(owed.iter().copied());
             restarts += 1;
@@ -157,6 +162,7 @@ pub(in crate::pipeline::tests) async fn run_restarting_at_inspecting(
             {
                 refusing = false;
                 pipeline = restart(&temp_dir, pipeline, scenario, &mut owed, &mut *inspect).await;
+                sent = pipeline.event_tx.subscribe();
                 in_memory.extend(owed.iter().copied());
                 restarts += 1;
                 continue;
@@ -199,6 +205,7 @@ pub(in crate::pipeline::tests) async fn run_restarting_at_inspecting(
                 };
                 let before = figures(&pipeline);
                 pipeline = restart(&temp_dir, pipeline, scenario, &mut owed, &mut going_down).await;
+                sent = pipeline.event_tx.subscribe();
                 // Its recovery reads what arrived of it again before the job
                 // fetches: the figures stand once that is heard.
                 crate::pipeline::tests::hear_rewalks(&mut pipeline, JOB).await;
@@ -269,6 +276,8 @@ pub(in crate::pipeline::tests) async fn run_restarting_at_inspecting(
     pipeline.db.flush_write_queue().await.unwrap();
     let mut files = BTreeMap::new();
     collect(&complete_dir, &complete_dir, &mut files);
+    let mut events = Vec::new();
+    drain(&mut sent, &mut events);
     retire_pipeline_database(pipeline).await;
     Restarted {
         status,
@@ -279,6 +288,7 @@ pub(in crate::pipeline::tests) async fn run_restarting_at_inspecting(
         restarts,
         order,
         graph,
+        events,
     }
 }
 

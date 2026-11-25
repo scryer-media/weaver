@@ -199,6 +199,7 @@ pub async fn drive_stream(
         in_memory: Default::default(),
         restarts: usize::from(after.is_some()),
         order: articles.to_vec(),
+        events: Vec::new(),
     }
 }
 

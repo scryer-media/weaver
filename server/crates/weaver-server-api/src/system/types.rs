@@ -969,6 +969,16 @@ impl From<&weaver_server_core::events::model::PipelineEvent> for PipelineEventGq
                     set, reason,
                 ),
             },
+            PipelineEvent::SfvMismatch {
+                job_id,
+                file,
+                listing,
+            } => Self {
+                kind: EventKind::SfvMismatch,
+                job_id: Some(job_id.0),
+                file_id: None,
+                message: weaver_server_core::events::model::sfv_mismatch_message(file, listing),
+            },
             PipelineEvent::MoveToCompleteStarted { job_id } => Self {
                 kind: EventKind::MoveToCompleteStarted,
                 job_id: Some(job_id.0),

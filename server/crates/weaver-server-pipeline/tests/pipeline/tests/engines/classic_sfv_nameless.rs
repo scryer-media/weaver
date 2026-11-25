@@ -8,7 +8,7 @@
 // one does.
 
 use super::harness::{ARTICLE, Claim, Post, Scenario, kinds, payload, run};
-use super::sfv::{crc, listing_text};
+use super::sfv::{crc, listing_text, notes};
 use crate::jobs::model::JobStatus;
 
 // A listing posted under a name that says nothing, opening with a comment
@@ -47,9 +47,14 @@ async fn a_nameless_sfv_with_comments_and_blank_lines_is_used() {
     assert_eq!(kinds(&graph), ["sfv"]);
     assert_eq!(view.claims["lantern.mkv"], Claim::Complete);
     assert_eq!(view.claims["beacon.mkv"], Claim::Complete);
+    assert_eq!(
+        notes(&graph),
+        ["beacon.mkv does not match its CRC32 in oBfU5CaTeD-0001"]
+    );
 }
 
-// Two nameless listings each naming one file are both read as listings.
+// Two nameless listings each naming one file are both read as listings:
+// each notes the file it disagrees with.
 #[tokio::test]
 async fn two_nameless_sfv_listings_are_both_used() {
     let lantern = payload(3 * ARTICLE, 75);
@@ -59,7 +64,7 @@ async fn two_nameless_sfv_listings_are_both_used() {
         Post::plain("beacon.mkv", beacon.clone()),
         Post::plain(
             "5wXn1TLm",
-            listing_text("", &[("lantern.mkv", crc(&lantern))]),
+            listing_text("", &[("lantern.mkv", crc(&lantern) ^ 1)]),
         ),
         Post::plain(
             "aC3f9pQ2",
@@ -79,4 +84,13 @@ async fn two_nameless_sfv_listings_are_both_used() {
     assert_eq!(kinds(&graph), ["sfv"]);
     assert_eq!(view.claims["lantern.mkv"], Claim::Complete);
     assert_eq!(view.claims["beacon.mkv"], Claim::Complete);
+    let mut noted = notes(&graph);
+    noted.sort();
+    assert_eq!(
+        noted,
+        [
+            "beacon.mkv does not match its CRC32 in aC3f9pQ2",
+            "lantern.mkv does not match its CRC32 in 5wXn1TLm",
+        ]
+    );
 }

@@ -538,6 +538,8 @@ pub enum EventKind {
     ArchiveDemoted,
     // A recovery set the job ended with that bound no file.
     RecoverySetUnused,
+    // A file whose CRC32 disagrees with a checksum listing's.
+    SfvMismatch,
     MoveToCompleteStarted,
     MoveToCompleteFinished,
     SegmentRetryScheduled,
@@ -596,6 +598,7 @@ impl std::str::FromStr for EventKind {
             "ExtractionFailed" => Ok(Self::ExtractionFailed),
             "ArchiveDemoted" => Ok(Self::ArchiveDemoted),
             "RecoverySetUnused" => Ok(Self::RecoverySetUnused),
+            "SfvMismatch" => Ok(Self::SfvMismatch),
             "MoveToCompleteStarted" => Ok(Self::MoveToCompleteStarted),
             "MoveToCompleteFinished" => Ok(Self::MoveToCompleteFinished),
             "SegmentRetryScheduled" => Ok(Self::SegmentRetryScheduled),

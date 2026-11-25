@@ -401,6 +401,28 @@ impl NamespaceWriter {
         found
     }
 
+    // Every member a set disputes, as its object says once the job is
+    // done: the set, and the member's namespace. Sets that stand aside
+    // are asked too; a set's rulings say what it disputes otherwise.
+    pub(crate) fn disputed(&self, tree: &Tree) -> Vec<(NodeId, NodeId, MemberId)> {
+        let mut found = Vec::new();
+        let mut said = Vec::new();
+        for node in tree.live() {
+            let Some(namespace) = tree.namespace(node) else {
+                continue;
+            };
+            for set in tree.recovery_nodes(node) {
+                let Some(recovery) = tree.recovery(set) else {
+                    continue;
+                };
+                said.clear();
+                recovery.disputed(namespace, &mut said);
+                found.extend(said.drain(..).map(|member| (set, node, member)));
+            }
+        }
+        found
+    }
+
     // What a set is called: what the file that carries it is.
     pub fn set_name<'t>(&self, tree: &'t Tree, set: NodeId) -> Option<&'t str> {
         tree.volumes(set)
@@ -1822,6 +1844,30 @@ impl NamespaceWriter {
         }
     }
 
+    // The source's checksums of each member the set asks for, as it asks:
+    // whatever is kept of them, once. Nothing is read back for it.
+    fn answer_evidence(
+        &mut self,
+        tree: &mut Tree,
+        segments: &dyn Segments,
+        node: NodeId,
+        sets: &[NodeId],
+        set: NodeId,
+    ) {
+        let mut wanted = Vec::new();
+        if let (Some(recovery), Some(namespace)) = (tree.recovery(set), tree.namespace(node)) {
+            let covered = |member| self.covering(tree, sets, member).next().is_some();
+            recovery.evidence(namespace, &covered, &mut wanted);
+        }
+        for member in wanted {
+            self.early_evidence(tree, segments, node, member);
+            let evidence = &self.segments;
+            tree.with_recovery(set, |recovery, namespace| {
+                recovery.evidenced(namespace, member, evidence);
+            });
+        }
+    }
+
     // Let every set of the namespace match its members again, after the
     // members, their lengths or their first bytes changed. A set that names
     // a member just founded in a namespace bound here, or beside here, moves
@@ -1870,6 +1916,7 @@ impl NamespaceWriter {
         let mut renamed = std::mem::take(&mut self.renamed);
         renamed.clear();
         for &set in sets {
+            self.answer_evidence(tree, segments, node, sets, set);
             let newly = tree
                 .with_recovery(set, |recovery, namespace| {
                     // A member covered before the bind is not newly

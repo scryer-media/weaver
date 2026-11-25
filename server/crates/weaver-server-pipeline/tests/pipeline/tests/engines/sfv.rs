@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 pub(super) use weaver_server_pipeline::pipeline::tests::engines::sfv::{
-    assert_twin, assert_twin_but_text, crc, listing,
+    assert_twin, assert_twin_but_text, crc, listing, notes,
 };
 
 // SFV listings: a listing that agrees, one that names a
@@ -12,8 +12,14 @@ pub(super) use weaver_server_pipeline::pipeline::tests::engines::sfv::{
 // never claims damage: one that disagrees, or names a file the post lost,
 // leaves the job as the same posts without it.
 
-use super::harness::{ARTICLE, Claim, Post, Scenario, assert_fetched_once, payload, run};
+use super::harness::{
+    ARTICLE, Claim, JOB, Post, Scenario, assert_fetched_once, par2_set, payload, run, run_then,
+};
 use crate::jobs::model::JobStatus;
+use weaver_server_base::events::model::{PipelineEvent, sfv_mismatch_message};
+use weaver_server_pipeline::pipeline::tests::engines::restart_fixtures::{
+    assert_restarted, run_restarting,
+};
 
 fn claims_all(claims: &std::collections::BTreeMap<String, Claim>, expected: Claim) -> bool {
     !claims.is_empty() && claims.values().all(|claim| *claim == expected)
@@ -36,6 +42,7 @@ async fn an_sfv_whose_every_entry_matches_verifies_and_the_job_completes() {
     assert!(graph.completed(), "{:?}", graph.failure);
     assert!(claims_all(&graph.claims, Claim::Complete));
     assert!(claims_all(&graph.graph().claims, Claim::Complete));
+    assert_eq!(notes(&graph), Vec::<String>::new());
 }
 
 #[tokio::test]
@@ -76,7 +83,7 @@ fn mismatch(listed: bool) -> Scenario {
 
 // A listing that disagrees with a file whose bytes arrived as posted does
 // not mark it: both files are delivered as posted and the job completes,
-// as the same posts without the listing do.
+// as the same posts without the listing do. The job notes the file once.
 #[tokio::test]
 async fn an_sfv_mismatch_leaves_the_job_as_without_the_listing() {
     let graph = run(&mismatch(true)).await;
@@ -92,24 +99,36 @@ async fn an_sfv_mismatch_leaves_the_job_as_without_the_listing() {
     let view = graph.graph();
     assert_eq!(view.claims["lantern.mkv"], Claim::Complete);
     assert_eq!(view.claims["beacon.mkv"], Claim::Complete);
+    assert_eq!(
+        notes(&graph),
+        ["beacon.mkv does not match its CRC32 in lantern.sfv"]
+    );
     assert_twin(&graph, &run(&mismatch(false)).await);
 }
 
-// An entry naming a member in another case binds it: the listing
-// disagrees with the member, and the job still ends as the post without it.
+// An entry naming a member in another case names it: the listing disagrees
+// with the member, so the job notes it, and still ends as the post without
+// the listing.
 #[tokio::test]
 async fn an_sfv_naming_a_member_in_another_case_binds_and_verifies_it() {
     let lantern = payload(3 * ARTICLE, 26);
     let posts = |listed: bool| {
         let mut posts = vec![Post::plain("lantern.bin", lantern.clone())];
         if listed {
-            posts.push(listing("lantern.sfv", &[("LANTERN.BIN", crc(&lantern) ^ 1)]));
+            posts.push(listing(
+                "lantern.sfv",
+                &[("LANTERN.BIN", crc(&lantern) ^ 1)],
+            ));
         }
         Scenario::new(posts)
     };
     let graph = run(&posts(true)).await;
     assert_fetched_once(&graph);
     assert!(graph.completed(), "{:?}", graph.failure);
+    assert_eq!(
+        notes(&graph),
+        ["lantern.bin does not match its CRC32 in lantern.sfv"]
+    );
     assert_twin(&graph, &run(&posts(false)).await);
 }
 
@@ -128,11 +147,11 @@ async fn a_file_the_listing_does_not_name_completes_unchecked() {
     assert!(graph.completed(), "{:?}", graph.failure);
     assert_eq!(graph.graph().claims["beacon.bin"], Claim::Complete);
     assert_eq!(graph.files["lantern beacon/beacon.bin"], beacon);
+    assert_eq!(notes(&graph), Vec::<String>::new());
 }
 
-// Two listings that disagree about one name are a contradiction, not
-// evidence: that file is not failed on either, and the name they agree on
-// is still checked.
+// Two listings that disagree about one name each say what they say: that
+// file is not failed on either, and the listing it disagrees with notes it.
 #[tokio::test]
 async fn listings_that_disagree_about_a_name_fail_neither_way() {
     let lantern = payload(3 * ARTICLE, 33);
@@ -150,11 +169,16 @@ async fn listings_that_disagree_about_a_name_fail_neither_way() {
     assert_fetched_once(&graph);
     assert!(graph.completed(), "{:?}", graph.failure);
     assert_eq!(graph.graph().claims["beacon.bin"], Claim::Complete);
+    assert_eq!(
+        notes(&graph),
+        ["lantern.bin does not match its CRC32 in lantern.extra.sfv"]
+    );
 }
 
 // A file the listing names whose every article is lost is the one file not
 // delivered whole: the job ends Partial, as the same posts without the
-// listing do. The listing claims no damage of its own.
+// listing do. The listing claims no damage of its own, and notes nothing of
+// a file that never arrived whole.
 #[tokio::test]
 async fn a_listed_file_whose_articles_are_all_lost_ends_partial_marking_it() {
     let lantern = payload(2 * ARTICLE, 35);
@@ -182,5 +206,83 @@ async fn a_listed_file_whose_articles_are_all_lost_ends_partial_marking_it() {
     let view = graph.graph();
     assert_eq!(view.claims["lantern.mkv"], Claim::Complete);
     assert_ne!(view.claims["beacon.mkv"], Claim::Complete);
+    assert_eq!(notes(&graph), Vec::<String>::new());
+    assert_twin(&graph, &run(&posts(false)).await);
+}
+
+// The note is said once, when the job is done: a pass of the pipeline after
+// it, with nothing to do, says nothing more.
+#[tokio::test]
+async fn an_idle_pass_after_the_job_is_done_notes_nothing_again() {
+    let mut heard = Vec::new();
+    let graph = run_then(&mismatch(true), async |pipeline, _| {
+        let mut sent = pipeline.event_tx.subscribe();
+        if pipeline.jobs.contains_key(&JOB) {
+            pipeline.check_job_completion(JOB).await;
+        }
+        weaver_server_pipeline::pipeline::tests::pump_pipeline_runtime_queues(pipeline).await;
+        while let Ok(event) = sent.try_recv() {
+            heard.push(event);
+        }
+    })
+    .await;
+    assert_eq!(
+        notes(&graph),
+        ["beacon.mkv does not match its CRC32 in lantern.sfv"]
+    );
+    assert!(
+        !heard
+            .iter()
+            .any(|event| matches!(event, PipelineEvent::SfvMismatch { .. })),
+        "{heard:?}"
+    );
+}
+
+// A job taken down and restored on the way notes the file as the run with
+// no restart does: the restored listing asks the source again.
+#[tokio::test]
+async fn a_restored_job_notes_the_file_as_the_run_without_a_restart() {
+    let whole = run(&mismatch(true)).await;
+    let restarted = run_restarting(&mismatch(true)).await;
+    assert_restarted(&restarted, &whole);
+    let noted: Vec<String> = restarted
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            PipelineEvent::SfvMismatch {
+                job_id,
+                file,
+                listing,
+            } if *job_id == JOB => Some(sfv_mismatch_message(file, listing)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(noted, notes(&whole));
+}
+
+// A file a PAR2 set covers is sealed only once the set has ruled, when the
+// job is quiet; the listing asks for it as soon as it is whole, which is
+// before that, so the source still keeps its checksums and the listing that
+// disagrees with it notes it. The job ends as PAR2 rules it.
+#[tokio::test]
+async fn a_file_a_par2_set_covers_is_noted_as_the_listing_asked_before_the_seal() {
+    let lantern = payload(3 * ARTICLE, 37);
+    let posts = |listed: bool| {
+        let mut posts = vec![Post::plain("lantern.bin", lantern.clone())];
+        posts.extend(par2_set("lantern", &[("lantern.bin", &lantern)], 4));
+        if listed {
+            posts.push(listing(
+                "lantern.sfv",
+                &[("lantern.bin", crc(&lantern) ^ 1)],
+            ));
+        }
+        Scenario::new(posts)
+    };
+    let graph = run(&posts(true)).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert_eq!(
+        notes(&graph),
+        ["lantern.bin does not match its CRC32 in lantern.sfv"]
+    );
     assert_twin(&graph, &run(&posts(false)).await);
 }

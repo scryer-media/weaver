@@ -3,7 +3,7 @@
 
 mod facts;
 
-use weaver_graph::{ObjectId, Recovery};
+use weaver_graph::{ByteRange, MemberId, ObjectId, Recovery, Segment};
 
 use super::*;
 use crate::grid::crc32;
@@ -32,7 +32,8 @@ fn bind(job: &mut Job<Sfv>) {
 }
 
 // Comments, junk, a BOM, DOS and Unix paths, a short CRC, a size column,
-// a listing repeated verbatim and one that contradicts itself.
+// a listing repeated verbatim and one that contradicts itself. Each entry
+// keeps its basename in the listing's own case, the first spelling of it.
 #[test]
 fn entries_are_keyed_by_lower_cased_basename() {
     let parsed = entries(
@@ -41,14 +42,19 @@ fn entries_are_keyed_by_lower_cased_basename() {
          twice.bin 00000002\nTWICE.bin 00000002\nclash.bin 00000003\nclash.bin 00000004\n"
             .as_bytes(),
     );
+    let entry = |name: &str, crc32| {
+        let key = name.to_ascii_lowercase();
+        let name = name.to_owned();
+        (key, Entry { name, crc32 })
+    };
     assert_eq!(
         parsed,
         BTreeMap::from([
-            ("alpha.bin".to_owned(), 0xABCD),
-            ("dos.bin".to_owned(), 0xABC),
-            ("name with spaces.bin".to_owned(), 0xDEAD_BEEF),
-            ("twice.bin".to_owned(), 2),
-            ("unix.bin".to_owned(), 1),
+            entry("Alpha.bin", 0xABCD),
+            entry("Dos.bin", 0xABC),
+            entry("name with spaces.bin", 0xDEAD_BEEF),
+            entry("twice.bin", 2),
+            entry("unix.bin", 1),
         ])
     );
 }
@@ -76,4 +82,89 @@ fn sfv_text_delivered_out_of_order_is_read_whole() {
     job.volume("check.sfv", &text, 7, true);
     assert!(job.object.text == text);
     assert_eq!(entries(&job.object.text).len(), 2);
+}
+
+// A member as the namespace holds it once nothing more will arrive.
+fn whole(job: &mut Job<Sfv>, name: &str, bytes: &[u8]) -> MemberId {
+    let member = job.member(name, bytes);
+    job.namespace.get_mut(member).unwrap().closed = true;
+    member
+}
+
+fn asked(job: &Job<Sfv>) -> Vec<MemberId> {
+    let mut out = Vec::new();
+    job.object.evidence(&job.namespace, &|_| false, &mut out);
+    out
+}
+
+// The source's checksums of `bytes`, cut every `cut` bytes, as verified.
+fn checksums(bytes: &[u8], cut: usize) -> Vec<Segment> {
+    bytes
+        .chunks(cut)
+        .enumerate()
+        .map(|(index, chunk)| Segment {
+            range: ByteRange::at((index * cut) as u64, chunk.len() as u64),
+            crc32: crc32(chunk),
+            verified: true,
+        })
+        .collect()
+}
+
+fn disputed(job: &Job<Sfv>) -> Vec<MemberId> {
+    let mut out = Vec::new();
+    job.object.disputed(&job.namespace, &mut out);
+    out
+}
+
+// The listing asks once for each whole file it names, in any case, and
+// disputes the one whose checksums fold to another CRC32. A file it does not
+// name, and one still arriving, are not asked for.
+#[test]
+fn a_listing_asks_once_for_each_whole_file_it_names_and_disputes_one_that_disagrees() {
+    let one = payload(10, 2000);
+    let two = payload(11, 3000);
+    let three = payload(12, 1000);
+    let four = payload(13, 1000);
+    let mut job = job(&sfv_text(&[
+        ("one.bin", crc32(&one)),
+        ("TWO.bin", crc32(&two) ^ 1),
+        ("four.bin", crc32(&four)),
+    ]));
+    let one_id = whole(&mut job, "one.bin", &one);
+    let two_id = whole(&mut job, "two.bin", &two);
+    whole(&mut job, "three.bin", &three);
+    job.member("four.bin", &four);
+    assert_eq!(asked(&job), vec![one_id, two_id]);
+    job.object
+        .evidenced(&job.namespace, one_id, &checksums(&one, 700));
+    job.object
+        .evidenced(&job.namespace, two_id, &checksums(&two, 700));
+    assert_eq!(asked(&job), Vec::<MemberId>::new());
+    assert_eq!(disputed(&job), vec![two_id]);
+}
+
+// Checksums that do not reach every byte, or one the source did not
+// verify, say nothing: a file whose bytes were never checked whole is not
+// disputed.
+#[test]
+fn a_file_not_checked_whole_is_not_disputed() {
+    let bytes = payload(14, 3000);
+    for spoil in [
+        |segments: &mut Vec<Segment>| segments.clear(),
+        |segments: &mut Vec<Segment>| {
+            segments.pop();
+        },
+        |segments: &mut Vec<Segment>| {
+            segments.remove(1);
+        },
+        |segments: &mut Vec<Segment>| segments[0].verified = false,
+    ] {
+        let mut job = job(&sfv_text(&[("one.bin", crc32(&bytes) ^ 1)]));
+        let member = whole(&mut job, "one.bin", &bytes);
+        let mut segments = checksums(&bytes, 1000);
+        spoil(&mut segments);
+        job.object.evidenced(&job.namespace, member, &segments);
+        assert_eq!(asked(&job), Vec::<MemberId>::new());
+        assert_eq!(disputed(&job), Vec::<MemberId>::new());
+    }
 }

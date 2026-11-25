@@ -325,7 +325,10 @@ async fn an_sfv_that_binds_no_file_leaves_a_whole_post_complete() {
         "{:?}",
         graph.failure
     );
-    assert_twin(&graph, &run(&Scenario::new(pieces_listed(false, false))).await);
+    assert_twin(
+        &graph,
+        &run(&Scenario::new(pieces_listed(false, false))).await,
+    );
 }
 
 // An SFV that agrees with a whole file vouches for nothing: a hex-named

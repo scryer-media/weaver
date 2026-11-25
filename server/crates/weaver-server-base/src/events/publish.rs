@@ -82,6 +82,7 @@ pub fn pipeline_job_id(event: &PipelineEvent) -> Option<u64> {
         | PipelineEvent::ExtractionFailed { job_id, .. }
         | PipelineEvent::ArchiveDemoted { job_id, .. }
         | PipelineEvent::RecoverySetUnused { job_id, .. }
+        | PipelineEvent::SfvMismatch { job_id, .. }
         | PipelineEvent::MoveToCompleteStarted { job_id }
         | PipelineEvent::MoveToCompleteFinished { job_id }
         | PipelineEvent::PhaseProgressUpdated { job_id } => Some(job_id.0),

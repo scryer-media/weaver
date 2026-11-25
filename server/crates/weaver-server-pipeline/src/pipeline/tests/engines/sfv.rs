@@ -12,6 +12,24 @@ pub fn listing(name: &str, entries: &[(&str, u32)]) -> Post {
     Post::plain(name, text.into_bytes())
 }
 
+// The messages of every listing note the run sent for the job, in order.
+pub fn notes(graph: &Outcome) -> Vec<String> {
+    graph
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            weaver_server_base::events::model::PipelineEvent::SfvMismatch {
+                job_id,
+                file,
+                listing,
+            } if *job_id == super::state::JOB => Some(
+                weaver_server_base::events::model::sfv_mismatch_message(file, listing),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
 pub fn crc(bytes: &[u8]) -> u32 {
     par2_rs::checksum::crc32(bytes)
 }

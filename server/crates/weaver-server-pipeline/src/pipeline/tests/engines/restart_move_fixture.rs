@@ -338,6 +338,7 @@ pub async fn run_stopping_at(
         restarts: usize::from(restored.is_some()),
         order,
         graph,
+        events: Vec::new(),
     };
     (
         restarted,

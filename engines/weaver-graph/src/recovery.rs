@@ -341,6 +341,29 @@ pub trait Recovery {
     // job is done. An object that binds what it is handed says nothing.
     fn unbound(&self, _out: &mut Vec<Unbound>) {}
 
+    // The members of the namespace whose source checksums this object
+    // asks for, as a listing does that checks nothing but wants a CRC. It
+    // need not cover them. `covered` says whether a set that stands covers
+    // a member. Each member asked is answered once, through `evidenced`,
+    // with what the source still keeps of it, which may be nothing.
+    fn evidence(
+        &self,
+        _namespace: &Namespace,
+        _covered: &dyn Fn(MemberId) -> bool,
+        _out: &mut Vec<MemberId>,
+    ) {
+    }
+
+    // The answer to `evidence` for one member: the source's checksums of
+    // its bytes, in order. A member the source keeps none of, or only
+    // some of, gets what is kept.
+    fn evidenced(&mut self, _namespace: &Namespace, _member: MemberId, _segments: &[Segment]) {}
+
+    // The members of the namespace whose bytes disagree with what this
+    // object states of them, for a note. Asked once, when the job is done.
+    // An object whose disagreements are its rulings says nothing.
+    fn disputed(&self, _namespace: &Namespace, _out: &mut Vec<MemberId>) {}
+
     // How this object's repair ranks against another's over the same
     // bytes. A returned repair rewrites bytes an earlier repair wrote only
     // when its object ranks above every other set of its namespace; between

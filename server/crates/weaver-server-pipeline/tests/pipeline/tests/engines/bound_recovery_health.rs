@@ -426,7 +426,11 @@ async fn a_checksum_listing_is_not_counted_as_recovery() {
     bare.pop();
     let twin = run(&losing(Scenario::new(bare).framed(ARTICLE), 1)).await;
     assert_eq!(
-        (graph.status.clone(), graph.failure.clone(), graph.failure_kind),
+        (
+            graph.status.clone(),
+            graph.failure.clone(),
+            graph.failure_kind
+        ),
         (twin.status.clone(), twin.failure.clone(), twin.failure_kind),
         "{case} | {}",
         summary(&twin)

@@ -6,8 +6,8 @@ use weaver_graph::{Kind, Object};
 use super::super::Sfv;
 use super::{OWN, bind, job, sfv_text};
 use crate::grid::crc32;
-use crate::testing::replay::{Step, frames, restores_alike};
 use crate::testing::payload;
+use crate::testing::replay::{Step, frames, restores_alike};
 
 #[test]
 fn an_sfv_restored_mid_text_reads_the_rest_as_the_live_one() {

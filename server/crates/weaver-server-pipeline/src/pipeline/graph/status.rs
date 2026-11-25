@@ -285,9 +285,7 @@ pub fn failure(
     let failed: Vec<(&SetSummary, u64, u64)> = ruled
         .iter()
         .filter_map(|(set, outcome)| match outcome {
-            RepairOutcome::Impossible { damaged, reachable }
-                if !excused(set) =>
-            {
+            RepairOutcome::Impossible { damaged, reachable } if !excused(set) => {
                 Some((*set, *damaged, *reachable))
             }
             _ => None,

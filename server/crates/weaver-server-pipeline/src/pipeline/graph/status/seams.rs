@@ -137,43 +137,66 @@ pub(super) async fn settle(pipeline: &mut Pipeline, job_id: JobId, step: Step) {
     }
     match step {
         Step::Wait => {}
-        Step::Deliver => match pipeline.graph_terminal_status(job_id) {
-            Some(JobStatus::Failed { error }) if pipeline.graph_failure_from_feed(job_id) => {
-                // Nothing came whole of a post the feed gave up: it failed
-                // at its download, in the feed's words.
-                metrics::failed("post_dead");
-                pipeline
-                    .pipeline_failure_stages
-                    .entry(job_id)
-                    .or_insert(PipelineFailureStage::Download);
+        Step::Deliver => {
+            note_disputed(pipeline, job_id);
+            deliver(pipeline, job_id).await;
+        }
+    }
+}
+
+// What a listing disputes is said as the job delivers, whatever it comes
+// to: only then is a listing's own text in. The root is done before that,
+// as a set's own volumes are no payload it waits on, so a listing may
+// still be arriving when it is.
+fn note_disputed(pipeline: &mut Pipeline, job_id: JobId) {
+    let events = pipeline
+        .graph_jobs
+        .get(&job_id)
+        .map(|job| disputed_files(job_id, job))
+        .unwrap_or_default();
+    for event in events {
+        pipeline.emit_job_event(event);
+    }
+}
+
+// The job with nothing left to wait for, ended as its claims say.
+async fn deliver(pipeline: &mut Pipeline, job_id: JobId) {
+    match pipeline.graph_terminal_status(job_id) {
+        Some(JobStatus::Failed { error }) if pipeline.graph_failure_from_feed(job_id) => {
+            // Nothing came whole of a post the feed gave up: it failed
+            // at its download, in the feed's words.
+            metrics::failed("post_dead");
+            pipeline
+                .pipeline_failure_stages
+                .entry(job_id)
+                .or_insert(PipelineFailureStage::Download);
+            pipeline.fail_job_on_health(job_id, error);
+        }
+        Some(JobStatus::Failed { error }) => {
+            // The stage that left the delivery short is the one that
+            // broke, whatever the root showed.
+            let stage = pipeline.graph_shortfall(job_id).map(|(stage, _)| stage);
+            pipeline.enter_short_stage(job_id, stage);
+            pipeline.mark_failed_for_memory(job_id);
+            if pipeline.graph_failure_is_health(job_id) {
                 pipeline.fail_job_on_health(job_id, error);
+            } else {
+                pipeline.fail_job(job_id, error);
             }
-            Some(JobStatus::Failed { error }) => {
-                // The stage that left the delivery short is the one that
-                // broke, whatever the root showed.
-                let stage = pipeline.graph_shortfall(job_id).map(|(stage, _)| stage);
-                pipeline.enter_short_stage(job_id, stage);
-                pipeline.mark_failed_for_memory(job_id);
-                if pipeline.graph_failure_is_health(job_id) {
-                    pipeline.fail_job_on_health(job_id, error);
-                } else {
-                    pipeline.fail_job(job_id, error);
-                }
+        }
+        _ => {
+            pipeline.record_validated_archive_password(job_id);
+            pipeline.log_deliveries(job_id);
+            // A repair ruled before this delivery: the moment the e2e
+            // post-repair hook names, between the ruling and the move.
+            let hold = pipeline
+                .graph_recovery_summary(job_id)
+                .is_some_and(|summary| summary.repaired())
+                .then_some(weaver_server_base::e2e_failpoint::DIRECT_STORE_POST_REPAIR_VERIFY);
+            if let Err(error) = pipeline.start_move_to_complete_held(job_id, hold).await {
+                pipeline.fail_job(job_id, error);
             }
-            _ => {
-                pipeline.record_validated_archive_password(job_id);
-                pipeline.log_deliveries(job_id);
-                // A repair ruled before this delivery: the moment the e2e
-                // post-repair hook names, between the ruling and the move.
-                let hold = pipeline
-                    .graph_recovery_summary(job_id)
-                    .is_some_and(|summary| summary.repaired())
-                    .then_some(weaver_server_base::e2e_failpoint::DIRECT_STORE_POST_REPAIR_VERIFY);
-                if let Err(error) = pipeline.start_move_to_complete_held(job_id, hold).await {
-                    pipeline.fail_job(job_id, error);
-                }
-            }
-        },
+        }
     }
 }
 
@@ -278,6 +301,42 @@ fn unused_sets(job_id: JobId, job: &GraphJob) -> Vec<PipelineEvent> {
                 job_id,
                 set,
                 reason: reason.to_owned(),
+            }
+        })
+        .collect()
+}
+
+// Every file a set disputes, said once, when the job delivers: a line of
+// the log and an event of the job's each. A checksum listing says so of a
+// file whose CRC32 disagrees with its own; it changes nothing of the job.
+fn disputed_files(job_id: JobId, job: &GraphJob) -> Vec<PipelineEvent> {
+    let tree = job.tree();
+    job.writer()
+        .disputed(tree)
+        .into_iter()
+        .map(|(set, node, member)| {
+            let listing = job
+                .writer()
+                .set_name(tree, set)
+                .unwrap_or_default()
+                .to_owned();
+            let file = tree
+                .namespace(node)
+                .and_then(|namespace| namespace.get(member))
+                .map(|record| record.output_name.clone())
+                .unwrap_or_default();
+            info!(
+                job_id = job_id.0,
+                node = set.0,
+                file = %file,
+                listing = %listing,
+                "{}",
+                weaver_server_base::events::model::sfv_mismatch_message(&file, &listing)
+            );
+            PipelineEvent::SfvMismatch {
+                job_id,
+                file,
+                listing,
             }
         })
         .collect()
