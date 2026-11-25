@@ -39,7 +39,7 @@
     "babel-plugin-react-compiler": "^1.0.0",
     "oxlint": "^1.91.0",
     "postcss": "^8.5.32",
-    "prettier": "3.9.10",
+    "prettier": "3.10.1",
     "tailwindcss": "^4.3.4",
     "typescript": "^7.0.2",
     "vite": "^8.3.5",
