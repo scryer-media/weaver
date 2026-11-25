@@ -238,9 +238,14 @@ impl RarStore {
             }
             out.push(Emit::MemberClosed(member));
         }
+        // A checksum that passes under a key on trial proves its candidate.
+        if let Some(candidate) = entry.trial.filter(|_| proved) {
+            return self.prove(candidate);
+        }
         let Some((SliceVerdict::Damaged, composed)) = verdict else {
             return;
         };
+        let entry = &mut self.entries[id];
         // The gate composes verified runs only, so a failure here is on
         // verified bytes: under a key on trial it condemns the key, not the
         // bytes. Under a proved key, a checksum the store judges damages the

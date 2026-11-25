@@ -580,7 +580,9 @@ fn an_enciphered_compressed_member_asks_again_after_a_wrong_password() {
 // whole engine's run and the store's scoped run alike say damage and never
 // ask for another password. Without a check value, or in RAR4, which has
 // none, the password is unproven and the same failure asks for another, as
-// a wrong key's bytes would.
+// a wrong key's bytes would; but a RAR4 password that unsealed the store's
+// headers is proved there, and the store's run, handed it as proved, says
+// damage. The whole engine's run has no such proof.
 #[test]
 fn damage_under_a_proven_password_is_damage_and_under_an_unproven_one_asks_again() {
     for (version, check, proven) in [
@@ -630,6 +632,7 @@ fn damage_under_a_proven_password_is_damage_and_under_an_unproven_one_asks_again
             let strays = owner.run();
             assert!(strays.is_empty(), "{label}: {strays:?} {:?}", owner.said);
             let said = trouble(&owner);
+            let proven = proven || (headers && version == Version::Rar4);
             assert!(!owner.member("notes.nfo").closed, "{label}");
             assert_eq!(asks(&said), !proven, "{label}: {said:?}");
             assert_eq!(damage(&said), proven, "{label}: {said:?}");

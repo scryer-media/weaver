@@ -511,6 +511,11 @@ struct Candidate {
     // kept: a restart offers the candidate again and keys it on trial, and
     // condemning it once more costs one more reading of its bytes.
     files_wrong: bool,
+    // Something verified under it besides the headers: a key it derived
+    // passed the check value its header carries, or a file's checksum passed
+    // under a key it keyed on trial (`RarStore::proven`). Not kept, as
+    // `files_wrong` is not.
+    proven: bool,
 }
 
 pub struct RarStore {
