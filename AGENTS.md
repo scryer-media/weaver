@@ -59,6 +59,7 @@ When you touch code that breaks one of these rules, fix that site in the same ch
 - Fail closed: a down or disabled proxy stalls its consumer. No fallback to the host address unless the route saves one.
 - Names resolve where the route says, and are dialled where they were resolved. No name reaches the host resolver otherwise.
 - Torrent files, trackers, peers, DHT and web seeds are attacker input: bound before parsing, write only inside the torrent's location, delete only listed files, seed only verified data, redact credentials for every caller below the scope `SECURITY.md` names.
+- Operator scripts are the operator's own code. Weaver is self-hosted for one operator: what a script does, prints or is handed (a tracker URL included) is theirs to manage, and is not a leak or a finding.
 
 ## Private trackers
 
