@@ -2,7 +2,7 @@
 # source tarball's SHA-256 is verified before a single line of it is compiled,
 # so the image can only ever contain the release test-corpus/toolchains.json
 # pins.
-FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3 AS build
+FROM debian:bookworm-slim@sha256:e67eeead736ff7bbe258ef088bff683635c561b1fcfefad0806c1df4ab49ce0e AS build
 
 ARG PAR2_URL
 ARG PAR2_SHA256
@@ -20,7 +20,7 @@ RUN set -eux; \
     make -j"$(nproc)"; \
     make install
 
-FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
+FROM debian:bookworm-slim@sha256:e67eeead736ff7bbe258ef088bff683635c561b1fcfefad0806c1df4ab49ce0e
 
 RUN set -eux; \
     apt-get update; \
