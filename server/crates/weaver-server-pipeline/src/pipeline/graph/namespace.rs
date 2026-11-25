@@ -35,7 +35,7 @@ use weaver_graph::holds::{
 use weaver_graph::member::FIRST_BYTES;
 use weaver_graph::{
     Algorithm, Builder, ByteRange, Coverage, Effect, Emit, Evidenced, Kind, Marked, MemberId,
-    NodeId, Object, ObjectId, Placement, Provenance, Segment, Tree, VolumeIndex, Why,
+    NodeId, Object, ObjectId, Placement, Provenance, Segment, Took, Tree, VolumeIndex, Why,
 };
 
 use super::checkpoint::why_name;
@@ -487,8 +487,9 @@ pub struct NamespaceWriter {
     // applied: what it retracts is the run's, not its object's.
     run_speaking: Option<NodeId>,
     // Members an object retracted of its own accord since the job last
-    // asked: one its run makes invalidates that run (`GraphJob::step_runs`).
-    retracted: Vec<(NodeId, MemberId)>,
+    // asked, each with whether the tree's record made it the run's as it
+    // went: one its run makes invalidates that run (`GraphJob::step_runs`).
+    retracted: Vec<(NodeId, MemberId, bool)>,
     // Ranges of root members given back that came and are no longer in
     // hand, since the job last asked: the job fetches them again.
     unkept: Vec<(MemberId, ByteRange)>,
@@ -498,9 +499,10 @@ pub struct NamespaceWriter {
     given_up: BTreeSet<(NodeId, bool)>,
     // Why the run of each object that places members itself last refused
     // to make the members it makes, until a run of it starts again: what
-    // its container is withheld for (`run_refused`). One reason per such
-    // object of the job, kept as long as the job.
-    run_refusals: BTreeMap<NodeId, Why>,
+    // its container is withheld for (`run_refused`), and how many members
+    // it left unmade. One reason per such object of the job, kept as long
+    // as the job.
+    run_refusals: BTreeMap<NodeId, (Why, usize)>,
     // What a repair or a staging that failed gave back to the disk as it
     // failed, until the job asks: the room it needs to run again.
     gave_back: Option<u64>,
@@ -1095,8 +1097,8 @@ impl NamespaceWriter {
     }
 
     // Members objects retracted of their own accord since the job last
-    // asked, in the order they went.
-    pub(crate) fn take_retracted(&mut self) -> Vec<(NodeId, MemberId)> {
+    // asked, in the order they went, each with whether it was the run's.
+    pub(crate) fn take_retracted(&mut self) -> Vec<(NodeId, MemberId, bool)> {
         std::mem::take(&mut self.retracted)
     }
 
@@ -1236,7 +1238,18 @@ impl NamespaceWriter {
     // refused to make the members it makes, while no run of it started
     // since.
     pub fn run_refused(&self, node: NodeId) -> Option<Why> {
-        self.run_refusals.get(&node).copied()
+        self.run_refusals.get(&node).map(|(why, _)| *why)
+    }
+
+    // Each object whose run refused to make members it makes, while no run
+    // of it started since: its archive's name, how many members it left
+    // unmade, and why. One row per such object of the job.
+    pub fn unmade(&self, tree: &Tree) -> Vec<(String, usize, Why)> {
+        self.run_refusals
+            .iter()
+            .filter(|(_, (_, unmade))| *unmade > 0)
+            .map(|(node, (why, unmade))| (archive_name(tree, *node), *unmade, *why))
+            .collect()
     }
 
     // Whether the file system refused the member's name, so no file of it
@@ -1971,22 +1984,31 @@ impl NamespaceWriter {
 
     // The bytes a bound member's object kept for no member of its own: its
     // envelopes, and what it could not place yet, which the namespace holds
-    // for the member as it holds any bytes whose place is not known.
+    // for the member as it holds any bytes whose place is not known. Both
+    // are as the object placed the bytes when it took them (`took`): a
+    // later delivery of the same step may have given it its map since, and
+    // bytes it took while it had none are still to be handed to it.
     fn capture(
         &mut self,
         tree: &Tree,
         (child, volume): (NodeId, VolumeIndex),
         arrival: &Arrival,
+        took: &Took,
     ) -> Result<(), WriteError> {
         let mut placements = std::mem::take(&mut self.placements);
         placements.clear();
+        let mut placed = 0;
+        let mut moved = false;
         if tree.child_of(arrival.node, arrival.member) == Some((child, volume)) {
-            tree.locate(child, volume, arrival.range(), &mut placements);
+            // Pieces all into members come as their length alone; only
+            // pieces that are not walk the bytes below.
+            placements.extend_from_slice(&took.pieces);
+            placed = took.covered;
+            moved = tree.placement(child) != took.number;
         }
         // An object that gave the volume back in this delivery places none
         // of it. What no piece covers is held for the member, as any bytes
         // whose place is not known, and goes to its own file with the rest.
-        let placed: u64 = placements.iter().map(Placement::len).sum();
         if placed < arrival.range().len() {
             placements.push(Placement::Held {
                 range: ByteRange::new(arrival.offset + placed, arrival.range().end),
@@ -2037,6 +2059,12 @@ impl NamespaceWriter {
             .collect();
         self.placements = placements;
         kept?;
+        // Held under a map the object has moved on from since: no pass has
+        // asked the new map where these go.
+        if moved && !held.is_empty() {
+            self.asked
+                .remove(&(arrival.node, held_volume(arrival.member)));
+        }
         self.hold_for((arrival.node, arrival.member), held)
     }
 
@@ -2243,6 +2271,7 @@ impl NamespaceWriter {
                 offset,
                 bytes,
                 provenance,
+                took,
             } => {
                 let arrival = Arrival {
                     node: *node,
@@ -2264,7 +2293,7 @@ impl NamespaceWriter {
                         LoopSite::RecoveryVolume,
                     );
                 }
-                return self.capture(tree, (*child, *volume), &arrival);
+                return self.capture(tree, (*child, *volume), &arrival, took);
             }
             Effect::Announced { node, member } => {
                 self.announce(tree, builder, segments, *node, *member, out)?;
@@ -2380,9 +2409,9 @@ impl NamespaceWriter {
             } => {
                 self.unkept((*node, *member, *child), (*range, *envelope, *at))?;
             }
-            Effect::Retracted { node, member } => {
+            Effect::Retracted { node, member, made } => {
                 if self.run_speaking != Some(*node) {
-                    self.retracted.push((*node, *member));
+                    self.retracted.push((*node, *member, *made));
                 }
                 self.retract(tree, *node, *member)?;
                 self.prune(tree)?;
@@ -4483,18 +4512,12 @@ impl NamespaceWriter {
     // why they are not there. The archive is noted for the job's events with
     // that reason, once per archive, as one given up is; the object and what
     // it placed stand.
-    pub(crate) fn refuse_made(
-        &mut self,
-        tree: &Tree,
-        node: NodeId,
-        made: &BTreeSet<MemberId>,
-        why: Why,
-    ) {
-        let open = Self::made_open(tree, node, made);
+    pub(crate) fn refuse_made(&mut self, tree: &Tree, node: NodeId, why: Why) {
+        let open = Self::made_open(tree, node);
         for &member in &open {
             self.refuse(tree, node, member, why, false);
         }
-        self.run_refusals.insert(node, why);
+        self.run_refusals.insert(node, (why, open.len()));
         if !open.is_empty() && why.gives_back() && self.given_up.insert((node, true)) {
             self.given_back.push(GivenBack {
                 member: archive_name(tree, node),
@@ -4508,21 +4531,22 @@ impl NamespaceWriter {
     }
 
     // A new run makes them again: why the last one did not is forgotten.
-    pub(crate) fn unrefuse_made(&mut self, tree: &Tree, node: NodeId, made: &BTreeSet<MemberId>) {
+    pub(crate) fn unrefuse_made(&mut self, tree: &Tree, node: NodeId) {
         self.run_refusals.remove(&node);
-        for member in Self::made_open(tree, node, made) {
+        for member in Self::made_open(tree, node) {
             self.files_mut(node).unrefuse(member);
         }
     }
 
-    // The members of `made`, what the node's run makes, it left open.
-    fn made_open(tree: &Tree, node: NodeId, made: &BTreeSet<MemberId>) -> Vec<MemberId> {
+    // The members the node's run makes, those the tree's record does not
+    // give its object, that it left open.
+    fn made_open(tree: &Tree, node: NodeId) -> Vec<MemberId> {
         let Some(namespace) = tree.namespace(node) else {
             return Vec::new();
         };
-        made.iter()
-            .filter_map(|member| namespace.get(*member))
-            .filter(|member| !member.closed && !member.is_complete())
+        namespace
+            .members()
+            .filter(|member| !member.own && !member.closed && !member.is_complete())
             .map(|member| member.id)
             .collect()
     }

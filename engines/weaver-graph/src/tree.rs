@@ -312,6 +312,18 @@ impl MembersMut<'_> {
 // What the tree tells its owner to do with bytes it cannot place itself:
 // write a leaf, start an engine, refuse a member, and so on. The tree never
 // touches a file; the owner does.
+// How an object placed the bytes of one delivery the moment it took them:
+// how many of them, from the first, its pieces account for, the pieces in
+// order when any of them is not a member's, and the placement number it
+// said then. Pieces all into members, as a store with its map in hand
+// places most bytes, are left out, so the common delivery carries no list.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Took {
+    pub covered: u64,
+    pub pieces: Vec<Placement>,
+    pub number: Option<u64>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
     // Write these bytes of a leaf member of `node`'s namespace.
@@ -327,7 +339,9 @@ pub enum Effect {
     // object it was one of until the owner buries it. What the object
     // keeps of them for no member of its own is the owner's to keep,
     // whoever sent them: a source, or an object above that places them
-    // only now, read back from what it was handed before.
+    // only now, read back from what it was handed before. What it keeps is
+    // what `took` says it placed them as when it took them, whatever a
+    // later delivery of the same step made of its map.
     Reached {
         node: NodeId,
         member: MemberId,
@@ -336,6 +350,7 @@ pub enum Effect {
         offset: u64,
         bytes: Evidenced,
         provenance: Provenance,
+        took: Took,
     },
     // A new member of `node`'s namespace was announced.
     Announced {
@@ -431,6 +446,10 @@ pub enum Effect {
     Retracted {
         node: NodeId,
         member: MemberId,
+        // The member was the run's by the tree's record as it was
+        // retracted: its object has an engine face and did not place it
+        // itself.
+        made: bool,
     },
     // The object at `node` wants a password.
     NeedsPassword {
@@ -1425,14 +1444,24 @@ impl Tree {
     }
 
     // Whether the object at `node` places members itself beside those its
-    // run makes, as a 7z store that codes some folders does: it has an
-    // engine face, and some member of its namespace is not its run's.
+    // run makes, as a 7z store that codes some folders does: some member of
+    // its namespace is its own, by the tree's record. It answers while the
+    // object is out on loan.
     pub fn places_own(&self, node: NodeId) -> bool {
-        let Some(engine) = self.engine(node) else {
-            return false;
-        };
         self.namespace(node)
-            .is_some_and(|namespace| namespace.members().any(|member| !engine.makes(member.id)))
+            .is_some_and(|namespace| namespace.members().any(|member| member.own))
+    }
+
+    // The object's word on whether it places `member` itself, when it is in
+    // its node: an object with an engine face places what its run does not
+    // make, and any other object has no run. `None` for an object out of
+    // its node, which says nothing: only its run speaks then, and a run
+    // announces only members it makes, so the record stands as it is; a
+    // member the object placed itself was marked when the object said it,
+    // and a stale run's word does not unmark it.
+    pub(crate) fn own_word(object: Option<&dyn Object>, member: MemberId) -> Option<bool> {
+        let object = object?;
+        Some(object.engine().is_some_and(|engine| !engine.makes(member)))
     }
 
     // A run of the engine at `node`, from its object's present state. A
@@ -1467,6 +1496,12 @@ impl Tree {
         if let Some(progress) = self.nodes.progress_mut(node) {
             progress.asking = true;
         }
+    }
+
+    // Whether the engine's run at `node` asked for a password that no
+    // offer, nor a run started since, has answered.
+    pub fn run_asking(&self, node: NodeId) -> bool {
+        self.nodes.progress(node).asking
     }
 
     // Every live node, the root first. A node is numbered after the node
@@ -2974,7 +3009,9 @@ impl Tree {
             .get(&member)
             .copied()
             .or_else(|| self.retired(node, member));
+        let mut reached = None;
         if let Some((child, volume)) = owner {
+            reached = Some(effects.len());
             effects.push(Effect::Reached {
                 node,
                 member,
@@ -2983,6 +3020,7 @@ impl Tree {
                 offset,
                 bytes: bytes.clone(),
                 provenance,
+                took: Took::default(),
             });
         }
         // Clean bytes of a member no object owns are in hand for an object
@@ -2997,7 +3035,7 @@ impl Tree {
                     bytes,
                     provenance,
                 };
-                self.deliver_to_object(child, &arrived, length, builder, effects);
+                self.deliver_taking(child, &arrived, length, reached, builder, effects);
             }
             None => {
                 if provenance.arrived() && !provenance.is_damaged() {
@@ -4738,7 +4776,28 @@ impl Tree {
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) {
+        self.deliver_taking(node, arrived, length, None, builder, effects);
+    }
+
+    // As `deliver_to_object`, for a delivery whose `Effect::Reached` is
+    // `effects[reached]`: how the object placed the bytes once it took them
+    // and its words were applied goes on that effect, before a later
+    // delivery of the same step, as a parent handing down several volumes
+    // at once makes, can move its map. The owner keeps what it keeps of
+    // them by that, not by asking the object again when it drains the
+    // effects, so a step of many deliveries places each as a step of one
+    // would: one locate either way.
+    fn deliver_taking(
+        &mut self,
+        node: NodeId,
+        arrived: &Arrived,
+        length: Option<u64>,
+        reached: Option<usize>,
+        builder: &mut dyn Builder,
+        effects: &mut Vec<Effect>,
+    ) {
         if self.nodes.queue_lent_delivery(node, arrived, length) {
+            self.took(node, arrived, reached, effects);
             return;
         }
         self.arrived_over_held_lost(node, arrived);
@@ -4764,6 +4823,34 @@ impl Tree {
         }
         self.apply(node, &mut emits, builder, effects);
         self.emits = emits;
+        self.took(node, arrived, reached, effects);
+    }
+
+    // Set `effects[reached]`'s `took` to how the object at `node` places
+    // the arrived range now.
+    fn took(
+        &mut self,
+        node: NodeId,
+        arrived: &Arrived,
+        reached: Option<usize>,
+        effects: &mut [Effect],
+    ) {
+        let Some(Effect::Reached { took, .. }) = reached.and_then(|at| effects.get_mut(at)) else {
+            return;
+        };
+        let mut pieces = std::mem::take(&mut self.placements);
+        pieces.clear();
+        let range = ByteRange::at(arrived.offset, arrived.bytes.len() as u64);
+        self.locate(node, arrived.volume, range, &mut pieces);
+        took.covered = pieces.iter().map(Placement::len).sum();
+        took.number = self.placement(node);
+        if !pieces
+            .iter()
+            .all(|piece| matches!(piece, Placement::Member { .. }))
+        {
+            took.pieces.clone_from(&pieces);
+        }
+        self.placements = pieces;
     }
 
     // What an object said about bytes it received, turned into namespace
@@ -4814,12 +4901,16 @@ impl Tree {
                     // length said again is the producer's word on it now: a
                     // store whose geometry moved says its member anew.
                     let mut renamed = false;
+                    let own = Self::own_word(self.object(node), member);
                     if let Some(record) = self
                         .namespace_mut(node)
                         .and_then(|namespace| namespace.get_mut(member))
                     {
                         record.length = length.or(record.length);
                         renamed = record.name != name;
+                        if let Some(own) = own {
+                            record.own = own;
+                        }
                     }
                     if renamed {
                         self.rename(node, member, &name, builder, effects);
@@ -5166,6 +5257,14 @@ impl Tree {
     // is dropped with its subtree, and the member is a fresh, undecided
     // member again.
     fn retract(&mut self, node: NodeId, member: MemberId, effects: &mut Vec<Effect>) {
+        // Read before the retraction takes the record back. A retraction
+        // while the object is out on loan is its run's, and its owner knows
+        // the run speaks.
+        let made = self.engine(node).is_some()
+            && self
+                .namespace(node)
+                .and_then(|namespace| namespace.get(member))
+                .is_some_and(|record| !record.own);
         if let Some((child, _)) = self
             .nodes
             .get(&node)
@@ -5200,7 +5299,7 @@ impl Tree {
         if let Some(found) = self.nodes.get_mut(&node) {
             found.close_windows(member);
         }
-        effects.push(Effect::Retracted { node, member });
+        effects.push(Effect::Retracted { node, member, made });
     }
 
     // The object at `node` gives its members up: every volume it owned
@@ -5653,8 +5752,14 @@ impl Tree {
             };
             // What a run makes restarts with the run; what the object
             // places itself replays, and so does what is bound below it.
-            let engine = object.engine();
-            let made = |member: MemberId| engine.is_some_and(|engine| engine.makes(member));
+            let faced = object.engine().is_some();
+            let made = |member: MemberId| {
+                faced
+                    && found
+                        .namespace
+                        .get(member)
+                        .is_some_and(|record| !record.own)
+            };
             pending.extend(self.bound_below_where(node, |member| !made(member)));
             let mut extents = Vec::new();
             for member in found.namespace.members() {
@@ -6326,6 +6431,7 @@ impl Tree {
             .namespace(parent)
             .and_then(|namespace| namespace.get(member))
             .and_then(|member| member.length);
+        let reached = effects.len();
         effects.push(Effect::Reached {
             node: parent,
             member,
@@ -6334,6 +6440,7 @@ impl Tree {
             offset: posted.offset,
             bytes: posted.bytes.clone(),
             provenance: posted.provenance,
+            took: Took::default(),
         });
         let arrived = Arrived {
             volume,
@@ -6341,7 +6448,7 @@ impl Tree {
             bytes: posted.bytes,
             provenance: posted.provenance,
         };
-        self.deliver_to_object(node, &arrived, length, builder, effects);
+        self.deliver_taking(node, &arrived, length, Some(reached), builder, effects);
     }
 
     // Each member the ranges of the nodes' volumes landed in, by the node's
@@ -6582,6 +6689,7 @@ mod tests {
     mod sets;
     mod sidecars;
     mod takes;
+    mod took;
     mod windows;
 
     const SIGNATURE: &[u8] = b"Rar!\x1a\x07\x00";
@@ -7877,7 +7985,8 @@ mod tests {
             &mut effects,
         );
         // The bytes reached the store before it gave its volumes up, so
-        // the owner keeps what it placed of them for its refusal to read.
+        // the owner keeps what it placed of them for its refusal to read:
+        // into its member, as it took them.
         assert_eq!(
             effects,
             vec![
@@ -7889,6 +7998,10 @@ mod tests {
                     offset: 20,
                     bytes: Bytes::from_static(b"REFUSE").into(),
                     provenance: Provenance::Fresh,
+                    took: Took {
+                        covered: 6,
+                        ..Took::default()
+                    },
                 },
                 Effect::Refused {
                     node: NodeId::ROOT,
@@ -8214,7 +8327,8 @@ mod tests {
             effects,
             vec![Effect::Retracted {
                 node: child,
-                member: MemberId(0)
+                member: MemberId(0),
+                made: false,
             }]
         );
         let inner = tree.namespace(child).unwrap().get(MemberId(0)).unwrap();
@@ -8322,6 +8436,10 @@ mod tests {
                     offset: 20,
                     bytes: Bytes::from_static(b"ENGINE").into(),
                     provenance: Provenance::Fresh,
+                    took: Took {
+                        covered: 6,
+                        ..Took::default()
+                    },
                 },
                 Effect::NeedsEngine {
                     node: NodeId::ROOT,

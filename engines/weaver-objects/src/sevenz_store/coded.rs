@@ -15,7 +15,12 @@ use super::map::Map;
 use crate::sevenz_engine::run::{Run, Scope};
 
 // With no map in hand there is no coded folder, and the run decodes nothing.
-pub(super) fn run(map: Option<&Map>, password: Option<String>) -> Box<dyn Extraction> {
+// `proven` when the store proved `password`.
+pub(super) fn run(
+    map: Option<&Map>,
+    password: Option<String>,
+    proven: bool,
+) -> Box<dyn Extraction> {
     let folders: Vec<usize> = map.into_iter().flat_map(Map::coded).collect();
     let members = map
         .into_iter()
@@ -25,5 +30,9 @@ pub(super) fn run(map: Option<&Map>, password: Option<String>) -> Box<dyn Extrac
                 .flat_map(|folder| map.folders[*folder].entries.iter().copied())
         })
         .collect();
-    Box::new(Run::of(password, Scope::Folders { folders, members }))
+    Box::new(Run::of(
+        password,
+        proven,
+        Scope::Folders { folders, members },
+    ))
 }

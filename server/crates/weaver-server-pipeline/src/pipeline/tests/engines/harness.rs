@@ -1257,6 +1257,9 @@ pub struct Outcome {
     pub status: Option<JobStatus>,
     pub failure: Option<String>,
     pub failure_kind: Option<HistoryFailureKind>,
+    // The reason the job's history row keeps: a failed job's error, or why
+    // a partial one is short.
+    pub history_error: Option<String>,
     pub files: BTreeMap<String, Vec<u8>>,
     pub retained_files: BTreeMap<String, Vec<u8>>,
     // Every directory delivered with nothing in it, by its path and a
@@ -1522,6 +1525,11 @@ async fn try_run_then(
         .unwrap()
         .get(&JOB.0)
         .and_then(|state| state.failure_kind);
+    let history_error = pipeline
+        .db
+        .get_job_history(JOB.0)
+        .unwrap()
+        .and_then(|row| row.error_message);
     let mut files = BTreeMap::new();
     collect(&complete_dir, &complete_dir, &mut files);
     let mut retained_files = BTreeMap::new();
@@ -1569,6 +1577,7 @@ async fn try_run_then(
         status,
         failure,
         failure_kind,
+        history_error,
         files,
         retained_files,
         empty,
@@ -2317,6 +2326,8 @@ pub struct Held {
     pub after: Vec<(JobStatus, bool)>,
     pub status: Option<JobStatus>,
     pub files: BTreeMap<String, Vec<u8>>,
+    // The most password candidates each node was offered at any look.
+    pub offered: BTreeMap<weaver_graph::NodeId, usize>,
 }
 
 // Plays the server, holding every article of post `held` as a server holds
@@ -2451,9 +2462,16 @@ pub async fn run_holding_where(
     }
     let mut after = Vec::new();
     let mut stalled = None;
+    let mut offered: BTreeMap<weaver_graph::NodeId, usize> = BTreeMap::new();
     while !finished(&pipeline) {
         if let Some(report) = pipeline.job_report(JOB) {
             after.push((report.status.clone(), report.fetching_repair_data));
+        }
+        if let Some(job) = pipeline.graph_jobs.get(&JOB) {
+            for (node, count) in job.passwords_offered() {
+                let most = offered.entry(node).or_default();
+                *most = (*most).max(count);
+            }
         }
         let before = look(&pipeline);
         settle(&mut pipeline, scenario, &held, &mut out).await;
@@ -2473,6 +2491,7 @@ pub async fn run_holding_where(
         after,
         status,
         files,
+        offered,
     }
 }
 

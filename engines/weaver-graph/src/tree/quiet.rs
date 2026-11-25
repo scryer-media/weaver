@@ -240,22 +240,12 @@ impl Tree {
     }
 }
 
-// The tree's record of one object, read while the object rules.
+// The tree's record of one object, read while the object rules. At quiet
+// an object rules on every member it named, those its run makes among them:
+// a member its run left open is unplaced.
 struct Stood<'a> {
     tree: &'a Tree,
     node: NodeId,
-}
-
-impl Stood<'_> {
-    // Which members the object rules on. An object that places some of its
-    // members itself and runs for the rest rules on its own: those its run
-    // makes stand as the run left them. Every member is an engine's own,
-    // as every member is any other object's.
-    fn own(&self) -> impl Fn(MemberId) -> bool + '_ {
-        let engine = self.tree.engine(self.node);
-        let places_own = self.tree.places_own(self.node);
-        move |member| !places_own || engine.is_none_or(|engine| !engine.makes(member))
-    }
 }
 
 impl Standing for Stood<'_> {
@@ -269,11 +259,9 @@ impl Standing for Stood<'_> {
         let Some(namespace) = tree.namespace(node) else {
             return false;
         };
-        let own = self.own();
         !tree.vouched_above(node)
             && namespace.members().any(|member| {
-                own(member.id)
-                    && tree.child_of(node, member.id).is_none()
+                tree.child_of(node, member.id).is_none()
                     && member.coverage.damaged_ranges().next().is_some()
                     && !tree.nodes.retired().contains_key(&(node, member.id))
                     && !tree.given_back(node, member.id)
@@ -291,15 +279,13 @@ impl Standing for Stood<'_> {
         let Some(namespace) = tree.namespace(node) else {
             return false;
         };
-        let own = self.own();
         namespace.is_empty()
             || namespace.members().any(|member| {
-                own(member.id)
-                    && !(member.closed
-                        || member.is_complete()
-                        || tree
-                            .child_of(node, member.id)
-                            .is_some_and(|(child, _)| tree.recovers(child)))
+                !(member.closed
+                    || member.is_complete()
+                    || tree
+                        .child_of(node, member.id)
+                        .is_some_and(|(child, _)| tree.recovers(child)))
             })
     }
 

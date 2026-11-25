@@ -239,9 +239,16 @@ pub struct SevenZipStore {
     grid: Grid,
     #[serde(skip)]
     candidates: Vec<Candidate>,
+    // The candidate the job offered last, by index: offered again after the
+    // job's cursor went back, it is already among `candidates`.
+    #[serde(skip)]
+    latest: Option<usize>,
     // The candidate that opened the header or the folders.
     #[serde(skip)]
     opened: Option<usize>,
+    // The candidate the coded run last started under, by index.
+    #[serde(skip)]
+    ran: Option<usize>,
     // Whether the header or a proof file proved it. A candidate opened
     // unproven is on trial: a checksum it fails on verified bytes condemns
     // it. Kept: the candidate a restart offers again is the one that proved
@@ -366,7 +373,9 @@ impl SevenZipStore {
             members: Arc::default(),
             grid: Grid::default(),
             candidates: Vec::new(),
+            latest: None,
             opened: None,
+            ran: None,
             proven: false,
             wrong_key: false,
             condemned: BTreeSet::new(),
@@ -771,10 +780,13 @@ fn moved(old: &Map, new: &Map) -> Vec<usize> {
         .collect()
 }
 
-// One folder in both maps: the same pack, plaintext and cipher.
+// One folder in both maps: the same pack, plaintext and cipher, coded or
+// stored alike, and a coded one by the same coders.
 fn same_folder(a: &map::Folder, b: &map::Folder) -> bool {
     a.pack == b.pack
         && a.plain_len == b.plain_len
+        && a.coded == b.coded
+        && a.coders == b.coders
         && match (&a.aes, &b.aes) {
             (None, None) => true,
             (Some(a), Some(b)) => {
@@ -984,11 +996,12 @@ impl Object for SevenZipStore {
         // opens nothing leaves it free to ask for the next one.
         self.install(out);
         self.asked = false;
-        if !self
+        let held = self
             .candidates
             .iter()
-            .any(|candidate| candidate.secret.as_str() == secret)
-        {
+            .position(|candidate| candidate.secret.as_str() == secret);
+        self.latest = Some(held.unwrap_or(self.candidates.len()));
+        if held.is_none() {
             self.candidates.push(Candidate {
                 secret: Zeroizing::new(secret.to_owned()),
                 password: Password::new(secret),
@@ -1087,10 +1100,22 @@ impl Object for SevenZipStore {
 // every place is the store's own and settled.
 impl Engine for SevenZipStore {
     fn start(&mut self) -> Box<dyn Extraction> {
-        coded::run(self.map.as_deref(), self.password())
+        self.ran = self.opened.or(self.latest);
+        // The password is proven only when the candidate that opened the
+        // store and proved itself is the one the run decodes under.
+        let proven = self.proven && self.opened.is_some();
+        coded::run(self.map.as_deref(), self.password(), proven)
     }
 
+    // A proof still to rule on a candidate holds the run: it declares no
+    // window until the proof has proved the candidate or ruled it wrong, so
+    // the run decodes under a candidate the store has ruled on. The ruling
+    // lands as the store is touched (bytes delivered, or a key the pool
+    // derived taken back), which asks the run again.
     fn reserve(&self) -> Option<u64> {
+        if self.proving() {
+            return None;
+        }
         crate::engine::reserve::<SevenZip>(self.window)
     }
 
@@ -1116,8 +1141,8 @@ impl SevenZipStore {
     // or the latest the job offered, which answers what a run asked.
     fn password(&self) -> Option<String> {
         self.opened
+            .or(self.latest)
             .and_then(|index| self.candidates.get(index))
-            .or_else(|| self.candidates.last())
             .map(|candidate| candidate.secret.as_str().to_owned())
     }
 }

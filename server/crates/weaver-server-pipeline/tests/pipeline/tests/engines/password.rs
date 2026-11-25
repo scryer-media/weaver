@@ -10,7 +10,7 @@
 use super::archive_scenario_fixtures::password::{
     MEMBER, SECRET, WRONG, assert_body, assert_whole, body, wrong_then_right,
 };
-use super::harness::{ARTICLE, Outcome, Scenario, run};
+use super::harness::{ARTICLE, Outcome, Scenario, par2_set, run, run_holding};
 use super::rar::{posts, with_par2};
 use super::restart::{Down, run_restarting_at};
 use crate::history::HistoryFailureKind;
@@ -229,4 +229,37 @@ async fn pw_rar4_stored_p_wrong_password_restarted_after_the_second_volume_fails
 async fn pw_rar4_stored_hp_wrong_then_right_delivers() {
     let graph = run(&wrong_then_right(posts(rar4_stored_hp()), SECRET)).await;
     assert_body(&graph, &body());
+}
+
+// 8. RAR4 and RAR5 compressed `-p` under the engine, the right candidate
+// first and a wrong one after, a byte of the enciphered data wrong as
+// posted and the PAR2 volume held until nothing moves: the run reads the
+// damage under the right candidate, and the wrong one fails as well. The
+// repair lands behind what the run read, so the job tries its candidates
+// again from the first, which opens the member.
+#[tokio::test]
+async fn pw_compressed_p_right_first_damaged_then_repaired_delivers() {
+    for name in ["rar4_enc_lz.rar", "rar5_enc_lz.rar"] {
+        let written = fixture(name);
+        let mut posted = posts(written.clone());
+        let at = posted[0].bytes.len() / 2;
+        posted[0].bytes[at] ^= 0x5a;
+        posted.extend(par2_set(
+            "moonlit",
+            &[(written[0].0.as_str(), written[0].1.as_slice())],
+            4,
+        ));
+        let scenario = Scenario::new(posted)
+            .global_password(FIXTURE_SECRET)
+            .global_password(WRONG);
+        let held = run_holding(&scenario, 2).await;
+        assert_eq!(held.status, Some(JobStatus::Complete), "{name}");
+        assert!(
+            held.files
+                .keys()
+                .any(|file| file.ends_with(&format!("/{FIXTURE_MEMBER}"))),
+            "{name}: {:?}",
+            held.files.keys()
+        );
+    }
 }

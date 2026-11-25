@@ -173,6 +173,10 @@ pub struct Delivery {
     pub unrepaired: Vec<String>,
     // Given back withheld, with the reason its object refused it.
     pub withheld: Vec<(String, Why)>,
+    // Archives whose object places some members itself and whose run
+    // refused to make the rest: the archive, how many members it left
+    // unmade, and why. Said beside a partial delivery.
+    pub unmade: Vec<(String, usize, Why)>,
     // Left out of the delivery for an unwanted extension
     // (`remove_unwanted`): no file of it, whole or short.
     pub removed: Vec<String>,
@@ -443,10 +447,9 @@ impl Delivery {
     // password opens it with the marker integrations read a password
     // failure by.
     pub(crate) fn partial_error(&self) -> String {
-        let marker = if self
-            .withheld
-            .iter()
-            .any(|(_, why)| matches!(why, Why::Encrypted | Why::EncryptedHeader))
+        let password = |why: &Why| matches!(why, Why::Encrypted | Why::EncryptedHeader);
+        let marker = if self.withheld.iter().any(|(_, why)| password(why))
+            || self.unmade.iter().any(|(_, _, why)| password(why))
         {
             crate::pipeline::extraction::error::PASSWORD_REQUIRED_MARKER
         } else {
@@ -499,6 +502,13 @@ impl Delivery {
         }
         if more > 0 {
             text.push_str(&format!("; and {more} more"));
+        }
+        // Why an archive's run left members unmade, in the words a failed
+        // job gives for the same reason.
+        for (archive, unmade, why) in &self.unmade {
+            let files = if *unmade == 1 { "file" } else { "files" };
+            let reason = withheld_because(archive, *why, self.password_given);
+            text.push_str(&format!("; {unmade} {files} not made: {archive} {reason}"));
         }
         text
     }
@@ -798,6 +808,7 @@ fn withheld_because(name: &str, why: Why, given: bool) -> String {
         Why::Encrypted | Why::EncryptedHeader => "needs a password and none was given",
         Why::Compressed => "is compressed and no engine reads it",
         Why::Unmapped => "never placed every member it named",
+        Why::Unrepairable => "has damage that could not be repaired",
         Why::Unfound { volume } => {
             let lacks = weaver_objects::engine::volume_name(name, volume)
                 .unwrap_or_else(|| format!("volume {}", u64::from(volume) + 1));

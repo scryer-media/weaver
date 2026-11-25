@@ -292,24 +292,101 @@ fn one_compressed_folder_beside_a_stored_one_is_coded_and_the_stored_one_streams
     assert!(owner.object.engine().is_some());
 }
 
-// A folder that compresses under AES is not coded: the whole set goes to
-// an engine, which has the password, as it did before a set could be mixed.
+// A folder that compresses under AES is coded as a plain compressed one
+// is: the stored member streams with no password asked, and the coded one
+// waits for the store's run, which deciphers it.
 #[test]
-fn a_compressed_folder_under_aes_beside_a_stored_one_sends_the_whole_container_to_an_engine() {
+fn a_compressed_folder_under_aes_beside_a_stored_one_is_coded_and_the_stored_one_streams() {
     let alpha = payload(5, 2_000);
     let beta = payload(6, 2_000);
-    let mut sealed = aes();
-    sealed.truncate(1);
-    sealed.extend(lzma2());
     let bytes = write(
         copy(),
         false,
         &[
             (None, Entry::File("alpha.bin", &alpha)),
-            (Some(sealed), Entry::File("beta.bin", &beta)),
+            (Some(aes_lzma2()), Entry::File("beta.bin", &beta)),
         ],
     );
     let mut owner = Owner::single(store(), bytes);
+    owner.whole(4096);
+    no_trouble(&owner);
+    assert!(!has(&owner, &Emit::NeedsPassword), "the store asks nothing");
+    assert_eq!(owner.member("alpha.bin").bytes, alpha);
+    assert!(owner.member("alpha.bin").closed);
+    assert!(!owner.member("beta.bin").closed);
+    let engine = owner.object.engine().expect("the coded folder runs");
+    assert!(!engine.makes(MemberId(0)));
+    assert!(engine.makes(MemberId(1)));
+}
+
+// A compression chain under AES: AES first, then LZMA2.
+fn aes_lzma2() -> Vec<EncoderConfiguration> {
+    let mut sealed = aes();
+    sealed.truncate(1);
+    sealed.extend(lzma2());
+    sealed
+}
+
+// Beside a folder stored under AES: the store proves the password on the
+// stored member and streams it, and the coded folder waits for the run.
+#[test]
+fn a_compressed_folder_under_aes_beside_an_aes_stored_one_is_coded() {
+    let alpha = payload(5, 2_000);
+    let beta = payload(6, 2_000);
+    let bytes = write(
+        aes(),
+        false,
+        &[
+            (None, Entry::File("alpha.bin", &alpha)),
+            (Some(aes_lzma2()), Entry::File("beta.bin", &beta)),
+        ],
+    );
+    let mut owner = Owner::single(store(), bytes);
+    owner.whole(4096);
+    assert!(has(&owner, &Emit::NeedsPassword));
+    owner.offer(PASSWORD);
+    owner.close(0);
+    no_trouble(&owner);
+    assert_eq!(owner.member("alpha.bin").bytes, alpha);
+    assert!(owner.member("alpha.bin").closed);
+    assert!(!owner.member("beta.bin").closed);
+    let engine = owner.object.engine().expect("the coded folder runs");
+    assert!(!engine.makes(MemberId(0)));
+    assert!(engine.makes(MemberId(1)));
+}
+
+// With the end header enciphered too: the store opens it, streams the
+// stored member and leaves the coded one to its run.
+#[test]
+fn a_compressed_folder_under_aes_under_an_encrypted_header_is_coded() {
+    let alpha = payload(5, 2_000);
+    let beta = payload(6, 2_000);
+    let bytes = write(
+        copy(),
+        true,
+        &[
+            (None, Entry::File("alpha.bin", &alpha)),
+            (Some(aes_lzma2()), Entry::File("beta.bin", &beta)),
+        ],
+    );
+    let mut owner = Owner::single(store(), bytes);
+    owner.whole(4096);
+    assert!(has(&owner, &Emit::NeedsPassword));
+    owner.offer(PASSWORD);
+    owner.close(0);
+    no_trouble(&owner);
+    assert_eq!(owner.member("alpha.bin").bytes, alpha);
+    assert!(owner.member("alpha.bin").closed);
+    assert!(!owner.member("beta.bin").closed);
+    let engine = owner.object.engine().expect("the coded folder runs");
+    assert!(engine.makes(MemberId(1)) && !engine.makes(MemberId(0)));
+}
+
+// Every folder compressed under AES: nothing streams, and the whole set
+// goes to an engine for the password, as before a set could be mixed.
+#[test]
+fn a_set_compressed_under_aes_alone_goes_to_an_engine_for_its_password() {
+    let mut owner = Owner::single(store(), archive(aes_lzma2(), false));
     owner.whole(4096);
     assert!(has(&owner, &Emit::NeedsEngine(Why::Encrypted)));
     assert!(owner.members.is_empty());

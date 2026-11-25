@@ -159,3 +159,42 @@ fn a_store_replays_every_damaged_member_and_an_engine_none() {
     let (tree, root, _) = damaged(Some(vec![true, true]));
     assert!(tree.rejected_inputs(NodeId::ROOT, [root]).is_empty());
 }
+
+// The members the object's run makes, by the tree's record.
+fn run_makes(tree: &Tree, node: NodeId) -> Vec<MemberId> {
+    tree.namespace(node)
+        .expect("the namespace")
+        .members()
+        .filter(|member| !member.own)
+        .map(|member| member.id)
+        .collect()
+}
+
+// The object lent out: the tree's record answers as it did while the object
+// was in its node, and a member its run names meanwhile is the run's.
+#[test]
+fn a_lent_hybrid_places_its_own_and_its_run_makes_the_rest_as_before() {
+    let (mut tree, _, child) = damaged(Some(vec![false, true]));
+    assert!(tree.places_own(child));
+    assert_eq!(run_makes(&tree, child), vec![MemberId(1)]);
+    let _object = tree.lend_for_test(child).expect("lent");
+    assert!(tree.lent(child));
+    assert!(tree.places_own(child), "still a hybrid while out");
+    assert_eq!(run_makes(&tree, child), vec![MemberId(1)]);
+    let mut effects = Vec::new();
+    tree.emitted(
+        child,
+        vec![Emit::Member {
+            member: MemberId(2),
+            name: "late.mkv".into(),
+            length: Some(6),
+        }],
+        &mut Builds(None),
+        &mut effects,
+    );
+    assert_eq!(
+        run_makes(&tree, child),
+        vec![MemberId(1), MemberId(2)],
+        "a member named while out is the run's"
+    );
+}

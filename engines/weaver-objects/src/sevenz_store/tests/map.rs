@@ -6,10 +6,10 @@
 
 use std::io::Cursor;
 
-use sevenz_turbo::{Archive, ArchiveEntry, ArchiveWriter, Password};
+use sevenz_turbo::{Archive, ArchiveEntry, ArchiveWriter, EncoderMethod, Password};
 use weaver_graph::Why;
 
-use super::super::map::build;
+use super::super::map::{build, coded_by};
 use super::{Entry, PASSWORD, aes, archive, copy, files, lzma2, write};
 
 fn parsed(bytes: &[u8]) -> Archive {
@@ -39,6 +39,77 @@ fn aes_over_a_compressor_is_enciphered_bytes_for_an_engine() {
     methods.truncate(1);
     methods.extend(lzma2());
     assert_eq!(refused(&parsed(&archive(methods, false))), Why::Encrypted);
+}
+
+fn aes_over(
+    methods: Vec<sevenz_turbo::EncoderConfiguration>,
+) -> Vec<sevenz_turbo::EncoderConfiguration> {
+    let mut sealed = aes();
+    sealed.truncate(1);
+    sealed.extend(methods);
+    sealed
+}
+
+// Nothing stored, every folder coded: the set goes to an engine for the
+// first coded folder's own reason, as it did before AES could be coded.
+#[test]
+fn a_set_with_nothing_stored_goes_to_an_engine_for_its_first_coded_folders_reason() {
+    let files = files();
+    let two = |first, second| {
+        write(
+            first,
+            false,
+            &[
+                (None, Entry::File(files[0].0, &files[0].1)),
+                (Some(second), Entry::File(files[1].0, &files[1].1)),
+            ],
+        )
+    };
+    assert_eq!(
+        refused(&parsed(&two(lzma2(), aes_over(lzma2())))),
+        Why::Compressed
+    );
+    assert_eq!(
+        refused(&parsed(&two(aes_over(lzma2()), lzma2()))),
+        Why::Encrypted
+    );
+}
+
+// Which folders are coded, by their methods. Without AES, every folder
+// that does not stream is, as before. Under AES, only a chain whose other
+// methods the run decodes, with at least one that is not a copy: AES
+// alone, AES over copies, and AES beside a method the run cannot decode
+// are not, and their set goes to an engine for the password.
+#[test]
+fn a_folder_under_aes_is_coded_only_over_a_chain_the_run_decodes() {
+    let aes = EncoderMethod::ID_AES256_SHA256;
+    let copy = EncoderMethod::ID_COPY;
+    let unknown: &[u8] = &[0x7f, 0x7f];
+    for coded in [
+        vec![EncoderMethod::ID_LZMA2],
+        vec![unknown],
+        vec![EncoderMethod::ID_DEFLATE64],
+        vec![aes, EncoderMethod::ID_LZMA2],
+        vec![aes, EncoderMethod::ID_LZMA],
+        vec![aes, EncoderMethod::ID_BCJ_X86, EncoderMethod::ID_LZMA2],
+        vec![aes, EncoderMethod::ID_DELTA],
+        vec![aes, EncoderMethod::ID_ZSTD],
+        vec![aes, copy, EncoderMethod::ID_PPMD],
+    ] {
+        assert!(coded_by(&coded), "{coded:?}");
+    }
+    for refused in [
+        vec![aes],
+        vec![aes, copy],
+        vec![aes, copy, copy],
+        vec![aes, EncoderMethod::ID_DEFLATE64],
+        vec![aes, EncoderMethod::ID_LZS],
+        vec![aes, EncoderMethod::ID_LIZARD],
+        vec![aes, unknown],
+        vec![aes, EncoderMethod::ID_LZMA2, unknown],
+    ] {
+        assert!(!coded_by(&refused), "{refused:?}");
+    }
 }
 
 #[test]
