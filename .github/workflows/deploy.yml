@@ -2621,10 +2621,12 @@ jobs:
 
   docker-publish:
     name: docker-publish
-    # A test override leaves failed test jobs above this one, and a plain
-    # condition skips a job with any failed job above it. So this runs on
-    # what it needs directly, and every one of those must have succeeded.
-    if: ${{ !cancelled() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') && !contains(needs.*.result, 'skipped') }}
+    # A test override leaves failed or skipped test jobs above this one, and
+    # a plain condition skips a job with any such job above it. So this
+    # names each job it needs, and every one of those must have succeeded.
+    # It names them one by one: with a needs.* test, the 0.17.3 and 0.17.4
+    # tag runs skipped this job though every job it names had succeeded.
+    if: ${{ !cancelled() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') && needs.verify-release-tag.result == 'success' && needs.rust-fmt.result == 'success' && needs.rust-clippy.result == 'success' && needs.rust-audit.result == 'success' && needs.release-tests.result == 'success' && needs.rust-yenc-simd-targets.result == 'success' && needs.rust-package-linux-x86_64-portable.result == 'success' && needs.rust-package-linux-arm64-portable.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     needs:
@@ -2716,10 +2718,12 @@ jobs:
 
   generate-container-provenance:
     name: generate-container-provenance
-    # A test override leaves failed test jobs above this one, and a plain
-    # condition skips a job with any failed job above it. So this runs on
-    # what it needs directly, and every one of those must have succeeded.
-    if: ${{ !cancelled() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') && !contains(needs.*.result, 'skipped') }}
+    # A test override leaves failed or skipped test jobs above this one, and
+    # a plain condition skips a job with any such job above it. So this
+    # names each job it needs, and every one of those must have succeeded.
+    # It names them one by one: with a needs.* test, the 0.17.3 and 0.17.4
+    # tag runs skipped this job though every job it names had succeeded.
+    if: ${{ !cancelled() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') && needs.verify-release-tag.result == 'success' && needs.docker-publish.result == 'success' }}
     needs: [verify-release-tag, docker-publish]
     permissions:
       actions: read
@@ -2738,10 +2742,12 @@ jobs:
 
   verify-container-release:
     name: verify-container-release
-    # A test override leaves failed test jobs above this one, and a plain
-    # condition skips a job with any failed job above it. So this runs on
-    # what it needs directly, and every one of those must have succeeded.
-    if: ${{ !cancelled() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') && !contains(needs.*.result, 'skipped') }}
+    # A test override leaves failed or skipped test jobs above this one, and
+    # a plain condition skips a job with any such job above it. So this
+    # names each job it needs, and every one of those must have succeeded.
+    # It names them one by one: with a needs.* test, the 0.17.3 and 0.17.4
+    # tag runs skipped this job though every job it names had succeeded.
+    if: ${{ !cancelled() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') && needs.verify-release-tag.result == 'success' && needs.docker-publish.result == 'success' && needs.generate-container-provenance.result == 'success' }}
     runs-on: ubuntu-24.04
     needs: [verify-release-tag, docker-publish, generate-container-provenance]
     permissions:
@@ -2791,10 +2797,12 @@ jobs:
 
   github-release:
     name: github-release
-    # A test override leaves failed test jobs above this one, and a plain
-    # condition skips a job with any failed job above it. So this runs on
-    # what it needs directly, and every one of those must have succeeded.
-    if: ${{ !cancelled() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') && !contains(needs.*.result, 'skipped') }}
+    # A test override leaves failed or skipped test jobs above this one, and
+    # a plain condition skips a job with any such job above it. So this
+    # names each job it needs, and every one of those must have succeeded.
+    # It names them one by one: with a needs.* test, the 0.17.3 and 0.17.4
+    # tag runs skipped this job though every job it names had succeeded.
+    if: ${{ !cancelled() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') && needs.verify-release-tag.result == 'success' && needs.rust-fmt.result == 'success' && needs.rust-clippy.result == 'success' && needs.rust-clippy-windows.result == 'success' && needs.rust-audit.result == 'success' && needs.release-tests.result == 'success' && needs.rust-yenc-simd-targets.result == 'success' && needs.rust-package-linux-x86_64-portable.result == 'success' && needs.rust-package-linux-arm64-portable.result == 'success' && needs.rust-package-darwin-x86_64-portable.result == 'success' && needs.rust-package-darwin-arm64-portable.result == 'success' && needs.rust-package-windows-x86_64.result == 'success' && needs.rust-package-windows-arm64.result == 'success' && needs.prepare-release-provenance.result == 'success' && needs.generate-release-provenance.result == 'success' && needs.verify-container-release.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     needs:
@@ -3194,10 +3202,12 @@ jobs:
 
   marketing-site-rebuild:
     name: marketing-site-rebuild
-    # A test override leaves failed test jobs above this one, and a plain
-    # condition skips a job with any failed job above it. So this runs on
-    # what it needs directly, and every one of those must have succeeded.
-    if: ${{ !cancelled() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') && !contains(needs.*.result, 'skipped') }}
+    # A test override leaves failed or skipped test jobs above this one, and
+    # a plain condition skips a job with any such job above it. So this
+    # names each job it needs, and every one of those must have succeeded.
+    # It names them one by one: with a needs.* test, the 0.17.3 and 0.17.4
+    # tag runs skipped this job though every job it names had succeeded.
+    if: ${{ !cancelled() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') && needs.verify-release-tag.result == 'success' && needs.github-release.result == 'success' }}
     needs: [verify-release-tag, github-release]
     runs-on: ubuntu-24.04
     continue-on-error: true
@@ -3218,10 +3228,12 @@ jobs:
 
   winget-published-install:
     name: winget-published-install
-    # A test override leaves failed test jobs above this one, and a plain
-    # condition skips a job with any failed job above it. So this runs on
-    # what it needs directly, and every one of those must have succeeded.
-    if: ${{ !cancelled() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') && !contains(needs.*.result, 'skipped') }}
+    # A test override leaves failed or skipped test jobs above this one, and
+    # a plain condition skips a job with any such job above it. So this
+    # names each job it needs, and every one of those must have succeeded.
+    # It names them one by one: with a needs.* test, the 0.17.3 and 0.17.4
+    # tag runs skipped this job though every job it names had succeeded.
+    if: ${{ !cancelled() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') && needs.verify-release-tag.result == 'success' && needs.github-release.result == 'success' }}
     needs: [verify-release-tag, github-release]
     runs-on: windows-2025-vs2026
     timeout-minutes: 20
@@ -3253,10 +3265,12 @@ jobs:
     # Unlike scryer, weaver's winget-pkgs submission is approved and armed:
     # the org-level WINGET_TOKEN secret authenticates the PR, so this job
     # runs on every release tag rather than being gated behind a variable.
-    # A test override leaves failed test jobs above this one, and a plain
-    # condition skips a job with any failed job above it. So this runs on
-    # what it needs directly, and every one of those must have succeeded.
-    if: ${{ !cancelled() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') && !contains(needs.*.result, 'skipped') }}
+    # A test override leaves failed or skipped test jobs above this one, and
+    # a plain condition skips a job with any such job above it. So this
+    # names each job it needs, and every one of those must have succeeded.
+    # It names them one by one: with a needs.* test, the 0.17.3 and 0.17.4
+    # tag runs skipped this job though every job it names had succeeded.
+    if: ${{ !cancelled() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') && needs.verify-release-tag.result == 'success' && needs.github-release.result == 'success' && needs.winget-published-install.result == 'success' }}
     needs: [verify-release-tag, github-release, winget-published-install]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
