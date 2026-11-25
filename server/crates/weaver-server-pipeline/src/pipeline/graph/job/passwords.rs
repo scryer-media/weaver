@@ -195,10 +195,13 @@ impl GraphJob {
     }
 
     // The object at `node` asked for a password: it gets the next candidate,
-    // and an engine's run starts over under it over the same bytes
-    // (`Shelf::restart`), which counts no repair and so never sends the
-    // cursor back. With none left, the node is left asking. True
-    // when a candidate was offered.
+    // and the node's run, when it has one in any life, starts over under it
+    // over the same bytes (`Shelf::restart`), which counts no repair and so
+    // never sends the cursor back. The run's record decides, not the
+    // object's face: an object out on loan shows none, hears the offer once
+    // it is back, and its run starts over then, as nothing starts while it
+    // is out. With none left, the node is left asking. True when a candidate
+    // was offered.
     pub(super) fn offer_password(&mut self, node: NodeId, effects: &mut Vec<Effect>) -> bool {
         let builder: &mut dyn Builder = &mut *self.builder;
         let Some(secret) = self.passwords.next(node) else {
@@ -206,7 +209,7 @@ impl GraphJob {
         };
         self.tree
             .offer_password(node, secret, &mut self.writer.placing(builder), effects);
-        if self.tree.engine(node).is_some() {
+        if self.runs.has(node) {
             self.writer.shelf(node).restart();
         }
         true

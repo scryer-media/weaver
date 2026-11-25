@@ -45,18 +45,39 @@ type Files = Vec<(&'static str, Vec<u8>)>;
 // folder plain. Every stored size is a whole number of AES blocks, so the
 // coded pack sits right after the first stored member.
 fn archive(coded: Vec<EncoderConfiguration>) -> (Vec<u8>, Files) {
+    let stored: Vec<EncoderConfiguration> = vec![
+        AesEncoderOptions::new(Password::new(SECRET)).into(),
+        EncoderConfiguration::new(EncoderMethod::COPY),
+    ];
+    archive_under(true, stored, coded)
+}
+
+// The header and the stored folders plain, the coded folder under AES over
+// LZMA2: no candidate is tried before the run, which asks for one itself.
+fn asking() -> (Vec<u8>, Files) {
+    let mut coded: Vec<EncoderConfiguration> =
+        vec![AesEncoderOptions::new(Password::new(SECRET)).into()];
+    coded.extend(lzma2());
+    archive_under(
+        false,
+        vec![EncoderConfiguration::new(EncoderMethod::COPY)],
+        coded,
+    )
+}
+
+fn archive_under(
+    header: bool,
+    stored: Vec<EncoderConfiguration>,
+    coded: Vec<EncoderConfiguration>,
+) -> (Vec<u8>, Files) {
     let files: Files = vec![
         ("ember.mkv", payload(5 * FRAME, 41)),
         ("quill.mkv", payload(3 * FRAME - 3, 42)),
         ("cinder.nfo", payload(2 * FRAME + 5, 43)),
         ("lumen.mkv", payload(4 * FRAME, 44)),
     ];
-    let stored: Vec<EncoderConfiguration> = vec![
-        AesEncoderOptions::new(Password::new(SECRET)).into(),
-        EncoderConfiguration::new(EncoderMethod::COPY),
-    ];
     let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
-    writer.set_encrypt_header(true);
+    writer.set_encrypt_header(header);
     writer.set_content_methods(stored.clone());
     writer
         .push_archive_entry(
@@ -100,7 +121,11 @@ struct Rig {
 }
 
 impl Rig {
-    fn new((volume, files): (Vec<u8>, Files)) -> Self {
+    fn new(archive: (Vec<u8>, Files)) -> Self {
+        Self::offering(archive, &[SECRET])
+    }
+
+    fn offering((volume, files): (Vec<u8>, Files), candidates: &[&str]) -> Self {
         let sizes: Vec<u32> = volume
             .chunks(FRAME)
             .map(|chunk| chunk.len() as u32)
@@ -127,7 +152,12 @@ impl Rig {
             runs,
             u32::MAX,
         )
-        .offering(vec![SECRET.to_owned()]);
+        .offering(
+            candidates
+                .iter()
+                .map(|&candidate| candidate.to_owned())
+                .collect(),
+        );
         job.hold_loans();
         Self {
             job,
@@ -382,4 +412,70 @@ async fn a_hybrid_start_that_falls_while_its_store_is_lent_happens_once_after_th
     let (members, generations) = rig.named();
     assert_eq!(members, BTreeSet::from(CODED), "the members runs named");
     assert_eq!(generations.len(), 1, "one start: {generations:?}");
+}
+
+// (iv) The coded folder's run asks for a password while its store is out,
+// each time: the offer is queued for the store, and the run's record, not
+// the store's face, says the run starts over under it, once the store is
+// back. Nothing starts while it is out. Every wrong candidate is asked past
+// so, and the right one, wherever it stands, makes every coded member.
+async fn asked_while_lent_through(candidates: &[&str]) {
+    let mut rig = Rig::offering(asking(), candidates);
+    rig.serve(LIMIT);
+    rig.give_back(LIMIT);
+    let node = rig.run_node();
+    let mut lent = 0;
+    while !rig.job.runs.holding().is_empty() {
+        let store = rig.job.lend_object_for_test(node).expect("the store lends");
+        lent += 1;
+        rig.hear_until_ended(node).await;
+        assert!(rig.job.tree.lent(node), "the store was out throughout");
+        assert!(
+            rig.job.runs.holding().is_empty(),
+            "nothing started while out"
+        );
+        rig.job.take_back_for_test(node, store, LIMIT).unwrap();
+        rig.take();
+        rig.settle();
+    }
+    // The first run has no candidate and asks at once; then one run under
+    // each candidate.
+    assert_eq!(lent, candidates.len() + 1, "one run per candidate");
+    for index in 0..4 {
+        assert!(rig.whole(index), "member {index} whole");
+    }
+    rig.assert_stored_stand(node);
+    for index in CODED {
+        assert_eq!(rig.job.writer.refused(node, MemberId(index)), None);
+    }
+    let (members, generations) = rig.named();
+    assert_eq!(members, BTreeSet::from(CODED), "the members runs named");
+    assert_eq!(generations.len(), lent, "every run spoke: {generations:?}");
+    // A run under a wrong candidate names its first member and retracts it
+    // when the folder fails to decode; only the last, under the right
+    // candidate, gives a member's bytes.
+    let naming: BTreeSet<u64> = rig
+        .spoken
+        .iter()
+        .filter(|(_, message)| message.starts_with("Emit(Bytes"))
+        .map(|(generation, _)| *generation)
+        .collect();
+    assert_eq!(naming.len(), 1, "{naming:?}");
+    assert_eq!(naming.last(), generations.last(), "{naming:?}");
+}
+
+#[tokio::test]
+async fn a_hybrid_run_asking_while_its_store_is_lent_runs_again_under_the_right_candidate() {
+    asked_while_lent_through(&["lumen-wrong-guess", SECRET]).await;
+}
+
+#[tokio::test]
+async fn a_hybrid_run_asking_while_its_store_is_lent_reaches_the_right_candidate_last_of_four() {
+    asked_while_lent_through(&[
+        "lumen-wrong-one",
+        "lumen-wrong-two",
+        "lumen-wrong-three",
+        SECRET,
+    ])
+    .await;
 }
