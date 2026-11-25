@@ -1,0 +1,34 @@
+# Write. Replaces everything saved in a script job: build the input from
+# ScriptJob and change only the agreed fields. Each input goes back as
+# {"name", "value"} (plain), {"name", "secretId"} (linked) or
+# {"name", "secret": true} (sealed, keeps the saved secret). An input left out
+# is removed. schedule left out is kept. Needs the operator's yes.
+# Scope: ADMIN.
+# Variables: {"id": "<script job id>", "input": {"name": "notify",
+#   "script": "notify.py", "trigger": "POST_PROCESSING", "inputs": [],
+#   "categories": [], "enabled": true, "blocking": true,
+#   "timeoutSeconds": null}}
+mutation UpdateScriptJob($id: String!, $input: ScriptInstanceInput!) {
+  updateScriptInstance(id: $id, input: $input) {
+    id
+    name
+    script
+    trigger
+    queueEvent
+    categories
+    enabled
+    blocking
+    timeoutSeconds
+    runOrder
+    scriptProblem
+    inputs {
+      name
+      value
+      sealed
+      secret {
+        id
+        name
+      }
+    }
+  }
+}

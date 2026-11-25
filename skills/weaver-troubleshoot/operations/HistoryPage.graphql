@@ -1,0 +1,33 @@
+# One bounded page of finished jobs, newest first by default, with the
+# success and failure counts of all history in the chosen categories.
+# Scope: READ.
+# Variables: {"input": {"pageIndex": 0, "pageSize": 25, "status": "FAILURE"}}
+# "status" is ALL, SUCCESS or FAILURE (failed, cancelled, Partial). Narrow with
+# "search", "protocol", "completedSinceEpochSec". pageSize at most 500.
+query HistoryPage($input: HistoryPageInput!) {
+  historyPage(input: $input) {
+    totalCount
+    counts {
+      all
+      success
+      failure
+    }
+    items {
+      id
+      protocol
+      name
+      state
+      outcome
+      error
+      failedBytes
+      health
+      failedForMemory
+      category
+      completedAt
+      attention {
+        code
+        message
+      }
+    }
+  }
+}

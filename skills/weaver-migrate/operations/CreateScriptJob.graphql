@@ -1,0 +1,33 @@
+# Write. Wires a script in the scripts directory to one trigger. The header is
+# not checked. queueEvent is required for QUEUE. Empty categories = every
+# category. Send "enabled": false until the test run passes. A secret input is
+# {"name", "secretId"}; never put a secret value in this file by hand.
+# Needs the operator's yes. Scope: ADMIN.
+# Variables: {"input": {"name": "", "script": "notify.py",
+#   "trigger": "POST_PROCESSING", "inputs": [{"name": "Host", "value": "x"},
+#   {"name": "ApiKey", "secretId": "<secret id>"}], "categories": ["tv"],
+#   "enabled": false, "blocking": true, "timeoutSeconds": null}}
+mutation CreateScriptJob($input: ScriptInstanceInput!) {
+  createScriptInstance(input: $input) {
+    id
+    name
+    script
+    trigger
+    queueEvent
+    categories
+    enabled
+    blocking
+    timeoutSeconds
+    runOrder
+    scriptProblem
+    inputs {
+      name
+      value
+      sealed
+      secret {
+        id
+        name
+      }
+    }
+  }
+}

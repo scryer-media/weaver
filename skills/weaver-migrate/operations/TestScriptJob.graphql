@@ -1,0 +1,19 @@
+# Write. EXECUTES the script once on the Weaver host against a made-up
+# download in a scratch folder that is removed afterwards. Saved inputs and
+# secrets are real. Printed commands are reported, never applied. Works on a
+# disabled job; refused while script execution is off. At most 4 at once.
+# Needs a yes that says all of this. Read the result with ScriptTestResult.
+# Scope: ADMIN.
+# Variables: {"id": "<script job id>"}
+mutation TestScriptJob($id: String!) {
+  testScriptInstance(id: $id) {
+    id
+    instanceName
+    script
+    event
+    adapter
+    timeoutSeconds
+    running
+    status
+  }
+}

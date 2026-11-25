@@ -1,0 +1,33 @@
+# One script job, complete enough to rebuild an UpdateScriptJob input.
+# Null when the id does not exist. Scope: ADMIN.
+# Variables: {"id": "<script job id>"}
+query ScriptJob($id: String!) {
+  scriptInstance(id: $id) {
+    id
+    name
+    script
+    trigger
+    queueEvent
+    categories
+    enabled
+    blocking
+    timeoutSeconds
+    runOrder
+    scriptProblem
+    headerDrift
+    schedule {
+      days
+      times
+      runAtStartup
+    }
+    inputs {
+      name
+      value
+      sealed
+      secret {
+        id
+        name
+      }
+    }
+  }
+}

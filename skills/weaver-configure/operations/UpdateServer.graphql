@@ -1,0 +1,26 @@
+# Write. Replaces a news server's settings: build input from ServerSettings
+# and change only what was agreed. Left out: password, maxDownloadSpeed,
+# downloadQuota and the route keep their value; username, tlsCaCert and the
+# adopted certificate are cleared; active, priority, backfill and
+# retentionDays take their defaults. An active server is tested against the
+# provider first. Needs the operator's yes naming the host. Scope: ADMIN.
+# Variables: {"id": 1, "input": {"host": "news.example.com", "port": 563,
+#   "tls": true, "connections": 30, "active": true, "priority": 0,
+#   "backfill": false, "retentionDays": 0, "tlsCaCert": null,
+#   "tlsNameMismatchCertificateDerBase64": null}}
+mutation UpdateServer($id: Int!, $input: ServerInput!) {
+  updateServer(id: $id, input: $input) {
+    id
+    host
+    port
+    tls
+    connections
+    active
+    priority
+    backfill
+    retentionDays
+    maxDownloadSpeed
+    supportsPipelining
+    tlsCipherSuite
+  }
+}
