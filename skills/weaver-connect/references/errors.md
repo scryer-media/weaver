@@ -11,8 +11,8 @@ Shape:
 - `extensions.params`: an object of the values the sentence names, present
   only when it names any.
 - `extensions.matched`: on a batch `CONFLICT`, the count that matches now.
-- Some failures (state, storage, a step that could not start) carry no
-  `extensions` at all. `gql.sh` prints them as `NO_CODE`.
+- A wrong variable type or a missing required variable is refused before any
+  resolver runs: fix the variables file against the operation's comment.
 
 Decide on `code` and its facts only. Quote the message to the operator when
 useful; never parse it.
@@ -62,7 +62,17 @@ useful; never parse it.
 | `extensions.code` | Meaning | Do |
 |---|---|---|
 | `INTERNAL` | Server fault | Report the message. Do not retry in a loop. |
-| `NO_CODE` (no `extensions`) | Server fault without a code | Same. |
+| `STORAGE_FULL` | The disk holding Weaver's database has no room; nothing was written | Report; the operator frees space. No retry. |
+
+## Servers and scripts
+
+| `extensions.code` | Meaning | Do |
+|---|---|---|
+| `SERVER_TEST_FAILED` | A news server test failed, or a save that tests first; nothing saved | Show the message (login, host, port, TLS). |
+| `TLS_NAME_MISMATCH` | The same, and the provider's certificate names another host | Report; trusting it is the operator's call in the web UI. |
+| `STRICT_SECURITY` | `WEAVER_STRICT_SECURITY=1` on the host refuses the setting | Host setting; report and stop. |
+| `SCRIPT_HEADER_INVALID` | A script's header or manifest cannot be read, or declares nothing | Wire the script by hand (`weaver-migrate`). |
+| `SCRIPT_TEST_BUSY` | Four script tests are already running | Ask again when one ends. |
 
 Other codes are refusals with a code of their own (settings, network access,
 routes); their message and `params` say what was refused.
@@ -78,6 +88,14 @@ schema runs answer `{"code": "...", "error": "..."}`:
 | 401 | `AUTHENTICATION_REQUIRED` | No key reached Weaver | Check `WEAVER_API_KEY` is exported. |
 | 403 | `BROWSER_VERIFICATION_REQUIRED` | A browser origin or CSRF check failed | Not sent to a request with a key; check a proxy is not stripping the header. |
 | 413 | `REQUEST_TOO_LARGE` | The request body is over the limit | Send less in one request. |
+
+`GET $WEAVER_URL/api/system/diagnostics` (the bundle) answers the same 401
+and 403 codes, plus:
+
+| HTTP | `code` | Meaning | Do |
+|---|---|---|---|
+| 403 | `FORBIDDEN` | The key is not `ADMIN` | Name the scope; stop. |
+| 500 | `INTERNAL` | The bundle could not be built | Report the `error`. |
 
 Other answers:
 

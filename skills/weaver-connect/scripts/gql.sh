@@ -9,7 +9,7 @@
 # stdout: the full JSON response body, whatever happened.
 # stderr: one line per GraphQL error:
 #         "<code> [<params as JSON>] [matched=N] <message>", where code is
-#         extensions.code, or NO_CODE when the error carries none.
+#         extensions.code (NO_CODE is a fallback for a malformed error).
 # Exit status: 0 success, 1 the response carried errors, 2 transport,
 #              non-JSON response or HTTP-level refusal, 64 usage or
 #              environment problem.

@@ -22,7 +22,10 @@ A field the key's scope does not cover fails with `extensions.code`
 or `admin scope required`. Report that scope to the operator and stop. Do not
 ask for a broader key unless the task needs it.
 
-`GET /api/system/diagnostics` refuses a non-`ADMIN` key with a bare HTTP 403.
+`GET /api/system/diagnostics` refuses a non-`ADMIN` key with HTTP 403, code
+`FORBIDDEN`.
+
+`CallerScope` (`callerScope`) names the key's scope; any key may ask.
 
 ## Secrets by scope
 

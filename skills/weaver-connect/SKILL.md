@@ -60,12 +60,14 @@ Needs: POSIX `sh`, `curl`, `jq` 1.6+.
 S=path/to/skills/weaver-connect
 "$S/scripts/gql.sh" "$S/operations/Version.graphql" > version.json && \
   jq -r '.data.version' version.json
+"$S/scripts/gql.sh" "$S/operations/CallerScope.graphql" > scope.json && \
+  jq -r '.data.callerScope' scope.json
 ```
 
-Success prints the Weaver version. Weaver checks the key before it reads the
-request, so an answer proves the key works. It does not show the key's
-scope: ask the operator which scope they chose. A field outside it fails
-later with `FORBIDDEN`.
+Success prints the Weaver version, then the key's scope (`READ`, `CONTROL`
+or `ADMIN`). Weaver checks the key before it reads the request, so an answer
+proves the key works. A scope below what the task needs: say which one, and
+stop. A field outside the scope fails with `FORBIDDEN`.
 
 ## 5. The runner: scripts/gql.sh
 
@@ -79,7 +81,6 @@ gql.sh <operation-file.graphql> [variables-json-file] > out.json
   environment problem.
 - On errors prints one line per error to stderr:
   `<extensions.code> [<extensions.params as JSON>] [matched=N] <message>`.
-  An error without a code prints `NO_CODE`.
 - Key goes to curl on stdin; never in argv, output or logs.
 - Write variables with `jq -n ... > vars.json`. Do not hand-edit JSON that
   contains secrets.
@@ -138,7 +139,7 @@ Branch on `extensions.code` and its facts (`extensions.params`,
   needs, stop.
 - `INVALID_INPUT`: refused input → fix the input.
 - `NOT_FOUND`: id does not exist → re-read ids.
-- `INTERNAL` or `NO_CODE`: server fault → report the message; do not retry in
+- `INTERNAL`: server fault → report the message; do not retry in
   a loop.
 
 ## 7. Keyless and local access
