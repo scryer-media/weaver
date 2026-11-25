@@ -1,0 +1,72 @@
+name: chart
+
+on:
+  pull_request:
+    paths:
+      - "charts/**"
+      - ".github/workflows/chart.yml"
+
+concurrency:
+  group: weaver-chart-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  chart:
+    name: chart
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Lint
+        run: |
+          set -euo pipefail
+          helm version
+          helm lint --strict charts/weaver
+          for values in charts/weaver/ci/*-values.yaml; do
+            echo "::group::lint $values"
+            helm lint --strict charts/weaver -f "$values"
+            echo "::endgroup::"
+          done
+
+      - name: Template
+        run: |
+          set -euo pipefail
+          helm template weaver charts/weaver --namespace weaver > /dev/null
+          for values in charts/weaver/ci/*-values.yaml; do
+            echo "::group::template $values"
+            helm template weaver charts/weaver --namespace weaver -f "$values"
+            echo "::endgroup::"
+          done
+
+      - name: Create kind cluster
+        run: |
+          set -euo pipefail
+          kind version
+          kind create cluster --name weaver-chart --wait 300s
+          kubectl create namespace weaver
+          kubectl label namespace weaver \
+            pod-security.kubernetes.io/enforce=restricted \
+            pod-security.kubernetes.io/enforce-version=latest
+
+      - name: Install
+        run: |
+          set -euo pipefail
+          helm install weaver charts/weaver --namespace weaver --wait --timeout 5m
+
+      - name: Test
+        run: |
+          set -euo pipefail
+          helm test weaver --namespace weaver --timeout 3m --logs
+
+      - name: Diagnostics
+        if: ${{ failure() }}
+        run: |
+          kubectl --namespace weaver get all,pvc,events || true
+          kubectl --namespace weaver describe pods || true
+          kubectl --namespace weaver logs deploy/weaver --tail=200 || true
