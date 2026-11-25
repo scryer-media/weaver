@@ -498,9 +498,10 @@ pub struct NamespaceWriter {
     given_up: BTreeSet<(NodeId, bool)>,
     // Why the run of each object that places members itself last refused
     // to make the members it makes, until a run of it starts again: what
-    // its container is withheld for (`run_refused`). One reason per such
-    // object of the job, kept as long as the job.
-    run_refusals: BTreeMap<NodeId, Why>,
+    // its container is withheld for (`run_refused`), and how many members
+    // it left unmade. One reason per such object of the job, kept as long
+    // as the job.
+    run_refusals: BTreeMap<NodeId, (Why, usize)>,
     // What a repair or a staging that failed gave back to the disk as it
     // failed, until the job asks: the room it needs to run again.
     gave_back: Option<u64>,
@@ -1236,7 +1237,18 @@ impl NamespaceWriter {
     // refused to make the members it makes, while no run of it started
     // since.
     pub fn run_refused(&self, node: NodeId) -> Option<Why> {
-        self.run_refusals.get(&node).copied()
+        self.run_refusals.get(&node).map(|(why, _)| *why)
+    }
+
+    // Each object whose run refused to make members it makes, while no run
+    // of it started since: its archive's name, how many members it left
+    // unmade, and why. One row per such object of the job.
+    pub fn unmade(&self, tree: &Tree) -> Vec<(String, usize, Why)> {
+        self.run_refusals
+            .iter()
+            .filter(|(_, (_, unmade))| *unmade > 0)
+            .map(|(node, (why, unmade))| (archive_name(tree, *node), *unmade, *why))
+            .collect()
     }
 
     // Whether the file system refused the member's name, so no file of it
@@ -4510,7 +4522,7 @@ impl NamespaceWriter {
         for &member in &open {
             self.refuse(tree, node, member, why, false);
         }
-        self.run_refusals.insert(node, why);
+        self.run_refusals.insert(node, (why, open.len()));
         if !open.is_empty() && why.gives_back() && self.given_up.insert((node, true)) {
             self.given_back.push(GivenBack {
                 member: archive_name(tree, node),

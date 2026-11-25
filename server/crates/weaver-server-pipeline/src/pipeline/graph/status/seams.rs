@@ -505,6 +505,7 @@ pub fn delivery_of(job: &GraphJob, posted: Posted<'_>) -> (Delivery, Option<Fail
         // of the delivery: the final move leaves it out.
         let mut delivery = delivery;
         delivery.password_given = job.has_passwords();
+        delivery.unmade = job.writer().unmade(job.tree());
         if let Some(policy) = job.writer().removes() {
             delivery.remove_unwanted(|name| policy.removes(name));
         }

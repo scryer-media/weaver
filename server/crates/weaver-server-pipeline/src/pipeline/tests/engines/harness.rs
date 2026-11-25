@@ -1219,6 +1219,9 @@ pub struct Outcome {
     pub status: Option<JobStatus>,
     pub failure: Option<String>,
     pub failure_kind: Option<HistoryFailureKind>,
+    // The reason the job's history row keeps: a failed job's error, or why
+    // a partial one is short.
+    pub history_error: Option<String>,
     pub files: BTreeMap<String, Vec<u8>>,
     pub retained_files: BTreeMap<String, Vec<u8>>,
     // Every directory delivered with nothing in it, by its path and a
@@ -1484,6 +1487,11 @@ async fn try_run_then(
         .unwrap()
         .get(&JOB.0)
         .and_then(|state| state.failure_kind);
+    let history_error = pipeline
+        .db
+        .get_job_history(JOB.0)
+        .unwrap()
+        .and_then(|row| row.error_message);
     let mut files = BTreeMap::new();
     collect(&complete_dir, &complete_dir, &mut files);
     let mut retained_files = BTreeMap::new();
@@ -1531,6 +1539,7 @@ async fn try_run_then(
         status,
         failure,
         failure_kind,
+        history_error,
         files,
         retained_files,
         empty,

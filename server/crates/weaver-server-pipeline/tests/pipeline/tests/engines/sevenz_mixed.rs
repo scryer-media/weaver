@@ -2425,3 +2425,63 @@ mod coded_apart {
         }
     }
 }
+
+// A partial job's history says why the coded members are missing, in the
+// words a failed job gives for the same reason; a complete one says nothing.
+mod shortfall_text {
+    use super::*;
+    use crate::history::HistoryFailureKind;
+
+    fn partial(graph: &Outcome, said: &str) {
+        assert_eq!(
+            graph.status,
+            Some(JobStatus::Partial),
+            "{:?}",
+            graph.failure
+        );
+        assert_eq!(graph.history_error.as_deref(), Some(said));
+    }
+
+    #[tokio::test]
+    async fn a_coded_pack_beyond_repair_says_its_files_were_not_made_for_the_damage() {
+        let (graph, _) = coded_pack_lost(MKV).await;
+        partial(
+            &graph,
+            "delivered in part; damaged: lantern.7z; \
+             2 files not made: lantern.7z has damage that could not be repaired",
+        );
+        assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Unpack));
+    }
+
+    #[tokio::test]
+    async fn a_coded_folder_with_no_password_says_its_files_were_not_made_for_the_password() {
+        let (archive, _) = mixed_under(MKV, copy(), under_aes(lzma2()), false);
+        let graph = run(&Scenario::new(vec![Post::plain("lantern.7z", archive)])).await;
+        partial(
+            &graph,
+            "WEAVER_PASSWORD_REQUIRED: delivered in part; withheld: lantern.7z; \
+             2 files not made: lantern.7z needs a password and none was given",
+        );
+        assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Password));
+    }
+
+    #[tokio::test]
+    async fn a_coded_folder_no_decode_pool_holds_says_its_files_were_not_made_for_the_memory() {
+        let (graph, _) = no_decode_pool(MKV).await;
+        partial(
+            &graph,
+            "delivered in part; withheld: lantern.7z; \
+             2 files not made: lantern.7z needs 5.0 MiB of decode memory, 4.0 MiB allowed",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mixed_7z_delivered_whole_says_nothing() {
+        let (archive, files) = mixed(MKV, lzma2());
+        let graph = run(&Scenario::new(vec![Post::plain("lantern.7z", archive)])).await;
+        assert_members(&graph, &files);
+        assert_eq!(graph.status, Some(JobStatus::Complete));
+        assert_eq!(graph.history_error, None);
+        assert!(graph.graph().delivery.unmade.is_empty());
+    }
+}
