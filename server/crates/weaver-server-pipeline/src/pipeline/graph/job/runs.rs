@@ -172,6 +172,7 @@ impl GraphJob {
     ) -> Result<(), GraphError> {
         let _job =
             weaver_server_base::runtime::panic_trap::JobScope::enter(crate::JobId(said.scope));
+        self.grow_made();
         let node = said.node;
         let admitted = match said.heard {
             Heard::Repaired(returned) => {
@@ -689,6 +690,7 @@ impl GraphJob {
         }
         loop {
             let limit = self.run_limit(pipeline_limit);
+            self.grow_made();
             self.invalidate_runs();
             let (engines, gone) = self.touched_engines();
             admitted.extend(self.runs.forget(gone, limit));
@@ -732,6 +734,29 @@ impl GraphJob {
         }
     }
 
+    // A member announced since a run of an object that places members of
+    // its own started, which the run makes, is the run's as much as one it
+    // made from the start: what its record says it makes grows by it, so a
+    // refusal, a restart and a retraction reach it too. Each announce costs
+    // one lookup of the node's run and one insert into its set. One
+    // announced while the object is out on loan is kept until it is back,
+    // which steps the runs before any starts.
+    fn grow_made(&mut self) {
+        let mut kept = Vec::new();
+        for (node, member) in self.writer.take_announced() {
+            if !matches!(self.runs.made(node), Some(Made::Only(_))) {
+                continue;
+            }
+            match self.tree.engine(node) {
+                Some(engine) if engine.makes(member) => self.runs.grow(node, member),
+                Some(_) => {}
+                None if self.tree.lent(node) => kept.push((node, member)),
+                None => {}
+            }
+        }
+        self.writer.keep_announced(kept);
+    }
+
     // An object that retracted, of its own accord, a member its run makes
     // invalidates the run: its shelf starts over, as behind a repair, and
     // the run is retracted and asked again once its node is brought up. A
@@ -765,6 +790,7 @@ impl GraphJob {
         if !self.tree.run_asking(node) {
             return;
         }
+        self.grow_made();
         if let Some(Made::Only(made)) = self.runs.made(node) {
             self.writer
                 .refuse_made(&self.tree, node, made, Why::EncryptedHeader);

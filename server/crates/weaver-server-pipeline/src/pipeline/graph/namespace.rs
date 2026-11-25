@@ -489,6 +489,10 @@ pub struct NamespaceWriter {
     // Members an object retracted of its own accord since the job last
     // asked: one its run makes invalidates that run (`GraphJob::step_runs`).
     retracted: Vec<(NodeId, MemberId)>,
+    // Members objects below the root announced since the job last asked:
+    // one a live run makes joins what its record says it makes
+    // (`GraphJob::grow_made`).
+    announced: Vec<(NodeId, MemberId)>,
     // The files of members retracted in a batch, discarded as they were
     // retracted and read from where they wait to be removed, by what had
     // arrived in each: a request the same say made to have the object's
@@ -677,6 +681,7 @@ impl NamespaceWriter {
             given_back: Vec::new(),
             run_speaking: None,
             retracted: Vec::new(),
+            announced: Vec::new(),
             retracting: Vec::new(),
             batch: (0, 0),
             unkept: Vec::new(),
@@ -1122,6 +1127,17 @@ impl NamespaceWriter {
     // asked, in the order they went.
     pub(crate) fn take_retracted(&mut self) -> Vec<(NodeId, MemberId)> {
         std::mem::take(&mut self.retracted)
+    }
+
+    // Members objects below the root announced since the job last asked.
+    pub(crate) fn take_announced(&mut self) -> Vec<(NodeId, MemberId)> {
+        std::mem::take(&mut self.announced)
+    }
+
+    // Announces the job could not weigh yet, its object out on loan: asked
+    // again with the next.
+    pub(crate) fn keep_announced(&mut self, kept: Vec<(NodeId, MemberId)>) {
+        self.announced.extend(kept);
     }
 
     // The node's run starts over, as behind a repair: the shelf moves on a
@@ -2370,6 +2386,9 @@ impl NamespaceWriter {
                 return self.capture(tree, (*child, *volume), &arrival, took);
             }
             Effect::Announced { node, member } => {
+                if *node != NodeId::ROOT {
+                    self.announced.push((*node, *member));
+                }
                 self.announce(tree, builder, segments, *node, *member, out)?;
             }
             Effect::Closed { node, member } => {

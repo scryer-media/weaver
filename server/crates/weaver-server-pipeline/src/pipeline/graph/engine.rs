@@ -713,6 +713,15 @@ impl Runs {
         }
     }
 
+    // A member announced since the run started, which it makes, joins what
+    // its record says it makes. A run that makes every member already has
+    // it.
+    pub fn grow(&mut self, node: NodeId, member: MemberId) {
+        if let Some(Made::Only(made)) = self.runs.get_mut(&node).and_then(|run| run.made.as_mut()) {
+            made.insert(member);
+        }
+    }
+
     // What the node's run makes, from its start; `None` before one started.
     pub fn made(&self, node: NodeId) -> Option<&Made> {
         self.runs.get(&node)?.made.as_ref()
