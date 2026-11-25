@@ -1032,6 +1032,71 @@ async fn a_rar4_set_whose_made_only_volumes_par2_moves_writes_the_stored_file_af
     );
 }
 
+// A RAR4 set, a stored file, a compressed one and a stored file, with the
+// compressed member's header marked a Unix symlink by its attributes, as
+// `rar` writes a link on a Unix host: RAR4 has no redirection record. The
+// store and the run read "is a link" by one rule, so the store does not
+// make it: the compressed link is the engine's, and the job ends as the
+// engine ends the set read whole, the link passed over as no file and the
+// stored files around it delivered.
+#[tokio::test]
+async fn a_compressed_rar4_unix_symlink_is_no_member_of_the_run() {
+    let linked = |solid: bool| {
+        let mut options = options(Version::Rar4);
+        options.solid = solid;
+        let mut set = mixed(Version::Rar4, Size::Small, MKV, &options);
+        let bytes = &mut set.volumes[0].1;
+        let name = MKV[1].as_bytes();
+        let at = bytes
+            .windows(name.len())
+            .position(|window| window == name)
+            .expect("the compressed member's header");
+        let header = at - 32;
+        assert_eq!(bytes[header + 2], 0x74, "a file header");
+        assert_eq!(bytes[header + 15], 3, "written on a Unix host");
+        assert_ne!(bytes[header + 25], 0x30, "compressed");
+        bytes[header + 28..header + 32].copy_from_slice(&0o120_777u32.to_le_bytes());
+        let size = u16::from_le_bytes([bytes[header + 5], bytes[header + 6]]) as usize;
+        let crc = (par2_rs::checksum::crc32(&bytes[header + 2..header + size]) & 0xffff) as u16;
+        bytes[header..header + 2].copy_from_slice(&crc.to_le_bytes());
+        set
+    };
+    // What a job's end is judged on: its status, what it delivered, and
+    // what its delivery holds back.
+    let end = |graph: &Outcome| {
+        let delivery = &graph.graph().delivery;
+        format!(
+            "{:?} {:?} {:?} {:?} {:?}",
+            graph.status, graph.failure_kind, graph.files, delivery.withheld, delivery.unmade
+        )
+    };
+    let set = linked(false);
+    let graph = run(&Scenario::new(set.posts())).await;
+    assert!(
+        graph.completed(),
+        "{:?} {:?} {:?}",
+        graph.status,
+        graph.failure,
+        graph.files.keys()
+    );
+    assert!(
+        kinds(&graph).contains(&"rar_engine"),
+        "the engine read the set: {:?}",
+        kinds(&graph)
+    );
+    assert_files(
+        "mixed",
+        &graph.files,
+        &[set.files[0].clone(), set.files[2].clone()],
+    );
+    assert!(graph.graph().delivery.withheld.is_empty());
+    assert!(graph.graph().delivery.unmade.is_empty());
+    // The base behaviour: the same set written solid, which the store never
+    // keeps, so the engine reads it whole from the start.
+    let whole = run(&Scenario::new(linked(true).posts())).await;
+    assert_eq!(end(&graph), end(&whole), "as the engine reads it whole");
+}
+
 // A recovery record in every volume is the set's own: the store leaves it,
 // and the compressed member is made as without one.
 #[tokio::test]
