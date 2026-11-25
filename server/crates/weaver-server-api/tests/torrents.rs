@@ -2392,6 +2392,112 @@ async fn the_torrents_list_pages_with_a_default_and_a_most() {
     );
 }
 
+// `torrentPage` walks the list to its end by `nextCursor`, with no gap and
+// no repeat, ends on a null cursor, and each page holds what `torrents`
+// gives for the same arguments.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_torrent_page_walks_the_list_by_its_next_cursor() {
+    let rig = rig().await;
+    rig.torrents
+        .set_settings(TorrentSettings {
+            upload_cap: None,
+            complete_dir: rig._dir.path().join("complete"),
+            categories: vec![CategoryConfig {
+                upload_cap: Default::default(),
+                id: 1,
+                name: "tv".into(),
+                dest_dir: None,
+                aliases: String::new(),
+                seeding: None,
+                torrent_route: false,
+                unpack: None,
+            }]
+            .into(),
+            seeding: None,
+            torrent: TorrentConfig {
+                enabled: true,
+                ..TorrentConfig::default()
+            },
+        })
+        .await;
+    for index in 0..5 {
+        let category = if index % 2 == 0 {
+            "category: \"tv\""
+        } else {
+            ""
+        };
+        let response = rig
+            .execute(&submit(
+                &metainfo(&format!("{index}.bin"), 2000, false),
+                category,
+            ))
+            .await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+    }
+    let every: Vec<u64> = rig.torrents.job_ids().await.iter().map(|id| id.0).collect();
+    assert_eq!(every.len(), 5);
+    let data = |response: Response| -> Value {
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        response.data.into_json().unwrap()
+    };
+
+    for (category, want) in [("", 5), ("category: \"tv\",", 3)] {
+        let mut after = String::new();
+        let mut walked = Vec::new();
+        loop {
+            let arguments = format!("{category} first: 2 {after}");
+            let page = data(
+                rig.execute(&format!(
+                    "{{ torrentPage({arguments}) {{ items {{ id name savePath }} nextCursor }} }}"
+                ))
+                .await,
+            )["torrentPage"]
+                .clone();
+            let list = data(
+                rig.execute(&format!(
+                    "{{ torrents({arguments}) {{ id name savePath }} }}"
+                ))
+                .await,
+            )["torrents"]
+                .clone();
+            assert_eq!(page["items"], list, "{arguments}");
+            let items = page["items"].as_array().unwrap();
+            assert!(!items.is_empty(), "{arguments}");
+            walked.extend(items.iter().map(|item| item["id"].as_u64().unwrap()));
+            match page["nextCursor"].as_str() {
+                Some(cursor) => after = format!("after: \"{cursor}\""),
+                None => break,
+            }
+        }
+        assert_eq!(walked.len(), want, "{category}");
+        let whole = data(
+            rig.execute(&format!("{{ torrents({category} first: 500) {{ id }} }}"))
+                .await,
+        )["torrents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["id"].as_u64().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(walked, whole, "{category}");
+        if category.is_empty() {
+            assert_eq!(walked, every);
+        }
+    }
+
+    // A page that ends exactly at the list's end has no next.
+    let exact = data(
+        rig.execute("{ torrentPage(first: 5) { items { id } nextCursor } }")
+            .await,
+    );
+    assert_eq!(exact["torrentPage"]["items"].as_array().unwrap().len(), 5);
+    assert!(exact["torrentPage"]["nextCursor"].is_null());
+    let invalid = rig
+        .execute("{ torrentPage(after: \"not-a-cursor\") { nextCursor } }")
+        .await;
+    assert_eq!(code(&invalid).as_deref(), Some("CURSOR_INVALID"));
+}
+
 // A follow of a few torrents is given those of them there are, in the
 // list's order; it names one torrent or several, never both, and at most
 // a page of them.

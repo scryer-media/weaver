@@ -4071,6 +4071,12 @@ type QueryRoot {
 	"""
 	torrents(category: String, first: Int, after: String): [Torrent!]!
 	"""
+	`torrents` as a page: the same torrents, order, limits and cursor,
+	with the `after` of the next page, null on the last. One torrent past
+	the page is read to know whether there is a next; nothing is counted.
+	"""
+	torrentPage(category: String, first: Int, after: String): TorrentPage!
+	"""
 	Every tag made, in tag order, with how many jobs carry it.
 	"""
 	jobTags: [JobTag!]!
@@ -6829,6 +6835,17 @@ type TorrentHistory {
 	Now, as the torrent client last published its torrents.
 	"""
 	peers: TorrentPeers!
+}
+
+"""
+One page of `torrentPage`.
+"""
+type TorrentPage {
+	items: [Torrent!]!
+	"""
+	The `after` that asks for the next page; null on the last page.
+	"""
+	nextCursor: String
 }
 
 """

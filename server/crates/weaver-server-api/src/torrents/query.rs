@@ -8,10 +8,10 @@ use weaver_server_core::torrents::service::listing::{CategoryPick, Pick, Shown, 
 use super::mutation::action_error;
 use super::service;
 use super::types::{
-    ScheduleSeedingGql, Torrent, TorrentPeerGql, TorrentRouteGql, TorrentTrackerGql,
+    ScheduleSeedingGql, Torrent, TorrentPage, TorrentPeerGql, TorrentRouteGql, TorrentTrackerGql,
 };
 use crate::auth::{ReadGuard, graphql_error};
-use crate::jobs::types::decode_offset_cursor;
+use crate::jobs::types::{decode_offset_cursor, encode_offset_cursor};
 
 /// The torrents a `torrents` page holds when `first` is not given.
 pub const DEFAULT_TORRENT_PAGE: usize = 100;
@@ -105,36 +105,79 @@ impl TorrentsQuery {
     ) -> Result<Vec<Torrent>> {
         let offset = decode_offset_cursor(after.as_deref())
             .map_err(|message| graphql_error("CURSOR_INVALID", message))?;
-        let limit = first
-            .map_or(DEFAULT_TORRENT_PAGE, |first| first as usize)
-            .min(MAX_TORRENT_PAGE);
-        let field = ctx.look_ahead();
-        let shown = Shown {
-            files: field.field("files").exists(),
-            trackers: field.field("trackers").exists(),
-            tags: field.field("tags").exists(),
-        };
-        let pick = Pick {
-            category: category.as_deref().map(CategoryPick::Named),
-            ..Pick::default()
-        };
-        // The save path is read from the files: without them, from their
-        // totals, which say whether it is one file named as the torrent is.
-        if !shown.files && field.field("savePath").exists() {
-            return Ok(service(ctx)?
-                .picked_rows(pick, page(offset, limit), shown)
-                .await
-                .map_err(super::list_error)?
-                .into_iter()
-                .map(|(view, totals)| Torrent::of(view, totals.one_file))
-                .collect());
-        }
-        Ok(service(ctx)?
-            .picked(pick, page(offset, limit), shown)
+        let limit = page_limit(first);
+        read_page(ctx, ctx.look_ahead(), category, offset, limit).await
+    }
+
+    /// `torrents` as a page: the same torrents, order, limits and cursor,
+    /// with the `after` of the next page, null on the last. One torrent past
+    /// the page is read to know whether there is a next; nothing is counted.
+    #[graphql(guard = "ReadGuard")]
+    async fn torrent_page(
+        &self,
+        ctx: &Context<'_>,
+        category: Option<String>,
+        first: Option<u32>,
+        after: Option<String>,
+    ) -> Result<TorrentPage> {
+        let offset = decode_offset_cursor(after.as_deref())
+            .map_err(|message| graphql_error("CURSOR_INVALID", message))?;
+        let limit = page_limit(first);
+        let mut items = read_page(
+            ctx,
+            ctx.look_ahead().field("items"),
+            category,
+            offset,
+            limit + 1,
+        )
+        .await?;
+        let next_cursor = (items.len() > limit).then(|| encode_offset_cursor(offset + limit));
+        items.truncate(limit);
+        Ok(TorrentPage { items, next_cursor })
+    }
+}
+
+// A page's size: `first`, 100 when not given, at most 500.
+fn page_limit(first: Option<u32>) -> usize {
+    first
+        .map_or(DEFAULT_TORRENT_PAGE, |first| first as usize)
+        .min(MAX_TORRENT_PAGE)
+}
+
+// The `limit` torrents after `offset`, reading only what `field`, the
+// selection of one torrent, shows.
+async fn read_page(
+    ctx: &Context<'_>,
+    field: async_graphql::Lookahead<'_>,
+    category: Option<String>,
+    offset: usize,
+    limit: usize,
+) -> Result<Vec<Torrent>> {
+    let shown = Shown {
+        files: field.field("files").exists(),
+        trackers: field.field("trackers").exists(),
+        tags: field.field("tags").exists(),
+    };
+    let pick = Pick {
+        category: category.as_deref().map(CategoryPick::Named),
+        ..Pick::default()
+    };
+    // The save path is read from the files: without them, from their
+    // totals, which say whether it is one file named as the torrent is.
+    if !shown.files && field.field("savePath").exists() {
+        return Ok(service(ctx)?
+            .picked_rows(pick, page(offset, limit), shown)
             .await
             .map_err(super::list_error)?
             .into_iter()
-            .map(Into::into)
-            .collect())
+            .map(|(view, totals)| Torrent::of(view, totals.one_file))
+            .collect());
     }
+    Ok(service(ctx)?
+        .picked(pick, page(offset, limit), shown)
+        .await
+        .map_err(super::list_error)?
+        .into_iter()
+        .map(Into::into)
+        .collect())
 }
