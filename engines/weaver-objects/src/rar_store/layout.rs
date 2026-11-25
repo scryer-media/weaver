@@ -900,10 +900,15 @@ impl RarStore {
                 self.unmapped.remove(&VolumeIndex(part.volume));
             }
             let at_piece = self.entries[id].pieces.len();
-            self.pieces_in
-                .entry(VolumeIndex(part.volume))
-                .or_default()
-                .push((id, at_piece));
+            // Filed in data order, which a layout laying members in archive
+            // order keeps by appending; one laid again into a slot before
+            // others goes where its data starts.
+            let filed = self.pieces_in.entry(VolumeIndex(part.volume)).or_default();
+            let key = (part.data_offset, id, at_piece);
+            let entries = &self.entries;
+            let place =
+                filed.partition_point(|&(other, at)| super::piece_order(entries, other, at) < key);
+            filed.insert(place, (id, at_piece));
             self.entries[id].pieces.push(Piece {
                 volume: VolumeIndex(part.volume),
                 data: ByteRange::at(part.data_offset, part.data_size),

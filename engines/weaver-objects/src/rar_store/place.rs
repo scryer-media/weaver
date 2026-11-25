@@ -321,7 +321,8 @@ impl RarStore {
         }
         let window = ByteRange::new(from, reach);
         let mut placements = Vec::new();
-        // The members whose bytes went back here, in volume order.
+        // The enciphered members whose bytes went back here, in volume
+        // order: only their records' padding goes back with them.
         let mut given = BTreeSet::new();
         for (range, _, _) in found.kept.runs() {
             let Some(range) = range.intersect(window) else {
@@ -337,10 +338,27 @@ impl RarStore {
                     Placement::Envelope { envelope, range }
                         if *envelope == volume.0 && *range == piece =>
                     {
-                        self.padding_in(volume, piece, &given)
+                        // Kept where it is, but for the padding of an
+                        // enciphered record given back here.
+                        #[cfg(test)]
+                        let old = super::counts::scan();
+                        #[cfg(not(test))]
+                        let old = false;
+                        match given.is_empty() && !old {
+                            true => Vec::new(),
+                            false => self.padding_in(volume, piece, &given),
+                        }
                     }
                     Placement::Member { member, .. } => {
-                        given.insert(member.0 as usize);
+                        // Only an enciphered member's record has padding.
+                        let id = member.0 as usize;
+                        if self
+                            .entries
+                            .get(id)
+                            .is_some_and(|entry| !matches!(entry.lock, Lock::Plain))
+                        {
+                            given.insert(id);
+                        }
                         vec![piece]
                     }
                     _ => vec![piece],
@@ -432,12 +450,56 @@ impl RarStore {
         volume: VolumeIndex,
         range: ByteRange,
     ) -> Vec<(usize, ByteRange, ByteRange)> {
+        #[cfg(test)]
+        if super::counts::scan() {
+            return self.parts_filtered(volume, range);
+        }
+        let filed = self.pieces_in.get(&volume).map_or(&[][..], Vec::as_slice);
+        let piece = |&(id, at): &(usize, usize)| {
+            self.entries.get(id).and_then(|entry| entry.pieces.get(at))
+        };
+        // The volume's data areas do not overlap, so filed by where they
+        // start they also end in order: the first that ends past the start
+        // of the range is the first it can meet.
+        let first = filed.partition_point(|filed| {
+            piece(filed).is_some_and(|piece| piece.data.end <= range.start)
+        });
+        let mut parts = Vec::new();
+        for filed in &filed[first..] {
+            #[cfg(test)]
+            super::counts::bump(|counts| counts.parts_visited += 1);
+            let Some(piece) = piece(filed) else {
+                continue;
+            };
+            if piece.data.start >= range.end {
+                break;
+            }
+            let Some(part) = piece.data.intersect(range) else {
+                continue;
+            };
+            let stream = ByteRange::at(piece.at + (part.start - piece.data.start), part.len());
+            parts.push((filed.0, part, stream));
+        }
+        #[cfg(test)]
+        assert_eq!(parts, self.parts_scanned(volume, range));
+        parts
+    }
+
+    // The parts as found before they were looked up by range: every piece
+    // filed in the volume, filtered, then sorted.
+    #[cfg(test)]
+    fn parts_filtered(
+        &self,
+        volume: VolumeIndex,
+        range: ByteRange,
+    ) -> Vec<(usize, ByteRange, ByteRange)> {
         let mut parts: Vec<(u64, usize, usize, ByteRange, ByteRange)> = self
             .pieces_in
             .get(&volume)
             .into_iter()
             .flatten()
             .filter_map(|&(id, at)| {
+                super::counts::bump(|counts| counts.parts_visited += 1);
                 let piece = self.entries.get(id)?.pieces.get(at)?;
                 let part = piece.data.intersect(range)?;
                 let stream = ByteRange::at(piece.at + (part.start - piece.data.start), part.len());
@@ -445,13 +507,10 @@ impl RarStore {
             })
             .collect();
         parts.sort_unstable_by_key(|&(start, id, at, _, _)| (start, id, at));
-        let parts: Vec<(usize, ByteRange, ByteRange)> = parts
+        parts
             .into_iter()
             .map(|(_, id, _, part, stream)| (id, part, stream))
-            .collect();
-        #[cfg(test)]
-        assert_eq!(parts, self.parts_scanned(volume, range));
-        parts
+            .collect()
     }
 
     // The scan the index stands for: every entry's every piece.

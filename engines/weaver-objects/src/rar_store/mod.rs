@@ -275,12 +275,28 @@ mod counts {
         // made entries whose window was worked out.
         pub(crate) parts_compared: usize,
         pub(crate) windows_filed: usize,
+        // Pieces looked at to find a volume range's parts.
+        pub(crate) parts_visited: usize,
     }
 
     thread_local! {
         static COUNTS: RefCell<Counts> = RefCell::default();
         static OLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         static WHOLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static SCAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    // Whether a volume range's parts are found by a scan of every piece the
+    // volume holds, and an envelope's kept bytes are searched for padding
+    // whether or not an enciphered member went back, as before the pieces
+    // were filed by where their data starts. The store looking the old way
+    // scans too.
+    pub(crate) fn scan() -> bool {
+        SCAN.with(std::cell::Cell::get) || old()
+    }
+
+    pub(crate) fn set_scan(scan: bool) {
+        SCAN.with(|cell| cell.set(scan));
     }
 
     // Whether a layout is handed a volume's whole facts every time, as it
@@ -325,6 +341,16 @@ enum Lock {
     Locked,
     Open(Arc<Cbc>),
     Sealed(Box<Chain>),
+}
+
+// Where a piece is filed among its volume's: by where its data starts, then
+// by entry and piece.
+fn piece_order(entries: &[Entry], id: usize, at: usize) -> (u64, usize, usize) {
+    let start = entries
+        .get(id)
+        .and_then(|entry| entry.pieces.get(at))
+        .map_or(u64::MAX, |piece| piece.data.start);
+    (start, id, at)
 }
 
 // One volume's part of a file: its data area there and where it starts in
@@ -486,7 +512,9 @@ pub struct RarStore {
     open: BTreeSet<VolumeIndex>,
     // Every entry's pieces by the volume they lie in, as (entry, piece),
     // filed where `unmapped` is, so finding a volume's parts scans no other
-    // volume's pieces.
+    // volume's pieces. Each volume's are filed in the order their data
+    // starts, then entry and piece (`piece_order`), so the parts in a range
+    // are found by where it starts.
     pieces_in: BTreeMap<VolumeIndex, Vec<(usize, usize)>>,
     // The entries locked or sealed, filed wherever an entry's lock changes
     // and where `pieces_in` is, so opening files scans no open or plain one.
@@ -733,6 +761,9 @@ impl RarStore {
                     .or_default()
                     .push((id, at));
             }
+        }
+        for pieces in self.pieces_in.values_mut() {
+            pieces.sort_unstable_by_key(|&(id, at)| piece_order(&self.entries, id, at));
         }
         let mapped: BTreeSet<VolumeIndex> = self
             .entries

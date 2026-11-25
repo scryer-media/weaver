@@ -669,3 +669,84 @@ fn looking_only_at_what_changed_says_what_looking_at_everything_said() {
         }
     }
 }
+
+// A volume's parts in a range are found from where the range starts, among
+// its pieces filed in data order: the same parts, said the same way, as the
+// scan of every piece it holds, over a volume of a few thousand stored
+// members, and over enciphered members kept until a repaired header
+// reaches them, each given back with its record's padding.
+// The pieces looked at grow with the parts a range meets, not with the
+// volume's members.
+#[test]
+fn a_volume_range_finds_its_parts_as_a_scan_of_every_piece_does() {
+    let plain = || {
+        let volumes = write(&many_items(2_000, 40, None), &options(None, None));
+        assert_eq!(volumes.len(), 1);
+        let mut owner = Owner::named(store(), volumes);
+        owner.whole(16_384);
+        no_trouble(&owner);
+        assert_eq!(owner.members.len(), 2_000);
+        owner
+    };
+    // RAR4 with enciphered headers, posted with one header damaged and
+    // then repaired: the members after it were kept unplaced, and once the
+    // repaired headers reach them each is given back with its record's
+    // cipher padding.
+    let mut enciphered = Options::new(Version::Rar4);
+    enciphered.password = Some(PASSWORD);
+    enciphered.encrypt_headers = true;
+    let real = write(&many_items(300, 997, None), &enciphered).remove(0);
+    let wrong = write(&many_items(300, 997, Some(150)), &enciphered).remove(0);
+    assert_eq!(real.len(), wrong.len());
+    let first = real.iter().zip(&wrong).position(|(a, b)| a != b).unwrap() as u64;
+    let length = real.len() as u64;
+    let padded = || {
+        let mut owner = Owner::named(store(), vec![real.clone()]);
+        owner.offer(PASSWORD);
+        let whole = ByteRange::new(0, length);
+        owner.deliver_as(0, whole, Provenance::Damaged, Some(&wrong));
+        owner.close(0);
+        let header = ByteRange::new(first.saturating_sub(64), first + 64);
+        owner.deliver_as(0, header, Provenance::Repaired, None);
+        owner.deliver_as(0, whole, Provenance::Repaired, None);
+        owner.close(0);
+        assert_eq!(owner.members.len(), 300);
+        assert!(owner.members.values().all(|got| got.closed));
+        owner
+    };
+    // Keys derived by a first run are cached for every later one, and a
+    // run under cached keys reads its headers sooner: both runs compared
+    // start warm.
+    padded();
+    for (name, scenario) in [("plain", &plain as &dyn Fn() -> Owner), ("padded", &padded)] {
+        counts::set_scan(true);
+        counts::take();
+        let old = scenario().log;
+        let old_counts = counts::take();
+        counts::set_scan(false);
+        let new = scenario().log;
+        let new_counts = counts::take();
+        assert_eq!(old, new, "{name}");
+        if name == "padded" {
+            // A record's padding, short of a cipher block, goes back on its
+            // own after the member's bytes.
+            assert!(
+                new.iter().any(|emit| matches!(
+                    emit,
+                    weaver_graph::Emit::Unkept { range, .. } if range.len() < 16
+                )),
+                "{name}: no padding went back"
+            );
+        }
+        eprintln!(
+            "{name}: pieces visited scanning {}, by range {}",
+            old_counts.parts_visited, new_counts.parts_visited
+        );
+        assert!(
+            new_counts.parts_visited * 20 < old_counts.parts_visited,
+            "{name}: {} against {}",
+            new_counts.parts_visited,
+            old_counts.parts_visited
+        );
+    }
+}
