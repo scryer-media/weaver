@@ -75,7 +75,7 @@ persistence:
   # job is moved by a rename, not a copy.
   downloads:
     # emptyDir, pvc, existingClaim, hostPath or nfs. An emptyDir is lost
-    # with the pod; a pvc is deleted on uninstall; hostPath needs a
+    # with the pod; a pvc is kept on uninstall (see retain); hostPath needs a
     # privileged Pod Security namespace.
     type: emptyDir
     existingClaim: ""
@@ -83,6 +83,8 @@ persistence:
     accessModes:
       - ReadWriteOnce
     size: 100Gi
+    # With type pvc: keep the claim when the release is uninstalled.
+    retain: true
     hostPath: ""
     nfs:
       server: ""

@@ -64,8 +64,8 @@ user 1000. Pod Security `restricted` and `baseline` both refuse hostPath
 volumes, so the namespace must enforce `privileged`; otherwise no pod is
 created. Prefer `existingClaim` with a local PersistentVolume.
 
-A claim made with `type: pvc` belongs to the release and is deleted on
-uninstall, downloads included. Use `existingClaim` to keep them.
+A claim made with `type: pvc` is kept on uninstall, downloads included. Set
+`persistence.downloads.retain: false` to remove it with the release.
 
 The chart sets `WEAVER_INTERMEDIATE_DIR=/downloads/intermediate` and
 `WEAVER_COMPLETE_DIR=/downloads/complete`. These seed a new database only;
@@ -203,6 +203,11 @@ kubectl -n media delete pvc weaver-config
 
 Set `persistence.config.retain: false` to remove it with the release.
 
+A downloads claim made with `type: pvc` is kept the same way, as
+`weaver-downloads`: reinstall onto it with `persistence.downloads.type:
+existingClaim` and `persistence.downloads.existingClaim: weaver-downloads`, or
+delete it. `persistence.downloads.retain: false` removes it with the release.
+
 ## Values
 
 | Value                                      | Default                       | Meaning                                       |
@@ -242,6 +247,7 @@ Set `persistence.config.retain: false` to remove it with the release.
 | `persistence.downloads.storageClass`       | `""`                          | For `pvc`                                     |
 | `persistence.downloads.accessModes`        | `[ReadWriteOnce]`             | For `pvc`                                     |
 | `persistence.downloads.size`               | `100Gi`                       | For `pvc`                                     |
+| `persistence.downloads.retain`             | `true`                        | For `pvc`: keep the claim on uninstall        |
 | `persistence.downloads.hostPath`           | `""`                          | For `hostPath`; must exist                    |
 | `persistence.downloads.nfs.server`         | `""`                          | For `nfs`                                     |
 | `persistence.downloads.nfs.path`           | `""`                          | For `nfs`                                     |

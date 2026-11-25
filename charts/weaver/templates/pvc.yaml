@@ -28,7 +28,11 @@ metadata:
   name: {{ printf "%s-downloads" (include "weaver.fullname" .) }}
   labels:
     {{- include "weaver.labels" . | nindent 4 }}
-  {{- with include "weaver.annotations" (dict "root" .) }}{{ . | nindent 2 }}{{- end }}
+  {{- $keepDownloads := dict }}
+  {{- if $downloads.retain }}
+  {{- $keepDownloads = dict "helm.sh/resource-policy" "keep" }}
+  {{- end }}
+  {{- with include "weaver.annotations" (dict "root" . "extra" $keepDownloads) }}{{ . | nindent 2 }}{{- end }}
 spec:
   accessModes:
     {{- toYaml $downloads.accessModes | nindent 4 }}
