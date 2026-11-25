@@ -843,12 +843,33 @@ async fn assert_repaired_header_places_the_bytes_behind_it(
     graph
 }
 
-// The compressed fixture: the member the repaired header names is
-// compressed, so the store gives `mixed.rar` up to the RAR engine, which
-// reads the bytes back where they went.
+// The compressed fixture: a solid RAR5 set, a stored member, then the one
+// the repaired header names, compressed. A solid set is the engine's, so
+// the store gives `mixed.rar` up to the RAR engine, which reads the bytes
+// back where they went.
+fn solid_mixed() -> Vec<u8> {
+    use weaver_objects::rar_store::writer::{Item, Options, Version, lifted, write};
+    let lz = crate::pipeline::tests::rar5_fixture_bytes("rar5_multifile_lz.rar");
+    let (plain, packed, codec) = lifted(&lz, "zeros_64k.bin");
+    let mut options = Options::new(Version::Rar5);
+    options.solid = true;
+    let items = [
+        Item::File("hello.txt", payload(40, 3)),
+        Item::Packed {
+            name: "zeros_64k.bin",
+            plain,
+            packed,
+            codec,
+        },
+    ];
+    let mut volumes = write(&items, &options);
+    assert_eq!(volumes.len(), 1);
+    volumes.remove(0)
+}
+
 async fn assert_repaired_bytes_read_back_after_refusal(wrap: WrapMembers) {
-    let mixed = crate::pipeline::tests::rar5_fixture_bytes("rar5_multifile_lz.rar");
-    let graph = assert_repaired_header_places_the_bytes_behind_it(mixed, "hello.txt", wrap).await;
+    let graph =
+        assert_repaired_header_places_the_bytes_behind_it(solid_mixed(), "hello.txt", wrap).await;
     assert!(kinds(&graph).contains(&"rar_engine"), "{:?}", kinds(&graph));
 }
 
