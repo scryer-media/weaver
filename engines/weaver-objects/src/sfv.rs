@@ -338,27 +338,107 @@ impl Recovery for Sfv {
     fn verdicts(&self, _member: MemberId, _out: &mut Vec<SliceVerdict>) {}
 
     // The whole members it names, for a note, not asked before this run.
+    // The whole members it names, for a note, and while an entry names no
+    // member, the whole members no entry names and no set that stands
+    // covers, for a name: each once.
     fn evidence(
         &self,
         namespace: &Namespace,
-        _covered: &dyn Fn(MemberId) -> bool,
+        covered: &dyn Fn(MemberId) -> bool,
         out: &mut Vec<MemberId>,
     ) {
         self.with_listing(|listed| {
             if listed.is_empty() {
                 return;
             }
-            out.extend(
-                namespace
-                    .members()
-                    .filter(|member| {
-                        member.is_whole()
-                            && !self.checked.contains_key(&member.id.0)
-                            && listed.contains_key(&sfv_basename(&member.name))
-                    })
-                    .map(|member| member.id),
-            );
+            let mut answered = BTreeSet::new();
+            let mut unnamed = Vec::new();
+            for member in namespace.members() {
+                let key = sfv_basename(&member.name);
+                let named = listed.contains_key(&key);
+                if named {
+                    answered.insert(key);
+                }
+                if !member.is_whole() || self.checked.contains_key(&member.id.0) {
+                    continue;
+                }
+                if named {
+                    out.push(member.id);
+                } else {
+                    unnamed.push(member.id);
+                }
+            }
+            if answered.len() < listed.len() {
+                out.extend(unnamed.into_iter().filter(|member| !covered(*member)));
+            }
         });
+    }
+
+    // An entry no member answers names the one member its CRC32 is the
+    // CRC32 of, when no other entry no member answers states that CRC32
+    // and no other such member has it. A member is such when its CRC32
+    // was asked for under the name it still has, while no entry named it.
+    // The name is the entry's, in the listing's own case. A set that names
+    // the member after renames it again, and the listing never takes it
+    // back: its name is no longer the one it was asked under.
+    fn bind(&mut self, namespace: &mut Namespace, renamed: &mut Vec<MemberId>) {
+        if self.listed.is_none() {
+            self.listed = Some(entries(&self.text));
+        }
+        let Some(listed) = &self.listed else {
+            return;
+        };
+        let answered: BTreeSet<String> = namespace
+            .members()
+            .map(|member| sfv_basename(&member.name))
+            .filter(|key| listed.contains_key(key))
+            .collect();
+        if answered.len() == listed.len() {
+            return;
+        }
+        // Each CRC32 the entries no member answers state: the entry, or
+        // `None` when two of them state it.
+        let mut wanted: BTreeMap<u32, Option<&Entry>> = BTreeMap::new();
+        for (key, entry) in listed {
+            if answered.contains(key) {
+                continue;
+            }
+            wanted
+                .entry(entry.crc32)
+                .and_modify(|one| *one = None)
+                .or_insert(Some(entry));
+        }
+        // Each wanted CRC32 the candidates have: the member, or `None` when
+        // two of them have it.
+        let mut found: BTreeMap<u32, Option<MemberId>> = BTreeMap::new();
+        for (member, checked) in &self.checked {
+            let Some(crc32) = checked.crc32 else {
+                continue;
+            };
+            if !wanted.contains_key(&crc32) {
+                continue;
+            }
+            let member = MemberId(*member);
+            let candidate = namespace.get(member).is_some_and(|record| {
+                record.name == checked.name
+                    && record.length == Some(checked.length)
+                    && !listed.contains_key(&sfv_basename(&record.name))
+            });
+            if candidate {
+                found
+                    .entry(crc32)
+                    .and_modify(|one| *one = None)
+                    .or_insert(Some(member));
+            }
+        }
+        for (crc32, member) in found {
+            let (Some(member), Some(Some(entry))) = (member, wanted.get(&crc32)) else {
+                continue;
+            };
+            if namespace.rename(member, &entry.name).is_some() {
+                renamed.push(member);
+            }
+        }
     }
 
     fn evidenced(&mut self, namespace: &Namespace, member: MemberId, segments: &[Segment]) {

@@ -203,7 +203,8 @@ async fn deliver(pipeline: &mut Pipeline, job_id: JobId) {
 // Every recovery object's ruling, said once, when the root is done and no
 // object will rule again: one line a set for an object that reports its
 // sets, and one from the object's own outcome for an object that reports
-// none (a RAR recovery record, a `.rev` set, an SFV).
+// none (a RAR recovery record, a `.rev` set). A listing stands aside and
+// rules nothing.
 fn log_set_rulings(job_id: JobId, job: &GraphJob) {
     // The words a ruling is logged in, `None` for one not made.
     fn words(outcome: RepairOutcome, read: bool) -> Option<(&'static str, u64, &'static str)> {

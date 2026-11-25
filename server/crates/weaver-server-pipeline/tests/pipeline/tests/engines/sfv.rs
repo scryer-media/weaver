@@ -286,3 +286,115 @@ async fn a_file_a_par2_set_covers_is_noted_as_the_listing_asked_before_the_seal(
     );
     assert_twin(&graph, &run(&posts(false)).await);
 }
+
+// The delivered files by base name.
+fn delivered(files: &std::collections::BTreeMap<String, Vec<u8>>) -> Vec<(String, Vec<u8>)> {
+    let mut named: Vec<_> = files
+        .iter()
+        .map(|(path, bytes)| {
+            let name = path.rsplit('/').next().unwrap_or(path).to_owned();
+            (name, bytes.clone())
+        })
+        .collect();
+    named.sort();
+    named
+}
+
+fn names(files: &std::collections::BTreeMap<String, Vec<u8>>) -> Vec<String> {
+    delivered(files).into_iter().map(|(name, _)| name).collect()
+}
+
+// A file posted under a name that says nothing, and a listing whose entry
+// for it no file answers: `lose` loses the file's last article.
+fn obfuscated(lose: bool) -> Scenario {
+    let lantern = payload(3 * ARTICLE, 40);
+    let beacon = payload(2 * ARTICLE, 41);
+    let scenario = Scenario::new(vec![
+        Post::plain("e93a07c1d25b4f68", lantern.clone()),
+        Post::plain("beacon.mkv", beacon.clone()),
+        listing(
+            "release.sfv",
+            &[("Lantern.MKV", crc(&lantern)), ("beacon.mkv", crc(&beacon))],
+        ),
+    ]);
+    if lose { scenario.lost(0, 2) } else { scenario }
+}
+
+// The listing names the file whose CRC32 its unanswered entry states, in
+// the listing's case, and the job ends as it would have under that name.
+#[tokio::test]
+async fn a_listing_names_the_one_file_with_its_unanswered_crc() {
+    let graph = run(&obfuscated(false)).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert_eq!(
+        names(&graph.files),
+        ["Lantern.MKV", "beacon.mkv", "release.sfv"]
+    );
+    assert_eq!(
+        delivered(&graph.files)[0].1,
+        payload(3 * ARTICLE, 40),
+        "the named file is the posted one"
+    );
+    assert_eq!(notes(&graph), Vec::<String>::new());
+}
+
+// A file that did not arrive whole is not named: its bytes were never
+// checked whole.
+#[tokio::test]
+async fn a_listing_names_no_file_that_arrived_damaged() {
+    let graph = run(&obfuscated(true)).await;
+    let named = names(&graph.files);
+    assert!(
+        !named.iter().any(|name| name == "Lantern.MKV"),
+        "{named:?} {:?}",
+        graph.status
+    );
+}
+
+// Two unanswered entries that state the CRC32 of one file: the listing
+// cannot say which name is its, and gives neither.
+#[tokio::test]
+async fn a_listing_names_no_file_two_of_its_entries_state_the_crc_of() {
+    let lantern = payload(3 * ARTICLE, 42);
+    let graph = run(&Scenario::new(vec![
+        Post::plain("e93a07c1d25b4f68", lantern.clone()),
+        listing(
+            "release.sfv",
+            &[
+                ("lantern.mkv", crc(&lantern)),
+                ("beacon.mkv", crc(&lantern)),
+            ],
+        ),
+    ]))
+    .await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert_eq!(names(&graph.files), ["e93a07c1d25b4f68", "release.sfv"]);
+}
+
+// A file a PAR2 set describes takes the set's name, whatever the listing
+// says of it, and keeps it.
+#[tokio::test]
+async fn a_par2_name_stands_over_the_listings() {
+    let lantern = payload(3 * ARTICLE, 43);
+    let mut posts = vec![Post::plain("e93a07c1d25b4f68", lantern.clone())];
+    posts.extend(par2_set("lantern", &[("lantern.bin", &lantern)], 4));
+    posts.push(listing("release.sfv", &[("other.bin", crc(&lantern))]));
+    let graph = run(&Scenario::new(posts)).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    let named = names(&graph.files);
+    assert!(named.iter().any(|name| name == "lantern.bin"), "{named:?}");
+    assert!(!named.iter().any(|name| name == "other.bin"), "{named:?}");
+}
+
+// A job taken down and restored on the way names the file as the run with
+// no restart does.
+#[tokio::test]
+async fn a_restored_job_names_the_file_as_the_run_without_a_restart() {
+    let whole = run(&obfuscated(false)).await;
+    let restarted = run_restarting(&obfuscated(false)).await;
+    assert_restarted(&restarted, &whole);
+    assert_eq!(
+        names(&restarted.files),
+        ["Lantern.MKV", "beacon.mkv", "release.sfv"]
+    );
+}

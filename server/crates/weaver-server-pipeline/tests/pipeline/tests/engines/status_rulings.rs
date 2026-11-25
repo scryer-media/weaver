@@ -272,6 +272,55 @@ fn pieces_listed(beside: bool, listed: bool) -> Vec<Post> {
     posts
 }
 
+// The same pieces under a listing whose entries state their CRC32s: each
+// unanswered entry names the one piece with its CRC32, and the job ends as
+// the same posts without the listing, under those names.
+#[tokio::test]
+async fn an_sfv_names_the_pieces_whose_crcs_its_unanswered_entries_state() {
+    let first = payload(ARTICLE, 51);
+    let second = payload(2 * ARTICLE + 3, 52);
+    let posts = |listed: bool| {
+        let mut posts = vec![
+            Post::plain(FIRST_PIECE, first.clone()),
+            Post::plain(SECOND_PIECE, second.clone()),
+            Post::plain("feature.mkv", payload(2 * ARTICLE, 53)),
+        ];
+        if listed {
+            posts.push(listing(
+                "silver.horizon.sfv",
+                &[
+                    ("Silver.Horizon.part1.bin", crc(&first)),
+                    ("Silver.Horizon.part2.bin", crc(&second)),
+                ],
+            ));
+        }
+        Scenario::new(posts)
+    };
+    let graph = run(&posts(true)).await;
+    let twin = run(&posts(false)).await;
+    assert_eq!(graph.status, twin.status, "{:?}", graph.failure);
+    assert_eq!(graph.failure_kind, twin.failure_kind);
+    let mut named: Vec<(String, Vec<u8>)> = graph
+        .files
+        .iter()
+        .map(|(path, bytes)| (path.rsplit('/').next().unwrap().to_owned(), bytes.clone()))
+        .collect();
+    named.sort();
+    assert_eq!(
+        named
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "Silver.Horizon.part1.bin",
+            "Silver.Horizon.part2.bin",
+            "feature.mkv",
+            "silver.horizon.sfv",
+        ]
+    );
+    assert!(named[0].1 == first && named[1].1 == second);
+}
+
 // An SFV that names no file vouches for nothing: a piece lost whole beside
 // it shortens the job as it does with no SFV at all. Nothing whole is of a
 // type people open, so the job fails; a whole `.mkv` beside the pieces

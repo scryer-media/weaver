@@ -168,3 +168,84 @@ fn a_file_not_checked_whole_is_not_disputed() {
         assert_eq!(disputed(&job), Vec::<MemberId>::new());
     }
 }
+
+fn renamed(job: &mut Job<Sfv>) -> Vec<MemberId> {
+    let mut renamed = Vec::new();
+    job.object.bind(&mut job.namespace, &mut renamed);
+    renamed
+}
+
+// Each member asked for answered with the source's checksums of `bytes`.
+fn answer(job: &mut Job<Sfv>, members: &[(MemberId, &[u8])]) {
+    for (member, bytes) in members {
+        job.object
+            .evidenced(&job.namespace, *member, &checksums(bytes, 700));
+    }
+}
+
+// A whole member under a name no entry gives, whose CRC32 one entry no
+// member answers states, takes that entry's name in the listing's case.
+// The entry another member answers names nothing again.
+#[test]
+fn an_entry_no_member_answers_names_the_one_member_with_its_crc() {
+    let one = payload(20, 2000);
+    let two = payload(21, 2500);
+    let mut job = job(&sfv_text(&[
+        ("Sub\\Lantern.MKV", crc32(&one)),
+        ("beacon.mkv", crc32(&two)),
+    ]));
+    let hidden = whole(&mut job, "a8f3k2", &one);
+    let beacon = whole(&mut job, "beacon.mkv", &two);
+    assert_eq!(asked(&job), vec![beacon, hidden]);
+    answer(&mut job, &[(hidden, &one), (beacon, &two)]);
+    assert_eq!(renamed(&mut job), vec![hidden]);
+    assert_eq!(job.namespace.get(hidden).unwrap().name, "Lantern.MKV");
+    assert_eq!(renamed(&mut job), Vec::<MemberId>::new());
+    assert_eq!(disputed(&job), Vec::<MemberId>::new());
+}
+
+// Two candidates with one CRC32, or two entries stating it, name nothing.
+#[test]
+fn a_crc_two_candidates_or_two_entries_share_names_nothing() {
+    let one = payload(22, 2000);
+    let mut job = job(&sfv_text(&[("lantern.mkv", crc32(&one))]));
+    let first = whole(&mut job, "a8f3k2", &one);
+    let second = whole(&mut job, "b9g4l3", &one);
+    assert_eq!(asked(&job), vec![first, second]);
+    answer(&mut job, &[(first, &one), (second, &one)]);
+    assert_eq!(renamed(&mut job), Vec::<MemberId>::new());
+
+    let mut job = self::job(&sfv_text(&[
+        ("lantern.mkv", crc32(&one)),
+        ("beacon.mkv", crc32(&one)),
+    ]));
+    let only = whole(&mut job, "a8f3k2", &one);
+    answer(&mut job, &[(only, &one)]);
+    assert_eq!(renamed(&mut job), Vec::<MemberId>::new());
+}
+
+// A member still arriving, one a standing set covers, and one no checksums
+// reach whole are not named; nor is one renamed since it was asked for,
+// as a set that recognises it renames it: its name stands.
+#[test]
+fn a_member_not_whole_covered_unchecked_or_renamed_since_is_not_named() {
+    let one = payload(23, 2000);
+    let mut job = job(&sfv_text(&[("lantern.mkv", crc32(&one))]));
+    let arriving = job.member("a8f3k2", &one);
+    assert_eq!(asked(&job), Vec::<MemberId>::new());
+    job.namespace.get_mut(arriving).unwrap().closed = true;
+    let mut out = Vec::new();
+    job.object
+        .evidence(&job.namespace, &|member| member == arriving, &mut out);
+    assert_eq!(out, Vec::<MemberId>::new());
+
+    job.object.evidenced(&job.namespace, arriving, &[]);
+    assert_eq!(renamed(&mut job), Vec::<MemberId>::new());
+
+    let mut job = self::job(&sfv_text(&[("lantern.mkv", crc32(&one))]));
+    let member = whole(&mut job, "a8f3k2", &one);
+    answer(&mut job, &[(member, &one)]);
+    job.namespace.rename(member, "described.mkv");
+    assert_eq!(renamed(&mut job), Vec::<MemberId>::new());
+    assert_eq!(job.namespace.get(member).unwrap().name, "described.mkv");
+}

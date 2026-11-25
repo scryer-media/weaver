@@ -45,7 +45,9 @@ pub fn listing_text(header: &str, entries: &[(&str, u32)]) -> Vec<u8> {
 
 // What a run delivered and claimed of the post's own files, by base name,
 // leaving out the listings: what a twin without them must match.
-fn posted(graph: &Outcome) -> (Vec<(String, Vec<u8>)>, Vec<(String, Claim)>) {
+type Posted = (Vec<(String, Vec<u8>)>, Vec<(String, Claim)>);
+
+fn posted(graph: &Outcome) -> Posted {
     let base = |path: &str| path.rsplit('/').next().unwrap_or(path).to_owned();
     let listing = |name: &str| name.to_ascii_lowercase().ends_with(".sfv");
     let mut files: Vec<_> = graph
