@@ -2463,7 +2463,6 @@ mod chase {
     // header right, the member is the store's to stream: the run restarts
     // without it, in a new generation, and the member is delivered whole.
     #[tokio::test]
-    #[ignore = "the job's record of what a run makes is fixed at its start"]
     async fn a_repaired_header_turning_a_made_member_stored_mid_run_streams_it() {
         let version = Version::Rar4;
         let (made, plain) = packed(version, Size::Small, "notes.nfo");

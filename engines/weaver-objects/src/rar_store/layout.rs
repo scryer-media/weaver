@@ -735,6 +735,28 @@ impl RarStore {
                     || (entry.made && !self.made_by_run(id, member, format))
             })
             .map_or(self.entries.len(), |at| start + at);
+        // A made entry whose place the layout now gives a member the run
+        // does not make, as a repaired header that says it is stored: its
+        // data the shelf kept for the run is no longer the shelf's, and
+        // comes again to the member streamed in its place. One made again
+        // stays the run's, and its bytes stay where they were.
+        for (id, entry) in self.entries.iter().enumerate().skip(keep) {
+            let streamed = entry.made
+                && members
+                    .get(id)
+                    .is_some_and(|member| !self.made_by_run(id, member, format));
+            if !streamed {
+                continue;
+            }
+            for piece in &entry.pieces {
+                out.push(Emit::Unkept {
+                    volume: piece.volume,
+                    range: piece.data,
+                    envelope: piece.volume.0,
+                    at: piece.data.start,
+                });
+            }
+        }
         for id in (keep..self.entries.len()).rev() {
             out.push(Emit::Retract(MemberId(id as u32)));
         }

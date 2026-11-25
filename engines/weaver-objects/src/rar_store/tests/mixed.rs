@@ -781,6 +781,14 @@ fn repaired_header_of_a_made_member(version: Version, headers: bool, warm: bool)
         assert!(made.makes(MemberId(1)), "{label}");
     }
 
+    // The data the run had of the made member, which stays the run's.
+    let made_data: Vec<weaver_graph::ByteRange> = owner
+        .object
+        .entries
+        .get(1)
+        .map(|entry| entry.pieces.iter().map(|piece| piece.data).collect())
+        .unwrap_or_default();
+
     // The header comes again repaired, and the rest after it.
     let first = real.iter().zip(&wrong).position(|(a, b)| a != b).unwrap() as u64;
     let header = weaver_graph::ByteRange::new(first.saturating_sub(64), first + 64);
@@ -800,6 +808,15 @@ fn repaired_header_of_a_made_member(version: Version, headers: bool, warm: bool)
         owner.said
     );
     assert!(!owner.said.contains(&Emit::Retract(MemberId(0))), "{label}");
+    // Made again, the member's data is not given back.
+    assert!(
+        !owner.said.iter().any(|emit| matches!(
+            emit,
+            Emit::Unkept { range, .. } if made_data.contains(range)
+        )),
+        "{label}: {:?}",
+        owner.said
+    );
     assert!(
         owner
             .object
@@ -811,5 +828,82 @@ fn repaired_header_of_a_made_member(version: Version, headers: bool, warm: bool)
     for (name, bytes) in unrar(std::slice::from_ref(&real), options.password) {
         let got = owner.member(&name);
         assert!(got.closed && got.bytes == bytes, "{label}: {name}");
+    }
+}
+
+// A RAR4 header posted naming a stored member compressed: the store makes
+// it, keeping its data on the shelf for the run. Once the header comes
+// again repaired, saying the member is stored, the store retracts it,
+// gives back the data of each of its pieces, and streams it from those
+// bytes: no byte of its data comes again.
+#[test]
+fn a_repaired_header_turning_a_made_member_stored_gives_back_its_data() {
+    let version = Version::Rar4;
+    let (notes, _) = packed(version, "notes.nfo");
+    let items = vec![
+        Item::File("alpha.mkv", payload(1, 10_000)),
+        notes,
+        Item::File("beta.mkv", payload(2, 5_003)),
+    ];
+    let real = write(&items, &Options::new(version)).remove(0);
+    let length = real.len() as u64;
+    // beta.mkv's header, its method byte set to a compressed one.
+    let mut wrong = real.clone();
+    let name = wrong
+        .windows(8)
+        .rposition(|window| window == b"beta.mkv")
+        .expect("beta.mkv's header");
+    let at = name - 32;
+    assert_eq!(wrong[at + 2], 0x74, "a file header");
+    assert_eq!(wrong[at + 25], 0x30, "stored");
+    wrong[at + 25] = 0x33;
+    let size = u16::from_le_bytes([wrong[at + 5], wrong[at + 6]]) as usize;
+    let crc = (crate::grid::crc32(&wrong[at + 2..at + size]) & 0xffff) as u16;
+    wrong[at..at + 2].copy_from_slice(&crc.to_le_bytes());
+    let header = weaver_graph::ByteRange::new(at as u64, (at + size) as u64);
+    let packed = u32::from_le_bytes(wrong[at + 7..at + 11].try_into().unwrap()) as u64;
+    let data = weaver_graph::ByteRange::at(header.end, packed);
+
+    let mut owner = Owner::named(store(), vec![real.clone()]);
+    owner.deliver(0, weaver_graph::ByteRange::new(0, header.start));
+    owner.deliver_as(
+        0,
+        header,
+        weaver_graph::Provenance::Damaged,
+        Some(&wrong[header.start as usize..header.end as usize]),
+    );
+    owner.deliver(0, weaver_graph::ByteRange::new(header.end, length));
+    owner.close(0);
+    let made = owner.object.engine().expect("a mixed set runs");
+    assert!(made.makes(MemberId(2)), "beta.mkv is made");
+
+    owner.said.clear();
+    owner.deliver_as(0, header, weaver_graph::Provenance::Repaired, None);
+    assert!(
+        owner.said.contains(&Emit::Retract(MemberId(2))),
+        "{:?}",
+        owner.said
+    );
+    assert!(
+        owner.said.contains(&Emit::Unkept {
+            volume: VolumeIndex(0),
+            range: data,
+            envelope: 0,
+            at: data.start,
+        }),
+        "{:?}",
+        owner.said
+    );
+    assert!(
+        !owner
+            .object
+            .engine()
+            .expect("still mixed")
+            .makes(MemberId(2))
+    );
+    assert!(owner.run().is_empty());
+    for (name, bytes) in unrar(std::slice::from_ref(&real), None) {
+        let got = owner.member(&name);
+        assert!(got.closed && got.bytes == bytes, "{name}");
     }
 }
