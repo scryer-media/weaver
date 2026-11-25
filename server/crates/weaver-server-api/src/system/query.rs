@@ -47,16 +47,23 @@ impl SystemQuery {
         let runtime = ctx.data::<crate::context::SystemRuntimeContext>()?;
         let config = ctx.data::<SharedConfig>()?;
         let database = ctx.data::<Database>()?;
-        let storage_inputs = with_timed_config_read(config, "system.query.system_info", |cfg| {
-            configured_storage_inputs(cfg)
-        })
-        .await;
-        // Each folder is answered by the disk owner: a current reading, or a
-        // look of its own, all looked at together.
-        let storage = ctx
-            .data::<weaver_server_core::SharedPipelineState>()?
-            .storage_capacity();
-        let configured_storage = configured_storage(storage.as_deref(), storage_inputs).await;
+        // The folders are read and looked at only when the query asks for
+        // them: a look can wait on a slow disk.
+        let configured_storage = if ctx.look_ahead().field("configuredStorage").exists() {
+            let storage_inputs =
+                with_timed_config_read(config, "system.query.system_info", |cfg| {
+                    configured_storage_inputs(cfg)
+                })
+                .await;
+            // Each folder is answered by the disk owner: a current reading,
+            // or a look of its own, all looked at together.
+            let storage = ctx
+                .data::<weaver_server_core::SharedPipelineState>()?
+                .storage_capacity();
+            configured_storage(storage.as_deref(), storage_inputs).await
+        } else {
+            Vec::new()
+        };
 
         let environment = weaver_server_core::runtime::environment::detect_runtime_environment();
         let profile = runtime
