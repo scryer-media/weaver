@@ -572,7 +572,8 @@ impl JobsMutation {
         let handle = ctx.data::<SchedulerHandle>()?;
         handle
             .reprocess_job_with_options(JobId(id), password, no_memory_limit.unwrap_or(false))
-            .await?;
+            .await
+            .map_err(crate::observability::scheduler_error)?;
         Ok(true)
     }
     /// Re-download a completed or failed job from its persisted NZB under the same job ID.
@@ -586,7 +587,8 @@ impl JobsMutation {
         let handle = ctx.data::<SchedulerHandle>()?;
         handle
             .redownload_job_with_password(JobId(id), password)
-            .await?;
+            .await
+            .map_err(crate::observability::scheduler_error)?;
         Ok(true)
     }
     /// Delete completed/failed/cancelled jobs from history.

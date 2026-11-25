@@ -461,7 +461,14 @@ impl NetworkRuntime {
                         .map(|id| {
                             self.hop(&config, *id, stage.clone(), bottom.clone(), &carriers)
                                 .map(|hop| (*id, hop))
-                                .map_err(|detail| (ProxyFault::Other { detail }, Some(*id)))
+                                .map_err(|error| {
+                                    (
+                                        ProxyFault::Other {
+                                            detail: error.to_string(),
+                                        },
+                                        Some(*id),
+                                    )
+                                })
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     let top: Arc<dyn Dialer> = PoolStage::new(pool, members, self.handle.clone());
@@ -496,7 +503,14 @@ impl NetworkRuntime {
                     Some(id) => self
                         .hop(&config, *id, stage.clone(), bottom.clone(), &carriers)
                         .map(|top| (stage, Some(top)))
-                        .map_err(|detail| (ProxyFault::Other { detail }, Some(*id))),
+                        .map_err(|error| {
+                            (
+                                ProxyFault::Other {
+                                    detail: error.to_string(),
+                                },
+                                Some(*id),
+                            )
+                        }),
                 });
                 let ids: Vec<u32> = carriers.iter().copied().chain(*subject).collect();
                 let (kind, down, names) = torrent_leg(match ids.as_slice() {
@@ -544,7 +558,14 @@ impl NetworkRuntime {
             }
             stage = self
                 .hop(config, *id, stage, bottom.clone(), &carriers[..index])
-                .map_err(|detail| (ProxyFault::Other { detail }, Some(*id)))?;
+                .map_err(|error| {
+                    (
+                        ProxyFault::Other {
+                            detail: error.to_string(),
+                        },
+                        Some(*id),
+                    )
+                })?;
         }
         Ok(stage)
     }

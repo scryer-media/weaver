@@ -1347,7 +1347,7 @@ async fn a_draft_on_a_proxy_name_profile_is_refused_as_its_save_is() {
         .draft_route(Consumer::Rss(1), policy, Duration::from_secs(1))
         .err()
         .unwrap();
-    assert_eq!(refused, NOT_A_ROUTE_PROFILE.to_string());
+    assert_eq!(refused, RouteError::Refused(NOT_A_ROUTE_PROFILE));
     assert!(
         runtime
             .validate_policy(&named_route(LegPath::Direct))

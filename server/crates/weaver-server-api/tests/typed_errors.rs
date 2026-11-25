@@ -124,3 +124,37 @@ async fn a_rerun_of_a_job_without_history_is_a_conflict() {
         "CONFLICT",
     );
 }
+
+#[tokio::test]
+async fn a_setting_the_environment_pins_is_env_pinned() {
+    use weaver_server_core::security::{BindAddressSource, RuntimeSecurityConfig};
+    let mut security = RuntimeSecurityConfig::default();
+    security.bind_address_source = BindAddressSource::Environment;
+    let h = TestHarness::new_with_security(security).await;
+    let resp = h
+        .execute(r#"mutation { setHttpBindAddress(address: "127.0.0.1") }"#)
+        .await;
+    assert_refusal(
+        &resp,
+        "WEAVER_HTTP_BIND_ADDRESS is set in this deployment's environment, \
+         which takes precedence; change it there instead",
+        "ENV_PINNED",
+    );
+}
+
+#[tokio::test]
+async fn an_open_bind_under_strict_security_is_strict_security() {
+    use weaver_server_core::security::RuntimeSecurityConfig;
+    let mut security = RuntimeSecurityConfig::default();
+    security.strict_security = true;
+    let h = TestHarness::new_with_security(security).await;
+    let resp = h
+        .execute(r#"mutation { setHttpBindAddress(address: "0.0.0.0") }"#)
+        .await;
+    assert_refusal(
+        &resp,
+        "WEAVER_STRICT_SECURITY=1 refuses a non-loopback bind address while \
+         login is disabled; enable login first",
+        "STRICT_SECURITY",
+    );
+}

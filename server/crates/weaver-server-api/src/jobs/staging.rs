@@ -446,6 +446,7 @@ pub(crate) fn upload_refusal(error: SubmitNzbError) -> async_graphql::Error {
     let code = match &error {
         SubmitNzbError::Upload(io) if is_upload_too_large(io) => "UPLOAD_TOO_LARGE",
         SubmitNzbError::Save(_) => "INTERNAL",
+        SubmitNzbError::Fetch(_) => "FETCH_FAILED",
         SubmitNzbError::State(state) => crate::observability::state_code(state),
         SubmitNzbError::Scheduler(scheduler) => crate::observability::scheduler_code(scheduler),
         _ => "INVALID_INPUT",
@@ -630,6 +631,10 @@ mod tests {
             (
                 SubmitNzbError::Save(std::io::Error::other("disk gone")),
                 "INTERNAL",
+            ),
+            (
+                SubmitNzbError::Fetch("connection refused".into()),
+                "FETCH_FAILED",
             ),
         ];
         for (error, code) in cases {

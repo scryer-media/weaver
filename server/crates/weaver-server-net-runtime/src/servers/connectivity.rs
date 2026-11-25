@@ -89,7 +89,7 @@ pub async fn probe_unsaved_server(
         SERVER_CONNECT_TIMEOUT,
     ) {
         Ok(route) => probe_server_route(config, &route).await,
-        Err(error) => Err(error),
+        Err(error) => Err(error.to_string()),
     };
     match probed {
         Ok(mut results) => match results.iter().position(|result| result.success) {

@@ -6,7 +6,7 @@ use regex::Regex;
 use weaver_server_core::rss::RssPersistenceQueries;
 use weaver_server_core::rss::RssQueries;
 
-use crate::auth::{AdminGuard, invalid_input, not_found};
+use crate::auth::{AdminGuard, graphql_error, invalid_input, not_found};
 use crate::jobs::types::MetadataInput;
 use crate::observability::{spawn_blocking_with, state_error};
 use crate::rss::RssService;
@@ -377,15 +377,49 @@ fn merge_optional_string(existing: Option<String>, incoming: Option<String>) -> 
     }
 }
 
-// A feed preview or sync that failed, worded as it stands. A feed that is
-// not there is not found; a feed that could not be fetched or read, or
-// routes mid-reload, fit no code yet.
+// A feed preview or sync that failed, worded as it stands: a feed that is
+// not there, one that could not be fetched or read, or routes mid-reload.
 fn rss_service_error(error: crate::rss::RssServiceError) -> async_graphql::Error {
     use crate::rss::RssServiceError;
     match error {
         RssServiceError::FeedNotFound(_) => not_found(error.to_string()),
-        RssServiceError::Parse(_) | RssServiceError::Http(_) | RssServiceError::RoutesChanging => {
-            async_graphql::Error::new(error.to_string())
+        RssServiceError::Parse(_) | RssServiceError::Http(_) => {
+            graphql_error("FEED_UNREADABLE", error.to_string())
+        }
+        RssServiceError::RoutesChanging => graphql_error("CONFLICT", error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rss::RssServiceError;
+
+    // A feed that could not be fetched or read is unreadable, a reload of the
+    // routes is a conflict, and a missing feed is not found. Each keeps its
+    // sentence.
+    #[test]
+    fn each_feed_failure_carries_the_code_of_its_kind() {
+        let cases = [
+            (RssServiceError::FeedNotFound(4), "NOT_FOUND"),
+            (
+                RssServiceError::Parse("no channel".into()),
+                "FEED_UNREADABLE",
+            ),
+            (
+                RssServiceError::Http("status 503".into()),
+                "FEED_UNREADABLE",
+            ),
+            (RssServiceError::RoutesChanging, "CONFLICT"),
+        ];
+        for (error, code) in cases {
+            let message = error.to_string();
+            let refused = rss_service_error(error);
+            assert_eq!(refused.message, message);
+            assert_eq!(
+                refused.extensions.as_ref().and_then(|ext| ext.get("code")),
+                Some(&async_graphql::Value::from(code))
+            );
         }
     }
 }

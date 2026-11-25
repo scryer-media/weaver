@@ -729,7 +729,7 @@ impl SettingsMutation {
             state_error,
         )
         .await?
-        .map_err(async_graphql::Error::new)?;
+        .map_err(tracker_rule_refusal)?;
         tracker_rules_saved(ctx, &routed, &rules).await?;
         Ok(rules.into_iter().map(Into::into).collect())
     }
@@ -863,6 +863,21 @@ impl SettingsMutation {
     }
 }
 
+// A tracker rule not saved, worded as it stands: a locked field or a host
+// another rule covers is a conflict, a name in use is taken, and an id of no
+// rule is not found.
+fn tracker_rule_refusal(
+    refusal: weaver_server_core::settings::repository::TrackerRuleRefusal,
+) -> async_graphql::Error {
+    use weaver_server_core::settings::repository::TrackerRuleRefusal;
+    let code = match &refusal {
+        TrackerRuleRefusal::Locked(_) | TrackerRuleRefusal::Covered { .. } => "CONFLICT",
+        TrackerRuleRefusal::NameTaken(_) => "NAME_TAKEN",
+        TrackerRuleRefusal::NotFound(_) => "NOT_FOUND",
+    };
+    graphql_error(code, refusal.to_string())
+}
+
 // The tracker rules that route their torrents themselves: each is a route
 // consumer of its own (`torrent_route`), by id.
 fn routed_rules(rules: &[weaver_server_core::settings::model::TrackerRule]) -> Vec<u32> {
@@ -946,7 +961,9 @@ fn normalize_watch_folder_update(
         })
         .transpose()?;
     if input.poll_interval_secs == Some(0) {
-        return Err("watch_folder.poll_interval_secs must be greater than 0".into());
+        return Err(invalid_input(
+            "watch_folder.poll_interval_secs must be greater than 0",
+        ));
     }
     Ok(NormalizedWatchFolderSettingsInput {
         mode,
@@ -1017,6 +1034,34 @@ mod tests {
     use crate::observability::{persist_then_update_config, with_timed_config_read};
 
     use super::*;
+
+    // A lock or an overlap is a conflict, a taken name is taken, and an
+    // unknown id is not found. Each keeps its sentence.
+    #[test]
+    fn each_tracker_rule_refusal_carries_the_code_of_its_kind() {
+        use weaver_server_core::settings::repository::TrackerRuleRefusal;
+        let cases = [
+            (TrackerRuleRefusal::Locked("locked".into()), "CONFLICT"),
+            (TrackerRuleRefusal::NameTaken("Linux".into()), "NAME_TAKEN"),
+            (
+                TrackerRuleRefusal::Covered {
+                    pattern: "*.example.org".into(),
+                    by: "Linux".into(),
+                },
+                "CONFLICT",
+            ),
+            (TrackerRuleRefusal::NotFound(7), "NOT_FOUND"),
+        ];
+        for (refusal, code) in cases {
+            let message = refusal.to_string();
+            let refused = tracker_rule_refusal(refusal);
+            assert_eq!(refused.message, message);
+            assert_eq!(
+                refused.extensions.as_ref().and_then(|ext| ext.get("code")),
+                Some(&async_graphql::Value::from(code))
+            );
+        }
+    }
 
     fn test_config() -> SharedConfig {
         Arc::new(RwLock::new(weaver_server_core::settings::Config {

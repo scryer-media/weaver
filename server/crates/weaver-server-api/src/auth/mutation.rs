@@ -108,7 +108,8 @@ impl AuthMutation {
 
         let security = ctx.data::<RuntimeSecurityConfig>()?;
         if matches!(security.bind_address_source, BindAddressSource::Environment) {
-            return Err(async_graphql::Error::new(
+            return Err(graphql_error(
+                "ENV_PINNED",
                 "WEAVER_HTTP_BIND_ADDRESS is set in this deployment's environment, \
                  which takes precedence; change it there instead",
             ));
@@ -133,7 +134,8 @@ impl AuthMutation {
                 .snapshot()
                 .is_some();
             if !login_enabled {
-                return Err(async_graphql::Error::new(
+                return Err(graphql_error(
+                    "STRICT_SECURITY",
                     "WEAVER_STRICT_SECURITY=1 refuses a non-loopback bind address while \
                      login is disabled; enable login first",
                 ));
@@ -182,10 +184,13 @@ impl AuthMutation {
 
         let security = ctx.data::<RuntimeSecurityConfig>()?;
         if security.mcp_enabled_env.is_some() {
-            return Err(async_graphql::Error::new(format!(
-                "{ENV_MCP_ENABLED} is set in this deployment's environment, which takes \
+            return Err(graphql_error(
+                "ENV_PINNED",
+                format!(
+                    "{ENV_MCP_ENABLED} is set in this deployment's environment, which takes \
                  precedence; change it there instead"
-            )));
+                ),
+            ));
         }
         let db = ctx.data::<Database>()?.clone();
         spawn_blocking_with(
@@ -316,7 +321,8 @@ impl AuthMutation {
             ));
         }
         if security.trust_env_pinned {
-            return Err(async_graphql::Error::new(
+            return Err(graphql_error(
+                "ENV_PINNED",
                 "WEAVER_TRUSTED_CIDRS is set in this deployment's environment, which takes \
                  precedence; change it there instead",
             ));
@@ -325,7 +331,8 @@ impl AuthMutation {
             return Err(invalid_input("unknown access mode"));
         };
         if security.strict_security && !matches!(parsed_mode, AccessMode::LoginRequired) {
-            return Err(async_graphql::Error::new(
+            return Err(graphql_error(
+                "STRICT_SECURITY",
                 "WEAVER_STRICT_SECURITY=1 refuses trusting access modes",
             ));
         }
@@ -337,7 +344,8 @@ impl AuthMutation {
             .snapshot()
             .is_some();
         if matches!(parsed_mode, AccessMode::NoLogin) && login_enabled {
-            return Err(async_graphql::Error::new(
+            return Err(graphql_error(
+                "CONFLICT",
                 "disable login before switching to no-login mode",
             ));
         }
@@ -412,7 +420,8 @@ impl AuthMutation {
             .data::<weaver_server_core::security::RuntimeSecurityConfig>()?
             .authenticated_access_mode()
         {
-            return Err(async_graphql::Error::new(
+            return Err(graphql_error(
+                "CONFLICT",
                 "login is already required; use changePassword to change credentials",
             ));
         }
@@ -458,7 +467,8 @@ impl AuthMutation {
             .data::<weaver_server_core::security::RuntimeSecurityConfig>()?
             .authenticated_access_mode()
         {
-            return Err(async_graphql::Error::new(
+            return Err(graphql_error(
+                "CONFLICT",
                 "authenticated browser access cannot be downgraded by disabling login",
             ));
         }

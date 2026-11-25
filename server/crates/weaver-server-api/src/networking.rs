@@ -940,7 +940,10 @@ async fn test_via_torrent(
     ctx.data::<weaver_server_core::torrents::TorrentAvailability>()?
         .may_test()
         .map_err(refusal_error)?;
-    route.legs.first().ok_or("the route has no leg")?;
+    route
+        .legs
+        .first()
+        .ok_or_else(|| crate::auth::invalid_input("the route has no leg"))?;
     // Tests point the test torrent at a loopback source.
     let source = ctx
         .data_opt::<weaver_server_core::speed_test::TestTorrentSource>()
@@ -1877,7 +1880,7 @@ impl NetworkingMutation {
         .into_iter()
         .next()
         .map(Into::into)
-        .ok_or_else(|| "the test tried no path".into())
+        .ok_or_else(|| crate::auth::graphql_error("INTERNAL", "the test tried no path"))
     }
     #[graphql(
         guard = "AdminGuard",
@@ -1897,13 +1900,15 @@ impl NetworkingMutation {
             .await?
             .into_iter()
             .find(|pool| pool.id == id)
-            .ok_or("proxy pool does not exist")?;
+            .ok_or_else(|| crate::auth::not_found("proxy pool does not exist"))?;
         if matches!(
             pool.kind,
             core::ProxyKind::Socks5 | core::ProxyKind::HttpConnect
         ) && (host.is_none() || port.is_none())
         {
-            return Err("host and port are required for a SOCKS5 or HTTP CONNECT pool test".into());
+            return Err(crate::auth::invalid_input(
+                "host and port are required for a SOCKS5 or HTTP CONNECT pool test",
+            ));
         }
         let target = host.zip(port);
         Ok(test_via(

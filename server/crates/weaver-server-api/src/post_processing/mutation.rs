@@ -54,16 +54,15 @@ fn require_script(db: &Database, script: &ScriptName) -> Result<()> {
         .map_err(listing_error)
 }
 
-// A named script that is not there to run. A manifest the script directory
-// holds that does not parse fits no code: it is neither the caller's input
-// nor a fault inside Weaver.
+// A named script that is not there to run, or a manifest the script
+// directory holds that does not parse.
 pub(super) fn listing_error(error: ListingError) -> async_graphql::Error {
     let message = error.to_string();
     match error {
         ListingError::NotFound(_) => not_found(message),
         ListingError::Validation(_) => invalid_input(message),
         ListingError::Io(_) => graphql_error("INTERNAL", message),
-        ListingError::Manifest(_) => async_graphql::Error::new(message),
+        ListingError::Manifest(_) => graphql_error("SCRIPT_HEADER_INVALID", message),
     }
 }
 
@@ -78,28 +77,30 @@ fn instance_error(error: ScriptInstanceError) -> async_graphql::Error {
     }
 }
 
-// A header the script carries that cannot be read, or declares nothing, fits
-// no code: the first arrives as a sentence with its cause already lost.
+// A script that is not in the directory, one whose header cannot be read or
+// declares nothing, or a directory that could not be read.
 fn header_error(error: HeaderSetupError) -> async_graphql::Error {
+    let message = error.to_string();
     match error {
         HeaderSetupError::Instance(error) => instance_error(error),
         HeaderSetupError::Storage(state) => state_error(state),
-        error @ (HeaderSetupError::Script(_) | HeaderSetupError::NothingDeclared) => {
-            async_graphql::Error::new(error.to_string())
-        }
+        HeaderSetupError::Script(ListingError::NotFound(_)) => not_found(message),
+        HeaderSetupError::Script(ListingError::Io(_)) => graphql_error("INTERNAL", message),
+        HeaderSetupError::Script(ListingError::Manifest(_) | ListingError::Validation(_))
+        | HeaderSetupError::NothingDeclared => graphql_error("SCRIPT_HEADER_INVALID", message),
     }
 }
 
-// A test the settings refuse, one whose script is not there, and one past
-// the limit of runs fit no code; a test that could not be set up is a fault.
+// A test the settings refuse is a conflict, one that cannot run here or
+// could not be set up is a fault, and one past the limit of runs is busy.
 fn script_test_error(error: ScriptTestError) -> async_graphql::Error {
     let message = error.to_string();
     match error {
         ScriptTestError::NotFound => not_found(message),
         ScriptTestError::Setup(_) => graphql_error("INTERNAL", message),
-        ScriptTestError::Refused(_) | ScriptTestError::Unavailable(_) | ScriptTestError::Busy => {
-            async_graphql::Error::new(message)
-        }
+        ScriptTestError::Refused(_) => graphql_error("CONFLICT", message),
+        ScriptTestError::Unavailable(_) => graphql_error("INTERNAL", message),
+        ScriptTestError::Busy => graphql_error("SCRIPT_TEST_BUSY", message),
     }
 }
 
@@ -159,7 +160,8 @@ impl PostProcessingMutation {
         // on under strict security should be told immediately, not discover it
         // in a job log later.
         if execution_enabled && strict_security_enabled() {
-            return Err(async_graphql::Error::new(
+            return Err(graphql_error(
+                "STRICT_SECURITY",
                 "WEAVER_STRICT_SECURITY=1 refuses post-processing script execution",
             ));
         }
@@ -650,5 +652,85 @@ impl PostProcessingMutation {
             pass.map_err(scheduler_error)?;
         }
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod code_tests {
+    use super::*;
+    use weaver_server_core::post_processing::manifest::ManifestError;
+
+    fn code_of(error: &async_graphql::Error) -> Option<async_graphql::Value> {
+        error
+            .extensions
+            .as_ref()
+            .and_then(|ext| ext.get("code"))
+            .cloned()
+    }
+
+    fn assert_code(error: async_graphql::Error, message: &str, code: &str) {
+        assert_eq!(error.message, message);
+        assert_eq!(code_of(&error), Some(async_graphql::Value::from(code)));
+    }
+
+    #[test]
+    fn each_listing_failure_carries_the_code_of_its_kind() {
+        let cases = [
+            (ListingError::NotFound("a.sh".into()), "NOT_FOUND"),
+            (
+                ListingError::Manifest(ManifestError::InvalidJson),
+                "SCRIPT_HEADER_INVALID",
+            ),
+            (ListingError::Io(std::io::Error::other("gone")), "INTERNAL"),
+        ];
+        for (error, code) in cases {
+            let message = error.to_string();
+            assert_code(listing_error(error), &message, code);
+        }
+    }
+
+    #[test]
+    fn each_header_failure_carries_the_code_of_its_kind() {
+        let cases = [
+            (
+                HeaderSetupError::Script(ListingError::NotFound("a.sh".into())),
+                "NOT_FOUND",
+            ),
+            (
+                HeaderSetupError::Script(ListingError::Manifest(ManifestError::InvalidShape)),
+                "SCRIPT_HEADER_INVALID",
+            ),
+            (
+                HeaderSetupError::Script(ListingError::Io(std::io::Error::other("gone"))),
+                "INTERNAL",
+            ),
+            (HeaderSetupError::NothingDeclared, "SCRIPT_HEADER_INVALID"),
+            (
+                HeaderSetupError::Instance(ScriptInstanceError::NotFound),
+                "NOT_FOUND",
+            ),
+        ];
+        for (error, code) in cases {
+            let message = error.to_string();
+            assert_code(header_error(error), &message, code);
+        }
+    }
+
+    #[test]
+    fn each_script_test_failure_carries_the_code_of_its_kind() {
+        let cases = [
+            (ScriptTestError::NotFound, "NOT_FOUND"),
+            (ScriptTestError::Setup("no room".into()), "INTERNAL"),
+            (
+                ScriptTestError::Refused("script execution is off"),
+                "CONFLICT",
+            ),
+            (ScriptTestError::Unavailable("no shell".into()), "INTERNAL"),
+            (ScriptTestError::Busy, "SCRIPT_TEST_BUSY"),
+        ];
+        for (error, code) in cases {
+            let message = error.to_string();
+            assert_code(script_test_error(error), &message, code);
+        }
     }
 }
