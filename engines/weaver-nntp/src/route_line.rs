@@ -241,15 +241,19 @@ impl RouteLine {
         }
     }
 
-    // A slot rang: the first lane still waiting goes, or, while one is
-    // dialling, the ring is kept for its dial's end.
+    // A slot rang: the first lane still waiting goes if the route has room,
+    // or, while one is dialling, the ring is kept for its dial's end.
+    //
+    // The route is asked because a ring can be late: the socket it rang for
+    // may already have gone to a lane let go on the route's word, whose dial
+    // has ended. Going on the ring alone would dial the full route again.
     fn rung(&self) {
         let going = {
             let mut line = self.line();
             line.rang |= line.going;
             line.going
         };
-        if !going {
+        if !going && self.dialer.room().is_ok() {
             self.let_one_go();
         }
     }
