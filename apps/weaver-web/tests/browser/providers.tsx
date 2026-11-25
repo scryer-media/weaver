@@ -8,7 +8,10 @@ import { fromValue, mergeMap, pipe, type Source } from "wonka";
 import { TranslateContext } from "@/lib/context/translate-context";
 import en from "@/lib/i18n/locales/en";
 import { nextEn } from "@/next/i18n/en";
-import { SettingsShellProvider, type PanelFlags } from "@/next/pages/settings/framework";
+import {
+  SettingsShellProvider,
+  type PanelFlags,
+} from "@/next/pages/settings/framework";
 import { SearchRegistry } from "@/next/pages/settings/search";
 import { ProvidersPanel } from "@/next/pages/settings/panels/ProvidersPanel";
 import "@/next/fonts.css";
@@ -23,10 +26,30 @@ const count = Number(params.get("servers") ?? "0");
 const partial = params.has("partial");
 
 const servers = Array.from({ length: count }, (_, index) => ({
-  id: index + 1, host: `news${index + 1}.example.test`, port: 563, tls: true, connections: 10, active: true,
-  supportsPipelining: false, priority: 0, backfill: false, retentionDays: 0, maxDownloadSpeed: 0,
-  routing: null, routingStatus: null, tlsCipherSuite: null, tlsNameMismatchCertificateFingerprint: null,
-  downloadQuota: { enabled: false, limitBytes: 0, period: "MONTHLY", resetDay: 1, usedBytes: 0, remainingBytes: 0, blocked: false },
+  id: index + 1,
+  host: `news${index + 1}.example.test`,
+  port: 563,
+  tls: true,
+  connections: 10,
+  active: true,
+  supportsPipelining: false,
+  priority: 0,
+  backfill: false,
+  retentionDays: 0,
+  maxDownloadSpeed: 0,
+  routing: null,
+  routingStatus: null,
+  tlsCipherSuite: null,
+  tlsNameMismatchCertificateFingerprint: null,
+  downloadQuota: {
+    enabled: false,
+    limitBytes: 0,
+    period: "MONTHLY",
+    resetDay: 1,
+    usedBytes: 0,
+    remainingBytes: 0,
+    blocked: false,
+  },
 }));
 
 // Every read of the list, in order.
@@ -34,38 +57,100 @@ const reads: string[] = [];
 const fixture = { reads, refusing: params.has("refuse") };
 Object.assign(window, { providersFixture: fixture });
 
-const refused = () => new CombinedError({
-  graphQLErrors: [{ message: "admin scope required", extensions: { code: "FORBIDDEN" } }],
-});
+const refused = () =>
+  new CombinedError({
+    graphQLErrors: [
+      { message: "admin scope required", extensions: { code: "FORBIDDEN" } },
+    ],
+  });
 
-const client = new Client({ url: "http://fixture.invalid/graphql", exchanges: [() => (operations) => pipe(operations, mergeMap((operation): Source<OperationResult> => {
-  const definition = operation.query.definitions.find((entry) => entry.kind === "OperationDefinition");
-  const name = definition?.kind === "OperationDefinition" ? definition.name?.value ?? "" : "";
-  if (name !== "Servers") {
-    return fromValue({ operation, data: {}, stale: false, hasNext: false });
-  }
-  reads.push(name);
-  if (partial) {
-    return fromValue({ operation, data: { servers }, error: refused(), stale: false, hasNext: false });
-  }
-  if (fixture.refusing) {
-    return fromValue({ operation, data: undefined, error: refused(), stale: false, hasNext: false });
-  }
-  return fromValue({ operation, data: { servers }, stale: false, hasNext: false });
-}))] });
+const client = new Client({
+  url: "http://fixture.invalid/graphql",
+  exchanges: [
+    () => (operations) =>
+      pipe(
+        operations,
+        mergeMap((operation): Source<OperationResult> => {
+          const definition = operation.query.definitions.find(
+            (entry) => entry.kind === "OperationDefinition",
+          );
+          const name =
+            definition?.kind === "OperationDefinition"
+              ? (definition.name?.value ?? "")
+              : "";
+          if (name !== "Servers") {
+            return fromValue({
+              operation,
+              data: {},
+              stale: false,
+              hasNext: false,
+            });
+          }
+          reads.push(name);
+          if (partial) {
+            return fromValue({
+              operation,
+              data: { servers },
+              error: refused(),
+              stale: false,
+              hasNext: false,
+            });
+          }
+          if (fixture.refusing) {
+            return fromValue({
+              operation,
+              data: undefined,
+              error: refused(),
+              stale: false,
+              hasNext: false,
+            });
+          }
+          return fromValue({
+            operation,
+            data: { servers },
+            stale: false,
+            hasNext: false,
+          });
+        }),
+      ),
+  ],
+});
 
 const dictionary = { ...en, ...nextEn } as Record<string, string>;
 const status = document.getElementById("status")!;
 const shell = {
-  search: "", actionsRef: { current: null }, controlsHost: document.getElementById("controls"), registry: new SearchRegistry(),
+  search: "",
+  actionsRef: { current: null },
+  controlsHost: document.getElementById("controls"),
+  registry: new SearchRegistry(),
   setFlags: (next: PanelFlags) => {
-    status.textContent = `${next.failed ? "failed" : "ok"} ${typeof next.status === "string" ? next.status : ""}`.trim();
+    status.textContent =
+      `${next.failed ? "failed" : "ok"} ${typeof next.status === "string" ? next.status : ""}`.trim();
   },
 };
 
 createRoot(document.getElementById("root")!).render(
-  <Provider value={client}><TranslateContext.Provider value={{
-    t: (key, values) => Object.entries(values ?? {}).reduce((text, [name, value]) => text.replaceAll(`{{${name}}}`, String(value)), dictionary[key] ?? key),
-    uiLanguage: "eng", selectedLanguage: { code: "eng", label: "English" }, setLanguagePreference: () => {},
-  }}><MemoryRouter><SettingsShellProvider {...shell}><main className="mx-auto max-w-[1400px] p-8"><ProvidersPanel /></main></SettingsShellProvider></MemoryRouter></TranslateContext.Provider></Provider>,
+  <Provider value={client}>
+    <TranslateContext.Provider
+      value={{
+        t: (key, values) =>
+          Object.entries(values ?? {}).reduce(
+            (text, [name, value]) =>
+              text.replaceAll(`{{${name}}}`, String(value)),
+            dictionary[key] ?? key,
+          ),
+        uiLanguage: "eng",
+        selectedLanguage: { code: "eng", label: "English" },
+        setLanguagePreference: () => {},
+      }}
+    >
+      <MemoryRouter>
+        <SettingsShellProvider {...shell}>
+          <main className="mx-auto max-w-[1400px] p-8">
+            <ProvidersPanel />
+          </main>
+        </SettingsShellProvider>
+      </MemoryRouter>
+    </TranslateContext.Provider>
+  </Provider>,
 );

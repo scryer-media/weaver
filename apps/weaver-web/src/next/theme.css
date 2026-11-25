@@ -105,7 +105,8 @@
    * which text is a value, but they are set in the same face as the body.
    */
   --font-wv-title: "Sora Variable", ui-sans-serif, system-ui, sans-serif;
-  --font-wv-ui: "Fira Code Variable", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  --font-wv-ui:
+    "Fira Code Variable", ui-monospace, "SFMono-Regular", Menlo, monospace;
   --font-wv-mono: var(--font-wv-ui);
 
   /* The single shadow in the system. */
@@ -324,7 +325,8 @@ html .wv-setup-intro .wv-setup-intro-form {
   }
   100% {
     opacity: 1;
-    transform: translate(var(--wv-intro-x), var(--wv-intro-y)) scale(var(--wv-intro-scale));
+    transform: translate(var(--wv-intro-x), var(--wv-intro-y))
+      scale(var(--wv-intro-scale));
   }
 }
 

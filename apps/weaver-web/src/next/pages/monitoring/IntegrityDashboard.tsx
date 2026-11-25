@@ -5,26 +5,51 @@ import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { EmptyState, MetricCell, SectionHeader } from "../../components/chrome";
 import { columnStyle } from "../../components/columns";
 import { useNow } from "../../data/clock";
-import { averageSeconds, dailyRepairShare, percentOf, stagesInOrder, STAGE_ORDER } from "../../data/dashboards";
-import { EM_DASH, formatCount, formatDuration, formatSize } from "../../data/format";
+import {
+  averageSeconds,
+  dailyRepairShare,
+  percentOf,
+  stagesInOrder,
+  STAGE_ORDER,
+} from "../../data/dashboards";
+import {
+  EM_DASH,
+  formatCount,
+  formatDuration,
+  formatSize,
+} from "../../data/format";
 import { WV } from "../../data/palette";
 import { DailyBars } from "./DailyBars";
 import { DashboardSlot } from "./shell-slots";
 import { UsageRangeBar, useUsageRange } from "./RangeBar";
 import { useIntegrityHistory } from "./usage";
 
-const CAUSES = ["repair", "password", "disk_full", "unpack", "move", "health", "duplicate"];
+const CAUSES = [
+  "repair",
+  "password",
+  "disk_full",
+  "unpack",
+  "move",
+  "health",
+  "duplicate",
+];
 
 const STAGE_COLUMNS = "minmax(140px, 2fr) repeat(3, minmax(76px, 1fr))";
 
 const cell = "truncate text-right font-wv-mono text-[12.5px] text-wv-secondary";
 
 function causeLabel(t: Translate, cause: string): string {
-  return t(CAUSES.includes(cause) ? `next.integrity.cause.${cause}` : "next.integrity.cause.other");
+  return t(
+    CAUSES.includes(cause)
+      ? `next.integrity.cause.${cause}`
+      : "next.integrity.cause.other",
+  );
 }
 
 function stageLabel(t: Translate, stage: string): string {
-  return (STAGE_ORDER as readonly string[]).includes(stage) ? t(`next.integrity.stage.${stage}`) : stage;
+  return (STAGE_ORDER as readonly string[]).includes(stage)
+    ? t(`next.integrity.stage.${stage}`)
+    : stage;
 }
 
 function percentText(value: number | null): string {
@@ -39,10 +64,17 @@ export function IntegrityDashboard() {
 
   const finished = integrity?.finished.range.events ?? 0;
   const repaired = integrity?.repaired.range.events ?? 0;
-  const recovery = integrity?.recovery ?? { availableBytes: 0, fetchedBytes: 0 };
-  const failures = [...(integrity?.failures ?? [])].sort((left, right) => right.count - left.count);
+  const recovery = integrity?.recovery ?? {
+    availableBytes: 0,
+    fetchedBytes: 0,
+  };
+  const failures = [...(integrity?.failures ?? [])].sort(
+    (left, right) => right.count - left.count,
+  );
   const failed = failures.reduce((sum, failure) => sum + failure.count, 0);
-  const stages = stagesInOrder(integrity?.stages ?? []).filter((stage) => stage.range.events > 0);
+  const stages = stagesInOrder(integrity?.stages ?? []).filter(
+    (stage) => stage.range.events > 0,
+  );
   const days = integrity?.finished.days ?? [];
   const shares = dailyRepairShare(days, integrity?.repaired.days ?? []);
 
@@ -50,20 +82,32 @@ export function IntegrityDashboard() {
     <>
       {error ? <DashboardSlot slot="status">{error}</DashboardSlot> : null}
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
-        <UsageRangeBar state={rangeState} rangeStart={integrity?.rangeStart} rangeEnd={integrity?.rangeEnd} />
+        <UsageRangeBar
+          state={rangeState}
+          rangeStart={integrity?.rangeStart}
+          rangeEnd={integrity?.rangeEnd}
+        />
 
         <div
           className="wv-cols grid flex-none border-b border-wv-hairline bg-wv-app"
-          style={columnStyle({ base: "repeat(1, minmax(0, 1fr))", sm: "repeat(3, minmax(0, 1fr))" })}
+          style={columnStyle({
+            base: "repeat(1, minmax(0, 1fr))",
+            sm: "repeat(3, minmax(0, 1fr))",
+          })}
         >
           <MetricCell
             eyebrow={t("next.integrity.repaired")}
             value={percentText(percentOf(repaired, finished))}
-            note={t("next.integrity.ofJobs", { repaired: formatCount(repaired), finished: formatCount(finished) })}
+            note={t("next.integrity.ofJobs", {
+              repaired: formatCount(repaired),
+              finished: formatCount(finished),
+            })}
           />
           <MetricCell
             eyebrow={t("next.integrity.recovery")}
-            value={percentText(percentOf(recovery.fetchedBytes, recovery.availableBytes))}
+            value={percentText(
+              percentOf(recovery.fetchedBytes, recovery.availableBytes),
+            )}
             note={t("next.integrity.recoveryOf", {
               fetched: formatSize(recovery.fetchedBytes),
               available: formatSize(recovery.availableBytes),
@@ -79,7 +123,10 @@ export function IntegrityDashboard() {
         </div>
 
         <section className="flex flex-none flex-col">
-          <SectionHeader label={t("next.integrity.repairsPerDay")} sticky={false} />
+          <SectionHeader
+            label={t("next.integrity.repairsPerDay")}
+            sticky={false}
+          />
           {repaired === 0 ? (
             <EmptyState
               testId="integrity-no-repairs"
@@ -90,7 +137,13 @@ export function IntegrityDashboard() {
           ) : (
             <DailyBars
               days={days.map((day) => day.day)}
-              series={[{ label: t("next.integrity.repairsPerDay"), color: WV.accent, values: shares }]}
+              series={[
+                {
+                  label: t("next.integrity.repairsPerDay"),
+                  color: WV.accent,
+                  values: shares,
+                },
+              ]}
               format={(value) => `${value.toFixed(1)}%`}
               label={t("next.integrity.repairsPerDay")}
             />
@@ -113,7 +166,9 @@ export function IntegrityDashboard() {
                 data-testid={`integrity-cause-${failure.cause || "other"}`}
                 className="flex items-center justify-between gap-4 border-b border-wv-hairline px-4 py-3 sm:px-6"
               >
-                <span className="truncate text-[13px] text-wv-fg">{causeLabel(t, failure.cause)}</span>
+                <span className="truncate text-[13px] text-wv-fg">
+                  {causeLabel(t, failure.cause)}
+                </span>
                 <span className={cell}>{formatCount(failure.count)}</span>
               </div>
             ))
@@ -138,8 +193,12 @@ export function IntegrityDashboard() {
                 >
                   <span>{t("next.integrity.stage")}</span>
                   <span className="text-right">{t("next.integrity.runs")}</span>
-                  <span className="text-right">{t("next.integrity.average")}</span>
-                  <span className="text-right">{t("next.integrity.total")}</span>
+                  <span className="text-right">
+                    {t("next.integrity.average")}
+                  </span>
+                  <span className="text-right">
+                    {t("next.integrity.total")}
+                  </span>
                 </div>
                 {stages.map((stage) => (
                   <div
@@ -148,10 +207,18 @@ export function IntegrityDashboard() {
                     className="grid items-center gap-x-4 border-b border-wv-hairline px-4 py-3 hover:bg-wv-cell-hover sm:px-6"
                     style={{ gridTemplateColumns: STAGE_COLUMNS }}
                   >
-                    <span className="truncate text-[13px] text-wv-fg">{stageLabel(t, stage.id)}</span>
-                    <span className={cell}>{formatCount(stage.range.events)}</span>
-                    <span className={cell}>{formatDuration(averageSeconds(stage.range) ?? 0)}</span>
-                    <span className={cell}>{formatDuration(stage.range.durationMs / 1000)}</span>
+                    <span className="truncate text-[13px] text-wv-fg">
+                      {stageLabel(t, stage.id)}
+                    </span>
+                    <span className={cell}>
+                      {formatCount(stage.range.events)}
+                    </span>
+                    <span className={cell}>
+                      {formatDuration(averageSeconds(stage.range) ?? 0)}
+                    </span>
+                    <span className={cell}>
+                      {formatDuration(stage.range.durationMs / 1000)}
+                    </span>
                   </div>
                 ))}
               </div>

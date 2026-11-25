@@ -15,7 +15,9 @@ import {
  * The one way the screens ask for entries to be archived: the History bulk
  * bar, a History row and the job page all send through this.
  */
-export function useArchiveHistory(): (ids: readonly number[]) => Promise<ArchiveHistoryRequest> {
+export function useArchiveHistory(): (
+  ids: readonly number[],
+) => Promise<ArchiveHistoryRequest> {
   const t = useTranslate();
   const [, archiveHistory] = useMutation<{
     archiveHistory: { results: ArchiveHistoryAcceptResult[] };

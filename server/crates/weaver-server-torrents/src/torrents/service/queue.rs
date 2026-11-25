@@ -5,7 +5,6 @@ use super::disk_room::DiskHeld;
 use super::intake::Resolving;
 use super::intake::{AddError, AddRequest};
 use super::live::Live;
-use super::scripts::StoppedSeeding;
 use super::{ActionError, Asked, Inner, TorrentService, locked, state_error};
 use crate::SchedulerError;
 use crate::jobs::JobId;
@@ -16,7 +15,6 @@ use crate::jobs::handle::{CancellationOrigin, QueueAction, QueueMoveTarget, Sche
 use crate::jobs::model::Protocol;
 use crate::jobs::model::{FieldUpdate, JobUpdate, PRIORITY_ATTRIBUTE_KEY};
 use crate::torrents::admission::Refusal;
-use crate::torrents::metrics::FetchOutcome;
 use crate::torrents::persistence::TorrentsPersistenceInsertTorrentQueries;
 use crate::torrents::{TorrentIntent, status};
 use std::collections::{BTreeMap, HashSet, VecDeque};
@@ -120,29 +118,14 @@ impl TorrentService {
             .clone()
     }
 
+    // The pause of one torrent is the pause of many: its intent and the end
+    // of a magnet's fetch land under one hold of the torrents, so a resume
+    // comes before both or after both.
     pub async fn pause(&self, job_id: JobId) -> Result<(), ActionError> {
-        let stopped = self
-            .with_torrent(job_id, |torrent| {
-                Ok(self.seeding_stopped(torrent, StoppedSeeding::Paused))
-            })
-            .await?;
-        self.set_intent(job_id, TorrentIntent::Paused).await?;
-        self.queue_script_event(stopped);
-        self.with_torrent(job_id, |torrent| {
-            if let Some(Resolving::Fetching(fetch)) = &torrent.resolving {
-                fetch.abort();
-                self.inner.counters.fetch(FetchOutcome::Cancelled);
-                torrent.resolving = Some(Resolving::Paused);
-                // A paused magnet shows no fetch's table, as one paused
-                // before its fetch began.
-                torrent.fetching = None;
-            }
-            Ok(())
-        })
-        .await?;
-        self.apply_queue().await;
-        self.publish().await;
-        Ok(())
+        self.pause_many(&[job_id])
+            .await
+            .remove(&job_id)
+            .unwrap_or(Err(ActionError::NotFound(job_id)))
     }
 
     /// Resume a paused torrent, or one its seeding goal stopped.

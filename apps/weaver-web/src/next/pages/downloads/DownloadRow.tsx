@@ -73,18 +73,32 @@ export const DownloadRow = memo(function DownloadRow({
   // A torrent's zero is its swarm gone quiet, so it shows as it comes.
   const rate = useHeldRate(
     held === null ? liveRate : 0,
-    held === null && job.protocol !== "TORRENT" && isActiveStatus(progress.status) ? progress.status : null,
+    held === null &&
+      job.protocol !== "TORRENT" &&
+      isActiveStatus(progress.status)
+      ? progress.status
+      : null,
   );
   const name = formatJobReleaseName(job);
   const isPaused = statusToken(job.status) === "paused";
   // The phase the label names, or failing that the last one with a bar; a
   // phase still settling is not what the row says it is doing.
   const phase =
-    progress.bars.find((bar) => bar.phase === progress.status) ?? progress.bars.at(-1) ?? null;
+    progress.bars.find((bar) => bar.phase === progress.status) ??
+    progress.bars.at(-1) ??
+    null;
   const progressText =
-    phase && progress.status !== "QUEUED" ? `${Math.round(phase.progressPercent)}%` : EM_DASH;
+    phase && progress.status !== "QUEUED"
+      ? `${Math.round(phase.progressPercent)}%`
+      : EM_DASH;
   const lead = useMemo(
-    () => <CheckBox label={t("next.common.selectItem", { name })} checked={picked} onChange={() => onPick(job.id)} />,
+    () => (
+      <CheckBox
+        label={t("next.common.selectItem", { name })}
+        checked={picked}
+        onChange={() => onPick(job.id)}
+      />
+    ),
     [job.id, name, onPick, picked, t],
   );
 
@@ -106,7 +120,8 @@ export const DownloadRow = memo(function DownloadRow({
         <div className="flex min-w-0 flex-[1_1_240px] flex-wrap items-center gap-x-5 gap-y-[9px]">
           <span
             data-testid={torrentIds.queueRowName}
-            className="max-w-full min-w-0 flex-[1_1_auto] text-[13.5px] font-medium tracking-[-0.005em] [overflow-wrap:anywhere] text-wv-fg">
+            className="max-w-full min-w-0 flex-[1_1_auto] text-[13.5px] font-medium tracking-[-0.005em] [overflow-wrap:anywhere] text-wv-fg"
+          >
             {name}
           </span>
           <TagChips tags={job.tags} />
@@ -130,12 +145,19 @@ export const DownloadRow = memo(function DownloadRow({
       right={
         <>
           <span
-            data-testid={torrentIds.queueRowProtocol(job.protocol === "TORRENT" ? "TORRENT" : "NZB")}
+            data-testid={torrentIds.queueRowProtocol(
+              job.protocol === "TORRENT" ? "TORRENT" : "NZB",
+            )}
             className="min-w-[56px] truncate text-[12.5px] text-wv-secondary"
           >
-            {job.protocol === "TORRENT" ? t("next.protocol.torrent") : t("next.protocol.usenet")}
+            {job.protocol === "TORRENT"
+              ? t("next.protocol.torrent")
+              : t("next.protocol.usenet")}
           </span>
-          <div className="flex min-w-[96px] items-center gap-[9px]" title={statusTitle}>
+          <div
+            className="flex min-w-[96px] items-center gap-[9px]"
+            title={statusTitle}
+          >
             <Square color={statusColor(progress.status)} />
             <span className="flex min-w-0 flex-col">
               <span
@@ -152,7 +174,12 @@ export const DownloadRow = memo(function DownloadRow({
                   {hold}
                 </span>
               ) : rate > 0 ? (
-                <RateCounter arrow="down" rate={rate} title={t("next.torrent.downloadSpeed")} className="justify-start" />
+                <RateCounter
+                  arrow="down"
+                  rate={rate}
+                  title={t("next.torrent.downloadSpeed")}
+                  className="justify-start"
+                />
               ) : null}
             </span>
           </div>
@@ -166,7 +193,9 @@ export const DownloadRow = memo(function DownloadRow({
                   title={t("next.torrent.seedingCell")}
                   className="inline-flex items-baseline"
                 >
-                  <span className="inline-block w-[6ch] text-right">{seeding.ratio.toFixed(2)}</span>
+                  <span className="inline-block w-[6ch] text-right">
+                    {seeding.ratio.toFixed(2)}
+                  </span>
                   <RateCounter
                     arrow="up"
                     rate={seeding.uploadBps}
@@ -181,7 +210,12 @@ export const DownloadRow = memo(function DownloadRow({
           <ValueCell>
             <RowWait id={job.id} held={held} fallback={progressText} />
           </ValueCell>
-          <RowActions id={job.id} paused={isPaused} onPause={onPause} onCancel={onCancel} />
+          <RowActions
+            id={job.id}
+            paused={isPaused}
+            onPause={onPause}
+            onCancel={onCancel}
+          />
         </>
       }
     />
@@ -190,7 +224,8 @@ export const DownloadRow = memo(function DownloadRow({
 
 const ROW_BAR = "max-w-[343px] min-w-[56px] flex-1";
 const ROW_PERCENT = "w-[34px] text-[11.5px] text-wv-muted";
-const ROW_BARS = "basis-full @6xl:flex-[0_0_242px] @min-[100rem]:flex-[0_0_389px]";
+const ROW_BARS =
+  "basis-full @6xl:flex-[0_0_242px] @min-[100rem]:flex-[0_0_389px]";
 
 /**
  * A seeding torrent's bars, in place of its download's. The download is done,
@@ -199,14 +234,30 @@ const ROW_BARS = "basis-full @6xl:flex-[0_0_242px] @min-[100rem]:flex-[0_0_389px
  * The percentage is how far toward each goal, and each goal bar is named;
  * with no ratio goal the gray bar stays whole and unnamed.
  */
-const SeedingBars = memo(function SeedingBars({ torrent }: { torrent: TorrentSummaryData }) {
+const SeedingBars = memo(function SeedingBars({
+  torrent,
+}: {
+  torrent: TorrentSummaryData;
+}) {
   const t = useTranslate();
   const goals = seedingGoalProgress(torrent);
   const lines = [
-    { key: "ratio", percent: goals.ratio, name: t("next.torrentDash.ratio"), label: t("next.seeding.ratioGoal") },
+    {
+      key: "ratio",
+      percent: goals.ratio,
+      name: t("next.torrentDash.ratio"),
+      label: t("next.seeding.ratioGoal"),
+    },
     ...(goals.seedTime === null
       ? []
-      : [{ key: "seedTime", percent: goals.seedTime, name: t("next.torrentDash.seedTime"), label: t("next.seeding.seedTimeGoal") }]),
+      : [
+          {
+            key: "seedTime",
+            percent: goals.seedTime,
+            name: t("next.torrentDash.seedTime"),
+            label: t("next.seeding.seedTimeGoal"),
+          },
+        ]),
   ];
   // Every goal bar is named, and the name column is as wide as the longest
   // name either goal has, so bars end together from row to row.
@@ -215,24 +266,36 @@ const SeedingBars = memo(function SeedingBars({ torrent }: { torrent: TorrentSum
     [...t("next.torrentDash.seedTime")].length,
   );
   return (
-    <div data-testid={torrentIds.queueRowSeedingBars} className={`flex min-w-0 flex-col gap-[7px] ${ROW_BARS}`}>
+    <div
+      data-testid={torrentIds.queueRowSeedingBars}
+      className={`flex min-w-0 flex-col gap-[7px] ${ROW_BARS}`}
+    >
       {lines.map((line) => (
         <div key={line.key} className="flex min-w-0 items-center gap-3">
           <div className={`relative ${ROW_BAR}`}>
-            {line.key === "ratio" ? <Bar percent={100} color={WV.inert} height={10} /> : null}
+            {line.key === "ratio" ? (
+              <Bar percent={100} color={WV.inert} height={10} />
+            ) : null}
             {line.percent === null ? null : (
               <Bar
                 percent={line.percent}
                 color={WV.info}
                 height={10}
                 label={line.label}
-                className={line.key === "ratio" ? "absolute inset-0" : undefined}
+                className={
+                  line.key === "ratio" ? "absolute inset-0" : undefined
+                }
                 // Over the gray bar, only the goal's cells draw; the track is the gray bar's.
-                style={line.key === "ratio" ? { backgroundImage: "none" } : undefined}
+                style={
+                  line.key === "ratio" ? { backgroundImage: "none" } : undefined
+                }
               />
             )}
           </div>
-          <span aria-hidden="true" className={`flex-none font-wv-mono ${ROW_PERCENT}`}>
+          <span
+            aria-hidden="true"
+            className={`flex-none font-wv-mono ${ROW_PERCENT}`}
+          >
             {Math.floor(line.percent ?? 100)}%
           </span>
           <span
@@ -307,7 +370,10 @@ const RowActions = memo(function RowActions({
  * new status starts from its own rate, never one carried over from the last.
  */
 function useHeldRate(rate: number, activeStatus: string | null): number {
-  const last = useRef<{ status: string | null; rate: number }>({ status: null, rate: 0 });
+  const last = useRef<{ status: string | null; rate: number }>({
+    status: null,
+    rate: 0,
+  });
   if (activeStatus === null) {
     last.current = { status: null, rate: 0 };
     return rate;

@@ -11,7 +11,11 @@ import type { JobData } from "@/lib/job-types";
  * speed counter on the same tick; otherwise from the queue item's download
  * phase, which lags it by up to a second.
  */
-export function useDownloadRate(job: Pick<JobData, "id" | "phaseProgress">): number {
-  const phase = job.phaseProgress.find((candidate) => candidate.phase === "DOWNLOADING");
+export function useDownloadRate(
+  job: Pick<JobData, "id" | "phaseProgress">,
+): number {
+  const phase = job.phaseProgress.find(
+    (candidate) => candidate.phase === "DOWNLOADING",
+  );
   return useLiveJobDownloadRate(job.id, phase?.rateBps ?? 0);
 }

@@ -5,7 +5,11 @@ import { useMemo } from "react";
 import { useSubscription } from "urql";
 import { TORRENT_SUMMARY_UPDATES_SUBSCRIPTION } from "@/graphql/queries";
 import { usePageVisible } from "@/lib/page-visible";
-import { applyTorrentChanges, type TorrentChangesData, type TorrentSummaryData } from "@/lib/torrents";
+import {
+  applyTorrentChanges,
+  type TorrentChangesData,
+  type TorrentSummaryData,
+} from "@/lib/torrents";
 import { useNextData } from "@/next/data/next-data";
 
 const NO_TORRENTS: ReadonlyMap<number, TorrentSummaryData> = new Map();
@@ -15,12 +19,17 @@ const NO_TORRENTS: ReadonlyMap<number, TorrentSummaryData> = new Map();
  * id: the torrents a page shows, followed while it shows any and the tab
  * is visible. Shown again, the tab reads them afresh.
  */
-export function useTorrentSummaries(ids: readonly number[]): ReadonlyMap<number, TorrentSummaryData> {
+export function useTorrentSummaries(
+  ids: readonly number[],
+): ReadonlyMap<number, TorrentSummaryData> {
   const { connection } = useNextData("connection");
   const visible = usePageVisible();
   // The same torrents in another order are the same follow.
   const key = [...new Set(ids)].sort((a, b) => a - b).join(",");
-  const variables = useMemo(() => ({ ids: key === "" ? [] : key.split(",").map(Number) }), [key]);
+  const variables = useMemo(
+    () => ({ ids: key === "" ? [] : key.split(",").map(Number) }),
+    [key],
+  );
   const active = key !== "";
   // Each push carries only what moved, so the torrents are kept between them.
   const [{ data }] = useSubscription<

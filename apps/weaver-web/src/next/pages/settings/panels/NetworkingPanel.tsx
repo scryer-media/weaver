@@ -9,7 +9,12 @@ export function NetworkingPanel() {
     <NetworkingWorkspace
       proxies={(onChanged) => <ProxiesPanel onChanged={onChanged} />}
       proxyEditor={(id, onClose, onChanged) => (
-        <ProxyEditorFor key={id} id={id} onClose={onClose} onChanged={onChanged} />
+        <ProxyEditorFor
+          key={id}
+          id={id}
+          onClose={onClose}
+          onChanged={onChanged}
+        />
       )}
     />
   );

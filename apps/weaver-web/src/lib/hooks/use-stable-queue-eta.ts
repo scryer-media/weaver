@@ -75,7 +75,9 @@ function sumDownloadedBytes(jobs: EtaJobInput[]): number {
 
 function trimSamples(samples: EtaSample[], now: number): EtaSample[] {
   const cutoff = now - MAX_SAMPLE_AGE_MS;
-  const trimmed = samples.filter((sample, index) => index === samples.length - 1 || sample.at >= cutoff);
+  const trimmed = samples.filter(
+    (sample, index) => index === samples.length - 1 || sample.at >= cutoff,
+  );
   return trimmed.length > 0 ? trimmed : samples.slice(-1);
 }
 
@@ -94,7 +96,10 @@ function observedSpeed(samples: EtaSample[], now: number): number {
 
   const baseline = comparisonSample(samples, now);
   const latest = samples[samples.length - 1];
-  const deltaBytes = Math.max(latest.downloadedBytes - baseline.downloadedBytes, 0);
+  const deltaBytes = Math.max(
+    latest.downloadedBytes - baseline.downloadedBytes,
+    0,
+  );
   const deltaSeconds = Math.max((latest.at - baseline.at) / 1_000, 0);
   if (deltaBytes <= 0 || deltaSeconds <= 0) {
     return 0;
@@ -135,9 +140,9 @@ export function nextEtaSpeed(
   // whose jobs only wait (behind a full disk, say) keeps it: the wire is as
   // fast when they go on, and the samples start again from nothing.
   if (
-    conditions.speedLimit !== state.speedLimit
-    || conditions.paused
-    || activeEtaJobs(jobs).length === 0
+    conditions.speedLimit !== state.speedLimit ||
+    conditions.paused ||
+    activeEtaJobs(jobs).length === 0
   ) {
     state.peakSpeed = 0;
   }
@@ -147,7 +152,10 @@ export function nextEtaSpeed(
   }
   state.peakSpeed = Math.max(state.peakSpeed, state.smoothedSpeed);
   const diskRate = conditions.diskRate ?? 0;
-  const floor = diskRate > 0 ? capped(Math.min(diskRate, state.peakSpeed), conditions.speedLimit) : 0;
+  const floor =
+    diskRate > 0
+      ? capped(Math.min(diskRate, state.peakSpeed), conditions.speedLimit)
+      : 0;
   return Math.max(eased, floor);
 }
 
@@ -178,23 +186,35 @@ function easedEtaSpeed(
   const downloadedBytes = sumDownloadedBytes(activeJobs);
   const lastSample = state.samples[state.samples.length - 1];
   const queueChanged = signature !== state.signature;
-  const bytesWentBackwards = !!lastSample && downloadedBytes < lastSample.downloadedBytes;
+  const bytesWentBackwards =
+    !!lastSample && downloadedBytes < lastSample.downloadedBytes;
 
-  if (queueChanged || bytesWentBackwards || limitChanged || state.samples.length === 0) {
+  if (
+    queueChanged ||
+    bytesWentBackwards ||
+    limitChanged ||
+    state.samples.length === 0
+  ) {
     state.signature = signature;
     state.samples = [{ at: now, downloadedBytes }];
-    state.smoothedSpeed = capped(Math.max(instantaneousSpeed, 0), conditions.speedLimit);
+    state.smoothedSpeed = capped(
+      Math.max(instantaneousSpeed, 0),
+      conditions.speedLimit,
+    );
     state.displayedSpeed = state.smoothedSpeed;
     state.displayedAt = now;
     return state.displayedSpeed;
   }
 
   if (
-    !lastSample
-    || downloadedBytes !== lastSample.downloadedBytes
-    || now - lastSample.at >= SAMPLE_INTERVAL_MS
+    !lastSample ||
+    downloadedBytes !== lastSample.downloadedBytes ||
+    now - lastSample.at >= SAMPLE_INTERVAL_MS
   ) {
-    state.samples = trimSamples([...state.samples, { at: now, downloadedBytes }], now);
+    state.samples = trimSamples(
+      [...state.samples, { at: now, downloadedBytes }],
+      now,
+    );
   }
 
   const first = state.samples[0];
@@ -206,7 +226,9 @@ function easedEtaSpeed(
   if (longWindowSpeed > 0 && instantaneousSpeed > 0) {
     const shortWindowWeight = 0.15 + warmupWeight * 0.6;
     const longWindowWeight = 1 - shortWindowWeight;
-    const blended = instantaneousSpeed * shortWindowWeight + longWindowSpeed * longWindowWeight;
+    const blended =
+      instantaneousSpeed * shortWindowWeight +
+      longWindowSpeed * longWindowWeight;
     if (warmupWeight < 0.45) {
       const floor = longWindowSpeed * (1 - SETTLED_DEVIATION);
       const ceiling = longWindowSpeed * (1 + SETTLED_DEVIATION);
@@ -233,9 +255,10 @@ function easedEtaSpeed(
   const settled = clamp(elapsedMs / WARMUP_MS, 0, 1);
   const alpha = 0.22 - settled * 0.14;
   targetSpeed = capped(targetSpeed, conditions.speedLimit);
-  state.smoothedSpeed = state.smoothedSpeed > 0
-    ? state.smoothedSpeed + alpha * (targetSpeed - state.smoothedSpeed)
-    : targetSpeed;
+  state.smoothedSpeed =
+    state.smoothedSpeed > 0
+      ? state.smoothedSpeed + alpha * (targetSpeed - state.smoothedSpeed)
+      : targetSpeed;
   if (now - state.displayedAt >= DISPLAY_INTERVAL_MS) {
     state.displayedSpeed = state.smoothedSpeed;
     state.displayedAt = now;
@@ -243,7 +266,10 @@ function easedEtaSpeed(
   return state.displayedSpeed;
 }
 
-export function formatEtaFromRemainingBytes(remainingBytes: number, speed: number): string {
+export function formatEtaFromRemainingBytes(
+  remainingBytes: number,
+  speed: number,
+): string {
   if (speed <= 0 || remainingBytes <= 0) return "\u2014";
   const secs = Math.ceil(remainingBytes / speed);
   if (secs < 60) return `${secs}s`;
@@ -251,7 +277,10 @@ export function formatEtaFromRemainingBytes(remainingBytes: number, speed: numbe
   return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`;
 }
 
-export function buildQueueEtaById(jobs: EtaJobInput[], speed: number): Map<number, string> {
+export function buildQueueEtaById(
+  jobs: EtaJobInput[],
+  speed: number,
+): Map<number, string> {
   const etaById = new Map<number, string>();
   if (speed <= 0) {
     return etaById;

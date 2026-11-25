@@ -4,10 +4,21 @@
 import { useMemo, useState } from "react";
 import { useTranslate } from "@/lib/context/translate-context";
 import { Segmented } from "../../components/controls";
-import { dayKey, USAGE_KEPT_DAYS, type UsagePeriod } from "../../data/dashboards";
+import {
+  dayKey,
+  USAGE_KEPT_DAYS,
+  type UsagePeriod,
+} from "../../data/dashboards";
 import type { UsageRangeInput } from "./usage";
 
-const PERIODS: readonly UsagePeriod[] = ["TODAY", "WEEK", "MONTH", "YEAR", "ALL", "CUSTOM"];
+const PERIODS: readonly UsagePeriod[] = [
+  "TODAY",
+  "WEEK",
+  "MONTH",
+  "YEAR",
+  "ALL",
+  "CUSTOM",
+];
 
 export interface UsageRangeState {
   period: UsagePeriod;
@@ -33,9 +44,23 @@ export function useUsageRange(now: number): UsageRangeState {
   const range = useMemo<UsageRangeInput | null>(() => {
     if (period !== "CUSTOM") return { period };
     if (!fromDay || !toDay) return null;
-    return { period, fromDay: fromDay < earliestDay ? earliestDay : fromDay, toDay };
+    return {
+      period,
+      fromDay: fromDay < earliestDay ? earliestDay : fromDay,
+      toDay,
+    };
   }, [period, fromDay, toDay, earliestDay]);
-  return { period, setPeriod, fromDay, setFromDay, toDay, setToDay, today, earliestDay, range };
+  return {
+    period,
+    setPeriod,
+    fromDay,
+    setFromDay,
+    toDay,
+    setToDay,
+    today,
+    earliestDay,
+    range,
+  };
 }
 
 /** The period picker, the custom dates, and the dates the server read. */
@@ -49,7 +74,16 @@ export function UsageRangeBar({
   rangeEnd?: string;
 }) {
   const t = useTranslate();
-  const { period, setPeriod, fromDay, setFromDay, toDay, setToDay, today, earliestDay } = state;
+  const {
+    period,
+    setPeriod,
+    fromDay,
+    setFromDay,
+    toDay,
+    setToDay,
+    today,
+    earliestDay,
+  } = state;
   return (
     <div className="flex flex-none flex-wrap items-center gap-3 border-b border-wv-hairline bg-wv-app px-4 py-3 sm:px-6">
       <Segmented

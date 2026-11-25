@@ -6,7 +6,6 @@ import { duplicateLocaleEntries } from "../duplicate-locales";
 import { nextZh } from "@/next/i18n/zh";
 
 const zh: LocaleDictionary = {
-
   // Navigation
   "nav.settings": "设置",
   "nav.sponsor": "赞助",
@@ -15,7 +14,8 @@ const zh: LocaleDictionary = {
   "applicationUpgrade.upToDate": "Weaver v{{version}} 已是最新版本。",
   "applicationUpgrade.available": "Weaver v{{version}} 可用。",
   "applicationUpgrade.install": "安装 v{{version}}",
-  "applicationUpgrade.notEligible": "Weaver 无法在应用内更新此安装（{{reason}}）。",
+  "applicationUpgrade.notEligible":
+    "Weaver 无法在应用内更新此安装（{{reason}}）。",
   "applicationUpgrade.failed": "更新到 v{{version}} 失败：{{error}}",
   "applicationUpgrade.githubUnavailable": "GitHub 暂时不可用。请稍后重试更新。",
   "applicationUpgrade.completed": "已更新到 v{{version}}。",
@@ -152,7 +152,8 @@ const zh: LocaleDictionary = {
   "action.edit": "编辑",
   "action.save": "保存",
 
-  "upload.forceDesc": "即使语义和文章指纹重复策略匹配，也接受此提交。幂等性冲突仍然有效。",
+  "upload.forceDesc":
+    "即使语义和文章指纹重复策略匹配，也接受此提交。幂等性冲突仍然有效。",
 
   // System info
   "systemInfo.diagnosticsFailed": "无法创建诊断包。",

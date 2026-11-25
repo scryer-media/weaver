@@ -26,7 +26,12 @@ test("the rail lists what is configured, in the order it was configured", () => 
   // still filter by them.
   const entries = categoryFacets({ configured: CONFIGURED, rows: [] });
 
-  assert.deepEqual(labels(entries), ["All categories", "movies", "tv", "audio"]);
+  assert.deepEqual(labels(entries), [
+    "All categories",
+    "movies",
+    "tv",
+    "audio",
+  ]);
   assert.deepEqual(
     entries.map((entry) => entry.count),
     [0, 0, 0, 0],
@@ -53,7 +58,10 @@ test("counts are per facet and ignore the current selection", () => {
 });
 
 test("uncategorised appears only once something is in it", () => {
-  const entries = categoryFacets({ configured: CONFIGURED, rows: [{ category: "tv" }] });
+  const entries = categoryFacets({
+    configured: CONFIGURED,
+    rows: [{ category: "tv" }],
+  });
   assert.equal(labels(entries).includes("Uncategorised"), false);
 });
 
@@ -140,5 +148,8 @@ test("the daemon's filter wants the empty string for uncategorised", () => {
   assert.equal(facetsToCategories(new Set()), undefined);
   assert.deepEqual(facetsToCategories(new Set(["movies"])), ["movies"]);
   assert.deepEqual(facetsToCategories(new Set([UNCATEGORISED])), [""]);
-  assert.deepEqual(facetsToCategories(new Set(["tv", UNCATEGORISED])).sort(), ["", "tv"]);
+  assert.deepEqual(facetsToCategories(new Set(["tv", UNCATEGORISED])).sort(), [
+    "",
+    "tv",
+  ]);
 });

@@ -15,7 +15,10 @@ import {
   UPDATE_ARCHIVE_PASSWORD_SETTINGS_MUTATION,
   UPDATE_SETTINGS_MUTATION,
 } from "@/graphql/queries";
-import { useLanguageSettings, useTranslate } from "@/lib/context/translate-context";
+import {
+  useLanguageSettings,
+  useTranslate,
+} from "@/lib/context/translate-context";
 import { AVAILABLE_LANGUAGES } from "@/lib/i18n";
 import {
   DEFAULT_DUPLICATE_POLICY,
@@ -35,8 +38,17 @@ import {
   type HardwareProfileSettings,
 } from "../../../data/hardware-profiles";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
-import { SecondaryButton, Select, TextArea } from "../../../components/controls";
-import { SettingsBlocks, usePanelStatus, type FieldSpec, type SettingsBlock } from "../framework";
+import {
+  SecondaryButton,
+  Select,
+  TextArea,
+} from "../../../components/controls";
+import {
+  SettingsBlocks,
+  usePanelStatus,
+  type FieldSpec,
+  type SettingsBlock,
+} from "../framework";
 import { settingsIds, testIds } from "../../../testids";
 
 /**
@@ -66,12 +78,16 @@ interface GeneralSettings {
 /** What a download holding a file with an unwanted extension comes to. */
 type UnwantedExtensionAction = "FAIL_JOB" | "DELETE_FILES";
 
-const UNWANTED_EXTENSION_ACTIONS: UnwantedExtensionAction[] = ["FAIL_JOB", "DELETE_FILES"];
+const UNWANTED_EXTENSION_ACTIONS: UnwantedExtensionAction[] = [
+  "FAIL_JOB",
+  "DELETE_FILES",
+];
 
-const UNWANTED_EXTENSION_ACTION_LABEL: Record<UnwantedExtensionAction, string> = {
-  FAIL_JOB: "next.general.unwantedExtensionAction.fail",
-  DELETE_FILES: "next.general.unwantedExtensionAction.delete",
-};
+const UNWANTED_EXTENSION_ACTION_LABEL: Record<UnwantedExtensionAction, string> =
+  {
+    FAIL_JOB: "next.general.unwantedExtensionAction.fail",
+    DELETE_FILES: "next.general.unwantedExtensionAction.delete",
+  };
 
 interface ArchivePasswordSettings {
   hasPasswords: boolean;
@@ -138,8 +154,13 @@ function without<T extends object>(record: T, key: keyof T): T {
  * The daemon's copy of a setting: as last read, or as a save last answered.
  * An answer stands in until the setting is read again.
  */
-function useAnswered<T>(read: T | undefined): [T | undefined, (answer: T) => void] {
-  const [answered, setAnswered] = useState<{ read: T | undefined; value: T } | null>(null);
+function useAnswered<T>(
+  read: T | undefined,
+): [T | undefined, (answer: T) => void] {
+  const [answered, setAnswered] = useState<{
+    read: T | undefined;
+    value: T;
+  } | null>(null);
   // The read an answer lands on, which may be newer than the one it was asked under.
   const readRef = useRef(read);
   useLayoutEffect(() => {
@@ -159,7 +180,11 @@ const DUPLICATE_ACTION_LABEL: Record<DuplicateAction, string> = {
 };
 
 /** Translation keys, resolved when the panel renders. */
-const DUPLICATE_FIELDS: { key: keyof DuplicatePolicy; label: string; help: string }[] = [
+const DUPLICATE_FIELDS: {
+  key: keyof DuplicatePolicy;
+  label: string;
+  help: string;
+}[] = [
   {
     key: "strictActiveOrSuccess",
     label: "next.general.duplicate.strictActive",
@@ -195,8 +220,12 @@ const DUPLICATE_FIELDS: { key: keyof DuplicatePolicy; label: string; help: strin
 export function GeneralPanel() {
   const t = useTranslate();
   const { uiLanguage, setLanguagePreference } = useLanguageSettings();
-  const [{ data, fetching }] = useQuery<{ settings: GeneralSettings }>({ query: SETTINGS_QUERY });
-  const [{ data: profileData }] = useQuery<{ hardwareProfile: HardwareProfileSettings }>({
+  const [{ data, fetching }] = useQuery<{ settings: GeneralSettings }>({
+    query: SETTINGS_QUERY,
+  });
+  const [{ data: profileData }] = useQuery<{
+    hardwareProfile: HardwareProfileSettings;
+  }>({
     query: HARDWARE_PROFILE_QUERY,
   });
   const profileSettings = profileData?.hardwareProfile ?? null;
@@ -204,17 +233,30 @@ export function GeneralPanel() {
     archivePasswordSettings: ArchivePasswordSettings;
   }>({ query: ARCHIVE_PASSWORD_SETTINGS_QUERY });
   const [{ data: extensionsData }] = useQuery<{
-    postProcessingSettings: { unacceptableExtensions: string[]; unwantedExtensionAction: UnwantedExtensionAction };
+    postProcessingSettings: {
+      unacceptableExtensions: string[];
+      unwantedExtensionAction: UnwantedExtensionAction;
+    };
   }>({ query: UNACCEPTABLE_EXTENSIONS_QUERY });
   const [, updateSettings] = useMutation(UPDATE_SETTINGS_MUTATION);
-  const [, updateArchivePasswords] = useMutation(UPDATE_ARCHIVE_PASSWORD_SETTINGS_MUTATION);
-  const [, updateArchivePasswordList] = useMutation(UPDATE_ARCHIVE_PASSWORD_LIST_MUTATION);
+  const [, updateArchivePasswords] = useMutation(
+    UPDATE_ARCHIVE_PASSWORD_SETTINGS_MUTATION,
+  );
+  const [, updateArchivePasswordList] = useMutation(
+    UPDATE_ARCHIVE_PASSWORD_LIST_MUTATION,
+  );
   const [, setExtensions] = useMutation(SET_UNACCEPTABLE_EXTENSIONS_MUTATION);
-  const [, setExtensionAction] = useMutation(SET_UNWANTED_EXTENSION_ACTION_MUTATION);
+  const [, setExtensionAction] = useMutation(
+    SET_UNWANTED_EXTENSION_ACTION_MUTATION,
+  );
   // Each save answers with the setting as stored, so nothing is read again.
   const [settings, answerSettings] = useAnswered(data?.settings);
-  const [archive, answerArchive] = useAnswered(archiveData?.archivePasswordSettings);
-  const [extensions, answerExtensions] = useAnswered(extensionsData?.postProcessingSettings.unacceptableExtensions);
+  const [archive, answerArchive] = useAnswered(
+    archiveData?.archivePasswordSettings,
+  );
+  const [extensions, answerExtensions] = useAnswered(
+    extensionsData?.postProcessingSettings.unacceptableExtensions,
+  );
   const [extensionAction, answerExtensionAction] = useAnswered(
     extensionsData?.postProcessingSettings.unwantedExtensionAction,
   );
@@ -232,13 +274,19 @@ export function GeneralPanel() {
   // to a field is the one the daemon keeps.
   const queue = useRef<Promise<void>>(Promise.resolve());
   const [saving, setSaving] = useState(0);
-  const [failure, setFailure] = useState<{ key: FieldKey; message: string } | null>(null);
+  const [failure, setFailure] = useState<{
+    key: FieldKey;
+    message: string;
+  } | null>(null);
   // The password box stays shut until asked for, so clicking through settings on a shared screen shows none.
   const [editingPasswords, setEditingPasswords] = useState(false);
   // The stored list never comes back, so clearing it is asked first.
   const [confirmClear, setConfirmClear] = useState(false);
 
-  usePanelStatus(failure?.message ?? (saving > 0 ? t("settings.saving") : null), failure !== null);
+  usePanelStatus(
+    failure?.message ?? (saving > 0 ? t("settings.saving") : null),
+    failure !== null,
+  );
 
   const stored = useMemo<Form | null>(
     () =>
@@ -268,7 +316,9 @@ export function GeneralPanel() {
   const hasPasswords = archive?.hasPasswords ?? false;
 
   const refusal = (error: CombinedError | undefined) =>
-    error ? (error.graphQLErrors[0]?.message ?? error.message) : t("next.settings.saveFailed");
+    error
+      ? (error.graphQLErrors[0]?.message ?? error.message)
+      : t("next.settings.saveFailed");
 
   const sendSettings = async (input: Record<string, unknown>) => {
     const result = await updateSettings({ input });
@@ -282,9 +332,17 @@ export function GeneralPanel() {
 
   // A list given replaces the stored one, and an empty list removes it; a
   // file left out keeps the stored file, and null forgets it.
-  const sendArchive = async (variables: { passwords?: string[]; passwordFile?: string | null }) => {
-    const result = await ("passwordFile" in variables ? updateArchivePasswords : updateArchivePasswordList)(variables);
-    const answer = result.data?.updateArchivePasswordSettings as ArchivePasswordSettings | undefined;
+  const sendArchive = async (variables: {
+    passwords?: string[];
+    passwordFile?: string | null;
+  }) => {
+    const result = await (
+      "passwordFile" in variables
+        ? updateArchivePasswords
+        : updateArchivePasswordList
+    )(variables);
+    const answer = result.data?.updateArchivePasswordSettings as
+      ArchivePasswordSettings | undefined;
     if (result.error || !answer) {
       return refusal(result.error);
     }
@@ -294,7 +352,8 @@ export function GeneralPanel() {
 
   const sendExtensions = async (list: string[]) => {
     const result = await setExtensions({ extensions: list });
-    const answer = result.data?.setUnacceptableExtensions as string[] | undefined;
+    const answer = result.data?.setUnacceptableExtensions as
+      string[] | undefined;
     if (result.error || !answer) {
       return refusal(result.error);
     }
@@ -304,7 +363,8 @@ export function GeneralPanel() {
 
   const sendExtensionAction = async (action: UnwantedExtensionAction) => {
     const result = await setExtensionAction({ action });
-    const answer = result.data?.setUnwantedExtensionAction as UnwantedExtensionAction | undefined;
+    const answer = result.data?.setUnwantedExtensionAction as
+      UnwantedExtensionAction | undefined;
     if (result.error || !answer) {
       return refusal(result.error);
     }
@@ -312,10 +372,16 @@ export function GeneralPanel() {
     return null;
   };
 
-  const forget = (key: FieldKey) => setFailure((current) => (current?.key === key ? null : current));
+  const forget = (key: FieldKey) =>
+    setFailure((current) => (current?.key === key ? null : current));
 
   /** Queue one field's save; `send` answers with the daemon's refusal, or null once stored. */
-  const run = <K extends FieldKey>(key: K, value: Form[K], send: () => Promise<string | null>, onStored?: () => void) => {
+  const run = <K extends FieldKey>(
+    key: K,
+    value: Form[K],
+    send: () => Promise<string | null>,
+    onStored?: () => void,
+  ) => {
     pending.current = { ...pending.current, [key]: value };
     setSaving((count) => count + 1);
     forget(key);
@@ -337,11 +403,14 @@ export function GeneralPanel() {
       forget(key);
       onStored?.();
       // Stored: the field shows the daemon's copy again, unless it changed meanwhile.
-      setEdits((current) => (current[key] === value ? without(current, key) : current));
+      setEdits((current) =>
+        current[key] === value ? without(current, key) : current,
+      );
     });
   };
 
-  const edit = <K extends FieldKey>(key: K, value: Form[K]) => setEdits((current) => ({ ...current, [key]: value }));
+  const edit = <K extends FieldKey>(key: K, value: Form[K]) =>
+    setEdits((current) => ({ ...current, [key]: value }));
 
   /** A field's new value, stored unless the field already holds it or is about to. */
   const commit = <K extends FieldKey>(key: K, value: Form[K]) => {
@@ -349,7 +418,10 @@ export function GeneralPanel() {
       return;
     }
     const onItsWay = key in pending.current;
-    if (comparable(key, value) === comparable(key, onItsWay ? pending.current[key] : stored[key])) {
+    if (
+      comparable(key, value) ===
+      comparable(key, onItsWay ? pending.current[key] : stored[key])
+    ) {
       if (!onItsWay) {
         setEdits((current) => without(current, key));
         forget(key);
@@ -421,7 +493,12 @@ export function GeneralPanel() {
   ];
 
   const blocks: (SettingsBlock | null)[] = [
-    { kind: "section", id: "interface", title: t("next.general.interface"), fields: interfaceFields },
+    {
+      kind: "section",
+      id: "interface",
+      title: t("next.general.interface"),
+      fields: interfaceFields,
+    },
     {
       kind: "section",
       id: "updates",
@@ -519,7 +596,11 @@ export function GeneralPanel() {
                   value: action,
                   label: t(UNWANTED_EXTENSION_ACTION_LABEL[action]),
                 })),
-                onChange: (next: string) => commit("unwantedExtensionAction", next as UnwantedExtensionAction),
+                onChange: (next: string) =>
+                  commit(
+                    "unwantedExtensionAction",
+                    next as UnwantedExtensionAction,
+                  ),
               },
             },
           ],
@@ -552,12 +633,20 @@ export function GeneralPanel() {
                         onBlur={() => commitPasswords(values.archivePasswords)}
                       />
                     ) : (
-                      <SecondaryButton icon="password" onClick={() => setEditingPasswords(true)} testId={settingsIds.archivePasswordEdit}>
+                      <SecondaryButton
+                        icon="password"
+                        onClick={() => setEditingPasswords(true)}
+                        testId={settingsIds.archivePasswordEdit}
+                      >
                         {t("next.archivePasswords.edit")}
                       </SecondaryButton>
                     )}
                     {hasPasswords ? (
-                      <SecondaryButton icon="remove" onClick={() => setConfirmClear(true)} testId={settingsIds.archivePasswordClear}>
+                      <SecondaryButton
+                        icon="remove"
+                        onClick={() => setConfirmClear(true)}
+                        testId={settingsIds.archivePasswordClear}
+                      >
                         {t("next.common.clear")}
                       </SecondaryButton>
                     ) : null}
@@ -592,8 +681,12 @@ export function GeneralPanel() {
               id: "hardwareProfile",
               label: t("next.performance.profile"),
               help: t("next.performance.timing"),
-              keywords: "performance profile hardware memory threads efficient balanced",
-              control: { kind: "custom", control: <PerformanceProfile settings={profileSettings} /> },
+              keywords:
+                "performance profile hardware memory threads efficient balanced",
+              control: {
+                kind: "custom",
+                control: <PerformanceProfile settings={profileSettings} />,
+              },
             },
           ],
         }
@@ -726,7 +819,11 @@ export function GeneralPanel() {
  * The daemon validates the pick against the machine it is running on, and a
  * refusal belongs beside the select.
  */
-function PerformanceProfile({ settings }: { settings: HardwareProfileSettings }) {
+function PerformanceProfile({
+  settings,
+}: {
+  settings: HardwareProfileSettings;
+}) {
   const t = useTranslate();
   const [state, setProfile] = useMutation(SET_HARDWARE_PROFILE_MUTATION);
   const [chosen, setChosen] = useState<HardwareProfileName | null>(null);
@@ -734,7 +831,9 @@ function PerformanceProfile({ settings }: { settings: HardwareProfileSettings })
 
   // The mutation answers with the whole setting, so a save is visible without
   // asking the daemon again.
-  const saved = (state.data?.setHardwareProfile as HardwareProfileSettings | undefined) ?? settings;
+  const saved =
+    (state.data?.setHardwareProfile as HardwareProfileSettings | undefined) ??
+    settings;
   const value = chosen ?? initialProfile(saved);
   const scheduledNotice = scheduledProfileNotice(t, saved);
 
@@ -744,7 +843,9 @@ function PerformanceProfile({ settings }: { settings: HardwareProfileSettings })
     void setProfile({ profile: next }).then((result) => {
       if (result.error) {
         setChosen(null);
-        setError(result.error.graphQLErrors[0]?.message ?? result.error.message);
+        setError(
+          result.error.graphQLErrors[0]?.message ?? result.error.message,
+        );
       }
     });
   };
@@ -755,11 +856,22 @@ function PerformanceProfile({ settings }: { settings: HardwareProfileSettings })
         testId={testIds.field("hardwareProfile")}
         label={t("next.performance.profile")}
         options={saved.options.map((option) => {
-          const Icon = { EFFICIENT: Leaf, BALANCED: Scale, PERFORMANCE: Rocket }[option.profile];
+          const Icon = {
+            EFFICIENT: Leaf,
+            BALANCED: Scale,
+            PERFORMANCE: Rocket,
+          }[option.profile];
           return {
             value: option.profile,
             label: profileName(t, option.profile),
-            icon: <Icon aria-hidden="true" size={16} strokeWidth={1.5} className="flex-none text-wv-muted" />,
+            icon: (
+              <Icon
+                aria-hidden="true"
+                size={16}
+                strokeWidth={1.5}
+                className="flex-none text-wv-muted"
+              />
+            ),
           };
         })}
         value={value}
@@ -767,9 +879,16 @@ function PerformanceProfile({ settings }: { settings: HardwareProfileSettings })
         disabled={state.fetching}
       />
       {saved.selected === null ? (
-        <p data-testid={settingsIds.profileUnconfirmed} className="text-[11.5px] text-wv-dim">{t("next.performance.notConfirmed")}</p>
+        <p
+          data-testid={settingsIds.profileUnconfirmed}
+          className="text-[11.5px] text-wv-dim"
+        >
+          {t("next.performance.notConfirmed")}
+        </p>
       ) : null}
-      {scheduledNotice ? <p className="text-[11.5px] text-wv-dim">{scheduledNotice}</p> : null}
+      {scheduledNotice ? (
+        <p className="text-[11.5px] text-wv-dim">{scheduledNotice}</p>
+      ) : null}
       {error ? (
         <p role="alert" className="text-[12.5px] text-wv-error-text">
           {error}
@@ -788,7 +907,10 @@ function UpdateCheck() {
       <SecondaryButton icon="refresh" disabled={busy} onClick={check}>
         {t("next.general.checkNow")}
       </SecondaryButton>
-      <span role="status" className={`max-w-full text-right text-[12.5px] whitespace-normal [overflow-wrap:anywhere] ${failed ? "text-wv-error" : "text-wv-dim"}`}>
+      <span
+        role="status"
+        className={`max-w-full text-right text-[12.5px] whitespace-normal [overflow-wrap:anywhere] ${failed ? "text-wv-error" : "text-wv-dim"}`}
+      >
         {summary}
       </span>
     </div>

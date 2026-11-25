@@ -10,8 +10,15 @@ import {
 } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
 import { testIds } from "@/next/testids";
-import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
-import { CheckBox, SecondaryButton, TextField } from "../../../components/controls";
+import {
+  RecordEditor,
+  type EditorSection,
+} from "../../../components/RecordEditor";
+import {
+  CheckBox,
+  SecondaryButton,
+  TextField,
+} from "../../../components/controls";
 import { Icon } from "../../../components/icons";
 import {
   MAX_TIMEOUT_SECONDS,
@@ -44,7 +51,11 @@ import {
 import { SCHEDULE_DAYS } from "../../../data/schedule-options";
 import { withoutTorrentOnly } from "../../../data/torrents-shown";
 import { useTorrentsAvailable } from "../../../data/use-torrents-shown";
-import { sortedSecrets, type Secret, type SecretRef } from "../../../data/secrets";
+import {
+  sortedSecrets,
+  type Secret,
+  type SecretRef,
+} from "../../../data/secrets";
 import { FieldControlView, type FieldSpec } from "../framework";
 import { SecretEditor } from "./SecretEditor";
 
@@ -65,14 +76,18 @@ import { SecretEditor } from "./SecretEditor";
  */
 
 /** What the editor was opened on: a saved instance, or a new one. */
-export type InstanceEditorTarget = { mode: "new" } | { mode: "edit"; instance: ScriptInstance };
+export type InstanceEditorTarget =
+  { mode: "new" } | { mode: "edit"; instance: ScriptInstance };
 
 /** The secret picker's entry that opens the editor of a new secret. */
 const CREATE_SECRET = "\u0000create";
 
-const CHIP = "flex h-8 cursor-pointer items-center justify-center border px-[11px] font-wv-mono text-[11.5px]";
-const CHIP_ON = "border-wv-accent bg-wv-segment-active font-medium text-wv-strong";
-const CHIP_OFF = "border-wv-control bg-wv-input text-wv-muted hover:border-wv-control-hover";
+const CHIP =
+  "flex h-8 cursor-pointer items-center justify-center border px-[11px] font-wv-mono text-[11.5px]";
+const CHIP_ON =
+  "border-wv-accent bg-wv-segment-active font-medium text-wv-strong";
+const CHIP_OFF =
+  "border-wv-control bg-wv-input text-wv-muted hover:border-wv-control-hover";
 
 export function ScriptInstanceEditor({
   target,
@@ -110,7 +125,10 @@ export function ScriptInstanceEditor({
   const [, updateInstance] = useMutation(UPDATE_SCRIPT_INSTANCE_MUTATION);
 
   const editing = target.mode === "edit" ? target.instance : null;
-  const byName = useMemo(() => new Map(scripts.map((entry) => [entry.name, entry])), [scripts]);
+  const byName = useMemo(
+    () => new Map(scripts.map((entry) => [entry.name, entry])),
+    [scripts],
+  );
   const [form, setForm] = useState<InstanceForm>(() =>
     target.mode === "edit"
       ? formFromInstance(target.instance, byName.get(target.instance.script))
@@ -123,18 +141,28 @@ export function ScriptInstanceEditor({
   const [newValue, setNewValue] = useState("");
   const [newSecret, setNewSecret] = useState(false);
   const [newProblem, setNewProblem] = useState<string | null>(null);
-  const [{ data: secretsData }] = useQuery<{ secrets: Secret[] }>({ query: SECRETS_QUERY });
+  const [{ data: secretsData }] = useQuery<{ secrets: Secret[] }>({
+    query: SECRETS_QUERY,
+  });
   // Secrets created from this editor, until the list is read again.
   const [created, setCreated] = useState<Secret[]>([]);
   // The input a new secret is being created for.
   const [creatingFor, setCreatingFor] = useState<number | null>(null);
   const secrets = useMemo(() => {
     const listed = secretsData?.secrets ?? [];
-    return sortedSecrets([...listed, ...created.filter((entry) => !listed.some((own) => own.id === entry.id))]);
+    return sortedSecrets([
+      ...listed,
+      ...created.filter((entry) => !listed.some((own) => own.id === entry.id)),
+    ]);
   }, [secretsData?.secrets, created]);
   // What a saved input links, for a secret the list does not hold.
   const linked = useMemo(
-    () => new Map<string, SecretRef>((editing?.inputs ?? []).flatMap((input) => (input.secret ? [[input.secret.id, input.secret]] : []))),
+    () =>
+      new Map<string, SecretRef>(
+        (editing?.inputs ?? []).flatMap((input) =>
+          input.secret ? [[input.secret.id, input.secret]] : [],
+        ),
+      ),
     [editing],
   );
 
@@ -148,14 +176,21 @@ export function ScriptInstanceEditor({
   const schedule = form.schedule;
   const patchSchedule = (next: Partial<JobScheduleForm>) => {
     setError(null);
-    setForm((current) => ({ ...current, schedule: { ...current.schedule, ...next } }));
+    setForm((current) => ({
+      ...current,
+      schedule: { ...current.schedule, ...next },
+    }));
   };
 
   const save = async () => {
     // What is wrong with the times is said before anything is saved. A job
     // that is turned off may wait without any.
     const times = scheduled ? jobSchedule(schedule) : null;
-    if (times && "problem" in times && (times.problem === "invalid" || form.enabled)) {
+    if (
+      times &&
+      "problem" in times &&
+      (times.problem === "invalid" || form.enabled)
+    ) {
       setError(
         times.problem === "invalid"
           ? t("next.postProcessing.runTimeInvalid", { time: times.time })
@@ -174,7 +209,12 @@ export function ScriptInstanceEditor({
       return;
     }
     const name = input.name || input.script;
-    const status = t(editing ? "next.postProcessing.instanceSaved" : "next.postProcessing.instanceCreated", { name });
+    const status = t(
+      editing
+        ? "next.postProcessing.instanceSaved"
+        : "next.postProcessing.instanceCreated",
+      { name },
+    );
     setBusy(false);
     onSaved(status);
   };
@@ -192,21 +232,37 @@ export function ScriptInstanceEditor({
   /* ------------------------------------------------------------- the script */
 
   const scriptOptions = [
-    ...(form.script === "" ? [{ value: "", label: t("next.postProcessing.chooseScript") }] : []),
+    ...(form.script === ""
+      ? [{ value: "", label: t("next.postProcessing.chooseScript") }]
+      : []),
     ...scripts.map((entry) => ({
       value: entry.name,
-      label: entry.displayName === entry.name ? entry.name : `${entry.displayName} · ${entry.name}`,
+      label:
+        entry.displayName === entry.name
+          ? entry.name
+          : `${entry.displayName} · ${entry.name}`,
     })),
     // A saved instance keeps naming its script after the file has gone.
     ...(form.script !== "" && !script
-      ? [{ value: form.script, label: `${form.script} · ${t("next.postProcessing.missing")}` }]
+      ? [
+          {
+            value: form.script,
+            label: `${form.script} · ${t("next.postProcessing.missing")}`,
+          },
+        ]
       : []),
   ];
 
   // The events offered: without the torrents' own on a server that has no
   // torrents. The one a saved instance runs on stays listed either way.
-  const events: string[] = withoutTorrentOnly(QUEUE_EVENTS, torrentsAvailable, isTorrentQueueEvent);
-  const queueEvents: string[] = events.includes(form.queueEvent) ? events : [...events, form.queueEvent];
+  const events: string[] = withoutTorrentOnly(
+    QUEUE_EVENTS,
+    torrentsAvailable,
+    isTorrentQueueEvent,
+  );
+  const queueEvents: string[] = events.includes(form.queueEvent)
+    ? events
+    : [...events, form.queueEvent];
 
   const scriptFields: FieldSpec[] = [
     {
@@ -218,7 +274,9 @@ export function ScriptInstanceEditor({
         options: scriptOptions,
         onChange: (next) => {
           setError(null);
-          setForm((current) => withScript(current, byName.get(next), editing === null));
+          setForm((current) =>
+            withScript(current, byName.get(next), editing === null),
+          );
         },
       },
     },
@@ -243,8 +301,12 @@ export function ScriptInstanceEditor({
             control: {
               kind: "select" as const,
               value: form.queueEvent,
-              options: queueEvents.map((event) => ({ value: event, label: event })),
-              onChange: (next: string) => patch({ queueEvent: next as QueueEvent }),
+              options: queueEvents.map((event) => ({
+                value: event,
+                label: event,
+              })),
+              onChange: (next: string) =>
+                patch({ queueEvent: next as QueueEvent }),
             },
           },
         ]
@@ -266,84 +328,107 @@ export function ScriptInstanceEditor({
   /* ----------------------------------------------------------- when it runs */
 
   const scheduleFields: FieldSpec[] = [
-        {
-          id: "runTimes",
-          label: t("next.postProcessing.runTimes"),
-          help: t("next.schedules.scriptTimeHelp"),
-          control: {
-            kind: "text",
-            value: schedule.times,
-            placeholder: "04:00, *:30",
-            onChange: (next) => patchSchedule({ times: next }),
-          },
-        },
-        {
-          id: "runDays",
-          label: t("next.schedules.days"),
-          help: t("next.schedules.daysHelp"),
-          control: {
-            kind: "custom",
-            control: (
-              <div role="group" aria-label={t("next.schedules.days")} className="flex flex-wrap justify-end gap-1.5">
-                {SCHEDULE_DAYS.map((day) => {
-                  const active = schedule.days.includes(day.key);
-                  return (
-                    <button
-                      key={day.key}
-                      type="button"
-                      aria-pressed={active}
-                      onClick={() =>
-                        patchSchedule({
-                          days: active
-                            ? schedule.days.filter((entry) => entry !== day.key)
-                            : [...schedule.days, day.key],
-                        })
-                      }
-                      className={`${CHIP} ${active ? CHIP_ON : CHIP_OFF}`}
-                    >
-                      {t(day.label)}
-                    </button>
-                  );
-                })}
-              </div>
-            ),
-          },
-        },
-        {
-          id: "runAtStartup",
-          label: t("next.schedules.runAtStartup"),
-          control: {
-            kind: "toggle",
-            value: schedule.startup,
-            onChange: (next) => patchSchedule({ startup: next }),
-          },
-        },
+    {
+      id: "runTimes",
+      label: t("next.postProcessing.runTimes"),
+      help: t("next.schedules.scriptTimeHelp"),
+      control: {
+        kind: "text",
+        value: schedule.times,
+        placeholder: "04:00, *:30",
+        onChange: (next) => patchSchedule({ times: next }),
+      },
+    },
+    {
+      id: "runDays",
+      label: t("next.schedules.days"),
+      help: t("next.schedules.daysHelp"),
+      control: {
+        kind: "custom",
+        control: (
+          <div
+            role="group"
+            aria-label={t("next.schedules.days")}
+            className="flex flex-wrap justify-end gap-1.5"
+          >
+            {SCHEDULE_DAYS.map((day) => {
+              const active = schedule.days.includes(day.key);
+              return (
+                <button
+                  key={day.key}
+                  type="button"
+                  aria-pressed={active}
+                  onClick={() =>
+                    patchSchedule({
+                      days: active
+                        ? schedule.days.filter((entry) => entry !== day.key)
+                        : [...schedule.days, day.key],
+                    })
+                  }
+                  className={`${CHIP} ${active ? CHIP_ON : CHIP_OFF}`}
+                >
+                  {t(day.label)}
+                </button>
+              );
+            })}
+          </div>
+        ),
+      },
+    },
+    {
+      id: "runAtStartup",
+      label: t("next.schedules.runAtStartup"),
+      control: {
+        kind: "toggle",
+        value: schedule.startup,
+        onChange: (next) => patchSchedule({ startup: next }),
+      },
+    },
   ];
 
   /* ------------------------------------------------------------- its inputs */
 
-  const changeInput = (index: number, change: (input: InstanceInputForm) => InstanceInputForm) => {
+  const changeInput = (
+    index: number,
+    change: (input: InstanceInputForm) => InstanceInputForm,
+  ) => {
     setError(null);
     setForm((current) => ({
       ...current,
-      inputs: current.inputs.map((entry, at) => (at === index ? change(entry) : entry)),
+      inputs: current.inputs.map((entry, at) =>
+        at === index ? change(entry) : entry,
+      ),
     }));
   };
-  const setInput = (index: number, value: string) => changeInput(index, (entry) => ({ ...entry, value }));
+  const setInput = (index: number, value: string) =>
+    changeInput(index, (entry) => ({ ...entry, value }));
   const linkSecret = (index: number, secretId: string | null) =>
     changeInput(index, (entry) => withLinkedSecret(entry, secretId));
 
   // The first entry clears the link: a prompt while nothing is linked, and
   // "No secret" once something is.
   const secretOptions = (input: InstanceInputForm) => {
-    const known = input.secretId === null || secrets.some((entry) => entry.id === input.secretId);
+    const known =
+      input.secretId === null ||
+      secrets.some((entry) => entry.id === input.secretId);
     return [
       {
         value: "",
-        label: t(input.secretId === null ? "next.postProcessing.chooseSecret" : "next.postProcessing.noSecret"),
+        label: t(
+          input.secretId === null
+            ? "next.postProcessing.chooseSecret"
+            : "next.postProcessing.noSecret",
+        ),
       },
       ...secrets.map((entry) => ({ value: entry.id, label: entry.name })),
-      ...(known ? [] : [{ value: input.secretId!, label: linked.get(input.secretId!)?.name ?? input.secretId! }]),
+      ...(known
+        ? []
+        : [
+            {
+              value: input.secretId!,
+              label: linked.get(input.secretId!)?.name ?? input.secretId!,
+            },
+          ]),
       { value: CREATE_SECRET, label: t("next.postProcessing.createSecret") },
     ];
   };
@@ -376,40 +461,44 @@ export function ScriptInstanceEditor({
             type: "password",
             value: input.value,
             // A saved one is not read back: left blank, it stays as it is.
-            placeholder: input.held ? t("next.postProcessing.ownSecretSaved") : undefined,
+            placeholder: input.held
+              ? t("next.postProcessing.ownSecretSaved")
+              : undefined,
             onChange,
           }
         : input.secret
-        ? {
-            kind: "select",
-            value: input.secretId ?? "",
-            className: width,
-            options: secretOptions(input),
-            onChange: (next: string) => {
-              if (next === CREATE_SECRET) {
-                setCreatingFor(index);
-              } else {
-                linkSecret(index, next === "" ? null : next);
-              }
-            },
-          }
-        : option && option.select.length > 0
           ? {
               kind: "select",
-              value: input.value,
+              value: input.secretId ?? "",
               className: width,
-              options: (option.select.includes(input.value) ? option.select : [input.value, ...option.select]).map(
-                (entry) => ({ value: entry, label: entry }),
-              ),
-              onChange,
+              options: secretOptions(input),
+              onChange: (next: string) => {
+                if (next === CREATE_SECRET) {
+                  setCreatingFor(index);
+                } else {
+                  linkSecret(index, next === "" ? null : next);
+                }
+              },
             }
-          : option?.optionType === "BOOLEAN"
+          : option && option.select.length > 0
             ? {
-                kind: "toggle",
-                value: booleanInputOn(input.value),
-                onChange: (next: boolean) => onChange(booleanInputValue(next)),
+                kind: "select",
+                value: input.value,
+                className: width,
+                options: (option.select.includes(input.value)
+                  ? option.select
+                  : [input.value, ...option.select]
+                ).map((entry) => ({ value: entry, label: entry })),
+                onChange,
               }
-            : { kind: "text", value: input.value, onChange },
+            : option?.optionType === "BOOLEAN"
+              ? {
+                  kind: "toggle",
+                  value: booleanInputOn(input.value),
+                  onChange: (next: boolean) =>
+                    onChange(booleanInputValue(next)),
+                }
+              : { kind: "text", value: input.value, onChange },
     };
     // An input is a value or a secret, not a thing switched between the two:
     // the header says which for one it declares, and one added here is a value
@@ -417,7 +506,8 @@ export function ScriptInstanceEditor({
     // an input for a secret by its name, and an input it calls plain may have
     // been saved as a secret; either can be made plain, which empties it.
     // Only an input the header does not ask for can be taken away.
-    const secretChoice = option !== undefined && (option.optionType === "SECRET" || input.secret);
+    const secretChoice =
+      option !== undefined && (option.optionType === "SECRET" || input.secret);
     return {
       ...field,
       control: {
@@ -430,8 +520,12 @@ export function ScriptInstanceEditor({
               <label className="flex flex-none cursor-pointer items-center gap-2 text-[12.5px] text-wv-secondary">
                 <CheckBox
                   checked={input.secret}
-                  onChange={(next) => changeInput(index, (entry) => withSecret(entry, next))}
-                  label={t("next.postProcessing.inputIsSecret", { name: input.name })}
+                  onChange={(next) =>
+                    changeInput(index, (entry) => withSecret(entry, next))
+                  }
+                  label={t("next.postProcessing.inputIsSecret", {
+                    name: input.name,
+                  })}
                 />
                 {t("next.postProcessing.secret")}
               </label>
@@ -439,7 +533,9 @@ export function ScriptInstanceEditor({
             {option ? null : (
               <SecondaryButton
                 className="px-[10px]"
-                title={t("next.postProcessing.removeInput", { name: input.name })}
+                title={t("next.postProcessing.removeInput", {
+                  name: input.name,
+                })}
                 onClick={() => {
                   setError(null);
                   setForm((current) => ({
@@ -468,7 +564,14 @@ export function ScriptInstanceEditor({
       ...current,
       inputs: [
         ...current.inputs,
-        { name: newName.trim(), value: newValue, secret: false, secretId: null, own: newSecret, held: false },
+        {
+          name: newName.trim(),
+          value: newValue,
+          secret: false,
+          secretId: null,
+          own: newSecret,
+          held: false,
+        },
       ],
     }));
     setNewName("");
@@ -533,7 +636,10 @@ export function ScriptInstanceEditor({
           </SecondaryButton>
         </div>
         {newProblem ? (
-          <span role="alert" className="text-[12px] leading-[1.45] text-wv-error-text">
+          <span
+            role="alert"
+            className="text-[12px] leading-[1.45] text-wv-error-text"
+          >
             {t(newProblem)}
           </span>
         ) : null}
@@ -543,11 +649,14 @@ export function ScriptInstanceEditor({
 
   /* ------------------------------------------------------------ how it runs */
 
-  const sameCategory = (left: string, right: string) => left.toLowerCase() === right.toLowerCase();
+  const sameCategory = (left: string, right: string) =>
+    left.toLowerCase() === right.toLowerCase();
   // A category that has since been removed stays offered while it is still saved.
   const offered = [
     ...categories,
-    ...form.categories.filter((saved) => !categories.some((name) => sameCategory(name, saved))),
+    ...form.categories.filter(
+      (saved) => !categories.some((name) => sameCategory(name, saved)),
+    ),
   ];
 
   const runFields: FieldSpec[] = [
@@ -560,12 +669,22 @@ export function ScriptInstanceEditor({
             keywords: offered.join(" "),
             control:
               offered.length === 0
-                ? { kind: "static" as const, value: t("next.postProcessing.noCategories") }
+                ? {
+                    kind: "static" as const,
+                    value: t("next.postProcessing.noCategories"),
+                  }
                 : {
                     kind: "multiselect" as const,
                     // What is saved may differ in case from the category as it is named now.
-                    values: offered.filter((name) => form.categories.some((entry) => sameCategory(entry, name))),
-                    options: offered.map((name) => ({ value: name, label: name })),
+                    values: offered.filter((name) =>
+                      form.categories.some((entry) =>
+                        sameCategory(entry, name),
+                      ),
+                    ),
+                    options: offered.map((name) => ({
+                      value: name,
+                      label: name,
+                    })),
                     placeholder: t("next.postProcessing.everyCategory"),
                     className: "w-[268px] max-w-full",
                     onChange: (next: string[]) => patch({ categories: next }),
@@ -582,7 +701,10 @@ export function ScriptInstanceEditor({
         value: form.blocking ? "blocking" : "background",
         options: [
           { value: "blocking", label: t("next.postProcessing.blocking") },
-          { value: "background", label: t("next.postProcessing.fireAndForget") },
+          {
+            value: "background",
+            label: t("next.postProcessing.fireAndForget"),
+          },
         ],
         onChange: (next) => patch({ blocking: next === "blocking" }),
       },
@@ -613,23 +735,39 @@ export function ScriptInstanceEditor({
 
   // Under the choice of script: why a saved instance's script cannot run, or,
   // for a new one, why the script looked for is not among the choices.
-  const NOTE = "flex-none border-b border-wv-hairline px-4 py-3 text-[12.5px] leading-[1.5] sm:px-6";
+  const NOTE =
+    "flex-none border-b border-wv-hairline px-4 py-3 text-[12.5px] leading-[1.5] sm:px-6";
   const scriptNotes = editing ? (
     editing.scriptProblem ? (
-      <div className={`${NOTE} text-wv-error-text`}>{editing.scriptProblem}</div>
+      <div className={`${NOTE} text-wv-error-text`}>
+        {editing.scriptProblem}
+      </div>
     ) : undefined
   ) : scripts.length === 0 || problems.length > 0 ? (
     <>
       {scripts.length === 0 ? (
-        <div className={`${NOTE} text-wv-muted`}>{t("next.postProcessing.discoveredEmpty")}</div>
+        <div className={`${NOTE} text-wv-muted`}>
+          {t("next.postProcessing.discoveredEmpty")}
+        </div>
       ) : null}
       {problems.length > 0 ? (
-        <div role="group" aria-label={t("next.postProcessing.problems")} className={`${NOTE} flex flex-col gap-1`}>
-          <span className="text-wv-muted">{t("next.postProcessing.problems")}</span>
+        <div
+          role="group"
+          aria-label={t("next.postProcessing.problems")}
+          className={`${NOTE} flex flex-col gap-1`}
+        >
+          <span className="text-wv-muted">
+            {t("next.postProcessing.problems")}
+          </span>
           {problems.map((problem) => (
-            <span key={problem.name} className="flex flex-wrap items-baseline gap-x-3">
+            <span
+              key={problem.name}
+              className="flex flex-wrap items-baseline gap-x-3"
+            >
               <span className="font-wv-mono text-wv-fg">{problem.name}</span>
-              <span className="min-w-0 flex-1 text-wv-error-text">{problem.message}</span>
+              <span className="min-w-0 flex-1 text-wv-error-text">
+                {problem.message}
+              </span>
             </span>
           ))}
         </div>
@@ -645,7 +783,13 @@ export function ScriptInstanceEditor({
       body: scriptNotes,
     },
     ...(scheduled
-      ? [{ id: "schedule", title: t("next.schedules.schedule"), fields: scheduleFields }]
+      ? [
+          {
+            id: "schedule",
+            title: t("next.schedules.schedule"),
+            fields: scheduleFields,
+          },
+        ]
       : []),
     {
       id: "inputs",
@@ -662,57 +806,64 @@ export function ScriptInstanceEditor({
 
   // Setting up from the header only has something to do while the header asks
   // for an instance the script does not have yet.
-  const canSetUp = editing === null && script !== undefined && unwiredTriggers(script, instances).length > 0;
+  const canSetUp =
+    editing === null &&
+    script !== undefined &&
+    unwiredTriggers(script, instances).length > 0;
 
   return (
     <>
-    <RecordEditor
-      testId={testIds.dialog("pp-job")}
-      open
-      title={editing ? editing.name : t("next.postProcessing.createInstance")}
-      note={
-        editing
-          ? triggerTitle(t, editing.trigger, editing.queueEvent)
-          : undefined
-      }
-      width={640}
-      sections={sections}
-      error={error}
-      busy={busy}
-      saveDisabled={form.script === ""}
-      onSave={() => void save()}
-      onDismiss={onDismiss}
-      onDelete={editing ? () => onDelete(editing) : undefined}
-      extraActions={
-        <>
-          {editing?.headerDrift ? (
-            <SecondaryButton icon="reset" disabled={busy} onClick={() => onReapply(editing)}>
-              {t("next.postProcessing.reapply")}
-            </SecondaryButton>
-          ) : null}
-          {canSetUp ? (
-            <SecondaryButton
-              disabled={busy}
-              title={t("next.postProcessing.setUpFromHeaderHelp")}
-              onClick={() => void setUp()}
-            >
-              {t("next.postProcessing.setUpFromHeader")}
-            </SecondaryButton>
-          ) : null}
-        </>
-      }
-    />
-    {creatingFor !== null ? (
-      <SecretEditor
-        target={{ mode: "new" }}
-        onSaved={(secret) => {
-          setCreated((current) => [...current, secret]);
-          linkSecret(creatingFor, secret.id);
-          setCreatingFor(null);
-        }}
-        onDismiss={() => setCreatingFor(null)}
+      <RecordEditor
+        testId={testIds.dialog("pp-job")}
+        open
+        title={editing ? editing.name : t("next.postProcessing.createInstance")}
+        note={
+          editing
+            ? triggerTitle(t, editing.trigger, editing.queueEvent)
+            : undefined
+        }
+        width={640}
+        sections={sections}
+        error={error}
+        busy={busy}
+        saveDisabled={form.script === ""}
+        onSave={() => void save()}
+        onDismiss={onDismiss}
+        onDelete={editing ? () => onDelete(editing) : undefined}
+        extraActions={
+          <>
+            {editing?.headerDrift ? (
+              <SecondaryButton
+                icon="reset"
+                disabled={busy}
+                onClick={() => onReapply(editing)}
+              >
+                {t("next.postProcessing.reapply")}
+              </SecondaryButton>
+            ) : null}
+            {canSetUp ? (
+              <SecondaryButton
+                disabled={busy}
+                title={t("next.postProcessing.setUpFromHeaderHelp")}
+                onClick={() => void setUp()}
+              >
+                {t("next.postProcessing.setUpFromHeader")}
+              </SecondaryButton>
+            ) : null}
+          </>
+        }
       />
-    ) : null}
+      {creatingFor !== null ? (
+        <SecretEditor
+          target={{ mode: "new" }}
+          onSaved={(secret) => {
+            setCreated((current) => [...current, secret]);
+            linkSecret(creatingFor, secret.id);
+            setCreatingFor(null);
+          }}
+          onDismiss={() => setCreatingFor(null)}
+        />
+      ) : null}
     </>
   );
 }

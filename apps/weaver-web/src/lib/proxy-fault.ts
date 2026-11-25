@@ -18,10 +18,23 @@ export const proxyTestKey = (code: string) => `next.proxyTest.${code}`;
 
 /** What to show for a proxy's failure: our sentence for its code, or the daemon's words. */
 export function proxyFaultSentence(t: Translate, fault: CodedOutcome): string {
-  return codedSentence(t, proxyFaultKey(fault.code), fault.params, fault.message);
+  return codedSentence(
+    t,
+    proxyFaultKey(fault.code),
+    fault.params,
+    fault.message,
+  );
 }
 
 /** What to show for a proxy test, passed or failed. */
-export function proxyTestSentence(t: Translate, test: CodedOutcome & { success: boolean }): string {
-  return codedSentence(t, (test.success ? proxyTestKey : proxyFaultKey)(test.code), test.params, test.message);
+export function proxyTestSentence(
+  t: Translate,
+  test: CodedOutcome & { success: boolean },
+): string {
+  return codedSentence(
+    t,
+    (test.success ? proxyTestKey : proxyFaultKey)(test.code),
+    test.params,
+    test.message,
+  );
 }

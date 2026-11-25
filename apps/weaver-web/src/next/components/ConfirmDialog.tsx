@@ -57,13 +57,23 @@ export function ConfirmDialog({
       testId={testId}
       footer={
         <>
-          <SecondaryButton onClick={onDismiss} testId={testIds.confirmDismiss}>{dismissLabel ?? t("action.cancel")}</SecondaryButton>
+          <SecondaryButton onClick={onDismiss} testId={testIds.confirmDismiss}>
+            {dismissLabel ?? t("action.cancel")}
+          </SecondaryButton>
           {alternative === undefined ? null : alternative.plain ? (
-            <SecondaryButton onClick={alternative.onConfirm} disabled={busy} testId={testIds.confirmAlternative}>
+            <SecondaryButton
+              onClick={alternative.onConfirm}
+              disabled={busy}
+              testId={testIds.confirmAlternative}
+            >
               {alternative.label}
             </SecondaryButton>
           ) : (
-            <DangerButton onClick={alternative.onConfirm} disabled={busy} testId={testIds.confirmAlternative}>
+            <DangerButton
+              onClick={alternative.onConfirm}
+              disabled={busy}
+              testId={testIds.confirmAlternative}
+            >
               {alternative.label}
             </DangerButton>
           )}
@@ -77,7 +87,11 @@ export function ConfirmDialog({
               {confirmLabel ?? t("next.common.remove")}
             </DangerButton>
           ) : (
-            <PrimaryButton onClick={onConfirm} disabled={busy} testId={testIds.confirmAccept}>
+            <PrimaryButton
+              onClick={onConfirm}
+              disabled={busy}
+              testId={testIds.confirmAccept}
+            >
               {confirmLabel ?? t("next.common.remove")}
             </PrimaryButton>
           )}

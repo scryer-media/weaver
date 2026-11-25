@@ -78,7 +78,9 @@ export function SecurityUpgradeNotice() {
     query: SECURITY_UPGRADE_NOTICE_QUERY,
     requestPolicy: "network-only",
   });
-  const [dismissState, dismissNotice] = useMutation(DISMISS_SECURITY_UPGRADE_NOTICE_MUTATION);
+  const [dismissState, dismissNotice] = useMutation(
+    DISMISS_SECURITY_UPGRADE_NOTICE_MUTATION,
+  );
   const notice = data?.securityUpgradeNotice;
 
   // Opened once per page load; a refetch never reopens a closed notice.
@@ -98,7 +100,11 @@ export function SecurityUpgradeNotice() {
     setError(null);
     void dismissNotice({}).then((result) => {
       if (result.error) {
-        setError(t("next.securityNotice.dismissFailed", { message: result.error.message }));
+        setError(
+          t("next.securityNotice.dismissFailed", {
+            message: result.error.message,
+          }),
+        );
         return;
       }
       setOpen(false);
@@ -121,7 +127,11 @@ export function SecurityUpgradeNotice() {
             rel="noreferrer noopener"
             className="flex h-[34px] items-center justify-center whitespace-nowrap border border-wv-control bg-wv-button px-[14px] text-[13px] font-medium text-wv-fg hover:border-wv-control-hover hover:bg-wv-button-hover"
           >
-            <Icon name="external" size={14} className="-ml-[2px] mr-[7px] flex-none" />
+            <Icon
+              name="external"
+              size={14}
+              className="-ml-[2px] mr-[7px] flex-none"
+            />
             {t("next.securityNotice.guide")}
           </a>
           <PrimaryButton disabled={dismissState.fetching} onClick={dismiss}>
@@ -154,7 +164,9 @@ export function SecurityUpgradeNotice() {
               {steps.code}
             </pre>
           )}
-          {steps.after === null ? null : <p className="text-wv-muted">{steps.after}</p>}
+          {steps.after === null ? null : (
+            <p className="text-wv-muted">{steps.after}</p>
+          )}
           <p className="text-wv-muted">
             {notice.loginEnabled
               ? t("next.securityNotice.keepsLogin")
@@ -162,7 +174,9 @@ export function SecurityUpgradeNotice() {
           </p>
         </section>
 
-        {error === null ? null : <p className="text-[12.5px] text-wv-error-text">{error}</p>}
+        {error === null ? null : (
+          <p className="text-[12.5px] text-wv-error-text">{error}</p>
+        )}
       </div>
     </Dialog>
   );

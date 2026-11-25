@@ -45,9 +45,19 @@ export function ScriptRunName({ run }: { run: ScriptRunInstance }) {
   const name = scriptRunName(run);
   return (
     <span className="flex min-w-0 items-baseline gap-2">
-      <span className="min-w-0 truncate font-wv-mono text-[12.5px] text-wv-fg" title={name}>{name}</span>
+      <span
+        className="min-w-0 truncate font-wv-mono text-[12.5px] text-wv-fg"
+        title={name}
+      >
+        {name}
+      </span>
       {name === run.script ? null : (
-        <span className="min-w-0 truncate font-wv-mono text-[11px] text-wv-muted" title={run.script}>{run.script}</span>
+        <span
+          className="min-w-0 truncate font-wv-mono text-[11px] text-wv-muted"
+          title={run.script}
+        >
+          {run.script}
+        </span>
       )}
     </span>
   );
@@ -61,7 +71,11 @@ interface ScriptResult extends ScriptRunOutputSource, ScriptRunInstance {
   background: boolean;
 }
 
-const OUTPUT_QUERY = gql`query ScriptOutput($outputId: String!) { scriptOutput(outputId: $outputId) }`;
+const OUTPUT_QUERY = gql`
+  query ScriptOutput($outputId: String!) {
+    scriptOutput(outputId: $outputId)
+  }
+`;
 
 /** How a run ended, as the colour of its square and of the word beside it. */
 const STATUS_TONE: Record<string, { color: string; text: string }> = {
@@ -81,9 +95,14 @@ const QUIET_ACTION = "cursor-pointer text-wv-dim hover:text-wv-fg";
 export function ScriptStatusMark({ status }: { status: string }) {
   const tone = STATUS_TONE[status] ?? QUIET_TONE;
   return (
-    <span data-testid={jobIds.scriptRunStatus(status)} className="flex flex-none items-center gap-[7px]">
+    <span
+      data-testid={jobIds.scriptRunStatus(status)}
+      className="flex flex-none items-center gap-[7px]"
+    >
       <Square color={tone.color} />
-      <span className={cn("font-wv-mono text-[11px]", tone.text)}>{status}</span>
+      <span className={cn("font-wv-mono text-[11px]", tone.text)}>
+        {status}
+      </span>
     </span>
   );
 }
@@ -102,7 +121,10 @@ export function FireAndForgetTag() {
 export function TruncatedTag() {
   const t = useTranslate();
   return (
-    <span className="flex flex-none whitespace-nowrap" title={t("next.job.scriptOutputTruncated")}>
+    <span
+      className="flex flex-none whitespace-nowrap"
+      title={t("next.job.scriptOutputTruncated")}
+    >
       <Tag>{t("next.postProcessing.outputTruncatedChip")}</Tag>
     </span>
   );
@@ -112,10 +134,13 @@ export function TruncatedTag() {
 export function ScriptRunOutput({ run }: { run: ScriptRunOutputSource }) {
   const t = useTranslate();
   const [expanded, setExpanded] = useState(false);
-  const [{ data, fetching, error }] = useQuery<{ scriptOutput: string | null }>({
-    query: OUTPUT_QUERY, variables: { outputId: run.outputId ?? "" },
-    pause: !expanded || !run.outputId,
-  });
+  const [{ data, fetching, error }] = useQuery<{ scriptOutput: string | null }>(
+    {
+      query: OUTPUT_QUERY,
+      variables: { outputId: run.outputId ?? "" },
+      pause: !expanded || !run.outputId,
+    },
+  );
   const retained = expanded ? data?.scriptOutput : undefined;
   // The excerpt stays up until the retained output arrives, so the row does not jump.
   const output = retained ?? run.outputTail;
@@ -129,16 +154,28 @@ export function ScriptRunOutput({ run }: { run: ScriptRunOutputSource }) {
       ) : null}
       <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1 font-wv-mono text-[11px] text-wv-muted">
         {run.outputRetained && run.outputId ? (
-          <button type="button" onClick={() => setExpanded(!expanded)} className={QUIET_ACTION}>
-            {t(expanded ? "next.job.scriptOutputExcerpt" : "next.job.scriptOutputShow")}
+          <button
+            type="button"
+            onClick={() => setExpanded(!expanded)}
+            className={QUIET_ACTION}
+          >
+            {t(
+              expanded
+                ? "next.job.scriptOutputExcerpt"
+                : "next.job.scriptOutputShow",
+            )}
           </button>
         ) : (
           <span>{gone}</span>
         )}
         {expanded && retained == null ? (
-          <span>{fetching ? t("next.common.loading") : (error?.message ?? gone)}</span>
+          <span>
+            {fetching ? t("next.common.loading") : (error?.message ?? gone)}
+          </span>
         ) : null}
-        {run.outputTruncated ? <span>{t("next.job.scriptOutputTruncated")}</span> : null}
+        {run.outputTruncated ? (
+          <span>{t("next.job.scriptOutputTruncated")}</span>
+        ) : null}
       </div>
     </>
   );
@@ -146,7 +183,10 @@ export function ScriptRunOutput({ run }: { run: ScriptRunOutputSource }) {
 
 function RunOutput({ result }: { result: ScriptResult }) {
   return (
-    <div data-testid={jobIds.scriptRun} className="flex min-w-0 flex-col gap-2 border-t border-wv-hairline py-[10px] pl-5">
+    <div
+      data-testid={jobIds.scriptRun}
+      className="flex min-w-0 flex-col gap-2 border-t border-wv-hairline py-[10px] pl-5"
+    >
       <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1">
         <span className="flex min-w-0 items-center gap-[10px]">
           <ScriptRunName run={result} />
@@ -155,30 +195,53 @@ function RunOutput({ result }: { result: ScriptResult }) {
         <ScriptStatusMark status={result.status} />
       </div>
       {result.errorMessage ? (
-        <span className="text-[12.5px] text-wv-error-text">{result.errorMessage}</span>
+        <span className="text-[12.5px] text-wv-error-text">
+          {result.errorMessage}
+        </span>
       ) : null}
       <ScriptRunOutput run={result} />
     </div>
   );
 }
 
-function EventRuns({ event, results }: { event: string; results: ScriptResult[] }) {
+function EventRuns({
+  event,
+  results,
+}: {
+  event: string;
+  results: ScriptResult[];
+}) {
   const [open, setOpen] = useState(true);
   const label = `${event} (${results.length})`;
   return (
-    <div role="group" aria-label={label} data-testid={jobIds.scriptEventGroup(event)} className="flex min-w-0 flex-col border-t border-wv-hairline">
+    <div
+      role="group"
+      aria-label={label}
+      data-testid={jobIds.scriptEventGroup(event)}
+      className="flex min-w-0 flex-col border-t border-wv-hairline"
+    >
       <button
         type="button"
         aria-expanded={open}
         onClick={() => setOpen(!open)}
         className="flex h-8 cursor-pointer items-center gap-2 text-left font-wv-mono text-[11px] text-wv-muted hover:text-wv-fg"
       >
-        <Icon name="expand" size={12} className={cn("flex-none transition-transform", open && "rotate-90")} />
+        <Icon
+          name="expand"
+          size={12}
+          className={cn("flex-none transition-transform", open && "rotate-90")}
+        />
         {label}
       </button>
       {open
         ? results.map((result, index) => (
-            <RunOutput key={result.outputId ?? `${result.script}-${result.finishedAtEpochMs}-${index}`} result={result} />
+            <RunOutput
+              key={
+                result.outputId ??
+                `${result.script}-${result.finishedAtEpochMs}-${index}`
+              }
+              result={result}
+            />
           ))
         : null}
     </div>
@@ -187,8 +250,12 @@ function EventRuns({ event, results }: { event: string; results: ScriptResult[] 
 
 export function JobScriptResults({ jobId }: { jobId: number }) {
   const t = useTranslate();
-  const [{ data, error }, refresh] = useQuery<{ postProcessingResults: ScriptResult[] }>({
-    query: POST_PROCESSING_RESULTS_QUERY, variables: { jobId }, requestPolicy: "cache-and-network",
+  const [{ data, error }, refresh] = useQuery<{
+    postProcessingResults: ScriptResult[];
+  }>({
+    query: POST_PROCESSING_RESULTS_QUERY,
+    variables: { jobId },
+    requestPolicy: "cache-and-network",
   });
   const results = data?.postProcessingResults ?? [];
   const groups = new Map<string, ScriptResult[]>();
@@ -203,16 +270,24 @@ export function JobScriptResults({ jobId }: { jobId: number }) {
       title={t("next.job.scriptRuns")}
       note={countLabel(t, "next.job.scriptRunCount", results.length)}
       right={
-        <button type="button" onClick={() => refresh({ requestPolicy: "network-only" })} className={QUIET_ACTION}>
+        <button
+          type="button"
+          onClick={() => refresh({ requestPolicy: "network-only" })}
+          className={QUIET_ACTION}
+        >
           {t("action.refresh")}
         </button>
       }
     >
       {error ? (
-        <span role="alert" className="pb-3 text-[12.5px] text-wv-error-text">{error.message}</span>
+        <span role="alert" className="pb-3 text-[12.5px] text-wv-error-text">
+          {error.message}
+        </span>
       ) : null}
       {groups.size === 0 ? (
-        <span className="text-[12.5px] text-wv-muted">{t("next.job.noScriptRuns")}</span>
+        <span className="text-[12.5px] text-wv-muted">
+          {t("next.job.noScriptRuns")}
+        </span>
       ) : null}
       {[...groups].map(([event, entries]) => (
         <EventRuns key={event} event={event} results={entries} />

@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { useEffect, useId, useRef, useState, type ReactNode, type Ref } from "react";
+import {
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type ReactNode,
+  type Ref,
+} from "react";
 import { useTranslate } from "@/lib/context/translate-context";
 import { usePasswordManagerIgnore } from "@/lib/password-manager";
 import { cn } from "@/lib/utils";
@@ -98,7 +105,9 @@ export function SecondaryButton({
       disabled={disabled}
       className={cn(
         "flex cursor-pointer items-center justify-center whitespace-nowrap border border-wv-control bg-wv-button font-medium",
-        size === "compact" ? "h-8 px-3 text-[12.5px]" : "h-[34px] px-[14px] text-[13px]",
+        size === "compact"
+          ? "h-8 px-3 text-[12.5px]"
+          : "h-[34px] px-[14px] text-[13px]",
         disabled
           ? "cursor-default text-wv-disabled"
           : "text-wv-fg hover:border-wv-control-hover hover:bg-wv-button-hover",
@@ -106,7 +115,11 @@ export function SecondaryButton({
       )}
     >
       {icon === undefined ? null : (
-        <Icon name={icon} size={size === "compact" ? 13 : 14} className="-ml-[2px] mr-[7px] flex-none" />
+        <Icon
+          name={icon}
+          size={size === "compact" ? 13 : 14}
+          className="-ml-[2px] mr-[7px] flex-none"
+        />
       )}
       {children}
     </button>
@@ -145,7 +158,9 @@ export function DangerButton({
         solid
           ? "!border-wv-error bg-wv-error text-wv-on-accent"
           : "!border-wv-danger-border bg-wv-button text-wv-error-text",
-        size === "compact" ? "h-8 px-3 text-[12.5px]" : "h-[34px] px-[14px] text-[13px]",
+        size === "compact"
+          ? "h-8 px-3 text-[12.5px]"
+          : "h-[34px] px-[14px] text-[13px]",
         disabled
           ? "cursor-default opacity-50"
           : solid
@@ -155,7 +170,11 @@ export function DangerButton({
       )}
     >
       {icon === undefined ? null : (
-        <Icon name={icon} size={size === "compact" ? 13 : 14} className="-ml-[2px] mr-[7px] flex-none" />
+        <Icon
+          name={icon}
+          size={size === "compact" ? 13 : 14}
+          className="-ml-[2px] mr-[7px] flex-none"
+        />
       )}
       {children}
     </button>
@@ -269,7 +288,11 @@ export function CheckBox({
           onChange(!checked);
         }
       }}
-      className={cn("group flex items-center", disabled ? "cursor-default opacity-40" : "cursor-pointer", className)}
+      className={cn(
+        "group flex items-center",
+        disabled ? "cursor-default opacity-40" : "cursor-pointer",
+        className,
+      )}
     >
       <span
         aria-hidden="true"
@@ -277,7 +300,10 @@ export function CheckBox({
           "size-3.5 flex-none border",
           checked
             ? "!border-wv-accent bg-wv-accent"
-            : cn("!border-wv-faint", !disabled && "group-hover:!border-wv-muted"),
+            : cn(
+                "!border-wv-faint",
+                !disabled && "group-hover:!border-wv-muted",
+              ),
         )}
       />
     </button>
@@ -324,18 +350,26 @@ export function Segmented<T extends string>({
             key={option.value}
             type="button"
             role="radio"
-            data-testid={testId === undefined ? undefined : testIds.option(testId, option.value)}
+            data-testid={
+              testId === undefined
+                ? undefined
+                : testIds.option(testId, option.value)
+            }
             aria-checked={active}
             disabled={option.disabled}
             onClick={() => onChange(option.value)}
             className={cn(
               "flex items-center whitespace-nowrap",
-              option.disabled ? "cursor-default opacity-50" : "cursor-pointer hover:text-wv-strong",
+              option.disabled
+                ? "cursor-default opacity-50"
+                : "cursor-pointer hover:text-wv-strong",
               compact
                 ? "h-[28px] px-[11px] font-wv-mono text-[11.5px]"
                 : "h-8 px-[13px] text-[12.5px]",
               index > 0 && "border-l border-wv-control",
-              active ? "bg-wv-segment-active font-medium text-wv-strong" : "text-wv-muted",
+              active
+                ? "bg-wv-segment-active font-medium text-wv-strong"
+                : "text-wv-muted",
             )}
           >
             {option.label}
@@ -434,18 +468,33 @@ export function Select<T extends string>({
         aria-haspopup="listbox"
         aria-expanded={open}
         aria-label={label}
-        onClick={(event) => setPlacement(open ? null : placeMenu(event.currentTarget))}
+        onClick={(event) =>
+          setPlacement(open ? null : placeMenu(event.currentTarget))
+        }
         className={cn(
           "flex h-[34px] min-w-[208px] items-center justify-between gap-3 border border-wv-control bg-wv-input px-3 text-[13px]",
-          disabled ? "cursor-default text-wv-disabled" : "cursor-pointer text-wv-fg hover:border-wv-control-hover-strong",
+          disabled
+            ? "cursor-default text-wv-disabled"
+            : "cursor-pointer text-wv-fg hover:border-wv-control-hover-strong",
           className,
         )}
       >
-        {icon ? <Icon name={icon} size={13} className="-mr-1 flex-none text-wv-muted" /> : null}
+        {icon ? (
+          <Icon
+            name={icon}
+            size={13}
+            className="-mr-1 flex-none text-wv-muted"
+          />
+        ) : null}
         {current?.icon}
         <span
-          data-testid={testId === undefined ? undefined : testIds.selected(testId, value)}
-          className={cn("min-w-0 flex-1 truncate text-left", !current && placeholder && "text-wv-muted")}
+          data-testid={
+            testId === undefined ? undefined : testIds.selected(testId, value)
+          }
+          className={cn(
+            "min-w-0 flex-1 truncate text-left",
+            !current && placeholder && "text-wv-muted",
+          )}
         >
           {current?.label ?? placeholder ?? value}
         </span>
@@ -463,7 +512,11 @@ export function Select<T extends string>({
           <MenuItem
             key={option.value}
             selected={option.value === value}
-            testId={testId === undefined ? undefined : testIds.option(testId, option.value)}
+            testId={
+              testId === undefined
+                ? undefined
+                : testIds.option(testId, option.value)
+            }
             onSelect={() => {
               onChange(option.value);
               setPlacement(null);
@@ -521,7 +574,9 @@ export function MultiSelect<T extends string>({
         aria-haspopup="menu"
         aria-expanded={open}
         aria-label={label}
-        onClick={(event) => setPlacement(open ? null : placeMenu(event.currentTarget))}
+        onClick={(event) =>
+          setPlacement(open ? null : placeMenu(event.currentTarget))
+        }
         className={cn(
           "flex h-[34px] min-w-[208px] cursor-pointer items-center justify-between gap-3 border border-wv-control bg-wv-input px-3 text-[13px] hover:border-wv-control-hover-strong",
           chosen.length === 0 ? "text-wv-muted" : "text-wv-fg",
@@ -529,7 +584,9 @@ export function MultiSelect<T extends string>({
         )}
       >
         <span className="min-w-0 flex-1 truncate text-left">
-          {chosen.length === 0 ? placeholder : chosen.map((option) => option.label).join(", ")}
+          {chosen.length === 0
+            ? placeholder
+            : chosen.map((option) => option.label).join(", ")}
         </span>
         <Icon name="dropdown" size={13} className="flex-none text-wv-muted" />
       </button>
@@ -547,11 +604,19 @@ export function MultiSelect<T extends string>({
             <MenuCheckItem
               key={option.value}
               checked={checked}
-              testId={testId === undefined ? undefined : testIds.option(testId, option.value)}
+              testId={
+                testId === undefined
+                  ? undefined
+                  : testIds.option(testId, option.value)
+              }
               onToggle={() =>
                 onChange(
                   options
-                    .filter((entry) => (entry.value === option.value ? !checked : values.includes(entry.value)))
+                    .filter((entry) =>
+                      entry.value === option.value
+                        ? !checked
+                        : values.includes(entry.value),
+                    )
                     .map((entry) => entry.value),
                 )
               }
@@ -837,12 +902,21 @@ export function NumberField({
         }}
         className={cn(
           "h-full min-w-0 bg-transparent pl-3 font-wv-mono text-[12px] text-wv-fg outline-none",
-          suffix === undefined ? "flex-1 pr-3" : narrow ? "w-[42px] flex-none" : "w-[86px] flex-none",
+          suffix === undefined
+            ? "flex-1 pr-3"
+            : narrow
+              ? "w-[42px] flex-none"
+              : "w-[86px] flex-none",
           disabled && "text-wv-disabled",
         )}
       />
       {suffix === undefined ? null : (
-        <span className={cn("flex-none pr-3 font-wv-mono text-[11.5px] text-wv-muted", narrow ? "pl-0.5" : "pl-2")}>
+        <span
+          className={cn(
+            "flex-none pr-3 font-wv-mono text-[11.5px] text-wv-muted",
+            narrow ? "pl-0.5" : "pl-2",
+          )}
+        >
           {suffix}
         </span>
       )}

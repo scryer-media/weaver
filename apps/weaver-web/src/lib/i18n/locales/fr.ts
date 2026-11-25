@@ -6,7 +6,6 @@ import { duplicateLocaleEntries } from "../duplicate-locales";
 import { nextFr } from "@/next/i18n/fr";
 
 const fr: LocaleDictionary = {
-
   // Navigation
   "nav.settings": "Paramètres",
   "nav.sponsor": "Sponsoriser",
@@ -15,19 +14,25 @@ const fr: LocaleDictionary = {
   "applicationUpgrade.upToDate": "Weaver v{{version}} est à jour.",
   "applicationUpgrade.available": "Weaver v{{version}} est disponible.",
   "applicationUpgrade.install": "Installer la v{{version}}",
-  "applicationUpgrade.notEligible": "Weaver ne peut pas mettre à jour cette installation depuis l’application ({{reason}}).",
-  "applicationUpgrade.failed": "La mise à jour vers la v{{version}} a échoué : {{error}}",
-  "applicationUpgrade.githubUnavailable": "GitHub est temporairement indisponible. Veuillez réessayer la mise à jour plus tard.",
+  "applicationUpgrade.notEligible":
+    "Weaver ne peut pas mettre à jour cette installation depuis l’application ({{reason}}).",
+  "applicationUpgrade.failed":
+    "La mise à jour vers la v{{version}} a échoué : {{error}}",
+  "applicationUpgrade.githubUnavailable":
+    "GitHub est temporairement indisponible. Veuillez réessayer la mise à jour plus tard.",
   "applicationUpgrade.completed": "Mis à jour vers la v{{version}}.",
   "applicationUpgrade.phase.checking": "Vérification de la version…",
   "applicationUpgrade.phase.downloading": "Téléchargement de la v{{version}}…",
   "applicationUpgrade.phase.verifying": "Vérification du téléchargement…",
   "applicationUpgrade.phase.staging": "Décompression de la mise à jour…",
   "applicationUpgrade.phase.applying": "Installation de la v{{version}}…",
-  "applicationUpgrade.phase.awaiting_elevation": "Attente de l'autorisation d'installer…",
+  "applicationUpgrade.phase.awaiting_elevation":
+    "Attente de l'autorisation d'installer…",
   "applicationUpgrade.phase.restarting": "Redémarrage de Weaver…",
-  "applicationUpgrade.phase.reboot_required": "Redémarrez cet ordinateur pour terminer la mise à jour.",
-  "update.newVersionAria": "Ouvrir Weaver v{{version}} sur GitHub dans un nouvel onglet",
+  "applicationUpgrade.phase.reboot_required":
+    "Redémarrez cet ordinateur pour terminer la mise à jour.",
+  "update.newVersionAria":
+    "Ouvrir Weaver v{{version}} sur GitHub dans un nouvel onglet",
 
   // Status labels
   "status.queued": "En attente",
@@ -69,7 +74,8 @@ const fr: LocaleDictionary = {
   "action.next": "Suivant",
 
   // Confirmation dialogs
-  "confirm.cancelSelectedMessage": "Ces téléchargements seront arrêtés et ne pourront pas être repris.",
+  "confirm.cancelSelectedMessage":
+    "Ces téléchargements seront arrêtés et ne pourront pas être repris.",
   "bulk.selected": "{{count}} sélectionnés",
   "bulk.editSelected": "Modifier la sélection",
   "bulk.pauseSelected": "Mettre en pause la sélection",
@@ -79,7 +85,8 @@ const fr: LocaleDictionary = {
   "action.deleteAll": "Tout supprimer",
 
   // Upload page
-  "upload.invalidFiles": "Veuillez sélectionner uniquement des fichiers .nzb ou .nzb.xz.",
+  "upload.invalidFiles":
+    "Veuillez sélectionner uniquement des fichiers .nzb ou .nzb.xz.",
   "upload.noCategory": "Aucune catégorie",
   "upload.priorityLow": "Basse",
   "upload.priorityNormal": "Normale",
@@ -152,10 +159,12 @@ const fr: LocaleDictionary = {
   "action.edit": "Modifier",
   "action.save": "Enregistrer",
 
-  "upload.forceDesc": "Accepte cet envoi malgré la politique de doublons sémantique et d'articles. Les conflits d'idempotence restent applicables.",
+  "upload.forceDesc":
+    "Accepte cet envoi malgré la politique de doublons sémantique et d'articles. Les conflits d'idempotence restent applicables.",
 
   // System info
-  "systemInfo.diagnosticsFailed": "Le paquet de diagnostic n'a pas pu être créé.",
+  "systemInfo.diagnosticsFailed":
+    "Le paquet de diagnostic n'a pas pu être créé.",
   ...duplicateLocaleEntries.fra,
   ...nextFr,
 };

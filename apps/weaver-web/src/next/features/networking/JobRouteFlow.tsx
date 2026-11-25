@@ -34,7 +34,11 @@ export function JobRouteFlow({
   /** The job's name, as the enlarged view's note. */
   title: string;
   onReport: (message: string) => void;
-  proxyEditor: (id: number, onClose: () => void, onChanged: () => void) => ReactNode;
+  proxyEditor: (
+    id: number,
+    onClose: () => void,
+    onChanged: () => void,
+  ) => ReactNode;
 }) {
   const t = useTranslate();
   const workspace = useNetworkingWorkspace("overview");
@@ -47,13 +51,17 @@ export function JobRouteFlow({
   const routeKey = routes.join("\n");
   // A usenet job that no server has served yet may leave on any of them.
   const shown = useMemo(() => {
-    if (routeKey === "") return consumers.filter((consumer) => consumer.kind === "SERVER");
+    if (routeKey === "")
+      return consumers.filter((consumer) => consumer.kind === "SERVER");
     const wanted = new Set(routeKey.split("\n"));
     return consumers.filter((consumer) => wanted.has(consumer.key));
   }, [consumers, routeKey]);
   const shownFlow = useMemo<Flow>(() => {
     const wanted = new Set(shown.map((consumer) => consumer.key));
-    return { ...flow, legs: flow.legs.filter((leg) => wanted.has(leg.consumer)) };
+    return {
+      ...flow,
+      legs: flow.legs.filter((leg) => wanted.has(leg.consumer)),
+    };
   }, [flow, shown]);
 
   // What an edit made of it goes to the page's status bar.

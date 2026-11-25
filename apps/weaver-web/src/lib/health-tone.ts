@@ -7,15 +7,23 @@ export type HealthTone = "good" | "warn" | "low" | "failing";
 // what its recovery can rebuild: the server's critical health. A post with
 // no recovery fails below 85%; one whose recovery is over half the post
 // never does.
-export function criticalHealthMilli(totalBytes: number, recoveryBytes: number): number {
+export function criticalHealthMilli(
+  totalBytes: number,
+  recoveryBytes: number,
+): number {
   if (recoveryBytes <= 0) return 850;
   if (recoveryBytes * 2 > totalBytes) return 0;
-  return Math.floor(((totalBytes - recoveryBytes * 2) * 1000) / (totalBytes - recoveryBytes));
+  return Math.floor(
+    ((totalBytes - recoveryBytes * 2) * 1000) / (totalBytes - recoveryBytes),
+  );
 }
 
 // Green at 95% and up, yellow from 85%, orange below; red below the job's
 // critical health, whatever the band.
-export function healthTone(healthMilli: number, criticalMilli: number): HealthTone {
+export function healthTone(
+  healthMilli: number,
+  criticalMilli: number,
+): HealthTone {
   if (healthMilli < criticalMilli) return "failing";
   if (healthMilli >= 950) return "good";
   if (healthMilli >= 850) return "warn";

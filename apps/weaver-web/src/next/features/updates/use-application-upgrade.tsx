@@ -28,14 +28,20 @@ import {
  */
 
 /** The server's upgrade state, kept live. */
-export function useApplicationUpgradeStatus(): ApplicationUpgradeStatus | undefined {
+export function useApplicationUpgradeStatus():
+  ApplicationUpgradeStatus | undefined {
   const [{ data: queryData }] = useQuery<{
     applicationUpgradeStatus: ApplicationUpgradeStatus;
-  }>({ query: APPLICATION_UPGRADE_STATUS_QUERY, requestPolicy: "cache-and-network" });
+  }>({
+    query: APPLICATION_UPGRADE_STATUS_QUERY,
+    requestPolicy: "cache-and-network",
+  });
   const [{ data: liveData }] = useSubscription<{
     applicationUpgradeUpdates: ApplicationUpgradeStatus;
   }>({ query: APPLICATION_UPGRADE_SUBSCRIPTION });
-  return liveData?.applicationUpgradeUpdates ?? queryData?.applicationUpgradeStatus;
+  return (
+    liveData?.applicationUpgradeUpdates ?? queryData?.applicationUpgradeStatus
+  );
 }
 
 /** Upgrade state and the install action for the System Info section. */
@@ -53,11 +59,16 @@ export function useApplicationUpgrade() {
     setStarting(true);
     setStartError(null);
     const result = await startUpgrade({
-      input: { expectedTag: installable.tag, expectedVersion: installable.version },
+      input: {
+        expectedTag: installable.tag,
+        expectedVersion: installable.version,
+      },
     });
     setStarting(false);
     if (result.error) {
-      setStartError(result.error.graphQLErrors[0]?.message ?? result.error.message);
+      setStartError(
+        result.error.graphQLErrors[0]?.message ?? result.error.message,
+      );
     }
   };
 
@@ -76,7 +87,9 @@ export function RunProgress({
   const percent = downloadPercent(run);
   return (
     <div role="status" className={className}>
-      {t(`applicationUpgrade.phase.${run.phase}`, { version: run.targetVersion })}
+      {t(`applicationUpgrade.phase.${run.phase}`, {
+        version: run.targetVersion,
+      })}
       {run.phase === "downloading" && percent != null ? ` · ${percent}%` : null}
     </div>
   );

@@ -637,6 +637,28 @@ async fn a_files_level_reaches_its_torrents_follower_and_no_list() {
         })
         .await
         .unwrap();
+    // Its session finishes starting it on its own task, and each publish
+    // reads it live: the rows are compared only once it shows paused and
+    // no settle is under way, so nothing but the level moves them.
+    handle_of(&rig.service, job_id)
+        .await
+        .wait_until_initialized()
+        .await
+        .unwrap();
+    view_once(&rig.service, job_id, |view| {
+        view.state == TorrentState::Paused
+    })
+    .await;
+    rig.service
+        .inner
+        .settled
+        .subscribe()
+        .wait_for(|_| {
+            !rig.service.inner.signal.pass_wanted.load(Ordering::SeqCst)
+                && !rig.service.inner.settling.load(Ordering::SeqCst)
+        })
+        .await
+        .unwrap();
     rig.service.publish().await;
     let mut one = rig.service.updates(job_id);
     let first = one.next().await.torrents;

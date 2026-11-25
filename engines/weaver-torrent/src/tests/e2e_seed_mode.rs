@@ -972,3 +972,95 @@ async fn test_a_torrents_seed_check_across_a_pause_checks_the_paused_torrent() -
     assert!(seed.seed_mode());
     Ok(())
 }
+
+// A piece that fails its seed-mode check leaves seed mode on a failure, and
+// from then on the run serves nothing: a block of another piece no check
+// has passed is not sent, though seed mode no longer holds it back. The
+// check of every piece that follows ends the run and lets the peer go, as
+// libtorrent's `torrent::leave_seed_mode` with `check_files` does at once
+// (`set_have_all(false)`, `force_recheck`, `disconnect_all`). The peer asks
+// for the damaged piece, and for another once that check has failed, and is
+// sent no block. Asked for together, the other piece's own check may pass
+// first, and it is then served before any failure, as it should be.
+#[tokio::test(start_paused = true)]
+async fn test_seed_mode_failed_check_serves_no_other_unchecked_piece() -> anyhow::Result<()> {
+    use crate::peer_info_reader::tests::{Dialed, MockPeer};
+    use crate::peer_protocol::{Message, Request};
+    use crate::tests::e2e_pause::{Tracker, announce, next};
+    use crate::tests::e2e_tracker_announces::tracker_session_opts;
+    use std::net::{Ipv4Addr, SocketAddr};
+    const DAMAGED: u32 = 0;
+    const OTHER: u32 = 1;
+
+    let peer_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 6881));
+    let (tracker, mut heard) = Tracker::start(Some(peer_addr));
+    let (tx, mut dials) = tokio::sync::mpsc::unbounded_channel();
+    let out = TempDir::with_prefix("seed_mode_failed_serves_none_out")?;
+    let session = Session::new_with_opts(
+        out.path().into(),
+        crate::SessionOptions {
+            socket_factory: std::sync::Arc::new(Dialed(tx)),
+            connect: Some(crate::ConnectionOptions {
+                enable_tcp: true,
+                enable_utp: None,
+                utp_on_demand: false,
+                peer_opts: None,
+            }),
+            ..tracker_session_opts()?
+        },
+    )
+    .await?;
+    let t = TestTorrent::new(
+        "seed_mode_failed_serves_none",
+        PIECES * PIECE_LENGTH as usize,
+        PIECE_LENGTH,
+    )
+    .await?;
+    let mut content = t.content.clone();
+    content[(DAMAGED * PIECE_LENGTH) as usize] ^= 0xff;
+    let torrent = session
+        .add_torrent(
+            AddTorrent::from_bytes(t.torrent.clone()),
+            Some(AddTorrentOptions {
+                storage_factory: Some(MemoryStorageFactory::holding(vec![content]).clone_box()),
+                trackers: Some(vec![tracker.url()]),
+                seed_mode: true,
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+    assert_eq!(next(&mut heard).await?, announce(Some("started")));
+    let (dialed, stream) = dials.recv().await.context("no dial")?;
+    assert_eq!(dialed, peer_addr);
+    let mut peer = MockPeer::greet(stream, torrent.shared().info_hashes).await;
+    let run = torrent.live().context("the torrent is not live")?;
+    while run.stats_snapshot().peer_stats.live != 1 {
+        tokio::task::yield_now().await;
+    }
+    assert!(torrent.seed_mode());
+    assert!(torrent.shared().options.seed.unchecked(piece_of(OTHER)?));
+
+    peer.send(Message::Interested).await;
+    peer.send(Message::Request(Request::new(DAMAGED, 0, PIECE_LENGTH)))
+        .await;
+    while torrent.seed_mode() {
+        tokio::task::yield_now().await;
+    }
+    // The check of every piece may have let the peer go already.
+    peer.send_if_open(Message::Request(Request::new(OTHER, 0, PIECE_LENGTH)))
+        .await;
+    // What the peer receives until the check of every piece lets it go.
+    assert_eq!(
+        peer.next_block()
+            .await
+            .map(|(piece, begin, _)| (piece, begin)),
+        None,
+        "a block was served after a piece failed its seed-mode check"
+    );
+    assert!(!torrent.seed_mode());
+    drop(tracker);
+    session.stop().await;
+    Ok(())
+}

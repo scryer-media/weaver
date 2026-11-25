@@ -19,7 +19,13 @@ const TOTAL = 100_000 * MB;
 // The queue as the page samples it: one job holding the daemon's totals.
 function sample(total: number, downloaded: number) {
   return [
-    { id: 0, status: "DOWNLOADING", totalBytes: total, downloadedBytes: downloaded, remainingBytes: total - downloaded },
+    {
+      id: 0,
+      status: "DOWNLOADING",
+      totalBytes: total,
+      downloadedBytes: downloaded,
+      remainingBytes: total - downloaded,
+    },
   ];
 }
 
@@ -39,7 +45,13 @@ class Clock {
   tick(rate: number, conditions: EtaConditions, shown = rate): number {
     this.now += TICK_MS;
     this.downloaded += (rate * TICK_MS) / 1_000;
-    return nextEtaSpeed(this.state, sample(this.total, this.downloaded), shown, this.now, conditions);
+    return nextEtaSpeed(
+      this.state,
+      sample(this.total, this.downloaded),
+      shown,
+      this.now,
+      conditions,
+    );
   }
 
   run(seconds: number, rate: number, conditions: EtaConditions): number {
@@ -57,8 +69,20 @@ test("each job's time left counts what the daemon says is still to come", () => 
   const etaById = buildQueueEtaById(
     [
       // Every wanted article is in; only held-back recovery is undone.
-      { id: 1, status: "DOWNLOADING", totalBytes: 1_000, downloadedBytes: 870, remainingBytes: 0 },
-      { id: 2, status: "QUEUED", totalBytes: 500, downloadedBytes: 0, remainingBytes: 150 },
+      {
+        id: 1,
+        status: "DOWNLOADING",
+        totalBytes: 1_000,
+        downloadedBytes: 870,
+        remainingBytes: 0,
+      },
+      {
+        id: 2,
+        status: "QUEUED",
+        totalBytes: 500,
+        downloadedBytes: 0,
+        remainingBytes: 150,
+      },
     ],
     50,
   );
@@ -94,9 +118,15 @@ test("a lowered limit reads at or below the new limit on the next tick", () => {
   clock.run(60, 10 * MB, FREE);
 
   // The daemon's rate still shows the old speed for this tick.
-  const next = clock.tick(2 * MB, { paused: false, speedLimit: 2 * MB }, 10 * MB);
+  const next = clock.tick(
+    2 * MB,
+    { paused: false, speedLimit: 2 * MB },
+    10 * MB,
+  );
   assert.ok(next <= 2 * MB, `${next}`);
-  assert.ok(clock.run(30, 2 * MB, { paused: false, speedLimit: 2 * MB }) <= 2 * MB);
+  assert.ok(
+    clock.run(30, 2 * MB, { paused: false, speedLimit: 2 * MB }) <= 2 * MB,
+  );
 });
 
 test("a raised limit reaches the new rate within the warm-up", () => {
@@ -162,9 +192,19 @@ test("a queue with nothing downloading reads 0 on the next tick", () => {
   assert.ok(clock.run(60, 10 * MB, FREE) > 9 * MB);
 
   // The last download finished with bytes still counted; the daemon's rate trails.
-  assert.equal(clock.tick(0, { paused: false, speedLimit: 0, idle: true }, 8 * MB), 0);
+  assert.equal(
+    clock.tick(0, { paused: false, speedLimit: 0, idle: true }, 8 * MB),
+    0,
+  );
   // A slow disk still writing does not hold the speed up once nothing downloads.
-  assert.equal(clock.tick(0, { paused: false, speedLimit: 0, idle: true, diskRate: 5 * MB }, 3 * MB), 0);
+  assert.equal(
+    clock.tick(
+      0,
+      { paused: false, speedLimit: 0, idle: true, diskRate: 5 * MB },
+      3 * MB,
+    ),
+    0,
+  );
 
   // A download starts again: the first tick reads its rate.
   assert.equal(clock.tick(4 * MB, FREE), 4 * MB);
@@ -174,7 +214,11 @@ test("a stall behind a slow disk holds the speed at the disk's rate", () => {
   const clock = new Clock();
   clock.run(120, 10 * MB, FREE);
 
-  const behind: EtaConditions = { paused: false, speedLimit: 0, diskRate: 4 * MB };
+  const behind: EtaConditions = {
+    paused: false,
+    speedLimit: 0,
+    diskRate: 4 * MB,
+  };
   // Ten minutes with no byte in: without the disk's rate this eases to 0.
   const held = clock.run(600, 0, behind);
   assert.equal(held, 4 * MB);
@@ -187,7 +231,11 @@ test("a job leaving the queue during a stall behind a slow disk keeps the speed"
   const clock = new Clock();
   clock.run(120, 10 * MB, FREE);
 
-  const behind: EtaConditions = { paused: false, speedLimit: 0, diskRate: 4 * MB };
+  const behind: EtaConditions = {
+    paused: false,
+    speedLimit: 0,
+    diskRate: 4 * MB,
+  };
   // A finished job's bytes leave the totals while nothing comes in.
   clock.downloaded -= 500 * MB;
   assert.equal(clock.tick(0, behind), 4 * MB);
@@ -198,7 +246,11 @@ test("a wait with nothing downloading keeps the disk's rate for the stall after 
   const clock = new Clock();
   clock.run(120, 10 * MB, FREE);
 
-  const behind: EtaConditions = { paused: false, speedLimit: 0, diskRate: 4 * MB };
+  const behind: EtaConditions = {
+    paused: false,
+    speedLimit: 0,
+    diskRate: 4 * MB,
+  };
   // The jobs left only wait for a while: no speed is shown.
   assert.equal(clock.tick(0, { ...behind, idle: true }), 0);
   // They go on at a trickle behind the same disk: the speed is the disk's
@@ -213,7 +265,11 @@ test("a wait with nothing downloading keeps the disk's rate for the stall after 
 
 test("a disk faster than the downloads lifts nothing", () => {
   const clock = new Clock();
-  const fast: EtaConditions = { paused: false, speedLimit: 0, diskRate: 50 * MB };
+  const fast: EtaConditions = {
+    paused: false,
+    speedLimit: 0,
+    diskRate: 50 * MB,
+  };
   const shown = clock.run(120, 2 * MB, fast);
   assert.ok(shown <= 2.1 * MB, `${shown}`);
   assert.ok(clock.run(600, 0, fast) <= 2.1 * MB);
@@ -222,7 +278,11 @@ test("a disk faster than the downloads lifts nothing", () => {
 test("a speed limit caps the disk's rate too", () => {
   const clock = new Clock();
   clock.run(120, 10 * MB, FREE);
-  const limited: EtaConditions = { paused: false, speedLimit: 2 * MB, diskRate: 4 * MB };
+  const limited: EtaConditions = {
+    paused: false,
+    speedLimit: 2 * MB,
+    diskRate: 4 * MB,
+  };
   clock.run(60, 2 * MB, limited);
   assert.ok(clock.run(600, 0, limited) <= 2 * MB);
 });

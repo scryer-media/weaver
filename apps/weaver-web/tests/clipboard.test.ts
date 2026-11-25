@@ -11,7 +11,11 @@ type Globals = { navigator?: unknown; document?: unknown };
 function withGlobals(values: Globals, run: () => Promise<void>): Promise<void> {
   const saved = Object.getOwnPropertyDescriptors(globalThis);
   for (const [name, value] of Object.entries(values)) {
-    Object.defineProperty(globalThis, name, { value, configurable: true, writable: true });
+    Object.defineProperty(globalThis, name, {
+      value,
+      configurable: true,
+      writable: true,
+    });
   }
   return run().finally(() => {
     for (const name of Object.keys(values)) {
@@ -31,7 +35,9 @@ function fakeDocument(taken: string[], outcome: boolean | "throw") {
   const focused = { focused: 0, focus: () => void focused.focused++ };
   return {
     activeElement: focused,
-    body: { appendChild: (child: { value: string }) => void children.push(child) },
+    body: {
+      appendChild: (child: { value: string }) => void children.push(child),
+    },
     createElement: () => {
       const area = {
         value: "",
@@ -61,7 +67,11 @@ test("a secure origin copies through the asynchronous clipboard", async () => {
   const written: string[] = [];
   await withGlobals(
     {
-      navigator: { clipboard: { writeText: async (text: string) => void written.push(text) } },
+      navigator: {
+        clipboard: {
+          writeText: async (text: string) => void written.push(text),
+        },
+      },
       document: undefined,
     },
     async () => {
@@ -77,8 +87,16 @@ test("a plain-HTTP origin, which has no asynchronous clipboard, copies through t
   await withGlobals({ navigator: {}, document }, async () => {
     assert.equal(await copyText("wv_key"), true);
     assert.deepEqual(taken, ["wv_key"]);
-    assert.deepEqual(document.children, [], "the throwaway textarea is removed");
-    assert.equal(document.focused.focused, 1, "focus returns to the field that had it");
+    assert.deepEqual(
+      document.children,
+      [],
+      "the throwaway textarea is removed",
+    );
+    assert.equal(
+      document.focused.focused,
+      1,
+      "focus returns to the field that had it",
+    );
   });
 });
 
@@ -87,7 +105,11 @@ test("a refused asynchronous clipboard falls back to the selection command", asy
   const document = fakeDocument(taken, true);
   await withGlobals(
     {
-      navigator: { clipboard: { writeText: async () => Promise.reject(new Error("not focused")) } },
+      navigator: {
+        clipboard: {
+          writeText: async () => Promise.reject(new Error("not focused")),
+        },
+      },
       document,
     },
     async () => {

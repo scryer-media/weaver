@@ -30,27 +30,31 @@ const NO_LOCKS: ReadonlyMap<number, DeleteLock> = new Map();
  * operation is active its progress is polled every second; and when the last
  * one drains, `onDrained` refetches whatever the screen shows.
  */
-export function useHistoryDeletes<T extends { id: number; deleteOperation: RowDeleteOperation | null }>({
-  rows,
-  onDrained,
-}: {
-  rows: readonly T[];
-  onDrained: () => void;
-}) {
+export function useHistoryDeletes<
+  T extends { id: number; deleteOperation: RowDeleteOperation | null },
+>({ rows, onDrained }: { rows: readonly T[]; onDrained: () => void }) {
   const t = useTranslate();
   const [locks, setLocks] = useState(NO_LOCKS);
   // The target count of an acceptance the operation list has not caught up with.
   const [pendingTargets, setPendingTargets] = useState(0);
-  const [awaitingRefresh, setAwaitingRefresh] = useState<"no" | "requested" | "started">("no");
+  const [awaitingRefresh, setAwaitingRefresh] = useState<
+    "no" | "requested" | "started"
+  >("no");
 
   const [{ fetching: accepting }, acceptHistoryDelete] = useMutation<{
     acceptHistoryDelete: { operationId: number; totalTargets: number };
   }>(ACCEPT_HISTORY_DELETE_MUTATION);
   const [{ data, fetching }, reexecute] = useQuery<{
     historyDeleteOperations: HistoryDeleteOperation[];
-  }>({ query: HISTORY_DELETE_OPERATIONS_QUERY, variables: { activeOnly: true } });
+  }>({
+    query: HISTORY_DELETE_OPERATIONS_QUERY,
+    variables: { activeOnly: true },
+  });
 
-  const operations = useMemo(() => data?.historyDeleteOperations ?? [], [data?.historyDeleteOperations]);
+  const operations = useMemo(
+    () => data?.historyDeleteOperations ?? [],
+    [data?.historyDeleteOperations],
+  );
   const active = operations.length > 0 || pendingTargets > 0;
   const progress = useMemo(
     () => deleteProgress(operations, pendingTargets || locks.size),
@@ -82,11 +86,14 @@ export function useHistoryDeletes<T extends { id: number; deleteOperation: RowDe
     }
   }, [awaitingRefresh, fetching]);
 
-  useVisibleInterval(() => {
-    if (!fetchingRef.current) {
-      pollOperations();
-    }
-  }, active ? POLL_MS : null);
+  useVisibleInterval(
+    () => {
+      if (!fetchingRef.current) {
+        pollOperations();
+      }
+    },
+    active ? POLL_MS : null,
+  );
 
   const wasActive = useRef(active);
   useEffect(() => {
@@ -99,8 +106,13 @@ export function useHistoryDeletes<T extends { id: number; deleteOperation: RowDe
 
   /** Hand these rows to a delete operation; resolves to an error message, or null once accepted. */
   const accept = useCallback(
-    async (ids: readonly number[], deleteFiles: boolean): Promise<string | null> => {
-      const result = await acceptHistoryDelete({ input: { mode: "IDS", ids: [...ids], deleteFiles } });
+    async (
+      ids: readonly number[],
+      deleteFiles: boolean,
+    ): Promise<string | null> => {
+      const result = await acceptHistoryDelete({
+        input: { mode: "IDS", ids: [...ids], deleteFiles },
+      });
       const acceptance = result.data?.acceptHistoryDelete;
       if (result.error || !acceptance) {
         return result.error?.message ?? t("next.deletes.notAccepted");
@@ -120,7 +132,10 @@ export function useHistoryDeletes<T extends { id: number; deleteOperation: RowDe
     [acceptHistoryDelete, pollOperations, t],
   );
 
-  const lockedRows = useMemo(() => withDeleteLocks(rows, settled), [rows, settled]);
+  const lockedRows = useMemo(
+    () => withDeleteLocks(rows, settled),
+    [rows, settled],
+  );
 
   return {
     rows: lockedRows,

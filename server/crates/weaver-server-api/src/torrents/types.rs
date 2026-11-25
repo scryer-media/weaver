@@ -238,7 +238,8 @@ pub struct TorrentPortMappingGql {
     /// The port the gateway forwards; none once the mapping failed or was
     /// removed.
     pub external_port: Option<u16>,
-    /// The gateway's external address, when it told it.
+    /// The gateway's external address, when it told a public one. A gateway
+    /// inside a tunnel may tell the tunnel's own private address: not shown.
     pub gateway_address: Option<String>,
     pub error: Option<String>,
 }
@@ -257,7 +258,7 @@ impl From<PortMapped> for TorrentPortMappingGql {
             },
             local_port: mapped.local_port,
             external_port: mapped.external_port,
-            gateway_address: mapped.external_ip.map(|ip| ip.to_string()),
+            gateway_address: mapped.public_ip().map(|ip| ip.to_string()),
             error: mapped.error,
         }
     }

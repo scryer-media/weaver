@@ -176,6 +176,11 @@ pub struct Live {
     // of the check the session it joins makes is judged as a recheck's is
     // (`rejudge_after_check`). Taken by that join.
     pub(super) check_owed: bool,
+    // The run whose check of every piece a recheck began, from then until
+    // the check's end is judged (`rejudge_after_check`): a run that goes
+    // on, whose refused start holds only its download, as that judgement
+    // holds it.
+    pub(super) rechecked: Option<Arc<weaver_torrent::ManagedTorrent>>,
     // Waits for room on its disk, and how: the service's wait for it is in
     // `Inner::disk_waits`.
     pub disk_held: Option<DiskHeld>,
@@ -201,6 +206,11 @@ pub struct Live {
     // (`start_waits_on_move`): the move's end makes one pass over the
     // queue for it, and none otherwise.
     pub(super) start_held: bool,
+    // Read from the database at start, and its start not judged yet in
+    // this run: one that downloaded before is promised what it has left,
+    // unjudged, whether its join or a pass judges it first. False for one
+    // added in this run, and once its start is judged.
+    pub restored_unjudged: bool,
     // A removal has begun writing its mark: no move starts, and a failure
     // leaves the torrent to the removal (`remove_as`).
     pub(super) removing: bool,
@@ -301,6 +311,7 @@ impl Live {
             sealed: None,
             files_missing: false,
             check_owed: false,
+            rechecked: None,
             disk_held: None,
             start_refused: None,
             queued: false,
@@ -311,6 +322,7 @@ impl Live {
             peers: (0, 0, 0),
             moving: None,
             start_held: false,
+            restored_unjudged: false,
             removing: false,
             failed_removing: None,
             leveling: None,

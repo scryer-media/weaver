@@ -16,7 +16,10 @@ import { UNPACK_CHOICES, unpackChoice, unpackOf } from "@/lib/torrents";
 import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { Toggle } from "../../../components/controls";
-import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
+import {
+  RecordEditor,
+  type EditorSection,
+} from "../../../components/RecordEditor";
 import { Cell } from "../../../components/rows";
 import { testIds } from "../../../testids";
 import { useNextData } from "../../../data/next-data";
@@ -90,17 +93,22 @@ const formOf = (category: Category): CategoryForm => ({
 });
 
 /** The terms as the input takes them, comparable with others; terms that all inherit are none. */
-const seedingValue = (policy: SeedingPolicy) => (seedingInherits(policy) ? null : seedingInput(policy));
+const seedingValue = (policy: SeedingPolicy) =>
+  seedingInherits(policy) ? null : seedingInput(policy);
 
 export function CategoriesPanel() {
   const t = useTranslate();
-  const [{ data, fetching }, reexecute] = useQuery<{ categories: Category[] }>({ query: CATEGORIES_QUERY });
+  const [{ data, fetching }, reexecute] = useQuery<{ categories: Category[] }>({
+    query: CATEGORIES_QUERY,
+  });
   // The rails and pickers elsewhere read the shared copy, which this panel's own query does not reach.
   const { refreshCategories } = useNextData("refreshCategories");
   // A category's Torrents section shows only while torrents are on; a save
   // sends its fields only when they were edited, so hiding it keeps them.
   const torrentsOn = useTorrentsShown();
-  const [{ data: settingsData }] = useQuery<{ settings: { completeDir: string; dataDir: string } }>({
+  const [{ data: settingsData }] = useQuery<{
+    settings: { completeDir: string; dataDir: string };
+  }>({
     query: SETTINGS_QUERY,
   });
   const [, addCategory] = useMutation(ADD_CATEGORY_MUTATION);
@@ -116,13 +124,22 @@ export function CategoriesPanel() {
   const [confirmRemove, setConfirmRemove] = useState<Category | null>(null);
 
   const categories = useMemo(
-    () => [...(data?.categories ?? [])].sort((left, right) => left.name.localeCompare(right.name)),
+    () =>
+      [...(data?.categories ?? [])].sort((left, right) =>
+        left.name.localeCompare(right.name),
+      ),
     [data?.categories],
   );
 
-  const completeDir = settingsData?.settings?.completeDir
-    || (settingsData?.settings?.dataDir ? `${settingsData.settings.dataDir}/complete` : "");
-  const editing = typeof editingId === "number" ? categories.find((c) => c.id === editingId) : null;
+  const completeDir =
+    settingsData?.settings?.completeDir ||
+    (settingsData?.settings?.dataDir
+      ? `${settingsData.settings.dataDir}/complete`
+      : "");
+  const editing =
+    typeof editingId === "number"
+      ? categories.find((c) => c.id === editingId)
+      : null;
 
   const open = (category: Category | null) => {
     setError(null);
@@ -144,10 +161,17 @@ export function CategoriesPanel() {
       name,
       destDir: form.destDir.trim() || null,
       aliases: form.aliases.trim(),
-      ...(JSON.stringify(seeding) !== JSON.stringify(seedingValue(opened.seeding)) ? { seeding } : {}),
-      ...(form.torrentRoute !== opened.torrentRoute ? { torrentRoute: form.torrentRoute } : {}),
+      ...(JSON.stringify(seeding) !==
+      JSON.stringify(seedingValue(opened.seeding))
+        ? { seeding }
+        : {}),
+      ...(form.torrentRoute !== opened.torrentRoute
+        ? { torrentRoute: form.torrentRoute }
+        : {}),
       ...(form.unpack !== opened.unpack ? { unpack: form.unpack } : {}),
-      ...(JSON.stringify(form.uploadCap) !== JSON.stringify(opened.uploadCap) ? { uploadCap: leafInput(form.uploadCap) } : {}),
+      ...(JSON.stringify(form.uploadCap) !== JSON.stringify(opened.uploadCap)
+        ? { uploadCap: leafInput(form.uploadCap) }
+        : {}),
     };
     const result =
       editingId === "new"
@@ -183,7 +207,11 @@ export function CategoriesPanel() {
       title: t("next.settings.panel.categories"),
       note: t("next.categories.note"),
       columns: "minmax(0, 1fr) minmax(0, 1.4fr) minmax(0, 1fr)",
-      headers: [t("next.categories.name"), t("next.categories.destination"), t("next.categories.aliases")],
+      headers: [
+        t("next.categories.name"),
+        t("next.categories.destination"),
+        t("next.categories.aliases"),
+      ],
       empty: t("next.categories.empty"),
       add: { label: t("next.categories.add"), onClick: () => open(null) },
       onRowClick: (id) => {
@@ -200,7 +228,12 @@ export function CategoriesPanel() {
             <Square color={categoryColor(category.name)} />
             <span className="min-w-0 truncate">{category.name}</span>
           </span>,
-          <Cell key="dest" mono className="text-wv-secondary" title={category.destDir ?? ""}>
+          <Cell
+            key="dest"
+            mono
+            className="text-wv-secondary"
+            title={category.destDir ?? ""}
+          >
             {category.destDir || `${completeDir}/${category.name}`}
           </Cell>,
           <Cell key="aliases" mono className="text-wv-muted">
@@ -218,7 +251,11 @@ export function CategoriesPanel() {
       <RecordEditor
         open={editingId !== null}
         testId={testIds.dialog("category")}
-        title={editingId === "new" ? t("next.categories.add") : (editing?.name ?? t("next.categories.category"))}
+        title={
+          editingId === "new"
+            ? t("next.categories.add")
+            : (editing?.name ?? t("next.categories.category"))
+        }
         note={editingId === "new" ? undefined : `#${editing?.id ?? ""}`}
         error={error}
         busy={busy}
@@ -239,7 +276,8 @@ export function CategoriesPanel() {
                   kind: "text",
                   mono: false,
                   value: form.name,
-                  onChange: (next) => setForm((current) => ({ ...current, name: next })),
+                  onChange: (next) =>
+                    setForm((current) => ({ ...current, name: next })),
                 },
               },
               {
@@ -251,8 +289,11 @@ export function CategoriesPanel() {
                 control: {
                   kind: "path",
                   value: form.destDir,
-                  placeholder: completeDir ? `${completeDir}/${form.name || "name"}` : "",
-                  onChange: (next) => setForm((current) => ({ ...current, destDir: next })),
+                  placeholder: completeDir
+                    ? `${completeDir}/${form.name || "name"}`
+                    : "",
+                  onChange: (next) =>
+                    setForm((current) => ({ ...current, destDir: next })),
                 },
               },
               {
@@ -263,65 +304,99 @@ export function CategoriesPanel() {
                   kind: "text",
                   value: form.aliases,
                   placeholder: "tv, series",
-                  onChange: (next) => setForm((current) => ({ ...current, aliases: next })),
+                  onChange: (next) =>
+                    setForm((current) => ({ ...current, aliases: next })),
                 },
               },
             ],
           },
-          ...(torrentsOn ? [{
-            id: "torrents",
-            title: t("next.categories.torrents"),
-            fields: [
-              {
-                id: "torrentRoute",
-                label: t("next.categories.torrentRoute"),
-                keywords: "torrent route networking",
-                control: {
-                  kind: "custom",
-                  // Off, the category's torrents ride the default torrent route; on,
-                  // the category owns a route, edited under Networking's routes.
-                  control: (
-                    <div className="flex items-center gap-[10px]">
-                      <Toggle
-                        checked={form.torrentRoute}
-                        label={t("next.categories.torrentRoute")}
-                        onChange={(torrentRoute) => setForm((current) => ({ ...current, torrentRoute }))}
-                        testId={testIds.field("torrentRoute")}
-                      />
-                      {form.torrentRoute && typeof editingId === "number" ? (
-                        <Link
-                          to={`/settings/networking/routes?consumer=torrent:category:${editingId}`}
-                          className="font-wv-mono text-[11.5px] text-wv-accent hover:text-wv-accent-hover"
-                        >
-                          {t("next.categories.routeOwn")}
-                        </Link>
-                      ) : form.torrentRoute ? (
-                        <span className="font-wv-mono text-[11.5px] text-wv-muted">{t("next.categories.routeOwn")}</span>
-                      ) : (
-                        <span className="font-wv-mono text-[11.5px] text-wv-muted">{t("next.networking.defaultTorrent")}</span>
-                      )}
-                    </div>
-                  ),
-                },
-              },
-              {
-                id: "unpack",
-                label: t("next.torrents.unpack"),
-                keywords: "unpack extract archive",
-                control: {
-                  kind: "segmented",
-                  value: unpackChoice(form.unpack),
-                  options: UNPACK_CHOICES.map((option) => ({ ...option, label: t(option.label) })),
-                  onChange: (choice) => setForm((current) => ({ ...current, unpack: unpackOf(choice) })),
-                },
-              },
-              ...seedingFields(t, form.seeding, (seeding) => setForm((current) => ({ ...current, seeding })), {
-                inherits: true,
-                idPrefix: "categorySeeding",
-              }),
-              uploadCapField(t, form.uploadCap, (uploadCap) => setForm((current) => ({ ...current, uploadCap })), "categorySeeding"),
-            ],
-          } satisfies EditorSection] : []),
+          ...(torrentsOn
+            ? [
+                {
+                  id: "torrents",
+                  title: t("next.categories.torrents"),
+                  fields: [
+                    {
+                      id: "torrentRoute",
+                      label: t("next.categories.torrentRoute"),
+                      keywords: "torrent route networking",
+                      control: {
+                        kind: "custom",
+                        // Off, the category's torrents ride the default torrent route; on,
+                        // the category owns a route, edited under Networking's routes.
+                        control: (
+                          <div className="flex items-center gap-[10px]">
+                            <Toggle
+                              checked={form.torrentRoute}
+                              label={t("next.categories.torrentRoute")}
+                              onChange={(torrentRoute) =>
+                                setForm((current) => ({
+                                  ...current,
+                                  torrentRoute,
+                                }))
+                              }
+                              testId={testIds.field("torrentRoute")}
+                            />
+                            {form.torrentRoute &&
+                            typeof editingId === "number" ? (
+                              <Link
+                                to={`/settings/networking/routes?consumer=torrent:category:${editingId}`}
+                                className="font-wv-mono text-[11.5px] text-wv-accent hover:text-wv-accent-hover"
+                              >
+                                {t("next.categories.routeOwn")}
+                              </Link>
+                            ) : form.torrentRoute ? (
+                              <span className="font-wv-mono text-[11.5px] text-wv-muted">
+                                {t("next.categories.routeOwn")}
+                              </span>
+                            ) : (
+                              <span className="font-wv-mono text-[11.5px] text-wv-muted">
+                                {t("next.networking.defaultTorrent")}
+                              </span>
+                            )}
+                          </div>
+                        ),
+                      },
+                    },
+                    {
+                      id: "unpack",
+                      label: t("next.torrents.unpack"),
+                      keywords: "unpack extract archive",
+                      control: {
+                        kind: "segmented",
+                        value: unpackChoice(form.unpack),
+                        options: UNPACK_CHOICES.map((option) => ({
+                          ...option,
+                          label: t(option.label),
+                        })),
+                        onChange: (choice) =>
+                          setForm((current) => ({
+                            ...current,
+                            unpack: unpackOf(choice),
+                          })),
+                      },
+                    },
+                    ...seedingFields(
+                      t,
+                      form.seeding,
+                      (seeding) =>
+                        setForm((current) => ({ ...current, seeding })),
+                      {
+                        inherits: true,
+                        idPrefix: "categorySeeding",
+                      },
+                    ),
+                    uploadCapField(
+                      t,
+                      form.uploadCap,
+                      (uploadCap) =>
+                        setForm((current) => ({ ...current, uploadCap })),
+                      "categorySeeding",
+                    ),
+                  ],
+                } satisfies EditorSection,
+              ]
+            : []),
         ]}
       />
 
@@ -332,7 +407,9 @@ export function CategoriesPanel() {
         note={confirmRemove?.name}
         busy={busy}
         confirmLabel={t("next.categories.remove")}
-        body={t("next.categories.removeBody", { name: confirmRemove?.name ?? "" })}
+        body={t("next.categories.removeBody", {
+          name: confirmRemove?.name ?? "",
+        })}
         onConfirm={() => void remove()}
         onDismiss={() => setConfirmRemove(null)}
       />

@@ -16,12 +16,21 @@ import {
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { LoadingMark } from "@/lib/loading-mark";
 import type { DownloadQuota } from "@/lib/networking";
-import { blockedRouting, directRouting, routeFields, type RoutingPolicy, type RoutingStatus } from "@/lib/proxies";
+import {
+  blockedRouting,
+  directRouting,
+  routeFields,
+  type RoutingPolicy,
+  type RoutingStatus,
+} from "@/lib/proxies";
 import { refusalMessage } from "@/lib/refusal";
 import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { Icon } from "../../../components/icons";
-import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
+import {
+  RecordEditor,
+  type EditorSection,
+} from "../../../components/RecordEditor";
 import { speedPage } from "../../../features/networking/data";
 import { SecondaryButton, Toggle } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
@@ -29,8 +38,19 @@ import { settingsIds, testIds } from "../../../testids";
 import { WorkingOverlay } from "../../../components/WorkingOverlay";
 import { WV } from "../../../data/palette";
 import { formatHostnames, formatLatency } from "../../../data/format";
-import { SettingsBlocks, usePanelStatus, useSettingsPanelActive, type SettingsBlock } from "../framework";
-import { quotaDraft, quotaFields, quotaInput, trimNumber, type QuotaDraft } from "../quota";
+import {
+  SettingsBlocks,
+  usePanelStatus,
+  useSettingsPanelActive,
+  type SettingsBlock,
+} from "../framework";
+import {
+  quotaDraft,
+  quotaFields,
+  quotaInput,
+  trimNumber,
+  type QuotaDraft,
+} from "../quota";
 
 /**
  * Providers: the news servers weaver downloads from.
@@ -161,7 +181,9 @@ function transportLabel(t: Translate, server: Server): string {
   if (!server.tls) {
     return t("next.providers.plain");
   }
-  return server.tlsCipherSuite ? `TLS · ${shortCipher(server.tlsCipherSuite)}` : "TLS";
+  return server.tlsCipherSuite
+    ? `TLS · ${shortCipher(server.tlsCipherSuite)}`
+    : "TLS";
 }
 
 function roleLabel(t: Translate, server: Server): string {
@@ -175,7 +197,10 @@ function roleLabel(t: Translate, server: Server): string {
       : t("next.providers.priorityN", { priority: server.priority });
 }
 
-function formToState(server: ServerDetails | Server, username: string): ServerForm {
+function formToState(
+  server: ServerDetails | Server,
+  username: string,
+): ServerForm {
   return {
     host: server.host,
     port: server.port,
@@ -188,7 +213,10 @@ function formToState(server: ServerDetails | Server, username: string): ServerFo
     backfill: server.backfill,
     retentionDays: server.retentionDays,
     speedUnlimited: server.maxDownloadSpeed === 0,
-    speedMib: server.maxDownloadSpeed === 0 ? "10" : trimNumber(server.maxDownloadSpeed / MIB),
+    speedMib:
+      server.maxDownloadSpeed === 0
+        ? "10"
+        : trimNumber(server.maxDownloadSpeed / MIB),
     quota: quotaDraft(server.downloadQuota),
     quotaUsedBytes: server.downloadQuota?.usedBytes ?? 0,
     routing: server.routing ?? directRouting,
@@ -197,7 +225,8 @@ function formToState(server: ServerDetails | Server, username: string): ServerFo
       "tlsNameMismatchCertificateDerBase64" in server
         ? server.tlsNameMismatchCertificateDerBase64
         : null,
-    certificateFingerprint: server.tlsNameMismatchCertificateFingerprint ?? null,
+    certificateFingerprint:
+      server.tlsNameMismatchCertificateFingerprint ?? null,
   };
 }
 
@@ -215,18 +244,24 @@ function serverInput(form: ServerForm) {
     backfill: form.backfill,
     retentionDays: form.retentionDays,
     tlsNameMismatchCertificateDerBase64: form.certificateDerBase64,
-    maxDownloadSpeed: form.speedUnlimited ? 0 : Math.round(Number(form.speedMib || 0) * MIB),
+    maxDownloadSpeed: form.speedUnlimited
+      ? 0
+      : Math.round(Number(form.speedMib || 0) * MIB),
     downloadQuota: quotaInput(form.quota),
   };
 }
 
 export function ProvidersPanel() {
   const t = useTranslate();
-  const [{ data, fetching, error: listError }, reexecute] = useQuery<{ servers: Server[] }>({ query: SERVERS_QUERY });
+  const [{ data, fetching, error: listError }, reexecute] = useQuery<{
+    servers: Server[];
+  }>({ query: SERVERS_QUERY });
   const [, addServer] = useMutation(ADD_SERVER_MUTATION);
   const [, updateServer] = useMutation(UPDATE_SERVER_MUTATION);
   const [, removeServer] = useMutation(REMOVE_SERVER_MUTATION);
-  const [, resetQuota] = useMutation(RESET_SERVER_DOWNLOAD_QUOTA_USAGE_MUTATION);
+  const [, resetQuota] = useMutation(
+    RESET_SERVER_DOWNLOAD_QUOTA_USAGE_MUTATION,
+  );
   const [, testConnection] = useMutation(TEST_CONNECTION_MUTATION);
   const client = useClient();
   const navigate = useNavigate();
@@ -237,12 +272,20 @@ export function ProvidersPanel() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [testing, setTesting] = useState(false);
-  const [submittedTestResult, setTestResult] = useState<(TestResult & { values: ServerForm }) | null>(null);
-  const testResult = submittedTestResult && JSON.stringify(submittedTestResult.values) === JSON.stringify(form)
-    ? submittedTestResult
-    : null;
+  const [submittedTestResult, setTestResult] = useState<
+    (TestResult & { values: ServerForm }) | null
+  >(null);
+  const testResult =
+    submittedTestResult &&
+    JSON.stringify(submittedTestResult.values) === JSON.stringify(form)
+      ? submittedTestResult
+      : null;
   const [confirmRemove, setConfirmRemove] = useState<Server | null>(null);
-  const [confirmTrust, setConfirmTrust] = useState<{ derBase64: string; fingerprint: string; names: string[] } | null>(null);
+  const [confirmTrust, setConfirmTrust] = useState<{
+    derBase64: string;
+    fingerprint: string;
+    names: string[];
+  } | null>(null);
 
   // Only the single-server query carries the stored username; the list does not.
   const [{ data: detailsData }] = useQuery<{ server: ServerDetails | null }>({
@@ -254,22 +297,28 @@ export function ProvidersPanel() {
   // A list that could not be read says why: in place of the table when there
   // are no rows to show, on the status line beside rows the answer still held.
   const listFailure = listError ? refusalMessage(t, listError) : null;
-  const failureBesideRows = (data?.servers?.length ?? 0) > 0 ? listFailure : null;
+  const failureBesideRows =
+    (data?.servers?.length ?? 0) > 0 ? listFailure : null;
   usePanelStatus(failureBesideRows, failureBesideRows !== null);
 
   const servers = useMemo(
     () =>
       [...(data?.servers ?? [])].sort(
-        (left, right) => left.priority - right.priority || left.host.localeCompare(right.host),
+        (left, right) =>
+          left.priority - right.priority || left.host.localeCompare(right.host),
       ),
     [data?.servers],
   );
 
   // urql retains the previous result while a different provider is loading.
-  const details = typeof editingId === "number" && detailsData?.server?.id === editingId
-    ? detailsData.server
-    : null;
-  const editing = typeof editingId === "number" ? servers.find((s) => s.id === editingId) : null;
+  const details =
+    typeof editingId === "number" && detailsData?.server?.id === editingId
+      ? detailsData.server
+      : null;
+  const editing =
+    typeof editingId === "number"
+      ? servers.find((s) => s.id === editingId)
+      : null;
 
   // `updateServer` keeps a password it is not given but clears a username it is
   // not given, so no edit may be sent from the list's copy of a row: the form
@@ -346,7 +395,10 @@ export function ProvidersPanel() {
     }
     await updateServer({
       id: server.id,
-      input: { ...serverInput(formToState(details, details.username ?? "")), active },
+      input: {
+        ...serverInput(formToState(details, details.username ?? "")),
+        active,
+      },
     });
     void reexecute({ requestPolicy: "network-only" });
   };
@@ -366,7 +418,11 @@ export function ProvidersPanel() {
     const result =
       editingId === "new"
         ? // Behind a kill switch there is no way out to test, so the server is kept off.
-          await addServer({ input: values.killSwitch ? { ...input, active: false, routing: blockedRouting } : input })
+          await addServer({
+            input: values.killSwitch
+              ? { ...input, active: false, routing: blockedRouting }
+              : input,
+          })
         : await updateServer({ id: editingId, input });
     if (session !== editorSession.current) {
       void reexecute({ requestPolicy: "network-only" });
@@ -374,8 +430,13 @@ export function ProvidersPanel() {
     }
     setBusy(false);
     if (result.error) {
-      const message = result.error.graphQLErrors[0]?.message ?? result.error.message;
-      if (values.tls && !values.certificateDerBase64 && message.includes(CERTIFICATE_NAME_MISMATCH)) {
+      const message =
+        result.error.graphQLErrors[0]?.message ?? result.error.message;
+      if (
+        values.tls &&
+        !values.certificateDerBase64 &&
+        message.includes(CERTIFICATE_NAME_MISMATCH)
+      ) {
         // Show the certificate the way a test does, so it can be trusted here.
         await runTest();
         return;
@@ -396,10 +457,16 @@ export function ProvidersPanel() {
     setError(null);
     const session = editorSession.current;
     // A test saves nothing, so it is told the route to leave by.
-    const result = await testConnection({ input: { ...serverInput(provider), ...routeFields(provider.routing) } });
+    const result = await testConnection({
+      input: { ...serverInput(provider), ...routeFields(provider.routing) },
+    });
     if (session !== editorSession.current) return;
     setTesting(false);
-    setTestResult(result.data?.testConnection ? { ...(result.data.testConnection as TestResult), values: provider } : null);
+    setTestResult(
+      result.data?.testConnection
+        ? { ...(result.data.testConnection as TestResult), values: provider }
+        : null,
+    );
   };
 
   const trust = () => {
@@ -417,10 +484,15 @@ export function ProvidersPanel() {
     void runTest(next);
   };
 
-  const adoptable = values?.certificateDerBase64 ? null : (testResult?.adoptableTlsNameMismatchCertificate ?? null);
+  const adoptable = values?.certificateDerBase64
+    ? null
+    : (testResult?.adoptableTlsNameMismatchCertificate ?? null);
 
   // A trusted certificate belongs to one host and port over TLS.
-  const forgetCertificate = { certificateDerBase64: null, certificateFingerprint: null };
+  const forgetCertificate = {
+    certificateDerBase64: null,
+    certificateFingerprint: null,
+  };
 
   const remove = async () => {
     if (!confirmRemove) {
@@ -459,7 +531,8 @@ export function ProvidersPanel() {
       id: "servers",
       title: t("next.providers.servers"),
       note: t("next.settings.panel.serversNote"),
-      columns: "minmax(0, 1.2fr) 132px minmax(0, 1fr) minmax(0, 0.8fr) 92px 208px",
+      columns:
+        "minmax(0, 1.2fr) 132px minmax(0, 1fr) minmax(0, 0.8fr) 92px 208px",
       centered: [4],
       headers: [
         t("next.providers.host"),
@@ -470,15 +543,17 @@ export function ProvidersPanel() {
         "",
       ],
       empty: t("next.providers.empty"),
-      failure: listFailure === null
-        ? undefined
-        : {
-            message: listFailure,
-            retry: {
-              label: t("next.networking.retry"),
-              onClick: () => void reexecute({ requestPolicy: "network-only" }),
+      failure:
+        listFailure === null
+          ? undefined
+          : {
+              message: listFailure,
+              retry: {
+                label: t("next.networking.retry"),
+                onClick: () =>
+                  void reexecute({ requestPolicy: "network-only" }),
+              },
             },
-          },
       add: { label: t("next.providers.add"), onClick: addProvider },
       onRowClick: (id) => editProvider(Number(id)),
       rows: servers.map((server) => ({
@@ -487,13 +562,22 @@ export function ProvidersPanel() {
         cells: [
           <span key="host" className="flex min-w-0 items-center gap-[10px]">
             <Square color={server.active ? WV.accent : WV.inert} />
-            <span className="min-w-0 truncate font-wv-mono text-[12.5px]">{server.host}</span>
-            <span className="flex-none font-wv-mono text-[11px] text-wv-faint">:{server.port}</span>
+            <span className="min-w-0 truncate font-wv-mono text-[12.5px]">
+              {server.host}
+            </span>
+            <span className="flex-none font-wv-mono text-[11px] text-wv-faint">
+              :{server.port}
+            </span>
           </span>,
           <Cell key="connections" mono testId={settingsIds.providerConnections}>
             {server.connections}
           </Cell>,
-          <Cell key="transport" mono className="text-wv-secondary" testId={settingsIds.providerTransport(server.tls ? "tls" : "plain")}>
+          <Cell
+            key="transport"
+            mono
+            className="text-wv-secondary"
+            testId={settingsIds.providerTransport(server.tls ? "tls" : "plain")}
+          >
             {transportLabel(t, server)}
           </Cell>,
           <Cell key="role">{roleLabel(t, server)}</Cell>,
@@ -506,7 +590,11 @@ export function ProvidersPanel() {
               testId={settingsIds.providerEnabled}
             />
           </span>,
-          <span key="actions" className="ml-auto flex gap-2" onClick={(event) => event.stopPropagation()}>
+          <span
+            key="actions"
+            className="ml-auto flex gap-2"
+            onClick={(event) => event.stopPropagation()}
+          >
             <SecondaryButton
               size="compact"
               icon="speedTest"
@@ -514,7 +602,11 @@ export function ProvidersPanel() {
             >
               {t("next.networking.speed.title")}
             </SecondaryButton>
-            <SecondaryButton size="compact" icon="edit" onClick={() => editProvider(server.id)}>
+            <SecondaryButton
+              size="compact"
+              icon="edit"
+              onClick={() => editProvider(server.id)}
+            >
               {t("next.common.edit")}
             </SecondaryButton>
           </span>,
@@ -556,7 +648,12 @@ export function ProvidersPanel() {
               control: {
                 kind: "toggle",
                 value: values.tls,
-                onChange: (next) => patch({ tls: next, port: next ? 563 : 119, ...forgetCertificate }),
+                onChange: (next) =>
+                  patch({
+                    tls: next,
+                    port: next ? 563 : 119,
+                    ...forgetCertificate,
+                  }),
               },
             },
             {
@@ -572,7 +669,10 @@ export function ProvidersPanel() {
             {
               id: "password",
               label: t("next.providers.password"),
-              help: editingId === "new" ? undefined : t("next.providers.passwordKeep"),
+              help:
+                editingId === "new"
+                  ? undefined
+                  : t("next.providers.passwordKeep"),
               control: {
                 kind: "text",
                 type: "password",
@@ -708,11 +808,17 @@ export function ProvidersPanel() {
       <RecordEditor
         open={editingId !== null}
         testId={testIds.dialog("provider")}
-        title={editingId === "new" ? t("next.providers.add") : (editing?.host ?? t("next.providers.provider"))}
+        title={
+          editingId === "new"
+            ? t("next.providers.add")
+            : (editing?.host ?? t("next.providers.provider"))
+        }
         note={
           editingId === "new"
             ? undefined
-            : t("next.providers.priorityNote", { priority: values?.priority ?? 0 })
+            : t("next.providers.priorityNote", {
+                priority: values?.priority ?? 0,
+              })
         }
         width={620}
         overlay={
@@ -745,14 +851,21 @@ export function ProvidersPanel() {
                 {t("next.providers.resetUsage")}
               </SecondaryButton>
             ) : null}
-            <SecondaryButton icon="test" onClick={() => void runTest()} disabled={testing || values?.killSwitch}>
+            <SecondaryButton
+              icon="test"
+              onClick={() => void runTest()}
+              disabled={testing || values?.killSwitch}
+            >
               {testing ? t("next.providers.testing") : t("next.providers.test")}
             </SecondaryButton>
           </>
         }
       >
         {values === null ? (
-          <div role="status" className="flex items-center gap-3 px-4 sm:px-6 py-5 font-wv-mono text-[12px] text-wv-muted">
+          <div
+            role="status"
+            className="flex items-center gap-3 px-4 sm:px-6 py-5 font-wv-mono text-[12px] text-wv-muted"
+          >
             <LoadingMark className="h-5" />
             {t("next.providers.loading")}
           </div>
@@ -762,10 +875,18 @@ export function ProvidersPanel() {
             <div
               role="status"
               className={`flex items-center gap-3 px-[12px] py-[11px] text-wv-on-accent ${
-                adoptable ? "bg-wv-warn" : testResult.success ? "bg-wv-accent" : "bg-wv-error"
+                adoptable
+                  ? "bg-wv-warn"
+                  : testResult.success
+                    ? "bg-wv-accent"
+                    : "bg-wv-error"
               }`}
             >
-              <Icon name={adoptable ? "trust" : "test"} size={22} className="flex-none self-start" />
+              <Icon
+                name={adoptable ? "trust" : "test"}
+                size={22}
+                className="flex-none self-start"
+              />
               <span className="flex min-w-0 flex-col gap-[5px]">
                 <span className="text-[13.5px] leading-[1.35] font-semibold tracking-[-0.005em]">
                   {adoptable
@@ -782,8 +903,12 @@ export function ProvidersPanel() {
                 {testResult.latencyMs === null ? null : (
                   <span className="font-wv-mono text-[11px] leading-none">
                     {formatLatency(testResult.latencyMs)}
-                    {testResult.supportsPipelining ? ` · ${t("next.providers.pipelining")}` : ""}
-                    {testResult.tlsCipherSuite ? ` · ${shortCipher(testResult.tlsCipherSuite)}` : ""}
+                    {testResult.supportsPipelining
+                      ? ` · ${t("next.providers.pipelining")}`
+                      : ""}
+                    {testResult.tlsCipherSuite
+                      ? ` · ${shortCipher(testResult.tlsCipherSuite)}`
+                      : ""}
                   </span>
                 )}
               </span>
@@ -791,7 +916,9 @@ export function ProvidersPanel() {
             {adoptable ? (
               <div className="flex flex-col gap-2 pt-1.5">
                 <span className="font-wv-mono text-[11px] break-all text-wv-muted">
-                  {t("next.providers.certFingerprint", { fingerprint: adoptable.sha256Fingerprint })}
+                  {t("next.providers.certFingerprint", {
+                    fingerprint: adoptable.sha256Fingerprint,
+                  })}
                 </span>
                 <SecondaryButton
                   icon="trust"
@@ -827,7 +954,9 @@ export function ProvidersPanel() {
             </div>
             {values.certificateFingerprint ? (
               <span className="font-wv-mono text-[11px] break-all">
-                {t("next.providers.certFingerprint", { fingerprint: values.certificateFingerprint })}
+                {t("next.providers.certFingerprint", {
+                  fingerprint: values.certificateFingerprint,
+                })}
               </span>
             ) : null}
           </div>
@@ -842,9 +971,17 @@ export function ProvidersPanel() {
             <span>{t("next.providers.trustBody")}</span>
             <span className="flex flex-col gap-1 font-wv-mono text-[11px] break-all text-wv-muted">
               {confirmTrust?.names.length ? (
-                <span>{t("next.providers.certNames", { names: formatHostnames(confirmTrust.names) })}</span>
+                <span>
+                  {t("next.providers.certNames", {
+                    names: formatHostnames(confirmTrust.names),
+                  })}
+                </span>
               ) : null}
-              <span>{t("next.providers.certFingerprint", { fingerprint: confirmTrust?.fingerprint ?? "" })}</span>
+              <span>
+                {t("next.providers.certFingerprint", {
+                  fingerprint: confirmTrust?.fingerprint ?? "",
+                })}
+              </span>
             </span>
           </span>
         }

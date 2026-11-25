@@ -13,10 +13,10 @@ const basename = window.__WEAVER_BASE__ || "/";
  * The interface's route table. Every screen loads on its own the first time it
  * is visited.
  */
-function lazyRoute<TModule extends Record<string, unknown>, TKey extends keyof TModule>(
-  importer: () => Promise<TModule>,
-  exportName: TKey,
-) {
+function lazyRoute<
+  TModule extends Record<string, unknown>,
+  TKey extends keyof TModule,
+>(importer: () => Promise<TModule>, exportName: TKey) {
   return {
     HydrateFallback: NextRouteFallback,
     lazy: async () => {
@@ -31,26 +31,44 @@ export const nextRouter = createBrowserRouter(
     {
       errorElement: <RouteErrorPage />,
       children: [
-        { index: true, ...lazyRoute(() => import("./pages/DownloadsPage"), "DownloadsPage") },
-        { path: "history", ...lazyRoute(() => import("./pages/HistoryPage"), "HistoryPage") },
+        {
+          index: true,
+          ...lazyRoute(() => import("./pages/DownloadsPage"), "DownloadsPage"),
+        },
+        {
+          path: "history",
+          ...lazyRoute(() => import("./pages/HistoryPage"), "HistoryPage"),
+        },
         {
           path: "jobs/:id",
           ...lazyRoute(() => import("./pages/JobDetailPage"), "JobDetailPage"),
         },
         {
           path: "monitoring/:dashboard?",
-          ...lazyRoute(() => import("./pages/monitoring/dashboards"), "MonitoringRoute"),
+          ...lazyRoute(
+            () => import("./pages/monitoring/dashboards"),
+            "MonitoringRoute",
+          ),
         },
         {
           path: "system-info",
-          ...lazyRoute(() => import("./pages/SystemInfoPage"), "SystemInfoPage"),
+          ...lazyRoute(
+            () => import("./pages/SystemInfoPage"),
+            "SystemInfoPage",
+          ),
         },
-        { path: "logs", ...lazyRoute(() => import("./pages/LogsPage"), "LogsPage") },
+        {
+          path: "logs",
+          ...lazyRoute(() => import("./pages/LogsPage"), "LogsPage"),
+        },
         {
           path: "tools/analyzer",
           ...lazyRoute(() => import("./pages/AnalyzerPage"), "AnalyzerPage"),
         },
-        { path: "tools/nzb-analyzer", element: <Navigate to="/tools/analyzer" replace /> },
+        {
+          path: "tools/nzb-analyzer",
+          element: <Navigate to="/tools/analyzer" replace />,
+        },
         {
           path: "settings",
           children: [
@@ -58,7 +76,10 @@ export const nextRouter = createBrowserRouter(
             ...SETTINGS_REDIRECTS,
             {
               path: ":panel/*",
-              ...lazyRoute(() => import("./pages/settings/SettingsPage"), "SettingsPage"),
+              ...lazyRoute(
+                () => import("./pages/settings/SettingsPage"),
+                "SettingsPage",
+              ),
             },
           ],
         },

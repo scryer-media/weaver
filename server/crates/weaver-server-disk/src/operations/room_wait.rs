@@ -7,8 +7,9 @@
 // holds already: nothing here touches the disk.
 //
 // The wait has one mark: what its disk showed free as the write failed, or
-// what a probe running then published after. A reading counts when it is
-// good and its probe began after the write failed. What it has to show
+// what a probe running then, that had begun to read free space, published
+// after. A reading counts when it is good and its probe began after the
+// write failed, or began before and read after. What it has to show
 // depends on what the step that failed did with its own output. A step that
 // removed what it had written (or never wrote it) names what it needs free
 // to run again: a reading has to show at least that much. A step that gave
@@ -129,7 +130,8 @@ pub struct RoomWait {
     pub quota: bool,
     pub disk: Disk,
     // The disk's count of the probes it had begun as the write failed: only
-    // a later probe's reading can show room made since.
+    // a later probe's reading can show room made since. One less once the
+    // probe running then is found to have read after the failure.
     pub(crate) since: u64,
     // What the disk showed free when the write failed: the figure of its
     // newest reading whose probe began no later than the failure, even a
@@ -148,6 +150,10 @@ pub struct RoomWait {
     // A probe was running as the write failed: it began before the failure,
     // so the figure it publishes takes the mark's place, once.
     pub(crate) running: bool,
+    // The root's count of the probes that had begun to read free space as
+    // the write failed: the running probe's figure is from before the
+    // failure only when its read is counted in it. `None` for a path.
+    pub(crate) read: Option<u64>,
     // How many times the root waited on had been pointed elsewhere, and the
     // directory it was pointed at as the write failed: when the root is
     // pointed elsewhere, the wait goes on reading that directory's disk.
@@ -218,6 +224,7 @@ impl RoomWait {
             freed: 0,
             needs,
             running,
+            read: look.reads,
             moved: look.moved,
             dir,
         }
@@ -249,6 +256,7 @@ impl RoomWait {
             self.disk = Disk::Path(self.dir.clone());
             self.since = look.begun;
             self.running = false;
+            self.read = look.reads;
             self.moved = look.moved;
         }
         // What the disk shows now, and what is free on it to spend: for a
@@ -267,11 +275,19 @@ impl RoomWait {
             }
         };
         let look = look?;
-        // A probe running as the write failed began before it: what it
-        // published is the newest figure from before the failure, and takes
-        // the mark's place.
+        // A probe running as the write failed began before it. When it had
+        // begun to read free space by then, what it published is the newest
+        // figure from before the failure, and takes the mark's place. When
+        // it read after, room made since the failure may show in it: it is
+        // judged as a later reading is, against the mark taken then.
         if self.running && look.probe >= self.since {
-            if let Some(before) = look.figure_of(self.since) {
+            let read_after = matches!(
+                (look.read_of(self.since), self.read),
+                (Some(read), Some(at_failure)) if read > at_failure
+            );
+            if read_after {
+                self.since -= 1;
+            } else if let Some(before) = look.figure_of(self.since) {
                 self.mark = Some(before);
             }
             self.running = false;
@@ -1067,6 +1083,178 @@ mod tests {
             .collect();
         assert_eq!(heard.len(), 1);
         assert_eq!(heard[0].disk, Disk::Path(path));
+    }
+
+    const GIB: u64 = 1 << 30;
+    const MIB: u64 = 1 << 20;
+
+    // A probe of the complete root's directory that shows `room` as free,
+    // and that, once it has read, holds the read counted `stop` among its
+    // reads until `stop` changes. Every other directory shows plenty.
+    struct GatedProbe {
+        dir: PathBuf,
+        room: std::sync::atomic::AtomicU64,
+        // How many reads of `dir` have begun, and the one held.
+        gate: std::sync::Mutex<(u64, Option<u64>)>,
+        moved: std::sync::Condvar,
+    }
+
+    impl GatedProbe {
+        fn new(dir: &Path, room: u64) -> Arc<Self> {
+            Arc::new(Self {
+                dir: dir.to_path_buf(),
+                room: room.into(),
+                gate: std::sync::Mutex::new((0, None)),
+                moved: std::sync::Condvar::new(),
+            })
+        }
+
+        fn read(&self, path: &Path) -> DiskSpace {
+            if path != self.dir {
+                return DiskSpace {
+                    total_bytes: 1 << 40,
+                    available_bytes: 1 << 40,
+                };
+            }
+            let available_bytes = self.room.load(std::sync::atomic::Ordering::SeqCst);
+            let mut gate = self.gate.lock().unwrap();
+            gate.0 += 1;
+            let read = gate.0;
+            self.moved.notify_all();
+            drop(
+                self.moved
+                    .wait_while(gate, |gate| gate.1 == Some(read))
+                    .unwrap(),
+            );
+            DiskSpace {
+                total_bytes: 1 << 40,
+                available_bytes,
+            }
+        }
+
+        // Hold the read counted `read` once it has read; `None` holds none.
+        fn stop(&self, read: Option<u64>) {
+            self.gate.lock().unwrap().1 = read;
+            self.moved.notify_all();
+        }
+
+        // Block until `read` reads of the directory have read.
+        fn wait_for_read(&self, read: u64) {
+            drop(
+                self.moved
+                    .wait_while(self.gate.lock().unwrap(), |gate| gate.0 < read)
+                    .unwrap(),
+            );
+        }
+
+        fn capacity(self: &Arc<Self>, other: &Path) -> StorageCapacity {
+            let probe = Arc::clone(self);
+            // Data, working, complete.
+            let capacity = StorageCapacity::with_probe(
+                [other.to_path_buf(), other.to_path_buf(), self.dir.clone()],
+                Duration::from_secs(365 * 24 * 60 * 60),
+                Arc::new(move |path: &Path| Ok(probe.read(path))),
+            );
+            for root in StorageRoot::ALL {
+                capacity.wait_for_probes(root, 1);
+            }
+            capacity
+        }
+    }
+
+    fn wait_on_complete(capacity: &StorageCapacity, dir: &Path) -> RoomWait {
+        RoomWait::begin(
+            capacity,
+            Disk::Root(StorageRoot::Complete),
+            dir.to_path_buf(),
+            Wants {
+                needs: None,
+                left: Some(MIB),
+                quota: false,
+            },
+            MIB,
+        )
+    }
+
+    // A probe begun before a write failed, that read free space only after
+    // room was made, shows that room: the job waiting is let go.
+    #[test]
+    fn a_probe_begun_before_the_failure_that_reads_after_room_is_made_lets_the_job_go() {
+        let complete = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let probe = GatedProbe::new(complete.path(), GIB);
+        let capacity = probe.capacity(other.path());
+        let root = StorageRoot::Complete;
+        // The next probe begins, and is held before it reads free space.
+        let (device, mut looked_up) = crate::runtime::fs::test_devices::hold(complete.path());
+        capacity.request_refresh(root);
+        assert_eq!(looked_up.blocking_recv().as_deref(), Some(complete.path()));
+        assert_eq!(capacity.probes_begun(root), 2);
+        assert_eq!(capacity.reads_begun(root), 1);
+        // The write fails while it is held; the probe the wait asks for
+        // stays unpublished, so only the held one's reading is judged.
+        probe.stop(Some(3));
+        let mut wait = wait_on_complete(&capacity, complete.path());
+        assert!(wait.running);
+        assert_eq!(wait.mark, Some(GIB));
+        // Room is made, and then the held probe reads.
+        probe
+            .room
+            .store(4 * GIB, std::sync::atomic::Ordering::SeqCst);
+        drop(device);
+        capacity.wait_for_probes(root, 2);
+        assert_eq!(capacity.look(root).probe, 2);
+        assert_eq!(
+            wait.judge(&capacity, MIB, false, |_, _| 0),
+            Some((MIB, wait.disk.device(&capacity)))
+        );
+        probe.stop(None);
+    }
+
+    // A probe that read free space before a write failed, and published
+    // after it, only sets the mark: the job is let go by a later rise.
+    #[test]
+    fn a_probe_that_read_before_the_failure_only_sets_the_mark() {
+        let complete = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let probe = GatedProbe::new(complete.path(), GIB);
+        let capacity = probe.capacity(other.path());
+        let root = StorageRoot::Complete;
+        // Room is made, and the next probe reads it before the write fails,
+        // then is held before it publishes.
+        probe
+            .room
+            .store(2 * GIB, std::sync::atomic::Ordering::SeqCst);
+        probe.stop(Some(2));
+        capacity.request_refresh(root);
+        probe.wait_for_read(2);
+        assert_eq!(capacity.probes_begun(root), 2);
+        assert_eq!(capacity.reads_begun(root), 2);
+        let mut wait = wait_on_complete(&capacity, complete.path());
+        assert!(wait.running);
+        assert_eq!(wait.mark, Some(GIB));
+        // It publishes; the probe the wait asked for is held unpublished.
+        probe.stop(Some(3));
+        capacity.wait_for_probes(root, 2);
+        assert_eq!(capacity.look(root).probe, 2);
+        assert_eq!(wait.judge(&capacity, MIB, false, |_, _| 0), None);
+        assert_eq!(wait.mark, Some(2 * GIB));
+        // A later reading of the same figure shows no rise.
+        probe.stop(None);
+        capacity.wait_for_probes(root, 3);
+        assert_eq!(wait.judge(&capacity, MIB, false, |_, _| 0), None);
+        assert_eq!(wait.mark, Some(2 * GIB));
+        // A later rise lets it go.
+        probe
+            .room
+            .store(3 * GIB, std::sync::atomic::Ordering::SeqCst);
+        let begun = capacity.probes_begun(root);
+        capacity.request_refresh(root);
+        capacity.wait_for_reading_begun_after(root, begun);
+        assert_eq!(
+            wait.judge(&capacity, MIB, false, |_, _| 0),
+            Some((MIB, wait.disk.device(&capacity)))
+        );
     }
 
     // A small fixed generator, so every run sees the same seeded promises.

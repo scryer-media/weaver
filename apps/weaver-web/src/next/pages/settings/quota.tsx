@@ -59,8 +59,16 @@ export function AllowanceControl({
 }) {
   return (
     <div className="flex items-center gap-[10px]">
-      <AllowanceInput label={label} value={limit} onChange={(next) => onChange({ limit: next, unit })} />
-      <UnitStrip options={ALLOWANCE_UNITS} value={unit} onChange={(next) => onChange({ limit, unit: next })} />
+      <AllowanceInput
+        label={label}
+        value={limit}
+        onChange={(next) => onChange({ limit: next, unit })}
+      />
+      <UnitStrip
+        options={ALLOWANCE_UNITS}
+        value={unit}
+        onChange={(next) => onChange({ limit, unit: next })}
+      />
     </div>
   );
 }
@@ -71,7 +79,10 @@ const GIB = 1024 ** 3;
 const TIB = 1024 ** 4;
 
 /** A size in bytes as an allowance is typed: a number, and the unit it reads best in. */
-export function allowanceText(bytes: number): { limit: string; unit: AllowanceUnit } {
+export function allowanceText(bytes: number): {
+  limit: string;
+  unit: AllowanceUnit;
+} {
   const unit = bytes >= TIB ? "TB" : "GB";
   return { limit: trimNumber(bytes / (unit === "TB" ? TIB : GIB)), unit };
 }
@@ -80,7 +91,10 @@ export function allowanceText(bytes: number): { limit: string; unit: AllowanceUn
  * An allowance as typed, in bytes. Text that is not a number, or a number too
  * large to send exactly, is null: no allowance at all.
  */
-export function allowanceBytes(limit: string, unit: AllowanceUnit): number | null {
+export function allowanceBytes(
+  limit: string,
+  unit: AllowanceUnit,
+): number | null {
   if (!limit.trim()) {
     return null;
   }
@@ -140,12 +154,17 @@ export function trimNumber(value: number): string {
   return String(Number(value.toFixed(4)));
 }
 
-export function quotaDraft(quota: DownloadQuota | null | undefined): QuotaDraft {
+export function quotaDraft(
+  quota: DownloadQuota | null | undefined,
+): QuotaDraft {
   const saved = quota ?? EMPTY_QUOTA;
   const unit = saved.limitBytes >= TIB ? "TB" : "GB";
   return {
     quota: saved,
-    limit: saved.limitBytes === 0 ? "" : trimNumber(saved.limitBytes / (unit === "TB" ? TIB : GIB)),
+    limit:
+      saved.limitBytes === 0
+        ? ""
+        : trimNumber(saved.limitBytes / (unit === "TB" ? TIB : GIB)),
     unit,
     resetTime: minutesToTime(saved.resetTimeMinutesLocal),
   };
@@ -164,13 +183,18 @@ export function quotaInput(draft: QuotaDraft): DownloadQuota {
     period: draft.quota.period,
     resetTimeMinutesLocal: timeToMinutes(draft.resetTime),
     weeklyResetWeekday: draft.quota.weeklyResetWeekday,
-    monthlyResetDay: Math.min(31, Math.max(1, Math.trunc(draft.quota.monthlyResetDay))),
+    monthlyResetDay: Math.min(
+      31,
+      Math.max(1, Math.trunc(draft.quota.monthlyResetDay)),
+    ),
   };
 }
 
 /** Why a switched-on quota cannot be saved, or null when it can. */
 export function quotaProblem(t: Translate, draft: QuotaDraft): string | null {
-  return draft.quota.enabled && quotaInput(draft).limitBytes <= 0 ? t("next.quota.sizeRequired") : null;
+  return draft.quota.enabled && quotaInput(draft).limitBytes <= 0
+    ? t("next.quota.sizeRequired")
+    : null;
 }
 
 /**
@@ -183,13 +207,18 @@ export function quotaFields(
   onChange: (next: QuotaDraft) => void,
   options: { label: string; help?: string; usedBytes?: number },
 ): FieldSpec[] {
-  const patchQuota = (next: Partial<DownloadQuota>) => onChange({ ...draft, quota: { ...draft.quota, ...next } });
+  const patchQuota = (next: Partial<DownloadQuota>) =>
+    onChange({ ...draft, quota: { ...draft.quota, ...next } });
   const toggle: FieldSpec = {
     id: "quotaEnabled",
     label: options.label,
     help: options.help,
     keywords: "quota allowance metered cap",
-    control: { kind: "toggle", value: draft.quota.enabled, onChange: (enabled) => patchQuota({ enabled }) },
+    control: {
+      kind: "toggle",
+      value: draft.quota.enabled,
+      onChange: (enabled) => patchQuota({ enabled }),
+    },
   };
   if (!draft.quota.enabled) {
     return [toggle];
@@ -203,7 +232,9 @@ export function quotaFields(
       help:
         options.usedBytes === undefined
           ? undefined
-          : t("next.providers.usedSoFar", { size: formatSize(options.usedBytes) }),
+          : t("next.providers.usedSoFar", {
+              size: formatSize(options.usedBytes),
+            }),
       control: {
         kind: "custom",
         control: (
@@ -225,7 +256,11 @@ export function quotaFields(
         monthlyResetDay: draft.quota.monthlyResetDay,
       },
       ({ resetTime, ...quota }) =>
-        onChange({ ...draft, resetTime: resetTime ?? draft.resetTime, quota: { ...draft.quota, ...quota } }),
+        onChange({
+          ...draft,
+          resetTime: resetTime ?? draft.resetTime,
+          quota: { ...draft.quota, ...quota },
+        }),
     ),
   ];
 }
@@ -239,14 +274,21 @@ export interface QuotaWindow {
 }
 
 /** The window's period picker, as a field. */
-export function periodField(t: Translate, period: QuotaPeriod, onChange: (period: QuotaPeriod) => void): FieldSpec {
+export function periodField(
+  t: Translate,
+  period: QuotaPeriod,
+  onChange: (period: QuotaPeriod) => void,
+): FieldSpec {
   return {
     id: "quotaPeriod",
     label: t("next.providers.quotaWindow"),
     control: {
       kind: "select",
       value: period,
-      options: QUOTA_PERIODS.map((option) => ({ ...option, label: t(option.label) })),
+      options: QUOTA_PERIODS.map((option) => ({
+        ...option,
+        label: t(option.label),
+      })),
       onChange: (next) => onChange(next as QuotaPeriod),
     },
   };
@@ -280,8 +322,12 @@ export function windowFields(
             control: {
               kind: "select" as const,
               value: window.weeklyResetWeekday,
-              options: WEEKDAYS.map((option) => ({ ...option, label: t(option.label) })),
-              onChange: (next: string) => patch({ weeklyResetWeekday: next as Weekday }),
+              options: WEEKDAYS.map((option) => ({
+                ...option,
+                label: t(option.label),
+              })),
+              onChange: (next: string) =>
+                patch({ weeklyResetWeekday: next as Weekday }),
             },
           },
         ]

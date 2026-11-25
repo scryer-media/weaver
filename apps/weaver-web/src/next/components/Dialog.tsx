@@ -54,7 +54,10 @@ export function Dialog({
     const layer = {};
     openDialogs.push(layer);
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && openDialogs[openDialogs.length - 1] === layer) {
+      if (
+        event.key === "Escape" &&
+        openDialogs[openDialogs.length - 1] === layer
+      ) {
         dismissRef.current();
       }
     };
@@ -95,11 +98,15 @@ export function Dialog({
               {title}
             </h2>
             {note === undefined ? null : (
-              <span className="truncate font-wv-mono text-[11.5px] text-wv-muted">{note}</span>
+              <span className="truncate font-wv-mono text-[11.5px] text-wv-muted">
+                {note}
+              </span>
             )}
           </div>
         </header>
-        <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">{children}</div>
+        <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
+          {children}
+        </div>
         {footer === undefined ? null : (
           <div className="flex flex-none flex-wrap items-center justify-end gap-[10px] border-t border-wv-line-strong px-4 sm:px-6 py-4">
             {footer}

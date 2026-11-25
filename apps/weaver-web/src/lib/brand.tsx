@@ -89,7 +89,11 @@ export function BrandMark({ className, decorative = false }: BrandProps) {
 
 export function BrandWordmark({ className, decorative = false }: BrandProps) {
   return (
-    <svg viewBox={WORDMARK_VIEW_BOX} className={className} {...naming(decorative)}>
+    <svg
+      viewBox={WORDMARK_VIEW_BOX}
+      className={className}
+      {...naming(decorative)}
+    >
       {WORDMARK_PATHS.map((path) => (
         <path key={path} d={path} fill="currentColor" />
       ))}
@@ -100,11 +104,19 @@ export function BrandWordmark({ className, decorative = false }: BrandProps) {
 export function BrandLockup({ className, decorative = false }: BrandProps) {
   const gradient = useId();
   return (
-    <svg viewBox={LOCKUP_VIEW_BOX} className={className} {...naming(decorative)}>
+    <svg
+      viewBox={LOCKUP_VIEW_BOX}
+      className={className}
+      {...naming(decorative)}
+    >
       <defs>
         <MarkGradient id={gradient} />
       </defs>
-      <path data-brand-part="mark" d={MARK_PATH} fill={"url(#" + gradient + ")"} />
+      <path
+        data-brand-part="mark"
+        d={MARK_PATH}
+        fill={"url(#" + gradient + ")"}
+      />
       <g data-brand-part="wordmark">
         {WORDMARK_PATHS.map((path) => (
           <path key={path} d={path} fill="currentColor" />

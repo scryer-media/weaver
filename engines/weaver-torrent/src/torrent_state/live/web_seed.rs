@@ -266,6 +266,8 @@ impl WebSeeds {
         let mut g = self.inner.lock();
         let mut limit = MAX_WEB_SEED_CONNECTIONS;
         let mut due = Vec::new();
+        // The seeds removed, in order, taken out in one pass at the end.
+        let mut removed = Vec::new();
         let mut at = 0;
         while at < g.seeds.len() && limit > 0 {
             let entry = &mut g.seeds[at];
@@ -302,10 +304,12 @@ impl WebSeeds {
                         url = redacted_tracker_url(&entry.seed.url),
                         why, "web seed removed"
                     );
-                    remove_at(&mut g, at);
+                    removed.push(at);
+                    at += 1;
                 }
             }
         }
+        remove_each(&mut g, &removed);
         due
     }
 
@@ -407,6 +411,28 @@ fn remove_at(g: &mut Inner, at: usize) {
     if let Some(c) = entry.connection {
         c.cancel();
     }
+}
+
+// `remove_at` of each seed at `at`, in ascending order, in one pass: the
+// seeds left keep their order.
+fn remove_each(g: &mut Inner, at: &[usize]) {
+    if at.is_empty() {
+        return;
+    }
+    let Inner { seeds, known, .. } = g;
+    let mut gone = at.iter().copied().peekable();
+    let mut index = 0;
+    seeds.retain_mut(|entry| {
+        let removed = gone.next_if_eq(&index).is_some();
+        index += 1;
+        if removed {
+            known.remove(&seed_key(&entry.seed));
+            if let Some(c) = entry.connection.take() {
+                c.cancel();
+            }
+        }
+        !removed
+    });
 }
 
 enum Refused {

@@ -11,11 +11,22 @@ import {
   STORAGE_VOLUMES_QUERY,
 } from "@/graphql/queries";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
-import { formatJobReleaseName, normalizeGraphqlTimestamp, type JobProtocol } from "@/lib/job-types";
+import {
+  formatJobReleaseName,
+  normalizeGraphqlTimestamp,
+  type JobProtocol,
+} from "@/lib/job-types";
 import { saveBlobAsDownload } from "@/lib/download";
 import { cn } from "@/lib/utils";
 import { statusToken } from "@/lib/status-tokens";
-import { EmptyState, MetricCell, MetricStrip, ProtocolTag, SectionHeader, Square } from "../components/chrome";
+import {
+  EmptyState,
+  MetricCell,
+  MetricStrip,
+  ProtocolTag,
+  SectionHeader,
+  Square,
+} from "../components/chrome";
 import { BulkBar, BulkButton, BulkCluster } from "../components/BulkBar";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { ArchivePasswordDialog } from "../components/ArchivePassword";
@@ -24,10 +35,17 @@ import { CheckBox, SecondaryButton, TextField } from "../components/controls";
 import { Icon } from "../components/icons";
 import { Menu, MenuItem } from "../components/Menu";
 import { GridHeader, GridRow, RowIconButton } from "../components/rows";
-import { StorageMounts, storageMounts, type StorageVolume } from "../components/storage";
+import {
+  StorageMounts,
+  storageMounts,
+  type StorageVolume,
+} from "../components/storage";
 import { Tabs } from "../components/Tabs";
 import { useStartOfToday } from "../data/clock";
-import { NEXT_HISTORY_PAGE_QUERY, NEXT_HISTORY_SAMPLE_QUERY } from "../data/queries";
+import {
+  NEXT_HISTORY_PAGE_QUERY,
+  NEXT_HISTORY_SAMPLE_QUERY,
+} from "../data/queries";
 import { useDebouncedValue } from "../data/timers";
 import {
   EM_DASH,
@@ -117,9 +135,24 @@ const SORT_OPTIONS: {
   field: string;
   direction: "ASC" | "DESC";
 }[] = [
-  { value: "newest", label: "next.completed.sort.newest", field: "COMPLETED_AT", direction: "DESC" },
-  { value: "largest", label: "next.completed.sort.largest", field: "SIZE", direction: "DESC" },
-  { value: "integrity", label: "next.completed.sort.integrity", field: "HEALTH", direction: "ASC" },
+  {
+    value: "newest",
+    label: "next.completed.sort.newest",
+    field: "COMPLETED_AT",
+    direction: "DESC",
+  },
+  {
+    value: "largest",
+    label: "next.completed.sort.largest",
+    field: "SIZE",
+    direction: "DESC",
+  },
+  {
+    value: "integrity",
+    label: "next.completed.sort.integrity",
+    field: "HEALTH",
+    direction: "ASC",
+  },
 ];
 
 const TAB_STATUS: Record<TabId, "ALL" | "SUCCESS" | "FAILURE"> = {
@@ -186,7 +219,9 @@ function millis(value: string | number | null): number | null {
 }
 
 /** How long the job took, start to finish, or null when either end is missing. */
-function elapsedMs(row: Pick<HistoryRow, "createdAt" | "completedAt">): number | null {
+function elapsedMs(
+  row: Pick<HistoryRow, "createdAt" | "completedAt">,
+): number | null {
   const started = millis(row.createdAt);
   const finished = millis(row.completedAt);
   if (started === null || finished === null || finished < started) {
@@ -207,7 +242,10 @@ function groupByDay(t: Translate, rows: readonly HistoryRow[]): DayGroup[] {
     } else {
       groups.set(key, {
         key,
-        label: finished === null ? t("next.day.undated") : formatDayLabel(t, finished),
+        label:
+          finished === null
+            ? t("next.day.undated")
+            : formatDayLabel(t, finished),
         rows: [row],
         bytes: row.totalBytes,
       });
@@ -225,7 +263,10 @@ export function HistoryPage() {
   const t = useTranslate();
   const navigate = useNavigate();
   const statusLabel = useStatusLabel();
-  const { categories: configured, refreshHistoryCount } = useNextData("categories", "refreshHistoryCount");
+  const { categories: configured, refreshHistoryCount } = useNextData(
+    "categories",
+    "refreshHistoryCount",
+  );
 
   const [tab, setTab] = useState<TabId>("all");
   const [sort, setSort] = useState<SortId>("newest");
@@ -241,10 +282,16 @@ export function HistoryPage() {
   // The protocol filter is torrent-only: while it is hidden it filters nothing.
   const protocol = torrentsOn ? pickedProtocol : null;
   // The entries a confirm dialog acts on: the picked ones, or one row's own.
-  const [confirmDelete, setConfirmDelete] = useState<ConfirmTargets | null>(null);
-  const [confirmArchive, setConfirmArchive] = useState<ConfirmTargets | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<ConfirmTargets | null>(
+    null,
+  );
+  const [confirmArchive, setConfirmArchive] = useState<ConfirmTargets | null>(
+    null,
+  );
   const [archiveError, setArchiveError] = useState<string | null>(null);
-  const [retryAction, setRetryAction] = useState<"redownload" | "reprocess" | null>(null);
+  const [retryAction, setRetryAction] = useState<
+    "redownload" | "reprocess" | null
+  >(null);
   const [report, setReport] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
@@ -253,7 +300,10 @@ export function HistoryPage() {
   // Overview's finished-today count links here with today's midnight.
   const [searchParams, setSearchParams] = useSearchParams();
   const sinceParam = Number(searchParams.get("since"));
-  const since = Number.isFinite(sinceParam) && sinceParam > 0 ? Math.floor(sinceParam) : null;
+  const since =
+    Number.isFinite(sinceParam) && sinceParam > 0
+      ? Math.floor(sinceParam)
+      : null;
   const clearSince = useCallback(() => {
     setPageIndex(0);
     setSearchParams((previous) => {
@@ -285,7 +335,18 @@ export function HistoryPage() {
       tag: tag ?? undefined,
       protocol: protocol ?? undefined,
     }),
-    [categories, pageIndex, pageSize, protocol, search, since, sortOption.direction, sortOption.field, tab, tag],
+    [
+      categories,
+      pageIndex,
+      pageSize,
+      protocol,
+      search,
+      since,
+      sortOption.direction,
+      sortOption.field,
+      tab,
+      tag,
+    ],
   );
 
   const [{ data, fetching }, reexecute] = useQuery<HistoryPageResponse>({
@@ -296,22 +357,23 @@ export function HistoryPage() {
   // The strip's own numbers — today's jobs and what they averaged — need rows
   // the current page may not hold, so they come from a shallow newest-first
   // window rather than from whatever happens to be on screen.
-  const [{ data: sampleData }, reexecuteSample] = useQuery<HistorySampleResponse>({
-    query: NEXT_HISTORY_SAMPLE_QUERY,
-    variables: {
-      input: {
-        pageIndex: 0,
-        pageSize: SAMPLE_SIZE,
-        status: "ALL",
-        categories,
-        sortField: "COMPLETED_AT",
-        sortDirection: "DESC",
-        tag: tag ?? undefined,
-        protocol: protocol ?? undefined,
+  const [{ data: sampleData }, reexecuteSample] =
+    useQuery<HistorySampleResponse>({
+      query: NEXT_HISTORY_SAMPLE_QUERY,
+      variables: {
+        input: {
+          pageIndex: 0,
+          pageSize: SAMPLE_SIZE,
+          status: "ALL",
+          categories,
+          sortField: "COMPLETED_AT",
+          sortDirection: "DESC",
+          tag: tag ?? undefined,
+          protocol: protocol ?? undefined,
+        },
       },
-    },
-    context: TAG_CONTEXT,
-  });
+      context: TAG_CONTEXT,
+    });
   const [{ data: systemInfo }] = useQuery<{
     systemInfo: { configuredStorage: StorageVolume[] };
   }>({ query: STORAGE_VOLUMES_QUERY });
@@ -349,10 +411,16 @@ export function HistoryPage() {
     refresh();
     refreshDeletes();
   }, [refresh, refreshDeletes]);
-  useHistoryLiveRefresh({ refresh: refreshLive, deletesActive: deletes.active });
+  useHistoryLiveRefresh({
+    refresh: refreshLive,
+    deletesActive: deletes.active,
+  });
   const rows = deletes.rows;
   const lockedIds = useMemo(
-    () => new Set(rows.filter((row) => row.deleteOperation?.locked).map((row) => row.id)),
+    () =>
+      new Set(
+        rows.filter((row) => row.deleteOperation?.locked).map((row) => row.id),
+      ),
     [rows],
   );
   if ([...picked].some((id) => lockedIds.has(id))) {
@@ -371,10 +439,18 @@ export function HistoryPage() {
     [sampleData?.historyPage?.items],
   );
   const metrics = useMemo(() => {
-    const today = sample.filter((row) => (millis(row.completedAt) ?? 0) >= midnight);
-    const timed = (today.length > 0 ? today : sample).filter((row) => elapsedMs(row) !== null);
-    const bytes = timed.reduce((total, row) => total + (row.downloadedBytes || row.totalBytes), 0);
-    const seconds = timed.reduce((total, row) => total + (elapsedMs(row) ?? 0), 0) / 1000;
+    const today = sample.filter(
+      (row) => (millis(row.completedAt) ?? 0) >= midnight,
+    );
+    const timed = (today.length > 0 ? today : sample).filter(
+      (row) => elapsedMs(row) !== null,
+    );
+    const bytes = timed.reduce(
+      (total, row) => total + (row.downloadedBytes || row.totalBytes),
+      0,
+    );
+    const seconds =
+      timed.reduce((total, row) => total + (elapsedMs(row) ?? 0), 0) / 1000;
     return {
       todayCount: today.length,
       todayBytes: today.reduce((total, row) => total + row.totalBytes, 0),
@@ -401,7 +477,8 @@ export function HistoryPage() {
 
   const protocolCounts = useMemo(() => {
     const count = (protocol: JobProtocol) =>
-      page?.protocolCounts.find((entry) => entry.protocol === protocol)?.count ?? 0;
+      page?.protocolCounts.find((entry) => entry.protocol === protocol)
+        ?.count ?? 0;
     const torrents = count("TORRENT");
     const usenet = count("NZB");
     return { ALL: torrents + usenet, TORRENT: torrents, NZB: usenet };
@@ -417,7 +494,8 @@ export function HistoryPage() {
   // A row already being deleted cannot be picked, so select-all passes over it.
   const selectable = rows.filter((row) => !lockedIds.has(row.id));
   const pickedOnPage = selectable.filter((row) => picked.has(row.id));
-  const allPicked = selectable.length > 0 && pickedOnPage.length === selectable.length;
+  const allPicked =
+    selectable.length > 0 && pickedOnPage.length === selectable.length;
 
   const togglePicked = (id: number) => {
     setPicked((current) => {
@@ -458,7 +536,9 @@ export function HistoryPage() {
     setPicked(new Set());
     setReport(
       failures === 0
-        ? countLabel(t, `next.completed.bulk.${kind}`, ids.length, { count: formatCount(ids.length) })
+        ? countLabel(t, `next.completed.bulk.${kind}`, ids.length, {
+            count: formatCount(ids.length),
+          })
         : t(`next.completed.bulk.${kind}Partial`, {
             done: formatCount(ids.length - failures),
             total: formatCount(ids.length),
@@ -469,7 +549,10 @@ export function HistoryPage() {
   };
 
   // The bulk delete and a row's own run this, with the picked ids or the row's.
-  const deleteEntries = async (ids: readonly number[], deleteFiles: boolean) => {
+  const deleteEntries = async (
+    ids: readonly number[],
+    deleteFiles: boolean,
+  ) => {
     setDeleteError(null);
     const error = await deletes.accept([...ids], deleteFiles);
     if (error !== null) {
@@ -478,12 +561,17 @@ export function HistoryPage() {
     }
     setConfirmDelete(null);
     setReport(null);
-    setPicked((current) => new Set([...current].filter((id) => !ids.includes(id))));
+    setPicked(
+      (current) => new Set([...current].filter((id) => !ids.includes(id))),
+    );
   };
 
   // An entry already archived is not offered for archiving again.
   const archivedIds = useMemo(
-    () => new Set(rows.filter((row) => row.archivedAt !== null).map((row) => row.id)),
+    () =>
+      new Set(
+        rows.filter((row) => row.archivedAt !== null).map((row) => row.id),
+      ),
     [rows],
   );
   const archivableIds = [...picked].filter((id) => !archivedIds.has(id));
@@ -502,7 +590,9 @@ export function HistoryPage() {
     // Answered entries leave the selection; entries no call answered for
     // stay picked, so they can be sent again.
     const answered = new Set(results.map((result) => result.id));
-    setPicked((current) => new Set([...current].filter((id) => !answered.has(id))));
+    setPicked(
+      (current) => new Set([...current].filter((id) => !answered.has(id))),
+    );
     const summary = describeArchiveHistory(t, results, ids.length);
     setReport(refused === null ? summary : `${summary} · ${refused}`);
     refresh();
@@ -522,7 +612,11 @@ export function HistoryPage() {
       >
         {t("next.completed.redownload")}
       </BulkButton>
-      <BulkButton icon="reprocess" disabled={actionsBusy} onClick={() => setRetryAction("reprocess")}>
+      <BulkButton
+        icon="reprocess"
+        disabled={actionsBusy}
+        onClick={() => setRetryAction("reprocess")}
+      >
         {t("next.job.reprocess")}
       </BulkButton>
       <BulkButton
@@ -555,7 +649,10 @@ export function HistoryPage() {
         disabled={actionsBusy}
         onClick={() => {
           setDeleteError(null);
-          setConfirmDelete({ ids: [...picked], note: t("bulk.selected", { count: picked.size }) });
+          setConfirmDelete({
+            ids: [...picked],
+            note: t("bulk.selected", { count: picked.size }),
+          });
         }}
       >
         {t("action.delete")}
@@ -592,10 +689,16 @@ export function HistoryPage() {
     });
     const stamp = new Date().toISOString().slice(0, 10);
     saveBlobAsDownload(
-      new Blob([[header.join(","), ...lines].join("\n")], { type: "text/csv;charset=utf-8" }),
+      new Blob([[header.join(","), ...lines].join("\n")], {
+        type: "text/csv;charset=utf-8",
+      }),
       `weaver-history-${stamp}.csv`,
     );
-    setReport(countLabel(t, "next.completed.exported", rows.length, { count: formatCount(rows.length) }));
+    setReport(
+      countLabel(t, "next.completed.exported", rows.length, {
+        count: formatCount(rows.length),
+      }),
+    );
   };
 
   const rate = splitSpeed(metrics.rate);
@@ -603,7 +706,9 @@ export function HistoryPage() {
   return (
     <NextShell
       title={t("next.nav.history")}
-      note={countLabel(t, "next.completed.kept", counts.all, { count: formatCount(counts.all) })}
+      note={countLabel(t, "next.completed.kept", counts.all, {
+        count: formatCount(counts.all),
+      })}
       controls={
         <>
           <TextField
@@ -614,7 +719,11 @@ export function HistoryPage() {
             onChange={setQuery}
             className="w-[118px] min-w-[80px] sm:w-[172px] sm:min-w-[96px]"
           />
-          <SecondaryButton icon="downloadFile" onClick={exportList} disabled={rows.length === 0}>
+          <SecondaryButton
+            icon="downloadFile"
+            onClick={exportList}
+            disabled={rows.length === 0}
+          >
             {t("next.completed.export")}
           </SecondaryButton>
         </>
@@ -631,10 +740,15 @@ export function HistoryPage() {
           <CategoryListBlock
             items={facetItems}
             selected={facets}
-            onToggle={(key) => reset(() => setFacets((current) => toggleFacet(current, key)))}
+            onToggle={(key) =>
+              reset(() => setFacets((current) => toggleFacet(current, key)))
+            }
             onClear={() => reset(() => setFacets(NO_FACETS))}
           />
-          <TagFilterBlock selected={tag} onSelect={(next) => reset(() => setTag(next))} />
+          <TagFilterBlock
+            selected={tag}
+            onSelect={(next) => reset(() => setTag(next))}
+          />
         </>
       }
       railFooter={
@@ -648,23 +762,35 @@ export function HistoryPage() {
             <MetricCell
               variant="strip"
               eyebrow={t("next.day.today")}
-              value={metrics.capped && metrics.todayCount >= SAMPLE_SIZE
-                ? `${SAMPLE_SIZE}+`
-                : formatCount(metrics.todayCount)}
-              unit={countLabel(t, "next.completed.jobsUnit", metrics.todayCount)}
-              note={t("next.completed.downloaded", { size: formatSize(metrics.todayBytes) })}
+              value={
+                metrics.capped && metrics.todayCount >= SAMPLE_SIZE
+                  ? `${SAMPLE_SIZE}+`
+                  : formatCount(metrics.todayCount)
+              }
+              unit={countLabel(
+                t,
+                "next.completed.jobsUnit",
+                metrics.todayCount,
+              )}
+              note={t("next.completed.downloaded", {
+                size: formatSize(metrics.todayBytes),
+              })}
             />
             <MetricCell
               variant="strip"
               eyebrow={t("next.completed.complete")}
               value={formatCount(counts.success)}
-              unit={t("next.completed.ofTotal", { total: formatCount(counts.all) })}
+              unit={t("next.completed.ofTotal", {
+                total: formatCount(counts.all),
+              })}
             />
             <MetricCell
               variant="strip"
               eyebrow={t("status.failed")}
               value={formatCount(counts.failure)}
-              unit={t("next.completed.ofTotal", { total: formatCount(counts.all) })}
+              unit={t("next.completed.ofTotal", {
+                total: formatCount(counts.all),
+              })}
               valueClassName={counts.failure > 0 ? "text-wv-error" : undefined}
             />
             <MetricCell
@@ -677,7 +803,11 @@ export function HistoryPage() {
                   ? t("next.completed.nothingFinished")
                   : metrics.rateScope === "today"
                     ? t("next.completed.rateToday")
-                    : countLabel(t, "next.completed.rateRecent", metrics.timedCount)
+                    : countLabel(
+                        t,
+                        "next.completed.rateRecent",
+                        metrics.timedCount,
+                      )
               }
             />
           </MetricStrip>
@@ -685,14 +815,25 @@ export function HistoryPage() {
           <Tabs
             tabs={[
               { id: "all", label: t("history.filterAll"), count: counts.all },
-              { id: "success", label: t("next.completed.complete"), count: counts.success },
-              { id: "failure", label: t("status.failed"), count: counts.failure },
+              {
+                id: "success",
+                label: t("next.completed.complete"),
+                count: counts.success,
+              },
+              {
+                id: "failure",
+                label: t("status.failed"),
+                count: counts.failure,
+              },
             ]}
             active={tab}
             onSelect={(next) => reset(() => setTab(next))}
             center={
               picked.size === 0 ? undefined : (
-                <BulkCluster count={picked.size} onClear={() => setPicked(new Set())}>
+                <BulkCluster
+                  count={picked.size}
+                  onClear={() => setPicked(new Set())}
+                >
                   {bulkActions}
                 </BulkCluster>
               )
@@ -701,7 +842,9 @@ export function HistoryPage() {
               <div className="relative flex items-center gap-4">
                 {since === null ? null : (
                   <span className="flex items-center gap-2 font-wv-mono text-[11px] text-wv-secondary">
-                    {t("next.completed.since", { time: formatClock(since * 1000) })}
+                    {t("next.completed.since", {
+                      time: formatClock(since * 1000),
+                    })}
                     <button
                       type="button"
                       onClick={clearSince}
@@ -720,7 +863,11 @@ export function HistoryPage() {
                   className="flex cursor-pointer items-center gap-[7px] font-wv-mono text-[11px] text-wv-muted hover:text-wv-fg"
                 >
                   {t(sortOption.label)}
-                  <Icon name="dropdown" size={12} className="text-wv-disabled" />
+                  <Icon
+                    name="dropdown"
+                    size={12}
+                    className="text-wv-disabled"
+                  />
                 </button>
                 <Menu
                   open={sortOpen}
@@ -776,7 +923,13 @@ export function HistoryPage() {
               "",
               "",
             ]}
-            cellClassNames={[undefined, undefined, undefined, "hidden sm:block", "hidden lg:block"]}
+            cellClassNames={[
+              undefined,
+              undefined,
+              undefined,
+              "hidden sm:block",
+              "hidden lg:block",
+            ]}
           />
         </>
       }
@@ -784,7 +937,9 @@ export function HistoryPage() {
         <Pagination
           pageIndex={clampedPage}
           pageCount={pageCount}
-          onPage={(next) => setPageIndex(Math.max(0, Math.min(pageCount - 1, next)))}
+          onPage={(next) =>
+            setPageIndex(Math.max(0, Math.min(pageCount - 1, next)))
+          }
           pageSize={pageSize}
           pageSizes={PAGE_SIZES}
           onPageSize={(next) => reset(() => setPageSize(next))}
@@ -792,22 +947,38 @@ export function HistoryPage() {
         />
       }
       statusNote={
-        deletes.active ? describeDeleteProgress(t, deletes.progress) : (report ?? undefined)
+        deletes.active
+          ? describeDeleteProgress(t, deletes.progress)
+          : (report ?? undefined)
       }
       statusRight={
         mounts.length === 0
           ? undefined
           : mounts.length === 1
-            ? t("next.completed.freeOn", { size: formatSize(freeAcross), volume: mounts[0].label })
-            : t("next.completed.freeAcross", { size: formatSize(freeAcross), count: mounts.length })
+            ? t("next.completed.freeOn", {
+                size: formatSize(freeAcross),
+                volume: mounts[0].label,
+              })
+            : t("next.completed.freeAcross", {
+                size: formatSize(freeAcross),
+                count: mounts.length,
+              })
       }
     >
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
         {rows.length === 0 ? (
           <EmptyState
             loading={fetching}
-            title={fetching ? t("next.common.loading") : t("next.downloads.noMatchTitle")}
-            body={fetching ? t("next.completed.loadingBody") : t("next.completed.noMatchBody")}
+            title={
+              fetching
+                ? t("next.common.loading")
+                : t("next.downloads.noMatchTitle")
+            }
+            body={
+              fetching
+                ? t("next.completed.loadingBody")
+                : t("next.completed.noMatchBody")
+            }
           />
         ) : (
           days.map((day) => (
@@ -815,13 +986,16 @@ export function HistoryPage() {
               <SectionHeader
                 label={day.label}
                 count={countLabel(t, "next.completed.items", day.rows.length)}
-                note={t("next.completed.dayTotal", { size: formatSize(day.bytes) })}
+                note={t("next.completed.dayTotal", {
+                  size: formatSize(day.bytes),
+                })}
               />
               {day.rows.map((row) => {
                 const token = statusToken(row.status);
                 const failed = token === "failed";
                 const operation = rowOperationKind(row.deleteOperation);
-                const pending = operation === "deleting" || operation === "archiving";
+                const pending =
+                  operation === "deleting" || operation === "archiving";
                 const archiveFailed =
                   operation === "archiveFailed" && row.deleteOperation
                     ? describeFailedArchive(t, row.deleteOperation)
@@ -845,7 +1019,9 @@ export function HistoryPage() {
                     )}
                   >
                     <CheckBox
-                      label={t("next.common.selectItem", { name: formatJobReleaseName(row) })}
+                      label={t("next.common.selectItem", {
+                        name: formatJobReleaseName(row),
+                      })}
                       checked={picked.has(row.id)}
                       disabled={locked}
                       onChange={() => togglePicked(row.id)}
@@ -855,7 +1031,11 @@ export function HistoryPage() {
                       <div className="min-w-0 truncate font-wv-mono text-[12.5px] text-wv-fg">
                         {formatJobReleaseName(row)}
                         {row.hasPassword ? (
-                          <Icon name="lock" size={11} className="ml-[6px] inline-block align-[-1px] text-wv-muted" />
+                          <Icon
+                            name="lock"
+                            size={11}
+                            className="ml-[6px] inline-block align-[-1px] text-wv-muted"
+                          />
                         ) : null}
                         {row.archivedAt !== null ? (
                           <span
@@ -870,11 +1050,16 @@ export function HistoryPage() {
                           </span>
                         ) : null}
                       </div>
-                      <TagChips tags={row.tags} className="flex-none flex-nowrap" />
+                      <TagChips
+                        tags={row.tags}
+                        className="flex-none flex-nowrap"
+                      />
                     </div>
                     <div className="flex min-w-0 items-center gap-[7px]">
                       <Square
-                        color={pending ? WV.idle : failed ? WV.error : WV.accent}
+                        color={
+                          pending ? WV.idle : failed ? WV.error : WV.accent
+                        }
                       />
                       <span className="truncate text-[12.5px] text-wv-secondary">
                         {operation === "deleting"
@@ -882,10 +1067,10 @@ export function HistoryPage() {
                           : operation === "archiving"
                             ? t("next.historyArchive.pending")
                             : token === "completed"
-                            ? t("next.completed.complete")
-                            : failed
-                              ? t("status.failed")
-                              : statusLabel(row.status)}
+                              ? t("next.completed.complete")
+                              : failed
+                                ? t("status.failed")
+                                : statusLabel(row.status)}
                       </span>
                     </div>
                     <div className="hidden text-right font-wv-mono text-[12.5px] text-wv-secondary sm:block">
@@ -896,7 +1081,11 @@ export function HistoryPage() {
                         {formatClock(finished)}
                       </span>
                       <span className="font-wv-mono text-[10.5px] whitespace-nowrap text-wv-faint">
-                        {elapsed === null ? EM_DASH : t("next.completed.took", { span: formatElapsed(elapsed) })}
+                        {elapsed === null
+                          ? EM_DASH
+                          : t("next.completed.took", {
+                              span: formatElapsed(elapsed),
+                            })}
                       </span>
                     </div>
                     <div className="flex items-center justify-end gap-0.5">
@@ -909,7 +1098,10 @@ export function HistoryPage() {
                           testId={jobIds.historyRowArchive(row.id)}
                           onClick={() => {
                             setArchiveError(null);
-                            setConfirmArchive({ ids: [row.id], note: formatJobReleaseName(row) });
+                            setConfirmArchive({
+                              ids: [row.id],
+                              note: formatJobReleaseName(row),
+                            });
                           }}
                         />
                       ) : null}
@@ -922,7 +1114,10 @@ export function HistoryPage() {
                           testId={jobIds.historyRowDelete(row.id)}
                           onClick={() => {
                             setDeleteError(null);
-                            setConfirmDelete({ ids: [row.id], note: formatJobReleaseName(row) });
+                            setConfirmDelete({
+                              ids: [row.id],
+                              note: formatJobReleaseName(row),
+                            });
                           }}
                         />
                       ) : null}
@@ -938,13 +1133,25 @@ export function HistoryPage() {
         )}
       </div>
 
-      {retryAction ? <ArchivePasswordDialog
-        title={t(retryAction === "redownload" ? "next.completed.redownload" : "next.job.reprocess")}
-        busy={actionsBusy} onDismiss={() => setRetryAction(null)}
-        onConfirm={(password) => {
-          setRetryAction(null);
-          void runOnPicked("requeued", (id) => retryAction === "redownload" ? redownloadJob({ id, password }) : reprocessJob({ id, password }));
-        }} /> : null}
+      {retryAction ? (
+        <ArchivePasswordDialog
+          title={t(
+            retryAction === "redownload"
+              ? "next.completed.redownload"
+              : "next.job.reprocess",
+          )}
+          busy={actionsBusy}
+          onDismiss={() => setRetryAction(null)}
+          onConfirm={(password) => {
+            setRetryAction(null);
+            void runOnPicked("requeued", (id) =>
+              retryAction === "redownload"
+                ? redownloadJob({ id, password })
+                : reprocessJob({ id, password }),
+            );
+          }}
+        />
+      ) : null}
       <ConfirmDialog
         open={confirmDelete !== null}
         title={t("action.delete")}
@@ -954,7 +1161,9 @@ export function HistoryPage() {
           <>
             {t("next.completed.deleteBody")}
             {deleteError === null ? null : (
-              <span className="mt-3 block text-wv-error-text">{deleteError}</span>
+              <span className="mt-3 block text-wv-error-text">
+                {deleteError}
+              </span>
             )}
           </>
         }
@@ -974,9 +1183,13 @@ export function HistoryPage() {
         busy={actionsBusy}
         body={
           <>
-            {confirmArchive?.ids.length === 1 ? t("next.historyArchive.jobBody") : t("next.historyArchive.body")}
+            {confirmArchive?.ids.length === 1
+              ? t("next.historyArchive.jobBody")
+              : t("next.historyArchive.body")}
             {archiveError === null ? null : (
-              <span className="mt-3 block text-wv-error-text">{archiveError}</span>
+              <span className="mt-3 block text-wv-error-text">
+                {archiveError}
+              </span>
             )}
           </>
         }

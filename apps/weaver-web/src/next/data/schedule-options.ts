@@ -13,16 +13,34 @@ export const SCHEDULE_ACTIONS = [
   { value: "pause", label: "next.schedules.pause" },
   { value: "resume", label: "next.schedules.resume" },
   { value: "pause_all", label: "next.schedules.pauseAll" },
-  { value: "pause_class:TORRENT", label: "next.schedules.pauseTorrents", torrentOnly: true },
-  { value: "resume_class:TORRENT", label: "next.schedules.resumeTorrents", torrentOnly: true },
+  {
+    value: "pause_class:TORRENT",
+    label: "next.schedules.pauseTorrents",
+    torrentOnly: true,
+  },
+  {
+    value: "resume_class:TORRENT",
+    label: "next.schedules.resumeTorrents",
+    torrentOnly: true,
+  },
   { value: "pause_post_processing", label: "next.schedules.pausePost" },
   { value: "resume_post_processing", label: "next.schedules.resumePost" },
-  { value: "pause_watch_folder_scanning", label: "next.schedules.pauseWatchFolder" },
-  { value: "resume_watch_folder_scanning", label: "next.schedules.resumeWatchFolder" },
+  {
+    value: "pause_watch_folder_scanning",
+    label: "next.schedules.pauseWatchFolder",
+  },
+  {
+    value: "resume_watch_folder_scanning",
+    label: "next.schedules.resumeWatchFolder",
+  },
   { value: "pause_rss", label: "next.schedules.pauseRss" },
   { value: "resume_rss", label: "next.schedules.resumeRss" },
   { value: "speed_limit", label: "next.schedules.setLimit" },
-  { value: "bandwidth_split", label: "next.schedules.setSplit", torrentOnly: true },
+  {
+    value: "bandwidth_split",
+    label: "next.schedules.setSplit",
+    torrentOnly: true,
+  },
   { value: "hardware_profile", label: "next.schedules.setProfile" },
   { value: "set_server_active", label: "next.schedules.serverActive" },
   { value: "prune_history", label: "next.schedules.pruneHistory" },
@@ -36,19 +54,27 @@ export type ScheduleClass = "NZB" | "TORRENT";
  * The picker's key for a rule: its action, and for a class's pause or resume
  * the class it holds, as `pause_class:TORRENT`.
  */
-export function scheduleActionKey(rule: { actionType: string; class?: ScheduleClass | null }): string {
+export function scheduleActionKey(rule: {
+  actionType: string;
+  class?: ScheduleClass | null;
+}): string {
   return rule.class ? `${rule.actionType}:${rule.class}` : rule.actionType;
 }
 
 /** The action and class a picker key stands for, as a rule's input takes them. */
-export function scheduleActionOfKey(key: string): { actionType: string; class: ScheduleClass | null } {
+export function scheduleActionOfKey(key: string): {
+  actionType: string;
+  class: ScheduleClass | null;
+} {
   const [actionType, held] = key.split(":");
   return { actionType, class: (held as ScheduleClass | undefined) ?? null };
 }
 
 /** Whether a rule taking `actionType` (a picker key) acts on torrents alone. */
 export function torrentOnlyAction(actionType: string): boolean {
-  return SCHEDULE_ACTIONS.some((option) => option.value === actionType && "torrentOnly" in option);
+  return SCHEDULE_ACTIONS.some(
+    (option) => option.value === actionType && "torrentOnly" in option,
+  );
 }
 
 /** The weekdays a rule may be narrowed to. Labels are translation keys. */
@@ -63,7 +89,10 @@ export const SCHEDULE_DAYS = [
 ];
 
 /** The days a rule runs on; none chosen, like all of them, is every day. */
-export function scheduleDaysLabel(t: Translate, days: readonly string[]): string {
+export function scheduleDaysLabel(
+  t: Translate,
+  days: readonly string[],
+): string {
   if (days.length === 0 || days.length === SCHEDULE_DAYS.length) {
     return t("next.schedules.everyDay");
   }
@@ -114,7 +143,10 @@ export interface ScheduleOptions {
   splitUsenetPct: number | null;
 }
 
-export interface ScheduleOptionsForm extends Omit<ScheduleOptions, "times" | "speedLimits" | "splitUsenetPct"> {
+export interface ScheduleOptionsForm extends Omit<
+  ScheduleOptions,
+  "times" | "speedLimits" | "splitUsenetPct"
+> {
   timesText: string;
   /** A split rule that lifts the scheduled split rather than setting one. */
   splitLift: boolean;
@@ -138,7 +170,9 @@ export function speedKey(kind: SpeedTargetKind, id: number | null): string {
 
 /** A stored rate as its field shows it: MB/s, to two places; null stays no limit. */
 function rateText(bytesPerSec: number | null): string | null {
-  return bytesPerSec === null ? null : String(Math.round((bytesPerSec / MIB) * 100) / 100);
+  return bytesPerSec === null
+    ? null
+    : String(Math.round((bytesPerSec / MIB) * 100) / 100);
 }
 
 /** Why a typed rate cannot be saved, as a translation key; null when it can. No limit always can. */
@@ -146,24 +180,40 @@ function rateProblem(text: string | null): string | null {
   if (text === null) return null;
   const trimmed = text.trim();
   const value = Number(trimmed);
-  return trimmed !== "" && Number.isFinite(value) && value >= 0 ? null : "next.schedules.speedInvalid";
+  return trimmed !== "" && Number.isFinite(value) && value >= 0
+    ? null
+    : "next.schedules.speedInvalid";
 }
 
 /** Why a target's entry cannot be saved, as a translation key; null when it can. */
-export function speedProblem(entry: SpeedEntry, kind: SpeedTargetKind): string | null {
-  return rateProblem(entry.download) ?? (kind === "GLOBAL" ? rateProblem(entry.upload) : null);
+export function speedProblem(
+  entry: SpeedEntry,
+  kind: SpeedTargetKind,
+): string | null {
+  return (
+    rateProblem(entry.download) ??
+    (kind === "GLOBAL" ? rateProblem(entry.upload) : null)
+  );
 }
 
 /** The target a form key names. */
-export function speedTarget(key: string): { kind: SpeedTargetKind; id: number | null } {
+export function speedTarget(key: string): {
+  kind: SpeedTargetKind;
+  id: number | null;
+} {
   const [kind, id] = key.split(":") as [SpeedTargetKind, string | undefined];
   return { kind, id: id === undefined ? null : Number(id) };
 }
 
 /** A typed rate in bytes, or the stored one when the field only rounded it for display. */
-function rateBytes(text: string | null, saved: number | null | undefined): number | null {
+function rateBytes(
+  text: string | null,
+  saved: number | null | undefined,
+): number | null {
   if (text === null) return null;
-  return saved !== undefined && saved !== null && rateText(saved) === String(Number(text.trim()))
+  return saved !== undefined &&
+    saved !== null &&
+    rateText(saved) === String(Number(text.trim()))
     ? saved
     : Math.round(Number(text.trim()) * MIB);
 }
@@ -177,19 +227,29 @@ export function speedLimitsInput(
   speeds: Record<string, SpeedEntry>,
   stored: readonly ScheduleSpeedLimit[] = [],
 ): ScheduleSpeedLimit[] {
-  const order = (kind: SpeedTargetKind) => (kind === "GLOBAL" ? 0 : kind === "EGRESS" ? 1 : 2);
+  const order = (kind: SpeedTargetKind) =>
+    kind === "GLOBAL" ? 0 : kind === "EGRESS" ? 1 : 2;
   return Object.entries(speeds)
     .map(([key, entry]) => ({ target: speedTarget(key), entry }))
     .filter(({ target, entry }) => speedProblem(entry, target.kind) === null)
     .map(({ target, entry }): ScheduleSpeedLimit => {
-      const saved = stored.find((limit) => limit.kind === target.kind && limit.id === target.id);
+      const saved = stored.find(
+        (limit) => limit.kind === target.kind && limit.id === target.id,
+      );
       return {
         ...target,
         download: rateBytes(entry.download, saved?.download),
-        upload: target.kind === "GLOBAL" ? rateBytes(entry.upload, saved?.upload) : null,
+        upload:
+          target.kind === "GLOBAL"
+            ? rateBytes(entry.upload, saved?.upload)
+            : null,
       };
     })
-    .sort((left, right) => order(left.kind) - order(right.kind) || (left.id ?? 0) - (right.id ?? 0));
+    .sort(
+      (left, right) =>
+        order(left.kind) - order(right.kind) ||
+        (left.id ?? 0) - (right.id ?? 0),
+    );
 }
 
 /** A speed rule in the table's words: "Global ↓ 5 MB/s ↑ unlimited, wan 2 MB/s", with "unlimited" for a lifted limit. */
@@ -204,11 +264,13 @@ export function speedLimitsLabel(
         limit.kind === "GLOBAL"
           ? t("next.schedules.speedGlobal")
           : limit.kind === "EGRESS"
-            ? targets?.egressInterfaces.find((egress) => egress.id === limit.id)?.name ??
-              `${t("next.schedules.egress")} #${limit.id}`
-            : targets?.servers.find((server) => server.id === limit.id)?.host ??
-              `${t("next.schedules.server")} #${limit.id}`;
-      const rate = (bytes: number | null) => (bytes !== null ? formatRate(bytes) : t("next.schedules.unlimited"));
+            ? (targets?.egressInterfaces.find(
+                (egress) => egress.id === limit.id,
+              )?.name ?? `${t("next.schedules.egress")} #${limit.id}`)
+            : (targets?.servers.find((server) => server.id === limit.id)
+                ?.host ?? `${t("next.schedules.server")} #${limit.id}`);
+      const rate = (bytes: number | null) =>
+        bytes !== null ? formatRate(bytes) : t("next.schedules.unlimited");
       return limit.kind === "GLOBAL"
         ? `${name} ↓ ${rate(limit.download)} ↑ ${rate(limit.upload)}`
         : `${name} ${rate(limit.download)}`;
@@ -221,19 +283,28 @@ export function scheduleActionDetails(
   schedule: ScheduleOptions & { actionType: string },
   targets?: ScheduleTargets,
 ): string | null {
-  const state = (enabled: boolean | null) => t(enabled ? "next.common.on" : "next.common.off");
+  const state = (enabled: boolean | null) =>
+    t(enabled ? "next.common.on" : "next.common.off");
   switch (schedule.actionType) {
     case "set_server_active": {
-      const server = targets?.servers.find((entry) => entry.id === schedule.serverId);
+      const server = targets?.servers.find(
+        (entry) => entry.id === schedule.serverId,
+      );
       return `${t("next.schedules.serverActive")}: ${server?.host ?? `${t("next.schedules.server")} #${schedule.serverId}`} (${state(schedule.serverActive)})`;
     }
     case "set_quota_metering": {
       const egress =
         schedule.quotaEgressId === null
           ? null
-          : targets?.egressInterfaces.find((entry) => entry.id === schedule.quotaEgressId)?.name ??
-            `${t("next.schedules.egress")} #${schedule.quotaEgressId}`;
-      const action = t(schedule.quotaMeteringEnabled ? "next.schedules.quotaCountOn" : "next.schedules.quotaCountOff");
+          : (targets?.egressInterfaces.find(
+              (entry) => entry.id === schedule.quotaEgressId,
+            )?.name ??
+            `${t("next.schedules.egress")} #${schedule.quotaEgressId}`);
+      const action = t(
+        schedule.quotaMeteringEnabled
+          ? "next.schedules.quotaCountOn"
+          : "next.schedules.quotaCountOff",
+      );
       return egress ? `${action}: ${egress}` : action;
     }
     case "speed_limit":
@@ -243,11 +314,19 @@ export function scheduleActionDetails(
     case "bandwidth_split":
       return schedule.splitUsenetPct === null
         ? t("next.schedules.splitLifted")
-        : t("next.schedules.splitTo", { usenet: schedule.splitUsenetPct, torrent: 100 - schedule.splitUsenetPct });
+        : t("next.schedules.splitTo", {
+            usenet: schedule.splitUsenetPct,
+            torrent: 100 - schedule.splitUsenetPct,
+          });
     case "prune_history": {
-      const choices = (["pruneFailed", "pruneCompleted", "pruneCancelled"] as const)
+      const choices = (
+        ["pruneFailed", "pruneCompleted", "pruneCancelled"] as const
+      )
         .filter((key) => schedule[key] !== null)
-        .map((key) => `${t(`next.schedules.${key}`)} (${t("next.schedules.deleteFiles")}: ${state(schedule[key]!.deleteFiles)})`);
+        .map(
+          (key) =>
+            `${t(`next.schedules.${key}`)} (${t("next.schedules.deleteFiles")}: ${state(schedule[key]!.deleteFiles)})`,
+        );
       return `${t("next.schedules.pruneHistory")}: ${choices.join(", ")}`;
     }
     default:
@@ -256,17 +335,26 @@ export function scheduleActionDetails(
 }
 
 export const NEW_SCHEDULE_OPTIONS: ScheduleOptionsForm = {
-  timesText: "", everyHourAtMinute: null,
-  serverId: null, serverActive: true, quotaMeteringEnabled: true, quotaEgressId: null,
-  pruneFailed: null, pruneCompleted: null, pruneCancelled: null,
+  timesText: "",
+  everyHourAtMinute: null,
+  serverId: null,
+  serverActive: true,
+  quotaMeteringEnabled: true,
+  quotaEgressId: null,
+  pruneFailed: null,
+  pruneCompleted: null,
+  pruneCancelled: null,
   speeds: {},
-  splitLift: false, splitPct: 50,
+  splitLift: false,
+  splitPct: 50,
 };
 
 /** Only pruning runs once each time rather than holding until the next rule. */
 export const isOneShot = (action: string) => action === "prune_history";
 
-export function optionsFromSchedule(schedule: ScheduleOptions & { actionType: string }): ScheduleOptionsForm {
+export function optionsFromSchedule(
+  schedule: ScheduleOptions & { actionType: string },
+): ScheduleOptionsForm {
   const { times, speedLimits, splitUsenetPct, actionType, ...rest } = schedule;
   return {
     ...rest,
@@ -278,33 +366,53 @@ export function optionsFromSchedule(schedule: ScheduleOptions & { actionType: st
     speeds: Object.fromEntries(
       (speedLimits ?? []).map((limit) => [
         speedKey(limit.kind, limit.id),
-        { download: rateText(limit.download), upload: limit.kind === "GLOBAL" ? rateText(limit.upload) : null },
+        {
+          download: rateText(limit.download),
+          upload: limit.kind === "GLOBAL" ? rateText(limit.upload) : null,
+        },
       ]),
     ),
   };
 }
 
-export function optionsInput(form: ScheduleOptionsForm, action: string, stored: readonly ScheduleSpeedLimit[] = []) {
+export function optionsInput(
+  form: ScheduleOptionsForm,
+  action: string,
+  stored: readonly ScheduleSpeedLimit[] = [],
+) {
   const hourly = isOneShot(action) ? form.everyHourAtMinute : null;
   // A speed rule takes the one time of day.
   const listed = hourly === null && action !== "speed_limit";
   return {
-    times: listed ? form.timesText.split(",").map((time) => time.trim()).filter(Boolean) : [],
+    times: listed
+      ? form.timesText
+          .split(",")
+          .map((time) => time.trim())
+          .filter(Boolean)
+      : [],
     everyHourAtMinute: hourly,
     serverId: action === "set_server_active" ? form.serverId : null,
     serverActive: action === "set_server_active" ? form.serverActive : null,
-    quotaMeteringEnabled: action === "set_quota_metering" ? form.quotaMeteringEnabled : null,
+    quotaMeteringEnabled:
+      action === "set_quota_metering" ? form.quotaMeteringEnabled : null,
     quotaEgressId: action === "set_quota_metering" ? form.quotaEgressId : null,
     pruneFailed: action === "prune_history" ? form.pruneFailed : null,
     pruneCompleted: action === "prune_history" ? form.pruneCompleted : null,
     pruneCancelled: action === "prune_history" ? form.pruneCancelled : null,
-    speedLimits: action === "speed_limit" ? speedLimitsInput(form.speeds, stored) : null,
-    splitUsenetPct: action === "bandwidth_split" && !form.splitLift ? form.splitPct : null,
+    speedLimits:
+      action === "speed_limit" ? speedLimitsInput(form.speeds, stored) : null,
+    splitUsenetPct:
+      action === "bandwidth_split" && !form.splitLift ? form.splitPct : null,
   };
 }
 
-export function scheduleTimeLabel(schedule: ScheduleOptions & { time: string }): string {
-  return schedule.everyHourAtMinute !== null && schedule.everyHourAtMinute !== undefined
+export function scheduleTimeLabel(
+  schedule: ScheduleOptions & { time: string },
+): string {
+  return schedule.everyHourAtMinute !== null &&
+    schedule.everyHourAtMinute !== undefined
     ? `*:${String(schedule.everyHourAtMinute).padStart(2, "0")}`
-    : schedule.times?.length ? schedule.times.join(", ") : schedule.time;
+    : schedule.times?.length
+      ? schedule.times.join(", ")
+      : schedule.time;
 }

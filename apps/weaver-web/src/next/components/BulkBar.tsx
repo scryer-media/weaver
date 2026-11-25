@@ -113,7 +113,9 @@ export function BulkButton({
       disabled={disabled}
       className={bulkButtonClass(tone, disabled)}
     >
-      {icon === undefined ? null : <Icon name={icon} size={13} className="-ml-[1px] mr-[6px] flex-none" />}
+      {icon === undefined ? null : (
+        <Icon name={icon} size={13} className="-ml-[1px] mr-[6px] flex-none" />
+      )}
       {children}
     </button>
   );
@@ -152,9 +154,19 @@ export function BulkMenu({
         onClick={() => setOpen((previous) => !previous)}
         className={bulkButtonClass("default", disabled)}
       >
-        {icon === undefined ? null : <Icon name={icon} size={13} className="-ml-[1px] mr-[6px] flex-none" />}
+        {icon === undefined ? null : (
+          <Icon
+            name={icon}
+            size={13}
+            className="-ml-[1px] mr-[6px] flex-none"
+          />
+        )}
         {children}
-        <Icon name="dropdown" size={12} className="-mr-[2px] ml-[6px] flex-none text-wv-muted" />
+        <Icon
+          name="dropdown"
+          size={12}
+          className="-mr-[2px] ml-[6px] flex-none text-wv-muted"
+        />
       </button>
       <Menu
         open={open}
@@ -178,7 +190,10 @@ export function BulkMenu({
   );
 }
 
-function bulkButtonClass(tone: "default" | "danger", disabled: boolean | undefined): string {
+function bulkButtonClass(
+  tone: "default" | "danger",
+  disabled: boolean | undefined,
+): string {
   return cn(
     "flex h-[26px] cursor-pointer items-center border px-[11px] text-[12.5px] whitespace-nowrap",
     tone === "danger"

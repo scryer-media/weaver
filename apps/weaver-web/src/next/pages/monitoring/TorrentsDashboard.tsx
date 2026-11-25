@@ -5,8 +5,18 @@ import { useTranslate } from "@/lib/context/translate-context";
 import { EmptyState, MetricCell, SectionHeader } from "../../components/chrome";
 import { columnStyle } from "../../components/columns";
 import { useNow } from "../../data/clock";
-import { noTorrents, shareRatio, trackersInOrder, type UsageTotals } from "../../data/dashboards";
-import { EM_DASH, formatCount, formatDuration, formatSize } from "../../data/format";
+import {
+  noTorrents,
+  shareRatio,
+  trackersInOrder,
+  type UsageTotals,
+} from "../../data/dashboards";
+import {
+  EM_DASH,
+  formatCount,
+  formatDuration,
+  formatSize,
+} from "../../data/format";
 import { WV } from "../../data/palette";
 import { DailyBars } from "./DailyBars";
 import { DashboardSlot } from "./shell-slots";
@@ -38,7 +48,11 @@ export function TorrentsDashboard() {
     <>
       {error ? <DashboardSlot slot="status">{error}</DashboardSlot> : null}
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
-        <UsageRangeBar state={rangeState} rangeStart={torrents?.rangeStart} rangeEnd={torrents?.rangeEnd} />
+        <UsageRangeBar
+          state={rangeState}
+          rangeStart={torrents?.rangeStart}
+          rangeEnd={torrents?.rangeEnd}
+        />
 
         {empty || torrents === null ? (
           <EmptyState
@@ -52,7 +66,10 @@ export function TorrentsDashboard() {
           <>
             <div
               className="wv-cols grid flex-none border-b border-wv-hairline bg-wv-app"
-              style={columnStyle({ base: "repeat(1, minmax(0, 1fr))", sm: "repeat(3, minmax(0, 1fr))" })}
+              style={columnStyle({
+                base: "repeat(1, minmax(0, 1fr))",
+                sm: "repeat(3, minmax(0, 1fr))",
+              })}
             >
               <MetricCell
                 eyebrow={t("next.torrentDash.ratio")}
@@ -66,7 +83,9 @@ export function TorrentsDashboard() {
                 eyebrow={t("next.torrentDash.seedTime")}
                 value={formatDuration((range?.durationMs ?? 0) / 1000)}
                 note={t("next.torrentDash.allTime", {
-                  time: formatDuration(torrents.total.allTime.durationMs / 1000),
+                  time: formatDuration(
+                    torrents.total.allTime.durationMs / 1000,
+                  ),
                 })}
               />
               <MetricCell
@@ -81,7 +100,10 @@ export function TorrentsDashboard() {
             </div>
 
             <section className="flex flex-none flex-col">
-              <SectionHeader label={t("next.torrentDash.perDay")} sticky={false} />
+              <SectionHeader
+                label={t("next.torrentDash.perDay")}
+                sticky={false}
+              />
               <DailyBars
                 days={days.map((day) => day.day)}
                 series={[
@@ -102,7 +124,11 @@ export function TorrentsDashboard() {
             </section>
 
             <section className="flex flex-none flex-col">
-              <SectionHeader label={t("next.torrentDash.trackers")} note={t("next.torrentDash.trackersNote")} sticky={false} />
+              <SectionHeader
+                label={t("next.torrentDash.trackers")}
+                note={t("next.torrentDash.trackersNote")}
+                sticky={false}
+              />
               <div className="overflow-x-auto">
                 <div className="min-w-[560px]">
                   <div
@@ -110,10 +136,18 @@ export function TorrentsDashboard() {
                     style={{ gridTemplateColumns: COLUMNS }}
                   >
                     <span>{t("next.torrentDash.tracker")}</span>
-                    <span className="text-right">{t("next.torrentDash.downloaded")}</span>
-                    <span className="text-right">{t("next.torrentDash.uploaded")}</span>
-                    <span className="text-right">{t("next.torrentDash.ratio")}</span>
-                    <span className="text-right">{t("next.torrentDash.seedTime")}</span>
+                    <span className="text-right">
+                      {t("next.torrentDash.downloaded")}
+                    </span>
+                    <span className="text-right">
+                      {t("next.torrentDash.uploaded")}
+                    </span>
+                    <span className="text-right">
+                      {t("next.torrentDash.ratio")}
+                    </span>
+                    <span className="text-right">
+                      {t("next.torrentDash.seedTime")}
+                    </span>
                   </div>
                   {trackers.map((tracker) => (
                     <div
@@ -125,12 +159,20 @@ export function TorrentsDashboard() {
                       <span
                         className={`truncate font-wv-mono text-[12.5px] ${tracker.id === "" ? "text-wv-muted" : "text-wv-fg"}`}
                       >
-                        {tracker.id === "" ? t("next.torrentDash.noTracker") : tracker.id}
+                        {tracker.id === ""
+                          ? t("next.torrentDash.noTracker")
+                          : tracker.id}
                       </span>
-                      <span className={cell}>{formatSize(tracker.range.bytes)}</span>
-                      <span className={cell}>{formatSize(tracker.range.bytesUploaded)}</span>
+                      <span className={cell}>
+                        {formatSize(tracker.range.bytes)}
+                      </span>
+                      <span className={cell}>
+                        {formatSize(tracker.range.bytesUploaded)}
+                      </span>
                       <span className={cell}>{ratioText(tracker.range)}</span>
-                      <span className={cell}>{formatDuration(tracker.range.durationMs / 1000)}</span>
+                      <span className={cell}>
+                        {formatDuration(tracker.range.durationMs / 1000)}
+                      </span>
                     </div>
                   ))}
                 </div>

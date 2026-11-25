@@ -44,14 +44,17 @@ export function buildAliasedIdMutation({
   const fields = ids
     .map((_, index) => {
       const idVariable = `$id${index}`;
-      const argumentsText = buildFieldArguments?.(idVariable) ?? `id: ${idVariable}`;
+      const argumentsText =
+        buildFieldArguments?.(idVariable) ?? `id: ${idVariable}`;
       const resultSelection = selectionSet ? ` ${selectionSet}` : "";
       return `  ${aliasPrefix}${index}: ${fieldName}(${argumentsText})${resultSelection}`;
     })
     .join("\n");
 
   const fragmentText = fragments.length > 0 ? `\n${fragments.join("\n")}` : "";
-  return gql(`mutation ${operationName}(${variableDefinitions}) {\n${fields}\n}${fragmentText}`);
+  return gql(
+    `mutation ${operationName}(${variableDefinitions}) {\n${fields}\n}${fragmentText}`,
+  );
 }
 
 /**
@@ -72,18 +75,33 @@ export async function executeAliasedIdMutation<TData = boolean>({
   ids,
   sharedVariables = {},
   ...definition
-}: ExecuteAliasedIdMutationOptions): Promise<{ data: Record<string, TData>; error?: CombinedError }> {
+}: ExecuteAliasedIdMutationOptions): Promise<{
+  data: Record<string, TData>;
+  error?: CombinedError;
+}> {
   const data: Record<string, TData> = {};
   let error: CombinedError | undefined;
   for (let start = 0; start < ids.length; start += ALIASED_GROUP_SIZE) {
     const group = ids.slice(start, start + ALIASED_GROUP_SIZE);
-    const mutation = buildAliasedIdMutation({ ids: group, sharedVariables, ...definition });
+    const mutation = buildAliasedIdMutation({
+      ids: group,
+      sharedVariables,
+      ...definition,
+    });
     const variables: Record<string, unknown> = {
       ...Object.fromEntries(group.map((id, index) => [`id${index}`, id])),
-      ...Object.fromEntries(Object.entries(sharedVariables).map(([name, spec]) => [name, spec.value])),
+      ...Object.fromEntries(
+        Object.entries(sharedVariables).map(([name, spec]) => [
+          name,
+          spec.value,
+        ]),
+      ),
     };
     const result = await client
-      .mutation<Record<string, TData>, Record<string, unknown>>(mutation, variables)
+      .mutation<Record<string, TData>, Record<string, unknown>>(
+        mutation,
+        variables,
+      )
       .toPromise();
     error ??= result.error;
     group.forEach((_id, index) => {

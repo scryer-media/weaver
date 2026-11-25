@@ -13,13 +13,21 @@ import {
 } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useClient } from "urql";
-import { BROWSE_DIRECTORIES_QUERY, BROWSE_FILES_QUERY, CREATE_DIRECTORY_MUTATION } from "@/graphql/queries";
+import {
+  BROWSE_DIRECTORIES_QUERY,
+  BROWSE_FILES_QUERY,
+  CREATE_DIRECTORY_MUTATION,
+} from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
 import { LoadingMark } from "@/lib/loading-mark";
 import { cn } from "@/lib/utils";
 import { Dialog } from "@/next/components/Dialog";
 import { Cell, GridHeader, GridRow } from "@/next/components/rows";
-import { PrimaryButton, SecondaryButton, TextField } from "@/next/components/controls";
+import {
+  PrimaryButton,
+  SecondaryButton,
+  TextField,
+} from "@/next/components/controls";
 import { testIds } from "@/next/testids";
 import {
   describeEntryCount,
@@ -43,7 +51,10 @@ type Stop = { path: string | null; select?: string };
 const ROW_HEIGHT = 34;
 const COLUMNS = "minmax(0,1fr) auto";
 
-function failureMessage(error: { graphQLErrors: { message: string }[]; message: string }): string {
+function failureMessage(error: {
+  graphQLErrors: { message: string }[];
+  message: string;
+}): string {
   return error.graphQLErrors[0]?.message ?? error.message;
 }
 
@@ -68,10 +79,19 @@ type DirectoryBrowserProps = {
 
 export function DirectoryBrowserDialog(props: DirectoryBrowserProps) {
   // A reopened picker must not inherit a previous folder's pending creation.
-  return props.open ? <DirectoryBrowserSession key={props.initialPath} {...props} /> : null;
+  return props.open ? (
+    <DirectoryBrowserSession key={props.initialPath} {...props} />
+  ) : null;
 }
 
-function DirectoryBrowserSession({ open, initialPath, title, pick, onClose, onChoose }: DirectoryBrowserProps) {
+function DirectoryBrowserSession({
+  open,
+  initialPath,
+  title,
+  pick,
+  onClose,
+  onChoose,
+}: DirectoryBrowserProps) {
   const files = pick === "file";
   const t = useTranslate();
   const client = useClient();
@@ -96,7 +116,11 @@ function DirectoryBrowserSession({ open, initialPath, title, pick, onClose, onCh
     setTypedPath(next.currentPath);
     setFilter("");
     setError(null);
-    setSelected(select !== undefined && next.files?.some((file) => file.path === select) ? select : null);
+    setSelected(
+      select !== undefined && next.files?.some((file) => file.path === select)
+        ? select
+        : null,
+    );
   }, []);
 
   const browse = useCallback(
@@ -127,7 +151,11 @@ function DirectoryBrowserSession({ open, initialPath, title, pick, onClose, onCh
             continue;
           }
           setLoading(false);
-          setError(result.error ? failureMessage(result.error) : t("next.folders.readFailed"));
+          setError(
+            result.error
+              ? failureMessage(result.error)
+              : t("next.folders.readFailed"),
+          );
           return;
         }
         setLoading(false);
@@ -159,7 +187,12 @@ function DirectoryBrowserSession({ open, initialPath, title, pick, onClose, onCh
     }
     const start = initialPath?.trim() || null;
     // A saved path that no longer exists still opens somewhere useful.
-    void browse(start, start === null ? [{ path: "/" }] : [...fileStops(start), { path: null }, { path: "/" }]);
+    void browse(
+      start,
+      start === null
+        ? [{ path: "/" }]
+        : [...fileStops(start), { path: null }, { path: "/" }],
+    );
   }, [browse, fileStops, initialPath, open]);
 
   // Keys go to the picker once it is up, not to the field under the overlay.
@@ -177,14 +210,21 @@ function DirectoryBrowserSession({ open, initialPath, title, pick, onClose, onCh
     setCreating(true);
     setCreateError(null);
     const result = await client
-      .mutation<{ createDirectory: DirectoryListing }>(CREATE_DIRECTORY_MUTATION, {
-        path: listing.currentPath,
-        name,
-      })
+      .mutation<{ createDirectory: DirectoryListing }>(
+        CREATE_DIRECTORY_MUTATION,
+        {
+          path: listing.currentPath,
+          name,
+        },
+      )
       .toPromise();
     setCreating(false);
     if (result.error || !result.data?.createDirectory) {
-      setCreateError(result.error ? failureMessage(result.error) : t("next.folders.createFailed"));
+      setCreateError(
+        result.error
+          ? failureMessage(result.error)
+          : t("next.folders.createFailed"),
+      );
       return;
     }
     requestRef.current += 1;
@@ -209,7 +249,9 @@ function DirectoryBrowserSession({ open, initialPath, title, pick, onClose, onCh
     }
   };
   const currentPath = listing?.currentPath ?? "";
-  const parent = listing ? (listing.parentPath ?? parentOf(listing.currentPath)) : null;
+  const parent = listing
+    ? (listing.parentPath ?? parentOf(listing.currentPath))
+    : null;
   const busy = loading || creating;
 
   // A new folder or a new filter starts from the top of the list, and the
@@ -241,18 +283,30 @@ function DirectoryBrowserSession({ open, initialPath, title, pick, onClose, onCh
             title={createError ?? selected ?? currentPath}
             className={cn(
               "mr-auto min-w-0 flex-[1_1_200px] truncate text-[11.5px]",
-              createError === null ? "font-wv-mono text-wv-muted" : "text-wv-error-text",
+              createError === null
+                ? "font-wv-mono text-wv-muted"
+                : "text-wv-error-text",
             )}
           >
             {createError ?? selected ?? currentPath}
           </span>
-          <SecondaryButton onClick={onClose} testId={testIds.pickerCancel}>{t("action.cancel")}</SecondaryButton>
+          <SecondaryButton onClick={onClose} testId={testIds.pickerCancel}>
+            {t("action.cancel")}
+          </SecondaryButton>
           {files ? (
-            <PrimaryButton disabled={busy || selected === null} onClick={() => selected !== null && onChoose(selected)} testId={testIds.pickerUse}>
+            <PrimaryButton
+              disabled={busy || selected === null}
+              onClick={() => selected !== null && onChoose(selected)}
+              testId={testIds.pickerUse}
+            >
               {t("next.files.use")}
             </PrimaryButton>
           ) : (
-            <PrimaryButton disabled={busy || !listing} onClick={() => listing && onChoose(listing.currentPath)} testId={testIds.pickerUse}>
+            <PrimaryButton
+              disabled={busy || !listing}
+              onClick={() => listing && onChoose(listing.currentPath)}
+              testId={testIds.pickerUse}
+            >
               {t("next.folders.use")}
             </PrimaryButton>
           )}
@@ -267,8 +321,15 @@ function DirectoryBrowserSession({ open, initialPath, title, pick, onClose, onCh
           {crumbs.map((crumb, index) => {
             const last = index === crumbs.length - 1;
             return (
-              <span key={crumb.path} className="flex flex-none items-center gap-[6px]">
-                {index === 0 ? null : <span className="font-wv-mono text-[11px] text-wv-faint">›</span>}
+              <span
+                key={crumb.path}
+                className="flex flex-none items-center gap-[6px]"
+              >
+                {index === 0 ? null : (
+                  <span className="font-wv-mono text-[11px] text-wv-faint">
+                    ›
+                  </span>
+                )}
                 <button
                   type="button"
                   title={crumb.path}
@@ -276,7 +337,9 @@ function DirectoryBrowserSession({ open, initialPath, title, pick, onClose, onCh
                   onClick={() => void browse(crumb.path)}
                   className={cn(
                     "max-w-[220px] truncate font-wv-mono text-[12px]",
-                    last ? "cursor-default text-wv-fg" : "cursor-pointer text-wv-muted hover:text-wv-fg",
+                    last
+                      ? "cursor-default text-wv-fg"
+                      : "cursor-pointer text-wv-muted hover:text-wv-fg",
                   )}
                 >
                   {crumb.label}
@@ -306,7 +369,9 @@ function DirectoryBrowserSession({ open, initialPath, title, pick, onClose, onCh
               icon="go"
               testId={testIds.pickerGo}
               disabled={busy || typedPath.trim() === ""}
-              onClick={() => void browse(typedPath.trim(), fileStops(typedPath.trim()))}
+              onClick={() =>
+                void browse(typedPath.trim(), fileStops(typedPath.trim()))
+              }
             >
               {t("next.folders.go")}
             </SecondaryButton>
@@ -331,7 +396,9 @@ function DirectoryBrowserSession({ open, initialPath, title, pick, onClose, onCh
           columns={COLUMNS}
           cells={[
             files ? t("next.files.name") : t("next.folders.folder"),
-            !files && listing && !loading && error === null ? describeEntryCount(t, shown.length, entries.length) : "",
+            !files && listing && !loading && error === null
+              ? describeEntryCount(t, shown.length, entries.length)
+              : "",
           ]}
           cellClassNames={[undefined, "text-right"]}
         />
@@ -339,14 +406,21 @@ function DirectoryBrowserSession({ open, initialPath, title, pick, onClose, onCh
         <GridRow
           columns={COLUMNS}
           title={parent ?? undefined}
-          onClick={parent === null || busy ? undefined : () => void browse(parent)}
+          onClick={
+            parent === null || busy ? undefined : () => void browse(parent)
+          }
           className="h-[34px] flex-none border-b border-wv-hairline px-4 sm:px-[22px]"
         >
-          <Cell mono className={parent === null ? "text-wv-faint" : "text-wv-muted"}>
+          <Cell
+            mono
+            className={parent === null ? "text-wv-faint" : "text-wv-muted"}
+          >
             ..
           </Cell>
           <Cell mono className="text-right text-[11px] text-wv-faint">
-            {listing !== null && parent === null ? t("next.folders.topLevel") : t("next.folders.upOne")}
+            {listing !== null && parent === null
+              ? t("next.folders.topLevel")
+              : t("next.folders.upOne")}
           </Cell>
         </GridRow>
 
@@ -441,12 +515,17 @@ const EntryList = memo(function EntryList({
       className="relative h-[420px] min-h-[136px] flex-[0_1_420px] overflow-y-auto bg-wv-list"
     >
       {loading ? (
-        <div role="status" className="flex items-center gap-3 px-4 py-4 text-[12.5px] text-wv-muted sm:px-6">
+        <div
+          role="status"
+          className="flex items-center gap-3 px-4 py-4 text-[12.5px] text-wv-muted sm:px-6"
+        >
           <LoadingMark reveal />
           {t("next.folders.reading")}
         </div>
       ) : error !== null ? (
-        <div className="px-4 py-4 text-[12.5px] text-wv-error-text sm:px-6">{error}</div>
+        <div className="px-4 py-4 text-[12.5px] text-wv-error-text sm:px-6">
+          {error}
+        </div>
       ) : shown.length === 0 ? (
         <div className="px-4 py-4 text-[12.5px] text-wv-muted sm:px-6">
           {empty
@@ -454,14 +533,20 @@ const EntryList = memo(function EntryList({
             : t(files ? "next.files.noMatch" : "next.folders.noMatch")}
         </div>
       ) : (
-        <div style={{ height: virtualizer.getTotalSize() }} className="relative w-full">
+        <div
+          style={{ height: virtualizer.getTotalSize() }}
+          className="relative w-full"
+        >
           {virtualizer.getVirtualItems().map((item) => {
             const entry = shown[item.index]!;
             return (
               <div
                 key={item.key}
                 className="absolute top-0 left-0 w-full"
-                style={{ height: ROW_HEIGHT, transform: `translateY(${item.start}px)` }}
+                style={{
+                  height: ROW_HEIGHT,
+                  transform: `translateY(${item.start}px)`,
+                }}
               >
                 <GridRow
                   columns={COLUMNS}
@@ -474,7 +559,10 @@ const EntryList = memo(function EntryList({
                   <Cell className="text-wv-fg">{entry.name}</Cell>
                   {/* Among files, a folder is the row that opens. */}
                   {files && !entry.file ? (
-                    <span aria-hidden className="text-right font-wv-mono text-[11px] text-wv-faint">
+                    <span
+                      aria-hidden
+                      className="text-right font-wv-mono text-[11px] text-wv-faint"
+                    >
                       ›
                     </span>
                   ) : (
@@ -554,7 +642,12 @@ export function PathField({
   };
 
   return (
-    <div className={cn("flex min-w-0 items-center gap-2", className ?? "w-[340px] max-w-full")}>
+    <div
+      className={cn(
+        "flex min-w-0 items-center gap-2",
+        className ?? "w-[340px] max-w-full",
+      )}
+    >
       <TextField
         ref={fieldRef}
         testId={testId}

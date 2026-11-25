@@ -81,7 +81,13 @@ export function statusColor(status: string): string {
  * is what keeps a category the same colour in the rail, in the list and in the
  * settings table.
  */
-const CATEGORY_COLORS = [WV.info, WV.violet, WV.green, WV.gold, WV.accent] as const;
+const CATEGORY_COLORS = [
+  WV.info,
+  WV.violet,
+  WV.green,
+  WV.gold,
+  WV.accent,
+] as const;
 
 export const UNCATEGORISED_COLOR = WV.inert;
 

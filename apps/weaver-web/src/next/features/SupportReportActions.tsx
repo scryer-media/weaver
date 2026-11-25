@@ -15,16 +15,25 @@ import {
 
 // Outside the component, so the component itself compiles: what each action reports.
 
-async function copyReport(t: Translate, fetchReport: () => Promise<SupportReport>): Promise<string> {
+async function copyReport(
+  t: Translate,
+  fetchReport: () => Promise<SupportReport>,
+): Promise<string> {
   try {
     const report = await fetchReport();
-    return (await copySupportReport(report)) ? t("next.support.copied") : t("next.support.copyBlocked");
+    return (await copySupportReport(report))
+      ? t("next.support.copied")
+      : t("next.support.copyBlocked");
   } catch {
     return t("next.support.failed");
   }
 }
 
-async function downloadReport(t: Translate, fetchReport: () => Promise<SupportReport>, jobId: number): Promise<string> {
+async function downloadReport(
+  t: Translate,
+  fetchReport: () => Promise<SupportReport>,
+  jobId: number,
+): Promise<string> {
   try {
     downloadSupportReportJson(await fetchReport(), jobId);
     return t("next.support.saved");
@@ -74,7 +83,11 @@ export function SupportReportActions({
         onClick={() => setOpen((previous) => !previous)}
       >
         {t("next.support.report")}
-        <Icon name="dropdown" size={12} className="-mr-[2px] ml-[6px] flex-none text-wv-muted" />
+        <Icon
+          name="dropdown"
+          size={12}
+          className="-mr-[2px] ml-[6px] flex-none text-wv-muted"
+        />
       </SecondaryButton>
       <Menu
         open={open}

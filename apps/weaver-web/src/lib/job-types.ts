@@ -9,7 +9,14 @@ export interface DeleteOperationData {
   errorMessage?: string | null;
   /** Selected where it is read: the job page. */
   action?: "DELETE" | "ARCHIVE";
-  archiveOutcome?: "ARCHIVED" | "ALREADY_GONE" | "NOT_MANAGED" | "BUSY" | "NOT_FOUND" | "FAILED" | null;
+  archiveOutcome?:
+    | "ARCHIVED"
+    | "ALREADY_GONE"
+    | "NOT_MANAGED"
+    | "BUSY"
+    | "NOT_FOUND"
+    | "FAILED"
+    | null;
 }
 
 export type JobPhase = "DOWNLOADING" | "REPAIRING" | "EXTRACTING" | "MOVING";
@@ -83,7 +90,10 @@ export interface JobData {
   deleteOperation?: DeleteOperationData | null;
 }
 
-export interface GraphqlJobData extends Omit<JobData, "progress" | "phaseProgress" | "createdAt" | "completedAt" | "metadata"> {
+export interface GraphqlJobData extends Omit<
+  JobData,
+  "progress" | "phaseProgress" | "createdAt" | "completedAt" | "metadata"
+> {
   progress?: number | null;
   progressPercent?: number | null;
   createdAt?: string | number | null;
@@ -119,7 +129,9 @@ export function normalizeFacadeJobProgress(
   return 0;
 }
 
-export function normalizeGraphqlTimestamp(value?: string | number | null): number | null {
+export function normalizeGraphqlTimestamp(
+  value?: string | number | null,
+): number | null {
   if (typeof value === "number" && Number.isFinite(value)) {
     return value;
   }
@@ -130,13 +142,16 @@ export function normalizeGraphqlTimestamp(value?: string | number | null): numbe
   return null;
 }
 
-export function normalizeJobData<T extends GraphqlJobData>(job: T): T & JobData {
+export function normalizeJobData<T extends GraphqlJobData>(
+  job: T,
+): T & JobData {
   return {
     ...job,
-    status: job.downloadWaitReason === "propagation_delay"
-      && (job.status === "QUEUED" || job.status === "DOWNLOADING")
-      ? "PROPAGATING"
-      : normalizeFacadeJobStatus(job.status),
+    status:
+      job.downloadWaitReason === "propagation_delay" &&
+      (job.status === "QUEUED" || job.status === "DOWNLOADING")
+        ? "PROPAGATING"
+        : normalizeFacadeJobStatus(job.status),
     progress: normalizeFacadeJobProgress(job.progressPercent, job.progress),
     phaseProgress: job.phaseProgress ?? [],
     createdAt: normalizeGraphqlTimestamp(job.createdAt),
@@ -145,7 +160,9 @@ export function normalizeJobData<T extends GraphqlJobData>(job: T): T & JobData 
   };
 }
 
-export function formatJobReleaseName(job: Pick<JobData, "name" | "originalTitle" | "displayTitle">): string {
+export function formatJobReleaseName(
+  job: Pick<JobData, "name" | "originalTitle" | "displayTitle">,
+): string {
   const releaseName = job.originalTitle.trim() || job.name.trim();
   if (!releaseName) {
     return job.displayTitle;

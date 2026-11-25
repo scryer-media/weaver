@@ -7,13 +7,25 @@ import { authHeaders } from "@/graphql/client";
 import { SYSTEM_INFO_QUERY } from "@/graphql/queries";
 import { copyText } from "@/lib/clipboard";
 import { useTranslate } from "@/lib/context/translate-context";
-import { readDownloadErrorMessage, saveResponseAsDownload } from "@/lib/download";
+import {
+  readDownloadErrorMessage,
+  saveResponseAsDownload,
+} from "@/lib/download";
 import type { MetricsSnapshot } from "@/lib/metrics";
 import { EmptyState, KeyValueRow, SectionHeader } from "../components/chrome";
 import { PrimaryButton, SecondaryButton } from "../components/controls";
 import { StorageUsage } from "../components/storage";
-import { EM_DASH, formatCount, formatDuration, formatRate, formatSize } from "../data/format";
-import { MetricsSnapshotContext, useMetricsSnapshot } from "../data/use-metrics-series";
+import {
+  EM_DASH,
+  formatCount,
+  formatDuration,
+  formatRate,
+  formatSize,
+} from "../data/format";
+import {
+  MetricsSnapshotContext,
+  useMetricsSnapshot,
+} from "../data/use-metrics-series";
 import { NextShell } from "../shell/NextShell";
 import { AttentionBlock, UptimeBlock } from "../shell/rail-blocks";
 import { ApplicationUpgradeSection } from "../features/ApplicationUpgradeSection";
@@ -71,7 +83,10 @@ const KERNEL_LABEL: Record<KernelComponent, { key: string; report: string }> = {
   PAR2_REPAIR: { key: "next.system.kernel.par2Repair", report: "PAR2 repair" },
   PAR2_MD5: { key: "next.system.kernel.par2Md5", report: "PAR2 MD5" },
   PAR2_CRC32: { key: "next.system.kernel.par2Crc32", report: "PAR2 CRC32" },
-  RAR_RECOVERY: { key: "next.system.kernel.rarRecovery", report: "RAR5 recovery records" },
+  RAR_RECOVERY: {
+    key: "next.system.kernel.rarRecovery",
+    report: "RAR5 recovery records",
+  },
   RAR_CRC32: { key: "next.system.kernel.rarCrc32", report: "RAR CRC32" },
   RAR_SHA1: { key: "next.system.kernel.rarSha1", report: "RAR SHA-1" },
   RAR_AES: { key: "next.system.kernel.rarAes", report: "RAR decryption" },
@@ -117,9 +132,15 @@ function enumLabel(value: string): string {
  * The bug-report text. It stays in English whatever the interface language: it
  * is read by whoever triages the report, not by the person who copied it.
  */
-function reportText(info: SystemInfo, cacheBytes: number, cacheLimit: number): string {
+function reportText(
+  info: SystemInfo,
+  cacheBytes: number,
+  cacheLimit: number,
+): string {
   const cacheInUse =
-    cacheLimit > 0 ? `${formatSize(cacheBytes)} of ${formatSize(cacheLimit)}` : formatSize(cacheBytes);
+    cacheLimit > 0
+      ? `${formatSize(cacheBytes)} of ${formatSize(cacheLimit)}`
+      : formatSize(cacheBytes);
   const lines = [
     `Weaver ${info.version}`,
     `Deployment: ${enumLabel(info.deployment)} · ${info.architecture}`,
@@ -146,7 +167,9 @@ function reportText(info: SystemInfo, cacheBytes: number, cacheLimit: number): s
             ? "not writing"
             : `writing ${formatRate(volume.throughputBytesPerSecond)}`
         } · ${formatSize(volume.bufferedBytes)}${
-          volume.bufferLimitBytes == null ? "" : ` of ${formatSize(volume.bufferLimitBytes)}`
+          volume.bufferLimitBytes == null
+            ? ""
+            : ` of ${formatSize(volume.bufferLimitBytes)}`
         } buffered`,
     ),
     ...info.compute.kernels.map((entry) => {
@@ -172,9 +195,15 @@ function KernelRow({ entry }: { entry: KernelSelection }) {
   const selected = entry.ladder.indexOf(entry.kernel);
   return (
     <div className="grid grid-cols-[minmax(0,max-content)_minmax(0,1fr)] items-baseline gap-x-6 gap-y-1 border-b border-wv-hairline px-4 sm:px-6 py-[11px] hover:bg-wv-cell-hover">
-      <span className="text-[13px] text-wv-muted">{label ? t(label.key) : entry.component}</span>
-      <span className="justify-self-end text-right font-wv-mono text-[12.5px] text-wv-fg">{entry.kernel}</span>
-      <span className="font-wv-mono text-[11px] text-wv-faint">{entry.library}</span>
+      <span className="text-[13px] text-wv-muted">
+        {label ? t(label.key) : entry.component}
+      </span>
+      <span className="justify-self-end text-right font-wv-mono text-[12.5px] text-wv-fg">
+        {entry.kernel}
+      </span>
+      <span className="font-wv-mono text-[11px] text-wv-faint">
+        {entry.library}
+      </span>
       {entry.ladder.length > 1 ? (
         <ol
           aria-label={t("next.system.kernelLadder")}
@@ -192,7 +221,9 @@ function KernelRow({ entry }: { entry: KernelSelection }) {
                     : "text-wv-faint"
               }
             >
-              {index > 0 ? <span className="mr-1.5 text-wv-disabled">›</span> : null}
+              {index > 0 ? (
+                <span className="mr-1.5 text-wv-disabled">›</span>
+              ) : null}
               {rung}
             </li>
           ))}
@@ -242,7 +273,9 @@ export function SystemInfoPage() {
   async function downloadDiagnostics() {
     setBusy(true);
     setFailure(null);
-    const failed = await saveDiagnostics(() => t("systemInfo.diagnosticsFailed"));
+    const failed = await saveDiagnostics(() =>
+      t("systemInfo.diagnosticsFailed"),
+    );
     if (failed !== null) {
       setFailure(failed);
     }
@@ -262,8 +295,14 @@ export function SystemInfoPage() {
               onCopied={() => setCopied(true)}
               onFailed={() => setFailure(t("next.system.copyFailed"))}
             />
-            <PrimaryButton icon="downloadFile" disabled={busy} onClick={() => void downloadDiagnostics()}>
-              {busy ? t("next.system.collecting") : t("next.system.downloadDiagnostics")}
+            <PrimaryButton
+              icon="downloadFile"
+              disabled={busy}
+              onClick={() => void downloadDiagnostics()}
+            >
+              {busy
+                ? t("next.system.collecting")
+                : t("next.system.downloadDiagnostics")}
             </PrimaryButton>
           </>
         }
@@ -280,7 +319,9 @@ export function SystemInfoPage() {
           {!info ? (
             <EmptyState
               loading={!error}
-              title={error ? t("next.system.unavailable") : t("next.common.loading")}
+              title={
+                error ? t("next.system.unavailable") : t("next.common.loading")
+              }
               body={error ? error.message : t("next.system.loadingBody")}
             />
           ) : (
@@ -292,22 +333,43 @@ export function SystemInfoPage() {
                   uptime: formatDuration(info.uptimeSeconds),
                 })}
               />
-              <KeyValueRow label={t("next.system.version")} value={info.version} />
+              <KeyValueRow
+                label={t("next.system.version")}
+                value={info.version}
+              />
               <KeyValueRow
                 label={t("next.system.deployment")}
                 value={`${enumLabel(info.deployment)} · ${info.architecture}`}
               />
-              <KeyValueRow label={t("next.system.operatingSystem")} value={enumLabel(info.operatingSystem)} />
-              <KeyValueRow label={t("next.system.database")} value={enumLabel(info.databaseEngine)} />
-              <KeyValueRow label={t("next.rail.uptime")} value={formatDuration(info.uptimeSeconds)} />
+              <KeyValueRow
+                label={t("next.system.operatingSystem")}
+                value={enumLabel(info.operatingSystem)}
+              />
+              <KeyValueRow
+                label={t("next.system.database")}
+                value={enumLabel(info.databaseEngine)}
+              />
+              <KeyValueRow
+                label={t("next.rail.uptime")}
+                value={formatDuration(info.uptimeSeconds)}
+              />
 
               <ApplicationUpgradeSection />
 
-              <SectionHeader label={t("next.system.compute")} note={t("next.system.computeNote")} />
-              <KeyValueRow label={t("next.system.decoderTier")} value={info.compute.decoderTier} />
+              <SectionHeader
+                label={t("next.system.compute")}
+                note={t("next.system.computeNote")}
+              />
+              <KeyValueRow
+                label={t("next.system.decoderTier")}
+                value={info.compute.decoderTier}
+              />
               <KeyValueRow
                 label={t("next.system.simd")}
-                value={info.compute.simdFeatures.join(", ") || t("next.system.noneDetected")}
+                value={
+                  info.compute.simdFeatures.join(", ") ||
+                  t("next.system.noneDetected")
+                }
               />
               <KeyValueRow
                 label={t("next.system.cores")}
@@ -327,15 +389,24 @@ export function SystemInfoPage() {
 
               {info.compute.kernels.length > 0 ? (
                 <>
-                  <SectionHeader label={t("next.system.kernels")} note={t("next.system.kernelsNote")} />
+                  <SectionHeader
+                    label={t("next.system.kernels")}
+                    note={t("next.system.kernelsNote")}
+                  />
                   {info.compute.kernels.map((entry) => (
                     <KernelRow key={entry.component} entry={entry} />
                   ))}
                 </>
               ) : null}
 
-              <SectionHeader label={t("next.system.memory")} note={t("next.system.memoryNote")} />
-              <KeyValueRow label={t("next.system.totalMemory")} value={formatSize(info.memory.totalBytes)} />
+              <SectionHeader
+                label={t("next.system.memory")}
+                note={t("next.system.memoryNote")}
+              />
+              <KeyValueRow
+                label={t("next.system.totalMemory")}
+                value={formatSize(info.memory.totalBytes)}
+              />
               <KeyValueRow
                 label={t("next.system.availableAtStartup")}
                 value={formatSize(info.memory.availableAtStartupBytes)}
@@ -358,22 +429,36 @@ export function SystemInfoPage() {
                 label={t("next.system.primaryStorage")}
                 note={t("next.system.primaryStorageNote")}
               />
-              <KeyValueRow label={t("next.system.filesystem")} value={info.primaryStorage.filesystem} />
-              <KeyValueRow label={t("next.system.storageClass")} value={info.primaryStorage.storageClass} />
+              <KeyValueRow
+                label={t("next.system.filesystem")}
+                value={info.primaryStorage.filesystem}
+              />
+              <KeyValueRow
+                label={t("next.system.storageClass")}
+                value={info.primaryStorage.storageClass}
+              />
               <KeyValueRow
                 label={t("next.system.randomRead")}
                 value={`${formatCount(info.primaryStorage.startupRandomReadIops)} IOPS`}
               />
 
-              <SectionHeader label={t("next.system.volumes")} note={t("next.system.volumesNote")} />
+              <SectionHeader
+                label={t("next.system.volumes")}
+                note={t("next.system.volumesNote")}
+              />
               {info.volumes.length === 0 ? (
-                <div className="px-4 sm:px-6 py-5 text-[13px] text-wv-muted">{t("next.system.noVolumes")}</div>
+                <div className="px-4 sm:px-6 py-5 text-[13px] text-wv-muted">
+                  {t("next.system.noVolumes")}
+                </div>
               ) : (
                 info.volumes.map((volume, index) => (
                   <KeyValueRow
                     key={`${index}:${volume.label}`}
                     label={
-                      <span title={volume.label} className="font-wv-mono text-[12px]">
+                      <span
+                        title={volume.label}
+                        className="font-wv-mono text-[12px]"
+                      >
                         {volume.label || t("next.system.storageFallback")}
                       </span>
                     }
@@ -381,12 +466,18 @@ export function SystemInfoPage() {
                       volume.storageKind,
                       volume.writeRateBytesPerSecond == null
                         ? t("next.system.volumeNotMeasured")
-                        : t("next.system.volumeTakes", { rate: formatRate(volume.writeRateBytesPerSecond) }),
+                        : t("next.system.volumeTakes", {
+                            rate: formatRate(volume.writeRateBytesPerSecond),
+                          }),
                       volume.throughputBytesPerSecond == null
                         ? t("next.system.volumeNotWriting")
-                        : t("next.system.volumeWriting", { rate: formatRate(volume.throughputBytesPerSecond) }),
+                        : t("next.system.volumeWriting", {
+                            rate: formatRate(volume.throughputBytesPerSecond),
+                          }),
                       volume.bufferLimitBytes == null
-                        ? t("next.system.volumeBuffered", { size: formatSize(volume.bufferedBytes) })
+                        ? t("next.system.volumeBuffered", {
+                            size: formatSize(volume.bufferedBytes),
+                          })
                         : t("next.system.volumeBufferedOf", {
                             size: formatSize(volume.bufferedBytes),
                             limit: formatSize(volume.bufferLimitBytes),
@@ -412,9 +503,13 @@ export function SystemInfoPage() {
                   >
                     <div className="flex min-w-0 flex-[1_1_260px] flex-col gap-1">
                       <span className="truncate text-[13.5px] font-medium tracking-[-0.005em] text-wv-fg">
-                        {volume.labels.join(" · ") || t("next.system.storageFallback")}
+                        {volume.labels.join(" · ") ||
+                          t("next.system.storageFallback")}
                       </span>
-                      <span title={volume.path} className="truncate font-wv-mono text-[11.5px] text-wv-faint">
+                      <span
+                        title={volume.path}
+                        className="truncate font-wv-mono text-[11.5px] text-wv-faint"
+                      >
                         {volume.path}
                       </span>
                     </div>
@@ -443,7 +538,10 @@ export function SystemInfoPage() {
 }
 
 /** The article cache's bytes in use and its hard limit, from the latest sample. */
-function articleCache(metrics: MetricsSnapshot | null): { bytes: number; limit: number } {
+function articleCache(metrics: MetricsSnapshot | null): {
+  bytes: number;
+  limit: number;
+} {
   return {
     bytes: metrics?.decodePendingBytes ?? 0,
     limit: metrics?.decodePressureHardLimitBytes ?? 0,
@@ -456,14 +554,20 @@ function articleCache(metrics: MetricsSnapshot | null): { bytes: number; limit: 
  */
 async function saveDiagnostics(failed: () => string): Promise<string | null> {
   try {
-    const response = await fetch(new URL("api/system/diagnostics", document.baseURI).href, {
-      headers: authHeaders(),
-      credentials: "same-origin",
-    });
+    const response = await fetch(
+      new URL("api/system/diagnostics", document.baseURI).href,
+      {
+        headers: authHeaders(),
+        credentials: "same-origin",
+      },
+    );
     if (!response.ok) {
       throw new Error(await readDownloadErrorMessage(response, failed()));
     }
-    await saveResponseAsDownload(response, `weaver-diagnostics-${Date.now()}.tar.zst`);
+    await saveResponseAsDownload(
+      response,
+      `weaver-diagnostics-${Date.now()}.tar.zst`,
+    );
     return null;
   } catch (caught) {
     return caught instanceof Error ? caught.message : failed();
@@ -490,8 +594,8 @@ const CopyReportButton = memo(function CopyReportButton({
       disabled={!info}
       onClick={() => {
         if (!info) return;
-        void copyText(reportText(info, cache.bytes, cache.limit)).then((taken) =>
-          taken ? onCopied() : onFailed(),
+        void copyText(reportText(info, cache.bytes, cache.limit)).then(
+          (taken) => (taken ? onCopied() : onFailed()),
         );
       }}
     >
@@ -506,7 +610,12 @@ const ArticleCacheRow = memo(function ArticleCacheRow() {
   const cache = articleCache(useContext(MetricsSnapshotContext));
   const cacheInUse =
     cache.limit > 0
-      ? t("next.system.usedOf", { used: formatSize(cache.bytes), total: formatSize(cache.limit) })
+      ? t("next.system.usedOf", {
+          used: formatSize(cache.bytes),
+          total: formatSize(cache.limit),
+        })
       : formatSize(cache.bytes);
-  return <KeyValueRow label={t("next.system.articleCache")} value={cacheInUse} />;
+  return (
+    <KeyValueRow label={t("next.system.articleCache")} value={cacheInUse} />
+  );
 });

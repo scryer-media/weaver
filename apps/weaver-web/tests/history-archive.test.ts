@@ -18,13 +18,21 @@ import {
 } from "../src/next/data/history-archive.ts";
 import { englishTranslate as t } from "./english-translate.ts";
 
-const result = (id: number, outcome: ArchiveHistoryAcceptOutcome): ArchiveHistoryAcceptResult => ({ id, outcome });
+const result = (
+  id: number,
+  outcome: ArchiveHistoryAcceptOutcome,
+): ArchiveHistoryAcceptResult => ({ id, outcome });
 
 const op = (
   action: HistoryRowOperation["action"],
   state: HistoryRowOperation["state"],
   extra: Partial<HistoryRowOperation> = {},
-): HistoryRowOperation => ({ action, state, locked: state !== "FAILED", ...extra });
+): HistoryRowOperation => ({
+  action,
+  state,
+  locked: state !== "FAILED",
+  ...extra,
+});
 
 const row = (
   status: string,
@@ -51,13 +59,25 @@ test("a row offers to archive it when finished, not archived, and free or last f
   // Already archived.
   assert.equal(rowArchives(row("COMPLETE", 1_767_225_600_000)), false);
   // An archive waiting or running.
-  assert.equal(rowArchives(row("COMPLETE", null, op("ARCHIVE", "QUEUED"))), false);
-  assert.equal(rowArchives(row("COMPLETE", null, op("ARCHIVE", "RUNNING"))), false);
+  assert.equal(
+    rowArchives(row("COMPLETE", null, op("ARCHIVE", "QUEUED"))),
+    false,
+  );
+  assert.equal(
+    rowArchives(row("COMPLETE", null, op("ARCHIVE", "RUNNING"))),
+    false,
+  );
   // An archive that failed is offered again.
-  assert.equal(rowArchives(row("COMPLETE", null, op("ARCHIVE", "FAILED"))), true);
+  assert.equal(
+    rowArchives(row("COMPLETE", null, op("ARCHIVE", "FAILED"))),
+    true,
+  );
   // Any delete, in any state.
   for (const state of ["QUEUED", "RUNNING", "FAILED"] as const) {
-    assert.equal(rowArchives(row("COMPLETE", null, op("DELETE", state))), false);
+    assert.equal(
+      rowArchives(row("COMPLETE", null, op("DELETE", state))),
+      false,
+    );
   }
 });
 
@@ -65,30 +85,54 @@ test("a row offers to delete it unless an operation locks it, as picking does", 
   assert.equal(rowDeletes(row("COMPLETE")), true);
   assert.equal(rowDeletes(row("FAILED", 1_767_225_600_000)), true);
   assert.equal(rowDeletes(row("COMPLETE", null, op("DELETE", "FAILED"))), true);
-  assert.equal(rowDeletes(row("COMPLETE", null, op("ARCHIVE", "FAILED"))), true);
-  assert.equal(rowDeletes(row("COMPLETE", null, op("DELETE", "RUNNING"))), false);
-  assert.equal(rowDeletes(row("COMPLETE", null, op("ARCHIVE", "QUEUED"))), false);
-  assert.equal(rowDeletes(row("COMPLETE", null, op("ARCHIVE", "RUNNING"))), false);
+  assert.equal(
+    rowDeletes(row("COMPLETE", null, op("ARCHIVE", "FAILED"))),
+    true,
+  );
+  assert.equal(
+    rowDeletes(row("COMPLETE", null, op("DELETE", "RUNNING"))),
+    false,
+  );
+  assert.equal(
+    rowDeletes(row("COMPLETE", null, op("ARCHIVE", "QUEUED"))),
+    false,
+  );
+  assert.equal(
+    rowDeletes(row("COMPLETE", null, op("ARCHIVE", "RUNNING"))),
+    false,
+  );
 });
 
 test("a failed archive reads as its outcome, with the server's message when there is one", () => {
   assert.equal(
-    describeFailedArchive(t, op("ARCHIVE", "FAILED", { archiveOutcome: "NOT_MANAGED" })),
+    describeFailedArchive(
+      t,
+      op("ARCHIVE", "FAILED", { archiveOutcome: "NOT_MANAGED" }),
+    ),
     "Not archived · Not managed by Weaver",
   );
   assert.equal(
-    describeFailedArchive(t, op("ARCHIVE", "FAILED", { archiveOutcome: "BUSY", errorMessage: "  " })),
+    describeFailedArchive(
+      t,
+      op("ARCHIVE", "FAILED", { archiveOutcome: "BUSY", errorMessage: "  " }),
+    ),
     "Not archived · Busy",
   );
   assert.equal(
     describeFailedArchive(
       t,
-      op("ARCHIVE", "FAILED", { archiveOutcome: "FAILED", errorMessage: "disk error" }),
+      op("ARCHIVE", "FAILED", {
+        archiveOutcome: "FAILED",
+        errorMessage: "disk error",
+      }),
     ),
     "Not archived · Failed: disk error",
   );
   // No outcome given reads as failed.
-  assert.equal(describeFailedArchive(t, op("ARCHIVE", "FAILED")), "Not archived · Failed");
+  assert.equal(
+    describeFailedArchive(t, op("ARCHIVE", "FAILED")),
+    "Not archived · Failed",
+  );
 });
 
 test("ids go out in calls of at most 100", () => {
@@ -106,14 +150,19 @@ test("a request sends every chunk in order and stops at the first refused", asyn
     sent.push(chunk);
     return { results: chunk.map((id) => result(id, "ACCEPTED")) };
   });
-  assert.deepEqual(sent.map((chunk) => chunk[0]), [1, 101, 201]);
+  assert.deepEqual(
+    sent.map((chunk) => chunk[0]),
+    [1, 101, 201],
+  );
   assert.equal(all.results.length, 250);
   assert.equal(all.refused, null);
 
   const calls: number[][] = [];
   const stopped = await requestArchiveHistory(ids, async (chunk) => {
     calls.push(chunk);
-    return calls.length === 2 ? { error: "refused" } : { results: chunk.map((id) => result(id, "ACCEPTED")) };
+    return calls.length === 2
+      ? { error: "refused" }
+      : { results: chunk.map((id) => result(id, "ACCEPTED")) };
   });
   assert.equal(calls.length, 2);
   assert.equal(stopped.results.length, 100);
@@ -126,15 +175,24 @@ test("every entry accepted reads as queued, not archived", () => {
     describeArchiveHistory(t, [result(1, "ACCEPTED"), result(2, "ACCEPTED")]),
     "Queued 2 entries to archive",
   );
-  assert.equal(describeArchiveHistory(t, [result(1, "ACCEPTED")]), "Queued 1 entry to archive");
+  assert.equal(
+    describeArchiveHistory(t, [result(1, "ACCEPTED")]),
+    "Queued 1 entry to archive",
+  );
 });
 
 test("entries already archived are counted quietly, not as refusals", () => {
   assert.equal(
-    describeArchiveHistory(t, [result(1, "ACCEPTED"), result(2, "ALREADY_ARCHIVED")]),
+    describeArchiveHistory(t, [
+      result(1, "ACCEPTED"),
+      result(2, "ALREADY_ARCHIVED"),
+    ]),
     "Queued 1 entry to archive · 1 already archived",
   );
-  assert.equal(describeArchiveHistory(t, [result(2, "ALREADY_ARCHIVED")]), "1 already archived");
+  assert.equal(
+    describeArchiveHistory(t, [result(2, "ALREADY_ARCHIVED")]),
+    "1 already archived",
+  );
 });
 
 test("refusals name a few entries, then how many more", () => {

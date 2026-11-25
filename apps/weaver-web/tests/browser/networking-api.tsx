@@ -4,7 +4,13 @@
 import { useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Link, MemoryRouter } from "react-router";
-import { cacheExchange, createClient, fetchExchange, subscriptionExchange, Provider } from "urql";
+import {
+  cacheExchange,
+  createClient,
+  fetchExchange,
+  subscriptionExchange,
+  Provider,
+} from "urql";
 import { createClient as createWSClient } from "graphql-ws";
 import { TranslateContext } from "@/lib/context/translate-context";
 import { translateDictionary } from "@/lib/i18n";
@@ -15,14 +21,86 @@ import { SearchRegistry } from "@/next/pages/settings/search";
 import { NextDataContext, type NextData } from "@/next/data/next-data";
 import "@/next/fonts.css";
 import "@/next/theme.css";
-const ws=createWSClient({url:`ws://${window.location.host}/graphql`});
-const client=createClient({url:"/graphql",preferGetMethod:false,requestPolicy:"cache-and-network",exchanges:[cacheExchange,fetchExchange,subscriptionExchange({forwardSubscription(operation){return {subscribe(sink){return {unsubscribe:ws.subscribe({...operation,query:operation.query!},sink)};}};}})]});
-const actionsRef={current:null};
-const torrentsOn={torrents:"on",torrentPresence:{available:true,enabled:true,jobs:false,running:false,windingDown:false,windDown:null}} as NextData;
-const setFlags=()=>{};
-const registry=new SearchRegistry();
-function Fixture(){
- const [host,setHost]=useState<HTMLDivElement|null>(null);
- return <main className="bg-wv-bg text-wv-primary" style={{padding:16,display:"grid",gap:16}}><nav style={{display:"flex",gap:16}}><Link to="/settings/networking/overview">Overview</Link><Link to="/settings/networking/egress">Egress interfaces</Link><Link to="/settings/networking/routes">Routes</Link></nav><div ref={setHost}/>{host&&<SettingsShellProvider search="" actionsRef={actionsRef} setFlags={setFlags} registry={registry} controlsHost={host}><NetworkingWorkspace proxies={()=>null} proxyEditor={()=>null}/></SettingsShellProvider>}</main>;
+const ws = createWSClient({ url: `ws://${window.location.host}/graphql` });
+const client = createClient({
+  url: "/graphql",
+  preferGetMethod: false,
+  requestPolicy: "cache-and-network",
+  exchanges: [
+    cacheExchange,
+    fetchExchange,
+    subscriptionExchange({
+      forwardSubscription(operation) {
+        return {
+          subscribe(sink) {
+            return {
+              unsubscribe: ws.subscribe(
+                { ...operation, query: operation.query! },
+                sink,
+              ),
+            };
+          },
+        };
+      },
+    }),
+  ],
+});
+const actionsRef = { current: null };
+const torrentsOn = {
+  torrents: "on",
+  torrentPresence: {
+    available: true,
+    enabled: true,
+    jobs: false,
+    running: false,
+    windingDown: false,
+    windDown: null,
+  },
+} as NextData;
+const setFlags = () => {};
+const registry = new SearchRegistry();
+function Fixture() {
+  const [host, setHost] = useState<HTMLDivElement | null>(null);
+  return (
+    <main
+      className="bg-wv-bg text-wv-primary"
+      style={{ padding: 16, display: "grid", gap: 16 }}
+    >
+      <nav style={{ display: "flex", gap: 16 }}>
+        <Link to="/settings/networking/overview">Overview</Link>
+        <Link to="/settings/networking/egress">Egress interfaces</Link>
+        <Link to="/settings/networking/routes">Routes</Link>
+      </nav>
+      <div ref={setHost} />
+      {host && (
+        <SettingsShellProvider
+          search=""
+          actionsRef={actionsRef}
+          setFlags={setFlags}
+          registry={registry}
+          controlsHost={host}
+        >
+          <NetworkingWorkspace proxies={() => null} proxyEditor={() => null} />
+        </SettingsShellProvider>
+      )}
+    </main>
+  );
 }
-createRoot(document.getElementById("root")!).render(<Provider value={client}><TranslateContext.Provider value={{t:(key,values)=>translateDictionary(en,key,values),uiLanguage:"eng",selectedLanguage:{code:"eng",label:"English"},setLanguagePreference:()=>{}}}><MemoryRouter initialEntries={["/settings/networking/egress"]}><NextDataContext.Provider value={torrentsOn}><Fixture/></NextDataContext.Provider></MemoryRouter></TranslateContext.Provider></Provider>);
+createRoot(document.getElementById("root")!).render(
+  <Provider value={client}>
+    <TranslateContext.Provider
+      value={{
+        t: (key, values) => translateDictionary(en, key, values),
+        uiLanguage: "eng",
+        selectedLanguage: { code: "eng", label: "English" },
+        setLanguagePreference: () => {},
+      }}
+    >
+      <MemoryRouter initialEntries={["/settings/networking/egress"]}>
+        <NextDataContext.Provider value={torrentsOn}>
+          <Fixture />
+        </NextDataContext.Provider>
+      </MemoryRouter>
+    </TranslateContext.Provider>
+  </Provider>,
+);

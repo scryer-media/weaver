@@ -21,7 +21,8 @@ import { Icon, type IconName } from "./icons";
  */
 
 /** The controls inside a row that keep their own clicks. */
-const ROW_CONTROLS = "a, button, input, label, select, textarea, [role=button], [role=checkbox], [role=switch]";
+const ROW_CONTROLS =
+  "a, button, input, label, select, textarea, [role=button], [role=checkbox], [role=switch]";
 
 export function ListRow({
   left,
@@ -184,10 +185,20 @@ export function FormRow({
           {label}
         </label>
         {help === undefined ? null : (
-          <div data-testid={helpTestId} className="text-[12px] leading-[1.45] text-pretty text-wv-muted">{help}</div>
+          <div
+            data-testid={helpTestId}
+            className="text-[12px] leading-[1.45] text-pretty text-wv-muted"
+          >
+            {help}
+          </div>
         )}
       </div>
-      <div className={cn("flex min-w-0 items-center gap-3", !stacked && "sm:justify-end")}>
+      <div
+        className={cn(
+          "flex min-w-0 items-center gap-3",
+          !stacked && "sm:justify-end",
+        )}
+      >
         {children}
       </div>
     </div>
@@ -362,7 +373,10 @@ export function RowIconButton({
         "flex size-7 flex-none items-center justify-center border border-transparent text-wv-muted",
         disabled
           ? "cursor-default opacity-40"
-          : cn("cursor-pointer hover:border-wv-control hover:bg-wv-button", danger ? "hover:text-wv-error" : "hover:text-wv-fg"),
+          : cn(
+              "cursor-pointer hover:border-wv-control hover:bg-wv-button",
+              danger ? "hover:text-wv-error" : "hover:text-wv-fg",
+            ),
       )}
     >
       <Icon name={icon} size={15} />

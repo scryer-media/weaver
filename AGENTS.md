@@ -158,6 +158,12 @@ Same result on a slow, loaded, shared runner as on an idle workstation. A test t
 - No deadlines or timeouts in tests, no upper bound on elapsed time. The runner bounds tests (`.config/nextest.toml`: flag at a minute, end at an hour).
 - Never fix a flake with a longer timeout, a sleep or a retry. Remove the race. If nothing observable exists to wait on, report the gap.
 
+## Web formatting
+
+- Everything under `apps/weaver-web` is formatted with Prettier. Run `npm run format` there before committing a web change.
+- `npm run format:check` runs in CI and in the release script. A failure blocks.
+- Never widen `.prettierignore` or add `prettier-ignore` comments to pass a change. A generated or byte-exact file is the only reason for an entry.
+
 ## Playwright e2e specs
 
 - Before changing anything under `e2e/playwright-weaver`, read `.agents/skills/e2e-playwright/SKILL.md`. It is binding: durable ids, waits tied to the item, no sleeps or timeouts, isolated fixtures, assertions on product behaviour.

@@ -366,6 +366,10 @@ async fn a_seed_let_go_while_nothing_was_wanted_is_dialled_once_a_piece_is_wante
             Some("not needed")
         );
     }
+    // The connect loop told the list we are finished before it waited, and
+    // with no candidate due it does not look again: the change itself has to
+    // tell the list we are not.
+    h.peers.set_finished(true);
     let now = tokio::time::Instant::now();
     assert!(h.peers.connect_next(now).is_none());
     h.set_piece_priorities([(h.piece(1), PiecePriority::Normal)])

@@ -143,6 +143,9 @@ jobs:
       - name: Lint
         working-directory: apps/weaver-web
         run: npm run lint
+      - name: Format check
+        working-directory: apps/weaver-web
+        run: npm run format:check
       - name: Build web app
         working-directory: apps/weaver-web
         run: npm run build
@@ -1092,10 +1095,10 @@ jobs:
 
   rust-package-linux-arm64-portable:
     name: rust-package-linux-arm64-portable
-    # Pull requests build the lighter rc profile on the hosted runner;
-    # releases build on the larger paid runner.
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04-arm' || 'linux_arm_release' }}
-    timeout-minutes: 90
+    # The standard hosted arm64 runner, for pull requests (the lighter rc
+    # profile) and for releases.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
     needs: [changes, verify-release-tag, web-build]
     if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.web-build.result == 'success' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
     env:
@@ -1476,7 +1479,7 @@ jobs:
   rust-package-darwin-arm64-portable:
     name: rust-package-darwin-arm64-portable
     runs-on: macos-26
-    timeout-minutes: 120
+    timeout-minutes: 240
     needs: [changes, verify-release-tag, web-build]
     if: ${{ always() && needs.changes.outputs.rust == 'true' && needs.web-build.result == 'success' && (github.event_name != 'push' || needs.verify-release-tag.result == 'success') }}
     env:
@@ -1486,6 +1489,8 @@ jobs:
       AWS_LC_SYS_CMAKE_BUILDER: "0"
       CFLAGS_aarch64_apple_darwin: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
       CXXFLAGS_aarch64_apple_darwin: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+      # Thin LTO, as on the Intel package.
+      CARGO_PROFILE_RELEASE_LTO: thin
       # Pull requests only prove the tree compiles and links, so they build
       # the fast ci-throwaway profile, as Scryer does. Tags build release.
       WEAVER_CARGO_PROFILE: ${{ github.event_name == 'pull_request' && 'ci-throwaway' || 'release' }}

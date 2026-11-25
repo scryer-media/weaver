@@ -9,7 +9,9 @@ function decodeAttachmentFilename(value: string): string | null {
   }
 }
 
-export function parseAttachmentFilename(contentDisposition: string | null): string | null {
+export function parseAttachmentFilename(
+  contentDisposition: string | null,
+): string | null {
   if (!contentDisposition) {
     return null;
   }
@@ -83,10 +85,14 @@ export function submitFormAsDownload(
   form.remove();
 }
 
-export async function saveResponseAsDownload(response: Response, fallbackFilename: string) {
+export async function saveResponseAsDownload(
+  response: Response,
+  fallbackFilename: string,
+) {
   const blob = await response.blob();
   const filename =
-    parseAttachmentFilename(response.headers.get("content-disposition")) ?? fallbackFilename;
+    parseAttachmentFilename(response.headers.get("content-disposition")) ??
+    fallbackFilename;
   saveBlobAsDownload(blob, filename);
   return filename;
 }
@@ -99,7 +105,7 @@ export async function readDownloadErrorMessage(
 
   if (contentType.includes("application/json")) {
     try {
-      const body = await response.json() as { error?: string | null };
+      const body = (await response.json()) as { error?: string | null };
       if (body.error?.trim()) {
         return body.error.trim();
       }

@@ -41,12 +41,26 @@ export function FlowPreview({
   note?: string;
   editing: FlowTarget | null;
   onEdit: (target: FlowTarget | null) => void;
-  proxyEditor: (id: number, onClose: () => void, onChanged: () => void) => ReactNode;
+  proxyEditor: (
+    id: number,
+    onClose: () => void,
+    onChanged: () => void,
+  ) => ReactNode;
   /** The small drawing's frame; by default a hairline box. */
   className?: string;
 }) {
   const t = useTranslate();
-  const { data, flow: whole, consumers: every, egresses, profiles, pools, action, busy, retry } = workspace;
+  const {
+    data,
+    flow: whole,
+    consumers: every,
+    egresses,
+    profiles,
+    pools,
+    action,
+    busy,
+    retry,
+  } = workspace;
   const [enlarged, setEnlarged] = useState(false);
   return (
     <>
@@ -55,7 +69,10 @@ export function FlowPreview({
         tabIndex={0}
         title={t("next.job.enlargeFlow")}
         aria-label={t("next.job.enlargeFlow")}
-        className={className ?? "min-w-0 cursor-zoom-in border border-wv-hairline hover:border-wv-control"}
+        className={
+          className ??
+          "min-w-0 cursor-zoom-in border border-wv-hairline hover:border-wv-control"
+        }
         onClick={() => setEnlarged(true)}
         onKeyDown={(event) => {
           if (event.key === "Enter" || event.key === " ") {
@@ -83,7 +100,9 @@ export function FlowPreview({
         width={2400}
         onDismiss={() => setEnlarged(false)}
         footer={
-          <SecondaryButton onClick={() => setEnlarged(false)}>{t("next.networking.close")}</SecondaryButton>
+          <SecondaryButton onClick={() => setEnlarged(false)}>
+            {t("next.networking.close")}
+          </SecondaryButton>
         }
       >
         <NetworkFlow

@@ -12,7 +12,9 @@ import {
   type ApplicationUpgradeStatus,
 } from "../src/next/features/updates/application-upgrade.ts";
 
-function run(overrides: Partial<ApplicationUpgradeRun> = {}): ApplicationUpgradeRun {
+function run(
+  overrides: Partial<ApplicationUpgradeRun> = {},
+): ApplicationUpgradeRun {
   return {
     runId: "run-1",
     status: "RUNNING",
@@ -29,7 +31,9 @@ function run(overrides: Partial<ApplicationUpgradeRun> = {}): ApplicationUpgrade
   };
 }
 
-function status(overrides: Partial<ApplicationUpgradeStatus> = {}): ApplicationUpgradeStatus {
+function status(
+  overrides: Partial<ApplicationUpgradeStatus> = {},
+): ApplicationUpgradeStatus {
   return {
     currentVersion: "9.8.6",
     updateVersion: "9.8.7",
@@ -49,7 +53,10 @@ test("GitHub server failures explain that the update can be tried again later", 
   for (const host of ["github.com", "release-assets.githubusercontent.com"]) {
     for (const code of [500, 502, 503, 504]) {
       const error = `failed to fetch v2 upgrade manifest: HTTP status server error (${code} Gateway Timeout) (https://${host}/releases/manifest.json)`;
-      assert.equal(upgradeFailureKey(error), "applicationUpgrade.githubUnavailable");
+      assert.equal(
+        upgradeFailureKey(error),
+        "applicationUpgrade.githubUnavailable",
+      );
     }
   }
 });
@@ -80,9 +87,14 @@ test("offers nothing before the first status arrives", () => {
 });
 
 test("offers nothing when there is no update, or the install is managed elsewhere", () => {
-  assert.equal(installableUpgrade(status({ updateAvailable: false })), undefined);
   assert.equal(
-    installableUpgrade(status({ eligible: false, eligibilityReason: "managed_by_docker" })),
+    installableUpgrade(status({ updateAvailable: false })),
+    undefined,
+  );
+  assert.equal(
+    installableUpgrade(
+      status({ eligible: false, eligibilityReason: "managed_by_docker" }),
+    ),
     undefined,
   );
 });
@@ -98,19 +110,32 @@ test("offers nothing on a partial status the server would refuse", () => {
 
 test("download progress waits for a known size", () => {
   assert.equal(downloadPercent(run()), undefined);
-  assert.equal(downloadPercent(run({ downloadedBytes: 50, totalBytes: 200 })), 25);
+  assert.equal(
+    downloadPercent(run({ downloadedBytes: 50, totalBytes: 200 })),
+    25,
+  );
   // A server that over-reports cannot push the bar past the end.
-  assert.equal(downloadPercent(run({ downloadedBytes: 300, totalBytes: 200 })), 100);
+  assert.equal(
+    downloadPercent(run({ downloadedBytes: 300, totalBytes: 200 })),
+    100,
+  );
 });
 
 test("a release notice goes to the installer only on an installation that upgrades itself", () => {
   assert.equal(upgradesInApp(status()), true);
-  assert.equal(upgradesInApp(status({ updateAvailable: false, activeRun: run() })), true);
+  assert.equal(
+    upgradesInApp(status({ updateAvailable: false, activeRun: run() })),
+    true,
+  );
   assert.equal(
     upgradesInApp(status({ eligible: false, managementOwner: "HOMEBREW" })),
     false,
     "a managed install upgrades through its manager, so the notice keeps the release page",
   );
   assert.equal(upgradesInApp(status({ updateAvailable: false })), false);
-  assert.equal(upgradesInApp(undefined), false, "unknown state keeps the release page");
+  assert.equal(
+    upgradesInApp(undefined),
+    false,
+    "unknown state keeps the release page",
+  );
 });

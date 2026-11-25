@@ -42,8 +42,11 @@ export function Menu({
       // The trigger lives outside the menu, so a pointerdown on it would both
       // dismiss here and toggle there, leaving the menu shut on every click.
       // Ignoring the trigger's own subtree keeps the toggle authoritative.
-      if (node && !node.contains(event.target as Node)
-        && !(event.target as HTMLElement).closest?.("[data-wv-menu-trigger]")) {
+      if (
+        node &&
+        !node.contains(event.target as Node) &&
+        !(event.target as HTMLElement).closest?.("[data-wv-menu-trigger]")
+      ) {
         onDismiss();
       }
     };
@@ -151,7 +154,10 @@ export function MenuCheckItem({
     >
       <span
         aria-hidden="true"
-        className={cn("size-3.5 flex-none border", checked ? "!border-wv-accent bg-wv-accent" : "!border-wv-faint")}
+        className={cn(
+          "size-3.5 flex-none border",
+          checked ? "!border-wv-accent bg-wv-accent" : "!border-wv-faint",
+        )}
       />
       {children}
     </button>
