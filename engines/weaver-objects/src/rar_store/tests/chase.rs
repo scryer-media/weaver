@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use unrar_rs::KdfCache;
-use weaver_graph::{ByteRange, Provenance};
+use weaver_graph::{ByteRange, Object, Placement, Provenance};
 
 use super::PASSWORD;
 use super::mixed::packed;
@@ -380,4 +380,79 @@ fn packed_data_of_a_set_held_out_of_place_reaches_the_shelf_only_after_its_membe
     // retracted: what stood held stood.
     assert!(lagged > 0);
     assert_eq!((cuts, retracts), (0, 0));
+}
+
+// A made member's packed data in a volume the layout laid, and then, laid
+// afresh short of it, dropped while the store still holds the volume: the
+// piece is the envelope's, where capture put it, so the store places it
+// there, as the run reads it, and not as held bytes.
+#[test]
+fn a_made_piece_in_a_volume_the_layout_dropped_is_placed_in_its_envelope() {
+    let mut options = Options::new(Version::Rar4);
+    options.split = Some(6_000);
+    let real = write(&two_compressed(Version::Rar4), &options);
+    let count = real.len();
+    let mut dropped = 0;
+    for swap in 1..count - 1 {
+        let posted: Vec<(String, Vec<u8>)> = (0..count)
+            .map(|k| match k {
+                _ if k == swap => swap + 1,
+                _ if k == swap + 1 => swap,
+                _ => k,
+            })
+            .enumerate()
+            .map(|(k, r)| (format!("alpha.part{}.rar", k + 1), real[r].clone()))
+            .collect();
+        let mut owner = Owner::new(store(), posted);
+        for volume in 0..count {
+            let length = owner.volumes[volume].1.len() as u64;
+            let mut start = 0;
+            while start < length {
+                let end = (start + 512).min(length);
+                owner.deliver(volume, ByteRange::new(start, end));
+                dropped += placed_in_envelope(&owner, &format!("swap {swap}"));
+                start = end;
+            }
+        }
+        for volume in 0..count {
+            owner.close(volume);
+            dropped += placed_in_envelope(&owner, &format!("swap {swap} close"));
+        }
+    }
+    assert!(
+        dropped > 0,
+        "no layout dropped a volume a made piece lies in"
+    );
+}
+
+// Every made piece in a volume the store holds past the layout is placed
+// whole in its envelope; how many there were.
+fn placed_in_envelope(owner: &Owner, step: &str) -> usize {
+    let laid = owner.object.laid_through().unwrap_or(0);
+    let mut pieces = 0;
+    for entry in owner.object.entries.iter().filter(|entry| entry.made) {
+        for piece in &entry.pieces {
+            if piece.volume.0 < laid || !owner.object.volumes.contains_key(&piece.volume) {
+                continue;
+            }
+            let mut placements = Vec::new();
+            owner
+                .object
+                .locate(piece.volume, piece.data, &mut placements);
+            let mut at = piece.data.start;
+            for placement in &placements {
+                let Placement::Envelope { envelope, range } = placement else {
+                    panic!(
+                        "{step}: {:?} of {:?}: {placements:?}",
+                        piece.data, piece.volume
+                    );
+                };
+                assert_eq!((*envelope, range.start), (piece.volume.0, at), "{step}");
+                at = range.end;
+            }
+            assert_eq!(at, piece.data.end, "{step}");
+            pieces += 1;
+        }
+    }
+    pieces
 }

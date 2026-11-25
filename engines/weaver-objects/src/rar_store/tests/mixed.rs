@@ -712,6 +712,136 @@ fn a_nameless_rar4_volume_the_run_reads_stays_where_it_was_laid() {
     }
 }
 
+// A RAR4 set, a stored file then a compressed one, whose two neighbouring
+// volumes, only the compressed member's packed data in each, are posted
+// under each other's names: the names hold each on trust where the other
+// belongs, and the layout lays the member across them. A repair then names
+// them rightly: each goes back, as the engine's volumes do, the member made
+// from them is retracted, and once each is held at its own place the run
+// makes it whole.
+#[test]
+fn a_volume_only_made_pieces_lie_in_named_elsewhere_goes_back_and_is_made_again() {
+    let mut options = Options::new(Version::Rar4);
+    options.split = Some(6_000);
+    let volumes = write(&stored_then_made(), &options);
+    let made = made_only(&volumes);
+    let (a, b) = (made[1], made[2]);
+    assert_eq!(b, a + 1, "{made:?}");
+    let mut posted = volumes.clone();
+    posted.swap(a, b);
+    let mut owner = Owner::named(store(), posted);
+    owner.whole(4096);
+    let notes = owner
+        .object
+        .entries
+        .iter()
+        .position(|entry| entry.made && entry.name == "notes.nfo")
+        .expect("the compressed member is laid");
+    let laid_in = |owner: &Owner| -> Vec<u32> {
+        owner.object.entries.get(notes).map_or(Vec::new(), |entry| {
+            entry.pieces.iter().map(|piece| piece.volume.0).collect()
+        })
+    };
+    for volume in [a, b] {
+        assert!(laid_in(&owner).contains(&(volume as u32)), "{volume}");
+    }
+    owner.said.clear();
+
+    // The repair's names: each volume is misplaced where it is held.
+    owner.renamed(a, &format!("alpha.part{}.rar", b + 1));
+    owner.renamed(b, &format!("alpha.part{}.rar", a + 1));
+    for volume in [a, b] {
+        let volume = VolumeIndex(volume as u32);
+        assert!(
+            owner.said.contains(&Emit::GiveBack(volume)),
+            "{:?}",
+            owner.said
+        );
+        assert!(!owner.object.volumes.contains_key(&volume));
+    }
+    assert!(
+        owner.said.contains(&Emit::Retract(MemberId(notes as u32))),
+        "{:?}",
+        owner.said
+    );
+    // Laid again only as far as the volumes still held, short of them.
+    assert!(
+        laid_in(&owner).iter().all(|&volume| (volume as usize) < a),
+        "{:?}",
+        laid_in(&owner)
+    );
+
+    // Each held again at its own place: the member is laid and announced
+    // anew, and the run makes it whole.
+    owner.exchanged(a, b);
+    for volume in [a, b] {
+        owner.close(volume);
+    }
+    assert_eq!(owner.object.volumes.len(), volumes.len());
+    assert!(owner.run().is_empty());
+    for (name, bytes) in unrar(&volumes, None) {
+        let got = owner.member(&name);
+        assert!(got.closed && got.bytes == bytes, "{name}");
+    }
+}
+
+// Its twin: a volume a stored member's bytes were streamed from, named
+// elsewhere, stays. Its bytes went to that member's file, and the tree,
+// handed it, could only refuse the member.
+#[test]
+fn a_volume_a_stored_member_streamed_from_named_elsewhere_stays() {
+    let mut options = Options::new(Version::Rar4);
+    options.split = Some(6_000);
+    let volumes = write(&stored_then_made(), &options);
+    let made = made_only(&volumes);
+    // The stored file's last volume, past the first.
+    let streamed = made[0] - 1;
+    assert!(streamed > 0, "{made:?}");
+    let mut owner = Owner::named(store(), volumes.clone());
+    owner.whole(4096);
+    owner.said.clear();
+    owner.renamed(streamed, &format!("alpha.part{}.rar", streamed + 2));
+    let volume = VolumeIndex(streamed as u32);
+    // Misplaced by the name, two places on, as the made-only volumes were:
+    // only its bytes, gone to the stored member, keep it.
+    let found = &owner.object.volumes[&volume];
+    assert!(!found.stated().is_some_and(claim::states_position) && found.ordered() != Some(volume));
+    assert!(
+        !owner.said.contains(&Emit::GiveBack(volume)),
+        "{:?}",
+        owner.said
+    );
+    assert!(owner.object.volumes.contains_key(&volume));
+    assert!(owner.object.give_back(volume).is_none());
+    assert!(owner.run().is_empty());
+    for (name, bytes) in unrar(&volumes, None) {
+        let got = owner.member(&name);
+        assert!(got.closed && got.bytes == bytes, "{name}");
+    }
+}
+
+// A stored file, then a compressed one that ends the set: a retraction of
+// the compressed one reaches no stored member after it.
+fn stored_then_made() -> Vec<Item> {
+    let (notes, _) = packed(Version::Rar4, "notes.nfo");
+    vec![Item::File("alpha.mkv", payload(1, 10_000)), notes]
+}
+
+// The volumes of a set no stored member's data lies in, in order.
+fn made_only(volumes: &[Vec<u8>]) -> Vec<usize> {
+    volumes
+        .iter()
+        .enumerate()
+        .filter(|(_, bytes)| {
+            facts(bytes)
+                .members
+                .iter()
+                .all(|member| member.compression_method != 0 || member.data_size == 0)
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
 // A repaired header that names the compressed member otherwise than the
 // bytes first posted did: the store renames it where it stands, retracting
 // nothing, and the run then makes it under its repaired name. Plain and enciphered headers. The

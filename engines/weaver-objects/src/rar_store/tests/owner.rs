@@ -437,6 +437,64 @@ impl Owner {
         }
     }
 
+    // A volume named anew, as a repair's recovery set names it, and what
+    // the store says of it applied as the tree applies it.
+    pub fn renamed(&mut self, volume: usize, name: &str) {
+        self.doing = ("rename", volume);
+        name.clone_into(&mut self.volumes[volume].0);
+        let mut out = Vec::new();
+        self.object
+            .renamed(VolumeIndex(volume as u32), name, &mut out);
+        self.apply(out);
+        self.settle();
+    }
+
+    // Two volumes the store said it gives back, each taken again at the
+    // other's place with what was parsed of it, as the tree parks a volume
+    // and holds it where its name now places it: what came for each, what
+    // its envelope kept and what the tree holds of it move with it.
+    pub fn exchanged(&mut self, a: usize, b: usize) {
+        let (one, two) = (VolumeIndex(a as u32), VolumeIndex(b as u32));
+        let mut parked = Vec::new();
+        for volume in [one, two] {
+            parked.push(self.object.give_back(volume).expect("a volume going back"));
+        }
+        self.volumes.swap(a, b);
+        self.bound.swap(a, b);
+        let mut delivered = BTreeMap::new();
+        let mut shelves = BTreeMap::new();
+        for (from, to) in [(a, b), (b, a)] {
+            if let Some(coverage) = self.delivered.remove(&(from as u32)) {
+                delivered.insert(to as u32, coverage);
+            }
+            if let Some(shelf) = self.shelves.remove(&(from as u32)) {
+                shelves.insert(to as u32, shelf);
+            }
+        }
+        self.delivered.extend(delivered);
+        self.shelves.extend(shelves);
+        for (volume, ..) in &mut self.held {
+            *volume = match *volume {
+                held if held == one => two,
+                held if held == two => one,
+                held => held,
+            };
+        }
+        for (volume, carried) in [two, one].into_iter().zip(parked) {
+            let (name, bytes) = &self.volumes[volume.0 as usize];
+            let front = &bytes[..bytes.len().min(FRONT)];
+            assert_eq!(
+                self.object.claim(name, front.into(), None),
+                vec![volume],
+                "claims {name}"
+            );
+            let name = name.clone();
+            self.object.adopt(volume, &name, &[], None, carried);
+        }
+        self.doing = ("exchange", a);
+        self.settle();
+    }
+
     // Nothing more will arrive, and every member stands whole and placed.
     pub fn quiet(&mut self) {
         struct Whole;
