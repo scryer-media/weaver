@@ -1,0 +1,36 @@
+apiVersion: v2
+name: weaver
+description: Weaver, a self-hosted Usenet and torrent download server.
+type: application
+# Both follow Weaver's own version: a release bumps them with the workspace.
+version: 0.17.5
+appVersion: "0.17.5"
+kubeVersion: ">=1.27.0-0"
+home: https://www.scryer.media/weaver/
+icon: https://raw.githubusercontent.com/scryer-media/weaver/main/docs/img/weaver-lockup-on-light.svg
+sources:
+  - https://github.com/scryer-media/weaver
+keywords:
+  - usenet
+  - nzb
+  - torrent
+  - downloader
+  - par2
+maintainers:
+  - name: scryer-media
+    url: https://github.com/scryer-media
+annotations:
+  artifacthub.io/license: GPL-3.0-or-later
+  artifacthub.io/links: |
+    - name: Source
+      url: https://github.com/scryer-media/weaver
+    - name: Website
+      url: https://www.scryer.media/weaver/
+    - name: Security policy
+      url: https://github.com/scryer-media/weaver/blob/main/SECURITY.md
+  artifacthub.io/images: |
+    - name: weaver
+      image: ghcr.io/scryer-media/weaver:0.17.5
+      platforms:
+        - linux/amd64
+        - linux/arm64

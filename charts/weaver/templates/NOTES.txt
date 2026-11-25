@@ -1,0 +1,52 @@
+Weaver {{ .Chart.AppVersion }} is installed as {{ include "weaver.fullname" . }} in {{ .Release.Namespace }}.
+
+Open the web UI:
+{{- if .Values.ingress.enabled }}
+{{- range .Values.ingress.hosts }}
+  http{{ if $.Values.ingress.tls }}s{{ end }}://{{ . }}{{ include "weaver.basePath" $ }}/
+{{- end }}
+{{- else if .Values.httpRoute.enabled }}
+{{- range .Values.httpRoute.hostnames }}
+  https://{{ . }}{{ include "weaver.basePath" $ }}/
+{{- end }}
+{{- else }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "weaver.fullname" . }} {{ .Values.service.port }}
+  then http://localhost:{{ .Values.service.port }}{{ include "weaver.basePath" . }}/
+{{- end }}
+
+{{- if not .Values.bootstrapLogin.existingSecret }}
+
+First start: the setup page asks for a one-time code. Weaver prints it in its log:
+  kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "weaver.fullname" . }} | grep "one-time setup code"
+{{- end }}
+
+{{- if eq .Values.persistence.downloads.type "emptyDir" }}
+
+WARNING: downloads are on an emptyDir. Everything under /downloads is lost when
+the pod goes. Set persistence.downloads.type to pvc, existingClaim, hostPath or
+nfs to keep them.
+{{- end }}
+
+{{- if eq .Values.persistence.downloads.type "hostPath" }}
+
+hostPath downloads need a namespace whose Pod Security level is privileged;
+restricted and baseline refuse the pod.
+{{- end }}
+
+{{- if and (not .Values.persistence.config.existingClaim) .Values.persistence.config.retain }}
+
+The config claim {{ include "weaver.fullname" . }}-config is kept on uninstall.
+Delete it yourself to remove the database.
+{{- end }}
+
+{{- if and (eq .Values.persistence.downloads.type "pvc") .Values.persistence.downloads.retain }}
+
+The downloads claim {{ include "weaver.fullname" . }}-downloads is kept on uninstall.
+Delete it yourself to remove the downloads.
+{{- end }}
+
+{{- if .Values.torrents.enabled }}
+
+Torrents are available. Turn them on in Settings, and set the listen port there
+to {{ .Values.torrents.port }}, the port of {{ include "weaver.fullname" . }}-torrent.
+{{- end }}

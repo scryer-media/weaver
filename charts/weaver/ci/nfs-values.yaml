@@ -1,0 +1,6 @@
+persistence:
+  downloads:
+    type: nfs
+    nfs:
+      server: nfs.example.test
+      path: /export/downloads
