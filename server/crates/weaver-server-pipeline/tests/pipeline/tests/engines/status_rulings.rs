@@ -321,6 +321,66 @@ async fn an_sfv_names_the_pieces_whose_crcs_its_unanswered_entries_state() {
     assert!(named[0].1 == first && named[1].1 == second);
 }
 
+// The same pieces under the entry names the fixture's listing gives them,
+// `.7z.001` and `.7z.002`, with their CRC32s. A name the listing gives is a
+// name, as a PAR2 name is: the pieces become the volumes of a split 7z
+// archive, which is not a file people open, and their bytes open as no
+// archive. So the job ends as the same posts under those names would, not
+// as its twin under hex names: the whole `.mkv` beside them is the one
+// usable file.
+#[tokio::test]
+async fn an_sfv_names_the_pieces_split_archive_volumes_and_the_job_ends_as_under_those_names() {
+    let first = payload(ARTICLE, 51);
+    let second = payload(2 * ARTICLE + 3, 52);
+    let posts = |names: Option<[&str; 2]>, listed: bool| {
+        let [one, two] = names.unwrap_or([FIRST_PIECE, SECOND_PIECE]);
+        let mut posts = vec![
+            Post::plain(one, first.clone()),
+            Post::plain(two, second.clone()),
+            Post::plain("feature.mkv", payload(2 * ARTICLE, 53)),
+        ];
+        if listed {
+            posts.push(listing(
+                "silver.horizon.sfv",
+                &[
+                    ("silver.horizon.7z.001", crc(&first)),
+                    ("silver.horizon.7z.002", crc(&second)),
+                ],
+            ));
+        }
+        Scenario::new(posts)
+    };
+    let graph = run(&posts(None, true)).await;
+    let mut named: Vec<String> = graph
+        .files
+        .keys()
+        .map(|path| path.rsplit('/').next().unwrap().to_owned())
+        .collect();
+    named.sort();
+    assert!(
+        named.contains(&"feature.mkv".to_owned())
+            && !named
+                .iter()
+                .any(|name| name == FIRST_PIECE || name == SECOND_PIECE),
+        "{named:?}"
+    );
+    let hex = run(&posts(None, false)).await;
+    assert_eq!(hex.status, Some(JobStatus::Complete), "{:?}", hex.failure);
+    let posted_so = run(&posts(
+        Some(["silver.horizon.7z.001", "silver.horizon.7z.002"]),
+        false,
+    ))
+    .await;
+    assert_eq!(
+        graph.status,
+        Some(JobStatus::Partial),
+        "{:?}",
+        graph.failure
+    );
+    assert_eq!(graph.status, posted_so.status, "{:?}", posted_so.failure);
+    assert_eq!(graph.failure_kind, posted_so.failure_kind);
+}
+
 // An SFV that names no file vouches for nothing: a piece lost whole beside
 // it shortens the job as it does with no SFV at all. Nothing whole is of a
 // type people open, so the job fails; a whole `.mkv` beside the pieces

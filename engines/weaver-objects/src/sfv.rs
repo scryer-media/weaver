@@ -46,7 +46,9 @@ pub struct Sfv {
     // What the source's checksums said of each member asked for, by
     // member id, under the name it had then. Kept with the text, so a
     // listing restored, or back from being out of its node, asks no
-    // member again: one entry per member it asked for.
+    // member again. Bounded by the members asked for, at most the members
+    // of its node, each once: one fixed record of a name, a length and a
+    // CRC32.
     checked: BTreeMap<u32, Checked>,
 }
 
@@ -337,10 +339,9 @@ impl Recovery for Sfv {
 
     fn verdicts(&self, _member: MemberId, _out: &mut Vec<SliceVerdict>) {}
 
-    // The whole members it names, for a note, not asked before this run.
-    // The whole members it names, for a note, and while an entry names no
-    // member, the whole members no entry names and no set that stands
-    // covers, for a name: each once.
+    // The whole members no set that stands covers: those it names, for a
+    // note, and while an entry names no member, those no entry names, for
+    // a name. Each once.
     fn evidence(
         &self,
         namespace: &Namespace,
@@ -359,7 +360,10 @@ impl Recovery for Sfv {
                 if named {
                     answered.insert(key);
                 }
-                if !member.is_whole() || self.checked.contains_key(&member.id.0) {
+                if !member.is_whole()
+                    || self.checked.contains_key(&member.id.0)
+                    || covered(member.id)
+                {
                     continue;
                 }
                 if named {
@@ -369,7 +373,7 @@ impl Recovery for Sfv {
                 }
             }
             if answered.len() < listed.len() {
-                out.extend(unnamed.into_iter().filter(|member| !covered(*member)));
+                out.extend(unnamed);
             }
         });
     }

@@ -260,12 +260,11 @@ async fn a_restored_job_notes_the_file_as_the_run_without_a_restart() {
     assert_eq!(noted, notes(&whole));
 }
 
-// A file a PAR2 set covers is sealed only once the set has ruled, when the
-// job is quiet; the listing asks for it as soon as it is whole, which is
-// before that, so the source still keeps its checksums and the listing that
-// disagrees with it notes it. The job ends as PAR2 rules it.
+// A file a PAR2 set covers is not asked for, so a listing that disagrees
+// with it notes nothing: PAR2 says what became of it. The job ends as PAR2
+// rules it.
 #[tokio::test]
-async fn a_file_a_par2_set_covers_is_noted_as_the_listing_asked_before_the_seal() {
+async fn a_file_a_par2_set_covers_is_not_noted() {
     let lantern = payload(3 * ARTICLE, 37);
     let posts = |listed: bool| {
         let mut posts = vec![Post::plain("lantern.bin", lantern.clone())];
@@ -280,10 +279,7 @@ async fn a_file_a_par2_set_covers_is_noted_as_the_listing_asked_before_the_seal(
     };
     let graph = run(&posts(true)).await;
     assert!(graph.completed(), "{:?}", graph.failure);
-    assert_eq!(
-        notes(&graph),
-        ["lantern.bin does not match its CRC32 in lantern.sfv"]
-    );
+    assert_eq!(notes(&graph), Vec::<String>::new());
     assert_twin(&graph, &run(&posts(false)).await);
 }
 

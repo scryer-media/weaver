@@ -143,6 +143,27 @@ fn a_listing_asks_once_for_each_whole_file_it_names_and_disputes_one_that_disagr
     assert_eq!(disputed(&job), vec![two_id]);
 }
 
+// A file it names that a standing set covers is not asked for: that set
+// says what became of it, and the listing notes nothing.
+#[test]
+fn a_listing_asks_for_no_file_a_standing_set_covers() {
+    let one = payload(15, 2000);
+    let two = payload(16, 2000);
+    let mut job = job(&sfv_text(&[
+        ("one.bin", crc32(&one) ^ 1),
+        ("two.bin", crc32(&two)),
+    ]));
+    let one_id = whole(&mut job, "one.bin", &one);
+    let two_id = whole(&mut job, "two.bin", &two);
+    let mut out = Vec::new();
+    job.object
+        .evidence(&job.namespace, &|member| member == one_id, &mut out);
+    assert_eq!(out, vec![two_id]);
+    job.object
+        .evidenced(&job.namespace, two_id, &checksums(&two, 700));
+    assert_eq!(disputed(&job), Vec::<MemberId>::new());
+}
+
 // Checksums that do not reach every byte, or one the source did not
 // verify, say nothing: a file whose bytes were never checked whole is not
 // disputed.
