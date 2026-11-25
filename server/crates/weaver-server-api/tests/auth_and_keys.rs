@@ -590,3 +590,39 @@ async fn control_scope_can_submit() {
         "QUEUED"
     );
 }
+
+#[tokio::test]
+async fn caller_scope_names_the_scope_the_request_runs_with() {
+    let h = TestHarness::new().await;
+    for (scope, expected) in [
+        (CallerScope::Read, "READ"),
+        (CallerScope::Control, "CONTROL"),
+        (CallerScope::Admin, "ADMIN"),
+        (CallerScope::Local, "ADMIN"),
+    ] {
+        let resp = h.execute_as("{ callerScope }", scope).await;
+        assert_no_errors(&resp);
+        assert_eq!(
+            response_data(&resp)["callerScope"],
+            serde_json::json!(expected),
+            "{scope:?}"
+        );
+    }
+
+    // A script run's token reaches only its allowlist.
+    let resp = h
+        .execute_as("{ callerScope }", CallerScope::ScriptRun)
+        .await;
+    assert_has_errors(&resp);
+    assert_eq!(
+        resp.errors[0]
+            .extensions
+            .as_ref()
+            .and_then(|extensions| extensions.get("code"))
+            .and_then(|value| match value {
+                Value::String(code) => Some(code.as_str()),
+                _ => None,
+            }),
+        Some("NOT_ALLOWED_FOR_SCRIPT_RUN")
+    );
+}

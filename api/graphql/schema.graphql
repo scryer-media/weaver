@@ -3695,6 +3695,12 @@ type QueryRoot {
 	speedTestRuns: [SpeedTestRun!]!
 	speedTestRun(id: Int!): SpeedTestRun
 	"""
+	The scope this request runs with, so a client can tell what it may do
+	before it tries. A caller trusted without a credential (loopback or a
+	trusted network) is `ADMIN`. Read from the request, never the database.
+	"""
+	callerScope: ApiKeyScope!
+	"""
 	Admin-facing auth status moved to query semantics.
 	"""
 	adminLoginStatus: LoginStatusResult!

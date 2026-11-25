@@ -10,6 +10,22 @@ pub(crate) struct AuthQuery;
 
 #[Object]
 impl AuthQuery {
+    /// The scope this request runs with, so a client can tell what it may do
+    /// before it tries. A caller trusted without a credential (loopback or a
+    /// trusted network) is `ADMIN`. Read from the request, never the database.
+    #[graphql(guard = "ReadGuard")]
+    async fn caller_scope(&self, ctx: &Context<'_>) -> Result<crate::auth::types::ApiKeyScope> {
+        use crate::auth::types::ApiKeyScope;
+        use weaver_server_core::auth::CallerScope;
+        Ok(match ctx.data::<CallerScope>()? {
+            CallerScope::Local | CallerScope::Admin => ApiKeyScope::Admin,
+            CallerScope::Control => ApiKeyScope::Control,
+            // A script run reaches only its allowlist, which leaves this field
+            // out; it is named here so the match stays whole.
+            CallerScope::Read | CallerScope::ScriptRun => ApiKeyScope::Read,
+        })
+    }
+
     /// Admin-facing auth status moved to query semantics.
     #[graphql(guard = "AdminGuard")]
     async fn admin_login_status(
