@@ -173,21 +173,25 @@ impl Tree {
             recovery.verdicts(member.id, &mut verdicts);
             verdicts.contains(&SliceVerdict::Damaged)
         });
-        let extracted_whole = |member: MemberId| {
-            self.child_of(node, member)
-                .and_then(|(child, _)| self.namespace(child))
-                .is_some_and(|below| {
-                    !below.is_empty()
-                        && below
-                            .members()
-                            .all(|member| member.is_whole() && member.crc32.is_some())
-                })
-        };
         let mut any = false;
         disputed.all(|member| {
             any = true;
-            extracted_whole(member.id)
+            self.whole_below(node, member.id)
         }) && any
+    }
+
+    // What the member of the namespace at `node` was read as stands whole
+    // below it: an object came out of it, and every member that object
+    // delivered is whole against the CRC its own headers state.
+    pub fn whole_below(&self, node: NodeId, member: MemberId) -> bool {
+        self.child_of(node, member)
+            .and_then(|(child, _)| self.namespace(child))
+            .is_some_and(|below| {
+                !below.is_empty()
+                    && below
+                        .members()
+                        .all(|member| member.is_whole() && member.crc32.is_some())
+            })
     }
 
     // The member's damaged ranges past what every recovery object that

@@ -1144,11 +1144,18 @@ impl NamespaceWriter {
         }
         // An SFV below the root whose namespace came out of volumes a
         // recovery set above proved makes no claim of damage: every byte of
-        // what it lists is what was posted.
-        let found = if tree.kind(set) == Some(Kind::Sfv) && tree.vouched_above(node) {
+        // what it lists is what was posted. Nor does it claim a member it
+        // disputes that stands whole below it: what was read out of the
+        // member answered its own checksums.
+        let found = if tree.kind(set) != Some(Kind::Sfv) {
+            found
+        } else if tree.vouched_above(node) {
             Vec::new()
         } else {
             found
+                .into_iter()
+                .filter(|(member, _)| !tree.whole_below(node, *member))
+                .collect()
         };
         self.tail = Some(ReturnTail {
             set,
