@@ -3244,10 +3244,14 @@ fn a_retraction_discards_the_leaf_and_keeps_its_name_for_what_comes_back() {
     let mut job = Job::new(PLENTY);
     let (member, child) = bound_store(&mut job);
     job.send(member, 12, b"RETRACT", Provenance::Fresh);
-    assert!(job.out.contains(&Effect::Retracted {
-        node: child,
-        member: MemberId(0),
-    }));
+    assert!(job.out.iter().any(|effect| matches!(
+        effect,
+        Effect::Retracted {
+            node,
+            member: MemberId(0),
+            ..
+        } if *node == child
+    )));
     assert!(job.dir.path().join("inner.bin").exists());
     job.commit();
     assert!(!job.dir.path().join("inner.bin").exists());

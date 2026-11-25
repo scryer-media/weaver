@@ -111,6 +111,7 @@ pub(crate) mod pipeline {
             mod hybrid_loan_tests;
             mod loan_tests;
             mod quiet_face_tests;
+            mod relaid_again_tests;
             mod verification_tests;
         }
         pub(crate) mod leaf {

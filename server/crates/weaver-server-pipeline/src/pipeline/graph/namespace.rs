@@ -489,6 +489,16 @@ pub struct NamespaceWriter {
     // Members an object retracted of its own accord since the job last
     // asked: one its run makes invalidates that run (`GraphJob::step_runs`).
     retracted: Vec<(NodeId, MemberId)>,
+    // The files of members retracted in a batch, discarded as they were
+    // retracted and read from where they wait to be removed, by what had
+    // arrived in each: a request the same say made to have the object's
+    // volumes said again reads its posted bytes back from them. Each goes
+    // once that request is answered, or as its batch ends when the say made
+    // none; one whose request waits for a replay of the same object goes
+    // when that replay ends.
+    retracting: Vec<Retracting>,
+    // The batch being applied, and the last given out.
+    batch: (u64, u64),
     // Ranges of root members given back that came and are no longer in
     // hand, since the job last asked: the job fetches them again.
     unkept: Vec<(MemberId, ByteRange)>,
@@ -580,6 +590,17 @@ pub(super) struct HeldWant {
     pub(super) absent: BTreeSet<MemberId>,
 }
 
+// A member's file retracted in a batch: where it waits in `leaving`, under
+// which name, and what of it had arrived.
+struct Retracting {
+    node: NodeId,
+    member: MemberId,
+    written: Coverage,
+    leaving: usize,
+    name: String,
+    batch: u64,
+}
+
 // Bytes of `member` of `node` at `range`, read just now from the file
 // `file`.
 #[derive(Clone, Copy, Debug)]
@@ -656,6 +677,8 @@ impl NamespaceWriter {
             given_back: Vec::new(),
             run_speaking: None,
             retracted: Vec::new(),
+            retracting: Vec::new(),
+            batch: (0, 0),
             unkept: Vec::new(),
             given_up: BTreeSet::new(),
             run_refusals: BTreeMap::new(),
@@ -1521,13 +1544,65 @@ impl NamespaceWriter {
         // on from itself, as the hand-over reads the file around them.
         let depth = self.reached_now.len();
         self.reached_now.extend(end.reached.iter().copied());
+        self.batch.1 += 1;
+        let batch = self.batch.1;
+        let outer = std::mem::replace(&mut self.batch.0, batch);
         let applied = effects.drain(..).try_for_each(|effect| {
             self.apply(tree, builder, segments, effect, write, out)?;
             self.apply_unnamed(tree, builder, segments, out)
         });
         let finished = applied.and_then(|()| self.finish_batch(tree, builder, segments, end, out));
+        self.batch.0 = outer;
         self.reached_now.truncate(depth);
+        // The outermost batch ends the step: nothing it or any pass before
+        // it retracted is read past it but for a request still held.
+        self.retracted_end((outer != 0).then_some(batch));
         finished
+    }
+
+    // The batch ends, or with `None` the step: the files it retracted go,
+    // but for those whose say asked for its object's volumes again in a
+    // request still held.
+    fn retracted_end(&mut self, batch: Option<u64>) {
+        if self.retracting.is_empty() {
+            return;
+        }
+        let held: BTreeSet<NodeId> = self
+            .again_held
+            .iter()
+            .filter_map(|held| match held {
+                Effect::Again { node, .. } => Some(*node),
+                _ => None,
+            })
+            .collect();
+        self.retracting.retain(|retracting| {
+            batch.is_some_and(|batch| retracting.batch != batch) || held.contains(&retracting.node)
+        });
+    }
+
+    // A range of a member's file retracted in a batch still applying, read
+    // where the file waits to be removed: `None` when no such file holds
+    // all of the range.
+    fn retracted_read(
+        &self,
+        site: LoopSite,
+        (node, member): (NodeId, MemberId),
+        range: ByteRange,
+        into: &mut Vec<u8>,
+    ) -> Option<bool> {
+        let retracting = self.retracting.iter().rev().find(|retracting| {
+            retracting.node == node
+                && retracting.member == member
+                && retracting.written.covered(range)
+        })?;
+        let (leaf, _) = self
+            .leaving
+            .get(retracting.leaving)
+            .filter(|(leaf, _)| leaf.name() == retracting.name)?;
+        Some(
+            leaf.read(site, range.start, index(range.len()), into)
+                .is_ok(),
+        )
     }
 
     // What a batch leaves to do once every effect of it is applied.
@@ -2408,11 +2483,15 @@ impl NamespaceWriter {
             } => {
                 self.unkept((*node, *member, *child), (*range, *envelope, *at))?;
             }
-            Effect::Retracted { node, member } => {
+            Effect::Retracted {
+                node,
+                member,
+                written,
+            } => {
                 if self.run_speaking != Some(*node) {
                     self.retracted.push((*node, *member));
                 }
-                self.retract(tree, *node, *member)?;
+                self.retract(tree, *node, *member, written.clone())?;
                 self.prune(tree)?;
             }
             Effect::RecoveryAt {
@@ -2571,6 +2650,9 @@ impl NamespaceWriter {
             self.replaying.remove(&node);
             self.again_held
                 .retain(|held| !matches!(held, Effect::Again { node: at, .. } if *at == node));
+            // Every request the object made is answered: what its says
+            // retracted has been read back.
+            self.retracting.retain(|retracting| retracting.node != node);
         }
         #[cfg(any(test, feature = "pipeline-test-fixtures"))]
         {
@@ -4419,13 +4501,31 @@ impl NamespaceWriter {
         (size(&self.output_free_disk), working)
     }
 
-    fn retract(&mut self, tree: &Tree, node: NodeId, member: MemberId) -> Result<(), WriteError> {
+    fn retract(
+        &mut self,
+        tree: &Tree,
+        node: NodeId,
+        member: MemberId,
+        written: Coverage,
+    ) -> Result<(), WriteError> {
         self.drop_held(node, member, ALL)?;
         if let Some(leaf) = self
             .files
             .get_mut(&node)
             .and_then(|files| files.leaves.remove(&member))
         {
+            // Discarded as before, its file read where it waits to go
+            // until the say that retracted it is answered.
+            if leaf.on_disk() && written.bytes_covered() > 0 {
+                self.retracting.push(Retracting {
+                    node,
+                    member,
+                    written,
+                    leaving: self.leaving.len(),
+                    name: leaf.name().to_owned(),
+                    batch: self.batch.0,
+                });
+            }
             self.discard(leaf)?;
         }
         self.caps.forget(tree, node, member);
@@ -5181,6 +5281,14 @@ impl Source for Access<'_> {
     // The file is read where the member's coverage tiles the range with
     // runs of any provenance, lost included: a lost run does not stop it.
     fn leaf(&self, node: NodeId, member: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool {
+        // A file retracted in the batch applying holds the bytes the
+        // object posted there until its say is answered.
+        if let Some(read) = self
+            .writer
+            .retracted_read(self.site, (node, member), range, into)
+        {
+            return read;
+        }
         let written = self
             .tree
             .namespace(node)
