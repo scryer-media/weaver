@@ -2543,7 +2543,6 @@ mod chase {
     // not, and the repair's renames move them behind what the run read. The
     // run is restarted on the moved volumes, and the job ends Complete.
     #[tokio::test]
-    #[ignore = "blocked: a RAR4 set held on trust and renamed by PAR2 ends Failed, lost proven bytes"]
     async fn a_rar4_set_held_on_trust_whose_volumes_par2_moves_is_read_again() {
         let set = on_trust();
         let count = set.volumes.len();
