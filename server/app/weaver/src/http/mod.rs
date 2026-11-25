@@ -130,14 +130,17 @@ fn coded_error_response(status: StatusCode, code: &str, message: &str) -> Respon
 }
 
 // The code a refusal's status means, for a refusal that names no code of its
-// own: not found, bad input, a conflict, an upload past its limit, or a
-// fault. Any other status has none.
+// own: not found, bad input, a conflict, an upload past its limit, too many
+// attempts, a password check that is due, or a fault. Any other status has
+// none.
 fn status_code_name(status: StatusCode) -> Option<&'static str> {
     match status {
         StatusCode::NOT_FOUND => Some("NOT_FOUND"),
         StatusCode::BAD_REQUEST => Some("INVALID_INPUT"),
         StatusCode::CONFLICT => Some("CONFLICT"),
         StatusCode::PAYLOAD_TOO_LARGE => Some("UPLOAD_TOO_LARGE"),
+        StatusCode::TOO_MANY_REQUESTS => Some("RATE_LIMITED"),
+        StatusCode::PRECONDITION_REQUIRED => Some("REAUTH_REQUIRED"),
         StatusCode::INTERNAL_SERVER_ERROR => Some("INTERNAL"),
         _ => None,
     }

@@ -200,6 +200,8 @@ async fn a_status_refusal_carries_the_code_its_status_means() {
         (StatusCode::BAD_REQUEST, "INVALID_INPUT"),
         (StatusCode::CONFLICT, "CONFLICT"),
         (StatusCode::PAYLOAD_TOO_LARGE, "UPLOAD_TOO_LARGE"),
+        (StatusCode::TOO_MANY_REQUESTS, "RATE_LIMITED"),
+        (StatusCode::PRECONDITION_REQUIRED, "REAUTH_REQUIRED"),
         (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL"),
     ] {
         let (got, payload) = refusal_of(status_error_response(status, "as it stands")).await;
@@ -217,13 +219,13 @@ async fn a_status_refusal_carries_the_code_its_status_means() {
     }
 
     let (got, payload) = refusal_of(status_error_response(
-        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::SERVICE_UNAVAILABLE,
         "slow down",
     ))
     .await;
-    assert_eq!(got, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(got, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(payload, serde_json::json!({ "error": "slow down" }));
-    let bare = coded_status_response(StatusCode::TOO_MANY_REQUESTS);
+    let bare = coded_status_response(StatusCode::SERVICE_UNAVAILABLE);
     assert!(
         to_bytes(bare.into_body(), usize::MAX)
             .await

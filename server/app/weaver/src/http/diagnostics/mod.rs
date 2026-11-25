@@ -213,7 +213,7 @@ pub(super) async fn diagnostics_package_handler(
     ) {
         Ok(archive) => archive,
         Err(error) => {
-            return super::error_response(
+            return super::status_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("failed to write diagnostics archive: {error}"),
             );
