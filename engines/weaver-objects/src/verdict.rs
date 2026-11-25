@@ -35,9 +35,13 @@ const TERMINAL: Emit = Emit::Refuse(Why::Unsupported);
 pub(crate) fn sevenz(error: &sevenz_turbo::Error) -> Emit {
     use sevenz_turbo::{BlockErrorKind, Error};
     match error {
-        // A run reads verified bytes only, so a decode that fails under a
-        // candidate key cannot be damage: what is left is the key, and the
-        // next candidate is tried.
+        // A decode that fails under a candidate key, or a checksum of an
+        // enciphered folder that fails, says the key or the bytes are wrong,
+        // and a run reads bytes no repair has verified yet. It is taken as
+        // the key, and the next candidate is tried; a repair landing behind
+        // what the run read sends the job's cursor back to the first
+        // candidate (`Passwords::rewind`), so a candidate failed on damage
+        // is tried again on the repaired bytes.
         Error::PasswordRequired | Error::MaybeBadPassword(_) => PASSWORD,
         Error::BlockDecode {
             kind: BlockErrorKind::Corrupted | BlockErrorKind::ChecksumMismatch,

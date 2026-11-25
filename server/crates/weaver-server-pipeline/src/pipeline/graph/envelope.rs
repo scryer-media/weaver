@@ -201,6 +201,11 @@ pub struct Shelved {
     // Which run may read. Moving it on stops the one reading: a repair
     // behind what it read, or the node going away.
     pub(crate) generation: u64,
+    // How many times repaired bytes, or a clean copy mending damage, landed
+    // behind what a run read: what a candidate key failed on before is
+    // gone, so the job tries its candidates again (`Passwords::rewind`).
+    // A password offer's restart does not move it.
+    pub(crate) repaired: u64,
     // How many times the shelf woke its waiters, and the count a run last
     // began to wait at: a run waits for good while the two agree.
     pub(crate) woken: u64,
@@ -438,6 +443,7 @@ impl Envelopes {
             kept.coverage.write(range, provenance);
             if (provenance == Provenance::Repaired || mends) && range.start < kept.reached {
                 state.generation += 1;
+                state.repaired += 1;
             }
             Ok(())
         })
@@ -839,6 +845,11 @@ impl Shelf {
 
     pub fn generation(&self) -> u64 {
         self.lock().generation
+    }
+
+    // How many times a repair landed behind what a run read (`repaired`).
+    pub fn repaired(&self) -> u64 {
+        self.lock().repaired
     }
 
     // The bytes the run read are good, but the object now knows something

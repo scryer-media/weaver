@@ -1187,6 +1187,118 @@ mod aes_coded {
         repaired_after_the_run_read_it(&["ember-wrong-guess", SECRET]).await;
     }
 
+    // The right password first and a wrong one after: the run reads the
+    // damage under the right one and takes it for the key, and the wrong
+    // one fails too. The repair lands behind what the run read, so the
+    // job tries its candidates again from the first, which delivers.
+    #[tokio::test]
+    async fn a_damaged_coded_pack_with_the_right_password_first_delivers_every_member() {
+        repaired_after_the_run_read_it(&[SECRET, "ember-wrong-guess"]).await;
+    }
+
+    // The same with the right password alone.
+    #[tokio::test]
+    async fn a_damaged_coded_pack_with_the_right_password_alone_delivers_every_member() {
+        repaired_after_the_run_read_it(&[SECRET]).await;
+    }
+
+    // The right password first, restarted after every article.
+    #[tokio::test]
+    async fn a_damaged_coded_pack_right_first_restarted_after_every_article_delivers() {
+        let (scenario, files) = damaged_pack(&[SECRET, "ember-wrong-guess"]);
+        let whole = restart_row(scenario).await;
+        assert_members(&whole, &files);
+    }
+
+    // No damage: each candidate is offered once, as before, whichever
+    // order they come in; the right one first is the only one offered.
+    #[tokio::test]
+    async fn without_damage_each_candidate_is_offered_once() {
+        let (archive, files) = sealed(lzma2(), false);
+        for (candidates, offers) in [
+            (vec![SECRET, "ember-wrong-guess"], vec![1]),
+            (vec!["ember-wrong-guess", SECRET], vec![2]),
+        ] {
+            let scenario = candidates.iter().fold(
+                Scenario::new(vec![Post::plain("lantern.7z", archive.clone())]),
+                |scenario, candidate| scenario.global_password(candidate),
+            );
+            let graph = delivers(scenario, &files).await;
+            assert_eq!(offered(&graph), offers, "{candidates:?}");
+        }
+    }
+
+    // A whole 7z coded under AES, which the engine opens alone, the right
+    // password first: the repair of the pack its run read sends the
+    // candidates back to the first, and the engine delivers every file.
+    #[tokio::test]
+    async fn a_damaged_all_coded_aes_7z_with_the_right_password_first_delivers_every_file() {
+        let (_, files) = sealed(delta(), false);
+        let entries: Vec<(&str, Vec<u8>)> = files
+            .iter()
+            .map(|(name, bytes)| (*name, bytes.clone()))
+            .collect();
+        let archive = super::nested::sevenz(&[(under_aes(delta()), entries)]);
+        for candidates in [[SECRET, "ember-wrong-guess"], ["ember-wrong-guess", SECRET]] {
+            let mut posted = archive.clone();
+            posted[32 + 3 * ARTICLE + 7] ^= 0x5a;
+            let mut posts = with_par2(&archive);
+            posts[0].bytes = posted;
+            let scenario = candidates
+                .iter()
+                .fold(Scenario::new(posts), |scenario, candidate| {
+                    scenario.global_password(candidate)
+                });
+            let held = run_holding(&scenario, 2).await;
+            assert_eq!(
+                held.status,
+                Some(JobStatus::Complete),
+                "{candidates:?} {:?}",
+                held.files.keys()
+            );
+            for (name, bytes) in &files {
+                assert!(held.files[&delivered(name)] == *bytes, "{name} bytes");
+            }
+        }
+    }
+
+    // The stored folders under AES too, a byte of the smallest stored member
+    // wrong as posted: the store proves a candidate on that member before it
+    // opens the folders, and bytes of the proof coming again are tried under
+    // every candidate the store holds. The right password alone, or after a
+    // wrong one, delivers every member once the proof is repaired.
+    #[tokio::test]
+    async fn a_damaged_proof_repaired_delivers_every_member() {
+        let (archive, files) = mixed_under(MKV, aes_copy(), under_aes(delta()), false);
+        // Each folder enciphered is padded to the cipher's block.
+        let pad = |len: usize| len.next_multiple_of(16);
+        let lumen = 32 + pad(files[0].1.len()) + pad(files[1].1.len() + files[2].1.len());
+        let mut posted = archive.clone();
+        posted[lumen + 70] ^= 0x5a;
+        for candidates in [vec![SECRET], vec!["ember-wrong-guess", SECRET]] {
+            let mut posts = with_par2(&archive);
+            posts[0].bytes = posted.clone();
+            let (scenario, spoken) = hearing(
+                candidates
+                    .iter()
+                    .fold(Scenario::new(posts), |scenario, candidate| {
+                        scenario.global_password(candidate)
+                    }),
+            );
+            let held = run_holding(&scenario, 2).await;
+            assert_eq!(
+                held.status,
+                Some(JobStatus::Complete),
+                "{candidates:?} {:?} {:?}",
+                held.files.keys(),
+                spoken.lock().unwrap()
+            );
+            for (name, bytes) in &files {
+                assert!(held.files[&delivered(name)] == *bytes, "{name} bytes");
+            }
+        }
+    }
+
     // Restarted after every article, the damage repaired.
     #[tokio::test]
     async fn a_damaged_coded_pack_restarted_after_every_article_delivers_every_member() {

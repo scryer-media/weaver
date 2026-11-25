@@ -239,6 +239,10 @@ pub struct SevenZipStore {
     grid: Grid,
     #[serde(skip)]
     candidates: Vec<Candidate>,
+    // The candidate the job offered last, by index: offered again after the
+    // job's cursor went back, it is already among `candidates`.
+    #[serde(skip)]
+    latest: Option<usize>,
     // The candidate that opened the header or the folders.
     #[serde(skip)]
     opened: Option<usize>,
@@ -366,6 +370,7 @@ impl SevenZipStore {
             members: Arc::default(),
             grid: Grid::default(),
             candidates: Vec::new(),
+            latest: None,
             opened: None,
             proven: false,
             wrong_key: false,
@@ -987,11 +992,12 @@ impl Object for SevenZipStore {
         // opens nothing leaves it free to ask for the next one.
         self.install(out);
         self.asked = false;
-        if !self
+        let held = self
             .candidates
             .iter()
-            .any(|candidate| candidate.secret.as_str() == secret)
-        {
+            .position(|candidate| candidate.secret.as_str() == secret);
+        self.latest = Some(held.unwrap_or(self.candidates.len()));
+        if held.is_none() {
             self.candidates.push(Candidate {
                 secret: Zeroizing::new(secret.to_owned()),
                 password: Password::new(secret),
@@ -1119,8 +1125,8 @@ impl SevenZipStore {
     // or the latest the job offered, which answers what a run asked.
     fn password(&self) -> Option<String> {
         self.opened
+            .or(self.latest)
             .and_then(|index| self.candidates.get(index))
-            .or_else(|| self.candidates.last())
             .map(|candidate| candidate.secret.as_str().to_owned())
     }
 }

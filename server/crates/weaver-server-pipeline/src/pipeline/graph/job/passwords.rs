@@ -5,14 +5,21 @@
 // time and in the order they are tried. Which one each node was offered last
 // is the job's to remember, not the tree's: the tree is format-blind and
 // knows no secrets. An object asks again only after it tried the last offer,
-// so one is in flight per node, and the cursor moving on is what keeps any
-// candidate from being offered twice to the same node. A node that asks
+// so one is in flight per node, and the cursor moving on is what keeps a
+// candidate from being offered twice to the same node over the same bytes.
+// A run reads bytes no repair has verified yet, so a candidate failing on
+// damaged bytes proves nothing of the candidate: once a repair lands behind
+// what the node's run read, the cursor goes back to the start and every
+// candidate is tried again on the repaired bytes (`rewind`). Only a repair
+// moves it back, never an offer, so it moves back at most once per repair
+// of that node's shelf. A node that asks
 // with none left is left asking: more of it may still arrive, and the
 // object, which knows it is still asking, refuses itself once all of it
 // has or once the job is quiet.
 //
 // The values are secrets. Nothing here prints them; Debug says how many.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use weaver_graph::{Builder, Effect, Marked, NodeId, Why};
@@ -29,6 +36,10 @@ pub struct Passwords {
     // How many candidates each node was offered, marked for every node an
     // offer moves on, so a checkpoint reads again only those.
     offered: Marked<NodeId, usize>,
+    // The count of repairs behind a run (`Shelf::repaired`) each node's
+    // cursor last went back for. In memory: a restored shelf counts from
+    // zero again, and so does this.
+    rewound: BTreeMap<NodeId, u64>,
 }
 
 impl fmt::Debug for Passwords {
@@ -90,6 +101,23 @@ impl Passwords {
         let candidate = self.candidates.get(index)?;
         self.offered.insert(node, index + 1);
         Some(candidate)
+    }
+
+    // Repairs landed behind what the node's run read, `repaired` of them
+    // so far: when that is more than the cursor last went back for, it goes
+    // back to the start, marked, so a checkpoint records it and the next
+    // ask is offered the first candidate. True when it went back.
+    pub(super) fn rewind(&mut self, node: NodeId, repaired: u64) -> bool {
+        let seen = self.rewound.entry(node).or_default();
+        if repaired <= *seen {
+            return false;
+        }
+        *seen = repaired;
+        if self.offered.get(&node).is_none_or(|offered| *offered == 0) {
+            return false;
+        }
+        self.offered.insert(node, 0);
+        true
     }
 
     // The candidate after the one the node was offered last, if any is left.
@@ -167,8 +195,9 @@ impl GraphJob {
     }
 
     // The object at `node` asked for a password: it gets the next candidate,
-    // and an engine's run starts over under it, by the transition a repair
-    // behind the run takes. With none left, the node is left asking. True
+    // and an engine's run starts over under it over the same bytes
+    // (`Shelf::restart`), which counts no repair and so never sends the
+    // cursor back. With none left, the node is left asking. True
     // when a candidate was offered.
     pub(super) fn offer_password(&mut self, node: NodeId, effects: &mut Vec<Effect>) -> bool {
         let builder: &mut dyn Builder = &mut *self.builder;

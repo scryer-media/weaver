@@ -695,6 +695,9 @@ impl GraphJob {
             for (&node, &facts) in &engines {
                 self.feed(node, facts)?;
                 let shelf = self.writer.shelf(node);
+                // What a candidate failed on before a repair behind the run
+                // proves nothing of it: the candidates are tried again.
+                self.passwords.rewind(node, shelf.repaired());
                 let asks = match self.runs.generation(node) {
                     Some(generation) if generation != shelf.generation() => {
                         self.retract_run(node)?;
