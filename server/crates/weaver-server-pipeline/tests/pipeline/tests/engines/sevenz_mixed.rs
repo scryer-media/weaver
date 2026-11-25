@@ -2462,6 +2462,54 @@ mod shortfall_text {
         );
     }
 
+    // Taken down after the run refused and before the job ended, with a
+    // plain file posted after the archive so the job is not done when the
+    // run refuses: the restored job asks the run again, which refuses again,
+    // and says what the uninterrupted one says. A run refused for damage or
+    // a password is refused only at quiet, the job's end, so no restart
+    // falls between.
+    async fn same_after_a_restart(scenario: Scenario) {
+        use weaver_server_pipeline::pipeline::graph::status::shortfall_message;
+        use weaver_server_pipeline::pipeline::tests::engines::restart_fixtures::run_restarted_after_refusal;
+        let whole = run(&scenario).await;
+        assert_eq!(
+            whole.status,
+            Some(JobStatus::Partial),
+            "{:?}",
+            whole.failure
+        );
+        let restarted = run_restarted_after_refusal(&scenario).await;
+        assert_eq!(restarted.restarts, 1, "taken down between refusal and end");
+        assert_eq!(restarted.status, whole.status);
+        assert_eq!(
+            shortfall_message(&restarted.graph.delivery, None),
+            whole.history_error
+        );
+        assert_eq!(
+            restarted.graph.delivery.withheld,
+            whole.graph().delivery.withheld
+        );
+    }
+
+    fn trailed(archive: Vec<u8>) -> Scenario {
+        Scenario::new(vec![
+            Post::plain("lantern.7z", archive),
+            Post::plain("zz.nfo", b"posted after the archive\n".repeat(8192)),
+        ])
+    }
+
+    #[tokio::test]
+    async fn a_restart_after_a_refusal_for_the_memory_says_the_same() {
+        use weaver_server_pipeline::pipeline::graph::engine::{DecodePool, RUN_OVERHEAD};
+        let (archive, _) = mixed(MKV, lzma2());
+        same_after_a_restart(
+            trailed(archive).setup(|pipeline| {
+                pipeline.graph_decode = Arc::new(DecodePool::new(RUN_OVERHEAD - 1))
+            }),
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn a_mixed_7z_delivered_whole_says_nothing() {
         let (archive, files) = mixed(MKV, lzma2());

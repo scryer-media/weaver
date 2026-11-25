@@ -73,6 +73,10 @@ pub enum Down<'a> {
     // its namespace and is not finished: between a lift and the read of the
     // set the volume rose to. Only there, not after articles.
     Lifting,
+    // As a crash, once, after the first article served once a run has
+    // refused to make the members it makes and the job is not finished:
+    // between the refusal and the job's end. Only there.
+    RunRefused,
 }
 
 // As `run_restarting_inspecting`, going down as `down` says and only after the articles
@@ -102,6 +106,7 @@ pub(in crate::pipeline::tests) async fn run_restarting_at_inspecting(
     let mut graph = GraphView::default();
     let mut reads = 0;
     let mut lifting = down == Down::Lifting;
+    let mut refusing = down == Down::RunRefused;
     loop {
         // Down between a lift and the read of the set it rose to, once.
         if lifting
@@ -144,11 +149,23 @@ pub(in crate::pipeline::tests) async fn run_restarting_at_inspecting(
             if finished(&pipeline) {
                 break;
             }
+            if refusing
+                && pipeline
+                    .graph_jobs
+                    .get(&JOB)
+                    .is_some_and(|job| !job.writer().unmade(job.tree()).is_empty())
+            {
+                refusing = false;
+                pipeline = restart(&temp_dir, pipeline, scenario, &mut owed, &mut *inspect).await;
+                in_memory.extend(owed.iter().copied());
+                restarts += 1;
+                continue;
+            }
             // Only after an article asked for the first time: what a restart
             // fetches again comes back before the next one, so the run moves.
             // A live run is no reason to wait: the checkpoint describes what
             // is on disk, never how far a run has read.
-            if first && down != Down::Lifting && at(requests.len()) {
+            if first && !matches!(down, Down::Lifting | Down::RunRefused) && at(requests.len()) {
                 if down == Down::RefusingForHolds {
                     pipeline
                         .graph_jobs
@@ -1212,4 +1229,11 @@ pub async fn run_restarted_after_repairing(scenario: &Scenario) -> RestartedDone
 
 pub fn member_check_bytes() -> u64 {
     crate::pipeline::graph::namespace::checked::so_far()
+}
+
+// The job served as `run` serves it, and taken down once, as a crash drops
+// it, after a run refused to make the members it makes and before the job
+// ends.
+pub async fn run_restarted_after_refusal(scenario: &Scenario) -> Restarted {
+    run_restarting_at_inspecting(scenario, &mut |_| {}, Down::RunRefused, &|_| false).await
 }
