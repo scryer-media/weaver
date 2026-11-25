@@ -217,6 +217,7 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
                 Arc::clone(&disk_space),
                 http_metrics.clone(),
             ),
+            stored_names: Default::default(),
         },
     );
 

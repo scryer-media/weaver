@@ -255,7 +255,7 @@ fn local_hostname() -> Option<String> {
 }
 
 // Every name the database holds, read once for the table.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub(super) struct StoredNames {
     pub(super) jobs: BTreeMap<u64, JobNameRecord>,
     // The title and posted file names of each job's persisted NZB.

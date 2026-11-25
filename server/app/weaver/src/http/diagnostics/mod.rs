@@ -47,6 +47,7 @@ mod archive;
 mod bounded;
 mod database_facts;
 mod graphql;
+mod names_cache;
 mod nzb_reports;
 mod pipeline_internals;
 mod redact;
@@ -350,11 +351,39 @@ impl NameTableRead {
         handle: &SchedulerHandle,
         config: &SharedConfig,
     ) -> stored_read::TableNames {
-        let _ = tokio::time::timeout_at(self.deadline, self.reader).await;
-        let state = self.read.finish();
+        let state = self.stored().await;
         let memory = stored_read::MemoryNames::current(handle, config).await;
         stored_read::TableNames::from_read(state, memory)
     }
+
+    // What the read gathered by its deadline, before memory is merged in.
+    async fn stored(self) -> stored_read::ReadState {
+        let _ = tokio::time::timeout_at(self.deadline, self.reader).await;
+        self.read.finish()
+    }
+}
+
+// The stored names for one MCP diagnostics call: those `cache` keeps, read
+// now when it holds none under their lifetime.
+async fn cached_stored_names(
+    cache: &names_cache::StoredNamesCache,
+    handle: &SchedulerHandle,
+    db: &Database,
+) -> Arc<stored_read::ReadState> {
+    cache
+        .get(|| NameTableRead::start(handle, db).stored())
+        .await
+}
+
+// The stand-in table over kept stored names, with the names in memory
+// gathered now, once the call's collection is in, and merged over them.
+async fn table_over(
+    stored: &stored_read::ReadState,
+    handle: &SchedulerHandle,
+    config: &SharedConfig,
+) -> stored_read::TableNames {
+    let memory = stored_read::MemoryNames::current(handle, config).await;
+    stored_read::TableNames::from_read(stored.clone(), memory)
 }
 
 // The configured directories, as the collection reads them.

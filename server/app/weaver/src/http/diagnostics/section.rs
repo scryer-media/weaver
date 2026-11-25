@@ -31,8 +31,9 @@ use weaver_server_core::{Database, SchedulerHandle};
 use super::archive::{Component, Form};
 use super::graphql::SchemaShape;
 use super::{
-    ConfiguredDirs, GRAPHQL_COMPONENTS, GRAPHQL_WAIT, NameTableRead, collect_config_files,
-    collect_graphql_within, collect_host, database_facts, graphql, sanitize, sanitize_components,
+    ConfiguredDirs, GRAPHQL_COMPONENTS, GRAPHQL_WAIT, cached_stored_names, collect_config_files,
+    collect_graphql_within, collect_host, database_facts, graphql, names_cache, sanitize,
+    sanitize_components, table_over,
 };
 
 // Lines of the Prometheus exposition one `metrics` section holds.
@@ -76,6 +77,9 @@ pub(crate) struct DiagnosticsSources {
     pub disk_space: Option<Arc<StorageCapacity>>,
     pub log_buffer: LogRingBuffer,
     pub metrics: MetricsRender,
+    // The stored names the MCP tools share for five minutes; the package
+    // download reads its own.
+    pub stored_names: Arc<names_cache::StoredNamesCache>,
 }
 
 // The sections one call can read, each the package file it is named after.
@@ -196,28 +200,41 @@ impl DiagnosticsSources {
         section: DiagnosticsSection,
         families: &[String],
     ) -> SectionRead {
-        let names = NameTableRead::start(&self.handle, &self.db);
         let dirs = ConfiguredDirs::current(&self.config).await;
-        let mut metric_lines_left_out = 0;
-        let components = match section {
-            DiagnosticsSection::Database => database_facts::collect_database_facts(&self.db).await,
-            DiagnosticsSection::Host => vec![collect_host(self.disk_space.as_deref(), &dirs).await],
-            DiagnosticsSection::Config => collect_config_files(&dirs.data).await,
-            DiagnosticsSection::Metrics => {
-                let exposition = (self.metrics.0)().await;
-                let (text, left_out) = metric_lines(&exposition, families);
-                metric_lines_left_out = left_out;
-                vec![Component::text("metrics.txt", text)]
+        // The stored names, kept or read now, beside the collection, as the
+        // package reads its own beside its collection.
+        let stored = cached_stored_names(&self.stored_names, &self.handle, &self.db);
+        let collect = async {
+            match section {
+                DiagnosticsSection::Database => {
+                    (database_facts::collect_database_facts(&self.db).await, 0)
+                }
+                DiagnosticsSection::Host => (
+                    vec![collect_host(self.disk_space.as_deref(), &dirs).await],
+                    0,
+                ),
+                DiagnosticsSection::Config => (collect_config_files(&dirs.data).await, 0),
+                DiagnosticsSection::Metrics => {
+                    let exposition = (self.metrics.0)().await;
+                    let (text, left_out) = metric_lines(&exposition, families);
+                    (vec![Component::text("metrics.txt", text)], left_out)
+                }
+                graphql_section => (
+                    self.graphql_section(scope, identity, graphql_section).await,
+                    0,
+                ),
             }
-            graphql_section => self.graphql_section(scope, identity, graphql_section).await,
         };
+        let (stored, (components, metric_lines_left_out)) = tokio::join!(stored, collect);
         let volumes = self
             .disk_space
             .as_ref()
             .map(|disk_space| disk_space.volume_labels())
             .unwrap_or_default();
         let local = dirs.local_names(volumes);
-        let names = names.finish(&self.handle, &self.config).await;
+        // Memory is read once the collection is in, so a job it names that
+        // joined since the stored read is still named.
+        let names = table_over(&stored, &self.handle, &self.config).await;
         let (components, sanitized) = sanitize_components(components, names, local).await;
         SectionRead {
             files: components.into_iter().map(section_file).collect(),
@@ -262,7 +279,7 @@ impl DiagnosticsSources {
     // The service log as it stands, with the stand-in table read for it as
     // the package reads it.
     pub(crate) async fn service_log(&self) -> ServiceLog {
-        let names = NameTableRead::start(&self.handle, &self.db);
+        let stored = cached_stored_names(&self.stored_names, &self.handle, &self.db).await;
         let (first, records) = self.log_buffer.numbered_snapshot();
         let volumes = self
             .disk_space
@@ -272,7 +289,7 @@ impl DiagnosticsSources {
         let local = ConfiguredDirs::current(&self.config)
             .await
             .local_names(volumes);
-        let names = names.finish(&self.handle, &self.config).await;
+        let names = table_over(&stored, &self.handle, &self.config).await;
         ServiceLog {
             first,
             records,
@@ -328,6 +345,7 @@ impl DiagnosticsSources {
             disk_space: None,
             log_buffer,
             metrics,
+            stored_names: Default::default(),
         }
     }
 }
