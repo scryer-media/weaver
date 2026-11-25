@@ -1,0 +1,28 @@
+# Every script job, in run order. A secret input shows an empty value and its
+# link or sealed flag, never the secret. Scope: ADMIN.
+# Variables: none.
+query ListScriptJobs {
+  scriptInstances {
+    id
+    name
+    script
+    trigger
+    queueEvent
+    categories
+    enabled
+    blocking
+    timeoutSeconds
+    runOrder
+    scriptProblem
+    headerDrift
+    inputs {
+      name
+      value
+      sealed
+      secret {
+        id
+        name
+      }
+    }
+  }
+}

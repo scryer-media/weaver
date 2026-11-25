@@ -1,0 +1,31 @@
+# Write. Creates one script job per trigger the script's header declares and
+# that the script has no job for yet, filled from the header. Jobs arrive
+# ENABLED, blocking, for every category; a secret input is left out unless
+# another job of the script already links one. The header is not read again.
+# Refused when the header declares nothing. Needs the operator's yes.
+# Scope: ADMIN.
+# Variables: {"script": "VideoSort"}
+mutation SetUpScriptFromHeader($script: String!) {
+  setUpScriptFromHeader(script: $script) {
+    id
+    name
+    script
+    trigger
+    queueEvent
+    categories
+    enabled
+    blocking
+    timeoutSeconds
+    runOrder
+    scriptProblem
+    inputs {
+      name
+      value
+      sealed
+      secret {
+        id
+        name
+      }
+    }
+  }
+}

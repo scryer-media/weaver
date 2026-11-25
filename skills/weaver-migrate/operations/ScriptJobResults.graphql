@@ -1,0 +1,20 @@
+# Script runs recorded for one real download (post-processing and its queue
+# events). outputTail is redacted; quote only the lines that matter.
+# Scope: READ.
+# Variables: {"jobId": 42}
+query ScriptJobResults($jobId: Int!) {
+  postProcessingResults(jobId: $jobId) {
+    script
+    instanceName
+    event
+    background
+    adapter
+    status
+    exitCode
+    durationMs
+    errorMessage
+    outputTail
+    outputTruncated
+    finishedAtEpochMs
+  }
+}

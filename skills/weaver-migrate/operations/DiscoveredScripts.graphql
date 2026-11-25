@@ -1,0 +1,37 @@
+# Scripts Weaver finds in its scripts directory right now, with what each
+# header declares, and files it could not read as a script. Secret header
+# options never carry a default. Scope: ADMIN.
+# Variables: none.
+query DiscoveredScripts {
+  discoveredScripts {
+    scripts {
+      name
+      displayName
+      adapter
+      kinds
+      queueEvents
+      taskTimes
+      options {
+        name
+        optionType
+        required
+        defaultValue
+      }
+      preset {
+        triggers {
+          trigger
+          queueEvent
+        }
+        inputs {
+          name
+          value
+          secret
+        }
+      }
+    }
+    problems {
+      name
+      message
+    }
+  }
+}

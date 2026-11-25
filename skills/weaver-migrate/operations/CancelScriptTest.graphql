@@ -1,0 +1,6 @@
+# Write. Stops a running test run. False when it has already ended.
+# Needs the operator's yes. Scope: ADMIN.
+# Variables: {"id": "<test run id>"}
+mutation CancelScriptTest($id: String!) {
+  cancelScriptTest(id: $id)
+}
