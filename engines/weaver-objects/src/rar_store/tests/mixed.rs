@@ -444,7 +444,12 @@ fn a_set_of_compressed_files_alone_stays_with_the_store() {
             options.split = split;
             let volumes = write(&items, &options);
             let owner = check(&format!("{version:?} {split:?}"), volumes, None);
-            assert!(!owner.said.iter().any(|emit| matches!(emit, Emit::NeedsEngine(_))));
+            assert!(
+                !owner
+                    .said
+                    .iter()
+                    .any(|emit| matches!(emit, Emit::NeedsEngine(_)))
+            );
         }
     }
 }
@@ -460,7 +465,12 @@ fn a_set_whose_first_file_is_compressed_streams_the_stored_one_after_it() {
             let volumes = write(&compressed_first(version), &options);
             let owner = check(&format!("{version:?} {split:?}"), volumes, None);
             assert!(owner.member("alpha.mkv").closed);
-            assert!(!owner.said.iter().any(|emit| matches!(emit, Emit::NeedsEngine(_))));
+            assert!(
+                !owner
+                    .said
+                    .iter()
+                    .any(|emit| matches!(emit, Emit::NeedsEngine(_)))
+            );
         }
     }
 }

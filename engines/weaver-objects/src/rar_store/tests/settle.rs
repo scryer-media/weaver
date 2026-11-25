@@ -579,8 +579,8 @@ fn looking_only_at_what_changed_says_what_looking_at_everything_said() {
         owner
     };
     // A volume whose headers change: its first copy names a file otherwise,
-    // and a repair brings the real headers.
-    let retracted = || {
+    // and a repair brings the real headers, which rename it where it stands.
+    let renamed = || {
         let real = write(&many_items(25, 400, None), &options(None, None)).remove(0);
         let wrong = write(&many_items(25, 400, Some(9)), &options(None, None)).remove(0);
         assert_eq!(real.len(), wrong.len());
@@ -602,12 +602,10 @@ fn looking_only_at_what_changed_says_what_looking_at_everything_said() {
         );
         owner.deliver_as(0, ByteRange::new(0, length), Provenance::Repaired, None);
         owner.close(0);
-        assert!(
-            owner
-                .said
-                .iter()
-                .any(|emit| matches!(emit, weaver_graph::Emit::Retract(_))),
-            "the wrong headers are retracted"
+        assert_eq!(
+            owner.renamed,
+            [(9, "m0009z.bin".to_owned(), "m00009.bin".to_owned())],
+            "the file the wrong headers named is renamed"
         );
         owner
     };
@@ -646,7 +644,7 @@ fn looking_only_at_what_changed_says_what_looking_at_everything_said() {
         ("members spanning volumes", &spanning),
         ("encrypted", &encrypted),
         ("out of order", &out_of_order),
-        ("retracted", &retracted),
+        ("renamed", &renamed),
         ("retracted in a set", &retracted_in_a_set),
     ];
     for (name, scenario) in scenarios {

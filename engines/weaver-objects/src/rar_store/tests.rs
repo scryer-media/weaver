@@ -1590,7 +1590,7 @@ fn a_volume_unlinked_after_its_parts_were_placed_keeps_them() {
 }
 
 #[test]
-fn a_repair_behind_an_announced_member_retracts_and_rewalks() {
+fn a_repair_behind_an_announced_stored_member_renames_it_where_it_stands() {
     for version in [Version::Rar5, Version::Rar4] {
         let real = write(&items(), &Options::new(version)).remove(0);
         // Wrong bytes whose header checksums hold: the same set with its
@@ -1613,16 +1613,71 @@ fn a_repair_behind_an_announced_member_retracts_and_rewalks() {
         let at = find(&real, b"alpha.bin") as u64;
         let header = ByteRange::new(at.saturating_sub(40), at + 9);
         owner.deliver_as(0, header, Provenance::Repaired, None);
+        // The repaired header names the member otherwise over the same
+        // pieces: it is renamed where it stands, not retracted.
+        assert_eq!(
+            owner.renamed,
+            [(0, "alphz.bin".to_owned(), "alpha.bin".to_owned())],
+            "{version:?}"
+        );
         assert!(
-            owner
+            !owner
                 .said
-                .contains(&Emit::Retract(weaver_graph::MemberId(0))),
+                .iter()
+                .any(|emit| matches!(emit, Emit::Retract(_))),
             "{version:?} {:?}",
             owner.said
         );
         // The rest of the volume comes again from a second source.
         owner.deliver_as(0, ByteRange::new(0, length), Provenance::Repaired, None);
         owner.close(0);
+        streamed(&owner);
+        posted_whole(&owner);
+    }
+}
+
+// A set posted with its first file under another name, every byte passing
+// its checksums, streams each file under the name posted. A repair
+// of the first file's header names it as it should be over the same pieces:
+// the store renames it where it stands, retracts nothing, and writes no byte
+// again, neither of it nor of the files after it.
+#[test]
+fn a_repaired_header_renaming_a_stored_member_writes_nothing_again() {
+    for version in [Version::Rar5, Version::Rar4] {
+        let real = write(&items(), &Options::new(version));
+        let mut other = items();
+        other[0] = Item::File("alphz.bin", files()[0].1.clone());
+        let wrong = write(&other, &Options::new(version));
+        assert_eq!(real.len(), wrong.len(), "{version:?}");
+        let mut owner = Owner::named(store(), real.clone());
+        for (volume, bytes) in wrong.iter().enumerate() {
+            assert_eq!(bytes.len(), real[volume].len(), "{version:?}");
+            owner.deliver_as(
+                volume,
+                ByteRange::new(0, bytes.len() as u64),
+                Provenance::Fresh,
+                Some(bytes),
+            );
+            owner.close(volume);
+        }
+        assert!(owner.member("alphz.bin").closed, "{version:?}");
+        let before = owner.log.len();
+        let at = find(&real[0], b"alpha.bin") as u64;
+        let header = ByteRange::new(at.saturating_sub(40), at + 9);
+        owner.deliver_as(0, header, Provenance::Repaired, None);
+        assert_eq!(
+            owner.renamed,
+            [(0, "alphz.bin".to_owned(), "alpha.bin".to_owned())],
+            "{version:?}"
+        );
+        let since = &owner.log[before..];
+        assert!(
+            !since
+                .iter()
+                .any(|emit| matches!(emit, Emit::Retract(_) | Emit::Bytes { .. })),
+            "{version:?} {since:?}"
+        );
+        no_trouble(&owner);
         streamed(&owner);
         posted_whole(&owner);
     }

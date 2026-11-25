@@ -75,7 +75,12 @@ fn unannounced(owner: &Owner, parts: &[Part]) -> Vec<String> {
                     got.name == crate::rar_store::made::name(&part.name) || got.name == part.name
                 })
         })
-        .map(|part| format!("{} (index {}) in volume {}", part.name, part.index, part.volume))
+        .map(|part| {
+            format!(
+                "{} (index {}) in volume {}",
+                part.name, part.index, part.volume
+            )
+        })
         .collect()
 }
 
@@ -242,7 +247,11 @@ fn packed_data_of_a_nameless_set_reaches_the_shelf_only_after_its_member_is_anno
         let mut owner = Owner::new(store(), named.clone());
         let order: Vec<usize> = (0..volumes.len()).collect();
         let seen = delivered(&mut owner, &parts, &order, 512, tail_first);
-        assert!(seen.early.is_empty(), "tail first {tail_first}: {:?}", seen.early);
+        assert!(
+            seen.early.is_empty(),
+            "tail first {tail_first}: {:?}",
+            seen.early
+        );
         assert!(seen.shelved > 0);
         assert!(owner.object.runs(), "tail first {tail_first}");
     }
@@ -307,7 +316,11 @@ fn packed_data_under_a_repaired_header_reaches_the_shelf_only_after_its_member_i
                         Provenance::Repaired,
                         None,
                     );
-                    seen.check(&owner, &parts, &format!("{label}: repaired {volume} at {start}"));
+                    seen.check(
+                        &owner,
+                        &parts,
+                        &format!("{label}: repaired {volume} at {start}"),
+                    );
                     start = end;
                 }
             }

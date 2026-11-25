@@ -123,6 +123,9 @@ pub(super) struct Owner {
     // The most bytes one read of a range asked for again took from any
     // place they lie.
     pub again_read_most: u64,
+    // Each member said again under another name: its id, the name it had
+    // and the one it took.
+    pub renamed: Vec<(u32, String, String)>,
 }
 
 impl Owner {
@@ -154,6 +157,7 @@ impl Owner {
             gated: Vec::new(),
             doing: ("found", first),
             again_read_most: 0,
+            renamed: Vec::new(),
         };
         let (name, bytes) = &owner.volumes[first];
         let front = &bytes[..bytes.len().min(FRONT)];
@@ -491,6 +495,19 @@ impl Owner {
                     member,
                     name,
                     length,
+                } if member.0 < self.next => {
+                    // Said again under another name, as the tree takes it:
+                    // the member is renamed where it stands, its bytes kept.
+                    let got = self.members.get_mut(&member.0).expect("announced first");
+                    assert_eq!(got.length, length, "a rename keeps the length");
+                    self.renamed
+                        .push((member.0, got.name.clone(), name.clone()));
+                    got.name = name;
+                }
+                Emit::Member {
+                    member,
+                    name,
+                    length,
                 } => {
                     assert_eq!(member.0, self.next, "members are announced in id order");
                     self.next += 1;
@@ -670,7 +687,10 @@ impl Owner {
     }
 
     // A run started earlier, over the shelf as it stands now, as `run`.
-    pub fn run_started(&mut self, started: Box<dyn weaver_graph::Extraction>) -> Vec<(u32, u64, usize)> {
+    pub fn run_started(
+        &mut self,
+        started: Box<dyn weaver_graph::Extraction>,
+    ) -> Vec<(u32, u64, usize)> {
         let shelved = self.shelved();
         let mut emits = Vec::new();
         let mut sink = |emit| {

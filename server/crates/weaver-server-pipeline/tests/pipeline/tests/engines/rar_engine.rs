@@ -104,7 +104,11 @@ fn assert_kept_by_solidity(graph: &Outcome, solid: bool) {
         "{:?}",
         graph.graph().kinds
     );
-    assert!(graph.graph().kinds.contains("rar_store"), "{:?}", graph.graph().kinds);
+    assert!(
+        graph.graph().kinds.contains("rar_store"),
+        "{:?}",
+        graph.graph().kinds
+    );
 }
 
 // The engine object ran: the graph bound a RAR engine to the volumes.

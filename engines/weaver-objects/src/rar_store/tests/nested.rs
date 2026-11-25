@@ -125,9 +125,16 @@ fn a_set_with_two_compressed_members_runs_once_from_the_first() {
         );
         let started = owner.start();
         owner.whole(512);
-        assert!(owner.object.engine().unwrap().makes(MemberId(3)), "{version:?}");
+        assert!(
+            owner.object.engine().unwrap().makes(MemberId(3)),
+            "{version:?}"
+        );
         assert!(owner.run_started(started).is_empty(), "{version:?}");
-        assert!(super::mixed::trouble(&owner).is_empty(), "{version:?}: {:?}", owner.said);
+        assert!(
+            super::mixed::trouble(&owner).is_empty(),
+            "{version:?}: {:?}",
+            owner.said
+        );
         for (name, bytes) in [("inner.rar", &rar), ("inner.7z", &sevenz)] {
             let got = owner.member(name);
             assert!(got.closed && got.bytes == *bytes, "{version:?}: {name}");

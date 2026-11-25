@@ -1168,6 +1168,28 @@ pub struct GraphView {
     // At each look that differed from the one before: what a run could read
     // off every object's envelopes then, and the members objects announced.
     pub shelf_looks: Vec<ShelfLook>,
+    // Every member file below the root, by node and member: each file it
+    // lay in at any look, by inode, and whether it was ever seen shorter
+    // than at a look before. A member written again is a new file.
+    pub member_files: BTreeMap<(weaver_graph::NodeId, weaver_graph::MemberId), MemberFile>,
+}
+
+// The file a path names: its inode, where the platform has one.
+#[cfg(unix)]
+fn file_id(meta: &std::fs::Metadata) -> u64 {
+    std::os::unix::fs::MetadataExt::ino(meta)
+}
+
+#[cfg(not(unix))]
+fn file_id(_meta: &std::fs::Metadata) -> u64 {
+    0
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemberFile {
+    pub inodes: BTreeSet<u64>,
+    pub longest: u64,
+    pub shrank: bool,
 }
 
 // What the shelves held at one look: every envelope's runs with how they
@@ -2115,6 +2137,20 @@ pub(in crate::pipeline::tests) fn observe(
             .collect();
         if view.shelf_looks.last() != Some(&look) {
             view.shelf_looks.push(look);
+        }
+    }
+    for node in job.writer().file_nodes() {
+        if node == weaver_graph::NodeId::ROOT {
+            continue;
+        }
+        for (member, path) in job.writer().files(node) {
+            let Ok(meta) = std::fs::metadata(path) else {
+                continue;
+            };
+            let seen = view.member_files.entry((node, member)).or_default();
+            seen.inodes.insert(file_id(&meta));
+            seen.shrank |= meta.len() < seen.longest;
+            seen.longest = seen.longest.max(meta.len());
         }
     }
     view.checkpoints = job.pending().tally();

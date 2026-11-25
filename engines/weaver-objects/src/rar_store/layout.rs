@@ -16,8 +16,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use unrar_rs::{
-    ArchiveFormat, IneligibilityReason, MalformedReason, MemberEligibility, RarVolumeFacts,
-    RarVolumeFactsDelta, RarVolumeMemberFacts, StoredLayoutBuilder, StoredMember,
+    ArchiveFormat, EncryptedStore, IneligibilityReason, MalformedReason, MemberEligibility,
+    RarVolumeFacts, RarVolumeFactsDelta, RarVolumeMemberFacts, StoredLayoutBuilder, StoredMember,
 };
 use weaver_graph::{ByteRange, Coverage, Emit, Handed, MemberId, RecoveryKind, VolumeIndex, Why};
 
@@ -118,15 +118,34 @@ fn in_clear(volumes: &BTreeMap<VolumeIndex, Volume>, member: &StoredMember) -> b
     parts.peek().is_some() && parts.all(|part| !part.is_encrypted)
 }
 
-// Whether an announced entry is still the member the layout lists: every
-// part the layout lists for it so far is the part the entry holds.
+// Whether an announced entry is still made of what the layout lists for
+// the member: every part the layout lists for it so far is the part the
+// entry holds. The name is not part of it: a repaired header that only
+// names the member otherwise leaves its pieces as they are.
 fn same(entry: &Entry, member: &StoredMember) -> bool {
-    entry.name == member.name
-        && entry.pieces.iter().zip(&member.parts).all(|(piece, part)| {
-            piece.volume.0 == part.volume
-                && piece.data == ByteRange::at(part.data_offset, part.data_size)
-                && piece.after == part.split_after
-        })
+    entry.pieces.iter().zip(&member.parts).all(|(piece, part)| {
+        piece.volume.0 == part.volume
+            && piece.data == ByteRange::at(part.data_offset, part.data_size)
+            && piece.after == part.split_after
+    })
+}
+
+// Whether an entry `same` holds, that its headers now name otherwise, is
+// renamed where it stands: a stored entry whose length stands and, when it
+// is enciphered, whose pieces are keyed as before, so its bytes read the
+// same. A member the run makes is retracted and made again under its new
+// name, as the run names what it makes when it starts. An enciphered entry
+// whose keying is not known, as one restored before its headers are walked
+// again, is retracted as any other changed entry.
+fn renamed_in_place(entry: &Entry, member: &StoredMember) -> bool {
+    let length = match is_directory(member) {
+        true => Some(0),
+        false => member.unpacked_size,
+    };
+    let keyed = |store: Option<EncryptedStore>| store.map(|store| store.keying());
+    !entry.made
+        && entry.length == length
+        && keyed(entry.store) == keyed(member.eligibility.encrypted_store())
 }
 
 // The headers the layout takes a volume on, and whether it reads on past
@@ -711,7 +730,9 @@ impl RarStore {
             .position(|(entry, (id, member))| {
                 #[cfg(test)]
                 super::counts::bump(|counts| counts.compared += 1);
-                !same(entry, member) || (entry.made && !self.made_by_run(id, member, format))
+                !same(entry, member)
+                    || (entry.name != member.name && !renamed_in_place(entry, member))
+                    || (entry.made && !self.made_by_run(id, member, format))
             })
             .map_or(self.entries.len(), |at| start + at);
         for id in (keep..self.entries.len()).rev() {
@@ -720,6 +741,18 @@ impl RarStore {
         if keep < self.entries.len() {
             self.entries.truncate(keep);
             self.remap();
+        }
+        // A stored entry its headers now name otherwise is renamed where it
+        // stands: its bytes, and every entry after it, are as they were.
+        for (id, member) in members.iter().enumerate().take(keep).skip(start) {
+            if self.entries[id].name != member.name {
+                self.entries[id].name.clone_from(&member.name);
+                out.push(Emit::Member {
+                    member: MemberId(id as u32),
+                    name: member_name(&member.name, is_directory(member)),
+                    length: self.entries[id].length,
+                });
+            }
         }
         for (id, member) in members.iter().enumerate().skip(start) {
             if refusal.is_some() {

@@ -1048,12 +1048,12 @@ async fn a_repaired_header_renaming_the_compressed_member_makes_it_again() {
 }
 
 // A header posted naming a member otherwise, under a PAR2 set over the set
-// as it should be: the stored members stream under the posted names, the
-// repair rewrites the header, and the re-lay retracts the renamed member and
-// every one after it. The store asks again for the posted bytes of each
-// retracted stored member, so they stream into the members announced under
-// the repaired names; a made member is made again by its run. A member
-// before the renamed one is kept and not written again.
+// as it should be: the stored members stream under the posted names, and
+// the repair rewrites the header. A stored member whose pieces the repair
+// leaves as they were is renamed where it stands: its file keeps the bytes
+// already written and is not written again, nor is any member after it. A
+// made member renamed is retracted and made again by its run, with every
+// member after it.
 //
 // `which` is the member renamed: 0 the first, 1 the middle one. A mixed set
 // is a stored file, the compressed one and a stored file; otherwise all
@@ -1064,10 +1064,7 @@ async fn renamed_member(version: Version, options: &Options, mixed: bool, which:
         options.password, options.encrypt_headers
     );
     let build = |rename: bool| {
-        let mut names = match mixed {
-            true => ["alpha.mkv", "notes.nfo", "beta.mkv"],
-            false => ["alpha.mkv", "beta.mkv", "gamma.mkv"],
-        };
+        let mut names = renamed_names(mixed);
         if rename {
             names[which] = match (mixed, which) {
                 (_, 0) => "alphx.mkv",
@@ -1113,46 +1110,101 @@ async fn renamed_member(version: Version, options: &Options, mixed: bool, which:
     // file under the name posted.
     assert_files(&label, &graph.files, &after.files);
     assert_fetched_once(&graph);
+    // Under `-hp` the repaired volume's headers are walked again and the
+    // store gives the set to the whole engine, which makes every member
+    // anew.
+    if options.encrypt_headers {
+        assert!(graph.graph().kinds.contains("rar_engine"), "{label}");
+        return;
+    }
+    // Each stored member's file was written once: one file, never cut back.
+    // The compressed member of a mixed set is its run's: a repair that
+    // replaces bytes its run read restarts the run, which makes it again,
+    // and when it is the member renamed it is retracted with every member
+    // after it.
+    let written_once = (0..renamed_names(mixed).len())
+        .filter(|&member| !(mixed && member == 1))
+        .filter(|&member| !(mixed && which == 1 && member > which));
+    let files = &graph.graph().member_files;
+    for member in written_once {
+        let seen = files
+            .iter()
+            .filter(|((node, id), _)| *node != weaver_graph::NodeId::ROOT && id.0 == member as u32)
+            .map(|(_, seen)| seen)
+            .collect::<Vec<_>>();
+        assert_eq!(seen.len(), 1, "{label}: member {member} files {files:?}");
+        assert!(
+            seen[0].inodes.len() == 1 && !seen[0].shrank,
+            "{label}: member {member} was written again: {:?}",
+            seen[0]
+        );
+    }
 }
 
-// The first member renamed, and the middle one, in a set that stores every
-// file and in a mixed set.
+fn renamed_names(mixed: bool) -> [&'static str; 3] {
+    match mixed {
+        true => ["alpha.mkv", "notes.nfo", "beta.mkv"],
+        false => ["alpha.mkv", "beta.mkv", "gamma.mkv"],
+    }
+}
+
+// The stored members renamed: the first and the middle one of a set that
+// stores every file, and the stored first one of a mixed set, as
+// `(mixed, which)`.
+const STORED_RENAMES: [(bool, usize); 3] = [(false, 0), (false, 1), (true, 0)];
+
 #[tokio::test]
-#[ignore = "a retracted stored member's leaf is discarded before its posted bytes can be read back, so nothing streams them into the member announced again"]
-async fn a_repaired_header_renaming_a_member_streams_it_and_those_after_it_again() {
+async fn a_repaired_header_renaming_a_stored_member_renames_it_where_it_stands() {
     for version in VERSIONS {
-        for mixed in [false, true] {
-            for which in [0, 1] {
-                renamed_member(version, &options(version), mixed, which).await;
-            }
+        for (mixed, which) in STORED_RENAMES {
+            renamed_member(version, &options(version), mixed, which).await;
         }
     }
 }
 
 // The same with every file enciphered under `-p`.
 #[tokio::test]
-#[ignore = "a retracted stored member's leaf is discarded before its posted bytes can be read back, so nothing streams them into the member announced again"]
-async fn a_repaired_header_renaming_an_enciphered_member_streams_it_again() {
+async fn a_repaired_header_renaming_an_enciphered_stored_member_renames_it_where_it_stands() {
     for version in VERSIONS {
         let mut sealed = options(version);
         sealed.password = Some(SECRET);
-        for mixed in [false, true] {
-            for which in [0, 1] {
-                renamed_member(version, &sealed, mixed, which).await;
-            }
+        for (mixed, which) in STORED_RENAMES {
+            renamed_member(version, &sealed, mixed, which).await;
         }
     }
 }
 
-// The same under `-hp`.
+// The same under `-hp`: the store gives the set to the whole engine.
 #[tokio::test]
-#[ignore = "a retracted stored member's leaf is discarded before its posted bytes can be read back, so nothing streams them into the member announced again"]
-async fn a_repaired_enciphered_header_renaming_a_member_streams_it_again() {
+async fn a_repaired_enciphered_header_renaming_a_member_gives_the_set_to_the_engine() {
     for version in VERSIONS {
-        for mixed in [false, true] {
-            for which in [0, 1] {
-                renamed_member(version, &sealed_headers(version), mixed, which).await;
+        for (mixed, which) in STORED_RENAMES {
+            if (version, mixed, which) == (Version::Rar5, false, 1) {
+                continue;
             }
+            renamed_member(version, &sealed_headers(version), mixed, which).await;
+        }
+    }
+}
+
+// A RAR5 set that stores every file under `-hp`, its middle file renamed.
+#[tokio::test]
+#[ignore = "blocked: the whole engine given the set ends Partial without the renamed member, as it did before members were renamed in place"]
+async fn a_repaired_enciphered_header_renaming_the_middle_member_gives_the_set_to_the_engine() {
+    renamed_member(Version::Rar5, &sealed_headers(Version::Rar5), false, 1).await;
+}
+
+// The compressed member of a mixed set renamed: its run's member is
+// retracted with the stored member after it, and made again under its new
+// name.
+#[tokio::test]
+#[ignore = "blocked: a renamed made member is retracted with the stored members after it, whose posted bytes are gone before they can be read back; the store refuses the set as unmapped and the whole engine makes it, and under -p the job ends Partial without them"]
+async fn a_repaired_header_renaming_the_made_member_of_a_mixed_set_makes_it_again() {
+    for version in VERSIONS {
+        let mut sealed = options(version);
+        sealed.password = Some(SECRET);
+        for options in [options(version), sealed] {
+            renamed_member(version, &options, true, 1).await;
         }
     }
 }
@@ -1990,7 +2042,10 @@ async fn packed_data_reaches_the_shelf_only_after_its_member_is_announced() {
             }
         }
     }
-    assert!(raced > 0, "no look had packed data shelved ahead of a member");
+    assert!(
+        raced > 0,
+        "no look had packed data shelved ahead of a member"
+    );
 }
 
 // Headers posted naming the large compressed member otherwise, under a PAR2
@@ -2046,7 +2101,11 @@ async fn packed_data_under_a_repaired_header_reaches_the_shelf_only_after_its_me
             .iter()
             .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
             .collect();
-        posts.extend(par2_set("silver.horizon", &volumes, 2 * renamed.len() as u32));
+        posts.extend(par2_set(
+            "silver.horizon",
+            &volumes,
+            2 * renamed.len() as u32,
+        ));
         let graph = run(&Scenario::new(posts)).await;
         assert!(
             graph.completed(),
@@ -2275,7 +2334,11 @@ mod chase {
                 assert_members(&label, &graph, &set.files);
                 assert_fetched_once(&graph);
                 let (members, _) = named(&spoken);
-                assert_eq!(members, BTreeSet::from([0]), "{label}: runs name the first only");
+                assert_eq!(
+                    members,
+                    BTreeSet::from([0]),
+                    "{label}: runs name the first only"
+                );
             }
         }
     }
@@ -2291,7 +2354,11 @@ mod chase {
             let graph = run(&Scenario::new(set.posts())).await;
             assert!(graph.completed(), "{label}: {:?}", graph.failure);
             assert_files(&label, &graph.files, &set.files);
-            assert!(kinds(&graph).contains(&"rar_engine"), "{label}: {:?}", kinds(&graph));
+            assert!(
+                kinds(&graph).contains(&"rar_engine"),
+                "{label}: {:?}",
+                kinds(&graph)
+            );
         }
     }
 
@@ -2311,14 +2378,21 @@ mod chase {
         let Item::Packed { codec, .. } = &mut items[3] else {
             unreachable!()
         };
-        *codec = Codec { dict: wide, ..*codec };
+        *codec = Codec {
+            dict: wide,
+            ..*codec
+        };
         let set = set_of((items, files), &split(version, 4_400));
-        for (case, ceiling) in [("lent", None), ("held to the ceiling", Some(RUN_OVERHEAD + wide))] {
+        for (case, ceiling) in [
+            ("lent", None),
+            ("held to the ceiling", Some(RUN_OVERHEAD + wide)),
+        ] {
             let label = format!("{version:?} {case}");
             let mut scenario = Scenario::new(set.posts());
             if let Some(ceiling) = ceiling {
-                scenario = scenario
-                    .setup(move |pipeline| pipeline.graph_decode = Arc::new(DecodePool::new(ceiling)));
+                scenario = scenario.setup(move |pipeline| {
+                    pipeline.graph_decode = Arc::new(DecodePool::new(ceiling))
+                });
             }
             let (scenario, spoken) = hearing(scenario);
             let graph = run(&scenario).await;
@@ -2352,7 +2426,10 @@ mod chase {
                 .all(|volume| volume < inner.first().unwrap()),
             "{label}"
         );
-        let middle = *inner.iter().nth(inner.len() / 2).expect("inner.txt's volumes") as usize;
+        let middle = *inner
+            .iter()
+            .nth(inner.len() / 2)
+            .expect("inner.txt's volumes") as usize;
         let other = write(
             &[Item::File("gamma.srt", payload(2 * ARTICLE + 3, 47))],
             &Options::new(Version::Rar4),
@@ -2459,7 +2536,10 @@ mod chase {
             .map(|(name, bytes)| Post::plain(&name, bytes))
             .collect();
         for (case, scenario) in [
-            ("nameless, landing out of order", Scenario::new(nameless).reversed(&every)),
+            (
+                "nameless, landing out of order",
+                Scenario::new(nameless).reversed(&every),
+            ),
             ("posted backwards", Scenario::new(set.posts()).backwards()),
         ] {
             let (scenario, spoken) = hearing(scenario);
